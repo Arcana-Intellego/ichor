@@ -1,0 +1,121 @@
+import shutil
+from pathlib import Path
+from typing import Optional, Union
+
+import ichor.hpc.global_variables
+from ichor.core.common.io import mkdir
+from ichor.core.files.ferebus import PyFerebusScript, ExtractModelsScript
+
+from ichor.hpc.batch_system import JobID
+from ichor.hpc.global_variables import get_param_from_config
+from ichor.hpc.submission_commands import PythonCommand
+from ichor.hpc.submission_script import SubmissionScript
+
+
+def find_and_setup_ferebus_subdirs(input_dir):
+    # find directories containing training data and job-details files
+    # makes sure to copy job-details file into each subdirectory
+    # ferebus needs job-details and properties to be in same directory
+    base = Path(input_dir)
+
+    dest_paths = []
+
+    # Recursively find TRAIN directories anywhere under base
+    training_dirs = [d for d in base.rglob("*") if d.is_dir() and "TRAIN" in d.name]
+
+    print(f"Found {len(training_dirs)} TRAIN directories.")
+
+    for d in training_dirs:
+        job_file = d / "job-details"
+        if not job_file.is_file():
+            print(f"Skipping {d.name}: no job-details file")
+            continue
+
+        # exactly one subfolder inside each TRAIN directory
+        subdirs = [p for p in d.iterdir() if p.is_dir()]
+        if len(subdirs) != 1:
+            print(f"Skipping {d.name}: expected 1 subfolder, found {len(subdirs)}")
+            continue
+
+        dest = subdirs[0] / "job-details"
+        shutil.copy(job_file, dest)
+
+        dest_paths.append(dest)
+        print(f"Copied job-details → {dest}")
+
+    # return list of training directories so user can choose how many to submit
+    return dest_paths
+
+
+def write_pyferebus_input_script(
+    input_dir,
+    hold: JobID = None,
+    **kwargs,
+) -> Optional[JobID]:
+
+    input_filename = "pyferebus_input" + PyFerebusScript.get_filetype()
+
+    pyferebus_input_script = PyFerebusScript(
+        Path(input_filename),
+        **kwargs,
+    )
+    pyferebus_input_script.write()
+
+    return pyferebus_input_script.path
+
+
+def write_extract_models_script(
+    hold: JobID = None,
+    **kwargs,
+) -> Optional[JobID]:
+
+    input_filename = "extract_models" + ExtractModelsScript.get_filetype()
+
+    extract_models_script = ExtractModelsScript(
+        Path(input_filename),
+    )
+    extract_models_script.write()
+
+    return extract_models_script.path
+
+
+# def submit_pyferebus(
+#     input_script: Path,
+#     script_name: Optional[Union[str, Path]],
+#     hold: Optional[JobID] = None,
+#     ncores=2,
+#     outputs_dir_path=ichor.hpc.global_variables.FILE_STRUCTURE["outputs"],
+#     errors_dir_path=ichor.hpc.global_variables.FILE_STRUCTURE["errors"],
+#     **kwargs,
+# ) -> JobID:
+#     """Function that writes out a submission script which contains an array of
+#     Gaussian jobs to be ran on compute nodes. If calling this function from
+#     a log-in node, it will write out the submission script, a datafile (file which contains the names of
+#     all the .gjf file that need to be ran through Gaussian),
+#     and it will submit the submission script to compute nodes as well to run Gaussian on compute nodes.
+#     However, if using this function from a compute node,
+#     (which will happen when ichor is ran in auto-run mode), this function will only be used to write out
+#     the datafile and will not submit any new jobs
+#     from the compute node (as you cannot submit jobs from compute nodes on CSF3.)
+
+#     :param gjfs: A list of Path objects pointing to .gjf files
+#     :param force_calculate_wfn: Run Gaussian calculations on given .gjf files,
+#         even if .wfn files already exist. Defaults to False.
+#     :script_name: Path to write submission script out to defaults to ichor.hpc.global_variables.SCRIPT_NAMES["gaussian"]
+#     :param hold: An optional JobID for which this job to hold.
+#         This is used in auto-run to hold this job for the previous job to finish, defaults to None
+#     :return: The JobID of this job given by the submission system.
+#     """
+
+#     # make a SubmissionScript instance which is going to contain all the jobs that are going to be ran
+#     # the submission_script object can be accessed even after the context manager
+#     with SubmissionScript(
+#         script_name,
+#         ncores=ncores,
+#         outputs_dir_path=outputs_dir_path,
+#         errors_dir_path=errors_dir_path,
+#     ) as submission_script:
+
+#         submission_script.add_command(PythonCommand(input_script))
+
+#     return submission_script.submit(hold=hold)

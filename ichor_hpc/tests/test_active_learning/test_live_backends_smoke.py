@@ -1,0 +1,476 @@
+"""Live-backend smoke tests.
+
+Every test in this file is decorated with one or more skip-if-absent
+guards (sbatch, sacct, Gaussian, AIMAll, FEREBUS, ariadne). On Windows /
+off-cluster, all tests SKIP cleanly with a clear reason; on a CSF4 login
+node (or any host where the binary is present) they run for real.
+
+These tests do NOT consume real core-hours: they invoke each binary with
+its trivial smoke argument (typically --version) and parse the result.
+The most expensive test submits a one-second sleep via sbatch and checks
+the JobID round-trips through sacct -- core-hour cost ~0.
+
+Run only the live tests when on the cluster:
+
+    pytest -m live ichor_hpc/tests/test_active_learning/test_live_backends_smoke.py
+"""
+from __future__ import annotations
+
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from ichor.hpc.active_learning.config import CampaignConfig
+from ichor.hpc.active_learning.daemon import live_executor as live_executor_mod
+from ichor.hpc.active_learning.daemon.live_executor import (
+    LiveBackendNotAvailableError,
+    LiveBackendsPhaseExecutor,
+    build_sbatch_script,
+)
+from ichor.hpc.active_learning.daemon.preflight import (
+    BackendAvailability,
+    check_backends,
+    missing_backend_message,
+)
+
+
+# --- skip-if-absent helpers ------------------------------------------------
+
+
+def _which(name: str) -> str:
+    return shutil.which(name) or ""
+
+
+requires_sbatch = pytest.mark.skipif(
+    not _which("sbatch"), reason="sbatch not on PATH"
+)
+requires_sacct = pytest.mark.skipif(
+    not _which("sacct"), reason="sacct not on PATH"
+)
+requires_gaussian = pytest.mark.skipif(
+    not _which("g16"),
+    reason="g16 not on PATH",
+)
+requires_aimall = pytest.mark.skipif(
+    not (_which("aimqb.ish") or _which("aimqb")),
+    reason="aimqb.ish / aimqb not on PATH",
+)
+requires_ferebus = pytest.mark.skipif(
+    not (_which("FEREBUS") or _which("ferebus")),
+    reason="FEREBUS not on PATH",
+)
+
+try:
+    import ariadne as _ariadne_module  # type: ignore[import]
+    HAS_ARIADNE = True
+except Exception:
+    HAS_ARIADNE = False
+
+requires_ariadne = pytest.mark.skipif(
+    not HAS_ARIADNE, reason="ariadne not importable"
+)
+
+
+# --- preflight introspection (always run) ----------------------------------
+
+
+def test_check_backends_returns_structured_result():
+    a = check_backends()
+    assert isinstance(a, BackendAvailability)
+    assert isinstance(a.all_present, bool)
+    # Each component flag is a bool, mirrored to its absolute path string.
+    assert isinstance(a.sbatch, bool)
+    assert isinstance(a.sacct, bool)
+    assert isinstance(a.gaussian, bool)
+    assert isinstance(a.aimall, bool)
+    assert isinstance(a.ferebus, bool)
+    assert isinstance(a.ariadne, bool)
+
+
+def test_missing_backend_message_lists_each_missing():
+    a = check_backends()
+    msg = missing_backend_message(a)
+    if a.all_present:
+        assert msg == ""
+    else:
+        # Every missing component must be named in the message.
+        for component in a.missing:
+            assert component in msg.lower() or component.upper() in msg
+
+
+def test_missing_backend_message_names_rendered_gaussian_module():
+    a = BackendAvailability(
+        sbatch=True,
+        sacct=True,
+        gaussian=False,
+        aimall=True,
+        ferebus=True,
+        ariadne=True,
+        polus_rs=True,
+        pyferebus=True,
+        bc=True,
+        gaussian_binary="",
+        sbatch_path="/usr/bin/sbatch",
+        sacct_path="/usr/bin/sacct",
+        bc_path="/usr/bin/bc",
+        aimall_path="/opt/AIMAll/aimqb.ish",
+        ferebus_path="/usr/local/bin/ferebus",
+    )
+    msg = missing_backend_message(a)
+    assert "gaussian/g16c01_em64t_detectcpu" in msg
+    assert "gaussian/g16`" not in msg
+
+
+def test_live_executor_refuses_when_sbatch_absent_on_windows():
+    """On any host without sbatch, the constructor must refuse."""
+    a = check_backends()
+    if a.sbatch:
+        pytest.skip("sbatch is on PATH; this test is for off-cluster hosts")
+    cfg = CampaignConfig()
+    with tempfile.TemporaryDirectory() as td:
+        with pytest.raises(LiveBackendNotAvailableError):
+            LiveBackendsPhaseExecutor(campaign_dir=Path(td), config=cfg)
+
+
+# --- sbatch script body smoke (no backends needed) ------------------------
+
+
+def test_build_sbatch_script_renders_gaussian_block():
+    body = build_sbatch_script(
+        phase_name="INITIAL_GAUSSIAN",
+        iteration=0,
+        campaign_dir=Path("/scratch/campaign"),
+        config=CampaignConfig(),
+    )
+    assert "#SBATCH --job-name=INITIAL_GAUSSIAN-0" in body
+    assert "module load gaussian/g16c01_em64t_detectcpu" in body
+    assert "g16 < input.gjf" in body
+    assert "> input.gau" in body
+    assert "> output.log" not in body
+    assert "|| true" not in body
+    assert "set -euo pipefail" in body
+    assert "export LC_ALL=C" in body
+    assert "export LC_NUMERIC=C" in body
+
+
+def test_build_sbatch_script_uses_strict_daemon_module_loads():
+    body = build_sbatch_script(
+        phase_name="PHASE_A_POLUS",
+        iteration=0,
+        campaign_dir=Path("/scratch/campaign"),
+        config=CampaignConfig(),
+    )
+    assert "module load apps/anaconda3/2024.02" in body
+    assert "module load compilers/oneapi/2024.2.0" in body
+    assert "module load mkl/2024.2" in body
+    assert "|| true" not in body
+
+
+def test_build_sbatch_script_uses_yaml_scheduler_resources_by_default():
+    cfg = CampaignConfig()
+    cfg.resources.partition = "csf4-debug"
+    cfg.resources.walltime_hours = 7
+    body = build_sbatch_script(
+        phase_name="PHASE_A_POLUS",
+        iteration=0,
+        campaign_dir=Path("/scratch/campaign"),
+        config=cfg,
+    )
+    assert "#SBATCH --partition=csf4-debug" in body
+    assert "#SBATCH --time=7:00:00" in body
+
+
+def test_build_sbatch_script_explicit_scheduler_overrides_win():
+    cfg = CampaignConfig()
+    cfg.resources.partition = "yaml-partition"
+    cfg.resources.walltime_hours = 7
+    body = build_sbatch_script(
+        phase_name="PHASE_A_POLUS",
+        iteration=0,
+        campaign_dir=Path("/scratch/campaign"),
+        config=cfg,
+        partition="explicit-partition",
+        walltime_hours=11,
+    )
+    assert "#SBATCH --partition=explicit-partition" in body
+    assert "#SBATCH --time=11:00:00" in body
+    assert "yaml-partition" not in body
+    assert "#SBATCH --time=7:00:00" not in body
+
+
+def test_build_sbatch_script_renders_ferebus_block():
+    body = build_sbatch_script(
+        phase_name="INITIAL_FEREBUS",
+        iteration=0,
+        campaign_dir=Path("/scratch/campaign"),
+        config=CampaignConfig(),
+    )
+    # Live FEREBUS uses pyferebus_wrap.submit_ferebus(), not the generic renderer.
+    assert "pyferebus wrapper" in body
+    assert 'ferebus_${ATOM}.toml' not in body
+    assert "runferebus.py" not in body.lower()
+
+
+def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
+    from ichor.hpc.active_learning.daemon import input_staging as stg
+    from ichor.hpc.active_learning.submit import pyferebus_wrap
+    from ichor.hpc.active_learning.submit.pyferebus_wrap import FerebusSubmission
+
+    cfg = CampaignConfig()
+    cfg.resources.walltime_hours = 9
+    campaign = tmp_path / "campaign"
+    campaign.mkdir()
+    staging = campaign / "6_TRAINED_MODELS" / "iteration-staging"
+    staging.mkdir(parents=True)
+    (staging / stg.FEREBUS_JOB_DETAILS).write_text(
+        "system_name WATER\n", encoding="utf-8",
+    )
+
+    calls = {}
+
+    def fake_stage(campaign_dir, config, training_version, *, is_initial=False):
+        calls["stage"] = {
+            "campaign_dir": Path(campaign_dir),
+            "training_version": training_version,
+            "is_initial": is_initial,
+        }
+        return staging, 3
+
+    def fake_submit(jd_file, working_directory, **kwargs):
+        script = Path(working_directory) / "runFerebus.sh"
+        script.write_text("#!/bin/sh\n", encoding="utf-8")
+        calls["submit"] = {
+            "jd_file": Path(jd_file),
+            "working_directory": Path(working_directory),
+            "kwargs": dict(kwargs),
+        }
+        return FerebusSubmission(
+            job_id="4242",
+            cluster=None,
+            submission_script=script,
+            working_dir=Path(working_directory),
+            transfer_learning=False,
+        )
+
+    monkeypatch.setattr(stg, "stage_ferebus_inputs", fake_stage)
+    monkeypatch.setattr(pyferebus_wrap, "submit_ferebus", fake_submit)
+
+    runner = object()
+    ex = LiveBackendsPhaseExecutor(
+        campaign_dir=campaign,
+        config=cfg,
+        sbatch_runner=runner,
+        backend_check=False,
+    )
+    result = ex.submit_or_run(
+        SimpleNamespace(iteration=0, training_set_version=4),
+        "FEREBUS",
+    )
+
+    assert result.submitted_job_id == "4242"
+    assert calls["stage"]["training_version"] == 4
+    assert calls["stage"]["is_initial"] is False
+    assert calls["submit"]["jd_file"] == staging / stg.FEREBUS_JOB_DETAILS
+    assert calls["submit"]["working_directory"] == staging
+    assert calls["submit"]["kwargs"]["overwrite_workdir"] is False
+    assert calls["submit"]["kwargs"]["move_dataset_files"] is True
+    assert calls["submit"]["kwargs"]["submit_runner"] is runner
+    assert calls["submit"]["kwargs"]["walltime_hours"] == cfg.resources.walltime_hours
+
+
+def test_build_sbatch_script_renders_aimall_block(monkeypatch):
+    monkeypatch.setattr(
+        live_executor_mod,
+        "_configured_backend_path",
+        lambda backend_name, fallback: "/opt/AIM All/aimqb.ish",
+    )
+    body = build_sbatch_script(
+        phase_name="AIMALL",
+        iteration=3,
+        campaign_dir=Path("/scratch/campaign"),
+        config=CampaignConfig(),
+    )
+    assert shlex.quote("/opt/AIM All/aimqb.ish") + " input.wfn" in body
+    assert "AIMALL-3" in body
+
+
+def test_build_sbatch_script_renders_ariadne_block():
+    body = build_sbatch_script(
+        phase_name="ARIADNE_ARRAY",
+        iteration=2,
+        campaign_dir=Path("/scratch/campaign"),
+        config=CampaignConfig(),
+    )
+    assert "ariadne_runner" in body
+    assert shlex.quote(sys.executable) + " -m ichor.hpc.active_learning.acquisition.ariadne_runner" in body
+    assert "\npython -m ichor.hpc.active_learning.acquisition.ariadne_runner" not in body
+    assert "--seed-index $SLURM_ARRAY_TASK_ID" in body
+    assert "--iteration 2" in body
+
+
+def test_build_sbatch_script_renders_polus_block_with_configured_descriptor():
+    cfg = CampaignConfig()
+    cfg.phase_b.descriptor = "acquisition_weighted"
+    body = build_sbatch_script(
+        phase_name="PHASE_B_POLUS",
+        iteration=4,
+        campaign_dir=Path("/scratch/campaign"),
+        config=cfg,
+    )
+    assert "polus_wrapper" in body
+    assert shlex.quote(sys.executable) + " -m ichor.hpc.active_learning.sampling.polus_wrapper" in body
+    assert "\npython -m ichor.hpc.active_learning.sampling.polus_wrapper" not in body
+    assert "--descriptor acquisition_weighted" in body
+    assert "--iteration 4" in body
+
+
+def test_build_sbatch_script_renders_phase_a_polus_as_negative_iteration():
+    body = build_sbatch_script(
+        phase_name="PHASE_A_POLUS",
+        iteration=0,
+        campaign_dir=Path("/scratch/campaign"),
+        config=CampaignConfig(),
+    )
+    assert "polus_wrapper" in body
+    assert "--descriptor rmsd_massweight" in body
+    assert "--iteration -1" in body
+
+
+def test_write_real_script_creates_sbatch_log_dirs(tmp_path):
+    ex = LiveBackendsPhaseExecutor(
+        campaign_dir=tmp_path / "campaign",
+        config=CampaignConfig(),
+        backend_check=False,
+    )
+    ex._write_real_script(
+        "PHASE_A_POLUS",
+        SimpleNamespace(iteration=0, campaign_uid="uid"),
+    )
+    assert (tmp_path / "campaign" / ".DATA" / "SCRIPTS" / "OUTPUTS").is_dir()
+    assert (tmp_path / "campaign" / ".DATA" / "SCRIPTS" / "ERRORS").is_dir()
+
+
+# --- live binaries (skipped off-cluster) ----------------------------------
+
+
+@pytest.mark.live
+@requires_sbatch
+def test_sbatch_help_runs():
+    """sbatch --help exits 0 on a healthy SLURM host."""
+    result = subprocess.run(
+        ["sbatch", "--help"], capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 0
+    assert "sbatch" in result.stdout.lower() or "sbatch" in result.stderr.lower()
+
+
+@pytest.mark.live
+@requires_sacct
+def test_sacct_help_runs():
+    result = subprocess.run(
+        ["sacct", "--help"], capture_output=True, text=True, timeout=20,
+    )
+    # sacct prints help to stderr on some versions; accept either stream.
+    assert result.returncode == 0
+    text = (result.stdout + result.stderr).lower()
+    assert "sacct" in text
+
+
+@pytest.mark.live
+@requires_sbatch
+@requires_sacct
+def test_sbatch_one_shot_roundtrip(tmp_path):
+    """Submit a 1-second sleep via sbatch --parsable; poll sacct; assert
+    the JobID round-trips and reaches a terminal state."""
+    script = tmp_path / "smoke.sh"
+    script.write_text(
+        "#!/bin/bash\n#SBATCH --time=00:01:00\nsleep 1\n",
+        encoding="utf-8",
+    )
+    os.chmod(script, 0o755)
+    submit = subprocess.run(
+        ["sbatch", "--parsable", str(script)],
+        capture_output=True, text=True, timeout=20, check=False,
+    )
+    assert submit.returncode == 0, submit.stderr
+    job_id = submit.stdout.strip().split(";")[0]
+    assert job_id and job_id[0].isdigit()
+
+    from ichor.hpc.active_learning.submit.sacct_poll import (
+        aggregate_states,
+        poll_job,
+    )
+
+    deadline = time.time() + 180.0
+    last_obs = []
+    while time.time() < deadline:
+        try:
+            last_obs = poll_job(job_id)
+        except RuntimeError:
+            time.sleep(5.0)
+            continue
+        summary = aggregate_states(job_id, last_obs)
+        if summary.is_terminal and summary.n_tasks > 0:
+            assert summary.n_completed >= 1 or summary.n_failed >= 1
+            return
+        time.sleep(5.0)
+    pytest.fail("smoke job did not reach a terminal sacct state in 180s")
+
+
+@pytest.mark.live
+@requires_gaussian
+def test_gaussian_binary_runs_version():
+    binary = _which("g16") or _which("g09")
+    result = subprocess.run(
+        [binary, "--help"], capture_output=True, text=True, timeout=20, check=False,
+    )
+    # Gaussian exits non-zero on --help but writes its banner. Accept any output.
+    text = (result.stdout + result.stderr).lower()
+    assert "gaussian" in text or "g16" in text or "g09" in text
+
+
+@pytest.mark.live
+@requires_aimall
+def test_aimall_binary_exists_and_is_executable():
+    aim = _which("aimqb.ish") or _which("aimqb")
+    assert aim
+    assert os.access(aim, os.X_OK)
+
+
+@pytest.mark.live
+@requires_ferebus
+def test_ferebus_binary_exists_and_is_executable():
+    fer = _which("FEREBUS") or _which("ferebus")
+    assert fer
+    assert os.access(fer, os.X_OK)
+
+
+@pytest.mark.live
+@requires_ariadne
+def test_ariadne_optimiser_class_present():
+    import ariadne  # type: ignore[import]
+    assert hasattr(ariadne, "Geometric_Trqn") or hasattr(ariadne, "Ds_Optimiser"), (
+        "ariadne imported but no documented optimiser class found"
+    )
+
+
+@pytest.mark.live
+@requires_sbatch
+@requires_gaussian
+@requires_aimall
+@requires_ferebus
+@requires_ariadne
+def test_full_backend_set_available():
+    """All-in-one preflight: only passes on a CSF4-equivalent host where
+    every backend the daemon needs is present. This is the test that flips
+    from skip to pass when you move from Windows to the cluster."""
+    a = check_backends()
+    assert a.all_present, missing_backend_message(a)

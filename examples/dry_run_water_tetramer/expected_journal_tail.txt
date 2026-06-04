@@ -1,0 +1,23 @@
+# Representative tail of the journal after a successful 2-iteration
+# dry-run campaign. Timestamps and JobIDs in your run will differ;
+# the event sequence + payload shape should match.
+
+{"event": "phase_transition", "from_phase": "AIMALL", "iteration": 1, "to_phase": "APPEND", ...}
+{"event": "training_set_committed", "iteration": 1, "n_committed_points": 2, "training_set_version": 2, ...}
+{"event": "phase_transition", "from_phase": "APPEND", "iteration": 1, "to_phase": "FEREBUS", ...}
+{"event": "sbatch", "iteration": 1, "job_id": "DRYRUN-FEREBUS-1", "phase": "FEREBUS", ...}
+{"event": "phase_succeeded", "iteration": 1, "n_completed": 1, "n_failed": 0, "n_tasks": 1, "phase": "FEREBUS", ...}
+{"event": "phase_transition", "from_phase": "FEREBUS", "iteration": 1, "to_phase": "STOP_CHECK", ...}
+{"event": "phase_transition", "from_phase": "STOP_CHECK", "iteration": 1, "to_phase": "DONE", ...}
+{"event": "daemon_stopped", "pid": ..., ...}
+
+# Anchors to grep for after a successful run:
+#
+#   * exactly TWO `training_set_committed` events (iterations 0 + 1)
+#   * exactly TWO `phase_succeeded` events per per-iteration SBATCH phase
+#   * exactly ONE `daemon_stopped` event at the end
+#   * NO `tick_error` or `live_postprocess_refused` events
+#
+# Full event stream is ~80 lines; this excerpt shows only the final
+# ~10. Pipe `ichor-al-daemon journal --campaign-dir .` to a pager to
+# read the whole thing.

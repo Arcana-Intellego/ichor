@@ -1,0 +1,47 @@
+repos:
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+    -   id: check-byte-order-marker
+    -   id: check-case-conflict
+    -   id: check-merge-conflict
+    -   id: end-of-file-fixer
+    -   id: mixed-line-ending
+        args: [--fix=lf]
+    -   id: trailing-whitespace
+    -   id: debug-statements
+-   repo: https://github.com/omnilib/ufmt
+    rev: v2.7.0
+    hooks:
+    -   id: ufmt
+        additional_dependencies:
+        - black == 22.3.0
+        - usort == 1.0.3
+        exclude: ^(build/*)|(docs/*)|(examples/*)|(docs/build)
+-   repo: https://github.com/pycqa/flake8
+    rev: 7.1.0
+    hooks:
+    -   id: flake8
+        args: [--config=setup.cfg]
+        exclude: ^(examples/*)|(docs/*)|(docs/build)
+-   repo: https://github.com/jumanjihouse/pre-commit-hooks
+    rev: 3.0.0
+    hooks:
+    -   id: script-must-have-extension
+    -   id: forbid-binary
+        exclude: ^(examples/*)|(example_files/*)|(docs/build)|(docs/source/extra_files/*)
+-   repo: https://github.com/Lucas-C/pre-commit-hooks
+    rev: v1.5.5
+    hooks:
+    -   id: forbid-crlf
+        exclude: (docs/build)
+    -   id: forbid-tabs
+        exclude: ^(docs/source/_static/*)|(docs/Makefile)|(docs/build)
+-   repo: local
+    hooks:
+      - id: ascii-check
+        name: ASCII Compliance Check
+        entry: python check_ascii.py
+        language: system
+        types: [text]
+        exclude: ^(examples/*)|(.github/ISSUE_TEMPLATE/*)|(docs/source)|(docs/build)

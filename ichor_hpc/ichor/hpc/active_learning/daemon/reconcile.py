@@ -1,0 +1,358 @@
+"""Recovery for a corrupt or missing state.json with user in the loop.
+
+The daemon's design treats 'state.json' as the only authoritative checkpoint.
+If it goes missing or fails schema validation, the daemon refuses to auto-
+recover; a silent reconstruction is exactly the bug class we want to avoid.
+
+"reconcile" inspects the on-disk artefacts that DO exist (5_TRAINING/
+committed iterations, 6_TRAINED_MODELS/, journal entries) and proposes a
+"CampaignState" it believes is consistent with them. The proposal is
+written to "<state_path>.proposed" and the operator must explicitly
+promote it ("mv state.json.proposed state.json") before restarting the
+daemon.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
+from ..versioning.training_set import TrainingSetVersioning
+from .artifact_contracts import (
+    verify_committed_model_version,
+    verify_committed_training_version,
+)
+from .journal import iter_events
+from . import submission_intent as _submission_intent
+from .state import (
+    CampaignPhase,
+    CampaignState,
+    DEFAULT_STATE_FILENAME,
+    StateSchemaError,
+    fresh_campaign_state,
+    read_state,
+    write_state,
+)
+
+
+__all__ = [
+    "ReconciliationReport",
+    "propose_recovery",
+    "write_proposed_state",
+    "RECONCILE_SUFFIX",
+]
+
+
+RECONCILE_SUFFIX = ".proposed"
+
+
+@dataclass
+class ReconciliationReport:
+    """Diagnostic bundle returned by :func: propose_recovery."""
+
+    proposed_state: CampaignState
+    committed_training_versions: List[int] = field(default_factory=list)
+    committed_model_versions: List[int] = field(default_factory=list)
+    last_phase_in_journal: Optional[str] = None
+    last_iteration_in_journal: Optional[int] = None
+    notes: List[str] = field(default_factory=list)
+    existing_state_loaded: bool = False
+    unsafe_reasons: List[str] = field(default_factory=list)
+    active_submission_intents: List[Dict[str, Any]] = field(default_factory=list)
+
+
+def propose_recovery(
+    campaign_dir: Union[str, Path],
+    *,
+    training_dir_name: str = "5_TRAINING",
+    models_dir_name: str = "6_TRAINED_MODELS",
+    data_subdir: Union[str, Path] = Path(".DATA") / "ACTIVE_LEARNING",
+    iteration_prefix: str = "iteration",
+    allow_fresh_init_on_nonempty: bool = False,
+) -> ReconciliationReport:
+    """Inspect the campaign tree and propose a recovered CampaignState.
+
+    The recovered state is conservative: it always positions the daemon at
+    a stable "safe" entry point (STOP_CHECK for completed iterations or
+    INIT when nothing is committed yet) and clears any pending_jobs so the
+    next run re-submits rather than blindly polls unknown JobIDs.
+
+    Heuristics:
+        - committed training versions in "5_TRAINING/" define the maximum
+          completed iteration; the next iteration to plan from is one past
+          that.
+        - committed model versions in "6_TRAINED_MODELS/" likewise.
+        - journal entries inform "last_phase_in_journal" for the report only.
+        - if a prior state.json exists and parses, its "max_iterations",
+          "campaign_uid", and "campaign_started_iso" are preserved so the
+          recovery does not destroy provenance.
+    """
+    campaign = Path(campaign_dir)
+    data = campaign / data_subdir
+    state_path = data / DEFAULT_STATE_FILENAME
+
+    notes: List[str] = []
+    unsafe_reasons: List[str] = []
+
+    existing: Optional[CampaignState] = None
+    existing_loaded = False
+    salvaged_uid = None
+    salvaged_started = None
+    if state_path.exists():
+        try:
+            existing = read_state(state_path)
+            existing_loaded = True
+            notes.append("existing state.json loaded; preserved campaign_uid and max_iterations")
+        except (StateSchemaError, ValueError) as exc:
+            notes.append("existing state.json failed validation: " + str(exc)[:200])
+            # present but schema-invalid (a bad alpha_history, say). salvage the
+            # campaign identity from the raw json so recovery does not silently
+            # mint a brand-new campaign_uid and bin the provenance.
+            try:
+                import json as _json
+                raw = _json.loads(state_path.read_text(encoding="utf-8"))
+                salvaged_uid = raw.get("campaign_uid")
+                salvaged_started = raw.get("campaign_started_iso")
+                if salvaged_uid:
+                    notes.append("salvaged campaign_uid from the unparsable state.json")
+                else:
+                    notes.append("WARNING: no campaign_uid to salvage; a fresh one will be minted")
+            except Exception:
+                notes.append("WARNING: state.json not even json; a fresh campaign_uid will be minted")
+        except Exception as exc:
+            notes.append("existing state.json unreadable: " + type(exc).__name__)
+            notes.append("WARNING: a fresh campaign_uid will be minted; restore a good state.json to keep provenance")
+    else:
+        notes.append("no existing state.json")
+
+    #committed training versions
+    training_dir = campaign / training_dir_name
+    if training_dir.is_dir():
+        tv = TrainingSetVersioning(training_dir, prefix=iteration_prefix).list_committed_versions()
+    else:
+        tv = []
+        notes.append("training dir " + training_dir_name + " missing")
+    #committed model versions
+    models_dir = campaign / models_dir_name
+    if models_dir.is_dir():
+        mv = TrainingSetVersioning(models_dir, prefix=iteration_prefix).list_committed_versions()
+    else:
+        mv = []
+        notes.append("models dir " + models_dir_name + " missing")
+
+    #last phase observed in journal (informational)
+    last_phase = None
+    last_iter = None
+    journal_path = data / "journal.ndjson"
+    if journal_path.exists():
+        for event in iter_events(journal_path):
+            if event.get("event") == "phase_transition":
+                #to_phase tells us what was advanced to most recently
+                last_phase = event.get("to_phase") or last_phase
+                last_iter = event.get("iteration", last_iter)
+
+    active_intents: List[Dict[str, Any]] = []
+    intent_root = _submission_intent.intent_dir(campaign)
+    if intent_root.is_dir():
+        for p in sorted(intent_root.glob("*.json")):
+            try:
+                import json as _json
+                payload = _json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                unsafe_reasons.append("unreadable submission intent: " + str(p))
+                continue
+            if isinstance(payload, dict) and str(payload.get("status")) in _submission_intent.ACTIVE_STATUSES:
+                active_intents.append(payload)
+
+    staging_root = campaign / ".DATA" / "STAGING"
+    staging_children = [
+        p for p in (staging_root.iterdir() if staging_root.is_dir() else [])
+        if p.name not in (".", "..")
+    ]
+    scripts_root = campaign / ".DATA" / "SCRIPTS"
+    script_files = [
+        p for p in (scripts_root.glob("*.sh") if scripts_root.is_dir() else [])
+        if p.is_file()
+    ]
+    dangling_training = (
+        TrainingSetVersioning(training_dir, prefix=iteration_prefix).list_dangling_staging()
+        if training_dir.is_dir() else []
+    )
+    dangling_models = (
+        TrainingSetVersioning(models_dir, prefix=iteration_prefix).list_dangling_staging()
+        if models_dir.is_dir() else []
+    )
+    model_iteration_staging = models_dir / "iteration-staging"
+    has_model_iteration_staging = model_iteration_staging.is_dir()
+
+    if active_intents:
+        unsafe_reasons.append(
+            "active submission intent(s) present: "
+            + ", ".join(
+                str(i.get("phase")) + "@" + str(i.get("iteration"))
+                + " job_id=" + str(i.get("job_id"))
+                + " expected_job_name=" + str(i.get("expected_job_name"))
+                for i in active_intents
+            )
+        )
+    if staging_children:
+        unsafe_reasons.append(".DATA/STAGING is non-empty")
+    if script_files:
+        unsafe_reasons.append(".DATA/SCRIPTS contains sbatch scripts")
+    if dangling_training:
+        unsafe_reasons.append("dangling training staging directories exist")
+    if dangling_models or has_model_iteration_staging:
+        unsafe_reasons.append("dangling model staging directories exist")
+
+    for version in tv:
+        try:
+            verify_committed_training_version(
+                campaign,
+                int(version),
+                training_dir_name=training_dir_name,
+            )
+        except Exception as exc:
+            unsafe_reasons.append(
+                "committed training version "
+                + str(version)
+                + " manifest invalid: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:160]
+            )
+    for version in mv:
+        try:
+            verify_committed_model_version(
+                campaign,
+                int(version),
+                models_dir_name=models_dir_name,
+            )
+        except Exception as exc:
+            unsafe_reasons.append(
+                "committed model version "
+                + str(version)
+                + " manifest invalid: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:160]
+            )
+
+    #build the recovered state
+    if existing is not None:
+        #Remeber: In v1, these
+        #were silently dropped on reconcile, wiping the alpha-trend
+        # history (forcing STOP_CHECK to rebuild) and the cached
+       # reference scales (forcing recompute regardless of refresh policy).
+        recovered = CampaignState(
+            iteration=existing.iteration,
+            max_iterations=existing.max_iterations,
+            phase=existing.phase,
+            pending_jobs={},
+            training_set_version=existing.training_set_version,
+            validation_set_version=existing.validation_set_version,
+            models_version=existing.models_version,
+            last_acquisition_alpha0=existing.last_acquisition_alpha0,
+            stop_streak=existing.stop_streak,
+            shutdown_requested=False,
+            # cached GP reference scales (so we don't recompute on resume):
+            reference_scales=existing.reference_scales,
+            reference_scales_iteration=existing.reference_scales_iteration,
+            # alpha trend across iterations (drives the stop check):
+            alpha_history=list(existing.alpha_history),
+            # anti-overlap diagnostic + sacct stale-job streak counters:
+            last_n_anti_overlap_flagged=existing.last_n_anti_overlap_flagged,
+            sacct_empty_streak=dict(existing.sacct_empty_streak),
+            campaign_uid=existing.campaign_uid,
+            campaign_started_iso=existing.campaign_started_iso,
+        )
+    else:
+        recovered = fresh_campaign_state()
+        # a corrupt-but-readable state.json still carries its identity; keep it
+        # so recovery does not silently start a brand-new campaign.
+        if salvaged_uid:
+            recovered.campaign_uid = str(salvaged_uid)
+            if salvaged_started:
+                recovered.campaign_started_iso = str(salvaged_started)
+
+    # reconcile against committed artefacts
+    if tv:
+        max_tv = max(tv)
+        if recovered.training_set_version < max_tv:
+            notes.append(
+                "training_set_version raised from " + str(recovered.training_set_version)
+                + " to " + str(max_tv) + " based on committed " + training_dir_name
+            )
+        recovered.training_set_version = max(recovered.training_set_version, max_tv)
+    if mv:
+        max_mv = max(mv)
+        if recovered.models_version < max_mv:
+            notes.append(
+                "models_version raised from " + str(recovered.models_version)
+                + " to " + str(max_mv) + " based on committed " + models_dir_name
+            )
+        recovered.models_version = max(recovered.models_version, max_mv)
+
+    # choose a safe re-entry phase. If we have NOTHING committed, start at
+    #  INIT; otherwise rewind to STOP_CHECK so the next tick decides whether
+    # to loop or terminate.
+    if not tv and not mv and not existing_loaded and unsafe_reasons and not allow_fresh_init_on_nonempty:
+        recovered.phase = CampaignPhase.HALTED
+        notes.append(
+            "non-empty campaign with no valid state.json; proposed HALTED instead of fresh INIT"
+        )
+        for reason in unsafe_reasons:
+            notes.append("unsafe recovery reason: " + reason)
+        if active_intents:
+            latest = active_intents[-1]
+            try:
+                recovered.phase = CampaignPhase(str(latest.get("phase")))
+                recovered.iteration = int(latest.get("iteration"))
+                notes.append(
+                    "active submission intent selected re-entry phase "
+                    + recovered.phase.value
+                    + " iteration "
+                    + str(recovered.iteration)
+                )
+            except Exception:
+                recovered.phase = CampaignPhase.HALTED
+    elif not tv and not mv and not existing_loaded:
+        recovered.phase = CampaignPhase.INIT
+        notes.append("no committed iterations; re-entry at INIT")
+    else:
+        recovered.phase = CampaignPhase.STOP_CHECK
+        notes.append("re-entry at STOP_CHECK (next tick decides loop/terminate)")
+    recovered.pending_jobs = {}
+    recovered.shutdown_requested = False
+
+    return ReconciliationReport(
+        proposed_state=recovered,
+        committed_training_versions=tv,
+        committed_model_versions=mv,
+        last_phase_in_journal=last_phase,
+        last_iteration_in_journal=last_iter,
+        notes=notes,
+        existing_state_loaded=existing_loaded,
+        unsafe_reasons=unsafe_reasons,
+        active_submission_intents=active_intents,
+    )
+
+
+
+def write_proposed_state(
+    campaign_dir: Union[str, Path],
+    report: ReconciliationReport,
+    *,
+    data_subdir: Union[str, Path] = Path(".DATA") / "ACTIVE_LEARNING",
+) -> Path:
+    """Write the proposed state to <state_path>.proposed and return the
+    path. The operator promotes it manually via mv state.json.proposed
+    state.json after reviewing."""
+    target = (
+        Path(campaign_dir) / data_subdir / (DEFAULT_STATE_FILENAME + RECONCILE_SUFFIX)
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    write_state(target, report.proposed_state)
+    return target
+
+
+

@@ -1,0 +1,203 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, List, Sequence, Tuple, Union
+
+import numpy as np
+from ichor.core.atoms import Atom, Atoms
+from ichor.core.files.xyz import Trajectory, XYZ
+
+
+ArrayLikePath = Union[str, Path]
+
+
+@dataclass(frozen=True)
+class Neighbour:
+    index: int
+    atoms: Atoms
+    aligned_distance: float
+
+
+
+def load_seed_atoms(seed: Union[ArrayLikePath, XYZ, Atoms]) -> Atoms:
+    if isinstance(seed, Atoms):
+        return seed.copy()
+    if isinstance(seed, XYZ):
+        return seed.atoms.copy()
+    seed_path = Path(seed)
+    xyz = XYZ(seed_path)
+    xyz.read()
+    return xyz.atoms.copy()
+
+
+
+def load_trajectory(trajectory: Union[ArrayLikePath, Trajectory, Sequence[Atoms]]) -> List[Atoms]:
+    if isinstance(trajectory, Trajectory):
+        return [atoms.copy() for atoms in trajectory]
+    if isinstance(trajectory, (list, tuple)) and trajectory and isinstance(trajectory[0], Atoms):
+        return [atoms.copy() for atoms in trajectory]
+    traj = Trajectory(Path(trajectory))
+    traj.read()
+    return [atoms.copy() for atoms in traj]
+
+
+
+def atoms_to_coordinates(atoms: Atoms) -> np.ndarray:
+    return np.asarray(atoms.coordinates, dtype=float)
+
+
+
+def coordinates_to_atoms(template: Atoms, coordinates: np.ndarray) -> Atoms:
+    """Build a new Atoms with same atom identities as 'template' but new
+    coordinates. Use Atom.from_atom() to preserve per-atom state
+    (index, parent, units) that the legacy `Atom(type, x, y, z)` constructor
+    silently dropped. Critical for any flow where the perturbed geometry
+    feeds back into an ALF / index-aware downstream (the per-mode FD stencils
+    in acquisition.py do exactly this on every call).
+    """
+    new_atoms = Atoms()
+    coordinates = np.asarray(coordinates, dtype=float)
+    for atom, coord in zip(template, coordinates):
+        new_atom = Atom.from_atom(atom)
+        # x/y/z are read-only properties; mutate the backing ndarray.
+        new_atom.coordinates = np.array(
+            [float(coord[0]), float(coord[1]), float(coord[2])], dtype=float,
+        )
+        new_atoms.add(new_atom)
+    return new_atoms
+
+
+
+def copy_atoms_with_flat_displacement(template: Atoms, displacement_flat: np.ndarray) -> Atoms:
+    coords = atoms_to_coordinates(template).reshape(-1) + np.asarray(displacement_flat, dtype=float)
+    return coordinates_to_atoms(template, coords.reshape((-1, 3)))
+
+
+
+def mass_vector(atoms: Atoms) -> np.ndarray:
+    masses = np.asarray(atoms.masses, dtype=float)
+    return np.repeat(masses, 3)
+
+
+
+def _weighted_centroid(coords: np.ndarray, weights: np.ndarray | None) -> np.ndarray:
+    if weights is None:
+        return np.mean(coords, axis=0)
+    w = np.asarray(weights, dtype=float).reshape(-1, 1)
+    return np.sum(w * coords, axis=0) / np.sum(w)
+
+
+
+def kabsch_align(reference: np.ndarray, mobile: np.ndarray, weights: np.ndarray | None = None) -> np.ndarray:
+    """Return 'mobile' rigidly aligned to 'reference' using a weighted Kabsch fit."""
+    ref = np.asarray(reference, dtype=float)
+    mob = np.asarray(mobile, dtype=float)
+    if ref.shape != mob.shape or ref.ndim != 2 or ref.shape[1] != 3:
+        raise ValueError("reference and mobile must both be shaped (n_atoms, 3)")
+
+    ref_centroid = _weighted_centroid(ref, weights)
+    mob_centroid = _weighted_centroid(mob, weights)
+    ref0 = ref - ref_centroid
+    mob0 = mob - mob_centroid
+
+    if weights is None:
+        cov = mob0.T @ ref0
+    else:
+        w = np.asarray(weights, dtype=float).reshape(-1, 1)
+        cov = (w * mob0).T @ ref0
+
+    u, _, vt = np.linalg.svd(cov)
+    rot = vt.T @ u.T
+    if np.linalg.det(rot) < 0.0:
+        vt[-1, :] *= -1.0
+        rot = vt.T @ u.T
+    aligned = mob0 @ rot + ref_centroid
+    return aligned
+
+
+
+def aligned_mass_weighted_distance(reference: Atoms, mobile: Atoms) -> float:
+    ref = atoms_to_coordinates(reference)
+    mob = atoms_to_coordinates(mobile)
+    masses = np.asarray(reference.masses, dtype=float)
+    aligned = kabsch_align(ref, mob, weights=masses)
+    diff = aligned - ref
+    m = mass_vector(reference)
+    return float(np.sqrt(np.dot(m, diff.reshape(-1) ** 2)))
+
+
+
+def aligned_mass_weighted_displacement(reference: Atoms, mobile: Atoms) -> np.ndarray:
+    ref = atoms_to_coordinates(reference)
+    mob = atoms_to_coordinates(mobile)
+    masses = np.asarray(reference.masses, dtype=float)
+    aligned = kabsch_align(ref, mob, weights=masses)
+    diff = aligned - ref
+    return np.sqrt(mass_vector(reference)) * diff.reshape(-1)
+
+
+
+def select_local_neighbours(
+    seed_atoms: Atoms,
+    trajectory,
+    max_neighbours: int,
+    deduplicate_rmsd: float = 1.0e-3,
+) -> List[Neighbour]:
+    """Select a local neighbourhood around the seed from a trajectory.
+
+    Neighbours are ranked by aligned mass-weighted distance. Near-duplicate
+    frames are thinned by an aligned RMSD threshold to avoid covariance
+    estimates dominated by temporally adjacent copies of the same structure.
+
+    'trajectory' may be either:
+
+    * a plain 'Sequence[Atoms]' -- the historical contract. The
+      'Neighbour.index' returned is simply the enumeration position
+      within that sequence (transient, not stable across sessions).
+    * any object that exposes 'frame(frame_id)' + 'frame_ids()'
+      duck-typed methods (e.g. 'ichor.hpc.active_learning.acquisition.
+      trajectory_pool.TrajectoryPool'). When given such an object, the
+      returned 'Neighbour.index' is the **stable frame_id** from the
+      pool, suitable for persistence in provenance ledgers / journal
+      events.
+
+    The duck-typing keeps 'ichor.core' free of an 'ichor.hpc' import.
+    """
+    #Build the (frame_id, atoms) pair generator from whichever form was passed.
+    if hasattr(trajectory, "frame") and hasattr(trajectory, "frame_ids"):
+        pairs = ((int(fid), trajectory.frame(fid)) for fid in trajectory.frame_ids())
+    else:
+        pairs = ((int(idx), atoms) for idx, atoms in enumerate(trajectory))
+
+    ranked: List[Neighbour] = []
+    for frame_id, atoms in pairs:
+        ranked.append(
+            Neighbour(
+                index=frame_id,
+                atoms=atoms.copy(),
+                aligned_distance=aligned_mass_weighted_distance(seed_atoms, atoms),
+            )
+        )
+    ranked.sort(key=lambda item: item.aligned_distance)
+
+    selected: List[Neighbour] = []
+    selected_coords: List[np.ndarray] = []
+    ref_coords = atoms_to_coordinates(seed_atoms)
+    masses = np.asarray(seed_atoms.masses, dtype=float)
+    for item in ranked:
+        aligned = kabsch_align(ref_coords, atoms_to_coordinates(item.atoms), weights=masses)
+        if selected_coords:
+            is_duplicate = False
+            for coords in selected_coords:
+                rmsd = np.sqrt(np.mean(np.sum((aligned - coords) ** 2, axis=1)))
+                if rmsd < deduplicate_rmsd:
+                    is_duplicate = True
+                    break
+            if is_duplicate:
+                continue
+        selected.append(item)
+        selected_coords.append(aligned)
+        if len(selected) >= max_neighbours:
+            break
+    return selected

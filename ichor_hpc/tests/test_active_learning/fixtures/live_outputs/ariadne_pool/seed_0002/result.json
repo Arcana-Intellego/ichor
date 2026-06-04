@@ -1,0 +1,62 @@
+{
+  "initial_coordinates": [
+    [
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.96,
+      0.0,
+      0.0
+    ],
+    [
+      -0.24,
+      0.93,
+      0.0
+    ]
+  ],
+  "final_coordinates": [
+    [
+      0.01,
+      0.0,
+      0.0
+    ],
+    [
+      0.96,
+      0.01,
+      0.0
+    ],
+    [
+      -0.24,
+      0.93,
+      0.01
+    ]
+  ],
+  "atom_types": [
+    "O",
+    "H",
+    "H"
+  ],
+  "alpha_trajectory": [
+    0.42,
+    1.05,
+    1.83,
+    2.13
+  ],
+  "alpha_initial": 0.42,
+  "alpha_final": 2.13,
+  "grad_norm_trajectory": [
+    0.5,
+    0.3,
+    0.15,
+    0.08
+  ],
+  "n_evaluations": 227,
+  "return_code": 0,
+  "wall_seconds": 19.4,
+  "fell_back_to_ds": false,
+  "rigid_force_clamps": 0,
+  "mock": false,
+  "whitened_distance_final": 12.0
+}

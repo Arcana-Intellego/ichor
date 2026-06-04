@@ -1,0 +1,65 @@
+venv/
+.vscode/
+.DS_Store
+*.sh
+*.csv
+wily*
+rmsd*
+*.log
+.DATA/
+makeSets.py
+*.code-workspace
+__pycache__/
+periodic_kernel_implementation_testing.py
+ichor.egg-info/
+debug/
+*.pyc
+*.inp
+ichor_cli/ichor_cli.egg-info/PKG-INFO
+ichor_cli/ichor_cli.egg-info/SOURCES.txt
+ichor_cli/ichor_cli.egg-info/top_level.txt
+ichor_cli/ichor_cli.egg-info/dependency_links.txt
+ichor/ichor_lib.egg-info/dependency_links.txt
+ichor/ichor_lib.egg-info/PKG-INFO
+ichor/ichor_lib.egg-info/SOURCES.txt
+ichor/ichor_lib.egg-info/top_level.txt
+ichor_lib.egg-info
+.idea
+*PKG-INFO*
+SOURCES.txt
+top_level.txt
+dependency_links.txt
+requires.txt
+dist
+*venv*
+*egg-info*
+test.*
+.pytest_cache
+.pytest-tmp*/
+output.txt
+docs/build
+Dockerfile
+
+# Active learning daemon runtime artifacts:
+#
+# .DATA/ covers state.json, journal.ndjson,
+# recent_seeds.json, seed_frame_id_index.json, and the various
+# *.lock files since the daemon writes them all under
+# <campaign>/.DATA/ACTIVE_LEARNING/.
+# The patterns below cover the
+# campaign root subtrees that hold committed iterations and the
+# per-pointdir sidecars that live outside .DATA/.
+
+3_DIVERSITY_SAMPLING/
+5_TRAINING/
+6_TRAINED_MODELS/
+7_ACTIVE_LEARNING/
+.provenance.json
+.provenance.lock
+daemon.lock
+daemon.pid
+.__ichor.lock
+
+# Python tooling caches
+.mypy_cache/
+.ruff_cache/

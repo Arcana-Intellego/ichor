@@ -1,0 +1,71 @@
+"""Persistent pointdir-level FEREBUS split ledger tests."""
+import json
+
+import pytest
+
+from ichor.hpc.active_learning.daemon.ferebus_dataset import plan_sizes
+from ichor.hpc.active_learning.daemon.ferebus_split_ledger import (
+    ensure_split_assignments,
+    ledger_path,
+)
+
+
+def _names(n):
+    return ["POINT_" + str(i).zfill(4) + ".pointdir" for i in range(n)]
+
+
+def test_initial_split_ledger_assigns_exact_planned_counts(tmp_path):
+    names = _names(10)
+    result = ensure_split_assignments(
+        tmp_path,
+        names,
+        training_version=0,
+        fractions=(0.6, 0.2, 0.2),
+    )
+
+    expected = plan_sizes(len(names), (0.6, 0.2, 0.2))
+    assert result["counts"] == {
+        "train": expected[0],
+        "int_val": expected[1],
+        "ext_val": expected[2],
+    }
+    assert result["row_ids"]["train"] == [0, 1, 2, 3, 4, 5]
+    assert result["row_ids"]["int_val"] == [6, 7]
+    assert result["row_ids"]["ext_val"] == [8, 9]
+
+
+def test_existing_split_ledger_assignments_never_change(tmp_path):
+    first_names = _names(10)
+    first = ensure_split_assignments(
+        tmp_path,
+        first_names,
+        training_version=0,
+        fractions=(0.6, 0.2, 0.2),
+    )
+    first_assignments = dict(first["assignments"])
+
+    grown_names = _names(20)
+    second = ensure_split_assignments(
+        tmp_path,
+        grown_names,
+        training_version=1,
+        fractions=(0.6, 0.2, 0.2),
+    )
+
+    for name, record in first_assignments.items():
+        assert second["assignments"][name]["split"] == record["split"]
+    assert second["counts"] == {"train": 12, "int_val": 4, "ext_val": 4}
+    assert second["row_ids"]["train"][:6] == [0, 1, 2, 3, 4, 5]
+    payload = json.loads(ledger_path(tmp_path).read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1
+    assert len(payload["assignments"]) == 20
+
+
+def test_split_ledger_rejects_duplicate_pointdir_names(tmp_path):
+    with pytest.raises(ValueError, match="duplicate"):
+        ensure_split_assignments(
+            tmp_path,
+            ["POINT_0000.pointdir", "POINT_0000.pointdir"],
+            training_version=0,
+            fractions=(0.6, 0.2, 0.2),
+        )

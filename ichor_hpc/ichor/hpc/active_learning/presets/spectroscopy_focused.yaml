@@ -1,0 +1,51 @@
+# Spectroscopy-focused preset.
+#
+# WARNING: this preset is NOT yet calibrated against any benchmark dataset.
+# Treat the values as best effort starting points based on heuristics; 
+# the calibration record below will be populated once we have
+# real data.
+#
+# Calibration status: PENDING
+#
+# Downstream goal: ACCURACY -- train an IQA MLP whose MD trajectories reproduce vibrational
+# spectra (peak positions, widths, intensities) and velocity-autocorrelated
+# (VACF) metrics.
+#
+# Notes on the choices made:
+#   * neighbour_count is raised so more low-frequency modes are recoverable
+#     from the local subspace PCA
+#   * max_subspace_dim is bumped to 10; this REQUIRES gradient.mode =
+#     active_fd (cartesian_fd would explode the FD cost on a 30-DOF system;
+#     CampaignConfig.to_acquisition_config enforces this)
+#   * mode_weighting_policy = inverse_frequency biases the aggregation
+#     toward the low-frequency modes where VACF peaks concentrate
+#   * lambda_frequency / lambda_anharmonic are raised
+#   * stencils.step_scale is reduced for cleaner cubic estimates
+#   * stencils.autotune_from_cubic is enabled
+#
+# CAVEAT TO REMEMBER: inverse_frequency weighting improves peak POSITIONS,
+# not intensities. The TotalEnergyPosterior sums per-atom IQA posterior means
+# under an independence approximation; transition dipole derivatives are
+# not in the posterior. A future extension to something like TotalEnergyPosterior to
+# include multipole moments would be required for intensity targeting.
+
+schema_version: 2
+
+acquisition:
+  subspace:
+    neighbour_count: 80
+    max_subspace_dim: 10
+    mode_weighting_policy: inverse_frequency
+  gradient:
+    mode: active_fd
+  weights:
+    lambda_force: 1.0
+    lambda_frequency: 2.5
+    lambda_anharmonic: 1.8
+    lambda_energy: 0.25
+    lambda_distance: 1.0
+  stencils:
+    step_scale: 0.25
+    autotune_from_cubic: true
+
+

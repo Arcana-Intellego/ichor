@@ -1,0 +1,26 @@
+# Tuned for a fast walkthrough (~30s end-to-end). Two iterations,
+# tiny seed counts, small training batch. Real campaigns would lift these
+# defaults substantially (see ichor_hpc/.../presets/ for spectroscopy and
+# thermodynamics-focused starting points).
+
+schema_version: 2
+system_name: WATER_TETRAMER
+
+# Iteration loop.
+max_iterations: 2
+poll_interval_seconds: 1
+
+# Initial sub-sampling.
+initial_train_size: 4
+initial_val_size: 2
+
+# Batch sizing per iteration.
+batch_sizing:
+  policy: linear
+  floor: 2
+  cap: 4
+
+# Seeds per ARIADNE_ARRAY task.
+seed_selection:
+  n_seeds_per_iteration: 2
+  bulk_fraction: 0.5

@@ -1,0 +1,5 @@
+[ferebus]
+kernel = "rbfc_per"
+loss = "huber"
+nagents = 20
+maxiter = 200

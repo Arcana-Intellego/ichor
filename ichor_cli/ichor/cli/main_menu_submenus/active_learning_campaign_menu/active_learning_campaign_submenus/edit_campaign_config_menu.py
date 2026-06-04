@@ -1,0 +1,662 @@
+"""Edit campaign config menu -- schema v2.
+
+Field-grouped editor over a single CampaignConfig instance held in module
+state. The grouping mirrors the nested block structure of schema v2: one
+menu item per top-level block plus a separate submenu tree for deeper
+acquisition surface.
+"""
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+import ichor.cli.global_menu_variables
+import ichor.hpc.global_variables
+from consolemenu.items import FunctionItem, SubmenuItem
+from ichor.cli.console_menu import ConsoleMenu, add_items_to_menu
+from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+    CampaignSelectionError,
+    print_campaign_selection_error,
+    selected_campaign_dir,
+)
+from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_submenus.edit_campaign_config_submenus import (
+    edit_ariadne_block_menu,
+    EDIT_ARIADNE_BLOCK_MENU_DESCRIPTION,
+)
+from ichor.cli.menu_description import MenuDescription
+from ichor.cli.menu_options import MenuOptions
+from ichor.cli.useful_functions import (
+    user_input_bool,
+    user_input_float,
+    user_input_free_flow,
+    user_input_int,
+    user_input_restricted,
+)
+from ichor.hpc.active_learning.config import (
+    CampaignConfig,
+    ConfigValidationError,
+    VALID_BATCH_POLICIES,
+    VALID_DESCRIPTORS,
+    VALID_GRADIENT_MODES,
+    VALID_GRADIENT_PARALLEL_BACKENDS,
+    VALID_MODE_WEIGHTING_POLICIES,
+    VALID_SPLITS,
+    VALID_WARMSTART,
+)
+
+
+EDIT_CAMPAIGN_CONFIG_MENU_DESCRIPTION = MenuDescription(
+    "Edit Campaign Config Menu",
+    subtitle=(
+        "Edit campaign.yaml block-by-block. Changes accumulate in memory; "
+        "use Save to disk to validate and write the yaml. Load from disk "
+        "discards pending edits and re-reads the file.\n"
+    ),
+)
+
+
+_campaign_config: CampaignConfig = CampaignConfig()
+_loaded_from_path: Optional[Path] = None
+
+
+def get_campaign_config() -> CampaignConfig:
+    return _campaign_config
+
+
+def _replace_campaign_config(cfg, loaded_from):
+    global _campaign_config, _loaded_from_path
+    _campaign_config = cfg
+    _loaded_from_path = loaded_from
+    _sync_options_from_config()
+
+
+@dataclass
+class EditCampaignConfigMenuOptions(MenuOptions):
+    loaded_from: str = "defaults"
+    system_name: str = "SYSTEM"
+    max_iterations: int = 50
+    n_seeds_per_iteration: int = 50
+    phase_b_descriptor: str = "hybrid_alf_rmsd"
+    split_strategy: str = "stratified_with_holdout"
+    ferebus_warmstart: str = "adaptive"
+    ferebus_kernel: str = "rbfc_per"
+    acquisition_gradient_mode: str = "cartesian_fd"
+    acquisition_max_subspace_dim: int = 6
+
+
+edit_campaign_config_menu_options = EditCampaignConfigMenuOptions()
+
+
+def _sync_options_from_config():
+    edit_campaign_config_menu_options.loaded_from = (
+        str(_loaded_from_path) if _loaded_from_path is not None else "defaults"
+    )
+    edit_campaign_config_menu_options.system_name = _campaign_config.system_name
+    edit_campaign_config_menu_options.max_iterations = _campaign_config.max_iterations
+    edit_campaign_config_menu_options.n_seeds_per_iteration = (
+        _campaign_config.seed_selection.n_seeds_per_iteration
+    )
+    edit_campaign_config_menu_options.phase_b_descriptor = _campaign_config.phase_b.descriptor
+    edit_campaign_config_menu_options.split_strategy = _campaign_config.split.strategy
+    edit_campaign_config_menu_options.ferebus_warmstart = _campaign_config.ferebus.warmstart
+    edit_campaign_config_menu_options.ferebus_kernel = _campaign_config.ferebus.kernel
+    edit_campaign_config_menu_options.acquisition_gradient_mode = (
+        _campaign_config.acquisition.gradient.mode
+    )
+    edit_campaign_config_menu_options.acquisition_max_subspace_dim = (
+        _campaign_config.acquisition.subspace.max_subspace_dim
+    )
+
+
+def _campaign_yaml_path():
+    return selected_campaign_dir() / "campaign.yaml"
+
+
+def _pause():
+    user_input_free_flow("Press enter to return to the menu: ", "")
+
+
+class EditCampaignConfigFunctions:
+    @staticmethod
+    def show_current_config():
+        import json
+        print("Loaded from: " + edit_campaign_config_menu_options.loaded_from)
+        print(json.dumps(_campaign_config.to_dict(), indent=2, sort_keys=True))
+        _pause()
+
+    @staticmethod
+    def load_from_disk():
+        try:
+            yaml_path = _campaign_yaml_path()
+        except CampaignSelectionError as exc:
+            print_campaign_selection_error(exc)
+            _pause()
+            return
+        if not yaml_path.exists():
+            print("No campaign.yaml at " + str(yaml_path) + " -- nothing to load.")
+            _pause()
+            return
+        try:
+            cfg = CampaignConfig.from_yaml(yaml_path)
+        except Exception as exc:
+            print("Failed to load " + str(yaml_path) + ": " + str(exc))
+            _pause()
+            return
+        _replace_campaign_config(cfg, loaded_from=yaml_path)
+        ichor.hpc.global_variables.LOGGER.info(
+            "Campaign config loaded from " + str(yaml_path)
+        )
+        print("Loaded.")
+        _pause()
+
+    @staticmethod
+    def reset_to_defaults():
+        _replace_campaign_config(CampaignConfig(), loaded_from=None)
+        ichor.hpc.global_variables.LOGGER.info("Campaign config reset to defaults")
+        print("Reset.")
+        _pause()
+
+    @staticmethod
+    def validate_current_config():
+        try:
+            _campaign_config._validate()
+        except ConfigValidationError as exc:
+            print("Validation failed.")
+            print("  " + str(exc))
+            _pause()
+            return
+        print("Current config validates.")
+        _pause()
+
+    @staticmethod
+    def edit_campaign_identity():
+        _campaign_config.system_name = user_input_free_flow(
+            "system_name: ", _campaign_config.system_name,
+        )
+        _sync_options_from_config()
+
+    @staticmethod
+    def edit_trajectory_pool():
+        _campaign_config.trajectory_pool.source_path = user_input_free_flow(
+            "trajectory_pool.source_path: ",
+            _campaign_config.trajectory_pool.source_path,
+        )
+        _sync_options_from_config()
+
+    @staticmethod
+    def edit_iteration_control():
+        _campaign_config.max_iterations = user_input_int(
+            "max_iterations: ", _campaign_config.max_iterations,
+        )
+        _campaign_config.poll_interval_seconds = user_input_int(
+            "poll_interval_seconds: ", _campaign_config.poll_interval_seconds,
+        )
+        _campaign_config.poll_interval_idle_seconds = user_input_int(
+            "poll_interval_idle_seconds: ", _campaign_config.poll_interval_idle_seconds,
+        )
+        _campaign_config.poll_sacct_empty_max_ticks = user_input_int(
+            "poll_sacct_empty_max_ticks (0 disables empty-sacct escalation): ",
+            _campaign_config.poll_sacct_empty_max_ticks,
+        )
+        _sync_options_from_config()
+
+    @staticmethod
+    def edit_resources():
+        r = _campaign_config.resources
+        r.partition = user_input_free_flow("resources.partition: ", r.partition)
+        r.walltime_hours = user_input_int(
+            "resources.walltime_hours: ", r.walltime_hours,
+        )
+        r.mem_per_cpu = user_input_free_flow(
+            "resources.mem_per_cpu (SLURM style, e.g. 4G): ", r.mem_per_cpu,
+        )
+        r.cpus_per_task = user_input_int(
+            "resources.cpus_per_task: ", r.cpus_per_task,
+        )
+        r.ntasks = user_input_int("resources.ntasks: ", r.ntasks)
+        r.ariadne_cpus_per_task = user_input_int(
+            "resources.ariadne_cpus_per_task: ", r.ariadne_cpus_per_task,
+        )
+        chosen = user_input_restricted(
+            sorted(VALID_GRADIENT_PARALLEL_BACKENDS),
+            "resources.gradient_parallel_backend: ",
+            r.gradient_parallel_backend,
+        )
+        if chosen is not None:
+            r.gradient_parallel_backend = chosen
+        _sync_options_from_config()
+
+    @staticmethod
+    def edit_gaussian():
+        g = _campaign_config.gaussian
+        g.method = user_input_free_flow("gaussian.method: ", g.method)
+        g.basis_set = user_input_free_flow("gaussian.basis_set: ", g.basis_set)
+        g.charge = user_input_int("gaussian.charge: ", g.charge)
+        g.spin_multiplicity = user_input_int(
+            "gaussian.spin_multiplicity: ", g.spin_multiplicity,
+        )
+        g.extra_keywords = user_input_free_flow(
+            "gaussian.extra_keywords: ", g.extra_keywords,
+        )
+        g.nproc = user_input_int("gaussian.nproc: ", g.nproc)
+        g.mem = user_input_free_flow(
+            "gaussian.mem (Gaussian style, e.g. 8GB): ", g.mem,
+        )
+        _sync_options_from_config()
+
+    @staticmethod
+    def edit_initial_subsample():
+        _campaign_config.initial_train_size = user_input_int(
+            "initial_train_size: ", _campaign_config.initial_train_size,
+        )
+        _campaign_config.initial_val_size = user_input_int(
+            "initial_val_size: ", _campaign_config.initial_val_size,
+        )
+        _sync_options_from_config()
+
+    @staticmethod
+    def edit_batch_sizing():
+        b = _campaign_config.batch_sizing
+        chosen = user_input_restricted(
+            sorted(VALID_BATCH_POLICIES), "batch_sizing.policy: ", b.policy,
+        )
+        if chosen is not None:
+            b.policy = chosen
+        b.floor = user_input_int("batch_sizing.floor: ", b.floor)
+        b.cap = user_input_int("batch_sizing.cap: ", b.cap)
+        _sync_options_from_config()
+
+    @staticmethod
+    def edit_seed_selection():
+        s = _campaign_config.seed_selection
+        s.n_seeds_per_iteration = user_input_int(
+            "seed_selection.n_seeds_per_iteration: ", s.n_seeds_per_iteration,
+        )
+        s.bulk_fraction = user_input_float(
+            "seed_selection.bulk_fraction (0.0-1.0): ", s.bulk_fraction,
+        )
+        _sync_options_from_config()
+
+    @staticmethod
+    def edit_anti_overlap():
+        a = _campaign_config.anti_overlap
+        a.skip_training_seeds = user_input_bool(
+            "anti_overlap.skip_training_seeds: ", a.skip_training_seeds,
+        )
+        a.recent_seeds_cooldown = user_input_int(
+            "anti_overlap.recent_seeds_cooldown: ", a.recent_seeds_cooldown,
+        )
+        a.min_post_ariadne_whitened_distance = user_input_float(
+            "anti_overlap.min_post_ariadne_whitened_distance: ",
+            a.min_post_ariadne_whitened_distance,
+        )
+        a.max_post_ariadne_whitened_distance = user_input_float(
+            "anti_overlap.max_post_ariadne_whitened_distance: ",
+            a.max_post_ariadne_whitened_distance,
+        )
+        a.enforce_post_ariadne = user_input_bool(
+            "anti_overlap.enforce_post_ariadne: ", a.enforce_post_ariadne,
+        )
+        _sync_options_from_config()
+
+    @staticmethod
+    def edit_phase_b():
+        pb = _campaign_config.phase_b
+        chosen = user_input_restricted(
+            sorted(VALID_DESCRIPTORS), "phase_b.descriptor: ", pb.descriptor,
+        )
+        if chosen is not None:
+            pb.descriptor = chosen
+        pb.beta = user_input_float("phase_b.beta (0.0-1.0): ", pb.beta)
+        pb.min_separation = user_input_float(
+            "phase_b.min_separation: ", pb.min_separation,
+        )
+        _sync_options_from_config()
+
+    @staticmethod
+    def edit_split():
+        s = _campaign_config.split
+        chosen = user_input_restricted(
+            sorted(VALID_SPLITS), "split.strategy: ", s.strategy,
+        )
+        if chosen is not None:
+            s.strategy = chosen
+        s.train_fraction = user_input_float(
+            "split.train_fraction (0.0-1.0): ", s.train_fraction,
+        )
+        s.val_mid_fraction = user_input_float(
+            "split.val_mid_fraction (0.0-1.0): ", s.val_mid_fraction,
+        )
+        s.high_holdout_fraction = user_input_float(
+            "split.high_holdout_fraction (0.0-1.0): ", s.high_holdout_fraction,
+        )
+        _sync_options_from_config()
+
+    @staticmethod
+    def edit_ferebus():
+        f = _campaign_config.ferebus
+        chosen = user_input_restricted(
+            sorted(VALID_WARMSTART), "ferebus.warmstart: ", f.warmstart,
+        )
+        if chosen is not None:
+            f.warmstart = chosen
+        f.warmstart_streak = user_input_int(
+            "ferebus.warmstart_streak: ", f.warmstart_streak,
+        )
+        f.kernel = user_input_free_flow(
+            "ferebus.kernel (e.g. rbfc_per, rbf_per): ", f.kernel,
+        )
+        f.loss = user_input_free_flow(
+            "ferebus.loss (e.g. huber, mse, mae): ", f.loss,
+        )
+        f.nagents = user_input_int("ferebus.nagents: ", f.nagents)
+        f.maxiter = user_input_int("ferebus.maxiter: ", f.maxiter)
+        f.is_constant_noise = user_input_bool(
+            "ferebus.is_constant_noise: ", f.is_constant_noise,
+        )
+        f.scaling = user_input_bool("ferebus.scaling: ", f.scaling)
+        f.full_ARD = user_input_bool("ferebus.full_ARD: ", f.full_ARD)
+        raw_props = user_input_free_flow(
+            "ferebus.properties (comma-separated, e.g. iqa,q00): ",
+            ",".join(f.properties),
+        )
+        f.properties = [p.strip() for p in str(raw_props).split(",") if p.strip()]
+        f.train_fraction = user_input_float(
+            "ferebus.train_fraction: ", f.train_fraction,
+        )
+        f.int_val_fraction = user_input_float(
+            "ferebus.int_val_fraction: ", f.int_val_fraction,
+        )
+        f.ext_val_fraction = user_input_float(
+            "ferebus.ext_val_fraction: ", f.ext_val_fraction,
+        )
+        _sync_options_from_config()
+
+    @staticmethod
+    def edit_acquisition_core():
+        a = _campaign_config.acquisition
+        a.property_name = user_input_free_flow(
+            "acquisition.property_name: ", a.property_name,
+        )
+        a.use_scaled_posterior_covariance = user_input_bool(
+            "acquisition.use_scaled_posterior_covariance: ",
+            a.use_scaled_posterior_covariance,
+        )
+        a.allow_uniform_posterior_fallback = user_input_bool(
+            "acquisition.allow_uniform_posterior_fallback: ",
+            a.allow_uniform_posterior_fallback,
+        )
+        _sync_options_from_config()
+
+    @staticmethod
+    def edit_robustness():
+        _campaign_config.failure_threshold_fraction = user_input_float(
+            "failure_threshold_fraction (0.0-1.0): ",
+            _campaign_config.failure_threshold_fraction,
+        )
+        _campaign_config.max_force_per_atom_ha_per_ang = user_input_float(
+            "max_force_per_atom_ha_per_ang (Hartree/Angstrom): ",
+            _campaign_config.max_force_per_atom_ha_per_ang,
+        )
+        _sync_options_from_config()
+
+    @staticmethod
+    def edit_acquisition_subspace():
+        sb = _campaign_config.acquisition.subspace
+        sb.neighbour_count = user_input_int(
+            "acquisition.subspace.neighbour_count: ", sb.neighbour_count,
+        )
+        sb.variance_capture = user_input_float(
+            "acquisition.subspace.variance_capture (0.0-1.0): ", sb.variance_capture,
+        )
+        sb.min_subspace_dim = user_input_int(
+            "acquisition.subspace.min_subspace_dim: ", sb.min_subspace_dim,
+        )
+        sb.max_subspace_dim = user_input_int(
+            "acquisition.subspace.max_subspace_dim: ", sb.max_subspace_dim,
+        )
+        chosen = user_input_restricted(
+            sorted(VALID_MODE_WEIGHTING_POLICIES),
+            "acquisition.subspace.mode_weighting_policy: ",
+            sb.mode_weighting_policy,
+        )
+        if chosen is not None:
+            sb.mode_weighting_policy = chosen
+        sb.canonicalise_basis = user_input_bool(
+            "acquisition.subspace.canonicalise_basis: ", sb.canonicalise_basis,
+        )
+        _sync_options_from_config()
+
+    @staticmethod
+    def edit_acquisition_weights():
+        w = _campaign_config.acquisition.weights
+        w.lambda_force = user_input_float(
+            "acquisition.weights.lambda_force: ", w.lambda_force,
+        )
+        w.lambda_frequency = user_input_float(
+            "acquisition.weights.lambda_frequency: ", w.lambda_frequency,
+        )
+        w.lambda_anharmonic = user_input_float(
+            "acquisition.weights.lambda_anharmonic: ", w.lambda_anharmonic,
+        )
+        w.lambda_energy = user_input_float(
+            "acquisition.weights.lambda_energy: ", w.lambda_energy,
+        )
+        w.lambda_distance = user_input_float(
+            "acquisition.weights.lambda_distance: ", w.lambda_distance,
+        )
+        _sync_options_from_config()
+
+    @staticmethod
+    def edit_acquisition_gradient():
+        g = _campaign_config.acquisition.gradient
+        chosen = user_input_restricted(
+            sorted(VALID_GRADIENT_MODES), "acquisition.gradient.mode: ", g.mode,
+        )
+        if chosen is not None:
+            g.mode = chosen
+        g.cartesian_step = user_input_float(
+            "acquisition.gradient.cartesian_step: ", g.cartesian_step,
+        )
+        g.active_step = user_input_float(
+            "acquisition.gradient.active_step: ", g.active_step,
+        )
+        _sync_options_from_config()
+
+    @staticmethod
+    def edit_acquisition_barrier():
+        b = _campaign_config.acquisition.barrier
+        b.use_connectivity_barrier = user_input_bool(
+            "acquisition.barrier.use_connectivity_barrier: ", b.use_connectivity_barrier,
+        )
+        b.nonbonded_clash_scale = user_input_float(
+            "acquisition.barrier.nonbonded_clash_scale: ", b.nonbonded_clash_scale,
+        )
+        b.clash_delta = user_input_float(
+            "acquisition.barrier.clash_delta: ", b.clash_delta,
+        )
+        b.clash_lambda = user_input_float(
+            "acquisition.barrier.clash_lambda: ", b.clash_lambda,
+        )
+        b.bond_lower_scale = user_input_float(
+            "acquisition.barrier.bond_lower_scale: ", b.bond_lower_scale,
+        )
+        b.bond_upper_scale = user_input_float(
+            "acquisition.barrier.bond_upper_scale: ", b.bond_upper_scale,
+        )
+        b.bond_lambda = user_input_float(
+            "acquisition.barrier.bond_lambda: ", b.bond_lambda,
+        )
+        b.energy_cap_quantile = user_input_float(
+            "acquisition.barrier.energy_cap_quantile (0.0-1.0): ", b.energy_cap_quantile,
+        )
+        b.energy_cap_lambda = user_input_float(
+            "acquisition.barrier.energy_cap_lambda: ", b.energy_cap_lambda,
+        )
+        _sync_options_from_config()
+
+    @staticmethod
+    def edit_acquisition_stencils():
+        st = _campaign_config.acquisition.stencils
+        st.step_scale = user_input_float(
+            "acquisition.stencils.step_scale: ", st.step_scale,
+        )
+        st.min_step = user_input_float(
+            "acquisition.stencils.min_step: ", st.min_step,
+        )
+        st.max_step = user_input_float(
+            "acquisition.stencils.max_step: ", st.max_step,
+        )
+        st.curvature_floor = user_input_float(
+            "acquisition.stencils.curvature_floor: ", st.curvature_floor,
+        )
+        st.softplus_scale = user_input_float(
+            "acquisition.stencils.softplus_scale: ", st.softplus_scale,
+        )
+        st.autotune_from_cubic = user_input_bool(
+            "acquisition.stencils.autotune_from_cubic: ",
+            st.autotune_from_cubic,
+        )
+        _sync_options_from_config()
+
+    @staticmethod
+    def edit_acquisition_references():
+        rs = _campaign_config.acquisition.references
+        rs.max_reference_samples = user_input_int(
+            "acquisition.references.max_reference_samples: ", rs.max_reference_samples,
+        )
+        rs.floor = user_input_float(
+            "acquisition.references.floor: ", rs.floor,
+        )
+        chosen = user_input_restricted(
+            ["every_iteration", "every_n_iterations", "never"],
+            "acquisition.references.refresh_policy: ",
+            rs.refresh_policy,
+        )
+        if chosen is not None:
+            rs.refresh_policy = chosen
+        rs.refresh_period = user_input_int(
+            "acquisition.references.refresh_period (only used by every_n_iterations): ",
+            rs.refresh_period,
+        )
+        _sync_options_from_config()
+
+    @staticmethod
+    def edit_stop():
+        st = _campaign_config.stop
+        st.alpha0_streak_threshold = user_input_float(
+            "stop.alpha0_streak_threshold: ", st.alpha0_streak_threshold,
+        )
+        st.alpha0_streak_length = user_input_int(
+            "stop.alpha0_streak_length (0 disables this rule): ",
+            st.alpha0_streak_length,
+        )
+        st.rel_alpha_improvement_min = user_input_float(
+            "stop.rel_alpha_improvement_min: ", st.rel_alpha_improvement_min,
+        )
+        st.rel_alpha_improvement_window = user_input_int(
+            "stop.rel_alpha_improvement_window (0 disables this rule): ",
+            st.rel_alpha_improvement_window,
+        )
+        st.min_iterations_before_stop = user_input_int(
+            "stop.min_iterations_before_stop: ", st.min_iterations_before_stop,
+        )
+        _sync_options_from_config()
+
+    @staticmethod
+    def edit_outlier_filter():
+        of = _campaign_config.outlier_filter
+        of.enabled = user_input_bool(
+            "outlier_filter.enabled: ", of.enabled,
+        )
+        of.energy_z_threshold = user_input_float(
+            "outlier_filter.energy_z_threshold: ", of.energy_z_threshold,
+        )
+        of.per_atom_rmsd_z_threshold = user_input_float(
+            "outlier_filter.per_atom_rmsd_z_threshold: ",
+            of.per_atom_rmsd_z_threshold,
+        )
+        _sync_options_from_config()
+
+    @staticmethod
+    def save_to_disk():
+        try:
+            _campaign_config._validate()
+        except ConfigValidationError as exc:
+            print("Validation failed; campaign.yaml NOT written.")
+            print("  " + str(exc))
+            _pause()
+            return
+        try:
+            target = _campaign_yaml_path()
+        except CampaignSelectionError as exc:
+            print_campaign_selection_error(exc)
+            _pause()
+            return
+        if not target.parent.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            _campaign_config.to_yaml(target)
+        except Exception as exc:
+            print("Failed to write " + str(target) + ": " + str(exc))
+            _pause()
+            return
+        global _loaded_from_path
+        _loaded_from_path = target
+        _sync_options_from_config()
+        ichor.hpc.global_variables.LOGGER.info(
+            "Campaign config saved to " + str(target)
+        )
+        print("Wrote " + str(target))
+        _pause()
+
+
+edit_campaign_config_menu = ConsoleMenu(
+    this_menu_options=edit_campaign_config_menu_options,
+    title=EDIT_CAMPAIGN_CONFIG_MENU_DESCRIPTION.title,
+    subtitle=EDIT_CAMPAIGN_CONFIG_MENU_DESCRIPTION.subtitle,
+    prologue_text=EDIT_CAMPAIGN_CONFIG_MENU_DESCRIPTION.prologue_description_text,
+    epilogue_text=EDIT_CAMPAIGN_CONFIG_MENU_DESCRIPTION.epilogue_description_text,
+    show_exit_option=EDIT_CAMPAIGN_CONFIG_MENU_DESCRIPTION.show_exit_option,
+)
+
+
+edit_campaign_config_menu_items = [
+    FunctionItem("Show current config", EditCampaignConfigFunctions.show_current_config),
+    FunctionItem("Load from disk", EditCampaignConfigFunctions.load_from_disk),
+    FunctionItem("Reset to defaults", EditCampaignConfigFunctions.reset_to_defaults),
+    FunctionItem("Validate current config", EditCampaignConfigFunctions.validate_current_config),
+    FunctionItem("Edit campaign identity", EditCampaignConfigFunctions.edit_campaign_identity),
+    FunctionItem("Edit trajectory_pool", EditCampaignConfigFunctions.edit_trajectory_pool),
+    FunctionItem("Edit iteration control", EditCampaignConfigFunctions.edit_iteration_control),
+    FunctionItem("Edit initial sub-sample sizes", EditCampaignConfigFunctions.edit_initial_subsample),
+    FunctionItem("Edit resources", EditCampaignConfigFunctions.edit_resources),
+    FunctionItem("Edit Gaussian block", EditCampaignConfigFunctions.edit_gaussian),
+    FunctionItem("Edit batch_sizing", EditCampaignConfigFunctions.edit_batch_sizing),
+    FunctionItem("Edit seed_selection", EditCampaignConfigFunctions.edit_seed_selection),
+    FunctionItem("Edit anti_overlap", EditCampaignConfigFunctions.edit_anti_overlap),
+    FunctionItem("Edit phase_b", EditCampaignConfigFunctions.edit_phase_b),
+    FunctionItem("Edit split", EditCampaignConfigFunctions.edit_split),
+    FunctionItem("Edit FEREBUS block", EditCampaignConfigFunctions.edit_ferebus),
+    FunctionItem("Edit robustness", EditCampaignConfigFunctions.edit_robustness),
+    FunctionItem("Edit acquisition core", EditCampaignConfigFunctions.edit_acquisition_core),
+    FunctionItem("Edit acquisition.subspace", EditCampaignConfigFunctions.edit_acquisition_subspace),
+    FunctionItem("Edit acquisition.weights", EditCampaignConfigFunctions.edit_acquisition_weights),
+    FunctionItem("Edit acquisition.gradient", EditCampaignConfigFunctions.edit_acquisition_gradient),
+    FunctionItem("Edit acquisition.barrier", EditCampaignConfigFunctions.edit_acquisition_barrier),
+    FunctionItem("Edit acquisition.stencils", EditCampaignConfigFunctions.edit_acquisition_stencils),
+    FunctionItem("Edit acquisition.references", EditCampaignConfigFunctions.edit_acquisition_references),
+    FunctionItem("Edit stop", EditCampaignConfigFunctions.edit_stop),
+    FunctionItem("Edit outlier_filter", EditCampaignConfigFunctions.edit_outlier_filter),
+    SubmenuItem(
+        EDIT_ARIADNE_BLOCK_MENU_DESCRIPTION.title,
+        edit_ariadne_block_menu,
+        edit_campaign_config_menu,
+    ),
+    FunctionItem("Save to disk", EditCampaignConfigFunctions.save_to_disk),
+]
+
+
+add_items_to_menu(edit_campaign_config_menu, edit_campaign_config_menu_items)
+
+
+_sync_options_from_config()

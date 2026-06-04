@@ -1,0 +1,21 @@
+# Balanced preset.
+#
+# This preset is the explicit default copy of CampaignConfig.
+# It exists so users can launch with --preset balanced and get the
+# documented defaults written into campaign.yaml without having to
+# write every field by hand.
+#
+# Warning! Calibration pending (uncalibrated against benchmark data;
+# treated as the dataclass-default baseline only).
+
+schema_version: 2
+
+acquisition:
+  subspace:
+    mode_weighting_policy: variance
+  weights:
+    lambda_force: 1.0
+    lambda_frequency: 1.5
+    lambda_anharmonic: 1.0
+    lambda_energy: 0.25
+    lambda_distance: 1.0
