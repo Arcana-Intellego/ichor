@@ -66,6 +66,20 @@ __all__ = [
     "LIVE_POSTPROCESS_IMPLEMENTED",
 ]
 
+DEFAULT_DAEMON_PYTHON_MODULES: List[str] = [
+    "python/3.11.3-gcccore-12.3.0",
+]
+
+DEFAULT_DAEMON_ARIADNE_RUNTIME_MODULES: List[str] = [
+    "compilers/oneapi/2024.2.0",
+    "compiler-rt tbb compiler",
+    "mkl/2024.2",
+]
+
+DEFAULT_DAEMON_RUNTIME_MODULES: List[str] = (
+    DEFAULT_DAEMON_PYTHON_MODULES + DEFAULT_DAEMON_ARIADNE_RUNTIME_MODULES
+)
+
 #  SBATCH-phase postprocess refusal guard.
 #
 #
@@ -2053,6 +2067,65 @@ def _python_executable_for_script() -> str:
     return _shell_quote(sys.executable)
 
 
+def _normalise_module_list(raw: Any, *, label: str) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        values = [raw]
+    else:
+        try:
+            values = list(raw)
+        except TypeError as exc:
+            raise BackendSubmissionError(
+                "configured " + label + " modules must be a string or list"
+            ) from exc
+    modules: List[str] = []
+    for value in values:
+        module = str(value).strip()
+        if not module:
+            continue
+        _reject_shell_control_chars("configured " + label + " module", module)
+        modules.append(module)
+    return modules
+
+
+def _configured_daemon_runtime_modules() -> List[str]:
+    """Modules loaded by daemon-owned live sbatch scripts.
+
+    Python and ARIADNE/MKL runtime modules are kept in ichor_config.yaml so a
+    CSF4 Python-module update does not require a code edit. Missing config
+    falls back to the current non-Anaconda CSF4 stack. FEREBUS is not included:
+    pyferebus writes and submits its own CSF4 script for FEREBUS phases.
+    """
+    try:
+        from ichor.hpc.global_variables import ICHOR_CONFIG, MACHINE, get_param_from_config
+        if ICHOR_CONFIG is None:
+            return list(DEFAULT_DAEMON_RUNTIME_MODULES)
+        machine = MACHINE
+        if not machine and "csf4" in ICHOR_CONFIG:
+            machine = "csf4"
+        if not machine:
+            return list(DEFAULT_DAEMON_RUNTIME_MODULES)
+        python_modules = get_param_from_config(
+            ICHOR_CONFIG, machine, "software", "python", "modules",
+            default=None,
+        )
+        ariadne_modules = get_param_from_config(
+            ICHOR_CONFIG, machine, "software", "ariadne_runtime", "modules",
+            default=None,
+        )
+    except Exception:
+        return list(DEFAULT_DAEMON_RUNTIME_MODULES)
+
+    modules = (
+        (_normalise_module_list(python_modules, label="python")
+         if python_modules is not None else list(DEFAULT_DAEMON_PYTHON_MODULES))
+        + (_normalise_module_list(ariadne_modules, label="ariadne_runtime")
+           if ariadne_modules is not None else list(DEFAULT_DAEMON_ARIADNE_RUNTIME_MODULES))
+    )
+    return modules
+
+
 def build_sbatch_script(
     *,
     phase_name: str,
@@ -2102,9 +2175,7 @@ def build_sbatch_script(
         "export LC_ALL=C",
         "export LC_NUMERIC=C",
         "",
-        "module load apps/anaconda3/2024.02",
-        "module load compilers/oneapi/2024.2.0",
-        "module load mkl/2024.2",
+        *["module load " + m for m in _configured_daemon_runtime_modules()],
         "",
     ]
     bucket = "initial" if phase_name.startswith("INITIAL_") else ("iter_" + str(iteration))

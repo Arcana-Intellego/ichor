@@ -63,6 +63,12 @@ csf4:
       executable_path: "$g16root/g16/g16"
       modules: ["gaussian/g16c01_em64t_detectcpu"]
 
+    ariadne_runtime:
+      modules:
+        - "compilers/oneapi/2024.2.0"
+        - "compiler-rt tbb compiler"
+        - "mkl/2024.2"
+
     amber:
       modules: ["amber/20.12-iomkl-2020.02-ambertools-21.12"]
       executable_path: sander
@@ -83,9 +89,9 @@ csf4:
       modules: ["iomkl/2020.02"]
 
     python:
-      env_name: "ase_plumed_env"
-      python_path: "~/.conda/envs/ase_plumed_env/bin/python"
-      modules: ["anaconda3/2024.02"]
+      env_name: "ichor-al"
+      python_path: "~/.venv/ichor-al/bin/python"
+      modules: ["python/3.11.3-gcccore-12.3.0"]
 
     tyche:
       modules: ["iomkl/2020.02"]

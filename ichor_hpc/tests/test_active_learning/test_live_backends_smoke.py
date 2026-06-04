@@ -24,7 +24,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -161,17 +161,95 @@ def test_build_sbatch_script_renders_gaussian_block():
     assert "export LC_NUMERIC=C" in body
 
 
-def test_build_sbatch_script_uses_strict_daemon_module_loads():
+def test_build_sbatch_script_uses_strict_daemon_module_loads(monkeypatch):
+    monkeypatch.setattr(
+        live_executor_mod,
+        "_configured_daemon_runtime_modules",
+        lambda: list(live_executor_mod.DEFAULT_DAEMON_RUNTIME_MODULES),
+    )
     body = build_sbatch_script(
         phase_name="PHASE_A_POLUS",
         iteration=0,
         campaign_dir=Path("/scratch/campaign"),
         config=CampaignConfig(),
     )
-    assert "module load apps/anaconda3/2024.02" in body
+    assert "module load python/3.11.3-gcccore-12.3.0" in body
     assert "module load compilers/oneapi/2024.2.0" in body
+    assert "module load compiler-rt tbb compiler" in body
     assert "module load mkl/2024.2" in body
+    assert "anaconda" not in body.lower()
     assert "|| true" not in body
+
+
+def test_build_sbatch_script_uses_configured_runtime_modules(monkeypatch):
+    fake_global_variables = ModuleType("ichor.hpc.global_variables")
+    fake_global_variables.ICHOR_CONFIG = {
+        "csf4": {
+            "software": {
+                "python": {"modules": ["python/custom"]},
+                "ariadne_runtime": {"modules": ["oneapi/custom", "mkl/custom"]},
+            }
+        }
+    }
+    fake_global_variables.MACHINE = "csf4"
+
+    def fake_get_param_from_config(config, *keys, default=None):
+        value = config
+        for key in keys:
+            if not isinstance(value, dict) or key not in value:
+                return default
+            value = value[key]
+        return value
+
+    fake_global_variables.get_param_from_config = fake_get_param_from_config
+    monkeypatch.setitem(
+        sys.modules,
+        "ichor.hpc.global_variables",
+        fake_global_variables,
+    )
+
+    body = build_sbatch_script(
+        phase_name="PHASE_A_POLUS",
+        iteration=0,
+        campaign_dir=Path("/scratch/campaign"),
+        config=CampaignConfig(),
+    )
+    assert "module load python/custom" in body
+    assert "module load oneapi/custom" in body
+    assert "module load mkl/custom" in body
+    assert "module load python/3.11.3-gcccore-12.3.0" not in body
+
+
+def test_runtime_modules_keep_ariadne_defaults_when_only_python_configured(monkeypatch):
+    fake_global_variables = ModuleType("ichor.hpc.global_variables")
+    fake_global_variables.ICHOR_CONFIG = {
+        "csf4": {
+            "software": {
+                "python": {"modules": ["python/custom"]},
+            }
+        }
+    }
+    fake_global_variables.MACHINE = "csf4"
+
+    def fake_get_param_from_config(config, *keys, default=None):
+        value = config
+        for key in keys:
+            if not isinstance(value, dict) or key not in value:
+                return default
+            value = value[key]
+        return value
+
+    fake_global_variables.get_param_from_config = fake_get_param_from_config
+    monkeypatch.setitem(
+        sys.modules,
+        "ichor.hpc.global_variables",
+        fake_global_variables,
+    )
+
+    assert live_executor_mod._configured_daemon_runtime_modules() == [
+        "python/custom",
+        *live_executor_mod.DEFAULT_DAEMON_ARIADNE_RUNTIME_MODULES,
+    ]
 
 
 def test_build_sbatch_script_uses_yaml_scheduler_resources_by_default():

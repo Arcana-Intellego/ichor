@@ -37,51 +37,59 @@ Below is a more thorough explanation on how to set up ichor on a compute cluster
 
     .. * `Anaconda CSF3 <https://ri.itservices.manchester.ac.uk/csf3/software/applications/anaconda-python/>`_
 
-CSF3/CSF4 have a very old Python 3 installed, so you will need to load in an anaconda module file to gain access to recent python versions.
-Please make sure that you are using the latest version of conda on CSF3/CSF4.
-At the time of writing this guide, the latest version of Python with conda is ``3.9``. Using an older conda version will make it harder to install ichor as the python/setuptools/pip version supplied are older.
+CSF3 and CSF4 differ in their Python module stacks. On CSF4, prefer the
+non-Anaconda Python modules when available. For the active-learning daemon,
+``python/3.11.3-gcccore-12.3.0`` is a suitable base because ARIADNE requires
+Python >= 3.9. Run ``module avail python`` on the cluster if this module name
+changes.
 
-To load conda, use
-
-.. code-block:: text
-
-    module load apps/binapps/anaconda3/2022.10
-
-To activate the ``base`` conda environment, which should have Python ``3.9`` with the above module, do
+To load the recommended CSF4 Python module, use
 
 .. code-block:: text
 
-    conda activate
+    module load python/3.11.3-gcccore-12.3.0
+    module load python-bundle-pypi/2023.06-gcccore-12.3.0
 
-and you should see a ``(base)`` on the left of the terminal, you can check the version by doing ``python3 --version``.
+The ``python-bundle-pypi`` module is useful while bootstrapping a venv because
+it provides common packaging tools. Once the venv exists, use the venv's own
+``python -m pip``.
 
-On CSF3, you need to do ``qrsh -l short`` as the network proxy is no longer available.
+If you are on CSF3 and only Anaconda provides a recent enough Python for your
+project, you may still use Anaconda there. Avoid mixing Conda packages and pip
+packages in the daemon environment unless you have a specific reason.
+
+Check the active Python version with
+
+.. code-block:: text
+
+    python3 --version
+
+On CSF3, you may need to do ``qrsh -l short`` as the network proxy is no longer available.
 This goes into a submit (compute) node, you can access the internet and install packages as well as make new conda environments with different python versions.
 
 .. warning::
 
-    You will need to load in the anaconda module and activate the environment again in the
-    compute node to be able to install packages in the correct environment.
-    Create environments while in the compute node which has internet access. After you have installed all the packages,
-    then you can exit out of the compute node and should be able to load in the environment on the login node.
-    You should be able to submit jobs now on the login node using the Python environment made on the compute node.
+    You will need to load the same Python module and activate the same venv again
+    on whichever node installs packages. Create environments while on a node with
+    internet access. After you have installed all the packages, you should be able
+    to submit jobs using that venv.
 
-Now you can make a ``venv`` environment which will use the Python version from the activated conda environment. To make a venv, do
+Now you can make a ``venv`` environment which will use the Python version from
+the loaded module. To make a venv, do
 
 .. code-block:: text
 
     python3 -m venv ~/.venv/ichor
 
 This creates a virtual environment in the ``~/.venv/ichor`` folder and all environment packages will be installed here.
-To active the venv environment, do ``source ~/.venv/env_name/bin/activate``. Use this is you have problems with the anaconda for some reason or problems installing packages in anaconda.
+To activate the venv environment, do ``source ~/.venv/env_name/bin/activate``.
 To activate on GitBash, do ``. ~/.venv/ichor/Scripts/activate``.
 
 .. note::
 
-    You will not need the conda module anymore if using venv. If you make a venv environment, the python version will be
-    taken from the conda environment (so we are going to be using the same python version available in the conda environment),
-    however, all packages will now be installed in the venv environment instead of the conda environment. This should remove
-    problems associated with anaconda / loading anaconda modules.
+    You will not need an Anaconda module when using a venv made from a
+    non-Anaconda Python module. You do still need to load the same Python module
+    before activating the venv so the interpreter and runtime libraries match.
 
 You should see ``(ichor)`` show up on the left side of the terminal, which indicates you are in the ``ichor`` environment. This is the
 same for both venv and conda.
@@ -143,4 +151,7 @@ meaning that changes in the ichor source code will be directly made in the insta
 .. note::
 
     Note it is usually better to use venv.
-    On CSF3, activate anaconda first. After that use the python from the anaconda environment to make a venv. After this step is done, you can activate the venv and you no longer need to activate or use conda.
+    On CSF4, load a recent non-Anaconda Python module first, then create the
+    venv from that interpreter. On CSF3, use whichever recent Python module is
+    available to you; if that is Anaconda, use it only to create the venv and
+    then install packages into the venv.

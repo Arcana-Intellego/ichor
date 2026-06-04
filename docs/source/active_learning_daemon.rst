@@ -188,15 +188,15 @@ A live campaign on CSF4 (or another SLURM cluster) needs five backends
 available on PATH at submission time. The daemon checks them at start
 and refuses with exit 12 if any are missing::
 
-    module load apps/anaconda3/2024.02
+    module load python/3.11.3-gcccore-12.3.0
     module load compilers/oneapi/2024.2.0
+    module load compiler-rt tbb compiler
     module load mkl/2024.2
     module load gaussian/g16c01_em64t_detectcpu
     # AIMAll lives in ~/AIMAll/ on most CSF nodes (operator-installed).
     # FEREBUS is invoked via the pyferebus Python wrapper; install it
-    # in the same conda/venv environment as ichor_hpc.
-    # ARIADNE is the oneAPI .so + Python wrapper at:
-    #   $ARIADNE_BUILD/python (must be on PYTHONPATH)
+    # in the same venv environment as ichor_hpc.
+    # ARIADNE is the oneAPI .so + Python wrapper installed into that venv.
 
 The exact module names and versions come from your local
 :code:`~/ichor_config.yaml`; see :code:`ichor_config_setup.rst` for the
@@ -228,18 +228,17 @@ Backend availability
      - :code:`--live`
      - :code:`ls ~/AIMAll/aimqb.ish`
    * - FEREBUS (pyferebus)
-     - :code:`pip install pyferebus` (in same env as ichor_hpc)
+     - :code:`pip install -e FEREBUS_CPU/pyferebus --no-deps` (in same env as ichor_hpc)
      - :code:`--live`
      - :code:`python -c "import pyferebus"`
    * - ARIADNE (oneAPI .so)
-     - Build from source; prepend
-       :code:`$ARIADNE_BUILD/python` to :code:`PYTHONPATH`
+     - Build from source with oneAPI/MKL and install into the active venv
      - :code:`--live` (skip with :code:`--mock-ariadne`)
      - :code:`python -c "import ariadne"`
    * - POLUS (DIVSampler)
-     - :code:`pip install polus` (in same env as ichor_hpc)
+     - :code:`pip install -e POLUS/polus_core_subpackage --no-deps` (in same env as ichor_hpc)
      - :code:`--live`
-     - :code:`python -c "import polus"`
+     - :code:`python -c "import polus.samplers.RS.randomSampling"`
 
 The :code:`ichor-al-daemon` :code:`start --live` command exits cleanly
 (no partial writes) if any of the above checks fail. You can also run

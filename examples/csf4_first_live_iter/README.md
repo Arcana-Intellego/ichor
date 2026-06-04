@@ -18,22 +18,24 @@ paths as needed.
 ```
 ssh csf4
 module purge
-module load apps/anaconda3/2024.02
+module load python/3.11.3-gcccore-12.3.0
+module load python-bundle-pypi/2023.06-gcccore-12.3.0
 module load compilers/oneapi/2024.2.0
 module load compiler-rt tbb compiler
 module load mkl/2024.2
 module load gaussian/g16c01_em64t_detectcpu
 ```
 
-The Intel oneAPI + MKL stack is needed to build ARIADNE. Gaussian g16 is
-the SCF backend for the INITIAL_GAUSSIAN + GAUSSIAN phases. AIMAll and
-FEREBUS do not have modules; you install them yourself (see section 3).
+The non-Anaconda Python module is the base for the daemon venv. The Intel
+oneAPI + MKL stack is needed to build ARIADNE. Gaussian g16 is the SCF
+backend for the INITIAL_GAUSSIAN + GAUSSIAN phases. AIMAll and FEREBUS do
+not have modules; you install them yourself (see section 3).
 
 ## 2. set up the Python venv
 
 ```
-python -m venv ~/.venv/ichor
-source ~/.venv/ichor/bin/activate
+python -m venv ~/.venv/ichor-al
+source ~/.venv/ichor-al/bin/activate
 python -m pip install --upgrade pip
 
 # the three ICHOR packages, in dependency order
@@ -41,12 +43,12 @@ pip install -e ~/projects/ichor-active-learning/ichor_core
 pip install -e ~/projects/ichor-active-learning/ichor_hpc
 pip install -e ~/projects/ichor-active-learning/ichor_cli
 
-# the diversity sampler
-pip install -e ~/projects/POLUS/polus_core_subpackage
+# the diversity sampler subtree used by the daemon
+pip install -e ~/projects/POLUS/polus_core_subpackage --no-deps
 
 # the FEREBUS Python wrapper (submission staging only -- runtime is the
 # Fortran binary you place under <MACHINE>.software.ferebus in step 4)
-pip install -e ~/projects/pyferebus
+pip install -e ~/projects/FEREBUS_CPU/pyferebus --no-deps
 
 # ARIADNE -- a single pip install puts the oneAPI .so + Python wrapper
 # in the venv site-packages, so `import ariadne` works without any
@@ -61,8 +63,8 @@ Confirm each backend imports cleanly:
 
 ```
 python -c "import ichor.core, ichor.hpc, ichor.cli; print('ichor packages OK')"
-python -c "import polus; print('polus OK')"
-python -c "import pyferebus; print('pyferebus OK')"
+python -c "import polus.samplers.RS.randomSampling; print('polus RS OK')"
+python -c "import pyferebus.executors.trainer; print('pyferebus OK')"
 python -c "import ariadne; print('ariadne OK')"
 ```
 
@@ -114,6 +116,17 @@ csf4:
     gaussian:
       executable_path: "$g16root/g16/g16"
       modules: ["gaussian/g16c01_em64t_detectcpu"]
+
+    python:
+      env_name: "ichor-al"
+      python_path: "~/.venv/ichor-al/bin/python"
+      modules: ["python/3.11.3-gcccore-12.3.0"]
+
+    ariadne_runtime:
+      modules:
+        - "compilers/oneapi/2024.2.0"
+        - "compiler-rt tbb compiler"
+        - "mkl/2024.2"
 ```
 
 Adjust the AIMAll + FEREBUS paths to match where you actually installed
