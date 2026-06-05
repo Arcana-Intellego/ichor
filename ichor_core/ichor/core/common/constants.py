@@ -679,14 +679,17 @@ class Orbital:
         return f"{self.name}({self.value})"
 
 
-class Orbitals(Orbital, Enum):
+class Orbitals(Enum):
     S = 2
     P = 6
     D = 10
     F = 14
 
-    def __init__(self, value):
-        pass
+    def __add__(self, other):
+        return Orbital(f"{self.name}{other.name}", self.value + other.value)
+
+    def __repr__(self):
+        return f"{self.name}({self.value})"
 
 
 type2orbital = {
