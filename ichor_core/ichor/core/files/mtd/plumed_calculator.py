@@ -1,3 +1,4 @@
+import os
 from os.path import exists
 
 import numpy as np
@@ -134,7 +135,8 @@ class Plumed(Calculator):
 
         if world.rank == 0:
             natoms = len(atoms.get_positions())
-            self.plumed = pl()
+            kernel = os.environ.get("PLUMED_KERNEL")
+            self.plumed = pl(kernel=kernel) if kernel else pl()
 
             """ Units setup
             warning: inputs and outputs of plumed will still be in

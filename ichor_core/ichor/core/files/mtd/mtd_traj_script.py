@@ -101,7 +101,7 @@ class MtdTrajScript(WriteFile, File):
         self.iterations = self.iterations or 1024
         self.temperature = self.temperature or 300
         self.system_name = self.system_name or "generic_molecule"
-        self.calculator = self.calculator or '"GFN2-xTB"'
+        self.calculator = self.calculator or "GFN2-xTB"
         self.time_units = self.time_units or "1000 * units.fs"
         self.dist_units = self.dist_units or "A"
         self.energy_units = self.energy_units or "{units.mol/units.kJ}"
@@ -119,7 +119,7 @@ class MtdTrajScript(WriteFile, File):
 
     def build_cv_str(self, cv, num, group):
         if group == "":
-            cv_to_str = ",".join(str(i) for i in cv)
+            cv_to_str = ",".join(str(self._plumed_atom_id(i)) for i in cv)
         else:
             cv_to_str = group
         if len(cv) == 2:
@@ -131,9 +131,13 @@ class MtdTrajScript(WriteFile, File):
         return cv_str
 
     def build_group_str(self, cv, num):
-        cv_to_str = ",".join(str(i) for i in cv)
+        cv_to_str = ",".join(str(self._plumed_atom_id(i)) for i in cv)
         group_str = f'\t"GROUP ATOMS={cv_to_str} LABEL=g{num}",\n'
         return group_str
+
+    @staticmethod
+    def _plumed_atom_id(atom_index: int) -> int:
+        return int(atom_index) + 1
 
     ## need some complex logic here to define MTD arguments etc.
     def build_mtd_setup_str(self):
@@ -187,6 +191,7 @@ class MtdTrajScript(WriteFile, File):
         mtd_traj_script_template = Template(
             textwrap.dedent(
                 """
+            import os
             from os.path import exists
             import numpy as np
             from ase import units
@@ -243,7 +248,8 @@ class MtdTrajScript(WriteFile, File):
 
                     if world.rank == 0:
                         natoms = len(atoms.get_positions())
-                        self.plumed = pl()
+                        kernel = os.environ.get("PLUMED_KERNEL")
+                        self.plumed = pl(kernel=kernel) if kernel else pl()
                         ps = 1000 * fs
                         self.plumed.cmd("setMDEnergyUnits", mol / kJ)
                         self.plumed.cmd("setMDLengthUnits", 1 / nm)

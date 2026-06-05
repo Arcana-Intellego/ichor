@@ -7,6 +7,7 @@ from ichor.core.common.io import mkdir
 
 from ichor.core.files import PointsDirectory, Trajectory, XTB
 from ichor.hpc.batch_system import JobID
+from ichor.hpc.runtime_preflight import ensure_xtb_ase_available
 from ichor.hpc.submission_commands import PythonCommand
 from ichor.hpc.submission_script import SubmissionScript
 
@@ -14,7 +15,7 @@ from ichor.hpc.submission_script import SubmissionScript
 def submit_single_ase_xyz(
     input_xyz_path: Union[str, Path],
     ncores=2,
-    method="GFN2-xT",
+    method="GFN2-xTB",
     solvent="none",
     electronic_temperature=300,
     max_iterations=2048,
@@ -169,6 +170,8 @@ def submit_xtb(
         This is used in auto-run to hold this job for the previous job to finish, defaults to None
     :return: The JobID of this job given by the submission system.
     """
+
+    ensure_xtb_ase_available(run_energy=False)
 
     # make a SubmissionScript instance which is going to contain all the jobs that are going to be ran
     # the submission_script object can be accessed even after the context manager

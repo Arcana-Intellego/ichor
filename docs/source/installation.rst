@@ -102,6 +102,72 @@ To make sure you are using the latest versions of the packages, use
 
     python3 -m pip install --upgrade pip setuptools
 
+++++++++++++++++++++++++++
+CSF4 PLUMED without Conda
+++++++++++++++++++++++++++
+
+PLUMED does not require Anaconda for ICHOR metadynamics. The runtime
+contract is:
+
+* the Python venv can import the PyPI ``plumed`` wrapper;
+* ``PLUMED_KERNEL`` points at a readable compiled ``libplumedKernel.so``;
+* submitted jobs inherit that kernel path and the PLUMED library path.
+
+On CSF4, build PLUMED under the same non-Anaconda Python/compiler stack used
+for the ICHOR venv:
+
+.. code-block:: text
+
+    module purge
+    module load python/3.11.3-gcccore-12.3.0
+    module load python-bundle-pypi/2023.06-gcccore-12.3.0
+
+    tar -xf plumed-2.10.0.tgz
+    cd plumed-2.10.0
+    ./configure --prefix=$HOME/opt/plumed-2.10.0 \
+        --disable-external-blas \
+        --disable-external-lapack \
+        --disable-mpi
+    make -j 4
+    make install
+
+Then install the Python wrapper into the active ICHOR venv:
+
+.. code-block:: text
+
+    source ~/.venv/ichor-al/bin/activate
+    python -m pip install "plumed==2.10.0"
+
+If CSF4 cannot download from PyPI directly, transfer the ``plumed`` source
+distribution or wheel to the cluster and install it with ``python -m pip
+install /path/to/plumed-2.10.0*.tar.gz``. Keep the wrapper version matched
+to the compiled PLUMED kernel version.
+
+Declare the native kernel in ``~/ichor_config.yaml`` so generated submission
+scripts export the same runtime state on worker nodes:
+
+.. code-block:: yaml
+
+    csf4:
+      software:
+        python:
+          env_name: "ichor-al"
+          python_path: "~/.venv/ichor-al/bin/python"
+          modules: ["python/3.11.3-gcccore-12.3.0"]
+
+        plumed:
+          kernel_path: "$HOME/opt/plumed-2.10.0/lib/libplumedKernel.so"
+          library_path: "$HOME/opt/plumed-2.10.0/lib"
+          modules: []
+
+These checks prove the wrapper and kernel can see each other:
+
+.. code-block:: text
+
+    export PLUMED_KERNEL=$HOME/opt/plumed-2.10.0/lib/libplumedKernel.so
+    python -c "import os, plumed; p=plumed.Plumed(kernel=os.environ['PLUMED_KERNEL']); p.finalize(); print('PLUMED OK')"
+    python -c "from ichor.hpc.runtime_preflight import ensure_plumed_available; ensure_plumed_available(); print('ICHOR PLUMED preflight OK')"
+
 ++++++++++++++++++++++++++++++
 Downloading ichor
 ++++++++++++++++++++++++++++++

@@ -1,14 +1,65 @@
+import os
+import shlex
 from pathlib import Path
 from typing import List, Optional
 
 import ichor.hpc.global_variables
 
 from ichor.core.common.functools import classproperty
+from ichor.hpc.global_variables import get_param_from_config
 from ichor.hpc.submission_command import SubmissionCommand
 
 
 class PythonEnvironmentNotFound(Exception):
     pass
+
+
+def _as_list(value) -> list:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def _expand_path(value: str) -> str:
+    return str(Path(os.path.expanduser(os.path.expandvars(str(value)))))
+
+
+def _config_value(*keys, default=None):
+    return get_param_from_config(
+        ichor.hpc.global_variables.ICHOR_CONFIG or {},
+        ichor.hpc.global_variables.MACHINE,
+        *keys,
+        default=default,
+    )
+
+
+def _configured_modules(section: str) -> list:
+    return _as_list(_config_value("software", section, "modules", default=[]))
+
+
+def _configured_plumed_exports() -> List[str]:
+    exports = []
+    kernel_path = _config_value("software", "plumed", "kernel_path")
+    library_path = _config_value("software", "plumed", "library_path")
+
+    if kernel_path:
+        expanded_kernel = _expand_path(kernel_path)
+        exports.append(f"export PLUMED_KERNEL={shlex.quote(expanded_kernel)}")
+        if not library_path:
+            library_path = str(Path(expanded_kernel).parent)
+
+    if library_path:
+        expanded_library = _expand_path(library_path)
+        exports.append(
+            "export LD_LIBRARY_PATH="
+            f"{shlex.quote(expanded_library)}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
+        )
+
+    return exports
 
 
 class PythonCommand(SubmissionCommand):
@@ -25,7 +76,7 @@ class PythonCommand(SubmissionCommand):
     @classproperty
     def modules(self) -> list:
         """Returns the python executable that the current ichor program is running from."""
-        return ""
+        return _configured_modules("python") + _configured_modules("plumed")
 
     @property
     def data(self) -> None:
@@ -40,10 +91,10 @@ class PythonCommand(SubmissionCommand):
         if python_env.uses_venv:
             env_path = python_env.venv_path.absolute()
             activate_script = env_path / "bin" / "activate"
-            return f"source {str(activate_script)}"
+            return f"source {shlex.quote(str(activate_script))}"
         elif python_env.uses_conda:
             env_path = python_env.conda_path.absolute()
-            return f"source activate {str(env_path)}"
+            return f"source activate {shlex.quote(str(env_path))}"
 
         raise PythonEnvironmentNotFound(
             "Python environment was not found. Cannot submit Python command."
@@ -51,6 +102,11 @@ class PythonCommand(SubmissionCommand):
 
     def repr(self, variables: Optional[List[str]] = None) -> str:
         """Returns a string which is then written into the submission script in order to run a python job."""
-        activate_env = PythonCommand.command + "\n"
-        python_script_to_run = f"python3 {self.script} {' '.join(self.args)}"
-        return activate_env + python_script_to_run
+        env_lines = [PythonCommand.command]
+        env_lines.extend(_configured_plumed_exports())
+        args = " ".join(shlex.quote(str(arg)) for arg in self.args)
+        python_script_to_run = f"python3 {shlex.quote(str(self.script))}"
+        if args:
+            python_script_to_run = f"{python_script_to_run} {args}"
+        env_lines.append(python_script_to_run)
+        return "\n".join(env_lines)

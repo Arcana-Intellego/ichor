@@ -43,6 +43,9 @@ class XTB(WriteFile, File):
         self.max_iterations = self.max_iterations or 2048
         self.fmax = self.fmax or 0.01
 
+    def _set_write_defaults_if_needed(self):
+        self.set_write_defaults_if_needed()
+
     def _write_file(self, path: Path, *args, **kwargs):
         write_str = ""
 

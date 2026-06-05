@@ -93,6 +93,11 @@ csf4:
       python_path: "~/.venv/ichor-al/bin/python"
       modules: ["python/3.11.3-gcccore-12.3.0"]
 
+    plumed:
+      kernel_path: "$HOME/opt/plumed-2.10.0/lib/libplumedKernel.so"
+      library_path: "$HOME/opt/plumed-2.10.0/lib"
+      modules: []
+
     tyche:
       modules: ["iomkl/2020.02"]
 

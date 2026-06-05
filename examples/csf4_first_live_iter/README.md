@@ -59,6 +59,25 @@ export FC=ifx CC=icx CXX=icpx
 python -m pip install . --no-build-isolation -v
 ```
 
+Build and install PLUMED without Conda. The Python package is only the
+wrapper; the native kernel is the compiled `libplumedKernel.so`.
+
+```
+cd ~/projects
+tar -xf plumed-2.10.0.tgz
+cd plumed-2.10.0
+./configure --prefix=$HOME/opt/plumed-2.10.0 \
+    --disable-external-blas \
+    --disable-external-lapack \
+    --disable-mpi
+make -j 4
+make install
+
+source ~/.venv/ichor-al/bin/activate
+python -m pip install "plumed==2.10.0"
+export PLUMED_KERNEL=$HOME/opt/plumed-2.10.0/lib/libplumedKernel.so
+```
+
 Confirm each backend imports cleanly:
 
 ```
@@ -66,6 +85,10 @@ python -c "import ichor.core, ichor.hpc, ichor.cli; print('ichor packages OK')"
 python -c "import polus.samplers.RS.randomSampling; print('polus RS OK')"
 python -c "import pyferebus.executors.trainer; print('pyferebus OK')"
 python -c "import ariadne; print('ariadne OK')"
+python -c "import ase; print('ASE OK')"
+python -c "from xtb.ase.calculator import XTB; print('XTB ASE OK')"
+python -c "import os, plumed; p=plumed.Plumed(kernel=os.environ['PLUMED_KERNEL']); p.finalize(); print('PLUMED OK')"
+python -c "from ichor.hpc.runtime_preflight import ensure_xtb_ase_available, ensure_plumed_available; ensure_xtb_ase_available(run_energy=True); ensure_plumed_available(run_ase_smoke=True); print('ASE/xTB/PLUMED preflight OK')"
 ```
 
 If any of these blow up, fix the import error before going further. The
@@ -121,6 +144,11 @@ csf4:
       env_name: "ichor-al"
       python_path: "~/.venv/ichor-al/bin/python"
       modules: ["python/3.11.3-gcccore-12.3.0"]
+
+    plumed:
+      kernel_path: "$HOME/opt/plumed-2.10.0/lib/libplumedKernel.so"
+      library_path: "$HOME/opt/plumed-2.10.0/lib"
+      modules: []
 
     ariadne_runtime:
       modules:

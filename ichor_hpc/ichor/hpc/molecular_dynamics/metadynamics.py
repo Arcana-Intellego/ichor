@@ -8,7 +8,8 @@ from ichor.core.files.mtd import MtdTrajScript
 from ichor.core.files import Trajectory
 
 from ichor.hpc.batch_system import JobID
-from ichor.hpc.submission_commands import AnacondaCommand
+from ichor.hpc.runtime_preflight import ensure_metadynamics_available
+from ichor.hpc.submission_commands import PythonCommand
 from ichor.hpc.submission_script import SubmissionScript
 
 
@@ -70,6 +71,8 @@ def submit_mtd(
     errors_dir_path=ichor.hpc.global_variables.FILE_STRUCTURE["errors"],
     **kwargs,
 ) -> JobID:
+    ensure_metadynamics_available(run_xtb_smoke=False, run_plumed_smoke=False)
+
     # make a SubmissionScript instance which is going to contain all the jobs that are going to be ran
     # the submission_script object can be accessed even after the context manager
     with SubmissionScript(
@@ -79,6 +82,6 @@ def submit_mtd(
         errors_dir_path=errors_dir_path,
     ) as submission_script:
 
-        submission_script.add_command(AnacondaCommand(input_script))
+        submission_script.add_command(PythonCommand(input_script))
 
     return submission_script.submit(hold=hold)
