@@ -1,17 +1,114 @@
+import ast
+import configparser
+import re
+import sys
 from pathlib import Path
 
 
-def test_ichor_hpc_declares_tqdm_dependency():
-    setup_cfg = Path(__file__).resolve().parents[2] / "setup.cfg"
-    text = setup_cfg.read_text(encoding="utf-8").lower()
+REPO_ROOT = Path(__file__).resolve().parents[3]
+PACKAGE_DIRS = {
+    "ichor_core": REPO_ROOT / "ichor_core",
+    "ichor_hpc": REPO_ROOT / "ichor_hpc",
+    "ichor_cli": REPO_ROOT / "ichor_cli",
+}
+IMPORT_TO_PACKAGE = {
+    "consolemenu": "console-menu",
+    "concurrent_log_handler": "concurrent-log-handler",
+    "sqlalchemy": "SQLAlchemy",
+    "yaml": "pyyaml",
+}
+EXTERNAL_BACKENDS = {"ariadne", "polus", "pyferebus"}
 
-    assert "tqdm" in text
+
+def _normalise_package_name(name: str) -> str:
+    return name.lower().replace("_", "-").replace(".", "-")
 
 
-def test_ichor_core_declares_metadynamics_runtime_dependencies():
-    setup_cfg = Path(__file__).resolve().parents[3] / "ichor_core" / "setup.cfg"
-    text = setup_cfg.read_text(encoding="utf-8").lower()
+def _declared_runtime_dependencies(package_dir: Path) -> set[str]:
+    config = configparser.ConfigParser()
+    config.read(package_dir / "setup.cfg")
+    deps = set()
+    for line in config.get("options", "install_requires").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        package_name = re.split(r"[<>=;\[]", line, maxsplit=1)[0].strip()
+        deps.add(_normalise_package_name(package_name))
+    return deps
 
-    assert "ase" in text
-    assert "xtb" in text
-    assert "plumed" in text
+
+def _stdlib_modules() -> set[str]:
+    modules = set(getattr(sys, "stdlib_module_names", set()))
+    modules.update(sys.builtin_module_names)
+    return modules
+
+
+def _production_imports(source_root: Path) -> dict[str, set[str]]:
+    imports: dict[str, set[str]] = {}
+    for py_file in source_root.rglob("*.py"):
+        if "__pycache__" in py_file.parts:
+            continue
+        tree = ast.parse(py_file.read_text(encoding="utf-8"))
+        rel = str(py_file.relative_to(REPO_ROOT))
+        for node in ast.walk(tree):
+            names: list[str] = []
+            if isinstance(node, ast.Import):
+                names = [alias.name.split(".")[0] for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names = [node.module.split(".")[0]]
+            elif _literal_dynamic_import(node):
+                names = [node.args[0].value.split(".")[0]]
+            for name in names:
+                imports.setdefault(name, set()).add(f"{rel}:{node.lineno}")
+    return imports
+
+
+def _literal_dynamic_import(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call) or not node.args:
+        return False
+    if not isinstance(node.args[0], ast.Constant) or not isinstance(
+        node.args[0].value, str
+    ):
+        return False
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id in {"__import__", "import_module"}
+    if isinstance(func, ast.Attribute):
+        return func.attr == "import_module"
+    return False
+
+
+def _third_party_imports(package_name: str) -> dict[str, set[str]]:
+    stdlib = _stdlib_modules()
+    imports = _production_imports(PACKAGE_DIRS[package_name] / "ichor")
+    return {
+        name: locations
+        for name, locations in imports.items()
+        if name != "ichor" and name not in stdlib and not name.startswith("_")
+    }
+
+
+def test_runtime_dependency_metadata_covers_production_imports():
+    missing = []
+    for package_name, package_dir in PACKAGE_DIRS.items():
+        declared = _declared_runtime_dependencies(package_dir)
+        for import_name, locations in _third_party_imports(package_name).items():
+            if import_name in EXTERNAL_BACKENDS:
+                continue
+            package = IMPORT_TO_PACKAGE.get(import_name, import_name)
+            if _normalise_package_name(package) not in declared:
+                missing.append(
+                    f"{package_name}: import {import_name!r} should declare "
+                    f"{package!r}; seen at {sorted(locations)[:3]}"
+                )
+    assert missing == []
+
+
+def test_csf4_critical_runtime_dependencies_are_declared():
+    core_deps = _declared_runtime_dependencies(PACKAGE_DIRS["ichor_core"])
+    hpc_deps = _declared_runtime_dependencies(PACKAGE_DIRS["ichor_hpc"])
+    cli_deps = _declared_runtime_dependencies(PACKAGE_DIRS["ichor_cli"])
+
+    assert {"ase", "xtb", "plumed", "rdkit", "tqdm"} <= core_deps
+    assert {"numpy", "ase", "xtb", "plumed", "portalocker", "tqdm"} <= hpc_deps
+    assert {"console-menu", "termcolor", "ase"} <= cli_deps
