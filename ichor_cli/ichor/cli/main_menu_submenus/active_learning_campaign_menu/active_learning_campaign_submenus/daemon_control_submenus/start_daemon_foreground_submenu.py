@@ -10,11 +10,16 @@ from dataclasses import dataclass
 
 import ichor.cli.global_menu_variables
 from consolemenu.items import FunctionItem
-from ichor.cli.console_menu import ConsoleMenu, add_items_to_menu
 from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
     CampaignSelectionError,
     print_campaign_selection_error,
     selected_campaign_dir,
+)
+from ichor.cli.main_menu_submenus.active_learning_campaign_menu.field_menu import (
+    get_attr_path,
+    make_field_menu,
+    set_attr_path,
+    spec,
 )
 from ichor.cli.menu_description import MenuDescription
 from ichor.cli.menu_options import MenuOptions
@@ -57,6 +62,22 @@ class StartDaemonForegroundMenuOptions(MenuOptions):
 start_daemon_foreground_menu_options = StartDaemonForegroundMenuOptions(
     *START_DAEMON_FOREGROUND_DEFAULTS.values()
 )
+
+
+def _format_max_ticks(value):
+    return "0 (unlimited)" if int(value) == 0 else str(value)
+
+
+def _format_poll_interval(value):
+    return "0 (campaign default)" if int(value) == 0 else str(value)
+
+
+def _get_value(path: str):
+    return get_attr_path(start_daemon_foreground_menu_options, path)
+
+
+def _set_value(path: str, value):
+    set_attr_path(start_daemon_foreground_menu_options, path, value)
 
 
 class StartDaemonForegroundFunctions:
@@ -159,24 +180,66 @@ class StartDaemonForegroundFunctions:
 
 
 start_daemon_foreground_menu_items = [
-    FunctionItem("Select command", StartDaemonForegroundFunctions.select_command),
-    FunctionItem("Select mode", StartDaemonForegroundFunctions.select_mode),
-    FunctionItem("Set max-ticks", StartDaemonForegroundFunctions.select_max_ticks),
-    FunctionItem("Set poll-interval", StartDaemonForegroundFunctions.select_poll_interval),
-    FunctionItem("Set config override", StartDaemonForegroundFunctions.select_config),
-    FunctionItem("Set preset", StartDaemonForegroundFunctions.select_preset),
     FunctionItem("Launch (blocks)", StartDaemonForegroundFunctions.launch),
 ]
 
 
-start_daemon_foreground_menu = ConsoleMenu(
-    this_menu_options=start_daemon_foreground_menu_options,
-    title=START_DAEMON_FOREGROUND_MENU_DESCRIPTION.title,
-    subtitle=START_DAEMON_FOREGROUND_MENU_DESCRIPTION.subtitle,
-    prologue_text=START_DAEMON_FOREGROUND_MENU_DESCRIPTION.prologue_description_text,
-    epilogue_text=START_DAEMON_FOREGROUND_MENU_DESCRIPTION.epilogue_description_text,
-    show_exit_option=START_DAEMON_FOREGROUND_MENU_DESCRIPTION.show_exit_option,
+START_DAEMON_FOREGROUND_FIELD_SPECS = [
+    spec(
+        "selected_command",
+        "choice",
+        choices=["start", "resume"],
+        prompt="Select command: ",
+        item_text="Set command",
+        display_path="command",
+    ),
+    spec(
+        "selected_mode",
+        "choice",
+        choices=["mock-ariadne", "dry-run", "live"],
+        prompt="Select mode: ",
+        item_text="Set mode",
+        display_path="mode",
+    ),
+    spec(
+        "selected_max_ticks",
+        "int",
+        prompt="Max ticks (0 for unlimited): ",
+        item_text="Set max-ticks",
+        display_path="max_ticks",
+        formatter=_format_max_ticks,
+    ),
+    spec(
+        "selected_poll_interval",
+        "int",
+        prompt="Poll interval seconds (0 to use config default): ",
+        item_text="Set poll-interval",
+        display_path="poll_interval",
+        formatter=_format_poll_interval,
+    ),
+    spec(
+        "selected_config",
+        "clearable_str",
+        prompt="Config path override",
+        item_text="Set config override",
+        display_path="config",
+    ),
+    spec(
+        "selected_preset",
+        "clearable_str",
+        prompt="Preset name",
+        item_text="Set preset",
+        display_path="preset",
+    ),
+]
+
+
+start_daemon_foreground_menu = make_field_menu(
+    START_DAEMON_FOREGROUND_MENU_DESCRIPTION.title,
+    START_DAEMON_FOREGROUND_MENU_DESCRIPTION.subtitle,
+    START_DAEMON_FOREGROUND_FIELD_SPECS,
+    _get_value,
+    _set_value,
+    prologue_text="Current launch options:\n",
+    extra_items=start_daemon_foreground_menu_items,
 )
-
-
-add_items_to_menu(start_daemon_foreground_menu, start_daemon_foreground_menu_items)

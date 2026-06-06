@@ -1,23 +1,21 @@
 """Daemon control submenu.
 
 Bridges into ichor.hpc.active_learning.cli.cmd_* for read / stop /
-reconcile operations (no subprocess needed -- they take an
-argparse.Namespace) and into the two start submenus
+reconcile operations (no subprocess needed) and into the start/import submenus
 (foreground / background) for the launch path.
 """
-import argparse
 from dataclasses import dataclass
 
-import ichor.cli.global_menu_variables
 from consolemenu.items import FunctionItem, SubmenuItem
 from ichor.cli.console_menu import ConsoleMenu, add_items_to_menu
 from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
     CampaignSelectionError,
     campaign_dir_ns,
     print_campaign_selection_error,
-    selected_campaign_dir,
 )
 from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_submenus.daemon_control_submenus import (
+    import_trajectory_pool_menu,
+    IMPORT_TRAJECTORY_POOL_MENU_DESCRIPTION,
     start_daemon_background_menu,
     START_DAEMON_BACKGROUND_MENU_DESCRIPTION,
     start_daemon_foreground_menu,
@@ -25,7 +23,7 @@ from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_
 )
 from ichor.cli.menu_description import MenuDescription
 from ichor.cli.menu_options import MenuOptions
-from ichor.cli.useful_functions import user_input_bool, user_input_free_flow
+from ichor.cli.useful_functions import user_input_free_flow
 
 
 DAEMON_CONTROL_MENU_DESCRIPTION = MenuDescription(
@@ -152,46 +150,12 @@ class DaemonControlFunctions:
 
     @staticmethod
     def import_trajectory_pool():
-        """Copy the operator's MD trajectory into the per-campaign canonical
-        pool location and pin a SHA-256 manifest. Required once per campaign
-        before the daemon can build any subspace from real data."""
-        import argparse
-        from ichor.hpc.active_learning.cli import cmd_import_pool
-        from ichor.cli.useful_functions import user_input_path
+        """Compatibility dispatcher for the import-pool option submenu."""
+        from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_submenus.daemon_control_submenus.import_trajectory_pool_submenu import (
+            ImportTrajectoryPoolFunctions,
+        )
 
-        try:
-            campaign_dir = selected_campaign_dir()
-        except CampaignSelectionError as exc:
-            print_campaign_selection_error(exc)
-            user_input_free_flow("Press enter to return to the menu: ", "")
-            return
-        source = user_input_path("Enter source trajectory path (xyz): ")
-        if not source:
-            print("Cancelled (no source path).")
-            user_input_free_flow("Press enter to return to the menu: ", "")
-            return
-        no_outlier_filter = user_input_bool(
-            "Disable trajectory outlier filter (--no-outlier-filter)? ",
-            False,
-        )
-        ns = argparse.Namespace(
-            campaign_dir=str(campaign_dir),
-            source=source,
-            force=False,
-            no_outlier_filter=bool(no_outlier_filter),
-        )
-        rc = cmd_import_pool(ns)
-        if rc == 13:
-            answer = user_input_free_flow(
-                "Pool already exists. Reimport with --force (DANGEROUS, "
-                "invalidates committed provenance)? [y/N]: ", "n",
-            )
-            if (answer or "").strip().lower() in ("y", "yes"):
-                ns.force = True
-                rc = cmd_import_pool(ns)
-        if rc != 0 and rc != 13:
-            print("import-pool returned exit code " + str(rc))
-        user_input_free_flow("Press enter to return to the menu: ", "")
+        ImportTrajectoryPoolFunctions.run_import()
 
 
 daemon_control_menu = ConsoleMenu(
@@ -207,7 +171,11 @@ daemon_control_menu = ConsoleMenu(
 daemon_control_menu_items = [
     FunctionItem("Show status", DaemonControlFunctions.show_status),
     FunctionItem("Preflight backends", DaemonControlFunctions.preflight_backends),
-    FunctionItem("Import trajectory pool", DaemonControlFunctions.import_trajectory_pool),
+    SubmenuItem(
+        IMPORT_TRAJECTORY_POOL_MENU_DESCRIPTION.title,
+        import_trajectory_pool_menu,
+        daemon_control_menu,
+    ),
     SubmenuItem(
         START_DAEMON_FOREGROUND_MENU_DESCRIPTION.title,
         start_daemon_foreground_menu,

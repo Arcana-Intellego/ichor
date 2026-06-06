@@ -18,6 +18,15 @@ from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context
     print_campaign_selection_error,
     selected_campaign_dir,
 )
+from ichor.cli.main_menu_submenus.active_learning_campaign_menu.field_menu import (
+    FieldSpec as _FieldSpec,
+    edit_field as _shared_edit_field,
+    format_field_value as _format_value,
+    get_attr_path,
+    make_field_menu,
+    set_attr_path,
+    spec as _shared_spec,
+)
 from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_submenus.edit_campaign_config_submenus import (
     edit_ariadne_block_menu,
     EDIT_ARIADNE_BLOCK_MENU_DESCRIPTION,
@@ -84,6 +93,38 @@ class EditCampaignConfigMenuOptions(MenuOptions):
 
 
 edit_campaign_config_menu_options = EditCampaignConfigMenuOptions()
+
+
+def _get_config_value(path: str):
+    return get_attr_path(_campaign_config, path)
+
+
+def _set_config_value(path: str, value):
+    set_attr_path(_campaign_config, path, value)
+    _sync_options_from_config()
+
+
+def _edit_field(spec: _FieldSpec):
+    _shared_edit_field(spec, _get_config_value, _set_config_value)
+
+
+def _make_block_menu(title: str, subtitle: str, fields):
+    return make_field_menu(
+        title,
+        subtitle,
+        fields,
+        _get_config_value,
+        _set_config_value,
+        prologue_text="Current values for this campaign.yaml block:\n",
+    )
+
+
+def _spec(path: str, input_kind: str, choices=None, transform=None, prompt=None):
+    return _shared_spec(path, input_kind, choices, transform, prompt)
+
+
+def _read_only_spec(path: str):
+    return _FieldSpec(path=path, read_only=True)
 
 
 def _sync_options_from_config():
@@ -620,33 +661,328 @@ edit_campaign_config_menu = ConsoleMenu(
 )
 
 
+_BLOCK_MENUS_BY_LABEL = {
+    "Edit campaign identity": _make_block_menu(
+        "Edit Campaign Identity",
+        "Top-level campaign identity fields.",
+        [_read_only_spec("schema_version"), _spec("system_name", "str")],
+    ),
+    "Edit trajectory_pool": _make_block_menu(
+        "Edit trajectory_pool",
+        "Trajectory source used when importing the campaign pool.",
+        [_spec("trajectory_pool.source_path", "str")],
+    ),
+    "Edit iteration control": _make_block_menu(
+        "Edit Iteration Control",
+        "Daemon iteration and polling controls.",
+        [
+            _spec("max_iterations", "int"),
+            _spec("poll_interval_seconds", "int"),
+            _spec("poll_interval_idle_seconds", "int"),
+            _spec("poll_sacct_empty_max_ticks", "int", prompt="poll_sacct_empty_max_ticks (0 disables empty-sacct escalation): "),
+        ],
+    ),
+    "Edit initial sub-sample sizes": _make_block_menu(
+        "Edit Initial Sub-Sample Sizes",
+        "Initial POLUS train/validation sample sizes.",
+        [
+            _spec("initial_train_size", "int"),
+            _spec("initial_val_size", "int"),
+        ],
+    ),
+    "Edit resources": _make_block_menu(
+        "Edit resources",
+        "SLURM resources used by live backend phases.",
+        [
+            _spec("resources.partition", "str"),
+            _spec("resources.walltime_hours", "int"),
+            _spec("resources.mem_per_cpu", "str", prompt="resources.mem_per_cpu (SLURM style, e.g. 4G): "),
+            _spec("resources.cpus_per_task", "int"),
+            _spec("resources.ntasks", "int"),
+            _spec("resources.ariadne_cpus_per_task", "int"),
+            _spec("resources.gradient_parallel_backend", "choice", choices=sorted(VALID_GRADIENT_PARALLEL_BACKENDS)),
+        ],
+    ),
+    "Edit Gaussian block": _make_block_menu(
+        "Edit Gaussian Block",
+        "Ab-initio backend settings for training-data calculations.",
+        [
+            _spec("gaussian.method", "str"),
+            _spec("gaussian.basis_set", "str"),
+            _spec("gaussian.charge", "int"),
+            _spec("gaussian.spin_multiplicity", "int"),
+            _spec("gaussian.extra_keywords", "str"),
+            _spec("gaussian.nproc", "int"),
+            _spec("gaussian.mem", "str", prompt="gaussian.mem (Gaussian style, e.g. 8GB): "),
+        ],
+    ),
+    "Edit batch_sizing": _make_block_menu(
+        "Edit batch_sizing",
+        "Batch size policy for later active-learning iterations.",
+        [
+            _spec("batch_sizing.policy", "choice", choices=sorted(VALID_BATCH_POLICIES)),
+            _spec("batch_sizing.floor", "int"),
+            _spec("batch_sizing.cap", "int"),
+        ],
+    ),
+    "Edit seed_selection": _make_block_menu(
+        "Edit seed_selection",
+        "Seed count and uncertainty-evaluation controls.",
+        [
+            _spec("seed_selection.n_seeds_per_iteration", "int"),
+            _spec("seed_selection.bulk_fraction", "float", prompt="seed_selection.bulk_fraction (0.0-1.0): "),
+            _spec("seed_selection.variance_chunk_size", "int"),
+        ],
+    ),
+    "Edit anti_overlap": _make_block_menu(
+        "Edit anti_overlap",
+        "Candidate anti-overlap and ARIADNE movement filters.",
+        [
+            _spec("anti_overlap.skip_training_seeds", "bool"),
+            _spec("anti_overlap.recent_seeds_cooldown", "int"),
+            _spec("anti_overlap.min_post_ariadne_whitened_distance", "float"),
+            _spec("anti_overlap.max_post_ariadne_whitened_distance", "float"),
+            _spec("anti_overlap.enforce_post_ariadne", "bool"),
+        ],
+    ),
+    "Edit phase_b": _make_block_menu(
+        "Edit phase_b",
+        "Phase-B descriptor/FPS selection controls.",
+        [
+            _spec("phase_b.descriptor", "choice", choices=sorted(VALID_DESCRIPTORS)),
+            _spec("phase_b.beta", "float", prompt="phase_b.beta (0.0-1.0): "),
+            _spec("phase_b.min_separation", "float"),
+        ],
+    ),
+    "Edit split": _make_block_menu(
+        "Edit split",
+        "High-level train/validation split strategy.",
+        [
+            _spec("split.strategy", "choice", choices=sorted(VALID_SPLITS)),
+            _spec("split.train_fraction", "float", prompt="split.train_fraction (0.0-1.0): "),
+            _spec("split.val_mid_fraction", "float", prompt="split.val_mid_fraction (0.0-1.0): "),
+            _spec("split.high_holdout_fraction", "float", prompt="split.high_holdout_fraction (0.0-1.0): "),
+        ],
+    ),
+    "Edit FEREBUS block": _make_block_menu(
+        "Edit FEREBUS Block",
+        "FEREBUS training and dataset split controls.",
+        [
+            _spec("ferebus.warmstart", "choice", choices=sorted(VALID_WARMSTART)),
+            _spec("ferebus.warmstart_streak", "int"),
+            _spec("ferebus.kernel", "str", prompt="ferebus.kernel (e.g. rbfc_per, rbf_per): "),
+            _spec("ferebus.loss", "str", prompt="ferebus.loss (e.g. huber, mse, mae): "),
+            _spec("ferebus.nagents", "int"),
+            _spec("ferebus.maxiter", "int"),
+            _spec("ferebus.is_constant_noise", "bool"),
+            _spec("ferebus.scaling", "bool"),
+            _spec("ferebus.full_ARD", "bool"),
+            _spec("ferebus.properties", "csv_list", prompt="ferebus.properties (comma-separated, e.g. iqa,q00): "),
+            _spec("ferebus.train_fraction", "float"),
+            _spec("ferebus.int_val_fraction", "float"),
+            _spec("ferebus.ext_val_fraction", "float"),
+        ],
+    ),
+    "Edit robustness": _make_block_menu(
+        "Edit Robustness",
+        "Global failure and force sanity thresholds.",
+        [
+            _spec("failure_threshold_fraction", "float", prompt="failure_threshold_fraction (0.0-1.0): "),
+            _spec("max_force_per_atom_ha_per_ang", "float", prompt="max_force_per_atom_ha_per_ang (Hartree/Angstrom): "),
+        ],
+    ),
+    "Edit acquisition core": _make_block_menu(
+        "Edit Acquisition Core",
+        "Top-level adversarial acquisition settings.",
+        [
+            _spec("acquisition.property_name", "str"),
+            _spec("acquisition.use_scaled_posterior_covariance", "bool"),
+            _spec("acquisition.allow_uniform_posterior_fallback", "bool"),
+        ],
+    ),
+    "Edit acquisition.subspace": _make_block_menu(
+        "Edit acquisition.subspace",
+        "Local subspace construction for adversarial acquisition.",
+        [
+            _spec("acquisition.subspace.neighbour_count", "int"),
+            _spec("acquisition.subspace.neighbour_deduplicate_rmsd", "float"),
+            _spec("acquisition.subspace.variance_capture", "float", prompt="acquisition.subspace.variance_capture (0.0-1.0): "),
+            _spec("acquisition.subspace.min_subspace_dim", "int"),
+            _spec("acquisition.subspace.max_subspace_dim", "int"),
+            _spec("acquisition.subspace.gaussian_weight_sigma", "optional_float"),
+            _spec("acquisition.subspace.covariance_regularization", "float"),
+            _spec("acquisition.subspace.canonicalise_basis", "bool"),
+            _spec("acquisition.subspace.degeneracy_tolerance", "float"),
+            _spec("acquisition.subspace.mode_weighting_policy", "choice", choices=sorted(VALID_MODE_WEIGHTING_POLICIES)),
+        ],
+    ),
+    "Edit acquisition.weights": _make_block_menu(
+        "Edit acquisition.weights",
+        "Weights in the adversarial acquisition objective.",
+        [
+            _spec("acquisition.weights.lambda_force", "float"),
+            _spec("acquisition.weights.lambda_frequency", "float"),
+            _spec("acquisition.weights.lambda_anharmonic", "float"),
+            _spec("acquisition.weights.lambda_energy", "float"),
+            _spec("acquisition.weights.lambda_distance", "float"),
+        ],
+    ),
+    "Edit acquisition.gradient": _make_block_menu(
+        "Edit acquisition.gradient",
+        "Finite-difference gradient controls.",
+        [
+            _spec("acquisition.gradient.mode", "choice", choices=sorted(VALID_GRADIENT_MODES)),
+            _spec("acquisition.gradient.cartesian_step", "float"),
+            _spec("acquisition.gradient.active_step", "float"),
+            _spec("acquisition.gradient.regularization", "float"),
+            _spec("acquisition.gradient.cartesian_step_floor", "float"),
+            _spec("acquisition.gradient.ghost_mass_threshold", "float"),
+        ],
+    ),
+    "Edit acquisition.barrier": _make_block_menu(
+        "Edit acquisition.barrier",
+        "Geometry and energy risk penalties in the acquisition objective.",
+        [
+            _spec("acquisition.barrier.use_connectivity_barrier", "bool"),
+            _spec("acquisition.barrier.nonbonded_clash_scale", "float"),
+            _spec("acquisition.barrier.clash_delta", "float"),
+            _spec("acquisition.barrier.clash_lambda", "float"),
+            _spec("acquisition.barrier.bond_lower_scale", "float"),
+            _spec("acquisition.barrier.bond_upper_scale", "float"),
+            _spec("acquisition.barrier.bond_delta", "float"),
+            _spec("acquisition.barrier.bond_lambda", "float"),
+            _spec("acquisition.barrier.energy_cap_quantile", "float", prompt="acquisition.barrier.energy_cap_quantile (0.0-1.0): "),
+            _spec("acquisition.barrier.energy_cap_floor", "float"),
+            _spec("acquisition.barrier.energy_cap_delta", "float"),
+            _spec("acquisition.barrier.energy_cap_lambda", "float"),
+            _spec("acquisition.barrier.softplus_cap", "optional_float"),
+        ],
+    ),
+    "Edit acquisition.stencils": _make_block_menu(
+        "Edit acquisition.stencils",
+        "Stencil step and curvature controls for finite-difference diagnostics.",
+        [
+            _spec("acquisition.stencils.step_scale", "float"),
+            _spec("acquisition.stencils.min_step", "float"),
+            _spec("acquisition.stencils.max_step", "float"),
+            _spec("acquisition.stencils.jitter", "float"),
+            _spec("acquisition.stencils.curvature_floor", "float"),
+            _spec("acquisition.stencils.softplus_scale", "float"),
+            _spec("acquisition.stencils.autotune_from_cubic", "bool"),
+        ],
+    ),
+    "Edit acquisition.references": _make_block_menu(
+        "Edit acquisition.references",
+        "Reference scale refresh controls for acquisition normalisation.",
+        [
+            _spec("acquisition.references.max_reference_samples", "int"),
+            _spec("acquisition.references.floor", "float"),
+            _spec("acquisition.references.refresh_policy", "choice", choices=["every_iteration", "every_n_iterations", "never"]),
+            _spec("acquisition.references.refresh_period", "int", prompt="acquisition.references.refresh_period (only used by every_n_iterations): "),
+        ],
+    ),
+    "Edit stop": _make_block_menu(
+        "Edit stop",
+        "Automatic stopping criteria.",
+        [
+            _spec("stop.alpha0_streak_threshold", "float"),
+            _spec("stop.alpha0_streak_length", "int", prompt="stop.alpha0_streak_length (0 disables this rule): "),
+            _spec("stop.rel_alpha_improvement_min", "float"),
+            _spec("stop.rel_alpha_improvement_window", "int", prompt="stop.rel_alpha_improvement_window (0 disables this rule): "),
+            _spec("stop.min_iterations_before_stop", "int"),
+        ],
+    ),
+    "Edit outlier_filter": _make_block_menu(
+        "Edit outlier_filter",
+        "Pre-Phase-A trajectory outlier filter thresholds.",
+        [
+            _spec("outlier_filter.enabled", "bool"),
+            _spec("outlier_filter.energy_z_threshold", "float"),
+            _spec("outlier_filter.per_atom_rmsd_z_threshold", "float"),
+        ],
+    ),
+    "Edit adversarial_safety": _make_block_menu(
+        "Edit adversarial_safety",
+        "Safe adversarial landing policy and thresholds.",
+        [
+            _spec("adversarial_safety.enabled", "bool"),
+            _spec("adversarial_safety.reject_unsafe_landings", "bool"),
+            _spec("adversarial_safety.salvage_safe_iterate", "bool"),
+            _spec("adversarial_safety.backtrack_to_safe_landing", "bool"),
+            _spec("adversarial_safety.backtrack_points", "int"),
+            _spec("adversarial_safety.allow_seed_fallback", "bool"),
+            _spec("adversarial_safety.min_whitened_distance", "float"),
+            _spec("adversarial_safety.max_whitened_distance", "float"),
+            _spec("adversarial_safety.enforce_min_whitened_distance", "bool"),
+            _spec("adversarial_safety.max_predicted_energy_delta_ha", "optional_float"),
+            _spec("adversarial_safety.max_energy_variance", "optional_float"),
+            _spec("adversarial_safety.max_chemistry_penalty", "optional_float"),
+            _spec("adversarial_safety.phase_b_filter_enabled", "bool"),
+        ],
+    ),
+    "Edit quality_gates": _make_block_menu(
+        "Edit quality_gates",
+        "Science-quality gates for QM/AIMAll, FEREBUS, and ARIADNE outputs.",
+        [
+            _spec("quality_gates.require_readable_aimall_geometry", "bool"),
+            _spec("quality_gates.require_finite_iqa", "bool"),
+            _spec("quality_gates.require_finite_integration_error", "bool"),
+            _spec("quality_gates.max_abs_integration_error", "optional_float"),
+            _spec("quality_gates.iqa_energy_recovery_tolerance_ha", "optional_float"),
+            _spec("quality_gates.ferebus_min_ext_r2", "optional_float"),
+            _spec("quality_gates.ferebus_max_ext_rmse_ha", "optional_float"),
+            _spec("quality_gates.ferebus_max_condition_number", "optional_float"),
+            _spec("quality_gates.ariadne_max_displacement_ang", "optional_float"),
+            _spec("quality_gates.ariadne_min_pair_distance_ang", "optional_float"),
+        ],
+    ),
+    "Edit runtime": _make_block_menu(
+        "Edit runtime",
+        "Daemon runtime resilience and retry controls.",
+        [
+            _spec("runtime.lease_stale_seconds", "int"),
+            _spec("runtime.postprocess_settle_attempts", "int"),
+            _spec("runtime.postprocess_settle_seconds", "int"),
+            _spec("runtime.transient_phase_retry_max", "int"),
+        ],
+    ),
+}
+
+
+def _block_submenu_item(label: str):
+    return SubmenuItem(label, _BLOCK_MENUS_BY_LABEL[label], edit_campaign_config_menu)
+
+
 edit_campaign_config_menu_items = [
     FunctionItem("Show current config", EditCampaignConfigFunctions.show_current_config),
     FunctionItem("Load from disk", EditCampaignConfigFunctions.load_from_disk),
     FunctionItem("Reset to defaults", EditCampaignConfigFunctions.reset_to_defaults),
     FunctionItem("Validate current config", EditCampaignConfigFunctions.validate_current_config),
-    FunctionItem("Edit campaign identity", EditCampaignConfigFunctions.edit_campaign_identity),
-    FunctionItem("Edit trajectory_pool", EditCampaignConfigFunctions.edit_trajectory_pool),
-    FunctionItem("Edit iteration control", EditCampaignConfigFunctions.edit_iteration_control),
-    FunctionItem("Edit initial sub-sample sizes", EditCampaignConfigFunctions.edit_initial_subsample),
-    FunctionItem("Edit resources", EditCampaignConfigFunctions.edit_resources),
-    FunctionItem("Edit Gaussian block", EditCampaignConfigFunctions.edit_gaussian),
-    FunctionItem("Edit batch_sizing", EditCampaignConfigFunctions.edit_batch_sizing),
-    FunctionItem("Edit seed_selection", EditCampaignConfigFunctions.edit_seed_selection),
-    FunctionItem("Edit anti_overlap", EditCampaignConfigFunctions.edit_anti_overlap),
-    FunctionItem("Edit phase_b", EditCampaignConfigFunctions.edit_phase_b),
-    FunctionItem("Edit split", EditCampaignConfigFunctions.edit_split),
-    FunctionItem("Edit FEREBUS block", EditCampaignConfigFunctions.edit_ferebus),
-    FunctionItem("Edit robustness", EditCampaignConfigFunctions.edit_robustness),
-    FunctionItem("Edit acquisition core", EditCampaignConfigFunctions.edit_acquisition_core),
-    FunctionItem("Edit acquisition.subspace", EditCampaignConfigFunctions.edit_acquisition_subspace),
-    FunctionItem("Edit acquisition.weights", EditCampaignConfigFunctions.edit_acquisition_weights),
-    FunctionItem("Edit acquisition.gradient", EditCampaignConfigFunctions.edit_acquisition_gradient),
-    FunctionItem("Edit acquisition.barrier", EditCampaignConfigFunctions.edit_acquisition_barrier),
-    FunctionItem("Edit acquisition.stencils", EditCampaignConfigFunctions.edit_acquisition_stencils),
-    FunctionItem("Edit acquisition.references", EditCampaignConfigFunctions.edit_acquisition_references),
-    FunctionItem("Edit stop", EditCampaignConfigFunctions.edit_stop),
-    FunctionItem("Edit outlier_filter", EditCampaignConfigFunctions.edit_outlier_filter),
+    _block_submenu_item("Edit campaign identity"),
+    _block_submenu_item("Edit trajectory_pool"),
+    _block_submenu_item("Edit iteration control"),
+    _block_submenu_item("Edit initial sub-sample sizes"),
+    _block_submenu_item("Edit resources"),
+    _block_submenu_item("Edit Gaussian block"),
+    _block_submenu_item("Edit batch_sizing"),
+    _block_submenu_item("Edit seed_selection"),
+    _block_submenu_item("Edit anti_overlap"),
+    _block_submenu_item("Edit phase_b"),
+    _block_submenu_item("Edit split"),
+    _block_submenu_item("Edit FEREBUS block"),
+    _block_submenu_item("Edit robustness"),
+    _block_submenu_item("Edit acquisition core"),
+    _block_submenu_item("Edit acquisition.subspace"),
+    _block_submenu_item("Edit acquisition.weights"),
+    _block_submenu_item("Edit acquisition.gradient"),
+    _block_submenu_item("Edit acquisition.barrier"),
+    _block_submenu_item("Edit acquisition.stencils"),
+    _block_submenu_item("Edit acquisition.references"),
+    _block_submenu_item("Edit stop"),
+    _block_submenu_item("Edit outlier_filter"),
+    _block_submenu_item("Edit adversarial_safety"),
+    _block_submenu_item("Edit quality_gates"),
+    _block_submenu_item("Edit runtime"),
     SubmenuItem(
         EDIT_ARIADNE_BLOCK_MENU_DESCRIPTION.title,
         edit_ariadne_block_menu,

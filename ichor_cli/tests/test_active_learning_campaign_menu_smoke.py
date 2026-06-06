@@ -36,6 +36,7 @@ def test_daemon_control_menu_items():
     for expected in (
         "Show status",
         "Preflight backends",
+        "Import Trajectory Pool",
         "Start/Resume Daemon (Foreground)",
         "Start/Resume Daemon (Background)",
         "Stop daemon",
@@ -59,23 +60,149 @@ def test_edit_campaign_config_menu_items():
         "Edit campaign identity",
         "Edit trajectory_pool",
         "Edit iteration control",
+        "Edit initial sub-sample sizes",
         "Edit resources",
         "Edit Gaussian block",
+        "Edit batch_sizing",
+        "Edit seed_selection",
+        "Edit anti_overlap",
+        "Edit phase_b",
+        "Edit split",
         "Edit FEREBUS block",
+        "Edit robustness",
         "Edit acquisition core",
         "Edit ARIADNE Block",
         # M15 F15: blocks added in this milestone.
+        "Edit acquisition.subspace",
+        "Edit acquisition.weights",
+        "Edit acquisition.gradient",
         "Edit acquisition.barrier",
         "Edit acquisition.stencils",
         "Edit acquisition.references",
         "Edit stop",
         "Edit outlier_filter",
+        "Edit adversarial_safety",
+        "Edit quality_gates",
+        "Edit runtime",
         "Save to disk",
     ):
         assert expected in texts, "missing item: " + expected
     cfg = get_campaign_config()
     assert cfg.max_iterations >= 1
     assert hasattr(cfg, "ariadne")
+
+
+def test_campaign_config_block_submenus_show_values_and_edit_one_field(monkeypatch):
+    import importlib
+
+    import ichor.cli.main_menu_submenus.active_learning_campaign_menu.field_menu as field_menu
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    menu._replace_campaign_config(CampaignConfig(), loaded_from=None)
+
+    resources_menu = menu._BLOCK_MENUS_BY_LABEL["Edit resources"]
+    rendered = resources_menu.this_menu_options()
+    assert "resources.partition" in rendered
+    assert "resources.walltime_hours" in rendered
+    assert "resources.gradient_parallel_backend" in rendered
+
+    texts = [it.text for it in resources_menu.items]
+    assert "Set partition" in texts
+    assert "Set walltime_hours" in texts
+
+    cfg = menu.get_campaign_config()
+    old_partition = cfg.resources.partition
+    spec = next(
+        spec
+        for spec in resources_menu.this_menu_options.fields
+        if spec.path == "resources.walltime_hours"
+    )
+    monkeypatch.setattr(field_menu, "user_input_int", lambda prompt, default: 37)
+
+    menu._edit_field(spec)
+
+    assert cfg.resources.walltime_hours == 37
+    assert cfg.resources.partition == old_partition
+    assert "resources.walltime_hours: 37" in resources_menu.this_menu_options()
+
+
+def test_campaign_config_csv_and_optional_float_field_editors(monkeypatch):
+    import importlib
+
+    import ichor.cli.main_menu_submenus.active_learning_campaign_menu.field_menu as field_menu
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    cfg = CampaignConfig()
+    cfg.quality_gates.max_abs_integration_error = 0.2
+    menu._replace_campaign_config(cfg, loaded_from=None)
+
+    ferebus_menu = menu._BLOCK_MENUS_BY_LABEL["Edit FEREBUS block"]
+    properties_spec = next(
+        spec
+        for spec in ferebus_menu.this_menu_options.fields
+        if spec.path == "ferebus.properties"
+    )
+    monkeypatch.setattr(field_menu, "user_input_free_flow", lambda prompt, default: "iqa, q00")
+    menu._edit_field(properties_spec)
+    assert menu.get_campaign_config().ferebus.properties == ["iqa", "q00"]
+
+    quality_menu = menu._BLOCK_MENUS_BY_LABEL["Edit quality_gates"]
+    optional_spec = next(
+        spec
+        for spec in quality_menu.this_menu_options.fields
+        if spec.path == "quality_gates.max_abs_integration_error"
+    )
+    monkeypatch.setattr("builtins.input", lambda prompt: "null")
+    menu._edit_field(optional_spec)
+    assert menu.get_campaign_config().quality_gates.max_abs_integration_error is None
+
+
+def test_campaign_config_menu_covers_every_config_leaf():
+    from dataclasses import fields, is_dataclass
+
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_submenus.edit_campaign_config_menu import (
+        _BLOCK_MENUS_BY_LABEL,
+    )
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_submenus.edit_campaign_config_submenus.edit_ariadne_block_submenu import (
+        ARIADNE_FIELD_SPECS,
+    )
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    def leaf_paths(obj, prefix=""):
+        if is_dataclass(obj):
+            out = []
+            for field in fields(obj):
+                child = getattr(obj, field.name)
+                path = field.name if not prefix else prefix + "." + field.name
+                out.extend(leaf_paths(child, path))
+            return out
+        return [prefix]
+
+    specs = []
+    for block_menu in _BLOCK_MENUS_BY_LABEL.values():
+        specs.extend(block_menu.this_menu_options.fields)
+    spec_paths = [spec.path for spec in specs]
+    spec_paths.extend("ariadne." + spec.path for spec in ARIADNE_FIELD_SPECS)
+
+    assert len(spec_paths) == len(set(spec_paths))
+    expected_editable = set(leaf_paths(CampaignConfig())) - {"schema_version"}
+    actual_editable = {
+        spec.path
+        for spec in specs
+        if not spec.read_only
+    } | {"ariadne." + spec.path for spec in ARIADNE_FIELD_SPECS}
+    read_only = {spec.path for spec in specs if spec.read_only}
+
+    assert read_only == {"schema_version"}
+    assert actual_editable == expected_editable
 
 
 def test_ariadne_submenu_shares_block_with_parent():
@@ -92,22 +219,81 @@ def test_ariadne_submenu_shares_block_with_parent():
         "ARIADNE submenu must mutate the same block instance as the parent config"
     )
     texts = [it.text for it in edit_ariadne_block_menu.items]
-    assert "Edit optimiser" in texts
-    assert "Edit max iterations" in texts
+    assert "Set optimiser" in texts
+    assert "Set max_iter" in texts
+    assert "Set delta0" in texts
+    assert "Set delta_max" in texts
+    assert "Edit trust radii" not in texts
 
 
 def test_journal_menu_items():
     from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_submenus.journal_menu import (
         journal_menu,
+        journal_menu_options,
     )
     texts = [it.text for it in journal_menu.items]
     for expected in (
+        "Set since timestamp",
+        "Set event types",
+        "Set last_n",
+        "View matching events",
         "View all events",
-        "View events since ISO timestamp",
-        "Filter by event type",
         "View last N events",
+        "Clear journal filters",
     ):
         assert expected in texts, "missing item: " + expected
+    journal_menu_options.since = "2026-05-23T00:00:00Z"
+    journal_menu_options.event_types = ["sbatch", "phase_succeeded"]
+    journal_menu_options.last_n = 17
+    rendered = journal_menu.this_menu_options()
+    assert "since: 2026-05-23T00:00:00Z" in rendered
+    assert "event_types: sbatch,phase_succeeded" in rendered
+    assert "last_n: 17" in rendered
+
+
+def test_journal_matching_events_uses_visible_filters(tmp_path, monkeypatch):
+    import importlib
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.journal_menu"
+    )
+    import ichor.hpc.active_learning.cli as daemon_cli
+
+    set_selected_campaign_dir(tmp_path)
+    menu.journal_menu_options.since = "2026-05-23T00:00:00Z"
+    menu.journal_menu_options.event_types = ["sbatch", "phase_succeeded"]
+    calls = []
+    monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: "")
+    monkeypatch.setattr(daemon_cli, "cmd_journal", lambda ns: calls.append(ns) or 0)
+
+    menu.JournalFunctions.view_matching_events()
+
+    assert calls
+    assert calls[0].campaign_dir == str(tmp_path)
+    assert calls[0].since == "2026-05-23T00:00:00Z"
+    assert calls[0].event_type == ["sbatch", "phase_succeeded"]
+
+
+def test_journal_clear_filters_resets_visible_state():
+    import importlib
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.journal_menu"
+    )
+
+    menu.journal_menu_options.since = "2026-05-23T00:00:00Z"
+    menu.journal_menu_options.event_types = ["sbatch"]
+    menu.journal_menu_options.last_n = 3
+
+    menu.JournalFunctions.clear_filters()
+
+    assert menu.journal_menu_options.since == ""
+    assert menu.journal_menu_options.event_types == []
+    assert menu.journal_menu_options.last_n == 50
 
 
 def test_top_level_menu_registered_in_main_menu():
@@ -116,7 +302,7 @@ def test_top_level_menu_registered_in_main_menu():
     main_menu_source = (
         Path(__file__).parents[1] / "ichor" / "cli" / "main_menu.py"
     ).read_text(encoding="utf-8")
-    assert "ACTIVE_LEARNING_CAMPAIGN_MENU_DESCRIPTION.title" in main_menu_source
+    assert "ACTIVE_LEARNING_CAMPAIGN_MENU_DESCRIPTION" in main_menu_source
     assert "active_learning_campaign_menu" in main_menu_source
 
 
@@ -382,7 +568,7 @@ def test_campaign_config_load_edit_save_preserves_hidden_fields(tmp_path, monkey
             "full_ARD": False,
         },
         "acquisition": {
-            "property_name": "q00",
+            "property_name": "iqa",
             "allow_uniform_posterior_fallback": True,
         },
     }
@@ -481,24 +667,54 @@ def test_import_pool_passes_no_outlier_filter_choice(tmp_path, monkeypatch):
     )
     menu = importlib.import_module(
         "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
-        "active_learning_campaign_submenus.daemon_control_menu"
+        "active_learning_campaign_submenus.daemon_control_submenus."
+        "import_trajectory_pool_submenu"
     )
-    import ichor.cli.useful_functions as useful_functions
     import ichor.hpc.active_learning.cli as daemon_cli
 
     set_selected_campaign_dir(tmp_path)
+    menu.import_trajectory_pool_menu_options.source_path = "pool.xyz"
+    menu.import_trajectory_pool_menu_options.no_outlier_filter = True
+    menu.import_trajectory_pool_menu_options.force_reimport = False
     calls = []
-    monkeypatch.setattr(useful_functions, "user_input_path", lambda *args, **kwargs: "pool.xyz")
-    monkeypatch.setattr(menu, "user_input_bool", lambda *args, **kwargs: True)
     monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: "")
     monkeypatch.setattr(daemon_cli, "cmd_import_pool", lambda ns: calls.append(ns) or 0)
 
-    menu.DaemonControlFunctions.import_trajectory_pool()
+    menu.ImportTrajectoryPoolFunctions.run_import()
 
     assert calls
     assert calls[0].campaign_dir == str(tmp_path)
     assert calls[0].source == "pool.xyz"
     assert calls[0].no_outlier_filter is True
+    assert calls[0].force is False
+
+
+def test_import_pool_force_requires_confirmation_and_resets(tmp_path, monkeypatch):
+    import importlib
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.daemon_control_submenus."
+        "import_trajectory_pool_submenu"
+    )
+    import ichor.hpc.active_learning.cli as daemon_cli
+
+    set_selected_campaign_dir(tmp_path)
+    menu.import_trajectory_pool_menu_options.source_path = "pool.xyz"
+    menu.import_trajectory_pool_menu_options.no_outlier_filter = False
+    menu.import_trajectory_pool_menu_options.force_reimport = True
+    calls = []
+    responses = iter(["YES", ""])
+    monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: next(responses))
+    monkeypatch.setattr(daemon_cli, "cmd_import_pool", lambda ns: calls.append(ns) or 0)
+
+    menu.ImportTrajectoryPoolFunctions.run_import()
+
+    assert calls
+    assert calls[0].force is True
+    assert menu.import_trajectory_pool_menu_options.force_reimport is False
 
 
 def test_foreground_launch_uses_resume_when_selected(tmp_path, monkeypatch):
@@ -520,6 +736,10 @@ def test_foreground_launch_uses_resume_when_selected(tmp_path, monkeypatch):
     menu.start_daemon_foreground_menu_options.selected_preset = "csf4"
     menu.start_daemon_foreground_menu_options.selected_poll_interval = 3
     menu.start_daemon_foreground_menu_options.selected_max_ticks = 2
+    rendered = menu.start_daemon_foreground_menu.this_menu_options()
+    assert "command: resume" in rendered
+    assert "poll_interval: 3" in rendered
+    assert "max_ticks: 2" in rendered
     calls = []
     monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: "")
     monkeypatch.setattr(daemon_cli, "cmd_start", lambda ns: calls.append(("start", ns)) or 0)
@@ -556,6 +776,10 @@ def test_background_launch_reports_checked_result(tmp_path, monkeypatch, capsys)
     menu.start_daemon_background_menu_options.selected_preset = ""
     menu.start_daemon_background_menu_options.selected_poll_interval = 0
     menu.start_daemon_background_menu_options.selected_max_ticks = 0
+    rendered = menu.start_daemon_background_menu.this_menu_options()
+    assert "poll_interval: 0 (campaign default)" in rendered
+    assert "max_ticks: 0 (unlimited)" in rendered
+    assert "config: <blank>" in rendered
     seen = {}
 
     def fake_launch(campaign_dir, **kwargs):
