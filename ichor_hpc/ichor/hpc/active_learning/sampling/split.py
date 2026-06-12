@@ -98,6 +98,8 @@ def split_stratified_with_holdout(
     rng = np.random.default_rng(int(rng_seed))
     n_holdout = int(round(high_holdout_fraction * n_top_tier))
     n_holdout = max(0, min(n_holdout, n_top_tier))
+    if n_top_tier > 0 and n_holdout >= n_top_tier:
+        n_holdout = n_top_tier - 1
     if n_holdout > 0:
         holdout_choice = rng.choice(n_top_tier, size=n_holdout, replace=False)
         holdout_local = set(int(i) for i in holdout_choice)
@@ -199,4 +201,3 @@ def get_split_strategy(name: str) -> Callable[..., SplitResult]:
             f"unknown split strategy {name!r}; available: {sorted(AVAILABLE_STRATEGIES)}"
         )
     return AVAILABLE_STRATEGIES[name]
-

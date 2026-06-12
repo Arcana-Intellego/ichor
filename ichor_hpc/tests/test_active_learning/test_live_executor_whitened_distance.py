@@ -119,6 +119,35 @@ def test_postprocess_prefers_json_whitened_distance(tmp_path):
     assert d == pytest.approx(0.42, abs=1.0e-6)
 
 
+def test_postprocess_uses_campaign_anti_overlap_bounds(tmp_path):
+    cfg = CampaignConfig()
+    cfg.anti_overlap.min_post_ariadne_whitened_distance = 0.5
+    cfg.anti_overlap.max_post_ariadne_whitened_distance = 2.0
+    ex = LiveBackendsPhaseExecutor(
+        campaign_dir=tmp_path / "campaign",
+        config=cfg,
+        backend_check=False,
+    )
+    _seed_iter_pool(
+        tmp_path / "campaign", 0,
+        [{"alpha_initial": 0.5, "alpha_final": 1.0,
+          "whitened_distance_final": 0.42,
+          "n_evaluations": 1, "return_code": 0,
+          "wall_seconds": 1.0, "fell_back_to_ds": False}],
+    )
+    result = ex._parse_ariadne_array_postprocess(
+        SimpleNamespace(iteration=0, campaign_uid="u"),
+        CampaignPhase("ARIADNE_ARRAY"),
+        observations=[],
+    )
+    assert result.is_complete is True
+    from ichor.hpc.active_learning.versioning.provenance import read_provenance
+    prov = read_provenance(
+        tmp_path / "campaign" / "7_ACTIVE_LEARNING" / "iteration-0000" / "pool" / "seed_0000"
+    )
+    assert prov["anti_overlap"]["flag"] == "moved_too_little"
+
+
 def test_postprocess_falls_back_to_synthetic_when_field_missing(tmp_path):
     ex = _make_executor(tmp_path)
     # NO whitened_distance_final key -- the parser should fall back to

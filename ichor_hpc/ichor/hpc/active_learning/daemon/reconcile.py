@@ -163,6 +163,13 @@ def propose_recovery(
                 continue
             if isinstance(payload, dict) and str(payload.get("status")) in _submission_intent.ACTIVE_STATUSES:
                 active_intents.append(payload)
+    active_intents.sort(
+        key=lambda item: (
+            str(item.get("updated_at_iso") or item.get("updated_iso") or ""),
+            str(item.get("phase") or ""),
+            int(item.get("iteration") or 0),
+        )
+    )
 
     staging_root = campaign / ".DATA" / "STAGING"
     staging_children = [

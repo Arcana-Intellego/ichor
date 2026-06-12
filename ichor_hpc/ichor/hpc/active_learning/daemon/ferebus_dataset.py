@@ -343,9 +343,22 @@ def prop_stats(csv_path, prop: str = "iqa") -> Dict[str, float]:
     # guard the all-equal/single-row case so we dont sqrt a tiny negative rounding crumb.
     var = sum((v - mean) ** 2 for v in vals) / n
     std = _math.sqrt(var) if var > 0.0 else 0.0
+    prop_range = srt[-1] - srt[0]
+    degenerate = (
+        not _math.isfinite(std)
+        or not _math.isfinite(prop_range)
+        or std <= 0.0
+        or prop_range <= 0.0
+    )
+    floor = 1.0e-12
+    if not _math.isfinite(std) or std <= 0.0:
+        std = floor
+    if not _math.isfinite(prop_range) or prop_range <= 0.0:
+        prop_range = floor
     # coefficient of variation is std/|mean|; some properties sit near zero mean so guard it.
     cv = std / abs(mean) if mean != 0.0 else 0.0
     return {
-        "min": srt[0], "max": srt[-1], "range": srt[-1] - srt[0],
+        "min": srt[0], "max": srt[-1], "range": prop_range,
         "mean": mean, "median": median, "std": std, "cv": cv,
+        "degenerate_property_stats": bool(degenerate),
     }

@@ -35,6 +35,7 @@ from ichor.hpc.active_learning.daemon.live_executor import (
     LiveBackendsPhaseExecutor,
     build_sbatch_script,
 )
+from ichor.hpc.active_learning.daemon.phase_executor import BackendSubmissionError
 from ichor.hpc.active_learning.daemon.preflight import (
     BackendAvailability,
     check_backends,
@@ -220,6 +221,33 @@ def test_build_sbatch_script_uses_configured_runtime_modules(monkeypatch):
     assert "module load python/3.11.3-gcccore-12.3.0" not in body
 
 
+def test_build_sbatch_script_rejects_unsafe_configured_module(monkeypatch):
+    fake_global_variables = ModuleType("ichor.hpc.global_variables")
+    fake_global_variables.ICHOR_CONFIG = {
+        "csf4": {"software": {"python": {"modules": ["python,custom"]}}}
+    }
+    fake_global_variables.MACHINE = "csf4"
+
+    def fake_get_param_from_config(config, *keys, default=None):
+        value = config
+        for key in keys:
+            if not isinstance(value, dict) or key not in value:
+                return default
+            value = value[key]
+        return value
+
+    fake_global_variables.get_param_from_config = fake_get_param_from_config
+    monkeypatch.setitem(sys.modules, "ichor.hpc.global_variables", fake_global_variables)
+
+    with pytest.raises(BackendSubmissionError, match="unsafe characters"):
+        build_sbatch_script(
+            phase_name="PHASE_A_POLUS",
+            iteration=0,
+            campaign_dir=Path("/scratch/campaign"),
+            config=CampaignConfig(),
+        )
+
+
 def test_runtime_modules_keep_ariadne_defaults_when_only_python_configured(monkeypatch):
     fake_global_variables = ModuleType("ichor.hpc.global_variables")
     fake_global_variables.ICHOR_CONFIG = {
@@ -376,7 +404,7 @@ def test_build_sbatch_script_renders_aimall_block(monkeypatch):
         campaign_dir=Path("/scratch/campaign"),
         config=CampaignConfig(),
     )
-    assert shlex.quote("/opt/AIM All/aimqb.ish") + " input.wfn" in body
+    assert shlex.quote("/opt/AIM All/aimqb.ish") + " -nogui -encomp=3 input.wfn" in body
     assert "AIMALL-3" in body
 
 

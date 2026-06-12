@@ -268,6 +268,30 @@ def test_find_running_job_handles_sacct_error():
     assert find_running_job_by_name("x", sacct_runner=runner) is None
 
 
+def test_live_job_finder_checks_new_and_legacy_uid_prefixes():
+    from types import SimpleNamespace
+
+    from ichor.hpc.active_learning.daemon.live_executor import make_live_job_finder
+
+    seen = []
+
+    def runner(cmd, **kwargs):
+        name = cmd[cmd.index("--name") + 1]
+        seen.append(name)
+        if name.startswith("abcdefghijkl-"):
+            return _stub_sacct("")()
+        return _stub_sacct("555_0|RUNNING\n")()
+
+    finder = make_live_job_finder(sacct_runner=runner)
+    lookup = finder(
+        SimpleNamespace(campaign_uid="abcdefghijklmnop", iteration=3),
+        CampaignPhase.FEREBUS,
+    )
+
+    assert lookup.job_id == "555"
+    assert seen == ["abcdefghijkl-FEREBUS-3", "abcdefgh-FEREBUS-3"]
+
+
 # --- A4 / A55: manifest robustness ---------------------------------------------------------
 
 

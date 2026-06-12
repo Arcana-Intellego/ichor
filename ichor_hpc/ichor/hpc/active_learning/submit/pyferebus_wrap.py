@@ -23,6 +23,7 @@ from __future__ import annotations
 import subprocess
 import os
 import shlex
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
@@ -207,6 +208,25 @@ def _validate_generated_pyferebus_artifacts(working_dir: Path) -> Path:
     return script
 
 
+def _harden_generated_script(script: Path) -> None:
+    text = script.read_text(encoding="utf-8")
+    if "set -euo pipefail" in text:
+        text = text.replace("set -euo pipefail", "set -eo pipefail")
+        script.write_text(text, encoding="utf-8", newline="\n")
+    lines = text.splitlines()
+    insert_at = 1 if lines and lines[0].startswith("#!") else 0
+    additions = []
+    if "set -eo pipefail" not in text and "set -euo pipefail" not in text:
+        additions.append("set -eo pipefail")
+    if "export LC_ALL=C" not in text:
+        additions.append("export LC_ALL=C")
+    if "export LC_NUMERIC=C" not in text:
+        additions.append("export LC_NUMERIC=C")
+    if additions:
+        lines[insert_at:insert_at] = additions
+        script.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+
+
 def _validate_configured_executable(path_to_executable: Union[str, Path]) -> str:
     exe = str(path_to_executable)
     _reject_control_chars("configured FEREBUS executable", exe)
@@ -230,17 +250,21 @@ def _patch_generated_executable(script: Path, path_to_executable: Union[str, Pat
     if not exe or exe == "ferebus":
         return
     text = script.read_text(encoding="utf-8")
-    bare_call = "            ferebus ${line}"
-    replacement = "            " + shlex.quote(exe) + " ${line}"
-    if bare_call in text:
-        text = text.replace(bare_call, replacement)
+    executable_call = shlex.quote(exe) + " ${line}"
+    patched_text = re.sub(
+        r"(?m)^([ \t]*)ferebus[ \t]+\$\{line\}[ \t]*$",
+        lambda match: match.group(1) + executable_call,
+        text,
+    )
+    if patched_text != text:
+        text = patched_text
         script.write_text(text, encoding="utf-8", newline="\n")
-    elif replacement not in text:
+    elif executable_call not in text:
         raise FerebusSubmissionError(
             "could not patch FEREBUS executable path into " + str(script)
         )
     patched = script.read_text(encoding="utf-8")
-    if bare_call in patched or replacement not in patched:
+    if re.search(r"(?m)^[ \t]*ferebus[ \t]+\$\{line\}[ \t]*$", patched) or executable_call not in patched:
         raise FerebusSubmissionError(
             "FEREBUS executable patch validation failed for " + str(script)
         )
@@ -389,6 +413,7 @@ def submit_ferebus(
         os.chdir(cwd)
 
     script = _validate_generated_pyferebus_artifacts(working_dir)
+    _harden_generated_script(script)
     if path_to_executable:
         _patch_generated_executable(script, path_to_executable)
 

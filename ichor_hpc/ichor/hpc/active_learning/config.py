@@ -41,6 +41,7 @@ __all__ = [
     "StopConfigBlock",
     "CONFIG_SCHEMA_VERSION",
     "ConfigValidationError",
+    "AimallConfigBlock",
     "VALID_BATCH_POLICIES",
     "VALID_WARMSTART",
     "VALID_DESCRIPTORS",
@@ -73,6 +74,7 @@ _SYSTEM_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 _SCHEDULER_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$")
 _SLURM_MEMORY_RE = re.compile(r"^[1-9][0-9]*[KMGT]?$")
 _GAUSSIAN_MEMORY_RE = re.compile(r"^[1-9][0-9]*(?:[KMGT](?:B|W)?)?$")
+_MEMORY_PARSE_RE = re.compile(r"^([1-9][0-9]*)([KMGT]?)([BW]?)$")
 
 
 # Sentinel used by diff_against_defaults to distinguish "default match" from
@@ -124,6 +126,32 @@ def _validate_memory(name: str, value: Any, pattern: re.Pattern, description: st
         raise ConfigValidationError(name + " must be a string")
     if not pattern.fullmatch(value):
         raise ConfigValidationError(name + " must use " + description + ": " + repr(value))
+
+
+def _memory_mebibytes(name: str, value: str, *, gaussian: bool) -> float:
+    """Parse the memory syntaxes this daemon accepts into MiB.
+
+    SLURM values are plain K/M/G/T suffixes. Gaussian accepts byte-like MB/GB and word-like MW/GW
+    suffixes; for the resource cross-check, one Gaussian word is treated as eight bytes.
+    Bare numbers are interpreted as MiB because CSF4 SLURM and our campaign examples use explicit
+    G/GB in normal operation and this is the least surprising fallback for validation.
+    """
+    match = _MEMORY_PARSE_RE.fullmatch(str(value).upper())
+    if not match:
+        raise ConfigValidationError(name + " has unsupported memory syntax: " + repr(value))
+    amount = int(match.group(1))
+    scale = match.group(2) or "M"
+    suffix = match.group(3)
+    multiplier_mib = {
+        "K": 1.0 / 1024.0,
+        "M": 1.0,
+        "G": 1024.0,
+        "T": 1024.0 * 1024.0,
+    }[scale]
+    mib = float(amount) * multiplier_mib
+    if gaussian and suffix == "W":
+        mib *= 8.0
+    return mib
 
 
 def diff_against_defaults(config) -> Dict[str, Any]:
@@ -180,10 +208,17 @@ class AcquisitionBarrierBlock:
     nonbonded_clash_scale: float = 0.85
     clash_delta: float = 0.05
     clash_lambda: float = 5.0
+    nonbonded_expansion_scale: float = 1.80
+    nonbonded_expansion_delta: float = 0.10
+    nonbonded_expansion_lambda: float = 0.5
     bond_lower_scale: float = 0.80
     bond_upper_scale: float = 1.25
     bond_delta: float = 0.05
     bond_lambda: float = 2.0
+    angle_lower_scale: float = 0.65
+    angle_upper_scale: float = 1.35
+    angle_delta: float = 0.10
+    angle_lambda: float = 0.5
     energy_cap_quantile: float = 0.95
     energy_cap_floor: float = 0.05
     energy_cap_delta: float = 0.05
@@ -202,7 +237,7 @@ class AcquisitionStencilsBlock:
     jitter: float = 1.0e-12
     curvature_floor: float = 1.0e-6
     softplus_scale: float = 1.0e-4
-    autotune_from_cubic: bool = False
+    autotune_from_cubic: bool = True
 
 
 @dataclass
@@ -379,8 +414,8 @@ class QualityGatesConfigBlock:
     ferebus_min_ext_r2: Optional[float] = None
     ferebus_max_ext_rmse_ha: Optional[float] = None
     ferebus_max_condition_number: Optional[float] = None
-    ariadne_max_displacement_ang: Optional[float] = None
-    ariadne_min_pair_distance_ang: Optional[float] = None
+    ariadne_max_displacement_ang: Optional[float] = 1.25
+    ariadne_min_pair_distance_ang: Optional[float] = 0.60
 
 
 @dataclass
@@ -389,6 +424,7 @@ class RuntimeConfigBlock:
     postprocess_settle_attempts: int = 3
     postprocess_settle_seconds: int = 10
     transient_phase_retry_max: int = 1
+    poll_sacct_unknown_max_ticks: int = 3
 
 
 @dataclass
@@ -411,7 +447,7 @@ class ResourceConfigBlock:
     # --mem gets rejected/ignored there, so we emit this as --mem-per-cpu. the total a task gets
     # is roughly this * cpus_per_task. keep the sbatch unit style (4G, 8G) -- gaussian.mem below
     # uses gaussian's own "8GB" style, the two are deliberately different conventions.
-    mem_per_cpu: str = "4G"
+    mem_per_cpu: str = "8G"
     cpus_per_task: int = 1
     ntasks: int = 1
     ariadne_cpus_per_task: int = 8
@@ -441,6 +477,12 @@ class GaussianConfigBlock:
 
 
 @dataclass
+class AimallConfigBlock:
+    encomp: int = 3
+    nogui: bool = True
+
+
+@dataclass
 class CampaignConfig:
     """Top-level campaign configuration (schema v2)."""
 
@@ -464,6 +506,7 @@ class CampaignConfig:
     initial_val_size: int = 50
 
     failure_threshold_fraction: float = 0.5
+    max_acquisition_grad_per_ang: Optional[float] = None
     max_force_per_atom_ha_per_ang: float = 50.0
 
     trajectory_pool: TrajectoryPoolConfigBlock = field(
@@ -498,6 +541,7 @@ class CampaignConfig:
     stop: StopConfigBlock = field(default_factory=StopConfigBlock)
     resources: ResourceConfigBlock = field(default_factory=ResourceConfigBlock)
     gaussian: GaussianConfigBlock = field(default_factory=GaussianConfigBlock)
+    aimall: AimallConfigBlock = field(default_factory=AimallConfigBlock)
 
     def to_dict(self):
         return asdict(self)
@@ -593,6 +637,9 @@ class CampaignConfig:
             _GAUSSIAN_MEMORY_RE,
             "Gaussian memory syntax such as 8GB or 8000MB",
         )
+        _validate_positive_int("aimall.encomp", self.aimall.encomp)
+        if not isinstance(self.aimall.nogui, bool):
+            raise ConfigValidationError("aimall.nogui must be a boolean")
         if self.max_iterations <= 0:
             raise ConfigValidationError("max_iterations must be > 0")
         if self.poll_interval_seconds < 1:
@@ -639,6 +686,10 @@ class CampaignConfig:
             "runtime.transient_phase_retry_max",
             self.runtime.transient_phase_retry_max,
         )
+        _validate_nonnegative_int(
+            "runtime.poll_sacct_unknown_max_ticks",
+            self.runtime.poll_sacct_unknown_max_ticks,
+        )
         if self.anti_overlap.recent_seeds_cooldown < 0:
             raise ConfigValidationError(
                 "anti_overlap.recent_seeds_cooldown must be >= 0"
@@ -678,6 +729,10 @@ class CampaignConfig:
         ):
             if not 0.0 <= frac <= 1.0:
                 raise ConfigValidationError(frac_name + " must be in [0, 1]")
+        if float(self.split.train_fraction) + float(self.split.val_mid_fraction) > 1.0:
+            raise ConfigValidationError(
+                "split.train_fraction + split.val_mid_fraction must be <= 1"
+            )
         if self.ferebus.warmstart not in VALID_WARMSTART:
             raise ConfigValidationError(
                 "ferebus.warmstart must be one of " + repr(sorted(VALID_WARMSTART))
@@ -797,9 +852,30 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "adversarial_safety.max_whitened_distance must be > min_whitened_distance"
             )
+        if self.max_acquisition_grad_per_ang is not None:
+            _validate_optional_nonnegative_float(
+                "max_acquisition_grad_per_ang",
+                self.max_acquisition_grad_per_ang,
+            )
+            if float(self.max_acquisition_grad_per_ang) <= 0.0:
+                raise ConfigValidationError(
+                    "max_acquisition_grad_per_ang must be > 0"
+                )
         if self.max_force_per_atom_ha_per_ang <= 0:
             raise ConfigValidationError(
                 "max_force_per_atom_ha_per_ang must be > 0"
+            )
+        if (
+            self.max_acquisition_grad_per_ang is not None
+            and float(self.max_force_per_atom_ha_per_ang) != 50.0
+            and abs(
+                float(self.max_acquisition_grad_per_ang)
+                - float(self.max_force_per_atom_ha_per_ang)
+            ) > 1.0e-12
+        ):
+            raise ConfigValidationError(
+                "max_acquisition_grad_per_ang conflicts with deprecated "
+                "max_force_per_atom_ha_per_ang; set only one clamp field"
             )
         # Subspace-dim cross-validation. These catch configurations
         #that pass field-by-field validation but blow up later inside PCA.
@@ -831,6 +907,43 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "acquisition.allow_uniform_posterior_fallback must be a boolean"
             )
+        ba = self.acquisition.barrier
+        for name, value in (
+            ("acquisition.barrier.nonbonded_clash_scale", ba.nonbonded_clash_scale),
+            ("acquisition.barrier.clash_delta", ba.clash_delta),
+            ("acquisition.barrier.clash_lambda", ba.clash_lambda),
+            ("acquisition.barrier.nonbonded_expansion_scale", ba.nonbonded_expansion_scale),
+            ("acquisition.barrier.nonbonded_expansion_delta", ba.nonbonded_expansion_delta),
+            ("acquisition.barrier.nonbonded_expansion_lambda", ba.nonbonded_expansion_lambda),
+            ("acquisition.barrier.bond_lower_scale", ba.bond_lower_scale),
+            ("acquisition.barrier.bond_upper_scale", ba.bond_upper_scale),
+            ("acquisition.barrier.bond_delta", ba.bond_delta),
+            ("acquisition.barrier.bond_lambda", ba.bond_lambda),
+            ("acquisition.barrier.angle_lower_scale", ba.angle_lower_scale),
+            ("acquisition.barrier.angle_upper_scale", ba.angle_upper_scale),
+            ("acquisition.barrier.angle_delta", ba.angle_delta),
+            ("acquisition.barrier.angle_lambda", ba.angle_lambda),
+            ("acquisition.barrier.energy_cap_quantile", ba.energy_cap_quantile),
+            ("acquisition.barrier.energy_cap_floor", ba.energy_cap_floor),
+            ("acquisition.barrier.energy_cap_delta", ba.energy_cap_delta),
+            ("acquisition.barrier.energy_cap_lambda", ba.energy_cap_lambda),
+        ):
+            _validate_optional_nonnegative_float(name, value)
+        if ba.bond_upper_scale <= ba.bond_lower_scale:
+            raise ConfigValidationError(
+                "acquisition.barrier.bond_upper_scale must be > bond_lower_scale"
+            )
+        if ba.angle_upper_scale <= ba.angle_lower_scale:
+            raise ConfigValidationError(
+                "acquisition.barrier.angle_upper_scale must be > angle_lower_scale"
+            )
+        if not 0.0 <= float(ba.energy_cap_quantile) <= 1.0:
+            raise ConfigValidationError(
+                "acquisition.barrier.energy_cap_quantile must be in [0, 1]"
+            )
+        _validate_optional_nonnegative_float(
+            "acquisition.barrier.softplus_cap", ba.softplus_cap
+        )
         if (
             self.acquisition.subspace.mode_weighting_policy
             not in VALID_MODE_WEIGHTING_POLICIES
@@ -849,6 +962,25 @@ class CampaignConfig:
                 "resources.cpus_per_task (" + str(self.resources.cpus_per_task) + ") -- "
                 "%NProcShared threads would oversubscribe the cores SLURM gives the task"
             )
+        gaussian_mem_mib = _memory_mebibytes("gaussian.mem", self.gaussian.mem, gaussian=True)
+        slurm_mem_mib = _memory_mebibytes(
+            "resources.mem_per_cpu", self.resources.mem_per_cpu, gaussian=False
+        ) * float(self.resources.cpus_per_task)
+        if gaussian_mem_mib > slurm_mem_mib:
+            raise ConfigValidationError(
+                "gaussian.mem ("
+                + str(self.gaussian.mem)
+                + ") exceeds SLURM allocation resources.mem_per_cpu * cpus_per_task ("
+                + str(self.resources.mem_per_cpu)
+                + " * "
+                + str(self.resources.cpus_per_task)
+                + ")"
+            )
+
+    def effective_max_acquisition_grad_per_ang(self) -> float:
+        if self.max_acquisition_grad_per_ang is not None:
+            return float(self.max_acquisition_grad_per_ang)
+        return float(self.max_force_per_atom_ha_per_ang)
 
     def to_acquisition_config(self):
         """Materialise an ichor.core AcquisitionConfig from the nested
@@ -900,10 +1032,17 @@ class CampaignConfig:
                 nonbonded_clash_scale=ba.nonbonded_clash_scale,
                 clash_delta=ba.clash_delta,
                 clash_lambda=ba.clash_lambda,
+                nonbonded_expansion_scale=ba.nonbonded_expansion_scale,
+                nonbonded_expansion_delta=ba.nonbonded_expansion_delta,
+                nonbonded_expansion_lambda=ba.nonbonded_expansion_lambda,
                 bond_lower_scale=ba.bond_lower_scale,
                 bond_upper_scale=ba.bond_upper_scale,
                 bond_delta=ba.bond_delta,
                 bond_lambda=ba.bond_lambda,
+                angle_lower_scale=ba.angle_lower_scale,
+                angle_upper_scale=ba.angle_upper_scale,
+                angle_delta=ba.angle_delta,
+                angle_lambda=ba.angle_lambda,
                 energy_cap_quantile=ba.energy_cap_quantile,
                 energy_cap_floor=ba.energy_cap_floor,
                 energy_cap_delta=ba.energy_cap_delta,

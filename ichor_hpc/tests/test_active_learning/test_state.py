@@ -97,6 +97,28 @@ def test_read_state_rejects_wrong_schema_version(tmp_path):
         read_state(p)
 
 
+@pytest.mark.parametrize(
+    "field,value,match",
+    [
+        ("schema_version", None, "schema_version"),
+        ("reference_scales_iteration", None, "reference_scales_iteration"),
+        ("last_n_anti_overlap_flagged", "abc", "last_n_anti_overlap_flagged"),
+    ],
+)
+def test_read_state_wraps_malformed_integer_fields(field, value, match):
+    payload = fresh_campaign_state().to_dict()
+    payload[field] = value
+    with pytest.raises(StateSchemaError, match=match):
+        CampaignState.from_dict(payload)
+
+
+def test_read_state_wraps_malformed_sacct_empty_streak_value():
+    payload = fresh_campaign_state().to_dict()
+    payload["sacct_empty_streak"] = {"123": "abc"}
+    with pytest.raises(StateSchemaError, match="sacct_empty_streak"):
+        CampaignState.from_dict(payload)
+
+
 def test_read_state_rejects_unknown_phase(tmp_path):
     p = tmp_path / "state.json"
     bad = fresh_campaign_state().to_dict()

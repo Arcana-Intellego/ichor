@@ -127,6 +127,27 @@ def aligned_mass_weighted_distance(reference: Atoms, mobile: Atoms) -> float:
     return float(np.sqrt(np.dot(m, diff.reshape(-1) ** 2)))
 
 
+def aligned_mass_weighted_rmsd(reference: Atoms, mobile: Atoms) -> float:
+    """Return aligned mass-normalised RMSD in coordinate units.
+
+    This is the RMSD-like version operators expect for duplicate filtering: the squared
+    displacement is mass weighted, then normalised by the total molecular mass instead of growing
+    with molecule size.
+    """
+    ref = atoms_to_coordinates(reference)
+    mob = atoms_to_coordinates(mobile)
+    masses = np.asarray(reference.masses, dtype=float)
+    aligned = kabsch_align(ref, mob, weights=masses)
+    diff = aligned - ref
+    denom = float(np.sum(masses))
+    if denom <= 0.0 or not np.isfinite(denom):
+        denom = float(len(reference))
+    if denom <= 0.0:
+        return 0.0
+    weighted_sq = float(np.sum(masses[:, None] * diff ** 2))
+    return float(np.sqrt(max(0.0, weighted_sq / denom)))
+
+
 
 def aligned_mass_weighted_displacement(reference: Atoms, mobile: Atoms) -> np.ndarray:
     ref = atoms_to_coordinates(reference)

@@ -195,6 +195,22 @@ def test_prop_stats_from_iqa_column(tmp_path):
     assert abs(s["cv"] - (s["std"] / 2.5)) < 1e-12
 
 
+def test_prop_stats_floors_degenerate_property_column(tmp_path):
+    from ichor.hpc.active_learning.daemon.ferebus_dataset import prop_stats
+    src = tmp_path / "constant.csv"
+    src.write_text(
+        "f1,f2,f3,iqa\n"
+        "0.1,0.2,0.3,-75.0\n"
+        "0.4,0.5,0.6,-75.0\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    s = prop_stats(src, "iqa")
+    assert s["degenerate_property_stats"] is True
+    assert s["std"] > 0.0
+    assert s["range"] > 0.0
+
+
 def test_prop_stats_empty_or_missing(tmp_path):
     from ichor.hpc.active_learning.daemon.ferebus_dataset import prop_stats
     # header only, no data rows -> empty dict, caller just omits the keys

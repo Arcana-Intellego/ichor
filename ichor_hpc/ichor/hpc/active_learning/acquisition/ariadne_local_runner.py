@@ -28,9 +28,8 @@ from typing import List, Optional
 import numpy as np
 
 
-# 1 Hartree expressed in eV. matches the value ASE uses; we redefine
-# it here rather than depend on ase.units so this module is importable
-# in environments where ase is not installed (e.g. very lean CI runs).
+# ASE's Hartree-to-eV scale. Here it is only the reversible pseudo-energy
+# scale used by AdversarialASECalculator at the ASE boundary.
 _HARTREE_EV = 27.211386245988
 
 # ariadne tags hessian models by integer. mirror the starter pack
@@ -112,28 +111,33 @@ def _hessian_model_id(name) -> int:
     return _HESSIAN_MODEL_MAP[key]
 
 
+def _flatten_xyz(values) -> np.ndarray:
+    return np.asfortranarray(np.asarray(values, dtype=np.float64).reshape(-1), dtype=np.float64)
+
+
 def _eval_energy_gradient(atoms):
-    """One calculator evaluation. Returns (e_hartree, g_xyz_hartree_ang).
+    """One calculator evaluation. Returns (f_pseudo, g_flat_pseudo).
 
     Mirrors evaluate_energy_and_gradient from the ARIADNE starter pack.
-    The adversarial calculator returns energy + forces in ASE units
-    (eV and eV/Angstrom). ARIADNE wants Hartree and Hartree/Angstrom,
-    so we convert. Sign-flipping force -> gradient lives here too.
+    The adversarial calculator returns pseudo-energy + pseudo-forces in ASE
+    units (eV and eV/Angstrom). Divide by the same pseudo Hartree scale so
+    ARIADNE optimises alpha in acquisition units.
     """
     e_ev = float(atoms.get_potential_energy())
     forces_ev = np.asarray(atoms.get_forces(), dtype=np.float64)
     grad_ev = -forces_ev
     e_hartree = e_ev / _HARTREE_EV
     g_xyz_hartree = np.asfortranarray(grad_ev / _HARTREE_EV, dtype=np.float64)
+    g_flat_hartree = _flatten_xyz(g_xyz_hartree)
     if not np.isfinite(e_hartree):
         raise RuntimeError(
-            "calculator returned non-finite energy"
+            "calculator returned non-finite pseudo-energy"
         )
-    if not np.isfinite(g_xyz_hartree).all():
+    if not np.isfinite(g_flat_hartree).all():
         raise RuntimeError(
             "calculator returned non-finite entries in the gradient"
         )
-    return e_hartree, g_xyz_hartree
+    return e_hartree, g_flat_hartree
 
 
 def _sync_state(opt, n_atoms):
@@ -173,6 +177,64 @@ def _status_ds(opt):
     accepted = bool(status[9])
     f_current = float(status[2])
     return converged, accepted, f_current
+
+
+def _status_tuple(opt):
+    try:
+        return tuple(opt.get_status_py())
+    except Exception:
+        return ()
+
+
+def _optimizer_flag(opt, name: str):
+    if not hasattr(opt, name):
+        return None
+    value = getattr(opt, name)
+    try:
+        value = value() if callable(value) else value
+    except Exception:
+        return None
+    return value
+
+
+def _raise_if_init_failed(opt, label: str) -> None:
+    init_ok = _optimizer_flag(opt, "init_ok")
+    if init_ok is not None and not bool(init_ok):
+        reason = _optimizer_flag(opt, "init_reason")
+        if reason is None:
+            reason = _optimizer_flag(opt, "init_message")
+        raise RuntimeError(
+            "ARIADNE "
+            + label
+            + " initialisation failed"
+            + (": " + str(reason) if reason else "")
+        )
+
+
+def _proposal_pending(opt, status) -> bool:
+    value = _optimizer_flag(opt, "proposal_pending")
+    if value is not None:
+        return bool(value)
+    if len(status) > 3 and isinstance(status[3], (bool, np.bool_)):
+        return bool(status[3])
+    return True
+
+
+def _skip_step_after_rebuild(opt, status) -> bool:
+    value = _optimizer_flag(opt, "skip_step_after_rebuild")
+    if value is not None:
+        return bool(value)
+    return False
+
+
+def _set_invalid_trial_reason(opt, reason: str) -> None:
+    setter = getattr(opt, "set_invalid_trial_reason_py", None)
+    if setter is None:
+        return
+    try:
+        setter(str(reason)[:240])
+    except Exception:
+        return
 
 
 def _push_positions(atoms, q_xyz):
@@ -259,7 +321,8 @@ def run_optimisation_against_calculator(
 
     # one calculator call before the loop -- ariadne needs an initial
     # energy + gradient to seed its internal hessian model.
-    e0_hartree, g0_xyz = _eval_energy_gradient(atoms)
+    e0_hartree, g0_flat = _eval_energy_gradient(atoms)
+    g0_xyz = np.asfortranarray(g0_flat.reshape(natoms, 3), dtype=np.float64)
     n_evaluations = 1
 
     optimiser_name = (run_config.optimiser or "trust_region_qn").strip().lower()
@@ -275,14 +338,16 @@ def run_optimisation_against_calculator(
             + "; valid: trust_region_qn | dissipative_symplectic"
         )
 
+    _raise_if_init_failed(opt, "DS" if not is_trqn else "TRQN")
+
     # alpha is what we want to MAXIMISE (the adversarial acquisition
-    # value). the calculator already negated energy so ariadne can
-    # minimise, so alpha = -energy.
+    # value). the calculator exposes a pseudo-energy so ariadne can
+    # minimise, so alpha = -f_pseudo.
     alpha_trajectory = [-e0_hartree]
-    grad_norm_trajectory = [float(np.linalg.norm(g0_xyz))]
+    grad_norm_trajectory = [float(np.linalg.norm(g0_flat))]
     candidate_positions = [np.asarray(q0_xyz_angstrom, dtype=np.float64).copy()]
     candidate_alphas = [float(-e0_hartree)]
-    candidate_grad_norms = [float(np.linalg.norm(g0_xyz))]
+    candidate_grad_norms = [float(np.linalg.norm(g0_flat))]
     fell_back_to_ds = False
     rigid_force_clamps = 0
     consecutive_rejects = 0
@@ -290,7 +355,7 @@ def run_optimisation_against_calculator(
     converged = False
     return_code = 1  # max_iter default until we converge or error
 
-    zero_grad = np.zeros((natoms, 3), dtype=np.float64, order="F")
+    zero_grad = np.zeros(3 * natoms, dtype=np.float64, order="F")
 
     for step_idx in range(int(run_config.max_iter)):
         f_old = f_current
@@ -304,6 +369,34 @@ def run_optimisation_against_calculator(
         except Exception:
             return_code = 2
             break
+        status_after_stage0 = _status_tuple(opt)
+        if (
+            not _proposal_pending(opt, status_after_stage0)
+            or _skip_step_after_rebuild(opt, status_after_stage0)
+        ):
+            q_current, g_current = _sync_state(opt, natoms)
+            _push_positions(atoms, q_current)
+            try:
+                opt.step_py(
+                    stage=1,
+                    f_old=f_old,
+                    f_new=f_old,
+                    g_xyz_new=_flatten_xyz(g_current),
+                )
+            except Exception:
+                return_code = 2
+                break
+            if is_trqn:
+                opt_converged, accepted, f_current = _status_trqn(opt)
+            else:
+                opt_converged, accepted, f_current = _status_ds(opt)
+            alpha_trajectory.append(-float(f_current))
+            grad_norm_trajectory.append(float(np.linalg.norm(g_current)))
+            if opt_converged:
+                converged = True
+                return_code = 0
+                break
+            continue
 
         # pull the proposed geometry out and push it into the ASE atoms
         # so the calculator can evaluate the trial point.
@@ -313,10 +406,20 @@ def run_optimisation_against_calculator(
         try:
             f_trial, g_trial = _eval_energy_gradient(atoms)
             n_evaluations += 1
-        except Exception:
-            # calculator died on the trial point. break out and tag as
-            # error -- the caller will write a small result.json and
-            # the postprocess parser will flag the seed.
+        except Exception as exc:
+            _set_invalid_trial_reason(opt, type(exc).__name__ + ": " + str(exc))
+            try:
+                _q_current, g_current = _sync_state(opt, natoms)
+                if not np.isfinite(g_current).all():
+                    g_current = zero_grad
+                opt.step_py(
+                    stage=1,
+                    f_old=f_old,
+                    f_new=f_old,
+                    g_xyz_new=_flatten_xyz(g_current),
+                )
+            except Exception:
+                pass
             return_code = 2
             break
 
@@ -382,8 +485,11 @@ def run_optimisation_against_calculator(
                     np.asfortranarray(
                         atoms.get_positions(), dtype=np.float64,
                     ),
-                    g_here, atom_list, run_config,
+                    np.asfortranarray(g_here.reshape(natoms, 3), dtype=np.float64),
+                    atom_list,
+                    run_config,
                 )
+                _raise_if_init_failed(opt, "DS")
                 is_trqn = False
                 fell_back_to_ds = True
                 consecutive_rejects = 0
@@ -392,11 +498,14 @@ def run_optimisation_against_calculator(
                 break
 
     # the adversarial calculator subscripts the clamp counter as a dict;
-    # per_atom_force is the key it bumps when it had to clip a gradient.
+    # per_atom_acquisition_grad is the current key. read the old key too so
+    # older calculator shims remain schema-compatible.
     cc = getattr(calculator, "_clamp_counter", None)
     if isinstance(cc, dict):
         try:
-            rigid_force_clamps = int(cc.get("per_atom_force", 0))
+            rigid_force_clamps = int(
+                cc.get("per_atom_acquisition_grad", cc.get("per_atom_force", 0))
+            )
         except (TypeError, ValueError):
             rigid_force_clamps = 0
 

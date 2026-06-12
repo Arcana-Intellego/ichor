@@ -37,10 +37,17 @@ class BarrierConfig:
     nonbonded_clash_scale: float = 0.85
     clash_delta: float = 0.05
     clash_lambda: float = 5.0
+    nonbonded_expansion_scale: float = 1.80
+    nonbonded_expansion_delta: float = 0.10
+    nonbonded_expansion_lambda: float = 0.5
     bond_lower_scale: float = 0.80
     bond_upper_scale: float = 1.25
     bond_delta: float = 0.05
     bond_lambda: float = 2.0
+    angle_lower_scale: float = 0.65
+    angle_upper_scale: float = 1.35
+    angle_delta: float = 0.10
+    angle_lambda: float = 0.5
     energy_cap_quantile: float = 0.95
     energy_cap_floor: float = 0.05
     energy_cap_delta: float = 0.05

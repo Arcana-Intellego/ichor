@@ -153,7 +153,8 @@ def optimise_seed(
     mock: bool = False,
     seed_frame_id: Optional[int] = None,
     external_reference_scales: Optional[dict] = None,
-    max_force_per_atom_ha_per_ang: float = 50.0,
+    max_acquisition_grad_per_ang: Optional[float] = None,
+    max_force_per_atom_ha_per_ang: Optional[float] = 50.0,
     project_rigid: bool = True,
     gradient_backend: str = "process",
     safety_config: Optional[Any] = None,
@@ -169,7 +170,7 @@ def optimise_seed(
         Needs the oneAPI .so on PYTHONPATH.
 
     The extra kwargs (seed_frame_id, external_reference_scales,
-    max_force_per_atom_ha_per_ang, project_rigid) are passed through
+    max_acquisition_grad_per_ang, project_rigid) are passed through
     to _live_optimise_seed when mock=False. They are ignored in the
     mock path -- the mock has no real posterior or subspace to use
     them with.
@@ -182,6 +183,7 @@ def optimise_seed(
         models, seed, trajectory, acquisition_config, run_config,
         seed_frame_id=seed_frame_id,
         external_reference_scales=external_reference_scales,
+        max_acquisition_grad_per_ang=max_acquisition_grad_per_ang,
         max_force_per_atom_ha_per_ang=max_force_per_atom_ha_per_ang,
         project_rigid=project_rigid,
         gradient_backend=gradient_backend,
@@ -275,6 +277,14 @@ def _evaluate_landing_candidate(
     coords = np.asarray(coords, dtype=float).reshape(-1, 3)
     metrics = _geometry_metrics(seed_coords, coords)
     atoms = _copy_atoms_with_coords(seed_atoms, coords)
+    try:
+        from ichor.core.adversarial.geometry import aligned_mass_weighted_rmsd
+
+        metrics["aligned_mass_weighted_rmsd_ang"] = float(
+            aligned_mass_weighted_rmsd(seed_atoms, atoms)
+        )
+    except Exception:
+        metrics["aligned_mass_weighted_rmsd_ang"] = None
 
     if coords.shape != seed_coords.shape or not np.all(np.isfinite(coords)):
         reasons.append("ariadne_landing_geometry_nonfinite")
@@ -321,6 +331,7 @@ def _evaluate_landing_candidate(
         metrics["energy_variance"] = float(breakdown.energy_variance)
         metrics["chemistry_penalty"] = float(breakdown.chemistry_penalty)
         metrics["distance_penalty"] = float(breakdown.distance_penalty)
+        metrics["total_score"] = float(breakdown.total)
         alpha_value = float(breakdown.total if alpha is None else alpha)
         informativeness = float(breakdown.informativeness_score)
         risk_penalty = float(breakdown.risk_penalty_score)
@@ -514,7 +525,11 @@ def _select_safe_landing(
     safe_candidates = [c for c in candidates if bool(c.get("accepted"))]
     if safe_candidates:
         def _rank(candidate: Dict[str, Any]) -> float:
-            value = _safe_float_or_none(candidate.get("informativeness_score"))
+            value = _safe_float_or_none(candidate.get("alpha"))
+            if value is None:
+                value = _safe_float_or_none(
+                    candidate.get("metrics", {}).get("total_score")
+                )
             return -math.inf if value is None else float(value)
 
         selected = max(
@@ -650,7 +665,8 @@ def _live_optimise_seed(
     *,
     seed_frame_id: Optional[int] = None,
     external_reference_scales: Optional[dict] = None,
-    max_force_per_atom_ha_per_ang: float = 50.0,
+    max_acquisition_grad_per_ang: Optional[float] = None,
+    max_force_per_atom_ha_per_ang: Optional[float] = 50.0,
     project_rigid: bool = True,
     gradient_backend: str = "process",
     safety_config: Optional[Any] = None,
@@ -688,13 +704,14 @@ def _live_optimise_seed(
     )
 
     # AdversarialASECalculator subscripts the clamp counter as a dict
-    # (per_atom_force key). a plain dict matches that contract exactly --
+    # (per_atom_acquisition_grad key). a plain dict matches that contract exactly --
     # an earlier custom-class shim had a .value attribute that did not.
     counter = {}
 
     calculator = AdversarialASECalculator(
         acquisition=acquisition,
         project_rigid=project_rigid,
+        max_acquisition_grad_per_ang=max_acquisition_grad_per_ang,
         max_force_per_atom_ha_per_ang=max_force_per_atom_ha_per_ang,
         # honour the operator's resources.gradient_parallel_backend rather than hardcoding -- lets
         # them force "serial" on a node without fork, or for debugging (A33).
@@ -983,9 +1000,7 @@ def main(argv=None) -> int:
             mock=False,
             seed_frame_id=seed_frame_id,
             external_reference_scales=external_reference_scales,
-            max_force_per_atom_ha_per_ang=float(
-                config.max_force_per_atom_ha_per_ang,
-            ),
+            max_acquisition_grad_per_ang=config.effective_max_acquisition_grad_per_ang(),
             gradient_backend=str(config.resources.gradient_parallel_backend),
             safety_config=getattr(config, "adversarial_safety", None),
             quality_gates=getattr(config, "quality_gates", None),

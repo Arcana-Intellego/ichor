@@ -26,7 +26,7 @@ from typing import Iterable, List, Sequence, Tuple
 
 import numpy as np
 
-from ichor.core.adversarial.geometry import aligned_mass_weighted_distance
+from ichor.core.adversarial.geometry import aligned_mass_weighted_rmsd
 from ichor.core.atoms import Atoms
 
 
@@ -56,7 +56,7 @@ class DedupReport:
 
 
 def min_distance_to_training(candidate: Atoms, training: Sequence[Atoms]) -> float:
-    """Return the smallest aligned mass-weighted distance from "candidate"
+    """Return the smallest aligned mass-weighted RMSD from "candidate"
     to any point in "training".
 
     Returns "float("inf")" if "training" is empty -- the candidate is
@@ -66,7 +66,7 @@ def min_distance_to_training(candidate: Atoms, training: Sequence[Atoms]) -> flo
         return float("inf")
     best = float("inf")
     for t in training:
-        d = float(aligned_mass_weighted_distance(candidate, t))
+        d = float(aligned_mass_weighted_rmsd(candidate, t))
         if d < best:
             best = d
     return best
@@ -114,7 +114,6 @@ def filter_candidates_against_training(
         distances_to_nearest=tuple(distances),
         min_separation=float(min_separation),
     )
-
 
 
 

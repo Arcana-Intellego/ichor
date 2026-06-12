@@ -54,6 +54,19 @@ def test_stratified_holdout_proportion_matches_request():
     assert len(r.holdout_indices) == expected_holdout
 
 
+def test_stratified_holdout_cannot_empty_nonempty_training_set():
+    r = split_stratified_with_holdout(
+        [1.0],
+        train_fraction=1.0,
+        val_mid_fraction=0.0,
+        high_holdout_fraction=1.0,
+        rng_seed=0,
+    )
+    assert r.train_indices == [0]
+    assert r.val_indices == []
+    assert r.holdout_indices == []
+
+
 def test_stratified_reproducible_with_same_seed():
     alpha = list(range(50, 0, -1))
     a = split_stratified_with_holdout(alpha, rng_seed=7)

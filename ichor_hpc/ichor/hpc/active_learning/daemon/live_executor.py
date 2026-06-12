@@ -26,6 +26,7 @@ import shlex
 import subprocess
 import sys
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
@@ -41,9 +42,8 @@ from ..versioning.provenance import (
     write_seed_provenance,
 )
 from .dry_run_executor import (
-    ANTI_OVERLAP_MAX_WHITENED_DISTANCE,
-    ANTI_OVERLAP_MIN_WHITENED_DISTANCE,
     DryRunPhaseExecutor,
+    anti_overlap_whitened_distance_bounds,
 )
 from .phase_executor import (
     BackendSubmissionError,
@@ -79,6 +79,8 @@ DEFAULT_DAEMON_ARIADNE_RUNTIME_MODULES: List[str] = [
 DEFAULT_DAEMON_RUNTIME_MODULES: List[str] = (
     DEFAULT_DAEMON_PYTHON_MODULES + DEFAULT_DAEMON_ARIADNE_RUNTIME_MODULES
 )
+
+_MODULE_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/+-]*(?: [A-Za-z0-9][A-Za-z0-9_.:/+-]*)*$")
 
 #  SBATCH-phase postprocess refusal guard.
 #
@@ -504,6 +506,24 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         try:
             tv = int(getattr(state, "training_set_version", 0))
             is_initial = phase_name == "INITIAL_FEREBUS"
+            state_updates: Dict[str, Any] = {}
+            if not is_initial:
+                from ..versioning.training_set import TrainingSetVersioning
+
+                v_train = TrainingSetVersioning(Path(self.campaign_dir) / self.training_dir_name)
+                committed = v_train.list_committed_versions()
+                committed_max = max(committed) if committed else -1
+                if committed_max > tv:
+                    tv = committed_max
+                    v_train.ensure_current(committed_max)
+                    state_updates["training_set_version"] = int(committed_max)
+                elif committed_max < tv:
+                    raise BackendSubmissionError(
+                        "state.training_set_version "
+                        + str(tv)
+                        + " is ahead of committed training versions "
+                        + repr(committed)
+                    )
             staging, n_tasks = _stg.stage_ferebus_inputs(
                 self.campaign_dir,
                 self.config,
@@ -516,6 +536,16 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             resources = getattr(self.config, "resources", None)
             ncores = int(resources.cpus_for(phase_name)) if resources is not None else 1
             ferebus_path = _configured_backend_path("ferebus", "ferebus")
+            allow_bare_ferebus = (
+                os.environ.get("ICHOR_ALLOW_BARE_FEREBUS", "") == "1"
+                or self.sbatch_runner is not subprocess.run
+            )
+            if ferebus_path == "ferebus" and not allow_bare_ferebus:
+                raise BackendSubmissionError(
+                    "live CSF4 FEREBUS requires software.ferebus.executable_path "
+                    "in ichor_config.yaml; set ICHOR_ALLOW_BARE_FEREBUS=1 only for "
+                    "development tests"
+                )
             path_to_executable = None if ferebus_path == "ferebus" else ferebus_path
             effective_walltime = (
                 int(self.walltime_hours)
@@ -561,7 +591,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 + str(exc)
             ) from exc
         self.artefact_log.append(str(submission.submission_script))
-        return PhaseResult(is_complete=False, submitted_job_id=str(submission.job_id))
+        return PhaseResult(
+            is_complete=False,
+            submitted_job_id=str(submission.job_id),
+            expected_tasks=int(n_tasks),
+            state_updates=state_updates,
+        )
 
     def _seed_selection_posterior(self, state, training_atoms):
         """Live seed selection ranks the exploit half by the real GP posterior
@@ -632,17 +667,27 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
         v = self._versioning("training")
         committed = v.list_committed_versions()
-        expected_next = int(getattr(state, "training_set_version", 0)) + 1
-        if expected_next in committed:
-            v.ensure_current(expected_next)
+        state_version = int(getattr(state, "training_set_version", 0))
+        committed_max = max(committed) if committed else -1
+        if committed_max > state_version:
+            v.ensure_current(committed_max)
             self._journal_event(
                 "training_set_committed",
                 iteration=int(state.iteration),
-                training_set_version=int(expected_next),
+                training_set_version=int(committed_max),
                 n_committed_points=0,
                 idempotent_skip=True,
             )
-            return {"training_set_version": int(expected_next)}
+            return {"training_set_version": int(committed_max)}
+        if committed_max < state_version:
+            raise BackendSubmissionError(
+                "training_set_version "
+                + str(state_version)
+                + " is ahead of committed training versions "
+                + repr(committed)
+            )
+        if committed:
+            v.ensure_current(committed_max)
 
         staging_root = _stg.bucket_dir(self.campaign_dir, "APPEND", int(state.iteration))
         try:
@@ -657,9 +702,9 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 + type(exc).__name__ + ": " + str(exc)
             ) from exc
 
-        next_version = max(committed) + 1 if committed else 0
+        next_version = committed_max + 1
         v.recover_dangling_staging()
-        source = max(committed) if committed else None
+        source = committed_max if committed_max >= 0 else None
         staging = v.stage(source_version=source, target_version=next_version)
 
         committed_names = []
@@ -749,7 +794,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 "sbatch returned unparsable JobID for phase " + phase_name + ": " + repr(head)
             )
         self.artefact_log.append(str(script))
-        return PhaseResult(is_complete=False, submitted_job_id=job_id)
+        expected_tasks = int(array_size) if array_size is not None else 1
+        return PhaseResult(
+            is_complete=False,
+            submitted_job_id=job_id,
+            expected_tasks=expected_tasks,
+        )
 
     # --- real script bodies --------------------------------------------
 
@@ -1721,9 +1771,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 d_w_is_synthetic = True
             flag = None
             if d_w is not None:
-                if d_w < ANTI_OVERLAP_MIN_WHITENED_DISTANCE:
+                min_d, max_d = anti_overlap_whitened_distance_bounds(self.config)
+                if d_w < min_d:
                     flag = "moved_too_little"
-                elif d_w > ANTI_OVERLAP_MAX_WHITENED_DISTANCE:
+                elif d_w > max_d:
                     flag = "moved_too_far"
             enrich_with_anti_overlap(
                 seed_dir,
@@ -2040,14 +2091,29 @@ def make_live_job_finder(sacct_runner=None):
     """the job_finder the daemon uses in live mode: given (state, phase) return the JobID of an
     already-running job for that exact phase+iteration, or None. lets the daemon adopt a job a crash
     orphaned rather than double-submit (A24/A25)."""
-    from ..submit.sacct_poll import find_running_job_by_name
+    from ..submit.sacct_poll import JobNameLookup, find_running_job_by_name_detailed
 
     def _finder(state, phase):
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
-        name = live_job_name(
-            getattr(state, "campaign_uid", None), phase_name, getattr(state, "iteration", 0),
-        )
-        return find_running_job_by_name(name, sacct_runner=sacct_runner)
+        uid = getattr(state, "campaign_uid", None)
+        iteration = getattr(state, "iteration", 0)
+        names = [
+            live_job_name(uid, phase_name, iteration),
+        ]
+        if uid:
+            legacy = str(uid)[:8] + "-" + str(phase_name) + "-" + str(int(iteration))
+            if legacy not in names:
+                names.append(legacy)
+        inconclusive: Optional[JobNameLookup] = None
+        last_lookup = JobNameLookup(None, inconclusive=False)
+        for name in names:
+            found = find_running_job_by_name_detailed(name, sacct_runner=sacct_runner)
+            last_lookup = found
+            if found.job_id:
+                return found
+            if found.inconclusive and inconclusive is None:
+                inconclusive = found
+        return inconclusive if inconclusive is not None else last_lookup
 
     return _finder
 
@@ -2085,6 +2151,13 @@ def _normalise_module_list(raw: Any, *, label: str) -> List[str]:
         if not module:
             continue
         _reject_shell_control_chars("configured " + label + " module", module)
+        if not _MODULE_TOKEN_RE.fullmatch(module):
+            raise BackendSubmissionError(
+                "configured "
+                + label
+                + " module contains unsafe characters: "
+                + repr(module)
+            )
         modules.append(module)
     return modules
 
@@ -2272,11 +2345,17 @@ def _configured_backend_modules(backend_name: str, fallback: List[str]) -> List[
         return list(fallback)
     if not raw:
         return list(fallback)
-    return [str(x) for x in raw]
+    return _normalise_module_list(raw, label=backend_name)
 
 
 def _aimall_invocation_block(iteration, camp, config, points_file) -> List[str]:
     aimall_path = _configured_backend_path("aimall", "~/AIMAll/aimqb.ish")
+    aimall_cfg = getattr(config, "aimall", None)
+    args: List[str] = []
+    if bool(getattr(aimall_cfg, "nogui", True)):
+        args.append("-nogui")
+    encomp = int(getattr(aimall_cfg, "encomp", 3))
+    args.append("-encomp=" + str(encomp))
     points_file_q = _shell_quote(points_file)
     return [
         "# per-point AIMAll array over the .wfn files gaussian produced.",
@@ -2288,7 +2367,7 @@ def _aimall_invocation_block(iteration, camp, config, points_file) -> List[str]:
         'POINT_DIR=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" ' + points_file_q + ")",
         'if [ -z "$POINT_DIR" ]; then echo "no pointdir for index $SLURM_ARRAY_TASK_ID" >&2; exit 1; fi',
         'cd "$POINT_DIR"',
-        _shell_quote(aimall_path) + " input.wfn",
+        " ".join([_shell_quote(aimall_path)] + args + ["input.wfn"]),
     ]
 
 

@@ -5,6 +5,10 @@ import numpy as np
 import pytest
 
 from ichor.core.atoms import Atom, Atoms
+from ichor.core.adversarial.geometry import (
+    aligned_mass_weighted_distance,
+    aligned_mass_weighted_rmsd,
+)
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.daemon.dry_run_executor import DryRunPhaseExecutor
 from ichor.hpc.active_learning.daemon.state import (
@@ -190,6 +194,16 @@ def test_min_distance_picks_closest():
     ]
     d = min_distance_to_training(candidate, training)
     assert d == pytest.approx(0.0, abs=1.0e-9)
+
+
+def test_min_distance_uses_mass_normalized_rmsd_not_size_scaled_distance():
+    training = [Atoms([Atom("H", 0.0, 0.0, 0.0), Atom("H", 1.0, 0.0, 0.0)])]
+    candidate = Atoms([Atom("H", 0.0, 0.0, 0.0), Atom("H", 2.0, 0.0, 0.0)])
+
+    d = min_distance_to_training(candidate, training)
+
+    assert d == pytest.approx(aligned_mass_weighted_rmsd(training[0], candidate))
+    assert d < aligned_mass_weighted_distance(training[0], candidate)
 
 
 def test_filter_keeps_far_candidates_drops_close_ones():

@@ -68,10 +68,13 @@ __all__ = [
 
 DRYRUN_JOB_PREFIX = "DRYRUN-"
 
-#anti-overlap thresholds (case c). Will be moved to CampaignConfig
-#once the schema-v2 nested blocks are implemented.
-ANTI_OVERLAP_MIN_WHITENED_DISTANCE = 0.01
-ANTI_OVERLAP_MAX_WHITENED_DISTANCE = 10.0
+
+def anti_overlap_whitened_distance_bounds(config: CampaignConfig) -> tuple[float, float]:
+    anti = getattr(config, "anti_overlap", None)
+    return (
+        float(getattr(anti, "min_post_ariadne_whitened_distance", 0.01)),
+        float(getattr(anti, "max_post_ariadne_whitened_distance", 10.0)),
+    )
 
 
 @dataclass
@@ -323,6 +326,7 @@ class DryRunPhaseExecutor:
             "variances": [float(v) for v in selection.variances],
             "seed_records": seed_records,
             "forbidden_set_size": int(len(forbidden)),
+            "skipped_unknown_provenance": int(selection.skipped_unknown_provenance),
             # pin the trajectory this selection was made against. frame ids are positional, so if
             # the pool ever got re-imported/swapped underneath the campaign, frame 7 would now be a
             # different geometry -- ARIADNE on the compute node cross-checks this and refuses rather
@@ -336,7 +340,9 @@ class DryRunPhaseExecutor:
         lines_out = [
             "# DRYRUN seed selection for iteration " + str(state.iteration),
             "# pool_available=True n_picked=" + str(selection.n)
-            + " forbidden_set_size=" + str(len(forbidden)),
+            + " forbidden_set_size=" + str(len(forbidden))
+            + " skipped_unknown_provenance="
+            + str(selection.skipped_unknown_provenance),
         ]
         for k, fid in enumerate(selection.frame_ids):
             lines_out.append("# seed[" + str(k) + "].frame_id = " + str(fid))
@@ -357,6 +363,7 @@ class DryRunPhaseExecutor:
             pool_available=True,
             n_picked=int(selection.n),
             forbidden_set_size=int(len(forbidden)),
+            skipped_unknown_provenance=int(selection.skipped_unknown_provenance),
         )
         #seeds_picked + forbidden_set_size live in the journal
         #("seed_selected" event above) and the seeds_picked.json sidecar;
@@ -464,6 +471,15 @@ class DryRunPhaseExecutor:
             # never land here -- but fall back to the default rather
             # than crash if somehow we do.
             result = strategy_fn(alphas)
+        train_set = set(int(i) for i in result.train_indices)
+        val_set = set(int(i) for i in result.val_indices)
+        holdout_set = set(int(i) for i in result.holdout_indices)
+        if train_set & val_set:
+            raise BackendSubmissionError("split strategy returned overlapping train/val indices")
+        if not holdout_set.issubset(val_set):
+            raise BackendSubmissionError("split strategy returned holdout indices outside validation")
+        if result.n_train <= 0 and len(alphas) > 0:
+            raise BackendSubmissionError("split strategy returned no training rows for non-empty candidates")
 
         payload = {
             "strategy": result.strategy,
@@ -499,21 +515,31 @@ class DryRunPhaseExecutor:
 
         v = self._versioning("training")
         committed = v.list_committed_versions()
-        expected_next = int(getattr(state, "training_set_version", 0)) + 1
-        if expected_next in committed:
+        state_version = int(getattr(state, "training_set_version", 0))
+        committed_max = max(committed) if committed else -1
+        if committed_max > state_version:
             #already committed in a previous run; idempotent no-op.
             self._journal_event(
                 "training_set_committed",
                 iteration=int(state.iteration),
-                training_set_version=int(expected_next),
+                training_set_version=int(committed_max),
                 n_committed_points=0,
                 idempotent_skip=True,
             )
-            v.ensure_current(expected_next)
-            return {"training_set_version": int(expected_next)}
-        next_version = max(committed) + 1 if committed else 0
+            v.ensure_current(committed_max)
+            return {"training_set_version": int(committed_max)}
+        if committed_max < state_version:
+            raise BackendSubmissionError(
+                "training_set_version "
+                + str(state_version)
+                + " is ahead of committed training versions "
+                + repr(committed)
+            )
+        if committed:
+            v.ensure_current(committed_max)
+        next_version = committed_max + 1
         v.recover_dangling_staging()
-        source = max(committed) if committed else None
+        source = committed_max if committed_max >= 0 else None
         staging = v.stage(source_version=source, target_version=next_version)
         marker = staging / ("DRYRUN_iter_" + str(state.iteration) + ".txt")
         marker.write_text(
@@ -847,9 +873,10 @@ class DryRunPhaseExecutor:
             d_w = self._synthetic_whitened_distance(result)
             flag = None
             if d_w is not None:
-                if d_w < ANTI_OVERLAP_MIN_WHITENED_DISTANCE:
+                min_d, max_d = anti_overlap_whitened_distance_bounds(self.config)
+                if d_w < min_d:
                     flag = "moved_too_little"
-                elif d_w > ANTI_OVERLAP_MAX_WHITENED_DISTANCE:
+                elif d_w > max_d:
                     flag = "moved_too_far"
             enrich_with_anti_overlap(
                 seed_dir,

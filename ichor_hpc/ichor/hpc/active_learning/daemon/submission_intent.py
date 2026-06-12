@@ -73,7 +73,9 @@ def load_active_intent(
 
 def _write_payload(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload["updated_iso"] = _now_iso()
+    now = _now_iso()
+    payload["updated_iso"] = now
+    payload["updated_at_iso"] = now
     atomic_write_json(path, payload)
     return payload
 
@@ -108,6 +110,8 @@ def update_intent_status(
     status: str,
     job_id: Optional[str] = None,
     reason: Optional[str] = None,
+    expected_tasks: Optional[int] = None,
+    job_ids_seen: Optional[Any] = None,
 ) -> Dict[str, Any]:
     path = intent_path(campaign_dir, phase_name, iteration)
     data = load_intent(campaign_dir, phase_name, iteration) or {
@@ -120,22 +124,46 @@ def update_intent_status(
     data["status"] = str(status)
     if job_id is not None:
         data["job_id"] = str(job_id)
+        seen = data.get("job_ids_seen", [])
+        if not isinstance(seen, list):
+            seen = []
+        if str(job_id) not in [str(x) for x in seen]:
+            seen.append(str(job_id))
+        data["job_ids_seen"] = seen
     if reason is not None:
         data["reason"] = str(reason)
+    if expected_tasks is not None:
+        data["expected_tasks"] = int(expected_tasks)
+    if job_ids_seen is not None:
+        data["job_ids_seen"] = [str(x) for x in list(job_ids_seen)]
     return _write_payload(path, data)
 
 
-def mark_submitted(campaign_dir: Union[str, Path], phase_name: str, iteration: int, job_id: str) -> Dict[str, Any]:
+def mark_submitted(
+    campaign_dir: Union[str, Path],
+    phase_name: str,
+    iteration: int,
+    job_id: str,
+    *,
+    expected_tasks: Optional[int] = None,
+) -> Dict[str, Any]:
     return update_intent_status(
         campaign_dir, phase_name=phase_name, iteration=iteration,
-        status="SUBMITTED", job_id=str(job_id),
+        status="SUBMITTED", job_id=str(job_id), expected_tasks=expected_tasks,
     )
 
 
-def mark_adopted(campaign_dir: Union[str, Path], phase_name: str, iteration: int, job_id: str) -> Dict[str, Any]:
+def mark_adopted(
+    campaign_dir: Union[str, Path],
+    phase_name: str,
+    iteration: int,
+    job_id: str,
+    *,
+    expected_tasks: Optional[int] = None,
+) -> Dict[str, Any]:
     return update_intent_status(
         campaign_dir, phase_name=phase_name, iteration=iteration,
-        status="ADOPTED", job_id=str(job_id),
+        status="ADOPTED", job_id=str(job_id), expected_tasks=expected_tasks,
     )
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
@@ -10,6 +11,7 @@ from ichor.core.models.models import Models
 
 GeometryInput = Union[Atoms, Dict[str, np.ndarray], np.ndarray]
 VARIANCE_NEGATIVE_TOLERANCE = 1.0e-10
+POSTERIOR_CACHE_MAX_SIZE = 4096
 
 
 
@@ -84,8 +86,28 @@ class TotalEnergyPosterior:
         if not property_models:
             raise ValueError(f"No models of property {self.property_name!r} were found.")
         self._property_models: Dict[str, object] = {model.atom: model for model in property_models}
-        self._mean_cache: Dict[Tuple[float, ...], float] = {}
-        self._cov_cache: Dict[Tuple[Tuple[float, ...], Tuple[float, ...]], float] = {}
+        self._model_identity = (
+            id(self.models),
+            tuple(sorted((str(model.atom), id(model)) for model in property_models)),
+        )
+        self._mean_cache: "OrderedDict[Tuple[object, Tuple[float, ...]], float]" = OrderedDict()
+        self._cov_cache: "OrderedDict[Tuple[object, Tuple[float, ...], Tuple[float, ...]], float]" = OrderedDict()
+
+    @staticmethod
+    def _cache_get(cache: OrderedDict, key):
+        if key not in cache:
+            return None
+        value = cache.pop(key)
+        cache[key] = value
+        return value
+
+    @staticmethod
+    def _cache_set(cache: OrderedDict, key, value) -> None:
+        if key in cache:
+            cache.pop(key)
+        cache[key] = value
+        while len(cache) > POSTERIOR_CACHE_MAX_SIZE:
+            cache.popitem(last=False)
 
     def _features(self, x: GeometryInput) -> Dict[str, np.ndarray]:
         features = self.models.get_features_dict(x)
@@ -117,28 +139,34 @@ class TotalEnergyPosterior:
         return tuple(np.round(arr, 12))
 
     def mean(self, x: GeometryInput) -> float:
-        key = self._geometry_key(x)
-        if key in self._mean_cache:
-            return self._mean_cache[key]
+        key = (self._model_identity, self._geometry_key(x))
+        cached = self._cache_get(self._mean_cache, key)
+        if cached is not None:
+            return cached
         features = self._features(x)
         total = 0.0
         for atom, model in self._property_models.items():
             total += float(np.asarray(model.predict(features[atom]), dtype=float).reshape(-1)[0])
-        self._mean_cache[key] = total
+        self._cache_set(self._mean_cache, key, total)
         return total
 
     def covariance(self, x1: GeometryInput, x2: GeometryInput) -> float:
         key1 = self._geometry_key(x1)
         key2 = self._geometry_key(x2)
-        cache_key = (key1, key2) if key1 <= key2 else (key2, key1)
-        if cache_key in self._cov_cache:
-            return self._cov_cache[cache_key]
+        cache_key = (
+            (self._model_identity, key1, key2)
+            if key1 <= key2
+            else (self._model_identity, key2, key1)
+        )
+        cached = self._cache_get(self._cov_cache, cache_key)
+        if cached is not None:
+            return cached
         features1 = self._features(x1)
         features2 = self._features(x2)
         total = 0.0
         for atom, model in self._property_models.items():
             total += float(model_posterior_covariance(model, features1[atom], features2[atom], scaled=self.scaled)[0, 0])
-        self._cov_cache[cache_key] = total
+        self._cache_set(self._cov_cache, cache_key, total)
         return total
 
     def variance(self, x: GeometryInput) -> float:

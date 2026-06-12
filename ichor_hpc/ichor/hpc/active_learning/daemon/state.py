@@ -98,6 +98,31 @@ def _is_finite_number(value: Any) -> bool:
     )
 
 
+def _coerce_state_int(payload: Dict[str, Any], key: str, default: Any = None) -> int:
+    raw = payload.get(key, default)
+    if isinstance(raw, bool):
+        raise StateSchemaError(key + " must be an integer")
+    try:
+        return int(raw)
+    except (TypeError, ValueError) as exc:
+        raise StateSchemaError(key + " must be an integer") from exc
+
+
+def _coerce_sacct_empty_streak(payload: Dict[str, Any]) -> Dict[str, int]:
+    raw = payload.get("sacct_empty_streak", {}) or {}
+    if not isinstance(raw, dict):
+        raise StateSchemaError("sacct_empty_streak must be an object")
+    parsed: Dict[str, int] = {}
+    for key, value in raw.items():
+        if isinstance(value, bool):
+            raise StateSchemaError("sacct_empty_streak values must be integers")
+        try:
+            parsed[str(key)] = int(value)
+        except (TypeError, ValueError) as exc:
+            raise StateSchemaError("sacct_empty_streak values must be integers") from exc
+    return parsed
+
+
 @dataclass
 class CampaignState:
     """One snapshot of the daemon's campaign state.
@@ -152,7 +177,7 @@ class CampaignState:
     def from_dict(cls, payload: Dict[str, Any]) -> "CampaignState":
         if not isinstance(payload, dict):
             raise StateSchemaError("state.json must contain a JSON object")
-        schema = int(payload.get("schema_version", -1))
+        schema = _coerce_state_int(payload, "schema_version", -1)
         if schema != SCHEMA_VERSION:
             raise StateSchemaError(
                 "state.json schema_version " + str(schema)
@@ -215,13 +240,18 @@ class CampaignState:
             stop_streak=int(payload["stop_streak"]),
             shutdown_requested=bool(payload.get("shutdown_requested", False)),
             reference_scales=payload.get("reference_scales"),
-            reference_scales_iteration=int(payload.get("reference_scales_iteration", -1)),
+            reference_scales_iteration=_coerce_state_int(
+                payload,
+                "reference_scales_iteration",
+                -1,
+            ),
             alpha_history=_coerce_alpha_history(payload),
-            last_n_anti_overlap_flagged=int(payload.get("last_n_anti_overlap_flagged", 0)),
-            sacct_empty_streak={
-                str(k): int(v)
-                for k, v in (payload.get("sacct_empty_streak", {}) or {}).items()
-            },
+            last_n_anti_overlap_flagged=_coerce_state_int(
+                payload,
+                "last_n_anti_overlap_flagged",
+                0,
+            ),
+            sacct_empty_streak=_coerce_sacct_empty_streak(payload),
             schema_version=schema,
             campaign_uid=str(payload["campaign_uid"]),
             campaign_started_iso=str(payload["campaign_started_iso"]),
@@ -320,5 +350,4 @@ def write_state(path: Union[str, Path], state: CampaignState) -> None:
     payload = state.to_dict()
     CampaignState.from_dict(payload)
     atomic_write_json(path, payload)
-
 

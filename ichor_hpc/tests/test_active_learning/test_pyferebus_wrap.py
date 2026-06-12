@@ -165,6 +165,11 @@ def test_submit_ferebus_happy_path(tmp_path):
     assert captured[0].kwargs["maxiter"] == 50
     assert captured[0].kwargs["full_ARD"] is False
     assert captured[0].kwargs["scaling"] is False
+    script = (tmp_path / "runFerebus.sh").read_text(encoding="utf-8")
+    assert "set -eo pipefail" in script
+    assert "set -euo pipefail" not in script
+    assert "export LC_ALL=C" in script
+    assert "export LC_NUMERIC=C" in script
     # sbatch was driven with --parsable.
     assert runner.calls == [["sbatch", "--parsable", str(tmp_path / "runFerebus.sh")]]
 

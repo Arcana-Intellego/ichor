@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Callable, Union
+from typing import Callable, Dict, Union
 
 from ichor.core.atoms import Atoms, AtomsNotFoundError
 from ichor.core.files import OrcaInput, OrcaOutput
@@ -117,6 +117,35 @@ class PointDirectory(AnnotatedDirectory, HasAtoms, HasData):
         return self.atoms.features(
             feature_calculator, *args, is_atomic=is_atomic, **kwargs
         )
+
+    def properties(self, system_alf) -> Dict[str, Dict[str, float]]:
+        """Return per-atom AIMAll properties for this point directory.
+
+        PointsDirectory.features_with_properties_to_csv() calls this on each contained
+        PointDirectory. The AIMAll parser needs the atom-local C matrices to rotate multipoles, so
+        build them from the caller's system ALF and delegate to IntDirectory.properties().
+        """
+        if not self.ints:
+            raise FileNotFoundError(
+                "AIMAll .int directory missing for pointdir: " + str(self.path)
+            )
+        try:
+            c_matrices = self.C_matrix_dict(system_alf)
+        except Exception as exc:
+            raise ValueError(
+                "failed to build C-matrix dictionary for pointdir "
+                + str(self.path)
+            ) from exc
+        try:
+            props = self.ints.properties(c_matrices)
+        except Exception as exc:
+            raise ValueError(
+                "failed to parse AIMAll .int properties for pointdir "
+                + str(self.path)
+            ) from exc
+        if not props:
+            raise ValueError("AIMAll .int properties are empty for pointdir: " + str(self.path))
+        return props
 
     @atoms.setter
     def atoms(self, atms: Atoms):

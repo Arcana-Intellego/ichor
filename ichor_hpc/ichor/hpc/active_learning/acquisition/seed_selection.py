@@ -59,6 +59,7 @@ class SeedSelection:
     variance_indices: List[int]
     variances: List[float]
     frame_ids: List[Optional[int]] = field(default_factory=list)
+    skipped_unknown_provenance: int = 0
 
     @property
     def n(self) -> int:
@@ -144,17 +145,18 @@ def select_seeds(
 
     forbidden = frozenset(int(f) for f in forbidden_frame_ids)
 
-    #Filter eligible positions: a position is eligible iff its frame_id is
-    #not in "forbidden". A position with frame_id=None is always eligible
-    #(we have no way to tell whether it duplicates a forbidden one).
+    # Filter eligible positions. When the forbidden ledger is active, unknown provenance is
+    # excluded instead of being silently eligible: otherwise old pointdirs without frame_id metadata
+    # can bypass the anti-repeat guard and re-seed already-forbidden trajectory frames.
+    skipped_unknown = sum(1 for fid in fids if fid is None) if forbidden else 0
     eligible: List[int] = [
         i for i in range(n_total)
-        if fids[i] is None or fids[i] not in forbidden
+        if (fids[i] is not None and fids[i] not in forbidden) or (not forbidden and fids[i] is None)
     ]
     n_eligible = len(eligible)
     if n_eligible <= 0:
         #forbidden set ate every training point; return empty selection.
-        return SeedSelection([], [], [], [], [], [])
+        return SeedSelection([], [], [], [], [], [], skipped_unknown)
 
     if n_seeds >= n_eligible:
         all_idx = list(eligible)
@@ -174,6 +176,7 @@ def select_seeds(
             variance_indices=[],
             variances=variances,
             frame_ids=[fids[i] for i in all_idx],
+            skipped_unknown_provenance=skipped_unknown,
         )
 
     rng = np.random.default_rng(int(rng_seed))
@@ -230,4 +233,5 @@ def select_seeds(
         variance_indices=variance_idx,
         variances=variances,
         frame_ids=[fids[i] for i in all_idx],
+        skipped_unknown_provenance=skipped_unknown,
     )

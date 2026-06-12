@@ -69,6 +69,10 @@ def test_stage_ferebus_inputs_orchestration(tmp_path, monkeypatch):
     assert "q00-O1 " in jd
     manifest = json.loads((staging / stg.FEREBUS_TASK_MANIFEST).read_text(encoding="utf-8"))
     assert manifest["n_tasks"] == 6
+    assert manifest["pointdir_row_order"] == [
+        "POINT_" + str(i).zfill(4) + ".pointdir" for i in range(20)
+    ]
+    assert manifest["degenerate_property_stats"] == []
     assert {task["property"] for task in manifest["tasks"]} == {"iqa", "q00"}
     assert {tuple(task["alf_1_indexed"]) for task in manifest["tasks"]} >= {(1, 2, 3)}
     assert not list(staging.glob("ferebus_*.toml"))

@@ -10,8 +10,6 @@ import pytest
 
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.daemon.dry_run_executor import (
-    ANTI_OVERLAP_MAX_WHITENED_DISTANCE,
-    ANTI_OVERLAP_MIN_WHITENED_DISTANCE,
     DryRunPhaseExecutor,
 )
 from ichor.hpc.active_learning.daemon.live_executor import LiveBackendsPhaseExecutor
@@ -243,6 +241,23 @@ def test_anti_overlap_passes_when_distance_within_band(tmp_path):
     assert (len(flagged_events) > 0) == any_flagged
 
 
+def test_anti_overlap_uses_campaign_whitened_distance_bounds(tmp_path):
+    cd = tmp_path / "campaign"
+    cfg = CampaignConfig()
+    cfg.seed_selection.n_seeds_per_iteration = 2
+    cfg.anti_overlap.min_post_ariadne_whitened_distance = 100.0
+    cfg.anti_overlap.max_post_ariadne_whitened_distance = 200.0
+    ex = DryRunPhaseExecutor(campaign_dir=cd, config=cfg)
+    ex.postprocess(SimpleNamespace(iteration=0), CampaignPhase.ARIADNE_ARRAY, observations=[])
+
+    pool_dir = cd / "7_ACTIVE_LEARNING" / "iteration-0000" / "pool"
+    seed_dirs = sorted(d for d in pool_dir.iterdir() if d.is_dir())
+    assert seed_dirs
+    for sd in seed_dirs:
+        data = read_provenance(sd)
+        assert data["anti_overlap"]["flag"] == "moved_too_little"
+
+
 def test_synthetic_whitened_distance_returns_none_when_alpha_missing(tmp_path):
     cd = tmp_path / "campaign"
     cfg = CampaignConfig()
@@ -256,8 +271,9 @@ def test_synthetic_whitened_distance_returns_none_when_alpha_missing(tmp_path):
 
 
 def test_anti_overlap_thresholds_have_documented_defaults():
-    assert ANTI_OVERLAP_MIN_WHITENED_DISTANCE == 0.01
-    assert ANTI_OVERLAP_MAX_WHITENED_DISTANCE == 10.0
+    c = CampaignConfig()
+    assert c.anti_overlap.min_post_ariadne_whitened_distance == 0.01
+    assert c.anti_overlap.max_post_ariadne_whitened_distance == 10.0
 
 
 def test_post_ariadne_uses_picked_seed_frame_ids_when_present(tmp_path):

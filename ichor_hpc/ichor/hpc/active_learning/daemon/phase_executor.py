@@ -80,6 +80,7 @@ class PhaseResult:
 
     is_complete: bool = False
     submitted_job_id: Optional[str] = None
+    expected_tasks: Optional[int] = None
     state_updates: Dict[str, Any] = field(default_factory=dict)
     journal_events: List[Dict[str, Any]] = field(default_factory=list)
     failure_reason: Optional[str] = None
@@ -165,7 +166,6 @@ class MockPhaseExecutor:
     def operations(self) -> List[str]:
         """Compact list of (operation, phase) pairs for assertions."""
         return [c.operation + ":" + c.phase for c in self.calls]
-
 
 
 

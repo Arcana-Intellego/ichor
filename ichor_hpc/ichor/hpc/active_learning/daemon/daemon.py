@@ -396,24 +396,6 @@ class Daemon:
         if state.is_terminal:
             return TickStatus.TERMINAL
 
-        if bool(getattr(self.executor, "strict_committed_artifact_verification", False)):
-            try:
-                from .artifact_contracts import verify_state_referenced_artifacts
-                verify_state_referenced_artifacts(
-                    self.campaign_dir,
-                    state,
-                    strict_models=True,
-                )
-            except Exception as exc:
-                return self._halt(
-                    state,
-                    state.phase,
-                    "committed_artifact_contract_invalid: "
-                    + type(exc).__name__
-                    + ": "
-                    + str(exc)[:180],
-                )
-
         phase = state.phase
         pending = state.pending_jobs.get(phase.value)
 
@@ -421,9 +403,37 @@ class Daemon:
             return self._on_phase_entry(state, phase)
         return self._on_pending(state, phase, pending)
 
+    def _verify_committed_artifacts_if_enabled(
+        self,
+        state: CampaignState,
+        phase: CampaignPhase,
+    ) -> Optional[str]:
+        if not bool(getattr(self.executor, "strict_committed_artifact_verification", False)):
+            return None
+        try:
+            from .artifact_contracts import verify_state_referenced_artifacts
+            verify_state_referenced_artifacts(
+                self.campaign_dir,
+                state,
+                strict_models=True,
+            )
+        except Exception as exc:
+            return self._halt(
+                state,
+                phase,
+                "committed_artifact_contract_invalid: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:180],
+            )
+        return None
+
     def _on_phase_entry(self, state: CampaignState, phase: CampaignPhase) -> str:
         """Called once when entering a phase with no pending JobID."""
         phase_name = phase.value
+        verify_status = self._verify_committed_artifacts_if_enabled(state, phase)
+        if verify_status is not None:
+            return verify_status
         active_intent = None
         if phase_name in SBATCH_PHASES:
             try:
@@ -444,8 +454,13 @@ class Daemon:
         # instead. only for sbatch phases (inline phases have no job) and only when a finder is wired
         # (live mode); mock/dry leave it None and submit as before. (A24/A25)
         if self.job_finder is not None and phase_name in SBATCH_PHASES:
+            lookup_inconclusive = False
+            lookup_rows = []
             try:
-                existing = self.job_finder(state, phase)
+                lookup = self.job_finder(state, phase)
+                existing = getattr(lookup, "job_id", lookup)
+                lookup_inconclusive = bool(getattr(lookup, "inconclusive", False))
+                lookup_rows = list(getattr(lookup, "rows", []) or [])
             except Exception as exc:
                 self._journal(
                     "job_adopt_check_failed", phase=phase_name, error=str(exc)[:200],
@@ -458,11 +473,20 @@ class Daemon:
                         + type(exc).__name__ + ": " + str(exc)[:160],
                     )
                 existing = None
+                lookup_inconclusive = True
             if existing:
-                state.pending_jobs[phase_name] = str(existing)
+                existing_job_id = str(existing)
+                state.pending_jobs[phase_name] = existing_job_id
                 try:
                     _submission_intent.mark_adopted(
-                        self.campaign_dir, phase_name, int(state.iteration), str(existing),
+                        self.campaign_dir,
+                        phase_name,
+                        int(state.iteration),
+                        existing_job_id,
+                        expected_tasks=(
+                            None if active_intent is None
+                            else active_intent.get("expected_tasks")
+                        ),
                     )
                 except Exception as exc:
                     self._journal(
@@ -474,9 +498,17 @@ class Daemon:
                 self._persist(state)
                 self._journal(
                     "adopted_inflight_job", phase=phase_name,
-                    job_id=str(existing), iteration=state.iteration,
+                    job_id=existing_job_id, iteration=state.iteration,
+                    matching_sacct_rows=lookup_rows,
                 )
                 return TickStatus.SUBMITTED
+            if active_intent is not None and lookup_inconclusive:
+                return self._halt(
+                    state,
+                    phase,
+                    "active_submission_adoption_inconclusive: "
+                    "sacct lookup failed or was inconclusive; refusing to supersede active intent",
+                )
         if active_intent is not None and phase_name in SBATCH_PHASES:
             try:
                 _submission_intent.mark_superseded(
@@ -550,6 +582,7 @@ class Daemon:
                         phase_name,
                         int(state.iteration),
                         result.submitted_job_id,
+                        expected_tasks=result.expected_tasks,
                     )
                 except Exception as exc:
                     self._journal(
@@ -568,6 +601,7 @@ class Daemon:
             self._journal(
                 "sbatch", phase=phase_name, job_id=result.submitted_job_id,
                 iteration=state.iteration,
+                expected_tasks=result.expected_tasks,
             )
             return TickStatus.SUBMITTED
         if result.is_complete:
@@ -593,12 +627,17 @@ class Daemon:
             )
             return TickStatus.POLLING
 
-        summary = aggregate_states(job_id, observations)
+        expected_tasks = self._expected_tasks_for_pending(state, phase, job_id)
+        summary = aggregate_states(
+            job_id,
+            observations,
+            expected_task_count=expected_tasks,
+        )
         #Detect empty sacct response BEFORE checking is_terminal --
         #an empty observations list is the "accounting aged out" signature
         #we want to escalate after a streak. is_terminal is False for n=0
         #so without this gate the streak path is unreachable.
-        if summary.n_tasks == 0:
+        if not observations or summary.n_tasks == 0:
             current = state.sacct_empty_streak.get(job_id, 0) + 1
             state.sacct_empty_streak[job_id] = current
             self._persist(state)
@@ -621,6 +660,37 @@ class Daemon:
             state.sacct_empty_streak.pop(job_id, None)
             self._persist(state)
 
+        unknown_key = job_id + ":UNKNOWN"
+        if int(getattr(summary, "n_unknown", 0)) > 0:
+            current = state.sacct_empty_streak.get(unknown_key, 0) + 1
+            state.sacct_empty_streak[unknown_key] = current
+            self._persist(state)
+            max_unknown = int(
+                getattr(self.config.runtime, "poll_sacct_unknown_max_ticks", 3)
+            )
+            if max_unknown > 0 and current >= max_unknown:
+                self._journal(
+                    "sacct_unknown_timeout",
+                    phase=phase.value,
+                    job_id=job_id,
+                    streak=int(current),
+                    max_ticks=int(max_unknown),
+                    iteration=state.iteration,
+                )
+                return self._halt(
+                    state,
+                    phase,
+                    "sacct_unknown_timeout: "
+                    + str(current)
+                    + "/"
+                    + str(max_unknown)
+                    + " ticks contained UNKNOWN scheduler states",
+                )
+            return TickStatus.POLLING
+        if unknown_key in state.sacct_empty_streak:
+            state.sacct_empty_streak.pop(unknown_key, None)
+            self._persist(state)
+
         if not summary.is_terminal:
             return TickStatus.POLLING
 
@@ -633,6 +703,48 @@ class Daemon:
         if summary.is_fully_successful or success_ratio >= failure_threshold:
             return self._postprocess(state, phase, observations, summary)
         return self._handle_failure(state, phase, observations, summary)
+
+    def _expected_tasks_for_pending(
+        self,
+        state: CampaignState,
+        phase: CampaignPhase,
+        job_id: str,
+    ) -> Optional[int]:
+        if phase.value not in SBATCH_PHASES:
+            return None
+        try:
+            data = _submission_intent.load_intent(
+                self.campaign_dir,
+                phase.value,
+                int(state.iteration),
+            )
+        except Exception as exc:
+            self._journal(
+                "submission_intent_read_failed",
+                phase=phase.value,
+                iteration=int(state.iteration),
+                error=str(exc)[:200],
+            )
+            return None
+        if not isinstance(data, dict):
+            return None
+        recorded_job = data.get("job_id")
+        if recorded_job is not None and str(recorded_job) != str(job_id):
+            return None
+        raw = data.get("expected_tasks")
+        if raw is None:
+            return None
+        try:
+            expected = int(raw)
+        except (TypeError, ValueError):
+            self._journal(
+                "submission_intent_expected_tasks_invalid",
+                phase=phase.value,
+                iteration=int(state.iteration),
+                value=repr(raw),
+            )
+            return None
+        return expected if expected > 0 else None
 
     def _postprocess(
         self,
@@ -683,15 +795,8 @@ class Daemon:
             return self._halt(state, phase, "postprocess_failed_without_result")
         if result.failure_reason:
             return self._halt(state, phase, result.failure_reason)
-        #clear the pending job and advance.
-        state.pending_jobs[phase.value] = None
-        self._journal(
-            "phase_succeeded", phase=phase.value, iteration=state.iteration,
-            n_completed=summary.n_completed, n_failed=summary.n_failed,
-            n_tasks=summary.n_tasks,
-        )
+        self._clear_sacct_streaks(state, str(summary.parent_job_id))
         completed_iteration = int(state.iteration)
-        self._advance(state, phase, result.state_updates)
         if phase.value in SBATCH_PHASES:
             try:
                 _submission_intent.mark_completed(
@@ -704,6 +809,14 @@ class Daemon:
                     iteration=completed_iteration,
                     error=str(exc)[:200],
                 )
+        #clear the pending job and advance.
+        state.pending_jobs[phase.value] = None
+        self._journal(
+            "phase_succeeded", phase=phase.value, iteration=state.iteration,
+            n_completed=summary.n_completed, n_failed=summary.n_failed,
+            n_tasks=summary.n_tasks,
+        )
+        self._advance(state, phase, result.state_updates)
         return TickStatus.ADVANCED
 
     def _handle_failure(
@@ -728,6 +841,7 @@ class Daemon:
             n_failed=summary.n_failed,
         )
         if action == FailureAction.HALT:
+            self._clear_sacct_streaks(state, str(summary.parent_job_id))
             return self._halt(
                 state, phase,
                 "too_many_failures: " + str(summary.n_failed) + "/" + str(summary.n_tasks),
@@ -743,9 +857,14 @@ class Daemon:
                 )
             except Exception:
                 pass
+        self._clear_sacct_streaks(state, str(summary.parent_job_id))
         state.pending_jobs[phase.value] = None
         self._advance(state, phase, {})
         return TickStatus.SCRUBBED
+
+    def _clear_sacct_streaks(self, state: CampaignState, job_id: str) -> None:
+        state.sacct_empty_streak.pop(str(job_id), None)
+        state.sacct_empty_streak.pop(str(job_id) + ":UNKNOWN", None)
 
     def _looks_like_file_settle(self, reason: str) -> bool:
         text = str(reason).lower()
@@ -826,6 +945,7 @@ class Daemon:
             )
         except Exception:
             pass
+        self._clear_sacct_streaks(state, str(summary.parent_job_id))
         state.pending_jobs[phase.value] = None
         self._persist(state)
         statuses = [

@@ -57,7 +57,7 @@ def test_terminal_state_sets_are_consistent():
     assert TERMINAL_STATES == SUCCESS_STATES | FAILURE_STATES
     assert JobStatus.RUNNING not in TERMINAL_STATES
     assert JobStatus.PENDING not in TERMINAL_STATES
-    assert JobStatus.UNKNOWN in TERMINAL_STATES
+    assert JobStatus.UNKNOWN not in TERMINAL_STATES
 
 
 def test_parse_sacct_single_completed():
@@ -167,13 +167,29 @@ def test_aggregate_single_non_array_job():
     assert summary.is_fully_successful
 
 
-def test_aggregate_parent_only_failed_and_unknown_are_terminal_failures():
+def test_aggregate_parent_only_failed_is_terminal_failure_but_unknown_is_inconclusive():
     failed = aggregate_states("99", [JobObservation("99", JobStatus.FAILED, (1, 0), 100)])
     assert failed.is_terminal
     assert failed.n_failed == 1
     unknown = aggregate_states("99", [JobObservation("99", JobStatus.UNKNOWN, None, None)])
-    assert unknown.is_terminal
-    assert unknown.n_failed == 1
+    assert not unknown.is_terminal
+    assert unknown.n_failed == 0
+    assert unknown.n_unknown == 1
+    assert unknown.n_pending_or_running == 1
+
+
+def test_expected_task_count_marks_missing_array_rows_pending():
+    obs = [
+        JobObservation("777_0", JobStatus.COMPLETED, (0, 0), 90),
+        JobObservation("777_1", JobStatus.COMPLETED, (0, 0), 91),
+    ]
+    summary = aggregate_states("777", obs, expected_task_count=5)
+    assert summary.n_tasks == 5
+    assert summary.n_observed == 2
+    assert summary.n_missing == 3
+    assert summary.n_completed == 2
+    assert summary.n_pending_or_running == 3
+    assert not summary.is_terminal
 
 
 def test_poll_job_invokes_sacct_with_correct_flags():

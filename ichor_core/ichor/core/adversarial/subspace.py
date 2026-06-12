@@ -134,10 +134,13 @@ def build_local_subspace(seed_atoms: Atoms, neighbours: Sequence[Neighbour], con
     weights = _gaussian_neighbour_weights(distances, config.gaussian_weight_sigma)
 
     weight_sum = float(np.sum(weights))
+    if not np.isfinite(weight_sum) or weight_sum <= 0.0:
+        weights = np.ones_like(weights, dtype=float)
+        weight_sum = float(np.sum(weights))
     covariance = np.zeros((displacements.shape[1], displacements.shape[1]), dtype=float)
     for w, y in zip(weights, displacements):
         covariance += w * np.outer(y, y)
-    covariance /= max(weight_sum, 1.0)
+    covariance /= weight_sum
     covariance += config.covariance_regularization * np.eye(covariance.shape[0], dtype=float)
 
     eigenvalues, eigenvectors = np.linalg.eigh(covariance)

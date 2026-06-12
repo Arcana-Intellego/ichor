@@ -26,6 +26,8 @@ from typing import Any, Dict, List, Sequence, Tuple
 from ichor.core.atoms import Atoms
 from ichor.core.files.xyz import Trajectory
 
+from .state import atomic_write_json
+
 
 QUANTUM_ACCEPTANCE_MANIFEST = "accepted_pointdirs.json"
 QUANTUM_ACCEPTANCE_SCHEMA_VERSION = 1
@@ -123,13 +125,7 @@ def write_quantum_acceptance_manifest(
         "n_total": int(len(accepted_names) + len(rejected_payload)),
     }
     path = quantum_acceptance_manifest_path(staging)
-    tmp = staging / ("." + QUANTUM_ACCEPTANCE_MANIFEST + ".tmp")
-    tmp.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
-    os.replace(str(tmp), str(path))
+    atomic_write_json(path, payload)
     return path
 
 
@@ -178,8 +174,13 @@ def read_quantum_acceptance_manifest(
     if not isinstance(rejected, list):
         raise ValueError("quantum acceptance manifest rejected must be a list")
     n_total = data.get("n_total")
-    if n_total is not None and int(n_total) != len(accepted) + len(rejected):
-        raise ValueError("quantum acceptance manifest n_total does not match payload lengths")
+    if n_total is not None:
+        try:
+            parsed_total = int(n_total)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("quantum acceptance manifest n_total is not an integer") from exc
+        if parsed_total != len(accepted) + len(rejected):
+            raise ValueError("quantum acceptance manifest n_total does not match payload lengths")
 
     seen = set()
     resolved: List[Path] = []
@@ -229,13 +230,7 @@ def _write_ferebus_manifest(staging_dir: Path, payload: Dict[str, Any]) -> Path:
     staging = Path(staging_dir)
     staging.mkdir(parents=True, exist_ok=True)
     path = ferebus_manifest_path(staging)
-    tmp = staging / ("." + FEREBUS_TASK_MANIFEST + ".tmp")
-    tmp.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
-    os.replace(str(tmp), str(path))
+    atomic_write_json(path, payload)
     return path
 
 
@@ -509,6 +504,7 @@ def stage_ferebus_inputs(campaign_dir, config, training_version, is_initial=Fals
     prop_dirs = {prop: staging / prop for prop in properties}
     for prop_dir in prop_dirs.values():
         prop_dir.mkdir(parents=True, exist_ok=True)
+    degenerate_property_stats: List[Dict[str, Any]] = []
     for atom_csv in feature_csvs:
         # filename is "<atom>_train.csv"; recover the atom label.
         atom = atom_csv.name[:-len("_train.csv")]
@@ -552,6 +548,13 @@ def stage_ferebus_inputs(campaign_dir, config, training_version, is_initial=Fals
                     + str(train_csv)
                 )
             stats_by_prop_atom[(prop, atom)] = stats
+            if bool(stats.get("degenerate_property_stats", False)):
+                degenerate_property_stats.append({
+                    "property": str(prop),
+                    "atom": str(atom),
+                    "std": float(stats["std"]),
+                    "range": float(stats["range"]),
+                })
     n_atoms = len(atom_labels)
     atoms_file = staging / "ATOMS.txt"
     atoms_file.write_text(
@@ -619,6 +622,11 @@ def stage_ferebus_inputs(campaign_dir, config, training_version, is_initial=Fals
                     "command": command,
                     "row_counts": dict(split_counts[atom]),
                     "row_ids": dict(row_ids_by_atom[atom]),
+                    "degenerate_property_stats": bool(
+                        stats_by_prop_atom.get((prop, atom), {}).get(
+                            "degenerate_property_stats", False
+                        )
+                    ),
                 }
             )
             task_index += 1
@@ -629,10 +637,12 @@ def stage_ferebus_inputs(campaign_dir, config, training_version, is_initial=Fals
             "schema_version": FEREBUS_TASK_SCHEMA_VERSION,
             "system": system,
             "training_version": int(training_version),
+            "pointdir_row_order": list(pointdir_names),
             "properties": properties,
             "atoms": atom_labels,
             "n_atoms": int(n_atoms),
             "n_tasks": int(len(tasks)),
+            "degenerate_property_stats": list(degenerate_property_stats),
             "job_details": str(job_details.resolve()),
             "split_ledger": {
                 "path": str(split_ledger["path"]),

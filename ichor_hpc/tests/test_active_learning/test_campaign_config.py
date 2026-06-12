@@ -27,7 +27,15 @@ def test_default_campaign_config_is_valid():
     assert c.runtime.postprocess_settle_attempts == 3
     assert c.runtime.postprocess_settle_seconds == 10
     assert c.runtime.transient_phase_retry_max == 1
+    assert c.runtime.poll_sacct_unknown_max_ticks == 3
     assert c.seed_selection.variance_chunk_size == 512
+    assert c.resources.mem_per_cpu == "8G"
+    assert c.aimall.encomp == 3
+    assert c.aimall.nogui is True
+    assert c.quality_gates.ariadne_max_displacement_ang == 1.25
+    assert c.quality_gates.ariadne_min_pair_distance_ang == 0.60
+    assert c.max_acquisition_grad_per_ang is None
+    assert c.effective_max_acquisition_grad_per_ang() == 50.0
 
 
 @pytest.mark.parametrize("name", ["WATER", "nh3_batch_01", "C6H6-AL"])
@@ -92,6 +100,7 @@ def test_scheduler_partition_rejects_unsafe_tokens(partition):
 def test_slurm_memory_accepts_csf4_style_units(mem):
     payload = CampaignConfig().to_dict()
     payload["resources"]["mem_per_cpu"] = mem
+    payload["gaussian"]["mem"] = "1MB"
     assert CampaignConfig.from_dict(payload).resources.mem_per_cpu == mem
 
 
@@ -130,6 +139,56 @@ def test_gaussian_nproc_must_not_exceed_allocated_cpus():
     payload["resources"]["cpus_per_task"] = 2
     payload["gaussian"]["nproc"] = 3
     with pytest.raises(ConfigValidationError, match="gaussian.nproc"):
+        CampaignConfig.from_dict(payload)
+
+
+def test_gaussian_mem_must_not_exceed_slurm_task_allocation():
+    payload = CampaignConfig().to_dict()
+    payload["resources"]["mem_per_cpu"] = "4G"
+    payload["resources"]["cpus_per_task"] = 1
+    payload["gaussian"]["mem"] = "8GB"
+    with pytest.raises(ConfigValidationError, match="gaussian.mem"):
+        CampaignConfig.from_dict(payload)
+
+
+def test_aimall_fields_validated():
+    payload = CampaignConfig().to_dict()
+    payload["aimall"]["encomp"] = 0
+    with pytest.raises(ConfigValidationError, match="aimall.encomp"):
+        CampaignConfig.from_dict(payload)
+    payload = CampaignConfig().to_dict()
+    payload["aimall"]["nogui"] = "yes"
+    with pytest.raises(ConfigValidationError, match="aimall.nogui"):
+        CampaignConfig.from_dict(payload)
+
+
+def test_preferred_acquisition_gradient_clamp_overrides_legacy_default():
+    payload = CampaignConfig().to_dict()
+    payload["max_acquisition_grad_per_ang"] = 7.5
+    cfg = CampaignConfig.from_dict(payload)
+    assert cfg.effective_max_acquisition_grad_per_ang() == 7.5
+
+
+def test_legacy_force_clamp_alias_still_supported():
+    payload = CampaignConfig().to_dict()
+    payload["max_force_per_atom_ha_per_ang"] = 6.0
+    cfg = CampaignConfig.from_dict(payload)
+    assert cfg.max_acquisition_grad_per_ang is None
+    assert cfg.effective_max_acquisition_grad_per_ang() == 6.0
+
+
+def test_acquisition_gradient_clamp_rejects_ambiguous_alias_values():
+    payload = CampaignConfig().to_dict()
+    payload["max_acquisition_grad_per_ang"] = 7.5
+    payload["max_force_per_atom_ha_per_ang"] = 6.0
+    with pytest.raises(ConfigValidationError, match="conflicts"):
+        CampaignConfig.from_dict(payload)
+
+
+def test_acquisition_gradient_clamp_must_be_positive():
+    payload = CampaignConfig().to_dict()
+    payload["max_acquisition_grad_per_ang"] = 0.0
+    with pytest.raises(ConfigValidationError, match="max_acquisition_grad_per_ang"):
         CampaignConfig.from_dict(payload)
 
 
@@ -317,6 +376,7 @@ def test_non_iqa_active_acquisition_rejected_even_if_trained():
         ("postprocess_settle_attempts", 0),
         ("postprocess_settle_seconds", -1),
         ("transient_phase_retry_max", -1),
+        ("poll_sacct_unknown_max_ticks", -1),
     ],
 )
 def test_runtime_fields_validated(field, value):
@@ -337,4 +397,23 @@ def test_seed_selection_variance_chunk_size_must_be_positive():
     payload = CampaignConfig().to_dict()
     payload["seed_selection"]["variance_chunk_size"] = 0
     with pytest.raises(ConfigValidationError, match="variance_chunk_size"):
+        CampaignConfig.from_dict(payload)
+
+
+def test_split_train_and_mid_validation_fraction_sum_validated():
+    payload = CampaignConfig().to_dict()
+    payload["split"]["train_fraction"] = 0.9
+    payload["split"]["val_mid_fraction"] = 0.2
+    with pytest.raises(ConfigValidationError, match="train_fraction \\+ split.val_mid_fraction"):
+        CampaignConfig.from_dict(payload)
+
+
+def test_barrier_new_safety_terms_validated():
+    payload = CampaignConfig().to_dict()
+    payload["acquisition"]["barrier"]["nonbonded_expansion_delta"] = -0.1
+    with pytest.raises(ConfigValidationError, match="nonbonded_expansion_delta"):
+        CampaignConfig.from_dict(payload)
+    payload = CampaignConfig().to_dict()
+    payload["acquisition"]["barrier"]["angle_upper_scale"] = 0.1
+    with pytest.raises(ConfigValidationError, match="angle_upper_scale"):
         CampaignConfig.from_dict(payload)

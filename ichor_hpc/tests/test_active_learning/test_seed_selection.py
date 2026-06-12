@@ -191,10 +191,11 @@ def test_forbidden_set_eating_all_returns_empty():
     assert out.frame_ids == []
 
 
-def test_none_frame_id_rows_are_always_eligible():
-    """Rows whose frame_id is None can't be matched against the forbidden
-    set; the implementation must let them through (they often come from
-    legacy / synthetic data with no pool linkage)."""
+def test_none_frame_id_rows_are_excluded_when_forbidden_filter_is_active():
+    """Rows whose frame_id is None are unsafe when a forbidden-frame ledger is active:
+    they might be old training rows that predate provenance metadata, so do not let them
+    bypass the repeat-frame guard.
+    """
     atoms, posterior, _ = _atoms_with_indexed_variances(6)
     # Half the rows have None frame_id; the other half are 100..102.
     fids = [None, None, None, 100, 101, 102]
@@ -203,10 +204,22 @@ def test_none_frame_id_rows_are_always_eligible():
         training_frame_ids=fids,
         forbidden_frame_ids=frozenset({100, 101, 102}),
     )
-    # All 3 of the int-frame_id rows are forbidden; only the None rows
-    # remain eligible, so the pick must be the three None-frame_id rows.
-    assert sorted(out.indices) == [0, 1, 2]
-    assert out.frame_ids == [None, None, None]
+    assert out.n == 0
+    assert out.skipped_unknown_provenance == 3
+
+
+def test_none_frame_id_rows_remain_eligible_without_forbidden_filter():
+    atoms, posterior, _ = _atoms_with_indexed_variances(4)
+    out = select_seeds(
+        atoms,
+        posterior,
+        n_seeds=2,
+        rng_seed=0,
+        training_frame_ids=[None, None, 10, 11],
+        forbidden_frame_ids=frozenset(),
+    )
+    assert out.n == 2
+    assert out.skipped_unknown_provenance == 0
 
 
 def test_mismatched_frame_ids_length_raises():

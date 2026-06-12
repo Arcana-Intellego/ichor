@@ -91,7 +91,7 @@ def test_forces_are_positive_alpha_gradient_in_ev_per_angstrom():
     )
     forces = calc.get_forces(atoms)
 
-    # forces (eV/A) = +grad(alpha) (Ha/A) * Hartree
+    # forces (eV/A) = +grad(alpha) (acquisition units/A) * Hartree pseudo-scale
     expected = grad_vib * H
     np.testing.assert_allclose(forces, expected, atol=1.0e-10)
 
@@ -109,7 +109,7 @@ def test_rigid_projection_strips_translation_from_forces():
         acq, project_rigid=False, max_force_per_atom_ha_per_ang=0.0,
     )
     f_no_proj = calc_no_proj.get_forces(atoms)
-    # Without projection, the per-atom force equals t * H.
+    # Without projection, the per-atom pseudo-force equals t * H.
     np.testing.assert_allclose(f_no_proj, grad * H, atol=1.0e-10)
 
     calc_proj = AdversarialASECalculator(
@@ -121,13 +121,13 @@ def test_rigid_projection_strips_translation_from_forces():
     np.testing.assert_allclose(f_proj, np.zeros((3, 3)), atol=1.0e-10)
 
 
-def test_per_atom_force_clamp_and_counter():
+def test_per_atom_acquisition_gradient_clamp_and_counter():
     atoms = _water()
     H = _hartree_ev()
     # Vibrational gradient with one row well above the clamp.
     # Build via projection so rigid component is gone before clamping.
     raw = np.array([
-        [100.0, 0.0, 0.0],   # |grad| = 100 Ha/A; should clamp to 5
+        [100.0, 0.0, 0.0],   # |grad| = 100 acquisition units/A; should clamp to 5
         [-50.0, 1.0, 0.0],   # vibrational; small after projection
         [0.0, 0.0, 0.0],
     ])
@@ -139,16 +139,30 @@ def test_per_atom_force_clamp_and_counter():
     calc = AdversarialASECalculator(
         acq,
         project_rigid=True,
-        max_force_per_atom_ha_per_ang=5.0,
+        max_acquisition_grad_per_ang=5.0,
         clamp_counter=counter,
     )
     forces = calc.get_forces(atoms)
 
-    # Per-atom norms after clamp must all be <= 5 Ha/A * Hartree.
+    # Per-atom norms after clamp must all be <= 5 acquisition units/A * Hartree.
     per_atom_ev = np.linalg.norm(forces, axis=1)
     assert np.all(per_atom_ev <= 5.0 * H + 1.0e-9)
     # At least one row should have been clamped (counter > 0).
-    assert counter.get("per_atom_force", 0) > 0
+    assert counter.get("per_atom_acquisition_grad", 0) > 0
+
+
+def test_deprecated_force_clamp_alias_still_applies():
+    atoms = _water()
+    H = _hartree_ev()
+    raw = np.array([[100.0, 0.0, 0.0], [-50.0, 1.0, 0.0], [0.0, 0.0, 0.0]])
+    acq = _stub_acquisition(lambda a: 0.0, lambda a: raw)
+    calc = AdversarialASECalculator(
+        acq,
+        project_rigid=True,
+        max_force_per_atom_ha_per_ang=5.0,
+    )
+    forces = calc.get_forces(atoms)
+    assert np.all(np.linalg.norm(forces, axis=1) <= 5.0 * H + 1.0e-9)
 
 
 def test_value_and_gradient_cache_avoids_double_compute():

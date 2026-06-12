@@ -435,7 +435,7 @@ class EditCampaignConfigFunctions:
             _campaign_config.failure_threshold_fraction,
         )
         _campaign_config.max_force_per_atom_ha_per_ang = user_input_float(
-            "max_force_per_atom_ha_per_ang (Hartree/Angstrom): ",
+            "max_force_per_atom_ha_per_ang (deprecated acquisition-gradient alias): ",
             _campaign_config.max_force_per_atom_ha_per_ang,
         )
         _sync_options_from_config()
@@ -716,6 +716,14 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("gaussian.mem", "str", prompt="gaussian.mem (Gaussian style, e.g. 8GB): "),
         ],
     ),
+    "Edit AIMAll block": _make_block_menu(
+        "Edit AIMAll Block",
+        "AIMAll invocation controls for live QM post-processing.",
+        [
+            _spec("aimall.encomp", "int"),
+            _spec("aimall.nogui", "bool"),
+        ],
+    ),
     "Edit batch_sizing": _make_block_menu(
         "Edit batch_sizing",
         "Batch size policy for later active-learning iterations.",
@@ -788,7 +796,8 @@ _BLOCK_MENUS_BY_LABEL = {
         "Global failure and force sanity thresholds.",
         [
             _spec("failure_threshold_fraction", "float", prompt="failure_threshold_fraction (0.0-1.0): "),
-            _spec("max_force_per_atom_ha_per_ang", "float", prompt="max_force_per_atom_ha_per_ang (Hartree/Angstrom): "),
+            _spec("max_acquisition_grad_per_ang", "optional_float", prompt="max_acquisition_grad_per_ang (acquisition units/Angstrom, null uses deprecated alias): "),
+            _spec("max_force_per_atom_ha_per_ang", "float", prompt="max_force_per_atom_ha_per_ang (deprecated acquisition-gradient alias): "),
         ],
     ),
     "Edit acquisition core": _make_block_menu(
@@ -847,10 +856,17 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("acquisition.barrier.nonbonded_clash_scale", "float"),
             _spec("acquisition.barrier.clash_delta", "float"),
             _spec("acquisition.barrier.clash_lambda", "float"),
+            _spec("acquisition.barrier.nonbonded_expansion_scale", "float"),
+            _spec("acquisition.barrier.nonbonded_expansion_delta", "float"),
+            _spec("acquisition.barrier.nonbonded_expansion_lambda", "float"),
             _spec("acquisition.barrier.bond_lower_scale", "float"),
             _spec("acquisition.barrier.bond_upper_scale", "float"),
             _spec("acquisition.barrier.bond_delta", "float"),
             _spec("acquisition.barrier.bond_lambda", "float"),
+            _spec("acquisition.barrier.angle_lower_scale", "float"),
+            _spec("acquisition.barrier.angle_upper_scale", "float"),
+            _spec("acquisition.barrier.angle_delta", "float"),
+            _spec("acquisition.barrier.angle_lambda", "float"),
             _spec("acquisition.barrier.energy_cap_quantile", "float", prompt="acquisition.barrier.energy_cap_quantile (0.0-1.0): "),
             _spec("acquisition.barrier.energy_cap_floor", "float"),
             _spec("acquisition.barrier.energy_cap_delta", "float"),
@@ -944,6 +960,7 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("runtime.postprocess_settle_attempts", "int"),
             _spec("runtime.postprocess_settle_seconds", "int"),
             _spec("runtime.transient_phase_retry_max", "int"),
+            _spec("runtime.poll_sacct_unknown_max_ticks", "int"),
         ],
     ),
 }
@@ -964,6 +981,7 @@ edit_campaign_config_menu_items = [
     _block_submenu_item("Edit initial sub-sample sizes"),
     _block_submenu_item("Edit resources"),
     _block_submenu_item("Edit Gaussian block"),
+    _block_submenu_item("Edit AIMAll block"),
     _block_submenu_item("Edit batch_sizing"),
     _block_submenu_item("Edit seed_selection"),
     _block_submenu_item("Edit anti_overlap"),

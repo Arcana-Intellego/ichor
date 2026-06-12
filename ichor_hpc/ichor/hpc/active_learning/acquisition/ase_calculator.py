@@ -10,16 +10,18 @@ an energy). The translation is:
 ASE convention is "F = -dE/dx". With "E = -alpha" we get
 "F = -d(-alpha)/dx = +grad(alpha)", so the forces returned here are the
 positive gradient of the acquisition. ARIADNE's "run_ariadne.py:613" reads
-ASE forces and negates them to obtain a Hartree-internal gradient -- this
-keeps the contract exact.
+ASE forces and negates them to obtain the optimiser gradient. The Hartree
+factor is only a reversible pseudo-energy scale used at the ASE boundary.
 
 Optional safety net at the boundary (all opt-in via constructor args):
 
 * "project_rigid": apply the mass-weighted rigid projector from
   :mod:".rigid_projection" to remove translation / rotation components from
   the gradient before the Hartree -> eV scaling. Defaults to "True".
-* "max_force_per_atom_ha_per_ang": per-atom magnitude cap on the gradient
-  (Hartree / Angstrom). Defaults to 50.0; set <= 0 to disable.
+* "max_acquisition_grad_per_ang": per-atom magnitude cap on the acquisition
+  gradient before the pseudo-energy Hartree -> eV scaling. Defaults to 50.0;
+  set <= 0 to disable. "max_force_per_atom_ha_per_ang" is accepted as a
+  deprecated alias for existing configs and tests.
 * "clamp_counter": optional "collections.Counter" updated whenever the
   per-atom cap clips a row; used by the daemon to report on saturation.
 """
@@ -72,14 +74,22 @@ class AdversarialASECalculator:
         acquisition: SeedLocalAdversarialAcquisition,
         *,
         project_rigid: bool = True,
-        max_force_per_atom_ha_per_ang: float = 50.0,
+        max_acquisition_grad_per_ang: Optional[float] = None,
+        max_force_per_atom_ha_per_ang: Optional[float] = 50.0,
         gradient_mode: Optional[str] = None,
         gradient_backend: Optional[str] = None,
         clamp_counter=None,
     ) -> None:
         self._acq = acquisition
         self._project_rigid = bool(project_rigid)
-        self._max_force = float(max_force_per_atom_ha_per_ang)
+        legacy_limit = 50.0 if max_force_per_atom_ha_per_ang is None else float(
+            max_force_per_atom_ha_per_ang
+        )
+        self._max_acquisition_grad = float(
+            legacy_limit
+            if max_acquisition_grad_per_ang is None
+            else max_acquisition_grad_per_ang
+        )
         self._gradient_mode = gradient_mode
         # None -> call acq.gradient as before. "process"/"thread"/"serial"
         # routes a cartesian_fd gradient through the parallel driver (process
@@ -165,21 +175,22 @@ class AdversarialASECalculator:
         if self._project_rigid:
             grad = project_out_rigid(grad, ichor_atoms)
 
-        if self._max_force > 0.0:
-            # cap the largest per-atom force without bending the descent
+        if self._max_acquisition_grad > 0.0:
+            # cap the largest per-atom acquisition gradient without bending the descent
             # direction: scale the whole gradient by a single factor. clamping
             # each atom on its own tilts the 3N vector, and scaling after the
             # projection would smuggle the rigid modes back in -- so project
             # first, then scale uniformly.
             norms = np.linalg.norm(grad, axis=1)
             max_norm = float(norms.max()) if norms.size else 0.0
-            if max_norm > self._max_force:
+            if max_norm > self._max_acquisition_grad:
                 if self._clamp_counter is not None:
-                    clipped = int(np.sum(norms > self._max_force))
-                    self._clamp_counter["per_atom_force"] = (
-                        int(self._clamp_counter.get("per_atom_force", 0)) + clipped
+                    clipped = int(np.sum(norms > self._max_acquisition_grad))
+                    self._clamp_counter["per_atom_acquisition_grad"] = (
+                        int(self._clamp_counter.get("per_atom_acquisition_grad", 0))
+                        + clipped
                     )
-                grad = grad * (self._max_force / max_norm)
+                grad = grad * (self._max_acquisition_grad / max_norm)
 
         forces_ev_per_ang = grad * hartree
 

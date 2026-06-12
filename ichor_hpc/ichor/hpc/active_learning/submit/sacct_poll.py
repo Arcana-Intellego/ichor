@@ -37,6 +37,8 @@ __all__ = [
     "parse_sacct_output",
     "aggregate_states",
     "poll_job",
+    "JobNameLookup",
+    "find_running_job_by_name_detailed",
     "find_running_job_by_name",
 ]
 
@@ -98,7 +100,6 @@ TERMINAL_STATES = frozenset({
     JobStatus.REVOKED,
     JobStatus.SPECIAL_EXIT,
     JobStatus.STOPPED,
-    JobStatus.UNKNOWN,
 })
 
 SUCCESS_STATES = frozenset({JobStatus.COMPLETED})
@@ -143,6 +144,10 @@ class ArrayJobSummary:
     n_completed: int
     n_failed: int
     n_pending_or_running: int
+    n_unknown: int = 0
+    n_expected: Optional[int] = None
+    n_observed: int = 0
+    n_missing: int = 0
     failure_indices: List[int] = field(default_factory=list)
 
     @property
@@ -228,6 +233,7 @@ def parse_sacct_output(stdout: str) -> List[JobObservation]:
 def aggregate_states(
     parent_job_id: str,
     observations: Sequence[JobObservation],
+    expected_task_count: Optional[int] = None,
 ) -> ArrayJobSummary:
     """Collapse per-task observations into one summary.
 
@@ -243,9 +249,15 @@ def aggregate_states(
     has_tasks = any(o.job_id.startswith(prefix) for o in task_obs)
     if has_tasks:
         task_obs = [o for o in task_obs if o.job_id.startswith(prefix)]
+    observed_count = len(task_obs)
+    expected = None if expected_task_count is None else max(0, int(expected_task_count))
+    missing = 0
+    if expected is not None and expected > observed_count:
+        missing = expected - observed_count
     n_completed = sum(1 for o in task_obs if o.is_success)
     n_failed = sum(1 for o in task_obs if o.is_failure)
-    n_pending = sum(1 for o in task_obs if not o.is_terminal)
+    n_unknown = sum(1 for o in task_obs if o.status == JobStatus.UNKNOWN)
+    n_pending = sum(1 for o in task_obs if not o.is_terminal) + missing
     failure_indices: List[int] = []
     for o in task_obs:
         if o.is_failure and "_" in o.job_id:
@@ -257,10 +269,14 @@ def aggregate_states(
     return ArrayJobSummary(
         parent_job_id=str(parent_job_id),
         observations=list(task_obs),
-        n_tasks=len(task_obs),
+        n_tasks=(expected if expected is not None else observed_count),
         n_completed=n_completed,
         n_failed=n_failed,
         n_pending_or_running=n_pending,
+        n_unknown=n_unknown,
+        n_expected=expected,
+        n_observed=observed_count,
+        n_missing=missing,
         failure_indices=sorted(failure_indices),
     )
 
@@ -297,11 +313,22 @@ def poll_job(
     return parse_sacct_output(stdout)
 
 
-def find_running_job_by_name(
+@dataclass(frozen=True)
+class JobNameLookup:
+    job_id: Optional[str]
+    inconclusive: bool = False
+    rows: List[Tuple[str, str]] = field(default_factory=list)
+    error: Optional[str] = None
+
+    def __bool__(self) -> bool:
+        return bool(self.job_id)
+
+
+def find_running_job_by_name_detailed(
     name: str,
     *,
     sacct_runner: Optional[Callable[..., Any]] = None,
-) -> Optional[str]:
+) -> JobNameLookup:
     """Look for a still-running (or queued) SLURM job with this --job-name and return its JobID,
     or None.
 
@@ -320,12 +347,21 @@ def find_running_job_by_name(
     ]
     try:
         completed = sacct_runner(cmd, check=False, capture_output=True, text=True)
-    except Exception:
-        return None
+    except Exception as exc:
+        return JobNameLookup(None, inconclusive=True, error=type(exc).__name__ + ": " + str(exc))
     if int(getattr(completed, "returncode", 1)) != 0:
-        return None
+        stderr = getattr(completed, "stderr", "") or ""
+        return JobNameLookup(
+            None,
+            inconclusive=True,
+            error="sacct exited with code "
+            + str(int(getattr(completed, "returncode", 1)))
+            + ": "
+            + repr(stderr),
+        )
     stdout = getattr(completed, "stdout", "") or ""
     non_terminal = set()
+    rows: List[Tuple[str, str]] = []
     for line in stdout.splitlines():
         if not line.strip():
             continue
@@ -335,11 +371,24 @@ def find_running_job_by_name(
         job_id = parts[0].strip()
         if not job_id:
             continue
-        if JobStatus.from_sacct(parts[1]) in NON_TERMINAL_STATES:
+        status = JobStatus.from_sacct(parts[1])
+        rows.append((job_id, status.value))
+        if status in NON_TERMINAL_STATES:
             # 123_4 -> 123 (and 123.batch -> 123): adopt the whole allocation, not a sub-step.
             base = job_id.split("_", 1)[0].split(".", 1)[0]
             non_terminal.add(base)
     if not non_terminal:
-        return None
+        return JobNameLookup(None, inconclusive=False, rows=rows)
     # lowest id == earliest submission; adopt that one if somehow several share the name.
-    return sorted(non_terminal)[0]
+    return JobNameLookup(sorted(non_terminal)[0], inconclusive=False, rows=rows)
+
+
+def find_running_job_by_name(
+    name: str,
+    *,
+    sacct_runner: Optional[Callable[..., Any]] = None,
+) -> Optional[str]:
+    return find_running_job_by_name_detailed(
+        name,
+        sacct_runner=sacct_runner,
+    ).job_id
