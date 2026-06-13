@@ -2,6 +2,8 @@ csf3:
 
   hpc:
 
+    jobscript_shebang: "#!/bin/bash --login"
+    max_array_task_id: 25000
     memory_per_core_gb: 8
     parallel_environments:
       serial: [1, 1]
@@ -12,9 +14,20 @@ csf3:
     gaussian:
       executable_path: "$g16root/g16/g16"
       modules: ["apps/binapps/gaussian/g16c01_em64t_detectcpu"]
+      scratch_root: "/scratch/$USER"
 
     aimall:
       executable_path: "~/AIMAll/aimqb.ish"
+
+    ferebus:
+      executable_path: "$HOME/.local/bin/ferebus"
+      pyferebus_platform: "CSF3"
+
+    ariadne_runtime:
+      modules:
+        - "compilers/intel/oneapi/2025.0.1"
+        - "umf compiler-rt tbb compiler"
+        - "mkl/2025.0"
 
     amber:
       modules: ["apps/intel-17.0/amber/18-at19-may2019"]
@@ -35,9 +48,15 @@ csf3:
     pandora:
       modules: ["mpi/intel-18.0/openmpi/4.0.1"]
 
-    # likely not needed
     python:
-      modules: ["apps/anaconda3/5.2.0/bin"]
+      env_name: "ichor-al-csf3"
+      python_path: "$HOME/.venv/ichor-al-csf3/bin/python"
+      modules: []
+
+    plumed:
+      kernel_path: "$HOME/opt/plumed-2.10.0/lib/libplumedKernel.so"
+      library_path: "$HOME/opt/plumed-2.10.0/lib"
+      modules: []
 
     tyche:
       modules: ["compilers/intel/18.0.3"]
@@ -46,6 +65,7 @@ csf4:
 
   hpc:
 
+    jobscript_shebang: "#!/bin/bash"
     memory_per_core_gb: 4
     parallel_environments:
       serial: [1, 1]

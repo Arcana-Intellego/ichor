@@ -80,7 +80,43 @@ requires_ariadne = pytest.mark.skipif(
 )
 
 
+def _install_fake_global_variables(monkeypatch, config, machine):
+    fake_global_variables = ModuleType("ichor.hpc.global_variables")
+    fake_global_variables.ICHOR_CONFIG = config
+    fake_global_variables.MACHINE = machine
+
+    def fake_get_param_from_config(config_obj, *keys, default=None):
+        value = config_obj
+        for key in keys:
+            if not isinstance(value, dict) or key not in value:
+                return default
+            value = value[key]
+        return value
+
+    fake_global_variables.get_param_from_config = fake_get_param_from_config
+    monkeypatch.setitem(
+        sys.modules,
+        "ichor.hpc.global_variables",
+        fake_global_variables,
+    )
+
+
 # --- preflight introspection (always run) ----------------------------------
+
+
+def test_ichor_machine_env_override_selects_profile(monkeypatch):
+    from ichor.hpc.useful_functions.get_machine import init_machine
+
+    monkeypatch.setenv("ICHOR_MACHINE", "csf3")
+    assert init_machine("login3", {"csf3": {}, "csf4": {}}) == "csf3"
+
+
+def test_ichor_machine_env_override_rejects_unknown_profile(monkeypatch):
+    from ichor.hpc.useful_functions.get_machine import init_machine
+
+    monkeypatch.setenv("ICHOR_MACHINE", "missing")
+    with pytest.raises(ValueError, match="ICHOR_MACHINE"):
+        init_machine("login3", {"csf3": {}, "csf4": {}})
 
 
 def test_check_backends_returns_structured_result():
@@ -109,6 +145,7 @@ def test_missing_backend_message_lists_each_missing():
 
 def test_missing_backend_message_names_rendered_gaussian_module():
     a = BackendAvailability(
+        profile=True,
         sbatch=True,
         sacct=True,
         gaussian=False,
@@ -124,9 +161,13 @@ def test_missing_backend_message_names_rendered_gaussian_module():
         bc_path="/usr/bin/bc",
         aimall_path="/opt/AIMAll/aimqb.ish",
         ferebus_path="/usr/local/bin/ferebus",
+        active_profile="csf3",
+        profile_error="",
+        python_executable="/home/user/.venv/ichor-al-csf3/bin/python",
     )
     msg = missing_backend_message(a)
-    assert "gaussian/g16c01_em64t_detectcpu" in msg
+    assert "Active ICHOR profile: csf3" in msg
+    assert "cluster-specific" in msg
     assert "gaussian/g16`" not in msg
 
 
@@ -280,6 +321,93 @@ def test_runtime_modules_keep_ariadne_defaults_when_only_python_configured(monke
     ]
 
 
+def test_csf3_profile_accepts_empty_python_modules_and_uses_runtime_modules(monkeypatch):
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf3": {
+                "hpc": {"jobscript_shebang": "#!/bin/bash --login"},
+                "software": {
+                    "python": {
+                        "modules": [],
+                        "python_path": "$HOME/.venv/ichor-al-csf3/bin/python",
+                    },
+                    "ariadne_runtime": {
+                        "modules": [
+                            "compilers/intel/oneapi/2025.0.1",
+                            "umf compiler-rt tbb compiler",
+                            "mkl/2025.0",
+                        ],
+                    },
+                },
+            }
+        },
+        "csf3",
+    )
+
+    body = build_sbatch_script(
+        phase_name="ARIADNE_ARRAY",
+        iteration=0,
+        campaign_dir=Path("/scratch/campaign"),
+        config=CampaignConfig(),
+        array_size=2,
+    )
+    assert body.startswith("#!/bin/bash --login")
+    assert "module load python/" not in body
+    assert "module load compilers/intel/oneapi/2025.0.1" in body
+    assert "module load umf compiler-rt tbb compiler" in body
+    assert "module load mkl/2025.0" in body
+    assert ".venv/ichor-al-csf3/bin/python" in body
+
+
+def test_csf3_gaussian_block_uses_configured_module_path_and_scratch(monkeypatch):
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf3": {
+                "hpc": {"jobscript_shebang": "#!/bin/bash --login"},
+                "software": {
+                    "gaussian": {
+                        "modules": ["apps/binapps/gaussian/g16c01_em64t_detectcpu"],
+                        "executable_path": "$g16root/g16/g16",
+                        "scratch_root": "/scratch/$USER",
+                    }
+                },
+            }
+        },
+        "csf3",
+    )
+    body = build_sbatch_script(
+        phase_name="INITIAL_GAUSSIAN",
+        iteration=0,
+        campaign_dir=Path("/scratch/campaign"),
+        config=CampaignConfig(),
+        array_size=1,
+    )
+    assert body.startswith("#!/bin/bash --login")
+    assert "module load apps/binapps/gaussian/g16c01_em64t_detectcpu" in body
+    assert "$g16root/g16/g16 < input.gjf > input.gau" in body
+    assert "export GAUSS_SCRATCH_ROOT=/scratch/$USER" in body
+    assert 'export GAUSS_SCRDIR="${GAUSS_SCRATCH_ROOT%/}/ichor_gaussian_${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"' in body
+    assert 'export GAUSS_PDEF="${SLURM_CPUS_PER_TASK:-1}"' in body
+
+
+def test_configured_array_task_limit_rejects_too_large_array(monkeypatch):
+    _install_fake_global_variables(
+        monkeypatch,
+        {"csf3": {"hpc": {"max_array_task_id": 25000}}},
+        "csf3",
+    )
+    with pytest.raises(BackendSubmissionError, match="max_array_task_id"):
+        build_sbatch_script(
+            phase_name="ARIADNE_ARRAY",
+            iteration=0,
+            campaign_dir=Path("/scratch/campaign"),
+            config=CampaignConfig(),
+            array_size=25002,
+        )
+
+
 def test_build_sbatch_script_uses_yaml_scheduler_resources_by_default():
     cfg = CampaignConfig()
     cfg.resources.partition = "csf4-debug"
@@ -368,6 +496,20 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
 
     monkeypatch.setattr(stg, "stage_ferebus_inputs", fake_stage)
     monkeypatch.setattr(pyferebus_wrap, "submit_ferebus", fake_submit)
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf3": {
+                "software": {
+                    "ferebus": {
+                        "executable_path": "$HOME/.local/bin/ferebus",
+                        "pyferebus_platform": "CSF3",
+                    }
+                }
+            }
+        },
+        "csf3",
+    )
 
     runner = object()
     ex = LiveBackendsPhaseExecutor(
@@ -390,6 +532,7 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
     assert calls["submit"]["kwargs"]["move_dataset_files"] is True
     assert calls["submit"]["kwargs"]["submit_runner"] is runner
     assert calls["submit"]["kwargs"]["walltime_hours"] == cfg.resources.walltime_hours
+    assert calls["submit"]["kwargs"]["platform"] == "CSF3"
 
 
 def test_build_sbatch_script_renders_aimall_block(monkeypatch):

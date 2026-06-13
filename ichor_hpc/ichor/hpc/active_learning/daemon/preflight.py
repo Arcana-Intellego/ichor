@@ -5,7 +5,7 @@ LiveBackendsPhaseExecutor requires before it can drive a real campaign:
 
     * sbatch     -- SLURM submit
     * sacct      -- SLURM accounting (also needed by the daemon poll loop)
-    * g16        -- Gaussian; required by the generated CSF4 sbatch scripts
+    * g16        -- Gaussian; required by the generated SLURM scripts
     * aimqb.ish  -- AIMAll wrapper script (per pyferebus convention)
     * FEREBUS    -- Fortran kriging executable
     * ariadne    -- importable Python module from the oneAPI build
@@ -22,6 +22,13 @@ import shutil
 from dataclasses import dataclass
 from typing import List
 
+from .cluster_profile import (
+    ClusterProfileError,
+    active_machine,
+    expanded_profile_value,
+    profile_value,
+    require_cluster_profile,
+)
 
 __all__ = [
     "BackendAvailability",
@@ -32,6 +39,7 @@ __all__ = [
 
 @dataclass(frozen=True)
 class BackendAvailability:
+    profile: bool
     sbatch: bool
     sacct: bool
     gaussian: bool
@@ -47,11 +55,14 @@ class BackendAvailability:
     bc_path: str
     aimall_path: str
     ferebus_path: str
+    active_profile: str
+    profile_error: str
+    python_executable: str
 
     @property
     def all_present(self) -> bool:
         return (
-            self.sbatch and self.sacct and self.gaussian and
+            self.profile and self.sbatch and self.sacct and self.gaussian and
             self.aimall and self.ferebus and self.ariadne and
             self.polus_rs and self.pyferebus and self.bc
         )
@@ -60,7 +71,7 @@ class BackendAvailability:
     def missing(self) -> List[str]:
         out: List[str] = []
         for attr in (
-            "sbatch", "sacct", "gaussian", "aimall", "ferebus",
+            "profile", "sbatch", "sacct", "gaussian", "aimall", "ferebus",
             "ariadne", "polus_rs", "pyferebus", "bc",
         ):
             if not getattr(self, attr):
@@ -86,24 +97,13 @@ def _from_config_or_path(backend_name: str, *path_lookup_names: str) -> str:
     Returns the empty string if no usable executable is found.
     """
     import os
-    try:
-        from ichor.hpc.global_variables import ICHOR_CONFIG, MACHINE, get_param_from_config
-    except Exception:
-        ICHOR_CONFIG = None
-        MACHINE = None
-        get_param_from_config = None
-    machine = MACHINE
-    if ICHOR_CONFIG and not machine and "csf4" in ICHOR_CONFIG:
-        machine = "csf4"
-    if ICHOR_CONFIG and machine and get_param_from_config:
-        raw = get_param_from_config(
-            ICHOR_CONFIG, machine, "software", backend_name,
-            "executable_path", default=None,
-        )
-        if raw:
-            expanded = os.path.expanduser(os.path.expandvars(str(raw)))
-            if os.path.isfile(expanded) and os.access(expanded, os.X_OK):
-                return expanded
+    raw = expanded_profile_value(
+        "software", backend_name, "executable_path", default=None
+    )
+    if raw:
+        expanded = str(raw)
+        if os.path.isfile(expanded) and os.access(expanded, os.X_OK):
+            return expanded
     # PATH-based fallback
     for name in path_lookup_names:
         found = shutil.which(name)
@@ -115,35 +115,18 @@ def _from_config_or_path(backend_name: str, *path_lookup_names: str) -> str:
 def _gaussian_binary() -> str:
     """Return login-node g16, or a jobscript-resolved Gaussian config marker.
 
-    On CSF4 the Gaussian module is jobscript-only and refuses to load on login
-    nodes. That is still a valid live configuration as long as ichor_config.yaml
-    declares both the Gaussian module and executable path for the generated
-    SLURM scripts.
+    Some Gaussian modules are jobscript-only and unavailable on login nodes.
+    That is still a valid live configuration as long as ichor_config.yaml
+    declares both the Gaussian module and executable path for generated SLURM
+    scripts.
     """
     found = _which("g16")
     if found:
         return found
 
-    try:
-        from ichor.hpc.global_variables import ICHOR_CONFIG, MACHINE, get_param_from_config
-    except Exception:
-        return ""
-
-    if not ICHOR_CONFIG:
-        return ""
-
-    machine = MACHINE
-    if not machine and "csf4" in ICHOR_CONFIG:
-        machine = "csf4"
-    if not machine:
-        return ""
-
-    modules = get_param_from_config(
-        ICHOR_CONFIG, machine, "software", "gaussian", "modules", default=None
-    )
-    executable = get_param_from_config(
-        ICHOR_CONFIG, machine, "software", "gaussian", "executable_path",
-        default=None,
+    modules = profile_value("software", "gaussian", "modules", default=None)
+    executable = profile_value(
+        "software", "gaussian", "executable_path", default=None
     )
 
     if executable and modules:
@@ -186,10 +169,20 @@ def check_backends() -> BackendAvailability:
     sbatch = _which("sbatch")
     sacct = _which("sacct")
     bc = _which("bc")
+    profile_error = ""
+    try:
+        profile = require_cluster_profile()
+        machine = profile.machine
+        profile_ok = True
+    except ClusterProfileError as exc:
+        machine = active_machine() or ""
+        profile_ok = False
+        profile_error = str(exc)
     gauss = _gaussian_binary()
     aim = _from_config_or_path("aimall", "aimqb.ish", "aimqb")
     fer = _from_config_or_path("ferebus", "FEREBUS", "ferebus")
     return BackendAvailability(
+        profile=profile_ok,
         sbatch=bool(sbatch),
         sacct=bool(sacct),
         gaussian=bool(gauss),
@@ -205,23 +198,41 @@ def check_backends() -> BackendAvailability:
         bc_path=bc,
         aimall_path=aim,
         ferebus_path=fer,
+        active_profile=machine,
+        profile_error=profile_error,
+        python_executable=expanded_profile_value(
+            "software", "python", "python_path", default=""
+        ) or "",
     )
 
 
 def missing_backend_message(avail: BackendAvailability) -> str:
     if avail.all_present:
         return ""
-    lines = ["The following backends are not available on PATH / PYTHONPATH:"]
+    profile = avail.active_profile or "<unresolved>"
+    lines = [
+        "The following configured Slurm backends are not available on PATH / PYTHONPATH:",
+        "Active ICHOR profile: " + profile,
+    ]
+    if not avail.profile:
+        lines.append(
+            "  - profile. "
+            + (
+                avail.profile_error
+                if avail.profile_error
+                else "Set ICHOR_MACHINE to a top-level key in ~/ichor_config.yaml "
+                "(for example ICHOR_MACHINE=csf3)."
+            )
+        )
     if not avail.sbatch:
-        lines.append("  - sbatch (SLURM submit). Are you on a CSF4 login node?")
+        lines.append("  - sbatch (SLURM submit). Are you on a Slurm login node?")
     if not avail.sacct:
         lines.append("  - sacct (SLURM accounting).")
     if not avail.gaussian:
         lines.append(
             "  - Gaussian. Either g16 must be on PATH, or ~/ichor_config.yaml "
             "must declare <MACHINE>.software.gaussian.modules and "
-            "executable_path. On CSF4 this is usually "
-            "gaussian/g16c01_em64t_detectcpu, but do not load Gaussian on "
+            "executable_path. The module name is cluster-specific; do not load Gaussian on "
             "the login node; it is jobscript-only."
         )
     if not avail.aimall:

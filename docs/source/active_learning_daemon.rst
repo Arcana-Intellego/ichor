@@ -184,9 +184,11 @@ explicitly-set key, so the preset acts as a strong default::
 Cluster prerequisites for :code:`--live`
 ----------------------------------------
 
-A live campaign on CSF4 (or another SLURM cluster) needs five backends
-available on PATH at submission time. The daemon checks them at start
-and refuses with exit 12 if any are missing::
+A live campaign on a configured SLURM cluster needs the backend profile in
+``~/ichor_config.yaml`` plus the Python modules/binaries for that profile.
+Set ``ICHOR_MACHINE`` when the login hostname does not contain the intended
+top-level profile key, for example ``ICHOR_MACHINE=csf3``. The daemon checks
+the live backends at start and refuses with exit 12 if any are missing::
 
     module load python/3.11.3-gcccore-12.3.0
     module load compilers/oneapi/2024.2.0
@@ -201,7 +203,9 @@ and refuses with exit 12 if any are missing::
 The exact module names and versions come from your local
 :code:`~/ichor_config.yaml`; see :code:`ichor_config_setup.rst` for the
 config-file format. CSF4 operators at Manchester can reuse the canonical
-:code:`ichor_config.yaml` checked in at the repo root.
+:code:`ichor_config.yaml` checked in at the repo root. CSF3 operators should
+start from :code:`examples/csf3_first_live_iter/README.md`, which documents the
+private CPython 3.11 non-Conda route and CSF3 oneAPI runtime modules.
 
 
 Backend availability
@@ -220,9 +224,9 @@ Backend availability
      - :code:`--live`
      - :code:`which sbatch && which sacct`
    * - Gaussian g16
-     - :code:`module load gaussian/g16c01_em64t_detectcpu`
+     - Cluster module declared in :code:`~/ichor_config.yaml`
      - :code:`--live`
-     - :code:`which g16`
+     - :code:`ichor-al-daemon preflight --campaign-dir .`
    * - AIMAll
      - Operator-installed at :code:`~/AIMAll/aimqb.ish`
      - :code:`--live`
@@ -242,11 +246,12 @@ Backend availability
 
 The :code:`ichor-al-daemon` :code:`start --live` command exits cleanly
 (no partial writes) if any of the above checks fail. You can also run
-the backend preflight script directly::
+the backend preflight command directly::
 
-    python -m ichor.hpc.active_learning.daemon.preflight
+    ichor-al-daemon preflight --campaign-dir .
 
-which prints a one-line PASS / FAIL per backend.
+which prints structured backend/profile diagnostics and exits with code 12 if
+anything required for live mode is missing.
 
 
 Recovery + troubleshooting

@@ -42,6 +42,39 @@ def test_parser_rejects_missing_subcommand():
         build_parser().parse_args([])
 
 
+def test_cli_preflight_prints_structured_backend_status(capsys, monkeypatch):
+    from ichor.hpc.active_learning.daemon.preflight import BackendAvailability
+
+    avail = BackendAvailability(
+        profile=True,
+        sbatch=True,
+        sacct=True,
+        gaussian=True,
+        aimall=True,
+        ferebus=True,
+        ariadne=True,
+        polus_rs=True,
+        pyferebus=True,
+        bc=True,
+        gaussian_binary="jobscript:$g16root/g16/g16",
+        sbatch_path="/usr/bin/sbatch",
+        sacct_path="/usr/bin/sacct",
+        bc_path="/usr/bin/bc",
+        aimall_path="/home/user/AIMAll/aimqb.ish",
+        ferebus_path="/home/user/.local/bin/ferebus",
+        active_profile="csf3",
+        profile_error="",
+        python_executable="/home/user/.venv/ichor-al-csf3/bin/python",
+    )
+    monkeypatch.setattr(cli_mod, "check_backends", lambda: avail)
+
+    rc = main(["preflight", "--campaign-dir", "."])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["active_profile"] == "csf3"
+    assert payload["python_executable"].endswith("ichor-al-csf3/bin/python")
+
+
 def test_cli_status_prints_state_json(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
     (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)

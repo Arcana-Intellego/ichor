@@ -1,0 +1,26 @@
+# minimal one-iteration campaign config for the first CSF3 live smoke.
+# see README.md in this directory for the full walkthrough.
+
+schema_version: 2
+system_name: WATER
+
+max_iterations: 1
+poll_interval_seconds: 60
+
+initial_train_size: 8
+initial_val_size: 2
+
+batch_sizing:
+  policy: linear
+  floor: 4
+  cap: 8
+
+seed_selection:
+  n_seeds_per_iteration: 4
+  bulk_fraction: 0.5
+
+ariadne:
+  optimiser: trust_region_qn
+  hessian_model: ALMLOF
+  max_iter: 50
+  gradf_tol: 1.0e-4

@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import asdict
 from pathlib import Path
 from typing import List, Optional, Sequence
 
@@ -240,7 +241,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         sacct_poller = None
     else:
         print("no execution mode selected. Pick one of:", file=sys.stderr)
-        print("  --live          run against real CSF4 backends (requires sbatch + Gaussian + AIMAll + FEREBUS + ariadne)", file=sys.stderr)
+        print("  --live          run against configured Slurm backends (requires sbatch + Gaussian + AIMAll + FEREBUS + ariadne)", file=sys.stderr)
         print("  --dry-run       stub backends, real file-system flow", file=sys.stderr)
         print("  --mock-ariadne  pure state-machine progression test", file=sys.stderr)
         return 3
@@ -484,6 +485,16 @@ def cmd_import_pool(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_preflight(args: argparse.Namespace) -> int:
+    avail = check_backends()
+    print(json.dumps(asdict(avail), indent=2, sort_keys=True))
+    if avail.all_present:
+        return 0
+    print("", file=sys.stderr)
+    print(missing_backend_message(avail), file=sys.stderr)
+    return 12
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ichor-al-daemon",
@@ -513,7 +524,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_start.add_argument(
         "--live", action="store_true",
-        help="Use LiveBackendsPhaseExecutor against real CSF4 backends (sbatch + Gaussian + AIMAll + FEREBUS + ARIADNE). Refuses with exit 12 if any are missing.",
+        help="Use LiveBackendsPhaseExecutor against configured Slurm backends (sbatch + Gaussian + AIMAll + FEREBUS + ARIADNE). Refuses with exit 12 if any are missing.",
     )
     p_start.add_argument(
         "--poll-interval", type=int, default=None,
@@ -608,6 +619,14 @@ def build_parser() -> argparse.ArgumentParser:
              "writes rejected.json alongside pool.manifest.json.",
     )
     p_imp.set_defaults(func=cmd_import_pool)
+
+    p_pre = sub.add_parser("preflight", help="Check configured live Slurm backends.")
+    p_pre.add_argument(
+        "--campaign-dir",
+        default=".",
+        help="Accepted for symmetry with other commands; not used by preflight.",
+    )
+    p_pre.set_defaults(func=cmd_preflight)
 
     return parser
 

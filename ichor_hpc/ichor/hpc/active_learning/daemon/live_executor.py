@@ -1,4 +1,4 @@
-"""LiveBackendsPhaseExecutor -- the CSF4 deployment target.
+"""LiveBackendsPhaseExecutor -- the configured Slurm deployment target.
 
 Inherits the file system layout management from :class: DryRunPhaseExecutor
 but overrides the SBATCH phase submission to:
@@ -16,7 +16,7 @@ structures.
 
 The wiring is verified via the smoke tests ('pytest -m live'), which
 skip cleanly when the required binaries are absent. 
-On CSF4 they exercise sbatch + sacct against tiny one-shot
+On configured Slurm clusters they exercise sbatch + sacct against tiny one-shot
 jobs that take seconds, not hours.
 """
 from __future__ import annotations
@@ -52,7 +52,12 @@ from .phase_executor import (
     PhaseResult,
     SBATCH_PHASES,
 )
-from .preflight import BackendAvailability, check_backends
+from .preflight import BackendAvailability, check_backends, missing_backend_message
+from .cluster_profile import (
+    active_machine,
+    expanded_profile_value,
+    profile_value,
+)
 from .state import CampaignPhase
 from .job_names import live_job_name
 
@@ -81,6 +86,8 @@ DEFAULT_DAEMON_RUNTIME_MODULES: List[str] = (
 )
 
 _MODULE_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/+-]*(?: [A-Za-z0-9][A-Za-z0-9_.:/+-]*)*$")
+_SHEBANG_RE = re.compile(r"^#![A-Za-z0-9_./ -]+$")
+_SHELL_PATH_FRAGMENT_RE = re.compile(r"^[A-Za-z0-9_./${}:+-]+$")
 
 #  SBATCH-phase postprocess refusal guard.
 #
@@ -434,6 +441,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         DryRunPhaseExecutor.__post_init__(self)
         if self.backend_check:
             avail = check_backends()
+            if not avail.profile:
+                raise LiveBackendNotAvailableError(missing_backend_message(avail))
             if not avail.sbatch:
                 raise LiveBackendNotAvailableError(
                     "sbatch is not on PATH; LiveBackendsPhaseExecutor cannot "
@@ -542,11 +551,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             )
             if ferebus_path == "ferebus" and not allow_bare_ferebus:
                 raise BackendSubmissionError(
-                    "live CSF4 FEREBUS requires software.ferebus.executable_path "
+                    "live FEREBUS requires software.ferebus.executable_path "
                     "in ichor_config.yaml; set ICHOR_ALLOW_BARE_FEREBUS=1 only for "
                     "development tests"
                 )
             path_to_executable = None if ferebus_path == "ferebus" else ferebus_path
+            ferebus_platform = _configured_ferebus_platform()
             effective_walltime = (
                 int(self.walltime_hours)
                 if self.walltime_hours is not None
@@ -555,7 +565,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             submission = submit_ferebus(
                 staging / _stg.FEREBUS_JOB_DETAILS,
                 staging,
-                platform="CSF4",
+                platform=ferebus_platform,
                 walltime_hours=effective_walltime,
                 ncores=max(1, ncores),
                 kernel=str(f.kernel),
@@ -2129,8 +2139,19 @@ def _shell_quote(value: Any) -> str:
     return shlex.quote(text)
 
 
+def _shell_executable(value: Any) -> str:
+    text = str(value)
+    _reject_shell_control_chars("shell executable", text)
+    if "$" in text and _SHELL_PATH_FRAGMENT_RE.fullmatch(text):
+        return text
+    return shlex.quote(text)
+
+
 def _python_executable_for_script() -> str:
-    return _shell_quote(sys.executable)
+    python_path = expanded_profile_value(
+        "software", "python", "python_path", default=None
+    )
+    return _shell_quote(python_path or sys.executable)
 
 
 def _normalise_module_list(raw: Any, *, label: str) -> List[str]:
@@ -2162,39 +2183,99 @@ def _normalise_module_list(raw: Any, *, label: str) -> List[str]:
     return modules
 
 
+def _configured_jobscript_shebang() -> str:
+    raw = profile_value("hpc", "jobscript_shebang", default=None)
+    if raw is None:
+        return "#!/bin/bash --login" if active_machine() else "#!/bin/bash"
+    value = str(raw).strip()
+    _reject_shell_control_chars("configured hpc.jobscript_shebang", value)
+    if not _SHEBANG_RE.fullmatch(value):
+        raise BackendSubmissionError(
+            "configured hpc.jobscript_shebang is unsafe: " + repr(value)
+        )
+    return value
+
+
+def _configured_max_array_task_id() -> Optional[int]:
+    raw = profile_value("hpc", "max_array_task_id", default=None)
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise BackendSubmissionError(
+            "configured hpc.max_array_task_id must be an integer"
+        ) from exc
+    if value < 0:
+        raise BackendSubmissionError(
+            "configured hpc.max_array_task_id must be >= 0"
+        )
+    return value
+
+
+def _configured_ferebus_platform() -> str:
+    raw = profile_value(
+        "software", "ferebus", "pyferebus_platform", default=None
+    )
+    if raw:
+        value = str(raw).strip()
+    else:
+        machine = active_machine()
+        value = machine.upper() if machine else "CSF4"
+    _reject_shell_control_chars("configured ferebus pyferebus_platform", value)
+    if not re.fullmatch(r"^[A-Za-z0-9_.-]+$", value):
+        raise BackendSubmissionError(
+            "configured ferebus pyferebus_platform is unsafe: " + repr(value)
+        )
+    return value
+
+
+def _configured_gaussian_scratch_root() -> str:
+    raw = profile_value(
+        "software", "gaussian", "scratch_root", default="/scratch/${USER}"
+    )
+    value = str(raw).strip() if raw is not None else "/scratch/${USER}"
+    _reject_shell_control_chars("configured gaussian scratch_root", value)
+    if not _SHELL_PATH_FRAGMENT_RE.fullmatch(value):
+        raise BackendSubmissionError(
+            "configured gaussian scratch_root contains unsafe characters: "
+            + repr(value)
+        )
+    return value
+
+
 def _configured_daemon_runtime_modules() -> List[str]:
     """Modules loaded by daemon-owned live sbatch scripts.
 
     Python and ARIADNE/MKL runtime modules are kept in ichor_config.yaml so a
-    CSF4 Python-module update does not require a code edit. Missing config
-    falls back to the current non-Anaconda CSF4 stack. FEREBUS is not included:
-    pyferebus writes and submits its own CSF4 script for FEREBUS phases.
+    cluster-module update does not require a code edit. Missing config falls
+    back to the current CSF4 stack for off-cluster tests and legacy configs.
+    FEREBUS is not included: pyferebus writes and submits its own script for
+    FEREBUS phases.
     """
     try:
-        from ichor.hpc.global_variables import ICHOR_CONFIG, MACHINE, get_param_from_config
-        if ICHOR_CONFIG is None:
-            return list(DEFAULT_DAEMON_RUNTIME_MODULES)
-        machine = MACHINE
-        if not machine and "csf4" in ICHOR_CONFIG:
-            machine = "csf4"
-        if not machine:
-            return list(DEFAULT_DAEMON_RUNTIME_MODULES)
-        python_modules = get_param_from_config(
-            ICHOR_CONFIG, machine, "software", "python", "modules",
-            default=None,
+        python_modules = profile_value(
+            "software", "python", "modules", default=None
         )
-        ariadne_modules = get_param_from_config(
-            ICHOR_CONFIG, machine, "software", "ariadne_runtime", "modules",
-            default=None,
+        ariadne_modules = profile_value(
+            "software", "ariadne_runtime", "modules", default=None
         )
     except Exception:
         return list(DEFAULT_DAEMON_RUNTIME_MODULES)
 
+    machine = (active_machine() or "").lower()
+    legacy_defaults = (not machine) or machine == "csf4"
+    default_python_modules = (
+        list(DEFAULT_DAEMON_PYTHON_MODULES) if legacy_defaults else []
+    )
+    default_ariadne_modules = (
+        list(DEFAULT_DAEMON_ARIADNE_RUNTIME_MODULES) if legacy_defaults else []
+    )
     modules = (
         (_normalise_module_list(python_modules, label="python")
-         if python_modules is not None else list(DEFAULT_DAEMON_PYTHON_MODULES))
+         if python_modules is not None else default_python_modules)
         + (_normalise_module_list(ariadne_modules, label="ariadne_runtime")
-           if ariadne_modules is not None else list(DEFAULT_DAEMON_ARIADNE_RUNTIME_MODULES))
+           if ariadne_modules is not None else default_ariadne_modules)
     )
     return modules
 
@@ -2228,9 +2309,19 @@ def build_sbatch_script(
     job_name = live_job_name(campaign_uid, phase_name, iteration)
     logs = camp + "/.DATA/SCRIPTS"
     is_array = array_size is not None and int(array_size) > 0
+    if is_array:
+        max_array_task_id = _configured_max_array_task_id()
+        highest_task_id = int(array_size) - 1
+        if max_array_task_id is not None and highest_task_id > max_array_task_id:
+            raise BackendSubmissionError(
+                "array task id "
+                + str(highest_task_id)
+                + " exceeds configured hpc.max_array_task_id "
+                + str(max_array_task_id)
+            )
     tag = ".%A_%a" if is_array else ".%j"
     lines: List[str] = [
-        "#!/bin/bash",
+        _configured_jobscript_shebang(),
         "#SBATCH --job-name=" + job_name,
         "#SBATCH --partition=" + part,
         "#SBATCH --time=" + str(int(wall)) + ":00:00",
@@ -2278,11 +2369,16 @@ def _gaussian_invocation_block(iteration, camp, config, points_file) -> List[str
         ["gaussian/g16c01_em64t_detectcpu"],
     )
     gaussian_exe = _configured_backend_path("gaussian", "g16")
+    scratch_root = _configured_gaussian_scratch_root()
     points_file_q = _shell_quote(points_file)
     return [
         *["module load " + m for m in gaussian_modules],
         "",
         "# per-point gaussian array: task N runs the Nth staged pointdir.",
+        "export GAUSS_SCRATCH_ROOT=" + scratch_root,
+        'export GAUSS_SCRDIR="${GAUSS_SCRATCH_ROOT%/}/ichor_gaussian_${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"',
+        'export GAUSS_PDEF="${SLURM_CPUS_PER_TASK:-1}"',
+        'mkdir -p "$GAUSS_SCRDIR"',
         # check the file FIRST -- under set -e a failing sed (missing POINTS.txt) aborts the
         # assignment before the friendly -z guard below ever runs, leaving just a bare sed error.
         "if [ ! -f " + points_file_q + " ]; then echo "
@@ -2291,29 +2387,19 @@ def _gaussian_invocation_block(iteration, camp, config, points_file) -> List[str
         'POINT_DIR=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" ' + points_file_q + ")",
         'if [ -z "$POINT_DIR" ]; then echo "no pointdir for index $SLURM_ARRAY_TASK_ID" >&2; exit 1; fi',
         'cd "$POINT_DIR"',
-        _shell_quote(gaussian_exe) + " < input.gjf > input.gau",
+        _shell_executable(gaussian_exe) + " < input.gjf > input.gau",
     ]
 
 
 def _configured_backend_path(backend_name: str, fallback: str) -> str:
     """Look up the executable_path for a software backend from the operator's
     ~/ichor_config.yaml. Falls back to a sensible default (usually the bare
-    command) when the machine is not recognised or the backend not declared,
-    so unit tests + non-CSF environments keep working.
+    command) when no active profile/backend path is declared, so unit tests
+    and non-cluster environments keep working.
     """
-    raw = None
     try:
-        from ichor.hpc.global_variables import ICHOR_CONFIG, MACHINE, get_param_from_config
-        if ICHOR_CONFIG is None:
-            return fallback
-        machine = MACHINE
-        if not machine and "csf4" in ICHOR_CONFIG:
-            machine = "csf4"
-        if not machine:
-            return fallback
-        raw = get_param_from_config(
-            ICHOR_CONFIG, machine, "software", backend_name, "executable_path",
-            default=None,
+        raw = expanded_profile_value(
+            "software", backend_name, "executable_path", default=None
         )
     except Exception:
         return fallback
@@ -2329,21 +2415,10 @@ def _configured_backend_path(backend_name: str, fallback: str) -> str:
 
 def _configured_backend_modules(backend_name: str, fallback: List[str]) -> List[str]:
     try:
-        from ichor.hpc.global_variables import ICHOR_CONFIG, MACHINE, get_param_from_config
-        if ICHOR_CONFIG is None:
-            return list(fallback)
-        machine = MACHINE
-        if not machine and "csf4" in ICHOR_CONFIG:
-            machine = "csf4"
-        if not machine:
-            return list(fallback)
-        raw = get_param_from_config(
-            ICHOR_CONFIG, machine, "software", backend_name, "modules",
-            default=None,
-        )
+        raw = profile_value("software", backend_name, "modules", default=None)
     except Exception:
         return list(fallback)
-    if not raw:
+    if raw is None:
         return list(fallback)
     return _normalise_module_list(raw, label=backend_name)
 

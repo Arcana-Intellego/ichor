@@ -54,9 +54,11 @@ The ``python-bundle-pypi`` module is useful while bootstrapping a venv because
 it provides common packaging tools. Once the venv exists, use the venv's own
 ``python -m pip``.
 
-If you are on CSF3 and only Anaconda provides a recent enough Python for your
-project, you may still use Anaconda there. Avoid mixing Conda packages and pip
-packages in the daemon environment unless you have a specific reason.
+On CSF3, do not use the central ``python/3.13.1`` module for the
+active-learning stack unless every compiled dependency has been proven against
+it. The recommended non-Conda route is a private CPython 3.11 build installed
+under ``$HOME/opt`` and a venv created from that interpreter. Miniforge remains
+a fallback if you deliberately choose a Conda environment.
 
 Check the active Python version with
 
@@ -64,15 +66,38 @@ Check the active Python version with
 
     python3 --version
 
-On CSF3, you may need to do ``qrsh -l short`` as the network proxy is no longer available.
-This goes into a submit (compute) node, you can access the internet and install packages as well as make new conda environments with different python versions.
+Build private CPython 3.11 on CSF3 from the official source tarball:
+
+.. code-block:: text
+
+    mkdir -p ~/src ~/opt
+    cd ~/src
+    wget https://www.python.org/ftp/python/3.11.15/Python-3.11.15.tgz
+    tar -xzf Python-3.11.15.tgz
+    cd Python-3.11.15
+    ./configure --prefix=$HOME/opt/python-3.11.15 --enable-shared --with-ensurepip=install
+    make -j 8
+    make install
+
+Then create the ICHOR venv:
+
+.. code-block:: text
+
+    export LD_LIBRARY_PATH=$HOME/opt/python-3.11.15/lib:$LD_LIBRARY_PATH
+    $HOME/opt/python-3.11.15/bin/python3.11 -m venv ~/.venv/ichor-al-csf3
+    source ~/.venv/ichor-al-csf3/bin/activate
+    python -m pip install --upgrade pip setuptools wheel
+
+If CSF3 cannot download directly, download the Python tarball locally from
+``python.org``, transfer it to ``~/src`` on CSF3, and build it there. Do not
+vendor Python into the ICHOR repository.
 
 .. warning::
 
-    You will need to load the same Python module and activate the same venv again
-    on whichever node installs packages. Create environments while on a node with
-    internet access. After you have installed all the packages, you should be able
-    to submit jobs using that venv.
+    You will need to load the same Python module, or export the same private
+    Python ``LD_LIBRARY_PATH``, and activate the same venv again on whichever
+    node installs packages. After you have installed all the packages, you
+    should be able to submit jobs using that venv.
 
 Now you can make a ``venv`` environment which will use the Python version from
 the loaded module. To make a venv, do
@@ -102,9 +127,9 @@ To make sure you are using the latest versions of the packages, use
 
     python3 -m pip install --upgrade pip setuptools
 
-++++++++++++++++++++++++++
-CSF4 PLUMED without Conda
-++++++++++++++++++++++++++
++++++++++++++++++++
+PLUMED without Conda
++++++++++++++++++++
 
 PLUMED does not require Anaconda for ICHOR metadynamics. The runtime
 contract is:
@@ -203,8 +228,9 @@ meaning that changes in the ichor source code will be directly made in the insta
 
     You will need to have access to the relevant
     software on the computer cluster if submitting jobs with `ichor.hpc` or
-    `ichor.cli`. Currently, the paths to programs are hard coded into the ichor code, so
-    they will need to exist at the correct paths.
+    `ichor.cli`. Backend modules and executable paths are read from
+    ``~/ichor_config.yaml``; set ``ICHOR_MACHINE`` when the login hostname does
+    not make the intended top-level profile obvious.
 
     Also, make sure that you have access to the right versions of the software
     on the right cluster.
@@ -218,6 +244,5 @@ meaning that changes in the ichor source code will be directly made in the insta
 
     Note it is usually better to use venv.
     On CSF4, load a recent non-Anaconda Python module first, then create the
-    venv from that interpreter. On CSF3, use whichever recent Python module is
-    available to you; if that is Anaconda, use it only to create the venv and
-    then install packages into the venv.
+    venv from that interpreter. On CSF3, prefer the private CPython 3.11 route
+    above for the active-learning daemon; use Miniforge only as a fallback.
