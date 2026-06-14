@@ -29,3 +29,8 @@ def init_machine(platform_name: str, ichor_config: dict) -> str:
             if k in platform_name:
 
                 return k
+
+        if "_default" in ichor_config:
+            return "_default"
+
+    return None

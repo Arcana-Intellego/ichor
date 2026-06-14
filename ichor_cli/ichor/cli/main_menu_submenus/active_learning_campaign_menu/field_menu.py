@@ -103,6 +103,22 @@ def user_input_optional_float(prompt: str, default):
             pass
 
 
+def user_input_optional_int(prompt: str, default):
+    while True:
+        try:
+            raw = input(prompt + " (int, blank keeps current, null clears): ")
+        except EOFError:
+            return default
+        if raw == "":
+            return default
+        if raw.strip().lower() in {"none", "null"}:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+
+
 def user_input_clearable_str(prompt: str, default):
     while True:
         try:
@@ -135,6 +151,8 @@ def edit_field(
         value = user_input_float(prompt, current)
     elif spec.input_kind == "optional_float":
         value = user_input_optional_float(prompt, current)
+    elif spec.input_kind == "optional_int":
+        value = user_input_optional_int(prompt, current)
     elif spec.input_kind == "bool":
         value = user_input_bool(prompt, current)
     elif spec.input_kind == "choice":

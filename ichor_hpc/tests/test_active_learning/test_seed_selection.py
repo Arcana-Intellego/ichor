@@ -33,6 +33,29 @@ class _ChunkedPosterior(_StubPosterior):
         return np.array([self.variance(atoms) for atoms in atoms_list], dtype=float)
 
 
+class _CovariancePosterior:
+    def __init__(self, atoms, covariance):
+        self._pos = {id(atom): i for i, atom in enumerate(atoms)}
+        self._cov = np.asarray(covariance, dtype=float)
+        self.covariance_matrix_called = False
+
+    def variance(self, atoms):
+        idx = self._pos[id(atoms)]
+        return float(self._cov[idx, idx])
+
+    def variances(self, atoms_list, *, chunk_size=None):
+        return np.array([self.variance(atoms) for atoms in atoms_list], dtype=float)
+
+    def covariance(self, atoms_a, atoms_b):
+        ia = self._pos[id(atoms_a)]
+        ib = self._pos[id(atoms_b)]
+        return float(self._cov[ia, ib])
+
+    def covariance_matrix(self, _atoms_list):
+        self.covariance_matrix_called = True
+        raise AssertionError("seed selection must not build a full pool covariance matrix")
+
+
 def _atoms_with_indexed_variances(n):
     """Return (atoms_list, posterior, variances) where variance(atoms[i]) = i."""
     atoms = [object() for _ in range(n)]   # opaque marker; posterior keys on id
@@ -272,3 +295,109 @@ def test_variance_chunk_size_is_backward_compatible_with_old_batched_posterior()
         variance_chunk_size=2,
     )
     assert out.variance_indices == [5, 4, 3]
+
+
+def test_d_optimal_avoids_redundant_high_variance_candidate():
+    atoms = [object() for _ in range(4)]
+    cov = np.diag([10.0, 9.0, 8.0, 1.0])
+    cov[0, 1] = cov[1, 0] = np.sqrt(10.0 * 9.0) * 0.999
+    posterior = _CovariancePosterior(atoms, cov)
+
+    out = select_seeds(
+        atoms,
+        posterior,
+        n_seeds=2,
+        bulk_fraction=0.0,
+        strategy="d_optimal",
+        d_optimal_pool_multiplier=4,
+    )
+
+    assert out.indices == [0, 2]
+    assert out.selection_origins == ["d_optimal", "d_optimal"]
+    assert out.variance_indices == [0, 2]
+    assert out.selection_diagnostics[1]["d_optimal_conditional_variance"] == pytest.approx(8.0)
+    assert posterior.covariance_matrix_called is False
+
+
+def test_d_optimal_is_deterministic_and_reports_gain_diagnostics():
+    atoms = [object() for _ in range(5)]
+    posterior = _CovariancePosterior(atoms, np.diag([5.0, 4.0, 3.0, 2.0, 1.0]))
+
+    a = select_seeds(
+        atoms,
+        posterior,
+        n_seeds=3,
+        bulk_fraction=0.0,
+        strategy="d_optimal",
+        d_optimal_pool_multiplier=2,
+    )
+    b = select_seeds(
+        atoms,
+        posterior,
+        n_seeds=3,
+        bulk_fraction=0.0,
+        strategy="d_optimal",
+        d_optimal_pool_multiplier=2,
+    )
+
+    assert a.indices == b.indices == [0, 1, 2]
+    assert len(set(a.indices)) == len(a.indices)
+    assert all(row["d_optimal_gain"] >= 0.0 for row in a.selection_diagnostics)
+    assert a.diagnostics["prefilter_pool_size"] == 5
+
+
+def test_d_optimal_can_rank_by_transformed_score():
+    atoms = [object() for _ in range(4)]
+    posterior = _CovariancePosterior(atoms, np.diag([10.0, 9.0, 8.0, 1.0]))
+
+    out = select_seeds(
+        atoms,
+        posterior,
+        n_seeds=1,
+        bulk_fraction=0.0,
+        strategy="d_optimal",
+        score_transform=lambda idx, var: 100.0 if idx == 2 else var,
+    )
+
+    assert out.indices == [2]
+    assert out.selection_diagnostics[0]["raw_score"] == pytest.approx(100.0)
+
+
+def test_d_optimal_respects_bulk_context():
+    atoms = [object() for _ in range(5)]
+    cov = np.diag([10.0, 9.0, 8.0, 7.0, 6.0])
+    cov[0, 1] = cov[1, 0] = np.sqrt(10.0 * 9.0) * 0.999
+    posterior = _CovariancePosterior(atoms, cov)
+
+    out = select_seeds(
+        atoms,
+        posterior,
+        n_seeds=2,
+        bulk_fraction=0.5,
+        rng_seed=12,
+        strategy="d_optimal",
+        d_optimal_pool_multiplier=4,
+    )
+
+    assert len(out.bulk_indices) == 1
+    assert len(out.variance_indices) == 1
+    assert out.selection_origins == ["bulk", "d_optimal"]
+    assert out.bulk_indices[0] not in out.variance_indices
+
+
+def test_d_optimal_requires_covariance_contract():
+    atoms, posterior, _ = _atoms_with_indexed_variances(6)
+    with pytest.raises(ValueError, match="requires posterior.covariance"):
+        select_seeds(
+            atoms,
+            posterior,
+            n_seeds=3,
+            bulk_fraction=0.0,
+            strategy="d_optimal",
+        )
+
+
+def test_invalid_seed_selection_strategy_raises():
+    atoms, posterior, _ = _atoms_with_indexed_variances(6)
+    with pytest.raises(ValueError, match="strategy"):
+        select_seeds(atoms, posterior, n_seeds=2, strategy="not_real")

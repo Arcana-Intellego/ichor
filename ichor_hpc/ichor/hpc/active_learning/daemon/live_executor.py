@@ -38,6 +38,7 @@ from ..versioning.provenance import (
     ensure_index,
     enrich_with_anti_overlap,
     enrich_with_ariadne,
+    enrich_with_error_calibration_input,
     enrich_with_phase_b,
     write_seed_provenance,
 )
@@ -1053,6 +1054,53 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 n_total=int(len(quality_records)),
                 n_rejected=int(sum(1 for r in quality_records if not bool(r.get("accepted")))),
             )
+            if phase_name == "AIMALL":
+                try:
+                    from .error_calibration import (
+                        ERROR_CALIBRATION_AUDIT_FILENAME,
+                        ERROR_CALIBRATION_MODEL_FILENAME,
+                        update_from_aimall_acceptance,
+                    )
+
+                    iter_dir = self._iter_dir(state.iteration)
+                    audit = update_from_aimall_acceptance(
+                        campaign_dir=self.campaign_dir,
+                        iter_dir=iter_dir,
+                        config=self.config,
+                        iteration=int(state.iteration),
+                        models_version=int(getattr(state, "models_version", -1)),
+                        accepted_pointdirs=kept,
+                        quality_records=quality_records,
+                    )
+                    self.artefact_log.append(
+                        str((iter_dir / ERROR_CALIBRATION_AUDIT_FILENAME).resolve())
+                    )
+                    self.artefact_log.append(
+                        str(
+                            (
+                                Path(self.campaign_dir)
+                                / ".DATA" / "ACTIVE_LEARNING"
+                                / ERROR_CALIBRATION_MODEL_FILENAME
+                            ).resolve()
+                        )
+                    )
+                    self._journal_event(
+                        "error_calibration_summary",
+                        phase=phase_name,
+                        iteration=int(state.iteration),
+                        n_added_records=int(audit.get("n_added_records", 0)),
+                        n_total_records=int(audit.get("n_total_records", 0)),
+                        usable_for_acquisition=bool(
+                            audit.get("usable_for_acquisition", False)
+                        ),
+                    )
+                except Exception as exc:
+                    self._journal_event(
+                        "error_calibration_failed",
+                        phase=phase_name,
+                        iteration=int(state.iteration),
+                        reason=type(exc).__name__ + ": " + str(exc)[:240],
+                    )
         else:
             kept, rejected = self._parse_staged_pointdirs(
                 staging_root, validators=validators,
@@ -1518,8 +1566,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         import json as _json
         from ..handoff_manifests import (
             ARIADNE_RESULTS_SCHEMA_VERSION,
+            acquisition_maturity_audit_payload,
             load_seeds_picked,
             validate_ariadne_result,
+            write_acquisition_maturity_audit,
             write_ariadne_landing_audit,
             write_ariadne_results_manifest,
         )
@@ -1567,6 +1617,13 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 "summary": _ariadne_landing_audit_summary(landing_audit_records),
                 "seeds": landing_audit_records,
             })
+            write_acquisition_maturity_audit(
+                iter_dir,
+                acquisition_maturity_audit_payload(
+                    iteration=int(state.iteration),
+                    seed_records=landing_audit_records,
+                ),
+            )
             write_ariadne_results_manifest(iter_dir, {
                 "schema_version": ARIADNE_RESULTS_SCHEMA_VERSION,
                 "iteration": int(state.iteration),
@@ -1761,6 +1818,28 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 wall_seconds=float(validated["wall_seconds"]),
                 return_code=int(validated["return_code"]),
             )
+            selection_diagnostics = result_dict.get("selection_diagnostics")
+            if isinstance(selection_diagnostics, dict):
+                diag_payload = dict(selection_diagnostics)
+                diag_payload["model_version"] = int(getattr(state, "models_version", -1))
+                diag_payload["seed_index"] = int(seed_index)
+                diag_payload["seed_frame_id"] = seed_record.get("frame_id")
+                diag_payload["result_json"] = str(result_path.resolve())
+                diag_payload["landing_policy"] = str(
+                    landing_safety.get(
+                        "policy",
+                        diag_payload.get("landing_policy", "unknown"),
+                    )
+                )
+                diag_payload["safety_metrics"] = dict(
+                    landing_safety.get(
+                        "metrics",
+                        diag_payload.get("safety_metrics", {}),
+                    )
+                    or {}
+                )
+                audit_record["selection_diagnostics"] = dict(diag_payload)
+                enrich_with_error_calibration_input(seed_dir, diag_payload)
 
             class _ResultShim:
                 def __init__(self, ai, af, alpha_trajectory):
@@ -1849,6 +1928,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 "geometry_quality": dict(geometry_quality.get("metrics") or {}),
                 "landing_safety": dict(landing_safety),
                 "landing_policy": str(landing_safety.get("policy", "unknown")),
+                "selection_diagnostics": (
+                    dict(selection_diagnostics)
+                    if isinstance(selection_diagnostics, dict)
+                    else None
+                ),
                 "return_code": int(validated["return_code"]),
             })
 
@@ -1861,6 +1945,14 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             "seeds": landing_audit_records,
         })
         self.artefact_log.append(str(audit_path))
+        maturity_path = write_acquisition_maturity_audit(
+            iter_dir,
+            acquisition_maturity_audit_payload(
+                iteration=int(state.iteration),
+                seed_records=landing_audit_records,
+            ),
+        )
+        self.artefact_log.append(str(maturity_path))
         manifest_path = write_ariadne_results_manifest(iter_dir, {
             "schema_version": ARIADNE_RESULTS_SCHEMA_VERSION,
             "iteration": int(state.iteration),
@@ -2148,10 +2240,10 @@ def _shell_executable(value: Any) -> str:
 
 
 def _python_executable_for_script() -> str:
-    python_path = expanded_profile_value(
+    python_path = profile_value(
         "software", "python", "python_path", default=None
     )
-    return _shell_quote(python_path or sys.executable)
+    return _shell_executable(python_path or sys.executable)
 
 
 def _normalise_module_list(raw: Any, *, label: str) -> List[str]:
@@ -2213,6 +2305,106 @@ def _configured_max_array_task_id() -> Optional[int]:
     return value
 
 
+def _configured_scheduler() -> str:
+    raw = profile_value("hpc", "scheduler", default=None)
+    if raw is None:
+        return "slurm"
+    value = str(raw).strip().lower()
+    _reject_shell_control_chars("configured hpc.scheduler", value)
+    if value != "slurm":
+        raise BackendSubmissionError(
+            "active-learning live mode supports hpc.scheduler='slurm'; got "
+            + repr(value)
+        )
+    return value
+
+
+def _slurm_memory_mib(value: Any) -> float:
+    text = str(value).strip().upper()
+    match = re.fullmatch(r"([1-9][0-9]*)([KMGT]?)", text)
+    if not match:
+        raise BackendSubmissionError(
+            "unsupported Slurm memory syntax: " + repr(value)
+        )
+    amount = int(match.group(1))
+    unit = match.group(2) or "M"
+    scale = {
+        "K": 1.0 / 1024.0,
+        "M": 1.0,
+        "G": 1024.0,
+        "T": 1024.0 * 1024.0,
+    }[unit]
+    return float(amount) * scale
+
+
+def _configured_memory_per_core_gb(partition: str) -> Optional[float]:
+    by_partition = profile_value(
+        "hpc",
+        "memory_per_core_gb_by_partition",
+        default=None,
+    )
+    if isinstance(by_partition, dict):
+        raw = by_partition.get(str(partition))
+        if raw is None:
+            raw = by_partition.get("default")
+        if raw is not None:
+            try:
+                value = float(raw)
+            except (TypeError, ValueError) as exc:
+                raise BackendSubmissionError(
+                    "configured hpc.memory_per_core_gb_by_partition for "
+                    + str(partition)
+                    + " must be numeric"
+                ) from exc
+            if value <= 0.0:
+                raise BackendSubmissionError(
+                    "configured hpc.memory_per_core_gb_by_partition for "
+                    + str(partition)
+                    + " must be > 0"
+                )
+            return value
+    raw_default = profile_value("hpc", "memory_per_core_gb", default=None)
+    if raw_default is None:
+        return None
+    try:
+        value = float(raw_default)
+    except (TypeError, ValueError) as exc:
+        raise BackendSubmissionError(
+            "configured hpc.memory_per_core_gb must be numeric"
+        ) from exc
+    if value <= 0.0:
+        raise BackendSubmissionError("configured hpc.memory_per_core_gb must be > 0")
+    return value
+
+
+def _resolve_mem_per_cpu(config: CampaignConfig, partition: str) -> str:
+    requested = str(config.resources.mem_per_cpu).strip()
+    profile_gb = _configured_memory_per_core_gb(partition)
+    if requested.lower() == "auto":
+        gb = profile_gb if profile_gb is not None else 4.0
+        return str(int(math.floor(gb))) + "G"
+    if profile_gb is not None:
+        requested_mib = _slurm_memory_mib(requested)
+        cap_mib = float(profile_gb) * 1024.0
+        if requested_mib > cap_mib + 1.0e-9:
+            raise BackendSubmissionError(
+                "resources.mem_per_cpu "
+                + requested
+                + " exceeds configured profile memory cap for partition "
+                + repr(partition)
+                + " ("
+                + str(profile_gb)
+                + " GB/core)"
+            )
+    return requested
+
+
+def _gaussian_mdef_gb(config: CampaignConfig, mem_per_cpu: str, gaussian_cores: int) -> int:
+    allocated_mib = _slurm_memory_mib(mem_per_cpu) * float(max(1, int(gaussian_cores)))
+    usable_mib = allocated_mib * float(config.gaussian.memory_fraction_of_slurm)
+    return max(1, int(math.floor(usable_mib / 1024.0)))
+
+
 def _configured_ferebus_platform() -> str:
     raw = profile_value(
         "software", "ferebus", "pyferebus_platform", default=None
@@ -2221,7 +2413,12 @@ def _configured_ferebus_platform() -> str:
         value = str(raw).strip()
     else:
         machine = active_machine()
-        value = machine.upper() if machine else "CSF4"
+        if machine:
+            raise BackendSubmissionError(
+                "live FEREBUS requires software.ferebus.pyferebus_platform "
+                "in ichor_config.yaml"
+            )
+        value = "CSF4"
     _reject_shell_control_chars("configured ferebus pyferebus_platform", value)
     if not re.fullmatch(r"^[A-Za-z0-9_.-]+$", value):
         raise BackendSubmissionError(
@@ -2302,11 +2499,16 @@ def build_sbatch_script(
     on sbatch being launched from any particular directory.
     """
     res = config.resources
+    _configured_scheduler()
     part = partition if partition is not None else res.partition
     wall = walltime_hours if walltime_hours is not None else res.walltime_hours
-    cpus = res.cpus_for(phase_name)
+    is_gaussian_phase = phase_name in ("INITIAL_GAUSSIAN", "GAUSSIAN")
+    cpus = int(config.gaussian.nproc) if is_gaussian_phase else res.cpus_for(phase_name)
+    ntasks = 1 if is_gaussian_phase else int(res.ntasks)
+    mem_per_cpu = _resolve_mem_per_cpu(config, str(part))
     camp = str(Path(campaign_dir).resolve())
     job_name = live_job_name(campaign_uid, phase_name, iteration)
+    _reject_shell_control_chars("Slurm job name", job_name)
     logs = camp + "/.DATA/SCRIPTS"
     is_array = array_size is not None and int(array_size) > 0
     if is_array:
@@ -2325,12 +2527,16 @@ def build_sbatch_script(
         "#SBATCH --job-name=" + job_name,
         "#SBATCH --partition=" + part,
         "#SBATCH --time=" + str(int(wall)) + ":00:00",
-        "#SBATCH --mem-per-cpu=" + str(res.mem_per_cpu),
+        "#SBATCH --mem-per-cpu=" + str(mem_per_cpu),
         "#SBATCH --cpus-per-task=" + str(int(cpus)),
-        "#SBATCH --ntasks=" + str(int(res.ntasks)),
+        "#SBATCH --ntasks=" + str(int(ntasks)),
     ]
     if is_array:
-        lines.append("#SBATCH --array=0-" + str(int(array_size) - 1))
+        throttle = getattr(res, "array_concurrency_limit", None)
+        array_spec = "0-" + str(int(array_size) - 1)
+        if throttle is not None:
+            array_spec += "%" + str(int(throttle))
+        lines.append("#SBATCH --array=" + array_spec)
     lines += [
         "#SBATCH --output=" + logs + "/OUTPUTS/" + job_name + tag + ".o",
         "#SBATCH --error="  + logs + "/ERRORS/"  + job_name + tag + ".e",
@@ -2346,7 +2552,14 @@ def build_sbatch_script(
     points_file = camp + "/.DATA/STAGING/" + bucket + "/POINTS.txt"
 
     if phase_name in ("INITIAL_GAUSSIAN", "GAUSSIAN"):
-        lines += _gaussian_invocation_block(iteration, camp, config, points_file)
+        lines += _gaussian_invocation_block(
+            iteration,
+            camp,
+            config,
+            points_file,
+            mem_per_cpu=mem_per_cpu,
+            gaussian_cores=int(cpus),
+        )
     elif phase_name in ("INITIAL_AIMALL", "AIMALL"):
         lines += _aimall_invocation_block(iteration, camp, config, points_file)
     elif phase_name in ("INITIAL_FEREBUS", "FEREBUS"):
@@ -2363,13 +2576,22 @@ def build_sbatch_script(
     return "\n".join(lines)
 
 
-def _gaussian_invocation_block(iteration, camp, config, points_file) -> List[str]:
+def _gaussian_invocation_block(
+    iteration,
+    camp,
+    config,
+    points_file,
+    *,
+    mem_per_cpu: str,
+    gaussian_cores: int,
+) -> List[str]:
     gaussian_modules = _configured_backend_modules(
         "gaussian",
         ["gaussian/g16c01_em64t_detectcpu"],
     )
-    gaussian_exe = _configured_backend_path("gaussian", "g16")
+    gaussian_exe = _configured_backend_shell_executable("gaussian", "g16")
     scratch_root = _configured_gaussian_scratch_root()
+    mdef_gb = _gaussian_mdef_gb(config, mem_per_cpu, int(gaussian_cores))
     points_file_q = _shell_quote(points_file)
     return [
         *["module load " + m for m in gaussian_modules],
@@ -2378,6 +2600,7 @@ def _gaussian_invocation_block(iteration, camp, config, points_file) -> List[str
         "export GAUSS_SCRATCH_ROOT=" + scratch_root,
         'export GAUSS_SCRDIR="${GAUSS_SCRATCH_ROOT%/}/ichor_gaussian_${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"',
         'export GAUSS_PDEF="${SLURM_CPUS_PER_TASK:-1}"',
+        "export GAUSS_MDEF=" + str(int(mdef_gb)) + "GB",
         'mkdir -p "$GAUSS_SCRDIR"',
         # check the file FIRST -- under set -e a failing sed (missing POINTS.txt) aborts the
         # assignment before the friendly -z guard below ever runs, leaving just a bare sed error.
@@ -2387,7 +2610,7 @@ def _gaussian_invocation_block(iteration, camp, config, points_file) -> List[str
         'POINT_DIR=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" ' + points_file_q + ")",
         'if [ -z "$POINT_DIR" ]; then echo "no pointdir for index $SLURM_ARRAY_TASK_ID" >&2; exit 1; fi',
         'cd "$POINT_DIR"',
-        _shell_executable(gaussian_exe) + " < input.gjf > input.gau",
+        gaussian_exe + " < input.gjf > input.gau",
     ]
 
 
@@ -2411,6 +2634,21 @@ def _configured_backend_path(backend_name: str, fallback: str) -> str:
         value,
     )
     return value
+
+
+def _configured_backend_shell_executable(backend_name: str, fallback: str) -> str:
+    try:
+        raw = profile_value(
+            "software", backend_name, "executable_path", default=None
+        )
+    except Exception:
+        raw = None
+    value = os.path.expanduser(str(raw or fallback))
+    _reject_shell_control_chars(
+        "configured " + backend_name + " executable_path",
+        value,
+    )
+    return _shell_executable(value)
 
 
 def _configured_backend_modules(backend_name: str, fallback: List[str]) -> List[str]:

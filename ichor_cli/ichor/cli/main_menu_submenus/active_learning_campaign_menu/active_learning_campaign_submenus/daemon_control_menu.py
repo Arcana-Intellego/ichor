@@ -12,6 +12,10 @@ from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context
     CampaignSelectionError,
     campaign_dir_ns,
     print_campaign_selection_error,
+    selected_campaign_dir,
+)
+from ichor.cli.main_menu_submenus.active_learning_campaign_menu.protocol_summary import (
+    format_saved_sampling_protocol_summary,
 )
 from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_submenus.daemon_control_submenus import (
     import_trajectory_pool_menu,
@@ -96,6 +100,17 @@ class DaemonControlFunctions:
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
+    def show_sampling_protocol_summary():
+        try:
+            campaign_dir = selected_campaign_dir()
+        except CampaignSelectionError as exc:
+            print_campaign_selection_error(exc)
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        print(format_saved_sampling_protocol_summary(campaign_dir))
+        user_input_free_flow("Press enter to return to the menu: ", "")
+
+    @staticmethod
     def stop_daemon():
         """Set shutdown_requested=true in state.json so the running daemon
         finishes its current tick and exits cleanly on the next."""
@@ -170,6 +185,10 @@ daemon_control_menu = ConsoleMenu(
 
 daemon_control_menu_items = [
     FunctionItem("Show status", DaemonControlFunctions.show_status),
+    FunctionItem(
+        "Show sampling protocol summary",
+        DaemonControlFunctions.show_sampling_protocol_summary,
+    ),
     FunctionItem("Preflight backends", DaemonControlFunctions.preflight_backends),
     SubmenuItem(
         IMPORT_TRAJECTORY_POOL_MENU_DESCRIPTION.title,

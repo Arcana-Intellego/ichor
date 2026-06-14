@@ -21,11 +21,13 @@ from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context
 from ichor.cli.main_menu_submenus.active_learning_campaign_menu.field_menu import (
     FieldSpec as _FieldSpec,
     edit_field as _shared_edit_field,
-    format_field_value as _format_value,
     get_attr_path,
     make_field_menu,
     set_attr_path,
     spec as _shared_spec,
+)
+from ichor.cli.main_menu_submenus.active_learning_campaign_menu.protocol_summary import (
+    format_sampling_protocol_summary,
 )
 from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_submenus.edit_campaign_config_submenus import (
     edit_ariadne_block_menu,
@@ -33,21 +35,23 @@ from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_
 )
 from ichor.cli.menu_description import MenuDescription
 from ichor.cli.menu_options import MenuOptions
-from ichor.cli.useful_functions import (
-    user_input_bool,
-    user_input_float,
-    user_input_free_flow,
-    user_input_int,
-    user_input_restricted,
-)
+from ichor.cli.useful_functions import user_input_free_flow
 from ichor.hpc.active_learning.config import (
     CampaignConfig,
     ConfigValidationError,
+    VALID_CALIBRATED_ENERGY_UTILITIES,
     VALID_BATCH_POLICIES,
     VALID_DESCRIPTORS,
+    VALID_ERROR_CALIBRATION_MODES,
+    VALID_ERROR_CALIBRATION_MODEL_VERSION_POLICIES,
+    VALID_FULLSPACE_RESIDUAL_SCALES,
+    VALID_GAUSSIAN_MEMORY_MODES,
     VALID_GRADIENT_MODES,
     VALID_GRADIENT_PARALLEL_BACKENDS,
     VALID_MODE_WEIGHTING_POLICIES,
+    VALID_NEGATIVE_CURVATURE_POLICIES,
+    VALID_SEED_SELECTION_STRATEGIES,
+    VALID_SPECTRAL_MODES,
     VALID_SPLITS,
     VALID_WARMSTART,
 )
@@ -162,6 +166,11 @@ class EditCampaignConfigFunctions:
         import json
         print("Loaded from: " + edit_campaign_config_menu_options.loaded_from)
         print(json.dumps(_campaign_config.to_dict(), indent=2, sort_keys=True))
+        _pause()
+
+    @staticmethod
+    def show_sampling_protocol_summary():
+        print(format_sampling_protocol_summary(_campaign_config))
         _pause()
 
     @staticmethod
@@ -314,6 +323,29 @@ class EditCampaignConfigFunctions:
         )
         s.bulk_fraction = user_input_float(
             "seed_selection.bulk_fraction (0.0-1.0): ", s.bulk_fraction,
+        )
+        chosen = user_input_restricted(
+            sorted(VALID_SEED_SELECTION_STRATEGIES),
+            "seed_selection.strategy: ",
+            s.strategy,
+        )
+        if chosen is not None:
+            s.strategy = chosen
+        s.variance_chunk_size = user_input_int(
+            "seed_selection.variance_chunk_size: ", s.variance_chunk_size,
+        )
+        s.d_optimal_pool_multiplier = user_input_int(
+            "seed_selection.d_optimal_pool_multiplier: ",
+            s.d_optimal_pool_multiplier,
+        )
+        s.d_optimal_jitter = user_input_float(
+            "seed_selection.d_optimal_jitter: ", s.d_optimal_jitter,
+        )
+        s.d_optimal_novelty_floor = user_input_float(
+            "seed_selection.d_optimal_novelty_floor: ", s.d_optimal_novelty_floor,
+        )
+        s.d_optimal_score_power = user_input_float(
+            "seed_selection.d_optimal_score_power: ", s.d_optimal_score_power,
         )
         _sync_options_from_config()
 
@@ -651,6 +683,45 @@ class EditCampaignConfigFunctions:
         _pause()
 
 
+def _unsupported_sequential_field_editor():
+    raise RuntimeError(
+        "Sequential campaign config editors are no longer supported. "
+        "Use the block field menus so current values remain visible and every "
+        "campaign.yaml field is edited through one authoritative path."
+    )
+
+
+for _legacy_editor_name in (
+    "edit_campaign_identity",
+    "edit_trajectory_pool",
+    "edit_iteration_control",
+    "edit_resources",
+    "edit_gaussian",
+    "edit_initial_subsample",
+    "edit_batch_sizing",
+    "edit_seed_selection",
+    "edit_anti_overlap",
+    "edit_phase_b",
+    "edit_split",
+    "edit_ferebus",
+    "edit_acquisition_core",
+    "edit_robustness",
+    "edit_acquisition_subspace",
+    "edit_acquisition_weights",
+    "edit_acquisition_gradient",
+    "edit_acquisition_barrier",
+    "edit_acquisition_stencils",
+    "edit_acquisition_references",
+    "edit_stop",
+    "edit_outlier_filter",
+):
+    setattr(
+        EditCampaignConfigFunctions,
+        _legacy_editor_name,
+        staticmethod(_unsupported_sequential_field_editor),
+    )
+
+
 edit_campaign_config_menu = ConsoleMenu(
     this_menu_options=edit_campaign_config_menu_options,
     title=EDIT_CAMPAIGN_CONFIG_MENU_DESCRIPTION.title,
@@ -700,6 +771,7 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("resources.cpus_per_task", "int"),
             _spec("resources.ntasks", "int"),
             _spec("resources.ariadne_cpus_per_task", "int"),
+            _spec("resources.array_concurrency_limit", "optional_int"),
             _spec("resources.gradient_parallel_backend", "choice", choices=sorted(VALID_GRADIENT_PARALLEL_BACKENDS)),
         ],
     ),
@@ -714,6 +786,8 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("gaussian.extra_keywords", "str"),
             _spec("gaussian.nproc", "int"),
             _spec("gaussian.mem", "str", prompt="gaussian.mem (Gaussian style, e.g. 8GB): "),
+            _spec("gaussian.memory_mode", "choice", choices=sorted(VALID_GAUSSIAN_MEMORY_MODES)),
+            _spec("gaussian.memory_fraction_of_slurm", "float"),
         ],
     ),
     "Edit AIMAll block": _make_block_menu(
@@ -740,6 +814,11 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("seed_selection.n_seeds_per_iteration", "int"),
             _spec("seed_selection.bulk_fraction", "float", prompt="seed_selection.bulk_fraction (0.0-1.0): "),
             _spec("seed_selection.variance_chunk_size", "int"),
+            _spec("seed_selection.strategy", "choice", choices=sorted(VALID_SEED_SELECTION_STRATEGIES)),
+            _spec("seed_selection.d_optimal_pool_multiplier", "int"),
+            _spec("seed_selection.d_optimal_jitter", "float"),
+            _spec("seed_selection.d_optimal_novelty_floor", "float"),
+            _spec("seed_selection.d_optimal_score_power", "float"),
         ],
     ),
     "Edit anti_overlap": _make_block_menu(
@@ -836,6 +915,45 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("acquisition.weights.lambda_distance", "float"),
         ],
     ),
+    "Edit acquisition.spectral": _make_block_menu(
+        "Edit acquisition.spectral",
+        "Observable-oriented spectral frequency acquisition settings.",
+        [
+            _spec("acquisition.spectral.enabled", "bool"),
+            _spec("acquisition.spectral.mode", "choice", choices=sorted(VALID_SPECTRAL_MODES)),
+            _spec("acquisition.spectral.mode_weighting", "choice", choices=sorted(VALID_MODE_WEIGHTING_POLICIES)),
+            _spec("acquisition.spectral.lambda_spectral", "float"),
+            _spec("acquisition.spectral.omega_floor", "float"),
+            _spec("acquisition.spectral.low_frequency_power", "float"),
+            _spec("acquisition.spectral.max_modes", "optional_int"),
+        ],
+    ),
+    "Edit acquisition.calibrated_energy": _make_block_menu(
+        "Edit acquisition.calibrated_energy",
+        "Banded calibrated IQA-error utility settings.",
+        [
+            _spec("acquisition.calibrated_energy.utility", "choice", choices=sorted(VALID_CALIBRATED_ENERGY_UTILITIES)),
+            _spec("acquisition.calibrated_energy.band_low_ha", "optional_float"),
+            _spec("acquisition.calibrated_energy.band_high_ha", "optional_float"),
+            _spec("acquisition.calibrated_energy.low_softness_ha", "optional_float"),
+            _spec("acquisition.calibrated_energy.high_softness_ha", "optional_float"),
+            _spec("acquisition.calibrated_energy.fallback_to_raw_variance", "bool"),
+        ],
+    ),
+    "Edit acquisition.fullspace_confinement": _make_block_menu(
+        "Edit acquisition.fullspace_confinement",
+        "Full-space geometric confinement outside the local active subspace.",
+        [
+            _spec("acquisition.fullspace_confinement.enabled", "bool"),
+            _spec("acquisition.fullspace_confinement.lambda_residual", "float"),
+            _spec("acquisition.fullspace_confinement.lambda_rmsd", "float"),
+            _spec("acquisition.fullspace_confinement.residual_scale", "choice", choices=sorted(VALID_FULLSPACE_RESIDUAL_SCALES)),
+            _spec("acquisition.fullspace_confinement.fixed_residual_scale_ang", "optional_float"),
+            _spec("acquisition.fullspace_confinement.rmsd_scale_ang", "float"),
+            _spec("acquisition.fullspace_confinement.min_residual_scale_ang", "float"),
+            _spec("acquisition.fullspace_confinement.failure_penalty", "float"),
+        ],
+    ),
     "Edit acquisition.gradient": _make_block_menu(
         "Edit acquisition.gradient",
         "Finite-difference gradient controls.",
@@ -885,6 +1003,8 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("acquisition.stencils.curvature_floor", "float"),
             _spec("acquisition.stencils.softplus_scale", "float"),
             _spec("acquisition.stencils.autotune_from_cubic", "bool"),
+            _spec("acquisition.stencils.negative_curvature_policy", "choice", choices=sorted(VALID_NEGATIVE_CURVATURE_POLICIES)),
+            _spec("acquisition.stencils.lambda_negative_curvature", "float"),
         ],
     ),
     "Edit acquisition.references": _make_block_menu(
@@ -936,6 +1056,22 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("adversarial_safety.phase_b_filter_enabled", "bool"),
         ],
     ),
+    "Edit error_calibration": _make_block_menu(
+        "Edit error_calibration",
+        "Empirical mapping from raw uncertainty to realised IQA error.",
+        [
+            _spec("error_calibration.enabled", "bool"),
+            _spec("error_calibration.mode", "choice", choices=sorted(VALID_ERROR_CALIBRATION_MODES)),
+            _spec("error_calibration.min_records_to_apply", "int"),
+            _spec("error_calibration.n_bins", "int"),
+            _spec("error_calibration.min_bin_records", "int"),
+            _spec("error_calibration.apply_strength", "float"),
+            _spec("error_calibration.group_by_atom_type", "bool"),
+            _spec("error_calibration.group_by_landing_policy", "bool"),
+            _spec("error_calibration.model_version_policy", "choice", choices=sorted(VALID_ERROR_CALIBRATION_MODEL_VERSION_POLICIES)),
+            _spec("error_calibration.output_units", "choice", choices=["ha"]),
+        ],
+    ),
     "Edit quality_gates": _make_block_menu(
         "Edit quality_gates",
         "Science-quality gates for QM/AIMAll, FEREBUS, and ARIADNE outputs.",
@@ -972,6 +1108,10 @@ def _block_submenu_item(label: str):
 
 edit_campaign_config_menu_items = [
     FunctionItem("Show current config", EditCampaignConfigFunctions.show_current_config),
+    FunctionItem(
+        "Show sampling protocol summary",
+        EditCampaignConfigFunctions.show_sampling_protocol_summary,
+    ),
     FunctionItem("Load from disk", EditCampaignConfigFunctions.load_from_disk),
     FunctionItem("Reset to defaults", EditCampaignConfigFunctions.reset_to_defaults),
     FunctionItem("Validate current config", EditCampaignConfigFunctions.validate_current_config),
@@ -992,6 +1132,9 @@ edit_campaign_config_menu_items = [
     _block_submenu_item("Edit acquisition core"),
     _block_submenu_item("Edit acquisition.subspace"),
     _block_submenu_item("Edit acquisition.weights"),
+    _block_submenu_item("Edit acquisition.spectral"),
+    _block_submenu_item("Edit acquisition.calibrated_energy"),
+    _block_submenu_item("Edit acquisition.fullspace_confinement"),
     _block_submenu_item("Edit acquisition.gradient"),
     _block_submenu_item("Edit acquisition.barrier"),
     _block_submenu_item("Edit acquisition.stencils"),
@@ -999,6 +1142,7 @@ edit_campaign_config_menu_items = [
     _block_submenu_item("Edit stop"),
     _block_submenu_item("Edit outlier_filter"),
     _block_submenu_item("Edit adversarial_safety"),
+    _block_submenu_item("Edit error_calibration"),
     _block_submenu_item("Edit quality_gates"),
     _block_submenu_item("Edit runtime"),
     SubmenuItem(

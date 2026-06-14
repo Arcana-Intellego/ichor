@@ -16,6 +16,11 @@ from ichor.hpc.active_learning.daemon.live_executor import LiveBackendsPhaseExec
 from ichor.hpc.active_learning.daemon.phase_executor import BackendSubmissionError
 from ichor.hpc.active_learning.daemon.state import CampaignPhase
 from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
+from ichor.hpc.active_learning.handoff_manifests import (
+    load_seeds_picked,
+    read_seed_selection_diagnostics,
+    write_seed_selection_diagnostics,
+)
 from ichor.hpc.active_learning.versioning.provenance import (
     append_recent_seeds,
     append_to_index,
@@ -81,6 +86,56 @@ def test_inline_seed_select_with_pool_writes_seeds_picked_json(tmp_path):
     valid = set(pool.frame_ids())
     for fid in payload["frame_ids"]:
         assert fid in valid
+
+
+def test_d_optimal_seed_select_writes_diagnostics_manifest(tmp_path):
+    cd = tmp_path / "campaign"
+    cfg = CampaignConfig()
+    cfg.seed_selection.n_seeds_per_iteration = 4
+    cfg.seed_selection.bulk_fraction = 0.0
+    cfg.seed_selection.strategy = "d_optimal"
+    ex = DryRunPhaseExecutor(campaign_dir=cd, config=cfg)
+    TrajectoryPool.import_from(FIXTURE, cd)
+
+    ex.submit_or_run(SimpleNamespace(iteration=0), CampaignPhase.SEED_SELECT)
+
+    iter_dir = cd / "7_ACTIVE_LEARNING" / "iteration-0000"
+    picked = load_seeds_picked(iter_dir, expected_iteration=0)
+    assert all(
+        rec["selection_origin"] == "d_optimal"
+        for rec in picked["seed_records"]
+    )
+    assert picked["d_optimal_indices"] == picked["indices"]
+    assert all("d_optimal_gain" in rec for rec in picked["seed_records"])
+
+    diagnostics = read_seed_selection_diagnostics(iter_dir, expected_iteration=0)
+    assert diagnostics["strategy"] == "d_optimal"
+    assert diagnostics["n_picked"] == 4
+    assert len(diagnostics["selected"]) == 4
+
+
+def test_seed_selection_diagnostics_manifest_roundtrips(tmp_path):
+    iter_dir = tmp_path / "iteration-0000"
+    path = write_seed_selection_diagnostics(
+        iter_dir,
+        {
+            "iteration": 0,
+            "strategy": "d_optimal",
+            "n_picked": 1,
+            "selected": [
+                {
+                    "seed_index": 0,
+                    "selection_origin": "d_optimal",
+                    "d_optimal_gain": 1.0,
+                }
+            ],
+        },
+    )
+
+    assert path.name == "SEED_SELECTION_DIAGNOSTICS.json"
+    data = read_seed_selection_diagnostics(iter_dir, expected_iteration=0)
+    assert data["schema_version"] == 1
+    assert data["selected"][0]["selection_origin"] == "d_optimal"
 
 
 def test_inline_seed_select_skips_training_pool_frame_ids(tmp_path):

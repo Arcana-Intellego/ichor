@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Sequence
+from typing import Dict, List, Sequence
 
 import numpy as np
 from ichor.core.atoms import Atoms
@@ -141,8 +141,6 @@ def build_local_subspace(seed_atoms: Atoms, neighbours: Sequence[Neighbour], con
     for w, y in zip(weights, displacements):
         covariance += w * np.outer(y, y)
     covariance /= weight_sum
-    covariance += config.covariance_regularization * np.eye(covariance.shape[0], dtype=float)
-
     eigenvalues, eigenvectors = np.linalg.eigh(covariance)
     order = np.argsort(eigenvalues)[::-1]
     eigenvalues = eigenvalues[order]
@@ -160,6 +158,11 @@ def build_local_subspace(seed_atoms: Atoms, neighbours: Sequence[Neighbour], con
 
     basis = eigenvectors[:, :r].copy()
     active_eigs = positive[:r].copy()
+    relative_regularization = float(config.covariance_regularization) * max(
+        float(active_eigs[0]) if active_eigs.size else 0.0,
+        1.0e-12,
+    )
+    covariance += relative_regularization * np.eye(covariance.shape[0], dtype=float)
     if config.canonicalise_basis:
         basis = _canonicalise_basis(basis, active_eigs, config.degeneracy_tolerance)
     active_cov = np.diag(active_eigs)
@@ -185,9 +188,60 @@ def active_coordinates(subspace: LocalSubspace, atoms: Atoms) -> np.ndarray:
 
 
 
+def _mass_normalisation(subspace: LocalSubspace) -> float:
+    total_mass = float(np.sum(np.asarray(subspace.seed_atoms.masses, dtype=float)))
+    if not np.isfinite(total_mass) or total_mass <= 0.0:
+        total_mass = float(len(subspace.seed_atoms))
+    return float(np.sqrt(max(total_mass, 1.0e-12)))
+
+
+
+def active_and_residual_displacement(subspace: LocalSubspace, atoms: Atoms) -> Dict[str, np.ndarray]:
+    """Split aligned mass-weighted displacement into active and residual parts."""
+    disp = aligned_mass_weighted_displacement(subspace.seed_atoms, atoms)
+    xi = subspace.basis.T @ disp
+    active = subspace.basis @ xi
+    residual = disp - active
+    return {
+        "displacement": disp,
+        "active": active,
+        "residual": residual,
+        "active_coordinates": xi,
+    }
+
+
+
+def fullspace_residual_distance(subspace: LocalSubspace, atoms: Atoms) -> float:
+    """Return active-subspace-orthogonal displacement in RMSD-like Angstrom units."""
+    parts = active_and_residual_displacement(subspace, atoms)
+    return float(np.linalg.norm(parts["residual"]) / _mass_normalisation(subspace))
+
+
+
+def local_neighbour_residual_scale(
+    subspace: LocalSubspace,
+    floor: float = 1.0e-12,
+    min_scale: float = 1.0e-3,
+) -> float:
+    """Robust residual-distance scale from the seed-local neighbourhood."""
+    values = []
+    for neighbour in subspace.neighbours:
+        try:
+            values.append(fullspace_residual_distance(subspace, neighbour.atoms))
+        except Exception:
+            continue
+    finite = np.asarray([v for v in values if np.isfinite(v) and v > 0.0], dtype=float)
+    if finite.size:
+        return float(max(np.median(finite) + float(floor), float(min_scale)))
+    return float(max(float(floor), float(min_scale), 1.0e-12))
+
+
+
 def whitened_distance_squared(subspace: LocalSubspace, atoms: Atoms, regularization: float = 1.0e-10) -> float:
     xi = active_coordinates(subspace, atoms)
-    metric = np.linalg.inv(subspace.active_covariance + regularization * np.eye(subspace.dimension))
+    eig_max = float(np.max(np.diag(subspace.active_covariance))) if subspace.dimension else 1.0
+    reg = float(regularization) * max(eig_max, 1.0e-12)
+    metric = np.linalg.inv(subspace.active_covariance + reg * np.eye(subspace.dimension))
     return float(xi.T @ metric @ xi)
 
 

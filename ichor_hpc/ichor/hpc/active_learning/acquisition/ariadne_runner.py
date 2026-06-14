@@ -83,6 +83,7 @@ class AriadneRunResult:
     raw_whitened_distance_final: Optional[float] = None
     landing_safety: Optional[Dict[str, Any]] = None
     landing_candidates: List[Dict[str, Any]] = field(default_factory=list)
+    selection_diagnostics: Optional[Dict[str, Any]] = None
 
     @property
     def alpha_initial(self) -> Optional[float]:
@@ -128,6 +129,8 @@ class AriadneRunResult:
             data["landing_safety"] = dict(self.landing_safety)
         if self.landing_candidates:
             data["landing_candidates"] = [dict(c) for c in self.landing_candidates]
+        if self.selection_diagnostics is not None:
+            data["selection_diagnostics"] = dict(self.selection_diagnostics)
         return data
 
 
@@ -153,6 +156,8 @@ def optimise_seed(
     mock: bool = False,
     seed_frame_id: Optional[int] = None,
     external_reference_scales: Optional[dict] = None,
+    error_calibration_model: Optional[dict] = None,
+    error_calibration_apply_strength: float = 0.0,
     max_acquisition_grad_per_ang: Optional[float] = None,
     max_force_per_atom_ha_per_ang: Optional[float] = 50.0,
     project_rigid: bool = True,
@@ -183,6 +188,8 @@ def optimise_seed(
         models, seed, trajectory, acquisition_config, run_config,
         seed_frame_id=seed_frame_id,
         external_reference_scales=external_reference_scales,
+        error_calibration_model=error_calibration_model,
+        error_calibration_apply_strength=error_calibration_apply_strength,
         max_acquisition_grad_per_ang=max_acquisition_grad_per_ang,
         max_force_per_atom_ha_per_ang=max_force_per_atom_ha_per_ang,
         project_rigid=project_rigid,
@@ -331,6 +338,37 @@ def _evaluate_landing_candidate(
         metrics["energy_variance"] = float(breakdown.energy_variance)
         metrics["chemistry_penalty"] = float(breakdown.chemistry_penalty)
         metrics["distance_penalty"] = float(breakdown.distance_penalty)
+        metrics["spectral_frequency_risk"] = (
+            None if breakdown.spectral_frequency_risk is None
+            else float(breakdown.spectral_frequency_risk)
+        )
+        metrics["legacy_frequency_risk"] = (
+            None if breakdown.legacy_frequency_risk is None
+            else float(breakdown.legacy_frequency_risk)
+        )
+        metrics["banded_energy_risk"] = (
+            None if breakdown.banded_energy_risk is None
+            else float(breakdown.banded_energy_risk)
+        )
+        metrics["fullspace_residual_distance"] = (
+            None if breakdown.fullspace_residual_distance is None
+            else float(breakdown.fullspace_residual_distance)
+        )
+        metrics["fullspace_residual_penalty"] = float(
+            breakdown.fullspace_residual_penalty
+        )
+        metrics["aligned_rmsd_penalty"] = float(breakdown.aligned_rmsd_penalty)
+        if breakdown.aligned_rmsd_ang is not None:
+            metrics["aligned_rmsd_ang"] = float(breakdown.aligned_rmsd_ang)
+        metrics["observable_score"] = (
+            None if breakdown.observable_score is None
+            else float(breakdown.observable_score)
+        )
+        metrics["outlier_penalty_score"] = (
+            None if breakdown.outlier_penalty_score is None
+            else float(breakdown.outlier_penalty_score)
+        )
+        metrics["acquisition_fallback_reasons"] = list(breakdown.fallback_reasons)
         metrics["total_score"] = float(breakdown.total)
         alpha_value = float(breakdown.total if alpha is None else alpha)
         informativeness = float(breakdown.informativeness_score)
@@ -399,6 +437,103 @@ def _evaluate_landing_candidate(
         "reasons": reasons,
         "record_only_reasons": record_only,
         "metrics": metrics,
+    }
+
+
+def _selection_prediction_diagnostics(
+    acquisition: SeedLocalAdversarialAcquisition,
+    atoms: Atoms,
+    *,
+    landing_safety: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    breakdown = acquisition.components(atoms)
+    per_atom = []
+    for atom, diag in acquisition.posterior.atom_diagnostics(atoms).items():
+        per_atom.append(
+            {
+                "atom": str(atom),
+                "atom_type": str(diag.get("atom_type", "")),
+                "property": str(acquisition.config.property_name),
+                "predicted_iqa_ha": float(diag["predicted_iqa_ha"]),
+                "raw_variance": float(diag["raw_variance"]),
+            }
+        )
+    safety_metrics = {}
+    if isinstance(landing_safety, dict):
+        safety_metrics = dict(landing_safety.get("metrics") or {})
+    return {
+        "schema_version": 1,
+        "property": str(acquisition.config.property_name),
+        "total_predicted_iqa_ha": float(breakdown.mean_energy),
+        "total_energy_variance": float(breakdown.energy_variance),
+        "raw_total_score": float(breakdown.total),
+        "raw_energy_risk": (
+            float(breakdown.raw_energy_risk)
+            if breakdown.raw_energy_risk is not None
+            else float(breakdown.energy_risk)
+        ),
+        "energy_risk": float(breakdown.energy_risk),
+        "banded_energy_risk": (
+            None
+            if breakdown.banded_energy_risk is None
+            else float(breakdown.banded_energy_risk)
+        ),
+        "calibrated_expected_iqa_error_ha": (
+            None
+            if breakdown.calibrated_expected_iqa_error_ha is None
+            else float(breakdown.calibrated_expected_iqa_error_ha)
+        ),
+        "calibration_applied": bool(breakdown.calibration_applied),
+        "spectral_frequency_risk": (
+            None
+            if breakdown.spectral_frequency_risk is None
+            else float(breakdown.spectral_frequency_risk)
+        ),
+        "legacy_frequency_risk": (
+            None
+            if breakdown.legacy_frequency_risk is None
+            else float(breakdown.legacy_frequency_risk)
+        ),
+        "fullspace_residual_distance": (
+            None
+            if breakdown.fullspace_residual_distance is None
+            else float(breakdown.fullspace_residual_distance)
+        ),
+        "fullspace_residual_penalty": float(breakdown.fullspace_residual_penalty),
+        "aligned_rmsd_ang": (
+            None
+            if breakdown.aligned_rmsd_ang is None
+            else float(breakdown.aligned_rmsd_ang)
+        ),
+        "aligned_rmsd_penalty": float(breakdown.aligned_rmsd_penalty),
+        "observable_score": (
+            None
+            if breakdown.observable_score is None
+            else float(breakdown.observable_score)
+        ),
+        "outlier_penalty_score": (
+            None
+            if breakdown.outlier_penalty_score is None
+            else float(breakdown.outlier_penalty_score)
+        ),
+        "acquisition_fallback_reasons": list(breakdown.fallback_reasons),
+        "spectral_modes": [
+            {
+                "index": int(mode.index),
+                "omega": float(mode.omega),
+                "omega_std": float(mode.omega_std),
+                "spectral_weight": float(mode.spectral_weight),
+                "frequency_observable_score": float(mode.frequency_observable_score),
+            }
+            for mode in breakdown.mode_evaluations
+        ],
+        "landing_policy": (
+            str(landing_safety.get("policy", "unknown"))
+            if isinstance(landing_safety, dict)
+            else "unknown"
+        ),
+        "safety_metrics": safety_metrics,
+        "per_atom": per_atom,
     }
 
 
@@ -587,6 +722,15 @@ def _mock_landing_safety(seed: Atoms, final: Atoms) -> Dict[str, Any]:
     final_coords = _coords_array(final)
     metrics = _geometry_metrics(seed_coords, final_coords)
     metrics["whitened_distance"] = 0.0
+    metrics["spectral_frequency_risk"] = 0.0
+    metrics["legacy_frequency_risk"] = 0.0
+    metrics["banded_energy_risk"] = None
+    metrics["fullspace_residual_distance"] = 0.0
+    metrics["fullspace_residual_penalty"] = 0.0
+    metrics["aligned_rmsd_penalty"] = 0.0
+    metrics["observable_score"] = 0.0
+    metrics["outlier_penalty_score"] = 0.0
+    metrics["acquisition_fallback_reasons"] = ["synthetic_mock_acquisition_metrics"]
     candidate = {
         "candidate_index": 0,
         "origin": "mock_final",
@@ -636,6 +780,40 @@ def _mock_optimise_seed(
     wall = max(time.perf_counter() - t0, 1.0e-6)
     landing_safety = _mock_landing_safety(seed, final)
     landing_candidates = [dict(landing_safety["raw_final"])]
+    per_atom = []
+    for idx, atom in enumerate(final):
+        per_atom.append({
+            "atom": str(atom.name),
+            "atom_type": str(atom.type),
+            "property": "iqa",
+            "predicted_iqa_ha": float(-1.0 - 1.0e-4 * idx),
+            "raw_variance": float(1.0e-3 + 1.0e-4 * idx),
+        })
+    selection_diagnostics = {
+        "schema_version": 1,
+        "property": "iqa",
+        "total_predicted_iqa_ha": float(sum(r["predicted_iqa_ha"] for r in per_atom)),
+        "total_energy_variance": float(sum(r["raw_variance"] for r in per_atom)),
+        "raw_total_score": float(alpha_values[-1]),
+        "raw_energy_risk": float(sum(r["raw_variance"] for r in per_atom)),
+        "energy_risk": float(sum(r["raw_variance"] for r in per_atom)),
+        "banded_energy_risk": None,
+        "calibrated_expected_iqa_error_ha": None,
+        "calibration_applied": False,
+        "spectral_frequency_risk": 0.0,
+        "legacy_frequency_risk": 0.0,
+        "fullspace_residual_distance": 0.0,
+        "fullspace_residual_penalty": 0.0,
+        "aligned_rmsd_ang": 0.0,
+        "aligned_rmsd_penalty": 0.0,
+        "observable_score": float(alpha_values[-1]),
+        "outlier_penalty_score": 0.0,
+        "acquisition_fallback_reasons": ["synthetic_mock_acquisition_metrics"],
+        "spectral_modes": [],
+        "landing_policy": "mock_final",
+        "safety_metrics": dict(landing_safety.get("metrics") or {}),
+        "per_atom": per_atom,
+    }
     return AriadneRunResult(
         initial_atoms=seed,
         final_atoms=final,
@@ -653,6 +831,7 @@ def _mock_optimise_seed(
         raw_whitened_distance_final=0.0,
         landing_safety=landing_safety,
         landing_candidates=landing_candidates,
+        selection_diagnostics=selection_diagnostics,
     )
 
 
@@ -665,6 +844,8 @@ def _live_optimise_seed(
     *,
     seed_frame_id: Optional[int] = None,
     external_reference_scales: Optional[dict] = None,
+    error_calibration_model: Optional[dict] = None,
+    error_calibration_apply_strength: float = 0.0,
     max_acquisition_grad_per_ang: Optional[float] = None,
     max_force_per_atom_ha_per_ang: Optional[float] = 50.0,
     project_rigid: bool = True,
@@ -701,6 +882,8 @@ def _live_optimise_seed(
         config=acquisition_config,
         seed_frame_id=seed_frame_id,
         external_reference_scales=external_reference_scales,
+        error_calibration_model=error_calibration_model,
+        error_calibration_apply_strength=error_calibration_apply_strength,
     )
 
     # AdversarialASECalculator subscripts the clamp counter as a dict
@@ -741,6 +924,14 @@ def _live_optimise_seed(
         safety_config=safety_config,
         quality_gates=quality_gates,
     )
+    try:
+        selection_diagnostics = _selection_prediction_diagnostics(
+            acquisition,
+            landing["selected_atoms"],
+            landing_safety=landing["landing_safety"],
+        )
+    except Exception:
+        selection_diagnostics = None
 
     return AriadneRunResult(
         initial_atoms=acquisition.seed_atoms,
@@ -763,6 +954,7 @@ def _live_optimise_seed(
         raw_whitened_distance_final=landing["raw_whitened_distance"],
         landing_safety=landing["landing_safety"],
         landing_candidates=landing["landing_candidates"],
+        selection_diagnostics=selection_diagnostics,
     )
 
 
@@ -989,6 +1181,22 @@ def main(argv=None) -> int:
 
     acquisition_config = config.to_acquisition_config()
     ariadne_run_config = config.to_ariadne_run_config()
+    error_calibration_model = None
+    error_calibration_reason = "disabled"
+    try:
+        from ..daemon.error_calibration import load_calibration_model_for_acquisition
+
+        error_calibration_model, error_calibration_reason = (
+            load_calibration_model_for_acquisition(campaign, config)
+        )
+    except Exception:
+        error_calibration_model = None
+        error_calibration_reason = "malformed_model"
+    error_calibration_strength = (
+        float(config.error_calibration.apply_strength)
+        if error_calibration_model is not None
+        else 0.0
+    )
 
     try:
         result = optimise_seed(
@@ -1000,6 +1208,8 @@ def main(argv=None) -> int:
             mock=False,
             seed_frame_id=seed_frame_id,
             external_reference_scales=external_reference_scales,
+            error_calibration_model=error_calibration_model,
+            error_calibration_apply_strength=error_calibration_strength,
             max_acquisition_grad_per_ang=config.effective_max_acquisition_grad_per_ang(),
             gradient_backend=str(config.resources.gradient_parallel_backend),
             safety_config=getattr(config, "adversarial_safety", None),
@@ -1026,6 +1236,13 @@ def main(argv=None) -> int:
     payload["seed_frame_id"] = seed_frame_id
     payload["seed_index"] = int(args.seed_index)
     payload["iteration"] = int(args.iteration)
+    if isinstance(payload.get("selection_diagnostics"), dict):
+        payload["selection_diagnostics"]["model_version"] = int(state.models_version)
+        payload["selection_diagnostics"]["seed_index"] = int(args.seed_index)
+        payload["selection_diagnostics"]["seed_frame_id"] = int(seed_frame_id)
+        payload["selection_diagnostics"]["error_calibration_model_reason"] = str(
+            error_calibration_reason
+        )
     with open(
         seed_dir / "result.json", "w", encoding="utf-8",
     ) as f:

@@ -78,6 +78,8 @@ class StencilConfig:
     #eps**2 * |cubic| stays below 1 percent of the gradient magnitude. Cost ~2x
     #stencil evals on iteration 1; subsequent calls re-use the auto-tuned step.
     autotune_from_cubic: bool = False
+    negative_curvature_policy: str = "ignore"
+    lambda_negative_curvature: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -89,6 +91,45 @@ class WeightConfig:
     lambda_anharmonic: float = 1.0
     lambda_energy: float = 0.25
     lambda_distance: float = 1.0
+
+
+@dataclass(frozen=True)
+class SpectralConfig:
+    """Observable-oriented frequency acquisition settings."""
+
+    enabled: bool = True
+    mode: str = "blend"
+    mode_weighting: str = "inverse_frequency"
+    lambda_spectral: float = 1.5
+    omega_floor: float = 1.0e-6
+    low_frequency_power: float = 1.0
+    max_modes: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class CalibratedEnergyConfig:
+    """Energy/error utility settings for calibrated active learning."""
+
+    utility: str = "banded"
+    band_low_ha: Optional[float] = None
+    band_high_ha: Optional[float] = None
+    low_softness_ha: Optional[float] = None
+    high_softness_ha: Optional[float] = None
+    fallback_to_raw_variance: bool = True
+
+
+@dataclass(frozen=True)
+class FullspaceConfinementConfig:
+    """Geometry confinement outside the active local subspace."""
+
+    enabled: bool = True
+    lambda_residual: float = 0.5
+    lambda_rmsd: float = 0.25
+    residual_scale: str = "local_neighbour_median"
+    fixed_residual_scale_ang: Optional[float] = None
+    rmsd_scale_ang: float = 0.50
+    min_residual_scale_ang: float = 1.0e-3
+    failure_penalty: float = 1.0e6
 
 
 @dataclass(frozen=True)
@@ -134,5 +175,8 @@ class AcquisitionConfig:
     barrier: BarrierConfig = BarrierConfig()
     stencils: StencilConfig = StencilConfig()
     weights: WeightConfig = WeightConfig()
+    spectral: SpectralConfig = SpectralConfig()
+    calibrated_energy: CalibratedEnergyConfig = CalibratedEnergyConfig()
+    fullspace_confinement: FullspaceConfinementConfig = FullspaceConfinementConfig()
     gradient: GradientConfig = GradientConfig()
     references: ReferenceScaleConfig = ReferenceScaleConfig()

@@ -389,4 +389,15 @@ def validate_reference_scales(scales: Mapping[str, Any]) -> Dict[str, float]:
         if not np.isfinite(value) or value <= 0.0:
             raise ModelContractError("reference_scale_non_finite_or_non_positive:" + key)
         out[key] = value
+    for key, raw in scales.items():
+        key_s = str(key)
+        if key_s in out:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ModelContractError("reference_scale_invalid:" + key_s) from exc
+        if not np.isfinite(value) or value <= 0.0:
+            raise ModelContractError("reference_scale_non_finite_or_non_positive:" + key_s)
+        out[key_s] = value
     return out

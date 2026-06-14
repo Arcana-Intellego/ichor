@@ -324,7 +324,7 @@ def atomic_write_text(target: Union[str, Path], text: str) -> None:
 def atomic_write_json(target: Union[str, Path], payload: Any) -> None:
     """Serialise "payload" as JSON (indent=2, sort_keys=True) and write it
     atomically via :func:"atomic_write_text"."""
-    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    text = json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
     atomic_write_text(target, text)
 
 
@@ -350,4 +350,3 @@ def write_state(path: Union[str, Path], state: CampaignState) -> None:
     payload = state.to_dict()
     CampaignState.from_dict(payload)
     atomic_write_json(path, payload)
-

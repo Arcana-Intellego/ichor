@@ -22,6 +22,10 @@ PHASE_A_SAMPLE_FILENAME = "PHASE_A_SAMPLE.json"
 PHASE_A_SAMPLE_SCHEMA_VERSION = 1
 PHASE_B_SELECTION_FILENAME = "PHASE_B_SELECTION.json"
 PHASE_B_SELECTION_SCHEMA_VERSION = 1
+SEED_SELECTION_DIAGNOSTICS_FILENAME = "SEED_SELECTION_DIAGNOSTICS.json"
+SEED_SELECTION_DIAGNOSTICS_SCHEMA_VERSION = 1
+ACQUISITION_MATURITY_AUDIT_FILENAME = "ACQUISITION_MATURITY_AUDIT.json"
+ACQUISITION_MATURITY_AUDIT_SCHEMA_VERSION = 1
 
 
 class HandoffManifestError(ValueError):
@@ -38,6 +42,14 @@ def iteration_dir(campaign_dir: Any, iteration: int) -> Path:
 
 def seeds_picked_path(iter_dir: Any) -> Path:
     return Path(iter_dir) / "seeds_picked.json"
+
+
+def seed_selection_diagnostics_path(iter_dir: Any) -> Path:
+    return Path(iter_dir) / SEED_SELECTION_DIAGNOSTICS_FILENAME
+
+
+def acquisition_maturity_audit_path(iter_dir: Any) -> Path:
+    return Path(iter_dir) / ACQUISITION_MATURITY_AUDIT_FILENAME
 
 
 def ariadne_results_path(iter_dir: Any) -> Path:
@@ -77,6 +89,25 @@ def _int_or_none(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError) as exc:
         raise HandoffManifestError("expected integer or null, got " + repr(value)) from exc
+
+
+def _required_int(value: Any, label: str) -> int:
+    if isinstance(value, bool):
+        raise HandoffManifestError(label + " must be an integer, got bool")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise HandoffManifestError(label + " must be an integer") from exc
+
+
+def _json_number_or_none(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
 
 
 def load_seeds_picked(iter_dir: Any, *, expected_iteration: Optional[int] = None) -> Dict[str, Any]:
@@ -164,9 +195,9 @@ def load_seeds_picked(iter_dir: Any, *, expected_iteration: Optional[int] = None
                     "seed_records frame_id mismatch for seed_index " + str(seed_index)
                 )
             origin = str(raw.get("selection_origin", "unknown"))
-            if origin not in ("bulk", "variance", "unknown"):
+            if origin not in ("bulk", "variance", "d_optimal", "unknown"):
                 raise HandoffManifestError("unknown selection_origin: " + origin)
-            records.append({
+            record = {
                 "seed_index": seed_index,
                 "frame_id": frame_id,
                 "selection_index": int(raw.get("selection_index", indices_norm[seed_index])),
@@ -174,7 +205,22 @@ def load_seeds_picked(iter_dir: Any, *, expected_iteration: Optional[int] = None
                 "variance_at_selection": _finite_float(
                     raw.get("variance_at_selection"), allow_none=True,
                 ),
-            })
+            }
+            for key in (
+                "raw_variance",
+                "raw_score",
+                "d_optimal_conditional_variance",
+                "d_optimal_gain",
+                "d_optimal_max_correlation_to_selected",
+            ):
+                if key in raw:
+                    record[key] = _finite_float(raw.get(key), allow_none=True)
+            for key in ("d_optimal_prefilter_rank", "variance_rank"):
+                if key in raw and raw.get(key) is not None:
+                    if isinstance(raw.get(key), bool):
+                        raise HandoffManifestError(key + " must be an integer, got bool")
+                    record[key] = int(raw.get(key))
+            records.append(record)
         if len(seen) != n_picked:
             raise HandoffManifestError("seed_records does not cover every picked seed")
         records.sort(key=lambda rec: int(rec["seed_index"]))
@@ -185,6 +231,173 @@ def load_seeds_picked(iter_dir: Any, *, expected_iteration: Optional[int] = None
     out["frame_ids"] = frame_ids_norm
     out["seed_records"] = records
     return out
+
+
+def write_seed_selection_diagnostics(iter_dir: Any, payload: Dict[str, Any]) -> Path:
+    data = dict(payload)
+    data["schema_version"] = SEED_SELECTION_DIAGNOSTICS_SCHEMA_VERSION
+    path = seed_selection_diagnostics_path(iter_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(path, data)
+    return path
+
+
+def read_seed_selection_diagnostics(
+    iter_dir: Any,
+    *,
+    expected_iteration: Optional[int] = None,
+) -> Dict[str, Any]:
+    path = seed_selection_diagnostics_path(iter_dir)
+    if not path.is_file():
+        raise FileNotFoundError("seed selection diagnostics missing: " + str(path))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise HandoffManifestError("seed selection diagnostics unreadable: " + str(path)) from exc
+    if not isinstance(data, dict):
+        raise HandoffManifestError("seed selection diagnostics must be a JSON object")
+    if _required_int(data.get("schema_version", -1), "seed selection diagnostics schema_version") != SEED_SELECTION_DIAGNOSTICS_SCHEMA_VERSION:
+        raise HandoffManifestError("unsupported seed selection diagnostics schema")
+    iteration = _required_int(data.get("iteration"), "seed selection diagnostics iteration")
+    if expected_iteration is not None and iteration != int(expected_iteration):
+        raise HandoffManifestError("seed selection diagnostics iteration mismatch")
+    selected = data.get("selected")
+    if not isinstance(selected, list):
+        raise HandoffManifestError("seed selection diagnostics selected must be a list")
+    return data
+
+
+def write_acquisition_maturity_audit(iter_dir: Any, payload: Dict[str, Any]) -> Path:
+    data = dict(payload)
+    data["schema_version"] = ACQUISITION_MATURITY_AUDIT_SCHEMA_VERSION
+    path = acquisition_maturity_audit_path(iter_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(path, data)
+    return path
+
+
+def acquisition_maturity_audit_payload(
+    *,
+    iteration: int,
+    seed_records: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    fallback_counts: Dict[str, int] = {}
+    n_candidates = 0
+    n_with_spectral = 0
+    n_with_residual = 0
+    n_with_banded_energy = 0
+    seeds: List[Dict[str, Any]] = []
+    for record in seed_records:
+        candidates = []
+        for candidate in list(record.get("landing_candidates") or []):
+            if not isinstance(candidate, dict):
+                continue
+            metrics = candidate.get("metrics") or {}
+            if not isinstance(metrics, dict):
+                metrics = {}
+            n_candidates += 1
+            if metrics.get("spectral_frequency_risk") is not None:
+                n_with_spectral += 1
+            if metrics.get("fullspace_residual_distance") is not None:
+                n_with_residual += 1
+            if metrics.get("banded_energy_risk") is not None:
+                n_with_banded_energy += 1
+            reasons = metrics.get("acquisition_fallback_reasons") or []
+            if isinstance(reasons, list):
+                for reason in reasons:
+                    key = str(reason)
+                    fallback_counts[key] = int(fallback_counts.get(key, 0)) + 1
+            candidates.append({
+                "candidate_index": candidate.get("candidate_index"),
+                "origin": candidate.get("origin"),
+                "accepted": bool(candidate.get("accepted", False)),
+                "reasons": list(candidate.get("reasons") or []),
+                "record_only_reasons": list(candidate.get("record_only_reasons") or []),
+                "alpha": _json_number_or_none(candidate.get("alpha")),
+                "informativeness_score": _json_number_or_none(candidate.get("informativeness_score")),
+                "risk_penalty_score": _json_number_or_none(candidate.get("risk_penalty_score")),
+                "metrics": {
+                    key: (
+                        list(metrics.get(key) or [])
+                        if key == "acquisition_fallback_reasons"
+                        else _json_number_or_none(metrics.get(key))
+                    )
+                    for key in (
+                        "total_score",
+                        "observable_score",
+                        "outlier_penalty_score",
+                        "energy_risk",
+                        "banded_energy_risk",
+                        "spectral_frequency_risk",
+                        "legacy_frequency_risk",
+                        "fullspace_residual_distance",
+                        "fullspace_residual_penalty",
+                        "aligned_rmsd_ang",
+                        "aligned_rmsd_penalty",
+                        "chemistry_penalty",
+                        "distance_penalty",
+                        "whitened_distance",
+                        "acquisition_fallback_reasons",
+                    )
+                    if key in metrics
+                },
+            })
+        selection_diagnostics = record.get("selection_diagnostics")
+        if not isinstance(selection_diagnostics, dict):
+            selection_diagnostics = None
+        seeds.append({
+            "seed_index": record.get("seed_index"),
+            "result_json": record.get("result_json"),
+            "landing_policy": (
+                (record.get("landing_safety") or {}).get("policy")
+                if isinstance(record.get("landing_safety"), dict)
+                else None
+            ),
+            "landing_safety_metrics": (
+                dict((record.get("landing_safety") or {}).get("metrics") or {})
+                if isinstance(record.get("landing_safety"), dict)
+                else {}
+            ),
+            "selection_diagnostics": selection_diagnostics,
+            "landing_candidates": candidates,
+        })
+    return {
+        "iteration": int(iteration),
+        "summary": {
+            "n_seeds": int(len(seed_records)),
+            "n_candidates": int(n_candidates),
+            "n_candidates_with_spectral": int(n_with_spectral),
+            "n_candidates_with_fullspace_residual": int(n_with_residual),
+            "n_candidates_with_banded_energy": int(n_with_banded_energy),
+            "fallback_reasons": fallback_counts,
+        },
+        "seeds": seeds,
+    }
+
+
+def read_acquisition_maturity_audit(
+    iter_dir: Any,
+    *,
+    expected_iteration: Optional[int] = None,
+) -> Dict[str, Any]:
+    path = acquisition_maturity_audit_path(iter_dir)
+    if not path.is_file():
+        raise FileNotFoundError("acquisition maturity audit missing: " + str(path))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise HandoffManifestError("acquisition maturity audit unreadable: " + str(path)) from exc
+    if not isinstance(data, dict):
+        raise HandoffManifestError("acquisition maturity audit must be a JSON object")
+    if _required_int(data.get("schema_version", -1), "acquisition maturity audit schema_version") != ACQUISITION_MATURITY_AUDIT_SCHEMA_VERSION:
+        raise HandoffManifestError("unsupported acquisition maturity audit schema")
+    iteration = _required_int(data.get("iteration"), "acquisition maturity audit iteration")
+    if expected_iteration is not None and iteration != int(expected_iteration):
+        raise HandoffManifestError("acquisition maturity audit iteration mismatch")
+    seeds = data.get("seeds")
+    if not isinstance(seeds, list):
+        raise HandoffManifestError("acquisition maturity audit seeds must be a list")
+    return data
 
 
 def validate_ariadne_result(
@@ -274,9 +487,9 @@ def read_ariadne_landing_audit(
         raise HandoffManifestError("ARIADNE landing audit unreadable: " + str(path)) from exc
     if not isinstance(data, dict):
         raise HandoffManifestError("ARIADNE landing audit must be a JSON object")
-    if int(data.get("schema_version", -1)) != ARIADNE_LANDING_AUDIT_SCHEMA_VERSION:
+    if _required_int(data.get("schema_version", -1), "ARIADNE landing audit schema_version") != ARIADNE_LANDING_AUDIT_SCHEMA_VERSION:
         raise HandoffManifestError("unsupported ARIADNE landing audit schema")
-    iteration = int(data.get("iteration"))
+    iteration = _required_int(data.get("iteration"), "ARIADNE landing audit iteration")
     if expected_iteration is not None and iteration != int(expected_iteration):
         raise HandoffManifestError("ARIADNE landing audit iteration mismatch")
     summary = data.get("summary")
@@ -289,7 +502,7 @@ def read_ariadne_landing_audit(
     for rec in seeds:
         if not isinstance(rec, dict):
             raise HandoffManifestError("ARIADNE landing audit seed record must be an object")
-        seed_index = int(rec.get("seed_index"))
+        seed_index = _required_int(rec.get("seed_index"), "ARIADNE landing audit seed_index")
         if seed_index in seen:
             raise HandoffManifestError("duplicate ARIADNE landing audit seed_index")
         seen.add(seed_index)

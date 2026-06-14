@@ -97,7 +97,8 @@ def build_chemistry_barrier_state(
         radius_sum = seed_atoms[i].radius + seed_atoms[j].radius
         safe_nonbonded[(i, j)] = config.nonbonded_clash_scale * radius_sum
         seed_dist = _pair_distance(seed_atoms, i, j)
-        if seed_dist <= config.nonbonded_expansion_scale * radius_sum:
+        expansion_margin = max(float(config.nonbonded_expansion_delta), 0.0)
+        if seed_dist <= (config.nonbonded_expansion_scale + expansion_margin) * radius_sum:
             neighbour_dists = (
                 np.array([_pair_distance(atoms, i, j) for atoms in neighbours], dtype=float)
                 if neighbours else np.array([seed_dist], dtype=float)

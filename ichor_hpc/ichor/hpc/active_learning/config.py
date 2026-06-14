@@ -31,11 +31,15 @@ __all__ = [
     "AcquisitionBarrierBlock",
     "AcquisitionStencilsBlock",
     "AcquisitionWeightsBlock",
+    "AcquisitionSpectralBlock",
+    "AcquisitionCalibratedEnergyBlock",
+    "AcquisitionFullspaceConfinementBlock",
     "AcquisitionGradientBlock",
     "AcquisitionReferencesBlock",
     "AcquisitionConfigBlock",
     "AriadneConfigBlock",
     "AdversarialSafetyConfigBlock",
+    "ErrorCalibrationConfigBlock",
     "QualityGatesConfigBlock",
     "RuntimeConfigBlock",
     "StopConfigBlock",
@@ -46,8 +50,15 @@ __all__ = [
     "VALID_WARMSTART",
     "VALID_DESCRIPTORS",
     "VALID_SPLITS",
+    "VALID_SEED_SELECTION_STRATEGIES",
     "VALID_GRADIENT_MODES",
     "VALID_MODE_WEIGHTING_POLICIES",
+    "VALID_SPECTRAL_MODES",
+    "VALID_CALIBRATED_ENERGY_UTILITIES",
+    "VALID_FULLSPACE_RESIDUAL_SCALES",
+    "VALID_GAUSSIAN_MEMORY_MODES",
+    "VALID_ERROR_CALIBRATION_MODEL_VERSION_POLICIES",
+    "VALID_NEGATIVE_CURVATURE_POLICIES",
 ]
 
 
@@ -66,13 +77,21 @@ VALID_DESCRIPTORS = frozenset({
 VALID_SPLITS = frozenset({
     "stratified_with_holdout", "random_80_20", "pure_top_k",
 })
+VALID_SEED_SELECTION_STRATEGIES = frozenset({"hybrid_variance", "d_optimal"})
 VALID_GRADIENT_MODES = frozenset({"cartesian_fd", "active_fd"})
 VALID_MODE_WEIGHTING_POLICIES = frozenset({"variance", "inverse_frequency", "uniform"})
 VALID_GRADIENT_PARALLEL_BACKENDS = frozenset({"serial", "thread", "process"})
+VALID_ERROR_CALIBRATION_MODES = frozenset({"record_only", "apply_to_acquisition"})
+VALID_ERROR_CALIBRATION_MODEL_VERSION_POLICIES = frozenset({"current", "all"})
+VALID_SPECTRAL_MODES = frozenset({"off", "record_only", "blend"})
+VALID_CALIBRATED_ENERGY_UTILITIES = frozenset({"log", "banded"})
+VALID_FULLSPACE_RESIDUAL_SCALES = frozenset({"local_neighbour_median", "fixed"})
+VALID_GAUSSIAN_MEMORY_MODES = frozenset({"slurm_env", "link0"})
+VALID_NEGATIVE_CURVATURE_POLICIES = frozenset({"ignore", "penalise"})
 
 _SYSTEM_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 _SCHEDULER_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$")
-_SLURM_MEMORY_RE = re.compile(r"^[1-9][0-9]*[KMGT]?$")
+_SLURM_MEMORY_RE = re.compile(r"^(?:auto|[1-9][0-9]*[KMGT]?)$")
 _GAUSSIAN_MEMORY_RE = re.compile(r"^[1-9][0-9]*(?:[KMGT](?:B|W)?)?$")
 _MEMORY_PARSE_RE = re.compile(r"^([1-9][0-9]*)([KMGT]?)([BW]?)$")
 
@@ -238,6 +257,8 @@ class AcquisitionStencilsBlock:
     curvature_floor: float = 1.0e-6
     softplus_scale: float = 1.0e-4
     autotune_from_cubic: bool = True
+    negative_curvature_policy: str = "ignore"
+    lambda_negative_curvature: float = 1.0
 
 
 @dataclass
@@ -247,6 +268,39 @@ class AcquisitionWeightsBlock:
     lambda_anharmonic: float = 1.0
     lambda_energy: float = 0.25
     lambda_distance: float = 1.0
+
+
+@dataclass
+class AcquisitionSpectralBlock:
+    enabled: bool = True
+    mode: str = "blend"
+    mode_weighting: str = "inverse_frequency"
+    lambda_spectral: float = 1.5
+    omega_floor: float = 1.0e-6
+    low_frequency_power: float = 1.0
+    max_modes: Optional[int] = None
+
+
+@dataclass
+class AcquisitionCalibratedEnergyBlock:
+    utility: str = "banded"
+    band_low_ha: Optional[float] = None
+    band_high_ha: Optional[float] = None
+    low_softness_ha: Optional[float] = None
+    high_softness_ha: Optional[float] = None
+    fallback_to_raw_variance: bool = True
+
+
+@dataclass
+class AcquisitionFullspaceConfinementBlock:
+    enabled: bool = True
+    lambda_residual: float = 0.5
+    lambda_rmsd: float = 0.25
+    residual_scale: str = "local_neighbour_median"
+    fixed_residual_scale_ang: Optional[float] = None
+    rmsd_scale_ang: float = 0.50
+    min_residual_scale_ang: float = 1.0e-3
+    failure_penalty: float = 1.0e6
 
 
 @dataclass
@@ -276,6 +330,9 @@ class AcquisitionConfigBlock:
     barrier: AcquisitionBarrierBlock = field(default_factory=AcquisitionBarrierBlock)
     stencils: AcquisitionStencilsBlock = field(default_factory=AcquisitionStencilsBlock)
     weights: AcquisitionWeightsBlock = field(default_factory=AcquisitionWeightsBlock)
+    spectral: AcquisitionSpectralBlock = field(default_factory=AcquisitionSpectralBlock)
+    calibrated_energy: AcquisitionCalibratedEnergyBlock = field(default_factory=AcquisitionCalibratedEnergyBlock)
+    fullspace_confinement: AcquisitionFullspaceConfinementBlock = field(default_factory=AcquisitionFullspaceConfinementBlock)
     gradient: AcquisitionGradientBlock = field(default_factory=AcquisitionGradientBlock)
     references: AcquisitionReferencesBlock = field(default_factory=AcquisitionReferencesBlock)
 
@@ -311,6 +368,11 @@ class SeedSelectionConfigBlock:
     n_seeds_per_iteration: int = 50
     bulk_fraction: float = 0.5
     variance_chunk_size: int = 512
+    strategy: str = "hybrid_variance"
+    d_optimal_pool_multiplier: int = 8
+    d_optimal_jitter: float = 1.0e-12
+    d_optimal_novelty_floor: float = 1.0e-12
+    d_optimal_score_power: float = 1.0
 
 
 @dataclass
@@ -405,6 +467,20 @@ class AdversarialSafetyConfigBlock:
 
 
 @dataclass
+class ErrorCalibrationConfigBlock:
+    enabled: bool = True
+    mode: str = "record_only"
+    min_records_to_apply: int = 100
+    n_bins: int = 10
+    min_bin_records: int = 8
+    apply_strength: float = 0.0
+    group_by_atom_type: bool = True
+    group_by_landing_policy: bool = False
+    model_version_policy: str = "current"
+    output_units: str = "ha"
+
+
+@dataclass
 class QualityGatesConfigBlock:
     require_readable_aimall_geometry: bool = True
     require_finite_iqa: bool = True
@@ -443,14 +519,14 @@ class ResourceConfigBlock:
     # array tasks parallelise the acquisition gradient across those cores.
     partition: str = "multicore"
     walltime_hours: int = 24
-    # per-core memory, NOT per-job. CSF4 multicore hands memory out per core and a job-level
-    # --mem gets rejected/ignored there, so we emit this as --mem-per-cpu. the total a task gets
-    # is roughly this * cpus_per_task. keep the sbatch unit style (4G, 8G) -- gaussian.mem below
-    # uses gaussian's own "8GB" style, the two are deliberately different conventions.
-    mem_per_cpu: str = "8G"
+    # Per-core memory, NOT per-job. "auto" resolves from the active cluster
+    # profile and partition during live Slurm rendering, so CSF4 gets 4G/core
+    # while CSF3 multicore can use 8G/core without editing campaign.yaml.
+    mem_per_cpu: str = "auto"
     cpus_per_task: int = 1
     ntasks: int = 1
     ariadne_cpus_per_task: int = 8
+    array_concurrency_limit: Optional[int] = None
     # "process" -> node-local process pool sized to the task's cpus-per-task.
     # "serial"  -> force single-core (off-cluster / debugging).
     gradient_parallel_backend: str = "process"
@@ -474,6 +550,8 @@ class GaussianConfigBlock:
     extra_keywords: str = ""
     nproc: int = 1
     mem: str = "8GB"
+    memory_mode: str = "slurm_env"
+    memory_fraction_of_slurm: float = 0.85
 
 
 @dataclass
@@ -533,6 +611,9 @@ class CampaignConfig:
     ariadne: AriadneConfigBlock = field(default_factory=AriadneConfigBlock)
     adversarial_safety: AdversarialSafetyConfigBlock = field(
         default_factory=AdversarialSafetyConfigBlock
+    )
+    error_calibration: ErrorCalibrationConfigBlock = field(
+        default_factory=ErrorCalibrationConfigBlock
     )
     quality_gates: QualityGatesConfigBlock = field(
         default_factory=QualityGatesConfigBlock
@@ -619,11 +700,16 @@ class CampaignConfig:
             "resources.ariadne_cpus_per_task",
             self.resources.ariadne_cpus_per_task,
         )
+        if self.resources.array_concurrency_limit is not None:
+            _validate_positive_int(
+                "resources.array_concurrency_limit",
+                self.resources.array_concurrency_limit,
+            )
         _validate_memory(
             "resources.mem_per_cpu",
             self.resources.mem_per_cpu,
             _SLURM_MEMORY_RE,
-            "SLURM memory syntax such as 4G or 4000M",
+            "SLURM memory syntax such as 4G or 4000M, or auto",
         )
         if self.resources.gradient_parallel_backend not in VALID_GRADIENT_PARALLEL_BACKENDS:
             raise ConfigValidationError(
@@ -631,6 +717,19 @@ class CampaignConfig:
                 + repr(sorted(VALID_GRADIENT_PARALLEL_BACKENDS))
             )
         _validate_positive_int("gaussian.nproc", self.gaussian.nproc)
+        if self.gaussian.memory_mode not in VALID_GAUSSIAN_MEMORY_MODES:
+            raise ConfigValidationError(
+                "gaussian.memory_mode must be one of "
+                + repr(sorted(VALID_GAUSSIAN_MEMORY_MODES))
+            )
+        if isinstance(self.gaussian.memory_fraction_of_slurm, bool) or not isinstance(
+            self.gaussian.memory_fraction_of_slurm, (int, float)
+        ):
+            raise ConfigValidationError("gaussian.memory_fraction_of_slurm must be a number")
+        if not 0.0 < float(self.gaussian.memory_fraction_of_slurm) <= 1.0:
+            raise ConfigValidationError(
+                "gaussian.memory_fraction_of_slurm must be in (0, 1]"
+            )
         _validate_memory(
             "gaussian.mem",
             self.gaussian.mem,
@@ -673,6 +772,23 @@ class CampaignConfig:
             "seed_selection.variance_chunk_size",
             self.seed_selection.variance_chunk_size,
         )
+        if self.seed_selection.strategy not in VALID_SEED_SELECTION_STRATEGIES:
+            raise ConfigValidationError(
+                "seed_selection.strategy must be one of "
+                + repr(sorted(VALID_SEED_SELECTION_STRATEGIES))
+            )
+        _validate_positive_int(
+            "seed_selection.d_optimal_pool_multiplier",
+            self.seed_selection.d_optimal_pool_multiplier,
+        )
+        for name, value in (
+            ("seed_selection.d_optimal_jitter", self.seed_selection.d_optimal_jitter),
+            ("seed_selection.d_optimal_novelty_floor", self.seed_selection.d_optimal_novelty_floor),
+            ("seed_selection.d_optimal_score_power", self.seed_selection.d_optimal_score_power),
+        ):
+            _validate_optional_nonnegative_float(name, value)
+        if float(self.seed_selection.d_optimal_jitter) <= 0.0:
+            raise ConfigValidationError("seed_selection.d_optimal_jitter must be > 0")
         _validate_positive_int("runtime.lease_stale_seconds", self.runtime.lease_stale_seconds)
         _validate_positive_int(
             "runtime.postprocess_settle_attempts",
@@ -852,6 +968,46 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "adversarial_safety.max_whitened_distance must be > min_whitened_distance"
             )
+        calib = self.error_calibration
+        if not isinstance(calib.enabled, bool):
+            raise ConfigValidationError("error_calibration.enabled must be a boolean")
+        if calib.mode not in VALID_ERROR_CALIBRATION_MODES:
+            raise ConfigValidationError(
+                "error_calibration.mode must be one of "
+                + repr(sorted(VALID_ERROR_CALIBRATION_MODES))
+            )
+        _validate_positive_int(
+            "error_calibration.min_records_to_apply",
+            calib.min_records_to_apply,
+        )
+        _validate_positive_int("error_calibration.n_bins", calib.n_bins)
+        _validate_positive_int(
+            "error_calibration.min_bin_records",
+            calib.min_bin_records,
+        )
+        if isinstance(calib.apply_strength, bool) or not isinstance(
+            calib.apply_strength, (int, float)
+        ):
+            raise ConfigValidationError("error_calibration.apply_strength must be a number")
+        if not 0.0 <= float(calib.apply_strength) <= 1.0:
+            raise ConfigValidationError(
+                "error_calibration.apply_strength must be in [0, 1]"
+            )
+        if not isinstance(calib.group_by_atom_type, bool):
+            raise ConfigValidationError(
+                "error_calibration.group_by_atom_type must be a boolean"
+            )
+        if not isinstance(calib.group_by_landing_policy, bool):
+            raise ConfigValidationError(
+                "error_calibration.group_by_landing_policy must be a boolean"
+            )
+        if calib.output_units != "ha":
+            raise ConfigValidationError("error_calibration.output_units must be 'ha'")
+        if calib.model_version_policy not in VALID_ERROR_CALIBRATION_MODEL_VERSION_POLICIES:
+            raise ConfigValidationError(
+                "error_calibration.model_version_policy must be one of "
+                + repr(sorted(VALID_ERROR_CALIBRATION_MODEL_VERSION_POLICIES))
+            )
         if self.max_acquisition_grad_per_ang is not None:
             _validate_optional_nonnegative_float(
                 "max_acquisition_grad_per_ang",
@@ -952,30 +1108,141 @@ class CampaignConfig:
                 "acquisition.subspace.mode_weighting_policy must be one of "
                 + repr(sorted(VALID_MODE_WEIGHTING_POLICIES))
             )
-        # gaussian's %NProcShared and the SLURM --cpus-per-task it runs under are separate knobs with
-        # no link, so an operator can set gaussian.nproc=8 while cpus_per_task stays 1 -> 8 threads on
-        # 1 allocated core: oversubscription, or a cgroup kill. cross-check so the mismatch is caught
-        # at load, not on the cluster (A9).
-        if int(self.gaussian.nproc) > int(self.resources.cpus_per_task):
+        spectral = self.acquisition.spectral
+        if not isinstance(spectral.enabled, bool):
+            raise ConfigValidationError("acquisition.spectral.enabled must be a boolean")
+        if spectral.mode not in VALID_SPECTRAL_MODES:
             raise ConfigValidationError(
-                "gaussian.nproc (" + str(self.gaussian.nproc) + ") must be <= "
-                "resources.cpus_per_task (" + str(self.resources.cpus_per_task) + ") -- "
-                "%NProcShared threads would oversubscribe the cores SLURM gives the task"
+                "acquisition.spectral.mode must be one of "
+                + repr(sorted(VALID_SPECTRAL_MODES))
             )
-        gaussian_mem_mib = _memory_mebibytes("gaussian.mem", self.gaussian.mem, gaussian=True)
-        slurm_mem_mib = _memory_mebibytes(
-            "resources.mem_per_cpu", self.resources.mem_per_cpu, gaussian=False
-        ) * float(self.resources.cpus_per_task)
-        if gaussian_mem_mib > slurm_mem_mib:
+        if spectral.mode_weighting not in VALID_MODE_WEIGHTING_POLICIES:
             raise ConfigValidationError(
-                "gaussian.mem ("
-                + str(self.gaussian.mem)
-                + ") exceeds SLURM allocation resources.mem_per_cpu * cpus_per_task ("
-                + str(self.resources.mem_per_cpu)
-                + " * "
-                + str(self.resources.cpus_per_task)
-                + ")"
+                "acquisition.spectral.mode_weighting must be one of "
+                + repr(sorted(VALID_MODE_WEIGHTING_POLICIES))
             )
+        for name, value in (
+            ("acquisition.spectral.lambda_spectral", spectral.lambda_spectral),
+            ("acquisition.spectral.omega_floor", spectral.omega_floor),
+            ("acquisition.spectral.low_frequency_power", spectral.low_frequency_power),
+        ):
+            _validate_optional_nonnegative_float(name, value)
+        if spectral.lambda_spectral < 0.0:
+            raise ConfigValidationError("acquisition.spectral.lambda_spectral must be >= 0")
+        if spectral.omega_floor <= 0.0:
+            raise ConfigValidationError("acquisition.spectral.omega_floor must be > 0")
+        if spectral.max_modes is not None:
+            _validate_positive_int("acquisition.spectral.max_modes", spectral.max_modes)
+
+        cal_energy = self.acquisition.calibrated_energy
+        if cal_energy.utility not in VALID_CALIBRATED_ENERGY_UTILITIES:
+            raise ConfigValidationError(
+                "acquisition.calibrated_energy.utility must be one of "
+                + repr(sorted(VALID_CALIBRATED_ENERGY_UTILITIES))
+            )
+        if not isinstance(cal_energy.fallback_to_raw_variance, bool):
+            raise ConfigValidationError(
+                "acquisition.calibrated_energy.fallback_to_raw_variance must be a boolean"
+            )
+        for name, value in (
+            ("acquisition.calibrated_energy.band_low_ha", cal_energy.band_low_ha),
+            ("acquisition.calibrated_energy.band_high_ha", cal_energy.band_high_ha),
+            ("acquisition.calibrated_energy.low_softness_ha", cal_energy.low_softness_ha),
+            ("acquisition.calibrated_energy.high_softness_ha", cal_energy.high_softness_ha),
+        ):
+            _validate_optional_nonnegative_float(name, value)
+        if (
+            cal_energy.band_low_ha is not None
+            and cal_energy.band_high_ha is not None
+            and float(cal_energy.band_high_ha) <= float(cal_energy.band_low_ha)
+        ):
+            raise ConfigValidationError(
+                "acquisition.calibrated_energy.band_high_ha must be > band_low_ha"
+            )
+        if cal_energy.band_high_ha is not None and float(cal_energy.band_high_ha) <= 0.0:
+            raise ConfigValidationError(
+                "acquisition.calibrated_energy.band_high_ha must be > 0"
+            )
+        for name, value in (
+            ("acquisition.calibrated_energy.low_softness_ha", cal_energy.low_softness_ha),
+            ("acquisition.calibrated_energy.high_softness_ha", cal_energy.high_softness_ha),
+        ):
+            if value is not None and float(value) <= 0.0:
+                raise ConfigValidationError(name + " must be > 0")
+
+        fullspace = self.acquisition.fullspace_confinement
+        if not isinstance(fullspace.enabled, bool):
+            raise ConfigValidationError(
+                "acquisition.fullspace_confinement.enabled must be a boolean"
+            )
+        if fullspace.residual_scale not in VALID_FULLSPACE_RESIDUAL_SCALES:
+            raise ConfigValidationError(
+                "acquisition.fullspace_confinement.residual_scale must be one of "
+                + repr(sorted(VALID_FULLSPACE_RESIDUAL_SCALES))
+            )
+        for name, value in (
+            ("acquisition.fullspace_confinement.lambda_residual", fullspace.lambda_residual),
+            ("acquisition.fullspace_confinement.lambda_rmsd", fullspace.lambda_rmsd),
+            ("acquisition.fullspace_confinement.fixed_residual_scale_ang", fullspace.fixed_residual_scale_ang),
+            ("acquisition.fullspace_confinement.rmsd_scale_ang", fullspace.rmsd_scale_ang),
+            ("acquisition.fullspace_confinement.min_residual_scale_ang", fullspace.min_residual_scale_ang),
+            ("acquisition.fullspace_confinement.failure_penalty", fullspace.failure_penalty),
+        ):
+            _validate_optional_nonnegative_float(name, value)
+        if fullspace.rmsd_scale_ang <= 0.0:
+            raise ConfigValidationError(
+                "acquisition.fullspace_confinement.rmsd_scale_ang must be > 0"
+            )
+        if (
+            fullspace.residual_scale == "fixed"
+            and fullspace.fixed_residual_scale_ang is None
+        ):
+            raise ConfigValidationError(
+                "acquisition.fullspace_confinement.fixed_residual_scale_ang is required when residual_scale='fixed'"
+            )
+        if (
+            fullspace.fixed_residual_scale_ang is not None
+            and float(fullspace.fixed_residual_scale_ang) <= 0.0
+        ):
+            raise ConfigValidationError(
+                "acquisition.fullspace_confinement.fixed_residual_scale_ang must be > 0"
+            )
+        if float(fullspace.min_residual_scale_ang) <= 0.0:
+            raise ConfigValidationError(
+                "acquisition.fullspace_confinement.min_residual_scale_ang must be > 0"
+            )
+        if float(fullspace.failure_penalty) <= 0.0:
+            raise ConfigValidationError(
+                "acquisition.fullspace_confinement.failure_penalty must be > 0"
+            )
+        stencils = self.acquisition.stencils
+        if stencils.negative_curvature_policy not in VALID_NEGATIVE_CURVATURE_POLICIES:
+            raise ConfigValidationError(
+                "acquisition.stencils.negative_curvature_policy must be one of "
+                + repr(sorted(VALID_NEGATIVE_CURVATURE_POLICIES))
+            )
+        _validate_optional_nonnegative_float(
+            "acquisition.stencils.lambda_negative_curvature",
+            stencils.lambda_negative_curvature,
+        )
+        if self.gaussian.memory_mode == "link0" and str(self.resources.mem_per_cpu) != "auto":
+            gaussian_mem_mib = _memory_mebibytes("gaussian.mem", self.gaussian.mem, gaussian=True)
+            slurm_mem_mib = _memory_mebibytes(
+                "resources.mem_per_cpu", self.resources.mem_per_cpu, gaussian=False
+            ) * float(self.gaussian.nproc)
+            limit_mib = float(self.gaussian.memory_fraction_of_slurm) * slurm_mem_mib
+            if gaussian_mem_mib > limit_mib:
+                raise ConfigValidationError(
+                    "gaussian.mem ("
+                    + str(self.gaussian.mem)
+                    + ") exceeds "
+                    + str(self.gaussian.memory_fraction_of_slurm)
+                    + " of the Gaussian Slurm allocation resources.mem_per_cpu * gaussian.nproc ("
+                    + str(self.resources.mem_per_cpu)
+                    + " * "
+                    + str(self.gaussian.nproc)
+                    + ")"
+                )
 
     def effective_max_acquisition_grad_per_ang(self) -> float:
         if self.max_acquisition_grad_per_ang is not None:
@@ -1000,8 +1267,11 @@ class CampaignConfig:
         from ichor.core.adversarial.config import (
             AcquisitionConfig,
             BarrierConfig,
+            CalibratedEnergyConfig,
+            FullspaceConfinementConfig,
             GradientConfig,
             ReferenceScaleConfig,
+            SpectralConfig,
             StencilConfig,
             SubspaceConfig,
             WeightConfig,
@@ -1010,6 +1280,9 @@ class CampaignConfig:
         ba = self.acquisition.barrier
         st = self.acquisition.stencils
         we = self.acquisition.weights
+        sp = self.acquisition.spectral
+        ce = self.acquisition.calibrated_energy
+        fs = self.acquisition.fullspace_confinement
         gr = self.acquisition.gradient
         re = self.acquisition.references
         return AcquisitionConfig(
@@ -1057,6 +1330,8 @@ class CampaignConfig:
                 curvature_floor=st.curvature_floor,
                 softplus_scale=st.softplus_scale,
                 autotune_from_cubic=st.autotune_from_cubic,
+                negative_curvature_policy=st.negative_curvature_policy,
+                lambda_negative_curvature=st.lambda_negative_curvature,
             ),
             weights=WeightConfig(
                 lambda_force=we.lambda_force,
@@ -1064,6 +1339,33 @@ class CampaignConfig:
                 lambda_anharmonic=we.lambda_anharmonic,
                 lambda_energy=we.lambda_energy,
                 lambda_distance=we.lambda_distance,
+            ),
+            spectral=SpectralConfig(
+                enabled=sp.enabled,
+                mode=sp.mode,
+                mode_weighting=sp.mode_weighting,
+                lambda_spectral=sp.lambda_spectral,
+                omega_floor=sp.omega_floor,
+                low_frequency_power=sp.low_frequency_power,
+                max_modes=sp.max_modes,
+            ),
+            calibrated_energy=CalibratedEnergyConfig(
+                utility=ce.utility,
+                band_low_ha=ce.band_low_ha,
+                band_high_ha=ce.band_high_ha,
+                low_softness_ha=ce.low_softness_ha,
+                high_softness_ha=ce.high_softness_ha,
+                fallback_to_raw_variance=ce.fallback_to_raw_variance,
+            ),
+            fullspace_confinement=FullspaceConfinementConfig(
+                enabled=fs.enabled,
+                lambda_residual=fs.lambda_residual,
+                lambda_rmsd=fs.lambda_rmsd,
+                residual_scale=fs.residual_scale,
+                fixed_residual_scale_ang=fs.fixed_residual_scale_ang,
+                rmsd_scale_ang=fs.rmsd_scale_ang,
+                min_residual_scale_ang=fs.min_residual_scale_ang,
+                failure_penalty=fs.failure_penalty,
             ),
             gradient=GradientConfig(
                 mode=gr.mode,

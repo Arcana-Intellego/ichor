@@ -150,6 +150,16 @@ class TotalEnergyPosterior:
         self._cache_set(self._mean_cache, key, total)
         return total
 
+    @staticmethod
+    def _atom_type_from_input(x: GeometryInput, atom: str) -> str:
+        if isinstance(x, Atoms):
+            try:
+                return str(x[atom].type)
+            except Exception:
+                pass
+        stripped = "".join(ch for ch in str(atom) if not ch.isdigit())
+        return stripped or str(atom)
+
     def covariance(self, x1: GeometryInput, x2: GeometryInput) -> float:
         key1 = self._geometry_key(x1)
         key2 = self._geometry_key(x2)
@@ -171,6 +181,62 @@ class TotalEnergyPosterior:
 
     def variance(self, x: GeometryInput) -> float:
         return float(_check_variance_array([self.covariance(x, x)], "posterior variance")[0])
+
+    def variance_components(self, x: GeometryInput) -> Tuple[float, Dict[str, float]]:
+        """Return total predictive variance plus the per-atom contributions.
+
+        This is the same calculation as ``variance(x)`` but exposes the
+        atom-level diagonal terms so daemon-side error calibration can map
+        per-atom realised IQA errors back to the uncertainty signal that
+        selected the point. No extra model evaluations are performed by callers
+        that only need the total.
+        """
+        features = self._features(x)
+        per_atom: Dict[str, float] = {}
+        total = 0.0
+        for atom, model in self._property_models.items():
+            value = float(
+                model_posterior_covariance(
+                    model,
+                    features[atom],
+                    features[atom],
+                    scaled=self.scaled,
+                )[0, 0]
+            )
+            per_atom[str(atom)] = value
+            total += value
+        return (
+            float(_check_variance_array([total], "posterior variance")[0]),
+            {
+                atom: float(_check_variance_array([value], "atom posterior variance")[0])
+                for atom, value in per_atom.items()
+            },
+        )
+
+    def atom_diagnostics(self, x: GeometryInput) -> Dict[str, Dict[str, float]]:
+        """Per-atom prediction and uncertainty diagnostics for one geometry."""
+        features = self._features(x)
+        out: Dict[str, Dict[str, float]] = {}
+        for atom, model in self._property_models.items():
+            prediction = float(
+                np.asarray(model.predict(features[atom]), dtype=float).reshape(-1)[0]
+            )
+            variance = float(
+                model_posterior_covariance(
+                    model,
+                    features[atom],
+                    features[atom],
+                    scaled=self.scaled,
+                )[0, 0]
+            )
+            _check_finite_array([prediction], "atom prediction")
+            _check_variance_array([variance], "atom posterior variance")
+            out[str(atom)] = {
+                "predicted_iqa_ha": prediction,
+                "raw_variance": variance,
+                "atom_type": self._atom_type_from_input(x, str(atom)),
+            }
+        return out
 
     def variances(
         self,
@@ -231,6 +297,42 @@ class TotalEnergyPosterior:
                 cov[i, j] = value
                 cov[j, i] = value
         return cov
+
+    def cross_covariances(
+        self,
+        left: Sequence[GeometryInput],
+        right: Sequence[GeometryInput],
+        *,
+        chunk_size: Optional[int] = None,
+    ) -> np.ndarray:
+        """Posterior covariance between two geometry lists.
+
+        This is intentionally rectangular. Seed selection uses it for
+        candidate-vs-selected D-optimal gains without materialising an N x N
+        covariance matrix for the whole trajectory pool.
+        """
+        n_left = len(left)
+        n_right = len(right)
+        if n_left == 0 or n_right == 0:
+            return np.zeros((n_left, n_right), dtype=float)
+        if chunk_size is not None and int(chunk_size) > 0 and n_left > int(chunk_size):
+            chunks = [
+                self.cross_covariances(
+                    left[i:i + int(chunk_size)],
+                    right,
+                    chunk_size=None,
+                )
+                for i in range(0, n_left, int(chunk_size))
+            ]
+            return _check_finite_array(
+                np.vstack(chunks) if chunks else np.zeros((0, n_right), dtype=float),
+                "posterior cross-covariances",
+            )
+        cov = np.zeros((n_left, n_right), dtype=float)
+        for i, x_left in enumerate(left):
+            for j, x_right in enumerate(right):
+                cov[i, j] = self.covariance(x_left, x_right)
+        return _check_finite_array(cov, "posterior cross-covariances")
 
     def means(self, points: Sequence[GeometryInput]) -> np.ndarray:
         return np.array([self.mean(point) for point in points], dtype=float)

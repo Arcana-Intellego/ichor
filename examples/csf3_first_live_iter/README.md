@@ -97,9 +97,16 @@ in the venv and under `$HOME/opt`; no binaries are committed to this repo.
 ```yaml
 csf3:
   hpc:
+    scheduler: slurm
     jobscript_shebang: "#!/bin/bash --login"
     max_array_task_id: 25000
     memory_per_core_gb: 8
+    memory_per_core_gb_by_partition:
+      multicore: 8
+      interactive: 8
+      serial: 5
+      multicore_small: 5
+      himem: 32
     parallel_environments:
       serial: [1, 1]
       multicore: [2, 168]
@@ -134,6 +141,14 @@ csf3:
       modules: []
 ```
 
+The active-learning daemon defaults to `resources.mem_per_cpu: auto`. On CSF3
+that resolves from `hpc.memory_per_core_gb_by_partition`: the AMD `multicore`
+and `interactive` partitions use 8G/core, the lower-memory Intel
+`serial`/`multicore_small` partitions use 5G/core, and `himem` is available for
+larger memory jobs. Gaussian live jobs use Slurm-provided memory through
+`GAUSS_PDEF` and `GAUSS_MDEF` by default; only legacy `gaussian.memory_mode:
+link0` writes `%NProcShared` and `%mem` into `.gjf` files.
+
 ## 6. Preflight and launch
 
 ```bash
@@ -147,5 +162,6 @@ ichor-al-daemon start --live --campaign-dir . --max-ticks 200
 ```
 
 The generated Gaussian scripts should use `#!/bin/bash --login`, the CSF3
-Gaussian module, `GAUSS_SCRDIR`, and `GAUSS_PDEF`. The generated FEREBUS script
-should come from pyferebus with `platform="CSF3"` and the configured executable.
+Gaussian module, `GAUSS_SCRDIR`, `GAUSS_PDEF`, and `GAUSS_MDEF`. The generated
+FEREBUS script should come from pyferebus with `platform="CSF3"` and the
+configured executable.

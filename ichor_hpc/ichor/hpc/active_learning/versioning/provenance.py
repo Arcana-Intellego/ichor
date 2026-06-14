@@ -110,6 +110,7 @@ __all__ = [
     "enrich_with_ariadne",
     "enrich_with_phase_b",
     "enrich_with_anti_overlap",
+    "enrich_with_error_calibration_input",
     "read_provenance",
     "ensure_index",
     "append_to_index",
@@ -185,6 +186,7 @@ def write_seed_provenance(
         },
         "ariadne": None,
         "anti_overlap": None,
+        "error_calibration_input": None,
         "phase_b": None,
     }
     p = _provenance_path(pointdir)
@@ -279,6 +281,14 @@ def enrich_with_anti_overlap(
         "flag": (None if flag is None else str(flag)),
     }
     return _merge_section(pointdir, "anti_overlap", payload)
+
+
+def enrich_with_error_calibration_input(
+    pointdir: Union[str, Path],
+    payload: Dict[str, Any],
+) -> Path:
+    """Append selected-landing prediction diagnostics for later calibration."""
+    return _merge_section(pointdir, "error_calibration_input", dict(payload))
 
 
 def enrich_with_phase_b(

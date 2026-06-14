@@ -93,6 +93,8 @@ KNOWN_EVENT_TYPES = (
     "models_committed",
     "ariadne_landing_rejected",
     "ariadne_landing_summary",
+    "error_calibration_summary",
+    "error_calibration_failed",
 )
 
 
@@ -211,7 +213,6 @@ def read_events(
         if since is not None and str(record.get("ts", "")) < since:
             continue
         yield record
-
 
 
 

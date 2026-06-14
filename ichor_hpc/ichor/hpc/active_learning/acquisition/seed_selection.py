@@ -1,10 +1,10 @@
 """Seed selection for the adversarial attack phase.
 
-Half of the seeds are sampled uniformly at random from the current training
-set; the other half are chosen as the top variance points by
-posterior.variance(x) on the current GP model. The split mirrors the
-explore-vs-exploit decomposition of expected information gain (random covers
-the bulk of the support; variance-weighted concentrates on weak regions).
+By default, part of the batch is sampled uniformly at random from the current
+training set and the remainder is chosen by top posterior variance. Operators
+can opt into a cheap D-optimal mode for the non-random part: it still starts
+from high-variance candidates, but greedily avoids points that are redundant
+with seeds already selected in model-posterior covariance space.
 
 Current wiring: callers may pass "training_frame_ids" (parallel to
 "training_atoms") that label each training point with its stable trajectory
@@ -17,7 +17,7 @@ pointdir.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import FrozenSet, List, Optional, Sequence
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -27,10 +27,22 @@ from ichor.core.atoms import Atoms
 __all__ = ["SeedSelection", "select_seeds"]
 
 
+VALID_STRATEGIES = frozenset({"hybrid_variance", "d_optimal"})
+
+
 def _finite_variances(values, *, context: str) -> np.ndarray:
     arr = np.asarray(values, dtype=float)
     if not np.all(np.isfinite(arr)):
         raise ValueError(context + " contains non-finite posterior variance")
+    return arr
+
+
+def _finite_matrix(values, *, context: str) -> np.ndarray:
+    arr = np.asarray(values, dtype=float)
+    if arr.ndim != 2:
+        raise ValueError(context + " must be a 2D covariance matrix")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(context + " contains non-finite posterior covariance")
     return arr
 
 
@@ -49,6 +61,197 @@ def _posterior_variances(posterior, points, *, chunk_size: Optional[int]):
         return posterior.variances(points)
 
 
+def _posterior_cross_covariances(
+    posterior,
+    left_points,
+    right_points,
+    *,
+    chunk_size: Optional[int],
+) -> np.ndarray:
+    """Return covariance(left, right) without asking for a full pool matrix."""
+    n_left = len(left_points)
+    n_right = len(right_points)
+    if n_left == 0 or n_right == 0:
+        return np.zeros((n_left, n_right), dtype=float)
+    if hasattr(posterior, "cross_covariances"):
+        try:
+            return _finite_matrix(
+                posterior.cross_covariances(
+                    left_points,
+                    right_points,
+                    chunk_size=chunk_size,
+                ),
+                context="D-optimal posterior cross-covariance",
+            )
+        except TypeError as exc:
+            if "chunk_size" not in str(exc):
+                raise
+            return _finite_matrix(
+                posterior.cross_covariances(left_points, right_points),
+                context="D-optimal posterior cross-covariance",
+            )
+    if not hasattr(posterior, "covariance"):
+        raise ValueError(
+            "d_optimal seed_selection.strategy requires posterior.covariance "
+            "or posterior.cross_covariances"
+        )
+    cov = np.zeros((n_left, n_right), dtype=float)
+    for i, left in enumerate(left_points):
+        for j, right in enumerate(right_points):
+            cov[i, j] = float(posterior.covariance(left, right))
+    return _finite_matrix(cov, context="D-optimal posterior cross-covariance")
+
+
+def _d_optimal_select(
+    *,
+    training_atoms: Sequence[Atoms],
+    posterior,
+    remaining_indices: Sequence[int],
+    remaining_variances: np.ndarray,
+    remaining_scores: np.ndarray,
+    selected_context: Sequence[int],
+    n_select: int,
+    pool_multiplier: int,
+    jitter: float,
+    novelty_floor: float,
+    score_power: float,
+    variance_chunk_size: Optional[int],
+) -> Tuple[List[int], List[Dict[str, Any]], Dict[str, Any]]:
+    """Greedy D-optimal pick from a bounded high-variance candidate pool."""
+    if n_select <= 0 or not remaining_indices:
+        return [], [], {
+            "prefilter_pool_size": 0,
+            "d_optimal_requested": int(max(0, n_select)),
+            "d_optimal_selected": 0,
+        }
+    n_pool = min(
+        len(remaining_indices),
+        max(int(n_select), int(n_select) * int(pool_multiplier)),
+    )
+    order = np.argsort(-remaining_scores, kind="stable")
+    pool_positions = [int(pos) for pos in order[:n_pool]]
+    candidate_indices = [int(remaining_indices[pos]) for pos in pool_positions]
+    candidate_vars = np.asarray(
+        [float(remaining_variances[pos]) for pos in pool_positions],
+        dtype=float,
+    )
+    candidate_scores = np.asarray(
+        [float(remaining_scores[pos]) for pos in pool_positions],
+        dtype=float,
+    )
+    candidate_rank = {
+        int(remaining_indices[int(pos)]): int(rank)
+        for rank, pos in enumerate(order)
+    }
+
+    selected = [int(i) for i in selected_context]
+    picked: List[int] = []
+    picked_diag: List[Dict[str, Any]] = []
+    floor = float(max(0.0, novelty_floor))
+    power = float(score_power)
+    eps = max(floor, 1.0e-300)
+    selected_inv: Optional[np.ndarray] = None
+    selected_diag = np.zeros(0, dtype=float)
+    k_xs = np.zeros((len(candidate_indices), 0), dtype=float)
+    if selected:
+        selected_points = [training_atoms[i] for i in selected]
+        selected_cov = _posterior_cross_covariances(
+            posterior,
+            selected_points,
+            selected_points,
+            chunk_size=variance_chunk_size,
+        )
+        selected_cov = 0.5 * (selected_cov + selected_cov.T)
+        selected_cov = selected_cov + np.eye(selected_cov.shape[0], dtype=float) * float(jitter)
+        try:
+            selected_inv = np.linalg.inv(selected_cov)
+        except np.linalg.LinAlgError as exc:
+            raise ValueError("D-optimal seed covariance inverse failed") from exc
+        selected_diag = np.maximum(np.diag(selected_cov), eps)
+        k_xs = _posterior_cross_covariances(
+            posterior,
+            [training_atoms[i] for i in candidate_indices],
+            selected_points,
+            chunk_size=variance_chunk_size,
+        )
+
+    while candidate_indices and len(picked) < int(n_select):
+        if selected_inv is not None and k_xs.shape[1] > 0:
+            solved = selected_inv @ k_xs.T
+            conditional = candidate_vars - np.einsum("ij,ji->i", k_xs, solved)
+            denom = np.sqrt(np.maximum(candidate_vars, eps)[:, None] * selected_diag[None, :])
+            max_corr = np.max(np.abs(k_xs) / denom, axis=1)
+        else:
+            conditional = np.array(candidate_vars, dtype=float)
+            max_corr = np.zeros(len(candidate_indices), dtype=float)
+
+        if not np.all(np.isfinite(conditional)):
+            raise ValueError("D-optimal conditional variance contains non-finite values")
+        if not np.all(np.isfinite(max_corr)):
+            raise ValueError("D-optimal correlation diagnostics contain non-finite values")
+
+        raw_scores = np.maximum(candidate_scores, 0.0) ** power
+        conditional_floor = np.maximum(conditional, floor)
+        gains = raw_scores * conditional_floor
+        if not np.all(np.isfinite(gains)):
+            raise ValueError("D-optimal gain contains non-finite values")
+
+        pick_pos = int(np.argmax(gains))
+        pick_index = int(candidate_indices[pick_pos])
+        pick_cov_to_selected = (
+            np.array(k_xs[pick_pos, :], dtype=float)
+            if k_xs.shape[1] > 0
+            else np.zeros(0, dtype=float)
+        )
+        pick_variance_with_jitter = float(candidate_vars[pick_pos]) + float(jitter)
+        picked.append(pick_index)
+        selected.append(pick_index)
+        picked_diag.append({
+            "selection_index": pick_index,
+            "selection_origin": "d_optimal",
+            "raw_variance": float(candidate_vars[pick_pos]),
+            "raw_score": float(candidate_scores[pick_pos]),
+            "d_optimal_conditional_variance": float(conditional_floor[pick_pos]),
+            "d_optimal_gain": float(gains[pick_pos]),
+            "d_optimal_prefilter_rank": int(candidate_rank[pick_index]),
+            "d_optimal_max_correlation_to_selected": float(max_corr[pick_pos]),
+        })
+        if selected_inv is None or selected_inv.size == 0:
+            selected_inv = np.array([[1.0 / max(pick_variance_with_jitter, eps)]], dtype=float)
+        else:
+            inv_b = selected_inv @ pick_cov_to_selected.reshape(-1, 1)
+            explained = (pick_cov_to_selected.reshape(1, -1) @ inv_b).item()
+            schur = float(pick_variance_with_jitter - float(explained))
+            schur = max(schur, float(jitter), eps)
+            top_left = selected_inv + (inv_b @ inv_b.T) / schur
+            top_right = -inv_b / schur
+            bottom = np.array([[1.0 / schur]], dtype=float)
+            selected_inv = np.block([[top_left, top_right], [top_right.T, bottom]])
+        selected_diag = np.append(selected_diag, max(pick_variance_with_jitter, eps))
+        new_col = None
+        if len(candidate_indices) > 1:
+            new_col = _posterior_cross_covariances(
+                posterior,
+                [training_atoms[i] for i in candidate_indices],
+                [training_atoms[pick_index]],
+                chunk_size=variance_chunk_size,
+            ).reshape(-1, 1)
+        del candidate_indices[pick_pos]
+        candidate_vars = np.delete(candidate_vars, pick_pos)
+        candidate_scores = np.delete(candidate_scores, pick_pos)
+        if k_xs.size:
+            k_xs = np.delete(k_xs, pick_pos, axis=0)
+        if new_col is not None:
+            new_col = np.delete(new_col, pick_pos, axis=0)
+            k_xs = np.hstack([k_xs, new_col]) if k_xs.size else new_col
+
+    return picked, picked_diag, {
+        "prefilter_pool_size": int(n_pool),
+        "d_optimal_requested": int(n_select),
+        "d_optimal_selected": int(len(picked)),
+    }
+
+
 @dataclass(frozen=True)
 class SeedSelection:
     """Structured result of `select_seeds`."""
@@ -60,6 +263,9 @@ class SeedSelection:
     variances: List[float]
     frame_ids: List[Optional[int]] = field(default_factory=list)
     skipped_unknown_provenance: int = 0
+    selection_origins: List[str] = field(default_factory=list)
+    selection_diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+    diagnostics: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def n(self) -> int:
@@ -76,11 +282,19 @@ def select_seeds(
     training_frame_ids: Optional[Sequence[Optional[int]]] = None,
     forbidden_frame_ids: FrozenSet[int] = frozenset(),
     variance_chunk_size: Optional[int] = None,
+    strategy: str = "hybrid_variance",
+    d_optimal_pool_multiplier: int = 8,
+    d_optimal_jitter: float = 1.0e-12,
+    d_optimal_novelty_floor: float = 1.0e-12,
+    d_optimal_score_power: float = 1.0,
+    score_transform: Optional[Callable[[int, float], Optional[float]]] = None,
 ) -> SeedSelection:
     """Return n_seeds seeds from training_atoms.
 
-    Half (rounded) are uniform-random; the other half are the highest-variance
-    points by posterior.variance(x) among the remaining training points.
+    With the default ``hybrid_variance`` strategy, the non-random part is the
+    highest-variance points by posterior.variance(x). With ``d_optimal``, the
+    non-random part is selected greedily by posterior conditional variance
+    against the already selected batch seeds.
 
     Parameters
     ----------
@@ -113,6 +327,13 @@ def select_seeds(
     variance_chunk_size
         Optional chunk size passed to posterior.variances when the posterior
         supports that keyword.
+    strategy
+        ``hybrid_variance`` keeps the existing variance-rank path. ``d_optimal``
+        replaces only that non-random path with the greedy model-space selector.
+    score_transform
+        Optional cheap transform for D-optimal ranking/gain scores. It receives
+        ``(training_index, posterior_variance)`` and should return a finite,
+        non-negative score. ``None``/non-finite values fall back to variance.
 
     Returns
     -------
@@ -123,12 +344,23 @@ def select_seeds(
     """
     if not 0.0 <= bulk_fraction <= 1.0:
         raise ValueError(f"bulk_fraction must be in [0, 1]; got {bulk_fraction}")
+    strategy = str(strategy)
+    if strategy not in VALID_STRATEGIES:
+        raise ValueError("seed selection strategy must be one of " + repr(sorted(VALID_STRATEGIES)))
+    if int(d_optimal_pool_multiplier) <= 0:
+        raise ValueError("d_optimal_pool_multiplier must be > 0")
+    if float(d_optimal_jitter) <= 0.0:
+        raise ValueError("d_optimal_jitter must be > 0")
+    if float(d_optimal_novelty_floor) < 0.0:
+        raise ValueError("d_optimal_novelty_floor must be >= 0")
+    if float(d_optimal_score_power) < 0.0:
+        raise ValueError("d_optimal_score_power must be >= 0")
 
     n_total = len(training_atoms)
     if n_total <= 0:
         raise ValueError("training_atoms is empty")
     if n_seeds <= 0:
-        return SeedSelection([], [], [], [], [], [])
+        return SeedSelection([], [], [], [], [], [], 0, [], [], {"strategy": strategy})
 
     #build the parallel frame_ids vector. If the caller passed None, treat
     #every training row as having no frame_id (and therefore unfilterable).
@@ -156,7 +388,15 @@ def select_seeds(
     n_eligible = len(eligible)
     if n_eligible <= 0:
         #forbidden set ate every training point; return empty selection.
-        return SeedSelection([], [], [], [], [], [], skipped_unknown)
+        return SeedSelection(
+            [], [], [], [], [], [], skipped_unknown, [], [],
+            {
+                "strategy": strategy,
+                "n_total": int(n_total),
+                "n_eligible": 0,
+                "skipped_unknown_provenance": int(skipped_unknown),
+            },
+        )
 
     if n_seeds >= n_eligible:
         all_idx = list(eligible)
@@ -169,6 +409,14 @@ def select_seeds(
             float(v)
             for v in _finite_variances(raw_variances, context="seed selection")
         ]
+        diagnostics = [
+            {
+                "selection_index": int(idx),
+                "selection_origin": "bulk",
+                "raw_variance": float(var),
+            }
+            for idx, var in zip(all_idx, variances)
+        ]
         return SeedSelection(
             seeds=[training_atoms[i] for i in all_idx],
             indices=all_idx,
@@ -177,6 +425,18 @@ def select_seeds(
             variances=variances,
             frame_ids=[fids[i] for i in all_idx],
             skipped_unknown_provenance=skipped_unknown,
+            selection_origins=["bulk"] * len(all_idx),
+            selection_diagnostics=diagnostics,
+            diagnostics={
+                "strategy": strategy,
+                "n_total": int(n_total),
+                "n_eligible": int(n_eligible),
+                "n_bulk": int(len(all_idx)),
+                "n_ranked": 0,
+                "prefilter_pool_size": 0,
+                "skipped_unknown_provenance": int(skipped_unknown),
+                "d_optimal_bypassed_all_eligible_bulk": bool(strategy == "d_optimal"),
+            },
         )
 
     rng = np.random.default_rng(int(rng_seed))
@@ -204,14 +464,59 @@ def select_seeds(
         dtype=float,
     )
     remaining_vars = _finite_variances(remaining_vars, context="seed ranking")
+    remaining_scores = np.array(remaining_vars, dtype=float)
+    if score_transform is not None:
+        transformed = []
+        for idx, var in zip(remaining, remaining_vars):
+            value = score_transform(int(idx), float(var))
+            try:
+                score = float(value) if value is not None else float(var)
+            except (TypeError, ValueError):
+                score = float(var)
+            if not np.isfinite(score) or score < 0.0:
+                score = float(var)
+            transformed.append(score)
+        remaining_scores = _finite_variances(transformed, context="seed ranking score")
+    selection_diag_by_index: Dict[int, Dict[str, Any]] = {}
     if remaining:
         order = np.argsort(-remaining_vars, kind="stable")
-        variance_idx = [
-            remaining[int(order[k])]
-            for k in range(min(n_variance, len(remaining)))
-        ]
+        if strategy == "hybrid_variance":
+            variance_idx = [
+                remaining[int(order[k])]
+                for k in range(min(n_variance, len(remaining)))
+            ]
+            for rank, pos in enumerate(order):
+                idx = int(remaining[int(pos)])
+                if idx in variance_idx:
+                    selection_diag_by_index[idx] = {
+                        "selection_index": idx,
+                        "selection_origin": "variance",
+                        "raw_variance": float(remaining_vars[int(pos)]),
+                        "variance_rank": int(rank),
+                    }
+        else:
+            variance_idx, dopt_diags, dopt_summary = _d_optimal_select(
+                training_atoms=training_atoms,
+                posterior=posterior,
+                remaining_indices=remaining,
+                remaining_variances=remaining_vars,
+                remaining_scores=remaining_scores,
+                selected_context=bulk_idx,
+                n_select=min(n_variance, len(remaining)),
+                pool_multiplier=int(d_optimal_pool_multiplier),
+                jitter=float(d_optimal_jitter),
+                novelty_floor=float(d_optimal_novelty_floor),
+                score_power=float(d_optimal_score_power),
+                variance_chunk_size=variance_chunk_size,
+            )
+            selection_diag_by_index.update({int(d["selection_index"]): dict(d) for d in dopt_diags})
     else:
         variance_idx = []
+        dopt_summary = {
+            "prefilter_pool_size": 0,
+            "d_optimal_requested": int(n_variance),
+            "d_optimal_selected": 0,
+        }
 
     all_idx = bulk_idx + variance_idx
     variances = [
@@ -225,6 +530,38 @@ def select_seeds(
             context="seed selection",
         )
     ]
+    variance_by_idx = {int(idx): float(var) for idx, var in zip(all_idx, variances)}
+    selection_origins = []
+    selection_diagnostics: List[Dict[str, Any]] = []
+    for idx in all_idx:
+        if int(idx) in bulk_set:
+            origin = "bulk"
+            diag = {
+                "selection_index": int(idx),
+                "selection_origin": origin,
+                "raw_variance": float(variance_by_idx[int(idx)]),
+            }
+        else:
+            origin = "d_optimal" if strategy == "d_optimal" else "variance"
+            diag = dict(selection_diag_by_index.get(int(idx), {}))
+            diag.setdefault("selection_index", int(idx))
+            diag.setdefault("selection_origin", origin)
+            diag.setdefault("raw_variance", float(variance_by_idx[int(idx)]))
+        selection_origins.append(origin)
+        selection_diagnostics.append(diag)
+
+    summary = {
+        "strategy": strategy,
+        "n_total": int(n_total),
+        "n_eligible": int(n_eligible),
+        "n_bulk": int(len(bulk_idx)),
+        "n_ranked": int(len(variance_idx)),
+        "skipped_unknown_provenance": int(skipped_unknown),
+    }
+    if strategy == "d_optimal":
+        summary.update(dopt_summary)
+    else:
+        summary["prefilter_pool_size"] = int(len(remaining))
 
     return SeedSelection(
         seeds=[training_atoms[i] for i in all_idx],
@@ -234,4 +571,7 @@ def select_seeds(
         variances=variances,
         frame_ids=[fids[i] for i in all_idx],
         skipped_unknown_provenance=skipped_unknown,
+        selection_origins=selection_origins,
+        selection_diagnostics=selection_diagnostics,
+        diagnostics=summary,
     )

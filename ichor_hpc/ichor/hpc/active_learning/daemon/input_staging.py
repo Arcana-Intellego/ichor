@@ -338,8 +338,9 @@ def stage_gaussian_inputs(campaign_dir, config, phase_name, iteration, sample_xy
             spin_multiplicity=int(g.spin_multiplicity),
             atoms=atoms,
         )
-        gjf.set_nproc(int(g.nproc))
-        gjf.set_mem(str(g.mem))
+        if str(getattr(g, "memory_mode", "slurm_env")) == "link0":
+            gjf.set_nproc(int(g.nproc))
+            gjf.set_mem(str(g.mem))
         gjf.write()
         if phase_b_records:
             from ..versioning.provenance import PROVENANCE_FILENAME

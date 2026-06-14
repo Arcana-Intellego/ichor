@@ -35,6 +35,7 @@ def test_daemon_control_menu_items():
     texts = [it.text for it in daemon_control_menu.items]
     for expected in (
         "Show status",
+        "Show sampling protocol summary",
         "Preflight backends",
         "Import Trajectory Pool",
         "Start/Resume Daemon (Foreground)",
@@ -54,6 +55,7 @@ def test_edit_campaign_config_menu_items():
     texts = [it.text for it in edit_campaign_config_menu.items]
     for expected in (
         "Show current config",
+        "Show sampling protocol summary",
         "Load from disk",
         "Reset to defaults",
         "Validate current config",
@@ -75,6 +77,9 @@ def test_edit_campaign_config_menu_items():
         # M15 F15: blocks added in this milestone.
         "Edit acquisition.subspace",
         "Edit acquisition.weights",
+        "Edit acquisition.spectral",
+        "Edit acquisition.calibrated_energy",
+        "Edit acquisition.fullspace_confinement",
         "Edit acquisition.gradient",
         "Edit acquisition.barrier",
         "Edit acquisition.stencils",
@@ -82,6 +87,7 @@ def test_edit_campaign_config_menu_items():
         "Edit stop",
         "Edit outlier_filter",
         "Edit adversarial_safety",
+        "Edit error_calibration",
         "Edit quality_gates",
         "Edit runtime",
         "Save to disk",
@@ -163,6 +169,156 @@ def test_campaign_config_csv_and_optional_float_field_editors(monkeypatch):
     monkeypatch.setattr("builtins.input", lambda prompt: "null")
     menu._edit_field(optional_spec)
     assert menu.get_campaign_config().quality_gates.max_abs_integration_error is None
+
+
+def test_campaign_config_optional_int_field_editor(monkeypatch):
+    import importlib
+
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    cfg = CampaignConfig()
+    cfg.acquisition.spectral.max_modes = 12
+    menu._replace_campaign_config(cfg, loaded_from=None)
+
+    spectral_menu = menu._BLOCK_MENUS_BY_LABEL["Edit acquisition.spectral"]
+    optional_int_spec = next(
+        spec
+        for spec in spectral_menu.this_menu_options.fields
+        if spec.path == "acquisition.spectral.max_modes"
+    )
+
+    monkeypatch.setattr("builtins.input", lambda prompt: "")
+    menu._edit_field(optional_int_spec)
+    assert menu.get_campaign_config().acquisition.spectral.max_modes == 12
+
+    monkeypatch.setattr("builtins.input", lambda prompt: "8")
+    menu._edit_field(optional_int_spec)
+    assert menu.get_campaign_config().acquisition.spectral.max_modes == 8
+
+    monkeypatch.setattr("builtins.input", lambda prompt: "null")
+    menu._edit_field(optional_int_spec)
+    assert menu.get_campaign_config().acquisition.spectral.max_modes is None
+
+
+def test_top_three_roi_config_blocks_render_current_values():
+    import importlib
+
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    cfg = CampaignConfig()
+    cfg.seed_selection.strategy = "d_optimal"
+    cfg.error_calibration.mode = "apply_to_acquisition"
+    cfg.acquisition.spectral.max_modes = 9
+    cfg.acquisition.calibrated_energy.band_low_ha = 0.001
+    cfg.acquisition.fullspace_confinement.lambda_residual = 0.75
+    menu._replace_campaign_config(cfg, loaded_from=None)
+
+    seed_rendered = menu._BLOCK_MENUS_BY_LABEL["Edit seed_selection"].this_menu_options()
+    assert "seed_selection.strategy: d_optimal" in seed_rendered
+    assert "seed_selection.d_optimal_pool_multiplier" in seed_rendered
+    assert "seed_selection.d_optimal_score_power" in seed_rendered
+
+    calibration_rendered = menu._BLOCK_MENUS_BY_LABEL[
+        "Edit error_calibration"
+    ].this_menu_options()
+    assert "error_calibration.mode: apply_to_acquisition" in calibration_rendered
+    assert "error_calibration.apply_strength" in calibration_rendered
+
+    spectral_rendered = menu._BLOCK_MENUS_BY_LABEL[
+        "Edit acquisition.spectral"
+    ].this_menu_options()
+    assert "acquisition.spectral.max_modes: 9" in spectral_rendered
+
+    energy_rendered = menu._BLOCK_MENUS_BY_LABEL[
+        "Edit acquisition.calibrated_energy"
+    ].this_menu_options()
+    assert "acquisition.calibrated_energy.band_low_ha: 0.001" in energy_rendered
+
+    fullspace_rendered = menu._BLOCK_MENUS_BY_LABEL[
+        "Edit acquisition.fullspace_confinement"
+    ].this_menu_options()
+    assert "acquisition.fullspace_confinement.lambda_residual: 0.75" in fullspace_rendered
+
+
+def test_legacy_sequential_campaign_editors_are_neutralized():
+    import importlib
+
+    import pytest
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+
+    with pytest.raises(RuntimeError, match="Sequential campaign config editors"):
+        menu.EditCampaignConfigFunctions.edit_seed_selection()
+
+
+def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys, monkeypatch):
+    import importlib
+
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    cfg = CampaignConfig()
+    cfg.seed_selection.strategy = "d_optimal"
+    cfg.error_calibration.mode = "apply_to_acquisition"
+    cfg.error_calibration.apply_strength = 0.5
+    cfg.acquisition.spectral.mode = "blend"
+    cfg.acquisition.calibrated_energy.utility = "banded"
+    cfg.acquisition.fullspace_confinement.enabled = True
+    menu._replace_campaign_config(cfg, loaded_from=None)
+    monkeypatch.setattr(menu, "_pause", lambda: None)
+
+    menu.EditCampaignConfigFunctions.show_sampling_protocol_summary()
+
+    out = capsys.readouterr().out
+    assert "Sampling protocol summary" in out
+    assert "seed_selection.strategy: d_optimal" in out
+    assert "error_calibration.mode: apply_to_acquisition" in out
+    assert "error_calibration.apply_strength: 0.5" in out
+    assert "acquisition.spectral.mode: blend" in out
+    assert "acquisition.calibrated_energy.utility: banded" in out
+    assert "acquisition.fullspace_confinement.enabled: True" in out
+
+
+def test_daemon_control_sampling_protocol_summary_uses_saved_campaign(tmp_path, monkeypatch, capsys):
+    import importlib
+
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.daemon_control_menu"
+    )
+    cfg = CampaignConfig()
+    cfg.seed_selection.strategy = "d_optimal"
+    cfg.error_calibration.mode = "record_only"
+    cfg.acquisition.spectral.lambda_spectral = 2.5
+    cfg.to_yaml(tmp_path / "campaign.yaml")
+    set_selected_campaign_dir(tmp_path)
+    monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: "")
+
+    menu.DaemonControlFunctions.show_sampling_protocol_summary()
+
+    out = capsys.readouterr().out
+    assert "seed_selection.strategy: d_optimal" in out
+    assert "error_calibration.mode: record_only" in out
+    assert "acquisition.spectral.lambda_spectral: 2.5" in out
 
 
 def test_campaign_config_menu_covers_every_config_leaf():

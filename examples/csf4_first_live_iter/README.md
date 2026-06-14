@@ -13,23 +13,29 @@ three external packages (POLUS, pyferebus, ARIADNE) into sibling
 directories under `~/projects/` (or wherever you keep code). Adjust the
 paths as needed.
 
-## 1. ssh in and load the standard module stack
+## 1. ssh in and load the base module stack
 
 ```
 ssh csf4
 module purge
 module load python/3.11.3-gcccore-12.3.0
 module load python-bundle-pypi/2023.06-gcccore-12.3.0
-module load compilers/oneapi/2024.2.0
-module load compiler-rt tbb compiler
-module load mkl/2024.2
 module load gaussian/g16c01_em64t_detectcpu
 ```
 
-The non-Anaconda Python module is the base for the daemon venv. The Intel
-oneAPI + MKL stack is needed to build ARIADNE. Gaussian g16 is the SCF
-backend for the INITIAL_GAUSSIAN + GAUSSIAN phases. AIMAll and FEREBUS do
-not have modules; you install them yourself (see section 3).
+The non-Anaconda Python module is the base for the daemon venv. Gaussian
+g16 is the SCF backend for the INITIAL_GAUSSIAN + GAUSSIAN phases. AIMAll
+and FEREBUS do not have modules; you install them yourself (see section 3).
+
+Do not put `CC`, `CXX`, or `FC` exports in `.bashrc`, `.bash_profile`, or
+`~/ichor_config.yaml`. They are build-time compiler selectors, not runtime
+settings. ARIADNE and PLUMED can live in the same `ichor-al` venv, but they
+should not be built under the same leaked compiler environment:
+
+- ARIADNE build: Intel oneAPI (`CC=icx`, `CXX=icpx`, `FC=ifx`).
+- PLUMED Python wrapper and local PLUMED source build: GCC (`CC=gcc`,
+  `CXX=g++`).
+- Runtime: unset compiler variables; use the venv plus `PLUMED_KERNEL`.
 
 ## 2. set up the Python venv
 
@@ -50,19 +56,45 @@ pip install -e ~/projects/POLUS/polus_core_subpackage --no-deps
 # Fortran binary you place under <MACHINE>.software.ferebus in step 4)
 pip install -e ~/projects/FEREBUS_CPU/pyferebus --no-deps
 
-# ARIADNE -- a single pip install puts the oneAPI .so + Python wrapper
-# in the venv site-packages, so `import ariadne` works without any
-# PYTHONPATH games on login OR worker nodes.
+```
+
+Build ARIADNE with oneAPI, then immediately clear the compiler variables.
+A single pip install puts the ARIADNE `.so` + Python wrapper in the venv
+site-packages, so `import ariadne` works without any PYTHONPATH games on
+login OR worker nodes.
+
+```
+module load compilers/oneapi/2024.2.0
+module load compiler-rt tbb compiler
+module load mkl/2024.2
+
 cd ~/projects/ARIADNE
 python -m pip install -r requirements-build.txt
-export FC=ifx CC=icx CXX=icpx
+export CC=icx
+export CXX=icpx
+export FC=ifx
 python -m pip install . --no-build-isolation -v
+
+unset CC CXX FC F77 F90
 ```
 
 Build and install PLUMED without Conda. The Python package is only the
-wrapper; the native kernel is the compiled `libplumedKernel.so`.
+wrapper; the native kernel is the compiled `libplumedKernel.so`. Use a clean
+GCC-side compiler environment here. This avoids the common failure where pip
+tries to compile the PLUMED wrapper with a leaked `CC=icx` from the ARIADNE
+build and exits with `error: command 'icx' failed: Permission denied`.
 
 ```
+module purge
+module load python/3.11.3-gcccore-12.3.0
+module load python-bundle-pypi/2023.06-gcccore-12.3.0
+module load gaussian/g16c01_em64t_detectcpu
+
+source ~/.venv/ichor-al/bin/activate
+unset CC CXX FC F77 F90
+export CC=gcc
+export CXX=g++
+
 cd ~/projects
 tar -xf plumed-2.10.0.tgz
 cd plumed-2.10.0
@@ -73,9 +105,24 @@ cd plumed-2.10.0
 make -j 4
 make install
 
-source ~/.venv/ichor-al/bin/activate
 python -m pip install "plumed==2.10.0"
+
+unset CC CXX FC F77 F90
 export PLUMED_KERNEL=$HOME/opt/plumed-2.10.0/lib/libplumedKernel.so
+export LD_LIBRARY_PATH=$HOME/opt/plumed-2.10.0/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+```
+
+Before verification, load the ARIADNE runtime modules again. This is a
+runtime library step, not an instruction to compile anything with Intel.
+Keep the compiler variables unset.
+
+```
+module load compilers/oneapi/2024.2.0
+module load compiler-rt tbb compiler
+module load mkl/2024.2
+
+unset CC CXX FC F77 F90
+echo "CC=${CC:-<unset>} CXX=${CXX:-<unset>} FC=${FC:-<unset>}"
 ```
 
 Confirm each backend imports cleanly:
@@ -123,7 +170,13 @@ A minimal CSF4 entry that the daemon will be happy with:
 csf4:
 
   hpc:
+    scheduler: slurm
+    max_array_task_id: 25000
     memory_per_core_gb: 4
+    memory_per_core_gb_by_partition:
+      serial: 4
+      multicore: 4
+      multinode: 4
     parallel_environments:
       serial: [1, 1]
       multicore: [2, 32]
@@ -135,10 +188,12 @@ csf4:
 
     ferebus:
       executable_path: "$HOME/.local/bin/ferebus"
+      pyferebus_platform: "CSF4"
 
     gaussian:
       executable_path: "$g16root/g16/g16"
       modules: ["gaussian/g16c01_em64t_detectcpu"]
+      scratch_root: "/scratch/$USER"
 
     python:
       env_name: "ichor-al"
@@ -160,6 +215,13 @@ csf4:
 Adjust the AIMAll + FEREBUS paths to match where you actually installed
 them in step 3. The repo ships a fuller `ichor_config.yaml` at the repo
 root that you can copy + edit.
+
+The active-learning daemon defaults to `resources.mem_per_cpu: auto`. On CSF4
+that resolves to 4G/core from the profile above. Gaussian live jobs use the
+Slurm allocation via `GAUSS_PDEF` and `GAUSS_MDEF` by default, rather than
+hard-coding `%NProcShared` or `%mem` inside every `.gjf`. For a cautious first
+smoke you can also set `resources.array_concurrency_limit` in `campaign.yaml`
+to throttle large Gaussian/AIMAll arrays with Slurm's `--array=...%N` syntax.
 
 If a path is missing or points at a non-executable file, the daemon
 refuses to start with a message naming the offending key. Confirm by

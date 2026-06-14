@@ -200,7 +200,9 @@ def _optimizer_flag(opt, name: str):
 def _raise_if_init_failed(opt, label: str) -> None:
     init_ok = _optimizer_flag(opt, "init_ok")
     if init_ok is not None and not bool(init_ok):
-        reason = _optimizer_flag(opt, "init_reason")
+        reason = _optimizer_flag(opt, "last_config_error_msg")
+        if reason is None:
+            reason = _optimizer_flag(opt, "init_reason")
         if reason is None:
             reason = _optimizer_flag(opt, "init_message")
         raise RuntimeError(
@@ -215,8 +217,12 @@ def _proposal_pending(opt, status) -> bool:
     value = _optimizer_flag(opt, "proposal_pending")
     if value is not None:
         return bool(value)
-    if len(status) > 3 and isinstance(status[3], (bool, np.bool_)):
-        return bool(status[3])
+    if len(status) > 3:
+        try:
+            return bool(int(status[3]))
+        except (TypeError, ValueError):
+            if isinstance(status[3], (bool, np.bool_)):
+                return bool(status[3])
     return True
 
 
@@ -227,12 +233,20 @@ def _skip_step_after_rebuild(opt, status) -> bool:
     return False
 
 
+_TRIAL_REASON_CODES = {
+    "calc_exception": 7,
+    "calc_nonconverged": 8,
+    "py_geometry_guard": 9,
+    "calc_nonfinite_output": 10,
+}
+
+
 def _set_invalid_trial_reason(opt, reason: str) -> None:
     setter = getattr(opt, "set_invalid_trial_reason_py", None)
     if setter is None:
         return
     try:
-        setter(str(reason)[:240])
+        setter(int(_TRIAL_REASON_CODES.get(str(reason), 7)))
     except Exception:
         return
 

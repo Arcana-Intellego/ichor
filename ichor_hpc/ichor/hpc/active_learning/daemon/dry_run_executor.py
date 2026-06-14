@@ -42,6 +42,7 @@ from ..versioning.provenance import (
     append_to_index,
     enrich_with_anti_overlap,
     enrich_with_ariadne,
+    enrich_with_error_calibration_input,
     enrich_with_phase_b,
     ensure_index,
     load_recent_seed_frame_ids,
@@ -57,7 +58,7 @@ from .phase_executor import (
     PhaseResult,
     SBATCH_PHASES,
 )
-from .state import CampaignPhase
+from .state import CampaignPhase, atomic_write_json
 
 
 __all__ = [
@@ -173,7 +174,37 @@ class DryRunPhaseExecutor:
         class _UniformPosterior:
             def variance(self, _atoms):
                 return 1.0
+            def covariance(self, atoms_a, atoms_b):
+                return 1.0 if atoms_a is atoms_b else 0.0
         return _UniformPosterior()
+
+    def _seed_selection_score_transform(self):
+        """Optional calibrated score transform for D-optimal seed ranking.
+
+        This is deliberately cheap: it maps the already-computed total
+        posterior variance through the global empirical calibration table.
+        Missing, sparse, record-only, or malformed calibration falls back to
+        raw posterior variance.
+        """
+        try:
+            from .error_calibration import (
+                load_calibration_model_for_acquisition,
+                lookup_calibrated_abs_error,
+            )
+
+            model, reason = load_calibration_model_for_acquisition(
+                self.campaign_dir,
+                self.config,
+            )
+            if model is None:
+                return None, reason
+
+            def _transform(_selection_index: int, posterior_variance: float):
+                return lookup_calibrated_abs_error(model, posterior_variance)
+
+            return _transform, "loaded"
+        except Exception as exc:
+            return None, "error:" + type(exc).__name__
 
     def _inline_seed_select(self, state) -> Dict[str, Any]:
         """Current wiring: SEED_SELECT invokes :func:'select_seeds' against the
@@ -267,6 +298,10 @@ class DryRunPhaseExecutor:
         training_frame_ids = list(pool.frame_ids())
 
         posterior = self._seed_selection_posterior(state, training_atoms)
+        if str(self.config.seed_selection.strategy) == "d_optimal":
+            score_transform, score_transform_reason = self._seed_selection_score_transform()
+        else:
+            score_transform, score_transform_reason = None, "strategy_hybrid_variance"
 
         selection = select_seeds(
             training_atoms,
@@ -277,6 +312,18 @@ class DryRunPhaseExecutor:
             training_frame_ids=training_frame_ids,
             forbidden_frame_ids=forbidden,
             variance_chunk_size=int(self.config.seed_selection.variance_chunk_size),
+            strategy=str(self.config.seed_selection.strategy),
+            d_optimal_pool_multiplier=int(
+                self.config.seed_selection.d_optimal_pool_multiplier
+            ),
+            d_optimal_jitter=float(self.config.seed_selection.d_optimal_jitter),
+            d_optimal_novelty_floor=float(
+                self.config.seed_selection.d_optimal_novelty_floor
+            ),
+            d_optimal_score_power=float(
+                self.config.seed_selection.d_optimal_score_power
+            ),
+            score_transform=score_transform,
         )
         requested_n = int(self.config.seed_selection.n_seeds_per_iteration)
         if selection.n <= 0:
@@ -295,9 +342,16 @@ class DryRunPhaseExecutor:
         bulk_set = {int(i) for i in selection.bulk_indices}
         variance_set = {int(i) for i in selection.variance_indices}
         seed_records = []
+        diagnostics_by_index = {
+            int(row.get("selection_index")): dict(row)
+            for row in selection.selection_diagnostics
+            if isinstance(row, dict) and row.get("selection_index") is not None
+        }
         for seed_index, frame_id in enumerate(selection.frame_ids):
             selection_index = int(selection.indices[seed_index])
-            if selection_index in bulk_set:
+            if seed_index < len(selection.selection_origins):
+                origin = str(selection.selection_origins[seed_index])
+            elif selection_index in bulk_set:
                 origin = "bulk"
             elif selection_index in variance_set:
                 origin = "variance"
@@ -306,36 +360,84 @@ class DryRunPhaseExecutor:
             variance_value = None
             if seed_index < len(selection.variances):
                 variance_value = float(selection.variances[seed_index])
-            seed_records.append({
+            record = {
                 "seed_index": int(seed_index),
                 "frame_id": frame_id if isinstance(frame_id, int) else None,
                 "selection_index": selection_index,
                 "selection_origin": origin,
                 "variance_at_selection": variance_value,
-            })
+            }
+            diag = diagnostics_by_index.get(selection_index, {})
+            for key in (
+                "raw_variance",
+                "raw_score",
+                "d_optimal_conditional_variance",
+                "d_optimal_gain",
+                "d_optimal_prefilter_rank",
+                "d_optimal_max_correlation_to_selected",
+                "variance_rank",
+            ):
+                if key in diag:
+                    record[key] = diag[key]
+            seed_records.append(record)
 
         seeds_picked_path = iter_dir / "seeds_picked.json"
         seeds_picked_payload = {
             "schema_version": 1,
             "iteration": int(state.iteration),
+            "selection_strategy": str(self.config.seed_selection.strategy),
             "n_picked": int(selection.n),
             "frame_ids": list(selection.frame_ids),
             "indices": list(selection.indices),
             "bulk_indices": list(selection.bulk_indices),
             "variance_indices": list(selection.variance_indices),
+            "d_optimal_indices": [
+                int(rec["selection_index"])
+                for rec in seed_records
+                if rec.get("selection_origin") == "d_optimal"
+            ],
             "variances": [float(v) for v in selection.variances],
             "seed_records": seed_records,
             "forbidden_set_size": int(len(forbidden)),
             "skipped_unknown_provenance": int(selection.skipped_unknown_provenance),
+            "score_source": (
+                "error_calibration"
+                if score_transform is not None
+                else "posterior_variance"
+            ),
+            "score_source_reason": str(score_transform_reason),
             # pin the trajectory this selection was made against. frame ids are positional, so if
             # the pool ever got re-imported/swapped underneath the campaign, frame 7 would now be a
             # different geometry -- ARIADNE on the compute node cross-checks this and refuses rather
             # than silently attack the wrong point (A30).
             "trajectory_sha256": pool.sha256,
         }
-        seeds_picked_path.write_text(
-            json.dumps(seeds_picked_payload, indent=2), encoding="utf-8",
-        )
+        atomic_write_json(seeds_picked_path, seeds_picked_payload)
+        from ..handoff_manifests import write_seed_selection_diagnostics
+
+        diagnostics_payload = {
+            "iteration": int(state.iteration),
+            "strategy": str(self.config.seed_selection.strategy),
+            "requested_n": int(requested_n),
+            "n_picked": int(selection.n),
+            "n_total": int(selection.diagnostics.get("n_total", len(training_atoms))),
+            "n_eligible": int(selection.diagnostics.get("n_eligible", len(selection.indices))),
+            "n_bulk": int(len(selection.bulk_indices)),
+            "n_ranked": int(len(selection.variance_indices)),
+            "prefilter_pool_size": int(selection.diagnostics.get("prefilter_pool_size", 0)),
+            "forbidden_set_size": int(len(forbidden)),
+            "skipped_unknown_provenance": int(selection.skipped_unknown_provenance),
+            "score_source": (
+                "error_calibration"
+                if score_transform is not None
+                else "posterior_variance"
+            ),
+            "score_source_reason": str(score_transform_reason),
+            "trajectory_sha256": pool.sha256,
+            "selected": seed_records,
+            "summary": dict(selection.diagnostics),
+        }
+        seed_diag_path = write_seed_selection_diagnostics(iter_dir, diagnostics_payload)
 
         lines_out = [
             "# DRYRUN seed selection for iteration " + str(state.iteration),
@@ -349,6 +451,7 @@ class DryRunPhaseExecutor:
         seeds_path.write_text("\n".join(lines_out) + "\n", encoding="utf-8")
         self.artefact_log.append(str(seeds_path))
         self.artefact_log.append(str(seeds_picked_path))
+        self.artefact_log.append(str(seed_diag_path))
 
         append_recent_seeds(
             self.campaign_dir,
@@ -361,6 +464,13 @@ class DryRunPhaseExecutor:
             "seed_selected",
             iteration=int(state.iteration),
             pool_available=True,
+            selection_strategy=str(self.config.seed_selection.strategy),
+            score_source=(
+                "error_calibration"
+                if score_transform is not None
+                else "posterior_variance"
+            ),
+            score_source_reason=str(score_transform_reason),
             n_picked=int(selection.n),
             forbidden_set_size=int(len(forbidden)),
             skipped_unknown_provenance=int(selection.skipped_unknown_provenance),
@@ -763,7 +873,9 @@ class DryRunPhaseExecutor:
         from ichor.core.atoms import Atom, Atoms as IchorAtoms
         from ..handoff_manifests import (
             ARIADNE_RESULTS_SCHEMA_VERSION,
+            acquisition_maturity_audit_payload,
             load_seeds_picked,
+            write_acquisition_maturity_audit,
             write_ariadne_landing_audit,
             write_ariadne_results_manifest,
         )
@@ -825,6 +937,15 @@ class DryRunPhaseExecutor:
             result_payload["seed_frame_id"] = seed_frame_id
             result_payload["seed_index"] = int(k)
             result_payload["iteration"] = int(state.iteration)
+            if isinstance(result_payload.get("selection_diagnostics"), dict):
+                result_payload["selection_diagnostics"]["model_version"] = int(
+                    getattr(state, "models_version", -1)
+                )
+                result_payload["selection_diagnostics"]["seed_index"] = int(k)
+                result_payload["selection_diagnostics"]["seed_frame_id"] = seed_frame_id
+                result_payload["selection_diagnostics"]["result_json"] = str(
+                    (seed_dir / "result.json").resolve()
+                )
             landing_safety = result_payload.get("landing_safety") or {
                 "accepted": True,
                 "policy": "mock_legacy_safe",
@@ -832,13 +953,18 @@ class DryRunPhaseExecutor:
                 "record_only_reasons": ["synthetic_mock_safety_metrics"],
                 "metrics": {},
             }
-            landing_audit_records.append({
+            audit_record = {
                 "seed_index": int(k),
                 "seed_dir": str(seed_dir.resolve()),
                 "result_json": str((seed_dir / "result.json").resolve()),
                 "landing_safety": dict(landing_safety),
                 "landing_candidates": list(result_payload.get("landing_candidates") or []),
-            })
+            }
+            if isinstance(result_payload.get("selection_diagnostics"), dict):
+                audit_record["selection_diagnostics"] = dict(
+                    result_payload["selection_diagnostics"]
+                )
+            landing_audit_records.append(audit_record)
             (seed_dir / "result.json").write_text(
                 json.dumps(result_payload, indent=2), encoding="utf-8",
             )
@@ -867,6 +993,11 @@ class DryRunPhaseExecutor:
                 wall_seconds=float(getattr(result, "wall_seconds", 0.0) or 0.0),
                 return_code=int(getattr(result, "return_code", 0) or 0),
             )
+            if isinstance(result_payload.get("selection_diagnostics"), dict):
+                enrich_with_error_calibration_input(
+                    seed_dir,
+                    dict(result_payload["selection_diagnostics"]),
+                )
             #synthesise a placeholder whitened distance from the
             # alpha change during ARIADNE descent; threshold against the
             # trust-region bounds. Live executor swaps in the real metric.
@@ -913,6 +1044,11 @@ class DryRunPhaseExecutor:
                 "whitened_distance_final": d_w,
                 "landing_safety": dict(landing_safety),
                 "landing_policy": str(landing_safety.get("policy", "unknown")),
+                "selection_diagnostics": (
+                    dict(result_payload["selection_diagnostics"])
+                    if isinstance(result_payload.get("selection_diagnostics"), dict)
+                    else None
+                ),
                 "return_code": int(getattr(result, "return_code", 0) or 0),
             })
         policies = {}
@@ -933,6 +1069,14 @@ class DryRunPhaseExecutor:
             "seeds": landing_audit_records,
         })
         self.artefact_log.append(str(audit_path))
+        maturity_path = write_acquisition_maturity_audit(
+            iter_dir,
+            acquisition_maturity_audit_payload(
+                iteration=int(state.iteration),
+                seed_records=landing_audit_records,
+            ),
+        )
+        self.artefact_log.append(str(maturity_path))
         manifest_path = write_ariadne_results_manifest(iter_dir, {
             "schema_version": ARIADNE_RESULTS_SCHEMA_VERSION,
             "iteration": int(state.iteration),
@@ -1302,4 +1446,61 @@ class DryRunPhaseExecutor:
                 gates=getattr(self.config, "quality_gates", None),
             )
             self.artefact_log.append(str(manifest))
+            if not initial and bool(getattr(self.config.error_calibration, "enabled", True)):
+                from .error_calibration import (
+                    append_records,
+                    build_calibration_model,
+                    synthetic_dry_records,
+                    write_calibration_model,
+                    write_iteration_audit,
+                )
+
+                synthetic = synthetic_dry_records(
+                    iteration=int(state.iteration),
+                    models_version=int(getattr(state, "models_version", -1)),
+                    n_points=n_points,
+                )
+                all_records, added, duplicate = append_records(
+                    self.campaign_dir,
+                    synthetic,
+                )
+                model = build_calibration_model(
+                    all_records,
+                    self.config,
+                    iteration=int(state.iteration),
+                    current_model_version=int(getattr(state, "models_version", -1)),
+                )
+                model_path = write_calibration_model(self.campaign_dir, model)
+                iter_dir = self._iter_dir(state.iteration)
+                audit_path = write_iteration_audit(
+                    iter_dir,
+                    {
+                        "iteration": int(state.iteration),
+                        "enabled": True,
+                        "mode": str(self.config.error_calibration.mode),
+                        "n_new_records": int(len(synthetic)),
+                        "n_added_records": int(added),
+                        "n_duplicate_records": int(duplicate),
+                        "n_total_records": int(len(all_records)),
+                        "n_usable_records": int(model.get("n_records", 0)),
+                        "n_usable_total_records": int(model.get("n_total_error_records", 0)),
+                        "usable_for_acquisition": bool(
+                            model.get("usable_for_acquisition", False)
+                        ),
+                        "model": str(model_path.resolve()),
+                        "skipped": {},
+                    },
+                )
+                self.artefact_log.append(str(audit_path))
+                self.artefact_log.append(str(model_path))
+                self._journal_event(
+                    "error_calibration_summary",
+                    phase="AIMALL",
+                    iteration=int(state.iteration),
+                    n_added_records=int(added),
+                    n_total_records=int(len(all_records)),
+                    usable_for_acquisition=bool(
+                        model.get("usable_for_acquisition", False)
+                    ),
+                )
         return {}

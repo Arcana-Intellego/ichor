@@ -201,6 +201,7 @@ def test_build_sbatch_script_renders_gaussian_block():
     assert "set -euo pipefail" in body
     assert "export LC_ALL=C" in body
     assert "export LC_NUMERIC=C" in body
+    assert "export GAUSS_MDEF=" in body
 
 
 def test_build_sbatch_script_uses_strict_daemon_module_loads(monkeypatch):
@@ -326,7 +327,10 @@ def test_csf3_profile_accepts_empty_python_modules_and_uses_runtime_modules(monk
         monkeypatch,
         {
             "csf3": {
-                "hpc": {"jobscript_shebang": "#!/bin/bash --login"},
+                "hpc": {
+                    "jobscript_shebang": "#!/bin/bash --login",
+                    "memory_per_core_gb_by_partition": {"multicore": 8},
+                },
                 "software": {
                     "python": {
                         "modules": [],
@@ -357,7 +361,7 @@ def test_csf3_profile_accepts_empty_python_modules_and_uses_runtime_modules(monk
     assert "module load compilers/intel/oneapi/2025.0.1" in body
     assert "module load umf compiler-rt tbb compiler" in body
     assert "module load mkl/2025.0" in body
-    assert ".venv/ichor-al-csf3/bin/python" in body
+    assert "$HOME/.venv/ichor-al-csf3/bin/python" in body
 
 
 def test_csf3_gaussian_block_uses_configured_module_path_and_scratch(monkeypatch):
@@ -365,7 +369,10 @@ def test_csf3_gaussian_block_uses_configured_module_path_and_scratch(monkeypatch
         monkeypatch,
         {
             "csf3": {
-                "hpc": {"jobscript_shebang": "#!/bin/bash --login"},
+                "hpc": {
+                    "jobscript_shebang": "#!/bin/bash --login",
+                    "memory_per_core_gb_by_partition": {"multicore": 8},
+                },
                 "software": {
                     "gaussian": {
                         "modules": ["apps/binapps/gaussian/g16c01_em64t_detectcpu"],
@@ -390,6 +397,69 @@ def test_csf3_gaussian_block_uses_configured_module_path_and_scratch(monkeypatch
     assert "export GAUSS_SCRATCH_ROOT=/scratch/$USER" in body
     assert 'export GAUSS_SCRDIR="${GAUSS_SCRATCH_ROOT%/}/ichor_gaussian_${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"' in body
     assert 'export GAUSS_PDEF="${SLURM_CPUS_PER_TASK:-1}"' in body
+    assert "export GAUSS_MDEF=6GB" in body
+
+
+def test_profile_memory_auto_resolves_csf4_partition_cap(monkeypatch):
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf4": {
+                "hpc": {
+                    "memory_per_core_gb_by_partition": {"multicore": 4},
+                }
+            }
+        },
+        "csf4",
+    )
+    cfg = CampaignConfig()
+    cfg.gaussian.nproc = 2
+    body = build_sbatch_script(
+        phase_name="INITIAL_GAUSSIAN",
+        iteration=0,
+        campaign_dir=Path("/scratch/campaign"),
+        config=cfg,
+        array_size=1,
+    )
+    assert "#SBATCH --mem-per-cpu=4G" in body
+    assert "#SBATCH --cpus-per-task=2" in body
+    assert "export GAUSS_MDEF=6GB" in body
+
+
+def test_explicit_memory_above_profile_cap_fails_before_sbatch(monkeypatch):
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf4": {
+                "hpc": {
+                    "memory_per_core_gb_by_partition": {"multicore": 4},
+                }
+            }
+        },
+        "csf4",
+    )
+    cfg = CampaignConfig()
+    cfg.resources.mem_per_cpu = "8G"
+    with pytest.raises(BackendSubmissionError, match="exceeds configured profile memory cap"):
+        build_sbatch_script(
+            phase_name="PHASE_A_POLUS",
+            iteration=0,
+            campaign_dir=Path("/scratch/campaign"),
+            config=cfg,
+        )
+
+
+def test_array_concurrency_limit_renders_slurm_percent_throttle():
+    cfg = CampaignConfig()
+    cfg.resources.array_concurrency_limit = 7
+    body = build_sbatch_script(
+        phase_name="ARIADNE_ARRAY",
+        iteration=0,
+        campaign_dir=Path("/scratch/campaign"),
+        config=cfg,
+        array_size=20,
+    )
+    assert "#SBATCH --array=0-19%7" in body
 
 
 def test_configured_array_task_limit_rejects_too_large_array(monkeypatch):
