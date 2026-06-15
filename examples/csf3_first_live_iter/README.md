@@ -82,15 +82,16 @@ module purge
 module load compilers/intel/oneapi/2025.0.1
 module load umf compiler-rt tbb compiler
 module load mkl/2025.0
+which icx icpx ifx
 
 source ~/.venv/ichor-csf3/bin/activate
 export LD_LIBRARY_PATH=$HOME/opt/python-3.11.15/lib:$LD_LIBRARY_PATH
 
 cd ~/projects/ARIADNE
 python -m pip install -r requirements-build.txt
-export CC=icx
-export CXX=icpx
-export FC=ifx
+export CC="$(command -v icx)"
+export CXX="$(command -v icpx)"
+export FC="$(command -v ifx)"
 python -m pip install . --no-build-isolation -v
 unset CC CXX FC F77 F90
 ```

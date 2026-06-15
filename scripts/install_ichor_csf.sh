@@ -178,6 +178,26 @@ require_cmd() {
     fi
 }
 
+resolve_required_cmd() {
+    local cmd="$1"
+    local hint="${2:-}"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "+ resolve command ${cmd}" >&2
+        printf '<resolved:%s>\n' "${cmd}"
+        return 0
+    fi
+
+    local resolved
+    resolved="$(command -v "${cmd}" || true)"
+    if [[ -z "${resolved}" ]]; then
+        if [[ -n "${hint}" ]]; then
+            die "required command '${cmd}' is not on PATH. ${hint}"
+        fi
+        die "required command '${cmd}' is not on PATH"
+    fi
+    printf '%s\n' "${resolved}"
+}
+
 initialise_modules() {
     if command -v module >/dev/null 2>&1; then
         return 0
@@ -332,6 +352,9 @@ load_ariadne_modules() {
         module_cmd load compiler-rt tbb compiler
         module_cmd load mkl/2024.2
     fi
+    require_cmd icx "ARIADNE requires the Intel oneAPI C compiler. Run 'module list' and check the oneAPI compiler module."
+    require_cmd icpx "ARIADNE requires the Intel oneAPI C++ compiler. Run 'module list' and check the oneAPI compiler module."
+    require_cmd ifx "ARIADNE requires the Intel oneAPI Fortran compiler. Run 'module list' and check the oneAPI compiler module."
 }
 
 load_gcc_build_modules() {
@@ -493,12 +516,12 @@ install_ariadne_if_needed() {
     local ariadne_root="${PROJECTS_DIR}/ARIADNE"
     require_dir "${ariadne_root}" "ARIADNE source tree"
     pip_install -r "${ariadne_root}/requirements-build.txt"
-    export CC=icx
-    export CXX=icpx
-    export FC=ifx
+    export CC="$(resolve_required_cmd icx "ARIADNE requires the Intel oneAPI C compiler.")"
+    export CXX="$(resolve_required_cmd icpx "ARIADNE requires the Intel oneAPI C++ compiler.")"
+    export FC="$(resolve_required_cmd ifx "ARIADNE requires the Intel oneAPI Fortran compiler.")"
     export CMAKE_BUILD_PARALLEL_LEVEL="${INSTALL_JOBS}"
     export MAKEFLAGS="-j${INSTALL_JOBS}"
-    [[ "${DRY_RUN}" -eq 1 ]] && echo "+ export CC=icx CXX=icpx FC=ifx CMAKE_BUILD_PARALLEL_LEVEL=${INSTALL_JOBS} MAKEFLAGS=-j${INSTALL_JOBS}"
+    [[ "${DRY_RUN}" -eq 1 ]] && echo "+ export CC=${CC} CXX=${CXX} FC=${FC} CMAKE_BUILD_PARALLEL_LEVEL=${INSTALL_JOBS} MAKEFLAGS=-j${INSTALL_JOBS}"
     run_shell "cd $(printf '%q' "${ariadne_root}") && $(printf '%q' "${PYTHON}") -m pip install . --no-build-isolation -v"
     unset CC CXX FC F77 F90
     unset MAKEFLAGS CMAKE_BUILD_PARALLEL_LEVEL

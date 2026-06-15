@@ -66,6 +66,14 @@ def test_install_script_is_present():
     assert "--with-openssl=" in text
     assert "--with-openssl-rpath=auto" in text
     assert "import ssl; print(ssl.OPENSSL_VERSION)" in text
+    assert "command -v \"${cmd}\"" in text
+    assert "resolve_required_cmd icx" in text
+    assert "resolve_required_cmd icpx" in text
+    assert "resolve_required_cmd ifx" in text
+    assert "export CC=icx" not in text
+    assert "unset CC CXX FC F77 F90" in text
+    assert "export CC=gcc" in text
+    assert "export CXX=g++" in text
 
 
 def test_install_script_bash_syntax():
