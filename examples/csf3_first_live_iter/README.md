@@ -28,16 +28,29 @@ on Python 3.11 because RDKit, xTB, PLUMED, f90wrap, NumPy, and ARIADNE include
 compiled components.
 
 ```bash
+module purge
+module load compilers/gcc/13.3.0
+module load tools/gcc/cmake/3.31.6
+module load libs/gcc/openssl/1.1.1w
+
 mkdir -p ~/src ~/opt
 cd ~/src
 wget https://www.python.org/ftp/python/3.11.15/Python-3.11.15.tgz
 tar -xzf Python-3.11.15.tgz
 cd Python-3.11.15
-./configure --prefix=$HOME/opt/python-3.11.15 --enable-shared --with-ensurepip=install
+
+OPENSSL_PREFIX="${EBROOTOPENSSL:-${OPENSSL_ROOT_DIR:-$(dirname "$(dirname "$(which openssl)")")}}"
+./configure \
+  --prefix=$HOME/opt/python-3.11.15 \
+  --enable-shared \
+  --with-ensurepip=install \
+  --with-openssl="$OPENSSL_PREFIX" \
+  --with-openssl-rpath=auto
 make -j 8
 make install
 
 export LD_LIBRARY_PATH=$HOME/opt/python-3.11.15/lib:$LD_LIBRARY_PATH
+$HOME/opt/python-3.11.15/bin/python3.11 -c "import ssl; print(ssl.OPENSSL_VERSION)"
 $HOME/opt/python-3.11.15/bin/python3.11 -m venv ~/.venv/ichor-csf3
 source ~/.venv/ichor-csf3/bin/activate
 python -m pip install --upgrade pip setuptools wheel
@@ -45,6 +58,8 @@ python -m pip install --upgrade pip setuptools wheel
 
 If direct download is blocked, download the tarball locally from `python.org`,
 copy it to CSF3, and build it on CSF3.
+The `import ssl` check is required: if it fails, `pip` cannot use PyPI over
+HTTPS and the Python install must be rebuilt with the OpenSSL module loaded.
 
 ## 2. Install ICHOR and sibling Python packages
 

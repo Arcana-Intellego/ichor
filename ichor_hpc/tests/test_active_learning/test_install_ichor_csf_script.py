@@ -62,6 +62,10 @@ def test_install_script_is_present():
     assert "from xtb.ase.calculator import XTB" in text
     assert "pyferebus_platform\": \"CSF3\"" in text
     assert "pyferebus_platform\": \"CSF4\"" in text
+    assert "libs/gcc/openssl/1.1.1w" in text
+    assert "--with-openssl=" in text
+    assert "--with-openssl-rpath=auto" in text
+    assert "import ssl; print(ssl.OPENSSL_VERSION)" in text
 
 
 def test_install_script_bash_syntax():

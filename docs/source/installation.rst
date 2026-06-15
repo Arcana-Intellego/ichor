@@ -81,12 +81,24 @@ Build private CPython 3.11 on CSF3 from the official source tarball:
 
 .. code-block:: text
 
+    module purge
+    module load compilers/gcc/13.3.0
+    module load tools/gcc/cmake/3.31.6
+    module load libs/gcc/openssl/1.1.1w
+
     mkdir -p ~/src ~/opt
     cd ~/src
     wget https://www.python.org/ftp/python/3.11.15/Python-3.11.15.tgz
     tar -xzf Python-3.11.15.tgz
     cd Python-3.11.15
-    ./configure --prefix=$HOME/opt/python-3.11.15 --enable-shared --with-ensurepip=install
+
+    OPENSSL_PREFIX="${EBROOTOPENSSL:-${OPENSSL_ROOT_DIR:-$(dirname "$(dirname "$(which openssl)")")}}"
+    ./configure \
+      --prefix=$HOME/opt/python-3.11.15 \
+      --enable-shared \
+      --with-ensurepip=install \
+      --with-openssl="$OPENSSL_PREFIX" \
+      --with-openssl-rpath=auto
     make -j 8
     make install
 
@@ -95,6 +107,7 @@ Then create the ICHOR venv:
 .. code-block:: text
 
     export LD_LIBRARY_PATH=$HOME/opt/python-3.11.15/lib:$LD_LIBRARY_PATH
+    $HOME/opt/python-3.11.15/bin/python3.11 -c "import ssl; print(ssl.OPENSSL_VERSION)"
     $HOME/opt/python-3.11.15/bin/python3.11 -m venv ~/.venv/ichor-csf3
     source ~/.venv/ichor-csf3/bin/activate
     python -m pip install --upgrade pip setuptools wheel
@@ -102,6 +115,8 @@ Then create the ICHOR venv:
 If CSF3 cannot download directly, download the Python tarball locally from
 ``python.org``, transfer it to ``~/src`` on CSF3, and build it there. Do not
 vendor Python into the ICHOR repository.
+The ``import ssl`` check must pass before creating the venv; otherwise ``pip``
+cannot use PyPI over HTTPS.
 
 .. warning::
 

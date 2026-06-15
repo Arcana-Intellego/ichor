@@ -347,27 +347,75 @@ load_gcc_build_modules() {
     fi
 }
 
+load_csf3_python_build_modules() {
+    load_gcc_build_modules
+    module_cmd load libs/gcc/openssl/1.1.1w
+}
+
+resolve_openssl_prefix() {
+    local prefix
+    for var_name in EBROOTOPENSSL OPENSSL_ROOT_DIR; do
+        prefix="${!var_name:-}"
+        if [[ -n "${prefix}" && -d "${prefix}" ]]; then
+            printf '%s\n' "${prefix}"
+            return 0
+        fi
+    done
+
+    local openssl_bin
+    openssl_bin="$(command -v openssl || true)"
+    if [[ -n "${openssl_bin}" ]]; then
+        prefix="$(cd "$(dirname "${openssl_bin}")/.." && pwd)"
+        if [[ -d "${prefix}/include/openssl" ]]; then
+            printf '%s\n' "${prefix}"
+            return 0
+        fi
+    fi
+
+    die "OpenSSL prefix could not be resolved. On CSF3 load libs/gcc/openssl/1.1.1w before building private Python."
+}
+
+verify_python_ssl() {
+    local python_exe="$1"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "+ ${python_exe} -c 'import ssl; print(ssl.OPENSSL_VERSION)'"
+        return 0
+    fi
+    if ! "${python_exe}" -c "import ssl; print(ssl.OPENSSL_VERSION)" >/dev/null 2>&1; then
+        die "Private Python at ${python_exe} cannot import ssl. Move aside ${PYTHON_PREFIX} and rebuild with the CSF3 OpenSSL module loaded."
+    fi
+}
+
 ensure_csf3_python() {
     if [[ "${MACHINE}" != "csf3" ]]; then
         return 0
     fi
+    load_csf3_python_build_modules
     local py="${PYTHON_PREFIX}/bin/python3.11"
     if [[ -x "${py}" ]]; then
         export LD_LIBRARY_PATH="${PYTHON_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+        verify_python_ssl "${py}"
         return 0
     fi
 
     note "Private CPython ${PYTHON_VERSION} is missing; preparing build"
-    load_gcc_build_modules
     require_cmd gcc "Load a GCC compiler module first."
     require_cmd make "Load a build tool module first."
+    require_cmd openssl "Load libs/gcc/openssl/1.1.1w first."
+    local openssl_prefix
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        openssl_prefix="\${OPENSSL_PREFIX_FROM_MODULE}"
+    else
+        openssl_prefix="$(resolve_openssl_prefix)"
+    fi
     local sources_dir="${PROJECTS_DIR}/_sources"
     local tarball="${sources_dir}/${PYTHON_TARBALL}"
     if [[ ! -f "${tarball}" ]]; then
         download_to "${PYTHON_URL}" "${tarball}"
     fi
     if [[ "${DRY_RUN}" -eq 1 ]]; then
-        echo "+ build private CPython ${PYTHON_VERSION} from ${tarball}"
+        echo "+ build private CPython ${PYTHON_VERSION} from ${tarball} with --with-openssl=${openssl_prefix}"
+        verify_python_ssl "${py}"
         export LD_LIBRARY_PATH="${PYTHON_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
         return 0
     fi
@@ -376,10 +424,11 @@ ensure_csf3_python() {
     local src_dir="${build_parent}/Python-${PYTHON_VERSION}"
     run_cmd mkdir -p "${build_parent}" "$(dirname "${PYTHON_PREFIX}")"
     run_cmd tar -xzf "${tarball}" -C "${build_parent}"
-    run_shell "cd $(printf '%q' "${src_dir}") && ./configure --prefix=$(printf '%q' "${PYTHON_PREFIX}") --enable-shared --with-ensurepip=install"
+    run_shell "cd $(printf '%q' "${src_dir}") && ./configure --prefix=$(printf '%q' "${PYTHON_PREFIX}") --enable-shared --with-ensurepip=install --with-openssl=$(printf '%q' "${openssl_prefix}") --with-openssl-rpath=auto"
     run_shell "cd $(printf '%q' "${src_dir}") && make -j $(printf '%q' "${INSTALL_JOBS}")"
     run_shell "cd $(printf '%q' "${src_dir}") && make install"
     export LD_LIBRARY_PATH="${PYTHON_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    verify_python_ssl "${py}"
 }
 
 create_or_activate_venv() {
@@ -401,6 +450,9 @@ create_or_activate_venv() {
     fi
     PYTHON="${VENV}/bin/python"
     PIP="${PYTHON} -m pip"
+    if [[ "${MACHINE}" == "csf3" ]]; then
+        verify_python_ssl "${PYTHON}"
+    fi
 }
 
 pip_install() {
