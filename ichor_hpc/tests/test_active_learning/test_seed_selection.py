@@ -346,6 +346,25 @@ def test_d_optimal_is_deterministic_and_reports_gain_diagnostics():
     assert a.diagnostics["prefilter_pool_size"] == 5
 
 
+def test_d_optimal_skips_degenerate_zero_pivot_candidate():
+    atoms = [object() for _ in range(3)]
+    posterior = _CovariancePosterior(atoms, np.diag([2.0, 1.0, 0.0]))
+
+    out = select_seeds(
+        atoms,
+        posterior,
+        n_seeds=2,
+        bulk_fraction=0.0,
+        strategy="d_optimal",
+        d_optimal_pool_multiplier=3,
+        d_optimal_score_power=0.0,
+    )
+
+    assert out.indices == [0, 1]
+    assert 2 not in out.indices
+    assert out.diagnostics["d_optimal_skipped_degenerate"] == 1
+
+
 def test_d_optimal_can_rank_by_transformed_score():
     atoms = [object() for _ in range(4)]
     posterior = _CovariancePosterior(atoms, np.diag([10.0, 9.0, 8.0, 1.0]))

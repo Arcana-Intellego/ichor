@@ -107,8 +107,26 @@ def filter_by_per_atom_rmsd_zscore(
     frame_finite = np.isfinite(coords).all(axis=(1, 2))
     if not frame_finite.any():
         return [], list(range(n))
-    mean_coords = coords[frame_finite].mean(axis=0)
-    diffs = coords - mean_coords[None, :, :]
+    from .descriptors import kabsch_align
+
+    ref_idx = int(np.where(frame_finite)[0][0])
+    reference = coords[ref_idx]
+    try:
+        masses = np.asarray(frames[ref_idx].masses, dtype=float)
+        if (
+            masses.shape[0] != natoms
+            or not np.isfinite(masses).all()
+            or float(np.sum(masses)) <= 0.0
+        ):
+            masses = None
+    except Exception:
+        masses = None
+    aligned = coords.copy()
+    for i in np.where(frame_finite)[0]:
+        aligned[int(i)] = kabsch_align(reference, coords[int(i)], weights=masses)
+
+    mean_coords = aligned[frame_finite].mean(axis=0)
+    diffs = aligned - mean_coords[None, :, :]
     per_atom_dist = np.linalg.norm(diffs, axis=2)
     good = per_atom_dist[frame_finite]
     mu = good.mean(axis=0)
@@ -162,8 +180,6 @@ def filter_initial_trajectory(
         energy_z_threshold=energy_z_threshold,
         rmsd_z_threshold=rmsd_z_threshold,
     )
-
-
 
 
 

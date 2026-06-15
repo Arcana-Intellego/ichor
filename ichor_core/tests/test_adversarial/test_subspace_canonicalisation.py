@@ -10,12 +10,17 @@ together with its eigenvalues, return a representation that is
 import numpy as np
 import pytest
 
+from ichor.core.adversarial.config import SubspaceConfig
 from ichor.core.adversarial.subspace import _canonicalise_basis
 
 
 def _orthonormalise(M):
     Q, _ = np.linalg.qr(M)
     return Q
+
+
+def test_core_subspace_config_defaults_to_canonical_basis():
+    assert SubspaceConfig().canonicalise_basis is True
 
 
 def test_canonicalise_is_idempotent():

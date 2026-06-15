@@ -10,6 +10,8 @@ from ichor.hpc.active_learning.daemon.error_calibration import (
     load_calibration_model_for_acquisition,
     load_records,
     lookup_calibrated_abs_error,
+    mark_calibration_model_stale,
+    records_path,
     synthetic_dry_records,
     update_from_aimall_acceptance,
     write_calibration_model,
@@ -78,6 +80,21 @@ def test_append_records_is_idempotent(tmp_path):
     merged, added, skipped = append_records(tmp_path, records)
     assert added == 0
     assert skipped == 2
+    assert load_records(tmp_path) == merged
+
+
+def test_append_records_quarantines_corrupt_records_file(tmp_path):
+    path = records_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text("{not json", encoding="utf-8")
+
+    merged, added, skipped = append_records(tmp_path, [_record(0)])
+
+    assert added == 1
+    assert skipped == 0
+    assert len(merged) == 1
+    quarantined = list(path.parent.glob(path.name + ".corrupt.*"))
+    assert quarantined
     assert load_records(tmp_path) == merged
 
 
@@ -165,6 +182,18 @@ def test_load_calibration_model_for_acquisition_requires_apply_mode_and_records(
     loaded, reason = load_calibration_model_for_acquisition(tmp_path, cfg)
     assert reason == "loaded"
     assert loaded["usable_for_acquisition"] is True
+
+
+def test_stale_calibration_model_is_not_loaded_for_acquisition(tmp_path):
+    cfg = CampaignConfig()
+    cfg.error_calibration.mode = "apply_to_acquisition"
+    cfg.error_calibration.apply_strength = 0.5
+
+    mark_calibration_model_stale(tmp_path, reason="build failed", iteration=3)
+    loaded, reason = load_calibration_model_for_acquisition(tmp_path, cfg)
+
+    assert loaded is None
+    assert reason == "stale_model"
 
 
 def test_update_from_aimall_acceptance_joins_provenance_and_quality(tmp_path):

@@ -26,9 +26,13 @@ Install the three packages in order::
     python3 -m pip install -e ichor_hpc
     python3 -m pip install -e ichor_cli
 
-The convenience script at the repository root wraps the same three commands::
+For a full Manchester CSF3/CSF4 live active-learning install, use the cluster
+installer. It creates the CSF-specific venv, checks sibling POLUS/FEREBUS_CPU/
+ARIADNE trees, builds ARIADNE/FEREBUS/PLUMED where needed, verifies xTB/ASE,
+and safely upserts ``~/ichor_config.yaml``::
 
-    ./install_all.sh             # macOS / Linux / WSL
+    bash scripts/install_ichor_csf.sh --machine csf4 --projects-dir ~/projects
+    bash scripts/install_ichor_csf.sh --machine csf3 --projects-dir ~/projects
 
 Run the bundled example to confirm the install works (~30 seconds on a
 laptop, no cluster required)::

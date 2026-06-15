@@ -12,6 +12,17 @@ To install ichor, simply do
 This will install all the packages in editable mode, so that any changes to the source code will
 be available to the user directly.
 
+On Manchester CSF3/CSF4, prefer the unified active-learning installer from
+the repository root. It keeps downloads opt-in, checks the sibling POLUS,
+FEREBUS_CPU, and ARIADNE trees, builds native ARIADNE/FEREBUS/PLUMED components
+where needed, verifies xTB/ASE, and updates only the active CSF profile in
+``~/ichor_config.yaml``:
+
+.. code-block:: text
+
+    bash scripts/install_ichor_csf.sh --machine csf4 --projects-dir ~/projects
+    bash scripts/install_ichor_csf.sh --machine csf3 --projects-dir ~/projects
+
 +++++++++++++++++++++++++++++++++
 Setting up ichor_config.yaml file
 +++++++++++++++++++++++++++++++++
@@ -84,8 +95,8 @@ Then create the ICHOR venv:
 .. code-block:: text
 
     export LD_LIBRARY_PATH=$HOME/opt/python-3.11.15/lib:$LD_LIBRARY_PATH
-    $HOME/opt/python-3.11.15/bin/python3.11 -m venv ~/.venv/ichor-al-csf3
-    source ~/.venv/ichor-al-csf3/bin/activate
+    $HOME/opt/python-3.11.15/bin/python3.11 -m venv ~/.venv/ichor-csf3
+    source ~/.venv/ichor-csf3/bin/activate
     python -m pip install --upgrade pip setuptools wheel
 
 If CSF3 cannot download directly, download the Python tarball locally from
@@ -160,7 +171,7 @@ Then install the Python wrapper into the active ICHOR venv:
 
 .. code-block:: text
 
-    source ~/.venv/ichor-al/bin/activate
+    source ~/.venv/ichor-csf4/bin/activate
     python -m pip install "plumed==2.10.0"
 
 If CSF4 cannot download from PyPI directly, transfer the ``plumed`` source
@@ -176,8 +187,8 @@ scripts export the same runtime state on worker nodes:
     csf4:
       software:
         python:
-          env_name: "ichor-al"
-          python_path: "~/.venv/ichor-al/bin/python"
+          env_name: "ichor-csf4"
+          python_path: "~/.venv/ichor-csf4/bin/python"
           modules: ["python/3.11.3-gcccore-12.3.0"]
 
         plumed:

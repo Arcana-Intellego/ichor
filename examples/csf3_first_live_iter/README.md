@@ -4,6 +4,23 @@ This is the CSF3 equivalent of the CSF4 live smoke. It proves one real
 active-learning iteration with Slurm, Gaussian, AIMAll, FEREBUS, ARIADNE, and
 POLUS, while keeping Python, FEREBUS, ARIADNE, and PLUMED outside the repo.
 
+Recommended install path:
+
+```bash
+cd ~/projects/ichor-active-learning
+bash scripts/install_ichor_csf.sh --machine csf3 --projects-dir ~/projects \
+    --aimall-path ~/AIMAll/aimqb.ish
+export ICHOR_MACHINE=csf3
+export LD_LIBRARY_PATH=$HOME/opt/python-3.11.15/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+source ~/.venv/ichor-csf3/bin/activate
+```
+
+The installer uses private CPython 3.11 by default, checks download access,
+prints exact staging instructions when downloads are blocked, builds ARIADNE,
+FEREBUS, and PLUMED with `--jobs 4` by default, verifies xTB/ASE, and backs up
+`~/ichor_config.yaml` before upserting the CSF3 profile. The manual sections
+below are kept as a fallback and for troubleshooting individual components.
+
 ## 1. Build private CPython 3.11
 
 CSF3 currently exposes `python/3.13.1`, but the ICHOR scientific stack is safer
@@ -21,8 +38,8 @@ make -j 8
 make install
 
 export LD_LIBRARY_PATH=$HOME/opt/python-3.11.15/lib:$LD_LIBRARY_PATH
-$HOME/opt/python-3.11.15/bin/python3.11 -m venv ~/.venv/ichor-al-csf3
-source ~/.venv/ichor-al-csf3/bin/activate
+$HOME/opt/python-3.11.15/bin/python3.11 -m venv ~/.venv/ichor-csf3
+source ~/.venv/ichor-csf3/bin/activate
 python -m pip install --upgrade pip setuptools wheel
 ```
 
@@ -32,7 +49,7 @@ copy it to CSF3, and build it on CSF3.
 ## 2. Install ICHOR and sibling Python packages
 
 ```bash
-source ~/.venv/ichor-al-csf3/bin/activate
+source ~/.venv/ichor-csf3/bin/activate
 export LD_LIBRARY_PATH=$HOME/opt/python-3.11.15/lib:$LD_LIBRARY_PATH
 
 pip install -e ~/projects/ichor-active-learning/ichor_core
@@ -51,7 +68,7 @@ module load compilers/intel/oneapi/2025.0.1
 module load umf compiler-rt tbb compiler
 module load mkl/2025.0
 
-source ~/.venv/ichor-al-csf3/bin/activate
+source ~/.venv/ichor-csf3/bin/activate
 export LD_LIBRARY_PATH=$HOME/opt/python-3.11.15/lib:$LD_LIBRARY_PATH
 
 cd ~/projects/ARIADNE
@@ -113,8 +130,8 @@ csf3:
 
   software:
     python:
-      env_name: "ichor-al-csf3"
-      python_path: "$HOME/.venv/ichor-al-csf3/bin/python"
+      env_name: "ichor-csf3"
+      python_path: "$HOME/.venv/ichor-csf3/bin/python"
       modules: []
 
     gaussian:
@@ -153,7 +170,7 @@ link0` writes `%NProcShared` and `%mem` into `.gjf` files.
 
 ```bash
 export ICHOR_MACHINE=csf3
-source ~/.venv/ichor-al-csf3/bin/activate
+source ~/.venv/ichor-csf3/bin/activate
 export LD_LIBRARY_PATH=$HOME/opt/python-3.11.15/lib:$LD_LIBRARY_PATH
 
 ichor-al-daemon preflight --campaign-dir .

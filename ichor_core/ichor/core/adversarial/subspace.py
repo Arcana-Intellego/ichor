@@ -142,7 +142,7 @@ def build_local_subspace(seed_atoms: Atoms, neighbours: Sequence[Neighbour], con
         covariance += w * np.outer(y, y)
     covariance /= weight_sum
     eigenvalues, eigenvectors = np.linalg.eigh(covariance)
-    order = np.argsort(eigenvalues)[::-1]
+    order = np.argsort(-eigenvalues, kind="stable")
     eigenvalues = eigenvalues[order]
     eigenvectors = eigenvectors[:, order]
 

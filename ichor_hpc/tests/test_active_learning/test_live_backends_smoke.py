@@ -132,6 +132,26 @@ def test_check_backends_returns_structured_result():
     assert isinstance(a.ariadne, bool)
 
 
+def test_default_profile_is_not_live_active_learning_profile(monkeypatch):
+    _install_fake_global_variables(
+        monkeypatch,
+        {"_default": {"hpc": {"scheduler": "slurm"}}},
+        "_default",
+    )
+
+    a = check_backends()
+
+    assert a.profile is False
+    assert "_default" in a.profile_error
+    with pytest.raises(BackendSubmissionError, match="_default"):
+        build_sbatch_script(
+            phase_name="PHASE_A_POLUS",
+            iteration=0,
+            campaign_dir=Path("/scratch/campaign"),
+            config=CampaignConfig(),
+        )
+
+
 def test_missing_backend_message_lists_each_missing():
     a = check_backends()
     msg = missing_backend_message(a)
@@ -202,6 +222,65 @@ def test_build_sbatch_script_renders_gaussian_block():
     assert "export LC_ALL=C" in body
     assert "export LC_NUMERIC=C" in body
     assert "export GAUSS_MDEF=" in body
+
+
+def test_link0_gaussian_memory_validates_after_auto_resolution(monkeypatch):
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf4": {
+                "hpc": {
+                    "scheduler": "slurm",
+                    "memory_per_core_gb_by_partition": {"multicore": 4},
+                }
+            }
+        },
+        "csf4",
+    )
+    cfg = CampaignConfig()
+    cfg.gaussian.memory_mode = "link0"
+    cfg.resources.mem_per_cpu = "auto"
+    cfg.resources.partition = "multicore"
+    cfg.gaussian.nproc = 1
+    cfg.gaussian.mem = "8GB"
+
+    with pytest.raises(BackendSubmissionError, match="gaussian.mem"):
+        build_sbatch_script(
+            phase_name="INITIAL_GAUSSIAN",
+            iteration=0,
+            campaign_dir=Path("/scratch/campaign"),
+            config=cfg,
+        )
+
+
+def test_slurm_env_gaussian_memory_still_uses_environment_contract(monkeypatch):
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf4": {
+                "hpc": {
+                    "scheduler": "slurm",
+                    "memory_per_core_gb_by_partition": {"multicore": 4},
+                }
+            }
+        },
+        "csf4",
+    )
+    cfg = CampaignConfig()
+    cfg.gaussian.memory_mode = "slurm_env"
+    cfg.resources.mem_per_cpu = "auto"
+    cfg.gaussian.mem = "500GB"
+
+    body = build_sbatch_script(
+        phase_name="INITIAL_GAUSSIAN",
+        iteration=0,
+        campaign_dir=Path("/scratch/campaign"),
+        config=cfg,
+    )
+
+    assert "#SBATCH --mem-per-cpu=4G" in body
+    assert "export GAUSS_MDEF=3GB" in body
+    assert "%mem" not in body.lower()
 
 
 def test_build_sbatch_script_uses_strict_daemon_module_loads(monkeypatch):

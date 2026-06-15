@@ -32,6 +32,7 @@ def format_sampling_protocol_summary(config: CampaignConfig) -> str:
     gates = config.quality_gates
     phase_b = config.phase_b
     anti = config.anti_overlap
+    runtime = config.runtime
 
     lines = ["Sampling protocol summary:\n"]
     lines.append(_line("seed_selection.strategy", seed.strategy))
@@ -123,6 +124,12 @@ def format_sampling_protocol_summary(config: CampaignConfig) -> str:
     lines.append(_line("gaussian.memory_mode", gaussian.memory_mode))
     lines.append(
         _line("gaussian.memory_fraction_of_slurm", gaussian.memory_fraction_of_slurm)
+    )
+    lines.append(
+        _line(
+            "runtime.poll_sacct_missing_max_ticks",
+            runtime.poll_sacct_missing_max_ticks,
+        )
     )
     lines.append(_line("adversarial_safety.enabled", safety.enabled))
     lines.append(

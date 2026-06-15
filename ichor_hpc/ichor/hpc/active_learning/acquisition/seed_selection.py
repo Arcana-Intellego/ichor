@@ -147,9 +147,11 @@ def _d_optimal_select(
     selected = [int(i) for i in selected_context]
     picked: List[int] = []
     picked_diag: List[Dict[str, Any]] = []
-    floor = float(max(0.0, novelty_floor))
+    gain_floor = float(max(0.0, novelty_floor))
     power = float(score_power)
-    eps = max(floor, 1.0e-300)
+    pivot_eps = max(float(jitter), 1.0e-300)
+    diag_eps = max(gain_floor, pivot_eps)
+    degenerate_candidates = set()
     selected_inv: Optional[np.ndarray] = None
     selected_diag = np.zeros(0, dtype=float)
     k_xs = np.zeros((len(candidate_indices), 0), dtype=float)
@@ -167,7 +169,7 @@ def _d_optimal_select(
             selected_inv = np.linalg.inv(selected_cov)
         except np.linalg.LinAlgError as exc:
             raise ValueError("D-optimal seed covariance inverse failed") from exc
-        selected_diag = np.maximum(np.diag(selected_cov), eps)
+        selected_diag = np.maximum(np.diag(selected_cov), diag_eps)
         k_xs = _posterior_cross_covariances(
             posterior,
             [training_atoms[i] for i in candidate_indices],
@@ -179,7 +181,7 @@ def _d_optimal_select(
         if selected_inv is not None and k_xs.shape[1] > 0:
             solved = selected_inv @ k_xs.T
             conditional = candidate_vars - np.einsum("ij,ji->i", k_xs, solved)
-            denom = np.sqrt(np.maximum(candidate_vars, eps)[:, None] * selected_diag[None, :])
+            denom = np.sqrt(np.maximum(candidate_vars, diag_eps)[:, None] * selected_diag[None, :])
             max_corr = np.max(np.abs(k_xs) / denom, axis=1)
         else:
             conditional = np.array(candidate_vars, dtype=float)
@@ -191,10 +193,16 @@ def _d_optimal_select(
             raise ValueError("D-optimal correlation diagnostics contain non-finite values")
 
         raw_scores = np.maximum(candidate_scores, 0.0) ** power
-        conditional_floor = np.maximum(conditional, floor)
-        gains = raw_scores * conditional_floor
-        if not np.all(np.isfinite(gains)):
+        conditional_floor = np.maximum(conditional, gain_floor)
+        usable = conditional > pivot_eps
+        for idx, is_usable in zip(candidate_indices, usable):
+            if not bool(is_usable):
+                degenerate_candidates.add(int(idx))
+        gains = np.where(usable, raw_scores * conditional_floor, -np.inf)
+        if not np.all(np.isfinite(gains) | np.isneginf(gains)):
             raise ValueError("D-optimal gain contains non-finite values")
+        if not np.any(np.isfinite(gains)):
+            break
 
         pick_pos = int(np.argmax(gains))
         pick_index = int(candidate_indices[pick_pos])
@@ -212,22 +220,34 @@ def _d_optimal_select(
             "raw_variance": float(candidate_vars[pick_pos]),
             "raw_score": float(candidate_scores[pick_pos]),
             "d_optimal_conditional_variance": float(conditional_floor[pick_pos]),
+            "d_optimal_raw_conditional_variance": float(conditional[pick_pos]),
             "d_optimal_gain": float(gains[pick_pos]),
             "d_optimal_prefilter_rank": int(candidate_rank[pick_index]),
             "d_optimal_max_correlation_to_selected": float(max_corr[pick_pos]),
         })
         if selected_inv is None or selected_inv.size == 0:
-            selected_inv = np.array([[1.0 / max(pick_variance_with_jitter, eps)]], dtype=float)
+            selected_inv = np.array([[1.0 / max(pick_variance_with_jitter, pivot_eps)]], dtype=float)
         else:
             inv_b = selected_inv @ pick_cov_to_selected.reshape(-1, 1)
             explained = (pick_cov_to_selected.reshape(1, -1) @ inv_b).item()
             schur = float(pick_variance_with_jitter - float(explained))
-            schur = max(schur, float(jitter), eps)
+            if not np.isfinite(schur) or schur <= pivot_eps:
+                degenerate_candidates.add(pick_index)
+                picked.pop()
+                selected.pop()
+                picked_diag.pop()
+                del candidate_indices[pick_pos]
+                candidate_vars = np.delete(candidate_vars, pick_pos)
+                candidate_scores = np.delete(candidate_scores, pick_pos)
+                if k_xs.size:
+                    k_xs = np.delete(k_xs, pick_pos, axis=0)
+                continue
+            schur = max(schur, pivot_eps)
             top_left = selected_inv + (inv_b @ inv_b.T) / schur
             top_right = -inv_b / schur
             bottom = np.array([[1.0 / schur]], dtype=float)
             selected_inv = np.block([[top_left, top_right], [top_right.T, bottom]])
-        selected_diag = np.append(selected_diag, max(pick_variance_with_jitter, eps))
+        selected_diag = np.append(selected_diag, max(pick_variance_with_jitter, diag_eps))
         new_col = None
         if len(candidate_indices) > 1:
             new_col = _posterior_cross_covariances(
@@ -249,6 +269,7 @@ def _d_optimal_select(
         "prefilter_pool_size": int(n_pool),
         "d_optimal_requested": int(n_select),
         "d_optimal_selected": int(len(picked)),
+        "d_optimal_skipped_degenerate": int(len(degenerate_candidates)),
     }
 
 

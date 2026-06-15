@@ -965,9 +965,7 @@ class DryRunPhaseExecutor:
                     result_payload["selection_diagnostics"]
                 )
             landing_audit_records.append(audit_record)
-            (seed_dir / "result.json").write_text(
-                json.dumps(result_payload, indent=2), encoding="utf-8",
-            )
+            atomic_write_json(seed_dir / "result.json", result_payload)
             #initial provenance sidecar -- seed_frame_id is None in dry-run
             #(synthetic seed; no pool involvement). Current wiring replaces None
             #with the real frame_id chosen by select_seeds().
@@ -1450,57 +1448,74 @@ class DryRunPhaseExecutor:
                 from .error_calibration import (
                     append_records,
                     build_calibration_model,
+                    mark_calibration_model_stale,
                     synthetic_dry_records,
                     write_calibration_model,
                     write_iteration_audit,
                 )
 
-                synthetic = synthetic_dry_records(
-                    iteration=int(state.iteration),
-                    models_version=int(getattr(state, "models_version", -1)),
-                    n_points=n_points,
-                )
-                all_records, added, duplicate = append_records(
-                    self.campaign_dir,
-                    synthetic,
-                )
-                model = build_calibration_model(
-                    all_records,
-                    self.config,
-                    iteration=int(state.iteration),
-                    current_model_version=int(getattr(state, "models_version", -1)),
-                )
-                model_path = write_calibration_model(self.campaign_dir, model)
-                iter_dir = self._iter_dir(state.iteration)
-                audit_path = write_iteration_audit(
-                    iter_dir,
-                    {
-                        "iteration": int(state.iteration),
-                        "enabled": True,
-                        "mode": str(self.config.error_calibration.mode),
-                        "n_new_records": int(len(synthetic)),
-                        "n_added_records": int(added),
-                        "n_duplicate_records": int(duplicate),
-                        "n_total_records": int(len(all_records)),
-                        "n_usable_records": int(model.get("n_records", 0)),
-                        "n_usable_total_records": int(model.get("n_total_error_records", 0)),
-                        "usable_for_acquisition": bool(
+                try:
+                    synthetic = synthetic_dry_records(
+                        iteration=int(state.iteration),
+                        models_version=int(getattr(state, "models_version", -1)),
+                        n_points=n_points,
+                    )
+                    all_records, added, duplicate = append_records(
+                        self.campaign_dir,
+                        synthetic,
+                    )
+                    model = build_calibration_model(
+                        all_records,
+                        self.config,
+                        iteration=int(state.iteration),
+                        current_model_version=int(getattr(state, "models_version", -1)),
+                    )
+                    model_path = write_calibration_model(self.campaign_dir, model)
+                    iter_dir = self._iter_dir(state.iteration)
+                    audit_path = write_iteration_audit(
+                        iter_dir,
+                        {
+                            "iteration": int(state.iteration),
+                            "enabled": True,
+                            "mode": str(self.config.error_calibration.mode),
+                            "n_new_records": int(len(synthetic)),
+                            "n_added_records": int(added),
+                            "n_duplicate_records": int(duplicate),
+                            "n_total_records": int(len(all_records)),
+                            "n_usable_records": int(model.get("n_records", 0)),
+                            "n_usable_total_records": int(model.get("n_total_error_records", 0)),
+                            "usable_for_acquisition": bool(
+                                model.get("usable_for_acquisition", False)
+                            ),
+                            "model": str(model_path.resolve()),
+                            "skipped": {},
+                        },
+                    )
+                    self.artefact_log.append(str(audit_path))
+                    self.artefact_log.append(str(model_path))
+                    self._journal_event(
+                        "error_calibration_summary",
+                        phase="AIMALL",
+                        iteration=int(state.iteration),
+                        n_added_records=int(added),
+                        n_total_records=int(len(all_records)),
+                        usable_for_acquisition=bool(
                             model.get("usable_for_acquisition", False)
                         ),
-                        "model": str(model_path.resolve()),
-                        "skipped": {},
-                    },
-                )
-                self.artefact_log.append(str(audit_path))
-                self.artefact_log.append(str(model_path))
-                self._journal_event(
-                    "error_calibration_summary",
-                    phase="AIMALL",
-                    iteration=int(state.iteration),
-                    n_added_records=int(added),
-                    n_total_records=int(len(all_records)),
-                    usable_for_acquisition=bool(
-                        model.get("usable_for_acquisition", False)
-                    ),
-                )
+                    )
+                except Exception as exc:
+                    try:
+                        mark_calibration_model_stale(
+                            self.campaign_dir,
+                            reason=type(exc).__name__ + ": " + str(exc)[:240],
+                            iteration=int(state.iteration),
+                        )
+                    except Exception:
+                        pass
+                    self._journal_event(
+                        "error_calibration_failed",
+                        phase="AIMALL",
+                        iteration=int(state.iteration),
+                        reason=type(exc).__name__ + ": " + str(exc)[:240],
+                    )
         return {}

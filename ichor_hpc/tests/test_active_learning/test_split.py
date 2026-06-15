@@ -29,12 +29,23 @@ def test_get_split_strategy_returns_callable():
     assert callable(fn)
 
 
-def test_stratified_partition_is_disjoint_and_covers_all():
-    alpha = [10.0, 8.0, 5.0, 4.0, 3.0, 2.0, 1.5, 1.0, 0.5, 0.1]
+@pytest.mark.parametrize("n", [10, 20, 100])
+def test_stratified_partition_is_disjoint_and_covers_all(n):
+    alpha = list(range(n, 0, -1))
     r = split_stratified_with_holdout(alpha, rng_seed=0)
     union = set(r.train_indices) | set(r.val_indices)
     assert union == set(range(len(alpha)))
     assert set(r.train_indices).isdisjoint(r.val_indices)
+
+
+def test_stratified_low_acquisition_remainder_goes_to_validation():
+    alpha = list(range(20, 0, -1))
+    r = split_stratified_with_holdout(alpha, rng_seed=0)
+
+    assert r.metadata["n_low_remainder"] > 0
+    low_remainder = set(range(18, 20))
+    assert low_remainder.issubset(set(r.val_indices))
+    assert low_remainder.isdisjoint(r.train_indices)
 
 
 def test_stratified_holdout_is_subset_of_val_and_came_from_top_tier():

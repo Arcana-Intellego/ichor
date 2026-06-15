@@ -21,6 +21,28 @@ def _water_at(z=0.0, h_offset=0.0):
     ])
 
 
+def _atoms_from_coords(template, coords):
+    return Atoms([
+        Atom(template[i].type, *coords[i])
+        for i in range(len(template))
+    ])
+
+
+def _rotated_translated(atoms, angle_rad, translation):
+    c = float(np.cos(angle_rad))
+    s = float(np.sin(angle_rad))
+    rot = np.array(
+        [
+            [c, -s, 0.0],
+            [s, c, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    coords = np.asarray(atoms.coordinates, dtype=float) @ rot.T
+    coords = coords + np.asarray(translation, dtype=float)[None, :]
+    return _atoms_from_coords(atoms, coords)
+
+
 def test_energy_zscore_keeps_well_behaved_samples():
     rng = np.random.default_rng(0)
     energies = rng.normal(0.0, 1.0, size=100).tolist()
@@ -82,6 +104,39 @@ def test_per_atom_rmsd_zscore_rejects_atom_flying_away():
     ]))
     kept, rejected = filter_by_per_atom_rmsd_zscore(frames, z_threshold=4.0)
     assert (len(frames) - 1) in rejected
+
+
+def test_per_atom_rmsd_zscore_keeps_rigidly_rotated_frame():
+    rng = np.random.default_rng(4)
+    base = _water_at(0.0)
+    frames = []
+    for _ in range(20):
+        jittered_coords = np.asarray(base.coordinates) + rng.normal(0, 0.005, size=(3, 3))
+        frames.append(_atoms_from_coords(base, jittered_coords))
+    frames.append(_rotated_translated(base, np.pi / 2.0, [5.0, -2.0, 1.0]))
+
+    kept, rejected = filter_by_per_atom_rmsd_zscore(frames, z_threshold=4.0)
+
+    assert (len(frames) - 1) in kept
+    assert (len(frames) - 1) not in rejected
+
+
+def test_per_atom_rmsd_zscore_rejects_rotated_frame_with_one_displaced_atom():
+    rng = np.random.default_rng(5)
+    base = _water_at(0.0)
+    frames = []
+    for _ in range(20):
+        jittered_coords = np.asarray(base.coordinates) + rng.normal(0, 0.005, size=(3, 3))
+        frames.append(_atoms_from_coords(base, jittered_coords))
+    bad = _rotated_translated(base, np.pi / 2.0, [5.0, -2.0, 1.0])
+    bad_coords = np.asarray(bad.coordinates, dtype=float)
+    bad_coords[1, 0] += 5.0
+    frames.append(_atoms_from_coords(base, bad_coords))
+
+    kept, rejected = filter_by_per_atom_rmsd_zscore(frames, z_threshold=4.0)
+
+    assert (len(frames) - 1) in rejected
+    assert (len(frames) - 1) not in kept
 
 
 def test_filter_initial_trajectory_combines_filters():

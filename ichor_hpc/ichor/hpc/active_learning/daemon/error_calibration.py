@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from pathlib import Path
 from statistics import mean, median
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -99,6 +100,29 @@ def write_records(campaign_dir: Any, records: Sequence[Mapping[str, Any]]) -> Pa
     return path
 
 
+def _quarantine_records_file(campaign_dir: Any, reason: str) -> Optional[Path]:
+    path = records_path(campaign_dir)
+    if not path.exists():
+        return None
+    suffix = ".corrupt." + str(time.time_ns())
+    target = path.with_name(path.name + suffix)
+    try:
+        path.rename(target)
+    except OSError as exc:
+        raise ErrorCalibrationError(
+            "failed to quarantine malformed calibration records "
+            + str(path)
+            + ": "
+            + str(exc)
+        ) from exc
+    marker = target.with_suffix(target.suffix + ".reason.txt")
+    try:
+        marker.write_text(str(reason) + "\n", encoding="utf-8", newline="\n")
+    except OSError:
+        pass
+    return target
+
+
 def _record_key(record: Mapping[str, Any]) -> str:
     return "|".join(
         str(record.get(k, ""))
@@ -110,7 +134,11 @@ def append_records(
     campaign_dir: Any,
     new_records: Sequence[Mapping[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], int, int]:
-    existing = load_records(campaign_dir)
+    try:
+        existing = load_records(campaign_dir)
+    except ErrorCalibrationError as exc:
+        _quarantine_records_file(campaign_dir, str(exc))
+        existing = []
     by_key = {_record_key(r): dict(r) for r in existing}
     added = 0
     skipped = 0
@@ -394,6 +422,23 @@ def write_calibration_model(
     return path
 
 
+def mark_calibration_model_stale(
+    campaign_dir: Any,
+    *,
+    reason: str,
+    iteration: Optional[int] = None,
+) -> Path:
+    payload = {
+        "schema_version": ERROR_CALIBRATION_SCHEMA_VERSION,
+        "usable_for_acquisition": False,
+        "stale": True,
+        "stale_reason": str(reason),
+        "iteration": None if iteration is None else int(iteration),
+        "tables": {},
+    }
+    return write_calibration_model(campaign_dir, payload)
+
+
 def load_calibration_model_for_acquisition(
     campaign_dir: Any,
     config: Any,
@@ -412,6 +457,8 @@ def load_calibration_model_for_acquisition(
         data = _read_json_object(path)
         if int(data.get("schema_version", -1)) != ERROR_CALIBRATION_SCHEMA_VERSION:
             return None, "unsupported_schema"
+        if bool(data.get("stale", False)):
+            return None, "stale_model"
         if not bool(data.get("usable_for_acquisition", False)):
             return None, "not_enough_records"
         if not isinstance(data.get("tables"), dict):

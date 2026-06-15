@@ -15,10 +15,9 @@ class SubspaceConfig:
     max_subspace_dim: int = 6
     gaussian_weight_sigma: Optional[float] = None
     covariance_regularization: float = 1.0e-10
-    #Fix #1 (opt-in): canonicalise the eigenbasis so degenerate-eigenvalue
-    #blocks do not produce visibly different bases across otherwise identical
-    #runs. Default False preserves prior behaviour exactly.
-    canonicalise_basis: bool = False
+    # Canonicalise the eigenbasis so degenerate-eigenvalue blocks do not
+    # produce visibly different bases across otherwise identical runs.
+    canonicalise_basis: bool = True
     #Two consecutive eigenvalues are treated as degenerate when their gap is
     #below 'degeneracy_tolerance * max(eigenvalues)'. Only consulted when
     #'canonicalise_basis' is True.

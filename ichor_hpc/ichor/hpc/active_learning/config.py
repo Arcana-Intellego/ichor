@@ -216,7 +216,7 @@ class AcquisitionSubspaceBlock:
     max_subspace_dim: int = 6
     gaussian_weight_sigma: Optional[float] = None
     covariance_regularization: float = 1.0e-10
-    canonicalise_basis: bool = False
+    canonicalise_basis: bool = True
     degeneracy_tolerance: float = 1.0e-3
     mode_weighting_policy: str = "variance"
 
@@ -501,6 +501,7 @@ class RuntimeConfigBlock:
     postprocess_settle_seconds: int = 10
     transient_phase_retry_max: int = 1
     poll_sacct_unknown_max_ticks: int = 3
+    poll_sacct_missing_max_ticks: int = 3
 
 
 @dataclass
@@ -805,6 +806,10 @@ class CampaignConfig:
         _validate_nonnegative_int(
             "runtime.poll_sacct_unknown_max_ticks",
             self.runtime.poll_sacct_unknown_max_ticks,
+        )
+        _validate_nonnegative_int(
+            "runtime.poll_sacct_missing_max_ticks",
+            self.runtime.poll_sacct_missing_max_ticks,
         )
         if self.anti_overlap.recent_seeds_cooldown < 0:
             raise ConfigValidationError(

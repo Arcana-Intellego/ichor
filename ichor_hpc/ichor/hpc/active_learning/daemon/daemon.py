@@ -499,7 +499,9 @@ class Daemon:
                 self._journal(
                     "adopted_inflight_job", phase=phase_name,
                     job_id=existing_job_id, iteration=state.iteration,
-                    matching_sacct_rows=lookup_rows,
+                    n_matching_sacct_rows=len(lookup_rows),
+                    matching_sacct_rows_sample=lookup_rows[:8],
+                    matching_sacct_rows_truncated=bool(len(lookup_rows) > 8),
                 )
                 return TickStatus.SUBMITTED
             if active_intent is not None and lookup_inconclusive:
@@ -691,6 +693,42 @@ class Daemon:
             state.sacct_empty_streak.pop(unknown_key, None)
             self._persist(state)
 
+        missing_key = job_id + ":MISSING"
+        if int(getattr(summary, "n_missing", 0)) > 0:
+            current = state.sacct_empty_streak.get(missing_key, 0) + 1
+            state.sacct_empty_streak[missing_key] = current
+            self._persist(state)
+            max_missing = int(
+                getattr(self.config.runtime, "poll_sacct_missing_max_ticks", 3)
+            )
+            if max_missing > 0 and current >= max_missing:
+                self._journal(
+                    "sacct_missing_timeout",
+                    phase=phase.value,
+                    job_id=job_id,
+                    streak=int(current),
+                    max_ticks=int(max_missing),
+                    n_expected=getattr(summary, "n_expected", None),
+                    n_observed=int(getattr(summary, "n_observed", 0)),
+                    n_missing=int(getattr(summary, "n_missing", 0)),
+                    iteration=state.iteration,
+                )
+                return self._halt(
+                    state,
+                    phase,
+                    "sacct_missing_timeout: "
+                    + str(current)
+                    + "/"
+                    + str(max_missing)
+                    + " ticks missed "
+                    + str(int(getattr(summary, "n_missing", 0)))
+                    + " expected Slurm array task rows",
+                )
+            return TickStatus.POLLING
+        if missing_key in state.sacct_empty_streak:
+            state.sacct_empty_streak.pop(missing_key, None)
+            self._persist(state)
+
         if not summary.is_terminal:
             return TickStatus.POLLING
 
@@ -865,6 +903,7 @@ class Daemon:
     def _clear_sacct_streaks(self, state: CampaignState, job_id: str) -> None:
         state.sacct_empty_streak.pop(str(job_id), None)
         state.sacct_empty_streak.pop(str(job_id) + ":UNKNOWN", None)
+        state.sacct_empty_streak.pop(str(job_id) + ":MISSING", None)
 
     def _looks_like_file_settle(self, reason: str) -> bool:
         text = str(reason).lower()

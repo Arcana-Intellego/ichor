@@ -114,8 +114,9 @@ def split_stratified_with_holdout(
     n_val_mid = int(round(val_mid_fraction * n))
     n_val_mid = max(0, min(n_val_mid, n_remaining))
     val_mid_indices = [int(i) for i in order[n_top_tier : n_top_tier + n_val_mid]]
+    low_remainder_indices = [int(i) for i in order[n_top_tier + n_val_mid :]]
 
-    val_indices = sorted(val_mid_indices + holdout_indices)
+    val_indices = sorted(val_mid_indices + low_remainder_indices + holdout_indices)
 
     return SplitResult(
         train_indices=sorted(train_indices),
@@ -127,6 +128,7 @@ def split_stratified_with_holdout(
             "val_mid_fraction": float(val_mid_fraction),
             "high_holdout_fraction": float(high_holdout_fraction),
             "n_top_tier": int(n_top_tier),
+            "n_low_remainder": int(len(low_remainder_indices)),
         },
     )
 

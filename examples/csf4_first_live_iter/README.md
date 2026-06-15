@@ -13,6 +13,23 @@ three external packages (POLUS, pyferebus, ARIADNE) into sibling
 directories under `~/projects/` (or wherever you keep code). Adjust the
 paths as needed.
 
+Recommended install path:
+
+```bash
+cd ~/projects/ichor-active-learning
+bash scripts/install_ichor_csf.sh --machine csf4 --projects-dir ~/projects \
+    --aimall-path ~/AIMAll/aimqb.ish
+export ICHOR_MACHINE=csf4
+source ~/.venv/ichor-csf4/bin/activate
+```
+
+The installer checks download access first, explains how to stage missing
+Python/PLUMED/OpenBLAS sources, builds ARIADNE before PLUMED so Intel compiler
+variables do not leak into the PLUMED build, installs the xTB/ASE stack, and
+backs up `~/ichor_config.yaml` before upserting the CSF4 profile. The remaining
+manual commands in this walkthrough are kept as a reference if you need to
+debug one component by hand.
+
 ## 1. ssh in and load the base module stack
 
 ```
@@ -29,7 +46,7 @@ and FEREBUS do not have modules; you install them yourself (see section 3).
 
 Do not put `CC`, `CXX`, or `FC` exports in `.bashrc`, `.bash_profile`, or
 `~/ichor_config.yaml`. They are build-time compiler selectors, not runtime
-settings. ARIADNE and PLUMED can live in the same `ichor-al` venv, but they
+settings. ARIADNE and PLUMED can live in the same `ichor-csf4` venv, but they
 should not be built under the same leaked compiler environment:
 
 - ARIADNE build: Intel oneAPI (`CC=icx`, `CXX=icpx`, `FC=ifx`).
@@ -40,8 +57,8 @@ should not be built under the same leaked compiler environment:
 ## 2. set up the Python venv
 
 ```
-python -m venv ~/.venv/ichor-al
-source ~/.venv/ichor-al/bin/activate
+python -m venv ~/.venv/ichor-csf4
+source ~/.venv/ichor-csf4/bin/activate
 python -m pip install --upgrade pip
 
 # the three ICHOR packages, in dependency order
@@ -90,7 +107,7 @@ module load python/3.11.3-gcccore-12.3.0
 module load python-bundle-pypi/2023.06-gcccore-12.3.0
 module load gaussian/g16c01_em64t_detectcpu
 
-source ~/.venv/ichor-al/bin/activate
+source ~/.venv/ichor-csf4/bin/activate
 unset CC CXX FC F77 F90
 export CC=gcc
 export CXX=g++
@@ -196,8 +213,8 @@ csf4:
       scratch_root: "/scratch/$USER"
 
     python:
-      env_name: "ichor-al"
-      python_path: "~/.venv/ichor-al/bin/python"
+      env_name: "ichor-csf4"
+      python_path: "~/.venv/ichor-csf4/bin/python"
       modules: ["python/3.11.3-gcccore-12.3.0"]
 
     plumed:
@@ -391,7 +408,7 @@ wants 200+.
 **oneAPI import error at ARIADNE_ARRAY start**. usually means the
 operator did not activate the venv before invoking the daemon. SLURM
 copies the submission shell's environment to worker nodes, so as long
-as `~/.venv/ichor/bin/activate` was sourced before `ichor-al-daemon
+as `~/.venv/ichor-csf4/bin/activate` was sourced before `ichor-al-daemon
 start --live`, the worker will find ariadne in the venv site-packages.
 Source the venv and re-launch.
 

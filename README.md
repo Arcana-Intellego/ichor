@@ -48,10 +48,15 @@ python3 -m pip install -e ichor_hpc
 python3 -m pip install -e ichor_cli
 ```
 
-Or use the convenience wrapper at the repo root:
+For a full Manchester CSF3/CSF4 active-learning install, use the cluster
+installer instead. It checks the sibling POLUS/FEREBUS_CPU/ARIADNE trees,
+creates the CSF-specific venv, builds ARIADNE/FEREBUS/PLUMED where needed,
+and updates `~/ichor_config.yaml`:
 
 ```
-./install_all.sh             # macOS / Linux / WSL
+bash scripts/install_ichor_csf.sh --machine csf4 --projects-dir ~/projects
+# or
+bash scripts/install_ichor_csf.sh --machine csf3 --projects-dir ~/projects
 ```
 
 ## Active learning daemon
@@ -77,9 +82,11 @@ for the daemon user guide.
 | sbatch / sacct     | Cluster-side (SLURM)                                  | `--live`           | `which sbatch`            |
 | Gaussian g16       | `module load gaussian/g16c01_em64t_detectcpu`         | `--live`           | `which g16`               |
 | AIMAll             | Operator-installed at `~/AIMAll/aimqb.ish`            | `--live`           | `ls ~/AIMAll/aimqb.ish`   |
-| FEREBUS            | `pip install pyferebus` (in same env as `ichor_hpc`)  | `--live`           | `python -c "import pyferebus"` |
-| ARIADNE            | Build oneAPI `.so`; set `PYTHONPATH=$ARIADNE_BUILD/python` | `--live` (skip with `--mock-ariadne`) | `python -c "import ariadne"`   |
-| POLUS              | `pip install polus` (in same env as `ichor_hpc`)      | `--live`           | `python -c "import polus"`     |
+| FEREBUS            | Build `FEREBUS_CPU` binary + editable `pyferebus`      | `--live`           | `python -c "import pyferebus"` |
+| ARIADNE            | Build/install sibling `ARIADNE` into the venv          | `--live` (skip with `--mock-ariadne`) | `python -c "import ariadne"`   |
+| POLUS              | Editable sibling `POLUS/polus_core_subpackage`         | `--live`           | `python -c "import polus.samplers.RS.randomSampling"` |
+| PLUMED             | Local kernel + PyPI wrapper                            | full CLI/metadynamics | `python -c "import plumed"` |
+| xTB                | PyPI `xtb` package, used through ASE                   | full CLI/metadynamics | `python -c "from xtb.ase.calculator import XTB"` |
 
 The daemon refuses to start in `--live` mode if any required backend is
 missing (exit code 12). Use `--dry-run` off-cluster -- it writes real

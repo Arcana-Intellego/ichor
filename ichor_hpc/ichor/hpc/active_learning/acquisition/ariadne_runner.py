@@ -1243,10 +1243,9 @@ def main(argv=None) -> int:
         payload["selection_diagnostics"]["error_calibration_model_reason"] = str(
             error_calibration_reason
         )
-    with open(
-        seed_dir / "result.json", "w", encoding="utf-8",
-    ) as f:
-        json.dump(payload, f, indent=2)
+    from ..daemon.state import atomic_write_json
+
+    atomic_write_json(seed_dir / "result.json", payload)
     return 0 if result.return_code == 0 else 4
 
 

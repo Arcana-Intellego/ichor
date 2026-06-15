@@ -59,7 +59,7 @@ from .cluster_profile import (
     expanded_profile_value,
     profile_value,
 )
-from .state import CampaignPhase
+from .state import CampaignPhase, atomic_write_json
 from .job_names import live_job_name
 
 
@@ -1095,6 +1095,16 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         ),
                     )
                 except Exception as exc:
+                    try:
+                        from .error_calibration import mark_calibration_model_stale
+
+                        mark_calibration_model_stale(
+                            self.campaign_dir,
+                            reason=type(exc).__name__ + ": " + str(exc)[:240],
+                            iteration=int(state.iteration),
+                        )
+                    except Exception:
+                        pass
                     self._journal_event(
                         "error_calibration_failed",
                         phase=phase_name,
@@ -1205,7 +1215,6 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         from ichor.core.adversarial.acquisition import SeedLocalAdversarialAcquisition
         from ichor.core.models import Models
         from pathlib import Path as _Path
-        import json as _json
         from .model_contract import validate_reference_scales
         from .artifact_contracts import verify_committed_model_version
 
@@ -1349,10 +1358,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         iter_dir.mkdir(parents=True, exist_ok=True)
         sidecar = iter_dir / "reference_scales.json"
         try:
-            sidecar.write_text(
-                _json.dumps(scales, indent=2, sort_keys=True),
-                encoding="utf-8",
-            )
+            atomic_write_json(sidecar, scales)
         except OSError:
             # disk issue; do not crash the daemon mid-tick.
             pass
@@ -2306,6 +2312,12 @@ def _configured_max_array_task_id() -> Optional[int]:
 
 
 def _configured_scheduler() -> str:
+    if active_machine() == "_default":
+        raise BackendSubmissionError(
+            "_default is a fallback configuration, not a live active-learning "
+            "profile; set ICHOR_MACHINE to a real Slurm profile such as csf3 "
+            "or csf4"
+        )
     raw = profile_value("hpc", "scheduler", default=None)
     if raw is None:
         return "slurm"
@@ -2325,6 +2337,24 @@ def _slurm_memory_mib(value: Any) -> float:
     if not match:
         raise BackendSubmissionError(
             "unsupported Slurm memory syntax: " + repr(value)
+        )
+    amount = int(match.group(1))
+    unit = match.group(2) or "M"
+    scale = {
+        "K": 1.0 / 1024.0,
+        "M": 1.0,
+        "G": 1024.0,
+        "T": 1024.0 * 1024.0,
+    }[unit]
+    return float(amount) * scale
+
+
+def _gaussian_memory_mib(value: Any) -> float:
+    text = str(value).strip().upper()
+    match = re.fullmatch(r"([1-9][0-9]*)([KMGT]?)(?:B|W)?", text)
+    if not match:
+        raise BackendSubmissionError(
+            "unsupported Gaussian memory syntax: " + repr(value)
         )
     amount = int(match.group(1))
     unit = match.group(2) or "M"
@@ -2403,6 +2433,32 @@ def _gaussian_mdef_gb(config: CampaignConfig, mem_per_cpu: str, gaussian_cores: 
     allocated_mib = _slurm_memory_mib(mem_per_cpu) * float(max(1, int(gaussian_cores)))
     usable_mib = allocated_mib * float(config.gaussian.memory_fraction_of_slurm)
     return max(1, int(math.floor(usable_mib / 1024.0)))
+
+
+def _validate_gaussian_link0_memory(
+    config: CampaignConfig,
+    mem_per_cpu: str,
+    gaussian_cores: int,
+) -> None:
+    if str(config.gaussian.memory_mode) != "link0":
+        return
+    gaussian_mib = _gaussian_memory_mib(config.gaussian.mem)
+    cores = max(1, int(gaussian_cores))
+    allocated_mib = _slurm_memory_mib(mem_per_cpu) * float(cores)
+    limit_mib = float(config.gaussian.memory_fraction_of_slurm) * allocated_mib
+    if gaussian_mib > limit_mib + 1.0e-9:
+        raise BackendSubmissionError(
+            "gaussian.mem "
+            + repr(str(config.gaussian.mem))
+            + " exceeds "
+            + str(config.gaussian.memory_fraction_of_slurm)
+            + " of the resolved Link0 Gaussian Slurm allocation "
+            + "(resources.mem_per_cpu="
+            + repr(str(mem_per_cpu))
+            + ", gaussian.nproc="
+            + str(cores)
+            + ")"
+        )
 
 
 def _configured_ferebus_platform() -> str:
@@ -2506,6 +2562,8 @@ def build_sbatch_script(
     cpus = int(config.gaussian.nproc) if is_gaussian_phase else res.cpus_for(phase_name)
     ntasks = 1 if is_gaussian_phase else int(res.ntasks)
     mem_per_cpu = _resolve_mem_per_cpu(config, str(part))
+    if is_gaussian_phase:
+        _validate_gaussian_link0_memory(config, mem_per_cpu, int(cpus))
     camp = str(Path(campaign_dir).resolve())
     job_name = live_job_name(campaign_uid, phase_name, iteration)
     _reject_shell_control_chars("Slurm job name", job_name)

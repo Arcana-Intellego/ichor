@@ -289,7 +289,7 @@ class WriteFile(File, ABC):
         if tmp_str:
             # if we got to here, we can safely assume that we got a string which can be written to a file
             # even if the actual string contains wrong things it it
-            with open(path, "w") as f:
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(tmp_str)
         else:
             raise TypeError("The contents type cannot be written to a file.")

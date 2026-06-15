@@ -2,6 +2,7 @@ venv/
 .vscode/
 .DS_Store
 *.sh
+!scripts/install_ichor_csf.sh
 *.csv
 wily*
 rmsd*

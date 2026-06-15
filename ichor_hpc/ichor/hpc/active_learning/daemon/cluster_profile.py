@@ -50,6 +50,12 @@ def require_cluster_profile() -> ClusterProfile:
             "no active ICHOR machine profile resolved; set ICHOR_MACHINE=csf3 "
             "or use a hostname containing a top-level ~/ichor_config.yaml key"
         )
+    if str(machine) == "_default":
+        raise ClusterProfileError(
+            "_default is a fallback configuration, not a live active-learning "
+            "profile; set ICHOR_MACHINE to a real Slurm profile such as csf3 "
+            "or csf4"
+        )
     if machine not in config:
         raise ClusterProfileError(
             "active ICHOR machine profile "

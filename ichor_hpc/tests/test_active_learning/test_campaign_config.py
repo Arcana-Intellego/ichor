@@ -28,6 +28,7 @@ def test_default_campaign_config_is_valid():
     assert c.runtime.postprocess_settle_seconds == 10
     assert c.runtime.transient_phase_retry_max == 1
     assert c.runtime.poll_sacct_unknown_max_ticks == 3
+    assert c.runtime.poll_sacct_missing_max_ticks == 3
     assert c.seed_selection.variance_chunk_size == 512
     assert c.seed_selection.strategy == "hybrid_variance"
     assert c.seed_selection.d_optimal_pool_multiplier == 8
@@ -69,6 +70,7 @@ def test_default_campaign_config_is_valid():
     assert c.acquisition.fullspace_confinement.failure_penalty == 1.0e6
     assert c.acquisition.stencils.negative_curvature_policy == "ignore"
     assert c.acquisition.stencils.lambda_negative_curvature == 1.0
+    assert c.acquisition.subspace.canonicalise_basis is True
 
 
 @pytest.mark.parametrize("name", ["WATER", "nh3_batch_01", "C6H6-AL"])

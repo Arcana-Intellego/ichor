@@ -1,6 +1,8 @@
 import numpy as np
+import pytest
 from ichor.core.atoms import ALF, Atom, Atoms
 from ichor.core.calculators import calculate_alf_features
+from ichor.core.calculators.features import alf_features_calculator as alf_mod
 
 
 def test_alf_features_calculator():
@@ -126,3 +128,41 @@ def test_alf_features_calculator():
     # should contain the features for all atoms, atoms x nfeatures
     assert features_array.shape == (6, 12)
     np.testing.assert_allclose(features_array, true_features)
+
+
+def test_alf_inter_axis_arccos_ratio_is_clipped(monkeypatch):
+    atoms = Atoms([
+        Atom("O", 0.0, 0.0, 0.0),
+        Atom("H", 1.0, 0.0, 0.0),
+        Atom("H", 0.0, 1.0, 0.0),
+    ])
+    real_dot = alf_mod.np.dot
+    calls = {"n": 0}
+
+    def slightly_too_large_dot(a, b):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return (
+                np.linalg.norm(np.asarray(a, dtype=float))
+                * np.linalg.norm(np.asarray(b, dtype=float))
+                * 1.0000000001
+            )
+        return real_dot(a, b)
+
+    monkeypatch.setattr(alf_mod.np, "dot", slightly_too_large_dot)
+
+    features = alf_mod.calculate_alf_features(atoms[0], ALF(0, 1, 2))
+
+    assert np.isfinite(features).all()
+    assert features[2] == pytest.approx(0.0)
+
+
+def test_alf_zero_bond_denominator_rejects_cleanly():
+    atoms = Atoms([
+        Atom("O", 0.0, 0.0, 0.0),
+        Atom("H", 0.0, 0.0, 0.0),
+        Atom("H", 0.0, 1.0, 0.0),
+    ])
+
+    with pytest.raises(ValueError, match="x-axis atom is coincident"):
+        alf_mod.calculate_alf_features(atoms[0], ALF(0, 1, 2))
