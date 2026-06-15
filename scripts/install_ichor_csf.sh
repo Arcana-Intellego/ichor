@@ -178,16 +178,17 @@ require_cmd() {
     fi
 }
 
-resolve_required_cmd() {
-    local cmd="$1"
-    local hint="${2:-}"
+resolve_required_cmd_into() {
+    local target_var="$1"
+    local cmd="$2"
+    local hint="${3:-}"
+    local resolved
     if [[ "${DRY_RUN}" -eq 1 ]]; then
         echo "+ resolve command ${cmd}" >&2
-        printf '<resolved:%s>\n' "${cmd}"
+        printf -v "${target_var}" '<resolved:%s>' "${cmd}"
         return 0
     fi
 
-    local resolved
     resolved="$(command -v "${cmd}" || true)"
     if [[ -z "${resolved}" ]]; then
         if [[ -n "${hint}" ]]; then
@@ -195,7 +196,7 @@ resolve_required_cmd() {
         fi
         die "required command '${cmd}' is not on PATH"
     fi
-    printf '%s\n' "${resolved}"
+    printf -v "${target_var}" '%s' "${resolved}"
 }
 
 initialise_modules() {
@@ -352,9 +353,9 @@ load_ariadne_modules() {
         module_cmd load compiler-rt tbb compiler
         module_cmd load mkl/2024.2
     fi
-    require_cmd icx "ARIADNE requires the Intel oneAPI C compiler. Run 'module list' and check the oneAPI compiler module."
-    require_cmd icpx "ARIADNE requires the Intel oneAPI C++ compiler. Run 'module list' and check the oneAPI compiler module."
-    require_cmd ifx "ARIADNE requires the Intel oneAPI Fortran compiler. Run 'module list' and check the oneAPI compiler module."
+    resolve_required_cmd_into ARIADNE_CC icx "ARIADNE requires the Intel oneAPI C compiler. Run 'module list' and check the oneAPI compiler module."
+    resolve_required_cmd_into ARIADNE_CXX icpx "ARIADNE requires the Intel oneAPI C++ compiler. Run 'module list' and check the oneAPI compiler module."
+    resolve_required_cmd_into ARIADNE_FC ifx "ARIADNE requires the Intel oneAPI Fortran compiler. Run 'module list' and check the oneAPI compiler module."
 }
 
 load_gcc_build_modules() {
@@ -516,9 +517,13 @@ install_ariadne_if_needed() {
     local ariadne_root="${PROJECTS_DIR}/ARIADNE"
     require_dir "${ariadne_root}" "ARIADNE source tree"
     pip_install -r "${ariadne_root}/requirements-build.txt"
-    export CC="$(resolve_required_cmd icx "ARIADNE requires the Intel oneAPI C compiler.")"
-    export CXX="$(resolve_required_cmd icpx "ARIADNE requires the Intel oneAPI C++ compiler.")"
-    export FC="$(resolve_required_cmd ifx "ARIADNE requires the Intel oneAPI Fortran compiler.")"
+    [[ -n "${ARIADNE_CC:-}" && -n "${ARIADNE_CXX:-}" && -n "${ARIADNE_FC:-}" ]] || die "ARIADNE compiler paths were not resolved after loading oneAPI modules."
+    [[ "${DRY_RUN}" -eq 1 || -x "${ARIADNE_CC}" ]] || die "resolved ARIADNE C compiler is not executable: ${ARIADNE_CC}"
+    [[ "${DRY_RUN}" -eq 1 || -x "${ARIADNE_CXX}" ]] || die "resolved ARIADNE C++ compiler is not executable: ${ARIADNE_CXX}"
+    [[ "${DRY_RUN}" -eq 1 || -x "${ARIADNE_FC}" ]] || die "resolved ARIADNE Fortran compiler is not executable: ${ARIADNE_FC}"
+    export CC="${ARIADNE_CC}"
+    export CXX="${ARIADNE_CXX}"
+    export FC="${ARIADNE_FC}"
     export CMAKE_BUILD_PARALLEL_LEVEL="${INSTALL_JOBS}"
     export MAKEFLAGS="-j${INSTALL_JOBS}"
     [[ "${DRY_RUN}" -eq 1 ]] && echo "+ export CC=${CC} CXX=${CXX} FC=${FC} CMAKE_BUILD_PARALLEL_LEVEL=${INSTALL_JOBS} MAKEFLAGS=-j${INSTALL_JOBS}"

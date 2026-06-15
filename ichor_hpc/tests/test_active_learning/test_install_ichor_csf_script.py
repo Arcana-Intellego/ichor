@@ -67,9 +67,13 @@ def test_install_script_is_present():
     assert "--with-openssl-rpath=auto" in text
     assert "import ssl; print(ssl.OPENSSL_VERSION)" in text
     assert "command -v \"${cmd}\"" in text
-    assert "resolve_required_cmd icx" in text
-    assert "resolve_required_cmd icpx" in text
-    assert "resolve_required_cmd ifx" in text
+    assert "resolve_required_cmd_into ARIADNE_CC icx" in text
+    assert "resolve_required_cmd_into ARIADNE_CXX icpx" in text
+    assert "resolve_required_cmd_into ARIADNE_FC ifx" in text
+    assert "export CC=\"${ARIADNE_CC}\"" in text
+    assert "export CXX=\"${ARIADNE_CXX}\"" in text
+    assert "export FC=\"${ARIADNE_FC}\"" in text
+    assert "export CC=\"$(resolve_required_cmd" not in text
     assert "export CC=icx" not in text
     assert "unset CC CXX FC F77 F90" in text
     assert "export CC=gcc" in text
