@@ -92,7 +92,8 @@ python -m pip install -r requirements-build.txt
 export CC="$(command -v icx)"
 export CXX="$(command -v icpx)"
 export FC="$(command -v ifx)"
-python -m pip install . --no-build-isolation -v
+python -m pip install . --no-build-isolation -v \
+    --config-settings=cmake.define.ARIADNE_SAFE_IFX_FLAGS=ON
 unset CC CXX FC F77 F90
 ```
 

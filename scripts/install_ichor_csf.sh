@@ -526,8 +526,12 @@ install_ariadne_if_needed() {
     export FC="${ARIADNE_FC}"
     export CMAKE_BUILD_PARALLEL_LEVEL="${INSTALL_JOBS}"
     export MAKEFLAGS="-j${INSTALL_JOBS}"
+    local ariadne_pip_config=""
+    if [[ "${MACHINE}" == "csf3" ]]; then
+        ariadne_pip_config=" --config-settings=cmake.define.ARIADNE_SAFE_IFX_FLAGS=ON"
+    fi
     [[ "${DRY_RUN}" -eq 1 ]] && echo "+ export CC=${CC} CXX=${CXX} FC=${FC} CMAKE_BUILD_PARALLEL_LEVEL=${INSTALL_JOBS} MAKEFLAGS=-j${INSTALL_JOBS}"
-    run_shell "cd $(printf '%q' "${ariadne_root}") && $(printf '%q' "${PYTHON}") -m pip install . --no-build-isolation -v"
+    run_shell "cd $(printf '%q' "${ariadne_root}") && $(printf '%q' "${PYTHON}") -m pip install . --no-build-isolation -v${ariadne_pip_config}"
     unset CC CXX FC F77 F90
     unset MAKEFLAGS CMAKE_BUILD_PARALLEL_LEVEL
     [[ "${DRY_RUN}" -eq 1 ]] || python_import_ok ariadne || die "ARIADNE install completed but import ariadne still fails"

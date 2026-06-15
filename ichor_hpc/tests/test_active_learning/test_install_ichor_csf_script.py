@@ -75,6 +75,8 @@ def test_install_script_is_present():
     assert "export FC=\"${ARIADNE_FC}\"" in text
     assert "export CC=\"$(resolve_required_cmd" not in text
     assert "export CC=icx" not in text
+    assert "ARIADNE_SAFE_IFX_FLAGS=ON" in text
+    assert 'if [[ "${MACHINE}" == "csf3" ]]' in text
     assert "unset CC CXX FC F77 F90" in text
     assert "export CC=gcc" in text
     assert "export CXX=g++" in text
