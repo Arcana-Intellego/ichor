@@ -197,17 +197,17 @@ ichor-al-daemon import-pool --campaign-dir . --source pool.xyz
 ichor-al-daemon start --live --campaign-dir . --max-ticks 200
 ```
 
-The smoke config intentionally throttles Slurm arrays with
-`resources.array_concurrency_limit: 2`. Because throttled pending rows may not
-appear in `sacct` immediately on CSF3, the shipped config sets
-`runtime.poll_sacct_missing_max_ticks: 30`. Do not lower that for throttled
-live runs unless you also remove the array throttle.
+The smoke config leaves Slurm arrays unthrottled with
+`resources.array_concurrency_limit: null`, so Gaussian and AIMAll can use as
+much concurrency as Slurm policy and current cluster load allow. If you set a
+manual `%N` array throttle later, keep `runtime.poll_sacct_missing_max_ticks`
+generous because throttled pending rows may not appear in `sacct` immediately.
 
 The generated Gaussian scripts should use `#!/bin/bash --login`, the CSF3
 Gaussian module, `GAUSS_SCRDIR`, `GAUSS_PDEF`, and `GAUSS_MDEF`. The generated
 FEREBUS script should come from pyferebus with `platform="CSF3"` and the
 configured executable.
 
-If the journal reports `sacct_missing_timeout` while `squeue` still shows array
-tasks pending or running, increase `runtime.poll_sacct_missing_max_ticks` or
-remove `resources.array_concurrency_limit` for the smoke.
+If the journal reports `sacct_rows_missing_but_squeue_active`, the daemon has
+seen that `sacct` is lagging while `squeue` still shows active array tasks, so
+it will keep polling rather than halting the campaign.

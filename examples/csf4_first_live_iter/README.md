@@ -238,8 +238,10 @@ The active-learning daemon defaults to `resources.mem_per_cpu: auto`. On CSF4
 that resolves to 4G/core from the profile above. Gaussian live jobs use the
 Slurm allocation via `GAUSS_PDEF` and `GAUSS_MDEF` by default, rather than
 hard-coding `%NProcShared` or `%mem` inside every `.gjf`. For a cautious first
-smoke you can also set `resources.array_concurrency_limit` in `campaign.yaml`
-to throttle large Gaussian/AIMAll arrays with Slurm's `--array=...%N` syntax.
+smoke leaves `resources.array_concurrency_limit: null` so Gaussian/AIMAll
+arrays can run with as much concurrency as Slurm policy and cluster load allow.
+For larger shared-cluster campaigns you can set `resources.array_concurrency_limit`
+to throttle arrays with Slurm's `--array=...%N` syntax.
 
 If a path is missing or points at a non-executable file, the daemon
 refuses to start with a message naming the offending key. Confirm by
@@ -302,7 +304,7 @@ resources:
   cpus_per_task: 2
   ntasks: 1
   ariadne_cpus_per_task: 8
-  array_concurrency_limit: 2
+  array_concurrency_limit: null
 
 gaussian:
   nproc: 2
@@ -342,11 +344,10 @@ another shell:
 ichor-al-daemon journal --campaign-dir . | tail -n 20
 ```
 
-The smoke config intentionally throttles Slurm arrays with
-`resources.array_concurrency_limit: 2`. Because throttled pending rows may not
-appear in `sacct` immediately on every cluster, the shipped config sets
-`runtime.poll_sacct_missing_max_ticks: 30`. Do not lower that for throttled
-live runs unless you also remove the array throttle.
+The smoke config leaves Slurm arrays unthrottled with
+`resources.array_concurrency_limit: null`. If you later set a manual `%N`
+array throttle, keep `runtime.poll_sacct_missing_max_ticks` generous because
+throttled pending rows may not appear in `sacct` immediately on every cluster.
 
 Every state transition lands as a `phase_transition` event; every
 successful sbatch postprocess lands as a `phase_succeeded_live` event.
@@ -432,10 +433,9 @@ trajectory is too short (under ~20 frames). use a longer trajectory; the
 test fixture only has 20 frames which is OK for the smoke but production
 wants 200+.
 
-**sacct_missing_timeout while `squeue` still shows array jobs**. happens when
-array throttling keeps later tasks pending and CSF accounting has not emitted
-all expected task rows yet. increase `runtime.poll_sacct_missing_max_ticks` or
-remove `resources.array_concurrency_limit` for the smoke.
+**`sacct_rows_missing_but_squeue_active` appears in the journal**. this means
+CSF accounting has not emitted all expected task rows yet, but `squeue` still
+shows active Slurm array jobs. The daemon keeps polling in this state.
 
 **oneAPI import error at ARIADNE_ARRAY start**. usually means the
 operator did not activate the venv before invoking the daemon. SLURM

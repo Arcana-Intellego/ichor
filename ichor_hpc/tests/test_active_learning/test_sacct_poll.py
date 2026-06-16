@@ -12,6 +12,7 @@ from ichor.hpc.active_learning.submit.sacct_poll import (
     SUCCESS_STATES,
     TERMINAL_STATES,
     aggregate_states,
+    find_active_job_by_id_detailed,
     parse_sacct_output,
     poll_job,
 )
@@ -216,3 +217,35 @@ def test_poll_job_passes_through_extra_args():
     runner = _StubRunner(result=_StubResult(stdout=""))
     poll_job("42", sacct_runner=runner, extra_args=["--starttime", "2024-01-01"])
     assert runner.calls[0][-2:] == ["--starttime", "2024-01-01"]
+
+
+def test_find_active_job_by_id_uses_squeue_rows():
+    runner = _StubRunner(
+        result=_StubResult(stdout="16153025_[6-9%2]|PENDING\n16153025_4|RUNNING\n")
+    )
+    lookup = find_active_job_by_id_detailed("16153025", squeue_runner=runner)
+    assert lookup.active
+    assert not lookup.inconclusive
+    assert lookup.rows == [
+        ("16153025_[6-9%2]", "PENDING"),
+        ("16153025_4", "RUNNING"),
+    ]
+    call = runner.calls[0]
+    assert call[:3] == ["squeue", "-j", "16153025"]
+    assert "--noheader" in call
+
+
+def test_find_active_job_by_id_empty_squeue_is_conclusive_inactive():
+    runner = _StubRunner(result=_StubResult(stdout=""))
+    lookup = find_active_job_by_id_detailed("16153025", squeue_runner=runner)
+    assert not lookup.active
+    assert not lookup.inconclusive
+    assert lookup.rows == []
+
+
+def test_find_active_job_by_id_squeue_error_is_inconclusive():
+    runner = _StubRunner(result=_StubResult(returncode=1, stderr="slurmctld busy"))
+    lookup = find_active_job_by_id_detailed("16153025", squeue_runner=runner)
+    assert not lookup.active
+    assert lookup.inconclusive
+    assert "squeue exited with code 1" in str(lookup.error)

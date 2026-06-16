@@ -69,6 +69,7 @@ __all__ = [
     "build_sbatch_script",
     "live_job_name",
     "make_live_job_finder",
+    "make_live_job_liveness_checker",
     "LIVE_POSTPROCESS_IMPLEMENTED",
 ]
 
@@ -2224,6 +2225,16 @@ def make_live_job_finder(sacct_runner=None):
         return inconclusive if inconclusive is not None else last_lookup
 
     return _finder
+
+
+def make_live_job_liveness_checker(squeue_runner=None):
+    """Return a live-mode checker for whether an existing Slurm JobID is active."""
+    from ..submit.sacct_poll import find_active_job_by_id_detailed
+
+    def _checker(job_id):
+        return find_active_job_by_id_detailed(job_id, squeue_runner=squeue_runner)
+
+    return _checker
 
 
 def _reject_shell_control_chars(label: str, value: str) -> None:

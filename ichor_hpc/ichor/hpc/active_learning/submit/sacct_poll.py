@@ -30,6 +30,7 @@ __all__ = [
     "JobStatus",
     "JobObservation",
     "ArrayJobSummary",
+    "JobQueueLookup",
     "TERMINAL_STATES",
     "NON_TERMINAL_STATES",
     "SUCCESS_STATES",
@@ -37,6 +38,7 @@ __all__ = [
     "parse_sacct_output",
     "aggregate_states",
     "poll_job",
+    "find_active_job_by_id_detailed",
     "JobNameLookup",
     "find_running_job_by_name_detailed",
     "find_running_job_by_name",
@@ -157,6 +159,19 @@ class ArrayJobSummary:
     @property
     def is_fully_successful(self) -> bool:
         return self.is_terminal and self.n_failed == 0 and self.n_completed == self.n_tasks
+
+
+@dataclass(frozen=True)
+class JobQueueLookup:
+    """Best-effort squeue liveness check for an existing Slurm job id."""
+
+    active: bool
+    inconclusive: bool = False
+    rows: List[Tuple[str, str]] = field(default_factory=list)
+    error: Optional[str] = None
+
+    def __bool__(self) -> bool:
+        return bool(self.active)
 
 
 def _parse_elapsed(text: str) -> Optional[int]:
@@ -311,6 +326,56 @@ def poll_job(
         )
     stdout = getattr(completed, "stdout", "") or ""
     return parse_sacct_output(stdout)
+
+
+def find_active_job_by_id_detailed(
+    job_id: str,
+    *,
+    squeue_runner: Optional[Callable[..., Any]] = None,
+) -> JobQueueLookup:
+    """Return whether ``squeue`` still shows a Slurm job or array as active.
+
+    ``sacct`` can lag behind throttled array jobs on CSF3/CSF4: pending array
+    elements may still be visible in ``squeue`` while their task rows are not
+    yet present in accounting.  The daemon uses this as a liveness guard so
+    sparse accounting rows do not falsely kill a valid campaign.
+    """
+    if squeue_runner is None:
+        squeue_runner = subprocess.run
+    cmd = [
+        "squeue",
+        "-j", str(job_id),
+        "--noheader",
+        "--format=%i|%T",
+    ]
+    try:
+        completed = squeue_runner(cmd, check=False, capture_output=True, text=True)
+    except Exception as exc:
+        return JobQueueLookup(
+            active=False,
+            inconclusive=True,
+            error=type(exc).__name__ + ": " + str(exc),
+        )
+    return_code = int(getattr(completed, "returncode", 1))
+    if return_code != 0:
+        stderr = getattr(completed, "stderr", "") or ""
+        return JobQueueLookup(
+            active=False,
+            inconclusive=True,
+            error="squeue exited with code " + str(return_code) + ": " + repr(stderr),
+        )
+    stdout = getattr(completed, "stdout", "") or ""
+    rows: List[Tuple[str, str]] = []
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("|", 1)
+        jid = parts[0].strip()
+        if not jid:
+            continue
+        state = parts[1].strip() if len(parts) > 1 else ""
+        rows.append((jid, state))
+    return JobQueueLookup(active=bool(rows), rows=rows)
 
 
 @dataclass(frozen=True)

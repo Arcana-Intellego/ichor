@@ -43,6 +43,7 @@ from .daemon.live_executor import (
     LiveBackendNotAvailableError,
     LiveBackendsPhaseExecutor,
     make_live_job_finder,
+    make_live_job_liveness_checker,
 )
 from .daemon.phase_executor import MockPhaseExecutor
 from .daemon.preflight import check_backends, missing_backend_message
@@ -213,6 +214,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         return 2
 
     job_finder = None  # set in the live branch below; mock/dry leave it None (no adopt check)
+    job_liveness_checker = None
     if getattr(args, "live", False):
         avail = check_backends()
         if not avail.all_present:
@@ -230,6 +232,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         # live mode: let the daemon spot + adopt an orphaned in-flight job on (re)entry rather than
         # double-submitting after a crash or reconcile (A24/A25).
         job_finder = make_live_job_finder()
+        job_liveness_checker = make_live_job_liveness_checker()
     elif getattr(args, "dry_run", False):
         executor = DryRunPhaseExecutor(
             campaign_dir=campaign,
@@ -255,6 +258,8 @@ def cmd_start(args: argparse.Namespace) -> int:
         daemon_kwargs["sacct_poller"] = sacct_poller
     if job_finder is not None:
         daemon_kwargs["job_finder"] = job_finder
+    if job_liveness_checker is not None:
+        daemon_kwargs["job_liveness_checker"] = job_liveness_checker
     d = Daemon(**daemon_kwargs)
     if args.poll_interval is not None:
         #override config-loaded poll interval per-invocation.

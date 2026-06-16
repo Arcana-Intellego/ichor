@@ -29,7 +29,7 @@ resources:
   cpus_per_task: 2
   ntasks: 1
   ariadne_cpus_per_task: 8
-  array_concurrency_limit: 2
+  array_concurrency_limit: null
 
 gaussian:
   nproc: 2

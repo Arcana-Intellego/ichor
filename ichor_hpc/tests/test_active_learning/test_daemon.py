@@ -2,6 +2,7 @@
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import List
 
 import pytest
@@ -28,6 +29,7 @@ from ichor.hpc.active_learning.daemon.state import (
     read_state,
     write_state,
 )
+from ichor.hpc.active_learning.daemon import submission_intent
 from ichor.hpc.active_learning.submit.sacct_poll import JobObservation, JobStatus
 
 
@@ -57,7 +59,14 @@ def _running_poll(job_id, **kw):
     return [JobObservation(job_id=job_id, status=JobStatus.RUNNING, exit_code=None, elapsed_seconds=None)]
 
 
-def _make_daemon(tmp_path, *, max_iterations=1, executor=None, sacct=None) -> Daemon:
+def _make_daemon(
+    tmp_path,
+    *,
+    max_iterations=1,
+    executor=None,
+    sacct=None,
+    job_liveness_checker=None,
+) -> Daemon:
     cfg = CampaignConfig(max_iterations=max_iterations)
     executor = executor or MockPhaseExecutor(treat_as_sbatch=set(_SBATCH_PHASES))
     sacct = sacct or _completed_poll
@@ -67,6 +76,7 @@ def _make_daemon(tmp_path, *, max_iterations=1, executor=None, sacct=None) -> Da
         executor=executor,
         sacct_poller=sacct,
         sleep_fn=lambda s: None,
+        job_liveness_checker=job_liveness_checker,
     )
 
 
@@ -146,6 +156,107 @@ def test_tick_polling_keeps_state_when_job_running(tmp_path):
     state = read_state(d.state_path())
     assert state.phase is CampaignPhase.PHASE_A_POLUS
     assert state.pending_jobs[CampaignPhase.PHASE_A_POLUS.value] == "MOCK-1"
+
+
+def _install_pending_array_state(d: Daemon, *, phase=CampaignPhase.INITIAL_AIMALL) -> None:
+    d.data_dir().mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = phase
+    state.pending_jobs[phase.value] = "777"
+    write_state(d.state_path(), state)
+    submission_intent.mark_submitted(
+        d.campaign_dir,
+        phase.value,
+        0,
+        "777",
+        expected_tasks=5,
+    )
+
+
+def _partial_array_poll(job_id, **kw):
+    return [
+        JobObservation(
+            job_id=str(job_id) + "_0",
+            status=JobStatus.COMPLETED,
+            exit_code=(0, 0),
+            elapsed_seconds=1,
+        ),
+        JobObservation(
+            job_id=str(job_id) + "_1",
+            status=JobStatus.COMPLETED,
+            exit_code=(0, 0),
+            elapsed_seconds=1,
+        ),
+    ]
+
+
+def test_missing_sacct_rows_keep_polling_when_squeue_still_active(tmp_path):
+    d = _make_daemon(
+        tmp_path,
+        sacct=_partial_array_poll,
+        job_liveness_checker=lambda job_id: SimpleNamespace(
+            active=True,
+            inconclusive=False,
+            rows=[
+                (str(job_id) + "_2", "RUNNING"),
+                (str(job_id) + "_[3-4]", "PENDING"),
+            ],
+            error=None,
+        ),
+    )
+    d.config.runtime.poll_sacct_missing_max_ticks = 1
+    _install_pending_array_state(d)
+
+    assert d.tick() == TickStatus.POLLING
+    state = read_state(d.state_path())
+    assert state.phase is CampaignPhase.INITIAL_AIMALL
+    assert state.pending_jobs[CampaignPhase.INITIAL_AIMALL.value] == "777"
+    assert state.sacct_empty_streak.get("777:MISSING") is None
+    events = list(iter_events(d.journal_path()))
+    assert any(e.get("event") == "sacct_rows_missing_but_squeue_active" for e in events)
+
+
+def test_missing_sacct_rows_keep_polling_when_squeue_inconclusive(tmp_path):
+    d = _make_daemon(
+        tmp_path,
+        sacct=_partial_array_poll,
+        job_liveness_checker=lambda job_id: SimpleNamespace(
+            active=False,
+            inconclusive=True,
+            rows=[],
+            error="squeue transient failure",
+        ),
+    )
+    d.config.runtime.poll_sacct_missing_max_ticks = 1
+    _install_pending_array_state(d)
+
+    assert d.tick() == TickStatus.POLLING
+    state = read_state(d.state_path())
+    assert state.phase is CampaignPhase.INITIAL_AIMALL
+    assert state.sacct_empty_streak.get("777:MISSING") is None
+    events = list(iter_events(d.journal_path()))
+    assert any(e.get("event") == "squeue_liveness_inconclusive" for e in events)
+
+
+def test_missing_sacct_rows_halt_when_squeue_confirms_job_gone(tmp_path):
+    d = _make_daemon(
+        tmp_path,
+        sacct=_partial_array_poll,
+        job_liveness_checker=lambda job_id: SimpleNamespace(
+            active=False,
+            inconclusive=False,
+            rows=[],
+            error=None,
+        ),
+    )
+    d.config.runtime.poll_sacct_missing_max_ticks = 1
+    _install_pending_array_state(d)
+
+    assert d.tick() == TickStatus.HALTED
+    state = read_state(d.state_path())
+    assert state.phase is CampaignPhase.HALTED
+    events = list(iter_events(d.journal_path()))
+    assert any(e.get("event") == "sacct_missing_timeout" for e in events)
 
 
 def test_tick_scrubs_when_failure_below_threshold(tmp_path):

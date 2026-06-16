@@ -37,6 +37,7 @@ import time
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from ..config import CampaignConfig
@@ -175,6 +176,11 @@ class Daemon:
     # phase+iteration, or None. lets a restart/reconcile adopt a job a crash orphaned instead of
     # double-submitting (A24/A25). None (mock/dry) -> the check is skipped and we submit as before.
     job_finder: Optional[Callable[..., Optional[str]]] = None
+    # live-mode only: given a Slurm JobID, returns a small object with active,
+    # inconclusive, rows and error attributes. Used to distinguish genuinely
+    # missing sacct array rows from throttled jobs that are still visible in
+    # squeue.
+    job_liveness_checker: Optional[Callable[[str], Any]] = None
 
     #internal flags; not part of the public dataclass surface.
     _shutdown_requested: bool = field(default=False, init=False, repr=False)
@@ -695,6 +701,37 @@ class Daemon:
 
         missing_key = job_id + ":MISSING"
         if int(getattr(summary, "n_missing", 0)) > 0:
+            liveness = self._check_job_liveness(job_id)
+            if liveness is not None and (
+                bool(getattr(liveness, "active", False))
+                or bool(getattr(liveness, "inconclusive", False))
+            ):
+                if missing_key in state.sacct_empty_streak:
+                    state.sacct_empty_streak.pop(missing_key, None)
+                    self._persist(state)
+                if bool(getattr(liveness, "active", False)):
+                    self._journal(
+                        "sacct_rows_missing_but_squeue_active",
+                        phase=phase.value,
+                        job_id=job_id,
+                        n_expected=getattr(summary, "n_expected", None),
+                        n_observed=int(getattr(summary, "n_observed", 0)),
+                        n_missing=int(getattr(summary, "n_missing", 0)),
+                        squeue_rows_sample=self._queue_rows_sample(liveness),
+                        iteration=state.iteration,
+                    )
+                else:
+                    self._journal(
+                        "squeue_liveness_inconclusive",
+                        phase=phase.value,
+                        job_id=job_id,
+                        n_expected=getattr(summary, "n_expected", None),
+                        n_observed=int(getattr(summary, "n_observed", 0)),
+                        n_missing=int(getattr(summary, "n_missing", 0)),
+                        error=str(getattr(liveness, "error", "") or "")[:200],
+                        iteration=state.iteration,
+                    )
+                return TickStatus.POLLING
             current = state.sacct_empty_streak.get(missing_key, 0) + 1
             state.sacct_empty_streak[missing_key] = current
             self._persist(state)
@@ -783,6 +820,32 @@ class Daemon:
             )
             return None
         return expected if expected > 0 else None
+
+    def _check_job_liveness(self, job_id: str) -> Optional[Any]:
+        if self.job_liveness_checker is None:
+            return None
+        try:
+            return self.job_liveness_checker(str(job_id))
+        except Exception as exc:
+            return SimpleNamespace(
+                active=False,
+                inconclusive=True,
+                rows=[],
+                error=type(exc).__name__ + ": " + str(exc),
+            )
+
+    @staticmethod
+    def _queue_rows_sample(liveness: Any, limit: int = 5) -> List[Dict[str, str]]:
+        rows = getattr(liveness, "rows", []) or []
+        out: List[Dict[str, str]] = []
+        for row in list(rows)[: max(0, int(limit))]:
+            try:
+                job, state = row
+            except Exception:
+                out.append({"job_id": str(row), "state": ""})
+                continue
+            out.append({"job_id": str(job), "state": str(state)})
+        return out
 
     def _postprocess(
         self,
