@@ -114,11 +114,13 @@ def test_campaign_config_block_submenus_show_values_and_edit_one_field(monkeypat
     rendered = resources_menu.this_menu_options()
     assert "resources.partition" in rendered
     assert "resources.walltime_hours" in rendered
+    assert "resources.aimall_cpus_per_task" in rendered
     assert "resources.gradient_parallel_backend" in rendered
 
     texts = [it.text for it in resources_menu.items]
     assert "Set partition" in texts
     assert "Set walltime_hours" in texts
+    assert "Set aimall_cpus_per_task" in texts
 
     cfg = menu.get_campaign_config()
     old_partition = cfg.resources.partition
@@ -291,6 +293,7 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
     assert "acquisition.spectral.mode: blend" in out
     assert "acquisition.calibrated_energy.utility: banded" in out
     assert "acquisition.fullspace_confinement.enabled: True" in out
+    assert "resources.aimall_cpus_per_task: 8" in out
 
 
 def test_daemon_control_sampling_protocol_summary_uses_saved_campaign(tmp_path, monkeypatch, capsys):
@@ -706,6 +709,7 @@ def test_campaign_config_load_edit_save_preserves_hidden_fields(tmp_path, monkey
             "mem_per_cpu": "5G",
             "cpus_per_task": 4,
             "ntasks": 1,
+            "aimall_cpus_per_task": 6,
             "ariadne_cpus_per_task": 4,
             "gradient_parallel_backend": "serial",
         },
@@ -738,6 +742,7 @@ def test_campaign_config_load_edit_save_preserves_hidden_fields(tmp_path, monkey
     reloaded = CampaignConfig.from_yaml(tmp_path / "campaign.yaml")
     assert reloaded.system_name == "WATER_AL"
     assert reloaded.resources.walltime_hours == 12
+    assert reloaded.resources.aimall_cpus_per_task == 6
     assert reloaded.resources.gradient_parallel_backend == "serial"
     assert reloaded.gaussian.method == "PBE0"
     assert reloaded.ferebus.properties == ["iqa", "q00"]

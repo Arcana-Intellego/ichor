@@ -240,8 +240,10 @@ Slurm allocation via `GAUSS_PDEF` and `GAUSS_MDEF` by default, rather than
 hard-coding `%NProcShared` or `%mem` inside every `.gjf`. For a cautious first
 smoke leaves `resources.array_concurrency_limit: null` so Gaussian/AIMAll
 arrays can run with as much concurrency as Slurm policy and cluster load allow.
-For larger shared-cluster campaigns you can set `resources.array_concurrency_limit`
-to throttle arrays with Slurm's `--array=...%N` syntax.
+It also sets `resources.aimall_cpus_per_task: 8` to avoid making AIMAll the
+first-smoke bottleneck. For larger shared-cluster campaigns you can set
+`resources.array_concurrency_limit` to throttle arrays with Slurm's
+`--array=...%N` syntax.
 
 If a path is missing or points at a non-executable file, the daemon
 refuses to start with a message naming the offending key. Confirm by
@@ -303,6 +305,7 @@ resources:
   mem_per_cpu: auto
   cpus_per_task: 2
   ntasks: 1
+  aimall_cpus_per_task: 8
   ariadne_cpus_per_task: 8
   array_concurrency_limit: null
 

@@ -263,6 +263,9 @@ class EditCampaignConfigFunctions:
             "resources.cpus_per_task: ", r.cpus_per_task,
         )
         r.ntasks = user_input_int("resources.ntasks: ", r.ntasks)
+        r.aimall_cpus_per_task = user_input_int(
+            "resources.aimall_cpus_per_task: ", r.aimall_cpus_per_task,
+        )
         r.ariadne_cpus_per_task = user_input_int(
             "resources.ariadne_cpus_per_task: ", r.ariadne_cpus_per_task,
         )
@@ -770,6 +773,7 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("resources.mem_per_cpu", "str", prompt="resources.mem_per_cpu (SLURM style, e.g. 4G): "),
             _spec("resources.cpus_per_task", "int"),
             _spec("resources.ntasks", "int"),
+            _spec("resources.aimall_cpus_per_task", "int"),
             _spec("resources.ariadne_cpus_per_task", "int"),
             _spec("resources.array_concurrency_limit", "optional_int"),
             _spec("resources.gradient_parallel_backend", "choice", choices=sorted(VALID_GRADIENT_PARALLEL_BACKENDS)),

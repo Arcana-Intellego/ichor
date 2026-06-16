@@ -796,6 +796,7 @@ def test_build_sbatch_script_renders_aimall_block(monkeypatch):
         config=CampaignConfig(),
     )
     assert shlex.quote("/opt/AIM All/aimqb.ish") + " -nogui -encomp=3 input.wfn" in body
+    assert "#SBATCH --cpus-per-task=8" in body
     assert "AIMALL-3" in body
 
 

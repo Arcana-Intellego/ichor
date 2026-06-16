@@ -199,9 +199,11 @@ ichor-al-daemon start --live --campaign-dir . --max-ticks 200
 
 The smoke config leaves Slurm arrays unthrottled with
 `resources.array_concurrency_limit: null`, so Gaussian and AIMAll can use as
-much concurrency as Slurm policy and current cluster load allow. If you set a
-manual `%N` array throttle later, keep `runtime.poll_sacct_missing_max_ticks`
-generous because throttled pending rows may not appear in `sacct` immediately.
+much concurrency as Slurm policy and current cluster load allow. It also sets
+`resources.aimall_cpus_per_task: 8` because AIMAll is usually the slowest first
+smoke phase on CSF3. If you set a manual `%N` array throttle later, keep
+`runtime.poll_sacct_missing_max_ticks` generous because throttled pending rows
+may not appear in `sacct` immediately.
 
 The generated Gaussian scripts should use `#!/bin/bash --login`, the CSF3
 Gaussian module, `GAUSS_SCRDIR`, `GAUSS_PDEF`, and `GAUSS_MDEF`. The generated

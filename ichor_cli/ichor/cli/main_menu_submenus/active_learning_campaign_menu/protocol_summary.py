@@ -117,6 +117,9 @@ def format_sampling_protocol_summary(config: CampaignConfig) -> str:
     )
     lines.append(_line("resources.partition", resources.partition))
     lines.append(_line("resources.mem_per_cpu", resources.mem_per_cpu))
+    lines.append(_line("resources.cpus_per_task", resources.cpus_per_task))
+    lines.append(_line("resources.aimall_cpus_per_task", resources.aimall_cpus_per_task))
+    lines.append(_line("resources.ariadne_cpus_per_task", resources.ariadne_cpus_per_task))
     lines.append(
         _line("resources.array_concurrency_limit", resources.array_concurrency_limit)
     )

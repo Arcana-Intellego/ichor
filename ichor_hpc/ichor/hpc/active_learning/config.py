@@ -516,8 +516,9 @@ class StopConfigBlock:
 @dataclass
 class ResourceConfigBlock:
     # SLURM resources for the sbatch phases. defaults suit the small CSF4 smoke
-    # jobs; bump them per campaign. ARIADNE gets its own core count because its
-    # array tasks parallelise the acquisition gradient across those cores.
+    # jobs; bump them per campaign. ARIADNE and AIMAll get their own core counts
+    # because their scaling and queue-time trade-offs differ from light wrapper
+    # phases.
     partition: str = "multicore"
     walltime_hours: int = 24
     # Per-core memory, NOT per-job. "auto" resolves from the active cluster
@@ -526,6 +527,7 @@ class ResourceConfigBlock:
     mem_per_cpu: str = "auto"
     cpus_per_task: int = 1
     ntasks: int = 1
+    aimall_cpus_per_task: int = 8
     ariadne_cpus_per_task: int = 8
     array_concurrency_limit: Optional[int] = None
     # "process" -> node-local process pool sized to the task's cpus-per-task.
@@ -533,6 +535,8 @@ class ResourceConfigBlock:
     gradient_parallel_backend: str = "process"
 
     def cpus_for(self, phase_name: str) -> int:
+        if phase_name in ("INITIAL_AIMALL", "AIMALL"):
+            return int(self.aimall_cpus_per_task)
         if phase_name == "ARIADNE_ARRAY":
             return int(self.ariadne_cpus_per_task)
         return int(self.cpus_per_task)
@@ -697,6 +701,10 @@ class CampaignConfig:
         _validate_positive_int("resources.walltime_hours", self.resources.walltime_hours)
         _validate_positive_int("resources.cpus_per_task", self.resources.cpus_per_task)
         _validate_positive_int("resources.ntasks", self.resources.ntasks)
+        _validate_positive_int(
+            "resources.aimall_cpus_per_task",
+            self.resources.aimall_cpus_per_task,
+        )
         _validate_positive_int(
             "resources.ariadne_cpus_per_task",
             self.resources.ariadne_cpus_per_task,

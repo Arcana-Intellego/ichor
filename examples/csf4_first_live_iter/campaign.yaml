@@ -28,6 +28,7 @@ resources:
   mem_per_cpu: auto
   cpus_per_task: 2
   ntasks: 1
+  aimall_cpus_per_task: 8
   ariadne_cpus_per_task: 8
   array_concurrency_limit: null
 

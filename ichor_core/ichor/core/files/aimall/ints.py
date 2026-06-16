@@ -60,7 +60,7 @@ class IntDirectory(HasData, AnnotatedDirectory):
         """
 
         out: Dict[str, Dict[str, float]] = {}
-        for atom_name, int_file_instance in self.items():
+        for int_file_instance in self.ints:
             atom_label = str(int_file_instance.atom_name)
             try:
                 c_matrix = C_dict[atom_label]

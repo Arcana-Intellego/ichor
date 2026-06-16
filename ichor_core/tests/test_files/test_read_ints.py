@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import numpy as np
+
 from ichor.core.files import IntDirectory
 
 from tests.path import get_cwd
@@ -151,6 +153,11 @@ def _test_ints(
     }
 
     _assert_val_optional(int_dir_instance.raw_data, expected_raw_data)
+    props = int_dir_instance.properties(
+        {atom_name: np.eye(3) for atom_name in expected_raw_data}
+    )
+    assert sorted(props) == ["H2", "H3", "O1"]
+    assert props["O1"]["iqa"] == expected_raw_data["O1"]["iqa"]
 
 
 def test_water_ints_dir():
