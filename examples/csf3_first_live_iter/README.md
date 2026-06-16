@@ -157,7 +157,6 @@ csf3:
     gaussian:
       executable_path: "$g09root/g09/g09"
       modules: ["apps/binapps/gaussian/g09d01_em64t"]
-      scratch_root: "/scratch/$USER"
 
     aimall:
       executable_path: "~/AIMAll/aimqb.ish"
@@ -206,9 +205,11 @@ smoke phase on CSF3. If you set a manual `%N` array throttle later, keep
 may not appear in `sacct` immediately.
 
 The generated Gaussian scripts should use `#!/bin/bash --login`, the CSF3
-Gaussian module, `GAUSS_SCRDIR`, `GAUSS_PDEF`, and `GAUSS_MDEF`. The generated
-FEREBUS script should come from pyferebus with `platform="CSF3"` and the
-configured executable.
+Gaussian module, `GAUSS_SCRDIR`, `GAUSS_PDEF`, and `GAUSS_MDEF`. Gaussian
+scratch is daemon-owned under `.DATA/SCRATCH/GAUSSIAN/<phase>/`; successful
+Gaussian tasks remove their own scratch directory, while failed tasks keep it
+for diagnosis. The generated FEREBUS script should come from pyferebus with
+`platform="CSF3"` and the configured executable.
 
 If the journal reports `sacct_rows_missing_but_squeue_active`, the daemon has
 seen that `sacct` is lagging while `squeue` still shows active array tasks, so

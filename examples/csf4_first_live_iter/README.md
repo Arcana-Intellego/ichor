@@ -211,7 +211,6 @@ csf4:
     gaussian:
       executable_path: "$g16root/g16/g16"
       modules: ["gaussian/g16c01_em64t_detectcpu"]
-      scratch_root: "/scratch/$USER"
 
     python:
       env_name: "ichor-csf4"
@@ -237,12 +236,14 @@ root that you can copy + edit.
 The active-learning daemon defaults to `resources.mem_per_cpu: auto`. On CSF4
 that resolves to 4G/core from the profile above. Gaussian live jobs use the
 Slurm allocation via `GAUSS_PDEF` and `GAUSS_MDEF` by default, rather than
-hard-coding `%NProcShared` or `%mem` inside every `.gjf`. For a cautious first
-smoke leaves `resources.array_concurrency_limit: null` so Gaussian/AIMAll
-arrays can run with as much concurrency as Slurm policy and cluster load allow.
-It also sets `resources.aimall_cpus_per_task: 8` to avoid making AIMAll the
-first-smoke bottleneck. For larger shared-cluster campaigns you can set
-`resources.array_concurrency_limit` to throttle arrays with Slurm's
+hard-coding `%NProcShared` or `%mem` inside every `.gjf`. Gaussian scratch is
+daemon-owned under `.DATA/SCRATCH/GAUSSIAN/<phase>/`; successful Gaussian tasks
+remove their own scratch directory, while failed tasks keep it for diagnosis.
+For a cautious first smoke leaves `resources.array_concurrency_limit: null` so
+Gaussian/AIMAll arrays can run with as much concurrency as Slurm policy and
+cluster load allow. It also sets `resources.aimall_cpus_per_task: 8` to avoid
+making AIMAll the first-smoke bottleneck. For larger shared-cluster campaigns
+you can set `resources.array_concurrency_limit` to throttle arrays with Slurm's
 `--array=...%N` syntax.
 
 If a path is missing or points at a non-executable file, the daemon

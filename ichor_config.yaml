@@ -21,7 +21,6 @@ csf3:
     gaussian:
       executable_path: "$g09root/g09/g09"
       modules: ["apps/binapps/gaussian/g09d01_em64t"]
-      scratch_root: "/scratch/$USER"
 
     aimall:
       executable_path: "~/AIMAll/aimqb.ish"

@@ -2539,20 +2539,6 @@ def _configured_ferebus_platform() -> str:
     return value
 
 
-def _configured_gaussian_scratch_root() -> str:
-    raw = profile_value(
-        "software", "gaussian", "scratch_root", default="/scratch/${USER}"
-    )
-    value = str(raw).strip() if raw is not None else "/scratch/${USER}"
-    _reject_shell_control_chars("configured gaussian scratch_root", value)
-    if not _SHELL_PATH_FRAGMENT_RE.fullmatch(value):
-        raise BackendSubmissionError(
-            "configured gaussian scratch_root contains unsafe characters: "
-            + repr(value)
-        )
-    return value
-
-
 def _configured_daemon_runtime_modules() -> List[str]:
     """Modules loaded by daemon-owned live sbatch scripts.
 
@@ -2676,6 +2662,7 @@ def build_sbatch_script(
 
     if phase_name in ("INITIAL_GAUSSIAN", "GAUSSIAN"):
         lines += _gaussian_invocation_block(
+            phase_name,
             iteration,
             camp,
             config,
@@ -2700,6 +2687,7 @@ def build_sbatch_script(
 
 
 def _gaussian_invocation_block(
+    phase_name,
     iteration,
     camp,
     config,
@@ -2713,18 +2701,27 @@ def _gaussian_invocation_block(
         ["gaussian/g16c01_em64t_detectcpu"],
     )
     gaussian_exe = _configured_backend_shell_executable("gaussian", "g16")
-    scratch_root = _configured_gaussian_scratch_root()
     mdef_gb = _gaussian_mdef_gb(config, mem_per_cpu, int(gaussian_cores))
     points_file_q = _shell_quote(points_file)
+    camp_q = _shell_quote(camp)
+    phase_q = _shell_quote(str(phase_name))
     return [
         *["module load " + m for m in gaussian_modules],
         "",
         "# per-point gaussian array: task N runs the Nth staged pointdir.",
-        "export GAUSS_SCRATCH_ROOT=" + scratch_root,
-        'export GAUSS_SCRDIR="${GAUSS_SCRATCH_ROOT%/}/ichor_gaussian_${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"',
+        "export ICHOR_CAMPAIGN_DIR=" + camp_q,
+        "export ICHOR_GAUSSIAN_PHASE=" + phase_q,
+        'export GAUSS_SCRDIR="${ICHOR_CAMPAIGN_DIR}/.DATA/SCRATCH/GAUSSIAN/${ICHOR_GAUSSIAN_PHASE}/${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"',
         'export GAUSS_PDEF="${SLURM_CPUS_PER_TASK:-1}"',
         "export GAUSS_MDEF=" + str(int(mdef_gb)) + "GB",
         'mkdir -p "$GAUSS_SCRDIR"',
+        'echo "GAUSS_SCRDIR=$GAUSS_SCRDIR"',
+        "cleanup_gaussian_scratch_success() {",
+        '  case "$GAUSS_SCRDIR" in',
+        '    "$ICHOR_CAMPAIGN_DIR"/.DATA/SCRATCH/GAUSSIAN/*/"$SLURM_JOB_ID"_*) rm -rf -- "$GAUSS_SCRDIR" ;;',
+        '    *) echo "Refusing to remove unexpected Gaussian scratch path: $GAUSS_SCRDIR" >&2 ;;',
+        "  esac",
+        "}",
         # check the file FIRST -- under set -e a failing sed (missing POINTS.txt) aborts the
         # assignment before the friendly -z guard below ever runs, leaving just a bare sed error.
         "if [ ! -f " + points_file_q + " ]; then echo "
@@ -2733,7 +2730,14 @@ def _gaussian_invocation_block(
         'POINT_DIR=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" ' + points_file_q + ")",
         'if [ -z "$POINT_DIR" ]; then echo "no pointdir for index $SLURM_ARRAY_TASK_ID" >&2; exit 1; fi',
         'cd "$POINT_DIR"',
-        gaussian_exe + " < input.gjf > input.gau",
+        "GAUSSIAN_EXIT=0",
+        gaussian_exe + " < input.gjf > input.gau || GAUSSIAN_EXIT=$?",
+        'if [ "$GAUSSIAN_EXIT" -eq 0 ]; then',
+        "  cleanup_gaussian_scratch_success",
+        "else",
+        '  echo "Gaussian failed; keeping scratch at $GAUSS_SCRDIR" >&2',
+        '  exit "$GAUSSIAN_EXIT"',
+        "fi",
     ]
 
 

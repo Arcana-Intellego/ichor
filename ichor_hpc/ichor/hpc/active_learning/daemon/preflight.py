@@ -22,6 +22,7 @@ import shutil
 from dataclasses import dataclass
 from typing import List
 
+from .import_utils import quiet_import_module
 from .cluster_profile import (
     ClusterProfileError,
     active_machine,
@@ -148,7 +149,7 @@ def _polus_rs_importable() -> bool:
     # subtree, not the full polus package (managers/descriptors drag in
     # sklearn/torch). probe exactly what we import.
     try:
-        importlib.import_module("polus.samplers.RS.randomSampling")
+        quiet_import_module("polus.samplers.RS.randomSampling")
     except Exception:
         return False
     return True

@@ -719,7 +719,6 @@ if machine == "csf3":
             "gaussian": {
                 "executable_path": "$g09root/g09/g09",
                 "modules": ["apps/binapps/gaussian/g09d01_em64t"],
-                "scratch_root": "/scratch/$USER",
             },
             "aimall": {"executable_path": aimall_path},
             "ferebus": {"executable_path": ferebus_path, "pyferebus_platform": "CSF3"},
@@ -756,7 +755,6 @@ else:
             "gaussian": {
                 "executable_path": "$g16root/g16/g16",
                 "modules": ["gaussian/g16c01_em64t_detectcpu"],
-                "scratch_root": "/scratch/$USER",
             },
             "aimall": {"executable_path": aimall_path},
             "ferebus": {"executable_path": ferebus_path, "pyferebus_platform": "CSF4"},

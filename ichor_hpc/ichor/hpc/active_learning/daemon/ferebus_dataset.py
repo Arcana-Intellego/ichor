@@ -26,6 +26,8 @@ import re
 from pathlib import Path
 from typing import Dict, List, Mapping, Sequence, Tuple
 
+from .import_utils import quiet_import_module
+
 # feature column written with an alf suffix, e.g. f1_O3 -> we want f1. anything
 # that is not f-then-digits-then-underscore (iqa, integration_error, q00) is left
 # exactly as-is.
@@ -104,7 +106,7 @@ def split_indices(
     Determinism is the caller's job: seed `random` before calling if a
     reproducible split is wanted (RS uses the stdlib `random` module).
     """
-    from polus.samplers.RS.randomSampling import RS
+    RS = quiet_import_module("polus.samplers.RS.randomSampling").RS
 
     n = _row_count(source_csv)
     n_tr, n_iv, n_ev = plan_sizes(n, fractions)

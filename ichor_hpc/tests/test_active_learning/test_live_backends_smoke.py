@@ -132,6 +132,24 @@ def test_check_backends_returns_structured_result():
     assert isinstance(a.ariadne, bool)
 
 
+def test_quiet_import_module_suppresses_import_time_banner(monkeypatch, capsys):
+    from ichor.hpc.active_learning.daemon import import_utils
+
+    def noisy_import(module_name):
+        print("POLUS banner on stdout")
+        print("POLUS banner on stderr", file=sys.stderr)
+        return SimpleNamespace(module_name=module_name)
+
+    monkeypatch.setattr(import_utils.importlib, "import_module", noisy_import)
+
+    module = import_utils.quiet_import_module("polus.samplers.RS.randomSampling")
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+    assert module.module_name == "polus.samplers.RS.randomSampling"
+
+
 def test_default_profile_is_not_live_active_learning_profile(monkeypatch):
     _install_fake_global_variables(
         monkeypatch,
@@ -456,7 +474,6 @@ def test_csf3_gaussian_block_uses_configured_module_path_and_scratch(monkeypatch
                     "gaussian": {
                         "modules": ["apps/binapps/gaussian/g16c01_em64t_detectcpu"],
                         "executable_path": "$g16root/g16/g16",
-                        "scratch_root": "/scratch/$USER",
                     }
                 },
             }
@@ -473,8 +490,12 @@ def test_csf3_gaussian_block_uses_configured_module_path_and_scratch(monkeypatch
     assert body.startswith("#!/bin/bash --login")
     assert "module load apps/binapps/gaussian/g16c01_em64t_detectcpu" in body
     assert "$g16root/g16/g16 < input.gjf > input.gau" in body
-    assert "export GAUSS_SCRATCH_ROOT=/scratch/$USER" in body
-    assert 'export GAUSS_SCRDIR="${GAUSS_SCRATCH_ROOT%/}/ichor_gaussian_${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"' in body
+    assert "export ICHOR_CAMPAIGN_DIR=/scratch/campaign" in body
+    assert "export ICHOR_GAUSSIAN_PHASE=INITIAL_GAUSSIAN" in body
+    assert 'export GAUSS_SCRDIR="${ICHOR_CAMPAIGN_DIR}/.DATA/SCRATCH/GAUSSIAN/${ICHOR_GAUSSIAN_PHASE}/${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"' in body
+    assert 'rm -rf -- "$GAUSS_SCRDIR"' in body
+    assert "Gaussian failed; keeping scratch at $GAUSS_SCRDIR" in body
+    assert "ichor_gaussian_${SLURM_JOB_ID}" not in body
     assert 'export GAUSS_PDEF="${SLURM_CPUS_PER_TASK:-1}"' in body
     assert "export GAUSS_MDEF=6GB" in body
 
