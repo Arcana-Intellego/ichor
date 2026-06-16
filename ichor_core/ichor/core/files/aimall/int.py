@@ -384,3 +384,48 @@ class Int(ReadFile, HasData):
             local_spherical_multipoles[hexadecapole_name] = hexadecapole_value
 
         return local_spherical_multipoles
+
+    def _finite_float_property(self, name: str, value) -> float:
+        try:
+            out = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "AIMAll .int property "
+                + str(name)
+                + " is not numeric in "
+                + str(self.path)
+            ) from exc
+        if not np.isfinite(out):
+            raise ValueError(
+                "AIMAll .int property "
+                + str(name)
+                + " is not finite in "
+                + str(self.path)
+            )
+        return out
+
+    def properties(self, C: np.ndarray) -> Dict[str, float]:
+        """Return FEREBUS-training properties for this AIMAll atom.
+
+        ``IntDirectory.properties`` calls this during
+        ``PointsDirectory.features_with_properties_to_csv``.  FEREBUS expects
+        scalar IQA/integration values plus local-frame multipoles keyed by the
+        existing ICHOR property names.
+        """
+        props: Dict[str, float] = {
+            "iqa": self._finite_float_property("iqa", self.iqa),
+            "integration_error": self._finite_float_property(
+                "integration_error",
+                self.integration_error,
+            ),
+        }
+        try:
+            multipoles = self.local_spherical_multipoles(C)
+        except Exception as exc:
+            raise ValueError(
+                "failed to calculate local multipoles for AIMAll .int file "
+                + str(self.path)
+            ) from exc
+        for name, value in multipoles.items():
+            props[str(name)] = self._finite_float_property(str(name), value)
+        return props

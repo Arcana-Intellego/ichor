@@ -99,11 +99,14 @@ def _test_int(
     # these require having a C matrix to rotate multipoles
     # TODO: If dipole magnitude stays the same since we are rotating only, technically can use original multipoles.
     if C_matrix is not None and local_spherical_multipoles is not None:
-        _assert_val_optional(
-            int_file_instance.local_spherical_multipoles(C_matrix),
-            local_spherical_multipoles,
-        )
+        local_multipoles = int_file_instance.local_spherical_multipoles(C_matrix)
+        _assert_val_optional(local_multipoles, local_spherical_multipoles)
         _assert_val_optional(int_file_instance.dipole_mag, dipole_mag)
+        properties = int_file_instance.properties(C_matrix)
+        assert properties["iqa"] == pytest.approx(iqa)
+        assert properties["integration_error"] == pytest.approx(integration_error)
+        for name, value in local_multipoles.items():
+            assert properties[name] == pytest.approx(value)
 
     _assert_val_optional(int_file_instance.total_time, total_time)
 

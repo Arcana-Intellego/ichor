@@ -59,10 +59,28 @@ class IntDirectory(HasData, AnnotatedDirectory):
             with the int file does not exist. Then we cannot calculate multipoles.
         """
 
-        return {
-            atom_name: int_file_instance.properties(C_dict[int_file_instance.atom_name])
-            for atom_name, int_file_instance in self.items()
-        }
+        out: Dict[str, Dict[str, float]] = {}
+        for atom_name, int_file_instance in self.items():
+            atom_label = str(int_file_instance.atom_name)
+            try:
+                c_matrix = C_dict[atom_label]
+            except KeyError as exc:
+                raise KeyError(
+                    "missing C matrix for AIMAll atom "
+                    + atom_label
+                    + " while parsing "
+                    + str(int_file_instance.path)
+                ) from exc
+            try:
+                out[atom_label] = int_file_instance.properties(c_matrix)
+            except Exception as exc:
+                raise ValueError(
+                    "failed to parse AIMAll .int properties for atom "
+                    + atom_label
+                    + " in "
+                    + str(int_file_instance.path)
+                ) from exc
+        return out
 
     # TODO: remove, add to processing data
     # def local_spherical_multipoles(

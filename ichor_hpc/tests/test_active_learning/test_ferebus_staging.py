@@ -3,13 +3,20 @@
 The daemon stages pyferebus's flat property directories, a pyferebus job-details file, and a
 strict daemon manifest. pyferebus itself later moves the CSVs into per-atom datasets folders.
 """
+import csv
 import json
+import math
+import os
+from pathlib import Path
 
 import ichor.core.files as core_files
 
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.daemon import input_staging as stg
 from ichor.hpc.active_learning.versioning.manifest import ManifestMismatchError, write_manifest
+
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "live_outputs"
 
 
 class _FakePointsDirectory:
@@ -118,3 +125,40 @@ def test_stage_ferebus_inputs_rejects_unmanifested_committed_pointdir(tmp_path, 
         pass
     else:
         raise AssertionError("unmanifested committed pointdir was not rejected")
+
+
+def test_real_points_directory_exports_iqa_csv_from_aimall_fixtures(tmp_path):
+    """Regression for the live INITIAL_FEREBUS handoff.
+
+    Accepted AIMAll pointdirs must expose per-atom properties through
+    PointsDirectory.features_with_properties_to_csv(), because FEREBUS staging
+    builds its training CSVs from this API.
+    """
+    from ichor.core.calculators.alf import calculate_alf_atom_sequence
+    from ichor.core.files import PointsDirectory
+
+    points = PointsDirectory(FIXTURES / "initial_quantum")
+    point_count = sum(1 for _ in points)
+    system_alf = points.alf_dict(calculate_alf_atom_sequence)
+
+    cwd = os.getcwd()
+    try:
+        os.chdir(tmp_path)
+        points.features_with_properties_to_csv(
+            system_alf,
+            str_to_append_to_fname="_train.csv",
+            property_types=["iqa"],
+        )
+    finally:
+        os.chdir(cwd)
+
+    csv_paths = sorted(tmp_path.glob("*_train.csv"))
+    assert csv_paths
+    for csv_path in csv_paths:
+        with open(csv_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+        assert "iqa" in (reader.fieldnames or [])
+        assert len(rows) == point_count
+        for row in rows:
+            assert math.isfinite(float(row["iqa"]))
