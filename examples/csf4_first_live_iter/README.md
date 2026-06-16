@@ -295,11 +295,31 @@ seed_selection:
   n_seeds_per_iteration: 4
   bulk_fraction: 0.5
 
+resources:
+  partition: multicore
+  walltime_hours: 2
+  mem_per_cpu: auto
+  cpus_per_task: 2
+  ntasks: 1
+  ariadne_cpus_per_task: 8
+  array_concurrency_limit: 2
+
+gaussian:
+  nproc: 2
+  memory_mode: slurm_env
+
 ariadne:
   optimiser: trust_region_qn
   hessian_model: ALMLOF
   max_iter: 50
   gradf_tol: 1.0e-4
+
+runtime:
+  poll_sacct_missing_max_ticks: 30
+  poll_sacct_unknown_max_ticks: 3
+  postprocess_settle_attempts: 3
+  postprocess_settle_seconds: 10
+  transient_phase_retry_max: 1
 ```
 
 These are deliberately tight numbers (small initial sample, few seeds,
@@ -321,6 +341,12 @@ another shell:
 ```
 ichor-al-daemon journal --campaign-dir . | tail -n 20
 ```
+
+The smoke config intentionally throttles Slurm arrays with
+`resources.array_concurrency_limit: 2`. Because throttled pending rows may not
+appear in `sacct` immediately on every cluster, the shipped config sets
+`runtime.poll_sacct_missing_max_ticks: 30`. Do not lower that for throttled
+live runs unless you also remove the array throttle.
 
 Every state transition lands as a `phase_transition` event; every
 successful sbatch postprocess lands as a `phase_succeeded_live` event.
@@ -405,6 +431,11 @@ reasonable.
 trajectory is too short (under ~20 frames). use a longer trajectory; the
 test fixture only has 20 frames which is OK for the smoke but production
 wants 200+.
+
+**sacct_missing_timeout while `squeue` still shows array jobs**. happens when
+array throttling keeps later tasks pending and CSF accounting has not emitted
+all expected task rows yet. increase `runtime.poll_sacct_missing_max_ticks` or
+remove `resources.array_concurrency_limit` for the smoke.
 
 **oneAPI import error at ARIADNE_ARRAY start**. usually means the
 operator did not activate the venv before invoking the daemon. SLURM

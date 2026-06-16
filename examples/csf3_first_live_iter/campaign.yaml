@@ -39,6 +39,8 @@ ariadne:
   gradf_tol: 1.0e-4
 
 runtime:
+  poll_sacct_missing_max_ticks: 30
+  poll_sacct_unknown_max_ticks: 3
   postprocess_settle_attempts: 3
   postprocess_settle_seconds: 10
   transient_phase_retry_max: 1

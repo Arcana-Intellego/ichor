@@ -398,6 +398,8 @@ def test_shipped_active_learning_examples_are_resource_safe(relative_path):
     assert cfg.resources.partition == "multicore"
     assert cfg.resources.cpus_per_task >= 2
     assert cfg.gaussian.nproc <= cfg.resources.cpus_per_task
+    if "first_live_iter" in relative_path and cfg.resources.array_concurrency_limit is not None:
+        assert cfg.runtime.poll_sacct_missing_max_ticks >= 30
 
 
 def test_invalid_warmstart_rejected():
