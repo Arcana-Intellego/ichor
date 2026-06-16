@@ -717,8 +717,8 @@ if machine == "csf3":
         "software": {
             "python": {"env_name": "ichor-csf3", "python_path": python_path, "modules": []},
             "gaussian": {
-                "executable_path": "$g16root/g16/g16",
-                "modules": ["apps/binapps/gaussian/g16c01_em64t_detectcpu"],
+                "executable_path": "$g09root/g09/g09",
+                "modules": ["apps/binapps/gaussian/g09d01_em64t"],
                 "scratch_root": "/scratch/$USER",
             },
             "aimall": {"executable_path": aimall_path},

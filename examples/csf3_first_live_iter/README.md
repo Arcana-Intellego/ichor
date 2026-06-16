@@ -112,9 +112,11 @@ module search aimall
 which sbatch sacct squeue bc
 ```
 
-Gaussian 16 requires access to the Manchester Gaussian license group. AIMAll may
-be available centrally or via a group/user install; record the actual `aimqb.ish`
-path in `~/ichor_config.yaml`.
+The default CSF3 example profile uses Gaussian 09 because that module is
+protected by the older `gaussian` group. Gaussian 16 on CSF3 is protected by
+the separate `gaussian16` group; switch the module/path only if RI has granted
+that access. AIMAll may be available centrally or via a group/user install;
+record the actual `aimqb.ish` path in `~/ichor_config.yaml`.
 
 Build or copy the FEREBUS Fortran executable outside the repo:
 
@@ -153,8 +155,8 @@ csf3:
       modules: []
 
     gaussian:
-      executable_path: "$g16root/g16/g16"
-      modules: ["apps/binapps/gaussian/g16c01_em64t_detectcpu"]
+      executable_path: "$g09root/g09/g09"
+      modules: ["apps/binapps/gaussian/g09d01_em64t"]
       scratch_root: "/scratch/$USER"
 
     aimall:
