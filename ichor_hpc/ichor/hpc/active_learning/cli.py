@@ -24,9 +24,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .config import CampaignConfig
 from .daemon.daemon import (
@@ -115,6 +116,227 @@ def _probe_daemon_lease(lease_path: Path) -> dict:
     except Exception as exc:
         status["lease_probe_error"] = type(exc).__name__ + ": " + str(exc)
     return status
+
+
+def _format_value(value: Any) -> str:
+    if value is None:
+        return "none"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, (list, tuple, set)):
+        return ", ".join(str(v) for v in value) if value else "none"
+    return str(value)
+
+
+def _section(title: str, rows: Iterable[tuple[str, Any]]) -> List[str]:
+    lines = [title]
+    for key, value in rows:
+        lines.append("  " + key + ": " + _format_value(value))
+    return lines
+
+
+def _heartbeat_summary(heartbeat: Any) -> str:
+    if not isinstance(heartbeat, dict):
+        return "none"
+    parts = []
+    host = heartbeat.get("host")
+    pid = heartbeat.get("pid")
+    phase = heartbeat.get("phase")
+    iteration = heartbeat.get("iteration")
+    if host:
+        parts.append(str(host))
+    if pid is not None:
+        parts.append("pid " + str(pid))
+    if phase:
+        parts.append("phase " + str(phase))
+    if iteration is not None:
+        parts.append("iter " + str(iteration))
+    try:
+        age = max(0.0, time.time() - float(heartbeat.get("time")))
+        parts.append("age " + str(int(round(age))) + "s")
+    except Exception:
+        pass
+    return ", ".join(parts) if parts else "present"
+
+
+def _lock_summary(lock_held: Any) -> str:
+    if lock_held is True:
+        return "held"
+    if lock_held is False:
+        return "free"
+    return "unknown"
+
+
+def _latest_journal_event(journal_path: Path, event_type: str) -> Optional[Dict[str, Any]]:
+    latest = None
+    if not journal_path.exists():
+        return None
+    for event in iter_events(journal_path):
+        if event.get("event") == event_type:
+            latest = event
+    return latest
+
+
+def _format_artifact_summary(status: Any, *, verbose: bool) -> List[str]:
+    if not isinstance(status, dict):
+        return _section("Artifacts", [("status", "unavailable")])
+    rows = []
+    for label in ("training", "models"):
+        item = status.get(label)
+        if isinstance(item, dict):
+            ok = "ok" if item.get("ok") else "problem"
+            version = item.get("version")
+            rows.append((label + " v" + str(version), ok))
+            if verbose:
+                for error in item.get("errors") or []:
+                    rows.append(("  " + label + " error", error))
+        elif item is not None:
+            rows.append((label, item))
+    if "error" in status:
+        rows.append(("error", status.get("error")))
+    return _section("Artifacts", rows or [("status", "not checked")])
+
+
+def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path) -> str:
+    lines: List[str] = []
+    lines.extend(
+        _section(
+            "Campaign",
+            [
+                ("phase", payload.get("phase")),
+                (
+                    "iteration",
+                    str(payload.get("iteration")) + " / max " + str(payload.get("max_iterations")),
+                ),
+                ("uid", payload.get("campaign_uid")),
+                ("started", payload.get("campaign_started_iso")),
+            ],
+        )
+    )
+    pending = payload.get("pending_jobs")
+    job_rows = []
+    if isinstance(pending, dict) and pending:
+        for phase, job_id in sorted(pending.items()):
+            job_rows.append((str(phase), job_id if job_id else "done"))
+    else:
+        job_rows.append(("pending", "none"))
+    lines.append("")
+    lines.extend(_section("Jobs", job_rows))
+    lease = "active: " + _heartbeat_summary(payload.get("lease_heartbeat"))
+    if not payload.get("lease_dir_exists"):
+        lease = "none"
+    lines.append("")
+    lines.extend(
+        _section(
+            "Runtime",
+            [
+                ("lock", _lock_summary(payload.get("lock_held"))),
+                ("lease", lease),
+                ("shutdown_requested", payload.get("shutdown_requested")),
+            ],
+        )
+    )
+    if payload.get("phase") == "HALTED":
+        halt = _latest_journal_event(journal_path, "halt")
+        lines.append("")
+        lines.extend(
+            _section(
+                "Halt",
+                [
+                    ("reason", (halt or {}).get("reason", "unknown")),
+                    ("from_phase", (halt or {}).get("from_phase")),
+                ],
+            )
+        )
+    lines.append("")
+    lines.extend(
+        _format_artifact_summary(
+            payload.get("artifact_manifest_status"),
+            verbose=verbose,
+        )
+    )
+    if verbose:
+        lines.append("")
+        lines.extend(
+            _section(
+                "Paths",
+                [
+                    ("state", payload.get("state_path")),
+                    ("lock", payload.get("lock_path")),
+                    ("lease", payload.get("lease_path")),
+                ],
+            )
+        )
+        if payload.get("lock_probe_error"):
+            lines.append("")
+            lines.extend(_section("Diagnostics", [("lock_probe_error", payload["lock_probe_error"])]))
+    return "\n".join(lines) + "\n"
+
+
+def _event_time(event: Dict[str, Any]) -> str:
+    ts = str(event.get("ts", ""))
+    if "T" in ts:
+        tail = ts.split("T", 1)[1]
+        return tail.split(".", 1)[0].replace("+00:00", "")
+    return ts[:8] if ts else "--:--:--"
+
+
+def _event_phase(event: Dict[str, Any]) -> str:
+    for key in ("phase", "to_phase", "from_phase"):
+        value = event.get(key)
+        if value is not None:
+            return str(value)
+    return "-"
+
+
+def _compact_event_details(event: Dict[str, Any]) -> str:
+    detail_keys = [
+        ("iteration", "iter"),
+        ("job_id", "job"),
+        ("expected_tasks", "tasks"),
+        ("n_tasks", "tasks"),
+        ("n_completed", "completed"),
+        ("n_failed", "failed"),
+        ("n_kept", "kept"),
+        ("n_rejected", "rejected"),
+        ("n_frames", "frames"),
+        ("action", "action"),
+        ("reason", "reason"),
+    ]
+    parts: List[str] = []
+    for key, label in detail_keys:
+        if key in event and event.get(key) is not None:
+            value = _format_value(event.get(key))
+            if key == "reason" and len(value) > 90:
+                value = value[:87] + "..."
+            parts.append(label + "=" + value)
+    return "  ".join(parts)
+
+
+def _format_journal_events(events: Sequence[Dict[str, Any]], *, verbose: bool) -> str:
+    if not events:
+        return ""
+    lines: List[str] = []
+    for event in events:
+        event_name = str(event.get("event", "<missing>"))
+        phase = _event_phase(event)
+        first_line = (
+            _event_time(event).ljust(8)
+            + "  "
+            + event_name.ljust(24)
+            + "  "
+            + phase.ljust(18)
+        )
+        details = _compact_event_details(event)
+        lines.append(first_line + (("  " + details) if details else ""))
+        if verbose:
+            for key in sorted(event):
+                if key in {"ts", "event", "phase", "to_phase", "from_phase"}:
+                    continue
+                lines.append("  " + key + ": " + _format_value(event[key]))
+    return "\n".join(lines) + "\n"
 
 
 def cmd_start(args: argparse.Namespace) -> int:
@@ -308,7 +530,17 @@ def cmd_status(args: argparse.Namespace) -> int:
             "ok": False,
             "error": type(exc).__name__ + ": " + str(exc),
         }
-    print(json.dumps(payload, indent=2, sort_keys=True))
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(
+            _format_status(
+                payload,
+                verbose=bool(getattr(args, "verbose", False)),
+                journal_path=paths["journal"],
+            ),
+            end="",
+        )
     return 0
 
 
@@ -375,8 +607,21 @@ def cmd_journal(args: argparse.Namespace) -> int:
         since=args.since,
         event_type=args.event_type or None,
     )
-    for event in iterator:
-        print(json.dumps(event, sort_keys=True))
+    events = list(iterator)
+    last_n = getattr(args, "last_n", None)
+    if last_n is not None:
+        events = events[-int(last_n):] if int(last_n) > 0 else []
+    if bool(getattr(args, "json", False)) or bool(getattr(args, "raw", False)):
+        for event in events:
+            print(json.dumps(event, sort_keys=True))
+    else:
+        print(
+            _format_journal_events(
+                events,
+                verbose=bool(getattr(args, "verbose", False)),
+            ),
+            end="",
+        )
     return 0
 
 
@@ -553,8 +798,18 @@ def build_parser() -> argparse.ArgumentParser:
     add_campaign(p_stop)
     p_stop.set_defaults(func=cmd_stop)
 
-    p_status = sub.add_parser("status", help="Print state.json as JSON.")
+    p_status = sub.add_parser("status", help="Print the current daemon status.")
     add_campaign(p_status)
+    p_status.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the raw state/status payload as JSON.",
+    )
+    p_status.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Include expanded artifact, lease, and path diagnostics.",
+    )
     p_status.set_defaults(func=cmd_status)
 
     p_resume = sub.add_parser(
@@ -595,6 +850,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_jrn.add_argument(
         "--event-type", action="append", default=None,
         help="Filter to one or more event types (repeatable).",
+    )
+    p_jrn.add_argument(
+        "--last-n",
+        type=int,
+        default=None,
+        help="Show only the last N events after filters are applied.",
+    )
+    p_jrn.add_argument(
+        "--json",
+        action="store_true",
+        help="Print filtered events as NDJSON.",
+    )
+    p_jrn.add_argument(
+        "--raw",
+        action="store_true",
+        help="Alias for --json; keeps one JSON event per line.",
+    )
+    p_jrn.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print expanded key/value details for each event.",
     )
     p_jrn.set_defaults(func=cmd_journal)
 

@@ -75,13 +75,13 @@ def test_cli_preflight_prints_structured_backend_status(capsys, monkeypatch):
     assert payload["python_executable"].endswith("ichor-al-csf3/bin/python")
 
 
-def test_cli_status_prints_state_json(tmp_path, capsys):
+def test_cli_status_json_prints_state_payload(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
     (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
     s = fresh_campaign_state(max_iterations=5)
     s.iteration = 3
     write_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME, s)
-    rc = main(["status", "--campaign-dir", str(campaign)])
+    rc = main(["status", "--campaign-dir", str(campaign), "--json"])
     assert rc == 0
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
@@ -93,6 +93,25 @@ def test_cli_status_prints_state_json(tmp_path, capsys):
     assert "artifact_manifest_status" in payload
 
 
+def test_cli_status_default_prints_readable_summary(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
+    s = fresh_campaign_state(max_iterations=5)
+    s.iteration = 3
+    write_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME, s)
+
+    rc = main(["status", "--campaign-dir", str(campaign)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Campaign\n" in out
+    assert "  phase: INIT" in out
+    assert "  iteration: 3 / max 5" in out
+    assert "Jobs\n" in out
+    assert "Runtime\n" in out
+    assert not out.lstrip().startswith("{")
+
+
 def test_cli_status_reports_stale_lock_file_as_not_held(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
     data = campaign / DEFAULT_DATA_SUBDIR
@@ -100,7 +119,7 @@ def test_cli_status_reports_stale_lock_file_as_not_held(tmp_path, capsys):
     write_state(data / DEFAULT_STATE_FILENAME, fresh_campaign_state())
     (data / DAEMON_LOCK_FILENAME).write_text("stale\n", encoding="utf-8")
 
-    rc = main(["status", "--campaign-dir", str(campaign)])
+    rc = main(["status", "--campaign-dir", str(campaign), "--json"])
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["lock_file_exists"] is True
@@ -136,7 +155,7 @@ def test_cli_status_reports_actually_held_lock(tmp_path, capsys):
     try:
         assert holder.stdout is not None
         assert holder.stdout.readline().strip() == "ready"
-        rc = main(["status", "--campaign-dir", str(campaign)])
+        rc = main(["status", "--campaign-dir", str(campaign), "--json"])
     finally:
         holder.terminate()
         try:
@@ -166,7 +185,7 @@ def test_cli_status_surfaces_lock_probe_error(tmp_path, capsys, monkeypatch):
             "lock_probe_error": "RuntimeError: boom",
         },
     )
-    rc = main(["status", "--campaign-dir", str(campaign)])
+    rc = main(["status", "--campaign-dir", str(campaign), "--json"])
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["lock_held"] is None
@@ -210,14 +229,17 @@ def test_cli_stop_when_no_state_returns_4(tmp_path):
     assert rc == 4
 
 
-def test_cli_journal_prints_filtered_events(tmp_path, capsys):
+def test_cli_journal_json_prints_filtered_events(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
     (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
     journal = campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson"
     append_event(journal, "alpha", x=1)
     append_event(journal, "beta", x=2)
     append_event(journal, "alpha", x=3)
-    rc = main(["journal", "--campaign-dir", str(campaign), "--event-type", "alpha"])
+    rc = main([
+        "journal", "--campaign-dir", str(campaign),
+        "--event-type", "alpha", "--json",
+    ])
     assert rc == 0
     captured = capsys.readouterr()
     lines = [l for l in captured.out.splitlines() if l.strip()]
@@ -225,6 +247,41 @@ def test_cli_journal_prints_filtered_events(tmp_path, capsys):
     for line in lines:
         payload = json.loads(line)
         assert payload["event"] == "alpha"
+
+
+def test_cli_journal_default_prints_readable_events(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
+    journal = campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson"
+    append_event(journal, "alpha", x=1)
+    append_event(journal, "beta", x=2)
+    append_event(journal, "alpha", x=3)
+
+    rc = main(["journal", "--campaign-dir", str(campaign), "--last-n", "2"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    lines = [line for line in out.splitlines() if line.strip()]
+    assert len(lines) == 2
+    assert "alpha" in out
+    assert "beta" in out
+    assert not out.lstrip().startswith("{")
+
+
+def test_cli_journal_verbose_prints_event_details(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
+    journal = campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson"
+    append_event(journal, "sbatch", phase="INITIAL_AIMALL", job_id="123", expected_tasks=10)
+
+    rc = main(["journal", "--campaign-dir", str(campaign), "--verbose"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "sbatch" in out
+    assert "INITIAL_AIMALL" in out
+    assert "  job_id: 123" in out
+    assert "  expected_tasks: 10" in out
 
 
 def test_cli_journal_returns_4_when_no_journal(tmp_path):
