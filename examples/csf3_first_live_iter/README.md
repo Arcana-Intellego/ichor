@@ -10,9 +10,7 @@ Recommended install path:
 cd ~/projects/ichor-active-learning
 bash scripts/install_ichor_csf.sh --machine csf3 --projects-dir ~/projects \
     --aimall-path ~/AIMAll/aimqb.ish
-export ICHOR_MACHINE=csf3
-export LD_LIBRARY_PATH=$HOME/opt/python-3.11.15/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
-source ~/.venv/ichor-csf3/bin/activate
+source scripts/env_ichor_csf.sh csf3 --smoke
 ```
 
 The installer uses private CPython 3.11 by default, checks download access,
@@ -20,6 +18,9 @@ prints exact staging instructions when downloads are blocked, builds ARIADNE,
 FEREBUS, and PLUMED with `--jobs 4` by default, verifies xTB/ASE, and backs up
 `~/ichor_config.yaml` before upserting the CSF3 profile. The manual sections
 below are kept as a fallback and for troubleshooting individual components.
+For day-to-day use after installation, the sourced `env_ichor_csf.sh` helper is
+the expected way to load oneAPI/MKL runtime modules and avoid ARIADNE `libmkl`
+import errors.
 
 ## 1. Build private CPython 3.11
 
@@ -187,8 +188,7 @@ link0` writes `%NProcShared` and `%mem` into `.gjf` files.
 
 ```bash
 export ICHOR_MACHINE=csf3
-source ~/.venv/ichor-csf3/bin/activate
-export LD_LIBRARY_PATH=$HOME/opt/python-3.11.15/lib:$LD_LIBRARY_PATH
+source ~/projects/ichor-active-learning/scripts/env_ichor_csf.sh csf3 --smoke
 
 ichor-al-daemon preflight --campaign-dir .
 ichor-al-daemon import-pool --campaign-dir . --source pool.xyz

@@ -59,6 +59,15 @@ bash scripts/install_ichor_csf.sh --machine csf4 --projects-dir ~/projects
 bash scripts/install_ichor_csf.sh --machine csf3 --projects-dir ~/projects
 ```
 
+After installation, source the matching runtime helper in each new CSF shell
+before running the CLI or daemon:
+
+```
+source scripts/env_ichor_csf.sh csf4 --smoke
+# or
+source scripts/env_ichor_csf.sh csf3 --smoke
+```
+
 ## Active learning daemon
 Run the bundled example to confirm everything works (no cluster
 required, ~30 seconds on a laptop):

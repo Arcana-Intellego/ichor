@@ -23,6 +23,15 @@ where needed, verifies xTB/ASE, and updates only the active CSF profile in
     bash scripts/install_ichor_csf.sh --machine csf4 --projects-dir ~/projects
     bash scripts/install_ichor_csf.sh --machine csf3 --projects-dir ~/projects
 
+After installation, source the runtime helper that matches the cluster in
+each new shell. It loads the runtime modules, activates the venv, clears build
+compiler variables, and verifies ARIADNE/PLUMED:
+
+.. code-block:: text
+
+    source scripts/env_ichor_csf.sh csf4 --smoke
+    source scripts/env_ichor_csf.sh csf3 --smoke
+
 +++++++++++++++++++++++++++++++++
 Setting up ichor_config.yaml file
 +++++++++++++++++++++++++++++++++

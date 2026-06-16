@@ -19,8 +19,7 @@ Recommended install path:
 cd ~/projects/ichor-active-learning
 bash scripts/install_ichor_csf.sh --machine csf4 --projects-dir ~/projects \
     --aimall-path ~/AIMAll/aimqb.ish
-export ICHOR_MACHINE=csf4
-source ~/.venv/ichor-csf4/bin/activate
+source scripts/env_ichor_csf.sh csf4 --smoke
 ```
 
 The installer checks download access first, explains how to stage missing
@@ -28,7 +27,9 @@ Python/PLUMED/OpenBLAS sources, builds ARIADNE before PLUMED so Intel compiler
 variables do not leak into the PLUMED build, installs the xTB/ASE stack, and
 backs up `~/ichor_config.yaml` before upserting the CSF4 profile. The remaining
 manual commands in this walkthrough are kept as a reference if you need to
-debug one component by hand.
+debug one component by hand. For day-to-day use after installation, source the
+runtime helper in each new CSF4 shell before launching `ichor-cli` or the
+daemon.
 
 ## 1. ssh in and load the base module stack
 

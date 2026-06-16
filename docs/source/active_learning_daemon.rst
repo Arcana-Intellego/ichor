@@ -34,6 +34,12 @@ and safely upserts ``~/ichor_config.yaml``::
     bash scripts/install_ichor_csf.sh --machine csf4 --projects-dir ~/projects
     bash scripts/install_ichor_csf.sh --machine csf3 --projects-dir ~/projects
 
+After installation, source the matching runtime helper in every new CSF shell
+before running :code:`ichor-cli` or :code:`ichor-al-daemon`::
+
+    source scripts/env_ichor_csf.sh csf4 --smoke
+    source scripts/env_ichor_csf.sh csf3 --smoke
+
 Run the bundled example to confirm the install works (~30 seconds on a
 laptop, no cluster required)::
 
