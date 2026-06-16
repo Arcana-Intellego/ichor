@@ -493,6 +493,7 @@ def test_profile_memory_auto_resolves_csf4_partition_cap(monkeypatch):
     )
     cfg = CampaignConfig()
     cfg.gaussian.nproc = 2
+    cfg.resources.cpus_per_task = 2
     body = build_sbatch_script(
         phase_name="INITIAL_GAUSSIAN",
         iteration=0,
@@ -503,6 +504,104 @@ def test_profile_memory_auto_resolves_csf4_partition_cap(monkeypatch):
     assert "#SBATCH --mem-per-cpu=4G" in body
     assert "#SBATCH --cpus-per-task=2" in body
     assert "export GAUSS_MDEF=6GB" in body
+
+
+@pytest.mark.parametrize(("machine", "max_cores"), [("csf3", 168), ("csf4", 32)])
+def test_multicore_one_core_request_fails_before_sbatch(monkeypatch, machine, max_cores):
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            machine: {
+                "hpc": {
+                    "scheduler": "slurm",
+                    "parallel_environments": {"multicore": [2, max_cores]},
+                }
+            }
+        },
+        machine,
+    )
+    cfg = CampaignConfig()
+    cfg.resources.partition = "multicore"
+    cfg.resources.cpus_per_task = 1
+
+    with pytest.raises(BackendSubmissionError, match="configured range is \\[2,"):
+        build_sbatch_script(
+            phase_name="PHASE_A_POLUS",
+            iteration=0,
+            campaign_dir=Path("/scratch/campaign"),
+            config=cfg,
+        )
+
+
+def test_multicore_two_core_request_passes_profile_range_check(monkeypatch):
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf3": {
+                "hpc": {
+                    "scheduler": "slurm",
+                    "parallel_environments": {"multicore": [2, 168]},
+                }
+            }
+        },
+        "csf3",
+    )
+    cfg = CampaignConfig()
+    cfg.resources.partition = "multicore"
+    cfg.resources.cpus_per_task = 2
+
+    body = build_sbatch_script(
+        phase_name="PHASE_A_POLUS",
+        iteration=0,
+        campaign_dir=Path("/scratch/campaign"),
+        config=cfg,
+    )
+
+    assert "#SBATCH --partition=multicore" in body
+    assert "#SBATCH --cpus-per-task=2" in body
+
+
+def test_serial_one_core_request_passes_profile_range_check(monkeypatch):
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf3": {
+                "hpc": {
+                    "scheduler": "slurm",
+                    "parallel_environments": {"serial": [1, 1]},
+                }
+            }
+        },
+        "csf3",
+    )
+    cfg = CampaignConfig()
+    cfg.resources.partition = "serial"
+    cfg.resources.cpus_per_task = 1
+
+    body = build_sbatch_script(
+        phase_name="PHASE_A_POLUS",
+        iteration=0,
+        campaign_dir=Path("/scratch/campaign"),
+        config=cfg,
+    )
+
+    assert "#SBATCH --partition=serial" in body
+    assert "#SBATCH --cpus-per-task=1" in body
+
+
+def test_gaussian_nproc_must_not_exceed_live_resource_cpus():
+    cfg = CampaignConfig()
+    cfg.resources.cpus_per_task = 2
+    cfg.gaussian.nproc = 3
+
+    with pytest.raises(BackendSubmissionError, match="gaussian.nproc"):
+        build_sbatch_script(
+            phase_name="INITIAL_GAUSSIAN",
+            iteration=0,
+            campaign_dir=Path("/scratch/campaign"),
+            config=cfg,
+            array_size=1,
+        )
 
 
 def test_explicit_memory_above_profile_cap_fails_before_sbatch(monkeypatch):

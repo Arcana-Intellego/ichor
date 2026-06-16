@@ -2331,6 +2331,51 @@ def _configured_scheduler() -> str:
     return value
 
 
+def _validate_partition_core_request(partition: str, cpus: int) -> None:
+    parallel = profile_value("hpc", "parallel_environments", default=None)
+    if not isinstance(parallel, dict):
+        return
+    raw = parallel.get(str(partition))
+    if raw is None:
+        return
+    try:
+        lo, hi = list(raw)[:2]
+        min_cores = int(lo)
+        max_cores = int(hi)
+    except (TypeError, ValueError) as exc:
+        raise BackendSubmissionError(
+            "configured hpc.parallel_environments for partition "
+            + repr(str(partition))
+            + " must be [min_cores, max_cores]"
+        ) from exc
+    if min_cores < 1 or max_cores < min_cores:
+        raise BackendSubmissionError(
+            "configured hpc.parallel_environments for partition "
+            + repr(str(partition))
+            + " has invalid range ["
+            + str(min_cores)
+            + ", "
+            + str(max_cores)
+            + "]"
+        )
+    requested = int(cpus)
+    if requested < min_cores or requested > max_cores:
+        machine = active_machine() or "active profile"
+        raise BackendSubmissionError(
+            "resources.cpus_per_task="
+            + str(requested)
+            + " is invalid for partition "
+            + repr(str(partition))
+            + " on "
+            + str(machine)
+            + "; configured range is ["
+            + str(min_cores)
+            + ", "
+            + str(max_cores)
+            + "]. Use a core count inside that range or choose a compatible partition."
+        )
+
+
 def _slurm_memory_mib(value: Any) -> float:
     text = str(value).strip().upper()
     match = re.fullmatch(r"([1-9][0-9]*)([KMGT]?)", text)
@@ -2559,7 +2604,16 @@ def build_sbatch_script(
     part = partition if partition is not None else res.partition
     wall = walltime_hours if walltime_hours is not None else res.walltime_hours
     is_gaussian_phase = phase_name in ("INITIAL_GAUSSIAN", "GAUSSIAN")
+    if is_gaussian_phase and int(config.gaussian.nproc) > int(res.cpus_per_task):
+        raise BackendSubmissionError(
+            "gaussian.nproc="
+            + str(int(config.gaussian.nproc))
+            + " must be <= resources.cpus_per_task="
+            + str(int(res.cpus_per_task))
+            + " for live Gaussian phases"
+        )
     cpus = int(config.gaussian.nproc) if is_gaussian_phase else res.cpus_for(phase_name)
+    _validate_partition_core_request(str(part), int(cpus))
     ntasks = 1 if is_gaussian_phase else int(res.ntasks)
     mem_per_cpu = _resolve_mem_per_cpu(config, str(part))
     if is_gaussian_phase:

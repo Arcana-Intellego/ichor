@@ -24,3 +24,16 @@ batch_sizing:
 seed_selection:
   n_seeds_per_iteration: 2
   bulk_fraction: 0.5
+
+resources:
+  partition: multicore
+  walltime_hours: 1
+  mem_per_cpu: auto
+  cpus_per_task: 2
+  ntasks: 1
+  ariadne_cpus_per_task: 2
+  array_concurrency_limit: null
+
+gaussian:
+  nproc: 2
+  memory_mode: slurm_env

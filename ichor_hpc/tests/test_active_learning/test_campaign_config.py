@@ -3,6 +3,8 @@
 The legacy v1 flat-field tests have been retired wholesale; v2 introduces
 nested blocks and the v1 schema-version is rejected.
 """
+from pathlib import Path
+
 import pytest
 
 from ichor.hpc.active_learning.config import (
@@ -378,6 +380,24 @@ def test_invalid_split_strategy_rejected():
     payload["split"]["strategy"] = "invalid_split"
     with pytest.raises(ConfigValidationError):
         CampaignConfig.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "examples/csf3_first_live_iter/campaign.yaml",
+        "examples/csf4_first_live_iter/campaign.yaml",
+        "examples/dry_run_water_tetramer/campaign.yaml",
+    ],
+)
+def test_shipped_active_learning_examples_are_resource_safe(relative_path):
+    repo = Path(__file__).resolve().parents[3]
+    cfg = CampaignConfig.from_yaml(repo / relative_path)
+
+    assert cfg.schema_version == CONFIG_SCHEMA_VERSION
+    assert cfg.resources.partition == "multicore"
+    assert cfg.resources.cpus_per_task >= 2
+    assert cfg.gaussian.nproc <= cfg.resources.cpus_per_task
 
 
 def test_invalid_warmstart_rejected():

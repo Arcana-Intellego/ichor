@@ -19,8 +19,35 @@ seed_selection:
   n_seeds_per_iteration: 4
   bulk_fraction: 0.5
 
+resources:
+  partition: multicore
+  walltime_hours: 2
+  mem_per_cpu: auto
+  cpus_per_task: 2
+  ntasks: 1
+  ariadne_cpus_per_task: 8
+  array_concurrency_limit: 2
+
+gaussian:
+  nproc: 2
+  memory_mode: slurm_env
+
 ariadne:
   optimiser: trust_region_qn
   hessian_model: ALMLOF
   max_iter: 50
   gradf_tol: 1.0e-4
+
+runtime:
+  postprocess_settle_attempts: 3
+  postprocess_settle_seconds: 10
+  transient_phase_retry_max: 1
+
+quality_gates:
+  ariadne_max_displacement_ang: 1.25
+  ariadne_min_pair_distance_ang: 0.60
+
+error_calibration:
+  enabled: true
+  mode: record_only
+  apply_strength: 0.0
