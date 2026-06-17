@@ -124,6 +124,8 @@ TRANSIENT_RETRY_STATUSES = frozenset({
     "REVOKED",
 })
 
+_STRICT_FAILURE_REQUIRES_POSTPROCESS = frozenset(SBATCH_PHASES)
+
 
 def next_phase(current: CampaignPhase, iteration: int, max_iterations: int) -> Tuple[CampaignPhase, int]:
     """Return (next_phase, next_iteration).
@@ -185,6 +187,7 @@ class Daemon:
     #internal flags; not part of the public dataclass surface.
     _shutdown_requested: bool = field(default=False, init=False, repr=False)
     _lock_held: Optional[Any] = field(default=None, init=False, repr=False)
+    _provenance_index_repair_attempted: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.campaign_dir = Path(self.campaign_dir)
@@ -374,8 +377,30 @@ class Daemon:
                 campaign_uid=state.campaign_uid,
                 max_iterations=state.max_iterations,
             )
+            self._repair_provenance_index_best_effort()
             return state
-        return read_state(sp)
+        state = read_state(sp)
+        self._repair_provenance_index_best_effort()
+        return state
+
+    def _repair_provenance_index_best_effort(self) -> None:
+        if self._provenance_index_repair_attempted:
+            return
+        self._provenance_index_repair_attempted = True
+        try:
+            from ..versioning.provenance import repair_index_from_committed_pointdirs
+
+            added = repair_index_from_committed_pointdirs(
+                self.campaign_dir,
+                self.campaign_dir / "5_TRAINING",
+            )
+            if added:
+                self._journal("provenance_index_repaired", records_added=int(added))
+        except Exception as exc:
+            self._journal(
+                "provenance_index_repair_failed",
+                error=type(exc).__name__ + ": " + str(exc)[:180],
+            )
 
     def _journal(self, event_type: str, **payload: Any) -> None:
         try:
@@ -434,6 +459,9 @@ class Daemon:
             )
         return None
 
+    def _strict_artifact_checks_enabled(self) -> bool:
+        return bool(getattr(self.executor, "strict_committed_artifact_verification", False))
+
     def _on_phase_entry(self, state: CampaignState, phase: CampaignPhase) -> str:
         """Called once when entering a phase with no pending JobID."""
         phase_name = phase.value
@@ -482,6 +510,20 @@ class Daemon:
                 lookup_inconclusive = True
             if existing:
                 existing_job_id = str(existing)
+                expected_tasks = self._expected_tasks_for_adoption(
+                    active_intent,
+                    state,
+                    phase,
+                )
+                if expected_tasks is None and self._strict_artifact_checks_enabled():
+                    return self._halt(
+                        state,
+                        phase,
+                        "active_submission_expected_tasks_unavailable: "
+                        + phase_name
+                        + "@"
+                        + str(int(state.iteration)),
+                    )
                 state.pending_jobs[phase_name] = existing_job_id
                 try:
                     _submission_intent.mark_adopted(
@@ -489,10 +531,7 @@ class Daemon:
                         phase_name,
                         int(state.iteration),
                         existing_job_id,
-                        expected_tasks=(
-                            None if active_intent is None
-                            else active_intent.get("expected_tasks")
-                        ),
+                        expected_tasks=expected_tasks,
                     )
                 except Exception as exc:
                     self._journal(
@@ -508,6 +547,7 @@ class Daemon:
                     n_matching_sacct_rows=len(lookup_rows),
                     matching_sacct_rows_sample=lookup_rows[:8],
                     matching_sacct_rows_truncated=bool(len(lookup_rows) > 8),
+                    expected_tasks=expected_tasks,
                 )
                 return TickStatus.SUBMITTED
             if active_intent is not None and lookup_inconclusive:
@@ -518,6 +558,19 @@ class Daemon:
                     "sacct lookup failed or was inconclusive; refusing to supersede active intent",
                 )
         if active_intent is not None and phase_name in SBATCH_PHASES:
+            active_job_id = active_intent.get("job_id")
+            if active_job_id is not None and self.job_liveness_checker is not None:
+                liveness = self._check_job_liveness(str(active_job_id))
+                if liveness is not None and (
+                    bool(getattr(liveness, "active", False))
+                    or bool(getattr(liveness, "inconclusive", False))
+                ):
+                    return self._halt(
+                        state,
+                        phase,
+                        "active_submission_liveness_blocks_resubmit: "
+                        + str(active_job_id)
+                    )
             try:
                 _submission_intent.mark_superseded(
                     self.campaign_dir,
@@ -639,6 +692,15 @@ class Daemon:
             return TickStatus.POLLING
 
         expected_tasks = self._expected_tasks_for_pending(state, phase, job_id)
+        if expected_tasks is None and self._strict_artifact_checks_enabled():
+            return self._halt(
+                state,
+                phase,
+                "expected_task_count_unavailable_for_active_job: "
+                + phase.value
+                + " job_id="
+                + str(job_id),
+            )
         summary = aggregate_states(
             job_id,
             observations,
@@ -704,40 +766,10 @@ class Daemon:
 
         missing_key = job_id + ":MISSING"
         if int(getattr(summary, "n_missing", 0)) > 0:
-            liveness = self._check_job_liveness(job_id)
-            if liveness is not None and (
-                bool(getattr(liveness, "active", False))
-                or bool(getattr(liveness, "inconclusive", False))
-            ):
-                if missing_key in state.sacct_empty_streak:
-                    state.sacct_empty_streak.pop(missing_key, None)
-                    self._persist(state)
-                if bool(getattr(liveness, "active", False)):
-                    self._journal(
-                        "sacct_rows_missing_but_squeue_active",
-                        phase=phase.value,
-                        job_id=job_id,
-                        n_expected=getattr(summary, "n_expected", None),
-                        n_observed=int(getattr(summary, "n_observed", 0)),
-                        n_missing=int(getattr(summary, "n_missing", 0)),
-                        squeue_rows_sample=self._queue_rows_sample(liveness),
-                        iteration=state.iteration,
-                    )
-                else:
-                    self._journal(
-                        "squeue_liveness_inconclusive",
-                        phase=phase.value,
-                        job_id=job_id,
-                        n_expected=getattr(summary, "n_expected", None),
-                        n_observed=int(getattr(summary, "n_observed", 0)),
-                        n_missing=int(getattr(summary, "n_missing", 0)),
-                        error=str(getattr(liveness, "error", "") or "")[:200],
-                        iteration=state.iteration,
-                    )
-                return TickStatus.POLLING
             current = state.sacct_empty_streak.get(missing_key, 0) + 1
             state.sacct_empty_streak[missing_key] = current
             self._persist(state)
+            liveness = self._check_job_liveness(job_id)
             max_missing = int(
                 getattr(self.config.runtime, "poll_sacct_missing_max_ticks", 3)
             )
@@ -751,6 +783,14 @@ class Daemon:
                     n_expected=getattr(summary, "n_expected", None),
                     n_observed=int(getattr(summary, "n_observed", 0)),
                     n_missing=int(getattr(summary, "n_missing", 0)),
+                    squeue_active=(
+                        None if liveness is None
+                        else bool(getattr(liveness, "active", False))
+                    ),
+                    squeue_inconclusive=(
+                        None if liveness is None
+                        else bool(getattr(liveness, "inconclusive", False))
+                    ),
                     iteration=state.iteration,
                 )
                 return self._halt(
@@ -764,6 +804,35 @@ class Daemon:
                     + str(int(getattr(summary, "n_missing", 0)))
                     + " expected Slurm array task rows",
                 )
+            if liveness is not None and (
+                bool(getattr(liveness, "active", False))
+                or bool(getattr(liveness, "inconclusive", False))
+            ):
+                if bool(getattr(liveness, "active", False)):
+                    self._journal(
+                        "sacct_rows_missing_but_squeue_active",
+                        phase=phase.value,
+                        job_id=job_id,
+                        n_expected=getattr(summary, "n_expected", None),
+                        n_observed=int(getattr(summary, "n_observed", 0)),
+                        n_missing=int(getattr(summary, "n_missing", 0)),
+                        streak=int(current),
+                        squeue_rows_sample=self._queue_rows_sample(liveness),
+                        iteration=state.iteration,
+                    )
+                else:
+                    self._journal(
+                        "squeue_liveness_inconclusive",
+                        phase=phase.value,
+                        job_id=job_id,
+                        n_expected=getattr(summary, "n_expected", None),
+                        n_observed=int(getattr(summary, "n_observed", 0)),
+                        n_missing=int(getattr(summary, "n_missing", 0)),
+                        streak=int(current),
+                        error=str(getattr(liveness, "error", "") or "")[:200],
+                        iteration=state.iteration,
+                    )
+                return TickStatus.POLLING
             return TickStatus.POLLING
         if missing_key in state.sacct_empty_streak:
             state.sacct_empty_streak.pop(missing_key, None)
@@ -805,13 +874,13 @@ class Daemon:
             )
             return None
         if not isinstance(data, dict):
-            return None
+            return self._infer_expected_tasks_from_artifacts(state, phase)
         recorded_job = data.get("job_id")
         if recorded_job is not None and str(recorded_job) != str(job_id):
             return None
         raw = data.get("expected_tasks")
         if raw is None:
-            return None
+            return self._infer_expected_tasks_from_artifacts(state, phase)
         try:
             expected = int(raw)
         except (TypeError, ValueError):
@@ -821,8 +890,98 @@ class Daemon:
                 iteration=int(state.iteration),
                 value=repr(raw),
             )
+            return self._infer_expected_tasks_from_artifacts(state, phase)
+        return expected if expected > 0 else self._infer_expected_tasks_from_artifacts(state, phase)
+
+    def _expected_tasks_for_adoption(
+        self,
+        active_intent: Optional[Dict[str, Any]],
+        state: CampaignState,
+        phase: CampaignPhase,
+    ) -> Optional[int]:
+        if isinstance(active_intent, dict):
+            raw = active_intent.get("expected_tasks")
+            if raw is not None:
+                try:
+                    value = int(raw)
+                except (TypeError, ValueError):
+                    value = 0
+                if value > 0:
+                    return value
+        return self._infer_expected_tasks_from_artifacts(state, phase)
+
+    def _infer_expected_tasks_from_artifacts(
+        self,
+        state: CampaignState,
+        phase: CampaignPhase,
+    ) -> Optional[int]:
+        phase_name = phase.value
+        if phase_name in ("PHASE_A_POLUS", "PHASE_B_POLUS"):
+            return 1
+        try:
+            if phase_name in ("INITIAL_GAUSSIAN", "INITIAL_AIMALL"):
+                return self._count_nonempty_lines(
+                    self.campaign_dir / ".DATA" / "STAGING" / "initial" / "POINTS.txt"
+                )
+            if phase_name in ("GAUSSIAN", "AIMALL"):
+                return self._count_nonempty_lines(
+                    self.campaign_dir
+                    / ".DATA"
+                    / "STAGING"
+                    / ("iter_" + str(int(state.iteration)))
+                    / "POINTS.txt"
+                )
+            if phase_name in ("INITIAL_FEREBUS", "FEREBUS"):
+                manifest = (
+                    self.campaign_dir
+                    / "6_TRAINED_MODELS"
+                    / "iteration-staging"
+                    / "FEREBUS_TASKS.json"
+                )
+                if manifest.is_file():
+                    data = json.loads(manifest.read_text(encoding="utf-8"))
+                    raw = data.get("n_tasks")
+                    if raw is not None:
+                        value = int(raw)
+                        return value if value > 0 else None
+                    tasks = data.get("tasks")
+                    if isinstance(tasks, list) and tasks:
+                        return len(tasks)
+            if phase_name == "ARIADNE_ARRAY":
+                seeds = (
+                    self.campaign_dir
+                    / "7_ACTIVE_LEARNING"
+                    / ("iteration-" + str(int(state.iteration)).zfill(4))
+                    / "seeds_picked.json"
+                )
+                if seeds.is_file():
+                    data = json.loads(seeds.read_text(encoding="utf-8"))
+                    records = data.get("seed_records")
+                    if isinstance(records, list) and records:
+                        return len(records)
+                    frame_ids = data.get("frame_ids")
+                    if isinstance(frame_ids, list) and frame_ids:
+                        return len(frame_ids)
+        except Exception as exc:
+            self._journal(
+                "expected_tasks_inference_failed",
+                phase=phase_name,
+                iteration=int(state.iteration),
+                error=type(exc).__name__ + ": " + str(exc)[:160],
+            )
             return None
-        return expected if expected > 0 else None
+        return None
+
+    @staticmethod
+    def _count_nonempty_lines(path: Path) -> Optional[int]:
+        if not Path(path).is_file():
+            return None
+        count = 0
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    count += 1
+        return count if count > 0 else None
 
     def _check_job_liveness(self, job_id: str) -> Optional[Any]:
         if self.job_liveness_checker is None:
@@ -971,6 +1130,42 @@ class Daemon:
                 state, phase,
                 "too_many_failures: " + str(summary.n_failed) + "/" + str(summary.n_tasks),
             )
+        if self._strict_artifact_checks_enabled() and phase in (
+            CampaignPhase.INITIAL_FEREBUS,
+            CampaignPhase.FEREBUS,
+        ):
+            self._clear_sacct_streaks(state, str(summary.parent_job_id))
+            state.pending_jobs[phase.value] = None
+            contract_error = self._transition_output_contract_error(state, phase, {})
+            if contract_error is not None:
+                action_value = str(action.value if hasattr(action, "value") else action)
+                self._journal(
+                    "required_phase_output_missing_after_failure",
+                    phase=phase.value,
+                    iteration=state.iteration,
+                    action=action_value,
+                    n_tasks=summary.n_tasks,
+                    n_completed=summary.n_completed,
+                    n_failed=summary.n_failed,
+                    reason=contract_error,
+                )
+                return self._halt(
+                    state,
+                    phase,
+                    "required_phase_output_missing_after_failure: " + contract_error,
+                )
+        if (
+            self._strict_artifact_checks_enabled()
+            and phase.value in _STRICT_FAILURE_REQUIRES_POSTPROCESS
+        ):
+            self._clear_sacct_streaks(state, str(summary.parent_job_id))
+            return self._halt(
+                state,
+                phase,
+                "phase_failed_requires_postprocess: "
+                + phase.value
+                + " cannot scrub_and_continue after scheduler failure",
+            )
         #SCRUB_AND_CONTINUE: clear pending, advance regardless of partial loss.
         if phase.value in SBATCH_PHASES:
             try:
@@ -1070,6 +1265,29 @@ class Daemon:
         observations: Sequence[JobObservation],
         summary,
     ) -> str:
+        if self._strict_artifact_checks_enabled() and phase in (
+            CampaignPhase.INITIAL_FEREBUS,
+            CampaignPhase.FEREBUS,
+        ):
+            training_raw = getattr(state, "training_set_version", -1)
+            try:
+                training_version = int(training_raw)
+            except (TypeError, ValueError):
+                training_version = -1
+            if training_version >= 0:
+                candidate = (
+                    self.campaign_dir
+                    / "6_TRAINED_MODELS"
+                    / ("iteration-" + str(training_version).zfill(4))
+                )
+                if candidate.is_dir():
+                    return self._halt(
+                        state,
+                        phase,
+                        "transient_retry_found_committed_model_output: "
+                        + str(candidate)
+                        + "; run reconcile before retrying",
+                    )
         ledger = self._load_transient_retry_ledger()
         attempts = dict(ledger.get("attempts", {}))
         key = self._retry_key(phase, int(state.iteration))
@@ -1113,10 +1331,11 @@ class Daemon:
                 )
             except Exception:
                 pass
+            state.pending_jobs[phase.value] = None
         state.phase = CampaignPhase.HALTED
+        self._persist(state)
         self._journal("halt", from_phase=phase.value, reason=reason,
                       iteration=state.iteration)
-        self._persist(state)
         return TickStatus.HALTED
 
     def _transition_output_contract_error(
@@ -1138,7 +1357,12 @@ class Daemon:
         if phase not in (CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS):
             return None
 
-        raw_version = state_updates.get("models_version", getattr(state, "models_version", -1))
+        if "models_version" not in state_updates:
+            return (
+                "required fresh FEREBUS models_version missing from state_updates for "
+                + phase.value
+            )
+        raw_version = state_updates.get("models_version")
         try:
             models_version = int(raw_version)
         except (TypeError, ValueError):
@@ -1155,6 +1379,35 @@ class Daemon:
                 + ": "
                 + str(models_version)
             )
+        raw_training = state_updates.get(
+            "training_set_version",
+            getattr(state, "training_set_version", -1),
+        )
+        try:
+            training_version = int(raw_training)
+        except (TypeError, ValueError):
+            return (
+                "required FEREBUS training version is not an integer for "
+                + phase.value
+                + ": "
+                + repr(raw_training)
+            )
+        if training_version < 0:
+            return (
+                "required FEREBUS training version is negative for "
+                + phase.value
+                + ": "
+                + str(training_version)
+            )
+        if models_version != training_version:
+            return (
+                "FEREBUS model/training version skew after "
+                + phase.value
+                + ": models_version="
+                + str(models_version)
+                + ", training_set_version="
+                + str(training_version)
+            )
 
         expected_path = (
             self.campaign_dir
@@ -1162,7 +1415,11 @@ class Daemon:
             / ("iteration-" + str(models_version).zfill(4))
         )
         try:
-            from .artifact_contracts import verify_committed_model_version
+            from .artifact_contracts import (
+                verify_committed_model_version,
+                verify_committed_training_version,
+            )
+            verify_committed_training_version(self.campaign_dir, training_version)
             verify_committed_model_version(self.campaign_dir, models_version)
         except Exception as exc:
             return (

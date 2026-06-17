@@ -24,6 +24,7 @@ from ichor.hpc.active_learning.versioning.provenance import (
     enrich_with_phase_b,
     load_index,
     load_training_seed_frame_ids,
+    repair_index_from_committed_pointdirs,
     read_provenance,
     write_seed_provenance,
 )
@@ -242,6 +243,34 @@ def test_load_training_seed_frame_ids_skips_none(tmp_path):
 
 def test_load_training_seed_frame_ids_empty_for_fresh_campaign(tmp_path):
     assert load_training_seed_frame_ids(tmp_path) == set()
+
+
+def test_repair_index_from_committed_pointdirs_adds_missing_records(tmp_path):
+    training = tmp_path / "5_TRAINING"
+    pdir = training / "iteration-0003" / "POINT_0007.pointdir"
+    write_seed_provenance(
+        pdir,
+        campaign_uid="X",
+        iteration=3,
+        trajectory_sha256="",
+        seed_frame_id=42,
+        seed_selection_origin="variance",
+        seed_variance_at_selection=None,
+        subspace_neighbour_frame_ids=[42],
+        subspace_dimension=1,
+        subspace_eigenvalues=[1.0],
+    )
+
+    assert repair_index_from_committed_pointdirs(tmp_path, training) == 1
+    assert repair_index_from_committed_pointdirs(tmp_path, training) == 0
+    data = load_index(tmp_path)
+    assert data["records"] == [
+        {
+            "iteration": 3,
+            "pointdir_name": "POINT_0007.pointdir",
+            "seed_frame_id": 42,
+        }
+    ]
 
 
 # --- end-to-end integration (dry-run executor drives full chain) -------

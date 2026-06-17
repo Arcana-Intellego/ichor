@@ -1450,14 +1450,20 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         v_models.recover_dangling_staging()
         committed = v_models.list_committed_versions()
         is_initial = phase_name == "INITIAL_FEREBUS"
-        state_models_version = getattr(state, "models_version", None)
-        expected_next = 0 if is_initial else (
-            max(committed) + 1 if state_models_version is None and committed
-            else int(state_models_version if state_models_version is not None else -1) + 1
-        )
-        already_committed = [v for v in committed if v >= expected_next]
-        if already_committed:
-            next_version = max(already_committed)
+        if is_initial:
+            expected_next = 0
+        else:
+            expected_next = int(getattr(state, "training_set_version", -1))
+            if expected_next < 0:
+                return PhaseResult(
+                    is_complete=True,
+                    failure_reason=(
+                        "ferebus_training_version_invalid: "
+                        + repr(getattr(state, "training_set_version", None))
+                    ),
+                )
+        if expected_next in committed:
+            next_version = int(expected_next)
             v_models.ensure_current(next_version)
             committed_dir = v_models.iteration_path(next_version)
             try:
@@ -1487,7 +1493,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 state_updates["training_set_version"] = 0
             return PhaseResult(is_complete=True, state_updates=state_updates)
 
-        next_version = expected_next
+        next_version = int(expected_next)
         source_version = None if is_initial else (
             max(committed) if committed else None
         )

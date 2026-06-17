@@ -211,6 +211,7 @@ def propose_recovery(
     if dangling_models or has_model_iteration_staging:
         unsafe_reasons.append("dangling model staging directories exist")
 
+    valid_training_versions: List[int] = []
     for version in tv:
         try:
             verify_committed_training_version(
@@ -218,6 +219,7 @@ def propose_recovery(
                 int(version),
                 training_dir_name=training_dir_name,
             )
+            valid_training_versions.append(int(version))
         except Exception as exc:
             unsafe_reasons.append(
                 "committed training version "
@@ -227,6 +229,7 @@ def propose_recovery(
                 + ": "
                 + str(exc)[:160]
             )
+    valid_model_versions: List[int] = []
     for version in mv:
         try:
             verify_committed_model_version(
@@ -234,6 +237,7 @@ def propose_recovery(
                 int(version),
                 models_dir_name=models_dir_name,
             )
+            valid_model_versions.append(int(version))
         except Exception as exc:
             unsafe_reasons.append(
                 "committed model version "
@@ -281,23 +285,51 @@ def propose_recovery(
             if salvaged_started:
                 recovered.campaign_started_iso = str(salvaged_started)
 
-    # reconcile against committed artefacts
-    if tv:
-        max_tv = max(tv)
-        if recovered.training_set_version < max_tv:
+    coherent_pairs = sorted(set(valid_training_versions).intersection(valid_model_versions))
+    latest_training_only = max(valid_training_versions) if valid_training_versions else None
+    latest_model_only = max(valid_model_versions) if valid_model_versions else None
+    no_coherent_pair = False
+
+    if coherent_pairs:
+        coherent = int(coherent_pairs[-1])
+        if recovered.training_set_version != coherent:
             notes.append(
-                "training_set_version raised from " + str(recovered.training_set_version)
-                + " to " + str(max_tv) + " based on committed " + training_dir_name
+                "training_set_version set to coherent committed version "
+                + str(coherent)
             )
-        recovered.training_set_version = max(recovered.training_set_version, max_tv)
-    if mv:
-        max_mv = max(mv)
-        if recovered.models_version < max_mv:
+        if recovered.models_version != coherent:
             notes.append(
-                "models_version raised from " + str(recovered.models_version)
-                + " to " + str(max_mv) + " based on committed " + models_dir_name
+                "models_version set to coherent committed version "
+                + str(coherent)
             )
-        recovered.models_version = max(recovered.models_version, max_mv)
+        recovered.training_set_version = coherent
+        recovered.models_version = coherent
+        if latest_training_only is not None and latest_training_only > coherent:
+            unsafe_reasons.append(
+                "newer committed training version has no matching model: "
+                + str(latest_training_only)
+            )
+        if latest_model_only is not None and latest_model_only > coherent:
+            unsafe_reasons.append(
+                "newer committed model version has no matching training set: "
+                + str(latest_model_only)
+            )
+    elif valid_training_versions and not valid_model_versions:
+        recovered.training_set_version = int(latest_training_only)
+        recovered.models_version = -1
+        notes.append(
+            "valid training exists without any valid model; re-entry must train FEREBUS"
+        )
+    elif valid_training_versions or valid_model_versions:
+        no_coherent_pair = True
+        unsafe_reasons.append(
+            "no coherent committed training/model version pair exists "
+            + "(training="
+            + repr(valid_training_versions)
+            + ", models="
+            + repr(valid_model_versions)
+            + ")"
+        )
 
     # choose a safe re-entry phase. If we have NOTHING committed, start at
     #  INIT; otherwise rewind to STOP_CHECK so the next tick decides whether
@@ -325,6 +357,27 @@ def propose_recovery(
     elif not tv and not mv and not existing_loaded:
         recovered.phase = CampaignPhase.INIT
         notes.append("no committed iterations; re-entry at INIT")
+    elif no_coherent_pair:
+        recovered.phase = CampaignPhase.HALTED
+        notes.append("re-entry HALTED because no coherent training/model pair exists")
+    elif valid_training_versions and not valid_model_versions:
+        recovered.phase = CampaignPhase.INITIAL_FEREBUS if recovered.training_set_version == 0 else CampaignPhase.FEREBUS
+        notes.append(
+            "re-entry at "
+            + recovered.phase.value
+            + " to produce model version "
+            + str(recovered.training_set_version)
+        )
+    elif coherent_pairs and unsafe_reasons:
+        recovered.phase = CampaignPhase.HALTED
+        notes.append(
+            "re-entry HALTED because committed artefacts need operator review"
+        )
+    elif unsafe_reasons:
+        recovered.phase = CampaignPhase.HALTED
+        notes.append(
+            "re-entry HALTED because unsafe committed artefacts need operator review"
+        )
     else:
         recovered.phase = CampaignPhase.STOP_CHECK
         notes.append("re-entry at STOP_CHECK (next tick decides loop/terminate)")

@@ -101,7 +101,7 @@ def test_initial_gaussian_happy_path(tmp_path):
 def test_iter_gaussian_happy_path(tmp_path):
     ex = _make_executor(tmp_path)
     _bind_staging(ex, FIXTURES / "iter_quantum")
-    state = SimpleNamespace(iteration=3, campaign_uid="m16-test")
+    state = SimpleNamespace(iteration=3, campaign_uid="m16-test", training_set_version=0)
     result = ex._parse_quantum_postprocess(
         state, CampaignPhase("GAUSSIAN"), observations=[],
     )
@@ -223,7 +223,7 @@ def test_above_threshold_rejection_sets_failure_reason(tmp_path):
 def test_missing_staging_dir_sets_failure_reason(tmp_path):
     ex = _make_executor(tmp_path)
     _bind_staging(ex, tmp_path / "ghost_staging_that_does_not_exist")
-    state = SimpleNamespace(iteration=2, campaign_uid="m16-test")
+    state = SimpleNamespace(iteration=2, campaign_uid="m16-test", training_set_version=0)
     result = ex._parse_quantum_postprocess(
         state, CampaignPhase("GAUSSIAN"), observations=[],
     )
@@ -552,7 +552,7 @@ def test_ferebus_parser_rejects_empty_staging(tmp_path):
     ex = _make_executor(tmp_path)
     empty = tmp_path / "campaign" / "6_TRAINED_MODELS" / "iteration-staging"
     empty.mkdir(parents=True, exist_ok=True)
-    state = SimpleNamespace(iteration=2, campaign_uid="m16-test")
+    state = SimpleNamespace(iteration=2, campaign_uid="m16-test", training_set_version=0)
     result = ex._parse_ferebus_postprocess(
         state, CampaignPhase("FEREBUS"), observations=[],
     )

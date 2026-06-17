@@ -123,7 +123,7 @@ def test_ferebus_postprocess_commits_next_models_iteration(tmp_path):
     # Seed iteration 0
     e.postprocess(SimpleNamespace(iteration=0), CampaignPhase.INITIAL_FEREBUS, observations=[])
     # Run FEREBUS post for iter 0
-    e.postprocess(SimpleNamespace(iteration=0), CampaignPhase.FEREBUS, observations=[])
+    e.postprocess(SimpleNamespace(iteration=0, training_set_version=1), CampaignPhase.FEREBUS, observations=[])
     v = TrainingSetVersioning(tmp_path / "campaign" / "6_TRAINED_MODELS")
     assert sorted(v.list_committed_versions()) == [0, 1]
 

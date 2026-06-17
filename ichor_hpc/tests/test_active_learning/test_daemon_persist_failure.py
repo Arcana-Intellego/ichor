@@ -101,7 +101,12 @@ def test_initial_training_idempotent_skip_repairs_current_pointer(tmp_path):
 
 def test_dry_ferebus_idempotent_skip_repairs_model_current_pointer(tmp_path):
     ex = _make_executor(tmp_path)
-    state = SimpleNamespace(iteration=1, campaign_uid="uid", models_version=0)
+    state = SimpleNamespace(
+        iteration=1,
+        campaign_uid="uid",
+        training_set_version=1,
+        models_version=0,
+    )
     ex.postprocess(SimpleNamespace(iteration=0, campaign_uid="uid"), CampaignPhase.INITIAL_FEREBUS, observations=[])
 
     first = ex.postprocess(state, CampaignPhase.FEREBUS, observations=[])

@@ -50,6 +50,7 @@ from .daemon.phase_executor import MockPhaseExecutor
 from .daemon.preflight import check_backends, missing_backend_message
 from .daemon.reconcile import propose_recovery, write_proposed_state
 from .daemon.state import (
+    CampaignPhase,
     DEFAULT_STATE_FILENAME,
     StateSchemaError,
     read_state,
@@ -567,6 +568,14 @@ def cmd_resume(args: argparse.Namespace) -> int:
         except StateSchemaError as exc:
             print("state.json invalid: " + str(exc), file=sys.stderr)
             return 5
+        if state.phase is CampaignPhase.HALTED:
+            print(
+                "campaign is HALTED; run `ichor-al-daemon reconcile --campaign-dir "
+                + str(campaign)
+                + "` and review/promote the proposed state before resuming",
+                file=sys.stderr,
+            )
+            return 6
         if state.shutdown_requested:
             state.shutdown_requested = False
             write_state(state_path, state)

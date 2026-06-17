@@ -96,7 +96,8 @@ def test_propose_recovery_finds_committed_training_versions(tmp_path):
     report = propose_recovery(campaign)
     assert report.committed_training_versions == [0, 1, 2]
     assert report.proposed_state.training_set_version == 2
-    assert report.proposed_state.phase is CampaignPhase.STOP_CHECK
+    assert report.proposed_state.models_version == -1
+    assert report.proposed_state.phase is CampaignPhase.FEREBUS
 
 
 def test_propose_recovery_reports_unmanifested_committed_pointdir(tmp_path):
@@ -110,6 +111,7 @@ def test_propose_recovery_reports_unmanifested_committed_pointdir(tmp_path):
     (rogue / "input.gjf").write_text("%chk=x\n", encoding="utf-8")
     report = propose_recovery(campaign)
     assert any("committed training version 0" in r for r in report.unsafe_reasons)
+    assert report.proposed_state.phase is CampaignPhase.HALTED
 
 
 def test_propose_recovery_preserves_existing_campaign_uid(tmp_path):

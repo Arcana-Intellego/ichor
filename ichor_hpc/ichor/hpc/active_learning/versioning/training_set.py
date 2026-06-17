@@ -46,6 +46,7 @@ from .manifest import (
     MANIFEST_FILENAME,
     ManifestMismatchError,
     compute_directory_manifest,
+    fsync_regular_files,
     read_manifest,
     unmanifested_directories,
     verify_manifest,
@@ -252,6 +253,7 @@ class TrainingSetVersioning:
                 lock.unlink()
             except OSError:
                 pass
+        fsync_regular_files(staging, exclude=exclude_from_manifest)
         manifest = compute_directory_manifest(staging, exclude=exclude_from_manifest)
         write_manifest(staging, manifest)
         os.replace(str(staging), str(target))

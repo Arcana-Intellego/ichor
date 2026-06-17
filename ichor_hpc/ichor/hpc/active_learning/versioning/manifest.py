@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple, Union
@@ -24,6 +25,7 @@ __all__ = [
     "ManifestMismatchError",
     "compute_directory_manifest",
     "read_manifest",
+    "fsync_regular_files",
     "unmanifested_directories",
     "write_manifest",
     "verify_manifest",
@@ -97,6 +99,21 @@ def compute_directory_manifest(
         rel = f.relative_to(root_path).as_posix()
         manifest[rel] = sha256_file(f)
     return manifest
+
+
+def fsync_regular_files(
+    root: Union[str, Path],
+    *,
+    exclude: Iterable[str] = (),
+) -> None:
+    """Best-effort fsync for every regular file that will enter a manifest."""
+    root_path = Path(root)
+    for f in _iter_files(root_path, exclude=exclude):
+        try:
+            with open(f, "rb") as handle:
+                os.fsync(handle.fileno())
+        except OSError:
+            continue
 
 
 def read_manifest(root: Union[str, Path]) -> Dict[str, str]:

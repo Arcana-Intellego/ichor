@@ -1203,14 +1203,14 @@ class DryRunPhaseExecutor:
         v_models = self._versioning("models")
         v_models.recover_dangling_staging()
         committed = v_models.list_committed_versions()
-        state_models_version = getattr(state, "models_version", None)
-        expected_next = (
-            max(committed) + 1 if state_models_version is None and committed
-            else int(state_models_version if state_models_version is not None else -1) + 1
-        )
-        already_committed = [v for v in committed if v >= expected_next]
-        if already_committed:
-            repaired_version = max(already_committed)
+        expected_next = int(getattr(state, "training_set_version", -1))
+        if expected_next < 0:
+            raise ValueError(
+                "FEREBUS requires a committed training_set_version, got "
+                + repr(getattr(state, "training_set_version", None))
+            )
+        if expected_next in committed:
+            repaired_version = int(expected_next)
             v_models.ensure_current(repaired_version)
             self._journal_event(
                 "models_committed",
@@ -1220,7 +1220,7 @@ class DryRunPhaseExecutor:
                 idempotent_skip=True,
             )
             return {"models_version": int(repaired_version)}
-        next_version = max(committed) + 1 if committed else 0
+        next_version = int(expected_next)
         staging = v_models.stage(source_version=max(committed) if committed else None,
                                   target_version=next_version)
         (staging / "model.iqa").write_text(

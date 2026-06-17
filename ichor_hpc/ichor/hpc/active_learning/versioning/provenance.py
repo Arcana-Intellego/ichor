@@ -116,6 +116,7 @@ __all__ = [
     "append_to_index",
     "load_index",
     "load_training_seed_frame_ids",
+    "repair_index_from_committed_pointdirs",
     "seed_frame_ids_from_committed_pointdirs",
     "append_recent_seeds",
     "load_recent_seeds_payload",
@@ -425,6 +426,74 @@ def seed_frame_ids_from_committed_pointdirs(training_dir: Union[str, Path]) -> S
             if isinstance(fid, int):
                 out.add(int(fid))
     return out
+
+
+def _records_from_committed_pointdirs(training_dir: Union[str, Path]) -> List[Dict[str, Any]]:
+    base = Path(training_dir)
+    out: List[Dict[str, Any]] = []
+    if not base.is_dir():
+        return out
+    for iter_dir in sorted(base.glob("iteration-*")):
+        if not iter_dir.is_dir():
+            continue
+        try:
+            iteration = int(iter_dir.name.rsplit("-", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        for pointdir in sorted(iter_dir.glob("*.pointdir")):
+            sidecar = pointdir / PROVENANCE_FILENAME
+            if not sidecar.is_file():
+                continue
+            try:
+                with open(sidecar, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                fid = (data.get("seed") or {}).get("frame_id")
+            except (OSError, ValueError):
+                continue
+            out.append({
+                "iteration": int(iteration),
+                "pointdir_name": pointdir.name,
+                "seed_frame_id": int(fid) if isinstance(fid, int) else None,
+            })
+    return out
+
+
+def repair_index_from_committed_pointdirs(
+    campaign_dir: Union[str, Path],
+    training_dir: Union[str, Path],
+) -> int:
+    """Append missing committed pointdir records to seed_frame_id_index.json.
+
+    Existing records are keyed by (iteration, pointdir_name), making this
+    helper idempotent. Returns the number of records added.
+    """
+    truth = _records_from_committed_pointdirs(training_dir)
+    if not truth:
+        return 0
+    with _index_lock(campaign_dir):
+        data = load_index(campaign_dir)
+        records = data.get("records", [])
+        existing = {
+            (int(rec.get("iteration")), str(rec.get("pointdir_name")))
+            for rec in records
+            if isinstance(rec, dict)
+            and rec.get("iteration") is not None
+            and rec.get("pointdir_name") is not None
+        }
+        added = 0
+        for rec in truth:
+            key = (int(rec["iteration"]), str(rec["pointdir_name"]))
+            if key in existing:
+                continue
+            records.append(dict(rec))
+            existing.add(key)
+            added += 1
+        if added:
+            data["records"] = records
+            p = _index_path(campaign_dir)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(p, data)
+        return added
 
 
 def load_training_seed_frame_ids(

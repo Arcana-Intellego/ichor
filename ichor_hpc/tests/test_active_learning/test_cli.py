@@ -15,6 +15,7 @@ from ichor.hpc.active_learning.daemon.daemon import (
 )
 from ichor.hpc.active_learning.daemon.journal import append_event
 from ichor.hpc.active_learning.daemon.state import (
+    CampaignPhase,
     DEFAULT_STATE_FILENAME,
     fresh_campaign_state,
     read_state,
@@ -325,6 +326,20 @@ def test_cli_reconcile_writes_proposed_state(tmp_path, capsys):
     assert proposed.exists()
     captured = capsys.readouterr()
     assert "Proposed state written" in captured.out
+
+
+def test_cli_resume_refuses_halted_state(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state()
+    state.phase = CampaignPhase.HALTED
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+
+    rc = main(["resume", "--campaign-dir", str(campaign)])
+
+    assert rc == 6
+    assert "campaign is HALTED" in capsys.readouterr().err
 
 
 def test_cli_start_with_mock_ariadne_drives_state_machine(tmp_path):

@@ -13,6 +13,7 @@ class CommittedArtifactError(RuntimeError):
 
 
 _TRAINING_REQUIRED = {
+    CampaignPhase.INITIAL_FEREBUS,
     CampaignPhase.SEED_SELECT,
     CampaignPhase.ARIADNE_ARRAY,
     CampaignPhase.PHASE_B_POLUS,
@@ -33,6 +34,17 @@ _MODELS_REQUIRED = {
     CampaignPhase.AIMALL,
     CampaignPhase.APPEND,
     CampaignPhase.FEREBUS,
+    CampaignPhase.STOP_CHECK,
+}
+
+_COHERENT_TRAINING_MODEL_REQUIRED = {
+    CampaignPhase.SEED_SELECT,
+    CampaignPhase.ARIADNE_ARRAY,
+    CampaignPhase.PHASE_B_POLUS,
+    CampaignPhase.SPLIT,
+    CampaignPhase.GAUSSIAN,
+    CampaignPhase.AIMALL,
+    CampaignPhase.APPEND,
     CampaignPhase.STOP_CHECK,
 }
 
@@ -102,6 +114,13 @@ def verify_state_referenced_artifacts(
     campaign = Path(campaign_dir)
 
     train_version = int(getattr(state, "training_set_version", -1))
+    if phase in _TRAINING_REQUIRED and train_version < 0:
+        raise CommittedArtifactError(
+            "phase "
+            + phase.value
+            + " requires a committed training version but state has "
+            + str(train_version)
+        )
     if train_version >= 0:
         train_dir = (
             campaign
@@ -125,6 +144,13 @@ def verify_state_referenced_artifacts(
             )
 
     model_version = int(getattr(state, "models_version", -1))
+    if strict_models and phase in _MODELS_REQUIRED and model_version < 0:
+        raise CommittedArtifactError(
+            "phase "
+            + phase.value
+            + " requires a committed model version but state has "
+            + str(model_version)
+        )
     if model_version >= 0:
         model_dir = (
             campaign
@@ -146,6 +172,16 @@ def verify_state_referenced_artifacts(
                 + phase.value
                 + ": "
                 + str(model_dir)
+            )
+    if strict_models and phase in _COHERENT_TRAINING_MODEL_REQUIRED:
+        if train_version != model_version:
+            raise CommittedArtifactError(
+                "state training/model version skew for phase "
+                + phase.value
+                + ": training_set_version="
+                + str(train_version)
+                + ", models_version="
+                + str(model_version)
             )
 
 

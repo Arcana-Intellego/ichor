@@ -220,16 +220,22 @@ def test_missing_sacct_rows_keep_polling_when_squeue_still_active(tmp_path):
             error=None,
         ),
     )
-    d.config.runtime.poll_sacct_missing_max_ticks = 1
+    d.config.runtime.poll_sacct_missing_max_ticks = 2
     _install_pending_array_state(d)
 
     assert d.tick() == TickStatus.POLLING
     state = read_state(d.state_path())
     assert state.phase is CampaignPhase.INITIAL_AIMALL
     assert state.pending_jobs[CampaignPhase.INITIAL_AIMALL.value] == "777"
-    assert state.sacct_empty_streak.get("777:MISSING") is None
+    assert state.sacct_empty_streak.get("777:MISSING") == 1
     events = list(iter_events(d.journal_path()))
     assert any(e.get("event") == "sacct_rows_missing_but_squeue_active" for e in events)
+
+    assert d.tick() == TickStatus.HALTED
+    halted = read_state(d.state_path())
+    assert halted.phase is CampaignPhase.HALTED
+    events = list(iter_events(d.journal_path()))
+    assert any(e.get("event") == "sacct_missing_timeout" for e in events)
 
 
 def test_missing_sacct_rows_keep_polling_when_squeue_inconclusive(tmp_path):
@@ -243,15 +249,21 @@ def test_missing_sacct_rows_keep_polling_when_squeue_inconclusive(tmp_path):
             error="squeue transient failure",
         ),
     )
-    d.config.runtime.poll_sacct_missing_max_ticks = 1
+    d.config.runtime.poll_sacct_missing_max_ticks = 2
     _install_pending_array_state(d)
 
     assert d.tick() == TickStatus.POLLING
     state = read_state(d.state_path())
     assert state.phase is CampaignPhase.INITIAL_AIMALL
-    assert state.sacct_empty_streak.get("777:MISSING") is None
+    assert state.sacct_empty_streak.get("777:MISSING") == 1
     events = list(iter_events(d.journal_path()))
     assert any(e.get("event") == "squeue_liveness_inconclusive" for e in events)
+
+    assert d.tick() == TickStatus.HALTED
+    halted = read_state(d.state_path())
+    assert halted.phase is CampaignPhase.HALTED
+    events = list(iter_events(d.journal_path()))
+    assert any(e.get("event") == "sacct_missing_timeout" for e in events)
 
 
 def test_missing_sacct_rows_halt_when_squeue_confirms_job_gone(tmp_path):
@@ -304,6 +316,22 @@ def test_tick_halts_when_executor_handles_failure_with_halt(tmp_path):
     assert status == TickStatus.HALTED
     state = read_state(d.state_path())
     assert state.phase is CampaignPhase.HALTED
+
+
+def test_strict_sbatch_producer_failure_halts_instead_of_scrub(tmp_path):
+    executor = _StrictMockExecutor(treat_as_sbatch=set(_SBATCH_PHASES))
+    d = _make_daemon(tmp_path, executor=executor, sacct=_failed_poll)
+    d.tick()  # INIT -> PHASE_A_POLUS
+    d.tick()  # submit PHASE_A_POLUS
+
+    status = d.tick()
+
+    assert status == TickStatus.HALTED
+    state = read_state(d.state_path())
+    assert state.phase is CampaignPhase.HALTED
+    events = list(iter_events(d.journal_path()))
+    halt = [e for e in events if e.get("event") == "halt"][-1]
+    assert "phase_failed_requires_postprocess" in halt["reason"]
 
 
 def test_tick_terminal_state_returns_terminal(tmp_path):
@@ -472,6 +500,13 @@ def test_required_ferebus_output_missing_after_failure_halts_at_producer(tmp_pat
     state.phase = CampaignPhase.INITIAL_FEREBUS
     state.pending_jobs[CampaignPhase.INITIAL_FEREBUS.value] = "16177329"
     write_state(d.state_path(), state)
+    submission_intent.mark_submitted(
+        d.campaign_dir,
+        CampaignPhase.INITIAL_FEREBUS.value,
+        0,
+        "16177329",
+        expected_tasks=12,
+    )
 
     status = d.tick()
 
@@ -503,6 +538,13 @@ def test_required_ferebus_output_missing_after_success_halts_at_producer(tmp_pat
     state.phase = CampaignPhase.INITIAL_FEREBUS
     state.pending_jobs[CampaignPhase.INITIAL_FEREBUS.value] = "16177329"
     write_state(d.state_path(), state)
+    submission_intent.mark_submitted(
+        d.campaign_dir,
+        CampaignPhase.INITIAL_FEREBUS.value,
+        0,
+        "16177329",
+        expected_tasks=1,
+    )
 
     status = d.tick()
 
@@ -521,6 +563,38 @@ def test_required_ferebus_output_missing_after_success_halts_at_producer(tmp_pat
         and e.get("from_phase") == "INITIAL_FEREBUS"
         for e in events
     )
+
+
+def test_ferebus_transition_requires_fresh_model_update(tmp_path):
+    executor = _StrictMockExecutor(treat_as_sbatch=set(_SBATCH_PHASES))
+    d = _make_daemon(tmp_path, executor=executor)
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.FEREBUS
+    state.training_set_version = 1
+    state.models_version = 0
+
+    reason = d._transition_output_contract_error(state, CampaignPhase.FEREBUS, {})
+
+    assert reason is not None
+    assert "fresh FEREBUS models_version missing" in reason
+
+
+def test_ferebus_transition_rejects_training_model_skew(tmp_path):
+    executor = _StrictMockExecutor(treat_as_sbatch=set(_SBATCH_PHASES))
+    d = _make_daemon(tmp_path, executor=executor)
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.FEREBUS
+    state.training_set_version = 2
+    state.models_version = 1
+
+    reason = d._transition_output_contract_error(
+        state,
+        CampaignPhase.FEREBUS,
+        {"models_version": 1},
+    )
+
+    assert reason is not None
+    assert "model/training version skew" in reason
 
 
 def test_journal_records_phase_transitions(tmp_path):
