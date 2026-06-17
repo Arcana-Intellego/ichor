@@ -447,22 +447,43 @@ class Daemon:
     ) -> Optional[str]:
         if not bool(getattr(self.executor, "strict_committed_artifact_verification", False)):
             return None
-        try:
-            from .artifact_contracts import verify_state_referenced_artifacts
-            verify_state_referenced_artifacts(
-                self.campaign_dir,
-                state,
-                strict_models=True,
-            )
-        except Exception as exc:
-            return self._halt(
-                state,
-                phase,
-                "committed_artifact_contract_invalid: "
-                + type(exc).__name__
-                + ": "
-                + str(exc)[:180],
-            )
+        attempts = max(
+            1,
+            int(getattr(self.config.runtime, "postprocess_settle_attempts", 3)),
+        )
+        settle_seconds = max(
+            0,
+            int(getattr(self.config.runtime, "postprocess_settle_seconds", 10)),
+        )
+        for attempt in range(attempts):
+            try:
+                from .artifact_contracts import verify_state_referenced_artifacts
+                verify_state_referenced_artifacts(
+                    self.campaign_dir,
+                    state,
+                    strict_models=True,
+                )
+                return None
+            except Exception as exc:
+                reason = (
+                    "committed_artifact_contract_invalid: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)[:180]
+                )
+                if attempt + 1 < attempts and self._looks_like_file_settle(reason):
+                    self._journal(
+                        "committed_artifact_settle_retry",
+                        phase=phase.value,
+                        iteration=int(state.iteration),
+                        attempt=int(attempt + 1),
+                        reason=reason[:180],
+                    )
+                    self._write_lease_heartbeat(state)
+                    if settle_seconds:
+                        self.sleep_fn(float(settle_seconds))
+                    continue
+                return self._halt(state, phase, reason)
         return None
 
     def _strict_artifact_checks_enabled(self) -> bool:

@@ -98,6 +98,7 @@ KNOWN_EVENT_TYPES = (
     "phase_output_contract_invalid",
     "required_phase_output_missing_after_failure",
     "reconcile_applied",
+    "committed_artifact_settle_retry",
 )
 
 
@@ -216,5 +217,4 @@ def read_events(
         if since is not None and str(record.get("ts", "")) < since:
             continue
         yield record
-
 
