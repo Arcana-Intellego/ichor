@@ -95,6 +95,8 @@ KNOWN_EVENT_TYPES = (
     "ariadne_landing_summary",
     "error_calibration_summary",
     "error_calibration_failed",
+    "phase_output_contract_invalid",
+    "required_phase_output_missing_after_failure",
 )
 
 
@@ -213,7 +215,6 @@ def read_events(
         if since is not None and str(record.get("ts", "")) < since:
             continue
         yield record
-
 
 
 

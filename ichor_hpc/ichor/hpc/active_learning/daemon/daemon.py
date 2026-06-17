@@ -614,8 +614,11 @@ class Daemon:
             return TickStatus.SUBMITTED
         if result.is_complete:
             #inline phase, or executor decided no submission needed.
-            self._advance(state, phase, result.state_updates)
-            return TickStatus.ADVANCED
+            return (
+                TickStatus.ADVANCED
+                if self._advance(state, phase, result.state_updates)
+                else TickStatus.HALTED
+            )
         #defensive: executor returned neither a JobID nor completion.
         raise RuntimeError(
             "executor returned no submitted_job_id and is_complete=False for "
@@ -897,6 +900,24 @@ class Daemon:
         if result.failure_reason:
             return self._halt(state, phase, result.failure_reason)
         self._clear_sacct_streaks(state, str(summary.parent_job_id))
+        contract_error = self._transition_output_contract_error(
+            state,
+            phase,
+            result.state_updates,
+        )
+        if contract_error is not None:
+            state.pending_jobs[phase.value] = None
+            self._journal(
+                "phase_output_contract_invalid",
+                phase=phase.value,
+                iteration=state.iteration,
+                reason=contract_error,
+            )
+            return self._halt(
+                state,
+                phase,
+                "phase_output_contract_invalid: " + contract_error,
+            )
         completed_iteration = int(state.iteration)
         if phase.value in SBATCH_PHASES:
             try:
@@ -917,8 +938,11 @@ class Daemon:
             n_completed=summary.n_completed, n_failed=summary.n_failed,
             n_tasks=summary.n_tasks,
         )
-        self._advance(state, phase, result.state_updates)
-        return TickStatus.ADVANCED
+        return (
+            TickStatus.ADVANCED
+            if self._advance(state, phase, result.state_updates)
+            else TickStatus.HALTED
+        )
 
     def _handle_failure(
         self,
@@ -960,8 +984,25 @@ class Daemon:
                 pass
         self._clear_sacct_streaks(state, str(summary.parent_job_id))
         state.pending_jobs[phase.value] = None
-        self._advance(state, phase, {})
-        return TickStatus.SCRUBBED
+        contract_error = self._transition_output_contract_error(state, phase, {})
+        if contract_error is not None:
+            action_value = str(action.value if hasattr(action, "value") else action)
+            self._journal(
+                "required_phase_output_missing_after_failure",
+                phase=phase.value,
+                iteration=state.iteration,
+                action=action_value,
+                n_tasks=summary.n_tasks,
+                n_completed=summary.n_completed,
+                n_failed=summary.n_failed,
+                reason=contract_error,
+            )
+            return self._halt(
+                state,
+                phase,
+                "required_phase_output_missing_after_failure: " + contract_error,
+            )
+        return TickStatus.SCRUBBED if self._advance(state, phase, {}) else TickStatus.HALTED
 
     def _clear_sacct_streaks(self, state: CampaignState, job_id: str) -> None:
         state.sacct_empty_streak.pop(str(job_id), None)
@@ -1078,7 +1119,67 @@ class Daemon:
         self._persist(state)
         return TickStatus.HALTED
 
-    def _advance(self, state: CampaignState, phase: CampaignPhase, state_updates: Dict[str, Any]) -> None:
+    def _transition_output_contract_error(
+        self,
+        state: CampaignState,
+        phase: CampaignPhase,
+        state_updates: Dict[str, Any],
+    ) -> Optional[str]:
+        """Return a reason if advancing would violate a producer handoff.
+
+        This guard is intentionally driven by the same strict-artifact flag
+        used by live executors. Mock/dry executors can still exercise the FSM
+        without fabricating full FEREBUS model directories, while live runs
+        cannot advance past a required model-producing phase unless the
+        committed model contract is actually satisfied.
+        """
+        if not bool(getattr(self.executor, "strict_committed_artifact_verification", False)):
+            return None
+        if phase not in (CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS):
+            return None
+
+        raw_version = state_updates.get("models_version", getattr(state, "models_version", -1))
+        try:
+            models_version = int(raw_version)
+        except (TypeError, ValueError):
+            return (
+                "required FEREBUS model version is not an integer for "
+                + phase.value
+                + ": "
+                + repr(raw_version)
+            )
+        if models_version < 0:
+            return (
+                "required FEREBUS model version is negative for "
+                + phase.value
+                + ": "
+                + str(models_version)
+            )
+
+        expected_path = (
+            self.campaign_dir
+            / "6_TRAINED_MODELS"
+            / ("iteration-" + str(models_version).zfill(4))
+        )
+        try:
+            from .artifact_contracts import verify_committed_model_version
+            verify_committed_model_version(self.campaign_dir, models_version)
+        except Exception as exc:
+            return (
+                "required FEREBUS model commit missing or invalid after "
+                + phase.value
+                + " (models_version="
+                + str(models_version)
+                + ", expected_path="
+                + str(expected_path)
+                + "): "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:220]
+            )
+        return None
+
+    def _advance(self, state: CampaignState, phase: CampaignPhase, state_updates: Dict[str, Any]) -> bool:
         #NB:STOP_CHECK ghost-iteration fix. When _inline_stop_check
         #returns {"shutdown_requested": True}, the daemon must NOT also
         #advance phase + iteration -- otherwise state.json snapshots show
@@ -1093,7 +1194,26 @@ class Daemon:
                 "shutdown_requested", from_phase=phase.value,
                 iteration=int(state.iteration),
             )
-            return
+            return True
+
+        contract_error = self._transition_output_contract_error(
+            state,
+            phase,
+            state_updates,
+        )
+        if contract_error is not None:
+            self._journal(
+                "phase_output_contract_invalid",
+                phase=phase.value,
+                iteration=state.iteration,
+                reason=contract_error,
+            )
+            self._halt(
+                state,
+                phase,
+                "phase_output_contract_invalid: " + contract_error,
+            )
+            return False
 
         new_phase, new_iter = next_phase(phase, state.iteration, state.max_iterations)
         prior_iter = state.iteration
@@ -1109,6 +1229,7 @@ class Daemon:
             "phase_transition", from_phase=phase.value, to_phase=new_phase.value,
             iteration=new_iter, prior_iteration=prior_iter,
         )
+        return True
 
     def _apply_state_updates(self, state: CampaignState, updates: Dict[str, Any]) -> None:
         if not updates:

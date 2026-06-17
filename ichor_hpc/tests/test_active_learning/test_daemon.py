@@ -59,6 +59,22 @@ def _running_poll(job_id, **kw):
     return [JobObservation(job_id=job_id, status=JobStatus.RUNNING, exit_code=None, elapsed_seconds=None)]
 
 
+def _failed_ferebus_array_poll(job_id, **kw):
+    return [
+        JobObservation(
+            job_id=str(job_id) + "_" + str(i),
+            status=JobStatus.FAILED,
+            exit_code=(1, 0),
+            elapsed_seconds=1,
+        )
+        for i in range(12)
+    ]
+
+
+class _StrictMockExecutor(MockPhaseExecutor):
+    strict_committed_artifact_verification = True
+
+
 def _make_daemon(
     tmp_path,
     *,
@@ -446,6 +462,65 @@ def test_timeout_failure_does_not_transient_retry_by_default(tmp_path):
     assert not d.transient_retry_ledger_path().exists()
     state = read_state(d.state_path())
     assert state.phase is CampaignPhase.INITIAL_GAUSSIAN
+
+
+def test_required_ferebus_output_missing_after_failure_halts_at_producer(tmp_path):
+    executor = _StrictMockExecutor(treat_as_sbatch=set(_SBATCH_PHASES))
+    d = _make_daemon(tmp_path, executor=executor, sacct=_failed_ferebus_array_poll)
+    d.data_dir().mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.INITIAL_FEREBUS
+    state.pending_jobs[CampaignPhase.INITIAL_FEREBUS.value] = "16177329"
+    write_state(d.state_path(), state)
+
+    status = d.tick()
+
+    assert status == TickStatus.HALTED
+    halted = read_state(d.state_path())
+    assert halted.phase is CampaignPhase.HALTED
+    events = list(iter_events(d.journal_path()))
+    assert any(
+        e.get("event") == "required_phase_output_missing_after_failure"
+        and e.get("phase") == "INITIAL_FEREBUS"
+        for e in events
+    )
+    assert not any(
+        e.get("event") == "phase_transition"
+        and e.get("from_phase") == "INITIAL_FEREBUS"
+        and e.get("to_phase") == "SEED_SELECT"
+        for e in events
+    )
+    halt = [e for e in events if e.get("event") == "halt"][-1]
+    assert halt["from_phase"] == "INITIAL_FEREBUS"
+    assert "required_phase_output_missing_after_failure" in halt["reason"]
+
+
+def test_required_ferebus_output_missing_after_success_halts_at_producer(tmp_path):
+    executor = _StrictMockExecutor(treat_as_sbatch=set(_SBATCH_PHASES))
+    d = _make_daemon(tmp_path, executor=executor, sacct=_completed_poll)
+    d.data_dir().mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.INITIAL_FEREBUS
+    state.pending_jobs[CampaignPhase.INITIAL_FEREBUS.value] = "16177329"
+    write_state(d.state_path(), state)
+
+    status = d.tick()
+
+    assert status == TickStatus.HALTED
+    halted = read_state(d.state_path())
+    assert halted.phase is CampaignPhase.HALTED
+    events = list(iter_events(d.journal_path()))
+    assert any(
+        e.get("event") == "phase_output_contract_invalid"
+        and e.get("phase") == "INITIAL_FEREBUS"
+        for e in events
+    )
+    assert not any(e.get("event") == "phase_succeeded" for e in events)
+    assert not any(
+        e.get("event") == "phase_transition"
+        and e.get("from_phase") == "INITIAL_FEREBUS"
+        for e in events
+    )
 
 
 def test_journal_records_phase_transitions(tmp_path):
