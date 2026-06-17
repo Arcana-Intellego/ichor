@@ -27,7 +27,7 @@ import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .config import CampaignConfig
 from .daemon.daemon import (
@@ -318,18 +318,32 @@ def _compact_event_details(event: Dict[str, Any]) -> str:
 def _format_journal_events(events: Sequence[Dict[str, Any]], *, verbose: bool) -> str:
     if not events:
         return ""
-    lines: List[str] = []
+    rows: List[Tuple[Dict[str, Any], str, str, str, str]] = []
     for event in events:
         event_name = str(event.get("event", "<missing>"))
         phase = _event_phase(event)
-        first_line = (
-            _event_time(event).ljust(8)
-            + "  "
-            + event_name.ljust(24)
-            + "  "
-            + phase.ljust(18)
+        rows.append(
+            (
+                event,
+                _event_time(event),
+                event_name,
+                phase,
+                _compact_event_details(event),
+            )
         )
-        details = _compact_event_details(event)
+    time_width = max(8, max(len(row[1]) for row in rows))
+    event_width = max(24, max(len(row[2]) for row in rows))
+    phase_width = max(18, max(len(row[3]) for row in rows))
+
+    lines: List[str] = []
+    for event, event_time, event_name, phase, details in rows:
+        first_line = (
+            event_time.ljust(time_width)
+            + "  "
+            + event_name.ljust(event_width)
+            + "  "
+            + phase.ljust(phase_width)
+        )
         lines.append(first_line + (("  " + details) if details else ""))
         if verbose:
             for key in sorted(event):

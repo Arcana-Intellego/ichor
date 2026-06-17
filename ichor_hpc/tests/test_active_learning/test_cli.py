@@ -268,6 +268,33 @@ def test_cli_journal_default_prints_readable_events(tmp_path, capsys):
     assert not out.lstrip().startswith("{")
 
 
+def test_cli_journal_left_justifies_columns_for_long_events(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
+    journal = campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson"
+    append_event(
+        journal,
+        "sbatch",
+        phase="PHASE_A_POLUS",
+        job_id="16175189",
+        expected_tasks=1,
+    )
+    append_event(
+        journal,
+        "sacct_rows_missing_but_squeue_active",
+        phase="INITIAL_GAUSSIAN",
+        job_id="16175294",
+    )
+
+    rc = main(["journal", "--campaign-dir", str(campaign)])
+
+    assert rc == 0
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert len(lines) == 2
+    assert lines[0].index("PHASE_A_POLUS") == lines[1].index("INITIAL_GAUSSIAN")
+    assert lines[0].index("job=16175189") == lines[1].index("job=16175294")
+
+
 def test_cli_journal_verbose_prints_event_details(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
     (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
