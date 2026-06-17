@@ -97,6 +97,7 @@ KNOWN_EVENT_TYPES = (
     "error_calibration_failed",
     "phase_output_contract_invalid",
     "required_phase_output_missing_after_failure",
+    "reconcile_applied",
 )
 
 
@@ -215,6 +216,5 @@ def read_events(
         if since is not None and str(record.get("ts", "")) < since:
             continue
         yield record
-
 
 

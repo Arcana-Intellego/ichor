@@ -1,0 +1,437 @@
+"""Campaign configuration lock and guarded recovery checks.
+
+The active-learning daemon is allowed to restart after crashes, scheduler
+failures, and deliberate operator stops. It must not silently continue a
+campaign after a protocol-changing edit to ``campaign.yaml``. This module
+stores a canonical, default-expanded config snapshot and classifies later
+edits before ``reconcile --apply`` promotes a proposed recovery state.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import shutil
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+
+from ..config import CampaignConfig
+from ..versioning.training_set import TrainingSetVersioning
+from .state import CampaignPhase, CampaignState, atomic_write_json
+
+
+CONFIG_LOCK_SCHEMA_VERSION = 1
+CONFIG_LOCK_FILENAME = "config_lock.json"
+CONFIG_LOCK_POLICY_VERSION = 1
+
+
+@dataclass(frozen=True)
+class ConfigChange:
+    path: str
+    old: Any
+    new: Any
+    category: str
+    allowed: bool
+    reason: str
+
+
+@dataclass
+class ConfigLockReview:
+    lock_path: Path
+    lock_existed: bool
+    allowed_changes: List[ConfigChange] = field(default_factory=list)
+    blocked_changes: List[ConfigChange] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+
+    @property
+    def allowed(self) -> bool:
+        return not self.blocked_changes
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.allowed_changes or self.blocked_changes)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def config_lock_path(campaign_dir: Union[str, Path]) -> Path:
+    return (
+        Path(campaign_dir)
+        / ".DATA"
+        / "ACTIVE_LEARNING"
+        / CONFIG_LOCK_FILENAME
+    )
+
+
+def canonical_config(config: CampaignConfig) -> Dict[str, Any]:
+    return config.to_dict()
+
+
+def _canonical_json(payload: Dict[str, Any]) -> str:
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+
+
+def config_fingerprint(config_payload: Dict[str, Any]) -> str:
+    return hashlib.sha256(_canonical_json(config_payload).encode("utf-8")).hexdigest()
+
+
+def _lock_payload(config: CampaignConfig, *, created_at_iso: Optional[str] = None) -> Dict[str, Any]:
+    payload = canonical_config(config)
+    now = _now_iso()
+    return {
+        "schema_version": CONFIG_LOCK_SCHEMA_VERSION,
+        "campaign_schema_version": int(payload.get("schema_version", -1)),
+        "created_at_iso": created_at_iso or now,
+        "last_checked_at_iso": now,
+        "canonical_config": payload,
+        "fingerprint_sha256": config_fingerprint(payload),
+        "field_policy_version": CONFIG_LOCK_POLICY_VERSION,
+    }
+
+
+def write_config_lock(campaign_dir: Union[str, Path], config: CampaignConfig) -> Path:
+    path = config_lock_path(campaign_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    created = None
+    if path.is_file():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            created = str(existing.get("created_at_iso") or "") or None
+        except Exception:
+            created = None
+    atomic_write_json(path, _lock_payload(config, created_at_iso=created))
+    return path
+
+
+def ensure_config_lock(campaign_dir: Union[str, Path], config: CampaignConfig) -> Path:
+    path = config_lock_path(campaign_dir)
+    if not path.is_file():
+        return write_config_lock(campaign_dir, config)
+    return path
+
+
+def _flatten(payload: Any, prefix: str = "") -> Dict[str, Any]:
+    if isinstance(payload, dict):
+        out: Dict[str, Any] = {}
+        for key, value in payload.items():
+            path = (prefix + "." + str(key)) if prefix else str(key)
+            out.update(_flatten(value, path))
+        return out
+    return {prefix: payload}
+
+
+def _diff(old: Dict[str, Any], new: Dict[str, Any]) -> List[Tuple[str, Any, Any]]:
+    old_flat = _flatten(old)
+    new_flat = _flatten(new)
+    paths = sorted(set(old_flat) | set(new_flat))
+    return [
+        (path, old_flat.get(path), new_flat.get(path))
+        for path in paths
+        if old_flat.get(path) != new_flat.get(path)
+    ]
+
+
+def _matches(path: str, exact: Iterable[str], prefixes: Iterable[str]) -> bool:
+    return path in set(exact) or any(path.startswith(prefix) for prefix in prefixes)
+
+
+ALWAYS_SAFE_EXACT = {
+    "max_iterations",
+    "poll_interval_seconds",
+    "poll_interval_idle_seconds",
+    "poll_sacct_empty_max_ticks",
+}
+ALWAYS_SAFE_PREFIXES = {
+    "runtime.",
+    "stop.",
+    "error_calibration.",
+}
+ALWAYS_SAFE_RESOURCE_EXACT = {
+    "resources.walltime_hours",
+    "resources.mem_per_cpu",
+    "resources.array_concurrency_limit",
+    "resources.gradient_parallel_backend",
+}
+
+FUTURE_SAFE_PREFIXES = {
+    "seed_selection.",
+    "batch_sizing.",
+    "anti_overlap.",
+    "phase_b.",
+    "adversarial_safety.",
+    "ariadne.",
+    "acquisition.subspace.",
+    "acquisition.barrier.",
+    "acquisition.stencils.",
+    "acquisition.weights.",
+    "acquisition.spectral.",
+    "acquisition.calibrated_energy.",
+    "acquisition.fullspace_confinement.",
+    "acquisition.gradient.",
+    "acquisition.references.",
+}
+FUTURE_SAFE_EXACT = {
+    "resources.partition",
+    "resources.cpus_per_task",
+    "resources.ntasks",
+    "resources.aimall_cpus_per_task",
+    "resources.ariadne_cpus_per_task",
+    "acquisition.use_scaled_posterior_covariance",
+    "acquisition.allow_uniform_posterior_fallback",
+}
+
+PHASE_LOCAL_EXACT = {
+    "ferebus.warmstart",
+    "ferebus.warmstart_streak",
+    "ferebus.kernel",
+    "ferebus.loss",
+    "ferebus.nagents",
+    "ferebus.maxiter",
+    "ferebus.is_constant_noise",
+    "ferebus.scaling",
+    "ferebus.full_ARD",
+    "quality_gates.ferebus_min_ext_r2",
+    "quality_gates.ferebus_max_ext_rmse_ha",
+    "quality_gates.ferebus_max_condition_number",
+    "gaussian.nproc",
+    "gaussian.mem",
+    "gaussian.memory_mode",
+    "gaussian.memory_fraction_of_slurm",
+    "aimall.encomp",
+    "aimall.nogui",
+    "aimall.naat",
+    "aimall.boaq",
+    "aimall.iasmesh",
+}
+
+COMMITTED_LOCKED_EXACT = {
+    "trajectory_pool.source_path",
+    "outlier_filter.enabled",
+    "outlier_filter.energy_z_threshold",
+    "outlier_filter.per_atom_rmsd_z_threshold",
+    "split.strategy",
+    "split.train_fraction",
+    "split.val_mid_fraction",
+    "split.high_holdout_fraction",
+    "ferebus.properties",
+    "ferebus.train_fraction",
+    "ferebus.int_val_fraction",
+    "ferebus.ext_val_fraction",
+    "acquisition.property_name",
+    "quality_gates.require_readable_aimall_geometry",
+    "quality_gates.require_finite_iqa",
+    "quality_gates.require_finite_integration_error",
+    "quality_gates.max_abs_integration_error",
+    "quality_gates.iqa_energy_recovery_tolerance_ha",
+    "quality_gates.ariadne_max_displacement_ang",
+    "quality_gates.ariadne_min_pair_distance_ang",
+}
+
+CAMPAIGN_LOCKED_EXACT = {
+    "schema_version",
+    "system_name",
+    "initial_train_size",
+    "initial_val_size",
+    "gaussian.method",
+    "gaussian.basis_set",
+    "gaussian.charge",
+    "gaussian.spin_multiplicity",
+    "gaussian.extra_keywords",
+    "failure_threshold_fraction",
+    "max_acquisition_grad_per_ang",
+    "max_force_per_atom_ha_per_ang",
+}
+
+
+def _committed_model_exists(campaign_dir: Union[str, Path], version: int) -> bool:
+    models = Path(campaign_dir) / "6_TRAINED_MODELS"
+    if not models.is_dir():
+        return False
+    try:
+        committed = TrainingSetVersioning(models).list_committed_versions()
+    except Exception:
+        return False
+    return int(version) in {int(v) for v in committed}
+
+
+def _phase_local_allowed(
+    campaign_dir: Union[str, Path],
+    path: str,
+    proposed_state: CampaignState,
+) -> Tuple[bool, str]:
+    phase = proposed_state.phase
+    if path.startswith("ferebus.") or path.startswith("quality_gates.ferebus_"):
+        if phase not in (CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS):
+            return False, "FEREBUS settings may change only when re-entering a FEREBUS phase"
+        target = int(proposed_state.training_set_version)
+        if _committed_model_exists(campaign_dir, target):
+            return False, "target FEREBUS model version is already committed"
+        return True, "allowed for uncommitted FEREBUS re-entry"
+    if path.startswith("gaussian."):
+        if phase not in (CampaignPhase.INITIAL_GAUSSIAN, CampaignPhase.GAUSSIAN):
+            return False, "Gaussian runtime settings may change only when re-entering Gaussian"
+        return True, "allowed for Gaussian re-entry before acceptance"
+    if path.startswith("aimall."):
+        if phase not in (CampaignPhase.INITIAL_AIMALL, CampaignPhase.AIMALL):
+            return False, "AIMAll settings may change only when re-entering AIMAll"
+        return True, "allowed for AIMAll re-entry before acceptance"
+    return False, "phase-local field is not recognised for this re-entry phase"
+
+
+def _classify_change(
+    campaign_dir: Union[str, Path],
+    proposed_state: CampaignState,
+    path: str,
+    old: Any,
+    new: Any,
+) -> ConfigChange:
+    if _matches(path, ALWAYS_SAFE_EXACT | ALWAYS_SAFE_RESOURCE_EXACT, ALWAYS_SAFE_PREFIXES):
+        return ConfigChange(path, old, new, "always_safe", True, "safe runtime/diagnostic change")
+    if _matches(path, FUTURE_SAFE_EXACT, FUTURE_SAFE_PREFIXES):
+        return ConfigChange(path, old, new, "future_safe", True, "allowed for future phase execution")
+    if path in PHASE_LOCAL_EXACT:
+        allowed, reason = _phase_local_allowed(campaign_dir, path, proposed_state)
+        return ConfigChange(path, old, new, "phase_local", allowed, reason)
+    if path in COMMITTED_LOCKED_EXACT:
+        return ConfigChange(path, old, new, "committed_locked", False, "field affects committed artefact contracts")
+    if path in CAMPAIGN_LOCKED_EXACT:
+        return ConfigChange(path, old, new, "campaign_locked", False, "field is locked after campaign start")
+    return ConfigChange(path, old, new, "unclassified_locked", False, "field has no configured mid-campaign change policy")
+
+
+def review_config_changes(
+    campaign_dir: Union[str, Path],
+    config: CampaignConfig,
+    proposed_state: CampaignState,
+    *,
+    initialise_missing: bool = False,
+) -> ConfigLockReview:
+    path = config_lock_path(campaign_dir)
+    if not path.is_file():
+        review = ConfigLockReview(lock_path=path, lock_existed=False)
+        if initialise_missing:
+            write_config_lock(campaign_dir, config)
+            review.notes.append("config lock was missing and has been initialised from current campaign.yaml")
+        else:
+            review.notes.append("config lock is missing")
+        return review
+    try:
+        lock = json.loads(path.read_text(encoding="utf-8"))
+        old_config = lock.get("canonical_config")
+        if not isinstance(old_config, dict):
+            raise ValueError("canonical_config missing")
+    except Exception as exc:
+        review = ConfigLockReview(lock_path=path, lock_existed=True)
+        review.blocked_changes.append(
+            ConfigChange(
+                "config_lock",
+                "<unreadable>",
+                "<current>",
+                "lock_invalid",
+                False,
+                "config lock is unreadable: " + type(exc).__name__ + ": " + str(exc)[:160],
+            )
+        )
+        return review
+
+    new_config = canonical_config(config)
+    review = ConfigLockReview(lock_path=path, lock_existed=True)
+    for dotted, old, new in _diff(old_config, new_config):
+        change = _classify_change(campaign_dir, proposed_state, dotted, old, new)
+        if change.allowed:
+            review.allowed_changes.append(change)
+        else:
+            review.blocked_changes.append(change)
+    return review
+
+
+def assert_config_unchanged_for_start(
+    campaign_dir: Union[str, Path],
+    config: CampaignConfig,
+    state: Optional[CampaignState],
+) -> ConfigLockReview:
+    if state is None:
+        ensure_config_lock(campaign_dir, config)
+        return ConfigLockReview(lock_path=config_lock_path(campaign_dir), lock_existed=True)
+    review = review_config_changes(campaign_dir, config, state, initialise_missing=True)
+    if review.changed:
+        return review
+    if review.lock_existed:
+        write_config_lock(campaign_dir, config)
+    return review
+
+
+def _ensure_inside_campaign(campaign_dir: Path, target: Path) -> None:
+    campaign = campaign_dir.resolve()
+    resolved = target.resolve()
+    if resolved != campaign and campaign not in resolved.parents:
+        raise ValueError("refusing to clean path outside campaign: " + str(target))
+
+
+def clean_reentry_staging(campaign_dir: Union[str, Path], phase: CampaignPhase) -> List[str]:
+    campaign = Path(campaign_dir)
+    removed: List[str] = []
+    if phase in (CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS):
+        target = campaign / "6_TRAINED_MODELS" / "iteration-staging"
+        if target.exists():
+            _ensure_inside_campaign(campaign, target)
+            shutil.rmtree(target)
+            removed.append(str(target))
+    scripts = campaign / ".DATA" / "SCRIPTS"
+    if scripts.is_dir():
+        _ensure_inside_campaign(campaign, scripts)
+        for script in sorted(scripts.glob("*.sh")):
+            if script.is_file():
+                script.unlink()
+                removed.append(str(script))
+    return removed
+
+
+def apply_config_lock_update(
+    campaign_dir: Union[str, Path],
+    config: CampaignConfig,
+) -> Path:
+    return write_config_lock(campaign_dir, config)
+
+
+def format_config_review(review: ConfigLockReview) -> str:
+    lines: List[str] = []
+    if review.notes:
+        lines.extend(review.notes)
+    if review.allowed_changes:
+        lines.append("Allowed config changes:")
+        for change in review.allowed_changes:
+            lines.append(
+                "  - "
+                + change.path
+                + ": "
+                + repr(change.old)
+                + " -> "
+                + repr(change.new)
+                + " ("
+                + change.reason
+                + ")"
+            )
+    if review.blocked_changes:
+        lines.append("Blocked config changes:")
+        for change in review.blocked_changes:
+            lines.append(
+                "  - "
+                + change.path
+                + ": "
+                + repr(change.old)
+                + " -> "
+                + repr(change.new)
+                + " ("
+                + change.reason
+                + ")"
+            )
+    return "\n".join(lines)

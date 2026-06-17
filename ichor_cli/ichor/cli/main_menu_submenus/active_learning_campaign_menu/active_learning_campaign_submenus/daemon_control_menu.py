@@ -135,9 +135,34 @@ class DaemonControlFunctions:
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
         ns.allow_fresh_init = False
+        ns.apply = False
         rc = cmd_reconcile(ns)
         if rc != 0:
             print("reconcile returned exit code " + str(rc))
+        user_input_free_flow("Press enter to return to the menu: ", "")
+
+    @staticmethod
+    def reconcile_apply():
+        """Safely promote a reconcile proposal when config-lock checks pass."""
+        from ichor.hpc.active_learning.cli import cmd_reconcile
+
+        ns = _guarded_campaign_dir_ns()
+        if ns is None:
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        answer = user_input_free_flow(
+            "Apply safe reconcile proposal and clean stale uncommitted staging? Type YES: ",
+            "",
+        )
+        if answer != "YES":
+            print("Cancelled.")
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        ns.allow_fresh_init = False
+        ns.apply = True
+        rc = cmd_reconcile(ns)
+        if rc != 0:
+            print("reconcile --apply returned exit code " + str(rc))
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
@@ -158,6 +183,7 @@ class DaemonControlFunctions:
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
         ns.allow_fresh_init = True
+        ns.apply = False
         rc = cmd_reconcile(ns)
         if rc != 0:
             print("reconcile returned exit code " + str(rc))
@@ -207,6 +233,10 @@ daemon_control_menu_items = [
     ),
     FunctionItem("Stop daemon", DaemonControlFunctions.stop_daemon),
     FunctionItem("Reconcile state", DaemonControlFunctions.reconcile),
+    FunctionItem(
+        "Reconcile and apply safe proposal",
+        DaemonControlFunctions.reconcile_apply,
+    ),
     FunctionItem(
         "Reconcile state with --allow-fresh-init",
         DaemonControlFunctions.reconcile_allow_fresh_init,

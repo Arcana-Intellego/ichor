@@ -372,6 +372,12 @@ class Daemon:
         if not sp.exists():
             state = fresh_campaign_state(max_iterations=self.config.max_iterations)
             write_state(sp, state)
+            try:
+                from .config_lock import ensure_config_lock
+
+                ensure_config_lock(self.campaign_dir, self.config)
+            except Exception:
+                pass
             self._journal(
                 "campaign_started",
                 campaign_uid=state.campaign_uid,

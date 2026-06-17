@@ -38,6 +38,13 @@ from .daemon.daemon import (
     Daemon,
 )
 from .daemon.journal import iter_events, read_events
+from .daemon.config_lock import (
+    apply_config_lock_update,
+    assert_config_unchanged_for_start,
+    clean_reentry_staging,
+    format_config_review,
+    review_config_changes,
+)
 from .daemon.dry_run_executor import DryRunPhaseExecutor
 from .daemon.dry_run_sacct import DryRunSacctPoller
 from .daemon.live_executor import (
@@ -49,6 +56,7 @@ from .daemon.live_executor import (
 from .daemon.phase_executor import MockPhaseExecutor
 from .daemon.preflight import check_backends, missing_backend_message
 from .daemon.reconcile import propose_recovery, write_proposed_state
+from .daemon import submission_intent as _submission_intent
 from .daemon.state import (
     CampaignPhase,
     DEFAULT_STATE_FILENAME,
@@ -401,6 +409,35 @@ def cmd_start(args: argparse.Namespace) -> int:
     else:
         config = CampaignConfig.from_yaml(config_path)
 
+    paths = _campaign_paths(campaign)
+    state_for_lock = None
+    if paths["state"].is_file():
+        try:
+            state_for_lock = read_state(paths["state"])
+        except StateSchemaError:
+            state_for_lock = None
+    try:
+        lock_review = assert_config_unchanged_for_start(
+            campaign,
+            config,
+            state_for_lock,
+        )
+    except Exception as exc:
+        print("config lock check failed: " + str(exc), file=sys.stderr)
+        return 7
+    if lock_review.changed:
+        print(
+            "campaign.yaml changed since the config lock was written; "
+            "run `ichor-al-daemon reconcile --campaign-dir "
+            + str(campaign)
+            + " --apply` if the edits are safe.",
+            file=sys.stderr,
+        )
+        formatted = format_config_review(lock_review)
+        if formatted:
+            print(formatted, file=sys.stderr)
+        return 7
+
     #NB: journal the effective-config diff against CampaignConfig()
     #defaults. Operators inspecting the journal can see EXACTLY what the
     #preset overlay + their campaign.yaml combined to produce, without
@@ -572,7 +609,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
             print(
                 "campaign is HALTED; run `ichor-al-daemon reconcile --campaign-dir "
                 + str(campaign)
-                + "` and review/promote the proposed state before resuming",
+                + " --apply` if the recovery proposal is safe before resuming",
                 file=sys.stderr,
             )
             return 6
@@ -590,6 +627,23 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         allow_fresh_init_on_nonempty=bool(getattr(args, "allow_fresh_init", False)),
     )
     target = write_proposed_state(campaign, report)
+    config_path = campaign / "campaign.yaml"
+    config = None
+    config_review = None
+    if config_path.is_file():
+        try:
+            config = CampaignConfig.from_yaml(config_path)
+            config_review = review_config_changes(
+                campaign,
+                config,
+                report.proposed_state,
+                initialise_missing=False,
+            )
+        except Exception as exc:
+            if bool(getattr(args, "apply", False)):
+                print("campaign config could not be loaded: " + str(exc), file=sys.stderr)
+                return 8
+            print("campaign config could not be reviewed: " + str(exc), file=sys.stderr)
     print("Proposed state written to: " + str(target))
     print("")
     print("=== Diagnostic notes ===")
@@ -613,9 +667,122 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             for i in report.active_submission_intents
         ]))
     print("")
-    print("Review the proposal, then promote it manually:")
     target_canonical = target.with_name(DEFAULT_STATE_FILENAME)
-    print("    mv " + str(target) + " " + str(target_canonical))
+    if config_review is not None:
+        print("=== Config lock review ===")
+        formatted = format_config_review(config_review)
+        if formatted:
+            print(formatted)
+        else:
+            print("No campaign.yaml changes against the config lock.")
+        print("")
+    if not bool(getattr(args, "apply", False)):
+        print("Review the proposal, then promote it manually:")
+        print("    mv " + str(target) + " " + str(target_canonical))
+        print("")
+        print("Or apply the safe proposal automatically:")
+        print("    ichor-al-daemon reconcile --campaign-dir " + str(campaign) + " --apply")
+        return 0
+
+    if report.proposed_state.phase in (CampaignPhase.HALTED, CampaignPhase.DONE):
+        print(
+            "refusing --apply because proposed state is "
+            + report.proposed_state.phase.value,
+            file=sys.stderr,
+        )
+        return 9
+    if report.active_submission_intents:
+        print(
+            "refusing --apply while active submission intents are present",
+            file=sys.stderr,
+        )
+        return 9
+    if config is None:
+        print("refusing --apply because campaign.yaml is missing", file=sys.stderr)
+        return 8
+    if config_review is not None and config_review.blocked_changes:
+        print("refusing --apply because campaign.yaml has locked changes", file=sys.stderr)
+        print(format_config_review(config_review), file=sys.stderr)
+        return 8
+
+    cleanable_reasons = {
+        "dangling model staging directories exist",
+        ".DATA/SCRIPTS contains sbatch scripts",
+    }
+    uncleanable = [
+        reason
+        for reason in report.unsafe_reasons
+        if reason not in cleanable_reasons
+    ]
+    if uncleanable:
+        print(
+            "refusing --apply because reconcile reported unsafe artefacts "
+            "that cannot be cleaned automatically:",
+            file=sys.stderr,
+        )
+        for reason in uncleanable:
+            print("  - " + reason, file=sys.stderr)
+        return 9
+
+    backup_path = None
+    if target_canonical.exists():
+        from datetime import datetime, timezone
+        import shutil
+
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        backup_path = target_canonical.with_name(
+            target_canonical.name + ".before-reconcile-" + stamp
+        )
+        shutil.copy2(target_canonical, backup_path)
+    removed = clean_reentry_staging(campaign, report.proposed_state.phase)
+    target.replace(target_canonical)
+    write_state(target_canonical, report.proposed_state)
+    for intent_path in sorted(
+        (campaign / DEFAULT_DATA_SUBDIR / "submission_intents").glob("*.json")
+        if (campaign / DEFAULT_DATA_SUBDIR / "submission_intents").is_dir()
+        else []
+    ):
+        try:
+            payload = json.loads(intent_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if (
+            str(payload.get("phase")) == report.proposed_state.phase.value
+            and int(payload.get("iteration", -999999)) == int(report.proposed_state.iteration)
+            and str(payload.get("status")) == "FAILED"
+        ):
+            _submission_intent.mark_superseded(
+                campaign,
+                report.proposed_state.phase.value,
+                int(report.proposed_state.iteration),
+                "reconcile_apply_retry",
+            )
+    apply_config_lock_update(campaign, config)
+    try:
+        from .daemon.journal import append_event
+
+        append_event(
+            campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
+            "reconcile_applied",
+            phase=report.proposed_state.phase.value,
+            iteration=int(report.proposed_state.iteration),
+            n_allowed_config_changes=(
+                len(config_review.allowed_changes) if config_review is not None else 0
+            ),
+            n_removed_stale_paths=len(removed),
+        )
+    except Exception:
+        pass
+    print("Applied proposed state: " + str(target_canonical))
+    if backup_path is not None:
+        print("Previous state backup: " + str(backup_path))
+    if removed:
+        print("Removed stale uncommitted artefacts:")
+        for path in removed:
+            print("  - " + path)
+    print("")
+    print("Start the daemon with:")
+    print("    ichor-al-daemon start --campaign-dir " + str(campaign) + " --live")
     return 0
 
 
@@ -860,6 +1027,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Allow reconcile to propose INIT even when non-state campaign "
             "artifacts are present. Default is conservative HALTED/adoption-ready recovery."
+        ),
+    )
+    p_recon.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "After writing state.json.proposed, safely promote it to state.json, "
+            "clean stale uncommitted re-entry staging, and update the campaign "
+            "config lock. Refuses locked campaign.yaml changes."
         ),
     )
     p_recon.set_defaults(func=cmd_reconcile)
