@@ -115,6 +115,66 @@ def test_reconcile_apply_promotes_state_and_cleans_ferebus_staging(tmp_path, cap
     assert lock["canonical_config"]["ferebus"]["scaling"] is False
 
 
+def test_reconcile_apply_archives_data_staging_for_ferebus_reentry(tmp_path, capsys):
+    campaign = _campaign(tmp_path)
+    _commit_training_version(campaign, 0)
+    _write_halted_pre_ferebus_state(campaign)
+    changed = CampaignConfig()
+    changed.ferebus.scaling = False
+    _write_config(campaign, changed)
+    data_staging = campaign / ".DATA" / "STAGING"
+    stale_file = data_staging / "INITIAL_AIMALL" / "old.txt"
+    stale_file.parent.mkdir(parents=True)
+    stale_file.write_text("old scratch", encoding="utf-8")
+
+    rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            allow_fresh_init=False,
+            apply=True,
+        )
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    archived = sorted((campaign / ".DATA").glob("STAGING.before-reconcile-*"))
+    assert len(archived) == 1
+    assert (archived[0] / "INITIAL_AIMALL" / "old.txt").read_text(
+        encoding="utf-8"
+    ) == "old scratch"
+    assert data_staging.is_dir()
+    assert list(data_staging.iterdir()) == []
+    assert "Archived stale .DATA/STAGING" in out
+
+
+def test_reconcile_apply_keeps_data_staging_blocked_for_non_ferebus_reentry(tmp_path, capsys):
+    campaign = _campaign(tmp_path)
+    state = fresh_campaign_state(max_iterations=3)
+    state.phase = CampaignPhase.HALTED
+    state.training_set_version = 0
+    state.models_version = -1
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    cfg = CampaignConfig()
+    _write_config(campaign, cfg)
+    data_staging = campaign / ".DATA" / "STAGING"
+    stale_file = data_staging / "INITIAL_GAUSSIAN" / "old.txt"
+    stale_file.parent.mkdir(parents=True)
+    stale_file.write_text("old scratch", encoding="utf-8")
+
+    rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            allow_fresh_init=False,
+            apply=True,
+        )
+    )
+    err = capsys.readouterr().err
+
+    assert rc == 9
+    assert ".DATA/STAGING is non-empty" in err
+    assert stale_file.exists()
+
+
 def test_reconcile_apply_refuses_locked_config_change(tmp_path, capsys):
     campaign = _campaign(tmp_path)
     _commit_training_version(campaign, 0)

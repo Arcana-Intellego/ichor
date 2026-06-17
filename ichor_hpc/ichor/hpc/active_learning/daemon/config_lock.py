@@ -18,6 +18,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 from ..config import CampaignConfig
 from ..versioning.training_set import TrainingSetVersioning
+from .artifact_contracts import verify_committed_training_version
 from .state import CampaignPhase, CampaignState, atomic_write_json
 
 
@@ -393,6 +394,55 @@ def clean_reentry_staging(campaign_dir: Union[str, Path], phase: CampaignPhase) 
                 script.unlink()
                 removed.append(str(script))
     return removed
+
+
+def ferebus_reentry_can_archive_data_staging(
+    campaign_dir: Union[str, Path],
+    proposed_state: CampaignState,
+) -> Tuple[bool, str]:
+    if proposed_state.phase not in (CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS):
+        return False, "only FEREBUS re-entry may archive .DATA/STAGING"
+    if proposed_state.pending_jobs:
+        return False, "proposed state still has pending jobs"
+    try:
+        training_version = int(proposed_state.training_set_version)
+    except (TypeError, ValueError):
+        return False, "training_set_version is not an integer"
+    if training_version < 0:
+        return False, "training_set_version is negative"
+    try:
+        verify_committed_training_version(campaign_dir, training_version)
+    except Exception as exc:
+        return False, "committed training version is invalid: " + str(exc)[:180]
+    return True, "verified committed training exists for FEREBUS re-entry"
+
+
+def archive_data_staging_for_ferebus_reentry(
+    campaign_dir: Union[str, Path],
+    proposed_state: CampaignState,
+) -> List[str]:
+    ok, reason = ferebus_reentry_can_archive_data_staging(campaign_dir, proposed_state)
+    if not ok:
+        raise ValueError(reason)
+    campaign = Path(campaign_dir)
+    staging = campaign / ".DATA" / "STAGING"
+    if not staging.is_dir():
+        return []
+    children = [p for p in staging.iterdir() if p.name not in (".", "..")]
+    if not children:
+        return []
+    _ensure_inside_campaign(campaign, staging)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    target = staging.with_name(staging.name + ".before-reconcile-" + stamp)
+    suffix = 1
+    while target.exists():
+        target = staging.with_name(
+            staging.name + ".before-reconcile-" + stamp + "." + str(suffix)
+        )
+        suffix += 1
+    staging.rename(target)
+    staging.mkdir(parents=True, exist_ok=True)
+    return [str(target)]
 
 
 def apply_config_lock_update(

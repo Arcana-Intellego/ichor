@@ -40,8 +40,10 @@ from .daemon.daemon import (
 from .daemon.journal import iter_events, read_events
 from .daemon.config_lock import (
     apply_config_lock_update,
+    archive_data_staging_for_ferebus_reentry,
     assert_config_unchanged_for_start,
     clean_reentry_staging,
+    ferebus_reentry_can_archive_data_staging,
     format_config_review,
     review_config_changes,
 )
@@ -709,6 +711,17 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         "dangling model staging directories exist",
         ".DATA/SCRIPTS contains sbatch scripts",
     }
+    if ".DATA/STAGING is non-empty" in report.unsafe_reasons:
+        ok_to_archive_staging, staging_reason = ferebus_reentry_can_archive_data_staging(
+            campaign,
+            report.proposed_state,
+        )
+        if ok_to_archive_staging:
+            cleanable_reasons.add(".DATA/STAGING is non-empty")
+        else:
+            report.notes.append(
+                ".DATA/STAGING cannot be archived automatically: " + staging_reason
+            )
     uncleanable = [
         reason
         for reason in report.unsafe_reasons
@@ -734,6 +747,10 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             target_canonical.name + ".before-reconcile-" + stamp
         )
         shutil.copy2(target_canonical, backup_path)
+    archived = archive_data_staging_for_ferebus_reentry(
+        campaign,
+        report.proposed_state,
+    ) if ".DATA/STAGING is non-empty" in report.unsafe_reasons else []
     removed = clean_reentry_staging(campaign, report.proposed_state.phase)
     target.replace(target_canonical)
     write_state(target_canonical, report.proposed_state)
@@ -770,6 +787,8 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 len(config_review.allowed_changes) if config_review is not None else 0
             ),
             n_removed_stale_paths=len(removed),
+            n_archived_staging_paths=len(archived),
+            archived_staging_path=(archived[0] if archived else None),
         )
     except Exception:
         pass
@@ -779,6 +798,10 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     if removed:
         print("Removed stale uncommitted artefacts:")
         for path in removed:
+            print("  - " + path)
+    if archived:
+        print("Archived stale .DATA/STAGING:")
+        for path in archived:
             print("  - " + path)
     print("")
     print("Start the daemon with:")
