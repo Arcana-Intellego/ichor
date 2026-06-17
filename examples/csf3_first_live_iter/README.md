@@ -200,7 +200,10 @@ The smoke config leaves Slurm arrays unthrottled with
 `resources.array_concurrency_limit: null`, so Gaussian and AIMAll can use as
 much concurrency as Slurm policy and current cluster load allow. It also sets
 `resources.aimall_cpus_per_task: 8` because AIMAll is usually the slowest first
-smoke phase on CSF3. If you set a manual `%N` array throttle later, keep
+smoke phase on CSF3. The example AIMAll block uses `naat: auto`,
+`boaq: auto_gs2`, and `iasmesh: medium` to keep the first integration pass
+cheap while still emitting IQA terms with `encomp: 3`. If you set a manual
+`%N` array throttle later, keep
 `runtime.poll_sacct_missing_max_ticks` generous because throttled pending rows
 may not appear in `sacct` immediately.
 

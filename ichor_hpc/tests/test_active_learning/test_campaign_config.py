@@ -44,6 +44,9 @@ def test_default_campaign_config_is_valid():
     assert c.gaussian.memory_fraction_of_slurm == 0.85
     assert c.aimall.encomp == 3
     assert c.aimall.nogui is True
+    assert c.aimall.naat == "auto"
+    assert c.aimall.boaq == "auto"
+    assert c.aimall.iasmesh == "fine"
     assert c.quality_gates.ariadne_max_displacement_ang == 1.25
     assert c.quality_gates.ariadne_min_pair_distance_ang == 0.60
     assert c.max_acquisition_grad_per_ang is None
@@ -356,6 +359,35 @@ def test_unknown_nested_key_rejected_with_path():
         CampaignConfig.from_dict(payload)
 
 
+def test_aimall_grid_and_naat_values_roundtrip():
+    payload = CampaignConfig().to_dict()
+    payload["aimall"]["naat"] = 4
+    payload["aimall"]["boaq"] = "auto_gs2"
+    payload["aimall"]["iasmesh"] = "medium"
+    loaded = CampaignConfig.from_dict(payload)
+
+    assert loaded.aimall.naat == 4
+    assert loaded.aimall.boaq == "auto_gs2"
+    assert loaded.aimall.iasmesh == "medium"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("naat", "sometimes", "aimall.naat"),
+        ("naat", 99, "aimall.naat"),
+        ("boaq", "unknown_grid", "aimall.boaq"),
+        ("iasmesh", "tiny", "aimall.iasmesh"),
+    ],
+)
+def test_aimall_grid_and_naat_validation(field, value, message):
+    payload = CampaignConfig().to_dict()
+    payload["aimall"][field] = value
+
+    with pytest.raises(ConfigValidationError, match=message):
+        CampaignConfig.from_dict(payload)
+
+
 def test_unknown_ariadne_key_rejected_with_path():
     payload = CampaignConfig().to_dict()
     payload["ariadne"]["mystery"] = 99
@@ -401,6 +433,9 @@ def test_shipped_active_learning_examples_are_resource_safe(relative_path):
     assert cfg.resources.cpus_per_task >= 2
     if "first_live_iter" in relative_path:
         assert cfg.resources.aimall_cpus_per_task >= 8
+        assert cfg.aimall.naat == "auto"
+        assert cfg.aimall.boaq == "auto_gs2"
+        assert cfg.aimall.iasmesh == "medium"
     assert cfg.gaussian.nproc <= cfg.resources.cpus_per_task
     if "first_live_iter" in relative_path and cfg.resources.array_concurrency_limit is not None:
         assert cfg.runtime.poll_sacct_missing_max_ticks >= 30

@@ -242,7 +242,10 @@ remove their own scratch directory, while failed tasks keep it for diagnosis.
 For a cautious first smoke leaves `resources.array_concurrency_limit: null` so
 Gaussian/AIMAll arrays can run with as much concurrency as Slurm policy and
 cluster load allow. It also sets `resources.aimall_cpus_per_task: 8` to avoid
-making AIMAll the first-smoke bottleneck. For larger shared-cluster campaigns
+making AIMAll the first-smoke bottleneck. The example AIMAll block uses
+`naat: auto`, `boaq: auto_gs2`, and `iasmesh: medium` to keep the first
+integration pass cheap while still emitting IQA terms with `encomp: 3`.
+For larger shared-cluster campaigns
 you can set `resources.array_concurrency_limit` to throttle arrays with Slurm's
 `--array=...%N` syntax.
 

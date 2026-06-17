@@ -39,6 +39,8 @@ from ichor.cli.useful_functions import user_input_free_flow
 from ichor.hpc.active_learning.config import (
     CampaignConfig,
     ConfigValidationError,
+    VALID_AIMALL_BOAQ_VALUES,
+    VALID_AIMALL_IASMESH_VALUES,
     VALID_CALIBRATED_ENERGY_UTILITIES,
     VALID_BATCH_POLICIES,
     VALID_DESCRIPTORS,
@@ -129,6 +131,13 @@ def _spec(path: str, input_kind: str, choices=None, transform=None, prompt=None)
 
 def _read_only_spec(path: str):
     return _FieldSpec(path=path, read_only=True)
+
+
+def _auto_or_int(value):
+    text = str(value).strip()
+    if text.lower() == "auto":
+        return "auto"
+    return int(text)
 
 
 def _sync_options_from_config():
@@ -800,6 +809,9 @@ _BLOCK_MENUS_BY_LABEL = {
         [
             _spec("aimall.encomp", "int"),
             _spec("aimall.nogui", "bool"),
+            _spec("aimall.naat", "str", transform=_auto_or_int, prompt="aimall.naat (auto or positive integer): "),
+            _spec("aimall.boaq", "choice", choices=sorted(VALID_AIMALL_BOAQ_VALUES)),
+            _spec("aimall.iasmesh", "choice", choices=sorted(VALID_AIMALL_IASMESH_VALUES)),
         ],
     ),
     "Edit batch_sizing": _make_block_menu(

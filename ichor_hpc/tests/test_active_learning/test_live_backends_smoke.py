@@ -242,6 +242,30 @@ def test_build_sbatch_script_renders_gaussian_block():
     assert "export GAUSS_MDEF=" in body
 
 
+def test_build_sbatch_script_renders_aimall_directives():
+    cfg = CampaignConfig()
+    cfg.aimall.boaq = "auto_gs2"
+    cfg.aimall.iasmesh = "medium"
+    cfg.resources.aimall_cpus_per_task = 8
+    body = build_sbatch_script(
+        phase_name="INITIAL_AIMALL",
+        iteration=0,
+        campaign_dir=Path("/scratch/campaign"),
+        config=cfg,
+        array_size=1,
+    )
+
+    assert "#SBATCH --cpus-per-task=8" in body
+    assert "AIMALL_TASK.json" in body
+    assert '-nproc="${SLURM_CPUS_PER_TASK:-1}"' in body
+    assert '-naat="$AIMALL_NAAT"' in body
+    assert "-encomp=3" in body
+    assert "-boaq=auto_gs2" in body
+    assert "-iasmesh=medium" in body
+    command_line = next(line for line in body.splitlines() if "aimqb.ish" in line)
+    assert command_line.endswith(" input.wfn")
+
+
 def test_link0_gaussian_memory_validates_after_auto_resolution(monkeypatch):
     _install_fake_global_variables(
         monkeypatch,

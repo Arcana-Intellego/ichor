@@ -24,6 +24,7 @@ def format_sampling_protocol_summary(config: CampaignConfig) -> str:
     acq = config.acquisition
     resources = config.resources
     gaussian = config.gaussian
+    aimall = config.aimall
     spectral = acq.spectral
     energy = acq.calibrated_energy
     fullspace = acq.fullspace_confinement
@@ -123,6 +124,11 @@ def format_sampling_protocol_summary(config: CampaignConfig) -> str:
     lines.append(
         _line("resources.array_concurrency_limit", resources.array_concurrency_limit)
     )
+    lines.append(_line("aimall.nproc", resources.aimall_cpus_per_task))
+    lines.append(_line("aimall.naat", aimall.naat))
+    lines.append(_line("aimall.encomp", aimall.encomp))
+    lines.append(_line("aimall.boaq", aimall.boaq))
+    lines.append(_line("aimall.iasmesh", aimall.iasmesh))
     lines.append(_line("gaussian.nproc", gaussian.nproc))
     lines.append(_line("gaussian.memory_mode", gaussian.memory_mode))
     lines.append(

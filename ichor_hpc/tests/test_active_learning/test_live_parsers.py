@@ -134,6 +134,36 @@ def test_initial_aimall_happy_path(tmp_path):
     assert len(manifest["accepted_pointdirs"]) == 4
 
 
+def test_stage_aimall_inputs_writes_resolved_naat_metadata(tmp_path):
+    campaign = tmp_path / "campaign"
+    staging = campaign / ".DATA" / "STAGING" / "initial"
+    shutil.copytree(str(FIXTURES / "initial_quantum"), str(staging))
+    accepted = sorted(staging.glob("POINT_*.pointdir"))[:1]
+    stg.write_quantum_acceptance_manifest(
+        staging,
+        phase_name="INITIAL_GAUSSIAN",
+        iteration=0,
+        accepted=accepted,
+        rejected=[],
+    )
+    cfg = CampaignConfig()
+    cfg.resources.aimall_cpus_per_task = 8
+    cfg.aimall.naat = "auto"
+
+    staged_dir, n_points = stg.stage_aimall_inputs(
+        campaign, cfg, "INITIAL_AIMALL", 0,
+    )
+
+    assert staged_dir == staging
+    assert n_points == 1
+    task = json.loads(
+        (accepted[0] / stg.AIMALL_TASK_METADATA).read_text(encoding="utf-8")
+    )
+    assert task["atom_count"] == 3
+    assert task["nproc"] == 8
+    assert task["naat"] == 3
+
+
 def test_aimall_parser_only_consumes_gaussian_accepted_pointdirs(tmp_path):
     ex = _make_executor(tmp_path)
     staging = _bind_staging(ex, FIXTURES / "initial_quantum")

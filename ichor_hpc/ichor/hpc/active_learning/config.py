@@ -59,6 +59,8 @@ __all__ = [
     "VALID_GAUSSIAN_MEMORY_MODES",
     "VALID_ERROR_CALIBRATION_MODEL_VERSION_POLICIES",
     "VALID_NEGATIVE_CURVATURE_POLICIES",
+    "VALID_AIMALL_BOAQ_VALUES",
+    "VALID_AIMALL_IASMESH_VALUES",
 ]
 
 
@@ -88,6 +90,15 @@ VALID_CALIBRATED_ENERGY_UTILITIES = frozenset({"log", "banded"})
 VALID_FULLSPACE_RESIDUAL_SCALES = frozenset({"local_neighbour_median", "fixed"})
 VALID_GAUSSIAN_MEMORY_MODES = frozenset({"slurm_env", "link0"})
 VALID_NEGATIVE_CURVATURE_POLICIES = frozenset({"ignore", "penalise"})
+VALID_AIMALL_BOAQ_VALUES = frozenset({
+    "auto", "auto_gs2", "auto_gs4",
+    "gs1", "gs2", "gs3", "gs4", "gs5", "gs6", "gs7", "gs8", "gs9", "gs10",
+    "gs15", "gs20", "gs25", "gs30", "gs35", "gs40", "gs45", "gs50", "gs55", "gs60",
+    "leb23", "leb25", "leb27", "leb29", "leb31", "leb32",
+})
+VALID_AIMALL_IASMESH_VALUES = frozenset({
+    "sparse", "medium", "fine", "veryfine", "superfine",
+})
 
 _SYSTEM_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 _SCHEDULER_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$")
@@ -563,6 +574,9 @@ class GaussianConfigBlock:
 class AimallConfigBlock:
     encomp: int = 3
     nogui: bool = True
+    naat: Union[int, str] = "auto"
+    boaq: str = "auto"
+    iasmesh: str = "fine"
 
 
 @dataclass
@@ -748,6 +762,31 @@ class CampaignConfig:
         _validate_positive_int("aimall.encomp", self.aimall.encomp)
         if not isinstance(self.aimall.nogui, bool):
             raise ConfigValidationError("aimall.nogui must be a boolean")
+        if isinstance(self.aimall.naat, str):
+            if self.aimall.naat.strip().lower() != "auto":
+                raise ConfigValidationError("aimall.naat must be 'auto' or a positive integer")
+            self.aimall.naat = "auto"
+        else:
+            _validate_positive_int("aimall.naat", self.aimall.naat)
+            if int(self.aimall.naat) > int(self.resources.aimall_cpus_per_task):
+                raise ConfigValidationError(
+                    "aimall.naat must be <= resources.aimall_cpus_per_task"
+                )
+        if not isinstance(self.aimall.boaq, str):
+            raise ConfigValidationError("aimall.boaq must be a string")
+        self.aimall.boaq = self.aimall.boaq.strip().lower()
+        if self.aimall.boaq not in VALID_AIMALL_BOAQ_VALUES:
+            raise ConfigValidationError(
+                "aimall.boaq must be one of " + repr(sorted(VALID_AIMALL_BOAQ_VALUES))
+            )
+        if not isinstance(self.aimall.iasmesh, str):
+            raise ConfigValidationError("aimall.iasmesh must be a string")
+        self.aimall.iasmesh = self.aimall.iasmesh.strip().lower()
+        if self.aimall.iasmesh not in VALID_AIMALL_IASMESH_VALUES:
+            raise ConfigValidationError(
+                "aimall.iasmesh must be one of "
+                + repr(sorted(VALID_AIMALL_IASMESH_VALUES))
+            )
         if self.max_iterations <= 0:
             raise ConfigValidationError("max_iterations must be > 0")
         if self.poll_interval_seconds < 1:

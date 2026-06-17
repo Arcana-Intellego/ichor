@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
 from ichor.core.atoms import Atoms
+from ichor.core.files import PointDirectory
 from ichor.core.files.xyz import Trajectory
 
 from .state import atomic_write_json
@@ -31,6 +32,8 @@ from .state import atomic_write_json
 
 QUANTUM_ACCEPTANCE_MANIFEST = "accepted_pointdirs.json"
 QUANTUM_ACCEPTANCE_SCHEMA_VERSION = 1
+AIMALL_TASK_METADATA = "AIMALL_TASK.json"
+AIMALL_TASK_METADATA_SCHEMA_VERSION = 1
 FEREBUS_TASK_MANIFEST = "FEREBUS_TASKS.json"
 FEREBUS_TASK_SCHEMA_VERSION = 1
 FEREBUS_JOB_DETAILS = "job-details"
@@ -371,11 +374,38 @@ def stage_aimall_inputs(campaign_dir, config, phase_name, iteration) -> Tuple[Pa
         expected_phase=expected_phase,
         expected_iteration=int(iteration),
     )
+    aimall_cpus = int(config.resources.aimall_cpus_per_task)
+    raw_naat = getattr(config.aimall, "naat", "auto")
     for pointdir in pointdirs:
         if not (pointdir / "input.wfn").is_file():
             raise FileNotFoundError(
                 "Gaussian-accepted pointdir is missing input.wfn: " + str(pointdir)
             )
+        try:
+            atom_count = len(PointDirectory(pointdir).atoms)
+        except Exception as exc:
+            raise ValueError(
+                "failed to count atoms for AIMAll pointdir: " + str(pointdir)
+            ) from exc
+        if atom_count <= 0:
+            raise ValueError("AIMAll pointdir has no atoms: " + str(pointdir))
+        if isinstance(raw_naat, str) and raw_naat.strip().lower() == "auto":
+            resolved_naat = min(int(atom_count), int(aimall_cpus))
+        else:
+            resolved_naat = int(raw_naat)
+            if resolved_naat < 1 or resolved_naat > int(aimall_cpus):
+                raise ValueError(
+                    "aimall.naat must be in [1, resources.aimall_cpus_per_task]"
+                )
+        atomic_write_json(
+            pointdir / AIMALL_TASK_METADATA,
+            {
+                "schema_version": AIMALL_TASK_METADATA_SCHEMA_VERSION,
+                "atom_count": int(atom_count),
+                "nproc": int(aimall_cpus),
+                "naat": int(resolved_naat),
+            },
+        )
     write_points_file(staging, pointdirs)
     return staging, len(pointdirs)
 

@@ -31,7 +31,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from ..config import CampaignConfig
+from ..config import (
+    CampaignConfig,
+    VALID_AIMALL_BOAQ_VALUES,
+    VALID_AIMALL_IASMESH_VALUES,
+)
 from ..versioning.provenance import (
     PROVENANCE_FILENAME,
     append_to_index,
@@ -2794,9 +2798,20 @@ def _aimall_invocation_block(iteration, camp, config, points_file) -> List[str]:
     args: List[str] = []
     if bool(getattr(aimall_cfg, "nogui", True)):
         args.append("-nogui")
+    args.append('-nproc="${SLURM_CPUS_PER_TASK:-1}"')
+    args.append('-naat="$AIMALL_NAAT"')
     encomp = int(getattr(aimall_cfg, "encomp", 3))
     args.append("-encomp=" + str(encomp))
+    boaq = str(getattr(aimall_cfg, "boaq", "auto")).strip().lower()
+    if boaq not in VALID_AIMALL_BOAQ_VALUES:
+        raise BackendSubmissionError("aimall.boaq is invalid: " + repr(boaq))
+    args.append("-boaq=" + boaq)
+    iasmesh = str(getattr(aimall_cfg, "iasmesh", "fine")).strip().lower()
+    if iasmesh not in VALID_AIMALL_IASMESH_VALUES:
+        raise BackendSubmissionError("aimall.iasmesh is invalid: " + repr(iasmesh))
+    args.append("-iasmesh=" + iasmesh)
     points_file_q = _shell_quote(points_file)
+    python = _python_executable_for_script()
     return [
         "# per-point AIMAll array over the .wfn files gaussian produced.",
         # check the file FIRST -- under set -e a failing sed (missing POINTS.txt) aborts the
@@ -2807,6 +2822,15 @@ def _aimall_invocation_block(iteration, camp, config, points_file) -> List[str]:
         'POINT_DIR=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" ' + points_file_q + ")",
         'if [ -z "$POINT_DIR" ]; then echo "no pointdir for index $SLURM_ARRAY_TASK_ID" >&2; exit 1; fi',
         'cd "$POINT_DIR"',
+        'if [ ! -f AIMALL_TASK.json ]; then echo "AIMALL_TASK.json missing in $POINT_DIR" >&2; exit 1; fi',
+        "AIMALL_NAAT=$("
+        + python
+        + " -c "
+        + _shell_quote(
+            "import json; print(int(json.load(open('AIMALL_TASK.json', encoding='utf-8'))['naat']))"
+        )
+        + ")",
+        'if [ -z "$AIMALL_NAAT" ]; then echo "AIMALL_NAAT is empty in $POINT_DIR" >&2; exit 1; fi',
         " ".join([_shell_quote(aimall_path)] + args + ["input.wfn"]),
     ]
 

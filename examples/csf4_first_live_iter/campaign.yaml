@@ -36,6 +36,13 @@ gaussian:
   nproc: 2
   memory_mode: slurm_env
 
+aimall:
+  nogui: true
+  naat: auto
+  encomp: 3
+  boaq: auto_gs2
+  iasmesh: medium
+
 ariadne:
   optimiser: trust_region_qn
   hessian_model: ALMLOF
