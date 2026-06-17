@@ -76,10 +76,12 @@ class _StubModel:
 @dataclass
 class _StubRunner:
     calls: List[List[str]] = field(default_factory=list)
+    kwargs: List[Dict[str, Any]] = field(default_factory=list)
     result: _StubCompletedProcess = field(default_factory=lambda: _StubCompletedProcess(stdout="12345678\n"))
 
     def __call__(self, cmd, **kwargs):
         self.calls.append(list(cmd))
+        self.kwargs.append(dict(kwargs))
         return self.result
 
 
@@ -170,8 +172,13 @@ def test_submit_ferebus_happy_path(tmp_path):
     assert "set -euo pipefail" not in script
     assert "export LC_ALL=C" in script
     assert "export LC_NUMERIC=C" in script
-    # sbatch was driven with --parsable.
-    assert runner.calls == [["sbatch", "--parsable", str(tmp_path / "runFerebus.sh")]]
+    # sbatch is driven from the staging directory because the generated script reads
+    # sibling commands/list.txt files with relative paths.
+    assert runner.calls == [["sbatch", "--parsable", "runFerebus.sh"]]
+    assert runner.kwargs[0]["cwd"] == str(tmp_path)
+    assert runner.kwargs[0]["check"] is False
+    assert runner.kwargs[0]["capture_output"] is True
+    assert runner.kwargs[0]["text"] is True
 
 
 def test_submit_ferebus_keeps_sbatch_directives_before_shell_commands(tmp_path):

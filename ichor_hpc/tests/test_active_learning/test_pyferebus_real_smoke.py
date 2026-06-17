@@ -91,7 +91,8 @@ def test_real_pyferebus_generation_smoke_with_fake_sbatch(tmp_path):
     )
 
     assert submission.job_id == "987654"
-    assert fake_sbatch.calls[0][0] == ["sbatch", "--parsable", str(staging / "runFerebus.sh")]
+    assert fake_sbatch.calls[0][0] == ["sbatch", "--parsable", "runFerebus.sh"]
+    assert fake_sbatch.calls[0][1]["cwd"] == str(staging)
     assert (staging / "runFerebus.sh").is_file()
     assert (staging / "commands").is_file()
     assert (staging / "list.txt").is_file()

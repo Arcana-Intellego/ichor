@@ -427,10 +427,11 @@ def submit_ferebus(
         _patch_generated_executable(script, path_to_executable)
 
     completed = submit_runner(
-        ["sbatch", "--parsable", str(script)],
+        ["sbatch", "--parsable", script.name],
         check=False,
         capture_output=True,
         text=True,
+        cwd=str(working_dir),
     )
     stdout = getattr(completed, "stdout", "") or ""
     stderr = getattr(completed, "stderr", "") or ""
