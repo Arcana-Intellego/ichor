@@ -210,21 +210,30 @@ def _validate_generated_pyferebus_artifacts(working_dir: Path) -> Path:
 
 def _harden_generated_script(script: Path) -> None:
     text = script.read_text(encoding="utf-8")
-    if "set -euo pipefail" in text:
-        text = text.replace("set -euo pipefail", "set -eo pipefail")
-        script.write_text(text, encoding="utf-8", newline="\n")
-    lines = text.splitlines()
+    hardening_lines = {
+        "set -eo pipefail",
+        "set -euo pipefail",
+        "export LC_ALL=C",
+        "export LC_NUMERIC=C",
+    }
+    lines = [
+        line
+        for line in text.splitlines()
+        if line.strip() not in hardening_lines
+    ]
     insert_at = 1 if lines and lines[0].startswith("#!") else 0
-    additions = []
-    if "set -eo pipefail" not in text and "set -euo pipefail" not in text:
-        additions.append("set -eo pipefail")
-    if "export LC_ALL=C" not in text:
-        additions.append("export LC_ALL=C")
-    if "export LC_NUMERIC=C" not in text:
-        additions.append("export LC_NUMERIC=C")
-    if additions:
-        lines[insert_at:insert_at] = additions
-        script.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    while insert_at < len(lines):
+        stripped = lines[insert_at].lstrip()
+        if stripped.startswith("#SBATCH"):
+            insert_at += 1
+            continue
+        break
+    lines[insert_at:insert_at] = [
+        "set -eo pipefail",
+        "export LC_ALL=C",
+        "export LC_NUMERIC=C",
+    ]
+    script.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
 
 def _validate_configured_executable(path_to_executable: Union[str, Path]) -> str:

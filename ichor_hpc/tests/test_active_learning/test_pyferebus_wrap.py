@@ -174,6 +174,55 @@ def test_submit_ferebus_happy_path(tmp_path):
     assert runner.calls == [["sbatch", "--parsable", str(tmp_path / "runFerebus.sh")]]
 
 
+def test_submit_ferebus_keeps_sbatch_directives_before_shell_commands(tmp_path):
+    captured: List[_StubModel] = []
+    model_class = _make_model_class(
+        captured,
+        script_text=(
+            "#!/bin/bash --login\n"
+            "set -eo pipefail\n"
+            "export LC_ALL=C\n"
+            "export LC_NUMERIC=C\n"
+            "#SBATCH --partition multicore\n"
+            "#SBATCH -n 2\n"
+            "#SBATCH --job-name=ferebus-light\n"
+            "module load compilers/gcc/13.3.0\n"
+            "ferebus ${line}\n"
+        ),
+    )
+    jd = tmp_path / "job.json"
+    jd.write_text("{}")
+
+    submit_ferebus(
+        jd,
+        tmp_path,
+        platform="CSF3",
+        model_class=model_class,
+        submit_runner=_StubRunner(),
+    )
+
+    lines = (tmp_path / "runFerebus.sh").read_text(encoding="utf-8").splitlines()
+    assert lines[:7] == [
+        "#!/bin/bash --login",
+        "#SBATCH --partition multicore",
+        "#SBATCH -n 2",
+        "#SBATCH --job-name=ferebus-light",
+        "set -eo pipefail",
+        "export LC_ALL=C",
+        "export LC_NUMERIC=C",
+    ]
+    last_sbatch = max(i for i, line in enumerate(lines) if line.startswith("#SBATCH"))
+    first_shell_command = min(
+        i
+        for i, line in enumerate(lines)
+        if line
+        and not line.startswith("#!")
+        and not line.startswith("#SBATCH")
+        and not line.startswith("#")
+    )
+    assert first_shell_command > last_sbatch
+
+
 def test_submit_ferebus_patches_configured_executable(tmp_path):
     captured: List[_StubModel] = []
     model_class = _make_model_class(captured)
