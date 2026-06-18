@@ -3,7 +3,7 @@
 Console entry point 'ichor-al-daemon' registered in
 'ichor_cli/setup.cfg'. Subcommands available:
 
-    start      Start the daemon in the foreground (user backgrounds with nohup).
+    start      Start the daemon in the foreground, or use --background to detach.
     stop       Set shutdown_requested=true in state.json; running daemon picks
                it up on next tick.
     status     Print the current state snapshot.
@@ -22,6 +22,7 @@ exercise the state machine without invoking real backends.
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import subprocess
 import sys
@@ -73,6 +74,12 @@ from .daemon.state import (
 __all__ = ["build_parser", "main"]
 
 
+BACKGROUND_CHILD_ENV = "ICHOR_DAEMON_BACKGROUND_CHILD"
+BACKGROUND_LOG_FILENAME = "daemon.out"
+BACKGROUND_PID_FILENAME = "daemon.pid"
+BACKGROUND_PID_SCHEMA_VERSION = 1
+
+
 def _campaign_paths(campaign_dir: Path):
     data = campaign_dir / DEFAULT_DATA_SUBDIR
     return {
@@ -81,6 +88,8 @@ def _campaign_paths(campaign_dir: Path):
         "lock": data / DAEMON_LOCK_FILENAME,
         "lease": data / DAEMON_LEASE_DIRNAME,
         "journal": data / "journal.ndjson",
+        "background_log": data / BACKGROUND_LOG_FILENAME,
+        "background_pid": data / BACKGROUND_PID_FILENAME,
     }
 
 
@@ -129,6 +138,237 @@ def _probe_daemon_lease(lease_path: Path) -> dict:
     except Exception as exc:
         status["lease_probe_error"] = type(exc).__name__ + ": " + str(exc)
     return status
+
+
+def _pid_is_alive(pid: Any) -> bool:
+    try:
+        pid_int = int(pid)
+    except Exception:
+        return False
+    if pid_int <= 0:
+        return False
+    try:
+        os.kill(pid_int, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _read_background_pid_payload(pid_path: Path) -> Dict[str, Any]:
+    if not pid_path.is_file():
+        return {}
+    text = pid_path.read_text(encoding="utf-8").strip()
+    if not text:
+        return {}
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            return {"pid": int(text)}
+        except Exception:
+            return {"pid_parse_error": "not_json_or_int"}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _probe_background_daemon(pid_path: Path, log_path: Path) -> Dict[str, Any]:
+    payload = _read_background_pid_payload(pid_path)
+    pid = payload.get("pid")
+    alive = _pid_is_alive(pid)
+    out = {
+        "background_pid_path": str(pid_path),
+        "background_log_path": str(payload.get("log_path") or log_path),
+        "background_pid": pid,
+        "background_pid_alive": alive,
+    }
+    if payload:
+        out["background_pid_payload"] = payload
+    return out
+
+
+def _atomic_write_background_pid(pid_path: Path, payload: Dict[str, Any]) -> None:
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = pid_path.with_name(pid_path.name + ".tmp")
+    tmp_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    tmp_path.replace(pid_path)
+
+
+def _default_background_path(raw: Optional[str], default_path: Path) -> Path:
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return default_path.resolve()
+
+
+def _background_child_argv(args: argparse.Namespace, campaign: Path) -> List[str]:
+    command = str(getattr(args, "command", "start"))
+    argv = [
+        sys.executable,
+        "-m",
+        "ichor.hpc.active_learning.cli",
+        command,
+        "--campaign-dir",
+        str(campaign),
+    ]
+    config = getattr(args, "config", None)
+    if config:
+        argv.extend(["--config", str(Path(config).expanduser().resolve())])
+    if bool(getattr(args, "mock_ariadne", False)):
+        argv.append("--mock-ariadne")
+    if bool(getattr(args, "dry_run", False)):
+        argv.append("--dry-run")
+    if bool(getattr(args, "live", False)):
+        argv.append("--live")
+    if getattr(args, "poll_interval", None) is not None:
+        argv.extend(["--poll-interval", str(int(args.poll_interval))])
+    if getattr(args, "max_ticks", None) is not None:
+        argv.extend(["--max-ticks", str(int(args.max_ticks))])
+    if getattr(args, "preset", None):
+        argv.extend(["--preset", str(args.preset)])
+    return argv
+
+
+def _tail_text(path: Path, *, max_lines: int = 40) -> str:
+    if not path.is_file():
+        return ""
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception as exc:
+        return "<could not read log: " + type(exc).__name__ + ": " + str(exc) + ">"
+    return "\n".join(lines[-max_lines:])
+
+
+def _selected_mode_count(args: argparse.Namespace) -> int:
+    return sum([
+        bool(getattr(args, "live", False)),
+        bool(getattr(args, "dry_run", False)),
+        bool(getattr(args, "mock_ariadne", False)),
+    ])
+
+
+def _launch_background_daemon(args: argparse.Namespace, campaign: Path) -> int:
+    if os.environ.get(BACKGROUND_CHILD_ENV) == "1":
+        print("--background is not allowed inside a background child process", file=sys.stderr)
+        return 2
+    if _selected_mode_count(args) > 1:
+        print(
+            "--live, --dry-run, and --mock-ariadne are mutually exclusive; pick one.",
+            file=sys.stderr,
+        )
+        return 2
+    if _selected_mode_count(args) == 0:
+        print("no execution mode selected. Pick --live, --dry-run, or --mock-ariadne.", file=sys.stderr)
+        return 3
+
+    paths = _campaign_paths(campaign)
+    paths["data"].mkdir(parents=True, exist_ok=True)
+    lock_status = _probe_daemon_lock(paths["lock"])
+    if lock_status.get("lock_held") is True:
+        print("refusing background launch: daemon lock is already held", file=sys.stderr)
+        return 8
+    if lock_status.get("lock_held") is None:
+        print(
+            "refusing background launch: daemon lock state is unknown: "
+            + str(lock_status.get("lock_probe_error", "")),
+            file=sys.stderr,
+        )
+        return 8
+
+    log_path = _default_background_path(
+        getattr(args, "background_log", None),
+        paths["background_log"],
+    )
+    pid_path = _default_background_path(
+        getattr(args, "background_pid", None),
+        paths["background_pid"],
+    )
+    existing = _probe_background_daemon(pid_path, log_path)
+    if existing.get("background_pid_alive"):
+        print(
+            "refusing background launch: daemon pid "
+            + str(existing.get("background_pid"))
+            + " from "
+            + str(pid_path)
+            + " is still alive",
+            file=sys.stderr,
+        )
+        return 8
+    if pid_path.exists() and existing.get("background_pid") is not None:
+        print("stale daemon pid file found; replacing " + str(pid_path))
+
+    argv = _background_child_argv(args, campaign)
+    env = os.environ.copy()
+    env[BACKGROUND_CHILD_ENV] = "1"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    header = (
+        "\n===== ichor-al-daemon background launch "
+        + timestamp
+        + " command="
+        + " ".join(argv)
+        + " =====\n"
+    )
+    try:
+        with open(os.devnull, "rb") as stdin_fh, open(log_path, "a", encoding="utf-8") as log_fh:
+            log_fh.write(header)
+            log_fh.flush()
+            child = subprocess.Popen(
+                argv,
+                stdin=stdin_fh,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=True,
+            )
+    except Exception as exc:
+        print(
+            "could not launch background daemon: "
+            + type(exc).__name__
+            + ": "
+            + str(exc),
+            file=sys.stderr,
+        )
+        return 9
+
+    time.sleep(1.5)
+    rc = child.poll()
+    if rc is not None:
+        print(
+            "background daemon exited during startup with code "
+            + str(rc)
+            + "; log: "
+            + str(log_path),
+            file=sys.stderr,
+        )
+        tail = _tail_text(log_path)
+        if tail:
+            print(tail, file=sys.stderr)
+        return int(rc) if int(rc) != 0 else 0
+
+    payload = {
+        "schema_version": BACKGROUND_PID_SCHEMA_VERSION,
+        "pid": int(child.pid),
+        "command": argv,
+        "campaign_dir": str(campaign),
+        "log_path": str(log_path),
+        "started_at_utc": timestamp,
+        "host": os.uname().nodename if hasattr(os, "uname") else "",
+        "python_executable": sys.executable,
+    }
+    _atomic_write_background_pid(pid_path, payload)
+    print("daemon started in background")
+    print("  pid: " + str(child.pid))
+    print("  log: " + str(log_path))
+    print("  pid_file: " + str(pid_path))
+    print("  status: ichor-al-daemon status --campaign-dir " + str(campaign))
+    print("  journal: ichor-al-daemon journal --campaign-dir " + str(campaign) + " --json | tail -n 40")
+    return 0
 
 
 def _format_value(value: Any) -> str:
@@ -247,6 +487,8 @@ def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path
             [
                 ("lock", _lock_summary(payload.get("lock_held"))),
                 ("lease", lease),
+                ("background_pid", payload.get("background_pid")),
+                ("background_alive", payload.get("background_pid_alive")),
                 ("shutdown_requested", payload.get("shutdown_requested")),
             ],
         )
@@ -279,6 +521,8 @@ def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path
                     ("state", payload.get("state_path")),
                     ("lock", payload.get("lock_path")),
                     ("lease", payload.get("lease_path")),
+                    ("background_log", payload.get("background_log_path")),
+                    ("background_pid_file", payload.get("background_pid_path")),
                 ],
             )
         )
@@ -376,6 +620,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     if not config_path.exists() and not getattr(args, "preset", None):
         print("campaign config not found: " + str(config_path), file=sys.stderr)
         return 2
+    if bool(getattr(args, "background", False)):
+        return _launch_background_daemon(args, campaign)
     #Fix: --preset overlays the operator-supplied campaign.yaml on top of the
     #named preset. The preset is the base; the YAML on disk is the overlay.
     import yaml as _yaml
@@ -817,6 +1063,14 @@ def cmd_stop(args: argparse.Namespace) -> int:
         except Exception:
             pass
     print("shutdown_requested=true set in " + str(paths["state"]))
+    background = _probe_background_daemon(
+        paths["background_pid"],
+        paths["background_log"],
+    )
+    if background.get("background_pid") is not None:
+        suffix = " alive" if background.get("background_pid_alive") else " not running"
+        print("background pid: " + str(background.get("background_pid")) + " (" + suffix.strip() + ")")
+        print("background log: " + str(background.get("background_log_path")))
     if cancel_summary is not None:
         _print_cancel_jobs_summary(cancel_summary)
         if cancel_summary.get("failed"):
@@ -840,6 +1094,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     payload["lock_path"] = str(paths["lock"])
     payload.update(_probe_daemon_lock(paths["lock"]))
     payload.update(_probe_daemon_lease(paths["lease"]))
+    payload.update(_probe_background_daemon(paths["background_pid"], paths["background_log"]))
     try:
         from .daemon.artifact_contracts import artifact_manifest_status
         payload["artifact_manifest_status"] = artifact_manifest_status(campaign, state)
@@ -1433,6 +1688,33 @@ def build_parser() -> argparse.ArgumentParser:
             help="Root directory of the campaign.",
         )
 
+    def add_background_options(p):
+        p.add_argument(
+            "--background",
+            action="store_true",
+            help=(
+                "Launch the daemon as a detached background child. The foreground "
+                "command validates the campaign, writes a PID file, and appends logs "
+                "under .DATA/ACTIVE_LEARNING by default."
+            ),
+        )
+        p.add_argument(
+            "--background-log",
+            default=None,
+            help=(
+                "Background daemon log path. Defaults to "
+                "<campaign>/.DATA/ACTIVE_LEARNING/daemon.out."
+            ),
+        )
+        p.add_argument(
+            "--background-pid",
+            default=None,
+            help=(
+                "Background daemon PID metadata path. Defaults to "
+                "<campaign>/.DATA/ACTIVE_LEARNING/daemon.pid."
+            ),
+        )
+
     p_start = sub.add_parser("start", help="Start the daemon (foreground).")
     add_campaign(p_start)
     p_start.add_argument(
@@ -1467,6 +1749,7 @@ def build_parser() -> argparse.ArgumentParser:
             "explicitly-present key."
         ),
     )
+    add_background_options(p_start)
     p_start.set_defaults(func=cmd_start)
 
     p_stop = sub.add_parser("stop", help="Request a graceful shutdown.")
@@ -1507,6 +1790,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_resume.add_argument("--poll-interval", type=int, default=None)
     p_resume.add_argument("--max-ticks", type=int, default=None)
     p_resume.add_argument("--preset", default=None)
+    add_background_options(p_resume)
     p_resume.set_defaults(func=cmd_resume)
 
     p_recon = sub.add_parser(

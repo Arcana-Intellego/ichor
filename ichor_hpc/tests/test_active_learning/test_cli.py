@@ -451,6 +451,159 @@ def test_cli_resume_explicitly_clears_shutdown_flag(tmp_path):
     assert s.shutdown_requested is False
 
 
+def test_cli_start_background_spawns_child_without_shell(tmp_path, monkeypatch, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    calls = []
+
+    class FakePopen:
+        pid = 4321
+
+        def __init__(self, argv, **kwargs):
+            calls.append((argv, kwargs))
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(cli_mod.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(cli_mod.time, "sleep", lambda seconds: None)
+
+    rc = main([
+        "start",
+        "--campaign-dir",
+        str(campaign),
+        "--mock-ariadne",
+        "--max-ticks",
+        "7",
+        "--background",
+    ])
+
+    assert rc == 0
+    assert len(calls) == 1
+    argv, kwargs = calls[0]
+    assert argv[:4] == [
+        sys.executable,
+        "-m",
+        "ichor.hpc.active_learning.cli",
+        "start",
+    ]
+    assert "--background" not in argv
+    assert "--mock-ariadne" in argv
+    assert "--max-ticks" in argv
+    assert kwargs["stderr"] is subprocess.STDOUT
+    assert kwargs["start_new_session"] is True
+    assert "shell" not in kwargs
+    assert kwargs["env"][cli_mod.BACKGROUND_CHILD_ENV] == "1"
+    pid_path = campaign / DEFAULT_DATA_SUBDIR / cli_mod.BACKGROUND_PID_FILENAME
+    payload = json.loads(pid_path.read_text(encoding="utf-8"))
+    assert payload["pid"] == 4321
+    assert payload["schema_version"] == cli_mod.BACKGROUND_PID_SCHEMA_VERSION
+    assert payload["campaign_dir"] == str(campaign.resolve())
+    assert payload["log_path"].endswith(cli_mod.BACKGROUND_LOG_FILENAME)
+    assert "daemon started in background" in capsys.readouterr().out
+
+
+def test_cli_resume_background_clears_shutdown_and_spawns_resume(tmp_path, monkeypatch):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state()
+    state.shutdown_requested = True
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    calls = []
+
+    class FakePopen:
+        pid = 4322
+
+        def __init__(self, argv, **kwargs):
+            calls.append((argv, kwargs))
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(cli_mod.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(cli_mod.time, "sleep", lambda seconds: None)
+
+    rc = main([
+        "resume",
+        "--campaign-dir",
+        str(campaign),
+        "--mock-ariadne",
+        "--background",
+    ])
+
+    assert rc == 0
+    assert read_state(data / DEFAULT_STATE_FILENAME).shutdown_requested is False
+    argv, _kwargs = calls[0]
+    assert argv[3] == "resume"
+    assert "--background" not in argv
+
+
+def test_cli_background_refuses_recursive_child(tmp_path, monkeypatch, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    monkeypatch.setenv(cli_mod.BACKGROUND_CHILD_ENV, "1")
+
+    rc = main([
+        "start",
+        "--campaign-dir",
+        str(campaign),
+        "--mock-ariadne",
+        "--background",
+    ])
+
+    assert rc == 2
+    assert "background child" in capsys.readouterr().err
+
+
+def test_cli_background_refuses_live_pid_file(tmp_path, monkeypatch, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    pid_path = data / cli_mod.BACKGROUND_PID_FILENAME
+    pid_path.write_text(
+        json.dumps({"pid": 99999, "schema_version": 1}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli_mod, "_pid_is_alive", lambda pid: True)
+
+    rc = main([
+        "start",
+        "--campaign-dir",
+        str(campaign),
+        "--mock-ariadne",
+        "--background",
+    ])
+
+    assert rc == 8
+    assert "still alive" in capsys.readouterr().err
+
+
+def test_cli_status_reports_background_pid_metadata(tmp_path, capsys, monkeypatch):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    write_state(data / DEFAULT_STATE_FILENAME, fresh_campaign_state())
+    pid_path = data / cli_mod.BACKGROUND_PID_FILENAME
+    log_path = data / cli_mod.BACKGROUND_LOG_FILENAME
+    pid = 12345
+    pid_path.write_text(
+        json.dumps({
+            "schema_version": 1,
+            "pid": pid,
+            "log_path": str(log_path),
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli_mod, "_pid_is_alive", lambda value: True)
+
+    rc = main(["status", "--campaign-dir", str(campaign), "--json"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["background_pid"] == pid
+    assert payload["background_pid_alive"] is True
+    assert payload["background_log_path"] == str(log_path)
+
+
 def test_cli_stop_when_no_state_returns_4(tmp_path):
     campaign = _campaign_with_config(tmp_path)
     rc = main(["stop", "--campaign-dir", str(campaign)])
