@@ -41,6 +41,13 @@ _HESSIAN_MODEL_MAP = {
     "schlegel": 3,
 }
 
+# ARIADNE enum values mirrored from the starter pack. Passing these explicitly
+# avoids f90wrap optional-argument default drift in live cluster builds.
+_ARIADNE_ROT_PRIMITIVE_EXPMAP3 = 1
+_ARIADNE_CARTESIAN_RECOVERY_NEWTON = 2
+_ARIADNE_GEO_BT_DENSE = 1
+_ARIADNE_TRQN_CONTROLLER_NONE = 0
+
 # when TRQN rejects too many proposals in a row we give up and re-init
 # under DS. three is the value the starter pack uses for
 # recovery_accepts_to_exit which is the closest equivalent.
@@ -272,6 +279,11 @@ def _build_trqn(ariadne, q0_xyz, g0_xyz, atom_list, run_config):
         trust0=float(run_config.delta0),
         trust_min=1.0e-4,
         trust_max=float(run_config.delta_max),
+        controller_mode=_ARIADNE_TRQN_CONTROLLER_NONE,
+        cartesian_recovery_mode=_ARIADNE_CARTESIAN_RECOVERY_NEWTON,
+        geo_bt_mode=_ARIADNE_GEO_BT_DENSE,
+        rot_primitive_mode=_ARIADNE_ROT_PRIMITIVE_EXPMAP3,
+        skip_bfgs_after_rot_reset=False,
         hessian_model=_hessian_model_id(run_config.hessian_model),
     )
     return opt
@@ -292,6 +304,9 @@ def _build_ds(ariadne, q0_xyz, g0_xyz, atom_list, run_config):
         h=float(run_config.delta0),
         f_tol=float(run_config.f_tol),
         gradf_tol=float(run_config.gradf_tol),
+        cartesian_recovery_mode=_ARIADNE_CARTESIAN_RECOVERY_NEWTON,
+        geo_bt_mode=_ARIADNE_GEO_BT_DENSE,
+        rot_primitive_mode=_ARIADNE_ROT_PRIMITIVE_EXPMAP3,
     )
     return opt
 
