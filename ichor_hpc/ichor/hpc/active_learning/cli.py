@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import time
 from dataclasses import asdict
@@ -49,6 +50,7 @@ from .daemon.config_lock import (
 )
 from .daemon.dry_run_executor import DryRunPhaseExecutor
 from .daemon.dry_run_sacct import DryRunSacctPoller
+from .daemon.job_names import live_job_name
 from .daemon.live_executor import (
     LiveBackendNotAvailableError,
     LiveBackendsPhaseExecutor,
@@ -543,6 +545,227 @@ def cmd_start(args: argparse.Namespace) -> int:
     return d.run(max_ticks=args.max_ticks, catch_keyboard_interrupt=True)
 
 
+_FEREBUS_JOB_NAME_EXTERNAL_PHASES = frozenset({"INITIAL_FEREBUS", "FEREBUS"})
+
+
+def _load_active_submission_intents(campaign: Path) -> List[Dict[str, Any]]:
+    intents: List[Dict[str, Any]] = []
+    root = _submission_intent.intent_dir(campaign)
+    if not root.is_dir():
+        return intents
+    for path in sorted(root.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(payload, dict) and str(payload.get("status")) in _submission_intent.ACTIVE_STATUSES:
+            intents.append(payload)
+    return intents
+
+
+def _lookup_active_slurm_job_for_cancel(job_id: str) -> Dict[str, Any]:
+    cmd = [
+        "squeue",
+        "-j",
+        str(job_id),
+        "--noheader",
+        "--format=%i|%T|%j",
+    ]
+    try:
+        completed = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except Exception as exc:
+        return {
+            "active": False,
+            "inconclusive": True,
+            "rows": [],
+            "error": type(exc).__name__ + ": " + str(exc),
+        }
+    if int(getattr(completed, "returncode", 1)) != 0:
+        stderr = getattr(completed, "stderr", "") or ""
+        return {
+            "active": False,
+            "inconclusive": True,
+            "rows": [],
+            "error": "squeue exited with code "
+            + str(int(getattr(completed, "returncode", 1)))
+            + ": "
+            + repr(stderr),
+        }
+    rows = []
+    stdout = getattr(completed, "stdout", "") or ""
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("|", 2)
+        rows.append({
+            "job_id": parts[0].strip() if len(parts) > 0 else "",
+            "state": parts[1].strip() if len(parts) > 1 else "",
+            "job_name": parts[2].strip() if len(parts) > 2 else "",
+        })
+    return {
+        "active": bool(rows),
+        "inconclusive": False,
+        "rows": rows,
+        "error": None,
+    }
+
+
+def _run_scancel(job_id: str) -> Tuple[bool, str]:
+    try:
+        completed = subprocess.run(
+            ["scancel", str(job_id)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except Exception as exc:
+        return False, type(exc).__name__ + ": " + str(exc)
+    if int(getattr(completed, "returncode", 1)) == 0:
+        return True, ""
+    stderr = getattr(completed, "stderr", "") or ""
+    stdout = getattr(completed, "stdout", "") or ""
+    message = stderr.strip() or stdout.strip() or "scancel failed"
+    return False, message
+
+
+def _job_name_matches_expected(rows: Sequence[Dict[str, Any]], expected_names: Sequence[str]) -> bool:
+    expected = {str(name) for name in expected_names if str(name)}
+    if not expected:
+        return True
+    actual = {str(row.get("job_name") or "") for row in rows}
+    return bool(actual.intersection(expected))
+
+
+def _collect_stop_cancel_jobs(campaign: Path, state: Any) -> Dict[str, Dict[str, Any]]:
+    jobs: Dict[str, Dict[str, Any]] = {}
+
+    def ensure(job_id: str) -> Dict[str, Any]:
+        return jobs.setdefault(
+            str(job_id),
+            {
+                "job_id": str(job_id),
+                "phases": set(),
+                "expected_job_names": set(),
+                "intent_keys": set(),
+            },
+        )
+
+    for phase, job_id in sorted((state.pending_jobs or {}).items()):
+        if not job_id:
+            continue
+        item = ensure(str(job_id))
+        phase_name = str(phase)
+        item["phases"].add(phase_name)
+        if phase_name not in _FEREBUS_JOB_NAME_EXTERNAL_PHASES:
+            item["expected_job_names"].add(
+                live_job_name(state.campaign_uid, phase_name, int(state.iteration))
+            )
+
+    for intent in _load_active_submission_intents(campaign):
+        job_id = str(intent.get("job_id") or "")
+        if not job_id:
+            continue
+        phase_name, iteration = _intent_phase_iteration(intent)
+        item = ensure(job_id)
+        if phase_name:
+            item["phases"].add(phase_name)
+            item["intent_keys"].add((phase_name, int(iteration)))
+        expected = str(intent.get("expected_job_name") or "")
+        if expected and phase_name not in _FEREBUS_JOB_NAME_EXTERNAL_PHASES:
+            item["expected_job_names"].add(expected)
+
+    return jobs
+
+
+def _cancel_recorded_slurm_jobs(campaign: Path, state: Any) -> Dict[str, Any]:
+    jobs = _collect_stop_cancel_jobs(campaign, state)
+    cancelled: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
+    for job_id, item in sorted(jobs.items()):
+        lookup = _lookup_active_slurm_job_for_cancel(job_id)
+        if bool(lookup.get("inconclusive")):
+            failed.append({
+                "job_id": job_id,
+                "reason": "squeue lookup inconclusive: " + str(lookup.get("error") or "unknown error"),
+            })
+            continue
+        if not bool(lookup.get("active")):
+            skipped.append({
+                "job_id": job_id,
+                "reason": "not active in squeue",
+            })
+            continue
+        expected_names = sorted(str(name) for name in item.get("expected_job_names", set()) if str(name))
+        rows = list(lookup.get("rows") or [])
+        if not _job_name_matches_expected(rows, expected_names):
+            actual_names = sorted({str(row.get("job_name") or "") for row in rows})
+            failed.append({
+                "job_id": job_id,
+                "reason": "scheduler job name mismatch",
+                "expected_job_names": expected_names,
+                "actual_job_names": actual_names,
+            })
+            continue
+        ok, message = _run_scancel(job_id)
+        if not ok:
+            failed.append({
+                "job_id": job_id,
+                "reason": "scancel failed: " + message,
+            })
+            continue
+        phases = sorted(str(phase) for phase in item.get("phases", set()))
+        cancelled.append({
+            "job_id": job_id,
+            "phases": phases,
+        })
+        for phase in phases:
+            if state.pending_jobs.get(phase) == job_id:
+                state.pending_jobs[phase] = None
+        for phase_name, iteration in sorted(item.get("intent_keys", set())):
+            try:
+                _submission_intent.mark_failed(
+                    campaign,
+                    str(phase_name),
+                    int(iteration),
+                    "operator_cancelled_via_stop",
+                )
+            except Exception:
+                pass
+    return {
+        "cancelled": cancelled,
+        "skipped": skipped,
+        "failed": failed,
+    }
+
+
+def _print_cancel_jobs_summary(summary: Dict[str, Any]) -> None:
+    cancelled = list(summary.get("cancelled") or [])
+    skipped = list(summary.get("skipped") or [])
+    failed = list(summary.get("failed") or [])
+    if cancelled:
+        print("Cancelled Slurm jobs:")
+        for item in cancelled:
+            phases = ", ".join(str(phase) for phase in item.get("phases", []))
+            suffix = " (" + phases + ")" if phases else ""
+            print("  - " + str(item.get("job_id")) + suffix)
+    if skipped:
+        print("Skipped Slurm jobs:")
+        for item in skipped:
+            print("  - " + str(item.get("job_id")) + ": " + str(item.get("reason")))
+    if failed:
+        print("Jobs not cancelled:", file=sys.stderr)
+        for item in failed:
+            print("  - " + str(item.get("job_id")) + ": " + str(item.get("reason")), file=sys.stderr)
+    if not cancelled and not skipped and not failed:
+        print("No recorded active Slurm jobs found.")
+
+
 def cmd_stop(args: argparse.Namespace) -> int:
     campaign = Path(args.campaign_dir).resolve()
     paths = _campaign_paths(campaign)
@@ -555,8 +778,40 @@ def cmd_stop(args: argparse.Namespace) -> int:
         print("state.json invalid: " + str(exc), file=sys.stderr)
         return 5
     state.shutdown_requested = True
+    cancel_summary = None
+    if bool(getattr(args, "cancel_jobs", False)):
+        cancel_summary = _cancel_recorded_slurm_jobs(campaign, state)
     write_state(paths["state"], state)
+    if cancel_summary is not None:
+        try:
+            from .daemon.journal import append_event
+
+            append_event(
+                paths["journal"],
+                "operator_cancelled_jobs",
+                n_cancelled=len(cancel_summary.get("cancelled") or []),
+                n_skipped=len(cancel_summary.get("skipped") or []),
+                n_failed=len(cancel_summary.get("failed") or []),
+                cancelled_job_ids=[
+                    str(item.get("job_id"))
+                    for item in (cancel_summary.get("cancelled") or [])
+                ],
+                skipped_job_ids=[
+                    str(item.get("job_id"))
+                    for item in (cancel_summary.get("skipped") or [])
+                ],
+                failed_job_ids=[
+                    str(item.get("job_id"))
+                    for item in (cancel_summary.get("failed") or [])
+                ],
+            )
+        except Exception:
+            pass
     print("shutdown_requested=true set in " + str(paths["state"]))
+    if cancel_summary is not None:
+        _print_cancel_jobs_summary(cancel_summary)
+        if cancel_summary.get("failed"):
+            return 10
     return 0
 
 
@@ -1207,6 +1462,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_stop = sub.add_parser("stop", help="Request a graceful shutdown.")
     add_campaign(p_stop)
+    p_stop.add_argument(
+        "--cancel-jobs",
+        action="store_true",
+        help=(
+            "Also scancel active Slurm jobs recorded by this campaign. "
+            "Plain stop only requests daemon shutdown and leaves jobs alone."
+        ),
+    )
     p_stop.set_defaults(func=cmd_stop)
 
     p_status = sub.add_parser("status", help="Print the current daemon status.")

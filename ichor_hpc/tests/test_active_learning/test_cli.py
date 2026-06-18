@@ -13,6 +13,8 @@ from ichor.hpc.active_learning.daemon.daemon import (
     DAEMON_LOCK_FILENAME,
     DEFAULT_DATA_SUBDIR,
 )
+from ichor.hpc.active_learning.daemon import submission_intent
+from ichor.hpc.active_learning.daemon.job_names import live_job_name
 from ichor.hpc.active_learning.daemon.journal import append_event
 from ichor.hpc.active_learning.daemon.state import (
     CampaignPhase,
@@ -207,6 +209,194 @@ def test_cli_stop_sets_shutdown_flag(tmp_path):
     assert rc == 0
     s = read_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME)
     assert s.shutdown_requested is True
+
+
+def test_cli_stop_without_cancel_jobs_does_not_call_scancel(tmp_path, monkeypatch):
+    campaign = _campaign_with_config(tmp_path)
+    (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state()
+    state.pending_jobs[CampaignPhase.INITIAL_GAUSSIAN.value] = "123"
+    write_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME, state)
+    monkeypatch.setattr(
+        cli_mod,
+        "_run_scancel",
+        lambda job_id: pytest.fail("plain stop must not call scancel"),
+    )
+
+    rc = main(["stop", "--campaign-dir", str(campaign)])
+
+    assert rc == 0
+    stopped = read_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME)
+    assert stopped.shutdown_requested is True
+    assert stopped.pending_jobs[CampaignPhase.INITIAL_GAUSSIAN.value] == "123"
+
+
+def test_cli_stop_cancel_jobs_cancels_pending_job_and_clears_state(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state()
+    state.campaign_uid = "abc123def456-uid"
+    state.iteration = 0
+    phase = CampaignPhase.INITIAL_GAUSSIAN.value
+    state.pending_jobs[phase] = "123"
+    write_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME, state)
+    expected_name = live_job_name(state.campaign_uid, phase, 0)
+    cancelled = []
+    monkeypatch.setattr(
+        cli_mod,
+        "_lookup_active_slurm_job_for_cancel",
+        lambda job_id: {
+            "active": True,
+            "inconclusive": False,
+            "rows": [{"job_id": str(job_id), "state": "RUNNING", "job_name": expected_name}],
+            "error": None,
+        },
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_run_scancel",
+        lambda job_id: (cancelled.append(str(job_id)) or (True, "")),
+    )
+
+    rc = main(["stop", "--campaign-dir", str(campaign), "--cancel-jobs"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert cancelled == ["123"]
+    stopped = read_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME)
+    assert stopped.shutdown_requested is True
+    assert stopped.pending_jobs[phase] is None
+    assert "Cancelled Slurm jobs" in out
+
+
+def test_cli_stop_cancel_jobs_cancels_ferebus_intent_with_external_job_name(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state()
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    submission_intent.write_pre_submit_intent(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        phase_name=CampaignPhase.INITIAL_FEREBUS.value,
+        iteration=0,
+    )
+    submission_intent.mark_submitted(
+        campaign,
+        CampaignPhase.INITIAL_FEREBUS.value,
+        0,
+        "456",
+        expected_tasks=12,
+    )
+    cancelled = []
+    monkeypatch.setattr(
+        cli_mod,
+        "_lookup_active_slurm_job_for_cancel",
+        lambda job_id: {
+            "active": True,
+            "inconclusive": False,
+            "rows": [{"job_id": str(job_id), "state": "PENDING", "job_name": "ferebus-light"}],
+            "error": None,
+        },
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_run_scancel",
+        lambda job_id: (cancelled.append(str(job_id)) or (True, "")),
+    )
+
+    rc = main(["stop", "--campaign-dir", str(campaign), "--cancel-jobs"])
+
+    assert rc == 0
+    assert cancelled == ["456"]
+    intent = submission_intent.load_intent(
+        campaign,
+        CampaignPhase.INITIAL_FEREBUS.value,
+        0,
+    )
+    assert intent["status"] == "FAILED"
+    assert intent["reason"] == "operator_cancelled_via_stop"
+
+
+def test_cli_stop_cancel_jobs_refuses_inconclusive_scheduler_lookup(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state()
+    state.pending_jobs[CampaignPhase.INITIAL_GAUSSIAN.value] = "789"
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    monkeypatch.setattr(
+        cli_mod,
+        "_lookup_active_slurm_job_for_cancel",
+        lambda job_id: {
+            "active": False,
+            "inconclusive": True,
+            "rows": [],
+            "error": "squeue unavailable",
+        },
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_run_scancel",
+        lambda job_id: pytest.fail("inconclusive lookup must not scancel"),
+    )
+
+    rc = main(["stop", "--campaign-dir", str(campaign), "--cancel-jobs"])
+    err = capsys.readouterr().err
+
+    assert rc == 10
+    assert "squeue lookup inconclusive" in err
+    stopped = read_state(data / DEFAULT_STATE_FILENAME)
+    assert stopped.shutdown_requested is True
+    assert stopped.pending_jobs[CampaignPhase.INITIAL_GAUSSIAN.value] == "789"
+
+
+def test_cli_stop_cancel_jobs_refuses_campaign_job_name_mismatch(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state()
+    phase = CampaignPhase.INITIAL_GAUSSIAN.value
+    state.pending_jobs[phase] = "321"
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    monkeypatch.setattr(
+        cli_mod,
+        "_lookup_active_slurm_job_for_cancel",
+        lambda job_id: {
+            "active": True,
+            "inconclusive": False,
+            "rows": [{"job_id": str(job_id), "state": "RUNNING", "job_name": "other-campaign"}],
+            "error": None,
+        },
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_run_scancel",
+        lambda job_id: pytest.fail("job-name mismatch must not scancel"),
+    )
+
+    rc = main(["stop", "--campaign-dir", str(campaign), "--cancel-jobs"])
+    err = capsys.readouterr().err
+
+    assert rc == 10
+    assert "scheduler job name mismatch" in err
+    stopped = read_state(data / DEFAULT_STATE_FILENAME)
+    assert stopped.pending_jobs[phase] == "321"
 
 
 def test_cli_resume_explicitly_clears_shutdown_flag(tmp_path):
