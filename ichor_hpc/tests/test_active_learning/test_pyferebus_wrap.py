@@ -168,6 +168,7 @@ def test_submit_ferebus_happy_path(tmp_path):
     assert captured[0].kwargs["full_ARD"] is False
     assert captured[0].kwargs["scaling"] is False
     script = (tmp_path / "runFerebus.sh").read_text(encoding="utf-8")
+    assert "#SBATCH --time=12:00:00" in script
     assert "set -eo pipefail" in script
     assert "set -euo pipefail" not in script
     assert "export LC_ALL=C" in script
@@ -192,6 +193,7 @@ def test_submit_ferebus_keeps_sbatch_directives_before_shell_commands(tmp_path):
             "export LC_NUMERIC=C\n"
             "#SBATCH --partition multicore\n"
             "#SBATCH -n 2\n"
+            "#SBATCH -t 12-0\n"
             "#SBATCH --job-name=ferebus-light\n"
             "module load compilers/gcc/13.3.0\n"
             "ferebus ${line}\n"
@@ -209,15 +211,17 @@ def test_submit_ferebus_keeps_sbatch_directives_before_shell_commands(tmp_path):
     )
 
     lines = (tmp_path / "runFerebus.sh").read_text(encoding="utf-8").splitlines()
-    assert lines[:7] == [
+    assert lines[:8] == [
         "#!/bin/bash --login",
         "#SBATCH --partition multicore",
         "#SBATCH -n 2",
         "#SBATCH --job-name=ferebus-light",
+        "#SBATCH --time=24:00:00",
         "set -eo pipefail",
         "export LC_ALL=C",
         "export LC_NUMERIC=C",
     ]
+    assert not any(line.strip() == "#SBATCH -t 12-0" for line in lines)
     last_sbatch = max(i for i, line in enumerate(lines) if line.startswith("#SBATCH"))
     first_shell_command = min(
         i
@@ -228,6 +232,59 @@ def test_submit_ferebus_keeps_sbatch_directives_before_shell_commands(tmp_path):
         and not line.startswith("#")
     )
     assert first_shell_command > last_sbatch
+
+
+def test_submit_ferebus_rewrites_pyferebus_day_walltime_to_hours(tmp_path):
+    captured: List[_StubModel] = []
+    model_class = _make_model_class(
+        captured,
+        script_text=(
+            "#!/bin/bash --login\n"
+            "#SBATCH --partition multicore\n"
+            "#SBATCH -t 2-0\n"
+            "ferebus ${line}\n"
+        ),
+    )
+    jd = tmp_path / "job.json"
+    jd.write_text("{}")
+
+    submit_ferebus(
+        jd,
+        tmp_path,
+        walltime_hours=2,
+        model_class=model_class,
+        submit_runner=_StubRunner(),
+    )
+
+    script = (tmp_path / "runFerebus.sh").read_text(encoding="utf-8")
+    assert "#SBATCH --time=2:00:00" in script
+    assert "#SBATCH -t 2-0" not in script
+
+
+def test_submit_ferebus_formats_long_walltime_as_days(tmp_path):
+    captured: List[_StubModel] = []
+    model_class = _make_model_class(
+        captured,
+        script_text=(
+            "#!/bin/bash --login\n"
+            "#SBATCH --time=7-0\n"
+            "ferebus ${line}\n"
+        ),
+    )
+    jd = tmp_path / "job.json"
+    jd.write_text("{}")
+
+    submit_ferebus(
+        jd,
+        tmp_path,
+        walltime_hours=26,
+        model_class=model_class,
+        submit_runner=_StubRunner(),
+    )
+
+    script = (tmp_path / "runFerebus.sh").read_text(encoding="utf-8")
+    assert "#SBATCH --time=1-02:00:00" in script
+    assert "#SBATCH --time=7-0" not in script
 
 
 def test_submit_ferebus_patches_configured_executable(tmp_path):

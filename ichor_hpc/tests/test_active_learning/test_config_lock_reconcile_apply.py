@@ -67,6 +67,27 @@ def test_ferebus_scaling_change_allowed_for_uncommitted_initial_ferebus(tmp_path
     assert state.phase is CampaignPhase.HALTED
 
 
+def test_phase_walltime_changes_are_allowed_runtime_changes(tmp_path):
+    campaign = _campaign(tmp_path)
+    original = CampaignConfig()
+    write_config_lock(campaign, original)
+    changed = CampaignConfig()
+    changed.resources.ferebus_walltime_hours = 2
+    changed.resources.gaussian_walltime_hours = 3
+    _write_config(campaign, changed)
+
+    proposed = fresh_campaign_state()
+    proposed.phase = CampaignPhase.INITIAL_FEREBUS
+    review = review_config_changes(campaign, changed, proposed)
+
+    assert review.allowed
+    assert sorted(c.path for c in review.allowed_changes) == [
+        "resources.ferebus_walltime_hours",
+        "resources.gaussian_walltime_hours",
+    ]
+    assert not review.blocked_changes
+
+
 def test_gaussian_method_change_is_blocked_by_config_lock(tmp_path):
     campaign = _campaign(tmp_path)
     original = CampaignConfig()

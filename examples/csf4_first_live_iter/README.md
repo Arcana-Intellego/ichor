@@ -306,6 +306,11 @@ seed_selection:
 resources:
   partition: multicore
   walltime_hours: 2
+  polus_walltime_hours: 1
+  gaussian_walltime_hours: 2
+  aimall_walltime_hours: 2
+  ariadne_walltime_hours: 1
+  ferebus_walltime_hours: 2
   mem_per_cpu: auto
   cpus_per_task: 2
   ntasks: 1
@@ -322,6 +327,9 @@ ariadne:
   hessian_model: ALMLOF
   max_iter: 50
   gradf_tol: 1.0e-4
+
+ferebus:
+  scaling: false
 
 runtime:
   poll_sacct_missing_max_ticks: 30

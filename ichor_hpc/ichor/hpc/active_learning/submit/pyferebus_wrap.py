@@ -208,7 +208,20 @@ def _validate_generated_pyferebus_artifacts(working_dir: Path) -> Path:
     return script
 
 
-def _harden_generated_script(script: Path) -> None:
+def _format_slurm_walltime_hours(walltime_hours: int) -> str:
+    try:
+        hours = int(walltime_hours)
+    except (TypeError, ValueError) as exc:
+        raise FerebusSubmissionError("FEREBUS walltime_hours must be an integer") from exc
+    if hours <= 0:
+        raise FerebusSubmissionError("FEREBUS walltime_hours must be > 0")
+    days, rem_hours = divmod(hours, 24)
+    if hours > 24:
+        return str(days) + "-" + str(rem_hours).zfill(2) + ":00:00"
+    return str(hours) + ":00:00"
+
+
+def _harden_generated_script(script: Path, *, walltime_hours: int) -> None:
     text = script.read_text(encoding="utf-8")
     hardening_lines = {
         "set -eo pipefail",
@@ -220,15 +233,17 @@ def _harden_generated_script(script: Path) -> None:
         line
         for line in text.splitlines()
         if line.strip() not in hardening_lines
+        and not re.match(r"^#SBATCH\s+(?:-t\b|--time(?:=|\b))", line.strip())
     ]
-    insert_at = 1 if lines and lines[0].startswith("#!") else 0
-    while insert_at < len(lines):
-        stripped = lines[insert_at].lstrip()
+    sbatch_insert_at = 1 if lines and lines[0].startswith("#!") else 0
+    while sbatch_insert_at < len(lines):
+        stripped = lines[sbatch_insert_at].lstrip()
         if stripped.startswith("#SBATCH"):
-            insert_at += 1
+            sbatch_insert_at += 1
             continue
         break
-    lines[insert_at:insert_at] = [
+    lines[sbatch_insert_at:sbatch_insert_at] = [
+        "#SBATCH --time=" + _format_slurm_walltime_hours(walltime_hours),
         "set -eo pipefail",
         "export LC_ALL=C",
         "export LC_NUMERIC=C",
@@ -422,7 +437,7 @@ def submit_ferebus(
         os.chdir(cwd)
 
     script = _validate_generated_pyferebus_artifacts(working_dir)
-    _harden_generated_script(script)
+    _harden_generated_script(script, walltime_hours=walltime_hours)
     if path_to_executable:
         _patch_generated_executable(script, path_to_executable)
 

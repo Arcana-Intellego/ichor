@@ -566,7 +566,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             effective_walltime = (
                 int(self.walltime_hours)
                 if self.walltime_hours is not None
-                else int(resources.walltime_hours if resources is not None else 24)
+                else int(resources.walltime_for(phase_name) if resources is not None else 24)
             )
             submission = submit_ferebus(
                 staging / _stg.FEREBUS_JOB_DETAILS,
@@ -2609,7 +2609,7 @@ def build_sbatch_script(
     res = config.resources
     _configured_scheduler()
     part = partition if partition is not None else res.partition
-    wall = walltime_hours if walltime_hours is not None else res.walltime_hours
+    wall = walltime_hours if walltime_hours is not None else res.walltime_for(phase_name)
     is_gaussian_phase = phase_name in ("INITIAL_GAUSSIAN", "GAUSSIAN")
     if is_gaussian_phase and int(config.gaussian.nproc) > int(res.cpus_per_task):
         raise BackendSubmissionError(

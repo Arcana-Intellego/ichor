@@ -114,12 +114,14 @@ def test_campaign_config_block_submenus_show_values_and_edit_one_field(monkeypat
     rendered = resources_menu.this_menu_options()
     assert "resources.partition" in rendered
     assert "resources.walltime_hours" in rendered
+    assert "resources.ferebus_walltime_hours" in rendered
     assert "resources.aimall_cpus_per_task" in rendered
     assert "resources.gradient_parallel_backend" in rendered
 
     texts = [it.text for it in resources_menu.items]
     assert "Set partition" in texts
     assert "Set walltime_hours" in texts
+    assert "Set ferebus_walltime_hours" in texts
     assert "Set aimall_cpus_per_task" in texts
 
     cfg = menu.get_campaign_config()
@@ -294,6 +296,8 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
     assert "acquisition.calibrated_energy.utility: banded" in out
     assert "acquisition.fullspace_confinement.enabled: True" in out
     assert "resources.aimall_cpus_per_task: 8" in out
+    assert "resources.effective_phase_walltimes" in out
+    assert "FEREBUS=24h" in out
     assert "aimall.nproc: 8" in out
     assert "aimall.naat: auto" in out
     assert "aimall.boaq: auto" in out

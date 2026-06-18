@@ -18,6 +18,20 @@ def _line(label: str, value) -> str:
     return "-- " + label + ": " + format_field_value(value) + "\n"
 
 
+def _walltime_summary(resources) -> str:
+    phases = (
+        ("POLUS", "PHASE_A_POLUS"),
+        ("Gaussian", "INITIAL_GAUSSIAN"),
+        ("AIMAll", "INITIAL_AIMALL"),
+        ("ARIADNE", "ARIADNE_ARRAY"),
+        ("FEREBUS", "INITIAL_FEREBUS"),
+    )
+    return ", ".join(
+        label + "=" + str(int(resources.walltime_for(phase))) + "h"
+        for label, phase in phases
+    )
+
+
 def format_sampling_protocol_summary(config: CampaignConfig) -> str:
     seed = config.seed_selection
     calib = config.error_calibration
@@ -117,6 +131,8 @@ def format_sampling_protocol_summary(config: CampaignConfig) -> str:
         )
     )
     lines.append(_line("resources.partition", resources.partition))
+    lines.append(_line("resources.walltime_hours", resources.walltime_hours))
+    lines.append(_line("resources.effective_phase_walltimes", _walltime_summary(resources)))
     lines.append(_line("resources.mem_per_cpu", resources.mem_per_cpu))
     lines.append(_line("resources.cpus_per_task", resources.cpus_per_task))
     lines.append(_line("resources.aimall_cpus_per_task", resources.aimall_cpus_per_task))

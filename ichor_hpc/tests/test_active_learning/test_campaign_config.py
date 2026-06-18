@@ -103,6 +103,11 @@ def test_system_name_rejects_unsafe_tokens(name):
     [
         ("walltime_hours", 0),
         ("walltime_hours", -1),
+        ("polus_walltime_hours", 0),
+        ("gaussian_walltime_hours", -1),
+        ("aimall_walltime_hours", 0),
+        ("ariadne_walltime_hours", -1),
+        ("ferebus_walltime_hours", 0),
         ("cpus_per_task", 0),
         ("ntasks", 0),
         ("aimall_cpus_per_task", 0),
@@ -121,6 +126,31 @@ def test_scheduler_integer_fields_reject_non_integer_values():
     payload["resources"]["walltime_hours"] = "24"
     with pytest.raises(ConfigValidationError, match="walltime_hours"):
         CampaignConfig.from_dict(payload)
+
+
+def test_optional_phase_walltime_rejects_non_integer_values():
+    payload = CampaignConfig().to_dict()
+    payload["resources"]["ferebus_walltime_hours"] = "2"
+    with pytest.raises(ConfigValidationError, match="ferebus_walltime_hours"):
+        CampaignConfig.from_dict(payload)
+
+
+def test_phase_walltime_overrides_default_to_null_and_resolve_per_phase():
+    cfg = CampaignConfig()
+    assert cfg.resources.ferebus_walltime_hours is None
+    assert cfg.resources.walltime_for("INITIAL_FEREBUS") == cfg.resources.walltime_hours
+    cfg.resources.walltime_hours = 12
+    cfg.resources.polus_walltime_hours = 1
+    cfg.resources.gaussian_walltime_hours = 2
+    cfg.resources.aimall_walltime_hours = 3
+    cfg.resources.ariadne_walltime_hours = 4
+    cfg.resources.ferebus_walltime_hours = 5
+    assert cfg.resources.walltime_for("PHASE_A_POLUS") == 1
+    assert cfg.resources.walltime_for("GAUSSIAN") == 2
+    assert cfg.resources.walltime_for("INITIAL_AIMALL") == 3
+    assert cfg.resources.walltime_for("ARIADNE_ARRAY") == 4
+    assert cfg.resources.walltime_for("FEREBUS") == 5
+    assert cfg.resources.walltime_for("UNKNOWN") == 12
 
 
 @pytest.mark.parametrize("partition", ["multicore", "serial-debug", "gpu:shared", "csf4.test"])

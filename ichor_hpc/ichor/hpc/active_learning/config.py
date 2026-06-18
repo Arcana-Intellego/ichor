@@ -532,6 +532,11 @@ class ResourceConfigBlock:
     # phases.
     partition: str = "multicore"
     walltime_hours: int = 24
+    polus_walltime_hours: Optional[int] = None
+    gaussian_walltime_hours: Optional[int] = None
+    aimall_walltime_hours: Optional[int] = None
+    ariadne_walltime_hours: Optional[int] = None
+    ferebus_walltime_hours: Optional[int] = None
     # Per-core memory, NOT per-job. "auto" resolves from the active cluster
     # profile and partition during live Slurm rendering, so CSF4 gets 4G/core
     # while CSF3 multicore can use 8G/core without editing campaign.yaml.
@@ -551,6 +556,21 @@ class ResourceConfigBlock:
         if phase_name == "ARIADNE_ARRAY":
             return int(self.ariadne_cpus_per_task)
         return int(self.cpus_per_task)
+
+    def walltime_for(self, phase_name: str) -> int:
+        if phase_name in ("PHASE_A_POLUS", "PHASE_B_POLUS"):
+            value = self.polus_walltime_hours
+        elif phase_name in ("INITIAL_GAUSSIAN", "GAUSSIAN"):
+            value = self.gaussian_walltime_hours
+        elif phase_name in ("INITIAL_AIMALL", "AIMALL"):
+            value = self.aimall_walltime_hours
+        elif phase_name == "ARIADNE_ARRAY":
+            value = self.ariadne_walltime_hours
+        elif phase_name in ("INITIAL_FEREBUS", "FEREBUS"):
+            value = self.ferebus_walltime_hours
+        else:
+            value = None
+        return int(value if value is not None else self.walltime_hours)
 
 
 @dataclass
@@ -713,6 +733,16 @@ class CampaignConfig:
             "a scheduler token containing only letters, numbers, '.', '_', ':' and '-'",
         )
         _validate_positive_int("resources.walltime_hours", self.resources.walltime_hours)
+        for _name in (
+            "polus_walltime_hours",
+            "gaussian_walltime_hours",
+            "aimall_walltime_hours",
+            "ariadne_walltime_hours",
+            "ferebus_walltime_hours",
+        ):
+            _value = getattr(self.resources, _name)
+            if _value is not None:
+                _validate_positive_int("resources." + _name, _value)
         _validate_positive_int("resources.cpus_per_task", self.resources.cpus_per_task)
         _validate_positive_int("resources.ntasks", self.resources.ntasks)
         _validate_positive_int(

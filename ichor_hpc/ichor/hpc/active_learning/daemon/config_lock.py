@@ -157,6 +157,11 @@ ALWAYS_SAFE_PREFIXES = {
 }
 ALWAYS_SAFE_RESOURCE_EXACT = {
     "resources.walltime_hours",
+    "resources.polus_walltime_hours",
+    "resources.gaussian_walltime_hours",
+    "resources.aimall_walltime_hours",
+    "resources.ariadne_walltime_hours",
+    "resources.ferebus_walltime_hours",
     "resources.mem_per_cpu",
     "resources.array_concurrency_limit",
     "resources.gradient_parallel_backend",

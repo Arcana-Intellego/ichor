@@ -779,6 +779,11 @@ _BLOCK_MENUS_BY_LABEL = {
         [
             _spec("resources.partition", "str"),
             _spec("resources.walltime_hours", "int"),
+            _spec("resources.polus_walltime_hours", "optional_int"),
+            _spec("resources.gaussian_walltime_hours", "optional_int"),
+            _spec("resources.aimall_walltime_hours", "optional_int"),
+            _spec("resources.ariadne_walltime_hours", "optional_int"),
+            _spec("resources.ferebus_walltime_hours", "optional_int"),
             _spec("resources.mem_per_cpu", "str", prompt="resources.mem_per_cpu (SLURM style, e.g. 4G): "),
             _spec("resources.cpus_per_task", "int"),
             _spec("resources.ntasks", "int"),

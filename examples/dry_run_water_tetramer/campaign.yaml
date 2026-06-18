@@ -44,3 +44,6 @@ aimall:
   encomp: 3
   boaq: auto_gs2
   iasmesh: medium
+
+ferebus:
+  scaling: false

@@ -733,6 +733,42 @@ def test_build_sbatch_script_explicit_scheduler_overrides_win():
     assert "#SBATCH --time=7:00:00" not in body
 
 
+def test_build_sbatch_script_uses_phase_walltime_override():
+    cfg = CampaignConfig()
+    cfg.resources.walltime_hours = 12
+    cfg.resources.gaussian_walltime_hours = 3
+    cfg.resources.aimall_walltime_hours = 4
+    cfg.resources.ariadne_walltime_hours = 5
+    cfg.resources.polus_walltime_hours = 6
+    assert "#SBATCH --time=3:00:00" in build_sbatch_script(
+        phase_name="GAUSSIAN",
+        iteration=1,
+        campaign_dir=Path("/scratch/campaign"),
+        config=cfg,
+        array_size=1,
+    )
+    assert "#SBATCH --time=4:00:00" in build_sbatch_script(
+        phase_name="AIMALL",
+        iteration=1,
+        campaign_dir=Path("/scratch/campaign"),
+        config=cfg,
+        array_size=1,
+    )
+    assert "#SBATCH --time=5:00:00" in build_sbatch_script(
+        phase_name="ARIADNE_ARRAY",
+        iteration=1,
+        campaign_dir=Path("/scratch/campaign"),
+        config=cfg,
+        array_size=1,
+    )
+    assert "#SBATCH --time=6:00:00" in build_sbatch_script(
+        phase_name="PHASE_B_POLUS",
+        iteration=1,
+        campaign_dir=Path("/scratch/campaign"),
+        config=cfg,
+    )
+
+
 def test_build_sbatch_script_renders_ferebus_block():
     body = build_sbatch_script(
         phase_name="INITIAL_FEREBUS",
@@ -753,6 +789,7 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
 
     cfg = CampaignConfig()
     cfg.resources.walltime_hours = 9
+    cfg.resources.ferebus_walltime_hours = 2
     campaign = tmp_path / "campaign"
     campaign.mkdir()
     staging = campaign / "6_TRAINED_MODELS" / "iteration-staging"
@@ -824,7 +861,7 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
     assert calls["submit"]["kwargs"]["overwrite_workdir"] is False
     assert calls["submit"]["kwargs"]["move_dataset_files"] is True
     assert calls["submit"]["kwargs"]["submit_runner"] is runner
-    assert calls["submit"]["kwargs"]["walltime_hours"] == cfg.resources.walltime_hours
+    assert calls["submit"]["kwargs"]["walltime_hours"] == cfg.resources.ferebus_walltime_hours
     assert calls["submit"]["kwargs"]["platform"] == "CSF3"
 
 
