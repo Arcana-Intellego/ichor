@@ -106,6 +106,8 @@ def test_ds_init_forwards_ariadne_geometry_enum_defaults():
     assert kwargs["gamma"] == 0.4
     assert kwargs["f_tol"] == 1.0e-5
     assert kwargs["gradf_tol"] == 2.0e-4
+    assert kwargs["hpos_estimator"] == "syev"
+    assert kwargs["lanczos_k"] == 4
 
 
 def test_optimiser_diagnostics_are_json_safe_for_no_trial_path():
@@ -184,12 +186,14 @@ class _AcceptingDs:
     def __init__(self):
         self.q = np.zeros(6, dtype=np.float64)
         self.g = np.ones(6, dtype=np.float64)
+        self.init_kwargs = None
         self.pending = False
         self.accepted = False
         self.converged = False
         self.f_current = 0.0
 
     def init(self, **kwargs):
+        self.init_kwargs = dict(kwargs)
         self.q = np.asarray(kwargs["q0_xyz"], dtype=np.float64).reshape(-1).copy()
         self.g = np.asarray(kwargs["g0_xyz"], dtype=np.float64).reshape(-1).copy()
 
@@ -314,6 +318,8 @@ def test_repeated_trqn_no_proposal_backtransform_failure_falls_back_to_ds(monkey
     assert result.diagnostics["optimiser_final"] == "dissipative_symplectic"
     assert result.n_evaluations == 3
     assert len(result.candidate_positions_angstrom) == 2
+    assert ariadne._ds_factory.last.init_kwargs["hpos_estimator"] == "syev"
+    assert ariadne._ds_factory.last.init_kwargs["lanczos_k"] == 4
 
 
 def test_repeated_trqn_no_proposal_backtransform_failure_fails_early(monkeypatch):

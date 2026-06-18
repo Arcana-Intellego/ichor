@@ -506,6 +506,11 @@ def _build_ds(ariadne, q0_xyz, g0_xyz, atom_list, run_config):
         h=float(run_config.delta0),
         f_tol=float(run_config.f_tol),
         gradf_tol=float(run_config.gradf_tol),
+        # Pass these explicitly because some f90wrap builds treat omitted
+        # optional scalar arguments as present zero values, which trips the
+        # Fortran lanczos_k >= 1 guard during DS fallback initialisation.
+        hpos_estimator="syev",
+        lanczos_k=4,
         cartesian_recovery_mode=_ARIADNE_CARTESIAN_RECOVERY_NEWTON,
         geo_bt_mode=_ARIADNE_GEO_BT_DENSE,
         rot_primitive_mode=_ARIADNE_ROT_PRIMITIVE_EXPMAP3,
