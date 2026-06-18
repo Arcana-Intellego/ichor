@@ -18,7 +18,10 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 from ..config import CampaignConfig
 from ..versioning.training_set import TrainingSetVersioning
-from .artifact_contracts import verify_committed_training_version
+from .artifact_contracts import (
+    verify_committed_model_version,
+    verify_committed_training_version,
+)
 from .state import CampaignPhase, CampaignState, atomic_write_json
 
 
@@ -399,6 +402,59 @@ def clean_reentry_staging(campaign_dir: Union[str, Path], phase: CampaignPhase) 
                 script.unlink()
                 removed.append(str(script))
     return removed
+
+
+def archive_scripts_for_reconcile(campaign_dir: Union[str, Path]) -> List[str]:
+    campaign = Path(campaign_dir)
+    scripts = campaign / ".DATA" / "SCRIPTS"
+    if not scripts.exists():
+        return []
+    if scripts.is_symlink():
+        raise ValueError("refusing to archive symlinked .DATA/SCRIPTS")
+    if not scripts.is_dir():
+        raise ValueError(".DATA/SCRIPTS is not a directory")
+    children = [p for p in scripts.iterdir() if p.name not in (".", "..")]
+    if not children:
+        return []
+    _ensure_inside_campaign(campaign, scripts)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    target = scripts.with_name(scripts.name + ".before-reconcile-" + stamp)
+    suffix = 1
+    while target.exists():
+        target = scripts.with_name(
+            scripts.name + ".before-reconcile-" + stamp + "." + str(suffix)
+        )
+        suffix += 1
+    scripts.rename(target)
+    scripts.mkdir(parents=True, exist_ok=True)
+    (scripts / "OUTPUTS").mkdir(exist_ok=True)
+    (scripts / "ERRORS").mkdir(exist_ok=True)
+    return [str(target)]
+
+
+def clean_model_iteration_staging_for_reconcile(
+    campaign_dir: Union[str, Path],
+    proposed_state: CampaignState,
+) -> List[str]:
+    campaign = Path(campaign_dir)
+    target = campaign / "6_TRAINED_MODELS" / "iteration-staging"
+    if not target.exists():
+        return []
+    if target.is_symlink():
+        raise ValueError("refusing to remove symlinked model iteration-staging")
+    if not target.is_dir():
+        raise ValueError("model iteration-staging is not a directory")
+    _ensure_inside_campaign(campaign, target)
+    if proposed_state.phase not in (CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS):
+        try:
+            model_version = int(proposed_state.models_version)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("models_version is not an integer") from exc
+        if model_version < 0:
+            raise ValueError("models_version is negative; cannot verify committed model")
+        verify_committed_model_version(campaign, model_version)
+    shutil.rmtree(target)
+    return [str(target)]
 
 
 def ferebus_reentry_can_archive_data_staging(

@@ -42,8 +42,10 @@ from .daemon.daemon import (
 from .daemon.journal import iter_events, read_events
 from .daemon.config_lock import (
     apply_config_lock_update,
+    archive_scripts_for_reconcile,
     archive_data_staging_for_ferebus_reentry,
     assert_config_unchanged_for_start,
+    clean_model_iteration_staging_for_reconcile,
     clean_reentry_staging,
     ferebus_reentry_can_archive_data_staging,
     format_config_review,
@@ -78,6 +80,18 @@ BACKGROUND_CHILD_ENV = "ICHOR_DAEMON_BACKGROUND_CHILD"
 BACKGROUND_LOG_FILENAME = "daemon.out"
 BACKGROUND_PID_FILENAME = "daemon.pid"
 BACKGROUND_PID_SCHEMA_VERSION = 1
+
+
+RETRYABLE_CLEANED_REENTRY_PHASES = {
+    CampaignPhase.SEED_SELECT,
+    CampaignPhase.ARIADNE_ARRAY,
+    CampaignPhase.PHASE_B_POLUS,
+    CampaignPhase.SPLIT,
+    CampaignPhase.GAUSSIAN,
+    CampaignPhase.AIMALL,
+    CampaignPhase.APPEND,
+    CampaignPhase.FEREBUS,
+}
 
 
 def _campaign_paths(campaign_dir: Path):
@@ -1296,6 +1310,38 @@ def _resolve_terminal_submission_intents_for_apply(
     return resolved, blocking
 
 
+def _retry_phase_from_cleaned_report(report) -> Optional[CampaignPhase]:
+    try:
+        phase = CampaignPhase(str(report.last_phase_in_journal))
+    except Exception:
+        return None
+    if phase in RETRYABLE_CLEANED_REENTRY_PHASES:
+        return phase
+    return None
+
+
+def _apply_retry_phase_after_cleaned_halt(report, original_report) -> bool:
+    if report.proposed_state.phase is not CampaignPhase.STOP_CHECK:
+        return False
+    retry_phase = _retry_phase_from_cleaned_report(original_report)
+    if retry_phase is None:
+        return False
+    report.proposed_state.phase = retry_phase
+    if original_report.last_iteration_in_journal is not None:
+        try:
+            report.proposed_state.iteration = int(original_report.last_iteration_in_journal)
+        except (TypeError, ValueError):
+            pass
+    report.proposed_state.pending_jobs = {}
+    report.proposed_state.shutdown_requested = False
+    report.notes.append(
+        "re-entry at "
+        + retry_phase.value
+        + " after cleaning transient run artefacts"
+    )
+    return True
+
+
 def cmd_reconcile(args: argparse.Namespace) -> int:
     campaign = Path(args.campaign_dir).resolve()
     report = propose_recovery(
@@ -1360,7 +1406,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         print("    ichor-al-daemon reconcile --campaign-dir " + str(campaign) + " --apply")
         return 0
 
-    if report.proposed_state.phase in (CampaignPhase.HALTED, CampaignPhase.DONE):
+    if report.proposed_state.phase is CampaignPhase.DONE:
         print(
             "refusing --apply because proposed state is "
             + report.proposed_state.phase.value,
@@ -1454,6 +1500,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             print("  - " + reason, file=sys.stderr)
         return 9
 
+    original_report = report
     backup_path = None
     if target_canonical.exists():
         from datetime import datetime, timezone
@@ -1464,11 +1511,58 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             target_canonical.name + ".before-reconcile-" + stamp
         )
         shutil.copy2(target_canonical, backup_path)
+    archived_scripts = archive_scripts_for_reconcile(
+        campaign
+    ) if ".DATA/SCRIPTS contains sbatch scripts" in report.unsafe_reasons else []
     archived = archive_data_staging_for_ferebus_reentry(
         campaign,
         report.proposed_state,
     ) if ".DATA/STAGING is non-empty" in report.unsafe_reasons else []
+    removed_model_staging = clean_model_iteration_staging_for_reconcile(
+        campaign,
+        report.proposed_state,
+    ) if "dangling model staging directories exist" in report.unsafe_reasons else []
     removed = clean_reentry_staging(campaign, report.proposed_state.phase)
+
+    if original_report.proposed_state.phase is CampaignPhase.HALTED:
+        report = propose_recovery(
+            campaign,
+            allow_fresh_init_on_nonempty=bool(getattr(args, "allow_fresh_init", False)),
+        )
+        _apply_retry_phase_after_cleaned_halt(report, original_report)
+        target = write_proposed_state(campaign, report)
+        if config is not None:
+            try:
+                config_review = review_config_changes(
+                    campaign,
+                    config,
+                    report.proposed_state,
+                    initialise_missing=False,
+                )
+            except Exception as exc:
+                print("campaign config could not be reviewed: " + str(exc), file=sys.stderr)
+                return 8
+        if report.unsafe_reasons:
+            print(
+                "refusing --apply because cleanup did not produce a safe recovery proposal:",
+                file=sys.stderr,
+            )
+            for reason in report.unsafe_reasons:
+                print("  - " + reason, file=sys.stderr)
+            return 9
+        if report.proposed_state.phase in (CampaignPhase.HALTED, CampaignPhase.DONE):
+            print(
+                "refusing --apply because proposed state is "
+                + report.proposed_state.phase.value
+                + " after cleanup",
+                file=sys.stderr,
+            )
+            return 9
+        if config_review is not None and config_review.blocked_changes:
+            print("refusing --apply because campaign.yaml has locked changes", file=sys.stderr)
+            print(format_config_review(config_review), file=sys.stderr)
+            return 8
+
     target.replace(target_canonical)
     write_state(target_canonical, report.proposed_state)
     for intent_path in sorted(
@@ -1503,9 +1597,14 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             n_allowed_config_changes=(
                 len(config_review.allowed_changes) if config_review is not None else 0
             ),
-            n_removed_stale_paths=len(removed),
+            n_removed_stale_paths=len(removed) + len(removed_model_staging),
             n_archived_staging_paths=len(archived),
             archived_staging_path=(archived[0] if archived else None),
+            n_archived_scripts_paths=len(archived_scripts),
+            archived_scripts_path=(archived_scripts[0] if archived_scripts else None),
+            recomputed_after_transient_cleanup=(
+                original_report.proposed_state.phase is CampaignPhase.HALTED
+            ),
         )
     except Exception:
         pass
@@ -1515,6 +1614,14 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     if removed:
         print("Removed stale uncommitted artefacts:")
         for path in removed:
+            print("  - " + path)
+    if removed_model_staging:
+        print("Removed stale model staging:")
+        for path in removed_model_staging:
+            print("  - " + path)
+    if archived_scripts:
+        print("Archived stale .DATA/SCRIPTS:")
+        for path in archived_scripts:
             print("  - " + path)
     if archived:
         print("Archived stale .DATA/STAGING:")

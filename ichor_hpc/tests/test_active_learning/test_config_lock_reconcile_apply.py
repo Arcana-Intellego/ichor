@@ -2,13 +2,16 @@ import argparse
 import json
 from types import SimpleNamespace
 
+import ichor.hpc.active_learning.cli as cli_mod
 from ichor.hpc.active_learning.cli import cmd_reconcile, cmd_start
 from ichor.hpc.active_learning.config import CampaignConfig
+from ichor.hpc.active_learning.daemon import config_lock as config_lock_mod
 from ichor.hpc.active_learning.daemon.config_lock import (
     config_lock_path,
     review_config_changes,
     write_config_lock,
 )
+from ichor.hpc.active_learning.daemon.reconcile import ReconciliationReport
 from ichor.hpc.active_learning.daemon import submission_intent
 from ichor.hpc.active_learning.daemon.state import (
     CampaignPhase,
@@ -186,6 +189,99 @@ def test_reconcile_apply_archives_data_staging_for_ferebus_reentry(tmp_path, cap
     assert data_staging.is_dir()
     assert list(data_staging.iterdir()) == []
     assert "Archived stale .DATA/STAGING" in out
+
+
+def test_reconcile_apply_cleans_transient_halted_ariadne_reentry(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign(tmp_path)
+    config = CampaignConfig()
+    write_config_lock(campaign, config)
+    _write_config(campaign, config)
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.HALTED
+    state.training_set_version = 0
+    state.models_version = 0
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    scripts = campaign / ".DATA" / "SCRIPTS"
+    (scripts / "OUTPUTS").mkdir(parents=True)
+    (scripts / "ERRORS").mkdir()
+    (scripts / "ARIADNE_ARRAY-0.sh").write_text("# stale\n", encoding="utf-8")
+    (scripts / "ERRORS" / "ARIADNE_ARRAY-0.e").write_text(
+        "old error\n",
+        encoding="utf-8",
+    )
+    model_staging = campaign / "6_TRAINED_MODELS" / "iteration-staging"
+    model_staging.mkdir(parents=True)
+    (model_staging / "stale.model").write_text("stale\n", encoding="utf-8")
+    committed_model = campaign / "6_TRAINED_MODELS" / "iteration-0000"
+    committed_model.mkdir()
+    (committed_model / "marker.txt").write_text("committed\n", encoding="utf-8")
+
+    first_state = fresh_campaign_state(max_iterations=1)
+    first_state.phase = CampaignPhase.HALTED
+    first_state.training_set_version = 0
+    first_state.models_version = 0
+    second_state = fresh_campaign_state(max_iterations=1)
+    second_state.phase = CampaignPhase.STOP_CHECK
+    second_state.training_set_version = 0
+    second_state.models_version = 0
+    reports = iter([
+        ReconciliationReport(
+            proposed_state=first_state,
+            committed_training_versions=[0],
+            committed_model_versions=[0],
+            last_phase_in_journal=CampaignPhase.ARIADNE_ARRAY.value,
+            last_iteration_in_journal=0,
+            notes=["re-entry HALTED because committed artefacts need operator review"],
+            unsafe_reasons=[
+                ".DATA/SCRIPTS contains sbatch scripts",
+                "dangling model staging directories exist",
+            ],
+        ),
+        ReconciliationReport(
+            proposed_state=second_state,
+            committed_training_versions=[0],
+            committed_model_versions=[0],
+            last_phase_in_journal=CampaignPhase.ARIADNE_ARRAY.value,
+            last_iteration_in_journal=0,
+            notes=["re-entry at STOP_CHECK (next tick decides loop/terminate)"],
+            unsafe_reasons=[],
+        ),
+    ])
+
+    monkeypatch.setattr(cli_mod, "propose_recovery", lambda *args, **kwargs: next(reports))
+    monkeypatch.setattr(
+        config_lock_mod,
+        "verify_committed_model_version",
+        lambda *args, **kwargs: None,
+    )
+
+    rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            allow_fresh_init=False,
+            apply=True,
+        )
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    recovered = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
+    assert recovered.phase is CampaignPhase.ARIADNE_ARRAY
+    assert recovered.iteration == 0
+    assert not model_staging.exists()
+    assert (committed_model / "marker.txt").read_text(encoding="utf-8") == "committed\n"
+    archived_scripts = sorted((campaign / ".DATA").glob("SCRIPTS.before-reconcile-*"))
+    assert len(archived_scripts) == 1
+    assert (archived_scripts[0] / "ARIADNE_ARRAY-0.sh").is_file()
+    assert (archived_scripts[0] / "ERRORS" / "ARIADNE_ARRAY-0.e").is_file()
+    assert (scripts / "OUTPUTS").is_dir()
+    assert (scripts / "ERRORS").is_dir()
+    assert "Archived stale .DATA/SCRIPTS" in out
+    assert "Removed stale model staging" in out
 
 
 def test_reconcile_apply_keeps_data_staging_blocked_for_non_ferebus_reentry(tmp_path, capsys):
