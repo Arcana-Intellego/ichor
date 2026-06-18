@@ -48,6 +48,37 @@ _ARIADNE_CARTESIAN_RECOVERY_NEWTON = 2
 _ARIADNE_GEO_BT_DENSE = 1
 _ARIADNE_TRQN_CONTROLLER_NONE = 0
 
+# TRQN get_status_py layout. Keep these names close to the Fortran/starter-pack
+# contract so result.json diagnostics can be decoded without reading raw tuples.
+_TRQN_STATUS_TRUST = 0
+_TRQN_STATUS_RUN_IDX = 2
+_TRQN_STATUS_PROPOSAL_PENDING = 3
+_TRQN_STATUS_INVALID_REASON = 23
+_TRQN_STATUS_STEP_STATE = 35
+_TRQN_STATUS_FORCE_REBUILD = 39
+_TRQN_STATUS_SKIP_STEP_AFTER_REBUILD = 54
+_TRQN_STATUS_CONSECUTIVE_BT_FAIL_COUNT = 65
+
+_TRQN_INVALID_REASON_LABELS = {
+    0: "none",
+    1: "internal_solve_fail",
+    2: "backtransform_fail",
+    3: "unsafe_trial_geometry",
+    4: "rotation_refresh_fail",
+    5: "proposal_not_built",
+}
+_TRQN_INVALID_BACKTRANSFORM_FAIL = 2
+_TRQN_INVALID_PROPOSAL_NOT_BUILT = 5
+
+_TRQN_STEP_STATE_LABELS = {
+    0: "none",
+    1: "good",
+    2: "okay",
+    3: "poor",
+    4: "reject",
+}
+_TRQN_STEP_STATE_REJECT = 4
+
 # when TRQN rejects too many proposals in a row we give up and re-init
 # under DS. three is the value the starter pack uses for
 # recovery_accepts_to_exit which is the closest equivalent.
@@ -104,14 +135,77 @@ def _new_optimiser_diagnostics(optimiser_name: str) -> Dict[str, Any]:
         "n_stage1_calls": 0,
         "n_trial_evaluations": 0,
         "n_no_proposal_pending": 0,
+        "n_no_proposal_invalid": 0,
+        "n_no_proposal_backtransform_fail": 0,
+        "n_no_proposal_proposal_not_built": 0,
+        "n_no_proposal_reject": 0,
+        "n_no_proposal_recoveries": 0,
         "n_skip_step_after_rebuild": 0,
         "n_accepted_steps": 0,
         "n_rejected_steps": 0,
         "n_fallback_to_ds": 0,
         "last_return_code_reason": "not_finished",
+        "last_no_proposal_reason": None,
+        "last_no_proposal_status_summary": None,
         "status_samples_first": [],
         "status_samples_last": [],
     }
+
+
+def _status_int(status, index: int, default: Optional[int] = None) -> Optional[int]:
+    if status is None or len(status) <= int(index):
+        return default
+    try:
+        return int(status[index])
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _status_float(status, index: int, default: Optional[float] = None) -> Optional[float]:
+    if status is None or len(status) <= int(index):
+        return default
+    try:
+        value = float(status[index])
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return value if np.isfinite(value) else default
+
+
+def _status_bool(status, index: int, default: bool = False) -> bool:
+    value = _status_int(status, index, None)
+    if value is None:
+        return default
+    return bool(value)
+
+
+def _trqn_status_summary(status) -> Dict[str, Any]:
+    if not status:
+        return {}
+    invalid_reason = _status_int(status, _TRQN_STATUS_INVALID_REASON, 0)
+    step_state = _status_int(status, _TRQN_STATUS_STEP_STATE, 0)
+    summary = {
+        "trust": _status_float(status, _TRQN_STATUS_TRUST, None),
+        "run_idx": _status_int(status, _TRQN_STATUS_RUN_IDX, None),
+        "proposal_pending": _status_bool(
+            status, _TRQN_STATUS_PROPOSAL_PENDING, False,
+        ),
+        "invalid_reason": invalid_reason,
+        "invalid_reason_label": _TRQN_INVALID_REASON_LABELS.get(
+            invalid_reason, "unknown_" + str(invalid_reason),
+        ),
+        "step_state": step_state,
+        "step_state_label": _TRQN_STEP_STATE_LABELS.get(
+            step_state, "unknown_" + str(step_state),
+        ),
+        "force_rebuild": _status_bool(status, _TRQN_STATUS_FORCE_REBUILD, False),
+        "skip_step_after_rebuild": _status_bool(
+            status, _TRQN_STATUS_SKIP_STEP_AFTER_REBUILD, False,
+        ),
+        "consecutive_bt_fail_count": _status_int(
+            status, _TRQN_STATUS_CONSECUTIVE_BT_FAIL_COUNT, None,
+        ),
+    }
+    return {k: _json_safe_value(v) for k, v in summary.items()}
 
 
 def _append_status_sample(
@@ -125,6 +219,7 @@ def _append_status_sample(
         "step_index": int(step_index),
         "label": str(label),
         "status": _json_safe_status(status),
+        "status_summary": _trqn_status_summary(status),
     }
     first = diagnostics.setdefault("status_samples_first", [])
     if len(first) < 5:
@@ -305,20 +400,46 @@ def _proposal_pending(opt, status) -> bool:
     value = _optimizer_flag(opt, "proposal_pending")
     if value is not None:
         return bool(value)
-    if len(status) > 3:
-        try:
-            return bool(int(status[3]))
-        except (TypeError, ValueError):
-            if isinstance(status[3], (bool, np.bool_)):
-                return bool(status[3])
-    return True
+    return _status_bool(status, _TRQN_STATUS_PROPOSAL_PENDING, True)
 
 
 def _skip_step_after_rebuild(opt, status) -> bool:
     value = _optimizer_flag(opt, "skip_step_after_rebuild")
     if value is not None:
         return bool(value)
-    return False
+    return _status_bool(status, _TRQN_STATUS_SKIP_STEP_AFTER_REBUILD, False)
+
+
+def _trqn_no_proposal_failure_reason(status) -> Optional[str]:
+    invalid_reason = _status_int(status, _TRQN_STATUS_INVALID_REASON, 0)
+    if invalid_reason == _TRQN_INVALID_BACKTRANSFORM_FAIL:
+        return "trqn_no_proposal_backtransform_fail"
+    if invalid_reason == _TRQN_INVALID_PROPOSAL_NOT_BUILT:
+        return "trqn_no_proposal_proposal_not_built"
+    step_state = _status_int(status, _TRQN_STATUS_STEP_STATE, 0)
+    if step_state == _TRQN_STEP_STATE_REJECT:
+        return "trqn_no_proposal_reject"
+    return None
+
+
+def _record_no_proposal_failure(
+    diagnostics: Dict[str, Any],
+    *,
+    reason: str,
+    status,
+) -> None:
+    diagnostics["n_no_proposal_invalid"] = (
+        int(diagnostics.get("n_no_proposal_invalid", 0)) + 1
+    )
+    if reason == "trqn_no_proposal_backtransform_fail":
+        key = "n_no_proposal_backtransform_fail"
+    elif reason == "trqn_no_proposal_proposal_not_built":
+        key = "n_no_proposal_proposal_not_built"
+    else:
+        key = "n_no_proposal_reject"
+    diagnostics[key] = int(diagnostics.get(key, 0)) + 1
+    diagnostics["last_no_proposal_reason"] = str(reason)
+    diagnostics["last_no_proposal_status_summary"] = _trqn_status_summary(status)
 
 
 _TRIAL_REASON_CODES = {
@@ -392,6 +513,22 @@ def _build_ds(ariadne, q0_xyz, g0_xyz, atom_list, run_config):
     return opt
 
 
+def _restart_under_ds(ariadne, atoms, natoms, atom_list, run_config):
+    # Re-evaluate at the exact geometry DS will restart from. Gradients from a
+    # rejected TRQN proposal or a failed backtransform do not belong to this
+    # point and should not be re-used.
+    _f_here, g_here = _eval_energy_gradient(atoms)
+    opt = _build_ds(
+        ariadne,
+        np.asfortranarray(atoms.get_positions(), dtype=np.float64),
+        np.asfortranarray(g_here.reshape(natoms, 3), dtype=np.float64),
+        atom_list,
+        run_config,
+    )
+    _raise_if_init_failed(opt, "DS")
+    return opt
+
+
 def run_optimisation_against_calculator(
     seed_atoms,
     calculator,
@@ -462,6 +599,7 @@ def run_optimisation_against_calculator(
     fell_back_to_ds = False
     rigid_force_clamps = 0
     consecutive_rejects = 0
+    no_proposal_failure_reason: Optional[str] = None
     f_current = e0_hartree
     converged = False
     return_code = 1  # max_iter default until we converge or error
@@ -493,6 +631,15 @@ def run_optimisation_against_calculator(
         )
         proposal_pending = _proposal_pending(opt, status_after_stage0)
         skip_after_rebuild = _skip_step_after_rebuild(opt, status_after_stage0)
+        no_proposal_failure_reason = None
+        if (
+            is_trqn
+            and not proposal_pending
+            and not skip_after_rebuild
+        ):
+            no_proposal_failure_reason = _trqn_no_proposal_failure_reason(
+                status_after_stage0,
+            )
         if (
             not proposal_pending
             or skip_after_rebuild
@@ -533,6 +680,48 @@ def run_optimisation_against_calculator(
                 converged = True
                 return_code = 0
                 break
+            if no_proposal_failure_reason is not None:
+                _record_no_proposal_failure(
+                    diagnostics,
+                    reason=no_proposal_failure_reason,
+                    status=status_after_stage0,
+                )
+                consecutive_rejects += 1
+                if consecutive_rejects >= _REJECT_STREAK_TRIGGER:
+                    if (
+                        is_trqn
+                        and bool(run_config.fallback_to_ds)
+                        and not fell_back_to_ds
+                    ):
+                        try:
+                            opt = _restart_under_ds(
+                                ariadne,
+                                atoms,
+                                natoms,
+                                atom_list,
+                                run_config,
+                            )
+                            n_evaluations += 1
+                            is_trqn = False
+                            fell_back_to_ds = True
+                            diagnostics["n_fallback_to_ds"] += 1
+                            diagnostics["n_no_proposal_recoveries"] += 1
+                            diagnostics["optimiser_final"] = (
+                                "dissipative_symplectic"
+                            )
+                            consecutive_rejects = 0
+                        except Exception as exc:
+                            return_code = 2
+                            diagnostics["last_return_code_reason"] = (
+                                "fallback_to_ds_exception:" + type(exc).__name__
+                            )
+                            break
+                    else:
+                        return_code = 2
+                        diagnostics["last_return_code_reason"] = (
+                            no_proposal_failure_reason
+                        )
+                        break
             continue
 
         # pull the proposed geometry out and push it into the ASE atoms
@@ -629,21 +818,14 @@ def run_optimisation_against_calculator(
             and not fell_back_to_ds
             and consecutive_rejects >= _REJECT_STREAK_TRIGGER):
             try:
-                # the trial gradient belongs to the rejected proposal, not the
-                # geometry we are restarting DS from. re-evaluate here so the
-                # (position, gradient) pair handed to DS actually match up.
-                _f_here, g_here = _eval_energy_gradient(atoms)
-                n_evaluations += 1
-                opt = _build_ds(
+                opt = _restart_under_ds(
                     ariadne,
-                    np.asfortranarray(
-                        atoms.get_positions(), dtype=np.float64,
-                    ),
-                    np.asfortranarray(g_here.reshape(natoms, 3), dtype=np.float64),
+                    atoms,
+                    natoms,
                     atom_list,
                     run_config,
                 )
-                _raise_if_init_failed(opt, "DS")
+                n_evaluations += 1
                 is_trqn = False
                 fell_back_to_ds = True
                 diagnostics["n_fallback_to_ds"] += 1

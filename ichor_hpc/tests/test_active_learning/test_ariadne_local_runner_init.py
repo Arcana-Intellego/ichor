@@ -13,7 +13,9 @@ from ichor.hpc.active_learning.acquisition.ariadne_local_runner import (
     _build_trqn,
     _finalise_optimiser_diagnostics,
     _new_optimiser_diagnostics,
+    run_optimisation_against_calculator,
 )
+import ichor.hpc.active_learning.acquisition.ariadne_local_runner as local_runner
 from ichor.hpc.active_learning.acquisition.ariadne_runner import AriadneRunConfig
 
 
@@ -126,3 +128,234 @@ def test_optimiser_diagnostics_are_json_safe_for_no_trial_path():
     assert diagnostics["last_return_code_reason"] == "max_iterations_no_trial_evaluations"
     assert diagnostics["status_samples_first"][0]["status"] == [1.0, False, "nan"]
     json.dumps(diagnostics)
+
+
+def _trqn_status(
+    *,
+    proposal_pending=0,
+    invalid_reason=2,
+    step_state=4,
+    skip_step_after_rebuild=0,
+    run_idx=0,
+    trust=1.0e-4,
+    consecutive_bt_fail_count=1,
+):
+    status = [0] * 90
+    status[0] = trust
+    status[1] = 0.0
+    status[2] = run_idx
+    status[3] = proposal_pending
+    status[23] = invalid_reason
+    status[35] = step_state
+    status[39] = 1
+    status[54] = skip_step_after_rebuild
+    status[65] = consecutive_bt_fail_count
+    return tuple(status)
+
+
+class _NoProposalTrqn:
+    def __init__(self, *, skip_step_after_rebuild=False):
+        self.q = np.zeros(6, dtype=np.float64)
+        self.g = np.ones(6, dtype=np.float64)
+        self.run_idx = 0
+        self.skip_step_after_rebuild = bool(skip_step_after_rebuild)
+
+    def init(self, **kwargs):
+        self.q = np.asarray(kwargs["q0_xyz"], dtype=np.float64).reshape(-1).copy()
+        self.g = np.asarray(kwargs["g0_xyz"], dtype=np.float64).reshape(-1).copy()
+
+    def step_py(self, *, stage, f_old, f_new, g_xyz_new):
+        if int(stage) == 1:
+            self.run_idx += 1
+
+    def get_status_py(self):
+        return _trqn_status(
+            run_idx=self.run_idx,
+            skip_step_after_rebuild=int(self.skip_step_after_rebuild),
+            consecutive_bt_fail_count=max(1, self.run_idx),
+        )
+
+    def get_state_flat_py(self, q_flat, g_flat):
+        q_flat[:] = self.q
+        g_flat[:] = self.g
+
+
+class _AcceptingDs:
+    def __init__(self):
+        self.q = np.zeros(6, dtype=np.float64)
+        self.g = np.ones(6, dtype=np.float64)
+        self.pending = False
+        self.accepted = False
+        self.converged = False
+        self.f_current = 0.0
+
+    def init(self, **kwargs):
+        self.q = np.asarray(kwargs["q0_xyz"], dtype=np.float64).reshape(-1).copy()
+        self.g = np.asarray(kwargs["g0_xyz"], dtype=np.float64).reshape(-1).copy()
+
+    def proposal_pending(self):
+        return self.pending
+
+    def step_py(self, *, stage, f_old, f_new, g_xyz_new):
+        if int(stage) == 0:
+            self.pending = True
+            self.q = self.q + 0.1
+            return
+        self.pending = False
+        self.accepted = True
+        self.converged = True
+        self.f_current = float(f_new)
+        self.g = np.asarray(g_xyz_new, dtype=np.float64).reshape(-1).copy()
+
+    def get_status_py(self):
+        status = [0] * 12
+        status[2] = self.f_current
+        status[8] = int(self.converged)
+        status[9] = int(self.accepted)
+        return tuple(status)
+
+    def get_state_flat_py(self, q_flat, g_flat):
+        q_flat[:] = self.q
+        g_flat[:] = self.g
+
+
+class _NoProposalTrqnFactory:
+    def __init__(self, *, skip_step_after_rebuild=False):
+        self.skip_step_after_rebuild = bool(skip_step_after_rebuild)
+        self.last = None
+
+    def trust_region_qn(self):
+        self.last = _NoProposalTrqn(
+            skip_step_after_rebuild=self.skip_step_after_rebuild,
+        )
+        return self.last
+
+
+class _AcceptingDsFactory:
+    def __init__(self):
+        self.last = None
+
+    def dissipative_symplectic(self):
+        self.last = _AcceptingDs()
+        return self.last
+
+
+def _fake_runner_ariadne(*, skip_step_after_rebuild=False):
+    trqn = _NoProposalTrqnFactory(
+        skip_step_after_rebuild=skip_step_after_rebuild,
+    )
+    ds = _AcceptingDsFactory()
+    return SimpleNamespace(
+        Geometric_Trqn=trqn,
+        Ds_Optimiser=ds,
+        _trqn_factory=trqn,
+        _ds_factory=ds,
+    )
+
+
+class _FakeAtom:
+    def __init__(self, symbol):
+        self.symbol = str(symbol)
+
+
+class _FakeAtoms:
+    def __init__(self, positions=None):
+        self._symbols = ["O", "H"]
+        self._positions = np.asarray(
+            positions if positions is not None else np.zeros((2, 3)),
+            dtype=np.float64,
+        )
+        self.calc = None
+
+    def copy(self):
+        copied = _FakeAtoms(self._positions.copy())
+        copied.calc = self.calc
+        return copied
+
+    def __len__(self):
+        return 2
+
+    def __iter__(self):
+        return iter([_FakeAtom(s) for s in self._symbols])
+
+    def get_positions(self):
+        return self._positions.copy()
+
+    def set_positions(self, positions):
+        self._positions = np.asarray(positions, dtype=np.float64).reshape(2, 3)
+
+    def get_potential_energy(self):
+        return 0.0
+
+    def get_forces(self):
+        return np.ones((2, 3), dtype=np.float64)
+
+
+def test_repeated_trqn_no_proposal_backtransform_failure_falls_back_to_ds(monkeypatch):
+    ariadne = _fake_runner_ariadne()
+    monkeypatch.setattr(local_runner, "_import_ariadne", lambda: ariadne)
+
+    result = run_optimisation_against_calculator(
+        _FakeAtoms(),
+        calculator=None,
+        run_config=AriadneRunConfig(
+            optimiser="trust_region_qn",
+            max_iter=8,
+            fallback_to_ds=True,
+        ),
+    )
+
+    assert result.return_code == 0
+    assert result.fell_back_to_ds is True
+    assert result.diagnostics["n_no_proposal_pending"] == 3
+    assert result.diagnostics["n_no_proposal_backtransform_fail"] == 3
+    assert result.diagnostics["n_no_proposal_recoveries"] == 1
+    assert result.diagnostics["n_fallback_to_ds"] == 1
+    assert result.diagnostics["optimiser_final"] == "dissipative_symplectic"
+    assert result.n_evaluations == 3
+    assert len(result.candidate_positions_angstrom) == 2
+
+
+def test_repeated_trqn_no_proposal_backtransform_failure_fails_early(monkeypatch):
+    ariadne = _fake_runner_ariadne()
+    monkeypatch.setattr(local_runner, "_import_ariadne", lambda: ariadne)
+
+    result = run_optimisation_against_calculator(
+        _FakeAtoms(),
+        calculator=None,
+        run_config=AriadneRunConfig(
+            optimiser="trust_region_qn",
+            max_iter=8,
+            fallback_to_ds=False,
+        ),
+    )
+
+    assert result.return_code == 2
+    assert result.diagnostics["last_return_code_reason"] == (
+        "trqn_no_proposal_backtransform_fail"
+    )
+    assert result.diagnostics["n_stage0_calls"] == 3
+    assert result.diagnostics["n_no_proposal_backtransform_fail"] == 3
+    assert result.diagnostics["n_fallback_to_ds"] == 0
+
+
+def test_rebuild_skip_no_proposal_path_is_not_classified_as_fatal(monkeypatch):
+    ariadne = _fake_runner_ariadne(skip_step_after_rebuild=True)
+    monkeypatch.setattr(local_runner, "_import_ariadne", lambda: ariadne)
+
+    result = run_optimisation_against_calculator(
+        _FakeAtoms(),
+        calculator=None,
+        run_config=AriadneRunConfig(
+            optimiser="trust_region_qn",
+            max_iter=2,
+            fallback_to_ds=False,
+        ),
+    )
+
+    assert result.return_code == 1
+    assert result.diagnostics["last_return_code_reason"] == (
+        "max_iterations_no_trial_evaluations"
+    )
+    assert result.diagnostics["n_skip_step_after_rebuild"] == 2
+    assert result.diagnostics["n_no_proposal_invalid"] == 0
