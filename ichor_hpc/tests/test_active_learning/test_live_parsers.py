@@ -15,6 +15,7 @@ from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.daemon.live_executor import (
     LIVE_POSTPROCESS_IMPLEMENTED,
     LiveBackendsPhaseExecutor,
+    clean_stale_ariadne_seed_outputs,
 )
 from ichor.hpc.active_learning.daemon import input_staging as stg
 from ichor.hpc.active_learning.daemon.phase_executor import (
@@ -711,6 +712,72 @@ def test_ariadne_parser_all_results_unreadable_fails(tmp_path):
     )
     assert result.failure_reason is not None
     assert "ariadne_no_seed_results_parsed" in result.failure_reason
+
+
+def test_clean_stale_ariadne_seed_outputs_removes_only_results(tmp_path):
+    campaign = tmp_path / "campaign"
+    pool = _seed_ariadne_pool(campaign, iteration=4)
+    seed_dir = pool / "seed_0000"
+    tmp_result = seed_dir / "result.json.1234.abcd.tmp"
+    tmp_result.write_text("partial", encoding="utf-8")
+    protected = pool.parent / "seeds_picked.json"
+    assert protected.is_file()
+
+    removed = clean_stale_ariadne_seed_outputs(campaign, 4)
+
+    assert str(seed_dir / "result.json") in removed
+    assert str(tmp_result) in removed
+    assert not (seed_dir / "result.json").exists()
+    assert not tmp_result.exists()
+    assert protected.is_file()
+    assert seed_dir.is_dir()
+
+
+def test_clean_stale_ariadne_seed_outputs_rejects_non_regular_result(tmp_path):
+    campaign = tmp_path / "campaign"
+    pool = _seed_ariadne_pool(campaign, iteration=4)
+    result = pool / "seed_0000" / "result.json"
+    result.unlink()
+    result.mkdir()
+
+    with pytest.raises(BackendSubmissionError, match="non-regular ARIADNE output"):
+        clean_stale_ariadne_seed_outputs(campaign, 4)
+
+
+class _FakeSbatch:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, args, **kwargs):
+        self.calls.append((list(args), dict(kwargs)))
+        return SimpleNamespace(returncode=0, stdout="12345\n", stderr="")
+
+
+def test_ariadne_submit_cleans_stale_results_before_sbatch(tmp_path):
+    cfg = CampaignConfig()
+    runner = _FakeSbatch()
+    ex = LiveBackendsPhaseExecutor(
+        campaign_dir=tmp_path / "campaign",
+        config=cfg,
+        backend_check=False,
+        sbatch_runner=runner,
+    )
+    pool = _seed_ariadne_pool(tmp_path / "campaign", iteration=4)
+    stale_result = pool / "seed_0000" / "result.json"
+    assert stale_result.is_file()
+
+    result = ex.submit_or_run(
+        SimpleNamespace(iteration=4, campaign_uid="m16-test"),
+        CampaignPhase("ARIADNE_ARRAY"),
+    )
+
+    assert result.submitted_job_id == "12345"
+    assert runner.calls
+    assert not stale_result.exists()
+    events = _read_journal_events(tmp_path / "campaign")
+    cleaned = [e for e in events if e.get("event") == "ariadne_stale_outputs_cleaned"]
+    assert cleaned
+    assert cleaned[-1]["removed"] >= 1
 
 
 

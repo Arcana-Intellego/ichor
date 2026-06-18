@@ -95,6 +95,65 @@ _MODULE_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/+-]*(?: [A-Za-z0-9][A-
 _SHEBANG_RE = re.compile(r"^#![A-Za-z0-9_./ -]+$")
 _SHELL_PATH_FRAGMENT_RE = re.compile(r"^[A-Za-z0-9_./${}:+-]+$")
 
+
+def _iteration_active_learning_dir(campaign_dir: Path, iteration: int) -> Path:
+    return (
+        Path(campaign_dir)
+        / "7_ACTIVE_LEARNING"
+        / ("iteration-" + str(int(iteration)).zfill(4))
+    )
+
+
+def clean_stale_ariadne_seed_outputs(campaign_dir, iteration: int) -> List[str]:
+    """Remove stale per-seed ARIADNE result files before a retry submission.
+
+    Only daemon-owned output files are removed. Seed directories and iteration
+    manifests remain intact, so a retry can still use the same seed list while
+    early Fortran/Python aborts cannot leave misleading old result.json payloads
+    behind.
+    """
+    iter_dir = _iteration_active_learning_dir(Path(campaign_dir), int(iteration))
+    pool_dir = iter_dir / "pool"
+    if not pool_dir.exists():
+        return []
+    if pool_dir.is_symlink() or not pool_dir.is_dir():
+        raise BackendSubmissionError(
+            "refusing to clean ARIADNE pool that is not a real directory: "
+            + str(pool_dir)
+        )
+
+    iter_root = iter_dir.resolve()
+    removed: List[str] = []
+    for seed_dir in sorted(pool_dir.glob("seed_*")):
+        if seed_dir.is_symlink():
+            raise BackendSubmissionError(
+                "refusing to clean symlinked ARIADNE seed directory: "
+                + str(seed_dir)
+            )
+        if not seed_dir.is_dir():
+            continue
+        candidates = [seed_dir / "result.json"]
+        candidates.extend(sorted(seed_dir.glob("result.json.*.tmp")))
+        for target in candidates:
+            if not target.exists() and not target.is_symlink():
+                continue
+            resolved = target.resolve()
+            try:
+                resolved.relative_to(iter_root)
+            except ValueError as exc:
+                raise BackendSubmissionError(
+                    "refusing to clean ARIADNE output outside iteration dir: "
+                    + str(target)
+                ) from exc
+            if target.is_symlink() or not target.is_file():
+                raise BackendSubmissionError(
+                    "refusing to remove non-regular ARIADNE output: "
+                    + str(target)
+                )
+            target.unlink()
+            removed.append(str(target))
+    return removed
+
 #  SBATCH-phase postprocess refusal guard.
 #
 #
@@ -781,6 +840,18 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 raise BackendSubmissionError(
                     "nothing to submit for " + phase_name + ": staged 0 points/seeds"
                 )
+            if phase_name == "ARIADNE_ARRAY":
+                removed = clean_stale_ariadne_seed_outputs(
+                    self.campaign_dir,
+                    int(getattr(state, "iteration", 0)),
+                )
+                if removed:
+                    self._journal_event(
+                        "ariadne_stale_outputs_cleaned",
+                        iteration=int(getattr(state, "iteration", 0)),
+                        removed=int(len(removed)),
+                        sample=[str(p) for p in removed[:5]],
+                    )
             script = self._write_real_script(phase_name, state, array_size)
         except BackendSubmissionError:
             raise
