@@ -622,6 +622,161 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return cmd_start(args)
 
 
+def _intent_phase_iteration(intent: Dict[str, Any]) -> Tuple[str, int]:
+    phase = str(intent.get("phase") or "")
+    try:
+        iteration = int(intent.get("iteration"))
+    except Exception:
+        iteration = -1
+    return phase, iteration
+
+
+def _matching_sacct_observations(job_id: str, observations: Sequence[Any]) -> List[Any]:
+    prefix = str(job_id) + "_"
+    return [
+        observation
+        for observation in observations
+        if str(getattr(observation, "job_id", "")) == str(job_id)
+        or str(getattr(observation, "job_id", "")).startswith(prefix)
+    ]
+
+
+def _terminal_sacct_state_for_intent(
+    job_id: str,
+    observations: Sequence[Any],
+) -> Tuple[Optional[str], str, int]:
+    from .submit import sacct_poll
+
+    matching = _matching_sacct_observations(job_id, observations)
+    if not matching:
+        return None, "sacct returned no rows for job " + str(job_id), 0
+    states = [observation.status for observation in matching]
+    if any(state in sacct_poll.NON_TERMINAL_STATES for state in states):
+        return None, "sacct still has non-terminal rows for job " + str(job_id), len(matching)
+    if any(state == sacct_poll.JobStatus.UNKNOWN for state in states):
+        return None, "sacct returned UNKNOWN rows for job " + str(job_id), len(matching)
+    if not all(state in sacct_poll.TERMINAL_STATES for state in states):
+        return None, "sacct rows are not conclusively terminal for job " + str(job_id), len(matching)
+    failures = [state for state in states if state in sacct_poll.FAILURE_STATES]
+    if failures:
+        return failures[0].value, "", len(matching)
+    return (
+        None,
+        "sacct shows successful completion; reconcile will not clear "
+        "the intent without postprocess verification",
+        len(matching),
+    )
+
+
+def _resolve_terminal_submission_intents_for_apply(
+    campaign: Path,
+    active_intents: Sequence[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Make conclusively terminal active intents inactive before safe apply.
+
+    This is intentionally fail-closed.  ``reconcile --apply`` may clear a stale
+    active intent only when ``squeue`` no longer sees the job and ``sacct``
+    reports terminal rows for the recorded JobID.  Missing scheduler data keeps
+    the intent blocking so an operator cannot accidentally duplicate a live job.
+    """
+    from .daemon.journal import append_event
+    from .submit import sacct_poll
+
+    terminal_candidates: List[Dict[str, Any]] = []
+    blocking: List[Dict[str, Any]] = []
+    for intent in active_intents:
+        phase, iteration = _intent_phase_iteration(intent)
+        job_id = str(intent.get("job_id") or "")
+        if not phase or iteration < 0:
+            blocking.append({
+                "phase": phase,
+                "iteration": iteration,
+                "job_id": job_id,
+                "reason": "submission intent has malformed phase or iteration",
+            })
+            continue
+        if not job_id:
+            blocking.append({
+                "phase": phase,
+                "iteration": iteration,
+                "job_id": job_id,
+                "reason": "submission intent has no job_id",
+            })
+            continue
+        queue_lookup = sacct_poll.find_active_job_by_id_detailed(job_id)
+        if queue_lookup.inconclusive:
+            blocking.append({
+                "phase": phase,
+                "iteration": iteration,
+                "job_id": job_id,
+                "reason": "squeue lookup inconclusive: " + str(queue_lookup.error or "unknown error"),
+            })
+            continue
+        if queue_lookup.active:
+            blocking.append({
+                "phase": phase,
+                "iteration": iteration,
+                "job_id": job_id,
+                "reason": "job is still active in squeue",
+            })
+            continue
+        try:
+            observations = sacct_poll.poll_job(job_id)
+        except Exception as exc:
+            blocking.append({
+                "phase": phase,
+                "iteration": iteration,
+                "job_id": job_id,
+                "reason": "sacct lookup failed: " + type(exc).__name__ + ": " + str(exc),
+            })
+            continue
+        terminal_state, reason, n_rows = _terminal_sacct_state_for_intent(
+            job_id,
+            observations,
+        )
+        if terminal_state is None:
+            blocking.append({
+                "phase": phase,
+                "iteration": iteration,
+                "job_id": job_id,
+                "reason": reason,
+            })
+            continue
+        terminal_candidates.append({
+            "phase": phase,
+            "iteration": iteration,
+            "job_id": job_id,
+            "terminal_state": terminal_state,
+            "n_sacct_rows": n_rows,
+        })
+    if blocking:
+        return [], blocking
+    resolved: List[Dict[str, Any]] = []
+    for candidate in terminal_candidates:
+        phase = str(candidate["phase"])
+        iteration = int(candidate["iteration"])
+        terminal_state = str(candidate["terminal_state"])
+        failure_reason = "reconcile_apply_terminal_job:" + terminal_state
+        _submission_intent.mark_failed(
+            campaign,
+            phase,
+            iteration,
+            failure_reason,
+        )
+        payload = dict(candidate)
+        payload["reason"] = failure_reason
+        resolved.append(payload)
+        try:
+            append_event(
+                campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
+                "reconcile_resolved_terminal_intent",
+                **payload,
+            )
+        except Exception:
+            pass
+    return resolved, blocking
+
+
 def cmd_reconcile(args: argparse.Namespace) -> int:
     campaign = Path(args.campaign_dir).resolve()
     report = propose_recovery(
@@ -693,6 +848,49 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 9
+    if report.active_submission_intents:
+        resolved_intents, blocking_intents = _resolve_terminal_submission_intents_for_apply(
+            campaign,
+            report.active_submission_intents,
+        )
+        if blocking_intents:
+            print(
+                "refusing --apply because active submission intents are still live "
+                "or scheduler status is inconclusive:",
+                file=sys.stderr,
+            )
+            for item in blocking_intents:
+                print(
+                    "  - "
+                    + str(item.get("phase"))
+                    + "@"
+                    + str(item.get("iteration"))
+                    + " job_id="
+                    + str(item.get("job_id"))
+                    + ": "
+                    + str(item.get("reason")),
+                    file=sys.stderr,
+                )
+            return 9
+        if resolved_intents:
+            print("Resolved terminal submission intents:")
+            for item in resolved_intents:
+                print(
+                    "  - "
+                    + str(item.get("phase"))
+                    + "@"
+                    + str(item.get("iteration"))
+                    + " job_id="
+                    + str(item.get("job_id"))
+                    + " terminal_state="
+                    + str(item.get("terminal_state"))
+                )
+            report.active_submission_intents = []
+            report.unsafe_reasons = [
+                reason
+                for reason in report.unsafe_reasons
+                if not str(reason).startswith("active submission intent(s) present:")
+            ]
     if report.active_submission_intents:
         print(
             "refusing --apply while active submission intents are present",
