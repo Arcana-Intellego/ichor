@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -74,6 +74,87 @@ class OptimisationResult:
     candidate_positions_angstrom: List[np.ndarray]
     candidate_alphas: List[float]
     candidate_grad_norms: List[float]
+    diagnostics: Dict[str, Any]
+
+
+def _json_safe_value(value):
+    if isinstance(value, np.generic):
+        value = value.item()
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return value if np.isfinite(value) else str(value)
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return value if np.isfinite(value) else str(value)
+
+
+def _json_safe_status(status) -> List[Any]:
+    return [_json_safe_value(value) for value in tuple(status or ())]
+
+
+def _new_optimiser_diagnostics(optimiser_name: str) -> Dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "optimiser_initial": str(optimiser_name),
+        "optimiser_final": str(optimiser_name),
+        "n_stage0_calls": 0,
+        "n_stage1_calls": 0,
+        "n_trial_evaluations": 0,
+        "n_no_proposal_pending": 0,
+        "n_skip_step_after_rebuild": 0,
+        "n_accepted_steps": 0,
+        "n_rejected_steps": 0,
+        "n_fallback_to_ds": 0,
+        "last_return_code_reason": "not_finished",
+        "status_samples_first": [],
+        "status_samples_last": [],
+    }
+
+
+def _append_status_sample(
+    diagnostics: Dict[str, Any],
+    *,
+    step_index: int,
+    label: str,
+    status,
+) -> None:
+    sample = {
+        "step_index": int(step_index),
+        "label": str(label),
+        "status": _json_safe_status(status),
+    }
+    first = diagnostics.setdefault("status_samples_first", [])
+    if len(first) < 5:
+        first.append(dict(sample))
+    last = diagnostics.setdefault("status_samples_last", [])
+    last.append(dict(sample))
+    del last[:-5]
+
+
+def _finalise_optimiser_diagnostics(
+    diagnostics: Dict[str, Any],
+    *,
+    return_code: int,
+    converged: bool,
+) -> None:
+    diagnostics["return_code"] = int(return_code)
+    diagnostics["converged"] = bool(converged)
+    if str(diagnostics.get("last_return_code_reason")) != "not_finished":
+        return
+    if int(return_code) == 0:
+        diagnostics["last_return_code_reason"] = "converged"
+    elif int(return_code) == 1:
+        if int(diagnostics.get("n_trial_evaluations", 0)) == 0:
+            diagnostics["last_return_code_reason"] = "max_iterations_no_trial_evaluations"
+        elif int(diagnostics.get("n_accepted_steps", 0)) == 0:
+            diagnostics["last_return_code_reason"] = "max_iterations_no_accepted_steps"
+        else:
+            diagnostics["last_return_code_reason"] = "max_iterations"
+    else:
+        diagnostics["last_return_code_reason"] = "optimiser_error"
 
 
 def _import_ariadne():
@@ -366,6 +447,7 @@ def run_optimisation_against_calculator(
             "unknown ariadne.optimiser " + repr(run_config.optimiser)
             + "; valid: trust_region_qn | dissipative_symplectic"
         )
+    diagnostics = _new_optimiser_diagnostics(optimiser_name)
 
     _raise_if_init_failed(opt, "DS" if not is_trqn else "TRQN")
 
@@ -392,29 +474,55 @@ def run_optimisation_against_calculator(
         # stage 0 -- propose a step. ariadne does not need a trial
         # energy yet so we pass the previous f and a zero gradient.
         try:
+            diagnostics["n_stage0_calls"] += 1
             opt.step_py(
                 stage=0, f_old=f_old, f_new=f_old, g_xyz_new=zero_grad,
             )
-        except Exception:
+        except Exception as exc:
             return_code = 2
+            diagnostics["last_return_code_reason"] = (
+                "stage0_exception:" + type(exc).__name__
+            )
             break
         status_after_stage0 = _status_tuple(opt)
+        _append_status_sample(
+            diagnostics,
+            step_index=step_idx,
+            label="after_stage0",
+            status=status_after_stage0,
+        )
+        proposal_pending = _proposal_pending(opt, status_after_stage0)
+        skip_after_rebuild = _skip_step_after_rebuild(opt, status_after_stage0)
         if (
-            not _proposal_pending(opt, status_after_stage0)
-            or _skip_step_after_rebuild(opt, status_after_stage0)
+            not proposal_pending
+            or skip_after_rebuild
         ):
+            if not proposal_pending:
+                diagnostics["n_no_proposal_pending"] += 1
+            if skip_after_rebuild:
+                diagnostics["n_skip_step_after_rebuild"] += 1
             q_current, g_current = _sync_state(opt, natoms)
             _push_positions(atoms, q_current)
             try:
+                diagnostics["n_stage1_calls"] += 1
                 opt.step_py(
                     stage=1,
                     f_old=f_old,
                     f_new=f_old,
                     g_xyz_new=_flatten_xyz(g_current),
                 )
-            except Exception:
+            except Exception as exc:
                 return_code = 2
+                diagnostics["last_return_code_reason"] = (
+                    "no_proposal_stage1_exception:" + type(exc).__name__
+                )
                 break
+            _append_status_sample(
+                diagnostics,
+                step_index=step_idx,
+                label="after_no_proposal_stage1",
+                status=_status_tuple(opt),
+            )
             if is_trqn:
                 opt_converged, accepted, f_current = _status_trqn(opt)
             else:
@@ -435,12 +543,14 @@ def run_optimisation_against_calculator(
         try:
             f_trial, g_trial = _eval_energy_gradient(atoms)
             n_evaluations += 1
+            diagnostics["n_trial_evaluations"] += 1
         except Exception as exc:
             _set_invalid_trial_reason(opt, type(exc).__name__ + ": " + str(exc))
             try:
                 _q_current, g_current = _sync_state(opt, natoms)
                 if not np.isfinite(g_current).all():
                     g_current = zero_grad
+                diagnostics["n_stage1_calls"] += 1
                 opt.step_py(
                     stage=1,
                     f_old=f_old,
@@ -450,18 +560,31 @@ def run_optimisation_against_calculator(
             except Exception:
                 pass
             return_code = 2
+            diagnostics["last_return_code_reason"] = (
+                "trial_evaluation_exception:" + type(exc).__name__
+            )
             break
 
         # stage 1 -- ariadne sees the trial energy + gradient and
         # decides whether to accept, reject, or declare convergence.
         try:
+            diagnostics["n_stage1_calls"] += 1
             opt.step_py(
                 stage=1, f_old=f_old, f_new=float(f_trial),
                 g_xyz_new=g_trial,
             )
-        except Exception:
+        except Exception as exc:
             return_code = 2
+            diagnostics["last_return_code_reason"] = (
+                "stage1_exception:" + type(exc).__name__
+            )
             break
+        _append_status_sample(
+            diagnostics,
+            step_index=step_idx,
+            label="after_stage1",
+            status=_status_tuple(opt),
+        )
 
         q_current, _g_current = _sync_state(opt, natoms)
         _push_positions(atoms, q_current)
@@ -475,6 +598,7 @@ def run_optimisation_against_calculator(
         grad_norm_trajectory.append(float(np.linalg.norm(g_trial)))
 
         if accepted:
+            diagnostics["n_accepted_steps"] += 1
             consecutive_rejects = 0
             candidate_positions.append(
                 np.asarray(atoms.get_positions(), dtype=np.float64).copy()
@@ -482,6 +606,7 @@ def run_optimisation_against_calculator(
             candidate_alphas.append(float(-float(f_current)))
             candidate_grad_norms.append(float(np.linalg.norm(g_trial)))
         else:
+            diagnostics["n_rejected_steps"] += 1
             consecutive_rejects += 1
 
         if opt_converged:
@@ -521,9 +646,14 @@ def run_optimisation_against_calculator(
                 _raise_if_init_failed(opt, "DS")
                 is_trqn = False
                 fell_back_to_ds = True
+                diagnostics["n_fallback_to_ds"] += 1
+                diagnostics["optimiser_final"] = "dissipative_symplectic"
                 consecutive_rejects = 0
-            except Exception:
+            except Exception as exc:
                 return_code = 2
+                diagnostics["last_return_code_reason"] = (
+                    "fallback_to_ds_exception:" + type(exc).__name__
+                )
                 break
 
     # the adversarial calculator subscripts the clamp counter as a dict;
@@ -537,6 +667,12 @@ def run_optimisation_against_calculator(
             )
         except (TypeError, ValueError):
             rigid_force_clamps = 0
+
+    _finalise_optimiser_diagnostics(
+        diagnostics,
+        return_code=int(return_code),
+        converged=bool(converged),
+    )
 
     return OptimisationResult(
         final_positions_angstrom=np.asarray(
@@ -553,4 +689,5 @@ def run_optimisation_against_calculator(
         candidate_positions_angstrom=candidate_positions,
         candidate_alphas=candidate_alphas,
         candidate_grad_norms=candidate_grad_norms,
+        diagnostics=diagnostics,
     )

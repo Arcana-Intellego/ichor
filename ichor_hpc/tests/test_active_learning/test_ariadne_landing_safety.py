@@ -45,6 +45,21 @@ class _FakeAcquisition:
             risk_penalty_score=0.0,
             mean_energy=x,
             energy_variance=abs(x),
+            raw_energy_risk=abs(x),
+            energy_risk=abs(x),
+            banded_energy_risk=None,
+            calibrated_expected_iqa_error_ha=None,
+            calibration_applied=False,
+            spectral_frequency_risk=0.0,
+            legacy_frequency_risk=0.0,
+            fullspace_residual_distance=0.0,
+            fullspace_residual_penalty=0.0,
+            aligned_rmsd_ang=abs(x),
+            aligned_rmsd_penalty=0.0,
+            observable_score=x,
+            outlier_penalty_score=0.0,
+            fallback_reasons=[],
+            mode_evaluations=[],
             chemistry_penalty=0.0,
             distance_penalty=x * x,
         )
@@ -135,3 +150,31 @@ def test_no_safe_non_seed_landing_rejects_seed():
     )
     assert out["landing_safety"]["accepted"] is False
     assert "no_safe_non_seed_landing" in out["landing_safety"]["reasons"]
+
+
+def test_seed_equivalent_raw_final_rejects_when_seed_fallback_disabled():
+    out = _select(raw_x=0.0, candidate_xs=[], safety=_safety())
+
+    safety = out["landing_safety"]
+    assert safety["accepted"] is False
+    assert safety["policy"] == "unsafe_raw_final"
+    assert "no_safe_non_seed_landing" in safety["reasons"]
+    assert "ariadne_landing_is_seed" in safety["reasons"]
+    assert "seed_fallback_disabled" in safety["reasons"]
+    assert safety["raw_final"]["accepted"] is False
+    assert safety["raw_final"]["metrics"]["seed_equivalent"] is True
+
+
+def test_seed_equivalent_raw_final_accepts_only_when_seed_fallback_enabled():
+    out = _select(
+        raw_x=0.0,
+        candidate_xs=[],
+        safety=_safety(allow_seed_fallback=True),
+    )
+
+    safety = out["landing_safety"]
+    assert safety["accepted"] is True
+    assert safety["policy"] == "seed_fallback"
+    assert safety["selected_origin"] == "seed_fallback"
+    assert "ariadne_landing_is_seed" in safety["record_only_reasons"]
+    assert safety["metrics"]["seed_equivalent"] is True

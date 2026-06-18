@@ -84,6 +84,7 @@ class AriadneRunResult:
     landing_safety: Optional[Dict[str, Any]] = None
     landing_candidates: List[Dict[str, Any]] = field(default_factory=list)
     selection_diagnostics: Optional[Dict[str, Any]] = None
+    optimiser_diagnostics: Optional[Dict[str, Any]] = None
 
     @property
     def alpha_initial(self) -> Optional[float]:
@@ -131,6 +132,8 @@ class AriadneRunResult:
             data["landing_candidates"] = [dict(c) for c in self.landing_candidates]
         if self.selection_diagnostics is not None:
             data["selection_diagnostics"] = dict(self.selection_diagnostics)
+        if self.optimiser_diagnostics is not None:
+            data["optimiser_diagnostics"] = dict(self.optimiser_diagnostics)
         return data
 
 
@@ -295,8 +298,14 @@ def _evaluate_landing_candidate(
 
     if coords.shape != seed_coords.shape or not np.all(np.isfinite(coords)):
         reasons.append("ariadne_landing_geometry_nonfinite")
-    if coords.shape == seed_coords.shape and np.allclose(coords, seed_coords):
-        record_only.append("ariadne_landing_is_seed")
+    seed_equivalent = _is_seed_equivalent(seed_coords, coords)
+    metrics["seed_equivalent"] = bool(seed_equivalent)
+    if seed_equivalent:
+        if bool(_cfg_value(safety_config, "allow_seed_fallback", False)):
+            record_only.append("ariadne_landing_is_seed")
+        else:
+            reasons.append("ariadne_landing_is_seed")
+            reasons.append("seed_fallback_disabled")
 
     max_disp = _safe_float_or_none(
         _cfg_value(quality_gates, "ariadne_max_displacement_ang", None)
@@ -541,6 +550,17 @@ def _duplicate_coords(coords: np.ndarray, existing: Sequence[np.ndarray]) -> boo
     return any(np.allclose(coords, prev, atol=1.0e-12, rtol=1.0e-12) for prev in existing)
 
 
+def _is_seed_equivalent(seed_coords: np.ndarray, coords: np.ndarray) -> bool:
+    coords = np.asarray(coords, dtype=float)
+    seed_coords = np.asarray(seed_coords, dtype=float)
+    return (
+        coords.shape == seed_coords.shape
+        and np.all(np.isfinite(coords))
+        and np.all(np.isfinite(seed_coords))
+        and np.allclose(coords, seed_coords, atol=1.0e-12, rtol=1.0e-12)
+    )
+
+
 def _select_safe_landing(
     *,
     acquisition: SeedLocalAdversarialAcquisition,
@@ -585,9 +605,6 @@ def _select_safe_landing(
     salvage = bool(_cfg_value(safety_config, "salvage_safe_iterate", True))
     for k, coords in enumerate(opt_candidate_positions):
         coords = np.asarray(coords, dtype=float).reshape(-1, 3)
-        if k == 0 and not bool(_cfg_value(safety_config, "allow_seed_fallback", False)):
-            seen_coords.append(coords.copy())
-            continue
         if k > 0 and not salvage:
             seen_coords.append(coords.copy())
             continue
@@ -672,7 +689,10 @@ def _select_safe_landing(
             key=_rank,
         )
         selected_origin = str(selected.get("origin", "unknown"))
-        if selected_origin == "raw_final":
+        if bool(selected.get("metrics", {}).get("seed_equivalent", False)):
+            policy = "seed_fallback"
+            selected_origin = "seed_fallback"
+        elif selected_origin == "raw_final":
             policy = "raw_final"
         elif selected_origin == "backtrack":
             policy = "backtracked"
@@ -955,6 +975,7 @@ def _live_optimise_seed(
         landing_safety=landing["landing_safety"],
         landing_candidates=landing["landing_candidates"],
         selection_diagnostics=selection_diagnostics,
+        optimiser_diagnostics=dict(opt_result.diagnostics or {}),
     )
 
 

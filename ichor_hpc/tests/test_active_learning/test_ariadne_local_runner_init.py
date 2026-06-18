@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import json
 
 import numpy as np
 
@@ -7,8 +8,11 @@ from ichor.hpc.active_learning.acquisition.ariadne_local_runner import (
     _ARIADNE_GEO_BT_DENSE,
     _ARIADNE_ROT_PRIMITIVE_EXPMAP3,
     _ARIADNE_TRQN_CONTROLLER_NONE,
+    _append_status_sample,
     _build_ds,
     _build_trqn,
+    _finalise_optimiser_diagnostics,
+    _new_optimiser_diagnostics,
 )
 from ichor.hpc.active_learning.acquisition.ariadne_runner import AriadneRunConfig
 
@@ -100,3 +104,25 @@ def test_ds_init_forwards_ariadne_geometry_enum_defaults():
     assert kwargs["gamma"] == 0.4
     assert kwargs["f_tol"] == 1.0e-5
     assert kwargs["gradf_tol"] == 2.0e-4
+
+
+def test_optimiser_diagnostics_are_json_safe_for_no_trial_path():
+    diagnostics = _new_optimiser_diagnostics("trust_region_qn")
+    diagnostics["n_stage0_calls"] = 3
+    diagnostics["n_no_proposal_pending"] = 3
+    _append_status_sample(
+        diagnostics,
+        step_index=0,
+        label="after_stage0",
+        status=(np.float64(1.0), np.bool_(False), float("nan")),
+    )
+
+    _finalise_optimiser_diagnostics(
+        diagnostics,
+        return_code=1,
+        converged=False,
+    )
+
+    assert diagnostics["last_return_code_reason"] == "max_iterations_no_trial_evaluations"
+    assert diagnostics["status_samples_first"][0]["status"] == [1.0, False, "nan"]
+    json.dumps(diagnostics)

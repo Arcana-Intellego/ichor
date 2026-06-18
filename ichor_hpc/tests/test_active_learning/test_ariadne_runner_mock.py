@@ -105,6 +105,27 @@ def test_mock_to_dict_contains_landing_safety_payload():
     assert "raw_final_coordinates" in d
 
 
+def test_to_dict_includes_optional_optimiser_diagnostics():
+    seed = _water()
+    out = AriadneRunResult(
+        initial_atoms=seed,
+        final_atoms=seed,
+        optimiser_diagnostics={
+            "schema_version": 1,
+            "last_return_code_reason": "max_iterations_no_trial_evaluations",
+        },
+    )
+
+    d = out.to_dict()
+
+    assert d["optimiser_diagnostics"]["schema_version"] == 1
+    assert (
+        d["optimiser_diagnostics"]["last_return_code_reason"]
+        == "max_iterations_no_trial_evaluations"
+    )
+    json.dumps(d)
+
+
 def test_alpha_initial_and_final_properties():
     seed = _water()
     out = optimise_seed(models=None, seed=seed, trajectory=[seed], mock=True)
