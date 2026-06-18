@@ -4,6 +4,15 @@ from typing import Optional
 import numpy as np
 
 
+def _flat_kernel_params(value) -> np.ndarray:
+    if isinstance(value, (list, tuple)):
+        parts = [_flat_kernel_params(part) for part in value]
+        if not parts:
+            return np.array([], dtype=float)
+        return np.concatenate(parts)
+    return np.asarray(value, dtype=float).reshape(-1)
+
+
 class Kernel(ABC):
     """Base class for all kernels that implements dunder methods for addition or multiplication of separate kernels"""
 
@@ -80,7 +89,9 @@ class CompositeKernel(Kernel, ABC):
 
     @property
     def params(self) -> np.ndarray:
-        return np.concatenate(self.k1.params, self.k2.params)
+        return np.concatenate(
+            (_flat_kernel_params(self.k1.params), _flat_kernel_params(self.k2.params))
+        )
 
     @property
     def nkernel(self) -> int:
@@ -127,7 +138,9 @@ class KernelProd(CompositeKernel):
 
     @property
     def params(self):
-        return np.concatenate(self.k1.params, self.k2.params)
+        return np.concatenate(
+            (_flat_kernel_params(self.k1.params), _flat_kernel_params(self.k2.params))
+        )
 
     def k(self, xi, xj):
         return self.k1.k(xi, xj) * self.k2.k(xi, xj)
