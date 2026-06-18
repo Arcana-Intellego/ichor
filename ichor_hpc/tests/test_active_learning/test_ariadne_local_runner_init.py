@@ -2,17 +2,21 @@ from types import SimpleNamespace
 import json
 
 import numpy as np
+import pytest
 
 from ichor.hpc.active_learning.acquisition.ariadne_local_runner import (
     _ARIADNE_CARTESIAN_RECOVERY_NEWTON,
     _ARIADNE_GEO_BT_DENSE,
     _ARIADNE_ROT_PRIMITIVE_EXPMAP3,
     _ARIADNE_TRQN_CONTROLLER_NONE,
+    _DS_INIT_PROFILE,
     _append_status_sample,
     _build_ds,
     _build_trqn,
+    _ds_safe_init_kwargs,
     _finalise_optimiser_diagnostics,
     _new_optimiser_diagnostics,
+    _validate_ds_init_kwargs,
     run_optimisation_against_calculator,
 )
 import ichor.hpc.active_learning.acquisition.ariadne_local_runner as local_runner
@@ -108,6 +112,73 @@ def test_ds_init_forwards_ariadne_geometry_enum_defaults():
     assert kwargs["gradf_tol"] == 2.0e-4
     assert kwargs["hpos_estimator"] == "syev"
     assert kwargs["lanczos_k"] == 4
+    assert kwargs["hessian_model"] == "almlof"
+    assert kwargs["ds_controller"] == "safe"
+    assert kwargs["block_scale_seed_mode"] == "uniform"
+    assert kwargs["block_coupling_mode"] == "row_gram"
+    assert kwargs["block_transfer_mode"] == "weighted"
+    assert kwargs["delta0"] == 0.3
+    assert kwargs["delta_min"] > 0.0
+    assert kwargs["delta_max"] >= kwargs["delta0"]
+    assert kwargs["delta_grow"] > 1.0
+    assert 0.0 < kwargs["delta_shrink"] < 1.0
+    assert kwargs["h_min"] > 0.0
+    assert kwargs["h_max"] >= kwargs["h"]
+    assert kwargs["gamma_min"] > 0.0
+    assert kwargs["gamma_max"] >= kwargs["gamma"]
+    assert kwargs["cart_step_inf_max"] > 0.0
+    assert kwargs["cart_step_rms_max"] > 0.0
+    assert kwargs["cart_atom_step_max"] > 0.0
+    assert kwargs["cart_min_pair_dist"] > 0.0
+    assert kwargs["htvi_p_bregman"] == 2.0
+    assert kwargs["htvi_gamma_0"] > 0.0
+    assert kwargs["htvi_max_inner"] >= 1
+    assert kwargs["htvi_picard_max"] >= 1
+    assert kwargs["htvi_picard_tol_m"] > 0.0
+    assert kwargs["geo_sol_dt"] > 0.0
+    assert kwargs["geo_sol_tol"] > 0.0
+    assert kwargs["bt_ic_tol"] > 0.0
+    assert kwargs["max_backtransform_iter"] >= 1
+    assert kwargs["finish_after_uphill"] >= 1
+    assert kwargs["finish_small_step_streak"] >= 1
+    assert kwargs["finish_small_gmax_cap"] >= kwargs["finish_gmax_trigger"]
+    assert kwargs["delta_regrow_step_frac"] > 0.0
+    assert kwargs["controller_de_tol"] >= 0.0
+    assert kwargs["finish_stall_window"] >= 1
+    assert kwargs["finish_delta_grow"] > 1.0
+    assert 0.0 < kwargs["finish_delta_shrink"] < 1.0
+    assert kwargs["contact_max_edges_per_node"] >= 1
+    assert kwargs["soft_capacity"] >= 1
+    assert kwargs["soft_pulse_momentum_policy"] == 1
+    assert kwargs["soft_negative_curvature_policy"] == 1
+    assert kwargs["contact_participation_metric_mode"] == 2
+
+
+def test_ds_safe_init_kwargs_validate_starter_pack_sensitive_defaults():
+    kwargs = _ds_safe_init_kwargs(
+        AriadneRunConfig(delta0=0.2, delta_max=0.5, gamma=0.4, hessian_model="schlegel")
+    )
+
+    assert kwargs["hessian_model"] == "schlegel"
+    assert kwargs["hpos_estimator"] == "syev"
+    assert kwargs["lanczos_k"] == 4
+    assert kwargs["htvi_p_bregman"] == 2.0
+    assert kwargs["htvi_gamma_0"] > 0.0
+    assert kwargs["h_max"] >= kwargs["h"]
+    assert kwargs["gamma_max"] >= kwargs["gamma"]
+    assert kwargs["block_scale_seed_mode"] == "uniform"
+    assert kwargs["block_coupling_mode"] == "row_gram"
+    assert kwargs["block_transfer_mode"] == "weighted"
+
+
+def test_ds_safe_init_validation_rejects_bad_profile_values():
+    kwargs = _ds_safe_init_kwargs(AriadneRunConfig())
+    kwargs["htvi_p_bregman"] = 0.0
+    kwargs["lanczos_k"] = 0
+    kwargs["block_coupling_mode"] = "none"
+
+    with pytest.raises(ValueError, match="invalid DS init defaults"):
+        _validate_ds_init_kwargs(kwargs)
 
 
 def test_optimiser_diagnostics_are_json_safe_for_no_trial_path():
@@ -315,11 +386,14 @@ def test_repeated_trqn_no_proposal_backtransform_failure_falls_back_to_ds(monkey
     assert result.diagnostics["n_no_proposal_backtransform_fail"] == 3
     assert result.diagnostics["n_no_proposal_recoveries"] == 1
     assert result.diagnostics["n_fallback_to_ds"] == 1
+    assert result.diagnostics["ds_init_profile"] == _DS_INIT_PROFILE
     assert result.diagnostics["optimiser_final"] == "dissipative_symplectic"
     assert result.n_evaluations == 3
     assert len(result.candidate_positions_angstrom) == 2
     assert ariadne._ds_factory.last.init_kwargs["hpos_estimator"] == "syev"
     assert ariadne._ds_factory.last.init_kwargs["lanczos_k"] == 4
+    assert ariadne._ds_factory.last.init_kwargs["htvi_p_bregman"] == 2.0
+    assert ariadne._ds_factory.last.init_kwargs["htvi_gamma_0"] > 0.0
 
 
 def test_repeated_trqn_no_proposal_backtransform_failure_fails_early(monkeypatch):
@@ -343,6 +417,7 @@ def test_repeated_trqn_no_proposal_backtransform_failure_fails_early(monkeypatch
     assert result.diagnostics["n_stage0_calls"] == 3
     assert result.diagnostics["n_no_proposal_backtransform_fail"] == 3
     assert result.diagnostics["n_fallback_to_ds"] == 0
+    assert result.diagnostics["ds_init_profile"] is None
 
 
 def test_rebuild_skip_no_proposal_path_is_not_classified_as_fatal(monkeypatch):

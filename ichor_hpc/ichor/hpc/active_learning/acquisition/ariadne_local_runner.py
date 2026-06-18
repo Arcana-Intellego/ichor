@@ -144,6 +144,7 @@ def _new_optimiser_diagnostics(optimiser_name: str) -> Dict[str, Any]:
         "n_accepted_steps": 0,
         "n_rejected_steps": 0,
         "n_fallback_to_ds": 0,
+        "ds_init_profile": None,
         "last_return_code_reason": "not_finished",
         "last_no_proposal_reason": None,
         "last_no_proposal_status_summary": None,
@@ -449,6 +450,426 @@ _TRIAL_REASON_CODES = {
     "calc_nonfinite_output": 10,
 }
 
+_DS_INIT_PROFILE = "daemon_safe_v1"
+
+
+def _ds_hessian_model_name(value: Any) -> str:
+    name = str(value or "almlof").strip().lower()
+    if name not in _HESSIAN_MODEL_MAP:
+        raise ValueError(f"unsupported DS hessian_model: {value!r}")
+    return name
+
+
+def _positive_float(value: Any, *, name: str) -> float:
+    result = float(value)
+    if not np.isfinite(result) or result <= 0.0:
+        raise ValueError(f"{name} must be finite and > 0")
+    return result
+
+
+def _ds_safe_init_kwargs(run_config) -> Dict[str, Any]:
+    """Return the daemon-owned DS initialisation profile.
+
+    Several f90wrap builds treat omitted optional scalar arguments as present
+    zero values. Passing this profile explicitly keeps DS startup independent of
+    wrapper-default behaviour on CSF3/CSF4.
+    """
+    delta0 = _positive_float(run_config.delta0, name="delta0")
+    requested_delta_max = _positive_float(run_config.delta_max, name="delta_max")
+    delta_max = max(requested_delta_max, delta0)
+    delta_min = min(1.0e-4, delta0)
+    gamma = _positive_float(run_config.gamma, name="gamma")
+    h = delta0
+    h_min = min(1.0e-3, h)
+    h_max = max(1.0e-2, h)
+    gamma_min = min(1.0e-4, gamma)
+    gamma_max = max(5.0e1, gamma)
+    finish_gmax_trigger = 1.0e-3
+    finish_small_gmax_cap = 5.0e-3
+
+    kwargs: Dict[str, Any] = {
+        "gamma": gamma,
+        "h": h,
+        "f_tol": float(run_config.f_tol),
+        "gradf_tol": float(run_config.gradf_tol),
+        "hessian_model": _ds_hessian_model_name(run_config.hessian_model),
+        "auto_params": False,
+        "use_nonzero_p0": False,
+        "p0_strategy": "zero",
+        "ds_controller": "safe",
+        "hpos_estimator": "syev",
+        "lanczos_k": 4,
+        "cartesian_recovery_mode": _ARIADNE_CARTESIAN_RECOVERY_NEWTON,
+        "geo_bt_mode": _ARIADNE_GEO_BT_DENSE,
+        "rot_primitive_mode": _ARIADNE_ROT_PRIMITIVE_EXPMAP3,
+        "geo_sol_dt": 1.0e-2,
+        "geo_sol_tol": 1.0e-8,
+        "bt_ic_tol": 1.0e-6,
+        "max_backtransform_iter": 50,
+        "delta0": delta0,
+        "delta_min": delta_min,
+        "delta_max": delta_max,
+        "delta_grow": 1.5,
+        "delta_shrink": 0.5,
+        "delta_finish": delta_min,
+        "h_finish": h_min,
+        "gamma_finish": gamma,
+        "finish_after_uphill": 3,
+        "delta_regrow_step_frac": 0.10,
+        "controller_de_tol": 1.0e-6,
+        "finish_stall_window": 3,
+        "finish_stall_min_iter": 4,
+        "finish_stall_de_tol": 2.5e-7,
+        "finish_stall_step_tol": 2.5e-3,
+        "finish_stall_gmax_cap": 3.5e-4,
+        "finish_delta_cap": 8.0e-3,
+        "finish_delta_grow": 1.10,
+        "finish_delta_shrink": 0.70,
+        "finish_no_grow_gmax": 3.5e-4,
+        "finish_disp_target": 3.0e-3,
+        "finish_disp_hard": 5.0e-3,
+        "finish_growth_cooldown_steps": 2,
+        "finish_stall_delta_cap": 3.5e-3,
+        "finish_entry_accept_streak_req": 3,
+        "finish_entry_gmax_trigger": 4.5e-4,
+        "finish_entry_dmax_cap": 3.0e-3,
+        "finish_stage2_gmax": 3.0e-4,
+        "finish_delta_cap_stage1": 8.0e-3,
+        "finish_delta_cap_stage2": 4.5e-3,
+        "finish_delta_grow_stage1": 1.15,
+        "finish_delta_shrink_stage1": 0.70,
+        "finish_delta_shrink_stage2": 0.80,
+        "h_min": h_min,
+        "h_max": h_max,
+        "gamma_min": gamma_min,
+        "gamma_max": gamma_max,
+        "eig_abs_floor": 1.0e-6,
+        "mu_floor_rel": 1.0e-3,
+        "ch": 0.70,
+        "cart_step_inf_max": 3.0e-1,
+        "cart_step_rms_max": 1.5e-1,
+        "cart_atom_step_max": 4.5e-1,
+        "cart_min_pair_dist": 5.5e-1,
+        "cart_abs_coord_max": 1.0e3,
+        "cart_pair_dist_max": 1.0e3,
+        "grad_inf_max": 1.0e6,
+        "grad_growth_max": 1.0e6,
+        "finish_gmax_trigger": finish_gmax_trigger,
+        "finish_small_step_streak": 3,
+        "finish_step_ratio_trigger": 0.25,
+        "finish_grad_ratio_trigger": 1.0e-2,
+        "finish_small_gmax_cap": finish_small_gmax_cap,
+        "finish_small_step_min_iter": 0,
+        "delta_grow_dmax_floor": 0.0,
+        "mass_mode": "identity",
+        "kinetic_model": "quadratic",
+        "delta_rel": 0.0,
+        "recovery_accepts_to_exit": 2,
+        "recovery_h_scale": 0.5,
+        "recovery_gamma_grow": 1.2,
+        "recovery_momentum_scale": 0.0,
+        "reject_momentum_scale": 0.0,
+        "reject_delta_ref_frac": 1.0,
+        "reject_h_scale": 0.5,
+        "reject_gamma_scale": 1.2,
+        "max_reject_streak": 3,
+        "mass_diag_abs_floor": 1.0e-12,
+        "mass_diag_floor_rel": 1.0e-8,
+        "block_metric_eps": 1.0e-12,
+        "block_shape_eps": 1.0e-12,
+        "block_scale_min": 1.0e-3,
+        "block_scale_max": 1.0e3,
+        "block_scale_relax": 0.5,
+        "block_secant_disp_tol": 0.0,
+        "block_secant_curv_floor": 1.0e-8,
+        "block_scale_history_len": 4,
+        "block_scale_seed_mode": "uniform",
+        "block_coupling_mode": "row_gram",
+        "block_merge_hysteresis_gap": 0.04,
+        "block_transfer_min_row_overlap": 0.50,
+        "block_transfer_min_subspace_overlap": 0.60,
+        "block_transfer_mode": "weighted",
+        "block_transfer_total_weight_floor": 0.0,
+        "bond_switching": False,
+        "bond_switching_kappa": 8.0,
+        "bond_switching_xi0": 1.0,
+        "block_scale_metric_aware": True,
+        "block_scale_log_domain": True,
+        "external_mode_dominance": 0.75,
+        "rel_cap_mode": "global",
+        "delta_rel_trans_factor": 1.0,
+        "delta_rel_rot_factor": 1.0,
+        "delta_rel_mixed_factor": 1.0,
+        "poincare_monitor": "balanced",
+        "poincare_alpha": 1.0,
+        "poincare_beta": 1.0,
+        "poincare_zeta": 0.5,
+        "poincare_tau": 1.0e-3,
+        "poincare_lambda": 1.0e-3,
+        "poincare_m_min": 1.0e-6,
+        "poincare_m_max": 1.0,
+        "htvi_p_bregman": 2.0,
+        "htvi_gamma_0": 1.0,
+        "htvi_max_inner": 8,
+        "htvi_tol_abs": 1.0e-10,
+        "htvi_tol_rel": 1.0e-8,
+        "htvi_tol_step": 1.0e-10,
+        "htvi_monitor_eval": "start",
+        "htvi_picard_max": 8,
+        "htvi_picard_tol_m": 1.0e-10,
+        "saddle_active_escape": False,
+        "saddle_probe_on_final": True,
+        "saddle_probe_on_streak": False,
+        "saddle_entry_gmax_trigger": 4.5e-4,
+        "saddle_entry_accept_streak_req": 3,
+        "saddle_cooldown_steps": 8,
+        "saddle_probe_dx_target": 1.0e-4,
+        "saddle_lanczos_k_min": 4,
+        "saddle_lanczos_k_max": 12,
+        "saddle_lanczos_stab_tol": 1.0e-2,
+        "saddle_lambda_rel_threshold": 1.0e-3,
+        "saddle_lambda_abs_threshold": 1.0e-5,
+        "saddle_escape_df_target": 1.0e-3,
+        "saddle_probe_seed": 0,
+        "inline_gediis_enabled": False,
+        "inline_gediis_capacity": 4,
+        "inline_gediis_escalate_streak": 3,
+        "inline_gediis_e_scale": 1.0e-3,
+        "reject_response_aware_enabled": False,
+        "reject_h_scale_aggressive_mult": 1.0,
+        "reject_gamma_boost_mult": 1.0,
+        "reject_gamma_relax_rate": 0.7,
+        "reject_gamma_relax_steps": 5,
+        "reject_poincare_curvature_mult": 2.0,
+        "contact_active": False,
+        "contact_xi": 1.10,
+        "contact_kappa": 8.0,
+        "contact_weight_floor": 0.05,
+        "contact_max_edges_per_node": 8,
+        "contact_w0_norm": 6.0,
+        "contact_aabb_safety_margin": 2.0,
+        "contact_mass_gain": 0.25,
+        "contact_trust_cap_factor": 1.5,
+        "contact_max_modes_total": 16,
+        "contact_required_fragments": 0,
+        "soft_pulse_active": False,
+        "soft_capacity": 8,
+        "soft_stagnation_window": 5,
+        "soft_max_modes_target": 4,
+        "soft_stagnation_ratio_threshold": 0.95,
+        "soft_pulse_alpha_frac": 0.5,
+        "soft_pulse_kappa_floor": 1.0e-6,
+        "soft_pulse_orth_floor": 1.0e-9,
+        "soft_pulse_cooldown_after_chart": 1,
+        "soft_pulse_momentum_policy": 1,
+        "soft_pulse_momentum_damp_factor": 0.25,
+        "soft_pulse_htvi": False,
+        "soft_pulse_min_gmax_to_fire": 1.0e-3,
+        "soft_pulse_allow_in_finish_mode": False,
+        "soft_negative_curvature_policy": 1,
+        "contact_participation_metric_mode": 2,
+    }
+    _validate_ds_init_kwargs(kwargs)
+    return kwargs
+
+
+def _validate_ds_init_kwargs(kwargs: Dict[str, Any]) -> None:
+    failures: List[str] = []
+
+    def require(condition: bool, message: str) -> None:
+        if not condition:
+            failures.append(message)
+
+    def finite_positive(key: str) -> float:
+        value = float(kwargs[key])
+        require(np.isfinite(value) and value > 0.0, f"{key} must be finite and > 0")
+        return value
+
+    finite_positive("gamma")
+    finite_positive("h")
+    finite_positive("h_min")
+    finite_positive("h_max")
+    finite_positive("gamma_min")
+    finite_positive("gamma_max")
+    require(float(kwargs["h_max"]) >= float(kwargs["h"]), "h_max must cover h")
+    require(float(kwargs["gamma_max"]) >= float(kwargs["gamma"]), "gamma_max must cover gamma")
+    finite_positive("delta0")
+    finite_positive("delta_min")
+    finite_positive("delta_max")
+    require(float(kwargs["delta_max"]) >= float(kwargs["delta_min"]), "delta_max < delta_min")
+    require(float(kwargs["delta0"]) >= float(kwargs["delta_min"]), "delta0 < delta_min")
+    require(float(kwargs["delta0"]) <= float(kwargs["delta_max"]), "delta0 > delta_max")
+    require(float(kwargs["delta_grow"]) > 1.0, "delta_grow must be > 1")
+    require(0.0 < float(kwargs["delta_shrink"]) < 1.0, "delta_shrink must be in (0, 1)")
+    require(int(kwargs["lanczos_k"]) >= 1, "lanczos_k must be >= 1")
+    require(float(kwargs["htvi_p_bregman"]) >= 2.0, "htvi_p_bregman must be >= 2")
+    finite_positive("htvi_gamma_0")
+    require(int(kwargs["htvi_max_inner"]) >= 1, "htvi_max_inner must be >= 1")
+    require(int(kwargs["htvi_picard_max"]) >= 1, "htvi_picard_max must be >= 1")
+    finite_positive("htvi_picard_tol_m")
+    for key in (
+        "geo_sol_dt",
+        "geo_sol_tol",
+        "bt_ic_tol",
+        "cart_step_inf_max",
+        "cart_step_rms_max",
+        "cart_atom_step_max",
+        "cart_min_pair_dist",
+        "cart_abs_coord_max",
+        "cart_pair_dist_max",
+        "grad_inf_max",
+        "grad_growth_max",
+        "mass_diag_abs_floor",
+        "mass_diag_floor_rel",
+        "block_metric_eps",
+        "block_shape_eps",
+        "block_scale_min",
+        "block_secant_curv_floor",
+        "saddle_lanczos_stab_tol",
+        "contact_xi",
+        "contact_kappa",
+        "contact_weight_floor",
+        "contact_w0_norm",
+        "contact_aabb_safety_margin",
+        "contact_trust_cap_factor",
+        "soft_stagnation_ratio_threshold",
+        "soft_pulse_alpha_frac",
+        "soft_pulse_kappa_floor",
+        "soft_pulse_orth_floor",
+        "soft_pulse_momentum_damp_factor",
+        "soft_pulse_min_gmax_to_fire",
+    ):
+        finite_positive(key)
+    require(int(kwargs["max_backtransform_iter"]) >= 1, "max_backtransform_iter must be >= 1")
+    require(int(kwargs["finish_after_uphill"]) >= 1, "finish_after_uphill must be >= 1")
+    require(
+        int(kwargs["finish_small_step_streak"]) >= 1,
+        "finish_small_step_streak must be >= 1",
+    )
+    require(
+        0.0 < float(kwargs["finish_step_ratio_trigger"]) < 1.0,
+        "finish_step_ratio_trigger must be in (0, 1)",
+    )
+    finite_positive("finish_grad_ratio_trigger")
+    finite_positive("finish_gmax_trigger")
+    finite_positive("finish_small_gmax_cap")
+    require(0.0 < float(kwargs["delta_regrow_step_frac"]) < 1.0, "delta_regrow_step_frac invalid")
+    require(float(kwargs["controller_de_tol"]) >= 0.0, "controller_de_tol must be >= 0")
+    require(int(kwargs["finish_stall_window"]) >= 1, "finish_stall_window must be >= 1")
+    require(int(kwargs["finish_stall_min_iter"]) >= 0, "finish_stall_min_iter must be >= 0")
+    finite_positive("finish_stall_de_tol")
+    finite_positive("finish_stall_step_tol")
+    finite_positive("finish_stall_gmax_cap")
+    finite_positive("finish_delta_cap")
+    require(float(kwargs["finish_delta_grow"]) > 1.0, "finish_delta_grow must be > 1")
+    require(0.0 < float(kwargs["finish_delta_shrink"]) < 1.0, "finish_delta_shrink invalid")
+    finite_positive("finish_no_grow_gmax")
+    finite_positive("finish_disp_target")
+    finite_positive("finish_disp_hard")
+    require(
+        int(kwargs["finish_growth_cooldown_steps"]) >= 0,
+        "finish_growth_cooldown_steps must be >= 0",
+    )
+    finite_positive("finish_stall_delta_cap")
+    require(
+        int(kwargs["finish_entry_accept_streak_req"]) >= 1,
+        "finish_entry_accept_streak_req must be >= 1",
+    )
+    finite_positive("finish_entry_gmax_trigger")
+    finite_positive("finish_entry_dmax_cap")
+    finite_positive("finish_stage2_gmax")
+    finite_positive("finish_delta_cap_stage1")
+    finite_positive("finish_delta_cap_stage2")
+    require(
+        float(kwargs["finish_delta_grow_stage1"]) > 1.0,
+        "finish_delta_grow_stage1 must be > 1",
+    )
+    require(
+        0.0 < float(kwargs["finish_delta_shrink_stage1"]) < 1.0,
+        "finish_delta_shrink_stage1 invalid",
+    )
+    require(
+        0.0 < float(kwargs["finish_delta_shrink_stage2"]) < 1.0,
+        "finish_delta_shrink_stage2 invalid",
+    )
+    require(
+        float(kwargs["finish_small_gmax_cap"]) >= float(kwargs["finish_gmax_trigger"]),
+        "finish_small_gmax_cap must cover finish_gmax_trigger",
+    )
+    require(int(kwargs["recovery_accepts_to_exit"]) >= 1, "recovery_accepts_to_exit < 1")
+    require(0.0 < float(kwargs["recovery_h_scale"]) <= 1.0, "recovery_h_scale invalid")
+    require(float(kwargs["recovery_gamma_grow"]) >= 1.0, "recovery_gamma_grow invalid")
+    require(0.0 <= float(kwargs["recovery_momentum_scale"]) <= 1.0, "recovery momentum invalid")
+    require(0.0 <= float(kwargs["reject_momentum_scale"]) <= 1.0, "reject momentum invalid")
+    require(0.0 < float(kwargs["reject_delta_ref_frac"]) <= 1.0, "reject_delta_ref_frac invalid")
+    require(0.0 < float(kwargs["reject_h_scale"]) <= 1.0, "reject_h_scale invalid")
+    require(float(kwargs["reject_gamma_scale"]) >= 1.0, "reject_gamma_scale invalid")
+    require(int(kwargs["max_reject_streak"]) >= 1, "max_reject_streak must be >= 1")
+    require(float(kwargs["block_scale_max"]) >= float(kwargs["block_scale_min"]), "block scale bounds invalid")
+    require(0.0 < float(kwargs["block_scale_relax"]) <= 1.0, "block_scale_relax invalid")
+    require(int(kwargs["block_scale_history_len"]) >= 1, "block_scale_history_len must be >= 1")
+    require(
+        str(kwargs["block_scale_seed_mode"]).lower() in {"uniform", "hessian"},
+        "block_scale_seed_mode invalid",
+    )
+    require(
+        str(kwargs["block_coupling_mode"]).lower() in {"row_gram", "cart_subspace"},
+        "block_coupling_mode invalid",
+    )
+    require(float(kwargs["block_merge_hysteresis_gap"]) >= 0.0, "block_merge_hysteresis_gap invalid")
+    require(
+        0.0 <= float(kwargs["block_transfer_min_row_overlap"]) <= 1.0,
+        "block_transfer_min_row_overlap invalid",
+    )
+    require(
+        0.0 <= float(kwargs["block_transfer_min_subspace_overlap"]) <= 1.0,
+        "block_transfer_min_subspace_overlap invalid",
+    )
+    require(
+        str(kwargs["block_transfer_mode"]).lower() in {"weighted", "binary"},
+        "block_transfer_mode invalid",
+    )
+    require(
+        float(kwargs["block_transfer_total_weight_floor"]) >= 0.0,
+        "block_transfer_total_weight_floor invalid",
+    )
+    finite_positive("bond_switching_kappa")
+    finite_positive("bond_switching_xi0")
+    require(
+        0.50 <= float(kwargs["external_mode_dominance"]) <= 0.95,
+        "external_mode_dominance invalid",
+    )
+    require(str(kwargs["rel_cap_mode"]).lower() in {"global", "groupwise"}, "rel_cap_mode invalid")
+    require(float(kwargs["delta_rel_trans_factor"]) >= 0.0, "delta_rel_trans_factor invalid")
+    require(float(kwargs["delta_rel_rot_factor"]) >= 0.0, "delta_rel_rot_factor invalid")
+    require(float(kwargs["delta_rel_mixed_factor"]) >= 0.0, "delta_rel_mixed_factor invalid")
+    require(int(kwargs["saddle_lanczos_k_min"]) >= 1, "saddle_lanczos_k_min must be >= 1")
+    require(
+        int(kwargs["saddle_lanczos_k_max"]) >= int(kwargs["saddle_lanczos_k_min"]),
+        "saddle_lanczos_k_max must cover min",
+    )
+    require(
+        str(kwargs["hpos_estimator"]).lower() in {"syev", "lanczos"},
+        "hpos_estimator invalid",
+    )
+    require(
+        str(kwargs["hessian_model"]).lower() in _HESSIAN_MODEL_MAP,
+        "hessian_model invalid",
+    )
+    require(int(kwargs["contact_max_edges_per_node"]) >= 1, "contact_max_edges_per_node invalid")
+    require(float(kwargs["contact_mass_gain"]) >= 0.0, "contact_mass_gain invalid")
+    require(int(kwargs["contact_max_modes_total"]) >= 0, "contact_max_modes_total invalid")
+    require(int(kwargs["contact_required_fragments"]) >= 0, "contact_required_fragments invalid")
+    require(int(kwargs["soft_capacity"]) >= 1, "soft_capacity invalid")
+    require(int(kwargs["soft_stagnation_window"]) >= 1, "soft_stagnation_window invalid")
+    require(int(kwargs["soft_max_modes_target"]) >= 1, "soft_max_modes_target invalid")
+    require(int(kwargs["soft_pulse_cooldown_after_chart"]) >= 0, "soft_pulse_cooldown_after_chart invalid")
+    require(int(kwargs["soft_pulse_momentum_policy"]) in {1, 2, 3}, "soft_pulse_momentum_policy invalid")
+    require(int(kwargs["soft_negative_curvature_policy"]) in {1, 2}, "soft_negative_curvature_policy invalid")
+    require(int(kwargs["contact_participation_metric_mode"]) in {1, 2}, "contact_participation_metric_mode invalid")
+    if failures:
+        raise ValueError("invalid DS init defaults: " + "; ".join(failures))
+
 
 def _set_invalid_trial_reason(opt, reason: str) -> None:
     setter = getattr(opt, "set_invalid_trial_reason_py", None)
@@ -498,23 +919,9 @@ def _build_ds(ariadne, q0_xyz, g0_xyz, atom_list, run_config):
     config so the two optimisers start from the same trust scale.
     """
     opt = ariadne.Ds_Optimiser.dissipative_symplectic()
-    opt.init(
-        q0_xyz=q0_xyz,
-        g0_xyz=g0_xyz,
-        atom_list=atom_list,
-        gamma=float(run_config.gamma),
-        h=float(run_config.delta0),
-        f_tol=float(run_config.f_tol),
-        gradf_tol=float(run_config.gradf_tol),
-        # Pass these explicitly because some f90wrap builds treat omitted
-        # optional scalar arguments as present zero values, which trips the
-        # Fortran lanczos_k >= 1 guard during DS fallback initialisation.
-        hpos_estimator="syev",
-        lanczos_k=4,
-        cartesian_recovery_mode=_ARIADNE_CARTESIAN_RECOVERY_NEWTON,
-        geo_bt_mode=_ARIADNE_GEO_BT_DENSE,
-        rot_primitive_mode=_ARIADNE_ROT_PRIMITIVE_EXPMAP3,
-    )
+    init_kwargs = _ds_safe_init_kwargs(run_config)
+    init_kwargs.update(q0_xyz=q0_xyz, g0_xyz=g0_xyz, atom_list=atom_list)
+    opt.init(**init_kwargs)
     return opt
 
 
@@ -590,6 +997,8 @@ def run_optimisation_against_calculator(
             + "; valid: trust_region_qn | dissipative_symplectic"
         )
     diagnostics = _new_optimiser_diagnostics(optimiser_name)
+    if not is_trqn:
+        diagnostics["ds_init_profile"] = _DS_INIT_PROFILE
 
     _raise_if_init_failed(opt, "DS" if not is_trqn else "TRQN")
 
@@ -711,6 +1120,7 @@ def run_optimisation_against_calculator(
                             fell_back_to_ds = True
                             diagnostics["n_fallback_to_ds"] += 1
                             diagnostics["n_no_proposal_recoveries"] += 1
+                            diagnostics["ds_init_profile"] = _DS_INIT_PROFILE
                             diagnostics["optimiser_final"] = (
                                 "dissipative_symplectic"
                             )
@@ -834,6 +1244,7 @@ def run_optimisation_against_calculator(
                 is_trqn = False
                 fell_back_to_ds = True
                 diagnostics["n_fallback_to_ds"] += 1
+                diagnostics["ds_init_profile"] = _DS_INIT_PROFILE
                 diagnostics["optimiser_final"] = "dissipative_symplectic"
                 consecutive_rejects = 0
             except Exception as exc:
