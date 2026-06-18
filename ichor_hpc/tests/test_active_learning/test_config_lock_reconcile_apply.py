@@ -1,5 +1,6 @@
 import argparse
 import json
+from types import SimpleNamespace
 
 from ichor.hpc.active_learning.cli import cmd_reconcile, cmd_start
 from ichor.hpc.active_learning.config import CampaignConfig
@@ -270,6 +271,58 @@ def test_reconcile_apply_resolves_terminal_submission_intent(
             )
         ],
     )
+
+    rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            allow_fresh_init=False,
+            apply=True,
+        )
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "Resolved terminal submission intents" in out
+    state = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
+    assert state.phase is CampaignPhase.INITIAL_FEREBUS
+    intent = submission_intent.load_intent(
+        campaign,
+        CampaignPhase.INITIAL_FEREBUS.value,
+        0,
+    )
+    assert intent["status"] == "SUPERSEDED"
+    assert intent["reason"] == "reconcile_apply_retry"
+
+
+def test_reconcile_apply_resolves_cancelled_intent_when_squeue_invalid_job_id(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign(tmp_path)
+    _commit_training_version(campaign, 0)
+    _write_halted_pre_ferebus_state(campaign)
+    config = CampaignConfig()
+    write_config_lock(campaign, config)
+    _write_config(campaign, config)
+    _write_submitted_initial_ferebus_intent(campaign)
+
+    def fake_run(cmd, **kwargs):
+        if cmd[0] == "squeue":
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="slurm_load_jobs error: Invalid job id specified\n",
+            )
+        if cmd[0] == "sacct":
+            return SimpleNamespace(
+                returncode=0,
+                stdout="16218598_[1-12]|CANCELLED by 494098|0:0|00:00:00\n",
+                stderr="",
+            )
+        raise AssertionError("unexpected command: " + repr(cmd))
+
+    monkeypatch.setattr(sacct_poll.subprocess, "run", fake_run)
 
     rc = cmd_reconcile(
         argparse.Namespace(

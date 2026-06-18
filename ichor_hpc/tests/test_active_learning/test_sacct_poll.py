@@ -249,3 +249,17 @@ def test_find_active_job_by_id_squeue_error_is_inconclusive():
     assert not lookup.active
     assert lookup.inconclusive
     assert "squeue exited with code 1" in str(lookup.error)
+
+
+def test_find_active_job_by_id_invalid_job_id_is_conclusive_inactive():
+    runner = _StubRunner(
+        result=_StubResult(
+            returncode=1,
+            stderr="slurm_load_jobs error: Invalid job id specified\n",
+        )
+    )
+    lookup = find_active_job_by_id_detailed("16153025", squeue_runner=runner)
+    assert not lookup.active
+    assert not lookup.inconclusive
+    assert lookup.rows == []
+    assert lookup.error is None

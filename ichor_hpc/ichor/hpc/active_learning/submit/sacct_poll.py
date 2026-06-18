@@ -328,6 +328,11 @@ def poll_job(
     return parse_sacct_output(stdout)
 
 
+def _squeue_invalid_job_id(stderr: str) -> bool:
+    text = str(stderr or "").lower()
+    return "invalid job id specified" in text or "invalid job id" in text
+
+
 def find_active_job_by_id_detailed(
     job_id: str,
     *,
@@ -359,6 +364,8 @@ def find_active_job_by_id_detailed(
     return_code = int(getattr(completed, "returncode", 1))
     if return_code != 0:
         stderr = getattr(completed, "stderr", "") or ""
+        if _squeue_invalid_job_id(stderr):
+            return JobQueueLookup(active=False, inconclusive=False, rows=[])
         return JobQueueLookup(
             active=False,
             inconclusive=True,

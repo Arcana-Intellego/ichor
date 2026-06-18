@@ -587,6 +587,15 @@ def _lookup_active_slurm_job_for_cancel(job_id: str) -> Dict[str, Any]:
         }
     if int(getattr(completed, "returncode", 1)) != 0:
         stderr = getattr(completed, "stderr", "") or ""
+        from .submit.sacct_poll import _squeue_invalid_job_id
+
+        if _squeue_invalid_job_id(stderr):
+            return {
+                "active": False,
+                "inconclusive": False,
+                "rows": [],
+                "error": None,
+            }
         return {
             "active": False,
             "inconclusive": True,

@@ -362,6 +362,43 @@ def test_cli_stop_cancel_jobs_refuses_inconclusive_scheduler_lookup(
     assert stopped.pending_jobs[CampaignPhase.INITIAL_GAUSSIAN.value] == "789"
 
 
+def test_cli_stop_cancel_jobs_skips_invalid_squeue_job_id(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state()
+    state.pending_jobs[CampaignPhase.INITIAL_GAUSSIAN.value] = "789"
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+
+    def fake_run(cmd, **kwargs):
+        if cmd[0] == "squeue":
+            return subprocess.CompletedProcess(
+                cmd,
+                1,
+                stdout="",
+                stderr="slurm_load_jobs error: Invalid job id specified\n",
+            )
+        if cmd[0] == "scancel":
+            pytest.fail("invalid squeue job id must not call scancel")
+        raise AssertionError("unexpected command: " + repr(cmd))
+
+    monkeypatch.setattr(cli_mod.subprocess, "run", fake_run)
+
+    rc = main(["stop", "--campaign-dir", str(campaign), "--cancel-jobs"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "Skipped Slurm jobs" in out
+    assert "not active in squeue" in out
+    stopped = read_state(data / DEFAULT_STATE_FILENAME)
+    assert stopped.shutdown_requested is True
+    assert stopped.pending_jobs[CampaignPhase.INITIAL_GAUSSIAN.value] == "789"
+
+
 def test_cli_stop_cancel_jobs_refuses_campaign_job_name_mismatch(
     tmp_path,
     capsys,
