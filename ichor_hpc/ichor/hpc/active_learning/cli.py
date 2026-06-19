@@ -12,8 +12,9 @@ Console entry point 'ichor-al-daemon' registered in
     journal    Tail or filter the campaign journal.
     import-pool Import and outlier-filter a trajectory into the campaign pool.
 
-All commands take '--campaign-dir DIR' (required). 'start' takes
-'--config FILE' (the campaign.yaml).
+Commands that operate on a campaign accept '--campaign-dir DIR'. When it is
+omitted, the CLI uses the current working directory if it contains
+'campaign.yaml'.
 
 The CLI builds the Daemon with default executor/sacct_poller for production;
 '--mock-ariadne' swaps the executor for a deterministic Mock so dry-runs
@@ -73,13 +74,129 @@ from .daemon.state import (
 )
 
 
-__all__ = ["build_parser", "main"]
+__all__ = [
+    "build_parser",
+    "expand_boolean_short_flag_clusters",
+    "main",
+    "resolve_campaign_dir",
+    "ShortFlagClusterError",
+]
 
 
 BACKGROUND_CHILD_ENV = "ICHOR_DAEMON_BACKGROUND_CHILD"
 BACKGROUND_LOG_FILENAME = "daemon.out"
 BACKGROUND_PID_FILENAME = "daemon.pid"
 BACKGROUND_PID_SCHEMA_VERSION = 1
+
+
+class CampaignDirResolutionError(ValueError):
+    """Raised when a command cannot infer a valid campaign directory."""
+
+
+class ShortFlagClusterError(ValueError):
+    """Raised when a compact short-flag cluster would be ambiguous."""
+
+
+def resolve_campaign_dir(
+    value: Optional[str],
+    *,
+    require_campaign_yaml: bool = True,
+) -> Path:
+    """Resolve a campaign directory from an explicit value or cwd.
+
+    Explicit ``--campaign-dir`` values always win. When omitted, the current
+    directory is accepted only if it looks like a campaign directory, i.e. it
+    contains ``campaign.yaml``.
+    """
+    if value:
+        campaign = Path(value).expanduser().resolve()
+        if not campaign.exists():
+            raise CampaignDirResolutionError(
+                "campaign directory does not exist: " + str(campaign)
+            )
+        if not campaign.is_dir():
+            raise CampaignDirResolutionError(
+                "campaign path is not a directory: " + str(campaign)
+            )
+        if require_campaign_yaml and not (campaign / "campaign.yaml").is_file():
+            raise CampaignDirResolutionError(
+                "campaign directory does not contain campaign.yaml: "
+                + str(campaign)
+            )
+        return campaign
+
+    campaign = Path.cwd().resolve()
+    if require_campaign_yaml and not (campaign / "campaign.yaml").is_file():
+        raise CampaignDirResolutionError(
+            "No campaign directory supplied and the current directory does not "
+            "contain campaign.yaml. Use --campaign-dir DIR or cd into a "
+            "campaign directory."
+        )
+    return campaign
+
+
+_BOOLEAN_SHORT_CLUSTERS = {
+    "start": frozenset({"l", "b", "d", "m"}),
+    "resume": frozenset({"l", "b", "d", "m"}),
+    "stop": frozenset({"x"}),
+    "status": frozenset({"j", "v"}),
+    "reconcile": frozenset({"a", "F"}),
+    "journal": frozenset({"j", "r", "v"}),
+    "import-pool": frozenset({"f", "O"}),
+}
+
+
+_VALUE_SHORT_FLAGS = {
+    "start": frozenset({"c", "g", "p", "t", "P", "o", "i"}),
+    "resume": frozenset({"c", "g", "p", "t", "P", "o", "i"}),
+    "stop": frozenset({"c"}),
+    "status": frozenset({"c"}),
+    "reconcile": frozenset({"c"}),
+    "journal": frozenset({"c", "s", "e", "n"}),
+    "import-pool": frozenset({"c", "s"}),
+    "preflight": frozenset({"c"}),
+}
+
+
+def expand_boolean_short_flag_clusters(argv: Optional[Sequence[str]]) -> List[str]:
+    """Expand safe boolean short-flag clusters such as ``-lb``.
+
+    Only clusters made entirely from known no-value boolean flags for the
+    selected subcommand are expanded. Options that take values are left for
+    argparse to handle normally.
+    """
+    args = list(argv if argv is not None else sys.argv[1:])
+    if not args:
+        return args
+    command = args[0]
+    allowed = _BOOLEAN_SHORT_CLUSTERS.get(command)
+    value_flags = _VALUE_SHORT_FLAGS.get(command, frozenset())
+    if not allowed:
+        return args
+    out = [command]
+    for token in args[1:]:
+        if (
+            token.startswith("-")
+            and not token.startswith("--")
+            and len(token) > 2
+            and all(ch in allowed for ch in token[1:])
+        ):
+            out.extend("-" + ch for ch in token[1:])
+        elif (
+            token.startswith("-")
+            and not token.startswith("--")
+            and len(token) > 2
+            and token[1] in (allowed | value_flags)
+        ):
+            raise ShortFlagClusterError(
+                "unsupported short flag cluster "
+                + repr(token)
+                + "; use separate flags such as '-l -b', and pass values as "
+                "separate arguments such as '-t 10'."
+            )
+        else:
+            out.append(token)
+    return out
 
 
 RETRYABLE_CLEANED_REENTRY_PHASES = {
@@ -625,7 +742,7 @@ def _format_journal_events(events: Sequence[Dict[str, Any]], *, verbose: bool) -
 
 
 def cmd_start(args: argparse.Namespace) -> int:
-    campaign = Path(args.campaign_dir).resolve()
+    campaign = resolve_campaign_dir(args.campaign_dir)
     if not campaign.exists():
         print("campaign-dir does not exist: " + str(campaign), file=sys.stderr)
         return 2
@@ -1036,7 +1153,7 @@ def _print_cancel_jobs_summary(summary: Dict[str, Any]) -> None:
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
-    campaign = Path(args.campaign_dir).resolve()
+    campaign = resolve_campaign_dir(args.campaign_dir)
     paths = _campaign_paths(campaign)
     if not paths["state"].exists():
         print("no state.json at " + str(paths["state"]) + "; daemon not running?", file=sys.stderr)
@@ -1093,7 +1210,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    campaign = Path(args.campaign_dir).resolve()
+    campaign = resolve_campaign_dir(args.campaign_dir)
     paths = _campaign_paths(campaign)
     if not paths["state"].exists():
         print("no state.json at " + str(paths["state"]), file=sys.stderr)
@@ -1132,7 +1249,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
-    campaign = Path(args.campaign_dir).resolve()
+    campaign = resolve_campaign_dir(args.campaign_dir)
     state_path = _campaign_paths(campaign)["state"]
     if state_path.exists():
         try:
@@ -1343,7 +1460,7 @@ def _apply_retry_phase_after_cleaned_halt(report, original_report) -> bool:
 
 
 def cmd_reconcile(args: argparse.Namespace) -> int:
-    campaign = Path(args.campaign_dir).resolve()
+    campaign = resolve_campaign_dir(args.campaign_dir)
     report = propose_recovery(
         campaign,
         allow_fresh_init_on_nonempty=bool(getattr(args, "allow_fresh_init", False)),
@@ -1634,7 +1751,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
 
 
 def cmd_journal(args: argparse.Namespace) -> int:
-    campaign = Path(args.campaign_dir).resolve()
+    campaign = resolve_campaign_dir(args.campaign_dir)
     journal_path = _campaign_paths(campaign)["journal"]
     if not journal_path.exists():
         print("no journal at " + str(journal_path), file=sys.stderr)
@@ -1683,7 +1800,10 @@ def cmd_import_pool(args: argparse.Namespace) -> int:
     from .acquisition.trajectory_pool import TrajectoryPool
     from .config import CampaignConfig
 
-    campaign = Path(args.campaign_dir).resolve()
+    campaign = resolve_campaign_dir(
+        args.campaign_dir,
+        require_campaign_yaml=(args.campaign_dir is None),
+    )
     source = Path(args.source).resolve()
     if not campaign.exists():
         print("campaign-dir does not exist: " + str(campaign), file=sys.stderr)
@@ -1783,20 +1903,43 @@ def cmd_preflight(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    examples = """\
+Campaign directory:
+  If -c/--campaign-dir is omitted, the current directory is used when it
+  contains campaign.yaml.
+
+Examples:
+  cd ~/campaigns/water_001
+  ichor-al-daemon status
+  ichor-al-daemon start -l
+  ichor-al-daemon start -lb
+  ichor-al-daemon import-pool -s pool.xyz
+  ichor-al-daemon journal -e phase_submitted
+
+  ichor-al-daemon start -c ~/campaigns/water_001 --live
+"""
     parser = argparse.ArgumentParser(
         prog="ichor-al-daemon",
         description="ICHOR active-learning campaign daemon.",
+        epilog=examples,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add_campaign(p):
         p.add_argument(
-            "--campaign-dir", required=True,
-            help="Root directory of the campaign.",
+            "-c",
+            "--campaign-dir",
+            default=None,
+            help=(
+                "Campaign directory. If omitted, the current directory is used "
+                "when it contains campaign.yaml."
+            ),
         )
 
     def add_background_options(p):
         p.add_argument(
+            "-b",
             "--background",
             action="store_true",
             help=(
@@ -1806,6 +1949,7 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
         p.add_argument(
+            "-o",
             "--background-log",
             default=None,
             help=(
@@ -1814,6 +1958,7 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
         p.add_argument(
+            "-i",
             "--background-pid",
             default=None,
             help=(
@@ -1822,34 +1967,62 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
 
-    p_start = sub.add_parser("start", help="Start the daemon (foreground).")
+    p_start = sub.add_parser(
+        "start",
+        help="Start the daemon.",
+        description=(
+            "Start a campaign daemon. From inside a campaign directory, "
+            "--campaign-dir can be omitted."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  ichor-al-daemon start -d -t 10\n"
+            "  ichor-al-daemon start -l\n"
+            "  ichor-al-daemon start -lb\n"
+            "  ichor-al-daemon start -c ~/campaigns/water_001 --live"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     add_campaign(p_start)
     p_start.add_argument(
-        "--config", default=None,
+        "-g",
+        "--config",
+        default=None,
         help="Path to campaign.yaml (defaults to <campaign-dir>/campaign.yaml).",
     )
     p_start.add_argument(
+        "-m",
         "--mock-ariadne", action="store_true",
         help="Use MockPhaseExecutor for pure state-machine progression tests (no on-disk artefacts).",
     )
     p_start.add_argument(
+        "-d",
         "--dry-run", action="store_true",
         help="Use DryRunPhaseExecutor: stub all backend calls but produce real on-disk artefacts (scripts, training-set versions, manifests).",
     )
     p_start.add_argument(
+        "-l",
         "--live", action="store_true",
         help="Use LiveBackendsPhaseExecutor against configured Slurm backends (sbatch + Gaussian + AIMAll + FEREBUS + ARIADNE). Refuses with exit 12 if any are missing.",
     )
     p_start.add_argument(
-        "--poll-interval", type=int, default=None,
+        "-p",
+        "--poll-interval",
+        type=int,
+        default=None,
         help="Override poll_interval_seconds from the config.",
     )
     p_start.add_argument(
-        "--max-ticks", type=int, default=None,
+        "-t",
+        "--max-ticks",
+        type=int,
+        default=None,
         help="Limit total tick count (testing / time-boxed runs).",
     )
     p_start.add_argument(
-        "--preset", default=None,
+        "-P",
+        "--preset",
+        default=None,
         help=(
             "Name of a YAML preset under ichor_hpc/.../presets/ to overlay "
             "campaign.yaml on top of. campaign.yaml wins on every "
@@ -1859,9 +2032,17 @@ def build_parser() -> argparse.ArgumentParser:
     add_background_options(p_start)
     p_start.set_defaults(func=cmd_start)
 
-    p_stop = sub.add_parser("stop", help="Request a graceful shutdown.")
+    p_stop = sub.add_parser(
+        "stop",
+        help="Request a graceful shutdown.",
+        description=(
+            "Request daemon shutdown for the resolved campaign. Plain stop does "
+            "not cancel Slurm jobs unless --cancel-jobs is supplied."
+        ),
+    )
     add_campaign(p_stop)
     p_stop.add_argument(
+        "-x",
         "--cancel-jobs",
         action="store_true",
         help=(
@@ -1871,14 +2052,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_stop.set_defaults(func=cmd_stop)
 
-    p_status = sub.add_parser("status", help="Print the current daemon status.")
+    p_status = sub.add_parser(
+        "status",
+        help="Print the current daemon status.",
+        description=(
+            "Print the current daemon status for the resolved campaign. From "
+            "inside a campaign directory, --campaign-dir can be omitted."
+        ),
+    )
     add_campaign(p_status)
     p_status.add_argument(
+        "-j",
         "--json",
         action="store_true",
         help="Print the raw state/status payload as JSON.",
     )
     p_status.add_argument(
+        "-v",
         "--verbose",
         action="store_true",
         help="Include expanded artifact, lease, and path diagnostics.",
@@ -1888,24 +2078,34 @@ def build_parser() -> argparse.ArgumentParser:
     p_resume = sub.add_parser(
         "resume",
         help="Equivalent to start (kept for symmetry; works only when state.json exists).",
+        description=(
+            "Resume a campaign daemon. This accepts the same execution-mode "
+            "and background flags as start."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     add_campaign(p_resume)
-    p_resume.add_argument("--config", default=None)
-    p_resume.add_argument("--mock-ariadne", action="store_true")
-    p_resume.add_argument("--dry-run", action="store_true")
-    p_resume.add_argument("--live", action="store_true")
-    p_resume.add_argument("--poll-interval", type=int, default=None)
-    p_resume.add_argument("--max-ticks", type=int, default=None)
-    p_resume.add_argument("--preset", default=None)
+    p_resume.add_argument("-g", "--config", default=None)
+    p_resume.add_argument("-m", "--mock-ariadne", action="store_true")
+    p_resume.add_argument("-d", "--dry-run", action="store_true")
+    p_resume.add_argument("-l", "--live", action="store_true")
+    p_resume.add_argument("-p", "--poll-interval", type=int, default=None)
+    p_resume.add_argument("-t", "--max-ticks", type=int, default=None)
+    p_resume.add_argument("-P", "--preset", default=None)
     add_background_options(p_resume)
     p_resume.set_defaults(func=cmd_resume)
 
     p_recon = sub.add_parser(
         "reconcile",
         help="Inspect on-disk artefacts and propose a recovered state.",
+        description=(
+            "Inspect campaign artefacts and write state.json.proposed. With "
+            "--apply, safely promote the proposal when the recovery is clean."
+        ),
     )
     add_campaign(p_recon)
     p_recon.add_argument(
+        "-F",
         "--allow-fresh-init",
         action="store_true",
         help=(
@@ -1914,6 +2114,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_recon.add_argument(
+        "-a",
         "--apply",
         action="store_true",
         help=(
@@ -1924,33 +2125,56 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_recon.set_defaults(func=cmd_reconcile)
 
-    p_jrn = sub.add_parser("journal", help="Print campaign journal events.")
+    p_jrn = sub.add_parser(
+        "journal",
+        help="Print campaign journal events.",
+        description=(
+            "Print or filter the campaign journal. From inside a campaign "
+            "directory, --campaign-dir can be omitted."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  ichor-al-daemon journal\n"
+            "  ichor-al-daemon journal -e phase_submitted -n 20\n"
+            "  ichor-al-daemon journal -j | tail -n 40"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     add_campaign(p_jrn)
     p_jrn.add_argument(
-        "--since", default=None,
+        "-s",
+        "--since",
+        default=None,
         help="ISO timestamp lower bound (inclusive).",
     )
     p_jrn.add_argument(
-        "--event-type", action="append", default=None,
+        "-e",
+        "--event-type",
+        action="append",
+        default=None,
         help="Filter to one or more event types (repeatable).",
     )
     p_jrn.add_argument(
+        "-n",
         "--last-n",
         type=int,
         default=None,
         help="Show only the last N events after filters are applied.",
     )
     p_jrn.add_argument(
+        "-j",
         "--json",
         action="store_true",
         help="Print filtered events as NDJSON.",
     )
     p_jrn.add_argument(
+        "-r",
         "--raw",
         action="store_true",
         help="Alias for --json; keeps one JSON event per line.",
     )
     p_jrn.add_argument(
+        "-v",
         "--verbose",
         action="store_true",
         help="Print expanded key/value details for each event.",
@@ -1964,19 +2188,33 @@ def build_parser() -> argparse.ArgumentParser:
             "per-campaign pool location. Required once per campaign before "
             "the daemon can run; refuses to overwrite an existing pool."
         ),
+        description=(
+            "Copy an operator trajectory into the campaign pool and write a "
+            "SHA-pinned manifest. From inside a campaign directory, "
+            "--campaign-dir can be omitted."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  ichor-al-daemon import-pool -s pool.xyz\n"
+            "  ichor-al-daemon import-pool -c ~/campaigns/water_001 -s pool.xyz"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     add_campaign(p_imp)
     p_imp.add_argument(
+        "-s",
         "--source", required=True,
         help="Path to the operator's MD trajectory (.xyz). Will be copied into "
              "<campaign-dir>/.DATA/TRAJECTORY/pool.xyz.",
     )
     p_imp.add_argument(
+        "-f",
         "--force", action="store_true",
         help="Overwrite an existing pool (DANGEROUS: invalidates every committed "
              "iteration's frame-id provenance).",
     )
     p_imp.add_argument(
+        "-O",
         "--no-outlier-filter", action="store_true", dest="no_outlier_filter",
         help="Skip the pre-Phase-A outlier filter; import every frame verbatim. "
              "Default behaviour (filter ON) rejects per-atom z > 4 frames and "
@@ -1984,8 +2222,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_imp.set_defaults(func=cmd_import_pool)
 
-    p_pre = sub.add_parser("preflight", help="Check configured live Slurm backends.")
+    p_pre = sub.add_parser(
+        "preflight",
+        help="Check configured live Slurm backends.",
+        description=(
+            "Check the configured Slurm/Gaussian/AIMAll/FEREBUS/ARIADNE "
+            "backend profile. The campaign path is accepted for symmetry but "
+            "is not used by the backend probe."
+        ),
+    )
     p_pre.add_argument(
+        "-c",
         "--campaign-dir",
         default=".",
         help="Accepted for symmetry with other commands; not used by preflight.",
@@ -1997,8 +2244,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
-    return int(args.func(args))
+    try:
+        expanded_argv = expand_boolean_short_flag_clusters(argv)
+    except ShortFlagClusterError as exc:
+        parser.exit(2, parser.prog + ": error: " + str(exc) + "\n")
+    args = parser.parse_args(expanded_argv)
+    try:
+        return int(args.func(args))
+    except CampaignDirResolutionError as exc:
+        parser.exit(2, parser.prog + ": error: " + str(exc) + "\n")
 
 
 if __name__ == "__main__":

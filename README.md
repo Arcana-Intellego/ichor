@@ -74,15 +74,16 @@ required, ~30 seconds on a laptop):
 
 ```
 cd examples/dry_run_water_tetramer
-ichor-al-daemon import-pool --campaign-dir . --source pool.xyz
-ichor-al-daemon start --dry-run --campaign-dir . --max-ticks 200
-ichor-al-daemon status --campaign-dir .
+ichor-al-daemon import-pool -s pool.xyz
+ichor-al-daemon start -d -t 200
+ichor-al-daemon status
 ```
 
 After the third command you should see `"phase": "DONE"` and
 `"models_version": 2`. See `examples/dry_run_water_tetramer/README.md`
 for the full walkthrough and `docs/source/active_learning_daemon.rst`
 for the daemon user guide.
+When not already inside a campaign directory, pass `-c/--campaign-dir`.
 
 ### Backend availability
 

@@ -44,9 +44,9 @@ Run the bundled example to confirm the install works (~30 seconds on a
 laptop, no cluster required)::
 
     cd examples/dry_run_water_tetramer
-    ichor-al-daemon import-pool --campaign-dir . --source pool.xyz
-    ichor-al-daemon start --dry-run --campaign-dir . --max-ticks 200
-    ichor-al-daemon status --campaign-dir .
+    ichor-al-daemon import-pool -s pool.xyz
+    ichor-al-daemon start -d -t 200
+    ichor-al-daemon status
 
 After the third command you should see :code:`"phase": "DONE"` and
 :code:`"models_version": 2`. The campaign has run two iterations of the
@@ -54,6 +54,12 @@ full pipeline -- using dry-run stub backends, so no Gaussian / AIMAll /
 FEREBUS / ARIADNE binaries are required. See
 :code:`examples/dry_run_water_tetramer/README.md` for the full walkthrough
 and what to look at next.
+
+Most daemon commands accept :code:`-c/--campaign-dir`. If it is omitted, the
+current directory is used when it contains :code:`campaign.yaml`; otherwise the
+command exits with a usage error. Common flags also have short aliases, so a
+foreground live launch can be written as :code:`ichor-al-daemon start -l`, and a
+background live launch can be written as :code:`ichor-al-daemon start -lb`.
 
 
 Modes
