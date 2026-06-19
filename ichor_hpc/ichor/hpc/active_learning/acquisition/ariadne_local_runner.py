@@ -55,11 +55,30 @@ _ARIADNE_TRQN_CONTROLLER_NONE = 0
 _TRQN_STATUS_TRUST = 0
 _TRQN_STATUS_RUN_IDX = 2
 _TRQN_STATUS_PROPOSAL_PENDING = 3
+_TRQN_STATUS_TRUST_BEFORE_UPDATE = 21
+_TRQN_STATUS_TRUST_AFTER_UPDATE = 22
 _TRQN_STATUS_INVALID_REASON = 23
 _TRQN_STATUS_STEP_STATE = 35
+_TRQN_STATUS_CARTNORM_LAST = 36
 _TRQN_STATUS_FORCE_REBUILD = 39
-_TRQN_STATUS_SKIP_STEP_AFTER_REBUILD = 54
-_TRQN_STATUS_CONSECUTIVE_BT_FAIL_COUNT = 65
+_TRQN_STATUS_FORCE_REBUILD_REASON = 53
+_TRQN_STATUS_FORCE_REBUILD_COUNT = 54
+_TRQN_STATUS_SKIP_STEP_AFTER_REBUILD = 55
+_TRQN_STATUS_LAST_REBUILD_USED_CARTESIAN = 56
+_TRQN_STATUS_PROPOSAL_STAGE = 57
+_TRQN_STATUS_BT_ENTRY_CODE = 58
+_TRQN_STATUS_BT_ATTEMPTED = 59
+_TRQN_STATUS_PROPOSAL_READY = 60
+_TRQN_STATUS_REBUILD_REQUESTED_LAST = 61
+_TRQN_STATUS_REBUILD_APPLIED_LAST = 62
+_TRQN_STATUS_IC_SYSTEM_CHANGED_LAST = 63
+_TRQN_STATUS_BT_INPUT_DLC_INF = 64
+_TRQN_STATUS_BT_INPUT_CARTNORM = 65
+_TRQN_STATUS_CONSECUTIVE_BT_FAIL_COUNT = 66
+_TRQN_STATUS_PREVIOUS_CYCLE_WAS_REBUILD_SKIP = 71
+_TRQN_STATUS_FULLSTEP_BORKED_LAST = 72
+_TRQN_STATUS_FINAL_BORKED_LAST = 73
+_TRQN_STATUS_FINAL_SOLUTION_KIND_LAST = 74
 
 _TRQN_INVALID_REASON_LABELS = {
     0: "none",
@@ -200,12 +219,59 @@ def _trqn_status_summary(status) -> Dict[str, Any]:
         "step_state_label": _TRQN_STEP_STATE_LABELS.get(
             step_state, "unknown_" + str(step_state),
         ),
+        "trust_before_update": _status_float(
+            status, _TRQN_STATUS_TRUST_BEFORE_UPDATE, None,
+        ),
+        "trust_after_update": _status_float(
+            status, _TRQN_STATUS_TRUST_AFTER_UPDATE, None,
+        ),
+        "cartnorm_last": _status_float(status, _TRQN_STATUS_CARTNORM_LAST, None),
         "force_rebuild": _status_bool(status, _TRQN_STATUS_FORCE_REBUILD, False),
+        "force_rebuild_reason": _status_int(
+            status, _TRQN_STATUS_FORCE_REBUILD_REASON, None,
+        ),
+        "force_rebuild_count": _status_int(
+            status, _TRQN_STATUS_FORCE_REBUILD_COUNT, None,
+        ),
         "skip_step_after_rebuild": _status_bool(
             status, _TRQN_STATUS_SKIP_STEP_AFTER_REBUILD, False,
         ),
+        "last_rebuild_used_cartesian": _status_bool(
+            status, _TRQN_STATUS_LAST_REBUILD_USED_CARTESIAN, False,
+        ),
+        "proposal_stage": _status_int(status, _TRQN_STATUS_PROPOSAL_STAGE, None),
+        "bt_entry_code": _status_int(status, _TRQN_STATUS_BT_ENTRY_CODE, None),
+        "bt_attempted": _status_bool(status, _TRQN_STATUS_BT_ATTEMPTED, False),
+        "proposal_ready": _status_bool(status, _TRQN_STATUS_PROPOSAL_READY, False),
+        "rebuild_requested_last": _status_bool(
+            status, _TRQN_STATUS_REBUILD_REQUESTED_LAST, False,
+        ),
+        "rebuild_applied_last": _status_bool(
+            status, _TRQN_STATUS_REBUILD_APPLIED_LAST, False,
+        ),
+        "ic_system_changed_last": _status_bool(
+            status, _TRQN_STATUS_IC_SYSTEM_CHANGED_LAST, False,
+        ),
+        "bt_input_dlc_inf": _status_float(
+            status, _TRQN_STATUS_BT_INPUT_DLC_INF, None,
+        ),
+        "bt_input_cartnorm": _status_float(
+            status, _TRQN_STATUS_BT_INPUT_CARTNORM, None,
+        ),
         "consecutive_bt_fail_count": _status_int(
             status, _TRQN_STATUS_CONSECUTIVE_BT_FAIL_COUNT, None,
+        ),
+        "previous_cycle_was_rebuild_skip": _status_bool(
+            status, _TRQN_STATUS_PREVIOUS_CYCLE_WAS_REBUILD_SKIP, False,
+        ),
+        "fullstep_borked_last": _status_bool(
+            status, _TRQN_STATUS_FULLSTEP_BORKED_LAST, False,
+        ),
+        "final_borked_last": _status_bool(
+            status, _TRQN_STATUS_FINAL_BORKED_LAST, False,
+        ),
+        "final_solution_kind_last": _status_int(
+            status, _TRQN_STATUS_FINAL_SOLUTION_KIND_LAST, None,
         ),
     }
     return {k: _json_safe_value(v) for k, v in summary.items()}

@@ -18,6 +18,7 @@ from ichor.hpc.active_learning.acquisition.ariadne_local_runner import (
     _ds_safe_init_kwargs,
     _finalise_optimiser_diagnostics,
     _new_optimiser_diagnostics,
+    _trqn_status_summary,
     _validate_ds_init_kwargs,
     run_optimisation_against_calculator,
 )
@@ -275,12 +276,67 @@ def _trqn_status(
     status[1] = 0.0
     status[2] = run_idx
     status[3] = proposal_pending
+    status[21] = 0.2
+    status[22] = trust
     status[23] = invalid_reason
     status[35] = step_state
+    status[36] = 0.04
     status[39] = 1
-    status[54] = skip_step_after_rebuild
-    status[65] = consecutive_bt_fail_count
+    status[53] = 16
+    status[54] = 5
+    status[55] = skip_step_after_rebuild
+    status[56] = 1
+    status[57] = 4
+    status[58] = 3
+    status[59] = 1
+    status[60] = 0
+    status[61] = 1
+    status[62] = 1
+    status[63] = 1
+    status[64] = 0.03
+    status[65] = 0.04
+    status[66] = consecutive_bt_fail_count
+    status[71] = 1
+    status[72] = 1
+    status[73] = 0
+    status[74] = 2
     return tuple(status)
+
+
+def test_trqn_status_summary_decodes_current_ariadne_layout():
+    summary = _trqn_status_summary(
+        _trqn_status(
+            run_idx=7,
+            skip_step_after_rebuild=1,
+            consecutive_bt_fail_count=4,
+        )
+    )
+
+    assert summary["run_idx"] == 7
+    assert summary["invalid_reason_label"] == "backtransform_fail"
+    assert summary["trust_before_update"] == pytest.approx(0.2)
+    assert summary["trust_after_update"] == pytest.approx(1.0e-4)
+    assert summary["cartnorm_last"] == pytest.approx(0.04)
+    assert summary["force_rebuild"] is True
+    assert summary["force_rebuild_reason"] == 16
+    assert summary["force_rebuild_count"] == 5
+    assert summary["skip_step_after_rebuild"] is True
+    assert summary["last_rebuild_used_cartesian"] is True
+    assert summary["proposal_stage"] == 4
+    assert summary["bt_entry_code"] == 3
+    assert summary["bt_attempted"] is True
+    assert summary["proposal_ready"] is False
+    assert summary["rebuild_requested_last"] is True
+    assert summary["rebuild_applied_last"] is True
+    assert summary["ic_system_changed_last"] is True
+    assert summary["bt_input_dlc_inf"] == pytest.approx(0.03)
+    assert summary["bt_input_cartnorm"] == pytest.approx(0.04)
+    assert summary["consecutive_bt_fail_count"] == 4
+    assert summary["previous_cycle_was_rebuild_skip"] is True
+    assert summary["fullstep_borked_last"] is True
+    assert summary["final_borked_last"] is False
+    assert summary["final_solution_kind_last"] == 2
+    json.dumps(summary)
 
 
 class _NoProposalTrqn:
