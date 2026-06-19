@@ -21,8 +21,10 @@ SeedLocalAdversarialAcquisition we built earlier.
 """
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -228,6 +230,30 @@ def _append_status_sample(
     last = diagnostics.setdefault("status_samples_last", [])
     last.append(dict(sample))
     del last[:-5]
+
+
+def _append_trace_event(trace_path, **payload: Any) -> None:
+    if trace_path is None:
+        return
+    try:
+        path = Path(trace_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {"schema_version": 1}
+        record.update({str(k): _json_safe_value(v) for k, v in payload.items()})
+        with open(path, "a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")))
+            handle.write("\n")
+    except Exception:
+        return
+
+
+def _trace_status(status) -> Dict[str, Any]:
+    summary = _trqn_status_summary(status)
+    return {
+        "trust": summary.get("trust"),
+        "reason": summary.get("invalid_reason_label"),
+        "proposal_pending": summary.get("proposal_pending"),
+    }
 
 
 def _finalise_optimiser_diagnostics(
@@ -945,6 +971,7 @@ def run_optimisation_against_calculator(
     seed_atoms,
     calculator,
     run_config,
+    trace_path=None,
 ):
     """Drive ARIADNE for a single seed against the supplied calculator.
 
@@ -1001,6 +1028,16 @@ def run_optimisation_against_calculator(
         diagnostics["ds_init_profile"] = _DS_INIT_PROFILE
 
     _raise_if_init_failed(opt, "DS" if not is_trqn else "TRQN")
+    _append_trace_event(
+        trace_path,
+        event="start",
+        step=-1,
+        optimiser=("trust_region_qn" if is_trqn else "dissipative_symplectic"),
+        alpha=-float(e0_hartree),
+        grad_norm=float(np.linalg.norm(g0_flat)),
+        accepted=True,
+        wall_seconds=float(time.perf_counter() - t0),
+    )
 
     # alpha is what we want to MAXIMISE (the adversarial acquisition
     # value). the calculator exposes a pseudo-energy so ariadne can
@@ -1084,6 +1121,20 @@ def run_optimisation_against_calculator(
                 label="after_no_proposal_stage1",
                 status=_status_tuple(opt),
             )
+            trace_extra = _trace_status(status_after_stage0)
+            _append_trace_event(
+                trace_path,
+                event="trqn_no_proposal" if is_trqn else "no_proposal",
+                step=step_idx,
+                optimiser=(
+                    "trust_region_qn" if is_trqn else "dissipative_symplectic"
+                ),
+                alpha=-float(f_current),
+                grad_norm=float(np.linalg.norm(g_current)),
+                accepted=False,
+                wall_seconds=float(time.perf_counter() - t0),
+                **trace_extra,
+            )
             if is_trqn:
                 opt_converged, accepted, f_current = _status_trqn(opt)
             else:
@@ -1125,6 +1176,36 @@ def run_optimisation_against_calculator(
                                 "dissipative_symplectic"
                             )
                             consecutive_rejects = 0
+                            diagnostics["fallback_to_ds_step"] = int(step_idx)
+                            diagnostics["fallback_to_ds_reason"] = str(
+                                no_proposal_failure_reason
+                            )
+                            diagnostics["trqn_failed_reason"] = str(
+                                no_proposal_failure_reason
+                            )
+                            diagnostics["trqn_no_proposal_reason"] = str(
+                                no_proposal_failure_reason
+                            )
+                            bt_count = (
+                                diagnostics.get(
+                                    "last_no_proposal_status_summary", {}
+                                )
+                                or {}
+                            ).get("consecutive_bt_fail_count")
+                            diagnostics[
+                                "trqn_consecutive_backtransform_fail_count"
+                            ] = bt_count
+                            _append_trace_event(
+                                trace_path,
+                                event="fallback_to_ds",
+                                step=step_idx,
+                                optimiser="dissipative_symplectic",
+                                alpha=-float(f_current),
+                                grad_norm=float(np.linalg.norm(g_current)),
+                                accepted=False,
+                                reason=str(no_proposal_failure_reason),
+                                wall_seconds=float(time.perf_counter() - t0),
+                            )
                         except Exception as exc:
                             return_code = 2
                             diagnostics["last_return_code_reason"] = (
@@ -1212,6 +1293,16 @@ def run_optimisation_against_calculator(
         else:
             diagnostics["n_rejected_steps"] += 1
             consecutive_rejects += 1
+        _append_trace_event(
+            trace_path,
+            event="accepted_step" if accepted else "rejected_step",
+            step=step_idx,
+            optimiser=("trust_region_qn" if is_trqn else "dissipative_symplectic"),
+            alpha=-float(f_current),
+            grad_norm=float(np.linalg.norm(g_trial)),
+            accepted=bool(accepted),
+            wall_seconds=float(time.perf_counter() - t0),
+        )
 
         if opt_converged:
             converged = True
@@ -1247,6 +1338,20 @@ def run_optimisation_against_calculator(
                 diagnostics["ds_init_profile"] = _DS_INIT_PROFILE
                 diagnostics["optimiser_final"] = "dissipative_symplectic"
                 consecutive_rejects = 0
+                diagnostics["fallback_to_ds_step"] = int(step_idx)
+                diagnostics["fallback_to_ds_reason"] = "reject_streak"
+                diagnostics["trqn_failed_reason"] = "reject_streak"
+                _append_trace_event(
+                    trace_path,
+                    event="fallback_to_ds",
+                    step=step_idx,
+                    optimiser="dissipative_symplectic",
+                    alpha=-float(f_current),
+                    grad_norm=float(grad_norm_trajectory[-1]),
+                    accepted=False,
+                    reason="reject_streak",
+                    wall_seconds=float(time.perf_counter() - t0),
+                )
             except Exception as exc:
                 return_code = 2
                 diagnostics["last_return_code_reason"] = (
@@ -1270,6 +1375,35 @@ def run_optimisation_against_calculator(
         diagnostics,
         return_code=int(return_code),
         converged=bool(converged),
+    )
+    if int(return_code) == 1:
+        _append_trace_event(
+            trace_path,
+            event="max_iterations",
+            step=int(run_config.max_iter),
+            optimiser=("trust_region_qn" if is_trqn else "dissipative_symplectic"),
+            alpha=(float(alpha_trajectory[-1]) if alpha_trajectory else None),
+            grad_norm=(
+                float(grad_norm_trajectory[-1])
+                if grad_norm_trajectory else None
+            ),
+            accepted=False,
+            reason=str(diagnostics.get("last_return_code_reason", "")),
+            wall_seconds=float(time.perf_counter() - t0),
+        )
+    _append_trace_event(
+        trace_path,
+        event="finish",
+        step=int(len(alpha_trajectory) - 1),
+        optimiser=("trust_region_qn" if is_trqn else "dissipative_symplectic"),
+        alpha=(float(alpha_trajectory[-1]) if alpha_trajectory else None),
+        grad_norm=(
+            float(grad_norm_trajectory[-1])
+            if grad_norm_trajectory else None
+        ),
+        accepted=bool(converged),
+        reason=str(diagnostics.get("last_return_code_reason", "")),
+        wall_seconds=float(time.perf_counter() - t0),
     )
 
     return OptimisationResult(

@@ -132,7 +132,7 @@ def clean_stale_ariadne_seed_outputs(campaign_dir, iteration: int) -> List[str]:
             )
         if not seed_dir.is_dir():
             continue
-        candidates = [seed_dir / "result.json"]
+        candidates = [seed_dir / "result.json", seed_dir / "ARIADNE_TRACE.jsonl"]
         candidates.extend(sorted(seed_dir.glob("result.json.*.tmp")))
         for target in candidates:
             if not target.exists() and not target.is_symlink():
@@ -1661,6 +1661,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             write_ariadne_landing_audit,
             write_ariadne_results_manifest,
         )
+        from ..acquisition.ariadne_runner import ariadne_result_usability_payload
         from .phase_executor import PhaseResult
 
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
@@ -1745,6 +1746,13 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     "reason": "missing_result_json",
                 })
                 self._journal_event(
+                    "ariadne_task_rejected_missing_result",
+                    phase=phase_name,
+                    iteration=int(state.iteration),
+                    seed_dir=seed_dir.name,
+                    result_json=str(result_path.resolve()),
+                )
+                self._journal_event(
                     "quantum_output_rejected",
                     phase=phase_name,
                     iteration=int(state.iteration),
@@ -1768,6 +1776,14 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     "result_json": str(result_path.resolve()),
                     "reason": "result_json_parse_failure",
                 })
+                self._journal_event(
+                    "ariadne_task_rejected_malformed_result",
+                    phase=phase_name,
+                    iteration=int(state.iteration),
+                    seed_dir=seed_dir.name,
+                    result_json=str(result_path.resolve()),
+                    reason="result_json_parse_failure",
+                )
                 self._journal_event(
                     "quantum_output_rejected",
                     phase=phase_name,
@@ -1798,6 +1814,14 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     "reason": reason,
                 })
                 self._journal_event(
+                    "ariadne_task_rejected_malformed_result",
+                    phase=phase_name,
+                    iteration=int(state.iteration),
+                    seed_dir=seed_dir.name,
+                    result_json=str(result_path.resolve()),
+                    reason=reason,
+                )
+                self._journal_event(
                     "quantum_output_rejected",
                     phase=phase_name,
                     iteration=int(state.iteration),
@@ -1805,6 +1829,17 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     reason=reason,
                 )
                 continue
+
+            usability = ariadne_result_usability_payload(
+                result_dict,
+                allow_seed_fallback=bool(
+                    getattr(
+                        getattr(self.config, "adversarial_safety", None),
+                        "allow_seed_fallback",
+                        False,
+                    )
+                ),
+            )
 
             landing_safety = result_dict.get("landing_safety")
             if not isinstance(landing_safety, dict):
@@ -1826,6 +1861,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 "result_json": str(result_path.resolve()),
                 "landing_safety": dict(landing_safety),
                 "landing_candidates": list(result_dict.get("landing_candidates") or []),
+                "task_success": bool(usability.get("usable", False)),
+                "task_success_reason": str(usability.get("reason", "")),
             }
             landing_audit_records.append(audit_record)
             if not bool(landing_safety.get("accepted", False)):
@@ -1838,6 +1875,15 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     "reason": reason,
                     "landing_safety": dict(landing_safety),
                 })
+                self._journal_event(
+                    "ariadne_task_rejected_unsafe_landing",
+                    phase=phase_name,
+                    iteration=int(state.iteration),
+                    seed_dir=seed_dir.name,
+                    result_json=str(result_path.resolve()),
+                    reason=reason,
+                    policy=str(landing_safety.get("policy", "unknown")),
+                )
                 self._journal_event(
                     "ariadne_landing_rejected",
                     iteration=int(state.iteration),
@@ -1853,6 +1899,18 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     reason=reason,
                 )
                 continue
+
+            if int(validated["return_code"]) != 0:
+                self._journal_event(
+                    "ariadne_task_salvaged_from_nonzero_exit",
+                    phase=phase_name,
+                    iteration=int(state.iteration),
+                    seed_dir=seed_dir.name,
+                    result_json=str(result_path.resolve()),
+                    return_code=int(validated["return_code"]),
+                    reason=str(usability.get("reason", "")),
+                    policy=str(landing_safety.get("policy", "unknown")),
+                )
 
             geometry_quality = _ariadne_geometry_quality(
                 result_dict,
@@ -2022,6 +2080,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     else None
                 ),
                 "return_code": int(validated["return_code"]),
+                "task_success": bool(usability.get("usable", False)),
+                "task_success_reason": str(usability.get("reason", "")),
             })
 
         n_kept = len(accepted)

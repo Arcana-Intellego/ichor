@@ -85,6 +85,10 @@ class AriadneRunResult:
     landing_candidates: List[Dict[str, Any]] = field(default_factory=list)
     selection_diagnostics: Optional[Dict[str, Any]] = None
     optimiser_diagnostics: Optional[Dict[str, Any]] = None
+    optimiser_converged: Optional[bool] = None
+    task_success: Optional[bool] = None
+    task_success_reason: Optional[str] = None
+    task_exit_code: Optional[int] = None
 
     @property
     def alpha_initial(self) -> Optional[float]:
@@ -134,7 +138,137 @@ class AriadneRunResult:
             data["selection_diagnostics"] = dict(self.selection_diagnostics)
         if self.optimiser_diagnostics is not None:
             data["optimiser_diagnostics"] = dict(self.optimiser_diagnostics)
+        if self.optimiser_converged is not None:
+            data["optimiser_converged"] = bool(self.optimiser_converged)
+        if self.task_success is not None:
+            data["task_success"] = bool(self.task_success)
+        if self.task_success_reason is not None:
+            data["task_success_reason"] = str(self.task_success_reason)
+        if self.task_exit_code is not None:
+            data["task_exit_code"] = int(self.task_exit_code)
         return data
+
+
+def _payload_final_coordinates(payload: Dict[str, Any]) -> Optional[np.ndarray]:
+    try:
+        coords = np.asarray(payload.get("final_coordinates"), dtype=float)
+    except (TypeError, ValueError):
+        return None
+    if coords.ndim != 2 or coords.shape[1] != 3 or coords.shape[0] < 1:
+        return None
+    if not np.all(np.isfinite(coords)):
+        return None
+    return coords
+
+
+def ariadne_result_usability_payload(
+    payload: Dict[str, Any],
+    *,
+    allow_seed_fallback: bool = False,
+) -> Dict[str, Any]:
+    """Decide whether a per-seed ARIADNE result is usable by Phase B.
+
+    Optimiser convergence is useful diagnostic information, but the active
+    learning hand-off contract is a finite, safety-accepted landing. A
+    max-iteration run that selected a safe landing is therefore usable even
+    though the optimiser did not prove convergence.
+    """
+    if not isinstance(payload, dict):
+        return {
+            "usable": False,
+            "reason": "result_payload_not_mapping",
+            "task_exit_code": 4,
+            "optimiser_converged": False,
+        }
+    try:
+        return_code = int(payload.get("return_code"))
+    except (TypeError, ValueError):
+        return {
+            "usable": False,
+            "reason": "return_code_invalid",
+            "task_exit_code": 4,
+            "optimiser_converged": False,
+        }
+    optimiser_converged = bool(return_code == 0)
+    if return_code not in (0, 1):
+        return {
+            "usable": False,
+            "reason": "ariadne_return_code_" + str(return_code),
+            "task_exit_code": 4,
+            "optimiser_converged": optimiser_converged,
+        }
+    if _payload_final_coordinates(payload) is None:
+        return {
+            "usable": False,
+            "reason": "nonfinite_final_geometry",
+            "task_exit_code": 4,
+            "optimiser_converged": optimiser_converged,
+        }
+    safety = payload.get("landing_safety")
+    if not isinstance(safety, dict):
+        if return_code == 0:
+            return {
+                "usable": True,
+                "reason": "safe_landing_converged_legacy",
+                "task_exit_code": 0,
+                "optimiser_converged": True,
+            }
+        return {
+            "usable": False,
+            "reason": "missing_landing_safety",
+            "task_exit_code": 4,
+            "optimiser_converged": optimiser_converged,
+        }
+    if not bool(safety.get("accepted", False)):
+        reasons = safety.get("reasons") or ["landing_safety_rejected"]
+        reason = ";".join(str(r) for r in reasons)
+        return {
+            "usable": False,
+            "reason": reason,
+            "task_exit_code": 4,
+            "optimiser_converged": optimiser_converged,
+        }
+    policy = str(safety.get("policy", "unknown"))
+    selected_origin = str(safety.get("selected_origin", ""))
+    if (
+        not allow_seed_fallback
+        and (policy == "seed_fallback" or selected_origin == "seed_fallback")
+    ):
+        return {
+            "usable": False,
+            "reason": "seed_fallback_not_allowed",
+            "task_exit_code": 4,
+            "optimiser_converged": optimiser_converged,
+        }
+    if return_code == 0:
+        reason = "safe_landing_converged"
+    else:
+        diag = payload.get("optimiser_diagnostics")
+        opt_reason = ""
+        if isinstance(diag, dict):
+            opt_reason = str(diag.get("last_return_code_reason", ""))
+        reason = (
+            "safe_landing_after_max_iterations"
+            if opt_reason.startswith("max_iterations") or not opt_reason
+            else "safe_landing_nonconverged"
+        )
+    return {
+        "usable": True,
+        "reason": reason,
+        "task_exit_code": 0,
+        "optimiser_converged": optimiser_converged,
+    }
+
+
+def ariadne_result_usability(
+    result: AriadneRunResult,
+    *,
+    allow_seed_fallback: bool = False,
+) -> Dict[str, Any]:
+    return ariadne_result_usability_payload(
+        result.to_dict(),
+        allow_seed_fallback=allow_seed_fallback,
+    )
 
 
 def _import_ariadne():
@@ -167,6 +301,7 @@ def optimise_seed(
     gradient_backend: str = "process",
     safety_config: Optional[Any] = None,
     quality_gates: Optional[Any] = None,
+    trace_path: Optional[Any] = None,
 ) -> AriadneRunResult:
     """Drive the adversarial descent for a single seed.
 
@@ -199,6 +334,7 @@ def optimise_seed(
         gradient_backend=gradient_backend,
         safety_config=safety_config,
         quality_gates=quality_gates,
+        trace_path=trace_path,
     )
 
 
@@ -872,6 +1008,7 @@ def _live_optimise_seed(
     gradient_backend: str = "process",
     safety_config: Optional[Any] = None,
     quality_gates: Optional[Any] = None,
+    trace_path: Optional[Any] = None,
 ) -> AriadneRunResult:
     """Run ARIADNE adversarial descent for one seed against a real
     FEREBUS-trained posterior.
@@ -928,6 +1065,7 @@ def _live_optimise_seed(
         seed_atoms=seed_ase,
         calculator=calculator,
         run_config=run_config,
+        trace_path=trace_path,
     )
 
     raw_final_atoms = _make_ichor_from_positions(
@@ -976,6 +1114,7 @@ def _live_optimise_seed(
         landing_candidates=landing["landing_candidates"],
         selection_diagnostics=selection_diagnostics,
         optimiser_diagnostics=dict(opt_result.diagnostics or {}),
+        optimiser_converged=bool(opt_result.converged),
     )
 
 
@@ -1218,6 +1357,11 @@ def main(argv=None) -> int:
         if error_calibration_model is not None
         else 0.0
     )
+    seed_dir = (
+        iter_dir / "pool"
+        / ("seed_" + str(int(args.seed_index)).zfill(4))
+    )
+    trace_path = seed_dir / "ARIADNE_TRACE.jsonl"
 
     try:
         result = optimise_seed(
@@ -1235,6 +1379,7 @@ def main(argv=None) -> int:
             gradient_backend=str(config.resources.gradient_parallel_backend),
             safety_config=getattr(config, "adversarial_safety", None),
             quality_gates=getattr(config, "quality_gates", None),
+            trace_path=trace_path,
         )
     except Exception as exc:
         print(
@@ -1248,15 +1393,27 @@ def main(argv=None) -> int:
             mock=False,
         )
 
-    seed_dir = (
-        iter_dir / "pool"
-        / ("seed_" + str(int(args.seed_index)).zfill(4))
-    )
     seed_dir.mkdir(parents=True, exist_ok=True)
     payload = result.to_dict()
     payload["seed_frame_id"] = seed_frame_id
     payload["seed_index"] = int(args.seed_index)
     payload["iteration"] = int(args.iteration)
+    allow_seed_fallback = bool(
+        getattr(getattr(config, "adversarial_safety", None), "allow_seed_fallback", False)
+    )
+    usability = ariadne_result_usability_payload(
+        payload,
+        allow_seed_fallback=allow_seed_fallback,
+    )
+    payload["optimiser_converged"] = bool(usability["optimiser_converged"])
+    payload["task_success"] = bool(usability["usable"])
+    payload["task_success_reason"] = str(usability["reason"])
+    payload["task_exit_code"] = int(usability["task_exit_code"])
+    if isinstance(payload.get("landing_safety"), dict):
+        payload["selected_landing_policy"] = str(
+            payload["landing_safety"].get("policy", "unknown")
+        )
+        payload["selected_landing_usable"] = bool(usability["usable"])
     if isinstance(payload.get("selection_diagnostics"), dict):
         payload["selection_diagnostics"]["model_version"] = int(state.models_version)
         payload["selection_diagnostics"]["seed_index"] = int(args.seed_index)
@@ -1267,7 +1424,7 @@ def main(argv=None) -> int:
     from ..daemon.state import atomic_write_json
 
     atomic_write_json(seed_dir / "result.json", payload)
-    return 0 if result.return_code == 0 else 4
+    return int(usability["task_exit_code"])
 
 
 if __name__ == "__main__":

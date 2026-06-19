@@ -13,6 +13,7 @@ from ichor.core.atoms import Atom, Atoms
 from ichor.hpc.active_learning.acquisition.ariadne_runner import (
     AriadneRunConfig,
     AriadneRunResult,
+    ariadne_result_usability_payload,
     optimise_seed,
 )
 
@@ -124,6 +125,51 @@ def test_to_dict_includes_optional_optimiser_diagnostics():
         == "max_iterations_no_trial_evaluations"
     )
     json.dumps(d)
+
+
+def test_safe_max_iteration_result_is_task_usable():
+    seed = _water()
+    out = AriadneRunResult(
+        initial_atoms=seed,
+        final_atoms=seed,
+        alpha_trajectory=[1.0, 2.0],
+        grad_norm_trajectory=[3.0, 2.5],
+        return_code=1,
+        landing_safety={
+            "accepted": True,
+            "policy": "salvaged_iterate",
+            "selected_origin": "accepted_iterate",
+            "reasons": [],
+        },
+        optimiser_diagnostics={"last_return_code_reason": "max_iterations"},
+    )
+
+    usability = ariadne_result_usability_payload(out.to_dict())
+
+    assert usability["usable"] is True
+    assert usability["task_exit_code"] == 0
+    assert usability["reason"] == "safe_landing_after_max_iterations"
+    assert usability["optimiser_converged"] is False
+
+
+def test_unsafe_max_iteration_result_is_not_task_usable():
+    seed = _water()
+    out = AriadneRunResult(
+        initial_atoms=seed,
+        final_atoms=seed,
+        return_code=1,
+        landing_safety={
+            "accepted": False,
+            "policy": "rejected",
+            "reasons": ["no_safe_non_seed_landing"],
+        },
+    )
+
+    usability = ariadne_result_usability_payload(out.to_dict())
+
+    assert usability["usable"] is False
+    assert usability["task_exit_code"] == 4
+    assert usability["reason"] == "no_safe_non_seed_landing"
 
 
 def test_alpha_initial_and_final_properties():

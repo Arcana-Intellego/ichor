@@ -11,6 +11,7 @@ from ichor.hpc.active_learning.acquisition.ariadne_local_runner import (
     _ARIADNE_TRQN_CONTROLLER_NONE,
     _DS_INIT_PROFILE,
     _append_status_sample,
+    _append_trace_event,
     _build_ds,
     _build_trqn,
     _ds_safe_init_kwargs,
@@ -21,6 +22,35 @@ from ichor.hpc.active_learning.acquisition.ariadne_local_runner import (
 )
 import ichor.hpc.active_learning.acquisition.ariadne_local_runner as local_runner
 from ichor.hpc.active_learning.acquisition.ariadne_runner import AriadneRunConfig
+
+
+def test_append_trace_event_writes_jsonl(tmp_path):
+    trace = tmp_path / "seed_0000" / "ARIADNE_TRACE.jsonl"
+
+    _append_trace_event(
+        trace,
+        event="accepted_step",
+        step=3,
+        optimiser="dissipative_symplectic",
+        alpha=2.5,
+        grad_norm=0.25,
+        accepted=True,
+        wall_seconds=1.5,
+    )
+
+    rows = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    assert rows == [
+        {
+            "schema_version": 1,
+            "accepted": True,
+            "alpha": 2.5,
+            "event": "accepted_step",
+            "grad_norm": 0.25,
+            "optimiser": "dissipative_symplectic",
+            "step": 3,
+            "wall_seconds": 1.5,
+        }
+    ]
 
 
 class _FakeOptimiser:

@@ -870,6 +870,8 @@ class Daemon:
 
         #Job has reached terminal state(s). Decide between postprocess and
         #failure handling based on the success ratio.
+        if phase == CampaignPhase.ARIADNE_ARRAY:
+            return self._postprocess(state, phase, observations, summary)
 
         success_ratio = summary.n_completed / summary.n_tasks
         failure_threshold = 1.0 - self.config.failure_threshold_fraction

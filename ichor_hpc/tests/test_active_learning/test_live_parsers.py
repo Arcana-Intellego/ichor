@@ -655,6 +655,43 @@ def test_ariadne_parser_happy_path(tmp_path):
     assert succeeded[-1]["phase"] == "ARIADNE_ARRAY"
 
 
+def test_ariadne_parser_accepts_safe_max_iteration_result(tmp_path):
+    ex = _make_executor(tmp_path)
+    pool = _seed_ariadne_pool(tmp_path / "campaign", iteration=4, n_seeds=1)
+    result_path = pool / "seed_0000" / "result.json"
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    payload["return_code"] = 1
+    payload["optimiser_diagnostics"] = {
+        "schema_version": 1,
+        "last_return_code_reason": "max_iterations",
+    }
+    payload["landing_safety"] = {
+        "accepted": True,
+        "policy": "salvaged_iterate",
+        "selected_origin": "accepted_iterate",
+        "reasons": [],
+        "record_only_reasons": [],
+        "metrics": {},
+    }
+    result_path.write_text(json.dumps(payload), encoding="utf-8")
+    state = SimpleNamespace(iteration=4, campaign_uid="m16-test")
+
+    result = ex._parse_ariadne_array_postprocess(
+        state, CampaignPhase("ARIADNE_ARRAY"), observations=[],
+    )
+
+    assert result.is_complete is True
+    assert result.failure_reason is None
+    events = _read_journal_events(tmp_path / "campaign")
+    salvaged = [
+        e for e in events
+        if e.get("event") == "ariadne_task_salvaged_from_nonzero_exit"
+    ]
+    assert salvaged
+    assert salvaged[-1]["return_code"] == 1
+    assert salvaged[-1]["reason"] == "safe_landing_after_max_iterations"
+
+
 def test_ariadne_parser_missing_pool_dir(tmp_path):
     ex = _make_executor(tmp_path)
     # Do not seed the pool dir.
@@ -720,6 +757,8 @@ def test_clean_stale_ariadne_seed_outputs_removes_only_results(tmp_path):
     seed_dir = pool / "seed_0000"
     tmp_result = seed_dir / "result.json.1234.abcd.tmp"
     tmp_result.write_text("partial", encoding="utf-8")
+    trace = seed_dir / "ARIADNE_TRACE.jsonl"
+    trace.write_text('{"event":"old"}\n', encoding="utf-8")
     protected = pool.parent / "seeds_picked.json"
     assert protected.is_file()
 
@@ -727,8 +766,10 @@ def test_clean_stale_ariadne_seed_outputs_removes_only_results(tmp_path):
 
     assert str(seed_dir / "result.json") in removed
     assert str(tmp_result) in removed
+    assert str(trace) in removed
     assert not (seed_dir / "result.json").exists()
     assert not tmp_result.exists()
+    assert not trace.exists()
     assert protected.is_file()
     assert seed_dir.is_dir()
 

@@ -419,7 +419,19 @@ def validate_ariadne_result(
         raise HandoffManifestError("wrong_seed_frame")
     return_code = int(result.get("return_code"))
     if return_code != 0:
-        raise HandoffManifestError("ariadne_return_code_" + str(return_code))
+        try:
+            from .acquisition.ariadne_runner import ariadne_result_usability_payload
+
+            usability = ariadne_result_usability_payload(result)
+        except Exception:
+            usability = {"usable": False, "reason": "usability_check_failed"}
+        if not bool(usability.get("usable", False)):
+            raise HandoffManifestError(
+                "ariadne_return_code_"
+                + str(return_code)
+                + ":"
+                + str(usability.get("reason", "unusable_landing"))
+            )
     alpha_initial = _finite_float(result.get("alpha_initial"))
     alpha_final = _finite_float(result.get("alpha_final"))
     n_evaluations = int(result.get("n_evaluations"))
