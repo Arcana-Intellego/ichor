@@ -15,6 +15,7 @@ from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.daemon.live_executor import (
     LIVE_POSTPROCESS_IMPLEMENTED,
     LiveBackendsPhaseExecutor,
+    _ariadne_optional_diagnostic_warnings,
     clean_stale_ariadne_seed_outputs,
 )
 from ichor.hpc.active_learning.daemon import input_staging as stg
@@ -66,6 +67,27 @@ def _read_journal_events(campaign_dir):
         for line in journal_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+
+
+def test_ariadne_optional_scale_diagnostics_are_warnings_only():
+    payload = {
+        "optimiser_diagnostics": {
+            "trqn_scale_mode": "adaptive_initial_gradient",
+            "trqn_objective_scale": "not-a-number",
+            "trqn_initial_raw_grad_norm": 12.0,
+            "trqn_retry_scaled_grad_norm": float("inf"),
+        }
+    }
+
+    warnings = _ariadne_optional_diagnostic_warnings(payload)
+
+    assert "trqn_objective_scale_not_numeric" in warnings
+    assert "trqn_retry_scaled_grad_norm_not_finite" in warnings
+
+
+def test_ariadne_optional_scale_diagnostics_accept_old_results():
+    assert _ariadne_optional_diagnostic_warnings({}) == []
+    assert _ariadne_optional_diagnostic_warnings({"optimiser_diagnostics": {}}) == []
 
 
 def test_four_quantum_phases_registered_as_live():

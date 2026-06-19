@@ -39,6 +39,7 @@ def format_sampling_protocol_summary(config: CampaignConfig) -> str:
     resources = config.resources
     gaussian = config.gaussian
     aimall = config.aimall
+    ariadne = config.ariadne
     spectral = acq.spectral
     energy = acq.calibrated_energy
     fullspace = acq.fullspace_confinement
@@ -128,6 +129,31 @@ def format_sampling_protocol_summary(config: CampaignConfig) -> str:
         _line(
             "acquisition.stencils.lambda_negative_curvature",
             stencils.lambda_negative_curvature,
+        )
+    )
+    lines.append(_line("ariadne.optimiser", ariadne.optimiser))
+    lines.append(_line("ariadne.hessian_model", ariadne.hessian_model))
+    lines.append(_line("ariadne.fallback_to_ds", ariadne.fallback_to_ds))
+    lines.append(
+        _line(
+            "ariadne.trqn_objective_scaling",
+            "mode="
+            + str(ariadne.trqn_scale_mode)
+            + ", target="
+            + str(ariadne.trqn_target_initial_grad_norm)
+            + ", retry_target="
+            + str(ariadne.trqn_retry_target_initial_grad_norm)
+            + ", scale=["
+            + str(ariadne.trqn_min_objective_scale)
+            + ", "
+            + str(ariadne.trqn_max_objective_scale)
+            + "]",
+        )
+    )
+    lines.append(
+        _line(
+            "ariadne.trqn_retry_on_no_proposal",
+            ariadne.trqn_retry_on_no_proposal,
         )
     )
     lines.append(_line("resources.partition", resources.partition))

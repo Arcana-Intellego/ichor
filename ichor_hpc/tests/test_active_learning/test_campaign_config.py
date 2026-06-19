@@ -541,6 +541,13 @@ def test_ariadne_block_defaults():
     ab = AriadneConfigBlock()
     assert ab.optimiser == "trust_region_qn"
     assert ab.fallback_to_ds is True
+    assert ab.trqn_scale_mode == "adaptive_initial_gradient"
+    assert ab.trqn_target_initial_grad_norm == pytest.approx(0.01)
+    assert ab.trqn_retry_target_initial_grad_norm == pytest.approx(0.003)
+    assert ab.trqn_min_objective_scale == pytest.approx(1.0e-6)
+    assert ab.trqn_max_objective_scale == pytest.approx(1.0)
+    assert ab.trqn_fixed_objective_scale == pytest.approx(1.0)
+    assert ab.trqn_retry_on_no_proposal is True
 
 
 def test_ferebus_fraction_sum_must_be_one():

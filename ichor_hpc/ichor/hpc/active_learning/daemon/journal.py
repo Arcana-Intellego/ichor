@@ -99,6 +99,7 @@ KNOWN_EVENT_TYPES = (
     "required_phase_output_missing_after_failure",
     "reconcile_applied",
     "committed_artifact_settle_retry",
+    "ariadne_optional_diagnostics_warning",
 )
 
 
@@ -217,4 +218,3 @@ def read_events(
         if since is not None and str(record.get("ts", "")) < since:
             continue
         yield record
-

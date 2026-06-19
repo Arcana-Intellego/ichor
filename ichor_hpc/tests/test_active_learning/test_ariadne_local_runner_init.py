@@ -14,6 +14,7 @@ from ichor.hpc.active_learning.acquisition.ariadne_local_runner import (
     _append_trace_event,
     _build_ds,
     _build_trqn,
+    _compute_trqn_objective_scale,
     _ds_safe_init_kwargs,
     _finalise_optimiser_diagnostics,
     _new_optimiser_diagnostics,
@@ -211,6 +212,32 @@ def test_ds_safe_init_validation_rejects_bad_profile_values():
         _validate_ds_init_kwargs(kwargs)
 
 
+def test_trqn_adaptive_objective_scale_targets_initial_gradient_norm():
+    info = _compute_trqn_objective_scale(
+        AriadneRunConfig(trqn_target_initial_grad_norm=0.01),
+        64.0,
+    )
+
+    assert info["scale"] == pytest.approx(0.01 / 64.0)
+    assert info["scaled_grad_norm"] == pytest.approx(0.01)
+    assert info["reason"] == "adaptive_initial_gradient"
+
+
+def test_trqn_adaptive_objective_scale_respects_bounds_and_zero_gradient():
+    info = _compute_trqn_objective_scale(
+        AriadneRunConfig(
+            trqn_target_initial_grad_norm=0.01,
+            trqn_min_objective_scale=1.0e-4,
+        ),
+        1.0e9,
+    )
+    assert info["scale"] == pytest.approx(1.0e-4)
+
+    zero = _compute_trqn_objective_scale(AriadneRunConfig(), 0.0)
+    assert zero["scale"] == pytest.approx(1.0)
+    assert zero["reason"] == "zero_initial_gradient"
+
+
 def test_optimiser_diagnostics_are_json_safe_for_no_trial_path():
     diagnostics = _new_optimiser_diagnostics("trust_region_qn")
     diagnostics["n_stage0_calls"] = 3
@@ -260,10 +287,12 @@ class _NoProposalTrqn:
     def __init__(self, *, skip_step_after_rebuild=False):
         self.q = np.zeros(6, dtype=np.float64)
         self.g = np.ones(6, dtype=np.float64)
+        self.init_kwargs = None
         self.run_idx = 0
         self.skip_step_after_rebuild = bool(skip_step_after_rebuild)
 
     def init(self, **kwargs):
+        self.init_kwargs = dict(kwargs)
         self.q = np.asarray(kwargs["q0_xyz"], dtype=np.float64).reshape(-1).copy()
         self.g = np.asarray(kwargs["g0_xyz"], dtype=np.float64).reshape(-1).copy()
 
@@ -328,11 +357,13 @@ class _NoProposalTrqnFactory:
     def __init__(self, *, skip_step_after_rebuild=False):
         self.skip_step_after_rebuild = bool(skip_step_after_rebuild)
         self.last = None
+        self.instances = []
 
     def trust_region_qn(self):
         self.last = _NoProposalTrqn(
             skip_step_after_rebuild=self.skip_step_after_rebuild,
         )
+        self.instances.append(self.last)
         return self.last
 
 
@@ -407,6 +438,7 @@ def test_repeated_trqn_no_proposal_backtransform_failure_falls_back_to_ds(monkey
             optimiser="trust_region_qn",
             max_iter=8,
             fallback_to_ds=True,
+            trqn_retry_on_no_proposal=False,
         ),
     )
 
@@ -426,6 +458,39 @@ def test_repeated_trqn_no_proposal_backtransform_failure_falls_back_to_ds(monkey
     assert ariadne._ds_factory.last.init_kwargs["htvi_gamma_0"] > 0.0
 
 
+def test_trqn_no_proposal_retries_with_lower_objective_scale_before_ds(monkeypatch):
+    ariadne = _fake_runner_ariadne()
+    monkeypatch.setattr(local_runner, "_import_ariadne", lambda: ariadne)
+
+    result = run_optimisation_against_calculator(
+        _FakeAtoms(),
+        calculator=None,
+        run_config=AriadneRunConfig(
+            optimiser="trust_region_qn",
+            max_iter=9,
+            fallback_to_ds=True,
+            trqn_retry_on_no_proposal=True,
+            trqn_target_initial_grad_norm=0.01,
+            trqn_retry_target_initial_grad_norm=0.003,
+        ),
+    )
+
+    first, retry = ariadne._trqn_factory.instances[:2]
+    first_norm = np.linalg.norm(first.init_kwargs["g0_xyz"])
+    retry_norm = np.linalg.norm(retry.init_kwargs["g0_xyz"])
+    assert first_norm == pytest.approx(0.01)
+    assert retry_norm == pytest.approx(0.003)
+    assert result.return_code == 0
+    assert result.fell_back_to_ds is True
+    assert result.diagnostics["trqn_retry_attempted"] is True
+    assert result.diagnostics["trqn_retry_objective_scale"] < (
+        result.diagnostics["trqn_objective_scale"]
+    )
+    assert result.diagnostics["trqn_retry_succeeded"] is False
+    assert result.diagnostics["trqn_failed_after_retry"] is True
+    assert result.diagnostics["n_fallback_to_ds"] == 1
+
+
 def test_repeated_trqn_no_proposal_backtransform_failure_fails_early(monkeypatch):
     ariadne = _fake_runner_ariadne()
     monkeypatch.setattr(local_runner, "_import_ariadne", lambda: ariadne)
@@ -437,6 +502,7 @@ def test_repeated_trqn_no_proposal_backtransform_failure_fails_early(monkeypatch
             optimiser="trust_region_qn",
             max_iter=8,
             fallback_to_ds=False,
+            trqn_retry_on_no_proposal=False,
         ),
     )
 
@@ -461,6 +527,7 @@ def test_rebuild_skip_no_proposal_path_is_not_classified_as_fatal(monkeypatch):
             optimiser="trust_region_qn",
             max_iter=2,
             fallback_to_ds=False,
+            trqn_retry_on_no_proposal=False,
         ),
     )
 

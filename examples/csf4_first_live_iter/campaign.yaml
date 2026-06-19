@@ -53,6 +53,10 @@ ariadne:
   hessian_model: ALMLOF
   max_iter: 50
   gradf_tol: 1.0e-4
+  trqn_scale_mode: adaptive_initial_gradient
+  trqn_target_initial_grad_norm: 0.01
+  trqn_retry_target_initial_grad_norm: 0.003
+  trqn_retry_on_no_proposal: true
 
 ferebus:
   scaling: false

@@ -65,6 +65,42 @@ ARIADNE_FIELD_SPECS = [
         "bool",
         prompt="Fallback to dissipative_symplectic on BFGS curvature reject: ",
     ),
+    spec(
+        "trqn_scale_mode",
+        "choice",
+        choices=["off", "fixed", "adaptive_initial_gradient"],
+        prompt="TRQN objective scale mode: ",
+    ),
+    spec(
+        "trqn_target_initial_grad_norm",
+        "float",
+        prompt="TRQN target initial gradient norm: ",
+    ),
+    spec(
+        "trqn_retry_target_initial_grad_norm",
+        "float",
+        prompt="TRQN retry target initial gradient norm: ",
+    ),
+    spec(
+        "trqn_min_objective_scale",
+        "float",
+        prompt="TRQN minimum objective scale: ",
+    ),
+    spec(
+        "trqn_max_objective_scale",
+        "float",
+        prompt="TRQN maximum objective scale: ",
+    ),
+    spec(
+        "trqn_fixed_objective_scale",
+        "float",
+        prompt="TRQN fixed objective scale: ",
+    ),
+    spec(
+        "trqn_retry_on_no_proposal",
+        "bool",
+        prompt="Retry TRQN once after no-proposal failure: ",
+    ),
 ]
 
 

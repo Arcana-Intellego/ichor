@@ -53,6 +53,13 @@ class AriadneRunConfig:
     delta_max: float = 0.40
     gamma: float = 0.10
     fallback_to_ds: bool = True
+    trqn_scale_mode: str = "adaptive_initial_gradient"
+    trqn_target_initial_grad_norm: float = 0.01
+    trqn_retry_target_initial_grad_norm: float = 0.003
+    trqn_min_objective_scale: float = 1.0e-6
+    trqn_max_objective_scale: float = 1.0
+    trqn_fixed_objective_scale: float = 1.0
+    trqn_retry_on_no_proposal: bool = True
     rng_seed: int = 0
     mock_perturbation_angstrom: float = 1.0e-4
 

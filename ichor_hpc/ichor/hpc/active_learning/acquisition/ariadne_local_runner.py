@@ -325,19 +325,28 @@ def _flatten_xyz(values) -> np.ndarray:
     return np.asfortranarray(np.asarray(values, dtype=np.float64).reshape(-1), dtype=np.float64)
 
 
-def _eval_energy_gradient(atoms):
+def _eval_energy_gradient(atoms, *, objective_scale: float = 1.0):
     """One calculator evaluation. Returns (f_pseudo, g_flat_pseudo).
 
     Mirrors evaluate_energy_and_gradient from the ARIADNE starter pack.
     The adversarial calculator returns pseudo-energy + pseudo-forces in ASE
     units (eV and eV/Angstrom). Divide by the same pseudo Hartree scale so
-    ARIADNE optimises alpha in acquisition units.
+    ARIADNE optimises alpha in acquisition units, then optionally apply a
+    positive optimiser-only scale. The scale preserves the acquisition argmax
+    but can keep TRQN's internal-coordinate backtransform in a sane numerical
+    range.
     """
+    scale = float(objective_scale)
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise RuntimeError("objective_scale must be finite and positive")
     e_ev = float(atoms.get_potential_energy())
     forces_ev = np.asarray(atoms.get_forces(), dtype=np.float64)
     grad_ev = -forces_ev
-    e_hartree = e_ev / _HARTREE_EV
-    g_xyz_hartree = np.asfortranarray(grad_ev / _HARTREE_EV, dtype=np.float64)
+    e_hartree = (e_ev / _HARTREE_EV) * scale
+    g_xyz_hartree = np.asfortranarray(
+        (grad_ev / _HARTREE_EV) * scale,
+        dtype=np.float64,
+    )
     g_flat_hartree = _flatten_xyz(g_xyz_hartree)
     if not np.isfinite(e_hartree):
         raise RuntimeError(
@@ -348,6 +357,100 @@ def _eval_energy_gradient(atoms):
             "calculator returned non-finite entries in the gradient"
         )
     return e_hartree, g_flat_hartree
+
+
+def _raw_alpha_from_scaled(f_scaled: float, objective_scale: float) -> float:
+    scale = float(objective_scale)
+    if not np.isfinite(scale) or scale <= 0.0:
+        scale = 1.0
+    return -float(f_scaled) / scale
+
+
+def _raw_grad_norm_from_scaled(g_scaled, objective_scale: float) -> float:
+    scale = float(objective_scale)
+    if not np.isfinite(scale) or scale <= 0.0:
+        scale = 1.0
+    return float(np.linalg.norm(g_scaled)) / scale
+
+
+def _trqn_scale_mode(run_config) -> str:
+    mode = str(getattr(run_config, "trqn_scale_mode", "off") or "off").strip().lower()
+    if mode not in {"off", "fixed", "adaptive_initial_gradient"}:
+        return "off"
+    return mode
+
+
+def _bounded_objective_scale(run_config, value: float) -> float:
+    try:
+        lower = float(getattr(run_config, "trqn_min_objective_scale", 1.0e-6))
+        upper = float(getattr(run_config, "trqn_max_objective_scale", 1.0))
+    except (TypeError, ValueError):
+        lower, upper = 1.0e-6, 1.0
+    if not np.isfinite(lower) or lower <= 0.0:
+        lower = 1.0e-6
+    if not np.isfinite(upper) or upper <= 0.0:
+        upper = 1.0
+    if upper < lower:
+        upper = lower
+    upper = min(upper, 1.0)
+    scale = float(value)
+    if not np.isfinite(scale) or scale <= 0.0:
+        scale = upper
+    return float(min(max(scale, lower), upper))
+
+
+def _compute_trqn_objective_scale(
+    run_config,
+    raw_grad_norm: float,
+    *,
+    retry: bool = False,
+) -> Dict[str, Any]:
+    mode = _trqn_scale_mode(run_config)
+    raw_norm = float(raw_grad_norm)
+    if mode == "off":
+        target = None
+        scale = 1.0
+        reason = "disabled"
+    elif mode == "fixed":
+        target = None
+        scale = _bounded_objective_scale(
+            run_config,
+            float(getattr(run_config, "trqn_fixed_objective_scale", 1.0)),
+        )
+        reason = "fixed"
+    else:
+        attr = (
+            "trqn_retry_target_initial_grad_norm"
+            if retry else "trqn_target_initial_grad_norm"
+        )
+        try:
+            target = float(getattr(run_config, attr))
+        except (TypeError, ValueError):
+            target = 0.003 if retry else 0.01
+        if not np.isfinite(target) or target <= 0.0:
+            target = 0.003 if retry else 0.01
+        if not np.isfinite(raw_norm):
+            raise RuntimeError("TRQN initial raw gradient norm is non-finite")
+        if raw_norm <= 0.0:
+            scale = _bounded_objective_scale(
+                run_config,
+                float(getattr(run_config, "trqn_max_objective_scale", 1.0)),
+            )
+            reason = "zero_initial_gradient"
+        else:
+            scale = _bounded_objective_scale(run_config, target / raw_norm)
+            reason = "adaptive_initial_gradient"
+    return {
+        "mode": mode,
+        "scale": float(scale),
+        "target": target,
+        "raw_grad_norm": raw_norm,
+        "scaled_grad_norm": (
+            None if not np.isfinite(raw_norm) else float(raw_norm) * float(scale)
+        ),
+        "reason": reason,
+        "retry": bool(retry),
+    }
 
 
 def _sync_state(opt, n_atoms):
@@ -1005,13 +1108,36 @@ def run_optimisation_against_calculator(
         atoms.get_positions(), dtype=np.float64,
     )
 
-    # one calculator call before the loop -- ariadne needs an initial
-    # energy + gradient to seed its internal hessian model.
-    e0_hartree, g0_flat = _eval_energy_gradient(atoms)
-    g0_xyz = np.asfortranarray(g0_flat.reshape(natoms, 3), dtype=np.float64)
-    n_evaluations = 1
-
     optimiser_name = (run_config.optimiser or "trust_region_qn").strip().lower()
+    diagnostics = _new_optimiser_diagnostics(optimiser_name)
+
+    # one calculator call before the loop -- ariadne needs an initial
+    # energy + gradient to seed its internal hessian model. Evaluate once in
+    # raw acquisition units, then scale only the optimiser-facing copy when
+    # TRQN requests adaptive objective conditioning.
+    e0_raw, g0_raw = _eval_energy_gradient(atoms)
+    raw_initial_grad_norm = float(np.linalg.norm(g0_raw))
+    active_objective_scale = 1.0
+    trqn_scale_info = {
+        "mode": "not_applicable",
+        "scale": 1.0,
+        "target": None,
+        "raw_grad_norm": raw_initial_grad_norm,
+        "scaled_grad_norm": raw_initial_grad_norm,
+        "reason": "not_trqn",
+        "retry": False,
+    }
+    n_evaluations = 1
+    if optimiser_name in ("trust_region_qn", "trqn"):
+        trqn_scale_info = _compute_trqn_objective_scale(
+            run_config,
+            raw_initial_grad_norm,
+        )
+        active_objective_scale = float(trqn_scale_info["scale"])
+    e0_hartree = e0_raw * active_objective_scale
+    g0_flat = g0_raw * active_objective_scale
+    g0_xyz = np.asfortranarray(g0_flat.reshape(natoms, 3), dtype=np.float64)
+
     if optimiser_name in ("ds", "dissipative_symplectic"):
         opt = _build_ds(ariadne, q0_xyz_angstrom, g0_xyz, atom_list, run_config)
         is_trqn = False
@@ -1023,9 +1149,28 @@ def run_optimisation_against_calculator(
             "unknown ariadne.optimiser " + repr(run_config.optimiser)
             + "; valid: trust_region_qn | dissipative_symplectic"
         )
-    diagnostics = _new_optimiser_diagnostics(optimiser_name)
     if not is_trqn:
         diagnostics["ds_init_profile"] = _DS_INIT_PROFILE
+    diagnostics.update({
+        "objective_scale_schema_version": 1,
+        "trqn_scale_mode": str(trqn_scale_info["mode"]),
+        "trqn_objective_scale": float(trqn_scale_info["scale"]),
+        "trqn_scale_reason": str(trqn_scale_info["reason"]),
+        "trqn_target_initial_grad_norm": trqn_scale_info["target"],
+        "trqn_initial_raw_grad_norm": float(trqn_scale_info["raw_grad_norm"]),
+        "trqn_initial_scaled_grad_norm": trqn_scale_info["scaled_grad_norm"],
+        "trqn_retry_on_no_proposal": bool(
+            getattr(run_config, "trqn_retry_on_no_proposal", False)
+        ),
+        "trqn_retry_attempted": False,
+        "trqn_retry_objective_scale": None,
+        "trqn_retry_target_initial_grad_norm": None,
+        "trqn_retry_raw_grad_norm": None,
+        "trqn_retry_scaled_grad_norm": None,
+        "trqn_retry_reason": None,
+        "trqn_retry_succeeded": None,
+        "trqn_failed_after_retry": False,
+    })
 
     _raise_if_init_failed(opt, "DS" if not is_trqn else "TRQN")
     _append_trace_event(
@@ -1033,8 +1178,13 @@ def run_optimisation_against_calculator(
         event="start",
         step=-1,
         optimiser=("trust_region_qn" if is_trqn else "dissipative_symplectic"),
-        alpha=-float(e0_hartree),
-        grad_norm=float(np.linalg.norm(g0_flat)),
+        alpha=_raw_alpha_from_scaled(e0_hartree, active_objective_scale),
+        grad_norm=_raw_grad_norm_from_scaled(g0_flat, active_objective_scale),
+        objective_scale=float(active_objective_scale),
+        raw_grad_norm=float(raw_initial_grad_norm),
+        scaled_grad_norm=float(np.linalg.norm(g0_flat)),
+        scale_target=trqn_scale_info["target"],
+        scale_mode=str(trqn_scale_info["mode"]),
         accepted=True,
         wall_seconds=float(time.perf_counter() - t0),
     )
@@ -1042,12 +1192,15 @@ def run_optimisation_against_calculator(
     # alpha is what we want to MAXIMISE (the adversarial acquisition
     # value). the calculator exposes a pseudo-energy so ariadne can
     # minimise, so alpha = -f_pseudo.
-    alpha_trajectory = [-e0_hartree]
-    grad_norm_trajectory = [float(np.linalg.norm(g0_flat))]
+    alpha_trajectory = [_raw_alpha_from_scaled(e0_hartree, active_objective_scale)]
+    grad_norm_trajectory = [
+        _raw_grad_norm_from_scaled(g0_flat, active_objective_scale)
+    ]
     candidate_positions = [np.asarray(q0_xyz_angstrom, dtype=np.float64).copy()]
-    candidate_alphas = [float(-e0_hartree)]
-    candidate_grad_norms = [float(np.linalg.norm(g0_flat))]
+    candidate_alphas = [float(alpha_trajectory[0])]
+    candidate_grad_norms = [float(grad_norm_trajectory[0])]
     fell_back_to_ds = False
+    trqn_retry_attempted = False
     rigid_force_clamps = 0
     consecutive_rejects = 0
     no_proposal_failure_reason: Optional[str] = None
@@ -1129,8 +1282,12 @@ def run_optimisation_against_calculator(
                 optimiser=(
                     "trust_region_qn" if is_trqn else "dissipative_symplectic"
                 ),
-                alpha=-float(f_current),
-                grad_norm=float(np.linalg.norm(g_current)),
+                alpha=_raw_alpha_from_scaled(f_current, active_objective_scale),
+                grad_norm=_raw_grad_norm_from_scaled(
+                    g_current,
+                    active_objective_scale,
+                ),
+                objective_scale=float(active_objective_scale),
                 accepted=False,
                 wall_seconds=float(time.perf_counter() - t0),
                 **trace_extra,
@@ -1139,8 +1296,12 @@ def run_optimisation_against_calculator(
                 opt_converged, accepted, f_current = _status_trqn(opt)
             else:
                 opt_converged, accepted, f_current = _status_ds(opt)
-            alpha_trajectory.append(-float(f_current))
-            grad_norm_trajectory.append(float(np.linalg.norm(g_current)))
+            alpha_trajectory.append(
+                _raw_alpha_from_scaled(f_current, active_objective_scale)
+            )
+            grad_norm_trajectory.append(
+                _raw_grad_norm_from_scaled(g_current, active_objective_scale)
+            )
             if opt_converged:
                 converged = True
                 return_code = 0
@@ -1155,10 +1316,89 @@ def run_optimisation_against_calculator(
                 if consecutive_rejects >= _REJECT_STREAK_TRIGGER:
                     if (
                         is_trqn
+                        and bool(getattr(run_config, "trqn_retry_on_no_proposal", False))
+                        and not trqn_retry_attempted
+                    ):
+                        try:
+                            f_retry_raw, g_retry_raw = _eval_energy_gradient(atoms)
+                            n_evaluations += 1
+                            retry_info = _compute_trqn_objective_scale(
+                                run_config,
+                                float(np.linalg.norm(g_retry_raw)),
+                                retry=True,
+                            )
+                            active_objective_scale = float(retry_info["scale"])
+                            f_current = f_retry_raw * active_objective_scale
+                            g_retry = g_retry_raw * active_objective_scale
+                            opt = _build_trqn(
+                                ariadne,
+                                np.asfortranarray(
+                                    atoms.get_positions(), dtype=np.float64,
+                                ),
+                                np.asfortranarray(
+                                    g_retry.reshape(natoms, 3), dtype=np.float64,
+                                ),
+                                atom_list,
+                                run_config,
+                            )
+                            _raise_if_init_failed(opt, "TRQN retry")
+                            trqn_retry_attempted = True
+                            consecutive_rejects = 0
+                            diagnostics["trqn_retry_attempted"] = True
+                            diagnostics["trqn_retry_objective_scale"] = float(
+                                retry_info["scale"]
+                            )
+                            diagnostics["trqn_retry_target_initial_grad_norm"] = (
+                                retry_info["target"]
+                            )
+                            diagnostics["trqn_retry_raw_grad_norm"] = float(
+                                retry_info["raw_grad_norm"]
+                            )
+                            diagnostics["trqn_retry_scaled_grad_norm"] = (
+                                retry_info["scaled_grad_norm"]
+                            )
+                            diagnostics["trqn_retry_reason"] = str(
+                                no_proposal_failure_reason
+                            )
+                            diagnostics["trqn_retry_succeeded"] = None
+                            _append_trace_event(
+                                trace_path,
+                                event="trqn_retry",
+                                step=step_idx,
+                                optimiser="trust_region_qn",
+                                alpha=_raw_alpha_from_scaled(
+                                    f_current,
+                                    active_objective_scale,
+                                ),
+                                grad_norm=_raw_grad_norm_from_scaled(
+                                    g_retry,
+                                    active_objective_scale,
+                                ),
+                                objective_scale=float(active_objective_scale),
+                                raw_grad_norm=float(retry_info["raw_grad_norm"]),
+                                scaled_grad_norm=retry_info["scaled_grad_norm"],
+                                scale_target=retry_info["target"],
+                                scale_mode=str(retry_info["mode"]),
+                                accepted=False,
+                                reason=str(no_proposal_failure_reason),
+                                wall_seconds=float(time.perf_counter() - t0),
+                            )
+                            continue
+                        except Exception as exc:
+                            trqn_retry_attempted = True
+                            diagnostics["trqn_retry_attempted"] = True
+                            diagnostics["trqn_retry_succeeded"] = False
+                            diagnostics["trqn_failed_after_retry"] = True
+                            diagnostics["trqn_retry_reason"] = (
+                                "retry_exception:" + type(exc).__name__
+                            )
+                    if (
+                        is_trqn
                         and bool(run_config.fallback_to_ds)
                         and not fell_back_to_ds
                     ):
                         try:
+                            fallback_from_scale = float(active_objective_scale)
                             opt = _restart_under_ds(
                                 ariadne,
                                 atoms,
@@ -1167,8 +1407,12 @@ def run_optimisation_against_calculator(
                                 run_config,
                             )
                             n_evaluations += 1
+                            active_objective_scale = 1.0
                             is_trqn = False
                             fell_back_to_ds = True
+                            if bool(diagnostics.get("trqn_retry_attempted")):
+                                diagnostics["trqn_retry_succeeded"] = False
+                                diagnostics["trqn_failed_after_retry"] = True
                             diagnostics["n_fallback_to_ds"] += 1
                             diagnostics["n_no_proposal_recoveries"] += 1
                             diagnostics["ds_init_profile"] = _DS_INIT_PROFILE
@@ -1200,8 +1444,15 @@ def run_optimisation_against_calculator(
                                 event="fallback_to_ds",
                                 step=step_idx,
                                 optimiser="dissipative_symplectic",
-                                alpha=-float(f_current),
-                                grad_norm=float(np.linalg.norm(g_current)),
+                                alpha=_raw_alpha_from_scaled(
+                                    f_current,
+                                    fallback_from_scale,
+                                ),
+                                grad_norm=_raw_grad_norm_from_scaled(
+                                    g_current,
+                                    fallback_from_scale,
+                                ),
+                                objective_scale=float(fallback_from_scale),
                                 accepted=False,
                                 reason=str(no_proposal_failure_reason),
                                 wall_seconds=float(time.perf_counter() - t0),
@@ -1226,7 +1477,10 @@ def run_optimisation_against_calculator(
         _push_positions(atoms, q_proposed)
 
         try:
-            f_trial, g_trial = _eval_energy_gradient(atoms)
+            f_trial, g_trial = _eval_energy_gradient(
+                atoms,
+                objective_scale=active_objective_scale,
+            )
             n_evaluations += 1
             diagnostics["n_trial_evaluations"] += 1
         except Exception as exc:
@@ -1279,8 +1533,12 @@ def run_optimisation_against_calculator(
         else:
             opt_converged, accepted, f_current = _status_ds(opt)
 
-        alpha_trajectory.append(-float(f_current))
-        grad_norm_trajectory.append(float(np.linalg.norm(g_trial)))
+        alpha_trajectory.append(
+            _raw_alpha_from_scaled(f_current, active_objective_scale)
+        )
+        grad_norm_trajectory.append(
+            _raw_grad_norm_from_scaled(g_trial, active_objective_scale)
+        )
 
         if accepted:
             diagnostics["n_accepted_steps"] += 1
@@ -1288,8 +1546,10 @@ def run_optimisation_against_calculator(
             candidate_positions.append(
                 np.asarray(atoms.get_positions(), dtype=np.float64).copy()
             )
-            candidate_alphas.append(float(-float(f_current)))
-            candidate_grad_norms.append(float(np.linalg.norm(g_trial)))
+            candidate_alphas.append(float(alpha_trajectory[-1]))
+            candidate_grad_norms.append(float(grad_norm_trajectory[-1]))
+            if bool(diagnostics.get("trqn_retry_attempted")) and is_trqn:
+                diagnostics["trqn_retry_succeeded"] = True
         else:
             diagnostics["n_rejected_steps"] += 1
             consecutive_rejects += 1
@@ -1298,8 +1558,9 @@ def run_optimisation_against_calculator(
             event="accepted_step" if accepted else "rejected_step",
             step=step_idx,
             optimiser=("trust_region_qn" if is_trqn else "dissipative_symplectic"),
-            alpha=-float(f_current),
-            grad_norm=float(np.linalg.norm(g_trial)),
+            alpha=_raw_alpha_from_scaled(f_current, active_objective_scale),
+            grad_norm=_raw_grad_norm_from_scaled(g_trial, active_objective_scale),
+            objective_scale=float(active_objective_scale),
             accepted=bool(accepted),
             wall_seconds=float(time.perf_counter() - t0),
         )
@@ -1324,6 +1585,7 @@ def run_optimisation_against_calculator(
             and not fell_back_to_ds
             and consecutive_rejects >= _REJECT_STREAK_TRIGGER):
             try:
+                fallback_from_scale = float(active_objective_scale)
                 opt = _restart_under_ds(
                     ariadne,
                     atoms,
@@ -1332,8 +1594,12 @@ def run_optimisation_against_calculator(
                     run_config,
                 )
                 n_evaluations += 1
+                active_objective_scale = 1.0
                 is_trqn = False
                 fell_back_to_ds = True
+                if bool(diagnostics.get("trqn_retry_attempted")):
+                    diagnostics["trqn_retry_succeeded"] = False
+                    diagnostics["trqn_failed_after_retry"] = True
                 diagnostics["n_fallback_to_ds"] += 1
                 diagnostics["ds_init_profile"] = _DS_INIT_PROFILE
                 diagnostics["optimiser_final"] = "dissipative_symplectic"
@@ -1346,8 +1612,9 @@ def run_optimisation_against_calculator(
                     event="fallback_to_ds",
                     step=step_idx,
                     optimiser="dissipative_symplectic",
-                    alpha=-float(f_current),
+                    alpha=_raw_alpha_from_scaled(f_current, fallback_from_scale),
                     grad_norm=float(grad_norm_trajectory[-1]),
+                    objective_scale=float(fallback_from_scale),
                     accepted=False,
                     reason="reject_streak",
                     wall_seconds=float(time.perf_counter() - t0),
@@ -1387,6 +1654,7 @@ def run_optimisation_against_calculator(
                 float(grad_norm_trajectory[-1])
                 if grad_norm_trajectory else None
             ),
+            objective_scale=float(active_objective_scale),
             accepted=False,
             reason=str(diagnostics.get("last_return_code_reason", "")),
             wall_seconds=float(time.perf_counter() - t0),
@@ -1401,6 +1669,7 @@ def run_optimisation_against_calculator(
             float(grad_norm_trajectory[-1])
             if grad_norm_trajectory else None
         ),
+        objective_scale=float(active_objective_scale),
         accepted=bool(converged),
         reason=str(diagnostics.get("last_return_code_reason", "")),
         wall_seconds=float(time.perf_counter() - t0),

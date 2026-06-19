@@ -58,6 +58,7 @@ __all__ = [
     "VALID_FULLSPACE_RESIDUAL_SCALES",
     "VALID_GAUSSIAN_MEMORY_MODES",
     "VALID_ERROR_CALIBRATION_MODEL_VERSION_POLICIES",
+    "VALID_TRQN_SCALE_MODES",
     "VALID_NEGATIVE_CURVATURE_POLICIES",
     "VALID_AIMALL_BOAQ_VALUES",
     "VALID_AIMALL_IASMESH_VALUES",
@@ -89,6 +90,7 @@ VALID_SPECTRAL_MODES = frozenset({"off", "record_only", "blend"})
 VALID_CALIBRATED_ENERGY_UTILITIES = frozenset({"log", "banded"})
 VALID_FULLSPACE_RESIDUAL_SCALES = frozenset({"local_neighbour_median", "fixed"})
 VALID_GAUSSIAN_MEMORY_MODES = frozenset({"slurm_env", "link0"})
+VALID_TRQN_SCALE_MODES = frozenset({"off", "fixed", "adaptive_initial_gradient"})
 VALID_NEGATIVE_CURVATURE_POLICIES = frozenset({"ignore", "penalise"})
 VALID_AIMALL_BOAQ_VALUES = frozenset({
     "auto", "auto_gs2", "auto_gs4",
@@ -458,6 +460,13 @@ class AriadneConfigBlock:
     delta_max: float = 0.40
     gamma: float = 0.10
     fallback_to_ds: bool = True
+    trqn_scale_mode: str = "adaptive_initial_gradient"
+    trqn_target_initial_grad_norm: float = 0.01
+    trqn_retry_target_initial_grad_norm: float = 0.003
+    trqn_min_objective_scale: float = 1.0e-6
+    trqn_max_objective_scale: float = 1.0
+    trqn_fixed_objective_scale: float = 1.0
+    trqn_retry_on_no_proposal: bool = True
 
 
 @dataclass
@@ -1115,6 +1124,61 @@ class CampaignConfig:
                 "max_acquisition_grad_per_ang conflicts with deprecated "
                 "max_force_per_atom_ha_per_ang; set only one clamp field"
             )
+        ariadne = self.ariadne
+        if str(ariadne.trqn_scale_mode) not in VALID_TRQN_SCALE_MODES:
+            raise ConfigValidationError(
+                "ariadne.trqn_scale_mode must be one of "
+                + repr(sorted(VALID_TRQN_SCALE_MODES))
+            )
+        for name, value in (
+            (
+                "ariadne.trqn_target_initial_grad_norm",
+                ariadne.trqn_target_initial_grad_norm,
+            ),
+            (
+                "ariadne.trqn_retry_target_initial_grad_norm",
+                ariadne.trqn_retry_target_initial_grad_norm,
+            ),
+            ("ariadne.trqn_min_objective_scale", ariadne.trqn_min_objective_scale),
+            ("ariadne.trqn_max_objective_scale", ariadne.trqn_max_objective_scale),
+            ("ariadne.trqn_fixed_objective_scale", ariadne.trqn_fixed_objective_scale),
+        ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ConfigValidationError(name + " must be a number")
+            if not float(value) > 0.0:
+                raise ConfigValidationError(name + " must be > 0")
+        if (
+            float(ariadne.trqn_retry_target_initial_grad_norm)
+            > float(ariadne.trqn_target_initial_grad_norm)
+        ):
+            raise ConfigValidationError(
+                "ariadne.trqn_retry_target_initial_grad_norm must be <= "
+                "ariadne.trqn_target_initial_grad_norm"
+            )
+        if float(ariadne.trqn_min_objective_scale) > float(
+            ariadne.trqn_max_objective_scale
+        ):
+            raise ConfigValidationError(
+                "ariadne.trqn_min_objective_scale must be <= "
+                "ariadne.trqn_max_objective_scale"
+            )
+        if float(ariadne.trqn_max_objective_scale) > 1.0:
+            raise ConfigValidationError(
+                "ariadne.trqn_max_objective_scale must be <= 1"
+            )
+        if str(ariadne.trqn_scale_mode) == "fixed" and not (
+            float(ariadne.trqn_min_objective_scale)
+            <= float(ariadne.trqn_fixed_objective_scale)
+            <= float(ariadne.trqn_max_objective_scale)
+        ):
+            raise ConfigValidationError(
+                "ariadne.trqn_fixed_objective_scale must be inside the "
+                "configured TRQN objective scale bounds"
+            )
+        if not isinstance(ariadne.trqn_retry_on_no_proposal, bool):
+            raise ConfigValidationError(
+                "ariadne.trqn_retry_on_no_proposal must be a boolean"
+            )
         # Subspace-dim cross-validation. These catch configurations
         #that pass field-by-field validation but blow up later inside PCA.
         if self.acquisition.subspace.neighbour_count < 1:
@@ -1479,4 +1543,11 @@ class CampaignConfig:
             delta_max=a.delta_max,
             gamma=a.gamma,
             fallback_to_ds=a.fallback_to_ds,
+            trqn_scale_mode=a.trqn_scale_mode,
+            trqn_target_initial_grad_norm=a.trqn_target_initial_grad_norm,
+            trqn_retry_target_initial_grad_norm=a.trqn_retry_target_initial_grad_norm,
+            trqn_min_objective_scale=a.trqn_min_objective_scale,
+            trqn_max_objective_scale=a.trqn_max_objective_scale,
+            trqn_fixed_objective_scale=a.trqn_fixed_objective_scale,
+            trqn_retry_on_no_proposal=a.trqn_retry_on_no_proposal,
         )

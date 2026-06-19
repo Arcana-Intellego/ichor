@@ -475,6 +475,48 @@ def _ariadne_landing_audit_summary(seed_records: List[Dict[str, Any]]) -> Dict[s
     return summary
 
 
+def _ariadne_optional_diagnostic_warnings(result_dict: Dict[str, Any]) -> List[str]:
+    """Return warnings for optional ARIADNE diagnostics.
+
+    These fields are telemetry, not handoff contract. Reconcile must keep old
+    result.json files readable and must not reject an otherwise safe landing
+    because an optional scale diagnostic was malformed.
+    """
+    diagnostics = result_dict.get("optimiser_diagnostics")
+    if not isinstance(diagnostics, dict):
+        return []
+    numeric_fields = (
+        "trqn_objective_scale",
+        "trqn_target_initial_grad_norm",
+        "trqn_initial_raw_grad_norm",
+        "trqn_initial_scaled_grad_norm",
+        "trqn_retry_objective_scale",
+        "trqn_retry_target_initial_grad_norm",
+        "trqn_retry_raw_grad_norm",
+        "trqn_retry_scaled_grad_norm",
+    )
+    warnings: List[str] = []
+    for field in numeric_fields:
+        if field not in diagnostics or diagnostics.get(field) is None:
+            continue
+        try:
+            value = float(diagnostics.get(field))
+        except (TypeError, ValueError):
+            warnings.append(field + "_not_numeric")
+            continue
+        if not math.isfinite(value):
+            warnings.append(field + "_not_finite")
+    mode = diagnostics.get("trqn_scale_mode")
+    if mode is not None and str(mode) not in {
+        "not_applicable",
+        "off",
+        "fixed",
+        "adaptive_initial_gradient",
+    }:
+        warnings.append("trqn_scale_mode_unknown")
+    return warnings
+
+
 class LiveBackendNotAvailableError(RuntimeError):
     """Raised when --live is requested but a required backend is missing."""
 
@@ -1830,6 +1872,18 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 )
                 continue
 
+            optional_diag_warnings = _ariadne_optional_diagnostic_warnings(result_dict)
+            if optional_diag_warnings:
+                self._journal_event(
+                    "ariadne_optional_diagnostics_warning",
+                    phase=phase_name,
+                    iteration=int(state.iteration),
+                    seed_dir=seed_dir.name,
+                    result_json=str(result_path.resolve()),
+                    warnings=list(optional_diag_warnings[:8]),
+                    n_warnings=int(len(optional_diag_warnings)),
+                )
+
             usability = ariadne_result_usability_payload(
                 result_dict,
                 allow_seed_fallback=bool(
@@ -1864,6 +1918,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 "task_success": bool(usability.get("usable", False)),
                 "task_success_reason": str(usability.get("reason", "")),
             }
+            if optional_diag_warnings:
+                audit_record["optional_diagnostic_warnings"] = list(
+                    optional_diag_warnings
+                )
             landing_audit_records.append(audit_record)
             if not bool(landing_safety.get("accepted", False)):
                 reasons = landing_safety.get("reasons") or ["unsafe_landing"]

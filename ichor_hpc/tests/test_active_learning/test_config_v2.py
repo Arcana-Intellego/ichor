@@ -151,10 +151,37 @@ def test_to_ariadne_run_config_propagates_values():
     c.ariadne.max_iter = 350
     c.ariadne.gradf_tol = 1.0e-5
     c.ariadne.delta0 = 0.07
+    c.ariadne.trqn_scale_mode = "fixed"
+    c.ariadne.trqn_fixed_objective_scale = 0.25
+    c.ariadne.trqn_target_initial_grad_norm = 0.02
+    c.ariadne.trqn_retry_target_initial_grad_norm = 0.004
     rc = c.to_ariadne_run_config()
     assert rc.max_iter == 350
     assert rc.gradf_tol == pytest.approx(1.0e-5)
     assert rc.delta0 == pytest.approx(0.07)
+    assert rc.trqn_scale_mode == "fixed"
+    assert rc.trqn_fixed_objective_scale == pytest.approx(0.25)
+    assert rc.trqn_target_initial_grad_norm == pytest.approx(0.02)
+    assert rc.trqn_retry_target_initial_grad_norm == pytest.approx(0.004)
+
+
+def test_ariadne_trqn_scale_validation_rejects_invalid_values():
+    c = CampaignConfig()
+    c.ariadne.trqn_scale_mode = "mystery"
+    with pytest.raises(ConfigValidationError, match="trqn_scale_mode"):
+        c._validate()
+
+    c = CampaignConfig()
+    c.ariadne.trqn_retry_target_initial_grad_norm = 0.02
+    c.ariadne.trqn_target_initial_grad_norm = 0.01
+    with pytest.raises(ConfigValidationError, match="retry_target"):
+        c._validate()
+
+    c = CampaignConfig()
+    c.ariadne.trqn_min_objective_scale = 0.5
+    c.ariadne.trqn_max_objective_scale = 0.1
+    with pytest.raises(ConfigValidationError, match="min_objective_scale"):
+        c._validate()
 
 
 # --- dead-letter cleanup proof: every previously-orphaned field is read --
