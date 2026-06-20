@@ -20,6 +20,8 @@ PLUMED_URL="https://github.com/plumed/plumed2/releases/download/v${PLUMED_VERSIO
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib_ichor_csf.sh"
 
 MACHINE="${ICHOR_MACHINE:-auto}"
 PROJECTS_DIR="${ICHOR_PROJECTS_DIR:-${HOME}/projects}"
@@ -36,6 +38,15 @@ SKIP_ARIADNE_BUILD=0
 SKIP_FEREBUS_BUILD=0
 ASSUME_YES=0
 DRY_RUN=0
+DEBUG_TRACE=0
+CURRENT_STAGE="startup"
+LOG_FILE=""
+ARIADNE_CC=""
+ARIADNE_CXX=""
+ARIADNE_FC=""
+ARIADNE_CC_METHOD=""
+ARIADNE_CXX_METHOD=""
+ARIADNE_FC_METHOD=""
 
 usage() {
     cat <<'EOF'
@@ -47,7 +58,7 @@ Options:
   --projects-dir PATH             default: ~/projects
   --venv PATH                     default: ~/.venv/ichor-csf3 or ~/.venv/ichor-csf4
   --python-prefix PATH            CSF3 default: ~/opt/python-3.11.15
-  --only all|python|packages|ariadne|plumed|ferebus|config|verify
+  --only all|python|packages|ariadne|plumed|ferebus|config|verify|doctor
                                   default: all. A component stage repairs or
                                   reinstalls that component.
   --allow-download                permit Python/PLUMED/OpenBLAS/source downloads
@@ -59,6 +70,7 @@ Options:
   --jobs N                        default: 4
   --yes                           non-interactive mode
   --dry-run                       print planned actions without installing
+  --debug, --trace                print shell trace in the install log
   -h, --help                      show this help
 
 Environment equivalents:
@@ -82,6 +94,25 @@ warn() {
     echo "WARNING: $*" >&2
 }
 
+on_error() {
+    local status=$?
+    local line="${BASH_LINENO[0]:-unknown}"
+    local command="${BASH_COMMAND:-unknown}"
+    {
+        echo ""
+        echo "ERROR: install stage '${CURRENT_STAGE}' failed"
+        echo "  line: ${line}"
+        echo "  command: ${command}"
+        [[ -n "${LOG_FILE}" ]] && echo "  log: ${LOG_FILE}"
+        if [[ "${CURRENT_STAGE}" == "ariadne" ]]; then
+            print_ariadne_manual_recovery_block || true
+        fi
+    } >&2
+    exit "${status}"
+}
+
+trap on_error ERR
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --machine) MACHINE="${2:?missing value for --machine}"; shift 2 ;;
@@ -99,6 +130,7 @@ while [[ $# -gt 0 ]]; do
         --jobs) INSTALL_JOBS="${2:?missing value for --jobs}"; shift 2 ;;
         --yes) ASSUME_YES=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
+        --debug|--trace) DEBUG_TRACE=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unrecognised option: $1" ;;
     esac
@@ -109,15 +141,13 @@ case "${MACHINE}" in
     *) die "--machine must be auto, csf3, or csf4" ;;
 esac
 case "${ONLY_STAGE}" in
-    all|python|packages|ariadne|plumed|ferebus|config|verify) ;;
-    *) die "--only must be one of all, python, packages, ariadne, plumed, ferebus, config, verify" ;;
+    all|python|packages|ariadne|plumed|ferebus|config|verify|doctor) ;;
+    *) die "--only must be one of all, python, packages, ariadne, plumed, ferebus, config, verify, doctor" ;;
 esac
 [[ "${INSTALL_JOBS}" =~ ^[1-9][0-9]*$ ]] || die "--jobs must be a positive integer"
 
 expand_path() {
-    local value="$1"
-    value="${value/#\~/${HOME}}"
-    printf '%s\n' "${value}"
+    ichor_csf_expand_path "$1"
 }
 
 PROJECTS_DIR="$(expand_path "${PROJECTS_DIR}")"
@@ -148,32 +178,34 @@ run_shell() {
     if [[ "${DRY_RUN}" -eq 1 ]]; then
         echo "+ ${command}"
     else
-        bash -lc "${command}"
+        bash -c "${command}"
     fi
 }
 
-deactivate_existing_venv() {
-    local reason="${1:-environment setup}"
-    if [[ -z "${VIRTUAL_ENV:-}" ]]; then
+run_in_dir() {
+    local dir="$1"
+    shift
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        printf '+ cd %q &&' "${dir}"
+        printf ' %q' "$@"
+        printf '\n'
         return 0
     fi
-    warn "Deactivating active venv ${VIRTUAL_ENV} before ${reason}"
-    local active_bin="${VIRTUAL_ENV}/bin"
-    local new_path=""
-    local part
-    local -a _ichor_path_parts
-    IFS=':' read -r -a _ichor_path_parts <<< "${PATH:-}"
-    for part in "${_ichor_path_parts[@]}"; do
-        [[ -z "${part}" || "${part}" == "${active_bin}" ]] && continue
-        if [[ -z "${new_path}" ]]; then
-            new_path="${part}"
-        else
-            new_path="${new_path}:${part}"
-        fi
-    done
-    export PATH="${new_path}"
-    unset VIRTUAL_ENV VIRTUAL_ENV_PROMPT
-    hash -r 2>/dev/null || true
+    (cd "${dir}" && "$@")
+}
+
+run_shell_in_dir() {
+    local dir="$1"
+    local command="$2"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "+ cd $(printf '%q' "${dir}") && ${command}"
+        return 0
+    fi
+    (cd "${dir}" && bash -c "${command}")
+}
+
+deactivate_existing_venv() {
+    ichor_csf_deactivate_existing_venv "$@"
 }
 
 backup_existing_path() {
@@ -250,58 +282,15 @@ resolve_required_cmd_into() {
 }
 
 module_is_current_shell_function() {
-    [[ "$(type -t module 2>/dev/null || true)" == "function" ]]
+    ichor_csf_module_is_shell_function
 }
 
 initialise_modules() {
-    if module_is_current_shell_function; then
-        return 0
-    fi
-    # Common Environment Modules/Lmod initialisation points. Do not return
-    # merely because an external "module" command exists: external wrappers
-    # cannot mutate this script's PATH after "module load".
-    local init_file
-    for init_file in \
-        /etc/profile.d/modules.sh \
-        /usr/share/Modules/init/bash \
-        /usr/share/lmod/lmod/init/bash \
-        /opt/apps/etc/profile.d/modules.sh \
-        /opt/apps/Modules/init/bash \
-        /opt/apps/modules/init/bash \
-        /opt/apps/lmod/lmod/init/bash; do
-        # shellcheck disable=SC1090
-        [[ -f "${init_file}" ]] && source "${init_file}" || true
-        if module_is_current_shell_function; then
-            return 0
-        fi
-    done
-    if command -v modulecmd >/dev/null 2>&1; then
-        module() { eval "$(modulecmd bash "$@")"; }
-        if module_is_current_shell_function; then
-            return 0
-        fi
-    fi
-    if command -v lmod >/dev/null 2>&1; then
-        module() { eval "$(lmod bash "$@")"; }
-        if module_is_current_shell_function; then
-            return 0
-        fi
-    fi
+    ichor_csf_initialise_modules
 }
 
 module_debug() {
-    local context="${1:-module environment diagnostics}"
-    {
-        echo "Module diagnostics (${context}):"
-        echo "  module type: $(type -t module 2>/dev/null || echo unavailable)"
-        echo "  module path: $(command -v module 2>/dev/null || echo unavailable)"
-        echo "  PATH=${PATH:-}"
-        echo "  LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"
-        echo "  LOADEDMODULES=${LOADEDMODULES:-}"
-        if module_is_current_shell_function; then
-            module list || true
-        fi
-    } >&2
+    ichor_csf_module_debug "$@"
 }
 
 source_oneapi_setvars_if_available() {
@@ -309,83 +298,37 @@ source_oneapi_setvars_if_available() {
         echo "+ source oneAPI setvars.sh if compiler wrappers are not on PATH"
         return 0
     fi
-    local setvars=""
-    local candidate
-    for candidate in \
-        "${ONEAPIDIR:-}/setvars.sh" \
-        "${ONEAPI_ROOT:-}/setvars.sh" \
-        /opt/apps/compilers/intel/oneapi/2025.0.1/setvars.sh \
-        /opt/apps/compilers/oneapi/2024.2.0/setvars.sh; do
-        [[ -n "${candidate}" && -f "${candidate}" ]] || continue
-        setvars="${candidate}"
-        break
-    done
-    [[ -n "${setvars}" ]] || return 0
-    # shellcheck disable=SC1090
-    source "${setvars}" >/dev/null 2>&1 || source "${setvars}"
-    hash -r 2>/dev/null || true
+    ichor_csf_source_oneapi_setvars >/dev/null || return 0
 }
 
 find_ariadne_compiler_path() {
     local exe="$1"
-    local resolved
-    resolved="$(command -v "${exe}" 2>/dev/null || true)"
-    if [[ -n "${resolved}" ]]; then
-        printf '%s\n' "${resolved}"
-        return 0
-    fi
-
-    local root candidate path_part compiler_root
-    for root in \
-        "${ONEAPIDIR:-}" \
-        "${ONEAPI_ROOT:-}" \
-        /opt/apps/compilers/intel/oneapi/2025.0.1 \
-        /opt/apps/compilers/oneapi/2024.2.0; do
-        [[ -n "${root}" && -d "${root}" ]] || continue
-        for candidate in "${root}"/compiler/*/bin/"${exe}" "${root}"/compiler/latest/bin/"${exe}"; do
-            [[ -x "${candidate}" ]] || continue
-            printf '%s\n' "${candidate}"
-            return 0
-        done
-    done
-
-    local -a library_parts
-    IFS=':' read -r -a library_parts <<< "${LD_LIBRARY_PATH:-}"
-    for path_part in "${library_parts[@]}"; do
-        case "${path_part}" in
-            */compiler/*/lib)
-                compiler_root="$(dirname "${path_part}")"
-                candidate="${compiler_root}/bin/${exe}"
-                ;;
-            */compiler/*/opt/compiler/lib)
-                compiler_root="$(cd "${path_part}/../../.." 2>/dev/null && pwd || true)"
-                candidate="${compiler_root}/bin/${exe}"
-                ;;
-            *)
-                candidate=""
-                ;;
-        esac
-        [[ -n "${candidate}" && -x "${candidate}" ]] || continue
-        printf '%s\n' "${candidate}"
-        return 0
-    done
-    return 1
+    local result
+    result="$(ichor_csf_find_ariadne_compiler_path "${exe}" || true)"
+    [[ -n "${result}" ]] || return 1
+    printf '%s\n' "${result%%|*}"
 }
 
 ensure_ariadne_compilers_on_path() {
-    [[ "${DRY_RUN}" -eq 1 ]] && return 0
-    local compiler resolved bin_dir missing=0
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        return 0
+    fi
+    local compiler result resolved method bin_dir missing=0
     for compiler in icx icpx ifx; do
-        resolved="$(find_ariadne_compiler_path "${compiler}" || true)"
+        result="$(ichor_csf_find_ariadne_compiler_path "${compiler}" || true)"
+        resolved="${result%%|*}"
+        method="${result#*|}"
         if [[ -z "${resolved}" ]]; then
             warn "ARIADNE compiler '${compiler}' was not found after loading ARIADNE modules"
             missing=1
             continue
         fi
         bin_dir="$(dirname "${resolved}")"
-        case ":${PATH}:" in
-            *":${bin_dir}:"*) ;;
-            *) export PATH="${bin_dir}:${PATH}" ;;
+        ichor_csf_prepend_path_once "${bin_dir}"
+        case "${compiler}" in
+            icx) ARIADNE_CC="${resolved}"; ARIADNE_CC_METHOD="${method}" ;;
+            icpx) ARIADNE_CXX="${resolved}"; ARIADNE_CXX_METHOD="${method}" ;;
+            ifx) ARIADNE_FC="${resolved}"; ARIADNE_FC_METHOD="${method}" ;;
         esac
     done
     hash -r 2>/dev/null || true
@@ -402,33 +345,11 @@ module_cmd() {
         printf '\n'
         return 0
     fi
-    initialise_modules
-    if ! module_is_current_shell_function; then
-        module_debug "module initialisation failed"
-        die "module command is unavailable as a shell function on this shell"
-    fi
-    if ! module "$@"; then
-        module_debug "module $* failed"
-        die "module command failed: module $*"
-    fi
-    hash -r 2>/dev/null || true
+    ichor_csf_module "$@"
 }
 
 detect_machine() {
-    if [[ "${MACHINE}" != "auto" ]]; then
-        printf '%s\n' "${MACHINE}"
-        return 0
-    fi
-    local host
-    host="$(hostname -f 2>/dev/null || hostname 2>/dev/null || true)"
-    host="${host,,}"
-    if [[ "${host}" == *csf3* || "${host}" == *login3* ]]; then
-        printf 'csf3\n'
-    elif [[ "${host}" == *csf4* || "${host}" == *login0* ]]; then
-        printf 'csf4\n'
-    else
-        die "could not auto-detect CSF3/CSF4 from hostname '${host}'. Pass --machine csf3 or --machine csf4."
-    fi
+    ichor_csf_detect_machine "${MACHINE}" || die "could not auto-detect CSF3/CSF4. Pass --machine csf3 or --machine csf4."
 }
 
 url_available() {
@@ -653,9 +574,9 @@ ensure_csf3_python() {
     local src_dir="${build_parent}/Python-${PYTHON_VERSION}"
     run_cmd mkdir -p "${build_parent}" "$(dirname "${PYTHON_PREFIX}")"
     run_cmd tar -xzf "${tarball}" -C "${build_parent}"
-    run_shell "cd $(printf '%q' "${src_dir}") && ./configure --prefix=$(printf '%q' "${PYTHON_PREFIX}") --enable-shared --with-ensurepip=install --with-openssl=$(printf '%q' "${openssl_prefix}") --with-openssl-rpath=auto"
-    run_shell "cd $(printf '%q' "${src_dir}") && make -j $(printf '%q' "${INSTALL_JOBS}")"
-    run_shell "cd $(printf '%q' "${src_dir}") && make install"
+    run_in_dir "${src_dir}" ./configure "--prefix=${PYTHON_PREFIX}" --enable-shared --with-ensurepip=install "--with-openssl=${openssl_prefix}" --with-openssl-rpath=auto
+    run_in_dir "${src_dir}" make -j "${INSTALL_JOBS}"
+    run_in_dir "${src_dir}" make install
     export LD_LIBRARY_PATH="${PYTHON_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
     verify_python_ssl "${py}"
 }
@@ -765,17 +686,224 @@ print("ARIADNE OK")
 PY
 }
 
+print_ariadne_import_info() {
+    local label="${1:-ARIADNE import}"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "+ ${PYTHON:-python} -c 'print ${label} ariadne path and mtime'"
+        return 0
+    fi
+    if [[ -z "${PYTHON:-}" || ! -x "${PYTHON}" ]]; then
+        warn "${label}: target Python is not ready"
+        return 0
+    fi
+    "${PYTHON}" - "${label}" <<'PY' || true
+import os
+import sys
+import time
+
+label = sys.argv[1]
+try:
+    import ariadne
+except Exception as exc:
+    print(f"{label}: ariadne not importable ({exc})")
+    raise SystemExit(0)
+
+path = getattr(ariadne, "__file__", "<unknown>")
+try:
+    mtime = time.ctime(os.path.getmtime(path))
+except OSError:
+    mtime = "<unavailable>"
+print(f"{label}: {path}")
+print(f"{label} mtime: {mtime}")
+print(
+    f"{label} API: Geometric_Trqn={hasattr(ariadne, 'Geometric_Trqn')} "
+    f"Ds_Optimiser={hasattr(ariadne, 'Ds_Optimiser')}"
+)
+PY
+}
+
+assert_ariadne_inside_venv() {
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "+ ${PYTHON} -c 'assert ariadne imported from target venv'"
+        return 0
+    fi
+    "${PYTHON}" - "${VENV}" <<'PY'
+from pathlib import Path
+import sys
+
+import ariadne
+
+venv = Path(sys.argv[1]).resolve()
+path = Path(ariadne.__file__).resolve()
+if venv not in path.parents:
+    raise SystemExit(f"ariadne imported outside target venv: {path} (venv: {venv})")
+print(f"ARIADNE import path is inside target venv: {path}")
+PY
+}
+
+print_ariadne_compiler_paths() {
+    echo "ARIADNE_CC=${ARIADNE_CC:-<unresolved>} (${ARIADNE_CC_METHOD:-unknown})"
+    echo "ARIADNE_CXX=${ARIADNE_CXX:-<unresolved>} (${ARIADNE_CXX_METHOD:-unknown})"
+    echo "ARIADNE_FC=${ARIADNE_FC:-<unresolved>} (${ARIADNE_FC_METHOD:-unknown})"
+}
+
+ariadne_receipt_path() {
+    printf '%s\n' "${HOME}/.cache/ichor-al-install/ariadne-${MACHINE}-last-install.json"
+}
+
+write_ariadne_receipt() {
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "+ write ARIADNE install receipt $(ariadne_receipt_path)"
+        return 0
+    fi
+    mkdir -p "${HOME}/.cache/ichor-al-install"
+    local ariadne_root="${PROJECTS_DIR}/ARIADNE"
+    local repo_commit=""
+    repo_commit="$(git -C "${ariadne_root}" rev-parse --short HEAD 2>/dev/null || true)"
+    "${PYTHON}" - "$(ariadne_receipt_path)" "${MACHINE}" "${ariadne_root}" "${repo_commit}" "${PYTHON}" "${VENV}" "${ARIADNE_CC:-}" "${ARIADNE_CXX:-}" "${ARIADNE_FC:-}" <<'PY'
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import ariadne
+
+receipt, machine, repo_root, repo_commit, python, venv, cc, cxx, fc = sys.argv[1:10]
+ariadne_file = Path(ariadne.__file__).resolve()
+payload = {
+    "schema_version": 1,
+    "machine": machine,
+    "timestamp_iso": datetime.now(timezone.utc).isoformat(),
+    "repo_root": repo_root,
+    "repo_commit": repo_commit,
+    "python": python,
+    "venv": venv,
+    "ariadne_file": str(ariadne_file),
+    "ariadne_mtime": time.ctime(os.path.getmtime(ariadne_file)),
+    "ariadne_api": {
+        "Geometric_Trqn": hasattr(ariadne, "Geometric_Trqn"),
+        "Ds_Optimiser": hasattr(ariadne, "Ds_Optimiser"),
+    },
+    "compilers": {"CC": cc, "CXX": cxx, "FC": fc},
+    "cmake_settings": {
+        "ARIADNE_SAFE_IFX_FLAGS": machine == "csf3",
+    },
+}
+path = Path(receipt)
+path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+print(f"Wrote ARIADNE install receipt: {path}")
+PY
+}
+
+doctor_ariadne_receipt() {
+    local receipt
+    receipt="$(ariadne_receipt_path)"
+    if [[ ! -f "${receipt}" ]]; then
+        echo "ARIADNE receipt: missing (${receipt})"
+        return 0
+    fi
+    echo "ARIADNE receipt: ${receipt}"
+    if [[ "${DRY_RUN}" -eq 1 || -z "${PYTHON:-}" || ! -x "${PYTHON}" ]]; then
+        return 0
+    fi
+    "${PYTHON}" - "${receipt}" "${PROJECTS_DIR}/ARIADNE" <<'PY' || true
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+receipt = Path(sys.argv[1])
+ariadne_repo = Path(sys.argv[2])
+data = json.loads(receipt.read_text(encoding="utf-8"))
+try:
+    import ariadne
+except Exception as exc:
+    print(f"ARIADNE receipt compare: current import failed ({exc})")
+    raise SystemExit(0)
+
+current = str(Path(ariadne.__file__).resolve())
+recorded = str(Path(data.get("ariadne_file", "")).resolve())
+if current != recorded:
+    print(f"WARNING: ARIADNE import differs from receipt: current={current} receipt={recorded}")
+try:
+    current_mtime = os.path.getmtime(current)
+except OSError:
+    current_mtime = 0
+if data.get("python") != sys.executable:
+    print(f"WARNING: ARIADNE receipt Python differs: current={sys.executable} receipt={data.get('python')}")
+try:
+    commit = subprocess.check_output(["git", "-C", str(ariadne_repo), "rev-parse", "--short", "HEAD"], text=True).strip()
+except Exception:
+    commit = ""
+if commit and data.get("repo_commit") and commit != data.get("repo_commit"):
+    print(f"WARNING: ARIADNE repo changed since last receipt: current={commit} receipt={data.get('repo_commit')}")
+print(f"ARIADNE receipt compare complete: current_mtime={current_mtime}")
+PY
+}
+
+print_ariadne_manual_recovery_block() {
+    local ariadne_root="${PROJECTS_DIR:-${HOME}/projects}/ARIADNE"
+    local python_exe="${PYTHON:-${VENV:-${HOME}/.venv/ichor-${MACHINE:-csf3}}/bin/python}"
+    local safe_flag=""
+    if [[ "${MACHINE:-}" == "csf3" ]]; then
+        safe_flag=" --config-settings=cmake.define.ARIADNE_SAFE_IFX_FLAGS=ON"
+    fi
+    cat >&2 <<EOF
+
+Manual ARIADNE recovery block:
+cd ${ariadne_root}
+module purge
+EOF
+    if [[ "${MACHINE:-}" == "csf3" ]]; then
+        cat >&2 <<'EOF'
+module load compilers/intel/oneapi/2025.0.1
+module load umf compiler-rt tbb compiler
+module load mkl/2025.0
+EOF
+        echo "source ${VENV:-${HOME}/.venv/ichor-csf3}/bin/activate" >&2
+        echo "export LD_LIBRARY_PATH=${PYTHON_PREFIX:-${HOME}/opt/python-3.11.15}/lib:\${LD_LIBRARY_PATH}" >&2
+    else
+        cat >&2 <<'EOF'
+module load python/3.11.3-gcccore-12.3.0
+module load python-bundle-pypi/2023.06-gcccore-12.3.0
+module load compilers/oneapi/2024.2.0
+module load compiler-rt tbb compiler
+module load mkl/2024.2
+EOF
+        echo "source ${VENV:-${HOME}/.venv/ichor-csf4}/bin/activate" >&2
+    fi
+    cat >&2 <<EOF
+export CC=${ARIADNE_CC:-/resolved/path/icx}
+export CXX=${ARIADNE_CXX:-/resolved/path/icpx}
+export FC=${ARIADNE_FC:-/resolved/path/ifx}
+export CMAKE_BUILD_PARALLEL_LEVEL=${INSTALL_JOBS:-4}
+export MAKEFLAGS=-j${INSTALL_JOBS:-4}
+${python_exe} -m pip install . --no-build-isolation -v --force-reinstall --no-deps${safe_flag}
+EOF
+}
+
 install_ariadne_if_needed() {
     local reinstall="${1:-0}"
+    CURRENT_STAGE="ariadne"
     note "Checking ARIADNE"
     deactivate_existing_venv "ARIADNE module setup"
     load_ariadne_modules
     # shellcheck disable=SC1091
     create_or_activate_venv 0
     resolve_ariadne_compilers
+    print_ariadne_compiler_paths
+    print_ariadne_import_info "ARIADNE before install"
     if [[ "${reinstall}" -eq 0 && "${DRY_RUN}" -eq 0 ]] && python_import_ok ariadne; then
         echo "ARIADNE already importable"
         verify_ariadne_api
+        assert_ariadne_inside_venv
         return 0
     fi
     if [[ "${SKIP_ARIADNE_BUILD}" -eq 1 ]]; then
@@ -800,10 +928,22 @@ install_ariadne_if_needed() {
         ariadne_pip_config=" --config-settings=cmake.define.ARIADNE_SAFE_IFX_FLAGS=ON"
     fi
     [[ "${DRY_RUN}" -eq 1 ]] && echo "+ export CC=${CC} CXX=${CXX} FC=${FC} CMAKE_BUILD_PARALLEL_LEVEL=${INSTALL_JOBS} MAKEFLAGS=-j${INSTALL_JOBS}"
-    run_shell "cd $(printf '%q' "${ariadne_root}") && $(printf '%q' "${PYTHON}") -m pip install . --no-build-isolation -v --force-reinstall --no-deps${ariadne_pip_config}"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "+ clean ARIADNE-local build artefacts in ${ariadne_root}"
+    else
+        rm -rf "${ariadne_root}/_skbuild" "${ariadne_root}/build"
+    fi
+    # shellcheck disable=SC2086
+    if ! run_in_dir "${ariadne_root}" "${PYTHON}" -m pip install . --no-build-isolation -v --force-reinstall --no-deps ${ariadne_pip_config}; then
+        print_ariadne_manual_recovery_block
+        die "ARIADNE install failed"
+    fi
     unset CC CXX FC F77 F90
     unset MAKEFLAGS CMAKE_BUILD_PARALLEL_LEVEL
+    print_ariadne_import_info "ARIADNE after install"
     verify_ariadne_api
+    assert_ariadne_inside_venv
+    write_ariadne_receipt
 }
 
 plumed_source_dir() {
@@ -856,11 +996,11 @@ install_plumed_if_needed() {
         local src
         src="$(plumed_source_dir)"
         if [[ "${reinstall}" -eq 1 ]]; then
-            run_shell "cd $(printf '%q' "${src}") && make clean || true"
+            run_shell_in_dir "${src}" "make clean || true"
         fi
-        run_shell "cd $(printf '%q' "${src}") && ./configure --prefix=$(printf '%q' "${HOME}/opt/plumed-${PLUMED_VERSION}") --disable-external-blas --disable-external-lapack --disable-mpi"
-        run_shell "cd $(printf '%q' "${src}") && make -j $(printf '%q' "${INSTALL_JOBS}")"
-        run_shell "cd $(printf '%q' "${src}") && make install"
+        run_in_dir "${src}" ./configure "--prefix=${HOME}/opt/plumed-${PLUMED_VERSION}" --disable-external-blas --disable-external-lapack --disable-mpi
+        run_in_dir "${src}" make -j "${INSTALL_JOBS}"
+        run_in_dir "${src}" make install
         pip_install --force-reinstall "plumed==${PLUMED_VERSION}"
         unset CC CXX FC F77 F90
     fi
@@ -896,7 +1036,7 @@ install_ferebus_if_needed() {
         if [[ "${DRY_RUN}" -eq 1 ]]; then
             warn "dry-run: FEREBUS static OpenBLAS is not present; install will require staged OpenBLAS or --allow-download"
         elif [[ "${ALLOW_DOWNLOAD}" -eq 1 ]]; then
-            run_shell "cd $(printf '%q' "${root}/libs") && ./fetchOpenBlas.sh"
+            run_in_dir "${root}/libs" ./fetchOpenBlas.sh
         else
             die "FEREBUS static OpenBLAS is missing. Stage it under ${root}/libs/openblas or rerun with --allow-download."
         fi
@@ -925,13 +1065,13 @@ install_ferebus_if_needed() {
         backup_existing_path "${FEREBUS_PATH}" "FEREBUS executable"
     fi
     run_cmd mkdir -p "${build_dir}" "$(dirname "${FEREBUS_PATH}")"
-    run_shell "cmake -S $(printf '%q' "${root}") -B $(printf '%q' "${build_dir}") -DCMAKE_BUILD_TYPE=Release"
-    run_shell "cmake --build $(printf '%q' "${build_dir}") -j $(printf '%q' "${INSTALL_JOBS}")"
+    run_cmd cmake -S "${root}" -B "${build_dir}" -DCMAKE_BUILD_TYPE=Release
+    run_cmd cmake --build "${build_dir}" -j "${INSTALL_JOBS}"
     if [[ -f "${build_dir}/ferebus" ]]; then
         run_cmd cp "${build_dir}/ferebus" "${FEREBUS_PATH}"
         run_cmd chmod 755 "${FEREBUS_PATH}"
     else
-        run_shell "cmake --install $(printf '%q' "${build_dir}")"
+        run_cmd cmake --install "${build_dir}"
     fi
     [[ "${DRY_RUN}" -eq 1 || -x "${FEREBUS_PATH}" ]] || die "FEREBUS build did not create executable: ${FEREBUS_PATH}"
 }
@@ -1125,6 +1265,148 @@ verify_entrypoints() {
     command -v ichor-al-daemon >/dev/null 2>&1 || die "ichor-al-daemon is not on PATH after activating ${VENV}"
 }
 
+path_report_command() {
+    local name="$1"
+    local resolved
+    resolved="$(ichor_csf_command_path "${name}")"
+    if [[ -z "${resolved}" ]]; then
+        echo "${name}: missing"
+        return 0
+    fi
+    if ichor_csf_path_inside "${resolved}" "${VENV}"; then
+        echo "${name}: ${resolved} (target venv)"
+    else
+        echo "${name}: ${resolved} (outside target venv)"
+    fi
+}
+
+doctor_python_imports() {
+    if [[ ! -x "${VENV}/bin/python" ]]; then
+        echo "Python import checks: skipped; target venv Python missing"
+        return 0
+    fi
+    PYTHON="${VENV}/bin/python"
+    print_ariadne_import_info "ARIADNE doctor"
+    doctor_ariadne_receipt
+    if [[ -n "${PLUMED_KERNEL:-}" ]]; then
+        "${PYTHON}" - <<'PY' || true
+import os
+try:
+    import plumed
+    p = plumed.Plumed(kernel=os.environ["PLUMED_KERNEL"])
+    p.finalize()
+    print("PLUMED wrapper/kernel: OK")
+except Exception as exc:
+    print(f"PLUMED wrapper/kernel: failed ({exc})")
+PY
+    fi
+}
+
+doctor_load_ariadne_modules() {
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "+ module purge"
+        if [[ "${MACHINE}" == "csf3" ]]; then
+            echo "+ module load compilers/intel/oneapi/2025.0.1"
+            echo "+ module load umf compiler-rt tbb compiler"
+            echo "+ module load mkl/2025.0"
+        else
+            echo "+ module load python/3.11.3-gcccore-12.3.0"
+            echo "+ module load python-bundle-pypi/2023.06-gcccore-12.3.0"
+            echo "+ module load compilers/oneapi/2024.2.0"
+            echo "+ module load compiler-rt tbb compiler"
+            echo "+ module load mkl/2024.2"
+        fi
+        return 0
+    fi
+    if ! ichor_csf_module purge; then
+        echo "module purge: failed"
+        return 1
+    fi
+    if [[ "${MACHINE}" == "csf3" ]]; then
+        ichor_csf_module load compilers/intel/oneapi/2025.0.1 || return 1
+        ichor_csf_module load umf compiler-rt tbb compiler || return 1
+        ichor_csf_module load mkl/2025.0 || return 1
+        export LD_LIBRARY_PATH="${PYTHON_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    else
+        ichor_csf_module load python/3.11.3-gcccore-12.3.0 || return 1
+        ichor_csf_module load python-bundle-pypi/2023.06-gcccore-12.3.0 || return 1
+        ichor_csf_module load compilers/oneapi/2024.2.0 || return 1
+        ichor_csf_module load compiler-rt tbb compiler || return 1
+        ichor_csf_module load mkl/2024.2 || return 1
+    fi
+}
+
+doctor_print_ariadne_compiler_discovery() {
+    local compiler result resolved method
+    for compiler in icx icpx ifx; do
+        if [[ "${DRY_RUN}" -eq 1 ]]; then
+            echo "${compiler}: <dry-run>"
+            continue
+        fi
+        result="$(ichor_csf_find_ariadne_compiler_path "${compiler}" || true)"
+        resolved="${result%%|*}"
+        method="${result#*|}"
+        if [[ -n "${resolved}" ]]; then
+            echo "${compiler}: ${resolved} (${method})"
+        else
+            echo "${compiler}: unresolved"
+        fi
+    done
+}
+
+stage_doctor() {
+    CURRENT_STAGE="doctor"
+    note "Running CSF doctor diagnostics"
+    echo "machine: ${MACHINE}"
+    echo "repo root: ${REPO_ROOT}"
+    echo "projects dir: ${PROJECTS_DIR}"
+    echo "venv: ${VENV}"
+    echo "python prefix: ${PYTHON_PREFIX}"
+    echo "module shell function before init: $(type -t module 2>/dev/null || echo unavailable)"
+    initialise_modules || true
+    echo "module shell function after init: $(type -t module 2>/dev/null || echo unavailable)"
+    echo "module init: ${ICHOR_CSF_MODULE_INIT:-unresolved}"
+    if module_is_current_shell_function; then
+        module list || true
+    fi
+
+    echo ""
+    echo "ARIADNE compiler discovery:"
+    if doctor_load_ariadne_modules; then
+        doctor_print_ariadne_compiler_discovery
+    else
+        echo "ARIADNE module load failed; compiler discovery may be incomplete"
+    fi
+
+    echo ""
+    echo "Target venv paths:"
+    if [[ -f "${VENV}/bin/activate" ]]; then
+        activate_existing_venv || true
+        ichor_csf_warn_path_hazards "${VENV}"
+        path_report_command python
+        path_report_command pip
+        path_report_command ichor-cli
+        path_report_command ichor-al-daemon
+    else
+        echo "target venv activation script missing: ${VENV}/bin/activate"
+    fi
+
+    echo ""
+    echo "Backend paths:"
+    echo "AIMAll: ${AIMALL_PATH} $([[ -x "${AIMALL_PATH}" ]] && echo executable || echo missing-or-not-executable)"
+    echo "FEREBUS: ${FEREBUS_PATH} $([[ -x "${FEREBUS_PATH}" ]] && echo executable || echo missing-or-not-executable)"
+    if [[ "${MACHINE}" == "csf3" ]]; then
+        echo "Gaussian expected: apps/binapps/gaussian/g09d01_em64t / \$g09root/g09/g09"
+    else
+        echo "Gaussian expected: gaussian/g16c01_em64t_detectcpu / \$g16root/g16/g16"
+    fi
+    export PLUMED_KERNEL="${PLUMED_KERNEL:-${HOME}/opt/plumed-${PLUMED_VERSION}/lib/libplumedKernel.so}"
+    export PLUMED_LIBRARY_PATH="${PLUMED_LIBRARY_PATH:-${HOME}/opt/plumed-${PLUMED_VERSION}/lib}"
+    echo "PLUMED_KERNEL: ${PLUMED_KERNEL} $([[ -r "${PLUMED_KERNEL}" ]] && echo readable || echo missing-or-unreadable)"
+    echo "PLUMED_LIBRARY_PATH: ${PLUMED_LIBRARY_PATH}"
+    doctor_python_imports
+}
+
 require_all_sibling_repos() {
     require_dir "${PROJECTS_DIR}/POLUS" "POLUS sibling repo"
     require_dir "${PROJECTS_DIR}/FEREBUS_CPU" "FEREBUS_CPU sibling repo"
@@ -1132,11 +1414,13 @@ require_all_sibling_repos() {
 }
 
 stage_python() {
+    CURRENT_STAGE="python"
     prepare_python_and_venv 1 1
     pip_install --upgrade pip setuptools wheel
 }
 
 stage_packages() {
+    CURRENT_STAGE="packages"
     ensure_repo_root
     require_dir "${PROJECTS_DIR}/POLUS" "POLUS sibling repo"
     require_dir "${PROJECTS_DIR}/FEREBUS_CPU" "FEREBUS_CPU sibling repo"
@@ -1146,22 +1430,26 @@ stage_packages() {
 }
 
 stage_ariadne() {
+    CURRENT_STAGE="ariadne"
     require_dir "${PROJECTS_DIR}/ARIADNE" "ARIADNE sibling repo"
     prepare_python_and_venv 0 0
     install_ariadne_if_needed 1
 }
 
 stage_plumed() {
+    CURRENT_STAGE="plumed"
     prepare_python_and_venv 0 0
     install_plumed_if_needed 1
 }
 
 stage_ferebus() {
+    CURRENT_STAGE="ferebus"
     require_dir "${PROJECTS_DIR}/FEREBUS_CPU" "FEREBUS_CPU sibling repo"
     install_ferebus_if_needed 1
 }
 
 stage_config() {
+    CURRENT_STAGE="config"
     deactivate_existing_venv "config module setup"
     load_python_stack
     if [[ "${MACHINE}" == "csf3" ]]; then
@@ -1177,11 +1465,13 @@ stage_config() {
 }
 
 stage_verify() {
+    CURRENT_STAGE="verify"
     prepare_runtime_environment
     final_checks verify
 }
 
 stage_all() {
+    CURRENT_STAGE="all"
     ensure_repo_root
     require_all_sibling_repos
     prepare_python_and_venv 0 0
@@ -1204,9 +1494,13 @@ main() {
     local log_dir="${HOME}/.cache/ichor-al-install"
     if [[ "${DRY_RUN}" -eq 0 ]]; then
         mkdir -p "${log_dir}"
-        local log_file="${log_dir}/install-${MACHINE}-$(date +%Y%m%d-%H%M%S).log"
-        exec > >(tee -a "${log_file}") 2>&1
-        echo "Writing install log to ${log_file}"
+        LOG_FILE="${log_dir}/install-${MACHINE}-$(date +%Y%m%d-%H%M%S).log"
+        exec > >(tee -a "${LOG_FILE}") 2>&1
+        echo "Writing install log to ${LOG_FILE}"
+        if [[ "${DEBUG_TRACE}" -eq 1 ]]; then
+            export PS4='+ ${BASH_SOURCE##*/}:${LINENO}:${FUNCNAME[0]:-main}: '
+            set -x
+        fi
     fi
 
     note "Install settings"
@@ -1221,7 +1515,7 @@ downloads     = ${ALLOW_DOWNLOAD}
 dry run       = ${DRY_RUN}
 EOF
 
-    if [[ "${ONLY_STAGE}" != "verify" && "${ONLY_STAGE}" != "config" ]]; then
+    if [[ "${ONLY_STAGE}" != "verify" && "${ONLY_STAGE}" != "config" && "${ONLY_STAGE}" != "doctor" ]]; then
         print_download_readiness
     fi
 
@@ -1234,6 +1528,7 @@ EOF
         ferebus) stage_ferebus ;;
         config) stage_config ;;
         verify) stage_verify ;;
+        doctor) stage_doctor ;;
     esac
 }
 

@@ -11,6 +11,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = REPO_ROOT / "scripts" / "install_ichor_csf.sh"
+LIB = REPO_ROOT / "scripts" / "lib_ichor_csf.sh"
 
 
 def _make_fake_projects(tmp_path: Path) -> Path:
@@ -60,8 +61,14 @@ def test_install_script_is_present():
     assert SCRIPT.is_file()
     assert os.access(SCRIPT, os.R_OK)
     text = SCRIPT.read_text(encoding="utf-8")
+    lib_text = LIB.read_text(encoding="utf-8")
     assert "--machine auto|csf3|csf4" in text
-    assert "--only all|python|packages|ariadne|plumed|ferebus|config|verify" in text
+    assert "--only all|python|packages|ariadne|plumed|ferebus|config|verify|doctor" in text
+    assert "--debug, --trace" in text
+    assert "trap on_error ERR" in text
+    assert "stage_doctor()" in text
+    assert "ariadne-csf3-last-install.json" in text or "ariadne-${MACHINE}-last-install.json" in text
+    assert "Manual ARIADNE recovery block" in text
     assert "PLUMED" in text
     assert "ARIADNE" in text
     assert "FEREBUS_CPU" in text
@@ -71,17 +78,17 @@ def test_install_script_is_present():
     assert "libs/gcc/openssl/1.1.1w" in text
     assert "--with-openssl=" in text
     assert "--with-openssl-rpath=auto" in text
-    assert "module_is_current_shell_function()" in text
-    assert "module_debug()" in text
-    assert "source_oneapi_setvars_if_available()" in text
-    assert "find_ariadne_compiler_path()" in text
-    assert "ensure_ariadne_compilers_on_path()" in text
-    assert "/opt/apps/compilers/intel/oneapi/2025.0.1/setvars.sh" in text
-    assert '"/compiler/*/bin/"${exe}"' in text
-    assert "*/compiler/*/opt/compiler/lib" in text
-    assert "/opt/apps/etc/profile.d/modules.sh" in text
-    assert "/opt/apps/lmod/lmod/init/bash" in text
-    assert '[[ "$(type -t module' in text
+    assert "source \"${SCRIPT_DIR}/lib_ichor_csf.sh\"" in text
+    assert "ichor_csf_module_is_shell_function()" in lib_text
+    assert "ichor_csf_module_debug()" in lib_text
+    assert "ichor_csf_find_ariadne_compiler_path()" in lib_text
+    assert "/opt/apps/compilers/intel/oneapi/2025.0.1/setvars.sh" in lib_text
+    assert "/opt/apps/compilers/intel/oneapi/2025.0.1/compiler/2025.0/bin" in lib_text
+    assert '"/compiler/*/bin/"${exe}"' in lib_text
+    assert "*/compiler/*/opt/compiler/lib" in lib_text
+    assert "/opt/apps/etc/profile.d/modules.sh" in lib_text
+    assert "/opt/apps/lmod/lmod/init/bash" in lib_text
+    assert '[[ "$(type -t module' in lib_text
     assert "cannot mutate this script's PATH" in text
     assert "import ssl; print(ssl.OPENSSL_VERSION)" in text
     assert "command -v \"${cmd}\"" in text
@@ -97,6 +104,12 @@ def test_install_script_is_present():
     assert "export CC=icx" not in text
     assert "ARIADNE_SAFE_IFX_FLAGS=ON" in text
     assert "--force-reinstall --no-deps" in text
+    assert "assert_ariadne_inside_venv" in text
+    assert "write_ariadne_receipt" in text
+    assert "print_ariadne_import_info \"ARIADNE before install\"" in text
+    assert "print_ariadne_import_info \"ARIADNE after install\"" in text
+    assert "run_in_dir \"${ariadne_root}\"" in text
+    assert "bash -lc" not in text
     assert 'if [[ "${MACHINE}" == "csf3" ]]' in text
     assert "unset CC CXX FC F77 F90" in text
     assert "export CC=gcc" in text
@@ -111,6 +124,7 @@ def test_install_script_bash_syntax():
     bash = shutil.which("bash")
     if not bash:
         pytest.skip("bash is not available on this host")
+    subprocess.run([bash, "-n", str(LIB)], check=True)
     subprocess.run([bash, "-n", str(SCRIPT)], check=True)
 
 
@@ -148,7 +162,7 @@ def test_install_script_dry_run_uses_parallel_build_flags(tmp_path):
 
 @pytest.mark.parametrize(
     "stage",
-    ["python", "packages", "ariadne", "plumed", "ferebus", "config", "verify"],
+    ["python", "packages", "ariadne", "plumed", "ferebus", "config", "verify", "doctor"],
 )
 def test_install_script_dry_run_accepts_only_stages(stage, tmp_path):
     result = _run_dry("csf3", tmp_path, "--only", stage)
@@ -166,6 +180,8 @@ def test_install_script_dry_run_ariadne_stage_reinstalls_only_ariadne(tmp_path):
     assert "resolve command icx" in output
     assert "--force-reinstall --no-deps" in output
     assert "ARIADNE_SAFE_IFX_FLAGS=ON" in output
+    assert "clean ARIADNE-local build artefacts" in output
+    assert "write ARIADNE install receipt" in output
     assert "module load compilers/intel/oneapi/2025.0.1" in output
     assert "module load umf compiler-rt tbb compiler" in output
     assert "module load mkl/2025.0" in output
@@ -174,6 +190,7 @@ def test_install_script_dry_run_ariadne_stage_reinstalls_only_ariadne(tmp_path):
 
 def test_install_script_verifies_ariadne_compilers_after_module_load():
     text = SCRIPT.read_text(encoding="utf-8")
+    lib_text = LIB.read_text(encoding="utf-8")
     marker = "load_ariadne_modules()"
     start = text.index(marker)
     body = text[start:text.index("\n}\n\nresolve_ariadne_compilers", start)]
@@ -183,11 +200,13 @@ def test_install_script_verifies_ariadne_compilers_after_module_load():
     helper_start = text.index("ensure_ariadne_compilers_on_path()")
     helper_body = text[helper_start:text.index("\n}\n\nmodule_cmd", helper_start)]
     assert "for compiler in icx icpx ifx" in helper_body
-    assert "find_ariadne_compiler_path" in helper_body
-    assert "export PATH=\"${bin_dir}:${PATH}\"" in helper_body
+    assert "ichor_csf_find_ariadne_compiler_path" in helper_body
+    assert "ichor_csf_prepend_path_once" in helper_body
     assert "ARIADNE compiler check after module load" in helper_body
     assert "ARIADNE compiler modules did not expose icx/icpx/ifx" in helper_body
     assert "module_debug" in helper_body
+    assert "PATH|known-root|known-bin|ld-library-path|setvars" not in lib_text
+    assert "known-bin" in lib_text
 
 
 def test_install_script_dry_run_config_stage_preserves_gaussian_profiles(tmp_path):
