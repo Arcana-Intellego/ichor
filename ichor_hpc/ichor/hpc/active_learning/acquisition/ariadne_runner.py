@@ -133,6 +133,18 @@ class AriadneRunResult:
             )
         if self.raw_alpha_final is not None:
             data["raw_alpha_final"] = float(self.raw_alpha_final)
+        if self.alpha_initial is not None and self.alpha_final is not None:
+            selected_delta = float(self.alpha_final) - float(self.alpha_initial)
+            data["selected_alpha_delta"] = selected_delta
+            data["selected_improves_acquisition"] = bool(
+                selected_delta >= -_alpha_improvement_tolerance(
+                    float(self.alpha_initial)
+                )
+            )
+        if self.alpha_initial is not None and self.raw_alpha_final is not None:
+            data["raw_alpha_delta"] = (
+                float(self.raw_alpha_final) - float(self.alpha_initial)
+            )
         if self.raw_whitened_distance_final is not None:
             data["raw_whitened_distance_final"] = float(
                 self.raw_whitened_distance_final
@@ -367,6 +379,44 @@ def _safe_float_or_none(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return out if math.isfinite(out) else None
+
+
+def _alpha_improvement_tolerance(alpha_initial: float) -> float:
+    return max(1.0e-10, 1.0e-8 * max(abs(float(alpha_initial)), 1.0))
+
+
+def _annotate_acquisition_improvement(
+    candidate: Dict[str, Any],
+    alpha_initial: Optional[float],
+) -> None:
+    metrics = dict(candidate.get("metrics") or {})
+    candidate["metrics"] = metrics
+    metrics["alpha_initial"] = (
+        None if alpha_initial is None else float(alpha_initial)
+    )
+    alpha = _safe_float_or_none(candidate.get("alpha"))
+    if alpha_initial is None:
+        metrics["alpha_delta_from_initial"] = None
+        metrics["improves_acquisition"] = None
+        return
+    if alpha is None:
+        metrics["alpha_delta_from_initial"] = None
+        metrics["improves_acquisition"] = False
+        reasons = candidate.setdefault("reasons", [])
+        if "ariadne_landing_acquisition_evaluation_failed" not in reasons:
+            reasons.append("ariadne_landing_acquisition_not_finite")
+        candidate["accepted"] = False
+        return
+    delta = float(alpha) - float(alpha_initial)
+    tolerance = _alpha_improvement_tolerance(float(alpha_initial))
+    improves = delta >= -tolerance
+    metrics["alpha_delta_from_initial"] = float(delta)
+    metrics["alpha_improvement_tolerance"] = float(tolerance)
+    metrics["improves_acquisition"] = bool(improves)
+    if not improves:
+        reasons = candidate.setdefault("reasons", [])
+        reasons.append("ariadne_landing_acquisition_not_improved")
+        candidate["accepted"] = False
 
 
 def _coords_array(atoms: Atoms) -> np.ndarray:
@@ -740,6 +790,9 @@ def _select_safe_landing(
         }
 
     seed_mean_energy = float(acquisition.posterior.mean(seed_atoms))
+    initial_alpha = (
+        _safe_float_or_none(alpha_trajectory[0]) if alpha_trajectory else None
+    )
     raw_coords = _coords_array(raw_final_atoms)
     candidates: List[Dict[str, Any]] = []
     seen_coords: List[np.ndarray] = []
@@ -755,7 +808,7 @@ def _select_safe_landing(
             continue
         seen_coords.append(coords.copy())
         origin = "seed_fallback" if k == 0 else "accepted_iterate"
-        candidates.append(_evaluate_landing_candidate(
+        candidate = _evaluate_landing_candidate(
             acquisition=acquisition,
             seed_atoms=seed_atoms,
             seed_mean_energy=seed_mean_energy,
@@ -772,7 +825,9 @@ def _select_safe_landing(
             ),
             safety_config=safety_config,
             quality_gates=quality_gates,
-        ))
+        )
+        _annotate_acquisition_improvement(candidate, initial_alpha)
+        candidates.append(candidate)
         idx += 1
 
     raw_candidate = _evaluate_landing_candidate(
@@ -787,6 +842,7 @@ def _select_safe_landing(
         safety_config=safety_config,
         quality_gates=quality_gates,
     )
+    _annotate_acquisition_improvement(raw_candidate, initial_alpha)
     idx += 1
     candidates.append(raw_candidate)
     if not _duplicate_coords(raw_coords, seen_coords):
@@ -803,7 +859,7 @@ def _select_safe_landing(
             if _duplicate_coords(coords, seen_coords):
                 continue
             seen_coords.append(coords.copy())
-            candidates.append(_evaluate_landing_candidate(
+            candidate = _evaluate_landing_candidate(
                 acquisition=acquisition,
                 seed_atoms=seed_atoms,
                 seed_mean_energy=seed_mean_energy,
@@ -814,7 +870,9 @@ def _select_safe_landing(
                 grad_norm=None,
                 safety_config=safety_config,
                 quality_gates=quality_gates,
-            ))
+            )
+            _annotate_acquisition_improvement(candidate, initial_alpha)
+            candidates.append(candidate)
             idx += 1
 
     safe_candidates = [c for c in candidates if bool(c.get("accepted"))]
@@ -855,6 +913,24 @@ def _select_safe_landing(
             policy = "unsafe_raw_final_record_only"
 
     metrics = dict(selected.get("metrics") or {})
+    selected_alpha = _safe_float_or_none(selected.get("alpha"))
+    metrics.setdefault(
+        "alpha_initial",
+        None if initial_alpha is None else float(initial_alpha),
+    )
+    metrics.setdefault(
+        "selected_alpha_delta",
+        None if selected_alpha is None or initial_alpha is None
+        else float(selected_alpha) - float(initial_alpha),
+    )
+    metrics.setdefault(
+        "selected_improves_acquisition",
+        None if selected_alpha is None or initial_alpha is None
+        else bool(
+            float(selected_alpha) - float(initial_alpha)
+            >= -_alpha_improvement_tolerance(float(initial_alpha))
+        ),
+    )
     selected_w = _safe_float_or_none(metrics.get("whitened_distance"))
     landing_safety = {
         "accepted": bool(accepted),

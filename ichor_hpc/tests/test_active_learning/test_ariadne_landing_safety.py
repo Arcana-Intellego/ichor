@@ -178,3 +178,41 @@ def test_seed_equivalent_raw_final_accepts_only_when_seed_fallback_enabled():
     assert safety["selected_origin"] == "seed_fallback"
     assert "ariadne_landing_is_seed" in safety["record_only_reasons"]
     assert safety["metrics"]["seed_equivalent"] is True
+
+
+def test_safe_geometry_with_lower_alpha_is_rejected():
+    out = _select(
+        raw_x=-1.0,
+        candidate_xs=[],
+        safety=_safety(backtrack_to_safe_landing=False),
+    )
+
+    safety = out["landing_safety"]
+    assert safety["accepted"] is False
+    assert "no_safe_non_seed_landing" in safety["reasons"]
+    assert "ariadne_landing_acquisition_not_improved" in safety["reasons"]
+    assert safety["raw_final"]["accepted"] is False
+    assert safety["raw_final"]["metrics"]["improves_acquisition"] is False
+    assert safety["raw_final"]["metrics"]["alpha_delta_from_initial"] < 0.0
+
+
+def test_lower_alpha_raw_final_can_only_fall_back_to_seed_explicitly():
+    out = _select(
+        raw_x=-1.0,
+        candidate_xs=[],
+        safety=_safety(
+            allow_seed_fallback=True,
+            backtrack_to_safe_landing=False,
+        ),
+    )
+
+    safety = out["landing_safety"]
+    assert safety["accepted"] is True
+    assert safety["policy"] == "seed_fallback"
+    assert safety["selected_origin"] == "seed_fallback"
+    assert np.asarray(out["selected_atoms"].coordinates)[0, 0] == 0.0
+    assert safety["raw_final"]["accepted"] is False
+    assert (
+        "ariadne_landing_acquisition_not_improved"
+        in safety["raw_final"]["reasons"]
+    )
