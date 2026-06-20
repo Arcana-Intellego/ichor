@@ -22,7 +22,11 @@ def _make_fake_projects(tmp_path: Path) -> Path:
     return projects
 
 
-def _run_dry(machine: str, tmp_path: Path) -> subprocess.CompletedProcess:
+def _run_dry(
+    machine: str,
+    tmp_path: Path,
+    *extra_args: str,
+) -> subprocess.CompletedProcess:
     bash = shutil.which("bash")
     if not bash:
         pytest.skip("bash is not available on this host")
@@ -42,6 +46,7 @@ def _run_dry(machine: str, tmp_path: Path) -> subprocess.CompletedProcess:
             "--repo-root",
             str(REPO_ROOT),
             "--yes",
+            *extra_args,
         ],
         cwd=str(REPO_ROOT),
         env=env,
@@ -56,6 +61,7 @@ def test_install_script_is_present():
     assert os.access(SCRIPT, os.R_OK)
     text = SCRIPT.read_text(encoding="utf-8")
     assert "--machine auto|csf3|csf4" in text
+    assert "--only all|python|packages|ariadne|plumed|ferebus|config|verify" in text
     assert "PLUMED" in text
     assert "ARIADNE" in text
     assert "FEREBUS_CPU" in text
@@ -67,19 +73,26 @@ def test_install_script_is_present():
     assert "--with-openssl-rpath=auto" in text
     assert "import ssl; print(ssl.OPENSSL_VERSION)" in text
     assert "command -v \"${cmd}\"" in text
+    assert "resolve_ariadne_compilers()" in text
     assert "resolve_required_cmd_into ARIADNE_CC icx" in text
     assert "resolve_required_cmd_into ARIADNE_CXX icpx" in text
     assert "resolve_required_cmd_into ARIADNE_FC ifx" in text
+    assert "deactivate_existing_venv" in text
     assert "export CC=\"${ARIADNE_CC}\"" in text
     assert "export CXX=\"${ARIADNE_CXX}\"" in text
     assert "export FC=\"${ARIADNE_FC}\"" in text
     assert "export CC=\"$(resolve_required_cmd" not in text
     assert "export CC=icx" not in text
     assert "ARIADNE_SAFE_IFX_FLAGS=ON" in text
+    assert "--force-reinstall --no-deps" in text
     assert 'if [[ "${MACHINE}" == "csf3" ]]' in text
     assert "unset CC CXX FC F77 F90" in text
     assert "export CC=gcc" in text
     assert "export CXX=g++" in text
+    assert "apps/binapps/gaussian/g09d01_em64t" in text
+    assert "$g09root/g09/g09" in text
+    assert "gaussian/g16c01_em64t_detectcpu" in text
+    assert "$g16root/g16/g16" in text
 
 
 def test_install_script_bash_syntax():
@@ -99,6 +112,7 @@ def test_install_script_dry_run_renders_cluster_defaults(machine, venv_name, tmp
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
     assert f"machine       = {machine}" in output
+    assert "only          = all" in output
     assert venv_name in output
     assert "POLUS" in output
     assert "FEREBUS_CPU" in output
@@ -118,3 +132,40 @@ def test_install_script_dry_run_uses_parallel_build_flags(tmp_path):
     assert "make -j 4" in output
     assert "cmake --build" in output
     assert "-j 4" in output
+
+
+@pytest.mark.parametrize(
+    "stage",
+    ["python", "packages", "ariadne", "plumed", "ferebus", "config", "verify"],
+)
+def test_install_script_dry_run_accepts_only_stages(stage, tmp_path):
+    result = _run_dry("csf3", tmp_path, "--only", stage)
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert f"only          = {stage}" in output
+
+
+def test_install_script_dry_run_ariadne_stage_reinstalls_only_ariadne(tmp_path):
+    result = _run_dry("csf3", tmp_path, "--only", "ariadne")
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "resolve command icx" in output
+    assert "--force-reinstall --no-deps" in output
+    assert "ARIADNE_SAFE_IFX_FLAGS=ON" in output
+    assert "cmake --build" not in output
+
+
+def test_install_script_dry_run_config_stage_preserves_gaussian_profiles(tmp_path):
+    csf3 = _run_dry("csf3", tmp_path, "--only", "config")
+    csf4 = _run_dry("csf4", tmp_path, "--only", "config")
+
+    assert csf3.returncode == 0, csf3.stdout + csf3.stderr
+    assert csf4.returncode == 0, csf4.stdout + csf4.stderr
+
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert "apps/binapps/gaussian/g09d01_em64t" in text
+    assert "$g09root/g09/g09" in text
+    assert "gaussian/g16c01_em64t_detectcpu" in text
+    assert "$g16root/g16/g16" in text

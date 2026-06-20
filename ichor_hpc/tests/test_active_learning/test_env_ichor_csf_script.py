@@ -20,6 +20,7 @@ def test_env_script_is_present_and_documents_sourcing():
     assert "This script must be sourced" in text
     assert "source scripts/env_ichor_csf.sh csf3" in text
     assert "source scripts/env_ichor_csf.sh csf4" in text
+    assert "source scripts/env_ichor_csf.sh auto" in text
 
 
 def test_env_script_contains_required_runtime_contracts():
@@ -35,10 +36,14 @@ def test_env_script_contains_required_runtime_contracts():
     assert "PLUMED_KERNEL" in text
     assert "ichor-csf3" in text
     assert "ichor-csf4" in text
-    assert "import ariadne" in text
+    assert "_ichor_env_deactivate_existing_venv" in text
+    assert "import ariadne; assert hasattr" in text
     assert "plumed.Plumed" in text
     assert "ensure_xtb_ase_available" in text
     assert "ensure_plumed_available" in text
+    assert "--smoke-heavy" in text
+    assert "--print-env" in text
+    assert "_ichor_env_print_env" in text
 
 
 def test_env_script_bash_syntax():

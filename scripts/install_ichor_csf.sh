@@ -29,6 +29,7 @@ PYTHON_PREFIX="${PYTHON_PREFIX:-${HOME}/opt/python-${PYTHON_VERSION}}"
 AIMALL_PATH="${AIMALL_PATH:-${HOME}/AIMAll/aimqb.ish}"
 FEREBUS_PATH="${FEREBUS_PATH:-${HOME}/.local/bin/ferebus}"
 INSTALL_JOBS="${ICHOR_INSTALL_JOBS:-4}"
+ONLY_STAGE="all"
 ALLOW_DOWNLOAD=0
 SKIP_PLUMED=0
 SKIP_ARIADNE_BUILD=0
@@ -46,6 +47,9 @@ Options:
   --projects-dir PATH             default: ~/projects
   --venv PATH                     default: ~/.venv/ichor-csf3 or ~/.venv/ichor-csf4
   --python-prefix PATH            CSF3 default: ~/opt/python-3.11.15
+  --only all|python|packages|ariadne|plumed|ferebus|config|verify
+                                  default: all. A component stage repairs or
+                                  reinstalls that component.
   --allow-download                permit Python/PLUMED/OpenBLAS/source downloads
   --skip-plumed                   skip native PLUMED build and smoke
   --skip-ariadne-build            only verify import ariadne
@@ -85,6 +89,7 @@ while [[ $# -gt 0 ]]; do
         --projects-dir) PROJECTS_DIR="${2:?missing value for --projects-dir}"; shift 2 ;;
         --venv) VENV="${2:?missing value for --venv}"; shift 2 ;;
         --python-prefix) PYTHON_PREFIX="${2:?missing value for --python-prefix}"; shift 2 ;;
+        --only) ONLY_STAGE="${2:?missing value for --only}"; shift 2 ;;
         --allow-download) ALLOW_DOWNLOAD=1; shift ;;
         --skip-plumed) SKIP_PLUMED=1; shift ;;
         --skip-ariadne-build) SKIP_ARIADNE_BUILD=1; shift ;;
@@ -102,6 +107,10 @@ done
 case "${MACHINE}" in
     auto|csf3|csf4) ;;
     *) die "--machine must be auto, csf3, or csf4" ;;
+esac
+case "${ONLY_STAGE}" in
+    all|python|packages|ariadne|plumed|ferebus|config|verify) ;;
+    *) die "--only must be one of all, python, packages, ariadne, plumed, ferebus, config, verify" ;;
 esac
 [[ "${INSTALL_JOBS}" =~ ^[1-9][0-9]*$ ]] || die "--jobs must be a positive integer"
 
@@ -140,6 +149,44 @@ run_shell() {
         echo "+ ${command}"
     else
         bash -lc "${command}"
+    fi
+}
+
+deactivate_existing_venv() {
+    local reason="${1:-environment setup}"
+    if [[ -z "${VIRTUAL_ENV:-}" ]]; then
+        return 0
+    fi
+    warn "Deactivating active venv ${VIRTUAL_ENV} before ${reason}"
+    local active_bin="${VIRTUAL_ENV}/bin"
+    local new_path=""
+    local part
+    local -a _ichor_path_parts
+    IFS=':' read -r -a _ichor_path_parts <<< "${PATH:-}"
+    for part in "${_ichor_path_parts[@]}"; do
+        [[ -z "${part}" || "${part}" == "${active_bin}" ]] && continue
+        if [[ -z "${new_path}" ]]; then
+            new_path="${part}"
+        else
+            new_path="${new_path}:${part}"
+        fi
+    done
+    export PATH="${new_path}"
+    unset VIRTUAL_ENV VIRTUAL_ENV_PROMPT
+    hash -r 2>/dev/null || true
+}
+
+backup_existing_path() {
+    local path="$1"
+    local label="$2"
+    if [[ ! -e "${path}" ]]; then
+        return 0
+    fi
+    local backup="${path}.bak.$(date +%Y%m%d-%H%M%S)"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "+ move existing ${label} ${path} -> ${backup}"
+    else
+        run_cmd mv "${path}" "${backup}"
     fi
 }
 
@@ -353,6 +400,9 @@ load_ariadne_modules() {
         module_cmd load compiler-rt tbb compiler
         module_cmd load mkl/2024.2
     fi
+}
+
+resolve_ariadne_compilers() {
     resolve_required_cmd_into ARIADNE_CC icx "ARIADNE requires the Intel oneAPI C compiler. Run 'module list' and check the oneAPI compiler module."
     resolve_required_cmd_into ARIADNE_CXX icpx "ARIADNE requires the Intel oneAPI C++ compiler. Run 'module list' and check the oneAPI compiler module."
     resolve_required_cmd_into ARIADNE_FC ifx "ARIADNE requires the Intel oneAPI Fortran compiler. Run 'module list' and check the oneAPI compiler module."
@@ -411,11 +461,16 @@ verify_python_ssl() {
 }
 
 ensure_csf3_python() {
+    local rebuild="${1:-0}"
     if [[ "${MACHINE}" != "csf3" ]]; then
         return 0
     fi
     load_csf3_python_build_modules
     local py="${PYTHON_PREFIX}/bin/python3.11"
+    if [[ "${rebuild}" -eq 1 && -x "${py}" ]]; then
+        note "Rebuilding private CPython ${PYTHON_VERSION}"
+        backup_existing_path "${PYTHON_PREFIX}" "private Python prefix"
+    fi
     if [[ -x "${py}" ]]; then
         export LD_LIBRARY_PATH="${PYTHON_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
         verify_python_ssl "${py}"
@@ -456,16 +511,21 @@ ensure_csf3_python() {
 }
 
 create_or_activate_venv() {
+    local recreate="${1:-0}"
     local base_python
     if [[ "${MACHINE}" == "csf3" ]]; then
         base_python="${PYTHON_PREFIX}/bin/python3.11"
     else
         base_python="python"
     fi
+    if [[ "${recreate}" -eq 1 && -d "${VENV}" ]]; then
+        backup_existing_path "${VENV}" "venv"
+    fi
     if [[ ! -x "${VENV}/bin/python" ]]; then
         note "Creating venv at ${VENV}"
         run_cmd "${base_python}" -m venv "${VENV}"
     fi
+    deactivate_existing_venv "activating target venv"
     # shellcheck disable=SC1091
     if [[ "${DRY_RUN}" -eq 0 ]]; then
         source "${VENV}/bin/activate"
@@ -476,6 +536,47 @@ create_or_activate_venv() {
     PIP="${PYTHON} -m pip"
     if [[ "${MACHINE}" == "csf3" ]]; then
         verify_python_ssl "${PYTHON}"
+    fi
+}
+
+activate_existing_venv() {
+    if [[ "${DRY_RUN}" -eq 0 && ! -f "${VENV}/bin/activate" ]]; then
+        die "venv activation script not found: ${VENV}/bin/activate. Run --only python first."
+    fi
+    deactivate_existing_venv "activating target venv"
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        # shellcheck disable=SC1091
+        source "${VENV}/bin/activate"
+    else
+        echo "+ source $(printf '%q' "${VENV}/bin/activate")"
+    fi
+    PYTHON="${VENV}/bin/python"
+    PIP="${PYTHON} -m pip"
+    if [[ "${MACHINE}" == "csf3" ]]; then
+        verify_python_ssl "${PYTHON}"
+    fi
+}
+
+prepare_python_and_venv() {
+    local rebuild_python="${1:-0}"
+    local recreate_venv="${2:-0}"
+    deactivate_existing_venv "Python module setup"
+    load_python_stack
+    ensure_csf3_python "${rebuild_python}"
+    create_or_activate_venv "${recreate_venv}"
+}
+
+prepare_runtime_environment() {
+    note "Preparing runtime environment"
+    deactivate_existing_venv "runtime module setup"
+    load_ariadne_modules
+    activate_existing_venv
+    unset CC CXX FC F77 F90
+    export ICHOR_MACHINE="${MACHINE}"
+    if [[ "${SKIP_PLUMED}" -eq 0 ]]; then
+        export PLUMED_KERNEL="${PLUMED_KERNEL:-${HOME}/opt/plumed-${PLUMED_VERSION}/lib/libplumedKernel.so}"
+        export PLUMED_LIBRARY_PATH="${PLUMED_LIBRARY_PATH:-${HOME}/opt/plumed-${PLUMED_VERSION}/lib}"
+        export LD_LIBRARY_PATH="${PLUMED_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
     fi
 }
 
@@ -500,13 +601,31 @@ install_python_packages() {
     pip_install -e "${PROJECTS_DIR}/FEREBUS_CPU/pyferebus" --no-deps
 }
 
+verify_ariadne_api() {
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "+ ${PYTHON} -c 'import ariadne; check optimiser API'"
+        return 0
+    fi
+    "${PYTHON}" - <<'PY'
+import ariadne
+
+if not (hasattr(ariadne, "Geometric_Trqn") or hasattr(ariadne, "Ds_Optimiser")):
+    raise SystemExit("ariadne imported but no documented optimiser API was found")
+print("ARIADNE OK")
+PY
+}
+
 install_ariadne_if_needed() {
+    local reinstall="${1:-0}"
     note "Checking ARIADNE"
+    deactivate_existing_venv "ARIADNE module setup"
     load_ariadne_modules
     # shellcheck disable=SC1091
-    [[ "${DRY_RUN}" -eq 0 ]] && source "${VENV}/bin/activate" || echo "+ source $(printf '%q' "${VENV}/bin/activate")"
-    if [[ "${DRY_RUN}" -eq 0 ]] && python_import_ok ariadne; then
+    create_or_activate_venv 0
+    resolve_ariadne_compilers
+    if [[ "${reinstall}" -eq 0 && "${DRY_RUN}" -eq 0 ]] && python_import_ok ariadne; then
         echo "ARIADNE already importable"
+        verify_ariadne_api
         return 0
     fi
     if [[ "${SKIP_ARIADNE_BUILD}" -eq 1 ]]; then
@@ -531,10 +650,10 @@ install_ariadne_if_needed() {
         ariadne_pip_config=" --config-settings=cmake.define.ARIADNE_SAFE_IFX_FLAGS=ON"
     fi
     [[ "${DRY_RUN}" -eq 1 ]] && echo "+ export CC=${CC} CXX=${CXX} FC=${FC} CMAKE_BUILD_PARALLEL_LEVEL=${INSTALL_JOBS} MAKEFLAGS=-j${INSTALL_JOBS}"
-    run_shell "cd $(printf '%q' "${ariadne_root}") && $(printf '%q' "${PYTHON}") -m pip install . --no-build-isolation -v${ariadne_pip_config}"
+    run_shell "cd $(printf '%q' "${ariadne_root}") && $(printf '%q' "${PYTHON}") -m pip install . --no-build-isolation -v --force-reinstall --no-deps${ariadne_pip_config}"
     unset CC CXX FC F77 F90
     unset MAKEFLAGS CMAKE_BUILD_PARALLEL_LEVEL
-    [[ "${DRY_RUN}" -eq 1 ]] || python_import_ok ariadne || die "ARIADNE install completed but import ariadne still fails"
+    verify_ariadne_api
 }
 
 plumed_source_dir() {
@@ -559,6 +678,7 @@ plumed_source_dir() {
 }
 
 install_plumed_if_needed() {
+    local reinstall="${1:-0}"
     if [[ "${SKIP_PLUMED}" -eq 1 ]]; then
         warn "Skipping PLUMED install by request"
         return 0
@@ -570,12 +690,13 @@ install_plumed_if_needed() {
     export PLUMED_KERNEL="${kernel}"
     export LD_LIBRARY_PATH="${library_path}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
-    if [[ "${DRY_RUN}" -eq 0 ]] && [[ -r "${kernel}" ]] && "${PYTHON}" -c "import os, plumed; p=plumed.Plumed(kernel=os.environ['PLUMED_KERNEL']); p.finalize()" >/dev/null 2>&1; then
+    if [[ "${reinstall}" -eq 0 && "${DRY_RUN}" -eq 0 ]] && [[ -r "${kernel}" ]] && "${PYTHON}" -c "import os, plumed; p=plumed.Plumed(kernel=os.environ['PLUMED_KERNEL']); p.finalize()" >/dev/null 2>&1; then
         echo "PLUMED already usable"
     else
+        deactivate_existing_venv "PLUMED GCC module setup"
         load_gcc_build_modules
         # shellcheck disable=SC1091
-        [[ "${DRY_RUN}" -eq 0 ]] && source "${VENV}/bin/activate" || echo "+ source $(printf '%q' "${VENV}/bin/activate")"
+        create_or_activate_venv 0
         unset CC CXX FC F77 F90
         export CC=gcc
         export CXX=g++
@@ -584,10 +705,13 @@ install_plumed_if_needed() {
         require_cmd make "Load a compiler/build module first."
         local src
         src="$(plumed_source_dir)"
+        if [[ "${reinstall}" -eq 1 ]]; then
+            run_shell "cd $(printf '%q' "${src}") && make clean || true"
+        fi
         run_shell "cd $(printf '%q' "${src}") && ./configure --prefix=$(printf '%q' "${HOME}/opt/plumed-${PLUMED_VERSION}") --disable-external-blas --disable-external-lapack --disable-mpi"
         run_shell "cd $(printf '%q' "${src}") && make -j $(printf '%q' "${INSTALL_JOBS}")"
         run_shell "cd $(printf '%q' "${src}") && make install"
-        pip_install "plumed==${PLUMED_VERSION}"
+        pip_install --force-reinstall "plumed==${PLUMED_VERSION}"
         unset CC CXX FC F77 F90
     fi
     export PLUMED_KERNEL="${kernel}"
@@ -600,8 +724,9 @@ install_plumed_if_needed() {
 }
 
 install_ferebus_if_needed() {
+    local reinstall="${1:-0}"
     note "Checking FEREBUS"
-    if [[ -x "${FEREBUS_PATH}" ]]; then
+    if [[ "${reinstall}" -eq 0 && -x "${FEREBUS_PATH}" ]]; then
         echo "FEREBUS executable already present: ${FEREBUS_PATH}"
         return 0
     fi
@@ -641,6 +766,14 @@ install_ferebus_if_needed() {
     require_cmd cmake "Load the CSF CMake module first."
     require_cmd gfortran "Load a GCC compiler module first."
     local build_dir="${root}/build-ichor-install"
+    case "${build_dir}" in
+        "${root}/build-ichor-install") ;;
+        *) die "refusing to clean unexpected FEREBUS build directory: ${build_dir}" ;;
+    esac
+    if [[ "${reinstall}" -eq 1 ]]; then
+        run_cmd rm -rf "${build_dir}"
+        backup_existing_path "${FEREBUS_PATH}" "FEREBUS executable"
+    fi
     run_cmd mkdir -p "${build_dir}" "$(dirname "${FEREBUS_PATH}")"
     run_shell "cmake -S $(printf '%q' "${root}") -B $(printf '%q' "${build_dir}") -DCMAKE_BUILD_TYPE=Release"
     run_shell "cmake --build $(printf '%q' "${build_dir}") -j $(printf '%q' "${INSTALL_JOBS}")"
@@ -788,7 +921,16 @@ verify_operator_backends() {
     echo "FEREBUS: ${FEREBUS_PATH}"
 }
 
+require_yaml_available() {
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "+ ${PYTHON} -c 'import yaml'"
+        return 0
+    fi
+    "${PYTHON}" -c "import yaml" >/dev/null 2>&1 || die "PyYAML is not installed in ${VENV}. Run --only packages before --only config."
+}
+
 final_checks() {
+    local label="${1:-install}"
     note "Running final verification"
     if [[ "${DRY_RUN}" -eq 1 ]]; then
         echo "+ final import checks and ichor-al-daemon preflight"
@@ -798,7 +940,7 @@ final_checks() {
     "${PYTHON}" -c "import ichor.core, ichor.hpc, ichor.cli; print('ICHOR packages OK')"
     "${PYTHON}" -c "import polus.samplers.RS.randomSampling; print('POLUS RS OK')"
     "${PYTHON}" -c "import pyferebus.executors.trainer; print('pyferebus OK')"
-    "${PYTHON}" -c "import ariadne; print('ARIADNE OK')"
+    verify_ariadne_api
     "${PYTHON}" -c "import ase, rdkit, tqdm, portalocker; print('ASE/RDKit/tqdm/portalocker OK')"
     "${PYTHON}" -c "from xtb.ase.calculator import XTB; print('xTB OK')"
     "${PYTHON}" -c "from ichor.hpc.runtime_preflight import ensure_xtb_ase_available; ensure_xtb_ase_available(run_energy=True); print('xTB smoke OK')"
@@ -814,13 +956,93 @@ max_iterations: 1
 EOF
     "${VENV}/bin/ichor-al-daemon" preflight --campaign-dir "${smoke_dir}"
     echo ""
-    echo "Install complete."
-    echo "Activate with:"
-    echo "  export ICHOR_MACHINE=${MACHINE}"
-    if [[ "${MACHINE}" == "csf3" ]]; then
-        echo "  export LD_LIBRARY_PATH=${PYTHON_PREFIX}/lib:\$LD_LIBRARY_PATH"
+    if [[ "${label}" == "verify" ]]; then
+        echo "Verification complete."
+    else
+        echo "Install complete."
     fi
-    echo "  source ${VENV}/bin/activate"
+    echo "Enter the runtime environment with:"
+    echo "  source ${REPO_ROOT}/scripts/env_ichor_csf.sh ${MACHINE} --smoke"
+}
+
+verify_entrypoints() {
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "+ command -v ichor-cli"
+        echo "+ command -v ichor-al-daemon"
+        return 0
+    fi
+    command -v ichor-cli >/dev/null 2>&1 || die "ichor-cli is not on PATH after activating ${VENV}"
+    command -v ichor-al-daemon >/dev/null 2>&1 || die "ichor-al-daemon is not on PATH after activating ${VENV}"
+}
+
+require_all_sibling_repos() {
+    require_dir "${PROJECTS_DIR}/POLUS" "POLUS sibling repo"
+    require_dir "${PROJECTS_DIR}/FEREBUS_CPU" "FEREBUS_CPU sibling repo"
+    require_dir "${PROJECTS_DIR}/ARIADNE" "ARIADNE sibling repo"
+}
+
+stage_python() {
+    prepare_python_and_venv 1 1
+    pip_install --upgrade pip setuptools wheel
+}
+
+stage_packages() {
+    ensure_repo_root
+    require_dir "${PROJECTS_DIR}/POLUS" "POLUS sibling repo"
+    require_dir "${PROJECTS_DIR}/FEREBUS_CPU" "FEREBUS_CPU sibling repo"
+    prepare_python_and_venv 0 0
+    install_python_packages
+    verify_entrypoints
+}
+
+stage_ariadne() {
+    require_dir "${PROJECTS_DIR}/ARIADNE" "ARIADNE sibling repo"
+    prepare_python_and_venv 0 0
+    install_ariadne_if_needed 1
+}
+
+stage_plumed() {
+    prepare_python_and_venv 0 0
+    install_plumed_if_needed 1
+}
+
+stage_ferebus() {
+    require_dir "${PROJECTS_DIR}/FEREBUS_CPU" "FEREBUS_CPU sibling repo"
+    install_ferebus_if_needed 1
+}
+
+stage_config() {
+    deactivate_existing_venv "config module setup"
+    load_python_stack
+    if [[ "${MACHINE}" == "csf3" ]]; then
+        export LD_LIBRARY_PATH="${PYTHON_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    fi
+    activate_existing_venv
+    require_yaml_available
+    if [[ "${SKIP_PLUMED}" -eq 0 ]]; then
+        export PLUMED_KERNEL="${PLUMED_KERNEL:-${HOME}/opt/plumed-${PLUMED_VERSION}/lib/libplumedKernel.so}"
+        export PLUMED_LIBRARY_PATH="${PLUMED_LIBRARY_PATH:-${HOME}/opt/plumed-${PLUMED_VERSION}/lib}"
+    fi
+    upsert_ichor_config
+}
+
+stage_verify() {
+    prepare_runtime_environment
+    final_checks verify
+}
+
+stage_all() {
+    ensure_repo_root
+    require_all_sibling_repos
+    prepare_python_and_venv 0 0
+    install_python_packages
+    install_ariadne_if_needed 0
+    install_plumed_if_needed 0
+    install_ferebus_if_needed 0
+    prepare_runtime_environment
+    require_yaml_available
+    upsert_ichor_config
+    final_checks install
 }
 
 main() {
@@ -844,32 +1066,25 @@ repo root     = ${REPO_ROOT}
 projects dir  = ${PROJECTS_DIR}
 venv          = ${VENV}
 jobs          = ${INSTALL_JOBS}
+only          = ${ONLY_STAGE}
 downloads     = ${ALLOW_DOWNLOAD}
 dry run       = ${DRY_RUN}
 EOF
 
-    print_download_readiness
-    ensure_repo_root
-    require_dir "${PROJECTS_DIR}/POLUS" "POLUS sibling repo"
-    require_dir "${PROJECTS_DIR}/FEREBUS_CPU" "FEREBUS_CPU sibling repo"
-    require_dir "${PROJECTS_DIR}/ARIADNE" "ARIADNE sibling repo"
-
-    load_python_stack
-    ensure_csf3_python
-    create_or_activate_venv
-    install_python_packages
-    install_ariadne_if_needed
-    install_plumed_if_needed
-    install_ferebus_if_needed
-    load_ariadne_modules
-    # shellcheck disable=SC1091
-    [[ "${DRY_RUN}" -eq 0 ]] && source "${VENV}/bin/activate" || echo "+ source $(printf '%q' "${VENV}/bin/activate")"
-    if [[ "${SKIP_PLUMED}" -eq 0 ]]; then
-        export PLUMED_KERNEL="${PLUMED_KERNEL:-${HOME}/opt/plumed-${PLUMED_VERSION}/lib/libplumedKernel.so}"
-        export LD_LIBRARY_PATH="${PLUMED_LIBRARY_PATH:-${HOME}/opt/plumed-${PLUMED_VERSION}/lib}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    if [[ "${ONLY_STAGE}" != "verify" && "${ONLY_STAGE}" != "config" ]]; then
+        print_download_readiness
     fi
-    upsert_ichor_config
-    final_checks
+
+    case "${ONLY_STAGE}" in
+        all) stage_all ;;
+        python) stage_python ;;
+        packages) stage_packages ;;
+        ariadne) stage_ariadne ;;
+        plumed) stage_plumed ;;
+        ferebus) stage_ferebus ;;
+        config) stage_config ;;
+        verify) stage_verify ;;
+    esac
 }
 
 main "$@"

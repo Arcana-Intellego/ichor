@@ -12,6 +12,7 @@ This script must be sourced, not executed:
 
   source scripts/env_ichor_csf.sh csf3
   source scripts/env_ichor_csf.sh csf4
+  source scripts/env_ichor_csf.sh auto
 EOF
     exit 1
 fi
@@ -19,14 +20,16 @@ fi
 _ichor_env_usage() {
     cat <<'EOF'
 Usage:
-  source scripts/env_ichor_csf.sh csf3|csf4 [options]
+  source scripts/env_ichor_csf.sh auto|csf3|csf4 [options]
 
 Options:
   --venv PATH             Override venv path
   --python-prefix PATH    CSF3 private Python prefix, default ~/opt/python-3.11.15
   --plumed-prefix PATH    PLUMED prefix, default ~/opt/plumed-2.10.0
   --no-purge              Do not module purge before loading runtime modules
-  --smoke                 Run fuller xTB/RDKit/daemon import checks
+  --smoke                 Run import/path smoke checks
+  --smoke-heavy           Also run xTB energy and ASE+PLUMED smokes
+  --print-env             Print resolved runtime environment details
   --quiet                 Print only errors
   -h, --help              Show this help
 EOF
@@ -67,6 +70,43 @@ _ichor_env_module() {
     module "$@"
 }
 
+_ichor_env_detect_machine() {
+    local host
+    host="$(hostname -f 2>/dev/null || hostname 2>/dev/null || true)"
+    host="${host,,}"
+    if [[ "${host}" == *csf3* || "${host}" == *login3* ]]; then
+        printf 'csf3\n'
+    elif [[ "${host}" == *csf4* || "${host}" == *login0* ]]; then
+        printf 'csf4\n'
+    else
+        _ichor_env_error "could not auto-detect CSF3/CSF4 from hostname '${host}'"
+        return 1
+    fi
+}
+
+_ichor_env_deactivate_existing_venv() {
+    if [[ -z "${VIRTUAL_ENV:-}" ]]; then
+        return 0
+    fi
+    _ichor_env_note "Deactivating active venv ${VIRTUAL_ENV} before loading CSF modules"
+    local active_bin="${VIRTUAL_ENV}/bin"
+    local new_path=""
+    local part
+    local -a path_parts
+    IFS=':' read -r -a path_parts <<< "${PATH:-}"
+    for part in "${path_parts[@]}"; do
+        [[ -z "${part}" || "${part}" == "${active_bin}" ]] && continue
+        if [[ -z "${new_path}" ]]; then
+            new_path="${part}"
+        else
+            new_path="${new_path}:${part}"
+        fi
+    done
+    export PATH="${new_path}"
+    unset VIRTUAL_ENV VIRTUAL_ENV_PROMPT
+    hash -r 2>/dev/null || true
+}
+
 _ichor_env_import_check() {
     local label="$1"
     local code="$2"
@@ -81,6 +121,30 @@ _ichor_env_import_check() {
     return 1
 }
 
+_ichor_env_print_env() {
+    echo "ICHOR_MACHINE=${ICHOR_MACHINE:-}"
+    echo "VIRTUAL_ENV=${VIRTUAL_ENV:-}"
+    echo "python=$(command -v python || true)"
+    echo "ichor-cli=$(command -v ichor-cli || true)"
+    echo "ichor-al-daemon=$(command -v ichor-al-daemon || true)"
+    echo "PLUMED_KERNEL=${PLUMED_KERNEL:-}"
+    echo "PATH:"
+    local i=0
+    local part
+    local -a path_parts
+    IFS=':' read -r -a path_parts <<< "${PATH:-}"
+    for part in "${path_parts[@]}"; do
+        echo "  ${part}"
+        i=$((i + 1))
+        [[ "${i}" -ge 8 ]] && break
+    done
+    echo "LD_LIBRARY_PATH:"
+    IFS=':' read -r -a path_parts <<< "${LD_LIBRARY_PATH:-}"
+    for part in "${path_parts[@]}"; do
+        [[ -n "${part}" ]] && echo "  ${part}"
+    done
+}
+
 _ichor_env_main() {
     local machine="${1:-}"
     if [[ -z "${machine}" || "${machine}" == "-h" || "${machine}" == "--help" ]]; then
@@ -91,6 +155,8 @@ _ichor_env_main() {
 
     local do_purge=1
     local do_smoke=0
+    local do_smoke_heavy=0
+    local do_print_env=0
     local python_prefix="${HOME}/opt/python-3.11.15"
     local plumed_prefix="${HOME}/opt/plumed-2.10.0"
     local venv=""
@@ -118,6 +184,15 @@ _ichor_env_main() {
                 do_smoke=1
                 shift
                 ;;
+            --smoke-heavy)
+                do_smoke=1
+                do_smoke_heavy=1
+                shift
+                ;;
+            --print-env)
+                do_print_env=1
+                shift
+                ;;
             --quiet)
                 ICHOR_ENV_QUIET=1
                 shift
@@ -134,10 +209,14 @@ _ichor_env_main() {
         esac
     done
 
+    if [[ "${machine}" == "auto" ]]; then
+        machine="$(_ichor_env_detect_machine)" || return 2
+    fi
+
     case "${machine}" in
         csf3|csf4) ;;
         *)
-            _ichor_env_error "machine must be csf3 or csf4"
+            _ichor_env_error "machine must be auto, csf3, or csf4"
             _ichor_env_usage >&2
             return 2
             ;;
@@ -149,6 +228,8 @@ _ichor_env_main() {
         venv="${HOME}/.venv/ichor-${machine}"
     fi
     venv="$(_ichor_env_expand_path "${venv}")"
+
+    _ichor_env_deactivate_existing_venv || return 1
 
     if [[ "${do_purge}" -eq 1 ]]; then
         _ichor_env_module purge || return 1
@@ -194,7 +275,11 @@ _ichor_env_main() {
         echo "PLUMED_KERNEL=${PLUMED_KERNEL}"
     fi
 
-    _ichor_env_import_check "ARIADNE" "import ariadne" || return 1
+    if [[ "${do_print_env}" -eq 1 ]]; then
+        _ichor_env_print_env
+    fi
+
+    _ichor_env_import_check "ARIADNE" "import ariadne; assert hasattr(ariadne, 'Geometric_Trqn') or hasattr(ariadne, 'Ds_Optimiser')" || return 1
     _ichor_env_import_check "PLUMED" "import os, plumed; p=plumed.Plumed(kernel=os.environ['PLUMED_KERNEL']); p.finalize()" || return 1
 
     if [[ "${do_smoke}" -eq 1 ]]; then
@@ -203,6 +288,9 @@ _ichor_env_main() {
         _ichor_env_import_check "pyferebus" "import pyferebus.executors.trainer" || return 1
         _ichor_env_import_check "RDKit" "from rdkit import Chem" || return 1
         _ichor_env_import_check "xTB" "from xtb.ase.calculator import XTB" || return 1
+    fi
+
+    if [[ "${do_smoke_heavy}" -eq 1 ]]; then
         _ichor_env_import_check "xTB runtime smoke" "from ichor.hpc.runtime_preflight import ensure_xtb_ase_available; ensure_xtb_ase_available(run_energy=True)" || return 1
         _ichor_env_import_check "PLUMED runtime smoke" "from ichor.hpc.runtime_preflight import ensure_plumed_available; ensure_plumed_available(run_ase_smoke=True)" || return 1
     fi
@@ -211,7 +299,8 @@ _ichor_env_main() {
 _ichor_env_main "$@"
 _ichor_env_rc=$?
 unset -f _ichor_env_usage _ichor_env_error _ichor_env_note _ichor_env_expand_path
-unset -f _ichor_env_initialise_modules _ichor_env_module _ichor_env_import_check
+unset -f _ichor_env_initialise_modules _ichor_env_module _ichor_env_detect_machine
+unset -f _ichor_env_deactivate_existing_venv _ichor_env_import_check _ichor_env_print_env
 unset -f _ichor_env_main
 unset ICHOR_ENV_QUIET
 return "${_ichor_env_rc}"
