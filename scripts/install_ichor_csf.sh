@@ -304,6 +304,97 @@ module_debug() {
     } >&2
 }
 
+source_oneapi_setvars_if_available() {
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "+ source oneAPI setvars.sh if compiler wrappers are not on PATH"
+        return 0
+    fi
+    local setvars=""
+    local candidate
+    for candidate in \
+        "${ONEAPIDIR:-}/setvars.sh" \
+        "${ONEAPI_ROOT:-}/setvars.sh" \
+        /opt/apps/compilers/intel/oneapi/2025.0.1/setvars.sh \
+        /opt/apps/compilers/oneapi/2024.2.0/setvars.sh; do
+        [[ -n "${candidate}" && -f "${candidate}" ]] || continue
+        setvars="${candidate}"
+        break
+    done
+    [[ -n "${setvars}" ]] || return 0
+    # shellcheck disable=SC1090
+    source "${setvars}" >/dev/null 2>&1 || source "${setvars}"
+    hash -r 2>/dev/null || true
+}
+
+find_ariadne_compiler_path() {
+    local exe="$1"
+    local resolved
+    resolved="$(command -v "${exe}" 2>/dev/null || true)"
+    if [[ -n "${resolved}" ]]; then
+        printf '%s\n' "${resolved}"
+        return 0
+    fi
+
+    local root candidate path_part compiler_root
+    for root in \
+        "${ONEAPIDIR:-}" \
+        "${ONEAPI_ROOT:-}" \
+        /opt/apps/compilers/intel/oneapi/2025.0.1 \
+        /opt/apps/compilers/oneapi/2024.2.0; do
+        [[ -n "${root}" && -d "${root}" ]] || continue
+        for candidate in "${root}"/compiler/*/bin/"${exe}" "${root}"/compiler/latest/bin/"${exe}"; do
+            [[ -x "${candidate}" ]] || continue
+            printf '%s\n' "${candidate}"
+            return 0
+        done
+    done
+
+    local -a library_parts
+    IFS=':' read -r -a library_parts <<< "${LD_LIBRARY_PATH:-}"
+    for path_part in "${library_parts[@]}"; do
+        case "${path_part}" in
+            */compiler/*/lib)
+                compiler_root="$(dirname "${path_part}")"
+                candidate="${compiler_root}/bin/${exe}"
+                ;;
+            */compiler/*/opt/compiler/lib)
+                compiler_root="$(cd "${path_part}/../../.." 2>/dev/null && pwd || true)"
+                candidate="${compiler_root}/bin/${exe}"
+                ;;
+            *)
+                candidate=""
+                ;;
+        esac
+        [[ -n "${candidate}" && -x "${candidate}" ]] || continue
+        printf '%s\n' "${candidate}"
+        return 0
+    done
+    return 1
+}
+
+ensure_ariadne_compilers_on_path() {
+    [[ "${DRY_RUN}" -eq 1 ]] && return 0
+    local compiler resolved bin_dir missing=0
+    for compiler in icx icpx ifx; do
+        resolved="$(find_ariadne_compiler_path "${compiler}" || true)"
+        if [[ -z "${resolved}" ]]; then
+            warn "ARIADNE compiler '${compiler}' was not found after loading ARIADNE modules"
+            missing=1
+            continue
+        fi
+        bin_dir="$(dirname "${resolved}")"
+        case ":${PATH}:" in
+            *":${bin_dir}:"*) ;;
+            *) export PATH="${bin_dir}:${PATH}" ;;
+        esac
+    done
+    hash -r 2>/dev/null || true
+    if [[ "${missing}" -ne 0 ]]; then
+        module_debug "ARIADNE compiler check after module load"
+        die "ARIADNE compiler modules did not expose icx/icpx/ifx"
+    fi
+}
+
 module_cmd() {
     if [[ "${DRY_RUN}" -eq 1 ]]; then
         printf '+ module'
@@ -455,21 +546,13 @@ load_ariadne_modules() {
         module_cmd load mkl/2024.2
     fi
     if [[ "${DRY_RUN}" -eq 0 ]]; then
-        local missing=0
-        for compiler in icx icpx ifx; do
-            if ! command -v "${compiler}" >/dev/null 2>&1; then
-                warn "ARIADNE compiler '${compiler}' was not found after loading ARIADNE modules"
-                missing=1
-            fi
-        done
-        if [[ "${missing}" -ne 0 ]]; then
-            module_debug "ARIADNE compiler check after module load"
-            die "ARIADNE compiler modules did not expose icx/icpx/ifx"
-        fi
+        source_oneapi_setvars_if_available
+        ensure_ariadne_compilers_on_path
     fi
 }
 
 resolve_ariadne_compilers() {
+    ensure_ariadne_compilers_on_path
     resolve_required_cmd_into ARIADNE_CC icx "ARIADNE requires the Intel oneAPI C compiler. Run 'module list' and check the oneAPI compiler module."
     resolve_required_cmd_into ARIADNE_CXX icpx "ARIADNE requires the Intel oneAPI C++ compiler. Run 'module list' and check the oneAPI compiler module."
     resolve_required_cmd_into ARIADNE_FC ifx "ARIADNE requires the Intel oneAPI Fortran compiler. Run 'module list' and check the oneAPI compiler module."

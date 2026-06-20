@@ -73,6 +73,12 @@ def test_install_script_is_present():
     assert "--with-openssl-rpath=auto" in text
     assert "module_is_current_shell_function()" in text
     assert "module_debug()" in text
+    assert "source_oneapi_setvars_if_available()" in text
+    assert "find_ariadne_compiler_path()" in text
+    assert "ensure_ariadne_compilers_on_path()" in text
+    assert "/opt/apps/compilers/intel/oneapi/2025.0.1/setvars.sh" in text
+    assert '"/compiler/*/bin/"${exe}"' in text
+    assert "*/compiler/*/opt/compiler/lib" in text
     assert "/opt/apps/etc/profile.d/modules.sh" in text
     assert "/opt/apps/lmod/lmod/init/bash" in text
     assert '[[ "$(type -t module' in text
@@ -171,10 +177,17 @@ def test_install_script_verifies_ariadne_compilers_after_module_load():
     marker = "load_ariadne_modules()"
     start = text.index(marker)
     body = text[start:text.index("\n}\n\nresolve_ariadne_compilers", start)]
-    assert "for compiler in icx icpx ifx" in body
-    assert "ARIADNE compiler check after module load" in body
-    assert "ARIADNE compiler modules did not expose icx/icpx/ifx" in body
-    assert "module_debug" in body
+    assert "source_oneapi_setvars_if_available" in body
+    assert "ensure_ariadne_compilers_on_path" in body
+
+    helper_start = text.index("ensure_ariadne_compilers_on_path()")
+    helper_body = text[helper_start:text.index("\n}\n\nmodule_cmd", helper_start)]
+    assert "for compiler in icx icpx ifx" in helper_body
+    assert "find_ariadne_compiler_path" in helper_body
+    assert "export PATH=\"${bin_dir}:${PATH}\"" in helper_body
+    assert "ARIADNE compiler check after module load" in helper_body
+    assert "ARIADNE compiler modules did not expose icx/icpx/ifx" in helper_body
+    assert "module_debug" in helper_body
 
 
 def test_install_script_dry_run_config_stage_preserves_gaussian_profiles(tmp_path):
