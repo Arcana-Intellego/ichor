@@ -238,6 +238,9 @@ resolve_required_cmd_into() {
 
     resolved="$(command -v "${cmd}" || true)"
     if [[ -z "${resolved}" ]]; then
+        if [[ "${cmd}" == "icx" || "${cmd}" == "icpx" || "${cmd}" == "ifx" || "${hint}" == ARIADNE* ]]; then
+            module_debug "compiler resolution failed for ${cmd}"
+        fi
         if [[ -n "${hint}" ]]; then
             die "required command '${cmd}' is not on PATH. ${hint}"
         fi
@@ -246,15 +249,59 @@ resolve_required_cmd_into() {
     printf -v "${target_var}" '%s' "${resolved}"
 }
 
+module_is_current_shell_function() {
+    [[ "$(type -t module 2>/dev/null || true)" == "function" ]]
+}
+
 initialise_modules() {
-    if command -v module >/dev/null 2>&1; then
+    if module_is_current_shell_function; then
         return 0
     fi
-    # Common Environment Modules/Lmod initialisation points.
-    # shellcheck disable=SC1091
-    [[ -f /etc/profile.d/modules.sh ]] && source /etc/profile.d/modules.sh || true
-    # shellcheck disable=SC1091
-    [[ -f /usr/share/Modules/init/bash ]] && source /usr/share/Modules/init/bash || true
+    # Common Environment Modules/Lmod initialisation points. Do not return
+    # merely because an external "module" command exists: external wrappers
+    # cannot mutate this script's PATH after "module load".
+    local init_file
+    for init_file in \
+        /etc/profile.d/modules.sh \
+        /usr/share/Modules/init/bash \
+        /usr/share/lmod/lmod/init/bash \
+        /opt/apps/etc/profile.d/modules.sh \
+        /opt/apps/Modules/init/bash \
+        /opt/apps/modules/init/bash \
+        /opt/apps/lmod/lmod/init/bash; do
+        # shellcheck disable=SC1090
+        [[ -f "${init_file}" ]] && source "${init_file}" || true
+        if module_is_current_shell_function; then
+            return 0
+        fi
+    done
+    if command -v modulecmd >/dev/null 2>&1; then
+        module() { eval "$(modulecmd bash "$@")"; }
+        if module_is_current_shell_function; then
+            return 0
+        fi
+    fi
+    if command -v lmod >/dev/null 2>&1; then
+        module() { eval "$(lmod bash "$@")"; }
+        if module_is_current_shell_function; then
+            return 0
+        fi
+    fi
+}
+
+module_debug() {
+    local context="${1:-module environment diagnostics}"
+    {
+        echo "Module diagnostics (${context}):"
+        echo "  module type: $(type -t module 2>/dev/null || echo unavailable)"
+        echo "  module path: $(command -v module 2>/dev/null || echo unavailable)"
+        echo "  PATH=${PATH:-}"
+        echo "  LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"
+        echo "  LOADEDMODULES=${LOADEDMODULES:-}"
+        if module_is_current_shell_function; then
+            module list || true
+        fi
+    } >&2
 }
 
 module_cmd() {
@@ -265,8 +312,15 @@ module_cmd() {
         return 0
     fi
     initialise_modules
-    command -v module >/dev/null 2>&1 || die "module command is unavailable on this shell"
-    module "$@"
+    if ! module_is_current_shell_function; then
+        module_debug "module initialisation failed"
+        die "module command is unavailable as a shell function on this shell"
+    fi
+    if ! module "$@"; then
+        module_debug "module $* failed"
+        die "module command failed: module $*"
+    fi
+    hash -r 2>/dev/null || true
 }
 
 detect_machine() {
@@ -399,6 +453,19 @@ load_ariadne_modules() {
         module_cmd load compilers/oneapi/2024.2.0
         module_cmd load compiler-rt tbb compiler
         module_cmd load mkl/2024.2
+    fi
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        local missing=0
+        for compiler in icx icpx ifx; do
+            if ! command -v "${compiler}" >/dev/null 2>&1; then
+                warn "ARIADNE compiler '${compiler}' was not found after loading ARIADNE modules"
+                missing=1
+            fi
+        done
+        if [[ "${missing}" -ne 0 ]]; then
+            module_debug "ARIADNE compiler check after module load"
+            die "ARIADNE compiler modules did not expose icx/icpx/ifx"
+        fi
     fi
 }
 

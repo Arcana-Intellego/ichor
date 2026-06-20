@@ -71,6 +71,12 @@ def test_install_script_is_present():
     assert "libs/gcc/openssl/1.1.1w" in text
     assert "--with-openssl=" in text
     assert "--with-openssl-rpath=auto" in text
+    assert "module_is_current_shell_function()" in text
+    assert "module_debug()" in text
+    assert "/opt/apps/etc/profile.d/modules.sh" in text
+    assert "/opt/apps/lmod/lmod/init/bash" in text
+    assert '[[ "$(type -t module' in text
+    assert "cannot mutate this script's PATH" in text
     assert "import ssl; print(ssl.OPENSSL_VERSION)" in text
     assert "command -v \"${cmd}\"" in text
     assert "resolve_ariadne_compilers()" in text
@@ -154,7 +160,21 @@ def test_install_script_dry_run_ariadne_stage_reinstalls_only_ariadne(tmp_path):
     assert "resolve command icx" in output
     assert "--force-reinstall --no-deps" in output
     assert "ARIADNE_SAFE_IFX_FLAGS=ON" in output
+    assert "module load compilers/intel/oneapi/2025.0.1" in output
+    assert "module load umf compiler-rt tbb compiler" in output
+    assert "module load mkl/2025.0" in output
     assert "cmake --build" not in output
+
+
+def test_install_script_verifies_ariadne_compilers_after_module_load():
+    text = SCRIPT.read_text(encoding="utf-8")
+    marker = "load_ariadne_modules()"
+    start = text.index(marker)
+    body = text[start:text.index("\n}\n\nresolve_ariadne_compilers", start)]
+    assert "for compiler in icx icpx ifx" in body
+    assert "ARIADNE compiler check after module load" in body
+    assert "ARIADNE compiler modules did not expose icx/icpx/ifx" in body
+    assert "module_debug" in body
 
 
 def test_install_script_dry_run_config_stage_preserves_gaussian_profiles(tmp_path):
