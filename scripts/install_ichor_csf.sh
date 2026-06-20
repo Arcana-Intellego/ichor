@@ -293,14 +293,6 @@ module_debug() {
     ichor_csf_module_debug "$@"
 }
 
-source_oneapi_setvars_if_available() {
-    if [[ "${DRY_RUN}" -eq 1 ]]; then
-        echo "+ source oneAPI setvars.sh if compiler wrappers are not on PATH"
-        return 0
-    fi
-    ichor_csf_source_oneapi_setvars >/dev/null || return 0
-}
-
 find_ariadne_compiler_path() {
     local exe="$1"
     local result
@@ -467,7 +459,6 @@ load_ariadne_modules() {
         module_cmd load mkl/2024.2
     fi
     if [[ "${DRY_RUN}" -eq 0 ]]; then
-        source_oneapi_setvars_if_available
         ensure_ariadne_compilers_on_path
     fi
 }

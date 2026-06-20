@@ -82,7 +82,8 @@ def test_install_script_is_present():
     assert "ichor_csf_module_is_shell_function()" in lib_text
     assert "ichor_csf_module_debug()" in lib_text
     assert "ichor_csf_find_ariadne_compiler_path()" in lib_text
-    assert "/opt/apps/compilers/intel/oneapi/2025.0.1/setvars.sh" in lib_text
+    assert "setvars.sh" not in lib_text
+    assert "source_oneapi_setvars_if_available" not in text
     assert "/opt/apps/compilers/intel/oneapi/2025.0.1/compiler/2025.0/bin" in lib_text
     assert '"/compiler/*/bin/"${exe}"' in lib_text
     assert "*/compiler/*/opt/compiler/lib" in lib_text
@@ -194,7 +195,6 @@ def test_install_script_verifies_ariadne_compilers_after_module_load():
     marker = "load_ariadne_modules()"
     start = text.index(marker)
     body = text[start:text.index("\n}\n\nresolve_ariadne_compilers", start)]
-    assert "source_oneapi_setvars_if_available" in body
     assert "ensure_ariadne_compilers_on_path" in body
 
     helper_start = text.index("ensure_ariadne_compilers_on_path()")
@@ -205,8 +205,8 @@ def test_install_script_verifies_ariadne_compilers_after_module_load():
     assert "ARIADNE compiler check after module load" in helper_body
     assert "ARIADNE compiler modules did not expose icx/icpx/ifx" in helper_body
     assert "module_debug" in helper_body
-    assert "PATH|known-root|known-bin|ld-library-path|setvars" not in lib_text
     assert "known-bin" in lib_text
+    assert "setvars" not in lib_text
 
 
 def test_install_script_dry_run_config_stage_preserves_gaussian_profiles(tmp_path):

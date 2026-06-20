@@ -150,36 +150,6 @@ ichor_csf_deactivate_existing_venv() {
     hash -r 2>/dev/null || true
 }
 
-ichor_csf_find_oneapi_setvars() {
-    local candidate
-    for candidate in \
-        "${ONEAPIDIR:-}/setvars.sh" \
-        "${ONEAPI_ROOT:-}/setvars.sh" \
-        /opt/apps/compilers/intel/oneapi/2025.0.1/setvars.sh \
-        /opt/apps/compilers/oneapi/2024.2.0/setvars.sh; do
-        if [[ -n "${candidate}" && "${candidate}" != "/setvars.sh" && -f "${candidate}" ]]; then
-            printf '%s\n' "${candidate}"
-            return 0
-        fi
-    done
-    return 1
-}
-
-ichor_csf_source_oneapi_setvars() {
-    local setvars
-    setvars="$(ichor_csf_find_oneapi_setvars || true)"
-    if [[ -z "${setvars}" ]]; then
-        return 1
-    fi
-    # shellcheck disable=SC1090
-    if source "${setvars}" >/dev/null 2>&1; then
-        hash -r 2>/dev/null || true
-        printf '%s\n' "${setvars}"
-        return 0
-    fi
-    return 1
-}
-
 ichor_csf_find_ariadne_compiler_path() {
     local exe="$1"
     local resolved
@@ -238,14 +208,6 @@ ichor_csf_find_ariadne_compiler_path() {
             return 0
         fi
     done
-
-    if ichor_csf_source_oneapi_setvars >/dev/null; then
-        resolved="$(command -v "${exe}" 2>/dev/null || true)"
-        if [[ -n "${resolved}" ]]; then
-            printf '%s|setvars\n' "${resolved}"
-            return 0
-        fi
-    fi
 
     return 1
 }
