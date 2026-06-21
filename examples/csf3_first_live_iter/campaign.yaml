@@ -54,6 +54,8 @@ ariadne:
   trqn_target_initial_grad_norm: 0.01
   trqn_retry_target_initial_grad_norm: 0.003
   trqn_retry_on_no_proposal: true
+  trqn_backtransform_mode: geodesic
+  trqn_geodesic_bt_mode: dense
 
 ferebus:
   scaling: false

@@ -60,6 +60,8 @@ class AriadneRunConfig:
     trqn_max_objective_scale: float = 1.0
     trqn_fixed_objective_scale: float = 1.0
     trqn_retry_on_no_proposal: bool = True
+    trqn_backtransform_mode: str = "geodesic"
+    trqn_geodesic_bt_mode: str = "dense"
     rng_seed: int = 0
     mock_perturbation_angstrom: float = 1.0e-4
 
@@ -92,6 +94,8 @@ class AriadneRunResult:
     landing_candidates: List[Dict[str, Any]] = field(default_factory=list)
     selection_diagnostics: Optional[Dict[str, Any]] = None
     optimiser_diagnostics: Optional[Dict[str, Any]] = None
+    trqn_backtransform_mode: Optional[str] = None
+    trqn_geodesic_bt_mode: Optional[str] = None
     optimiser_converged: Optional[bool] = None
     task_success: Optional[bool] = None
     task_success_reason: Optional[str] = None
@@ -157,6 +161,10 @@ class AriadneRunResult:
             data["selection_diagnostics"] = dict(self.selection_diagnostics)
         if self.optimiser_diagnostics is not None:
             data["optimiser_diagnostics"] = dict(self.optimiser_diagnostics)
+        if self.trqn_backtransform_mode is not None:
+            data["trqn_backtransform_mode"] = str(self.trqn_backtransform_mode)
+        if self.trqn_geodesic_bt_mode is not None:
+            data["trqn_geodesic_bt_mode"] = str(self.trqn_geodesic_bt_mode)
         if self.optimiser_converged is not None:
             data["optimiser_converged"] = bool(self.optimiser_converged)
         if self.task_success is not None:
@@ -1080,6 +1088,8 @@ def _mock_optimise_seed(
         landing_safety=landing_safety,
         landing_candidates=landing_candidates,
         selection_diagnostics=selection_diagnostics,
+        trqn_backtransform_mode=run_config.trqn_backtransform_mode,
+        trqn_geodesic_bt_mode=run_config.trqn_geodesic_bt_mode,
     )
 
 
@@ -1206,6 +1216,8 @@ def _live_optimise_seed(
         landing_candidates=landing["landing_candidates"],
         selection_diagnostics=selection_diagnostics,
         optimiser_diagnostics=dict(opt_result.diagnostics or {}),
+        trqn_backtransform_mode=run_config.trqn_backtransform_mode,
+        trqn_geodesic_bt_mode=run_config.trqn_geodesic_bt_mode,
         optimiser_converged=bool(opt_result.converged),
     )
 
@@ -1483,6 +1495,8 @@ def main(argv=None) -> int:
             final_atoms=seed_atoms,
             return_code=2,
             mock=False,
+            trqn_backtransform_mode=ariadne_run_config.trqn_backtransform_mode,
+            trqn_geodesic_bt_mode=ariadne_run_config.trqn_geodesic_bt_mode,
         )
 
     seed_dir.mkdir(parents=True, exist_ok=True)

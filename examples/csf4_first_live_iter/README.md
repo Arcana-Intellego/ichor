@@ -327,6 +327,8 @@ ariadne:
   hessian_model: ALMLOF
   max_iter: 50
   gradf_tol: 1.0e-4
+  trqn_backtransform_mode: geodesic
+  trqn_geodesic_bt_mode: dense
 
 ferebus:
   scaling: false

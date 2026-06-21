@@ -188,6 +188,12 @@ def format_sampling_protocol_summary(config: CampaignConfig) -> str:
             ariadne.trqn_retry_on_no_proposal,
         )
     )
+    lines.append(
+        _line("ariadne.trqn_backtransform_mode", ariadne.trqn_backtransform_mode)
+    )
+    lines.append(
+        _line("ariadne.trqn_geodesic_bt_mode", ariadne.trqn_geodesic_bt_mode)
+    )
     lines.append(_line("resources.partition", resources.partition))
     lines.append(_line("resources.walltime_hours", resources.walltime_hours))
     lines.append(_line("resources.effective_phase_walltimes", _walltime_summary(resources)))

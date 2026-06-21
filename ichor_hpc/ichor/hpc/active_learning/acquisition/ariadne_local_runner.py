@@ -46,8 +46,10 @@ _HESSIAN_MODEL_MAP = {
 # ARIADNE enum values mirrored from the starter pack. Passing these explicitly
 # avoids f90wrap optional-argument default drift in live cluster builds.
 _ARIADNE_ROT_PRIMITIVE_EXPMAP3 = 1
+_ARIADNE_CARTESIAN_RECOVERY_GEODESIC = 1
 _ARIADNE_CARTESIAN_RECOVERY_NEWTON = 2
 _ARIADNE_GEO_BT_DENSE = 1
+_ARIADNE_GEO_BT_MATRIX_FREE = 2
 _ARIADNE_TRQN_CONTROLLER_NONE = 0
 
 # TRQN get_status_py layout. Keep these names close to the Fortran/starter-pack
@@ -172,6 +174,50 @@ def _new_optimiser_diagnostics(optimiser_name: str) -> Dict[str, Any]:
         "status_samples_first": [],
         "status_samples_last": [],
     }
+
+
+def _trqn_backtransform_mode(run_config) -> str:
+    mode = str(
+        getattr(run_config, "trqn_backtransform_mode", "geodesic") or "geodesic"
+    ).strip().lower()
+    if mode == "geodesic":
+        return "geodesic"
+    if mode == "newton":
+        return "newton"
+    raise ValueError(
+        "unknown ariadne.trqn_backtransform_mode " + repr(mode)
+        + "; valid: geodesic | newton"
+    )
+
+
+def _trqn_geodesic_bt_mode(run_config) -> str:
+    mode = str(
+        getattr(run_config, "trqn_geodesic_bt_mode", "dense") or "dense"
+    ).strip().lower()
+    if mode == "dense":
+        return "dense"
+    if mode == "matrix_free":
+        return "matrix_free"
+    raise ValueError(
+        "unknown ariadne.trqn_geodesic_bt_mode " + repr(mode)
+        + "; valid: dense | matrix_free"
+    )
+
+
+def _ariadne_cartesian_recovery_mode_id(mode: str) -> int:
+    return (
+        _ARIADNE_CARTESIAN_RECOVERY_GEODESIC
+        if str(mode) == "geodesic"
+        else _ARIADNE_CARTESIAN_RECOVERY_NEWTON
+    )
+
+
+def _ariadne_geo_bt_mode_id(mode: str) -> int:
+    return (
+        _ARIADNE_GEO_BT_MATRIX_FREE
+        if str(mode) == "matrix_free"
+        else _ARIADNE_GEO_BT_DENSE
+    )
 
 
 def _status_int(status, index: int, default: Optional[int] = None) -> Optional[int]:
@@ -1089,6 +1135,8 @@ def _build_trqn(ariadne, q0_xyz, g0_xyz, atom_list, run_config):
     trust_min so we pin a small floor here (1.0e-4 Angstrom), matching
     the starter pack default.
     """
+    backtransform_mode = _trqn_backtransform_mode(run_config)
+    geodesic_bt_mode = _trqn_geodesic_bt_mode(run_config)
     opt = ariadne.Geometric_Trqn.trust_region_qn()
     opt.init(
         q0_xyz=q0_xyz,
@@ -1098,8 +1146,10 @@ def _build_trqn(ariadne, q0_xyz, g0_xyz, atom_list, run_config):
         trust_min=1.0e-4,
         trust_max=float(run_config.delta_max),
         controller_mode=_ARIADNE_TRQN_CONTROLLER_NONE,
-        cartesian_recovery_mode=_ARIADNE_CARTESIAN_RECOVERY_NEWTON,
-        geo_bt_mode=_ARIADNE_GEO_BT_DENSE,
+        cartesian_recovery_mode=_ariadne_cartesian_recovery_mode_id(
+            backtransform_mode
+        ),
+        geo_bt_mode=_ariadne_geo_bt_mode_id(geodesic_bt_mode),
         rot_primitive_mode=_ARIADNE_ROT_PRIMITIVE_EXPMAP3,
         skip_bfgs_after_rot_reset=False,
         hessian_model=_hessian_model_id(run_config.hessian_model),
@@ -1228,6 +1278,14 @@ def run_optimisation_against_calculator(
         "trqn_retry_on_no_proposal": bool(
             getattr(run_config, "trqn_retry_on_no_proposal", False)
         ),
+        "trqn_backtransform_mode": _trqn_backtransform_mode(run_config),
+        "trqn_geodesic_bt_mode": _trqn_geodesic_bt_mode(run_config),
+        "ariadne_cartesian_recovery_mode": _ariadne_cartesian_recovery_mode_id(
+            _trqn_backtransform_mode(run_config)
+        ),
+        "ariadne_geo_bt_mode": _ariadne_geo_bt_mode_id(
+            _trqn_geodesic_bt_mode(run_config)
+        ),
         "trqn_retry_attempted": False,
         "trqn_retry_objective_scale": None,
         "trqn_retry_target_initial_grad_norm": None,
@@ -1251,6 +1309,8 @@ def run_optimisation_against_calculator(
         scaled_grad_norm=float(np.linalg.norm(g0_flat)),
         scale_target=trqn_scale_info["target"],
         scale_mode=str(trqn_scale_info["mode"]),
+        trqn_backtransform_mode=_trqn_backtransform_mode(run_config),
+        trqn_geodesic_bt_mode=_trqn_geodesic_bt_mode(run_config),
         accepted=True,
         wall_seconds=float(time.perf_counter() - t0),
     )

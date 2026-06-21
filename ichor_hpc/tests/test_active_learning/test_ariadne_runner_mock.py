@@ -94,6 +94,8 @@ def test_mock_to_dict_is_json_serialisable():
     assert "alpha_trajectory" in d
     assert d["mock"] is True
     assert d["atom_types"] == ["O", "H", "H"]
+    assert d["trqn_backtransform_mode"] == "geodesic"
+    assert d["trqn_geodesic_bt_mode"] == "dense"
 
 
 def test_mock_to_dict_contains_landing_safety_payload():

@@ -111,6 +111,27 @@ def test_phase_walltime_changes_are_allowed_runtime_changes(tmp_path):
     assert not review.blocked_changes
 
 
+def test_ariadne_backtransform_changes_are_future_safe(tmp_path):
+    campaign = _campaign(tmp_path)
+    original = CampaignConfig()
+    write_config_lock(campaign, original)
+    changed = CampaignConfig()
+    changed.ariadne.trqn_backtransform_mode = "newton"
+    changed.ariadne.trqn_geodesic_bt_mode = "matrix_free"
+
+    proposed = fresh_campaign_state()
+    proposed.phase = CampaignPhase.ARIADNE_ARRAY
+    review = review_config_changes(campaign, changed, proposed)
+
+    assert review.allowed
+    assert sorted(c.path for c in review.allowed_changes) == [
+        "ariadne.trqn_backtransform_mode",
+        "ariadne.trqn_geodesic_bt_mode",
+    ]
+    assert {c.classification for c in review.allowed_changes} == {"future_safe"}
+    assert not review.blocked_changes
+
+
 def test_gaussian_method_change_is_blocked_by_config_lock(tmp_path):
     campaign = _campaign(tmp_path)
     original = CampaignConfig()

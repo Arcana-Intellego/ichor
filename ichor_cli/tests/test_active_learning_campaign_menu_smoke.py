@@ -305,6 +305,8 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
     assert "aimall.naat: auto" in out
     assert "aimall.boaq: auto" in out
     assert "aimall.iasmesh: fine" in out
+    assert "ariadne.trqn_backtransform_mode: geodesic" in out
+    assert "ariadne.trqn_geodesic_bt_mode: dense" in out
 
 
 def test_daemon_control_sampling_protocol_summary_uses_saved_campaign(tmp_path, monkeypatch, capsys):
@@ -334,6 +336,8 @@ def test_daemon_control_sampling_protocol_summary_uses_saved_campaign(tmp_path, 
     assert "error_calibration.mode: record_only" in out
     assert "acquisition.spectral.lambda_spectral: 2.5" in out
     assert "acquisition.stencils.weak_mode_gating_enabled: True" in out
+    assert "ariadne.trqn_backtransform_mode: geodesic" in out
+    assert "ariadne.trqn_geodesic_bt_mode: dense" in out
 
 
 def test_campaign_config_menu_covers_every_config_leaf():
@@ -394,6 +398,8 @@ def test_ariadne_submenu_shares_block_with_parent():
     assert "Set max_iter" in texts
     assert "Set delta0" in texts
     assert "Set delta_max" in texts
+    assert "Set trqn_backtransform_mode" in texts
+    assert "Set trqn_geodesic_bt_mode" in texts
     assert "Edit trust radii" not in texts
 
 

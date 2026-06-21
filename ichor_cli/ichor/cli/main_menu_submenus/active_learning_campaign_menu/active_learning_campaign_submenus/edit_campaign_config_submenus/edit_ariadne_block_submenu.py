@@ -101,6 +101,18 @@ ARIADNE_FIELD_SPECS = [
         "bool",
         prompt="Retry TRQN once after no-proposal failure: ",
     ),
+    spec(
+        "trqn_backtransform_mode",
+        "choice",
+        choices=["geodesic", "newton"],
+        prompt="TRQN backtransform mode: ",
+    ),
+    spec(
+        "trqn_geodesic_bt_mode",
+        "choice",
+        choices=["dense", "matrix_free"],
+        prompt="TRQN geodesic backtransform mode: ",
+    ),
 ]
 
 

@@ -155,6 +155,8 @@ def test_to_ariadne_run_config_propagates_values():
     c.ariadne.trqn_fixed_objective_scale = 0.25
     c.ariadne.trqn_target_initial_grad_norm = 0.02
     c.ariadne.trqn_retry_target_initial_grad_norm = 0.004
+    c.ariadne.trqn_backtransform_mode = "newton"
+    c.ariadne.trqn_geodesic_bt_mode = "matrix_free"
     rc = c.to_ariadne_run_config()
     assert rc.max_iter == 350
     assert rc.gradf_tol == pytest.approx(1.0e-5)
@@ -163,6 +165,8 @@ def test_to_ariadne_run_config_propagates_values():
     assert rc.trqn_fixed_objective_scale == pytest.approx(0.25)
     assert rc.trqn_target_initial_grad_norm == pytest.approx(0.02)
     assert rc.trqn_retry_target_initial_grad_norm == pytest.approx(0.004)
+    assert rc.trqn_backtransform_mode == "newton"
+    assert rc.trqn_geodesic_bt_mode == "matrix_free"
 
 
 def test_ariadne_trqn_scale_validation_rejects_invalid_values():
@@ -181,6 +185,16 @@ def test_ariadne_trqn_scale_validation_rejects_invalid_values():
     c.ariadne.trqn_min_objective_scale = 0.5
     c.ariadne.trqn_max_objective_scale = 0.1
     with pytest.raises(ConfigValidationError, match="min_objective_scale"):
+        c._validate()
+
+    c = CampaignConfig()
+    c.ariadne.trqn_backtransform_mode = "mystery"
+    with pytest.raises(ConfigValidationError, match="trqn_backtransform_mode"):
+        c._validate()
+
+    c = CampaignConfig()
+    c.ariadne.trqn_geodesic_bt_mode = "mystery"
+    with pytest.raises(ConfigValidationError, match="trqn_geodesic_bt_mode"):
         c._validate()
 
 

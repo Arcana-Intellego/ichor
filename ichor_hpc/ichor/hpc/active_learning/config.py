@@ -59,6 +59,8 @@ __all__ = [
     "VALID_GAUSSIAN_MEMORY_MODES",
     "VALID_ERROR_CALIBRATION_MODEL_VERSION_POLICIES",
     "VALID_TRQN_SCALE_MODES",
+    "VALID_TRQN_BACKTRANSFORM_MODES",
+    "VALID_TRQN_GEODESIC_BT_MODES",
     "VALID_NEGATIVE_CURVATURE_POLICIES",
     "VALID_AIMALL_BOAQ_VALUES",
     "VALID_AIMALL_IASMESH_VALUES",
@@ -91,6 +93,8 @@ VALID_CALIBRATED_ENERGY_UTILITIES = frozenset({"log", "banded"})
 VALID_FULLSPACE_RESIDUAL_SCALES = frozenset({"local_neighbour_median", "fixed"})
 VALID_GAUSSIAN_MEMORY_MODES = frozenset({"slurm_env", "link0"})
 VALID_TRQN_SCALE_MODES = frozenset({"off", "fixed", "adaptive_initial_gradient"})
+VALID_TRQN_BACKTRANSFORM_MODES = frozenset({"geodesic", "newton"})
+VALID_TRQN_GEODESIC_BT_MODES = frozenset({"dense", "matrix_free"})
 VALID_NEGATIVE_CURVATURE_POLICIES = frozenset({"ignore", "penalise"})
 VALID_AIMALL_BOAQ_VALUES = frozenset({
     "auto", "auto_gs2", "auto_gs4",
@@ -474,6 +478,8 @@ class AriadneConfigBlock:
     trqn_max_objective_scale: float = 1.0
     trqn_fixed_objective_scale: float = 1.0
     trqn_retry_on_no_proposal: bool = True
+    trqn_backtransform_mode: str = "geodesic"
+    trqn_geodesic_bt_mode: str = "dense"
 
 
 @dataclass
@@ -1186,6 +1192,16 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "ariadne.trqn_retry_on_no_proposal must be a boolean"
             )
+        if str(ariadne.trqn_backtransform_mode) not in VALID_TRQN_BACKTRANSFORM_MODES:
+            raise ConfigValidationError(
+                "ariadne.trqn_backtransform_mode must be one of "
+                + repr(sorted(VALID_TRQN_BACKTRANSFORM_MODES))
+            )
+        if str(ariadne.trqn_geodesic_bt_mode) not in VALID_TRQN_GEODESIC_BT_MODES:
+            raise ConfigValidationError(
+                "ariadne.trqn_geodesic_bt_mode must be one of "
+                + repr(sorted(VALID_TRQN_GEODESIC_BT_MODES))
+            )
         # Subspace-dim cross-validation. These catch configurations
         #that pass field-by-field validation but blow up later inside PCA.
         if self.acquisition.subspace.neighbour_count < 1:
@@ -1616,4 +1632,6 @@ class CampaignConfig:
             trqn_max_objective_scale=a.trqn_max_objective_scale,
             trqn_fixed_objective_scale=a.trqn_fixed_objective_scale,
             trqn_retry_on_no_proposal=a.trqn_retry_on_no_proposal,
+            trqn_backtransform_mode=a.trqn_backtransform_mode,
+            trqn_geodesic_bt_mode=a.trqn_geodesic_bt_mode,
         )

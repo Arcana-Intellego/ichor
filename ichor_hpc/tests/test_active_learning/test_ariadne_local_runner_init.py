@@ -5,8 +5,10 @@ import numpy as np
 import pytest
 
 from ichor.hpc.active_learning.acquisition.ariadne_local_runner import (
+    _ARIADNE_CARTESIAN_RECOVERY_GEODESIC,
     _ARIADNE_CARTESIAN_RECOVERY_NEWTON,
     _ARIADNE_GEO_BT_DENSE,
+    _ARIADNE_GEO_BT_MATRIX_FREE,
     _ARIADNE_ROT_PRIMITIVE_EXPMAP3,
     _ARIADNE_TRQN_CONTROLLER_NONE,
     _DS_INIT_PROFILE,
@@ -113,13 +115,33 @@ def test_trqn_init_forwards_ariadne_enum_defaults():
 
     kwargs = ariadne._trqn_factory.last.init_kwargs
     assert kwargs["controller_mode"] == _ARIADNE_TRQN_CONTROLLER_NONE
-    assert kwargs["cartesian_recovery_mode"] == _ARIADNE_CARTESIAN_RECOVERY_NEWTON
+    assert kwargs["cartesian_recovery_mode"] == _ARIADNE_CARTESIAN_RECOVERY_GEODESIC
     assert kwargs["geo_bt_mode"] == _ARIADNE_GEO_BT_DENSE
     assert kwargs["rot_primitive_mode"] == _ARIADNE_ROT_PRIMITIVE_EXPMAP3
     assert kwargs["skip_bfgs_after_rot_reset"] is False
     assert kwargs["hessian_model"] == 3
     assert kwargs["trust0"] == 0.2
     assert kwargs["trust_max"] == 0.5
+
+
+def test_trqn_init_allows_newton_and_matrix_free_geodesic_modes():
+    ariadne = _fake_ariadne()
+    q0, g0, atom_list = _inputs()
+
+    _build_trqn(
+        ariadne,
+        q0,
+        g0,
+        atom_list,
+        AriadneRunConfig(
+            trqn_backtransform_mode="newton",
+            trqn_geodesic_bt_mode="matrix_free",
+        ),
+    )
+
+    kwargs = ariadne._trqn_factory.last.init_kwargs
+    assert kwargs["cartesian_recovery_mode"] == _ARIADNE_CARTESIAN_RECOVERY_NEWTON
+    assert kwargs["geo_bt_mode"] == _ARIADNE_GEO_BT_MATRIX_FREE
 
 
 def test_ds_init_forwards_ariadne_geometry_enum_defaults():
