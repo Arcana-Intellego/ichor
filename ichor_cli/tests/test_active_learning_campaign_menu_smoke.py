@@ -295,6 +295,9 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
     assert "acquisition.spectral.mode: blend" in out
     assert "acquisition.calibrated_energy.utility: banded" in out
     assert "acquisition.fullspace_confinement.enabled: True" in out
+    assert "acquisition.stencils.weak_mode_gating_enabled: True" in out
+    assert "acquisition.stencils.weak_mode_omega_band" in out
+    assert "acquisition.stencils.anharmonic_caps" in out
     assert "resources.aimall_cpus_per_task: 8" in out
     assert "resources.effective_phase_walltimes" in out
     assert "FEREBUS=24h" in out
@@ -330,6 +333,7 @@ def test_daemon_control_sampling_protocol_summary_uses_saved_campaign(tmp_path, 
     assert "seed_selection.strategy: d_optimal" in out
     assert "error_calibration.mode: record_only" in out
     assert "acquisition.spectral.lambda_spectral: 2.5" in out
+    assert "acquisition.stencils.weak_mode_gating_enabled: True" in out
 
 
 def test_campaign_config_menu_covers_every_config_leaf():

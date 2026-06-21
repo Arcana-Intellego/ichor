@@ -131,6 +131,38 @@ def format_sampling_protocol_summary(config: CampaignConfig) -> str:
             stencils.lambda_negative_curvature,
         )
     )
+    lines.append(
+        _line(
+            "acquisition.stencils.weak_mode_gating_enabled",
+            stencils.weak_mode_gating_enabled,
+        )
+    )
+    lines.append(
+        _line(
+            "acquisition.stencils.weak_mode_omega_band",
+            "low_fraction="
+            + str(stencils.weak_mode_omega_low_fraction)
+            + ", high_fraction="
+            + str(stencils.weak_mode_omega_high_fraction)
+            + ", abs_floor="
+            + str(stencils.weak_mode_abs_omega_floor),
+        )
+    )
+    lines.append(
+        _line(
+            "acquisition.stencils.weak_mode_penalty",
+            stencils.weak_mode_penalty,
+        )
+    )
+    lines.append(
+        _line(
+            "acquisition.stencils.anharmonic_caps",
+            "per_mode="
+            + str(stencils.max_anharmonic_mode_score)
+            + ", total="
+            + str(stencils.max_anharmonic_total_score),
+        )
+    )
     lines.append(_line("ariadne.optimiser", ariadne.optimiser))
     lines.append(_line("ariadne.hessian_model", ariadne.hessian_model))
     lines.append(_line("ariadne.fallback_to_ds", ariadne.fallback_to_ds))

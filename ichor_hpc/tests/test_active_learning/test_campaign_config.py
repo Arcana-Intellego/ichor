@@ -76,6 +76,13 @@ def test_default_campaign_config_is_valid():
     assert c.acquisition.fullspace_confinement.failure_penalty == 1.0e6
     assert c.acquisition.stencils.negative_curvature_policy == "ignore"
     assert c.acquisition.stencils.lambda_negative_curvature == 1.0
+    assert c.acquisition.stencils.weak_mode_gating_enabled is True
+    assert c.acquisition.stencils.weak_mode_omega_low_fraction == 0.05
+    assert c.acquisition.stencils.weak_mode_omega_high_fraction == 0.15
+    assert c.acquisition.stencils.weak_mode_abs_omega_floor == 1.0e-4
+    assert c.acquisition.stencils.weak_mode_penalty == 2.0
+    assert c.acquisition.stencils.max_anharmonic_mode_score == 6.0
+    assert c.acquisition.stencils.max_anharmonic_total_score == 15.0
     assert c.acquisition.subspace.canonicalise_basis is True
 
 
@@ -310,6 +317,11 @@ def test_error_calibration_apply_mode_roundtrips():
         (("fullspace_confinement", "min_residual_scale_ang"), 0.0, "min_residual_scale_ang"),
         (("fullspace_confinement", "failure_penalty"), 0.0, "failure_penalty"),
         (("stencils", "negative_curvature_policy"), "reward", "negative_curvature_policy"),
+        (("stencils", "weak_mode_gating_enabled"), "yes", "weak_mode_gating_enabled"),
+        (("stencils", "weak_mode_omega_low_fraction"), -0.1, "weak_mode_omega_low_fraction"),
+        (("stencils", "weak_mode_abs_omega_floor"), 0.0, "weak_mode_abs_omega_floor"),
+        (("stencils", "max_anharmonic_mode_score"), 0.0, "max_anharmonic_mode_score"),
+        (("stencils", "max_anharmonic_total_score"), 0.0, "max_anharmonic_total_score"),
     ],
 )
 def test_mature_acquisition_config_rejects_bad_values(path, value, match):
@@ -317,6 +329,14 @@ def test_mature_acquisition_config_rejects_bad_values(path, value, match):
     block, field = path
     payload["acquisition"][block][field] = value
     with pytest.raises(ConfigValidationError, match=match):
+        CampaignConfig.from_dict(payload)
+
+
+def test_weak_mode_threshold_band_must_be_ordered():
+    payload = CampaignConfig().to_dict()
+    payload["acquisition"]["stencils"]["weak_mode_omega_low_fraction"] = 0.20
+    payload["acquisition"]["stencils"]["weak_mode_omega_high_fraction"] = 0.10
+    with pytest.raises(ConfigValidationError, match="weak_mode_omega_high_fraction"):
         CampaignConfig.from_dict(payload)
 
 
@@ -332,6 +352,13 @@ def test_mature_acquisition_config_bridge_roundtrips_to_core():
     payload["acquisition"]["fullspace_confinement"]["failure_penalty"] = 123.0
     payload["acquisition"]["stencils"]["negative_curvature_policy"] = "penalise"
     payload["acquisition"]["stencils"]["lambda_negative_curvature"] = 2.0
+    payload["acquisition"]["stencils"]["weak_mode_gating_enabled"] = False
+    payload["acquisition"]["stencils"]["weak_mode_omega_low_fraction"] = 0.02
+    payload["acquisition"]["stencils"]["weak_mode_omega_high_fraction"] = 0.12
+    payload["acquisition"]["stencils"]["weak_mode_abs_omega_floor"] = 0.0002
+    payload["acquisition"]["stencils"]["weak_mode_penalty"] = 3.0
+    payload["acquisition"]["stencils"]["max_anharmonic_mode_score"] = 4.0
+    payload["acquisition"]["stencils"]["max_anharmonic_total_score"] = 9.0
     cfg = CampaignConfig.from_dict(payload)
     core = cfg.to_acquisition_config()
     assert core.spectral.mode == "record_only"
@@ -344,6 +371,13 @@ def test_mature_acquisition_config_bridge_roundtrips_to_core():
     assert core.fullspace_confinement.failure_penalty == 123.0
     assert core.stencils.negative_curvature_policy == "penalise"
     assert core.stencils.lambda_negative_curvature == 2.0
+    assert core.stencils.weak_mode_gating_enabled is False
+    assert core.stencils.weak_mode_omega_low_fraction == 0.02
+    assert core.stencils.weak_mode_omega_high_fraction == 0.12
+    assert core.stencils.weak_mode_abs_omega_floor == 0.0002
+    assert core.stencils.weak_mode_penalty == 3.0
+    assert core.stencils.max_anharmonic_mode_score == 4.0
+    assert core.stencils.max_anharmonic_total_score == 9.0
 
 
 def test_gradient_parallel_backend_rejects_unknown_values():

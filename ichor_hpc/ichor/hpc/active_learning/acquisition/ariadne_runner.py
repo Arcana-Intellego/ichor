@@ -562,6 +562,15 @@ def _evaluate_landing_candidate(
         metrics["aligned_rmsd_penalty"] = float(breakdown.aligned_rmsd_penalty)
         if breakdown.aligned_rmsd_ang is not None:
             metrics["aligned_rmsd_ang"] = float(breakdown.aligned_rmsd_ang)
+        metrics["weak_mode_penalty_score"] = float(
+            getattr(breakdown, "weak_mode_penalty_score", 0.0)
+        )
+        metrics["anharmonic_risk_raw"] = float(
+            getattr(breakdown, "anharmonic_risk_raw", breakdown.anharmonic_risk)
+        )
+        metrics["anharmonic_risk_capped"] = float(
+            getattr(breakdown, "anharmonic_risk_capped", breakdown.anharmonic_risk)
+        )
         metrics["observable_score"] = (
             None if breakdown.observable_score is None
             else float(breakdown.observable_score)

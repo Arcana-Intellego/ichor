@@ -45,6 +45,13 @@ class ModeEvaluation:
     anharmonicity_std: float
     spectral_weight: float = 0.0
     frequency_observable_score: float = 0.0
+    weak_mode_reliability: float = 1.0
+    raw_anharmonic_score: float = 0.0
+    capped_anharmonic_score: float = 0.0
+    safe_anharmonic_score: float = 0.0
+    weak_mode_penalty: float = 0.0
+    omega_low_threshold: float = 0.0
+    omega_high_threshold: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -71,6 +78,9 @@ class AcquisitionBreakdown:
     aligned_rmsd_ang: Optional[float] = None
     aligned_rmsd_penalty: float = 0.0
     negative_curvature_penalty: float = 0.0
+    weak_mode_penalty_score: float = 0.0
+    anharmonic_risk_raw: float = 0.0
+    anharmonic_risk_capped: float = 0.0
     observable_score: Optional[float] = None
     outlier_penalty_score: Optional[float] = None
     fallback_reasons: Tuple[str, ...] = field(default_factory=tuple)
@@ -435,6 +445,44 @@ class SeedLocalAdversarialAcquisition:
             total += float(weight) * bounded
         return float(total)
 
+    def _weak_mode_thresholds(self) -> Tuple[float, float]:
+        cfg = self.config.stencils
+        omega_ref = self._reference_scale(
+            "omega",
+            self.reference_scales.get("omega", float(cfg.curvature_floor) ** 0.5),
+        )
+        low = max(
+            float(cfg.weak_mode_abs_omega_floor),
+            float(cfg.weak_mode_omega_low_fraction) * omega_ref,
+        )
+        high = max(
+            low + 1.0e-12,
+            float(cfg.weak_mode_omega_high_fraction) * omega_ref,
+        )
+        return float(low), float(high)
+
+    @staticmethod
+    def _smoothstep01(value: float) -> float:
+        x = float(np.clip(float(value), 0.0, 1.0))
+        return float(x * x * (3.0 - 2.0 * x))
+
+    def _weak_mode_reliability(self, omega: float) -> Tuple[float, float, float]:
+        if not bool(getattr(self.config.stencils, "weak_mode_gating_enabled", True)):
+            return 1.0, 0.0, 0.0
+        low, high = self._weak_mode_thresholds()
+        t = (float(omega) - low) / max(high - low, 1.0e-12)
+        return self._smoothstep01(t), low, high
+
+    @staticmethod
+    def _saturating_cap(value: float, cap: float) -> float:
+        value_f = max(0.0, float(value))
+        cap_f = float(cap)
+        if not np.isfinite(cap_f) or cap_f <= 0.0:
+            return value_f
+        if value_f > cap_f * 50.0:
+            return cap_f
+        return float(cap_f * (1.0 - np.exp(-value_f / cap_f)))
+
     def _mode_metrics(self, atoms, mean_energy=None):
         """Compute per-mode metrics. With autotune_from_cubic enabled, the
         first call refines the per-mode FD step from the cubic estimate
@@ -663,10 +711,54 @@ class SeedLocalAdversarialAcquisition:
         legacy_frequency_risk = 0.0
         spectral_frequency_risk = 0.0
         anh_risk = 0.0
+        anh_risk_raw = 0.0
+        anh_risk_capped = 0.0
+        weak_mode_penalty_score = 0.0
+        mode_diagnostics: Dict[int, Dict[str, float]] = {}
+        gating_enabled = bool(
+            getattr(self.config.stencils, "weak_mode_gating_enabled", True)
+        )
         for weight, mode in zip(legacy_weights, mode_evals):
             force_risk += float(weight) * self._phi(mode.force_std / self.reference_scales["force"])
             legacy_frequency_risk += float(weight) * self._phi(mode.omega_std / self.reference_scales["omega"])
-            anh_risk += float(weight) * self._phi(mode.anharmonicity / self.reference_scales["anh"]) * self._phi(mode.anharmonicity_std / self.reference_scales["anh_std"])
+            reliability, omega_low, omega_high = self._weak_mode_reliability(mode.omega)
+            raw_anh = (
+                self._phi(mode.anharmonicity / self.reference_scales["anh"])
+                * self._phi(mode.anharmonicity_std / self.reference_scales["anh_std"])
+            )
+            if gating_enabled:
+                capped_anh = self._saturating_cap(
+                    raw_anh,
+                    self.config.stencils.max_anharmonic_mode_score,
+                )
+                safe_anh = float(reliability) * capped_anh
+                weak_penalty = (
+                    (1.0 - float(reliability))
+                    * float(self.config.stencils.weak_mode_penalty)
+                )
+            else:
+                capped_anh = float(raw_anh)
+                safe_anh = float(raw_anh)
+                weak_penalty = 0.0
+            anh_risk_raw += float(weight) * float(raw_anh)
+            anh_risk_capped += float(weight) * float(safe_anh)
+            weak_mode_penalty_score += float(weight) * float(weak_penalty)
+            mode_diagnostics[int(mode.index)] = {
+                "weak_mode_reliability": float(reliability),
+                "raw_anharmonic_score": float(raw_anh),
+                "capped_anharmonic_score": float(capped_anh),
+                "safe_anharmonic_score": float(safe_anh),
+                "weak_mode_penalty": float(weak_penalty),
+                "omega_low_threshold": float(omega_low),
+                "omega_high_threshold": float(omega_high),
+            }
+        if gating_enabled:
+            anh_risk = self._saturating_cap(
+                anh_risk_capped,
+                self.config.stencils.max_anharmonic_total_score,
+            )
+        else:
+            anh_risk = float(anh_risk_raw)
         negative_curvature_penalty = self._negative_curvature_penalty(
             mode_evals,
             legacy_weights,
@@ -674,13 +766,38 @@ class SeedLocalAdversarialAcquisition:
         spectral_scale = self._reference_scale("spectral", self.reference_scales["omega"])
         for mode in mode_evals:
             spectral_weight = spectral_by_index.get(int(mode.index), 0.0)
-            observable = spectral_weight * self._phi(mode.omega_std / spectral_scale)
+            mode_diag = mode_diagnostics.get(int(mode.index), {})
+            reliability = float(mode_diag.get("weak_mode_reliability", 1.0))
+            observable = (
+                reliability
+                * spectral_weight
+                * self._phi(mode.omega_std / spectral_scale)
+            )
             spectral_frequency_risk += observable
             annotated_modes.append(
                 replace(
                     mode,
                     spectral_weight=float(spectral_weight),
                     frequency_observable_score=float(observable),
+                    weak_mode_reliability=float(reliability),
+                    raw_anharmonic_score=float(
+                        mode_diag.get("raw_anharmonic_score", 0.0)
+                    ),
+                    capped_anharmonic_score=float(
+                        mode_diag.get("capped_anharmonic_score", 0.0)
+                    ),
+                    safe_anharmonic_score=float(
+                        mode_diag.get("safe_anharmonic_score", 0.0)
+                    ),
+                    weak_mode_penalty=float(
+                        mode_diag.get("weak_mode_penalty", 0.0)
+                    ),
+                    omega_low_threshold=float(
+                        mode_diag.get("omega_low_threshold", 0.0)
+                    ),
+                    omega_high_threshold=float(
+                        mode_diag.get("omega_high_threshold", 0.0)
+                    ),
                 )
             )
         mode_evals = tuple(annotated_modes)
@@ -763,6 +880,7 @@ class SeedLocalAdversarialAcquisition:
             + float(self.config.fullspace_confinement.lambda_residual) * residual_penalty
             + float(self.config.fullspace_confinement.lambda_rmsd) * rmsd_penalty
             + float(self.config.stencils.lambda_negative_curvature) * negative_curvature_penalty
+            + float(weak_mode_penalty_score)
             + chemistry_penalty
         )
         total = informativeness_score - risk_penalty_score
@@ -799,6 +917,9 @@ class SeedLocalAdversarialAcquisition:
             ),
             aligned_rmsd_penalty=float(rmsd_penalty),
             negative_curvature_penalty=float(negative_curvature_penalty),
+            weak_mode_penalty_score=float(weak_mode_penalty_score),
+            anharmonic_risk_raw=float(anh_risk_raw),
+            anharmonic_risk_capped=float(anh_risk_capped),
             observable_score=float(informativeness_score),
             outlier_penalty_score=float(risk_penalty_score),
             fallback_reasons=tuple(str(r) for r in fallback_reasons),

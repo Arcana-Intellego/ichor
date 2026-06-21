@@ -79,6 +79,13 @@ class StencilConfig:
     autotune_from_cubic: bool = False
     negative_curvature_policy: str = "ignore"
     lambda_negative_curvature: float = 1.0
+    weak_mode_gating_enabled: bool = True
+    weak_mode_omega_low_fraction: float = 0.05
+    weak_mode_omega_high_fraction: float = 0.15
+    weak_mode_abs_omega_floor: float = 1.0e-4
+    weak_mode_penalty: float = 2.0
+    max_anharmonic_mode_score: float = 6.0
+    max_anharmonic_total_score: float = 15.0
 
 
 @dataclass(frozen=True)

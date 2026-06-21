@@ -1026,6 +1026,13 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("acquisition.stencils.autotune_from_cubic", "bool"),
             _spec("acquisition.stencils.negative_curvature_policy", "choice", choices=sorted(VALID_NEGATIVE_CURVATURE_POLICIES)),
             _spec("acquisition.stencils.lambda_negative_curvature", "float"),
+            _spec("acquisition.stencils.weak_mode_gating_enabled", "bool"),
+            _spec("acquisition.stencils.weak_mode_omega_low_fraction", "float"),
+            _spec("acquisition.stencils.weak_mode_omega_high_fraction", "float"),
+            _spec("acquisition.stencils.weak_mode_abs_omega_floor", "float"),
+            _spec("acquisition.stencils.weak_mode_penalty", "float"),
+            _spec("acquisition.stencils.max_anharmonic_mode_score", "float"),
+            _spec("acquisition.stencils.max_anharmonic_total_score", "float"),
         ],
     ),
     "Edit acquisition.references": _make_block_menu(

@@ -272,6 +272,13 @@ class AcquisitionStencilsBlock:
     autotune_from_cubic: bool = True
     negative_curvature_policy: str = "ignore"
     lambda_negative_curvature: float = 1.0
+    weak_mode_gating_enabled: bool = True
+    weak_mode_omega_low_fraction: float = 0.05
+    weak_mode_omega_high_fraction: float = 0.15
+    weak_mode_abs_omega_floor: float = 1.0e-4
+    weak_mode_penalty: float = 2.0
+    max_anharmonic_mode_score: float = 6.0
+    max_anharmonic_total_score: float = 15.0
 
 
 @dataclass
@@ -1371,6 +1378,58 @@ class CampaignConfig:
             "acquisition.stencils.lambda_negative_curvature",
             stencils.lambda_negative_curvature,
         )
+        if not isinstance(stencils.weak_mode_gating_enabled, bool):
+            raise ConfigValidationError(
+                "acquisition.stencils.weak_mode_gating_enabled must be a boolean"
+            )
+        for name, value in (
+            (
+                "acquisition.stencils.weak_mode_omega_low_fraction",
+                stencils.weak_mode_omega_low_fraction,
+            ),
+            (
+                "acquisition.stencils.weak_mode_omega_high_fraction",
+                stencils.weak_mode_omega_high_fraction,
+            ),
+            (
+                "acquisition.stencils.weak_mode_abs_omega_floor",
+                stencils.weak_mode_abs_omega_floor,
+            ),
+            ("acquisition.stencils.weak_mode_penalty", stencils.weak_mode_penalty),
+            (
+                "acquisition.stencils.max_anharmonic_mode_score",
+                stencils.max_anharmonic_mode_score,
+            ),
+            (
+                "acquisition.stencils.max_anharmonic_total_score",
+                stencils.max_anharmonic_total_score,
+            ),
+        ):
+            _validate_optional_nonnegative_float(name, value)
+        if (
+            float(stencils.weak_mode_omega_high_fraction)
+            <= float(stencils.weak_mode_omega_low_fraction)
+        ):
+            raise ConfigValidationError(
+                "acquisition.stencils.weak_mode_omega_high_fraction must be > "
+                "weak_mode_omega_low_fraction"
+            )
+        for name, value in (
+            (
+                "acquisition.stencils.weak_mode_abs_omega_floor",
+                stencils.weak_mode_abs_omega_floor,
+            ),
+            (
+                "acquisition.stencils.max_anharmonic_mode_score",
+                stencils.max_anharmonic_mode_score,
+            ),
+            (
+                "acquisition.stencils.max_anharmonic_total_score",
+                stencils.max_anharmonic_total_score,
+            ),
+        ):
+            if float(value) <= 0.0:
+                raise ConfigValidationError(name + " must be > 0")
         if self.gaussian.memory_mode == "link0" and str(self.resources.mem_per_cpu) != "auto":
             gaussian_mem_mib = _memory_mebibytes("gaussian.mem", self.gaussian.mem, gaussian=True)
             slurm_mem_mib = _memory_mebibytes(
@@ -1478,6 +1537,13 @@ class CampaignConfig:
                 autotune_from_cubic=st.autotune_from_cubic,
                 negative_curvature_policy=st.negative_curvature_policy,
                 lambda_negative_curvature=st.lambda_negative_curvature,
+                weak_mode_gating_enabled=st.weak_mode_gating_enabled,
+                weak_mode_omega_low_fraction=st.weak_mode_omega_low_fraction,
+                weak_mode_omega_high_fraction=st.weak_mode_omega_high_fraction,
+                weak_mode_abs_omega_floor=st.weak_mode_abs_omega_floor,
+                weak_mode_penalty=st.weak_mode_penalty,
+                max_anharmonic_mode_score=st.max_anharmonic_mode_score,
+                max_anharmonic_total_score=st.max_anharmonic_total_score,
             ),
             weights=WeightConfig(
                 lambda_force=we.lambda_force,
