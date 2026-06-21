@@ -113,6 +113,31 @@ ARIADNE_FIELD_SPECS = [
         choices=["dense", "matrix_free"],
         prompt="TRQN geodesic backtransform mode: ",
     ),
+    spec(
+        "trqn_geodesic_dt",
+        "float",
+        prompt="TRQN geodesic ODE step size: ",
+    ),
+    spec(
+        "trqn_geodesic_tol",
+        "float",
+        prompt="TRQN geodesic ODE tolerance: ",
+    ),
+    spec(
+        "trqn_bt_ic_tol",
+        "float",
+        prompt="TRQN backtransform IC tolerance: ",
+    ),
+    spec(
+        "trqn_max_backtransform_iter",
+        "int",
+        prompt="TRQN max backtransform iterations: ",
+    ),
+    spec(
+        "trqn_trust_min",
+        "float",
+        prompt="TRQN minimum trust radius: ",
+    ),
 ]
 
 

@@ -11,6 +11,7 @@ from ichor.hpc.active_learning.acquisition.ariadne_local_runner import (
     _ARIADNE_GEO_BT_MATRIX_FREE,
     _ARIADNE_ROT_PRIMITIVE_EXPMAP3,
     _ARIADNE_TRQN_CONTROLLER_NONE,
+    _TRQN_EXPLICIT_INIT_KEYS,
     _DS_INIT_PROFILE,
     _append_status_sample,
     _append_trace_event,
@@ -20,6 +21,7 @@ from ichor.hpc.active_learning.acquisition.ariadne_local_runner import (
     _ds_safe_init_kwargs,
     _finalise_optimiser_diagnostics,
     _new_optimiser_diagnostics,
+    _trqn_control_init_kwargs,
     _trqn_status_summary,
     _validate_ds_init_kwargs,
     run_optimisation_against_calculator,
@@ -118,10 +120,19 @@ def test_trqn_init_forwards_ariadne_enum_defaults():
     assert kwargs["cartesian_recovery_mode"] == _ARIADNE_CARTESIAN_RECOVERY_GEODESIC
     assert kwargs["geo_bt_mode"] == _ARIADNE_GEO_BT_DENSE
     assert kwargs["rot_primitive_mode"] == _ARIADNE_ROT_PRIMITIVE_EXPMAP3
-    assert kwargs["skip_bfgs_after_rot_reset"] is False
+    assert kwargs["skip_bfgs_after_rot_reset"] is True
     assert kwargs["hessian_model"] == 3
     assert kwargs["trust0"] == 0.2
     assert kwargs["trust_max"] == 0.5
+    assert kwargs["geo_sol_dt"] == 1.0e-2
+    assert kwargs["geo_sol_tol"] == 1.0e-8
+    assert kwargs["bt_ic_tol"] == 1.0e-6
+    assert kwargs["max_backtransform_iter"] == 50
+    assert kwargs["freeze_dlc_basis"] is True
+    assert kwargs["enable_force_rebuild"] is True
+    assert kwargs["enable_cartesian_fallback"] is True
+    assert kwargs["strategy_mode"] == 0
+    assert kwargs["handoff_enabled"] is False
 
 
 def test_trqn_init_allows_newton_and_matrix_free_geodesic_modes():
@@ -142,6 +153,19 @@ def test_trqn_init_allows_newton_and_matrix_free_geodesic_modes():
     kwargs = ariadne._trqn_factory.last.init_kwargs
     assert kwargs["cartesian_recovery_mode"] == _ARIADNE_CARTESIAN_RECOVERY_NEWTON
     assert kwargs["geo_bt_mode"] == _ARIADNE_GEO_BT_MATRIX_FREE
+
+
+def test_trqn_init_profile_covers_starter_pack_direct_trqn_contract():
+    profile = _trqn_control_init_kwargs(AriadneRunConfig())
+
+    assert set(profile) == set(_TRQN_EXPLICIT_INIT_KEYS)
+    assert profile["cartesian_recovery_mode"] == _ARIADNE_CARTESIAN_RECOVERY_GEODESIC
+    assert profile["geo_bt_mode"] == _ARIADNE_GEO_BT_DENSE
+    assert profile["hessian_model"] == 3
+    assert profile["skip_bfgs_after_rot_reset"] is True
+    assert profile["geo_sol_dt"] == 1.0e-2
+    assert profile["geo_sol_tol"] == 1.0e-8
+    assert profile["max_backtransform_iter"] == 50
 
 
 def test_ds_init_forwards_ariadne_geometry_enum_defaults():
@@ -166,7 +190,7 @@ def test_ds_init_forwards_ariadne_geometry_enum_defaults():
     assert kwargs["gradf_tol"] == 2.0e-4
     assert kwargs["hpos_estimator"] == "syev"
     assert kwargs["lanczos_k"] == 4
-    assert kwargs["hessian_model"] == "almlof"
+    assert kwargs["hessian_model"] == "schlegel"
     assert kwargs["ds_controller"] == "safe"
     assert kwargs["block_scale_seed_mode"] == "uniform"
     assert kwargs["block_coupling_mode"] == "row_gram"

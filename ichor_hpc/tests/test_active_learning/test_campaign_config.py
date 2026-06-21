@@ -574,6 +574,7 @@ def test_invalid_mode_weighting_policy_rejected():
 def test_ariadne_block_defaults():
     ab = AriadneConfigBlock()
     assert ab.optimiser == "trust_region_qn"
+    assert ab.hessian_model == "SCHLEGEL"
     assert ab.fallback_to_ds is True
     assert ab.trqn_scale_mode == "adaptive_initial_gradient"
     assert ab.trqn_target_initial_grad_norm == pytest.approx(0.01)
@@ -584,6 +585,11 @@ def test_ariadne_block_defaults():
     assert ab.trqn_retry_on_no_proposal is True
     assert ab.trqn_backtransform_mode == "geodesic"
     assert ab.trqn_geodesic_bt_mode == "dense"
+    assert ab.trqn_geodesic_dt == pytest.approx(1.0e-2)
+    assert ab.trqn_geodesic_tol == pytest.approx(1.0e-8)
+    assert ab.trqn_bt_ic_tol == pytest.approx(1.0e-6)
+    assert ab.trqn_max_backtransform_iter == 50
+    assert ab.trqn_trust_min == pytest.approx(1.0e-4)
 
 
 def test_ferebus_fraction_sum_must_be_one():

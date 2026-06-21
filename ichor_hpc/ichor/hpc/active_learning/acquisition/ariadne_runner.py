@@ -45,7 +45,7 @@ class AriadneRunConfig:
     """ARIADNE-side configuration for a single-seed run."""
 
     optimiser: str = "trust_region_qn"
-    hessian_model: str = "ALMLOF"
+    hessian_model: str = "SCHLEGEL"
     max_iter: int = 200
     gradf_tol: float = 1.0e-4
     f_tol: float = 1.0e-6
@@ -62,6 +62,11 @@ class AriadneRunConfig:
     trqn_retry_on_no_proposal: bool = True
     trqn_backtransform_mode: str = "geodesic"
     trqn_geodesic_bt_mode: str = "dense"
+    trqn_geodesic_dt: float = 1.0e-2
+    trqn_geodesic_tol: float = 1.0e-8
+    trqn_bt_ic_tol: float = 1.0e-6
+    trqn_max_backtransform_iter: int = 50
+    trqn_trust_min: float = 1.0e-4
     rng_seed: int = 0
     mock_perturbation_angstrom: float = 1.0e-4
 

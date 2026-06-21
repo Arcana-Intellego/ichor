@@ -118,6 +118,11 @@ def test_ariadne_backtransform_changes_are_future_safe(tmp_path):
     changed = CampaignConfig()
     changed.ariadne.trqn_backtransform_mode = "newton"
     changed.ariadne.trqn_geodesic_bt_mode = "matrix_free"
+    changed.ariadne.trqn_geodesic_dt = 0.02
+    changed.ariadne.trqn_geodesic_tol = 2.0e-8
+    changed.ariadne.trqn_bt_ic_tol = 2.0e-6
+    changed.ariadne.trqn_max_backtransform_iter = 75
+    changed.ariadne.trqn_trust_min = 2.0e-4
 
     proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.ARIADNE_ARRAY
@@ -126,7 +131,12 @@ def test_ariadne_backtransform_changes_are_future_safe(tmp_path):
     assert review.allowed
     assert sorted(c.path for c in review.allowed_changes) == [
         "ariadne.trqn_backtransform_mode",
+        "ariadne.trqn_bt_ic_tol",
         "ariadne.trqn_geodesic_bt_mode",
+        "ariadne.trqn_geodesic_dt",
+        "ariadne.trqn_geodesic_tol",
+        "ariadne.trqn_max_backtransform_iter",
+        "ariadne.trqn_trust_min",
     ]
     assert {c.classification for c in review.allowed_changes} == {"future_safe"}
     assert not review.blocked_changes

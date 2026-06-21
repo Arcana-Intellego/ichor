@@ -463,7 +463,7 @@ class FerebusConfigBlock:
 @dataclass
 class AriadneConfigBlock:
     optimiser: str = "trust_region_qn"
-    hessian_model: str = "ALMLOF"
+    hessian_model: str = "SCHLEGEL"
     max_iter: int = 200
     gradf_tol: float = 1.0e-4
     f_tol: float = 1.0e-6
@@ -480,6 +480,11 @@ class AriadneConfigBlock:
     trqn_retry_on_no_proposal: bool = True
     trqn_backtransform_mode: str = "geodesic"
     trqn_geodesic_bt_mode: str = "dense"
+    trqn_geodesic_dt: float = 1.0e-2
+    trqn_geodesic_tol: float = 1.0e-8
+    trqn_bt_ic_tol: float = 1.0e-6
+    trqn_max_backtransform_iter: int = 50
+    trqn_trust_min: float = 1.0e-4
 
 
 @dataclass
@@ -1155,11 +1160,19 @@ class CampaignConfig:
             ("ariadne.trqn_min_objective_scale", ariadne.trqn_min_objective_scale),
             ("ariadne.trqn_max_objective_scale", ariadne.trqn_max_objective_scale),
             ("ariadne.trqn_fixed_objective_scale", ariadne.trqn_fixed_objective_scale),
+            ("ariadne.trqn_geodesic_dt", ariadne.trqn_geodesic_dt),
+            ("ariadne.trqn_geodesic_tol", ariadne.trqn_geodesic_tol),
+            ("ariadne.trqn_bt_ic_tol", ariadne.trqn_bt_ic_tol),
+            ("ariadne.trqn_trust_min", ariadne.trqn_trust_min),
         ):
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ConfigValidationError(name + " must be a number")
             if not float(value) > 0.0:
                 raise ConfigValidationError(name + " must be > 0")
+        _validate_positive_int(
+            "ariadne.trqn_max_backtransform_iter",
+            ariadne.trqn_max_backtransform_iter,
+        )
         if (
             float(ariadne.trqn_retry_target_initial_grad_norm)
             > float(ariadne.trqn_target_initial_grad_norm)
@@ -1634,4 +1647,9 @@ class CampaignConfig:
             trqn_retry_on_no_proposal=a.trqn_retry_on_no_proposal,
             trqn_backtransform_mode=a.trqn_backtransform_mode,
             trqn_geodesic_bt_mode=a.trqn_geodesic_bt_mode,
+            trqn_geodesic_dt=a.trqn_geodesic_dt,
+            trqn_geodesic_tol=a.trqn_geodesic_tol,
+            trqn_bt_ic_tol=a.trqn_bt_ic_tol,
+            trqn_max_backtransform_iter=a.trqn_max_backtransform_iter,
+            trqn_trust_min=a.trqn_trust_min,
         )

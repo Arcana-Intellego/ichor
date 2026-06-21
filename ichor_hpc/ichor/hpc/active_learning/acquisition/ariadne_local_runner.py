@@ -51,6 +51,59 @@ _ARIADNE_CARTESIAN_RECOVERY_NEWTON = 2
 _ARIADNE_GEO_BT_DENSE = 1
 _ARIADNE_GEO_BT_MATRIX_FREE = 2
 _ARIADNE_TRQN_CONTROLLER_NONE = 0
+_ARIADNE_TRQN_STRATEGY_BFGS = 0
+_ARIADNE_TRQN_HANDOFF_NONE = 0
+_ARIADNE_ROT_V_RESET_THRESH = float(0.9 * np.pi)
+_TRQN_EXPLICIT_INIT_KEYS = frozenset({
+    "trust0",
+    "trust_min",
+    "trust_max",
+    "controller_mode",
+    "q_good",
+    "q_okay",
+    "q_reject",
+    "rho_de_eps",
+    "hebden_tol_rel",
+    "brent_tol_frac",
+    "bt_ic_tol",
+    "geo_sol_dt",
+    "geo_sol_tol",
+    "max_backtransform_iter",
+    "max_hebdon_iter",
+    "cartesian_recovery_mode",
+    "geo_bt_mode",
+    "rot_primitive_mode",
+    "skip_bfgs_after_rot_reset",
+    "freeze_dlc_basis",
+    "rot_ref_reset_enabled",
+    "rot_v_reset_thresh",
+    "rot_gap_reset_rel",
+    "rot_gap_reset_abs",
+    "hessian_model",
+    "usedmax",
+    "epsilon_shift",
+    "reset_on_bad_hessian",
+    "subfrctor",
+    "history_trust_scale",
+    "max_hessian_updates",
+    "enable_force_rebuild",
+    "enable_cartesian_fallback",
+    "strategy_mode",
+    "gediis_history_capacity",
+    "gediis_min_history",
+    "gediis_rcond",
+    "gediis_energy_check",
+    "gediis_gradnorm_check",
+    "handoff_enabled",
+    "handoff_gmax_threshold",
+    "handoff_accept_streak_req",
+    "handoff_source_code",
+    "per_block_damping_enabled",
+    "flat_eig_rel_threshold",
+    "flat_eig_damping_ratio",
+    "s_model_enabled",
+    "s_model_delta",
+})
 
 # TRQN get_status_py layout. Keep these names close to the Fortran/starter-pack
 # contract so result.json diagnostics can be decoded without reading raw tuples.
@@ -424,7 +477,7 @@ def _symbols_to_atom_list(symbols):
 
 def _hessian_model_id(name) -> int:
     """Resolve a hessian-model name to the integer ARIADNE wants."""
-    key = (str(name) if name is not None else "almlof").strip().lower()
+    key = (str(name) if name is not None else "schlegel").strip().lower()
     if key not in _HESSIAN_MODEL_MAP:
         raise ValueError(
             "unknown ariadne.hessian_model " + repr(name)
@@ -695,7 +748,7 @@ _DS_INIT_PROFILE = "daemon_safe_v1"
 
 
 def _ds_hessian_model_name(value: Any) -> str:
-    name = str(value or "almlof").strip().lower()
+    name = str(value or "schlegel").strip().lower()
     if name not in _HESSIAN_MODEL_MAP:
         raise ValueError(f"unsupported DS hessian_model: {value!r}")
     return name
@@ -706,6 +759,150 @@ def _positive_float(value: Any, *, name: str) -> float:
     if not np.isfinite(result) or result <= 0.0:
         raise ValueError(f"{name} must be finite and > 0")
     return result
+
+
+def _positive_int(value: Any, *, name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer > 0")
+    result = int(value)
+    if result <= 0:
+        raise ValueError(f"{name} must be an integer > 0")
+    return result
+
+
+def _trqn_control_init_kwargs(run_config) -> Dict[str, Any]:
+    """Return ICHOR's explicit TRQN initialisation profile.
+
+    The key list mirrors ARIADNE's starter-pack direct-TRQN opt.init()
+    contract. Keeping this profile explicit avoids f90wrap optional-default
+    drift on CSF3/CSF4, while campaign.yaml still exposes only the few knobs
+    operators realistically tune.
+    """
+    backtransform_mode = _trqn_backtransform_mode(run_config)
+    geodesic_bt_mode = _trqn_geodesic_bt_mode(run_config)
+    delta0 = _positive_float(run_config.delta0, name="delta0")
+    delta_max = _positive_float(run_config.delta_max, name="delta_max")
+    trust_min = _positive_float(
+        getattr(run_config, "trqn_trust_min", 1.0e-4),
+        name="trqn_trust_min",
+    )
+    max_backtransform_iter = _positive_int(
+        getattr(run_config, "trqn_max_backtransform_iter", 50),
+        name="trqn_max_backtransform_iter",
+    )
+    kwargs: Dict[str, Any] = {
+        "trust0": delta0,
+        "trust_min": trust_min,
+        "trust_max": max(delta_max, delta0, trust_min),
+        "controller_mode": _ARIADNE_TRQN_CONTROLLER_NONE,
+        "q_good": 0.75,
+        "q_okay": 0.25,
+        "q_reject": -1.0,
+        "rho_de_eps": 1.0e-12,
+        "hebden_tol_rel": 1.0e-3,
+        "brent_tol_frac": 1.0e-1,
+        "bt_ic_tol": _positive_float(
+            getattr(run_config, "trqn_bt_ic_tol", 1.0e-6),
+            name="trqn_bt_ic_tol",
+        ),
+        "geo_sol_dt": _positive_float(
+            getattr(run_config, "trqn_geodesic_dt", 1.0e-2),
+            name="trqn_geodesic_dt",
+        ),
+        "geo_sol_tol": _positive_float(
+            getattr(run_config, "trqn_geodesic_tol", 1.0e-8),
+            name="trqn_geodesic_tol",
+        ),
+        "max_backtransform_iter": max_backtransform_iter,
+        "max_hebdon_iter": 50,
+        "cartesian_recovery_mode": _ariadne_cartesian_recovery_mode_id(
+            backtransform_mode
+        ),
+        "geo_bt_mode": _ariadne_geo_bt_mode_id(geodesic_bt_mode),
+        "rot_primitive_mode": _ARIADNE_ROT_PRIMITIVE_EXPMAP3,
+        "skip_bfgs_after_rot_reset": True,
+        "freeze_dlc_basis": True,
+        "rot_ref_reset_enabled": True,
+        "rot_v_reset_thresh": _ARIADNE_ROT_V_RESET_THRESH,
+        "rot_gap_reset_rel": 1.0e-6,
+        "rot_gap_reset_abs": 1.0e-10,
+        "hessian_model": _hessian_model_id(run_config.hessian_model),
+        "usedmax": False,
+        "epsilon_shift": 1.0e-5,
+        "reset_on_bad_hessian": True,
+        "subfrctor": 1,
+        "history_trust_scale": 1.1,
+        "max_hessian_updates": 100,
+        "enable_force_rebuild": True,
+        "enable_cartesian_fallback": True,
+        "strategy_mode": _ARIADNE_TRQN_STRATEGY_BFGS,
+        "gediis_history_capacity": 10,
+        "gediis_min_history": 2,
+        "gediis_rcond": 1.0e-10,
+        "gediis_energy_check": True,
+        "gediis_gradnorm_check": True,
+        "handoff_enabled": False,
+        "handoff_gmax_threshold": 1.0e-3,
+        "handoff_accept_streak_req": 2,
+        "handoff_source_code": _ARIADNE_TRQN_HANDOFF_NONE,
+        "per_block_damping_enabled": False,
+        "flat_eig_rel_threshold": 1.0e-2,
+        "flat_eig_damping_ratio": 0.1,
+        "s_model_enabled": False,
+        "s_model_delta": 1.0e-3,
+    }
+    _validate_trqn_init_kwargs(kwargs)
+    return kwargs
+
+
+def _validate_trqn_init_kwargs(kwargs: Dict[str, Any]) -> None:
+    missing = sorted(_TRQN_EXPLICIT_INIT_KEYS - set(kwargs))
+    extra = sorted(set(kwargs) - _TRQN_EXPLICIT_INIT_KEYS)
+    if missing or extra:
+        raise ValueError(
+            "TRQN init profile key mismatch; missing="
+            + repr(missing) + " extra=" + repr(extra)
+        )
+
+    for key in (
+        "trust0",
+        "trust_min",
+        "trust_max",
+        "rho_de_eps",
+        "hebden_tol_rel",
+        "brent_tol_frac",
+        "bt_ic_tol",
+        "geo_sol_dt",
+        "geo_sol_tol",
+        "epsilon_shift",
+        "history_trust_scale",
+        "gediis_rcond",
+        "handoff_gmax_threshold",
+        "flat_eig_rel_threshold",
+        "flat_eig_damping_ratio",
+        "s_model_delta",
+    ):
+        _positive_float(kwargs[key], name=key)
+    for key in (
+        "max_backtransform_iter",
+        "max_hebdon_iter",
+        "subfrctor",
+        "max_hessian_updates",
+        "gediis_history_capacity",
+        "gediis_min_history",
+        "handoff_accept_streak_req",
+    ):
+        _positive_int(kwargs[key], name=key)
+    if not float(kwargs["trust_max"]) >= float(kwargs["trust_min"]):
+        raise ValueError("trust_max must be >= trust_min")
+    if not float(kwargs["trust_max"]) >= float(kwargs["trust0"]):
+        raise ValueError("trust_max must be >= trust0")
+
+
+def _trqn_init_kwargs(q0_xyz, g0_xyz, atom_list, run_config) -> Dict[str, Any]:
+    kwargs = _trqn_control_init_kwargs(run_config)
+    kwargs.update(q0_xyz=q0_xyz, g0_xyz=g0_xyz, atom_list=atom_list)
+    return kwargs
 
 
 def _ds_safe_init_kwargs(run_config) -> Dict[str, Any]:
@@ -1130,30 +1327,12 @@ def _push_positions(atoms, q_xyz):
 def _build_trqn(ariadne, q0_xyz, g0_xyz, atom_list, run_config):
     """Build and init a trust-region quasi-Newton optimiser.
 
-    Minimal-required kwargs only -- everything else falls back to
-    ariadne internal defaults. AriadneRunConfig does not expose
-    trust_min so we pin a small floor here (1.0e-4 Angstrom), matching
-    the starter pack default.
+    Pass a full starter-pack-style init profile explicitly. Several f90wrap
+    builds have treated omitted optional scalar arguments as present zero
+    values; the geodesic ODE controls are especially sensitive to that.
     """
-    backtransform_mode = _trqn_backtransform_mode(run_config)
-    geodesic_bt_mode = _trqn_geodesic_bt_mode(run_config)
     opt = ariadne.Geometric_Trqn.trust_region_qn()
-    opt.init(
-        q0_xyz=q0_xyz,
-        g0_xyz=g0_xyz,
-        atom_list=atom_list,
-        trust0=float(run_config.delta0),
-        trust_min=1.0e-4,
-        trust_max=float(run_config.delta_max),
-        controller_mode=_ARIADNE_TRQN_CONTROLLER_NONE,
-        cartesian_recovery_mode=_ariadne_cartesian_recovery_mode_id(
-            backtransform_mode
-        ),
-        geo_bt_mode=_ariadne_geo_bt_mode_id(geodesic_bt_mode),
-        rot_primitive_mode=_ARIADNE_ROT_PRIMITIVE_EXPMAP3,
-        skip_bfgs_after_rot_reset=False,
-        hessian_model=_hessian_model_id(run_config.hessian_model),
-    )
+    opt.init(**_trqn_init_kwargs(q0_xyz, g0_xyz, atom_list, run_config))
     return opt
 
 
@@ -1286,6 +1465,10 @@ def run_optimisation_against_calculator(
         "ariadne_geo_bt_mode": _ariadne_geo_bt_mode_id(
             _trqn_geodesic_bt_mode(run_config)
         ),
+        "trqn_init_profile": {
+            str(k): _json_safe_value(v)
+            for k, v in sorted(_trqn_control_init_kwargs(run_config).items())
+        },
         "trqn_retry_attempted": False,
         "trqn_retry_objective_scale": None,
         "trqn_retry_target_initial_grad_norm": None,

@@ -324,11 +324,16 @@ gaussian:
 
 ariadne:
   optimiser: trust_region_qn
-  hessian_model: ALMLOF
+  hessian_model: SCHLEGEL
   max_iter: 50
   gradf_tol: 1.0e-4
   trqn_backtransform_mode: geodesic
   trqn_geodesic_bt_mode: dense
+  trqn_geodesic_dt: 1.0e-2
+  trqn_geodesic_tol: 1.0e-8
+  trqn_bt_ic_tol: 1.0e-6
+  trqn_max_backtransform_iter: 50
+  trqn_trust_min: 1.0e-4
 
 ferebus:
   scaling: false

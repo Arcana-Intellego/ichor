@@ -194,6 +194,21 @@ def format_sampling_protocol_summary(config: CampaignConfig) -> str:
     lines.append(
         _line("ariadne.trqn_geodesic_bt_mode", ariadne.trqn_geodesic_bt_mode)
     )
+    lines.append(
+        _line(
+            "ariadne.trqn_backtransform_numerics",
+            "dt="
+            + str(ariadne.trqn_geodesic_dt)
+            + ", tol="
+            + str(ariadne.trqn_geodesic_tol)
+            + ", ic_tol="
+            + str(ariadne.trqn_bt_ic_tol)
+            + ", max_iter="
+            + str(ariadne.trqn_max_backtransform_iter)
+            + ", trust_min="
+            + str(ariadne.trqn_trust_min),
+        )
+    )
     lines.append(_line("resources.partition", resources.partition))
     lines.append(_line("resources.walltime_hours", resources.walltime_hours))
     lines.append(_line("resources.effective_phase_walltimes", _walltime_summary(resources)))
