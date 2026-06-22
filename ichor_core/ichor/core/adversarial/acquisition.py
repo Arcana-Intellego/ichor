@@ -473,17 +473,25 @@ class SeedLocalAdversarialAcquisition:
             local = float(cfg.target_peak_floor_ang) / max(float(cfg.target_peak_fraction), 1.0e-12)
 
         eps = 1.0e-9
+        default_band = (
+            float(cfg.hard_min_floor_ang),
+            float(cfg.target_low_floor_ang),
+            float(cfg.target_peak_floor_ang),
+            min(float(cfg.target_high_cap_ang), max(float(cfg.target_peak_floor_ang) + 0.020, 0.120)),
+            float(cfg.hard_max_cap_ang),
+        )
         hard_min = max(float(cfg.hard_min_floor_ang), float(cfg.hard_min_fraction) * local)
         low = max(float(cfg.target_low_floor_ang), float(cfg.target_low_fraction) * local, hard_min + eps)
         peak = max(float(cfg.target_peak_floor_ang), float(cfg.target_peak_fraction) * local, low + eps)
         high = max(float(cfg.target_high_fraction) * local, peak + eps)
-        high = min(high, float(cfg.target_high_cap_ang))
-        if high <= peak:
-            high = peak + max(float(cfg.high_softness_ang) if hasattr(cfg, "high_softness_ang") else 0.020, 0.010)
         hard_max = max(float(cfg.hard_max_fraction) * local, high + eps)
         hard_max = min(hard_max, float(cfg.hard_max_cap_ang))
-        if hard_max <= high:
-            hard_max = min(float(cfg.hard_max_cap_ang), high + 0.010)
+        high = min(high, hard_max - eps, float(cfg.target_high_cap_ang))
+        peak = min(peak, high - eps)
+        low = min(low, peak - eps)
+        hard_min = min(hard_min, low - eps)
+        if not (hard_min < low < peak < high < hard_max):
+            hard_min, low, peak, high, hard_max = default_band
 
         band = {
             "local_rmsd_ang": float(local),
@@ -548,6 +556,19 @@ class SeedLocalAdversarialAcquisition:
         if str(getattr(self.config.movement_utility, "direction", source)) == source:
             try:
                 raw = np.asarray(self._base_cartesian_gradient(self.seed_atoms), dtype=float).reshape(-1)
+                if self.mode_directions:
+                    basis = np.column_stack([
+                        np.asarray(v, dtype=float).reshape(-1)
+                        for v in self.mode_directions
+                    ])
+                    if basis.shape[0] == raw.size and basis.shape[1] > 0:
+                        reg = max(
+                            float(self.config.subspace.covariance_regularization),
+                            1.0e-12,
+                        )
+                        gram = basis.T @ basis + reg * np.eye(basis.shape[1])
+                        coeff = np.linalg.solve(gram, basis.T @ raw)
+                        raw = basis @ coeff
                 norm = float(np.linalg.norm(raw))
                 if np.isfinite(norm) and norm > 0.0:
                     direction = raw / norm

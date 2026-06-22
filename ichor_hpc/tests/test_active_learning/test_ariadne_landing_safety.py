@@ -5,7 +5,10 @@ import numpy as np
 from ichor.core.adversarial.subspace import LocalSubspace
 from ichor.core.atoms import Atom, Atoms
 from ichor.hpc.active_learning.acquisition.ariadne_runner import (
+    AriadneRunConfig,
     _copy_atoms_with_coords,
+    _landing_needs_under_move_retry,
+    _select_safe_gradient_band_warm_start,
     _select_safe_landing,
 )
 
@@ -56,12 +59,31 @@ class _FakeAcquisition:
             fullspace_residual_penalty=0.0,
             aligned_rmsd_ang=abs(x),
             aligned_rmsd_penalty=0.0,
+            movement_metric="aligned_active_rmsd",
+            movement_rmsd_ang=abs(x),
+            movement_progress_ang=x,
+            movement_band_min_ang=0.1,
+            movement_band_low_ang=0.2,
+            movement_band_peak_ang=0.5,
+            movement_band_high_ang=2.0,
+            movement_band_max_ang=10.0,
+            movement_utility_score=0.0,
+            movement_band_score=1.0,
+            movement_progress_score=1.0,
+            movement_direction_source="test",
+            n_effective_movement_atoms=1.0,
             observable_score=x,
             outlier_penalty_score=0.0,
             fallback_reasons=[],
             mode_evaluations=[],
             chemistry_penalty=0.0,
             distance_penalty=x * x,
+        )
+
+    def gradient_band_probe_atoms(self):
+        return (
+            ("gradient_band_probe_min", _one_atom(0.05)),
+            ("gradient_band_probe_peak", _one_atom(0.5)),
         )
 
 
@@ -79,25 +101,28 @@ def _safety(**overrides):
         "max_predicted_energy_delta_ha": None,
         "max_energy_variance": None,
         "max_chemistry_penalty": None,
+        "enforce_movement_band": True,
+        "reject_over_moved": True,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
 
 
-def _select(raw_x, candidate_xs, safety):
+def _select(raw_x, candidate_xs, safety, origins=None, initial_x=0.0):
     seed = _one_atom(0.0)
     acquisition = _FakeAcquisition(seed)
     raw = _copy_atoms_with_coords(seed, np.array([[raw_x, 0.0, 0.0]]))
-    positions = [np.array([[0.0, 0.0, 0.0]])]
+    positions = [np.array([[initial_x, 0.0, 0.0]])]
     positions.extend(np.array([[x, 0.0, 0.0]]) for x in candidate_xs)
     return _select_safe_landing(
         acquisition=acquisition,
         seed_atoms=seed,
         raw_final_atoms=raw,
         opt_candidate_positions=positions,
-        opt_candidate_alphas=[0.0] + [float(x) for x in candidate_xs],
+        opt_candidate_alphas=[float(initial_x)] + [float(x) for x in candidate_xs],
         opt_candidate_grad_norms=[0.0 for _ in positions],
-        alpha_trajectory=[0.0, float(raw_x)],
+        opt_candidate_origins=origins,
+        alpha_trajectory=[float(initial_x), float(raw_x)],
         safety_config=safety,
         quality_gates=SimpleNamespace(
             ariadne_max_displacement_ang=None,
@@ -216,3 +241,56 @@ def test_lower_alpha_raw_final_can_only_fall_back_to_seed_explicitly():
         "ariadne_landing_acquisition_not_improved"
         in safety["raw_final"]["reasons"]
     )
+
+
+def test_gradient_band_warm_start_origin_is_not_seed_fallback():
+    out = _select(
+        raw_x=0.0,
+        candidate_xs=[],
+        safety=_safety(),
+        origins=["gradient_band_warm_start"],
+        initial_x=0.5,
+    )
+
+    safety = out["landing_safety"]
+    assert safety["accepted"] is True
+    assert safety["selected_origin"] == "gradient_band_warm_start"
+    assert safety["policy"] == "salvaged_iterate"
+    assert "seed_fallback_disabled" not in safety["reasons"]
+
+
+def test_safe_gradient_band_warm_start_skips_under_moved_probe():
+    seed = _one_atom(0.0)
+    acquisition = _FakeAcquisition(seed)
+
+    positions, origin, records = _select_safe_gradient_band_warm_start(
+        acquisition=acquisition,
+        seed_atoms=seed,
+        safety_config=_safety(),
+        quality_gates=SimpleNamespace(
+            ariadne_max_displacement_ang=None,
+            ariadne_min_pair_distance_ang=None,
+        ),
+    )
+
+    assert origin == "gradient_band_warm_start"
+    assert np.asarray(positions)[0, 0] == 0.5
+    assert records[0]["accepted"] is False
+    assert "ariadne_landing_under_moved" in records[0]["reasons"]
+    assert records[1]["selected_for_warm_start"] is True
+
+
+def test_under_move_retry_reads_top_level_landing_candidates():
+    payload = {
+        "landing_safety": {"accepted": False, "reasons": ["no_safe_non_seed_landing"]},
+        "landing_candidates": [{
+            "accepted": False,
+            "reasons": ["ariadne_landing_under_moved"],
+        }],
+    }
+
+    assert _landing_needs_under_move_retry(
+        payload,
+        safety_config=_safety(),
+        run_config=AriadneRunConfig(),
+    ) is True

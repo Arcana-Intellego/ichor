@@ -704,6 +704,26 @@ def _evaluate_landing_candidate(
     }
 
 
+def _rank_landing_candidate(candidate: Dict[str, Any]) -> float:
+    value = _safe_float_or_none(candidate.get("alpha"))
+    if value is None:
+        value = _safe_float_or_none(
+            candidate.get("metrics", {}).get("total_score")
+        )
+    if value is None:
+        return -math.inf
+    metrics = candidate.get("metrics", {}) or {}
+    r = _safe_float_or_none(metrics.get("movement_rmsd_ang"))
+    peak = _safe_float_or_none(metrics.get("movement_band_peak_ang"))
+    low = _safe_float_or_none(metrics.get("movement_band_low_ang"))
+    high = _safe_float_or_none(metrics.get("movement_band_high_ang"))
+    if r is None or peak is None or low is None or high is None:
+        return float(value)
+    width = max(float(high) - float(low), 1.0e-12)
+    tie = 0.05 * ((float(r) - float(peak)) / width) ** 2
+    return float(value) - float(tie)
+
+
 def _selection_prediction_diagnostics(
     acquisition: SeedLocalAdversarialAcquisition,
     atoms: Atoms,
@@ -725,6 +745,19 @@ def _selection_prediction_diagnostics(
     safety_metrics = {}
     if isinstance(landing_safety, dict):
         safety_metrics = dict(landing_safety.get("metrics") or {})
+    movement_fields = {
+        key: safety_metrics.get(key)
+        for key in (
+            "movement_rmsd_ang",
+            "movement_band_min_ang",
+            "movement_band_peak_ang",
+            "movement_band_max_ang",
+            "movement_utility_score",
+            "movement_progress_score",
+            "movement_direction_source",
+        )
+        if key in safety_metrics
+    }
     return {
         "schema_version": 1,
         "property": str(acquisition.config.property_name),
@@ -796,6 +829,7 @@ def _selection_prediction_diagnostics(
             if isinstance(landing_safety, dict)
             else "unknown"
         ),
+        **movement_fields,
         "safety_metrics": safety_metrics,
         "per_atom": per_atom,
     }
@@ -824,6 +858,7 @@ def _select_safe_landing(
     opt_candidate_positions: Sequence[np.ndarray],
     opt_candidate_alphas: Sequence[float],
     opt_candidate_grad_norms: Sequence[float],
+    opt_candidate_origins: Optional[Sequence[str]] = None,
     alpha_trajectory: Sequence[float],
     safety_config: Any,
     quality_gates: Any,
@@ -869,7 +904,11 @@ def _select_safe_landing(
         if _duplicate_coords(coords, seen_coords):
             continue
         seen_coords.append(coords.copy())
-        origin = "seed_fallback" if k == 0 else "accepted_iterate"
+        origin = (
+            str(opt_candidate_origins[k])
+            if opt_candidate_origins is not None and k < len(opt_candidate_origins)
+            else ("seed_fallback" if k == 0 else "accepted_iterate")
+        )
         candidate = _evaluate_landing_candidate(
             acquisition=acquisition,
             seed_atoms=seed_atoms,
@@ -939,28 +978,9 @@ def _select_safe_landing(
 
     safe_candidates = [c for c in candidates if bool(c.get("accepted"))]
     if safe_candidates:
-        def _rank(candidate: Dict[str, Any]) -> float:
-            value = _safe_float_or_none(candidate.get("alpha"))
-            if value is None:
-                value = _safe_float_or_none(
-                    candidate.get("metrics", {}).get("total_score")
-                )
-            if value is None:
-                return -math.inf
-            metrics = candidate.get("metrics", {}) or {}
-            r = _safe_float_or_none(metrics.get("movement_rmsd_ang"))
-            peak = _safe_float_or_none(metrics.get("movement_band_peak_ang"))
-            low = _safe_float_or_none(metrics.get("movement_band_low_ang"))
-            high = _safe_float_or_none(metrics.get("movement_band_high_ang"))
-            if r is None or peak is None or low is None or high is None:
-                return float(value)
-            width = max(float(high) - float(low), 1.0e-12)
-            tie = 0.05 * ((float(r) - float(peak)) / width) ** 2
-            return float(value) - float(tie)
-
         selected = max(
             safe_candidates,
-            key=_rank,
+            key=_rank_landing_candidate,
         )
         selected_origin = str(selected.get("origin", "unknown"))
         if bool(selected.get("metrics", {}).get("seed_equivalent", False)):
@@ -1165,6 +1185,102 @@ def _mock_optimise_seed(
     )
 
 
+def _select_safe_gradient_band_warm_start(
+    *,
+    acquisition: SeedLocalAdversarialAcquisition,
+    seed_atoms: Atoms,
+    safety_config: Any,
+    quality_gates: Any,
+) -> tuple[Optional[np.ndarray], str, List[Dict[str, Any]]]:
+    probe_method = getattr(acquisition, "gradient_band_probe_atoms", None)
+    if not callable(probe_method):
+        return None, "seed_fallback", []
+    seed_mean_energy = float(acquisition.posterior.mean(seed_atoms))
+    records: List[Dict[str, Any]] = []
+    candidates: List[Dict[str, Any]] = []
+    for idx, (label, probe_atoms) in enumerate(probe_method()):
+        try:
+            coords = _coords_array(probe_atoms)
+            candidate = _evaluate_landing_candidate(
+                acquisition=acquisition,
+                seed_atoms=seed_atoms,
+                seed_mean_energy=seed_mean_energy,
+                coords=coords,
+                origin=str(label),
+                candidate_index=idx,
+                alpha=None,
+                grad_norm=None,
+                safety_config=safety_config,
+                quality_gates=quality_gates,
+            )
+            public = _candidate_public(candidate)
+            records.append(public)
+            if bool(candidate.get("accepted")):
+                candidates.append(candidate)
+        except Exception as exc:
+            records.append({
+                "candidate_index": int(idx),
+                "origin": str(label),
+                "accepted": False,
+                "reasons": ["gradient_band_warm_start_evaluation_failed"],
+                "record_only_reasons": [],
+                "metrics": {"evaluation_error": type(exc).__name__ + ": " + str(exc)},
+                "alpha": None,
+                "grad_norm": None,
+                "informativeness_score": None,
+                "risk_penalty_score": None,
+            })
+    if not candidates:
+        return None, "seed_fallback", records
+    selected = max(candidates, key=_rank_landing_candidate)
+    selected_coords = _coords_array(selected["atoms"])
+    for record in records:
+        record["selected_for_warm_start"] = (
+            int(record.get("candidate_index", -1))
+            == int(selected.get("candidate_index", -2))
+        )
+    return selected_coords, "gradient_band_warm_start", records
+
+
+def _landing_needs_under_move_retry(
+    payload: Dict[str, Any],
+    *,
+    safety_config: Any,
+    run_config: AriadneRunConfig,
+) -> bool:
+    if not bool(_cfg_value(safety_config, "under_move_retry", True)):
+        return False
+    if not bool(getattr(run_config, "trqn_under_move_retry", True)):
+        return False
+    if int(getattr(run_config, "trqn_under_move_retry_max", 1)) <= 0:
+        return False
+    safety = payload.get("landing_safety", {}) if isinstance(payload, dict) else {}
+    if bool(safety.get("accepted", False)):
+        return False
+    candidates = (
+        payload.get("landing_candidates")
+        or safety.get("landing_candidates")
+        or []
+    )
+    under = 0
+    blocking = 0
+    for candidate in candidates:
+        reasons = set(candidate.get("reasons") or [])
+        if "ariadne_landing_under_moved" in reasons:
+            under += 1
+        other = {
+            r for r in reasons
+            if r not in {
+                "ariadne_landing_under_moved",
+                "ariadne_landing_is_seed",
+                "seed_fallback_disabled",
+            }
+        }
+        if other:
+            blocking += 1
+    return under > 0 and blocking == 0
+
+
 def _live_optimise_seed(
     models,
     seed: Atoms,
@@ -1234,12 +1350,23 @@ def _live_optimise_seed(
     )
 
     seed_ase = _ichor_to_ase(acquisition.seed_atoms)
+    warm_start_positions, initial_origin, warm_start_records = (
+        _select_safe_gradient_band_warm_start(
+            acquisition=acquisition,
+            seed_atoms=acquisition.seed_atoms,
+            safety_config=safety_config,
+            quality_gates=quality_gates,
+        )
+    )
 
     opt_result = run_optimisation_against_calculator(
         seed_atoms=seed_ase,
         calculator=calculator,
         run_config=run_config,
         trace_path=trace_path,
+        initial_positions_angstrom=warm_start_positions,
+        initial_origin=initial_origin,
+        warm_start_records=warm_start_records,
     )
 
     raw_final_atoms = _make_ichor_from_positions(
@@ -1252,40 +1379,16 @@ def _live_optimise_seed(
         opt_candidate_positions=list(opt_result.candidate_positions_angstrom),
         opt_candidate_alphas=list(opt_result.candidate_alphas),
         opt_candidate_grad_norms=list(opt_result.candidate_grad_norms),
+        opt_candidate_origins=list(opt_result.candidate_origins),
         alpha_trajectory=list(opt_result.alpha_trajectory),
         safety_config=safety_config,
         quality_gates=quality_gates,
     )
-    def _needs_under_move_retry(payload: Dict[str, Any]) -> bool:
-        if not bool(_cfg_value(safety_config, "under_move_retry", True)):
-            return False
-        if not bool(getattr(run_config, "trqn_under_move_retry", True)):
-            return False
-        if int(getattr(run_config, "trqn_under_move_retry_max", 1)) <= 0:
-            return False
-        safety = payload.get("landing_safety", {}) if isinstance(payload, dict) else {}
-        if bool(safety.get("accepted", False)):
-            return False
-        candidates = safety.get("landing_candidates") or []
-        under = 0
-        blocking = 0
-        for candidate in candidates:
-            reasons = set(candidate.get("reasons") or [])
-            if "ariadne_landing_under_moved" in reasons:
-                under += 1
-            other = {
-                r for r in reasons
-                if r not in {
-                    "ariadne_landing_under_moved",
-                    "ariadne_landing_is_seed",
-                    "seed_fallback_disabled",
-                }
-            }
-            if other:
-                blocking += 1
-        return under > 0 and blocking == 0
-
-    if _needs_under_move_retry(landing):
+    if _landing_needs_under_move_retry(
+        landing,
+        safety_config=safety_config,
+        run_config=run_config,
+    ):
         retry_config = replace(
             run_config,
             trqn_target_initial_grad_rms=float(
@@ -1299,6 +1402,9 @@ def _live_optimise_seed(
             calculator=calculator,
             run_config=retry_config,
             trace_path=trace_path,
+            initial_positions_angstrom=warm_start_positions,
+            initial_origin=initial_origin,
+            warm_start_records=warm_start_records,
         )
         raw_final_atoms_retry = _make_ichor_from_positions(
             acquisition.seed_atoms,
@@ -1311,6 +1417,7 @@ def _live_optimise_seed(
             opt_candidate_positions=list(opt_result_retry.candidate_positions_angstrom),
             opt_candidate_alphas=list(opt_result_retry.candidate_alphas),
             opt_candidate_grad_norms=list(opt_result_retry.candidate_grad_norms),
+            opt_candidate_origins=list(opt_result_retry.candidate_origins),
             alpha_trajectory=list(opt_result_retry.alpha_trajectory),
             safety_config=safety_config,
             quality_gates=quality_gates,

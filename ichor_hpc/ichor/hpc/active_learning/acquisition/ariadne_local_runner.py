@@ -181,6 +181,7 @@ class OptimisationResult:
     candidate_positions_angstrom: List[np.ndarray]
     candidate_alphas: List[float]
     candidate_grad_norms: List[float]
+    candidate_origins: List[str]
     diagnostics: Dict[str, Any]
 
 
@@ -1454,6 +1455,9 @@ def run_optimisation_against_calculator(
     calculator,
     run_config,
     trace_path=None,
+    initial_positions_angstrom=None,
+    initial_origin: str = "seed_fallback",
+    warm_start_records=None,
 ):
     """Drive ARIADNE for a single seed against the supplied calculator.
 
@@ -1479,6 +1483,8 @@ def run_optimisation_against_calculator(
 
     atoms = seed_atoms.copy()
     atoms.calc = calculator
+    if initial_positions_angstrom is not None:
+        atoms.set_positions(np.asarray(initial_positions_angstrom, dtype=np.float64).reshape(-1, 3))
 
     natoms = len(atoms)
     symbols = [a.symbol for a in atoms]
@@ -1489,41 +1495,7 @@ def run_optimisation_against_calculator(
 
     optimiser_name = (run_config.optimiser or "trust_region_qn").strip().lower()
     diagnostics = _new_optimiser_diagnostics(optimiser_name)
-    warm_start_records = []
-    warm_start_evaluations = 0
-    if bool(getattr(getattr(calculator, "_acq", None), "config", None)):
-        acq = getattr(calculator, "_acq", None)
-        probe_method = getattr(acq, "gradient_band_probe_atoms", None)
-        if callable(probe_method):
-            seed_positions = np.asarray(atoms.get_positions(), dtype=np.float64)
-            best_alpha = None
-            best_positions = None
-            for label, probe_atoms in probe_method():
-                try:
-                    positions = np.asarray(probe_atoms.coordinates, dtype=np.float64)
-                    atoms.set_positions(positions)
-                    f_probe, _ = _eval_energy_gradient(atoms)
-                    alpha_probe = -float(f_probe)
-                    warm_start_evaluations += 1
-                    warm_start_records.append({
-                        "origin": str(label),
-                        "alpha": float(alpha_probe),
-                    })
-                    if best_alpha is None or alpha_probe > best_alpha:
-                        best_alpha = float(alpha_probe)
-                        best_positions = positions.copy()
-                except Exception as exc:
-                    warm_start_records.append({
-                        "origin": str(label),
-                        "error": type(exc).__name__ + ": " + str(exc),
-                    })
-                finally:
-                    atoms.set_positions(seed_positions)
-            if best_positions is not None:
-                atoms.set_positions(best_positions)
-                q0_xyz_angstrom = np.asfortranarray(
-                    atoms.get_positions(), dtype=np.float64,
-                )
+    warm_start_records = list(warm_start_records or [])
 
     # one calculator call before the loop -- ariadne needs an initial
     # energy + gradient to seed its internal hessian model. Evaluate once in
@@ -1541,7 +1513,7 @@ def run_optimisation_against_calculator(
         "reason": "not_trqn",
         "retry": False,
     }
-    n_evaluations = 1 + int(warm_start_evaluations)
+    n_evaluations = 1
     if optimiser_name in ("trust_region_qn", "trqn"):
         trqn_scale_info = _compute_trqn_objective_scale(
             run_config,
@@ -1605,7 +1577,9 @@ def run_optimisation_against_calculator(
         "trqn_retry_reason": None,
         "trqn_retry_succeeded": None,
         "trqn_failed_after_retry": False,
-        "gradient_band_warm_start": bool(warm_start_records),
+        "gradient_band_warm_start": (
+            str(initial_origin) == "gradient_band_warm_start"
+        ),
         "gradient_band_warm_start_candidates": list(warm_start_records),
     })
 
@@ -1638,6 +1612,7 @@ def run_optimisation_against_calculator(
     candidate_positions = [np.asarray(q0_xyz_angstrom, dtype=np.float64).copy()]
     candidate_alphas = [float(alpha_trajectory[0])]
     candidate_grad_norms = [float(grad_norm_trajectory[0])]
+    candidate_origins = [str(initial_origin or "seed_fallback")]
     fell_back_to_ds = False
     trqn_retry_attempted = False
     rigid_force_clamps = 0
@@ -1994,6 +1969,7 @@ def run_optimisation_against_calculator(
             )
             candidate_alphas.append(float(alpha_trajectory[-1]))
             candidate_grad_norms.append(float(grad_norm_trajectory[-1]))
+            candidate_origins.append("accepted_iterate")
             if bool(diagnostics.get("trqn_retry_attempted")) and is_trqn:
                 diagnostics["trqn_retry_succeeded"] = True
         else:
@@ -2136,5 +2112,6 @@ def run_optimisation_against_calculator(
         candidate_positions_angstrom=candidate_positions,
         candidate_alphas=candidate_alphas,
         candidate_grad_norms=candidate_grad_norms,
+        candidate_origins=candidate_origins,
         diagnostics=diagnostics,
     )

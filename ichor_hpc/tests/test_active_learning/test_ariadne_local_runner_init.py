@@ -569,10 +569,36 @@ def test_repeated_trqn_no_proposal_backtransform_failure_falls_back_to_ds(monkey
     assert result.diagnostics["optimiser_final"] == "dissipative_symplectic"
     assert result.n_evaluations == 3
     assert len(result.candidate_positions_angstrom) == 2
+    assert result.candidate_origins[0] == "seed_fallback"
+    assert result.candidate_origins[1] == "accepted_iterate"
     assert ariadne._ds_factory.last.init_kwargs["hpos_estimator"] == "syev"
     assert ariadne._ds_factory.last.init_kwargs["lanczos_k"] == 4
     assert ariadne._ds_factory.last.init_kwargs["htvi_p_bregman"] == 2.0
     assert ariadne._ds_factory.last.init_kwargs["htvi_gamma_0"] > 0.0
+
+
+def test_initial_warm_start_origin_is_preserved(monkeypatch):
+    ariadne = _fake_runner_ariadne()
+    monkeypatch.setattr(local_runner, "_import_ariadne", lambda: ariadne)
+
+    result = run_optimisation_against_calculator(
+        _FakeAtoms(),
+        calculator=None,
+        run_config=AriadneRunConfig(
+            optimiser="trust_region_qn",
+            max_iter=2,
+            fallback_to_ds=False,
+            trqn_retry_on_no_proposal=False,
+        ),
+        initial_positions_angstrom=np.ones((2, 3), dtype=np.float64) * 0.25,
+        initial_origin="gradient_band_warm_start",
+        warm_start_records=[{"origin": "gradient_band_probe_peak", "accepted": True}],
+    )
+
+    assert result.candidate_origins[0] == "gradient_band_warm_start"
+    assert result.diagnostics["gradient_band_warm_start"] is True
+    assert result.diagnostics["gradient_band_warm_start_candidates"][0]["accepted"] is True
+    assert np.allclose(result.candidate_positions_angstrom[0], 0.25)
 
 
 def test_trqn_no_proposal_retries_with_lower_objective_scale_before_ds(monkeypatch):
