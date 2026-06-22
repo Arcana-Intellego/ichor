@@ -231,6 +231,138 @@ def test_unsafe_max_iteration_result_is_not_task_usable():
     assert usability["reason"] == "no_safe_non_seed_landing"
 
 
+def test_backtransform_failure_with_safe_landing_is_task_usable():
+    seed = _water()
+    out = AriadneRunResult(
+        initial_atoms=seed,
+        final_atoms=seed,
+        alpha_trajectory=[3.8, 4.1],
+        grad_norm_trajectory=[65.0, 65.2],
+        return_code=2,
+        landing_safety={
+            "accepted": True,
+            "policy": "salvaged_iterate",
+            "selected_origin": "accepted_iterate",
+            "reasons": [],
+            "metrics": {
+                "movement_rmsd_ang": 0.025,
+                "movement_band_min_ang": 0.014,
+                "movement_band_max_ang": 0.177,
+            },
+        },
+        optimiser_diagnostics={
+            "last_return_code_reason": "trqn_no_proposal_backtransform_fail",
+        },
+    )
+
+    usability = ariadne_result_usability_payload(out.to_dict())
+
+    assert usability["usable"] is True
+    assert usability["task_exit_code"] == 0
+    assert usability["optimiser_converged"] is False
+    assert usability["reason"] == "safe_landing_after_backtransform_failure"
+    assert usability["safe_landing_salvaged_after_optimiser_failure"] is True
+
+
+def test_backtransform_failure_still_honours_landing_safety_rejection():
+    seed = _water()
+    out = AriadneRunResult(
+        initial_atoms=seed,
+        final_atoms=seed,
+        return_code=2,
+        landing_safety={
+            "accepted": False,
+            "policy": "rejected",
+            "selected_origin": "raw_final",
+            "reasons": ["ariadne_landing_under_moved"],
+        },
+        optimiser_diagnostics={
+            "last_return_code_reason": "trqn_no_proposal_backtransform_fail",
+        },
+    )
+
+    usability = ariadne_result_usability_payload(out.to_dict())
+
+    assert usability["usable"] is False
+    assert usability["task_exit_code"] == 4
+    assert usability["reason"] == "ariadne_landing_under_moved"
+
+
+def test_backtransform_failure_still_honours_seed_fallback_policy():
+    seed = _water()
+    out = AriadneRunResult(
+        initial_atoms=seed,
+        final_atoms=seed,
+        return_code=2,
+        landing_safety={
+            "accepted": True,
+            "policy": "seed_fallback",
+            "selected_origin": "seed_fallback",
+            "reasons": [],
+        },
+        optimiser_diagnostics={
+            "last_return_code_reason": "trqn_no_proposal_backtransform_fail",
+        },
+    )
+
+    usability = ariadne_result_usability_payload(
+        out.to_dict(),
+        allow_seed_fallback=False,
+    )
+
+    assert usability["usable"] is False
+    assert usability["task_exit_code"] == 4
+    assert usability["reason"] == "seed_fallback_not_allowed"
+
+
+def test_return_code_two_unknown_reason_is_not_task_usable():
+    seed = _water()
+    out = AriadneRunResult(
+        initial_atoms=seed,
+        final_atoms=seed,
+        return_code=2,
+        landing_safety={
+            "accepted": True,
+            "policy": "salvaged_iterate",
+            "selected_origin": "accepted_iterate",
+            "reasons": [],
+        },
+        optimiser_diagnostics={"last_return_code_reason": "optimiser_error"},
+    )
+
+    usability = ariadne_result_usability_payload(out.to_dict())
+
+    assert usability["usable"] is False
+    assert usability["task_exit_code"] == 4
+    assert usability["reason"] == "ariadne_return_code_2"
+
+
+def test_return_code_two_nonfinite_geometry_is_not_task_usable():
+    seed = _water()
+    out = AriadneRunResult(
+        initial_atoms=seed,
+        final_atoms=seed,
+        return_code=2,
+        landing_safety={
+            "accepted": True,
+            "policy": "salvaged_iterate",
+            "selected_origin": "accepted_iterate",
+            "reasons": [],
+        },
+        optimiser_diagnostics={
+            "last_return_code_reason": "trqn_no_proposal_backtransform_fail",
+        },
+    )
+    payload = out.to_dict()
+    payload["final_coordinates"] = [[float("nan"), 0.0, 0.0]]
+
+    usability = ariadne_result_usability_payload(payload)
+
+    assert usability["usable"] is False
+    assert usability["task_exit_code"] == 4
+    assert usability["reason"] == "nonfinite_final_geometry"
+
+
 def test_alpha_initial_and_final_properties():
     seed = _water()
     out = optimise_seed(models=None, seed=seed, trajectory=[seed], mock=True)

@@ -242,6 +242,44 @@ def _payload_final_coordinates(payload: Dict[str, Any]) -> Optional[np.ndarray]:
     return coords
 
 
+def _optimiser_terminal_reason(payload: Dict[str, Any]) -> str:
+    diag = payload.get("optimiser_diagnostics")
+    if not isinstance(diag, dict):
+        return ""
+    for key in (
+        "last_return_code_reason",
+        "terminal_reason",
+        "trqn_no_proposal_reason",
+    ):
+        value = diag.get(key)
+        if value is not None:
+            text = str(value).strip()
+            if text:
+                return text
+    return ""
+
+
+def _is_salvageable_ariadne_return_code(
+    payload: Dict[str, Any],
+    return_code: int,
+) -> bool:
+    """Return whether a non-converged optimiser code may still hand off.
+
+    Code 2 is used by the live TRQN path when it can no longer build a useful
+    proposal, including backtransform failure after an already accepted step.
+    The selected landing still has to pass the normal finite-geometry and
+    landing-safety checks below; this helper only prevents an early hard fail.
+    """
+    if int(return_code) != 2:
+        return False
+    reason = _optimiser_terminal_reason(payload).lower()
+    return (
+        reason.startswith("trqn_no_proposal")
+        or reason == "backtransform_fail"
+        or reason.startswith("backtransform_fail")
+    )
+
+
 def ariadne_result_usability_payload(
     payload: Dict[str, Any],
     *,
@@ -271,7 +309,11 @@ def ariadne_result_usability_payload(
             "optimiser_converged": False,
         }
     optimiser_converged = bool(return_code == 0)
-    if return_code not in (0, 1):
+    salvageable_optimiser_failure = _is_salvageable_ariadne_return_code(
+        payload,
+        return_code,
+    )
+    if return_code not in (0, 1, 2):
         return {
             "usable": False,
             "reason": "ariadne_return_code_" + str(return_code),
@@ -323,11 +365,23 @@ def ariadne_result_usability_payload(
         }
     if return_code == 0:
         reason = "safe_landing_converged"
+    elif salvageable_optimiser_failure:
+        return {
+            "usable": True,
+            "reason": "safe_landing_after_backtransform_failure",
+            "task_exit_code": 0,
+            "optimiser_converged": False,
+            "safe_landing_salvaged_after_optimiser_failure": True,
+        }
+    elif return_code == 2:
+        return {
+            "usable": False,
+            "reason": "ariadne_return_code_2",
+            "task_exit_code": 4,
+            "optimiser_converged": False,
+        }
     else:
-        diag = payload.get("optimiser_diagnostics")
-        opt_reason = ""
-        if isinstance(diag, dict):
-            opt_reason = str(diag.get("last_return_code_reason", ""))
+        opt_reason = _optimiser_terminal_reason(payload)
         reason = (
             "safe_landing_after_max_iterations"
             if opt_reason.startswith("max_iterations") or not opt_reason
@@ -1876,6 +1930,16 @@ def main(argv=None) -> int:
         payload["selection_diagnostics"]["error_calibration_model_reason"] = str(
             error_calibration_reason
         )
+    if bool(usability.get("safe_landing_salvaged_after_optimiser_failure", False)):
+        diag = payload.get("optimiser_diagnostics")
+        if not isinstance(diag, dict):
+            diag = {}
+        diag["safe_landing_salvaged_after_optimiser_failure"] = True
+        diag.setdefault(
+            "salvaged_after_optimiser_failure_reason",
+            str(usability.get("reason", "")),
+        )
+        payload["optimiser_diagnostics"] = diag
     from ..daemon.state import atomic_write_json
 
     atomic_write_json(seed_dir / "result.json", payload)
