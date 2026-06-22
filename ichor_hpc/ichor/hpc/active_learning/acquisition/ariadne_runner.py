@@ -82,6 +82,12 @@ class AriadneRunResult:
 
     initial_atoms: Atoms
     final_atoms: Atoms
+    seed_atoms: Optional[Atoms] = None
+    seed_alpha: Optional[float] = None
+    optimiser_initial_atoms: Optional[Atoms] = None
+    optimiser_initial_alpha: Optional[float] = None
+    optimiser_initial_origin: Optional[str] = None
+    warm_start_alpha_delta_from_seed: Optional[float] = None
     alpha_trajectory: List[float] = field(default_factory=list)
     grad_norm_trajectory: List[float] = field(default_factory=list)
     n_evaluations: int = 0
@@ -122,8 +128,46 @@ class AriadneRunResult:
         return self.alpha_trajectory[-1] if self.alpha_trajectory else None
 
     def to_dict(self) -> dict:
+        seed_atoms = self.seed_atoms if self.seed_atoms is not None else self.initial_atoms
+        optimiser_initial_atoms = (
+            self.optimiser_initial_atoms
+            if self.optimiser_initial_atoms is not None
+            else self.initial_atoms
+        )
+        optimiser_initial_alpha = (
+            self.optimiser_initial_alpha
+            if self.optimiser_initial_alpha is not None
+            else self.alpha_initial
+        )
+        seed_alpha = (
+            self.seed_alpha
+            if self.seed_alpha is not None
+            else optimiser_initial_alpha
+        )
+        warm_start_delta = self.warm_start_alpha_delta_from_seed
+        if (
+            warm_start_delta is None
+            and seed_alpha is not None
+            and optimiser_initial_alpha is not None
+        ):
+            warm_start_delta = float(optimiser_initial_alpha) - float(seed_alpha)
         data = {
             "initial_coordinates": np.asarray(self.initial_atoms.coordinates).tolist(),
+            "seed_coordinates": np.asarray(seed_atoms.coordinates).tolist(),
+            "seed_alpha": None if seed_alpha is None else float(seed_alpha),
+            "optimiser_initial_coordinates": (
+                np.asarray(optimiser_initial_atoms.coordinates).tolist()
+            ),
+            "optimiser_initial_alpha": (
+                None if optimiser_initial_alpha is None
+                else float(optimiser_initial_alpha)
+            ),
+            "optimiser_initial_origin": str(
+                self.optimiser_initial_origin or "seed_fallback"
+            ),
+            "warm_start_alpha_delta_from_seed": (
+                None if warm_start_delta is None else float(warm_start_delta)
+            ),
             "final_coordinates": np.asarray(self.final_atoms.coordinates).tolist(),
             "atom_types": [a.type for a in self.initial_atoms],
             "alpha_trajectory": list(self.alpha_trajectory),
@@ -990,6 +1034,8 @@ def _select_safe_landing(
             policy = "raw_final"
         elif selected_origin == "backtrack":
             policy = "backtracked"
+        elif selected_origin == "gradient_band_warm_start":
+            policy = "gradient_band_warm_start"
         elif selected_origin == "seed_fallback":
             policy = "seed_fallback"
         else:
@@ -1140,6 +1186,10 @@ def _mock_optimise_seed(
     selection_diagnostics = {
         "schema_version": 1,
         "property": "iqa",
+        "seed_alpha": float(alpha_values[0]),
+        "optimiser_initial_alpha": float(alpha_values[0]),
+        "optimiser_initial_origin": "seed_fallback",
+        "warm_start_alpha_delta_from_seed": 0.0,
         "total_predicted_iqa_ha": float(sum(r["predicted_iqa_ha"] for r in per_atom)),
         "total_energy_variance": float(sum(r["raw_variance"] for r in per_atom)),
         "raw_total_score": float(alpha_values[-1]),
@@ -1159,11 +1209,24 @@ def _mock_optimise_seed(
         "acquisition_fallback_reasons": ["synthetic_mock_acquisition_metrics"],
         "spectral_modes": [],
         "landing_policy": "mock_final",
+        "movement_rmsd_ang": metrics["movement_rmsd_ang"],
+        "movement_band_min_ang": metrics["movement_band_min_ang"],
+        "movement_band_peak_ang": metrics["movement_band_peak_ang"],
+        "movement_band_max_ang": metrics["movement_band_max_ang"],
+        "movement_utility_score": metrics["movement_utility_score"],
+        "movement_progress_score": metrics["movement_progress_score"],
+        "movement_direction_source": metrics["movement_direction_source"],
         "safety_metrics": dict(landing_safety.get("metrics") or {}),
         "per_atom": per_atom,
     }
     return AriadneRunResult(
         initial_atoms=seed,
+        seed_atoms=seed,
+        seed_alpha=float(alpha_values[0]),
+        optimiser_initial_atoms=seed,
+        optimiser_initial_alpha=float(alpha_values[0]),
+        optimiser_initial_origin="seed_fallback",
+        warm_start_alpha_delta_from_seed=0.0,
         final_atoms=final,
         alpha_trajectory=alpha_values,
         grad_norm_trajectory=grad_values,
@@ -1332,6 +1395,7 @@ def _live_optimise_seed(
         error_calibration_model=error_calibration_model,
         error_calibration_apply_strength=error_calibration_apply_strength,
     )
+    seed_alpha = float(acquisition.components(acquisition.seed_atoms).total)
 
     # AdversarialASECalculator subscripts the clamp counter as a dict
     # (per_atom_acquisition_grad key). a plain dict matches that contract exactly --
@@ -1432,17 +1496,54 @@ def _live_optimise_seed(
         opt_result = opt_result_retry
         raw_final_atoms = raw_final_atoms_retry
         landing = landing_retry
+    optimiser_initial_positions = (
+        opt_result.candidate_positions_angstrom[0]
+        if opt_result.candidate_positions_angstrom
+        else np.asarray(acquisition.seed_atoms.coordinates, dtype=float)
+    )
+    optimiser_initial_atoms = _make_ichor_from_positions(
+        acquisition.seed_atoms,
+        optimiser_initial_positions,
+    )
+    optimiser_initial_alpha = (
+        float(opt_result.candidate_alphas[0])
+        if opt_result.candidate_alphas else None
+    )
+    optimiser_initial_origin = (
+        str(opt_result.candidate_origins[0])
+        if opt_result.candidate_origins else "seed_fallback"
+    )
+    warm_start_alpha_delta = (
+        None if optimiser_initial_alpha is None
+        else float(optimiser_initial_alpha) - float(seed_alpha)
+    )
     try:
         selection_diagnostics = _selection_prediction_diagnostics(
             acquisition,
             landing["selected_atoms"],
             landing_safety=landing["landing_safety"],
         )
+        selection_diagnostics["seed_alpha"] = float(seed_alpha)
+        selection_diagnostics["optimiser_initial_alpha"] = (
+            None if optimiser_initial_alpha is None
+            else float(optimiser_initial_alpha)
+        )
+        selection_diagnostics["optimiser_initial_origin"] = optimiser_initial_origin
+        selection_diagnostics["warm_start_alpha_delta_from_seed"] = (
+            None if warm_start_alpha_delta is None
+            else float(warm_start_alpha_delta)
+        )
     except Exception:
         selection_diagnostics = None
 
     return AriadneRunResult(
         initial_atoms=acquisition.seed_atoms,
+        seed_atoms=acquisition.seed_atoms,
+        seed_alpha=float(seed_alpha),
+        optimiser_initial_atoms=optimiser_initial_atoms,
+        optimiser_initial_alpha=optimiser_initial_alpha,
+        optimiser_initial_origin=optimiser_initial_origin,
+        warm_start_alpha_delta_from_seed=warm_start_alpha_delta,
         final_atoms=landing["selected_atoms"],
         alpha_trajectory=list(opt_result.alpha_trajectory),
         grad_norm_trajectory=list(opt_result.grad_norm_trajectory),

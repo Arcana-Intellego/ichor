@@ -96,6 +96,42 @@ def test_mock_to_dict_is_json_serialisable():
     assert d["atom_types"] == ["O", "H", "H"]
     assert d["trqn_backtransform_mode"] == "geodesic"
     assert d["trqn_geodesic_bt_mode"] == "dense"
+    assert d["seed_coordinates"] == d["initial_coordinates"]
+    assert d["optimiser_initial_coordinates"] == d["initial_coordinates"]
+    assert d["seed_alpha"] == d["optimiser_initial_alpha"]
+    assert d["optimiser_initial_origin"] == "seed_fallback"
+    assert d["warm_start_alpha_delta_from_seed"] == 0.0
+
+
+def test_to_dict_separates_seed_from_warm_started_initial_geometry():
+    seed = _water()
+    warm = Atoms([
+        Atom("O", 0.10, 0.0, 0.0),
+        Atom("H", 1.06, 0.0, 0.0),
+        Atom("H", -0.14, 0.93, 0.0),
+    ])
+    out = AriadneRunResult(
+        initial_atoms=seed,
+        seed_atoms=seed,
+        seed_alpha=1.0,
+        optimiser_initial_atoms=warm,
+        optimiser_initial_alpha=1.25,
+        optimiser_initial_origin="gradient_band_warm_start",
+        warm_start_alpha_delta_from_seed=0.25,
+        final_atoms=warm,
+        alpha_trajectory=[1.25, 1.4],
+    )
+
+    d = out.to_dict()
+
+    assert d["initial_coordinates"] == np.asarray(seed.coordinates).tolist()
+    assert d["seed_coordinates"] == np.asarray(seed.coordinates).tolist()
+    assert d["optimiser_initial_coordinates"] == np.asarray(warm.coordinates).tolist()
+    assert d["alpha_initial"] == 1.25
+    assert d["seed_alpha"] == 1.0
+    assert d["optimiser_initial_alpha"] == 1.25
+    assert d["optimiser_initial_origin"] == "gradient_band_warm_start"
+    assert d["warm_start_alpha_delta_from_seed"] == 0.25
 
 
 def test_mock_to_dict_contains_landing_safety_payload():
@@ -106,6 +142,27 @@ def test_mock_to_dict_contains_landing_safety_payload():
     assert d["landing_safety"]["policy"] == "mock_final"
     assert d["landing_candidates"][0]["origin"] == "mock_final"
     assert "raw_final_coordinates" in d
+
+
+def test_mock_selection_diagnostics_surface_movement_and_initial_fields():
+    seed = _water()
+    out = optimise_seed(models=None, seed=seed, trajectory=[seed], mock=True)
+    diag = out.to_dict()["selection_diagnostics"]
+
+    for key in (
+        "movement_rmsd_ang",
+        "movement_band_min_ang",
+        "movement_band_peak_ang",
+        "movement_band_max_ang",
+        "movement_utility_score",
+        "movement_progress_score",
+        "movement_direction_source",
+        "seed_alpha",
+        "optimiser_initial_alpha",
+        "optimiser_initial_origin",
+        "warm_start_alpha_delta_from_seed",
+    ):
+        assert key in diag
 
 
 def test_to_dict_includes_optional_optimiser_diagnostics():

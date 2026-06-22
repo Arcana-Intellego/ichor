@@ -255,7 +255,7 @@ def test_gradient_band_warm_start_origin_is_not_seed_fallback():
     safety = out["landing_safety"]
     assert safety["accepted"] is True
     assert safety["selected_origin"] == "gradient_band_warm_start"
-    assert safety["policy"] == "salvaged_iterate"
+    assert safety["policy"] == "gradient_band_warm_start"
     assert "seed_fallback_disabled" not in safety["reasons"]
 
 
