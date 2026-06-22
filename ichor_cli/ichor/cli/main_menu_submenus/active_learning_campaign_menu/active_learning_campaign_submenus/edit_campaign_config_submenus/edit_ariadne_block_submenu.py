@@ -68,7 +68,7 @@ ARIADNE_FIELD_SPECS = [
     spec(
         "trqn_scale_mode",
         "choice",
-        choices=["off", "fixed", "adaptive_initial_gradient"],
+        choices=["off", "fixed", "adaptive_initial_gradient", "adaptive_initial_gradient_rms"],
         prompt="TRQN objective scale mode: ",
     ),
     spec(
@@ -80,6 +80,31 @@ ARIADNE_FIELD_SPECS = [
         "trqn_retry_target_initial_grad_norm",
         "float",
         prompt="TRQN retry target initial gradient norm: ",
+    ),
+    spec(
+        "trqn_target_initial_grad_rms",
+        "float",
+        prompt="TRQN target initial gradient RMS: ",
+    ),
+    spec(
+        "trqn_retry_target_initial_grad_rms",
+        "float",
+        prompt="TRQN retry target initial gradient RMS: ",
+    ),
+    spec(
+        "trqn_under_move_target_initial_grad_rms",
+        "float",
+        prompt="TRQN under-move retry target gradient RMS: ",
+    ),
+    spec(
+        "trqn_under_move_retry",
+        "bool",
+        prompt="Retry TRQN once after under-moved landing: ",
+    ),
+    spec(
+        "trqn_under_move_retry_max",
+        "int",
+        prompt="TRQN under-move retry max: ",
     ),
     spec(
         "trqn_min_objective_scale",

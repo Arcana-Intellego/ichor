@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
@@ -53,10 +53,15 @@ class AriadneRunConfig:
     delta_max: float = 0.40
     gamma: float = 0.10
     fallback_to_ds: bool = True
-    trqn_scale_mode: str = "adaptive_initial_gradient"
+    trqn_scale_mode: str = "adaptive_initial_gradient_rms"
     trqn_target_initial_grad_norm: float = 0.01
     trqn_retry_target_initial_grad_norm: float = 0.003
-    trqn_min_objective_scale: float = 1.0e-6
+    trqn_target_initial_grad_rms: float = 2.0e-4
+    trqn_retry_target_initial_grad_rms: float = 4.0e-4
+    trqn_under_move_target_initial_grad_rms: float = 6.0e-4
+    trqn_under_move_retry: bool = True
+    trqn_under_move_retry_max: int = 1
+    trqn_min_objective_scale: float = 1.0e-8
     trqn_max_objective_scale: float = 1.0
     trqn_fixed_objective_scale: float = 1.0
     trqn_retry_on_no_proposal: bool = True
@@ -575,6 +580,26 @@ def _evaluate_landing_candidate(
         metrics["aligned_rmsd_penalty"] = float(breakdown.aligned_rmsd_penalty)
         if breakdown.aligned_rmsd_ang is not None:
             metrics["aligned_rmsd_ang"] = float(breakdown.aligned_rmsd_ang)
+        for key in (
+            "movement_metric",
+            "movement_rmsd_ang",
+            "movement_progress_ang",
+            "movement_band_min_ang",
+            "movement_band_low_ang",
+            "movement_band_peak_ang",
+            "movement_band_high_ang",
+            "movement_band_max_ang",
+            "movement_utility_score",
+            "movement_band_score",
+            "movement_progress_score",
+            "movement_direction_source",
+            "n_effective_movement_atoms",
+        ):
+            value = getattr(breakdown, key, None)
+            metrics[key] = None if value is None else (
+                str(value) if key in ("movement_metric", "movement_direction_source")
+                else float(value)
+            )
         metrics["weak_mode_penalty_score"] = float(
             getattr(breakdown, "weak_mode_penalty_score", 0.0)
         )
@@ -618,6 +643,21 @@ def _evaluate_landing_candidate(
                 record_only.append("ariadne_landing_below_min_whitened_distance")
         if float(d_w) > max_w:
             reasons.append("ariadne_landing_above_max_whitened_distance")
+
+    if bool(_cfg_value(safety_config, "enforce_movement_band", True)):
+        r_move = _safe_float_or_none(metrics.get("movement_rmsd_ang"))
+        r_min = _safe_float_or_none(metrics.get("movement_band_min_ang"))
+        r_max = _safe_float_or_none(metrics.get("movement_band_max_ang"))
+        if r_move is None or r_min is None or r_max is None:
+            reasons.append("ariadne_landing_movement_band_unavailable")
+        else:
+            if float(r_move) < float(r_min):
+                reasons.append("ariadne_landing_under_moved")
+            if (
+                bool(_cfg_value(safety_config, "reject_over_moved", True))
+                and float(r_move) > float(r_max)
+            ):
+                reasons.append("ariadne_landing_over_moved")
 
     max_de = _safe_float_or_none(
         _cfg_value(safety_config, "max_predicted_energy_delta_ha", None)
@@ -905,7 +945,18 @@ def _select_safe_landing(
                 value = _safe_float_or_none(
                     candidate.get("metrics", {}).get("total_score")
                 )
-            return -math.inf if value is None else float(value)
+            if value is None:
+                return -math.inf
+            metrics = candidate.get("metrics", {}) or {}
+            r = _safe_float_or_none(metrics.get("movement_rmsd_ang"))
+            peak = _safe_float_or_none(metrics.get("movement_band_peak_ang"))
+            low = _safe_float_or_none(metrics.get("movement_band_low_ang"))
+            high = _safe_float_or_none(metrics.get("movement_band_high_ang"))
+            if r is None or peak is None or low is None or high is None:
+                return float(value)
+            width = max(float(high) - float(low), 1.0e-12)
+            tie = 0.05 * ((float(r) - float(peak)) / width) ** 2
+            return float(value) - float(tie)
 
         selected = max(
             safe_candidates,
@@ -989,6 +1040,22 @@ def _mock_landing_safety(seed: Atoms, final: Atoms) -> Dict[str, Any]:
     metrics["fullspace_residual_distance"] = 0.0
     metrics["fullspace_residual_penalty"] = 0.0
     metrics["aligned_rmsd_penalty"] = 0.0
+    move_rmsd = _safe_float_or_none(metrics.get("aligned_mass_weighted_rmsd_ang"))
+    if move_rmsd is None:
+        move_rmsd = 0.05
+    metrics["movement_metric"] = "synthetic_mock_aligned_global_rmsd"
+    metrics["movement_rmsd_ang"] = float(move_rmsd)
+    metrics["movement_progress_ang"] = float(move_rmsd)
+    metrics["movement_band_min_ang"] = 0.0
+    metrics["movement_band_low_ang"] = 0.0
+    metrics["movement_band_peak_ang"] = float(move_rmsd)
+    metrics["movement_band_high_ang"] = max(float(move_rmsd), 0.1)
+    metrics["movement_band_max_ang"] = max(float(move_rmsd), 0.2)
+    metrics["movement_utility_score"] = 0.0
+    metrics["movement_band_score"] = 1.0
+    metrics["movement_progress_score"] = 1.0
+    metrics["movement_direction_source"] = "synthetic_mock"
+    metrics["n_effective_movement_atoms"] = float(len(seed))
     metrics["observable_score"] = 0.0
     metrics["outlier_penalty_score"] = 0.0
     metrics["acquisition_fallback_reasons"] = ["synthetic_mock_acquisition_metrics"]
@@ -1189,6 +1256,75 @@ def _live_optimise_seed(
         safety_config=safety_config,
         quality_gates=quality_gates,
     )
+    def _needs_under_move_retry(payload: Dict[str, Any]) -> bool:
+        if not bool(_cfg_value(safety_config, "under_move_retry", True)):
+            return False
+        if not bool(getattr(run_config, "trqn_under_move_retry", True)):
+            return False
+        if int(getattr(run_config, "trqn_under_move_retry_max", 1)) <= 0:
+            return False
+        safety = payload.get("landing_safety", {}) if isinstance(payload, dict) else {}
+        if bool(safety.get("accepted", False)):
+            return False
+        candidates = safety.get("landing_candidates") or []
+        under = 0
+        blocking = 0
+        for candidate in candidates:
+            reasons = set(candidate.get("reasons") or [])
+            if "ariadne_landing_under_moved" in reasons:
+                under += 1
+            other = {
+                r for r in reasons
+                if r not in {
+                    "ariadne_landing_under_moved",
+                    "ariadne_landing_is_seed",
+                    "seed_fallback_disabled",
+                }
+            }
+            if other:
+                blocking += 1
+        return under > 0 and blocking == 0
+
+    if _needs_under_move_retry(landing):
+        retry_config = replace(
+            run_config,
+            trqn_target_initial_grad_rms=float(
+                getattr(run_config, "trqn_under_move_target_initial_grad_rms", 6.0e-4)
+            ),
+            trqn_scale_mode="adaptive_initial_gradient_rms",
+            trqn_under_move_retry_max=0,
+        )
+        opt_result_retry = run_optimisation_against_calculator(
+            seed_atoms=seed_ase,
+            calculator=calculator,
+            run_config=retry_config,
+            trace_path=trace_path,
+        )
+        raw_final_atoms_retry = _make_ichor_from_positions(
+            acquisition.seed_atoms,
+            opt_result_retry.final_positions_angstrom,
+        )
+        landing_retry = _select_safe_landing(
+            acquisition=acquisition,
+            seed_atoms=acquisition.seed_atoms,
+            raw_final_atoms=raw_final_atoms_retry,
+            opt_candidate_positions=list(opt_result_retry.candidate_positions_angstrom),
+            opt_candidate_alphas=list(opt_result_retry.candidate_alphas),
+            opt_candidate_grad_norms=list(opt_result_retry.candidate_grad_norms),
+            alpha_trajectory=list(opt_result_retry.alpha_trajectory),
+            safety_config=safety_config,
+            quality_gates=quality_gates,
+        )
+        opt_result_retry.diagnostics["under_move_retry_attempted"] = True
+        opt_result_retry.diagnostics["under_move_retry_target_grad_rms"] = float(
+            getattr(run_config, "trqn_under_move_target_initial_grad_rms", 6.0e-4)
+        )
+        opt_result_retry.diagnostics["under_move_retry_succeeded"] = bool(
+            landing_retry.get("landing_safety", {}).get("accepted", False)
+        )
+        opt_result = opt_result_retry
+        raw_final_atoms = raw_final_atoms_retry
+        landing = landing_retry
     try:
         selection_diagnostics = _selection_prediction_diagnostics(
             acquisition,

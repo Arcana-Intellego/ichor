@@ -261,7 +261,10 @@ def test_ds_safe_init_validation_rejects_bad_profile_values():
 
 def test_trqn_adaptive_objective_scale_targets_initial_gradient_norm():
     info = _compute_trqn_objective_scale(
-        AriadneRunConfig(trqn_target_initial_grad_norm=0.01),
+        AriadneRunConfig(
+            trqn_scale_mode="adaptive_initial_gradient",
+            trqn_target_initial_grad_norm=0.01,
+        ),
         64.0,
     )
 
@@ -273,6 +276,7 @@ def test_trqn_adaptive_objective_scale_targets_initial_gradient_norm():
 def test_trqn_adaptive_objective_scale_respects_bounds_and_zero_gradient():
     info = _compute_trqn_objective_scale(
         AriadneRunConfig(
+            trqn_scale_mode="adaptive_initial_gradient",
             trqn_target_initial_grad_norm=0.01,
             trqn_min_objective_scale=1.0e-4,
         ),
@@ -282,7 +286,18 @@ def test_trqn_adaptive_objective_scale_respects_bounds_and_zero_gradient():
 
     zero = _compute_trqn_objective_scale(AriadneRunConfig(), 0.0)
     assert zero["scale"] == pytest.approx(1.0)
-    assert zero["reason"] == "zero_initial_gradient"
+    assert zero["reason"] == "zero_initial_gradient_rms"
+
+
+def test_trqn_rms_objective_scale_targets_initial_gradient_rms():
+    info = _compute_trqn_objective_scale(
+        AriadneRunConfig(trqn_target_initial_grad_rms=2.0e-4),
+        np.array([3.0, 4.0]),
+    )
+
+    assert info["scale"] == pytest.approx(2.0e-4 / (5.0 / np.sqrt(2.0)))
+    assert info["scaled_grad_rms"] == pytest.approx(2.0e-4)
+    assert info["reason"] == "adaptive_initial_gradient_rms"
 
 
 def test_optimiser_diagnostics_are_json_safe_for_no_trial_path():
@@ -572,6 +587,7 @@ def test_trqn_no_proposal_retries_with_lower_objective_scale_before_ds(monkeypat
             max_iter=9,
             fallback_to_ds=True,
             trqn_retry_on_no_proposal=True,
+            trqn_scale_mode="adaptive_initial_gradient",
             trqn_target_initial_grad_norm=0.01,
             trqn_retry_target_initial_grad_norm=0.003,
         ),

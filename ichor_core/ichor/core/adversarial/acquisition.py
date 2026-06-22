@@ -20,6 +20,9 @@ from .stencils import (
 )
 from .subspace import (
     LocalSubspace,
+    aligned_active_displacement,
+    aligned_active_rmsd,
+    active_participation_weights,
     active_coordinates,
     build_local_subspace,
     directional_step_sizes,
@@ -77,6 +80,20 @@ class AcquisitionBreakdown:
     fullspace_residual_penalty: float = 0.0
     aligned_rmsd_ang: Optional[float] = None
     aligned_rmsd_penalty: float = 0.0
+    movement_metric: Optional[str] = None
+    movement_rmsd_ang: Optional[float] = None
+    movement_progress_ang: Optional[float] = None
+    movement_band_min_ang: Optional[float] = None
+    movement_band_low_ang: Optional[float] = None
+    movement_band_peak_ang: Optional[float] = None
+    movement_band_high_ang: Optional[float] = None
+    movement_band_max_ang: Optional[float] = None
+    movement_utility_score: float = 0.0
+    movement_band_score: float = 0.0
+    movement_progress_score: float = 0.0
+    movement_direction_source: Optional[str] = None
+    n_effective_movement_atoms: Optional[float] = None
+    size_normalisation_mode: Optional[str] = None
     negative_curvature_penalty: float = 0.0
     weak_mode_penalty_score: float = 0.0
     anharmonic_risk_raw: float = 0.0
@@ -276,6 +293,8 @@ class SeedLocalAdversarialAcquisition:
             self.config.stencils.min_step,
             self.config.stencils.max_step,
         )
+        self._movement_band_cache: Optional[Dict[str, float]] = None
+        self._movement_direction_cache: Optional[Tuple[np.ndarray, str]] = None
         self.barrier_state = build_chemistry_barrier_state(
             self.seed_atoms,
             [item.atoms for item in neighbours],
@@ -429,6 +448,203 @@ class SeedLocalAdversarialAcquisition:
             ]
         return out
 
+    def movement_band(self) -> Dict[str, float]:
+        if self._movement_band_cache is not None:
+            return dict(self._movement_band_cache)
+        cfg = self.config.movement_band
+
+        values = []
+        for neighbour in self.subspace.neighbours:
+            try:
+                if str(cfg.metric) == "aligned_global_rmsd":
+                    value = aligned_mass_weighted_rmsd(self.seed_atoms, neighbour.atoms)
+                else:
+                    value = aligned_active_rmsd(self.subspace, neighbour.atoms)
+            except Exception:
+                continue
+            if np.isfinite(value) and float(value) > 0.0:
+                values.append(float(value))
+        if values:
+            q = 0.25 if str(cfg.local_statistic) == "p25" else 0.50
+            local = _percentile(values, q) or 0.0
+        else:
+            local = 0.0
+        if not np.isfinite(local) or local <= 0.0:
+            local = float(cfg.target_peak_floor_ang) / max(float(cfg.target_peak_fraction), 1.0e-12)
+
+        eps = 1.0e-9
+        hard_min = max(float(cfg.hard_min_floor_ang), float(cfg.hard_min_fraction) * local)
+        low = max(float(cfg.target_low_floor_ang), float(cfg.target_low_fraction) * local, hard_min + eps)
+        peak = max(float(cfg.target_peak_floor_ang), float(cfg.target_peak_fraction) * local, low + eps)
+        high = max(float(cfg.target_high_fraction) * local, peak + eps)
+        high = min(high, float(cfg.target_high_cap_ang))
+        if high <= peak:
+            high = peak + max(float(cfg.high_softness_ang) if hasattr(cfg, "high_softness_ang") else 0.020, 0.010)
+        hard_max = max(float(cfg.hard_max_fraction) * local, high + eps)
+        hard_max = min(hard_max, float(cfg.hard_max_cap_ang))
+        if hard_max <= high:
+            hard_max = min(float(cfg.hard_max_cap_ang), high + 0.010)
+
+        band = {
+            "local_rmsd_ang": float(local),
+            "min": float(hard_min),
+            "low": float(low),
+            "peak": float(peak),
+            "high": float(high),
+            "max": float(hard_max),
+        }
+        self._movement_band_cache = dict(band)
+        return band
+
+    def movement_distance(self, atoms: Atoms) -> Tuple[float, str]:
+        metric = str(getattr(self.config.movement_band, "metric", "aligned_active_rmsd"))
+        if metric == "aligned_global_rmsd":
+            return float(aligned_mass_weighted_rmsd(self.seed_atoms, atoms)), metric
+        try:
+            return float(aligned_active_rmsd(self.subspace, atoms)), metric
+        except Exception:
+            return float(aligned_mass_weighted_rmsd(self.seed_atoms, atoms)), "aligned_global_rmsd_fallback"
+
+    def _movement_delta_and_weights(self, atoms: Atoms) -> Tuple[np.ndarray, np.ndarray]:
+        if str(getattr(self.config.movement_band, "metric", "aligned_active_rmsd")) == "aligned_global_rmsd":
+            from .geometry import aligned_mass_weighted_displacement
+
+            disp = aligned_mass_weighted_displacement(self.seed_atoms, atoms)
+            masses = np.asarray(self.seed_atoms.masses, dtype=float)
+            masses = np.where(np.isfinite(masses) & (masses > 0.0), masses, 1.0)
+            delta = disp.reshape(-1, 3) / np.sqrt(masses)[:, None]
+            return delta.reshape(-1), np.ones(delta.size, dtype=float)
+        try:
+            return aligned_active_displacement(self.subspace, atoms)
+        except Exception:
+            from .geometry import aligned_mass_weighted_displacement
+
+            disp = aligned_mass_weighted_displacement(self.seed_atoms, atoms)
+            masses = np.asarray(self.seed_atoms.masses, dtype=float)
+            masses = np.where(np.isfinite(masses) & (masses > 0.0), masses, 1.0)
+            delta = disp.reshape(-1, 3) / np.sqrt(masses)[:, None]
+            return delta.reshape(-1), np.ones(delta.size, dtype=float)
+
+    def _base_value(self, atoms: Atoms) -> float:
+        return float(self.components(atoms, include_movement=False).total)
+
+    def _base_cartesian_gradient(self, atoms: Atoms) -> np.ndarray:
+        indices, flat, eps, shape = self._fd_indices_eps(atoms)
+        grad = np.zeros(flat.size, dtype=float)
+        for i in indices:
+            disp = np.zeros_like(flat)
+            disp[i] = eps
+            plus = self._atoms_from_flat(flat + disp, atoms)
+            minus = self._atoms_from_flat(flat - disp, atoms)
+            grad[i] = (self._base_value(plus) - self._base_value(minus)) / (2.0 * eps)
+        return grad.reshape(shape)
+
+    def movement_direction(self) -> Tuple[np.ndarray, str]:
+        if self._movement_direction_cache is not None:
+            direction, source = self._movement_direction_cache
+            return direction.copy(), source
+        source = "initial_projected_acquisition_gradient"
+        direction = None
+        if str(getattr(self.config.movement_utility, "direction", source)) == source:
+            try:
+                raw = np.asarray(self._base_cartesian_gradient(self.seed_atoms), dtype=float).reshape(-1)
+                norm = float(np.linalg.norm(raw))
+                if np.isfinite(norm) and norm > 0.0:
+                    direction = raw / norm
+            except Exception:
+                direction = None
+        if direction is None:
+            source = "dominant_active_mode"
+            if self.mode_directions:
+                raw = np.asarray(self.mode_directions[0], dtype=float).reshape(-1)
+                norm = float(np.linalg.norm(raw))
+                if np.isfinite(norm) and norm > 0.0:
+                    direction = raw / norm
+        if direction is None:
+            source = "movement_direction_unavailable"
+            direction = np.zeros(3 * len(self.seed_atoms), dtype=float)
+        self._movement_direction_cache = (np.asarray(direction, dtype=float), source)
+        return np.asarray(direction, dtype=float).copy(), source
+
+    def movement_metrics(self, atoms: Atoms) -> Dict[str, object]:
+        cfg = self.config.movement_utility
+        band_cfg = self.config.movement_band
+        band = self.movement_band()
+        distance, metric = self.movement_distance(atoms)
+        delta, weights = self._movement_delta_and_weights(atoms)
+        direction, source = self.movement_direction()
+        if direction.shape[0] != delta.shape[0]:
+            direction = np.zeros_like(delta)
+            source = "movement_direction_shape_mismatch"
+        coord_weights = np.asarray(weights, dtype=float)
+        coord_weights = np.where(np.isfinite(coord_weights) & (coord_weights > 0.0), coord_weights, 0.0)
+        weighted_delta = delta * np.sqrt(coord_weights)
+        weighted_direction = direction * np.sqrt(coord_weights)
+        direction_norm = float(np.linalg.norm(weighted_direction))
+        if not np.isfinite(direction_norm) or direction_norm <= 0.0:
+            progress = 0.0
+            source = "movement_direction_zero"
+        else:
+            progress = float(np.dot(weighted_delta, weighted_direction / direction_norm))
+
+        low_soft = max(float(cfg.low_softness_ang), 1.0e-12)
+        high_soft = max(float(cfg.high_softness_ang), 1.0e-12)
+        band_score = _sigmoid((float(distance) - band["low"]) / low_soft) * _sigmoid((band["high"] - float(distance)) / high_soft)
+        progress_score = float(np.tanh(progress / max(band["low"], 1.0e-12)))
+        raw = float(cfg.band_fraction) * float(band_score) + float(cfg.progress_fraction) * float(progress_score)
+        score = float(cfg.lambda_move) * raw if bool(cfg.enabled) and bool(band_cfg.enabled) else 0.0
+        atom_weights = active_participation_weights(self.subspace)
+        denom = float(np.sum(np.square(atom_weights)))
+        n_eff = None
+        if np.isfinite(denom) and denom > 0.0:
+            n_eff = float((float(np.sum(atom_weights)) ** 2) / denom)
+        return {
+            "movement_metric": metric,
+            "movement_rmsd_ang": float(distance),
+            "movement_progress_ang": float(progress),
+            "movement_band_min_ang": float(band["min"]),
+            "movement_band_low_ang": float(band["low"]),
+            "movement_band_peak_ang": float(band["peak"]),
+            "movement_band_high_ang": float(band["high"]),
+            "movement_band_max_ang": float(band["max"]),
+            "movement_utility_score": float(score),
+            "movement_band_score": float(band_score),
+            "movement_progress_score": float(progress_score),
+            "movement_direction_source": source,
+            "n_effective_movement_atoms": n_eff,
+        }
+
+    def gradient_band_probe_atoms(self) -> Tuple[Tuple[str, Atoms], ...]:
+        """Return conservative seed displacements along the movement direction."""
+        if not bool(getattr(self.config.movement_band, "enabled", True)):
+            return tuple()
+        direction, _ = self.movement_direction()
+        norm = float(np.linalg.norm(direction))
+        if not np.isfinite(norm) or norm <= 0.0:
+            return tuple()
+        unit = np.asarray(direction, dtype=float).reshape(-1) / norm
+        flat0 = np.asarray(self.seed_atoms.coordinates, dtype=float).reshape(-1)
+        probes = []
+        band = self.movement_band()
+        for label, radius in (
+            ("gradient_band_probe_min", band["min"]),
+            ("gradient_band_probe_low", band["low"]),
+            ("gradient_band_probe_peak", band["peak"]),
+        ):
+            target = float(radius)
+            if not np.isfinite(target) or target <= 0.0:
+                continue
+            trial_flat = flat0 + target * unit
+            atoms = self._atoms_from_flat(trial_flat, self.seed_atoms)
+            for _ in range(2):
+                current, _ = self.movement_distance(atoms)
+                if not np.isfinite(current) or current <= 1.0e-12:
+                    break
+                trial_flat = flat0 + unit * (target * target / float(current))
+                atoms = self._atoms_from_flat(trial_flat, self.seed_atoms)
+            probes.append((label, atoms))
+        return tuple(probes)
+
     def _curvature_floor(self, curvature: float) -> float:
         floor = self.config.stencils.curvature_floor
         beta = self.config.stencils.softplus_scale
@@ -575,7 +791,14 @@ class SeedLocalAdversarialAcquisition:
         rmsd_vals: List[float] = []
 
         for atoms in sample_atoms:
-            energy_vars.append(self.posterior.variance(atoms))
+            energy_value = float(self.posterior.variance(atoms))
+            if (
+                bool(getattr(self.config.size_normalisation, "enabled", True))
+                and str(getattr(self.config.size_normalisation, "energy_mode", "per_sqrt_atom"))
+                == "per_sqrt_atom"
+            ):
+                energy_value /= max(float(np.sqrt(max(1, len(atoms)))), 1.0e-12)
+            energy_vars.append(energy_value)
             try:
                 residual_vals.append(fullspace_residual_distance(self.subspace, atoms))
             except Exception:
@@ -687,7 +910,7 @@ class SeedLocalAdversarialAcquisition:
             return tuple(1.0 / len(mode_evals) for _ in mode_evals)
         return tuple(float(x / total) for x in inv)
 
-    def components(self, atoms: Atoms) -> AcquisitionBreakdown:
+    def components(self, atoms: Atoms, *, include_movement: bool = True) -> AcquisitionBreakdown:
         mean_energy = self.posterior.mean(atoms)
         atom_variances = None
         if self.error_calibration_model and self.error_calibration_apply_strength > 0.0:
@@ -824,7 +1047,16 @@ class SeedLocalAdversarialAcquisition:
                 self.config.weights.lambda_frequency * frequency_risk
             )
 
-        raw_energy_risk = self._phi(energy_var / self.reference_scales["energy"])
+        norm_enabled = bool(getattr(self.config.size_normalisation, "enabled", True))
+        n_atoms = max(1, len(atoms))
+        energy_norm = float(np.sqrt(float(n_atoms))) if (
+            norm_enabled
+            and str(getattr(self.config.size_normalisation, "energy_mode", "per_sqrt_atom"))
+            == "per_sqrt_atom"
+        ) else 1.0
+        energy_value = float(energy_var) / max(energy_norm, 1.0e-12)
+        energy_scale = self.reference_scales["energy"]
+        raw_energy_risk = self._phi(energy_value / max(energy_scale, 1.0e-12))
         energy_risk = raw_energy_risk
         banded_energy_risk = None
         calibrated_error = None
@@ -842,10 +1074,10 @@ class SeedLocalAdversarialAcquisition:
                     self.error_calibration_model.get("reference_error_ha")
                     if isinstance(self.error_calibration_model, Mapping)
                     else None,
-                    self._reference_scale("calibrated_error", self.reference_scales["energy"]),
+                    self._reference_scale("calibrated_error", self.reference_scales["energy"]) / max(energy_norm, 1.0e-12),
                 )
                 calibrated_risk, banded_energy_risk, energy_reasons = self._energy_utility(
-                    float(calibrated_error),
+                    float(calibrated_error) / max(energy_norm, 1.0e-12),
                     float(scale),
                 )
                 fallback_reasons.extend(energy_reasons)
@@ -863,17 +1095,34 @@ class SeedLocalAdversarialAcquisition:
                 energy_risk = 0.0
                 fallback_reasons.append("calibrated_energy_raw_variance_fallback_disabled")
         distance_penalty = whitened_distance_squared(self.subspace, atoms, self.config.subspace.covariance_regularization)
-        chemistry_penalty = chemistry_barrier_value(atoms, self.barrier_state, mean_energy)
+        if (
+            norm_enabled
+            and str(getattr(self.config.size_normalisation, "whitened_distance_mode", "per_subspace_dim"))
+            == "per_subspace_dim"
+        ):
+            distance_penalty = float(distance_penalty) / max(1, int(self.subspace.dimension))
+        chemistry_penalty = chemistry_barrier_value(
+            atoms,
+            self.barrier_state,
+            mean_energy,
+            normalisation_mode=(
+                str(getattr(self.config.size_normalisation, "chemistry_barrier_mode", "family_mean"))
+                if norm_enabled else "raw_sum"
+            ),
+        )
         fullspace = self._fullspace_confinement_metrics(atoms)
         fallback_reasons.extend(str(r) for r in fullspace.get("fallback_reasons", []) or [])
         residual_penalty = float(fullspace.get("residual_penalty", 0.0) or 0.0)
         rmsd_penalty = float(fullspace.get("rmsd_penalty", 0.0) or 0.0)
+        movement = self.movement_metrics(atoms) if include_movement else {}
+        movement_score = float(movement.get("movement_utility_score", 0.0) or 0.0)
 
         informativeness_score = (
             self.config.weights.lambda_force * force_risk
             + frequency_contribution
             + self.config.weights.lambda_anharmonic * anh_risk
             + self.config.weights.lambda_energy * energy_risk
+            + movement_score
         )
         risk_penalty_score = (
             self.config.weights.lambda_distance * distance_penalty
@@ -916,6 +1165,44 @@ class SeedLocalAdversarialAcquisition:
                 else float(fullspace["aligned_rmsd_ang"])
             ),
             aligned_rmsd_penalty=float(rmsd_penalty),
+            movement_metric=(
+                None if not movement else str(movement.get("movement_metric"))
+            ),
+            movement_rmsd_ang=(
+                None if not movement else float(movement.get("movement_rmsd_ang"))
+            ),
+            movement_progress_ang=(
+                None if not movement else float(movement.get("movement_progress_ang"))
+            ),
+            movement_band_min_ang=(
+                None if not movement else float(movement.get("movement_band_min_ang"))
+            ),
+            movement_band_low_ang=(
+                None if not movement else float(movement.get("movement_band_low_ang"))
+            ),
+            movement_band_peak_ang=(
+                None if not movement else float(movement.get("movement_band_peak_ang"))
+            ),
+            movement_band_high_ang=(
+                None if not movement else float(movement.get("movement_band_high_ang"))
+            ),
+            movement_band_max_ang=(
+                None if not movement else float(movement.get("movement_band_max_ang"))
+            ),
+            movement_utility_score=float(movement_score),
+            movement_band_score=float(movement.get("movement_band_score", 0.0) or 0.0),
+            movement_progress_score=float(movement.get("movement_progress_score", 0.0) or 0.0),
+            movement_direction_source=(
+                None if not movement else str(movement.get("movement_direction_source"))
+            ),
+            n_effective_movement_atoms=(
+                None
+                if not movement or movement.get("n_effective_movement_atoms") is None
+                else float(movement.get("n_effective_movement_atoms"))
+            ),
+            size_normalisation_mode=(
+                "enabled" if norm_enabled else "disabled"
+            ),
             negative_curvature_penalty=float(negative_curvature_penalty),
             weak_mode_penalty_score=float(weak_mode_penalty_score),
             anharmonic_risk_raw=float(anh_risk_raw),

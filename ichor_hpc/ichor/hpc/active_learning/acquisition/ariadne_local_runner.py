@@ -540,7 +540,7 @@ def _raw_grad_norm_from_scaled(g_scaled, objective_scale: float) -> float:
 
 def _trqn_scale_mode(run_config) -> str:
     mode = str(getattr(run_config, "trqn_scale_mode", "off") or "off").strip().lower()
-    if mode not in {"off", "fixed", "adaptive_initial_gradient"}:
+    if mode not in {"off", "fixed", "adaptive_initial_gradient", "adaptive_initial_gradient_rms"}:
         return "off"
     return mode
 
@@ -566,12 +566,26 @@ def _bounded_objective_scale(run_config, value: float) -> float:
 
 def _compute_trqn_objective_scale(
     run_config,
-    raw_grad_norm: float,
+    raw_gradient,
     *,
     retry: bool = False,
+    atoms=None,
+    under_move_retry: bool = False,
 ) -> Dict[str, Any]:
     mode = _trqn_scale_mode(run_config)
-    raw_norm = float(raw_grad_norm)
+    raw_array = np.asarray(raw_gradient, dtype=float)
+    if raw_array.ndim == 0:
+        raw_norm = float(raw_array)
+        raw_flat = None
+    else:
+        raw_flat = raw_array.reshape(-1)
+        raw_norm = float(np.linalg.norm(raw_flat))
+    raw_rms = None
+    n_live = None
+    n_rigid = None
+    n_effective = None
+    gradient_projected_rigid = False
+    target_kind = "total_norm"
     if mode == "off":
         target = None
         scale = 1.0
@@ -583,7 +597,7 @@ def _compute_trqn_objective_scale(
             float(getattr(run_config, "trqn_fixed_objective_scale", 1.0)),
         )
         reason = "fixed"
-    else:
+    elif mode == "adaptive_initial_gradient":
         attr = (
             "trqn_retry_target_initial_grad_norm"
             if retry else "trqn_target_initial_grad_norm"
@@ -605,16 +619,86 @@ def _compute_trqn_objective_scale(
         else:
             scale = _bounded_objective_scale(run_config, target / raw_norm)
             reason = "adaptive_initial_gradient"
+    else:
+        target_kind = "rms"
+        attr = (
+            "trqn_under_move_target_initial_grad_rms"
+            if under_move_retry
+            else (
+                "trqn_retry_target_initial_grad_rms"
+                if retry else "trqn_target_initial_grad_rms"
+            )
+        )
+        try:
+            target = float(getattr(run_config, attr))
+        except (TypeError, ValueError):
+            target = 6.0e-4 if under_move_retry else (4.0e-4 if retry else 2.0e-4)
+        if not np.isfinite(target) or target <= 0.0:
+            target = 6.0e-4 if under_move_retry else (4.0e-4 if retry else 2.0e-4)
+        if raw_flat is not None and atoms is not None:
+            try:
+                from .rigid_projection import rigid_basis, project_out_rigid
+
+                projected = np.asarray(project_out_rigid(raw_flat.reshape(-1, 3), atoms), dtype=float).reshape(-1)
+                n_live = int(projected.size)
+                n_rigid = int(rigid_basis(atoms).shape[1])
+                n_effective = max(1, int(n_live) - int(n_rigid))
+                raw_rms = float(np.linalg.norm(projected) / np.sqrt(float(n_effective)))
+                gradient_projected_rigid = True
+            except Exception:
+                n_live = int(raw_flat.size)
+                n_effective = max(1, n_live)
+                raw_rms = float(raw_norm / np.sqrt(float(n_effective)))
+        else:
+            n_live = None
+            n_effective = 1
+            raw_rms = raw_norm
+        if not np.isfinite(raw_rms):
+            raise RuntimeError("TRQN initial raw gradient RMS is non-finite")
+        if raw_rms <= 0.0:
+            scale = _bounded_objective_scale(
+                run_config,
+                float(getattr(run_config, "trqn_max_objective_scale", 1.0)),
+            )
+            reason = "zero_initial_gradient_rms"
+        else:
+            scale = _bounded_objective_scale(run_config, target / raw_rms)
+            reason = "adaptive_initial_gradient_rms"
+    try:
+        lower_bound = float(getattr(run_config, "trqn_min_objective_scale", 1.0e-8))
+        upper_bound = float(getattr(run_config, "trqn_max_objective_scale", 1.0))
+    except (TypeError, ValueError):
+        lower_bound, upper_bound = 1.0e-8, 1.0
+    clamped = (
+        np.isfinite(lower_bound)
+        and np.isfinite(upper_bound)
+        and (
+            abs(float(scale) - float(lower_bound)) <= 1.0e-15
+            or abs(float(scale) - float(upper_bound)) <= 1.0e-15
+        )
+    )
     return {
         "mode": mode,
         "scale": float(scale),
         "target": target,
+        "target_kind": target_kind,
         "raw_grad_norm": raw_norm,
+        "raw_grad_rms": raw_rms,
         "scaled_grad_norm": (
             None if not np.isfinite(raw_norm) else float(raw_norm) * float(scale)
         ),
+        "scaled_grad_rms": (
+            None if raw_rms is None or not np.isfinite(raw_rms)
+            else float(raw_rms) * float(scale)
+        ),
+        "n_live_cartesian_dof": n_live,
+        "n_projected_rigid_dof": n_rigid,
+        "n_effective_internal_dof": n_effective,
+        "gradient_projected_rigid": bool(gradient_projected_rigid),
+        "objective_scale_clamped": bool(clamped),
         "reason": reason,
         "retry": bool(retry),
+        "under_move_retry": bool(under_move_retry),
     }
 
 
@@ -1405,6 +1489,41 @@ def run_optimisation_against_calculator(
 
     optimiser_name = (run_config.optimiser or "trust_region_qn").strip().lower()
     diagnostics = _new_optimiser_diagnostics(optimiser_name)
+    warm_start_records = []
+    warm_start_evaluations = 0
+    if bool(getattr(getattr(calculator, "_acq", None), "config", None)):
+        acq = getattr(calculator, "_acq", None)
+        probe_method = getattr(acq, "gradient_band_probe_atoms", None)
+        if callable(probe_method):
+            seed_positions = np.asarray(atoms.get_positions(), dtype=np.float64)
+            best_alpha = None
+            best_positions = None
+            for label, probe_atoms in probe_method():
+                try:
+                    positions = np.asarray(probe_atoms.coordinates, dtype=np.float64)
+                    atoms.set_positions(positions)
+                    f_probe, _ = _eval_energy_gradient(atoms)
+                    alpha_probe = -float(f_probe)
+                    warm_start_evaluations += 1
+                    warm_start_records.append({
+                        "origin": str(label),
+                        "alpha": float(alpha_probe),
+                    })
+                    if best_alpha is None or alpha_probe > best_alpha:
+                        best_alpha = float(alpha_probe)
+                        best_positions = positions.copy()
+                except Exception as exc:
+                    warm_start_records.append({
+                        "origin": str(label),
+                        "error": type(exc).__name__ + ": " + str(exc),
+                    })
+                finally:
+                    atoms.set_positions(seed_positions)
+            if best_positions is not None:
+                atoms.set_positions(best_positions)
+                q0_xyz_angstrom = np.asfortranarray(
+                    atoms.get_positions(), dtype=np.float64,
+                )
 
     # one calculator call before the loop -- ariadne needs an initial
     # energy + gradient to seed its internal hessian model. Evaluate once in
@@ -1422,11 +1541,12 @@ def run_optimisation_against_calculator(
         "reason": "not_trqn",
         "retry": False,
     }
-    n_evaluations = 1
+    n_evaluations = 1 + int(warm_start_evaluations)
     if optimiser_name in ("trust_region_qn", "trqn"):
         trqn_scale_info = _compute_trqn_objective_scale(
             run_config,
-            raw_initial_grad_norm,
+            g0_raw,
+            atoms=atoms,
         )
         active_objective_scale = float(trqn_scale_info["scale"])
     e0_hartree = e0_raw * active_objective_scale
@@ -1452,8 +1572,16 @@ def run_optimisation_against_calculator(
         "trqn_objective_scale": float(trqn_scale_info["scale"]),
         "trqn_scale_reason": str(trqn_scale_info["reason"]),
         "trqn_target_initial_grad_norm": trqn_scale_info["target"],
+        "trqn_scale_target_kind": trqn_scale_info.get("target_kind"),
         "trqn_initial_raw_grad_norm": float(trqn_scale_info["raw_grad_norm"]),
+        "trqn_initial_raw_grad_rms": trqn_scale_info.get("raw_grad_rms"),
         "trqn_initial_scaled_grad_norm": trqn_scale_info["scaled_grad_norm"],
+        "trqn_initial_scaled_grad_rms": trqn_scale_info.get("scaled_grad_rms"),
+        "trqn_n_live_cartesian_dof": trqn_scale_info.get("n_live_cartesian_dof"),
+        "trqn_n_projected_rigid_dof": trqn_scale_info.get("n_projected_rigid_dof"),
+        "trqn_n_effective_internal_dof": trqn_scale_info.get("n_effective_internal_dof"),
+        "trqn_gradient_projected_rigid": trqn_scale_info.get("gradient_projected_rigid"),
+        "trqn_objective_scale_clamped": trqn_scale_info.get("objective_scale_clamped"),
         "trqn_retry_on_no_proposal": bool(
             getattr(run_config, "trqn_retry_on_no_proposal", False)
         ),
@@ -1477,6 +1605,8 @@ def run_optimisation_against_calculator(
         "trqn_retry_reason": None,
         "trqn_retry_succeeded": None,
         "trqn_failed_after_retry": False,
+        "gradient_band_warm_start": bool(warm_start_records),
+        "gradient_band_warm_start_candidates": list(warm_start_records),
     })
 
     _raise_if_init_failed(opt, "DS" if not is_trqn else "TRQN")
@@ -1633,8 +1763,9 @@ def run_optimisation_against_calculator(
                             n_evaluations += 1
                             retry_info = _compute_trqn_objective_scale(
                                 run_config,
-                                float(np.linalg.norm(g_retry_raw)),
+                                g_retry_raw,
                                 retry=True,
+                                atoms=atoms,
                             )
                             active_objective_scale = float(retry_info["scale"])
                             f_current = f_retry_raw * active_objective_scale
@@ -1663,8 +1794,14 @@ def run_optimisation_against_calculator(
                             diagnostics["trqn_retry_raw_grad_norm"] = float(
                                 retry_info["raw_grad_norm"]
                             )
+                            diagnostics["trqn_retry_raw_grad_rms"] = (
+                                retry_info.get("raw_grad_rms")
+                            )
                             diagnostics["trqn_retry_scaled_grad_norm"] = (
                                 retry_info["scaled_grad_norm"]
+                            )
+                            diagnostics["trqn_retry_scaled_grad_rms"] = (
+                                retry_info.get("scaled_grad_rms")
                             )
                             diagnostics["trqn_retry_reason"] = str(
                                 no_proposal_failure_reason

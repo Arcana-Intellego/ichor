@@ -576,10 +576,15 @@ def test_ariadne_block_defaults():
     assert ab.optimiser == "trust_region_qn"
     assert ab.hessian_model == "SCHLEGEL"
     assert ab.fallback_to_ds is True
-    assert ab.trqn_scale_mode == "adaptive_initial_gradient"
+    assert ab.trqn_scale_mode == "adaptive_initial_gradient_rms"
     assert ab.trqn_target_initial_grad_norm == pytest.approx(0.01)
     assert ab.trqn_retry_target_initial_grad_norm == pytest.approx(0.003)
-    assert ab.trqn_min_objective_scale == pytest.approx(1.0e-6)
+    assert ab.trqn_target_initial_grad_rms == pytest.approx(2.0e-4)
+    assert ab.trqn_retry_target_initial_grad_rms == pytest.approx(4.0e-4)
+    assert ab.trqn_under_move_target_initial_grad_rms == pytest.approx(6.0e-4)
+    assert ab.trqn_under_move_retry is True
+    assert ab.trqn_under_move_retry_max == 1
+    assert ab.trqn_min_objective_scale == pytest.approx(1.0e-8)
     assert ab.trqn_max_objective_scale == pytest.approx(1.0)
     assert ab.trqn_fixed_objective_scale == pytest.approx(1.0)
     assert ab.trqn_retry_on_no_proposal is True

@@ -93,9 +93,9 @@ class WeightConfig:
     """Relative weighting of the acquisition terms."""
 
     lambda_force: float = 1.0
-    lambda_frequency: float = 1.5
-    lambda_anharmonic: float = 1.0
-    lambda_energy: float = 0.25
+    lambda_frequency: float = 1.0
+    lambda_anharmonic: float = 0.75
+    lambda_energy: float = 0.15
     lambda_distance: float = 1.0
 
 
@@ -136,6 +136,48 @@ class FullspaceConfinementConfig:
     rmsd_scale_ang: float = 0.50
     min_residual_scale_ang: float = 1.0e-3
     failure_penalty: float = 1.0e6
+
+
+@dataclass(frozen=True)
+class SizeNormalisationConfig:
+    """Controls that keep acquisition terms intensive across system sizes."""
+
+    enabled: bool = True
+    energy_mode: str = "per_sqrt_atom"
+    whitened_distance_mode: str = "per_subspace_dim"
+    chemistry_barrier_mode: str = "family_mean"
+
+
+@dataclass(frozen=True)
+class MovementBandConfig:
+    """Aligned-RMSD movement band used by ARIADNE landing selection."""
+
+    enabled: bool = True
+    metric: str = "aligned_active_rmsd"
+    local_statistic: str = "p25"
+    hard_min_floor_ang: float = 0.010
+    target_low_floor_ang: float = 0.020
+    target_peak_floor_ang: float = 0.035
+    target_high_cap_ang: float = 0.120
+    hard_max_cap_ang: float = 0.180
+    hard_min_fraction: float = 0.10
+    target_low_fraction: float = 0.25
+    target_peak_fraction: float = 0.40
+    target_high_fraction: float = 0.75
+    hard_max_fraction: float = 1.25
+
+
+@dataclass(frozen=True)
+class MovementUtilityConfig:
+    """Bounded directional movement utility around the seed."""
+
+    enabled: bool = True
+    direction: str = "initial_projected_acquisition_gradient"
+    lambda_move: float = 0.75
+    band_fraction: float = 0.75
+    progress_fraction: float = 0.25
+    low_softness_ang: float = 0.005
+    high_softness_ang: float = 0.020
 
 
 @dataclass(frozen=True)
@@ -184,5 +226,8 @@ class AcquisitionConfig:
     spectral: SpectralConfig = SpectralConfig()
     calibrated_energy: CalibratedEnergyConfig = CalibratedEnergyConfig()
     fullspace_confinement: FullspaceConfinementConfig = FullspaceConfinementConfig()
+    size_normalisation: SizeNormalisationConfig = SizeNormalisationConfig()
+    movement_band: MovementBandConfig = MovementBandConfig()
+    movement_utility: MovementUtilityConfig = MovementUtilityConfig()
     gradient: GradientConfig = GradientConfig()
     references: ReferenceScaleConfig = ReferenceScaleConfig()

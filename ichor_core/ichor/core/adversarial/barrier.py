@@ -178,50 +178,108 @@ def chemistry_barrier_value(
     atoms: Atoms,
     barrier_state: ChemistryBarrierState,
     mean_energy: float,
+    *,
+    normalisation_mode: str = "raw_sum",
 ) -> float:
     cfg = barrier_state.config
-    total = 0.0
+    family_mean = str(normalisation_mode or "raw_sum").lower()
+    family_mean = family_mean == "family_mean"
+    clash_terms = []
+    expansion_terms = []
+    bond_terms = []
+    angle_terms = []
 
     for pair, safe_distance in barrier_state.safe_nonbonded.items():
         dist = _pair_distance(atoms, *pair)
-        total += cfg.clash_lambda * _softplus_sq(safe_distance - dist, cfg.clash_delta, cap=cfg.softplus_cap)
+        clash_terms.append(
+            cfg.clash_lambda
+            * _softplus_sq(safe_distance - dist, cfg.clash_delta, cap=cfg.softplus_cap)
+        )
 
     for pair, upper_distance in barrier_state.nonbonded_upper.items():
         dist = _pair_distance(atoms, *pair)
-        total += cfg.nonbonded_expansion_lambda * _softplus_sq(
-            dist - upper_distance,
-            cfg.nonbonded_expansion_delta,
-            cap=cfg.softplus_cap,
+        expansion_terms.append(
+            cfg.nonbonded_expansion_lambda
+            * _softplus_sq(
+                dist - upper_distance,
+                cfg.nonbonded_expansion_delta,
+                cap=cfg.softplus_cap,
+            )
         )
 
     if cfg.use_connectivity_barrier:
         for pair in barrier_state.bonded_pairs:
             dist = _pair_distance(atoms, *pair)
-            total += cfg.bond_lambda * _softplus_sq(barrier_state.bond_lower[pair] - dist, cfg.bond_delta, cap=cfg.softplus_cap)
-            total += cfg.bond_lambda * _softplus_sq(dist - barrier_state.bond_upper[pair], cfg.bond_delta, cap=cfg.softplus_cap)
+            bond_terms.append(
+                cfg.bond_lambda
+                * _softplus_sq(
+                    barrier_state.bond_lower[pair] - dist,
+                    cfg.bond_delta,
+                    cap=cfg.softplus_cap,
+                )
+            )
+            bond_terms.append(
+                cfg.bond_lambda
+                * _softplus_sq(
+                    dist - barrier_state.bond_upper[pair],
+                    cfg.bond_delta,
+                    cap=cfg.softplus_cap,
+                )
+            )
         for angle in barrier_state.angle_lower:
             value = _angle_radians(atoms, *angle)
             if not np.isfinite(value):
-                total += cfg.angle_lambda * _softplus_sq(
-                    np.pi,
+                angle_terms.append(
+                    cfg.angle_lambda
+                    * _softplus_sq(
+                        np.pi,
+                        cfg.angle_delta,
+                        cap=cfg.softplus_cap,
+                    )
+                )
+                continue
+            angle_terms.append(
+                cfg.angle_lambda
+                * _softplus_sq(
+                    barrier_state.angle_lower[angle] - value,
                     cfg.angle_delta,
                     cap=cfg.softplus_cap,
                 )
-                continue
-            total += cfg.angle_lambda * _softplus_sq(
-                barrier_state.angle_lower[angle] - value,
-                cfg.angle_delta,
-                cap=cfg.softplus_cap,
             )
-            total += cfg.angle_lambda * _softplus_sq(
-                value - barrier_state.angle_upper[angle],
-                cfg.angle_delta,
-                cap=cfg.softplus_cap,
+            angle_terms.append(
+                cfg.angle_lambda
+                * _softplus_sq(
+                    value - barrier_state.angle_upper[angle],
+                    cfg.angle_delta,
+                    cap=cfg.softplus_cap,
+                )
             )
 
-    total += cfg.energy_cap_lambda * _softplus_sq(
+    energy_term = cfg.energy_cap_lambda * _softplus_sq(
         mean_energy - barrier_state.seed_energy - barrier_state.energy_cap,
         cfg.energy_cap_delta,
         cap=cfg.softplus_cap,
+    )
+    if not family_mean:
+        total = (
+            float(np.sum(clash_terms))
+            + float(np.sum(expansion_terms))
+            + float(np.sum(bond_terms))
+            + float(np.sum(angle_terms))
+            + float(energy_term)
+        )
+        return float(total)
+
+    def _mean(values) -> float:
+        if not values:
+            return 0.0
+        return float(np.mean(np.asarray(values, dtype=float)))
+
+    total = (
+        _mean(clash_terms)
+        + _mean(expansion_terms)
+        + _mean(bond_terms)
+        + _mean(angle_terms)
+        + float(energy_term)
     )
     return float(total)

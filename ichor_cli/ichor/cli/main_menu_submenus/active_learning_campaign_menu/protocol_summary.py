@@ -43,6 +43,9 @@ def format_sampling_protocol_summary(config: CampaignConfig) -> str:
     spectral = acq.spectral
     energy = acq.calibrated_energy
     fullspace = acq.fullspace_confinement
+    size_norm = acq.size_normalisation
+    movement_band = acq.movement_band
+    movement_utility = acq.movement_utility
     stencils = acq.stencils
     safety = config.adversarial_safety
     gates = config.quality_gates
@@ -119,6 +122,48 @@ def format_sampling_protocol_summary(config: CampaignConfig) -> str:
             fullspace.failure_penalty,
         )
     )
+    lines.append(_line("acquisition.size_normalisation.enabled", size_norm.enabled))
+    lines.append(
+        _line(
+            "acquisition.size_normalisation",
+            "energy="
+            + str(size_norm.energy_mode)
+            + ", whitened="
+            + str(size_norm.whitened_distance_mode)
+            + ", chemistry="
+            + str(size_norm.chemistry_barrier_mode),
+        )
+    )
+    lines.append(_line("acquisition.movement_band.enabled", movement_band.enabled))
+    lines.append(
+        _line(
+            "acquisition.movement_band",
+            "metric="
+            + str(movement_band.metric)
+            + ", local="
+            + str(movement_band.local_statistic)
+            + ", floors/caps="
+            + str(movement_band.hard_min_floor_ang)
+            + "/"
+            + str(movement_band.target_low_floor_ang)
+            + "/"
+            + str(movement_band.target_peak_floor_ang)
+            + "/"
+            + str(movement_band.target_high_cap_ang)
+            + "/"
+            + str(movement_band.hard_max_cap_ang),
+        )
+    )
+    lines.append(_line("acquisition.movement_utility.enabled", movement_utility.enabled))
+    lines.append(
+        _line(
+            "acquisition.movement_utility",
+            "lambda="
+            + str(movement_utility.lambda_move)
+            + ", direction="
+            + str(movement_utility.direction),
+        )
+    )
     lines.append(
         _line(
             "acquisition.stencils.negative_curvature_policy",
@@ -173,8 +218,14 @@ def format_sampling_protocol_summary(config: CampaignConfig) -> str:
             + str(ariadne.trqn_scale_mode)
             + ", target="
             + str(ariadne.trqn_target_initial_grad_norm)
+            + ", target_rms="
+            + str(ariadne.trqn_target_initial_grad_rms)
             + ", retry_target="
             + str(ariadne.trqn_retry_target_initial_grad_norm)
+            + ", retry_target_rms="
+            + str(ariadne.trqn_retry_target_initial_grad_rms)
+            + ", under_move_target_rms="
+            + str(ariadne.trqn_under_move_target_initial_grad_rms)
             + ", scale=["
             + str(ariadne.trqn_min_objective_scale)
             + ", "
@@ -242,6 +293,9 @@ def format_sampling_protocol_summary(config: CampaignConfig) -> str:
     lines.append(
         _line("adversarial_safety.max_whitened_distance", safety.max_whitened_distance)
     )
+    lines.append(_line("adversarial_safety.enforce_movement_band", safety.enforce_movement_band))
+    lines.append(_line("adversarial_safety.under_move_retry", safety.under_move_retry))
+    lines.append(_line("adversarial_safety.reject_over_moved", safety.reject_over_moved))
     lines.append(
         _line(
             "quality_gates.ariadne_max_displacement_ang",

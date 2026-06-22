@@ -184,6 +184,9 @@ FUTURE_SAFE_PREFIXES = {
     "acquisition.spectral.",
     "acquisition.calibrated_energy.",
     "acquisition.fullspace_confinement.",
+    "acquisition.size_normalisation.",
+    "acquisition.movement_band.",
+    "acquisition.movement_utility.",
     "acquisition.gradient.",
     "acquisition.references.",
 }

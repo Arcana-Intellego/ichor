@@ -210,6 +210,46 @@ def active_and_residual_displacement(subspace: LocalSubspace, atoms: Atoms) -> D
     }
 
 
+def active_participation_weights(subspace: LocalSubspace) -> np.ndarray:
+    """Return one non-negative active-subspace participation weight per atom."""
+    basis = np.asarray(subspace.basis, dtype=float)
+    n_atoms = len(subspace.seed_atoms)
+    if basis.shape[0] != 3 * n_atoms or basis.size == 0:
+        return np.ones(n_atoms, dtype=float)
+    per_coord = np.sum(np.square(basis), axis=1)
+    weights = per_coord.reshape(n_atoms, 3).sum(axis=1)
+    if not np.isfinite(weights).all() or float(np.sum(weights)) <= 0.0:
+        return np.ones(n_atoms, dtype=float)
+    return np.asarray(weights, dtype=float)
+
+
+def aligned_active_rmsd(subspace: LocalSubspace, atoms: Atoms) -> float:
+    """Return aligned RMSD weighted by active-subspace atom participation."""
+    disp = aligned_mass_weighted_displacement(subspace.seed_atoms, atoms)
+    masses = np.asarray(subspace.seed_atoms.masses, dtype=float)
+    masses = np.where(np.isfinite(masses) & (masses > 0.0), masses, 1.0)
+    coord_delta = disp.reshape(-1, 3) / np.sqrt(masses)[:, None]
+    weights = active_participation_weights(subspace)
+    denom = float(np.sum(weights))
+    if not np.isfinite(denom) or denom <= 0.0:
+        return float(np.sqrt(np.mean(np.sum(np.square(coord_delta), axis=1))))
+    value = float(np.sum(weights[:, None] * np.square(coord_delta)) / denom)
+    return float(np.sqrt(max(0.0, value)))
+
+
+def aligned_active_displacement(
+    subspace: LocalSubspace,
+    atoms: Atoms,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return aligned coordinate displacement and per-coordinate active weights."""
+    disp = aligned_mass_weighted_displacement(subspace.seed_atoms, atoms)
+    masses = np.asarray(subspace.seed_atoms.masses, dtype=float)
+    masses = np.where(np.isfinite(masses) & (masses > 0.0), masses, 1.0)
+    coord_delta = disp.reshape(-1, 3) / np.sqrt(masses)[:, None]
+    weights = np.repeat(active_participation_weights(subspace), 3)
+    return coord_delta.reshape(-1), weights
+
+
 
 def fullspace_residual_distance(subspace: LocalSubspace, atoms: Atoms) -> float:
     """Return active-subspace-orthogonal displacement in RMSD-like Angstrom units."""

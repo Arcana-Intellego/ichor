@@ -34,6 +34,9 @@ __all__ = [
     "AcquisitionSpectralBlock",
     "AcquisitionCalibratedEnergyBlock",
     "AcquisitionFullspaceConfinementBlock",
+    "AcquisitionSizeNormalisationBlock",
+    "AcquisitionMovementBandBlock",
+    "AcquisitionMovementUtilityBlock",
     "AcquisitionGradientBlock",
     "AcquisitionReferencesBlock",
     "AcquisitionConfigBlock",
@@ -56,6 +59,12 @@ __all__ = [
     "VALID_SPECTRAL_MODES",
     "VALID_CALIBRATED_ENERGY_UTILITIES",
     "VALID_FULLSPACE_RESIDUAL_SCALES",
+    "VALID_SIZE_NORMALISATION_ENERGY_MODES",
+    "VALID_SIZE_NORMALISATION_DISTANCE_MODES",
+    "VALID_SIZE_NORMALISATION_BARRIER_MODES",
+    "VALID_MOVEMENT_BAND_METRICS",
+    "VALID_MOVEMENT_BAND_STATISTICS",
+    "VALID_MOVEMENT_DIRECTIONS",
     "VALID_GAUSSIAN_MEMORY_MODES",
     "VALID_ERROR_CALIBRATION_MODEL_VERSION_POLICIES",
     "VALID_TRQN_SCALE_MODES",
@@ -91,8 +100,22 @@ VALID_ERROR_CALIBRATION_MODEL_VERSION_POLICIES = frozenset({"current", "all"})
 VALID_SPECTRAL_MODES = frozenset({"off", "record_only", "blend"})
 VALID_CALIBRATED_ENERGY_UTILITIES = frozenset({"log", "banded"})
 VALID_FULLSPACE_RESIDUAL_SCALES = frozenset({"local_neighbour_median", "fixed"})
+VALID_SIZE_NORMALISATION_ENERGY_MODES = frozenset({"raw_total", "per_sqrt_atom"})
+VALID_SIZE_NORMALISATION_DISTANCE_MODES = frozenset({"raw", "per_subspace_dim"})
+VALID_SIZE_NORMALISATION_BARRIER_MODES = frozenset({"raw_sum", "family_mean"})
+VALID_MOVEMENT_BAND_METRICS = frozenset({"aligned_active_rmsd", "aligned_global_rmsd"})
+VALID_MOVEMENT_BAND_STATISTICS = frozenset({"p25", "median"})
+VALID_MOVEMENT_DIRECTIONS = frozenset({
+    "initial_projected_acquisition_gradient",
+    "dominant_active_mode",
+})
 VALID_GAUSSIAN_MEMORY_MODES = frozenset({"slurm_env", "link0"})
-VALID_TRQN_SCALE_MODES = frozenset({"off", "fixed", "adaptive_initial_gradient"})
+VALID_TRQN_SCALE_MODES = frozenset({
+    "off",
+    "fixed",
+    "adaptive_initial_gradient",
+    "adaptive_initial_gradient_rms",
+})
 VALID_TRQN_BACKTRANSFORM_MODES = frozenset({"geodesic", "newton"})
 VALID_TRQN_GEODESIC_BT_MODES = frozenset({"dense", "matrix_free"})
 VALID_NEGATIVE_CURVATURE_POLICIES = frozenset({"ignore", "penalise"})
@@ -288,9 +311,9 @@ class AcquisitionStencilsBlock:
 @dataclass
 class AcquisitionWeightsBlock:
     lambda_force: float = 1.0
-    lambda_frequency: float = 1.5
-    lambda_anharmonic: float = 1.0
-    lambda_energy: float = 0.25
+    lambda_frequency: float = 1.0
+    lambda_anharmonic: float = 0.75
+    lambda_energy: float = 0.15
     lambda_distance: float = 1.0
 
 
@@ -328,6 +351,42 @@ class AcquisitionFullspaceConfinementBlock:
 
 
 @dataclass
+class AcquisitionSizeNormalisationBlock:
+    enabled: bool = True
+    energy_mode: str = "per_sqrt_atom"
+    whitened_distance_mode: str = "per_subspace_dim"
+    chemistry_barrier_mode: str = "family_mean"
+
+
+@dataclass
+class AcquisitionMovementBandBlock:
+    enabled: bool = True
+    metric: str = "aligned_active_rmsd"
+    local_statistic: str = "p25"
+    hard_min_floor_ang: float = 0.010
+    target_low_floor_ang: float = 0.020
+    target_peak_floor_ang: float = 0.035
+    target_high_cap_ang: float = 0.120
+    hard_max_cap_ang: float = 0.180
+    hard_min_fraction: float = 0.10
+    target_low_fraction: float = 0.25
+    target_peak_fraction: float = 0.40
+    target_high_fraction: float = 0.75
+    hard_max_fraction: float = 1.25
+
+
+@dataclass
+class AcquisitionMovementUtilityBlock:
+    enabled: bool = True
+    direction: str = "initial_projected_acquisition_gradient"
+    lambda_move: float = 0.75
+    band_fraction: float = 0.75
+    progress_fraction: float = 0.25
+    low_softness_ang: float = 0.005
+    high_softness_ang: float = 0.020
+
+
+@dataclass
 class AcquisitionGradientBlock:
     mode: str = "cartesian_fd"
     cartesian_step: float = 1.0e-4
@@ -357,6 +416,9 @@ class AcquisitionConfigBlock:
     spectral: AcquisitionSpectralBlock = field(default_factory=AcquisitionSpectralBlock)
     calibrated_energy: AcquisitionCalibratedEnergyBlock = field(default_factory=AcquisitionCalibratedEnergyBlock)
     fullspace_confinement: AcquisitionFullspaceConfinementBlock = field(default_factory=AcquisitionFullspaceConfinementBlock)
+    size_normalisation: AcquisitionSizeNormalisationBlock = field(default_factory=AcquisitionSizeNormalisationBlock)
+    movement_band: AcquisitionMovementBandBlock = field(default_factory=AcquisitionMovementBandBlock)
+    movement_utility: AcquisitionMovementUtilityBlock = field(default_factory=AcquisitionMovementUtilityBlock)
     gradient: AcquisitionGradientBlock = field(default_factory=AcquisitionGradientBlock)
     references: AcquisitionReferencesBlock = field(default_factory=AcquisitionReferencesBlock)
 
@@ -471,10 +533,15 @@ class AriadneConfigBlock:
     delta_max: float = 0.40
     gamma: float = 0.10
     fallback_to_ds: bool = True
-    trqn_scale_mode: str = "adaptive_initial_gradient"
+    trqn_scale_mode: str = "adaptive_initial_gradient_rms"
     trqn_target_initial_grad_norm: float = 0.01
     trqn_retry_target_initial_grad_norm: float = 0.003
-    trqn_min_objective_scale: float = 1.0e-6
+    trqn_target_initial_grad_rms: float = 2.0e-4
+    trqn_retry_target_initial_grad_rms: float = 4.0e-4
+    trqn_under_move_target_initial_grad_rms: float = 6.0e-4
+    trqn_under_move_retry: bool = True
+    trqn_under_move_retry_max: int = 1
+    trqn_min_objective_scale: float = 1.0e-8
     trqn_max_objective_scale: float = 1.0
     trqn_fixed_objective_scale: float = 1.0
     trqn_retry_on_no_proposal: bool = True
@@ -502,6 +569,10 @@ class AdversarialSafetyConfigBlock:
     max_energy_variance: Optional[float] = None
     max_chemistry_penalty: Optional[float] = None
     phase_b_filter_enabled: bool = True
+    enforce_movement_band: bool = True
+    under_move_retry: bool = True
+    reject_under_moved_after_retry: bool = True
+    reject_over_moved: bool = True
 
 
 @dataclass
@@ -1053,6 +1124,10 @@ class CampaignConfig:
             "adversarial_safety.allow_seed_fallback",
             "adversarial_safety.enforce_min_whitened_distance",
             "adversarial_safety.phase_b_filter_enabled",
+            "adversarial_safety.enforce_movement_band",
+            "adversarial_safety.under_move_retry",
+            "adversarial_safety.reject_under_moved_after_retry",
+            "adversarial_safety.reject_over_moved",
         ):
             block, field_name = bool_name.split(".", 1)
             value = getattr(getattr(self, block), field_name)
@@ -1157,6 +1232,18 @@ class CampaignConfig:
                 "ariadne.trqn_retry_target_initial_grad_norm",
                 ariadne.trqn_retry_target_initial_grad_norm,
             ),
+            (
+                "ariadne.trqn_target_initial_grad_rms",
+                ariadne.trqn_target_initial_grad_rms,
+            ),
+            (
+                "ariadne.trqn_retry_target_initial_grad_rms",
+                ariadne.trqn_retry_target_initial_grad_rms,
+            ),
+            (
+                "ariadne.trqn_under_move_target_initial_grad_rms",
+                ariadne.trqn_under_move_target_initial_grad_rms,
+            ),
             ("ariadne.trqn_min_objective_scale", ariadne.trqn_min_objective_scale),
             ("ariadne.trqn_max_objective_scale", ariadne.trqn_max_objective_scale),
             ("ariadne.trqn_fixed_objective_scale", ariadne.trqn_fixed_objective_scale),
@@ -1172,6 +1259,10 @@ class CampaignConfig:
         _validate_positive_int(
             "ariadne.trqn_max_backtransform_iter",
             ariadne.trqn_max_backtransform_iter,
+        )
+        _validate_nonnegative_int(
+            "ariadne.trqn_under_move_retry_max",
+            ariadne.trqn_under_move_retry_max,
         )
         if (
             float(ariadne.trqn_retry_target_initial_grad_norm)
@@ -1204,6 +1295,10 @@ class CampaignConfig:
         if not isinstance(ariadne.trqn_retry_on_no_proposal, bool):
             raise ConfigValidationError(
                 "ariadne.trqn_retry_on_no_proposal must be a boolean"
+            )
+        if not isinstance(ariadne.trqn_under_move_retry, bool):
+            raise ConfigValidationError(
+                "ariadne.trqn_under_move_retry must be a boolean"
             )
         if str(ariadne.trqn_backtransform_mode) not in VALID_TRQN_BACKTRANSFORM_MODES:
             raise ConfigValidationError(
@@ -1397,6 +1492,90 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "acquisition.fullspace_confinement.failure_penalty must be > 0"
             )
+        norm = self.acquisition.size_normalisation
+        if not isinstance(norm.enabled, bool):
+            raise ConfigValidationError(
+                "acquisition.size_normalisation.enabled must be a boolean"
+            )
+        if norm.energy_mode not in VALID_SIZE_NORMALISATION_ENERGY_MODES:
+            raise ConfigValidationError(
+                "acquisition.size_normalisation.energy_mode must be one of "
+                + repr(sorted(VALID_SIZE_NORMALISATION_ENERGY_MODES))
+            )
+        if norm.whitened_distance_mode not in VALID_SIZE_NORMALISATION_DISTANCE_MODES:
+            raise ConfigValidationError(
+                "acquisition.size_normalisation.whitened_distance_mode must be one of "
+                + repr(sorted(VALID_SIZE_NORMALISATION_DISTANCE_MODES))
+            )
+        if norm.chemistry_barrier_mode not in VALID_SIZE_NORMALISATION_BARRIER_MODES:
+            raise ConfigValidationError(
+                "acquisition.size_normalisation.chemistry_barrier_mode must be one of "
+                + repr(sorted(VALID_SIZE_NORMALISATION_BARRIER_MODES))
+            )
+        move_band = self.acquisition.movement_band
+        if not isinstance(move_band.enabled, bool):
+            raise ConfigValidationError(
+                "acquisition.movement_band.enabled must be a boolean"
+            )
+        if move_band.metric not in VALID_MOVEMENT_BAND_METRICS:
+            raise ConfigValidationError(
+                "acquisition.movement_band.metric must be one of "
+                + repr(sorted(VALID_MOVEMENT_BAND_METRICS))
+            )
+        if move_band.local_statistic not in VALID_MOVEMENT_BAND_STATISTICS:
+            raise ConfigValidationError(
+                "acquisition.movement_band.local_statistic must be one of "
+                + repr(sorted(VALID_MOVEMENT_BAND_STATISTICS))
+            )
+        for name, value in (
+            ("acquisition.movement_band.hard_min_floor_ang", move_band.hard_min_floor_ang),
+            ("acquisition.movement_band.target_low_floor_ang", move_band.target_low_floor_ang),
+            ("acquisition.movement_band.target_peak_floor_ang", move_band.target_peak_floor_ang),
+            ("acquisition.movement_band.target_high_cap_ang", move_band.target_high_cap_ang),
+            ("acquisition.movement_band.hard_max_cap_ang", move_band.hard_max_cap_ang),
+            ("acquisition.movement_band.hard_min_fraction", move_band.hard_min_fraction),
+            ("acquisition.movement_band.target_low_fraction", move_band.target_low_fraction),
+            ("acquisition.movement_band.target_peak_fraction", move_band.target_peak_fraction),
+            ("acquisition.movement_band.target_high_fraction", move_band.target_high_fraction),
+            ("acquisition.movement_band.hard_max_fraction", move_band.hard_max_fraction),
+        ):
+            _validate_optional_nonnegative_float(name, value)
+        if not (
+            float(move_band.hard_min_floor_ang)
+            < float(move_band.target_low_floor_ang)
+            < float(move_band.target_peak_floor_ang)
+            < float(move_band.target_high_cap_ang)
+            < float(move_band.hard_max_cap_ang)
+        ):
+            raise ConfigValidationError(
+                "acquisition.movement_band floor/cap Angstrom values must be strictly ordered"
+            )
+        move_util = self.acquisition.movement_utility
+        if not isinstance(move_util.enabled, bool):
+            raise ConfigValidationError(
+                "acquisition.movement_utility.enabled must be a boolean"
+            )
+        if move_util.direction not in VALID_MOVEMENT_DIRECTIONS:
+            raise ConfigValidationError(
+                "acquisition.movement_utility.direction must be one of "
+                + repr(sorted(VALID_MOVEMENT_DIRECTIONS))
+            )
+        for name, value in (
+            ("acquisition.movement_utility.lambda_move", move_util.lambda_move),
+            ("acquisition.movement_utility.band_fraction", move_util.band_fraction),
+            ("acquisition.movement_utility.progress_fraction", move_util.progress_fraction),
+            ("acquisition.movement_utility.low_softness_ang", move_util.low_softness_ang),
+            ("acquisition.movement_utility.high_softness_ang", move_util.high_softness_ang),
+        ):
+            _validate_optional_nonnegative_float(name, value)
+        if float(move_util.low_softness_ang) <= 0.0:
+            raise ConfigValidationError(
+                "acquisition.movement_utility.low_softness_ang must be > 0"
+            )
+        if float(move_util.high_softness_ang) <= 0.0:
+            raise ConfigValidationError(
+                "acquisition.movement_utility.high_softness_ang must be > 0"
+            )
         stencils = self.acquisition.stencils
         if stencils.negative_curvature_policy not in VALID_NEGATIVE_CURVATURE_POLICIES:
             raise ConfigValidationError(
@@ -1504,7 +1683,10 @@ class CampaignConfig:
             CalibratedEnergyConfig,
             FullspaceConfinementConfig,
             GradientConfig,
+            MovementBandConfig,
+            MovementUtilityConfig,
             ReferenceScaleConfig,
+            SizeNormalisationConfig,
             SpectralConfig,
             StencilConfig,
             SubspaceConfig,
@@ -1517,6 +1699,9 @@ class CampaignConfig:
         sp = self.acquisition.spectral
         ce = self.acquisition.calibrated_energy
         fs = self.acquisition.fullspace_confinement
+        sn = self.acquisition.size_normalisation
+        mb = self.acquisition.movement_band
+        mu = self.acquisition.movement_utility
         gr = self.acquisition.gradient
         re = self.acquisition.references
         return AcquisitionConfig(
@@ -1608,6 +1793,36 @@ class CampaignConfig:
                 min_residual_scale_ang=fs.min_residual_scale_ang,
                 failure_penalty=fs.failure_penalty,
             ),
+            size_normalisation=SizeNormalisationConfig(
+                enabled=sn.enabled,
+                energy_mode=sn.energy_mode,
+                whitened_distance_mode=sn.whitened_distance_mode,
+                chemistry_barrier_mode=sn.chemistry_barrier_mode,
+            ),
+            movement_band=MovementBandConfig(
+                enabled=mb.enabled,
+                metric=mb.metric,
+                local_statistic=mb.local_statistic,
+                hard_min_floor_ang=mb.hard_min_floor_ang,
+                target_low_floor_ang=mb.target_low_floor_ang,
+                target_peak_floor_ang=mb.target_peak_floor_ang,
+                target_high_cap_ang=mb.target_high_cap_ang,
+                hard_max_cap_ang=mb.hard_max_cap_ang,
+                hard_min_fraction=mb.hard_min_fraction,
+                target_low_fraction=mb.target_low_fraction,
+                target_peak_fraction=mb.target_peak_fraction,
+                target_high_fraction=mb.target_high_fraction,
+                hard_max_fraction=mb.hard_max_fraction,
+            ),
+            movement_utility=MovementUtilityConfig(
+                enabled=mu.enabled,
+                direction=mu.direction,
+                lambda_move=mu.lambda_move,
+                band_fraction=mu.band_fraction,
+                progress_fraction=mu.progress_fraction,
+                low_softness_ang=mu.low_softness_ang,
+                high_softness_ang=mu.high_softness_ang,
+            ),
             gradient=GradientConfig(
                 mode=gr.mode,
                 cartesian_step=gr.cartesian_step,
@@ -1641,6 +1856,11 @@ class CampaignConfig:
             trqn_scale_mode=a.trqn_scale_mode,
             trqn_target_initial_grad_norm=a.trqn_target_initial_grad_norm,
             trqn_retry_target_initial_grad_norm=a.trqn_retry_target_initial_grad_norm,
+            trqn_target_initial_grad_rms=a.trqn_target_initial_grad_rms,
+            trqn_retry_target_initial_grad_rms=a.trqn_retry_target_initial_grad_rms,
+            trqn_under_move_target_initial_grad_rms=a.trqn_under_move_target_initial_grad_rms,
+            trqn_under_move_retry=a.trqn_under_move_retry,
+            trqn_under_move_retry_max=a.trqn_under_move_retry_max,
             trqn_min_objective_scale=a.trqn_min_objective_scale,
             trqn_max_objective_scale=a.trqn_max_objective_scale,
             trqn_fixed_objective_scale=a.trqn_fixed_objective_scale,
