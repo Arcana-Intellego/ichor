@@ -174,13 +174,14 @@ def build_chemistry_barrier_state(
 
 
 
-def chemistry_barrier_value(
+def chemistry_barrier_components(
     atoms: Atoms,
     barrier_state: ChemistryBarrierState,
     mean_energy: float,
     *,
     normalisation_mode: str = "raw_sum",
-) -> float:
+    include_angles: bool = True,
+) -> Dict[str, float]:
     cfg = barrier_state.config
     family_mean = str(normalisation_mode or "raw_sum").lower()
     family_mean = family_mean == "family_mean"
@@ -226,60 +227,69 @@ def chemistry_barrier_value(
                     cap=cfg.softplus_cap,
                 )
             )
-        for angle in barrier_state.angle_lower:
-            value = _angle_radians(atoms, *angle)
-            if not np.isfinite(value):
+        if include_angles:
+            for angle in barrier_state.angle_lower:
+                value = _angle_radians(atoms, *angle)
+                if not np.isfinite(value):
+                    angle_terms.append(
+                        cfg.angle_lambda
+                        * _softplus_sq(
+                            np.pi,
+                            cfg.angle_delta,
+                            cap=cfg.softplus_cap,
+                        )
+                    )
+                    continue
                 angle_terms.append(
                     cfg.angle_lambda
                     * _softplus_sq(
-                        np.pi,
+                        barrier_state.angle_lower[angle] - value,
                         cfg.angle_delta,
                         cap=cfg.softplus_cap,
                     )
                 )
-                continue
-            angle_terms.append(
-                cfg.angle_lambda
-                * _softplus_sq(
-                    barrier_state.angle_lower[angle] - value,
-                    cfg.angle_delta,
-                    cap=cfg.softplus_cap,
+                angle_terms.append(
+                    cfg.angle_lambda
+                    * _softplus_sq(
+                        value - barrier_state.angle_upper[angle],
+                        cfg.angle_delta,
+                        cap=cfg.softplus_cap,
+                    )
                 )
-            )
-            angle_terms.append(
-                cfg.angle_lambda
-                * _softplus_sq(
-                    value - barrier_state.angle_upper[angle],
-                    cfg.angle_delta,
-                    cap=cfg.softplus_cap,
-                )
-            )
 
     energy_term = cfg.energy_cap_lambda * _softplus_sq(
         mean_energy - barrier_state.seed_energy - barrier_state.energy_cap,
         cfg.energy_cap_delta,
         cap=cfg.softplus_cap,
     )
-    if not family_mean:
-        total = (
-            float(np.sum(clash_terms))
-            + float(np.sum(expansion_terms))
-            + float(np.sum(bond_terms))
-            + float(np.sum(angle_terms))
-            + float(energy_term)
-        )
-        return float(total)
-
     def _mean(values) -> float:
         if not values:
             return 0.0
         return float(np.mean(np.asarray(values, dtype=float)))
 
-    total = (
-        _mean(clash_terms)
-        + _mean(expansion_terms)
-        + _mean(bond_terms)
-        + _mean(angle_terms)
-        + float(energy_term)
+    reducer = _mean if family_mean else lambda values: float(np.sum(values))
+    return {
+        "clash": float(reducer(clash_terms)),
+        "nonbonded_expansion": float(reducer(expansion_terms)),
+        "bond": float(reducer(bond_terms)),
+        "angle": float(reducer(angle_terms)),
+        "energy_cap": float(energy_term),
+    }
+
+
+def chemistry_barrier_value(
+    atoms: Atoms,
+    barrier_state: ChemistryBarrierState,
+    mean_energy: float,
+    *,
+    normalisation_mode: str = "raw_sum",
+    include_angles: bool = True,
+) -> float:
+    components = chemistry_barrier_components(
+        atoms,
+        barrier_state,
+        mean_energy,
+        normalisation_mode=normalisation_mode,
+        include_angles=include_angles,
     )
-    return float(total)
+    return float(sum(float(value) for value in components.values()))

@@ -1334,6 +1334,9 @@ class SeedLocalAdversarialAcquisition:
             == "per_subspace_dim"
         ):
             distance_penalty = float(distance_penalty) / max(1, int(self.subspace.dimension))
+        include_chemistry_angles = str(getattr(cfg, "gradient_backend", "fd")) != "hybrid_geometry"
+        if not include_chemistry_angles:
+            fallback_reasons.append("cheap_driver_hybrid_omits_angle_barrier")
         chemistry_penalty = chemistry_barrier_value(
             atoms,
             self.barrier_state,
@@ -1342,6 +1345,7 @@ class SeedLocalAdversarialAcquisition:
                 str(getattr(self.config.size_normalisation, "chemistry_barrier_mode", "family_mean"))
                 if norm_enabled else "raw_sum"
             ),
+            include_angles=include_chemistry_angles,
         )
         fullspace = self._fullspace_confinement_metrics(atoms)
         fallback_reasons.extend(str(r) for r in fullspace.get("fallback_reasons", []) or [])

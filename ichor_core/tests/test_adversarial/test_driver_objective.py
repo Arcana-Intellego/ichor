@@ -1,5 +1,8 @@
+from types import SimpleNamespace
+
 import numpy as np
 
+import ichor.core.adversarial.acquisition as acquisition_mod
 from ichor.core.adversarial.acquisition import (
     AcquisitionBreakdown,
     SeedLocalAdversarialAcquisition,
@@ -146,3 +149,92 @@ def test_whitened_distance_gradient_uses_value_regularisation_scale():
         acq.subspace.active_covariance + reg * np.eye(3)
     ) @ disp
     np.testing.assert_allclose(out.reshape(-1), expected)
+
+
+def _minimal_real_component_acq(driver_backend="fd"):
+    acq = SeedLocalAdversarialAcquisition.__new__(SeedLocalAdversarialAcquisition)
+    acq.config = AcquisitionConfig(
+        driver=DriverConfig(gradient_backend=driver_backend),
+    )
+    acq.posterior = SimpleNamespace(
+        mean=lambda atoms: 0.0,
+        variance=lambda atoms: 1.0,
+    )
+    acq.error_calibration_model = None
+    acq.error_calibration_apply_strength = 0.0
+    acq.reference_scales = {
+        "energy": 1.0,
+        "force": 1.0,
+        "omega": 1.0,
+        "anh": 1.0,
+        "anh_std": 1.0,
+        "spectral": 1.0,
+    }
+    acq.subspace = SimpleNamespace(dimension=1)
+    acq.barrier_state = object()
+    acq._fullspace_confinement_metrics = lambda atoms: {
+        "residual_distance": 0.0,
+        "residual_penalty": 0.0,
+        "aligned_rmsd_ang": 0.0,
+        "rmsd_penalty": 0.0,
+        "fallback_reasons": [],
+    }
+    acq.movement_metrics = lambda atoms: {}
+    acq._mode_metrics = lambda atoms, mean_energy=None: ()
+    acq._effective_mode_weights = lambda mode_evals: ()
+    acq._spectral_mode_weights = lambda mode_evals: ()
+    acq._negative_curvature_penalty = lambda mode_evals, weights: 0.0
+    return acq
+
+
+def test_driver_components_keep_angle_barrier_for_fd_backend(monkeypatch):
+    calls = []
+
+    def fake_barrier(*args, include_angles=True, **kwargs):
+        calls.append(include_angles)
+        return 2.0 if include_angles else 1.0
+
+    monkeypatch.setattr(acquisition_mod, "chemistry_barrier_value", fake_barrier)
+    monkeypatch.setattr(acquisition_mod, "whitened_distance_squared", lambda *args: 0.0)
+    acq = _minimal_real_component_acq(driver_backend="fd")
+
+    out = acq._driver_components(_water_like(), include_movement=False)
+
+    assert calls == [True]
+    assert out.chemistry_penalty == 2.0
+    assert "cheap_driver_hybrid_omits_angle_barrier" not in out.fallback_reasons
+
+
+def test_driver_components_omit_angle_barrier_for_hybrid_backend(monkeypatch):
+    calls = []
+
+    def fake_barrier(*args, include_angles=True, **kwargs):
+        calls.append(include_angles)
+        return 2.0 if include_angles else 1.0
+
+    monkeypatch.setattr(acquisition_mod, "chemistry_barrier_value", fake_barrier)
+    monkeypatch.setattr(acquisition_mod, "whitened_distance_squared", lambda *args: 0.0)
+    acq = _minimal_real_component_acq(driver_backend="hybrid_geometry")
+
+    out = acq._driver_components(_water_like(), include_movement=False)
+
+    assert calls == [False]
+    assert out.chemistry_penalty == 1.0
+    assert "cheap_driver_hybrid_omits_angle_barrier" in out.fallback_reasons
+
+
+def test_full_components_always_keep_angle_barrier(monkeypatch):
+    calls = []
+
+    def fake_barrier(*args, include_angles=True, **kwargs):
+        calls.append(include_angles)
+        return 2.0 if include_angles else 1.0
+
+    monkeypatch.setattr(acquisition_mod, "chemistry_barrier_value", fake_barrier)
+    monkeypatch.setattr(acquisition_mod, "whitened_distance_squared", lambda *args: 0.0)
+    acq = _minimal_real_component_acq(driver_backend="hybrid_geometry")
+
+    out = acq.components(_water_like(), include_movement=False, objective="full")
+
+    assert calls == [True]
+    assert out.chemistry_penalty == 2.0
