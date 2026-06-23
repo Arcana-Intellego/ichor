@@ -330,6 +330,15 @@ class TotalEnergyPosterior:
         self._diagnostic_add("n_covariance_matrix_batched_calls")
         n = len(points)
         feats = [self._features(p) for p in points]
+        return self._covariance_matrix_batched_from_features(feats, n=n)
+
+    def _covariance_matrix_batched_from_features(
+        self,
+        feats: Sequence[Mapping[str, np.ndarray]],
+        *,
+        n: Optional[int] = None,
+    ) -> np.ndarray:
+        n = len(feats) if n is None else int(n)
         total_cov = np.zeros((n, n), dtype=float)
         for atom, model in self._property_models.items():
             X = self._stack_feature_rows(feats, atom)
@@ -429,6 +438,15 @@ class TotalEnergyPosterior:
         self._diagnostic_add("n_means_batched_calls")
         n = len(points)
         feats = [self._features(p) for p in points]
+        return self._means_batched_from_features(feats, n=n)
+
+    def _means_batched_from_features(
+        self,
+        feats: Sequence[Mapping[str, np.ndarray]],
+        *,
+        n: Optional[int] = None,
+    ) -> np.ndarray:
+        n = len(feats) if n is None else int(n)
         total = np.zeros(n, dtype=float)
         for atom, model in self._property_models.items():
             X = self._stack_feature_rows(feats, atom)
@@ -470,3 +488,45 @@ class TotalEnergyPosterior:
         except Exception:
             self._diagnostic_add("n_means_scalar_fallbacks")
             return self._means_scalar(points)
+
+    def means_and_covariance_matrix(
+        self,
+        points: Sequence[GeometryInput],
+        *,
+        chunk_size: Optional[int] = None,
+        prefer_batched: bool = True,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return posterior means and covariance using one feature extraction pass.
+
+        Fused directional stencils need both moments for the same small set of
+        geometries. This helper preserves the existing public means() and
+        covariance_matrix() methods while avoiding duplicate ALF feature work.
+        """
+        n = len(points)
+        if n == 0:
+            return np.zeros(0, dtype=float), np.zeros((0, 0), dtype=float)
+        if chunk_size is not None and int(chunk_size) > 0 and n > int(chunk_size):
+            means_chunks = []
+            cov = self.covariance_matrix(points, chunk_size=chunk_size, prefer_batched=prefer_batched)
+            for i in range(0, n, int(chunk_size)):
+                means_chunk, _cov_chunk = self.means_and_covariance_matrix(
+                    points[i:i + int(chunk_size)],
+                    chunk_size=None,
+                    prefer_batched=prefer_batched,
+                )
+                means_chunks.append(means_chunk)
+            means = np.concatenate(means_chunks) if means_chunks else np.zeros(0, dtype=float)
+            return _check_finite_array(means, "posterior means"), cov
+        if not prefer_batched:
+            return self._means_scalar(points), self._covariance_matrix_scalar(points)
+        try:
+            self._diagnostic_add("n_means_batched_calls")
+            self._diagnostic_add("n_covariance_matrix_batched_calls")
+            feats = [self._features(p) for p in points]
+            means = self._means_batched_from_features(feats, n=n)
+            cov = self._covariance_matrix_batched_from_features(feats, n=n)
+            return means, cov
+        except Exception:
+            self._diagnostic_add("n_means_scalar_fallbacks")
+            self._diagnostic_add("n_covariance_matrix_scalar_fallbacks")
+            return self._means_scalar(points), self._covariance_matrix_scalar(points)

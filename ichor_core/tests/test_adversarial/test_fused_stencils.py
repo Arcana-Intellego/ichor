@@ -14,6 +14,7 @@ class _PolynomialPosterior:
     def __init__(self):
         self.n_means_calls = 0
         self.n_covariance_calls = 0
+        self.n_moments_calls = 0
 
     def means(self, points):
         self.n_means_calls += 1
@@ -33,6 +34,10 @@ class _PolynomialPosterior:
         cov = np.exp(-(delta**2) / 0.7)
         cov += np.eye(len(points), dtype=float) * 0.05
         return cov
+
+    def means_and_covariance_matrix(self, points):
+        self.n_moments_calls += 1
+        return self.means(points), self.covariance_matrix(points)
 
 
 def _atoms():
@@ -91,6 +96,7 @@ def test_directional_all_stencils_reuses_one_posterior_block():
 
     bundle = directional_all_stencils(posterior, _atoms(), _direction(), step=0.17)
 
+    assert posterior.n_moments_calls == 1
     assert posterior.n_means_calls == 1
     assert posterior.n_covariance_calls == 1
     assert bundle.means.shape == (5,)

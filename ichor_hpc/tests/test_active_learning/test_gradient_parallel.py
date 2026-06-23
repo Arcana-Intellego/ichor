@@ -1,6 +1,7 @@
 """The parallel acquisition-gradient driver must be numerically identical to
 the serial loop, on every backend. Process uses real fork on Linux and falls
 back to serial here on Windows -- either way it must match."""
+import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -8,6 +9,8 @@ import numpy as np
 from ichor.core.atoms import Atom, Atoms
 from ichor.core.adversarial.acquisition import SeedLocalAdversarialAcquisition
 from ichor.hpc.active_learning.acquisition.parallel_gradient import (
+    _THREAD_ENV_NAMES,
+    _capped_worker_thread_env,
     compute_active_gradient,
     compute_cartesian_gradient,
     inside_gradient_worker,
@@ -109,6 +112,18 @@ def test_disable_gradient_mp_forces_active_serial(monkeypatch):
 
     assert diag["gradient_backend"] == "serial"
     assert diag["parallel_fallback_reason"] == "disabled_by_environment"
+
+
+def test_worker_thread_env_cap_overrides_and_restores_parent(monkeypatch):
+    for name in _THREAD_ENV_NAMES:
+        monkeypatch.setenv(name, "8")
+
+    with _capped_worker_thread_env():
+        for name in _THREAD_ENV_NAMES:
+            assert os.environ[name] == "1"
+
+    for name in _THREAD_ENV_NAMES:
+        assert os.environ[name] == "8"
 
 
 def test_nested_gradient_worker_guard_forces_active_serial(monkeypatch):

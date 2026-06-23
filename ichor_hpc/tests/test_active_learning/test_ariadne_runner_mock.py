@@ -16,6 +16,7 @@ from ichor.hpc.active_learning.acquisition.ariadne_runner import (
     ariadne_result_usability_payload,
     optimise_seed,
 )
+from ichor.hpc.active_learning.acquisition import ariadne_runner
 
 
 def _water() -> Atoms:
@@ -204,6 +205,62 @@ def test_to_dict_includes_optional_gradient_diagnostics():
     assert d["gradient_diagnostics"]["gradient_mode"] == "active_fd"
     assert d["gradient_diagnostics"]["gradient_call_count"] == 3
     json.dumps(d)
+
+
+def test_safe_landing_improvement_compares_full_alpha_to_full_initial(monkeypatch):
+    seed = _water()
+    raw = _water()
+    raw[0].coordinates = np.array([11.0, 0.0, 0.0], dtype=float)
+
+    class _FakePosterior:
+        def mean(self, atoms):
+            return 0.0
+
+    class _FakeAcquisition:
+        posterior = _FakePosterior()
+
+        def components(self, atoms, objective="full"):
+            return type("Breakdown", (), {"total": 10.0})()
+
+    def fake_evaluate(**kwargs):
+        coords = np.asarray(kwargs["coords"], dtype=float)
+        atoms = Atoms([Atom("H", float(coords[0, 0]), 0.0, 0.0)])
+        alpha_full = float(coords[0, 0])
+        return {
+            "candidate_index": int(kwargs["candidate_index"]),
+            "origin": str(kwargs["origin"]),
+            "atoms": atoms,
+            "alpha": alpha_full,
+            "alpha_full": alpha_full,
+            "alpha_driver": kwargs.get("alpha"),
+            "grad_norm": None,
+            "accepted": True,
+            "reasons": [],
+            "record_only_reasons": [],
+            "metrics": {"total_score": alpha_full},
+        }
+
+    monkeypatch.setattr(ariadne_runner, "_evaluate_landing_candidate", fake_evaluate)
+
+    landing = ariadne_runner._select_safe_landing(
+        acquisition=_FakeAcquisition(),
+        seed_atoms=seed,
+        raw_final_atoms=raw,
+        opt_candidate_positions=[np.array([[11.0, 0.0, 0.0]], dtype=float)],
+        opt_candidate_alphas=[100.0],
+        opt_candidate_grad_norms=[1.0],
+        opt_candidate_origins=["accepted_iterate"],
+        alpha_trajectory=[100.0, 90.0],
+        full_initial_alpha=10.0,
+        safety_config=type("Safety", (), {"enabled": True, "salvage_safe_iterate": True})(),
+        quality_gates=object(),
+    )
+
+    assert landing["landing_safety"]["accepted"] is True
+    metrics = landing["landing_safety"]["metrics"]
+    assert metrics["alpha_full_initial"] == 10.0
+    assert metrics["alpha_driver_initial"] == 100.0
+    assert metrics["selected_improves_acquisition"] is True
 
 
 def test_safe_max_iteration_result_is_task_usable():

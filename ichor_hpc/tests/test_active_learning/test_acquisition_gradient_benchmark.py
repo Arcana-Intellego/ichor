@@ -30,11 +30,11 @@ class _FakeAcquisition:
             "n_covariance_matrix_batched_calls": 0,
         })
 
-    def components(self, atoms):
+    def components(self, atoms, objective="full"):
         self.posterior.diagnostics["n_means_batched_calls"] += 1
         return SimpleNamespace(total=0.0)
 
-    def gradient(self, atoms, mode=None):
+    def gradient(self, atoms, mode=None, objective="full"):
         self.posterior.diagnostics["n_covariance_matrix_batched_calls"] += 1
         if mode == "active_fd":
             return np.array([[0.0, 1.0, 0.0]], dtype=float)
@@ -106,7 +106,7 @@ def test_run_benchmark_uses_context_and_reports_mode_comparison(monkeypatch, tmp
     monkeypatch.setattr(
         bench,
         "_build_acquisition",
-        lambda context, mode: _FakeAcquisition(mode),
+        lambda context, mode, **kwargs: _FakeAcquisition(mode),
     )
 
     payload = bench.run_benchmark(
@@ -121,6 +121,8 @@ def test_run_benchmark_uses_context_and_reports_mode_comparison(monkeypatch, tmp
     assert payload["models_version"] == 7
     assert payload["seed_frame_id"] == 12
     assert len(payload["runs"]) == 4
+    assert payload["gradient_backend"] == "direct"
+    assert payload["objective"] == "full"
     assert {
         row["gradient_mode"] for row in payload["runs"]
     } == {"cartesian_fd", "active_fd"}
@@ -132,10 +134,11 @@ def test_run_benchmark_uses_context_and_reports_mode_comparison(monkeypatch, tmp
 
 def test_main_writes_json_payload(monkeypatch, tmp_path, capsys):
     output = tmp_path / "bench.json"
-    monkeypatch.setattr(
-        bench,
-        "run_benchmark",
-        lambda **kwargs: {
+    captured = {}
+
+    def fake_run_benchmark(**kwargs):
+        captured.update(kwargs)
+        return {
             "schema_version": 1,
             "runs": [{
                 "gradient_mode": "active_fd",
@@ -143,9 +146,16 @@ def test_main_writes_json_payload(monkeypatch, tmp_path, capsys):
                 "wall_seconds": 0.25,
                 "grad_norm": 1.0,
                 "n_estimated_acquisition_value_calls": 2,
+                "gradient_backend": kwargs["gradient_backend"],
+                "objective": kwargs["objective"],
             }],
             "comparisons": {},
-        },
+        }
+
+    monkeypatch.setattr(
+        bench,
+        "run_benchmark",
+        fake_run_benchmark,
     )
 
     rc = bench.main([
@@ -157,12 +167,23 @@ def test_main_writes_json_payload(monkeypatch, tmp_path, capsys):
         "0",
         "--gradient-mode",
         "active_fd",
+        "--gradient-backend",
+        "process",
+        "--objective",
+        "cheap_driver",
+        "--driver-gradient-backend",
+        "hybrid_geometry",
+        "--workers",
+        "3",
         "--json",
         str(output),
     ])
 
     assert rc == 0
+    assert captured["gradient_backend"] == "process"
+    assert captured["objective"] == "cheap_driver"
+    assert captured["driver_gradient_backend"] == "hybrid_geometry"
+    assert captured["workers"] == 3
     assert output.is_file()
     assert json.loads(output.read_text(encoding="utf-8"))["schema_version"] == 1
     assert "active_fd" in capsys.readouterr().out
-

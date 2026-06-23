@@ -140,6 +140,7 @@ def flatten_trace_gradient_diagnostics(data: Mapping[str, Any]) -> Dict[str, Any
         "driver_gradient_backend",
         "driver_gradient_mode",
         "driver_gradient_fallback",
+        "driver_gradient_fallback_reason",
         "workers_requested",
         "workers_used",
         "inside_gradient_worker",

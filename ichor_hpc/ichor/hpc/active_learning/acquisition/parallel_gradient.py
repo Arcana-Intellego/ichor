@@ -10,6 +10,7 @@ loop, just faster. Off-cluster (no fork available) it falls back to serial.
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 
 import numpy as np
 
@@ -24,6 +25,13 @@ _WORKER_ACTIVE_DIRECTIONS = None
 _WORKER_OBJECTIVE = "full"
 _INSIDE_GRADIENT_WORKER = False
 _LAST_GRADIENT_PARALLEL_DIAGNOSTICS = {}
+_THREAD_ENV_NAMES = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+)
 
 
 def _worker_component(i):
@@ -50,14 +58,23 @@ def _worker_init():
     global _INSIDE_GRADIENT_WORKER
     _INSIDE_GRADIENT_WORKER = True
     os.environ["ICHOR_GRADIENT_WORKER"] = "1"
-    for name in (
-        "OMP_NUM_THREADS",
-        "MKL_NUM_THREADS",
-        "OPENBLAS_NUM_THREADS",
-        "NUMEXPR_NUM_THREADS",
-        "VECLIB_MAXIMUM_THREADS",
-    ):
-        os.environ.setdefault(name, "1")
+    for name in _THREAD_ENV_NAMES:
+        os.environ[name] = "1"
+
+
+@contextmanager
+def _capped_worker_thread_env():
+    previous = {name: os.environ.get(name) for name in _THREAD_ENV_NAMES}
+    try:
+        for name in _THREAD_ENV_NAMES:
+            os.environ[name] = "1"
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def inside_gradient_worker() -> bool:
@@ -164,13 +181,14 @@ def parallel_cartesian_gradient(acq, atoms, *, workers, chunksize=2, objective="
     _WORKER_ACQ, _WORKER_ATOMS, _WORKER_FLAT, _WORKER_EPS = acq, atoms, flat, eps
     _WORKER_OBJECTIVE = str(objective or "full")
     try:
-        with ProcessPoolExecutor(
-            max_workers=int(workers_used),
-            mp_context=ctx,
-            initializer=_worker_init,
-        ) as pool:
-            for i, g in zip(indices, pool.map(_worker_component, indices, chunksize=chunksize)):
-                grad[i] = g
+        with _capped_worker_thread_env():
+            with ProcessPoolExecutor(
+                max_workers=int(workers_used),
+                mp_context=ctx,
+                initializer=_worker_init,
+            ) as pool:
+                for i, g in zip(indices, pool.map(_worker_component, indices, chunksize=chunksize)):
+                    grad[i] = g
         _set_last_diagnostics(
             gradient_backend="process",
             workers_requested=workers,
@@ -249,18 +267,19 @@ def parallel_active_gradient(acq, atoms, *, workers, chunksize=1, objective="ful
     _WORKER_ACTIVE_DIRECTIONS = directions
     _WORKER_OBJECTIVE = str(objective or "full")
     try:
-        with ProcessPoolExecutor(
-            max_workers=int(workers_used),
-            mp_context=ctx,
-            initializer=_worker_init,
-        ) as pool:
-            directional_derivs = list(
-                pool.map(
-                    _worker_active_component,
-                    range(len(directions)),
-                    chunksize=chunksize,
+        with _capped_worker_thread_env():
+            with ProcessPoolExecutor(
+                max_workers=int(workers_used),
+                mp_context=ctx,
+                initializer=_worker_init,
+            ) as pool:
+                directional_derivs = list(
+                    pool.map(
+                        _worker_active_component,
+                        range(len(directions)),
+                        chunksize=chunksize,
+                    )
                 )
-            )
         _set_last_diagnostics(
             gradient_backend="process",
             workers_requested=workers,

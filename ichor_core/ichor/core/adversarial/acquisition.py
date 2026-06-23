@@ -1668,7 +1668,8 @@ class SeedLocalAdversarialAcquisition:
         if basis.ndim != 2 or basis.shape[0] != disp.size or basis.shape[1] == 0:
             return np.zeros_like(np.asarray(atoms.coordinates, dtype=float))
         cov = np.asarray(self.subspace.active_covariance, dtype=float)
-        reg = float(self.config.subspace.covariance_regularization)
+        eig_max = float(np.max(np.diag(cov))) if int(self.subspace.dimension) else 1.0
+        reg = float(self.config.subspace.covariance_regularization) * max(eig_max, 1.0e-12)
         metric = np.linalg.inv(cov + reg * np.eye(cov.shape[0]))
         xi = basis.T @ disp
         grad_mw = 2.0 * (basis @ (metric @ xi))
@@ -1944,6 +1945,10 @@ class SeedLocalAdversarialAcquisition:
                 diag["driver_gradient_validation_cosine"] = float(cosine)
                 if cosine < float(getattr(driver, "analytic_validation_tol_cosine", 0.98)):
                     diag["driver_gradient_reasons"].append("analytic_validation_cosine_below_tolerance")
+                    diag["driver_gradient_fallback"] = True
+                    diag["driver_gradient_fallback_reason"] = "analytic_validation_cosine_below_tolerance"
+                    self._last_driver_gradient_diagnostics = dict(diag)
+                    return fd
             self._last_driver_gradient_diagnostics = dict(diag)
             return grad
         except Exception as exc:

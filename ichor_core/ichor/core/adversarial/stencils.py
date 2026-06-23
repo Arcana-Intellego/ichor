@@ -92,8 +92,13 @@ def directional_all_stencils(
         displaced_geometry(atoms, direction_flat, float(offset) * step_f)
         for offset in offsets
     ]
-    means = np.asarray(posterior.means(points), dtype=float)
-    covariance = np.asarray(posterior.covariance_matrix(points), dtype=float)
+    if hasattr(posterior, "means_and_covariance_matrix"):
+        means_raw, covariance_raw = posterior.means_and_covariance_matrix(points)
+    else:
+        means_raw = posterior.means(points)
+        covariance_raw = posterior.covariance_matrix(points)
+    means = np.asarray(means_raw, dtype=float)
+    covariance = np.asarray(covariance_raw, dtype=float)
 
     coeff_force = np.asarray([0.0, -1.0, 0.0, 1.0, 0.0], dtype=float) / (2.0 * step_f)
     coeff_curvature = np.asarray([0.0, 1.0, -2.0, 1.0, 0.0], dtype=float) / (step_f ** 2)

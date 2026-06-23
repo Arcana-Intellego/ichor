@@ -91,3 +91,58 @@ def test_cheap_driver_can_dispatch_to_hybrid_geometry_gradient():
 
     np.testing.assert_allclose(out, expected)
     assert calls == ["active_fd"]
+
+
+def test_hybrid_gradient_validation_falls_back_to_fd():
+    acq = _stub_acq()
+    acq.config = AcquisitionConfig(
+        driver=DriverConfig(
+            gradient_backend="hybrid_geometry",
+            finite_difference_energy=False,
+            analytic_movement=True,
+            analytic_whitened_distance=False,
+            analytic_pair_barriers=False,
+            analytic_fullspace_rmsd=False,
+            analytic_validation=True,
+            analytic_validation_tol_cosine=0.5,
+        )
+    )
+    atoms = _water_like()
+    fd = np.ones((3, 3), dtype=float)
+    acq._movement_utility_gradient = lambda atoms_arg: -fd  # type: ignore[assignment]
+    acq._cartesian_finite_difference_gradient = (  # type: ignore[assignment]
+        lambda atoms_arg, objective="full": fd
+    )
+
+    out = acq.gradient(atoms, mode="cartesian_fd", objective="cheap_driver")
+
+    np.testing.assert_allclose(out, fd)
+    diag = acq._last_driver_gradient_diagnostics
+    assert diag["driver_gradient_fallback"] is True
+    assert diag["driver_gradient_fallback_reason"] == "analytic_validation_cosine_below_tolerance"
+
+
+def test_whitened_distance_gradient_uses_value_regularisation_scale():
+    acq = _stub_acq()
+    acq.config = AcquisitionConfig()
+    acq.config = AcquisitionConfig()
+    acq.subspace = type("Subspace", (), {})()
+    acq.subspace.dimension = 3
+    acq.subspace.basis = np.eye(3, dtype=float)
+    acq.subspace.active_covariance = np.diag([100.0, 2.0, 1.0])
+    disp = np.array([1.0, 2.0, 3.0], dtype=float)
+    masses = np.ones(1, dtype=float)
+    acq._mass_weighted_displacement_and_masses = (  # type: ignore[assignment]
+        lambda atoms_arg: (disp, masses)
+    )
+    acq._mass_weighted_gradient_to_cartesian = (  # type: ignore[assignment]
+        lambda grad_mw, masses_arg: np.asarray(grad_mw, dtype=float).reshape(1, 3)
+    )
+
+    out = acq._whitened_distance_gradient(_water_like())
+
+    reg = acq.config.subspace.covariance_regularization * 100.0
+    expected = 2.0 * np.linalg.inv(
+        acq.subspace.active_covariance + reg * np.eye(3)
+    ) @ disp
+    np.testing.assert_allclose(out.reshape(-1), expected)

@@ -970,6 +970,7 @@ def _select_safe_landing(
     opt_candidate_grad_norms: Sequence[float],
     opt_candidate_origins: Optional[Sequence[str]] = None,
     alpha_trajectory: Sequence[float],
+    full_initial_alpha: Optional[float] = None,
     safety_config: Any,
     quality_gates: Any,
 ) -> Dict[str, Any]:
@@ -997,9 +998,15 @@ def _select_safe_landing(
         }
 
     seed_mean_energy = float(acquisition.posterior.mean(seed_atoms))
-    initial_alpha = (
+    driver_initial_alpha = (
         _safe_float_or_none(alpha_trajectory[0]) if alpha_trajectory else None
     )
+    initial_alpha = _safe_float_or_none(full_initial_alpha)
+    if initial_alpha is None:
+        try:
+            initial_alpha = float(acquisition.components(seed_atoms, objective="full").total)
+        except Exception:
+            initial_alpha = None
     raw_coords = _coords_array(raw_final_atoms)
     candidates: List[Dict[str, Any]] = []
     seen_coords: List[np.ndarray] = []
@@ -1037,6 +1044,17 @@ def _select_safe_landing(
             safety_config=safety_config,
             quality_gates=quality_gates,
         )
+        candidate_metrics = dict(candidate.get("metrics") or {})
+        candidate_metrics["alpha_full_initial"] = (
+            None if initial_alpha is None else float(initial_alpha)
+        )
+        candidate_metrics["alpha_driver_initial"] = (
+            None if driver_initial_alpha is None else float(driver_initial_alpha)
+        )
+        candidate_metrics["alpha_driver_candidate"] = _safe_float_or_none(
+            opt_candidate_alphas[k] if k < len(opt_candidate_alphas) else None
+        )
+        candidate["metrics"] = candidate_metrics
         _annotate_acquisition_improvement(candidate, initial_alpha)
         candidates.append(candidate)
         idx += 1
@@ -1053,6 +1071,17 @@ def _select_safe_landing(
         safety_config=safety_config,
         quality_gates=quality_gates,
     )
+    raw_metrics = dict(raw_candidate.get("metrics") or {})
+    raw_metrics["alpha_full_initial"] = (
+        None if initial_alpha is None else float(initial_alpha)
+    )
+    raw_metrics["alpha_driver_initial"] = (
+        None if driver_initial_alpha is None else float(driver_initial_alpha)
+    )
+    raw_metrics["alpha_driver_candidate"] = (
+        float(alpha_trajectory[-1]) if alpha_trajectory else None
+    )
+    raw_candidate["metrics"] = raw_metrics
     _annotate_acquisition_improvement(raw_candidate, initial_alpha)
     idx += 1
     candidates.append(raw_candidate)
@@ -1082,6 +1111,15 @@ def _select_safe_landing(
                 safety_config=safety_config,
                 quality_gates=quality_gates,
             )
+            candidate_metrics = dict(candidate.get("metrics") or {})
+            candidate_metrics["alpha_full_initial"] = (
+                None if initial_alpha is None else float(initial_alpha)
+            )
+            candidate_metrics["alpha_driver_initial"] = (
+                None if driver_initial_alpha is None else float(driver_initial_alpha)
+            )
+            candidate_metrics["alpha_driver_candidate"] = None
+            candidate["metrics"] = candidate_metrics
             _annotate_acquisition_improvement(candidate, initial_alpha)
             candidates.append(candidate)
             idx += 1
@@ -1122,6 +1160,14 @@ def _select_safe_landing(
     metrics.setdefault(
         "alpha_initial",
         None if initial_alpha is None else float(initial_alpha),
+    )
+    metrics.setdefault(
+        "alpha_full_initial",
+        None if initial_alpha is None else float(initial_alpha),
+    )
+    metrics.setdefault(
+        "alpha_driver_initial",
+        None if driver_initial_alpha is None else float(driver_initial_alpha),
     )
     metrics.setdefault(
         "selected_alpha_delta",
@@ -1521,6 +1567,20 @@ def _live_optimise_seed(
     raw_final_atoms = _make_ichor_from_positions(
         acquisition.seed_atoms, opt_result.final_positions_angstrom,
     )
+    full_initial_alpha = None
+    if opt_result.candidate_positions_angstrom:
+        try:
+            initial_atoms_for_scoring = _make_ichor_from_positions(
+                acquisition.seed_atoms,
+                opt_result.candidate_positions_angstrom[0],
+            )
+            full_initial_alpha = float(
+                acquisition.components(initial_atoms_for_scoring, objective="full").total
+            )
+        except Exception:
+            full_initial_alpha = None
+    if full_initial_alpha is None:
+        full_initial_alpha = float(seed_alpha)
     landing = _select_safe_landing(
         acquisition=acquisition,
         seed_atoms=acquisition.seed_atoms,
@@ -1530,6 +1590,7 @@ def _live_optimise_seed(
         opt_candidate_grad_norms=list(opt_result.candidate_grad_norms),
         opt_candidate_origins=list(opt_result.candidate_origins),
         alpha_trajectory=list(opt_result.alpha_trajectory),
+        full_initial_alpha=full_initial_alpha,
         safety_config=safety_config,
         quality_gates=quality_gates,
     )
@@ -1559,6 +1620,20 @@ def _live_optimise_seed(
             acquisition.seed_atoms,
             opt_result_retry.final_positions_angstrom,
         )
+        full_initial_alpha_retry = None
+        if opt_result_retry.candidate_positions_angstrom:
+            try:
+                initial_atoms_retry = _make_ichor_from_positions(
+                    acquisition.seed_atoms,
+                    opt_result_retry.candidate_positions_angstrom[0],
+                )
+                full_initial_alpha_retry = float(
+                    acquisition.components(initial_atoms_retry, objective="full").total
+                )
+            except Exception:
+                full_initial_alpha_retry = None
+        if full_initial_alpha_retry is None:
+            full_initial_alpha_retry = float(seed_alpha)
         landing_retry = _select_safe_landing(
             acquisition=acquisition,
             seed_atoms=acquisition.seed_atoms,
@@ -1568,6 +1643,7 @@ def _live_optimise_seed(
             opt_candidate_grad_norms=list(opt_result_retry.candidate_grad_norms),
             opt_candidate_origins=list(opt_result_retry.candidate_origins),
             alpha_trajectory=list(opt_result_retry.alpha_trajectory),
+            full_initial_alpha=full_initial_alpha_retry,
             safety_config=safety_config,
             quality_gates=quality_gates,
         )
