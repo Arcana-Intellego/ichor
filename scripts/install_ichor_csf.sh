@@ -656,6 +656,7 @@ install_python_packages() {
     require_dir "${PROJECTS_DIR}/FEREBUS_CPU/pyferebus" "pyferebus package"
 
     pip_install --upgrade pip setuptools wheel
+    pip_install pytest
     pip_install -e "${REPO_ROOT}/ichor_core"
     pip_install -e "${REPO_ROOT}/ichor_hpc"
     pip_install -e "${REPO_ROOT}/ichor_cli"
