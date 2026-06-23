@@ -37,6 +37,21 @@ def _declared_runtime_dependencies(package_dir: Path) -> set[str]:
     return deps
 
 
+def _console_scripts(package_dir: Path) -> dict[str, str]:
+    config = configparser.ConfigParser()
+    config.read(package_dir / "setup.cfg")
+    scripts: dict[str, str] = {}
+    if not config.has_section("options.entry_points"):
+        return scripts
+    for line in config.get("options.entry_points", "console_scripts").splitlines():
+        line = line.strip()
+        if not line or "=" not in line:
+            continue
+        name, target = line.split("=", 1)
+        scripts[name.strip()] = target.strip()
+    return scripts
+
+
 def _stdlib_modules() -> set[str]:
     modules = set(getattr(sys, "stdlib_module_names", set()))
     modules.update(sys.builtin_module_names)
@@ -112,3 +127,13 @@ def test_csf4_critical_runtime_dependencies_are_declared():
     assert {"ase", "xtb", "plumed", "rdkit", "tqdm"} <= core_deps
     assert {"numpy", "ase", "xtb", "plumed", "portalocker", "tqdm"} <= hpc_deps
     assert {"console-menu", "termcolor", "ase"} <= cli_deps
+
+
+def test_active_learning_console_scripts_are_declared():
+    scripts = _console_scripts(PACKAGE_DIRS["ichor_cli"])
+
+    assert scripts["ichor-al-daemon"] == "ichor.hpc.active_learning.cli:main"
+    assert (
+        scripts["ichor-al-benchmark-acquisition-gradient"]
+        == "ichor.hpc.active_learning.benchmark.acquisition_gradient:main"
+    )

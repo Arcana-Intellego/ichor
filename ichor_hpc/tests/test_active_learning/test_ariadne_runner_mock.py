@@ -186,6 +186,26 @@ def test_to_dict_includes_optional_optimiser_diagnostics():
     json.dumps(d)
 
 
+def test_to_dict_includes_optional_gradient_diagnostics():
+    seed = _water()
+    out = AriadneRunResult(
+        initial_atoms=seed,
+        final_atoms=seed,
+        gradient_diagnostics={
+            "schema_version": 1,
+            "gradient_mode": "active_fd",
+            "gradient_call_count": 3,
+        },
+    )
+
+    d = out.to_dict()
+
+    assert d["gradient_diagnostics"]["schema_version"] == 1
+    assert d["gradient_diagnostics"]["gradient_mode"] == "active_fd"
+    assert d["gradient_diagnostics"]["gradient_call_count"] == 3
+    json.dumps(d)
+
+
 def test_safe_max_iteration_result_is_task_usable():
     seed = _water()
     out = AriadneRunResult(

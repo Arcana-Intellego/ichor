@@ -10,13 +10,16 @@ from ichor.core.models.models import Models
 
 from .barrier import ChemistryBarrierState, build_chemistry_barrier_state, chemistry_barrier_value
 from .config import AcquisitionConfig
-from .geometry import aligned_mass_weighted_rmsd, load_seed_atoms, load_trajectory, select_local_neighbours
+from .geometry import (
+    aligned_mass_weighted_displacement,
+    aligned_mass_weighted_rmsd,
+    load_seed_atoms,
+    load_trajectory,
+    select_local_neighbours,
+)
 from .posterior import TotalEnergyPosterior
 from .stencils import (
-    directional_cubic_stencil,
-    directional_curvature_stencil,
-    directional_force_stencil,
-    directional_quartic_stencil,
+    directional_all_stencils,
 )
 from .subspace import (
     LocalSubspace,
@@ -765,10 +768,11 @@ class SeedLocalAdversarialAcquisition:
         evaluations = []
         for idx, (direction, step) in enumerate(zip(self.mode_directions, steps)):
             step_f = float(step)
-            force_eval = directional_force_stencil(self.posterior, atoms, direction, step_f)
-            curvature_eval = directional_curvature_stencil(self.posterior, atoms, direction, step_f)
-            cubic_eval = directional_cubic_stencil(self.posterior, atoms, direction, step_f)
-            quartic_eval = directional_quartic_stencil(self.posterior, atoms, direction, step_f)
+            bundle = directional_all_stencils(self.posterior, atoms, direction, step_f)
+            force_eval = bundle.force
+            curvature_eval = bundle.curvature
+            cubic_eval = bundle.cubic
+            quartic_eval = bundle.quartic
 
             k_hat = self._curvature_floor(curvature_eval.mean)
             omega = float(np.sqrt(k_hat))
@@ -931,7 +935,18 @@ class SeedLocalAdversarialAcquisition:
             return tuple(1.0 / len(mode_evals) for _ in mode_evals)
         return tuple(float(x / total) for x in inv)
 
-    def components(self, atoms: Atoms, *, include_movement: bool = True) -> AcquisitionBreakdown:
+    def components(
+        self,
+        atoms: Atoms,
+        *,
+        include_movement: bool = True,
+        objective: str = "full",
+    ) -> AcquisitionBreakdown:
+        objective = str(objective or "full")
+        if objective == "cheap_driver":
+            return self._driver_components(atoms, include_movement=include_movement)
+        if objective != "full":
+            raise ValueError("Unknown acquisition objective " + repr(objective))
         mean_energy = self.posterior.mean(atoms)
         atom_variances = None
         if self.error_calibration_model and self.error_calibration_apply_strength > 0.0:
@@ -1236,15 +1251,248 @@ class SeedLocalAdversarialAcquisition:
             mode_evaluations=mode_evals,
         )
 
-    def value(self, atoms: Atoms) -> float:
-        return self.components(atoms).total
+    def _driver_components(
+        self,
+        atoms: Atoms,
+        *,
+        include_movement: bool = True,
+    ) -> AcquisitionBreakdown:
+        """Cheap objective used only to drive ARIADNE steps.
 
-    def gradient(self, atoms: Atoms, mode: str | None = None) -> np.ndarray:
+        Full landing selection still calls objective="full". This omits the
+        directional force/frequency/anharmonic stencils and keeps only the
+        lower-cost energy uncertainty, movement, distance, full-space, and
+        chemistry terms.
+        """
+        cfg = self.config.driver
+        if bool(getattr(cfg, "include_stencils", False)):
+            return self.components(atoms, include_movement=include_movement, objective="full")
+        mean_energy = self.posterior.mean(atoms)
+        atom_variances = None
+        if self.error_calibration_model and self.error_calibration_apply_strength > 0.0:
+            energy_var, atom_variances = self.posterior.variance_components(atoms)
+        else:
+            energy_var = self.posterior.variance(atoms)
+
+        norm_enabled = bool(getattr(self.config.size_normalisation, "enabled", True))
+        n_atoms = max(1, len(atoms))
+        energy_norm = float(np.sqrt(float(n_atoms))) if (
+            norm_enabled
+            and str(getattr(self.config.size_normalisation, "energy_mode", "per_sqrt_atom"))
+            == "per_sqrt_atom"
+        ) else 1.0
+        energy_value = float(energy_var) / max(energy_norm, 1.0e-12)
+        energy_scale = self.reference_scales["energy"]
+        raw_energy_risk = self._phi(energy_value / max(energy_scale, 1.0e-12))
+        energy_risk = raw_energy_risk
+        banded_energy_risk = None
+        calibrated_error = None
+        calibration_applied = False
+        fallback_reasons: List[str] = ["cheap_driver_omits_stencils"]
+        if self.error_calibration_model and self.error_calibration_apply_strength > 0.0:
+            atom_types = [str(a.type) for a in atoms]
+            calibrated_error = _lookup_calibrated_error(
+                self.error_calibration_model,
+                atom_variances,
+                atom_types,
+                float(energy_var),
+            )
+            if calibrated_error is not None:
+                scale = _finite_positive_float(
+                    self.error_calibration_model.get("reference_error_ha")
+                    if isinstance(self.error_calibration_model, Mapping)
+                    else None,
+                    self._reference_scale("calibrated_error", self.reference_scales["energy"]) / max(energy_norm, 1.0e-12),
+                )
+                calibrated_risk, banded_energy_risk, energy_reasons = self._energy_utility(
+                    float(calibrated_error) / max(energy_norm, 1.0e-12),
+                    float(scale),
+                )
+                fallback_reasons.extend(energy_reasons)
+                strength = float(self.error_calibration_apply_strength)
+                energy_risk = (1.0 - strength) * raw_energy_risk + strength * calibrated_risk
+                calibration_applied = True
+            else:
+                fallback_reasons.append("calibrated_energy_missing_lookup")
+                if not bool(self.config.calibrated_energy.fallback_to_raw_variance):
+                    energy_risk = 0.0
+                    fallback_reasons.append("calibrated_energy_raw_variance_fallback_disabled")
+        elif self.config.calibrated_energy.utility == "banded":
+            fallback_reasons.append("calibrated_energy_not_active")
+            if not bool(self.config.calibrated_energy.fallback_to_raw_variance):
+                energy_risk = 0.0
+                fallback_reasons.append("calibrated_energy_raw_variance_fallback_disabled")
+
+        distance_penalty = whitened_distance_squared(
+            self.subspace,
+            atoms,
+            self.config.subspace.covariance_regularization,
+        )
+        if (
+            norm_enabled
+            and str(getattr(self.config.size_normalisation, "whitened_distance_mode", "per_subspace_dim"))
+            == "per_subspace_dim"
+        ):
+            distance_penalty = float(distance_penalty) / max(1, int(self.subspace.dimension))
+        chemistry_penalty = chemistry_barrier_value(
+            atoms,
+            self.barrier_state,
+            mean_energy,
+            normalisation_mode=(
+                str(getattr(self.config.size_normalisation, "chemistry_barrier_mode", "family_mean"))
+                if norm_enabled else "raw_sum"
+            ),
+        )
+        fullspace = self._fullspace_confinement_metrics(atoms)
+        fallback_reasons.extend(str(r) for r in fullspace.get("fallback_reasons", []) or [])
+        residual_penalty = float(fullspace.get("residual_penalty", 0.0) or 0.0)
+        rmsd_penalty = float(fullspace.get("rmsd_penalty", 0.0) or 0.0)
+        movement = self.movement_metrics(atoms) if include_movement else {}
+        movement_score = float(movement.get("movement_utility_score", 0.0) or 0.0)
+
+        fullspace_penalty = (
+            float(self.config.fullspace_confinement.lambda_residual) * residual_penalty
+            + float(self.config.fullspace_confinement.lambda_rmsd) * rmsd_penalty
+        )
+        informativeness_score = (
+            float(cfg.lambda_energy) * float(energy_risk)
+            + float(cfg.lambda_movement) * movement_score
+        )
+        risk_penalty_score = (
+            float(cfg.lambda_distance) * float(distance_penalty)
+            + float(cfg.lambda_fullspace) * float(fullspace_penalty)
+            + float(cfg.lambda_chemistry) * float(chemistry_penalty)
+        )
+        total = informativeness_score - risk_penalty_score
+        return AcquisitionBreakdown(
+            total=float(total),
+            informativeness_score=float(informativeness_score),
+            risk_penalty_score=float(risk_penalty_score),
+            energy_risk=float(energy_risk),
+            raw_energy_risk=float(raw_energy_risk),
+            banded_energy_risk=(
+                None if banded_energy_risk is None else float(banded_energy_risk)
+            ),
+            calibrated_expected_iqa_error_ha=(
+                None if calibrated_error is None else float(calibrated_error)
+            ),
+            calibration_applied=bool(calibration_applied),
+            force_risk=0.0,
+            frequency_risk=0.0,
+            spectral_frequency_risk=0.0,
+            legacy_frequency_risk=0.0,
+            anharmonic_risk=0.0,
+            distance_penalty=float(distance_penalty),
+            chemistry_penalty=float(chemistry_penalty),
+            fullspace_residual_distance=(
+                None
+                if fullspace.get("residual_distance") is None
+                else float(fullspace["residual_distance"])
+            ),
+            fullspace_residual_penalty=float(residual_penalty),
+            aligned_rmsd_ang=(
+                None
+                if fullspace.get("aligned_rmsd_ang") is None
+                else float(fullspace["aligned_rmsd_ang"])
+            ),
+            aligned_rmsd_penalty=float(rmsd_penalty),
+            movement_metric=(
+                None if not movement else str(movement.get("movement_metric"))
+            ),
+            movement_rmsd_ang=(
+                None if not movement else float(movement.get("movement_rmsd_ang"))
+            ),
+            movement_progress_ang=(
+                None if not movement else float(movement.get("movement_progress_ang"))
+            ),
+            movement_band_min_ang=(
+                None if not movement else float(movement.get("movement_band_min_ang"))
+            ),
+            movement_band_low_ang=(
+                None if not movement else float(movement.get("movement_band_low_ang"))
+            ),
+            movement_band_peak_ang=(
+                None if not movement else float(movement.get("movement_band_peak_ang"))
+            ),
+            movement_band_high_ang=(
+                None if not movement else float(movement.get("movement_band_high_ang"))
+            ),
+            movement_band_max_ang=(
+                None if not movement else float(movement.get("movement_band_max_ang"))
+            ),
+            movement_utility_score=float(movement_score),
+            movement_band_score=float(movement.get("movement_band_score", 0.0) or 0.0),
+            movement_progress_score=float(movement.get("movement_progress_score", 0.0) or 0.0),
+            movement_direction_source=(
+                None if not movement else str(movement.get("movement_direction_source"))
+            ),
+            n_effective_movement_atoms=(
+                None
+                if not movement or movement.get("n_effective_movement_atoms") is None
+                else float(movement.get("n_effective_movement_atoms"))
+            ),
+            size_normalisation_mode=("enabled" if norm_enabled else "disabled"),
+            negative_curvature_penalty=0.0,
+            weak_mode_penalty_score=0.0,
+            anharmonic_risk_raw=0.0,
+            anharmonic_risk_capped=0.0,
+            observable_score=float(informativeness_score),
+            outlier_penalty_score=float(risk_penalty_score),
+            fallback_reasons=tuple(str(r) for r in fallback_reasons),
+            mean_energy=float(mean_energy),
+            energy_variance=float(energy_var),
+            mode_evaluations=(),
+        )
+
+    def value(self, atoms: Atoms, *, objective: str = "full") -> float:
+        return self.components(atoms, objective=objective).total
+
+    def _driver_energy_value(self, atoms: Atoms) -> float:
+        """Cheap-driver energy channel only.
+
+        This deliberately keeps the posterior-derived channel finite
+        differenced. Geometry penalties use the hybrid analytic path below.
+        """
+        parts = self._driver_components(atoms, include_movement=False)
+        return float(self.config.driver.lambda_energy) * float(parts.energy_risk) - (
+            float(self.config.driver.lambda_chemistry)
+            * self._energy_cap_barrier_penalty(float(parts.mean_energy))
+        )
+
+    def _value_for_objective(self, atoms: Atoms, objective: str = "full") -> float:
+        """Call value with objective while preserving old full-objective shims."""
+        objective = str(objective or "full")
+        try:
+            return float(self.value(atoms, objective=objective))
+        except TypeError:
+            if objective == "full":
+                return float(self.value(atoms))
+            raise
+
+    def gradient(
+        self,
+        atoms: Atoms,
+        mode: str | None = None,
+        *,
+        objective: str = "full",
+    ) -> np.ndarray:
         gradient_mode = mode or self.config.gradient.mode
+        if (
+            str(objective or "full") == "cheap_driver"
+            and str(getattr(self.config.driver, "gradient_backend", "fd")) == "hybrid_geometry"
+            and not bool(getattr(self.config.driver, "include_stencils", False))
+        ):
+            return self._hybrid_driver_geometry_gradient(atoms, mode=gradient_mode)
         if gradient_mode == "cartesian_fd":
-            return self._cartesian_finite_difference_gradient(atoms)
+            return self._cartesian_finite_difference_gradient(
+                atoms,
+                objective=objective,
+            )
         if gradient_mode == "active_fd":
-            return self._active_finite_difference_gradient(atoms)
+            return self._active_finite_difference_gradient(
+                atoms,
+                objective=objective,
+            )
         raise ValueError(f"Unknown gradient mode {gradient_mode!r}")
 
     def _fd_indices_eps(self, atoms):
@@ -1273,7 +1521,7 @@ class SeedLocalAdversarialAcquisition:
         indices = [i for i in range(flat.size) if not skip[i]]
         return indices, flat, float(eps), coords.shape
 
-    def _fd_single(self, i, flat, eps, atoms):
+    def _fd_single(self, i, flat, eps, atoms, *, objective: str = "full"):
         """Central-difference derivative of the acquisition value along
         Cartesian DOF i. Independent of every other i, which is what lets the
         gradient be evaluated in parallel."""
@@ -1281,13 +1529,21 @@ class SeedLocalAdversarialAcquisition:
         disp[i] = eps
         plus = self._atoms_from_flat(flat + disp, atoms)
         minus = self._atoms_from_flat(flat - disp, atoms)
-        return (self.value(plus) - self.value(minus)) / (2.0 * eps)
+        return (
+            self._value_for_objective(plus, objective=objective)
+            - self._value_for_objective(minus, objective=objective)
+        ) / (2.0 * eps)
 
-    def _cartesian_finite_difference_gradient(self, atoms: Atoms) -> np.ndarray:
+    def _cartesian_finite_difference_gradient(
+        self,
+        atoms: Atoms,
+        *,
+        objective: str = "full",
+    ) -> np.ndarray:
         indices, flat, eps, shape = self._fd_indices_eps(atoms)
         grad = np.zeros(flat.size, dtype=float)
         for i in indices:
-            grad[i] = self._fd_single(i, flat, eps, atoms)
+            grad[i] = self._fd_single(i, flat, eps, atoms, objective=objective)
         return grad.reshape(shape)
 
     def _atoms_from_flat(self, flat: np.ndarray, template: Atoms) -> Atoms:
@@ -1295,7 +1551,12 @@ class SeedLocalAdversarialAcquisition:
 
         return coordinates_to_atoms(template, np.asarray(flat, dtype=float).reshape((-1, 3)))
 
-    def _active_finite_difference_gradient(self, atoms: Atoms) -> np.ndarray:
+    def _active_finite_difference_gradient(
+        self,
+        atoms: Atoms,
+        *,
+        objective: str = "full",
+    ) -> np.ndarray:
         """Active-mode FD gradient via Moore-Penrose pseudoinverse projection.
 
         self.mode_directions is M^{-1/2} * basis where basis is
@@ -1319,15 +1580,380 @@ class SeedLocalAdversarialAcquisition:
         descent target. Heterogeneous-mass systems get an unbiased
         Cartesian gradient.
         """
-        eps = self.config.gradient.active_step
+        directions, flat, eps, shape = self._active_fd_setup(atoms)
         directional_derivs: List[float] = []
-        for direction in self.mode_directions:
-            plus = self._atoms_from_flat(np.asarray(atoms.coordinates).reshape(-1) + eps * direction, atoms)
-            minus = self._atoms_from_flat(np.asarray(atoms.coordinates).reshape(-1) - eps * direction, atoms)
-            directional_derivs.append((self.value(plus) - self.value(minus)) / (2.0 * eps))
-        D = np.column_stack(self.mode_directions)
+        for direction in directions:
+            directional_derivs.append(
+                self._active_fd_single(direction, flat, eps, atoms, objective=objective)
+            )
+        return self._active_fd_project(directions, directional_derivs, shape)
+
+    def _active_fd_setup(self, atoms: Atoms):
+        """Shared active-FD setup for the serial core path and HPC workers."""
+        coords = np.asarray(atoms.coordinates, dtype=float)
+        flat = coords.reshape(-1)
+        eps = float(self.config.gradient.active_step)
+        directions = tuple(
+            np.asarray(direction, dtype=float).reshape(-1)
+            for direction in self.mode_directions
+        )
+        return directions, flat, eps, coords.shape
+
+    def _active_fd_single(self, direction, flat, eps, atoms, *, objective: str = "full"):
+        """Central-difference derivative along one active Cartesian direction."""
+        direction = np.asarray(direction, dtype=float).reshape(-1)
+        plus = self._atoms_from_flat(np.asarray(flat, dtype=float) + eps * direction, atoms)
+        minus = self._atoms_from_flat(np.asarray(flat, dtype=float) - eps * direction, atoms)
+        return (
+            self._value_for_objective(plus, objective=objective)
+            - self._value_for_objective(minus, objective=objective)
+        ) / (2.0 * eps)
+
+    def _active_fd_project(self, directions, directional_derivs, shape) -> np.ndarray:
+        """Project active-direction derivatives back to Cartesian coordinates."""
+        D = np.column_stack(directions)
         rhs = np.asarray(directional_derivs, dtype=float)
         gram = D.T @ D + self.config.gradient.regularization * np.eye(D.shape[1])
         coeffs = np.linalg.solve(gram, rhs)
         flat_grad = D @ coeffs
-        return flat_grad.reshape(np.asarray(atoms.coordinates).shape)
+        return flat_grad.reshape(shape)
+
+    def _driver_energy_finite_difference_gradient(self, atoms: Atoms, *, mode: str) -> np.ndarray:
+        """Finite-difference only the posterior energy-risk driver channel."""
+        if mode == "active_fd":
+            directions, flat, eps, shape = self._active_fd_setup(atoms)
+            directional_derivs: List[float] = []
+            for direction in directions:
+                plus = self._atoms_from_flat(flat + eps * direction, atoms)
+                minus = self._atoms_from_flat(flat - eps * direction, atoms)
+                directional_derivs.append(
+                    (self._driver_energy_value(plus) - self._driver_energy_value(minus))
+                    / (2.0 * eps)
+                )
+            return self._active_fd_project(directions, directional_derivs, shape)
+        if mode == "cartesian_fd":
+            indices, flat, eps, shape = self._fd_indices_eps(atoms)
+            grad = np.zeros(flat.size, dtype=float)
+            for i in indices:
+                disp = np.zeros_like(flat)
+                disp[i] = eps
+                plus = self._atoms_from_flat(flat + disp, atoms)
+                minus = self._atoms_from_flat(flat - disp, atoms)
+                grad[i] = (
+                    self._driver_energy_value(plus) - self._driver_energy_value(minus)
+                ) / (2.0 * eps)
+            return grad.reshape(shape)
+        raise ValueError(f"Unknown gradient mode {mode!r}")
+
+    def _active_project_cartesian_gradient(self, atoms: Atoms, grad: np.ndarray) -> np.ndarray:
+        """Project a Cartesian gradient into the configured active-FD basis."""
+        directions, _flat, _eps, shape = self._active_fd_setup(atoms)
+        flat_grad = np.asarray(grad, dtype=float).reshape(-1)
+        directional_derivs = [float(np.dot(flat_grad, direction)) for direction in directions]
+        return self._active_fd_project(directions, directional_derivs, shape)
+
+    def _mass_weighted_displacement_and_masses(self, atoms: Atoms) -> Tuple[np.ndarray, np.ndarray]:
+        disp = aligned_mass_weighted_displacement(self.seed_atoms, atoms).reshape(-1)
+        masses = np.asarray(self.seed_atoms.masses, dtype=float).reshape(-1)
+        masses = np.where(np.isfinite(masses) & (masses > 0.0), masses, 1.0)
+        return disp, masses
+
+    def _mass_weighted_gradient_to_cartesian(self, grad_mw: np.ndarray, masses: np.ndarray) -> np.ndarray:
+        mass_vec = np.repeat(np.sqrt(np.asarray(masses, dtype=float)), 3)
+        return (np.asarray(grad_mw, dtype=float).reshape(-1) * mass_vec).reshape((-1, 3))
+
+    def _whitened_distance_gradient(self, atoms: Atoms) -> np.ndarray:
+        disp, masses = self._mass_weighted_displacement_and_masses(atoms)
+        basis = np.asarray(self.subspace.basis, dtype=float)
+        if basis.ndim != 2 or basis.shape[0] != disp.size or basis.shape[1] == 0:
+            return np.zeros_like(np.asarray(atoms.coordinates, dtype=float))
+        cov = np.asarray(self.subspace.active_covariance, dtype=float)
+        reg = float(self.config.subspace.covariance_regularization)
+        metric = np.linalg.inv(cov + reg * np.eye(cov.shape[0]))
+        xi = basis.T @ disp
+        grad_mw = 2.0 * (basis @ (metric @ xi))
+        norm_enabled = bool(getattr(self.config.size_normalisation, "enabled", True))
+        if (
+            norm_enabled
+            and str(getattr(self.config.size_normalisation, "whitened_distance_mode", "per_subspace_dim"))
+            == "per_subspace_dim"
+        ):
+            grad_mw = grad_mw / max(1, int(self.subspace.dimension))
+        return self._mass_weighted_gradient_to_cartesian(grad_mw, masses)
+
+    def _fullspace_confinement_gradient(self, atoms: Atoms) -> np.ndarray:
+        cfg = self.config.fullspace_confinement
+        if not bool(getattr(cfg, "enabled", True)):
+            return np.zeros_like(np.asarray(atoms.coordinates, dtype=float))
+        disp, masses = self._mass_weighted_displacement_and_masses(atoms)
+        basis = np.asarray(self.subspace.basis, dtype=float)
+        if basis.ndim != 2 or basis.shape[0] != disp.size:
+            return np.zeros_like(np.asarray(atoms.coordinates, dtype=float))
+        residual = disp - basis @ (basis.T @ disp)
+        total_mass = float(np.sum(masses))
+        if not np.isfinite(total_mass) or total_mass <= 0.0:
+            total_mass = float(max(1, len(masses)))
+        residual_scale = self._reference_scale("residual", self._configured_residual_scale())
+        rmsd_scale = self._reference_scale("rmsd", float(cfg.rmsd_scale_ang))
+        grad_mw = (
+            2.0
+            * float(cfg.lambda_residual)
+            * residual
+            / max(total_mass * residual_scale * residual_scale, 1.0e-24)
+        )
+        coord_delta = (disp.reshape(-1, 3) / np.sqrt(masses)[:, None]).reshape(-1)
+        rmsd_grad = (
+            2.0
+            * float(cfg.lambda_rmsd)
+            * np.repeat(masses, 3)
+            * coord_delta
+            / max(total_mass * rmsd_scale * rmsd_scale, 1.0e-24)
+        )
+        return self._mass_weighted_gradient_to_cartesian(grad_mw, masses) + rmsd_grad.reshape((-1, 3))
+
+    @staticmethod
+    def _softplus_sq_value(u: float, delta: float, cap: float | None) -> float:
+        delta = max(float(delta), 1.0e-12)
+        arg = float(u) / delta
+        if cap is not None:
+            try:
+                cap_value = float(cap)
+            except (TypeError, ValueError):
+                cap_value = np.nan
+            if np.isfinite(cap_value):
+                arg = min(arg, cap_value)
+        soft = SeedLocalAdversarialAcquisition._softplus(arg)
+        return float(soft * soft)
+
+    def _energy_cap_barrier_penalty(self, mean_energy: float) -> float:
+        state = self.barrier_state
+        cfg = state.config
+        return float(cfg.energy_cap_lambda) * self._softplus_sq_value(
+            float(mean_energy) - float(state.seed_energy) - float(state.energy_cap),
+            float(cfg.energy_cap_delta),
+            cfg.softplus_cap,
+        )
+
+    @staticmethod
+    def _softplus_sq_derivative(u: float, delta: float, cap: float | None) -> float:
+        delta = max(float(delta), 1.0e-12)
+        arg = float(u) / delta
+        if cap is not None:
+            try:
+                cap_value = float(cap)
+            except (TypeError, ValueError):
+                cap_value = np.nan
+            if np.isfinite(cap_value) and arg > cap_value:
+                return 0.0
+        soft = SeedLocalAdversarialAcquisition._softplus(arg)
+        return float(2.0 * soft * _sigmoid(arg) / delta)
+
+    def _add_pair_barrier_gradient(
+        self,
+        grad: np.ndarray,
+        atoms: Atoms,
+        pair: Tuple[int, int],
+        coeff: float,
+        u: float,
+        delta: float,
+        sign_dudr: float,
+        scale: float,
+    ) -> None:
+        coords = np.asarray(atoms.coordinates, dtype=float)
+        i, j = int(pair[0]), int(pair[1])
+        if i < 0 or j < 0 or i >= len(coords) or j >= len(coords):
+            return
+        diff = coords[i] - coords[j]
+        dist = float(np.linalg.norm(diff))
+        if not np.isfinite(dist) or dist <= 1.0e-12:
+            return
+        deriv = (
+            float(coeff)
+            * self._softplus_sq_derivative(float(u), float(delta), self.barrier_state.config.softplus_cap)
+            * float(sign_dudr)
+            * float(scale)
+        )
+        vec = deriv * diff / dist
+        grad[i] += vec
+        grad[j] -= vec
+
+    def _pair_chemistry_barrier_gradient(self, atoms: Atoms) -> Tuple[np.ndarray, Tuple[str, ...]]:
+        state = self.barrier_state
+        cfg = state.config
+        grad = np.zeros_like(np.asarray(atoms.coordinates, dtype=float))
+        normalisation_mode = (
+            str(getattr(self.config.size_normalisation, "chemistry_barrier_mode", "family_mean"))
+            if bool(getattr(self.config.size_normalisation, "enabled", True))
+            else "raw_sum"
+        )
+        family_mean = normalisation_mode == "family_mean"
+        clash_scale = 1.0 / max(1, len(state.safe_nonbonded)) if family_mean else 1.0
+        expansion_scale = 1.0 / max(1, len(state.nonbonded_upper)) if family_mean else 1.0
+        bond_count = 2 * len(state.bonded_pairs)
+        bond_scale = 1.0 / max(1, bond_count) if family_mean else 1.0
+        coords = np.asarray(atoms.coordinates, dtype=float)
+        for pair, safe_distance in state.safe_nonbonded.items():
+            dist = float(np.linalg.norm(coords[int(pair[0])] - coords[int(pair[1])]))
+            self._add_pair_barrier_gradient(
+                grad,
+                atoms,
+                pair,
+                float(cfg.clash_lambda),
+                float(safe_distance) - dist,
+                float(cfg.clash_delta),
+                -1.0,
+                clash_scale,
+            )
+        for pair, upper_distance in state.nonbonded_upper.items():
+            dist = float(np.linalg.norm(coords[int(pair[0])] - coords[int(pair[1])]))
+            self._add_pair_barrier_gradient(
+                grad,
+                atoms,
+                pair,
+                float(cfg.nonbonded_expansion_lambda),
+                dist - float(upper_distance),
+                float(cfg.nonbonded_expansion_delta),
+                1.0,
+                expansion_scale,
+            )
+        if bool(getattr(cfg, "use_connectivity_barrier", True)):
+            for pair in state.bonded_pairs:
+                dist = float(np.linalg.norm(coords[int(pair[0])] - coords[int(pair[1])]))
+                self._add_pair_barrier_gradient(
+                    grad,
+                    atoms,
+                    pair,
+                    float(cfg.bond_lambda),
+                    float(state.bond_lower[pair]) - dist,
+                    float(cfg.bond_delta),
+                    -1.0,
+                    bond_scale,
+                )
+                self._add_pair_barrier_gradient(
+                    grad,
+                    atoms,
+                    pair,
+                    float(cfg.bond_lambda),
+                    dist - float(state.bond_upper[pair]),
+                    float(cfg.bond_delta),
+                    1.0,
+                    bond_scale,
+                )
+        reasons: List[str] = [
+            "angle_barrier_gradient_not_implemented",
+            "energy_cap_barrier_gradient_finite_differenced",
+        ]
+        return grad, tuple(reasons)
+
+    def _movement_utility_gradient(self, atoms: Atoms) -> np.ndarray:
+        cfg = self.config.movement_utility
+        band_cfg = self.config.movement_band
+        if not bool(cfg.enabled) or not bool(band_cfg.enabled):
+            return np.zeros_like(np.asarray(atoms.coordinates, dtype=float))
+        delta, weights = self._movement_delta_and_weights(atoms)
+        delta = np.asarray(delta, dtype=float).reshape(-1)
+        coord_weights = np.asarray(weights, dtype=float).reshape(-1)
+        coord_weights = np.where(np.isfinite(coord_weights) & (coord_weights > 0.0), coord_weights, 0.0)
+        if delta.size != coord_weights.size or delta.size != 3 * len(atoms):
+            return np.zeros_like(np.asarray(atoms.coordinates, dtype=float))
+        denom = float(np.sum(coord_weights) / 3.0)
+        if not np.isfinite(denom) or denom <= 0.0:
+            return np.zeros_like(np.asarray(atoms.coordinates, dtype=float))
+        distance = float(np.sqrt(max(0.0, float(np.sum(coord_weights * np.square(delta))) / denom)))
+        direction, _source = self.movement_direction()
+        direction = np.asarray(direction, dtype=float).reshape(-1)
+        if direction.size != delta.size:
+            direction = np.zeros_like(delta)
+        weighted_direction = direction * np.sqrt(coord_weights)
+        direction_norm = float(np.linalg.norm(weighted_direction))
+        band = self.movement_band()
+        low_soft = max(float(cfg.low_softness_ang), 1.0e-12)
+        high_soft = max(float(cfg.high_softness_ang), 1.0e-12)
+        s_low = _sigmoid((distance - float(band["low"])) / low_soft)
+        s_high = _sigmoid((float(band["high"]) - distance) / high_soft)
+        band_score = float(s_low * s_high)
+        d_band_dd = band_score * ((1.0 - s_low) / low_soft - (1.0 - s_high) / high_soft)
+        if distance > 1.0e-12:
+            d_distance = coord_weights * delta / max(denom * distance, 1.0e-24)
+        else:
+            d_distance = np.zeros_like(delta)
+        if np.isfinite(direction_norm) and direction_norm > 0.0:
+            d_progress = coord_weights * direction / direction_norm
+            progress = float(np.dot(delta, d_progress))
+        else:
+            d_progress = np.zeros_like(delta)
+            progress = 0.0
+        progress_scale = max(float(band["low"]), 1.0e-12)
+        progress_score = float(np.tanh(progress / progress_scale))
+        d_progress_score = (1.0 - progress_score * progress_score) / progress_scale
+        grad_delta = float(cfg.lambda_move) * (
+            float(cfg.band_fraction) * d_band_dd * d_distance
+            + float(cfg.progress_fraction) * d_progress_score * d_progress
+        )
+        return grad_delta.reshape((-1, 3))
+
+    def _hybrid_driver_geometry_gradient(self, atoms: Atoms, *, mode: str) -> np.ndarray:
+        """Hybrid cheap-driver gradient.
+
+        The posterior energy channel remains finite-differenced. Stable
+        geometry-only driver terms use local analytic gradients under the
+        same fixed-alignment approximation already used by the ALF projection
+        helpers. Any failure falls back to the previous finite-difference
+        cheap-driver gradient.
+        """
+        diag: Dict[str, object] = {
+            "driver_gradient_backend": "hybrid_geometry",
+            "driver_gradient_mode": str(mode),
+            "driver_gradient_fallback": False,
+            "driver_gradient_terms": [],
+            "driver_gradient_reasons": [],
+        }
+        self._last_driver_gradient_diagnostics = dict(diag)
+        driver = self.config.driver
+        try:
+            grad = np.zeros_like(np.asarray(atoms.coordinates, dtype=float))
+            if bool(getattr(driver, "finite_difference_energy", True)):
+                grad += self._driver_energy_finite_difference_gradient(atoms, mode=mode)
+                diag["driver_gradient_terms"].append("finite_difference_energy")
+            geom_grad = np.zeros_like(grad)
+            if bool(getattr(driver, "analytic_movement", True)):
+                geom_grad += float(driver.lambda_movement) * self._movement_utility_gradient(atoms)
+                diag["driver_gradient_terms"].append("analytic_movement")
+            if bool(getattr(driver, "analytic_whitened_distance", True)):
+                geom_grad -= float(driver.lambda_distance) * self._whitened_distance_gradient(atoms)
+                diag["driver_gradient_terms"].append("analytic_whitened_distance")
+            if bool(getattr(driver, "analytic_fullspace_rmsd", True)):
+                geom_grad -= float(driver.lambda_fullspace) * self._fullspace_confinement_gradient(atoms)
+                diag["driver_gradient_terms"].append("analytic_fullspace_rmsd")
+            if bool(getattr(driver, "analytic_pair_barriers", True)):
+                pair_grad, pair_reasons = self._pair_chemistry_barrier_gradient(atoms)
+                geom_grad -= float(driver.lambda_chemistry) * pair_grad
+                diag["driver_gradient_terms"].append("analytic_pair_barriers")
+                diag["driver_gradient_reasons"].extend(pair_reasons)
+            if mode == "active_fd":
+                geom_grad = self._active_project_cartesian_gradient(atoms, geom_grad)
+                diag["driver_gradient_terms"].append("active_projection")
+            grad += geom_grad
+            if not np.all(np.isfinite(grad)):
+                raise FloatingPointError("non_finite_hybrid_driver_gradient")
+            if bool(getattr(driver, "analytic_validation", False)):
+                fd = self._active_finite_difference_gradient(atoms, objective="cheap_driver") if mode == "active_fd" else self._cartesian_finite_difference_gradient(atoms, objective="cheap_driver")
+                num = float(np.dot(grad.reshape(-1), fd.reshape(-1)))
+                den = float(np.linalg.norm(grad.reshape(-1)) * np.linalg.norm(fd.reshape(-1)))
+                cosine = 1.0 if den <= 1.0e-24 else num / den
+                diag["driver_gradient_validation_cosine"] = float(cosine)
+                if cosine < float(getattr(driver, "analytic_validation_tol_cosine", 0.98)):
+                    diag["driver_gradient_reasons"].append("analytic_validation_cosine_below_tolerance")
+            self._last_driver_gradient_diagnostics = dict(diag)
+            return grad
+        except Exception as exc:
+            diag["driver_gradient_fallback"] = True
+            diag["driver_gradient_reasons"].append(
+                "hybrid_geometry_fallback:" + type(exc).__name__
+            )
+            self._last_driver_gradient_diagnostics = dict(diag)
+            if mode == "active_fd":
+                return self._active_finite_difference_gradient(atoms, objective="cheap_driver")
+            if mode == "cartesian_fd":
+                return self._cartesian_finite_difference_gradient(atoms, objective="cheap_driver")
+            raise

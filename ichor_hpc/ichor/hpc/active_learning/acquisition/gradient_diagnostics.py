@@ -1,0 +1,182 @@
+"""Small helpers for acquisition-gradient timing diagnostics."""
+from __future__ import annotations
+
+from typing import Any, Dict, Mapping, Optional
+
+import numpy as np
+
+
+def _finite_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out if np.isfinite(out) else default
+
+
+def _finite_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _posterior_diagnostics(acquisition) -> Dict[str, int]:
+    posterior = getattr(acquisition, "posterior", None)
+    diagnostics = getattr(posterior, "diagnostics", None)
+    if not isinstance(diagnostics, Mapping):
+        return {}
+    out: Dict[str, int] = {}
+    for key, value in diagnostics.items():
+        try:
+            out[str(key)] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def static_gradient_diagnostics(acquisition, atoms=None, *, gradient_mode=None, gradient_backend=None) -> Dict[str, Any]:
+    config = getattr(acquisition, "config", None)
+    gradient_config = getattr(config, "gradient", None)
+    mode = str(gradient_mode or getattr(gradient_config, "mode", "") or "")
+    raw_directions = getattr(acquisition, "mode_directions", ())
+    directions = tuple(raw_directions) if raw_directions is not None else ()
+    subspace_dim = len(directions)
+    natoms = 0
+    n_cartesian_dof = 0
+    if atoms is not None:
+        try:
+            natoms = int(len(atoms))
+        except Exception:
+            natoms = 0
+        n_cartesian_dof = 3 * natoms
+    live_cartesian_dof = n_cartesian_dof
+    if mode == "cartesian_fd" and atoms is not None:
+        setup = getattr(acquisition, "_fd_indices_eps", None)
+        if callable(setup):
+            try:
+                indices, _flat, _eps, _shape = setup(atoms)
+                live_cartesian_dof = len(indices)
+            except Exception:
+                live_cartesian_dof = n_cartesian_dof
+    if mode == "active_fd":
+        estimated_calls = 2 * subspace_dim
+    elif mode == "cartesian_fd":
+        estimated_calls = 2 * live_cartesian_dof
+    else:
+        estimated_calls = None
+    return {
+        "schema_version": 1,
+        "gradient_mode": mode or None,
+        "gradient_backend": None if gradient_backend is None else str(gradient_backend),
+        "natoms": int(natoms),
+        "n_cartesian_dof": int(n_cartesian_dof),
+        "n_live_cartesian_dof": int(live_cartesian_dof),
+        "subspace_dim": int(subspace_dim),
+        "n_estimated_acquisition_value_calls_per_gradient": (
+            None if estimated_calls is None else int(estimated_calls)
+        ),
+        "posterior_diagnostics": _posterior_diagnostics(acquisition),
+    }
+
+
+def calculator_gradient_diagnostics(calculator) -> Dict[str, Any]:
+    getter = getattr(calculator, "gradient_diagnostics", None)
+    if callable(getter):
+        try:
+            data = getter()
+        except Exception:
+            data = {}
+    else:
+        data = {}
+    if not isinstance(data, Mapping):
+        return {}
+    out = dict(data)
+    # Keep trace records compact and JSON-safe.
+    for key in (
+        "gradient_wall_seconds_last",
+        "gradient_wall_seconds_total",
+        "gradient_wall_seconds_mean",
+        "gradient_wall_seconds_max",
+        "last_gradient_norm",
+    ):
+        if key in out:
+            out[key] = _finite_float(out.get(key), 0.0)
+    for key in (
+        "gradient_call_count",
+        "natoms",
+        "n_cartesian_dof",
+        "n_live_cartesian_dof",
+        "subspace_dim",
+        "n_estimated_acquisition_value_calls_per_gradient",
+        "workers_requested",
+        "workers_used",
+    ):
+        if key in out and out[key] is not None:
+            out[key] = _finite_int(out.get(key), 0)
+    if "inside_gradient_worker" in out:
+        out["inside_gradient_worker"] = bool(out.get("inside_gradient_worker"))
+    if "driver_gradient_fallback" in out:
+        out["driver_gradient_fallback"] = bool(out.get("driver_gradient_fallback"))
+    for key in ("driver_gradient_terms", "driver_gradient_reasons"):
+        value = out.get(key)
+        if isinstance(value, (list, tuple)):
+            out[key] = [str(item) for item in value[:12]]
+    posterior = out.get("posterior_diagnostics")
+    if isinstance(posterior, Mapping):
+        out["posterior_diagnostics"] = {
+            str(k): _finite_int(v, 0) for k, v in posterior.items()
+        }
+    return out
+
+
+def flatten_trace_gradient_diagnostics(data: Mapping[str, Any]) -> Dict[str, Any]:
+    """Compact selected nested diagnostics into trace-friendly scalar fields."""
+    out: Dict[str, Any] = {}
+    for key in (
+        "gradient_mode",
+        "gradient_objective",
+        "gradient_backend",
+        "driver_gradient_backend",
+        "driver_gradient_mode",
+        "driver_gradient_fallback",
+        "workers_requested",
+        "workers_used",
+        "inside_gradient_worker",
+        "parallel_fallback_reason",
+        "natoms",
+        "n_cartesian_dof",
+        "n_live_cartesian_dof",
+        "subspace_dim",
+        "n_estimated_acquisition_value_calls_per_gradient",
+        "gradient_call_count",
+        "gradient_wall_seconds_last",
+        "gradient_wall_seconds_total",
+        "gradient_wall_seconds_mean",
+        "gradient_wall_seconds_max",
+        "last_gradient_norm",
+    ):
+        if key in data:
+            out[key] = data[key]
+    for key in ("driver_gradient_terms", "driver_gradient_reasons"):
+        value = data.get(key)
+        if isinstance(value, (list, tuple)):
+            out[key] = ",".join(str(item) for item in value[:12])
+    if "driver_gradient_validation_cosine" in data:
+        out["driver_gradient_validation_cosine"] = _finite_float(
+            data.get("driver_gradient_validation_cosine"),
+            None,
+        )
+    posterior = data.get("posterior_diagnostics")
+    if isinstance(posterior, Mapping):
+        for key in (
+            "n_means_batched_calls",
+            "n_covariance_matrix_batched_calls",
+            "n_means_scalar_fallbacks",
+            "n_covariance_matrix_scalar_fallbacks",
+            "n_mean_scalar_calls",
+            "n_covariance_scalar_calls",
+        ):
+            if key in posterior:
+                out["posterior_" + key] = posterior[key]
+    return out

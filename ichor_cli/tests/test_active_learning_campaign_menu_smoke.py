@@ -140,6 +140,88 @@ def test_campaign_config_block_submenus_show_values_and_edit_one_field(monkeypat
     assert "resources.walltime_hours: 37" in resources_menu.this_menu_options()
 
 
+def test_acquisition_gradient_menu_exposes_active_fd_controls():
+    import importlib
+
+    from ichor.hpc.active_learning.config import CampaignConfig, VALID_GRADIENT_MODES
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    cfg = CampaignConfig()
+    cfg.acquisition.gradient.mode = "active_fd"
+    cfg.acquisition.gradient.active_step = 3.0e-3
+    menu._replace_campaign_config(cfg, loaded_from=None)
+
+    gradient_menu = menu._BLOCK_MENUS_BY_LABEL["Edit acquisition.gradient"]
+    rendered = gradient_menu.this_menu_options()
+    field_specs = {spec.path: spec for spec in rendered.fields}
+
+    assert set(field_specs) == {
+        "acquisition.gradient.mode",
+        "acquisition.gradient.cartesian_step",
+        "acquisition.gradient.active_step",
+        "acquisition.gradient.regularization",
+        "acquisition.gradient.cartesian_step_floor",
+        "acquisition.gradient.ghost_mass_threshold",
+    }
+    assert set(field_specs["acquisition.gradient.mode"].choices) == set(VALID_GRADIENT_MODES)
+    assert "active_fd" in rendered
+    assert "acquisition.gradient.active_step: 0.003" in rendered
+
+
+def test_acquisition_driver_menu_exposes_driver_controls():
+    import importlib
+
+    from ichor.hpc.active_learning.config import (
+        CampaignConfig,
+        VALID_ACQUISITION_DRIVER_GRADIENT_BACKENDS,
+        VALID_ACQUISITION_DRIVER_OBJECTIVES,
+    )
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    cfg = CampaignConfig()
+    cfg.acquisition.driver.enabled = True
+    cfg.acquisition.driver.lambda_energy = 0.5
+    menu._replace_campaign_config(cfg, loaded_from=None)
+
+    driver_menu = menu._BLOCK_MENUS_BY_LABEL["Edit acquisition.driver"]
+    rendered = driver_menu.this_menu_options()
+    field_specs = {spec.path: spec for spec in rendered.fields}
+
+    assert set(field_specs) == {
+        "acquisition.driver.enabled",
+        "acquisition.driver.objective",
+        "acquisition.driver.gradient_backend",
+        "acquisition.driver.include_stencils",
+        "acquisition.driver.analytic_movement",
+        "acquisition.driver.analytic_whitened_distance",
+        "acquisition.driver.analytic_pair_barriers",
+        "acquisition.driver.analytic_fullspace_rmsd",
+        "acquisition.driver.finite_difference_energy",
+        "acquisition.driver.analytic_validation",
+        "acquisition.driver.analytic_validation_tol_cosine",
+        "acquisition.driver.lambda_energy",
+        "acquisition.driver.lambda_movement",
+        "acquisition.driver.lambda_distance",
+        "acquisition.driver.lambda_fullspace",
+        "acquisition.driver.lambda_chemistry",
+    }
+    assert set(field_specs["acquisition.driver.objective"].choices) == set(
+        VALID_ACQUISITION_DRIVER_OBJECTIVES
+    )
+    assert set(field_specs["acquisition.driver.gradient_backend"].choices) == set(
+        VALID_ACQUISITION_DRIVER_GRADIENT_BACKENDS
+    )
+    assert "acquisition.driver.enabled: True" in rendered
+    assert "acquisition.driver.gradient_backend: fd" in rendered
+    assert "acquisition.driver.lambda_energy: 0.5" in rendered
+
+
 def test_campaign_config_csv_and_optional_float_field_editors(monkeypatch):
     import importlib
 
@@ -282,6 +364,7 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
     cfg.acquisition.spectral.mode = "blend"
     cfg.acquisition.calibrated_energy.utility = "banded"
     cfg.acquisition.fullspace_confinement.enabled = True
+    cfg.acquisition.driver.enabled = True
     menu._replace_campaign_config(cfg, loaded_from=None)
     monkeypatch.setattr(menu, "_pause", lambda: None)
 
@@ -295,6 +378,8 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
     assert "acquisition.spectral.mode: blend" in out
     assert "acquisition.calibrated_energy.utility: banded" in out
     assert "acquisition.fullspace_confinement.enabled: True" in out
+    assert "acquisition.driver.enabled: True" in out
+    assert "acquisition.driver.objective: cheap_driver" in out
     assert "acquisition.stencils.weak_mode_gating_enabled: True" in out
     assert "acquisition.stencils.weak_mode_omega_band" in out
     assert "acquisition.stencils.anharmonic_caps" in out
@@ -327,6 +412,7 @@ def test_daemon_control_sampling_protocol_summary_uses_saved_campaign(tmp_path, 
     cfg.seed_selection.strategy = "d_optimal"
     cfg.error_calibration.mode = "record_only"
     cfg.acquisition.spectral.lambda_spectral = 2.5
+    cfg.acquisition.driver.enabled = True
     cfg.to_yaml(tmp_path / "campaign.yaml")
     set_selected_campaign_dir(tmp_path)
     monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: "")
@@ -337,6 +423,7 @@ def test_daemon_control_sampling_protocol_summary_uses_saved_campaign(tmp_path, 
     assert "seed_selection.strategy: d_optimal" in out
     assert "error_calibration.mode: record_only" in out
     assert "acquisition.spectral.lambda_spectral: 2.5" in out
+    assert "acquisition.driver.enabled: True" in out
     assert "acquisition.stencils.weak_mode_gating_enabled: True" in out
     assert "ariadne.trqn_backtransform_mode: geodesic" in out
     assert "ariadne.trqn_geodesic_bt_mode: dense" in out

@@ -46,6 +46,7 @@ def format_sampling_protocol_summary(config: CampaignConfig) -> str:
     size_norm = acq.size_normalisation
     movement_band = acq.movement_band
     movement_utility = acq.movement_utility
+    driver = acq.driver
     stencils = acq.stencils
     safety = config.adversarial_safety
     gates = config.quality_gates
@@ -162,6 +163,40 @@ def format_sampling_protocol_summary(config: CampaignConfig) -> str:
             + str(movement_utility.lambda_move)
             + ", direction="
             + str(movement_utility.direction),
+        )
+    )
+    lines.append(_line("acquisition.driver.enabled", driver.enabled))
+    lines.append(_line("acquisition.driver.objective", driver.objective))
+    lines.append(_line("acquisition.driver.gradient_backend", driver.gradient_backend))
+    lines.append(_line("acquisition.driver.include_stencils", driver.include_stencils))
+    lines.append(
+        _line(
+            "acquisition.driver.analytic_terms",
+            "movement="
+            + str(driver.analytic_movement)
+            + ", distance="
+            + str(driver.analytic_whitened_distance)
+            + ", pair_barriers="
+            + str(driver.analytic_pair_barriers)
+            + ", fullspace="
+            + str(driver.analytic_fullspace_rmsd)
+            + ", fd_energy="
+            + str(driver.finite_difference_energy),
+        )
+    )
+    lines.append(
+        _line(
+            "acquisition.driver.weights",
+            "energy="
+            + str(driver.lambda_energy)
+            + ", movement="
+            + str(driver.lambda_movement)
+            + ", distance="
+            + str(driver.lambda_distance)
+            + ", fullspace="
+            + str(driver.lambda_fullspace)
+            + ", chemistry="
+            + str(driver.lambda_chemistry),
         )
     )
     lines.append(

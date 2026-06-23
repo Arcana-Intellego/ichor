@@ -92,6 +92,14 @@ class TotalEnergyPosterior:
         )
         self._mean_cache: "OrderedDict[Tuple[object, Tuple[float, ...]], float]" = OrderedDict()
         self._cov_cache: "OrderedDict[Tuple[object, Tuple[float, ...], Tuple[float, ...]], float]" = OrderedDict()
+        self.diagnostics = {
+            "n_mean_scalar_calls": 0,
+            "n_means_batched_calls": 0,
+            "n_means_scalar_fallbacks": 0,
+            "n_covariance_scalar_calls": 0,
+            "n_covariance_matrix_batched_calls": 0,
+            "n_covariance_matrix_scalar_fallbacks": 0,
+        }
 
     @staticmethod
     def _cache_get(cache: OrderedDict, key):
@@ -108,6 +116,11 @@ class TotalEnergyPosterior:
         cache[key] = value
         while len(cache) > POSTERIOR_CACHE_MAX_SIZE:
             cache.popitem(last=False)
+
+    def _diagnostic_add(self, key: str, amount: int = 1) -> None:
+        diagnostics = getattr(self, "diagnostics", None)
+        if isinstance(diagnostics, dict):
+            diagnostics[key] = int(diagnostics.get(key, 0)) + int(amount)
 
     def _features(self, x: GeometryInput) -> Dict[str, np.ndarray]:
         features = self.models.get_features_dict(x)
@@ -139,6 +152,7 @@ class TotalEnergyPosterior:
         return tuple(np.round(arr, 12))
 
     def mean(self, x: GeometryInput) -> float:
+        self._diagnostic_add("n_mean_scalar_calls")
         key = (self._model_identity, self._geometry_key(x))
         cached = self._cache_get(self._mean_cache, key)
         if cached is not None:
@@ -161,6 +175,7 @@ class TotalEnergyPosterior:
         return stripped or str(atom)
 
     def covariance(self, x1: GeometryInput, x2: GeometryInput) -> float:
+        self._diagnostic_add("n_covariance_scalar_calls")
         key1 = self._geometry_key(x1)
         key2 = self._geometry_key(x2)
         cache_key = (
@@ -211,6 +226,19 @@ class TotalEnergyPosterior:
                 atom: float(_check_variance_array([value], "atom posterior variance")[0])
                 for atom, value in per_atom.items()
             },
+        )
+
+    @staticmethod
+    def _stack_feature_rows(
+        features: Sequence[Mapping[str, np.ndarray]],
+        atom: str,
+    ) -> np.ndarray:
+        return np.asarray(
+            [
+                np.asarray(features[i][atom], dtype=float).reshape(-1)
+                for i in range(len(features))
+            ],
+            dtype=float,
         )
 
     def atom_diagnostics(self, x: GeometryInput) -> Dict[str, Dict[str, float]]:
@@ -287,7 +315,7 @@ class TotalEnergyPosterior:
             total = total + diag
         return _check_variance_array(total, "posterior variances")
 
-    def covariance_matrix(self, points: Sequence[GeometryInput]) -> np.ndarray:
+    def _covariance_matrix_scalar(self, points: Sequence[GeometryInput]) -> np.ndarray:
         n = len(points)
         cov = np.zeros((n, n), dtype=float)
         for i in range(n):
@@ -296,7 +324,64 @@ class TotalEnergyPosterior:
                 value = self.covariance(points[i], points[j])
                 cov[i, j] = value
                 cov[j, i] = value
-        return cov
+        return _check_finite_array(cov, "posterior covariance matrix")
+
+    def _covariance_matrix_batched(self, points: Sequence[GeometryInput]) -> np.ndarray:
+        self._diagnostic_add("n_covariance_matrix_batched_calls")
+        n = len(points)
+        feats = [self._features(p) for p in points]
+        total_cov = np.zeros((n, n), dtype=float)
+        for atom, model in self._property_models.items():
+            X = self._stack_feature_rows(feats, atom)
+            kxx = _check_finite_array(model.kernel.k(X, X), "kernel covariance")
+            if kxx.shape != (n, n):
+                raise ValueError(
+                    f"kernel covariance shape for atom {atom} must be {(n, n)}, got {kxx.shape}"
+                )
+            r = _check_finite_array(model.r(X), "train-test covariance")
+            expected_r_shape = (int(model.ntrain), n)
+            if r.shape != expected_r_shape:
+                raise ValueError(
+                    f"train-test covariance shape for atom {atom} must be "
+                    f"{expected_r_shape}, got {r.shape}"
+                )
+            v = np.linalg.solve(model.lower_cholesky, r)
+            if v.shape != expected_r_shape:
+                raise ValueError(
+                    f"posterior solve shape for atom {atom} must be "
+                    f"{expected_r_shape}, got {v.shape}"
+                )
+            atom_cov = kxx - v.T @ v
+            if atom_cov.shape != (n, n):
+                raise ValueError(
+                    f"posterior covariance shape for atom {atom} must be {(n, n)}, got {atom_cov.shape}"
+                )
+            if self.scaled:
+                atom_cov = _estimated_signal_variance(model) * atom_cov
+            total_cov += atom_cov
+        total_cov = 0.5 * (total_cov + total_cov.T)
+        return _check_finite_array(total_cov, "posterior covariance matrix")
+
+    def covariance_matrix(
+        self,
+        points: Sequence[GeometryInput],
+        *,
+        chunk_size: Optional[int] = None,
+        prefer_batched: bool = True,
+    ) -> np.ndarray:
+        n = len(points)
+        if n == 0:
+            return np.zeros((0, 0), dtype=float)
+        if not prefer_batched:
+            return self._covariance_matrix_scalar(points)
+        if chunk_size is not None and int(chunk_size) > 0 and n > int(chunk_size):
+            self._diagnostic_add("n_covariance_matrix_scalar_fallbacks")
+            return self._covariance_matrix_scalar(points)
+        try:
+            return self._covariance_matrix_batched(points)
+        except Exception:
+            self._diagnostic_add("n_covariance_matrix_scalar_fallbacks")
+            return self._covariance_matrix_scalar(points)
 
     def cross_covariances(
         self,
@@ -334,5 +419,54 @@ class TotalEnergyPosterior:
                 cov[i, j] = self.covariance(x_left, x_right)
         return _check_finite_array(cov, "posterior cross-covariances")
 
-    def means(self, points: Sequence[GeometryInput]) -> np.ndarray:
-        return np.array([self.mean(point) for point in points], dtype=float)
+    def _means_scalar(self, points: Sequence[GeometryInput]) -> np.ndarray:
+        return _check_finite_array(
+            np.array([self.mean(point) for point in points], dtype=float),
+            "posterior means",
+        )
+
+    def _means_batched(self, points: Sequence[GeometryInput]) -> np.ndarray:
+        self._diagnostic_add("n_means_batched_calls")
+        n = len(points)
+        feats = [self._features(p) for p in points]
+        total = np.zeros(n, dtype=float)
+        for atom, model in self._property_models.items():
+            X = self._stack_feature_rows(feats, atom)
+            pred = _check_finite_array(model.predict(X), "posterior means").reshape(-1)
+            if pred.shape != (n,):
+                raise ValueError(
+                    f"model.predict(X) for atom {atom} must return {(n,)}, got {pred.shape}"
+                )
+            total += pred
+        return _check_finite_array(total, "posterior means")
+
+    def means(
+        self,
+        points: Sequence[GeometryInput],
+        *,
+        chunk_size: Optional[int] = None,
+        prefer_batched: bool = True,
+    ) -> np.ndarray:
+        n = len(points)
+        if n == 0:
+            return np.zeros(0, dtype=float)
+        if chunk_size is not None and int(chunk_size) > 0 and n > int(chunk_size):
+            chunks = [
+                self.means(
+                    points[i:i + int(chunk_size)],
+                    chunk_size=None,
+                    prefer_batched=prefer_batched,
+                )
+                for i in range(0, n, int(chunk_size))
+            ]
+            return _check_finite_array(
+                np.concatenate(chunks) if chunks else np.zeros(0, dtype=float),
+                "posterior means",
+            )
+        if not prefer_batched:
+            return self._means_scalar(points)
+        try:
+            return self._means_batched(points)
+        except Exception:
+            self._diagnostic_add("n_means_scalar_fallbacks")
+            return self._means_scalar(points)

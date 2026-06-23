@@ -27,12 +27,14 @@ Optional safety net at the boundary (all opt-in via constructor args):
 """
 from __future__ import annotations
 
+import time
 from typing import Optional
 
 import numpy as np
 
 from ichor.core.adversarial.acquisition import SeedLocalAdversarialAcquisition
 
+from .gradient_diagnostics import static_gradient_diagnostics
 from .rigid_projection import project_out_rigid
 
 
@@ -78,6 +80,7 @@ class AdversarialASECalculator:
         max_force_per_atom_ha_per_ang: Optional[float] = 50.0,
         gradient_mode: Optional[str] = None,
         gradient_backend: Optional[str] = None,
+        objective: str = "full",
         clamp_counter=None,
     ) -> None:
         self._acq = acquisition
@@ -95,12 +98,20 @@ class AdversarialASECalculator:
         # routes a cartesian_fd gradient through the parallel driver (process
         # forks a pool across the task's cores on linux; serial elsewhere).
         self._gradient_backend = gradient_backend
+        self._objective = str(objective or "full")
         self._clamp_counter = clamp_counter
         #cache results so a paired get_potential_energy + get_forces call on
         #the same geometry does not recompute the acquisition gradient.
         self._cache_key = None
         self._cache_energy = None
         self._cache_forces = None
+        self._last_atoms_for_diagnostics = None
+        self._gradient_call_count = 0
+        self._gradient_wall_seconds_total = 0.0
+        self._gradient_wall_seconds_last = 0.0
+        self._gradient_wall_seconds_max = 0.0
+        self._last_gradient_norm = 0.0
+        self._last_parallel_gradient_diagnostics = {}
 
     # --- public ASE-style API ----------------------------------------------
 
@@ -118,7 +129,59 @@ class AdversarialASECalculator:
         self._compute(atoms)
         return float(self._cache_energy), np.array(self._cache_forces, dtype=float)
 
+    def gradient_diagnostics(self) -> dict:
+        static = static_gradient_diagnostics(
+            self._acq,
+            self._last_atoms_for_diagnostics,
+            gradient_mode=(
+                self._gradient_mode
+                or getattr(
+                    getattr(getattr(self._acq, "config", None), "gradient", None),
+                    "mode",
+                    None,
+                )
+            ),
+            gradient_backend=self._gradient_backend,
+        )
+        static["gradient_objective"] = self._objective
+        driver_diag = getattr(self._acq, "_last_driver_gradient_diagnostics", None)
+        if isinstance(driver_diag, dict):
+            static.update(driver_diag)
+        count = int(self._gradient_call_count)
+        total = float(self._gradient_wall_seconds_total)
+        static.update({
+            "gradient_call_count": count,
+            "gradient_wall_seconds_last": float(self._gradient_wall_seconds_last),
+            "gradient_wall_seconds_total": total,
+            "gradient_wall_seconds_mean": (total / count if count else 0.0),
+            "gradient_wall_seconds_max": float(self._gradient_wall_seconds_max),
+            "last_gradient_norm": float(self._last_gradient_norm),
+        })
+        if isinstance(self._last_parallel_gradient_diagnostics, dict):
+            static.update(self._last_parallel_gradient_diagnostics)
+        return static
+
     # --- internals ----------------------------------------------------------
+
+    def _acquisition_value(self, atoms) -> float:
+        try:
+            return float(self._acq.value(atoms, objective=self._objective))
+        except TypeError:
+            if self._objective == "full":
+                return float(self._acq.value(atoms))
+            raise
+
+    def _acquisition_gradient(self, atoms):
+        try:
+            return self._acq.gradient(
+                atoms,
+                mode=self._gradient_mode,
+                objective=self._objective,
+            )
+        except TypeError:
+            if self._objective == "full":
+                return self._acq.gradient(atoms, mode=self._gradient_mode)
+            raise
 
     def _hartree(self) -> float:
         """Hartree -> eV conversion. Lazy-import ase.units so unit tests
@@ -149,28 +212,66 @@ class AdversarialASECalculator:
         else:
             ichor_atoms = atoms
 
-        alpha = float(self._acq.value(ichor_atoms))
+        alpha = self._acquisition_value(ichor_atoms)
         hartree = self._hartree()
         energy_ev = -alpha * hartree
 
         gmode = self._gradient_mode or getattr(
             getattr(getattr(self._acq, "config", None), "gradient", None), "mode", None
         )
-        if self._gradient_backend and gmode == "cartesian_fd":
-            from .parallel_gradient import compute_cartesian_gradient
-            grad = np.asarray(
-                compute_cartesian_gradient(
-                    self._acq, ichor_atoms, backend=self._gradient_backend
-                ),
-                dtype=float,
+        parallel_diagnostics = {}
+        if self._gradient_backend and gmode in {"cartesian_fd", "active_fd"}:
+            from .parallel_gradient import (
+                compute_active_gradient,
+                compute_cartesian_gradient,
+                last_gradient_parallel_diagnostics,
             )
+            t_grad = time.perf_counter()
+            try:
+                if gmode == "active_fd":
+                    raw_grad = compute_active_gradient(
+                        self._acq,
+                        ichor_atoms,
+                        backend=self._gradient_backend,
+                        objective=self._objective,
+                    )
+                else:
+                    raw_grad = compute_cartesian_gradient(
+                        self._acq,
+                        ichor_atoms,
+                        backend=self._gradient_backend,
+                        objective=self._objective,
+                    )
+                grad = np.asarray(raw_grad, dtype=float)
+                parallel_diagnostics = last_gradient_parallel_diagnostics()
+            finally:
+                elapsed = float(time.perf_counter() - t_grad)
+                self._gradient_call_count += 1
+                self._gradient_wall_seconds_last = elapsed
+                self._gradient_wall_seconds_total += elapsed
+                self._gradient_wall_seconds_max = max(
+                    self._gradient_wall_seconds_max, elapsed
+                )
         else:
-            grad = np.asarray(
-                self._acq.gradient(ichor_atoms, mode=self._gradient_mode),
-                dtype=float,
-            )
+            t_grad = time.perf_counter()
+            try:
+                grad = np.asarray(
+                    self._acquisition_gradient(ichor_atoms),
+                    dtype=float,
+                )
+            finally:
+                elapsed = float(time.perf_counter() - t_grad)
+                self._gradient_call_count += 1
+                self._gradient_wall_seconds_last = elapsed
+                self._gradient_wall_seconds_total += elapsed
+                self._gradient_wall_seconds_max = max(
+                    self._gradient_wall_seconds_max, elapsed
+                )
         if grad.ndim == 1:
             grad = grad.reshape(-1, 3)
+        self._last_atoms_for_diagnostics = ichor_atoms
+        self._last_gradient_norm = float(np.linalg.norm(grad))
+        self._last_parallel_gradient_diagnostics = dict(parallel_diagnostics)
 
         if self._project_rigid:
             grad = project_out_rigid(grad, ichor_atoms)

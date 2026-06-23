@@ -181,6 +181,33 @@ class MovementUtilityConfig:
 
 
 @dataclass(frozen=True)
+class DriverConfig:
+    """Cheap optimiser-driving acquisition objective.
+
+    When disabled, all existing calls use the full acquisition. When enabled
+    by the HPC runner, ARIADNE may use objective="cheap_driver" for gradients
+    while landing selection still evaluates objective="full".
+    """
+
+    enabled: bool = False
+    objective: str = "cheap_driver"
+    gradient_backend: str = "fd"
+    include_stencils: bool = False
+    analytic_movement: bool = True
+    analytic_whitened_distance: bool = True
+    analytic_pair_barriers: bool = True
+    analytic_fullspace_rmsd: bool = True
+    finite_difference_energy: bool = True
+    analytic_validation: bool = False
+    analytic_validation_tol_cosine: float = 0.98
+    lambda_energy: float = 1.0
+    lambda_movement: float = 1.0
+    lambda_distance: float = 1.0
+    lambda_fullspace: float = 1.0
+    lambda_chemistry: float = 1.0
+
+
+@dataclass(frozen=True)
 class GradientConfig:
     """Configuration for the pseudo-force gradient of the acquisition."""
 
@@ -229,5 +256,6 @@ class AcquisitionConfig:
     size_normalisation: SizeNormalisationConfig = SizeNormalisationConfig()
     movement_band: MovementBandConfig = MovementBandConfig()
     movement_utility: MovementUtilityConfig = MovementUtilityConfig()
+    driver: DriverConfig = DriverConfig()
     gradient: GradientConfig = GradientConfig()
     references: ReferenceScaleConfig = ReferenceScaleConfig()

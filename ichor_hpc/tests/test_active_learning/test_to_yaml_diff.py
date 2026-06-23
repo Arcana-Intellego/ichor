@@ -128,6 +128,22 @@ def test_save_load_round_trip_preserves_config(tmp_path):
     assert c2 == c
 
 
+def test_active_fd_gradient_settings_round_trip_through_yaml(tmp_path):
+    c = CampaignConfig()
+    c.acquisition.gradient.mode = "active_fd"
+    c.acquisition.gradient.active_step = 3.0e-3
+    c.acquisition.gradient.regularization = 4.0e-9
+
+    p = tmp_path / "campaign.yaml"
+    c.to_yaml(p)
+    c2 = CampaignConfig.from_yaml(p)
+
+    assert c2.acquisition.gradient.mode == "active_fd"
+    assert c2.acquisition.gradient.active_step == pytest.approx(3.0e-3)
+    assert c2.acquisition.gradient.regularization == pytest.approx(4.0e-9)
+    assert c2 == c
+
+
 def test_empty_diff_yaml_is_minimal(tmp_path):
     """A pristine config produces a tiny YAML (just schema_version)."""
     p = tmp_path / "c.yaml"

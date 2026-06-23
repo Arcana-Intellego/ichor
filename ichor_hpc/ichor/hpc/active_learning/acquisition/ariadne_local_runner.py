@@ -29,6 +29,11 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
+from .gradient_diagnostics import (
+    calculator_gradient_diagnostics,
+    flatten_trace_gradient_diagnostics,
+)
+
 
 # ASE's Hartree-to-eV scale. Here it is only the reversible pseudo-energy
 # scale used by AdversarialASECalculator at the ASE boundary.
@@ -411,6 +416,17 @@ def _append_trace_event(trace_path, **payload: Any) -> None:
             handle.write("\n")
     except Exception:
         return
+
+
+def _append_trace_event_with_gradient(trace_path, calculator, **payload: Any) -> None:
+    try:
+        gradient_payload = flatten_trace_gradient_diagnostics(
+            calculator_gradient_diagnostics(calculator)
+        )
+    except Exception:
+        gradient_payload = {}
+    gradient_payload.update(payload)
+    _append_trace_event(trace_path, **gradient_payload)
 
 
 def _trace_status(status) -> Dict[str, Any]:
@@ -1584,8 +1600,9 @@ def run_optimisation_against_calculator(
     })
 
     _raise_if_init_failed(opt, "DS" if not is_trqn else "TRQN")
-    _append_trace_event(
+    _append_trace_event_with_gradient(
         trace_path,
+        calculator,
         event="start",
         step=-1,
         optimiser=("trust_region_qn" if is_trqn else "dissipative_symplectic"),
@@ -1689,8 +1706,9 @@ def run_optimisation_against_calculator(
                 status=_status_tuple(opt),
             )
             trace_extra = _trace_status(status_after_stage0)
-            _append_trace_event(
+            _append_trace_event_with_gradient(
                 trace_path,
+                calculator,
                 event="trqn_no_proposal" if is_trqn else "no_proposal",
                 step=step_idx,
                 optimiser=(
@@ -1782,8 +1800,9 @@ def run_optimisation_against_calculator(
                                 no_proposal_failure_reason
                             )
                             diagnostics["trqn_retry_succeeded"] = None
-                            _append_trace_event(
+                            _append_trace_event_with_gradient(
                                 trace_path,
+                                calculator,
                                 event="trqn_retry",
                                 step=step_idx,
                                 optimiser="trust_region_qn",
@@ -1860,8 +1879,9 @@ def run_optimisation_against_calculator(
                             diagnostics[
                                 "trqn_consecutive_backtransform_fail_count"
                             ] = bt_count
-                            _append_trace_event(
+                            _append_trace_event_with_gradient(
                                 trace_path,
+                                calculator,
                                 event="fallback_to_ds",
                                 step=step_idx,
                                 optimiser="dissipative_symplectic",
@@ -1975,8 +1995,9 @@ def run_optimisation_against_calculator(
         else:
             diagnostics["n_rejected_steps"] += 1
             consecutive_rejects += 1
-        _append_trace_event(
+        _append_trace_event_with_gradient(
             trace_path,
+            calculator,
             event="accepted_step" if accepted else "rejected_step",
             step=step_idx,
             optimiser=("trust_region_qn" if is_trqn else "dissipative_symplectic"),
@@ -2029,8 +2050,9 @@ def run_optimisation_against_calculator(
                 diagnostics["fallback_to_ds_step"] = int(step_idx)
                 diagnostics["fallback_to_ds_reason"] = "reject_streak"
                 diagnostics["trqn_failed_reason"] = "reject_streak"
-                _append_trace_event(
+                _append_trace_event_with_gradient(
                     trace_path,
+                    calculator,
                     event="fallback_to_ds",
                     step=step_idx,
                     optimiser="dissipative_symplectic",
@@ -2066,8 +2088,9 @@ def run_optimisation_against_calculator(
         converged=bool(converged),
     )
     if int(return_code) == 1:
-        _append_trace_event(
+        _append_trace_event_with_gradient(
             trace_path,
+            calculator,
             event="max_iterations",
             step=int(run_config.max_iter),
             optimiser=("trust_region_qn" if is_trqn else "dissipative_symplectic"),
@@ -2081,8 +2104,9 @@ def run_optimisation_against_calculator(
             reason=str(diagnostics.get("last_return_code_reason", "")),
             wall_seconds=float(time.perf_counter() - t0),
         )
-    _append_trace_event(
+    _append_trace_event_with_gradient(
         trace_path,
+        calculator,
         event="finish",
         step=int(len(alpha_trajectory) - 1),
         optimiser=("trust_region_qn" if is_trqn else "dissipative_symplectic"),

@@ -37,6 +37,7 @@ __all__ = [
     "AcquisitionSizeNormalisationBlock",
     "AcquisitionMovementBandBlock",
     "AcquisitionMovementUtilityBlock",
+    "AcquisitionDriverBlock",
     "AcquisitionGradientBlock",
     "AcquisitionReferencesBlock",
     "AcquisitionConfigBlock",
@@ -65,6 +66,8 @@ __all__ = [
     "VALID_MOVEMENT_BAND_METRICS",
     "VALID_MOVEMENT_BAND_STATISTICS",
     "VALID_MOVEMENT_DIRECTIONS",
+    "VALID_ACQUISITION_DRIVER_OBJECTIVES",
+    "VALID_ACQUISITION_DRIVER_GRADIENT_BACKENDS",
     "VALID_GAUSSIAN_MEMORY_MODES",
     "VALID_ERROR_CALIBRATION_MODEL_VERSION_POLICIES",
     "VALID_TRQN_SCALE_MODES",
@@ -109,6 +112,8 @@ VALID_MOVEMENT_DIRECTIONS = frozenset({
     "initial_projected_acquisition_gradient",
     "dominant_active_mode",
 })
+VALID_ACQUISITION_DRIVER_OBJECTIVES = frozenset({"cheap_driver", "full"})
+VALID_ACQUISITION_DRIVER_GRADIENT_BACKENDS = frozenset({"fd", "hybrid_geometry"})
 VALID_GAUSSIAN_MEMORY_MODES = frozenset({"slurm_env", "link0"})
 VALID_TRQN_SCALE_MODES = frozenset({
     "off",
@@ -387,6 +392,26 @@ class AcquisitionMovementUtilityBlock:
 
 
 @dataclass
+class AcquisitionDriverBlock:
+    enabled: bool = False
+    objective: str = "cheap_driver"
+    gradient_backend: str = "fd"
+    include_stencils: bool = False
+    analytic_movement: bool = True
+    analytic_whitened_distance: bool = True
+    analytic_pair_barriers: bool = True
+    analytic_fullspace_rmsd: bool = True
+    finite_difference_energy: bool = True
+    analytic_validation: bool = False
+    analytic_validation_tol_cosine: float = 0.98
+    lambda_energy: float = 1.0
+    lambda_movement: float = 1.0
+    lambda_distance: float = 1.0
+    lambda_fullspace: float = 1.0
+    lambda_chemistry: float = 1.0
+
+
+@dataclass
 class AcquisitionGradientBlock:
     mode: str = "cartesian_fd"
     cartesian_step: float = 1.0e-4
@@ -419,6 +444,7 @@ class AcquisitionConfigBlock:
     size_normalisation: AcquisitionSizeNormalisationBlock = field(default_factory=AcquisitionSizeNormalisationBlock)
     movement_band: AcquisitionMovementBandBlock = field(default_factory=AcquisitionMovementBandBlock)
     movement_utility: AcquisitionMovementUtilityBlock = field(default_factory=AcquisitionMovementUtilityBlock)
+    driver: AcquisitionDriverBlock = field(default_factory=AcquisitionDriverBlock)
     gradient: AcquisitionGradientBlock = field(default_factory=AcquisitionGradientBlock)
     references: AcquisitionReferencesBlock = field(default_factory=AcquisitionReferencesBlock)
 
@@ -1576,6 +1602,49 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "acquisition.movement_utility.high_softness_ang must be > 0"
             )
+        driver = self.acquisition.driver
+        if not isinstance(driver.enabled, bool):
+            raise ConfigValidationError(
+                "acquisition.driver.enabled must be a boolean"
+            )
+        if driver.objective not in VALID_ACQUISITION_DRIVER_OBJECTIVES:
+            raise ConfigValidationError(
+                "acquisition.driver.objective must be one of "
+                + repr(sorted(VALID_ACQUISITION_DRIVER_OBJECTIVES))
+            )
+        if driver.gradient_backend not in VALID_ACQUISITION_DRIVER_GRADIENT_BACKENDS:
+            raise ConfigValidationError(
+                "acquisition.driver.gradient_backend must be one of "
+                + repr(sorted(VALID_ACQUISITION_DRIVER_GRADIENT_BACKENDS))
+            )
+        if not isinstance(driver.include_stencils, bool):
+            raise ConfigValidationError(
+                "acquisition.driver.include_stencils must be a boolean"
+            )
+        for name, value in (
+            ("acquisition.driver.analytic_movement", driver.analytic_movement),
+            ("acquisition.driver.analytic_whitened_distance", driver.analytic_whitened_distance),
+            ("acquisition.driver.analytic_pair_barriers", driver.analytic_pair_barriers),
+            ("acquisition.driver.analytic_fullspace_rmsd", driver.analytic_fullspace_rmsd),
+            ("acquisition.driver.finite_difference_energy", driver.finite_difference_energy),
+            ("acquisition.driver.analytic_validation", driver.analytic_validation),
+        ):
+            if not isinstance(value, bool):
+                raise ConfigValidationError(name + " must be a boolean")
+        if not (0.0 <= float(driver.analytic_validation_tol_cosine) <= 1.0):
+            raise ConfigValidationError(
+                "acquisition.driver.analytic_validation_tol_cosine must be in [0, 1]"
+            )
+        for name, value in (
+            ("acquisition.driver.lambda_energy", driver.lambda_energy),
+            ("acquisition.driver.lambda_movement", driver.lambda_movement),
+            ("acquisition.driver.lambda_distance", driver.lambda_distance),
+            ("acquisition.driver.lambda_fullspace", driver.lambda_fullspace),
+            ("acquisition.driver.lambda_chemistry", driver.lambda_chemistry),
+        ):
+            if value is None:
+                raise ConfigValidationError(name + " must be a number")
+            _validate_optional_nonnegative_float(name, value)
         stencils = self.acquisition.stencils
         if stencils.negative_curvature_policy not in VALID_NEGATIVE_CURVATURE_POLICIES:
             raise ConfigValidationError(
@@ -1681,6 +1750,7 @@ class CampaignConfig:
             AcquisitionConfig,
             BarrierConfig,
             CalibratedEnergyConfig,
+            DriverConfig,
             FullspaceConfinementConfig,
             GradientConfig,
             MovementBandConfig,
@@ -1702,6 +1772,7 @@ class CampaignConfig:
         sn = self.acquisition.size_normalisation
         mb = self.acquisition.movement_band
         mu = self.acquisition.movement_utility
+        dr = self.acquisition.driver
         gr = self.acquisition.gradient
         re = self.acquisition.references
         return AcquisitionConfig(
@@ -1822,6 +1893,24 @@ class CampaignConfig:
                 progress_fraction=mu.progress_fraction,
                 low_softness_ang=mu.low_softness_ang,
                 high_softness_ang=mu.high_softness_ang,
+            ),
+            driver=DriverConfig(
+                enabled=dr.enabled,
+                objective=dr.objective,
+                gradient_backend=dr.gradient_backend,
+                include_stencils=dr.include_stencils,
+                analytic_movement=dr.analytic_movement,
+                analytic_whitened_distance=dr.analytic_whitened_distance,
+                analytic_pair_barriers=dr.analytic_pair_barriers,
+                analytic_fullspace_rmsd=dr.analytic_fullspace_rmsd,
+                finite_difference_energy=dr.finite_difference_energy,
+                analytic_validation=dr.analytic_validation,
+                analytic_validation_tol_cosine=dr.analytic_validation_tol_cosine,
+                lambda_energy=dr.lambda_energy,
+                lambda_movement=dr.lambda_movement,
+                lambda_distance=dr.lambda_distance,
+                lambda_fullspace=dr.lambda_fullspace,
+                lambda_chemistry=dr.lambda_chemistry,
             ),
             gradient=GradientConfig(
                 mode=gr.mode,
