@@ -148,6 +148,7 @@ def test_whitened_distance_gradient_uses_value_regularisation_scale():
     expected = 2.0 * np.linalg.inv(
         acq.subspace.active_covariance + reg * np.eye(3)
     ) @ disp
+    expected = expected / acq.subspace.dimension
     np.testing.assert_allclose(out.reshape(-1), expected)
 
 

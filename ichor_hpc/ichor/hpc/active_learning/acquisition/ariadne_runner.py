@@ -1285,6 +1285,7 @@ def _mock_optimise_seed(
 
     wall = max(time.perf_counter() - t0, 1.0e-6)
     landing_safety = _mock_landing_safety(seed, final)
+    metrics = dict(landing_safety.get("metrics") or {})
     landing_candidates = [dict(landing_safety["raw_final"])]
     per_atom = []
     for idx, atom in enumerate(final):
