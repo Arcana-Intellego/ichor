@@ -1,59 +1,303 @@
-# minimal one-iteration campaign config for the first CSF3 live smoke.
-# see README.md in this directory for the full walkthrough.
+# campaign.yaml
+# Generic first-live-iteration active-learning campaign for CSF3/CSF4.
+# Intended for a small validation run, not a long production campaign.
 
 schema_version: 2
-system_name: WATER
 
+# -------------------------------------------------------------------------
+# Required system-level identifiers
+# -------------------------------------------------------------------------
+
+# Filename-safe token: letters/numbers/_/-, no spaces.
+system_name: CHANGE_ME_SYSTEM
+
+# First live iteration only.
+# This means: bootstrap initial training/model, then run one active-learning loop.
 max_iterations: 1
+
 poll_interval_seconds: 60
+poll_interval_idle_seconds: 120
+poll_sacct_empty_max_ticks: 10
 
-initial_train_size: 8
-initial_val_size: 2
+# Keep first-live examples small enough to debug quickly.
+# Increase for real campaigns.
+initial_train_size: 24
+initial_val_size: 6
 
+failure_threshold_fraction: 0.5
+
+# Prefer the new RMS TRQN scaling and movement gates; leave force clamp unset
+# so the legacy safe default is used through max_force_per_atom_ha_per_ang.
+max_acquisition_grad_per_ang: null
+max_force_per_atom_ha_per_ang: 50.0
+
+# -------------------------------------------------------------------------
+# Trajectory pool
+# -------------------------------------------------------------------------
+
+trajectory_pool:
+  # The import-pool command writes the canonical pool under .DATA/TRAJECTORY.
+  # Leave this empty unless your code path explicitly consumes it.
+  source_path: ""
+
+outlier_filter:
+  enabled: true
+  energy_z_threshold: 3.0
+  per_atom_rmsd_z_threshold: 4.0
+
+# -------------------------------------------------------------------------
+# Batch sizing and seed selection
+# -------------------------------------------------------------------------
+
+# Small first-live batch. For a real campaign, use larger values.
 batch_sizing:
-  policy: linear
+  policy: fixed
   floor: 4
-  cap: 8
+  cap: 4
 
 seed_selection:
   n_seeds_per_iteration: 4
   bulk_fraction: 0.5
+  variance_chunk_size: 512
+  strategy: hybrid_variance
+  d_optimal_pool_multiplier: 8
+  d_optimal_jitter: 1.0e-12
+  d_optimal_novelty_floor: 1.0e-12
+  d_optimal_score_power: 1.0
 
-resources:
-  partition: multicore
-  walltime_hours: 2
-  polus_walltime_hours: 1
-  gaussian_walltime_hours: 2
-  aimall_walltime_hours: 2
-  ariadne_walltime_hours: 1
-  ferebus_walltime_hours: 2
-  mem_per_cpu: auto
-  cpus_per_task: 2
-  ntasks: 1
-  aimall_cpus_per_task: 8
-  ariadne_cpus_per_task: 8
-  array_concurrency_limit: null
+anti_overlap:
+  skip_training_seeds: true
+  recent_seeds_cooldown: 3
+  min_post_ariadne_whitened_distance: 0.01
+  max_post_ariadne_whitened_distance: 10.0
+  enforce_post_ariadne: false
 
-gaussian:
-  nproc: 2
-  memory_mode: slurm_env
+phase_b:
+  descriptor: hybrid_alf_rmsd
+  beta: 0.3
+  min_separation: 0.05
 
-aimall:
-  nogui: true
-  naat: auto
-  encomp: 3
-  boaq: auto_gs2
-  iasmesh: medium
+split:
+  strategy: stratified_with_holdout
+  train_fraction: 0.75
+  val_mid_fraction: 0.15
+  high_holdout_fraction: 0.10
+
+# -------------------------------------------------------------------------
+# FEREBUS
+# -------------------------------------------------------------------------
+
+ferebus:
+  warmstart: adaptive
+  warmstart_streak: 5
+  kernel: rbfc_per
+  loss: huber
+  nagents: 20
+  maxiter: 200
+  is_constant_noise: true
+  scaling: true
+  full_ARD: true
+  properties:
+    - iqa
+  train_fraction: 0.8
+  int_val_fraction: 0.1
+  ext_val_fraction: 0.1
+
+# -------------------------------------------------------------------------
+# Acquisition function
+# -------------------------------------------------------------------------
+
+acquisition:
+  property_name: iqa
+  use_scaled_posterior_covariance: true
+  allow_uniform_posterior_fallback: false
+
+  subspace:
+    neighbour_count: 50
+    neighbour_deduplicate_rmsd: 1.0e-3
+    variance_capture: 0.90
+    min_subspace_dim: 3
+    max_subspace_dim: 6
+    gaussian_weight_sigma: null
+    covariance_regularization: 1.0e-10
+    canonicalise_basis: true
+    degeneracy_tolerance: 1.0e-3
+    mode_weighting_policy: variance
+
+  barrier:
+    use_connectivity_barrier: true
+    nonbonded_clash_scale: 0.85
+    clash_delta: 0.05
+    clash_lambda: 5.0
+    nonbonded_expansion_scale: 1.80
+    nonbonded_expansion_delta: 0.10
+    nonbonded_expansion_lambda: 0.5
+    bond_lower_scale: 0.80
+    bond_upper_scale: 1.25
+    bond_delta: 0.05
+    bond_lambda: 2.0
+    angle_lower_scale: 0.65
+    angle_upper_scale: 1.35
+    angle_delta: 0.10
+    angle_lambda: 0.5
+    energy_cap_quantile: 0.95
+    energy_cap_floor: 0.05
+    energy_cap_delta: 0.05
+    energy_cap_lambda: 1.0
+    softplus_cap: 10.0
+
+  stencils:
+    step_scale: 0.30
+    min_step: 1.0e-3
+    max_step: 0.10
+    jitter: 1.0e-12
+    curvature_floor: 1.0e-6
+    softplus_scale: 1.0e-4
+    autotune_from_cubic: true
+    negative_curvature_policy: ignore
+    lambda_negative_curvature: 1.0
+    weak_mode_gating_enabled: true
+    weak_mode_omega_low_fraction: 0.05
+    weak_mode_omega_high_fraction: 0.15
+    weak_mode_abs_omega_floor: 1.0e-4
+    weak_mode_penalty: 2.0
+    max_anharmonic_mode_score: 6.0
+    max_anharmonic_total_score: 15.0
+
+  weights:
+    lambda_force: 1.0
+    lambda_frequency: 1.0
+    lambda_anharmonic: 0.75
+    lambda_energy: 0.15
+    lambda_distance: 1.0
+
+  spectral:
+    enabled: true
+    mode: blend
+    mode_weighting: inverse_frequency
+    lambda_spectral: 1.5
+    omega_floor: 1.0e-6
+    low_frequency_power: 1.0
+    max_modes: null
+
+  calibrated_energy:
+    utility: banded
+    band_low_ha: null
+    band_high_ha: null
+    low_softness_ha: null
+    high_softness_ha: null
+    fallback_to_raw_variance: true
+
+  fullspace_confinement:
+    enabled: true
+    lambda_residual: 0.5
+    lambda_rmsd: 0.25
+    residual_scale: local_neighbour_median
+    fixed_residual_scale_ang: null
+    rmsd_scale_ang: 0.50
+    min_residual_scale_ang: 1.0e-3
+    failure_penalty: 1.0e6
+
+  size_normalisation:
+    enabled: true
+    energy_mode: per_sqrt_atom
+    whitened_distance_mode: per_subspace_dim
+    chemistry_barrier_mode: family_mean
+
+  movement_band:
+    enabled: true
+    metric: aligned_active_rmsd
+    local_statistic: p25
+    hard_min_floor_ang: 0.010
+    target_low_floor_ang: 0.020
+    target_peak_floor_ang: 0.035
+    target_high_cap_ang: 0.120
+    hard_max_cap_ang: 0.180
+    hard_min_fraction: 0.10
+    target_low_fraction: 0.25
+    target_peak_fraction: 0.40
+    target_high_fraction: 0.75
+    hard_max_fraction: 1.25
+
+  movement_utility:
+    enabled: true
+    direction: initial_projected_acquisition_gradient
+    lambda_move: 0.75
+    band_fraction: 0.75
+    progress_fraction: 0.25
+    low_softness_ang: 0.005
+    high_softness_ang: 0.020
+
+  # First-live default: use full scientific objective for ARIADNE.
+  # After this validates, test:
+  #   enabled: true
+  #   objective: cheap_driver
+  #   gradient_backend: fd
+  # and finally:
+  #   enabled: true
+  #   objective: cheap_driver
+  #   gradient_backend: hybrid_geometry
+  driver:
+    enabled: false
+    objective: cheap_driver
+    gradient_backend: fd
+    include_stencils: false
+    analytic_movement: true
+    analytic_whitened_distance: true
+    analytic_pair_barriers: true
+    analytic_fullspace_rmsd: true
+    finite_difference_energy: true
+    analytic_validation: false
+    analytic_validation_tol_cosine: 0.98
+    lambda_energy: 1.0
+    lambda_movement: 1.0
+    lambda_distance: 1.0
+    lambda_fullspace: 1.0
+    lambda_chemistry: 1.0
+
+  # The key first-live setting: active-mode FD, not full Cartesian FD.
+  gradient:
+    mode: active_fd
+    cartesian_step: 1.0e-4
+    active_step: 1.0e-3
+    regularization: 1.0e-10
+    cartesian_step_floor: 0.0
+    ghost_mass_threshold: 0.0
+
+  references:
+    max_reference_samples: 24
+    floor: 1.0e-12
+    refresh_policy: every_n_iterations
+    refresh_period: 3
+
+# -------------------------------------------------------------------------
+# ARIADNE
+# -------------------------------------------------------------------------
 
 ariadne:
   optimiser: trust_region_qn
   hessian_model: SCHLEGEL
-  max_iter: 50
+  max_iter: 200
   gradf_tol: 1.0e-4
-  trqn_scale_mode: adaptive_initial_gradient
+  f_tol: 1.0e-6
+  delta0: 0.10
+  delta_max: 0.40
+  gamma: 0.10
+  fallback_to_ds: true
+
+  trqn_scale_mode: adaptive_initial_gradient_rms
   trqn_target_initial_grad_norm: 0.01
   trqn_retry_target_initial_grad_norm: 0.003
+  trqn_target_initial_grad_rms: 2.0e-4
+  trqn_retry_target_initial_grad_rms: 4.0e-4
+  trqn_under_move_target_initial_grad_rms: 6.0e-4
+  trqn_under_move_retry: true
+  trqn_under_move_retry_max: 1
+  trqn_min_objective_scale: 1.0e-8
+  trqn_max_objective_scale: 1.0
+  trqn_fixed_objective_scale: 1.0
   trqn_retry_on_no_proposal: true
+
   trqn_backtransform_mode: geodesic
   trqn_geodesic_bt_mode: dense
   trqn_geodesic_dt: 1.0e-2
@@ -62,21 +306,125 @@ ariadne:
   trqn_max_backtransform_iter: 50
   trqn_trust_min: 1.0e-4
 
-ferebus:
-  scaling: false
+# -------------------------------------------------------------------------
+# Landing safety / quality gates
+# -------------------------------------------------------------------------
 
-runtime:
-  poll_sacct_missing_max_ticks: 30
-  poll_sacct_unknown_max_ticks: 3
-  postprocess_settle_attempts: 3
-  postprocess_settle_seconds: 10
-  transient_phase_retry_max: 1
-
-quality_gates:
-  ariadne_max_displacement_ang: 1.25
-  ariadne_min_pair_distance_ang: 0.60
+adversarial_safety:
+  enabled: true
+  reject_unsafe_landings: true
+  salvage_safe_iterate: true
+  backtrack_to_safe_landing: true
+  backtrack_points: 16
+  allow_seed_fallback: false
+  min_whitened_distance: 0.0
+  max_whitened_distance: 10.0
+  enforce_min_whitened_distance: false
+  max_predicted_energy_delta_ha: null
+  max_energy_variance: null
+  max_chemistry_penalty: null
+  phase_b_filter_enabled: true
+  enforce_movement_band: true
+  under_move_retry: true
+  reject_under_moved_after_retry: true
+  reject_over_moved: true
 
 error_calibration:
   enabled: true
   mode: record_only
+  min_records_to_apply: 100
+  n_bins: 10
+  min_bin_records: 8
   apply_strength: 0.0
+  group_by_atom_type: true
+  group_by_landing_policy: false
+  model_version_policy: current
+  output_units: ha
+
+quality_gates:
+  require_readable_aimall_geometry: true
+  require_finite_iqa: true
+  require_finite_integration_error: true
+  max_abs_integration_error: null
+  iqa_energy_recovery_tolerance_ha: null
+  ferebus_min_ext_r2: null
+  ferebus_max_ext_rmse_ha: null
+  ferebus_max_condition_number: null
+  ariadne_max_displacement_ang: 1.25
+  ariadne_min_pair_distance_ang: 0.60
+
+# -------------------------------------------------------------------------
+# Daemon runtime
+# -------------------------------------------------------------------------
+
+runtime:
+  lease_stale_seconds: 900
+  postprocess_settle_attempts: 3
+  postprocess_settle_seconds: 10
+  transient_phase_retry_max: 1
+  poll_sacct_unknown_max_ticks: 3
+  poll_sacct_missing_max_ticks: 3
+
+stop:
+  alpha0_streak_threshold: 1.0e-2
+  alpha0_streak_length: 5
+  rel_alpha_improvement_min: 0.02
+  rel_alpha_improvement_window: 3
+  min_iterations_before_stop: 8
+
+# -------------------------------------------------------------------------
+# Slurm resources
+# -------------------------------------------------------------------------
+
+resources:
+  partition: multicore
+  walltime_hours: 24
+
+  # Optional per-phase overrides. Keep these conservative for first live tests.
+  polus_walltime_hours: 2
+  gaussian_walltime_hours: 24
+  aimall_walltime_hours: 24
+  ariadne_walltime_hours: 4
+  ferebus_walltime_hours: 24
+
+  # Keep auto for CSF3/CSF4 examples; the live profile resolves cluster memory.
+  mem_per_cpu: auto
+
+  cpus_per_task: 1
+  ntasks: 1
+
+  # AIMAll and ARIADNE get separate CPU settings.
+  aimall_cpus_per_task: 8
+  ariadne_cpus_per_task: 8
+
+  # Keep the first live example gentle on the scheduler.
+  # For larger campaigns, increase or remove this.
+  array_concurrency_limit: 4
+
+  # Use process parallelism for the active_fd gradient path.
+  gradient_parallel_backend: process
+
+# -------------------------------------------------------------------------
+# Quantum chemistry / AIMAll
+# -------------------------------------------------------------------------
+
+gaussian:
+  method: B3LYP
+  basis_set: aug-cc-pVTZ
+
+  # CHANGE THESE PER SYSTEM.
+  charge: 0
+  spin_multiplicity: 1
+
+  extra_keywords: ""
+  nproc: 1
+  mem: 8GB
+  memory_mode: slurm_env
+  memory_fraction_of_slurm: 0.85
+
+aimall:
+  encomp: 3
+  nogui: true
+  naat: auto
+  boaq: auto
+  iasmesh: fine
