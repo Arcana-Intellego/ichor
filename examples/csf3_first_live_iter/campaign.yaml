@@ -196,7 +196,7 @@ acquisition:
     fixed_residual_scale_ang: null
     rmsd_scale_ang: 0.50
     min_residual_scale_ang: 1.0e-3
-    failure_penalty: 1.0e6
+    failure_penalty: 1.0e+6
 
   size_normalisation:
     enabled: true
