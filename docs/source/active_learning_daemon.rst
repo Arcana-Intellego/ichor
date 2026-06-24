@@ -105,7 +105,7 @@ The :code:`campaign.yaml` file is a nested block layout. The full
 minimal sparse config overrides only the keys you care about; every other
 field falls back to its dataclass default::
 
-    schema_version: 2
+    schema_version: 3
 
     max_iterations: 50
     poll_interval_seconds: 60

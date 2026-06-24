@@ -57,6 +57,12 @@ from .phase_executor import (
     PhaseResult,
     SBATCH_PHASES,
 )
+from .resource_solver import (
+    ResolvedPhaseResources,
+    gaussian_mdef_gb,
+    resolve_phase_resources,
+    validate_gaussian_link0_memory,
+)
 from .preflight import BackendAvailability, check_backends, missing_backend_message
 from .cluster_profile import (
     active_machine,
@@ -650,7 +656,22 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 raise BackendSubmissionError("nothing to submit for " + phase_name + ": staged 0 tasks")
             f = self.config.ferebus
             resources = getattr(self.config, "resources", None)
-            ncores = int(resources.cpus_for(phase_name)) if resources is not None else 1
+            effective_partition = (
+                str(self.partition)
+                if self.partition is not None
+                else str(getattr(resources, "partition", "multicore"))
+            )
+            resolved = resolve_phase_resources(
+                phase_name=phase_name,
+                config=self.config,
+                partition=effective_partition,
+                campaign_dir=self.campaign_dir,
+                iteration=int(getattr(state, "iteration", 0)),
+            )
+            self._journal_event(
+                "resolved_phase_resources",
+                **resolved.journal_payload(phase_name=phase_name),
+            )
             ferebus_path = _configured_backend_path("ferebus", "ferebus")
             allow_bare_ferebus = (
                 os.environ.get("ICHOR_ALLOW_BARE_FEREBUS", "") == "1"
@@ -674,7 +695,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 staging,
                 platform=ferebus_platform,
                 walltime_hours=effective_walltime,
-                ncores=max(1, ncores),
+                ncores=max(1, int(resolved.cpus_per_task)),
+                partition=str(resolved.partition),
+                mem_per_cpu=str(resolved.mem_per_cpu),
+                cpus_per_task=int(resolved.cpus_per_task),
+                ntasks=int(resolved.ntasks),
                 kernel=str(f.kernel),
                 loss=str(f.loss),
                 is_constant_noise=bool(f.is_constant_noise),
@@ -937,6 +962,23 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         (self.scripts_dir / "OUTPUTS").mkdir(parents=True, exist_ok=True)
         (self.scripts_dir / "ERRORS").mkdir(parents=True, exist_ok=True)
         path = self.scripts_dir / (phase_name + "-" + str(state.iteration) + ".sh")
+        effective_partition = (
+            str(self.partition)
+            if self.partition is not None
+            else str(getattr(self.config.resources, "partition", "multicore"))
+        )
+        resolved = resolve_phase_resources(
+            phase_name=phase_name,
+            config=self.config,
+            partition=effective_partition,
+            campaign_dir=self.campaign_dir,
+            iteration=int(state.iteration),
+            array_size=array_size,
+        )
+        self._journal_event(
+            "resolved_phase_resources",
+            **resolved.journal_payload(phase_name=phase_name),
+        )
         body = build_sbatch_script(
             phase_name=phase_name,
             iteration=state.iteration,
@@ -946,6 +988,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             walltime_hours=self.walltime_hours,
             partition=self.partition,
             campaign_uid=getattr(state, "campaign_uid", None),
+            resolved_resources=resolved,
         )
         path.write_text(body, encoding="utf-8")
         try:
@@ -2541,181 +2584,6 @@ def _configured_scheduler() -> str:
     return value
 
 
-def _validate_partition_core_request(partition: str, cpus: int) -> None:
-    parallel = profile_value("hpc", "parallel_environments", default=None)
-    if not isinstance(parallel, dict):
-        return
-    raw = parallel.get(str(partition))
-    if raw is None:
-        return
-    try:
-        lo, hi = list(raw)[:2]
-        min_cores = int(lo)
-        max_cores = int(hi)
-    except (TypeError, ValueError) as exc:
-        raise BackendSubmissionError(
-            "configured hpc.parallel_environments for partition "
-            + repr(str(partition))
-            + " must be [min_cores, max_cores]"
-        ) from exc
-    if min_cores < 1 or max_cores < min_cores:
-        raise BackendSubmissionError(
-            "configured hpc.parallel_environments for partition "
-            + repr(str(partition))
-            + " has invalid range ["
-            + str(min_cores)
-            + ", "
-            + str(max_cores)
-            + "]"
-        )
-    requested = int(cpus)
-    if requested < min_cores or requested > max_cores:
-        machine = active_machine() or "active profile"
-        raise BackendSubmissionError(
-            "resources.cpus_per_task="
-            + str(requested)
-            + " is invalid for partition "
-            + repr(str(partition))
-            + " on "
-            + str(machine)
-            + "; configured range is ["
-            + str(min_cores)
-            + ", "
-            + str(max_cores)
-            + "]. Use a core count inside that range or choose a compatible partition."
-        )
-
-
-def _slurm_memory_mib(value: Any) -> float:
-    text = str(value).strip().upper()
-    match = re.fullmatch(r"([1-9][0-9]*)([KMGT]?)", text)
-    if not match:
-        raise BackendSubmissionError(
-            "unsupported Slurm memory syntax: " + repr(value)
-        )
-    amount = int(match.group(1))
-    unit = match.group(2) or "M"
-    scale = {
-        "K": 1.0 / 1024.0,
-        "M": 1.0,
-        "G": 1024.0,
-        "T": 1024.0 * 1024.0,
-    }[unit]
-    return float(amount) * scale
-
-
-def _gaussian_memory_mib(value: Any) -> float:
-    text = str(value).strip().upper()
-    match = re.fullmatch(r"([1-9][0-9]*)([KMGT]?)(?:B|W)?", text)
-    if not match:
-        raise BackendSubmissionError(
-            "unsupported Gaussian memory syntax: " + repr(value)
-        )
-    amount = int(match.group(1))
-    unit = match.group(2) or "M"
-    scale = {
-        "K": 1.0 / 1024.0,
-        "M": 1.0,
-        "G": 1024.0,
-        "T": 1024.0 * 1024.0,
-    }[unit]
-    return float(amount) * scale
-
-
-def _configured_memory_per_core_gb(partition: str) -> Optional[float]:
-    by_partition = profile_value(
-        "hpc",
-        "memory_per_core_gb_by_partition",
-        default=None,
-    )
-    if isinstance(by_partition, dict):
-        raw = by_partition.get(str(partition))
-        if raw is None:
-            raw = by_partition.get("default")
-        if raw is not None:
-            try:
-                value = float(raw)
-            except (TypeError, ValueError) as exc:
-                raise BackendSubmissionError(
-                    "configured hpc.memory_per_core_gb_by_partition for "
-                    + str(partition)
-                    + " must be numeric"
-                ) from exc
-            if value <= 0.0:
-                raise BackendSubmissionError(
-                    "configured hpc.memory_per_core_gb_by_partition for "
-                    + str(partition)
-                    + " must be > 0"
-                )
-            return value
-    raw_default = profile_value("hpc", "memory_per_core_gb", default=None)
-    if raw_default is None:
-        return None
-    try:
-        value = float(raw_default)
-    except (TypeError, ValueError) as exc:
-        raise BackendSubmissionError(
-            "configured hpc.memory_per_core_gb must be numeric"
-        ) from exc
-    if value <= 0.0:
-        raise BackendSubmissionError("configured hpc.memory_per_core_gb must be > 0")
-    return value
-
-
-def _resolve_mem_per_cpu(config: CampaignConfig, partition: str) -> str:
-    requested = str(config.resources.mem_per_cpu).strip()
-    profile_gb = _configured_memory_per_core_gb(partition)
-    if requested.lower() == "auto":
-        gb = profile_gb if profile_gb is not None else 4.0
-        return str(int(math.floor(gb))) + "G"
-    if profile_gb is not None:
-        requested_mib = _slurm_memory_mib(requested)
-        cap_mib = float(profile_gb) * 1024.0
-        if requested_mib > cap_mib + 1.0e-9:
-            raise BackendSubmissionError(
-                "resources.mem_per_cpu "
-                + requested
-                + " exceeds configured profile memory cap for partition "
-                + repr(partition)
-                + " ("
-                + str(profile_gb)
-                + " GB/core)"
-            )
-    return requested
-
-
-def _gaussian_mdef_gb(config: CampaignConfig, mem_per_cpu: str, gaussian_cores: int) -> int:
-    allocated_mib = _slurm_memory_mib(mem_per_cpu) * float(max(1, int(gaussian_cores)))
-    usable_mib = allocated_mib * float(config.gaussian.memory_fraction_of_slurm)
-    return max(1, int(math.floor(usable_mib / 1024.0)))
-
-
-def _validate_gaussian_link0_memory(
-    config: CampaignConfig,
-    mem_per_cpu: str,
-    gaussian_cores: int,
-) -> None:
-    if str(config.gaussian.memory_mode) != "link0":
-        return
-    gaussian_mib = _gaussian_memory_mib(config.gaussian.mem)
-    cores = max(1, int(gaussian_cores))
-    allocated_mib = _slurm_memory_mib(mem_per_cpu) * float(cores)
-    limit_mib = float(config.gaussian.memory_fraction_of_slurm) * allocated_mib
-    if gaussian_mib > limit_mib + 1.0e-9:
-        raise BackendSubmissionError(
-            "gaussian.mem "
-            + repr(str(config.gaussian.mem))
-            + " exceeds "
-            + str(config.gaussian.memory_fraction_of_slurm)
-            + " of the resolved Link0 Gaussian Slurm allocation "
-            + "(resources.mem_per_cpu="
-            + repr(str(mem_per_cpu))
-            + ", gaussian.nproc="
-            + str(cores)
-            + ")"
-        )
-
-
 def _configured_ferebus_platform() -> str:
     raw = profile_value(
         "software", "ferebus", "pyferebus_platform", default=None
@@ -2784,6 +2652,7 @@ def build_sbatch_script(
     walltime_hours: Optional[int] = None,
     partition: Optional[str] = None,
     campaign_uid: Optional[str] = None,
+    resolved_resources: Optional[ResolvedPhaseResources] = None,
 ) -> str:
     """Return the body of an sbatch script for the given phase.
 
@@ -2795,25 +2664,23 @@ def build_sbatch_script(
     Paths are absolute (resolved campaign dir) so the script does not depend
     on sbatch being launched from any particular directory.
     """
-    res = config.resources
     _configured_scheduler()
-    part = partition if partition is not None else res.partition
+    res = config.resources
+    part = str(partition if partition is not None else res.partition)
+    resolved = resolved_resources or resolve_phase_resources(
+        phase_name=phase_name,
+        config=config,
+        partition=part,
+        campaign_dir=campaign_dir,
+        iteration=int(iteration),
+        array_size=array_size,
+    )
     wall = walltime_hours if walltime_hours is not None else res.walltime_for(phase_name)
-    is_gaussian_phase = phase_name in ("INITIAL_GAUSSIAN", "GAUSSIAN")
-    if is_gaussian_phase and int(config.gaussian.nproc) > int(res.cpus_per_task):
-        raise BackendSubmissionError(
-            "gaussian.nproc="
-            + str(int(config.gaussian.nproc))
-            + " must be <= resources.cpus_per_task="
-            + str(int(res.cpus_per_task))
-            + " for live Gaussian phases"
-        )
-    cpus = int(config.gaussian.nproc) if is_gaussian_phase else res.cpus_for(phase_name)
-    _validate_partition_core_request(str(part), int(cpus))
-    ntasks = 1 if is_gaussian_phase else int(res.ntasks)
-    mem_per_cpu = _resolve_mem_per_cpu(config, str(part))
-    if is_gaussian_phase:
-        _validate_gaussian_link0_memory(config, mem_per_cpu, int(cpus))
+    cpus = int(resolved.cpus_per_task)
+    ntasks = int(resolved.ntasks)
+    mem_per_cpu = str(resolved.mem_per_cpu)
+    if phase_name in ("INITIAL_GAUSSIAN", "GAUSSIAN"):
+        validate_gaussian_link0_memory(config, resolved)
     camp = str(Path(campaign_dir).resolve())
     job_name = live_job_name(campaign_uid, phase_name, iteration)
     _reject_shell_control_chars("Slurm job name", job_name)
@@ -2833,7 +2700,7 @@ def build_sbatch_script(
     lines: List[str] = [
         _configured_jobscript_shebang(),
         "#SBATCH --job-name=" + job_name,
-        "#SBATCH --partition=" + part,
+        "#SBATCH --partition=" + str(resolved.partition),
         "#SBATCH --time=" + str(int(wall)) + ":00:00",
         "#SBATCH --mem-per-cpu=" + str(mem_per_cpu),
         "#SBATCH --cpus-per-task=" + str(int(cpus)),
@@ -2849,6 +2716,12 @@ def build_sbatch_script(
         "#SBATCH --output=" + logs + "/OUTPUTS/" + job_name + tag + ".o",
         "#SBATCH --error="  + logs + "/ERRORS/"  + job_name + tag + ".e",
         "",
+        "# Resolved ICHOR resources: backend="
+        + str(resolved.backend)
+        + " cpu_reason="
+        + str(resolved.cpu_reason)
+        + " memory_reason="
+        + str(resolved.memory_reason),
         "set -euo pipefail",
         "export LC_ALL=C",
         "export LC_NUMERIC=C",
@@ -2866,8 +2739,7 @@ def build_sbatch_script(
             camp,
             config,
             points_file,
-            mem_per_cpu=mem_per_cpu,
-            gaussian_cores=int(cpus),
+            resolved_resources=resolved,
         )
     elif phase_name in ("INITIAL_AIMALL", "AIMALL"):
         lines += _aimall_invocation_block(iteration, camp, config, points_file)
@@ -2892,15 +2764,25 @@ def _gaussian_invocation_block(
     config,
     points_file,
     *,
-    mem_per_cpu: str,
-    gaussian_cores: int,
+    resolved_resources: ResolvedPhaseResources,
 ) -> List[str]:
     gaussian_modules = _configured_backend_modules(
         "gaussian",
         ["gaussian/g16c01_em64t_detectcpu"],
     )
     gaussian_exe = _configured_backend_shell_executable("gaussian", "g16")
-    mdef_gb = _gaussian_mdef_gb(config, mem_per_cpu, int(gaussian_cores))
+    mdef_gb = gaussian_mdef_gb(config, resolved_resources)
+    gaussian_memory_mode = str(config.resources.gaussian_memory_mode).strip().lower()
+    memory_lines: List[str]
+    if gaussian_memory_mode == "slurm_env":
+        memory_lines = [
+            'export GAUSS_PDEF="${SLURM_CPUS_PER_TASK:-1}"',
+            "export GAUSS_MDEF=" + str(int(mdef_gb)) + "GB",
+        ]
+    else:
+        memory_lines = [
+            "# Gaussian Link0 memory/core directives are written in input.gjf.",
+        ]
     points_file_q = _shell_quote(points_file)
     camp_q = _shell_quote(camp)
     phase_q = _shell_quote(str(phase_name))
@@ -2911,8 +2793,7 @@ def _gaussian_invocation_block(
         "export ICHOR_CAMPAIGN_DIR=" + camp_q,
         "export ICHOR_GAUSSIAN_PHASE=" + phase_q,
         'export GAUSS_SCRDIR="${ICHOR_CAMPAIGN_DIR}/.DATA/SCRATCH/GAUSSIAN/${ICHOR_GAUSSIAN_PHASE}/${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"',
-        'export GAUSS_PDEF="${SLURM_CPUS_PER_TASK:-1}"',
-        "export GAUSS_MDEF=" + str(int(mdef_gb)) + "GB",
+        *memory_lines,
         'mkdir -p "$GAUSS_SCRDIR"',
         'echo "GAUSS_SCRDIR=$GAUSS_SCRDIR"',
         "cleanup_gaussian_scratch_success() {",

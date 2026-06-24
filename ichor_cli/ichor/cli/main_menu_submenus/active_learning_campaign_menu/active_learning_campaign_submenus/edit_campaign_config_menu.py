@@ -268,50 +268,11 @@ class EditCampaignConfigFunctions:
 
     @staticmethod
     def edit_resources():
-        r = _campaign_config.resources
-        r.partition = user_input_free_flow("resources.partition: ", r.partition)
-        r.walltime_hours = user_input_int(
-            "resources.walltime_hours: ", r.walltime_hours,
-        )
-        r.mem_per_cpu = user_input_free_flow(
-            "resources.mem_per_cpu (SLURM style, e.g. 4G): ", r.mem_per_cpu,
-        )
-        r.cpus_per_task = user_input_int(
-            "resources.cpus_per_task: ", r.cpus_per_task,
-        )
-        r.ntasks = user_input_int("resources.ntasks: ", r.ntasks)
-        r.aimall_cpus_per_task = user_input_int(
-            "resources.aimall_cpus_per_task: ", r.aimall_cpus_per_task,
-        )
-        r.ariadne_cpus_per_task = user_input_int(
-            "resources.ariadne_cpus_per_task: ", r.ariadne_cpus_per_task,
-        )
-        chosen = user_input_restricted(
-            sorted(VALID_GRADIENT_PARALLEL_BACKENDS),
-            "resources.gradient_parallel_backend: ",
-            r.gradient_parallel_backend,
-        )
-        if chosen is not None:
-            r.gradient_parallel_backend = chosen
-        _sync_options_from_config()
+        _unsupported_sequential_field_editor()
 
     @staticmethod
     def edit_gaussian():
-        g = _campaign_config.gaussian
-        g.method = user_input_free_flow("gaussian.method: ", g.method)
-        g.basis_set = user_input_free_flow("gaussian.basis_set: ", g.basis_set)
-        g.charge = user_input_int("gaussian.charge: ", g.charge)
-        g.spin_multiplicity = user_input_int(
-            "gaussian.spin_multiplicity: ", g.spin_multiplicity,
-        )
-        g.extra_keywords = user_input_free_flow(
-            "gaussian.extra_keywords: ", g.extra_keywords,
-        )
-        g.nproc = user_input_int("gaussian.nproc: ", g.nproc)
-        g.mem = user_input_free_flow(
-            "gaussian.mem (Gaussian style, e.g. 8GB): ", g.mem,
-        )
-        _sync_options_from_config()
+        _unsupported_sequential_field_editor()
 
     @staticmethod
     def edit_initial_subsample():
@@ -786,17 +747,25 @@ _BLOCK_MENUS_BY_LABEL = {
         "SLURM resources used by live backend phases.",
         [
             _spec("resources.partition", "str"),
-            _spec("resources.walltime_hours", "int"),
+            _spec("resources.default_walltime_hours", "int"),
             _spec("resources.polus_walltime_hours", "optional_int"),
             _spec("resources.gaussian_walltime_hours", "optional_int"),
             _spec("resources.aimall_walltime_hours", "optional_int"),
             _spec("resources.ariadne_walltime_hours", "optional_int"),
             _spec("resources.ferebus_walltime_hours", "optional_int"),
-            _spec("resources.mem_per_cpu", "str", prompt="resources.mem_per_cpu (SLURM style, e.g. 4G): "),
-            _spec("resources.cpus_per_task", "int"),
-            _spec("resources.ntasks", "int"),
-            _spec("resources.aimall_cpus_per_task", "int"),
-            _spec("resources.ariadne_cpus_per_task", "int"),
+            _spec("resources.polus_cpus_per_task", "str", transform=_auto_or_int, prompt="resources.polus_cpus_per_task (auto or positive integer): "),
+            _spec("resources.gaussian_cpus_per_task", "str", transform=_auto_or_int, prompt="resources.gaussian_cpus_per_task (auto or positive integer): "),
+            _spec("resources.aimall_cpus_per_task", "str", transform=_auto_or_int, prompt="resources.aimall_cpus_per_task (auto or positive integer): "),
+            _spec("resources.ariadne_cpus_per_task", "str", transform=_auto_or_int, prompt="resources.ariadne_cpus_per_task (auto or positive integer): "),
+            _spec("resources.ferebus_cpus_per_task", "str", transform=_auto_or_int, prompt="resources.ferebus_cpus_per_task (auto or positive integer): "),
+            _spec("resources.polus_mem_per_cpu", "str", prompt="resources.polus_mem_per_cpu (auto or SLURM style, e.g. 4G): "),
+            _spec("resources.gaussian_mem_per_cpu", "str", prompt="resources.gaussian_mem_per_cpu (auto or SLURM style, e.g. 4G): "),
+            _spec("resources.aimall_mem_per_cpu", "str", prompt="resources.aimall_mem_per_cpu (auto or SLURM style, e.g. 4G): "),
+            _spec("resources.ariadne_mem_per_cpu", "str", prompt="resources.ariadne_mem_per_cpu (auto or SLURM style, e.g. 4G): "),
+            _spec("resources.ferebus_mem_per_cpu", "str", prompt="resources.ferebus_mem_per_cpu (auto or SLURM style, e.g. 4G): "),
+            _spec("resources.gaussian_memory_mode", "choice", choices=sorted(VALID_GAUSSIAN_MEMORY_MODES)),
+            _spec("resources.gaussian_link0_mem", "str", prompt="resources.gaussian_link0_mem (Gaussian style, e.g. 8GB): "),
+            _spec("resources.gaussian_memory_fraction_of_slurm", "float"),
             _spec("resources.array_concurrency_limit", "optional_int"),
             _spec("resources.gradient_parallel_backend", "choice", choices=sorted(VALID_GRADIENT_PARALLEL_BACKENDS)),
         ],
@@ -810,10 +779,6 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("gaussian.charge", "int"),
             _spec("gaussian.spin_multiplicity", "int"),
             _spec("gaussian.extra_keywords", "str"),
-            _spec("gaussian.nproc", "int"),
-            _spec("gaussian.mem", "str", prompt="gaussian.mem (Gaussian style, e.g. 8GB): "),
-            _spec("gaussian.memory_mode", "choice", choices=sorted(VALID_GAUSSIAN_MEMORY_MODES)),
-            _spec("gaussian.memory_fraction_of_slurm", "float"),
         ],
     ),
     "Edit AIMAll block": _make_block_menu(

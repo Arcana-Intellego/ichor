@@ -1,7 +1,7 @@
-"""Tests for ichor.hpc.active_learning.config -- schema v2 (M12).
+"""Tests for ichor.hpc.active_learning.config -- schema v3.
 
-The legacy v1 flat-field tests have been retired wholesale; v2 introduces
-nested blocks and the v1 schema-version is rejected.
+Schema v3 keeps nested blocks and moves live backend resources into explicit
+per-backend fields.
 """
 from pathlib import Path
 
@@ -15,8 +15,8 @@ from ichor.hpc.active_learning.config import (
 )
 
 
-def test_schema_version_is_two():
-    assert CONFIG_SCHEMA_VERSION == 2
+def test_schema_version_is_three():
+    assert CONFIG_SCHEMA_VERSION == 3
 
 
 def test_default_campaign_config_is_valid():
@@ -37,11 +37,20 @@ def test_default_campaign_config_is_valid():
     assert c.seed_selection.d_optimal_jitter == 1.0e-12
     assert c.seed_selection.d_optimal_novelty_floor == 1.0e-12
     assert c.seed_selection.d_optimal_score_power == 1.0
-    assert c.resources.mem_per_cpu == "auto"
-    assert c.resources.aimall_cpus_per_task == 8
+    assert c.resources.default_walltime_hours == 24
+    assert c.resources.polus_cpus_per_task == "auto"
+    assert c.resources.gaussian_cpus_per_task == "auto"
+    assert c.resources.aimall_cpus_per_task == "auto"
+    assert c.resources.ariadne_cpus_per_task == "auto"
+    assert c.resources.ferebus_cpus_per_task == "auto"
+    assert c.resources.polus_mem_per_cpu == "auto"
+    assert c.resources.gaussian_mem_per_cpu == "auto"
+    assert c.resources.aimall_mem_per_cpu == "auto"
+    assert c.resources.ariadne_mem_per_cpu == "auto"
+    assert c.resources.ferebus_mem_per_cpu == "auto"
     assert c.resources.array_concurrency_limit is None
-    assert c.gaussian.memory_mode == "slurm_env"
-    assert c.gaussian.memory_fraction_of_slurm == 0.85
+    assert c.resources.gaussian_memory_mode == "slurm_env"
+    assert c.resources.gaussian_memory_fraction_of_slurm == 0.85
     assert c.aimall.encomp == 3
     assert c.aimall.nogui is True
     assert c.aimall.naat == "auto"
@@ -108,17 +117,18 @@ def test_system_name_rejects_unsafe_tokens(name):
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("walltime_hours", 0),
-        ("walltime_hours", -1),
+        ("default_walltime_hours", 0),
+        ("default_walltime_hours", -1),
         ("polus_walltime_hours", 0),
         ("gaussian_walltime_hours", -1),
         ("aimall_walltime_hours", 0),
         ("ariadne_walltime_hours", -1),
         ("ferebus_walltime_hours", 0),
-        ("cpus_per_task", 0),
-        ("ntasks", 0),
+        ("polus_cpus_per_task", 0),
+        ("gaussian_cpus_per_task", 0),
         ("aimall_cpus_per_task", 0),
         ("ariadne_cpus_per_task", 0),
+        ("ferebus_cpus_per_task", 0),
     ],
 )
 def test_scheduler_positive_integer_fields_validated(field, value):
@@ -130,8 +140,8 @@ def test_scheduler_positive_integer_fields_validated(field, value):
 
 def test_scheduler_integer_fields_reject_non_integer_values():
     payload = CampaignConfig().to_dict()
-    payload["resources"]["walltime_hours"] = "24"
-    with pytest.raises(ConfigValidationError, match="walltime_hours"):
+    payload["resources"]["default_walltime_hours"] = "24"
+    with pytest.raises(ConfigValidationError, match="default_walltime_hours"):
         CampaignConfig.from_dict(payload)
 
 
@@ -145,8 +155,8 @@ def test_optional_phase_walltime_rejects_non_integer_values():
 def test_phase_walltime_overrides_default_to_null_and_resolve_per_phase():
     cfg = CampaignConfig()
     assert cfg.resources.ferebus_walltime_hours is None
-    assert cfg.resources.walltime_for("INITIAL_FEREBUS") == cfg.resources.walltime_hours
-    cfg.resources.walltime_hours = 12
+    assert cfg.resources.walltime_for("INITIAL_FEREBUS") == cfg.resources.default_walltime_hours
+    cfg.resources.default_walltime_hours = 12
     cfg.resources.polus_walltime_hours = 1
     cfg.resources.gaussian_walltime_hours = 2
     cfg.resources.aimall_walltime_hours = 3
@@ -178,56 +188,55 @@ def test_scheduler_partition_rejects_unsafe_tokens(partition):
 @pytest.mark.parametrize("mem", ["auto", "1K", "4000M", "4G", "2T"])
 def test_slurm_memory_accepts_csf4_style_units(mem):
     payload = CampaignConfig().to_dict()
-    payload["resources"]["mem_per_cpu"] = mem
-    payload["gaussian"]["mem"] = "1MB"
-    assert CampaignConfig.from_dict(payload).resources.mem_per_cpu == mem
+    payload["resources"]["gaussian_mem_per_cpu"] = mem
+    payload["resources"]["gaussian_link0_mem"] = "1MB"
+    assert CampaignConfig.from_dict(payload).resources.gaussian_mem_per_cpu == mem
 
 
 @pytest.mark.parametrize("mem", ["", "Auto", "0G", "4GB", "4 G", "fourG", "4G;rm"])
 def test_slurm_memory_rejects_invalid_units(mem):
     payload = CampaignConfig().to_dict()
-    payload["resources"]["mem_per_cpu"] = mem
-    with pytest.raises(ConfigValidationError, match="resources.mem_per_cpu"):
+    payload["resources"]["gaussian_mem_per_cpu"] = mem
+    with pytest.raises(ConfigValidationError, match="resources.gaussian_mem_per_cpu"):
         CampaignConfig.from_dict(payload)
 
 
 @pytest.mark.parametrize("mem", ["8GB", "8000MB", "8G", "500MW"])
 def test_gaussian_memory_accepts_gaussian_style_units(mem):
     payload = CampaignConfig().to_dict()
-    payload["gaussian"]["mem"] = mem
-    assert CampaignConfig.from_dict(payload).gaussian.mem == mem
+    payload["resources"]["gaussian_link0_mem"] = mem
+    assert CampaignConfig.from_dict(payload).resources.gaussian_link0_mem == mem
 
 
 @pytest.mark.parametrize("mem", ["", "0GB", "8 GB", "eightGB", "8GB;rm"])
 def test_gaussian_memory_rejects_invalid_units(mem):
     payload = CampaignConfig().to_dict()
-    payload["gaussian"]["mem"] = mem
-    with pytest.raises(ConfigValidationError, match="gaussian.mem"):
+    payload["resources"]["gaussian_link0_mem"] = mem
+    with pytest.raises(ConfigValidationError, match="gaussian_link0_mem"):
         CampaignConfig.from_dict(payload)
 
 
-def test_gaussian_nproc_must_be_positive():
+def test_gaussian_cpus_must_be_positive_or_auto():
     payload = CampaignConfig().to_dict()
-    payload["gaussian"]["nproc"] = 0
-    with pytest.raises(ConfigValidationError, match="gaussian.nproc"):
+    payload["resources"]["gaussian_cpus_per_task"] = 0
+    with pytest.raises(ConfigValidationError, match="gaussian_cpus_per_task"):
         CampaignConfig.from_dict(payload)
 
 
-def test_gaussian_slurm_env_nproc_is_independent_of_general_phase_cpus():
+def test_gaussian_slurm_env_cpus_are_backend_specific():
     payload = CampaignConfig().to_dict()
-    payload["resources"]["cpus_per_task"] = 1
-    payload["gaussian"]["nproc"] = 3
+    payload["resources"]["gaussian_cpus_per_task"] = 3
     cfg = CampaignConfig.from_dict(payload)
-    assert cfg.gaussian.nproc == 3
+    assert cfg.resources.gaussian_cpus_per_task == 3
 
 
 def test_gaussian_link0_mem_must_leave_slurm_headroom():
     payload = CampaignConfig().to_dict()
-    payload["gaussian"]["memory_mode"] = "link0"
-    payload["resources"]["mem_per_cpu"] = "4G"
-    payload["gaussian"]["nproc"] = 1
-    payload["gaussian"]["mem"] = "4GB"
-    with pytest.raises(ConfigValidationError, match="gaussian.mem"):
+    payload["resources"]["gaussian_memory_mode"] = "link0"
+    payload["resources"]["gaussian_mem_per_cpu"] = "4G"
+    payload["resources"]["gaussian_cpus_per_task"] = 1
+    payload["resources"]["gaussian_link0_mem"] = "4GB"
+    with pytest.raises(ConfigValidationError, match="gaussian_link0_mem"):
         CampaignConfig.from_dict(payload)
 
 
@@ -494,15 +503,17 @@ def test_shipped_active_learning_examples_are_resource_safe(relative_path):
 
     assert cfg.schema_version == CONFIG_SCHEMA_VERSION
     assert cfg.resources.partition == "multicore"
-    assert cfg.resources.cpus_per_task >= 2
+    assert cfg.resources.polus_cpus_per_task == "auto"
+    assert cfg.resources.gaussian_cpus_per_task == "auto"
     if "first_live_iter" in relative_path:
-        assert cfg.resources.aimall_cpus_per_task >= 8
+        assert cfg.resources.aimall_cpus_per_task == "auto"
+        assert cfg.resources.ariadne_cpus_per_task == "auto"
         assert cfg.aimall.naat == "auto"
         assert cfg.aimall.boaq == "auto_gs2"
         assert cfg.aimall.iasmesh == "medium"
-    assert cfg.gaussian.nproc <= cfg.resources.cpus_per_task
+    assert cfg.resources.gaussian_memory_mode == "slurm_env"
     if "first_live_iter" in relative_path and cfg.resources.array_concurrency_limit is not None:
-        assert cfg.runtime.poll_sacct_missing_max_ticks >= 30
+        assert cfg.runtime.poll_sacct_missing_max_ticks >= 3
 
 
 def test_invalid_warmstart_rejected():

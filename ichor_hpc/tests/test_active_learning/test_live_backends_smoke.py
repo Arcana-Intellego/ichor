@@ -280,13 +280,13 @@ def test_link0_gaussian_memory_validates_after_auto_resolution(monkeypatch):
         "csf4",
     )
     cfg = CampaignConfig()
-    cfg.gaussian.memory_mode = "link0"
-    cfg.resources.mem_per_cpu = "auto"
+    cfg.resources.gaussian_memory_mode = "link0"
+    cfg.resources.gaussian_mem_per_cpu = "auto"
     cfg.resources.partition = "multicore"
-    cfg.gaussian.nproc = 1
-    cfg.gaussian.mem = "8GB"
+    cfg.resources.gaussian_cpus_per_task = 1
+    cfg.resources.gaussian_link0_mem = "8GB"
 
-    with pytest.raises(BackendSubmissionError, match="gaussian.mem"):
+    with pytest.raises(BackendSubmissionError, match="gaussian_link0_mem"):
         build_sbatch_script(
             phase_name="INITIAL_GAUSSIAN",
             iteration=0,
@@ -309,9 +309,9 @@ def test_slurm_env_gaussian_memory_still_uses_environment_contract(monkeypatch):
         "csf4",
     )
     cfg = CampaignConfig()
-    cfg.gaussian.memory_mode = "slurm_env"
-    cfg.resources.mem_per_cpu = "auto"
-    cfg.gaussian.mem = "500GB"
+    cfg.resources.gaussian_memory_mode = "slurm_env"
+    cfg.resources.gaussian_mem_per_cpu = "auto"
+    cfg.resources.gaussian_link0_mem = "500GB"
 
     body = build_sbatch_script(
         phase_name="INITIAL_GAUSSIAN",
@@ -537,8 +537,7 @@ def test_profile_memory_auto_resolves_csf4_partition_cap(monkeypatch):
         "csf4",
     )
     cfg = CampaignConfig()
-    cfg.gaussian.nproc = 2
-    cfg.resources.cpus_per_task = 2
+    cfg.resources.gaussian_cpus_per_task = 2
     body = build_sbatch_script(
         phase_name="INITIAL_GAUSSIAN",
         iteration=0,
@@ -567,7 +566,7 @@ def test_multicore_one_core_request_fails_before_sbatch(monkeypatch, machine, ma
     )
     cfg = CampaignConfig()
     cfg.resources.partition = "multicore"
-    cfg.resources.cpus_per_task = 1
+    cfg.resources.polus_cpus_per_task = 1
 
     with pytest.raises(BackendSubmissionError, match="configured range is \\[2,"):
         build_sbatch_script(
@@ -593,7 +592,7 @@ def test_multicore_two_core_request_passes_profile_range_check(monkeypatch):
     )
     cfg = CampaignConfig()
     cfg.resources.partition = "multicore"
-    cfg.resources.cpus_per_task = 2
+    cfg.resources.polus_cpus_per_task = 2
 
     body = build_sbatch_script(
         phase_name="PHASE_A_POLUS",
@@ -621,7 +620,7 @@ def test_serial_one_core_request_passes_profile_range_check(monkeypatch):
     )
     cfg = CampaignConfig()
     cfg.resources.partition = "serial"
-    cfg.resources.cpus_per_task = 1
+    cfg.resources.polus_cpus_per_task = 1
 
     body = build_sbatch_script(
         phase_name="PHASE_A_POLUS",
@@ -634,12 +633,24 @@ def test_serial_one_core_request_passes_profile_range_check(monkeypatch):
     assert "#SBATCH --cpus-per-task=1" in body
 
 
-def test_gaussian_nproc_must_not_exceed_live_resource_cpus():
+def test_gaussian_cpus_must_fit_live_profile_range(monkeypatch):
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf3": {
+                "hpc": {
+                    "scheduler": "slurm",
+                    "parallel_environments": {"multicore": [2, 4]},
+                }
+            }
+        },
+        "csf3",
+    )
     cfg = CampaignConfig()
-    cfg.resources.cpus_per_task = 2
-    cfg.gaussian.nproc = 3
+    cfg.resources.partition = "multicore"
+    cfg.resources.gaussian_cpus_per_task = 8
 
-    with pytest.raises(BackendSubmissionError, match="gaussian.nproc"):
+    with pytest.raises(BackendSubmissionError, match="gaussian_cpus_per_task"):
         build_sbatch_script(
             phase_name="INITIAL_GAUSSIAN",
             iteration=0,
@@ -662,7 +673,7 @@ def test_explicit_memory_above_profile_cap_fails_before_sbatch(monkeypatch):
         "csf4",
     )
     cfg = CampaignConfig()
-    cfg.resources.mem_per_cpu = "8G"
+    cfg.resources.polus_mem_per_cpu = "8G"
     with pytest.raises(BackendSubmissionError, match="exceeds configured profile memory cap"):
         build_sbatch_script(
             phase_name="PHASE_A_POLUS",
@@ -704,7 +715,7 @@ def test_configured_array_task_limit_rejects_too_large_array(monkeypatch):
 def test_build_sbatch_script_uses_yaml_scheduler_resources_by_default():
     cfg = CampaignConfig()
     cfg.resources.partition = "csf4-debug"
-    cfg.resources.walltime_hours = 7
+    cfg.resources.default_walltime_hours = 7
     body = build_sbatch_script(
         phase_name="PHASE_A_POLUS",
         iteration=0,
@@ -718,7 +729,7 @@ def test_build_sbatch_script_uses_yaml_scheduler_resources_by_default():
 def test_build_sbatch_script_explicit_scheduler_overrides_win():
     cfg = CampaignConfig()
     cfg.resources.partition = "yaml-partition"
-    cfg.resources.walltime_hours = 7
+    cfg.resources.default_walltime_hours = 7
     body = build_sbatch_script(
         phase_name="PHASE_A_POLUS",
         iteration=0,
@@ -735,7 +746,7 @@ def test_build_sbatch_script_explicit_scheduler_overrides_win():
 
 def test_build_sbatch_script_uses_phase_walltime_override():
     cfg = CampaignConfig()
-    cfg.resources.walltime_hours = 12
+    cfg.resources.default_walltime_hours = 12
     cfg.resources.gaussian_walltime_hours = 3
     cfg.resources.aimall_walltime_hours = 4
     cfg.resources.ariadne_walltime_hours = 5
@@ -788,7 +799,7 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
     from ichor.hpc.active_learning.submit.pyferebus_wrap import FerebusSubmission
 
     cfg = CampaignConfig()
-    cfg.resources.walltime_hours = 9
+    cfg.resources.default_walltime_hours = 9
     cfg.resources.ferebus_walltime_hours = 2
     campaign = tmp_path / "campaign"
     campaign.mkdir()
@@ -863,6 +874,11 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
     assert calls["submit"]["kwargs"]["submit_runner"] is runner
     assert calls["submit"]["kwargs"]["walltime_hours"] == cfg.resources.ferebus_walltime_hours
     assert calls["submit"]["kwargs"]["platform"] == "CSF3"
+    assert calls["submit"]["kwargs"]["partition"] == "multicore"
+    assert calls["submit"]["kwargs"]["cpus_per_task"] == cfg.ferebus.nagents
+    assert calls["submit"]["kwargs"]["ncores"] == cfg.ferebus.nagents
+    assert calls["submit"]["kwargs"]["ntasks"] == 1
+    assert calls["submit"]["kwargs"]["mem_per_cpu"].endswith("G")
 
 
 def test_build_sbatch_script_renders_aimall_block(monkeypatch):
@@ -877,7 +893,12 @@ def test_build_sbatch_script_renders_aimall_block(monkeypatch):
         campaign_dir=Path("/scratch/campaign"),
         config=CampaignConfig(),
     )
-    assert shlex.quote("/opt/AIM All/aimqb.ish") + " -nogui -encomp=3 input.wfn" in body
+    command_line = next(line for line in body.splitlines() if "aimqb.ish" in line)
+    assert command_line.startswith(shlex.quote("/opt/AIM All/aimqb.ish") + " -nogui")
+    assert '-nproc="${SLURM_CPUS_PER_TASK:-1}"' in command_line
+    assert '-naat="$AIMALL_NAAT"' in command_line
+    assert "-encomp=3" in command_line
+    assert command_line.endswith(" input.wfn")
     assert "#SBATCH --cpus-per-task=8" in body
     assert "AIMALL-3" in body
 

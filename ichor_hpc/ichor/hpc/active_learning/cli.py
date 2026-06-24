@@ -760,7 +760,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         with open(config_path, "r", encoding="utf-8") as _f:
             campaign_payload = _yaml.safe_load(_f) or {}
     else:
-        campaign_payload = {"schema_version": 2}
+        campaign_payload = {"schema_version": 3}
     if getattr(args, "preset", None):
         from .preset_loader import apply_preset, PresetError
         try:

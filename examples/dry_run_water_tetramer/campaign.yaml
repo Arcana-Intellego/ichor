@@ -3,7 +3,7 @@
 # defaults substantially (see ichor_hpc/.../presets/ for spectroscopy and
 # thermodynamics-focused starting points).
 
-schema_version: 2
+schema_version: 3
 system_name: WATER_TETRAMER
 
 # Iteration loop.
@@ -27,16 +27,25 @@ seed_selection:
 
 resources:
   partition: multicore
-  walltime_hours: 1
-  mem_per_cpu: auto
-  cpus_per_task: 2
-  ntasks: 1
+  default_walltime_hours: 1
+  polus_cpus_per_task: auto
+  gaussian_cpus_per_task: auto
+  aimall_cpus_per_task: auto
   ariadne_cpus_per_task: 2
+  ferebus_cpus_per_task: auto
+  polus_mem_per_cpu: auto
+  gaussian_mem_per_cpu: auto
+  aimall_mem_per_cpu: auto
+  ariadne_mem_per_cpu: auto
+  ferebus_mem_per_cpu: auto
+  gaussian_memory_mode: slurm_env
+  gaussian_link0_mem: 8GB
+  gaussian_memory_fraction_of_slurm: 0.85
   array_concurrency_limit: null
 
 gaussian:
-  nproc: 2
-  memory_mode: slurm_env
+  method: B3LYP
+  basis_set: aug-cc-pVTZ
 
 aimall:
   nogui: true

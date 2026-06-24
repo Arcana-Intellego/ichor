@@ -1233,7 +1233,7 @@ final_checks() {
     local smoke_dir
     smoke_dir="$(mktemp -d)"
     cat > "${smoke_dir}/campaign.yaml" <<'EOF'
-schema_version: 2
+schema_version: 3
 max_iterations: 1
 EOF
     "${VENV}/bin/ichor-al-daemon" preflight --campaign-dir "${smoke_dir}"

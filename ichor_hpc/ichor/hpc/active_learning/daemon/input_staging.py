@@ -27,6 +27,11 @@ from ichor.core.atoms import Atoms
 from ichor.core.files import PointDirectory
 from ichor.core.files.xyz import Trajectory
 
+from .resource_solver import (
+    resolve_aimall_naat,
+    resolve_phase_resources,
+    validate_gaussian_link0_memory,
+)
 from .state import atomic_write_json
 
 
@@ -328,6 +333,18 @@ def stage_gaussian_inputs(campaign_dir, config, phase_name, iteration, sample_xy
     if str(g.extra_keywords).strip():
         keywords += str(g.extra_keywords).split()
 
+    gaussian_resources = None
+    if str(getattr(config.resources, "gaussian_memory_mode", "slurm_env")) == "link0":
+        gaussian_resources = resolve_phase_resources(
+            phase_name=str(phase_name),
+            config=config,
+            partition=str(config.resources.partition),
+            campaign_dir=campaign_dir,
+            iteration=int(iteration),
+            array_size=len(frames),
+        )
+        validate_gaussian_link0_memory(config, gaussian_resources)
+
     pointdirs: List[Path] = []
     for k, atoms in enumerate(frames):
         pd = staging / ("POINT_" + str(k).zfill(4) + ".pointdir")
@@ -341,9 +358,9 @@ def stage_gaussian_inputs(campaign_dir, config, phase_name, iteration, sample_xy
             spin_multiplicity=int(g.spin_multiplicity),
             atoms=atoms,
         )
-        if str(getattr(g, "memory_mode", "slurm_env")) == "link0":
-            gjf.set_nproc(int(g.nproc))
-            gjf.set_mem(str(g.mem))
+        if gaussian_resources is not None:
+            gjf.set_nproc(int(gaussian_resources.cpus_per_task))
+            gjf.set_mem(str(config.resources.gaussian_link0_mem))
         gjf.write()
         if phase_b_records:
             from ..versioning.provenance import PROVENANCE_FILENAME
@@ -374,7 +391,15 @@ def stage_aimall_inputs(campaign_dir, config, phase_name, iteration) -> Tuple[Pa
         expected_phase=expected_phase,
         expected_iteration=int(iteration),
     )
-    aimall_cpus = int(config.resources.aimall_cpus_per_task)
+    aimall_resources = resolve_phase_resources(
+        phase_name=str(phase_name),
+        config=config,
+        partition=str(config.resources.partition),
+        campaign_dir=campaign_dir,
+        iteration=int(iteration),
+        array_size=len(pointdirs),
+    )
+    aimall_cpus = int(aimall_resources.cpus_per_task)
     raw_naat = getattr(config.aimall, "naat", "auto")
     for pointdir in pointdirs:
         if not (pointdir / "input.wfn").is_file():
@@ -390,12 +415,12 @@ def stage_aimall_inputs(campaign_dir, config, phase_name, iteration) -> Tuple[Pa
         if atom_count <= 0:
             raise ValueError("AIMAll pointdir has no atoms: " + str(pointdir))
         if isinstance(raw_naat, str) and raw_naat.strip().lower() == "auto":
-            resolved_naat = min(int(atom_count), int(aimall_cpus))
+            resolved_naat = resolve_aimall_naat(config, aimall_cpus, atom_count)
         else:
             resolved_naat = int(raw_naat)
             if resolved_naat < 1 or resolved_naat > int(aimall_cpus):
                 raise ValueError(
-                    "aimall.naat must be in [1, resources.aimall_cpus_per_task]"
+                    "aimall.naat must be in [1, resolved resources.aimall_cpus_per_task]"
                 )
         atomic_write_json(
             pointdir / AIMALL_TASK_METADATA,
@@ -404,6 +429,9 @@ def stage_aimall_inputs(campaign_dir, config, phase_name, iteration) -> Tuple[Pa
                 "atom_count": int(atom_count),
                 "nproc": int(aimall_cpus),
                 "naat": int(resolved_naat),
+                "resource_resolution": aimall_resources.journal_payload(
+                    phase_name=str(phase_name)
+                ),
             },
         )
     write_points_file(staging, pointdirs)

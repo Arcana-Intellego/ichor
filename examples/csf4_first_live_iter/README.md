@@ -233,18 +233,19 @@ Adjust the AIMAll + FEREBUS paths to match where you actually installed
 them in step 3. The repo ships a fuller `ichor_config.yaml` at the repo
 root that you can copy + edit.
 
-The active-learning daemon defaults to `resources.mem_per_cpu: auto`. On CSF4
-that resolves to 4G/core from the profile above. Gaussian live jobs use the
-Slurm allocation via `GAUSS_PDEF` and `GAUSS_MDEF` by default, rather than
-hard-coding `%NProcShared` or `%mem` inside every `.gjf`. Gaussian scratch is
+The active-learning daemon defaults all backend-specific
+`resources.*_mem_per_cpu` fields to `auto`. On CSF4 that resolves to 4G/core
+from the profile above. Gaussian live jobs use the Slurm allocation via
+`GAUSS_PDEF` and `GAUSS_MDEF` by default, rather than hard-coding
+`%NProcShared` or `%mem` inside every `.gjf`. Gaussian scratch is
 daemon-owned under `.DATA/SCRATCH/GAUSSIAN/<phase>/`; successful Gaussian tasks
 remove their own scratch directory, while failed tasks keep it for diagnosis.
-For a cautious first smoke leaves `resources.array_concurrency_limit: null` so
-Gaussian/AIMAll arrays can run with as much concurrency as Slurm policy and
-cluster load allow. It also sets `resources.aimall_cpus_per_task: 8` to avoid
-making AIMAll the first-smoke bottleneck. The example AIMAll block uses
-`naat: auto`, `boaq: auto_gs2`, and `iasmesh: medium` to keep the first
-integration pass cheap while still emitting IQA terms with `encomp: 3`.
+The first smoke uses `resources.array_concurrency_limit: 4` to be gentle on
+the scheduler. Backend CPU fields default to `auto`; AIMAll combines that with
+`aimall.naat: auto` to choose an atom-level parallelism appropriate to the
+staged system size. The example AIMAll block uses `naat: auto`, `boaq:
+auto_gs2`, and `iasmesh: medium` to keep the first integration pass cheap while
+still emitting IQA terms with `encomp: 3`.
 For larger shared-cluster campaigns
 you can set `resources.array_concurrency_limit` to throttle arrays with Slurm's
 `--array=...%N` syntax.
@@ -286,7 +287,7 @@ A minimal `campaign.yaml` (also shipped at
 `examples/csf4_first_live_iter/campaign.yaml`):
 
 ```yaml
-schema_version: 2
+schema_version: 3
 
 max_iterations: 1
 poll_interval_seconds: 60
@@ -305,22 +306,30 @@ seed_selection:
 
 resources:
   partition: multicore
-  walltime_hours: 2
+  default_walltime_hours: 2
   polus_walltime_hours: 1
   gaussian_walltime_hours: 2
   aimall_walltime_hours: 2
   ariadne_walltime_hours: 1
   ferebus_walltime_hours: 2
-  mem_per_cpu: auto
-  cpus_per_task: 2
-  ntasks: 1
-  aimall_cpus_per_task: 8
-  ariadne_cpus_per_task: 8
+  polus_cpus_per_task: auto
+  gaussian_cpus_per_task: auto
+  aimall_cpus_per_task: auto
+  ariadne_cpus_per_task: auto
+  ferebus_cpus_per_task: auto
+  polus_mem_per_cpu: auto
+  gaussian_mem_per_cpu: auto
+  aimall_mem_per_cpu: auto
+  ariadne_mem_per_cpu: auto
+  ferebus_mem_per_cpu: auto
+  gaussian_memory_mode: slurm_env
+  gaussian_link0_mem: 8GB
+  gaussian_memory_fraction_of_slurm: 0.85
   array_concurrency_limit: null
 
 gaussian:
-  nproc: 2
-  memory_mode: slurm_env
+  method: B3LYP
+  basis_set: aug-cc-pVTZ
 
 ariadne:
   optimiser: trust_region_qn

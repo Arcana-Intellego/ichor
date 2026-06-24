@@ -159,13 +159,12 @@ ALWAYS_SAFE_PREFIXES = {
     "error_calibration.",
 }
 ALWAYS_SAFE_RESOURCE_EXACT = {
-    "resources.walltime_hours",
+    "resources.default_walltime_hours",
     "resources.polus_walltime_hours",
     "resources.gaussian_walltime_hours",
     "resources.aimall_walltime_hours",
     "resources.ariadne_walltime_hours",
     "resources.ferebus_walltime_hours",
-    "resources.mem_per_cpu",
     "resources.array_concurrency_limit",
     "resources.gradient_parallel_backend",
 }
@@ -192,10 +191,19 @@ FUTURE_SAFE_PREFIXES = {
 }
 FUTURE_SAFE_EXACT = {
     "resources.partition",
-    "resources.cpus_per_task",
-    "resources.ntasks",
+    "resources.polus_cpus_per_task",
+    "resources.gaussian_cpus_per_task",
     "resources.aimall_cpus_per_task",
     "resources.ariadne_cpus_per_task",
+    "resources.ferebus_cpus_per_task",
+    "resources.polus_mem_per_cpu",
+    "resources.gaussian_mem_per_cpu",
+    "resources.aimall_mem_per_cpu",
+    "resources.ariadne_mem_per_cpu",
+    "resources.ferebus_mem_per_cpu",
+    "resources.gaussian_memory_mode",
+    "resources.gaussian_link0_mem",
+    "resources.gaussian_memory_fraction_of_slurm",
     "acquisition.use_scaled_posterior_covariance",
     "acquisition.allow_uniform_posterior_fallback",
 }
@@ -213,10 +221,6 @@ PHASE_LOCAL_EXACT = {
     "quality_gates.ferebus_min_ext_r2",
     "quality_gates.ferebus_max_ext_rmse_ha",
     "quality_gates.ferebus_max_condition_number",
-    "gaussian.nproc",
-    "gaussian.mem",
-    "gaussian.memory_mode",
-    "gaussian.memory_fraction_of_slurm",
     "aimall.encomp",
     "aimall.nogui",
     "aimall.naat",

@@ -2,7 +2,7 @@
 # Generic first-live-iteration active-learning campaign for CSF3/CSF4.
 # Intended for a small validation run, not a long production campaign.
 
-schema_version: 2
+schema_version: 3
 
 # -------------------------------------------------------------------------
 # Required system-level identifiers
@@ -378,7 +378,7 @@ stop:
 
 resources:
   partition: multicore
-  walltime_hours: 24
+  default_walltime_hours: 24
 
   # Optional per-phase overrides. Keep these conservative for first live tests.
   polus_walltime_hours: 2
@@ -387,15 +387,23 @@ resources:
   ariadne_walltime_hours: 4
   ferebus_walltime_hours: 24
 
-  # Keep auto for CSF3/CSF4 examples; the live profile resolves cluster memory.
-  mem_per_cpu: auto
+  # Keep auto for CSF3/CSF4 examples; the live profile and staged data
+  # resolve backend-specific CPU and memory requests before submission.
+  polus_cpus_per_task: auto
+  gaussian_cpus_per_task: auto
+  aimall_cpus_per_task: auto
+  ariadne_cpus_per_task: auto
+  ferebus_cpus_per_task: auto
 
-  cpus_per_task: 1
-  ntasks: 1
+  polus_mem_per_cpu: auto
+  gaussian_mem_per_cpu: auto
+  aimall_mem_per_cpu: auto
+  ariadne_mem_per_cpu: auto
+  ferebus_mem_per_cpu: auto
 
-  # AIMAll and ARIADNE get separate CPU settings.
-  aimall_cpus_per_task: 8
-  ariadne_cpus_per_task: 8
+  gaussian_memory_mode: slurm_env
+  gaussian_link0_mem: 8GB
+  gaussian_memory_fraction_of_slurm: 0.85
 
   # Keep the first live example gentle on the scheduler.
   # For larger campaigns, increase or remove this.
@@ -417,14 +425,10 @@ gaussian:
   spin_multiplicity: 1
 
   extra_keywords: ""
-  nproc: 1
-  mem: 8GB
-  memory_mode: slurm_env
-  memory_fraction_of_slurm: 0.85
 
 aimall:
   encomp: 3
   nogui: true
   naat: auto
-  boaq: auto
-  iasmesh: fine
+  boaq: auto_gs2
+  iasmesh: medium

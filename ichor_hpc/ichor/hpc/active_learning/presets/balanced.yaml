@@ -8,7 +8,7 @@
 # Warning! Calibration pending (uncalibrated against benchmark data;
 # treated as the dataclass-default baseline only).
 
-schema_version: 2
+schema_version: 3
 
 acquisition:
   subspace:

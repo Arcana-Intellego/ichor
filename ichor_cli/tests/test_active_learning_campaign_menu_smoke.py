@@ -113,14 +113,16 @@ def test_campaign_config_block_submenus_show_values_and_edit_one_field(monkeypat
     resources_menu = menu._BLOCK_MENUS_BY_LABEL["Edit resources"]
     rendered = resources_menu.this_menu_options()
     assert "resources.partition" in rendered
-    assert "resources.walltime_hours" in rendered
+    assert "resources.default_walltime_hours" in rendered
     assert "resources.ferebus_walltime_hours" in rendered
+    assert "resources.polus_cpus_per_task" in rendered
     assert "resources.aimall_cpus_per_task" in rendered
+    assert "resources.gaussian_mem_per_cpu" in rendered
     assert "resources.gradient_parallel_backend" in rendered
 
     texts = [it.text for it in resources_menu.items]
     assert "Set partition" in texts
-    assert "Set walltime_hours" in texts
+    assert "Set default_walltime_hours" in texts
     assert "Set ferebus_walltime_hours" in texts
     assert "Set aimall_cpus_per_task" in texts
 
@@ -129,15 +131,15 @@ def test_campaign_config_block_submenus_show_values_and_edit_one_field(monkeypat
     spec = next(
         spec
         for spec in resources_menu.this_menu_options.fields
-        if spec.path == "resources.walltime_hours"
+        if spec.path == "resources.default_walltime_hours"
     )
     monkeypatch.setattr(field_menu, "user_input_int", lambda prompt, default: 37)
 
     menu._edit_field(spec)
 
-    assert cfg.resources.walltime_hours == 37
+    assert cfg.resources.default_walltime_hours == 37
     assert cfg.resources.partition == old_partition
-    assert "resources.walltime_hours: 37" in resources_menu.this_menu_options()
+    assert "resources.default_walltime_hours: 37" in resources_menu.this_menu_options()
 
 
 def test_acquisition_gradient_menu_exposes_active_fd_controls():
@@ -854,8 +856,13 @@ def test_campaign_config_load_edit_save_preserves_hidden_fields(tmp_path, monkey
 
     reloaded = CampaignConfig.from_yaml(tmp_path / "campaign.yaml")
     assert reloaded.system_name == "WATER_AL"
-    assert reloaded.resources.walltime_hours == 12
+    assert reloaded.resources.default_walltime_hours == 12
+    assert reloaded.resources.polus_cpus_per_task == 4
+    assert reloaded.resources.ferebus_cpus_per_task == 4
+    assert reloaded.resources.gaussian_cpus_per_task == 2
     assert reloaded.resources.aimall_cpus_per_task == 6
+    assert reloaded.resources.ariadne_cpus_per_task == 4
+    assert reloaded.resources.gaussian_link0_mem == "6GB"
     assert reloaded.resources.gradient_parallel_backend == "serial"
     assert reloaded.gaussian.method == "PBE0"
     assert reloaded.ferebus.properties == ["iqa", "q00"]

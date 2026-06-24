@@ -1,14 +1,12 @@
-"""Campaign configuration -- schema v2 (clean break from earlier v1).
+"""Campaign configuration -- schema v3.
 
-Schema v2 organises the config fields into nested blocks that mirror
-the logical structure of the active sampling pipeline. Every previously inactive field in v1
-should now be either 
-(a) wired to its downstream consumer
-via the to_acquisition_config / to_ariadne_run_config translators, or (
-b) explicitly deprecated.
+Schema v3 keeps scientific settings and batch-system resources separate.
+Gaussian contains level-of-theory/input choices only; Slurm CPU, memory, and
+Gaussian runtime-memory policy live under resources.
 """
 from __future__ import annotations
 
+import copy
 import re
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
@@ -79,7 +77,7 @@ __all__ = [
 ]
 
 
-CONFIG_SCHEMA_VERSION = 2
+CONFIG_SCHEMA_VERSION = 3
 
 
 class ConfigValidationError(ValueError):
@@ -154,6 +152,14 @@ def _validate_positive_int(name: str, value: Any) -> None:
         )
     if value <= 0:
         raise ConfigValidationError(name + " must be > 0")
+
+
+def _validate_positive_int_or_auto(name: str, value: Any) -> None:
+    if isinstance(value, str):
+        if value.strip().lower() == "auto":
+            return
+        raise ConfigValidationError(name + " must be a positive integer or 'auto'")
+    _validate_positive_int(name, value)
 
 
 def _validate_nonnegative_int(name: str, value: Any) -> None:
@@ -650,36 +656,59 @@ class StopConfigBlock:
 
 @dataclass
 class ResourceConfigBlock:
-    # SLURM resources for the sbatch phases. defaults suit the small CSF4 smoke
-    # jobs; bump them per campaign. ARIADNE and AIMAll get their own core counts
-    # because their scaling and queue-time trade-offs differ from light wrapper
-    # phases.
+    # Slurm resources for live phases. Schema v3 is explicit: every backend has
+    # its own CPU and memory field so there is no hidden generic CPU fallback.
+    # The string "auto" is resolved by the live resource solver against the
+    # active cluster profile, staged artefacts, and backend-specific scaling.
     partition: str = "multicore"
-    walltime_hours: int = 24
+    default_walltime_hours: int = 24
     polus_walltime_hours: Optional[int] = None
     gaussian_walltime_hours: Optional[int] = None
     aimall_walltime_hours: Optional[int] = None
     ariadne_walltime_hours: Optional[int] = None
     ferebus_walltime_hours: Optional[int] = None
-    # Per-core memory, NOT per-job. "auto" resolves from the active cluster
-    # profile and partition during live Slurm rendering, so CSF4 gets 4G/core
-    # while CSF3 multicore can use 8G/core without editing campaign.yaml.
-    mem_per_cpu: str = "auto"
-    cpus_per_task: int = 1
-    ntasks: int = 1
-    aimall_cpus_per_task: int = 8
-    ariadne_cpus_per_task: int = 8
+
+    polus_cpus_per_task: Union[int, str] = "auto"
+    gaussian_cpus_per_task: Union[int, str] = "auto"
+    aimall_cpus_per_task: Union[int, str] = "auto"
+    ariadne_cpus_per_task: Union[int, str] = "auto"
+    ferebus_cpus_per_task: Union[int, str] = "auto"
+
+    polus_mem_per_cpu: str = "auto"
+    gaussian_mem_per_cpu: str = "auto"
+    aimall_mem_per_cpu: str = "auto"
+    ariadne_mem_per_cpu: str = "auto"
+    ferebus_mem_per_cpu: str = "auto"
+
+    gaussian_memory_mode: str = "slurm_env"
+    gaussian_link0_mem: str = "8GB"
+    gaussian_memory_fraction_of_slurm: float = 0.85
+
     array_concurrency_limit: Optional[int] = None
     # "process" -> node-local process pool sized to the task's cpus-per-task.
     # "serial"  -> force single-core (off-cluster / debugging).
     gradient_parallel_backend: str = "process"
 
-    def cpus_for(self, phase_name: str) -> int:
+    def backend_for_phase(self, phase_name: str) -> str:
+        if phase_name in ("PHASE_A_POLUS", "PHASE_B_POLUS"):
+            return "polus"
+        if phase_name in ("INITIAL_GAUSSIAN", "GAUSSIAN"):
+            return "gaussian"
         if phase_name in ("INITIAL_AIMALL", "AIMALL"):
-            return int(self.aimall_cpus_per_task)
+            return "aimall"
         if phase_name == "ARIADNE_ARRAY":
-            return int(self.ariadne_cpus_per_task)
-        return int(self.cpus_per_task)
+            return "ariadne"
+        if phase_name in ("INITIAL_FEREBUS", "FEREBUS"):
+            return "ferebus"
+        return "polus"
+
+    def cpus_for(self, phase_name: str) -> Union[int, str]:
+        backend = self.backend_for_phase(phase_name)
+        return getattr(self, backend + "_cpus_per_task")
+
+    def mem_per_cpu_for(self, phase_name: str) -> str:
+        backend = self.backend_for_phase(phase_name)
+        return str(getattr(self, backend + "_mem_per_cpu"))
 
     def walltime_for(self, phase_name: str) -> int:
         if phase_name in ("PHASE_A_POLUS", "PHASE_B_POLUS"):
@@ -694,7 +723,7 @@ class ResourceConfigBlock:
             value = self.ferebus_walltime_hours
         else:
             value = None
-        return int(value if value is not None else self.walltime_hours)
+        return int(value if value is not None else self.default_walltime_hours)
 
 
 @dataclass
@@ -708,10 +737,158 @@ class GaussianConfigBlock:
     charge: int = 0
     spin_multiplicity: int = 1
     extra_keywords: str = ""
-    nproc: int = 1
-    mem: str = "8GB"
-    memory_mode: str = "slurm_env"
-    memory_fraction_of_slurm: float = 0.85
+
+
+_DEPRECATED_SCHEMA_V3_FIELDS = {
+    "resources.walltime_hours",
+    "resources.mem_per_cpu",
+    "resources.ntasks",
+    "resources.cpus_per_task",
+    "gaussian.nproc",
+    "gaussian.mem",
+    "gaussian.memory_mode",
+    "gaussian.memory_fraction_of_slurm",
+}
+
+
+def _same_config_value(a: Any, b: Any) -> bool:
+    if isinstance(a, str) or isinstance(b, str):
+        return str(a).strip().lower() == str(b).strip().lower()
+    return a == b
+
+
+def _set_migrated_value(
+    target: Dict[str, Any],
+    key: str,
+    value: Any,
+    *,
+    source_path: str,
+    target_path: str,
+) -> None:
+    if key in target:
+        if not _same_config_value(target[key], value):
+            raise ConfigValidationError(
+                "Conflicting campaign resource settings: "
+                + source_path
+                + "="
+                + repr(value)
+                + " but "
+                + target_path
+                + "="
+                + repr(target[key])
+                + ". Use only "
+                + target_path
+                + "."
+            )
+        return
+    target[key] = value
+
+
+def _migrate_schema_v2_to_v3(data: Dict[str, Any]) -> Dict[str, Any]:
+    migrated = copy.deepcopy(data)
+    migrated["schema_version"] = CONFIG_SCHEMA_VERSION
+    resources = migrated.setdefault("resources", {})
+    gaussian = migrated.setdefault("gaussian", {})
+    if not isinstance(resources, dict):
+        raise ConfigValidationError("resources must be a mapping")
+    if not isinstance(gaussian, dict):
+        raise ConfigValidationError("gaussian must be a mapping")
+
+    if "walltime_hours" in resources:
+        _set_migrated_value(
+            resources,
+            "default_walltime_hours",
+            resources.pop("walltime_hours"),
+            source_path="resources.walltime_hours",
+            target_path="resources.default_walltime_hours",
+        )
+    if "ntasks" in resources:
+        old_ntasks = resources.pop("ntasks")
+        try:
+            ntasks_int = int(old_ntasks)
+        except (TypeError, ValueError) as exc:
+            raise ConfigValidationError(
+                "resources.ntasks in schema v2 must be 1 to migrate to schema v3"
+            ) from exc
+        if ntasks_int != 1:
+            raise ConfigValidationError(
+                "resources.ntasks="
+                + repr(old_ntasks)
+                + " cannot migrate to schema v3; current live backends support "
+                "only --ntasks=1"
+            )
+    if "mem_per_cpu" in resources:
+        old_mem = resources.pop("mem_per_cpu")
+        for backend in ("polus", "gaussian", "aimall", "ariadne", "ferebus"):
+            _set_migrated_value(
+                resources,
+                backend + "_mem_per_cpu",
+                old_mem,
+                source_path="resources.mem_per_cpu",
+                target_path="resources." + backend + "_mem_per_cpu",
+            )
+    old_cpus = resources.pop("cpus_per_task", None)
+    old_gaussian_nproc = gaussian.pop("nproc", None)
+    if old_cpus is not None:
+        for backend in ("polus", "ferebus"):
+            _set_migrated_value(
+                resources,
+                backend + "_cpus_per_task",
+                old_cpus,
+                source_path="resources.cpus_per_task",
+                target_path="resources." + backend + "_cpus_per_task",
+            )
+        if old_gaussian_nproc is None:
+            _set_migrated_value(
+                resources,
+                "gaussian_cpus_per_task",
+                old_cpus,
+                source_path="resources.cpus_per_task",
+                target_path="resources.gaussian_cpus_per_task",
+            )
+    if old_gaussian_nproc is not None:
+        _set_migrated_value(
+            resources,
+            "gaussian_cpus_per_task",
+            old_gaussian_nproc,
+            source_path="gaussian.nproc",
+            target_path="resources.gaussian_cpus_per_task",
+        )
+    gaussian_resource_moves = {
+        "mem": "gaussian_link0_mem",
+        "memory_mode": "gaussian_memory_mode",
+        "memory_fraction_of_slurm": "gaussian_memory_fraction_of_slurm",
+    }
+    for old_key, new_key in gaussian_resource_moves.items():
+        if old_key in gaussian:
+            _set_migrated_value(
+                resources,
+                new_key,
+                gaussian.pop(old_key),
+                source_path="gaussian." + old_key,
+                target_path="resources." + new_key,
+            )
+    return migrated
+
+
+def _reject_schema_v3_deprecated_fields(data: Dict[str, Any]) -> None:
+    resources = data.get("resources")
+    gaussian = data.get("gaussian")
+    present: List[str] = []
+    if isinstance(resources, dict):
+        for key in ("walltime_hours", "mem_per_cpu", "ntasks", "cpus_per_task"):
+            if key in resources:
+                present.append("resources." + key)
+    if isinstance(gaussian, dict):
+        for key in ("nproc", "mem", "memory_mode", "memory_fraction_of_slurm"):
+            if key in gaussian:
+                present.append("gaussian." + key)
+    if present:
+        raise ConfigValidationError(
+            "schema v3 no longer accepts deprecated resource fields "
+            + repr(sorted(present))
+            + "; use backend-specific fields under resources"
+        )
 
 
 @dataclass
@@ -796,12 +973,19 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "campaign.yaml must be a mapping at the top level"
             )
-        schema = int(data.get("schema_version", -1))
+        try:
+            schema = int(data.get("schema_version", -1))
+        except (TypeError, ValueError) as exc:
+            raise ConfigValidationError("campaign.yaml schema_version must be an integer") from exc
+        if schema == 2:
+            data = _migrate_schema_v2_to_v3(data)
+            schema = CONFIG_SCHEMA_VERSION
         if schema != CONFIG_SCHEMA_VERSION:
             raise ConfigValidationError(
                 "campaign.yaml schema_version " + str(schema)
                 + " != " + str(CONFIG_SCHEMA_VERSION)
             )
+        _reject_schema_v3_deprecated_fields(data)
         try:
             inst = parse_dataclass_block(cls, data)
         except DataclassParseError as exc:
@@ -856,7 +1040,10 @@ class CampaignConfig:
             _SCHEDULER_TOKEN_RE,
             "a scheduler token containing only letters, numbers, '.', '_', ':' and '-'",
         )
-        _validate_positive_int("resources.walltime_hours", self.resources.walltime_hours)
+        _validate_positive_int(
+            "resources.default_walltime_hours",
+            self.resources.default_walltime_hours,
+        )
         for _name in (
             "polus_walltime_hours",
             "gaussian_walltime_hours",
@@ -867,49 +1054,58 @@ class CampaignConfig:
             _value = getattr(self.resources, _name)
             if _value is not None:
                 _validate_positive_int("resources." + _name, _value)
-        _validate_positive_int("resources.cpus_per_task", self.resources.cpus_per_task)
-        _validate_positive_int("resources.ntasks", self.resources.ntasks)
-        _validate_positive_int(
-            "resources.aimall_cpus_per_task",
-            self.resources.aimall_cpus_per_task,
-        )
-        _validate_positive_int(
-            "resources.ariadne_cpus_per_task",
-            self.resources.ariadne_cpus_per_task,
-        )
+        for _name in (
+            "polus_cpus_per_task",
+            "gaussian_cpus_per_task",
+            "aimall_cpus_per_task",
+            "ariadne_cpus_per_task",
+            "ferebus_cpus_per_task",
+        ):
+            _validate_positive_int_or_auto(
+                "resources." + _name,
+                getattr(self.resources, _name),
+            )
+        for _name in (
+            "polus_mem_per_cpu",
+            "gaussian_mem_per_cpu",
+            "aimall_mem_per_cpu",
+            "ariadne_mem_per_cpu",
+            "ferebus_mem_per_cpu",
+        ):
+            _validate_memory(
+                "resources." + _name,
+                getattr(self.resources, _name),
+                _SLURM_MEMORY_RE,
+                "SLURM memory syntax such as 4G or 4000M, or auto",
+            )
         if self.resources.array_concurrency_limit is not None:
             _validate_positive_int(
                 "resources.array_concurrency_limit",
                 self.resources.array_concurrency_limit,
             )
-        _validate_memory(
-            "resources.mem_per_cpu",
-            self.resources.mem_per_cpu,
-            _SLURM_MEMORY_RE,
-            "SLURM memory syntax such as 4G or 4000M, or auto",
-        )
         if self.resources.gradient_parallel_backend not in VALID_GRADIENT_PARALLEL_BACKENDS:
             raise ConfigValidationError(
                 "resources.gradient_parallel_backend must be one of "
                 + repr(sorted(VALID_GRADIENT_PARALLEL_BACKENDS))
             )
-        _validate_positive_int("gaussian.nproc", self.gaussian.nproc)
-        if self.gaussian.memory_mode not in VALID_GAUSSIAN_MEMORY_MODES:
+        if self.resources.gaussian_memory_mode not in VALID_GAUSSIAN_MEMORY_MODES:
             raise ConfigValidationError(
-                "gaussian.memory_mode must be one of "
+                "resources.gaussian_memory_mode must be one of "
                 + repr(sorted(VALID_GAUSSIAN_MEMORY_MODES))
             )
-        if isinstance(self.gaussian.memory_fraction_of_slurm, bool) or not isinstance(
-            self.gaussian.memory_fraction_of_slurm, (int, float)
+        if isinstance(self.resources.gaussian_memory_fraction_of_slurm, bool) or not isinstance(
+            self.resources.gaussian_memory_fraction_of_slurm, (int, float)
         ):
-            raise ConfigValidationError("gaussian.memory_fraction_of_slurm must be a number")
-        if not 0.0 < float(self.gaussian.memory_fraction_of_slurm) <= 1.0:
             raise ConfigValidationError(
-                "gaussian.memory_fraction_of_slurm must be in (0, 1]"
+                "resources.gaussian_memory_fraction_of_slurm must be a number"
+            )
+        if not 0.0 < float(self.resources.gaussian_memory_fraction_of_slurm) <= 1.0:
+            raise ConfigValidationError(
+                "resources.gaussian_memory_fraction_of_slurm must be in (0, 1]"
             )
         _validate_memory(
-            "gaussian.mem",
-            self.gaussian.mem,
+            "resources.gaussian_link0_mem",
+            self.resources.gaussian_link0_mem,
             _GAUSSIAN_MEMORY_RE,
             "Gaussian memory syntax such as 8GB or 8000MB",
         )
@@ -922,7 +1118,11 @@ class CampaignConfig:
             self.aimall.naat = "auto"
         else:
             _validate_positive_int("aimall.naat", self.aimall.naat)
-            if int(self.aimall.naat) > int(self.resources.aimall_cpus_per_task):
+            aimall_raw_cpus = self.resources.aimall_cpus_per_task
+            if not (
+                isinstance(aimall_raw_cpus, str)
+                and aimall_raw_cpus.strip().lower() == "auto"
+            ) and int(self.aimall.naat) > int(aimall_raw_cpus):
                 raise ConfigValidationError(
                     "aimall.naat must be <= resources.aimall_cpus_per_task"
                 )
@@ -1707,22 +1907,39 @@ class CampaignConfig:
         ):
             if float(value) <= 0.0:
                 raise ConfigValidationError(name + " must be > 0")
-        if self.gaussian.memory_mode == "link0" and str(self.resources.mem_per_cpu) != "auto":
-            gaussian_mem_mib = _memory_mebibytes("gaussian.mem", self.gaussian.mem, gaussian=True)
+        if (
+            self.resources.gaussian_memory_mode == "link0"
+            and str(self.resources.gaussian_mem_per_cpu).strip().lower() != "auto"
+            and not (
+                isinstance(self.resources.gaussian_cpus_per_task, str)
+                and self.resources.gaussian_cpus_per_task.strip().lower() == "auto"
+            )
+        ):
+            gaussian_mem_mib = _memory_mebibytes(
+                "resources.gaussian_link0_mem",
+                self.resources.gaussian_link0_mem,
+                gaussian=True,
+            )
             slurm_mem_mib = _memory_mebibytes(
-                "resources.mem_per_cpu", self.resources.mem_per_cpu, gaussian=False
-            ) * float(self.gaussian.nproc)
-            limit_mib = float(self.gaussian.memory_fraction_of_slurm) * slurm_mem_mib
+                "resources.gaussian_mem_per_cpu",
+                self.resources.gaussian_mem_per_cpu,
+                gaussian=False,
+            ) * float(self.resources.gaussian_cpus_per_task)
+            limit_mib = (
+                float(self.resources.gaussian_memory_fraction_of_slurm)
+                * slurm_mem_mib
+            )
             if gaussian_mem_mib > limit_mib:
                 raise ConfigValidationError(
-                    "gaussian.mem ("
-                    + str(self.gaussian.mem)
+                    "resources.gaussian_link0_mem ("
+                    + str(self.resources.gaussian_link0_mem)
                     + ") exceeds "
-                    + str(self.gaussian.memory_fraction_of_slurm)
-                    + " of the Gaussian Slurm allocation resources.mem_per_cpu * gaussian.nproc ("
-                    + str(self.resources.mem_per_cpu)
+                    + str(self.resources.gaussian_memory_fraction_of_slurm)
+                    + " of the Gaussian Slurm allocation resources.gaussian_mem_per_cpu "
+                    "* resources.gaussian_cpus_per_task ("
+                    + str(self.resources.gaussian_mem_per_cpu)
                     + " * "
-                    + str(self.gaussian.nproc)
+                    + str(self.resources.gaussian_cpus_per_task)
                     + ")"
                 )
 

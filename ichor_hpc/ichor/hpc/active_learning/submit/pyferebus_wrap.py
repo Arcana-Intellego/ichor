@@ -221,7 +221,15 @@ def _format_slurm_walltime_hours(walltime_hours: int) -> str:
     return str(hours) + ":00:00"
 
 
-def _harden_generated_script(script: Path, *, walltime_hours: int) -> None:
+def _harden_generated_script(
+    script: Path,
+    *,
+    walltime_hours: int,
+    partition: Optional[str],
+    mem_per_cpu: Optional[str],
+    cpus_per_task: Optional[int],
+    ntasks: Optional[int],
+) -> None:
     text = script.read_text(encoding="utf-8")
     hardening_lines = {
         "set -eo pipefail",
@@ -229,11 +237,33 @@ def _harden_generated_script(script: Path, *, walltime_hours: int) -> None:
         "export LC_ALL=C",
         "export LC_NUMERIC=C",
     }
+    def _drop_sbatch_directive(line: str) -> bool:
+        stripped = line.strip()
+        if re.match(r"^#SBATCH\s+(?:-t\b|--time(?:=|\b))", stripped):
+            return True
+        if partition is not None and re.match(
+            r"^#SBATCH\s+(?:-p\b|--partition(?:=|\b))", stripped
+        ):
+            return True
+        if mem_per_cpu is not None and re.match(
+            r"^#SBATCH\s+--mem-per-cpu(?:=|\b)", stripped
+        ):
+            return True
+        if cpus_per_task is not None and re.match(
+            r"^#SBATCH\s+(?:-c\b|--cpus-per-task(?:=|\b))", stripped
+        ):
+            return True
+        if ntasks is not None and re.match(
+            r"^#SBATCH\s+(?:-n\b|--ntasks(?:=|\b))", stripped
+        ):
+            return True
+        return False
+
     lines = [
         line
         for line in text.splitlines()
         if line.strip() not in hardening_lines
-        and not re.match(r"^#SBATCH\s+(?:-t\b|--time(?:=|\b))", line.strip())
+        and not _drop_sbatch_directive(line)
     ]
     sbatch_insert_at = 1 if lines and lines[0].startswith("#!") else 0
     while sbatch_insert_at < len(lines):
@@ -242,8 +272,16 @@ def _harden_generated_script(script: Path, *, walltime_hours: int) -> None:
             sbatch_insert_at += 1
             continue
         break
-    lines[sbatch_insert_at:sbatch_insert_at] = [
-        "#SBATCH --time=" + _format_slurm_walltime_hours(walltime_hours),
+    directives = ["#SBATCH --time=" + _format_slurm_walltime_hours(walltime_hours)]
+    if partition is not None:
+        directives.append("#SBATCH --partition=" + str(partition))
+    if mem_per_cpu is not None:
+        directives.append("#SBATCH --mem-per-cpu=" + str(mem_per_cpu))
+    if cpus_per_task is not None:
+        directives.append("#SBATCH --cpus-per-task=" + str(int(cpus_per_task)))
+    if ntasks is not None:
+        directives.append("#SBATCH --ntasks=" + str(int(ntasks)))
+    lines[sbatch_insert_at:sbatch_insert_at] = directives + [
         "set -eo pipefail",
         "export LC_ALL=C",
         "export LC_NUMERIC=C",
@@ -352,6 +390,10 @@ def submit_ferebus(
     platform: str = "CSF4",
     walltime_hours: int = 24,
     ncores: int = 16,
+    partition: Optional[str] = None,
+    mem_per_cpu: Optional[str] = None,
+    cpus_per_task: Optional[int] = None,
+    ntasks: Optional[int] = None,
     kernel: str = "rbfc_per",
     loss: str = "huber",
     is_constant_noise: bool = True,
@@ -437,7 +479,14 @@ def submit_ferebus(
         os.chdir(cwd)
 
     script = _validate_generated_pyferebus_artifacts(working_dir)
-    _harden_generated_script(script, walltime_hours=walltime_hours)
+    _harden_generated_script(
+        script,
+        walltime_hours=walltime_hours,
+        partition=partition,
+        mem_per_cpu=mem_per_cpu,
+        cpus_per_task=cpus_per_task,
+        ntasks=ntasks,
+    )
     if path_to_executable:
         _patch_generated_executable(script, path_to_executable)
 

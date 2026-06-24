@@ -177,13 +177,14 @@ csf3:
       modules: []
 ```
 
-The active-learning daemon defaults to `resources.mem_per_cpu: auto`. On CSF3
-that resolves from `hpc.memory_per_core_gb_by_partition`: the AMD `multicore`
-and `interactive` partitions use 8G/core, the lower-memory Intel
-`serial`/`multicore_small` partitions use 5G/core, and `himem` is available for
-larger memory jobs. Gaussian live jobs use Slurm-provided memory through
-`GAUSS_PDEF` and `GAUSS_MDEF` by default; only legacy `gaussian.memory_mode:
-link0` writes `%NProcShared` and `%mem` into `.gjf` files.
+The active-learning daemon defaults all backend-specific
+`resources.*_mem_per_cpu` fields to `auto`. On CSF3 these resolve from
+`hpc.memory_per_core_gb_by_partition`: the AMD `multicore` and `interactive`
+partitions use 8G/core, the lower-memory Intel `serial`/`multicore_small`
+partitions use 5G/core, and `himem` is available for larger memory jobs.
+Gaussian live jobs use Slurm-provided memory through `GAUSS_PDEF` and
+`GAUSS_MDEF` by default; only legacy `resources.gaussian_memory_mode: link0`
+writes `%NProcShared` and `%mem` into `.gjf` files.
 
 ## 6. Preflight and launch
 
@@ -196,11 +197,11 @@ ichor-al-daemon import-pool --campaign-dir . --source pool.xyz
 ichor-al-daemon start --live --campaign-dir . --max-ticks 200
 ```
 
-The smoke config leaves Slurm arrays unthrottled with
-`resources.array_concurrency_limit: null`, so Gaussian and AIMAll can use as
-much concurrency as Slurm policy and current cluster load allow. It also sets
-`resources.aimall_cpus_per_task: 8` because AIMAll is usually the slowest first
-smoke phase on CSF3. The example AIMAll block uses `naat: auto`,
+The smoke config throttles Slurm arrays with
+`resources.array_concurrency_limit: 4` to be gentle on the scheduler. Backend
+CPU fields default to `auto`; AIMAll combines that with `aimall.naat: auto`
+to choose an atom-level parallelism appropriate to the staged system size.
+The example AIMAll block uses `naat: auto`,
 `boaq: auto_gs2`, and `iasmesh: medium` to keep the first integration pass
 cheap while still emitting IQA terms with `encomp: 3`. If you set a manual
 `%N` array throttle later, keep

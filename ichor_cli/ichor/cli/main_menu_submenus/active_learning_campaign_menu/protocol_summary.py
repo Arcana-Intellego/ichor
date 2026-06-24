@@ -296,25 +296,57 @@ def format_sampling_protocol_summary(config: CampaignConfig) -> str:
         )
     )
     lines.append(_line("resources.partition", resources.partition))
-    lines.append(_line("resources.walltime_hours", resources.walltime_hours))
+    lines.append(_line("resources.default_walltime_hours", resources.default_walltime_hours))
     lines.append(_line("resources.effective_phase_walltimes", _walltime_summary(resources)))
-    lines.append(_line("resources.mem_per_cpu", resources.mem_per_cpu))
-    lines.append(_line("resources.cpus_per_task", resources.cpus_per_task))
-    lines.append(_line("resources.aimall_cpus_per_task", resources.aimall_cpus_per_task))
-    lines.append(_line("resources.ariadne_cpus_per_task", resources.ariadne_cpus_per_task))
+    lines.append(
+        _line(
+            "resources.phase_cpus",
+            "POLUS="
+            + str(resources.polus_cpus_per_task)
+            + ", Gaussian="
+            + str(resources.gaussian_cpus_per_task)
+            + ", AIMAll="
+            + str(resources.aimall_cpus_per_task)
+            + ", ARIADNE="
+            + str(resources.ariadne_cpus_per_task)
+            + ", FEREBUS="
+            + str(resources.ferebus_cpus_per_task),
+        )
+    )
+    lines.append(
+        _line(
+            "resources.phase_mem_per_cpu",
+            "POLUS="
+            + str(resources.polus_mem_per_cpu)
+            + ", Gaussian="
+            + str(resources.gaussian_mem_per_cpu)
+            + ", AIMAll="
+            + str(resources.aimall_mem_per_cpu)
+            + ", ARIADNE="
+            + str(resources.ariadne_mem_per_cpu)
+            + ", FEREBUS="
+            + str(resources.ferebus_mem_per_cpu),
+        )
+    )
+    lines.append(_line("resources.gaussian_memory_mode", resources.gaussian_memory_mode))
+    lines.append(_line("resources.gaussian_link0_mem", resources.gaussian_link0_mem))
+    lines.append(
+        _line(
+            "resources.gaussian_memory_fraction_of_slurm",
+            resources.gaussian_memory_fraction_of_slurm,
+        )
+    )
     lines.append(
         _line("resources.array_concurrency_limit", resources.array_concurrency_limit)
     )
-    lines.append(_line("aimall.nproc", resources.aimall_cpus_per_task))
+    lines.append(_line("resources.gradient_parallel_backend", resources.gradient_parallel_backend))
+    lines.append(_line("resources.aimall_cpus_per_task", resources.aimall_cpus_per_task))
     lines.append(_line("aimall.naat", aimall.naat))
     lines.append(_line("aimall.encomp", aimall.encomp))
     lines.append(_line("aimall.boaq", aimall.boaq))
     lines.append(_line("aimall.iasmesh", aimall.iasmesh))
-    lines.append(_line("gaussian.nproc", gaussian.nproc))
-    lines.append(_line("gaussian.memory_mode", gaussian.memory_mode))
-    lines.append(
-        _line("gaussian.memory_fraction_of_slurm", gaussian.memory_fraction_of_slurm)
-    )
+    lines.append(_line("gaussian.method", gaussian.method))
+    lines.append(_line("gaussian.basis_set", gaussian.basis_set))
     lines.append(
         _line(
             "runtime.poll_sacct_missing_max_ticks",
