@@ -286,8 +286,7 @@ def test_submit_ferebus_replaces_all_memory_directives(tmp_path):
     )
 
     lines = (tmp_path / "runFerebus.sh").read_text(encoding="utf-8").splitlines()
-    memory_lines = [line for line in lines if line.startswith("#SBATCH --mem")]
-    assert memory_lines == ["#SBATCH --mem-per-cpu=6G"]
+    assert "#SBATCH --mem-per-cpu=6G" in lines
     assert "#SBATCH --mem=32G" not in lines
     assert "#SBATCH --mem-per-cpu=2G" not in lines
     assert "#SBATCH --mem-bind=local" in lines

@@ -101,6 +101,38 @@ def _install_fake_global_variables(monkeypatch, config, machine):
     )
 
 
+def _install_fake_script_render_profile(monkeypatch):
+    python_path = "/opt/ichor-test/bin/python"
+    gaussian_module = "apps/binapps/gaussian/g16c01_em64t_detectcpu"
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf3": {
+                "hpc": {
+                    "scheduler": "slurm",
+                    "jobscript_shebang": "#!/bin/bash --login",
+                    "memory_per_core_gb_by_partition": {"multicore": 8},
+                    "parallel_environments": {"multicore": [1, 168]},
+                },
+                "software": {
+                    "python": {
+                        "modules": [],
+                        "python_path": python_path,
+                    },
+                    "gaussian": {
+                        "modules": [gaussian_module],
+                        "executable_path": "g16",
+                        "scratch_root": "/scratch/$USER",
+                    },
+                    "ariadne_runtime": {"modules": []},
+                },
+            },
+        },
+        "csf3",
+    )
+    return python_path, gaussian_module
+
+
 # --- preflight introspection (always run) ----------------------------------
 
 
@@ -223,7 +255,8 @@ def test_live_executor_refuses_when_sbatch_absent_on_windows():
 # --- sbatch script body smoke (no backends needed) ------------------------
 
 
-def test_build_sbatch_script_renders_gaussian_block():
+def test_build_sbatch_script_renders_gaussian_block(monkeypatch):
+    _, gaussian_module = _install_fake_script_render_profile(monkeypatch)
     body = build_sbatch_script(
         phase_name="INITIAL_GAUSSIAN",
         iteration=0,
@@ -231,7 +264,7 @@ def test_build_sbatch_script_renders_gaussian_block():
         config=CampaignConfig(),
     )
     assert "#SBATCH --job-name=INITIAL_GAUSSIAN-0" in body
-    assert "module load gaussian/g16c01_em64t_detectcpu" in body
+    assert "module load " + gaussian_module in body
     assert "g16 < input.gjf" in body
     assert "> input.gau" in body
     assert "> output.log" not in body
@@ -1030,16 +1063,19 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
 
 
 def test_build_sbatch_script_renders_aimall_block(monkeypatch):
+    _install_fake_script_render_profile(monkeypatch)
     monkeypatch.setattr(
         live_executor_mod,
         "_configured_backend_path",
         lambda backend_name, fallback: "/opt/AIM All/aimqb.ish",
     )
+    cfg = CampaignConfig()
+    cfg.resources.aimall_cpus_per_task = 8
     body = build_sbatch_script(
         phase_name="AIMALL",
         iteration=3,
         campaign_dir=Path("/scratch/campaign"),
-        config=CampaignConfig(),
+        config=cfg,
     )
     command_line = next(line for line in body.splitlines() if "aimqb.ish" in line)
     assert command_line.startswith(shlex.quote("/opt/AIM All/aimqb.ish") + " -nogui")
@@ -1051,7 +1087,8 @@ def test_build_sbatch_script_renders_aimall_block(monkeypatch):
     assert "AIMALL-3" in body
 
 
-def test_build_sbatch_script_renders_ariadne_block():
+def test_build_sbatch_script_renders_ariadne_block(monkeypatch):
+    python_path, _ = _install_fake_script_render_profile(monkeypatch)
     body = build_sbatch_script(
         phase_name="ARIADNE_ARRAY",
         iteration=2,
@@ -1059,13 +1096,14 @@ def test_build_sbatch_script_renders_ariadne_block():
         config=CampaignConfig(),
     )
     assert "ariadne_runner" in body
-    assert shlex.quote(sys.executable) + " -m ichor.hpc.active_learning.acquisition.ariadne_runner" in body
+    assert shlex.quote(python_path) + " -m ichor.hpc.active_learning.acquisition.ariadne_runner" in body
     assert "\npython -m ichor.hpc.active_learning.acquisition.ariadne_runner" not in body
     assert "--seed-index $SLURM_ARRAY_TASK_ID" in body
     assert "--iteration 2" in body
 
 
-def test_build_sbatch_script_renders_polus_block_with_configured_descriptor():
+def test_build_sbatch_script_renders_polus_block_with_configured_descriptor(monkeypatch):
+    python_path, _ = _install_fake_script_render_profile(monkeypatch)
     cfg = CampaignConfig()
     cfg.phase_b.descriptor = "acquisition_weighted"
     body = build_sbatch_script(
@@ -1075,7 +1113,7 @@ def test_build_sbatch_script_renders_polus_block_with_configured_descriptor():
         config=cfg,
     )
     assert "polus_wrapper" in body
-    assert shlex.quote(sys.executable) + " -m ichor.hpc.active_learning.sampling.polus_wrapper" in body
+    assert shlex.quote(python_path) + " -m ichor.hpc.active_learning.sampling.polus_wrapper" in body
     assert "\npython -m ichor.hpc.active_learning.sampling.polus_wrapper" not in body
     assert "--descriptor acquisition_weighted" in body
     assert "--iteration 4" in body
