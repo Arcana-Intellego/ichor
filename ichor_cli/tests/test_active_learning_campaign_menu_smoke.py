@@ -1554,8 +1554,10 @@ def test_prologue_summary_when_state_json_schema_drift(tmp_path):
         active_learning_campaign_menu_options.selected_active_learning_campaign_directory_path = original
 
 
-def test_prologue_call_refreshes_summary(tmp_path):
+def test_prologue_call_refreshes_summary(tmp_path, monkeypatch):
     """Calling MenuOptions() must refresh the summary before stringifying."""
+    import ichor.cli.global_menu_variables as globals_
+    import ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context as campaign_context
     from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_menu import (
         active_learning_campaign_menu_options,
     )
@@ -1566,6 +1568,12 @@ def test_prologue_call_refreshes_summary(tmp_path):
 
     original = active_learning_campaign_menu_options.selected_active_learning_campaign_directory_path
     try:
+        monkeypatch.setattr(campaign_context, "_explicit_selection", True)
+        monkeypatch.setattr(
+            globals_,
+            "SELECTED_ACTIVE_LEARNING_CAMPAIGN_DIRECTORY_PATH",
+            campaign,
+        )
         active_learning_campaign_menu_options.selected_active_learning_campaign_directory_path = campaign
         active_learning_campaign_menu_options.daemon_status_summary = "(should be overwritten)"
         # Invoke the MenuOptions __call__ as the ConsoleMenu prologue would.
@@ -1642,7 +1650,7 @@ def test_campaign_config_load_edit_save_preserves_hidden_fields(tmp_path, monkey
     (tmp_path / "campaign.yaml").write_text(yaml.safe_dump(payload), encoding="utf-8")
     monkeypatch.setattr(menu, "_pause", lambda: None)
 
-    menu.EditCampaignConfigFunctions.load_from_disk()
+    assert menu.load_config_for_campaign_dir(tmp_path, quiet=True, prompt_if_dirty=False)
     menu.get_campaign_config().system_name = "WATER_AL"
     menu.EditCampaignConfigFunctions.save_to_disk()
 
