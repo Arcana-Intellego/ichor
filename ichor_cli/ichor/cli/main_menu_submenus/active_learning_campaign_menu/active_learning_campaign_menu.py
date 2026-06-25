@@ -31,6 +31,8 @@ from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_
     JOURNAL_MENU_DESCRIPTION,
 )
 from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+    adopt_initial_campaign_dir_if_valid,
+    is_explicit_campaign_selection,
     set_selected_campaign_dir,
 )
 from ichor.cli.menu_description import MenuDescription
@@ -64,16 +66,12 @@ class ActiveLearningCampaignMenuOptions(MenuOptions):
         is not a directory; the prologue surfaces it in red so the operator
         cannot accidentally drive a daemon against a bad path.
         """
+        if not is_explicit_campaign_selection():
+            return (
+                "No active learning campaign directory selected yet. "
+                "Use 'Select / switch campaign directory' to choose one."
+            )
         path = Path(self.selected_active_learning_campaign_directory_path)
-        if str(path) == "" or path == Path("").absolute():
-            # The global is initialised to Path("").absolute() == cwd; warn only
-            # if the cwd does not look like a campaign dir (no .DATA subtree yet).
-            if not (path / ".DATA" / "ACTIVE_LEARNING").exists():
-                return (
-                    "No active learning campaign directory selected yet. "
-                    "Use 'Select / switch campaign directory' to choose one."
-                )
-            return None
         if not path.exists():
             return f"Campaign directory {path} does not exist."
         if not path.is_dir():
@@ -88,15 +86,40 @@ class ActiveLearningCampaignMenuOptions(MenuOptions):
         state.json -- the operator falls back to 'Reconcile state' from the
         daemon control submenu instead.
         """
+        self._sync_selected_campaign_from_context()
         self._refresh_daemon_status_summary()
         return super().__call__()
+
+    def _sync_selected_campaign_from_context(self) -> None:
+        adopted = adopt_initial_campaign_dir_if_valid()
+        if adopted is None:
+            if is_explicit_campaign_selection():
+                self.selected_active_learning_campaign_directory_path = (
+                    ichor.cli.global_menu_variables.SELECTED_ACTIVE_LEARNING_CAMPAIGN_DIRECTORY_PATH
+                )
+            else:
+                self.selected_active_learning_campaign_directory_path = "(none)"
+            return
+
+        self.selected_active_learning_campaign_directory_path = adopted
+        cfg_menu = importlib.import_module(
+            "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+            "active_learning_campaign_submenus.edit_campaign_config_menu"
+        )
+        if not cfg_menu.has_unsaved_config_changes():
+            cfg_menu.load_config_for_campaign_dir(
+                adopted,
+                quiet=True,
+                prompt_if_dirty=False,
+            )
 
     def _refresh_daemon_status_summary(self) -> None:
         import json
 
+        if not is_explicit_campaign_selection():
+            self.daemon_status_summary = "(no campaign selected)"
+            return
         path = Path(self.selected_active_learning_campaign_directory_path)
-        # Treat the initial cwd default as "no campaign" unless it actually
-        # has the expected .DATA/ACTIVE_LEARNING subtree.
         state_path = path / ".DATA" / "ACTIVE_LEARNING" / "state.json"
         if not state_path.is_file():
             self.daemon_status_summary = "(no state.json yet)"

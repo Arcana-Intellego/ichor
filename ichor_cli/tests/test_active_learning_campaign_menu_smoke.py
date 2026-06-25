@@ -236,6 +236,109 @@ def test_select_campaign_directory_auto_loads_campaign_yaml(tmp_path, monkeypatc
     assert not menu.has_unsaved_config_changes()
 
 
+def test_active_learning_menu_auto_adopts_valid_campaign_cwd(tmp_path, monkeypatch):
+    import importlib
+
+    import ichor.cli.global_menu_variables as globals_
+    import ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context as campaign_context
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    top = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_menu"
+    )
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    cfg = CampaignConfig()
+    cfg.gaussian.basis_set = "def2-SVP"
+    cfg.to_yaml(tmp_path / "campaign.yaml")
+    monkeypatch.setattr(campaign_context, "_explicit_selection", False)
+    monkeypatch.setattr(
+        globals_,
+        "SELECTED_ACTIVE_LEARNING_CAMPAIGN_DIRECTORY_PATH",
+        tmp_path,
+    )
+    top.active_learning_campaign_menu_options.selected_active_learning_campaign_directory_path = (
+        tmp_path
+    )
+
+    rendered = top.active_learning_campaign_menu_options()
+
+    assert str(tmp_path) in rendered
+    assert "(none)" not in rendered
+    assert campaign_context.selected_campaign_dir() == tmp_path
+    assert menu.get_campaign_config().gaussian.basis_set == "def2-SVP"
+    assert str(tmp_path / "campaign.yaml") == menu.edit_campaign_config_menu_options.loaded_from
+
+
+def test_save_to_disk_works_after_auto_adopting_valid_campaign_cwd(
+    tmp_path, monkeypatch,
+):
+    import importlib
+
+    import ichor.cli.global_menu_variables as globals_
+    import ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context as campaign_context
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    top = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_menu"
+    )
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    CampaignConfig().to_yaml(tmp_path / "campaign.yaml")
+    monkeypatch.setattr(campaign_context, "_explicit_selection", False)
+    monkeypatch.setattr(
+        globals_,
+        "SELECTED_ACTIVE_LEARNING_CAMPAIGN_DIRECTORY_PATH",
+        tmp_path,
+    )
+    monkeypatch.setattr(menu, "_pause", lambda: None)
+    top.active_learning_campaign_menu_options.selected_active_learning_campaign_directory_path = (
+        tmp_path
+    )
+
+    top.active_learning_campaign_menu_options()
+    menu._set_config_value("gaussian.basis_set", "6-31+G(d,p)")
+    menu.EditCampaignConfigFunctions.save_to_disk()
+
+    loaded = CampaignConfig.from_yaml(tmp_path / "campaign.yaml")
+    assert loaded.gaussian.basis_set == "6-31+G(d,p)"
+    assert not menu.has_unsaved_config_changes()
+
+
+def test_active_learning_menu_does_not_show_non_campaign_cwd_as_selected(
+    tmp_path, monkeypatch,
+):
+    import importlib
+
+    import ichor.cli.global_menu_variables as globals_
+    import ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context as campaign_context
+
+    top = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_menu"
+    )
+    monkeypatch.setattr(campaign_context, "_explicit_selection", False)
+    monkeypatch.setattr(
+        globals_,
+        "SELECTED_ACTIVE_LEARNING_CAMPAIGN_DIRECTORY_PATH",
+        tmp_path,
+    )
+    top.active_learning_campaign_menu_options.selected_active_learning_campaign_directory_path = (
+        tmp_path
+    )
+
+    rendered = top.active_learning_campaign_menu_options()
+
+    assert "Selected active learning campaign directory path: (none)" in rendered
+    assert "No active learning campaign directory selected yet" in rendered
+
+
 def test_switch_campaign_auto_loads_new_yaml_without_reusing_old_state(tmp_path):
     import importlib
 

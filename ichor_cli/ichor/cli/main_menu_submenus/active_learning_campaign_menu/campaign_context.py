@@ -22,6 +22,40 @@ _INITIAL_DEFAULT_PATH = Path("").absolute()
 _explicit_selection = False
 
 
+def _current_global_campaign_path() -> Path:
+    return Path(
+        ichor.cli.global_menu_variables.SELECTED_ACTIVE_LEARNING_CAMPAIGN_DIRECTORY_PATH
+    ).expanduser().absolute()
+
+
+def is_explicit_campaign_selection() -> bool:
+    return _explicit_selection
+
+
+def is_campaign_directory(path: str | Path) -> bool:
+    candidate = Path(path).expanduser().absolute()
+    return (
+        candidate.exists()
+        and candidate.is_dir()
+        and (candidate / "campaign.yaml").is_file()
+    )
+
+
+def adopt_initial_campaign_dir_if_valid() -> Optional[Path]:
+    """Make a valid launch-cwd campaign an explicit menu selection.
+
+    The top-level menu may inherit the process cwd through the legacy global.
+    That path is safe to adopt only when it already contains campaign.yaml.
+    First-run campaigns do not need .DATA/ACTIVE_LEARNING yet.
+    """
+    if _explicit_selection:
+        return selected_campaign_dir_or_none()
+    candidate = _current_global_campaign_path()
+    if not is_campaign_directory(candidate):
+        return None
+    return set_selected_campaign_dir(candidate)
+
+
 def set_selected_campaign_dir(path: str | Path) -> Path:
     """Record an operator-selected campaign path and mirror the legacy global."""
     global _explicit_selection
@@ -33,9 +67,7 @@ def set_selected_campaign_dir(path: str | Path) -> Path:
 
 def selected_campaign_dir() -> Path:
     """Return the selected campaign directory or raise a fail-closed error."""
-    path = Path(
-        ichor.cli.global_menu_variables.SELECTED_ACTIVE_LEARNING_CAMPAIGN_DIRECTORY_PATH
-    ).expanduser().absolute()
+    path = _current_global_campaign_path()
     if not _explicit_selection and path == _INITIAL_DEFAULT_PATH:
         raise CampaignSelectionError(
             "No active-learning campaign directory has been selected. "
