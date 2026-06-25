@@ -574,12 +574,12 @@ def _auto_cpu_target(
             reason = "ariadne_serial_gradient_backend"
         elif mode == "active_fd":
             dim = int(getattr(config.acquisition.subspace, "max_subspace_dim", 6))
-            target = 2 * dim + 1
-            reason = "ariadne_active_fd_stencil_workers"
+            target = dim
+            reason = "ariadne_active_fd_direction_workers"
         else:
             n_atoms = int(_staged_natoms(campaign_dir, phase_name, iteration) or 12)
-            target = 2 * (3 * n_atoms) + 1
-            reason = "ariadne_cartesian_fd_stencil_workers"
+            target = 3 * n_atoms
+            reason = "ariadne_cartesian_fd_component_workers"
             extra["n_atoms"] = int(n_atoms)
         if target > partition_max:
             extra["cpu_cap_warning"] = "auto target capped at partition maximum"

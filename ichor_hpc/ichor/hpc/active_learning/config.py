@@ -902,7 +902,7 @@ class AimallConfigBlock:
 
 @dataclass
 class CampaignConfig:
-    """Top-level campaign configuration (schema v2)."""
+    """Top-level campaign configuration (schema v3)."""
 
     schema_version: int = CONFIG_SCHEMA_VERSION
 

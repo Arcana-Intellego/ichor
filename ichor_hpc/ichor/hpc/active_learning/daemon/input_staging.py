@@ -21,7 +21,7 @@ import os  # stage_ferebus_inputs cd's into the staging dir to export csvs; this
 import re
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ichor.core.atoms import Atoms
 from ichor.core.files import PointDirectory
@@ -297,7 +297,15 @@ def _write_pyferebus_job_details(
     return path
 
 
-def stage_gaussian_inputs(campaign_dir, config, phase_name, iteration, sample_xyz) -> Tuple[Path, int]:
+def stage_gaussian_inputs(
+    campaign_dir,
+    config,
+    phase_name,
+    iteration,
+    sample_xyz,
+    *,
+    partition_override: Optional[str] = None,
+) -> Tuple[Path, int]:
     """Write one POINT_<k>.pointdir/input.gjf per frame in sample_xyz, plus
     POINTS.txt. Returns (staging_dir, n_points)."""
     from ichor.core.files.gaussian.gjf import GJF
@@ -338,7 +346,7 @@ def stage_gaussian_inputs(campaign_dir, config, phase_name, iteration, sample_xy
         gaussian_resources = resolve_phase_resources(
             phase_name=str(phase_name),
             config=config,
-            partition=str(config.resources.partition),
+            partition=str(partition_override or config.resources.partition),
             campaign_dir=campaign_dir,
             iteration=int(iteration),
             array_size=len(frames),
@@ -380,7 +388,14 @@ def stage_gaussian_inputs(campaign_dir, config, phase_name, iteration, sample_xy
     return staging, len(pointdirs)
 
 
-def stage_aimall_inputs(campaign_dir, config, phase_name, iteration) -> Tuple[Path, int]:
+def stage_aimall_inputs(
+    campaign_dir,
+    config,
+    phase_name,
+    iteration,
+    *,
+    partition_override: Optional[str] = None,
+) -> Tuple[Path, int]:
     """AIMAll runs on the .wfn files Gaussian produced in the same bucket. The
     pointdirs already exist; rewrite POINTS.txt over the Gaussian-accepted
     pointdirs so the array only indexes ready points. Returns (dir, n_points)."""
@@ -394,7 +409,7 @@ def stage_aimall_inputs(campaign_dir, config, phase_name, iteration) -> Tuple[Pa
     aimall_resources = resolve_phase_resources(
         phase_name=str(phase_name),
         config=config,
-        partition=str(config.resources.partition),
+        partition=str(partition_override or config.resources.partition),
         campaign_dir=campaign_dir,
         iteration=int(iteration),
         array_size=len(pointdirs),

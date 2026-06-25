@@ -606,16 +606,34 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         from . import input_staging as _stg
         camp = Path(self.campaign_dir)
         it = int(state.iteration)
+        effective_partition = (
+            str(self.partition)
+            if self.partition is not None
+            else str(getattr(self.config.resources, "partition", "multicore"))
+        )
         if phase_name in ("INITIAL_GAUSSIAN", "GAUSSIAN"):
             sample = self._locate_sample_xyz(phase_name, it)
             if sample is None:
                 raise BackendSubmissionError(
                     "no POLUS sample to stage for " + phase_name
                 )
-            _, n = _stg.stage_gaussian_inputs(camp, self.config, phase_name, it, sample)
+            _, n = _stg.stage_gaussian_inputs(
+                camp,
+                self.config,
+                phase_name,
+                it,
+                sample,
+                partition_override=effective_partition,
+            )
             return n
         if phase_name in ("INITIAL_AIMALL", "AIMALL"):
-            _, n = _stg.stage_aimall_inputs(camp, self.config, phase_name, it)
+            _, n = _stg.stage_aimall_inputs(
+                camp,
+                self.config,
+                phase_name,
+                it,
+                partition_override=effective_partition,
+            )
             return n
         if phase_name == "ARIADNE_ARRAY":
             return self._count_seeds(it)

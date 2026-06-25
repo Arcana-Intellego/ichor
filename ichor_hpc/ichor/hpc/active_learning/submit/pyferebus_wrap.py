@@ -246,7 +246,8 @@ def _harden_generated_script(
         ):
             return True
         if mem_per_cpu is not None and re.match(
-            r"^#SBATCH\s+--mem-per-cpu(?:=|\b)", stripped
+            r"^#SBATCH\s+(?:--mem(?:=|\b)|--mem-per-cpu(?:=|\b))",
+            stripped,
         ):
             return True
         if cpus_per_task is not None and re.match(

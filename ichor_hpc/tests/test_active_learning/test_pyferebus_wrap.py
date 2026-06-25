@@ -261,6 +261,36 @@ def test_submit_ferebus_rewrites_pyferebus_day_walltime_to_hours(tmp_path):
     assert "#SBATCH -t 2-0" not in script
 
 
+def test_submit_ferebus_replaces_all_memory_directives(tmp_path):
+    captured: List[_StubModel] = []
+    model_class = _make_model_class(
+        captured,
+        script_text=(
+            "#!/bin/bash --login\n"
+            "#SBATCH --mem=32G\n"
+            "#SBATCH --mem-per-cpu=2G\n"
+            "#SBATCH --job-name=ferebus-light\n"
+            "ferebus ${line}\n"
+        ),
+    )
+    jd = tmp_path / "job.json"
+    jd.write_text("{}")
+
+    submit_ferebus(
+        jd,
+        tmp_path,
+        mem_per_cpu="6G",
+        model_class=model_class,
+        submit_runner=_StubRunner(),
+    )
+
+    lines = (tmp_path / "runFerebus.sh").read_text(encoding="utf-8").splitlines()
+    memory_lines = [line for line in lines if line.startswith("#SBATCH --mem")]
+    assert memory_lines == ["#SBATCH --mem-per-cpu=6G"]
+    assert "#SBATCH --mem=32G" not in lines
+    assert "#SBATCH --mem-per-cpu=2G" not in lines
+
+
 def test_submit_ferebus_formats_long_walltime_as_days(tmp_path):
     captured: List[_StubModel] = []
     model_class = _make_model_class(

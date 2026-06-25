@@ -780,6 +780,154 @@ def test_build_sbatch_script_uses_phase_walltime_override():
     )
 
 
+def test_ariadne_auto_cpus_match_active_fd_worker_count(monkeypatch):
+    from ichor.hpc.active_learning.daemon.resource_solver import resolve_phase_resources
+
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf3": {
+                "hpc": {
+                    "parallel_environments": {"multicore": [1, 64]},
+                    "memory_per_core_gb_by_partition": {"multicore": 8},
+                }
+            }
+        },
+        "csf3",
+    )
+    cfg = CampaignConfig()
+    cfg.resources.partition = "multicore"
+    cfg.resources.ariadne_cpus_per_task = "auto"
+    cfg.acquisition.gradient.mode = "active_fd"
+    cfg.acquisition.subspace.max_subspace_dim = 6
+
+    resolved = resolve_phase_resources(
+        phase_name="ARIADNE_ARRAY",
+        config=cfg,
+        partition="multicore",
+        campaign_dir=None,
+        iteration=0,
+    )
+
+    assert resolved.cpus_per_task == 6
+    assert resolved.cpu_reason == "ariadne_active_fd_direction_workers"
+
+
+def test_ariadne_auto_cpus_match_cartesian_fd_component_count(monkeypatch, tmp_path):
+    from ichor.hpc.active_learning.daemon.resource_solver import resolve_phase_resources
+
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf3": {
+                "hpc": {
+                    "parallel_environments": {"multicore": [1, 64]},
+                    "memory_per_core_gb_by_partition": {"multicore": 8},
+                }
+            }
+        },
+        "csf3",
+    )
+    staging = tmp_path / ".DATA" / "STAGING" / "iter_0"
+    pointdir = staging / "POINT_0000.pointdir"
+    pointdir.mkdir(parents=True)
+    (pointdir / "input.gjf").write_text(
+        "\n".join([
+            "# test",
+            "",
+            "title",
+            "",
+            "0 1",
+            "O 0.0 0.0 0.0",
+            "H 0.0 0.0 1.0",
+            "H 0.0 1.0 0.0",
+            "H 1.0 0.0 0.0",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+    (staging / "POINTS.txt").write_text(str(pointdir) + "\n", encoding="utf-8")
+    cfg = CampaignConfig()
+    cfg.resources.partition = "multicore"
+    cfg.resources.ariadne_cpus_per_task = "auto"
+    cfg.acquisition.gradient.mode = "cartesian_fd"
+
+    resolved = resolve_phase_resources(
+        phase_name="ARIADNE_ARRAY",
+        config=cfg,
+        partition="multicore",
+        campaign_dir=tmp_path,
+        iteration=0,
+    )
+
+    assert resolved.cpus_per_task == 12
+    assert resolved.cpu_reason == "ariadne_cartesian_fd_component_workers"
+
+
+def test_array_staging_receives_executor_partition_override(monkeypatch, tmp_path):
+    from ichor.hpc.active_learning.daemon import input_staging as stg
+
+    cfg = CampaignConfig()
+    cfg.resources.partition = "yaml-partition"
+    campaign = tmp_path / "campaign"
+    campaign.mkdir()
+    sample = campaign / "sample.xyz"
+    sample.write_text("0\n\n", encoding="utf-8")
+    calls = {}
+
+    def fake_stage_gaussian(
+        campaign_dir,
+        config,
+        phase_name,
+        iteration,
+        sample_xyz,
+        *,
+        partition_override=None,
+    ):
+        calls["gaussian"] = {
+            "campaign_dir": Path(campaign_dir),
+            "phase_name": phase_name,
+            "iteration": iteration,
+            "sample_xyz": Path(sample_xyz),
+            "partition_override": partition_override,
+        }
+        return campaign / "gaussian-stage", 3
+
+    def fake_stage_aimall(
+        campaign_dir,
+        config,
+        phase_name,
+        iteration,
+        *,
+        partition_override=None,
+    ):
+        calls["aimall"] = {
+            "campaign_dir": Path(campaign_dir),
+            "phase_name": phase_name,
+            "iteration": iteration,
+            "partition_override": partition_override,
+        }
+        return campaign / "aimall-stage", 2
+
+    monkeypatch.setattr(stg, "stage_gaussian_inputs", fake_stage_gaussian)
+    monkeypatch.setattr(stg, "stage_aimall_inputs", fake_stage_aimall)
+    ex = LiveBackendsPhaseExecutor(
+        campaign_dir=campaign,
+        config=cfg,
+        sbatch_runner=object(),
+        backend_check=False,
+        partition="override-partition",
+    )
+    monkeypatch.setattr(ex, "_locate_sample_xyz", lambda phase_name, iteration: sample)
+
+    assert ex._array_size_after_staging("GAUSSIAN", SimpleNamespace(iteration=4)) == 3
+    assert ex._array_size_after_staging("AIMALL", SimpleNamespace(iteration=4)) == 2
+
+    assert calls["gaussian"]["partition_override"] == "override-partition"
+    assert calls["gaussian"]["sample_xyz"] == sample
+    assert calls["aimall"]["partition_override"] == "override-partition"
+
+
 def test_build_sbatch_script_renders_ferebus_block():
     body = build_sbatch_script(
         phase_name="INITIAL_FEREBUS",
