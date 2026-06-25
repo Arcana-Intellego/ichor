@@ -269,6 +269,7 @@ def test_submit_ferebus_replaces_all_memory_directives(tmp_path):
             "#!/bin/bash --login\n"
             "#SBATCH --mem=32G\n"
             "#SBATCH --mem-per-cpu=2G\n"
+            "#SBATCH --mem-bind=local\n"
             "#SBATCH --job-name=ferebus-light\n"
             "ferebus ${line}\n"
         ),
@@ -289,6 +290,7 @@ def test_submit_ferebus_replaces_all_memory_directives(tmp_path):
     assert memory_lines == ["#SBATCH --mem-per-cpu=6G"]
     assert "#SBATCH --mem=32G" not in lines
     assert "#SBATCH --mem-per-cpu=2G" not in lines
+    assert "#SBATCH --mem-bind=local" in lines
 
 
 def test_submit_ferebus_formats_long_walltime_as_days(tmp_path):
