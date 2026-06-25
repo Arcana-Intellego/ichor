@@ -159,7 +159,9 @@ def test_campaign_config_block_submenus_show_values_and_edit_one_field(monkeypat
     assert "resources.default_walltime_hours: 37" in resources_menu.this_menu_options()
 
 
-def test_edit_gaussian_basis_set_saves_to_selected_campaign_yaml(tmp_path, monkeypatch):
+def test_edit_gaussian_basis_set_saves_to_selected_campaign_yaml(
+    tmp_path, monkeypatch, capsys,
+):
     import importlib
 
     import ichor.cli.main_menu_submenus.active_learning_campaign_menu.field_menu as field_menu
@@ -176,6 +178,7 @@ def test_edit_gaussian_basis_set_saves_to_selected_campaign_yaml(tmp_path, monke
     campaign_dir = tmp_path / "campaign"
     campaign_dir.mkdir()
     cfg = CampaignConfig()
+    old_basis = cfg.gaussian.basis_set
     cfg.to_yaml(campaign_dir / "campaign.yaml")
     set_selected_campaign_dir(campaign_dir)
     assert menu.load_config_for_campaign_dir(campaign_dir, quiet=True)
@@ -198,8 +201,18 @@ def test_edit_gaussian_basis_set_saves_to_selected_campaign_yaml(tmp_path, monke
     assert menu.get_campaign_config().gaussian.basis_set == "6-31+G(d,p)"
     assert menu.has_unsaved_config_changes()
     assert "gaussian.basis_set" in menu.dirty_paths()
+    assert (
+        "  gaussian.basis_set: " + old_basis + " -> 6-31+G(d,p)"
+        in menu._pending_sparse_yaml()
+    )
 
     menu.EditCampaignConfigFunctions.save_to_disk()
+    output = capsys.readouterr().out
+    assert "Changed fields saved:" in output
+    assert (
+        "  gaussian.basis_set: " + old_basis + " -> 6-31+G(d,p)"
+        in output
+    )
 
     loaded = CampaignConfig.from_yaml(campaign_dir / "campaign.yaml")
     assert loaded.gaussian.basis_set == "6-31+G(d,p)"

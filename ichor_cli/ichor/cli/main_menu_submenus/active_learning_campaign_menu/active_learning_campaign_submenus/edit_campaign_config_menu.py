@@ -24,6 +24,7 @@ from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context
 from ichor.cli.main_menu_submenus.active_learning_campaign_menu.field_menu import (
     FieldSpec as _FieldSpec,
     edit_field as _shared_edit_field,
+    format_field_value,
     get_attr_path,
     make_field_menu,
     set_attr_path,
@@ -570,11 +571,33 @@ def _pending_sparse_yaml() -> str:
         return "No pending campaign.yaml field changes.\n"
     lines = ["Pending campaign.yaml field changes:\n"]
     for path in paths:
-        if path == "campaign.yaml":
-            lines.append("  campaign.yaml: initialise from packaged template\n")
-        else:
-            lines.append("  " + path + ": " + str(_get_config_value(path)) + "\n")
+        lines.append(_format_config_change_line(path) + "\n")
     return "".join(lines)
+
+
+def _get_snapshot_value(path: str):
+    if _loaded_snapshot is None:
+        raise KeyError(path)
+    cursor = _loaded_snapshot
+    for part in path.split("."):
+        if not isinstance(cursor, dict) or part not in cursor:
+            raise KeyError(path)
+        cursor = cursor[part]
+    return cursor
+
+
+def _format_config_change_line(path: str) -> str:
+    if path == "campaign.yaml":
+        return "  campaign.yaml: <not present> -> generated template"
+    try:
+        old = format_field_value(_get_snapshot_value(path))
+    except KeyError:
+        old = "<not present>"
+    try:
+        new = format_field_value(_get_config_value(path))
+    except Exception:
+        new = "<not available>"
+    return "  " + path + ": " + old + " -> " + new
 
 
 def load_config_for_campaign_dir(
@@ -1198,6 +1221,7 @@ class EditCampaignConfigFunctions:
         if not target.parent.exists():
             target.parent.mkdir(parents=True, exist_ok=True)
         changed = dirty_paths()
+        changed_lines = [_format_config_change_line(path) for path in changed]
         try:
             from ichor.hpc.active_learning.campaign_yaml import (
                 patch_campaign_yaml_fields,
@@ -1234,8 +1258,8 @@ class EditCampaignConfigFunctions:
         print("Wrote and verified " + str(target))
         if changed:
             print("Changed fields saved:")
-            for path in changed:
-                print("  " + path)
+            for line in changed_lines:
+                print(line)
         print("Note: unmodified campaign.yaml fields and comments are preserved where possible.")
         _pause()
 
