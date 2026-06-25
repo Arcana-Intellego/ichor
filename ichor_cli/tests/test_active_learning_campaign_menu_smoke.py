@@ -293,6 +293,94 @@ def test_save_validation_failure_keeps_dirty_state(tmp_path, monkeypatch):
     assert "Validation failed" in menu.edit_campaign_config_menu_options.last_error
 
 
+def test_save_reload_failure_leaves_existing_campaign_yaml_untouched(tmp_path, monkeypatch):
+    import importlib
+
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    original = CampaignConfig()
+    original.gaussian.basis_set = "def2-SVP"
+    original.to_yaml(tmp_path / "campaign.yaml")
+    original_text = (tmp_path / "campaign.yaml").read_text(encoding="utf-8")
+    set_selected_campaign_dir(tmp_path)
+    assert menu.load_config_for_campaign_dir(tmp_path, quiet=True)
+    monkeypatch.setattr(menu, "_pause", lambda: None)
+    real_from_yaml = menu.CampaignConfig.from_yaml
+
+    def fail_reload(path):
+        if ".menu-save." in str(path):
+            raise RuntimeError("synthetic reload failure")
+        return real_from_yaml(path)
+
+    menu._set_config_value("gaussian.basis_set", "6-31+G(d,p)")
+    monkeypatch.setattr(menu.CampaignConfig, "from_yaml", fail_reload)
+
+    menu.EditCampaignConfigFunctions.save_to_disk()
+
+    assert (tmp_path / "campaign.yaml").read_text(encoding="utf-8") == original_text
+    loaded = real_from_yaml(tmp_path / "campaign.yaml")
+    assert loaded.gaussian.basis_set == "def2-SVP"
+    assert menu.has_unsaved_config_changes()
+    assert "Reload before save failed" in menu.edit_campaign_config_menu_options.last_error
+    assert not list(tmp_path.glob("*.menu-save.*.tmp"))
+
+
+def test_dirty_paths_clear_when_field_is_reverted(tmp_path):
+    import importlib
+
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    cfg = CampaignConfig()
+    cfg.gaussian.basis_set = "def2-SVP"
+    cfg.to_yaml(tmp_path / "campaign.yaml")
+    set_selected_campaign_dir(tmp_path)
+    assert menu.load_config_for_campaign_dir(tmp_path, quiet=True)
+
+    menu._set_config_value("gaussian.basis_set", "6-31+G(d,p)")
+    assert "gaussian.basis_set" in menu.dirty_paths()
+
+    menu._set_config_value("gaussian.basis_set", "def2-SVP")
+
+    assert not menu.has_unsaved_config_changes()
+    assert menu.dirty_paths() == []
+
+
+def test_load_config_rejects_nonexistent_campaign_directory(tmp_path):
+    import importlib
+
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    CampaignConfig().to_yaml(existing / "campaign.yaml")
+    assert menu.load_config_for_campaign_dir(existing, quiet=True)
+    previous_campaign = menu.edit_campaign_config_menu_options.selected_campaign
+
+    missing = tmp_path / "missing"
+    assert not menu.load_config_for_campaign_dir(missing, quiet=True)
+
+    assert menu.edit_campaign_config_menu_options.selected_campaign == previous_campaign
+    assert "does not exist" in menu.edit_campaign_config_menu_options.last_error
+
+
 def test_field_transform_error_is_nonfatal(monkeypatch):
     import ichor.cli.main_menu_submenus.active_learning_campaign_menu.field_menu as field_menu
 
@@ -481,6 +569,138 @@ def test_daemon_launch_refuses_saved_blocked_config_change(
     out = capsys.readouterr().out
     assert "Saved campaign.yaml differs from the config lock" in out
     assert "gaussian.method" in out
+
+
+def test_foreground_launch_reviews_selected_config_override(
+    tmp_path, monkeypatch, capsys,
+):
+    import importlib
+
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    edit_menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    start_menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.daemon_control_submenus.start_daemon_foreground_submenu"
+    )
+    original = CampaignConfig()
+    _write_started_campaign_with_lock(tmp_path, original)
+    override = CampaignConfig()
+    override.gaussian.method = "PBE0"
+    override_path = tmp_path / "override.yaml"
+    override.to_yaml(override_path)
+    set_selected_campaign_dir(tmp_path)
+    edit_menu.load_config_for_campaign_dir(tmp_path, quiet=True)
+    start_menu.start_daemon_foreground_menu_options.selected_command = "resume"
+    start_menu.start_daemon_foreground_menu_options.selected_mode = "dry-run"
+    start_menu.start_daemon_foreground_menu_options.selected_config = str(override_path)
+    calls = []
+    import ichor.hpc.active_learning.cli as daemon_cli
+
+    monkeypatch.setattr(start_menu, "user_input_free_flow", lambda *args, **kwargs: "")
+    monkeypatch.setattr(daemon_cli, "cmd_resume", lambda ns: calls.append(ns) or 0)
+
+    start_menu.StartDaemonForegroundFunctions.launch()
+
+    out = capsys.readouterr().out
+    assert "Selected config override differs from the config lock" in out
+    assert "gaussian.method" in out
+    assert calls == []
+
+
+def test_foreground_launch_allows_clean_override_when_campaign_yaml_is_dirty_on_disk(
+    tmp_path, monkeypatch,
+):
+    import importlib
+
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    edit_menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    start_menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.daemon_control_submenus.start_daemon_foreground_submenu"
+    )
+    original = CampaignConfig()
+    _write_started_campaign_with_lock(tmp_path, original)
+    clean_override_path = tmp_path / "clean_override.yaml"
+    original.to_yaml(clean_override_path)
+    changed_campaign = CampaignConfig()
+    changed_campaign.gaussian.method = "PBE0"
+    changed_campaign.to_yaml(tmp_path / "campaign.yaml")
+    set_selected_campaign_dir(tmp_path)
+    edit_menu.load_config_for_campaign_dir(tmp_path, quiet=True)
+    start_menu.start_daemon_foreground_menu_options.selected_command = "resume"
+    start_menu.start_daemon_foreground_menu_options.selected_mode = "dry-run"
+    start_menu.start_daemon_foreground_menu_options.selected_config = str(clean_override_path)
+    start_menu.start_daemon_foreground_menu_options.selected_preset = ""
+    calls = []
+    import ichor.hpc.active_learning.cli as daemon_cli
+
+    monkeypatch.setattr(start_menu, "user_input_free_flow", lambda *args, **kwargs: "")
+    monkeypatch.setattr(daemon_cli, "cmd_resume", lambda ns: calls.append(ns) or 0)
+
+    start_menu.StartDaemonForegroundFunctions.launch()
+
+    assert len(calls) == 1
+    assert calls[0].config == str(clean_override_path)
+
+
+def test_background_launch_reviews_selected_config_override(
+    tmp_path, monkeypatch, capsys,
+):
+    import importlib
+
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    edit_menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    start_menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.daemon_control_submenus.start_daemon_background_submenu"
+    )
+    original = CampaignConfig()
+    _write_started_campaign_with_lock(tmp_path, original)
+    override = CampaignConfig()
+    override.gaussian.method = "PBE0"
+    override_path = tmp_path / "override.yaml"
+    override.to_yaml(override_path)
+    set_selected_campaign_dir(tmp_path)
+    edit_menu.load_config_for_campaign_dir(tmp_path, quiet=True)
+    start_menu.start_daemon_background_menu_options.selected_command = "resume"
+    start_menu.start_daemon_background_menu_options.selected_mode = "dry-run"
+    start_menu.start_daemon_background_menu_options.selected_config = str(override_path)
+    calls = []
+
+    monkeypatch.setattr(start_menu, "user_input_free_flow", lambda *args, **kwargs: "")
+    monkeypatch.setattr(
+        start_menu,
+        "launch_daemon_detached_checked",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    start_menu.StartDaemonBackgroundFunctions.launch()
+
+    out = capsys.readouterr().out
+    assert "Selected config override differs from the config lock" in out
+    assert "gaussian.method" in out
+    assert calls == []
 
 
 def test_acquisition_gradient_menu_exposes_active_fd_controls():

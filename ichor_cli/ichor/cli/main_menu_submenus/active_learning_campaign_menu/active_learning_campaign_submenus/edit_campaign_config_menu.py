@@ -1,8 +1,8 @@
 """Edit campaign config menu -- schema v3.
 
 Field-grouped editor over a single CampaignConfig instance held in module
-state. The grouping mirrors the nested block structure of schema v2: one
-menu item per top-level block plus a separate submenu tree for deeper
+state. The grouping follows the current CampaignConfig block structure: one
+menu item per top-level block plus a separate submenu tree for the deeper
 acquisition surface.
 """
 import hashlib
@@ -10,6 +10,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from uuid import uuid4
 
 import ichor.cli.global_menu_variables
 import ichor.hpc.global_variables
@@ -86,6 +87,7 @@ _loaded_from_path: Optional[Path] = None
 _editor_selected_campaign_dir: Optional[Path] = None
 _dirty_paths: set[str] = set()
 _loaded_fingerprint: Optional[str] = None
+_loaded_snapshot: Optional[dict] = None
 _last_save_path: Optional[Path] = None
 _last_error: str = ""
 _last_config_lock_error: str = ""
@@ -119,20 +121,22 @@ def _replace_campaign_config(
 
 
 def _clear_dirty_state():
-    global _dirty_paths, _loaded_fingerprint, _last_error
+    global _dirty_paths, _loaded_fingerprint, _loaded_snapshot, _last_error
     _dirty_paths = set()
     _loaded_fingerprint = _config_fingerprint(_campaign_config)
+    _loaded_snapshot = _campaign_config.to_dict()
     _last_error = ""
 
 
 def _mark_new_default_campaign(selected_dir: Path):
     global _campaign_config, _loaded_from_path, _editor_selected_campaign_dir
-    global _dirty_paths, _loaded_fingerprint
+    global _dirty_paths, _loaded_fingerprint, _loaded_snapshot
     _campaign_config = CampaignConfig()
     _loaded_from_path = None
     _editor_selected_campaign_dir = Path(selected_dir)
     _dirty_paths = {"campaign.yaml"}
     _loaded_fingerprint = None
+    _loaded_snapshot = None
     _sync_options_from_config()
 
 
@@ -145,7 +149,28 @@ def has_unsaved_config_changes() -> bool:
 def dirty_paths() -> list[str]:
     if not has_unsaved_config_changes():
         return []
+    if _loaded_snapshot is not None:
+        paths = _diff_config_paths(_loaded_snapshot, _campaign_config.to_dict())
+        return sorted(paths)
     return sorted(_dirty_paths)
+
+
+def _diff_config_paths(before, after, prefix: str = "") -> set[str]:
+    if before == after:
+        return set()
+    if isinstance(before, dict) and isinstance(after, dict):
+        paths: set[str] = set()
+        for key in sorted(set(before) | set(after)):
+            child_prefix = key if not prefix else prefix + "." + key
+            paths.update(
+                _diff_config_paths(
+                    before.get(key),
+                    after.get(key),
+                    child_prefix,
+                )
+            )
+        return paths
+    return {prefix or "campaign.yaml"}
 
 
 def _state_path_for_campaign(campaign_dir: Path) -> Path:
@@ -188,11 +213,22 @@ def current_config_lock_review():
     return review
 
 
-def saved_config_lock_review():
+def _saved_config_path_for_review(config_override=None) -> Optional[Path]:
     campaign_dir = selected_campaign_dir_or_none()
     if campaign_dir is None:
         return None
-    config_path = campaign_dir / "campaign.yaml"
+    if config_override:
+        return Path(config_override).expanduser().resolve()
+    return campaign_dir / "campaign.yaml"
+
+
+def saved_config_lock_review(config_override=None):
+    campaign_dir = selected_campaign_dir_or_none()
+    if campaign_dir is None:
+        return None
+    config_path = _saved_config_path_for_review(config_override)
+    if config_path is None:
+        return None
     state_path = _state_path_for_campaign(campaign_dir)
     if not config_path.is_file() or not state_path.is_file():
         return None
@@ -313,18 +349,18 @@ def format_current_config_lock_review() -> str:
     return formatted or "No campaign.yaml changes against the config lock."
 
 
-def saved_config_has_blocked_changes() -> bool:
-    review = saved_config_lock_review()
+def saved_config_has_blocked_changes(config_override=None) -> bool:
+    review = saved_config_lock_review(config_override)
     return bool(review is not None and review.blocked_changes)
 
 
-def saved_config_has_lock_changes() -> bool:
-    review = saved_config_lock_review()
+def saved_config_has_lock_changes(config_override=None) -> bool:
+    review = saved_config_lock_review(config_override)
     return bool(review is not None and review.changed)
 
 
-def format_saved_config_lock_review() -> str:
-    review = saved_config_lock_review()
+def format_saved_config_lock_review(config_override=None) -> str:
+    review = saved_config_lock_review(config_override)
     if review is None:
         return "No saved config lock review is available."
     from ichor.hpc.active_learning.daemon.config_lock import format_config_review
@@ -501,7 +537,20 @@ def load_config_for_campaign_dir(
     quiet: bool = False,
     prompt_if_dirty: bool = False,
 ) -> bool:
+    global _last_error
     selected = Path(campaign_dir).expanduser().absolute()
+    if not selected.exists():
+        _last_error = "Campaign directory does not exist: " + str(selected)
+        if not quiet:
+            print(_last_error)
+        _sync_options_from_config()
+        return False
+    if not selected.is_dir():
+        _last_error = "Campaign path is not a directory: " + str(selected)
+        if not quiet:
+            print(_last_error)
+        _sync_options_from_config()
+        return False
     if prompt_if_dirty and not _confirm_discard_dirty("load " + str(selected)):
         if not quiet:
             print("Load cancelled; current editor state was kept.")
@@ -512,7 +561,6 @@ def load_config_for_campaign_dir(
         try:
             cfg = CampaignConfig.from_yaml(yaml_path)
         except Exception as exc:
-            global _last_error
             _last_error = "Failed to load " + str(yaml_path) + ": " + str(exc)
             if not quiet:
                 print(_last_error)
@@ -1105,27 +1153,59 @@ class EditCampaignConfigFunctions:
             target.parent.mkdir(parents=True, exist_ok=True)
         changed = dirty_paths()
         before = _campaign_config.to_dict()
+        temp_path = target.with_name(
+            "." + target.name + ".menu-save." + uuid4().hex + ".tmp"
+        )
         try:
-            _campaign_config.to_yaml(target)
+            _campaign_config.to_yaml(temp_path)
         except Exception as exc:
-            print("Failed to write " + str(target) + ": " + str(exc))
+            print("Failed to write temporary config " + str(temp_path) + ": " + str(exc))
             _last_error = "Write failed: " + str(exc)
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             _sync_options_from_config()
             _pause()
             return
         try:
-            reloaded = CampaignConfig.from_yaml(target)
+            reloaded = CampaignConfig.from_yaml(temp_path)
         except Exception as exc:
-            print("Wrote " + str(target) + " but reload failed: " + str(exc))
-            _last_error = "Reload after save failed: " + str(exc)
+            print(
+                "Temporary campaign.yaml reload failed; existing "
+                + str(target)
+                + " was left untouched: "
+                + str(exc)
+            )
+            _last_error = "Reload before save failed: " + str(exc)
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             _sync_options_from_config()
             _pause()
             return
         after = reloaded.to_dict()
         if before != after:
             print("ERROR: saved campaign.yaml reloads to a different config.")
-            print("campaign.yaml was not accepted as verified.")
+            print("Existing " + str(target) + " was left untouched.")
             _last_error = "Save round-trip mismatch"
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            _sync_options_from_config()
+            _pause()
+            return
+        try:
+            temp_path.replace(target)
+        except Exception as exc:
+            print("Failed to replace " + str(target) + ": " + str(exc))
+            _last_error = "Replace failed: " + str(exc)
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             _sync_options_from_config()
             _pause()
             return

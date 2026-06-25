@@ -165,9 +165,17 @@ class StartDaemonBackgroundFunctions:
             print("Save or discard them before starting the daemon.")
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
-        if edit_menu.saved_config_has_lock_changes():
-            print("Saved campaign.yaml differs from the config lock:")
-            print(edit_menu.format_saved_config_lock_review())
+        config_override = (
+            Path(start_daemon_background_menu_options.selected_config)
+            if start_daemon_background_menu_options.selected_config
+            else None
+        )
+        if edit_menu.saved_config_has_lock_changes(config_override):
+            if config_override:
+                print("Selected config override differs from the config lock:")
+            else:
+                print("Saved campaign.yaml differs from the config lock:")
+            print(edit_menu.format_saved_config_lock_review(config_override))
             print("Run reconcile --apply for safe edits or revert blocked edits before starting.")
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
@@ -186,11 +194,7 @@ class StartDaemonBackgroundFunctions:
                     if start_daemon_background_menu_options.selected_max_ticks > 0
                     else None
                 ),
-                config=(
-                    Path(start_daemon_background_menu_options.selected_config)
-                    if start_daemon_background_menu_options.selected_config
-                    else None
-                ),
+                config=config_override,
                 preset=(
                     start_daemon_background_menu_options.selected_preset
                     if start_daemon_background_menu_options.selected_preset
