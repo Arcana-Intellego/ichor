@@ -161,6 +161,11 @@ class StartDaemonForegroundFunctions:
             if start_daemon_foreground_menu_options.selected_config
             else None
         )
+        if config_override and edit_menu.saved_config_review_failed(config_override):
+            print("Selected config override could not be reviewed:")
+            print("  " + edit_menu.saved_config_lock_review_error())
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
         if edit_menu.saved_config_has_lock_changes(config_override):
             if config_override:
                 print("Selected config override differs from the config lock:")

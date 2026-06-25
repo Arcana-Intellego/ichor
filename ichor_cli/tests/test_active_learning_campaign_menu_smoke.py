@@ -614,6 +614,89 @@ def test_foreground_launch_reviews_selected_config_override(
     assert calls == []
 
 
+def test_foreground_launch_refuses_missing_config_override(
+    tmp_path, monkeypatch, capsys,
+):
+    import importlib
+
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    edit_menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    start_menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.daemon_control_submenus.start_daemon_foreground_submenu"
+    )
+    CampaignConfig().to_yaml(tmp_path / "campaign.yaml")
+    set_selected_campaign_dir(tmp_path)
+    edit_menu.load_config_for_campaign_dir(tmp_path, quiet=True)
+    start_menu.start_daemon_foreground_menu_options.selected_command = "resume"
+    start_menu.start_daemon_foreground_menu_options.selected_mode = "dry-run"
+    start_menu.start_daemon_foreground_menu_options.selected_config = str(
+        tmp_path / "missing.yaml"
+    )
+    calls = []
+    import ichor.hpc.active_learning.cli as daemon_cli
+
+    monkeypatch.setattr(start_menu, "user_input_free_flow", lambda *args, **kwargs: "")
+    monkeypatch.setattr(daemon_cli, "cmd_resume", lambda ns: calls.append(ns) or 0)
+
+    start_menu.StartDaemonForegroundFunctions.launch()
+
+    out = capsys.readouterr().out
+    assert "Selected config override could not be reviewed" in out
+    assert "not a readable file" in out
+    assert calls == []
+
+
+def test_foreground_launch_refuses_invalid_config_override(
+    tmp_path, monkeypatch, capsys,
+):
+    import importlib
+
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    edit_menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    start_menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.daemon_control_submenus.start_daemon_foreground_submenu"
+    )
+    CampaignConfig().to_yaml(tmp_path / "campaign.yaml")
+    override_path = tmp_path / "invalid.yaml"
+    override_path.write_text(
+        "schema_version: 3\nsplit:\n  train_fraction: 0.9\n  val_mid_fraction: 0.9\n",
+        encoding="utf-8",
+    )
+    set_selected_campaign_dir(tmp_path)
+    edit_menu.load_config_for_campaign_dir(tmp_path, quiet=True)
+    start_menu.start_daemon_foreground_menu_options.selected_command = "resume"
+    start_menu.start_daemon_foreground_menu_options.selected_mode = "dry-run"
+    start_menu.start_daemon_foreground_menu_options.selected_config = str(override_path)
+    calls = []
+    import ichor.hpc.active_learning.cli as daemon_cli
+
+    monkeypatch.setattr(start_menu, "user_input_free_flow", lambda *args, **kwargs: "")
+    monkeypatch.setattr(daemon_cli, "cmd_resume", lambda ns: calls.append(ns) or 0)
+
+    start_menu.StartDaemonForegroundFunctions.launch()
+
+    out = capsys.readouterr().out
+    assert "Selected config override could not be reviewed" in out
+    assert "could not be loaded" in out
+    assert calls == []
+
+
 def test_foreground_launch_allows_clean_override_when_campaign_yaml_is_dirty_on_disk(
     tmp_path, monkeypatch,
 ):
@@ -700,6 +783,52 @@ def test_background_launch_reviews_selected_config_override(
     out = capsys.readouterr().out
     assert "Selected config override differs from the config lock" in out
     assert "gaussian.method" in out
+    assert calls == []
+
+
+def test_background_launch_refuses_invalid_config_override(
+    tmp_path, monkeypatch, capsys,
+):
+    import importlib
+
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    edit_menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    start_menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.daemon_control_submenus.start_daemon_background_submenu"
+    )
+    CampaignConfig().to_yaml(tmp_path / "campaign.yaml")
+    override_path = tmp_path / "invalid.yaml"
+    override_path.write_text(
+        "schema_version: 3\nsplit:\n  train_fraction: 0.9\n  val_mid_fraction: 0.9\n",
+        encoding="utf-8",
+    )
+    set_selected_campaign_dir(tmp_path)
+    edit_menu.load_config_for_campaign_dir(tmp_path, quiet=True)
+    start_menu.start_daemon_background_menu_options.selected_command = "resume"
+    start_menu.start_daemon_background_menu_options.selected_mode = "dry-run"
+    start_menu.start_daemon_background_menu_options.selected_config = str(override_path)
+    calls = []
+
+    monkeypatch.setattr(start_menu, "user_input_free_flow", lambda *args, **kwargs: "")
+    monkeypatch.setattr(
+        start_menu,
+        "launch_daemon_detached_checked",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    start_menu.StartDaemonBackgroundFunctions.launch()
+
+    out = capsys.readouterr().out
+    assert "Selected config override could not be reviewed" in out
+    assert "could not be loaded" in out
     assert calls == []
 
 

@@ -91,6 +91,7 @@ _loaded_snapshot: Optional[dict] = None
 _last_save_path: Optional[Path] = None
 _last_error: str = ""
 _last_config_lock_error: str = ""
+_last_saved_config_lock_error: str = ""
 
 
 def _config_fingerprint(cfg: CampaignConfig) -> str:
@@ -223,24 +224,54 @@ def _saved_config_path_for_review(config_override=None) -> Optional[Path]:
 
 
 def saved_config_lock_review(config_override=None):
+    global _last_saved_config_lock_error
+    _last_saved_config_lock_error = ""
+    override_requested = bool(config_override)
     campaign_dir = selected_campaign_dir_or_none()
     if campaign_dir is None:
+        if override_requested:
+            _last_saved_config_lock_error = "No campaign directory is selected."
         return None
     config_path = _saved_config_path_for_review(config_override)
     if config_path is None:
         return None
     state_path = _state_path_for_campaign(campaign_dir)
-    if not config_path.is_file() or not state_path.is_file():
+    if override_requested and not config_path.is_file():
+        _last_saved_config_lock_error = (
+            "Selected config override is not a readable file: "
+            + str(config_path)
+        )
+        return None
+    if not config_path.is_file():
         return None
     try:
         cfg = CampaignConfig.from_yaml(config_path)
+    except Exception as exc:
+        if override_requested:
+            _last_saved_config_lock_error = (
+                "Selected config override could not be loaded: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:200]
+            )
+        return None
+    if not state_path.is_file():
+        return None
+    try:
         state = _read_editor_state_for_lock(campaign_dir)
         from ichor.hpc.active_learning.daemon.config_lock import (
             review_config_changes,
         )
 
         return review_config_changes(campaign_dir, cfg, state)
-    except Exception:
+    except Exception as exc:
+        if override_requested:
+            _last_saved_config_lock_error = (
+                "Selected config override could not be reviewed: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:200]
+            )
         return None
 
 
@@ -359,10 +390,21 @@ def saved_config_has_lock_changes(config_override=None) -> bool:
     return bool(review is not None and review.changed)
 
 
+def saved_config_review_failed(config_override=None) -> bool:
+    if not config_override:
+        return False
+    saved_config_lock_review(config_override)
+    return bool(_last_saved_config_lock_error)
+
+
+def saved_config_lock_review_error() -> str:
+    return _last_saved_config_lock_error
+
+
 def format_saved_config_lock_review(config_override=None) -> str:
     review = saved_config_lock_review(config_override)
     if review is None:
-        return "No saved config lock review is available."
+        return _last_saved_config_lock_error or "No saved config lock review is available."
     from ichor.hpc.active_learning.daemon.config_lock import format_config_review
 
     formatted = format_config_review(review)
