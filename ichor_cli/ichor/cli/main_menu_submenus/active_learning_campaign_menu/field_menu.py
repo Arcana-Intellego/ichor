@@ -163,7 +163,12 @@ def edit_field(
     else:
         raise ValueError("unknown field menu input kind: " + spec.input_kind)
     if spec.transform is not None and value is not None:
-        value = spec.transform(value)
+        try:
+            value = spec.transform(value)
+        except Exception as exc:
+            print("Invalid value for " + spec.path + ": " + str(exc))
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
     set_value(spec.path, value)
 
 

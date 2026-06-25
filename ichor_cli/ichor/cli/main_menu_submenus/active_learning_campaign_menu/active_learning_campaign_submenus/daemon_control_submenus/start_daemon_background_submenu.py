@@ -142,6 +142,8 @@ class StartDaemonBackgroundFunctions:
     @staticmethod
     def launch():
         """Spawn the detached daemon and return immediately."""
+        import importlib
+
         try:
             campaign_dir = selected_campaign_dir()
         except CampaignSelectionError as exc:
@@ -150,6 +152,17 @@ class StartDaemonBackgroundFunctions:
             return
         if not campaign_dir.is_dir():
             print("Campaign directory does not exist: " + str(campaign_dir))
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        edit_menu = importlib.import_module(
+            "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+            "active_learning_campaign_submenus.edit_campaign_config_menu"
+        )
+        if edit_menu.has_unsaved_config_changes():
+            print("There are unsaved campaign.yaml edits:")
+            for path in edit_menu.dirty_paths()[:20]:
+                print("  " + path)
+            print("Save or discard them before starting the daemon.")
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
         try:

@@ -136,7 +136,12 @@ class StartDaemonForegroundFunctions:
     @staticmethod
     def launch():
         """Launch the daemon in the foreground; the menu blocks until exit."""
-        from ichor.hpc.active_learning.cli import cmd_resume, cmd_start
+        import importlib
+
+        edit_menu = importlib.import_module(
+            "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+            "active_learning_campaign_submenus.edit_campaign_config_menu"
+        )
 
         try:
             campaign_dir = selected_campaign_dir()
@@ -144,6 +149,15 @@ class StartDaemonForegroundFunctions:
             print_campaign_selection_error(exc)
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
+        if edit_menu.has_unsaved_config_changes():
+            print("There are unsaved campaign.yaml edits:")
+            for path in edit_menu.dirty_paths()[:20]:
+                print("  " + path)
+            print("Save or discard them before starting the daemon.")
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        from ichor.hpc.active_learning.cli import cmd_resume, cmd_start
+
         mode = start_daemon_foreground_menu_options.selected_mode
         ns = argparse.Namespace(
             campaign_dir=str(campaign_dir),

@@ -15,6 +15,7 @@ this menu just dispatches into the same ichor.hpc.active_learning.cli
 functions and Daemon.run() entry point.
 """
 from dataclasses import dataclass
+import importlib
 from pathlib import Path
 from typing import Union
 
@@ -147,7 +148,18 @@ class ActiveLearningCampaignFunctions:
                 ichor.cli.global_menu_variables.SELECTED_ACTIVE_LEARNING_CAMPAIGN_DIRECTORY_PATH
             ),
         )
-        selected = set_selected_campaign_dir(new_path)
+        cfg_menu = importlib.import_module(
+            "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+            "active_learning_campaign_submenus.edit_campaign_config_menu"
+        )
+        candidate = Path(new_path).expanduser().absolute()
+        if not cfg_menu.load_config_for_campaign_dir(
+            candidate,
+            quiet=False,
+            prompt_if_dirty=True,
+        ):
+            return
+        selected = set_selected_campaign_dir(candidate)
         active_learning_campaign_menu_options.selected_active_learning_campaign_directory_path = (
             selected
         )

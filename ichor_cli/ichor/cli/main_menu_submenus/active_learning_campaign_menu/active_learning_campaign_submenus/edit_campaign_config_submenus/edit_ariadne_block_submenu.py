@@ -32,7 +32,11 @@ def _get_value(path: str):
 
 
 def _set_value(path: str, value):
-    set_attr_path(_get_block(), path, value)
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_submenus.edit_campaign_config_menu import (
+        _set_config_value,
+    )
+
+    _set_config_value("ariadne." + path, value)
 
 
 def _sync_options_from_block(block):

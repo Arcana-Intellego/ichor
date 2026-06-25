@@ -1,10 +1,12 @@
-"""Edit campaign config menu -- schema v2.
+"""Edit campaign config menu -- schema v3.
 
 Field-grouped editor over a single CampaignConfig instance held in module
 state. The grouping mirrors the nested block structure of schema v2: one
 menu item per top-level block plus a separate submenu tree for deeper
 acquisition surface.
 """
+import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -17,6 +19,7 @@ from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context
     CampaignSelectionError,
     print_campaign_selection_error,
     selected_campaign_dir,
+    selected_campaign_dir_or_none,
 )
 from ichor.cli.main_menu_submenus.active_learning_campaign_menu.field_menu import (
     FieldSpec as _FieldSpec,
@@ -39,6 +42,7 @@ from ichor.cli.useful_functions import user_input_free_flow
 from ichor.hpc.active_learning.config import (
     CampaignConfig,
     ConfigValidationError,
+    diff_against_defaults,
     VALID_AIMALL_BOAQ_VALUES,
     VALID_AIMALL_IASMESH_VALUES,
     VALID_ACQUISITION_DRIVER_GRADIENT_BACKENDS,
@@ -79,22 +83,78 @@ EDIT_CAMPAIGN_CONFIG_MENU_DESCRIPTION = MenuDescription(
 
 _campaign_config: CampaignConfig = CampaignConfig()
 _loaded_from_path: Optional[Path] = None
+_editor_selected_campaign_dir: Optional[Path] = None
+_dirty_paths: set[str] = set()
+_loaded_fingerprint: Optional[str] = None
+_last_save_path: Optional[Path] = None
+_last_error: str = ""
+
+
+def _config_fingerprint(cfg: CampaignConfig) -> str:
+    payload = cfg.to_dict()
+    text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def get_campaign_config() -> CampaignConfig:
     return _campaign_config
 
 
-def _replace_campaign_config(cfg, loaded_from):
-    global _campaign_config, _loaded_from_path
+def _replace_campaign_config(
+    cfg,
+    loaded_from,
+    *,
+    selected_dir: Optional[Path] = None,
+    clear_dirty: bool = True,
+):
+    global _campaign_config, _loaded_from_path, _editor_selected_campaign_dir
     _campaign_config = cfg
-    _loaded_from_path = loaded_from
+    _loaded_from_path = Path(loaded_from) if loaded_from is not None else None
+    if selected_dir is not None:
+        _editor_selected_campaign_dir = Path(selected_dir)
+    if clear_dirty:
+        _clear_dirty_state()
     _sync_options_from_config()
+
+
+def _clear_dirty_state():
+    global _dirty_paths, _loaded_fingerprint, _last_error
+    _dirty_paths = set()
+    _loaded_fingerprint = _config_fingerprint(_campaign_config)
+    _last_error = ""
+
+
+def _mark_new_default_campaign(selected_dir: Path):
+    global _campaign_config, _loaded_from_path, _editor_selected_campaign_dir
+    global _dirty_paths, _loaded_fingerprint
+    _campaign_config = CampaignConfig()
+    _loaded_from_path = None
+    _editor_selected_campaign_dir = Path(selected_dir)
+    _dirty_paths = {"campaign.yaml"}
+    _loaded_fingerprint = None
+    _sync_options_from_config()
+
+
+def has_unsaved_config_changes() -> bool:
+    if _loaded_fingerprint is None:
+        return bool(_dirty_paths)
+    return _config_fingerprint(_campaign_config) != _loaded_fingerprint
+
+
+def dirty_paths() -> list[str]:
+    if not has_unsaved_config_changes():
+        return []
+    return sorted(_dirty_paths)
 
 
 @dataclass
 class EditCampaignConfigMenuOptions(MenuOptions):
     loaded_from: str = "defaults"
+    selected_campaign: str = "(none)"
+    unsaved_changes: str = "no"
+    dirty_fields: str = ""
+    last_save_path: str = ""
+    last_error: str = ""
     system_name: str = "SYSTEM"
     max_iterations: int = 50
     n_seeds_per_iteration: int = 50
@@ -105,6 +165,10 @@ class EditCampaignConfigMenuOptions(MenuOptions):
     acquisition_gradient_mode: str = "cartesian_fd"
     acquisition_max_subspace_dim: int = 6
 
+    def __call__(self):
+        _ensure_selected_campaign_loaded_for_editor()
+        return super().__call__()
+
 
 edit_campaign_config_menu_options = EditCampaignConfigMenuOptions()
 
@@ -114,12 +178,22 @@ def _get_config_value(path: str):
 
 
 def _set_config_value(path: str, value):
+    old = get_attr_path(_campaign_config, path)
     set_attr_path(_campaign_config, path, value)
+    if old != value:
+        _dirty_paths.add(path)
     _sync_options_from_config()
 
 
 def _edit_field(spec: _FieldSpec):
+    old = _get_config_value(spec.path)
     _shared_edit_field(spec, _get_config_value, _set_config_value)
+    new = _get_config_value(spec.path)
+    if old != new:
+        print("Set " + spec.path + ":")
+        print("  old: " + str(old))
+        print("  new: " + str(new))
+        print("Pending changes are not saved yet. Use Save to disk.")
 
 
 def _make_block_menu(title: str, subtitle: str, fields):
@@ -150,7 +224,29 @@ def _auto_or_int(value):
 
 def _sync_options_from_config():
     edit_campaign_config_menu_options.loaded_from = (
-        str(_loaded_from_path) if _loaded_from_path is not None else "defaults"
+        str(_loaded_from_path)
+        if _loaded_from_path is not None
+        else "DEFAULTS ONLY -- no campaign.yaml loaded"
+    )
+    edit_campaign_config_menu_options.selected_campaign = (
+        str(_editor_selected_campaign_dir)
+        if _editor_selected_campaign_dir is not None
+        else "(none)"
+    )
+    edit_campaign_config_menu_options.unsaved_changes = (
+        "yes" if has_unsaved_config_changes() else "no"
+    )
+    dirty = dirty_paths()
+    edit_campaign_config_menu_options.dirty_fields = (
+        ", ".join(dirty[:8]) + (" ..." if len(dirty) > 8 else "")
+        if dirty
+        else ""
+    )
+    edit_campaign_config_menu_options.last_save_path = (
+        str(_last_save_path) if _last_save_path is not None else ""
+    )
+    edit_campaign_config_menu_options.last_error = (
+        _last_error[:160] if _last_error else ""
     )
     edit_campaign_config_menu_options.system_name = _campaign_config.system_name
     edit_campaign_config_menu_options.max_iterations = _campaign_config.max_iterations
@@ -173,6 +269,71 @@ def _campaign_yaml_path():
     return selected_campaign_dir() / "campaign.yaml"
 
 
+def _confirm_discard_dirty(action: str) -> bool:
+    if not has_unsaved_config_changes():
+        return True
+    print("There are unsaved campaign.yaml edits:")
+    for path in dirty_paths()[:20]:
+        print("  " + path)
+    answer = user_input_free_flow(
+        "Type YES to discard these edits and " + action + ": ",
+        "",
+    )
+    return str(answer).strip() == "YES"
+
+
+def _pending_sparse_yaml() -> str:
+    import yaml
+
+    diff = diff_against_defaults(_campaign_config)
+    return yaml.safe_dump(diff, sort_keys=True, default_flow_style=False)
+
+
+def load_config_for_campaign_dir(
+    campaign_dir: Path,
+    *,
+    quiet: bool = False,
+    prompt_if_dirty: bool = False,
+) -> bool:
+    selected = Path(campaign_dir).expanduser().absolute()
+    if prompt_if_dirty and not _confirm_discard_dirty("load " + str(selected)):
+        if not quiet:
+            print("Load cancelled; current editor state was kept.")
+        _sync_options_from_config()
+        return False
+    yaml_path = selected / "campaign.yaml"
+    if yaml_path.is_file():
+        try:
+            cfg = CampaignConfig.from_yaml(yaml_path)
+        except Exception as exc:
+            global _last_error
+            _last_error = "Failed to load " + str(yaml_path) + ": " + str(exc)
+            if not quiet:
+                print(_last_error)
+            _sync_options_from_config()
+            return False
+        _replace_campaign_config(cfg, loaded_from=yaml_path, selected_dir=selected)
+        if not quiet:
+            print("Loaded " + str(yaml_path))
+        return True
+    _mark_new_default_campaign(selected)
+    if not quiet:
+        print("No campaign.yaml at " + str(yaml_path))
+        print("Loaded defaults for a new unsaved campaign.yaml.")
+    return True
+
+
+def _ensure_selected_campaign_loaded_for_editor() -> None:
+    selected = selected_campaign_dir_or_none()
+    if selected is None:
+        return
+    if _editor_selected_campaign_dir == selected:
+        return
+    if has_unsaved_config_changes():
+        return
+    load_config_for_campaign_dir(selected, quiet=True, prompt_if_dirty=False)
+
+
 def _pause():
     user_input_free_flow("Press enter to return to the menu: ", "")
 
@@ -180,14 +341,70 @@ def _pause():
 class EditCampaignConfigFunctions:
     @staticmethod
     def show_current_config():
-        import json
+        print("Current in-memory config")
         print("Loaded from: " + edit_campaign_config_menu_options.loaded_from)
+        print("Selected campaign: " + edit_campaign_config_menu_options.selected_campaign)
+        print("Unsaved changes: " + edit_campaign_config_menu_options.unsaved_changes)
         print(json.dumps(_campaign_config.to_dict(), indent=2, sort_keys=True))
         _pause()
 
     @staticmethod
     def show_sampling_protocol_summary():
+        print("Summary source: current in-memory editor config.")
         print(format_sampling_protocol_summary(_campaign_config))
+        _pause()
+
+    @staticmethod
+    def show_unsaved_changes():
+        if not has_unsaved_config_changes():
+            print("No unsaved changes.")
+        else:
+            print("Unsaved fields:")
+            for path in dirty_paths():
+                print("  " + path)
+        _pause()
+
+    @staticmethod
+    def show_pending_yaml_diff():
+        print("Sparse campaign.yaml that would be written:")
+        print(_pending_sparse_yaml())
+        _pause()
+
+    @staticmethod
+    def export_dense_config_snapshot():
+        try:
+            target = _campaign_yaml_path().with_name("campaign.dense.yaml")
+        except CampaignSelectionError as exc:
+            print_campaign_selection_error(exc)
+            _pause()
+            return
+        try:
+            _campaign_config.to_yaml_dense(target)
+        except Exception as exc:
+            print("Failed to write dense config snapshot: " + str(exc))
+            _pause()
+            return
+        print("Wrote dense config snapshot to " + str(target))
+        _pause()
+
+    @staticmethod
+    def discard_unsaved_changes():
+        try:
+            yaml_path = _campaign_yaml_path()
+        except CampaignSelectionError as exc:
+            print_campaign_selection_error(exc)
+            _pause()
+            return
+        if not yaml_path.exists():
+            print("No campaign.yaml at " + str(yaml_path) + " -- nothing to reload.")
+            _pause()
+            return
+        if not _confirm_discard_dirty("reload from disk"):
+            print("Reload cancelled.")
+            _pause()
+            return
+        load_config_for_campaign_dir(yaml_path.parent, quiet=True, prompt_if_dirty=False)
+        print("Reloaded " + str(yaml_path))
         _pause()
 
     @staticmethod
@@ -202,24 +419,37 @@ class EditCampaignConfigFunctions:
             print("No campaign.yaml at " + str(yaml_path) + " -- nothing to load.")
             _pause()
             return
-        try:
-            cfg = CampaignConfig.from_yaml(yaml_path)
-        except Exception as exc:
-            print("Failed to load " + str(yaml_path) + ": " + str(exc))
+        if not _confirm_discard_dirty("load from disk"):
+            print("Load cancelled.")
             _pause()
             return
-        _replace_campaign_config(cfg, loaded_from=yaml_path)
+        if not load_config_for_campaign_dir(
+            yaml_path.parent, quiet=True, prompt_if_dirty=False
+        ):
+            _pause()
+            return
         ichor.hpc.global_variables.LOGGER.info(
             "Campaign config loaded from " + str(yaml_path)
         )
-        print("Loaded.")
+        print("Loaded " + str(yaml_path))
         _pause()
 
     @staticmethod
     def reset_to_defaults():
-        _replace_campaign_config(CampaignConfig(), loaded_from=None)
+        if not _confirm_discard_dirty("reset to defaults"):
+            print("Reset cancelled.")
+            _pause()
+            return
+        _replace_campaign_config(
+            CampaignConfig(),
+            loaded_from=None,
+            selected_dir=_editor_selected_campaign_dir,
+            clear_dirty=False,
+        )
+        _dirty_paths.add("campaign.yaml")
         ichor.hpc.global_variables.LOGGER.info("Campaign config reset to defaults")
-        print("Reset.")
+        _sync_options_from_config()
+        print("Reset to defaults. Save to disk to write campaign.yaml.")
         _pause()
 
     @staticmethod
@@ -633,11 +863,14 @@ class EditCampaignConfigFunctions:
 
     @staticmethod
     def save_to_disk():
+        global _last_save_path, _last_error
         try:
             _campaign_config._validate()
         except ConfigValidationError as exc:
             print("Validation failed; campaign.yaml NOT written.")
             print("  " + str(exc))
+            _last_error = "Validation failed: " + str(exc)
+            _sync_options_from_config()
             _pause()
             return
         try:
@@ -648,19 +881,50 @@ class EditCampaignConfigFunctions:
             return
         if not target.parent.exists():
             target.parent.mkdir(parents=True, exist_ok=True)
+        changed = dirty_paths()
+        before = _campaign_config.to_dict()
         try:
             _campaign_config.to_yaml(target)
         except Exception as exc:
             print("Failed to write " + str(target) + ": " + str(exc))
+            _last_error = "Write failed: " + str(exc)
+            _sync_options_from_config()
             _pause()
             return
-        global _loaded_from_path
-        _loaded_from_path = target
+        try:
+            reloaded = CampaignConfig.from_yaml(target)
+        except Exception as exc:
+            print("Wrote " + str(target) + " but reload failed: " + str(exc))
+            _last_error = "Reload after save failed: " + str(exc)
+            _sync_options_from_config()
+            _pause()
+            return
+        after = reloaded.to_dict()
+        if before != after:
+            print("ERROR: saved campaign.yaml reloads to a different config.")
+            print("campaign.yaml was not accepted as verified.")
+            _last_error = "Save round-trip mismatch"
+            _sync_options_from_config()
+            _pause()
+            return
+        _replace_campaign_config(
+            reloaded,
+            loaded_from=target,
+            selected_dir=target.parent,
+            clear_dirty=True,
+        )
+        _last_save_path = target
+        _last_error = ""
         _sync_options_from_config()
         ichor.hpc.global_variables.LOGGER.info(
             "Campaign config saved to " + str(target)
         )
-        print("Wrote " + str(target))
+        print("Wrote and verified " + str(target))
+        if changed:
+            print("Changed fields saved:")
+            for path in changed:
+                print("  " + path)
+        print("Note: campaign.yaml is sparse; default-valued fields are intentionally omitted.")
         _pause()
 
 
@@ -1176,8 +1440,48 @@ def _block_submenu_item(label: str):
     return SubmenuItem(label, _BLOCK_MENUS_BY_LABEL[label], edit_campaign_config_menu)
 
 
+_ACQUISITION_BLOCK_LABELS = (
+    "Edit acquisition core",
+    "Edit acquisition.subspace",
+    "Edit acquisition.weights",
+    "Edit acquisition.spectral",
+    "Edit acquisition.calibrated_energy",
+    "Edit acquisition.fullspace_confinement",
+    "Edit acquisition.size_normalisation",
+    "Edit acquisition.movement_band",
+    "Edit acquisition.movement_utility",
+    "Edit acquisition.driver",
+    "Edit acquisition.gradient",
+    "Edit acquisition.barrier",
+    "Edit acquisition.stencils",
+    "Edit acquisition.references",
+)
+
+
+edit_acquisition_config_menu = ConsoleMenu(
+    title="Edit acquisition",
+    subtitle=(
+        "Edit the adversarial acquisition objective, local subspace, "
+        "movement, gradient, barriers and reference-scale settings.\n"
+    ),
+    prologue_text="Acquisition config blocks:\n",
+)
+
+
+add_items_to_menu(
+    edit_acquisition_config_menu,
+    [
+        SubmenuItem(label, _BLOCK_MENUS_BY_LABEL[label], edit_acquisition_config_menu)
+        for label in _ACQUISITION_BLOCK_LABELS
+    ],
+)
+
+
 edit_campaign_config_menu_items = [
-    FunctionItem("Show current config", EditCampaignConfigFunctions.show_current_config),
+    FunctionItem(
+        "Show current in-memory config",
+        EditCampaignConfigFunctions.show_current_config,
+    ),
     FunctionItem(
         "Show sampling protocol summary",
         EditCampaignConfigFunctions.show_sampling_protocol_summary,
@@ -1199,20 +1503,11 @@ edit_campaign_config_menu_items = [
     _block_submenu_item("Edit split"),
     _block_submenu_item("Edit FEREBUS block"),
     _block_submenu_item("Edit robustness"),
-    _block_submenu_item("Edit acquisition core"),
-    _block_submenu_item("Edit acquisition.subspace"),
-    _block_submenu_item("Edit acquisition.weights"),
-    _block_submenu_item("Edit acquisition.spectral"),
-    _block_submenu_item("Edit acquisition.calibrated_energy"),
-    _block_submenu_item("Edit acquisition.fullspace_confinement"),
-    _block_submenu_item("Edit acquisition.size_normalisation"),
-    _block_submenu_item("Edit acquisition.movement_band"),
-    _block_submenu_item("Edit acquisition.movement_utility"),
-    _block_submenu_item("Edit acquisition.driver"),
-    _block_submenu_item("Edit acquisition.gradient"),
-    _block_submenu_item("Edit acquisition.barrier"),
-    _block_submenu_item("Edit acquisition.stencils"),
-    _block_submenu_item("Edit acquisition.references"),
+    SubmenuItem(
+        "Edit acquisition",
+        edit_acquisition_config_menu,
+        edit_campaign_config_menu,
+    ),
     _block_submenu_item("Edit stop"),
     _block_submenu_item("Edit outlier_filter"),
     _block_submenu_item("Edit adversarial_safety"),
@@ -1223,6 +1518,22 @@ edit_campaign_config_menu_items = [
         EDIT_ARIADNE_BLOCK_MENU_DESCRIPTION.title,
         edit_ariadne_block_menu,
         edit_campaign_config_menu,
+    ),
+    FunctionItem(
+        "Show unsaved changes",
+        EditCampaignConfigFunctions.show_unsaved_changes,
+    ),
+    FunctionItem(
+        "Show pending YAML diff",
+        EditCampaignConfigFunctions.show_pending_yaml_diff,
+    ),
+    FunctionItem(
+        "Discard unsaved changes / reload from disk",
+        EditCampaignConfigFunctions.discard_unsaved_changes,
+    ),
+    FunctionItem(
+        "Export dense config snapshot",
+        EditCampaignConfigFunctions.export_dense_config_snapshot,
     ),
     FunctionItem("Save to disk", EditCampaignConfigFunctions.save_to_disk),
 ]

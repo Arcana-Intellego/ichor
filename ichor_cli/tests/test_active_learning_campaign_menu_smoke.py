@@ -49,12 +49,13 @@ def test_daemon_control_menu_items():
 
 def test_edit_campaign_config_menu_items():
     from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_submenus.edit_campaign_config_menu import (
+        edit_acquisition_config_menu,
         edit_campaign_config_menu,
         get_campaign_config,
     )
     texts = [it.text for it in edit_campaign_config_menu.items]
     for expected in (
-        "Show current config",
+        "Show current in-memory config",
         "Show sampling protocol summary",
         "Load from disk",
         "Reset to defaults",
@@ -72,27 +73,42 @@ def test_edit_campaign_config_menu_items():
         "Edit split",
         "Edit FEREBUS block",
         "Edit robustness",
-        "Edit acquisition core",
+        "Edit acquisition",
         "Edit ARIADNE Block",
-        # M15 F15: blocks added in this milestone.
-        "Edit acquisition.subspace",
-        "Edit acquisition.weights",
-        "Edit acquisition.spectral",
-        "Edit acquisition.calibrated_energy",
-        "Edit acquisition.fullspace_confinement",
-        "Edit acquisition.gradient",
-        "Edit acquisition.barrier",
-        "Edit acquisition.stencils",
-        "Edit acquisition.references",
         "Edit stop",
         "Edit outlier_filter",
         "Edit adversarial_safety",
         "Edit error_calibration",
         "Edit quality_gates",
         "Edit runtime",
+        "Show unsaved changes",
+        "Show pending YAML diff",
+        "Discard unsaved changes / reload from disk",
+        "Export dense config snapshot",
         "Save to disk",
     ):
         assert expected in texts, "missing item: " + expected
+    assert "Edit acquisition.subspace" not in texts
+    assert "Edit acquisition.weights" not in texts
+    assert "Edit acquisition.gradient" not in texts
+    acquisition_texts = [it.text for it in edit_acquisition_config_menu.items]
+    for expected in (
+        "Edit acquisition core",
+        "Edit acquisition.subspace",
+        "Edit acquisition.weights",
+        "Edit acquisition.spectral",
+        "Edit acquisition.calibrated_energy",
+        "Edit acquisition.fullspace_confinement",
+        "Edit acquisition.size_normalisation",
+        "Edit acquisition.movement_band",
+        "Edit acquisition.movement_utility",
+        "Edit acquisition.driver",
+        "Edit acquisition.gradient",
+        "Edit acquisition.barrier",
+        "Edit acquisition.stencils",
+        "Edit acquisition.references",
+    ):
+        assert expected in acquisition_texts, "missing acquisition item: " + expected
     cfg = get_campaign_config()
     assert cfg.max_iterations >= 1
     assert hasattr(cfg, "ariadne")
@@ -140,6 +156,182 @@ def test_campaign_config_block_submenus_show_values_and_edit_one_field(monkeypat
     assert cfg.resources.default_walltime_hours == 37
     assert cfg.resources.partition == old_partition
     assert "resources.default_walltime_hours: 37" in resources_menu.this_menu_options()
+
+
+def test_edit_gaussian_basis_set_saves_to_selected_campaign_yaml(tmp_path, monkeypatch):
+    import importlib
+
+    import ichor.cli.main_menu_submenus.active_learning_campaign_menu.field_menu as field_menu
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+
+    campaign_dir = tmp_path / "campaign"
+    campaign_dir.mkdir()
+    cfg = CampaignConfig()
+    cfg.to_yaml(campaign_dir / "campaign.yaml")
+    set_selected_campaign_dir(campaign_dir)
+    assert menu.load_config_for_campaign_dir(campaign_dir, quiet=True)
+
+    gaussian_menu = menu._BLOCK_MENUS_BY_LABEL["Edit Gaussian block"]
+    basis_spec = next(
+        spec
+        for spec in gaussian_menu.this_menu_options.fields
+        if spec.path == "gaussian.basis_set"
+    )
+
+    monkeypatch.setattr(
+        field_menu,
+        "user_input_free_flow",
+        lambda prompt, default: "6-31+G(d,p)",
+    )
+    monkeypatch.setattr(menu, "_pause", lambda: None)
+
+    menu._edit_field(basis_spec)
+    assert menu.get_campaign_config().gaussian.basis_set == "6-31+G(d,p)"
+    assert menu.has_unsaved_config_changes()
+    assert "gaussian.basis_set" in menu.dirty_paths()
+
+    menu.EditCampaignConfigFunctions.save_to_disk()
+
+    loaded = CampaignConfig.from_yaml(campaign_dir / "campaign.yaml")
+    assert loaded.gaussian.basis_set == "6-31+G(d,p)"
+    raw = (campaign_dir / "campaign.yaml").read_text(encoding="utf-8")
+    assert "basis_set" in raw
+    assert "6-31+G(d,p)" in raw
+    assert not menu.has_unsaved_config_changes()
+
+
+def test_select_campaign_directory_auto_loads_campaign_yaml(tmp_path, monkeypatch):
+    import importlib
+
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    top = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_menu"
+    )
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    cfg = CampaignConfig()
+    cfg.gaussian.basis_set = "def2-SVP"
+    cfg.to_yaml(tmp_path / "campaign.yaml")
+
+    monkeypatch.setattr(top, "user_input_path", lambda prompt, default_path: tmp_path)
+    monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: "YES")
+
+    top.ActiveLearningCampaignFunctions.select_campaign_directory()
+
+    assert menu.get_campaign_config().gaussian.basis_set == "def2-SVP"
+    assert str(tmp_path / "campaign.yaml") == menu.edit_campaign_config_menu_options.loaded_from
+    assert not menu.has_unsaved_config_changes()
+
+
+def test_switch_campaign_auto_loads_new_yaml_without_reusing_old_state(tmp_path):
+    import importlib
+
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    c1 = tmp_path / "c1"
+    c2 = tmp_path / "c2"
+    c1.mkdir()
+    c2.mkdir()
+    cfg1 = CampaignConfig()
+    cfg1.gaussian.basis_set = "6-31+G(d,p)"
+    cfg1.to_yaml(c1 / "campaign.yaml")
+    cfg2 = CampaignConfig()
+    cfg2.gaussian.basis_set = "def2-SVP"
+    cfg2.to_yaml(c2 / "campaign.yaml")
+
+    assert menu.load_config_for_campaign_dir(c1, quiet=True)
+    assert menu.get_campaign_config().gaussian.basis_set == "6-31+G(d,p)"
+
+    assert menu.load_config_for_campaign_dir(c2, quiet=True)
+    assert menu.get_campaign_config().gaussian.basis_set == "def2-SVP"
+
+
+def test_save_validation_failure_keeps_dirty_state(tmp_path, monkeypatch):
+    import importlib
+
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    tmp_path.mkdir(exist_ok=True)
+    set_selected_campaign_dir(tmp_path)
+    cfg = CampaignConfig()
+    cfg.to_yaml(tmp_path / "campaign.yaml")
+    menu.load_config_for_campaign_dir(tmp_path, quiet=True)
+    monkeypatch.setattr(menu, "_pause", lambda: None)
+
+    menu._set_config_value("gaussian.basis_set", "6-31+G(d,p)")
+    menu._set_config_value("split.train_fraction", 0.9)
+    menu._set_config_value("split.val_mid_fraction", 0.9)
+
+    menu.EditCampaignConfigFunctions.save_to_disk()
+
+    assert menu.has_unsaved_config_changes()
+    assert "gaussian.basis_set" in menu.dirty_paths()
+    assert "Validation failed" in menu.edit_campaign_config_menu_options.last_error
+
+
+def test_field_transform_error_is_nonfatal(monkeypatch):
+    import ichor.cli.main_menu_submenus.active_learning_campaign_menu.field_menu as field_menu
+
+    calls = []
+    spec = field_menu.spec("resources.aimall_cpus_per_task", "str", transform=int)
+    monkeypatch.setattr(field_menu, "user_input_free_flow", lambda *args, **kwargs: "bad")
+
+    field_menu.edit_field(spec, lambda path: "auto", lambda path, value: calls.append(value))
+
+    assert calls == []
+
+
+def test_daemon_launch_refuses_when_config_editor_dirty(tmp_path, monkeypatch, capsys):
+    import importlib
+
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    edit_menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    start_menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.daemon_control_submenus.start_daemon_foreground_submenu"
+    )
+    cfg = CampaignConfig()
+    cfg.to_yaml(tmp_path / "campaign.yaml")
+    set_selected_campaign_dir(tmp_path)
+    edit_menu.load_config_for_campaign_dir(tmp_path, quiet=True)
+    edit_menu._set_config_value("gaussian.basis_set", "6-31+G(d,p)")
+    monkeypatch.setattr(start_menu, "user_input_free_flow", lambda *args, **kwargs: "")
+
+    start_menu.StartDaemonForegroundFunctions.launch()
+
+    out = capsys.readouterr().out
+    assert "unsaved campaign.yaml edits" in out
+    assert "gaussian.basis_set" in out
 
 
 def test_acquisition_gradient_menu_exposes_active_fd_controls():
