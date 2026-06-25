@@ -487,6 +487,7 @@ def _make_block_menu(title: str, subtitle: str, fields):
         _set_config_value,
         prologue_text="Current values for this campaign.yaml block:\n",
         status_for_path=_config_lock_change_status,
+        include_parent_menu_options=False,
     )
 
 
@@ -1801,6 +1802,7 @@ edit_acquisition_config_menu = ConsoleMenu(
         "movement, gradient, barriers and reference-scale settings.\n"
     ),
     prologue_text="Acquisition config blocks:\n",
+    include_parent_menu_options=False,
 )
 
 

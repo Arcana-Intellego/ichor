@@ -196,6 +196,7 @@ def make_field_menu(
     prologue_text: str = "Current values:\n",
     extra_items: Optional[Sequence] = None,
     status_for_path: Optional[Callable[[str], str]] = None,
+    include_parent_menu_options: bool = True,
 ):
     menu = ConsoleMenu(
         this_menu_options=FieldMenuOptions(
@@ -207,6 +208,7 @@ def make_field_menu(
         title=title,
         subtitle=subtitle,
         prologue_text=prologue_text,
+        include_parent_menu_options=include_parent_menu_options,
     )
     items = []
     if set_value is not None:

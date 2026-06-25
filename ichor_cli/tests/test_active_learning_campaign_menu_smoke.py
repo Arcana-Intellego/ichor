@@ -113,6 +113,11 @@ def test_edit_campaign_config_menu_items():
     cfg = get_campaign_config()
     assert cfg.max_iterations >= 1
     assert hasattr(cfg, "ariadne")
+    edit_acquisition_config_menu.parent = edit_campaign_config_menu
+    acquisition_prologue = edit_acquisition_config_menu.get_prologue_text()
+    assert "Acquisition config blocks:" in acquisition_prologue
+    assert "Loaded from:" not in acquisition_prologue
+    assert "Selected campaign:" not in acquisition_prologue
 
 
 def test_campaign_config_block_submenus_show_values_and_edit_one_field(monkeypatch):
@@ -142,6 +147,12 @@ def test_campaign_config_block_submenus_show_values_and_edit_one_field(monkeypat
     assert "Set default_walltime_hours" in texts
     assert "Set ferebus_walltime_hours" in texts
     assert "Set aimall_cpus_per_task" in texts
+    resources_menu.parent = menu.edit_campaign_config_menu
+    prologue = resources_menu.get_prologue_text()
+    assert "Current values for this campaign.yaml block:" in prologue
+    assert "resources.partition" in prologue
+    assert "Loaded from:" not in prologue
+    assert "Selected campaign:" not in prologue
 
     cfg = menu.get_campaign_config()
     old_partition = cfg.resources.partition

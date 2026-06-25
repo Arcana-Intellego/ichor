@@ -177,6 +177,7 @@ edit_ariadne_block_menu = make_field_menu(
     _get_value,
     _set_value,
     prologue_text="Current values for this campaign.yaml block:\n",
+    include_parent_menu_options=False,
 )
 
 

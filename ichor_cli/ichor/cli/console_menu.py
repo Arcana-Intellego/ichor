@@ -71,6 +71,7 @@ class ConsoleMenu(OriginalConsoleMenu):
         show_exit_option=True,
         exit_option_text="Exit",
         exit_menu_char="q",
+        include_parent_menu_options=True,
     ):
 
         # make screen bigger by default
@@ -92,6 +93,7 @@ class ConsoleMenu(OriginalConsoleMenu):
         )
 
         self.this_menu_options = this_menu_options
+        self.include_parent_menu_options = include_parent_menu_options
         # if formatter is None:
         #     formatter = MenuFormatBuilder(max_dimension=Dimension(120, 100))
         # self.formatter = formatter
@@ -132,9 +134,10 @@ class ConsoleMenu(OriginalConsoleMenu):
             self.prologue_text() if callable(self.prologue_text) else self.prologue_text
         )
         # add the strings that each parent gives
-        for p_options in self.parent_menu_options:
-            # the __call__ method of a MenuOption just makes it into a string which can be printed to the prologue
-            prologue_txt += p_options()
+        if self.include_parent_menu_options:
+            for p_options in self.parent_menu_options:
+                # the __call__ method of a MenuOption just makes it into a string which can be printed to the prologue
+                prologue_txt += p_options()
         # finally add any new options from the current menu, again __call__ method of MenuOption is used
         if self.this_menu_options:
             prologue_txt += self.this_menu_options()
