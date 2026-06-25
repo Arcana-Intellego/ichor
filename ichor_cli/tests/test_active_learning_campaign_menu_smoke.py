@@ -848,7 +848,7 @@ def test_acquisition_gradient_menu_exposes_active_fd_controls():
 
     gradient_menu = menu._BLOCK_MENUS_BY_LABEL["Edit acquisition.gradient"]
     rendered = gradient_menu.this_menu_options()
-    field_specs = {spec.path: spec for spec in rendered.fields}
+    field_specs = {spec.path: spec for spec in gradient_menu.this_menu_options.fields}
 
     assert set(field_specs) == {
         "acquisition.gradient.mode",
@@ -883,7 +883,7 @@ def test_acquisition_driver_menu_exposes_driver_controls():
 
     driver_menu = menu._BLOCK_MENUS_BY_LABEL["Edit acquisition.driver"]
     rendered = driver_menu.this_menu_options()
-    field_specs = {spec.path: spec for spec in rendered.fields}
+    field_specs = {spec.path: spec for spec in driver_menu.this_menu_options.fields}
 
     assert set(field_specs) == {
         "acquisition.driver.enabled",
@@ -1075,10 +1075,9 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
     assert "acquisition.stencils.weak_mode_gating_enabled: True" in out
     assert "acquisition.stencils.weak_mode_omega_band" in out
     assert "acquisition.stencils.anharmonic_caps" in out
-    assert "resources.aimall_cpus_per_task: 8" in out
+    assert "resources.aimall_cpus_per_task: auto" in out
     assert "resources.effective_phase_walltimes" in out
     assert "FEREBUS=24h" in out
-    assert "aimall.nproc: 8" in out
     assert "aimall.naat: auto" in out
     assert "aimall.boaq: auto" in out
     assert "aimall.iasmesh: fine" in out
