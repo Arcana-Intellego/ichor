@@ -44,7 +44,7 @@ Run the bundled example to confirm the install works (~30 seconds on a
 laptop, no cluster required)::
 
     cd examples/dry_run_water_tetramer
-    ichor-al-daemon import-pool -s pool.xyz
+    ichor-al-daemon init
     ichor-al-daemon start -d -t 200
     ichor-al-daemon status
 

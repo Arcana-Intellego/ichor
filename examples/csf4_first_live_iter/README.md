@@ -272,10 +272,10 @@ cd ~/scratch/ichor_live_smoke
 # something to pick a diverse initial set from.
 cp ~/projects/ichor-active-learning/ichor_hpc/tests/test_active_learning/fixtures/water_tetramer.xyz pool.xyz
 
-ichor-al-daemon import-pool --campaign-dir . --source pool.xyz
+ichor-al-daemon init
 ```
 
-The import-pool subcommand copies the trajectory into
+The init subcommand populates campaign.yaml when needed, then copies the trajectory into
 `.DATA/TRAJECTORY/pool.xyz` and writes a SHA-pinned manifest next to it.
 Once imported the SHA is the anchor every iteration descends from, so do
 not delete or re-import the pool unless you really mean to start a new

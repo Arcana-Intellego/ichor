@@ -191,7 +191,7 @@ class DaemonControlFunctions:
 
     @staticmethod
     def import_trajectory_pool():
-        """Compatibility dispatcher for the import-pool option submenu."""
+        """Compatibility dispatcher for the init/import option submenu."""
         from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_submenus.daemon_control_submenus.import_trajectory_pool_submenu import (
             ImportTrajectoryPoolFunctions,
         )

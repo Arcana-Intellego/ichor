@@ -37,7 +37,7 @@ def test_daemon_control_menu_items():
         "Show status",
         "Show sampling protocol summary",
         "Preflight backends",
-        "Import Trajectory Pool",
+        "Initialise Campaign / Import Trajectory Pool",
         "Start/Resume Daemon (Foreground)",
         "Start/Resume Daemon (Background)",
         "Stop daemon",
@@ -415,15 +415,17 @@ def test_save_reload_failure_leaves_existing_campaign_yaml_untouched(tmp_path, m
     set_selected_campaign_dir(tmp_path)
     assert menu.load_config_for_campaign_dir(tmp_path, quiet=True)
     monkeypatch.setattr(menu, "_pause", lambda: None)
-    real_from_yaml = menu.CampaignConfig.from_yaml
+    import ichor.hpc.active_learning.campaign_yaml as campaign_yaml
+
+    real_from_yaml = campaign_yaml.CampaignConfig.from_yaml
 
     def fail_reload(path):
-        if ".menu-save." in str(path):
+        if ".verify." in str(path):
             raise RuntimeError("synthetic reload failure")
         return real_from_yaml(path)
 
     menu._set_config_value("gaussian.basis_set", "6-31+G(d,p)")
-    monkeypatch.setattr(menu.CampaignConfig, "from_yaml", fail_reload)
+    monkeypatch.setattr(campaign_yaml.CampaignConfig, "from_yaml", fail_reload)
 
     menu.EditCampaignConfigFunctions.save_to_disk()
 
@@ -431,8 +433,8 @@ def test_save_reload_failure_leaves_existing_campaign_yaml_untouched(tmp_path, m
     loaded = real_from_yaml(tmp_path / "campaign.yaml")
     assert loaded.gaussian.basis_set == "def2-SVP"
     assert menu.has_unsaved_config_changes()
-    assert "Reload before save failed" in menu.edit_campaign_config_menu_options.last_error
-    assert not list(tmp_path.glob("*.menu-save.*.tmp"))
+    assert "reload failed before write" in menu.edit_campaign_config_menu_options.last_error
+    assert not list(tmp_path.glob("*.verify.*.tmp"))
 
 
 def test_dirty_paths_clear_when_field_is_reverted(tmp_path):
@@ -1741,7 +1743,7 @@ def test_reconcile_paths_pass_allow_fresh_init_flag(tmp_path, monkeypatch):
     assert calls == [False, True]
 
 
-def test_import_pool_passes_no_outlier_filter_choice(tmp_path, monkeypatch):
+def test_init_pool_passes_no_outlier_filter_choice(tmp_path, monkeypatch):
     import importlib
     from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
         set_selected_campaign_dir,
@@ -1759,7 +1761,7 @@ def test_import_pool_passes_no_outlier_filter_choice(tmp_path, monkeypatch):
     menu.import_trajectory_pool_menu_options.force_reimport = False
     calls = []
     monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: "")
-    monkeypatch.setattr(daemon_cli, "cmd_import_pool", lambda ns: calls.append(ns) or 0)
+    monkeypatch.setattr(daemon_cli, "cmd_init", lambda ns: calls.append(ns) or 0)
 
     menu.ImportTrajectoryPoolFunctions.run_import()
 
@@ -1770,7 +1772,7 @@ def test_import_pool_passes_no_outlier_filter_choice(tmp_path, monkeypatch):
     assert calls[0].force is False
 
 
-def test_import_pool_force_requires_confirmation_and_resets(tmp_path, monkeypatch):
+def test_init_pool_force_requires_confirmation_and_resets(tmp_path, monkeypatch):
     import importlib
     from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
         set_selected_campaign_dir,
@@ -1789,7 +1791,7 @@ def test_import_pool_force_requires_confirmation_and_resets(tmp_path, monkeypatc
     calls = []
     responses = iter(["YES", ""])
     monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: next(responses))
-    monkeypatch.setattr(daemon_cli, "cmd_import_pool", lambda ns: calls.append(ns) or 0)
+    monkeypatch.setattr(daemon_cli, "cmd_init", lambda ns: calls.append(ns) or 0)
 
     menu.ImportTrajectoryPoolFunctions.run_import()
 

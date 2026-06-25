@@ -10,7 +10,7 @@ Console entry point 'ichor-al-daemon' registered in
     resume     Equivalent to start when state.json already exists.
     reconcile  Inspect on-disk artefacts and propose a recovered state.
     journal    Tail or filter the campaign journal.
-    import-pool Import and outlier-filter a trajectory into the campaign pool.
+    init       Initialise campaign.yaml and import the trajectory pool.
 
 Commands that operate on a campaign accept '--campaign-dir DIR'. When it is
 omitted, the CLI uses the current working directory if it contains
@@ -142,6 +142,7 @@ _BOOLEAN_SHORT_CLUSTERS = {
     "status": frozenset({"j", "v"}),
     "reconcile": frozenset({"a", "F"}),
     "journal": frozenset({"j", "r", "v"}),
+    "init": frozenset({"f", "O"}),
     "import-pool": frozenset({"f", "O"}),
 }
 
@@ -153,6 +154,7 @@ _VALUE_SHORT_FLAGS = {
     "status": frozenset({"c"}),
     "reconcile": frozenset({"c"}),
     "journal": frozenset({"c", "s", "e", "n"}),
+    "init": frozenset({"c", "s"}),
     "import-pool": frozenset({"c", "s"}),
     "preflight": frozenset({"c"}),
 }
@@ -1779,7 +1781,36 @@ def cmd_journal(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_import_pool(args: argparse.Namespace) -> int:
+def _resolve_init_campaign_dir(raw_campaign_dir: Optional[str]) -> Path:
+    if raw_campaign_dir:
+        campaign = Path(raw_campaign_dir).expanduser().resolve()
+    else:
+        campaign = Path.cwd().resolve()
+    if campaign.exists() and not campaign.is_dir():
+        raise CampaignDirResolutionError(
+            "campaign path is not a directory: " + str(campaign)
+        )
+    campaign.mkdir(parents=True, exist_ok=True)
+    return campaign
+
+
+def _resolve_init_source(campaign: Path, raw_source: Optional[str]) -> Path:
+    if raw_source:
+        source = Path(raw_source).expanduser().resolve()
+    else:
+        source = campaign / "pool.xyz"
+    if not source.exists():
+        raise FileNotFoundError(
+            "source trajectory does not exist: "
+            + str(source)
+            + ". Put pool.xyz in the campaign directory or pass --source PATH."
+        )
+    if not source.is_file():
+        raise FileNotFoundError("source trajectory is not a file: " + str(source))
+    return source
+
+
+def _import_pool_impl(args: argparse.Namespace, campaign: Path, source: Path) -> int:
     """Pull the operator's MD trajectory into the campaign's canonical
     pool location and write a SHA-pinned manifest next to it.
 
@@ -1799,18 +1830,6 @@ def cmd_import_pool(args: argparse.Namespace) -> int:
     """
     from .acquisition.trajectory_pool import TrajectoryPool
     from .config import CampaignConfig
-
-    campaign = resolve_campaign_dir(
-        args.campaign_dir,
-        require_campaign_yaml=(args.campaign_dir is None),
-    )
-    source = Path(args.source).resolve()
-    if not campaign.exists():
-        print("campaign-dir does not exist: " + str(campaign), file=sys.stderr)
-        return 2
-    if not source.exists():
-        print("source trajectory does not exist: " + str(source), file=sys.stderr)
-        return 2
 
     # work out the outlier settings using the layered precedence above.
     # start from dataclass defaults; let campaign.yaml override; let the
@@ -1892,6 +1911,40 @@ def cmd_import_pool(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_init(args: argparse.Namespace) -> int:
+    """Initialise campaign.yaml and import the trajectory pool."""
+    try:
+        campaign = _resolve_init_campaign_dir(getattr(args, "campaign_dir", None))
+    except CampaignDirResolutionError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    try:
+        from .campaign_yaml import CampaignYamlError, initialise_campaign_yaml
+
+        initialise_campaign_yaml(campaign)
+    except CampaignYamlError as exc:
+        print("campaign.yaml initialisation failed: " + str(exc), file=sys.stderr)
+        return 15
+    except Exception as exc:
+        print("campaign.yaml initialisation failed: " + str(exc), file=sys.stderr)
+        return 15
+    try:
+        source = _resolve_init_source(campaign, getattr(args, "source", None))
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    print("Initialised campaign.yaml: " + str(campaign / "campaign.yaml"))
+    return _import_pool_impl(args, campaign, source)
+
+
+def cmd_import_pool(args: argparse.Namespace) -> int:
+    print(
+        "warning: import-pool is deprecated; use 'ichor-al-daemon init' instead.",
+        file=sys.stderr,
+    )
+    return cmd_init(args)
+
+
 def cmd_preflight(args: argparse.Namespace) -> int:
     avail = check_backends()
     print(json.dumps(asdict(avail), indent=2, sort_keys=True))
@@ -1910,10 +1963,10 @@ Campaign directory:
 
 Examples:
   cd ~/campaigns/water_001
+  ichor-al-daemon init
   ichor-al-daemon status
   ichor-al-daemon start -l
   ichor-al-daemon start -lb
-  ichor-al-daemon import-pool -s pool.xyz
   ichor-al-daemon journal -e phase_submitted
 
   ichor-al-daemon start -c ~/campaigns/water_001 --live
@@ -2181,45 +2234,67 @@ Examples:
     )
     p_jrn.set_defaults(func=cmd_journal)
 
-    p_imp = sub.add_parser(
-        "import-pool",
-        help=(
-            "Import the MD / metadynamics trajectory into the canonical "
-            "per-campaign pool location. Required once per campaign before "
-            "the daemon can run; refuses to overwrite an existing pool."
-        ),
+    def add_init_options(p, *, source_required: bool = False):
+        add_campaign(p)
+        p.add_argument(
+            "-s",
+            "--source",
+            required=source_required,
+            default=None,
+            help=(
+                "Path to the operator's MD trajectory (.xyz). Defaults to "
+                "<campaign-dir>/pool.xyz when omitted."
+            ),
+        )
+        p.add_argument(
+            "-f",
+            "--force", action="store_true",
+            help="Overwrite an existing pool (DANGEROUS: invalidates every committed "
+                 "iteration's frame-id provenance).",
+        )
+        p.add_argument(
+            "-O",
+            "--no-outlier-filter", action="store_true", dest="no_outlier_filter",
+            help="Skip the pre-Phase-A outlier filter; import every frame verbatim. "
+                 "Default behaviour (filter ON) rejects per-atom z > 4 frames and "
+                 "writes rejected.json alongside pool.manifest.json.",
+        )
+
+    p_init = sub.add_parser(
+        "init",
+        help="Initialise campaign.yaml and import pool.xyz.",
         description=(
-            "Copy an operator trajectory into the campaign pool and write a "
-            "SHA-pinned manifest. From inside a campaign directory, "
-            "--campaign-dir can be omitted."
+            "Initialise or populate campaign.yaml from the packaged template, "
+            "then copy the operator trajectory into the campaign pool and "
+            "write a SHA-pinned manifest. From inside a campaign directory, "
+            "--campaign-dir and --source can be omitted when campaign.yaml "
+            "and pool.xyz are present."
         ),
         epilog=(
             "Examples:\n"
-            "  ichor-al-daemon import-pool -s pool.xyz\n"
-            "  ichor-al-daemon import-pool -c ~/campaigns/water_001 -s pool.xyz"
+            "  ichor-al-daemon init\n"
+            "  ichor-al-daemon init -c ~/campaigns/water_001 -s pool.xyz"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    add_campaign(p_imp)
-    p_imp.add_argument(
-        "-s",
-        "--source", required=True,
-        help="Path to the operator's MD trajectory (.xyz). Will be copied into "
-             "<campaign-dir>/.DATA/TRAJECTORY/pool.xyz.",
+    add_init_options(p_init)
+    p_init.set_defaults(func=cmd_init)
+
+    p_imp = sub.add_parser(
+        "import-pool",
+        help=argparse.SUPPRESS,
+        description=(
+            "Deprecated compatibility alias for 'init'. Use "
+            "'ichor-al-daemon init' for new workflows."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  ichor-al-daemon init\n"
+            "  ichor-al-daemon init -c ~/campaigns/water_001 -s pool.xyz"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p_imp.add_argument(
-        "-f",
-        "--force", action="store_true",
-        help="Overwrite an existing pool (DANGEROUS: invalidates every committed "
-             "iteration's frame-id provenance).",
-    )
-    p_imp.add_argument(
-        "-O",
-        "--no-outlier-filter", action="store_true", dest="no_outlier_filter",
-        help="Skip the pre-Phase-A outlier filter; import every frame verbatim. "
-             "Default behaviour (filter ON) rejects per-atom z > 4 frames and "
-             "writes rejected.json alongside pool.manifest.json.",
-    )
+    add_init_options(p_imp)
     p_imp.set_defaults(func=cmd_import_pool)
 
     p_pre = sub.add_parser(

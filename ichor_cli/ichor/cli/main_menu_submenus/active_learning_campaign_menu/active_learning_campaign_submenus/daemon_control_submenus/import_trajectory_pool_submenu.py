@@ -1,4 +1,4 @@
-"""Import trajectory pool option submenu."""
+"""Initialise campaign and import trajectory pool option submenu."""
 import argparse
 from dataclasses import dataclass
 
@@ -20,10 +20,11 @@ from ichor.cli.useful_functions import user_input_free_flow
 
 
 IMPORT_TRAJECTORY_POOL_MENU_DESCRIPTION = MenuDescription(
-    "Import Trajectory Pool",
+    "Initialise Campaign / Import Trajectory Pool",
     subtitle=(
-        "Configure and import the source MD trajectory into the selected "
-        "campaign's canonical pool location.\n"
+        "Populate campaign.yaml from the active-learning template and import "
+        "the source MD trajectory into the selected campaign's canonical pool "
+        "location.\n"
     ),
 )
 
@@ -53,7 +54,7 @@ def _pause():
 class ImportTrajectoryPoolFunctions:
     @staticmethod
     def run_import():
-        from ichor.hpc.active_learning.cli import cmd_import_pool
+        from ichor.hpc.active_learning.cli import cmd_init
 
         try:
             campaign_dir = selected_campaign_dir()
@@ -61,11 +62,7 @@ class ImportTrajectoryPoolFunctions:
             print_campaign_selection_error(exc)
             _pause()
             return
-        source = import_trajectory_pool_menu_options.source_path
-        if not source:
-            print("Cancelled (no source path).")
-            _pause()
-            return
+        source = import_trajectory_pool_menu_options.source_path or None
         force = bool(import_trajectory_pool_menu_options.force_reimport)
         if force:
             answer = user_input_free_flow(
@@ -85,11 +82,11 @@ class ImportTrajectoryPoolFunctions:
                 import_trajectory_pool_menu_options.no_outlier_filter
             ),
         )
-        rc = cmd_import_pool(ns)
+        rc = cmd_init(ns)
         if rc == 13 and not force:
             print("Pool already exists. Set force_reimport=true to replace it.")
         elif rc != 0:
-            print("import-pool returned exit code " + str(rc))
+            print("init returned exit code " + str(rc))
         import_trajectory_pool_menu_options.force_reimport = False
         _pause()
 
@@ -99,7 +96,7 @@ IMPORT_TRAJECTORY_POOL_FIELD_SPECS = [
         "source_path",
         "clearable_str",
         prompt="Source trajectory path",
-        item_text="Set source path",
+        item_text="Set source path (blank uses <campaign>/pool.xyz)",
     ),
     spec(
         "no_outlier_filter",
@@ -117,7 +114,10 @@ IMPORT_TRAJECTORY_POOL_FIELD_SPECS = [
 
 
 import_trajectory_pool_menu_items = [
-    FunctionItem("Import trajectory pool", ImportTrajectoryPoolFunctions.run_import),
+    FunctionItem(
+        "Initialise campaign / import trajectory pool",
+        ImportTrajectoryPoolFunctions.run_import,
+    ),
 ]
 
 
@@ -127,6 +127,6 @@ import_trajectory_pool_menu = make_field_menu(
     IMPORT_TRAJECTORY_POOL_FIELD_SPECS,
     _get_value,
     _set_value,
-    prologue_text="Current import-pool options:\n",
+    prologue_text="Current init options:\n",
     extra_items=import_trajectory_pool_menu_items,
 )

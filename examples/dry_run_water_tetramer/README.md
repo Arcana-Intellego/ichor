@@ -23,7 +23,7 @@ Run from this directory.
 ### 1. Import the MD pool
 
 ```
-python -m ichor.hpc.active_learning.cli import-pool \
+python -m ichor.hpc.active_learning.cli init \
     --campaign-dir . \
     --source pool.xyz
 ```

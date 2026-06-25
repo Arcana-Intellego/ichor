@@ -213,7 +213,7 @@ class DryRunPhaseExecutor:
 
         Behaviour:
           * If no trajectory pool is present (legacy dry-run without
-            'ichor-al-daemon import-pool'), writes a placeholder seeds.xyz
+            'ichor-al-daemon init'), writes a placeholder seeds.xyz
             and journals 'seed_selected' with 'pool_available=False'. This
             preserves the existing test_dry_run_executor.py contract.
           * If a pool IS present, treats every frame as an eligible seed

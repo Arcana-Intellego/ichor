@@ -74,7 +74,7 @@ required, ~30 seconds on a laptop):
 
 ```
 cd examples/dry_run_water_tetramer
-ichor-al-daemon import-pool -s pool.xyz
+ichor-al-daemon init
 ichor-al-daemon start -d -t 200
 ichor-al-daemon status
 ```

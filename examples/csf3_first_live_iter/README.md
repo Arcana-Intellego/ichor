@@ -193,7 +193,7 @@ export ICHOR_MACHINE=csf3
 source ~/projects/ichor-active-learning/scripts/env_ichor_csf.sh csf3 --smoke
 
 ichor-al-daemon preflight --campaign-dir .
-ichor-al-daemon import-pool --campaign-dir . --source pool.xyz
+ichor-al-daemon init
 ichor-al-daemon start --live --campaign-dir . --max-ticks 200
 ```
 

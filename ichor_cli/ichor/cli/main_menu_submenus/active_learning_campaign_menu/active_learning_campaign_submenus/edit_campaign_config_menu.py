@@ -10,7 +10,6 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-from uuid import uuid4
 
 import ichor.cli.global_menu_variables
 import ichor.hpc.global_variables
@@ -43,7 +42,6 @@ from ichor.cli.useful_functions import user_input_free_flow
 from ichor.hpc.active_learning.config import (
     CampaignConfig,
     ConfigValidationError,
-    diff_against_defaults,
     VALID_AIMALL_BOAQ_VALUES,
     VALID_AIMALL_IASMESH_VALUES,
     VALID_ACQUISITION_DRIVER_GRADIENT_BACKENDS,
@@ -567,10 +565,16 @@ def _confirm_discard_dirty(action: str) -> bool:
 
 
 def _pending_sparse_yaml() -> str:
-    import yaml
-
-    diff = diff_against_defaults(_campaign_config)
-    return yaml.safe_dump(diff, sort_keys=True, default_flow_style=False)
+    paths = dirty_paths()
+    if not paths:
+        return "No pending campaign.yaml field changes.\n"
+    lines = ["Pending campaign.yaml field changes:\n"]
+    for path in paths:
+        if path == "campaign.yaml":
+            lines.append("  campaign.yaml: initialise from packaged template\n")
+        else:
+            lines.append("  " + path + ": " + str(_get_config_value(path)) + "\n")
+    return "".join(lines)
 
 
 def load_config_for_campaign_dir(
@@ -1194,60 +1198,24 @@ class EditCampaignConfigFunctions:
         if not target.parent.exists():
             target.parent.mkdir(parents=True, exist_ok=True)
         changed = dirty_paths()
-        before = _campaign_config.to_dict()
-        temp_path = target.with_name(
-            "." + target.name + ".menu-save." + uuid4().hex + ".tmp"
-        )
         try:
-            _campaign_config.to_yaml(temp_path)
-        except Exception as exc:
-            print("Failed to write temporary config " + str(temp_path) + ": " + str(exc))
-            _last_error = "Write failed: " + str(exc)
-            try:
-                temp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            _sync_options_from_config()
-            _pause()
-            return
-        try:
-            reloaded = CampaignConfig.from_yaml(temp_path)
+            from ichor.hpc.active_learning.campaign_yaml import (
+                patch_campaign_yaml_fields,
+            )
+
+            reloaded = patch_campaign_yaml_fields(
+                target,
+                _campaign_config,
+                changed,
+            )
         except Exception as exc:
             print(
-                "Temporary campaign.yaml reload failed; existing "
+                "Failed to patch and verify "
                 + str(target)
-                + " was left untouched: "
+                + "; existing campaign.yaml was left untouched: "
                 + str(exc)
             )
-            _last_error = "Reload before save failed: " + str(exc)
-            try:
-                temp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            _sync_options_from_config()
-            _pause()
-            return
-        after = reloaded.to_dict()
-        if before != after:
-            print("ERROR: saved campaign.yaml reloads to a different config.")
-            print("Existing " + str(target) + " was left untouched.")
-            _last_error = "Save round-trip mismatch"
-            try:
-                temp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            _sync_options_from_config()
-            _pause()
-            return
-        try:
-            temp_path.replace(target)
-        except Exception as exc:
-            print("Failed to replace " + str(target) + ": " + str(exc))
-            _last_error = "Replace failed: " + str(exc)
-            try:
-                temp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+            _last_error = "Patch save failed: " + str(exc)
             _sync_options_from_config()
             _pause()
             return
@@ -1268,7 +1236,7 @@ class EditCampaignConfigFunctions:
             print("Changed fields saved:")
             for path in changed:
                 print("  " + path)
-        print("Note: campaign.yaml is sparse; default-valued fields are intentionally omitted.")
+        print("Note: unmodified campaign.yaml fields and comments are preserved where possible.")
         _pause()
 
 

@@ -62,7 +62,7 @@ def test_csf4_first_iteration_end_to_end(tmp_path):
 
     Steps mirrored from the README section 4 onwards:
       1. copy a water-tetramer trajectory into the tmp campaign dir.
-      2. ichor-al-daemon import-pool.
+      2. ichor-al-daemon init.
       3. copy the example campaign.yaml in.
       4. ichor-al-daemon start --live --max-ticks 2000.
       5. assert state.phase == DONE, training_set_version >= 1.
@@ -86,9 +86,9 @@ def test_csf4_first_iteration_end_to_end(tmp_path):
     shutil.copy(fixture_pool, campaign / "pool.xyz")
     shutil.copy(EXAMPLE_DIR / "campaign.yaml", campaign / "campaign.yaml")
 
-    # import-pool
+    # init
     rc = subprocess.run(
-        ["ichor-al-daemon", "import-pool",
+        ["ichor-al-daemon", "init",
          "--campaign-dir", str(campaign),
          "--source", str(campaign / "pool.xyz")],
         capture_output=True, text=True, timeout=300,

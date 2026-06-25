@@ -36,7 +36,7 @@ max_force_per_atom_ha_per_ang: 50.0
 # -------------------------------------------------------------------------
 
 trajectory_pool:
-  # The import-pool command writes the canonical pool under .DATA/TRAJECTORY.
+  # The init command writes the canonical pool under .DATA/TRAJECTORY.
   # Leave this empty unless your code path explicitly consumes it.
   source_path: ""
 

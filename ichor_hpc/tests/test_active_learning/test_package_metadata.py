@@ -14,6 +14,7 @@ PACKAGE_DIRS = {
 IMPORT_TO_PACKAGE = {
     "consolemenu": "console-menu",
     "concurrent_log_handler": "concurrent-log-handler",
+    "ruamel": "ruamel.yaml",
     "sqlalchemy": "SQLAlchemy",
     "yaml": "pyyaml",
 }
@@ -125,7 +126,7 @@ def test_csf4_critical_runtime_dependencies_are_declared():
     cli_deps = _declared_runtime_dependencies(PACKAGE_DIRS["ichor_cli"])
 
     assert {"ase", "xtb", "plumed", "rdkit", "tqdm"} <= core_deps
-    assert {"numpy", "ase", "xtb", "plumed", "portalocker", "tqdm"} <= hpc_deps
+    assert {"numpy", "ase", "xtb", "plumed", "portalocker", "tqdm", "ruamel-yaml"} <= hpc_deps
     assert {"console-menu", "termcolor", "ase"} <= cli_deps
 
 

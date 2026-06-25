@@ -68,7 +68,7 @@ pytest ichor_hpc/tests -m live
 
 - `ichor-al-daemon` -- active-learning campaign driver.
   Subcommands: `start`, `stop`, `status`, `resume`, `reconcile`,
-  `journal`, `import-pool`. Run `ichor-al-daemon --help` for full usage.
+  `journal`, `init`. Run `ichor-al-daemon --help` for full usage.
 
 ## Where to go from here
 

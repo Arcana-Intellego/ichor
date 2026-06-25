@@ -99,11 +99,16 @@ def test_main_reports_ambiguous_short_cluster_without_traceback(capsys):
     assert "unsupported short flag cluster '-lt'" in captured.err
 
 
-def test_import_pool_and_journal_short_flags_parse():
-    imp = _parse(["import-pool", "-s", "pool.xyz", "-f", "-O"])
+def test_init_and_journal_short_flags_parse():
+    imp = _parse(["init", "-s", "pool.xyz", "-f", "-O"])
     assert imp.source == "pool.xyz"
     assert imp.force is True
     assert imp.no_outlier_filter is True
+
+    legacy = _parse(["import-pool", "-s", "pool.xyz", "-f", "-O"])
+    assert legacy.source == "pool.xyz"
+    assert legacy.force is True
+    assert legacy.no_outlier_filter is True
 
     journal = _parse(["journal", "-e", "phase_submitted", "-n", "20", "-j"])
     assert journal.event_type == ["phase_submitted"]
@@ -139,6 +144,7 @@ def test_help_mentions_campaign_auto_detection_and_examples(capsys):
     top = capsys.readouterr().out
     assert "campaign.yaml" in top
     assert "ichor-al-daemon start -lb" in top
+    assert "ichor-al-daemon init" in top
 
     with pytest.raises(SystemExit):
         parser.parse_args(["start", "--help"])
@@ -150,7 +156,8 @@ def test_help_mentions_campaign_auto_detection_and_examples(capsys):
     assert "ichor-al-daemon start -lb" in start
 
     with pytest.raises(SystemExit):
-        parser.parse_args(["import-pool", "--help"])
-    import_pool = capsys.readouterr().out
-    assert "-s" in import_pool
-    assert "--source" in import_pool
+        parser.parse_args(["init", "--help"])
+    init_help = capsys.readouterr().out
+    assert "-s" in init_help
+    assert "--source" in init_help
+    assert "campaign.yaml" in init_help
