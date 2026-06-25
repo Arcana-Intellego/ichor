@@ -35,10 +35,12 @@ class FieldMenuOptions(MenuOptions):
         fields: Sequence[FieldSpec],
         get_value: Callable[[str], Any],
         title: str = "",
+        status_for_path: Optional[Callable[[str], str]] = None,
     ):
         self.title = title
         self.fields = list(fields)
         self.get_value = get_value
+        self.status_for_path = status_for_path
 
     def __str__(self):
         lines = []
@@ -52,6 +54,10 @@ class FieldMenuOptions(MenuOptions):
             label = spec.display_path or spec.path
             if spec.read_only:
                 rendered += " (read-only)"
+            if self.status_for_path is not None:
+                status = self.status_for_path(spec.path)
+                if status:
+                    rendered += " [" + status + "]"
             lines.append("-- " + label + ": " + rendered + "\n")
         return "".join(lines)
 
@@ -189,9 +195,15 @@ def make_field_menu(
     set_value: Optional[Callable[[str, Any], None]] = None,
     prologue_text: str = "Current values:\n",
     extra_items: Optional[Sequence] = None,
+    status_for_path: Optional[Callable[[str], str]] = None,
 ):
     menu = ConsoleMenu(
-        this_menu_options=FieldMenuOptions(fields, get_value, title=title),
+        this_menu_options=FieldMenuOptions(
+            fields,
+            get_value,
+            title=title,
+            status_for_path=status_for_path,
+        ),
         title=title,
         subtitle=subtitle,
         prologue_text=prologue_text,

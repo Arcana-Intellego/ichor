@@ -82,6 +82,7 @@ def test_edit_campaign_config_menu_items():
         "Edit quality_gates",
         "Edit runtime",
         "Show unsaved changes",
+        "Show config lock review",
         "Show pending YAML diff",
         "Discard unsaved changes / reload from disk",
         "Export dense config snapshot",
@@ -332,6 +333,154 @@ def test_daemon_launch_refuses_when_config_editor_dirty(tmp_path, monkeypatch, c
     out = capsys.readouterr().out
     assert "unsaved campaign.yaml edits" in out
     assert "gaussian.basis_set" in out
+
+
+def _write_started_campaign_with_lock(campaign, config):
+    from ichor.hpc.active_learning.daemon.config_lock import write_config_lock
+    from ichor.hpc.active_learning.daemon.state import fresh_campaign_state, write_state
+
+    campaign.mkdir(exist_ok=True)
+    config.to_yaml(campaign / "campaign.yaml")
+    data = campaign / ".DATA" / "ACTIVE_LEARNING"
+    data.mkdir(parents=True, exist_ok=True)
+    write_state(data / "state.json", fresh_campaign_state())
+    write_config_lock(campaign, config)
+
+
+def test_config_lock_status_renders_in_field_menu(tmp_path):
+    import importlib
+
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    original = CampaignConfig()
+    _write_started_campaign_with_lock(tmp_path, original)
+    set_selected_campaign_dir(tmp_path)
+    menu.load_config_for_campaign_dir(tmp_path, quiet=True)
+    menu._set_config_value("gaussian.basis_set", "6-31+G(d,p)")
+
+    rendered = menu._BLOCK_MENUS_BY_LABEL["Edit Gaussian block"].this_menu_options()
+
+    assert "gaussian.basis_set: 6-31+G(d,p) [blocked:" in rendered
+
+
+def test_save_refuses_blocked_config_lock_change(tmp_path, monkeypatch):
+    import importlib
+
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    original = CampaignConfig()
+    _write_started_campaign_with_lock(tmp_path, original)
+    set_selected_campaign_dir(tmp_path)
+    menu.load_config_for_campaign_dir(tmp_path, quiet=True)
+    menu._set_config_value("gaussian.basis_set", "6-31+G(d,p)")
+    monkeypatch.setattr(menu, "_pause", lambda: None)
+
+    menu.EditCampaignConfigFunctions.save_to_disk()
+
+    loaded = CampaignConfig.from_yaml(tmp_path / "campaign.yaml")
+    assert loaded.gaussian.basis_set == original.gaussian.basis_set
+    assert menu.has_unsaved_config_changes()
+    assert "Config lock blocked save" in menu.edit_campaign_config_menu_options.last_error
+
+
+def test_save_allows_safe_runtime_change_under_config_lock(tmp_path, monkeypatch):
+    import importlib
+
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    original = CampaignConfig()
+    _write_started_campaign_with_lock(tmp_path, original)
+    set_selected_campaign_dir(tmp_path)
+    menu.load_config_for_campaign_dir(tmp_path, quiet=True)
+    menu._set_config_value("resources.gaussian_walltime_hours", 3)
+    monkeypatch.setattr(menu, "_pause", lambda: None)
+
+    menu.EditCampaignConfigFunctions.save_to_disk()
+
+    loaded = CampaignConfig.from_yaml(tmp_path / "campaign.yaml")
+    assert loaded.resources.gaussian_walltime_hours == 3
+    assert not menu.has_unsaved_config_changes()
+
+
+def test_show_config_lock_review_lists_blocked_changes(tmp_path, monkeypatch, capsys):
+    import importlib
+
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    original = CampaignConfig()
+    _write_started_campaign_with_lock(tmp_path, original)
+    set_selected_campaign_dir(tmp_path)
+    menu.load_config_for_campaign_dir(tmp_path, quiet=True)
+    menu._set_config_value("gaussian.basis_set", "6-31+G(d,p)")
+    monkeypatch.setattr(menu, "_pause", lambda: None)
+
+    menu.EditCampaignConfigFunctions.show_config_lock_review()
+
+    out = capsys.readouterr().out
+    assert "Blocked config changes" in out
+    assert "gaussian.basis_set" in out
+
+
+def test_daemon_launch_refuses_saved_blocked_config_change(
+    tmp_path, monkeypatch, capsys,
+):
+    import importlib
+
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    edit_menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    start_menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.daemon_control_submenus.start_daemon_foreground_submenu"
+    )
+    original = CampaignConfig()
+    _write_started_campaign_with_lock(tmp_path, original)
+    changed = CampaignConfig()
+    changed.gaussian.method = "PBE0"
+    changed.to_yaml(tmp_path / "campaign.yaml")
+    set_selected_campaign_dir(tmp_path)
+    edit_menu.load_config_for_campaign_dir(tmp_path, quiet=True)
+    monkeypatch.setattr(start_menu, "user_input_free_flow", lambda *args, **kwargs: "")
+
+    start_menu.StartDaemonForegroundFunctions.launch()
+
+    out = capsys.readouterr().out
+    assert "Saved campaign.yaml differs from the config lock" in out
+    assert "gaussian.method" in out
 
 
 def test_acquisition_gradient_menu_exposes_active_fd_controls():

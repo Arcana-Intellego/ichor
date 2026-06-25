@@ -165,6 +165,12 @@ class StartDaemonBackgroundFunctions:
             print("Save or discard them before starting the daemon.")
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
+        if edit_menu.saved_config_has_lock_changes():
+            print("Saved campaign.yaml differs from the config lock:")
+            print(edit_menu.format_saved_config_lock_review())
+            print("Run reconcile --apply for safe edits or revert blocked edits before starting.")
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
         try:
             result = launch_daemon_detached_checked(
                 campaign_dir,

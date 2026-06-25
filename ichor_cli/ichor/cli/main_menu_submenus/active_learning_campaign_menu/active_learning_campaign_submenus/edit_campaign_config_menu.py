@@ -88,6 +88,7 @@ _dirty_paths: set[str] = set()
 _loaded_fingerprint: Optional[str] = None
 _last_save_path: Optional[Path] = None
 _last_error: str = ""
+_last_config_lock_error: str = ""
 
 
 def _config_fingerprint(cfg: CampaignConfig) -> str:
@@ -147,6 +148,191 @@ def dirty_paths() -> list[str]:
     return sorted(_dirty_paths)
 
 
+def _state_path_for_campaign(campaign_dir: Path) -> Path:
+    from ichor.hpc.active_learning.daemon.state import DEFAULT_STATE_FILENAME
+
+    return campaign_dir / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
+
+
+def _read_editor_state_for_lock(campaign_dir: Path):
+    from ichor.hpc.active_learning.daemon.state import read_state
+
+    return read_state(_state_path_for_campaign(campaign_dir))
+
+
+def current_config_lock_review():
+    global _last_config_lock_error
+    campaign_dir = _editor_selected_campaign_dir or selected_campaign_dir_or_none()
+    if campaign_dir is None:
+        return None
+    state_path = _state_path_for_campaign(campaign_dir)
+    if not state_path.is_file():
+        _last_config_lock_error = ""
+        return None
+    try:
+        state = _read_editor_state_for_lock(campaign_dir)
+        from ichor.hpc.active_learning.daemon.config_lock import (
+            review_config_changes,
+        )
+
+        review = review_config_changes(campaign_dir, _campaign_config, state)
+    except Exception as exc:
+        _last_config_lock_error = (
+            "config lock review failed: "
+            + type(exc).__name__
+            + ": "
+            + str(exc)[:160]
+        )
+        return None
+    _last_config_lock_error = ""
+    return review
+
+
+def saved_config_lock_review():
+    campaign_dir = selected_campaign_dir_or_none()
+    if campaign_dir is None:
+        return None
+    config_path = campaign_dir / "campaign.yaml"
+    state_path = _state_path_for_campaign(campaign_dir)
+    if not config_path.is_file() or not state_path.is_file():
+        return None
+    try:
+        cfg = CampaignConfig.from_yaml(config_path)
+        state = _read_editor_state_for_lock(campaign_dir)
+        from ichor.hpc.active_learning.daemon.config_lock import (
+            review_config_changes,
+        )
+
+        return review_config_changes(campaign_dir, cfg, state)
+    except Exception:
+        return None
+
+
+def blocked_config_lock_paths() -> set[str]:
+    review = current_config_lock_review()
+    if review is None:
+        return set()
+    return {change.path for change in review.blocked_changes}
+
+
+def allowed_config_lock_paths() -> set[str]:
+    review = current_config_lock_review()
+    if review is None:
+        return set()
+    return {change.path for change in review.allowed_changes}
+
+
+def _summarise_paths(paths) -> str:
+    values = sorted(paths)
+    if not values:
+        return ""
+    return ", ".join(values[:8]) + (" ..." if len(values) > 8 else "")
+
+
+def _config_lock_change_status(path: str) -> str:
+    review = current_config_lock_review()
+    if review is not None:
+        for change in review.blocked_changes:
+            if change.path == path:
+                return "blocked: " + change.reason
+        for change in review.allowed_changes:
+            if change.path == path:
+                return "allowed: " + change.reason
+    campaign_dir = _editor_selected_campaign_dir or selected_campaign_dir_or_none()
+    if campaign_dir is None or not _state_path_for_campaign(campaign_dir).is_file():
+        return ""
+    from ichor.hpc.active_learning.daemon import config_lock as lock_mod
+
+    if path in lock_mod.COMMITTED_LOCKED_EXACT:
+        return "locked after committed artefacts"
+    if path in lock_mod.CAMPAIGN_LOCKED_EXACT:
+        return "locked after campaign start"
+    if path in lock_mod.PHASE_LOCAL_EXACT:
+        return "phase-local"
+    if path in lock_mod.ALWAYS_SAFE_EXACT or path in lock_mod.ALWAYS_SAFE_RESOURCE_EXACT:
+        return "safe runtime change"
+    if any(path.startswith(prefix) for prefix in lock_mod.ALWAYS_SAFE_PREFIXES):
+        return "safe runtime change"
+    if path in lock_mod.FUTURE_SAFE_EXACT:
+        return "future-safe"
+    if any(path.startswith(prefix) for prefix in lock_mod.FUTURE_SAFE_PREFIXES):
+        return "future-safe"
+    if not path.startswith("schema_version"):
+        return "unclassified lock policy"
+    return ""
+
+
+def _refresh_config_lock_options() -> None:
+    campaign_dir = _editor_selected_campaign_dir or selected_campaign_dir_or_none()
+    started = bool(
+        campaign_dir is not None
+        and _state_path_for_campaign(campaign_dir).is_file()
+    )
+    edit_campaign_config_menu_options.campaign_started = (
+        "yes" if started else "no"
+    )
+    review = current_config_lock_review()
+    if not started:
+        edit_campaign_config_menu_options.config_lock = "not started"
+        edit_campaign_config_menu_options.blocked_config_fields = ""
+        edit_campaign_config_menu_options.allowed_config_fields = ""
+        return
+    if _last_config_lock_error:
+        edit_campaign_config_menu_options.config_lock = _last_config_lock_error
+        edit_campaign_config_menu_options.blocked_config_fields = ""
+        edit_campaign_config_menu_options.allowed_config_fields = ""
+        return
+    if review is None:
+        edit_campaign_config_menu_options.config_lock = "unavailable"
+        edit_campaign_config_menu_options.blocked_config_fields = ""
+        edit_campaign_config_menu_options.allowed_config_fields = ""
+        return
+    if review.blocked_changes:
+        edit_campaign_config_menu_options.config_lock = "blocked changes"
+    elif review.allowed_changes:
+        edit_campaign_config_menu_options.config_lock = "allowed changes"
+    elif not review.lock_existed:
+        edit_campaign_config_menu_options.config_lock = "missing"
+    else:
+        edit_campaign_config_menu_options.config_lock = "clean"
+    edit_campaign_config_menu_options.blocked_config_fields = _summarise_paths(
+        change.path for change in review.blocked_changes
+    )
+    edit_campaign_config_menu_options.allowed_config_fields = _summarise_paths(
+        change.path for change in review.allowed_changes
+    )
+
+
+def format_current_config_lock_review() -> str:
+    review = current_config_lock_review()
+    if review is None:
+        return _last_config_lock_error or "No config lock review is available."
+    from ichor.hpc.active_learning.daemon.config_lock import format_config_review
+
+    formatted = format_config_review(review)
+    return formatted or "No campaign.yaml changes against the config lock."
+
+
+def saved_config_has_blocked_changes() -> bool:
+    review = saved_config_lock_review()
+    return bool(review is not None and review.blocked_changes)
+
+
+def saved_config_has_lock_changes() -> bool:
+    review = saved_config_lock_review()
+    return bool(review is not None and review.changed)
+
+
+def format_saved_config_lock_review() -> str:
+    review = saved_config_lock_review()
+    if review is None:
+        return "No saved config lock review is available."
+    from ichor.hpc.active_learning.daemon.config_lock import format_config_review
+
+    formatted = format_config_review(review)
+    return formatted or "No campaign.yaml changes against the config lock."
+
+
 @dataclass
 class EditCampaignConfigMenuOptions(MenuOptions):
     loaded_from: str = "defaults"
@@ -155,6 +341,10 @@ class EditCampaignConfigMenuOptions(MenuOptions):
     dirty_fields: str = ""
     last_save_path: str = ""
     last_error: str = ""
+    campaign_started: str = "no"
+    config_lock: str = "absent"
+    blocked_config_fields: str = ""
+    allowed_config_fields: str = ""
     system_name: str = "SYSTEM"
     max_iterations: int = 50
     n_seeds_per_iteration: int = 50
@@ -167,6 +357,7 @@ class EditCampaignConfigMenuOptions(MenuOptions):
 
     def __call__(self):
         _ensure_selected_campaign_loaded_for_editor()
+        _refresh_config_lock_options()
         return super().__call__()
 
 
@@ -186,6 +377,20 @@ def _set_config_value(path: str, value):
 
 
 def _edit_field(spec: _FieldSpec):
+    status = _config_lock_change_status(spec.path)
+    if (
+        status.startswith("locked")
+        or status.startswith("blocked")
+        or status.startswith("unclassified")
+    ):
+        print("Config-lock warning for " + spec.path + ": " + status)
+        answer = user_input_free_flow(
+            "Type YES to edit this field anyway: ",
+            "",
+        )
+        if str(answer).strip() != "YES":
+            print("Edit cancelled.")
+            return
     old = _get_config_value(spec.path)
     _shared_edit_field(spec, _get_config_value, _set_config_value)
     new = _get_config_value(spec.path)
@@ -204,6 +409,7 @@ def _make_block_menu(title: str, subtitle: str, fields):
         _get_config_value,
         _set_config_value,
         prologue_text="Current values for this campaign.yaml block:\n",
+        status_for_path=_config_lock_change_status,
     )
 
 
@@ -362,6 +568,11 @@ class EditCampaignConfigFunctions:
             print("Unsaved fields:")
             for path in dirty_paths():
                 print("  " + path)
+        _pause()
+
+    @staticmethod
+    def show_config_lock_review():
+        print(format_current_config_lock_review())
         _pause()
 
     @staticmethod
@@ -870,6 +1081,17 @@ class EditCampaignConfigFunctions:
             print("Validation failed; campaign.yaml NOT written.")
             print("  " + str(exc))
             _last_error = "Validation failed: " + str(exc)
+            _sync_options_from_config()
+            _pause()
+            return
+        review = current_config_lock_review()
+        if review is not None and review.blocked_changes:
+            print(
+                "campaign.yaml NOT written because these changes are "
+                "locked after campaign start:"
+            )
+            print(format_current_config_lock_review())
+            _last_error = "Config lock blocked save"
             _sync_options_from_config()
             _pause()
             return
@@ -1522,6 +1744,10 @@ edit_campaign_config_menu_items = [
     FunctionItem(
         "Show unsaved changes",
         EditCampaignConfigFunctions.show_unsaved_changes,
+    ),
+    FunctionItem(
+        "Show config lock review",
+        EditCampaignConfigFunctions.show_config_lock_review,
     ),
     FunctionItem(
         "Show pending YAML diff",
