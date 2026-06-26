@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+from ..acquisition.trajectory_pool import TrajectoryPool
 from ..versioning.training_set import TrainingSetVersioning
 from .artifact_contracts import (
     verify_committed_model_version,
@@ -59,6 +60,56 @@ class ReconciliationReport:
     existing_state_loaded: bool = False
     unsafe_reasons: List[str] = field(default_factory=list)
     active_submission_intents: List[Dict[str, Any]] = field(default_factory=list)
+    decision: str = ""
+    trusted_artifacts: List[str] = field(default_factory=list)
+    blocking_artifacts: List[str] = field(default_factory=list)
+    recommended_actions: List[str] = field(default_factory=list)
+
+
+def _needs_trajectory_pool_check(
+    *,
+    existing_loaded: bool,
+    training_versions: List[int],
+    model_versions: List[int],
+    active_intents: List[Dict[str, Any]],
+    last_phase: Optional[str],
+    staging_children: List[Path],
+    script_files: List[Path],
+    dangling_training: List[Path],
+    dangling_models: List[Path],
+    has_model_iteration_staging: bool,
+) -> bool:
+    return any(
+        (
+            existing_loaded,
+            bool(training_versions),
+            bool(model_versions),
+            bool(active_intents),
+            bool(last_phase),
+            bool(staging_children),
+            bool(script_files),
+            bool(dangling_training),
+            bool(dangling_models),
+            bool(has_model_iteration_staging),
+        )
+    )
+
+
+def _trajectory_pool_unsafe_reason(exc: Exception) -> str:
+    msg = str(exc)
+    if isinstance(exc, FileNotFoundError):
+        if "pool manifest" in msg:
+            return "trajectory pool manifest missing"
+        if "pool xyz" in msg:
+            return "trajectory pool missing"
+        return "trajectory pool missing"
+    if isinstance(exc, RuntimeError) and "pool drift detected" in msg:
+        return "trajectory pool SHA mismatch"
+    if isinstance(exc, ValueError):
+        if "natoms" in msg or "atom_types" in msg or "masses" in msg:
+            return "trajectory pool atom count invalid"
+        return "trajectory pool unreadable"
+    return "trajectory pool unreadable"
 
 
 def propose_recovery(
@@ -93,6 +144,9 @@ def propose_recovery(
 
     notes: List[str] = []
     unsafe_reasons: List[str] = []
+    trusted_artifacts: List[str] = []
+    blocking_artifacts: List[str] = []
+    recommended_actions: List[str] = []
 
     existing: Optional[CampaignState] = None
     existing_loaded = False
@@ -202,14 +256,24 @@ def propose_recovery(
                 for i in active_intents
             )
         )
+        blocking_artifacts.append("active submission intent(s)")
+        recommended_actions.append(
+            "If these jobs should be cancelled, run: ichor-al-daemon stop --campaign-dir "
+            + str(campaign)
+            + " --cancel-jobs"
+        )
     if staging_children:
         unsafe_reasons.append(".DATA/STAGING is non-empty")
+        blocking_artifacts.append(".DATA/STAGING")
     if script_files:
         unsafe_reasons.append(".DATA/SCRIPTS contains sbatch scripts")
+        trusted_artifacts.append(".DATA/SCRIPTS can be archived by reconcile --apply")
     if dangling_training:
         unsafe_reasons.append("dangling training staging directories exist")
+        blocking_artifacts.append("dangling training staging")
     if dangling_models or has_model_iteration_staging:
         unsafe_reasons.append("dangling model staging directories exist")
+        blocking_artifacts.append("dangling model staging")
 
     valid_training_versions: List[int] = []
     for version in tv:
@@ -220,6 +284,7 @@ def propose_recovery(
                 training_dir_name=training_dir_name,
             )
             valid_training_versions.append(int(version))
+            trusted_artifacts.append("training version " + str(version))
         except Exception as exc:
             unsafe_reasons.append(
                 "committed training version "
@@ -229,6 +294,7 @@ def propose_recovery(
                 + ": "
                 + str(exc)[:160]
             )
+            blocking_artifacts.append("training version " + str(version))
     valid_model_versions: List[int] = []
     for version in mv:
         try:
@@ -238,6 +304,7 @@ def propose_recovery(
                 models_dir_name=models_dir_name,
             )
             valid_model_versions.append(int(version))
+            trusted_artifacts.append("model version " + str(version))
         except Exception as exc:
             unsafe_reasons.append(
                 "committed model version "
@@ -247,6 +314,31 @@ def propose_recovery(
                 + ": "
                 + str(exc)[:160]
             )
+            blocking_artifacts.append("model version " + str(version))
+
+    if _needs_trajectory_pool_check(
+        existing_loaded=existing_loaded,
+        training_versions=tv,
+        model_versions=mv,
+        active_intents=active_intents,
+        last_phase=last_phase,
+        staging_children=staging_children,
+        script_files=script_files,
+        dangling_training=dangling_training,
+        dangling_models=dangling_models,
+        has_model_iteration_staging=has_model_iteration_staging,
+    ):
+        try:
+            pool = TrajectoryPool.load(campaign)
+            if pool.manifest.natoms <= 0:
+                raise ValueError("pool natoms must be positive")
+            trusted_artifacts.append(
+                "trajectory pool SHA " + str(pool.sha256)[:12]
+            )
+        except Exception as exc:
+            reason = _trajectory_pool_unsafe_reason(exc)
+            unsafe_reasons.append(reason + ": " + str(exc)[:180])
+            blocking_artifacts.append("trajectory pool")
 
     #build the recovered state
     if existing is not None:
@@ -336,6 +428,7 @@ def propose_recovery(
     # to loop or terminate.
     if not tv and not mv and not existing_loaded and unsafe_reasons and not allow_fresh_init_on_nonempty:
         recovered.phase = CampaignPhase.HALTED
+        decision = "HALTED: non-empty campaign has no valid state or committed versions"
         notes.append(
             "non-empty campaign with no valid state.json; proposed HALTED instead of fresh INIT"
         )
@@ -352,16 +445,23 @@ def propose_recovery(
                     + " iteration "
                     + str(recovered.iteration)
                 )
+                decision = (
+                    recovered.phase.value
+                    + ": selected from active submission intent for operator review"
+                )
             except Exception:
                 recovered.phase = CampaignPhase.HALTED
     elif not tv and not mv and not existing_loaded:
         recovered.phase = CampaignPhase.INIT
+        decision = "INIT: no existing state or committed iterations"
         notes.append("no committed iterations; re-entry at INIT")
     elif no_coherent_pair:
         recovered.phase = CampaignPhase.HALTED
+        decision = "HALTED: no coherent committed training/model pair"
         notes.append("re-entry HALTED because no coherent training/model pair exists")
     elif valid_training_versions and not valid_model_versions:
         recovered.phase = CampaignPhase.INITIAL_FEREBUS if recovered.training_set_version == 0 else CampaignPhase.FEREBUS
+        decision = recovered.phase.value + ": valid training exists without a committed model"
         notes.append(
             "re-entry at "
             + recovered.phase.value
@@ -370,19 +470,24 @@ def propose_recovery(
         )
     elif coherent_pairs and unsafe_reasons:
         recovered.phase = CampaignPhase.HALTED
+        decision = "HALTED: coherent committed versions exist but unsafe artefacts need review"
         notes.append(
             "re-entry HALTED because committed artefacts need operator review"
         )
     elif unsafe_reasons:
         recovered.phase = CampaignPhase.HALTED
+        decision = "HALTED: unsafe artefacts need operator review"
         notes.append(
             "re-entry HALTED because unsafe committed artefacts need operator review"
         )
     else:
         recovered.phase = CampaignPhase.STOP_CHECK
+        decision = "STOP_CHECK: latest coherent committed training/model pair is trusted"
         notes.append("re-entry at STOP_CHECK (next tick decides loop/terminate)")
     recovered.pending_jobs = {}
     recovered.shutdown_requested = False
+    if recovered.phase is CampaignPhase.HALTED and not recommended_actions:
+        recommended_actions.append("Inspect unsafe recovery reasons before applying.")
 
     return ReconciliationReport(
         proposed_state=recovered,
@@ -394,6 +499,10 @@ def propose_recovery(
         existing_state_loaded=existing_loaded,
         unsafe_reasons=unsafe_reasons,
         active_submission_intents=active_intents,
+        decision=decision,
+        trusted_artifacts=trusted_artifacts,
+        blocking_artifacts=blocking_artifacts,
+        recommended_actions=recommended_actions,
     )
 
 

@@ -520,6 +520,115 @@ def apply_config_lock_update(
     return write_config_lock(campaign_dir, config)
 
 
+def restore_config_from_lock_proposal(campaign_dir: Union[str, Path]) -> Path:
+    """Write campaign.yaml.proposed from the locked canonical config.
+
+    This is deliberately proposal-only.  The operator must inspect and promote
+    the file manually because campaign.yaml is the protocol contract.
+    """
+    campaign = Path(campaign_dir)
+    campaign_yaml = campaign / "campaign.yaml"
+    if campaign_yaml.exists():
+        raise FileExistsError(
+            "campaign.yaml already exists; refusing to overwrite it"
+        )
+    path = config_lock_path(campaign)
+    if not path.is_file():
+        raise FileNotFoundError("config lock not found at " + str(path))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(
+            "config lock is unreadable: "
+            + type(exc).__name__
+            + ": "
+            + str(exc)[:160]
+        ) from exc
+    config_payload = payload.get("canonical_config")
+    if not isinstance(config_payload, dict):
+        raise ValueError("config lock does not contain canonical_config")
+    config = CampaignConfig.from_dict(config_payload)
+    target = campaign / "campaign.yaml.proposed"
+    config.to_yaml_dense(target)
+    return target
+
+
+def training_staging_can_archive_for_reconcile(
+    campaign_dir: Union[str, Path],
+    proposed_state: CampaignState,
+) -> Tuple[bool, str]:
+    campaign = Path(campaign_dir)
+    training = campaign / "5_TRAINING"
+    if not training.is_dir():
+        return False, "5_TRAINING is missing"
+    tv = TrainingSetVersioning(training)
+    dangling = tv.list_dangling_staging()
+    if not dangling:
+        return True, "no dangling training staging exists"
+    try:
+        training_version = int(proposed_state.training_set_version)
+    except (TypeError, ValueError):
+        return False, "training_set_version is not an integer"
+    if training_version < 0:
+        return False, "training_set_version is negative"
+    try:
+        verify_committed_training_version(campaign, training_version)
+    except Exception as exc:
+        return False, "committed training version is invalid: " + str(exc)[:180]
+    try:
+        model_version = int(proposed_state.models_version)
+    except (TypeError, ValueError):
+        model_version = -1
+    if model_version >= 0:
+        try:
+            verify_committed_model_version(campaign, model_version)
+        except Exception as exc:
+            return False, "committed model version is invalid: " + str(exc)[:180]
+    training_resolved = training.resolve()
+    for path in dangling:
+        if path.is_symlink():
+            return False, "refusing to archive symlinked training staging: " + str(path)
+        if not path.is_dir():
+            return False, "training staging is not a directory: " + str(path)
+        _ensure_inside_campaign(campaign, path)
+        resolved = path.resolve()
+        if training_resolved not in resolved.parents:
+            return False, "training staging is outside 5_TRAINING: " + str(path)
+    return True, "dangling training staging can be archived"
+
+
+def archive_training_staging_for_reconcile(
+    campaign_dir: Union[str, Path],
+    proposed_state: CampaignState,
+) -> List[str]:
+    ok, reason = training_staging_can_archive_for_reconcile(
+        campaign_dir,
+        proposed_state,
+    )
+    if not ok:
+        raise ValueError(reason)
+    campaign = Path(campaign_dir)
+    training = campaign / "5_TRAINING"
+    tv = TrainingSetVersioning(training)
+    archived: List[str] = []
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    for staging in tv.list_dangling_staging():
+        target = staging.with_name(staging.name + ".before-reconcile-" + stamp)
+        suffix = 1
+        while target.exists():
+            target = staging.with_name(
+                staging.name
+                + ".before-reconcile-"
+                + stamp
+                + "."
+                + str(suffix)
+            )
+            suffix += 1
+        staging.rename(target)
+        archived.append(str(target))
+    return archived
+
+
 def format_config_review(review: ConfigLockReview) -> str:
     lines: List[str] = []
     if review.notes:

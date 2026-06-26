@@ -166,6 +166,31 @@ class DaemonControlFunctions:
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
+    def reconcile_restore_config_from_lock():
+        """Write campaign.yaml.proposed from config_lock.json."""
+        from ichor.hpc.active_learning.cli import cmd_reconcile
+
+        ns = _guarded_campaign_dir_ns()
+        if ns is None:
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        answer = user_input_free_flow(
+            "Write campaign.yaml.proposed from config_lock.json? Type YES: ",
+            "",
+        )
+        if answer != "YES":
+            print("Cancelled.")
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        ns.allow_fresh_init = False
+        ns.apply = False
+        ns.restore_config_from_lock = True
+        rc = cmd_reconcile(ns)
+        if rc != 0:
+            print("reconcile --restore-config-from-lock returned exit code " + str(rc))
+        user_input_free_flow("Press enter to return to the menu: ", "")
+
+    @staticmethod
     def reconcile_allow_fresh_init():
         """Dangerous reconcile mode matching --allow-fresh-init."""
         from ichor.hpc.active_learning.cli import cmd_reconcile
@@ -236,6 +261,10 @@ daemon_control_menu_items = [
     FunctionItem(
         "Reconcile and apply safe proposal",
         DaemonControlFunctions.reconcile_apply,
+    ),
+    FunctionItem(
+        "Restore campaign.yaml proposal from config lock",
+        DaemonControlFunctions.reconcile_restore_config_from_lock,
     ),
     FunctionItem(
         "Reconcile state with --allow-fresh-init",

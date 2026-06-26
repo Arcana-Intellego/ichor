@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import ichor.hpc.active_learning.cli as cli_mod
 from ichor.hpc.active_learning.cli import cmd_reconcile, cmd_start
 from ichor.hpc.active_learning.config import CampaignConfig
+from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
 from ichor.hpc.active_learning.daemon import config_lock as config_lock_mod
 from ichor.hpc.active_learning.daemon.config_lock import (
     config_lock_path,
@@ -31,7 +32,24 @@ def _campaign(tmp_path):
     return campaign
 
 
+def _write_pool(campaign):
+    src = campaign / "pool_source.xyz"
+    src.write_text(
+        "1\n"
+        "frame 0\n"
+        "H 0.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    TrajectoryPool.import_from(
+        src,
+        campaign,
+        overwrite=True,
+        outlier_filter_enabled=False,
+    )
+
+
 def _commit_training_version(campaign, version=0):
+    _write_pool(campaign)
     tv = TrainingSetVersioning(campaign / "5_TRAINING")
     staging = tv.stage(None, version)
     (staging / "marker.txt").write_text("training", encoding="utf-8")
@@ -43,6 +61,7 @@ def _write_config(campaign, config):
 
 
 def _write_halted_pre_ferebus_state(campaign):
+    _write_pool(campaign)
     state = fresh_campaign_state(max_iterations=3)
     state.phase = CampaignPhase.HALTED
     state.training_set_version = 0
@@ -190,6 +209,127 @@ def test_reconcile_apply_promotes_state_and_cleans_ferebus_staging(tmp_path, cap
     assert lock["canonical_config"]["ferebus"]["scaling"] is False
 
 
+def test_reconcile_apply_refuses_when_daemon_lock_may_be_active(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign(tmp_path)
+    _commit_training_version(campaign, 0)
+    _write_halted_pre_ferebus_state(campaign)
+    config = CampaignConfig()
+    write_config_lock(campaign, config)
+    _write_config(campaign, config)
+
+    monkeypatch.setattr(
+        cli_mod,
+        "_reconcile_runtime_status",
+        lambda campaign: {
+            "lock_held": True,
+            "lease_heartbeat": None,
+            "background_pid": None,
+            "background_pid_alive": False,
+            "reconcile_apply_blockers": ["daemon lock is held"],
+        },
+    )
+
+    rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            allow_fresh_init=False,
+            apply=True,
+            restore_config_from_lock=False,
+        )
+    )
+    err = capsys.readouterr().err
+
+    assert rc == 9
+    assert "daemon may still be running" in err
+    assert not (campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json.proposed").exists()
+
+
+def test_reconcile_non_apply_warns_when_daemon_lock_may_be_active(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign(tmp_path)
+    _commit_training_version(campaign, 0)
+    _write_halted_pre_ferebus_state(campaign)
+    monkeypatch.setattr(
+        cli_mod,
+        "_reconcile_runtime_status",
+        lambda campaign: {
+            "lock_held": True,
+            "lease_heartbeat": None,
+            "background_pid": None,
+            "background_pid_alive": False,
+            "reconcile_apply_blockers": ["daemon lock is held"],
+        },
+    )
+
+    rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            allow_fresh_init=False,
+            apply=False,
+            restore_config_from_lock=False,
+        )
+    )
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "daemon may still be running" in captured.err
+    assert (campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json.proposed").exists()
+
+
+def test_reconcile_restore_config_from_lock_writes_proposal(tmp_path, capsys):
+    campaign = _campaign(tmp_path)
+    config = CampaignConfig()
+    config.system_name = "RESTORED"
+    write_config_lock(campaign, config)
+
+    rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            allow_fresh_init=False,
+            apply=False,
+            restore_config_from_lock=True,
+        )
+    )
+    out = capsys.readouterr().out
+
+    proposed = campaign / "campaign.yaml.proposed"
+    assert rc == 0
+    assert proposed.is_file()
+    assert "Config proposal written" in out
+    restored = CampaignConfig.from_yaml(proposed)
+    assert restored.system_name == "RESTORED"
+
+
+def test_reconcile_restore_config_from_lock_refuses_existing_campaign_yaml(
+    tmp_path,
+    capsys,
+):
+    campaign = _campaign(tmp_path)
+    config = CampaignConfig()
+    write_config_lock(campaign, config)
+    _write_config(campaign, config)
+
+    rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            allow_fresh_init=False,
+            apply=False,
+            restore_config_from_lock=True,
+        )
+    )
+    err = capsys.readouterr().err
+
+    assert rc == 8
+    assert "campaign.yaml already exists" in err
+
+
 def test_reconcile_apply_archives_data_staging_for_ferebus_reentry(tmp_path, capsys):
     campaign = _campaign(tmp_path)
     _commit_training_version(campaign, 0)
@@ -220,6 +360,35 @@ def test_reconcile_apply_archives_data_staging_for_ferebus_reentry(tmp_path, cap
     assert data_staging.is_dir()
     assert list(data_staging.iterdir()) == []
     assert "Archived stale .DATA/STAGING" in out
+
+
+def test_reconcile_apply_archives_safe_dangling_training_staging(tmp_path, capsys):
+    campaign = _campaign(tmp_path)
+    _commit_training_version(campaign, 0)
+    _write_halted_pre_ferebus_state(campaign)
+    config = CampaignConfig()
+    write_config_lock(campaign, config)
+    _write_config(campaign, config)
+    tv = TrainingSetVersioning(campaign / "5_TRAINING")
+    dangling = tv.staging_path(1)
+    dangling.mkdir(parents=True)
+    (dangling / "partial.txt").write_text("partial\n", encoding="utf-8")
+
+    rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            allow_fresh_init=False,
+            apply=True,
+            restore_config_from_lock=False,
+        )
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    archived = sorted((campaign / "5_TRAINING").glob("iteration-0001.staging.before-reconcile-*"))
+    assert len(archived) == 1
+    assert (archived[0] / "partial.txt").read_text(encoding="utf-8") == "partial\n"
+    assert "Archived stale training staging" in out
 
 
 def test_reconcile_apply_cleans_transient_halted_ariadne_reentry(

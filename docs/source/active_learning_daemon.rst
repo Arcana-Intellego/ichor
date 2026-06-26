@@ -290,16 +290,55 @@ fails schema validation, run::
 
 This inspects the on-disk artefacts (committed iterations in
 :code:`5_TRAINING/` and :code:`6_TRAINED_MODELS/`, plus journal events)
-and proposes a recovered state at :code:`state.json.proposed`. Review
-the proposal, then promote it manually::
+and proposes a recovered state at :code:`state.json.proposed`. Plain
+reconcile is diagnostic: it may write the proposal file and warn about a
+live daemon, but it does not alter :code:`state.json`. Review the proposal,
+then promote it manually::
 
     mv .DATA/ACTIVE_LEARNING/state.json.proposed .DATA/ACTIVE_LEARNING/state.json
     ichor-al-daemon start --live --campaign-dir . --resume
+
+For routine crash recovery, use the guarded apply path instead::
+
+    ichor-al-daemon reconcile --campaign-dir . --apply
+
+The apply path refuses to run if the daemon lock is held, the lock state is
+unknown, the lease heartbeat is fresh, or the background daemon PID appears
+alive. Stop the daemon first when reconcile reports live jobs or an active
+runtime::
+
+    ichor-al-daemon stop --campaign-dir . --cancel-jobs
+    ichor-al-daemon reconcile --campaign-dir . --apply
 
 The reconcile path is conservative: it ALWAYS positions the daemon at a
 "safe" re-entry point (STOP_CHECK for completed iterations or INIT when
 nothing is committed) and clears any pending jobs so the next run
 re-submits rather than blindly polls unknown JobIDs.
+
+Reconcile also verifies the trajectory-pool contract for non-empty campaigns:
+:code:`.DATA/TRAJECTORY/pool.xyz` and
+:code:`.DATA/TRAJECTORY/pool.manifest.json` must exist and the SHA-256 in the
+manifest must match the canonical pool. Pool corruption or deletion is reported
+as unsafe; reconcile does not automatically repair the pool because it is
+provenance-critical.
+
+If :code:`campaign.yaml` was accidentally removed but the config lock is still
+present, write a proposal from the lock::
+
+    ichor-al-daemon reconcile --campaign-dir . --restore-config-from-lock
+
+This creates :code:`campaign.yaml.proposed` only. Inspect it, then promote it
+manually before running :code:`reconcile --apply`.
+
+What reconcile still does not do:
+
+- it does not postprocess successful Slurm jobs whose daemon-side commit did
+  not run;
+- it does not harvest uncommitted Gaussian/AIMAll outputs into a training
+  version;
+- it does not rebuild committed manifests automatically;
+- it does not roll back one-sided newer training/model versions without
+  operator review.
 
 Common failure modes:
 

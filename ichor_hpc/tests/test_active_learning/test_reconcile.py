@@ -98,6 +98,27 @@ def test_propose_recovery_finds_committed_training_versions(tmp_path):
     assert report.proposed_state.training_set_version == 2
     assert report.proposed_state.models_version == -1
     assert report.proposed_state.phase is CampaignPhase.FEREBUS
+    assert any("trajectory pool" in r for r in report.unsafe_reasons)
+
+
+def test_propose_recovery_reports_decision_and_trusted_versions(tmp_path):
+    campaign, _, training, models = _campaign_dirs(tmp_path)
+    tv = TrainingSetVersioning(training)
+    mv = TrainingSetVersioning(models)
+    s = tv.stage(None, 0)
+    (s / "marker.txt").write_text("training", encoding="utf-8")
+    tv.commit(0)
+    s = mv.stage(None, 0)
+    (s / "marker.txt").write_text("model", encoding="utf-8")
+    mv.commit(0)
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.HALTED
+    assert "coherent committed" in report.decision
+    assert "training version 0" in report.trusted_artifacts
+    assert "model version 0" in report.trusted_artifacts
+    assert "trajectory pool" in report.blocking_artifacts
 
 
 def test_propose_recovery_reports_unmanifested_committed_pointdir(tmp_path):

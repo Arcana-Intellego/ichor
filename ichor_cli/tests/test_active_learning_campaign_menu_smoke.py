@@ -42,6 +42,8 @@ def test_daemon_control_menu_items():
         "Start/Resume Daemon (Background)",
         "Stop daemon",
         "Reconcile state",
+        "Reconcile and apply safe proposal",
+        "Restore campaign.yaml proposal from config lock",
         "Reconcile state with --allow-fresh-init",
     ):
         assert expected in texts, "missing item: " + expected

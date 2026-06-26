@@ -45,12 +45,15 @@ from .daemon.config_lock import (
     apply_config_lock_update,
     archive_scripts_for_reconcile,
     archive_data_staging_for_ferebus_reentry,
+    archive_training_staging_for_reconcile,
     assert_config_unchanged_for_start,
     clean_model_iteration_staging_for_reconcile,
     clean_reentry_staging,
     ferebus_reentry_can_archive_data_staging,
     format_config_review,
     review_config_changes,
+    restore_config_from_lock_proposal,
+    training_staging_can_archive_for_reconcile,
 )
 from .daemon.dry_run_executor import DryRunPhaseExecutor
 from .daemon.dry_run_sacct import DryRunSacctPoller
@@ -320,6 +323,75 @@ def _probe_background_daemon(pid_path: Path, log_path: Path) -> Dict[str, Any]:
     if payload:
         out["background_pid_payload"] = payload
     return out
+
+
+def _lease_is_fresh(heartbeat: Any, *, stale_seconds: int = 900) -> bool:
+    if not isinstance(heartbeat, dict):
+        return False
+    try:
+        age = time.time() - float(heartbeat.get("time"))
+    except Exception:
+        return False
+    return age <= float(stale_seconds)
+
+
+def _reconcile_runtime_status(campaign: Path) -> Dict[str, Any]:
+    paths = _campaign_paths(campaign)
+    status: Dict[str, Any] = {}
+    status.update(_probe_daemon_lock(paths["lock"]))
+    status.update(_probe_daemon_lease(paths["lease"]))
+    status.update(_probe_background_daemon(paths["background_pid"], paths["background_log"]))
+    blockers: List[str] = []
+    if status.get("lock_held") is True:
+        blockers.append("daemon lock is held")
+    elif status.get("lock_held") is None:
+        blockers.append(
+            "daemon lock state is unknown: "
+            + str(status.get("lock_probe_error", "unknown error"))
+        )
+    if status.get("lease_probe_error"):
+        blockers.append(
+            "daemon lease state is unknown: "
+            + str(status.get("lease_probe_error"))
+        )
+    elif _lease_is_fresh(status.get("lease_heartbeat")):
+        blockers.append("daemon lease heartbeat is fresh")
+    if status.get("background_pid_alive"):
+        blockers.append(
+            "background daemon pid "
+            + str(status.get("background_pid"))
+            + " appears alive"
+        )
+    status["reconcile_apply_blockers"] = blockers
+    return status
+
+
+def _print_reconcile_runtime_warning(status: Dict[str, Any], campaign: Path) -> None:
+    blockers = list(status.get("reconcile_apply_blockers") or [])
+    if not blockers:
+        return
+    print("WARNING: a daemon may still be running for this campaign.", file=sys.stderr)
+    for blocker in blockers:
+        print("  - " + str(blocker), file=sys.stderr)
+    print("Lock: " + _lock_summary(status.get("lock_held")), file=sys.stderr)
+    print("Lease: " + _heartbeat_summary(status.get("lease_heartbeat")), file=sys.stderr)
+    print(
+        "Background pid: "
+        + str(status.get("background_pid"))
+        + " alive="
+        + str(status.get("background_pid_alive")),
+        file=sys.stderr,
+    )
+    print(
+        "Do not apply recovery while the daemon is active. If this daemon should stop, run:",
+        file=sys.stderr,
+    )
+    print(
+        "  ichor-al-daemon stop --campaign-dir "
+        + str(campaign)
+        + " --cancel-jobs",
+        file=sys.stderr,
+    )
 
 
 def _atomic_write_background_pid(pid_path: Path, payload: Dict[str, Any]) -> None:
@@ -1339,11 +1411,13 @@ def _resolve_terminal_submission_intents_for_apply(
     for intent in active_intents:
         phase, iteration = _intent_phase_iteration(intent)
         job_id = str(intent.get("job_id") or "")
+        expected_job_name = str(intent.get("expected_job_name") or "")
         if not phase or iteration < 0:
             blocking.append({
                 "phase": phase,
                 "iteration": iteration,
                 "job_id": job_id,
+                "expected_job_name": expected_job_name,
                 "reason": "submission intent has malformed phase or iteration",
             })
             continue
@@ -1352,6 +1426,7 @@ def _resolve_terminal_submission_intents_for_apply(
                 "phase": phase,
                 "iteration": iteration,
                 "job_id": job_id,
+                "expected_job_name": expected_job_name,
                 "reason": "submission intent has no job_id",
             })
             continue
@@ -1361,6 +1436,7 @@ def _resolve_terminal_submission_intents_for_apply(
                 "phase": phase,
                 "iteration": iteration,
                 "job_id": job_id,
+                "expected_job_name": expected_job_name,
                 "reason": "squeue lookup inconclusive: " + str(queue_lookup.error or "unknown error"),
             })
             continue
@@ -1369,6 +1445,7 @@ def _resolve_terminal_submission_intents_for_apply(
                 "phase": phase,
                 "iteration": iteration,
                 "job_id": job_id,
+                "expected_job_name": expected_job_name,
                 "reason": "job is still active in squeue",
             })
             continue
@@ -1379,6 +1456,7 @@ def _resolve_terminal_submission_intents_for_apply(
                 "phase": phase,
                 "iteration": iteration,
                 "job_id": job_id,
+                "expected_job_name": expected_job_name,
                 "reason": "sacct lookup failed: " + type(exc).__name__ + ": " + str(exc),
             })
             continue
@@ -1391,6 +1469,7 @@ def _resolve_terminal_submission_intents_for_apply(
                 "phase": phase,
                 "iteration": iteration,
                 "job_id": job_id,
+                "expected_job_name": expected_job_name,
                 "reason": reason,
             })
             continue
@@ -1463,6 +1542,36 @@ def _apply_retry_phase_after_cleaned_halt(report, original_report) -> bool:
 
 def cmd_reconcile(args: argparse.Namespace) -> int:
     campaign = resolve_campaign_dir(args.campaign_dir)
+    runtime_status = _reconcile_runtime_status(campaign)
+    if bool(getattr(args, "restore_config_from_lock", False)):
+        if bool(getattr(args, "apply", False)):
+            print(
+                "refusing --restore-config-from-lock together with --apply; "
+                "restore the config proposal first, then run reconcile --apply",
+                file=sys.stderr,
+            )
+            return 2
+        if runtime_status.get("reconcile_apply_blockers"):
+            _print_reconcile_runtime_warning(runtime_status, campaign)
+        try:
+            target_config = restore_config_from_lock_proposal(campaign)
+        except Exception as exc:
+            print(
+                "could not restore campaign.yaml from config lock: "
+                + str(exc),
+                file=sys.stderr,
+            )
+            return 8
+        print("Config proposal written to: " + str(target_config))
+        print("Review the proposal, then promote it manually:")
+        print("    mv " + str(target_config) + " " + str(campaign / "campaign.yaml"))
+        print("Then re-run reconcile:")
+        print("    ichor-al-daemon reconcile --campaign-dir " + str(campaign) + " --apply")
+        return 0
+    if bool(getattr(args, "apply", False)) and runtime_status.get("reconcile_apply_blockers"):
+        print("refusing --apply because a daemon may still be running", file=sys.stderr)
+        _print_reconcile_runtime_warning(runtime_status, campaign)
+        return 9
     report = propose_recovery(
         campaign,
         allow_fresh_init_on_nonempty=bool(getattr(args, "allow_fresh_init", False)),
@@ -1495,6 +1604,12 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     print("Committed model versions:    " + repr(report.committed_model_versions))
     print("Last phase in journal:       " + repr(report.last_phase_in_journal))
     print("Last iteration in journal:   " + repr(report.last_iteration_in_journal))
+    if report.decision:
+        print("Recovery decision:           " + str(report.decision))
+    if report.trusted_artifacts:
+        print("Trusted artefacts:           " + repr(report.trusted_artifacts))
+    if report.blocking_artifacts:
+        print("Blocking artefacts:          " + repr(report.blocking_artifacts))
     if report.unsafe_reasons:
         print("Unsafe recovery reasons:     " + repr(report.unsafe_reasons))
     if report.active_submission_intents:
@@ -1504,10 +1619,17 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 "iteration": i.get("iteration"),
                 "status": i.get("status"),
                 "job_id": i.get("job_id"),
+                "expected_job_name": i.get("expected_job_name"),
             }
             for i in report.active_submission_intents
         ]))
+    if report.recommended_actions:
+        print("Recommended actions:")
+        for action in report.recommended_actions:
+            print("  - " + str(action))
     print("")
+    if not bool(getattr(args, "apply", False)) and runtime_status.get("reconcile_apply_blockers"):
+        _print_reconcile_runtime_warning(runtime_status, campaign)
     target_canonical = target.with_name(DEFAULT_STATE_FILENAME)
     if config_review is not None:
         print("=== Config lock review ===")
@@ -1551,10 +1673,25 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                     + str(item.get("iteration"))
                     + " job_id="
                     + str(item.get("job_id"))
+                    + " expected_job_name="
+                    + str(item.get("expected_job_name"))
                     + ": "
                     + str(item.get("reason")),
                     file=sys.stderr,
                 )
+            print("Next safe command if these jobs should be cancelled:", file=sys.stderr)
+            print(
+                "  ichor-al-daemon stop --campaign-dir "
+                + str(campaign)
+                + " --cancel-jobs",
+                file=sys.stderr,
+            )
+            print(
+                "  ichor-al-daemon reconcile --campaign-dir "
+                + str(campaign)
+                + " --apply",
+                file=sys.stderr,
+            )
             return 9
         if resolved_intents:
             print("Resolved terminal submission intents:")
@@ -1604,6 +1741,18 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             report.notes.append(
                 ".DATA/STAGING cannot be archived automatically: " + staging_reason
             )
+    if "dangling training staging directories exist" in report.unsafe_reasons:
+        ok_to_archive_training, training_reason = training_staging_can_archive_for_reconcile(
+            campaign,
+            report.proposed_state,
+        )
+        if ok_to_archive_training:
+            cleanable_reasons.add("dangling training staging directories exist")
+        else:
+            report.notes.append(
+                "dangling training staging cannot be archived automatically: "
+                + training_reason
+            )
     uncleanable = [
         reason
         for reason in report.unsafe_reasons
@@ -1641,6 +1790,10 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         campaign,
         report.proposed_state,
     ) if "dangling model staging directories exist" in report.unsafe_reasons else []
+    archived_training_staging = archive_training_staging_for_reconcile(
+        campaign,
+        report.proposed_state,
+    ) if "dangling training staging directories exist" in report.unsafe_reasons else []
     removed = clean_reentry_staging(campaign, report.proposed_state.phase)
 
     if original_report.proposed_state.phase is CampaignPhase.HALTED:
@@ -1717,8 +1870,9 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 len(config_review.allowed_changes) if config_review is not None else 0
             ),
             n_removed_stale_paths=len(removed) + len(removed_model_staging),
-            n_archived_staging_paths=len(archived),
+            n_archived_staging_paths=len(archived) + len(archived_training_staging),
             archived_staging_path=(archived[0] if archived else None),
+            archived_training_staging_paths=archived_training_staging,
             n_archived_scripts_paths=len(archived_scripts),
             archived_scripts_path=(archived_scripts[0] if archived_scripts else None),
             recomputed_after_transient_cleanup=(
@@ -1745,6 +1899,10 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     if archived:
         print("Archived stale .DATA/STAGING:")
         for path in archived:
+            print("  - " + path)
+    if archived_training_staging:
+        print("Archived stale training staging:")
+        for path in archived_training_staging:
             print("  - " + path)
     print("")
     print("Start the daemon with:")
@@ -2174,6 +2332,15 @@ Examples:
             "After writing state.json.proposed, safely promote it to state.json, "
             "clean stale uncommitted re-entry staging, and update the campaign "
             "config lock. Refuses locked campaign.yaml changes."
+        ),
+    )
+    p_recon.add_argument(
+        "--restore-config-from-lock",
+        action="store_true",
+        help=(
+            "When campaign.yaml is missing, write campaign.yaml.proposed from "
+            "the locked canonical config. Proposal-only; never overwrites "
+            "campaign.yaml."
         ),
     )
     p_recon.set_defaults(func=cmd_reconcile)
