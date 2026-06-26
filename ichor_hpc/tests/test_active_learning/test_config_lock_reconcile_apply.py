@@ -14,6 +14,7 @@ from ichor.hpc.active_learning.daemon.config_lock import (
     restore_config_from_lock_proposal,
     write_config_lock,
 )
+from ichor.hpc.active_learning.daemon.journal import iter_events
 from ichor.hpc.active_learning.daemon.reconcile import ReconciliationReport
 from ichor.hpc.active_learning.daemon import submission_intent
 from ichor.hpc.active_learning.daemon.state import (
@@ -656,6 +657,92 @@ def test_reconcile_apply_keeps_data_staging_blocked_for_non_ferebus_reentry(tmp_
 
     assert rc == 9
     assert ".DATA/STAGING is non-empty" in err
+    assert stale_file.exists()
+
+
+def test_reconcile_apply_archive_staging_explicitly_handles_non_ferebus_reentry(
+    tmp_path,
+    capsys,
+):
+    campaign = _campaign(tmp_path)
+    _write_pool(campaign)
+    config = CampaignConfig()
+    write_config_lock(campaign, config)
+    _write_config(campaign, config)
+
+    tv = TrainingSetVersioning(campaign / "5_TRAINING")
+    staging = tv.stage(None, 0)
+    (staging / "marker.txt").write_text("training", encoding="utf-8")
+    tv.commit(0)
+    mv = TrainingSetVersioning(campaign / "6_TRAINED_MODELS")
+    staging = mv.stage(None, 0)
+    (staging / "marker.txt").write_text("model", encoding="utf-8")
+    mv.commit(0)
+
+    state = fresh_campaign_state(max_iterations=3)
+    state.phase = CampaignPhase.HALTED
+    state.training_set_version = 0
+    state.models_version = 0
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    data_staging = campaign / ".DATA" / "STAGING"
+    stale_file = data_staging / "GAUSSIAN" / "old.txt"
+    stale_file.parent.mkdir(parents=True)
+    stale_file.write_text("old scratch", encoding="utf-8")
+
+    rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            allow_fresh_init=False,
+            apply=True,
+            restore_config_from_lock=False,
+            archive_staging=True,
+        )
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    archived = sorted((campaign / ".DATA").glob("STAGING.archived-*"))
+    assert len(archived) == 1
+    assert (archived[0] / "GAUSSIAN" / "old.txt").read_text(
+        encoding="utf-8"
+    ) == "old scratch"
+    assert data_staging.is_dir()
+    assert list(data_staging.iterdir()) == []
+    assert "Archived stale .DATA/STAGING" in out
+    recovered = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
+    assert recovered.phase is CampaignPhase.STOP_CHECK
+    events = list(iter_events(campaign / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson"))
+    assert any(e.get("event") == "staging_archived" for e in events)
+
+
+def test_reconcile_apply_archive_staging_refuses_pending_job(tmp_path, capsys):
+    campaign = _campaign(tmp_path)
+    config = CampaignConfig()
+    write_config_lock(campaign, config)
+    _write_config(campaign, config)
+    state = fresh_campaign_state(max_iterations=3)
+    state.phase = CampaignPhase.HALTED
+    state.pending_jobs[CampaignPhase.GAUSSIAN.value] = "12345"
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    data_staging = campaign / ".DATA" / "STAGING"
+    stale_file = data_staging / "GAUSSIAN" / "old.txt"
+    stale_file.parent.mkdir(parents=True)
+    stale_file.write_text("old scratch", encoding="utf-8")
+
+    rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            allow_fresh_init=False,
+            apply=True,
+            restore_config_from_lock=False,
+            archive_staging=True,
+        )
+    )
+    err = capsys.readouterr().err
+
+    assert rc == 9
+    assert "DATA/STAGING is non-empty" in err
+    assert "pending job" in err
     assert stale_file.exists()
 
 

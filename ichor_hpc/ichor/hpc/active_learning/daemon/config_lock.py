@@ -513,6 +513,47 @@ def archive_data_staging_for_ferebus_reentry(
     return [str(target)]
 
 
+def archive_data_staging_for_operator_reconcile(
+    campaign_dir: Union[str, Path],
+) -> List[str]:
+    """Archive ``.DATA/STAGING`` for an explicitly approved reconcile repair.
+
+    Safety checks that depend on daemon state, locks, intents, or scheduler
+    visibility live in the CLI before this mutating helper is called. This
+    helper only validates the filesystem contract and performs a lossless
+    rename; it never deletes staging contents.
+    """
+    campaign = Path(campaign_dir)
+    staging = campaign / ".DATA" / "STAGING"
+    if not staging.exists():
+        return []
+    if staging.is_symlink():
+        raise ValueError("refusing to archive symlinked .DATA/STAGING")
+    if not staging.is_dir():
+        raise ValueError(".DATA/STAGING exists but is not a directory")
+    children = [p for p in staging.iterdir() if p.name not in (".", "..")]
+    if not children:
+        return []
+    for path in staging.rglob("*"):
+        if path.is_symlink():
+            raise ValueError(
+                "refusing to archive .DATA/STAGING containing symlink: "
+                + str(path)
+            )
+    _ensure_inside_campaign(campaign, staging)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    target = staging.with_name(staging.name + ".archived-" + stamp)
+    suffix = 1
+    while target.exists():
+        target = staging.with_name(
+            staging.name + ".archived-" + stamp + "." + str(suffix)
+        )
+        suffix += 1
+    staging.rename(target)
+    staging.mkdir(parents=True, exist_ok=True)
+    return [str(target)]
+
+
 def apply_config_lock_update(
     campaign_dir: Union[str, Path],
     config: CampaignConfig,

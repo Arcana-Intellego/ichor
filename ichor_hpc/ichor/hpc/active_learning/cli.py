@@ -46,6 +46,7 @@ from .daemon.config_lock import (
     apply_config_lock_update,
     archive_scripts_for_reconcile,
     archive_data_staging_for_ferebus_reentry,
+    archive_data_staging_for_operator_reconcile,
     archive_training_staging_for_reconcile,
     assert_config_unchanged_for_start,
     clean_model_iteration_staging_for_reconcile,
@@ -69,6 +70,7 @@ from .daemon.live_executor import (
 from .daemon.phase_executor import MockPhaseExecutor
 from .daemon.preflight import check_backends, missing_backend_message
 from .daemon.reconcile import (
+    data_staging_inventory,
     propose_recovery,
     stateful_campaign_artifacts,
     write_proposed_state,
@@ -398,6 +400,91 @@ def _print_reconcile_runtime_warning(status: Dict[str, Any], campaign: Path) -> 
         + " --cancel-jobs",
         file=sys.stderr,
     )
+
+
+def _read_last_exception_summary(campaign: Path) -> str:
+    path = campaign / DEFAULT_DATA_SUBDIR / "LAST_EXCEPTION.json"
+    if not path.is_file():
+        return "none"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return "unreadable " + type(exc).__name__ + ": " + str(exc)[:100]
+    if not isinstance(payload, dict):
+        return "unreadable: payload is not an object"
+    parts = [
+        str(payload.get("timestamp") or "?"),
+        str(payload.get("exception_type") or "?"),
+        str(payload.get("message") or "")[:120],
+    ]
+    phase = payload.get("phase")
+    iteration = payload.get("iteration")
+    if phase is not None:
+        parts.append("phase=" + str(phase))
+    if iteration is not None:
+        parts.append("iteration=" + str(iteration))
+    return " | ".join(parts)
+
+
+def _format_staging_inventory_summary(inventory: Dict[str, Any]) -> str:
+    if not inventory.get("exists"):
+        return "missing"
+    if inventory.get("is_symlink"):
+        return "unsafe symlink"
+    if not inventory.get("is_dir"):
+        return "not a directory"
+    top_level_count = int(inventory.get("top_level_count") or 0)
+    if top_level_count <= 0:
+        return "empty"
+    sample = ", ".join(str(x) for x in list(inventory.get("top_level_entries") or [])[:5])
+    suffix = ""
+    if sample:
+        suffix = " sample=[" + sample + "]"
+    if inventory.get("has_symlink"):
+        suffix += " has_symlink=true"
+    return (
+        "non-empty top_level="
+        + str(top_level_count)
+        + " total_entries="
+        + str(inventory.get("total_entries"))
+        + " total_bytes="
+        + str(inventory.get("total_bytes"))
+        + suffix
+    )
+
+
+def _operator_staging_archive_blockers(
+    campaign: Path,
+    report: ReconciliationReport,
+    runtime_status: Dict[str, Any],
+) -> List[str]:
+    blockers = list(runtime_status.get("reconcile_apply_blockers") or [])
+    if report.active_submission_intents:
+        blockers.append("active submission intent(s) are present")
+    try:
+        state = read_state(_campaign_paths(campaign)["state"])
+        pending = {
+            str(phase): str(job_id)
+            for phase, job_id in (state.pending_jobs or {}).items()
+            if job_id
+        }
+        if pending:
+            blockers.append("state.json still has pending job(s): " + repr(pending))
+    except FileNotFoundError:
+        pass
+    except StateSchemaError:
+        # Reconcile has already proposed a conservative recovery state; do not
+        # make a corrupt old state an absolute blocker once the operator has
+        # explicitly requested an archive through --apply.
+        pass
+    inventory = data_staging_inventory(campaign)
+    if inventory.get("is_symlink"):
+        blockers.append(".DATA/STAGING is a symlink")
+    if inventory.get("has_symlink"):
+        blockers.append(".DATA/STAGING contains symlink entries")
+    if inventory.get("error"):
+        blockers.append(".DATA/STAGING inventory error: " + str(inventory.get("error")))
+    return blockers
 
 
 def _timestamped_sibling(path: Path, marker: str) -> Path:
@@ -1420,6 +1507,12 @@ def format_recovery_dashboard(campaign_dir: Path) -> str:
                 + str(exc)[:120]
             )
     lines.extend(_section("State", [("state.json", state_status)]))
+    lines.extend(
+        _section(
+            "Last exception",
+            [("LAST_EXCEPTION.json", _read_last_exception_summary(campaign))],
+        )
+    )
 
     lock_status = _probe_daemon_lock(paths["lock"])
     lease_status = _probe_daemon_lease(paths["lease"])
@@ -1467,6 +1560,25 @@ def format_recovery_dashboard(campaign_dir: Path) -> str:
     except Exception as exc:
         pool_status = type(exc).__name__ + ": " + str(exc)[:120]
     lines.extend(_section("Trajectory pool", [("status", pool_status)]))
+
+    staging_inventory = data_staging_inventory(campaign)
+    staging_archive_hint = "not needed"
+    if int(staging_inventory.get("top_level_count") or 0) > 0:
+        staging_archive_hint = (
+            "inspect first; if stale and no active jobs remain, run "
+            "reconcile --archive-staging --apply"
+        )
+    if staging_inventory.get("has_symlink") or staging_inventory.get("is_symlink"):
+        staging_archive_hint = "unsafe: symlink present; inspect manually"
+    lines.extend(
+        _section(
+            "Staging",
+            [
+                ("inventory", _format_staging_inventory_summary(staging_inventory)),
+                ("archive", staging_archive_hint),
+            ],
+        )
+    )
 
     cfg_path = campaign / "campaign.yaml"
     if not cfg_path.is_file():
@@ -1902,12 +2014,26 @@ def _apply_retry_phase_after_cleaned_halt(report, original_report) -> bool:
 
 def cmd_reconcile(args: argparse.Namespace) -> int:
     restore_config = bool(getattr(args, "restore_config_from_lock", False))
+    archive_staging_requested = bool(getattr(args, "archive_staging", False))
     campaign = resolve_campaign_dir(
         args.campaign_dir,
         require_campaign_yaml=not restore_config,
     )
     runtime_status = _reconcile_runtime_status(campaign)
+    if archive_staging_requested and not bool(getattr(args, "apply", False)):
+        print(
+            "refusing --archive-staging without --apply; this option mutates "
+            ".DATA/STAGING and must be explicit",
+            file=sys.stderr,
+        )
+        return 2
     if restore_config:
+        if archive_staging_requested:
+            print(
+                "refusing --restore-config-from-lock together with --archive-staging",
+                file=sys.stderr,
+            )
+            return 2
         if bool(getattr(args, "apply", False)):
             print(
                 "refusing --restore-config-from-lock together with --apply; "
@@ -2103,6 +2229,8 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         "dangling model staging directories exist",
         ".DATA/SCRIPTS contains sbatch scripts",
     }
+    data_staging_archive_mode = None
+    archive_staging_refusal_reasons: List[str] = []
     if ".DATA/STAGING is non-empty" in report.unsafe_reasons:
         ok_to_archive_staging, staging_reason = ferebus_reentry_can_archive_data_staging(
             campaign,
@@ -2110,6 +2238,22 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         )
         if ok_to_archive_staging:
             cleanable_reasons.add(".DATA/STAGING is non-empty")
+            data_staging_archive_mode = "ferebus_reentry"
+        elif archive_staging_requested:
+            archive_blockers = _operator_staging_archive_blockers(
+                campaign,
+                report,
+                runtime_status,
+            )
+            if not archive_blockers:
+                cleanable_reasons.add(".DATA/STAGING is non-empty")
+                data_staging_archive_mode = "operator"
+            else:
+                archive_staging_refusal_reasons = list(archive_blockers)
+                report.notes.append(
+                    ".DATA/STAGING cannot be archived automatically: "
+                    + "; ".join(str(item) for item in archive_blockers)
+                )
         else:
             report.notes.append(
                 ".DATA/STAGING cannot be archived automatically: " + staging_reason
@@ -2139,16 +2283,25 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         )
         for reason in uncleanable:
             print("  - " + reason, file=sys.stderr)
+        if archive_staging_refusal_reasons:
+            print("Archive staging blockers:", file=sys.stderr)
+            for reason in archive_staging_refusal_reasons:
+                print("  - " + str(reason), file=sys.stderr)
         return 9
 
     original_report = report
     archived_scripts = archive_scripts_for_reconcile(
         campaign
     ) if ".DATA/SCRIPTS contains sbatch scripts" in report.unsafe_reasons else []
-    archived = archive_data_staging_for_ferebus_reentry(
-        campaign,
-        report.proposed_state,
-    ) if ".DATA/STAGING is non-empty" in report.unsafe_reasons else []
+    archived = []
+    if ".DATA/STAGING is non-empty" in report.unsafe_reasons:
+        if data_staging_archive_mode == "ferebus_reentry":
+            archived = archive_data_staging_for_ferebus_reentry(
+                campaign,
+                report.proposed_state,
+            )
+        elif data_staging_archive_mode == "operator":
+            archived = archive_data_staging_for_operator_reconcile(campaign)
     removed_model_staging = clean_model_iteration_staging_for_reconcile(
         campaign,
         report.proposed_state,
@@ -2258,6 +2411,15 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     try:
         from .daemon.journal import append_event
 
+        if archived:
+            append_event(
+                campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
+                "staging_archived",
+                phase=report.proposed_state.phase.value,
+                iteration=int(report.proposed_state.iteration),
+                mode=str(data_staging_archive_mode),
+                archived_staging_paths=archived,
+            )
         append_event(
             campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
             "reconcile_applied",
@@ -2744,6 +2906,15 @@ Examples:
             "When campaign.yaml is missing, write campaign.yaml.proposed from "
             "the locked canonical config. Proposal-only; never overwrites "
             "campaign.yaml."
+        ),
+    )
+    p_recon.add_argument(
+        "--archive-staging",
+        action="store_true",
+        help=(
+            "With --apply, archive non-empty .DATA/STAGING to a timestamped "
+            "sibling when no active daemon work or recorded jobs remain. "
+            "Never deletes staging contents."
         ),
     )
     p_recon.set_defaults(func=cmd_reconcile)

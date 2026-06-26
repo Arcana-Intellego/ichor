@@ -45,6 +45,7 @@ def test_daemon_control_menu_items():
         "Stop daemon",
         "Reconcile state",
         "Reconcile and apply safe proposal",
+        "Archive stale staging",
         "Restore campaign.yaml proposal from config lock",
         "Reconcile state with --allow-fresh-init",
     ):
@@ -74,6 +75,37 @@ def test_daemon_control_stop_can_request_job_cancellation(monkeypatch):
     menu_mod.DaemonControlFunctions.stop_daemon()
 
     assert seen["cancel_jobs"] is True
+
+
+def test_daemon_control_archive_staging_dispatches_reconcile(monkeypatch):
+    import ichor.hpc.active_learning.cli as cli_mod
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_submenus import (
+        daemon_control_menu as menu_mod,
+    )
+
+    seen = {}
+
+    def fake_reconcile(ns):
+        seen["apply"] = ns.apply
+        seen["archive_staging"] = ns.archive_staging
+        seen["restore_config_from_lock"] = ns.restore_config_from_lock
+        return 0
+
+    monkeypatch.setattr(
+        menu_mod,
+        "_guarded_campaign_dir_ns",
+        lambda: SimpleNamespace(campaign_dir="/tmp/campaign"),
+    )
+    monkeypatch.setattr(menu_mod, "user_input_free_flow", lambda prompt, default: "YES")
+    monkeypatch.setattr(cli_mod, "cmd_reconcile", fake_reconcile)
+
+    menu_mod.DaemonControlFunctions.reconcile_archive_stale_staging()
+
+    assert seen == {
+        "apply": True,
+        "archive_staging": True,
+        "restore_config_from_lock": False,
+    }
 
 
 def test_edit_campaign_config_menu_items():

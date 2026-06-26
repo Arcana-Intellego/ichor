@@ -1408,6 +1408,32 @@ class Daemon:
                       iteration=state.iteration)
         return TickStatus.HALTED
 
+    def _halt_after_tick_exception(self, exc: Exception) -> bool:
+        """Move the campaign to HALTED after an unexpected tick exception.
+
+        This is deliberately not routed through ``_halt``. A generic daemon
+        exception is not evidence that a submitted Slurm job failed, so pending
+        jobs and active submission intents must remain intact for operator
+        cancellation or reconciliation.
+        """
+        try:
+            state = read_state(self.state_path())
+        except Exception:
+            return False
+        prior_phase = state.phase
+        state.phase = CampaignPhase.HALTED
+        try:
+            self._persist(state)
+        except Exception:
+            return False
+        self._journal(
+            "tick_exception_halted",
+            from_phase=prior_phase.value,
+            iteration=int(state.iteration),
+            error=type(exc).__name__ + ": " + str(exc)[:200],
+        )
+        return True
+
     def _transition_output_contract_error(
         self,
         state: CampaignState,
@@ -1682,6 +1708,9 @@ class Daemon:
             except Exception as exc:
                 self._journal("tick_error", error=type(exc).__name__ + ": " + str(exc)[:200])
                 self._write_last_exception(exc)
+                if bool(getattr(self.config.runtime, "halt_on_tick_exception", True)):
+                    if self._halt_after_tick_exception(exc):
+                        return 0
                 raise
 
             if status in (TickStatus.TERMINAL, TickStatus.HALTED, TickStatus.SHUTDOWN):

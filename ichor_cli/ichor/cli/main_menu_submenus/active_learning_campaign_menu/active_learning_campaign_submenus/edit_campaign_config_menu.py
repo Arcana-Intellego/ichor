@@ -1768,6 +1768,7 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("runtime.transient_phase_retry_max", "int"),
             _spec("runtime.poll_sacct_unknown_max_ticks", "int"),
             _spec("runtime.poll_sacct_missing_max_ticks", "int"),
+            _spec("runtime.halt_on_tick_exception", "bool"),
         ],
     ),
 }

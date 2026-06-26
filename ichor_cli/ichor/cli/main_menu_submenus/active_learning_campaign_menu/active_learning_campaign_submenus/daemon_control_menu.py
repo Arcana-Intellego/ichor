@@ -184,6 +184,32 @@ class DaemonControlFunctions:
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
+    def reconcile_archive_stale_staging():
+        """Archive stale .DATA/STAGING through guarded reconcile --apply."""
+        from ichor.hpc.active_learning.cli import cmd_reconcile
+
+        ns = _guarded_campaign_dir_ns()
+        if ns is None:
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        answer = user_input_free_flow(
+            "Archive stale .DATA/STAGING and apply safe reconcile proposal? Type YES: ",
+            "",
+        )
+        if answer != "YES":
+            print("Cancelled.")
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        ns.allow_fresh_init = False
+        ns.apply = True
+        ns.archive_staging = True
+        ns.restore_config_from_lock = False
+        rc = cmd_reconcile(ns)
+        if rc != 0:
+            print("reconcile --archive-staging --apply returned exit code " + str(rc))
+        user_input_free_flow("Press enter to return to the menu: ", "")
+
+    @staticmethod
     def reconcile_restore_config_from_lock():
         """Write campaign.yaml.proposed from config_lock.json."""
         from ichor.hpc.active_learning.cli import cmd_reconcile
@@ -283,6 +309,10 @@ daemon_control_menu_items = [
     FunctionItem(
         "Reconcile and apply safe proposal",
         DaemonControlFunctions.reconcile_apply,
+    ),
+    FunctionItem(
+        "Archive stale staging",
+        DaemonControlFunctions.reconcile_archive_stale_staging,
     ),
     FunctionItem(
         "Restore campaign.yaml proposal from config lock",

@@ -353,6 +353,12 @@ def format_sampling_protocol_summary(config: CampaignConfig) -> str:
             runtime.poll_sacct_missing_max_ticks,
         )
     )
+    lines.append(
+        _line(
+            "runtime.halt_on_tick_exception",
+            runtime.halt_on_tick_exception,
+        )
+    )
     lines.append(_line("adversarial_safety.enabled", safety.enabled))
     lines.append(
         _line("adversarial_safety.reject_unsafe_landings", safety.reject_unsafe_landings)

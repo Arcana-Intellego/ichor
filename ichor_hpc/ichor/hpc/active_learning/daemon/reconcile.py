@@ -38,6 +38,7 @@ from .state import (
 
 __all__ = [
     "ReconciliationReport",
+    "data_staging_inventory",
     "propose_recovery",
     "stateful_campaign_artifacts",
     "write_proposed_state",
@@ -46,6 +47,78 @@ __all__ = [
 
 
 RECONCILE_SUFFIX = ".proposed"
+
+
+def _iso_from_timestamp(value: float) -> str:
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat()
+
+
+def data_staging_inventory(campaign_dir: Union[str, Path]) -> Dict[str, Any]:
+    """Return a read-only summary of ``.DATA/STAGING``.
+
+    The inventory is intentionally conservative: it never follows symlinks,
+    and failures are returned as diagnostics so recovery dashboards remain
+    usable on partially damaged campaign trees.
+    """
+    campaign = Path(campaign_dir)
+    staging = campaign / ".DATA" / "STAGING"
+    payload: Dict[str, Any] = {
+        "path": str(staging),
+        "exists": staging.exists(),
+        "is_dir": staging.is_dir(),
+        "is_symlink": staging.is_symlink(),
+        "top_level_count": 0,
+        "top_level_entries": [],
+        "total_entries": 0,
+        "total_bytes": 0,
+        "has_symlink": False,
+        "symlink_entries": [],
+        "oldest_mtime_iso": None,
+        "newest_mtime_iso": None,
+        "error": None,
+    }
+    if not staging.exists():
+        return payload
+    if staging.is_symlink():
+        payload["has_symlink"] = True
+        payload["symlink_entries"] = ["."]
+        return payload
+    if not staging.is_dir():
+        payload["error"] = ".DATA/STAGING exists but is not a directory"
+        return payload
+    try:
+        children = sorted(
+            [p for p in staging.iterdir() if p.name not in (".", "..")],
+            key=lambda p: p.name,
+        )
+        payload["top_level_count"] = len(children)
+        payload["top_level_entries"] = [p.name for p in children[:10]]
+        mtimes: List[float] = []
+        for path in [staging] + list(staging.rglob("*")):
+            try:
+                st = path.lstat()
+            except OSError:
+                continue
+            payload["total_entries"] = int(payload["total_entries"]) + 1
+            mtimes.append(float(st.st_mtime))
+            if path.is_symlink():
+                payload["has_symlink"] = True
+                try:
+                    rel = str(path.relative_to(staging))
+                except ValueError:
+                    rel = str(path)
+                payload["symlink_entries"].append(rel)
+                continue
+            if path.is_file():
+                payload["total_bytes"] = int(payload["total_bytes"]) + int(st.st_size)
+        if mtimes:
+            payload["oldest_mtime_iso"] = _iso_from_timestamp(min(mtimes))
+            payload["newest_mtime_iso"] = _iso_from_timestamp(max(mtimes))
+    except Exception as exc:
+        payload["error"] = type(exc).__name__ + ": " + str(exc)[:180]
+    return payload
 
 
 def stateful_campaign_artifacts(campaign_dir: Union[str, Path]) -> List[str]:

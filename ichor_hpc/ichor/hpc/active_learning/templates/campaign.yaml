@@ -364,6 +364,7 @@ runtime:
   transient_phase_retry_max: 1
   poll_sacct_unknown_max_ticks: 3
   poll_sacct_missing_max_ticks: 3
+  halt_on_tick_exception: true
 
 stop:
   alpha0_streak_threshold: 1.0e-2

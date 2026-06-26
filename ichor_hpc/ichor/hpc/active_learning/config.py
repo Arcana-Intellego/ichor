@@ -643,6 +643,7 @@ class RuntimeConfigBlock:
     transient_phase_retry_max: int = 1
     poll_sacct_unknown_max_ticks: int = 3
     poll_sacct_missing_max_ticks: int = 3
+    halt_on_tick_exception: bool = True
 
 
 @dataclass
@@ -1212,6 +1213,10 @@ class CampaignConfig:
             "runtime.poll_sacct_missing_max_ticks",
             self.runtime.poll_sacct_missing_max_ticks,
         )
+        if not isinstance(self.runtime.halt_on_tick_exception, bool):
+            raise ConfigValidationError(
+                "runtime.halt_on_tick_exception must be a boolean"
+            )
         if self.anti_overlap.recent_seeds_cooldown < 0:
             raise ConfigValidationError(
                 "anti_overlap.recent_seeds_cooldown must be >= 0"

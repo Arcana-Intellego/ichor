@@ -476,8 +476,38 @@ def test_postprocess_settle_retries_initially_missing_artifacts(tmp_path):
     assert any(e.get("event") == "postprocess_settle_retry" for e in events)
 
 
-def test_generic_tick_exception_writes_last_exception_sidecar(tmp_path):
+def test_generic_tick_exception_writes_last_exception_sidecar_and_halts(tmp_path):
     d = _make_daemon(tmp_path)
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.PHASE_A_POLUS
+    state.pending_jobs[CampaignPhase.PHASE_A_POLUS.value] = "12345"
+    write_state(d.state_path(), state)
+
+    def raise_tick():
+        raise RuntimeError("simulated tick failure")
+
+    d.tick = raise_tick
+
+    assert d._run_loop(max_ticks=1) == 0
+
+    payload = json.loads(d.last_exception_path().read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1
+    assert payload["exception_type"] == "RuntimeError"
+    assert "simulated tick failure" in payload["message"]
+    assert payload["phase"] == CampaignPhase.PHASE_A_POLUS.value
+    assert payload["iteration"] == 0
+    assert "traceback" in payload
+    recovered = read_state(d.state_path())
+    assert recovered.phase is CampaignPhase.HALTED
+    assert recovered.pending_jobs[CampaignPhase.PHASE_A_POLUS.value] == "12345"
+    events = list(iter_events(d.journal_path()))
+    assert any(e.get("event") == "tick_error" for e in events)
+    assert any(e.get("event") == "tick_exception_halted" for e in events)
+
+
+def test_generic_tick_exception_can_re_raise_when_halt_disabled(tmp_path):
+    d = _make_daemon(tmp_path)
+    d.config.runtime.halt_on_tick_exception = False
     state = fresh_campaign_state(max_iterations=1)
     state.phase = CampaignPhase.PHASE_A_POLUS
     write_state(d.state_path(), state)
@@ -490,13 +520,7 @@ def test_generic_tick_exception_writes_last_exception_sidecar(tmp_path):
     with pytest.raises(RuntimeError, match="simulated tick failure"):
         d._run_loop(max_ticks=1)
 
-    payload = json.loads(d.last_exception_path().read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 1
-    assert payload["exception_type"] == "RuntimeError"
-    assert "simulated tick failure" in payload["message"]
-    assert payload["phase"] == CampaignPhase.PHASE_A_POLUS.value
-    assert payload["iteration"] == 0
-    assert "traceback" in payload
+    assert read_state(d.state_path()).phase is CampaignPhase.PHASE_A_POLUS
 
 
 def test_transient_scheduler_failure_retries_once(tmp_path):

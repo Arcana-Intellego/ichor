@@ -52,6 +52,7 @@ __all__ = [
 #  daemon_interrupted      -- KeyboardInterrupt path
 #  state_corrupt           -- state.json parse failure
 #  tick_error              -- unhandled exception in a tick
+#  tick_exception_halted   -- unhandled exception persisted state as HALTED
 #
 #  Later (provenance ledger) additions:
 #  subspace_built          -- per-iteration count of seeds whose subspace was built
@@ -72,6 +73,7 @@ KNOWN_EVENT_TYPES = (
     "daemon_interrupted",
     "state_corrupt",
     "tick_error",
+    "tick_exception_halted",
     "subspace_built",
     "training_set_committed",
     "seed_selected",
@@ -117,6 +119,7 @@ KNOWN_EVENT_TYPES = (
     "postprocess_settle_retry",
     "phase_pre_submit_intent",
     "phase_submitted",
+    "staging_archived",
 )
 
 

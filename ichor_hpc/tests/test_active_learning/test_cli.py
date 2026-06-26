@@ -100,6 +100,37 @@ def test_recovery_dashboard_reports_invalid_state(tmp_path):
     assert "run reconcile" in text
 
 
+def test_recovery_dashboard_reports_last_exception_and_staging(tmp_path):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    (data / "LAST_EXCEPTION.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "timestamp": "2026-01-02T03:04:05+00:00",
+                "exception_type": "RuntimeError",
+                "message": "boom",
+                "phase": "GAUSSIAN",
+                "iteration": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+    staging = campaign / ".DATA" / "STAGING" / "GAUSSIAN"
+    staging.mkdir(parents=True)
+    (staging / "old.txt").write_text("old", encoding="utf-8")
+
+    text = cli_mod.format_recovery_dashboard(campaign)
+
+    assert "Last exception" in text
+    assert "RuntimeError" in text
+    assert "boom" in text
+    assert "Staging" in text
+    assert "non-empty top_level=1" in text
+    assert "reconcile --archive-staging --apply" in text
+
+
 def test_recovery_dashboard_reports_active_intents(tmp_path):
     campaign = _campaign_with_config(tmp_path)
     submission_intent.write_pre_submit_intent(
