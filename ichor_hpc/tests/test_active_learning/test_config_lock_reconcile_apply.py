@@ -10,6 +10,7 @@ from ichor.hpc.active_learning.daemon import config_lock as config_lock_mod
 from ichor.hpc.active_learning.daemon.config_lock import (
     config_lock_path,
     review_config_changes,
+    restore_config_from_lock_proposal,
     write_config_lock,
 )
 from ichor.hpc.active_learning.daemon.reconcile import ReconciliationReport
@@ -305,6 +306,53 @@ def test_reconcile_restore_config_from_lock_writes_proposal(tmp_path, capsys):
     assert "Config proposal written" in out
     restored = CampaignConfig.from_yaml(proposed)
     assert restored.system_name == "RESTORED"
+
+
+def test_reconcile_restore_config_from_lock_uses_current_directory(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign(tmp_path)
+    config = CampaignConfig()
+    config.system_name = "RESTORED_CWD"
+    write_config_lock(campaign, config)
+    monkeypatch.chdir(campaign)
+
+    rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=None,
+            allow_fresh_init=False,
+            apply=False,
+            restore_config_from_lock=True,
+        )
+    )
+    capsys.readouterr()
+
+    proposed = campaign / "campaign.yaml.proposed"
+    assert rc == 0
+    assert proposed.is_file()
+    restored = CampaignConfig.from_yaml(proposed)
+    assert restored.system_name == "RESTORED_CWD"
+
+
+def test_restore_config_from_lock_archives_existing_proposal(tmp_path):
+    campaign = _campaign(tmp_path)
+    config = CampaignConfig()
+    config.system_name = "RESTORED_ARCHIVE"
+    write_config_lock(campaign, config)
+    old_proposal = campaign / "campaign.yaml.proposed"
+    old_proposal.write_text("old proposal marker\n", encoding="utf-8")
+
+    target = restore_config_from_lock_proposal(campaign)
+
+    archived = sorted(campaign.glob("campaign.yaml.proposed.before-*"))
+    assert target == old_proposal
+    assert target.is_file()
+    assert len(archived) == 1
+    assert archived[0].read_text(encoding="utf-8") == "old proposal marker\n"
+    restored = CampaignConfig.from_yaml(target)
+    assert restored.system_name == "RESTORED_ARCHIVE"
 
 
 def test_reconcile_restore_config_from_lock_refuses_existing_campaign_yaml(

@@ -549,6 +549,16 @@ def restore_config_from_lock_proposal(campaign_dir: Union[str, Path]) -> Path:
         raise ValueError("config lock does not contain canonical_config")
     config = CampaignConfig.from_dict(config_payload)
     target = campaign / "campaign.yaml.proposed"
+    if target.exists():
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        archive = target.with_name(target.name + ".before-" + stamp)
+        suffix = 1
+        while archive.exists():
+            archive = target.with_name(
+                target.name + ".before-" + stamp + "." + str(suffix)
+            )
+            suffix += 1
+        target.rename(archive)
     config.to_yaml_dense(target)
     return target
 
