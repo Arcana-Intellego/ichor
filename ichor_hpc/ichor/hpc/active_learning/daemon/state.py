@@ -120,6 +120,8 @@ def _coerce_sacct_empty_streak(payload: Dict[str, Any]) -> Dict[str, int]:
             parsed[str(key)] = int(value)
         except (TypeError, ValueError) as exc:
             raise StateSchemaError("sacct_empty_streak values must be integers") from exc
+        if parsed[str(key)] < 0:
+            raise StateSchemaError("sacct_empty_streak values must be >= 0")
     return parsed
 
 
@@ -196,17 +198,40 @@ class CampaignState:
             if not isinstance(payload.get(key), str) or not payload[key]:
                 raise StateSchemaError("missing or non-string field: " + key)
         for key in required_int:
-            if not isinstance(payload.get(key), int):
+            if not isinstance(payload.get(key), int) or isinstance(payload.get(key), bool):
                 raise StateSchemaError("missing or non-int field: " + key)
+        iteration = int(payload["iteration"])
+        max_iterations = int(payload["max_iterations"])
+        training_set_version = int(payload["training_set_version"])
+        validation_set_version = int(payload["validation_set_version"])
+        models_version = int(payload["models_version"])
+        stop_streak = int(payload["stop_streak"])
+        if iteration < 0:
+            raise StateSchemaError("iteration must be >= 0")
+        if max_iterations < 1:
+            raise StateSchemaError("max_iterations must be >= 1")
+        if training_set_version < -1:
+            raise StateSchemaError("training_set_version must be >= -1")
+        if validation_set_version < -1:
+            raise StateSchemaError("validation_set_version must be >= -1")
+        if models_version < -1:
+            raise StateSchemaError("models_version must be >= -1")
+        if stop_streak < 0:
+            raise StateSchemaError("stop_streak must be >= 0")
 
         pending = payload.get("pending_jobs", {})
         if not isinstance(pending, dict):
             raise StateSchemaError("pending_jobs must be an object")
+        known_phase_values = {phase.value for phase in CampaignPhase}
         for k, v in pending.items():
             if not isinstance(k, str):
                 raise StateSchemaError("pending_jobs key must be string")
+            if k not in known_phase_values:
+                raise StateSchemaError("pending_jobs key is not a known phase: " + repr(k))
             if v is not None and not isinstance(v, str):
                 raise StateSchemaError("pending_jobs value must be string or null")
+            if isinstance(v, str) and not v:
+                raise StateSchemaError("pending_jobs value must be non-empty string or null")
 
         alpha0 = payload.get("last_acquisition_alpha0")
         if alpha0 is not None and not _is_finite_number(alpha0):
@@ -228,30 +253,38 @@ class CampaignState:
                     "reference_scales must be null or an object of string -> finite number"
                 )
 
+        reference_scales_iteration = _coerce_state_int(
+            payload,
+            "reference_scales_iteration",
+            -1,
+        )
+        if reference_scales_iteration < -1:
+            raise StateSchemaError("reference_scales_iteration must be >= -1")
+        last_n_anti_overlap_flagged = _coerce_state_int(
+            payload,
+            "last_n_anti_overlap_flagged",
+            0,
+        )
+        if last_n_anti_overlap_flagged < 0:
+            raise StateSchemaError("last_n_anti_overlap_flagged must be >= 0")
+        sacct_empty_streak = _coerce_sacct_empty_streak(payload)
+
         return cls(
-            iteration=int(payload["iteration"]),
-            max_iterations=int(payload["max_iterations"]),
+            iteration=iteration,
+            max_iterations=max_iterations,
             phase=phase,
             pending_jobs=dict(pending),
-            training_set_version=int(payload["training_set_version"]),
-            validation_set_version=int(payload["validation_set_version"]),
-            models_version=int(payload["models_version"]),
+            training_set_version=training_set_version,
+            validation_set_version=validation_set_version,
+            models_version=models_version,
             last_acquisition_alpha0=None if alpha0 is None else float(alpha0),
-            stop_streak=int(payload["stop_streak"]),
+            stop_streak=stop_streak,
             shutdown_requested=bool(payload.get("shutdown_requested", False)),
             reference_scales=payload.get("reference_scales"),
-            reference_scales_iteration=_coerce_state_int(
-                payload,
-                "reference_scales_iteration",
-                -1,
-            ),
+            reference_scales_iteration=reference_scales_iteration,
             alpha_history=_coerce_alpha_history(payload),
-            last_n_anti_overlap_flagged=_coerce_state_int(
-                payload,
-                "last_n_anti_overlap_flagged",
-                0,
-            ),
-            sacct_empty_streak=_coerce_sacct_empty_streak(payload),
+            last_n_anti_overlap_flagged=last_n_anti_overlap_flagged,
+            sacct_empty_streak=sacct_empty_streak,
             schema_version=schema,
             campaign_uid=str(payload["campaign_uid"]),
             campaign_started_iso=str(payload["campaign_started_iso"]),

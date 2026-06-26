@@ -41,7 +41,7 @@ from .daemon.daemon import (
     DEFAULT_DATA_SUBDIR,
     Daemon,
 )
-from .daemon.journal import iter_events, read_events
+from .daemon.journal import KNOWN_EVENT_TYPES, iter_events, read_events
 from .daemon.config_lock import (
     apply_config_lock_update,
     archive_scripts_for_reconcile,
@@ -50,6 +50,7 @@ from .daemon.config_lock import (
     assert_config_unchanged_for_start,
     clean_model_iteration_staging_for_reconcile,
     clean_reentry_staging,
+    config_lock_path,
     ferebus_reentry_can_archive_data_staging,
     format_config_review,
     review_config_changes,
@@ -1388,6 +1389,150 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def format_recovery_dashboard(campaign_dir: Path) -> str:
+    """Return a read-only recovery dashboard for a campaign directory."""
+    campaign = Path(campaign_dir).expanduser().resolve()
+    paths = _campaign_paths(campaign)
+    lines: List[str] = [
+        "Recovery dashboard",
+        "Campaign: " + str(campaign),
+        "",
+    ]
+
+    state = None
+    state_status = "missing"
+    state_invalid = False
+    if paths["state"].is_file():
+        try:
+            state = read_state(paths["state"])
+            state_status = (
+                "present phase="
+                + state.phase.value
+                + " iteration="
+                + str(state.iteration)
+            )
+        except Exception as exc:
+            state_invalid = True
+            state_status = (
+                "invalid "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:120]
+            )
+    lines.extend(_section("State", [("state.json", state_status)]))
+
+    lock_status = _probe_daemon_lock(paths["lock"])
+    lease_status = _probe_daemon_lease(paths["lease"])
+    background = _probe_background_daemon(
+        paths["background_pid"],
+        paths["background_log"],
+    )
+    lines.extend(
+        _section(
+            "Runtime",
+            [
+                ("daemon lock", _lock_summary(lock_status.get("lock_held"))),
+                ("lease", _heartbeat_summary(lease_status.get("lease_heartbeat"))),
+                (
+                    "background pid",
+                    str(background.get("background_pid"))
+                    + " alive="
+                    + str(background.get("background_pid_alive")),
+                ),
+            ],
+        )
+    )
+
+    intents = _load_active_submission_intents(campaign)
+    intent_summary = str(len(intents))
+    if intents:
+        sample = [
+            str(item.get("phase"))
+            + "@"
+            + str(item.get("iteration"))
+            + " "
+            + str(item.get("status"))
+            + " job_id="
+            + str(item.get("job_id"))
+            for item in intents[:5]
+        ]
+        intent_summary += " (" + "; ".join(sample) + ")"
+    lines.extend(_section("Submission intents", [("active", intent_summary)]))
+
+    try:
+        from .acquisition.trajectory_pool import TrajectoryPool
+
+        pool = TrajectoryPool.load(campaign)
+        pool_status = "ok sha=" + str(pool.sha256)[:12]
+    except Exception as exc:
+        pool_status = type(exc).__name__ + ": " + str(exc)[:120]
+    lines.extend(_section("Trajectory pool", [("status", pool_status)]))
+
+    cfg_path = campaign / "campaign.yaml"
+    if not cfg_path.is_file():
+        if config_lock_path(campaign).is_file():
+            config_status = "campaign.yaml missing; config lock present"
+        else:
+            config_status = "campaign.yaml missing; config lock missing"
+    else:
+        try:
+            cfg = CampaignConfig.from_yaml(cfg_path)
+            if state is None:
+                config_status = "loaded; state unavailable for lock review"
+            else:
+                review = review_config_changes(
+                    campaign,
+                    cfg,
+                    state,
+                    initialise_missing=False,
+                )
+                if review.blocked_changes:
+                    config_status = (
+                        "blocked changes: "
+                        + str(len(review.blocked_changes))
+                    )
+                elif review.allowed_changes:
+                    config_status = (
+                        "allowed changes: "
+                        + str(len(review.allowed_changes))
+                    )
+                elif review.changed:
+                    config_status = "changed"
+                else:
+                    config_status = "clean"
+        except Exception as exc:
+            config_status = type(exc).__name__ + ": " + str(exc)[:120]
+    lines.extend(_section("Config lock", [("status", config_status)]))
+
+    recommendation = "start/resume is safe"
+    try:
+        report = propose_recovery(campaign)
+        if report.unsafe_reasons:
+            recommendation = "run reconcile and inspect unsafe artefacts"
+        elif state_invalid:
+            recommendation = "run reconcile"
+        elif state is None:
+            artefacts = stateful_campaign_artifacts(campaign)
+            recommendation = (
+                "run reconcile"
+                if artefacts
+                else "start/resume is safe for clean first run"
+            )
+    except Exception as exc:
+        recommendation = "run reconcile; recovery probe failed: " + str(exc)[:120]
+    if (
+        intents
+        or lock_status.get("lock_held")
+        or _lease_is_fresh(lease_status.get("lease_heartbeat"))
+        or background.get("background_pid_alive")
+    ):
+        recommendation = "stop --cancel-jobs first, then rerun reconcile"
+    if not cfg_path.is_file() and config_lock_path(campaign).is_file():
+        recommendation = "restore campaign.yaml from config lock"
+    lines.extend(_section("Recommendation", [("next action", recommendation)]))
+    return "\n".join(lines) + "\n"
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     campaign = resolve_campaign_dir(args.campaign_dir)
     paths = _campaign_paths(campaign)
@@ -2166,6 +2311,10 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
 
 def cmd_journal(args: argparse.Namespace) -> int:
     campaign = resolve_campaign_dir(args.campaign_dir)
+    if bool(getattr(args, "list_event_types", False)):
+        for event_type in sorted(KNOWN_EVENT_TYPES):
+            print(event_type)
+        return 0
     journal_path = _campaign_paths(campaign)["journal"]
     if not journal_path.exists():
         print("no journal at " + str(journal_path), file=sys.stderr)
@@ -2652,6 +2801,11 @@ Examples:
         "--verbose",
         action="store_true",
         help="Print expanded key/value details for each event.",
+    )
+    p_jrn.add_argument(
+        "--list-event-types",
+        action="store_true",
+        help="Print known daemon journal event names and exit.",
     )
     p_jrn.set_defaults(func=cmd_journal)
 

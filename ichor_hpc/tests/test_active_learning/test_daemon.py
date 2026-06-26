@@ -476,6 +476,29 @@ def test_postprocess_settle_retries_initially_missing_artifacts(tmp_path):
     assert any(e.get("event") == "postprocess_settle_retry" for e in events)
 
 
+def test_generic_tick_exception_writes_last_exception_sidecar(tmp_path):
+    d = _make_daemon(tmp_path)
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.PHASE_A_POLUS
+    write_state(d.state_path(), state)
+
+    def raise_tick():
+        raise RuntimeError("simulated tick failure")
+
+    d.tick = raise_tick
+
+    with pytest.raises(RuntimeError, match="simulated tick failure"):
+        d._run_loop(max_ticks=1)
+
+    payload = json.loads(d.last_exception_path().read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1
+    assert payload["exception_type"] == "RuntimeError"
+    assert "simulated tick failure" in payload["message"]
+    assert payload["phase"] == CampaignPhase.PHASE_A_POLUS.value
+    assert payload["iteration"] == 0
+    assert "traceback" in payload
+
+
 def test_transient_scheduler_failure_retries_once(tmp_path):
     d = _make_daemon(tmp_path, sacct=_node_fail_poll)
     d.tick()

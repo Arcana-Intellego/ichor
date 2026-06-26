@@ -100,6 +100,23 @@ KNOWN_EVENT_TYPES = (
     "reconcile_applied",
     "committed_artifact_settle_retry",
     "ariadne_optional_diagnostics_warning",
+    "resolved_phase_resources",
+    "reconcile_resolved_terminal_intent",
+    "operator_cancelled_jobs",
+    "sacct_unknown_timeout",
+    "sacct_missing_timeout",
+    "sacct_rows_missing_but_squeue_active",
+    "squeue_liveness_inconclusive",
+    "transient_phase_retry",
+    "job_adopt_check_failed",
+    "adopted_inflight_job",
+    "submission_intent_update_failed",
+    "submission_intent_read_failed",
+    "provenance_index_repaired",
+    "provenance_index_repair_failed",
+    "postprocess_settle_retry",
+    "phase_pre_submit_intent",
+    "phase_submitted",
 )
 
 

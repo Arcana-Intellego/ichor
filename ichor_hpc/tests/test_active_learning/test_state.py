@@ -146,6 +146,47 @@ def test_read_state_rejects_non_string_pending_job_value(tmp_path):
         read_state(p)
 
 
+@pytest.mark.parametrize(
+    "field,value,match",
+    [
+        ("iteration", -1, "iteration"),
+        ("max_iterations", 0, "max_iterations"),
+        ("training_set_version", -2, "training_set_version"),
+        ("validation_set_version", -2, "validation_set_version"),
+        ("models_version", -2, "models_version"),
+        ("stop_streak", -1, "stop_streak"),
+        ("reference_scales_iteration", -2, "reference_scales_iteration"),
+        ("last_n_anti_overlap_flagged", -1, "last_n_anti_overlap_flagged"),
+    ],
+)
+def test_read_state_rejects_invalid_integer_ranges(field, value, match):
+    payload = fresh_campaign_state().to_dict()
+    payload[field] = value
+    with pytest.raises(StateSchemaError, match=match):
+        CampaignState.from_dict(payload)
+
+
+def test_read_state_rejects_negative_sacct_empty_streak_value():
+    payload = fresh_campaign_state().to_dict()
+    payload["sacct_empty_streak"] = {"123": -1}
+    with pytest.raises(StateSchemaError, match="sacct_empty_streak"):
+        CampaignState.from_dict(payload)
+
+
+def test_read_state_rejects_unknown_pending_job_phase():
+    payload = fresh_campaign_state().to_dict()
+    payload["pending_jobs"] = {"NOT_A_PHASE": "123"}
+    with pytest.raises(StateSchemaError, match="pending_jobs key"):
+        CampaignState.from_dict(payload)
+
+
+def test_read_state_rejects_empty_pending_job_id():
+    payload = fresh_campaign_state().to_dict()
+    payload["pending_jobs"] = {CampaignPhase.FEREBUS.value: ""}
+    with pytest.raises(StateSchemaError, match="pending_jobs value"):
+        CampaignState.from_dict(payload)
+
+
 def test_state_is_terminal_flag():
     s = fresh_campaign_state()
     assert not s.is_terminal

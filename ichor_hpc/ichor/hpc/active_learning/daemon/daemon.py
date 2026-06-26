@@ -83,6 +83,7 @@ DAEMON_LEASE_DIRNAME = "daemon.lease.d"
 DAEMON_HEARTBEAT_FILENAME = "heartbeat.json"
 TRANSIENT_RETRY_LEDGER_FILENAME = "transient_retries.json"
 JOURNAL_FILENAME = "journal.ndjson"
+LAST_EXCEPTION_FILENAME = "LAST_EXCEPTION.json"
 
 PHASE_ORDER: Tuple[CampaignPhase, ...] = (
     CampaignPhase.INIT,
@@ -218,6 +219,9 @@ class Daemon:
 
     def journal_path(self) -> Path:
         return self.data_dir() / JOURNAL_FILENAME
+
+    def last_exception_path(self) -> Path:
+        return self.data_dir() / LAST_EXCEPTION_FILENAME
 
     # --- lock + lifecycle ----------------------------------------------
 
@@ -425,6 +429,31 @@ class Daemon:
             append_event(self.journal_path(), event_type, **payload)
         except Exception:
             # Journal writes are best-effort; never let logging crash the daemon.
+            pass
+
+    def _write_last_exception(self, exc: Exception) -> None:
+        from datetime import datetime, timezone
+        import traceback
+
+        payload: Dict[str, Any] = {
+            "schema_version": 1,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "exception_type": type(exc).__name__,
+            "message": str(exc),
+            "traceback": "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            ),
+        }
+        try:
+            state = read_state(self.state_path())
+            payload["phase"] = state.phase.value
+            payload["iteration"] = int(state.iteration)
+            payload["pending_jobs"] = dict(state.pending_jobs)
+        except Exception:
+            pass
+        try:
+            atomic_write_json(self.last_exception_path(), payload)
+        except Exception:
             pass
 
     # --- state-machine step --------------------------------------------
@@ -1652,6 +1681,7 @@ class Daemon:
                 return 2
             except Exception as exc:
                 self._journal("tick_error", error=type(exc).__name__ + ": " + str(exc)[:200])
+                self._write_last_exception(exc)
                 raise
 
             if status in (TickStatus.TERMINAL, TickStatus.HALTED, TickStatus.SHUTDOWN):

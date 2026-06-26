@@ -37,6 +37,7 @@ def test_daemon_control_menu_items():
     for expected in (
         "Show status",
         "Show sampling protocol summary",
+        "Recovery dashboard",
         "Preflight backends",
         "Initialise Campaign / Import Trajectory Pool",
         "Start/Resume Daemon (Foreground)",

@@ -78,6 +78,82 @@ def test_cli_preflight_prints_structured_backend_status(capsys, monkeypatch):
     assert payload["python_executable"].endswith("ichor-al-csf3/bin/python")
 
 
+def test_recovery_dashboard_reports_missing_state(tmp_path):
+    campaign = _campaign_with_config(tmp_path)
+
+    text = cli_mod.format_recovery_dashboard(campaign)
+
+    assert "Recovery dashboard" in text
+    assert "state.json: missing" in text
+    assert "start/resume is safe for clean first run" in text
+
+
+def test_recovery_dashboard_reports_invalid_state(tmp_path):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    (data / DEFAULT_STATE_FILENAME).write_text("{bad json", encoding="utf-8")
+
+    text = cli_mod.format_recovery_dashboard(campaign)
+
+    assert "state.json: invalid" in text
+    assert "run reconcile" in text
+
+
+def test_recovery_dashboard_reports_active_intents(tmp_path):
+    campaign = _campaign_with_config(tmp_path)
+    submission_intent.write_pre_submit_intent(
+        campaign,
+        campaign_uid="uid123456789",
+        phase_name=CampaignPhase.INITIAL_FEREBUS.value,
+        iteration=0,
+    )
+
+    text = cli_mod.format_recovery_dashboard(campaign)
+
+    assert "Submission intents" in text
+    assert "INITIAL_FEREBUS@0 PRE_SUBMIT" in text
+    assert "stop --cancel-jobs first" in text
+
+
+def test_recovery_dashboard_reports_trajectory_pool_sha_mismatch(tmp_path):
+    from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
+
+    campaign = _campaign_with_config(tmp_path)
+    source = tmp_path / "pool.xyz"
+    source.write_text(
+        "1\n"
+        "frame 0\n"
+        "H 0.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    TrajectoryPool.import_from(
+        source,
+        campaign,
+        overwrite=True,
+        outlier_filter_enabled=False,
+    )
+    pool_xyz = campaign / ".DATA" / "TRAJECTORY" / "pool.xyz"
+    with pool_xyz.open("a", encoding="utf-8") as f:
+        f.write("# drift\n")
+
+    text = cli_mod.format_recovery_dashboard(campaign)
+
+    assert "Trajectory pool" in text
+    assert "pool drift detected" in text
+
+
+def test_journal_list_event_types_does_not_require_journal_file(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+
+    rc = main(["journal", "--campaign-dir", str(campaign), "--list-event-types"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "reconcile_applied" in out
+    assert "phase_submitted" in out
+
+
 def test_cli_status_json_prints_state_payload(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
     (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)

@@ -111,6 +111,19 @@ class DaemonControlFunctions:
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
+    def show_recovery_dashboard():
+        from ichor.hpc.active_learning.cli import format_recovery_dashboard
+
+        try:
+            campaign_dir = selected_campaign_dir()
+        except CampaignSelectionError as exc:
+            print_campaign_selection_error(exc)
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        print(format_recovery_dashboard(campaign_dir))
+        user_input_free_flow("Press enter to return to the menu: ", "")
+
+    @staticmethod
     def stop_daemon():
         """Set shutdown_requested=true in state.json so the running daemon
         finishes its current tick and exits cleanly on the next."""
@@ -244,6 +257,10 @@ daemon_control_menu_items = [
     FunctionItem(
         "Show sampling protocol summary",
         DaemonControlFunctions.show_sampling_protocol_summary,
+    ),
+    FunctionItem(
+        "Recovery dashboard",
+        DaemonControlFunctions.show_recovery_dashboard,
     ),
     FunctionItem("Preflight backends", DaemonControlFunctions.preflight_backends),
     SubmenuItem(
