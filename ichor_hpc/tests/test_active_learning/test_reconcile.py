@@ -10,6 +10,7 @@ from ichor.hpc.active_learning.daemon.reconcile import (
     RECONCILE_SUFFIX,
     ReconciliationReport,
     propose_recovery,
+    stateful_campaign_artifacts,
     write_proposed_state,
 )
 from ichor.hpc.active_learning.daemon.state import (
@@ -69,6 +70,15 @@ def test_propose_recovery_missing_state_nonempty_staging_halts(tmp_path):
     assert report.proposed_state.phase is CampaignPhase.HALTED
     assert any("non-empty campaign" in n for n in report.notes)
     assert report.unsafe_reasons
+
+
+def test_stateful_campaign_artifacts_include_config_lock(tmp_path):
+    campaign, data, _, _ = _campaign_dirs(tmp_path)
+    (data / "config_lock.json").write_text("{}", encoding="utf-8")
+
+    findings = stateful_campaign_artifacts(campaign)
+
+    assert ".DATA/ACTIVE_LEARNING/config_lock.json" in findings
 
 
 def test_propose_recovery_active_submission_intent_is_adoption_ready(tmp_path):

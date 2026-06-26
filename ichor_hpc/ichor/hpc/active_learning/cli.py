@@ -509,12 +509,35 @@ def _copy_existing_timestamped(path: Path, marker: str) -> Optional[Path]:
     return target
 
 
+def _restore_state_from_backup_atomic(
+    target: Path,
+    backup_path: Optional[Path],
+) -> None:
+    if backup_path is None:
+        try:
+            target.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    restored_state = read_state(backup_path)
+    write_state(target, restored_state)
+
+
 def _rename_existing_timestamped(path: Path, marker: str) -> Optional[Path]:
     if not path.exists():
         return None
     target = _timestamped_sibling(path, marker)
     path.rename(target)
     return target
+
+
+def _print_cleanup_already_happened(paths: Sequence[str]) -> None:
+    if not paths:
+        return
+    print("Some cleanup/archive operations already happened:", file=sys.stderr)
+    for path in paths:
+        print("  - " + str(path), file=sys.stderr)
+    print("State/config lock was not applied.", file=sys.stderr)
 
 
 def _atomic_write_background_pid(pid_path: Path, payload: Dict[str, Any]) -> None:
@@ -1808,6 +1831,16 @@ def _resolve_terminal_submission_intents_for_apply(
             continue
         if not job_id:
             if status == "PRE_SUBMIT":
+                if phase in _FEREBUS_JOB_NAME_EXTERNAL_PHASES:
+                    blocking.append({
+                        "phase": phase,
+                        "iteration": iteration,
+                        "job_id": job_id,
+                        "expected_job_name": expected_job_name,
+                        "reason": "FEREBUS PRE_SUBMIT intent has no job_id; "
+                        "job name is external, inspect scheduler manually",
+                    })
+                    continue
                 if not expected_job_name:
                     blocking.append({
                         "phase": phase,
@@ -2311,6 +2344,13 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         report.proposed_state,
     ) if "dangling training staging directories exist" in report.unsafe_reasons else []
     removed = clean_reentry_staging(campaign, report.proposed_state.phase)
+    cleanup_paths_already_done = (
+        list(archived_scripts)
+        + list(archived)
+        + list(removed_model_staging)
+        + list(archived_training_staging)
+        + list(removed)
+    )
 
     if original_report.proposed_state.phase is CampaignPhase.HALTED:
         report = propose_recovery(
@@ -2329,6 +2369,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 )
             except Exception as exc:
                 print("campaign config could not be reviewed: " + str(exc), file=sys.stderr)
+                _print_cleanup_already_happened(cleanup_paths_already_done)
                 return 8
         if report.unsafe_reasons:
             print(
@@ -2337,6 +2378,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             )
             for reason in report.unsafe_reasons:
                 print("  - " + reason, file=sys.stderr)
+            _print_cleanup_already_happened(cleanup_paths_already_done)
             return 9
         if report.proposed_state.phase in (CampaignPhase.HALTED, CampaignPhase.DONE):
             print(
@@ -2345,10 +2387,12 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 + " after cleanup",
                 file=sys.stderr,
             )
+            _print_cleanup_already_happened(cleanup_paths_already_done)
             return 9
         if config_review is not None and config_review.blocked_changes:
             print("refusing --apply because campaign.yaml has locked changes", file=sys.stderr)
             print(format_config_review(config_review), file=sys.stderr)
+            _print_cleanup_already_happened(cleanup_paths_already_done)
             return 8
 
     backup_path = _copy_existing_timestamped(
@@ -2365,27 +2409,33 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             + str(exc),
             file=sys.stderr,
         )
+        _print_cleanup_already_happened(cleanup_paths_already_done)
         return 9
     try:
         apply_config_lock_update(campaign, config)
     except Exception as exc:
-        if backup_path is not None:
-            import shutil
-
-            shutil.copy2(backup_path, target_canonical)
-        else:
-            try:
-                target_canonical.unlink()
-            except FileNotFoundError:
-                pass
+        try:
+            _restore_state_from_backup_atomic(target_canonical, backup_path)
+            restore_message = "restored the previous state.json"
+        except Exception as restore_exc:
+            restore_message = (
+                "could not restore the previous state.json atomically from "
+                + str(backup_path)
+                + ": "
+                + type(restore_exc).__name__
+                + ": "
+                + str(restore_exc)
+            )
         print(
             "failed to update config lock after writing state.json; "
-            "restored the previous state.json: "
+            + restore_message
+            + ": "
             + type(exc).__name__
             + ": "
             + str(exc),
             file=sys.stderr,
         )
+        _print_cleanup_already_happened(cleanup_paths_already_done)
         return 8
     for intent_path in sorted(
         (campaign / DEFAULT_DATA_SUBDIR / "submission_intents").glob("*.json")

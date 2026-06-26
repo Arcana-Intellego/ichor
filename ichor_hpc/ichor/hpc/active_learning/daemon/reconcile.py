@@ -141,6 +141,9 @@ def stateful_campaign_artifacts(campaign_dir: Union[str, Path]) -> List[str]:
     add_matches("7_ACTIVE_LEARNING/iteration-*")
     if (campaign / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson").is_file():
         findings.append(".DATA/ACTIVE_LEARNING/journal.ndjson")
+    config_lock = campaign / ".DATA" / "ACTIVE_LEARNING" / "config_lock.json"
+    if config_lock.is_file():
+        findings.append(".DATA/ACTIVE_LEARNING/config_lock.json")
     proposed_state = (
         campaign
         / ".DATA"
