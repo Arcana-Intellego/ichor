@@ -325,6 +325,94 @@ def test_cli_stop_cancel_jobs_cancels_ferebus_intent_with_external_job_name(
     assert intent["reason"] == "operator_cancelled_via_stop"
 
 
+def test_cli_stop_cancel_jobs_uses_intents_when_state_missing(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    phase = CampaignPhase.INITIAL_GAUSSIAN.value
+    submission_intent.write_pre_submit_intent(
+        campaign,
+        campaign_uid="uid123456789",
+        phase_name=phase,
+        iteration=0,
+    )
+    submission_intent.mark_submitted(campaign, phase, 0, "999")
+    expected_name = live_job_name("uid123456789", phase, 0)
+    cancelled = []
+    monkeypatch.setattr(
+        cli_mod,
+        "_lookup_active_slurm_job_for_cancel",
+        lambda job_id: {
+            "active": True,
+            "inconclusive": False,
+            "rows": [{"job_id": str(job_id), "state": "RUNNING", "job_name": expected_name}],
+            "error": None,
+        },
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_run_scancel",
+        lambda job_id: (cancelled.append(str(job_id)) or (True, "")),
+    )
+
+    rc = main(["stop", "--campaign-dir", str(campaign), "--cancel-jobs"])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "state.json is missing" in captured.err
+    assert cancelled == ["999"]
+    intent = submission_intent.load_intent(campaign, phase, 0)
+    assert intent["status"] == "FAILED"
+    assert intent["reason"] == "operator_cancelled_via_stop"
+
+
+def test_cli_stop_cancel_jobs_uses_intents_when_state_corrupt(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    (data / DEFAULT_STATE_FILENAME).write_text("{bad json", encoding="utf-8")
+    phase = CampaignPhase.INITIAL_FEREBUS.value
+    submission_intent.write_pre_submit_intent(
+        campaign,
+        campaign_uid="uid123456789",
+        phase_name=phase,
+        iteration=0,
+    )
+    submission_intent.mark_submitted(campaign, phase, 0, "1001")
+    cancelled = []
+    monkeypatch.setattr(
+        cli_mod,
+        "_lookup_active_slurm_job_for_cancel",
+        lambda job_id: {
+            "active": True,
+            "inconclusive": False,
+            "rows": [{"job_id": str(job_id), "state": "RUNNING", "job_name": "external-ferebus"}],
+            "error": None,
+        },
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_run_scancel",
+        lambda job_id: (cancelled.append(str(job_id)) or (True, "")),
+    )
+
+    rc = main(["stop", "--campaign-dir", str(campaign), "--cancel-jobs"])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "state.json invalid" in captured.err
+    assert cancelled == ["1001"]
+    intent = submission_intent.load_intent(campaign, phase, 0)
+    assert intent["status"] == "FAILED"
+    assert intent["reason"] == "operator_cancelled_via_stop"
+
+
 def test_cli_stop_cancel_jobs_refuses_inconclusive_scheduler_lookup(
     tmp_path,
     capsys,

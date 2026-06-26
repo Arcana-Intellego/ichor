@@ -30,6 +30,7 @@ import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .config import CampaignConfig
@@ -66,7 +67,11 @@ from .daemon.live_executor import (
 )
 from .daemon.phase_executor import MockPhaseExecutor
 from .daemon.preflight import check_backends, missing_backend_message
-from .daemon.reconcile import propose_recovery, write_proposed_state
+from .daemon.reconcile import (
+    propose_recovery,
+    stateful_campaign_artifacts,
+    write_proposed_state,
+)
 from .daemon import submission_intent as _submission_intent
 from .daemon.state import (
     CampaignPhase,
@@ -392,6 +397,36 @@ def _print_reconcile_runtime_warning(status: Dict[str, Any], campaign: Path) -> 
         + " --cancel-jobs",
         file=sys.stderr,
     )
+
+
+def _timestamped_sibling(path: Path, marker: str) -> Path:
+    from datetime import datetime, timezone
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    target = path.with_name(path.name + marker + stamp)
+    suffix = 1
+    while target.exists():
+        target = path.with_name(path.name + marker + stamp + "." + str(suffix))
+        suffix += 1
+    return target
+
+
+def _copy_existing_timestamped(path: Path, marker: str) -> Optional[Path]:
+    if not path.exists():
+        return None
+    import shutil
+
+    target = _timestamped_sibling(path, marker)
+    shutil.copy2(path, target)
+    return target
+
+
+def _rename_existing_timestamped(path: Path, marker: str) -> Optional[Path]:
+    if not path.exists():
+        return None
+    target = _timestamped_sibling(path, marker)
+    path.rename(target)
+    return target
 
 
 def _atomic_write_background_pid(pid_path: Path, payload: Dict[str, Any]) -> None:
@@ -825,6 +860,30 @@ def cmd_start(args: argparse.Namespace) -> int:
     if not config_path.exists() and not getattr(args, "preset", None):
         print("campaign config not found: " + str(config_path), file=sys.stderr)
         return 2
+    state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
+    if not state_path.exists():
+        artefacts = stateful_campaign_artifacts(campaign)
+        if artefacts:
+            print(
+                "state.json is missing but this campaign is not empty.",
+                file=sys.stderr,
+            )
+            print(
+                "Refusing to initialise a fresh state because that could "
+                "overwrite provenance.",
+                file=sys.stderr,
+            )
+            print("Stateful artefacts:", file=sys.stderr)
+            for artefact in artefacts[:12]:
+                print("  - " + artefact, file=sys.stderr)
+            if len(artefacts) > 12:
+                print("  ... " + str(len(artefacts) - 12) + " more", file=sys.stderr)
+            print("Run:", file=sys.stderr)
+            print(
+                "  ichor-al-daemon reconcile --campaign-dir " + str(campaign),
+                file=sys.stderr,
+            )
+            return 8
     if bool(getattr(args, "background", False)):
         return _launch_background_daemon(args, campaign)
     #Fix: --preset overlays the operator-supplied campaign.yaml on top of the
@@ -1147,6 +1206,17 @@ def _cancel_recorded_slurm_jobs(campaign: Path, state: Any) -> Dict[str, Any]:
     cancelled: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
     failed: List[Dict[str, Any]] = []
+    for intent in _load_active_submission_intents(campaign):
+        if str(intent.get("job_id") or ""):
+            continue
+        phase_name, iteration = _intent_phase_iteration(intent)
+        skipped.append({
+            "job_id": "",
+            "reason": "active submission intent has no job_id: "
+            + str(phase_name)
+            + "@"
+            + str(iteration),
+        })
     for job_id, item in sorted(jobs.items()):
         lookup = _lookup_active_slurm_job_for_cancel(job_id)
         if bool(lookup.get("inconclusive")):
@@ -1204,6 +1274,33 @@ def _cancel_recorded_slurm_jobs(campaign: Path, state: Any) -> Dict[str, Any]:
     }
 
 
+def _journal_cancel_jobs_summary(journal_path: Path, summary: Dict[str, Any]) -> None:
+    try:
+        from .daemon.journal import append_event
+
+        append_event(
+            journal_path,
+            "operator_cancelled_jobs",
+            n_cancelled=len(summary.get("cancelled") or []),
+            n_skipped=len(summary.get("skipped") or []),
+            n_failed=len(summary.get("failed") or []),
+            cancelled_job_ids=[
+                str(item.get("job_id"))
+                for item in (summary.get("cancelled") or [])
+            ],
+            skipped_job_ids=[
+                str(item.get("job_id"))
+                for item in (summary.get("skipped") or [])
+            ],
+            failed_job_ids=[
+                str(item.get("job_id"))
+                for item in (summary.get("failed") or [])
+            ],
+        )
+    except Exception:
+        pass
+
+
 def _print_cancel_jobs_summary(summary: Dict[str, Any]) -> None:
     cancelled = list(summary.get("cancelled") or [])
     skipped = list(summary.get("skipped") or [])
@@ -1230,11 +1327,42 @@ def cmd_stop(args: argparse.Namespace) -> int:
     campaign = resolve_campaign_dir(args.campaign_dir)
     paths = _campaign_paths(campaign)
     if not paths["state"].exists():
+        if bool(getattr(args, "cancel_jobs", False)):
+            print(
+                "state.json is missing, so pending_jobs could not be read; "
+                "falling back to active submission intents.",
+                file=sys.stderr,
+            )
+            fallback_state = SimpleNamespace(
+                pending_jobs={},
+                campaign_uid="",
+                iteration=0,
+            )
+            cancel_summary = _cancel_recorded_slurm_jobs(campaign, fallback_state)
+            _journal_cancel_jobs_summary(paths["journal"], cancel_summary)
+            _print_cancel_jobs_summary(cancel_summary)
+            return 10 if cancel_summary.get("failed") else 0
         print("no state.json at " + str(paths["state"]) + "; daemon not running?", file=sys.stderr)
         return 4
     try:
         state = read_state(paths["state"])
-    except StateSchemaError as exc:
+    except (StateSchemaError, ValueError) as exc:
+        if bool(getattr(args, "cancel_jobs", False)):
+            print("state.json invalid: " + str(exc), file=sys.stderr)
+            print(
+                "pending_jobs could not be read; falling back to active "
+                "submission intents.",
+                file=sys.stderr,
+            )
+            fallback_state = SimpleNamespace(
+                pending_jobs={},
+                campaign_uid="",
+                iteration=0,
+            )
+            cancel_summary = _cancel_recorded_slurm_jobs(campaign, fallback_state)
+            _journal_cancel_jobs_summary(paths["journal"], cancel_summary)
+            _print_cancel_jobs_summary(cancel_summary)
+            return 10 if cancel_summary.get("failed") else 0
         print("state.json invalid: " + str(exc), file=sys.stderr)
         return 5
     state.shutdown_requested = True
@@ -1243,30 +1371,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
         cancel_summary = _cancel_recorded_slurm_jobs(campaign, state)
     write_state(paths["state"], state)
     if cancel_summary is not None:
-        try:
-            from .daemon.journal import append_event
-
-            append_event(
-                paths["journal"],
-                "operator_cancelled_jobs",
-                n_cancelled=len(cancel_summary.get("cancelled") or []),
-                n_skipped=len(cancel_summary.get("skipped") or []),
-                n_failed=len(cancel_summary.get("failed") or []),
-                cancelled_job_ids=[
-                    str(item.get("job_id"))
-                    for item in (cancel_summary.get("cancelled") or [])
-                ],
-                skipped_job_ids=[
-                    str(item.get("job_id"))
-                    for item in (cancel_summary.get("skipped") or [])
-                ],
-                failed_job_ids=[
-                    str(item.get("job_id"))
-                    for item in (cancel_summary.get("failed") or [])
-                ],
-            )
-        except Exception:
-            pass
+        _journal_cancel_jobs_summary(paths["journal"], cancel_summary)
     print("shutdown_requested=true set in " + str(paths["state"]))
     background = _probe_background_daemon(
         paths["background_pid"],
@@ -1392,9 +1497,30 @@ def _terminal_sacct_state_for_intent(
     )
 
 
+def _intent_age_seconds(intent: Dict[str, Any]) -> Optional[float]:
+    from datetime import datetime, timezone
+
+    raw = (
+        intent.get("updated_at_iso")
+        or intent.get("updated_iso")
+        or intent.get("created_iso")
+    )
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        created = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - created).total_seconds())
+
+
 def _resolve_terminal_submission_intents_for_apply(
     campaign: Path,
     active_intents: Sequence[Dict[str, Any]],
+    *,
+    pre_submit_stale_seconds: int = 900,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Make conclusively terminal active intents inactive before safe apply.
 
@@ -1407,11 +1533,13 @@ def _resolve_terminal_submission_intents_for_apply(
     from .submit import sacct_poll
 
     terminal_candidates: List[Dict[str, Any]] = []
+    stale_pre_submit_no_job: List[Dict[str, Any]] = []
     blocking: List[Dict[str, Any]] = []
     for intent in active_intents:
         phase, iteration = _intent_phase_iteration(intent)
         job_id = str(intent.get("job_id") or "")
         expected_job_name = str(intent.get("expected_job_name") or "")
+        status = str(intent.get("status") or "")
         if not phase or iteration < 0:
             blocking.append({
                 "phase": phase,
@@ -1422,6 +1550,67 @@ def _resolve_terminal_submission_intents_for_apply(
             })
             continue
         if not job_id:
+            if status == "PRE_SUBMIT":
+                if not expected_job_name:
+                    blocking.append({
+                        "phase": phase,
+                        "iteration": iteration,
+                        "job_id": job_id,
+                        "expected_job_name": expected_job_name,
+                        "reason": "PRE_SUBMIT intent has no expected job name",
+                    })
+                    continue
+                lookup = sacct_poll.find_running_job_by_name_detailed(
+                    expected_job_name
+                )
+                if lookup.inconclusive:
+                    blocking.append({
+                        "phase": phase,
+                        "iteration": iteration,
+                        "job_id": job_id,
+                        "expected_job_name": expected_job_name,
+                        "reason": "job-name lookup inconclusive: "
+                        + str(lookup.error or "unknown error"),
+                    })
+                    continue
+                if lookup.job_id:
+                    blocking.append({
+                        "phase": phase,
+                        "iteration": iteration,
+                        "job_id": str(lookup.job_id),
+                        "expected_job_name": expected_job_name,
+                        "reason": "matching scheduler job exists but no job_id "
+                        "was persisted in the intent",
+                    })
+                    continue
+                age = _intent_age_seconds(intent)
+                if age is None:
+                    blocking.append({
+                        "phase": phase,
+                        "iteration": iteration,
+                        "job_id": job_id,
+                        "expected_job_name": expected_job_name,
+                        "reason": "PRE_SUBMIT intent has no parseable timestamp",
+                    })
+                    continue
+                if age < int(pre_submit_stale_seconds):
+                    blocking.append({
+                        "phase": phase,
+                        "iteration": iteration,
+                        "job_id": job_id,
+                        "expected_job_name": expected_job_name,
+                        "reason": "PRE_SUBMIT intent is too recent to supersede",
+                    })
+                    continue
+                stale_pre_submit_no_job.append({
+                    "phase": phase,
+                    "iteration": iteration,
+                    "job_id": job_id,
+                    "expected_job_name": expected_job_name,
+                    "terminal_state": "PRE_SUBMIT_NO_JOB_ID",
+                    "n_sacct_rows": len(lookup.rows),
+                })
+                continue
             blocking.append({
                 "phase": phase,
                 "iteration": iteration,
@@ -1483,6 +1672,32 @@ def _resolve_terminal_submission_intents_for_apply(
     if blocking:
         return [], blocking
     resolved: List[Dict[str, Any]] = []
+    for candidate in stale_pre_submit_no_job:
+        phase = str(candidate["phase"])
+        iteration = int(candidate["iteration"])
+        reason = "reconcile_apply_pre_submit_no_job_id"
+        _submission_intent.mark_superseded(
+            campaign,
+            phase,
+            iteration,
+            reason,
+        )
+        payload = dict(candidate)
+        payload["reason"] = reason
+        resolved.append(payload)
+        try:
+            append_event(
+                campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
+                "reconcile_resolved_terminal_intent",
+                phase=phase,
+                iteration=iteration,
+                job_id="",
+                terminal_state="PRE_SUBMIT_NO_JOB_ID",
+                n_sacct_rows=int(candidate.get("n_sacct_rows") or 0),
+                reason=reason,
+            )
+        except Exception:
+            pass
     for candidate in terminal_candidates:
         phase = str(candidate["phase"])
         iteration = int(candidate["iteration"])
@@ -1666,6 +1881,11 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         resolved_intents, blocking_intents = _resolve_terminal_submission_intents_for_apply(
             campaign,
             report.active_submission_intents,
+            pre_submit_stale_seconds=(
+                int(config.runtime.lease_stale_seconds)
+                if config is not None
+                else 900
+            ),
         )
         if blocking_intents:
             print(
@@ -1777,16 +1997,6 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         return 9
 
     original_report = report
-    backup_path = None
-    if target_canonical.exists():
-        from datetime import datetime, timezone
-        import shutil
-
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        backup_path = target_canonical.with_name(
-            target_canonical.name + ".before-reconcile-" + stamp
-        )
-        shutil.copy2(target_canonical, backup_path)
     archived_scripts = archive_scripts_for_reconcile(
         campaign
     ) if ".DATA/SCRIPTS contains sbatch scripts" in report.unsafe_reasons else []
@@ -1843,8 +2053,42 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             print(format_config_review(config_review), file=sys.stderr)
             return 8
 
-    target.replace(target_canonical)
-    write_state(target_canonical, report.proposed_state)
+    backup_path = _copy_existing_timestamped(
+        target_canonical,
+        ".before-reconcile-",
+    )
+    try:
+        write_state(target_canonical, report.proposed_state)
+    except Exception as exc:
+        print(
+            "failed to write recovered state.json: "
+            + type(exc).__name__
+            + ": "
+            + str(exc),
+            file=sys.stderr,
+        )
+        return 9
+    try:
+        apply_config_lock_update(campaign, config)
+    except Exception as exc:
+        if backup_path is not None:
+            import shutil
+
+            shutil.copy2(backup_path, target_canonical)
+        else:
+            try:
+                target_canonical.unlink()
+            except FileNotFoundError:
+                pass
+        print(
+            "failed to update config lock after writing state.json; "
+            "restored the previous state.json: "
+            + type(exc).__name__
+            + ": "
+            + str(exc),
+            file=sys.stderr,
+        )
+        return 8
     for intent_path in sorted(
         (campaign / DEFAULT_DATA_SUBDIR / "submission_intents").glob("*.json")
         if (campaign / DEFAULT_DATA_SUBDIR / "submission_intents").is_dir()
@@ -1865,7 +2109,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 int(report.proposed_state.iteration),
                 "reconcile_apply_retry",
             )
-    apply_config_lock_update(campaign, config)
+    applied_proposal_path = _rename_existing_timestamped(target, ".applied-")
     try:
         from .daemon.journal import append_event
 
@@ -1892,6 +2136,8 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     print("Applied proposed state: " + str(target_canonical))
     if backup_path is not None:
         print("Previous state backup: " + str(backup_path))
+    if applied_proposal_path is not None:
+        print("Applied proposal archive: " + str(applied_proposal_path))
     if removed:
         print("Removed stale uncommitted artefacts:")
         for path in removed:

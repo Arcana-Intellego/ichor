@@ -52,6 +52,7 @@ from .phase_executor import (
     PhaseResult,
     SBATCH_PHASES,
 )
+from .reconcile import stateful_campaign_artifacts
 from .state import (
     CampaignPhase,
     CampaignState,
@@ -370,6 +371,17 @@ class Daemon:
         self.data_dir().mkdir(parents=True, exist_ok=True)
         sp = self.state_path()
         if not sp.exists():
+            artefacts = stateful_campaign_artifacts(self.campaign_dir)
+            if artefacts:
+                raise StateSchemaError(
+                    "state.json is missing but this campaign is not empty; "
+                    "refusing fresh initialisation because that could "
+                    "overwrite provenance. Run `ichor-al-daemon reconcile "
+                    "--campaign-dir "
+                    + str(self.campaign_dir)
+                    + "`. Stateful artefacts: "
+                    + ", ".join(artefacts[:8])
+                )
             state = fresh_campaign_state(max_iterations=self.config.max_iterations)
             write_state(sp, state)
             try:

@@ -120,6 +120,11 @@ class DaemonControlFunctions:
         if ns is None:
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
+        answer = user_input_free_flow(
+            "Cancel active Slurm jobs too? Type YES to confirm: ",
+            "",
+        )
+        ns.cancel_jobs = str(answer).strip() == "YES"
         rc = cmd_stop(ns)
         if rc != 0:
             print("stop returned exit code " + str(rc))

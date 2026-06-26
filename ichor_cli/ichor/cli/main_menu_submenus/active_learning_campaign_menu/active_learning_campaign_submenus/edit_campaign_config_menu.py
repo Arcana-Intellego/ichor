@@ -695,7 +695,7 @@ class EditCampaignConfigFunctions:
 
     @staticmethod
     def show_pending_yaml_diff():
-        print("Sparse campaign.yaml that would be written:")
+        print("Pending campaign.yaml field changes:")
         print(_pending_sparse_yaml())
         _pause()
 
@@ -1866,7 +1866,7 @@ edit_campaign_config_menu_items = [
         EditCampaignConfigFunctions.show_config_lock_review,
     ),
     FunctionItem(
-        "Show pending YAML diff",
+        "Show pending config changes",
         EditCampaignConfigFunctions.show_pending_yaml_diff,
     ),
     FunctionItem(

@@ -288,6 +288,13 @@ fails schema validation, run::
 
     ichor-al-daemon reconcile --campaign-dir <DIR>
 
+Fresh :code:`state.json` initialisation is allowed only for a clean first-run
+campaign. If daemon-owned artefacts such as committed training/model
+iterations, staging directories, submission intents, scripts, journal entries,
+or :code:`7_ACTIVE_LEARNING/iteration-*` outputs already exist, start refuses
+to create a new state because that could damage provenance. Use reconcile
+instead.
+
 This inspects the on-disk artefacts (committed iterations in
 :code:`5_TRAINING/` and :code:`6_TRAINED_MODELS/`, plus journal events)
 and proposes a recovered state at :code:`state.json.proposed`. Plain

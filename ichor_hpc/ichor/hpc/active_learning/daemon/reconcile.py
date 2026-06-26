@@ -39,12 +39,60 @@ from .state import (
 __all__ = [
     "ReconciliationReport",
     "propose_recovery",
+    "stateful_campaign_artifacts",
     "write_proposed_state",
     "RECONCILE_SUFFIX",
 ]
 
 
 RECONCILE_SUFFIX = ".proposed"
+
+
+def stateful_campaign_artifacts(campaign_dir: Union[str, Path]) -> List[str]:
+    """Return recovery-relevant artefacts that make fresh state unsafe.
+
+    A first-run campaign may contain ``campaign.yaml`` and an imported
+    trajectory pool before ``state.json`` exists. Once any daemon-owned
+    stateful artefact appears, a missing ``state.json`` is a recovery
+    condition and must go through reconcile rather than fresh initialisation.
+    """
+    campaign = Path(campaign_dir)
+    findings: List[str] = []
+
+    def add_matches(pattern: str) -> None:
+        for path in sorted(campaign.glob(pattern)):
+            findings.append(str(path.relative_to(campaign)))
+
+    add_matches("5_TRAINING/iteration-*")
+    add_matches("6_TRAINED_MODELS/iteration-*")
+    add_matches("7_ACTIVE_LEARNING/iteration-*")
+    if (campaign / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson").is_file():
+        findings.append(".DATA/ACTIVE_LEARNING/journal.ndjson")
+    proposed_state = (
+        campaign
+        / ".DATA"
+        / "ACTIVE_LEARNING"
+        / (DEFAULT_STATE_FILENAME + RECONCILE_SUFFIX)
+    )
+    if proposed_state.exists():
+        findings.append(
+            ".DATA/ACTIVE_LEARNING/"
+            + DEFAULT_STATE_FILENAME
+            + RECONCILE_SUFFIX
+        )
+    intents = campaign / ".DATA" / "ACTIVE_LEARNING" / "submission_intents"
+    if intents.is_dir():
+        for path in sorted(intents.glob("*.json")):
+            findings.append(str(path.relative_to(campaign)))
+    staging = campaign / ".DATA" / "STAGING"
+    if staging.is_dir():
+        for path in sorted(staging.iterdir()):
+            findings.append(str(path.relative_to(campaign)))
+    scripts = campaign / ".DATA" / "SCRIPTS"
+    if scripts.is_dir():
+        for path in sorted(scripts.glob("*.sh")):
+            findings.append(str(path.relative_to(campaign)))
+    return findings
 
 
 @dataclass

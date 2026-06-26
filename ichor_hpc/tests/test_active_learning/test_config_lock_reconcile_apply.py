@@ -1,5 +1,6 @@
 import argparse
 import json
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import ichor.hpc.active_learning.cli as cli_mod
@@ -86,6 +87,23 @@ def _write_submitted_initial_ferebus_intent(campaign, job_id="16218598"):
         job_id,
         expected_tasks=12,
     )
+
+
+def _write_stale_pre_submit_intent(campaign, phase):
+    state = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
+    payload = submission_intent.write_pre_submit_intent(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        phase_name=phase,
+        iteration=0,
+    )
+    path = submission_intent.intent_path(campaign, phase, 0)
+    old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    payload["created_iso"] = old
+    payload["updated_iso"] = old
+    payload["updated_at_iso"] = old
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return payload
 
 
 def test_ferebus_scaling_change_allowed_for_uncommitted_initial_ferebus(tmp_path):
@@ -206,8 +224,89 @@ def test_reconcile_apply_promotes_state_and_cleans_ferebus_staging(tmp_path, cap
     assert state.models_version == -1
     assert not stale.exists()
     assert "Applied proposed state" in out
+    assert not (campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json.proposed").exists()
+    assert sorted(
+        (campaign / ".DATA" / "ACTIVE_LEARNING").glob(
+            "state.json.proposed.applied-*"
+        )
+    )
+    assert sorted(
+        (campaign / ".DATA" / "ACTIVE_LEARNING").glob(
+            "state.json.before-reconcile-*"
+        )
+    )
     lock = json.loads(config_lock_path(campaign).read_text(encoding="utf-8"))
     assert lock["canonical_config"]["ferebus"]["scaling"] is False
+
+
+def test_reconcile_apply_write_state_failure_keeps_old_state(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign(tmp_path)
+    _commit_training_version(campaign, 0)
+    old_state = _write_halted_pre_ferebus_state(campaign)
+    config = CampaignConfig()
+    write_config_lock(campaign, config)
+    _write_config(campaign, config)
+
+    def fail_write_state(path, state):
+        raise OSError("write failed")
+
+    monkeypatch.setattr(cli_mod, "write_state", fail_write_state)
+
+    rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            allow_fresh_init=False,
+            apply=True,
+            restore_config_from_lock=False,
+        )
+    )
+    err = capsys.readouterr().err
+
+    assert rc == 9
+    assert "failed to write recovered state.json" in err
+    state = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
+    assert state.phase is old_state.phase
+    assert state.training_set_version == old_state.training_set_version
+    assert (campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json.proposed").is_file()
+
+
+def test_reconcile_apply_config_lock_failure_restores_old_state(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign(tmp_path)
+    _commit_training_version(campaign, 0)
+    old_state = _write_halted_pre_ferebus_state(campaign)
+    config = CampaignConfig()
+    write_config_lock(campaign, config)
+    _write_config(campaign, config)
+
+    def fail_config_lock(path, config):
+        raise OSError("lock failed")
+
+    monkeypatch.setattr(cli_mod, "apply_config_lock_update", fail_config_lock)
+
+    rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            allow_fresh_init=False,
+            apply=True,
+            restore_config_from_lock=False,
+        )
+    )
+    err = capsys.readouterr().err
+
+    assert rc == 8
+    assert "failed to update config lock" in err
+    state = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
+    assert state.phase is old_state.phase
+    assert state.training_set_version == old_state.training_set_version
+    assert (campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json.proposed").is_file()
 
 
 def test_reconcile_apply_refuses_when_daemon_lock_may_be_active(
@@ -690,6 +789,125 @@ def test_reconcile_apply_resolves_cancelled_intent_when_squeue_invalid_job_id(
     assert intent["reason"] == "reconcile_apply_retry"
 
 
+def test_reconcile_apply_supersedes_stale_pre_submit_without_job_id(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign(tmp_path)
+    _commit_training_version(campaign, 0)
+    _write_halted_pre_ferebus_state(campaign)
+    config = CampaignConfig()
+    config.runtime.lease_stale_seconds = 10
+    write_config_lock(campaign, config)
+    _write_config(campaign, config)
+    phase = CampaignPhase.INITIAL_FEREBUS.value
+    _write_stale_pre_submit_intent(campaign, phase)
+
+    monkeypatch.setattr(
+        sacct_poll,
+        "find_running_job_by_name_detailed",
+        lambda name: sacct_poll.JobNameLookup(None, inconclusive=False, rows=[]),
+    )
+
+    rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            allow_fresh_init=False,
+            apply=True,
+        )
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "Resolved terminal submission intents" in out
+    intent = submission_intent.load_intent(campaign, phase, 0)
+    assert intent["status"] == "SUPERSEDED"
+    assert intent["reason"] == "reconcile_apply_pre_submit_no_job_id"
+
+
+def test_reconcile_apply_blocks_pre_submit_without_job_id_when_job_exists(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign(tmp_path)
+    _commit_training_version(campaign, 0)
+    _write_halted_pre_ferebus_state(campaign)
+    config = CampaignConfig()
+    config.runtime.lease_stale_seconds = 10
+    write_config_lock(campaign, config)
+    _write_config(campaign, config)
+    phase = CampaignPhase.INITIAL_FEREBUS.value
+    payload = _write_stale_pre_submit_intent(campaign, phase)
+
+    monkeypatch.setattr(
+        sacct_poll,
+        "find_running_job_by_name_detailed",
+        lambda name: sacct_poll.JobNameLookup(
+            "222",
+            inconclusive=False,
+            rows=[("222", "RUNNING")],
+        ),
+    )
+
+    rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            allow_fresh_init=False,
+            apply=True,
+        )
+    )
+    err = capsys.readouterr().err
+
+    assert rc == 9
+    assert "matching scheduler job exists" in err
+    intent = submission_intent.load_intent(campaign, phase, 0)
+    assert intent["status"] == "PRE_SUBMIT"
+    assert intent["expected_job_name"] == payload["expected_job_name"]
+
+
+def test_reconcile_apply_blocks_pre_submit_without_job_id_on_lookup_failure(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign(tmp_path)
+    _commit_training_version(campaign, 0)
+    _write_halted_pre_ferebus_state(campaign)
+    config = CampaignConfig()
+    config.runtime.lease_stale_seconds = 10
+    write_config_lock(campaign, config)
+    _write_config(campaign, config)
+    phase = CampaignPhase.INITIAL_FEREBUS.value
+    _write_stale_pre_submit_intent(campaign, phase)
+
+    monkeypatch.setattr(
+        sacct_poll,
+        "find_running_job_by_name_detailed",
+        lambda name: sacct_poll.JobNameLookup(
+            None,
+            inconclusive=True,
+            rows=[],
+            error="sacct unavailable",
+        ),
+    )
+
+    rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            allow_fresh_init=False,
+            apply=True,
+        )
+    )
+    err = capsys.readouterr().err
+
+    assert rc == 9
+    assert "job-name lookup inconclusive" in err
+    intent = submission_intent.load_intent(campaign, phase, 0)
+    assert intent["status"] == "PRE_SUBMIT"
+
+
 def test_reconcile_apply_refuses_when_submission_intent_job_is_still_active(
     tmp_path,
     capsys,
@@ -849,3 +1067,54 @@ def test_start_refuses_config_drift_without_reconcile_apply(tmp_path, capsys):
 
     assert rc == 7
     assert "campaign.yaml changed" in err
+
+
+def test_start_allows_clean_first_run_with_config_and_pool(tmp_path):
+    campaign = _campaign(tmp_path)
+    config = CampaignConfig(max_iterations=1)
+    _write_config(campaign, config)
+    _write_pool(campaign)
+
+    rc = cmd_start(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            config=None,
+            preset=None,
+            live=False,
+            dry_run=True,
+            mock_ariadne=False,
+            poll_interval=None,
+            max_ticks=1,
+            background=False,
+        )
+    )
+
+    assert rc == 0
+    assert (campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json").is_file()
+
+
+def test_start_refuses_missing_state_in_nonempty_campaign(tmp_path, capsys):
+    campaign = _campaign(tmp_path)
+    config = CampaignConfig()
+    _write_config(campaign, config)
+    _commit_training_version(campaign, 0)
+
+    rc = cmd_start(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            config=None,
+            preset=None,
+            live=False,
+            dry_run=True,
+            mock_ariadne=False,
+            poll_interval=None,
+            max_ticks=1,
+            background=False,
+        )
+    )
+    err = capsys.readouterr().err
+
+    assert rc == 8
+    assert "state.json is missing but this campaign is not empty" in err
+    assert "reconcile --campaign-dir" in err
+    assert not (campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json").exists()

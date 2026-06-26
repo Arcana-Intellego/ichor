@@ -25,6 +25,7 @@ from ichor.hpc.active_learning.daemon.phase_executor import (
 from ichor.hpc.active_learning.daemon.state import (
     CampaignPhase,
     CampaignState,
+    StateSchemaError,
     fresh_campaign_state,
     read_state,
     write_state,
@@ -127,6 +128,18 @@ def test_tick_initialises_state_on_first_call(tmp_path):
     assert status == TickStatus.ADVANCED
     state = read_state(d.state_path())
     assert state.phase is CampaignPhase.PHASE_A_POLUS
+
+
+def test_tick_refuses_fresh_state_when_campaign_has_committed_artifacts(tmp_path):
+    d = _make_daemon(tmp_path)
+    committed = d.campaign_dir / "5_TRAINING" / "iteration-0000"
+    committed.mkdir(parents=True)
+    (committed / "marker.txt").write_text("training\n", encoding="utf-8")
+
+    with pytest.raises(StateSchemaError, match="state.json is missing"):
+        d.tick()
+
+    assert not d.state_path().exists()
 
 
 def test_tick_submits_sbatch_phase_then_polls(tmp_path):

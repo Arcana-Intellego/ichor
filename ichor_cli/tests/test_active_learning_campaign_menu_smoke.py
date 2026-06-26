@@ -13,6 +13,7 @@ If any of these break, the menu wiring is the regression rather than the
 underlying daemon / config code (which has its own M1-M8 test suite).
 """
 import warnings
+from types import SimpleNamespace
 
 
 def test_top_level_menu_imports_and_has_expected_items():
@@ -47,6 +48,31 @@ def test_daemon_control_menu_items():
         "Reconcile state with --allow-fresh-init",
     ):
         assert expected in texts, "missing item: " + expected
+
+
+def test_daemon_control_stop_can_request_job_cancellation(monkeypatch):
+    import ichor.hpc.active_learning.cli as cli_mod
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_submenus import (
+        daemon_control_menu as menu_mod,
+    )
+
+    seen = {}
+
+    def fake_stop(ns):
+        seen["cancel_jobs"] = ns.cancel_jobs
+        return 0
+
+    monkeypatch.setattr(
+        menu_mod,
+        "_guarded_campaign_dir_ns",
+        lambda: SimpleNamespace(campaign_dir="/tmp/campaign"),
+    )
+    monkeypatch.setattr(menu_mod, "user_input_free_flow", lambda prompt, default: "YES")
+    monkeypatch.setattr(cli_mod, "cmd_stop", fake_stop)
+
+    menu_mod.DaemonControlFunctions.stop_daemon()
+
+    assert seen["cancel_jobs"] is True
 
 
 def test_edit_campaign_config_menu_items():
@@ -85,7 +111,7 @@ def test_edit_campaign_config_menu_items():
         "Edit runtime",
         "Show unsaved changes",
         "Show config lock review",
-        "Show pending YAML diff",
+        "Show pending config changes",
         "Discard unsaved changes / reload from disk",
         "Export dense config snapshot",
         "Save to disk",
