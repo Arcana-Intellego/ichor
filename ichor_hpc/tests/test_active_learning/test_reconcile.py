@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
 from ichor.hpc.active_learning.daemon.journal import append_event
 from ichor.hpc.active_learning.daemon.reconcile import (
     RECONCILE_SUFFIX,
@@ -30,6 +31,22 @@ def _campaign_dirs(tmp_path):
     training.mkdir(parents=True, exist_ok=True)
     models.mkdir(parents=True, exist_ok=True)
     return campaign, data, training, models
+
+
+def _write_pool(campaign):
+    src = campaign / "pool_source.xyz"
+    src.write_text(
+        "1\n"
+        "frame 0\n"
+        "H 0.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    TrajectoryPool.import_from(
+        src,
+        campaign,
+        overwrite=True,
+        outlier_filter_enabled=False,
+    )
 
 
 def test_propose_recovery_on_empty_campaign_returns_init(tmp_path):
@@ -118,6 +135,29 @@ def test_propose_recovery_reports_decision_and_trusted_versions(tmp_path):
     assert "coherent committed" in report.decision
     assert "training version 0" in report.trusted_artifacts
     assert "model version 0" in report.trusted_artifacts
+    assert "trajectory pool" in report.blocking_artifacts
+
+
+def test_propose_recovery_blocks_trajectory_pool_sha_drift(tmp_path):
+    campaign, _, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    tv = TrainingSetVersioning(training)
+    mv = TrainingSetVersioning(models)
+    s = tv.stage(None, 0)
+    (s / "marker.txt").write_text("training", encoding="utf-8")
+    tv.commit(0)
+    s = mv.stage(None, 0)
+    (s / "marker.txt").write_text("model", encoding="utf-8")
+    mv.commit(0)
+
+    pool_xyz = campaign / ".DATA" / "TRAJECTORY" / "pool.xyz"
+    with pool_xyz.open("a", encoding="utf-8") as f:
+        f.write("# drift\n")
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.HALTED
+    assert any("trajectory pool SHA mismatch" in r for r in report.unsafe_reasons)
     assert "trajectory pool" in report.blocking_artifacts
 
 

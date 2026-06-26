@@ -296,7 +296,7 @@ live daemon, but it does not alter :code:`state.json`. Review the proposal,
 then promote it manually::
 
     mv .DATA/ACTIVE_LEARNING/state.json.proposed .DATA/ACTIVE_LEARNING/state.json
-    ichor-al-daemon start --live --campaign-dir . --resume
+    ichor-al-daemon resume --campaign-dir . --live
 
 For routine crash recovery, use the guarded apply path instead::
 
@@ -327,8 +327,10 @@ present, write a proposal from the lock::
 
     ichor-al-daemon reconcile --campaign-dir . --restore-config-from-lock
 
-This creates :code:`campaign.yaml.proposed` only. Inspect it, then promote it
-manually before running :code:`reconcile --apply`.
+This creates :code:`campaign.yaml.proposed` only. The proposal is dense by
+design: it is a full config snapshot restored from
+:code:`config_lock.json`, not a sparse menu-style save. Inspect it, then
+promote it manually before running :code:`reconcile --apply`.
 
 What reconcile still does not do:
 

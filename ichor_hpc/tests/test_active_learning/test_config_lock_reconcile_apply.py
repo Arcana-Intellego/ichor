@@ -157,7 +157,7 @@ def test_ariadne_backtransform_changes_are_future_safe(tmp_path):
         "ariadne.trqn_max_backtransform_iter",
         "ariadne.trqn_trust_min",
     ]
-    assert {c.classification for c in review.allowed_changes} == {"future_safe"}
+    assert {c.category for c in review.allowed_changes} == {"future_safe"}
     assert not review.blocked_changes
 
 

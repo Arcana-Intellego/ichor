@@ -1541,9 +1541,13 @@ def _apply_retry_phase_after_cleaned_halt(report, original_report) -> bool:
 
 
 def cmd_reconcile(args: argparse.Namespace) -> int:
-    campaign = resolve_campaign_dir(args.campaign_dir)
+    restore_config = bool(getattr(args, "restore_config_from_lock", False))
+    campaign = resolve_campaign_dir(
+        args.campaign_dir,
+        require_campaign_yaml=not restore_config,
+    )
     runtime_status = _reconcile_runtime_status(campaign)
-    if bool(getattr(args, "restore_config_from_lock", False)):
+    if restore_config:
         if bool(getattr(args, "apply", False)):
             print(
                 "refusing --restore-config-from-lock together with --apply; "
@@ -1563,6 +1567,10 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             )
             return 8
         print("Config proposal written to: " + str(target_config))
+        print(
+            "The proposal is a dense full config snapshot restored from "
+            "config_lock.json."
+        )
         print("Review the proposal, then promote it manually:")
         print("    mv " + str(target_config) + " " + str(campaign / "campaign.yaml"))
         print("Then re-run reconcile:")
