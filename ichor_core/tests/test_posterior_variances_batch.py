@@ -6,6 +6,7 @@ with a genuine PSD kernel so the linear algebra is real. We then check that the
 vectorised diagonal matches the scalar path frame by frame, scaled and unscaled.
 """
 import numpy as np
+import pytest
 
 from ichor.core.adversarial.posterior import TotalEnergyPosterior
 from ichor.core.adversarial.stencils import directional_all_stencils
@@ -208,6 +209,35 @@ def test_variances_use_kernel_diagonal_without_full_candidate_block():
     assert np.all(np.isfinite(values))
     assert all(model.kernel.k_diag_calls >= 1 for model in models)
     assert all(model.kernel.full_test_kernel_calls == 0 for model in models)
+
+
+def test_variances_reject_kernel_active_dims_out_of_range():
+    post, rng, models = _make_diag_only_posterior()
+    models[0].kernel.active_dims = [0, 3]
+
+    with pytest.raises(ValueError, match="active_dims out of range"):
+        post.variances(_points(rng, 2))
+
+
+def test_variances_reject_non_integer_kernel_active_dims():
+    post, rng, models = _make_diag_only_posterior()
+    models[0].kernel.active_dims = [0, 1.2]
+
+    with pytest.raises(ValueError, match="active_dims must be integer"):
+        post.variances(_points(rng, 2))
+
+
+def test_variances_reject_wrong_kernel_diagonal_shape():
+    post, rng, models = _make_diag_only_posterior()
+
+    def _bad_k_diag(x):
+        n = np.atleast_2d(np.asarray(x, dtype=float)).shape[0]
+        return np.ones((n, 2), dtype=float)
+
+    models[0].kernel.k_diag = _bad_k_diag
+
+    with pytest.raises(ValueError, match="kernel diagonal shape"):
+        post.variances(_points(rng, 3))
 
 
 def test_batched_means_match_per_frame_scalar():

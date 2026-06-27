@@ -100,8 +100,7 @@ def write_records(campaign_dir: Any, records: Sequence[Mapping[str, Any]]) -> Pa
     return path
 
 
-def _quarantine_records_file(campaign_dir: Any, reason: str) -> Optional[Path]:
-    path = records_path(campaign_dir)
+def _quarantine_file(path: Path, reason: str, label: str) -> Optional[Path]:
     if not path.exists():
         return None
     suffix = ".corrupt." + str(time.time_ns())
@@ -110,7 +109,9 @@ def _quarantine_records_file(campaign_dir: Any, reason: str) -> Optional[Path]:
         path.rename(target)
     except OSError as exc:
         raise ErrorCalibrationError(
-            "failed to quarantine malformed calibration records "
+            "failed to quarantine malformed "
+            + label
+            + " "
             + str(path)
             + ": "
             + str(exc)
@@ -123,6 +124,14 @@ def _quarantine_records_file(campaign_dir: Any, reason: str) -> Optional[Path]:
     return target
 
 
+def _quarantine_records_file(campaign_dir: Any, reason: str) -> Optional[Path]:
+    return _quarantine_file(records_path(campaign_dir), reason, "calibration records")
+
+
+def _quarantine_model_file(campaign_dir: Any, reason: str) -> Optional[Path]:
+    return _quarantine_file(model_path(campaign_dir), reason, "calibration model")
+
+
 def _record_key(record: Mapping[str, Any]) -> str:
     return "|".join(
         str(record.get(k, ""))
@@ -133,6 +142,8 @@ def _record_key(record: Mapping[str, Any]) -> str:
 def append_records(
     campaign_dir: Any,
     new_records: Sequence[Mapping[str, Any]],
+    *,
+    max_records: Optional[int] = None,
 ) -> Tuple[List[Dict[str, Any]], int, int]:
     try:
         existing = load_records(campaign_dir)
@@ -158,6 +169,8 @@ def append_records(
             str(r.get("property", "")),
         )
     )
+    if max_records is not None and int(max_records) > 0 and len(merged) > int(max_records):
+        merged = merged[-int(max_records):]
     write_records(campaign_dir, merged)
     return merged, added, skipped
 
@@ -181,6 +194,8 @@ def _make_table(
     *,
     n_bins: int,
     min_bin_records: int,
+    monotone: bool,
+    quantile: float,
 ) -> Dict[str, Any]:
     pairs = []
     for record in records:
@@ -198,6 +213,7 @@ def _make_table(
         bin_count = 1
     bins = []
     running = 0.0
+    q = min(1.0, max(1.0e-12, float(quantile)))
     for idx in range(bin_count):
         start = int(round(idx * len(pairs) / bin_count))
         end = int(round((idx + 1) * len(pairs) / bin_count))
@@ -205,7 +221,8 @@ def _make_table(
         raws = [p[0] for p in chunk]
         errs = sorted(p[1] for p in chunk)
         med = float(median(errs))
-        running = max(running, med)
+        calibrated = float(_percentile(errs, q))
+        running = max(running, calibrated) if bool(monotone) else calibrated
         bins.append(
             {
                 "raw_uncertainty_min": float(min(raws)),
@@ -214,12 +231,15 @@ def _make_table(
                 "mean_abs_error_ha": float(mean(errs)),
                 "median_abs_error_ha": med,
                 "q90_abs_error_ha": _percentile(errs, 0.90),
+                "calibration_quantile": float(q),
                 "calibrated_abs_error_ha": float(running),
             }
         )
     return {
         "n_records": int(len(pairs)),
         "usable": bool(usable),
+        "monotone": bool(monotone),
+        "quantile": float(q),
         "bins": bins,
     }
 
@@ -254,6 +274,24 @@ def _filter_records_by_model_version(
                 out.append(dict(record))
         except (TypeError, ValueError):
             continue
+    return out
+
+
+def _filter_records_by_age(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    iteration: int,
+    max_age_iterations: int,
+) -> List[Dict[str, Any]]:
+    cutoff = int(iteration) - int(max_age_iterations)
+    out: List[Dict[str, Any]] = []
+    for record in records:
+        try:
+            rec_iteration = int(record.get("iteration"))
+        except (TypeError, ValueError):
+            continue
+        if rec_iteration >= cutoff:
+            out.append(dict(record))
     return out
 
 
@@ -327,6 +365,9 @@ def build_calibration_model(
     n_bins = int(_cfg_value(block, "n_bins", 10))
     min_bin_records = int(_cfg_value(block, "min_bin_records", 8))
     min_records_to_apply = int(_cfg_value(block, "min_records_to_apply", 100))
+    max_model_age_iterations = int(_cfg_value(block, "max_model_age_iterations", 10))
+    monotone_estimator = bool(_cfg_value(block, "monotone_estimator", True))
+    quantile = float(_cfg_value(block, "quantile", 0.75))
     group_by_atom_type = bool(_cfg_value(block, "group_by_atom_type", True))
     group_by_landing_policy = bool(_cfg_value(block, "group_by_landing_policy", False))
     model_version_policy = str(_cfg_value(block, "model_version_policy", "current"))
@@ -335,6 +376,11 @@ def build_calibration_model(
         records,
         policy=model_version_policy,
         current_model_version=current_model_version,
+    )
+    candidate_records = _filter_records_by_age(
+        candidate_records,
+        iteration=int(iteration),
+        max_age_iterations=max_model_age_iterations,
     )
     finite_records = [
         dict(r)
@@ -348,11 +394,15 @@ def build_calibration_model(
             finite_records,
             n_bins=n_bins,
             min_bin_records=min_bin_records,
+            monotone=monotone_estimator,
+            quantile=quantile,
         ),
         "global_total": _make_table(
             total_records,
             n_bins=n_bins,
             min_bin_records=min_bin_records,
+            monotone=monotone_estimator,
+            quantile=quantile,
         )
     }
     if group_by_atom_type:
@@ -363,6 +413,8 @@ def build_calibration_model(
                 grouped,
                 n_bins=n_bins,
                 min_bin_records=min_bin_records,
+                monotone=monotone_estimator,
+                quantile=quantile,
             )
             if table.get("usable"):
                 tables["atom_type:" + atom_type] = table
@@ -374,6 +426,8 @@ def build_calibration_model(
                 grouped,
                 n_bins=n_bins,
                 min_bin_records=min_bin_records,
+                monotone=monotone_estimator,
+                quantile=quantile,
             )
             if table.get("usable"):
                 tables["landing_policy:" + policy] = table
@@ -403,6 +457,9 @@ def build_calibration_model(
         "n_bins": int(n_bins),
         "min_bin_records": int(min_bin_records),
         "min_records_to_apply": int(min_records_to_apply),
+        "max_model_age_iterations": int(max_model_age_iterations),
+        "monotone_estimator": bool(monotone_estimator),
+        "quantile": float(quantile),
         "reference_error_ha": float(reference_error),
         "group_by_atom_type": bool(group_by_atom_type),
         "group_by_landing_policy": bool(group_by_landing_policy),
@@ -456,14 +513,17 @@ def load_calibration_model_for_acquisition(
     try:
         data = _read_json_object(path)
         if int(data.get("schema_version", -1)) != ERROR_CALIBRATION_SCHEMA_VERSION:
+            _quarantine_model_file(campaign_dir, "unsupported calibration model schema")
             return None, "unsupported_schema"
         if bool(data.get("stale", False)):
             return None, "stale_model"
         if not bool(data.get("usable_for_acquisition", False)):
             return None, "not_enough_records"
         if not isinstance(data.get("tables"), dict):
+            _quarantine_model_file(campaign_dir, "calibration model missing tables")
             return None, "missing_tables"
-    except ErrorCalibrationError:
+    except ErrorCalibrationError as exc:
+        _quarantine_model_file(campaign_dir, str(exc))
         return None, "malformed_model"
     return data, "loaded"
 
@@ -656,7 +716,11 @@ def update_from_aimall_acceptance(
         for reason in reasons:
             skipped[reason] = skipped.get(reason, 0) + 1
 
-    all_records, added, duplicate = append_records(campaign_dir, new_records)
+    all_records, added, duplicate = append_records(
+        campaign_dir,
+        new_records,
+        max_records=int(_cfg_value(_block(config), "max_records", 5000)),
+    )
     model = build_calibration_model(
         all_records,
         config,

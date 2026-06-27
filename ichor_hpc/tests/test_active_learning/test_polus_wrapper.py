@@ -86,6 +86,15 @@ def test_fps_select_indices_unique():
     assert len(set(out.indices)) == out.n
 
 
+def test_fps_select_ties_prefer_lowest_candidate_index():
+    D = np.ones((4, 4), dtype=float)
+    np.fill_diagonal(D, 0.0)
+
+    out = fps_select(D, 3, seed_index=0)
+
+    assert out.indices == [0, 1, 2]
+
+
 def test_fps_select_non_square_raises():
     with pytest.raises(ValueError):
         fps_select(np.zeros((5, 4)), 2)

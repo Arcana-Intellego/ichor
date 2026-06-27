@@ -461,6 +461,10 @@ def test_fresh_lease_blocks_second_daemon(tmp_path):
                 pass
 
     assert not d1.lease_path().exists()
+    events = list(iter_events(d1.journal_path()))
+    conflicts = [e for e in events if e["event"] == "daemon_lease_conflict"]
+    assert conflicts
+    assert conflicts[-1]["phase"] == "?"
 
 
 def test_stale_lease_is_recovered(tmp_path):
@@ -485,6 +489,11 @@ def test_stale_lease_is_recovered(tmp_path):
 
     stale_dirs = list(d.data_dir().glob("daemon.lease.d.stale.*"))
     assert stale_dirs
+    events = list(iter_events(d.journal_path()))
+    recovered = [e for e in events if e["event"] == "daemon_lease_stale_recovered"]
+    assert recovered
+    assert recovered[-1]["previous_host"] == "old-host"
+    assert recovered[-1]["previous_phase"] == "AIMALL"
 
 
 def test_request_shutdown_writes_flag_to_state(tmp_path):

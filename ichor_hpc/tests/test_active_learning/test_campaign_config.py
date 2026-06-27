@@ -66,6 +66,10 @@ def test_default_campaign_config_is_valid():
     assert c.error_calibration.min_records_to_apply == 100
     assert c.error_calibration.n_bins == 10
     assert c.error_calibration.min_bin_records == 8
+    assert c.error_calibration.max_records == 5000
+    assert c.error_calibration.max_model_age_iterations == 10
+    assert c.error_calibration.monotone_estimator is True
+    assert c.error_calibration.quantile == 0.75
     assert c.error_calibration.apply_strength == 0.0
     assert c.error_calibration.group_by_atom_type is True
     assert c.error_calibration.group_by_landing_policy is False
@@ -289,6 +293,11 @@ def test_acquisition_gradient_clamp_must_be_positive():
         ("min_records_to_apply", 0, "min_records_to_apply"),
         ("n_bins", 0, "n_bins"),
         ("min_bin_records", 0, "min_bin_records"),
+        ("max_records", 0, "max_records"),
+        ("max_model_age_iterations", -1, "max_model_age_iterations"),
+        ("monotone_estimator", "yes", "monotone_estimator"),
+        ("quantile", 0.0, "quantile"),
+        ("quantile", 1.1, "quantile"),
         ("apply_strength", -0.1, "apply_strength"),
         ("apply_strength", 1.1, "apply_strength"),
         ("group_by_atom_type", "yes", "group_by_atom_type"),

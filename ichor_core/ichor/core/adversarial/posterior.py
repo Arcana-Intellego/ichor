@@ -38,6 +38,32 @@ def _check_variance_array(values, label: str) -> np.ndarray:
     return arr
 
 
+def _check_kernel_active_dims(model, nfeats: int, label: str) -> None:
+    kernel = getattr(model, "kernel", None)
+    active_dims = getattr(kernel, "active_dims", None)
+    if active_dims is None:
+        return
+    arr = np.asarray(active_dims)
+    if arr.size == 0:
+        return
+    try:
+        raw_float = np.asarray(active_dims, dtype=float).reshape(-1)
+        dims = np.asarray(active_dims, dtype=int).reshape(-1)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(label + " kernel active_dims must be integer indices") from exc
+    if dims.size != arr.reshape(-1).size:
+        raise ValueError(label + " kernel active_dims shape is invalid")
+    if not np.all(np.isfinite(raw_float)) or not np.allclose(raw_float, dims):
+        raise ValueError(label + " kernel active_dims must be integer indices")
+    if np.any(dims < 0) or np.any(dims >= int(nfeats)):
+        raise ValueError(
+            label
+            + " kernel active_dims out of range for "
+            + str(int(nfeats))
+            + " features"
+        )
+
+
 
 def _estimated_signal_variance(model) -> float:
     y = _check_finite_array(model.y, "model.y").reshape((-1, 1))
@@ -136,6 +162,7 @@ class TotalEnergyPosterior:
                     f"Feature dimension mismatch for atom {atom}: "
                     f"{arr2d.shape[1]} != {nfeats}"
                 )
+            _check_kernel_active_dims(model, nfeats, f"atom {atom}")
         return features
 
     @staticmethod
@@ -303,6 +330,10 @@ class TotalEnergyPosterior:
             # forming the full n x n block: k_ii - sum_k v[k,i]^2.
             if hasattr(model.kernel, "k_diag"):
                 k_diag = _check_finite_array(model.kernel.k_diag(X), "kernel diagonal").reshape(-1)
+                if k_diag.shape != (n,):
+                    raise ValueError(
+                        f"kernel diagonal shape for atom {atom} must be {(n,)}, got {k_diag.shape}"
+                    )
             else:
                 k_diag = np.diag(
                     _check_finite_array(model.kernel.k(X, X), "kernel covariance")

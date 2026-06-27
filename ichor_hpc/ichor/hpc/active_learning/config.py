@@ -614,6 +614,10 @@ class ErrorCalibrationConfigBlock:
     min_records_to_apply: int = 100
     n_bins: int = 10
     min_bin_records: int = 8
+    max_records: int = 5000
+    max_model_age_iterations: int = 10
+    monotone_estimator: bool = True
+    quantile: float = 0.75
     apply_strength: float = 0.0
     group_by_atom_type: bool = True
     group_by_landing_policy: bool = False
@@ -1410,6 +1414,23 @@ class CampaignConfig:
             "error_calibration.min_bin_records",
             calib.min_bin_records,
         )
+        _validate_positive_int("error_calibration.max_records", calib.max_records)
+        _validate_nonnegative_int(
+            "error_calibration.max_model_age_iterations",
+            calib.max_model_age_iterations,
+        )
+        if not isinstance(calib.monotone_estimator, bool):
+            raise ConfigValidationError(
+                "error_calibration.monotone_estimator must be a boolean"
+            )
+        if isinstance(calib.quantile, bool) or not isinstance(
+            calib.quantile, (int, float)
+        ):
+            raise ConfigValidationError("error_calibration.quantile must be a number")
+        if not 0.0 < float(calib.quantile) <= 1.0:
+            raise ConfigValidationError(
+                "error_calibration.quantile must be in (0, 1]"
+            )
         if isinstance(calib.apply_strength, bool) or not isinstance(
             calib.apply_strength, (int, float)
         ):

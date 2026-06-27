@@ -11,6 +11,7 @@ from ichor.hpc.active_learning.daemon.error_calibration import (
     load_records,
     lookup_calibrated_abs_error,
     mark_calibration_model_stale,
+    model_path,
     records_path,
     synthetic_dry_records,
     update_from_aimall_acceptance,
@@ -98,6 +99,25 @@ def test_append_records_quarantines_corrupt_records_file(tmp_path):
     assert load_records(tmp_path) == merged
 
 
+def test_append_records_trims_oldest_records_when_window_is_configured(tmp_path):
+    records = []
+    for i in range(5):
+        record = _record(i)
+        record["iteration"] = i
+        records.append(record)
+
+    merged, added, skipped = append_records(tmp_path, records, max_records=3)
+
+    assert added == 5
+    assert skipped == 0
+    assert [r["pointdir"] for r in merged] == [
+        "POINT_0002.pointdir",
+        "POINT_0003.pointdir",
+        "POINT_0004.pointdir",
+    ]
+    assert load_records(tmp_path) == merged
+
+
 def test_calibration_model_builds_monotone_bins_and_sparse_group_fallback():
     cfg = CampaignConfig()
     cfg.error_calibration.n_bins = 3
@@ -118,6 +138,43 @@ def test_calibration_model_builds_monotone_bins_and_sparse_group_fallback():
     assert "global_total" in model["tables"]
     assert "atom_type:C" in model["tables"]
     assert "atom_type:H" not in model["tables"]
+
+
+def test_calibration_model_can_disable_monotone_quantile_bins():
+    cfg = CampaignConfig()
+    cfg.error_calibration.n_bins = 3
+    cfg.error_calibration.min_bin_records = 1
+    cfg.error_calibration.monotone_estimator = False
+    cfg.error_calibration.quantile = 0.5
+    records = [
+        _record(0, raw=1.0, err=0.003),
+        _record(1, raw=2.0, err=0.001),
+        _record(2, raw=3.0, err=0.002),
+    ]
+
+    model = build_calibration_model(records, cfg, iteration=1)
+
+    bins = model["tables"]["global"]["bins"]
+    assert [b["calibrated_abs_error_ha"] for b in bins] == pytest.approx(
+        [0.003, 0.001, 0.002]
+    )
+    assert model["tables"]["global"]["monotone"] is False
+    assert model["tables"]["global"]["quantile"] == pytest.approx(0.5)
+
+
+def test_calibration_model_uses_recent_records_only_by_default():
+    cfg = CampaignConfig()
+    cfg.error_calibration.min_bin_records = 1
+    cfg.error_calibration.max_model_age_iterations = 1
+    old_record = _record(0, raw=100.0, err=0.5)
+    old_record["iteration"] = 1
+    new_record = _record(1, raw=2.0, err=0.001)
+    new_record["iteration"] = 3
+
+    model = build_calibration_model([old_record, new_record], cfg, iteration=3)
+
+    assert model["n_records"] == 1
+    assert model["tables"]["global"]["bins"][0]["raw_uncertainty_min"] == 2.0
 
 
 def test_calibration_global_total_table_uses_total_variance_and_total_error():
@@ -194,6 +251,22 @@ def test_stale_calibration_model_is_not_loaded_for_acquisition(tmp_path):
 
     assert loaded is None
     assert reason == "stale_model"
+
+
+def test_malformed_calibration_model_is_quarantined_before_acquisition(tmp_path):
+    cfg = CampaignConfig()
+    cfg.error_calibration.mode = "apply_to_acquisition"
+    cfg.error_calibration.apply_strength = 0.5
+    path = model_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text("{not json", encoding="utf-8")
+
+    loaded, reason = load_calibration_model_for_acquisition(tmp_path, cfg)
+
+    assert loaded is None
+    assert reason == "malformed_model"
+    assert not path.exists()
+    assert list(path.parent.glob(path.name + ".corrupt.*"))
 
 
 def test_update_from_aimall_acceptance_joins_provenance_and_quality(tmp_path):

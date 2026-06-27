@@ -346,6 +346,24 @@ def test_d_optimal_is_deterministic_and_reports_gain_diagnostics():
     assert a.diagnostics["prefilter_pool_size"] == 5
 
 
+def test_d_optimal_ties_prefer_lowest_candidate_index():
+    atoms = [object() for _ in range(3)]
+    posterior = _CovariancePosterior(atoms, np.eye(3))
+
+    out = select_seeds(
+        atoms,
+        posterior,
+        n_seeds=2,
+        bulk_fraction=0.0,
+        strategy="d_optimal",
+        d_optimal_pool_multiplier=3,
+        d_optimal_score_power=0.0,
+    )
+
+    assert out.indices == [0, 1]
+    assert out.selection_origins == ["d_optimal", "d_optimal"]
+
+
 def test_d_optimal_skips_degenerate_zero_pivot_candidate():
     atoms = [object() for _ in range(3)]
     posterior = _CovariancePosterior(atoms, np.diag([2.0, 1.0, 0.0]))

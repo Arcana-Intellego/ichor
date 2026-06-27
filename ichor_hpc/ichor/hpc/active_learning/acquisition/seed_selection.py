@@ -204,7 +204,8 @@ def _d_optimal_select(
         if not np.any(np.isfinite(gains)):
             break
 
-        pick_pos = int(np.argmax(gains))
+        pick_order = np.lexsort((np.asarray(candidate_indices, dtype=int), -gains))
+        pick_pos = int(pick_order[0])
         pick_index = int(candidate_indices[pick_pos])
         pick_cov_to_selected = (
             np.array(k_xs[pick_pos, :], dtype=float)

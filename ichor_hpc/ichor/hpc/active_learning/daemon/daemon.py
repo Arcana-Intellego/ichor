@@ -291,6 +291,15 @@ class Daemon:
             age = self._lease_age_seconds()
             heartbeat = self._read_heartbeat() or {}
             if age < stale_after:
+                self._journal(
+                    "daemon_lease_conflict",
+                    host=str(heartbeat.get("host", "?")),
+                    pid=str(heartbeat.get("pid", "?")),
+                    phase=str(heartbeat.get("phase", "?")),
+                    iteration=str(heartbeat.get("iteration", "?")),
+                    age_seconds=float(age),
+                    stale_after_seconds=float(stale_after),
+                )
                 raise DaemonAlreadyRunningError(
                     "daemon lease is fresh; refuse to start "
                     + "(host="
@@ -312,6 +321,16 @@ class Daemon:
                 raise DaemonAlreadyRunningError(
                     "daemon lease looked stale but could not be recovered: " + str(exc)
                 ) from exc
+            self._journal(
+                "daemon_lease_stale_recovered",
+                stale_lease=str(stale),
+                previous_host=str(heartbeat.get("host", "?")),
+                previous_pid=str(heartbeat.get("pid", "?")),
+                previous_phase=str(heartbeat.get("phase", "?")),
+                previous_iteration=str(heartbeat.get("iteration", "?")),
+                age_seconds=float(age),
+                stale_after_seconds=float(stale_after),
+            )
             os.mkdir(str(lease))
         self._write_lease_heartbeat()
         try:
@@ -319,12 +338,22 @@ class Daemon:
         finally:
             try:
                 self.heartbeat_path().unlink()
-            except OSError:
-                pass
+            except OSError as exc:
+                self._journal(
+                    "daemon_lease_cleanup_failed",
+                    path=str(self.heartbeat_path()),
+                    operation="unlink_heartbeat",
+                    error=type(exc).__name__ + ": " + str(exc)[:160],
+                )
             try:
                 os.rmdir(str(lease))
-            except OSError:
-                pass
+            except OSError as exc:
+                self._journal(
+                    "daemon_lease_cleanup_failed",
+                    path=str(lease),
+                    operation="remove_lease_dir",
+                    error=type(exc).__name__ + ": " + str(exc)[:160],
+                )
 
     def _write_lease_heartbeat(self, state: Optional[CampaignState] = None) -> None:
         lease = self.lease_path()

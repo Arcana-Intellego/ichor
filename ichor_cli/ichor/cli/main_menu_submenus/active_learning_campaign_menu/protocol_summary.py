@@ -73,6 +73,15 @@ def format_sampling_protocol_summary(config: CampaignConfig) -> str:
     lines.append(
         _line("error_calibration.min_records_to_apply", calib.min_records_to_apply)
     )
+    lines.append(_line("error_calibration.max_records", calib.max_records))
+    lines.append(
+        _line(
+            "error_calibration.max_model_age_iterations",
+            calib.max_model_age_iterations,
+        )
+    )
+    lines.append(_line("error_calibration.monotone_estimator", calib.monotone_estimator))
+    lines.append(_line("error_calibration.quantile", calib.quantile))
     lines.append(_line("acquisition.property_name", acq.property_name))
     lines.append(_line("acquisition.spectral.enabled", spectral.enabled))
     lines.append(_line("acquisition.spectral.mode", spectral.mode))

@@ -121,6 +121,9 @@ KNOWN_EVENT_TYPES = (
     "phase_pre_submit_intent",
     "phase_submitted",
     "staging_archived",
+    "daemon_lease_conflict",
+    "daemon_lease_stale_recovered",
+    "daemon_lease_cleanup_failed",
 )
 
 

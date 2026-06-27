@@ -101,7 +101,8 @@ def fps_select(
         if candidates.size == 0:
             break
         scores = min_dists[candidates]
-        best_local = int(np.argmax(scores))
+        order = np.lexsort((candidates, -scores))
+        best_local = int(order[0])
         nxt = int(candidates[best_local])
         diversities.append(float(scores[best_local]))
         selected.append(nxt)
