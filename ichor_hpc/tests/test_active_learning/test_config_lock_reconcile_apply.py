@@ -17,6 +17,7 @@ from ichor.hpc.active_learning.daemon.config_lock import (
 )
 from ichor.hpc.active_learning.daemon.journal import iter_events
 from ichor.hpc.active_learning.daemon.reconcile import ReconciliationReport
+from ichor.hpc.active_learning.daemon import input_staging as stg
 from ichor.hpc.active_learning.daemon import submission_intent
 from ichor.hpc.active_learning.daemon.state import (
     CampaignPhase,
@@ -89,6 +90,21 @@ def _write_submitted_initial_ferebus_intent(campaign, job_id="16218598"):
         job_id,
         expected_tasks=12,
     )
+
+
+def _write_archived_bootstrap_handoff(campaign, *, phase, suffix="20260627-201927"):
+    initial = campaign / ".DATA" / ("STAGING.archived-" + suffix) / "initial"
+    pointdir = initial / "POINT_0000.pointdir"
+    pointdir.mkdir(parents=True, exist_ok=True)
+    (pointdir / "input.wfn").write_text("wfn\n", encoding="utf-8")
+    stg.write_quantum_acceptance_manifest(
+        initial,
+        phase_name=phase,
+        iteration=0,
+        accepted=[pointdir],
+        rejected=[],
+    )
+    return initial
 
 
 def _write_stale_pre_submit_intent(campaign, phase):
@@ -835,6 +851,55 @@ def test_reconcile_apply_archive_staging_explicitly_handles_non_ferebus_reentry(
     assert recovered.phase is CampaignPhase.STOP_CHECK
     events = list(iter_events(campaign / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson"))
     assert any(e.get("event") == "staging_archived" for e in events)
+
+
+def test_reconcile_apply_restores_archived_initial_gaussian_handoff(
+    tmp_path,
+    capsys,
+):
+    campaign = _campaign(tmp_path)
+    _write_pool(campaign)
+    config = CampaignConfig()
+    write_config_lock(campaign, config)
+    _write_config(campaign, config)
+    state = fresh_campaign_state(max_iterations=3)
+    state.phase = CampaignPhase.STOP_CHECK
+    state.training_set_version = 0
+    state.models_version = 0
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    archived = _write_archived_bootstrap_handoff(
+        campaign,
+        phase=CampaignPhase.INITIAL_GAUSSIAN.value,
+    )
+
+    rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            allow_fresh_init=False,
+            apply=True,
+            restore_config_from_lock=False,
+            archive_staging=False,
+        )
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    recovered = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
+    assert recovered.phase is CampaignPhase.INITIAL_AIMALL
+    restored = campaign / ".DATA" / "STAGING" / "initial"
+    assert (restored / "accepted_pointdirs.json").is_file()
+    assert (restored / "POINT_0000.pointdir" / "input.wfn").read_text(
+        encoding="utf-8"
+    ) == "wfn\n"
+    assert "Archived bootstrap handoff" in out
+    assert "Restored bootstrap staging from archive" in out
+    events = list(iter_events(campaign / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson"))
+    restored_events = [
+        e for e in events if e.get("event") == "staging_restored_from_archive"
+    ]
+    assert len(restored_events) == 1
+    assert restored_events[0]["source_path"] == str(archived)
+    assert restored_events[0]["source_phase"] == CampaignPhase.INITIAL_GAUSSIAN.value
 
 
 def test_reconcile_apply_archive_staging_refuses_pending_job(tmp_path, capsys):

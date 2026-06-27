@@ -65,6 +65,26 @@ def _write_valid_initial_aimall_handoff(campaign, *, iteration=0):
     return initial
 
 
+def _write_bootstrap_handoff(campaign, *, phase, iteration=0, archived=False, suffix="20260627-201927"):
+    root = (
+        campaign / ".DATA" / ("STAGING.archived-" + suffix)
+        if archived
+        else campaign / ".DATA" / "STAGING"
+    )
+    initial = root / "initial"
+    pointdir = initial / "POINT_0000.pointdir"
+    pointdir.mkdir(parents=True, exist_ok=True)
+    (pointdir / "input.wfn").write_text("wfn\n", encoding="utf-8")
+    stg.write_quantum_acceptance_manifest(
+        initial,
+        phase_name=phase,
+        iteration=iteration,
+        accepted=[pointdir],
+        rejected=[],
+    )
+    return initial
+
+
 def test_propose_recovery_on_empty_campaign_returns_init(tmp_path):
     campaign, _, _, _ = _campaign_dirs(tmp_path)
     report = propose_recovery(campaign)
@@ -171,6 +191,59 @@ def test_propose_recovery_initial_aimall_missing_handoff_halts(tmp_path):
     assert "INITIAL_AIMALL completed" in report.decision
     assert any("initial AIMAll handoff invalid or missing" in r for r in report.unsafe_reasons)
     assert ".DATA/STAGING/initial" in report.blocking_artifacts
+
+
+def test_propose_recovery_archived_initial_gaussian_handoff_reenters_initial_aimall(tmp_path):
+    campaign, data, _, _ = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    append_event(
+        data / "journal.ndjson",
+        "reconcile_applied",
+        phase=CampaignPhase.STOP_CHECK.value,
+        iteration=0,
+    )
+    state = fresh_campaign_state(max_iterations=50)
+    state.phase = CampaignPhase.STOP_CHECK
+    state.training_set_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    archived = _write_bootstrap_handoff(
+        campaign,
+        phase=CampaignPhase.INITIAL_GAUSSIAN.value,
+        archived=True,
+    )
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.INITIAL_AIMALL
+    assert report.proposed_state.training_set_version == -1
+    assert report.proposed_state.models_version == -1
+    assert report.bootstrap_handoff is not None
+    assert report.bootstrap_handoff["archived"] is True
+    assert report.bootstrap_handoff["path"] == str(archived)
+    assert "valid initial Gaussian handoff" in report.decision
+
+
+def test_propose_recovery_archived_initial_aimall_handoff_reenters_initial_ferebus(tmp_path):
+    campaign, data, _, _ = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    state = fresh_campaign_state(max_iterations=50)
+    state.phase = CampaignPhase.STOP_CHECK
+    state.training_set_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    archived = _write_bootstrap_handoff(
+        campaign,
+        phase=CampaignPhase.INITIAL_AIMALL.value,
+        archived=True,
+    )
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.INITIAL_FEREBUS
+    assert report.bootstrap_handoff is not None
+    assert report.bootstrap_handoff["path"] == str(archived)
+    assert "valid initial AIMAll handoff" in report.decision
 
 
 def test_propose_recovery_missing_state_nonempty_staging_halts(tmp_path):

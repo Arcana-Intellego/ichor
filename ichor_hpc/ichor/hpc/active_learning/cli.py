@@ -72,6 +72,7 @@ from .daemon.preflight import check_backends, missing_backend_message
 from .daemon.reconcile import (
     data_staging_inventory,
     propose_recovery,
+    restore_archived_bootstrap_handoff,
     stateful_campaign_artifacts,
     write_proposed_state,
 )
@@ -2386,6 +2387,21 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     print("Last iteration in journal:   " + repr(report.last_iteration_in_journal))
     if report.decision:
         print("Recovery decision:           " + str(report.decision))
+    if report.bootstrap_handoff:
+        label = "Archived bootstrap handoff" if report.bootstrap_handoff.get("archived") else "Bootstrap handoff"
+        print(
+            label
+            + ":     "
+            + repr(
+                {
+                    "path": report.bootstrap_handoff.get("path"),
+                    "phase": report.bootstrap_handoff.get("phase"),
+                    "iteration": report.bootstrap_handoff.get("iteration"),
+                    "n_total": report.bootstrap_handoff.get("n_total"),
+                    "accepted_count": report.bootstrap_handoff.get("accepted_count"),
+                }
+            )
+        )
     if report.trusted_artifacts:
         print("Trusted artefacts:           " + repr(report.trusted_artifacts))
     if report.blocking_artifacts:
@@ -2420,11 +2436,21 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             print("No campaign.yaml changes against the config lock.")
         print("")
     if not bool(getattr(args, "apply", False)):
-        print("Review the proposal, then promote it manually:")
-        print("    mv " + str(target) + " " + str(target_canonical))
-        print("")
-        print("Or apply the safe proposal automatically:")
-        print("    ichor-al-daemon reconcile --campaign-dir " + str(campaign) + " --apply")
+        if report.bootstrap_handoff and report.bootstrap_handoff.get("archived"):
+            print(
+                "This proposal depends on archived bootstrap staging. Use "
+                "--apply so reconcile can restore the handoff before writing "
+                "state.json."
+            )
+            print("")
+            print("Apply the safe proposal automatically:")
+            print("    ichor-al-daemon reconcile --campaign-dir " + str(campaign) + " --apply")
+        else:
+            print("Review the proposal, then promote it manually:")
+            print("    mv " + str(target) + " " + str(target_canonical))
+            print("")
+            print("Or apply the safe proposal automatically:")
+            print("    ichor-al-daemon reconcile --campaign-dir " + str(campaign) + " --apply")
         return 0
 
     if report.proposed_state.phase is CampaignPhase.DONE:
@@ -2648,6 +2674,22 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             _print_cleanup_already_happened(cleanup_paths_already_done)
             return 8
 
+    restored_bootstrap_handoff: List[str] = []
+    try:
+        restored_bootstrap_handoff = restore_archived_bootstrap_handoff(
+            campaign,
+            report,
+        )
+        cleanup_paths_already_done.extend(restored_bootstrap_handoff)
+    except Exception as exc:
+        print(
+            "refusing --apply because archived bootstrap staging could not be restored:",
+            file=sys.stderr,
+        )
+        print("  - " + type(exc).__name__ + ": " + str(exc), file=sys.stderr)
+        _print_cleanup_already_happened(cleanup_paths_already_done)
+        return 9
+
     contract_error = _reconcile_apply_contract_error(campaign, report.proposed_state)
     if contract_error is not None:
         print(
@@ -2734,6 +2776,29 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 mode=str(data_staging_archive_mode),
                 archived_staging_paths=archived,
             )
+        if restored_bootstrap_handoff:
+            append_event(
+                campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
+                "staging_restored_from_archive",
+                phase=report.proposed_state.phase.value,
+                iteration=int(report.proposed_state.iteration),
+                restored_paths=restored_bootstrap_handoff,
+                source_path=(
+                    report.bootstrap_handoff.get("path")
+                    if report.bootstrap_handoff
+                    else None
+                ),
+                source_phase=(
+                    report.bootstrap_handoff.get("phase")
+                    if report.bootstrap_handoff
+                    else None
+                ),
+                n_total=(
+                    report.bootstrap_handoff.get("n_total")
+                    if report.bootstrap_handoff
+                    else None
+                ),
+            )
         append_event(
             campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
             "reconcile_applied",
@@ -2778,6 +2843,10 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     if archived_training_staging:
         print("Archived stale training staging:")
         for path in archived_training_staging:
+            print("  - " + path)
+    if restored_bootstrap_handoff:
+        print("Restored bootstrap staging from archive:")
+        for path in restored_bootstrap_handoff:
             print("  - " + path)
     print("")
     print("Start the daemon with:")

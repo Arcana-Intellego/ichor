@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import shutil
 from typing import Any, Dict, List, Optional, Union
 
 from ..acquisition.trajectory_pool import TrajectoryPool
@@ -41,6 +42,7 @@ __all__ = [
     "ReconciliationReport",
     "data_staging_inventory",
     "propose_recovery",
+    "restore_archived_bootstrap_handoff",
     "stateful_campaign_artifacts",
     "write_proposed_state",
     "RECONCILE_SUFFIX",
@@ -207,6 +209,7 @@ class ReconciliationReport:
     trusted_artifacts: List[str] = field(default_factory=list)
     blocking_artifacts: List[str] = field(default_factory=list)
     recommended_actions: List[str] = field(default_factory=list)
+    bootstrap_handoff: Optional[Dict[str, Any]] = None
 
 
 def _needs_trajectory_pool_check(
@@ -308,9 +311,137 @@ def _validate_initial_ferebus_bootstrap(
     )
 
 
+def _read_bootstrap_handoff_at(
+    initial_dir: Path,
+    *,
+    expected_iteration: int,
+    archived: bool,
+) -> Optional[Dict[str, Any]]:
+    from .input_staging import (
+        quantum_acceptance_manifest_path,
+        read_quantum_acceptance_manifest,
+    )
+    import json as _json
+
+    initial = Path(initial_dir)
+    manifest_path = quantum_acceptance_manifest_path(initial)
+    if not manifest_path.is_file():
+        return None
+    try:
+        raw = _json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    phase = str(raw.get("phase") or "")
+    if phase not in {
+        CampaignPhase.INITIAL_GAUSSIAN.value,
+        CampaignPhase.INITIAL_AIMALL.value,
+    }:
+        return None
+    try:
+        pointdirs, manifest = read_quantum_acceptance_manifest(
+            initial,
+            expected_phase=phase,
+            expected_iteration=int(expected_iteration),
+            require_nonempty=True,
+        )
+    except Exception:
+        return None
+    return {
+        "path": str(initial),
+        "manifest_path": str(manifest_path),
+        "phase": phase,
+        "iteration": int(manifest.get("iteration", expected_iteration)),
+        "n_total": int(manifest.get("n_total", len(pointdirs))),
+        "accepted_count": len(pointdirs),
+        "archived": bool(archived),
+    }
+
+
+def _find_bootstrap_handoff(
+    campaign_dir: Union[str, Path],
+    *,
+    iteration: int,
+) -> Optional[Dict[str, Any]]:
+    campaign = Path(campaign_dir)
+    live = _read_bootstrap_handoff_at(
+        campaign / ".DATA" / "STAGING" / "initial",
+        expected_iteration=int(iteration),
+        archived=False,
+    )
+    if live is not None:
+        return live
+    data = campaign / ".DATA"
+    archives = sorted(
+        [
+            path
+            for path in data.glob("STAGING.archived-*")
+            if path.is_dir() and not path.is_symlink()
+        ],
+        key=lambda path: path.name,
+        reverse=True,
+    )
+    for archive in archives:
+        handoff = _read_bootstrap_handoff_at(
+            archive / "initial",
+            expected_iteration=int(iteration),
+            archived=True,
+        )
+        if handoff is not None:
+            return handoff
+    return None
+
+
+def restore_archived_bootstrap_handoff(
+    campaign_dir: Union[str, Path],
+    report: ReconciliationReport,
+) -> List[str]:
+    handoff = report.bootstrap_handoff
+    if not isinstance(handoff, dict) or not bool(handoff.get("archived")):
+        return []
+    campaign = Path(campaign_dir)
+    source = Path(str(handoff.get("path") or ""))
+    target = campaign / ".DATA" / "STAGING" / "initial"
+    if not source.is_dir():
+        raise FileNotFoundError("archived bootstrap handoff is missing: " + str(source))
+    if source.is_symlink():
+        raise ValueError("refusing to restore symlinked bootstrap handoff: " + str(source))
+    for path in source.rglob("*"):
+        if path.is_symlink():
+            raise ValueError(
+                "refusing to restore bootstrap handoff containing symlink: "
+                + str(path)
+            )
+    campaign_resolved = campaign.resolve()
+    source_resolved = source.resolve()
+    if campaign_resolved not in source_resolved.parents:
+        raise ValueError(
+            "refusing to restore bootstrap handoff outside campaign: "
+            + str(source)
+        )
+    if target.exists():
+        if target.is_symlink():
+            raise ValueError("refusing to restore over symlinked .DATA/STAGING/initial")
+        if not target.is_dir():
+            raise ValueError(".DATA/STAGING/initial exists but is not a directory")
+        existing = [p for p in target.iterdir() if p.name not in (".", "..")]
+        if existing:
+            raise ValueError(
+                "refusing to restore archived bootstrap handoff because "
+                ".DATA/STAGING/initial is not empty"
+            )
+        target.rmdir()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(str(source), str(target), symlinks=False)
+    return [str(target)]
+
+
 def _validate_recovered_state_contract(
     campaign_dir: Union[str, Path],
     state: CampaignState,
+    *,
+    bootstrap_handoff: Optional[Dict[str, Any]] = None,
 ) -> None:
     phase = CampaignPhase(state.phase)
     if phase in {CampaignPhase.INIT, CampaignPhase.DONE, CampaignPhase.HALTED}:
@@ -322,6 +453,12 @@ def _validate_recovered_state_contract(
         and training_version < 0
         and model_version < 0
     ):
+        if (
+            isinstance(bootstrap_handoff, dict)
+            and bootstrap_handoff.get("phase") == CampaignPhase.INITIAL_AIMALL.value
+            and int(bootstrap_handoff.get("iteration", -1)) == int(getattr(state, "iteration", 0))
+        ):
+            return
         _validate_initial_ferebus_bootstrap(
             campaign_dir,
             iteration=int(getattr(state, "iteration", 0)),
@@ -422,10 +559,24 @@ def propose_recovery(
             if phase_hint:
                 last_phase = str(phase_hint)
                 last_iter = event.get("iteration", last_iter)
+    try:
+        bootstrap_iteration = int(
+            getattr(existing, "iteration", 0)
+            if existing is not None
+            else (last_iter if last_iter is not None else 0)
+        )
+    except Exception:
+        bootstrap_iteration = 0
+    bootstrap_handoff = _find_bootstrap_handoff(
+        campaign,
+        iteration=bootstrap_iteration,
+    )
     initial_handoff_indicated = _initial_aimall_handoff_indicated(
         existing=existing,
         last_phase=last_phase,
     )
+    if bootstrap_handoff is not None:
+        initial_handoff_indicated = True
 
     active_intents: List[Dict[str, Any]] = []
     intent_root = _submission_intent.intent_dir(campaign)
@@ -453,7 +604,11 @@ def propose_recovery(
         if p.name not in (".", "..")
     ]
     unexpected_staging_children = list(staging_children)
-    if initial_handoff_indicated and not tv and not mv:
+    valid_live_bootstrap_handoff = (
+        isinstance(bootstrap_handoff, dict)
+        and not bool(bootstrap_handoff.get("archived"))
+    )
+    if initial_handoff_indicated and not tv and not mv and valid_live_bootstrap_handoff:
         unexpected_staging_children = [
             p for p in staging_children
             if p.name != "initial"
@@ -557,7 +712,11 @@ def propose_recovery(
         training_versions=tv,
         model_versions=mv,
         active_intents=active_intents,
-        last_phase=last_phase,
+        last_phase=last_phase or (
+            str(bootstrap_handoff.get("phase"))
+            if isinstance(bootstrap_handoff, dict)
+            else None
+        ),
         staging_children=staging_children,
         script_files=script_files,
         dangling_training=dangling_training,
@@ -620,15 +779,31 @@ def propose_recovery(
     initial_handoff_error: Optional[str] = None
     initial_handoff_valid = False
     if not tv and not mv and initial_handoff_indicated:
-        try:
-            _validate_initial_ferebus_bootstrap(
-                campaign,
-                iteration=int(getattr(recovered, "iteration", 0)),
-            )
+        if bootstrap_handoff is not None:
             initial_handoff_valid = True
-            trusted_artifacts.append("initial AIMAll acceptance manifest")
-        except Exception as exc:
-            initial_handoff_error = type(exc).__name__ + ": " + str(exc)[:180]
+            source = "archived" if bootstrap_handoff.get("archived") else "live"
+            trusted_artifacts.append(
+                source
+                + " bootstrap handoff "
+                + str(bootstrap_handoff.get("phase"))
+                + " at "
+                + str(bootstrap_handoff.get("path"))
+            )
+            if bool(bootstrap_handoff.get("archived")):
+                notes.append(
+                    "archived bootstrap handoff found at "
+                    + str(bootstrap_handoff.get("path"))
+                )
+        else:
+            try:
+                _validate_initial_ferebus_bootstrap(
+                    campaign,
+                    iteration=int(getattr(recovered, "iteration", 0)),
+                )
+                initial_handoff_valid = True
+                trusted_artifacts.append("initial AIMAll acceptance manifest")
+            except Exception as exc:
+                initial_handoff_error = type(exc).__name__ + ": " + str(exc)[:180]
 
     if coherent_pairs:
         coherent = int(coherent_pairs[-1])
@@ -700,13 +875,25 @@ def propose_recovery(
             except Exception:
                 recovered.phase = CampaignPhase.HALTED
     elif not tv and not mv and initial_handoff_indicated and initial_handoff_valid and not unsafe_reasons:
-        recovered.phase = CampaignPhase.INITIAL_FEREBUS
+        handoff_phase = (
+            str(bootstrap_handoff.get("phase"))
+            if isinstance(bootstrap_handoff, dict)
+            else CampaignPhase.INITIAL_AIMALL.value
+        )
+        if handoff_phase == CampaignPhase.INITIAL_GAUSSIAN.value:
+            recovered.phase = CampaignPhase.INITIAL_AIMALL
+            decision = "INITIAL_AIMALL: valid initial Gaussian handoff exists without committed models"
+            notes.append(
+                "re-entry at INITIAL_AIMALL to process the initial Gaussian handoff"
+            )
+        else:
+            recovered.phase = CampaignPhase.INITIAL_FEREBUS
+            decision = "INITIAL_FEREBUS: valid initial AIMAll handoff exists without committed models"
+            notes.append(
+                "re-entry at INITIAL_FEREBUS to commit initial training/model version 0"
+            )
         recovered.training_set_version = -1
         recovered.models_version = -1
-        decision = "INITIAL_FEREBUS: valid initial AIMAll handoff exists without committed models"
-        notes.append(
-            "re-entry at INITIAL_FEREBUS to commit initial training/model version 0"
-        )
     elif not tv and not mv and initial_handoff_indicated:
         recovered.phase = CampaignPhase.HALTED
         recovered.training_set_version = -1
@@ -772,7 +959,11 @@ def propose_recovery(
     recovered.shutdown_requested = False
     if recovered.phase is not CampaignPhase.HALTED:
         try:
-            _validate_recovered_state_contract(campaign, recovered)
+            _validate_recovered_state_contract(
+                campaign,
+                recovered,
+                bootstrap_handoff=bootstrap_handoff,
+            )
         except Exception as exc:
             recovered.phase = CampaignPhase.HALTED
             reason = (
@@ -804,6 +995,7 @@ def propose_recovery(
         trusted_artifacts=trusted_artifacts,
         blocking_artifacts=blocking_artifacts,
         recommended_actions=recommended_actions,
+        bootstrap_handoff=bootstrap_handoff,
     )
 
 
