@@ -40,6 +40,7 @@ __all__ = [
     "poll_job",
     "find_active_job_by_id_detailed",
     "JobNameLookup",
+    "find_active_job_by_name_detailed",
     "find_running_job_by_name_detailed",
     "find_running_job_by_name",
 ]
@@ -333,6 +334,10 @@ def _squeue_invalid_job_id(stderr: str) -> bool:
     return "invalid job id specified" in text or "invalid job id" in text
 
 
+def _base_allocation_id(job_id: str) -> str:
+    return str(job_id).split("_", 1)[0].split(".", 1)[0]
+
+
 def find_active_job_by_id_detailed(
     job_id: str,
     *,
@@ -396,10 +401,66 @@ class JobNameLookup:
         return bool(self.job_id)
 
 
+def find_active_job_by_name_detailed(
+    name: str,
+    *,
+    squeue_runner: Optional[Callable[..., Any]] = None,
+) -> JobNameLookup:
+    """Find an active Slurm job by name using ``squeue``.
+
+    This is a liveness fallback for the short window where ``sbatch`` has
+    accepted a job, but ``sacct`` has not yet made the job visible by name.
+    """
+    if squeue_runner is None:
+        squeue_runner = subprocess.run
+    cmd = [
+        "squeue",
+        "--name", str(name),
+        "--noheader",
+        "--format=%i|%T|%j",
+    ]
+    try:
+        completed = squeue_runner(cmd, check=False, capture_output=True, text=True)
+    except Exception as exc:
+        return JobNameLookup(
+            None,
+            inconclusive=True,
+            error=type(exc).__name__ + ": " + str(exc),
+        )
+    return_code = int(getattr(completed, "returncode", 1))
+    if return_code != 0:
+        stderr = getattr(completed, "stderr", "") or ""
+        return JobNameLookup(
+            None,
+            inconclusive=True,
+            error="squeue exited with code " + str(return_code) + ": " + repr(stderr),
+        )
+    rows: List[Tuple[str, str]] = []
+    active_ids = set()
+    for line in (getattr(completed, "stdout", "") or "").splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("|")
+        job_id = parts[0].strip() if len(parts) > 0 else ""
+        state = parts[1].strip() if len(parts) > 1 else ""
+        job_name = parts[2].strip() if len(parts) > 2 else ""
+        if not job_id:
+            continue
+        if job_name and job_name != str(name):
+            continue
+        rows.append((job_id, state))
+        active_ids.add(_base_allocation_id(job_id))
+    if not active_ids:
+        return JobNameLookup(None, inconclusive=False, rows=rows)
+    return JobNameLookup(sorted(active_ids)[0], inconclusive=False, rows=rows)
+
+
 def find_running_job_by_name_detailed(
     name: str,
     *,
     sacct_runner: Optional[Callable[..., Any]] = None,
+    squeue_runner: Optional[Callable[..., Any]] = None,
+    use_squeue_fallback: bool = False,
 ) -> JobNameLookup:
     """Look for a still-running (or queued) SLURM job with this --job-name and return its JobID,
     or None.
@@ -447,9 +508,16 @@ def find_running_job_by_name_detailed(
         rows.append((job_id, status.value))
         if status in NON_TERMINAL_STATES:
             # 123_4 -> 123 (and 123.batch -> 123): adopt the whole allocation, not a sub-step.
-            base = job_id.split("_", 1)[0].split(".", 1)[0]
+            base = _base_allocation_id(job_id)
             non_terminal.add(base)
     if not non_terminal:
+        if use_squeue_fallback:
+            fallback = find_active_job_by_name_detailed(
+                name,
+                squeue_runner=squeue_runner,
+            )
+            if fallback.job_id or fallback.inconclusive:
+                return fallback
         return JobNameLookup(None, inconclusive=False, rows=rows)
     # lowest id == earliest submission; adopt that one if somehow several share the name.
     return JobNameLookup(sorted(non_terminal)[0], inconclusive=False, rows=rows)
@@ -459,8 +527,12 @@ def find_running_job_by_name(
     name: str,
     *,
     sacct_runner: Optional[Callable[..., Any]] = None,
+    squeue_runner: Optional[Callable[..., Any]] = None,
+    use_squeue_fallback: bool = False,
 ) -> Optional[str]:
     return find_running_job_by_name_detailed(
         name,
         sacct_runner=sacct_runner,
+        squeue_runner=squeue_runner,
+        use_squeue_fallback=use_squeue_fallback,
     ).job_id

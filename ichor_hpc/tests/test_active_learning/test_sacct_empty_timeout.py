@@ -24,7 +24,12 @@ from ichor.hpc.active_learning.submit.sacct_poll import (
 )
 
 
-def _setup_daemon_with_pending_job(tmp_path, empty_poller, max_ticks=3):
+def _setup_daemon_with_pending_job(
+    tmp_path,
+    empty_poller,
+    max_ticks=3,
+    job_liveness_checker=None,
+):
     """Daemon with state preloaded with a pending SBATCH job."""
     cd = tmp_path / "campaign"
     (cd / ".DATA" / "ACTIVE_LEARNING").mkdir(parents=True)
@@ -41,6 +46,7 @@ def _setup_daemon_with_pending_job(tmp_path, empty_poller, max_ticks=3):
         campaign_dir=cd, config=cfg,
         executor=MockPhaseExecutor(), sacct_poller=empty_poller,
         sleep_fn=lambda s: None,
+        job_liveness_checker=job_liveness_checker,
     )
     return daemon, state_path
 
@@ -87,6 +93,64 @@ def test_streak_escalates_to_failure_at_max(tmp_path):
     assert timeouts, "sacct_empty_timeout event missing"
     assert timeouts[-1]["job_id"] == "99999"
     assert timeouts[-1]["streak"] == 3
+
+
+def test_empty_sacct_keeps_polling_when_squeue_active(tmp_path):
+    empty_poller = lambda job_id: []
+    daemon, state_path = _setup_daemon_with_pending_job(
+        tmp_path,
+        empty_poller,
+        max_ticks=2,
+        job_liveness_checker=lambda job_id: SimpleNamespace(
+            active=True,
+            inconclusive=False,
+            rows=[(str(job_id) + "_[0-2%1]", "PENDING")],
+            error=None,
+        ),
+    )
+
+    assert daemon.tick() == TickStatus.POLLING
+    assert daemon.tick() == TickStatus.POLLING
+
+    st = read_state(state_path)
+    assert st.phase is CampaignPhase.GAUSSIAN
+    assert st.pending_jobs[CampaignPhase.GAUSSIAN.value] == "99999"
+    assert st.sacct_empty_streak.get("99999") == 2
+    events = [
+        json.loads(line) for line in (tmp_path / "campaign" / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(e.get("event") == "sacct_empty_but_squeue_active" for e in events)
+    assert not any(e.get("event") == "sacct_empty_timeout" for e in events)
+
+
+def test_empty_sacct_keeps_polling_when_squeue_inconclusive(tmp_path):
+    empty_poller = lambda job_id: []
+    daemon, state_path = _setup_daemon_with_pending_job(
+        tmp_path,
+        empty_poller,
+        max_ticks=2,
+        job_liveness_checker=lambda job_id: SimpleNamespace(
+            active=False,
+            inconclusive=True,
+            rows=[],
+            error="squeue unavailable",
+        ),
+    )
+
+    assert daemon.tick() == TickStatus.POLLING
+    assert daemon.tick() == TickStatus.POLLING
+
+    st = read_state(state_path)
+    assert st.phase is CampaignPhase.GAUSSIAN
+    assert st.pending_jobs[CampaignPhase.GAUSSIAN.value] == "99999"
+    assert st.sacct_empty_streak.get("99999") == 2
+    events = [
+        json.loads(line) for line in (tmp_path / "campaign" / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(e.get("event") == "squeue_liveness_inconclusive" for e in events)
+    assert not any(e.get("event") == "sacct_empty_timeout" for e in events)
 
 
 def test_non_empty_response_resets_streak(tmp_path):

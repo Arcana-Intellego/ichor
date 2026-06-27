@@ -107,6 +107,7 @@ KNOWN_EVENT_TYPES = (
     "operator_cancelled_jobs",
     "sacct_unknown_timeout",
     "sacct_missing_timeout",
+    "sacct_empty_but_squeue_active",
     "sacct_rows_missing_but_squeue_active",
     "squeue_liveness_inconclusive",
     "transient_phase_retry",

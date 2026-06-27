@@ -2456,7 +2456,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 # ---module level: sbatch script builder -----------------
 
 
-def make_live_job_finder(sacct_runner=None):
+def make_live_job_finder(sacct_runner=None, squeue_runner=None):
     """the job_finder the daemon uses in live mode: given (state, phase) return the JobID of an
     already-running job for that exact phase+iteration, or None. lets the daemon adopt a job a crash
     orphaned rather than double-submit (A24/A25)."""
@@ -2475,8 +2475,14 @@ def make_live_job_finder(sacct_runner=None):
                 names.append(legacy)
         inconclusive: Optional[JobNameLookup] = None
         last_lookup = JobNameLookup(None, inconclusive=False)
+        use_squeue_fallback = squeue_runner is not None or sacct_runner is None
         for name in names:
-            found = find_running_job_by_name_detailed(name, sacct_runner=sacct_runner)
+            found = find_running_job_by_name_detailed(
+                name,
+                sacct_runner=sacct_runner,
+                squeue_runner=squeue_runner,
+                use_squeue_fallback=use_squeue_fallback,
+            )
             last_lookup = found
             if found.job_id:
                 return found

@@ -619,7 +619,7 @@ class Daemon:
                 )
                 return TickStatus.SUBMITTED
             if active_intent is not None and lookup_inconclusive:
-                return self._halt(
+                return self._halt_scheduler_uncertain(
                     state,
                     phase,
                     "active_submission_adoption_inconclusive: "
@@ -629,11 +629,52 @@ class Daemon:
             active_job_id = active_intent.get("job_id")
             if active_job_id is not None and self.job_liveness_checker is not None:
                 liveness = self._check_job_liveness(str(active_job_id))
-                if liveness is not None and (
-                    bool(getattr(liveness, "active", False))
-                    or bool(getattr(liveness, "inconclusive", False))
-                ):
-                    return self._halt(
+                if liveness is not None and bool(getattr(liveness, "active", False)):
+                    expected_tasks = self._expected_tasks_for_adoption(
+                        active_intent,
+                        state,
+                        phase,
+                    )
+                    if expected_tasks is None and self._strict_artifact_checks_enabled():
+                        return self._halt_scheduler_uncertain(
+                            state,
+                            phase,
+                            "active_submission_expected_tasks_unavailable: "
+                            + phase_name
+                            + "@"
+                            + str(int(state.iteration)),
+                        )
+                    state.pending_jobs[phase_name] = str(active_job_id)
+                    try:
+                        _submission_intent.mark_adopted(
+                            self.campaign_dir,
+                            phase_name,
+                            int(state.iteration),
+                            str(active_job_id),
+                            expected_tasks=expected_tasks,
+                        )
+                    except Exception as exc:
+                        self._journal(
+                            "submission_intent_update_failed",
+                            phase=phase_name,
+                            iteration=int(state.iteration),
+                            error=str(exc)[:200],
+                        )
+                    self._persist(state)
+                    self._journal(
+                        "adopted_inflight_job",
+                        phase=phase_name,
+                        job_id=str(active_job_id),
+                        iteration=state.iteration,
+                        n_matching_sacct_rows=0,
+                        matching_sacct_rows_sample=[],
+                        matching_sacct_rows_truncated=False,
+                        expected_tasks=expected_tasks,
+                        squeue_rows_sample=self._queue_rows_sample(liveness),
+                    )
+                    return TickStatus.SUBMITTED
+                if liveness is not None and bool(getattr(liveness, "inconclusive", False)):
+                    return self._halt_scheduler_uncertain(
                         state,
                         phase,
                         "active_submission_liveness_blocks_resubmit: "
@@ -782,12 +823,32 @@ class Daemon:
             current = state.sacct_empty_streak.get(job_id, 0) + 1
             state.sacct_empty_streak[job_id] = current
             self._persist(state)
+            liveness = self._check_job_liveness(job_id)
+            if self._liveness_blocks_accounting_timeout(liveness):
+                self._journal_sparse_accounting_liveness(
+                    phase=phase,
+                    job_id=job_id,
+                    streak=current,
+                    liveness=liveness,
+                    kind="empty",
+                    summary=summary,
+                    iteration=state.iteration,
+                )
+                return TickStatus.POLLING
             max_ticks = int(getattr(self.config, "poll_sacct_empty_max_ticks", 10))
             if max_ticks > 0 and current >= max_ticks:
                 self._journal(
                     "sacct_empty_timeout",
                     phase=phase.value, job_id=job_id,
                     streak=int(current), max_ticks=int(max_ticks),
+                    squeue_active=(
+                        None if liveness is None
+                        else bool(getattr(liveness, "active", False))
+                    ),
+                    squeue_inconclusive=(
+                        None if liveness is None
+                        else bool(getattr(liveness, "inconclusive", False))
+                    ),
                     iteration=state.iteration,
                 )
                 #treat as a full failure of every task in the array. Route
@@ -838,6 +899,17 @@ class Daemon:
             state.sacct_empty_streak[missing_key] = current
             self._persist(state)
             liveness = self._check_job_liveness(job_id)
+            if self._liveness_blocks_accounting_timeout(liveness):
+                self._journal_sparse_accounting_liveness(
+                    phase=phase,
+                    job_id=job_id,
+                    streak=current,
+                    liveness=liveness,
+                    kind="missing",
+                    summary=summary,
+                    iteration=state.iteration,
+                )
+                return TickStatus.POLLING
             max_missing = int(
                 getattr(self.config.runtime, "poll_sacct_missing_max_ticks", 3)
             )
@@ -872,35 +944,6 @@ class Daemon:
                     + str(int(getattr(summary, "n_missing", 0)))
                     + " expected Slurm array task rows",
                 )
-            if liveness is not None and (
-                bool(getattr(liveness, "active", False))
-                or bool(getattr(liveness, "inconclusive", False))
-            ):
-                if bool(getattr(liveness, "active", False)):
-                    self._journal(
-                        "sacct_rows_missing_but_squeue_active",
-                        phase=phase.value,
-                        job_id=job_id,
-                        n_expected=getattr(summary, "n_expected", None),
-                        n_observed=int(getattr(summary, "n_observed", 0)),
-                        n_missing=int(getattr(summary, "n_missing", 0)),
-                        streak=int(current),
-                        squeue_rows_sample=self._queue_rows_sample(liveness),
-                        iteration=state.iteration,
-                    )
-                else:
-                    self._journal(
-                        "squeue_liveness_inconclusive",
-                        phase=phase.value,
-                        job_id=job_id,
-                        n_expected=getattr(summary, "n_expected", None),
-                        n_observed=int(getattr(summary, "n_observed", 0)),
-                        n_missing=int(getattr(summary, "n_missing", 0)),
-                        streak=int(current),
-                        error=str(getattr(liveness, "error", "") or "")[:200],
-                        iteration=state.iteration,
-                    )
-                return TickStatus.POLLING
             return TickStatus.POLLING
         if missing_key in state.sacct_empty_streak:
             state.sacct_empty_streak.pop(missing_key, None)
@@ -1274,6 +1317,45 @@ class Daemon:
         state.sacct_empty_streak.pop(str(job_id) + ":UNKNOWN", None)
         state.sacct_empty_streak.pop(str(job_id) + ":MISSING", None)
 
+    def _liveness_blocks_accounting_timeout(self, liveness: Optional[Any]) -> bool:
+        return liveness is not None and (
+            bool(getattr(liveness, "active", False))
+            or bool(getattr(liveness, "inconclusive", False))
+        )
+
+    def _journal_sparse_accounting_liveness(
+        self,
+        *,
+        phase: CampaignPhase,
+        job_id: str,
+        streak: int,
+        liveness: Any,
+        kind: str,
+        summary: Any,
+        iteration: int,
+    ) -> None:
+        payload = {
+            "phase": phase.value,
+            "job_id": job_id,
+            "n_expected": getattr(summary, "n_expected", None),
+            "n_observed": int(getattr(summary, "n_observed", 0)),
+            "n_missing": int(getattr(summary, "n_missing", 0)),
+            "streak": int(streak),
+            "accounting_kind": str(kind),
+            "iteration": int(iteration),
+        }
+        if bool(getattr(liveness, "active", False)):
+            event = (
+                "sacct_empty_but_squeue_active"
+                if str(kind) == "empty"
+                else "sacct_rows_missing_but_squeue_active"
+            )
+            payload["squeue_rows_sample"] = self._queue_rows_sample(liveness)
+            self._journal(event, **payload)
+            return
+        payload["error"] = str(getattr(liveness, "error", "") or "")[:200]
+        self._journal("squeue_liveness_inconclusive", **payload)
+
     def _looks_like_file_settle(self, reason: str) -> bool:
         text = str(reason).lower()
         markers = (
@@ -1406,6 +1488,25 @@ class Daemon:
         self._persist(state)
         self._journal("halt", from_phase=phase.value, reason=reason,
                       iteration=state.iteration)
+        return TickStatus.HALTED
+
+    def _halt_scheduler_uncertain(
+        self,
+        state: CampaignState,
+        phase: CampaignPhase,
+        reason: str,
+    ) -> str:
+        state.phase = CampaignPhase.HALTED
+        self._persist(state)
+        self._journal(
+            "halt",
+            from_phase=phase.value,
+            reason=reason,
+            scheduler_uncertain=True,
+            preserves_pending_jobs=True,
+            preserves_submission_intent=True,
+            iteration=state.iteration,
+        )
         return TickStatus.HALTED
 
     def _halt_after_tick_exception(self, exc: Exception) -> bool:

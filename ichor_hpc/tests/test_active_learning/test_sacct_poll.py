@@ -13,6 +13,8 @@ from ichor.hpc.active_learning.submit.sacct_poll import (
     TERMINAL_STATES,
     aggregate_states,
     find_active_job_by_id_detailed,
+    find_active_job_by_name_detailed,
+    find_running_job_by_name_detailed,
     parse_sacct_output,
     poll_job,
 )
@@ -263,3 +265,32 @@ def test_find_active_job_by_id_invalid_job_id_is_conclusive_inactive():
     assert not lookup.inconclusive
     assert lookup.rows == []
     assert lookup.error is None
+
+
+def test_find_active_job_by_name_uses_squeue_rows():
+    runner = _StubRunner(
+        result=_StubResult(stdout="16153025_[6-9%2]|PENDING|camp-GAUSSIAN-1\n")
+    )
+    lookup = find_active_job_by_name_detailed("camp-GAUSSIAN-1", squeue_runner=runner)
+    assert lookup.job_id == "16153025"
+    assert not lookup.inconclusive
+    assert lookup.rows == [("16153025_[6-9%2]", "PENDING")]
+    call = runner.calls[0]
+    assert call[:2] == ["squeue", "--name"]
+    assert "camp-GAUSSIAN-1" in call
+
+
+def test_find_running_job_by_name_can_fallback_to_squeue_when_sacct_empty():
+    sacct_runner = _StubRunner(result=_StubResult(stdout=""))
+    squeue_runner = _StubRunner(
+        result=_StubResult(stdout="16153025_0|RUNNING|camp-AIMALL-1\n")
+    )
+    lookup = find_running_job_by_name_detailed(
+        "camp-AIMALL-1",
+        sacct_runner=sacct_runner,
+        squeue_runner=squeue_runner,
+        use_squeue_fallback=True,
+    )
+    assert lookup.job_id == "16153025"
+    assert sacct_runner.calls
+    assert squeue_runner.calls

@@ -1875,7 +1875,8 @@ def _resolve_terminal_submission_intents_for_apply(
                     })
                     continue
                 lookup = sacct_poll.find_running_job_by_name_detailed(
-                    expected_job_name
+                    expected_job_name,
+                    use_squeue_fallback=True,
                 )
                 if lookup.inconclusive:
                     blocking.append({

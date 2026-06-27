@@ -219,6 +219,50 @@ def _partial_array_poll(job_id, **kw):
     ]
 
 
+def test_phase_entry_adopts_active_intent_job_id_when_squeue_active(tmp_path):
+    campaign = tmp_path / "campaign"
+    cfg = CampaignConfig(max_iterations=1)
+    d = Daemon(
+        campaign_dir=campaign,
+        config=cfg,
+        executor=MockPhaseExecutor(treat_as_sbatch=set(_SBATCH_PHASES)),
+        job_finder=lambda state, phase: SimpleNamespace(
+            job_id=None,
+            inconclusive=False,
+            rows=[],
+        ),
+        job_liveness_checker=lambda job_id: SimpleNamespace(
+            active=True,
+            inconclusive=False,
+            rows=[(str(job_id) + "_[0-4%2]", "PENDING")],
+            error=None,
+        ),
+    )
+    d.data_dir().mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.INITIAL_GAUSSIAN
+    submission_intent.mark_submitted(
+        campaign,
+        CampaignPhase.INITIAL_GAUSSIAN.value,
+        0,
+        "888",
+        expected_tasks=5,
+    )
+
+    assert d._on_phase_entry(state, state.phase) == TickStatus.SUBMITTED
+
+    persisted = read_state(d.state_path())
+    assert persisted.phase is CampaignPhase.INITIAL_GAUSSIAN
+    assert persisted.pending_jobs[CampaignPhase.INITIAL_GAUSSIAN.value] == "888"
+    intent = submission_intent.load_intent(
+        campaign,
+        CampaignPhase.INITIAL_GAUSSIAN.value,
+        0,
+    )
+    assert intent["status"] == "ADOPTED"
+    assert intent["job_id"] == "888"
+
+
 def test_missing_sacct_rows_keep_polling_when_squeue_still_active(tmp_path):
     d = _make_daemon(
         tmp_path,
@@ -244,11 +288,15 @@ def test_missing_sacct_rows_keep_polling_when_squeue_still_active(tmp_path):
     events = list(iter_events(d.journal_path()))
     assert any(e.get("event") == "sacct_rows_missing_but_squeue_active" for e in events)
 
-    assert d.tick() == TickStatus.HALTED
+    assert d.tick() == TickStatus.POLLING
     halted = read_state(d.state_path())
-    assert halted.phase is CampaignPhase.HALTED
+    assert halted.phase is CampaignPhase.INITIAL_AIMALL
+    assert halted.pending_jobs[CampaignPhase.INITIAL_AIMALL.value] == "777"
+    assert halted.sacct_empty_streak.get("777:MISSING") == 2
+    intent = submission_intent.load_intent(d.campaign_dir, CampaignPhase.INITIAL_AIMALL.value, 0)
+    assert intent["status"] == "SUBMITTED"
     events = list(iter_events(d.journal_path()))
-    assert any(e.get("event") == "sacct_missing_timeout" for e in events)
+    assert not any(e.get("event") == "sacct_missing_timeout" for e in events)
 
 
 def test_missing_sacct_rows_keep_polling_when_squeue_inconclusive(tmp_path):
@@ -272,11 +320,15 @@ def test_missing_sacct_rows_keep_polling_when_squeue_inconclusive(tmp_path):
     events = list(iter_events(d.journal_path()))
     assert any(e.get("event") == "squeue_liveness_inconclusive" for e in events)
 
-    assert d.tick() == TickStatus.HALTED
+    assert d.tick() == TickStatus.POLLING
     halted = read_state(d.state_path())
-    assert halted.phase is CampaignPhase.HALTED
+    assert halted.phase is CampaignPhase.INITIAL_AIMALL
+    assert halted.pending_jobs[CampaignPhase.INITIAL_AIMALL.value] == "777"
+    assert halted.sacct_empty_streak.get("777:MISSING") == 2
+    intent = submission_intent.load_intent(d.campaign_dir, CampaignPhase.INITIAL_AIMALL.value, 0)
+    assert intent["status"] == "SUBMITTED"
     events = list(iter_events(d.journal_path()))
-    assert any(e.get("event") == "sacct_missing_timeout" for e in events)
+    assert not any(e.get("event") == "sacct_missing_timeout" for e in events)
 
 
 def test_missing_sacct_rows_halt_when_squeue_confirms_job_gone(tmp_path):

@@ -166,7 +166,10 @@ def test_submission_intent_exists_before_executor_calls_sbatch(tmp_path):
 
 
 def test_active_submission_intent_requires_successful_adoption_check(tmp_path):
-    from ichor.hpc.active_learning.daemon.submission_intent import write_pre_submit_intent
+    from ichor.hpc.active_learning.daemon.submission_intent import (
+        load_intent,
+        write_pre_submit_intent,
+    )
 
     d = Daemon(
         campaign_dir=tmp_path, config=CampaignConfig(),
@@ -185,6 +188,8 @@ def test_active_submission_intent_requires_successful_adoption_check(tmp_path):
     status = d._on_phase_entry(state, state.phase)
     assert status == TickStatus.HALTED
     assert read_state(d.state_path()).phase is CampaignPhase.HALTED
+    intent = load_intent(tmp_path, "FEREBUS", 0)
+    assert intent["status"] == "PRE_SUBMIT"
 
 
 def test_submission_intent_records_job_id_even_if_state_persist_fails(monkeypatch, tmp_path):
@@ -290,6 +295,36 @@ def test_live_job_finder_checks_new_and_legacy_uid_prefixes():
 
     assert lookup.job_id == "555"
     assert seen == ["abcdefghijkl-FEREBUS-3", "abcdefgh-FEREBUS-3"]
+
+
+def test_live_job_finder_uses_squeue_fallback_when_sacct_has_no_rows():
+    from types import SimpleNamespace
+
+    from ichor.hpc.active_learning.daemon.live_executor import make_live_job_finder
+
+    sacct_seen = []
+    squeue_seen = []
+
+    def sacct_runner(cmd, **kwargs):
+        sacct_seen.append(cmd[cmd.index("--name") + 1])
+        return _stub_sacct("")()
+
+    def squeue_runner(cmd, **kwargs):
+        squeue_seen.append(cmd[cmd.index("--name") + 1])
+        return _stub_sacct("999_[0-4%2]|PENDING|abcdefghijkl-GAUSSIAN-2\n")()
+
+    finder = make_live_job_finder(
+        sacct_runner=sacct_runner,
+        squeue_runner=squeue_runner,
+    )
+    lookup = finder(
+        SimpleNamespace(campaign_uid="abcdefghijklmnop", iteration=2),
+        CampaignPhase.GAUSSIAN,
+    )
+
+    assert lookup.job_id == "999"
+    assert sacct_seen == ["abcdefghijkl-GAUSSIAN-2"]
+    assert squeue_seen == ["abcdefghijkl-GAUSSIAN-2"]
 
 
 # --- A4 / A55: manifest robustness ---------------------------------------------------------

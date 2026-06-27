@@ -945,7 +945,7 @@ def test_reconcile_apply_supersedes_stale_pre_submit_without_job_id(
     monkeypatch.setattr(
         sacct_poll,
         "find_running_job_by_name_detailed",
-        lambda name: sacct_poll.JobNameLookup(None, inconclusive=False, rows=[]),
+        lambda name, **kwargs: sacct_poll.JobNameLookup(None, inconclusive=False, rows=[]),
     )
 
     rc = cmd_reconcile(
@@ -979,7 +979,7 @@ def test_reconcile_apply_blocks_ferebus_pre_submit_without_job_id(
     phase = CampaignPhase.INITIAL_FEREBUS.value
     _write_stale_pre_submit_intent(campaign, phase)
 
-    def fail_lookup(name):
+    def fail_lookup(name, **kwargs):
         raise AssertionError("FEREBUS PRE_SUBMIT must not use ICHOR job-name lookup")
 
     monkeypatch.setattr(sacct_poll, "find_running_job_by_name_detailed", fail_lookup)
@@ -1018,7 +1018,7 @@ def test_reconcile_apply_blocks_pre_submit_without_job_id_when_job_exists(
     monkeypatch.setattr(
         sacct_poll,
         "find_running_job_by_name_detailed",
-        lambda name: sacct_poll.JobNameLookup(
+        lambda name, **kwargs: sacct_poll.JobNameLookup(
             "222",
             inconclusive=False,
             rows=[("222", "RUNNING")],
@@ -1059,7 +1059,7 @@ def test_reconcile_apply_blocks_pre_submit_without_job_id_on_lookup_failure(
     monkeypatch.setattr(
         sacct_poll,
         "find_running_job_by_name_detailed",
-        lambda name: sacct_poll.JobNameLookup(
+        lambda name, **kwargs: sacct_poll.JobNameLookup(
             None,
             inconclusive=True,
             rows=[],
