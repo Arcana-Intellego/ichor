@@ -151,6 +151,29 @@ def test_phase_walltime_changes_are_allowed_runtime_changes(tmp_path):
     assert not review.blocked_changes
 
 
+def test_memory_estimate_guard_default_migration_is_allowed(tmp_path):
+    campaign = _campaign(tmp_path)
+    original = CampaignConfig()
+    write_config_lock(campaign, original)
+    path = config_lock_path(campaign)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    del payload["canonical_config"]["resources"]["fail_on_memory_estimate_exceeds_request"]
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    changed = CampaignConfig()
+    _write_config(campaign, changed)
+
+    proposed = fresh_campaign_state()
+    proposed.phase = CampaignPhase.INITIAL_AIMALL
+    review = review_config_changes(campaign, changed, proposed)
+
+    assert review.allowed
+    assert [c.path for c in review.allowed_changes] == [
+        "resources.fail_on_memory_estimate_exceeds_request"
+    ]
+    assert not review.blocked_changes
+
+
 def test_ariadne_backtransform_changes_are_future_safe(tmp_path):
     campaign = _campaign(tmp_path)
     original = CampaignConfig()

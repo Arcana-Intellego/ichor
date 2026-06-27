@@ -167,6 +167,7 @@ ALWAYS_SAFE_RESOURCE_EXACT = {
     "resources.ferebus_walltime_hours",
     "resources.array_concurrency_limit",
     "resources.gradient_parallel_backend",
+    "resources.fail_on_memory_estimate_exceeds_request",
 }
 
 FUTURE_SAFE_PREFIXES = {
