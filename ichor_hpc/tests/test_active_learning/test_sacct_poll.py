@@ -280,6 +280,23 @@ def test_find_active_job_by_name_uses_squeue_rows():
     assert "camp-GAUSSIAN-1" in call
 
 
+def test_find_active_job_by_name_multiple_active_rows_is_inconclusive():
+    runner = _StubRunner(
+        result=_StubResult(
+            stdout=(
+                "16153025_0|RUNNING|camp-GAUSSIAN-1\n"
+                "16153026_0|PENDING|camp-GAUSSIAN-1\n"
+            )
+        )
+    )
+
+    lookup = find_active_job_by_name_detailed("camp-GAUSSIAN-1", squeue_runner=runner)
+
+    assert lookup.job_id is None
+    assert lookup.inconclusive
+    assert "multiple active jobs" in str(lookup.error)
+
+
 def test_find_running_job_by_name_can_fallback_to_squeue_when_sacct_empty():
     sacct_runner = _StubRunner(result=_StubResult(stdout=""))
     squeue_runner = _StubRunner(
@@ -294,3 +311,26 @@ def test_find_running_job_by_name_can_fallback_to_squeue_when_sacct_empty():
     assert lookup.job_id == "16153025"
     assert sacct_runner.calls
     assert squeue_runner.calls
+
+
+def test_find_running_job_by_name_multiple_squeue_rows_is_inconclusive():
+    sacct_runner = _StubRunner(result=_StubResult(stdout=""))
+    squeue_runner = _StubRunner(
+        result=_StubResult(
+            stdout=(
+                "16153025_0|RUNNING|camp-AIMALL-1\n"
+                "16153026_0|PENDING|camp-AIMALL-1\n"
+            )
+        )
+    )
+
+    lookup = find_running_job_by_name_detailed(
+        "camp-AIMALL-1",
+        sacct_runner=sacct_runner,
+        squeue_runner=squeue_runner,
+        use_squeue_fallback=True,
+    )
+
+    assert lookup.job_id is None
+    assert lookup.inconclusive
+    assert "multiple active jobs" in str(lookup.error)

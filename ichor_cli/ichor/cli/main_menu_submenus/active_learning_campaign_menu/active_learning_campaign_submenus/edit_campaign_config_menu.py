@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Optional
 
 import ichor.cli.global_menu_variables
-import ichor.hpc.global_variables
 from consolemenu.items import FunctionItem, SubmenuItem
 from ichor.cli.console_menu import ConsoleMenu, add_items_to_menu
 from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
@@ -91,6 +90,15 @@ _last_save_path: Optional[Path] = None
 _last_error: str = ""
 _last_config_lock_error: str = ""
 _last_saved_config_lock_error: str = ""
+
+
+def _log_info(message: str) -> None:
+    try:
+        import ichor.hpc.global_variables as global_variables
+
+        global_variables.LOGGER.info(message)
+    except Exception:
+        pass
 
 
 def _config_fingerprint(cfg: CampaignConfig) -> str:
@@ -222,13 +230,32 @@ def _saved_config_path_for_review(config_override=None) -> Optional[Path]:
     return campaign_dir / "campaign.yaml"
 
 
-def saved_config_lock_review(config_override=None):
+def _load_saved_config_for_review(config_path: Path, preset=None) -> CampaignConfig:
+    import yaml
+
+    preset_name = str(preset).strip() if preset else ""
+    if config_path.is_file():
+        with open(config_path, "r", encoding="utf-8") as f:
+            payload = yaml.safe_load(f) or {}
+    elif preset_name:
+        payload = {}
+    else:
+        raise FileNotFoundError("campaign config is not a readable file: " + str(config_path))
+    if preset_name:
+        from ichor.hpc.active_learning.preset_loader import apply_preset
+
+        payload, _preset_payload = apply_preset(preset_name, payload)
+    return CampaignConfig.from_dict(payload)
+
+
+def saved_config_lock_review(config_override=None, preset=None):
     global _last_saved_config_lock_error
     _last_saved_config_lock_error = ""
     override_requested = bool(config_override)
+    preset_requested = bool(str(preset).strip()) if preset else False
     campaign_dir = selected_campaign_dir_or_none()
     if campaign_dir is None:
-        if override_requested:
+        if override_requested or preset_requested:
             _last_saved_config_lock_error = "No campaign directory is selected."
         return None
     config_path = _saved_config_path_for_review(config_override)
@@ -241,14 +268,14 @@ def saved_config_lock_review(config_override=None):
             + str(config_path)
         )
         return None
-    if not config_path.is_file():
+    if not config_path.is_file() and not preset_requested:
         return None
     try:
-        cfg = CampaignConfig.from_yaml(config_path)
+        cfg = _load_saved_config_for_review(config_path, preset=preset)
     except Exception as exc:
-        if override_requested:
+        if override_requested or preset_requested:
             _last_saved_config_lock_error = (
-                "Selected config override could not be loaded: "
+                "Saved config could not be loaded for lock review: "
                 + type(exc).__name__
                 + ": "
                 + str(exc)[:200]
@@ -379,20 +406,20 @@ def format_current_config_lock_review() -> str:
     return formatted or "No campaign.yaml changes against the config lock."
 
 
-def saved_config_has_blocked_changes(config_override=None) -> bool:
-    review = saved_config_lock_review(config_override)
+def saved_config_has_blocked_changes(config_override=None, preset=None) -> bool:
+    review = saved_config_lock_review(config_override, preset=preset)
     return bool(review is not None and review.blocked_changes)
 
 
-def saved_config_has_lock_changes(config_override=None) -> bool:
-    review = saved_config_lock_review(config_override)
+def saved_config_has_lock_changes(config_override=None, preset=None) -> bool:
+    review = saved_config_lock_review(config_override, preset=preset)
     return bool(review is not None and review.changed)
 
 
-def saved_config_review_failed(config_override=None) -> bool:
-    if not config_override:
+def saved_config_review_failed(config_override=None, preset=None) -> bool:
+    if not config_override and not (str(preset).strip() if preset else ""):
         return False
-    saved_config_lock_review(config_override)
+    saved_config_lock_review(config_override, preset=preset)
     return bool(_last_saved_config_lock_error)
 
 
@@ -400,8 +427,8 @@ def saved_config_lock_review_error() -> str:
     return _last_saved_config_lock_error
 
 
-def format_saved_config_lock_review(config_override=None) -> str:
-    review = saved_config_lock_review(config_override)
+def format_saved_config_lock_review(config_override=None, preset=None) -> str:
+    review = saved_config_lock_review(config_override, preset=preset)
     if review is None:
         return _last_saved_config_lock_error or "No saved config lock review is available."
     from ichor.hpc.active_learning.daemon.config_lock import format_config_review
@@ -757,9 +784,7 @@ class EditCampaignConfigFunctions:
         ):
             _pause()
             return
-        ichor.hpc.global_variables.LOGGER.info(
-            "Campaign config loaded from " + str(yaml_path)
-        )
+        _log_info("Campaign config loaded from " + str(yaml_path))
         print("Loaded " + str(yaml_path))
         _pause()
 
@@ -776,7 +801,7 @@ class EditCampaignConfigFunctions:
             clear_dirty=False,
         )
         _dirty_paths.add("campaign.yaml")
-        ichor.hpc.global_variables.LOGGER.info("Campaign config reset to defaults")
+        _log_info("Campaign config reset to defaults")
         _sync_options_from_config()
         print("Reset to defaults. Save to disk to write campaign.yaml.")
         _pause()
@@ -1202,7 +1227,19 @@ class EditCampaignConfigFunctions:
             _sync_options_from_config()
             _pause()
             return
+        campaign_dir = _editor_selected_campaign_dir or selected_campaign_dir_or_none()
+        started = bool(
+            campaign_dir is not None
+            and _state_path_for_campaign(campaign_dir).is_file()
+        )
         review = current_config_lock_review()
+        if started and review is None:
+            print("campaign.yaml NOT written because config-lock review is unavailable.")
+            print(format_current_config_lock_review())
+            _last_error = "Config lock review unavailable"
+            _sync_options_from_config()
+            _pause()
+            return
         if review is not None and review.blocked_changes:
             print(
                 "campaign.yaml NOT written because these changes are "
@@ -1253,9 +1290,7 @@ class EditCampaignConfigFunctions:
         _last_save_path = target
         _last_error = ""
         _sync_options_from_config()
-        ichor.hpc.global_variables.LOGGER.info(
-            "Campaign config saved to " + str(target)
-        )
+        _log_info("Campaign config saved to " + str(target))
         print("Wrote and verified " + str(target))
         if changed:
             print("Changed fields saved:")
@@ -1368,6 +1403,7 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("resources.gaussian_link0_mem", "str", prompt="resources.gaussian_link0_mem (Gaussian style, e.g. 8GB): "),
             _spec("resources.gaussian_memory_fraction_of_slurm", "float"),
             _spec("resources.array_concurrency_limit", "optional_int"),
+            _spec("resources.fail_on_memory_estimate_exceeds_request", "bool"),
             _spec("resources.gradient_parallel_backend", "choice", choices=sorted(VALID_GRADIENT_PARALLEL_BACKENDS)),
         ],
     ),
@@ -1768,6 +1804,7 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("runtime.transient_phase_retry_max", "int"),
             _spec("runtime.poll_sacct_unknown_max_ticks", "int"),
             _spec("runtime.poll_sacct_missing_max_ticks", "int"),
+            _spec("runtime.poll_squeue_inconclusive_max_ticks", "int"),
             _spec("runtime.halt_on_tick_exception", "bool"),
         ],
     ),

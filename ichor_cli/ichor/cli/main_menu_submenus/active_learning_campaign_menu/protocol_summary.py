@@ -339,6 +339,12 @@ def format_sampling_protocol_summary(config: CampaignConfig) -> str:
     lines.append(
         _line("resources.array_concurrency_limit", resources.array_concurrency_limit)
     )
+    lines.append(
+        _line(
+            "resources.fail_on_memory_estimate_exceeds_request",
+            resources.fail_on_memory_estimate_exceeds_request,
+        )
+    )
     lines.append(_line("resources.gradient_parallel_backend", resources.gradient_parallel_backend))
     lines.append(_line("resources.aimall_cpus_per_task", resources.aimall_cpus_per_task))
     lines.append(_line("aimall.naat", aimall.naat))

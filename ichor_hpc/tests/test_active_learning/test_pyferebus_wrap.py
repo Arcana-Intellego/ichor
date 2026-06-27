@@ -424,6 +424,32 @@ def test_submit_ferebus_raises_when_command_list_counts_mismatch(tmp_path):
         submit_ferebus(jd, tmp_path, model_class=model_class, submit_runner=_StubRunner())
 
 
+def test_submit_ferebus_raises_when_expected_task_count_mismatch(tmp_path):
+    captured: List[_StubModel] = []
+    model_class = _make_model_class(captured)
+    jd = tmp_path / "job.json"
+    jd.write_text("{}")
+    with pytest.raises(FerebusSubmissionError, match="n_tasks=2"):
+        submit_ferebus(
+            jd,
+            tmp_path,
+            expected_tasks=2,
+            model_class=model_class,
+            submit_runner=_StubRunner(),
+        )
+
+
+def test_submit_ferebus_rejects_list_entry_outside_workdir(tmp_path):
+    captured: List[_StubModel] = []
+    outside = tmp_path.parent / (tmp_path.name + "_outside")
+    outside.mkdir()
+    model_class = _make_model_class(captured, list_lines=[str(outside)])
+    jd = tmp_path / "job.json"
+    jd.write_text("{}")
+    with pytest.raises(FerebusSubmissionError, match="escapes the working directory"):
+        submit_ferebus(jd, tmp_path, model_class=model_class, submit_runner=_StubRunner())
+
+
 def test_submit_ferebus_raises_when_command_missing_required_flags(tmp_path):
     captured: List[_StubModel] = []
     model_class = _make_model_class(

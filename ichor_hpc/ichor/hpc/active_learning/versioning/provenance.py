@@ -112,6 +112,7 @@ __all__ = [
     "enrich_with_anti_overlap",
     "enrich_with_error_calibration_input",
     "read_provenance",
+    "validate_provenance",
     "ensure_index",
     "append_to_index",
     "load_index",
@@ -211,6 +212,82 @@ def read_provenance(pointdir: Union[str, Path]) -> Dict[str, Any]:
             str(p) + ": schema_version " + str(schema)
             + " != " + str(PROVENANCE_SCHEMA_VERSION)
         )
+    return data
+
+
+def _expect_int_or_none(value: Any, label: str) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ProvenanceError(label + " must be an integer or null")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ProvenanceError(label + " must be an integer or null") from exc
+
+
+def validate_provenance(
+    pointdir: Union[str, Path],
+    *,
+    campaign_uid: Optional[str] = None,
+    iteration: Optional[int] = None,
+    trajectory_sha256: Optional[str] = None,
+    seed_frame_id: Optional[int] = None,
+    require_phase_b_selected: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Read provenance and validate the campaign/seed handoff contract."""
+    data = read_provenance(pointdir)
+    if not isinstance(data.get("campaign_uid"), str) or not data.get("campaign_uid"):
+        raise ProvenanceError("provenance campaign_uid is missing or invalid")
+    if campaign_uid is not None and str(data.get("campaign_uid")) != str(campaign_uid):
+        raise ProvenanceError("provenance campaign_uid mismatch")
+    try:
+        prov_iteration = int(data.get("iteration"))
+    except (TypeError, ValueError) as exc:
+        raise ProvenanceError("provenance iteration must be an integer") from exc
+    if prov_iteration < 0:
+        raise ProvenanceError("provenance iteration must be >= 0")
+    if iteration is not None and prov_iteration != int(iteration):
+        raise ProvenanceError("provenance iteration mismatch")
+    if not isinstance(data.get("trajectory_sha256"), str):
+        raise ProvenanceError("provenance trajectory_sha256 is missing or invalid")
+    if (
+        trajectory_sha256 is not None
+        and str(data.get("trajectory_sha256")) != str(trajectory_sha256)
+    ):
+        raise ProvenanceError("provenance trajectory_sha256 mismatch")
+
+    seed = data.get("seed")
+    if not isinstance(seed, dict):
+        raise ProvenanceError("provenance seed block must be an object")
+    frame_id = _expect_int_or_none(seed.get("frame_id"), "provenance seed.frame_id")
+    if seed_frame_id is not None and frame_id != int(seed_frame_id):
+        raise ProvenanceError("provenance seed.frame_id mismatch")
+    if "selection_origin" in seed and not isinstance(seed.get("selection_origin"), str):
+        raise ProvenanceError("provenance seed.selection_origin must be a string")
+
+    subspace = data.get("subspace")
+    if not isinstance(subspace, dict):
+        raise ProvenanceError("provenance subspace block must be an object")
+    try:
+        dimension = int(subspace.get("dimension"))
+    except (TypeError, ValueError) as exc:
+        raise ProvenanceError("provenance subspace.dimension must be an integer") from exc
+    if dimension < 0:
+        raise ProvenanceError("provenance subspace.dimension must be >= 0")
+    neighbours = subspace.get("neighbour_frame_ids")
+    if not isinstance(neighbours, list):
+        raise ProvenanceError("provenance subspace.neighbour_frame_ids must be a list")
+    for value in neighbours:
+        _expect_int_or_none(value, "provenance subspace.neighbour_frame_ids")
+
+    phase_b = data.get("phase_b")
+    if require_phase_b_selected is not None:
+        if not isinstance(phase_b, dict):
+            raise ProvenanceError("provenance phase_b block must be an object")
+        selected = bool(phase_b.get("selected_after_fps", False))
+        if selected != bool(require_phase_b_selected):
+            raise ProvenanceError("provenance phase_b.selected_after_fps mismatch")
     return data
 
 

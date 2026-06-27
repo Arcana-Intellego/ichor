@@ -161,17 +161,22 @@ class StartDaemonForegroundFunctions:
             if start_daemon_foreground_menu_options.selected_config
             else None
         )
-        if config_override and edit_menu.saved_config_review_failed(config_override):
-            print("Selected config override could not be reviewed:")
+        preset_name = (
+            start_daemon_foreground_menu_options.selected_preset
+            if start_daemon_foreground_menu_options.selected_preset
+            else None
+        )
+        if edit_menu.saved_config_review_failed(config_override, preset_name):
+            print("Selected config override could not be reviewed (or selected preset is invalid):")
             print("  " + edit_menu.saved_config_lock_review_error())
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
-        if edit_menu.saved_config_has_lock_changes(config_override):
+        if edit_menu.saved_config_has_lock_changes(config_override, preset_name):
             if config_override:
                 print("Selected config override differs from the config lock:")
             else:
                 print("Saved campaign.yaml differs from the config lock:")
-            print(edit_menu.format_saved_config_lock_review(config_override))
+            print(edit_menu.format_saved_config_lock_review(config_override, preset_name))
             print("Run reconcile --apply for safe edits or revert blocked edits before starting.")
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
@@ -194,11 +199,7 @@ class StartDaemonForegroundFunctions:
                 if start_daemon_foreground_menu_options.selected_max_ticks > 0
                 else None
             ),
-            preset=(
-                start_daemon_foreground_menu_options.selected_preset
-                if start_daemon_foreground_menu_options.selected_preset
-                else None
-            ),
+            preset=preset_name,
         )
         if start_daemon_foreground_menu_options.selected_command == "resume":
             rc = cmd_resume(ns)

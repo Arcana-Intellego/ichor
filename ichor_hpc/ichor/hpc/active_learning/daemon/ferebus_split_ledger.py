@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from .ferebus_dataset import plan_sizes
 from .state import atomic_write_json
@@ -91,6 +91,7 @@ def ensure_split_assignments(
     *,
     training_version: int,
     fractions: Sequence[float],
+    pointdir_identity: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
     """Assign pointdirs to train/internal/external without moving old rows."""
     names = [str(n) for n in pointdir_names]
@@ -103,6 +104,21 @@ def ensure_split_assignments(
         assignments: Dict[str, Dict[str, Any]] = {
             str(k): dict(v) for k, v in payload.get("assignments", {}).items()
         }
+        identities = {str(k): str(v) for k, v in (pointdir_identity or {}).items()}
+        for name in names:
+            if name not in assignments:
+                continue
+            current_identity = identities.get(name)
+            if not current_identity:
+                continue
+            recorded_identity = assignments[name].get("provenance_sha256")
+            if recorded_identity is None:
+                assignments[name]["provenance_sha256"] = current_identity
+            elif str(recorded_identity) != current_identity:
+                raise ValueError(
+                    "FEREBUS split ledger pointdir identity mismatch for "
+                    + name
+                )
         new_names = [name for name in sorted(names) if name not in assignments]
         if not assignments and new_names:
             sizes = _target_counts(len(new_names), fractions_tuple)
@@ -117,6 +133,7 @@ def ensure_split_assignments(
                     "first_seen_training_version": int(training_version),
                     "assignment_version": 1,
                     "fractions_at_assignment": list(fractions_tuple),
+                    "provenance_sha256": identities.get(name),
                 }
         else:
             for name in new_names:
@@ -130,6 +147,7 @@ def ensure_split_assignments(
                     "first_seen_training_version": int(training_version),
                     "assignment_version": 1,
                     "fractions_at_assignment": list(fractions_tuple),
+                    "provenance_sha256": identities.get(name),
                 }
         payload = {
             "schema_version": FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION,

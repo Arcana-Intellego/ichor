@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import ichor.cli.global_menu_variables
-import ichor.hpc.global_variables
 from consolemenu.items import FunctionItem
 from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
     CampaignSelectionError,
@@ -69,6 +68,15 @@ class StartDaemonBackgroundMenuOptions(MenuOptions):
 start_daemon_background_menu_options = StartDaemonBackgroundMenuOptions(
     *START_DAEMON_BACKGROUND_DEFAULTS.values()
 )
+
+
+def _log_info(message: str) -> None:
+    try:
+        import ichor.hpc.global_variables as global_variables
+
+        global_variables.LOGGER.info(message)
+    except Exception:
+        pass
 
 
 def _format_max_ticks(value):
@@ -170,17 +178,22 @@ class StartDaemonBackgroundFunctions:
             if start_daemon_background_menu_options.selected_config
             else None
         )
-        if config_override and edit_menu.saved_config_review_failed(config_override):
-            print("Selected config override could not be reviewed:")
+        preset_name = (
+            start_daemon_background_menu_options.selected_preset
+            if start_daemon_background_menu_options.selected_preset
+            else None
+        )
+        if edit_menu.saved_config_review_failed(config_override, preset_name):
+            print("Selected config override could not be reviewed (or selected preset is invalid):")
             print("  " + edit_menu.saved_config_lock_review_error())
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
-        if edit_menu.saved_config_has_lock_changes(config_override):
+        if edit_menu.saved_config_has_lock_changes(config_override, preset_name):
             if config_override:
                 print("Selected config override differs from the config lock:")
             else:
                 print("Saved campaign.yaml differs from the config lock:")
-            print(edit_menu.format_saved_config_lock_review(config_override))
+            print(edit_menu.format_saved_config_lock_review(config_override, preset_name))
             print("Run reconcile --apply for safe edits or revert blocked edits before starting.")
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
@@ -200,11 +213,7 @@ class StartDaemonBackgroundFunctions:
                     else None
                 ),
                 config=config_override,
-                preset=(
-                    start_daemon_background_menu_options.selected_preset
-                    if start_daemon_background_menu_options.selected_preset
-                    else None
-                ),
+                preset=preset_name,
             )
         except Exception as exc:
             print("Failed to launch detached daemon: " + str(exc))
@@ -218,7 +227,7 @@ class StartDaemonBackgroundFunctions:
         else:
             print("Detached daemon launched with PID " + str(result.pid))
         print("Log: " + str(result.log_path))
-        ichor.hpc.global_variables.LOGGER.info(
+        _log_info(
             "Background daemon launched for campaign " + str(campaign_dir)
             + " with PID " + str(result.pid)
         )

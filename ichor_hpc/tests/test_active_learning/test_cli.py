@@ -147,6 +147,16 @@ def test_recovery_dashboard_reports_active_intents(tmp_path):
     assert "stop --cancel-jobs first" in text
 
 
+def test_live_job_name_rejects_control_characters_and_caps_length():
+    phase = CampaignPhase.INITIAL_GAUSSIAN.value
+    with pytest.raises(ValueError, match="unsafe Slurm job name"):
+        live_job_name("bad\nuid", phase, 0)
+
+    name = live_job_name("x" * 200, phase, 123456)
+    assert len(name) <= 128
+    assert "\n" not in name
+
+
 def test_recovery_dashboard_reports_trajectory_pool_sha_mismatch(tmp_path):
     from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
 

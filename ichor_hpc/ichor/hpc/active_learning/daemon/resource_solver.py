@@ -70,7 +70,7 @@ def backend_for_phase(phase_name: str) -> str:
         return "ariadne"
     if phase_name in ("INITIAL_FEREBUS", "FEREBUS"):
         return "ferebus"
-    return "polus"
+    raise BackendSubmissionError("unknown live backend phase: " + str(phase_name))
 
 
 def slurm_memory_mib(value: Any) -> float:
@@ -702,6 +702,30 @@ def resolve_phase_resources(
             )
     allocated_gb = (slurm_memory_mib(mem_per_cpu) / 1024.0) * float(cpus)
     if float(estimated_total) > allocated_gb + 1.0e-9:
+        if (
+            not _is_auto(raw_mem)
+            and bool(
+                getattr(
+                    config.resources,
+                    "fail_on_memory_estimate_exceeds_request",
+                    True,
+                )
+            )
+        ):
+            raise BackendSubmissionError(
+                "resources."
+                + backend
+                + "_mem_per_cpu="
+                + str(mem_per_cpu)
+                + " requests "
+                + str(round(allocated_gb, 3))
+                + " GB total for "
+                + str(phase_name)
+                + ", below the estimated "
+                + str(round(float(estimated_total), 3))
+                + " GB. Increase the request, choose auto, or set "
+                + "resources.fail_on_memory_estimate_exceeds_request=false."
+            )
         warnings.append("estimated memory exceeds requested allocation")
     if backend == "aimall":
         n_atoms = int(extra.get("n_atoms") or _staged_natoms(campaign_path, phase_name, int(iteration)) or 1)

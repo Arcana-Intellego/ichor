@@ -69,3 +69,42 @@ def test_split_ledger_rejects_duplicate_pointdir_names(tmp_path):
             training_version=0,
             fractions=(0.6, 0.2, 0.2),
         )
+
+
+def test_split_ledger_rejects_pointdir_identity_mismatch(tmp_path):
+    names = _names(3)
+    ensure_split_assignments(
+        tmp_path,
+        names,
+        training_version=0,
+        fractions=(0.6, 0.2, 0.2),
+        pointdir_identity={names[0]: "sha-a"},
+    )
+
+    with pytest.raises(ValueError, match="identity mismatch"):
+        ensure_split_assignments(
+            tmp_path,
+            names,
+            training_version=1,
+            fractions=(0.6, 0.2, 0.2),
+            pointdir_identity={names[0]: "sha-b"},
+        )
+
+
+def test_split_ledger_backfills_missing_pointdir_identity(tmp_path):
+    names = _names(2)
+    ensure_split_assignments(
+        tmp_path,
+        names,
+        training_version=0,
+        fractions=(0.5, 0.5, 0.0),
+    )
+    result = ensure_split_assignments(
+        tmp_path,
+        names,
+        training_version=1,
+        fractions=(0.5, 0.5, 0.0),
+        pointdir_identity={names[1]: "sha-later"},
+    )
+
+    assert result["assignments"][names[1]]["provenance_sha256"] == "sha-later"

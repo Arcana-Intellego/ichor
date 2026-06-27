@@ -110,6 +110,35 @@ def _json_number_or_none(value: Any) -> Optional[float]:
     return out if math.isfinite(out) else None
 
 
+def resolve_handoff_path(
+    root: Any,
+    raw: Any,
+    *,
+    kind: str,
+    must_exist: bool = True,
+    directory: bool = False,
+) -> Path:
+    base = Path(root).resolve()
+    p = Path(str(raw))
+    if not p.is_absolute():
+        p = base / p
+    try:
+        resolved = p.resolve(strict=False)
+    except OSError as exc:
+        raise HandoffManifestError(kind + " path cannot be resolved: " + str(p)) from exc
+    if resolved != base and base not in resolved.parents:
+        raise HandoffManifestError(kind + " path escapes handoff root: " + str(p))
+    if p.is_symlink() or resolved.is_symlink():
+        raise HandoffManifestError(kind + " path is a symlink: " + str(p))
+    if must_exist:
+        if directory:
+            if not resolved.is_dir():
+                raise FileNotFoundError(kind + " directory missing: " + str(resolved))
+        elif not resolved.is_file():
+            raise FileNotFoundError(kind + " file missing: " + str(resolved))
+    return resolved
+
+
 def load_seeds_picked(iter_dir: Any, *, expected_iteration: Optional[int] = None) -> Dict[str, Any]:
     """Read seeds_picked.json and return a normalised payload with seed_records.
 
@@ -405,6 +434,8 @@ def validate_ariadne_result(
     *,
     expected_iteration: int,
     seed_record: Dict[str, Any],
+    expected_atom_types: Optional[Sequence[str]] = None,
+    expected_trajectory_sha256: Optional[str] = None,
 ) -> Dict[str, Any]:
     if not isinstance(result, dict):
         raise HandoffManifestError("ARIADNE result must be a JSON object")
@@ -417,6 +448,10 @@ def validate_ariadne_result(
     result_frame_id = _int_or_none(result.get("seed_frame_id"))
     if result_frame_id != frame_id:
         raise HandoffManifestError("wrong_seed_frame")
+    if expected_trajectory_sha256:
+        result_sha = result.get("trajectory_sha256")
+        if result_sha is not None and str(result_sha) != str(expected_trajectory_sha256):
+            raise HandoffManifestError("wrong_trajectory_sha256")
     return_code = int(result.get("return_code"))
     if return_code != 0:
         try:
@@ -440,6 +475,11 @@ def validate_ariadne_result(
     final_coordinates = result.get("final_coordinates")
     if not isinstance(atom_types, list) or not atom_types:
         raise HandoffManifestError("missing_atom_types")
+    clean_atom_types = [str(x) for x in atom_types]
+    if expected_atom_types is not None:
+        expected = [str(x) for x in expected_atom_types]
+        if clean_atom_types != expected:
+            raise HandoffManifestError("atom_type_order_mismatch")
     if not isinstance(final_coordinates, list) or len(final_coordinates) != len(atom_types):
         raise HandoffManifestError("final_coordinates_shape_mismatch")
     clean_coords = []
@@ -464,7 +504,7 @@ def validate_ariadne_result(
         "wall_seconds": wall_seconds,
         "fell_back_to_ds": bool(result.get("fell_back_to_ds", False)),
         "whitened_distance_final": whitened,
-        "atom_types": [str(x) for x in atom_types],
+        "atom_types": clean_atom_types,
         "final_coordinates": clean_coords,
     }
 
@@ -558,11 +598,12 @@ def read_ariadne_results_manifest(
             raise HandoffManifestError("duplicate accepted ARIADNE seed_index")
         seen.add(seed_index)
         for key in ("seed_dir", "result_json", "provenance_json"):
-            p = Path(str(rec.get(key, "")))
-            if not p.is_file() and key != "seed_dir":
-                raise FileNotFoundError("ARIADNE manifest path missing: " + str(p))
-            if key == "seed_dir" and not p.is_dir():
-                raise FileNotFoundError("ARIADNE seed_dir missing: " + str(p))
+            resolve_handoff_path(
+                path.parent,
+                rec.get(key, ""),
+                kind="ARIADNE " + key,
+                directory=(key == "seed_dir"),
+            )
     return data
 
 
@@ -635,18 +676,18 @@ def read_phase_a_sample_manifest(
     if require_nonempty and n_select <= 0:
         raise HandoffManifestError("Phase A sample manifest n_select must be positive")
     root = Path(initial_dir)
-    sample = Path(str(data.get("sample_xyz", "")))
-    if not sample.is_absolute():
-        sample = root / sample
-    if not sample.is_file():
-        raise FileNotFoundError("Phase A sample file missing: " + str(sample))
+    sample = resolve_handoff_path(
+        root,
+        data.get("sample_xyz", ""),
+        kind="Phase A sample_xyz",
+    )
     if not (sample.name.startswith("initial-SAMPLE-") and sample.suffix == ".xyz"):
         raise HandoffManifestError("Phase A sample path has unexpected name: " + str(sample))
-    index_path = Path(str(data.get("index_path", "")))
-    if not index_path.is_absolute():
-        index_path = root / index_path
-    if not index_path.is_file():
-        raise FileNotFoundError("Phase A index file missing: " + str(index_path))
+    index_path = resolve_handoff_path(
+        root,
+        data.get("index_path", ""),
+        kind="Phase A index_path",
+    )
     if not (index_path.name.startswith("initial-INDEX-") and index_path.suffix == ".dat"):
         raise HandoffManifestError("Phase A index path has unexpected name: " + str(index_path))
     selected = data.get("selected_indices")
@@ -715,12 +756,12 @@ def read_phase_b_selection_manifest(
             raise HandoffManifestError("duplicate Phase B final_index")
         seen_final.add(final_index)
         for key in ("seed_dir", "result_json", "provenance_json"):
-            p = Path(str(rec.get(key, "")))
-            if key == "seed_dir":
-                if not p.is_dir():
-                    raise FileNotFoundError("Phase B seed_dir missing: " + str(p))
-            elif not p.is_file():
-                raise FileNotFoundError("Phase B source path missing: " + str(p))
+            resolve_handoff_path(
+                path.parent,
+                rec.get(key, ""),
+                kind="Phase B " + key,
+                directory=(key == "seed_dir"),
+            )
     if seen_final and sorted(seen_final) != list(range(len(seen_final))):
         raise HandoffManifestError("Phase B final_index values must be contiguous from zero")
     return data

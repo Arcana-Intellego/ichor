@@ -995,7 +995,27 @@ def cmd_start(args: argparse.Namespace) -> int:
     if not config_path.exists() and not getattr(args, "preset", None):
         print("campaign config not found: " + str(config_path), file=sys.stderr)
         return 2
+
+    mode_count = sum([
+        bool(getattr(args, "live", False)),
+        bool(getattr(args, "dry_run", False)),
+        bool(getattr(args, "mock_ariadne", False)),
+    ])
+    if mode_count > 1:
+        print(
+            "--live, --dry-run, and --mock-ariadne are mutually exclusive; "
+            "pick one.", file=sys.stderr,
+        )
+        return 2
+    if mode_count == 0:
+        print("no execution mode selected. Pick one of:", file=sys.stderr)
+        print("  --live          run against configured Slurm backends (requires sbatch + Gaussian + AIMAll + FEREBUS + ariadne)", file=sys.stderr)
+        print("  --dry-run       stub backends, real file-system flow", file=sys.stderr)
+        print("  --mock-ariadne  pure state-machine progression test", file=sys.stderr)
+        return 3
+
     state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
+    state_for_lock = None
     if not state_path.exists():
         artefacts = stateful_campaign_artifacts(campaign)
         if artefacts:
@@ -1019,6 +1039,18 @@ def cmd_start(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 8
+    else:
+        try:
+            state_for_lock = read_state(state_path)
+        except StateSchemaError as exc:
+            print(
+                "state.json is invalid; run `ichor-al-daemon reconcile --campaign-dir "
+                + str(campaign)
+                + "` before starting: "
+                + str(exc),
+                file=sys.stderr,
+            )
+            return 5
     if bool(getattr(args, "background", False)):
         return _launch_background_daemon(args, campaign)
     #Fix: --preset overlays the operator-supplied campaign.yaml on top of the
@@ -1058,13 +1090,6 @@ def cmd_start(args: argparse.Namespace) -> int:
     else:
         config = CampaignConfig.from_yaml(config_path)
 
-    paths = _campaign_paths(campaign)
-    state_for_lock = None
-    if paths["state"].is_file():
-        try:
-            state_for_lock = read_state(paths["state"])
-        except StateSchemaError:
-            state_for_lock = None
     try:
         lock_review = assert_config_unchanged_for_start(
             campaign,
@@ -1123,19 +1148,6 @@ def cmd_start(args: argparse.Namespace) -> int:
         #journal failure.
         pass
 
-    #mutually exclusive mode selection required.
-    mode_count = sum([
-        bool(getattr(args, "live", False)),
-        bool(getattr(args, "dry_run", False)),
-        bool(getattr(args, "mock_ariadne", False)),
-    ])
-    if mode_count > 1:
-        print(
-            "--live, --dry-run, and --mock-ariadne are mutually exclusive; "
-            "pick one.", file=sys.stderr,
-        )
-        return 2
-
     job_finder = None  # set in the live branch below; mock/dry leave it None (no adopt check)
     job_liveness_checker = None
     if getattr(args, "live", False):
@@ -1165,12 +1177,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     elif getattr(args, "mock_ariadne", False):
         executor = MockPhaseExecutor()
         sacct_poller = None
-    else:
-        print("no execution mode selected. Pick one of:", file=sys.stderr)
-        print("  --live          run against configured Slurm backends (requires sbatch + Gaussian + AIMAll + FEREBUS + ariadne)", file=sys.stderr)
-        print("  --dry-run       stub backends, real file-system flow", file=sys.stderr)
-        print("  --mock-ariadne  pure state-machine progression test", file=sys.stderr)
-        return 3
+    else:  # pragma: no cover - mode_count is validated before side effects
+        raise AssertionError("validated execution mode was not handled")
 
     daemon_kwargs = {
         "campaign_dir": campaign,
@@ -2628,6 +2636,33 @@ def _import_pool_impl(args: argparse.Namespace, campaign: Path, source: Path) ->
     """
     from .acquisition.trajectory_pool import TrajectoryPool
     from .config import CampaignConfig
+
+    if bool(getattr(args, "force", False)):
+        existing_manifest = campaign / ".DATA" / "TRAJECTORY" / "pool.manifest.json"
+        state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
+        if existing_manifest.exists():
+            blockers: List[str] = []
+            if state_path.is_file():
+                blockers.append(str(state_path.relative_to(campaign)))
+            blockers.extend(stateful_campaign_artifacts(campaign))
+            if blockers:
+                print(
+                    "refusing to overwrite the trajectory pool after the campaign "
+                    "has stateful daemon artefacts.",
+                    file=sys.stderr,
+                )
+                print(
+                    "Changing the pool would invalidate recorded frame IDs and "
+                    "trajectory SHA handoffs. Create a new campaign directory "
+                    "instead, or reconcile/remove state explicitly.",
+                    file=sys.stderr,
+                )
+                print("blocking artefacts:", file=sys.stderr)
+                for item in blockers[:20]:
+                    print("  " + str(item), file=sys.stderr)
+                if len(blockers) > 20:
+                    print("  ...", file=sys.stderr)
+                return 16
 
     # work out the outlier settings using the layered precedence above.
     # start from dataclass defaults; let campaign.yaml override; let the

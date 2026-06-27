@@ -7,6 +7,12 @@ import pytest
 
 from ichor.hpc.active_learning.cli import cmd_import_pool, cmd_init
 from ichor.hpc.active_learning.config import CampaignConfig
+from ichor.hpc.active_learning.daemon.daemon import DEFAULT_DATA_SUBDIR
+from ichor.hpc.active_learning.daemon.state import (
+    DEFAULT_STATE_FILENAME,
+    fresh_campaign_state,
+    write_state,
+)
 
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "water_tetramer.xyz"
@@ -79,3 +85,20 @@ def test_import_pool_deprecated_alias_calls_init(tmp_path, capsys):
     assert "import-pool is deprecated" in capsys.readouterr().err
     assert (tmp_path / "campaign.yaml").is_file()
     assert (tmp_path / ".DATA" / "TRAJECTORY" / "pool.xyz").is_file()
+
+
+def test_force_pool_import_refuses_started_campaign(tmp_path, capsys):
+    if not FIXTURE.is_file():
+        pytest.skip("water_tetramer.xyz fixture missing")
+    shutil.copy(FIXTURE, tmp_path / "pool.xyz")
+    assert cmd_init(_args(tmp_path)) == 0
+    data = tmp_path / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    write_state(data / DEFAULT_STATE_FILENAME, fresh_campaign_state())
+
+    rc = cmd_init(_args(tmp_path, source=FIXTURE, force=True))
+
+    err = capsys.readouterr().err
+    assert rc == 16
+    assert "refusing to overwrite the trajectory pool" in err
+    assert "state.json" in err

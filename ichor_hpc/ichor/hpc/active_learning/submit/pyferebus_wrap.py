@@ -162,7 +162,11 @@ def _read_required_nonempty_lines(path: Path, label: str) -> List[str]:
     return lines
 
 
-def _validate_generated_pyferebus_artifacts(working_dir: Path) -> Path:
+def _validate_generated_pyferebus_artifacts(
+    working_dir: Path,
+    *,
+    expected_tasks: Optional[int] = None,
+) -> Path:
     script = working_dir / "runFerebus.sh"
     if not script.is_file():
         raise FerebusSubmissionError(
@@ -183,9 +187,34 @@ def _validate_generated_pyferebus_artifacts(working_dir: Path) -> Path:
             + " list.txt="
             + str(len(list_lines))
         )
+    if expected_tasks is not None and len(command_lines) != int(expected_tasks):
+        raise FerebusSubmissionError(
+            "pyferebus generated task count "
+            + str(len(command_lines))
+            + " does not match daemon FEREBUS_TASKS.json n_tasks="
+            + str(int(expected_tasks))
+        )
 
+    root = working_dir.resolve()
     for i, folder in enumerate(list_lines, start=1):
-        if not Path(folder).is_dir():
+        raw_folder = Path(folder)
+        path = raw_folder if raw_folder.is_absolute() else working_dir / raw_folder
+        resolved = path.resolve(strict=False)
+        if resolved != root and root not in resolved.parents:
+            raise FerebusSubmissionError(
+                "pyferebus list.txt entry "
+                + str(i)
+                + " escapes the working directory: "
+                + folder
+            )
+        if path.is_symlink() or resolved.is_symlink():
+            raise FerebusSubmissionError(
+                "pyferebus list.txt entry "
+                + str(i)
+                + " is a symlink: "
+                + folder
+            )
+        if not resolved.is_dir():
             raise FerebusSubmissionError(
                 "pyferebus list.txt entry "
                 + str(i)
@@ -406,6 +435,7 @@ def submit_ferebus(
     overwrite_workdir: bool = False,
     move_dataset_files: bool = True,
     path_to_executable: Optional[Union[str, Path]] = None,
+    expected_tasks: Optional[int] = None,
     extra: Optional[Mapping[str, Any]] = None,
     model_class: Optional[Any] = None,
     submit_runner: Optional[Any] = None,
@@ -479,7 +509,10 @@ def submit_ferebus(
     finally:
         os.chdir(cwd)
 
-    script = _validate_generated_pyferebus_artifacts(working_dir)
+    script = _validate_generated_pyferebus_artifacts(
+        working_dir,
+        expected_tasks=expected_tasks,
+    )
     _harden_generated_script(
         script,
         walltime_hours=walltime_hours,

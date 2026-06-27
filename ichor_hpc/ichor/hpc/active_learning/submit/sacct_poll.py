@@ -452,6 +452,14 @@ def find_active_job_by_name_detailed(
         active_ids.add(_base_allocation_id(job_id))
     if not active_ids:
         return JobNameLookup(None, inconclusive=False, rows=rows)
+    if len(active_ids) > 1:
+        return JobNameLookup(
+            None,
+            inconclusive=True,
+            rows=rows,
+            error="multiple active jobs share expected name: "
+            + repr(sorted(active_ids)),
+        )
     return JobNameLookup(sorted(active_ids)[0], inconclusive=False, rows=rows)
 
 
@@ -519,7 +527,14 @@ def find_running_job_by_name_detailed(
             if fallback.job_id or fallback.inconclusive:
                 return fallback
         return JobNameLookup(None, inconclusive=False, rows=rows)
-    # lowest id == earliest submission; adopt that one if somehow several share the name.
+    if len(non_terminal) > 1:
+        return JobNameLookup(
+            None,
+            inconclusive=True,
+            rows=rows,
+            error="multiple active jobs share expected name: "
+            + repr(sorted(non_terminal)),
+        )
     return JobNameLookup(sorted(non_terminal)[0], inconclusive=False, rows=rows)
 
 

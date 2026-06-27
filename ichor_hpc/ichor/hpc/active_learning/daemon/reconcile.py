@@ -131,6 +131,18 @@ def stateful_campaign_artifacts(campaign_dir: Union[str, Path]) -> List[str]:
     """
     campaign = Path(campaign_dir)
     findings: List[str] = []
+    stateful_journal_events = {
+        "campaign_started",
+        "daemon_started",
+        "phase_transition",
+        "sbatch",
+        "phase_succeeded",
+        "phase_succeeded_live",
+        "halt",
+        "reconcile_applied",
+        "adopted_inflight_job",
+        "tick_exception_halted",
+    }
 
     def add_matches(pattern: str) -> None:
         for path in sorted(campaign.glob(pattern)):
@@ -139,11 +151,15 @@ def stateful_campaign_artifacts(campaign_dir: Union[str, Path]) -> List[str]:
     add_matches("5_TRAINING/iteration-*")
     add_matches("6_TRAINED_MODELS/iteration-*")
     add_matches("7_ACTIVE_LEARNING/iteration-*")
-    if (campaign / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson").is_file():
-        findings.append(".DATA/ACTIVE_LEARNING/journal.ndjson")
-    config_lock = campaign / ".DATA" / "ACTIVE_LEARNING" / "config_lock.json"
-    if config_lock.is_file():
-        findings.append(".DATA/ACTIVE_LEARNING/config_lock.json")
+    journal_path = campaign / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson"
+    if journal_path.is_file():
+        try:
+            for event in iter_events(journal_path):
+                if str(event.get("event", "")) in stateful_journal_events:
+                    findings.append(".DATA/ACTIVE_LEARNING/journal.ndjson")
+                    break
+        except Exception:
+            findings.append(".DATA/ACTIVE_LEARNING/journal.ndjson")
     proposed_state = (
         campaign
         / ".DATA"

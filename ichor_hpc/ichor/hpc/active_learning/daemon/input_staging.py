@@ -327,6 +327,27 @@ def stage_gaussian_inputs(
                 + " != sample frame count "
                 + str(len(frames))
             )
+    provenance_context = None
+    if phase_b_records:
+        try:
+            from .state import read_state, DEFAULT_STATE_FILENAME
+            from ..acquisition.trajectory_pool import TrajectoryPool
+
+            current_state = read_state(
+                Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
+            )
+            pool = TrajectoryPool.load(campaign_dir)
+            provenance_context = {
+                "campaign_uid": str(current_state.campaign_uid),
+                "trajectory_sha256": str(pool.sha256),
+            }
+        except Exception as exc:
+            raise ValueError(
+                "failed to load provenance validation context for Phase B Gaussian staging: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)
+            ) from exc
     g = config.gaussian
     staging = bucket_dir(campaign_dir, phase_name, iteration)
     # clear the bucket first so a same-iteration crash-retry does not leave stale POINT_*.pointdir
@@ -371,7 +392,7 @@ def stage_gaussian_inputs(
             gjf.set_mem(str(config.resources.gaussian_link0_mem))
         gjf.write()
         if phase_b_records:
-            from ..versioning.provenance import PROVENANCE_FILENAME
+            from ..versioning.provenance import PROVENANCE_FILENAME, validate_provenance
 
             src_prov = Path(str(phase_b_records[k].get("provenance_json", "")))
             if not src_prov.is_file():
@@ -381,6 +402,14 @@ def stage_gaussian_inputs(
                     + ": "
                     + str(src_prov)
                 )
+            validate_provenance(
+                src_prov.parent,
+                campaign_uid=str(provenance_context["campaign_uid"]),
+                iteration=int(iteration),
+                trajectory_sha256=str(provenance_context["trajectory_sha256"]),
+                seed_frame_id=phase_b_records[k].get("seed_frame_id"),
+                require_phase_b_selected=True,
+            )
             shutil.copy2(str(src_prov), str(pd / PROVENANCE_FILENAME))
         pointdirs.append(pd)
 
@@ -529,9 +558,21 @@ def stage_ferebus_inputs(campaign_dir, config, training_version, is_initial=Fals
     staging.mkdir(parents=True, exist_ok=True)
 
     pd = PointsDirectory(training_dir)
-    pointdir_names = [Path(getattr(p, "path", p)).name for p in pd]
+    pointdir_paths = [Path(getattr(p, "path", p)) for p in pd]
+    pointdir_names = [p.name for p in pointdir_paths]
     if not pointdir_names:
         raise ValueError("committed training set contains no pointdirs: " + str(training_dir))
+    pointdir_identities: Dict[str, str] = {}
+    try:
+        from ..versioning.manifest import sha256_file
+        from ..versioning.provenance import PROVENANCE_FILENAME
+
+        for name, pointdir_path in zip(pointdir_names, pointdir_paths):
+            sidecar = pointdir_path / PROVENANCE_FILENAME
+            if sidecar.is_file():
+                pointdir_identities[name] = sha256_file(sidecar)
+    except Exception as exc:
+        raise ValueError("failed to build FEREBUS pointdir identity map: " + str(exc)) from exc
     # system ALF defines the per-atom local frame the features are built in.
     system_alf = pd.alf_dict(calculate_alf_atom_sequence)
     f = config.ferebus
@@ -568,6 +609,7 @@ def stage_ferebus_inputs(campaign_dir, config, training_version, is_initial=Fals
         pointdir_names,
         training_version=int(training_version),
         fractions=fractions,
+        pointdir_identity=pointdir_identities,
     )
     ledger_row_ids = dict(split_ledger["row_ids"])
     atom_labels = []

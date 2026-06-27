@@ -643,6 +643,7 @@ class RuntimeConfigBlock:
     transient_phase_retry_max: int = 1
     poll_sacct_unknown_max_ticks: int = 3
     poll_sacct_missing_max_ticks: int = 3
+    poll_squeue_inconclusive_max_ticks: int = 10
     halt_on_tick_exception: bool = True
 
 
@@ -686,6 +687,7 @@ class ResourceConfigBlock:
     gaussian_memory_fraction_of_slurm: float = 0.85
 
     array_concurrency_limit: Optional[int] = None
+    fail_on_memory_estimate_exceeds_request: bool = True
     # "process" -> node-local process pool sized to the task's cpus-per-task.
     # "serial"  -> force single-core (off-cluster / debugging).
     gradient_parallel_backend: str = "process"
@@ -701,7 +703,7 @@ class ResourceConfigBlock:
             return "ariadne"
         if phase_name in ("INITIAL_FEREBUS", "FEREBUS"):
             return "ferebus"
-        return "polus"
+        raise ValueError("unknown live backend phase: " + str(phase_name))
 
     def cpus_for(self, phase_name: str) -> Union[int, str]:
         backend = self.backend_for_phase(phase_name)
@@ -1213,9 +1215,17 @@ class CampaignConfig:
             "runtime.poll_sacct_missing_max_ticks",
             self.runtime.poll_sacct_missing_max_ticks,
         )
+        _validate_nonnegative_int(
+            "runtime.poll_squeue_inconclusive_max_ticks",
+            self.runtime.poll_squeue_inconclusive_max_ticks,
+        )
         if not isinstance(self.runtime.halt_on_tick_exception, bool):
             raise ConfigValidationError(
                 "runtime.halt_on_tick_exception must be a boolean"
+            )
+        if not isinstance(self.resources.fail_on_memory_estimate_exceeds_request, bool):
+            raise ConfigValidationError(
+                "resources.fail_on_memory_estimate_exceeds_request must be a boolean"
             )
         if self.anti_overlap.recent_seeds_cooldown < 0:
             raise ConfigValidationError(

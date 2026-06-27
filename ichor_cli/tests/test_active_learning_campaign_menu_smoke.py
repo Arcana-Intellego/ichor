@@ -675,6 +675,37 @@ def test_save_refuses_blocked_config_lock_change(tmp_path, monkeypatch):
     assert "Config lock blocked save" in menu.edit_campaign_config_menu_options.last_error
 
 
+def test_save_refuses_when_started_config_lock_review_fails(tmp_path, monkeypatch, capsys):
+    import importlib
+
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    original = CampaignConfig()
+    _write_started_campaign_with_lock(tmp_path, original)
+    set_selected_campaign_dir(tmp_path)
+    menu.load_config_for_campaign_dir(tmp_path, quiet=True)
+    menu._set_config_value("runtime.poll_interval_seconds", 7)
+    monkeypatch.setattr(menu, "_pause", lambda: None)
+    monkeypatch.setattr(
+        menu,
+        "_read_editor_state_for_lock",
+        lambda campaign_dir: (_ for _ in ()).throw(RuntimeError("broken state")),
+    )
+
+    menu.EditCampaignConfigFunctions.save_to_disk()
+
+    out = capsys.readouterr().out
+    assert "config-lock review is unavailable" in out
+    assert "broken state" in out
+
+
 def test_save_allows_safe_runtime_change_under_config_lock(tmp_path, monkeypatch):
     import importlib
 
@@ -759,6 +790,34 @@ def test_daemon_launch_refuses_saved_blocked_config_change(
     out = capsys.readouterr().out
     assert "Saved campaign.yaml differs from the config lock" in out
     assert "gaussian.method" in out
+
+
+def test_saved_config_review_includes_selected_preset(tmp_path):
+    import importlib
+
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    edit_menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    original = CampaignConfig()
+    _write_started_campaign_with_lock(tmp_path, original)
+    set_selected_campaign_dir(tmp_path)
+    edit_menu.load_config_for_campaign_dir(tmp_path, quiet=True)
+
+    assert edit_menu.saved_config_has_lock_changes(
+        None,
+        "thermodynamics_focused",
+    )
+    rendered = edit_menu.format_saved_config_lock_review(
+        None,
+        "thermodynamics_focused",
+    )
+    assert "lambda_force" in rendered
 
 
 def test_foreground_launch_reviews_selected_config_override(

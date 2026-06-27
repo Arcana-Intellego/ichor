@@ -13,7 +13,6 @@ class CommittedArtifactError(RuntimeError):
 
 
 _TRAINING_REQUIRED = {
-    CampaignPhase.INITIAL_FEREBUS,
     CampaignPhase.SEED_SELECT,
     CampaignPhase.ARIADNE_ARRAY,
     CampaignPhase.PHASE_B_POLUS,
@@ -114,6 +113,25 @@ def verify_state_referenced_artifacts(
     campaign = Path(campaign_dir)
 
     train_version = int(getattr(state, "training_set_version", -1))
+    if phase is CampaignPhase.INITIAL_FEREBUS and train_version < 0:
+        staging = campaign / ".DATA" / "STAGING" / "initial"
+        try:
+            from .input_staging import read_quantum_acceptance_manifest
+
+            read_quantum_acceptance_manifest(
+                staging,
+                expected_phase="INITIAL_AIMALL",
+                expected_iteration=int(getattr(state, "iteration", 0)),
+                require_nonempty=True,
+            )
+        except Exception as exc:
+            raise CommittedArtifactError(
+                "initial_ferebus_bootstrap_manifest_invalid: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)
+            ) from exc
+
     if phase in _TRAINING_REQUIRED and train_version < 0:
         raise CommittedArtifactError(
             "phase "

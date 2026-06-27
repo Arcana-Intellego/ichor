@@ -44,7 +44,6 @@ from ..versioning.provenance import (
     enrich_with_ariadne,
     enrich_with_error_calibration_input,
     enrich_with_phase_b,
-    write_seed_provenance,
 )
 from .dry_run_executor import (
     DryRunPhaseExecutor,
@@ -193,7 +192,9 @@ def validate_gaussian_completed(pdir) -> tuple:
         gau_text = Path(gau.path).read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return False, "gaussian_output_unreadable"
-    if "Normal termination" not in gau_text:
+    last_normal = gau_text.rfind("Normal termination")
+    last_error = gau_text.rfind("Error termination")
+    if last_normal < 0 or last_error > last_normal:
         return False, "scf_nonconvergence_or_crash"
     #2. WFN present + parseable.
     wfn = getattr(pdir, "wfn", None)
@@ -703,6 +704,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 )
             path_to_executable = None if ferebus_path == "ferebus" else ferebus_path
             ferebus_platform = _configured_ferebus_platform()
+            ferebus_manifest = _stg.read_ferebus_manifest(staging)
+            expected_ferebus_tasks = int(ferebus_manifest.get("n_tasks", 0))
             effective_walltime = (
                 int(self.walltime_hours)
                 if self.walltime_hours is not None
@@ -728,6 +731,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 overwrite_workdir=False,
                 move_dataset_files=True,
                 path_to_executable=path_to_executable,
+                expected_tasks=expected_ferebus_tasks,
                 submit_runner=self.sbatch_runner,
             )
         except BackendSubmissionError:
@@ -1699,6 +1703,27 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             sidecar = _Path(staging) / sidecar_name
             if sidecar.is_file():
                 (staged / sidecar_name).write_bytes(sidecar.read_bytes())
+        try:
+            from .model_contract import validate_ferebus_model_contract
+
+            validate_ferebus_model_contract(staged, committed=True)
+        except Exception as exc:
+            self._journal_event(
+                "quantum_output_rejected",
+                phase=phase_name,
+                iteration=int(state.iteration),
+                pointdir=str(staged),
+                reason="staged_model_contract_invalid: " + str(exc)[:160],
+            )
+            return PhaseResult(
+                is_complete=True,
+                failure_reason=(
+                    "staged_model_contract_invalid: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)
+                ),
+            )
         v_models.commit(next_version)
         v_models.update_current(next_version)
         committed_dir = v_models.iteration_path(next_version)
@@ -1785,6 +1810,20 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
         seed_records = list(picked.get("seed_records", []))
         expected_n = int(picked.get("n_picked", len(seed_records)))
+        try:
+            from ..acquisition.trajectory_pool import TrajectoryPool
+
+            trajectory_pool = TrajectoryPool.load(self.campaign_dir)
+        except Exception as exc:
+            return PhaseResult(
+                is_complete=True,
+                failure_reason=(
+                    "trajectory_pool_invalid_for_ariadne_validation: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)[:180]
+                ),
+            )
         kept_alphas = []
         flagged_count = 0
         accepted = []
@@ -1897,10 +1936,17 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 continue
 
             try:
+                seed_frame_id = seed_record.get("frame_id")
+                expected_atom_types = None
+                if seed_frame_id is not None:
+                    seed_atoms = trajectory_pool.frame(int(seed_frame_id))
+                    expected_atom_types = [str(atom.type) for atom in seed_atoms]
                 validated = validate_ariadne_result(
                     result_dict,
                     expected_iteration=int(state.iteration),
                     seed_record=seed_record,
+                    expected_atom_types=expected_atom_types,
+                    expected_trajectory_sha256=str(picked.get("trajectory_sha256", "")),
                 )
             except Exception as exc:
                 reason = str(exc) or type(exc).__name__
@@ -2060,19 +2106,29 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
             prov_path = seed_dir / PROVENANCE_FILENAME
             if not prov_path.is_file():
-                write_seed_provenance(
-                    seed_dir,
-                    campaign_uid=str(getattr(state, "campaign_uid", "") or ""),
+                reason = "ariadne_provenance_missing"
+                rejected.append({
+                    "seed_index": seed_index,
+                    "seed_dir": str(seed_dir.resolve()),
+                    "result_json": str(result_path.resolve()),
+                    "provenance_json": str(prov_path.resolve()),
+                    "reason": reason,
+                })
+                landing_audit_records.append({
+                    "seed_index": seed_index,
+                    "seed_dir": str(seed_dir.resolve()),
+                    "result_json": str(result_path.resolve()),
+                    "provenance_json": str(prov_path.resolve()),
+                    "reason": reason,
+                })
+                self._journal_event(
+                    "quantum_output_rejected",
+                    phase=phase_name,
                     iteration=int(state.iteration),
-                    trajectory_sha256=str(picked.get("trajectory_sha256", "")),
-                    seed_frame_id=seed_record.get("frame_id"),
-                    seed_selection_origin=str(seed_record.get("selection_origin", "unknown")),
-                    seed_variance_at_selection=seed_record.get("variance_at_selection"),
-                    subspace_neighbour_frame_ids=[],
-                    subspace_dimension=0,
-                    subspace_eigenvalues=[],
-                    mode_weighting_policy=self._mode_weighting_policy_or_default(),
+                    pointdir=seed_dir.name,
+                    reason=reason,
                 )
+                continue
 
             enrich_with_ariadne(
                 seed_dir,
@@ -2706,7 +2762,10 @@ def build_sbatch_script(
     if phase_name in ("INITIAL_GAUSSIAN", "GAUSSIAN"):
         validate_gaussian_link0_memory(config, resolved)
     camp = str(Path(campaign_dir).resolve())
-    job_name = live_job_name(campaign_uid, phase_name, iteration)
+    try:
+        job_name = live_job_name(campaign_uid, phase_name, iteration)
+    except ValueError as exc:
+        raise BackendSubmissionError(str(exc)) from exc
     _reject_shell_control_chars("Slurm job name", job_name)
     logs = camp + "/.DATA/SCRIPTS"
     is_array = array_size is not None and int(array_size) > 0
@@ -2734,7 +2793,18 @@ def build_sbatch_script(
         throttle = getattr(res, "array_concurrency_limit", None)
         array_spec = "0-" + str(int(array_size) - 1)
         if throttle is not None:
-            array_spec += "%" + str(int(throttle))
+            try:
+                throttle_i = int(throttle)
+            except (TypeError, ValueError) as exc:
+                raise BackendSubmissionError(
+                    "resources.array_concurrency_limit must be a positive integer"
+                ) from exc
+            if throttle_i <= 0:
+                raise BackendSubmissionError(
+                    "resources.array_concurrency_limit must be > 0"
+                )
+            throttle_i = min(throttle_i, int(array_size))
+            array_spec += "%" + str(throttle_i)
         lines.append("#SBATCH --array=" + array_spec)
     lines += [
         "#SBATCH --output=" + logs + "/OUTPUTS/" + job_name + tag + ".o",
@@ -2816,6 +2886,7 @@ def _gaussian_invocation_block(
         "# per-point gaussian array: task N runs the Nth staged pointdir.",
         "export ICHOR_CAMPAIGN_DIR=" + camp_q,
         "export ICHOR_GAUSSIAN_PHASE=" + phase_q,
+        "export ICHOR_ITERATION=" + str(int(iteration)),
         'export GAUSS_SCRDIR="${ICHOR_CAMPAIGN_DIR}/.DATA/SCRATCH/GAUSSIAN/${ICHOR_GAUSSIAN_PHASE}/${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"',
         *memory_lines,
         'mkdir -p "$GAUSS_SCRDIR"',
@@ -2833,6 +2904,9 @@ def _gaussian_invocation_block(
         + " >&2; exit 1; fi",
         'POINT_DIR=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" ' + points_file_q + ")",
         'if [ -z "$POINT_DIR" ]; then echo "no pointdir for index $SLURM_ARRAY_TASK_ID" >&2; exit 1; fi',
+        'case "$POINT_DIR" in "$ICHOR_CAMPAIGN_DIR"/.DATA/STAGING/initial/POINT_*.pointdir|"$ICHOR_CAMPAIGN_DIR"/.DATA/STAGING/iter_"$ICHOR_ITERATION"/POINT_*.pointdir) ;; *) echo "POINT_DIR escapes campaign staging: $POINT_DIR" >&2; exit 1 ;; esac',
+        'if [ -L "$POINT_DIR" ]; then echo "POINT_DIR is a symlink: $POINT_DIR" >&2; exit 1; fi',
+        'if [ ! -f "$POINT_DIR/input.gjf" ]; then echo "input.gjf missing in $POINT_DIR" >&2; exit 1; fi',
         'cd "$POINT_DIR"',
         "GAUSSIAN_EXIT=0",
         gaussian_exe + " < input.gjf > input.gau || GAUSSIAN_EXIT=$?",
@@ -2911,9 +2985,12 @@ def _aimall_invocation_block(iteration, camp, config, points_file) -> List[str]:
         raise BackendSubmissionError("aimall.iasmesh is invalid: " + repr(iasmesh))
     args.append("-iasmesh=" + iasmesh)
     points_file_q = _shell_quote(points_file)
+    camp_q = _shell_quote(camp)
     python = _python_executable_for_script()
     return [
         "# per-point AIMAll array over the .wfn files gaussian produced.",
+        "export ICHOR_CAMPAIGN_DIR=" + camp_q,
+        "export ICHOR_ITERATION=" + str(int(iteration)),
         # check the file FIRST -- under set -e a failing sed (missing POINTS.txt) aborts the
         # assignment before the friendly -z guard below ever runs, leaving just a bare sed error.
         "if [ ! -f " + points_file_q + " ]; then echo "
@@ -2921,6 +2998,9 @@ def _aimall_invocation_block(iteration, camp, config, points_file) -> List[str]:
         + " >&2; exit 1; fi",
         'POINT_DIR=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" ' + points_file_q + ")",
         'if [ -z "$POINT_DIR" ]; then echo "no pointdir for index $SLURM_ARRAY_TASK_ID" >&2; exit 1; fi',
+        'case "$POINT_DIR" in "$ICHOR_CAMPAIGN_DIR"/.DATA/STAGING/initial/POINT_*.pointdir|"$ICHOR_CAMPAIGN_DIR"/.DATA/STAGING/iter_"$ICHOR_ITERATION"/POINT_*.pointdir) ;; *) echo "POINT_DIR escapes campaign staging: $POINT_DIR" >&2; exit 1 ;; esac',
+        'if [ -L "$POINT_DIR" ]; then echo "POINT_DIR is a symlink: $POINT_DIR" >&2; exit 1; fi',
+        'if [ ! -f "$POINT_DIR/input.wfn" ]; then echo "input.wfn missing in $POINT_DIR" >&2; exit 1; fi',
         'cd "$POINT_DIR"',
         'if [ ! -f AIMALL_TASK.json ]; then echo "AIMALL_TASK.json missing in $POINT_DIR" >&2; exit 1; fi',
         "AIMALL_NAAT=$("
