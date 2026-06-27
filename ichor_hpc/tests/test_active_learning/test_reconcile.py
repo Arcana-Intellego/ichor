@@ -122,6 +122,31 @@ def test_propose_recovery_initial_aimall_handoff_reenters_initial_ferebus(tmp_pa
     assert "initial AIMAll acceptance manifest" in report.trusted_artifacts
 
 
+def test_propose_recovery_initial_ferebus_journal_handoff_reenters_initial_ferebus(tmp_path):
+    campaign, data, _, _ = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    append_event(
+        data / "journal.ndjson",
+        "phase_transition",
+        from_phase=CampaignPhase.INITIAL_AIMALL.value,
+        to_phase=CampaignPhase.INITIAL_FEREBUS.value,
+        iteration=0,
+    )
+    state = fresh_campaign_state(max_iterations=50)
+    state.phase = CampaignPhase.STOP_CHECK
+    state.training_set_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    _write_valid_initial_aimall_handoff(campaign)
+
+    report = propose_recovery(campaign)
+
+    assert report.last_phase_in_journal == CampaignPhase.INITIAL_FEREBUS.value
+    assert report.proposed_state.phase is CampaignPhase.INITIAL_FEREBUS
+    assert report.proposed_state.training_set_version == -1
+    assert report.proposed_state.models_version == -1
+
+
 def test_propose_recovery_initial_aimall_missing_handoff_halts(tmp_path):
     campaign, data, _, _ = _campaign_dirs(tmp_path)
     _write_pool(campaign)
@@ -268,6 +293,8 @@ def test_propose_recovery_reports_unmanifested_committed_pointdir(tmp_path):
     rogue.mkdir()
     (rogue / "input.gjf").write_text("%chk=x\n", encoding="utf-8")
     report = propose_recovery(campaign)
+    assert report.committed_training_versions == [0]
+    assert report.valid_training_versions == []
     assert any("committed training version 0" in r for r in report.unsafe_reasons)
     assert report.proposed_state.phase is CampaignPhase.HALTED
 

@@ -783,10 +783,35 @@ def _latest_journal_event(journal_path: Path, event_type: str) -> Optional[Dict[
     return latest
 
 
-def _format_artifact_summary(status: Any, *, verbose: bool) -> List[str]:
+def _format_contract_status(contract: Any) -> Optional[str]:
+    if not isinstance(contract, dict):
+        return None
+    ok = contract.get("ok")
+    if ok is True:
+        return "ok"
+    if ok is False:
+        error = str(contract.get("error") or "")
+        if len(error) > 180:
+            error = error[:177] + "..."
+        return "problem" + (" - " + error if error else "")
+    return "not checked"
+
+
+def _format_artifact_summary(
+    status: Any,
+    *,
+    state_contract: Any = None,
+    verbose: bool,
+) -> List[str]:
     if not isinstance(status, dict):
         return _section("Artifacts", [("status", "unavailable")])
     rows = []
+    contract_text = _format_contract_status(state_contract)
+    if contract_text is not None:
+        rows.append(("state contract", contract_text))
+        if verbose and isinstance(state_contract, dict):
+            for error in state_contract.get("errors") or []:
+                rows.append(("state contract detail", error))
     for label in ("training", "models"):
         item = status.get(label)
         if isinstance(item, dict):
@@ -862,6 +887,10 @@ def _artifact_status_has_problem(status: Any) -> bool:
     return False
 
 
+def _state_contract_has_problem(contract: Any) -> bool:
+    return isinstance(contract, dict) and contract.get("ok") is False
+
+
 def _status_recommendation(payload: Dict[str, Any]) -> str:
     if payload.get("phase") == "HALTED":
         return "run reconcile and inspect the halt reason before restarting"
@@ -874,7 +903,10 @@ def _status_recommendation(payload: Dict[str, Any]) -> str:
         or _format_active_submission_intents(payload.get("active_submission_intents")) != "none"
     ):
         return "daemon work appears active; monitor journal/status or stop it intentionally"
-    if _artifact_status_has_problem(payload.get("artifact_manifest_status")):
+    if (
+        _artifact_status_has_problem(payload.get("artifact_manifest_status"))
+        or _state_contract_has_problem(payload.get("state_artifact_contract_status"))
+    ):
         if payload.get("phase") == "STOP_CHECK":
             return (
                 "run reconcile; if this remains unchanged, recovery could not "
@@ -957,6 +989,7 @@ def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path
     lines.extend(
         _format_artifact_summary(
             payload.get("artifact_manifest_status"),
+            state_contract=payload.get("state_artifact_contract_status"),
             verbose=verbose,
         )
     )
@@ -1818,12 +1851,24 @@ def cmd_status(args: argparse.Namespace) -> int:
     payload.update(_probe_background_daemon(paths["background_pid"], paths["background_log"]))
     payload["active_submission_intents"] = _load_active_submission_intents(campaign)
     try:
-        from .daemon.artifact_contracts import artifact_manifest_status
+        from .daemon.artifact_contracts import (
+            artifact_manifest_status,
+            state_artifact_contract_status,
+        )
         payload["artifact_manifest_status"] = artifact_manifest_status(campaign, state)
+        payload["state_artifact_contract_status"] = state_artifact_contract_status(
+            campaign,
+            state,
+        )
     except Exception as exc:
         payload["artifact_manifest_status"] = {
             "ok": False,
             "error": type(exc).__name__ + ": " + str(exc),
+        }
+        payload["state_artifact_contract_status"] = {
+            "ok": False,
+            "error": type(exc).__name__ + ": " + str(exc),
+            "errors": [type(exc).__name__ + ": " + str(exc)],
         }
     if bool(getattr(args, "json", False)):
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -2178,6 +2223,25 @@ def _apply_retry_phase_after_cleaned_halt(report, original_report) -> bool:
     return True
 
 
+def _reconcile_apply_contract_error(campaign: Path, state: Any) -> Optional[str]:
+    from .daemon.artifact_contracts import state_artifact_contract_status
+
+    status = state_artifact_contract_status(campaign, state)
+    if bool(status.get("ok")):
+        return None
+    detail = str(status.get("error") or "state contract invalid")
+    return (
+        "phase="
+        + str(status.get("phase"))
+        + " training_set_version="
+        + str(status.get("training_set_version"))
+        + " models_version="
+        + str(status.get("models_version"))
+        + ": "
+        + detail
+    )
+
+
 def cmd_reconcile(args: argparse.Namespace) -> int:
     restore_config = bool(getattr(args, "restore_config_from_lock", False))
     archive_staging_requested = bool(getattr(args, "archive_staging", False))
@@ -2261,7 +2325,9 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         print("  - " + note)
     print("")
     print("Committed training versions: " + repr(report.committed_training_versions))
+    print("Valid training versions:     " + repr(report.valid_training_versions))
     print("Committed model versions:    " + repr(report.committed_model_versions))
+    print("Valid model versions:        " + repr(report.valid_model_versions))
     print("Last phase in journal:       " + repr(report.last_phase_in_journal))
     print("Last iteration in journal:   " + repr(report.last_iteration_in_journal))
     if report.decision:
@@ -2527,6 +2593,17 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             print(format_config_review(config_review), file=sys.stderr)
             _print_cleanup_already_happened(cleanup_paths_already_done)
             return 8
+
+    contract_error = _reconcile_apply_contract_error(campaign, report.proposed_state)
+    if contract_error is not None:
+        print(
+            "refusing --apply because the final proposed state fails the "
+            "state/artefact contract:",
+            file=sys.stderr,
+        )
+        print("  - " + contract_error, file=sys.stderr)
+        _print_cleanup_already_happened(cleanup_paths_already_done)
+        return 9
 
     backup_path = _copy_existing_timestamped(
         target_canonical,

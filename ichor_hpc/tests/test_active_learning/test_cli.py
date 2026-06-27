@@ -212,6 +212,8 @@ def test_cli_status_json_prints_state_payload(tmp_path, capsys):
     assert payload["lock_held"] is False
     assert payload["active_submission_intents"] == []
     assert "artifact_manifest_status" in payload
+    assert "state_artifact_contract_status" in payload
+    assert payload["state_artifact_contract_status"]["ok"] is True
 
 
 def test_cli_status_default_prints_operator_friendly_summary(tmp_path, capsys):
@@ -238,6 +240,7 @@ def test_cli_status_default_prints_operator_friendly_summary(tmp_path, capsys):
     assert "  background daemon: not running" in out
     assert "  shutdown requested: no" in out
     assert "Artifacts\n" in out
+    assert "  state contract: problem - CommittedArtifactError:" in out
     assert "  training version: 0" in out
     assert "  training status: problem - CommittedArtifactError:" in out
     assert "  models version: 0" in out
@@ -251,6 +254,42 @@ def test_cli_status_default_prints_operator_friendly_summary(tmp_path, capsys):
     assert "background_pid" not in out
     assert "shutdown_requested" not in out
     assert not out.lstrip().startswith("{")
+
+
+def test_cli_status_reports_initial_ferebus_bootstrap_contract_problem(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    s = fresh_campaign_state(max_iterations=5)
+    s.phase = CampaignPhase.INITIAL_FEREBUS
+    s.training_set_version = -1
+    s.models_version = -1
+    write_state(data / DEFAULT_STATE_FILENAME, s)
+
+    rc = main(["status", "--campaign-dir", str(campaign)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "  state contract: problem - CommittedArtifactError:" in out
+    assert "initial_ferebus_bootstrap_manifest_invalid" in out
+    assert "  training status: not required yet" in out
+    assert "  models status: not required yet" in out
+
+
+def test_reconcile_apply_contract_guard_rejects_invalid_state(tmp_path):
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state(max_iterations=5)
+    state.phase = CampaignPhase.STOP_CHECK
+    state.training_set_version = 0
+    state.models_version = 0
+
+    error = cli_mod._reconcile_apply_contract_error(campaign, state)
+
+    assert error is not None
+    assert "phase=STOP_CHECK" in error
+    assert "training_set_version=0" in error
+    assert "models_version=0" in error
+    assert "state references missing committed training version" in error
 
 
 def test_cli_status_default_summarises_active_submission_intents(tmp_path, capsys):
@@ -1004,6 +1043,10 @@ def test_cli_reconcile_writes_proposed_state(tmp_path, capsys):
     assert proposed.exists()
     captured = capsys.readouterr()
     assert "Proposed state written" in captured.out
+    assert "Committed training versions:" in captured.out
+    assert "Valid training versions:" in captured.out
+    assert "Committed model versions:" in captured.out
+    assert "Valid model versions:" in captured.out
 
 
 def test_cli_resume_refuses_halted_state(tmp_path, capsys):

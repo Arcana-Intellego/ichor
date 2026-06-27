@@ -255,3 +255,47 @@ def artifact_manifest_status(
                 item["errors"].append(type(exc).__name__ + ": " + str(exc))
         out[key] = item
     return out
+
+
+def state_artifact_contract_status(
+    campaign_dir: Union[str, Path],
+    state: Any,
+    *,
+    training_dir_name: str = "5_TRAINING",
+    models_dir_name: str = "6_TRAINED_MODELS",
+    strict_models: bool = True,
+) -> Dict[str, Any]:
+    """Return the full state/artefact contract status for operator output.
+
+    ``artifact_manifest_status`` reports the independent training and model
+    version checks. This helper reports the combined producer/consumer
+    contract that the live daemon enforces before phase entry, including
+    bootstrap ``INITIAL_FEREBUS`` handoffs and training/model version skew.
+    """
+    try:
+        phase = CampaignPhase(state.phase).value
+    except Exception:
+        phase = str(getattr(state, "phase", "UNKNOWN"))
+    payload: Dict[str, Any] = {
+        "ok": None,
+        "phase": phase,
+        "training_set_version": int(getattr(state, "training_set_version", -1)),
+        "models_version": int(getattr(state, "models_version", -1)),
+        "strict_models": bool(strict_models),
+        "errors": [],
+    }
+    try:
+        verify_state_referenced_artifacts(
+            campaign_dir,
+            state,
+            training_dir_name=training_dir_name,
+            models_dir_name=models_dir_name,
+            strict_models=strict_models,
+        )
+        payload["ok"] = True
+    except Exception as exc:
+        error = type(exc).__name__ + ": " + str(exc)
+        payload["ok"] = False
+        payload["error"] = error
+        payload["errors"] = [error]
+    return payload

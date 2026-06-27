@@ -195,6 +195,8 @@ class ReconciliationReport:
     proposed_state: CampaignState
     committed_training_versions: List[int] = field(default_factory=list)
     committed_model_versions: List[int] = field(default_factory=list)
+    valid_training_versions: List[int] = field(default_factory=list)
+    valid_model_versions: List[int] = field(default_factory=list)
     last_phase_in_journal: Optional[str] = None
     last_iteration_in_journal: Optional[int] = None
     notes: List[str] = field(default_factory=list)
@@ -258,7 +260,10 @@ def _initial_aimall_handoff_indicated(
     existing: Optional[CampaignState],
     last_phase: Optional[str],
 ) -> bool:
-    if str(last_phase or "") == CampaignPhase.INITIAL_AIMALL.value:
+    if str(last_phase or "") in {
+        CampaignPhase.INITIAL_AIMALL.value,
+        CampaignPhase.INITIAL_FEREBUS.value,
+    }:
         return True
     if existing is None:
         return False
@@ -270,6 +275,22 @@ def _initial_aimall_handoff_indicated(
         CampaignPhase.INITIAL_AIMALL,
         CampaignPhase.INITIAL_FEREBUS,
     }
+
+
+def _journal_phase_hint(event: Dict[str, Any]) -> Optional[str]:
+    name = str(event.get("event", ""))
+    if name == "phase_transition":
+        return event.get("to_phase")
+    if name in {
+        "sbatch",
+        "phase_succeeded",
+        "phase_succeeded_live",
+        "reconcile_applied",
+    }:
+        return event.get("phase")
+    if name in {"halt", "tick_exception_halted"}:
+        return event.get("from_phase")
+    return None
 
 
 def _validate_initial_ferebus_bootstrap(
@@ -397,9 +418,9 @@ def propose_recovery(
     journal_path = data / "journal.ndjson"
     if journal_path.exists():
         for event in iter_events(journal_path):
-            if event.get("event") == "phase_transition":
-                #to_phase tells us what was advanced to most recently
-                last_phase = event.get("to_phase") or last_phase
+            phase_hint = _journal_phase_hint(event)
+            if phase_hint:
+                last_phase = str(phase_hint)
                 last_iter = event.get("iteration", last_iter)
     initial_handoff_indicated = _initial_aimall_handoff_indicated(
         existing=existing,
@@ -522,6 +543,14 @@ def propose_recovery(
                 + str(exc)[:160]
             )
             blocking_artifacts.append("model version " + str(version))
+    if tv != valid_training_versions:
+        notes.append(
+            "valid training versions differ from discovered committed versions"
+        )
+    if mv != valid_model_versions:
+        notes.append(
+            "valid model versions differ from discovered committed versions"
+        )
 
     if _needs_trajectory_pool_check(
         existing_loaded=existing_loaded,
@@ -763,6 +792,8 @@ def propose_recovery(
         proposed_state=recovered,
         committed_training_versions=tv,
         committed_model_versions=mv,
+        valid_training_versions=valid_training_versions,
+        valid_model_versions=valid_model_versions,
         last_phase_in_journal=last_phase,
         last_iteration_in_journal=last_iter,
         notes=notes,

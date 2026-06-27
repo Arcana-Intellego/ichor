@@ -723,6 +723,11 @@ def test_reconcile_apply_cleans_transient_halted_ariadne_reentry(
         "verify_committed_model_version",
         lambda *args, **kwargs: None,
     )
+    monkeypatch.setattr(
+        cli_mod,
+        "_reconcile_apply_contract_error",
+        lambda *args, **kwargs: None,
+    )
 
     rc = cmd_reconcile(
         argparse.Namespace(
