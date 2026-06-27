@@ -210,14 +210,16 @@ def test_cli_status_json_prints_state_payload(tmp_path, capsys):
     assert payload["state_path"].endswith(DEFAULT_STATE_FILENAME)
     assert payload["lock_file_exists"] is False
     assert payload["lock_held"] is False
+    assert payload["active_submission_intents"] == []
     assert "artifact_manifest_status" in payload
 
 
-def test_cli_status_default_prints_readable_summary(tmp_path, capsys):
+def test_cli_status_default_prints_operator_friendly_summary(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
     (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
     s = fresh_campaign_state(max_iterations=5)
     s.iteration = 3
+    s.phase = CampaignPhase.STOP_CHECK
     write_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME, s)
 
     rc = main(["status", "--campaign-dir", str(campaign)])
@@ -225,11 +227,55 @@ def test_cli_status_default_prints_readable_summary(tmp_path, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "Campaign\n" in out
-    assert "  phase: INIT" in out
+    assert "  phase: STOP_CHECK" in out
     assert "  iteration: 3 / max 5" in out
     assert "Jobs\n" in out
+    assert "  pending Slurm jobs: none recorded in state" in out
+    assert "  active submission intents: none" in out
     assert "Runtime\n" in out
+    assert "  foreground lock: free" in out
+    assert "  daemon lease: none" in out
+    assert "  background daemon: not running" in out
+    assert "  shutdown requested: no" in out
+    assert "Artifacts\n" in out
+    assert "  training version: 0" in out
+    assert "  training status: problem - CommittedArtifactError:" in out
+    assert "  models version: 0" in out
+    assert "  models status: problem - CommittedArtifactError:" in out
+    assert "Recommendation\n" in out
+    assert "  next action: run reconcile; committed artefacts are inconsistent with state" in out
+    assert "training v0: problem" not in out
+    assert "background_pid" not in out
+    assert "shutdown_requested" not in out
     assert not out.lstrip().startswith("{")
+
+
+def test_cli_status_default_summarises_active_submission_intents(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    s = fresh_campaign_state(max_iterations=5)
+    write_state(data / DEFAULT_STATE_FILENAME, s)
+    submission_intent.write_pre_submit_intent(
+        campaign,
+        campaign_uid=s.campaign_uid,
+        phase_name="GAUSSIAN",
+        iteration=0,
+    )
+    submission_intent.mark_submitted(
+        campaign,
+        "GAUSSIAN",
+        0,
+        "12345",
+        expected_tasks=20,
+    )
+
+    rc = main(["status", "--campaign-dir", str(campaign)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "  active submission intents: 1 (GAUSSIAN@0 SUBMITTED job_id=12345)" in out
+    assert "daemon work appears active" in out
 
 
 def test_cli_status_reports_stale_lock_file_as_not_held(tmp_path, capsys):

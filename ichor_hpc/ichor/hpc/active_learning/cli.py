@@ -790,17 +790,95 @@ def _format_artifact_summary(status: Any, *, verbose: bool) -> List[str]:
     for label in ("training", "models"):
         item = status.get(label)
         if isinstance(item, dict):
-            ok = "ok" if item.get("ok") else "problem"
             version = item.get("version")
-            rows.append((label + " v" + str(version), ok))
+            errors = [str(error) for error in (item.get("errors") or [])]
+            ok = item.get("ok")
+            if ok is True and isinstance(version, int) and version < 0:
+                status_text = "not required yet"
+            elif ok is True:
+                status_text = "ok"
+            elif ok is False:
+                status_text = "problem"
+                if errors:
+                    first = errors[0]
+                    if len(first) > 180:
+                        first = first[:177] + "..."
+                    status_text += " - " + first
+            else:
+                status_text = "not checked"
+            rows.append((label + " version", version))
+            rows.append((label + " status", status_text))
             if verbose:
-                for error in item.get("errors") or []:
-                    rows.append(("  " + label + " error", error))
+                for error in errors:
+                    rows.append((label + " detail", error))
         elif item is not None:
             rows.append((label, item))
     if "error" in status:
         rows.append(("error", status.get("error")))
     return _section("Artifacts", rows or [("status", "not checked")])
+
+
+def _format_active_submission_intents(value: Any) -> str:
+    if not isinstance(value, list) or not value:
+        return "none"
+    samples: List[str] = []
+    for intent in value[:3]:
+        if not isinstance(intent, dict):
+            continue
+        phase = str(intent.get("phase", "?"))
+        iteration = str(intent.get("iteration", "?"))
+        status = str(intent.get("status", "?"))
+        job_id = intent.get("job_id")
+        if job_id:
+            samples.append(
+                phase + "@" + iteration + " " + status + " job_id=" + str(job_id)
+            )
+        else:
+            samples.append(phase + "@" + iteration + " " + status)
+    summary = str(len(value))
+    if samples:
+        summary += " (" + "; ".join(samples) + ")"
+        if len(value) > len(samples):
+            summary += " ..."
+    return summary
+
+
+def _format_background_daemon(pid: Any, alive: Any) -> str:
+    if pid is None:
+        return "not running"
+    status = "alive" if alive is True else "not running"
+    return "pid " + str(pid) + " (" + status + ")"
+
+
+def _artifact_status_has_problem(status: Any) -> bool:
+    if not isinstance(status, dict):
+        return False
+    if status.get("error"):
+        return True
+    for label in ("training", "models"):
+        item = status.get(label)
+        if isinstance(item, dict) and item.get("ok") is False:
+            return True
+    return False
+
+
+def _status_recommendation(payload: Dict[str, Any]) -> str:
+    if payload.get("phase") == "HALTED":
+        return "run reconcile and inspect the halt reason before restarting"
+    if payload.get("shutdown_requested"):
+        return "clear the stop request or run reconcile before restarting"
+    if (
+        payload.get("lock_held")
+        or payload.get("background_pid_alive")
+        or _lease_is_fresh(payload.get("lease_heartbeat"))
+        or _format_active_submission_intents(payload.get("active_submission_intents")) != "none"
+    ):
+        return "daemon work appears active; monitor journal/status or stop it intentionally"
+    if _artifact_status_has_problem(payload.get("artifact_manifest_status")):
+        return "run reconcile; committed artefacts are inconsistent with state"
+    if payload.get("phase") == "DONE":
+        return "campaign is complete"
+    return "start or resume the daemon when ready"
 
 
 def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path) -> str:
@@ -823,9 +901,15 @@ def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path
     job_rows = []
     if isinstance(pending, dict) and pending:
         for phase, job_id in sorted(pending.items()):
-            job_rows.append((str(phase), job_id if job_id else "done"))
+            job_rows.append(("pending Slurm job " + str(phase), job_id if job_id else "done"))
     else:
-        job_rows.append(("pending", "none"))
+        job_rows.append(("pending Slurm jobs", "none recorded in state"))
+    job_rows.append(
+        (
+            "active submission intents",
+            _format_active_submission_intents(payload.get("active_submission_intents")),
+        )
+    )
     lines.append("")
     lines.extend(_section("Jobs", job_rows))
     lease = "active: " + _heartbeat_summary(payload.get("lease_heartbeat"))
@@ -836,11 +920,19 @@ def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path
         _section(
             "Runtime",
             [
-                ("lock", _lock_summary(payload.get("lock_held"))),
-                ("lease", lease),
-                ("background_pid", payload.get("background_pid")),
-                ("background_alive", payload.get("background_pid_alive")),
-                ("shutdown_requested", payload.get("shutdown_requested")),
+                ("foreground lock", _lock_summary(payload.get("lock_held"))),
+                ("daemon lease", lease),
+                (
+                    "background daemon",
+                    _format_background_daemon(
+                        payload.get("background_pid"),
+                        payload.get("background_pid_alive"),
+                    ),
+                ),
+                (
+                    "shutdown requested",
+                    "yes" if payload.get("shutdown_requested") else "no",
+                ),
             ],
         )
     )
@@ -863,6 +955,8 @@ def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path
             verbose=verbose,
         )
     )
+    lines.append("")
+    lines.extend(_section("Recommendation", [("next action", _status_recommendation(payload))]))
     if verbose:
         lines.append("")
         lines.extend(
@@ -1717,6 +1811,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     payload.update(_probe_daemon_lock(paths["lock"]))
     payload.update(_probe_daemon_lease(paths["lease"]))
     payload.update(_probe_background_daemon(paths["background_pid"], paths["background_log"]))
+    payload["active_submission_intents"] = _load_active_submission_intents(campaign)
     try:
         from .daemon.artifact_contracts import artifact_manifest_status
         payload["artifact_manifest_status"] = artifact_manifest_status(campaign, state)

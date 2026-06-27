@@ -404,16 +404,17 @@ in the daemon process).
    PHASE_B_POLUS  (sbatch)      |  POLUS FPS over the adversarial pool.
      |                         |
      v                         |
-   GAUSSIAN  (sbatch)           |  Per-point energies.
+   SPLIT  (inline)              |  Decide train / val / holdout membership
+     |                         |  for selected candidates.
+     v                         |
+   GAUSSIAN  (sbatch)           |  Per-point energies on selected candidates.
      |                         |
      v                         |
    AIMALL  (sbatch)             |  IQA decomposition.
      |                         |
      v                         |
-   SPLIT  (inline)              |  Stratified train / val / holdout.
-     |                         |
-     v                         |
-   APPEND  (inline)             |  Commit new training-set iteration.
+   APPEND  (inline)             |  Commit accepted AIMAll pointdirs into
+     |                         |  the new training-set iteration.
      |                         |
      v                         |
    FEREBUS  (sbatch)            |  Re-fit GP. Commits new models iter.
