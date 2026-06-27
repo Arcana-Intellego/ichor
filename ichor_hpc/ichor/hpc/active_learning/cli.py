@@ -83,6 +83,10 @@ from .daemon.state import (
     read_state,
     write_state,
 )
+from .daemon.status_recommendations import (
+    build_status_recommendations,
+    recommendation_dicts,
+)
 
 
 __all__ = [
@@ -875,47 +879,46 @@ def _format_background_daemon(pid: Any, alive: Any) -> str:
     return "pid " + str(pid) + " (" + status + ")"
 
 
-def _artifact_status_has_problem(status: Any) -> bool:
-    if not isinstance(status, dict):
-        return False
-    if status.get("error"):
-        return True
-    for label in ("training", "models"):
-        item = status.get(label)
-        if isinstance(item, dict) and item.get("ok") is False:
-            return True
-    return False
+def _first_recommendation(payload: Dict[str, Any]) -> Dict[str, Any]:
+    recommendations = payload.get("recommendations")
+    if isinstance(recommendations, list) and recommendations:
+        first = recommendations[0]
+        if isinstance(first, dict):
+            return first
+    return {
+        "code": "recommendation_unavailable",
+        "severity": "watch",
+        "primary": "run status again with --verbose or inspect the journal",
+        "why": "status recommendation payload was not available",
+    }
 
 
-def _state_contract_has_problem(contract: Any) -> bool:
-    return isinstance(contract, dict) and contract.get("ok") is False
-
-
-def _status_recommendation(payload: Dict[str, Any]) -> str:
-    if payload.get("phase") == "HALTED":
-        return "run reconcile and inspect the halt reason before restarting"
-    if payload.get("shutdown_requested"):
-        return "clear the stop request or run reconcile before restarting"
-    if (
-        payload.get("lock_held")
-        or payload.get("background_pid_alive")
-        or _lease_is_fresh(payload.get("lease_heartbeat"))
-        or _format_active_submission_intents(payload.get("active_submission_intents")) != "none"
-    ):
-        return "daemon work appears active; monitor journal/status or stop it intentionally"
-    if (
-        _artifact_status_has_problem(payload.get("artifact_manifest_status"))
-        or _state_contract_has_problem(payload.get("state_artifact_contract_status"))
-    ):
-        if payload.get("phase") == "STOP_CHECK":
-            return (
-                "run reconcile; if this remains unchanged, recovery could not "
-                "find committed training/model artefacts"
-            )
-        return "run reconcile; committed artefacts are inconsistent with state"
-    if payload.get("phase") == "DONE":
-        return "campaign is complete"
-    return "start or resume the daemon when ready"
+def _format_recommendations(payload: Dict[str, Any]) -> List[str]:
+    first = _first_recommendation(payload)
+    rows: List[tuple[str, Any]] = [
+        ("severity", first.get("severity")),
+        ("primary", first.get("primary")),
+        ("why", first.get("why")),
+    ]
+    if first.get("command"):
+        rows.append(("command", first.get("command")))
+    details = first.get("details")
+    if isinstance(details, list):
+        for detail in details[:5]:
+            rows.append(("detail", detail))
+    recommendations = payload.get("recommendations")
+    if isinstance(recommendations, list) and len(recommendations) > 1:
+        for recommendation in recommendations[1:4]:
+            if isinstance(recommendation, dict):
+                rows.append(
+                    (
+                        "secondary",
+                        str(recommendation.get("code"))
+                        + ": "
+                        + str(recommendation.get("primary")),
+                    )
+                )
+    return _section("Recommendation", rows)
 
 
 def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path) -> str:
@@ -994,7 +997,7 @@ def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path
         )
     )
     lines.append("")
-    lines.extend(_section("Recommendation", [("next action", _status_recommendation(payload))]))
+    lines.extend(_format_recommendations(payload))
     if verbose:
         lines.append("")
         lines.extend(
@@ -1012,6 +1015,25 @@ def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path
         if payload.get("lock_probe_error"):
             lines.append("")
             lines.extend(_section("Diagnostics", [("lock_probe_error", payload["lock_probe_error"])]))
+    return "\n".join(lines) + "\n"
+
+
+def _format_status_unavailable(payload: Dict[str, Any]) -> str:
+    lines: List[str] = []
+    lines.extend(
+        _section(
+            "Campaign",
+            [
+                ("phase", "unknown"),
+                ("state", payload.get("status_error")),
+            ],
+        )
+    )
+    if payload.get("state_error"):
+        lines.append("")
+        lines.extend(_section("State", [("error", payload.get("state_error"))]))
+    lines.append("")
+    lines.extend(_format_recommendations(payload))
     return "\n".join(lines) + "\n"
 
 
@@ -1836,12 +1858,39 @@ def cmd_status(args: argparse.Namespace) -> int:
     campaign = resolve_campaign_dir(args.campaign_dir)
     paths = _campaign_paths(campaign)
     if not paths["state"].exists():
-        print("no state.json at " + str(paths["state"]), file=sys.stderr)
+        payload: Dict[str, Any] = {
+            "status_error": "state_missing",
+            "state_path": str(paths["state"]),
+            "campaign_dir": str(campaign),
+        }
+        payload["recommendations"] = recommendation_dicts(
+            build_status_recommendations(campaign, payload, paths["journal"])
+        )
+        payload["next_action"] = payload["recommendations"][0]["primary"]
+        if bool(getattr(args, "json", False)):
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            print(_format_status_unavailable(payload), end="")
+            print("no state.json at " + str(paths["state"]), file=sys.stderr)
         return 4
     try:
         state = read_state(paths["state"])
     except StateSchemaError as exc:
-        print("state.json invalid: " + str(exc), file=sys.stderr)
+        payload = {
+            "status_error": "state_schema_invalid",
+            "state_error": "StateSchemaError: " + str(exc),
+            "state_path": str(paths["state"]),
+            "campaign_dir": str(campaign),
+        }
+        payload["recommendations"] = recommendation_dicts(
+            build_status_recommendations(campaign, payload, paths["journal"])
+        )
+        payload["next_action"] = payload["recommendations"][0]["primary"]
+        if bool(getattr(args, "json", False)):
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            print(_format_status_unavailable(payload), end="")
+            print("state.json invalid: " + str(exc), file=sys.stderr)
         return 5
     payload = state.to_dict()
     payload["state_path"] = str(paths["state"])
@@ -1850,6 +1899,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     payload.update(_probe_daemon_lease(paths["lease"]))
     payload.update(_probe_background_daemon(paths["background_pid"], paths["background_log"]))
     payload["active_submission_intents"] = _load_active_submission_intents(campaign)
+    payload["latest_halt_event"] = _latest_journal_event(paths["journal"], "halt")
     try:
         from .daemon.artifact_contracts import (
             artifact_manifest_status,
@@ -1870,6 +1920,10 @@ def cmd_status(args: argparse.Namespace) -> int:
             "error": type(exc).__name__ + ": " + str(exc),
             "errors": [type(exc).__name__ + ": " + str(exc)],
         }
+    payload["recommendations"] = recommendation_dicts(
+        build_status_recommendations(campaign, payload, paths["journal"])
+    )
+    payload["next_action"] = payload["recommendations"][0]["primary"]
     if bool(getattr(args, "json", False)):
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:

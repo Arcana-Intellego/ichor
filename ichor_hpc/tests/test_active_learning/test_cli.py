@@ -23,6 +23,10 @@ from ichor.hpc.active_learning.daemon.state import (
     read_state,
     write_state,
 )
+from ichor.hpc.active_learning.daemon.status_recommendations import (
+    build_status_recommendations,
+    recommendation_dicts,
+)
 
 
 def _campaign_with_config(tmp_path) -> Path:
@@ -214,6 +218,8 @@ def test_cli_status_json_prints_state_payload(tmp_path, capsys):
     assert "artifact_manifest_status" in payload
     assert "state_artifact_contract_status" in payload
     assert payload["state_artifact_contract_status"]["ok"] is True
+    assert payload["recommendations"][0]["code"] == "phase_init_ready"
+    assert payload["next_action"] == payload["recommendations"][0]["primary"]
 
 
 def test_cli_status_default_prints_operator_friendly_summary(tmp_path, capsys):
@@ -246,10 +252,10 @@ def test_cli_status_default_prints_operator_friendly_summary(tmp_path, capsys):
     assert "  models version: 0" in out
     assert "  models status: problem - CommittedArtifactError:" in out
     assert "Recommendation\n" in out
-    assert (
-        "  next action: run reconcile; if this remains unchanged, recovery could "
-        "not find committed training/model artefacts"
-    ) in out
+    assert "  severity: required" in out
+    assert "  primary: run reconcile; STOP_CHECK needs the latest coherent committed training/model pair" in out
+    assert "  why: CommittedArtifactError:" in out
+    assert "  command: ichor-al-daemon reconcile --campaign-dir " in out
     assert "training v0: problem" not in out
     assert "background_pid" not in out
     assert "shutdown_requested" not in out
@@ -317,7 +323,7 @@ def test_cli_status_default_summarises_active_submission_intents(tmp_path, capsy
     assert rc == 0
     out = capsys.readouterr().out
     assert "  active submission intents: 1 (GAUSSIAN@0 SUBMITTED job_id=12345)" in out
-    assert "daemon work appears active" in out
+    assert "a submission intent is still active" in out
 
 
 def test_cli_status_reports_stale_lock_file_as_not_held(tmp_path, capsys):
@@ -403,7 +409,182 @@ def test_cli_status_surfaces_lock_probe_error(tmp_path, capsys, monkeypatch):
 def test_cli_status_returns_4_when_state_missing(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
     rc = main(["status", "--campaign-dir", str(campaign)])
+    out = capsys.readouterr().out
     assert rc == 4
+    assert "Recommendation" in out
+    assert "initialise or reconcile the campaign" in out
+
+
+def test_cli_status_returns_json_recommendation_when_state_missing(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    rc = main(["status", "--campaign-dir", str(campaign), "--json"])
+    assert rc == 4
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status_error"] == "state_missing"
+    assert payload["recommendations"][0]["code"] == "state_missing"
+    assert payload["next_action"] == payload["recommendations"][0]["primary"]
+
+
+def _recommendation_codes(campaign: Path, payload: dict) -> list[str]:
+    return [item.code for item in build_status_recommendations(campaign, payload)]
+
+
+def test_status_recommendations_cover_runtime_and_job_blockers(tmp_path):
+    campaign = _campaign_with_config(tmp_path)
+
+    assert _recommendation_codes(campaign, {"lock_held": True}) == [
+        "daemon_running_lock"
+    ]
+    assert _recommendation_codes(
+        campaign,
+        {
+            "active_submission_intents": [
+                {"phase": "GAUSSIAN", "iteration": 0, "status": "SUBMITTED"}
+            ]
+        },
+    ) == ["active_submission_intent"]
+    assert _recommendation_codes(
+        campaign,
+        {"pending_jobs": {"INITIAL_GAUSSIAN": "12345"}},
+    ) == ["pending_state_job"]
+    assert _recommendation_codes(campaign, {"shutdown_requested": True}) == [
+        "shutdown_requested"
+    ]
+
+
+def test_status_recommendations_cover_halted_reason_classes(tmp_path):
+    campaign = _campaign_with_config(tmp_path)
+
+    assert _recommendation_codes(
+        campaign,
+        {
+            "phase": CampaignPhase.HALTED.value,
+            "latest_halt_event": {"reason": "NODE_FAIL during array"},
+        },
+    ) == ["halted_scheduler_transient"]
+    assert _recommendation_codes(
+        campaign,
+        {
+            "phase": CampaignPhase.HALTED.value,
+            "latest_halt_event": {"reason": "OUT_OF_MEMORY"},
+        },
+    ) == ["halted_scheduler_hard_failure"]
+    assert _recommendation_codes(
+        campaign,
+        {
+            "phase": CampaignPhase.HALTED.value,
+            "latest_halt_event": {"reason": "committed_model_contract_invalid"},
+        },
+    ) == ["halted_contract_failure"]
+    assert _recommendation_codes(
+        campaign,
+        {
+            "phase": CampaignPhase.HALTED.value,
+            "latest_halt_event": {"reason": "campaign.yaml changed"},
+        },
+    ) == ["halted_config_changed"]
+
+
+def test_status_recommendations_cover_contract_failure_classes(tmp_path):
+    campaign = _campaign_with_config(tmp_path)
+
+    assert _recommendation_codes(
+        campaign,
+        {
+            "phase": CampaignPhase.STOP_CHECK.value,
+            "state_artifact_contract_status": {
+                "ok": False,
+                "error": "CommittedArtifactError: state references missing committed model version 0",
+            },
+        },
+    ) == ["stop_check_no_committed_pair"]
+    assert _recommendation_codes(
+        campaign,
+        {
+            "phase": CampaignPhase.GAUSSIAN.value,
+            "state_artifact_contract_status": {
+                "ok": False,
+                "error": "CommittedArtifactError: state training/model version skew",
+            },
+        },
+    ) == ["version_skew"]
+    assert _recommendation_codes(
+        campaign,
+        {
+            "phase": CampaignPhase.SEED_SELECT.value,
+            "state_artifact_contract_status": {
+                "ok": False,
+                "error": "CommittedArtifactError: training_version_invalid:0",
+            },
+        },
+    ) == ["training_missing"]
+    assert _recommendation_codes(
+        campaign,
+        {
+            "phase": CampaignPhase.SEED_SELECT.value,
+            "state_artifact_contract_status": {
+                "ok": False,
+                "error": "CommittedArtifactError: models_version_invalid:0",
+            },
+        },
+    ) == ["models_missing"]
+
+
+@pytest.mark.parametrize(
+    ("phase", "code"),
+    [
+        (CampaignPhase.INIT, "phase_init_ready"),
+        (CampaignPhase.PHASE_A_POLUS, "phase_phase_a_polus_ready"),
+        (CampaignPhase.INITIAL_GAUSSIAN, "phase_initial_gaussian_ready"),
+        (CampaignPhase.INITIAL_AIMALL, "phase_initial_aimall_ready"),
+        (CampaignPhase.INITIAL_FEREBUS, "phase_initial_ferebus_ready"),
+        (CampaignPhase.SEED_SELECT, "phase_seed_select_ready"),
+        (CampaignPhase.ARIADNE_ARRAY, "phase_ariadne_array_ready"),
+        (CampaignPhase.PHASE_B_POLUS, "phase_phase_b_polus_ready"),
+        (CampaignPhase.SPLIT, "phase_split_ready"),
+        (CampaignPhase.GAUSSIAN, "phase_gaussian_ready"),
+        (CampaignPhase.AIMALL, "phase_aimall_ready"),
+        (CampaignPhase.APPEND, "phase_append_ready"),
+        (CampaignPhase.FEREBUS, "phase_ferebus_ready"),
+        (CampaignPhase.STOP_CHECK, "phase_stop_check_ready"),
+    ],
+)
+def test_status_recommendations_cover_all_idle_phases(tmp_path, phase, code):
+    campaign = _campaign_with_config(tmp_path)
+
+    assert _recommendation_codes(
+        campaign,
+        {
+            "phase": phase.value,
+            "state_artifact_contract_status": {"ok": True},
+            "artifact_manifest_status": {},
+        },
+    ) == [code]
+
+
+def test_status_recommendations_cover_done_and_unknown_phase(tmp_path):
+    campaign = _campaign_with_config(tmp_path)
+
+    assert _recommendation_codes(campaign, {"phase": CampaignPhase.DONE.value}) == [
+        "campaign_done"
+    ]
+    assert _recommendation_codes(campaign, {"phase": "NOT_A_PHASE"}) == [
+        "phase_unknown"
+    ]
+
+
+def test_status_recommendation_dicts_are_json_ready(tmp_path):
+    campaign = _campaign_with_config(tmp_path)
+    payload = {
+        "status_error": "state_schema_invalid",
+        "state_error": "StateSchemaError: bad field",
+    }
+
+    data = recommendation_dicts(build_status_recommendations(campaign, payload))
+
+    assert data[0]["code"] == "state_schema_invalid"
+    assert data[0]["severity"] == "required"
+    assert "primary" in data[0]
 
 
 def test_cli_stop_sets_shutdown_flag(tmp_path):
