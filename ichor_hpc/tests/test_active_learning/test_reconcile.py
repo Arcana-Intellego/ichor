@@ -13,6 +13,7 @@ from ichor.hpc.active_learning.daemon.reconcile import (
     stateful_campaign_artifacts,
     write_proposed_state,
 )
+from ichor.hpc.active_learning.daemon import input_staging as stg
 from ichor.hpc.active_learning.daemon.state import (
     CampaignPhase,
     DEFAULT_STATE_FILENAME,
@@ -50,6 +51,20 @@ def _write_pool(campaign):
     )
 
 
+def _write_valid_initial_aimall_handoff(campaign, *, iteration=0):
+    initial = campaign / ".DATA" / "STAGING" / "initial"
+    pointdir = initial / "POINT_0000.pointdir"
+    pointdir.mkdir(parents=True, exist_ok=True)
+    stg.write_quantum_acceptance_manifest(
+        initial,
+        phase_name=CampaignPhase.INITIAL_AIMALL.value,
+        iteration=iteration,
+        accepted=[pointdir],
+        rejected=[],
+    )
+    return initial
+
+
 def test_propose_recovery_on_empty_campaign_returns_init(tmp_path):
     campaign, _, _, _ = _campaign_dirs(tmp_path)
     report = propose_recovery(campaign)
@@ -59,6 +74,78 @@ def test_propose_recovery_on_empty_campaign_returns_init(tmp_path):
     assert report.committed_training_versions == []
     assert report.committed_model_versions == []
     assert report.existing_state_loaded is False
+
+
+def test_propose_recovery_never_trusts_stop_check_without_committed_versions(tmp_path):
+    campaign, data, _, _ = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    state = fresh_campaign_state(max_iterations=50)
+    state.phase = CampaignPhase.STOP_CHECK
+    state.training_set_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+
+    report = propose_recovery(campaign)
+
+    assert report.committed_training_versions == []
+    assert report.committed_model_versions == []
+    assert report.proposed_state.phase is CampaignPhase.HALTED
+    assert report.proposed_state.training_set_version == -1
+    assert report.proposed_state.models_version == -1
+    assert "latest coherent committed training/model pair is trusted" not in report.decision
+    assert "no committed versions" in report.decision
+
+
+def test_propose_recovery_initial_aimall_handoff_reenters_initial_ferebus(tmp_path):
+    campaign, data, _, _ = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    append_event(
+        data / "journal.ndjson",
+        "phase_transition",
+        from_phase=CampaignPhase.INITIAL_GAUSSIAN.value,
+        to_phase=CampaignPhase.INITIAL_AIMALL.value,
+        iteration=0,
+    )
+    state = fresh_campaign_state(max_iterations=50)
+    state.phase = CampaignPhase.STOP_CHECK
+    state.training_set_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    _write_valid_initial_aimall_handoff(campaign)
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.INITIAL_FEREBUS
+    assert report.proposed_state.training_set_version == -1
+    assert report.proposed_state.models_version == -1
+    assert "valid initial AIMAll handoff" in report.decision
+    assert "initial AIMAll acceptance manifest" in report.trusted_artifacts
+
+
+def test_propose_recovery_initial_aimall_missing_handoff_halts(tmp_path):
+    campaign, data, _, _ = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    append_event(
+        data / "journal.ndjson",
+        "phase_transition",
+        from_phase=CampaignPhase.INITIAL_GAUSSIAN.value,
+        to_phase=CampaignPhase.INITIAL_AIMALL.value,
+        iteration=0,
+    )
+    state = fresh_campaign_state(max_iterations=50)
+    state.phase = CampaignPhase.STOP_CHECK
+    state.training_set_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.HALTED
+    assert report.proposed_state.training_set_version == -1
+    assert report.proposed_state.models_version == -1
+    assert "INITIAL_AIMALL completed" in report.decision
+    assert any("initial AIMAll handoff invalid or missing" in r for r in report.unsafe_reasons)
+    assert ".DATA/STAGING/initial" in report.blocking_artifacts
 
 
 def test_propose_recovery_missing_state_nonempty_staging_halts(tmp_path):

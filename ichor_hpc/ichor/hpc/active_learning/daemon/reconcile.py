@@ -22,6 +22,7 @@ from ..versioning.training_set import TrainingSetVersioning
 from .artifact_contracts import (
     verify_committed_model_version,
     verify_committed_training_version,
+    verify_state_referenced_artifacts,
 )
 from .journal import iter_events
 from . import submission_intent as _submission_intent
@@ -252,6 +253,62 @@ def _trajectory_pool_unsafe_reason(exc: Exception) -> str:
     return "trajectory pool unreadable"
 
 
+def _initial_aimall_handoff_indicated(
+    *,
+    existing: Optional[CampaignState],
+    last_phase: Optional[str],
+) -> bool:
+    if str(last_phase or "") == CampaignPhase.INITIAL_AIMALL.value:
+        return True
+    if existing is None:
+        return False
+    try:
+        phase = CampaignPhase(existing.phase)
+    except Exception:
+        return False
+    return phase in {
+        CampaignPhase.INITIAL_AIMALL,
+        CampaignPhase.INITIAL_FEREBUS,
+    }
+
+
+def _validate_initial_ferebus_bootstrap(
+    campaign_dir: Union[str, Path],
+    *,
+    iteration: int,
+) -> None:
+    from .input_staging import read_quantum_acceptance_manifest
+
+    read_quantum_acceptance_manifest(
+        Path(campaign_dir) / ".DATA" / "STAGING" / "initial",
+        expected_phase=CampaignPhase.INITIAL_AIMALL.value,
+        expected_iteration=int(iteration),
+        require_nonempty=True,
+    )
+
+
+def _validate_recovered_state_contract(
+    campaign_dir: Union[str, Path],
+    state: CampaignState,
+) -> None:
+    phase = CampaignPhase(state.phase)
+    if phase in {CampaignPhase.INIT, CampaignPhase.DONE, CampaignPhase.HALTED}:
+        return
+    training_version = int(getattr(state, "training_set_version", -1))
+    model_version = int(getattr(state, "models_version", -1))
+    if (
+        phase is CampaignPhase.INITIAL_FEREBUS
+        and training_version < 0
+        and model_version < 0
+    ):
+        _validate_initial_ferebus_bootstrap(
+            campaign_dir,
+            iteration=int(getattr(state, "iteration", 0)),
+        )
+        return
+    verify_state_referenced_artifacts(campaign_dir, state)
+
+
 def propose_recovery(
     campaign_dir: Union[str, Path],
     *,
@@ -344,6 +401,10 @@ def propose_recovery(
                 #to_phase tells us what was advanced to most recently
                 last_phase = event.get("to_phase") or last_phase
                 last_iter = event.get("iteration", last_iter)
+    initial_handoff_indicated = _initial_aimall_handoff_indicated(
+        existing=existing,
+        last_phase=last_phase,
+    )
 
     active_intents: List[Dict[str, Any]] = []
     intent_root = _submission_intent.intent_dir(campaign)
@@ -370,6 +431,12 @@ def propose_recovery(
         p for p in (staging_root.iterdir() if staging_root.is_dir() else [])
         if p.name not in (".", "..")
     ]
+    unexpected_staging_children = list(staging_children)
+    if initial_handoff_indicated and not tv and not mv:
+        unexpected_staging_children = [
+            p for p in staging_children
+            if p.name != "initial"
+        ]
     scripts_root = campaign / ".DATA" / "SCRIPTS"
     script_files = [
         p for p in (scripts_root.glob("*.sh") if scripts_root.is_dir() else [])
@@ -402,7 +469,7 @@ def propose_recovery(
             + str(campaign)
             + " --cancel-jobs"
         )
-    if staging_children:
+    if unexpected_staging_children:
         unsafe_reasons.append(".DATA/STAGING is non-empty")
         blocking_artifacts.append(".DATA/STAGING")
     if script_files:
@@ -521,6 +588,18 @@ def propose_recovery(
     latest_training_only = max(valid_training_versions) if valid_training_versions else None
     latest_model_only = max(valid_model_versions) if valid_model_versions else None
     no_coherent_pair = False
+    initial_handoff_error: Optional[str] = None
+    initial_handoff_valid = False
+    if not tv and not mv and initial_handoff_indicated:
+        try:
+            _validate_initial_ferebus_bootstrap(
+                campaign,
+                iteration=int(getattr(recovered, "iteration", 0)),
+            )
+            initial_handoff_valid = True
+            trusted_artifacts.append("initial AIMAll acceptance manifest")
+        except Exception as exc:
+            initial_handoff_error = type(exc).__name__ + ": " + str(exc)[:180]
 
     if coherent_pairs:
         coherent = int(coherent_pairs[-1])
@@ -591,10 +670,46 @@ def propose_recovery(
                 )
             except Exception:
                 recovered.phase = CampaignPhase.HALTED
+    elif not tv and not mv and initial_handoff_indicated and initial_handoff_valid and not unsafe_reasons:
+        recovered.phase = CampaignPhase.INITIAL_FEREBUS
+        recovered.training_set_version = -1
+        recovered.models_version = -1
+        decision = "INITIAL_FEREBUS: valid initial AIMAll handoff exists without committed models"
+        notes.append(
+            "re-entry at INITIAL_FEREBUS to commit initial training/model version 0"
+        )
+    elif not tv and not mv and initial_handoff_indicated:
+        recovered.phase = CampaignPhase.HALTED
+        recovered.training_set_version = -1
+        recovered.models_version = -1
+        if initial_handoff_valid:
+            decision = "HALTED: valid initial AIMAll handoff exists but unsafe artefacts need review"
+            notes.append(
+                "re-entry HALTED because unsafe artefacts block INITIAL_FEREBUS recovery"
+            )
+        else:
+            decision = "HALTED: INITIAL_AIMALL completed but initial FEREBUS handoff is missing"
+            notes.append(
+                "re-entry HALTED because no committed training/model versions or valid initial AIMAll handoff exist"
+            )
+        if initial_handoff_error:
+            unsafe_reasons.append(
+                "initial AIMAll handoff invalid or missing: "
+                + initial_handoff_error
+            )
+            blocking_artifacts.append(".DATA/STAGING/initial")
     elif not tv and not mv and not existing_loaded:
         recovered.phase = CampaignPhase.INIT
         decision = "INIT: no existing state or committed iterations"
         notes.append("no committed iterations; re-entry at INIT")
+    elif not tv and not mv:
+        recovered.phase = CampaignPhase.HALTED
+        recovered.training_set_version = -1
+        recovered.models_version = -1
+        decision = "HALTED: existing state has no committed versions or recoverable initial handoff"
+        notes.append(
+            "re-entry HALTED because existing state has no committed training/model versions"
+        )
     elif no_coherent_pair:
         recovered.phase = CampaignPhase.HALTED
         decision = "HALTED: no coherent committed training/model pair"
@@ -626,6 +741,21 @@ def propose_recovery(
         notes.append("re-entry at STOP_CHECK (next tick decides loop/terminate)")
     recovered.pending_jobs = {}
     recovered.shutdown_requested = False
+    if recovered.phase is not CampaignPhase.HALTED:
+        try:
+            _validate_recovered_state_contract(campaign, recovered)
+        except Exception as exc:
+            recovered.phase = CampaignPhase.HALTED
+            reason = (
+                "proposed recovery failed final contract validation: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:180]
+            )
+            unsafe_reasons.append(reason)
+            blocking_artifacts.append("proposed state")
+            decision = "HALTED: proposed recovery failed final contract validation"
+            notes.append("re-entry HALTED because proposed state failed final contract validation")
     if recovered.phase is CampaignPhase.HALTED and not recommended_actions:
         recommended_actions.append("Inspect unsafe recovery reasons before applying.")
 

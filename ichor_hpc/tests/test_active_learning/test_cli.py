@@ -243,7 +243,10 @@ def test_cli_status_default_prints_operator_friendly_summary(tmp_path, capsys):
     assert "  models version: 0" in out
     assert "  models status: problem - CommittedArtifactError:" in out
     assert "Recommendation\n" in out
-    assert "  next action: run reconcile; committed artefacts are inconsistent with state" in out
+    assert (
+        "  next action: run reconcile; if this remains unchanged, recovery could "
+        "not find committed training/model artefacts"
+    ) in out
     assert "training v0: problem" not in out
     assert "background_pid" not in out
     assert "shutdown_requested" not in out

@@ -875,6 +875,11 @@ def _status_recommendation(payload: Dict[str, Any]) -> str:
     ):
         return "daemon work appears active; monitor journal/status or stop it intentionally"
     if _artifact_status_has_problem(payload.get("artifact_manifest_status")):
+        if payload.get("phase") == "STOP_CHECK":
+            return (
+                "run reconcile; if this remains unchanged, recovery could not "
+                "find committed training/model artefacts"
+            )
         return "run reconcile; committed artefacts are inconsistent with state"
     if payload.get("phase") == "DONE":
         return "campaign is complete"
