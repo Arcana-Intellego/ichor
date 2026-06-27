@@ -884,11 +884,32 @@ def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path
 
 
 def _event_time(event: Dict[str, Any]) -> str:
-    ts = str(event.get("ts", ""))
-    if "T" in ts:
-        tail = ts.split("T", 1)[1]
-        return tail.split(".", 1)[0].replace("+00:00", "")
-    return ts[:8] if ts else "--:--:--"
+    ts = str(event.get("ts", "")).strip()
+    if not ts:
+        return "--:--:--"
+    try:
+        from datetime import datetime
+
+        parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return parsed.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        if "T" in ts:
+            date_part, tail = ts.split("T", 1)
+            time_part = (
+                tail.split(".", 1)[0]
+                .replace("+00:00", "")
+                .replace("Z", "")
+            )
+            if date_part and time_part:
+                return date_part[:10] + " " + time_part[:8]
+        return ts
+
+
+def _event_iteration(event: Dict[str, Any]) -> str:
+    value = event.get("iteration")
+    if value is None:
+        return "iter=-"
+    return "iter=" + str(value)
 
 
 def _event_phase(event: Dict[str, Any]) -> str:
@@ -901,7 +922,6 @@ def _event_phase(event: Dict[str, Any]) -> str:
 
 def _compact_event_details(event: Dict[str, Any]) -> str:
     detail_keys = [
-        ("iteration", "iter"),
         ("job_id", "job"),
         ("expected_tasks", "tasks"),
         ("n_tasks", "tasks"),
@@ -926,7 +946,7 @@ def _compact_event_details(event: Dict[str, Any]) -> str:
 def _format_journal_events(events: Sequence[Dict[str, Any]], *, verbose: bool) -> str:
     if not events:
         return ""
-    rows: List[Tuple[Dict[str, Any], str, str, str, str]] = []
+    rows: List[Tuple[Dict[str, Any], str, str, str, str, str]] = []
     for event in events:
         event_name = str(event.get("event", "<missing>"))
         phase = _event_phase(event)
@@ -934,28 +954,32 @@ def _format_journal_events(events: Sequence[Dict[str, Any]], *, verbose: bool) -
             (
                 event,
                 _event_time(event),
-                event_name,
+                _event_iteration(event),
                 phase,
+                event_name,
                 _compact_event_details(event),
             )
         )
-    time_width = max(8, max(len(row[1]) for row in rows))
-    event_width = max(24, max(len(row[2]) for row in rows))
+    time_width = max(19, max(len(row[1]) for row in rows))
+    iteration_width = max(6, max(len(row[2]) for row in rows))
     phase_width = max(18, max(len(row[3]) for row in rows))
+    event_width = max(24, max(len(row[4]) for row in rows))
 
     lines: List[str] = []
-    for event, event_time, event_name, phase, details in rows:
+    for event, event_time, iteration, phase, event_name, details in rows:
         first_line = (
             event_time.ljust(time_width)
             + "  "
-            + event_name.ljust(event_width)
+            + iteration.ljust(iteration_width)
             + "  "
             + phase.ljust(phase_width)
+            + "  "
+            + event_name.ljust(event_width)
         )
-        lines.append(first_line + (("  " + details) if details else ""))
+        lines.append(first_line + "  " + (details if details else "-"))
         if verbose:
             for key in sorted(event):
-                if key in {"ts", "event", "phase", "to_phase", "from_phase"}:
+                if key in {"ts", "event", "phase", "to_phase", "from_phase", "iteration"}:
                     continue
                 lines.append("  " + key + ": " + _format_value(event[key]))
     return "\n".join(lines) + "\n"

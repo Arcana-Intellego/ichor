@@ -809,7 +809,7 @@ def test_cli_journal_json_prints_filtered_events(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
     (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
     journal = campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson"
-    append_event(journal, "alpha", x=1)
+    append_event(journal, "alpha", x=1, ts="2026-06-27T14:32:10.123456+00:00")
     append_event(journal, "beta", x=2)
     append_event(journal, "alpha", x=3)
     rc = main([
@@ -820,18 +820,37 @@ def test_cli_journal_json_prints_filtered_events(tmp_path, capsys):
     captured = capsys.readouterr()
     lines = [l for l in captured.out.splitlines() if l.strip()]
     assert len(lines) == 2
-    for line in lines:
-        payload = json.loads(line)
-        assert payload["event"] == "alpha"
+    payloads = [json.loads(line) for line in lines]
+    assert [payload["event"] for payload in payloads] == ["alpha", "alpha"]
+    assert payloads[0]["ts"] == "2026-06-27T14:32:10.123456+00:00"
 
 
 def test_cli_journal_default_prints_readable_events(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
     (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
     journal = campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson"
-    append_event(journal, "alpha", x=1)
-    append_event(journal, "beta", x=2)
-    append_event(journal, "alpha", x=3)
+    append_event(
+        journal,
+        "alpha",
+        phase="INITIAL_GAUSSIAN",
+        iteration=0,
+        job_id="111",
+        ts="2026-06-27T14:32:10.123456+00:00",
+    )
+    append_event(
+        journal,
+        "beta",
+        phase="INITIAL_AIMALL",
+        iteration=1,
+        n_completed=2,
+        ts="2026-06-27T14:42:55+00:00",
+    )
+    append_event(
+        journal,
+        "alpha",
+        phase="FEREBUS",
+        ts="2026-06-27T14:43:02Z",
+    )
 
     rc = main(["journal", "--campaign-dir", str(campaign), "--last-n", "2"])
 
@@ -841,6 +860,12 @@ def test_cli_journal_default_prints_readable_events(tmp_path, capsys):
     assert len(lines) == 2
     assert "alpha" in out
     assert "beta" in out
+    assert "2026-06-27 14:42:55" in out
+    assert "2026-06-27 14:43:02" in out
+    assert "iter=1" in lines[0]
+    assert "iter=-" in lines[1]
+    assert lines[0].count("iter=1") == 1
+    assert lines[1].rstrip().endswith("-")
     assert not out.lstrip().startswith("{")
 
 
@@ -852,14 +877,18 @@ def test_cli_journal_left_justifies_columns_for_long_events(tmp_path, capsys):
         journal,
         "sbatch",
         phase="PHASE_A_POLUS",
+        iteration=0,
         job_id="16175189",
         expected_tasks=1,
+        ts="2026-06-27T14:32:10.123456+00:00",
     )
     append_event(
         journal,
         "sacct_rows_missing_but_squeue_active",
         phase="INITIAL_GAUSSIAN",
+        iteration=12,
         job_id="16175294",
+        ts="2026-06-27T14:42:55+00:00",
     )
 
     rc = main(["journal", "--campaign-dir", str(campaign)])
@@ -867,7 +896,11 @@ def test_cli_journal_left_justifies_columns_for_long_events(tmp_path, capsys):
     assert rc == 0
     lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
     assert len(lines) == 2
+    assert lines[0].startswith("2026-06-27 14:32:10")
+    assert lines[1].startswith("2026-06-27 14:42:55")
+    assert lines[0].index("iter=0") == lines[1].index("iter=12")
     assert lines[0].index("PHASE_A_POLUS") == lines[1].index("INITIAL_GAUSSIAN")
+    assert lines[0].index("sbatch") == lines[1].index("sacct_rows_missing_but_squeue_active")
     assert lines[0].index("job=16175189") == lines[1].index("job=16175294")
 
 
@@ -875,7 +908,15 @@ def test_cli_journal_verbose_prints_event_details(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
     (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
     journal = campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson"
-    append_event(journal, "sbatch", phase="INITIAL_AIMALL", job_id="123", expected_tasks=10)
+    append_event(
+        journal,
+        "sbatch",
+        phase="INITIAL_AIMALL",
+        iteration=0,
+        job_id="123",
+        expected_tasks=10,
+        ts="not-a-real-timestamp",
+    )
 
     rc = main(["journal", "--campaign-dir", str(campaign), "--verbose"])
 
@@ -883,8 +924,11 @@ def test_cli_journal_verbose_prints_event_details(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "sbatch" in out
     assert "INITIAL_AIMALL" in out
+    assert "not-a-real-timestamp" in out
+    assert "iter=0" in out
     assert "  job_id: 123" in out
     assert "  expected_tasks: 10" in out
+    assert "  iteration: 0" not in out
 
 
 def test_cli_journal_returns_4_when_no_journal(tmp_path):
