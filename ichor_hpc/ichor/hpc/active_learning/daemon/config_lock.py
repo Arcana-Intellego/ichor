@@ -189,6 +189,7 @@ FUTURE_SAFE_PREFIXES = {
     "acquisition.movement_utility.",
     "acquisition.gradient.",
     "acquisition.references.",
+    "acquisition.driver.",
 }
 FUTURE_SAFE_EXACT = {
     "resources.partition",

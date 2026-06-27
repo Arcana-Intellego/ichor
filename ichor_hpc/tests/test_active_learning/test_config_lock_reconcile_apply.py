@@ -174,6 +174,49 @@ def test_memory_estimate_guard_default_migration_is_allowed(tmp_path):
     assert not review.blocked_changes
 
 
+def test_acquisition_driver_default_migration_is_future_safe(tmp_path):
+    campaign = _campaign(tmp_path)
+    original = CampaignConfig()
+    write_config_lock(campaign, original)
+    path = config_lock_path(campaign)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    del payload["canonical_config"]["acquisition"]["driver"]
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    changed = CampaignConfig()
+    _write_config(campaign, changed)
+
+    proposed = fresh_campaign_state()
+    proposed.phase = CampaignPhase.ARIADNE_ARRAY
+    review = review_config_changes(campaign, changed, proposed)
+
+    assert review.allowed
+    changed_paths = sorted(c.path for c in review.allowed_changes)
+    assert changed_paths
+    assert all(path.startswith("acquisition.driver.") for path in changed_paths)
+    assert {c.category for c in review.allowed_changes} == {"future_safe"}
+    assert not review.blocked_changes
+
+
+def test_default_campaign_config_has_no_unclassified_lock_paths():
+    config = CampaignConfig()
+    proposed = fresh_campaign_state()
+    campaign = Path("/tmp/campaign-placeholder")
+    unexpected = []
+    for path, value in sorted(config_lock_mod._flatten(config.to_dict()).items()):
+        change = config_lock_mod._classify_change(
+            campaign,
+            proposed,
+            path,
+            None,
+            value,
+        )
+        if change.category == "unclassified_locked":
+            unexpected.append(path)
+
+    assert unexpected == []
+
+
 def test_ariadne_backtransform_changes_are_future_safe(tmp_path):
     campaign = _campaign(tmp_path)
     original = CampaignConfig()
