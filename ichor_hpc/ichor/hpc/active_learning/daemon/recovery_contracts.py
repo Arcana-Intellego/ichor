@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from ..acquisition.trajectory_pool import TrajectoryPool
 from ..handoff_manifests import (
@@ -469,6 +469,120 @@ def _single_decision_or_none(decisions: Sequence[RecoveryDecision]) -> Optional[
     return None
 
 
+def _phase_contract_checks(
+    campaign: Path,
+    state: CampaignState,
+) -> List[Tuple[str, Callable[[], None]]]:
+    phase = CampaignPhase(state.phase)
+    iteration = int(getattr(state, "iteration", 0))
+    training_version = int(getattr(state, "training_set_version", -1))
+    model_version = int(getattr(state, "models_version", -1))
+
+    checks: Dict[CampaignPhase, List[Tuple[str, Callable[[], None]]]] = {
+        CampaignPhase.PHASE_A_POLUS: [
+            ("trajectory pool", lambda: _require_pool(campaign)),
+        ],
+        CampaignPhase.INITIAL_GAUSSIAN: [
+            ("Phase A sample", lambda: _require_phase_a(campaign)),
+        ],
+        CampaignPhase.INITIAL_AIMALL: [
+            (
+                "initial Gaussian handoff",
+                lambda: _require_initial_quantum(
+                    campaign,
+                    CampaignPhase.INITIAL_GAUSSIAN,
+                    iteration,
+                ),
+            ),
+        ],
+        CampaignPhase.INITIAL_FEREBUS: [
+            (
+                "initial AIMAll handoff or committed bootstrap training version 0",
+                lambda: _require_initial_ferebus_input(
+                    campaign,
+                    iteration,
+                    training_version,
+                    model_version,
+                ),
+            ),
+        ],
+        CampaignPhase.SEED_SELECT: [
+            (
+                "committed training version " + str(training_version),
+                lambda: _require_training_version(campaign, training_version),
+            ),
+            (
+                "committed model version " + str(model_version),
+                lambda: _require_model_version(campaign, model_version),
+            ),
+            ("trajectory pool", lambda: _require_pool(campaign)),
+        ],
+        CampaignPhase.ARIADNE_ARRAY: [
+            ("seeds_picked.json", lambda: _require_seeds(campaign, iteration)),
+        ],
+        CampaignPhase.PHASE_B_POLUS: [
+            (
+                "ARIADNE_RESULTS.json",
+                lambda: _require_ariadne_results(campaign, iteration),
+            ),
+        ],
+        CampaignPhase.SPLIT: [
+            (
+                "Phase B selection/sample",
+                lambda: _require_phase_b(campaign, iteration),
+            ),
+        ],
+        CampaignPhase.GAUSSIAN: [
+            (
+                "Phase B selection/sample",
+                lambda: _require_phase_b(campaign, iteration),
+            ),
+            ("split.json", lambda: _require_split(campaign, iteration)),
+        ],
+        CampaignPhase.AIMALL: [
+            (
+                "iterative Gaussian handoff",
+                lambda: _require_iter_quantum(
+                    campaign,
+                    CampaignPhase.GAUSSIAN,
+                    iteration,
+                ),
+            ),
+        ],
+        CampaignPhase.APPEND: [
+            (
+                "iterative AIMAll handoff",
+                lambda: _require_iter_quantum(
+                    campaign,
+                    CampaignPhase.AIMALL,
+                    iteration,
+                ),
+            ),
+        ],
+        CampaignPhase.FEREBUS: [
+            (
+                "committed training version ahead of model version",
+                lambda: _require_ferebus_needed(
+                    campaign,
+                    training_version,
+                    model_version,
+                ),
+            ),
+            (
+                "FEREBUS iteration matches training version",
+                lambda: _require_ferebus_iteration(iteration, training_version),
+            ),
+        ],
+        CampaignPhase.STOP_CHECK: [
+            (
+                "active iteration fully committed",
+                lambda: _require_active_iteration_committed(state, iteration),
+            ),
+        ],
+    }
+    return list(checks.get(phase, []))
+
+
 def _existing_phase_recovery(
     campaign: Path,
     state: CampaignState,
@@ -642,60 +756,85 @@ def phase_recovery_contract_error(
 ) -> Optional[str]:
     """Return a phase-specific input error for ``state``, or ``None``."""
     campaign = Path(campaign_dir)
+    for label, check in _phase_contract_checks(campaign, state):
+        error = _error(check)
+        if error is not None:
+            return label + ": " + error
+    return None
+
+
+def recovery_contract_status(
+    campaign_dir: Union[str, Path],
+    state: CampaignState,
+) -> Dict[str, Any]:
+    """Return an operator-facing phase input contract summary."""
+    campaign = Path(campaign_dir)
     phase = CampaignPhase(state.phase)
     iteration = int(getattr(state, "iteration", 0))
-    training_version = int(getattr(state, "training_set_version", -1))
-    model_version = int(getattr(state, "models_version", -1))
+    required_inputs: List[str] = []
+    trusted_inputs: List[str] = []
+    missing_or_invalid_inputs: List[str] = []
+    for label, check in _phase_contract_checks(campaign, state):
+        required_inputs.append(label)
+        error = _error(check)
+        if error is None:
+            trusted_inputs.append(label)
+        else:
+            missing_or_invalid_inputs.append(label + ": " + error)
 
-    checks = {
-        CampaignPhase.PHASE_A_POLUS: lambda: _require_pool(campaign),
-        CampaignPhase.INITIAL_GAUSSIAN: lambda: _require_phase_a(campaign),
-        CampaignPhase.INITIAL_AIMALL: lambda: _require_initial_quantum(
-            campaign,
-            CampaignPhase.INITIAL_GAUSSIAN,
-            iteration,
-        ),
-        CampaignPhase.INITIAL_FEREBUS: lambda: _require_initial_ferebus_input(
-            campaign,
-            iteration,
-            training_version,
-            model_version,
-        ),
-        CampaignPhase.SEED_SELECT: lambda: (
-            _require_training_version(campaign, training_version),
-            _require_model_version(campaign, model_version),
-            _require_pool(campaign),
-        ),
-        CampaignPhase.ARIADNE_ARRAY: lambda: _require_seeds(campaign, iteration),
-        CampaignPhase.PHASE_B_POLUS: lambda: _require_ariadne_results(campaign, iteration),
-        CampaignPhase.SPLIT: lambda: _require_phase_b(campaign, iteration),
-        CampaignPhase.GAUSSIAN: lambda: (
-            _require_phase_b(campaign, iteration),
-            _require_split(campaign, iteration),
-        ),
-        CampaignPhase.AIMALL: lambda: _require_iter_quantum(
-            campaign,
-            CampaignPhase.GAUSSIAN,
-            iteration,
-        ),
-        CampaignPhase.APPEND: lambda: _require_iter_quantum(
-            campaign,
-            CampaignPhase.AIMALL,
-            iteration,
-        ),
-        CampaignPhase.FEREBUS: lambda: (
-            _require_ferebus_needed(campaign, training_version, model_version),
-            _require_ferebus_iteration(iteration, training_version),
-        ),
-        CampaignPhase.STOP_CHECK: lambda: _require_active_iteration_committed(
-            state,
-            iteration,
-        ),
+    protected_artifacts = []
+    try:
+        for decision in staging_handoff_decisions(campaign, state):
+            protected_artifacts.append({
+                "phase": decision.phase.value,
+                "iteration": int(decision.iteration),
+                "path": str(decision.trusted_artifact or ""),
+            })
+    except Exception as exc:
+        protected_artifacts.append({
+            "phase": "UNKNOWN",
+            "iteration": iteration,
+            "path": (
+                "staging inventory failed: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:160]
+            ),
+        })
+
+    trusted_handoffs = []
+    try:
+        handoff_decisions = active_iteration_handoff_decisions(campaign, state)
+    except Exception as exc:
+        handoff_decisions = []
+        missing_or_invalid_inputs.append(
+            "active-iteration handoff inventory: "
+            + type(exc).__name__
+            + ": "
+            + str(exc)[:160]
+        )
+    for decision in handoff_decisions:
+        trusted_handoffs.append({
+            "phase": decision.phase.value,
+            "iteration": int(decision.iteration),
+            "path": str(decision.trusted_artifact or ""),
+        })
+
+    if not required_inputs and phase in {CampaignPhase.HALTED, CampaignPhase.DONE}:
+        missing_or_invalid_inputs.append(
+            "phase " + phase.value + " is not a runnable recovery phase"
+        )
+
+    return {
+        "selected_phase": phase.value,
+        "iteration": iteration,
+        "contract_ok": not missing_or_invalid_inputs,
+        "required_inputs": required_inputs,
+        "trusted_inputs": trusted_inputs,
+        "missing_or_invalid_inputs": missing_or_invalid_inputs,
+        "trusted_handoffs": trusted_handoffs,
+        "protected_artifacts": protected_artifacts,
     }
-    check = checks.get(phase)
-    if check is None:
-        return None
-    return _error(check)
 
 
 def validate_phase_recovery_contract(

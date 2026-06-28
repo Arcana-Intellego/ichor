@@ -210,6 +210,39 @@ def test_propose_recovery_on_empty_campaign_returns_init(tmp_path):
     assert report.existing_state_loaded is False
 
 
+def test_recovery_contract_status_marks_halted_state_not_runnable(tmp_path):
+    campaign, _, _, _ = _campaign_dirs(tmp_path)
+    state = fresh_campaign_state(max_iterations=3)
+    state.phase = CampaignPhase.HALTED
+
+    status = recovery_contracts_mod.recovery_contract_status(campaign, state)
+
+    assert status["selected_phase"] == CampaignPhase.HALTED.value
+    assert status["contract_ok"] is False
+    assert status["required_inputs"] == []
+    assert status["trusted_inputs"] == []
+    assert status["missing_or_invalid_inputs"] == [
+        "phase HALTED is not a runnable recovery phase"
+    ]
+
+
+def test_recovery_contract_status_reports_seed_handoff_contract(tmp_path):
+    campaign, _, _, _ = _campaign_dirs(tmp_path)
+    _write_seeds_picked(campaign, 2, n=3)
+    state = fresh_campaign_state(max_iterations=5)
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 2
+
+    status = recovery_contracts_mod.recovery_contract_status(campaign, state)
+
+    assert status["selected_phase"] == CampaignPhase.ARIADNE_ARRAY.value
+    assert status["iteration"] == 2
+    assert status["contract_ok"] is True
+    assert status["required_inputs"] == ["seeds_picked.json"]
+    assert status["trusted_inputs"] == ["seeds_picked.json"]
+    assert status["missing_or_invalid_inputs"] == []
+
+
 def test_propose_recovery_phase_a_sample_reenters_initial_gaussian(tmp_path):
     from ichor.hpc.active_learning.handoff_manifests import write_phase_a_sample_manifest
 

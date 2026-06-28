@@ -66,6 +66,43 @@ def _write_config(campaign, config):
     config.to_yaml(campaign / "campaign.yaml")
 
 
+def _write_phase_a_sample(campaign):
+    from ichor.hpc.active_learning.handoff_manifests import write_phase_a_sample_manifest
+
+    initial = campaign / "3_DIVERSITY_SAMPLING" / "initial"
+    initial.mkdir(parents=True, exist_ok=True)
+    sample = initial / "initial-SAMPLE-1.xyz"
+    index = initial / "initial-INDEX-1.dat"
+    sample.write_text("1\nframe 0\nH 0.0 0.0 0.0\n", encoding="utf-8")
+    index.write_text("0\n", encoding="utf-8")
+    write_phase_a_sample_manifest(initial, {
+        "phase": "PHASE_A_POLUS",
+        "iteration": -1,
+        "sample_xyz": str(sample.resolve()),
+        "index_path": str(index.resolve()),
+        "n_select": 1,
+        "n_frames": 1,
+        "selected_indices": [0],
+        "descriptor": "mass_weighted_rmsd",
+        "n_pool_frames": 1,
+    })
+
+
+def _write_live_initial_gaussian_handoff(campaign):
+    initial = campaign / ".DATA" / "STAGING" / "initial"
+    pointdir = initial / "POINT_0000.pointdir"
+    pointdir.mkdir(parents=True, exist_ok=True)
+    (pointdir / "input.wfn").write_text("wfn\n", encoding="utf-8")
+    stg.write_points_file(initial, [pointdir])
+    stg.write_quantum_acceptance_manifest(
+        initial,
+        phase_name=CampaignPhase.INITIAL_GAUSSIAN.value,
+        iteration=0,
+        accepted=[pointdir],
+        rejected=[],
+    )
+
+
 def _write_halted_pre_ferebus_state(campaign):
     _write_pool(campaign)
     state = fresh_campaign_state(max_iterations=3)
@@ -146,6 +183,63 @@ def test_ferebus_scaling_change_allowed_for_uncommitted_initial_ferebus(tmp_path
     assert [c.path for c in review.allowed_changes] == ["ferebus.scaling"]
     assert not review.blocked_changes
     assert state.phase is CampaignPhase.HALTED
+
+
+def test_reconcile_prints_recovery_contract_and_guidance(tmp_path, capsys):
+    campaign = _campaign(tmp_path)
+    _write_pool(campaign)
+    _write_phase_a_sample(campaign)
+    config = CampaignConfig()
+    _write_config(campaign, config)
+    write_config_lock(campaign, config)
+
+    rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            allow_fresh_init=False,
+            apply=False,
+            archive_staging=False,
+            restore_config_from_lock=False,
+        )
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "=== Recovery contract ===" in out
+    assert "selected phase: INITIAL_GAUSSIAN" in out
+    assert "contract:        ok" in out
+    assert "Required inputs:" in out
+    assert "Phase A sample" in out
+    assert "=== Recovery guidance ===" in out
+    assert "Next safe command:" in out
+    assert "ichor-al-daemon reconcile --campaign-dir " + str(campaign) + " --apply" in out
+    assert "Inspect commands:" in out
+
+
+def test_reconcile_prints_protected_staging_handoff(tmp_path, capsys):
+    campaign = _campaign(tmp_path)
+    _write_live_initial_gaussian_handoff(campaign)
+    config = CampaignConfig()
+    _write_config(campaign, config)
+    write_config_lock(campaign, config)
+
+    rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            allow_fresh_init=False,
+            apply=False,
+            archive_staging=False,
+            restore_config_from_lock=False,
+        )
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Protected staging handoffs:" in out
+    assert "INITIAL_AIMALL@0 -> .DATA\\STAGING\\initial" in out or (
+        "INITIAL_AIMALL@0 -> .DATA/STAGING/initial" in out
+    )
+    assert "Operator-review artefacts:" in out
 
 
 def test_phase_walltime_changes_are_allowed_runtime_changes(tmp_path):
