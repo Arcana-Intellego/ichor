@@ -380,6 +380,37 @@ def _phase_b_outputs_exist(campaign_dir: Union[str, Path], proposed_state: Campa
     return False
 
 
+def _active_iteration_committed(proposed_state: CampaignState, iteration: int) -> bool:
+    """Return true when active-loop artefacts for ``iteration`` are committed.
+
+    The initial diverse set is version 0. Active iteration ``i`` appends a new
+    training/model version ``i + 1``, so ARIADNE/Phase B outputs for iteration
+    ``i`` are historical only once both versions have reached that value.
+    """
+    try:
+        training_version = int(getattr(proposed_state, "training_set_version", -1))
+        models_version = int(getattr(proposed_state, "models_version", -1))
+    except (TypeError, ValueError):
+        return False
+    return min(training_version, models_version) >= int(iteration) + 1
+
+
+def _phase_outputs_lock_change(
+    campaign_dir: Union[str, Path],
+    proposed_state: CampaignState,
+    phase: CampaignPhase,
+    exists_fn,
+) -> bool:
+    iteration = int(getattr(proposed_state, "iteration", 0))
+    if not bool(exists_fn(campaign_dir, proposed_state)):
+        return False
+    if proposed_state.phase is phase:
+        return True
+    if proposed_state.phase in {CampaignPhase.HALTED, CampaignPhase.STOP_CHECK}:
+        return not _active_iteration_committed(proposed_state, iteration)
+    return False
+
+
 def _blocks_existing_phase_outputs(
     campaign_dir: Union[str, Path],
     proposed_state: CampaignState,
@@ -391,20 +422,28 @@ def _blocks_existing_phase_outputs(
             ARIADNE_OUTPUT_INTERPRETATION_EXACT,
             ARIADNE_OUTPUT_INTERPRETATION_PREFIXES,
         )
-        and proposed_state.phase is CampaignPhase.ARIADNE_ARRAY
-        and _ariadne_outputs_exist(campaign_dir, proposed_state)
+        and _phase_outputs_lock_change(
+            campaign_dir,
+            proposed_state,
+            CampaignPhase.ARIADNE_ARRAY,
+            _ariadne_outputs_exist,
+        )
     ):
-        return "field affects already-started ARIADNE outputs; discard or rerun the phase before changing it"
+        return "field affects in-flight or uncommitted ARIADNE outputs; discard or rerun the phase before changing it"
     if (
         _matches(
             path,
             PHASE_B_OUTPUT_INTERPRETATION_EXACT,
             PHASE_B_OUTPUT_INTERPRETATION_PREFIXES,
         )
-        and proposed_state.phase is CampaignPhase.PHASE_B_POLUS
-        and _phase_b_outputs_exist(campaign_dir, proposed_state)
+        and _phase_outputs_lock_change(
+            campaign_dir,
+            proposed_state,
+            CampaignPhase.PHASE_B_POLUS,
+            _phase_b_outputs_exist,
+        )
     ):
-        return "field affects already-started Phase B outputs; discard or rerun the phase before changing it"
+        return "field affects in-flight or uncommitted Phase B outputs; discard or rerun the phase before changing it"
     return None
 
 

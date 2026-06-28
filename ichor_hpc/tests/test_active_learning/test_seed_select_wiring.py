@@ -237,6 +237,20 @@ def test_live_seed_selection_requires_models_by_default(tmp_path):
         ex._seed_selection_posterior(state, [object()])
 
 
+def test_live_seed_select_requires_imported_trajectory_pool(tmp_path):
+    cfg = CampaignConfig()
+    cfg.acquisition.allow_uniform_posterior_fallback = True
+    ex = LiveBackendsPhaseExecutor(
+        campaign_dir=tmp_path / "campaign",
+        config=cfg,
+        backend_check=False,
+    )
+    state = SimpleNamespace(iteration=0, models_version=0)
+
+    with pytest.raises(BackendSubmissionError, match="imported trajectory pool"):
+        ex.submit_or_run(state, CampaignPhase.SEED_SELECT)
+
+
 def test_live_seed_selection_uniform_fallback_requires_explicit_config(tmp_path):
     cfg = CampaignConfig()
     cfg.acquisition.allow_uniform_posterior_fallback = True
