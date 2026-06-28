@@ -201,6 +201,8 @@ class ReconciliationReport:
     valid_model_versions: List[int] = field(default_factory=list)
     last_phase_in_journal: Optional[str] = None
     last_iteration_in_journal: Optional[int] = None
+    last_phase_event_in_journal: Optional[str] = None
+    last_phase_retryable: bool = False
     notes: List[str] = field(default_factory=list)
     existing_state_loaded: bool = False
     unsafe_reasons: List[str] = field(default_factory=list)
@@ -280,20 +282,39 @@ def _initial_aimall_handoff_indicated(
     }
 
 
-def _journal_phase_hint(event: Dict[str, Any]) -> Optional[str]:
+def _journal_phase_hint(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     name = str(event.get("event", ""))
     if name == "phase_transition":
-        return event.get("to_phase")
+        phase = event.get("to_phase")
+        retryable = False
     if name in {
         "sbatch",
         "phase_succeeded",
         "phase_succeeded_live",
         "reconcile_applied",
     }:
-        return event.get("phase")
+        phase = event.get("phase")
+        retryable = False
     if name in {"halt", "tick_exception_halted"}:
-        return event.get("from_phase")
-    return None
+        phase = event.get("from_phase")
+        retryable = True
+    if name not in {
+        "phase_transition",
+        "sbatch",
+        "phase_succeeded",
+        "phase_succeeded_live",
+        "reconcile_applied",
+        "halt",
+        "tick_exception_halted",
+    }:
+        return None
+    if phase is None:
+        return None
+    return {
+        "phase": phase,
+        "event": name,
+        "retryable": bool(retryable),
+    }
 
 
 def _validate_initial_ferebus_bootstrap(
@@ -552,12 +573,16 @@ def propose_recovery(
     #last phase observed in journal (informational)
     last_phase = None
     last_iter = None
+    last_phase_event = None
+    last_phase_retryable = False
     journal_path = data / "journal.ndjson"
     if journal_path.exists():
         for event in iter_events(journal_path):
             phase_hint = _journal_phase_hint(event)
             if phase_hint:
-                last_phase = str(phase_hint)
+                last_phase = str(phase_hint["phase"])
+                last_phase_event = str(phase_hint.get("event") or "")
+                last_phase_retryable = bool(phase_hint.get("retryable", False))
                 last_iter = event.get("iteration", last_iter)
     try:
         bootstrap_iteration = int(
@@ -775,6 +800,7 @@ def propose_recovery(
     coherent_pairs = sorted(set(valid_training_versions).intersection(valid_model_versions))
     latest_training_only = max(valid_training_versions) if valid_training_versions else None
     latest_model_only = max(valid_model_versions) if valid_model_versions else None
+    training_model_skew_reentry = False
     no_coherent_pair = False
     initial_handoff_error: Optional[str] = None
     initial_handoff_valid = False
@@ -807,24 +833,59 @@ def propose_recovery(
 
     if coherent_pairs:
         coherent = int(coherent_pairs[-1])
-        if recovered.training_set_version != coherent:
+        if (
+            latest_training_only is not None
+            and latest_model_only is not None
+            and int(latest_training_only) == coherent + 1
+            and int(latest_model_only) == coherent
+        ):
+            training_model_skew_reentry = True
+        target_training = int(latest_training_only) if training_model_skew_reentry else coherent
+        target_model = int(latest_model_only) if training_model_skew_reentry else coherent
+        if recovered.training_set_version != target_training:
             notes.append(
-                "training_set_version set to coherent committed version "
-                + str(coherent)
+                "training_set_version set to recovered committed version "
+                + str(target_training)
             )
-        if recovered.models_version != coherent:
+        if recovered.models_version != target_model:
             notes.append(
-                "models_version set to coherent committed version "
-                + str(coherent)
+                "models_version set to recovered committed version "
+                + str(target_model)
             )
-        recovered.training_set_version = coherent
-        recovered.models_version = coherent
-        if latest_training_only is not None and latest_training_only > coherent:
+        recovered.training_set_version = target_training
+        recovered.models_version = target_model
+        try:
+            current_iteration = int(recovered.iteration)
+        except Exception:
+            current_iteration = -1
+        if current_iteration != target_training:
+            notes.append(
+                "iteration set to recovered training version "
+                + str(target_training)
+            )
+            recovered.iteration = int(target_training)
+        if training_model_skew_reentry:
+            notes.append(
+                "valid committed training version "
+                + str(target_training)
+                + " is one ahead of committed model version "
+                + str(target_model)
+                + "; re-entry can train FEREBUS"
+            )
+        if (
+            latest_training_only is not None
+            and latest_training_only > coherent
+            and not training_model_skew_reentry
+        ):
             unsafe_reasons.append(
                 "newer committed training version has no matching model: "
                 + str(latest_training_only)
             )
-        if latest_model_only is not None and latest_model_only > coherent:
+        if (
+            latest_model_only is not None
+            and latest_model_only > coherent
+            and not training_model_skew_reentry
+        ):
             unsafe_reasons.append(
                 "newer committed model version has no matching training set: "
                 + str(latest_model_only)
@@ -945,6 +1006,13 @@ def propose_recovery(
         notes.append(
             "re-entry HALTED because committed artefacts need operator review"
         )
+    elif training_model_skew_reentry:
+        recovered.phase = CampaignPhase.FEREBUS
+        decision = "FEREBUS: committed training is one version ahead of committed models"
+        notes.append(
+            "re-entry at FEREBUS to produce model version "
+            + str(recovered.training_set_version)
+        )
     elif unsafe_reasons:
         recovered.phase = CampaignPhase.HALTED
         decision = "HALTED: unsafe artefacts need operator review"
@@ -987,6 +1055,8 @@ def propose_recovery(
         valid_model_versions=valid_model_versions,
         last_phase_in_journal=last_phase,
         last_iteration_in_journal=last_iter,
+        last_phase_event_in_journal=last_phase_event,
+        last_phase_retryable=last_phase_retryable,
         notes=notes,
         existing_state_loaded=existing_loaded,
         unsafe_reasons=unsafe_reasons,

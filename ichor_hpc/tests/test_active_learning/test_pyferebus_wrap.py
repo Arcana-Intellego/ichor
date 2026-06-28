@@ -234,6 +234,49 @@ def test_submit_ferebus_keeps_sbatch_directives_before_shell_commands(tmp_path):
     assert first_shell_command > last_sbatch
 
 
+def test_submit_ferebus_replaces_pyferebus_static_job_name(tmp_path):
+    captured: List[_StubModel] = []
+    model_class = _make_model_class(
+        captured,
+        script_text=(
+            "#!/bin/bash --login\n"
+            "#SBATCH --job-name=ferebus-light\n"
+            "#SBATCH -J another-stale-name\n"
+            "ferebus ${line}\n"
+        ),
+    )
+    jd = tmp_path / "job.json"
+    jd.write_text("{}")
+
+    submit_ferebus(
+        jd,
+        tmp_path,
+        expected_job_name="abc123-FEREBUS-4",
+        model_class=model_class,
+        submit_runner=_StubRunner(),
+    )
+
+    script = (tmp_path / "runFerebus.sh").read_text(encoding="utf-8")
+    assert script.count("#SBATCH --job-name=abc123-FEREBUS-4") == 1
+    assert "ferebus-light" not in script
+    assert "another-stale-name" not in script
+
+
+def test_submit_ferebus_rejects_control_character_in_expected_job_name(tmp_path):
+    captured: List[_StubModel] = []
+    model_class = _make_model_class(captured)
+    jd = tmp_path / "job.json"
+    jd.write_text("{}")
+    with pytest.raises(FerebusSubmissionError, match="control character"):
+        submit_ferebus(
+            jd,
+            tmp_path,
+            expected_job_name="bad\nname",
+            model_class=model_class,
+            submit_runner=_StubRunner(),
+        )
+
+
 def test_submit_ferebus_rewrites_pyferebus_day_walltime_to_hours(tmp_path):
     captured: List[_StubModel] = []
     model_class = _make_model_class(

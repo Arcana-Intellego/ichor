@@ -167,6 +167,54 @@ def test_phase_walltime_changes_are_allowed_runtime_changes(tmp_path):
     assert not review.blocked_changes
 
 
+def test_retry_phase_requires_retryable_journal_event():
+    state = fresh_campaign_state()
+    success_report = ReconciliationReport(
+        proposed_state=state,
+        last_phase_in_journal=CampaignPhase.PHASE_B_POLUS.value,
+        last_iteration_in_journal=0,
+        last_phase_event_in_journal="phase_succeeded",
+        last_phase_retryable=False,
+    )
+    halted_report = ReconciliationReport(
+        proposed_state=state,
+        last_phase_in_journal=CampaignPhase.PHASE_B_POLUS.value,
+        last_iteration_in_journal=0,
+        last_phase_event_in_journal="halt",
+        last_phase_retryable=True,
+    )
+
+    assert cli_mod._retry_phase_from_cleaned_report(success_report) is None
+    assert cli_mod._retry_phase_from_cleaned_report(halted_report) is CampaignPhase.PHASE_B_POLUS
+
+
+def test_reconcile_apply_uses_safe_max_iterations_change(tmp_path, capsys):
+    campaign = _campaign(tmp_path)
+    _commit_training_version(campaign, 0)
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.HALTED
+    state.training_set_version = 0
+    state.models_version = -1
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    original = CampaignConfig(max_iterations=1)
+    write_config_lock(campaign, original)
+    changed = CampaignConfig(max_iterations=7)
+    _write_config(campaign, changed)
+
+    rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            allow_fresh_init=False,
+            apply=True,
+        )
+    )
+
+    assert rc == 0
+    capsys.readouterr()
+    recovered = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
+    assert recovered.max_iterations == 7
+
+
 def test_memory_estimate_guard_default_migration_is_allowed(tmp_path):
     campaign = _campaign(tmp_path)
     original = CampaignConfig()
@@ -716,6 +764,8 @@ def test_reconcile_apply_cleans_transient_halted_ariadne_reentry(
             committed_model_versions=[0],
             last_phase_in_journal=CampaignPhase.ARIADNE_ARRAY.value,
             last_iteration_in_journal=0,
+            last_phase_event_in_journal="halt",
+            last_phase_retryable=True,
             notes=["re-entry HALTED because committed artefacts need operator review"],
             unsafe_reasons=[
                 ".DATA/SCRIPTS contains sbatch scripts",

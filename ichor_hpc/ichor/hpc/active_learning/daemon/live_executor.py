@@ -882,6 +882,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             ferebus_platform = _configured_ferebus_platform()
             ferebus_manifest = _stg.read_ferebus_manifest(staging)
             expected_ferebus_tasks = int(ferebus_manifest.get("n_tasks", 0))
+            expected_job_name = live_job_name(
+                getattr(state, "campaign_uid", None),
+                phase_name,
+                int(getattr(state, "iteration", 0)),
+            )
             effective_walltime = (
                 int(self.walltime_hours)
                 if self.walltime_hours is not None
@@ -908,6 +913,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 move_dataset_files=True,
                 path_to_executable=path_to_executable,
                 expected_tasks=expected_ferebus_tasks,
+                expected_job_name=expected_job_name,
                 submit_runner=self.sbatch_runner,
             )
         except BackendSubmissionError:

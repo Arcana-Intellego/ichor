@@ -2247,6 +2247,8 @@ def _resolve_terminal_submission_intents_for_apply(
 
 
 def _retry_phase_from_cleaned_report(report) -> Optional[CampaignPhase]:
+    if not bool(getattr(report, "last_phase_retryable", False)):
+        return None
     try:
         phase = CampaignPhase(str(report.last_phase_in_journal))
     except Exception:
@@ -2276,6 +2278,21 @@ def _apply_retry_phase_after_cleaned_halt(report, original_report) -> bool:
         + " after cleaning transient run artefacts"
     )
     return True
+
+
+def _apply_runtime_config_to_recovered_state(report, config: Optional[CampaignConfig]) -> None:
+    if config is None:
+        return
+    try:
+        configured_max = int(config.max_iterations)
+    except Exception:
+        return
+    if int(report.proposed_state.max_iterations) != configured_max:
+        report.notes.append(
+            "max_iterations set from campaign.yaml runtime config: "
+            + str(configured_max)
+        )
+        report.proposed_state.max_iterations = configured_max
 
 
 def _reconcile_apply_contract_error(campaign: Path, state: Any) -> Optional[str]:
@@ -2355,7 +2372,6 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         campaign,
         allow_fresh_init_on_nonempty=bool(getattr(args, "allow_fresh_init", False)),
     )
-    target = write_proposed_state(campaign, report)
     config_path = campaign / "campaign.yaml"
     config = None
     config_review = None
@@ -2373,6 +2389,8 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 print("campaign config could not be loaded: " + str(exc), file=sys.stderr)
                 return 8
             print("campaign config could not be reviewed: " + str(exc), file=sys.stderr)
+    _apply_runtime_config_to_recovered_state(report, config)
+    target = write_proposed_state(campaign, report)
     print("Proposed state written to: " + str(target))
     print("")
     print("=== Diagnostic notes ===")
@@ -2385,6 +2403,8 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     print("Valid model versions:        " + repr(report.valid_model_versions))
     print("Last phase in journal:       " + repr(report.last_phase_in_journal))
     print("Last iteration in journal:   " + repr(report.last_iteration_in_journal))
+    if getattr(report, "last_phase_event_in_journal", None):
+        print("Last phase event in journal: " + repr(report.last_phase_event_in_journal))
     if report.decision:
         print("Recovery decision:           " + str(report.decision))
     if report.bootstrap_handoff:
@@ -2637,6 +2657,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             allow_fresh_init_on_nonempty=bool(getattr(args, "allow_fresh_init", False)),
         )
         _apply_retry_phase_after_cleaned_halt(report, original_report)
+        _apply_runtime_config_to_recovered_state(report, config)
         target = write_proposed_state(campaign, report)
         if config is not None:
             try:

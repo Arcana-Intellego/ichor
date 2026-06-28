@@ -295,6 +295,8 @@ def _patch_ferebus_submit_for_live_smoke(monkeypatch, campaign_dir, call_log):
         calls["n"] += 1
         assert kwargs["overwrite_workdir"] is False
         assert kwargs["move_dataset_files"] is True
+        assert str(kwargs["expected_job_name"]).endswith("-" + phase_name + "-0")
+        assert int(kwargs["expected_tasks"]) == 1
         return FerebusSubmission(
             job_id=str(19000 + calls["n"]),
             cluster=None,

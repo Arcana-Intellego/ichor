@@ -192,6 +192,121 @@ def test_active_submission_intent_requires_successful_adoption_check(tmp_path):
     assert intent["status"] == "PRE_SUBMIT"
 
 
+def test_active_submission_intent_terminal_job_is_adopted_for_postprocess(tmp_path):
+    from ichor.hpc.active_learning.daemon.submission_intent import (
+        load_intent,
+        mark_submitted,
+        write_pre_submit_intent,
+    )
+    from ichor.hpc.active_learning.submit.sacct_poll import JobObservation, JobStatus
+
+    d = Daemon(
+        campaign_dir=tmp_path,
+        config=CampaignConfig(),
+        executor=_ExplodingExecutor(),
+        job_finder=lambda state, phase: None,
+        job_liveness_checker=lambda job_id: type(
+            "Lookup",
+            (),
+            {"active": False, "inconclusive": False, "rows": []},
+        )(),
+        sacct_poller=lambda job_id: [
+            JobObservation(
+                job_id=str(job_id),
+                status=JobStatus.COMPLETED,
+                exit_code=(0, 0),
+                elapsed_seconds=5,
+            )
+        ],
+    )
+    d.state_path().parent.mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state()
+    state.phase = CampaignPhase.FEREBUS
+    write_pre_submit_intent(
+        tmp_path,
+        campaign_uid=state.campaign_uid,
+        phase_name="FEREBUS",
+        iteration=0,
+    )
+    mark_submitted(tmp_path, "FEREBUS", 0, "333", expected_tasks=1)
+
+    status = d._on_phase_entry(state, state.phase)
+
+    assert status == TickStatus.SUBMITTED
+    assert state.pending_jobs["FEREBUS"] == "333"
+    intent = load_intent(tmp_path, "FEREBUS", 0)
+    assert intent["status"] == "ADOPTED"
+    assert intent["job_id"] == "333"
+
+
+def test_active_submission_intent_with_no_accounting_rows_halts_before_resubmit(tmp_path):
+    from ichor.hpc.active_learning.daemon.submission_intent import (
+        load_intent,
+        mark_submitted,
+        write_pre_submit_intent,
+    )
+
+    d = Daemon(
+        campaign_dir=tmp_path,
+        config=CampaignConfig(),
+        executor=_SubmittingExecutor(),
+        job_finder=lambda state, phase: None,
+        job_liveness_checker=lambda job_id: type(
+            "Lookup",
+            (),
+            {"active": False, "inconclusive": False, "rows": []},
+        )(),
+        sacct_poller=lambda job_id: [],
+    )
+    d.state_path().parent.mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state()
+    state.phase = CampaignPhase.FEREBUS
+    write_pre_submit_intent(
+        tmp_path,
+        campaign_uid=state.campaign_uid,
+        phase_name="FEREBUS",
+        iteration=0,
+    )
+    mark_submitted(tmp_path, "FEREBUS", 0, "333", expected_tasks=1)
+
+    status = d._on_phase_entry(state, state.phase)
+
+    assert status == TickStatus.HALTED
+    intent = load_intent(tmp_path, "FEREBUS", 0)
+    assert intent["status"] == "SUBMITTED"
+    assert "FEREBUS" not in state.pending_jobs
+
+
+def test_submission_intent_reader_rejects_phase_iteration_mismatch(tmp_path):
+    from ichor.hpc.active_learning.daemon.submission_intent import (
+        intent_path,
+        load_intent,
+        write_pre_submit_intent,
+    )
+    import json
+
+    state = fresh_campaign_state()
+    write_pre_submit_intent(
+        tmp_path,
+        campaign_uid=state.campaign_uid,
+        phase_name="FEREBUS",
+        iteration=0,
+    )
+    path = intent_path(tmp_path, "FEREBUS", 0)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["phase"] = "GAUSSIAN"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="phase mismatch"):
+        load_intent(tmp_path, "FEREBUS", 0)
+
+    payload["phase"] = "FEREBUS"
+    payload["iteration"] = 1
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="iteration mismatch"):
+        load_intent(tmp_path, "FEREBUS", 0)
+
+
 def test_submission_intent_records_job_id_even_if_state_persist_fails(monkeypatch, tmp_path):
     d = Daemon(
         campaign_dir=tmp_path, config=CampaignConfig(),

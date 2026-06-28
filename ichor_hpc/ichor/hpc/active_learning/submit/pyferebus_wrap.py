@@ -258,8 +258,11 @@ def _harden_generated_script(
     mem_per_cpu: Optional[str],
     cpus_per_task: Optional[int],
     ntasks: Optional[int],
+    expected_job_name: Optional[str] = None,
 ) -> None:
     text = script.read_text(encoding="utf-8")
+    if expected_job_name is not None:
+        _reject_control_chars("expected FEREBUS Slurm job name", str(expected_job_name))
     hardening_lines = {
         "set -eo pipefail",
         "set -euo pipefail",
@@ -287,6 +290,10 @@ def _harden_generated_script(
             r"^#SBATCH\s+(?:-n\b|--ntasks(?:=|\b))", stripped
         ):
             return True
+        if expected_job_name is not None and re.match(
+            r"^#SBATCH\s+(?:-J\b|--job-name(?:=|\b))", stripped
+        ):
+            return True
         return False
 
     lines = [
@@ -302,7 +309,10 @@ def _harden_generated_script(
             sbatch_insert_at += 1
             continue
         break
-    directives = ["#SBATCH --time=" + _format_slurm_walltime_hours(walltime_hours)]
+    directives = []
+    if expected_job_name is not None:
+        directives.append("#SBATCH --job-name=" + str(expected_job_name))
+    directives.append("#SBATCH --time=" + _format_slurm_walltime_hours(walltime_hours))
     if partition is not None:
         directives.append("#SBATCH --partition=" + str(partition))
     if mem_per_cpu is not None:
@@ -317,6 +327,19 @@ def _harden_generated_script(
         "export LC_NUMERIC=C",
     ]
     script.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    if expected_job_name is not None:
+        patched = script.read_text(encoding="utf-8")
+        matches = re.findall(
+            r"(?m)^#SBATCH\s+(?:-J\s+|--job-name(?:=|\s+))(.+?)\s*$",
+            patched,
+        )
+        if matches != [str(expected_job_name)]:
+            raise FerebusSubmissionError(
+                "FEREBUS job-name patch validation failed for "
+                + str(script)
+                + ": "
+                + repr(matches)
+            )
 
 
 def _validate_configured_executable(path_to_executable: Union[str, Path]) -> str:
@@ -436,6 +459,7 @@ def submit_ferebus(
     move_dataset_files: bool = True,
     path_to_executable: Optional[Union[str, Path]] = None,
     expected_tasks: Optional[int] = None,
+    expected_job_name: Optional[str] = None,
     extra: Optional[Mapping[str, Any]] = None,
     model_class: Optional[Any] = None,
     submit_runner: Optional[Any] = None,
@@ -520,6 +544,7 @@ def submit_ferebus(
         mem_per_cpu=mem_per_cpu,
         cpus_per_task=cpus_per_task,
         ntasks=ntasks,
+        expected_job_name=expected_job_name,
     )
     if path_to_executable:
         _patch_generated_executable(script, path_to_executable)

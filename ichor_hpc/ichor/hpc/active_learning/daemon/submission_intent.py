@@ -55,6 +55,39 @@ def load_intent(
         raise ValueError("submission intent must be a JSON object: " + str(path))
     if int(data.get("schema_version", -1)) != INTENT_SCHEMA_VERSION:
         raise ValueError("unsupported submission intent schema: " + str(path))
+    recorded_phase = data.get("phase")
+    if str(recorded_phase) != str(phase_name):
+        raise ValueError(
+            "submission intent phase mismatch for "
+            + str(path)
+            + ": expected "
+            + str(phase_name)
+            + " got "
+            + repr(recorded_phase)
+        )
+    try:
+        recorded_iteration = int(data.get("iteration"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "submission intent iteration is malformed for " + str(path)
+        ) from exc
+    if recorded_iteration != int(iteration):
+        raise ValueError(
+            "submission intent iteration mismatch for "
+            + str(path)
+            + ": expected "
+            + str(int(iteration))
+            + " got "
+            + str(recorded_iteration)
+        )
+    status = data.get("status")
+    if status is not None and not isinstance(status, str):
+        raise ValueError("submission intent status must be a string: " + str(path))
+    expected = data.get("expected_job_name")
+    if expected is not None and not isinstance(expected, str):
+        raise ValueError(
+            "submission intent expected_job_name must be a string: " + str(path)
+        )
     return data
 
 

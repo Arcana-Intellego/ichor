@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import ichor.hpc.active_learning.daemon.reconcile as reconcile_mod
 from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
 from ichor.hpc.active_learning.daemon.journal import append_event
 from ichor.hpc.active_learning.daemon.reconcile import (
@@ -333,6 +334,54 @@ def test_propose_recovery_reports_decision_and_trusted_versions(tmp_path):
     assert "trajectory pool" in report.blocking_artifacts
 
 
+def test_propose_recovery_sets_iteration_to_latest_coherent_version(tmp_path, monkeypatch):
+    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
+    campaign, _, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    tv = TrainingSetVersioning(training)
+    mv = TrainingSetVersioning(models)
+    for version in range(3):
+        s = tv.stage(None, version)
+        (s / "marker.txt").write_text("training " + str(version), encoding="utf-8")
+        tv.commit(version)
+        s = mv.stage(None, version)
+        (s / "marker.txt").write_text("model " + str(version), encoding="utf-8")
+        mv.commit(version)
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.STOP_CHECK
+    assert report.proposed_state.training_set_version == 2
+    assert report.proposed_state.models_version == 2
+    assert report.proposed_state.iteration == 2
+
+
+def test_propose_recovery_training_one_ahead_reenters_ferebus(tmp_path, monkeypatch):
+    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
+    campaign, _, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    tv = TrainingSetVersioning(training)
+    mv = TrainingSetVersioning(models)
+    for version in range(3):
+        s = tv.stage(None, version)
+        (s / "marker.txt").write_text("training " + str(version), encoding="utf-8")
+        tv.commit(version)
+    for version in range(2):
+        s = mv.stage(None, version)
+        (s / "marker.txt").write_text("model " + str(version), encoding="utf-8")
+        mv.commit(version)
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.FEREBUS
+    assert report.proposed_state.training_set_version == 2
+    assert report.proposed_state.models_version == 1
+    assert report.proposed_state.iteration == 2
+    assert not any("newer committed training version" in r for r in report.unsafe_reasons)
+
+
 def test_propose_recovery_blocks_trajectory_pool_sha_drift(tmp_path):
     campaign, _, training, models = _campaign_dirs(tmp_path)
     _write_pool(campaign)
@@ -413,6 +462,22 @@ def test_propose_recovery_reads_last_journal_transition(tmp_path):
     report = propose_recovery(campaign)
     assert report.last_phase_in_journal == "AIMALL"
     assert report.last_iteration_in_journal == 3
+    assert report.last_phase_event_in_journal == "phase_transition"
+    assert report.last_phase_retryable is False
+
+
+def test_propose_recovery_marks_halt_journal_phase_retryable(tmp_path):
+    campaign, data, _, _ = _campaign_dirs(tmp_path)
+    journal = data / "journal.ndjson"
+    append_event(journal, "phase_succeeded", phase="FEREBUS", iteration=2)
+    append_event(journal, "halt", from_phase="PHASE_B_POLUS", iteration=3)
+
+    report = propose_recovery(campaign)
+
+    assert report.last_phase_in_journal == "PHASE_B_POLUS"
+    assert report.last_iteration_in_journal == 3
+    assert report.last_phase_event_in_journal == "halt"
+    assert report.last_phase_retryable is True
 
 
 def test_propose_recovery_corrupt_state_does_not_crash(tmp_path):

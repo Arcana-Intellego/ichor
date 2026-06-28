@@ -709,6 +709,14 @@ class Daemon:
                         "active_submission_liveness_blocks_resubmit: "
                         + str(active_job_id)
                     )
+                accounted = self._adopt_accounted_intent_job(
+                    state,
+                    phase,
+                    active_intent,
+                    str(active_job_id),
+                )
+                if accounted is not None:
+                    return accounted
             try:
                 _submission_intent.mark_superseded(
                     self.campaign_dir,
@@ -815,6 +823,93 @@ class Daemon:
             "executor returned no submitted_job_id and is_complete=False for "
             + phase.value
         )
+
+    def _adopt_accounted_intent_job(
+        self,
+        state: CampaignState,
+        phase: CampaignPhase,
+        active_intent: Dict[str, Any],
+        job_id: str,
+    ) -> Optional[str]:
+        phase_name = phase.value
+        try:
+            observations = self.sacct_poller(str(job_id))
+        except RuntimeError as exc:
+            return self._halt_scheduler_uncertain(
+                state,
+                phase,
+                "active_submission_accounting_lookup_failed: "
+                + str(job_id)
+                + ": "
+                + str(exc)[:160],
+            )
+        expected_tasks = self._expected_tasks_for_adoption(
+            active_intent,
+            state,
+            phase,
+        )
+        if expected_tasks is None and self._strict_artifact_checks_enabled():
+            return self._halt_scheduler_uncertain(
+                state,
+                phase,
+                "active_submission_expected_tasks_unavailable: "
+                + phase_name
+                + "@"
+                + str(int(state.iteration)),
+            )
+        summary = aggregate_states(
+            str(job_id),
+            observations,
+            expected_task_count=expected_tasks,
+        )
+        if not observations or int(getattr(summary, "n_tasks", 0)) <= 0:
+            return self._halt_scheduler_uncertain(
+                state,
+                phase,
+                "active_submission_accounting_inconclusive: "
+                + str(job_id)
+                + " has no conclusive sacct rows; refusing to supersede active intent",
+            )
+        if int(getattr(summary, "n_unknown", 0)) > 0:
+            return self._halt_scheduler_uncertain(
+                state,
+                phase,
+                "active_submission_accounting_unknown: "
+                + str(job_id)
+                + " has UNKNOWN sacct rows; refusing to supersede active intent",
+            )
+        state.pending_jobs[phase_name] = str(job_id)
+        try:
+            _submission_intent.mark_adopted(
+                self.campaign_dir,
+                phase_name,
+                int(state.iteration),
+                str(job_id),
+                expected_tasks=expected_tasks,
+            )
+        except Exception as exc:
+            self._journal(
+                "submission_intent_update_failed",
+                phase=phase_name,
+                iteration=int(state.iteration),
+                error=str(exc)[:200],
+            )
+        self._persist(state)
+        self._journal(
+            "adopted_accounted_job",
+            phase=phase_name,
+            job_id=str(job_id),
+            iteration=state.iteration,
+            expected_tasks=expected_tasks,
+            n_observed=int(getattr(summary, "n_observed", 0)),
+            n_expected=getattr(summary, "n_expected", None),
+            n_missing=int(getattr(summary, "n_missing", 0)),
+            n_pending_or_running=int(getattr(summary, "n_pending_or_running", 0)),
+            n_completed=int(getattr(summary, "n_completed", 0)),
+            n_failed=int(getattr(summary, "n_failed", 0)),
+            terminal=bool(getattr(summary, "is_terminal", False)),
+        )
+        return TickStatus.SUBMITTED
 
     def _on_pending(self, state: CampaignState, phase: CampaignPhase, job_id: str) -> str:
         """Called while a SLURM job for `phase` is in flight."""
