@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 import ichor.hpc.active_learning.daemon.reconcile as reconcile_mod
+import ichor.hpc.active_learning.daemon.recovery_contracts as recovery_contracts_mod
 from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
 from ichor.hpc.active_learning.daemon.journal import append_event
 from ichor.hpc.active_learning.daemon.reconcile import (
@@ -368,7 +369,7 @@ def test_propose_recovery_reports_decision_and_trusted_versions(tmp_path):
     assert "trajectory pool" in report.blocking_artifacts
 
 
-def test_propose_recovery_sets_iteration_to_latest_coherent_version(tmp_path, monkeypatch):
+def test_propose_recovery_sets_iteration_from_active_version_mapping(tmp_path, monkeypatch):
     monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
     monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
     campaign, _, training, models = _campaign_dirs(tmp_path)
@@ -388,7 +389,7 @@ def test_propose_recovery_sets_iteration_to_latest_coherent_version(tmp_path, mo
     assert report.proposed_state.phase is CampaignPhase.STOP_CHECK
     assert report.proposed_state.training_set_version == 2
     assert report.proposed_state.models_version == 2
-    assert report.proposed_state.iteration == 2
+    assert report.proposed_state.iteration == 1
 
 
 def test_propose_recovery_training_one_ahead_reenters_ferebus(tmp_path, monkeypatch):
@@ -412,8 +413,74 @@ def test_propose_recovery_training_one_ahead_reenters_ferebus(tmp_path, monkeypa
     assert report.proposed_state.phase is CampaignPhase.FEREBUS
     assert report.proposed_state.training_set_version == 2
     assert report.proposed_state.models_version == 1
-    assert report.proposed_state.iteration == 2
+    assert report.proposed_state.iteration == 1
     assert not any("newer committed training version" in r for r in report.unsafe_reasons)
+
+
+def test_propose_recovery_preserves_existing_seed_select_cursor(tmp_path, monkeypatch):
+    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    monkeypatch.setattr(recovery_contracts_mod, "verify_committed_model_version", lambda *a, **k: None)
+    monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    tv = TrainingSetVersioning(training)
+    mv = TrainingSetVersioning(models)
+    s = tv.stage(None, 0)
+    (s / "marker.txt").write_text("training", encoding="utf-8")
+    tv.commit(0)
+    s = mv.stage(None, 0)
+    (s / "marker.txt").write_text("model", encoding="utf-8")
+    mv.commit(0)
+    state = fresh_campaign_state(max_iterations=3)
+    state.phase = CampaignPhase.SEED_SELECT
+    state.iteration = 0
+    state.training_set_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.SEED_SELECT
+    assert report.proposed_state.iteration == 0
+    assert "existing state phase has a valid input contract" in report.decision
+
+
+def test_propose_recovery_protects_active_gaussian_handoff(tmp_path, monkeypatch):
+    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    tv = TrainingSetVersioning(training)
+    mv = TrainingSetVersioning(models)
+    s = tv.stage(None, 0)
+    (s / "marker.txt").write_text("training", encoding="utf-8")
+    tv.commit(0)
+    s = mv.stage(None, 0)
+    (s / "marker.txt").write_text("model", encoding="utf-8")
+    mv.commit(0)
+    state = fresh_campaign_state(max_iterations=3)
+    state.phase = CampaignPhase.HALTED
+    state.iteration = 0
+    state.training_set_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    staging = campaign / ".DATA" / "STAGING" / "iter_0"
+    pointdir = staging / "POINT_0000.pointdir"
+    pointdir.mkdir(parents=True, exist_ok=True)
+    stg.write_points_file(staging, [pointdir])
+    stg.write_quantum_acceptance_manifest(
+        staging,
+        phase_name=CampaignPhase.GAUSSIAN.value,
+        iteration=0,
+        accepted=[pointdir],
+        rejected=[],
+    )
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.AIMALL
+    assert ".DATA/STAGING is non-empty" not in report.unsafe_reasons
+    assert any("protected active staging handoff" in item for item in report.trusted_artifacts)
 
 
 def test_propose_recovery_blocks_trajectory_pool_sha_drift(tmp_path):

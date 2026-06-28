@@ -70,6 +70,10 @@ from .daemon.live_executor import (
 )
 from .daemon.phase_executor import MockPhaseExecutor
 from .daemon.preflight import check_backends, missing_backend_message
+from .daemon.recovery_contracts import (
+    protected_staging_handoff,
+    validate_phase_recovery_contract,
+)
 from .daemon.reconcile import (
     data_staging_inventory,
     propose_recovery,
@@ -220,6 +224,10 @@ def expand_boolean_short_flag_clusters(argv: Optional[Sequence[str]]) -> List[st
 
 
 RETRYABLE_CLEANED_REENTRY_PHASES = {
+    CampaignPhase.PHASE_A_POLUS,
+    CampaignPhase.INITIAL_GAUSSIAN,
+    CampaignPhase.INITIAL_AIMALL,
+    CampaignPhase.INITIAL_FEREBUS,
     CampaignPhase.SEED_SELECT,
     CampaignPhase.ARIADNE_ARRAY,
     CampaignPhase.PHASE_B_POLUS,
@@ -489,6 +497,20 @@ def _operator_staging_archive_blockers(
         blockers.append(".DATA/STAGING is a symlink")
     if inventory.get("has_symlink"):
         blockers.append(".DATA/STAGING contains symlink entries")
+    try:
+        protected = protected_staging_handoff(
+            campaign,
+            iteration=int(getattr(report.proposed_state, "iteration", 0)),
+        )
+    except Exception:
+        protected = None
+    if protected is not None:
+        blockers.append(
+            ".DATA/STAGING contains a valid protected handoff for "
+            + protected.phase.value
+            + ": "
+            + str(protected.trusted_artifact)
+        )
     if inventory.get("error"):
         blockers.append(".DATA/STAGING inventory error: " + str(inventory.get("error")))
     return blockers
@@ -2304,6 +2326,19 @@ def _apply_runtime_config_to_recovered_state(report, config: Optional[CampaignCo
 def _reconcile_apply_contract_error(campaign: Path, state: Any) -> Optional[str]:
     from .daemon.artifact_contracts import state_artifact_contract_status
 
+    try:
+        validate_phase_recovery_contract(campaign, state)
+    except Exception as exc:
+        return (
+            "phase="
+            + str(getattr(state, "phase", "UNKNOWN"))
+            + " iteration="
+            + str(getattr(state, "iteration", "UNKNOWN"))
+            + ": "
+            + type(exc).__name__
+            + ": "
+            + str(exc)
+        )
     status = state_artifact_contract_status(campaign, state)
     if bool(status.get("ok")):
         return None
@@ -2864,6 +2899,12 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             recomputed_after_transient_cleanup=(
                 original_report.proposed_state.phase is CampaignPhase.HALTED
             ),
+            recovery_source_phase=(
+                original_report.last_phase_in_journal
+                or original_report.proposed_state.phase.value
+            ),
+            recovery_selected_phase=report.proposed_state.phase.value,
+            recovery_reason=str(report.decision or ""),
         )
     except Exception:
         pass

@@ -26,6 +26,11 @@ from .artifact_contracts import (
     verify_state_referenced_artifacts,
 )
 from .journal import iter_events
+from .recovery_contracts import (
+    protected_staging_handoff,
+    select_recovery_phase,
+    validate_phase_recovery_contract,
+)
 from . import submission_intent as _submission_intent
 from .state import (
     CampaignPhase,
@@ -519,6 +524,7 @@ def _validate_recovered_state_contract(
             iteration=int(getattr(state, "iteration", 0)),
         )
         return
+    validate_phase_recovery_contract(campaign_dir, state)
     verify_state_referenced_artifacts(campaign_dir, state)
 
 
@@ -664,6 +670,35 @@ def propose_recovery(
         if p.name not in (".", "..")
     ]
     unexpected_staging_children = list(staging_children)
+    protected_active_handoff = None
+    try:
+        protected_iteration = int(
+            getattr(existing, "iteration", 0)
+            if existing is not None
+            else (last_iter if last_iter is not None else 0)
+        )
+    except Exception:
+        protected_iteration = 0
+    try:
+        protected_active_handoff = protected_staging_handoff(
+            campaign,
+            iteration=protected_iteration,
+        )
+    except Exception:
+        protected_active_handoff = None
+    if protected_active_handoff is not None and protected_active_handoff.trusted_artifact:
+        protected_path = (campaign / protected_active_handoff.trusted_artifact).resolve(strict=False)
+        unexpected_staging_children = [
+            p
+            for p in unexpected_staging_children
+            if p.resolve(strict=False) != protected_path
+        ]
+        trusted_artifacts.append(
+            "protected active staging handoff for "
+            + protected_active_handoff.phase.value
+            + " at "
+            + str(protected_active_handoff.trusted_artifact)
+        )
     valid_live_bootstrap_handoff = (
         isinstance(bootstrap_handoff, dict)
         and not bool(bootstrap_handoff.get("archived"))
@@ -902,16 +937,18 @@ def propose_recovery(
             )
         recovered.training_set_version = target_training
         recovered.models_version = target_model
-        try:
-            current_iteration = int(recovered.iteration)
-        except Exception:
-            current_iteration = -1
-        if current_iteration != target_training:
-            notes.append(
-                "iteration set to recovered training version "
-                + str(target_training)
-            )
-            recovered.iteration = int(target_training)
+        if not existing_loaded:
+            target_iteration = max(0, int(target_training) - 1)
+            try:
+                current_iteration = int(recovered.iteration)
+            except Exception:
+                current_iteration = -1
+            if current_iteration != target_iteration:
+                notes.append(
+                    "iteration set from committed active-version mapping: "
+                    + str(target_iteration)
+                )
+                recovered.iteration = int(target_iteration)
         if training_model_skew_reentry:
             notes.append(
                 "valid committed training version "
@@ -955,6 +992,18 @@ def propose_recovery(
             + ")"
         )
 
+    phase_recovery = None
+    if not active_intents and not unsafe_reasons:
+        phase_recovery = select_recovery_phase(
+            campaign,
+            recovered,
+            valid_training_versions=valid_training_versions,
+            valid_model_versions=valid_model_versions,
+            existing_loaded=existing_loaded,
+            last_phase=last_phase,
+            last_iteration=last_iter,
+        )
+
     # choose a safe re-entry phase. If we have NOTHING committed, start at
     #  INIT; otherwise rewind to STOP_CHECK so the next tick decides whether
     # to loop or terminate.
@@ -983,6 +1032,16 @@ def propose_recovery(
                 )
             except Exception:
                 recovered.phase = CampaignPhase.HALTED
+    elif phase_recovery is not None:
+        recovered.phase = phase_recovery.phase
+        recovered.iteration = int(phase_recovery.iteration)
+        decision = phase_recovery.reason
+        notes.append("phase-aware recovery selected " + recovered.phase.value)
+        if phase_recovery.trusted_artifact:
+            trusted_artifacts.append(str(phase_recovery.trusted_artifact))
+        if not valid_training_versions and not valid_model_versions:
+            recovered.training_set_version = -1
+            recovered.models_version = -1
     elif not tv and not mv and initial_handoff_indicated and initial_handoff_valid and not unsafe_reasons:
         handoff_phase = (
             str(bootstrap_handoff.get("phase"))

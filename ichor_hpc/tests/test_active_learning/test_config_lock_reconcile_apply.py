@@ -1031,9 +1031,35 @@ def test_reconcile_apply_archive_staging_explicitly_handles_non_ferebus_reentry(
     assert list(data_staging.iterdir()) == []
     assert "Archived stale .DATA/STAGING" in out
     recovered = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
-    assert recovered.phase is CampaignPhase.STOP_CHECK
+    assert recovered.phase is CampaignPhase.SEED_SELECT
     events = list(iter_events(campaign / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson"))
     assert any(e.get("event") == "staging_archived" for e in events)
+
+
+def test_operator_archive_staging_blocks_protected_active_handoff(tmp_path):
+    campaign = _campaign(tmp_path)
+    state = fresh_campaign_state(max_iterations=3)
+    state.phase = CampaignPhase.HALTED
+    state.iteration = 0
+    state.training_set_version = 0
+    state.models_version = 0
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    staging = campaign / ".DATA" / "STAGING" / "iter_0"
+    pointdir = staging / "POINT_0000.pointdir"
+    pointdir.mkdir(parents=True, exist_ok=True)
+    stg.write_points_file(staging, [pointdir])
+    stg.write_quantum_acceptance_manifest(
+        staging,
+        phase_name=CampaignPhase.GAUSSIAN.value,
+        iteration=0,
+        accepted=[pointdir],
+        rejected=[],
+    )
+    report = ReconciliationReport(proposed_state=state)
+
+    blockers = cli_mod._operator_staging_archive_blockers(campaign, report, {})
+
+    assert any("protected handoff for AIMALL" in item for item in blockers)
 
 
 def test_reconcile_apply_restores_archived_initial_gaussian_handoff(
