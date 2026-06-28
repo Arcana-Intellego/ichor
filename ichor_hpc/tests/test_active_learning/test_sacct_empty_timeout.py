@@ -53,7 +53,7 @@ def _setup_daemon_with_pending_job(
 
 def test_default_poll_sacct_empty_max_ticks_is_ten():
     assert CampaignConfig().poll_sacct_empty_max_ticks == 10
-    assert CampaignConfig().runtime.poll_sacct_missing_max_ticks == 3
+    assert CampaignConfig().runtime.poll_sacct_missing_max_ticks == 12
 
 
 def test_empty_sacct_increments_streak(tmp_path):

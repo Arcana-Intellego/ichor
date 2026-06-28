@@ -646,7 +646,7 @@ class RuntimeConfigBlock:
     postprocess_settle_seconds: int = 10
     transient_phase_retry_max: int = 1
     poll_sacct_unknown_max_ticks: int = 3
-    poll_sacct_missing_max_ticks: int = 3
+    poll_sacct_missing_max_ticks: int = 12
     poll_squeue_inconclusive_max_ticks: int = 10
     halt_on_tick_exception: bool = True
 

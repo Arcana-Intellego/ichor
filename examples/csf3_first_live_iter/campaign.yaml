@@ -367,7 +367,7 @@ runtime:
   postprocess_settle_seconds: 10
   transient_phase_retry_max: 1
   poll_sacct_unknown_max_ticks: 3
-  poll_sacct_missing_max_ticks: 3
+  poll_sacct_missing_max_ticks: 12
   halt_on_tick_exception: true
 
 stop:

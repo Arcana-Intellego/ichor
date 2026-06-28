@@ -599,6 +599,27 @@ def test_ferebus_parser_rejects_missing_staging(tmp_path):
 
 
 def _write_seeds_picked(campaign_dir, iteration, n_seeds):
+    from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
+
+    campaign_dir.mkdir(parents=True, exist_ok=True)
+    pool_source = campaign_dir / "_test_pool.xyz"
+    frames = []
+    for frame_id in range(int(n_seeds)):
+        offset = 0.01 * float(frame_id)
+        frames.extend([
+            "3",
+            "frame " + str(frame_id),
+            "O " + str(offset) + " 0.0 0.0",
+            "H " + str(0.96 + offset) + " 0.0 0.0",
+            "H " + str(-0.24 + offset) + " 0.93 0.0",
+        ])
+    pool_source.write_text("\n".join(frames) + "\n", encoding="utf-8")
+    pool = TrajectoryPool.import_from(
+        pool_source,
+        campaign_dir,
+        overwrite=True,
+        outlier_filter_enabled=False,
+    )
     iter_dir = (
         campaign_dir / "7_ACTIVE_LEARNING"
         / ("iteration-" + str(iteration).zfill(4))
@@ -625,7 +646,7 @@ def _write_seeds_picked(campaign_dir, iteration, n_seeds):
                 }
                 for i in frame_ids
             ],
-            "trajectory_sha256": "0" * 64,
+            "trajectory_sha256": str(pool.sha256),
         }),
         encoding="utf-8",
     )
@@ -675,6 +696,43 @@ def test_ariadne_parser_happy_path(tmp_path):
     succeeded = [e for e in events if e.get("event") == "phase_succeeded_live"]
     assert succeeded
     assert succeeded[-1]["phase"] == "ARIADNE_ARRAY"
+
+
+def test_ariadne_parser_reconstructs_missing_seed_provenance(tmp_path):
+    from ichor.hpc.active_learning.versioning.provenance import (
+        PROVENANCE_FILENAME,
+        read_provenance,
+    )
+
+    ex = _make_executor(tmp_path)
+    pool = _seed_ariadne_pool(tmp_path / "campaign", iteration=4, n_seeds=1)
+    seed_dir = pool / "seed_0000"
+    prov_path = seed_dir / PROVENANCE_FILENAME
+    assert not prov_path.exists()
+
+    state = SimpleNamespace(iteration=4, campaign_uid="m16-test")
+    result = ex._parse_ariadne_array_postprocess(
+        state, CampaignPhase("ARIADNE_ARRAY"), observations=[],
+    )
+
+    assert result.failure_reason is None
+    assert prov_path.is_file()
+    prov = read_provenance(seed_dir)
+    assert prov["seed"]["frame_id"] == 0
+    assert prov["ariadne"] is not None
+    assert prov["anti_overlap"] is not None
+
+    iter_dir = tmp_path / "campaign" / "7_ACTIVE_LEARNING" / "iteration-0004"
+    manifest = json.loads((iter_dir / "ARIADNE_RESULTS.json").read_text(encoding="utf-8"))
+    assert manifest["n_accepted"] == 1
+    assert manifest["n_rejected"] == 0
+    assert manifest["accepted"][0]["provenance_json"] == str(prov_path.resolve())
+    audit = json.loads((iter_dir / "ARIADNE_LANDING_AUDIT.json").read_text(encoding="utf-8"))
+    assert len(audit["seeds"]) == 1
+    assert audit["seeds"][0]["provenance_reconstructed"] is True
+    assert audit["summary"]["handoff_accepted"] == 1
+    events = _read_journal_events(tmp_path / "campaign")
+    assert any(e.get("event") == "ariadne_provenance_reconstructed" for e in events)
 
 
 def test_ariadne_parser_accepts_safe_max_iteration_result(tmp_path):
@@ -817,6 +875,11 @@ class _FakeSbatch:
 
 
 def test_ariadne_submit_cleans_stale_results_before_sbatch(tmp_path):
+    from ichor.hpc.active_learning.versioning.provenance import (
+        PROVENANCE_FILENAME,
+        read_provenance,
+    )
+
     cfg = CampaignConfig()
     runner = _FakeSbatch()
     ex = LiveBackendsPhaseExecutor(
@@ -837,10 +900,48 @@ def test_ariadne_submit_cleans_stale_results_before_sbatch(tmp_path):
     assert result.submitted_job_id == "12345"
     assert runner.calls
     assert not stale_result.exists()
+    prov_path = pool / "seed_0000" / PROVENANCE_FILENAME
+    assert prov_path.is_file()
+    prov = read_provenance(pool / "seed_0000")
+    assert prov["seed"]["frame_id"] == 0
     events = _read_journal_events(tmp_path / "campaign")
     cleaned = [e for e in events if e.get("event") == "ariadne_stale_outputs_cleaned"]
     assert cleaned
     assert cleaned[-1]["removed"] >= 1
+
+
+def test_ariadne_submit_rejects_invalid_existing_seed_provenance(tmp_path):
+    from ichor.hpc.active_learning.versioning.provenance import write_seed_provenance
+
+    cfg = CampaignConfig()
+    runner = _FakeSbatch()
+    ex = LiveBackendsPhaseExecutor(
+        campaign_dir=tmp_path / "campaign",
+        config=cfg,
+        backend_check=False,
+        sbatch_runner=runner,
+    )
+    pool = _seed_ariadne_pool(tmp_path / "campaign", iteration=4, n_seeds=1)
+    write_seed_provenance(
+        pool / "seed_0000",
+        campaign_uid="wrong-campaign",
+        iteration=4,
+        trajectory_sha256="0" * 64,
+        seed_frame_id=0,
+        seed_selection_origin="bulk",
+        seed_variance_at_selection=0.0,
+        subspace_neighbour_frame_ids=[],
+        subspace_dimension=0,
+        subspace_eigenvalues=[],
+        mode_weighting_policy="variance",
+    )
+
+    with pytest.raises(BackendSubmissionError, match="ARIADNE seed provenance invalid"):
+        ex.submit_or_run(
+            SimpleNamespace(iteration=4, campaign_uid="m16-test"),
+            CampaignPhase("ARIADNE_ARRAY"),
+        )
+    assert not runner.calls
 
 
 

@@ -44,6 +44,8 @@ from ..versioning.provenance import (
     enrich_with_ariadne,
     enrich_with_error_calibration_input,
     enrich_with_phase_b,
+    validate_provenance,
+    write_seed_provenance,
 )
 from .dry_run_executor import (
     DryRunPhaseExecutor,
@@ -452,10 +454,17 @@ def _ariadne_landing_audit_summary(seed_records: List[Dict[str, Any]]) -> Dict[s
         "salvaged": 0,
         "backtracked": 0,
         "rejected": 0,
+        "handoff_accepted": 0,
+        "handoff_rejected": 0,
         "rejection_reasons": {},
+        "handoff_rejection_reasons": {},
         "policies": {},
     }
-    for rec in seed_records:
+    unique_records: Dict[str, Dict[str, Any]] = {}
+    for pos, rec in enumerate(seed_records):
+        key = str(rec.get("seed_index", "__pos_" + str(pos)))
+        unique_records[key] = rec
+    for rec in unique_records.values():
         safety = rec.get("landing_safety")
         if not isinstance(safety, dict):
             summary["rejected"] += 1
@@ -479,6 +488,19 @@ def _ariadne_landing_audit_summary(seed_records: List[Dict[str, Any]]) -> Dict[s
             bucket = summary["rejection_reasons"]
             for reason in reasons:
                 bucket[reason] = int(bucket.get(reason, 0)) + 1
+        handoff_accepted = rec.get("handoff_accepted")
+        if handoff_accepted is True:
+            summary["handoff_accepted"] += 1
+        elif handoff_accepted is False:
+            summary["handoff_rejected"] += 1
+            reason = str(
+                rec.get(
+                    "handoff_rejection_reason",
+                    rec.get("reason", "handoff_rejected"),
+                )
+            )
+            bucket = summary["handoff_rejection_reasons"]
+            bucket[reason] = int(bucket.get(reason, 0)) + 1
     return summary
 
 
@@ -601,6 +623,160 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             raise BackendSubmissionError("seeds_picked.json unreadable: " + str(exc))
         return int(data.get("n_picked", 0))
 
+    def _seed_dir_for_record(self, iteration: int, seed_record: Dict[str, Any]) -> Path:
+        seed_index = int(seed_record["seed_index"])
+        return (
+            Path(self.campaign_dir)
+            / "7_ACTIVE_LEARNING"
+            / ("iteration-" + str(int(iteration)).zfill(4))
+            / "pool"
+            / ("seed_" + str(seed_index).zfill(4))
+        )
+
+    @staticmethod
+    def _seed_record_frame_id(seed_record: Dict[str, Any]) -> Optional[int]:
+        raw = seed_record.get("frame_id")
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError) as exc:
+            raise BackendSubmissionError(
+                "ARIADNE seed record frame_id is not an integer: " + repr(raw)
+            ) from exc
+
+    @staticmethod
+    def _seed_record_variance(seed_record: Dict[str, Any]) -> Optional[float]:
+        raw = seed_record.get("variance_at_selection")
+        if raw is None:
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise BackendSubmissionError(
+                "ARIADNE seed record variance_at_selection is not numeric: "
+                + repr(raw)
+            ) from exc
+        return value if math.isfinite(value) else None
+
+    @staticmethod
+    def _seed_record_subspace_payload(seed_record: Dict[str, Any]) -> tuple:
+        neighbours = (
+            seed_record.get("subspace_neighbour_frame_ids")
+            if isinstance(seed_record.get("subspace_neighbour_frame_ids"), list)
+            else seed_record.get("neighbour_frame_ids")
+        )
+        if not isinstance(neighbours, list):
+            neighbours = []
+        eigenvalues = seed_record.get("subspace_eigenvalues")
+        if not isinstance(eigenvalues, list):
+            eigenvalues = []
+        raw_dimension = seed_record.get("subspace_dimension")
+        if raw_dimension is None:
+            raw_dimension = len(eigenvalues) if eigenvalues else 0
+        try:
+            dimension = int(raw_dimension)
+        except (TypeError, ValueError) as exc:
+            raise BackendSubmissionError(
+                "ARIADNE seed record subspace_dimension is not an integer: "
+                + repr(raw_dimension)
+            ) from exc
+        return neighbours, dimension, eigenvalues
+
+    def _ensure_ariadne_seed_provenance(
+        self,
+        state,
+        picked: Dict[str, Any],
+        seed_record: Dict[str, Any],
+    ) -> tuple:
+        """Ensure one live ARIADNE seed directory has its provenance sidecar.
+
+        Dry-run has always written this before enriching ARIADNE/Phase-B
+        blocks. Live mode must do the same because downstream Gaussian staging
+        validates and copies the sidecar into the labelled pointdir.
+        """
+        iteration = int(state.iteration)
+        seed_dir = self._seed_dir_for_record(iteration, seed_record)
+        prov_path = seed_dir / PROVENANCE_FILENAME
+        seed_frame_id = self._seed_record_frame_id(seed_record)
+        trajectory_sha = str(picked.get("trajectory_sha256", "") or "")
+        trajectory_sha_for_validation = trajectory_sha if trajectory_sha else None
+        if prov_path.is_file():
+            try:
+                validate_provenance(
+                    seed_dir,
+                    campaign_uid=str(getattr(state, "campaign_uid", "")),
+                    iteration=iteration,
+                    trajectory_sha256=trajectory_sha_for_validation,
+                    seed_frame_id=seed_frame_id,
+                )
+            except Exception as exc:
+                raise BackendSubmissionError(
+                    "ARIADNE seed provenance invalid for "
+                    + seed_dir.name
+                    + ": "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)
+                ) from exc
+            return prov_path, False
+
+        neighbours, dimension, eigenvalues = self._seed_record_subspace_payload(seed_record)
+        try:
+            write_seed_provenance(
+                seed_dir,
+                campaign_uid=str(getattr(state, "campaign_uid", "")),
+                iteration=iteration,
+                trajectory_sha256=trajectory_sha,
+                seed_frame_id=seed_frame_id,
+                seed_selection_origin=str(seed_record.get("selection_origin", "unknown")),
+                seed_variance_at_selection=self._seed_record_variance(seed_record),
+                subspace_neighbour_frame_ids=neighbours,
+                subspace_dimension=dimension,
+                subspace_eigenvalues=eigenvalues,
+                mode_weighting_policy=self._mode_weighting_policy_or_default(),
+            )
+        except Exception as exc:
+            raise BackendSubmissionError(
+                "ARIADNE seed provenance write failed for "
+                + seed_dir.name
+                + ": "
+                + type(exc).__name__
+                + ": "
+                + str(exc)
+            ) from exc
+        return prov_path, True
+
+    def _ensure_ariadne_seed_provenance_for_iteration(self, state) -> int:
+        from ..handoff_manifests import load_seeds_picked
+
+        iteration = int(state.iteration)
+        iter_dir = (
+            Path(self.campaign_dir)
+            / "7_ACTIVE_LEARNING"
+            / ("iteration-" + str(iteration).zfill(4))
+        )
+        try:
+            picked = load_seeds_picked(iter_dir, expected_iteration=iteration)
+        except Exception as exc:
+            raise BackendSubmissionError("seeds_picked.json unreadable: " + str(exc))
+        created = 0
+        for seed_record in list(picked.get("seed_records", [])):
+            _path, was_created = self._ensure_ariadne_seed_provenance(
+                state,
+                picked,
+                seed_record,
+            )
+            if was_created:
+                created += 1
+        if created:
+            self._journal_event(
+                "ariadne_seed_provenance_staged",
+                iteration=iteration,
+                n_created=int(created),
+            )
+        return int(picked.get("n_picked", 0))
+
     def _array_size_after_staging(self, phase_name, state):
         """Stage this phase's per-point inputs and return the SLURM array size.
         None for single-job phases (FEREBUS / POLUS) so no --array is emitted."""
@@ -637,7 +813,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             )
             return n
         if phase_name == "ARIADNE_ARRAY":
-            return self._count_seeds(it)
+            return self._ensure_ariadne_seed_provenance_for_iteration(state)
         return None
 
     def _submit_ferebus_phase(self, state, phase_name: str) -> PhaseResult:
@@ -1842,6 +2018,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     "seed_index": int(seed_record["seed_index"]),
                     "seed_dir": str(seed_dir.resolve()),
                     "reason": "ariadne_pool_missing",
+                    "handoff_accepted": False,
+                    "handoff_rejection_reason": "ariadne_pool_missing",
                 })
             write_ariadne_landing_audit(iter_dir, {
                 "iteration": int(state.iteration),
@@ -1886,6 +2064,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     "seed_dir": str(seed_dir.resolve()),
                     "result_json": str(result_path.resolve()),
                     "reason": "missing_result_json",
+                    "handoff_accepted": False,
+                    "handoff_rejection_reason": "missing_result_json",
                 })
                 self._journal_event(
                     "ariadne_task_rejected_missing_result",
@@ -1917,6 +2097,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     "seed_dir": str(seed_dir.resolve()),
                     "result_json": str(result_path.resolve()),
                     "reason": "result_json_parse_failure",
+                    "handoff_accepted": False,
+                    "handoff_rejection_reason": "result_json_parse_failure",
                 })
                 self._journal_event(
                     "ariadne_task_rejected_malformed_result",
@@ -1961,6 +2143,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     "seed_dir": str(seed_dir.resolve()),
                     "result_json": str(result_path.resolve()),
                     "reason": reason,
+                    "handoff_accepted": False,
+                    "handoff_rejection_reason": reason,
                 })
                 self._journal_event(
                     "ariadne_task_rejected_malformed_result",
@@ -2033,6 +2217,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             if not bool(landing_safety.get("accepted", False)):
                 reasons = landing_safety.get("reasons") or ["unsafe_landing"]
                 reason = ";".join(str(r) for r in reasons)
+                audit_record["handoff_accepted"] = False
+                audit_record["handoff_rejection_reason"] = reason
                 rejected.append({
                     "seed_index": seed_index,
                     "seed_dir": str(seed_dir.resolve()),
@@ -2084,6 +2270,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             )
             if not bool(geometry_quality.get("accepted")):
                 reason = ";".join(str(r) for r in geometry_quality.get("reasons", []))
+                audit_record["handoff_accepted"] = False
+                audit_record["handoff_rejection_reason"] = reason
                 rejected.append({
                     "seed_index": seed_index,
                     "seed_dir": str(seed_dir.resolve()),
@@ -2104,21 +2292,21 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 )
                 continue
 
-            prov_path = seed_dir / PROVENANCE_FILENAME
-            if not prov_path.is_file():
-                reason = "ariadne_provenance_missing"
+            try:
+                prov_path, provenance_reconstructed = self._ensure_ariadne_seed_provenance(
+                    state,
+                    picked,
+                    seed_record,
+                )
+            except BackendSubmissionError as exc:
+                reason = "ariadne_provenance_missing: " + str(exc)
+                audit_record["handoff_accepted"] = False
+                audit_record["handoff_rejection_reason"] = reason
                 rejected.append({
                     "seed_index": seed_index,
                     "seed_dir": str(seed_dir.resolve()),
                     "result_json": str(result_path.resolve()),
-                    "provenance_json": str(prov_path.resolve()),
-                    "reason": reason,
-                })
-                landing_audit_records.append({
-                    "seed_index": seed_index,
-                    "seed_dir": str(seed_dir.resolve()),
-                    "result_json": str(result_path.resolve()),
-                    "provenance_json": str(prov_path.resolve()),
+                    "provenance_json": str((seed_dir / PROVENANCE_FILENAME).resolve()),
                     "reason": reason,
                 })
                 self._journal_event(
@@ -2129,6 +2317,16 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     reason=reason,
                 )
                 continue
+            audit_record["provenance_json"] = str(prov_path.resolve())
+            audit_record["provenance_reconstructed"] = bool(provenance_reconstructed)
+            if provenance_reconstructed:
+                self._journal_event(
+                    "ariadne_provenance_reconstructed",
+                    phase=phase_name,
+                    iteration=int(state.iteration),
+                    seed_dir=seed_dir.name,
+                    provenance_json=str(prov_path.resolve()),
+                )
 
             enrich_with_ariadne(
                 seed_dir,
@@ -2217,6 +2415,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     rejected_by_anti_overlap = True
 
             if rejected_by_anti_overlap:
+                audit_record["handoff_accepted"] = False
+                audit_record["handoff_rejection_reason"] = str(flag)
                 rejected.append({
                     "seed_index": seed_index,
                     "seed_dir": str(seed_dir.resolve()),
@@ -2233,6 +2433,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 )
                 continue
 
+            audit_record["handoff_accepted"] = True
             kept_alphas.append(float(validated["alpha_final"]))
             accepted.append({
                 "seed_index": seed_index,

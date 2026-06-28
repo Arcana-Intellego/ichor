@@ -30,7 +30,7 @@ def test_default_campaign_config_is_valid():
     assert c.runtime.postprocess_settle_seconds == 10
     assert c.runtime.transient_phase_retry_max == 1
     assert c.runtime.poll_sacct_unknown_max_ticks == 3
-    assert c.runtime.poll_sacct_missing_max_ticks == 3
+    assert c.runtime.poll_sacct_missing_max_ticks == 12
     assert c.runtime.halt_on_tick_exception is True
     assert c.seed_selection.variance_chunk_size == 512
     assert c.seed_selection.strategy == "hybrid_variance"
