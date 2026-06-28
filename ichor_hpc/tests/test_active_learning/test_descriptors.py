@@ -78,6 +78,49 @@ def test_hybrid_descriptor_reduces_to_rmsd_when_beta_one():
     np.testing.assert_allclose(hybrid_only_rmsd, pure, atol=1.0e-10)
 
 
+def test_hybrid_descriptor_default_alf_extractor_is_finite():
+    frames = [
+        _water_at(0.0),
+        Atoms([
+            Atom("O", 0.0, 0.0, 0.0),
+            Atom("H", 1.05, 0.0, 0.0),
+            Atom("H", -0.24, 0.93, 0.0),
+        ]),
+        Atoms([
+            Atom("O", 0.0, 0.0, 0.0),
+            Atom("H", 0.96, 0.0, 0.0),
+            Atom("H", -0.30, 0.86, 0.0),
+        ]),
+    ]
+
+    D = HybridAlfRmsdDescriptor(beta=0.3).pairwise_distance_matrix(frames)
+
+    assert D.shape == (3, 3)
+    assert np.all(np.isfinite(D))
+    np.testing.assert_allclose(np.diag(D), 0.0, atol=1.0e-10)
+    np.testing.assert_allclose(D, D.T, atol=1.0e-10)
+    assert np.all(D >= 0.0)
+    assert np.max(D) > 0.0
+
+
+def test_hybrid_descriptor_default_alf_only_mode_does_not_crash():
+    frames = [
+        _water_at(0.0),
+        Atoms([
+            Atom("O", 0.0, 0.0, 0.0),
+            Atom("H", 1.08, 0.0, 0.0),
+            Atom("H", -0.24, 0.90, 0.0),
+        ]),
+    ]
+
+    D = HybridAlfRmsdDescriptor(beta=0.0).pairwise_distance_matrix(frames)
+
+    assert D.shape == (2, 2)
+    assert np.all(np.isfinite(D))
+    np.testing.assert_allclose(np.diag(D), 0.0, atol=1.0e-10)
+    np.testing.assert_allclose(D, D.T, atol=1.0e-10)
+
+
 def test_hybrid_descriptor_uses_feature_extractor_when_beta_zero():
     frames = [_water_at(0.0), _water_at(0.05), _water_at(0.10)]
     fake_feats = {id(frames[0]): np.array([1.0, 0.0]),
@@ -100,6 +143,35 @@ def test_hybrid_descriptor_beta_out_of_range_raises():
         HybridAlfRmsdDescriptor(beta=1.5).pairwise_distance_matrix(frames)
     with pytest.raises(ValueError):
         HybridAlfRmsdDescriptor(beta=-0.1).pairwise_distance_matrix(frames)
+
+
+def test_hybrid_descriptor_wraps_bad_alf_geometry_with_phase_b_context():
+    frames = [
+        _water_at(0.0),
+        Atoms([
+            Atom("O", 0.0, 0.0, 0.0),
+            Atom("H", 0.0, 0.0, 0.0),
+            Atom("H", -0.24, 0.93, 0.0),
+        ]),
+    ]
+
+    with pytest.raises(RuntimeError, match="hybrid_alf_rmsd feature extraction failed"):
+        HybridAlfRmsdDescriptor(beta=0.3).pairwise_distance_matrix(frames)
+
+
+def test_hybrid_descriptor_rejects_feature_length_mismatch():
+    frames = [_water_at(0.0), _water_at(0.05)]
+
+    def extractor(atoms):
+        if atoms is frames[0]:
+            return np.array([1.0, 2.0])
+        return np.array([1.0, 2.0, 3.0])
+
+    with pytest.raises(ValueError, match="feature length mismatch"):
+        HybridAlfRmsdDescriptor(
+            beta=0.3,
+            feature_extractor=extractor,
+        ).pairwise_distance_matrix(frames)
 
 
 def test_acquisition_weighted_descriptor_scales_distances_by_variance():

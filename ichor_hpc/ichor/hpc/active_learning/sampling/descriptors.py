@@ -113,14 +113,29 @@ class MassWeightedRMSDDescriptor:
 
 
 def _default_alf_feature_extractor():
-    from ichor.core.calculators import default_feature_calculator
+    from ichor.core.calculators import calculate_alf_features
+    from ichor.core.calculators import default_alf_calculator
 
     def extract(atoms):
-        features_dict = atoms.features_dict(default_feature_calculator)
-        return np.concatenate([
-            np.asarray(features_dict[name]).reshape(-1)
-            for name in sorted(features_dict.keys())
-        ])
+        try:
+            system_alf = atoms.alf(default_alf_calculator)
+            features = [
+                np.asarray(
+                    atom.features(calculate_alf_features, system_alf),
+                    dtype=float,
+                ).reshape(-1)
+                for atom in atoms
+            ]
+        except Exception as exc:
+            raise RuntimeError(
+                "Phase B ALF feature extraction failed: " + str(exc)
+            ) from exc
+        if not features:
+            raise ValueError("Phase B ALF feature extraction produced no features")
+        flat = np.concatenate(features)
+        if not np.all(np.isfinite(flat)):
+            raise ValueError("Phase B ALF feature extraction produced non-finite values")
+        return flat
 
     return extract
 
@@ -139,9 +154,43 @@ class HybridAlfRmsdDescriptor:
         if n == 0:
             return np.zeros((0, 0), dtype=float)
         extractor = self.feature_extractor or _default_alf_feature_extractor()
-        feats = np.vstack([
-            np.asarray(extractor(f), dtype=float).reshape(-1) for f in frames
-        ])
+        feature_rows = []
+        feature_size = None
+        for idx, frame in enumerate(frames):
+            try:
+                row = np.asarray(extractor(frame), dtype=float).reshape(-1)
+            except Exception as exc:
+                raise RuntimeError(
+                    "hybrid_alf_rmsd feature extraction failed for frame "
+                    + str(idx)
+                    + ": "
+                    + str(exc)
+                ) from exc
+            if row.size == 0:
+                raise ValueError(
+                    "hybrid_alf_rmsd feature extraction produced an empty "
+                    + "feature vector for frame "
+                    + str(idx)
+                )
+            if not np.all(np.isfinite(row)):
+                raise ValueError(
+                    "hybrid_alf_rmsd feature extraction produced non-finite "
+                    + "values for frame "
+                    + str(idx)
+                )
+            if feature_size is None:
+                feature_size = int(row.size)
+            elif int(row.size) != feature_size:
+                raise ValueError(
+                    "hybrid_alf_rmsd feature length mismatch: frame "
+                    + str(idx)
+                    + " has "
+                    + str(int(row.size))
+                    + " values, expected "
+                    + str(feature_size)
+                )
+            feature_rows.append(row)
+        feats = np.vstack(feature_rows)
         mu = feats.mean(axis=0, keepdims=True)
         sigma = feats.std(axis=0, keepdims=True)
         sigma = np.where(sigma > self.epsilon, sigma, 1.0)
@@ -206,7 +255,6 @@ def build_descriptor_from_config(config, *, posterior=None) -> "Descriptor":
             base_descriptor=HybridAlfRmsdDescriptor(beta=config.phase_b.beta),
         )
     raise ValueError("unknown phase_b.descriptor: " + repr(name))
-
 
 
 
