@@ -64,6 +64,7 @@ from .daemon.job_names import live_job_name
 from .daemon.live_executor import (
     LiveBackendNotAvailableError,
     LiveBackendsPhaseExecutor,
+    make_live_job_accounting_finder,
     make_live_job_finder,
     make_live_job_liveness_checker,
 )
@@ -1198,7 +1199,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     else:
         try:
             state_for_lock = read_state(state_path)
-        except StateSchemaError as exc:
+        except (StateSchemaError, json.JSONDecodeError) as exc:
             print(
                 "state.json is invalid; run `ichor-al-daemon reconcile --campaign-dir "
                 + str(campaign)
@@ -1305,6 +1306,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         pass
 
     job_finder = None  # set in the live branch below; mock/dry leave it None (no adopt check)
+    job_name_accounting_finder = None
     job_liveness_checker = None
     if getattr(args, "live", False):
         avail = check_backends()
@@ -1323,6 +1325,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         # live mode: let the daemon spot + adopt an orphaned in-flight job on (re)entry rather than
         # double-submitting after a crash or reconcile (A24/A25).
         job_finder = make_live_job_finder()
+        job_name_accounting_finder = make_live_job_accounting_finder()
         job_liveness_checker = make_live_job_liveness_checker()
     elif getattr(args, "dry_run", False):
         executor = DryRunPhaseExecutor(
@@ -1345,6 +1348,8 @@ def cmd_start(args: argparse.Namespace) -> int:
         daemon_kwargs["sacct_poller"] = sacct_poller
     if job_finder is not None:
         daemon_kwargs["job_finder"] = job_finder
+    if job_name_accounting_finder is not None:
+        daemon_kwargs["job_name_accounting_finder"] = job_name_accounting_finder
     if job_liveness_checker is not None:
         daemon_kwargs["job_liveness_checker"] = job_liveness_checker
     d = Daemon(**daemon_kwargs)
@@ -1877,10 +1882,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         return 4
     try:
         state = read_state(paths["state"])
-    except StateSchemaError as exc:
+    except (StateSchemaError, json.JSONDecodeError) as exc:
         payload = {
             "status_error": "state_schema_invalid",
-            "state_error": "StateSchemaError: " + str(exc),
+            "state_error": type(exc).__name__ + ": " + str(exc),
             "state_path": str(paths["state"]),
             "campaign_dir": str(campaign),
         }
@@ -1946,7 +1951,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
     if state_path.exists():
         try:
             state = read_state(state_path)
-        except StateSchemaError as exc:
+        except (StateSchemaError, json.JSONDecodeError) as exc:
             print("state.json invalid: " + str(exc), file=sys.stderr)
             return 5
         if state.phase is CampaignPhase.HALTED:

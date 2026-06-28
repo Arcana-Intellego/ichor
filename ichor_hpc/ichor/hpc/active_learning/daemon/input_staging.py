@@ -240,6 +240,7 @@ def read_quantum_acceptance_manifest(
     """
     staging = Path(staging_dir)
     phase_path = quantum_acceptance_manifest_path(staging, phase_name=expected_phase)
+    used_legacy_alias = not phase_path.is_file()
     path = phase_path if phase_path.is_file() else quantum_acceptance_manifest_path(staging)
     if not path.is_file():
         raise FileNotFoundError("quantum acceptance manifest missing: " + str(path))
@@ -300,6 +301,10 @@ def read_quantum_acceptance_manifest(
         resolved.append(pointdir)
     if require_nonempty and not resolved:
         raise ValueError("quantum acceptance manifest accepted_pointdirs is empty: " + str(path))
+    if used_legacy_alias:
+        # Migrate old in-flight campaigns before the next phase overwrites the
+        # legacy alias with its own acceptance payload.
+        atomic_write_json(phase_path, data)
     return resolved, data
 
 
@@ -685,8 +690,19 @@ def commit_initial_training_set(campaign_dir) -> bool:
                 raise ValueError(
                     "existing initial training set does not match initial AIMAll handoff"
                 )
-        except FileNotFoundError:
-            pass
+        except FileNotFoundError as exc:
+            try:
+                from .journal import append_event
+
+                append_event(
+                    campaign / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson",
+                    "initial_training_existing_without_bootstrap_handoff",
+                    iteration=0,
+                    training_version=0,
+                    reason=str(exc)[:200],
+                )
+            except Exception:
+                pass
         v_train.ensure_current(0)
         return False
     accepted_pointdirs, _manifest = read_quantum_acceptance_manifest(

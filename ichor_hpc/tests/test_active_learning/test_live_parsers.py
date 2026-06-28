@@ -332,6 +332,55 @@ def test_commit_initial_training_set_uses_aimall_acceptance_manifest(tmp_path):
     assert not (committed / "POINT_0000.pointdir").exists()
 
 
+def test_initial_aimall_reader_migrates_legacy_gaussian_alias(tmp_path):
+    campaign = tmp_path / "campaign"
+    initial = campaign / ".DATA" / "STAGING" / "initial"
+    pointdir = initial / "POINT_0000.pointdir"
+    pointdir.mkdir(parents=True)
+    stg.write_points_file(initial, [pointdir])
+    legacy = {
+        "schema_version": 1,
+        "phase": "INITIAL_GAUSSIAN",
+        "iteration": 0,
+        "accepted_pointdirs": ["POINT_0000.pointdir"],
+        "rejected": [],
+        "n_total": 1,
+    }
+    (initial / "accepted_pointdirs.json").write_text(
+        json.dumps(legacy, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    pointdirs, manifest = stg.read_quantum_acceptance_manifest(
+        initial,
+        expected_phase="INITIAL_GAUSSIAN",
+        expected_iteration=0,
+        require_points_file_membership=True,
+    )
+
+    assert [p.name for p in pointdirs] == ["POINT_0000.pointdir"]
+    assert manifest["phase"] == "INITIAL_GAUSSIAN"
+    migrated = initial / "accepted_pointdirs.INITIAL_GAUSSIAN.json"
+    assert migrated.is_file()
+    assert json.loads(migrated.read_text(encoding="utf-8")) == legacy
+
+
+def test_commit_initial_training_set_journals_missing_bootstrap_handoff(tmp_path):
+    campaign = tmp_path / "campaign"
+    v_train = TrainingSetVersioning(campaign / "5_TRAINING")
+    staging = v_train.stage(source_version=None, target_version=0)
+    (staging / "POINT_0000.pointdir").mkdir()
+    v_train.commit(0)
+
+    assert stg.commit_initial_training_set(campaign) is False
+
+    events = _read_journal_events(campaign)
+    assert any(
+        e.get("event") == "initial_training_existing_without_bootstrap_handoff"
+        for e in events
+    )
+
+
 def test_live_append_requires_aimall_acceptance_manifest(tmp_path):
     ex = _make_executor(tmp_path)
     v = TrainingSetVersioning(ex.campaign_dir / "5_TRAINING")
@@ -797,6 +846,38 @@ def test_ariadne_parser_accepts_safe_max_iteration_result(tmp_path):
     assert salvaged
     assert salvaged[-1]["return_code"] == 1
     assert salvaged[-1]["reason"] == "safe_landing_after_max_iterations"
+
+
+def test_ariadne_parser_rejects_explicit_unsuccessful_task(tmp_path):
+    ex = _make_executor(tmp_path)
+    pool = _seed_ariadne_pool(tmp_path / "campaign", iteration=4, n_seeds=1)
+    result_path = pool / "seed_0000" / "result.json"
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    payload["return_code"] = 0
+    payload["task_success"] = False
+    payload["task_success_reason"] = "runner_failed_after_result_write"
+    payload["landing_safety"] = {
+        "accepted": True,
+        "policy": "raw_final",
+        "selected_origin": "raw_final",
+        "reasons": [],
+        "record_only_reasons": [],
+        "metrics": {},
+    }
+    result_path.write_text(json.dumps(payload), encoding="utf-8")
+    state = SimpleNamespace(iteration=4, campaign_uid="m16-test")
+
+    result = ex._parse_ariadne_array_postprocess(
+        state, CampaignPhase("ARIADNE_ARRAY"), observations=[],
+    )
+
+    assert result.failure_reason == "ariadne_no_seed_results_parsed: 1"
+    iter_dir = tmp_path / "campaign" / "7_ACTIVE_LEARNING" / "iteration-0004"
+    manifest = json.loads((iter_dir / "ARIADNE_RESULTS.json").read_text(encoding="utf-8"))
+    assert manifest["n_accepted"] == 0
+    assert manifest["n_rejected"] == 1
+    assert manifest["rejected"][0]["reason"] == "runner_failed_after_result_write"
+    assert manifest["rejected"][0]["task_success"] is False
 
 
 def test_ariadne_parser_missing_pool_dir(tmp_path):

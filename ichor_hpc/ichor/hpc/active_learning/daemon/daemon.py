@@ -180,6 +180,11 @@ class Daemon:
     # phase+iteration, or None. lets a restart/reconcile adopt a job a crash orphaned instead of
     # double-submitting (A24/A25). None (mock/dry) -> the check is skipped and we submit as before.
     job_finder: Optional[Callable[..., Optional[str]]] = None
+    # live-mode only: given (state, phase, active_intent), return accounting
+    # evidence for an expected job name. This closes the PRE_SUBMIT/no-JobID
+    # crash window where sbatch accepted the job before mark_submitted wrote
+    # the allocation id.
+    job_name_accounting_finder: Optional[Callable[..., Any]] = None
     # live-mode only: given a Slurm JobID, returns a small object with active,
     # inconclusive, rows and error attributes. Used to distinguish genuinely
     # missing sacct array rows from throttled jobs that are still visible in
@@ -656,6 +661,14 @@ class Daemon:
                 )
         if active_intent is not None and phase_name in SBATCH_PHASES:
             active_job_id = active_intent.get("job_id")
+            if active_job_id is None:
+                recovered = self._recover_pre_submit_intent_without_job_id(
+                    state,
+                    phase,
+                    active_intent,
+                )
+                if recovered is not None:
+                    return recovered
             if active_job_id is not None and self.job_liveness_checker is not None:
                 liveness = self._check_job_liveness(str(active_job_id))
                 if liveness is not None and bool(getattr(liveness, "active", False)):
@@ -926,6 +939,121 @@ class Daemon:
             n_completed=int(getattr(summary, "n_completed", 0)),
             n_failed=int(getattr(summary, "n_failed", 0)),
             terminal=bool(getattr(summary, "is_terminal", False)),
+        )
+        return TickStatus.SUBMITTED
+
+    def _recover_pre_submit_intent_without_job_id(
+        self,
+        state: CampaignState,
+        phase: CampaignPhase,
+        active_intent: Dict[str, Any],
+    ) -> Optional[TickStatus]:
+        phase_name = phase.value
+        expected_name = str(active_intent.get("expected_job_name") or "")
+        if not expected_name:
+            return self._halt_scheduler_uncertain(
+                state,
+                phase,
+                "pre_submit_intent_missing_expected_job_name: "
+                + phase_name
+                + "@"
+                + str(int(state.iteration)),
+            )
+        if self.job_name_accounting_finder is None:
+            return self._halt_scheduler_uncertain(
+                state,
+                phase,
+                "pre_submit_no_job_id_accounting_unavailable: "
+                + expected_name
+                + "; refusing to supersede active intent",
+            )
+        try:
+            lookup = self.job_name_accounting_finder(state, phase, active_intent)
+        except Exception as exc:
+            return self._halt_scheduler_uncertain(
+                state,
+                phase,
+                "pre_submit_no_job_id_accounting_lookup_failed: "
+                + expected_name
+                + ": "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:160],
+            )
+        if lookup is None:
+            return self._halt_scheduler_uncertain(
+                state,
+                phase,
+                "pre_submit_no_job_id_accounting_inconclusive: "
+                + expected_name
+                + " produced no lookup result; refusing to resubmit",
+            )
+        if bool(getattr(lookup, "inconclusive", False)):
+            return self._halt_scheduler_uncertain(
+                state,
+                phase,
+                "pre_submit_no_job_id_accounting_inconclusive: "
+                + expected_name
+                + ": "
+                + str(getattr(lookup, "error", "") or "inconclusive"),
+            )
+        job_id = getattr(lookup, "job_id", None)
+        if not job_id:
+            return self._halt_scheduler_uncertain(
+                state,
+                phase,
+                "pre_submit_no_job_id_no_accounted_job: "
+                + expected_name
+                + "; refusing to supersede without operator review",
+            )
+        expected_tasks = self._expected_tasks_for_adoption(
+            active_intent,
+            state,
+            phase,
+        )
+        if expected_tasks is None and self._strict_artifact_checks_enabled():
+            return self._halt_scheduler_uncertain(
+                state,
+                phase,
+                "active_submission_expected_tasks_unavailable: "
+                + phase_name
+                + "@"
+                + str(int(state.iteration)),
+            )
+        recovered_job_id = str(job_id)
+        state.pending_jobs[phase_name] = recovered_job_id
+        try:
+            _submission_intent.mark_adopted(
+                self.campaign_dir,
+                phase_name,
+                int(state.iteration),
+                recovered_job_id,
+                expected_tasks=expected_tasks,
+            )
+        except Exception as exc:
+            self._journal(
+                "submission_intent_update_failed",
+                phase=phase_name,
+                iteration=int(state.iteration),
+                error=str(exc)[:200],
+            )
+        self._persist(state)
+        rows = list(getattr(lookup, "rows", []) or [])
+        self._journal(
+            "pre_submit_intent_terminal_adopted"
+            if bool(getattr(lookup, "terminal", False))
+            else "pre_submit_intent_recovered_by_job_name",
+            phase=phase_name,
+            job_id=recovered_job_id,
+            iteration=state.iteration,
+            expected_job_name=expected_name,
+            expected_tasks=expected_tasks,
+            terminal=bool(getattr(lookup, "terminal", False)),
+            successful=bool(getattr(lookup, "successful", False)),
+            failed=bool(getattr(lookup, "failed", False)),
+            n_matching_sacct_rows=len(rows),
+            matching_sacct_rows_sample=rows[:8],
+            matching_sacct_rows_truncated=bool(len(rows) > 8),
         )
         return TickStatus.SUBMITTED
 
@@ -1942,7 +2070,7 @@ class Daemon:
         if not bool(getattr(state, "shutdown_requested", False)):
             try:
                 on_disk = read_state(self.state_path())
-            except (FileNotFoundError, StateSchemaError):
+            except (FileNotFoundError, StateSchemaError, json.JSONDecodeError):
                 on_disk = None
             if on_disk is not None and bool(on_disk.shutdown_requested):
                 state.shutdown_requested = True
@@ -1963,7 +2091,7 @@ class Daemon:
             state = read_state(self.state_path())
             state.shutdown_requested = True
             self._persist(state)
-        except (FileNotFoundError, StateSchemaError):
+        except (FileNotFoundError, StateSchemaError, json.JSONDecodeError):
             pass
 
     def run(
@@ -1991,7 +2119,7 @@ class Daemon:
                     # campaign look like a recovery case on the first tick.
                     try:
                         self._read_or_initialise_state()
-                    except StateSchemaError as exc:
+                    except (StateSchemaError, json.JSONDecodeError) as exc:
                         self._journal("state_corrupt", error=str(exc)[:200])
                         print(
                             "state.json failed validation: " + str(exc)
@@ -2036,7 +2164,7 @@ class Daemon:
 
             try:
                 status = self.tick()
-            except StateSchemaError as exc:
+            except (StateSchemaError, json.JSONDecodeError) as exc:
                 self._journal("state_corrupt", error=str(exc)[:200])
                 print(
                     "state.json failed validation: " + str(exc)

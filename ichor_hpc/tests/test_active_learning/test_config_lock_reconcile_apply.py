@@ -314,6 +314,48 @@ def test_ariadne_backtransform_changes_are_future_safe(tmp_path):
     assert not review.blocked_changes
 
 
+def test_ariadne_config_change_blocks_after_result_exists(tmp_path):
+    campaign = _campaign(tmp_path)
+    original = CampaignConfig()
+    write_config_lock(campaign, original)
+    changed = CampaignConfig()
+    changed.ariadne.trqn_backtransform_mode = "newton"
+    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000" / "pool" / "seed_0000"
+    iter_dir.mkdir(parents=True)
+    (iter_dir / "result.json").write_text("{}", encoding="utf-8")
+
+    proposed = fresh_campaign_state()
+    proposed.phase = CampaignPhase.ARIADNE_ARRAY
+    proposed.iteration = 0
+    review = review_config_changes(campaign, changed, proposed)
+
+    assert not review.allowed
+    assert [c.path for c in review.blocked_changes] == [
+        "ariadne.trqn_backtransform_mode"
+    ]
+    assert review.blocked_changes[0].category == "postprocess_locked"
+
+
+def test_phase_b_config_change_blocks_after_selection_exists(tmp_path):
+    campaign = _campaign(tmp_path)
+    original = CampaignConfig()
+    write_config_lock(campaign, original)
+    changed = CampaignConfig()
+    changed.phase_b.min_separation = 0.20
+    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
+    iter_dir.mkdir(parents=True)
+    (iter_dir / "PHASE_B_SELECTION.json").write_text("{}", encoding="utf-8")
+
+    proposed = fresh_campaign_state()
+    proposed.phase = CampaignPhase.PHASE_B_POLUS
+    proposed.iteration = 0
+    review = review_config_changes(campaign, changed, proposed)
+
+    assert not review.allowed
+    assert [c.path for c in review.blocked_changes] == ["phase_b.min_separation"]
+    assert review.blocked_changes[0].category == "postprocess_locked"
+
+
 def test_gaussian_method_change_is_blocked_by_config_lock(tmp_path):
     campaign = _campaign(tmp_path)
     original = CampaignConfig()

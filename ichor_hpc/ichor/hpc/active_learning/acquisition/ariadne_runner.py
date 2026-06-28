@@ -302,6 +302,14 @@ def ariadne_result_usability_payload(
             "task_exit_code": 4,
             "optimiser_converged": False,
         }
+    if payload.get("task_success") is False:
+        reason = str(payload.get("task_success_reason") or "task_success_false")
+        return {
+            "usable": False,
+            "reason": reason,
+            "task_exit_code": 4,
+            "optimiser_converged": False,
+        }
     try:
         return_code = int(payload.get("return_code"))
     except (TypeError, ValueError):

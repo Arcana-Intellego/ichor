@@ -216,6 +216,7 @@ class ReconciliationReport:
     blocking_artifacts: List[str] = field(default_factory=list)
     recommended_actions: List[str] = field(default_factory=list)
     bootstrap_handoff: Optional[Dict[str, Any]] = None
+    phase_a_handoff: Optional[Dict[str, Any]] = None
 
 
 def _needs_trajectory_pool_check(
@@ -420,6 +421,25 @@ def _find_bootstrap_handoff(
     return None
 
 
+def _find_phase_a_handoff(campaign_dir: Union[str, Path]) -> Optional[Dict[str, Any]]:
+    from ..handoff_manifests import read_phase_a_sample_manifest
+
+    initial = Path(campaign_dir) / "3_DIVERSITY_SAMPLING" / "initial"
+    try:
+        manifest = read_phase_a_sample_manifest(initial, require_nonempty=True)
+    except Exception:
+        return None
+    return {
+        "path": str(initial),
+        "manifest_path": str(initial / "PHASE_A_SAMPLE.json"),
+        "phase": CampaignPhase.PHASE_A_POLUS.value,
+        "iteration": -1,
+        "n_select": int(manifest.get("n_select", 0)),
+        "sample_xyz": str(manifest.get("sample_xyz", "")),
+        "index_path": str(manifest.get("index_path", "")),
+    }
+
+
 def restore_archived_bootstrap_handoff(
     campaign_dir: Union[str, Path],
     report: ReconciliationReport,
@@ -469,12 +489,20 @@ def _validate_recovered_state_contract(
     state: CampaignState,
     *,
     bootstrap_handoff: Optional[Dict[str, Any]] = None,
+    phase_a_handoff: Optional[Dict[str, Any]] = None,
 ) -> None:
     phase = CampaignPhase(state.phase)
     if phase in {CampaignPhase.INIT, CampaignPhase.DONE, CampaignPhase.HALTED}:
         return
     training_version = int(getattr(state, "training_set_version", -1))
     model_version = int(getattr(state, "models_version", -1))
+    if (
+        phase is CampaignPhase.INITIAL_GAUSSIAN
+        and training_version < 0
+        and model_version < 0
+    ):
+        if isinstance(phase_a_handoff, dict):
+            return
     if (
         phase is CampaignPhase.INITIAL_FEREBUS
         and training_version < 0
@@ -602,6 +630,7 @@ def propose_recovery(
         campaign,
         iteration=bootstrap_iteration,
     )
+    phase_a_handoff = _find_phase_a_handoff(campaign)
     initial_handoff_indicated = _initial_aimall_handoff_indicated(
         existing=existing,
         last_phase=last_phase,
@@ -746,7 +775,11 @@ def propose_recovery(
         last_phase=last_phase or (
             str(bootstrap_handoff.get("phase"))
             if isinstance(bootstrap_handoff, dict)
-            else None
+            else (
+                str(phase_a_handoff.get("phase"))
+                if isinstance(phase_a_handoff, dict)
+                else None
+            )
         ),
         staging_children=staging_children,
         script_files=script_files,
@@ -840,6 +873,11 @@ def propose_recovery(
                 trusted_artifacts.append("initial AIMAll acceptance manifest")
             except Exception as exc:
                 initial_handoff_error = type(exc).__name__ + ": " + str(exc)[:180]
+    phase_a_handoff_valid = not tv and not mv and isinstance(phase_a_handoff, dict)
+    if phase_a_handoff_valid:
+        trusted_artifacts.append(
+            "Phase A sample handoff at " + str(phase_a_handoff.get("path"))
+        )
 
     if coherent_pairs:
         coherent = int(coherent_pairs[-1])
@@ -985,6 +1023,18 @@ def propose_recovery(
                 + initial_handoff_error
             )
             blocking_artifacts.append(".DATA/STAGING/initial")
+    elif (
+        not tv
+        and not mv
+        and not existing_loaded
+        and phase_a_handoff_valid
+        and not unsafe_reasons
+    ):
+        recovered.phase = CampaignPhase.INITIAL_GAUSSIAN
+        recovered.training_set_version = -1
+        recovered.models_version = -1
+        decision = "INITIAL_GAUSSIAN: valid Phase A sample exists without committed models"
+        notes.append("re-entry at INITIAL_GAUSSIAN to process the Phase A sample")
     elif not tv and not mv and not existing_loaded:
         recovered.phase = CampaignPhase.INIT
         decision = "INIT: no existing state or committed iterations"
@@ -1047,6 +1097,7 @@ def propose_recovery(
                 campaign,
                 recovered,
                 bootstrap_handoff=bootstrap_handoff,
+                phase_a_handoff=phase_a_handoff,
             )
         except Exception as exc:
             recovered.phase = CampaignPhase.HALTED
@@ -1082,6 +1133,7 @@ def propose_recovery(
         blocking_artifacts=blocking_artifacts,
         recommended_actions=recommended_actions,
         bootstrap_handoff=bootstrap_handoff,
+        phase_a_handoff=phase_a_handoff,
     )
 
 

@@ -83,6 +83,7 @@ def _make_daemon(
     executor=None,
     sacct=None,
     job_liveness_checker=None,
+    job_name_accounting_finder=None,
 ) -> Daemon:
     cfg = CampaignConfig(max_iterations=max_iterations)
     executor = executor or MockPhaseExecutor(treat_as_sbatch=set(_SBATCH_PHASES))
@@ -94,9 +95,99 @@ def _make_daemon(
         sacct_poller=sacct,
         sleep_fn=lambda s: None,
         job_liveness_checker=job_liveness_checker,
+        job_name_accounting_finder=job_name_accounting_finder,
     )
     daemon.data_dir().mkdir(parents=True, exist_ok=True)
     return daemon
+
+
+def test_run_handles_malformed_state_json_without_traceback(tmp_path):
+    d = _make_daemon(tmp_path)
+    d.data_dir().mkdir(parents=True, exist_ok=True)
+    d.state_path().write_text("{bad json", encoding="utf-8")
+
+    rc = d.run(max_ticks=1)
+
+    assert rc == 2
+    events = list(iter_events(d.data_dir() / "journal.ndjson"))
+    assert any(e.get("event") == "state_corrupt" for e in events)
+
+
+def test_pre_submit_intent_without_job_id_recovers_by_accounting_name(tmp_path):
+    def lookup(state, phase, intent):
+        assert phase is CampaignPhase.PHASE_A_POLUS
+        assert intent["status"] == "PRE_SUBMIT"
+        return SimpleNamespace(
+            job_id="777",
+            terminal=True,
+            successful=True,
+            failed=False,
+            inconclusive=False,
+            rows=[("777", "COMPLETED")],
+            reason="terminal_success",
+        )
+
+    d = _make_daemon(tmp_path, job_name_accounting_finder=lookup)
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.PHASE_A_POLUS
+    write_state(d.state_path(), state)
+    submission_intent.write_pre_submit_intent(
+        d.campaign_dir,
+        campaign_uid=state.campaign_uid,
+        phase_name=CampaignPhase.PHASE_A_POLUS.value,
+        iteration=0,
+    )
+
+    status = d.tick()
+
+    assert status is TickStatus.SUBMITTED
+    recovered = read_state(d.state_path())
+    assert recovered.pending_jobs[CampaignPhase.PHASE_A_POLUS.value] == "777"
+    intent = submission_intent.load_intent(
+        d.campaign_dir,
+        CampaignPhase.PHASE_A_POLUS.value,
+        0,
+    )
+    assert intent["status"] == "ADOPTED"
+    assert intent["job_id"] == "777"
+
+
+def test_pre_submit_intent_without_accounted_job_halts_instead_of_resubmitting(tmp_path):
+    def lookup(state, phase, intent):
+        return SimpleNamespace(
+            job_id=None,
+            terminal=False,
+            successful=False,
+            failed=False,
+            inconclusive=False,
+            rows=[],
+            reason="not_found",
+        )
+
+    executor = MockPhaseExecutor(treat_as_sbatch=set(_SBATCH_PHASES))
+    d = _make_daemon(tmp_path, executor=executor, job_name_accounting_finder=lookup)
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.PHASE_A_POLUS
+    write_state(d.state_path(), state)
+    submission_intent.write_pre_submit_intent(
+        d.campaign_dir,
+        campaign_uid=state.campaign_uid,
+        phase_name=CampaignPhase.PHASE_A_POLUS.value,
+        iteration=0,
+    )
+
+    status = d.tick()
+
+    assert status is TickStatus.HALTED
+    halted = read_state(d.state_path())
+    assert halted.phase is CampaignPhase.HALTED
+    assert not [c for c in executor.calls if c.operation == "submit_or_run"]
+    events = list(iter_events(d.data_dir() / "journal.ndjson"))
+    assert any(
+        e.get("event") == "halt"
+        and "pre_submit_no_job_id_no_accounted_job" in str(e.get("reason"))
+        for e in events
+    )
 
 
 def test_next_phase_progression_through_first_iteration():

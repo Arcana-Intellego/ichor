@@ -41,6 +41,8 @@ __all__ = [
     "find_active_job_by_id_detailed",
     "JobNameLookup",
     "find_active_job_by_name_detailed",
+    "JobNameAccountingLookup",
+    "find_accounted_job_by_name_detailed",
     "find_running_job_by_name_detailed",
     "find_running_job_by_name",
 ]
@@ -401,6 +403,27 @@ class JobNameLookup:
         return bool(self.job_id)
 
 
+@dataclass(frozen=True)
+class JobNameAccountingLookup:
+    """Accounting lookup for one expected Slurm job name.
+
+    This is stricter than the normal running-job lookup. It may return a
+    terminal allocation as well as an active one, so daemon crash recovery can
+    avoid resubmitting a job whose JobID was never persisted.
+    """
+
+    job_id: Optional[str]
+    terminal: bool = False
+    successful: bool = False
+    failed: bool = False
+    inconclusive: bool = False
+    rows: List[Tuple[str, str]] = field(default_factory=list)
+    error: Optional[str] = None
+
+    def __bool__(self) -> bool:
+        return bool(self.job_id)
+
+
 def find_active_job_by_name_detailed(
     name: str,
     *,
@@ -461,6 +484,120 @@ def find_active_job_by_name_detailed(
             + repr(sorted(active_ids)),
         )
     return JobNameLookup(sorted(active_ids)[0], inconclusive=False, rows=rows)
+
+
+def find_accounted_job_by_name_detailed(
+    name: str,
+    *,
+    expected_task_count: Optional[int] = None,
+    sacct_runner: Optional[Callable[..., Any]] = None,
+    squeue_runner: Optional[Callable[..., Any]] = None,
+    use_squeue_fallback: bool = False,
+) -> JobNameAccountingLookup:
+    """Return active or terminal accounting evidence for one expected job name."""
+    if sacct_runner is None:
+        sacct_runner = subprocess.run
+    cmd = [
+        "sacct", "--name", str(name),
+        "--format=JobID,State,ExitCode,Elapsed", "-X", "-P", "-n",
+    ]
+    try:
+        completed = sacct_runner(cmd, check=False, capture_output=True, text=True)
+    except Exception as exc:
+        return JobNameAccountingLookup(
+            None,
+            inconclusive=True,
+            error=type(exc).__name__ + ": " + str(exc),
+        )
+    return_code = int(getattr(completed, "returncode", 1))
+    if return_code != 0:
+        stderr = getattr(completed, "stderr", "") or ""
+        return JobNameAccountingLookup(
+            None,
+            inconclusive=True,
+            error="sacct exited with code " + str(return_code) + ": " + repr(stderr),
+        )
+    observations = parse_sacct_output(getattr(completed, "stdout", "") or "")
+    rows = [(str(o.job_id), str(o.status.value)) for o in observations]
+    base_ids = sorted({_base_allocation_id(o.job_id) for o in observations})
+    if not base_ids:
+        if use_squeue_fallback:
+            active = find_active_job_by_name_detailed(
+                name,
+                squeue_runner=squeue_runner,
+            )
+            if active.job_id:
+                return JobNameAccountingLookup(
+                    active.job_id,
+                    terminal=False,
+                    inconclusive=False,
+                    rows=list(active.rows),
+                )
+            if active.inconclusive:
+                return JobNameAccountingLookup(
+                    None,
+                    inconclusive=True,
+                    rows=list(active.rows),
+                    error=active.error,
+                )
+        return JobNameAccountingLookup(None, rows=rows)
+    if len(base_ids) > 1:
+        return JobNameAccountingLookup(
+            None,
+            inconclusive=True,
+            rows=rows,
+            error="multiple jobs share expected name: " + repr(base_ids),
+        )
+    job_id = base_ids[0]
+    summary = aggregate_states(
+        job_id,
+        observations,
+        expected_task_count=expected_task_count,
+    )
+    if int(summary.n_unknown) > 0:
+        return JobNameAccountingLookup(
+            None,
+            inconclusive=True,
+            rows=rows,
+            error="sacct returned UNKNOWN rows for expected job name",
+        )
+    if int(summary.n_tasks) <= 0 or int(summary.n_observed) <= 0:
+        return JobNameAccountingLookup(
+            None,
+            inconclusive=True,
+            rows=rows,
+            error="sacct returned no usable rows for expected job name",
+        )
+    if int(summary.n_pending_or_running) > 0:
+        return JobNameAccountingLookup(
+            job_id,
+            terminal=False,
+            successful=False,
+            failed=False,
+            rows=rows,
+        )
+    if bool(summary.is_fully_successful):
+        return JobNameAccountingLookup(
+            job_id,
+            terminal=True,
+            successful=True,
+            failed=False,
+            rows=rows,
+        )
+    if bool(summary.is_terminal):
+        return JobNameAccountingLookup(
+            job_id,
+            terminal=True,
+            successful=False,
+            failed=True,
+            rows=rows,
+        )
+    return JobNameAccountingLookup(
+        None,
+        inconclusive=True,
+        rows=rows,
+        error="sacct rows are not conclusively active or terminal",
+    )
 
 
 def find_running_job_by_name_detailed(

@@ -80,6 +80,7 @@ __all__ = [
     "build_sbatch_script",
     "live_job_name",
     "make_live_job_finder",
+    "make_live_job_accounting_finder",
     "make_live_job_liveness_checker",
     "LIVE_POSTPROCESS_IMPLEMENTED",
 ]
@@ -2311,6 +2312,37 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     optional_diag_warnings
                 )
             landing_audit_records.append(audit_record)
+            if not bool(usability.get("usable", False)):
+                reason = str(usability.get("reason", "ariadne_result_unusable"))
+                audit_record["handoff_accepted"] = False
+                audit_record["handoff_rejection_reason"] = reason
+                rejected.append({
+                    "seed_index": seed_index,
+                    "seed_dir": str(seed_dir.resolve()),
+                    "result_json": str(result_path.resolve()),
+                    "reason": reason,
+                    "landing_safety": dict(landing_safety),
+                    "task_success": False,
+                    "task_success_reason": reason,
+                })
+                self._journal_event(
+                    "ariadne_task_rejected_unusable_result",
+                    phase=phase_name,
+                    iteration=int(state.iteration),
+                    seed_dir=seed_dir.name,
+                    result_json=str(result_path.resolve()),
+                    return_code=int(validated["return_code"]),
+                    reason=reason,
+                    policy=str(landing_safety.get("policy", "unknown")),
+                )
+                self._journal_event(
+                    "quantum_output_rejected",
+                    phase=phase_name,
+                    iteration=int(state.iteration),
+                    pointdir=seed_dir.name,
+                    reason=reason,
+                )
+                continue
             if not bool(landing_safety.get("accepted", False)):
                 reasons = landing_safety.get("reasons") or ["unsafe_landing"]
                 reason = ";".join(str(r) for r in reasons)
@@ -2917,6 +2949,47 @@ def make_live_job_finder(sacct_runner=None, squeue_runner=None):
         for name in names:
             found = find_running_job_by_name_detailed(
                 name,
+                sacct_runner=sacct_runner,
+                squeue_runner=squeue_runner,
+                use_squeue_fallback=use_squeue_fallback,
+            )
+            last_lookup = found
+            if found.job_id:
+                return found
+            if found.inconclusive and inconclusive is None:
+                inconclusive = found
+        return inconclusive if inconclusive is not None else last_lookup
+
+    return _finder
+
+
+def make_live_job_accounting_finder(sacct_runner=None, squeue_runner=None):
+    """Return a live-mode expected-job-name accounting lookup."""
+    from ..submit.sacct_poll import find_accounted_job_by_name_detailed
+
+    def _finder(state, phase, active_intent):
+        phase_name = phase.value if hasattr(phase, "value") else str(phase)
+        uid = getattr(state, "campaign_uid", None)
+        iteration = getattr(state, "iteration", 0)
+        expected_tasks = active_intent.get("expected_tasks")
+        names = [str(active_intent.get("expected_job_name") or "")]
+        live_name = live_job_name(uid, phase_name, iteration)
+        if live_name not in names:
+            names.append(live_name)
+        if uid:
+            legacy = str(uid)[:8] + "-" + str(phase_name) + "-" + str(int(iteration))
+            if legacy not in names:
+                names.append(legacy)
+        names = [name for name in names if name]
+        inconclusive = None
+        last_lookup = None
+        use_squeue_fallback = squeue_runner is not None or sacct_runner is None
+        for name in names:
+            found = find_accounted_job_by_name_detailed(
+                name,
+                expected_task_count=(
+                    None if expected_tasks is None else int(expected_tasks)
+                ),
                 sacct_runner=sacct_runner,
                 squeue_runner=squeue_runner,
                 use_squeue_fallback=use_squeue_fallback,

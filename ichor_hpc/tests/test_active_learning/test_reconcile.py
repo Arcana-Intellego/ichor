@@ -99,6 +99,38 @@ def test_propose_recovery_on_empty_campaign_returns_init(tmp_path):
     assert report.existing_state_loaded is False
 
 
+def test_propose_recovery_phase_a_sample_reenters_initial_gaussian(tmp_path):
+    from ichor.hpc.active_learning.handoff_manifests import write_phase_a_sample_manifest
+
+    campaign, _, _, _ = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    initial = campaign / "3_DIVERSITY_SAMPLING" / "initial"
+    initial.mkdir(parents=True)
+    sample = initial / "initial-SAMPLE-1.xyz"
+    index = initial / "initial-INDEX-1.dat"
+    sample.write_text("1\nframe 0\nH 0.0 0.0 0.0\n", encoding="utf-8")
+    index.write_text("0\n", encoding="utf-8")
+    write_phase_a_sample_manifest(initial, {
+        "phase": "PHASE_A_POLUS",
+        "iteration": -1,
+        "sample_xyz": str(sample.resolve()),
+        "index_path": str(index.resolve()),
+        "n_select": 1,
+        "n_frames": 1,
+        "selected_indices": [0],
+        "descriptor": "mass_weighted_rmsd",
+        "n_pool_frames": 1,
+    })
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.INITIAL_GAUSSIAN
+    assert report.proposed_state.training_set_version == -1
+    assert report.proposed_state.models_version == -1
+    assert report.phase_a_handoff is not None
+    assert "valid Phase A sample" in report.decision
+
+
 def test_propose_recovery_never_trusts_stop_check_without_committed_versions(tmp_path):
     campaign, data, _, _ = _campaign_dirs(tmp_path)
     _write_pool(campaign)

@@ -210,6 +210,40 @@ FUTURE_SAFE_EXACT = {
     "acquisition.allow_uniform_posterior_fallback",
 }
 
+ARIADNE_OUTPUT_INTERPRETATION_PREFIXES = {
+    "adversarial_safety.",
+    "ariadne.",
+    "acquisition.subspace.",
+    "acquisition.barrier.",
+    "acquisition.stencils.",
+    "acquisition.weights.",
+    "acquisition.spectral.",
+    "acquisition.calibrated_energy.",
+    "acquisition.fullspace_confinement.",
+    "acquisition.size_normalisation.",
+    "acquisition.movement_band.",
+    "acquisition.movement_utility.",
+    "acquisition.gradient.",
+    "acquisition.references.",
+    "acquisition.driver.",
+}
+ARIADNE_OUTPUT_INTERPRETATION_EXACT = {
+    "acquisition.use_scaled_posterior_covariance",
+    "acquisition.allow_uniform_posterior_fallback",
+    "quality_gates.ariadne_max_displacement_ang",
+    "quality_gates.ariadne_min_pair_distance_ang",
+    "max_acquisition_grad_per_ang",
+    "max_force_per_atom_ha_per_ang",
+}
+
+PHASE_B_OUTPUT_INTERPRETATION_PREFIXES = {
+    "anti_overlap.",
+    "phase_b.",
+}
+PHASE_B_OUTPUT_INTERPRETATION_EXACT = {
+    "adversarial_safety.phase_b_filter_enabled",
+}
+
 PHASE_LOCAL_EXACT = {
     "ferebus.warmstart",
     "ferebus.warmstart_streak",
@@ -280,6 +314,100 @@ def _committed_model_exists(campaign_dir: Union[str, Path], version: int) -> boo
     return int(version) in {int(v) for v in committed}
 
 
+def _phase_intent_exists(
+    campaign_dir: Union[str, Path],
+    phase: CampaignPhase,
+    iteration: int,
+) -> bool:
+    try:
+        from . import submission_intent as _submission_intent
+
+        path = _submission_intent.intent_path(campaign_dir, phase.value, int(iteration))
+        if not path.is_file():
+            return False
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return True
+        status = str(payload.get("status") or "")
+        return status not in {"SUPERSEDED", "FAILED"}
+    except Exception:
+        # A malformed intent is still evidence that this phase has begun.
+        return True
+
+
+def _iteration_dir(campaign_dir: Union[str, Path], iteration: int) -> Path:
+    return (
+        Path(campaign_dir)
+        / "7_ACTIVE_LEARNING"
+        / ("iteration-" + str(int(iteration)).zfill(4))
+    )
+
+
+def _ariadne_outputs_exist(campaign_dir: Union[str, Path], proposed_state: CampaignState) -> bool:
+    iteration = int(getattr(proposed_state, "iteration", 0))
+    iter_dir = _iteration_dir(campaign_dir, iteration)
+    if _phase_intent_exists(campaign_dir, CampaignPhase.ARIADNE_ARRAY, iteration):
+        return True
+    for name in (
+        "ARIADNE_RESULTS.json",
+        "ARIADNE_LANDING_AUDIT.json",
+        "ACQUISITION_MATURITY_AUDIT.json",
+        "ERROR_CALIBRATION_AUDIT.json",
+    ):
+        if (iter_dir / name).is_file():
+            return True
+    pool = iter_dir / "pool"
+    if pool.is_dir():
+        for result in pool.glob("seed_*/result.json"):
+            if result.is_file():
+                return True
+    return False
+
+
+def _phase_b_outputs_exist(campaign_dir: Union[str, Path], proposed_state: CampaignState) -> bool:
+    iteration = int(getattr(proposed_state, "iteration", 0))
+    iter_dir = _iteration_dir(campaign_dir, iteration)
+    if _phase_intent_exists(campaign_dir, CampaignPhase.PHASE_B_POLUS, iteration):
+        return True
+    for name in (
+        "PHASE_B_SELECTION.json",
+        "phase_b_SAMPLE.xyz",
+        "phase_b_SAMPLE_raw.xyz",
+        "phase_b_dedup.json",
+    ):
+        if (iter_dir / name).exists():
+            return True
+    return False
+
+
+def _blocks_existing_phase_outputs(
+    campaign_dir: Union[str, Path],
+    proposed_state: CampaignState,
+    path: str,
+) -> Optional[str]:
+    if (
+        _matches(
+            path,
+            ARIADNE_OUTPUT_INTERPRETATION_EXACT,
+            ARIADNE_OUTPUT_INTERPRETATION_PREFIXES,
+        )
+        and proposed_state.phase is CampaignPhase.ARIADNE_ARRAY
+        and _ariadne_outputs_exist(campaign_dir, proposed_state)
+    ):
+        return "field affects already-started ARIADNE outputs; discard or rerun the phase before changing it"
+    if (
+        _matches(
+            path,
+            PHASE_B_OUTPUT_INTERPRETATION_EXACT,
+            PHASE_B_OUTPUT_INTERPRETATION_PREFIXES,
+        )
+        and proposed_state.phase is CampaignPhase.PHASE_B_POLUS
+        and _phase_b_outputs_exist(campaign_dir, proposed_state)
+    ):
+        return "field affects already-started Phase B outputs; discard or rerun the phase before changing it"
+    return None
+
+
 def _phase_local_allowed(
     campaign_dir: Union[str, Path],
     path: str,
@@ -314,6 +442,16 @@ def _classify_change(
     if _matches(path, ALWAYS_SAFE_EXACT | ALWAYS_SAFE_RESOURCE_EXACT, ALWAYS_SAFE_PREFIXES):
         return ConfigChange(path, old, new, "always_safe", True, "safe runtime/diagnostic change")
     if _matches(path, FUTURE_SAFE_EXACT, FUTURE_SAFE_PREFIXES):
+        blocked_reason = _blocks_existing_phase_outputs(campaign_dir, proposed_state, path)
+        if blocked_reason:
+            return ConfigChange(
+                path,
+                old,
+                new,
+                "postprocess_locked",
+                False,
+                blocked_reason,
+            )
         return ConfigChange(path, old, new, "future_safe", True, "allowed for future phase execution")
     if path in PHASE_LOCAL_EXACT:
         allowed, reason = _phase_local_allowed(campaign_dir, path, proposed_state)
