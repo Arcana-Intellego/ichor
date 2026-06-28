@@ -28,6 +28,7 @@ __all__ = ["SeedSelection", "select_seeds"]
 
 
 VALID_STRATEGIES = frozenset({"hybrid_variance", "d_optimal"})
+RANKING_SCORE_QUANTISATION = 1.0e-12
 
 
 def _finite_variances(values, *, context: str) -> np.ndarray:
@@ -44,6 +45,62 @@ def _finite_matrix(values, *, context: str) -> np.ndarray:
     if not np.all(np.isfinite(arr)):
         raise ValueError(context + " contains non-finite posterior covariance")
     return arr
+
+
+def _quantised_descending_order(
+    scores,
+    indices,
+    *,
+    quantum: float = RANKING_SCORE_QUANTISATION,
+) -> np.ndarray:
+    """Deterministic descending score order with candidate-index tie-breaks."""
+    arr = _finite_variances(scores, context="seed ranking score")
+    idx = np.asarray(indices, dtype=int)
+    if arr.shape != idx.shape:
+        raise ValueError("seed ranking scores and indices length mismatch")
+    raw_order = np.lexsort((idx, -arr))
+    if float(quantum) <= 0.0 or raw_order.size <= 1:
+        return raw_order
+    grouped: List[int] = []
+    start = 0
+    while start < raw_order.size:
+        stop = start + 1
+        group_max = float(arr[int(raw_order[start])])
+        while (
+            stop < raw_order.size
+            and group_max - float(arr[int(raw_order[stop])]) <= float(quantum)
+        ):
+            stop += 1
+        group = list(raw_order[start:stop])
+        group.sort(key=lambda pos: int(idx[int(pos)]))
+        grouped.extend(int(pos) for pos in group)
+        start = stop
+    return np.asarray(grouped, dtype=int)
+
+
+def _quantised_tie_count(
+    scores,
+    *,
+    quantum: float = RANKING_SCORE_QUANTISATION,
+) -> int:
+    arr = _finite_variances(scores, context="seed ranking score")
+    if arr.size <= 1:
+        return 0
+    order = _quantised_descending_order(arr, np.arange(arr.size), quantum=0.0)
+    ties = 0
+    start = 0
+    while start < order.size:
+        stop = start + 1
+        group_max = float(arr[int(order[start])])
+        while (
+            stop < order.size
+            and group_max - float(arr[int(order[stop])]) <= float(quantum)
+        ):
+            stop += 1
+        if stop - start > 1:
+            ties += stop - start
+        start = stop
+    return int(ties)
 
 
 def _posterior_variances(posterior, points, *, chunk_size: Optional[int]):
@@ -128,7 +185,7 @@ def _d_optimal_select(
         len(remaining_indices),
         max(int(n_select), int(n_select) * int(pool_multiplier)),
     )
-    order = np.argsort(-remaining_scores, kind="stable")
+    order = _quantised_descending_order(remaining_scores, remaining_indices)
     pool_positions = [int(pos) for pos in order[:n_pool]]
     candidate_indices = [int(remaining_indices[pos]) for pos in pool_positions]
     candidate_vars = np.asarray(
@@ -204,8 +261,12 @@ def _d_optimal_select(
         if not np.any(np.isfinite(gains)):
             break
 
-        pick_order = np.lexsort((np.asarray(candidate_indices, dtype=int), -gains))
-        pick_pos = int(pick_order[0])
+        finite_positions = np.where(np.isfinite(gains))[0]
+        pick_order = _quantised_descending_order(
+            gains[finite_positions],
+            np.asarray(candidate_indices, dtype=int)[finite_positions],
+        )
+        pick_pos = int(finite_positions[int(pick_order[0])])
         pick_index = int(candidate_indices[pick_pos])
         pick_cov_to_selected = (
             np.array(k_xs[pick_pos, :], dtype=float)
@@ -458,6 +519,11 @@ def select_seeds(
                 "prefilter_pool_size": 0,
                 "skipped_unknown_provenance": int(skipped_unknown),
                 "d_optimal_bypassed_all_eligible_bulk": bool(strategy == "d_optimal"),
+                "ranking_tie_break_policy": "quantised_score_then_index",
+                "ranking_score_quantisation_abs": float(RANKING_SCORE_QUANTISATION),
+                "n_variance_score_ties_after_quantisation": int(
+                    _quantised_tie_count(variances)
+                ),
             },
         )
 
@@ -501,7 +567,7 @@ def select_seeds(
         remaining_scores = _finite_variances(transformed, context="seed ranking score")
     selection_diag_by_index: Dict[int, Dict[str, Any]] = {}
     if remaining:
-        order = np.argsort(-remaining_vars, kind="stable")
+        order = _quantised_descending_order(remaining_vars, remaining)
         if strategy == "hybrid_variance":
             variance_idx = [
                 remaining[int(order[k])]
@@ -579,6 +645,11 @@ def select_seeds(
         "n_bulk": int(len(bulk_idx)),
         "n_ranked": int(len(variance_idx)),
         "skipped_unknown_provenance": int(skipped_unknown),
+        "ranking_tie_break_policy": "quantised_score_then_index",
+        "ranking_score_quantisation_abs": float(RANKING_SCORE_QUANTISATION),
+        "n_variance_score_ties_after_quantisation": int(
+            _quantised_tie_count(remaining_scores if remaining else [])
+        ),
     }
     if strategy == "d_optimal":
         summary.update(dopt_summary)

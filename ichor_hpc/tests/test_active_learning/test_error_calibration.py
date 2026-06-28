@@ -138,6 +138,8 @@ def test_calibration_model_builds_monotone_bins_and_sparse_group_fallback():
     assert "global_total" in model["tables"]
     assert "atom_type:C" in model["tables"]
     assert "atom_type:H" not in model["tables"]
+    assert model["estimator"] == "pava_quantile_bins"
+    assert model["activation_reason"] == "record_only"
 
 
 def test_calibration_model_can_disable_monotone_quantile_bins():
@@ -160,6 +162,30 @@ def test_calibration_model_can_disable_monotone_quantile_bins():
     )
     assert model["tables"]["global"]["monotone"] is False
     assert model["tables"]["global"]["quantile"] == pytest.approx(0.5)
+    assert model["tables"]["global"]["estimator"] == "raw_quantile_bins"
+
+
+def test_calibration_monotone_estimator_uses_weighted_pava_not_running_max():
+    cfg = CampaignConfig()
+    cfg.error_calibration.n_bins = 3
+    cfg.error_calibration.min_bin_records = 1
+    cfg.error_calibration.quantile = 0.5
+    records = [
+        _record(0, raw=1.0, err=0.003),
+        _record(1, raw=2.0, err=0.001),
+        _record(2, raw=3.0, err=0.002),
+    ]
+
+    model = build_calibration_model(records, cfg, iteration=1)
+
+    bins = model["tables"]["global"]["bins"]
+    assert model["tables"]["global"]["estimator"] == "pava_quantile_bins"
+    assert [b["raw_calibrated_abs_error_ha"] for b in bins] == pytest.approx(
+        [0.003, 0.001, 0.002]
+    )
+    assert [b["calibrated_abs_error_ha"] for b in bins] == pytest.approx(
+        [0.002, 0.002, 0.002]
+    )
 
 
 def test_calibration_model_uses_recent_records_only_by_default():
@@ -239,6 +265,8 @@ def test_load_calibration_model_for_acquisition_requires_apply_mode_and_records(
     loaded, reason = load_calibration_model_for_acquisition(tmp_path, cfg)
     assert reason == "loaded"
     assert loaded["usable_for_acquisition"] is True
+    assert loaded["activation_reason"] == "usable"
+    assert loaded["activation_blockers"] == []
 
 
 def test_stale_calibration_model_is_not_loaded_for_acquisition(tmp_path):

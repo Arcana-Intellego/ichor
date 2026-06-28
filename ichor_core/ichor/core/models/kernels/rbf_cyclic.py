@@ -11,7 +11,7 @@ class RBFCyclic(Kernel):
     # normalized, etc. because this kernel is affected by data preprocessing
 
     r"""
-    Implemtation of Radial Basis Function (RBF) kernel with cyclic feature correction for phi angle feature
+    Implementation of Radial Basis Function (RBF) kernel with cyclic feature correction for phi angle feature
 
     .. note::
         Cyclic correction is applied only for our phi angles (phi is the azimuthal angle measured in the xy plane).
@@ -67,10 +67,20 @@ class RBFCyclic(Kernel):
 
     @cached_property
     def mask(self):
-        return np.arange(2, len(self._thetas), 3)
+        active_dims = np.asarray(self.active_dims, dtype=int).reshape(-1)
+        if active_dims.shape[0] != len(self._thetas):
+            active_dims = np.arange(len(self._thetas), dtype=int)
+        return np.asarray(
+            [
+                local_idx
+                for local_idx, feature_idx in enumerate(active_dims)
+                if ((int(feature_idx) + 1) % 3) == 0 and int(feature_idx) != 2
+            ],
+            dtype=int,
+        )
 
     def k(self, x1: np.ndarray, x2: np.ndarray) -> np.ndarray:
-        """Calcualtes cyclic RBF covariance matrix from two sets of points
+        """Calculates cyclic RBF covariance matrix from two sets of points
 
         Args:
             :param: `x1` np.ndarray of shape n x ndimensions:

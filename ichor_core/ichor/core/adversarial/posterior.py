@@ -66,6 +66,25 @@ def _check_kernel_active_dims(model, nfeats: int, label: str) -> None:
 
 
 def _estimated_signal_variance(model) -> float:
+    y_raw = getattr(model, "y")
+    x_raw = getattr(model, "x")
+    chol_raw = getattr(model, "lower_cholesky")
+    cache_key = (
+        id(y_raw),
+        np.asarray(y_raw).shape,
+        id(x_raw),
+        np.asarray(x_raw).shape,
+        id(chol_raw),
+        np.asarray(chol_raw).shape,
+        int(getattr(model, "ntrain", 0)),
+    )
+    cached = getattr(model, "_ichor_al_signal_variance_cache", None)
+    if (
+        isinstance(cached, tuple)
+        and len(cached) == 2
+        and cached[0] == cache_key
+    ):
+        return float(cached[1])
     y = _check_finite_array(model.y, "model.y").reshape((-1, 1))
     x = _check_finite_array(model.x, "model.x")
     mean = _check_finite_array(model.mean.value(x), "model mean").reshape((-1, 1))
@@ -73,7 +92,11 @@ def _estimated_signal_variance(model) -> float:
     whitened = np.linalg.solve(model.lower_cholesky, resid)
     tau2 = float((whitened.T @ whitened).reshape(-1)[0] / max(model.ntrain, 1))
     if not np.isfinite(tau2) or tau2 <= 0.0:
-        return 1.0
+        tau2 = 1.0
+    try:
+        setattr(model, "_ichor_al_signal_variance_cache", (cache_key, float(tau2)))
+    except Exception:
+        pass
     return tau2
 
 

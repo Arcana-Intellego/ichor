@@ -106,6 +106,23 @@ def test_bulk_fraction_zero_pure_variance():
     assert out.variance_indices == [19, 18, 17, 16, 15]
 
 
+def test_variance_near_ties_are_quantised_then_broken_by_index():
+    atoms = [object() for _ in range(4)]
+    values = [
+        1.0,
+        2.0 + 3.0e-13,
+        2.0 + 4.0e-13,
+        0.5,
+    ]
+    posterior = _BatchedPosterior({id(a): v for a, v in zip(atoms, values)})
+
+    out = select_seeds(atoms, posterior, n_seeds=2, bulk_fraction=0.0)
+
+    assert out.variance_indices == [1, 2]
+    assert out.diagnostics["ranking_tie_break_policy"] == "quantised_score_then_index"
+    assert out.diagnostics["n_variance_score_ties_after_quantisation"] >= 2
+
+
 def test_bulk_fraction_one_pure_random():
     atoms, posterior, _ = _atoms_with_indexed_variances(20)
     out = select_seeds(atoms, posterior, n_seeds=5, bulk_fraction=1.0, rng_seed=0)
@@ -362,6 +379,24 @@ def test_d_optimal_ties_prefer_lowest_candidate_index():
 
     assert out.indices == [0, 1]
     assert out.selection_origins == ["d_optimal", "d_optimal"]
+
+
+def test_d_optimal_prefilter_near_ties_are_broken_by_index():
+    atoms = [object() for _ in range(4)]
+    cov = np.diag([1.0, 2.0 + 3.0e-13, 2.0 + 4.0e-13, 0.5])
+    posterior = _CovariancePosterior(atoms, cov)
+
+    out = select_seeds(
+        atoms,
+        posterior,
+        n_seeds=2,
+        bulk_fraction=0.0,
+        strategy="d_optimal",
+        d_optimal_pool_multiplier=4,
+    )
+
+    assert out.indices[:2] == [1, 2]
+    assert out.diagnostics["ranking_tie_break_policy"] == "quantised_score_then_index"
 
 
 def test_d_optimal_skips_degenerate_zero_pivot_candidate():

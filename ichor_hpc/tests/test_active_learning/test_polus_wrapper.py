@@ -67,6 +67,21 @@ def test_fps_select_seed_default_is_centroid():
     assert out.indices[0] == 2
 
 
+def test_fps_select_default_seed_near_ties_prefer_lowest_index():
+    D = np.array(
+        [
+            [0.0, 1.0, 2.0],
+            [1.0, 0.0, 2.0 - 3.0e-13],
+            [2.0, 2.0 - 3.0e-13, 0.0],
+        ],
+        dtype=float,
+    )
+
+    out = fps_select(D, 2)
+
+    assert out.indices[0] == 0
+
+
 def test_fps_select_diversities_monotone_non_increasing():
     rng = np.random.default_rng(0)
     n = 30

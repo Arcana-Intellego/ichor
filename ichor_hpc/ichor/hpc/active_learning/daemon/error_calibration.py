@@ -189,6 +189,39 @@ def _percentile(sorted_values: Sequence[float], q: float) -> float:
     return float((1.0 - frac) * sorted_values[lo] + frac * sorted_values[hi])
 
 
+def _pava_non_decreasing(values: Sequence[float], weights: Sequence[int]) -> List[float]:
+    """Weighted pool-adjacent-violators fit for monotone calibration bins."""
+    if len(values) != len(weights):
+        raise ValueError("PAVA values and weights length mismatch")
+    blocks: List[Dict[str, float]] = []
+    for idx, (value, weight) in enumerate(zip(values, weights)):
+        w = max(float(weight), 1.0)
+        blocks.append({
+            "start": float(idx),
+            "end": float(idx),
+            "weight": w,
+            "value": float(value),
+        })
+        while len(blocks) >= 2 and blocks[-2]["value"] > blocks[-1]["value"]:
+            right = blocks.pop()
+            left = blocks.pop()
+            total_weight = left["weight"] + right["weight"]
+            pooled = (
+                left["value"] * left["weight"] + right["value"] * right["weight"]
+            ) / total_weight
+            blocks.append({
+                "start": left["start"],
+                "end": right["end"],
+                "weight": total_weight,
+                "value": float(pooled),
+            })
+    fitted = [0.0] * len(values)
+    for block in blocks:
+        for idx in range(int(block["start"]), int(block["end"]) + 1):
+            fitted[idx] = float(block["value"])
+    return fitted
+
+
 def _make_table(
     records: Sequence[Mapping[str, Any]],
     *,
@@ -212,7 +245,8 @@ def _make_table(
     if not usable:
         bin_count = 1
     bins = []
-    running = 0.0
+    calibrated_values: List[float] = []
+    bin_weights: List[int] = []
     q = min(1.0, max(1.0e-12, float(quantile)))
     for idx in range(bin_count):
         start = int(round(idx * len(pairs) / bin_count))
@@ -222,7 +256,8 @@ def _make_table(
         errs = sorted(p[1] for p in chunk)
         med = float(median(errs))
         calibrated = float(_percentile(errs, q))
-        running = max(running, calibrated) if bool(monotone) else calibrated
+        calibrated_values.append(calibrated)
+        bin_weights.append(int(len(chunk)))
         bins.append(
             {
                 "raw_uncertainty_min": float(min(raws)),
@@ -232,13 +267,22 @@ def _make_table(
                 "median_abs_error_ha": med,
                 "q90_abs_error_ha": _percentile(errs, 0.90),
                 "calibration_quantile": float(q),
-                "calibrated_abs_error_ha": float(running),
+                "calibrated_abs_error_ha": float(calibrated),
             }
         )
+    if bool(monotone) and bins:
+        fitted = _pava_non_decreasing(calibrated_values, bin_weights)
+        for entry, value in zip(bins, fitted):
+            entry["raw_calibrated_abs_error_ha"] = float(
+                entry["calibrated_abs_error_ha"]
+            )
+            entry["calibrated_abs_error_ha"] = float(value)
     return {
         "n_records": int(len(pairs)),
         "usable": bool(usable),
         "monotone": bool(monotone),
+        "estimator": "pava_quantile_bins" if bool(monotone) else "raw_quantile_bins",
+        "pava_applied": bool(monotone and bins),
         "quantile": float(q),
         "bins": bins,
     }
@@ -372,6 +416,19 @@ def build_calibration_model(
     group_by_landing_policy = bool(_cfg_value(block, "group_by_landing_policy", False))
     model_version_policy = str(_cfg_value(block, "model_version_policy", "current"))
 
+    current_version = (
+        current_model_version
+        if current_model_version is not None
+        else _current_model_version(records)
+    )
+    n_records_by_model_version: Dict[str, int] = {}
+    for record in records:
+        try:
+            key = str(int(record.get("model_version")))
+        except (TypeError, ValueError):
+            key = "unknown"
+        n_records_by_model_version[key] = n_records_by_model_version.get(key, 0) + 1
+
     candidate_records = _filter_records_by_model_version(
         records,
         policy=model_version_policy,
@@ -382,6 +439,14 @@ def build_calibration_model(
         iteration=int(iteration),
         max_age_iterations=max_model_age_iterations,
     )
+    n_records_by_iteration: Dict[str, int] = {}
+    for record in candidate_records:
+        try:
+            key = str(int(record.get("iteration")))
+        except (TypeError, ValueError):
+            key = "unknown"
+        n_records_by_iteration[key] = n_records_by_iteration.get(key, 0) + 1
+
     finite_records = [
         dict(r)
         for r in candidate_records
@@ -435,36 +500,49 @@ def build_calibration_model(
     errors = sorted(float(r["abs_error_ha"]) for r in (total_records or finite_records))
     reference_error = max(_percentile(errors, 0.50), 1.0e-12) if errors else 1.0
     global_usable = bool(tables["global_total"].get("usable"))
-    usable_for_acquisition = (
-        bool(_enabled(config))
-        and str(_cfg_value(block, "mode", "record_only")) == "apply_to_acquisition"
-        and float(_cfg_value(block, "apply_strength", 0.0)) > 0.0
-        and len(total_records) >= min_records_to_apply
-        and global_usable
-    )
+    activation_blockers: List[str] = []
+    mode = str(_cfg_value(block, "mode", "record_only"))
+    apply_strength = float(_cfg_value(block, "apply_strength", 0.0))
+    if not bool(_enabled(config)):
+        activation_blockers.append("disabled")
+    if mode != "apply_to_acquisition":
+        activation_blockers.append("record_only")
+    if apply_strength <= 0.0:
+        activation_blockers.append("zero_apply_strength")
+    if len(total_records) < min_records_to_apply:
+        activation_blockers.append("not_enough_total_records")
+    if not global_usable:
+        activation_blockers.append("global_total_unusable")
+    usable_for_acquisition = not activation_blockers
+    activation_reason = "usable" if usable_for_acquisition else activation_blockers[0]
     return {
         "schema_version": ERROR_CALIBRATION_SCHEMA_VERSION,
         "iteration": int(iteration),
         "n_records": int(len(finite_records)),
         "n_total_error_records": int(len(total_records)),
         "n_total_records": int(len(records)),
+        "n_records_by_model_version": n_records_by_model_version,
+        "n_records_by_iteration_window": n_records_by_iteration,
         "model_version_policy": str(model_version_policy),
         "current_model_version": (
             None
-            if (current_model_version if current_model_version is not None else _current_model_version(records)) is None
-            else int(current_model_version if current_model_version is not None else _current_model_version(records))
+            if current_version is None
+            else int(current_version)
         ),
         "n_bins": int(n_bins),
         "min_bin_records": int(min_bin_records),
         "min_records_to_apply": int(min_records_to_apply),
         "max_model_age_iterations": int(max_model_age_iterations),
         "monotone_estimator": bool(monotone_estimator),
+        "estimator": "pava_quantile_bins" if monotone_estimator else "raw_quantile_bins",
         "quantile": float(quantile),
         "reference_error_ha": float(reference_error),
         "group_by_atom_type": bool(group_by_atom_type),
         "group_by_landing_policy": bool(group_by_landing_policy),
         "output_units": "ha",
         "usable_for_acquisition": bool(usable_for_acquisition),
+        "activation_reason": str(activation_reason),
+        "activation_blockers": activation_blockers,
         "tables": tables,
     }
 

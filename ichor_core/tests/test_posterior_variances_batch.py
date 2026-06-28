@@ -46,7 +46,11 @@ class _DiagOnlyKernel(_Kernel):
 
 
 class _Mean:
+    def __init__(self):
+        self.calls = 0
+
     def value(self, x):
+        self.calls += 1
         return np.zeros((np.atleast_2d(np.asarray(x, dtype=float)).shape[0], 1))
 
 
@@ -209,6 +213,23 @@ def test_variances_use_kernel_diagonal_without_full_candidate_block():
     assert np.all(np.isfinite(values))
     assert all(model.kernel.k_diag_calls >= 1 for model in models)
     assert all(model.kernel.full_test_kernel_calls == 0 for model in models)
+
+
+def test_scaled_signal_variance_is_cached_per_model_fit():
+    post, rng = _make_posterior(scaled=True)
+    pts = _points(rng, 4)
+
+    post.variances(pts)
+    first_calls = [model.mean.calls for model in post._property_models.values()]
+    post.variances(pts)
+    second_calls = [model.mean.calls for model in post._property_models.values()]
+
+    assert first_calls == [1, 1, 1]
+    assert second_calls == first_calls
+    assert all(
+        hasattr(model, "_ichor_al_signal_variance_cache")
+        for model in post._property_models.values()
+    )
 
 
 def test_variances_reject_kernel_active_dims_out_of_range():

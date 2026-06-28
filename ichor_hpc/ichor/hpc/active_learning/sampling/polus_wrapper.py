@@ -43,6 +43,7 @@ __all__ = [
 DEFAULT_DESCRIPTORS = {
     "rmsd_massweight": MassWeightedRMSDDescriptor,
 }
+FPS_TIE_QUANTISATION = 1.0e-12
 
 
 
@@ -85,7 +86,8 @@ def fps_select(
 
     if seed_index is None:
         row_sums = D.sum(axis=1)
-        seed = int(np.argmin(row_sums))
+        ranked = np.round(row_sums / FPS_TIE_QUANTISATION) * FPS_TIE_QUANTISATION
+        seed = int(np.lexsort((np.arange(n, dtype=int), ranked))[0])
     else:
         if not 0 <= int(seed_index) < n:
             raise ValueError(f"seed_index {seed_index} out of range")
