@@ -659,7 +659,7 @@ def test_cli_stop_cancel_jobs_cancels_pending_job_and_clears_state(
     assert "Cancelled Slurm jobs" in out
 
 
-def test_cli_stop_cancel_jobs_cancels_ferebus_intent_with_external_job_name(
+def test_cli_stop_cancel_jobs_cancels_ferebus_intent_with_expected_job_name(
     tmp_path,
     monkeypatch,
 ):
@@ -681,6 +681,11 @@ def test_cli_stop_cancel_jobs_cancels_ferebus_intent_with_external_job_name(
         "456",
         expected_tasks=12,
     )
+    expected_name = live_job_name(
+        state.campaign_uid,
+        CampaignPhase.INITIAL_FEREBUS.value,
+        0,
+    )
     cancelled = []
     monkeypatch.setattr(
         cli_mod,
@@ -688,7 +693,7 @@ def test_cli_stop_cancel_jobs_cancels_ferebus_intent_with_external_job_name(
         lambda job_id: {
             "active": True,
             "inconclusive": False,
-            "rows": [{"job_id": str(job_id), "state": "PENDING", "job_name": "ferebus-light"}],
+            "rows": [{"job_id": str(job_id), "state": "PENDING", "job_name": expected_name}],
             "error": None,
         },
     )
@@ -771,6 +776,7 @@ def test_cli_stop_cancel_jobs_uses_intents_when_state_corrupt(
         iteration=0,
     )
     submission_intent.mark_submitted(campaign, phase, 0, "1001")
+    expected_name = live_job_name("uid123456789", phase, 0)
     cancelled = []
     monkeypatch.setattr(
         cli_mod,
@@ -778,7 +784,7 @@ def test_cli_stop_cancel_jobs_uses_intents_when_state_corrupt(
         lambda job_id: {
             "active": True,
             "inconclusive": False,
-            "rows": [{"job_id": str(job_id), "state": "RUNNING", "job_name": "external-ferebus"}],
+            "rows": [{"job_id": str(job_id), "state": "RUNNING", "job_name": expected_name}],
             "error": None,
         },
     )

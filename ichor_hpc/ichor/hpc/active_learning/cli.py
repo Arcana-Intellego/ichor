@@ -1381,7 +1381,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     return d.run(max_ticks=args.max_ticks, catch_keyboard_interrupt=True)
 
 
-_FEREBUS_JOB_NAME_EXTERNAL_PHASES = frozenset({"INITIAL_FEREBUS", "FEREBUS"})
+_FEREBUS_JOB_NAME_EXTERNAL_PHASES = frozenset()
 
 
 def _load_active_submission_intents(campaign: Path) -> List[Dict[str, Any]]:
@@ -2066,8 +2066,10 @@ def _resolve_terminal_submission_intents_for_apply(
 
     This is intentionally fail-closed.  ``reconcile --apply`` may clear a stale
     active intent only when ``squeue`` no longer sees the job and ``sacct``
-    reports terminal rows for the recorded JobID.  Missing scheduler data keeps
-    the intent blocking so an operator cannot accidentally duplicate a live job.
+    reports terminal failure for the recorded JobID, or for the expected job
+    name in the PRE_SUBMIT crash window where the JobID was never persisted.
+    Missing scheduler data keeps the intent blocking so an operator cannot
+    accidentally duplicate a live job.
     """
     from .daemon.journal import append_event
     from .submit import sacct_poll
@@ -2091,16 +2093,6 @@ def _resolve_terminal_submission_intents_for_apply(
             continue
         if not job_id:
             if status == "PRE_SUBMIT":
-                if phase in _FEREBUS_JOB_NAME_EXTERNAL_PHASES:
-                    blocking.append({
-                        "phase": phase,
-                        "iteration": iteration,
-                        "job_id": job_id,
-                        "expected_job_name": expected_job_name,
-                        "reason": "FEREBUS PRE_SUBMIT intent has no job_id; "
-                        "job name is external, inspect scheduler manually",
-                    })
-                    continue
                 if not expected_job_name:
                     blocking.append({
                         "phase": phase,
@@ -2110,8 +2102,18 @@ def _resolve_terminal_submission_intents_for_apply(
                         "reason": "PRE_SUBMIT intent has no expected job name",
                     })
                     continue
-                lookup = sacct_poll.find_running_job_by_name_detailed(
+                raw_expected_tasks = intent.get("expected_tasks")
+                try:
+                    expected_tasks = (
+                        int(raw_expected_tasks)
+                        if raw_expected_tasks is not None
+                        else None
+                    )
+                except (TypeError, ValueError):
+                    expected_tasks = None
+                lookup = sacct_poll.find_accounted_job_by_name_detailed(
                     expected_job_name,
+                    expected_task_count=expected_tasks,
                     use_squeue_fallback=True,
                 )
                 if lookup.inconclusive:
@@ -2124,7 +2126,7 @@ def _resolve_terminal_submission_intents_for_apply(
                         + str(lookup.error or "unknown error"),
                     })
                     continue
-                if lookup.job_id:
+                if lookup.job_id and not bool(lookup.terminal):
                     blocking.append({
                         "phase": phase,
                         "iteration": iteration,
@@ -2132,6 +2134,42 @@ def _resolve_terminal_submission_intents_for_apply(
                         "expected_job_name": expected_job_name,
                         "reason": "matching scheduler job exists but no job_id "
                         "was persisted in the intent",
+                    })
+                    continue
+                if lookup.job_id and bool(lookup.successful):
+                    blocking.append({
+                        "phase": phase,
+                        "iteration": iteration,
+                        "job_id": str(lookup.job_id),
+                        "expected_job_name": expected_job_name,
+                        "reason": "matching scheduler job completed successfully "
+                        "but no job_id was persisted in the intent; "
+                        "postprocess/operator review is required",
+                    })
+                    continue
+                if lookup.job_id and bool(lookup.failed):
+                    terminal_state = "FAILED"
+                    for _row_job_id, row_state in list(lookup.rows):
+                        if row_state and row_state != "COMPLETED":
+                            terminal_state = str(row_state)
+                            break
+                    terminal_candidates.append({
+                        "phase": phase,
+                        "iteration": iteration,
+                        "job_id": str(lookup.job_id),
+                        "expected_job_name": expected_job_name,
+                        "terminal_state": terminal_state,
+                        "n_sacct_rows": len(lookup.rows),
+                    })
+                    continue
+                if lookup.job_id and bool(lookup.terminal):
+                    blocking.append({
+                        "phase": phase,
+                        "iteration": iteration,
+                        "job_id": str(lookup.job_id),
+                        "expected_job_name": expected_job_name,
+                        "reason": "matching scheduler job is terminal but not "
+                        "conclusively failed or successful; operator review is required",
                     })
                     continue
                 age = _intent_age_seconds(intent)

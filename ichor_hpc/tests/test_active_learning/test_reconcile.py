@@ -282,6 +282,36 @@ def test_propose_recovery_archived_initial_aimall_handoff_reenters_initial_fereb
     assert "valid initial AIMAll handoff" in report.decision
 
 
+def test_propose_recovery_bootstrap_training_only_reenters_initial_ferebus(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(reconcile_mod, "verify_committed_training_version", lambda *a, **k: None)
+    monkeypatch.setattr(
+        recovery_contracts_mod,
+        "verify_committed_training_version",
+        lambda *a, **k: None,
+    )
+    campaign, data, training, _ = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    tv = TrainingSetVersioning(training)
+    staged = tv.stage(None, 0)
+    (staged / "marker.txt").write_text("training", encoding="utf-8")
+    tv.commit(0)
+    state = fresh_campaign_state(max_iterations=50)
+    state.phase = CampaignPhase.HALTED
+    state.iteration = 0
+    state.training_set_version = 0
+    state.models_version = -1
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.INITIAL_FEREBUS
+    assert report.proposed_state.iteration == 0
+    assert "committed bootstrap training exists without model version 0" in report.decision
+
+
 def test_propose_recovery_missing_state_nonempty_staging_halts(tmp_path):
     campaign, _, _, _ = _campaign_dirs(tmp_path)
     staging = campaign / ".DATA" / "STAGING" / "iter_0"
@@ -300,6 +330,21 @@ def test_stateful_campaign_artifacts_include_config_lock(tmp_path):
     findings = stateful_campaign_artifacts(campaign)
 
     assert ".DATA/ACTIVE_LEARNING/config_lock.json" in findings
+
+
+def test_stateful_campaign_artifacts_include_phase_a_outputs(tmp_path):
+    campaign, _, _, _ = _campaign_dirs(tmp_path)
+    phase_a = campaign / "3_DIVERSITY_SAMPLING" / "initial"
+    phase_a.mkdir(parents=True)
+    (phase_a / "PHASE_A_SAMPLE.json").write_text("{}", encoding="utf-8")
+    (phase_a / "initial-SAMPLE-2.xyz").write_text("sample\n", encoding="utf-8")
+    (phase_a / "initial-INDEX-2.dat").write_text("0\n", encoding="utf-8")
+
+    findings = stateful_campaign_artifacts(campaign)
+
+    assert "3_DIVERSITY_SAMPLING/initial/PHASE_A_SAMPLE.json" in findings
+    assert "3_DIVERSITY_SAMPLING/initial/initial-SAMPLE-2.xyz" in findings
+    assert "3_DIVERSITY_SAMPLING/initial/initial-INDEX-2.dat" in findings
 
 
 def test_propose_recovery_active_submission_intent_is_adoption_ready(tmp_path):

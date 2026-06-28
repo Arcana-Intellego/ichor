@@ -104,6 +104,40 @@ def _require_initial_quantum(campaign: Path, phase: CampaignPhase, iteration: in
     )
 
 
+def _require_initial_ferebus_input(
+    campaign: Path,
+    iteration: int,
+    training_version: int,
+    model_version: int,
+) -> None:
+    try:
+        _require_initial_quantum(
+            campaign,
+            CampaignPhase.INITIAL_AIMALL,
+            int(iteration),
+        )
+        return
+    except Exception as handoff_error:
+        if int(training_version) == 0 and int(model_version) < 0:
+            try:
+                _require_training_version(campaign, 0)
+                return
+            except Exception as training_error:
+                raise RecoveryContractError(
+                    "INITIAL_FEREBUS requires either a valid initial AIMAll "
+                    "handoff or committed bootstrap training version 0; "
+                    "initial handoff error: "
+                    + type(handoff_error).__name__
+                    + ": "
+                    + str(handoff_error)[:120]
+                    + "; training error: "
+                    + type(training_error).__name__
+                    + ": "
+                    + str(training_error)[:120]
+                ) from training_error
+        raise
+
+
 def _require_iter_quantum(campaign: Path, phase: CampaignPhase, iteration: int) -> None:
     _stg.read_quantum_acceptance_manifest(
         campaign / ".DATA" / "STAGING" / ("iter_" + str(int(iteration))),
@@ -337,6 +371,15 @@ def select_recovery_phase(
     if protected is not None:
         return protected
 
+    if training_version == 0 and model_version < 0:
+        if _has_version(valid_training_versions, 0):
+            return RecoveryDecision(
+                CampaignPhase.INITIAL_FEREBUS,
+                0,
+                "INITIAL_FEREBUS: committed bootstrap training exists without model version 0",
+                "5_TRAINING/iteration-0000",
+            )
+
     if training_version == model_version and training_version >= 1:
         canonical_iteration = _active_iteration_for_training_version(training_version)
         if iteration != canonical_iteration and active_iteration_committed(
@@ -433,10 +476,11 @@ def phase_recovery_contract_error(
             CampaignPhase.INITIAL_GAUSSIAN,
             iteration,
         ),
-        CampaignPhase.INITIAL_FEREBUS: lambda: _require_initial_quantum(
+        CampaignPhase.INITIAL_FEREBUS: lambda: _require_initial_ferebus_input(
             campaign,
-            CampaignPhase.INITIAL_AIMALL,
             iteration,
+            training_version,
+            model_version,
         ),
         CampaignPhase.SEED_SELECT: lambda: (
             _require_training_version(campaign, training_version),

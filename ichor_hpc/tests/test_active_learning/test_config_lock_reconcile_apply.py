@@ -1289,8 +1289,12 @@ def test_reconcile_apply_supersedes_stale_pre_submit_without_job_id(
 
     monkeypatch.setattr(
         sacct_poll,
-        "find_running_job_by_name_detailed",
-        lambda name, **kwargs: sacct_poll.JobNameLookup(None, inconclusive=False, rows=[]),
+        "find_accounted_job_by_name_detailed",
+        lambda name, **kwargs: sacct_poll.JobNameAccountingLookup(
+            None,
+            inconclusive=False,
+            rows=[],
+        ),
     )
 
     rc = cmd_reconcile(
@@ -1309,7 +1313,7 @@ def test_reconcile_apply_supersedes_stale_pre_submit_without_job_id(
     assert intent["reason"] == "reconcile_apply_pre_submit_no_job_id"
 
 
-def test_reconcile_apply_blocks_ferebus_pre_submit_without_job_id(
+def test_reconcile_apply_uses_job_name_accounting_for_ferebus_pre_submit_without_job_id(
     tmp_path,
     capsys,
     monkeypatch,
@@ -1324,10 +1328,63 @@ def test_reconcile_apply_blocks_ferebus_pre_submit_without_job_id(
     phase = CampaignPhase.INITIAL_FEREBUS.value
     _write_stale_pre_submit_intent(campaign, phase)
 
-    def fail_lookup(name, **kwargs):
-        raise AssertionError("FEREBUS PRE_SUBMIT must not use ICHOR job-name lookup")
+    def fail_running_lookup(name, **kwargs):
+        raise AssertionError("PRE_SUBMIT recovery must use accounting lookup")
 
-    monkeypatch.setattr(sacct_poll, "find_running_job_by_name_detailed", fail_lookup)
+    monkeypatch.setattr(sacct_poll, "find_running_job_by_name_detailed", fail_running_lookup)
+    monkeypatch.setattr(
+        sacct_poll,
+        "find_accounted_job_by_name_detailed",
+        lambda name, **kwargs: sacct_poll.JobNameAccountingLookup(
+            None,
+            inconclusive=False,
+            rows=[],
+        ),
+    )
+
+    rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            allow_fresh_init=False,
+            apply=True,
+        )
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "Resolved terminal submission intents" in out
+    intent = submission_intent.load_intent(campaign, phase, 0)
+    assert intent["status"] == "SUPERSEDED"
+    assert intent["reason"] == "reconcile_apply_pre_submit_no_job_id"
+
+
+def test_reconcile_apply_blocks_pre_submit_without_job_id_when_accounting_completed(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign(tmp_path)
+    _commit_training_version(campaign, 0)
+    _write_halted_pre_ferebus_state(campaign)
+    config = CampaignConfig()
+    config.runtime.lease_stale_seconds = 10
+    write_config_lock(campaign, config)
+    _write_config(campaign, config)
+    phase = CampaignPhase.GAUSSIAN.value
+    _write_stale_pre_submit_intent(campaign, phase)
+
+    monkeypatch.setattr(
+        sacct_poll,
+        "find_accounted_job_by_name_detailed",
+        lambda name, **kwargs: sacct_poll.JobNameAccountingLookup(
+            "222",
+            terminal=True,
+            successful=True,
+            failed=False,
+            inconclusive=False,
+            rows=[("222", "COMPLETED")],
+        ),
+    )
 
     rc = cmd_reconcile(
         argparse.Namespace(
@@ -1339,10 +1396,53 @@ def test_reconcile_apply_blocks_ferebus_pre_submit_without_job_id(
     err = capsys.readouterr().err
 
     assert rc == 9
-    assert "FEREBUS PRE_SUBMIT intent has no job_id" in err
-    assert "inspect scheduler manually" in err
+    assert "postprocess/operator review is required" in err
     intent = submission_intent.load_intent(campaign, phase, 0)
     assert intent["status"] == "PRE_SUBMIT"
+
+
+def test_reconcile_apply_marks_failed_pre_submit_without_job_id_from_accounting(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign(tmp_path)
+    _commit_training_version(campaign, 0)
+    _write_halted_pre_ferebus_state(campaign)
+    config = CampaignConfig()
+    config.runtime.lease_stale_seconds = 10
+    write_config_lock(campaign, config)
+    _write_config(campaign, config)
+    phase = CampaignPhase.GAUSSIAN.value
+    _write_stale_pre_submit_intent(campaign, phase)
+
+    monkeypatch.setattr(
+        sacct_poll,
+        "find_accounted_job_by_name_detailed",
+        lambda name, **kwargs: sacct_poll.JobNameAccountingLookup(
+            "222",
+            terminal=True,
+            successful=False,
+            failed=True,
+            inconclusive=False,
+            rows=[("222", "FAILED")],
+        ),
+    )
+
+    rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            allow_fresh_init=False,
+            apply=True,
+        )
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "Resolved terminal submission intents" in out
+    intent = submission_intent.load_intent(campaign, phase, 0)
+    assert intent["status"] == "FAILED"
+    assert intent["reason"] == "reconcile_apply_terminal_job:FAILED"
 
 
 def test_reconcile_apply_blocks_pre_submit_without_job_id_when_job_exists(
@@ -1362,9 +1462,10 @@ def test_reconcile_apply_blocks_pre_submit_without_job_id_when_job_exists(
 
     monkeypatch.setattr(
         sacct_poll,
-        "find_running_job_by_name_detailed",
-        lambda name, **kwargs: sacct_poll.JobNameLookup(
+        "find_accounted_job_by_name_detailed",
+        lambda name, **kwargs: sacct_poll.JobNameAccountingLookup(
             "222",
+            terminal=False,
             inconclusive=False,
             rows=[("222", "RUNNING")],
         ),
@@ -1403,8 +1504,8 @@ def test_reconcile_apply_blocks_pre_submit_without_job_id_on_lookup_failure(
 
     monkeypatch.setattr(
         sacct_poll,
-        "find_running_job_by_name_detailed",
-        lambda name, **kwargs: sacct_poll.JobNameLookup(
+        "find_accounted_job_by_name_detailed",
+        lambda name, **kwargs: sacct_poll.JobNameAccountingLookup(
             None,
             inconclusive=True,
             rows=[],
