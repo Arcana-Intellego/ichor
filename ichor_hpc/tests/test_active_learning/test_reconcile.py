@@ -23,6 +23,7 @@ from ichor.hpc.active_learning.daemon.state import (
     read_state,
     write_state,
 )
+from ichor.hpc.active_learning.handoff_manifests import PHASE_B_SELECTION_SCHEMA_VERSION
 from ichor.hpc.active_learning.versioning.training_set import TrainingSetVersioning
 
 
@@ -87,6 +88,115 @@ def _write_bootstrap_handoff(campaign, *, phase, iteration=0, archived=False, su
         rejected=[],
     )
     return initial
+
+
+def _iter_dir(campaign, iteration):
+    path = campaign / "7_ACTIVE_LEARNING" / ("iteration-" + str(int(iteration)).zfill(4))
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _write_seeds_picked(campaign, iteration, *, n=1):
+    iter_dir = _iter_dir(campaign, iteration)
+    frame_ids = list(range(int(n)))
+    (iter_dir / "seeds_picked.json").write_text(
+        json.dumps({
+            "schema_version": 1,
+            "iteration": int(iteration),
+            "n_picked": int(n),
+            "frame_ids": frame_ids,
+            "indices": frame_ids,
+            "bulk_indices": frame_ids,
+            "variance_indices": [],
+            "variances": [0.0 for _ in frame_ids],
+            "seed_records": [
+                {
+                    "seed_index": int(i),
+                    "frame_id": int(i),
+                    "selection_index": int(i),
+                    "selection_origin": "bulk",
+                    "variance_at_selection": 0.0,
+                }
+                for i in frame_ids
+            ],
+        }),
+        encoding="utf-8",
+    )
+    return iter_dir
+
+
+def _write_phase_b_handoff(campaign, iteration, *, n=2):
+    iter_dir = _iter_dir(campaign, iteration)
+    pool = iter_dir / "pool"
+    raw = []
+    final = []
+    xyz_lines = []
+    for i in range(int(n)):
+        seed_dir = pool / ("seed_" + str(i).zfill(4))
+        seed_dir.mkdir(parents=True, exist_ok=True)
+        result = seed_dir / "result.json"
+        provenance = seed_dir / ".provenance.json"
+        result.write_text("{}", encoding="utf-8")
+        provenance.write_text("{}", encoding="utf-8")
+        record = {
+            "raw_index": int(i),
+            "final_index": int(i),
+            "seed_index": int(i),
+            "seed_dir": str(seed_dir),
+            "result_json": str(result),
+            "provenance_json": str(provenance),
+            "kept_after_dedup": True,
+        }
+        raw.append(dict(record))
+        final.append(dict(record))
+        xyz_lines.extend([
+            "1",
+            "frame " + str(i),
+            "H " + str(float(i)) + " 0.0 0.0",
+        ])
+    (iter_dir / "phase_b_SAMPLE.xyz").write_text(
+        "\n".join(xyz_lines) + "\n",
+        encoding="utf-8",
+    )
+    (iter_dir / "PHASE_B_SELECTION.json").write_text(
+        json.dumps({
+            "schema_version": PHASE_B_SELECTION_SCHEMA_VERSION,
+            "iteration": int(iteration),
+            "n_selected_raw": int(n),
+            "n_kept": int(n),
+            "raw": raw,
+            "final": final,
+        }),
+        encoding="utf-8",
+    )
+    return iter_dir
+
+
+def _write_split(campaign, iteration, *, train, val, holdout=None):
+    iter_dir = _iter_dir(campaign, iteration)
+    (iter_dir / "split.json").write_text(
+        json.dumps({
+            "iteration": int(iteration),
+            "strategy": "fixture",
+            "train_indices": list(train),
+            "val_indices": list(val),
+            "holdout_indices": list(holdout or []),
+        }),
+        encoding="utf-8",
+    )
+    return iter_dir / "split.json"
+
+
+def _commit_training_and_model_versions(training, models, versions):
+    tv = TrainingSetVersioning(training)
+    mv = TrainingSetVersioning(models)
+    for version in versions:
+        staged = tv.stage(None, int(version))
+        (staged / "marker.txt").write_text("training " + str(version), encoding="utf-8")
+        tv.commit(int(version))
+        staged = mv.stage(None, int(version))
+        (staged / "marker.txt").write_text("model " + str(version), encoding="utf-8")
+        mv.commit(int(version))
 
 
 def test_propose_recovery_on_empty_campaign_returns_init(tmp_path):
@@ -490,6 +600,135 @@ def test_propose_recovery_preserves_existing_seed_select_cursor(tmp_path, monkey
     assert "existing state phase has a valid input contract" in report.decision
 
 
+def test_propose_recovery_prefers_seeds_over_stale_seed_select(tmp_path, monkeypatch):
+    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_training_and_model_versions(training, models, [0])
+    state = fresh_campaign_state(max_iterations=3)
+    state.phase = CampaignPhase.SEED_SELECT
+    state.iteration = 0
+    state.training_set_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    _write_seeds_picked(campaign, 0)
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.ARIADNE_ARRAY
+    assert report.proposed_state.iteration == 0
+    assert "valid seed-selection handoff" in report.decision
+
+
+def test_propose_recovery_does_not_preserve_existing_phase_for_committed_iteration(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_training_and_model_versions(training, models, [0, 1])
+    state = fresh_campaign_state(max_iterations=3)
+    state.phase = CampaignPhase.SEED_SELECT
+    state.iteration = 0
+    state.training_set_version = 1
+    state.models_version = 1
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.STOP_CHECK
+    assert report.proposed_state.iteration == 0
+    assert "active iteration is fully committed" in report.decision
+
+
+def test_propose_recovery_prefers_phase_b_over_stale_seed_select(tmp_path, monkeypatch):
+    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_training_and_model_versions(training, models, [0])
+    state = fresh_campaign_state(max_iterations=3)
+    state.phase = CampaignPhase.SEED_SELECT
+    state.iteration = 0
+    state.training_set_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    _write_phase_b_handoff(campaign, 0, n=2)
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.SPLIT
+    assert report.proposed_state.iteration == 0
+    assert "valid Phase B handoff" in report.decision
+
+
+def test_propose_recovery_prefers_split_over_stale_phase_b(tmp_path, monkeypatch):
+    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_training_and_model_versions(training, models, [0])
+    state = fresh_campaign_state(max_iterations=3)
+    state.phase = CampaignPhase.PHASE_B_POLUS
+    state.iteration = 0
+    state.training_set_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    _write_phase_b_handoff(campaign, 0, n=2)
+    _write_split(campaign, 0, train=[0], val=[1])
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.GAUSSIAN
+    assert report.proposed_state.iteration == 0
+    assert "valid split handoff" in report.decision
+
+
+def test_propose_recovery_invalid_split_reenters_split(tmp_path, monkeypatch):
+    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_training_and_model_versions(training, models, [0])
+    state = fresh_campaign_state(max_iterations=3)
+    state.phase = CampaignPhase.SPLIT
+    state.iteration = 0
+    state.training_set_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    _write_phase_b_handoff(campaign, 0, n=2)
+    _write_split(campaign, 0, train=[0], val=[2])
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.SPLIT
+    assert report.proposed_state.iteration == 0
+    assert "valid Phase B handoff" in report.decision
+
+
+def test_propose_recovery_cross_iteration_partial_handoff_beats_stop_check(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_training_and_model_versions(training, models, [0, 1, 2])
+    state = fresh_campaign_state(max_iterations=5)
+    state.phase = CampaignPhase.STOP_CHECK
+    state.iteration = 7
+    state.training_set_version = 2
+    state.models_version = 2
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    _write_seeds_picked(campaign, 2)
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.ARIADNE_ARRAY
+    assert report.proposed_state.iteration == 2
+    assert "valid seed-selection handoff" in report.decision
+
+
 def test_propose_recovery_protects_active_gaussian_handoff(tmp_path, monkeypatch):
     monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
     monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
@@ -526,6 +765,70 @@ def test_propose_recovery_protects_active_gaussian_handoff(tmp_path, monkeypatch
     assert report.proposed_state.phase is CampaignPhase.AIMALL
     assert ".DATA/STAGING is non-empty" not in report.unsafe_reasons
     assert any("protected active staging handoff" in item for item in report.trusted_artifacts)
+
+
+def test_propose_recovery_finds_staging_handoff_in_later_iteration(tmp_path, monkeypatch):
+    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_training_and_model_versions(training, models, [0, 1])
+    state = fresh_campaign_state(max_iterations=4)
+    state.phase = CampaignPhase.HALTED
+    state.iteration = 0
+    state.training_set_version = 1
+    state.models_version = 1
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    staging = campaign / ".DATA" / "STAGING" / "iter_1"
+    pointdir = staging / "POINT_0000.pointdir"
+    pointdir.mkdir(parents=True, exist_ok=True)
+    stg.write_points_file(staging, [pointdir])
+    stg.write_quantum_acceptance_manifest(
+        staging,
+        phase_name=CampaignPhase.AIMALL.value,
+        iteration=1,
+        accepted=[pointdir],
+        rejected=[],
+    )
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.APPEND
+    assert report.proposed_state.iteration == 1
+    assert ".DATA/STAGING is non-empty" not in report.unsafe_reasons
+    assert any("protected active staging handoff" in item for item in report.trusted_artifacts)
+
+
+def test_propose_recovery_halts_on_multiple_valid_staging_handoffs(tmp_path, monkeypatch):
+    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_training_and_model_versions(training, models, [0])
+    state = fresh_campaign_state(max_iterations=4)
+    state.phase = CampaignPhase.HALTED
+    state.iteration = 0
+    state.training_set_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    for iteration in (0, 1):
+        staging = campaign / ".DATA" / "STAGING" / ("iter_" + str(iteration))
+        pointdir = staging / "POINT_0000.pointdir"
+        pointdir.mkdir(parents=True, exist_ok=True)
+        stg.write_points_file(staging, [pointdir])
+        stg.write_quantum_acceptance_manifest(
+            staging,
+            phase_name=CampaignPhase.GAUSSIAN.value,
+            iteration=iteration,
+            accepted=[pointdir],
+            rejected=[],
+        )
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.HALTED
+    assert any("multiple valid staging handoffs" in r for r in report.unsafe_reasons)
+    assert ".DATA/STAGING is non-empty" not in report.unsafe_reasons
 
 
 def test_propose_recovery_blocks_trajectory_pool_sha_drift(tmp_path):

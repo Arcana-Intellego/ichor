@@ -71,7 +71,7 @@ from .daemon.live_executor import (
 from .daemon.phase_executor import MockPhaseExecutor
 from .daemon.preflight import check_backends, missing_backend_message
 from .daemon.recovery_contracts import (
-    protected_staging_handoff,
+    staging_handoff_decisions,
     validate_phase_recovery_contract,
 )
 from .daemon.reconcile import (
@@ -498,16 +498,18 @@ def _operator_staging_archive_blockers(
     if inventory.get("has_symlink"):
         blockers.append(".DATA/STAGING contains symlink entries")
     try:
-        protected = protected_staging_handoff(
+        protected_handoffs = staging_handoff_decisions(
             campaign,
-            iteration=int(getattr(report.proposed_state, "iteration", 0)),
+            report.proposed_state,
         )
     except Exception:
-        protected = None
-    if protected is not None:
+        protected_handoffs = []
+    for protected in protected_handoffs:
         blockers.append(
             ".DATA/STAGING contains a valid protected handoff for "
             + protected.phase.value
+            + "@"
+            + str(int(protected.iteration))
             + ": "
             + str(protected.trusted_artifact)
         )

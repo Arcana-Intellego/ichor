@@ -27,8 +27,9 @@ from .artifact_contracts import (
 )
 from .journal import iter_events
 from .recovery_contracts import (
-    protected_staging_handoff,
+    active_iteration_handoff_decisions,
     select_recovery_phase,
+    staging_handoff_decisions,
     validate_phase_recovery_contract,
 )
 from . import submission_intent as _submission_intent
@@ -673,35 +674,6 @@ def propose_recovery(
         if p.name not in (".", "..")
     ]
     unexpected_staging_children = list(staging_children)
-    protected_active_handoff = None
-    try:
-        protected_iteration = int(
-            getattr(existing, "iteration", 0)
-            if existing is not None
-            else (last_iter if last_iter is not None else 0)
-        )
-    except Exception:
-        protected_iteration = 0
-    try:
-        protected_active_handoff = protected_staging_handoff(
-            campaign,
-            iteration=protected_iteration,
-        )
-    except Exception:
-        protected_active_handoff = None
-    if protected_active_handoff is not None and protected_active_handoff.trusted_artifact:
-        protected_path = (campaign / protected_active_handoff.trusted_artifact).resolve(strict=False)
-        unexpected_staging_children = [
-            p
-            for p in unexpected_staging_children
-            if p.resolve(strict=False) != protected_path
-        ]
-        trusted_artifacts.append(
-            "protected active staging handoff for "
-            + protected_active_handoff.phase.value
-            + " at "
-            + str(protected_active_handoff.trusted_artifact)
-        )
     valid_live_bootstrap_handoff = (
         isinstance(bootstrap_handoff, dict)
         and not bool(bootstrap_handoff.get("archived"))
@@ -743,9 +715,6 @@ def propose_recovery(
             + str(campaign)
             + " --cancel-jobs"
         )
-    if unexpected_staging_children:
-        unsafe_reasons.append(".DATA/STAGING is non-empty")
-        blocking_artifacts.append(".DATA/STAGING")
     if script_files:
         unsafe_reasons.append(".DATA/SCRIPTS contains sbatch scripts")
         trusted_artifacts.append(".DATA/SCRIPTS can be archived by reconcile --apply")
@@ -994,6 +963,87 @@ def propose_recovery(
             + repr(valid_model_versions)
             + ")"
         )
+
+    try:
+        protected_staging_handoffs = staging_handoff_decisions(campaign, recovered)
+    except Exception as exc:
+        protected_staging_handoffs = []
+        unsafe_reasons.append(
+            "staging handoff inventory failed: "
+            + type(exc).__name__
+            + ": "
+            + str(exc)[:180]
+        )
+    protected_staging_paths = set()
+    for decision in protected_staging_handoffs:
+        if decision.trusted_artifact:
+            protected_path = (campaign / decision.trusted_artifact).resolve(strict=False)
+            protected_staging_paths.add(str(protected_path))
+            trusted_artifacts.append(
+                "protected active staging handoff for "
+                + decision.phase.value
+                + " at "
+                + str(decision.trusted_artifact)
+            )
+    if protected_staging_paths:
+        unexpected_staging_children = [
+            p for p in unexpected_staging_children
+            if str(p.resolve(strict=False)) not in protected_staging_paths
+        ]
+    if len(protected_staging_handoffs) > 1:
+        unsafe_reasons.append(
+            "multiple valid staging handoffs need operator review: "
+            + ", ".join(
+                str(d.phase.value)
+                + "@"
+                + str(int(d.iteration))
+                + " "
+                + str(d.trusted_artifact)
+                for d in protected_staging_handoffs
+            )
+        )
+        blocking_artifacts.append(".DATA/STAGING")
+    try:
+        partial_iteration_handoffs = active_iteration_handoff_decisions(campaign, recovered)
+    except Exception as exc:
+        partial_iteration_handoffs = []
+        unsafe_reasons.append(
+            "active-iteration handoff inventory failed: "
+            + type(exc).__name__
+            + ": "
+            + str(exc)[:180]
+        )
+    if len(partial_iteration_handoffs) > 1:
+        unsafe_reasons.append(
+            "multiple valid active-iteration handoffs need operator review: "
+            + ", ".join(
+                str(d.phase.value)
+                + "@"
+                + str(int(d.iteration))
+                + " "
+                + str(d.trusted_artifact)
+                for d in partial_iteration_handoffs
+            )
+        )
+        blocking_artifacts.append("7_ACTIVE_LEARNING")
+    combined_handoffs = list(protected_staging_handoffs) + list(partial_iteration_handoffs)
+    combined_iterations = {int(d.iteration) for d in combined_handoffs}
+    if len(combined_iterations) > 1:
+        unsafe_reasons.append(
+            "valid handoffs exist in multiple iterations: "
+            + ", ".join(
+                str(d.phase.value)
+                + "@"
+                + str(int(d.iteration))
+                + " "
+                + str(d.trusted_artifact)
+                for d in combined_handoffs
+            )
+        )
+        blocking_artifacts.append("active-learning handoff inventory")
+    if unexpected_staging_children:
+        unsafe_reasons.append(".DATA/STAGING is non-empty")
+        blocking_artifacts.append(".DATA/STAGING")
 
     phase_recovery = None
     if not active_intents and not unsafe_reasons:

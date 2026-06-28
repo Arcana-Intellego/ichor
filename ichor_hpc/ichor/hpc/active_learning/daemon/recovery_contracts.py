@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Optional, Sequence, Union
+from typing import List, Optional, Sequence, Union
 
 from ..acquisition.trajectory_pool import TrajectoryPool
 from ..handoff_manifests import (
@@ -36,6 +36,13 @@ class RecoveryDecision:
     iteration: int
     reason: str
     trusted_artifact: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class RecoveryHandoff:
+    decision: RecoveryDecision
+    priority: int
+    kind: str
 
 
 def iteration_dir(campaign_dir: Union[str, Path], iteration: int) -> Path:
@@ -162,9 +169,39 @@ def _require_ariadne_results(campaign: Path, iteration: int) -> None:
     )
 
 
-def _require_phase_b(campaign: Path, iteration: int) -> None:
+def _count_xyz_frames(path: Path) -> int:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise RecoveryContractError("sample xyz unreadable: " + str(path)) from exc
+    pos = 0
+    n_frames = 0
+    while pos < len(lines):
+        if not lines[pos].strip():
+            pos += 1
+            continue
+        try:
+            natoms = int(lines[pos].strip())
+        except ValueError as exc:
+            raise RecoveryContractError(
+                "sample xyz frame atom count is not an integer at line "
+                + str(pos + 1)
+            ) from exc
+        if natoms < 0:
+            raise RecoveryContractError("sample xyz frame atom count is negative")
+        frame_end = pos + 2 + natoms
+        if frame_end > len(lines):
+            raise RecoveryContractError("sample xyz frame is truncated")
+        pos = frame_end
+        n_frames += 1
+    if n_frames <= 0:
+        raise RecoveryContractError("sample xyz contains no frames: " + str(path))
+    return n_frames
+
+
+def _phase_b_final_count(campaign: Path, iteration: int) -> int:
     idir = iteration_dir(campaign, iteration)
-    read_phase_b_selection_manifest(
+    manifest = read_phase_b_selection_manifest(
         idir,
         expected_iteration=int(iteration),
         require_nonempty=True,
@@ -172,6 +209,20 @@ def _require_phase_b(campaign: Path, iteration: int) -> None:
     sample = idir / "phase_b_SAMPLE.xyz"
     if not sample.is_file():
         raise FileNotFoundError("Phase B sample xyz missing: " + str(sample))
+    n_frames = _count_xyz_frames(sample)
+    n_final = len(list(manifest.get("final") or []))
+    if int(n_frames) != int(n_final):
+        raise RecoveryContractError(
+            "Phase B sample frame count "
+            + str(int(n_frames))
+            + " does not match final record count "
+            + str(int(n_final))
+        )
+    return int(n_final)
+
+
+def _require_phase_b(campaign: Path, iteration: int) -> None:
+    _phase_b_final_count(campaign, int(iteration))
 
 
 def _require_split(campaign: Path, iteration: int) -> None:
@@ -191,13 +242,34 @@ def _require_split(campaign: Path, iteration: int) -> None:
     holdout = data.get("holdout_indices")
     if not isinstance(train, list) or not isinstance(val, list) or not isinstance(holdout, list):
         raise RecoveryContractError("split.json train/val/holdout indices must be lists")
-    train_set = {int(x) for x in train}
-    val_set = {int(x) for x in val}
-    holdout_set = {int(x) for x in holdout}
+    def _index_set(values: Sequence[object], label: str) -> set:
+        out = set()
+        for value in values:
+            if isinstance(value, bool):
+                raise RecoveryContractError("split.json " + label + " indices must be integers")
+            try:
+                idx = int(value)
+            except (TypeError, ValueError) as exc:
+                raise RecoveryContractError("split.json " + label + " indices must be integers") from exc
+            out.add(idx)
+        if len(out) != len(values):
+            raise RecoveryContractError("split.json " + label + " indices contain duplicates")
+        return out
+
+    train_set = _index_set(train, "train")
+    val_set = _index_set(val, "validation")
+    holdout_set = _index_set(holdout, "holdout")
     if train_set & val_set:
         raise RecoveryContractError("split.json train and validation indices overlap")
     if not holdout_set.issubset(val_set):
         raise RecoveryContractError("split.json holdout indices must be a subset of validation")
+    n_final = _phase_b_final_count(campaign, int(iteration))
+    allowed = set(range(int(n_final)))
+    assigned = train_set | val_set
+    if not assigned.issubset(allowed):
+        raise RecoveryContractError("split.json indices are outside Phase B final record range")
+    if assigned != allowed:
+        raise RecoveryContractError("split.json train/validation indices do not cover every Phase B final record")
 
 
 def _require_training_version(campaign: Path, version: int) -> None:
@@ -269,6 +341,134 @@ def protected_staging_handoff(
     return None
 
 
+def staging_handoff_decisions(
+    campaign_dir: Union[str, Path],
+    state: CampaignState,
+    *,
+    include_committed: bool = False,
+) -> List[RecoveryDecision]:
+    """Return valid quantum staging handoffs that must not be archived."""
+    campaign = Path(campaign_dir)
+    decisions: List[RecoveryDecision] = []
+    models_version = int(getattr(state, "models_version", -1))
+    if include_committed or models_version < 0:
+        if _ok(_require_initial_quantum, campaign, CampaignPhase.INITIAL_AIMALL, 0):
+            decisions.append(
+                RecoveryDecision(
+                    CampaignPhase.INITIAL_FEREBUS,
+                    0,
+                    "INITIAL_FEREBUS: valid initial AIMAll handoff exists",
+                    ".DATA/STAGING/initial",
+                )
+            )
+        elif _ok(_require_initial_quantum, campaign, CampaignPhase.INITIAL_GAUSSIAN, 0):
+            decisions.append(
+                RecoveryDecision(
+                    CampaignPhase.INITIAL_AIMALL,
+                    0,
+                    "INITIAL_AIMALL: valid initial Gaussian handoff exists",
+                    ".DATA/STAGING/initial",
+                )
+            )
+    staging = campaign / ".DATA" / "STAGING"
+    if not staging.is_dir():
+        return decisions
+    for bucket in sorted(staging.glob("iter_*")):
+        if not bucket.is_dir() or bucket.is_symlink():
+            continue
+        suffix = bucket.name[len("iter_"):]
+        try:
+            iteration = int(suffix)
+        except ValueError:
+            continue
+        if not include_committed and active_iteration_committed(state, iteration):
+            continue
+        decision = protected_staging_handoff(campaign, iteration=iteration)
+        if decision is not None:
+            decisions.append(decision)
+    return decisions
+
+
+def _best_active_iteration_handoff(campaign: Path, iteration: int) -> Optional[RecoveryHandoff]:
+    if _ok(_require_split, campaign, int(iteration)):
+        return RecoveryHandoff(
+            RecoveryDecision(
+                CampaignPhase.GAUSSIAN,
+                int(iteration),
+                "GAUSSIAN: valid split handoff exists",
+                str(iteration_dir(campaign, iteration) / "split.json"),
+            ),
+            40,
+            "split",
+        )
+    if _ok(_require_phase_b, campaign, int(iteration)):
+        return RecoveryHandoff(
+            RecoveryDecision(
+                CampaignPhase.SPLIT,
+                int(iteration),
+                "SPLIT: valid Phase B handoff exists",
+                str(iteration_dir(campaign, iteration) / "PHASE_B_SELECTION.json"),
+            ),
+            30,
+            "phase_b",
+        )
+    if _ok(_require_ariadne_results, campaign, int(iteration)):
+        return RecoveryHandoff(
+            RecoveryDecision(
+                CampaignPhase.PHASE_B_POLUS,
+                int(iteration),
+                "PHASE_B_POLUS: valid ARIADNE results handoff exists",
+                str(iteration_dir(campaign, iteration) / "ARIADNE_RESULTS.json"),
+            ),
+            20,
+            "ariadne_results",
+        )
+    if _ok(_require_seeds, campaign, int(iteration)):
+        return RecoveryHandoff(
+            RecoveryDecision(
+                CampaignPhase.ARIADNE_ARRAY,
+                int(iteration),
+                "ARIADNE_ARRAY: valid seed-selection handoff exists",
+                str(iteration_dir(campaign, iteration) / "seeds_picked.json"),
+            ),
+            10,
+            "seeds",
+        )
+    return None
+
+
+def active_iteration_handoff_decisions(
+    campaign_dir: Union[str, Path],
+    state: CampaignState,
+) -> List[RecoveryDecision]:
+    """Return the furthest valid AL handoff for each uncommitted iteration."""
+    campaign = Path(campaign_dir)
+    root = campaign / "7_ACTIVE_LEARNING"
+    if not root.is_dir():
+        return []
+    decisions: List[RecoveryDecision] = []
+    for path in sorted(root.glob("iteration-*")):
+        if not path.is_dir() or path.is_symlink():
+            continue
+        suffix = path.name[len("iteration-"):]
+        try:
+            iteration = int(suffix)
+        except ValueError:
+            continue
+        if active_iteration_committed(state, iteration):
+            continue
+        handoff = _best_active_iteration_handoff(campaign, iteration)
+        if handoff is not None:
+            decisions.append(handoff.decision)
+    return decisions
+
+
+def _single_decision_or_none(decisions: Sequence[RecoveryDecision]) -> Optional[RecoveryDecision]:
+    if len(decisions) == 1:
+        return decisions[0]
+    return None
+
+
 def _existing_phase_recovery(
     campaign: Path,
     state: CampaignState,
@@ -310,16 +510,6 @@ def select_recovery_phase(
 ) -> Optional[RecoveryDecision]:
     """Choose the furthest safe re-entry phase from producer contracts."""
     campaign = Path(campaign_dir)
-    if existing_loaded:
-        existing = _existing_phase_recovery(
-            campaign,
-            state,
-            valid_training_versions=valid_training_versions,
-            valid_model_versions=valid_model_versions,
-        )
-        if existing is not None:
-            return existing
-
     iteration = int(getattr(state, "iteration", 0))
     if last_iteration is not None and not existing_loaded:
         try:
@@ -367,9 +557,13 @@ def select_recovery_phase(
                 )
         return None
 
-    protected = protected_staging_handoff(campaign, iteration=iteration)
-    if protected is not None:
-        return protected
+    staging_decision = _single_decision_or_none(staging_handoff_decisions(campaign, state))
+    if staging_decision is not None:
+        return staging_decision
+
+    handoff_decision = _single_decision_or_none(active_iteration_handoff_decisions(campaign, state))
+    if handoff_decision is not None:
+        return handoff_decision
 
     if training_version == 0 and model_version < 0:
         if _has_version(valid_training_versions, 0):
@@ -412,34 +606,19 @@ def select_recovery_phase(
                 "5_TRAINING/iteration-" + str(training_version).zfill(4),
             )
 
-    if _ok(_require_split, campaign, iteration):
-        return RecoveryDecision(
-            CampaignPhase.GAUSSIAN,
-            iteration,
-            "GAUSSIAN: valid split handoff exists",
-            str(iteration_dir(campaign, iteration) / "split.json"),
+    if existing_loaded:
+        existing = _existing_phase_recovery(
+            campaign,
+            state,
+            valid_training_versions=valid_training_versions,
+            valid_model_versions=valid_model_versions,
         )
-    if _ok(_require_phase_b, campaign, iteration):
-        return RecoveryDecision(
-            CampaignPhase.SPLIT,
-            iteration,
-            "SPLIT: valid Phase B handoff exists",
-            str(iteration_dir(campaign, iteration) / "PHASE_B_SELECTION.json"),
-        )
-    if _ok(_require_ariadne_results, campaign, iteration):
-        return RecoveryDecision(
-            CampaignPhase.PHASE_B_POLUS,
-            iteration,
-            "PHASE_B_POLUS: valid ARIADNE results handoff exists",
-            str(iteration_dir(campaign, iteration) / "ARIADNE_RESULTS.json"),
-        )
-    if _ok(_require_seeds, campaign, iteration):
-        return RecoveryDecision(
-            CampaignPhase.ARIADNE_ARRAY,
-            iteration,
-            "ARIADNE_ARRAY: valid seed-selection handoff exists",
-            str(iteration_dir(campaign, iteration) / "seeds_picked.json"),
-        )
+        if existing is not None:
+            return existing
+
+    current_handoff = _best_active_iteration_handoff(campaign, iteration)
+    if current_handoff is not None:
+        return current_handoff.decision
     if (
         training_version >= 0
         and model_version >= 0
