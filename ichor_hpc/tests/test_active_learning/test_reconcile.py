@@ -56,6 +56,7 @@ def _write_valid_initial_aimall_handoff(campaign, *, iteration=0):
     initial = campaign / ".DATA" / "STAGING" / "initial"
     pointdir = initial / "POINT_0000.pointdir"
     pointdir.mkdir(parents=True, exist_ok=True)
+    stg.write_points_file(initial, [pointdir])
     stg.write_quantum_acceptance_manifest(
         initial,
         phase_name=CampaignPhase.INITIAL_AIMALL.value,
@@ -76,6 +77,7 @@ def _write_bootstrap_handoff(campaign, *, phase, iteration=0, archived=False, su
     pointdir = initial / "POINT_0000.pointdir"
     pointdir.mkdir(parents=True, exist_ok=True)
     (pointdir / "input.wfn").write_text("wfn\n", encoding="utf-8")
+    stg.write_points_file(initial, [pointdir])
     stg.write_quantum_acceptance_manifest(
         initial,
         phase_name=phase,
@@ -328,9 +330,9 @@ def test_propose_recovery_reports_decision_and_trusted_versions(tmp_path):
     report = propose_recovery(campaign)
 
     assert report.proposed_state.phase is CampaignPhase.HALTED
-    assert "coherent committed" in report.decision
+    assert "committed model artefacts are present but invalid" in report.decision
     assert "training version 0" in report.trusted_artifacts
-    assert "model version 0" in report.trusted_artifacts
+    assert "model version 0" in report.blocking_artifacts
     assert "trajectory pool" in report.blocking_artifacts
 
 

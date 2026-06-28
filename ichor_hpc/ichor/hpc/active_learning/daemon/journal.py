@@ -111,6 +111,7 @@ KNOWN_EVENT_TYPES = (
     "sacct_rows_missing_but_squeue_active",
     "squeue_liveness_inconclusive",
     "transient_phase_retry",
+    "transient_retry_ledger_invalid",
     "job_adopt_check_failed",
     "adopted_inflight_job",
     "submission_intent_update_failed",

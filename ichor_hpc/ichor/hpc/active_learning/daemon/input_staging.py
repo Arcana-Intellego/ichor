@@ -20,8 +20,9 @@ import json
 import os  # stage_ferebus_inputs cd's into the staging dir to export csvs; this was missing and only bit on a live run
 import re
 import shutil
+import hashlib
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from ichor.core.atoms import Atoms
 from ichor.core.files import PointDirectory
@@ -37,6 +38,7 @@ from .state import atomic_write_json
 
 QUANTUM_ACCEPTANCE_MANIFEST = "accepted_pointdirs.json"
 QUANTUM_ACCEPTANCE_SCHEMA_VERSION = 1
+POINTDIR_BASENAME_RE = re.compile(r"^POINT_\d{4}\.pointdir$")
 AIMALL_TASK_METADATA = "AIMALL_TASK.json"
 AIMALL_TASK_METADATA_SCHEMA_VERSION = 1
 FEREBUS_TASK_MANIFEST = "FEREBUS_TASKS.json"
@@ -81,10 +83,46 @@ def validate_safe_path_token(label: str, value: str) -> None:
         )
 
 
-def _checked_rmtree(path: Path) -> None:
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    resolved = Path(path).resolve(strict=False)
+    root = Path(parent).resolve(strict=False)
+    return resolved == root or root in resolved.parents
+
+
+def _reject_symlink_ancestors(path: Path, stop_at: Path) -> None:
+    stop = Path(stop_at).resolve(strict=False)
+    current = Path(path)
+    for candidate in [current] + list(current.parents):
+        try:
+            resolved = candidate.resolve(strict=False)
+        except OSError:
+            resolved = candidate.absolute()
+        if resolved == stop:
+            break
+        if candidate.exists() and candidate.is_symlink():
+            raise OSError("refusing to clean path below symlink: " + str(candidate))
+
+
+def _checked_rmtree(
+    path: Path,
+    *,
+    campaign_dir: Optional[Path] = None,
+    allowed_roots: Iterable[Path] = (),
+) -> None:
     target = Path(path)
     if not target.exists():
         return
+    if target.is_symlink():
+        raise OSError("refusing to remove symlinked staging path: " + str(target))
+    if campaign_dir is not None:
+        campaign = Path(campaign_dir).resolve(strict=False)
+        resolved = target.resolve(strict=False)
+        if not _is_relative_to(resolved, campaign):
+            raise OSError("refusing to remove path outside campaign: " + str(target))
+        _reject_symlink_ancestors(target, campaign)
+        roots = [Path(root).resolve(strict=False) for root in allowed_roots]
+        if roots and not any(_is_relative_to(resolved, root) for root in roots):
+            raise OSError("refusing to remove path outside allowed staging roots: " + str(target))
     shutil.rmtree(str(target), ignore_errors=False)
     if target.exists():
         raise OSError("failed to remove stale staging directory: " + str(target))
@@ -104,8 +142,55 @@ def _copytree_no_symlinks(src: Path, dest: Path) -> None:
     shutil.copytree(str(src), str(dest), symlinks=False)
 
 
-def quantum_acceptance_manifest_path(staging_dir: Path) -> Path:
-    return Path(staging_dir) / QUANTUM_ACCEPTANCE_MANIFEST
+def _validate_pointdir_basename(name: str) -> str:
+    text = str(name).strip()
+    if Path(text).name != text or not POINTDIR_BASENAME_RE.fullmatch(text):
+        raise ValueError("unsafe pointdir name in manifest: " + repr(name))
+    return text
+
+
+def _points_file_names(staging_dir: Path) -> List[str]:
+    points_file = Path(staging_dir) / "POINTS.txt"
+    if not points_file.is_file():
+        raise FileNotFoundError("POINTS.txt missing in quantum staging: " + str(points_file))
+    names: List[str] = []
+    seen = set()
+    for line_no, raw in enumerate(points_file.read_text(encoding="utf-8").splitlines(), start=1):
+        text = raw.strip()
+        if not text:
+            continue
+        path = Path(text)
+        name = _validate_pointdir_basename(path.name)
+        if name in seen:
+            raise ValueError("duplicate pointdir in POINTS.txt line " + str(line_no) + ": " + name)
+        expected = Path(staging_dir) / name
+        try:
+            resolved = path.resolve(strict=False)
+            expected_resolved = expected.resolve(strict=False)
+        except OSError as exc:
+            raise ValueError("POINTS.txt path cannot be resolved at line " + str(line_no)) from exc
+        if resolved != expected_resolved:
+            raise ValueError(
+                "POINTS.txt path does not point inside staging at line "
+                + str(line_no)
+                + ": "
+                + str(path)
+            )
+        seen.add(name)
+        names.append(name)
+    return names
+
+
+def quantum_acceptance_manifest_path(
+    staging_dir: Path,
+    *,
+    phase_name: Optional[str] = None,
+) -> Path:
+    staging = Path(staging_dir)
+    if phase_name:
+        validate_safe_path_token("quantum acceptance phase", str(phase_name))
+        return staging / ("accepted_pointdirs." + str(phase_name) + ".json")
+    return staging / QUANTUM_ACCEPTANCE_MANIFEST
 
 
 def write_quantum_acceptance_manifest(
@@ -119,9 +204,9 @@ def write_quantum_acceptance_manifest(
     """Persist the exact validated quantum handoff for downstream live stages."""
     staging = Path(staging_dir)
     staging.mkdir(parents=True, exist_ok=True)
-    accepted_names = [_pointdir_name(p) for p in accepted]
+    accepted_names = [_validate_pointdir_basename(_pointdir_name(p)) for p in accepted]
     rejected_payload = [
-        {"pointdir": str(name), "reason": str(reason)}
+        {"pointdir": _validate_pointdir_basename(str(name)), "reason": str(reason)}
         for name, reason in rejected
     ]
     payload: Dict[str, Any] = {
@@ -132,9 +217,12 @@ def write_quantum_acceptance_manifest(
         "rejected": rejected_payload,
         "n_total": int(len(accepted_names) + len(rejected_payload)),
     }
-    path = quantum_acceptance_manifest_path(staging)
-    atomic_write_json(path, payload)
-    return path
+    phase_path = quantum_acceptance_manifest_path(staging, phase_name=phase_name)
+    atomic_write_json(phase_path, payload)
+    # Keep the legacy filename as a compatibility alias for older tools, while
+    # phase-aware readers prefer the immutable phase-specific handoff.
+    atomic_write_json(quantum_acceptance_manifest_path(staging), payload)
+    return phase_path
 
 
 def read_quantum_acceptance_manifest(
@@ -143,6 +231,7 @@ def read_quantum_acceptance_manifest(
     expected_phase: str,
     expected_iteration: int,
     require_nonempty: bool = True,
+    require_points_file_membership: bool = False,
 ) -> Tuple[List[Path], Dict[str, Any]]:
     """Read and validate the live quantum acceptance manifest.
 
@@ -150,7 +239,8 @@ def read_quantum_acceptance_manifest(
     rejected quantum outputs cannot be silently committed or reprocessed.
     """
     staging = Path(staging_dir)
-    path = quantum_acceptance_manifest_path(staging)
+    phase_path = quantum_acceptance_manifest_path(staging, phase_name=expected_phase)
+    path = phase_path if phase_path.is_file() else quantum_acceptance_manifest_path(staging)
     if not path.is_file():
         raise FileNotFoundError("quantum acceptance manifest missing: " + str(path))
     try:
@@ -192,14 +282,15 @@ def read_quantum_acceptance_manifest(
 
     seen = set()
     resolved: List[Path] = []
+    points_names = set(_points_file_names(staging)) if require_points_file_membership else None
     for raw_name in accepted:
         if not isinstance(raw_name, str):
             raise ValueError("accepted pointdir name is not a string")
-        name = raw_name.strip()
-        if Path(name).name != name or not name.endswith(".pointdir"):
-            raise ValueError("unsafe accepted pointdir name in manifest: " + repr(raw_name))
+        name = _validate_pointdir_basename(raw_name)
         if name in seen:
             raise ValueError("duplicate accepted pointdir in manifest: " + name)
+        if points_names is not None and name not in points_names:
+            raise ValueError("accepted pointdir is not present in POINTS.txt: " + name)
         seen.add(name)
         pointdir = staging / name
         if not pointdir.is_dir():
@@ -210,6 +301,19 @@ def read_quantum_acceptance_manifest(
     if require_nonempty and not resolved:
         raise ValueError("quantum acceptance manifest accepted_pointdirs is empty: " + str(path))
     return resolved, data
+
+
+def hash_pointdir_tree(pointdir: Path) -> str:
+    root = Path(pointdir)
+    _reject_symlink_tree(root)
+    digest = hashlib.sha256()
+    for path in sorted((p for p in root.rglob("*") if p.is_file()), key=lambda p: str(p.relative_to(root))):
+        rel = str(path.relative_to(root)).replace("\\", "/")
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def ferebus_manifest_path(staging_dir: Path) -> Path:
@@ -312,6 +416,8 @@ def stage_gaussian_inputs(
 
     frames = _load_frames(sample_xyz)
     phase_b_records: List[Dict[str, Any]] = []
+    initial_seed_frame_ids: List[Optional[int]] = []
+    initial_provenance_context: Optional[Dict[str, str]] = None
     if str(phase_name) == "GAUSSIAN":
         from ..handoff_manifests import read_phase_b_selection_manifest
 
@@ -327,6 +433,44 @@ def stage_gaussian_inputs(
                 + " != sample frame count "
                 + str(len(frames))
             )
+    if str(phase_name) == "INITIAL_GAUSSIAN":
+        try:
+            from .state import read_state, DEFAULT_STATE_FILENAME
+            from ..acquisition.trajectory_pool import TrajectoryPool
+            from ..handoff_manifests import read_phase_a_sample_manifest
+
+            phase_a_manifest = read_phase_a_sample_manifest(Path(sample_xyz).parent)
+            selected = phase_a_manifest.get("selected_indices")
+            if isinstance(selected, list):
+                if len(selected) != len(frames):
+                    raise ValueError(
+                        "Phase A selected index count "
+                        + str(len(selected))
+                        + " != initial sample frame count "
+                        + str(len(frames))
+                    )
+                initial_seed_frame_ids = [
+                    int(value) if value is not None else None
+                    for value in selected
+                ]
+                current_state = read_state(
+                    Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
+                )
+                pool = TrajectoryPool.load(campaign_dir)
+                initial_provenance_context = {
+                    "campaign_uid": str(current_state.campaign_uid),
+                    "trajectory_sha256": str(pool.sha256),
+                }
+        except FileNotFoundError:
+            initial_seed_frame_ids = []
+            initial_provenance_context = None
+        except Exception as exc:
+            raise ValueError(
+                "failed to load Phase A provenance context for initial Gaussian staging: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)
+            ) from exc
     provenance_context = None
     if phase_b_records:
         try:
@@ -355,7 +499,11 @@ def stage_gaussian_inputs(
     # writer so clearing here is safe -- AIMAll staging must NOT clear because it consumes the
     # Gaussian acceptance manifest and the accepted pointdirs in this same bucket.
     if staging.exists():
-        _checked_rmtree(staging)
+        _checked_rmtree(
+            staging,
+            campaign_dir=Path(campaign_dir),
+            allowed_roots=[Path(campaign_dir) / ".DATA" / "STAGING"],
+        )
     staging.mkdir(parents=True, exist_ok=True)
 
     keywords = ["nosymm", "output=wfn", "force", "geom=notest"]
@@ -391,6 +539,25 @@ def stage_gaussian_inputs(
             gjf.set_nproc(int(gaussian_resources.cpus_per_task))
             gjf.set_mem(str(config.resources.gaussian_link0_mem))
         gjf.write()
+        if (
+            initial_provenance_context is not None
+            and k < len(initial_seed_frame_ids)
+        ):
+            from ..versioning.provenance import write_seed_provenance
+
+            write_seed_provenance(
+                pd,
+                campaign_uid=str(initial_provenance_context["campaign_uid"]),
+                iteration=int(iteration),
+                trajectory_sha256=str(initial_provenance_context["trajectory_sha256"]),
+                seed_frame_id=initial_seed_frame_ids[k],
+                seed_selection_origin="phase_a_polus",
+                seed_variance_at_selection=None,
+                subspace_neighbour_frame_ids=[],
+                subspace_dimension=0,
+                subspace_eigenvalues=[],
+                mode_weighting_policy="phase_a_diversity",
+            )
         if phase_b_records:
             from ..versioning.provenance import PROVENANCE_FILENAME, validate_provenance
 
@@ -434,6 +601,7 @@ def stage_aimall_inputs(
         staging,
         expected_phase=expected_phase,
         expected_iteration=int(iteration),
+        require_points_file_membership=True,
     )
     aimall_resources = resolve_phase_resources(
         phase_name=str(phase_name),
@@ -497,14 +665,35 @@ def commit_initial_training_set(campaign_dir) -> bool:
 
     campaign = Path(campaign_dir)
     v_train = TrainingSetVersioning(campaign / "5_TRAINING")
+    initial_staging = campaign / ".DATA" / "STAGING" / "initial"
     if 0 in v_train.list_committed_versions():
+        try:
+            accepted_pointdirs, _manifest = read_quantum_acceptance_manifest(
+                initial_staging,
+                expected_phase="INITIAL_AIMALL",
+                expected_iteration=0,
+                require_points_file_membership=True,
+            )
+            accepted_names = {p.name for p in accepted_pointdirs}
+            committed_dir = v_train.iteration_path(0)
+            committed_names = {
+                child.name
+                for child in committed_dir.iterdir()
+                if child.is_dir() and POINTDIR_BASENAME_RE.fullmatch(child.name)
+            }
+            if committed_names != accepted_names:
+                raise ValueError(
+                    "existing initial training set does not match initial AIMAll handoff"
+                )
+        except FileNotFoundError:
+            pass
         v_train.ensure_current(0)
         return False
-    initial_staging = campaign / ".DATA" / "STAGING" / "initial"
     accepted_pointdirs, _manifest = read_quantum_acceptance_manifest(
         initial_staging,
         expected_phase="INITIAL_AIMALL",
         expected_iteration=0,
+        require_points_file_membership=True,
     )
     # bin any half-built staging left by a dead attempt, then stage an empty iter-0 and copy
     # the validated initial pointdirs into it.
@@ -513,7 +702,11 @@ def commit_initial_training_set(campaign_dir) -> bool:
     for pdir in accepted_pointdirs:
         dest = train_staging / pdir.name
         if dest.exists():
-            _checked_rmtree(dest)
+            _checked_rmtree(
+                dest,
+                campaign_dir=campaign,
+                allowed_roots=[train_staging],
+            )
         _copytree_no_symlinks(pdir, dest)
     v_train.commit(0)
     v_train.update_current(0)
@@ -554,7 +747,11 @@ def stage_ferebus_inputs(campaign_dir, config, training_version, is_initial=Fals
     # otherwise last iteration's *_train.csv / *.model lying around get globbed back in and we
     # either split stale data or re-commit an old model as a fresh version (both silent + nasty).
     if staging.exists():
-        _checked_rmtree(staging)
+        _checked_rmtree(
+            staging,
+            campaign_dir=campaign,
+            allowed_roots=[campaign / "6_TRAINED_MODELS"],
+        )
     staging.mkdir(parents=True, exist_ok=True)
 
     pd = PointsDirectory(training_dir)
@@ -570,7 +767,9 @@ def stage_ferebus_inputs(campaign_dir, config, training_version, is_initial=Fals
         for name, pointdir_path in zip(pointdir_names, pointdir_paths):
             sidecar = pointdir_path / PROVENANCE_FILENAME
             if sidecar.is_file():
-                pointdir_identities[name] = sha256_file(sidecar)
+                pointdir_identities[name] = "provenance:" + sha256_file(sidecar)
+            else:
+                pointdir_identities[name] = "pointdir-tree:" + hash_pointdir_tree(pointdir_path)
     except Exception as exc:
         raise ValueError("failed to build FEREBUS pointdir identity map: " + str(exc)) from exc
     # system ALF defines the per-atom local frame the features are built in.

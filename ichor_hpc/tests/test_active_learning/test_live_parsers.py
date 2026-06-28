@@ -50,6 +50,9 @@ def _bind_staging(ex, fixture_subdir):
             shutil.rmtree(str(target), ignore_errors=True)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(str(source), str(target))
+        pointdirs = sorted(target.glob("POINT_*.pointdir"))
+        if pointdirs:
+            stg.write_points_file(target, pointdirs)
     else:
         target = source
     ex._quantum_staging_path = lambda state, phase_name: target
@@ -162,6 +165,8 @@ def test_stage_aimall_inputs_writes_resolved_naat_metadata(tmp_path):
     staging = campaign / ".DATA" / "STAGING" / "initial"
     shutil.copytree(str(FIXTURES / "initial_quantum"), str(staging))
     accepted = sorted(staging.glob("POINT_*.pointdir"))[:1]
+    (accepted[0] / "input.wfn").write_text("synthetic wfn\n", encoding="utf-8")
+    stg.write_points_file(staging, sorted(staging.glob("POINT_*.pointdir")))
     stg.write_quantum_acceptance_manifest(
         staging,
         phase_name="INITIAL_GAUSSIAN",
@@ -312,6 +317,7 @@ def test_commit_initial_training_set_uses_aimall_acceptance_manifest(tmp_path):
     bad.mkdir(parents=True)
     (good / "accepted.txt").write_text("good\n", encoding="utf-8")
     (bad / "rejected.txt").write_text("bad\n", encoding="utf-8")
+    stg.write_points_file(initial, [bad, good])
     stg.write_quantum_acceptance_manifest(
         initial,
         phase_name="INITIAL_AIMALL",
@@ -355,6 +361,7 @@ def test_live_append_commits_global_pointdir_names_from_manifest(tmp_path):
     new_point = live_staging / "POINT_0000.pointdir"
     new_point.mkdir(parents=True)
     (new_point / "new.txt").write_text("new\n", encoding="utf-8")
+    stg.write_points_file(live_staging, [new_point])
     stg.write_quantum_acceptance_manifest(
         live_staging,
         phase_name="AIMALL",
@@ -418,6 +425,16 @@ def _seed_models_staging(campaign_dir):
     _write_metric_csv(train_csv, 5)
     _write_metric_csv(int_csv, 2)
     _write_metric_csv(ext_csv, 2)
+    (target / "FEREBUS_QUALITY.json").write_text(
+        json.dumps({
+            "schema_version": 1,
+            "training_version": 0,
+            "accepted": True,
+            "summary": {},
+            "tasks": [],
+        }),
+        encoding="utf-8",
+    )
     (target / stg.FEREBUS_TASK_MANIFEST).write_text(
         json.dumps({
             "schema_version": stg.FEREBUS_TASK_SCHEMA_VERSION,
@@ -512,7 +529,7 @@ def _write_loadable_model(
 def test_ferebus_parser_happy_path_commits_models_version(tmp_path):
     ex = _make_executor(tmp_path)
     _seed_models_staging(tmp_path / "campaign")
-    state = SimpleNamespace(iteration=3, campaign_uid="m16-test")
+    state = SimpleNamespace(iteration=3, campaign_uid="m16-test", training_set_version=0)
     result = ex._parse_ferebus_postprocess(
         state, CampaignPhase("FEREBUS"), observations=[],
     )
@@ -551,6 +568,7 @@ def test_initial_ferebus_also_commits_training_set_version_zero(tmp_path):
             for s in child.iterdir():
                 if s.is_file():
                     (sub / s.name).write_bytes(s.read_bytes())
+    stg.write_points_file(initial_staging, [dst_pdir])
     stg.write_quantum_acceptance_manifest(
         initial_staging,
         phase_name="INITIAL_AIMALL",
@@ -586,7 +604,7 @@ def test_ferebus_parser_rejects_empty_staging(tmp_path):
 def test_ferebus_parser_rejects_missing_staging(tmp_path):
     ex = _make_executor(tmp_path)
     # Do not create the staging dir.
-    state = SimpleNamespace(iteration=2, campaign_uid="m16-test")
+    state = SimpleNamespace(iteration=2, campaign_uid="m16-test", training_set_version=0)
     result = ex._parse_ferebus_postprocess(
         state, CampaignPhase("FEREBUS"), observations=[],
     )
@@ -662,6 +680,14 @@ def _seed_ariadne_pool(campaign_dir, iteration, *, n_seeds=3):
     )
     pool_dir.mkdir(parents=True, exist_ok=True)
     src = FIXTURES / "ariadne_pool"
+    seeds_manifest = json.loads(
+        (
+            campaign_dir / "7_ACTIVE_LEARNING"
+            / ("iteration-" + str(iteration).zfill(4))
+            / "seeds_picked.json"
+        ).read_text(encoding="utf-8")
+    )
+    trajectory_sha256 = str(seeds_manifest["trajectory_sha256"])
     for i in range(n_seeds):
         name = "seed_" + str(i).zfill(4)
         target = pool_dir / name
@@ -672,6 +698,7 @@ def _seed_ariadne_pool(campaign_dir, iteration, *, n_seeds=3):
             payload["iteration"] = int(iteration)
             payload["seed_index"] = int(i)
             payload["seed_frame_id"] = int(i)
+            payload["trajectory_sha256"] = trajectory_sha256
             (target / "result.json").write_text(
                 json.dumps(payload, indent=2),
                 encoding="utf-8",
@@ -990,7 +1017,7 @@ def _seed_phase_b_sample(campaign_dir, iteration):
     return iter_dir
 
 
-def _write_phase_b_manifest(iter_dir, *, n_final=1):
+def _write_phase_b_manifest(iter_dir, *, n_final=1, write_sample=True):
     from ichor.hpc.active_learning.handoff_manifests import (
         PHASE_B_SELECTION_SCHEMA_VERSION,
         write_phase_b_selection_manifest,
@@ -1001,9 +1028,15 @@ def _write_phase_b_manifest(iter_dir, *, n_final=1):
     )
 
     records = []
+    xyz_lines = []
     pool_dir = iter_dir / "pool"
     pool_dir.mkdir(parents=True, exist_ok=True)
     for i in range(int(n_final)):
+        coords = [
+            [0.0, 0.0, 0.0],
+            [0.96 + i * 0.01, 0.0, 0.0],
+            [-0.24, 0.93 + i * 0.01, 0.0],
+        ]
         seed_dir = pool_dir / ("seed_" + str(i).zfill(4))
         seed_dir.mkdir(parents=True, exist_ok=True)
         result_path = seed_dir / "result.json"
@@ -1012,8 +1045,9 @@ def _write_phase_b_manifest(iter_dir, *, n_final=1):
                 "iteration": int(iter_dir.name.split("-")[-1]),
                 "seed_index": int(i),
                 "seed_frame_id": int(i),
+                "trajectory_sha256": "0" * 64,
                 "atom_types": ["O", "H", "H"],
-                "final_coordinates": [[0.0, 0.0, 0.0], [0.96, 0.0, 0.0], [-0.24, 0.93, 0.0]],
+                "final_coordinates": coords,
                 "alpha_initial": 0.0,
                 "alpha_final": 1.0,
                 "alpha_trajectory": [0.0, 1.0],
@@ -1053,6 +1087,19 @@ def _write_phase_b_manifest(iter_dir, *, n_final=1):
             "kept_after_dedup": True,
             "drop_reason": None,
         })
+        xyz_lines.extend([
+            "3",
+            "seed_" + str(i).zfill(4),
+            "O " + " ".join(str(x) for x in coords[0]),
+            "H " + " ".join(str(x) for x in coords[1]),
+            "H " + " ".join(str(x) for x in coords[2]),
+        ])
+    if write_sample:
+        (iter_dir / "phase_b_SAMPLE.xyz").write_text(
+            "\n".join(xyz_lines) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
     write_phase_b_selection_manifest(iter_dir, {
         "schema_version": PHASE_B_SELECTION_SCHEMA_VERSION,
         "iteration": int(iter_dir.name.split("-")[-1]),
@@ -1181,7 +1228,7 @@ def test_polus_phase_b_missing_sample(tmp_path):
         tmp_path / "campaign" / "7_ACTIVE_LEARNING" / "iteration-0005"
     )
     iter_dir.mkdir(parents=True, exist_ok=True)
-    _write_phase_b_manifest(iter_dir, n_final=1)
+    _write_phase_b_manifest(iter_dir, n_final=1, write_sample=False)
     state = SimpleNamespace(iteration=5, campaign_uid="m16-test")
     result = ex._parse_polus_postprocess(
         state, CampaignPhase("PHASE_B_POLUS"), observations=[],
@@ -1198,7 +1245,7 @@ def test_polus_phase_b_raw_sample_only_is_rejected(tmp_path):
     iter_dir.mkdir(parents=True, exist_ok=True)
     src = FIXTURES / "polus_phase_b" / "phase_b_SAMPLE.xyz"
     (iter_dir / "phase_b_SAMPLE_raw.xyz").write_bytes(src.read_bytes())
-    _write_phase_b_manifest(iter_dir, n_final=1)
+    _write_phase_b_manifest(iter_dir, n_final=1, write_sample=False)
     state = SimpleNamespace(iteration=5, campaign_uid="m16-test")
     result = ex._parse_polus_postprocess(
         state, CampaignPhase("PHASE_B_POLUS"), observations=[],
@@ -1252,7 +1299,7 @@ def test_polus_phase_b_unreadable_sample_fails(tmp_path):
     )
     iter_dir.mkdir(parents=True, exist_ok=True)
     (iter_dir / "phase_b_SAMPLE.xyz").write_text("garbage no frames here", encoding="utf-8")
-    _write_phase_b_manifest(iter_dir, n_final=1)
+    _write_phase_b_manifest(iter_dir, n_final=1, write_sample=False)
     state = SimpleNamespace(iteration=5, campaign_uid="m16-test")
     result = ex._parse_polus_postprocess(
         state, CampaignPhase("PHASE_B_POLUS"), observations=[],

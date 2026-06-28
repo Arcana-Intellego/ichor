@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import ichor.hpc.active_learning.cli as cli_mod
+import ichor.hpc.active_learning.daemon.reconcile as reconcile_mod
 from ichor.hpc.active_learning.cli import cmd_reconcile, cmd_start
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
@@ -97,6 +98,7 @@ def _write_archived_bootstrap_handoff(campaign, *, phase, suffix="20260627-20192
     pointdir = initial / "POINT_0000.pointdir"
     pointdir.mkdir(parents=True, exist_ok=True)
     (pointdir / "input.wfn").write_text("wfn\n", encoding="utf-8")
+    stg.write_points_file(initial, [pointdir])
     stg.write_quantum_acceptance_manifest(
         initial,
         phase_name=phase,
@@ -748,6 +750,9 @@ def test_reconcile_apply_cleans_transient_halted_ariadne_reentry(
     committed_model = campaign / "6_TRAINED_MODELS" / "iteration-0000"
     committed_model.mkdir()
     (committed_model / "marker.txt").write_text("committed\n", encoding="utf-8")
+    committed_training = campaign / "5_TRAINING" / "iteration-0000"
+    committed_training.mkdir()
+    (committed_training / "marker.txt").write_text("committed\n", encoding="utf-8")
 
     first_state = fresh_campaign_state(max_iterations=1)
     first_state.phase = CampaignPhase.HALTED
@@ -851,6 +856,7 @@ def test_reconcile_apply_keeps_data_staging_blocked_for_non_ferebus_reentry(tmp_
 def test_reconcile_apply_archive_staging_explicitly_handles_non_ferebus_reentry(
     tmp_path,
     capsys,
+    monkeypatch,
 ):
     campaign = _campaign(tmp_path)
     _write_pool(campaign)
@@ -866,6 +872,21 @@ def test_reconcile_apply_archive_staging_explicitly_handles_non_ferebus_reentry(
     staging = mv.stage(None, 0)
     (staging / "marker.txt").write_text("model", encoding="utf-8")
     mv.commit(0)
+    monkeypatch.setattr(
+        reconcile_mod,
+        "verify_committed_model_version",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        reconcile_mod,
+        "_validate_recovered_state_contract",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_reconcile_apply_contract_error",
+        lambda *args, **kwargs: None,
+    )
 
     state = fresh_campaign_state(max_iterations=3)
     state.phase = CampaignPhase.HALTED

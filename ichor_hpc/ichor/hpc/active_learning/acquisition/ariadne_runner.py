@@ -2072,6 +2072,7 @@ def main(argv=None) -> int:
     payload["seed_frame_id"] = seed_frame_id
     payload["seed_index"] = int(args.seed_index)
     payload["iteration"] = int(args.iteration)
+    payload["trajectory_sha256"] = str(pool.sha256)
     allow_seed_fallback = bool(
         getattr(getattr(config, "adversarial_safety", None), "allow_seed_fallback", False)
     )

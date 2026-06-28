@@ -88,6 +88,7 @@ from .daemon.status_recommendations import (
     build_status_recommendations,
     recommendation_dicts,
 )
+from .versioning.training_set import TrainingSetVersioning
 
 
 __all__ = [
@@ -2319,7 +2320,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     archive_staging_requested = bool(getattr(args, "archive_staging", False))
     campaign = resolve_campaign_dir(
         args.campaign_dir,
-        require_campaign_yaml=not restore_config,
+        require_campaign_yaml=False,
     )
     runtime_status = _reconcile_runtime_status(campaign)
     if archive_staging_requested and not bool(getattr(args, "apply", False)):
@@ -2719,6 +2720,27 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         print("  - " + contract_error, file=sys.stderr)
+        _print_cleanup_already_happened(cleanup_paths_already_done)
+        return 9
+
+    try:
+        state_train_version = int(report.proposed_state.training_set_version)
+        if state_train_version >= 0:
+            TrainingSetVersioning(campaign / "5_TRAINING").ensure_current(
+                state_train_version
+            )
+        state_model_version = int(report.proposed_state.models_version)
+        if state_model_version >= 0:
+            TrainingSetVersioning(campaign / "6_TRAINED_MODELS").ensure_current(
+                state_model_version
+            )
+    except Exception as exc:
+        print(
+            "refusing --apply because committed current pointers could not be "
+            "repaired:",
+            file=sys.stderr,
+        )
+        print("  - " + type(exc).__name__ + ": " + str(exc), file=sys.stderr)
         _print_cleanup_already_happened(cleanup_paths_already_done)
         return 9
 

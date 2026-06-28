@@ -113,6 +113,33 @@ def _config_path_for(root: Path, task: FerebusTask, *, committed: bool) -> Path:
     return task.config_path
 
 
+def _resolve_under(root: Path, raw: Path, label: str) -> Path:
+    base = Path(root).resolve(strict=False)
+    path = Path(raw)
+    if not path.is_absolute():
+        path = base / path
+    try:
+        resolved = path.resolve(strict=False)
+    except OSError as exc:
+        raise ModelContractError(label + "_path_unresolvable: " + str(path)) from exc
+    if resolved != base and base not in resolved.parents:
+        raise ModelContractError(label + "_path_escapes_staging: " + str(path))
+    if path.is_symlink() or resolved.is_symlink():
+        raise ModelContractError(label + "_path_is_symlink: " + str(path))
+    return resolved
+
+
+def _version_from_iteration_dir(root: Path) -> Optional[int]:
+    name = Path(root).name
+    prefix = "iteration-"
+    if not name.startswith(prefix):
+        return None
+    try:
+        return int(name[len(prefix):])
+    except ValueError:
+        return None
+
+
 def _count_section_rows(path: Path, section: str) -> Optional[int]:
     marker = "[" + section + "]"
     try:
@@ -252,6 +279,7 @@ def validate_ferebus_model_contract(
     root_dir: Path,
     *,
     committed: bool = False,
+    expected_version: Optional[int] = None,
 ) -> None:
     """Validate a staged or committed FEREBUS model directory.
 
@@ -265,13 +293,76 @@ def validate_ferebus_model_contract(
     if not root.is_dir():
         raise ModelContractError("ferebus_model_root_missing: " + str(root))
     manifest = _stg.read_ferebus_manifest(root)
+    if committed:
+        if expected_version is None:
+            expected_version = _version_from_iteration_dir(root)
+        manifest_training_version = manifest.get("training_version")
+        if expected_version is not None:
+            try:
+                parsed_training_version = int(manifest_training_version)
+            except (TypeError, ValueError) as exc:
+                raise ModelContractError("ferebus_manifest_training_version_invalid") from exc
+            if parsed_training_version != int(expected_version):
+                raise ModelContractError(
+                    "ferebus_manifest_training_version_mismatch: "
+                    + str(parsed_training_version)
+                    + "!="
+                    + str(int(expected_version))
+                )
+        try:
+            from .ferebus_quality import (
+                FEREBUS_QUALITY_MANIFEST,
+                FEREBUS_QUALITY_SCHEMA_VERSION,
+            )
+            import json as _json
+
+            quality_path = root / FEREBUS_QUALITY_MANIFEST
+            if not quality_path.is_file():
+                raise ModelContractError("ferebus_quality_manifest_missing")
+            quality = _json.loads(quality_path.read_text(encoding="utf-8"))
+            if not isinstance(quality, Mapping):
+                raise ModelContractError("ferebus_quality_manifest_invalid")
+            if int(quality.get("schema_version", -1)) != FEREBUS_QUALITY_SCHEMA_VERSION:
+                raise ModelContractError("ferebus_quality_manifest_schema_mismatch")
+            if int(quality.get("training_version", -999999)) != int(manifest.get("training_version", -1)):
+                raise ModelContractError("ferebus_quality_training_version_mismatch")
+            if not bool(quality.get("accepted", False)):
+                raise ModelContractError("ferebus_quality_manifest_rejected")
+        except ModelContractError:
+            raise
+        except Exception as exc:
+            raise ModelContractError(
+                "ferebus_quality_manifest_invalid: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)
+            ) from exc
     system = str(manifest.get("system"))
     tasks = _manifest_tasks(manifest)
+    if not committed:
+        for raw_task in manifest.get("tasks", []):
+            if not isinstance(raw_task, Mapping):
+                raise ModelContractError("ferebus_manifest_task_invalid")
+            for key in (
+                "property_dir",
+                "output_dir",
+                "input_dir",
+                "config_path",
+                "training_csv",
+                "int_validation_csv",
+                "ext_validation_csv",
+                "expected_model_path",
+            ):
+                if key in raw_task:
+                    _resolve_under(root, Path(str(raw_task[key])), "ferebus_" + key)
     expected_models = set()
     model_paths: List[Tuple[FerebusTask, Path]] = []
     for task in tasks:
         config_path = _config_path_for(root, task, committed=committed)
         model_path = _model_path_for(root, task, committed=committed)
+        if not committed:
+            config_path = _resolve_under(root, config_path, "ferebus_config")
+            model_path = _resolve_under(root, model_path, "ferebus_model")
         expected_models.add(model_path.resolve())
         if not config_path.is_file():
             raise ModelContractError("ferebus_config_missing: " + str(config_path))

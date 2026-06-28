@@ -31,13 +31,19 @@ def test_copytree_no_symlinks_rejects_symlinked_pointdir_child(tmp_path):
 def test_quantum_acceptance_manifest_reports_malformed_n_total(tmp_path):
     path = tmp_path / stg.QUANTUM_ACCEPTANCE_MANIFEST
     path.write_text(
-        json.dumps({
-            "schema_version": stg.QUANTUM_ACCEPTANCE_SCHEMA_VERSION,
-            "accepted_pointdirs": [],
-            "rejected": [],
-            "n_total": "not-an-integer",
+            json.dumps({
+                "schema_version": stg.QUANTUM_ACCEPTANCE_SCHEMA_VERSION,
+                "phase": "GAUSSIAN",
+                "iteration": 0,
+                "accepted_pointdirs": [],
+                "rejected": [],
+                "n_total": "not-an-integer",
         }),
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="n_total is not an integer"):
-        stg.read_quantum_acceptance_manifest(tmp_path)
+        stg.read_quantum_acceptance_manifest(
+            tmp_path,
+            expected_phase="GAUSSIAN",
+            expected_iteration=0,
+        )

@@ -995,6 +995,21 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 + str(exc)
             ) from exc
 
+    def _inline_seed_select(self, state):
+        """Live SEED_SELECT must never use the dry-run no-pool placeholder."""
+        from ..acquisition.trajectory_pool import TrajectoryPool
+
+        try:
+            TrajectoryPool.load(self.campaign_dir)
+        except Exception as exc:
+            raise BackendSubmissionError(
+                "live seed selection requires an imported trajectory pool: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)
+            ) from exc
+        return super()._inline_seed_select(state)
+
     def _inline_append(self, state):
         """Live APPEND: commit the validated quantum outputs staged at
         .DATA/STAGING/iter_<N>/POINT_* into the training set -- the real
@@ -1016,6 +1031,13 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         state_version = int(getattr(state, "training_set_version", 0))
         committed_max = max(committed) if committed else -1
         if committed_max > state_version:
+            if int(committed_max) != int(state_version) + 1:
+                raise BackendSubmissionError(
+                    "training_set_version_gap: state="
+                    + str(state_version)
+                    + " committed_versions="
+                    + repr(committed)
+                )
             v.ensure_current(committed_max)
             self._journal_event(
                 "training_set_committed",
@@ -1041,6 +1063,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 staging_root,
                 expected_phase="AIMALL",
                 expected_iteration=int(state.iteration),
+                require_points_file_membership=True,
             )
         except Exception as exc:
             raise BackendSubmissionError(
@@ -1203,7 +1226,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
     # --- postprocess (CSF4-only implementation) -------------------------
 
-    def _parse_staged_pointdirs(self, staging_root, *, validators):
+    def _parse_staged_pointdirs(self, staging_root, *, validators, allowed_pointdir_names=None):
         """Walk staging_root for POINT_*.pointdir/ children, run
         every validator on each, return (kept, rejected).
 
@@ -1231,7 +1254,26 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         rejected = []
         if not staging_root.is_dir():
             return kept, rejected
-        for child in sorted(staging_root.iterdir()):
+        allowed = None
+        if allowed_pointdir_names is not None:
+            allowed = {str(name) for name in allowed_pointdir_names}
+            actual = {
+                child.name
+                for child in staging_root.iterdir()
+                if child.is_dir() and PointDirectory.check_path(child)
+            }
+            extras = sorted(actual - allowed)
+            if extras:
+                raise ValueError(
+                    "staging contains unsubmitted pointdirs: " + ", ".join(extras[:5])
+                )
+        children = sorted(staging_root.iterdir()) if allowed is None else [
+            staging_root / name for name in sorted(allowed)
+        ]
+        for child in children:
+            if allowed is not None and not child.exists():
+                rejected.append((child.name, "submitted_pointdir_missing"))
+                continue
             if not (child.is_dir() and PointDirectory.check_path(child)):
                 continue
             pdir = PointDirectory(child)
@@ -1337,6 +1379,14 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         validators = self._validators_for(phase_name)
         from . import input_staging as _stg
 
+        if not Path(staging_root).is_dir():
+            return PhaseResult(
+                is_complete=True,
+                failure_reason=(
+                    "no_pointdirs_in_staging: " + str(staging_root)
+                ),
+            )
+
         if "AIMALL" in phase_name:
             from ichor.core.files.point_directory import PointDirectory
             from .quantum_quality import (
@@ -1350,6 +1400,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     staging_root,
                     expected_phase=expected_phase,
                     expected_iteration=int(state.iteration),
+                    require_points_file_membership=True,
                 )
             except Exception as exc:
                 return PhaseResult(
@@ -1477,9 +1528,23 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         reason=type(exc).__name__ + ": " + str(exc)[:240],
                     )
         else:
-            kept, rejected = self._parse_staged_pointdirs(
-                staging_root, validators=validators,
-            )
+            try:
+                allowed_names = _stg._points_file_names(staging_root)
+                kept, rejected = self._parse_staged_pointdirs(
+                    staging_root,
+                    validators=validators,
+                    allowed_pointdir_names=allowed_names,
+                )
+            except Exception as exc:
+                return PhaseResult(
+                    is_complete=True,
+                    failure_reason=(
+                        "quantum_task_membership_invalid: "
+                        + type(exc).__name__
+                        + ": "
+                        + str(exc)[:180]
+                    ),
+                )
         _stg.write_quantum_acceptance_manifest(
             staging_root,
             phase_name=phase_name,
@@ -1503,6 +1568,16 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 is_complete=True,
                 failure_reason=(
                     "no_pointdirs_in_staging: " + str(staging_root)
+                ),
+            )
+        if len(kept) == 0:
+            return PhaseResult(
+                is_complete=True,
+                failure_reason=(
+                    "no_quantum_outputs_accepted: "
+                    + str(len(rejected))
+                    + "/"
+                    + str(n_total)
                 ),
             )
 
@@ -1756,6 +1831,56 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
         staging = self._models_staging_path()
+        v_models = self._versioning("models")
+        committed = v_models.list_committed_versions()
+        is_initial = phase_name == "INITIAL_FEREBUS"
+        if is_initial:
+            expected_next = 0
+        else:
+            expected_next = int(getattr(state, "training_set_version", -1))
+            if expected_next < 0:
+                return PhaseResult(
+                    is_complete=True,
+                    failure_reason=(
+                        "ferebus_training_version_invalid: "
+                        + repr(getattr(state, "training_set_version", None))
+                    ),
+                )
+        if expected_next in committed:
+            next_version = int(expected_next)
+            v_models.ensure_current(next_version)
+            committed_dir = v_models.iteration_path(next_version)
+            try:
+                from .model_contract import validate_ferebus_model_contract
+                validate_ferebus_model_contract(
+                    committed_dir,
+                    committed=True,
+                    expected_version=next_version,
+                )
+            except Exception as exc:
+                return PhaseResult(
+                    is_complete=True,
+                    failure_reason=(
+                        "committed_model_contract_invalid: "
+                        + type(exc).__name__
+                        + ": "
+                        + str(exc)
+                    ),
+                )
+            self._journal_event(
+                "models_committed",
+                phase=phase_name,
+                iteration=int(state.iteration),
+                models_version=int(next_version),
+                idempotent_skip=True,
+            )
+            state_updates = {"models_version": int(next_version), "validation_set_version": int(next_version)}
+            if is_initial:
+                from . import input_staging as _stg
+                _stg.commit_initial_training_set(self.campaign_dir)
+                state_updates["training_set_version"] = 0
+            return PhaseResult(is_complete=True, state_updates=state_updates)
+
         ok, reason = validate_ferebus_completed(staging)
         if not ok:
             self._journal_event(
@@ -1806,53 +1931,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 ),
             )
 
-        v_models = self._versioning("models")
         v_models.recover_dangling_staging()
-        committed = v_models.list_committed_versions()
-        is_initial = phase_name == "INITIAL_FEREBUS"
-        if is_initial:
-            expected_next = 0
-        else:
-            expected_next = int(getattr(state, "training_set_version", -1))
-            if expected_next < 0:
-                return PhaseResult(
-                    is_complete=True,
-                    failure_reason=(
-                        "ferebus_training_version_invalid: "
-                        + repr(getattr(state, "training_set_version", None))
-                    ),
-                )
-        if expected_next in committed:
-            next_version = int(expected_next)
-            v_models.ensure_current(next_version)
-            committed_dir = v_models.iteration_path(next_version)
-            try:
-                from .model_contract import validate_ferebus_model_contract
-                validate_ferebus_model_contract(committed_dir, committed=True)
-            except Exception as exc:
-                return PhaseResult(
-                    is_complete=True,
-                    failure_reason=(
-                        "committed_model_contract_invalid: "
-                        + type(exc).__name__
-                        + ": "
-                        + str(exc)
-                    ),
-                )
-            self._journal_event(
-                "models_committed",
-                phase=phase_name,
-                iteration=int(state.iteration),
-                models_version=int(next_version),
-                idempotent_skip=True,
-            )
-            state_updates = {"models_version": int(next_version), "validation_set_version": int(next_version)}
-            if is_initial:
-                from . import input_staging as _stg
-                _stg.commit_initial_training_set(self.campaign_dir)
-                state_updates["training_set_version"] = 0
-            return PhaseResult(is_complete=True, state_updates=state_updates)
-
         next_version = int(expected_next)
         source_version = None if is_initial else (
             max(committed) if committed else None
@@ -1888,7 +1967,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         try:
             from .model_contract import validate_ferebus_model_contract
 
-            validate_ferebus_model_contract(staged, committed=True)
+            validate_ferebus_model_contract(
+                staged,
+                committed=True,
+                expected_version=next_version,
+            )
         except Exception as exc:
             self._journal_event(
                 "quantum_output_rejected",
@@ -1911,7 +1994,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         committed_dir = v_models.iteration_path(next_version)
         try:
             from .model_contract import validate_ferebus_model_contract
-            validate_ferebus_model_contract(committed_dir, committed=True)
+            validate_ferebus_model_contract(
+                committed_dir,
+                committed=True,
+                expected_version=next_version,
+            )
         except Exception as exc:
             self._journal_event(
                 "quantum_output_rejected",
@@ -1992,18 +2079,22 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
         seed_records = list(picked.get("seed_records", []))
         expected_n = int(picked.get("n_picked", len(seed_records)))
+        trajectory_pool = None
         try:
             from ..acquisition.trajectory_pool import TrajectoryPool
 
             trajectory_pool = TrajectoryPool.load(self.campaign_dir)
         except Exception as exc:
-            return PhaseResult(
-                is_complete=True,
-                failure_reason=(
-                    "trajectory_pool_invalid_for_ariadne_validation: "
+            self._journal_event(
+                "ariadne_optional_diagnostics_warning",
+                phase=phase_name,
+                iteration=int(state.iteration),
+                seed_dir="pool",
+                reason=(
+                    "trajectory_pool_unavailable_for_atom_order_check: "
                     + type(exc).__name__
                     + ": "
-                    + str(exc)[:180]
+                    + str(exc)[:160]
                 ),
             )
         kept_alphas = []
@@ -2126,7 +2217,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             try:
                 seed_frame_id = seed_record.get("frame_id")
                 expected_atom_types = None
-                if seed_frame_id is not None:
+                if trajectory_pool is not None and seed_frame_id is not None:
                     seed_atoms = trajectory_pool.frame(int(seed_frame_id))
                     expected_atom_types = [str(atom.type) for atom in seed_atoms]
                 validated = validate_ariadne_result(
@@ -2651,6 +2742,15 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         + str(len(final_records))
                     ),
                 )
+            coordinate_error = self._phase_b_sample_coordinate_mismatch(
+                sample,
+                final_records,
+            )
+            if coordinate_error is not None:
+                return PhaseResult(
+                    is_complete=True,
+                    failure_reason="phase_b_selection_content_mismatch: " + coordinate_error,
+                )
             for rec in final_records:
                 seed_dir = _Path(str(rec["seed_dir"]))
                 enrich_with_phase_b(
@@ -2713,6 +2813,81 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 return None
             count += 1
         return count
+
+    def _read_xyz_records(self, sample_path):
+        from pathlib import Path as _Path
+
+        text = _Path(sample_path).read_text(encoding="utf-8")
+        lines = text.splitlines()
+        frames = []
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if not line or line.startswith("#"):
+                i += 1
+                continue
+            try:
+                natoms = int(line)
+            except ValueError:
+                raise ValueError("XYZ frame atom count is not an integer")
+            if natoms <= 0:
+                raise ValueError("XYZ frame atom count must be positive")
+            if i + 2 + natoms > len(lines):
+                raise ValueError("XYZ frame is truncated")
+            atoms = []
+            coords = []
+            for raw in lines[i + 2 : i + 2 + natoms]:
+                parts = raw.split()
+                if len(parts) < 4:
+                    raise ValueError("XYZ atom line has fewer than four columns")
+                atoms.append(str(parts[0]))
+                coords.append([float(parts[1]), float(parts[2]), float(parts[3])])
+            frames.append({"atom_types": atoms, "coordinates": coords})
+            i += 2 + natoms
+        return frames
+
+    def _phase_b_sample_coordinate_mismatch(self, sample_path, final_records):
+        import json as _json
+        import math as _math
+
+        try:
+            frames = self._read_xyz_records(sample_path)
+        except Exception as exc:
+            return "sample_xyz_unreadable: " + type(exc).__name__ + ": " + str(exc)
+        if len(frames) != len(final_records):
+            return "sample frame count differs from final records"
+        tolerance = 5.0e-6
+        for index, (frame, rec) in enumerate(zip(frames, final_records)):
+            result_path = Path(str(rec.get("result_json", "")))
+            try:
+                result = _json.loads(result_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                return (
+                    "result_json_unreadable for final_index "
+                    + str(index)
+                    + ": "
+                    + type(exc).__name__
+                )
+            expected_atoms = [str(x) for x in (result.get("atom_types") or [])]
+            expected_coords = result.get("final_coordinates") or []
+            if frame["atom_types"] != expected_atoms:
+                return "atom order mismatch at final_index " + str(index)
+            if len(frame["coordinates"]) != len(expected_coords):
+                return "coordinate row count mismatch at final_index " + str(index)
+            for atom_i, (actual, expected) in enumerate(zip(frame["coordinates"], expected_coords)):
+                if not isinstance(expected, list) or len(expected) != 3:
+                    return "result coordinate shape mismatch at final_index " + str(index)
+                for axis, (a, e) in enumerate(zip(actual, expected)):
+                    if not _math.isclose(float(a), float(e), rel_tol=0.0, abs_tol=tolerance):
+                        return (
+                            "coordinate mismatch at final_index "
+                            + str(index)
+                            + " atom "
+                            + str(atom_i)
+                            + " axis "
+                            + str(axis)
+                        )
+        return None
 
 
 

@@ -154,6 +154,10 @@ def stateful_campaign_artifacts(campaign_dir: Union[str, Path]) -> List[str]:
     add_matches("5_TRAINING/iteration-*")
     add_matches("6_TRAINED_MODELS/iteration-*")
     add_matches("7_ACTIVE_LEARNING/iteration-*")
+    config_lock = campaign / ".DATA" / "ACTIVE_LEARNING" / "config_lock.json"
+    pool_manifest = campaign / ".DATA" / "TRAJECTORY" / "pool.manifest.json"
+    if config_lock.is_file() and not pool_manifest.is_file():
+        findings.append(".DATA/ACTIVE_LEARNING/config_lock.json")
     journal_path = campaign / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson"
     if journal_path.is_file():
         try:
@@ -329,6 +333,7 @@ def _validate_initial_ferebus_bootstrap(
         expected_phase=CampaignPhase.INITIAL_AIMALL.value,
         expected_iteration=int(iteration),
         require_nonempty=True,
+        require_points_file_membership=True,
     )
 
 
@@ -366,6 +371,7 @@ def _read_bootstrap_handoff_at(
             expected_phase=phase,
             expected_iteration=int(expected_iteration),
             require_nonempty=True,
+            require_points_file_membership=True,
         )
     except Exception:
         return None
@@ -815,6 +821,10 @@ def propose_recovery(
                 + " at "
                 + str(bootstrap_handoff.get("path"))
             )
+            if str(bootstrap_handoff.get("phase")) == CampaignPhase.INITIAL_GAUSSIAN.value:
+                trusted_artifacts.append("initial Gaussian acceptance manifest")
+            elif str(bootstrap_handoff.get("phase")) == CampaignPhase.INITIAL_AIMALL.value:
+                trusted_artifacts.append("initial AIMAll acceptance manifest")
             if bool(bootstrap_handoff.get("archived")):
                 notes.append(
                     "archived bootstrap handoff found at "
@@ -991,6 +1001,12 @@ def propose_recovery(
         recovered.phase = CampaignPhase.HALTED
         decision = "HALTED: no coherent committed training/model pair"
         notes.append("re-entry HALTED because no coherent training/model pair exists")
+    elif valid_training_versions and mv and not valid_model_versions:
+        recovered.phase = CampaignPhase.HALTED
+        decision = "HALTED: committed model artefacts are present but invalid"
+        notes.append(
+            "re-entry HALTED because committed model artefacts failed validation"
+        )
     elif valid_training_versions and not valid_model_versions:
         recovered.phase = CampaignPhase.INITIAL_FEREBUS if recovered.training_set_version == 0 else CampaignPhase.FEREBUS
         decision = recovered.phase.value + ": valid training exists without a committed model"
@@ -1025,7 +1041,7 @@ def propose_recovery(
         notes.append("re-entry at STOP_CHECK (next tick decides loop/terminate)")
     recovered.pending_jobs = {}
     recovered.shutdown_requested = False
-    if recovered.phase is not CampaignPhase.HALTED:
+    if recovered.phase is not CampaignPhase.HALTED and not active_intents:
         try:
             _validate_recovered_state_contract(
                 campaign,

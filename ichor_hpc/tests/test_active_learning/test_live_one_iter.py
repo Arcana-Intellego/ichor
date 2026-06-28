@@ -128,15 +128,30 @@ def _ensure_live_quantum_contract_names(staging_dir):
             ("*.gjf", "input.gjf"),
         ):
             target = pointdir / canonical
-            if target.exists():
-                matches = sorted(pointdir.glob(suffix))
-            else:
-                matches = sorted(pointdir.glob(suffix))
-            if matches and not target.exists():
+            matches = sorted(pointdir.glob(suffix))
+            noncanonical_matches = [old for old in matches if old.name != canonical]
+            if noncanonical_matches:
+                target.write_bytes(noncanonical_matches[0].read_bytes())
+            elif matches and not target.exists():
                 target.write_bytes(matches[0].read_bytes())
             for old in matches:
                 if old.name != canonical:
                     old.unlink()
+
+
+def _prune_unlisted_pointdirs(staging_dir):
+    """Keep fixture staging aligned with the submitted POINTS.txt array."""
+    from pathlib import Path
+    import shutil
+
+    root = Path(staging_dir)
+    points = root / "POINTS.txt"
+    if not points.is_file():
+        return
+    allowed = {Path(line.strip()).name for line in points.read_text(encoding="utf-8").splitlines() if line.strip()}
+    for pointdir in root.glob("POINT_*.pointdir"):
+        if pointdir.name not in allowed:
+            shutil.rmtree(pointdir)
 
 
 def _live_smoke_fixtures():
@@ -192,7 +207,7 @@ def _write_loadable_ferebus_model(path, *, atom, alf, ntrain=5, nfeats=3):
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _seed_pyferebus_manifest_staging(campaign_dir):
+def _seed_pyferebus_manifest_staging(campaign_dir, training_version=0):
     """Seed the pyferebus-owned staging layout expected by live validators."""
     import json
     import shutil
@@ -238,6 +253,7 @@ def _seed_pyferebus_manifest_staging(campaign_dir):
         json.dumps({
             "schema_version": stg.FEREBUS_TASK_SCHEMA_VERSION,
             "system": "WATER",
+            "training_version": int(training_version),
             "properties": ["iqa"],
             "atoms": list(specs),
             "n_tasks": len(tasks),
@@ -281,7 +297,10 @@ def _patch_ferebus_submit_for_live_smoke(monkeypatch, campaign_dir, call_log):
     calls = {"n": 0}
 
     def fake_stage(campaign_dir_arg, config, training_version, *, is_initial=False):
-        staging = _seed_pyferebus_manifest_staging(campaign_dir_arg)
+        staging = _seed_pyferebus_manifest_staging(
+            campaign_dir_arg,
+            training_version=0 if is_initial else int(training_version),
+        )
         return staging, 1
 
     def fake_submit(jd_file, working_directory, **kwargs):
@@ -296,7 +315,7 @@ def _patch_ferebus_submit_for_live_smoke(monkeypatch, campaign_dir, call_log):
         assert kwargs["overwrite_workdir"] is False
         assert kwargs["move_dataset_files"] is True
         assert str(kwargs["expected_job_name"]).endswith("-" + phase_name + "-0")
-        assert int(kwargs["expected_tasks"]) == 1
+        assert int(kwargs["expected_tasks"]) >= 1
         return FerebusSubmission(
             job_id=str(19000 + calls["n"]),
             cluster=None,
@@ -346,10 +365,13 @@ def _annotate_ariadne_fixture_results(campaign_dir, iteration):
         data["iteration"] = int(iteration)
         data["seed_index"] = seed_index
         data["seed_frame_id"] = int(rec["frame_id"])
+        data["trajectory_sha256"] = str(picked.get("trajectory_sha256", ""))
         result_path.write_text(_json.dumps(data, indent=2), encoding="utf-8")
 
 
 def _write_phase_b_selection_for_live_smoke(campaign_dir, iteration):
+    import json as _json
+    from pathlib import Path
     from ichor.hpc.active_learning.handoff_manifests import (
         PHASE_B_SELECTION_SCHEMA_VERSION,
         read_ariadne_results_manifest,
@@ -367,6 +389,7 @@ def _write_phase_b_selection_for_live_smoke(campaign_dir, iteration):
         expected_iteration=int(iteration),
     )
     records = []
+    xyz_lines = []
     for final_index, source in enumerate(ariadne_manifest["accepted"][:n_final]):
         rec = dict(source)
         rec["candidate_index"] = int(final_index)
@@ -375,6 +398,21 @@ def _write_phase_b_selection_for_live_smoke(campaign_dir, iteration):
         rec["kept_after_dedup"] = True
         rec["drop_reason"] = None
         records.append(rec)
+        result = _json.loads(Path(str(rec["result_json"])).read_text(encoding="utf-8"))
+        atom_types = [str(x) for x in result["atom_types"]]
+        coords = result["final_coordinates"]
+        xyz_lines.append(str(len(atom_types)))
+        xyz_lines.append("fixture phase_b final " + str(final_index))
+        for atom, coord in zip(atom_types, coords):
+            xyz_lines.append(
+                "{atom} {x:.6f} {y:.6f} {z:.6f}".format(
+                    atom=atom,
+                    x=float(coord[0]),
+                    y=float(coord[1]),
+                    z=float(coord[2]),
+                )
+            )
+    final_sample.write_text("\n".join(xyz_lines) + "\n", encoding="utf-8")
     write_phase_b_selection_manifest(iter_dir, {
         "schema_version": PHASE_B_SELECTION_SCHEMA_VERSION,
         "iteration": int(iteration),
@@ -437,14 +475,19 @@ def _live_smoke_seed_for_phase(campaign_dir, phase_name, iteration):
         target = campaign_dir / ".DATA" / "STAGING" / "initial"
         _copy_tree(fixtures / "initial_quantum", target)
         _ensure_live_quantum_contract_names(target)
+        _prune_unlisted_pointdirs(target)
     elif phase_name in ("GAUSSIAN", "AIMALL"):
         target = (
             campaign_dir / ".DATA" / "STAGING" / ("iter_" + str(int(iteration)))
         )
         _copy_tree(fixtures / "iter_quantum", target)
         _ensure_live_quantum_contract_names(target)
+        _prune_unlisted_pointdirs(target)
     elif phase_name in ("INITIAL_FEREBUS", "FEREBUS"):
-        _seed_pyferebus_manifest_staging(campaign_dir)
+        _seed_pyferebus_manifest_staging(
+            campaign_dir,
+            training_version=0 if phase_name == "INITIAL_FEREBUS" else 1,
+        )
     elif phase_name == "ARIADNE_ARRAY":
         target = campaign_dir / "7_ACTIVE_LEARNING" / iter4 / "pool"
         _copy_tree(fixtures / "ariadne_pool", target)
@@ -498,12 +541,23 @@ def _build_live_smoke_poller():
     )
 
     def poller(job_id, **kwargs):
-        return [JobObservation(
-            job_id=str(job_id),
-            status=JobStatus.COMPLETED,
-            exit_code=(0, 0),
-            elapsed_seconds=0,
-        )]
+        expected = int(kwargs.get("expected_task_count") or 1)
+        if expected <= 1:
+            return [JobObservation(
+                job_id=str(job_id),
+                status=JobStatus.COMPLETED,
+                exit_code=(0, 0),
+                elapsed_seconds=0,
+            )]
+        return [
+            JobObservation(
+                job_id=str(job_id) + "_" + str(idx),
+                status=JobStatus.COMPLETED,
+                exit_code=(0, 0),
+                elapsed_seconds=0,
+            )
+            for idx in range(expected)
+        ]
     return poller
 
 

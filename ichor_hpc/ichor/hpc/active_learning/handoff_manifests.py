@@ -450,7 +450,9 @@ def validate_ariadne_result(
         raise HandoffManifestError("wrong_seed_frame")
     if expected_trajectory_sha256:
         result_sha = result.get("trajectory_sha256")
-        if result_sha is not None and str(result_sha) != str(expected_trajectory_sha256):
+        if result_sha is None:
+            raise HandoffManifestError("missing_trajectory_sha256")
+        if str(result_sha) != str(expected_trajectory_sha256):
             raise HandoffManifestError("wrong_trajectory_sha256")
     return_code = int(result.get("return_code"))
     if return_code != 0:
@@ -501,6 +503,7 @@ def validate_ariadne_result(
         "alpha_trajectory": [float(x) for x in alpha_trajectory],
         "n_evaluations": n_evaluations,
         "return_code": return_code,
+        "trajectory_sha256": str(result.get("trajectory_sha256", "")),
         "wall_seconds": wall_seconds,
         "fell_back_to_ds": bool(result.get("fell_back_to_ds", False)),
         "whitened_distance_final": whitened,
@@ -587,9 +590,20 @@ def read_ariadne_results_manifest(
         raise HandoffManifestError("ARIADNE results manifest accepted must be a list")
     if not isinstance(rejected, list):
         raise HandoffManifestError("ARIADNE results manifest rejected must be a list")
+    n_accepted = data.get("n_accepted")
+    if n_accepted is not None and int(n_accepted) != len(accepted):
+        raise HandoffManifestError("ARIADNE n_accepted does not match accepted length")
+    n_rejected = data.get("n_rejected")
+    if n_rejected is not None and int(n_rejected) != len(rejected):
+        raise HandoffManifestError("ARIADNE n_rejected does not match rejected length")
+    expected_n = data.get("expected_n")
+    if expected_n is not None and int(expected_n) != len(accepted) + len(rejected):
+        raise HandoffManifestError("ARIADNE expected_n does not match accepted+rejected length")
     if require_nonempty and not accepted:
         raise HandoffManifestError("ARIADNE results manifest accepted list is empty")
     seen = set()
+    normalised_accepted = []
+    trajectory_sha = str(data.get("trajectory_sha256") or "")
     for rec in accepted:
         if not isinstance(rec, dict):
             raise HandoffManifestError("accepted ARIADNE record must be an object")
@@ -597,14 +611,50 @@ def read_ariadne_results_manifest(
         if seed_index in seen:
             raise HandoffManifestError("duplicate accepted ARIADNE seed_index")
         seen.add(seed_index)
+        out_rec = dict(rec)
         for key in ("seed_dir", "result_json", "provenance_json"):
-            resolve_handoff_path(
+            resolved = resolve_handoff_path(
                 path.parent,
                 rec.get(key, ""),
                 kind="ARIADNE " + key,
                 directory=(key == "seed_dir"),
             )
-    return data
+            out_rec[key] = str(resolved)
+        try:
+            result_payload = json.loads(Path(str(out_rec["result_json"])).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise HandoffManifestError("ARIADNE result unreadable: " + str(out_rec["result_json"])) from exc
+        seed_record = {
+            "seed_index": seed_index,
+            "frame_id": _int_or_none(out_rec.get("seed_frame_id")),
+        }
+        validate_ariadne_result(
+            result_payload,
+            expected_iteration=iteration,
+            seed_record=seed_record,
+            expected_trajectory_sha256=trajectory_sha or None,
+        )
+        normalised_accepted.append(out_rec)
+    normalised_rejected = []
+    for rec in rejected:
+        if not isinstance(rec, dict):
+            raise HandoffManifestError("rejected ARIADNE record must be an object")
+        out_rec = dict(rec)
+        for key in ("seed_dir", "result_json", "provenance_json"):
+            if key in out_rec and out_rec.get(key):
+                resolved = resolve_handoff_path(
+                    path.parent,
+                    out_rec.get(key, ""),
+                    kind="ARIADNE rejected " + key,
+                    directory=(key == "seed_dir"),
+                    must_exist=(key == "seed_dir"),
+                )
+                out_rec[key] = str(resolved)
+        normalised_rejected.append(out_rec)
+    out = dict(data)
+    out["accepted"] = normalised_accepted
+    out["rejected"] = normalised_rejected
+    return out
 
 
 def ariadne_candidate_frames(
@@ -627,6 +677,16 @@ def ariadne_candidate_frames(
             result = json.loads(result_path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             raise HandoffManifestError("ARIADNE result unreadable: " + str(result_path)) from exc
+        seed_record = {
+            "seed_index": int(rec["seed_index"]),
+            "frame_id": _int_or_none(rec.get("seed_frame_id")),
+        }
+        validate_ariadne_result(
+            result,
+            expected_iteration=int(manifest["iteration"]),
+            seed_record=seed_record,
+            expected_trajectory_sha256=str(manifest.get("trajectory_sha256") or "") or None,
+        )
         atom_types = result.get("atom_types") or []
         coords = result.get("final_coordinates") or []
         if not atom_types or len(atom_types) != len(coords):
@@ -745,23 +805,88 @@ def read_phase_b_selection_manifest(
         raise HandoffManifestError("Phase B selection manifest raw must be a list")
     if not isinstance(final, list):
         raise HandoffManifestError("Phase B selection manifest final must be a list")
+    if data.get("n_selected_raw") is not None and int(data.get("n_selected_raw")) != len(raw):
+        raise HandoffManifestError("Phase B n_selected_raw does not match raw length")
+    if data.get("n_kept") is not None and int(data.get("n_kept")) != len(final):
+        raise HandoffManifestError("Phase B n_kept does not match final length")
+    source_manifest_raw = data.get("source_ariadne_manifest")
+    source_manifest = None
+    if source_manifest_raw:
+        source_manifest = resolve_handoff_path(
+            path.parent,
+            source_manifest_raw,
+            kind="Phase B source_ariadne_manifest",
+        )
     if require_nonempty and not final:
         raise HandoffManifestError("Phase B selection manifest final list is empty")
+    seen_raw = set()
+    normalised_raw = []
+    raw_kept_final_indexes = set()
+    for raw_idx, rec in enumerate(raw):
+        if not isinstance(rec, dict):
+            raise HandoffManifestError("Phase B raw record must be an object")
+        out_rec = dict(rec)
+        declared_raw_index = int(out_rec.get("raw_index"))
+        if declared_raw_index != raw_idx:
+            raise HandoffManifestError("Phase B raw_index values must match raw order")
+        if declared_raw_index in seen_raw:
+            raise HandoffManifestError("duplicate Phase B raw_index")
+        seen_raw.add(declared_raw_index)
+        kept = bool(out_rec.get("kept_after_dedup", False))
+        final_index_value = out_rec.get("final_index")
+        if kept:
+            if final_index_value is None:
+                raise HandoffManifestError("Phase B kept raw record has null final_index")
+            raw_kept_final_indexes.add(int(final_index_value))
+        elif final_index_value is not None:
+            raise HandoffManifestError("Phase B dropped raw record has non-null final_index")
+        for key in ("seed_dir", "result_json", "provenance_json"):
+            resolved = resolve_handoff_path(
+                path.parent,
+                out_rec.get(key, ""),
+                kind="Phase B raw " + key,
+                directory=(key == "seed_dir"),
+            )
+            out_rec[key] = str(resolved)
+        normalised_raw.append(out_rec)
     seen_final = set()
+    seen_final_raw = set()
+    normalised_final = []
     for rec in final:
         if not isinstance(rec, dict):
             raise HandoffManifestError("Phase B final record must be an object")
+        out_rec = dict(rec)
         final_index = int(rec.get("final_index"))
         if final_index in seen_final:
             raise HandoffManifestError("duplicate Phase B final_index")
         seen_final.add(final_index)
+        raw_index = int(out_rec.get("raw_index"))
+        if raw_index in seen_final_raw:
+            raise HandoffManifestError("duplicate Phase B final raw_index")
+        seen_final_raw.add(raw_index)
+        if not bool(out_rec.get("kept_after_dedup", False)):
+            raise HandoffManifestError("Phase B final record is not marked kept_after_dedup")
         for key in ("seed_dir", "result_json", "provenance_json"):
-            resolve_handoff_path(
+            resolved = resolve_handoff_path(
                 path.parent,
                 rec.get(key, ""),
                 kind="Phase B " + key,
                 directory=(key == "seed_dir"),
             )
+            out_rec[key] = str(resolved)
+        normalised_final.append(out_rec)
     if seen_final and sorted(seen_final) != list(range(len(seen_final))):
         raise HandoffManifestError("Phase B final_index values must be contiguous from zero")
-    return data
+    if seen_final != raw_kept_final_indexes:
+        raise HandoffManifestError("Phase B final records do not match kept raw records")
+    kept_raw_indexes = {
+        int(rec["raw_index"]) for rec in normalised_raw if bool(rec.get("kept_after_dedup", False))
+    }
+    if seen_final_raw != kept_raw_indexes:
+        raise HandoffManifestError("Phase B final raw_index set does not match kept raw records")
+    out = dict(data)
+    out["raw"] = normalised_raw
+    out["final"] = normalised_final
+    if source_manifest is not None:
+        out["source_ariadne_manifest"] = str(source_manifest)
+    return out

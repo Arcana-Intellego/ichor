@@ -32,7 +32,6 @@ _MODELS_REQUIRED = {
     CampaignPhase.GAUSSIAN,
     CampaignPhase.AIMALL,
     CampaignPhase.APPEND,
-    CampaignPhase.FEREBUS,
     CampaignPhase.STOP_CHECK,
 }
 
@@ -123,6 +122,7 @@ def verify_state_referenced_artifacts(
                 expected_phase="INITIAL_AIMALL",
                 expected_iteration=int(getattr(state, "iteration", 0)),
                 require_nonempty=True,
+                require_points_file_membership=True,
             )
         except Exception as exc:
             raise CommittedArtifactError(

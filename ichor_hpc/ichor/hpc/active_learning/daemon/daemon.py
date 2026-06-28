@@ -824,6 +824,21 @@ class Daemon:
             + phase.value
         )
 
+    def _poll_sacct(
+        self,
+        job_id: str,
+        *,
+        expected_task_count: Optional[int] = None,
+    ) -> Sequence[JobObservation]:
+        """Poll sacct, passing expected array size to compatible test pollers."""
+        try:
+            return self.sacct_poller(
+                str(job_id),
+                expected_task_count=expected_task_count,
+            )
+        except TypeError:
+            return self.sacct_poller(str(job_id))
+
     def _adopt_accounted_intent_job(
         self,
         state: CampaignState,
@@ -832,17 +847,6 @@ class Daemon:
         job_id: str,
     ) -> Optional[str]:
         phase_name = phase.value
-        try:
-            observations = self.sacct_poller(str(job_id))
-        except RuntimeError as exc:
-            return self._halt_scheduler_uncertain(
-                state,
-                phase,
-                "active_submission_accounting_lookup_failed: "
-                + str(job_id)
-                + ": "
-                + str(exc)[:160],
-            )
         expected_tasks = self._expected_tasks_for_adoption(
             active_intent,
             state,
@@ -856,6 +860,20 @@ class Daemon:
                 + phase_name
                 + "@"
                 + str(int(state.iteration)),
+            )
+        try:
+            observations = self._poll_sacct(
+                str(job_id),
+                expected_task_count=expected_tasks,
+            )
+        except RuntimeError as exc:
+            return self._halt_scheduler_uncertain(
+                state,
+                phase,
+                "active_submission_accounting_lookup_failed: "
+                + str(job_id)
+                + ": "
+                + str(exc)[:160],
             )
         summary = aggregate_states(
             str(job_id),
@@ -913,17 +931,6 @@ class Daemon:
 
     def _on_pending(self, state: CampaignState, phase: CampaignPhase, job_id: str) -> str:
         """Called while a SLURM job for `phase` is in flight."""
-        try:
-            observations = self.sacct_poller(job_id)
-        except RuntimeError as exc:
-            # sacct hiccup -- log and keep polling next tick. Don't escalate
-            #immediately because transient sacct failures are common.
-            self._journal(
-                "sacct_error", phase=phase.value, job_id=job_id,
-                error=str(exc)[:200],
-            )
-            return TickStatus.POLLING
-
         expected_tasks = self._expected_tasks_for_pending(state, phase, job_id)
         if expected_tasks is None and self._strict_artifact_checks_enabled():
             return self._halt_scheduler_uncertain(
@@ -934,6 +941,19 @@ class Daemon:
                 + " job_id="
                 + str(job_id),
             )
+        try:
+            observations = self._poll_sacct(
+                job_id,
+                expected_task_count=expected_tasks,
+            )
+        except RuntimeError as exc:
+            # sacct hiccup -- log and keep polling next tick. Don't escalate
+            #immediately because transient sacct failures are common.
+            self._journal(
+                "sacct_error", phase=phase.value, job_id=job_id,
+                error=str(exc)[:200],
+            )
+            return TickStatus.POLLING
         summary = aggregate_states(
             job_id,
             observations,
@@ -1558,13 +1578,26 @@ class Daemon:
             return {"schema_version": 1, "attempts": {}}
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return {"schema_version": 1, "attempts": {}}
+        except Exception as exc:
+            raise ValueError(
+                "transient retry ledger is unreadable: " + str(path)
+            ) from exc
         if not isinstance(data, dict) or int(data.get("schema_version", -1)) != 1:
-            return {"schema_version": 1, "attempts": {}}
+            raise ValueError("transient retry ledger has an unsupported schema")
         attempts = data.get("attempts")
         if not isinstance(attempts, dict):
-            attempts = {}
+            raise ValueError("transient retry ledger attempts must be an object")
+        for key, value in attempts.items():
+            try:
+                count = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "transient retry ledger attempt is not an integer for " + str(key)
+                ) from exc
+            if count < 0:
+                raise ValueError(
+                    "transient retry ledger attempt is negative for " + str(key)
+                )
         return {"schema_version": 1, "attempts": attempts}
 
     def _retry_key(self, phase: CampaignPhase, iteration: int) -> str:
@@ -1588,7 +1621,16 @@ class Daemon:
             return False
         if any(status not in TRANSIENT_RETRY_STATUSES for status in failure_statuses):
             return False
-        ledger = self._load_transient_retry_ledger()
+        try:
+            ledger = self._load_transient_retry_ledger()
+        except Exception as exc:
+            self._journal(
+                "transient_retry_ledger_invalid",
+                phase=phase.value,
+                iteration=int(state.iteration),
+                reason=type(exc).__name__ + ": " + str(exc)[:180],
+            )
+            return False
         attempts = ledger.get("attempts", {})
         key = self._retry_key(phase, int(state.iteration))
         return int(attempts.get(key, 0)) < max_retry
@@ -1944,6 +1986,20 @@ class Daemon:
                 with self._acquire_lease():
                     self._write_pid()
                     self._install_signal_handlers()
+                    # Initialise state before writing daemon_started. A
+                    # pre-state journal entry would otherwise make a brand-new
+                    # campaign look like a recovery case on the first tick.
+                    try:
+                        self._read_or_initialise_state()
+                    except StateSchemaError as exc:
+                        self._journal("state_corrupt", error=str(exc)[:200])
+                        print(
+                            "state.json failed validation: " + str(exc)
+                            + "\nRun `ichor-al-daemon reconcile --campaign-dir "
+                            + str(self.campaign_dir) + "` for manual recovery.",
+                            file=sys.stderr,
+                        )
+                        return 2
                     self._journal("daemon_started", pid=os.getpid())
                     try:
                         return self._run_loop(max_ticks=max_ticks)

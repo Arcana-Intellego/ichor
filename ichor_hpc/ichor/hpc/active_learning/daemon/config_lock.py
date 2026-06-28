@@ -454,6 +454,17 @@ def clean_model_iteration_staging_for_reconcile(
     if not target.is_dir():
         raise ValueError("model iteration-staging is not a directory")
     _ensure_inside_campaign(campaign, target)
+    try:
+        from .live_executor import validate_ferebus_completed
+
+        ok, reason = validate_ferebus_completed(target)
+    except Exception:
+        ok, reason = False, "validation unavailable"
+    if ok:
+        raise ValueError(
+            "refusing to remove completed FEREBUS iteration-staging; "
+            "postprocess or commit it first"
+        )
     if proposed_state.phase not in (CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS):
         try:
             model_version = int(proposed_state.models_version)

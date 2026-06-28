@@ -87,7 +87,7 @@ def _make_daemon(
     cfg = CampaignConfig(max_iterations=max_iterations)
     executor = executor or MockPhaseExecutor(treat_as_sbatch=set(_SBATCH_PHASES))
     sacct = sacct or _completed_poll
-    return Daemon(
+    daemon = Daemon(
         campaign_dir=tmp_path / "campaign",
         config=cfg,
         executor=executor,
@@ -95,6 +95,8 @@ def _make_daemon(
         sleep_fn=lambda s: None,
         job_liveness_checker=job_liveness_checker,
     )
+    daemon.data_dir().mkdir(parents=True, exist_ok=True)
+    return daemon
 
 
 def test_next_phase_progression_through_first_iteration():

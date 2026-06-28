@@ -44,6 +44,7 @@ def _seed_iter_pool(campaign_dir, iteration, results):
         payload["iteration"] = int(iteration)
         payload["seed_index"] = int(idx)
         payload["seed_frame_id"] = int(idx)
+        payload.setdefault("trajectory_sha256", "0" * 64)
         (sd / "result.json").write_text(json.dumps(payload), encoding="utf-8")
         # write the provenance sidecar that enrich_with_anti_overlap needs
         write_seed_provenance(

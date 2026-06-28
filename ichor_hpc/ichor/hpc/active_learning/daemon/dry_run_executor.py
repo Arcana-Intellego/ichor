@@ -628,6 +628,13 @@ class DryRunPhaseExecutor:
         state_version = int(getattr(state, "training_set_version", 0))
         committed_max = max(committed) if committed else -1
         if committed_max > state_version:
+            if int(committed_max) != int(state_version) + 1:
+                raise BackendSubmissionError(
+                    "training_set_version_gap: state="
+                    + str(state_version)
+                    + " committed_versions="
+                    + repr(committed)
+                )
             #already committed in a previous run; idempotent no-op.
             self._journal_event(
                 "training_set_committed",
@@ -937,6 +944,7 @@ class DryRunPhaseExecutor:
             result_payload["seed_frame_id"] = seed_frame_id
             result_payload["seed_index"] = int(k)
             result_payload["iteration"] = int(state.iteration)
+            result_payload["trajectory_sha256"] = str(picked_payload.get("trajectory_sha256", traj_sha))
             if isinstance(result_payload.get("selection_diagnostics"), dict):
                 result_payload["selection_diagnostics"]["model_version"] = int(
                     getattr(state, "models_version", -1)
