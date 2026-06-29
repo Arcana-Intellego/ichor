@@ -27,6 +27,12 @@ from ichor.hpc.active_learning.daemon.status_recommendations import (
     build_status_recommendations,
     recommendation_dicts,
 )
+from ichor.hpc.active_learning.handoff_manifests import (
+    ARIADNE_RESULTS_SCHEMA_VERSION,
+    write_ariadne_results_manifest,
+)
+from ichor.hpc.active_learning.versioning.provenance import write_seed_provenance
+from ichor.hpc.active_learning.versioning.training_set import TrainingSetVersioning
 
 
 def _campaign_with_config(tmp_path) -> Path:
@@ -34,6 +40,72 @@ def _campaign_with_config(tmp_path) -> Path:
     campaign.mkdir()
     CampaignConfig(max_iterations=2).to_yaml(campaign / "campaign.yaml")
     return campaign
+
+
+def _commit_training_and_model_versions(campaign: Path, versions):
+    training = TrainingSetVersioning(campaign / "5_TRAINING")
+    models = TrainingSetVersioning(campaign / "6_TRAINED_MODELS")
+    for version in versions:
+        staged = training.stage(None, int(version))
+        (staged / "marker.txt").write_text("training", encoding="utf-8")
+        training.commit(int(version))
+        staged = models.stage(None, int(version))
+        (staged / "marker.txt").write_text("model", encoding="utf-8")
+        models.commit(int(version))
+
+
+def _write_valid_ariadne_results(campaign: Path, iteration: int = 0):
+    iter_dir = campaign / "7_ACTIVE_LEARNING" / ("iteration-" + str(iteration).zfill(4))
+    seed_dir = iter_dir / "pool" / "seed_0000"
+    seed_dir.mkdir(parents=True, exist_ok=True)
+    result_path = seed_dir / "result.json"
+    result_path.write_text(json.dumps({
+        "iteration": int(iteration),
+        "seed_index": 0,
+        "seed_frame_id": 0,
+        "trajectory_sha256": "0" * 64,
+        "atom_types": ["H"],
+        "final_coordinates": [[0.0, 0.0, 0.0]],
+        "alpha_trajectory": [0.0, 1.0],
+        "alpha_initial": 0.0,
+        "alpha_final": 1.0,
+        "n_evaluations": 2,
+        "return_code": 0,
+        "wall_seconds": 1.0,
+        "fell_back_to_ds": False,
+        "whitened_distance_final": 0.5,
+    }), encoding="utf-8")
+    prov_path = write_seed_provenance(
+        seed_dir,
+        campaign_uid="test",
+        iteration=int(iteration),
+        trajectory_sha256="0" * 64,
+        seed_frame_id=0,
+        seed_selection_origin="bulk",
+        seed_variance_at_selection=0.0,
+        subspace_neighbour_frame_ids=[],
+        subspace_dimension=0,
+        subspace_eigenvalues=[],
+        mode_weighting_policy="variance",
+    )
+    write_ariadne_results_manifest(iter_dir, {
+        "schema_version": ARIADNE_RESULTS_SCHEMA_VERSION,
+        "iteration": int(iteration),
+        "trajectory_sha256": "0" * 64,
+        "expected_n": 1,
+        "n_accepted": 1,
+        "n_rejected": 0,
+        "accepted": [{
+            "seed_index": 0,
+            "seed_frame_id": 0,
+            "seed_dir": str(seed_dir.resolve()),
+            "result_json": str(result_path.resolve()),
+            "provenance_json": str(Path(prov_path).resolve()),
+            "return_code": 0,
+        }],
+        "rejected": [],
+    })
+    return iter_dir
 
 
 def test_build_parser_has_all_subcommands():
@@ -1234,6 +1306,90 @@ def test_cli_reconcile_writes_proposed_state(tmp_path, capsys):
     assert "Valid training versions:" in captured.out
     assert "Committed model versions:" in captured.out
     assert "Valid model versions:" in captured.out
+
+
+def test_cli_reconcile_cleanable_scripts_reports_candidate_without_manual_mv(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    _commit_training_and_model_versions(campaign, [0])
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.HALTED
+    state.iteration = 0
+    state.training_set_version = 0
+    state.models_version = 0
+    write_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME, state)
+    append_event(
+        campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
+        "halt",
+        from_phase="PHASE_B_POLUS",
+        iteration=0,
+        reason="too_many_failures: 1/1",
+    )
+    _write_valid_ariadne_results(campaign, iteration=0)
+    scripts = campaign / ".DATA" / "SCRIPTS"
+    scripts.mkdir(parents=True)
+    (scripts / "PHASE_B_POLUS-0.sh").write_text("#!/bin/bash\n", encoding="utf-8")
+    monkeypatch.setattr(cli_mod, "_reconcile_runtime_status", lambda campaign: {})
+
+    rc = main(["reconcile", "--campaign-dir", str(campaign)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "=== Current state ===" in out
+    assert "=== Last failure ===" in out
+    assert "reason: too_many_failures: 1/1" in out
+    assert "=== Script inventory ===" in out
+    assert "=== First-pass recovery proposal ===" in out
+    assert "phase: HALTED" in out
+    assert "Cleanable by --apply:" in out
+    assert ".DATA/SCRIPTS contains sbatch scripts" in out
+    assert "Expected recovery after cleanup" in out
+    assert "PHASE_B_POLUS@0" in out
+    assert "ARIADNE_RESULTS.json" in out
+    assert "Do not manually promote this first-pass HALTED proposal" in out
+    assert "mv " not in out
+
+
+def test_cli_reconcile_apply_prints_final_recomputed_phase(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    _commit_training_and_model_versions(campaign, [0])
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.HALTED
+    state.iteration = 0
+    state.training_set_version = 0
+    state.models_version = 0
+    write_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME, state)
+    append_event(
+        campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
+        "halt",
+        from_phase="PHASE_B_POLUS",
+        iteration=0,
+        reason="too_many_failures: 1/1",
+    )
+    _write_valid_ariadne_results(campaign, iteration=0)
+    scripts = campaign / ".DATA" / "SCRIPTS"
+    scripts.mkdir(parents=True)
+    (scripts / "PHASE_B_POLUS-0.sh").write_text("#!/bin/bash\n", encoding="utf-8")
+    monkeypatch.setattr(cli_mod, "_reconcile_runtime_status", lambda campaign: {})
+
+    rc = main(["reconcile", "--campaign-dir", str(campaign), "--apply"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "=== Apply cleanup plan ===" in out
+    assert "=== Recomputed recovery after cleanup ===" in out
+    assert "=== Final applied recovery ===" in out
+    assert "phase: PHASE_B_POLUS" in out
+    assert "contract: ok" in out
+    assert "ARIADNE_RESULTS.json" in out
+    assert "Start the daemon with:" in out
 
 
 def test_cli_resume_refuses_halted_state(tmp_path, capsys):

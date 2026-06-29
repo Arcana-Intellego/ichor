@@ -216,6 +216,8 @@ class ReconciliationReport:
     last_iteration_in_journal: Optional[int] = None
     last_phase_event_in_journal: Optional[str] = None
     last_phase_retryable: bool = False
+    last_halt_event: Optional[Dict[str, Any]] = None
+    script_inventory: Dict[str, Any] = field(default_factory=dict)
     notes: List[str] = field(default_factory=list)
     existing_state_loaded: bool = False
     unsafe_reasons: List[str] = field(default_factory=list)
@@ -272,6 +274,36 @@ def _trajectory_pool_unsafe_reason(exc: Exception) -> str:
             return "trajectory pool atom count invalid"
         return "trajectory pool unreadable"
     return "trajectory pool unreadable"
+
+
+def _scripts_inventory(campaign: Path) -> Dict[str, Any]:
+    scripts = campaign / ".DATA" / "SCRIPTS"
+    payload: Dict[str, Any] = {
+        "path": str(scripts),
+        "exists": scripts.exists(),
+        "is_dir": scripts.is_dir(),
+        "count": 0,
+        "sample": [],
+        "error": None,
+    }
+    if not scripts.exists():
+        return payload
+    if not scripts.is_dir():
+        payload["error"] = ".DATA/SCRIPTS exists but is not a directory"
+        return payload
+    try:
+        files = sorted(
+            [p for p in scripts.rglob("*") if p.is_file()],
+            key=lambda p: str(p.relative_to(scripts)),
+        )
+        payload["count"] = len(files)
+        payload["sample"] = [
+            str(p.relative_to(campaign))
+            for p in files[:5]
+        ]
+    except Exception as exc:
+        payload["error"] = type(exc).__name__ + ": " + str(exc)[:180]
+    return payload
 
 
 def _initial_aimall_handoff_indicated(
@@ -619,6 +651,7 @@ def propose_recovery(
     last_iter = None
     last_phase_event = None
     last_phase_retryable = False
+    last_halt_event = None
     journal_path = data / "journal.ndjson"
     if journal_path.exists():
         for event in iter_events(journal_path):
@@ -628,6 +661,8 @@ def propose_recovery(
                 last_phase_event = str(phase_hint.get("event") or "")
                 last_phase_retryable = bool(phase_hint.get("retryable", False))
                 last_iter = event.get("iteration", last_iter)
+            if str(event.get("event") or "") == "halt":
+                last_halt_event = dict(event)
     try:
         bootstrap_iteration = int(
             getattr(existing, "iteration", 0)
@@ -684,6 +719,7 @@ def propose_recovery(
             if p.name != "initial"
         ]
     scripts_root = campaign / ".DATA" / "SCRIPTS"
+    script_inventory = _scripts_inventory(campaign)
     script_files = [
         p for p in (scripts_root.glob("*.sh") if scripts_root.is_dir() else [])
         if p.is_file()
@@ -1236,6 +1272,8 @@ def propose_recovery(
         last_iteration_in_journal=last_iter,
         last_phase_event_in_journal=last_phase_event,
         last_phase_retryable=last_phase_retryable,
+        last_halt_event=last_halt_event,
+        script_inventory=script_inventory,
         notes=notes,
         existing_state_loaded=existing_loaded,
         unsafe_reasons=unsafe_reasons,
