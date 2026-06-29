@@ -75,6 +75,18 @@ def _write_valid_ariadne_results(campaign: Path, iteration: int = 0):
         "wall_seconds": 1.0,
         "fell_back_to_ds": False,
         "whitened_distance_final": 0.5,
+        "landing_safety": {
+            "accepted": True,
+            "policy": "raw_final",
+            "selected_origin": "raw_final",
+            "selected_candidate_index": 0,
+            "reasons": [],
+            "record_only_reasons": [],
+            "metrics": {"whitened_distance": 0.5},
+            "raw_final": {},
+            "n_candidates_evaluated": 1,
+            "n_safe_candidates": 1,
+        },
     }), encoding="utf-8")
     prov_path = write_seed_provenance(
         seed_dir,
@@ -103,6 +115,18 @@ def _write_valid_ariadne_results(campaign: Path, iteration: int = 0):
             "result_json": str(result_path.resolve()),
             "provenance_json": str(Path(prov_path).resolve()),
             "return_code": 0,
+            "landing_safety": {
+                "accepted": True,
+                "policy": "raw_final",
+                "selected_origin": "raw_final",
+                "selected_candidate_index": 0,
+                "reasons": [],
+                "record_only_reasons": [],
+                "metrics": {"whitened_distance": 0.5},
+                "raw_final": {},
+                "n_candidates_evaluated": 1,
+                "n_safe_candidates": 1,
+            },
         }],
         "rejected": [],
     })

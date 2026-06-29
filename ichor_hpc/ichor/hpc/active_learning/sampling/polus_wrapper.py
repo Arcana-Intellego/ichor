@@ -466,10 +466,19 @@ def _run_phase_b(args, campaign, config):
         )
         return 3
 
+    accept_legacy_missing_landing_safety = bool(
+        getattr(
+            getattr(config, "adversarial_safety", None),
+            "accept_legacy_missing_landing_safety",
+            False,
+        )
+    )
+
     try:
         ariadne_manifest, candidate_frames, candidate_records = ariadne_candidate_frames(
             iter_dir,
             expected_iteration=int(args.iteration),
+            accept_legacy_missing_landing_safety=accept_legacy_missing_landing_safety,
         )
     except Exception as exc:
         print(
@@ -498,13 +507,7 @@ def _run_phase_b(args, campaign, config):
                 _phase_b_landing_safety_filter(
                     candidate_frames,
                     candidate_records,
-                    accept_legacy_missing_landing_safety=bool(
-                        getattr(
-                            getattr(config, "adversarial_safety", None),
-                            "accept_legacy_missing_landing_safety",
-                            False,
-                        )
-                    ),
+                    accept_legacy_missing_landing_safety=accept_legacy_missing_landing_safety,
                 )
             )
         except Exception as exc:

@@ -23,7 +23,11 @@ from ichor.hpc.active_learning.daemon.state import (
     read_state,
     write_state,
 )
-from ichor.hpc.active_learning.handoff_manifests import PHASE_B_SELECTION_SCHEMA_VERSION
+from ichor.hpc.active_learning.handoff_manifests import (
+    ARIADNE_RESULTS_SCHEMA_VERSION,
+    PHASE_B_SELECTION_SCHEMA_VERSION,
+    write_ariadne_results_manifest,
+)
 from ichor.hpc.active_learning.versioning.training_set import TrainingSetVersioning
 
 
@@ -169,6 +173,52 @@ def _write_phase_b_handoff(campaign, iteration, *, n=2):
         }),
         encoding="utf-8",
     )
+    return iter_dir
+
+
+def _write_legacy_ariadne_results_without_landing_safety(campaign, iteration):
+    iter_dir = _iter_dir(campaign, iteration)
+    seed_dir = iter_dir / "pool" / "seed_0000"
+    seed_dir.mkdir(parents=True, exist_ok=True)
+    result_path = seed_dir / "result.json"
+    result_path.write_text(
+        json.dumps({
+            "iteration": int(iteration),
+            "seed_index": 0,
+            "seed_frame_id": 0,
+            "trajectory_sha256": "0" * 64,
+            "atom_types": ["H"],
+            "final_coordinates": [[0.0, 0.0, 0.0]],
+            "alpha_trajectory": [0.0, 1.0],
+            "alpha_initial": 0.0,
+            "alpha_final": 1.0,
+            "n_evaluations": 2,
+            "return_code": 0,
+            "wall_seconds": 1.0,
+            "fell_back_to_ds": False,
+            "whitened_distance_final": 0.5,
+        }),
+        encoding="utf-8",
+    )
+    provenance_path = seed_dir / ".provenance.json"
+    provenance_path.write_text("{}", encoding="utf-8")
+    write_ariadne_results_manifest(iter_dir, {
+        "schema_version": ARIADNE_RESULTS_SCHEMA_VERSION,
+        "iteration": int(iteration),
+        "trajectory_sha256": "0" * 64,
+        "expected_n": 1,
+        "n_accepted": 1,
+        "n_rejected": 0,
+        "accepted": [{
+            "seed_index": 0,
+            "seed_frame_id": 0,
+            "seed_dir": str(seed_dir.resolve()),
+            "result_json": str(result_path.resolve()),
+            "provenance_json": str(provenance_path.resolve()),
+            "return_code": 0,
+        }],
+        "rejected": [],
+    })
     return iter_dir
 
 
@@ -651,6 +701,32 @@ def test_propose_recovery_prefers_seeds_over_stale_seed_select(tmp_path, monkeyp
     assert report.proposed_state.phase is CampaignPhase.ARIADNE_ARRAY
     assert report.proposed_state.iteration == 0
     assert "valid seed-selection handoff" in report.decision
+
+
+def test_recovery_rejects_legacy_ariadne_results_without_landing_safety(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_training_and_model_versions(training, models, [0])
+    state = fresh_campaign_state(max_iterations=3)
+    state.phase = CampaignPhase.SEED_SELECT
+    state.iteration = 0
+    state.training_set_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    _write_seeds_picked(campaign, 0)
+    _write_legacy_ariadne_results_without_landing_safety(campaign, 0)
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.ARIADNE_ARRAY
+    assert report.proposed_state.iteration == 0
+    assert "valid seed-selection handoff" in report.decision
+    assert "valid ARIADNE results handoff" not in report.decision
 
 
 def test_propose_recovery_does_not_preserve_existing_phase_for_committed_iteration(

@@ -242,7 +242,7 @@ def test_phase_b_writes_sample_and_dedup(tmp_path):
     assert d["min_separation"] == 0.05
 
 
-def test_phase_b_filters_unsafe_landings_before_fps(tmp_path):
+def test_phase_b_rejects_unsafe_accepted_landing_before_fps(tmp_path):
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
@@ -267,18 +267,9 @@ def test_phase_b_filters_unsafe_landings_before_fps(tmp_path):
         "--iteration", "0",
         "--campaign-dir", str(campaign),
     ])
-    assert result.returncode == 0, result.stderr
-    raw_lines = (iter_dir / "phase_b_SAMPLE_raw.xyz").read_text(
-        encoding="utf-8",
-    ).splitlines()
-    assert len(raw_lines) == 2 * (len(atom_types) + 2)
-    manifest = json.loads(
-        (iter_dir / "PHASE_B_SELECTION.json").read_text(encoding="utf-8")
-    )
-    assert manifest["safety_filter"]["n_input"] == 3
-    assert manifest["safety_filter"]["n_dropped"] == 1
-    raw_seed_indices = {int(r["seed_index"]) for r in manifest["raw"]}
-    assert raw_seed_indices == {0, 2}
+    assert result.returncode == 3
+    assert "no_safe_non_seed_landing" in result.stderr
+    assert not (iter_dir / "phase_b_SAMPLE_raw.xyz").exists()
 
 
 def test_phase_b_rejects_partial_missing_landing_safety(tmp_path):
@@ -306,7 +297,7 @@ def test_phase_b_rejects_partial_missing_landing_safety(tmp_path):
         "--campaign-dir", str(campaign),
     ])
     assert result.returncode == 3
-    assert "partial missing landing_safety" in result.stderr
+    assert "missing_landing_safety" in result.stderr
 
 
 def test_phase_b_rejects_all_missing_landing_safety_by_default(tmp_path):
@@ -335,7 +326,7 @@ def test_phase_b_rejects_all_missing_landing_safety_by_default(tmp_path):
     ])
 
     assert result.returncode == 3
-    assert "all Phase B candidates are missing landing_safety metadata" in result.stderr
+    assert "missing_landing_safety" in result.stderr
     assert not (iter_dir / "phase_b_SAMPLE_raw.xyz").exists()
 
 
@@ -405,7 +396,7 @@ def test_phase_b_all_unsafe_candidates_halts_before_gaussian_handoff(tmp_path):
     ])
 
     assert result.returncode == 3
-    assert "removed every candidate" in result.stderr
+    assert "no_safe_non_seed_landing" in result.stderr
     assert not (iter_dir / "phase_b_SAMPLE_raw.xyz").exists()
 
 

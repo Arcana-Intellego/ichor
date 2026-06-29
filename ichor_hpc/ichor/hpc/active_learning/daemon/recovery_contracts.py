@@ -166,6 +166,7 @@ def _require_ariadne_results(campaign: Path, iteration: int) -> None:
         iteration_dir(campaign, iteration),
         expected_iteration=int(iteration),
         require_nonempty=True,
+        accept_legacy_missing_landing_safety=False,
     )
 
 

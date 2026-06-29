@@ -436,6 +436,7 @@ def validate_ariadne_result(
     seed_record: Dict[str, Any],
     expected_atom_types: Optional[Sequence[str]] = None,
     expected_trajectory_sha256: Optional[str] = None,
+    accept_legacy_missing_landing_safety: bool = False,
 ) -> Dict[str, Any]:
     if not isinstance(result, dict):
         raise HandoffManifestError("ARIADNE result must be a JSON object")
@@ -462,20 +463,22 @@ def validate_ariadne_result(
         elif str(result_sha) != str(expected_trajectory_sha256):
             raise HandoffManifestError("wrong_trajectory_sha256")
     return_code = _required_int(result.get("return_code"), "ARIADNE result return_code")
-    if return_code != 0:
-        try:
-            from .acquisition.ariadne_runner import ariadne_result_usability_payload
+    try:
+        from .acquisition.ariadne_runner import ariadne_result_usability_payload
 
-            usability = ariadne_result_usability_payload(result)
-        except Exception:
-            usability = {"usable": False, "reason": "usability_check_failed"}
-        if not bool(usability.get("usable", False)):
-            raise HandoffManifestError(
-                "ariadne_return_code_"
-                + str(return_code)
-                + ":"
-                + str(usability.get("reason", "unusable_landing"))
-            )
+        usability = ariadne_result_usability_payload(
+            result,
+            accept_legacy_missing_landing_safety=bool(
+                accept_legacy_missing_landing_safety
+            ),
+        )
+    except Exception:
+        usability = {"usable": False, "reason": "usability_check_failed"}
+    if not bool(usability.get("usable", False)):
+        raise HandoffManifestError(
+            "ariadne_unusable:"
+            + str(usability.get("reason", "unusable_landing"))
+        )
     alpha_initial = _finite_float(result.get("alpha_initial"))
     alpha_final = _finite_float(result.get("alpha_final"))
     n_evaluations = _required_int(result.get("n_evaluations"), "ARIADNE result n_evaluations")
@@ -579,6 +582,7 @@ def read_ariadne_results_manifest(
     *,
     expected_iteration: Optional[int] = None,
     require_nonempty: bool = True,
+    accept_legacy_missing_landing_safety: bool = False,
 ) -> Dict[str, Any]:
     path = ariadne_results_path(iter_dir)
     if not path.is_file():
@@ -634,6 +638,18 @@ def read_ariadne_results_manifest(
             result_payload = json.loads(Path(str(out_rec["result_json"])).read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             raise HandoffManifestError("ARIADNE result unreadable: " + str(out_rec["result_json"])) from exc
+        result_safety = result_payload.get("landing_safety")
+        record_safety = out_rec.get("landing_safety")
+        if isinstance(result_safety, dict) and isinstance(record_safety, dict):
+            if bool(result_safety.get("accepted", False)) != bool(
+                record_safety.get("accepted", False)
+            ):
+                raise HandoffManifestError("landing_safety_mismatch")
+        elif isinstance(result_safety, dict):
+            out_rec["landing_safety"] = dict(result_safety)
+        elif isinstance(record_safety, dict):
+            result_payload = dict(result_payload)
+            result_payload["landing_safety"] = dict(record_safety)
         seed_record = {
             "seed_index": seed_index,
             "frame_id": _int_or_none(out_rec.get("seed_frame_id")),
@@ -643,6 +659,9 @@ def read_ariadne_results_manifest(
             expected_iteration=iteration,
             seed_record=seed_record,
             expected_trajectory_sha256=trajectory_sha or None,
+            accept_legacy_missing_landing_safety=bool(
+                accept_legacy_missing_landing_safety
+            ),
         )
         if bool(validated.get("legacy_missing_trajectory_sha256", False)):
             out_rec["legacy_missing_trajectory_sha256"] = True
@@ -674,6 +693,7 @@ def ariadne_candidate_frames(
     iter_dir: Any,
     *,
     expected_iteration: Optional[int] = None,
+    accept_legacy_missing_landing_safety: bool = False,
 ) -> Tuple[Dict[str, Any], List[Any], List[Dict[str, Any]]]:
     """Return accepted ARIADNE geometries as ICHOR Atoms plus manifest records."""
     from ichor.core.atoms import Atom, Atoms
@@ -681,6 +701,9 @@ def ariadne_candidate_frames(
     manifest = read_ariadne_results_manifest(
         iter_dir,
         expected_iteration=expected_iteration,
+        accept_legacy_missing_landing_safety=bool(
+            accept_legacy_missing_landing_safety
+        ),
     )
     frames = []
     records = []
@@ -690,6 +713,16 @@ def ariadne_candidate_frames(
             result = json.loads(result_path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             raise HandoffManifestError("ARIADNE result unreadable: " + str(result_path)) from exc
+        result_safety = result.get("landing_safety")
+        record_safety = rec.get("landing_safety")
+        if isinstance(result_safety, dict) and isinstance(record_safety, dict):
+            if bool(result_safety.get("accepted", False)) != bool(
+                record_safety.get("accepted", False)
+            ):
+                raise HandoffManifestError("landing_safety_mismatch")
+        elif isinstance(record_safety, dict):
+            result = dict(result)
+            result["landing_safety"] = dict(record_safety)
         seed_record = {
             "seed_index": int(rec["seed_index"]),
             "frame_id": _int_or_none(rec.get("seed_frame_id")),
@@ -699,6 +732,9 @@ def ariadne_candidate_frames(
             expected_iteration=int(manifest["iteration"]),
             seed_record=seed_record,
             expected_trajectory_sha256=str(manifest.get("trajectory_sha256") or "") or None,
+            accept_legacy_missing_landing_safety=bool(
+                accept_legacy_missing_landing_safety
+            ),
         )
         atom_types = result.get("atom_types") or []
         coords = result.get("final_coordinates") or []

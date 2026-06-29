@@ -40,6 +40,18 @@ def _make_seed_result(seed_dir, atom_types, final_coords):
         "iteration": 0,
         "seed_index": seed_index,
         "seed_frame_id": seed_index,
+        "landing_safety": {
+            "accepted": True,
+            "policy": "raw_final",
+            "selected_origin": "raw_final",
+            "selected_candidate_index": 0,
+            "reasons": [],
+            "record_only_reasons": [],
+            "metrics": {"whitened_distance": 0.5},
+            "raw_final": {},
+            "n_candidates_evaluated": 1,
+            "n_safe_candidates": 1,
+        },
     }
     (seed_dir / "result.json").write_text(json.dumps(payload), encoding="utf-8")
 
@@ -86,6 +98,7 @@ def _write_ariadne_manifest(iter_dir):
             "alpha_final": float(result["alpha_final"]),
             "whitened_distance_final": float(result["whitened_distance_final"]),
             "return_code": 0,
+            "landing_safety": dict(result["landing_safety"]),
         })
     write_ariadne_results_manifest(iter_dir, {
         "schema_version": ARIADNE_RESULTS_SCHEMA_VERSION,
