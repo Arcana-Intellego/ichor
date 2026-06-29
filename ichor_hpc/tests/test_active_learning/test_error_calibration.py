@@ -224,6 +224,26 @@ def test_calibration_global_total_table_uses_total_variance_and_total_error():
     )
 
 
+def test_acquisition_lookup_does_not_fall_back_to_per_atom_global_table():
+    model = {
+        "schema_version": 1,
+        "usable_for_acquisition": True,
+        "tables": {
+            "global": {
+                "bins": [
+                    {
+                        "raw_uncertainty_min": 0.0,
+                        "raw_uncertainty_max": 100.0,
+                        "calibrated_abs_error_ha": 9.0,
+                    }
+                ]
+            }
+        },
+    }
+
+    assert lookup_calibrated_abs_error(model, 20.0) is None
+
+
 def test_calibration_model_defaults_to_current_model_version():
     cfg = CampaignConfig()
     cfg.error_calibration.min_bin_records = 1

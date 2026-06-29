@@ -182,11 +182,11 @@ def test_min_separation_drops_close_candidates(tmp_path):
     _make_seed_result(pool_dir / "seed_0000", atom_types, base)
     _make_seed_result(
         pool_dir / "seed_0001", atom_types,
-        [(c[0] + 1.0, c[1], c[2]) for c in base],
+        [(0.0, 0.0, 0.0), (1.60, 0.0, 0.0), (-0.24, 0.93, 0.0)],
     )
     _make_seed_result(
         pool_dir / "seed_0002", atom_types,
-        [(c[0] + 2.0, c[1], c[2]) for c in base],
+        [(0.0, 0.0, 0.0), (0.96, 0.0, 0.0), (-0.70, 1.35, 0.0)],
     )
     _write_ariadne_manifest(iter_dir)
     rc = _run(["--descriptor", "rmsd_massweight",
@@ -202,3 +202,43 @@ def test_min_separation_drops_close_candidates(tmp_path):
     raw_lines = (iter_dir / "phase_b_SAMPLE_raw.xyz").read_text(encoding="utf-8").splitlines()
     final_lines = (iter_dir / "phase_b_SAMPLE.xyz").read_text(encoding="utf-8").splitlines()
     assert len(final_lines) < len(raw_lines)
+
+
+def test_min_separation_all_candidates_removed_fails_at_phase_b(tmp_path):
+    """If anti-overlap removes every selected candidate, Phase B must not
+    publish a successful empty selection manifest for the next phase to reject.
+    """
+    campaign = tmp_path / "c"
+    campaign.mkdir()
+    cfg = CampaignConfig()
+    cfg.batch_sizing.floor = 3
+    cfg.phase_b.descriptor = "rmsd_massweight"
+    cfg.phase_b.min_separation = 0.1
+    cfg.to_yaml(campaign / "campaign.yaml")
+
+    training_dir = campaign / "5_TRAINING" / "iteration-0000"
+    base = [(0.0, 0.0, 0.0), (0.96, 0.0, 0.0), (-0.24, 0.93, 0.0)]
+    atom_types = ["O", "H", "H"]
+    _write_pointdir(training_dir / "POINT_0000.pointdir", atom_types, base)
+    write_manifest(training_dir, compute_directory_manifest(training_dir))
+    (campaign / "5_TRAINING" / ".current.pointer").write_text(
+        "iteration-0000", encoding="utf-8",
+    )
+
+    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
+    pool_dir = iter_dir / "pool"
+    for i in range(3):
+        # Pure translations are removed by the aligned RMSD metric, so all
+        # three candidates overlap the committed training point.
+        coords = [(c[0] + float(i), c[1], c[2]) for c in base]
+        _make_seed_result(pool_dir / f"seed_{i:04d}", atom_types, coords)
+    _write_ariadne_manifest(iter_dir)
+
+    rc = _run(["--descriptor", "rmsd_massweight",
+               "--iteration", "0",
+               "--campaign-dir", str(campaign)])
+
+    assert rc.returncode == 3
+    assert "phase_b_anti_overlap_removed_every_candidate" in rc.stderr
+    assert (iter_dir / "phase_b_dedup.json").is_file()
+    assert not (iter_dir / "PHASE_B_SELECTION.json").exists()

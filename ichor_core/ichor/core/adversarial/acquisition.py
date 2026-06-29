@@ -160,21 +160,6 @@ def _lookup_calibrated_error(
         total_value = _lookup_table_error(total_table, float(total_variance))
         if total_value is not None:
             return float(total_value)
-
-    values: List[float] = []
-    if atom_variances:
-        for atom, raw in atom_variances.items():
-            table = tables.get("global")
-            if isinstance(table, Mapping):
-                value = _lookup_table_error(table, float(raw))
-                if value is not None:
-                    values.append(float(value))
-    if values:
-        return float(np.sqrt(float(np.sum(np.square(values)))))
-
-    global_table = tables.get("global")
-    if isinstance(global_table, Mapping):
-        return _lookup_table_error(global_table, float(total_variance))
     return None
 
 

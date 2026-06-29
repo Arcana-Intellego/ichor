@@ -533,8 +533,6 @@ def _run_phase_b(args, campaign, config):
     report = filter_candidates_against_training(
         selected_frames, training, min_separation=min_sep,
     )
-    kept_frames = [selected_frames[i] for i in report.kept_indices]
-    _write_xyz_file(kept_frames, final_path)
     dedup_payload = {
         "kept_indices": list(report.kept_indices),
         "dropped_indices": list(report.dropped_indices),
@@ -546,6 +544,19 @@ def _run_phase_b(args, campaign, config):
         "descriptor_used": descriptor.name,
     }
     dedup_path.write_text(_json.dumps(dedup_payload, indent=2), encoding="utf-8")
+    if int(report.n_kept) <= 0:
+        print(
+            "phase_b_anti_overlap_removed_every_candidate: "
+            + "kept 0/"
+            + str(len(selected_frames))
+            + " candidates after anti-overlap; diagnostics written to "
+            + str(dedup_path),
+            file=_sys.stderr,
+        )
+        return 3
+
+    kept_frames = [selected_frames[i] for i in report.kept_indices]
+    _write_xyz_file(kept_frames, final_path)
 
     kept_lookup = {int(raw_index): final_index for final_index, raw_index in enumerate(report.kept_indices)}
     raw_records = []

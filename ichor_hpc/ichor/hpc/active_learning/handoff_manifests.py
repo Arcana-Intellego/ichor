@@ -439,11 +439,11 @@ def validate_ariadne_result(
 ) -> Dict[str, Any]:
     if not isinstance(result, dict):
         raise HandoffManifestError("ARIADNE result must be a JSON object")
-    seed_index = int(seed_record["seed_index"])
+    seed_index = _required_int(seed_record.get("seed_index"), "ARIADNE seed_record seed_index")
     frame_id = seed_record.get("frame_id")
-    if int(result.get("iteration")) != int(expected_iteration):
+    if _required_int(result.get("iteration"), "ARIADNE result iteration") != int(expected_iteration):
         raise HandoffManifestError("wrong_iteration")
-    if int(result.get("seed_index")) != seed_index:
+    if _required_int(result.get("seed_index"), "ARIADNE result seed_index") != seed_index:
         raise HandoffManifestError("wrong_seed_index")
     result_frame_id = _int_or_none(result.get("seed_frame_id"))
     if result_frame_id != frame_id:
@@ -461,7 +461,7 @@ def validate_ariadne_result(
             result_sha = expected_trajectory_sha256
         elif str(result_sha) != str(expected_trajectory_sha256):
             raise HandoffManifestError("wrong_trajectory_sha256")
-    return_code = int(result.get("return_code"))
+    return_code = _required_int(result.get("return_code"), "ARIADNE result return_code")
     if return_code != 0:
         try:
             from .acquisition.ariadne_runner import ariadne_result_usability_payload
@@ -478,7 +478,7 @@ def validate_ariadne_result(
             )
     alpha_initial = _finite_float(result.get("alpha_initial"))
     alpha_final = _finite_float(result.get("alpha_final"))
-    n_evaluations = int(result.get("n_evaluations"))
+    n_evaluations = _required_int(result.get("n_evaluations"), "ARIADNE result n_evaluations")
     wall_seconds = _finite_float(result.get("wall_seconds"))
     atom_types = result.get("atom_types")
     final_coordinates = result.get("final_coordinates")
@@ -589,9 +589,9 @@ def read_ariadne_results_manifest(
         raise HandoffManifestError("ARIADNE results manifest unreadable: " + str(path)) from exc
     if not isinstance(data, dict):
         raise HandoffManifestError("ARIADNE results manifest must be a JSON object")
-    if int(data.get("schema_version", -1)) != ARIADNE_RESULTS_SCHEMA_VERSION:
+    if _required_int(data.get("schema_version", -1), "ARIADNE results schema_version") != ARIADNE_RESULTS_SCHEMA_VERSION:
         raise HandoffManifestError("unsupported ARIADNE results manifest schema")
-    iteration = int(data.get("iteration"))
+    iteration = _required_int(data.get("iteration"), "ARIADNE results iteration")
     if expected_iteration is not None and iteration != int(expected_iteration):
         raise HandoffManifestError("ARIADNE results manifest iteration mismatch")
     accepted = data.get("accepted")
@@ -601,13 +601,13 @@ def read_ariadne_results_manifest(
     if not isinstance(rejected, list):
         raise HandoffManifestError("ARIADNE results manifest rejected must be a list")
     n_accepted = data.get("n_accepted")
-    if n_accepted is not None and int(n_accepted) != len(accepted):
+    if n_accepted is not None and _required_int(n_accepted, "ARIADNE n_accepted") != len(accepted):
         raise HandoffManifestError("ARIADNE n_accepted does not match accepted length")
     n_rejected = data.get("n_rejected")
-    if n_rejected is not None and int(n_rejected) != len(rejected):
+    if n_rejected is not None and _required_int(n_rejected, "ARIADNE n_rejected") != len(rejected):
         raise HandoffManifestError("ARIADNE n_rejected does not match rejected length")
     expected_n = data.get("expected_n")
-    if expected_n is not None and int(expected_n) != len(accepted) + len(rejected):
+    if expected_n is not None and _required_int(expected_n, "ARIADNE expected_n") != len(accepted) + len(rejected):
         raise HandoffManifestError("ARIADNE expected_n does not match accepted+rejected length")
     if require_nonempty and not accepted:
         raise HandoffManifestError("ARIADNE results manifest accepted list is empty")
@@ -617,7 +617,7 @@ def read_ariadne_results_manifest(
     for rec in accepted:
         if not isinstance(rec, dict):
             raise HandoffManifestError("accepted ARIADNE record must be an object")
-        seed_index = int(rec.get("seed_index"))
+        seed_index = _required_int(rec.get("seed_index"), "accepted ARIADNE seed_index")
         if seed_index in seen:
             raise HandoffManifestError("duplicate accepted ARIADNE seed_index")
         seen.add(seed_index)
@@ -736,16 +736,13 @@ def read_phase_a_sample_manifest(
         raise HandoffManifestError("Phase A sample manifest unreadable: " + str(path)) from exc
     if not isinstance(data, dict):
         raise HandoffManifestError("Phase A sample manifest must be a JSON object")
-    if int(data.get("schema_version", -1)) != PHASE_A_SAMPLE_SCHEMA_VERSION:
+    if _required_int(data.get("schema_version", -1), "Phase A schema_version") != PHASE_A_SAMPLE_SCHEMA_VERSION:
         raise HandoffManifestError("unsupported Phase A sample manifest schema")
     if str(data.get("phase")) != "PHASE_A_POLUS":
         raise HandoffManifestError("Phase A sample manifest phase mismatch")
-    if int(data.get("iteration")) != -1:
+    if _required_int(data.get("iteration"), "Phase A iteration") != -1:
         raise HandoffManifestError("Phase A sample manifest iteration must be -1")
-    try:
-        n_select = int(data.get("n_select"))
-    except (TypeError, ValueError) as exc:
-        raise HandoffManifestError("Phase A sample manifest n_select must be an integer") from exc
+    n_select = _required_int(data.get("n_select"), "Phase A n_select")
     if require_nonempty and n_select <= 0:
         raise HandoffManifestError("Phase A sample manifest n_select must be positive")
     root = Path(initial_dir)
@@ -771,10 +768,7 @@ def read_phase_a_sample_manifest(
             raise HandoffManifestError("Phase A selected_indices length mismatch")
         seen = set()
         for value in selected:
-            try:
-                idx = int(value)
-            except (TypeError, ValueError) as exc:
-                raise HandoffManifestError("Phase A selected_indices must be integers") from exc
+            idx = _required_int(value, "Phase A selected_indices")
             if idx in seen:
                 raise HandoffManifestError("Phase A selected_indices contains duplicates")
             seen.add(idx)
@@ -807,9 +801,9 @@ def read_phase_b_selection_manifest(
         raise HandoffManifestError("Phase B selection manifest unreadable: " + str(path)) from exc
     if not isinstance(data, dict):
         raise HandoffManifestError("Phase B selection manifest must be a JSON object")
-    if int(data.get("schema_version", -1)) != PHASE_B_SELECTION_SCHEMA_VERSION:
+    if _required_int(data.get("schema_version", -1), "Phase B schema_version") != PHASE_B_SELECTION_SCHEMA_VERSION:
         raise HandoffManifestError("unsupported Phase B selection manifest schema")
-    iteration = int(data.get("iteration"))
+    iteration = _required_int(data.get("iteration"), "Phase B iteration")
     if expected_iteration is not None and iteration != int(expected_iteration):
         raise HandoffManifestError("Phase B selection manifest iteration mismatch")
     raw = data.get("raw")
@@ -818,9 +812,9 @@ def read_phase_b_selection_manifest(
         raise HandoffManifestError("Phase B selection manifest raw must be a list")
     if not isinstance(final, list):
         raise HandoffManifestError("Phase B selection manifest final must be a list")
-    if data.get("n_selected_raw") is not None and int(data.get("n_selected_raw")) != len(raw):
+    if data.get("n_selected_raw") is not None and _required_int(data.get("n_selected_raw"), "Phase B n_selected_raw") != len(raw):
         raise HandoffManifestError("Phase B n_selected_raw does not match raw length")
-    if data.get("n_kept") is not None and int(data.get("n_kept")) != len(final):
+    if data.get("n_kept") is not None and _required_int(data.get("n_kept"), "Phase B n_kept") != len(final):
         raise HandoffManifestError("Phase B n_kept does not match final length")
     source_manifest_raw = data.get("source_ariadne_manifest")
     source_manifest = None
@@ -839,7 +833,7 @@ def read_phase_b_selection_manifest(
         if not isinstance(rec, dict):
             raise HandoffManifestError("Phase B raw record must be an object")
         out_rec = dict(rec)
-        declared_raw_index = int(out_rec.get("raw_index"))
+        declared_raw_index = _required_int(out_rec.get("raw_index"), "Phase B raw_index")
         if declared_raw_index != raw_idx:
             raise HandoffManifestError("Phase B raw_index values must match raw order")
         if declared_raw_index in seen_raw:
@@ -850,7 +844,7 @@ def read_phase_b_selection_manifest(
         if kept:
             if final_index_value is None:
                 raise HandoffManifestError("Phase B kept raw record has null final_index")
-            raw_kept_final_indexes.add(int(final_index_value))
+            raw_kept_final_indexes.add(_required_int(final_index_value, "Phase B raw final_index"))
         elif final_index_value is not None:
             raise HandoffManifestError("Phase B dropped raw record has non-null final_index")
         for key in ("seed_dir", "result_json", "provenance_json"):
@@ -869,11 +863,11 @@ def read_phase_b_selection_manifest(
         if not isinstance(rec, dict):
             raise HandoffManifestError("Phase B final record must be an object")
         out_rec = dict(rec)
-        final_index = int(rec.get("final_index"))
+        final_index = _required_int(rec.get("final_index"), "Phase B final_index")
         if final_index in seen_final:
             raise HandoffManifestError("duplicate Phase B final_index")
         seen_final.add(final_index)
-        raw_index = int(out_rec.get("raw_index"))
+        raw_index = _required_int(out_rec.get("raw_index"), "Phase B final raw_index")
         if raw_index in seen_final_raw:
             raise HandoffManifestError("duplicate Phase B final raw_index")
         seen_final_raw.add(raw_index)
@@ -893,7 +887,9 @@ def read_phase_b_selection_manifest(
     if seen_final != raw_kept_final_indexes:
         raise HandoffManifestError("Phase B final records do not match kept raw records")
     kept_raw_indexes = {
-        int(rec["raw_index"]) for rec in normalised_raw if bool(rec.get("kept_after_dedup", False))
+        _required_int(rec.get("raw_index"), "Phase B kept raw_index")
+        for rec in normalised_raw
+        if bool(rec.get("kept_after_dedup", False))
     }
     if seen_final_raw != kept_raw_indexes:
         raise HandoffManifestError("Phase B final raw_index set does not match kept raw records")

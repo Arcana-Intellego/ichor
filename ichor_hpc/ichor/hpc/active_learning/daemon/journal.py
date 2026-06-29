@@ -125,6 +125,7 @@ KNOWN_EVENT_TYPES = (
     "daemon_lease_conflict",
     "daemon_lease_stale_recovered",
     "daemon_lease_cleanup_failed",
+    "ariadne_seed_provenance_repaired",
 )
 
 

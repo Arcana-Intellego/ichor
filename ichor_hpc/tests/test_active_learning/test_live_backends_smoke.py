@@ -557,6 +557,138 @@ def test_csf3_gaussian_block_uses_configured_module_path_and_scratch(monkeypatch
     assert "export GAUSS_MDEF=6GB" in body
 
 
+def test_gaussian_block_uses_configured_scratch_root(monkeypatch):
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf3": {
+                "hpc": {
+                    "jobscript_shebang": "#!/bin/bash --login",
+                    "memory_per_core_gb_by_partition": {"multicore": 8},
+                },
+                "software": {
+                    "gaussian": {
+                        "modules": ["apps/binapps/gaussian/g09d01_em64t"],
+                        "executable_path": "$g09root/g09/g09",
+                        "scratch_root": "/scratch/$USER",
+                    }
+                },
+            }
+        },
+        "csf3",
+    )
+
+    body = build_sbatch_script(
+        phase_name="GAUSSIAN",
+        iteration=2,
+        campaign_dir=Path("/net/scratch/q/campaign"),
+        config=CampaignConfig(),
+        array_size=1,
+        campaign_uid="campaign:with unsafe/chars",
+    )
+
+    assert "export ICHOR_GAUSSIAN_SCRATCH_ROOT=/scratch/$USER" in body
+    assert "export ICHOR_CAMPAIGN_UID=campaign_with_unsafe_chars" in body
+    assert 'export GAUSS_SCRDIR="${ICHOR_GAUSSIAN_SCRATCH_ROOT%/}/ichor-gaussian/${ICHOR_CAMPAIGN_UID}/${ICHOR_GAUSSIAN_PHASE}/${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"' in body
+    assert '"$ICHOR_GAUSSIAN_SCRATCH_ROOT%/"' not in body
+    assert '"${ICHOR_GAUSSIAN_SCRATCH_ROOT%/}"/ichor-gaussian/' in body
+
+
+def test_default_trqn_scale_mode_is_not_warned():
+    warnings = live_executor_mod._ariadne_optional_diagnostic_warnings({
+        "optimiser_diagnostics": {
+            "trqn_scale_mode": "adaptive_initial_gradient_rms",
+        }
+    })
+
+    assert "trqn_scale_mode_unknown" not in warnings
+
+
+def test_ariadne_seed_provenance_legacy_invalid_is_repaired(tmp_path):
+    from ichor.hpc.active_learning.versioning.provenance import (
+        PROVENANCE_FILENAME,
+        validate_provenance,
+    )
+
+    campaign = tmp_path / "campaign"
+    ex = LiveBackendsPhaseExecutor.__new__(LiveBackendsPhaseExecutor)
+    ex.campaign_dir = campaign
+    ex.config = CampaignConfig()
+    ex.al_dir_name = "7_ACTIVE_LEARNING"
+    ex.artefact_log = []
+    state = SimpleNamespace(iteration=0, campaign_uid="test-campaign")
+    seed_record = {
+        "seed_index": 0,
+        "frame_id": 7,
+        "selection_origin": "d_optimal",
+        "variance_at_selection": 1.0,
+        "subspace_neighbour_frame_ids": [1, 2],
+        "subspace_dimension": 2,
+        "subspace_eigenvalues": [1.0, 0.5],
+    }
+    picked = {"trajectory_sha256": "a" * 64}
+    seed_dir = ex._seed_dir_for_record(0, seed_record)
+    seed_dir.mkdir(parents=True)
+    prov_path = seed_dir / PROVENANCE_FILENAME
+    prov_path.write_text(
+        '{"campaign_uid":"test-campaign","iteration":0,"seed":{"frame_id":7}}',
+        encoding="utf-8",
+    )
+
+    repaired_path, created = ex._ensure_ariadne_seed_provenance(
+        state,
+        picked,
+        seed_record,
+    )
+
+    assert repaired_path == prov_path
+    assert created is True
+    assert list(seed_dir.glob(PROVENANCE_FILENAME + ".legacy_invalid.*"))
+    validate_provenance(
+        seed_dir,
+        campaign_uid="test-campaign",
+        iteration=0,
+        trajectory_sha256="a" * 64,
+        seed_frame_id=7,
+    )
+
+
+def test_ariadne_seed_provenance_identity_mismatch_still_fails(tmp_path):
+    from ichor.hpc.active_learning.versioning.provenance import PROVENANCE_FILENAME
+
+    campaign = tmp_path / "campaign"
+    ex = LiveBackendsPhaseExecutor.__new__(LiveBackendsPhaseExecutor)
+    ex.campaign_dir = campaign
+    ex.config = CampaignConfig()
+    ex.al_dir_name = "7_ACTIVE_LEARNING"
+    ex.artefact_log = []
+    state = SimpleNamespace(iteration=0, campaign_uid="test-campaign")
+    seed_record = {
+        "seed_index": 0,
+        "frame_id": 7,
+        "selection_origin": "bulk",
+        "variance_at_selection": 1.0,
+        "subspace_neighbour_frame_ids": [],
+        "subspace_dimension": 0,
+        "subspace_eigenvalues": [],
+    }
+    seed_dir = ex._seed_dir_for_record(0, seed_record)
+    seed_dir.mkdir(parents=True)
+    (seed_dir / PROVENANCE_FILENAME).write_text(
+        '{"campaign_uid":"wrong","iteration":0,'
+        '"trajectory_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+        '"seed":{"frame_id":7},"subspace":{"dimension":0,"neighbour_frame_ids":[]}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(BackendSubmissionError, match="campaign_uid mismatch"):
+        ex._ensure_ariadne_seed_provenance(
+            state,
+            {"trajectory_sha256": "a" * 64},
+            seed_record,
+        )
+
+
 def test_profile_memory_auto_resolves_csf4_partition_cap(monkeypatch):
     _install_fake_global_variables(
         monkeypatch,

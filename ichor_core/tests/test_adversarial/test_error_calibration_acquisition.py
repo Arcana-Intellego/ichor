@@ -94,3 +94,32 @@ def test_apply_to_acquisition_replaces_energy_risk_when_strength_one(monkeypatch
     assert breakdown.raw_energy_risk == pytest.approx(math.log1p(4.0 / 2.0))
     assert breakdown.calibrated_expected_iqa_error_ha == pytest.approx(0.3)
     assert breakdown.energy_risk == pytest.approx(math.log1p(0.3 / 0.1))
+
+
+def test_apply_to_acquisition_requires_global_total_table(monkeypatch):
+    monkeypatch.setattr(acquisition_mod, "whitened_distance_squared", lambda *args: 0.0)
+    monkeypatch.setattr(acquisition_mod, "chemistry_barrier_value", lambda *args: 0.0)
+    monkeypatch.setattr(SeedLocalAdversarialAcquisition, "_mode_metrics", lambda self, atoms, mean_energy: ())
+    legacy_atom_only_model = {
+        "reference_error_ha": 0.1,
+        "tables": {
+            "global": {
+                "bins": [
+                    {
+                        "raw_uncertainty_min": 0.0,
+                        "raw_uncertainty_max": 5.0,
+                        "calibrated_abs_error_ha": 9.0,
+                    }
+                ]
+            },
+        },
+    }
+
+    atoms = Atoms([Atom("C", 0, 0, 0), Atom("H", 1, 0, 0)])
+    acq = _acquisition(model=legacy_atom_only_model, strength=1.0)
+
+    breakdown = acq.components(atoms)
+
+    assert breakdown.calibration_applied is False
+    assert breakdown.calibrated_expected_iqa_error_ha is None
+    assert breakdown.energy_risk == pytest.approx(math.log1p(4.0 / 2.0))

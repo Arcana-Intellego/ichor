@@ -614,9 +614,9 @@ def lookup_calibrated_abs_error(
 ) -> Optional[float]:
     """Return calibrated absolute IQA error for a raw uncertainty value.
 
-    Seed selection only has a cheap total posterior variance for the whole
-    pool scan, so it uses the total calibration table by default. ARIADNE can
-    still fall back to per-atom diagnostics when a total table is unavailable.
+    Acquisition-facing callers use the total calibration table. Per-atom
+    calibration tables remain diagnostic-only and must not be combined into a
+    total-energy acquisition signal.
     """
     raw = _finite_float(raw_uncertainty)
     if raw is None:
@@ -626,7 +626,7 @@ def lookup_calibrated_abs_error(
         return None
     table = tables.get(str(table_key))
     if not isinstance(table, Mapping):
-        table = tables.get("global_total") or tables.get("global")
+        table = tables.get("global_total")
     if not isinstance(table, Mapping):
         return None
     bins = table.get("bins")

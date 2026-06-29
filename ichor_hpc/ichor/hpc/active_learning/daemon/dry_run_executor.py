@@ -547,9 +547,7 @@ class DryRunPhaseExecutor:
                 "val_indices": [floor],
                 "holdout_indices": [],
             }
-            split_path.write_text(
-                json.dumps(payload, indent=2), encoding="utf-8",
-            )
+            atomic_write_json(split_path, payload)
             self.artefact_log.append(str(split_path))
             return {}
 
@@ -601,9 +599,7 @@ class DryRunPhaseExecutor:
             "val_indices": list(result.val_indices),
             "holdout_indices": list(result.holdout_indices),
         }
-        split_path.write_text(
-            json.dumps(payload, indent=2), encoding="utf-8",
-        )
+        atomic_write_json(split_path, payload)
         self.artefact_log.append(str(split_path))
         return {}
 

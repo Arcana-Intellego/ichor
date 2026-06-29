@@ -149,3 +149,34 @@ def test_read_ariadne_manifest_still_rejects_wrong_result_sha(tmp_path):
 
     with pytest.raises(HandoffManifestError, match="wrong_trajectory_sha256"):
         read_ariadne_results_manifest(iter_dir, expected_iteration=0)
+
+
+def test_read_ariadne_manifest_wraps_malformed_integer_fields(tmp_path):
+    iter_dir = tmp_path / "iteration-0000"
+    seed_dir = iter_dir / "pool" / "seed_0000"
+    seed_dir.mkdir(parents=True)
+    result_path = seed_dir / "result.json"
+    result_path.write_text(json.dumps(_result_payload()), encoding="utf-8")
+    provenance_path = seed_dir / ".provenance.json"
+    provenance_path.write_text("{}", encoding="utf-8")
+
+    write_ariadne_results_manifest(iter_dir, {
+        "schema_version": ARIADNE_RESULTS_SCHEMA_VERSION,
+        "iteration": "not-an-int",
+        "trajectory_sha256": "a" * 64,
+        "expected_n": 1,
+        "n_accepted": 1,
+        "n_rejected": 0,
+        "accepted": [{
+            "seed_index": 0,
+            "seed_frame_id": 2,
+            "seed_dir": str(seed_dir.resolve()),
+            "result_json": str(result_path.resolve()),
+            "provenance_json": str(provenance_path.resolve()),
+            "return_code": 0,
+        }],
+        "rejected": [],
+    })
+
+    with pytest.raises(HandoffManifestError, match="ARIADNE results iteration"):
+        read_ariadne_results_manifest(iter_dir, expected_iteration=0)

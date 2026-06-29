@@ -542,6 +542,7 @@ def _ariadne_optional_diagnostic_warnings(result_dict: Dict[str, Any]) -> List[s
         "off",
         "fixed",
         "adaptive_initial_gradient",
+        "adaptive_initial_gradient_rms",
     }:
         warnings.append("trqn_scale_mode_unknown")
     return warnings
@@ -712,15 +713,51 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     seed_frame_id=seed_frame_id,
                 )
             except Exception as exc:
-                raise BackendSubmissionError(
-                    "ARIADNE seed provenance invalid for "
-                    + seed_dir.name
-                    + ": "
-                    + type(exc).__name__
-                    + ": "
-                    + str(exc)
-                ) from exc
-            return prov_path, False
+                reason = type(exc).__name__ + ": " + str(exc)
+                if "mismatch" in str(exc):
+                    raise BackendSubmissionError(
+                        "ARIADNE seed provenance invalid for "
+                        + seed_dir.name
+                        + ": "
+                        + reason
+                    ) from exc
+                quarantine = prov_path.with_name(
+                    prov_path.name
+                    + ".legacy_invalid."
+                    + str(os.getpid())
+                )
+                counter = 0
+                while quarantine.exists():
+                    counter += 1
+                    quarantine = prov_path.with_name(
+                        prov_path.name
+                        + ".legacy_invalid."
+                        + str(os.getpid())
+                        + "."
+                        + str(counter)
+                    )
+                try:
+                    os.replace(prov_path, quarantine)
+                except OSError as move_exc:
+                    raise BackendSubmissionError(
+                        "ARIADNE seed provenance invalid and could not be "
+                        "quarantined for "
+                        + seed_dir.name
+                        + ": "
+                        + type(move_exc).__name__
+                        + ": "
+                        + str(move_exc)
+                    ) from move_exc
+                self._journal_event(
+                    "ariadne_seed_provenance_repaired",
+                    iteration=iteration,
+                    seed_index=seed_record.get("seed_index"),
+                    seed_dir=seed_dir.name,
+                    reason=reason[:240],
+                    quarantined_path=str(quarantine),
+                )
+            else:
+                return prov_path, False
 
         neighbours, dimension, eigenvalues = self._seed_record_subspace_payload(seed_record)
         try:
@@ -3054,6 +3091,15 @@ def _shell_executable(value: Any) -> str:
     return shlex.quote(text)
 
 
+def _safe_shell_path_component(value: Any, *, fallback: str = "unknown") -> str:
+    text = str(value or "").strip()
+    if not text:
+        text = str(fallback)
+    _reject_shell_control_chars("shell path component", text)
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("._-")
+    return safe or str(fallback)
+
+
 def _python_executable_for_script() -> str:
     python_path = profile_value(
         "software", "python", "python_path", default=None
@@ -3309,6 +3355,7 @@ def build_sbatch_script(
             camp,
             config,
             points_file,
+            campaign_uid=campaign_uid,
             resolved_resources=resolved,
         )
     elif phase_name in ("INITIAL_AIMALL", "AIMALL"):
@@ -3334,6 +3381,7 @@ def _gaussian_invocation_block(
     config,
     points_file,
     *,
+    campaign_uid: Optional[str] = None,
     resolved_resources: ResolvedPhaseResources,
 ) -> List[str]:
     gaussian_modules = _configured_backend_modules(
@@ -3356,20 +3404,50 @@ def _gaussian_invocation_block(
     points_file_q = _shell_quote(points_file)
     camp_q = _shell_quote(camp)
     phase_q = _shell_quote(str(phase_name))
+    uid = _safe_shell_path_component(campaign_uid)
+    uid_q = _shell_quote(uid)
+    scratch_root = profile_value("software", "gaussian", "scratch_root", default=None)
+    scratch_lines: List[str]
+    cleanup_case: str
+    if scratch_root is not None and str(scratch_root).strip():
+        scratch_root_text = str(scratch_root).strip()
+        _reject_shell_control_chars(
+            "configured software.gaussian.scratch_root",
+            scratch_root_text,
+        )
+        scratch_lines = [
+            "export ICHOR_GAUSSIAN_SCRATCH_ROOT="
+            + _shell_executable(scratch_root_text),
+            'export GAUSS_SCRDIR="${ICHOR_GAUSSIAN_SCRATCH_ROOT%/}/ichor-gaussian/${ICHOR_CAMPAIGN_UID}/${ICHOR_GAUSSIAN_PHASE}/${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"',
+        ]
+        cleanup_case = (
+            '    "${ICHOR_GAUSSIAN_SCRATCH_ROOT%/}"/ichor-gaussian/'
+            '"$ICHOR_CAMPAIGN_UID"/"$ICHOR_GAUSSIAN_PHASE"/'
+            '"$SLURM_JOB_ID"_*) rm -rf -- "$GAUSS_SCRDIR" ;;'
+        )
+    else:
+        scratch_lines = [
+            'export GAUSS_SCRDIR="${ICHOR_CAMPAIGN_DIR}/.DATA/SCRATCH/GAUSSIAN/${ICHOR_GAUSSIAN_PHASE}/${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"',
+        ]
+        cleanup_case = (
+            '    "$ICHOR_CAMPAIGN_DIR"/.DATA/SCRATCH/GAUSSIAN/*/'
+            '"$SLURM_JOB_ID"_*) rm -rf -- "$GAUSS_SCRDIR" ;;'
+        )
     return [
         *["module load " + m for m in gaussian_modules],
         "",
         "# per-point gaussian array: task N runs the Nth staged pointdir.",
         "export ICHOR_CAMPAIGN_DIR=" + camp_q,
+        "export ICHOR_CAMPAIGN_UID=" + uid_q,
         "export ICHOR_GAUSSIAN_PHASE=" + phase_q,
         "export ICHOR_ITERATION=" + str(int(iteration)),
-        'export GAUSS_SCRDIR="${ICHOR_CAMPAIGN_DIR}/.DATA/SCRATCH/GAUSSIAN/${ICHOR_GAUSSIAN_PHASE}/${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"',
+        *scratch_lines,
         *memory_lines,
         'mkdir -p "$GAUSS_SCRDIR"',
         'echo "GAUSS_SCRDIR=$GAUSS_SCRDIR"',
         "cleanup_gaussian_scratch_success() {",
         '  case "$GAUSS_SCRDIR" in',
-        '    "$ICHOR_CAMPAIGN_DIR"/.DATA/SCRATCH/GAUSSIAN/*/"$SLURM_JOB_ID"_*) rm -rf -- "$GAUSS_SCRDIR" ;;',
+        cleanup_case,
         '    *) echo "Refusing to remove unexpected Gaussian scratch path: $GAUSS_SCRDIR" >&2 ;;',
         "  esac",
         "}",
