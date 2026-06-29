@@ -2322,6 +2322,13 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     n_warnings=int(len(optional_diag_warnings)),
                 )
 
+            accept_legacy_missing_landing_safety = bool(
+                getattr(
+                    getattr(self.config, "adversarial_safety", None),
+                    "accept_legacy_missing_landing_safety",
+                    False,
+                )
+            )
             usability = ariadne_result_usability_payload(
                 result_dict,
                 allow_seed_fallback=bool(
@@ -2331,16 +2338,21 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         False,
                     )
                 ),
+                accept_legacy_missing_landing_safety=accept_legacy_missing_landing_safety,
             )
 
             landing_safety = result_dict.get("landing_safety")
             if not isinstance(landing_safety, dict):
                 landing_safety = {
-                    "accepted": True,
+                    "accepted": bool(accept_legacy_missing_landing_safety),
                     "policy": "legacy_missing_safety",
                     "selected_origin": "legacy_result",
                     "selected_candidate_index": None,
-                    "reasons": [],
+                    "reasons": (
+                        []
+                        if accept_legacy_missing_landing_safety
+                        else ["missing_landing_safety"]
+                    ),
                     "record_only_reasons": ["legacy_missing_landing_safety"],
                     "metrics": {},
                     "raw_final": {},

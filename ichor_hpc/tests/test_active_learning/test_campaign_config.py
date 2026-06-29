@@ -59,6 +59,7 @@ def test_default_campaign_config_is_valid():
     assert c.aimall.iasmesh == "fine"
     assert c.quality_gates.ariadne_max_displacement_ang == 1.25
     assert c.quality_gates.ariadne_min_pair_distance_ang == 0.60
+    assert c.adversarial_safety.accept_legacy_missing_landing_safety is False
     assert c.max_acquisition_grad_per_ang is None
     assert c.effective_max_acquisition_grad_per_ang() == 50.0
     assert c.error_calibration.enabled is True
@@ -504,6 +505,8 @@ def test_invalid_split_strategy_rejected():
     [
         "examples/csf3_first_live_iter/campaign.yaml",
         "examples/csf4_first_live_iter/campaign.yaml",
+        "examples/csf3_long_campaign/campaign.yaml",
+        "examples/csf4_long_campaign/campaign.yaml",
         "examples/dry_run_water_tetramer/campaign.yaml",
     ],
 )

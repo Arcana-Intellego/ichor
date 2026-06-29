@@ -796,8 +796,9 @@ class Daemon:
             )
         if result.submitted_job_id and not result.is_complete:
             if phase_name in SBATCH_PHASES:
+                submitted_intent = None
                 try:
-                    _submission_intent.mark_submitted(
+                    submitted_intent = _submission_intent.mark_submitted(
                         self.campaign_dir,
                         phase_name,
                         int(state.iteration),
@@ -822,6 +823,11 @@ class Daemon:
                 "sbatch", phase=phase_name, job_id=result.submitted_job_id,
                 iteration=state.iteration,
                 expected_tasks=result.expected_tasks,
+                submitted_at_iso=(
+                    submitted_intent.get("submitted_at_iso")
+                    if isinstance(submitted_intent, dict)
+                    else None
+                ),
             )
             return TickStatus.SUBMITTED
         if result.is_complete:
@@ -1087,6 +1093,18 @@ class Daemon:
             observations,
             expected_task_count=expected_tasks,
         )
+        if observations:
+            first_status = getattr(observations[0].status, "value", observations[0].status)
+            self._record_queue_lifecycle(
+                state,
+                phase,
+                job_id,
+                "first_sacct",
+                status=str(first_status),
+                n_expected=getattr(summary, "n_expected", None),
+                n_observed=int(getattr(summary, "n_observed", 0)),
+                n_missing=int(getattr(summary, "n_missing", 0)),
+            )
         #Detect empty sacct response BEFORE checking is_terminal --
         #an empty observations list is the "accounting aged out" signature
         #we want to escalate after a streak. is_terminal is False for n=0
@@ -1243,6 +1261,19 @@ class Daemon:
 
         if not summary.is_terminal:
             return TickStatus.POLLING
+
+        self._record_queue_lifecycle(
+            state,
+            phase,
+            job_id,
+            "terminal",
+            status=(
+                "COMPLETED" if bool(summary.is_fully_successful) else "FAILED"
+            ),
+            n_expected=getattr(summary, "n_expected", None),
+            n_observed=int(getattr(summary, "n_observed", 0)),
+            n_missing=int(getattr(summary, "n_missing", 0)),
+        )
 
         #Job has reached terminal state(s). Decide between postprocess and
         #failure handling based on the success ratio.
@@ -1414,6 +1445,55 @@ class Daemon:
             out.append({"job_id": str(job), "state": str(state)})
         return out
 
+    def _record_queue_lifecycle(
+        self,
+        state: CampaignState,
+        phase: CampaignPhase,
+        job_id: str,
+        event: str,
+        *,
+        status: Optional[str] = None,
+        n_expected: Optional[int] = None,
+        n_observed: Optional[int] = None,
+        n_missing: Optional[int] = None,
+        rows_sample: Optional[Any] = None,
+    ) -> None:
+        try:
+            update = _submission_intent.record_queue_lifecycle(
+                self.campaign_dir,
+                phase.value,
+                int(state.iteration),
+                event,
+                job_id=str(job_id),
+                status=status,
+                n_expected=n_expected,
+                n_observed=n_observed,
+                n_missing=n_missing,
+                rows_sample=rows_sample,
+            )
+        except Exception as exc:
+            self._journal(
+                "submission_intent_update_failed",
+                phase=phase.value,
+                iteration=int(state.iteration),
+                error="queue_lifecycle_" + str(event) + ": " + str(exc)[:180],
+            )
+            return
+        changed = update.get("changed_keys") if isinstance(update, dict) else None
+        if isinstance(changed, list) and changed:
+            self._journal(
+                "queue_lifecycle_update",
+                phase=phase.value,
+                iteration=int(state.iteration),
+                job_id=str(job_id),
+                queue_event=str(event),
+                status=status,
+                changed_keys=[str(k) for k in changed[:8]],
+                n_expected=n_expected,
+                n_observed=n_observed,
+                n_missing=n_missing,
+            )
+
     def _postprocess(
         self,
         state: CampaignState,
@@ -1424,6 +1504,16 @@ class Daemon:
         attempts = max(1, int(getattr(self.config.runtime, "postprocess_settle_attempts", 3)))
         settle_seconds = max(0, int(getattr(self.config.runtime, "postprocess_settle_seconds", 10)))
         result = None
+        self._record_queue_lifecycle(
+            state,
+            phase,
+            str(summary.parent_job_id),
+            "postprocess_started",
+            status="started",
+            n_expected=getattr(summary, "n_expected", None),
+            n_observed=int(getattr(summary, "n_observed", 0)),
+            n_missing=int(getattr(summary, "n_missing", 0)),
+        )
         for attempt in range(attempts):
             try:
                 result = self.executor.postprocess(state, phase, observations)
@@ -1441,6 +1531,16 @@ class Daemon:
                     if settle_seconds:
                         self.sleep_fn(float(settle_seconds))
                     continue
+                self._record_queue_lifecycle(
+                    state,
+                    phase,
+                    str(summary.parent_job_id),
+                    "postprocess_finished",
+                    status="failed",
+                    n_expected=getattr(summary, "n_expected", None),
+                    n_observed=int(getattr(summary, "n_observed", 0)),
+                    n_missing=int(getattr(summary, "n_missing", 0)),
+                )
                 return self._halt(state, phase, reason)
             if (
                 result.failure_reason
@@ -1460,8 +1560,28 @@ class Daemon:
                 continue
             break
         if result is None:
+            self._record_queue_lifecycle(
+                state,
+                phase,
+                str(summary.parent_job_id),
+                "postprocess_finished",
+                status="failed",
+                n_expected=getattr(summary, "n_expected", None),
+                n_observed=int(getattr(summary, "n_observed", 0)),
+                n_missing=int(getattr(summary, "n_missing", 0)),
+            )
             return self._halt(state, phase, "postprocess_failed_without_result")
         if result.failure_reason:
+            self._record_queue_lifecycle(
+                state,
+                phase,
+                str(summary.parent_job_id),
+                "postprocess_finished",
+                status="failed",
+                n_expected=getattr(summary, "n_expected", None),
+                n_observed=int(getattr(summary, "n_observed", 0)),
+                n_missing=int(getattr(summary, "n_missing", 0)),
+            )
             return self._halt(state, phase, result.failure_reason)
         self._clear_sacct_streaks(state, str(summary.parent_job_id))
         contract_error = self._transition_output_contract_error(
@@ -1470,6 +1590,16 @@ class Daemon:
             result.state_updates,
         )
         if contract_error is not None:
+            self._record_queue_lifecycle(
+                state,
+                phase,
+                str(summary.parent_job_id),
+                "postprocess_finished",
+                status="failed",
+                n_expected=getattr(summary, "n_expected", None),
+                n_observed=int(getattr(summary, "n_observed", 0)),
+                n_missing=int(getattr(summary, "n_missing", 0)),
+            )
             state.pending_jobs[phase.value] = None
             self._journal(
                 "phase_output_contract_invalid",
@@ -1484,6 +1614,16 @@ class Daemon:
             )
         completed_iteration = int(state.iteration)
         if phase.value in SBATCH_PHASES:
+            self._record_queue_lifecycle(
+                state,
+                phase,
+                str(summary.parent_job_id),
+                "postprocess_finished",
+                status="succeeded",
+                n_expected=getattr(summary, "n_expected", None),
+                n_observed=int(getattr(summary, "n_observed", 0)),
+                n_missing=int(getattr(summary, "n_missing", 0)),
+            )
             try:
                 _submission_intent.mark_completed(
                     self.campaign_dir, phase.value, completed_iteration,
@@ -1682,6 +1822,26 @@ class Daemon:
                 else "sacct_rows_missing_but_squeue_active"
             )
             payload["squeue_rows_sample"] = self._queue_rows_sample(liveness)
+            try:
+                first_state = (
+                    payload["squeue_rows_sample"][0].get("state")
+                    if payload["squeue_rows_sample"]
+                    else "active"
+                )
+                _submission_intent.record_queue_lifecycle(
+                    self.campaign_dir,
+                    phase.value,
+                    int(iteration),
+                    "first_squeue",
+                    job_id=str(job_id),
+                    status=str(first_state),
+                    n_expected=getattr(summary, "n_expected", None),
+                    n_observed=int(getattr(summary, "n_observed", 0)),
+                    n_missing=int(getattr(summary, "n_missing", 0)),
+                    rows_sample=payload["squeue_rows_sample"],
+                )
+            except Exception as exc:
+                payload["queue_lifecycle_warning"] = str(exc)[:160]
             self._journal(event, **payload)
             return
         payload["error"] = str(getattr(liveness, "error", "") or "")[:200]

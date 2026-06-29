@@ -1,0 +1,31 @@
+schema_version: 3
+system_name: ICHOR_CSF3_LONG_CAMPAIGN
+max_iterations: 20
+
+# Production-style starting point. Calibrate thresholds from one first-live
+# campaign before increasing batch sizes further.
+initial_train_size: 80
+initial_val_size: 20
+
+seed_selection:
+  strategy: d_optimal
+  n_seeds_per_iteration: 16
+  bulk_fraction: 0.2
+
+batch_sizing:
+  policy: linear
+  floor: 8
+  cap: 24
+
+resources:
+  partition: multicore
+  array_concurrency_limit: 8
+  gaussian_memory_mode: slurm_env
+
+adversarial_safety:
+  accept_legacy_missing_landing_safety: false
+  allow_seed_fallback: false
+
+error_calibration:
+  mode: record_only
+  model_version_policy: current

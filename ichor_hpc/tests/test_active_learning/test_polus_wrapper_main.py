@@ -218,7 +218,9 @@ def test_phase_b_writes_sample_and_dedup(tmp_path):
     for i in range(5):
         # spread the seeds out in x
         coords = [(c[0] + 0.1 * i, c[1], c[2]) for c in base]
-        _make_seed_result(pool_dir / f"seed_{i:04d}", atom_types, coords)
+        seed_dir = pool_dir / f"seed_{i:04d}"
+        _make_seed_result(seed_dir, atom_types, coords)
+        _set_landing_safety(seed_dir, accepted=True)
     _write_ariadne_manifest(iter_dir)
 
     result = _run([
@@ -307,6 +309,106 @@ def test_phase_b_rejects_partial_missing_landing_safety(tmp_path):
     assert "partial missing landing_safety" in result.stderr
 
 
+def test_phase_b_rejects_all_missing_landing_safety_by_default(tmp_path):
+    campaign = tmp_path / "c"
+    campaign.mkdir()
+    cfg = CampaignConfig()
+    cfg.phase_b.descriptor = "rmsd_massweight"
+    cfg.to_yaml(campaign / "campaign.yaml")
+
+    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
+    pool_dir = iter_dir / "pool"
+    atom_types = ["O", "H", "H"]
+    base = [(0.0, 0.0, 0.0), (0.96, 0.0, 0.0), (-0.24, 0.93, 0.0)]
+    for i in range(2):
+        _make_seed_result(
+            pool_dir / f"seed_{i:04d}",
+            atom_types,
+            [(c[0] + 0.4 * i, c[1], c[2]) for c in base],
+        )
+    _write_ariadne_manifest(iter_dir)
+
+    result = _run([
+        "--descriptor", "rmsd_massweight",
+        "--iteration", "0",
+        "--campaign-dir", str(campaign),
+    ])
+
+    assert result.returncode == 3
+    assert "all Phase B candidates are missing landing_safety metadata" in result.stderr
+    assert not (iter_dir / "phase_b_SAMPLE_raw.xyz").exists()
+
+
+def test_phase_b_accepts_all_missing_landing_safety_with_legacy_override(tmp_path):
+    campaign = tmp_path / "c"
+    campaign.mkdir()
+    cfg = CampaignConfig()
+    cfg.phase_b.descriptor = "rmsd_massweight"
+    cfg.adversarial_safety.accept_legacy_missing_landing_safety = True
+    cfg.to_yaml(campaign / "campaign.yaml")
+
+    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
+    pool_dir = iter_dir / "pool"
+    atom_types = ["O", "H", "H"]
+    base = [(0.0, 0.0, 0.0), (0.96, 0.0, 0.0), (-0.24, 0.93, 0.0)]
+    for i in range(2):
+        _make_seed_result(
+            pool_dir / f"seed_{i:04d}",
+            atom_types,
+            [(c[0] + 0.4 * i, c[1], c[2]) for c in base],
+        )
+    _write_ariadne_manifest(iter_dir)
+
+    result = _run([
+        "--descriptor", "rmsd_massweight",
+        "--iteration", "0",
+        "--campaign-dir", str(campaign),
+    ])
+
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads(
+        (iter_dir / "PHASE_B_SELECTION.json").read_text(encoding="utf-8")
+    )
+    assert manifest["safety_filter"]["legacy_missing_safety"] is True
+
+
+def test_phase_b_all_unsafe_candidates_halts_before_gaussian_handoff(tmp_path):
+    campaign = tmp_path / "c"
+    campaign.mkdir()
+    cfg = CampaignConfig()
+    cfg.phase_b.descriptor = "rmsd_massweight"
+    cfg.to_yaml(campaign / "campaign.yaml")
+
+    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
+    pool_dir = iter_dir / "pool"
+    atom_types = ["O", "H", "H"]
+    base = [(0.0, 0.0, 0.0), (0.96, 0.0, 0.0), (-0.24, 0.93, 0.0)]
+    for i in range(2):
+        seed_dir = pool_dir / f"seed_{i:04d}"
+        _make_seed_result(
+            seed_dir,
+            atom_types,
+            [(c[0] + 0.4 * i, c[1], c[2]) for c in base],
+        )
+        _set_landing_safety(
+            seed_dir,
+            accepted=False,
+            reasons=["no_safe_non_seed_landing"],
+            policy="rejected",
+        )
+    _write_ariadne_manifest(iter_dir)
+
+    result = _run([
+        "--descriptor", "rmsd_massweight",
+        "--iteration", "0",
+        "--campaign-dir", str(campaign),
+    ])
+
+    assert result.returncode == 3
+    assert "removed every candidate" in result.stderr
+    assert not (iter_dir / "phase_b_SAMPLE_raw.xyz").exists()
+
+
 def test_phase_b_no_seeds_returns_3(tmp_path):
     """Empty pool dir -> exit 3."""
     campaign = tmp_path / "c"
@@ -345,6 +447,7 @@ def test_acquisition_weighted_descriptor_refuses(tmp_path):
         ["O", "H", "H"],
         [(0.0, 0.0, 0.0), (0.96, 0.0, 0.0), (-0.24, 0.93, 0.0)],
     )
+    _set_landing_safety(pool_dir / "seed_0000", accepted=True)
     _write_ariadne_manifest(iter_dir)
     result = _run([
         "--descriptor", "acquisition_weighted",

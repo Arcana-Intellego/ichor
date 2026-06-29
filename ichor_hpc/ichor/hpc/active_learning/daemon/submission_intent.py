@@ -26,6 +26,17 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _duration_seconds(start: Optional[str], end: Optional[str]) -> Optional[float]:
+    if not start or not end:
+        return None
+    try:
+        start_dt = datetime.fromisoformat(str(start))
+        end_dt = datetime.fromisoformat(str(end))
+    except ValueError:
+        return None
+    return max(0.0, float((end_dt - start_dt).total_seconds()))
+
+
 def intent_dir(campaign_dir: Union[str, Path]) -> Path:
     return Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING" / INTENT_DIR_NAME
 
@@ -155,6 +166,9 @@ def update_intent_status(
         "created_iso": _now_iso(),
     }
     data["status"] = str(status)
+    lifecycle = data.get("queue_lifecycle")
+    if not isinstance(lifecycle, dict):
+        lifecycle = {}
     if job_id is not None:
         data["job_id"] = str(job_id)
         seen = data.get("job_ids_seen", [])
@@ -169,7 +183,100 @@ def update_intent_status(
         data["expected_tasks"] = int(expected_tasks)
     if job_ids_seen is not None:
         data["job_ids_seen"] = [str(x) for x in list(job_ids_seen)]
+    if str(status) == "SUBMITTED":
+        submitted_at = data.get("submitted_at_iso") or _now_iso()
+        data["submitted_at_iso"] = str(submitted_at)
+        lifecycle.setdefault("submitted_at_iso", str(submitted_at))
+    if str(status) == "ADOPTED":
+        adopted_at = data.get("adopted_at_iso") or _now_iso()
+        data["adopted_at_iso"] = str(adopted_at)
+        lifecycle.setdefault("adopted_at_iso", str(adopted_at))
+    if str(status) == "COMPLETED":
+        completed_at = data.get("completed_at_iso") or _now_iso()
+        data["completed_at_iso"] = str(completed_at)
+        lifecycle.setdefault("completed_at_iso", str(completed_at))
+    data["queue_lifecycle"] = lifecycle
     return _write_payload(path, data)
+
+
+def record_queue_lifecycle(
+    campaign_dir: Union[str, Path],
+    phase_name: str,
+    iteration: int,
+    event: str,
+    *,
+    job_id: Optional[str] = None,
+    status: Optional[str] = None,
+    n_expected: Optional[int] = None,
+    n_observed: Optional[int] = None,
+    n_missing: Optional[int] = None,
+    rows_sample: Optional[Any] = None,
+) -> Dict[str, Any]:
+    data = load_intent(campaign_dir, phase_name, iteration)
+    if data is None:
+        return {"changed_keys": [], "intent": None}
+    if job_id is not None:
+        recorded_job = data.get("job_id")
+        if recorded_job is not None and str(recorded_job) != str(job_id):
+            return {"changed_keys": [], "intent": data}
+    lifecycle = data.get("queue_lifecycle")
+    if not isinstance(lifecycle, dict):
+        lifecycle = {}
+    changed: list[str] = []
+    now = _now_iso()
+
+    def set_once(key: str, value: Any) -> None:
+        if key not in lifecycle:
+            lifecycle[key] = value
+            changed.append(key)
+
+    event_name = str(event)
+    if event_name == "first_sacct":
+        set_once("first_sacct_at_iso", now)
+        if status is not None:
+            set_once("first_sacct_status", str(status))
+    elif event_name == "first_squeue":
+        set_once("first_squeue_at_iso", now)
+        if status is not None:
+            set_once("first_squeue_status", str(status))
+        if rows_sample is not None:
+            set_once("first_squeue_rows_sample", list(rows_sample)[:5])
+    elif event_name == "terminal":
+        set_once("terminal_at_iso", now)
+        if status is not None:
+            set_once("terminal_status", str(status))
+    elif event_name == "postprocess_started":
+        lifecycle["postprocess_started_at_iso"] = now
+        changed.append("postprocess_started_at_iso")
+    elif event_name == "postprocess_finished":
+        lifecycle["postprocess_finished_at_iso"] = now
+        changed.append("postprocess_finished_at_iso")
+    else:
+        set_once(event_name + "_at_iso", now)
+    if n_expected is not None:
+        lifecycle["n_expected"] = int(n_expected)
+    if n_observed is not None:
+        lifecycle["n_observed"] = int(n_observed)
+    if n_missing is not None:
+        lifecycle["n_missing"] = int(n_missing)
+
+    submitted_at = lifecycle.get("submitted_at_iso") or data.get("submitted_at_iso")
+    first_seen = lifecycle.get("first_squeue_at_iso") or lifecycle.get("first_sacct_at_iso")
+    queue_wait = _duration_seconds(
+        str(submitted_at) if submitted_at else None,
+        str(first_seen) if first_seen else None,
+    )
+    if queue_wait is not None:
+        lifecycle["queue_wait_seconds"] = queue_wait
+    postprocess_seconds = _duration_seconds(
+        str(lifecycle.get("postprocess_started_at_iso") or ""),
+        str(lifecycle.get("postprocess_finished_at_iso") or ""),
+    )
+    if postprocess_seconds is not None:
+        lifecycle["postprocess_seconds"] = postprocess_seconds
+    data["queue_lifecycle"] = lifecycle
+    updated = _write_payload(intent_path(campaign_dir, phase_name, iteration), data)
+    return {"changed_keys": changed, "intent": updated}
 
 
 def mark_submitted(

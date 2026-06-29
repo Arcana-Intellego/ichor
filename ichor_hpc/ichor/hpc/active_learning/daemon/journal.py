@@ -121,6 +121,7 @@ KNOWN_EVENT_TYPES = (
     "postprocess_settle_retry",
     "phase_pre_submit_intent",
     "phase_submitted",
+    "queue_lifecycle_update",
     "staging_archived",
     "daemon_lease_conflict",
     "daemon_lease_stale_recovered",

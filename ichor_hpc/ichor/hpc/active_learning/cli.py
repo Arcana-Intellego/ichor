@@ -886,12 +886,34 @@ def _format_active_submission_intents(value: Any) -> str:
         iteration = str(intent.get("iteration", "?"))
         status = str(intent.get("status", "?"))
         job_id = intent.get("job_id")
+        lifecycle = intent.get("queue_lifecycle")
+        lifecycle_bits: List[str] = []
+        if isinstance(lifecycle, dict):
+            if lifecycle.get("first_squeue_at_iso"):
+                lifecycle_bits.append("squeue_seen")
+            if lifecycle.get("first_sacct_at_iso"):
+                lifecycle_bits.append("sacct_seen")
+            if lifecycle.get("terminal_at_iso"):
+                lifecycle_bits.append("terminal")
+            if lifecycle.get("queue_wait_seconds") is not None:
+                lifecycle_bits.append(
+                    "queue_wait="
+                    + str(round(float(lifecycle["queue_wait_seconds"]), 1))
+                    + "s"
+                )
+            if lifecycle.get("postprocess_seconds") is not None:
+                lifecycle_bits.append(
+                    "postprocess="
+                    + str(round(float(lifecycle["postprocess_seconds"]), 1))
+                    + "s"
+                )
         if job_id:
-            samples.append(
-                phase + "@" + iteration + " " + status + " job_id=" + str(job_id)
-            )
+            text = phase + "@" + iteration + " " + status + " job_id=" + str(job_id)
         else:
-            samples.append(phase + "@" + iteration + " " + status)
+            text = phase + "@" + iteration + " " + status
+        if lifecycle_bits:
+            text += " [" + ", ".join(lifecycle_bits) + "]"
+        samples.append(text)
     summary = str(len(value))
     if samples:
         summary += " (" + "; ".join(samples) + ")"
@@ -2623,6 +2645,73 @@ def _print_reconcile_cleanup_prediction(
     print("")
 
 
+def _reconcile_decision_payload(
+    campaign: Path,
+    report: Any,
+    contract_status: Dict[str, Any],
+    *,
+    proposed_state_path: Optional[Path] = None,
+    runtime_status: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    cleanable = _reconcile_cleanable_reasons(report)
+    blockers = _reconcile_hard_blockers(report, contract_status)
+    candidates = _reconcile_valid_candidates(campaign, contract_status, report)
+    selected_state = report.proposed_state
+    runnable = bool(contract_status.get("contract_ok")) and not blockers
+    why_not_runnable: List[str] = []
+    if not bool(contract_status.get("contract_ok")):
+        why_not_runnable.extend(
+            "missing/invalid input: " + str(item)
+            for item in contract_status.get("missing_or_invalid_inputs", [])
+        )
+    why_not_runnable.extend(blockers)
+    if selected_state.phase in (CampaignPhase.HALTED, CampaignPhase.DONE):
+        why_not_runnable.append(
+            "selected phase is terminal: " + selected_state.phase.value
+        )
+    next_command = (
+        "ichor-al-daemon start --campaign-dir " + str(campaign)
+        if runnable and selected_state.phase is not CampaignPhase.DONE
+        else "ichor-al-daemon reconcile --campaign-dir " + str(campaign) + " --apply"
+        if cleanable and not blockers
+        else "inspect blockers before restarting"
+    )
+    if selected_state.phase is CampaignPhase.DONE:
+        next_command = "campaign is DONE; inspect outputs or initialise a new campaign"
+    return {
+        "schema_version": 1,
+        "campaign_dir": str(campaign),
+        "proposed_state_path": (
+            str(proposed_state_path) if proposed_state_path is not None else None
+        ),
+        "selected_phase": selected_state.phase.value,
+        "selected_iteration": int(selected_state.iteration),
+        "runnable": bool(runnable and selected_state.phase is not CampaignPhase.HALTED),
+        "decision": str(getattr(report, "decision", "") or ""),
+        "why_selected": list(getattr(report, "notes", []) or []),
+        "why_not_runnable": why_not_runnable,
+        "trusted_artifacts": [str(item) for item in getattr(report, "trusted_artifacts", [])],
+        "trusted_inputs": [str(item) for item in contract_status.get("trusted_inputs", [])],
+        "trusted_handoffs": [
+            _format_reconcile_contract_item(campaign, item)
+            for item in contract_status.get("trusted_handoffs", [])
+        ],
+        "protected_artifacts": [
+            _format_reconcile_contract_item(campaign, item)
+            for item in contract_status.get("protected_artifacts", [])
+        ],
+        "hard_blockers": blockers,
+        "cleanable_artifacts": cleanable,
+        "safe_cleanup_actions": cleanable,
+        "valid_recovery_candidates": candidates,
+        "active_submission_intents": list(getattr(report, "active_submission_intents", []) or []),
+        "recommended_actions": list(getattr(report, "recommended_actions", []) or []),
+        "next_command": next_command,
+        "contract": contract_status,
+        "runtime_status": runtime_status or {},
+    }
+
+
 def _print_reconcile_apply_plan(report: Any) -> None:
     cleanable = _reconcile_cleanable_reasons(report)
     if not cleanable:
@@ -2735,6 +2824,19 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         require_campaign_yaml=False,
     )
     runtime_status = _reconcile_runtime_status(campaign)
+    if bool(getattr(args, "json", False)) and bool(getattr(args, "apply", False)):
+        print(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "error": "json_apply_not_supported",
+                    "message": "reconcile --json is proposal-only; rerun without --json to apply",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 2
     if archive_staging_requested and not bool(getattr(args, "apply", False)):
         print(
             "refusing --archive-staging without --apply; this option mutates "
@@ -2804,6 +2906,22 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             print("campaign config could not be reviewed: " + str(exc), file=sys.stderr)
     _apply_runtime_config_to_recovered_state(report, config)
     target = write_proposed_state(campaign, report)
+    if bool(getattr(args, "json", False)):
+        contract_status = recovery_contract_status(campaign, report.proposed_state)
+        print(
+            json.dumps(
+                _reconcile_decision_payload(
+                    campaign,
+                    report,
+                    contract_status,
+                    proposed_state_path=target,
+                    runtime_status=runtime_status,
+                ),
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
     print("Proposed state written to: " + str(target))
     print("")
     _print_reconcile_current_state(campaign)
@@ -3815,6 +3933,15 @@ Examples:
             "After writing state.json.proposed, safely promote it to state.json, "
             "clean stale uncommitted re-entry staging, and update the campaign "
             "config lock. Refuses locked campaign.yaml changes."
+        ),
+    )
+    p_recon.add_argument(
+        "-j",
+        "--json",
+        action="store_true",
+        help=(
+            "Print a machine-readable recovery decision payload. Proposal-only; "
+            "do not combine with --apply."
         ),
     )
     p_recon.add_argument(

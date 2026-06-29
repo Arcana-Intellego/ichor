@@ -317,6 +317,7 @@ adversarial_safety:
   backtrack_to_safe_landing: true
   backtrack_points: 16
   allow_seed_fallback: false
+  accept_legacy_missing_landing_safety: false
   min_whitened_distance: 0.0
   max_whitened_distance: 10.0
   enforce_min_whitened_distance: false

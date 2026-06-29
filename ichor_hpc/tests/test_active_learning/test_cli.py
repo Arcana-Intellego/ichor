@@ -1309,6 +1309,39 @@ def test_cli_reconcile_writes_proposed_state(tmp_path, capsys):
     assert "Valid model versions:" in captured.out
 
 
+def test_cli_reconcile_json_outputs_machine_readable_decision(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+
+    rc = main(["reconcile", "--campaign-dir", str(campaign), "--json"])
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["schema_version"] == 1
+    assert payload["campaign_dir"] == str(campaign)
+    assert payload["proposed_state_path"].endswith("state.json.proposed")
+    assert "selected_phase" in payload
+    assert "hard_blockers" in payload
+    assert "next_command" in payload
+    assert "Proposed state written" not in captured.out
+
+
+def test_cli_reconcile_json_is_proposal_only(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+
+    rc = main([
+        "reconcile",
+        "--campaign-dir",
+        str(campaign),
+        "--json",
+        "--apply",
+    ])
+
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"] == "json_apply_not_supported"
+
+
 def test_cli_reconcile_cleanable_scripts_reports_candidate_without_manual_mv(
     tmp_path,
     capsys,

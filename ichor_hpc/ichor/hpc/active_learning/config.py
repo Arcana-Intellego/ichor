@@ -594,6 +594,7 @@ class AdversarialSafetyConfigBlock:
     backtrack_to_safe_landing: bool = True
     backtrack_points: int = 16
     allow_seed_fallback: bool = False
+    accept_legacy_missing_landing_safety: bool = False
     min_whitened_distance: float = 0.0
     max_whitened_distance: float = 10.0
     enforce_min_whitened_distance: bool = False
@@ -1367,6 +1368,7 @@ class CampaignConfig:
             "adversarial_safety.salvage_safe_iterate",
             "adversarial_safety.backtrack_to_safe_landing",
             "adversarial_safety.allow_seed_fallback",
+            "adversarial_safety.accept_legacy_missing_landing_safety",
             "adversarial_safety.enforce_min_whitened_distance",
             "adversarial_safety.phase_b_filter_enabled",
             "adversarial_safety.enforce_movement_band",

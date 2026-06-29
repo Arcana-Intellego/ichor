@@ -152,6 +152,55 @@ def test_pre_submit_intent_without_job_id_recovers_by_accounting_name(tmp_path):
     assert intent["job_id"] == "777"
 
 
+def test_queue_lifecycle_timestamps_are_recorded_for_successful_job(tmp_path):
+    d = _make_daemon(tmp_path)
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.PHASE_A_POLUS
+    state.pending_jobs[CampaignPhase.PHASE_A_POLUS.value] = "999"
+    write_state(d.state_path(), state)
+    submission_intent.write_pre_submit_intent(
+        d.campaign_dir,
+        campaign_uid=state.campaign_uid,
+        phase_name=CampaignPhase.PHASE_A_POLUS.value,
+        iteration=0,
+    )
+    submission_intent.mark_submitted(
+        d.campaign_dir,
+        CampaignPhase.PHASE_A_POLUS.value,
+        0,
+        "999",
+        expected_tasks=1,
+    )
+
+    assert d.tick() == TickStatus.ADVANCED
+
+    intent = submission_intent.load_intent(
+        d.campaign_dir,
+        CampaignPhase.PHASE_A_POLUS.value,
+        0,
+    )
+    lifecycle = intent["queue_lifecycle"]
+    assert lifecycle["submitted_at_iso"]
+    assert lifecycle["first_sacct_at_iso"]
+    assert lifecycle["first_sacct_status"] == "COMPLETED"
+    assert lifecycle["terminal_at_iso"]
+    assert lifecycle["terminal_status"] == "COMPLETED"
+    assert lifecycle["postprocess_started_at_iso"]
+    assert lifecycle["postprocess_finished_at_iso"]
+    assert lifecycle["postprocess_seconds"] >= 0.0
+    assert lifecycle["completed_at_iso"]
+    events = list(iter_events(d.journal_path()))
+    lifecycle_events = [
+        e for e in events if e.get("event") == "queue_lifecycle_update"
+    ]
+    assert any(
+        e.get("queue_event") == "first_sacct"
+        and e.get("status") == "COMPLETED"
+        and "first_sacct_at_iso" in e.get("changed_keys", [])
+        for e in lifecycle_events
+    )
+
+
 def test_pre_submit_intent_without_accounted_job_halts_instead_of_resubmitting(tmp_path):
     def lookup(state, phase, intent):
         return SimpleNamespace(

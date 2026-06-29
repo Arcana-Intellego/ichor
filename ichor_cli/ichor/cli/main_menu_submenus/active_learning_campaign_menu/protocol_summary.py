@@ -379,6 +379,12 @@ def format_sampling_protocol_summary(config: CampaignConfig) -> str:
         _line("adversarial_safety.reject_unsafe_landings", safety.reject_unsafe_landings)
     )
     lines.append(
+        _line(
+            "adversarial_safety.accept_legacy_missing_landing_safety",
+            safety.accept_legacy_missing_landing_safety,
+        )
+    )
+    lines.append(
         _line("adversarial_safety.max_whitened_distance", safety.max_whitened_distance)
     )
     lines.append(_line("adversarial_safety.enforce_movement_band", safety.enforce_movement_band))

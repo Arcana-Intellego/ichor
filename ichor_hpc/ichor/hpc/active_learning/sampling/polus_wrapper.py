@@ -278,12 +278,23 @@ def _build_phase_b_posterior(campaign, config):
     )
 
 
-def _phase_b_landing_safety_filter(candidate_frames, candidate_records):
+def _phase_b_landing_safety_filter(
+    candidate_frames,
+    candidate_records,
+    *,
+    accept_legacy_missing_landing_safety: bool = False,
+):
     missing = [
         i for i, rec in enumerate(candidate_records)
         if not isinstance(rec.get("landing_safety"), dict)
     ]
     if len(missing) == len(candidate_records):
+        if not bool(accept_legacy_missing_landing_safety):
+            raise ValueError(
+                "all Phase B candidates are missing landing_safety metadata; "
+                "set adversarial_safety.accept_legacy_missing_landing_safety "
+                "to true only for deliberate legacy migration"
+            )
         return (
             list(candidate_frames),
             list(candidate_records),
@@ -329,6 +340,30 @@ def _phase_b_landing_safety_filter(candidate_frames, candidate_records):
             "dropped": dropped,
         },
     )
+
+
+def _phase_b_json_safe(value):
+    """Return a JSON-safe copy of Phase B diagnostics.
+
+    Anti-overlap diagnostics can legitimately contain infinite nearest
+    distances when no committed training set exists. The manifest writer uses
+    strict JSON, so non-finite diagnostic values are represented as null at the
+    serialisation boundary.
+    """
+    if isinstance(value, dict):
+        return {str(k): _phase_b_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_phase_b_json_safe(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return [_phase_b_json_safe(v) for v in value.tolist()]
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        val = float(value)
+        return val if np.isfinite(val) else None
+    return value
 
 
 def _run_phase_a(campaign, config):
@@ -460,7 +495,17 @@ def _run_phase_b(args, campaign, config):
     if bool(getattr(config.adversarial_safety, "phase_b_filter_enabled", True)):
         try:
             candidate_frames, candidate_records, safety_filter = (
-                _phase_b_landing_safety_filter(candidate_frames, candidate_records)
+                _phase_b_landing_safety_filter(
+                    candidate_frames,
+                    candidate_records,
+                    accept_legacy_missing_landing_safety=bool(
+                        getattr(
+                            getattr(config, "adversarial_safety", None),
+                            "accept_legacy_missing_landing_safety",
+                            False,
+                        )
+                    ),
+                )
             )
         except Exception as exc:
             print(
@@ -543,7 +588,10 @@ def _run_phase_b(args, campaign, config):
         "n_candidates": len(selected_frames),
         "descriptor_used": descriptor.name,
     }
-    dedup_path.write_text(_json.dumps(dedup_payload, indent=2), encoding="utf-8")
+    dedup_path.write_text(
+        _json.dumps(_phase_b_json_safe(dedup_payload), indent=2),
+        encoding="utf-8",
+    )
     if int(report.n_kept) <= 0:
         print(
             "phase_b_anti_overlap_removed_every_candidate: "
@@ -574,7 +622,7 @@ def _run_phase_b(args, campaign, config):
         raw_records.append(dict(out_rec))
         if out_rec["kept_after_dedup"]:
             final_records.append(dict(out_rec))
-    manifest_path = write_phase_b_selection_manifest(iter_dir, {
+    phase_b_manifest = {
         "schema_version": PHASE_B_SELECTION_SCHEMA_VERSION,
         "iteration": int(args.iteration),
         "descriptor": str(descriptor.name),
@@ -587,7 +635,11 @@ def _run_phase_b(args, campaign, config):
         "dedup": dedup_payload,
         "safety_filter": safety_filter,
         "source_expected_n": int(ariadne_manifest.get("expected_n", len(candidate_frames))),
-    })
+    }
+    manifest_path = write_phase_b_selection_manifest(
+        iter_dir,
+        _phase_b_json_safe(phase_b_manifest),
+    )
 
     print(
         "Phase B: kept " + str(report.n_kept) + "/"

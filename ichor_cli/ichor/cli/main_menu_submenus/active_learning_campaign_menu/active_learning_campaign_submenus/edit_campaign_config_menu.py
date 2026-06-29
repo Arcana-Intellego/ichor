@@ -1749,6 +1749,7 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("adversarial_safety.backtrack_to_safe_landing", "bool"),
             _spec("adversarial_safety.backtrack_points", "int"),
             _spec("adversarial_safety.allow_seed_fallback", "bool"),
+            _spec("adversarial_safety.accept_legacy_missing_landing_safety", "bool"),
             _spec("adversarial_safety.min_whitened_distance", "float"),
             _spec("adversarial_safety.max_whitened_distance", "float"),
             _spec("adversarial_safety.enforce_min_whitened_distance", "bool"),

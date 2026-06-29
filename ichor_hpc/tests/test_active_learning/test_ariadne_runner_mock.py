@@ -288,6 +288,39 @@ def test_safe_max_iteration_result_is_task_usable():
     assert usability["optimiser_converged"] is False
 
 
+def test_missing_landing_safety_is_not_task_usable_by_default():
+    seed = _water()
+    out = AriadneRunResult(
+        initial_atoms=seed,
+        final_atoms=seed,
+        return_code=0,
+    )
+
+    usability = ariadne_result_usability_payload(out.to_dict())
+
+    assert usability["usable"] is False
+    assert usability["task_exit_code"] == 4
+    assert usability["reason"] == "missing_landing_safety"
+
+
+def test_missing_landing_safety_can_be_accepted_for_explicit_legacy_migration():
+    seed = _water()
+    out = AriadneRunResult(
+        initial_atoms=seed,
+        final_atoms=seed,
+        return_code=0,
+    )
+
+    usability = ariadne_result_usability_payload(
+        out.to_dict(),
+        accept_legacy_missing_landing_safety=True,
+    )
+
+    assert usability["usable"] is True
+    assert usability["task_exit_code"] == 0
+    assert usability["reason"] == "safe_landing_converged_legacy"
+
+
 def test_unsafe_max_iteration_result_is_not_task_usable():
     seed = _water()
     out = AriadneRunResult(

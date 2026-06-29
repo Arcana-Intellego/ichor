@@ -287,6 +287,7 @@ def ariadne_result_usability_payload(
     payload: Dict[str, Any],
     *,
     allow_seed_fallback: bool = False,
+    accept_legacy_missing_landing_safety: bool = False,
 ) -> Dict[str, Any]:
     """Decide whether a per-seed ARIADNE result is usable by Phase B.
 
@@ -340,7 +341,7 @@ def ariadne_result_usability_payload(
         }
     safety = payload.get("landing_safety")
     if not isinstance(safety, dict):
-        if return_code == 0:
+        if return_code == 0 and bool(accept_legacy_missing_landing_safety):
             return {
                 "usable": True,
                 "reason": "safe_landing_converged_legacy",
@@ -410,10 +411,12 @@ def ariadne_result_usability(
     result: AriadneRunResult,
     *,
     allow_seed_fallback: bool = False,
+    accept_legacy_missing_landing_safety: bool = False,
 ) -> Dict[str, Any]:
     return ariadne_result_usability_payload(
         result.to_dict(),
         allow_seed_fallback=allow_seed_fallback,
+        accept_legacy_missing_landing_safety=accept_legacy_missing_landing_safety,
     )
 
 
@@ -2084,9 +2087,17 @@ def main(argv=None) -> int:
     allow_seed_fallback = bool(
         getattr(getattr(config, "adversarial_safety", None), "allow_seed_fallback", False)
     )
+    accept_legacy_missing_landing_safety = bool(
+        getattr(
+            getattr(config, "adversarial_safety", None),
+            "accept_legacy_missing_landing_safety",
+            False,
+        )
+    )
     usability = ariadne_result_usability_payload(
         payload,
         allow_seed_fallback=allow_seed_fallback,
+        accept_legacy_missing_landing_safety=accept_legacy_missing_landing_safety,
     )
     payload["optimiser_converged"] = bool(usability["optimiser_converged"])
     payload["task_success"] = bool(usability["usable"])
