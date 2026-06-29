@@ -185,7 +185,7 @@ def test_ferebus_scaling_change_allowed_for_uncommitted_initial_ferebus(tmp_path
     assert state.phase is CampaignPhase.HALTED
 
 
-def test_reconcile_prints_recovery_contract_and_guidance(tmp_path, capsys):
+def test_reconcile_prints_recovery_contract_and_first_pass_guidance(tmp_path, capsys):
     campaign = _campaign(tmp_path)
     _write_pool(campaign)
     _write_phase_a_sample(campaign)
@@ -210,10 +210,11 @@ def test_reconcile_prints_recovery_contract_and_guidance(tmp_path, capsys):
     assert "contract:        ok" in out
     assert "Required inputs:" in out
     assert "Phase A sample" in out
-    assert "=== Recovery guidance ===" in out
-    assert "Next safe command:" in out
+    assert "=== Recovery guidance ===" not in out
+    assert "=== First-pass recovery proposal ===" in out
+    assert "Valid recovery candidates:" in out
     assert "ichor-al-daemon reconcile --campaign-dir " + str(campaign) + " --apply" in out
-    assert "Inspect commands:" in out
+    assert "=== Inspect commands ===" in out
 
 
 def test_reconcile_prints_protected_staging_handoff(tmp_path, capsys):
@@ -239,7 +240,8 @@ def test_reconcile_prints_protected_staging_handoff(tmp_path, capsys):
     assert "INITIAL_AIMALL@0 -> .DATA\\STAGING\\initial" in out or (
         "INITIAL_AIMALL@0 -> .DATA/STAGING/initial" in out
     )
-    assert "Operator-review artefacts:" in out
+    assert "Operator-review artefacts:" not in out
+    assert "Hard blockers:" in out
 
 
 def test_phase_walltime_changes_are_allowed_runtime_changes(tmp_path):

@@ -3,6 +3,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1350,7 +1351,58 @@ def test_cli_reconcile_cleanable_scripts_reports_candidate_without_manual_mv(
     assert "PHASE_B_POLUS@0" in out
     assert "ARIADNE_RESULTS.json" in out
     assert "Do not manually promote this first-pass HALTED proposal" in out
+    assert "=== Recovery guidance ===" not in out
+    assert "Operator-review artefacts:" not in out
     assert "mv " not in out
+
+
+def test_reconcile_hard_blockers_filter_cleanable_staging_artifacts():
+    report = SimpleNamespace(
+        unsafe_reasons=[
+            "dangling model staging directories exist",
+            "dangling training staging directories exist",
+        ],
+        blocking_artifacts=[
+            "dangling model staging",
+            "dangling training staging",
+            "training version 3",
+        ],
+        active_submission_intents=[],
+    )
+
+    blockers = cli_mod._reconcile_hard_blockers(
+        report,
+        {
+            "selected_phase": CampaignPhase.PHASE_B_POLUS.value,
+            "missing_or_invalid_inputs": [],
+        },
+    )
+
+    assert "dangling model staging" not in blockers
+    assert "dangling training staging" not in blockers
+    assert "training version 3" in blockers
+
+
+def test_reconcile_hard_blockers_keep_data_staging_without_archive_staging():
+    report = SimpleNamespace(
+        unsafe_reasons=[".DATA/STAGING is non-empty"],
+        blocking_artifacts=[".DATA/STAGING"],
+        active_submission_intents=[],
+    )
+
+    blockers = cli_mod._reconcile_hard_blockers(
+        report,
+        {
+            "selected_phase": CampaignPhase.FEREBUS.value,
+            "missing_or_invalid_inputs": [],
+        },
+    )
+
+    assert (
+        ".DATA/STAGING is non-empty unless --archive-staging is explicitly requested"
+        in blockers
+    )
+    assert ".DATA/STAGING" in blockers
 
 
 def test_cli_reconcile_apply_prints_final_recomputed_phase(

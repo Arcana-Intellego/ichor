@@ -2455,6 +2455,12 @@ def _reconcile_hard_blockers(
         "dangling model staging directories exist",
         "dangling training staging directories exist",
     }
+    cleanable_blocking_artifacts = set()
+    reasons = set(str(reason) for reason in getattr(report, "unsafe_reasons", []))
+    if "dangling model staging directories exist" in reasons:
+        cleanable_blocking_artifacts.add("dangling model staging")
+    if "dangling training staging directories exist" in reasons:
+        cleanable_blocking_artifacts.add("dangling training staging")
     blockers: List[str] = []
     for reason in getattr(report, "unsafe_reasons", []):
         if reason in cleanable_exact:
@@ -2465,7 +2471,11 @@ def _reconcile_hard_blockers(
             )
             continue
         blockers.append(str(reason))
-    blockers.extend(str(item) for item in getattr(report, "blocking_artifacts", []))
+    for item in getattr(report, "blocking_artifacts", []):
+        text = str(item)
+        if text in cleanable_blocking_artifacts:
+            continue
+        blockers.append(text)
     if getattr(report, "active_submission_intents", []):
         blockers.append("active submission intent(s) present")
     if contract_status is not None:
@@ -2700,10 +2710,6 @@ def _print_recovery_contract_status(campaign: Path, report: Any) -> Dict[str, An
     return status
 
 
-def _reconcile_start_command(campaign: Path) -> str:
-    return "ichor-al-daemon start --campaign-dir " + str(campaign) + " --live"
-
-
 def _reconcile_apply_command(campaign: Path, report: Any) -> str:
     command = "ichor-al-daemon reconcile --campaign-dir " + str(campaign)
     if ".DATA/STAGING is non-empty" in list(getattr(report, "unsafe_reasons", [])):
@@ -2711,67 +2717,8 @@ def _reconcile_apply_command(campaign: Path, report: Any) -> str:
     return command + " --apply"
 
 
-def _print_recovery_guidance(
-    campaign: Path,
-    report: Any,
-    contract_status: Dict[str, Any],
-    *,
-    apply_requested: bool,
-) -> None:
-    protected = [
-        _format_reconcile_contract_item(campaign, item)
-        for item in contract_status.get("protected_artifacts", [])
-    ]
-    cleanable: List[str] = []
-    for item in getattr(report, "trusted_artifacts", []):
-        text = str(item)
-        if "can be archived" in text or "can be cleaned" in text:
-            cleanable.append(text)
-    if "dangling model staging directories exist" in getattr(report, "unsafe_reasons", []):
-        cleanable.append(
-            "dangling model staging directories may be removed by reconcile --apply"
-        )
-    if "dangling training staging directories exist" in getattr(
-        report,
-        "unsafe_reasons",
-        [],
-    ):
-        cleanable.append(
-            "dangling training staging directories may be archived by reconcile --apply"
-        )
-    if ".DATA/STAGING is non-empty" in getattr(report, "unsafe_reasons", []):
-        cleanable.append(
-            ".DATA/STAGING is archiveable only with --archive-staging after operator review"
-        )
-    operator_review: List[str] = []
-    operator_review.extend(str(item) for item in getattr(report, "blocking_artifacts", []))
-    operator_review.extend(str(item) for item in getattr(report, "unsafe_reasons", []))
-    operator_review.extend(
-        "missing/invalid input: " + str(item)
-        for item in contract_status.get("missing_or_invalid_inputs", [])
-    )
-
-    print("=== Recovery guidance ===")
-    _print_reconcile_bullets("Protected handoffs", protected)
-    _print_reconcile_bullets("Safe cleanup candidates", cleanable)
-    _print_reconcile_bullets("Operator-review artefacts", operator_review)
-    phase = str(contract_status.get("selected_phase") or "")
-    runnable = (
-        bool(contract_status.get("contract_ok"))
-        and phase not in {CampaignPhase.HALTED.value, CampaignPhase.DONE.value}
-        and not getattr(report, "active_submission_intents", [])
-        and not getattr(report, "unsafe_reasons", [])
-    )
-    if not apply_requested:
-        print("Next safe command:")
-        print("  " + _reconcile_apply_command(campaign, report))
-    elif runnable:
-        print("Next safe command:")
-        print("  " + _reconcile_start_command(campaign))
-    else:
-        print("Next safe command:")
-        print("  resolve operator-review artefacts, then run:")
-        print("  " + _reconcile_apply_command(campaign, report))
+def _print_reconcile_inspect_commands(campaign: Path) -> None:
+    print("=== Inspect commands ===")
     print("Inspect commands:")
     print("  ichor-al-daemon status --campaign-dir " + str(campaign))
     print("  ichor-al-daemon journal --campaign-dir " + str(campaign) + " --last-n 20")
@@ -2894,7 +2841,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     if report.trusted_artifacts:
         print("Trusted artefacts:           " + repr(report.trusted_artifacts))
     if report.blocking_artifacts:
-        print("Blocking artefacts:          " + repr(report.blocking_artifacts))
+        print("Recovery artefact inventory: " + repr(report.blocking_artifacts))
     if report.unsafe_reasons:
         print("Unsafe recovery reasons:     " + repr(report.unsafe_reasons))
     if report.active_submission_intents:
@@ -2914,12 +2861,6 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             print("  - " + str(action))
     print("")
     contract_status = _print_recovery_contract_status(campaign, report)
-    _print_recovery_guidance(
-        campaign,
-        report,
-        contract_status,
-        apply_requested=bool(getattr(args, "apply", False)),
-    )
     if not bool(getattr(args, "apply", False)) and runtime_status.get("reconcile_apply_blockers"):
         _print_reconcile_runtime_warning(runtime_status, campaign)
     target_canonical = target.with_name(DEFAULT_STATE_FILENAME)
@@ -2933,6 +2874,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         print("")
     _print_reconcile_first_pass(campaign, report, contract_status)
     _print_reconcile_cleanup_prediction(campaign, report, contract_status)
+    _print_reconcile_inspect_commands(campaign)
     if not bool(getattr(args, "apply", False)):
         if report.bootstrap_handoff and report.bootstrap_handoff.get("archived"):
             print(
