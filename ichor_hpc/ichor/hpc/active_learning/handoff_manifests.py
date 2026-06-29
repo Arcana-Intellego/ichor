@@ -448,11 +448,18 @@ def validate_ariadne_result(
     result_frame_id = _int_or_none(result.get("seed_frame_id"))
     if result_frame_id != frame_id:
         raise HandoffManifestError("wrong_seed_frame")
+    result_sha = result.get("trajectory_sha256")
+    legacy_missing_trajectory_sha256 = False
     if expected_trajectory_sha256:
-        result_sha = result.get("trajectory_sha256")
         if result_sha is None:
-            raise HandoffManifestError("missing_trajectory_sha256")
-        if str(result_sha) != str(expected_trajectory_sha256):
+            # Older ARIADNE result.json files did not carry the trajectory
+            # hash.  If the enclosing daemon-owned manifest supplies the
+            # expected hash and the rest of this result validates, recover
+            # using that trusted manifest value.  A present-but-wrong hash is
+            # still a hard contract violation.
+            legacy_missing_trajectory_sha256 = True
+            result_sha = expected_trajectory_sha256
+        elif str(result_sha) != str(expected_trajectory_sha256):
             raise HandoffManifestError("wrong_trajectory_sha256")
     return_code = int(result.get("return_code"))
     if return_code != 0:
@@ -503,7 +510,10 @@ def validate_ariadne_result(
         "alpha_trajectory": [float(x) for x in alpha_trajectory],
         "n_evaluations": n_evaluations,
         "return_code": return_code,
-        "trajectory_sha256": str(result.get("trajectory_sha256", "")),
+        "trajectory_sha256": str(result_sha or ""),
+        "legacy_missing_trajectory_sha256": bool(
+            legacy_missing_trajectory_sha256
+        ),
         "wall_seconds": wall_seconds,
         "fell_back_to_ds": bool(result.get("fell_back_to_ds", False)),
         "whitened_distance_final": whitened,
@@ -628,12 +638,15 @@ def read_ariadne_results_manifest(
             "seed_index": seed_index,
             "frame_id": _int_or_none(out_rec.get("seed_frame_id")),
         }
-        validate_ariadne_result(
+        validated = validate_ariadne_result(
             result_payload,
             expected_iteration=iteration,
             seed_record=seed_record,
             expected_trajectory_sha256=trajectory_sha or None,
         )
+        if bool(validated.get("legacy_missing_trajectory_sha256", False)):
+            out_rec["legacy_missing_trajectory_sha256"] = True
+            out_rec["trajectory_sha256"] = str(validated.get("trajectory_sha256", ""))
         normalised_accepted.append(out_rec)
     normalised_rejected = []
     for rec in rejected:

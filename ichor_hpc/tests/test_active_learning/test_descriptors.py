@@ -121,6 +121,41 @@ def test_hybrid_descriptor_default_alf_only_mode_does_not_crash():
     np.testing.assert_allclose(D, D.T, atol=1.0e-10)
 
 
+def test_hybrid_descriptor_default_alf_handles_multi_atom_landing_frames():
+    atom_types = ["C", "O", "N", "H", "H", "C", "H", "O", "H", "N", "H", "H"]
+    coords = np.array([
+        [0.00, 0.00, 0.00],
+        [1.22, 0.18, 0.09],
+        [-0.42, 1.15, 0.31],
+        [0.18, -0.86, 0.72],
+        [1.65, -0.42, -0.35],
+        [-1.35, 0.22, -0.48],
+        [-1.78, 1.04, 0.26],
+        [0.74, 1.96, -0.58],
+        [1.58, 2.34, 0.18],
+        [-0.96, -1.18, -0.64],
+        [-1.52, -1.94, 0.08],
+        [0.48, -1.72, -1.12],
+    ], dtype=float)
+    frames = []
+    for scale in (0.0, 0.01, -0.015, 0.025):
+        shifted = coords.copy()
+        shifted[:, 0] += scale * np.arange(len(atom_types), dtype=float)
+        shifted[:, 1] -= scale * 0.5
+        frames.append(Atoms([
+            Atom(atom_type, float(x), float(y), float(z))
+            for atom_type, (x, y, z) in zip(atom_types, shifted)
+        ]))
+
+    D = HybridAlfRmsdDescriptor(beta=0.3).pairwise_distance_matrix(frames)
+
+    assert D.shape == (4, 4)
+    assert np.all(np.isfinite(D))
+    np.testing.assert_allclose(np.diag(D), 0.0, atol=1.0e-10)
+    np.testing.assert_allclose(D, D.T, atol=1.0e-10)
+    assert np.max(D) > 0.0
+
+
 def test_hybrid_descriptor_uses_feature_extractor_when_beta_zero():
     frames = [_water_at(0.0), _water_at(0.05), _water_at(0.10)]
     fake_feats = {id(frames[0]): np.array([1.0, 0.0]),

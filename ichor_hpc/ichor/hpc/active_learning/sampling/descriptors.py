@@ -140,6 +140,14 @@ def _default_alf_feature_extractor():
     return extract
 
 
+def _frame_diagnostic_context(frame: Atoms) -> str:
+    labels = []
+    for atom in frame:
+        label = getattr(atom, "name", None) or getattr(atom, "type", None)
+        labels.append(str(label if label is not None else "?"))
+    return "natoms=" + str(len(frame)) + " atom_labels=" + repr(labels)
+
+
 @dataclass
 class HybridAlfRmsdDescriptor:
     beta: float = 0.3
@@ -163,6 +171,9 @@ class HybridAlfRmsdDescriptor:
                 raise RuntimeError(
                     "hybrid_alf_rmsd feature extraction failed for frame "
                     + str(idx)
+                    + " ("
+                    + _frame_diagnostic_context(frame)
+                    + ")"
                     + ": "
                     + str(exc)
                 ) from exc
@@ -255,7 +266,6 @@ def build_descriptor_from_config(config, *, posterior=None) -> "Descriptor":
             base_descriptor=HybridAlfRmsdDescriptor(beta=config.phase_b.beta),
         )
     raise ValueError("unknown phase_b.descriptor: " + repr(name))
-
 
 
 

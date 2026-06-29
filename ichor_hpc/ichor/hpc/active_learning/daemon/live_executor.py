@@ -2262,6 +2262,18 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 continue
 
             optional_diag_warnings = _ariadne_optional_diagnostic_warnings(result_dict)
+            legacy_missing_trajectory_sha256 = bool(
+                validated.get("legacy_missing_trajectory_sha256", False)
+            )
+            if legacy_missing_trajectory_sha256:
+                self._journal_event(
+                    "ariadne_legacy_missing_trajectory_sha256",
+                    phase=phase_name,
+                    iteration=int(state.iteration),
+                    seed_dir=seed_dir.name,
+                    result_json=str(result_path.resolve()),
+                    trajectory_sha256=str(validated.get("trajectory_sha256", "")),
+                )
             if optional_diag_warnings:
                 self._journal_event(
                     "ariadne_optional_diagnostics_warning",
@@ -2310,6 +2322,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             if optional_diag_warnings:
                 audit_record["optional_diagnostic_warnings"] = list(
                     optional_diag_warnings
+                )
+            if legacy_missing_trajectory_sha256:
+                audit_record["legacy_missing_trajectory_sha256"] = True
+                audit_record["trajectory_sha256"] = str(
+                    validated.get("trajectory_sha256", "")
                 )
             landing_audit_records.append(audit_record)
             if not bool(usability.get("usable", False)):
@@ -2575,6 +2592,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 "variance_at_selection": seed_record.get("variance_at_selection"),
                 "alpha_initial": float(validated["alpha_initial"]),
                 "alpha_final": float(validated["alpha_final"]),
+                "trajectory_sha256": str(validated.get("trajectory_sha256", "")),
+                "legacy_missing_trajectory_sha256": bool(
+                    legacy_missing_trajectory_sha256
+                ),
                 "whitened_distance_final": d_w,
                 "geometry_quality": dict(geometry_quality.get("metrics") or {}),
                 "landing_safety": dict(landing_safety),
