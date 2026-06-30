@@ -5,6 +5,7 @@ import pytest
 
 from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
 from ichor.hpc.active_learning.config import CampaignConfig
+from ichor.hpc.active_learning.geometry_protocol import PHASE_B_MIN_SEPARATION_SCALE
 from ichor.hpc.active_learning.geometry_novelty import (
     apply_geometry_novelty_to_acquisition_config,
     compute_geometry_novelty_scale,
@@ -84,7 +85,6 @@ def test_geometry_novelty_uses_seed_neighbour_motion(tmp_path):
 
 def test_scaled_threshold_and_scores_are_dimensionless():
     cfg = CampaignConfig()
-    cfg.phase_b.min_separation_scaled = 0.5
     payload = {"scale_angstrom": 0.04}
 
     threshold, mode = effective_phase_b_min_separation(cfg, payload)
@@ -99,12 +99,12 @@ def test_scaled_threshold_and_scores_are_dimensionless():
 
 def test_geometry_novelty_resolves_all_current_consumers():
     cfg = CampaignConfig()
-    cfg.phase_b.min_separation_scaled = 0.5
     payload = {"scale_angstrom": 0.04}
 
     resolved = resolve_geometry_novelty_consumers(cfg, payload)
 
     assert resolved["threshold_mode"] == "scaled"
+    assert resolved["phase_b"]["scaled_threshold"] == pytest.approx(PHASE_B_MIN_SEPARATION_SCALE)
     assert resolved["phase_b"]["effective_min_separation_angstrom"] == pytest.approx(0.02)
     assert resolved["movement_band"]["target_peak_angstrom"] == pytest.approx(0.016)
     assert resolved["movement_utility"]["low_softness_angstrom"] == pytest.approx(0.004)

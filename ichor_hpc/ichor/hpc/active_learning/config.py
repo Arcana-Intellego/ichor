@@ -1,8 +1,8 @@
-"""Campaign configuration -- schema v4.
+"""Campaign configuration -- schema v5.
 
-Schema v4 keeps scientific settings and grouped batch-system resources
-separate. Gaussian contains level-of-theory/input choices only; Slurm CPU,
-memory, partition, and Gaussian runtime-memory policy live under resources.
+Schema v5 keeps geometry-novelty scale estimation public while moving the
+size-dependent Phase B and ARIADNE geometry coefficients into internal
+protocol constants.
 """
 from __future__ import annotations
 
@@ -17,6 +17,28 @@ from .campaign_migrations import (
     migrate_campaign_payload,
 )
 from .config_dataclass import DataclassParseError, parse_dataclass_block
+from .geometry_protocol import (
+    FULLSPACE_FAILURE_PENALTY,
+    FULLSPACE_FIXED_RESIDUAL_SCALE_ANGSTROM,
+    FULLSPACE_MIN_RESIDUAL_SCALE_ANGSTROM,
+    FULLSPACE_RESIDUAL_SCALE,
+    FULLSPACE_RMSD_SCALE_MULTIPLIER,
+    MOVEMENT_BAND_ENABLED,
+    MOVEMENT_BAND_HARD_MAX_FRACTION,
+    MOVEMENT_BAND_HARD_MIN_FRACTION,
+    MOVEMENT_BAND_LOCAL_STATISTIC,
+    MOVEMENT_BAND_METRIC,
+    MOVEMENT_BAND_TARGET_HIGH_FRACTION,
+    MOVEMENT_BAND_TARGET_LOW_FRACTION,
+    MOVEMENT_BAND_TARGET_PEAK_FRACTION,
+    MOVEMENT_UTILITY_BAND_FRACTION,
+    MOVEMENT_UTILITY_DIRECTION,
+    MOVEMENT_UTILITY_ENABLED,
+    MOVEMENT_UTILITY_HIGH_SOFTNESS_FRACTION,
+    MOVEMENT_UTILITY_LAMBDA_MOVE,
+    MOVEMENT_UTILITY_LOW_SOFTNESS_FRACTION,
+    MOVEMENT_UTILITY_PROGRESS_FRACTION,
+)
 
 
 __all__ = [
@@ -38,8 +60,6 @@ __all__ = [
     "AcquisitionCalibratedEnergyBlock",
     "AcquisitionFullspaceConfinementBlock",
     "AcquisitionSizeNormalisationBlock",
-    "AcquisitionMovementBandBlock",
-    "AcquisitionMovementUtilityBlock",
     "AcquisitionDriverBlock",
     "AcquisitionGradientBlock",
     "AcquisitionReferencesBlock",
@@ -61,20 +81,15 @@ __all__ = [
     "VALID_DESCRIPTORS",
     "VALID_GEOMETRY_NOVELTY_SCALE_SOURCES",
     "VALID_GEOMETRY_NOVELTY_STATISTICS",
-    "VALID_GEOMETRY_NOVELTY_SCORE_TRANSFORMS",
     "VALID_SPLITS",
     "VALID_SEED_SELECTION_STRATEGIES",
     "VALID_GRADIENT_MODES",
     "VALID_MODE_WEIGHTING_POLICIES",
     "VALID_SPECTRAL_MODES",
     "VALID_CALIBRATED_ENERGY_UTILITIES",
-    "VALID_FULLSPACE_RESIDUAL_SCALES",
     "VALID_SIZE_NORMALISATION_ENERGY_MODES",
     "VALID_SIZE_NORMALISATION_DISTANCE_MODES",
     "VALID_SIZE_NORMALISATION_BARRIER_MODES",
-    "VALID_MOVEMENT_BAND_METRICS",
-    "VALID_MOVEMENT_BAND_STATISTICS",
-    "VALID_MOVEMENT_DIRECTIONS",
     "VALID_ACQUISITION_DRIVER_OBJECTIVES",
     "VALID_ACQUISITION_DRIVER_GRADIENT_BACKENDS",
     "VALID_GAUSSIAN_MEMORY_MODES",
@@ -104,9 +119,6 @@ VALID_GEOMETRY_NOVELTY_SCALE_SOURCES = frozenset({
     "local_motion", "movement_history", "hybrid",
 })
 VALID_GEOMETRY_NOVELTY_STATISTICS = frozenset({"p25", "median", "p75"})
-VALID_GEOMETRY_NOVELTY_SCORE_TRANSFORMS = frozenset({
-    "linear_cap", "exponential",
-})
 VALID_SPLITS = frozenset({
     "stratified_with_holdout", "random_80_20", "pure_top_k",
 })
@@ -118,16 +130,9 @@ VALID_ERROR_CALIBRATION_MODES = frozenset({"record_only", "apply_to_acquisition"
 VALID_ERROR_CALIBRATION_MODEL_VERSION_POLICIES = frozenset({"current", "all"})
 VALID_SPECTRAL_MODES = frozenset({"off", "record_only", "blend"})
 VALID_CALIBRATED_ENERGY_UTILITIES = frozenset({"log", "banded"})
-VALID_FULLSPACE_RESIDUAL_SCALES = frozenset({"local_neighbour_median", "fixed"})
 VALID_SIZE_NORMALISATION_ENERGY_MODES = frozenset({"raw_total", "per_sqrt_atom"})
 VALID_SIZE_NORMALISATION_DISTANCE_MODES = frozenset({"raw", "per_subspace_dim"})
 VALID_SIZE_NORMALISATION_BARRIER_MODES = frozenset({"raw_sum", "family_mean"})
-VALID_MOVEMENT_BAND_METRICS = frozenset({"aligned_active_rmsd", "aligned_global_rmsd"})
-VALID_MOVEMENT_BAND_STATISTICS = frozenset({"p25", "median"})
-VALID_MOVEMENT_DIRECTIONS = frozenset({
-    "initial_projected_acquisition_gradient",
-    "dominant_active_mode",
-})
 VALID_ACQUISITION_DRIVER_OBJECTIVES = frozenset({"cheap_driver", "full"})
 VALID_ACQUISITION_DRIVER_GRADIENT_BACKENDS = frozenset({"fd", "hybrid_geometry"})
 VALID_GAUSSIAN_MEMORY_MODES = frozenset({"slurm_env", "link0"})
@@ -379,11 +384,6 @@ class AcquisitionFullspaceConfinementBlock:
     enabled: bool = True
     lambda_residual: float = 0.5
     lambda_rmsd: float = 0.25
-    residual_scale: str = "local_neighbour_median"
-    fixed_residual_scale_ang: Optional[float] = None
-    rmsd_scale_ang: float = 0.50
-    min_residual_scale_ang: float = 1.0e-3
-    failure_penalty: float = 1.0e6
 
 
 @dataclass
@@ -392,34 +392,6 @@ class AcquisitionSizeNormalisationBlock:
     energy_mode: str = "per_sqrt_atom"
     whitened_distance_mode: str = "per_subspace_dim"
     chemistry_barrier_mode: str = "family_mean"
-
-
-@dataclass
-class AcquisitionMovementBandBlock:
-    enabled: bool = True
-    metric: str = "aligned_active_rmsd"
-    local_statistic: str = "p25"
-    hard_min_floor_ang: float = 0.010
-    target_low_floor_ang: float = 0.020
-    target_peak_floor_ang: float = 0.035
-    target_high_cap_ang: float = 0.120
-    hard_max_cap_ang: float = 0.180
-    hard_min_fraction: float = 0.10
-    target_low_fraction: float = 0.25
-    target_peak_fraction: float = 0.40
-    target_high_fraction: float = 0.75
-    hard_max_fraction: float = 1.25
-
-
-@dataclass
-class AcquisitionMovementUtilityBlock:
-    enabled: bool = True
-    direction: str = "initial_projected_acquisition_gradient"
-    lambda_move: float = 0.75
-    band_fraction: float = 0.75
-    progress_fraction: float = 0.25
-    low_softness_ang: float = 0.005
-    high_softness_ang: float = 0.020
 
 
 @dataclass
@@ -473,8 +445,6 @@ class AcquisitionConfigBlock:
     calibrated_energy: AcquisitionCalibratedEnergyBlock = field(default_factory=AcquisitionCalibratedEnergyBlock)
     fullspace_confinement: AcquisitionFullspaceConfinementBlock = field(default_factory=AcquisitionFullspaceConfinementBlock)
     size_normalisation: AcquisitionSizeNormalisationBlock = field(default_factory=AcquisitionSizeNormalisationBlock)
-    movement_band: AcquisitionMovementBandBlock = field(default_factory=AcquisitionMovementBandBlock)
-    movement_utility: AcquisitionMovementUtilityBlock = field(default_factory=AcquisitionMovementUtilityBlock)
     driver: AcquisitionDriverBlock = field(default_factory=AcquisitionDriverBlock)
     gradient: AcquisitionGradientBlock = field(default_factory=AcquisitionGradientBlock)
     references: AcquisitionReferencesBlock = field(default_factory=AcquisitionReferencesBlock)
@@ -529,7 +499,7 @@ class AntiOverlapConfigBlock:
     # whitened-distance check is a FLAG, not a filter -- dropping on it starves the batch early on
     # (poor model -> ARIADNE barely moves -> nearly everything flags moved_too_little) exactly when
     # you most need the points. near-duplicates get removed instead by Phase-B case (d), via
-    # phase_b.min_separation below. (A43)
+    # the geometry-novelty Phase B threshold. (A43)
     enforce_post_ariadne: bool = False
 
 
@@ -537,14 +507,6 @@ class AntiOverlapConfigBlock:
 class PhaseBConfigBlock:
     descriptor: str = "hybrid_alf_rmsd"
     beta: float = 0.3
-    # how close (in aligned mass-weighted RMSD) a candidate may sit to ANY existing training point
-    # before we drop it from Phase-B. this is anti-overlap case (d) -- the DESIGNED way to weed out
-    # near-duplicates before they reach expensive QM -- and it is on by default now (0.05) so it
-    # does that job, rather than leaning on the post-ARIADNE quality flag (see
-    # anti_overlap.enforce_post_ariadne). units: angstrom, or whatever the trajectory uses.
-    # CALIBRATE per system -- too large and it over-drops genuinely new points. (A43)
-    min_separation: float = 0.05
-    min_separation_scaled: float = 0.5
 
 
 @dataclass
@@ -555,7 +517,6 @@ class GeometryNoveltyConfigBlock:
     scale_floor_angstrom: float = 1.0e-3
     history_window_iterations: int = 5
     fallback_scale_angstrom: float = 0.05
-    score_transform: str = "linear_cap"
 
 
 @dataclass
@@ -1017,7 +978,7 @@ class AimallConfigBlock:
 
 @dataclass
 class CampaignConfig:
-    """Top-level campaign configuration (schema v4)."""
+    """Top-level campaign configuration (schema v5)."""
 
     schema_version: int = CONFIG_SCHEMA_VERSION
 
@@ -1358,14 +1319,6 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "phase_b.beta must be in [0, 1]"
             )
-        if self.phase_b.min_separation < 0.0:
-            raise ConfigValidationError(
-                "phase_b.min_separation must be >= 0"
-            )
-        if self.phase_b.min_separation_scaled < 0.0:
-            raise ConfigValidationError(
-                "phase_b.min_separation_scaled must be >= 0"
-            )
         if not isinstance(self.geometry_novelty.enabled, bool):
             raise ConfigValidationError(
                 "geometry_novelty.enabled must be a boolean"
@@ -1379,11 +1332,6 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "geometry_novelty.statistic must be one of "
                 + repr(sorted(VALID_GEOMETRY_NOVELTY_STATISTICS))
-            )
-        if self.geometry_novelty.score_transform not in VALID_GEOMETRY_NOVELTY_SCORE_TRANSFORMS:
-            raise ConfigValidationError(
-                "geometry_novelty.score_transform must be one of "
-                + repr(sorted(VALID_GEOMETRY_NOVELTY_SCORE_TRANSFORMS))
             )
         if self.geometry_novelty.scale_floor_angstrom <= 0.0:
             raise ConfigValidationError(
@@ -1854,46 +1802,11 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "acquisition.fullspace_confinement.enabled must be a boolean"
             )
-        if fullspace.residual_scale not in VALID_FULLSPACE_RESIDUAL_SCALES:
-            raise ConfigValidationError(
-                "acquisition.fullspace_confinement.residual_scale must be one of "
-                + repr(sorted(VALID_FULLSPACE_RESIDUAL_SCALES))
-            )
         for name, value in (
             ("acquisition.fullspace_confinement.lambda_residual", fullspace.lambda_residual),
             ("acquisition.fullspace_confinement.lambda_rmsd", fullspace.lambda_rmsd),
-            ("acquisition.fullspace_confinement.fixed_residual_scale_ang", fullspace.fixed_residual_scale_ang),
-            ("acquisition.fullspace_confinement.rmsd_scale_ang", fullspace.rmsd_scale_ang),
-            ("acquisition.fullspace_confinement.min_residual_scale_ang", fullspace.min_residual_scale_ang),
-            ("acquisition.fullspace_confinement.failure_penalty", fullspace.failure_penalty),
         ):
             _validate_optional_nonnegative_float(name, value)
-        if fullspace.rmsd_scale_ang <= 0.0:
-            raise ConfigValidationError(
-                "acquisition.fullspace_confinement.rmsd_scale_ang must be > 0"
-            )
-        if (
-            fullspace.residual_scale == "fixed"
-            and fullspace.fixed_residual_scale_ang is None
-        ):
-            raise ConfigValidationError(
-                "acquisition.fullspace_confinement.fixed_residual_scale_ang is required when residual_scale='fixed'"
-            )
-        if (
-            fullspace.fixed_residual_scale_ang is not None
-            and float(fullspace.fixed_residual_scale_ang) <= 0.0
-        ):
-            raise ConfigValidationError(
-                "acquisition.fullspace_confinement.fixed_residual_scale_ang must be > 0"
-            )
-        if float(fullspace.min_residual_scale_ang) <= 0.0:
-            raise ConfigValidationError(
-                "acquisition.fullspace_confinement.min_residual_scale_ang must be > 0"
-            )
-        if float(fullspace.failure_penalty) <= 0.0:
-            raise ConfigValidationError(
-                "acquisition.fullspace_confinement.failure_penalty must be > 0"
-            )
         norm = self.acquisition.size_normalisation
         if not isinstance(norm.enabled, bool):
             raise ConfigValidationError(
@@ -1913,80 +1826,6 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "acquisition.size_normalisation.chemistry_barrier_mode must be one of "
                 + repr(sorted(VALID_SIZE_NORMALISATION_BARRIER_MODES))
-            )
-        move_band = self.acquisition.movement_band
-        if not isinstance(move_band.enabled, bool):
-            raise ConfigValidationError(
-                "acquisition.movement_band.enabled must be a boolean"
-            )
-        if move_band.metric not in VALID_MOVEMENT_BAND_METRICS:
-            raise ConfigValidationError(
-                "acquisition.movement_band.metric must be one of "
-                + repr(sorted(VALID_MOVEMENT_BAND_METRICS))
-            )
-        if move_band.local_statistic not in VALID_MOVEMENT_BAND_STATISTICS:
-            raise ConfigValidationError(
-                "acquisition.movement_band.local_statistic must be one of "
-                + repr(sorted(VALID_MOVEMENT_BAND_STATISTICS))
-            )
-        for name, value in (
-            ("acquisition.movement_band.hard_min_floor_ang", move_band.hard_min_floor_ang),
-            ("acquisition.movement_band.target_low_floor_ang", move_band.target_low_floor_ang),
-            ("acquisition.movement_band.target_peak_floor_ang", move_band.target_peak_floor_ang),
-            ("acquisition.movement_band.target_high_cap_ang", move_band.target_high_cap_ang),
-            ("acquisition.movement_band.hard_max_cap_ang", move_band.hard_max_cap_ang),
-            ("acquisition.movement_band.hard_min_fraction", move_band.hard_min_fraction),
-            ("acquisition.movement_band.target_low_fraction", move_band.target_low_fraction),
-            ("acquisition.movement_band.target_peak_fraction", move_band.target_peak_fraction),
-            ("acquisition.movement_band.target_high_fraction", move_band.target_high_fraction),
-            ("acquisition.movement_band.hard_max_fraction", move_band.hard_max_fraction),
-        ):
-            _validate_optional_nonnegative_float(name, value)
-        if not (
-            float(move_band.hard_min_floor_ang)
-            < float(move_band.target_low_floor_ang)
-            < float(move_band.target_peak_floor_ang)
-            < float(move_band.target_high_cap_ang)
-            < float(move_band.hard_max_cap_ang)
-        ):
-            raise ConfigValidationError(
-                "acquisition.movement_band floor/cap Angstrom values must be strictly ordered"
-            )
-        if not (
-            float(move_band.hard_min_fraction)
-            < float(move_band.target_low_fraction)
-            < float(move_band.target_peak_fraction)
-            < float(move_band.target_high_fraction)
-            < float(move_band.hard_max_fraction)
-        ):
-            raise ConfigValidationError(
-                "acquisition.movement_band scaled fractions must be strictly ordered"
-            )
-        move_util = self.acquisition.movement_utility
-        if not isinstance(move_util.enabled, bool):
-            raise ConfigValidationError(
-                "acquisition.movement_utility.enabled must be a boolean"
-            )
-        if move_util.direction not in VALID_MOVEMENT_DIRECTIONS:
-            raise ConfigValidationError(
-                "acquisition.movement_utility.direction must be one of "
-                + repr(sorted(VALID_MOVEMENT_DIRECTIONS))
-            )
-        for name, value in (
-            ("acquisition.movement_utility.lambda_move", move_util.lambda_move),
-            ("acquisition.movement_utility.band_fraction", move_util.band_fraction),
-            ("acquisition.movement_utility.progress_fraction", move_util.progress_fraction),
-            ("acquisition.movement_utility.low_softness_ang", move_util.low_softness_ang),
-            ("acquisition.movement_utility.high_softness_ang", move_util.high_softness_ang),
-        ):
-            _validate_optional_nonnegative_float(name, value)
-        if float(move_util.low_softness_ang) <= 0.0:
-            raise ConfigValidationError(
-                "acquisition.movement_utility.low_softness_ang must be > 0"
-            )
-        if float(move_util.high_softness_ang) <= 0.0:
-            raise ConfigValidationError(
-                "acquisition.movement_utility.high_softness_ang must be > 0"
             )
         driver = self.acquisition.driver
         if not isinstance(driver.enabled, bool):
@@ -2175,8 +2014,6 @@ class CampaignConfig:
         ce = self.acquisition.calibrated_energy
         fs = self.acquisition.fullspace_confinement
         sn = self.acquisition.size_normalisation
-        mb = self.acquisition.movement_band
-        mu = self.acquisition.movement_utility
         dr = self.acquisition.driver
         gr = self.acquisition.gradient
         re = self.acquisition.references
@@ -2263,11 +2100,12 @@ class CampaignConfig:
                 enabled=fs.enabled,
                 lambda_residual=fs.lambda_residual,
                 lambda_rmsd=fs.lambda_rmsd,
-                residual_scale=fs.residual_scale,
-                fixed_residual_scale_ang=fs.fixed_residual_scale_ang,
-                rmsd_scale_ang=fs.rmsd_scale_ang,
-                min_residual_scale_ang=fs.min_residual_scale_ang,
-                failure_penalty=fs.failure_penalty,
+                residual_scale=FULLSPACE_RESIDUAL_SCALE,
+                fixed_residual_scale_ang=FULLSPACE_FIXED_RESIDUAL_SCALE_ANGSTROM,
+                rmsd_scale_ang=FULLSPACE_RMSD_SCALE_MULTIPLIER
+                * self.geometry_novelty.fallback_scale_angstrom,
+                min_residual_scale_ang=FULLSPACE_MIN_RESIDUAL_SCALE_ANGSTROM,
+                failure_penalty=FULLSPACE_FAILURE_PENALTY,
             ),
             size_normalisation=SizeNormalisationConfig(
                 enabled=sn.enabled,
@@ -2276,29 +2114,50 @@ class CampaignConfig:
                 chemistry_barrier_mode=sn.chemistry_barrier_mode,
             ),
             movement_band=MovementBandConfig(
-                enabled=mb.enabled,
-                metric=mb.metric,
-                local_statistic=mb.local_statistic,
-                hard_min_floor_ang=mb.hard_min_floor_ang,
-                target_low_floor_ang=mb.target_low_floor_ang,
-                target_peak_floor_ang=mb.target_peak_floor_ang,
-                target_high_cap_ang=mb.target_high_cap_ang,
-                hard_max_cap_ang=mb.hard_max_cap_ang,
-                hard_min_fraction=mb.hard_min_fraction,
-                target_low_fraction=mb.target_low_fraction,
-                target_peak_fraction=mb.target_peak_fraction,
-                target_high_fraction=mb.target_high_fraction,
-                hard_max_fraction=mb.hard_max_fraction,
+                enabled=MOVEMENT_BAND_ENABLED,
+                metric=MOVEMENT_BAND_METRIC,
+                local_statistic=MOVEMENT_BAND_LOCAL_STATISTIC,
+                hard_min_floor_ang=(
+                    MOVEMENT_BAND_HARD_MIN_FRACTION
+                    * self.geometry_novelty.fallback_scale_angstrom
+                ),
+                target_low_floor_ang=(
+                    MOVEMENT_BAND_TARGET_LOW_FRACTION
+                    * self.geometry_novelty.fallback_scale_angstrom
+                ),
+                target_peak_floor_ang=(
+                    MOVEMENT_BAND_TARGET_PEAK_FRACTION
+                    * self.geometry_novelty.fallback_scale_angstrom
+                ),
+                target_high_cap_ang=(
+                    MOVEMENT_BAND_TARGET_HIGH_FRACTION
+                    * self.geometry_novelty.fallback_scale_angstrom
+                ),
+                hard_max_cap_ang=(
+                    MOVEMENT_BAND_HARD_MAX_FRACTION
+                    * self.geometry_novelty.fallback_scale_angstrom
+                ),
+                hard_min_fraction=MOVEMENT_BAND_HARD_MIN_FRACTION,
+                target_low_fraction=MOVEMENT_BAND_TARGET_LOW_FRACTION,
+                target_peak_fraction=MOVEMENT_BAND_TARGET_PEAK_FRACTION,
+                target_high_fraction=MOVEMENT_BAND_TARGET_HIGH_FRACTION,
+                hard_max_fraction=MOVEMENT_BAND_HARD_MAX_FRACTION,
                 geometry_novelty_scale_angstrom=None,
             ),
             movement_utility=MovementUtilityConfig(
-                enabled=mu.enabled,
-                direction=mu.direction,
-                lambda_move=mu.lambda_move,
-                band_fraction=mu.band_fraction,
-                progress_fraction=mu.progress_fraction,
-                low_softness_ang=mu.low_softness_ang,
-                high_softness_ang=mu.high_softness_ang,
+                enabled=MOVEMENT_UTILITY_ENABLED,
+                direction=MOVEMENT_UTILITY_DIRECTION,
+                lambda_move=MOVEMENT_UTILITY_LAMBDA_MOVE,
+                band_fraction=MOVEMENT_UTILITY_BAND_FRACTION,
+                progress_fraction=MOVEMENT_UTILITY_PROGRESS_FRACTION,
+                low_softness_ang=(
+                    MOVEMENT_UTILITY_LOW_SOFTNESS_FRACTION
+                    * self.geometry_novelty.fallback_scale_angstrom
+                ),
+                high_softness_ang=(
+                    MOVEMENT_UTILITY_HIGH_SOFTNESS_FRACTION
+                    * self.geometry_novelty.fallback_scale_angstrom
+                ),
             ),
             driver=DriverConfig(
                 enabled=dr.enabled,

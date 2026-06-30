@@ -237,9 +237,9 @@ def test_phase_b_writes_sample_and_dedup(tmp_path):
     assert dedup.is_file()
     d = json.loads(dedup.read_text(encoding="utf-8"))
     # fresh campaign, no committed training set to dedup against, so case (d) drops nothing
-    # regardless of the (now 0.05 by default) min_separation -- see A43.
+    # regardless of the geometry novelty-derived default minimum separation.
     assert d["n_dropped"] == 0
-    assert d["min_separation"] == 0.05
+    assert d["min_separation"] == 0.025
 
 
 def test_phase_b_rejects_unsafe_accepted_landing_before_fps(tmp_path):

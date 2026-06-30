@@ -3,7 +3,7 @@
 # defaults substantially (see ichor_hpc/.../presets/ for spectroscopy and
 # thermodynamics-focused starting points).
 
-schema_version: 4
+schema_version: 5
 system_name: WATER_TETRAMER
 
 # Iteration loop.

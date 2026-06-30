@@ -16,8 +16,8 @@ pool + the daemon state. case (d) operates on a fully-formed candidate
 list (post-FPS) and a snapshot of the current training set. Same
 distance metric, different inputs.
 
-The min_separation hyperparameter is user-tunable - a follow-on extension to
-campaign.yaml can promote it to an explicit phase_b.min_separation field.
+The effective min_separation is resolved from the daemon's geometry-novelty
+protocol scale rather than a public campaign.yaml Angstrom threshold.
 """
 from __future__ import annotations
 
@@ -114,7 +114,6 @@ def filter_candidates_against_training(
         distances_to_nearest=tuple(distances),
         min_separation=float(min_separation),
     )
-
 
 
 

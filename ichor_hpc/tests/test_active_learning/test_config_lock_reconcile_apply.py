@@ -534,7 +534,7 @@ def test_phase_b_config_change_blocks_after_selection_exists(tmp_path):
     original = CampaignConfig()
     write_config_lock(campaign, original)
     changed = CampaignConfig()
-    changed.phase_b.min_separation = 0.20
+    changed.phase_b.beta = 0.40
     iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
     iter_dir.mkdir(parents=True)
     (iter_dir / "PHASE_B_SELECTION.json").write_text("{}", encoding="utf-8")
@@ -545,7 +545,7 @@ def test_phase_b_config_change_blocks_after_selection_exists(tmp_path):
     review = review_config_changes(campaign, changed, proposed)
 
     assert not review.allowed
-    assert [c.path for c in review.blocked_changes] == ["phase_b.min_separation"]
+    assert [c.path for c in review.blocked_changes] == ["phase_b.beta"]
     assert review.blocked_changes[0].category == "postprocess_locked"
 
 
@@ -554,7 +554,6 @@ def test_geometry_novelty_change_allowed_before_phase_b_outputs(tmp_path):
     original = CampaignConfig()
     write_config_lock(campaign, original)
     changed = CampaignConfig()
-    changed.phase_b.min_separation_scaled = 0.25
     changed.geometry_novelty.fallback_scale_angstrom = 0.02
 
     proposed = fresh_campaign_state()
@@ -565,7 +564,6 @@ def test_geometry_novelty_change_allowed_before_phase_b_outputs(tmp_path):
     assert review.allowed
     assert sorted(c.path for c in review.allowed_changes) == [
         "geometry_novelty.fallback_scale_angstrom",
-        "phase_b.min_separation_scaled",
     ]
     assert not review.blocked_changes
 
@@ -620,7 +618,7 @@ def test_phase_b_config_change_blocks_halted_uncommitted_selection(tmp_path):
     original = CampaignConfig()
     write_config_lock(campaign, original)
     changed = CampaignConfig()
-    changed.phase_b.min_separation = 0.20
+    changed.phase_b.beta = 0.40
     iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
     iter_dir.mkdir(parents=True)
     (iter_dir / "PHASE_B_SELECTION.json").write_text("{}", encoding="utf-8")
@@ -633,7 +631,7 @@ def test_phase_b_config_change_blocks_halted_uncommitted_selection(tmp_path):
     review = review_config_changes(campaign, changed, proposed)
 
     assert not review.allowed
-    assert [c.path for c in review.blocked_changes] == ["phase_b.min_separation"]
+    assert [c.path for c in review.blocked_changes] == ["phase_b.beta"]
     assert "uncommitted Phase B" in review.blocked_changes[0].reason
 
 

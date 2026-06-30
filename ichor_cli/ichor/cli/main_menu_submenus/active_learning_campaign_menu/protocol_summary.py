@@ -63,6 +63,14 @@ def _geometry_novelty_resolved_lines(
         from ichor.hpc.active_learning.geometry_novelty import (
             resolve_geometry_novelty_consumers,
         )
+        from ichor.hpc.active_learning.geometry_protocol import (
+            FULLSPACE_RMSD_SCALE_MULTIPLIER,
+            GEOMETRY_NOVELTY_SCORE_TRANSFORM,
+            MOVEMENT_UTILITY_HIGH_SOFTNESS_FRACTION,
+            MOVEMENT_UTILITY_LOW_SOFTNESS_FRACTION,
+            PHASE_B_MIN_SEPARATION_SCALE,
+            movement_band_fractions,
+        )
     except Exception as exc:
         return [
             _line(
@@ -97,6 +105,28 @@ def _geometry_novelty_resolved_lines(
     movement_utility = dict(resolved.get("movement_utility") or {})
     fullspace = dict(resolved.get("fullspace_confinement") or {})
     return [
+        _line(
+            "geometry_novelty.protocol.phase_b_scale",
+            PHASE_B_MIN_SEPARATION_SCALE,
+        ),
+        _line(
+            "geometry_novelty.protocol.movement_band_fractions",
+            movement_band_fractions(),
+        ),
+        _line(
+            "geometry_novelty.protocol.movement_utility_softness_fractions",
+            str(MOVEMENT_UTILITY_LOW_SOFTNESS_FRACTION)
+            + "/"
+            + str(MOVEMENT_UTILITY_HIGH_SOFTNESS_FRACTION),
+        ),
+        _line(
+            "geometry_novelty.protocol.fullspace_rmsd_multiplier",
+            FULLSPACE_RMSD_SCALE_MULTIPLIER,
+        ),
+        _line(
+            "geometry_novelty.protocol.score_transform",
+            GEOMETRY_NOVELTY_SCORE_TRANSFORM,
+        ),
         _line(
             "geometry_novelty.resolved_source",
             str(source)
@@ -211,8 +241,6 @@ def format_sampling_protocol_summary(
     energy = acq.calibrated_energy
     fullspace = acq.fullspace_confinement
     size_norm = acq.size_normalisation
-    movement_band = acq.movement_band
-    movement_utility = acq.movement_utility
     driver = acq.driver
     stencils = acq.stencils
     safety = config.adversarial_safety
@@ -278,26 +306,8 @@ def format_sampling_protocol_summary(
     )
     lines.append(
         _line(
-            "acquisition.fullspace_confinement.residual_scale",
-            fullspace.residual_scale,
-        )
-    )
-    lines.append(
-        _line(
-            "acquisition.fullspace_confinement.rmsd_scale_ang",
-            fullspace.rmsd_scale_ang,
-        )
-    )
-    lines.append(
-        _line(
-            "acquisition.fullspace_confinement.min_residual_scale_ang",
-            fullspace.min_residual_scale_ang,
-        )
-    )
-    lines.append(
-        _line(
-            "acquisition.fullspace_confinement.failure_penalty",
-            fullspace.failure_penalty,
+            "acquisition.fullspace_confinement.public_fields",
+            "enabled/lambda_residual/lambda_rmsd; scale and failure policy are protocol constants",
         )
     )
     lines.append(_line("acquisition.size_normalisation.enabled", size_norm.enabled))
@@ -312,36 +322,8 @@ def format_sampling_protocol_summary(
             + str(size_norm.chemistry_barrier_mode),
         )
     )
-    lines.append(_line("acquisition.movement_band.enabled", movement_band.enabled))
-    lines.append(
-        _line(
-            "acquisition.movement_band",
-            "metric="
-            + str(movement_band.metric)
-            + ", local="
-            + str(movement_band.local_statistic)
-            + ", floors/caps="
-            + str(movement_band.hard_min_floor_ang)
-            + "/"
-            + str(movement_band.target_low_floor_ang)
-            + "/"
-            + str(movement_band.target_peak_floor_ang)
-            + "/"
-            + str(movement_band.target_high_cap_ang)
-            + "/"
-            + str(movement_band.hard_max_cap_ang),
-        )
-    )
-    lines.append(_line("acquisition.movement_utility.enabled", movement_utility.enabled))
-    lines.append(
-        _line(
-            "acquisition.movement_utility",
-            "lambda="
-            + str(movement_utility.lambda_move)
-            + ", direction="
-            + str(movement_utility.direction),
-        )
-    )
+    lines.append(_line("geometry_novelty.protocol.movement_band", "internal"))
+    lines.append(_line("geometry_novelty.protocol.movement_utility", "internal"))
     lines.append(_line("acquisition.driver.enabled", driver.enabled))
     lines.append(_line("acquisition.driver.objective", driver.objective))
     lines.append(_line("acquisition.driver.gradient_backend", driver.gradient_backend))
@@ -561,8 +543,6 @@ def format_sampling_protocol_summary(
         )
     )
     lines.append(_line("phase_b.descriptor", phase_b.descriptor))
-    lines.append(_line("phase_b.min_separation", phase_b.min_separation))
-    lines.append(_line("phase_b.min_separation_scaled", phase_b.min_separation_scaled))
     lines.append(_line("geometry_novelty.enabled", novelty.enabled))
     lines.append(
         _line(
@@ -577,7 +557,6 @@ def format_sampling_protocol_summary(
             + str(novelty.scale_floor_angstrom),
         )
     )
-    lines.append(_line("geometry_novelty.score_transform", novelty.score_transform))
     if campaign_dir is not None:
         lines.append(
             _line(

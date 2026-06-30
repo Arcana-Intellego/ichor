@@ -167,8 +167,6 @@ def test_edit_campaign_config_menu_items():
         "Edit acquisition.calibrated_energy",
         "Edit acquisition.fullspace_confinement",
         "Edit acquisition.size_normalisation",
-        "Edit acquisition.movement_band",
-        "Edit acquisition.movement_utility",
         "Edit acquisition.driver",
         "Edit acquisition.gradient",
         "Edit acquisition.barrier",
@@ -1276,7 +1274,6 @@ def test_top_three_roi_config_blocks_render_current_values():
     cfg.acquisition.spectral.max_modes = 9
     cfg.acquisition.calibrated_energy.band_low_ha = 0.001
     cfg.acquisition.fullspace_confinement.lambda_residual = 0.75
-    cfg.phase_b.min_separation_scaled = 0.25
     cfg.geometry_novelty.fallback_scale_angstrom = 0.02
     menu._replace_campaign_config(cfg, loaded_from=None)
 
@@ -1307,7 +1304,9 @@ def test_top_three_roi_config_blocks_render_current_values():
     assert "acquisition.fullspace_confinement.lambda_residual: 0.75" in fullspace_rendered
 
     phase_b_rendered = menu._BLOCK_MENUS_BY_LABEL["Edit phase_b"].this_menu_options()
-    assert "phase_b.min_separation_scaled: 0.25" in phase_b_rendered
+    assert "phase_b.descriptor: hybrid_alf_rmsd" in phase_b_rendered
+    assert "phase_b.beta: 0.5" in phase_b_rendered
+    assert "phase_b.min_separation_scaled" not in phase_b_rendered
 
     novelty_rendered = menu._BLOCK_MENUS_BY_LABEL[
         "Edit geometry_novelty"
@@ -1368,8 +1367,10 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
     assert "resources.aimall.effective_cpus_per_task: auto" in out
     assert "resources.effective_phase_walltimes" in out
     assert "FEREBUS=24h" in out
-    assert "phase_b.min_separation_scaled: 0.5" in out
     assert "geometry_novelty.enabled: True" in out
+    assert "geometry_novelty.protocol.phase_b_scale: 0.5" in out
+    assert "geometry_novelty.protocol.movement_band_fractions" in out
+    assert "geometry_novelty.protocol.movement_utility_softness_fractions" in out
     assert "geometry_novelty.scale" in out
     assert "geometry_novelty.resolved_source: configured_fallback" in out
     assert "geometry_novelty.resolved_phase_b" in out
@@ -1414,7 +1415,7 @@ def test_daemon_control_sampling_protocol_summary_uses_saved_campaign(tmp_path, 
     assert "acquisition.spectral.lambda_spectral: 2.5" in out
     assert "acquisition.driver.enabled: True" in out
     assert "acquisition.stencils.weak_mode_gating_enabled: True" in out
-    assert "phase_b.min_separation_scaled: 0.5" in out
+    assert "geometry_novelty.protocol.phase_b_scale: 0.5" in out
     assert "geometry_novelty.latest_sidecar: not written yet" in out
     assert "geometry_novelty.resolved_source: configured_fallback" in out
     assert "geometry_novelty.resolved_phase_b" in out

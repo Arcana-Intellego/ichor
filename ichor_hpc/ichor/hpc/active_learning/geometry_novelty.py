@@ -20,14 +20,24 @@ from ichor.core.adversarial.geometry import aligned_mass_weighted_rmsd
 from ichor.core.atoms import Atoms
 
 from .daemon.state import atomic_write_json
+from .geometry_protocol import (
+    FULLSPACE_RMSD_SCALE_MULTIPLIER,
+    GEOMETRY_NOVELTY_SCORE_TRANSFORM,
+    MOVEMENT_BAND_HARD_MAX_FRACTION,
+    MOVEMENT_BAND_HARD_MIN_FRACTION,
+    MOVEMENT_BAND_TARGET_HIGH_FRACTION,
+    MOVEMENT_BAND_TARGET_LOW_FRACTION,
+    MOVEMENT_BAND_TARGET_PEAK_FRACTION,
+    MOVEMENT_UTILITY_HIGH_SOFTNESS_FRACTION,
+    MOVEMENT_UTILITY_LOW_SOFTNESS_FRACTION,
+    PHASE_B_MIN_SEPARATION_SCALE,
+    movement_band_fractions,
+)
 
 
 GEOMETRY_NOVELTY_SCALE_SCHEMA_VERSION = 1
 GEOMETRY_NOVELTY_SCALE_FILENAME = "GEOMETRY_NOVELTY_SCALE.json"
 EXACT_DUPLICATE_EPSILON_ANGSTROM = 1.0e-12
-MOVEMENT_UTILITY_LOW_SOFTNESS_FRACTION = 0.10
-MOVEMENT_UTILITY_HIGH_SOFTNESS_FRACTION = 0.40
-FULLSPACE_RMSD_SCALE_MULTIPLIER = 10.0
 
 
 __all__ = [
@@ -221,7 +231,7 @@ def compute_geometry_novelty_scale(
     floor_value = float(_normalise_config_value(config, "scale_floor_angstrom", 1.0e-3))
     fallback_value = float(_normalise_config_value(config, "fallback_scale_angstrom", 0.05))
     history_window = int(_normalise_config_value(config, "history_window_iterations", 5))
-    score_transform = str(_normalise_config_value(config, "score_transform", "linear_cap"))
+    score_transform = GEOMETRY_NOVELTY_SCORE_TRANSFORM
 
     local_values: List[float] = []
     history_values: List[float] = []
@@ -348,35 +358,24 @@ def resolve_geometry_novelty_consumers(
     """Resolve every current geometry-novelty consumer from one scale.
 
     This is the single HPC-side place where dimensionless campaign settings
-    become Angstrom values. If geometry novelty is disabled, it reports the
-    legacy absolute values instead of changing behaviour.
+    become Angstrom values. If geometry novelty is disabled, it reports values
+    derived from the configured fallback scale.
     """
     enabled = _config_enabled(config)
     scale = _scale_from_payload(scale_payload) if enabled else None
     mode = "scaled" if scale is not None else "absolute"
-    phase_b_scaled = float(getattr(config.phase_b, "min_separation_scaled", 0.5))
-    phase_b_absolute = float(getattr(config.phase_b, "min_separation", 0.0))
-
-    mb = config.acquisition.movement_band
-    mu = config.acquisition.movement_utility
-    fs = config.acquisition.fullspace_confinement
+    phase_b_scaled = PHASE_B_MIN_SEPARATION_SCALE
 
     if scale is not None:
         movement_band = {
             "threshold_mode": "scaled",
             "scale_angstrom": float(scale),
-            "hard_min_angstrom": float(mb.hard_min_fraction) * float(scale),
-            "target_low_angstrom": float(mb.target_low_fraction) * float(scale),
-            "target_peak_angstrom": float(mb.target_peak_fraction) * float(scale),
-            "target_high_angstrom": float(mb.target_high_fraction) * float(scale),
-            "hard_max_angstrom": float(mb.hard_max_fraction) * float(scale),
-            "fractions": {
-                "hard_min": float(mb.hard_min_fraction),
-                "target_low": float(mb.target_low_fraction),
-                "target_peak": float(mb.target_peak_fraction),
-                "target_high": float(mb.target_high_fraction),
-                "hard_max": float(mb.hard_max_fraction),
-            },
+            "hard_min_angstrom": MOVEMENT_BAND_HARD_MIN_FRACTION * float(scale),
+            "target_low_angstrom": MOVEMENT_BAND_TARGET_LOW_FRACTION * float(scale),
+            "target_peak_angstrom": MOVEMENT_BAND_TARGET_PEAK_FRACTION * float(scale),
+            "target_high_angstrom": MOVEMENT_BAND_TARGET_HIGH_FRACTION * float(scale),
+            "hard_max_angstrom": MOVEMENT_BAND_HARD_MAX_FRACTION * float(scale),
+            "fractions": movement_band_fractions(),
         }
         movement_utility = {
             "threshold_mode": "scaled",
@@ -398,30 +397,33 @@ def resolve_geometry_novelty_consumers(
             "threshold_mode": "scaled",
             "min_separation_scaled": phase_b_scaled,
             "effective_min_separation_angstrom": phase_b_scaled * float(scale),
-            "legacy_min_separation_angstrom": phase_b_absolute,
         }
     else:
+        fallback = float(_normalise_config_value(config, "fallback_scale_angstrom", 0.05))
         movement_band = {
             "threshold_mode": "absolute",
-            "hard_min_angstrom": float(mb.hard_min_floor_ang),
-            "target_low_angstrom": float(mb.target_low_floor_ang),
-            "target_peak_angstrom": float(mb.target_peak_floor_ang),
-            "target_high_angstrom": float(mb.target_high_cap_ang),
-            "hard_max_angstrom": float(mb.hard_max_cap_ang),
+            "hard_min_angstrom": MOVEMENT_BAND_HARD_MIN_FRACTION * fallback,
+            "target_low_angstrom": MOVEMENT_BAND_TARGET_LOW_FRACTION * fallback,
+            "target_peak_angstrom": MOVEMENT_BAND_TARGET_PEAK_FRACTION * fallback,
+            "target_high_angstrom": MOVEMENT_BAND_TARGET_HIGH_FRACTION * fallback,
+            "hard_max_angstrom": MOVEMENT_BAND_HARD_MAX_FRACTION * fallback,
+            "fractions": movement_band_fractions(),
         }
         movement_utility = {
             "threshold_mode": "absolute",
-            "low_softness_angstrom": float(mu.low_softness_ang),
-            "high_softness_angstrom": float(mu.high_softness_ang),
+            "low_softness_angstrom": MOVEMENT_UTILITY_LOW_SOFTNESS_FRACTION * fallback,
+            "high_softness_angstrom": MOVEMENT_UTILITY_HIGH_SOFTNESS_FRACTION * fallback,
+            "low_softness_fraction": MOVEMENT_UTILITY_LOW_SOFTNESS_FRACTION,
+            "high_softness_fraction": MOVEMENT_UTILITY_HIGH_SOFTNESS_FRACTION,
         }
         fullspace = {
             "threshold_mode": "absolute",
-            "rmsd_scale_angstrom": float(fs.rmsd_scale_ang),
+            "rmsd_scale_angstrom": FULLSPACE_RMSD_SCALE_MULTIPLIER * fallback,
+            "rmsd_scale_multiplier": FULLSPACE_RMSD_SCALE_MULTIPLIER,
         }
         phase_b = {
             "threshold_mode": "absolute",
-            "effective_min_separation_angstrom": phase_b_absolute,
-            "legacy_min_separation_angstrom": phase_b_absolute,
+            "effective_min_separation_angstrom": phase_b_scaled * fallback,
             "min_separation_scaled": phase_b_scaled,
         }
 

@@ -1,4 +1,4 @@
-"""Edit campaign config menu -- schema v3.
+"""Edit campaign config menu -- current active-learning schema.
 
 Field-grouped editor over a single CampaignConfig instance held in module
 state. The grouping follows the current CampaignConfig block structure: one
@@ -51,16 +51,11 @@ from ichor.hpc.active_learning.config import (
     VALID_DESCRIPTORS,
     VALID_ERROR_CALIBRATION_MODES,
     VALID_ERROR_CALIBRATION_MODEL_VERSION_POLICIES,
-    VALID_FULLSPACE_RESIDUAL_SCALES,
     VALID_GAUSSIAN_MEMORY_MODES,
     VALID_GEOMETRY_NOVELTY_SCALE_SOURCES,
-    VALID_GEOMETRY_NOVELTY_SCORE_TRANSFORMS,
     VALID_GEOMETRY_NOVELTY_STATISTICS,
     VALID_GRADIENT_MODES,
     VALID_GRADIENT_PARALLEL_BACKENDS,
-    VALID_MOVEMENT_BAND_METRICS,
-    VALID_MOVEMENT_BAND_STATISTICS,
-    VALID_MOVEMENT_DIRECTIONS,
     VALID_MODE_WEIGHTING_POLICIES,
     VALID_NEGATIVE_CURVATURE_POLICIES,
     VALID_SEED_SELECTION_STRATEGIES,
@@ -950,9 +945,6 @@ class EditCampaignConfigFunctions:
         if chosen is not None:
             pb.descriptor = chosen
         pb.beta = user_input_float("phase_b.beta (0.0-1.0): ", pb.beta)
-        pb.min_separation = user_input_float(
-            "phase_b.min_separation: ", pb.min_separation,
-        )
         _sync_options_from_config()
 
     @staticmethod
@@ -1511,8 +1503,6 @@ _BLOCK_MENUS_BY_LABEL = {
         [
             _spec("phase_b.descriptor", "choice", choices=sorted(VALID_DESCRIPTORS)),
             _spec("phase_b.beta", "float", prompt="phase_b.beta (0.0-1.0): "),
-            _spec("phase_b.min_separation", "float"),
-            _spec("phase_b.min_separation_scaled", "float"),
         ],
     ),
     "Edit geometry_novelty": _make_block_menu(
@@ -1533,11 +1523,6 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("geometry_novelty.scale_floor_angstrom", "float"),
             _spec("geometry_novelty.history_window_iterations", "int"),
             _spec("geometry_novelty.fallback_scale_angstrom", "float"),
-            _spec(
-                "geometry_novelty.score_transform",
-                "choice",
-                choices=sorted(VALID_GEOMETRY_NOVELTY_SCORE_TRANSFORMS),
-            ),
         ],
     ),
     "Edit split": _make_block_menu(
@@ -1646,11 +1631,6 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("acquisition.fullspace_confinement.enabled", "bool"),
             _spec("acquisition.fullspace_confinement.lambda_residual", "float"),
             _spec("acquisition.fullspace_confinement.lambda_rmsd", "float"),
-            _spec("acquisition.fullspace_confinement.residual_scale", "choice", choices=sorted(VALID_FULLSPACE_RESIDUAL_SCALES)),
-            _spec("acquisition.fullspace_confinement.fixed_residual_scale_ang", "optional_float"),
-            _spec("acquisition.fullspace_confinement.rmsd_scale_ang", "float"),
-            _spec("acquisition.fullspace_confinement.min_residual_scale_ang", "float"),
-            _spec("acquisition.fullspace_confinement.failure_penalty", "float"),
         ],
     ),
     "Edit acquisition.size_normalisation": _make_block_menu(
@@ -1661,38 +1641,6 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("acquisition.size_normalisation.energy_mode", "choice", choices=sorted(VALID_SIZE_NORMALISATION_ENERGY_MODES)),
             _spec("acquisition.size_normalisation.whitened_distance_mode", "choice", choices=sorted(VALID_SIZE_NORMALISATION_DISTANCE_MODES)),
             _spec("acquisition.size_normalisation.chemistry_barrier_mode", "choice", choices=sorted(VALID_SIZE_NORMALISATION_BARRIER_MODES)),
-        ],
-    ),
-    "Edit acquisition.movement_band": _make_block_menu(
-        "Edit acquisition.movement_band",
-        "Aligned-RMSD landing band for useful non-outlier movement.",
-        [
-            _spec("acquisition.movement_band.enabled", "bool"),
-            _spec("acquisition.movement_band.metric", "choice", choices=sorted(VALID_MOVEMENT_BAND_METRICS)),
-            _spec("acquisition.movement_band.local_statistic", "choice", choices=sorted(VALID_MOVEMENT_BAND_STATISTICS)),
-            _spec("acquisition.movement_band.hard_min_floor_ang", "float"),
-            _spec("acquisition.movement_band.target_low_floor_ang", "float"),
-            _spec("acquisition.movement_band.target_peak_floor_ang", "float"),
-            _spec("acquisition.movement_band.target_high_cap_ang", "float"),
-            _spec("acquisition.movement_band.hard_max_cap_ang", "float"),
-            _spec("acquisition.movement_band.hard_min_fraction", "float"),
-            _spec("acquisition.movement_band.target_low_fraction", "float"),
-            _spec("acquisition.movement_band.target_peak_fraction", "float"),
-            _spec("acquisition.movement_band.target_high_fraction", "float"),
-            _spec("acquisition.movement_band.hard_max_fraction", "float"),
-        ],
-    ),
-    "Edit acquisition.movement_utility": _make_block_menu(
-        "Edit acquisition.movement_utility",
-        "Directional movement utility used by ARIADNE.",
-        [
-            _spec("acquisition.movement_utility.enabled", "bool"),
-            _spec("acquisition.movement_utility.direction", "choice", choices=sorted(VALID_MOVEMENT_DIRECTIONS)),
-            _spec("acquisition.movement_utility.lambda_move", "float"),
-            _spec("acquisition.movement_utility.band_fraction", "float"),
-            _spec("acquisition.movement_utility.progress_fraction", "float"),
-            _spec("acquisition.movement_utility.low_softness_ang", "float"),
-            _spec("acquisition.movement_utility.high_softness_ang", "float"),
         ],
     ),
     "Edit acquisition.driver": _make_block_menu(
@@ -1896,8 +1844,6 @@ _ACQUISITION_BLOCK_LABELS = (
     "Edit acquisition.calibrated_energy",
     "Edit acquisition.fullspace_confinement",
     "Edit acquisition.size_normalisation",
-    "Edit acquisition.movement_band",
-    "Edit acquisition.movement_utility",
     "Edit acquisition.driver",
     "Edit acquisition.gradient",
     "Edit acquisition.barrier",

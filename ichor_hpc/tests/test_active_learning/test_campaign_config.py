@@ -1,7 +1,4 @@
-"""Tests for ichor.hpc.active_learning.config -- schema v4.
-
-Schema v4 keeps nested blocks and groups live backend resources by backend.
-"""
+"""Tests for ichor.hpc.active_learning.config -- schema v5."""
 from pathlib import Path
 
 import pytest
@@ -12,10 +9,28 @@ from ichor.hpc.active_learning.config import (
     CampaignConfig,
     ConfigValidationError,
 )
+from ichor.hpc.active_learning.geometry_protocol import (
+    FULLSPACE_FAILURE_PENALTY,
+    FULLSPACE_FIXED_RESIDUAL_SCALE_ANGSTROM,
+    FULLSPACE_MIN_RESIDUAL_SCALE_ANGSTROM,
+    FULLSPACE_RESIDUAL_SCALE,
+    FULLSPACE_RMSD_SCALE_MULTIPLIER,
+    MOVEMENT_BAND_HARD_MAX_FRACTION,
+    MOVEMENT_BAND_HARD_MIN_FRACTION,
+    MOVEMENT_BAND_TARGET_HIGH_FRACTION,
+    MOVEMENT_BAND_TARGET_LOW_FRACTION,
+    MOVEMENT_BAND_TARGET_PEAK_FRACTION,
+    MOVEMENT_UTILITY_BAND_FRACTION,
+    MOVEMENT_UTILITY_DIRECTION,
+    MOVEMENT_UTILITY_HIGH_SOFTNESS_FRACTION,
+    MOVEMENT_UTILITY_LAMBDA_MOVE,
+    MOVEMENT_UTILITY_LOW_SOFTNESS_FRACTION,
+    MOVEMENT_UTILITY_PROGRESS_FRACTION,
+)
 
 
-def test_schema_version_is_four():
-    assert CONFIG_SCHEMA_VERSION == 4
+def test_schema_version_is_five():
+    assert CONFIG_SCHEMA_VERSION == 5
 
 
 def test_default_campaign_config_is_valid():
@@ -37,14 +52,12 @@ def test_default_campaign_config_is_valid():
     assert c.seed_selection.d_optimal_jitter == 1.0e-12
     assert c.seed_selection.d_optimal_novelty_floor == 1.0e-12
     assert c.seed_selection.d_optimal_score_power == 1.0
-    assert c.phase_b.min_separation_scaled == 0.5
     assert c.geometry_novelty.enabled is True
     assert c.geometry_novelty.scale_source == "local_motion"
     assert c.geometry_novelty.statistic == "median"
     assert c.geometry_novelty.scale_floor_angstrom == 1.0e-3
     assert c.geometry_novelty.history_window_iterations == 5
     assert c.geometry_novelty.fallback_scale_angstrom == 0.05
-    assert c.geometry_novelty.score_transform == "linear_cap"
     assert c.resources.defaults.partition == "multicore"
     assert c.resources.defaults.walltime_hours == 24
     assert c.resources.defaults.cpus_per_task == "auto"
@@ -90,10 +103,6 @@ def test_default_campaign_config_is_valid():
     assert c.acquisition.fullspace_confinement.enabled is True
     assert c.acquisition.fullspace_confinement.lambda_residual == 0.5
     assert c.acquisition.fullspace_confinement.lambda_rmsd == 0.25
-    assert c.acquisition.fullspace_confinement.residual_scale == "local_neighbour_median"
-    assert c.acquisition.fullspace_confinement.rmsd_scale_ang == 0.50
-    assert c.acquisition.fullspace_confinement.min_residual_scale_ang == 1.0e-3
-    assert c.acquisition.fullspace_confinement.failure_penalty == 1.0e6
     assert c.acquisition.stencils.negative_curvature_policy == "ignore"
     assert c.acquisition.stencils.lambda_negative_curvature == 1.0
     assert c.acquisition.stencils.weak_mode_gating_enabled is True
@@ -262,7 +271,7 @@ def test_gaussian_link0_mem_must_leave_slurm_headroom():
         CampaignConfig.from_dict(payload)
 
 
-def test_schema_v3_resources_migrate_to_grouped_schema_v4():
+def test_schema_v3_resources_migrate_to_current_grouped_schema():
     payload = {
         "schema_version": 3,
         "system_name": "MIGRATE",
@@ -277,7 +286,7 @@ def test_schema_v3_resources_migrate_to_grouped_schema_v4():
         },
     }
     cfg = CampaignConfig.from_dict(payload)
-    assert cfg.schema_version == 4
+    assert cfg.schema_version == 5
     assert cfg.resources.defaults.partition == "multicore"
     assert cfg.resources.defaults.walltime_hours == 12
     assert cfg.resources.polus.walltime_hours == 1
@@ -379,10 +388,6 @@ def test_error_calibration_apply_mode_roundtrips():
         (("spectral", "max_modes"), 0, "max_modes"),
         (("calibrated_energy", "utility"), "linear", "calibrated_energy.utility"),
         (("calibrated_energy", "band_high_ha"), -1.0, "band_high_ha"),
-        (("fullspace_confinement", "residual_scale"), "global", "residual_scale"),
-        (("fullspace_confinement", "rmsd_scale_ang"), 0.0, "rmsd_scale_ang"),
-        (("fullspace_confinement", "min_residual_scale_ang"), 0.0, "min_residual_scale_ang"),
-        (("fullspace_confinement", "failure_penalty"), 0.0, "failure_penalty"),
         (("stencils", "negative_curvature_policy"), "reward", "negative_curvature_policy"),
         (("stencils", "weak_mode_gating_enabled"), "yes", "weak_mode_gating_enabled"),
         (("stencils", "weak_mode_omega_low_fraction"), -0.1, "weak_mode_omega_low_fraction"),
@@ -409,14 +414,11 @@ def test_weak_mode_threshold_band_must_be_ordered():
 
 def test_mature_acquisition_config_bridge_roundtrips_to_core():
     payload = CampaignConfig().to_dict()
+    payload["geometry_novelty"]["fallback_scale_angstrom"] = 0.04
     payload["acquisition"]["spectral"]["mode"] = "record_only"
     payload["acquisition"]["spectral"]["max_modes"] = 3
     payload["acquisition"]["calibrated_energy"]["band_low_ha"] = 0.01
     payload["acquisition"]["calibrated_energy"]["band_high_ha"] = 0.10
-    payload["acquisition"]["fullspace_confinement"]["residual_scale"] = "fixed"
-    payload["acquisition"]["fullspace_confinement"]["fixed_residual_scale_ang"] = 0.2
-    payload["acquisition"]["fullspace_confinement"]["min_residual_scale_ang"] = 0.003
-    payload["acquisition"]["fullspace_confinement"]["failure_penalty"] = 123.0
     payload["acquisition"]["stencils"]["negative_curvature_policy"] = "penalise"
     payload["acquisition"]["stencils"]["lambda_negative_curvature"] = 2.0
     payload["acquisition"]["stencils"]["weak_mode_gating_enabled"] = False
@@ -432,10 +434,28 @@ def test_mature_acquisition_config_bridge_roundtrips_to_core():
     assert core.spectral.max_modes == 3
     assert core.calibrated_energy.band_low_ha == 0.01
     assert core.calibrated_energy.band_high_ha == 0.10
-    assert core.fullspace_confinement.residual_scale == "fixed"
-    assert core.fullspace_confinement.fixed_residual_scale_ang == 0.2
-    assert core.fullspace_confinement.min_residual_scale_ang == 0.003
-    assert core.fullspace_confinement.failure_penalty == 123.0
+    assert core.fullspace_confinement.residual_scale == FULLSPACE_RESIDUAL_SCALE
+    assert core.fullspace_confinement.fixed_residual_scale_ang == FULLSPACE_FIXED_RESIDUAL_SCALE_ANGSTROM
+    assert core.fullspace_confinement.rmsd_scale_ang == pytest.approx(
+        FULLSPACE_RMSD_SCALE_MULTIPLIER * 0.04
+    )
+    assert core.fullspace_confinement.min_residual_scale_ang == FULLSPACE_MIN_RESIDUAL_SCALE_ANGSTROM
+    assert core.fullspace_confinement.failure_penalty == FULLSPACE_FAILURE_PENALTY
+    assert core.movement_band.hard_min_fraction == MOVEMENT_BAND_HARD_MIN_FRACTION
+    assert core.movement_band.target_low_fraction == MOVEMENT_BAND_TARGET_LOW_FRACTION
+    assert core.movement_band.target_peak_fraction == MOVEMENT_BAND_TARGET_PEAK_FRACTION
+    assert core.movement_band.target_high_fraction == MOVEMENT_BAND_TARGET_HIGH_FRACTION
+    assert core.movement_band.hard_max_fraction == MOVEMENT_BAND_HARD_MAX_FRACTION
+    assert core.movement_utility.direction == MOVEMENT_UTILITY_DIRECTION
+    assert core.movement_utility.lambda_move == MOVEMENT_UTILITY_LAMBDA_MOVE
+    assert core.movement_utility.band_fraction == MOVEMENT_UTILITY_BAND_FRACTION
+    assert core.movement_utility.progress_fraction == MOVEMENT_UTILITY_PROGRESS_FRACTION
+    assert core.movement_utility.low_softness_ang == pytest.approx(
+        MOVEMENT_UTILITY_LOW_SOFTNESS_FRACTION * 0.04
+    )
+    assert core.movement_utility.high_softness_ang == pytest.approx(
+        MOVEMENT_UTILITY_HIGH_SOFTNESS_FRACTION * 0.04
+    )
     assert core.stencils.negative_curvature_policy == "penalise"
     assert core.stencils.lambda_negative_curvature == 2.0
     assert core.stencils.weak_mode_gating_enabled is False
@@ -543,13 +563,11 @@ def test_invalid_descriptor_rejected():
 @pytest.mark.parametrize(
     "path,value",
     [
-        ("phase_b.min_separation_scaled", -0.1),
         ("geometry_novelty.scale_source", "global_magic"),
         ("geometry_novelty.statistic", "mean"),
         ("geometry_novelty.scale_floor_angstrom", 0.0),
         ("geometry_novelty.history_window_iterations", -1),
         ("geometry_novelty.fallback_scale_angstrom", 0.0),
-        ("geometry_novelty.score_transform", "sigmoid"),
     ],
 )
 def test_geometry_novelty_config_validated(path, value):
@@ -559,12 +577,36 @@ def test_geometry_novelty_config_validated(path, value):
         CampaignConfig.from_dict(payload)
 
 
-def test_movement_band_scaled_fraction_order_validated():
+def test_schema_v4_geometry_knobs_migrate_out_of_public_config():
     payload = CampaignConfig().to_dict()
-    payload["acquisition"]["movement_band"]["target_peak_fraction"] = 0.20
-    payload["acquisition"]["movement_band"]["target_low_fraction"] = 0.25
+    payload["schema_version"] = 4
+    payload["phase_b"]["min_separation"] = 0.20
+    payload["phase_b"]["min_separation_scaled"] = 10.0
+    payload["geometry_novelty"]["score_transform"] = "exponential"
+    payload["acquisition"]["movement_band"] = {
+        "target_peak_fraction": 0.20,
+    }
+    payload["acquisition"]["movement_utility"] = {
+        "lambda_move": 2.0,
+    }
+    payload["acquisition"]["fullspace_confinement"]["rmsd_scale_ang"] = 99.0
 
-    with pytest.raises(ConfigValidationError, match="scaled fractions"):
+    cfg = CampaignConfig.from_dict(payload)
+
+    assert cfg.schema_version == 5
+    assert not hasattr(cfg.phase_b, "min_separation")
+    assert not hasattr(cfg.phase_b, "min_separation_scaled")
+    assert not hasattr(cfg.geometry_novelty, "score_transform")
+    assert not hasattr(cfg.acquisition, "movement_band")
+    assert not hasattr(cfg.acquisition, "movement_utility")
+    assert not hasattr(cfg.acquisition.fullspace_confinement, "rmsd_scale_ang")
+
+
+def test_schema_v5_rejects_removed_geometry_knobs():
+    payload = CampaignConfig().to_dict()
+    payload["phase_b"]["min_separation_scaled"] = 0.5
+
+    with pytest.raises(ConfigValidationError, match="unknown keys"):
         CampaignConfig.from_dict(payload)
 
 

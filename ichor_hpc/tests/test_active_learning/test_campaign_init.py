@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from ichor.hpc.active_learning.cli import cmd_import_pool, cmd_init
-from ichor.hpc.active_learning.config import CampaignConfig
+from ichor.hpc.active_learning.config import CONFIG_SCHEMA_VERSION, CampaignConfig
 from ichor.hpc.active_learning.daemon.daemon import DEFAULT_DATA_SUBDIR
 from ichor.hpc.active_learning.daemon.state import (
     DEFAULT_STATE_FILENAME,
@@ -38,7 +38,7 @@ def test_init_populates_missing_campaign_yaml_and_imports_default_pool(tmp_path)
 
     assert rc == 0
     cfg = CampaignConfig.from_yaml(tmp_path / "campaign.yaml")
-    assert cfg.schema_version == 3
+    assert cfg.schema_version == CONFIG_SCHEMA_VERSION
     assert cfg.max_iterations == 1
     assert (tmp_path / ".DATA" / "TRAJECTORY" / "pool.xyz").is_file()
 

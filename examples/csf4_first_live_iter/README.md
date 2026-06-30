@@ -306,7 +306,7 @@ A minimal `campaign.yaml` (also shipped at
 `examples/csf4_first_live_iter/campaign.yaml`):
 
 ```yaml
-schema_version: 4
+schema_version: 5
 
 max_iterations: 1
 poll_interval_seconds: 60
@@ -508,9 +508,9 @@ learning campaign on CSF4. Real next steps from here:
 - swap in the `spectroscopy_focused` preset if your downstream target is
   vibrational spectra (the preset bumps the subspace dim and switches the
   mode-weighting policy to inverse-frequency).
-- consider enabling `phase_b.min_separation` to a modest value (0.05 to
-  0.1 Angstrom) if you find later iterations picking near-duplicates of
-  earlier training points.
+- tune `geometry_novelty.fallback_scale_angstrom` if you find later
+  iterations picking near-duplicates of earlier training points; Phase B
+  derives its minimum separation from the geometry novelty protocol.
 - pay attention to the `alpha_history` field in state.json -- the
   STOP_CHECK alpha-trend rules use it to decide when to terminate
   automatically.

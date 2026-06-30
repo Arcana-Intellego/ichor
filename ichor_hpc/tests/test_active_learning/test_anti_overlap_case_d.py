@@ -1,7 +1,8 @@
 """Tests for the Phase-B anti-overlap consumer (case d).
 
 We exercise the full integration: polus_wrapper.main runs Phase B,
-invokes filter_candidates_against_training with phase_b.min_separation,
+invokes filter_candidates_against_training with the geometry novelty-derived
+minimum separation,
 and writes both raw + filtered samples plus the DedupReport.
 """
 from __future__ import annotations
@@ -163,13 +164,13 @@ def test_min_separation_zero_drops_nothing(tmp_path):
 
 def test_min_separation_drops_close_candidates(tmp_path):
     """With a training point coincident with one of the candidates
-    and a positive min_separation, the matching candidate gets dropped."""
+    and a positive derived minimum separation, the matching candidate gets dropped."""
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
     cfg.batch_sizing.floor = 3
     cfg.phase_b.descriptor = "rmsd_massweight"
-    cfg.phase_b.min_separation = 0.1
+    cfg.geometry_novelty.fallback_scale_angstrom = 0.2
     cfg.to_yaml(campaign / "campaign.yaml")
 
     # commit a training set with one point coincident with seed_0000.
@@ -226,7 +227,7 @@ def test_min_separation_all_candidates_removed_fails_at_phase_b(tmp_path):
     cfg = CampaignConfig()
     cfg.batch_sizing.floor = 3
     cfg.phase_b.descriptor = "rmsd_massweight"
-    cfg.phase_b.min_separation = 0.1
+    cfg.geometry_novelty.fallback_scale_angstrom = 0.2
     cfg.to_yaml(campaign / "campaign.yaml")
 
     training_dir = campaign / "5_TRAINING" / "iteration-0000"
@@ -266,8 +267,8 @@ def test_scaled_min_separation_rescues_farthest_non_duplicate(tmp_path):
     cfg = CampaignConfig()
     cfg.batch_sizing.floor = 3
     cfg.phase_b.descriptor = "rmsd_massweight"
-    cfg.phase_b.min_separation_scaled = 100.0
-    cfg.geometry_novelty.fallback_scale_angstrom = 0.05
+    cfg.geometry_novelty.fallback_scale_angstrom = 10.0
+
     cfg.to_yaml(campaign / "campaign.yaml")
 
     training_dir = campaign / "5_TRAINING" / "iteration-0000"
