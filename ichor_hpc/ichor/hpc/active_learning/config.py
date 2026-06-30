@@ -27,6 +27,7 @@ __all__ = [
     "SeedSelectionConfigBlock",
     "AntiOverlapConfigBlock",
     "PhaseBConfigBlock",
+    "GeometryNoveltyConfigBlock",
     "SplitConfigBlock",
     "FerebusConfigBlock",
     "AcquisitionSubspaceBlock",
@@ -58,6 +59,9 @@ __all__ = [
     "VALID_BATCH_POLICIES",
     "VALID_WARMSTART",
     "VALID_DESCRIPTORS",
+    "VALID_GEOMETRY_NOVELTY_SCALE_SOURCES",
+    "VALID_GEOMETRY_NOVELTY_STATISTICS",
+    "VALID_GEOMETRY_NOVELTY_SCORE_TRANSFORMS",
     "VALID_SPLITS",
     "VALID_SEED_SELECTION_STRATEGIES",
     "VALID_GRADIENT_MODES",
@@ -95,6 +99,13 @@ VALID_BATCH_POLICIES = frozenset({"linear", "sqrt", "fixed"})
 VALID_WARMSTART = frozenset({"always", "never", "adaptive"})
 VALID_DESCRIPTORS = frozenset({
     "rmsd_massweight", "hybrid_alf_rmsd", "acquisition_weighted",
+})
+VALID_GEOMETRY_NOVELTY_SCALE_SOURCES = frozenset({
+    "local_motion", "movement_history", "hybrid",
+})
+VALID_GEOMETRY_NOVELTY_STATISTICS = frozenset({"p25", "median", "p75"})
+VALID_GEOMETRY_NOVELTY_SCORE_TRANSFORMS = frozenset({
+    "linear_cap", "exponential",
 })
 VALID_SPLITS = frozenset({
     "stratified_with_holdout", "random_80_20", "pure_top_k",
@@ -533,6 +544,18 @@ class PhaseBConfigBlock:
     # anti_overlap.enforce_post_ariadne). units: angstrom, or whatever the trajectory uses.
     # CALIBRATE per system -- too large and it over-drops genuinely new points. (A43)
     min_separation: float = 0.05
+    min_separation_scaled: float = 0.5
+
+
+@dataclass
+class GeometryNoveltyConfigBlock:
+    enabled: bool = True
+    scale_source: str = "local_motion"
+    statistic: str = "median"
+    scale_floor_angstrom: float = 1.0e-3
+    history_window_iterations: int = 5
+    fallback_scale_angstrom: float = 0.05
+    score_transform: str = "linear_cap"
 
 
 @dataclass
@@ -1035,6 +1058,9 @@ class CampaignConfig:
         default_factory=AntiOverlapConfigBlock
     )
     phase_b: PhaseBConfigBlock = field(default_factory=PhaseBConfigBlock)
+    geometry_novelty: GeometryNoveltyConfigBlock = field(
+        default_factory=GeometryNoveltyConfigBlock
+    )
     split: SplitConfigBlock = field(default_factory=SplitConfigBlock)
     ferebus: FerebusConfigBlock = field(default_factory=FerebusConfigBlock)
     acquisition: AcquisitionConfigBlock = field(
@@ -1335,6 +1361,41 @@ class CampaignConfig:
         if self.phase_b.min_separation < 0.0:
             raise ConfigValidationError(
                 "phase_b.min_separation must be >= 0"
+            )
+        if self.phase_b.min_separation_scaled < 0.0:
+            raise ConfigValidationError(
+                "phase_b.min_separation_scaled must be >= 0"
+            )
+        if not isinstance(self.geometry_novelty.enabled, bool):
+            raise ConfigValidationError(
+                "geometry_novelty.enabled must be a boolean"
+            )
+        if self.geometry_novelty.scale_source not in VALID_GEOMETRY_NOVELTY_SCALE_SOURCES:
+            raise ConfigValidationError(
+                "geometry_novelty.scale_source must be one of "
+                + repr(sorted(VALID_GEOMETRY_NOVELTY_SCALE_SOURCES))
+            )
+        if self.geometry_novelty.statistic not in VALID_GEOMETRY_NOVELTY_STATISTICS:
+            raise ConfigValidationError(
+                "geometry_novelty.statistic must be one of "
+                + repr(sorted(VALID_GEOMETRY_NOVELTY_STATISTICS))
+            )
+        if self.geometry_novelty.score_transform not in VALID_GEOMETRY_NOVELTY_SCORE_TRANSFORMS:
+            raise ConfigValidationError(
+                "geometry_novelty.score_transform must be one of "
+                + repr(sorted(VALID_GEOMETRY_NOVELTY_SCORE_TRANSFORMS))
+            )
+        if self.geometry_novelty.scale_floor_angstrom <= 0.0:
+            raise ConfigValidationError(
+                "geometry_novelty.scale_floor_angstrom must be > 0"
+            )
+        if self.geometry_novelty.history_window_iterations < 0:
+            raise ConfigValidationError(
+                "geometry_novelty.history_window_iterations must be >= 0"
+            )
+        if self.geometry_novelty.fallback_scale_angstrom <= 0.0:
+            raise ConfigValidationError(
+                "geometry_novelty.fallback_scale_angstrom must be > 0"
             )
         if self.split.strategy not in VALID_SPLITS:
             raise ConfigValidationError(

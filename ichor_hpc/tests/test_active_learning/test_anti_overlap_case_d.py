@@ -252,6 +252,60 @@ def test_min_separation_all_candidates_removed_fails_at_phase_b(tmp_path):
                "--campaign-dir", str(campaign)])
 
     assert rc.returncode == 3
-    assert "phase_b_anti_overlap_removed_every_candidate" in rc.stderr
+    assert "phase_b_geometry_novelty_no_non_duplicate_candidate" in rc.stderr
     assert (iter_dir / "phase_b_dedup.json").is_file()
     assert not (iter_dir / "PHASE_B_SELECTION.json").exists()
+
+
+def test_scaled_min_separation_rescues_farthest_non_duplicate(tmp_path):
+    """Scaled mode should keep one farthest non-duplicate candidate instead
+    of failing the campaign when the estimated threshold is too strict.
+    """
+    campaign = tmp_path / "c"
+    campaign.mkdir()
+    cfg = CampaignConfig()
+    cfg.batch_sizing.floor = 3
+    cfg.phase_b.descriptor = "rmsd_massweight"
+    cfg.phase_b.min_separation_scaled = 100.0
+    cfg.geometry_novelty.fallback_scale_angstrom = 0.05
+    cfg.to_yaml(campaign / "campaign.yaml")
+
+    training_dir = campaign / "5_TRAINING" / "iteration-0000"
+    base = [(0.0, 0.0, 0.0), (0.96, 0.0, 0.0), (-0.24, 0.93, 0.0)]
+    atom_types = ["O", "H", "H"]
+    _write_pointdir(training_dir / "POINT_0000.pointdir", atom_types, base)
+    write_manifest(training_dir, compute_directory_manifest(training_dir))
+    (campaign / "5_TRAINING" / ".current.pointer").write_text(
+        "iteration-0000", encoding="utf-8",
+    )
+
+    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
+    pool_dir = iter_dir / "pool"
+    _make_seed_result(
+        pool_dir / "seed_0000",
+        atom_types,
+        [(0.0, 0.0, 0.0), (0.98, 0.0, 0.0), (-0.24, 0.93, 0.0)],
+    )
+    _make_seed_result(
+        pool_dir / "seed_0001",
+        atom_types,
+        [(0.0, 0.0, 0.0), (1.05, 0.0, 0.0), (-0.24, 0.93, 0.0)],
+    )
+    _make_seed_result(
+        pool_dir / "seed_0002",
+        atom_types,
+        [(0.0, 0.0, 0.0), (1.00, 0.0, 0.0), (-0.24, 0.93, 0.0)],
+    )
+    _write_ariadne_manifest(iter_dir)
+
+    rc = _run(["--descriptor", "rmsd_massweight",
+               "--iteration", "0",
+               "--campaign-dir", str(campaign)])
+
+    assert rc.returncode == 0, rc.stderr
+    dedup = json.loads((iter_dir / "phase_b_dedup.json").read_text(encoding="utf-8"))
+    assert dedup["threshold_mode"] == "scaled"
+    assert dedup["relaxation"]["applied"] is True
+    assert dedup["n_kept"] == 1
+    assert dedup["n_dropped"] == 2
+    assert (iter_dir / "GEOMETRY_NOVELTY_SCALE.json").is_file()

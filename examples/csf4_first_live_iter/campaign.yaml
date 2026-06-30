@@ -76,6 +76,16 @@ phase_b:
   descriptor: hybrid_alf_rmsd
   beta: 0.3
   min_separation: 0.05
+  min_separation_scaled: 0.5
+
+geometry_novelty:
+  enabled: true
+  scale_source: local_motion
+  statistic: median
+  scale_floor_angstrom: 1.0e-3
+  history_window_iterations: 5
+  fallback_scale_angstrom: 0.05
+  score_transform: linear_cap
 
 split:
   strategy: stratified_with_holdout

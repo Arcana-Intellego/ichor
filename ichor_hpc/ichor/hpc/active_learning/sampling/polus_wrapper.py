@@ -445,6 +445,15 @@ def _run_phase_b(args, campaign, config):
     """
     from .descriptors import build_descriptor_from_config
     from .anti_overlap import filter_candidates_against_training
+    from ..daemon.state import atomic_write_json
+    from ..geometry_novelty import (
+        EXACT_DUPLICATE_EPSILON_ANGSTROM,
+        compute_geometry_novelty_scale,
+        effective_phase_b_min_separation,
+        novelty_score,
+        scaled_distances,
+        write_geometry_novelty_scale,
+    )
     from ..handoff_manifests import (
         PHASE_B_SELECTION_SCHEMA_VERSION,
         ariadne_candidate_frames,
@@ -452,7 +461,6 @@ def _run_phase_b(args, campaign, config):
         write_phase_b_selection_manifest,
     )
     import sys as _sys
-    import json as _json
 
     iter_dir = (
         campaign / "7_ACTIVE_LEARNING"
@@ -562,9 +570,31 @@ def _run_phase_b(args, campaign, config):
     raw_path = iter_dir / "phase_b_SAMPLE_raw.xyz"
     _write_xyz_file(selected_frames, raw_path)
 
+    geometry_scale_payload = None
+    try:
+        geometry_scale_payload = compute_geometry_novelty_scale(
+            campaign,
+            config,
+            iteration=int(args.iteration),
+        )
+        write_geometry_novelty_scale(iter_dir, geometry_scale_payload)
+        min_sep, threshold_mode = effective_phase_b_min_separation(
+            config,
+            geometry_scale_payload,
+        )
+    except Exception as exc:
+        print(
+            "Phase B geometry novelty scale failed: "
+            + type(exc).__name__
+            + ": "
+            + str(exc),
+            file=_sys.stderr,
+        )
+        return 3
+
     # anti-overlap case (d): drop any selected candidate that lands too
-    # close to an existing training point. off by default (min_sep=0).
-    min_sep = float(config.phase_b.min_separation)
+    # close to an existing training point. In scaled mode the configured
+    # threshold is dimensionless and is multiplied by the iteration scale.
     final_path = iter_dir / "phase_b_SAMPLE.xyz"
     dedup_path = iter_dir / "phase_b_dedup.json"
     try:
@@ -581,21 +611,96 @@ def _run_phase_b(args, campaign, config):
     report = filter_candidates_against_training(
         selected_frames, training, min_separation=min_sep,
     )
+    relaxation = {
+        "applied": False,
+        "reason": None,
+    }
+    if int(report.n_kept) <= 0 and threshold_mode == "scaled":
+        finite_nonzero = []
+        for raw_index, distance in enumerate(report.distances_to_nearest):
+            try:
+                d = float(distance)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(d) and d > EXACT_DUPLICATE_EPSILON_ANGSTROM:
+                finite_nonzero.append((int(raw_index), float(d)))
+        if finite_nonzero:
+            keep_index, keep_distance = max(
+                finite_nonzero,
+                key=lambda item: (item[1], -item[0]),
+            )
+            dropped_indices = tuple(
+                i for i in range(len(selected_frames)) if int(i) != int(keep_index)
+            )
+            report = type(report)(
+                kept_indices=(int(keep_index),),
+                dropped_indices=dropped_indices,
+                distances_to_nearest=tuple(report.distances_to_nearest),
+                min_separation=float(min_sep),
+            )
+            relaxation = {
+                "applied": True,
+                "reason": "all_candidates_below_scaled_threshold",
+                "kept_raw_index": int(keep_index),
+                "distance_to_nearest_angstrom": float(keep_distance),
+                "effective_min_separation_angstrom": float(min_sep),
+            }
+
+    scale_angstrom = (
+        geometry_scale_payload.get("scale_angstrom")
+        if isinstance(geometry_scale_payload, dict)
+        else None
+    )
+    scaled_nearest = (
+        scaled_distances(report.distances_to_nearest, scale_angstrom)
+        if threshold_mode == "scaled"
+        else []
+    )
+    transform = (
+        geometry_scale_payload.get("score_transform", "linear_cap")
+        if isinstance(geometry_scale_payload, dict)
+        else "linear_cap"
+    )
+    novelty_scores = (
+        [
+            novelty_score(distance, scale_angstrom, str(transform))
+            for distance in report.distances_to_nearest
+        ]
+        if threshold_mode == "scaled"
+        else []
+    )
     dedup_payload = {
         "kept_indices": list(report.kept_indices),
         "dropped_indices": list(report.dropped_indices),
         "distances_to_nearest": list(report.distances_to_nearest),
         "min_separation": report.min_separation,
+        "threshold_mode": threshold_mode,
+        "legacy_min_separation": float(config.phase_b.min_separation),
+        "effective_min_separation_angstrom": float(min_sep),
+        "min_separation_scaled": float(config.phase_b.min_separation_scaled),
+        "scaled_distances_to_nearest": list(scaled_nearest),
+        "novelty_scores": list(novelty_scores),
+        "geometry_novelty_scale": geometry_scale_payload,
+        "relaxation": relaxation,
         "n_kept": report.n_kept,
         "n_dropped": report.n_dropped,
         "n_candidates": len(selected_frames),
         "descriptor_used": descriptor.name,
     }
-    dedup_path.write_text(
-        _json.dumps(_phase_b_json_safe(dedup_payload), indent=2),
-        encoding="utf-8",
-    )
+    atomic_write_json(dedup_path, _phase_b_json_safe(dedup_payload))
     if int(report.n_kept) <= 0:
+        if threshold_mode == "scaled":
+            print(
+                "phase_b_geometry_novelty_no_non_duplicate_candidate: "
+                + "kept 0/"
+                + str(len(selected_frames))
+                + " candidates; every candidate was an exact duplicate, "
+                + "non-finite, or below the scaled novelty threshold; "
+                + "diagnostics written to "
+                + str(dedup_path),
+                file=_sys.stderr,
+            )
+            return 3
         print(
             "phase_b_anti_overlap_removed_every_candidate: "
             + "kept 0/"

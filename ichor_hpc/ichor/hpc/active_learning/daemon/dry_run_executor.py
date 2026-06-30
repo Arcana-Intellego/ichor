@@ -1104,6 +1104,11 @@ class DryRunPhaseExecutor:
         }
 
     def _post_phase_b_polus(self, state) -> Dict[str, Any]:
+        from ..geometry_novelty import (
+            compute_geometry_novelty_scale,
+            effective_phase_b_min_separation,
+            write_geometry_novelty_scale,
+        )
         from ..handoff_manifests import (
             PHASE_B_SELECTION_SCHEMA_VERSION,
             read_ariadne_results_manifest,
@@ -1175,6 +1180,35 @@ class DryRunPhaseExecutor:
             out_rec["kept_after_dedup"] = True
             out_rec["drop_reason"] = None
             final_records.append(out_rec)
+        geometry_scale_payload = compute_geometry_novelty_scale(
+            self.campaign_dir,
+            self.config,
+            iteration=int(state.iteration),
+        )
+        self.artefact_log.append(
+            str(write_geometry_novelty_scale(iter_dir, geometry_scale_payload))
+        )
+        effective_min_separation, threshold_mode = effective_phase_b_min_separation(
+            self.config,
+            geometry_scale_payload,
+        )
+        dedup_payload = {
+            "n_candidates": int(len(final_records)),
+            "n_kept": int(len(final_records)),
+            "n_dropped": 0,
+            "kept_indices": [int(i) for i in range(len(final_records))],
+            "dropped_indices": [],
+            "distances_to_nearest": [],
+            "min_separation": float(effective_min_separation),
+            "threshold_mode": str(threshold_mode),
+            "legacy_min_separation": float(self.config.phase_b.min_separation),
+            "effective_min_separation_angstrom": float(effective_min_separation),
+            "min_separation_scaled": float(self.config.phase_b.min_separation_scaled),
+            "scaled_distances_to_nearest": [],
+            "novelty_scores": [],
+            "geometry_novelty_scale": geometry_scale_payload,
+            "relaxation": {"applied": False, "reason": None},
+        }
         manifest_path = write_phase_b_selection_manifest(iter_dir, {
             "schema_version": PHASE_B_SELECTION_SCHEMA_VERSION,
             "iteration": int(state.iteration),
@@ -1185,12 +1219,7 @@ class DryRunPhaseExecutor:
             "n_kept": int(len(final_records)),
             "raw": list(final_records),
             "final": list(final_records),
-            "dedup": {
-                "n_candidates": int(len(final_records)),
-                "n_kept": int(len(final_records)),
-                "n_dropped": 0,
-                "min_separation": float(self.config.phase_b.min_separation),
-            },
+            "dedup": dedup_payload,
         })
         self.artefact_log.append(str(manifest_path))
         return {}

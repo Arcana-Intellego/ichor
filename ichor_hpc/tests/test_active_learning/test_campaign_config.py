@@ -37,6 +37,14 @@ def test_default_campaign_config_is_valid():
     assert c.seed_selection.d_optimal_jitter == 1.0e-12
     assert c.seed_selection.d_optimal_novelty_floor == 1.0e-12
     assert c.seed_selection.d_optimal_score_power == 1.0
+    assert c.phase_b.min_separation_scaled == 0.5
+    assert c.geometry_novelty.enabled is True
+    assert c.geometry_novelty.scale_source == "local_motion"
+    assert c.geometry_novelty.statistic == "median"
+    assert c.geometry_novelty.scale_floor_angstrom == 1.0e-3
+    assert c.geometry_novelty.history_window_iterations == 5
+    assert c.geometry_novelty.fallback_scale_angstrom == 0.05
+    assert c.geometry_novelty.score_transform == "linear_cap"
     assert c.resources.defaults.partition == "multicore"
     assert c.resources.defaults.walltime_hours == 24
     assert c.resources.defaults.cpus_per_task == "auto"
@@ -529,6 +537,25 @@ def test_invalid_descriptor_rejected():
     payload = CampaignConfig().to_dict()
     payload["phase_b"]["descriptor"] = "not_a_real_descriptor"
     with pytest.raises(ConfigValidationError):
+        CampaignConfig.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    "path,value",
+    [
+        ("phase_b.min_separation_scaled", -0.1),
+        ("geometry_novelty.scale_source", "global_magic"),
+        ("geometry_novelty.statistic", "mean"),
+        ("geometry_novelty.scale_floor_angstrom", 0.0),
+        ("geometry_novelty.history_window_iterations", -1),
+        ("geometry_novelty.fallback_scale_angstrom", 0.0),
+        ("geometry_novelty.score_transform", "sigmoid"),
+    ],
+)
+def test_geometry_novelty_config_validated(path, value):
+    payload = CampaignConfig().to_dict()
+    _set_path(payload, path, value)
+    with pytest.raises(ConfigValidationError, match=path.split(".")[0]):
         CampaignConfig.from_dict(payload)
 
 

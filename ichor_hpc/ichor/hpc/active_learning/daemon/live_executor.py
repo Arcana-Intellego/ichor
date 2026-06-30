@@ -2882,11 +2882,31 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         if phase_name == "PHASE_B_POLUS":
             d = phase_b_manifest.get("dedup", {}) if isinstance(phase_b_manifest, dict) else {}
             if isinstance(d, dict):
+                relaxation = d.get("relaxation") if isinstance(d.get("relaxation"), dict) else {}
                 dedup_payload = {
                     "n_kept": int(d.get("n_kept", 0)),
                     "n_dropped": int(d.get("n_dropped", 0)),
                     "min_separation": float(d.get("min_separation", 0.0)),
+                    "threshold_mode": str(d.get("threshold_mode", "absolute")),
                 }
+                if d.get("effective_min_separation_angstrom") is not None:
+                    dedup_payload["effective_min_separation_angstrom"] = float(
+                        d.get("effective_min_separation_angstrom")
+                    )
+                if bool(relaxation.get("applied", False)):
+                    self._journal_event(
+                        "phase_b_novelty_threshold_relaxed",
+                        phase=phase_name,
+                        iteration=int(state.iteration),
+                        reason=str(relaxation.get("reason", "unknown")),
+                        kept_raw_index=int(relaxation.get("kept_raw_index", -1)),
+                        distance_to_nearest_angstrom=relaxation.get(
+                            "distance_to_nearest_angstrom"
+                        ),
+                        effective_min_separation_angstrom=relaxation.get(
+                            "effective_min_separation_angstrom"
+                        ),
+                    )
         self._journal_event(
             "phase_succeeded_live",
             phase=phase_name,

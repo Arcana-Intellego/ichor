@@ -176,6 +176,7 @@ FUTURE_SAFE_PREFIXES = {
     "batch_sizing.",
     "anti_overlap.",
     "phase_b.",
+    "geometry_novelty.",
     "adversarial_safety.",
     "ariadne.",
     "acquisition.subspace.",
@@ -247,6 +248,7 @@ ARIADNE_OUTPUT_INTERPRETATION_EXACT = {
 PHASE_B_OUTPUT_INTERPRETATION_PREFIXES = {
     "anti_overlap.",
     "phase_b.",
+    "geometry_novelty.",
 }
 PHASE_B_OUTPUT_INTERPRETATION_EXACT = {
     "adversarial_safety.phase_b_filter_enabled",

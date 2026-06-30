@@ -18,6 +18,36 @@ def _line(label: str, value) -> str:
     return "-- " + label + ": " + format_field_value(value) + "\n"
 
 
+def _latest_geometry_novelty_scale_summary(campaign_dir: Path) -> str:
+    try:
+        from ichor.hpc.active_learning.geometry_novelty import (
+            read_geometry_novelty_scale,
+        )
+    except Exception as exc:
+        return "unavailable (" + type(exc).__name__ + ": " + str(exc) + ")"
+    base = Path(campaign_dir) / "7_ACTIVE_LEARNING"
+    if not base.is_dir():
+        return "not written yet"
+    candidates = sorted(base.glob("iteration-*/GEOMETRY_NOVELTY_SCALE.json"))
+    if not candidates:
+        return "not written yet"
+    latest = candidates[-1].parent
+    try:
+        payload = read_geometry_novelty_scale(latest)
+    except Exception as exc:
+        return "unreadable (" + type(exc).__name__ + ": " + str(exc) + ")"
+    return (
+        "iteration="
+        + str(payload.get("iteration"))
+        + ", scale_angstrom="
+        + str(payload.get("scale_angstrom"))
+        + ", fallback_used="
+        + str(payload.get("fallback_used"))
+        + ", n_values="
+        + str(payload.get("n_values"))
+    )
+
+
 def _hours_label(value) -> str:
     try:
         hours = float(value)
@@ -66,7 +96,10 @@ def _backend_effective_summary(resources, field_name: str) -> str:
     return ", ".join(values)
 
 
-def format_sampling_protocol_summary(config: CampaignConfig) -> str:
+def format_sampling_protocol_summary(
+    config: CampaignConfig,
+    campaign_dir: str | Path | None = None,
+) -> str:
     seed = config.seed_selection
     calib = config.error_calibration
     acq = config.acquisition
@@ -85,6 +118,7 @@ def format_sampling_protocol_summary(config: CampaignConfig) -> str:
     safety = config.adversarial_safety
     gates = config.quality_gates
     phase_b = config.phase_b
+    novelty = config.geometry_novelty
     anti = config.anti_overlap
     runtime = config.runtime
 
@@ -428,6 +462,29 @@ def format_sampling_protocol_summary(config: CampaignConfig) -> str:
     )
     lines.append(_line("phase_b.descriptor", phase_b.descriptor))
     lines.append(_line("phase_b.min_separation", phase_b.min_separation))
+    lines.append(_line("phase_b.min_separation_scaled", phase_b.min_separation_scaled))
+    lines.append(_line("geometry_novelty.enabled", novelty.enabled))
+    lines.append(
+        _line(
+            "geometry_novelty.scale",
+            "source="
+            + str(novelty.scale_source)
+            + ", statistic="
+            + str(novelty.statistic)
+            + ", fallback_scale_angstrom="
+            + str(novelty.fallback_scale_angstrom)
+            + ", floor="
+            + str(novelty.scale_floor_angstrom),
+        )
+    )
+    lines.append(_line("geometry_novelty.score_transform", novelty.score_transform))
+    if campaign_dir is not None:
+        lines.append(
+            _line(
+                "geometry_novelty.latest_sidecar",
+                _latest_geometry_novelty_scale_summary(Path(campaign_dir)),
+            )
+        )
     lines.append(
         _line(
             "anti_overlap.post_ariadne_whitened_distance",
@@ -448,4 +505,4 @@ def format_saved_sampling_protocol_summary(campaign_dir: str | Path) -> str:
         config = CampaignConfig.from_yaml(yaml_path)
     except Exception as exc:
         return "Failed to load " + str(yaml_path) + ": " + str(exc)
-    return format_sampling_protocol_summary(config)
+    return format_sampling_protocol_summary(config, campaign_dir=campaign)
