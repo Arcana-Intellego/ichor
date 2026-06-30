@@ -48,6 +48,7 @@ __all__ = [
     "compute_geometry_novelty_scale",
     "effective_phase_b_min_separation",
     "ensure_geometry_novelty_scale",
+    "geometry_novelty_input_fingerprint",
     "geometry_novelty_scale_path",
     "novelty_score",
     "read_geometry_novelty_scale",
@@ -288,17 +289,22 @@ def _movement_from_landing_safety(safety: Any) -> Optional[float]:
 
 def _movement_values_from_records(records: Any) -> Tuple[List[float], Dict[str, int]]:
     values: List[float] = []
+    skipped_handoff_rejected = 0
     skipped_rejected = 0
     skipped_nonfinite = 0
     if not isinstance(records, list):
         return values, {
             "n_records": 0,
             "n_accepted_movements": 0,
+            "n_skipped_handoff_rejected": 0,
             "n_skipped_rejected": 0,
             "n_skipped_nonfinite": 0,
         }
     for rec in records:
         if not isinstance(rec, dict):
+            continue
+        if rec.get("handoff_accepted") is False:
+            skipped_handoff_rejected += 1
             continue
         safety = rec.get("landing_safety")
         if not isinstance(safety, dict):
@@ -315,6 +321,7 @@ def _movement_values_from_records(records: Any) -> Tuple[List[float], Dict[str, 
     return values, {
         "n_records": int(len(records)),
         "n_accepted_movements": int(len(values)),
+        "n_skipped_handoff_rejected": int(skipped_handoff_rejected),
         "n_skipped_rejected": int(skipped_rejected),
         "n_skipped_nonfinite": int(skipped_nonfinite),
     }
@@ -333,6 +340,7 @@ def _ariadne_movement_history_values(
     n_files = 0
     n_audit_files = 0
     n_results_files = 0
+    n_skipped_handoff_rejected = 0
     n_skipped_rejected = 0
     n_skipped_nonfinite = 0
     for previous in range(start, int(iteration)):
@@ -374,6 +382,9 @@ def _ariadne_movement_history_values(
                     source_kind = "results"
                     n_results_files += 1
         values.extend(new_values)
+        n_skipped_handoff_rejected += int(
+            diag.get("n_skipped_handoff_rejected", 0)
+        )
         n_skipped_rejected += int(diag.get("n_skipped_rejected", 0))
         n_skipped_nonfinite += int(diag.get("n_skipped_nonfinite", 0))
         n_files += 1
@@ -391,6 +402,7 @@ def _ariadne_movement_history_values(
         "n_audit_files": int(n_audit_files),
         "n_results_files": int(n_results_files),
         "n_accepted_movements": int(len(values)),
+        "n_skipped_handoff_rejected": int(n_skipped_handoff_rejected),
         "n_skipped_rejected": int(n_skipped_rejected),
         "n_skipped_nonfinite": int(n_skipped_nonfinite),
     }
@@ -423,6 +435,148 @@ def _sidecar_provenance(campaign_dir: Path, iter_dir: Path, iteration: int) -> D
         "models_version": models_version,
         "state_available": bool(state_available),
     }
+
+
+def _geometry_novelty_config_fingerprint(config: Any) -> Dict[str, Any]:
+    return {
+        "enabled": bool(_normalise_config_value(config, "enabled", True)),
+        "scale_source": str(
+            _normalise_config_value(config, "scale_source", "local_motion")
+        ),
+        "statistic": str(_normalise_config_value(config, "statistic", "median")),
+        "scale_floor_angstrom": float(
+            _normalise_config_value(config, "scale_floor_angstrom", 1.0e-3)
+        ),
+        "fallback_scale_angstrom": float(
+            _normalise_config_value(config, "fallback_scale_angstrom", 0.05)
+        ),
+        "history_window_iterations": int(
+            _normalise_config_value(config, "history_window_iterations", 5)
+        ),
+    }
+
+
+def _geometry_protocol_constants_fingerprint() -> Dict[str, Any]:
+    return {
+        "phase_b_min_separation_scale": float(PHASE_B_MIN_SEPARATION_SCALE),
+        "movement_band_fractions": dict(movement_band_fractions()),
+        "movement_utility_low_softness_fraction": float(
+            MOVEMENT_UTILITY_LOW_SOFTNESS_FRACTION
+        ),
+        "movement_utility_high_softness_fraction": float(
+            MOVEMENT_UTILITY_HIGH_SOFTNESS_FRACTION
+        ),
+        "fullspace_rmsd_scale_multiplier": float(FULLSPACE_RMSD_SCALE_MULTIPLIER),
+        "geometry_novelty_score_transform": str(GEOMETRY_NOVELTY_SCORE_TRANSFORM),
+    }
+
+
+def _history_source_fingerprints(
+    campaign_dir: Path,
+    *,
+    iteration: int,
+    history_window: int,
+) -> List[Dict[str, Any]]:
+    if int(history_window) <= 0 or int(iteration) <= 0:
+        return []
+    base = campaign_dir / "7_ACTIVE_LEARNING"
+    start = max(0, int(iteration) - int(history_window))
+    out: List[Dict[str, Any]] = []
+    for previous in range(start, int(iteration)):
+        iter_dir = base / ("iteration-" + str(previous).zfill(4))
+        for kind, filename in (
+            ("ariadne_landing_audit", "ARIADNE_LANDING_AUDIT.json"),
+            ("ariadne_results", "ARIADNE_RESULTS.json"),
+        ):
+            path = iter_dir / filename
+            if not path.is_file():
+                continue
+            out.append(
+                {
+                    "iteration": int(previous),
+                    "kind": kind,
+                    "filename": filename,
+                    "sha256": _sha256_file(path),
+                }
+            )
+    return out
+
+
+def geometry_novelty_input_fingerprint(
+    campaign_dir: Union[str, Path],
+    config: Any,
+    *,
+    iteration: int,
+) -> Dict[str, Any]:
+    """Return the inputs that make a geometry-novelty scale current.
+
+    This is intentionally separate from operator-facing provenance. Provenance
+    explains where the sidecar came from; the fingerprint decides whether it is
+    still safe to reuse after restart or manual recovery.
+    """
+    campaign = Path(campaign_dir)
+    iter_dir = _campaign_iteration_dir(campaign, int(iteration))
+    seed_path = iter_dir / "seeds_picked.json"
+    seed_payload = _load_seed_payload(iter_dir)
+    novelty_config = _geometry_novelty_config_fingerprint(config)
+    scale_source = str(novelty_config.get("scale_source", "local_motion"))
+    history_files: List[Dict[str, Any]] = []
+    if bool(novelty_config.get("enabled", True)) and scale_source in (
+        "movement_history",
+        "hybrid",
+    ):
+        history_files = _history_source_fingerprints(
+            campaign,
+            iteration=int(iteration),
+            history_window=int(novelty_config["history_window_iterations"]),
+        )
+    return {
+        "seed_selection_sha256": _sha256_file(seed_path),
+        "trajectory_sha256": str(seed_payload.get("trajectory_sha256") or ""),
+        "geometry_novelty_config": novelty_config,
+        "geometry_protocol_constants": _geometry_protocol_constants_fingerprint(),
+        "history_source_files": history_files,
+    }
+
+
+def _append_reason(payload: Dict[str, Any], reason: str) -> None:
+    raw = payload.get("reasons")
+    reasons = [str(item) for item in raw] if isinstance(raw, list) else []
+    if str(reason) not in reasons:
+        reasons.append(str(reason))
+    payload["reasons"] = reasons
+
+
+def _input_fingerprint_mismatches(
+    previous: Any,
+    current: Dict[str, Any],
+) -> List[str]:
+    if not isinstance(previous, dict):
+        return ["input_fingerprint"]
+    keys = (
+        "seed_selection_sha256",
+        "trajectory_sha256",
+        "geometry_novelty_config",
+        "geometry_protocol_constants",
+        "history_source_files",
+    )
+    return [key for key in keys if previous.get(key) != current.get(key)]
+
+
+def _payload_with_resolved_consumers(
+    payload: Dict[str, Any],
+    config: Any,
+    *,
+    append_reason: bool = True,
+) -> Tuple[Dict[str, Any], bool]:
+    out = dict(payload)
+    resolved = resolve_geometry_novelty_consumers(config, out)
+    if out.get("resolved_consumers") == resolved:
+        return out, False
+    out["resolved_consumers"] = resolved
+    if append_reason:
+        _append_reason(out, "resolved_consumers_backfilled")
+    return out, True
 
 
 def _normalise_config_value(config: Any, name: str, default: Any) -> Any:
@@ -527,6 +681,11 @@ def compute_geometry_novelty_scale(
         "movement_history_summary_angstrom": _summary(history_values),
         "diagnostics": diagnostics,
         "provenance": _sidecar_provenance(campaign, iter_dir, int(iteration)),
+        "input_fingerprint": geometry_novelty_input_fingerprint(
+            campaign,
+            config,
+            iteration=int(iteration),
+        ),
     }
 
 
@@ -711,28 +870,58 @@ def ensure_geometry_novelty_scale(
     """
     iter_dir = _campaign_iteration_dir(campaign_dir, iteration)
     path = geometry_novelty_scale_path(iter_dir)
+    current_fingerprint = geometry_novelty_input_fingerprint(
+        campaign_dir,
+        config,
+        iteration=int(iteration),
+    )
+    recompute_reason: Optional[str] = None
+    mismatch_keys: List[str] = []
+    payload: Optional[Dict[str, Any]] = None
     if path.is_file():
         try:
-            payload = read_geometry_novelty_scale(
+            existing = read_geometry_novelty_scale(
                 iter_dir,
                 expected_iteration=int(iteration),
             )
+            previous_fingerprint = existing.get("input_fingerprint")
+            if not isinstance(previous_fingerprint, dict):
+                recompute_reason = "missing_input_fingerprint_recomputed"
+            else:
+                mismatch_keys = _input_fingerprint_mismatches(
+                    previous_fingerprint,
+                    current_fingerprint,
+                )
+                if mismatch_keys:
+                    recompute_reason = "input_fingerprint_mismatch_recomputed"
+            if recompute_reason is None:
+                payload, changed = _payload_with_resolved_consumers(existing, config)
+                if changed:
+                    write_geometry_novelty_scale(iter_dir, payload)
+                return payload
         except Exception:
-            payload = compute_geometry_novelty_scale(
-                campaign_dir,
-                config,
-                iteration=int(iteration),
-            )
-    else:
+            recompute_reason = "invalid_sidecar_recomputed"
+
+    if payload is None:
         payload = compute_geometry_novelty_scale(
             campaign_dir,
             config,
             iteration=int(iteration),
         )
     payload = dict(payload)
-    payload["resolved_consumers"] = resolve_geometry_novelty_consumers(
-        config,
+    if recompute_reason:
+        _append_reason(payload, recompute_reason)
+        if mismatch_keys:
+            diagnostics = dict(payload.get("diagnostics") or {})
+            diagnostics["input_fingerprint_mismatch"] = {
+                "keys": [str(key) for key in mismatch_keys],
+            }
+            payload["diagnostics"] = diagnostics
+    payload["input_fingerprint"] = current_fingerprint
+    payload, _changed = _payload_with_resolved_consumers(
         payload,
+        config,
+        append_reason=False,
     )
     write_geometry_novelty_scale(iter_dir, payload)
     return payload

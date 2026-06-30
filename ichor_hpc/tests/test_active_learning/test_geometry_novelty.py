@@ -11,6 +11,7 @@ from ichor.hpc.active_learning.geometry_novelty import (
     compute_geometry_novelty_scale,
     effective_phase_b_min_separation,
     ensure_geometry_novelty_scale,
+    geometry_novelty_input_fingerprint,
     geometry_novelty_scale_path,
     novelty_score,
     read_geometry_novelty_scale,
@@ -162,6 +163,14 @@ def test_geometry_novelty_movement_history_reads_ariadne_landing_audit(tmp_path)
                             "metrics": {"movement_rmsd_ang": 9.0},
                         },
                     },
+                    {
+                        "seed_index": 2,
+                        "handoff_accepted": False,
+                        "landing_safety": {
+                            "accepted": True,
+                            "metrics": {"movement_rmsd_ang": 8.0},
+                        },
+                    },
                 ],
             }
         ),
@@ -175,6 +184,7 @@ def test_geometry_novelty_movement_history_reads_ariadne_landing_audit(tmp_path)
     history_diag = payload["diagnostics"]["movement_history"]
     assert history_diag["source"] == "ariadne_landing_audit"
     assert history_diag["n_accepted_movements"] == 1
+    assert history_diag["n_skipped_handoff_rejected"] == 1
     assert history_diag["n_skipped_rejected"] == 1
 
 
@@ -254,7 +264,7 @@ def test_geometry_novelty_disabled_reports_fallback_protocol_semantics():
     assert threshold == pytest.approx(0.03)
 
 
-def test_ensure_geometry_novelty_scale_backfills_resolved_consumers(tmp_path):
+def test_ensure_geometry_novelty_scale_recomputes_sidecar_without_fingerprint(tmp_path):
     cfg = CampaignConfig()
     cfg.geometry_novelty.fallback_scale_angstrom = 0.04
     iter_dir = _iter_dir(tmp_path)
@@ -272,8 +282,160 @@ def test_ensure_geometry_novelty_scale_backfills_resolved_consumers(tmp_path):
     payload = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=0)
     loaded = read_geometry_novelty_scale(iter_dir)
 
+    assert payload["scale_angstrom"] == pytest.approx(0.04)
+    assert "missing_input_fingerprint_recomputed" in payload["reasons"]
     assert payload["resolved_consumers"]["phase_b"]["threshold_mode"] == "scaled"
     assert loaded["resolved_consumers"]["movement_band"]["target_peak_angstrom"] == pytest.approx(0.016)
+
+
+def test_ensure_geometry_novelty_scale_backfills_current_sidecar_resolved_consumers(tmp_path):
+    cfg = CampaignConfig()
+    cfg.geometry_novelty.fallback_scale_angstrom = 0.04
+    iter_dir = _iter_dir(tmp_path)
+    payload = compute_geometry_novelty_scale(tmp_path, cfg, iteration=0)
+    write_geometry_novelty_scale(iter_dir, payload)
+
+    loaded = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=0)
+
+    assert "input_fingerprint_mismatch_recomputed" not in loaded["reasons"]
+    assert "missing_input_fingerprint_recomputed" not in loaded["reasons"]
+    assert "resolved_consumers_backfilled" in loaded["reasons"]
+    assert loaded["resolved_consumers"]["phase_b"]["threshold_mode"] == "scaled"
+
+
+def test_ensure_geometry_novelty_scale_reuses_current_sidecar_without_rewrite(tmp_path):
+    cfg = CampaignConfig()
+    cfg.geometry_novelty.fallback_scale_angstrom = 0.04
+    iter_dir = _iter_dir(tmp_path)
+
+    first = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=0)
+    before = geometry_novelty_scale_path(iter_dir).read_text(encoding="utf-8")
+    second = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=0)
+    after = geometry_novelty_scale_path(iter_dir).read_text(encoding="utf-8")
+
+    assert second == first
+    assert after == before
+
+
+def test_geometry_novelty_recomputes_when_seed_selection_changes(tmp_path):
+    cfg = CampaignConfig()
+    cfg.geometry_novelty.fallback_scale_angstrom = 0.04
+    iter_dir = _iter_dir(tmp_path)
+    seed_path = iter_dir / "seeds_picked.json"
+    seed_path.write_text(
+        json.dumps(
+            {
+                "iteration": 0,
+                "n_picked": 1,
+                "frame_ids": [0],
+                "indices": [0],
+                "trajectory_sha256": "a" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+    first = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=0)
+
+    seed_path.write_text(
+        json.dumps(
+            {
+                "iteration": 0,
+                "n_picked": 1,
+                "frame_ids": [0],
+                "indices": [0],
+                "trajectory_sha256": "b" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+    second = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=0)
+
+    assert second["input_fingerprint"]["trajectory_sha256"] == "b" * 64
+    assert second["input_fingerprint"] != first["input_fingerprint"]
+    assert "input_fingerprint_mismatch_recomputed" in second["reasons"]
+    mismatch = second["diagnostics"]["input_fingerprint_mismatch"]["keys"]
+    assert "seed_selection_sha256" in mismatch
+    assert "trajectory_sha256" in mismatch
+
+
+def test_geometry_novelty_recomputes_when_config_changes(tmp_path):
+    cfg = CampaignConfig()
+    cfg.geometry_novelty.fallback_scale_angstrom = 0.04
+    ensure_geometry_novelty_scale(tmp_path, cfg, iteration=0)
+
+    cfg.geometry_novelty.statistic = "p75"
+    payload = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=0)
+
+    assert payload["statistic"] == "p75"
+    assert "input_fingerprint_mismatch_recomputed" in payload["reasons"]
+    mismatch = payload["diagnostics"]["input_fingerprint_mismatch"]["keys"]
+    assert "geometry_novelty_config" in mismatch
+
+
+def test_geometry_novelty_fingerprint_omits_history_for_local_motion(tmp_path):
+    cfg = CampaignConfig()
+    cfg.geometry_novelty.scale_source = "local_motion"
+    iter0 = _iter_dir(tmp_path, iteration=0)
+    (iter0 / "ARIADNE_LANDING_AUDIT.json").write_text(
+        json.dumps({"schema_version": 1, "seeds": []}),
+        encoding="utf-8",
+    )
+
+    fingerprint = geometry_novelty_input_fingerprint(tmp_path, cfg, iteration=1)
+
+    assert fingerprint["history_source_files"] == []
+
+
+def test_geometry_novelty_recomputes_when_history_file_changes(tmp_path):
+    cfg = CampaignConfig()
+    cfg.geometry_novelty.scale_source = "movement_history"
+    iter0 = _iter_dir(tmp_path, iteration=0)
+    audit = iter0 / "ARIADNE_LANDING_AUDIT.json"
+    audit.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "iteration": 0,
+                "seeds": [
+                    {
+                        "seed_index": 0,
+                        "landing_safety": {
+                            "accepted": True,
+                            "metrics": {"movement_rmsd_ang": 0.07},
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    first = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=1)
+    assert first["scale_angstrom"] == pytest.approx(0.07)
+
+    audit.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "iteration": 0,
+                "seeds": [
+                    {
+                        "seed_index": 0,
+                        "landing_safety": {
+                            "accepted": True,
+                            "metrics": {"movement_rmsd_ang": 0.11},
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    second = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=1)
+
+    assert second["scale_angstrom"] == pytest.approx(0.11)
+    assert "input_fingerprint_mismatch_recomputed" in second["reasons"]
+    mismatch = second["diagnostics"]["input_fingerprint_mismatch"]["keys"]
+    assert "history_source_files" in mismatch
 
 
 def test_geometry_novelty_sidecar_records_provenance_and_checks_iteration(tmp_path):

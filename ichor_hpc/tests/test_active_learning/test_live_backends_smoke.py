@@ -16,6 +16,7 @@ Run only the live tests when on the cluster:
 """
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import shutil
@@ -1208,6 +1209,100 @@ def test_array_staging_receives_executor_partition_override(monkeypatch, tmp_pat
     assert calls["gaussian"]["partition_override"] == "override-partition"
     assert calls["gaussian"]["sample_xyz"] == sample
     assert calls["aimall"]["partition_override"] == "override-partition"
+
+
+def test_ariadne_array_staging_precomputes_geometry_novelty_scale(tmp_path, monkeypatch):
+    from ichor.hpc.active_learning import geometry_novelty
+
+    cfg = CampaignConfig()
+    campaign = tmp_path / "campaign"
+    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
+    iter_dir.mkdir(parents=True)
+    (iter_dir / "seeds_picked.json").write_text(
+        json.dumps(
+            {
+                "iteration": 0,
+                "n_picked": 0,
+                "frame_ids": [],
+                "indices": [],
+                "trajectory_sha256": "c" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_ensure(campaign_dir, config, *, iteration):
+        calls.append((Path(campaign_dir), config, int(iteration)))
+        return {
+            "scale_angstrom": 0.04,
+            "scale_resolution_mode": "fallback_protocol",
+            "n_values": 0,
+        }
+
+    monkeypatch.setattr(
+        geometry_novelty,
+        "ensure_geometry_novelty_scale",
+        fake_ensure,
+    )
+    ex = LiveBackendsPhaseExecutor(
+        campaign_dir=campaign,
+        config=cfg,
+        sbatch_runner=object(),
+        backend_check=False,
+    )
+
+    n = ex._array_size_after_staging(
+        "ARIADNE_ARRAY",
+        SimpleNamespace(iteration=0, campaign_uid="uid"),
+    )
+
+    assert n == 0
+    assert calls == [(campaign, cfg, 0)]
+
+
+def test_ariadne_array_staging_fails_before_submit_when_scale_precompute_fails(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning import geometry_novelty
+
+    cfg = CampaignConfig()
+    campaign = tmp_path / "campaign"
+    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
+    iter_dir.mkdir(parents=True)
+    (iter_dir / "seeds_picked.json").write_text(
+        json.dumps(
+            {
+                "iteration": 0,
+                "n_picked": 0,
+                "frame_ids": [],
+                "indices": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_ensure(campaign_dir, config, *, iteration):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        geometry_novelty,
+        "ensure_geometry_novelty_scale",
+        fake_ensure,
+    )
+    ex = LiveBackendsPhaseExecutor(
+        campaign_dir=campaign,
+        config=cfg,
+        sbatch_runner=object(),
+        backend_check=False,
+    )
+
+    with pytest.raises(BackendSubmissionError, match="precompute failed"):
+        ex._array_size_after_staging(
+            "ARIADNE_ARRAY",
+            SimpleNamespace(iteration=0, campaign_uid="uid"),
+        )
 
 
 def test_build_sbatch_script_renders_ferebus_block():

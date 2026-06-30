@@ -866,7 +866,31 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             )
             return n
         if phase_name == "ARIADNE_ARRAY":
-            return self._ensure_ariadne_seed_provenance_for_iteration(state)
+            n = self._ensure_ariadne_seed_provenance_for_iteration(state)
+            try:
+                from ..geometry_novelty import ensure_geometry_novelty_scale
+
+                payload = ensure_geometry_novelty_scale(
+                    self.campaign_dir,
+                    self.config,
+                    iteration=it,
+                )
+            except Exception as exc:
+                raise BackendSubmissionError(
+                    "geometry novelty scale precompute failed before ARIADNE_ARRAY "
+                    + "submission: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)
+                ) from exc
+            self._journal_event(
+                "geometry_novelty_scale_precomputed",
+                iteration=it,
+                scale_angstrom=payload.get("scale_angstrom"),
+                scale_resolution_mode=payload.get("scale_resolution_mode"),
+                n_values=payload.get("n_values"),
+            )
+            return n
         return None
 
     def _submit_ferebus_phase(self, state, phase_name: str) -> PhaseResult:
