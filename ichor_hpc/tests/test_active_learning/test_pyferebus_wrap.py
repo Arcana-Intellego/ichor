@@ -216,7 +216,7 @@ def test_submit_ferebus_keeps_sbatch_directives_before_shell_commands(tmp_path):
         "#SBATCH --partition multicore",
         "#SBATCH -n 2",
         "#SBATCH --job-name=ferebus-light",
-        "#SBATCH --time=24:00:00",
+        "#SBATCH --time=1-00:00:00",
         "set -eo pipefail",
         "export LC_ALL=C",
         "export LC_NUMERIC=C",
@@ -300,7 +300,7 @@ def test_submit_ferebus_rewrites_pyferebus_day_walltime_to_hours(tmp_path):
     )
 
     script = (tmp_path / "runFerebus.sh").read_text(encoding="utf-8")
-    assert "#SBATCH --time=2:00:00" in script
+    assert "#SBATCH --time=02:00:00" in script
     assert "#SBATCH -t 2-0" not in script
 
 

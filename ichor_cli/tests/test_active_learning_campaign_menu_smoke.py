@@ -125,7 +125,12 @@ def test_edit_campaign_config_menu_items():
         "Edit trajectory_pool",
         "Edit iteration control",
         "Edit initial sub-sample sizes",
-        "Edit resources",
+        "Edit resource defaults",
+        "Edit POLUS resources",
+        "Edit Gaussian runtime resources",
+        "Edit AIMAll resources",
+        "Edit ARIADNE resources",
+        "Edit FEREBUS resources",
         "Edit Gaussian block",
         "Edit batch_sizing",
         "Edit seed_selection",
@@ -193,42 +198,39 @@ def test_campaign_config_block_submenus_show_values_and_edit_one_field(monkeypat
     )
     menu._replace_campaign_config(CampaignConfig(), loaded_from=None)
 
-    resources_menu = menu._BLOCK_MENUS_BY_LABEL["Edit resources"]
+    resources_menu = menu._BLOCK_MENUS_BY_LABEL["Edit resource defaults"]
     rendered = resources_menu.this_menu_options()
-    assert "resources.partition" in rendered
-    assert "resources.default_walltime_hours" in rendered
-    assert "resources.ferebus_walltime_hours" in rendered
-    assert "resources.polus_cpus_per_task" in rendered
-    assert "resources.aimall_cpus_per_task" in rendered
-    assert "resources.gaussian_mem_per_cpu" in rendered
+    assert "resources.defaults.partition" in rendered
+    assert "resources.defaults.walltime_hours" in rendered
+    assert "resources.defaults.cpus_per_task" in rendered
+    assert "resources.defaults.mem_per_cpu" in rendered
     assert "resources.gradient_parallel_backend" in rendered
 
     texts = [it.text for it in resources_menu.items]
     assert "Set partition" in texts
-    assert "Set default_walltime_hours" in texts
-    assert "Set ferebus_walltime_hours" in texts
-    assert "Set aimall_cpus_per_task" in texts
+    assert "Set walltime_hours" in texts
+    assert "Set cpus_per_task" in texts
     resources_menu.parent = menu.edit_campaign_config_menu
     prologue = resources_menu.get_prologue_text()
     assert "Current values for this campaign.yaml block:" in prologue
-    assert "resources.partition" in prologue
+    assert "resources.defaults.partition" in prologue
     assert "Loaded from:" not in prologue
     assert "Selected campaign:" not in prologue
 
     cfg = menu.get_campaign_config()
-    old_partition = cfg.resources.partition
+    old_partition = cfg.resources.defaults.partition
     spec = next(
         spec
         for spec in resources_menu.this_menu_options.fields
-        if spec.path == "resources.default_walltime_hours"
+        if spec.path == "resources.defaults.walltime_hours"
     )
-    monkeypatch.setattr(field_menu, "user_input_int", lambda prompt, default: 37)
+    monkeypatch.setattr(field_menu, "user_input_float", lambda prompt, default: 37)
 
     menu._edit_field(spec)
 
-    assert cfg.resources.default_walltime_hours == 37
-    assert cfg.resources.partition == old_partition
-    assert "resources.default_walltime_hours: 37" in resources_menu.this_menu_options()
+    assert cfg.resources.defaults.walltime_hours == 37
+    assert cfg.resources.defaults.partition == old_partition
+    assert "resources.defaults.walltime_hours: 37" in resources_menu.this_menu_options()
 
 
 def test_edit_gaussian_basis_set_saves_to_selected_campaign_yaml(
@@ -575,7 +577,7 @@ def test_field_transform_error_is_nonfatal(monkeypatch):
     import ichor.cli.main_menu_submenus.active_learning_campaign_menu.field_menu as field_menu
 
     calls = []
-    spec = field_menu.spec("resources.aimall_cpus_per_task", "str", transform=int)
+    spec = field_menu.spec("resources.aimall.cpus_per_task", "str", transform=int)
     monkeypatch.setattr(field_menu, "user_input_free_flow", lambda *args, **kwargs: "bad")
 
     field_menu.edit_field(spec, lambda path: "auto", lambda path, value: calls.append(value))
@@ -722,13 +724,13 @@ def test_save_allows_safe_runtime_change_under_config_lock(tmp_path, monkeypatch
     _write_started_campaign_with_lock(tmp_path, original)
     set_selected_campaign_dir(tmp_path)
     menu.load_config_for_campaign_dir(tmp_path, quiet=True)
-    menu._set_config_value("resources.gaussian_walltime_hours", 3)
+    menu._set_config_value("resources.gaussian.walltime_hours", 3)
     monkeypatch.setattr(menu, "_pause", lambda: None)
 
     menu.EditCampaignConfigFunctions.save_to_disk()
 
     loaded = CampaignConfig.from_yaml(tmp_path / "campaign.yaml")
-    assert loaded.resources.gaussian_walltime_hours == 3
+    assert loaded.resources.gaussian.walltime_hours == 3
     assert not menu.has_unsaved_config_changes()
 
 
@@ -1231,6 +1233,34 @@ def test_campaign_config_optional_int_field_editor(monkeypatch):
     assert menu.get_campaign_config().acquisition.spectral.max_modes is None
 
 
+def test_backend_cpu_override_can_be_cleared_to_inherit(monkeypatch):
+    import importlib
+
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    cfg = CampaignConfig()
+    cfg.resources.polus.cpus_per_task = 4
+    menu._replace_campaign_config(cfg, loaded_from=None)
+
+    polus_menu = menu._BLOCK_MENUS_BY_LABEL["Edit POLUS resources"]
+    cpu_spec = next(
+        spec
+        for spec in polus_menu.this_menu_options.fields
+        if spec.path == "resources.polus.cpus_per_task"
+    )
+
+    monkeypatch.setattr("builtins.input", lambda prompt: "null")
+    menu._edit_field(cpu_spec)
+
+    updated = menu.get_campaign_config()
+    assert updated.resources.polus.cpus_per_task is None
+    assert updated.resources.cpus_for("PHASE_A_POLUS") == "auto"
+
+
 def test_top_three_roi_config_blocks_render_current_values():
     import importlib
 
@@ -1324,7 +1354,7 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
     assert "acquisition.stencils.weak_mode_gating_enabled: True" in out
     assert "acquisition.stencils.weak_mode_omega_band" in out
     assert "acquisition.stencils.anharmonic_caps" in out
-    assert "resources.aimall_cpus_per_task: auto" in out
+    assert "resources.aimall.effective_cpus_per_task: auto" in out
     assert "resources.effective_phase_walltimes" in out
     assert "FEREBUS=24h" in out
     assert "aimall.naat: auto" in out
@@ -1802,7 +1832,7 @@ def test_campaign_config_load_edit_save_preserves_hidden_fields(tmp_path, monkey
 
     reloaded = CampaignConfig.from_yaml(tmp_path / "campaign.yaml")
     assert reloaded.system_name == "WATER_AL"
-    assert reloaded.resources.default_walltime_hours == 12
+    assert reloaded.resources.defaults.walltime_hours == 12
     assert reloaded.resources.polus_cpus_per_task == 4
     assert reloaded.resources.ferebus_cpus_per_task == 4
     assert reloaded.resources.gaussian_cpus_per_task == 2

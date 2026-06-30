@@ -516,11 +516,11 @@ def stage_gaussian_inputs(
         keywords += str(g.extra_keywords).split()
 
     gaussian_resources = None
-    if str(getattr(config.resources, "gaussian_memory_mode", "slurm_env")) == "link0":
+    if str(config.resources.gaussian_memory_mode_for()) == "link0":
         gaussian_resources = resolve_phase_resources(
             phase_name=str(phase_name),
             config=config,
-            partition=str(partition_override or config.resources.partition),
+            partition=str(partition_override or config.resources.partition_for(str(phase_name))),
             campaign_dir=campaign_dir,
             iteration=int(iteration),
             array_size=len(frames),
@@ -542,7 +542,7 @@ def stage_gaussian_inputs(
         )
         if gaussian_resources is not None:
             gjf.set_nproc(int(gaussian_resources.cpus_per_task))
-            gjf.set_mem(str(config.resources.gaussian_link0_mem))
+            gjf.set_mem(str(config.resources.gaussian_link0_mem_for()))
         gjf.write()
         if (
             initial_provenance_context is not None
@@ -611,7 +611,7 @@ def stage_aimall_inputs(
     aimall_resources = resolve_phase_resources(
         phase_name=str(phase_name),
         config=config,
-        partition=str(partition_override or config.resources.partition),
+        partition=str(partition_override or config.resources.partition_for(str(phase_name))),
         campaign_dir=campaign_dir,
         iteration=int(iteration),
         array_size=len(pointdirs),
@@ -637,7 +637,7 @@ def stage_aimall_inputs(
             resolved_naat = int(raw_naat)
             if resolved_naat < 1 or resolved_naat > int(aimall_cpus):
                 raise ValueError(
-                    "aimall.naat must be in [1, resolved resources.aimall_cpus_per_task]"
+                    "aimall.naat must be in [1, resolved resources.aimall.cpus_per_task]"
                 )
         atomic_write_json(
             pointdir / AIMALL_TASK_METADATA,

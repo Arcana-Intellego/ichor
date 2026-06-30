@@ -138,6 +138,19 @@ def user_input_clearable_str(prompt: str, default):
         return raw
 
 
+def user_input_optional_str(prompt: str, default):
+    while True:
+        try:
+            raw = input(prompt + " (blank keeps current, null clears): ")
+        except EOFError:
+            return default
+        if raw == "":
+            return default
+        if raw.strip().lower() in {"none", "null"}:
+            return None
+        return raw
+
+
 def edit_field(
     spec: FieldSpec,
     get_value: Callable[[str], Any],
@@ -151,6 +164,8 @@ def edit_field(
         value = user_input_free_flow(prompt, current)
     elif spec.input_kind == "clearable_str":
         value = user_input_clearable_str(prompt, current)
+    elif spec.input_kind == "optional_str":
+        value = user_input_optional_str(prompt, current)
     elif spec.input_kind == "int":
         value = user_input_int(prompt, current)
     elif spec.input_kind == "float":

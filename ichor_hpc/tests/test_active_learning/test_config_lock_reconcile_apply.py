@@ -249,8 +249,8 @@ def test_phase_walltime_changes_are_allowed_runtime_changes(tmp_path):
     original = CampaignConfig()
     write_config_lock(campaign, original)
     changed = CampaignConfig()
-    changed.resources.ferebus_walltime_hours = 2
-    changed.resources.gaussian_walltime_hours = 3
+    changed.resources.ferebus.walltime_hours = 2
+    changed.resources.gaussian.walltime_hours = 3
     _write_config(campaign, changed)
 
     proposed = fresh_campaign_state()
@@ -259,10 +259,59 @@ def test_phase_walltime_changes_are_allowed_runtime_changes(tmp_path):
 
     assert review.allowed
     assert sorted(c.path for c in review.allowed_changes) == [
-        "resources.ferebus_walltime_hours",
-        "resources.gaussian_walltime_hours",
+        "resources.ferebus.walltime_hours",
+        "resources.gaussian.walltime_hours",
     ]
     assert not review.blocked_changes
+
+
+def test_schema_v3_config_lock_migrates_before_diff(tmp_path):
+    campaign = _campaign(tmp_path)
+    current = CampaignConfig()
+    old_v3 = {
+        "schema_version": 3,
+        "system_name": current.system_name,
+        "resources": {
+            "partition": "multicore",
+            "default_walltime_hours": 24,
+            "polus_walltime_hours": 2,
+            "gaussian_walltime_hours": 24,
+            "polus_cpus_per_task": "auto",
+            "gaussian_cpus_per_task": "auto",
+            "aimall_cpus_per_task": "auto",
+            "ariadne_cpus_per_task": "auto",
+            "ferebus_cpus_per_task": "auto",
+            "polus_mem_per_cpu": "auto",
+            "gaussian_mem_per_cpu": "auto",
+            "aimall_mem_per_cpu": "auto",
+            "ariadne_mem_per_cpu": "auto",
+            "ferebus_mem_per_cpu": "auto",
+            "gaussian_memory_mode": "slurm_env",
+            "gaussian_link0_mem": "8GB",
+            "gaussian_memory_fraction_of_slurm": 0.85,
+            "array_concurrency_limit": None,
+            "fail_on_memory_estimate_exceeds_request": True,
+            "gradient_parallel_backend": "process",
+        },
+    }
+    path = config_lock_path(campaign)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "campaign_schema_version": 3,
+                "created_at_iso": "2026-01-01T00:00:00+00:00",
+                "last_checked_at_iso": "2026-01-01T00:00:00+00:00",
+                "canonical_config": old_v3,
+                "fingerprint_sha256": "legacy",
+                "field_policy_version": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    review = review_config_changes(campaign, current, fresh_campaign_state())
+    assert review.allowed
+    assert not review.changed
 
 
 def test_retry_phase_requires_retryable_journal_event():

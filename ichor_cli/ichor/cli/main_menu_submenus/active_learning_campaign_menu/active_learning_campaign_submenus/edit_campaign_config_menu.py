@@ -527,6 +527,8 @@ def _read_only_spec(path: str):
 
 
 def _auto_or_int(value):
+    if value is None:
+        return None
     text = str(value).strip()
     if text.lower() == "auto":
         return "auto"
@@ -1378,33 +1380,70 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("initial_val_size", "int"),
         ],
     ),
-    "Edit resources": _make_block_menu(
-        "Edit resources",
-        "SLURM resources used by live backend phases.",
+    "Edit resource defaults": _make_block_menu(
+        "Edit Resource Defaults",
+        "Default SLURM resources inherited by backend-specific resource blocks.",
         [
-            _spec("resources.partition", "str"),
-            _spec("resources.default_walltime_hours", "int"),
-            _spec("resources.polus_walltime_hours", "optional_int"),
-            _spec("resources.gaussian_walltime_hours", "optional_int"),
-            _spec("resources.aimall_walltime_hours", "optional_int"),
-            _spec("resources.ariadne_walltime_hours", "optional_int"),
-            _spec("resources.ferebus_walltime_hours", "optional_int"),
-            _spec("resources.polus_cpus_per_task", "str", transform=_auto_or_int, prompt="resources.polus_cpus_per_task (auto or positive integer): "),
-            _spec("resources.gaussian_cpus_per_task", "str", transform=_auto_or_int, prompt="resources.gaussian_cpus_per_task (auto or positive integer): "),
-            _spec("resources.aimall_cpus_per_task", "str", transform=_auto_or_int, prompt="resources.aimall_cpus_per_task (auto or positive integer): "),
-            _spec("resources.ariadne_cpus_per_task", "str", transform=_auto_or_int, prompt="resources.ariadne_cpus_per_task (auto or positive integer): "),
-            _spec("resources.ferebus_cpus_per_task", "str", transform=_auto_or_int, prompt="resources.ferebus_cpus_per_task (auto or positive integer): "),
-            _spec("resources.polus_mem_per_cpu", "str", prompt="resources.polus_mem_per_cpu (auto or SLURM style, e.g. 4G): "),
-            _spec("resources.gaussian_mem_per_cpu", "str", prompt="resources.gaussian_mem_per_cpu (auto or SLURM style, e.g. 4G): "),
-            _spec("resources.aimall_mem_per_cpu", "str", prompt="resources.aimall_mem_per_cpu (auto or SLURM style, e.g. 4G): "),
-            _spec("resources.ariadne_mem_per_cpu", "str", prompt="resources.ariadne_mem_per_cpu (auto or SLURM style, e.g. 4G): "),
-            _spec("resources.ferebus_mem_per_cpu", "str", prompt="resources.ferebus_mem_per_cpu (auto or SLURM style, e.g. 4G): "),
-            _spec("resources.gaussian_memory_mode", "choice", choices=sorted(VALID_GAUSSIAN_MEMORY_MODES)),
-            _spec("resources.gaussian_link0_mem", "str", prompt="resources.gaussian_link0_mem (Gaussian style, e.g. 8GB): "),
-            _spec("resources.gaussian_memory_fraction_of_slurm", "float"),
+            _spec("resources.defaults.partition", "str"),
+            _spec("resources.defaults.walltime_hours", "float"),
+            _spec("resources.defaults.cpus_per_task", "str", transform=_auto_or_int, prompt="resources.defaults.cpus_per_task (auto or positive integer): "),
+            _spec("resources.defaults.mem_per_cpu", "str", prompt="resources.defaults.mem_per_cpu (auto or SLURM style, e.g. 4G): "),
             _spec("resources.array_concurrency_limit", "optional_int"),
             _spec("resources.fail_on_memory_estimate_exceeds_request", "bool"),
             _spec("resources.gradient_parallel_backend", "choice", choices=sorted(VALID_GRADIENT_PARALLEL_BACKENDS)),
+        ],
+    ),
+    "Edit POLUS resources": _make_block_menu(
+        "Edit POLUS Resources",
+        "POLUS backend overrides; null values inherit from resource defaults.",
+        [
+            _spec("resources.polus.partition", "optional_str"),
+            _spec("resources.polus.walltime_hours", "optional_float"),
+            _spec("resources.polus.cpus_per_task", "optional_str", transform=_auto_or_int, prompt="resources.polus.cpus_per_task (null, auto, or positive integer): "),
+            _spec("resources.polus.mem_per_cpu", "optional_str", prompt="resources.polus.mem_per_cpu (null, auto, or SLURM style, e.g. 4G): "),
+        ],
+    ),
+    "Edit Gaussian runtime resources": _make_block_menu(
+        "Edit Gaussian Runtime Resources",
+        "Gaussian Slurm resources and Gaussian memory contract.",
+        [
+            _spec("resources.gaussian.partition", "optional_str"),
+            _spec("resources.gaussian.walltime_hours", "optional_float"),
+            _spec("resources.gaussian.cpus_per_task", "optional_str", transform=_auto_or_int, prompt="resources.gaussian.cpus_per_task (null, auto, or positive integer): "),
+            _spec("resources.gaussian.mem_per_cpu", "optional_str", prompt="resources.gaussian.mem_per_cpu (null, auto, or SLURM style, e.g. 4G): "),
+            _spec("resources.gaussian.memory_mode", "choice", choices=sorted(VALID_GAUSSIAN_MEMORY_MODES)),
+            _spec("resources.gaussian.link0_mem", "str", prompt="resources.gaussian.link0_mem (Gaussian style, e.g. 8GB): "),
+            _spec("resources.gaussian.memory_fraction_of_slurm", "float"),
+        ],
+    ),
+    "Edit AIMAll resources": _make_block_menu(
+        "Edit AIMAll Resources",
+        "AIMAll backend overrides; null values inherit from resource defaults.",
+        [
+            _spec("resources.aimall.partition", "optional_str"),
+            _spec("resources.aimall.walltime_hours", "optional_float"),
+            _spec("resources.aimall.cpus_per_task", "optional_str", transform=_auto_or_int, prompt="resources.aimall.cpus_per_task (null, auto, or positive integer): "),
+            _spec("resources.aimall.mem_per_cpu", "optional_str", prompt="resources.aimall.mem_per_cpu (null, auto, or SLURM style, e.g. 4G): "),
+        ],
+    ),
+    "Edit ARIADNE resources": _make_block_menu(
+        "Edit ARIADNE Resources",
+        "ARIADNE backend overrides; null values inherit from resource defaults.",
+        [
+            _spec("resources.ariadne.partition", "optional_str"),
+            _spec("resources.ariadne.walltime_hours", "optional_float"),
+            _spec("resources.ariadne.cpus_per_task", "optional_str", transform=_auto_or_int, prompt="resources.ariadne.cpus_per_task (null, auto, or positive integer): "),
+            _spec("resources.ariadne.mem_per_cpu", "optional_str", prompt="resources.ariadne.mem_per_cpu (null, auto, or SLURM style, e.g. 4G): "),
+        ],
+    ),
+    "Edit FEREBUS resources": _make_block_menu(
+        "Edit FEREBUS Resources",
+        "FEREBUS backend overrides; null values inherit from resource defaults.",
+        [
+            _spec("resources.ferebus.partition", "optional_str"),
+            _spec("resources.ferebus.walltime_hours", "optional_float"),
+            _spec("resources.ferebus.cpus_per_task", "optional_str", transform=_auto_or_int, prompt="resources.ferebus.cpus_per_task (null, auto, or positive integer): "),
+            _spec("resources.ferebus.mem_per_cpu", "optional_str", prompt="resources.ferebus.mem_per_cpu (null, auto, or SLURM style, e.g. 4G): "),
         ],
     ),
     "Edit Gaussian block": _make_block_menu(
@@ -1874,7 +1913,12 @@ edit_campaign_config_menu_items = [
     _block_submenu_item("Edit trajectory_pool"),
     _block_submenu_item("Edit iteration control"),
     _block_submenu_item("Edit initial sub-sample sizes"),
-    _block_submenu_item("Edit resources"),
+    _block_submenu_item("Edit resource defaults"),
+    _block_submenu_item("Edit POLUS resources"),
+    _block_submenu_item("Edit Gaussian runtime resources"),
+    _block_submenu_item("Edit AIMAll resources"),
+    _block_submenu_item("Edit ARIADNE resources"),
+    _block_submenu_item("Edit FEREBUS resources"),
     _block_submenu_item("Edit Gaussian block"),
     _block_submenu_item("Edit AIMAll block"),
     _block_submenu_item("Edit batch_sizing"),

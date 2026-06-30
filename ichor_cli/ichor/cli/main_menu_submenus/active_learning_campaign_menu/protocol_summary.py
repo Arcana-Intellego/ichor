@@ -18,6 +18,17 @@ def _line(label: str, value) -> str:
     return "-- " + label + ": " + format_field_value(value) + "\n"
 
 
+def _hours_label(value) -> str:
+    try:
+        hours = float(value)
+    except (TypeError, ValueError):
+        return str(value) + "h"
+    if hours.is_integer():
+        return str(int(hours)) + "h"
+    minutes = int(round(hours * 60.0))
+    return str(hours) + "h (" + str(minutes) + "m)"
+
+
 def _walltime_summary(resources) -> str:
     phases = (
         ("POLUS", "PHASE_A_POLUS"),
@@ -27,9 +38,32 @@ def _walltime_summary(resources) -> str:
         ("FEREBUS", "INITIAL_FEREBUS"),
     )
     return ", ".join(
-        label + "=" + str(int(resources.walltime_for(phase))) + "h"
+        label + "=" + _hours_label(resources.walltime_for(phase))
         for label, phase in phases
     )
+
+
+def _backend_effective_summary(resources, field_name: str) -> str:
+    phases = (
+        ("POLUS", "PHASE_A_POLUS"),
+        ("Gaussian", "INITIAL_GAUSSIAN"),
+        ("AIMAll", "INITIAL_AIMALL"),
+        ("ARIADNE", "ARIADNE_ARRAY"),
+        ("FEREBUS", "INITIAL_FEREBUS"),
+    )
+    values = []
+    for label, phase in phases:
+        if field_name == "partition":
+            effective = resources.partition_for(phase)
+        elif field_name == "cpus_per_task":
+            effective = resources.cpus_for(phase)
+        elif field_name == "mem_per_cpu":
+            effective = resources.mem_per_cpu_for(phase)
+        else:
+            effective = resources.walltime_for(phase)
+        explicit = getattr(getattr(resources, resources.backend_for_phase(phase)), field_name)
+        values.append(label + "=" + format_field_value(explicit) + " -> " + str(effective))
+    return ", ".join(values)
 
 
 def format_sampling_protocol_summary(config: CampaignConfig) -> str:
@@ -304,45 +338,35 @@ def format_sampling_protocol_summary(config: CampaignConfig) -> str:
             + str(ariadne.trqn_trust_min),
         )
     )
-    lines.append(_line("resources.partition", resources.partition))
-    lines.append(_line("resources.default_walltime_hours", resources.default_walltime_hours))
+    lines.append(_line("resources.defaults.partition", resources.defaults.partition))
+    lines.append(_line("resources.defaults.walltime_hours", resources.defaults.walltime_hours))
+    lines.append(_line("resources.defaults.cpus_per_task", resources.defaults.cpus_per_task))
+    lines.append(_line("resources.defaults.mem_per_cpu", resources.defaults.mem_per_cpu))
+    lines.append(
+        _line(
+            "resources.backend_partitions",
+            _backend_effective_summary(resources, "partition"),
+        )
+    )
     lines.append(_line("resources.effective_phase_walltimes", _walltime_summary(resources)))
     lines.append(
         _line(
-            "resources.phase_cpus",
-            "POLUS="
-            + str(resources.polus_cpus_per_task)
-            + ", Gaussian="
-            + str(resources.gaussian_cpus_per_task)
-            + ", AIMAll="
-            + str(resources.aimall_cpus_per_task)
-            + ", ARIADNE="
-            + str(resources.ariadne_cpus_per_task)
-            + ", FEREBUS="
-            + str(resources.ferebus_cpus_per_task),
+            "resources.backend_cpus",
+            _backend_effective_summary(resources, "cpus_per_task"),
         )
     )
     lines.append(
         _line(
-            "resources.phase_mem_per_cpu",
-            "POLUS="
-            + str(resources.polus_mem_per_cpu)
-            + ", Gaussian="
-            + str(resources.gaussian_mem_per_cpu)
-            + ", AIMAll="
-            + str(resources.aimall_mem_per_cpu)
-            + ", ARIADNE="
-            + str(resources.ariadne_mem_per_cpu)
-            + ", FEREBUS="
-            + str(resources.ferebus_mem_per_cpu),
+            "resources.backend_mem_per_cpu",
+            _backend_effective_summary(resources, "mem_per_cpu"),
         )
     )
-    lines.append(_line("resources.gaussian_memory_mode", resources.gaussian_memory_mode))
-    lines.append(_line("resources.gaussian_link0_mem", resources.gaussian_link0_mem))
+    lines.append(_line("resources.gaussian.memory_mode", resources.gaussian.memory_mode))
+    lines.append(_line("resources.gaussian.link0_mem", resources.gaussian.link0_mem))
     lines.append(
         _line(
-            "resources.gaussian_memory_fraction_of_slurm",
-            resources.gaussian_memory_fraction_of_slurm,
+            "resources.gaussian.memory_fraction_of_slurm",
+            resources.gaussian.memory_fraction_of_slurm,
         )
     )
     lines.append(
@@ -355,7 +379,7 @@ def format_sampling_protocol_summary(config: CampaignConfig) -> str:
         )
     )
     lines.append(_line("resources.gradient_parallel_backend", resources.gradient_parallel_backend))
-    lines.append(_line("resources.aimall_cpus_per_task", resources.aimall_cpus_per_task))
+    lines.append(_line("resources.aimall.effective_cpus_per_task", resources.cpus_for("AIMALL")))
     lines.append(_line("aimall.naat", aimall.naat))
     lines.append(_line("aimall.encomp", aimall.encomp))
     lines.append(_line("aimall.boaq", aimall.boaq))

@@ -12,7 +12,7 @@ import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from .cluster_profile import active_machine, profile_value
 from .phase_executor import BackendSubmissionError
@@ -107,13 +107,72 @@ def gaussian_memory_mib(value: Any) -> float:
     return float(amount) * scale
 
 
+def _partition_profile(partition: str) -> Optional[Dict[str, Any]]:
+    partitions = profile_value("hpc", "partitions", default=None)
+    if not isinstance(partitions, dict):
+        return None
+    raw = partitions.get(str(partition))
+    if raw is None:
+        raise BackendSubmissionError(
+            "partition "
+            + repr(str(partition))
+            + " is not present in active profile hpc.partitions"
+        )
+    if not isinstance(raw, dict):
+        raise BackendSubmissionError(
+            "configured hpc.partitions."
+            + str(partition)
+            + " must be a mapping"
+        )
+    return raw
+
+
+def validate_partition_supported(partition: str) -> None:
+    profile = _partition_profile(partition)
+    if profile is None:
+        return
+    if bool(profile.get("daemon_supported", True)) is False:
+        raise BackendSubmissionError(
+            "partition "
+            + repr(str(partition))
+            + " is configured but is not supported for ICHOR active-learning "
+            "daemon live phases"
+        )
+
+
 def partition_core_range(partition: str) -> Optional[Tuple[int, int]]:
+    profile = _partition_profile(partition)
+    if profile is not None:
+        try:
+            min_cores = int(profile.get("min_cpus", 1))
+            max_cores = int(profile.get("max_cpus", min_cores))
+        except (TypeError, ValueError) as exc:
+            raise BackendSubmissionError(
+                "configured hpc.partitions."
+                + str(partition)
+                + " min_cpus/max_cpus must be integers"
+            ) from exc
+        if min_cores < 1 or max_cores < min_cores:
+            raise BackendSubmissionError(
+                "configured hpc.partitions."
+                + str(partition)
+                + " has invalid core range ["
+                + str(min_cores)
+                + ", "
+                + str(max_cores)
+                + "]"
+            )
+        return min_cores, max_cores
     parallel = profile_value("hpc", "parallel_environments", default=None)
     if not isinstance(parallel, dict):
         return None
     raw = parallel.get(str(partition))
     if raw is None:
-        return None
+        raise BackendSubmissionError(
+            "partition "
+            + repr(str(partition))
+            + " is not present in active profile hpc.parallel_environments"
+        )
     try:
         lo, hi = list(raw)[:2]
         min_cores = int(lo)
@@ -138,6 +197,24 @@ def partition_core_range(partition: str) -> Optional[Tuple[int, int]]:
 
 
 def partition_memory_per_core_gb(partition: str) -> float:
+    profile = _partition_profile(partition)
+    if profile is not None:
+        raw_profile = profile.get("memory_per_core_gb")
+        try:
+            value = float(raw_profile)
+        except (TypeError, ValueError) as exc:
+            raise BackendSubmissionError(
+                "configured hpc.partitions."
+                + str(partition)
+                + ".memory_per_core_gb must be numeric"
+            ) from exc
+        if value <= 0.0:
+            raise BackendSubmissionError(
+                "configured hpc.partitions."
+                + str(partition)
+                + ".memory_per_core_gb must be > 0"
+            )
+        return value
     by_partition = profile_value(
         "hpc",
         "memory_per_core_gb_by_partition",
@@ -178,10 +255,39 @@ def partition_memory_per_core_gb(partition: str) -> float:
 
 
 def _partition_min_max(partition: str) -> Tuple[int, int]:
+    validate_partition_supported(partition)
     configured = partition_core_range(partition)
     if configured is None:
         return 1, 10_000
     return configured
+
+
+def validate_partition_walltime(partition: str, walltime_hours: Union[int, float]) -> None:
+    profile = _partition_profile(partition)
+    if profile is None:
+        return
+    raw = profile.get("max_walltime_hours")
+    if raw is None:
+        return
+    try:
+        limit = float(raw)
+        requested = float(walltime_hours)
+    except (TypeError, ValueError) as exc:
+        raise BackendSubmissionError(
+            "configured hpc.partitions."
+            + str(partition)
+            + ".max_walltime_hours must be numeric"
+        ) from exc
+    if requested > limit + 1.0e-9:
+        raise BackendSubmissionError(
+            "walltime "
+            + str(walltime_hours)
+            + " hours exceeds partition "
+            + repr(str(partition))
+            + " maximum "
+            + str(limit)
+            + " hours"
+        )
 
 
 def _is_auto(value: Any) -> bool:
@@ -588,11 +694,9 @@ def _auto_cpu_target(
         target = int(getattr(config.ferebus, "nagents", 20))
         if target > partition_max:
             raise BackendSubmissionError(
-                "resources.ferebus_cpus_per_task:auto resolves to ferebus.nagents="
+                "resources.ferebus.cpus_per_task:auto resolves to ferebus.nagents="
                 + str(target)
-                + " but partition "
-                + repr(str(getattr(config.resources, "partition", "")))
-                + " allows at most "
+                + " but partition allows at most "
                 + str(partition_max)
                 + " cores"
             )
@@ -610,10 +714,10 @@ def resolve_phase_resources(
     array_size: Optional[int] = None,
 ) -> ResolvedPhaseResources:
     resources = config.resources
-    part = str(partition if partition is not None else resources.partition)
     backend = backend_for_phase(phase_name)
-    raw_cpu = getattr(resources, backend + "_cpus_per_task")
-    raw_mem = getattr(resources, backend + "_mem_per_cpu")
+    part = str(partition if partition is not None else resources.partition_for(phase_name))
+    raw_cpu = resources.cpus_for(phase_name)
+    raw_mem = resources.mem_per_cpu_for(phase_name)
     partition_min, partition_max = _partition_min_max(part)
     partition_gb = partition_memory_per_core_gb(part)
     campaign_path = Path(campaign_dir) if campaign_dir is not None else None
@@ -634,9 +738,9 @@ def resolve_phase_resources(
             partition_gb,
         )
         extra.update(cpu_extra)
-        _validate_core_count("resources." + backend + "_cpus_per_task", int(cpus), part)
+        _validate_core_count("resources." + backend + ".cpus_per_task", int(cpus), part)
     else:
-        cpus = _explicit_cpu("resources." + backend + "_cpus_per_task", raw_cpu, part)
+        cpus = _explicit_cpu("resources." + backend + ".cpus_per_task", raw_cpu, part)
         cpu_reason = "explicit"
 
     if estimated_from_cpu > 0.0:
@@ -674,7 +778,7 @@ def resolve_phase_resources(
                     raise BackendSubmissionError(
                         "resources."
                         + backend
-                        + "_mem_per_cpu:auto estimates "
+                        + ".mem_per_cpu:auto estimates "
                         + str(round(mem_gb, 3))
                         + " GB/core for "
                         + phase_name
@@ -692,7 +796,7 @@ def resolve_phase_resources(
             raise BackendSubmissionError(
                 "resources."
                 + backend
-                + "_mem_per_cpu "
+                + ".mem_per_cpu "
                 + mem_per_cpu
                 + " exceeds configured profile memory cap for partition "
                 + repr(part)
@@ -715,7 +819,7 @@ def resolve_phase_resources(
             raise BackendSubmissionError(
                 "resources."
                 + backend
-                + "_mem_per_cpu="
+                + ".mem_per_cpu="
                 + str(mem_per_cpu)
                 + " requests "
                 + str(round(allocated_gb, 3))
@@ -749,26 +853,28 @@ def resolve_phase_resources(
 
 def gaussian_mdef_gb(config: Any, resolved: ResolvedPhaseResources) -> int:
     allocated_mib = slurm_memory_mib(resolved.mem_per_cpu) * float(max(1, int(resolved.cpus_per_task)))
-    usable_mib = allocated_mib * float(config.resources.gaussian_memory_fraction_of_slurm)
+    usable_mib = allocated_mib * float(
+        config.resources.gaussian_memory_fraction_of_slurm_for()
+    )
     return max(1, int(math.floor(usable_mib / 1024.0)))
 
 
 def validate_gaussian_link0_memory(config: Any, resolved: ResolvedPhaseResources) -> None:
-    if str(config.resources.gaussian_memory_mode) != "link0":
+    if str(config.resources.gaussian_memory_mode_for()) != "link0":
         return
-    gaussian_mib = gaussian_memory_mib(config.resources.gaussian_link0_mem)
+    gaussian_mib = gaussian_memory_mib(config.resources.gaussian_link0_mem_for())
     allocated_mib = slurm_memory_mib(resolved.mem_per_cpu) * float(max(1, int(resolved.cpus_per_task)))
-    limit_mib = float(config.resources.gaussian_memory_fraction_of_slurm) * allocated_mib
+    limit_mib = float(config.resources.gaussian_memory_fraction_of_slurm_for()) * allocated_mib
     if gaussian_mib > limit_mib + 1.0e-9:
         raise BackendSubmissionError(
-            "resources.gaussian_link0_mem "
-            + repr(str(config.resources.gaussian_link0_mem))
+            "resources.gaussian.link0_mem "
+            + repr(str(config.resources.gaussian_link0_mem_for()))
             + " exceeds "
-            + str(config.resources.gaussian_memory_fraction_of_slurm)
+            + str(config.resources.gaussian_memory_fraction_of_slurm_for())
             + " of the resolved Link0 Gaussian Slurm allocation "
-            + "(resources.gaussian_mem_per_cpu="
+            + "(resources.gaussian.mem_per_cpu="
             + repr(str(resolved.mem_per_cpu))
-            + ", resources.gaussian_cpus_per_task="
+            + ", resources.gaussian.cpus_per_task="
             + str(int(resolved.cpus_per_task))
             + ")"
         )

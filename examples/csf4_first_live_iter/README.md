@@ -197,7 +197,26 @@ csf4:
       multinode: 4
     parallel_environments:
       serial: [1, 1]
-      multicore: [2, 32]
+      multicore: [2, 40]
+    partitions:
+      serial:
+        min_cpus: 1
+        max_cpus: 1
+        memory_per_core_gb: 4
+        max_walltime_hours: 168
+        daemon_supported: true
+      multicore:
+        min_cpus: 2
+        max_cpus: 40
+        memory_per_core_gb: 4
+        max_walltime_hours: 168
+        daemon_supported: true
+      multinode:
+        min_cpus: 2
+        max_cpus: 10000
+        memory_per_core_gb: 4
+        max_walltime_hours: 168
+        daemon_supported: false
 
   software:
 
@@ -287,7 +306,7 @@ A minimal `campaign.yaml` (also shipped at
 `examples/csf4_first_live_iter/campaign.yaml`):
 
 ```yaml
-schema_version: 3
+schema_version: 4
 
 max_iterations: 1
 poll_interval_seconds: 60
@@ -305,26 +324,24 @@ seed_selection:
   bulk_fraction: 0.5
 
 resources:
-  partition: multicore
-  default_walltime_hours: 2
-  polus_walltime_hours: 1
-  gaussian_walltime_hours: 2
-  aimall_walltime_hours: 2
-  ariadne_walltime_hours: 1
-  ferebus_walltime_hours: 2
-  polus_cpus_per_task: auto
-  gaussian_cpus_per_task: auto
-  aimall_cpus_per_task: auto
-  ariadne_cpus_per_task: auto
-  ferebus_cpus_per_task: auto
-  polus_mem_per_cpu: auto
-  gaussian_mem_per_cpu: auto
-  aimall_mem_per_cpu: auto
-  ariadne_mem_per_cpu: auto
-  ferebus_mem_per_cpu: auto
-  gaussian_memory_mode: slurm_env
-  gaussian_link0_mem: 8GB
-  gaussian_memory_fraction_of_slurm: 0.85
+  defaults:
+    partition: multicore
+    walltime_hours: 2
+    cpus_per_task: auto
+    mem_per_cpu: auto
+  polus:
+    walltime_hours: 1
+  gaussian:
+    walltime_hours: 2
+    memory_mode: slurm_env
+    link0_mem: 8GB
+    memory_fraction_of_slurm: 0.85
+  aimall:
+    walltime_hours: 2
+  ariadne:
+    walltime_hours: 1
+  ferebus:
+    walltime_hours: 2
   array_concurrency_limit: null
 
 gaussian:

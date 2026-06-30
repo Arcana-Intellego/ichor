@@ -20,6 +20,7 @@ cluster is touched.
 """
 from __future__ import annotations
 
+import math
 import subprocess
 import os
 import shlex
@@ -237,23 +238,24 @@ def _validate_generated_pyferebus_artifacts(
     return script
 
 
-def _format_slurm_walltime_hours(walltime_hours: int) -> str:
+def _format_slurm_walltime_hours(walltime_hours) -> str:
     try:
-        hours = int(walltime_hours)
+        total_seconds = int(math.ceil(float(walltime_hours) * 3600.0))
     except (TypeError, ValueError) as exc:
-        raise FerebusSubmissionError("FEREBUS walltime_hours must be an integer") from exc
-    if hours <= 0:
+        raise FerebusSubmissionError("FEREBUS walltime_hours must be a positive number") from exc
+    if total_seconds <= 0:
         raise FerebusSubmissionError("FEREBUS walltime_hours must be > 0")
-    days, rem_hours = divmod(hours, 24)
-    if hours > 24:
-        return str(days) + "-" + str(rem_hours).zfill(2) + ":00:00"
-    return str(hours) + ":00:00"
+    days, rem = divmod(total_seconds, 24 * 3600)
+    hh, rem = divmod(rem, 3600)
+    mm, ss = divmod(rem, 60)
+    clock = f"{hh:02d}:{mm:02d}:{ss:02d}"
+    return str(days) + "-" + clock if days else clock
 
 
 def _harden_generated_script(
     script: Path,
     *,
-    walltime_hours: int,
+    walltime_hours,
     partition: Optional[str],
     mem_per_cpu: Optional[str],
     cpus_per_task: Optional[int],
@@ -387,7 +389,7 @@ def _patch_generated_executable(script: Path, path_to_executable: Union[str, Pat
 
 def _resolve_model_kwargs(
     transfer_learning: bool,
-    walltime_hours: int,
+    walltime_hours,
     ncores: int,
     kernel: str,
     loss: str,
@@ -402,7 +404,7 @@ def _resolve_model_kwargs(
 ) -> Dict[str, Any]:
     merged: Dict[str, Any] = dict(_DEFAULT_MODEL_KWARGS)
     merged["transfer_learning"] = bool(transfer_learning)
-    merged["wallTime"] = int(walltime_hours)
+    merged["wallTime"] = max(1, int(math.ceil(float(walltime_hours))))
     merged["ncores"] = int(ncores)
     merged["kernel"] = str(kernel)
     merged["loss"] = str(loss)
@@ -441,7 +443,7 @@ def submit_ferebus(
     working_directory: Union[str, Path],
     *,
     platform: str = "CSF4",
-    walltime_hours: int = 24,
+    walltime_hours=24,
     ncores: int = 16,
     partition: Optional[str] = None,
     mem_per_cpu: Optional[str] = None,

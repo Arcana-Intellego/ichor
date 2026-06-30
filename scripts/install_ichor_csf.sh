@@ -1127,7 +1127,50 @@ if machine == "csf3":
                 "multicore_small": 5,
                 "himem": 32,
             },
-            "parallel_environments": {"serial": [1, 1], "multicore": [2, 168]},
+            "parallel_environments": {
+                "serial": [1, 1],
+                "multicore": [2, 168],
+                "interactive": [1, 168],
+                "multicore_small": [2, 32],
+                "himem": [1, 32],
+            },
+            "partitions": {
+                "multicore": {
+                    "min_cpus": 2,
+                    "max_cpus": 168,
+                    "memory_per_core_gb": 8,
+                    "max_walltime_hours": 168,
+                    "daemon_supported": True,
+                },
+                "interactive": {
+                    "min_cpus": 1,
+                    "max_cpus": 168,
+                    "memory_per_core_gb": 8,
+                    "max_walltime_hours": 24,
+                    "daemon_supported": True,
+                },
+                "multicore_small": {
+                    "min_cpus": 2,
+                    "max_cpus": 32,
+                    "memory_per_core_gb": 5,
+                    "max_walltime_hours": 168,
+                    "daemon_supported": True,
+                },
+                "serial": {
+                    "min_cpus": 1,
+                    "max_cpus": 1,
+                    "memory_per_core_gb": 5,
+                    "max_walltime_hours": 168,
+                    "daemon_supported": True,
+                },
+                "himem": {
+                    "min_cpus": 1,
+                    "max_cpus": 32,
+                    "memory_per_core_gb": 32,
+                    "max_walltime_hours": 168,
+                    "daemon_supported": True,
+                },
+            },
         },
         "software": {
             "python": {"env_name": "ichor-csf3", "python_path": python_path, "modules": []},
@@ -1159,7 +1202,30 @@ else:
                 "multicore": 4,
                 "multinode": 4,
             },
-            "parallel_environments": {"serial": [1, 1], "multicore": [2, 32]},
+            "parallel_environments": {"serial": [1, 1], "multicore": [2, 40]},
+            "partitions": {
+                "serial": {
+                    "min_cpus": 1,
+                    "max_cpus": 1,
+                    "memory_per_core_gb": 4,
+                    "max_walltime_hours": 168,
+                    "daemon_supported": True,
+                },
+                "multicore": {
+                    "min_cpus": 2,
+                    "max_cpus": 40,
+                    "memory_per_core_gb": 4,
+                    "max_walltime_hours": 168,
+                    "daemon_supported": True,
+                },
+                "multinode": {
+                    "min_cpus": 2,
+                    "max_cpus": 10000,
+                    "memory_per_core_gb": 4,
+                    "max_walltime_hours": 168,
+                    "daemon_supported": False,
+                },
+            },
         },
         "software": {
             "python": {

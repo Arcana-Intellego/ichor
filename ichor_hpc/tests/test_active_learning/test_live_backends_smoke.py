@@ -319,7 +319,7 @@ def test_link0_gaussian_memory_validates_after_auto_resolution(monkeypatch):
     cfg.resources.gaussian_cpus_per_task = 1
     cfg.resources.gaussian_link0_mem = "8GB"
 
-    with pytest.raises(BackendSubmissionError, match="gaussian_link0_mem"):
+    with pytest.raises(BackendSubmissionError, match="gaussian.link0_mem"):
         build_sbatch_script(
             phase_name="INITIAL_GAUSSIAN",
             iteration=0,
@@ -715,7 +715,7 @@ def test_profile_memory_auto_resolves_csf4_partition_cap(monkeypatch):
     assert "export GAUSS_MDEF=6GB" in body
 
 
-@pytest.mark.parametrize(("machine", "max_cores"), [("csf3", 168), ("csf4", 32)])
+@pytest.mark.parametrize(("machine", "max_cores"), [("csf3", 168), ("csf4", 40)])
 def test_multicore_one_core_request_fails_before_sbatch(monkeypatch, machine, max_cores):
     _install_fake_global_variables(
         monkeypatch,
@@ -798,6 +798,111 @@ def test_serial_one_core_request_passes_profile_range_check(monkeypatch):
     assert "#SBATCH --cpus-per-task=1" in body
 
 
+def test_backend_partition_override_uses_grouped_resource_partition(monkeypatch):
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf3": {
+                "hpc": {
+                    "scheduler": "slurm",
+                    "partitions": {
+                        "multicore": {
+                            "min_cpus": 2,
+                            "max_cpus": 168,
+                            "memory_per_core_gb": 8,
+                            "max_walltime_hours": 168,
+                            "daemon_supported": True,
+                        },
+                        "interactive": {
+                            "min_cpus": 1,
+                            "max_cpus": 168,
+                            "memory_per_core_gb": 8,
+                            "max_walltime_hours": 24,
+                            "daemon_supported": True,
+                        },
+                    },
+                }
+            }
+        },
+        "csf3",
+    )
+    cfg = CampaignConfig()
+    cfg.resources.defaults.partition = "multicore"
+    cfg.resources.polus.partition = "interactive"
+    cfg.resources.polus.cpus_per_task = 1
+    body = build_sbatch_script(
+        phase_name="PHASE_A_POLUS",
+        iteration=0,
+        campaign_dir=Path("/scratch/campaign"),
+        config=cfg,
+    )
+    assert "#SBATCH --partition=interactive" in body
+
+
+def test_unknown_partition_fails_against_active_profile(monkeypatch):
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf3": {
+                "hpc": {
+                    "scheduler": "slurm",
+                    "partitions": {
+                        "multicore": {
+                            "min_cpus": 2,
+                            "max_cpus": 168,
+                            "memory_per_core_gb": 8,
+                            "max_walltime_hours": 168,
+                            "daemon_supported": True,
+                        },
+                    },
+                }
+            }
+        },
+        "csf3",
+    )
+    cfg = CampaignConfig()
+    cfg.resources.polus.partition = "multinode"
+    with pytest.raises(BackendSubmissionError, match="not present"):
+        build_sbatch_script(
+            phase_name="PHASE_A_POLUS",
+            iteration=0,
+            campaign_dir=Path("/scratch/campaign"),
+            config=cfg,
+        )
+
+
+def test_unsupported_profile_partition_fails_before_sbatch(monkeypatch):
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf4": {
+                "hpc": {
+                    "scheduler": "slurm",
+                    "partitions": {
+                        "multinode": {
+                            "min_cpus": 2,
+                            "max_cpus": 10000,
+                            "memory_per_core_gb": 4,
+                            "max_walltime_hours": 168,
+                            "daemon_supported": False,
+                        },
+                    },
+                }
+            }
+        },
+        "csf4",
+    )
+    cfg = CampaignConfig()
+    cfg.resources.defaults.partition = "multinode"
+    with pytest.raises(BackendSubmissionError, match="not supported"):
+        build_sbatch_script(
+            phase_name="PHASE_A_POLUS",
+            iteration=0,
+            campaign_dir=Path("/scratch/campaign"),
+            config=cfg,
+        )
+
+
 def test_gaussian_cpus_must_fit_live_profile_range(monkeypatch):
     _install_fake_global_variables(
         monkeypatch,
@@ -815,7 +920,7 @@ def test_gaussian_cpus_must_fit_live_profile_range(monkeypatch):
     cfg.resources.partition = "multicore"
     cfg.resources.gaussian_cpus_per_task = 8
 
-    with pytest.raises(BackendSubmissionError, match="gaussian_cpus_per_task"):
+    with pytest.raises(BackendSubmissionError, match="gaussian.cpus_per_task"):
         build_sbatch_script(
             phase_name="INITIAL_GAUSSIAN",
             iteration=0,
@@ -888,7 +993,7 @@ def test_build_sbatch_script_uses_yaml_scheduler_resources_by_default():
         config=cfg,
     )
     assert "#SBATCH --partition=csf4-debug" in body
-    assert "#SBATCH --time=7:00:00" in body
+    assert "#SBATCH --time=07:00:00" in body
 
 
 def test_build_sbatch_script_explicit_scheduler_overrides_win():
@@ -906,7 +1011,7 @@ def test_build_sbatch_script_explicit_scheduler_overrides_win():
     assert "#SBATCH --partition=explicit-partition" in body
     assert "#SBATCH --time=11:00:00" in body
     assert "yaml-partition" not in body
-    assert "#SBATCH --time=7:00:00" not in body
+    assert "#SBATCH --time=07:00:00" not in body
 
 
 def test_build_sbatch_script_uses_phase_walltime_override():
@@ -916,33 +1021,45 @@ def test_build_sbatch_script_uses_phase_walltime_override():
     cfg.resources.aimall_walltime_hours = 4
     cfg.resources.ariadne_walltime_hours = 5
     cfg.resources.polus_walltime_hours = 6
-    assert "#SBATCH --time=3:00:00" in build_sbatch_script(
+    assert "#SBATCH --time=03:00:00" in build_sbatch_script(
         phase_name="GAUSSIAN",
         iteration=1,
         campaign_dir=Path("/scratch/campaign"),
         config=cfg,
         array_size=1,
     )
-    assert "#SBATCH --time=4:00:00" in build_sbatch_script(
+    assert "#SBATCH --time=04:00:00" in build_sbatch_script(
         phase_name="AIMALL",
         iteration=1,
         campaign_dir=Path("/scratch/campaign"),
         config=cfg,
         array_size=1,
     )
-    assert "#SBATCH --time=5:00:00" in build_sbatch_script(
+    assert "#SBATCH --time=05:00:00" in build_sbatch_script(
         phase_name="ARIADNE_ARRAY",
         iteration=1,
         campaign_dir=Path("/scratch/campaign"),
         config=cfg,
         array_size=1,
     )
-    assert "#SBATCH --time=6:00:00" in build_sbatch_script(
+    assert "#SBATCH --time=06:00:00" in build_sbatch_script(
         phase_name="PHASE_B_POLUS",
         iteration=1,
         campaign_dir=Path("/scratch/campaign"),
         config=cfg,
     )
+
+
+def test_fractional_walltime_renders_minutes():
+    cfg = CampaignConfig()
+    cfg.resources.polus.walltime_hours = 0.25
+    body = build_sbatch_script(
+        phase_name="PHASE_B_POLUS",
+        iteration=1,
+        campaign_dir=Path("/scratch/campaign"),
+        config=cfg,
+    )
+    assert "#SBATCH --time=00:15:00" in body
 
 
 def test_ariadne_auto_cpus_match_active_fd_worker_count(monkeypatch):

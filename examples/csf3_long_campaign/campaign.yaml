@@ -1,4 +1,4 @@
-schema_version: 3
+schema_version: 4
 system_name: ICHOR_CSF3_LONG_CAMPAIGN
 max_iterations: 20
 
@@ -18,9 +18,11 @@ batch_sizing:
   cap: 24
 
 resources:
-  partition: multicore
+  defaults:
+    partition: multicore
+  gaussian:
+    memory_mode: slurm_env
   array_concurrency_limit: 8
-  gaussian_memory_mode: slurm_env
 
 adversarial_safety:
   accept_legacy_missing_landing_safety: false

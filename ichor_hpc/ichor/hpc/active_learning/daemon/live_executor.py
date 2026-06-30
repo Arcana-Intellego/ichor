@@ -63,6 +63,7 @@ from .resource_solver import (
     gaussian_mdef_gb,
     resolve_phase_resources,
     validate_gaussian_link0_memory,
+    validate_partition_walltime,
 )
 from .preflight import BackendAvailability, check_backends, missing_backend_message
 from .cluster_profile import (
@@ -88,6 +89,20 @@ __all__ = [
 DEFAULT_DAEMON_PYTHON_MODULES: List[str] = [
     "python/3.11.3-gcccore-12.3.0",
 ]
+
+
+def _format_slurm_walltime_hours(hours: Any) -> str:
+    try:
+        total_seconds = int(math.ceil(float(hours) * 3600.0))
+    except (TypeError, ValueError) as exc:
+        raise BackendSubmissionError("walltime_hours must be a positive number") from exc
+    if total_seconds <= 0:
+        raise BackendSubmissionError("walltime_hours must be > 0")
+    days, rem = divmod(total_seconds, 24 * 3600)
+    hh, rem = divmod(rem, 3600)
+    mm, ss = divmod(rem, 60)
+    clock = f"{hh:02d}:{mm:02d}:{ss:02d}"
+    return str(days) + "-" + clock if days else clock
 
 DEFAULT_DAEMON_ARIADNE_RUNTIME_MODULES: List[str] = [
     "compilers/oneapi/2024.2.0",
@@ -570,7 +585,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
     """
 
     sbatch_runner: Callable[..., Any] = subprocess.run
-    walltime_hours: Optional[int] = None
+    walltime_hours: Optional[float] = None
     partition: Optional[str] = None
     backend_check: bool = True
     strict_committed_artifact_verification: bool = True
@@ -824,7 +839,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         effective_partition = (
             str(self.partition)
             if self.partition is not None
-            else str(getattr(self.config.resources, "partition", "multicore"))
+            else str(self.config.resources.partition_for(phase_name))
         )
         if phase_name in ("INITIAL_GAUSSIAN", "GAUSSIAN"):
             sample = self._locate_sample_xyz(phase_name, it)
@@ -892,7 +907,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             effective_partition = (
                 str(self.partition)
                 if self.partition is not None
-                else str(getattr(resources, "partition", "multicore"))
+                else str(resources.partition_for(phase_name))
             )
             resolved = resolve_phase_resources(
                 phase_name=phase_name,
@@ -926,9 +941,9 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 int(getattr(state, "iteration", 0)),
             )
             effective_walltime = (
-                int(self.walltime_hours)
+                self.walltime_hours
                 if self.walltime_hours is not None
-                else int(resources.walltime_for(phase_name) if resources is not None else 24)
+                else resources.walltime_for(phase_name) if resources is not None else 24
             )
             submission = submit_ferebus(
                 staging / _stg.FEREBUS_JOB_DETAILS,
@@ -1230,7 +1245,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         effective_partition = (
             str(self.partition)
             if self.partition is not None
-            else str(getattr(self.config.resources, "partition", "multicore"))
+            else str(self.config.resources.partition_for(phase_name))
         )
         resolved = resolve_phase_resources(
             phase_name=phase_name,
@@ -3263,7 +3278,7 @@ def build_sbatch_script(
     campaign_dir: Path,
     config: CampaignConfig,
     array_size: Optional[int] = None,
-    walltime_hours: Optional[int] = None,
+    walltime_hours: Optional[float] = None,
     partition: Optional[str] = None,
     campaign_uid: Optional[str] = None,
     resolved_resources: Optional[ResolvedPhaseResources] = None,
@@ -3280,7 +3295,7 @@ def build_sbatch_script(
     """
     _configured_scheduler()
     res = config.resources
-    part = str(partition if partition is not None else res.partition)
+    part = str(partition if partition is not None else res.partition_for(phase_name))
     resolved = resolved_resources or resolve_phase_resources(
         phase_name=phase_name,
         config=config,
@@ -3290,6 +3305,7 @@ def build_sbatch_script(
         array_size=array_size,
     )
     wall = walltime_hours if walltime_hours is not None else res.walltime_for(phase_name)
+    validate_partition_walltime(str(resolved.partition), wall)
     cpus = int(resolved.cpus_per_task)
     ntasks = int(resolved.ntasks)
     mem_per_cpu = str(resolved.mem_per_cpu)
@@ -3318,7 +3334,7 @@ def build_sbatch_script(
         _configured_jobscript_shebang(),
         "#SBATCH --job-name=" + job_name,
         "#SBATCH --partition=" + str(resolved.partition),
-        "#SBATCH --time=" + str(int(wall)) + ":00:00",
+        "#SBATCH --time=" + _format_slurm_walltime_hours(wall),
         "#SBATCH --mem-per-cpu=" + str(mem_per_cpu),
         "#SBATCH --cpus-per-task=" + str(int(cpus)),
         "#SBATCH --ntasks=" + str(int(ntasks)),
@@ -3402,7 +3418,7 @@ def _gaussian_invocation_block(
     )
     gaussian_exe = _configured_backend_shell_executable("gaussian", "g16")
     mdef_gb = gaussian_mdef_gb(config, resolved_resources)
-    gaussian_memory_mode = str(config.resources.gaussian_memory_mode).strip().lower()
+    gaussian_memory_mode = str(config.resources.gaussian_memory_mode_for()).strip().lower()
     memory_lines: List[str]
     if gaussian_memory_mode == "slurm_env":
         memory_lines = [

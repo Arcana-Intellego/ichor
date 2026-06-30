@@ -1,17 +1,21 @@
-"""Campaign configuration -- schema v3.
+"""Campaign configuration -- schema v4.
 
-Schema v3 keeps scientific settings and batch-system resources separate.
-Gaussian contains level-of-theory/input choices only; Slurm CPU, memory, and
-Gaussian runtime-memory policy live under resources.
+Schema v4 keeps scientific settings and grouped batch-system resources
+separate. Gaussian contains level-of-theory/input choices only; Slurm CPU,
+memory, partition, and Gaussian runtime-memory policy live under resources.
 """
 from __future__ import annotations
 
-import copy
 import re
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+from .campaign_migrations import (
+    CURRENT_SCHEMA_VERSION,
+    CampaignMigrationError,
+    migrate_campaign_payload,
+)
 from .config_dataclass import DataclassParseError, parse_dataclass_block
 
 
@@ -45,6 +49,9 @@ __all__ = [
     "QualityGatesConfigBlock",
     "RuntimeConfigBlock",
     "StopConfigBlock",
+    "ResourceDefaultsBlock",
+    "BackendResourceBlock",
+    "GaussianResourceBlock",
     "CONFIG_SCHEMA_VERSION",
     "ConfigValidationError",
     "AimallConfigBlock",
@@ -77,7 +84,7 @@ __all__ = [
 ]
 
 
-CONFIG_SCHEMA_VERSION = 3
+CONFIG_SCHEMA_VERSION = CURRENT_SCHEMA_VERSION
 
 
 class ConfigValidationError(ValueError):
@@ -151,6 +158,13 @@ def _validate_positive_int(name: str, value: Any) -> None:
             name + " must be a positive integer, got " + type(value).__name__
         )
     if value <= 0:
+        raise ConfigValidationError(name + " must be > 0")
+
+
+def _validate_positive_walltime(name: str, value: Any) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigValidationError(name + " must be a positive number of hours")
+    if float(value) <= 0.0:
         raise ConfigValidationError(name + " must be > 0")
 
 
@@ -662,40 +676,56 @@ class StopConfigBlock:
 
 
 @dataclass
-class ResourceConfigBlock:
-    # Slurm resources for live phases. Schema v3 is explicit: every backend has
-    # its own CPU and memory field so there is no hidden generic CPU fallback.
-    # The string "auto" is resolved by the live resource solver against the
-    # active cluster profile, staged artefacts, and backend-specific scaling.
+class ResourceDefaultsBlock:
     partition: str = "multicore"
-    default_walltime_hours: int = 24
-    polus_walltime_hours: Optional[int] = None
-    gaussian_walltime_hours: Optional[int] = None
-    aimall_walltime_hours: Optional[int] = None
-    ariadne_walltime_hours: Optional[int] = None
-    ferebus_walltime_hours: Optional[int] = None
+    walltime_hours: Union[int, float] = 24
+    cpus_per_task: Union[int, str] = "auto"
+    mem_per_cpu: str = "auto"
 
-    polus_cpus_per_task: Union[int, str] = "auto"
-    gaussian_cpus_per_task: Union[int, str] = "auto"
-    aimall_cpus_per_task: Union[int, str] = "auto"
-    ariadne_cpus_per_task: Union[int, str] = "auto"
-    ferebus_cpus_per_task: Union[int, str] = "auto"
 
-    polus_mem_per_cpu: str = "auto"
-    gaussian_mem_per_cpu: str = "auto"
-    aimall_mem_per_cpu: str = "auto"
-    ariadne_mem_per_cpu: str = "auto"
-    ferebus_mem_per_cpu: str = "auto"
+@dataclass
+class BackendResourceBlock:
+    partition: Optional[str] = None
+    walltime_hours: Optional[Union[int, float]] = None
+    cpus_per_task: Optional[Union[int, str]] = None
+    mem_per_cpu: Optional[str] = None
 
-    gaussian_memory_mode: str = "slurm_env"
-    gaussian_link0_mem: str = "8GB"
-    gaussian_memory_fraction_of_slurm: float = 0.85
+
+@dataclass
+class GaussianResourceBlock:
+    partition: Optional[str] = None
+    walltime_hours: Optional[Union[int, float]] = None
+    cpus_per_task: Optional[Union[int, str]] = None
+    mem_per_cpu: Optional[str] = None
+    memory_mode: str = "slurm_env"
+    link0_mem: str = "8GB"
+    memory_fraction_of_slurm: float = 0.85
+
+
+@dataclass
+class ResourceConfigBlock:
+    # Slurm resources for live phases. Schema v4 groups backend-specific
+    # overrides while keeping defaults explicit. A backend value of None means
+    # "inherit from resources.defaults".
+    defaults: ResourceDefaultsBlock = field(default_factory=ResourceDefaultsBlock)
+    polus: BackendResourceBlock = field(default_factory=lambda: BackendResourceBlock(walltime_hours=2))
+    gaussian: GaussianResourceBlock = field(default_factory=lambda: GaussianResourceBlock(walltime_hours=24))
+    aimall: BackendResourceBlock = field(default_factory=BackendResourceBlock)
+    ariadne: BackendResourceBlock = field(default_factory=BackendResourceBlock)
+    ferebus: BackendResourceBlock = field(default_factory=BackendResourceBlock)
 
     array_concurrency_limit: Optional[int] = None
     fail_on_memory_estimate_exceeds_request: bool = True
     # "process" -> node-local process pool sized to the task's cpus-per-task.
     # "serial"  -> force single-core (off-cluster / debugging).
     gradient_parallel_backend: str = "process"
+
+    def _backend_block(self, backend: str):
+        return getattr(self, backend)
+
+    @staticmethod
+    def _inherit(value: Any, fallback: Any) -> Any:
+        return fallback if value is None else value
 
     def backend_for_phase(self, phase_name: str) -> str:
         if phase_name in ("PHASE_A_POLUS", "PHASE_B_POLUS"):
@@ -710,28 +740,234 @@ class ResourceConfigBlock:
             return "ferebus"
         raise ValueError("unknown live backend phase: " + str(phase_name))
 
+    def partition_for(self, phase_name: str) -> str:
+        backend = self.backend_for_phase(phase_name)
+        return str(
+            self._inherit(
+                self._backend_block(backend).partition,
+                self.defaults.partition,
+            )
+        )
+
     def cpus_for(self, phase_name: str) -> Union[int, str]:
         backend = self.backend_for_phase(phase_name)
-        return getattr(self, backend + "_cpus_per_task")
+        return self._inherit(
+            self._backend_block(backend).cpus_per_task,
+            self.defaults.cpus_per_task,
+        )
 
     def mem_per_cpu_for(self, phase_name: str) -> str:
         backend = self.backend_for_phase(phase_name)
-        return str(getattr(self, backend + "_mem_per_cpu"))
+        return str(
+            self._inherit(
+                self._backend_block(backend).mem_per_cpu,
+                self.defaults.mem_per_cpu,
+            )
+        )
 
-    def walltime_for(self, phase_name: str) -> int:
-        if phase_name in ("PHASE_A_POLUS", "PHASE_B_POLUS"):
-            value = self.polus_walltime_hours
-        elif phase_name in ("INITIAL_GAUSSIAN", "GAUSSIAN"):
-            value = self.gaussian_walltime_hours
-        elif phase_name in ("INITIAL_AIMALL", "AIMALL"):
-            value = self.aimall_walltime_hours
-        elif phase_name == "ARIADNE_ARRAY":
-            value = self.ariadne_walltime_hours
-        elif phase_name in ("INITIAL_FEREBUS", "FEREBUS"):
-            value = self.ferebus_walltime_hours
-        else:
-            value = None
-        return int(value if value is not None else self.default_walltime_hours)
+    def walltime_for(self, phase_name: str) -> Union[int, float]:
+        backend = self.backend_for_phase(phase_name)
+        return self._inherit(
+            self._backend_block(backend).walltime_hours,
+            self.defaults.walltime_hours,
+        )
+
+    def gaussian_memory_mode_for(self) -> str:
+        return str(self.gaussian.memory_mode)
+
+    def gaussian_link0_mem_for(self) -> str:
+        return str(self.gaussian.link0_mem)
+
+    def gaussian_memory_fraction_of_slurm_for(self) -> float:
+        return float(self.gaussian.memory_fraction_of_slurm)
+
+    # Backward-compatible Python properties for internal call sites and older
+    # tests. Schema-v4 YAML still rejects these flat keys.
+    @property
+    def partition(self) -> str:
+        return self.defaults.partition
+
+    @partition.setter
+    def partition(self, value: str) -> None:
+        self.defaults.partition = value
+
+    @property
+    def default_walltime_hours(self) -> Union[int, float]:
+        return self.defaults.walltime_hours
+
+    @default_walltime_hours.setter
+    def default_walltime_hours(self, value: Union[int, float]) -> None:
+        self.defaults.walltime_hours = value
+
+    def _get_walltime(self, backend: str):
+        return self._backend_block(backend).walltime_hours
+
+    def _set_walltime(self, backend: str, value) -> None:
+        self._backend_block(backend).walltime_hours = value
+
+    def _get_cpus(self, backend: str):
+        return self._inherit(
+            self._backend_block(backend).cpus_per_task,
+            self.defaults.cpus_per_task,
+        )
+
+    def _set_cpus(self, backend: str, value) -> None:
+        self._backend_block(backend).cpus_per_task = value
+
+    def _get_mem(self, backend: str) -> str:
+        return str(
+            self._inherit(
+                self._backend_block(backend).mem_per_cpu,
+                self.defaults.mem_per_cpu,
+            )
+        )
+
+    def _set_mem(self, backend: str, value: str) -> None:
+        self._backend_block(backend).mem_per_cpu = value
+
+    @property
+    def polus_walltime_hours(self):
+        return self._get_walltime("polus")
+
+    @polus_walltime_hours.setter
+    def polus_walltime_hours(self, value):
+        self._set_walltime("polus", value)
+
+    @property
+    def gaussian_walltime_hours(self):
+        return self._get_walltime("gaussian")
+
+    @gaussian_walltime_hours.setter
+    def gaussian_walltime_hours(self, value):
+        self._set_walltime("gaussian", value)
+
+    @property
+    def aimall_walltime_hours(self):
+        return self._get_walltime("aimall")
+
+    @aimall_walltime_hours.setter
+    def aimall_walltime_hours(self, value):
+        self._set_walltime("aimall", value)
+
+    @property
+    def ariadne_walltime_hours(self):
+        return self._get_walltime("ariadne")
+
+    @ariadne_walltime_hours.setter
+    def ariadne_walltime_hours(self, value):
+        self._set_walltime("ariadne", value)
+
+    @property
+    def ferebus_walltime_hours(self):
+        return self._get_walltime("ferebus")
+
+    @ferebus_walltime_hours.setter
+    def ferebus_walltime_hours(self, value):
+        self._set_walltime("ferebus", value)
+
+    @property
+    def polus_cpus_per_task(self):
+        return self._get_cpus("polus")
+
+    @polus_cpus_per_task.setter
+    def polus_cpus_per_task(self, value):
+        self._set_cpus("polus", value)
+
+    @property
+    def gaussian_cpus_per_task(self):
+        return self._get_cpus("gaussian")
+
+    @gaussian_cpus_per_task.setter
+    def gaussian_cpus_per_task(self, value):
+        self._set_cpus("gaussian", value)
+
+    @property
+    def aimall_cpus_per_task(self):
+        return self._get_cpus("aimall")
+
+    @aimall_cpus_per_task.setter
+    def aimall_cpus_per_task(self, value):
+        self._set_cpus("aimall", value)
+
+    @property
+    def ariadne_cpus_per_task(self):
+        return self._get_cpus("ariadne")
+
+    @ariadne_cpus_per_task.setter
+    def ariadne_cpus_per_task(self, value):
+        self._set_cpus("ariadne", value)
+
+    @property
+    def ferebus_cpus_per_task(self):
+        return self._get_cpus("ferebus")
+
+    @ferebus_cpus_per_task.setter
+    def ferebus_cpus_per_task(self, value):
+        self._set_cpus("ferebus", value)
+
+    @property
+    def polus_mem_per_cpu(self):
+        return self._get_mem("polus")
+
+    @polus_mem_per_cpu.setter
+    def polus_mem_per_cpu(self, value):
+        self._set_mem("polus", value)
+
+    @property
+    def gaussian_mem_per_cpu(self):
+        return self._get_mem("gaussian")
+
+    @gaussian_mem_per_cpu.setter
+    def gaussian_mem_per_cpu(self, value):
+        self._set_mem("gaussian", value)
+
+    @property
+    def aimall_mem_per_cpu(self):
+        return self._get_mem("aimall")
+
+    @aimall_mem_per_cpu.setter
+    def aimall_mem_per_cpu(self, value):
+        self._set_mem("aimall", value)
+
+    @property
+    def ariadne_mem_per_cpu(self):
+        return self._get_mem("ariadne")
+
+    @ariadne_mem_per_cpu.setter
+    def ariadne_mem_per_cpu(self, value):
+        self._set_mem("ariadne", value)
+
+    @property
+    def ferebus_mem_per_cpu(self):
+        return self._get_mem("ferebus")
+
+    @ferebus_mem_per_cpu.setter
+    def ferebus_mem_per_cpu(self, value):
+        self._set_mem("ferebus", value)
+
+    @property
+    def gaussian_memory_mode(self):
+        return self.gaussian.memory_mode
+
+    @gaussian_memory_mode.setter
+    def gaussian_memory_mode(self, value):
+        self.gaussian.memory_mode = value
+
+    @property
+    def gaussian_link0_mem(self):
+        return self.gaussian.link0_mem
+
+    @gaussian_link0_mem.setter
+    def gaussian_link0_mem(self, value):
+        self.gaussian.link0_mem = value
+
+    @property
+    def gaussian_memory_fraction_of_slurm(self):
+        return self.gaussian.memory_fraction_of_slurm
+
+    @gaussian_memory_fraction_of_slurm.setter
+    def gaussian_memory_fraction_of_slurm(self, value):
+        self.gaussian.memory_fraction_of_slurm = value
 
 
 @dataclass
@@ -747,158 +983,6 @@ class GaussianConfigBlock:
     extra_keywords: str = ""
 
 
-_DEPRECATED_SCHEMA_V3_FIELDS = {
-    "resources.walltime_hours",
-    "resources.mem_per_cpu",
-    "resources.ntasks",
-    "resources.cpus_per_task",
-    "gaussian.nproc",
-    "gaussian.mem",
-    "gaussian.memory_mode",
-    "gaussian.memory_fraction_of_slurm",
-}
-
-
-def _same_config_value(a: Any, b: Any) -> bool:
-    if isinstance(a, str) or isinstance(b, str):
-        return str(a).strip().lower() == str(b).strip().lower()
-    return a == b
-
-
-def _set_migrated_value(
-    target: Dict[str, Any],
-    key: str,
-    value: Any,
-    *,
-    source_path: str,
-    target_path: str,
-) -> None:
-    if key in target:
-        if not _same_config_value(target[key], value):
-            raise ConfigValidationError(
-                "Conflicting campaign resource settings: "
-                + source_path
-                + "="
-                + repr(value)
-                + " but "
-                + target_path
-                + "="
-                + repr(target[key])
-                + ". Use only "
-                + target_path
-                + "."
-            )
-        return
-    target[key] = value
-
-
-def _migrate_schema_v2_to_v3(data: Dict[str, Any]) -> Dict[str, Any]:
-    migrated = copy.deepcopy(data)
-    migrated["schema_version"] = CONFIG_SCHEMA_VERSION
-    resources = migrated.setdefault("resources", {})
-    gaussian = migrated.setdefault("gaussian", {})
-    if not isinstance(resources, dict):
-        raise ConfigValidationError("resources must be a mapping")
-    if not isinstance(gaussian, dict):
-        raise ConfigValidationError("gaussian must be a mapping")
-
-    if "walltime_hours" in resources:
-        _set_migrated_value(
-            resources,
-            "default_walltime_hours",
-            resources.pop("walltime_hours"),
-            source_path="resources.walltime_hours",
-            target_path="resources.default_walltime_hours",
-        )
-    if "ntasks" in resources:
-        old_ntasks = resources.pop("ntasks")
-        try:
-            ntasks_int = int(old_ntasks)
-        except (TypeError, ValueError) as exc:
-            raise ConfigValidationError(
-                "resources.ntasks in schema v2 must be 1 to migrate to schema v3"
-            ) from exc
-        if ntasks_int != 1:
-            raise ConfigValidationError(
-                "resources.ntasks="
-                + repr(old_ntasks)
-                + " cannot migrate to schema v3; current live backends support "
-                "only --ntasks=1"
-            )
-    if "mem_per_cpu" in resources:
-        old_mem = resources.pop("mem_per_cpu")
-        for backend in ("polus", "gaussian", "aimall", "ariadne", "ferebus"):
-            _set_migrated_value(
-                resources,
-                backend + "_mem_per_cpu",
-                old_mem,
-                source_path="resources.mem_per_cpu",
-                target_path="resources." + backend + "_mem_per_cpu",
-            )
-    old_cpus = resources.pop("cpus_per_task", None)
-    old_gaussian_nproc = gaussian.pop("nproc", None)
-    if old_cpus is not None:
-        for backend in ("polus", "ferebus"):
-            _set_migrated_value(
-                resources,
-                backend + "_cpus_per_task",
-                old_cpus,
-                source_path="resources.cpus_per_task",
-                target_path="resources." + backend + "_cpus_per_task",
-            )
-        if old_gaussian_nproc is None:
-            _set_migrated_value(
-                resources,
-                "gaussian_cpus_per_task",
-                old_cpus,
-                source_path="resources.cpus_per_task",
-                target_path="resources.gaussian_cpus_per_task",
-            )
-    if old_gaussian_nproc is not None:
-        _set_migrated_value(
-            resources,
-            "gaussian_cpus_per_task",
-            old_gaussian_nproc,
-            source_path="gaussian.nproc",
-            target_path="resources.gaussian_cpus_per_task",
-        )
-    gaussian_resource_moves = {
-        "mem": "gaussian_link0_mem",
-        "memory_mode": "gaussian_memory_mode",
-        "memory_fraction_of_slurm": "gaussian_memory_fraction_of_slurm",
-    }
-    for old_key, new_key in gaussian_resource_moves.items():
-        if old_key in gaussian:
-            _set_migrated_value(
-                resources,
-                new_key,
-                gaussian.pop(old_key),
-                source_path="gaussian." + old_key,
-                target_path="resources." + new_key,
-            )
-    return migrated
-
-
-def _reject_schema_v3_deprecated_fields(data: Dict[str, Any]) -> None:
-    resources = data.get("resources")
-    gaussian = data.get("gaussian")
-    present: List[str] = []
-    if isinstance(resources, dict):
-        for key in ("walltime_hours", "mem_per_cpu", "ntasks", "cpus_per_task"):
-            if key in resources:
-                present.append("resources." + key)
-    if isinstance(gaussian, dict):
-        for key in ("nproc", "mem", "memory_mode", "memory_fraction_of_slurm"):
-            if key in gaussian:
-                present.append("gaussian." + key)
-    if present:
-        raise ConfigValidationError(
-            "schema v3 no longer accepts deprecated resource fields "
-            + repr(sorted(present))
-            + "; use backend-specific fields under resources"
-        )
-
-
 @dataclass
 class AimallConfigBlock:
     encomp: int = 3
@@ -910,7 +994,7 @@ class AimallConfigBlock:
 
 @dataclass
 class CampaignConfig:
-    """Top-level campaign configuration (schema v3)."""
+    """Top-level campaign configuration (schema v4)."""
 
     schema_version: int = CONFIG_SCHEMA_VERSION
 
@@ -982,18 +1066,9 @@ class CampaignConfig:
                 "campaign.yaml must be a mapping at the top level"
             )
         try:
-            schema = int(data.get("schema_version", -1))
-        except (TypeError, ValueError) as exc:
-            raise ConfigValidationError("campaign.yaml schema_version must be an integer") from exc
-        if schema == 2:
-            data = _migrate_schema_v2_to_v3(data)
-            schema = CONFIG_SCHEMA_VERSION
-        if schema != CONFIG_SCHEMA_VERSION:
-            raise ConfigValidationError(
-                "campaign.yaml schema_version " + str(schema)
-                + " != " + str(CONFIG_SCHEMA_VERSION)
-            )
-        _reject_schema_v3_deprecated_fields(data)
+            data = migrate_campaign_payload(data)
+        except (CampaignMigrationError, ValueError) as exc:
+            raise ConfigValidationError(str(exc)) from exc
         try:
             inst = parse_dataclass_block(cls, data)
         except DataclassParseError as exc:
@@ -1043,49 +1118,51 @@ class CampaignConfig:
             "a filename-safe token matching ^[A-Za-z0-9][A-Za-z0-9_-]*$",
         )
         _validate_token(
-            "resources.partition",
-            self.resources.partition,
+            "resources.defaults.partition",
+            self.resources.defaults.partition,
             _SCHEDULER_TOKEN_RE,
             "a scheduler token containing only letters, numbers, '.', '_', ':' and '-'",
         )
-        _validate_positive_int(
-            "resources.default_walltime_hours",
-            self.resources.default_walltime_hours,
+        _validate_positive_walltime(
+            "resources.defaults.walltime_hours",
+            self.resources.defaults.walltime_hours,
         )
-        for _name in (
-            "polus_walltime_hours",
-            "gaussian_walltime_hours",
-            "aimall_walltime_hours",
-            "ariadne_walltime_hours",
-            "ferebus_walltime_hours",
-        ):
-            _value = getattr(self.resources, _name)
-            if _value is not None:
-                _validate_positive_int("resources." + _name, _value)
-        for _name in (
-            "polus_cpus_per_task",
-            "gaussian_cpus_per_task",
-            "aimall_cpus_per_task",
-            "ariadne_cpus_per_task",
-            "ferebus_cpus_per_task",
-        ):
-            _validate_positive_int_or_auto(
-                "resources." + _name,
-                getattr(self.resources, _name),
-            )
-        for _name in (
-            "polus_mem_per_cpu",
-            "gaussian_mem_per_cpu",
-            "aimall_mem_per_cpu",
-            "ariadne_mem_per_cpu",
-            "ferebus_mem_per_cpu",
-        ):
-            _validate_memory(
-                "resources." + _name,
-                getattr(self.resources, _name),
-                _SLURM_MEMORY_RE,
-                "SLURM memory syntax such as 4G or 4000M, or auto",
-            )
+        _validate_positive_int_or_auto(
+            "resources.defaults.cpus_per_task",
+            self.resources.defaults.cpus_per_task,
+        )
+        _validate_memory(
+            "resources.defaults.mem_per_cpu",
+            self.resources.defaults.mem_per_cpu,
+            _SLURM_MEMORY_RE,
+            "SLURM memory syntax such as 4G or 4000M, or auto",
+        )
+        for _backend in ("polus", "gaussian", "aimall", "ariadne", "ferebus"):
+            _block = getattr(self.resources, _backend)
+            if _block.partition is not None:
+                _validate_token(
+                    "resources." + _backend + ".partition",
+                    _block.partition,
+                    _SCHEDULER_TOKEN_RE,
+                    "a scheduler token containing only letters, numbers, '.', '_', ':' and '-'",
+                )
+            if _block.walltime_hours is not None:
+                _validate_positive_walltime(
+                    "resources." + _backend + ".walltime_hours",
+                    _block.walltime_hours,
+                )
+            if _block.cpus_per_task is not None:
+                _validate_positive_int_or_auto(
+                    "resources." + _backend + ".cpus_per_task",
+                    _block.cpus_per_task,
+                )
+            if _block.mem_per_cpu is not None:
+                _validate_memory(
+                    "resources." + _backend + ".mem_per_cpu",
+                    _block.mem_per_cpu,
+                    _SLURM_MEMORY_RE,
+                    "SLURM memory syntax such as 4G or 4000M, or auto",
+                )
         if self.resources.array_concurrency_limit is not None:
             _validate_positive_int(
                 "resources.array_concurrency_limit",
@@ -1096,24 +1173,24 @@ class CampaignConfig:
                 "resources.gradient_parallel_backend must be one of "
                 + repr(sorted(VALID_GRADIENT_PARALLEL_BACKENDS))
             )
-        if self.resources.gaussian_memory_mode not in VALID_GAUSSIAN_MEMORY_MODES:
+        if self.resources.gaussian.memory_mode not in VALID_GAUSSIAN_MEMORY_MODES:
             raise ConfigValidationError(
-                "resources.gaussian_memory_mode must be one of "
+                "resources.gaussian.memory_mode must be one of "
                 + repr(sorted(VALID_GAUSSIAN_MEMORY_MODES))
             )
-        if isinstance(self.resources.gaussian_memory_fraction_of_slurm, bool) or not isinstance(
-            self.resources.gaussian_memory_fraction_of_slurm, (int, float)
+        if isinstance(self.resources.gaussian.memory_fraction_of_slurm, bool) or not isinstance(
+            self.resources.gaussian.memory_fraction_of_slurm, (int, float)
         ):
             raise ConfigValidationError(
-                "resources.gaussian_memory_fraction_of_slurm must be a number"
+                "resources.gaussian.memory_fraction_of_slurm must be a number"
             )
-        if not 0.0 < float(self.resources.gaussian_memory_fraction_of_slurm) <= 1.0:
+        if not 0.0 < float(self.resources.gaussian.memory_fraction_of_slurm) <= 1.0:
             raise ConfigValidationError(
-                "resources.gaussian_memory_fraction_of_slurm must be in (0, 1]"
+                "resources.gaussian.memory_fraction_of_slurm must be in (0, 1]"
             )
         _validate_memory(
-            "resources.gaussian_link0_mem",
-            self.resources.gaussian_link0_mem,
+            "resources.gaussian.link0_mem",
+            self.resources.gaussian.link0_mem,
             _GAUSSIAN_MEMORY_RE,
             "Gaussian memory syntax such as 8GB or 8000MB",
         )
@@ -1126,13 +1203,13 @@ class CampaignConfig:
             self.aimall.naat = "auto"
         else:
             _validate_positive_int("aimall.naat", self.aimall.naat)
-            aimall_raw_cpus = self.resources.aimall_cpus_per_task
+            aimall_raw_cpus = self.resources.cpus_for("AIMALL")
             if not (
                 isinstance(aimall_raw_cpus, str)
                 and aimall_raw_cpus.strip().lower() == "auto"
             ) and int(self.aimall.naat) > int(aimall_raw_cpus):
                 raise ConfigValidationError(
-                    "aimall.naat must be <= resources.aimall_cpus_per_task"
+                    "aimall.naat must be <= effective resources.aimall.cpus_per_task"
                 )
         if not isinstance(self.aimall.boaq, str):
             raise ConfigValidationError("aimall.boaq must be a string")
@@ -1945,39 +2022,41 @@ class CampaignConfig:
         ):
             if float(value) <= 0.0:
                 raise ConfigValidationError(name + " must be > 0")
+        gaussian_mem_per_cpu = self.resources.mem_per_cpu_for("GAUSSIAN")
+        gaussian_cpus_per_task = self.resources.cpus_for("GAUSSIAN")
         if (
-            self.resources.gaussian_memory_mode == "link0"
-            and str(self.resources.gaussian_mem_per_cpu).strip().lower() != "auto"
+            self.resources.gaussian.memory_mode == "link0"
+            and str(gaussian_mem_per_cpu).strip().lower() != "auto"
             and not (
-                isinstance(self.resources.gaussian_cpus_per_task, str)
-                and self.resources.gaussian_cpus_per_task.strip().lower() == "auto"
+                isinstance(gaussian_cpus_per_task, str)
+                and gaussian_cpus_per_task.strip().lower() == "auto"
             )
         ):
             gaussian_mem_mib = _memory_mebibytes(
-                "resources.gaussian_link0_mem",
-                self.resources.gaussian_link0_mem,
+                "resources.gaussian.link0_mem",
+                self.resources.gaussian.link0_mem,
                 gaussian=True,
             )
             slurm_mem_mib = _memory_mebibytes(
-                "resources.gaussian_mem_per_cpu",
-                self.resources.gaussian_mem_per_cpu,
+                "resources.gaussian.mem_per_cpu",
+                gaussian_mem_per_cpu,
                 gaussian=False,
-            ) * float(self.resources.gaussian_cpus_per_task)
+            ) * float(gaussian_cpus_per_task)
             limit_mib = (
-                float(self.resources.gaussian_memory_fraction_of_slurm)
+                float(self.resources.gaussian.memory_fraction_of_slurm)
                 * slurm_mem_mib
             )
             if gaussian_mem_mib > limit_mib:
                 raise ConfigValidationError(
-                    "resources.gaussian_link0_mem ("
-                    + str(self.resources.gaussian_link0_mem)
+                    "resources.gaussian.link0_mem ("
+                    + str(self.resources.gaussian.link0_mem)
                     + ") exceeds "
-                    + str(self.resources.gaussian_memory_fraction_of_slurm)
-                    + " of the Gaussian Slurm allocation resources.gaussian_mem_per_cpu "
-                    "* resources.gaussian_cpus_per_task ("
-                    + str(self.resources.gaussian_mem_per_cpu)
+                    + str(self.resources.gaussian.memory_fraction_of_slurm)
+                    + " of the Gaussian Slurm allocation resources.gaussian.mem_per_cpu "
+                    "* resources.gaussian.cpus_per_task ("
+                    + str(gaussian_mem_per_cpu)
                     + " * "
-                    + str(self.resources.gaussian_cpus_per_task)
+                    + str(gaussian_cpus_per_task)
                     + ")"
                 )
 

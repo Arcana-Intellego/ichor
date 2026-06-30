@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
+from ..campaign_migrations import migrate_campaign_payload
 from ..config import CampaignConfig
 from ..versioning.training_set import TrainingSetVersioning
 from .artifact_contracts import (
@@ -159,12 +160,12 @@ ALWAYS_SAFE_PREFIXES = {
     "error_calibration.",
 }
 ALWAYS_SAFE_RESOURCE_EXACT = {
-    "resources.default_walltime_hours",
-    "resources.polus_walltime_hours",
-    "resources.gaussian_walltime_hours",
-    "resources.aimall_walltime_hours",
-    "resources.ariadne_walltime_hours",
-    "resources.ferebus_walltime_hours",
+    "resources.defaults.walltime_hours",
+    "resources.polus.walltime_hours",
+    "resources.gaussian.walltime_hours",
+    "resources.aimall.walltime_hours",
+    "resources.ariadne.walltime_hours",
+    "resources.ferebus.walltime_hours",
     "resources.array_concurrency_limit",
     "resources.gradient_parallel_backend",
     "resources.fail_on_memory_estimate_exceeds_request",
@@ -192,20 +193,27 @@ FUTURE_SAFE_PREFIXES = {
     "acquisition.driver.",
 }
 FUTURE_SAFE_EXACT = {
-    "resources.partition",
-    "resources.polus_cpus_per_task",
-    "resources.gaussian_cpus_per_task",
-    "resources.aimall_cpus_per_task",
-    "resources.ariadne_cpus_per_task",
-    "resources.ferebus_cpus_per_task",
-    "resources.polus_mem_per_cpu",
-    "resources.gaussian_mem_per_cpu",
-    "resources.aimall_mem_per_cpu",
-    "resources.ariadne_mem_per_cpu",
-    "resources.ferebus_mem_per_cpu",
-    "resources.gaussian_memory_mode",
-    "resources.gaussian_link0_mem",
-    "resources.gaussian_memory_fraction_of_slurm",
+    "resources.defaults.partition",
+    "resources.defaults.cpus_per_task",
+    "resources.defaults.mem_per_cpu",
+    "resources.polus.partition",
+    "resources.gaussian.partition",
+    "resources.aimall.partition",
+    "resources.ariadne.partition",
+    "resources.ferebus.partition",
+    "resources.polus.cpus_per_task",
+    "resources.gaussian.cpus_per_task",
+    "resources.aimall.cpus_per_task",
+    "resources.ariadne.cpus_per_task",
+    "resources.ferebus.cpus_per_task",
+    "resources.polus.mem_per_cpu",
+    "resources.gaussian.mem_per_cpu",
+    "resources.aimall.mem_per_cpu",
+    "resources.ariadne.mem_per_cpu",
+    "resources.ferebus.mem_per_cpu",
+    "resources.gaussian.memory_mode",
+    "resources.gaussian.link0_mem",
+    "resources.gaussian.memory_fraction_of_slurm",
     "acquisition.use_scaled_posterior_covariance",
     "acquisition.allow_uniform_posterior_fallback",
 }
@@ -537,7 +545,29 @@ def review_config_changes(
         )
         return review
 
-    new_config = canonical_config(config)
+    try:
+        old_config = CampaignConfig.from_dict(
+            migrate_campaign_payload(old_config)
+        ).to_dict()
+        new_config = CampaignConfig.from_dict(
+            migrate_campaign_payload(canonical_config(config))
+        ).to_dict()
+    except Exception as exc:
+        review = ConfigLockReview(lock_path=path, lock_existed=True)
+        review.blocked_changes.append(
+            ConfigChange(
+                "config_lock",
+                "<unmigrated>",
+                "<current>",
+                "lock_invalid",
+                False,
+                "config lock migration failed: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:160],
+            )
+        )
+        return review
     review = ConfigLockReview(lock_path=path, lock_existed=True)
     for dotted, old, new in _diff(old_config, new_config):
         change = _classify_change(campaign_dir, proposed_state, dotted, old, new)

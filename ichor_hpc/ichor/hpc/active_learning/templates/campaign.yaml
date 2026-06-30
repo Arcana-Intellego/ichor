@@ -2,7 +2,7 @@
 # Generic first-live-iteration active-learning campaign for CSF3/CSF4.
 # Intended for a small validation run, not a long production campaign.
 
-schema_version: 3
+schema_version: 4
 
 # -------------------------------------------------------------------------
 # Required system-level identifiers
@@ -383,33 +383,45 @@ stop:
 # -------------------------------------------------------------------------
 
 resources:
-  partition: multicore
-  default_walltime_hours: 24
+  defaults:
+    partition: multicore
+    walltime_hours: 24
+    cpus_per_task: auto
+    mem_per_cpu: auto
 
-  # Optional per-phase overrides. Keep these conservative for first live tests.
-  polus_walltime_hours: 2
-  gaussian_walltime_hours: 24
-  aimall_walltime_hours: 24
-  ariadne_walltime_hours: 4
-  ferebus_walltime_hours: 24
+  # Backend overrides. null means "inherit from resources.defaults".
+  polus:
+    partition: null
+    walltime_hours: 2
+    cpus_per_task: null
+    mem_per_cpu: null
 
-  # Keep auto for CSF3/CSF4 examples; the live profile and staged data
-  # resolve backend-specific CPU and memory requests before submission.
-  polus_cpus_per_task: auto
-  gaussian_cpus_per_task: auto
-  aimall_cpus_per_task: auto
-  ariadne_cpus_per_task: auto
-  ferebus_cpus_per_task: auto
+  gaussian:
+    partition: null
+    walltime_hours: 24
+    cpus_per_task: null
+    mem_per_cpu: null
+    memory_mode: slurm_env
+    link0_mem: 8GB
+    memory_fraction_of_slurm: 0.85
 
-  polus_mem_per_cpu: auto
-  gaussian_mem_per_cpu: auto
-  aimall_mem_per_cpu: auto
-  ariadne_mem_per_cpu: auto
-  ferebus_mem_per_cpu: auto
+  aimall:
+    partition: null
+    walltime_hours: 24
+    cpus_per_task: null
+    mem_per_cpu: null
 
-  gaussian_memory_mode: slurm_env
-  gaussian_link0_mem: 8GB
-  gaussian_memory_fraction_of_slurm: 0.85
+  ariadne:
+    partition: null
+    walltime_hours: 4
+    cpus_per_task: null
+    mem_per_cpu: null
+
+  ferebus:
+    partition: null
+    walltime_hours: 24
+    cpus_per_task: null
+    mem_per_cpu: null
 
   # Keep the first live example gentle on the scheduler.
   # For larger campaigns, increase or remove this.

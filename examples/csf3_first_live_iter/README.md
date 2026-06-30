@@ -147,6 +147,40 @@ csf3:
     parallel_environments:
       serial: [1, 1]
       multicore: [2, 168]
+      interactive: [1, 168]
+      multicore_small: [2, 32]
+      himem: [1, 32]
+    partitions:
+      serial:
+        min_cpus: 1
+        max_cpus: 1
+        memory_per_core_gb: 5
+        max_walltime_hours: 168
+        daemon_supported: true
+      multicore:
+        min_cpus: 2
+        max_cpus: 168
+        memory_per_core_gb: 8
+        max_walltime_hours: 168
+        daemon_supported: true
+      interactive:
+        min_cpus: 1
+        max_cpus: 168
+        memory_per_core_gb: 8
+        max_walltime_hours: 24
+        daemon_supported: true
+      multicore_small:
+        min_cpus: 2
+        max_cpus: 32
+        memory_per_core_gb: 5
+        max_walltime_hours: 168
+        daemon_supported: true
+      himem:
+        min_cpus: 1
+        max_cpus: 32
+        memory_per_core_gb: 32
+        max_walltime_hours: 168
+        daemon_supported: true
 
   software:
     python:
@@ -177,13 +211,15 @@ csf3:
       modules: []
 ```
 
-The active-learning daemon defaults all backend-specific
-`resources.*_mem_per_cpu` fields to `auto`. On CSF3 these resolve from
-`hpc.memory_per_core_gb_by_partition`: the AMD `multicore` and `interactive`
-partitions use 8G/core, the lower-memory Intel `serial`/`multicore_small`
-partitions use 5G/core, and `himem` is available for larger memory jobs.
+The active-learning daemon defaults all backend-specific `resources.<backend>`
+overrides to `null`, which means "inherit from `resources.defaults`". The
+canonical default partition is `multicore` for every backend. On CSF3 these
+effective resources resolve from the active profile partition metadata: the
+AMD `multicore` and `interactive` partitions use 8G/core, the lower-memory
+Intel `serial`/`multicore_small` partitions use 5G/core, and `himem` is
+available for larger memory jobs.
 Gaussian live jobs use Slurm-provided memory through `GAUSS_PDEF` and
-`GAUSS_MDEF` by default; only legacy `resources.gaussian_memory_mode: link0`
+`GAUSS_MDEF` by default; only legacy `resources.gaussian.memory_mode: link0`
 writes `%NProcShared` and `%mem` into `.gjf` files.
 
 ## 6. Preflight and launch
