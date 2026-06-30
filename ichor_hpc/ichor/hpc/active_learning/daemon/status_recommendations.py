@@ -503,12 +503,38 @@ def build_status_recommendations(
 
     status_error = str(payload.get("status_error") or "")
     if status_error == "state_missing":
+        if bool(payload.get("fresh_init_safe", False)):
+            if bool(payload.get("campaign_yaml_exists", False)):
+                return [
+                    StatusRecommendation(
+                        code="state_missing_fresh_init",
+                        severity="required",
+                        primary="bootstrap the fresh campaign before starting the daemon",
+                        why=(
+                            "campaign.yaml exists, but "
+                            ".DATA/ACTIVE_LEARNING/state.json has not been created"
+                        ),
+                        command="ichor-al-daemon init --campaign-dir " + str(campaign),
+                    )
+                ]
+            return [
+                StatusRecommendation(
+                    code="campaign_missing",
+                    severity="required",
+                    primary="initialise the campaign before starting the daemon",
+                    why="campaign.yaml and state.json are both missing",
+                    command="ichor-al-daemon init --campaign-dir " + str(campaign),
+                )
+            ]
         return [
             StatusRecommendation(
                 code="state_missing",
                 severity="required",
-                primary="initialise or reconcile the campaign before starting the daemon",
-                why="no .DATA/ACTIVE_LEARNING/state.json exists",
+                primary="run reconcile; missing state cannot be fresh-initialised safely",
+                why=(
+                    "no .DATA/ACTIVE_LEARNING/state.json exists, but the campaign "
+                    "contains stateful run artefacts"
+                ),
                 command=_reconcile_cmd(campaign, apply=True),
             )
         ]

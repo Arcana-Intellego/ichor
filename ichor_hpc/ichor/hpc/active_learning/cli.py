@@ -10,7 +10,7 @@ Console entry point 'ichor-al-daemon' registered in
     resume     Equivalent to start when state.json already exists.
     reconcile  Inspect on-disk artefacts and propose a recovered state.
     journal    Tail or filter the campaign journal.
-    init       Initialise campaign.yaml and import the trajectory pool.
+    init       Bootstrap campaign.yaml, daemon state, config lock, and pool.
 
 Commands that operate on a campaign accept '--campaign-dir DIR'. When it is
 omitted, the CLI uses the current working directory if it contains
@@ -52,6 +52,7 @@ from .daemon.config_lock import (
     clean_model_iteration_staging_for_reconcile,
     clean_reentry_staging,
     config_lock_path,
+    ensure_config_lock,
     ferebus_reentry_can_archive_data_staging,
     format_config_review,
     review_config_changes,
@@ -87,6 +88,7 @@ from .daemon.state import (
     CampaignPhase,
     DEFAULT_STATE_FILENAME,
     StateSchemaError,
+    fresh_campaign_state,
     read_state,
     write_state,
 )
@@ -114,6 +116,10 @@ BACKGROUND_PID_SCHEMA_VERSION = 1
 
 class CampaignDirResolutionError(ValueError):
     """Raised when a command cannot infer a valid campaign directory."""
+
+
+class CampaignBootstrapError(ValueError):
+    """Raised when init cannot safely create or validate daemon state."""
 
 
 class ShortFlagClusterError(ValueError):
@@ -250,6 +256,16 @@ def _campaign_paths(campaign_dir: Path):
         "journal": data / "journal.ndjson",
         "background_log": data / BACKGROUND_LOG_FILENAME,
         "background_pid": data / BACKGROUND_PID_FILENAME,
+    }
+
+
+def _missing_state_context(campaign: Path) -> Dict[str, Any]:
+    artefacts = stateful_campaign_artifacts(campaign)
+    return {
+        "campaign_yaml_exists": bool((campaign / "campaign.yaml").is_file()),
+        "stateful_artifacts": [str(item) for item in artefacts],
+        "stateful_artifacts_count": int(len(artefacts)),
+        "fresh_init_safe": bool(not artefacts),
     }
 
 
@@ -1070,13 +1086,20 @@ def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path
 
 def _format_status_unavailable(payload: Dict[str, Any]) -> str:
     lines: List[str] = []
+    campaign_rows = [
+        ("phase", "unknown"),
+        ("state", payload.get("status_error")),
+    ]
+    if "campaign_yaml_exists" in payload:
+        campaign_rows.append(("campaign.yaml", "present" if payload.get("campaign_yaml_exists") else "missing"))
+    if "stateful_artifacts_count" in payload:
+        campaign_rows.append(("stateful artefacts", payload.get("stateful_artifacts_count")))
+    if "fresh_init_safe" in payload:
+        campaign_rows.append(("fresh init safe", bool(payload.get("fresh_init_safe"))))
     lines.extend(
         _section(
             "Campaign",
-            [
-                ("phase", "unknown"),
-                ("state", payload.get("status_error")),
-            ],
+            campaign_rows,
         )
     )
     if payload.get("state_error"):
@@ -1221,7 +1244,27 @@ def cmd_start(args: argparse.Namespace) -> int:
     state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
     state_for_lock = None
     if not state_path.exists():
-        artefacts = stateful_campaign_artifacts(campaign)
+        missing_context = _missing_state_context(campaign)
+        artefacts = list(missing_context.get("stateful_artifacts") or [])
+        if bool(missing_context.get("fresh_init_safe", False)):
+            print(
+                "state.json is missing for a fresh campaign.",
+                file=sys.stderr,
+            )
+            print("Run:", file=sys.stderr)
+            print(
+                "  ichor-al-daemon init --campaign-dir " + str(campaign),
+                file=sys.stderr,
+            )
+            print(
+                "Then start live mode with:",
+                file=sys.stderr,
+            )
+            print(
+                "  ichor-al-daemon --campaign-dir " + str(campaign) + " --live",
+                file=sys.stderr,
+            )
+            return 8
         if artefacts:
             print(
                 "state.json is missing but this campaign is not empty.",
@@ -1917,6 +1960,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             "state_path": str(paths["state"]),
             "campaign_dir": str(campaign),
         }
+        payload.update(_missing_state_context(campaign))
         payload["recommendations"] = recommendation_dicts(
             build_status_recommendations(campaign, payload, paths["journal"])
         )
@@ -3670,8 +3714,123 @@ def _import_pool_impl(args: argparse.Namespace, campaign: Path, source: Path) ->
     return 0
 
 
+def _trajectory_pool_summary(campaign: Path) -> Dict[str, Any]:
+    from .acquisition.trajectory_pool import TrajectoryPool
+
+    pool = TrajectoryPool.load(campaign)
+    return {
+        "status": "ok",
+        "frames": int(pool.n_frames()),
+        "atoms": int(pool.manifest.natoms),
+        "sha256": str(pool.sha256),
+        "path": str(pool.canonical_path),
+    }
+
+
+def _print_pool_summary(summary: Dict[str, Any]) -> None:
+    if str(summary.get("status")) == "ok":
+        print(
+            "  trajectory pool: ok, frames="
+            + str(summary.get("frames"))
+            + ", atoms="
+            + str(summary.get("atoms"))
+            + ", sha="
+            + str(summary.get("sha256", ""))[:12]
+        )
+    elif str(summary.get("status")) == "missing":
+        print("  trajectory pool: missing")
+    else:
+        print("  trajectory pool: invalid - " + str(summary.get("error", "unknown")))
+
+
+def _bootstrap_fresh_campaign_state(
+    campaign: Path,
+    config: CampaignConfig,
+) -> Dict[str, Any]:
+    paths = _campaign_paths(campaign)
+    paths["data"].mkdir(parents=True, exist_ok=True)
+    (campaign / ".DATA" / "STAGING").mkdir(parents=True, exist_ok=True)
+    (campaign / "7_ACTIVE_LEARNING").mkdir(parents=True, exist_ok=True)
+
+    state_path = paths["state"]
+    if state_path.is_file():
+        try:
+            state = read_state(state_path)
+        except (StateSchemaError, json.JSONDecodeError) as exc:
+            raise CampaignBootstrapError(
+                "state.json is invalid; run `ichor-al-daemon reconcile --campaign-dir "
+                + str(campaign)
+                + "` before reinitialising: "
+                + str(exc)
+            ) from exc
+        review = review_config_changes(
+            campaign,
+            config,
+            state,
+            initialise_missing=True,
+        )
+        if review.changed:
+            formatted = format_config_review(review)
+            raise CampaignBootstrapError(
+                "campaign.yaml differs from config_lock.json; use reconcile "
+                "to approve safe edits before continuing."
+                + (("\n" + formatted) if formatted else "")
+            )
+        return {
+            "state_status": "already_initialised",
+            "state": state,
+            "config_lock_status": "ok",
+            "state_path": str(state_path),
+            "config_lock_path": str(config_lock_path(campaign)),
+        }
+
+    artefacts = stateful_campaign_artifacts(campaign)
+    if artefacts:
+        lines = [
+            "state.json is missing but this campaign has stateful run artefacts.",
+            "Refusing to create a fresh state because that could overwrite provenance.",
+            "Run:",
+            "  ichor-al-daemon reconcile --campaign-dir " + str(campaign) + " --apply",
+            "Stateful artefacts:",
+        ]
+        lines.extend("  - " + str(item) for item in artefacts[:12])
+        if len(artefacts) > 12:
+            lines.append("  ... " + str(len(artefacts) - 12) + " more")
+        raise CampaignBootstrapError("\n".join(lines))
+
+    lock_path = config_lock_path(campaign)
+    if lock_path.is_file():
+        review = review_config_changes(
+            campaign,
+            config,
+            fresh_campaign_state(max_iterations=int(config.max_iterations)),
+            initialise_missing=False,
+        )
+        if review.changed:
+            formatted = format_config_review(review)
+            raise CampaignBootstrapError(
+                "config_lock.json already exists and does not match campaign.yaml; "
+                "refusing to initialise a fresh state without operator review."
+                + (("\n" + formatted) if formatted else "")
+            )
+        lock_status = "ok"
+    else:
+        ensure_config_lock(campaign, config)
+        lock_status = "created"
+
+    state = fresh_campaign_state(max_iterations=int(config.max_iterations))
+    write_state(state_path, state)
+    return {
+        "state_status": "created",
+        "state": state,
+        "config_lock_status": lock_status,
+        "state_path": str(state_path),
+        "config_lock_path": str(config_lock_path(campaign)),
+    }
+
+
 def cmd_init(args: argparse.Namespace) -> int:
-    """Initialise campaign.yaml and import the trajectory pool."""
+    """Bootstrap campaign.yaml, daemon state, config lock, and trajectory pool."""
     try:
         campaign = _resolve_init_campaign_dir(getattr(args, "campaign_dir", None))
     except CampaignDirResolutionError as exc:
@@ -3680,20 +3839,74 @@ def cmd_init(args: argparse.Namespace) -> int:
     try:
         from .campaign_yaml import CampaignYamlError, initialise_campaign_yaml
 
-        initialise_campaign_yaml(campaign)
+        config = initialise_campaign_yaml(campaign)
     except CampaignYamlError as exc:
         print("campaign.yaml initialisation failed: " + str(exc), file=sys.stderr)
         return 15
     except Exception as exc:
         print("campaign.yaml initialisation failed: " + str(exc), file=sys.stderr)
         return 15
+
+    pool_summary: Dict[str, Any]
+    raw_source = getattr(args, "source", None)
+    source: Optional[Path] = None
+    if raw_source:
+        try:
+            source = _resolve_init_source(campaign, raw_source)
+        except FileNotFoundError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+    else:
+        default_source = campaign / "pool.xyz"
+        if default_source.is_file():
+            source = default_source.resolve()
+
     try:
-        source = _resolve_init_source(campaign, getattr(args, "source", None))
-    except FileNotFoundError as exc:
-        print(str(exc), file=sys.stderr)
-        return 2
-    print("Initialised campaign.yaml: " + str(campaign / "campaign.yaml"))
-    return _import_pool_impl(args, campaign, source)
+        bootstrap = _bootstrap_fresh_campaign_state(campaign, config)
+    except CampaignBootstrapError as exc:
+        print("campaign bootstrap failed: " + str(exc), file=sys.stderr)
+        return 16
+
+    if source is not None:
+        import_rc = _import_pool_impl(args, campaign, source)
+        if import_rc != 0:
+            return import_rc
+
+    try:
+        pool_summary = _trajectory_pool_summary(campaign)
+    except FileNotFoundError:
+        pool_summary = {"status": "missing"}
+    except Exception as exc:
+        pool_summary = {
+            "status": "invalid",
+            "error": type(exc).__name__ + ": " + str(exc),
+        }
+
+    state = bootstrap["state"]
+    print("Campaign initialised")
+    print("  campaign: " + str(campaign))
+    print("  campaign.yaml: ok, schema v" + str(config.schema_version))
+    _print_pool_summary(pool_summary)
+    print(
+        "  state.json: "
+        + str(bootstrap["state_status"])
+        + ", phase="
+        + str(state.phase.value)
+    )
+    print("  config_lock.json: " + str(bootstrap["config_lock_status"]))
+    print("")
+    if str(pool_summary.get("status")) == "ok":
+        print("Next:")
+        print("  ichor-al-daemon preflight --campaign-dir " + str(campaign))
+        print("  ichor-al-daemon --campaign-dir " + str(campaign) + " --live")
+    else:
+        print("Next:")
+        print(
+            "  ichor-al-daemon init --campaign-dir "
+            + str(campaign)
+            + " --source /path/to/pool.xyz"
+        )
+    return 0
 
 
 def cmd_import_pool(args: argparse.Namespace) -> int:
@@ -4033,8 +4246,9 @@ Examples:
             required=source_required,
             default=None,
             help=(
-                "Path to the operator's MD trajectory (.xyz). Defaults to "
-                "<campaign-dir>/pool.xyz when omitted."
+                "Path to the operator's MD trajectory (.xyz). If omitted, "
+                "<campaign-dir>/pool.xyz is imported when present; otherwise "
+                "init still bootstraps campaign state and reports the missing pool."
             ),
         )
         p.add_argument(
@@ -4053,18 +4267,19 @@ Examples:
 
     p_init = sub.add_parser(
         "init",
-        help="Initialise campaign.yaml and import pool.xyz.",
+        help="Bootstrap campaign.yaml, daemon state, config lock, and optionally pool.xyz.",
         description=(
             "Initialise or populate campaign.yaml from the packaged template, "
-            "then copy the operator trajectory into the campaign pool and "
-            "write a SHA-pinned manifest. From inside a campaign directory, "
-            "--campaign-dir and --source can be omitted when campaign.yaml "
-            "and pool.xyz are present."
+            "create the fresh daemon state/config lock when safe, and optionally "
+            "copy the operator trajectory into the campaign pool with a "
+            "SHA-pinned manifest. From inside a campaign directory, "
+            "--campaign-dir and --source can be omitted."
         ),
         epilog=(
             "Examples:\n"
             "  ichor-al-daemon init\n"
-            "  ichor-al-daemon init -c ~/campaigns/water_001 -s pool.xyz"
+            "  ichor-al-daemon init -c ~/campaigns/water_001 -s pool.xyz\n"
+            "  ichor-al-daemon --campaign-dir ~/campaigns/water_001 --live"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

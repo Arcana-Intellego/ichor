@@ -509,7 +509,8 @@ def test_cli_status_returns_4_when_state_missing(tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 4
     assert "Recommendation" in out
-    assert "initialise or reconcile the campaign" in out
+    assert "bootstrap the fresh campaign" in out
+    assert "fresh init safe: True" in out
 
 
 def test_cli_status_returns_json_recommendation_when_state_missing(tmp_path, capsys):
@@ -518,8 +519,68 @@ def test_cli_status_returns_json_recommendation_when_state_missing(tmp_path, cap
     assert rc == 4
     payload = json.loads(capsys.readouterr().out)
     assert payload["status_error"] == "state_missing"
-    assert payload["recommendations"][0]["code"] == "state_missing"
+    assert payload["fresh_init_safe"] is True
+    assert payload["recommendations"][0]["code"] == "state_missing_fresh_init"
     assert payload["next_action"] == payload["recommendations"][0]["primary"]
+
+
+def test_cli_status_recommends_reconcile_when_state_missing_with_artefacts(
+    tmp_path,
+    capsys,
+):
+    campaign = _campaign_with_config(tmp_path)
+    (campaign / "7_ACTIVE_LEARNING" / "iteration-0000").mkdir(parents=True)
+
+    rc = main(["status", "--campaign-dir", str(campaign), "--json"])
+
+    assert rc == 4
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["fresh_init_safe"] is False
+    assert payload["stateful_artifacts_count"] == 1
+    assert payload["recommendations"][0]["code"] == "state_missing"
+    assert "reconcile" in payload["recommendations"][0]["command"]
+
+
+def test_cli_init_bootstraps_fresh_state_and_config_lock(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+
+    rc = main(["init", "--campaign-dir", str(campaign)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Campaign initialised" in out
+    assert "trajectory pool: missing" in out
+    state = read_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME)
+    assert state.phase is CampaignPhase.INIT
+    assert state.max_iterations == 2
+    assert (campaign / DEFAULT_DATA_SUBDIR / "config_lock.json").is_file()
+    assert "ichor-al-daemon --campaign-dir " + str(campaign) + " --live" not in out
+    assert "ichor-al-daemon init --campaign-dir " + str(campaign) + " --source" in out
+
+
+def test_cli_init_rerun_preserves_existing_campaign_uid(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    assert main(["init", "--campaign-dir", str(campaign)]) == 0
+    first = read_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME)
+    capsys.readouterr()
+
+    assert main(["init", "--campaign-dir", str(campaign)]) == 0
+    second = read_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME)
+
+    assert second.campaign_uid == first.campaign_uid
+    assert "state.json: already_initialised" in capsys.readouterr().out
+
+
+def test_cli_init_refuses_missing_state_with_stateful_artefacts(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    (campaign / "7_ACTIVE_LEARNING" / "iteration-0000").mkdir(parents=True)
+
+    rc = main(["init", "--campaign-dir", str(campaign)])
+
+    assert rc == 16
+    err = capsys.readouterr().err
+    assert "campaign bootstrap failed" in err
+    assert "reconcile --campaign-dir" in err
 
 
 def _recommendation_codes(campaign: Path, payload: dict) -> list[str]:
@@ -1517,6 +1578,7 @@ def test_cli_resume_refuses_halted_state(tmp_path, capsys):
 
 def test_cli_start_with_mock_ariadne_drives_state_machine(tmp_path):
     campaign = _campaign_with_config(tmp_path)
+    assert main(["init", "--campaign-dir", str(campaign)]) == 0
     rc = main([
         "start", "--campaign-dir", str(campaign),
         "--mock-ariadne", "--max-ticks", "5",
@@ -1544,6 +1606,33 @@ def test_cli_start_without_mode_refuses(tmp_path, capsys):
     assert "--mock-ariadne" in captured.err
 
 
+def test_cli_start_missing_state_for_clean_campaign_recommends_init(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+
+    rc = main(["start", "--campaign-dir", str(campaign), "--live"])
+
+    assert rc == 8
+    err = capsys.readouterr().err
+    assert "state.json is missing for a fresh campaign" in err
+    assert "ichor-al-daemon init --campaign-dir " + str(campaign) in err
+    assert "reconcile --campaign-dir" not in err
+
+
+def test_cli_start_missing_state_with_artefacts_recommends_reconcile(
+    tmp_path,
+    capsys,
+):
+    campaign = _campaign_with_config(tmp_path)
+    (campaign / "7_ACTIVE_LEARNING" / "iteration-0000").mkdir(parents=True)
+
+    rc = main(["start", "--campaign-dir", str(campaign), "--live"])
+
+    assert rc == 8
+    err = capsys.readouterr().err
+    assert "state.json is missing but this campaign is not empty" in err
+    assert "ichor-al-daemon reconcile --campaign-dir " + str(campaign) in err
+
+
 def test_cli_start_with_mutually_exclusive_flags_refuses(tmp_path, capsys):
     """--live + --dry-run is a mutually-exclusive configuration; exit 2."""
     campaign = _campaign_with_config(tmp_path)
@@ -1558,6 +1647,8 @@ def test_cli_start_live_on_windows_refuses_with_exit_12(tmp_path, capsys):
     case), the CLI must refuse with exit 12 and a message naming the missing
     binaries -- not silently spin a daemon."""
     campaign = _campaign_with_config(tmp_path)
+    assert main(["init", "--campaign-dir", str(campaign)]) == 0
+    capsys.readouterr()
     rc = main(["start", "--campaign-dir", str(campaign), "--live"])
     # On a CSF4 host with all binaries present this test would skip; in our
     # CI / Windows environment, the backends are absent and exit 12 is the
