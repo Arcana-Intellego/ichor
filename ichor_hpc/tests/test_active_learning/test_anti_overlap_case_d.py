@@ -310,3 +310,13 @@ def test_scaled_min_separation_rescues_farthest_non_duplicate(tmp_path):
     assert dedup["n_kept"] == 1
     assert dedup["n_dropped"] == 2
     assert (iter_dir / "GEOMETRY_NOVELTY_SCALE.json").is_file()
+    journal = campaign / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson"
+    events = [
+        json.loads(line)
+        for line in journal.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(
+        event.get("event") == "phase_b_geometry_novelty_relaxed"
+        for event in events
+    )

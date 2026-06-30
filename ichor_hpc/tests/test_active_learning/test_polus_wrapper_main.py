@@ -240,6 +240,10 @@ def test_phase_b_writes_sample_and_dedup(tmp_path):
     # regardless of the geometry novelty-derived default minimum separation.
     assert d["n_dropped"] == 0
     assert d["min_separation"] == 0.025
+    manifest = json.loads((iter_dir / "PHASE_B_SELECTION.json").read_text(encoding="utf-8"))
+    assert "distance_to_nearest_angstrom" in manifest["raw"][0]
+    assert "scaled_distance_to_nearest" in manifest["raw"][0]
+    assert "novelty_score" in manifest["raw"][0]
 
 
 def test_phase_b_rejects_unsafe_accepted_landing_before_fps(tmp_path):

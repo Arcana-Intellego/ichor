@@ -7,6 +7,7 @@ lets Phase B express its threshold as a dimensionless multiple of that scale.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from dataclasses import replace
@@ -19,7 +20,7 @@ import numpy as np
 from ichor.core.adversarial.geometry import aligned_mass_weighted_rmsd
 from ichor.core.atoms import Atoms
 
-from .daemon.state import atomic_write_json
+from .daemon.state import DEFAULT_STATE_FILENAME, atomic_write_json, read_state
 from .geometry_protocol import (
     FULLSPACE_RMSD_SCALE_MULTIPLIER,
     GEOMETRY_NOVELTY_SCORE_TRANSFORM,
@@ -84,6 +85,16 @@ def _safe_int(value: Any) -> Optional[int]:
         return None
 
 
+def _sha256_file(path: Path) -> Optional[str]:
+    if not path.is_file():
+        return None
+    h = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _percentile(values: Sequence[float], statistic: str) -> float:
     arr = np.asarray([float(v) for v in values], dtype=float)
     if arr.size == 0:
@@ -116,9 +127,18 @@ def _summary(values: Sequence[float]) -> Dict[str, Any]:
     }
 
 
-def _load_raw_seed_records(iter_dir: Path) -> List[Dict[str, Any]]:
+def _load_seed_payload(iter_dir: Path) -> Dict[str, Any]:
     path = iter_dir / "seeds_picked.json"
+    if not path.is_file():
+        return {}
     data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def _load_raw_seed_records(iter_dir: Path) -> List[Dict[str, Any]]:
+    data = _load_seed_payload(iter_dir)
     raw = data.get("seed_records")
     if isinstance(raw, list):
         return [dict(rec) for rec in raw if isinstance(rec, dict)]
@@ -131,7 +151,11 @@ def _load_raw_seed_records(iter_dir: Path) -> List[Dict[str, Any]]:
     ]
 
 
-def _neighbour_ids_for_seed(record: Dict[str, Any], frame_id: int, n_frames: int) -> List[int]:
+def _manifest_neighbour_ids_for_seed(
+    record: Dict[str, Any],
+    frame_id: int,
+    n_frames: int,
+) -> List[int]:
     raw = record.get("subspace_neighbour_frame_ids")
     if not isinstance(raw, list):
         raw = record.get("neighbour_frame_ids")
@@ -143,16 +167,52 @@ def _neighbour_ids_for_seed(record: Dict[str, Any], frame_id: int, n_frames: int
                 neighbours.append(int(nid))
     if neighbours:
         return sorted(set(neighbours))
-
-    adjacent: List[int] = []
-    if int(frame_id) - 1 >= 0:
-        adjacent.append(int(frame_id) - 1)
-    if int(frame_id) + 1 < int(n_frames):
-        adjacent.append(int(frame_id) + 1)
-    return adjacent
+    return []
 
 
-def _local_motion_values(campaign_dir: Path, iter_dir: Path) -> Tuple[List[float], Dict[str, Any]]:
+def _neighbour_count_from_config(config: Any) -> int:
+    try:
+        raw = config.acquisition.subspace.neighbour_count
+        return max(1, min(16, int(raw)))
+    except Exception:
+        return 16
+
+
+def _nearest_pool_neighbour_ids(
+    pool: Any,
+    seed_atoms: Atoms,
+    frame_id: int,
+    *,
+    k: int,
+) -> Tuple[List[int], Dict[str, Any]]:
+    distances: List[Tuple[float, int]] = []
+    n_frames = int(pool.n_frames())
+    for candidate_id in range(n_frames):
+        if int(candidate_id) == int(frame_id):
+            continue
+        try:
+            distance = float(
+                aligned_mass_weighted_rmsd(seed_atoms, pool.frame(int(candidate_id)))
+            )
+        except Exception:
+            continue
+        if _finite_positive(distance) is not None:
+            distances.append((float(distance), int(candidate_id)))
+    distances.sort(key=lambda item: (item[0], item[1]))
+    picked = [int(candidate_id) for _, candidate_id in distances[: int(k)]]
+    return picked, {
+        "n_pool_frames": int(n_frames),
+        "n_pool_frames_scanned": int(max(0, n_frames - 1)),
+        "n_finite_positive_nearest_distances": int(len(distances)),
+        "nearest_k": int(k),
+    }
+
+
+def _local_motion_values(
+    campaign_dir: Path,
+    iter_dir: Path,
+    config: Any,
+) -> Tuple[List[float], Dict[str, Any]]:
     from .acquisition.trajectory_pool import TrajectoryPool
 
     pool = TrajectoryPool.load(campaign_dir)
@@ -160,6 +220,13 @@ def _local_motion_values(campaign_dir: Path, iter_dir: Path) -> Tuple[List[float
     values: List[float] = []
     n_seed_records = 0
     n_neighbour_pairs = 0
+    neighbour_source_counts: Dict[str, int] = {}
+    nearest_diag = {
+        "n_pool_frames": int(pool.n_frames()),
+        "n_pool_frames_scanned": 0,
+        "n_finite_positive_nearest_distances": 0,
+        "nearest_k": _neighbour_count_from_config(config),
+    }
     for rec in records:
         fid = _safe_int(rec.get("frame_id"))
         if fid is None:
@@ -168,7 +235,25 @@ def _local_motion_values(campaign_dir: Path, iter_dir: Path) -> Tuple[List[float
             continue
         n_seed_records += 1
         seed_atoms = pool.frame(int(fid))
-        for nid in _neighbour_ids_for_seed(rec, int(fid), pool.n_frames()):
+        neighbour_ids = _manifest_neighbour_ids_for_seed(rec, int(fid), pool.n_frames())
+        neighbour_source = "manifest_ids"
+        if not neighbour_ids:
+            neighbour_source = "nearest_pool_rmsd"
+            neighbour_ids, diag = _nearest_pool_neighbour_ids(
+                pool,
+                seed_atoms,
+                int(fid),
+                k=nearest_diag["nearest_k"],
+            )
+            for key in (
+                "n_pool_frames_scanned",
+                "n_finite_positive_nearest_distances",
+            ):
+                nearest_diag[key] = int(nearest_diag.get(key, 0)) + int(diag.get(key, 0))
+        neighbour_source_counts[neighbour_source] = (
+            int(neighbour_source_counts.get(neighbour_source, 0)) + 1
+        )
+        for nid in neighbour_ids:
             try:
                 d = float(aligned_mass_weighted_rmsd(seed_atoms, pool.frame(int(nid))))
             except Exception:
@@ -179,32 +264,165 @@ def _local_motion_values(campaign_dir: Path, iter_dir: Path) -> Tuple[List[float
     return values, {
         "n_seed_records": int(n_seed_records),
         "n_neighbour_pairs": int(n_neighbour_pairs),
+        "neighbour_sources": neighbour_source_counts,
+        "nearest_pool_rmsd": nearest_diag,
     }
 
 
-def _history_values(campaign_dir: Path, iteration: int, window: int) -> Tuple[List[float], Dict[str, Any]]:
+def _movement_from_landing_safety(safety: Any) -> Optional[float]:
+    if not isinstance(safety, dict) or not bool(safety.get("accepted", False)):
+        return None
+    metrics = safety.get("metrics")
+    if not isinstance(metrics, dict):
+        metrics = {}
+    for key in ("movement_rmsd_ang", "aligned_mass_weighted_rmsd_ang"):
+        value = _finite_positive(metrics.get(key))
+        if value is not None:
+            return float(value)
+    for key in ("movement_rmsd_ang", "aligned_mass_weighted_rmsd_ang"):
+        value = _finite_positive(safety.get(key))
+        if value is not None:
+            return float(value)
+    return None
+
+
+def _movement_values_from_records(records: Any) -> Tuple[List[float], Dict[str, int]]:
+    values: List[float] = []
+    skipped_rejected = 0
+    skipped_nonfinite = 0
+    if not isinstance(records, list):
+        return values, {
+            "n_records": 0,
+            "n_accepted_movements": 0,
+            "n_skipped_rejected": 0,
+            "n_skipped_nonfinite": 0,
+        }
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        safety = rec.get("landing_safety")
+        if not isinstance(safety, dict):
+            skipped_nonfinite += 1
+            continue
+        if not bool(safety.get("accepted", False)):
+            skipped_rejected += 1
+            continue
+        value = _movement_from_landing_safety(safety)
+        if value is None:
+            skipped_nonfinite += 1
+            continue
+        values.append(float(value))
+    return values, {
+        "n_records": int(len(records)),
+        "n_accepted_movements": int(len(values)),
+        "n_skipped_rejected": int(skipped_rejected),
+        "n_skipped_nonfinite": int(skipped_nonfinite),
+    }
+
+
+def _ariadne_movement_history_values(
+    campaign_dir: Path,
+    iteration: int,
+    window: int,
+) -> Tuple[List[float], Dict[str, Any]]:
     if int(window) <= 0 or int(iteration) <= 0:
         return [], {"n_history_files": 0}
     base = campaign_dir / "7_ACTIVE_LEARNING"
     start = max(0, int(iteration) - int(window))
     values: List[float] = []
     n_files = 0
+    n_audit_files = 0
+    n_results_files = 0
+    n_skipped_rejected = 0
+    n_skipped_nonfinite = 0
     for previous in range(start, int(iteration)):
-        path = geometry_novelty_scale_path(
-            base / ("iteration-" + str(previous).zfill(4))
-        )
-        if not path.is_file():
-            continue
+        iter_dir = base / ("iteration-" + str(previous).zfill(4))
+        audit_path = iter_dir / "ARIADNE_LANDING_AUDIT.json"
+        results_path = iter_dir / "ARIADNE_RESULTS.json"
+        source_records = None
+        source_kind = None
         try:
-            payload = read_geometry_novelty_scale(path.parent)
+            if audit_path.is_file():
+                payload = json.loads(audit_path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    source_records = payload.get("seeds")
+                    source_kind = "audit"
+                    n_audit_files += 1
+            elif results_path.is_file():
+                payload = json.loads(results_path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    source_records = payload.get("accepted")
+                    source_kind = "results"
+                    n_results_files += 1
         except Exception:
             continue
-        val = _finite_positive(payload.get("scale_angstrom"))
-        if val is None:
+        if source_records is None:
             continue
-        values.append(float(val))
+        new_values, diag = _movement_values_from_records(source_records)
+        if not new_values and source_kind == "audit" and results_path.is_file():
+            try:
+                payload = json.loads(results_path.read_text(encoding="utf-8"))
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                fallback_values, fallback_diag = _movement_values_from_records(
+                    payload.get("accepted")
+                )
+                if fallback_values:
+                    new_values = fallback_values
+                    diag = fallback_diag
+                    source_kind = "results"
+                    n_results_files += 1
+        values.extend(new_values)
+        n_skipped_rejected += int(diag.get("n_skipped_rejected", 0))
+        n_skipped_nonfinite += int(diag.get("n_skipped_nonfinite", 0))
         n_files += 1
-    return values, {"n_history_files": int(n_files)}
+    if n_audit_files and n_results_files:
+        source = "mixed"
+    elif n_audit_files:
+        source = "ariadne_landing_audit"
+    elif n_results_files:
+        source = "ariadne_results"
+    else:
+        source = "none"
+    return values, {
+        "source": source,
+        "n_history_files": int(n_files),
+        "n_audit_files": int(n_audit_files),
+        "n_results_files": int(n_results_files),
+        "n_accepted_movements": int(len(values)),
+        "n_skipped_rejected": int(n_skipped_rejected),
+        "n_skipped_nonfinite": int(n_skipped_nonfinite),
+    }
+
+
+def _sidecar_provenance(campaign_dir: Path, iter_dir: Path, iteration: int) -> Dict[str, Any]:
+    seed_path = iter_dir / "seeds_picked.json"
+    seed_payload = _load_seed_payload(iter_dir)
+    state_path = campaign_dir / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
+    training_version = None
+    models_version = None
+    state_available = False
+    if state_path.is_file():
+        try:
+            state = read_state(state_path)
+            training_version = int(getattr(state, "training_set_version", -1))
+            models_version = int(getattr(state, "models_version", -1))
+            state_available = True
+        except Exception:
+            state_available = False
+    return {
+        "campaign_dir": str(campaign_dir.resolve()),
+        "iteration": int(iteration),
+        "trajectory_sha256": str(seed_payload.get("trajectory_sha256") or ""),
+        "seed_selection_manifest": (
+            str(seed_path.resolve()) if seed_path.is_file() else None
+        ),
+        "seed_selection_sha256": _sha256_file(seed_path),
+        "training_set_version": training_version,
+        "models_version": models_version,
+        "state_available": bool(state_available),
+    }
 
 
 def _normalise_config_value(config: Any, name: str, default: Any) -> Any:
@@ -240,7 +458,7 @@ def compute_geometry_novelty_scale(
 
     if enabled and scale_source in ("local_motion", "hybrid"):
         try:
-            local_values, local_diag = _local_motion_values(campaign, iter_dir)
+            local_values, local_diag = _local_motion_values(campaign, iter_dir, config)
             diagnostics["local_motion"] = local_diag
         except Exception as exc:
             diagnostics["local_motion"] = {
@@ -250,7 +468,7 @@ def compute_geometry_novelty_scale(
 
     if enabled and scale_source in ("movement_history", "hybrid"):
         try:
-            history_values, history_diag = _history_values(
+            history_values, history_diag = _ariadne_movement_history_values(
                 campaign, int(iteration), history_window,
             )
             diagnostics["movement_history"] = history_diag
@@ -283,6 +501,9 @@ def compute_geometry_novelty_scale(
     scale = max(float(raw_scale), float(floor_value))
     if scale != float(raw_scale):
         reasons.append("scale_floor_applied")
+    scale_resolution_mode = (
+        "fallback_protocol" if bool(fallback_used) else "computed"
+    )
 
     return {
         "schema_version": GEOMETRY_NOVELTY_SCALE_SCHEMA_VERSION,
@@ -298,12 +519,14 @@ def compute_geometry_novelty_scale(
         "scale_angstrom": float(scale),
         "raw_scale_angstrom": float(raw_scale),
         "fallback_used": bool(fallback_used),
+        "scale_resolution_mode": scale_resolution_mode,
         "reasons": [str(reason) for reason in reasons],
         "n_values": int(len(combined_values)),
         "value_summary_angstrom": _summary(combined_values),
         "local_motion_summary_angstrom": _summary(local_values),
         "movement_history_summary_angstrom": _summary(history_values),
         "diagnostics": diagnostics,
+        "provenance": _sidecar_provenance(campaign, iter_dir, int(iteration)),
     }
 
 
@@ -314,7 +537,11 @@ def write_geometry_novelty_scale(iter_dir: Union[str, Path], payload: Dict[str, 
     return path
 
 
-def read_geometry_novelty_scale(iter_dir: Union[str, Path]) -> Dict[str, Any]:
+def read_geometry_novelty_scale(
+    iter_dir: Union[str, Path],
+    *,
+    expected_iteration: Optional[int] = None,
+) -> Dict[str, Any]:
     path = geometry_novelty_scale_path(iter_dir)
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
@@ -330,6 +557,18 @@ def read_geometry_novelty_scale(iter_dir: Union[str, Path]) -> Dict[str, Any]:
     scale = _finite_positive(payload.get("scale_angstrom"))
     if scale is None:
         raise ValueError("geometry novelty scale_angstrom must be finite and > 0")
+    if expected_iteration is not None and "iteration" in payload:
+        try:
+            iteration = int(payload.get("iteration"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("geometry novelty iteration must be an integer") from exc
+        if iteration != int(expected_iteration):
+            raise ValueError(
+                "geometry novelty iteration mismatch: expected "
+                + str(int(expected_iteration))
+                + " got "
+                + str(iteration)
+            )
     return payload
 
 
@@ -364,11 +603,21 @@ def resolve_geometry_novelty_consumers(
     enabled = _config_enabled(config)
     scale = _scale_from_payload(scale_payload) if enabled else None
     mode = "scaled" if scale is not None else "absolute"
+    scale_payload_dict = scale_payload if isinstance(scale_payload, dict) else {}
+    fallback_protocol = (
+        scale is None
+        or not bool(enabled)
+        or bool(scale_payload_dict.get("fallback_used", False))
+    )
+    scale_resolution_mode = (
+        "fallback_protocol" if fallback_protocol else "computed"
+    )
     phase_b_scaled = PHASE_B_MIN_SEPARATION_SCALE
 
     if scale is not None:
         movement_band = {
             "threshold_mode": "scaled",
+            "scale_resolution_mode": scale_resolution_mode,
             "scale_angstrom": float(scale),
             "hard_min_angstrom": MOVEMENT_BAND_HARD_MIN_FRACTION * float(scale),
             "target_low_angstrom": MOVEMENT_BAND_TARGET_LOW_FRACTION * float(scale),
@@ -379,6 +628,7 @@ def resolve_geometry_novelty_consumers(
         }
         movement_utility = {
             "threshold_mode": "scaled",
+            "scale_resolution_mode": scale_resolution_mode,
             "low_softness_angstrom": (
                 MOVEMENT_UTILITY_LOW_SOFTNESS_FRACTION * float(scale)
             ),
@@ -390,11 +640,14 @@ def resolve_geometry_novelty_consumers(
         }
         fullspace = {
             "threshold_mode": "scaled",
+            "scale_resolution_mode": scale_resolution_mode,
             "rmsd_scale_angstrom": FULLSPACE_RMSD_SCALE_MULTIPLIER * float(scale),
             "rmsd_scale_multiplier": FULLSPACE_RMSD_SCALE_MULTIPLIER,
         }
         phase_b = {
             "threshold_mode": "scaled",
+            "scale_resolution_mode": scale_resolution_mode,
+            "scaled_threshold": phase_b_scaled,
             "min_separation_scaled": phase_b_scaled,
             "effective_min_separation_angstrom": phase_b_scaled * float(scale),
         }
@@ -402,6 +655,7 @@ def resolve_geometry_novelty_consumers(
         fallback = float(_normalise_config_value(config, "fallback_scale_angstrom", 0.05))
         movement_band = {
             "threshold_mode": "absolute",
+            "scale_resolution_mode": scale_resolution_mode,
             "hard_min_angstrom": MOVEMENT_BAND_HARD_MIN_FRACTION * fallback,
             "target_low_angstrom": MOVEMENT_BAND_TARGET_LOW_FRACTION * fallback,
             "target_peak_angstrom": MOVEMENT_BAND_TARGET_PEAK_FRACTION * fallback,
@@ -411,6 +665,7 @@ def resolve_geometry_novelty_consumers(
         }
         movement_utility = {
             "threshold_mode": "absolute",
+            "scale_resolution_mode": scale_resolution_mode,
             "low_softness_angstrom": MOVEMENT_UTILITY_LOW_SOFTNESS_FRACTION * fallback,
             "high_softness_angstrom": MOVEMENT_UTILITY_HIGH_SOFTNESS_FRACTION * fallback,
             "low_softness_fraction": MOVEMENT_UTILITY_LOW_SOFTNESS_FRACTION,
@@ -418,12 +673,15 @@ def resolve_geometry_novelty_consumers(
         }
         fullspace = {
             "threshold_mode": "absolute",
+            "scale_resolution_mode": scale_resolution_mode,
             "rmsd_scale_angstrom": FULLSPACE_RMSD_SCALE_MULTIPLIER * fallback,
             "rmsd_scale_multiplier": FULLSPACE_RMSD_SCALE_MULTIPLIER,
         }
         phase_b = {
             "threshold_mode": "absolute",
+            "scale_resolution_mode": scale_resolution_mode,
             "effective_min_separation_angstrom": phase_b_scaled * fallback,
+            "scaled_threshold": phase_b_scaled,
             "min_separation_scaled": phase_b_scaled,
         }
 
@@ -431,6 +689,7 @@ def resolve_geometry_novelty_consumers(
         "schema_version": 1,
         "enabled": bool(enabled),
         "threshold_mode": mode,
+        "scale_resolution_mode": scale_resolution_mode,
         "scale_angstrom": None if scale is None else float(scale),
         "phase_b": phase_b,
         "movement_band": movement_band,
@@ -454,7 +713,10 @@ def ensure_geometry_novelty_scale(
     path = geometry_novelty_scale_path(iter_dir)
     if path.is_file():
         try:
-            payload = read_geometry_novelty_scale(iter_dir)
+            payload = read_geometry_novelty_scale(
+                iter_dir,
+                expected_iteration=int(iteration),
+            )
         except Exception:
             payload = compute_geometry_novelty_scale(
                 campaign_dir,

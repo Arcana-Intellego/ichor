@@ -132,6 +132,8 @@ def _geometry_novelty_resolved_lines(
             str(source)
             + ", mode="
             + str(resolved.get("threshold_mode"))
+            + ", resolution="
+            + str(resolved.get("scale_resolution_mode"))
             + ", scale_angstrom="
             + str(resolved.get("scale_angstrom")),
         ),
@@ -139,6 +141,8 @@ def _geometry_novelty_resolved_lines(
             "geometry_novelty.resolved_phase_b",
             "mode="
             + str(phase_b.get("threshold_mode"))
+            + ", resolution="
+            + str(phase_b.get("scale_resolution_mode"))
             + ", min_separation_angstrom="
             + str(phase_b.get("effective_min_separation_angstrom"))
             + ", coefficient="
@@ -148,6 +152,8 @@ def _geometry_novelty_resolved_lines(
             "geometry_novelty.resolved_movement_band",
             "mode="
             + str(movement_band.get("threshold_mode"))
+            + ", resolution="
+            + str(movement_band.get("scale_resolution_mode"))
             + ", min/low/peak/high/max_angstrom="
             + str(movement_band.get("hard_min_angstrom"))
             + "/"
@@ -163,6 +169,8 @@ def _geometry_novelty_resolved_lines(
             "geometry_novelty.resolved_movement_utility",
             "mode="
             + str(movement_utility.get("threshold_mode"))
+            + ", resolution="
+            + str(movement_utility.get("scale_resolution_mode"))
             + ", low/high_softness_angstrom="
             + str(movement_utility.get("low_softness_angstrom"))
             + "/"
@@ -172,6 +180,8 @@ def _geometry_novelty_resolved_lines(
             "geometry_novelty.resolved_fullspace_confinement",
             "mode="
             + str(fullspace.get("threshold_mode"))
+            + ", resolution="
+            + str(fullspace.get("scale_resolution_mode"))
             + ", rmsd_scale_angstrom="
             + str(fullspace.get("rmsd_scale_angstrom")),
         ),

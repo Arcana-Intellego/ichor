@@ -366,6 +366,16 @@ def _phase_b_json_safe(value):
     return value
 
 
+def _append_phase_b_journal_event(campaign, event_type, **payload) -> None:
+    try:
+        from ..daemon.journal import append_event
+
+        journal_path = Path(campaign) / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson"
+        append_event(journal_path, event_type, **payload)
+    except Exception:
+        return
+
+
 def _run_phase_a(campaign, config):
     """POLUS Phase-A: pick a diverse subsample from the imported
     trajectory pool to seed the campaign with initial training points.
@@ -684,6 +694,19 @@ def _run_phase_b(args, campaign, config):
         "descriptor_used": descriptor.name,
     }
     atomic_write_json(dedup_path, _phase_b_json_safe(dedup_payload))
+    if bool(relaxation.get("applied", False)):
+        _append_phase_b_journal_event(
+            campaign,
+            "phase_b_geometry_novelty_relaxed",
+            iteration=int(args.iteration),
+            reason=str(relaxation.get("reason", "")),
+            kept_raw_index=int(relaxation.get("kept_raw_index", -1)),
+            distance_to_nearest_angstrom=relaxation.get(
+                "distance_to_nearest_angstrom"
+            ),
+            effective_min_separation_angstrom=float(min_sep),
+            n_candidates=int(len(selected_frames)),
+        )
     if int(report.n_kept) <= 0:
         if threshold_mode == "scaled":
             print(
@@ -723,6 +746,21 @@ def _run_phase_b(args, campaign, config):
             if int(raw_index) in kept_lookup else None
         )
         out_rec["drop_reason"] = None if out_rec["kept_after_dedup"] else "min_separation"
+        out_rec["distance_to_nearest_angstrom"] = (
+            report.distances_to_nearest[raw_index]
+            if raw_index < len(report.distances_to_nearest)
+            else None
+        )
+        out_rec["scaled_distance_to_nearest"] = (
+            scaled_nearest[raw_index]
+            if raw_index < len(scaled_nearest)
+            else None
+        )
+        out_rec["novelty_score"] = (
+            novelty_scores[raw_index]
+            if raw_index < len(novelty_scores)
+            else None
+        )
         raw_records.append(dict(out_rec))
         if out_rec["kept_after_dedup"]:
             final_records.append(dict(out_rec))
