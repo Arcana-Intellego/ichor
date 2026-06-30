@@ -389,39 +389,39 @@ resources:
     cpus_per_task: auto
     mem_per_cpu: auto
 
-  # Backend overrides. null means "inherit from resources.defaults".
+  # Backend resources are explicit defaults; adjust per backend when needed.
   polus:
-    partition: null
+    partition: multicore
     walltime_hours: 2
-    cpus_per_task: null
-    mem_per_cpu: null
+    cpus_per_task: auto
+    mem_per_cpu: auto
 
   gaussian:
-    partition: null
+    partition: multicore
     walltime_hours: 24
-    cpus_per_task: null
-    mem_per_cpu: null
+    cpus_per_task: auto
+    mem_per_cpu: auto
     memory_mode: slurm_env
     link0_mem: 8GB
     memory_fraction_of_slurm: 0.85
 
   aimall:
-    partition: null
+    partition: multicore
     walltime_hours: 24
-    cpus_per_task: null
-    mem_per_cpu: null
+    cpus_per_task: auto
+    mem_per_cpu: auto
 
   ariadne:
-    partition: null
+    partition: multicore
     walltime_hours: 4
-    cpus_per_task: null
-    mem_per_cpu: null
+    cpus_per_task: auto
+    mem_per_cpu: auto
 
   ferebus:
-    partition: null
+    partition: multicore
     walltime_hours: 24
-    cpus_per_task: null
-    mem_per_cpu: null
+    cpus_per_task: auto
+    mem_per_cpu: auto
 
   # Keep the first live example gentle on the scheduler.
   # For larger campaigns, increase or remove this.
