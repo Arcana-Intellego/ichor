@@ -1355,6 +1355,11 @@ def test_cli_journal_left_justifies_columns_for_long_events(tmp_path, capsys):
         phase="INITIAL_GAUSSIAN",
         iteration=12,
         job_id="16175294",
+        n_expected=4,
+        n_observed=2,
+        n_missing=2,
+        streak=1,
+        squeue_rows_sample=[{"job_id": "16175294", "state": "PD"}],
         ts="2026-06-27T14:42:55+00:00",
     )
 
@@ -1367,8 +1372,55 @@ def test_cli_journal_left_justifies_columns_for_long_events(tmp_path, capsys):
     assert lines[1].startswith("2026-06-27 14:42:55")
     assert lines[0].index("iter=0") == lines[1].index("iter=12")
     assert lines[0].index("PHASE_A_POLUS") == lines[1].index("INITIAL_GAUSSIAN")
-    assert lines[0].index("sbatch") == lines[1].index("sacct_rows_missing_but_squeue_active")
-    assert lines[0].index("job=16175189") == lines[1].index("job=16175294")
+    assert lines[0].index("job submitted") == lines[1].index("waiting for array accounting")
+    assert "job=16175189" in lines[0]
+    assert "job=16175294" in lines[1]
+    assert "sacct_rows_missing_but_squeue_active" not in lines[1]
+    assert "Slurm job is still active" in lines[1]
+    assert "observed=2" in lines[1]
+    assert "expected=4" in lines[1]
+    assert "missing=2" in lines[1]
+    assert "squeue=active(PD)" in lines[1]
+
+
+def test_cli_journal_json_keeps_raw_event_names(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
+    journal = campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson"
+    append_event(
+        journal,
+        "sacct_rows_missing_but_squeue_active",
+        phase="INITIAL_GAUSSIAN",
+        iteration=12,
+        job_id="16175294",
+        ts="2026-06-27T14:42:55+00:00",
+    )
+
+    rc = main(["journal", "--campaign-dir", str(campaign), "--json"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["event"] == "sacct_rows_missing_but_squeue_active"
+
+
+def test_cli_journal_unknown_event_gets_readable_fallback_label(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
+    journal = campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson"
+    append_event(
+        journal,
+        "custom_scheduler_note",
+        phase="PHASE_A_POLUS",
+        iteration=0,
+        ts="2026-06-27T14:42:55+00:00",
+    )
+
+    rc = main(["journal", "--campaign-dir", str(campaign)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "custom scheduler note" in out
+    assert "custom_scheduler_note" not in out
 
 
 def test_cli_journal_verbose_prints_event_details(tmp_path, capsys):
@@ -1390,6 +1442,9 @@ def test_cli_journal_verbose_prints_event_details(tmp_path, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "sbatch" in out
+    assert "job submitted" in out
+    assert "  raw_event: sbatch" in out
+    assert "  event_label: job submitted" in out
     assert "INITIAL_AIMALL" in out
     assert "not-a-real-timestamp" in out
     assert "iter=0" in out

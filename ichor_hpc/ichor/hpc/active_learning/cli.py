@@ -1172,6 +1172,194 @@ def _event_phase(event: Dict[str, Any]) -> str:
     return "-"
 
 
+JOURNAL_EVENT_LABELS: Dict[str, str] = {
+    "campaign_started": "campaign started",
+    "phase_transition": "phase transition",
+    "sbatch": "job submitted",
+    "phase_succeeded": "phase completed",
+    "phase_succeeded_live": "live phase accepted outputs",
+    "sacct_error": "Slurm accounting error",
+    "shutdown_requested": "shutdown requested",
+    "daemon_started": "daemon started",
+    "daemon_stopped": "daemon stopped",
+    "daemon_interrupted": "daemon interrupted",
+    "state_corrupt": "state file corrupt",
+    "tick_error": "daemon tick error",
+    "tick_exception_halted": "daemon halted after exception",
+    "subspace_built": "subspace built",
+    "training_set_committed": "training set committed",
+    "models_committed": "models committed",
+    "seed_selected": "seeds selected",
+    "anti_overlap_flagged": "anti-overlap flagged",
+    "reference_scales_computed": "reference scales computed",
+    "preset_loaded": "preset loaded",
+    "failure_action": "phase failure decision",
+    "halt": "daemon halted",
+    "live_postprocess_refused": "live postprocess refused",
+    "effective_config_diff": "config diff recorded",
+    "autotune_applied": "autotune applied",
+    "trajectory_pool_filtered": "trajectory pool filtered",
+    "quantum_output_rejected": "QM output rejected",
+    "quantum_quality_summary": "QM quality summarised",
+    "ferebus_quality_summary": "FEREBUS quality summarised",
+    "ariadne_landing_rejected": "ARIADNE landing rejected",
+    "ariadne_landing_summary": "ARIADNE landing summary",
+    "ariadne_optional_diagnostics_warning": "ARIADNE diagnostics warning",
+    "ariadne_legacy_missing_trajectory_sha256": "ARIADNE legacy provenance",
+    "ariadne_provenance_reconstructed": "ARIADNE provenance rebuilt",
+    "ariadne_seed_provenance_repaired": "ARIADNE seed provenance repaired",
+    "ariadne_seed_provenance_staged": "ARIADNE seed provenance staged",
+    "ariadne_stale_outputs_cleaned": "ARIADNE stale outputs cleaned",
+    "ariadne_task_rejected_missing_result": "ARIADNE result missing",
+    "ariadne_task_rejected_malformed_result": "ARIADNE malformed result",
+    "ariadne_task_rejected_unusable_result": "ARIADNE result unusable",
+    "ariadne_task_rejected_unsafe_landing": "ARIADNE landing rejected",
+    "ariadne_task_salvaged_from_nonzero_exit": "ARIADNE task salvaged",
+    "error_calibration_summary": "error calibration summarised",
+    "error_calibration_failed": "error calibration failed",
+    "phase_output_contract_invalid": "phase output contract invalid",
+    "required_phase_output_missing_after_failure": "failure output missing",
+    "reconcile_applied": "reconcile applied",
+    "reconcile_resolved_terminal_intent": "terminal intent resolved",
+    "committed_artifact_settle_retry": "waiting for committed artefacts",
+    "resolved_phase_resources": "resources resolved",
+    "operator_cancelled_jobs": "operator cancelled jobs",
+    "sacct_empty_timeout": "Slurm accounting empty timeout",
+    "sacct_missing_timeout": "Slurm accounting timeout",
+    "sacct_unknown_timeout": "Slurm UNKNOWN timeout",
+    "sacct_empty_but_squeue_active": "waiting for Slurm accounting",
+    "sacct_rows_missing_but_squeue_active": "waiting for array accounting",
+    "squeue_liveness_inconclusive": "scheduler liveness unclear",
+    "transient_phase_retry": "transient phase retry",
+    "transient_retry_ledger_invalid": "retry ledger invalid",
+    "job_adopt_check_failed": "job adoption check failed",
+    "adopted_inflight_job": "adopted running job",
+    "adopted_accounted_job": "adopted completed job",
+    "expected_tasks_inference_failed": "task-count inference failed",
+    "submission_intent_expected_tasks_invalid": "expected task count invalid",
+    "submission_intent_update_failed": "submission intent update failed",
+    "submission_intent_read_failed": "submission intent read failed",
+    "provenance_index_repaired": "provenance index repaired",
+    "provenance_index_repair_failed": "provenance index repair failed",
+    "postprocess_settle_retry": "waiting for filesystem visibility",
+    "phase_pre_submit_intent": "pre-submit recorded",
+    "phase_submitted": "submission recorded",
+    "queue_lifecycle_update": "queue state updated",
+    "staging_archived": "staging archived",
+    "staging_restored_from_archive": "staging restored",
+    "daemon_lease_conflict": "daemon lease conflict",
+    "daemon_lease_stale_recovered": "stale daemon lease recovered",
+    "daemon_lease_cleanup_failed": "daemon lease cleanup failed",
+    "geometry_novelty_scale_precomputed": "novelty scale computed",
+    "phase_b_novelty_threshold_relaxed": "Phase B novelty relaxed",
+    "pool_feasibility_checked": "pool feasibility checked",
+    "seed_posterior_fallback": "seed posterior fallback",
+    "initial_training_existing_without_bootstrap_handoff": "bootstrap handoff missing",
+}
+
+
+def _journal_event_label(event: Dict[str, Any]) -> str:
+    raw = str(event.get("event", "<missing>"))
+    if raw in JOURNAL_EVENT_LABELS:
+        return JOURNAL_EVENT_LABELS[raw]
+    return raw.replace("_", " ")
+
+
+def _event_int(event: Dict[str, Any], key: str) -> Optional[int]:
+    try:
+        value = event.get(key)
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _squeue_activity_summary(event: Dict[str, Any]) -> str:
+    sample = event.get("squeue_rows_sample")
+    state = None
+    if isinstance(sample, list) and sample:
+        first = sample[0]
+        if isinstance(first, dict):
+            state = first.get("state") or first.get("State")
+    if state:
+        return "active(" + str(state) + ")"
+    return "active"
+
+
+def _sacct_row_summary(event: Dict[str, Any]) -> str:
+    expected = _event_int(event, "n_expected")
+    observed = _event_int(event, "n_observed")
+    missing = _event_int(event, "n_missing")
+    parts: List[str] = []
+    if observed is not None:
+        parts.append("observed=" + str(observed))
+    if expected is not None:
+        parts.append("expected=" + str(expected))
+    if missing is not None:
+        parts.append("missing=" + str(missing))
+    return " ".join(parts)
+
+
+def _journal_operator_summary(event: Dict[str, Any]) -> str:
+    raw = str(event.get("event", ""))
+    if raw == "sacct_rows_missing_but_squeue_active":
+        rows = _sacct_row_summary(event)
+        out = "Slurm job is still active"
+        if rows:
+            out += "; sacct rows " + rows
+        out += "; squeue=" + _squeue_activity_summary(event)
+        streak = _event_int(event, "streak")
+        if streak is not None:
+            out += "; streak=" + str(streak)
+        return out
+    if raw == "sacct_empty_but_squeue_active":
+        out = "Slurm job is still active; sacct has no rows yet"
+        out += "; squeue=" + _squeue_activity_summary(event)
+        streak = _event_int(event, "streak")
+        if streak is not None:
+            out += "; streak=" + str(streak)
+        return out
+    if raw in {"sacct_missing_timeout", "sacct_empty_timeout", "sacct_unknown_timeout"}:
+        rows = _sacct_row_summary(event)
+        out = "Slurm accounting did not become conclusive"
+        if rows:
+            out += "; " + rows
+        streak = _event_int(event, "streak")
+        max_ticks = _event_int(event, "max_ticks")
+        if streak is not None and max_ticks is not None:
+            out += "; ticks=" + str(streak) + "/" + str(max_ticks)
+        return out
+    if raw == "squeue_liveness_inconclusive":
+        rows = _sacct_row_summary(event)
+        out = "could not prove whether Slurm job is still active"
+        if rows:
+            out += "; " + rows
+        return out
+    if raw == "pool_feasibility_checked":
+        frames = event.get("pool_n_frames")
+        required = event.get("required_pool_frames")
+        return "pool frames=" + str(frames) + " required=" + str(required)
+    if raw == "ariadne_landing_summary":
+        parts = []
+        for key in ("accepted", "rejected", "salvaged", "backtracked"):
+            if key in event:
+                parts.append(key + "=" + str(event.get(key)))
+        return " ".join(parts)
+    if raw in {"quantum_quality_summary", "ferebus_quality_summary"}:
+        parts = []
+        for key in ("accepted", "rejected", "n_kept", "n_rejected", "n_tasks"):
+            if key in event:
+                parts.append(key + "=" + str(event.get(key)))
+        return " ".join(parts)
+    if raw == "failure_action":
+        failed = event.get("n_failed")
+        tasks = event.get("n_tasks")
+        action = event.get("action")
+        return "action=" + str(action) + " failed=" + str(failed) + "/" + str(tasks)
+    return ""
+
+
 def _compact_event_details(event: Dict[str, Any]) -> str:
     detail_keys = [
         ("job_id", "job"),
@@ -1200,8 +1388,14 @@ def _format_journal_events(events: Sequence[Dict[str, Any]], *, verbose: bool) -
         return ""
     rows: List[Tuple[Dict[str, Any], str, str, str, str, str]] = []
     for event in events:
-        event_name = str(event.get("event", "<missing>"))
+        event_name = _journal_event_label(event)
         phase = _event_phase(event)
+        operator_summary = _journal_operator_summary(event)
+        compact_details = _compact_event_details(event)
+        if operator_summary and compact_details:
+            details = operator_summary + "  " + compact_details
+        else:
+            details = operator_summary or compact_details
         rows.append(
             (
                 event,
@@ -1209,7 +1403,7 @@ def _format_journal_events(events: Sequence[Dict[str, Any]], *, verbose: bool) -
                 _event_iteration(event),
                 phase,
                 event_name,
-                _compact_event_details(event),
+                details,
             )
         )
     time_width = max(19, max(len(row[1]) for row in rows))
@@ -1230,6 +1424,9 @@ def _format_journal_events(events: Sequence[Dict[str, Any]], *, verbose: bool) -
         )
         lines.append(first_line + "  " + (details if details else "-"))
         if verbose:
+            raw_event = str(event.get("event", "<missing>"))
+            lines.append("  raw_event: " + raw_event)
+            lines.append("  event_label: " + event_name)
             for key in sorted(event):
                 if key in {"ts", "event", "phase", "to_phase", "from_phase", "iteration"}:
                     continue

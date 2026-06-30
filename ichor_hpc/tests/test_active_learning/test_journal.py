@@ -1,4 +1,5 @@
 """Tests for ichor.hpc.active_learning.daemon.journal."""
+import ast
 import json
 import multiprocessing as mp
 import os
@@ -9,6 +10,7 @@ import pytest
 from ichor.hpc.active_learning.daemon.journal import (
     EventTooLargeError,
     JOURNAL_LINE_LIMIT_BYTES,
+    KNOWN_EVENT_TYPES,
     append_event,
     iter_events,
     read_events,
@@ -95,6 +97,34 @@ def test_read_events_filters_by_since(tmp_path):
     append_event(j, "c", x=3, ts="2026-12-01T00:00:00Z")
     out = list(read_events(j, since="2026-05-01T00:00:00Z"))
     assert [e["event"] for e in out] == ["b", "c"]
+
+
+def test_known_event_types_cover_static_literal_emitters():
+    repo_root = Path(__file__).resolve().parents[3]
+    source_root = repo_root / "ichor_hpc" / "ichor" / "hpc" / "active_learning"
+    emitted = set()
+    for path in source_root.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name):
+                name = func.id
+            elif isinstance(func, ast.Attribute):
+                name = func.attr
+            else:
+                continue
+            if name not in {"append_event", "_journal", "_journal_event"}:
+                continue
+            event_arg_index = 1 if name == "append_event" else 0
+            if len(node.args) <= event_arg_index:
+                continue
+            event_arg = node.args[event_arg_index]
+            if isinstance(event_arg, ast.Constant) and isinstance(event_arg.value, str):
+                emitted.add(event_arg.value)
+
+    assert emitted - set(KNOWN_EVENT_TYPES) == set()
 
 
 def _worker_append(path, count, tag):
