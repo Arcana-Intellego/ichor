@@ -1081,10 +1081,10 @@ upsert_ichor_config() {
     plumed_kernel_config="$(config_path_for_yaml "${PLUMED_KERNEL:-${HOME}/opt/plumed-${PLUMED_VERSION}/lib/libplumedKernel.so}")"
     plumed_lib_config="$(config_path_for_yaml "${PLUMED_LIBRARY_PATH:-${HOME}/opt/plumed-${PLUMED_VERSION}/lib}")"
     if [[ "${DRY_RUN}" -eq 1 ]]; then
-        echo "+ upsert ${MACHINE} profile in ~/ichor_config.yaml"
+        echo "+ initialise/update ~/ichor_config.yaml from repo template and upsert ${MACHINE} profile"
         return 0
     fi
-    "${PYTHON}" - "${MACHINE}" "${venv_config}" "${aimall_config}" "${ferebus_config}" "${plumed_kernel_config}" "${plumed_lib_config}" <<'PY'
+    "${PYTHON}" - "${MACHINE}" "${REPO_ROOT}/ichor_config.yaml" "${venv_config}" "${aimall_config}" "${ferebus_config}" "${plumed_kernel_config}" "${plumed_lib_config}" <<'PY'
 from __future__ import annotations
 
 import shutil
@@ -1094,7 +1094,7 @@ from pathlib import Path
 
 import yaml
 
-machine, python_path, aimall_path, ferebus_path, plumed_kernel, plumed_lib = sys.argv[1:7]
+machine, repo_config_path, python_path, aimall_path, ferebus_path, plumed_kernel, plumed_lib = sys.argv[1:8]
 path = Path.home() / "ichor_config.yaml"
 data = {}
 if path.exists():
@@ -1105,6 +1105,14 @@ if path.exists():
     backup = path.with_name(path.name + ".bak." + str(int(time.time())))
     shutil.copy2(path, backup)
     print(f"Backed up existing config to {backup}")
+else:
+    repo_config = Path(repo_config_path)
+    if repo_config.is_file():
+        loaded = yaml.safe_load(repo_config.read_text(encoding="utf-8")) or {}
+        if not isinstance(loaded, dict):
+            raise SystemExit(f"{repo_config} must contain a YAML mapping")
+        data = loaded
+        print(f"Initialising {path} from {repo_config}")
 
 def deep_update(dst, src):
     for key, value in src.items():

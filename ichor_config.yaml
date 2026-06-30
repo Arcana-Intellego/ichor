@@ -15,6 +15,40 @@ csf3:
     parallel_environments:
       serial: [1, 1]
       multicore: [2, 168]
+      interactive: [1, 168]
+      multicore_small: [2, 32]
+      himem: [1, 32]
+    partitions:
+      multicore:
+        min_cpus: 2
+        max_cpus: 168
+        memory_per_core_gb: 8
+        max_walltime_hours: 168
+        daemon_supported: true
+      interactive:
+        min_cpus: 1
+        max_cpus: 168
+        memory_per_core_gb: 8
+        max_walltime_hours: 24
+        daemon_supported: true
+      multicore_small:
+        min_cpus: 2
+        max_cpus: 32
+        memory_per_core_gb: 5
+        max_walltime_hours: 168
+        daemon_supported: true
+      serial:
+        min_cpus: 1
+        max_cpus: 1
+        memory_per_core_gb: 5
+        max_walltime_hours: 168
+        daemon_supported: true
+      himem:
+        min_cpus: 1
+        max_cpus: 32
+        memory_per_core_gb: 32
+        max_walltime_hours: 168
+        daemon_supported: true
 
   software:
 
@@ -81,7 +115,26 @@ csf4:
       multinode: 4
     parallel_environments:
       serial: [1, 1]
-      multicore: [2, 32]
+      multicore: [2, 40]
+    partitions:
+      serial:
+        min_cpus: 1
+        max_cpus: 1
+        memory_per_core_gb: 4
+        max_walltime_hours: 168
+        daemon_supported: true
+      multicore:
+        min_cpus: 2
+        max_cpus: 40
+        memory_per_core_gb: 4
+        max_walltime_hours: 168
+        daemon_supported: true
+      multinode:
+        min_cpus: 2
+        max_cpus: 10000
+        memory_per_core_gb: 4
+        max_walltime_hours: 168
+        daemon_supported: false
 
   software:
 
