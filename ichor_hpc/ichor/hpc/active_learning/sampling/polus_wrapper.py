@@ -185,33 +185,18 @@ def _write_index_file(indices, path):
 
 
 def _phase_b_target_size(config, n_candidates, iteration=0):
-    """how many candidates to keep after Phase-B FPS, from the batch_sizing block.
-
-    the batch GROWS with iteration so the loop adds more points as the model matures, bounded by
-    batch_sizing.cap and never below floor (and never more than the pool actually has):
-      * fixed  -- always floor (iteration ignored).
-      * linear -- floor + iteration.
-      * sqrt   -- floor scaled by sqrt(1 + iteration).
-    the old code did min(floor, n, cap) which, since cap >= floor, collapsed to min(floor, n) -- so
-    the batch sat at floor forever and cap/policy did nothing at all (A40 + A41). iteration is
-    0-based (and < 0 for Phase A, where this is never called), so clamp it to >= 0; at iteration 0
-    linear gives exactly floor, which keeps the old behaviour for the first round.
-    """
-    import math as _math
-    b = config.batch_sizing
-    floor = max(1, int(b.floor))
-    cap = max(floor, int(b.cap))
-    it = max(0, int(iteration))
-    policy = str(getattr(b, "policy", "linear"))
-    if policy == "fixed":
-        grown = floor
-    elif policy == "sqrt":
-        grown = int(round(floor * _math.sqrt(1 + it)))
-    else:  # "linear" (default) and anything unrecognised -> linear growth
-        grown = floor + it
-    # never below floor, never above the cap, never more than the candidate pool holds.
-    target = min(max(floor, grown), cap, n_candidates)
-    return max(1, int(target))
+    """Return the fixed final active batch size for Phase-B FPS."""
+    del iteration
+    target = int(config.active_batch.final_batch_size)
+    if int(n_candidates) < target:
+        raise ValueError(
+            "active_batch_underfilled: wanted final_batch_size="
+            + str(target)
+            + " but only "
+            + str(int(n_candidates))
+            + " safe ARIADNE candidates are available"
+        )
+    return target
 
 
 def _load_committed_training_set(campaign_dir):
@@ -406,8 +391,25 @@ def _run_phase_a(campaign, config):
         print("trajectory pool is empty", file=_sys.stderr)
         return 3
 
-    n_target = int(config.initial_train_size) + int(config.initial_val_size)
-    n_select = min(max(1, n_target), len(frames))
+    try:
+        from ..daemon.pool_feasibility import require_pool_feasibility
+
+        feasibility = require_pool_feasibility(campaign, config)
+    except Exception as exc:
+        print(str(exc), file=_sys.stderr)
+        return 3
+
+    n_select = int(config.bootstrap.initial_labelled_size)
+    if n_select > len(frames):
+        print(
+            "bootstrap_initial_labelled_size_exceeds_pool: "
+            + "bootstrap.initial_labelled_size="
+            + str(n_select)
+            + ", pool_n_frames="
+            + str(len(frames)),
+            file=_sys.stderr,
+        )
+        return 3
 
     descriptor = MassWeightedRMSDDescriptor()
     matrix = descriptor.pairwise_distance_matrix(frames)
@@ -429,10 +431,11 @@ def _run_phase_a(campaign, config):
         "selected_indices": [int(i) for i in sel.indices],
         "descriptor": str(descriptor.name),
         "n_pool_frames": int(len(frames)),
+        "bootstrap_initial_labelled_size": int(n_select),
+        "reserve_after_bootstrap": int(feasibility.reserve_after_bootstrap),
+        "pool_feasibility": feasibility.to_dict(),
         "trajectory_sha256": str(pool.sha256),
         "source_pool_manifest": str((campaign / POOL_SUBDIR / POOL_MANIFEST_FILENAME).resolve()),
-        "initial_train_size": int(config.initial_train_size),
-        "initial_val_size": int(config.initial_val_size),
     })
 
     print(
@@ -570,7 +573,15 @@ def _run_phase_b(args, campaign, config):
             file=_sys.stderr,
         )
         return 3
-    n_select = _phase_b_target_size(config, len(candidate_frames), int(args.iteration))
+    try:
+        n_select = _phase_b_target_size(
+            config,
+            len(candidate_frames),
+            int(args.iteration),
+        )
+    except Exception as exc:
+        print(str(exc), file=_sys.stderr)
+        return 3
     sel = fps_select(matrix, n_select, descriptor_name=descriptor.name)
     selected_frames = [candidate_frames[i] for i in sel.indices]
     selected_records = [candidate_records[i] for i in sel.indices]
@@ -729,6 +740,17 @@ def _run_phase_b(args, campaign, config):
             file=_sys.stderr,
         )
         return 3
+    if int(report.n_kept) < int(config.active_batch.final_batch_size):
+        print(
+            "phase_b_final_batch_underfilled_after_anti_overlap: wanted "
+            + str(int(config.active_batch.final_batch_size))
+            + ", kept "
+            + str(int(report.n_kept))
+            + "; diagnostics written to "
+            + str(dedup_path),
+            file=_sys.stderr,
+        )
+        return 3
 
     kept_frames = [selected_frames[i] for i in report.kept_indices]
     _write_xyz_file(kept_frames, final_path)
@@ -769,6 +791,7 @@ def _run_phase_b(args, campaign, config):
         "iteration": int(args.iteration),
         "descriptor": str(descriptor.name),
         "source_ariadne_manifest": str((iter_dir / "ARIADNE_RESULTS.json").resolve()),
+        "expected_final_batch_size": int(config.active_batch.final_batch_size),
         "n_candidates": int(len(candidate_frames)),
         "n_selected_raw": int(len(raw_records)),
         "n_kept": int(len(final_records)),

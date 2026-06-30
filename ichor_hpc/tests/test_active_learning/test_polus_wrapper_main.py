@@ -36,8 +36,9 @@ def test_phase_a_writes_sample_and_index(tmp_path):
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
-    cfg.initial_train_size = 5
-    cfg.initial_val_size = 2
+    cfg.bootstrap.initial_labelled_size = 7
+    cfg.max_iterations = 1
+    cfg.seed_selection.n_seeds_per_iteration = 4
     cfg.to_yaml(campaign / "campaign.yaml")
     _import_pool(campaign, FIXTURE)
 
@@ -53,7 +54,7 @@ def test_phase_a_writes_sample_and_index(tmp_path):
     indices = list(outdir.glob("initial-INDEX-*.dat"))
     assert len(samples) == 1
     assert len(indices) == 1
-    # n_select = 5 + 2 = 7; we expect 7 entries in INDEX.dat
+    # n_select = bootstrap.initial_labelled_size = 7.
     idx_lines = indices[0].read_text(encoding="utf-8").strip().splitlines()
     assert len(idx_lines) == 7
     for ln in idx_lines:
@@ -69,14 +70,14 @@ def test_phase_a_writes_sample_and_index(tmp_path):
     assert manifest["trajectory_sha256"]
 
 
-def test_phase_a_caps_at_pool_size(tmp_path):
-    """If initial_train + initial_val exceed the pool, we cap at the
-    pool size rather than failing."""
+def test_phase_a_fails_when_bootstrap_exceeds_pool_size(tmp_path):
+    """If the bootstrap target exceeds the pool, Phase A fails fast."""
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
-    cfg.initial_train_size = 100
-    cfg.initial_val_size = 100
+    cfg.bootstrap.initial_labelled_size = 100
+    cfg.max_iterations = 1
+    cfg.seed_selection.n_seeds_per_iteration = 4
     cfg.to_yaml(campaign / "campaign.yaml")
     _import_pool(campaign, FIXTURE)
     result = _run([
@@ -84,15 +85,10 @@ def test_phase_a_caps_at_pool_size(tmp_path):
         "--iteration", "-1",
         "--campaign-dir", str(campaign),
     ])
-    assert result.returncode == 0, result.stderr
-    # fixture water_tetramer.xyz has 20 frames -- we cap at that.
+    assert result.returncode == 3
+    assert "pool_feasibility_failed" in result.stderr
     outdir = campaign / "3_DIVERSITY_SAMPLING" / "initial"
-    sample_files = list(outdir.glob("initial-SAMPLE-*.xyz"))
-    assert len(sample_files) == 1
-    assert "-SAMPLE-20." in sample_files[0].name
-    manifest = json.loads((outdir / PHASE_A_SAMPLE_FILENAME).read_text(encoding="utf-8"))
-    assert manifest["n_select"] == 20
-    assert len(manifest["selected_indices"]) == 20
+    assert not list(outdir.glob("initial-SAMPLE-*.xyz"))
 
 
 def _make_seed_result(seed_dir, atom_types, final_coords, alpha_final=1.0):
@@ -200,8 +196,7 @@ def test_phase_b_writes_sample_and_dedup(tmp_path):
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
-    cfg.batch_sizing.floor = 2
-    cfg.batch_sizing.cap = 4
+    cfg.active_batch.final_batch_size = 2
     # synthetic geometries lack ALF assignment so default hybrid_alf_rmsd
     # would crash on the feature extractor. mass-weighted RMSD is the
     # safe choice for unit tests.
@@ -250,7 +245,7 @@ def test_phase_b_rejects_unsafe_accepted_landing_before_fps(tmp_path):
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
-    cfg.batch_sizing.floor = 3
+    cfg.active_batch.final_batch_size = 3
     cfg.phase_b.descriptor = "rmsd_massweight"
     cfg.to_yaml(campaign / "campaign.yaml")
 
@@ -339,6 +334,7 @@ def test_phase_b_accepts_all_missing_landing_safety_with_legacy_override(tmp_pat
     campaign.mkdir()
     cfg = CampaignConfig()
     cfg.phase_b.descriptor = "rmsd_massweight"
+    cfg.active_batch.final_batch_size = 2
     cfg.adversarial_safety.accept_legacy_missing_landing_safety = True
     cfg.to_yaml(campaign / "campaign.yaml")
 

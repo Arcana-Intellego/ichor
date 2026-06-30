@@ -1077,10 +1077,10 @@ def _seed_phase_a_sample(campaign_dir, *, n_frames=2):
         "selected_indices": [int(i) for i in range(n_frames)],
         "descriptor": "rmsd_massweight",
         "n_pool_frames": int(n_frames),
+        "bootstrap_initial_labelled_size": int(n_frames),
+        "reserve_after_bootstrap": 0,
         "trajectory_sha256": "0" * 64,
         "source_pool_manifest": "",
-        "initial_train_size": int(n_frames),
-        "initial_val_size": 0,
     })
     return target
 

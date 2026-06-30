@@ -301,7 +301,7 @@ def test_full_provenance_chain_through_dry_run_executor(tmp_path):
 
     campaign_dir = tmp_path / "campaign"
     cfg = CampaignConfig(max_iterations=2)
-    cfg.batch_sizing.floor = 2
+    cfg.active_batch.final_batch_size = 2
     cfg.seed_selection.n_seeds_per_iteration = 3
     ex = DryRunPhaseExecutor(campaign_dir=campaign_dir, config=cfg)
     state = SimpleNamespace(iteration=0, campaign_uid="uid-e2e")
@@ -380,7 +380,7 @@ def test_full_provenance_chain_two_iterations_grows_index_monotonically(tmp_path
 
     campaign_dir = tmp_path / "campaign"
     cfg = CampaignConfig(max_iterations=3)
-    cfg.batch_sizing.floor = 2
+    cfg.active_batch.final_batch_size = 2
     cfg.seed_selection.n_seeds_per_iteration = 2
     ex = DryRunPhaseExecutor(campaign_dir=campaign_dir, config=cfg)
 

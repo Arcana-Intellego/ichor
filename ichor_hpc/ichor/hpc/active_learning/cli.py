@@ -1003,6 +1003,23 @@ def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path
             ],
         )
     )
+    feasibility = payload.get("pool_feasibility")
+    if isinstance(feasibility, dict):
+        pool_rows = []
+        if feasibility.get("error"):
+            pool_rows.append(("status", "unavailable"))
+            pool_rows.append(("error", feasibility.get("error")))
+        else:
+            pool_rows.extend(
+                [
+                    ("status", "ok" if feasibility.get("ok") else "failed"),
+                    ("frames", feasibility.get("pool_n_frames")),
+                    ("required", feasibility.get("required_pool_frames")),
+                    ("expression", feasibility.get("expression")),
+                ]
+            )
+        lines.append("")
+        lines.extend(_section("Pool Feasibility", pool_rows))
     pending = payload.get("pending_jobs")
     job_rows = []
     if isinstance(pending, dict) and pending:
@@ -1096,6 +1113,14 @@ def _format_status_unavailable(payload: Dict[str, Any]) -> str:
         campaign_rows.append(("stateful artefacts", payload.get("stateful_artifacts_count")))
     if "fresh_init_safe" in payload:
         campaign_rows.append(("fresh init safe", bool(payload.get("fresh_init_safe"))))
+    feasibility = payload.get("pool_feasibility")
+    if isinstance(feasibility, dict):
+        campaign_rows.append(
+            (
+                "pool feasibility",
+                "ok" if feasibility.get("ok") else "failed",
+            )
+        )
     lines.extend(
         _section(
             "Campaign",
@@ -1961,6 +1986,14 @@ def cmd_status(args: argparse.Namespace) -> int:
             "campaign_dir": str(campaign),
         }
         payload.update(_missing_state_context(campaign))
+        try:
+            cfg = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+            payload["pool_feasibility"] = _pool_feasibility_summary(campaign, cfg)
+        except Exception as exc:
+            payload["pool_feasibility"] = {
+                "ok": False,
+                "error": type(exc).__name__ + ": " + str(exc),
+            }
         payload["recommendations"] = recommendation_dicts(
             build_status_recommendations(campaign, payload, paths["journal"])
         )
@@ -1998,6 +2031,14 @@ def cmd_status(args: argparse.Namespace) -> int:
     payload.update(_probe_background_daemon(paths["background_pid"], paths["background_log"]))
     payload["active_submission_intents"] = _load_active_submission_intents(campaign)
     payload["latest_halt_event"] = _latest_journal_event(paths["journal"], "halt")
+    try:
+        cfg = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+        payload["pool_feasibility"] = _pool_feasibility_summary(campaign, cfg)
+    except Exception as exc:
+        payload["pool_feasibility"] = {
+            "ok": False,
+            "error": type(exc).__name__ + ": " + str(exc),
+        }
     try:
         from .daemon.artifact_contracts import (
             artifact_manifest_status,
@@ -3749,6 +3790,19 @@ def _trajectory_pool_summary(campaign: Path) -> Dict[str, Any]:
     }
 
 
+def _pool_feasibility_summary(campaign: Path, config: CampaignConfig) -> Dict[str, Any]:
+    try:
+        from .daemon.pool_feasibility import evaluate_pool_feasibility
+
+        result = evaluate_pool_feasibility(campaign, config)
+        return result.to_dict()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": type(exc).__name__ + ": " + str(exc),
+        }
+
+
 def _print_pool_summary(summary: Dict[str, Any]) -> None:
     if str(summary.get("status")) == "ok":
         print(
@@ -3763,6 +3817,22 @@ def _print_pool_summary(summary: Dict[str, Any]) -> None:
         print("  trajectory pool: missing")
     else:
         print("  trajectory pool: invalid - " + str(summary.get("error", "unknown")))
+
+
+def _print_pool_feasibility(summary: Dict[str, Any]) -> None:
+    if summary.get("error"):
+        print("  pool feasibility: unavailable - " + str(summary.get("error")))
+        return
+    print(
+        "  pool feasibility: "
+        + ("ok" if bool(summary.get("ok")) else "failed")
+        + ", frames="
+        + str(summary.get("pool_n_frames"))
+        + ", required="
+        + str(summary.get("required_pool_frames"))
+    )
+    if summary.get("expression"):
+        print("    " + str(summary.get("expression")))
 
 
 def _bootstrap_fresh_campaign_state(
@@ -3883,13 +3953,14 @@ def cmd_init(args: argparse.Namespace) -> int:
         if default_source.is_file():
             source = default_source.resolve()
 
-    try:
-        bootstrap = _bootstrap_fresh_campaign_state(campaign, config)
-    except CampaignBootstrapError as exc:
-        print("campaign bootstrap failed: " + str(exc), file=sys.stderr)
-        return 16
-
     if source is not None:
+        state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
+        if not state_path.is_file() and stateful_campaign_artifacts(campaign):
+            try:
+                _bootstrap_fresh_campaign_state(campaign, config)
+            except CampaignBootstrapError as exc:
+                print("campaign bootstrap failed: " + str(exc), file=sys.stderr)
+                return 16
         import_rc = _import_pool_impl(args, campaign, source)
         if import_rc != 0:
             return import_rc
@@ -3903,12 +3974,27 @@ def cmd_init(args: argparse.Namespace) -> int:
             "status": "invalid",
             "error": type(exc).__name__ + ": " + str(exc),
         }
+    feasibility_summary: Dict[str, Any] = {}
+    if str(pool_summary.get("status")) == "ok":
+        feasibility_summary = _pool_feasibility_summary(campaign, config)
+        if not bool(feasibility_summary.get("ok", False)):
+            print("campaign bootstrap failed: trajectory pool is infeasible", file=sys.stderr)
+            _print_pool_feasibility(feasibility_summary)
+            return 17
+
+    try:
+        bootstrap = _bootstrap_fresh_campaign_state(campaign, config)
+    except CampaignBootstrapError as exc:
+        print("campaign bootstrap failed: " + str(exc), file=sys.stderr)
+        return 16
 
     state = bootstrap["state"]
     print("Campaign initialised")
     print("  campaign: " + str(campaign))
     print("  campaign.yaml: ok, schema v" + str(config.schema_version))
     _print_pool_summary(pool_summary)
+    if feasibility_summary:
+        _print_pool_feasibility(feasibility_summary)
     print(
         "  state.json: "
         + str(bootstrap["state_status"])
@@ -3940,12 +4026,34 @@ def cmd_import_pool(args: argparse.Namespace) -> int:
 
 
 def cmd_preflight(args: argparse.Namespace) -> int:
+    campaign = resolve_campaign_dir(getattr(args, "campaign_dir", None))
     avail = check_backends()
+    feasibility_ok = True
+    feasibility_summary: Dict[str, Any] = {}
+    try:
+        config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+        feasibility_summary = _pool_feasibility_summary(campaign, config)
+        feasibility_ok = bool(feasibility_summary.get("ok", False))
+    except Exception as exc:
+        feasibility_ok = False
+        feasibility_summary = {
+            "ok": False,
+            "error": type(exc).__name__ + ": " + str(exc),
+        }
     print(json.dumps(asdict(avail), indent=2, sort_keys=True))
-    if avail.all_present:
+    print("")
+    print(json.dumps({"pool_feasibility": feasibility_summary}, indent=2, sort_keys=True))
+    if avail.all_present and feasibility_ok:
         return 0
     print("", file=sys.stderr)
-    print(missing_backend_message(avail), file=sys.stderr)
+    if not avail.all_present:
+        print(missing_backend_message(avail), file=sys.stderr)
+    if not feasibility_ok:
+        print(
+            "trajectory pool feasibility failed: "
+            + str(feasibility_summary.get("error") or feasibility_summary.get("expression")),
+            file=sys.stderr,
+        )
     return 12
 
 

@@ -61,10 +61,37 @@ def test_init_fills_sparse_campaign_yaml_preserving_user_override(tmp_path):
     cfg = CampaignConfig.from_yaml(tmp_path / "campaign.yaml")
     assert cfg.system_name == "MY_SYSTEM"
     assert cfg.gaussian.basis_set == "def2-SVP"
-    assert cfg.seed_selection.n_seeds_per_iteration == 4
+    assert cfg.seed_selection.n_seeds_per_iteration == 8
     raw = (tmp_path / "campaign.yaml").read_text(encoding="utf-8")
     assert "# campaign.yaml" in raw
     assert "seed_selection:" in raw
+
+
+def test_init_refuses_infeasible_pool_before_state_creation(tmp_path, capsys):
+    if not FIXTURE.is_file():
+        pytest.skip("water_tetramer.xyz fixture missing")
+    shutil.copy(FIXTURE, tmp_path / "pool.xyz")
+    (tmp_path / "campaign.yaml").write_text(
+        "schema_version: 6\n"
+        "max_iterations: 2\n"
+        "bootstrap:\n"
+        "  initial_labelled_size: 12\n"
+        "active_batch:\n"
+        "  final_batch_size: 4\n"
+        "seed_selection:\n"
+        "  n_seeds_per_iteration: 8\n",
+        encoding="utf-8",
+    )
+
+    rc = cmd_init(_args(tmp_path))
+
+    assert rc == 17
+    err = capsys.readouterr().err
+    assert "trajectory pool is infeasible" in err
+    assert "12 + 2 * 8 = 28" in err
+    assert not (
+        tmp_path / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
+    ).exists()
 
 
 def test_init_reports_missing_default_pool(tmp_path, capsys):

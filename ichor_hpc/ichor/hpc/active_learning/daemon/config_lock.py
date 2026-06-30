@@ -173,7 +173,7 @@ ALWAYS_SAFE_RESOURCE_EXACT = {
 
 FUTURE_SAFE_PREFIXES = {
     "seed_selection.",
-    "batch_sizing.",
+    "active_batch.",
     "anti_overlap.",
     "phase_b.",
     "geometry_novelty.",
@@ -218,6 +218,7 @@ FUTURE_SAFE_EXACT = {
 }
 
 ARIADNE_OUTPUT_INTERPRETATION_PREFIXES = {
+    "seed_selection.",
     "geometry_novelty.",
     "adversarial_safety.",
     "ariadne.",
@@ -243,6 +244,7 @@ ARIADNE_OUTPUT_INTERPRETATION_EXACT = {
 }
 
 PHASE_B_OUTPUT_INTERPRETATION_PREFIXES = {
+    "active_batch.",
     "anti_overlap.",
     "phase_b.",
     "geometry_novelty.",
@@ -297,8 +299,7 @@ COMMITTED_LOCKED_EXACT = {
 CAMPAIGN_LOCKED_EXACT = {
     "schema_version",
     "system_name",
-    "initial_train_size",
-    "initial_val_size",
+    "bootstrap.initial_labelled_size",
     "gaussian.method",
     "gaussian.basis_set",
     "gaussian.charge",

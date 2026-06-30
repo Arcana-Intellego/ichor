@@ -549,6 +549,50 @@ def test_phase_b_config_change_blocks_after_selection_exists(tmp_path):
     assert review.blocked_changes[0].category == "postprocess_locked"
 
 
+def test_active_batch_change_blocks_after_phase_b_selection_exists(tmp_path):
+    campaign = _campaign(tmp_path)
+    original = CampaignConfig()
+    write_config_lock(campaign, original)
+    changed = CampaignConfig()
+    changed.active_batch.final_batch_size = 5
+    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
+    iter_dir.mkdir(parents=True)
+    (iter_dir / "PHASE_B_SELECTION.json").write_text("{}", encoding="utf-8")
+
+    proposed = fresh_campaign_state()
+    proposed.phase = CampaignPhase.PHASE_B_POLUS
+    proposed.iteration = 0
+    review = review_config_changes(campaign, changed, proposed)
+
+    assert not review.allowed
+    assert [c.path for c in review.blocked_changes] == [
+        "active_batch.final_batch_size"
+    ]
+    assert "Phase B" in review.blocked_changes[0].reason
+
+
+def test_seed_selection_change_blocks_after_ariadne_result_exists(tmp_path):
+    campaign = _campaign(tmp_path)
+    original = CampaignConfig()
+    write_config_lock(campaign, original)
+    changed = CampaignConfig()
+    changed.seed_selection.n_seeds_per_iteration = 49
+    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000" / "pool" / "seed_0000"
+    iter_dir.mkdir(parents=True)
+    (iter_dir / "result.json").write_text("{}", encoding="utf-8")
+
+    proposed = fresh_campaign_state()
+    proposed.phase = CampaignPhase.ARIADNE_ARRAY
+    proposed.iteration = 0
+    review = review_config_changes(campaign, changed, proposed)
+
+    assert not review.allowed
+    assert [c.path for c in review.blocked_changes] == [
+        "seed_selection.n_seeds_per_iteration"
+    ]
+    assert "ARIADNE" in review.blocked_changes[0].reason
+
+
 def test_geometry_novelty_change_allowed_before_phase_b_outputs(tmp_path):
     campaign = _campaign(tmp_path)
     original = CampaignConfig()

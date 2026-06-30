@@ -329,7 +329,18 @@ class DryRunPhaseExecutor:
         if selection.n <= 0:
             raise BackendSubmissionError(
                 "seed_pool_exhausted: no eligible trajectory frames remain "
-                "after training/recent-seed exclusion"
+                "after training/recent-seed exclusion; requested="
+                + str(requested_n)
+                + ", training_forbidden="
+                + str(len(training_forbidden))
+                + ", recent_forbidden="
+                + str(len(recent_forbidden))
+                + ", forbidden_union="
+                + str(len(forbidden))
+                + ", skip_training_seeds="
+                + str(bool(getattr(self.config.anti_overlap, "skip_training_seeds", True)))
+                + ", recent_seeds_cooldown="
+                + str(int(getattr(self.config.anti_overlap, "recent_seeds_cooldown", 0)))
             )
         if selection.n < requested_n:
             raise BackendSubmissionError(
@@ -337,6 +348,16 @@ class DryRunPhaseExecutor:
                 + str(selection.n)
                 + " eligible trajectory frames remain for requested batch "
                 + str(requested_n)
+                + "; training_forbidden="
+                + str(len(training_forbidden))
+                + ", recent_forbidden="
+                + str(len(recent_forbidden))
+                + ", forbidden_union="
+                + str(len(forbidden))
+                + ", skip_training_seeds="
+                + str(bool(getattr(self.config.anti_overlap, "skip_training_seeds", True)))
+                + ", recent_seeds_cooldown="
+                + str(int(getattr(self.config.anti_overlap, "recent_seeds_cooldown", 0)))
             )
 
         bulk_set = {int(i) for i in selection.bulk_indices}
@@ -531,20 +552,19 @@ class DryRunPhaseExecutor:
                 alpha_f = 0.0
             alphas.append(alpha_f)
 
-        # if we ended up with nothing (no seed dirs at all, eg SEED_SELECT
-        # ran without a trajectory pool), fall back to the batch_sizing
-        # floor so APPEND still has something to do. this matches the
-        # previous stub behaviour exactly.
+        # If we ended up with nothing (no seed dirs at all, eg SEED_SELECT
+        # ran without a trajectory pool), fall back to the final active batch
+        # size so APPEND still has something to do in synthetic dry runs.
         if not alphas:
-            floor = int(self.config.batch_sizing.floor)
+            final_batch_size = int(self.config.active_batch.final_batch_size)
             payload = {
                 "strategy": self.config.split.strategy,
                 "train_fraction": self.config.split.train_fraction,
                 "val_mid_fraction": self.config.split.val_mid_fraction,
                 "high_holdout_fraction": self.config.split.high_holdout_fraction,
                 "iteration": state.iteration,
-                "train_indices": list(range(floor)),
-                "val_indices": [floor],
+                "train_indices": list(range(final_batch_size)),
+                "val_indices": [final_batch_size],
                 "holdout_indices": [],
             }
             atomic_write_json(split_path, payload)
@@ -693,6 +713,7 @@ class DryRunPhaseExecutor:
             iteration=int(state.iteration),
             training_set_version=int(next_version),
             n_committed_points=int(len(committed_pointdirs)),
+            expected_final_batch_size=int(self.config.active_batch.final_batch_size),
         )
         self.artefact_log.append(str(self._iter_dir(state.iteration) / "APPEND_marker"))
         return {"training_set_version": int(next_version)}
@@ -797,7 +818,7 @@ class DryRunPhaseExecutor:
 
         outdir = self.campaign_dir / self.diversity_dir_name / "initial"
         outdir.mkdir(parents=True, exist_ok=True)
-        n = self.config.initial_train_size + self.config.initial_val_size
+        n = int(self.config.bootstrap.initial_labelled_size)
         sample = outdir / ("initial-SAMPLE-" + str(n) + ".xyz")
         sample.write_text(
             "# DRYRUN POLUS Phase-A sample (n=" + str(n) + ")\n",
@@ -815,10 +836,10 @@ class DryRunPhaseExecutor:
             "selected_indices": [int(i) for i in range(n)],
             "descriptor": "rmsd_massweight",
             "n_pool_frames": int(n),
+            "bootstrap_initial_labelled_size": int(n),
+            "reserve_after_bootstrap": 0,
             "trajectory_sha256": "",
             "source_pool_manifest": "",
-            "initial_train_size": int(self.config.initial_train_size),
-            "initial_val_size": int(self.config.initial_val_size),
         })
         self.artefact_log.extend([str(sample), str(index), str(manifest)])
         return {}
@@ -1173,6 +1194,17 @@ class DryRunPhaseExecutor:
                             "alpha_final": None,
                         })
         final_records = []
+        final_batch_size = int(self.config.active_batch.final_batch_size)
+        n_accepted_candidates = len(accepted)
+        if n_accepted_candidates < final_batch_size:
+            raise BackendSubmissionError(
+                "active_batch_underfilled: wanted final_batch_size="
+                + str(final_batch_size)
+                + " but only "
+                + str(n_accepted_candidates)
+                + " safe ARIADNE candidates are available"
+            )
+        accepted = accepted[:final_batch_size]
         if pool_dir.is_dir():
             for seed_dir in sorted(pool_dir.iterdir()):
                 if not seed_dir.is_dir():
@@ -1228,7 +1260,8 @@ class DryRunPhaseExecutor:
             "iteration": int(state.iteration),
             "descriptor": str(self.config.phase_b.descriptor),
             "source_ariadne_manifest": ariadne_manifest_path,
-            "n_candidates": int(len(accepted)),
+            "expected_final_batch_size": int(final_batch_size),
+            "n_candidates": int(n_accepted_candidates),
             "n_selected_raw": int(len(final_records)),
             "n_kept": int(len(final_records)),
             "raw": list(final_records),
@@ -1448,7 +1481,11 @@ class DryRunPhaseExecutor:
             / ("initial" if initial else ("iter_" + str(state.iteration)))
         )
         staging_root.mkdir(parents=True, exist_ok=True)
-        n_points = max(1, min(self.config.batch_sizing.floor, 3))
+        n_points = (
+            int(self.config.bootstrap.initial_labelled_size)
+            if bool(initial)
+            else int(self.config.active_batch.final_batch_size)
+        )
         for i in range(n_points):
             point_dir = staging_root / ("POINT_" + str(i).zfill(4) + ".pointdir")
             point_dir.mkdir(exist_ok=True)

@@ -47,7 +47,6 @@ from ichor.hpc.active_learning.config import (
     VALID_ACQUISITION_DRIVER_GRADIENT_BACKENDS,
     VALID_ACQUISITION_DRIVER_OBJECTIVES,
     VALID_CALIBRATED_ENERGY_UTILITIES,
-    VALID_BATCH_POLICIES,
     VALID_DESCRIPTORS,
     VALID_ERROR_CALIBRATION_MODES,
     VALID_ERROR_CALIBRATION_MODEL_VERSION_POLICIES,
@@ -859,28 +858,6 @@ class EditCampaignConfigFunctions:
         _unsupported_sequential_field_editor()
 
     @staticmethod
-    def edit_initial_subsample():
-        _campaign_config.initial_train_size = user_input_int(
-            "initial_train_size: ", _campaign_config.initial_train_size,
-        )
-        _campaign_config.initial_val_size = user_input_int(
-            "initial_val_size: ", _campaign_config.initial_val_size,
-        )
-        _sync_options_from_config()
-
-    @staticmethod
-    def edit_batch_sizing():
-        b = _campaign_config.batch_sizing
-        chosen = user_input_restricted(
-            sorted(VALID_BATCH_POLICIES), "batch_sizing.policy: ", b.policy,
-        )
-        if chosen is not None:
-            b.policy = chosen
-        b.floor = user_input_int("batch_sizing.floor: ", b.floor)
-        b.cap = user_input_int("batch_sizing.cap: ", b.cap)
-        _sync_options_from_config()
-
-    @staticmethod
     def edit_seed_selection():
         s = _campaign_config.seed_selection
         s.n_seeds_per_iteration = user_input_int(
@@ -1311,8 +1288,6 @@ for _legacy_editor_name in (
     "edit_iteration_control",
     "edit_resources",
     "edit_gaussian",
-    "edit_initial_subsample",
-    "edit_batch_sizing",
     "edit_seed_selection",
     "edit_anti_overlap",
     "edit_phase_b",
@@ -1367,12 +1342,11 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("poll_sacct_empty_max_ticks", "int", prompt="poll_sacct_empty_max_ticks (0 disables empty-sacct escalation): "),
         ],
     ),
-    "Edit initial sub-sample sizes": _make_block_menu(
-        "Edit Initial Sub-Sample Sizes",
-        "Initial POLUS train/validation sample sizes.",
+    "Edit bootstrap": _make_block_menu(
+        "Edit Bootstrap",
+        "Initial labelled-set size before active learning begins.",
         [
-            _spec("initial_train_size", "int"),
-            _spec("initial_val_size", "int"),
+            _spec("bootstrap.initial_labelled_size", "int"),
         ],
     ),
     "Edit resource defaults": _make_block_menu(
@@ -1463,13 +1437,11 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("aimall.iasmesh", "choice", choices=sorted(VALID_AIMALL_IASMESH_VALUES)),
         ],
     ),
-    "Edit batch_sizing": _make_block_menu(
-        "Edit batch_sizing",
-        "Batch size policy for later active-learning iterations.",
+    "Edit active_batch": _make_block_menu(
+        "Edit active_batch",
+        "Fixed final Phase-B batch size for active-learning iterations.",
         [
-            _spec("batch_sizing.policy", "choice", choices=sorted(VALID_BATCH_POLICIES)),
-            _spec("batch_sizing.floor", "int"),
-            _spec("batch_sizing.cap", "int"),
+            _spec("active_batch.final_batch_size", "int"),
         ],
     ),
     "Edit seed_selection": _make_block_menu(
@@ -1887,7 +1859,7 @@ edit_campaign_config_menu_items = [
     _block_submenu_item("Edit campaign identity"),
     _block_submenu_item("Edit trajectory_pool"),
     _block_submenu_item("Edit iteration control"),
-    _block_submenu_item("Edit initial sub-sample sizes"),
+    _block_submenu_item("Edit bootstrap"),
     _block_submenu_item("Edit resource defaults"),
     _block_submenu_item("Edit POLUS resources"),
     _block_submenu_item("Edit Gaussian runtime resources"),
@@ -1896,7 +1868,7 @@ edit_campaign_config_menu_items = [
     _block_submenu_item("Edit FEREBUS resources"),
     _block_submenu_item("Edit Gaussian block"),
     _block_submenu_item("Edit AIMAll block"),
-    _block_submenu_item("Edit batch_sizing"),
+    _block_submenu_item("Edit active_batch"),
     _block_submenu_item("Edit seed_selection"),
     _block_submenu_item("Edit anti_overlap"),
     _block_submenu_item("Edit phase_b"),

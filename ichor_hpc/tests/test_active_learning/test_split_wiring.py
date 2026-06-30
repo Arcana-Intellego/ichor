@@ -45,7 +45,7 @@ def _seed_pool_with_alphas(campaign_dir: Path, iteration: int, alphas):
 def test_inline_split_honours_strategy(tmp_path, strategy):
     cfg = CampaignConfig()
     cfg.split.strategy = strategy
-    cfg.batch_sizing.floor = 2
+    cfg.active_batch.final_batch_size = 2
     cfg.seed_selection.n_seeds_per_iteration = 6
     ex = DryRunPhaseExecutor(campaign_dir=tmp_path / "c", config=cfg)
     state = fresh_campaign_state(max_iterations=1)
@@ -81,7 +81,7 @@ def test_inline_split_empty_pool_falls_back_to_floor(tmp_path):
     still has something to do. matches the previous behaviour exactly.
     """
     cfg = CampaignConfig()
-    cfg.batch_sizing.floor = 4
+    cfg.active_batch.final_batch_size = 4
     ex = DryRunPhaseExecutor(campaign_dir=tmp_path / "c", config=cfg)
     state = fresh_campaign_state(max_iterations=1)
     state.iteration = 0

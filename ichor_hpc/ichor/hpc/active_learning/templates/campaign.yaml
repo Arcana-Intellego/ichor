@@ -2,7 +2,7 @@
 # Generic first-live-iteration active-learning campaign for CSF3/CSF4.
 # Intended for a small validation run, not a long production campaign.
 
-schema_version: 5
+schema_version: 6
 
 # -------------------------------------------------------------------------
 # Required system-level identifiers
@@ -19,10 +19,10 @@ poll_interval_seconds: 60
 poll_interval_idle_seconds: 120
 poll_sacct_empty_max_ticks: 10
 
-# Keep first-live examples small enough to debug quickly.
-# Increase for real campaigns.
-initial_train_size: 24
-initial_val_size: 6
+# Keep first-live examples small enough to debug quickly. With the default
+# 20-frame smoke pool, 12 + 1 * 8 = 20 frames are required.
+bootstrap:
+  initial_labelled_size: 12
 
 failure_threshold_fraction: 0.5
 
@@ -46,17 +46,14 @@ outlier_filter:
   per_atom_rmsd_z_threshold: 4.0
 
 # -------------------------------------------------------------------------
-# Batch sizing and seed selection
+# Active batch and seed selection
 # -------------------------------------------------------------------------
 
-# Small first-live batch. For a real campaign, use larger values.
-batch_sizing:
-  policy: fixed
-  floor: 4
-  cap: 4
+active_batch:
+  final_batch_size: 4
 
 seed_selection:
-  n_seeds_per_iteration: 4
+  n_seeds_per_iteration: 8
   bulk_fraction: 0.5
   variance_chunk_size: 512
   strategy: hybrid_variance

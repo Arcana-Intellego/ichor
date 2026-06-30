@@ -40,7 +40,7 @@ def _make_campaign(tmp_path, *, max_iterations=2):
     campaign = tmp_path / "campaign"
     campaign.mkdir()
     cfg = CampaignConfig(max_iterations=max_iterations, poll_interval_seconds=1)
-    cfg.batch_sizing.floor = 2
+    cfg.active_batch.final_batch_size = 2
     cfg.seed_selection.n_seeds_per_iteration = 2
     return campaign, cfg
 

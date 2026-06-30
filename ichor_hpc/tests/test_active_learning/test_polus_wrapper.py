@@ -10,23 +10,14 @@ from ichor.hpc.active_learning.sampling.polus_wrapper import (
 from ichor.hpc.active_learning.config import CampaignConfig
 
 
-def test_phase_b_target_size_grows_with_iteration():
-    # A40/A41: the batch USED to be pinned to floor forever (min(floor, n, cap), and since
-    # cap >= floor that collapsed to min(floor, n)). it should now grow with iteration, capped.
+def test_phase_b_target_size_is_fixed_final_batch_size():
     cfg = CampaignConfig()
-    cfg.batch_sizing.floor = 5
-    cfg.batch_sizing.cap = 30
+    cfg.active_batch.final_batch_size = 5
     plenty = 1000  # never let the candidate pool be the binding constraint
-    cfg.batch_sizing.policy = "linear"
-    assert _phase_b_target_size(cfg, plenty, iteration=0) == 5     # floor at iter 0
-    assert _phase_b_target_size(cfg, plenty, iteration=5) == 10    # floor + iteration
-    assert _phase_b_target_size(cfg, plenty, iteration=100) == 30  # capped
-    cfg.batch_sizing.policy = "fixed"
-    assert _phase_b_target_size(cfg, plenty, iteration=50) == 5    # ignores iteration
-    cfg.batch_sizing.policy = "sqrt"
-    assert _phase_b_target_size(cfg, plenty, iteration=3) == 10    # round(5*sqrt(4)) = 10
-    # never keep more than the candidate pool actually holds
-    assert _phase_b_target_size(cfg, 3, iteration=100) == 3
+    assert _phase_b_target_size(cfg, plenty, iteration=0) == 5
+    assert _phase_b_target_size(cfg, plenty, iteration=100) == 5
+    with pytest.raises(ValueError, match="active_batch_underfilled"):
+        _phase_b_target_size(cfg, 3, iteration=100)
 
 
 def _line_distance_matrix(n, spacing=1.0):

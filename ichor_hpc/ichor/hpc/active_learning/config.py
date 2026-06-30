@@ -1,8 +1,8 @@
-"""Campaign configuration -- schema v5.
+"""Campaign configuration -- schema v6.
 
-Schema v5 keeps geometry-novelty scale estimation public while moving the
-size-dependent Phase B and ARIADNE geometry coefficients into internal
-protocol constants.
+Schema v6 makes the active-learning batch protocol explicit: bootstrap
+controls the initial labelled set, seed_selection controls ARIADNE attempts,
+and active_batch controls the fixed final Phase-B batch size.
 """
 from __future__ import annotations
 
@@ -45,7 +45,8 @@ __all__ = [
     "CampaignConfig",
     "TrajectoryPoolConfigBlock",
     "OutlierFilterConfigBlock",
-    "BatchSizingConfigBlock",
+    "BootstrapConfigBlock",
+    "ActiveBatchConfigBlock",
     "SeedSelectionConfigBlock",
     "AntiOverlapConfigBlock",
     "PhaseBConfigBlock",
@@ -76,7 +77,6 @@ __all__ = [
     "CONFIG_SCHEMA_VERSION",
     "ConfigValidationError",
     "AimallConfigBlock",
-    "VALID_BATCH_POLICIES",
     "VALID_WARMSTART",
     "VALID_DESCRIPTORS",
     "VALID_GEOMETRY_NOVELTY_SCALE_SOURCES",
@@ -110,7 +110,6 @@ class ConfigValidationError(ValueError):
     """Raised when campaign.yaml fails to validate."""
 
 
-VALID_BATCH_POLICIES = frozenset({"linear", "sqrt", "fixed"})
 VALID_WARMSTART = frozenset({"always", "never", "adaptive"})
 VALID_DESCRIPTORS = frozenset({
     "rmsd_massweight", "hybrid_alf_rmsd", "acquisition_weighted",
@@ -470,10 +469,13 @@ class OutlierFilterConfigBlock:
 
 
 @dataclass
-class BatchSizingConfigBlock:
-    policy: str = "linear"
-    floor: int = 5
-    cap: int = 30
+class BootstrapConfigBlock:
+    initial_labelled_size: int = 12
+
+
+@dataclass
+class ActiveBatchConfigBlock:
+    final_batch_size: int = 4
 
 
 @dataclass
@@ -978,7 +980,7 @@ class AimallConfigBlock:
 
 @dataclass
 class CampaignConfig:
-    """Top-level campaign configuration (schema v5)."""
+    """Top-level campaign configuration (schema v6)."""
 
     schema_version: int = CONFIG_SCHEMA_VERSION
 
@@ -996,9 +998,6 @@ class CampaignConfig:
     #daemon would poll indefinitely. Set to 0 to disable the escalation.
     poll_sacct_empty_max_ticks: int = 10
 
-    initial_train_size: int = 250
-    initial_val_size: int = 50
-
     failure_threshold_fraction: float = 0.5
     max_acquisition_grad_per_ang: Optional[float] = None
     max_force_per_atom_ha_per_ang: float = 50.0
@@ -1009,8 +1008,11 @@ class CampaignConfig:
     outlier_filter: OutlierFilterConfigBlock = field(
         default_factory=OutlierFilterConfigBlock
     )
-    batch_sizing: BatchSizingConfigBlock = field(
-        default_factory=BatchSizingConfigBlock
+    bootstrap: BootstrapConfigBlock = field(
+        default_factory=BootstrapConfigBlock
+    )
+    active_batch: ActiveBatchConfigBlock = field(
+        default_factory=ActiveBatchConfigBlock
     )
     seed_selection: SeedSelectionConfigBlock = field(
         default_factory=SeedSelectionConfigBlock
@@ -1221,22 +1223,25 @@ class CampaignConfig:
             raise ConfigValidationError("poll_interval_idle_seconds must be >= 1")
         if self.poll_sacct_empty_max_ticks < 0:
             raise ConfigValidationError("poll_sacct_empty_max_ticks must be >= 0")
-        if self.initial_train_size <= 0 or self.initial_val_size < 0:
-            raise ConfigValidationError("initial train/val sizes must be positive")
-        if self.batch_sizing.policy not in VALID_BATCH_POLICIES:
+        if self.bootstrap.initial_labelled_size <= 0:
             raise ConfigValidationError(
-                "batch_sizing.policy must be one of " + repr(sorted(VALID_BATCH_POLICIES))
+                "bootstrap.initial_labelled_size must be > 0"
             )
-        if (
-            self.batch_sizing.floor < 1
-            or self.batch_sizing.cap < self.batch_sizing.floor
-        ):
+        if self.active_batch.final_batch_size <= 0:
             raise ConfigValidationError(
-                "batch_sizing.cap must be >= batch_sizing.floor >= 1"
+                "active_batch.final_batch_size must be > 0"
             )
         if self.seed_selection.n_seeds_per_iteration <= 0:
             raise ConfigValidationError(
                 "seed_selection.n_seeds_per_iteration must be > 0"
+            )
+        if (
+            int(self.seed_selection.n_seeds_per_iteration)
+            < int(self.active_batch.final_batch_size)
+        ):
+            raise ConfigValidationError(
+                "seed_selection.n_seeds_per_iteration must be >= "
+                "active_batch.final_batch_size"
             )
         if not 0.0 <= self.seed_selection.bulk_fraction <= 1.0:
             raise ConfigValidationError(

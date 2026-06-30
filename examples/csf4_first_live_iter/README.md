@@ -306,21 +306,19 @@ A minimal `campaign.yaml` (also shipped at
 `examples/csf4_first_live_iter/campaign.yaml`):
 
 ```yaml
-schema_version: 5
+schema_version: 6
 
 max_iterations: 1
 poll_interval_seconds: 60
 
-initial_train_size: 8
-initial_val_size: 2
+bootstrap:
+  initial_labelled_size: 12
 
-batch_sizing:
-  policy: linear
-  floor: 4
-  cap: 8
+active_batch:
+  final_batch_size: 4
 
 seed_selection:
-  n_seeds_per_iteration: 4
+  n_seeds_per_iteration: 8
   bulk_fraction: 0.5
 
 resources:
@@ -372,7 +370,7 @@ runtime:
   transient_phase_retry_max: 1
 ```
 
-These are deliberately tight numbers (small initial sample, few seeds,
+These are deliberately tight numbers (small initial labelled set, few seeds,
 modest ARIADNE iteration budget) so the whole run finishes inside two
 hours. The whole point of the smoke is to prove the pipeline works at
 all -- the production sizes for a real campaign live in the spectroscopy
@@ -437,7 +435,7 @@ should have:
 **sampling outputs** at the iteration directory:
 
 - `phase_b_SAMPLE.xyz` exists with the expected frame count
-  (`batch_sizing.floor` = 4)
+  (`active_batch.final_batch_size` = 4)
 - `phase_b_dedup.json` exists; `n_dropped` is 0 by default (min_separation
   = 0.0 means the filter is off)
 
@@ -472,7 +470,7 @@ at 50; if individual seed descents still take too long, lower it. Real
 campaigns use 200; we use 50 here just for the smoke.
 
 **FEREBUS training fails to converge**. usually means the initial training
-set is too small or too clustered. bump `initial_train_size` and try
+set is too small or too clustered. bump `bootstrap.initial_labelled_size` and try
 again. or check that the Gaussian + AIMAll outputs in the pointdirs look
 reasonable.
 

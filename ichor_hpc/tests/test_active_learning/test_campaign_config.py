@@ -1,4 +1,4 @@
-"""Tests for ichor.hpc.active_learning.config -- schema v5."""
+"""Tests for ichor.hpc.active_learning.config -- schema v6."""
 from pathlib import Path
 
 import pytest
@@ -29,13 +29,15 @@ from ichor.hpc.active_learning.geometry_protocol import (
 )
 
 
-def test_schema_version_is_five():
-    assert CONFIG_SCHEMA_VERSION == 5
+def test_schema_version_is_six():
+    assert CONFIG_SCHEMA_VERSION == 6
 
 
 def test_default_campaign_config_is_valid():
     c = CampaignConfig()
     c._validate()
+    assert c.bootstrap.initial_labelled_size == 12
+    assert c.active_batch.final_batch_size == 4
     assert c.quality_gates.require_readable_aimall_geometry is True
     assert c.quality_gates.require_finite_iqa is True
     assert c.quality_gates.require_finite_integration_error is True
@@ -286,7 +288,7 @@ def test_schema_v3_resources_migrate_to_current_grouped_schema():
         },
     }
     cfg = CampaignConfig.from_dict(payload)
-    assert cfg.schema_version == 5
+    assert cfg.schema_version == 6
     assert cfg.resources.defaults.partition == "multicore"
     assert cfg.resources.defaults.walltime_hours == 12
     assert cfg.resources.polus.walltime_hours == 1
@@ -593,7 +595,7 @@ def test_schema_v4_geometry_knobs_migrate_out_of_public_config():
 
     cfg = CampaignConfig.from_dict(payload)
 
-    assert cfg.schema_version == 5
+    assert cfg.schema_version == 6
     assert not hasattr(cfg.phase_b, "min_separation")
     assert not hasattr(cfg.phase_b, "min_separation_scaled")
     assert not hasattr(cfg.geometry_novelty, "score_transform")
@@ -608,6 +610,29 @@ def test_schema_v5_rejects_removed_geometry_knobs():
 
     with pytest.raises(ConfigValidationError, match="unknown keys"):
         CampaignConfig.from_dict(payload)
+
+
+def test_schema_v5_bootstrap_and_batch_fields_migrate_to_v6():
+    payload = CampaignConfig().to_dict()
+    payload["schema_version"] = 5
+    payload.pop("bootstrap", None)
+    payload.pop("active_batch", None)
+    payload["initial_train_size"] = 24
+    payload["initial_val_size"] = 6
+    payload["batch_sizing"] = {
+        "policy": "linear",
+        "floor": 5,
+        "cap": 30,
+    }
+
+    cfg = CampaignConfig.from_dict(payload)
+
+    assert cfg.schema_version == 6
+    assert cfg.bootstrap.initial_labelled_size == 30
+    assert cfg.active_batch.final_batch_size == 5
+    assert not hasattr(cfg, "initial_train_size")
+    assert not hasattr(cfg, "initial_val_size")
+    assert not hasattr(cfg, "batch_sizing")
 
 
 def test_invalid_split_strategy_rejected():
@@ -696,11 +721,11 @@ def test_max_iterations_must_be_positive():
         CampaignConfig.from_dict(payload)
 
 
-def test_batch_sizing_cap_must_be_at_least_floor():
+def test_active_batch_cannot_exceed_ariadne_seed_count():
     payload = CampaignConfig().to_dict()
-    payload["batch_sizing"]["floor"] = 10
-    payload["batch_sizing"]["cap"] = 5
-    with pytest.raises(ConfigValidationError):
+    payload["seed_selection"]["n_seeds_per_iteration"] = 3
+    payload["active_batch"]["final_batch_size"] = 4
+    with pytest.raises(ConfigValidationError, match="active_batch.final_batch_size"):
         CampaignConfig.from_dict(payload)
 
 

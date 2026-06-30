@@ -466,10 +466,10 @@ def _live_smoke_seed_for_phase(campaign_dir, phase_name, iteration):
             "selected_indices": [0, 1],
             "descriptor": "rmsd_massweight",
             "n_pool_frames": 2,
+            "bootstrap_initial_labelled_size": 2,
+            "reserve_after_bootstrap": 0,
             "trajectory_sha256": "0" * 64,
             "source_pool_manifest": "",
-            "initial_train_size": 1,
-            "initial_val_size": 1,
         })
     elif phase_name in ("INITIAL_GAUSSIAN", "INITIAL_AIMALL"):
         target = campaign_dir / ".DATA" / "STAGING" / "initial"
@@ -598,7 +598,7 @@ def test_live_one_iter_water_tetramer_after_parsers_land(tmp_path, monkeypatch):
     campaign = tmp_path / "campaign"
     campaign.mkdir()
     cfg = CampaignConfig(max_iterations=1, poll_interval_seconds=1)
-    cfg.batch_sizing.floor = 2
+    cfg.active_batch.final_batch_size = 2
     cfg.seed_selection.n_seeds_per_iteration = 2
 
     call_log = []
@@ -737,7 +737,7 @@ def test_live_one_iter_whitened_distance_fallback(tmp_path, monkeypatch):
     campaign = tmp_path / "campaign"
     campaign.mkdir()
     cfg = CampaignConfig(max_iterations=1, poll_interval_seconds=1)
-    cfg.batch_sizing.floor = 2
+    cfg.active_batch.final_batch_size = 2
     cfg.seed_selection.n_seeds_per_iteration = 2
 
     call_log = []
@@ -833,7 +833,7 @@ def test_live_one_iter_prefers_dedup_filtered_sample(tmp_path, monkeypatch):
     campaign = tmp_path / "campaign"
     campaign.mkdir()
     cfg = CampaignConfig(max_iterations=1, poll_interval_seconds=1)
-    cfg.batch_sizing.floor = 2
+    cfg.active_batch.final_batch_size = 2
     cfg.seed_selection.n_seeds_per_iteration = 2
 
     call_log = []

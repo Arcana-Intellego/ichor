@@ -141,7 +141,7 @@ def test_min_separation_zero_drops_nothing(tmp_path):
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
-    cfg.batch_sizing.floor = 3
+    cfg.active_batch.final_batch_size = 3
     cfg.phase_b.descriptor = "rmsd_massweight"
     cfg.to_yaml(campaign / "campaign.yaml")
     iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
@@ -162,13 +162,14 @@ def test_min_separation_zero_drops_nothing(tmp_path):
     assert d["n_dropped"] == 0
 
 
-def test_min_separation_drops_close_candidates(tmp_path):
+def test_min_separation_underfills_after_dropping_close_candidates(tmp_path):
     """With a training point coincident with one of the candidates
-    and a positive derived minimum separation, the matching candidate gets dropped."""
+    and a positive derived minimum separation, Phase B must fail if the remaining
+    candidates cannot still fill the configured active batch."""
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
-    cfg.batch_sizing.floor = 3
+    cfg.active_batch.final_batch_size = 3
     cfg.phase_b.descriptor = "rmsd_massweight"
     cfg.geometry_novelty.fallback_scale_angstrom = 0.2
     cfg.to_yaml(campaign / "campaign.yaml")
@@ -206,16 +207,14 @@ def test_min_separation_drops_close_candidates(tmp_path):
     rc = _run(["--descriptor", "rmsd_massweight",
                "--iteration", "0",
                "--campaign-dir", str(campaign)])
-    assert rc.returncode == 0, rc.stderr
+    assert rc.returncode == 3
+    assert "phase_b_final_batch_underfilled_after_anti_overlap" in rc.stderr
     dedup = iter_dir / "phase_b_dedup.json"
     d = json.loads(dedup.read_text(encoding="utf-8"))
     # at least one candidate should have been dropped (the duplicate).
     assert d["n_dropped"] >= 1
     assert d["min_separation"] == 0.1
-    # the final SAMPLE.xyz should contain fewer frames than the raw file.
-    raw_lines = (iter_dir / "phase_b_SAMPLE_raw.xyz").read_text(encoding="utf-8").splitlines()
-    final_lines = (iter_dir / "phase_b_SAMPLE.xyz").read_text(encoding="utf-8").splitlines()
-    assert len(final_lines) < len(raw_lines)
+    assert not (iter_dir / "PHASE_B_SELECTION.json").exists()
 
 
 def test_min_separation_all_candidates_removed_fails_at_phase_b(tmp_path):
@@ -225,7 +224,7 @@ def test_min_separation_all_candidates_removed_fails_at_phase_b(tmp_path):
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
-    cfg.batch_sizing.floor = 3
+    cfg.active_batch.final_batch_size = 3
     cfg.phase_b.descriptor = "rmsd_massweight"
     cfg.geometry_novelty.fallback_scale_angstrom = 0.2
     cfg.to_yaml(campaign / "campaign.yaml")
@@ -265,7 +264,7 @@ def test_scaled_min_separation_rescues_farthest_non_duplicate(tmp_path):
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
-    cfg.batch_sizing.floor = 3
+    cfg.active_batch.final_batch_size = 1
     cfg.phase_b.descriptor = "rmsd_massweight"
     cfg.geometry_novelty.fallback_scale_angstrom = 10.0
 

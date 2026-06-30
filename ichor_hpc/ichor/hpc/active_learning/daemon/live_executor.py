@@ -841,6 +841,16 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             if self.partition is not None
             else str(self.config.resources.partition_for(phase_name))
         )
+        if phase_name == "PHASE_A_POLUS":
+            from .pool_feasibility import require_pool_feasibility
+
+            feasibility = require_pool_feasibility(camp, self.config)
+            self._journal_event(
+                "pool_feasibility_checked",
+                phase=phase_name,
+                **feasibility.to_dict(),
+            )
+            return None
         if phase_name in ("INITIAL_GAUSSIAN", "GAUSSIAN"):
             sample = self._locate_sample_xyz(phase_name, it)
             if sample is None:
@@ -1182,6 +1192,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             iteration=int(state.iteration),
             training_set_version=int(next_version),
             n_committed_points=len(committed_names),
+            expected_final_batch_size=int(self.config.active_batch.final_batch_size),
             source="live_quantum_staging",
         )
         return {"training_set_version": int(next_version)}

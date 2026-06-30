@@ -1307,9 +1307,26 @@ final_checks() {
     local smoke_dir
     smoke_dir="$(mktemp -d)"
     cat > "${smoke_dir}/campaign.yaml" <<'EOF'
-schema_version: 3
+schema_version: 6
 max_iterations: 1
+bootstrap:
+  initial_labelled_size: 12
+active_batch:
+  final_batch_size: 4
+seed_selection:
+  n_seeds_per_iteration: 8
 EOF
+    mkdir -p "${smoke_dir}/.DATA/TRAJECTORY"
+    : > "${smoke_dir}/.DATA/TRAJECTORY/pool.xyz"
+    for _ichor_i in $(seq 1 20); do
+        cat >> "${smoke_dir}/.DATA/TRAJECTORY/pool.xyz" <<'EOF'
+3
+installer smoke water frame
+O 0.000000 0.000000 0.000000
+H 0.957200 0.000000 0.000000
+H -0.239987 0.927297 0.000000
+EOF
+    done
     "${VENV}/bin/ichor-al-daemon" preflight --campaign-dir "${smoke_dir}"
     echo ""
     if [[ "${label}" == "verify" ]]; then

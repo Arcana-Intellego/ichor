@@ -3,22 +3,20 @@
 # defaults substantially (see ichor_hpc/.../presets/ for spectroscopy and
 # thermodynamics-focused starting points).
 
-schema_version: 5
+schema_version: 6
 system_name: WATER_TETRAMER
 
 # Iteration loop.
 max_iterations: 2
 poll_interval_seconds: 1
 
-# Initial sub-sampling.
-initial_train_size: 4
-initial_val_size: 2
+# Initial labelled set before active learning.
+bootstrap:
+  initial_labelled_size: 6
 
-# Batch sizing per iteration.
-batch_sizing:
-  policy: linear
-  floor: 2
-  cap: 4
+# Final labelled batch per active iteration.
+active_batch:
+  final_batch_size: 2
 
 # Seeds per ARIADNE_ARRAY task.
 seed_selection:

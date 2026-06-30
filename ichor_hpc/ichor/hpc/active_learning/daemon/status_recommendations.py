@@ -285,6 +285,18 @@ def _job_recommendations(campaign: Path, payload: Dict[str, Any]) -> List[Status
 def _halt_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusRecommendation:
     reason = _halt_reason(payload)
     upper = reason.upper()
+    if "SEED_POOL_EXHAUSTED" in upper:
+        return StatusRecommendation(
+            code="halted_seed_pool_exhausted",
+            severity="blocked",
+            primary="start a new campaign with a larger pool or smaller bootstrap/seed budget",
+            why="seed selection exhausted eligible trajectory frames: " + _short_error(reason),
+            command=_journal_cmd(campaign) + " --event-type halt --last-n 5",
+            details=[
+                "lowering bootstrap.initial_labelled_size after bootstrap has committed does not remove already-labelled provenance",
+                "for plumbing-only debugging, anti_overlap.skip_training_seeds=false can allow reseeding",
+            ],
+        )
     if "BACKEND_SUBMISSION_FAILED" in upper:
         return StatusRecommendation(
             code="halted_backend_submission_failed",
@@ -508,6 +520,29 @@ def build_status_recommendations(
     """Return ordered operator recommendations for a status payload."""
     del journal_path  # reserved for future journal-dependent detail expansion
     campaign = Path(campaign_dir)
+    feasibility = payload.get("pool_feasibility")
+    feasibility_error = (
+        str(feasibility.get("error") or "")
+        if isinstance(feasibility, dict)
+        else ""
+    )
+    if (
+        isinstance(feasibility, dict)
+        and feasibility.get("ok") is False
+        and "FileNotFoundError" not in feasibility_error
+    ):
+        return [
+            StatusRecommendation(
+                code="pool_feasibility_failed",
+                severity="blocked",
+                primary="fix bootstrap/seed sizing or import a larger trajectory pool before starting",
+                why=str(feasibility.get("error") or feasibility.get("expression") or "trajectory pool is infeasible"),
+                details=[
+                    "pool_n_frames=" + str(feasibility.get("pool_n_frames")),
+                    "required_pool_frames=" + str(feasibility.get("required_pool_frames")),
+                ],
+            )
+        ]
 
     status_error = str(payload.get("status_error") or "")
     if status_error == "state_missing":

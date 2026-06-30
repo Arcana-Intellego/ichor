@@ -213,6 +213,54 @@ def _walltime_summary(resources) -> str:
     )
 
 
+def _pool_feasibility_summary(
+    config: CampaignConfig,
+    campaign_dir: str | Path | None,
+) -> list[str]:
+    if campaign_dir is None:
+        if bool(config.anti_overlap.skip_training_seeds):
+            required = (
+                int(config.bootstrap.initial_labelled_size)
+                + int(config.max_iterations)
+                * int(config.seed_selection.n_seeds_per_iteration)
+            )
+            expression = (
+                str(config.bootstrap.initial_labelled_size)
+                + " + "
+                + str(config.max_iterations)
+                + " * "
+                + str(config.seed_selection.n_seeds_per_iteration)
+                + " = "
+                + str(required)
+            )
+        else:
+            required = int(config.bootstrap.initial_labelled_size)
+            expression = str(required)
+        return [
+            _line("pool_feasibility.imported_pool", "not available"),
+            _line("pool_feasibility.required_frames", str(required) + " (" + expression + ")"),
+        ]
+    try:
+        from ichor.hpc.active_learning.daemon.pool_feasibility import (
+            evaluate_pool_feasibility,
+        )
+
+        result = evaluate_pool_feasibility(Path(campaign_dir), config)
+        return [
+            _line("pool_feasibility.status", "ok" if result.ok else "failed"),
+            _line("pool_feasibility.pool_n_frames", result.pool_n_frames),
+            _line("pool_feasibility.required_pool_frames", result.required_pool_frames),
+            _line("pool_feasibility.expression", result.expression),
+        ]
+    except Exception as exc:
+        return [
+            _line(
+                "pool_feasibility.status",
+                "unavailable (" + type(exc).__name__ + ": " + str(exc) + ")",
+            )
+        ]
+
+
 def _backend_effective_summary(resources, field_name: str) -> str:
     phases = (
         ("POLUS", "PHASE_A_POLUS"),
@@ -261,6 +309,26 @@ def format_sampling_protocol_summary(
     runtime = config.runtime
 
     lines = ["Sampling protocol summary:\n"]
+    lines.append(
+        _line(
+            "bootstrap.initial_labelled_size",
+            config.bootstrap.initial_labelled_size,
+        )
+    )
+    lines.append(
+        _line(
+            "seed_selection.n_seeds_per_iteration",
+            seed.n_seeds_per_iteration,
+        )
+    )
+    lines.append(
+        _line(
+            "active_batch.final_batch_size",
+            config.active_batch.final_batch_size,
+        )
+    )
+    lines.append(_line("max_iterations", config.max_iterations))
+    lines.extend(_pool_feasibility_summary(config, campaign_dir))
     lines.append(_line("seed_selection.strategy", seed.strategy))
     lines.append(_line("seed_selection.bulk_fraction", seed.bulk_fraction))
     lines.append(

@@ -25,7 +25,7 @@ from ichor.hpc.active_learning.versioning.training_set import TrainingSetVersion
 
 def _make_exec(tmp_path: Path) -> DryRunPhaseExecutor:
     cfg = CampaignConfig(max_iterations=2)
-    cfg.batch_sizing.floor = 2
+    cfg.active_batch.final_batch_size = 2
     cfg.seed_selection.n_seeds_per_iteration = 2
     return DryRunPhaseExecutor(campaign_dir=tmp_path / "campaign", config=cfg)
 

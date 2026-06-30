@@ -18,7 +18,7 @@
 #    modes typically carry most of the force-error signal.
 #  * Everything else stays at the balanced defaults.
 
-schema_version: 3
+schema_version: 6
 
 acquisition:
   subspace:
@@ -29,4 +29,3 @@ acquisition:
     lambda_anharmonic: 1.0
     lambda_energy: 0.5
     lambda_distance: 1.0
-
