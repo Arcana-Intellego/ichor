@@ -18,24 +18,31 @@ def _line(label: str, value) -> str:
     return "-- " + label + ": " + format_field_value(value) + "\n"
 
 
-def _latest_geometry_novelty_scale_summary(campaign_dir: Path) -> str:
+def _latest_geometry_novelty_payload(campaign_dir: Path):
     try:
         from ichor.hpc.active_learning.geometry_novelty import (
             read_geometry_novelty_scale,
         )
     except Exception as exc:
-        return "unavailable (" + type(exc).__name__ + ": " + str(exc) + ")"
+        return None, "unavailable (" + type(exc).__name__ + ": " + str(exc) + ")"
     base = Path(campaign_dir) / "7_ACTIVE_LEARNING"
     if not base.is_dir():
-        return "not written yet"
+        return None, "not written yet"
     candidates = sorted(base.glob("iteration-*/GEOMETRY_NOVELTY_SCALE.json"))
     if not candidates:
-        return "not written yet"
+        return None, "not written yet"
     latest = candidates[-1].parent
     try:
         payload = read_geometry_novelty_scale(latest)
     except Exception as exc:
-        return "unreadable (" + type(exc).__name__ + ": " + str(exc) + ")"
+        return None, "unreadable (" + type(exc).__name__ + ": " + str(exc) + ")"
+    return payload, "latest_sidecar"
+
+
+def _latest_geometry_novelty_scale_summary(campaign_dir: Path) -> str:
+    payload, status = _latest_geometry_novelty_payload(campaign_dir)
+    if payload is None:
+        return str(status)
     return (
         "iteration="
         + str(payload.get("iteration"))
@@ -46,6 +53,99 @@ def _latest_geometry_novelty_scale_summary(campaign_dir: Path) -> str:
         + ", n_values="
         + str(payload.get("n_values"))
     )
+
+
+def _geometry_novelty_resolved_lines(
+    config: CampaignConfig,
+    campaign_dir: str | Path | None,
+) -> list[str]:
+    try:
+        from ichor.hpc.active_learning.geometry_novelty import (
+            resolve_geometry_novelty_consumers,
+        )
+    except Exception as exc:
+        return [
+            _line(
+                "geometry_novelty.resolved_consumers",
+                "unavailable (" + type(exc).__name__ + ": " + str(exc) + ")",
+            )
+        ]
+
+    payload = None
+    source = "configured_fallback"
+    if campaign_dir is not None:
+        payload, source = _latest_geometry_novelty_payload(Path(campaign_dir))
+    if payload is None and bool(config.geometry_novelty.enabled):
+        payload = {
+            "schema_version": 1,
+            "scale_angstrom": float(config.geometry_novelty.fallback_scale_angstrom),
+        }
+        source = "configured_fallback"
+
+    try:
+        resolved = resolve_geometry_novelty_consumers(config, payload)
+    except Exception as exc:
+        return [
+            _line(
+                "geometry_novelty.resolved_consumers",
+                "unreadable (" + type(exc).__name__ + ": " + str(exc) + ")",
+            )
+        ]
+
+    phase_b = dict(resolved.get("phase_b") or {})
+    movement_band = dict(resolved.get("movement_band") or {})
+    movement_utility = dict(resolved.get("movement_utility") or {})
+    fullspace = dict(resolved.get("fullspace_confinement") or {})
+    return [
+        _line(
+            "geometry_novelty.resolved_source",
+            str(source)
+            + ", mode="
+            + str(resolved.get("threshold_mode"))
+            + ", scale_angstrom="
+            + str(resolved.get("scale_angstrom")),
+        ),
+        _line(
+            "geometry_novelty.resolved_phase_b",
+            "mode="
+            + str(phase_b.get("threshold_mode"))
+            + ", min_separation_angstrom="
+            + str(phase_b.get("effective_min_separation_angstrom"))
+            + ", coefficient="
+            + str(phase_b.get("min_separation_scaled")),
+        ),
+        _line(
+            "geometry_novelty.resolved_movement_band",
+            "mode="
+            + str(movement_band.get("threshold_mode"))
+            + ", min/low/peak/high/max_angstrom="
+            + str(movement_band.get("hard_min_angstrom"))
+            + "/"
+            + str(movement_band.get("target_low_angstrom"))
+            + "/"
+            + str(movement_band.get("target_peak_angstrom"))
+            + "/"
+            + str(movement_band.get("target_high_angstrom"))
+            + "/"
+            + str(movement_band.get("hard_max_angstrom")),
+        ),
+        _line(
+            "geometry_novelty.resolved_movement_utility",
+            "mode="
+            + str(movement_utility.get("threshold_mode"))
+            + ", low/high_softness_angstrom="
+            + str(movement_utility.get("low_softness_angstrom"))
+            + "/"
+            + str(movement_utility.get("high_softness_angstrom")),
+        ),
+        _line(
+            "geometry_novelty.resolved_fullspace_confinement",
+            "mode="
+            + str(fullspace.get("threshold_mode"))
+            + ", rmsd_scale_angstrom="
+            + str(fullspace.get("rmsd_scale_angstrom")),
+        ),
+    ]
 
 
 def _hours_label(value) -> str:
@@ -485,6 +585,7 @@ def format_sampling_protocol_summary(
                 _latest_geometry_novelty_scale_summary(Path(campaign_dir)),
             )
         )
+    lines.extend(_geometry_novelty_resolved_lines(config, campaign_dir))
     lines.append(
         _line(
             "anti_overlap.post_ariadne_whitened_distance",

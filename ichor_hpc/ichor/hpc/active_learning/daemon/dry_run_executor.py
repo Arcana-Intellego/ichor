@@ -873,6 +873,10 @@ class DryRunPhaseExecutor:
             AriadneRunConfig,
             optimise_seed,
         )
+        from ..geometry_novelty import (
+            ensure_geometry_novelty_scale,
+            geometry_novelty_scale_path,
+        )
         from ichor.core.atoms import Atom, Atoms as IchorAtoms
         from ..handoff_manifests import (
             ARIADNE_RESULTS_SCHEMA_VERSION,
@@ -920,6 +924,12 @@ class DryRunPhaseExecutor:
         accepted_records = []
         landing_audit_records = []
         flagged_count = 0
+        geometry_scale_payload = ensure_geometry_novelty_scale(
+            self.campaign_dir,
+            self.config,
+            iteration=int(state.iteration),
+        )
+        self.artefact_log.append(str(geometry_novelty_scale_path(iter_dir)))
         for k in range(n_seeds):
             seed_record = seed_records[k]
             seed_frame_id = (
@@ -941,6 +951,7 @@ class DryRunPhaseExecutor:
             result_payload["seed_index"] = int(k)
             result_payload["iteration"] = int(state.iteration)
             result_payload["trajectory_sha256"] = str(picked_payload.get("trajectory_sha256", traj_sha))
+            result_payload["geometry_novelty_scale"] = dict(geometry_scale_payload)
             if isinstance(result_payload.get("selection_diagnostics"), dict):
                 result_payload["selection_diagnostics"]["model_version"] = int(
                     getattr(state, "models_version", -1)
@@ -949,6 +960,9 @@ class DryRunPhaseExecutor:
                 result_payload["selection_diagnostics"]["seed_frame_id"] = seed_frame_id
                 result_payload["selection_diagnostics"]["result_json"] = str(
                     (seed_dir / "result.json").resolve()
+                )
+                result_payload["selection_diagnostics"]["geometry_novelty_scale"] = dict(
+                    geometry_scale_payload
                 )
             landing_safety = result_payload.get("landing_safety") or {
                 "accepted": True,
@@ -963,6 +977,7 @@ class DryRunPhaseExecutor:
                 "result_json": str((seed_dir / "result.json").resolve()),
                 "landing_safety": dict(landing_safety),
                 "landing_candidates": list(result_payload.get("landing_candidates") or []),
+                "geometry_novelty_scale": dict(geometry_scale_payload),
             }
             if isinstance(result_payload.get("selection_diagnostics"), dict):
                 audit_record["selection_diagnostics"] = dict(
@@ -1046,6 +1061,7 @@ class DryRunPhaseExecutor:
                 "whitened_distance_final": d_w,
                 "landing_safety": dict(landing_safety),
                 "landing_policy": str(landing_safety.get("policy", "unknown")),
+                "geometry_novelty_scale": dict(geometry_scale_payload),
                 "selection_diagnostics": (
                     dict(result_payload["selection_diagnostics"])
                     if isinstance(result_payload.get("selection_diagnostics"), dict)
@@ -1105,9 +1121,9 @@ class DryRunPhaseExecutor:
 
     def _post_phase_b_polus(self, state) -> Dict[str, Any]:
         from ..geometry_novelty import (
-            compute_geometry_novelty_scale,
             effective_phase_b_min_separation,
-            write_geometry_novelty_scale,
+            ensure_geometry_novelty_scale,
+            geometry_novelty_scale_path,
         )
         from ..handoff_manifests import (
             PHASE_B_SELECTION_SCHEMA_VERSION,
@@ -1180,13 +1196,13 @@ class DryRunPhaseExecutor:
             out_rec["kept_after_dedup"] = True
             out_rec["drop_reason"] = None
             final_records.append(out_rec)
-        geometry_scale_payload = compute_geometry_novelty_scale(
+        geometry_scale_payload = ensure_geometry_novelty_scale(
             self.campaign_dir,
             self.config,
             iteration=int(state.iteration),
         )
         self.artefact_log.append(
-            str(write_geometry_novelty_scale(iter_dir, geometry_scale_payload))
+            str(geometry_novelty_scale_path(iter_dir))
         )
         effective_min_separation, threshold_mode = effective_phase_b_min_separation(
             self.config,

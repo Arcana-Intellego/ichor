@@ -95,6 +95,8 @@ class AcquisitionBreakdown:
     movement_band_score: float = 0.0
     movement_progress_score: float = 0.0
     movement_direction_source: Optional[str] = None
+    movement_band_scale_source: Optional[str] = None
+    geometry_novelty_scale_angstrom: Optional[float] = None
     n_effective_movement_atoms: Optional[float] = None
     size_normalisation_mode: Optional[str] = None
     negative_curvature_penalty: float = 0.0
@@ -441,6 +443,31 @@ class SeedLocalAdversarialAcquisition:
             return dict(self._movement_band_cache)
         cfg = self.config.movement_band
 
+        geometry_scale = getattr(cfg, "geometry_novelty_scale_angstrom", None)
+        try:
+            geometry_scale_value = float(geometry_scale)
+        except (TypeError, ValueError):
+            geometry_scale_value = math.nan
+        if np.isfinite(geometry_scale_value) and geometry_scale_value > 0.0:
+            eps = 1.0e-9
+            hard_min = max(0.0, float(cfg.hard_min_fraction) * geometry_scale_value)
+            low = max(float(cfg.target_low_fraction) * geometry_scale_value, hard_min + eps)
+            peak = max(float(cfg.target_peak_fraction) * geometry_scale_value, low + eps)
+            high = max(float(cfg.target_high_fraction) * geometry_scale_value, peak + eps)
+            hard_max = max(float(cfg.hard_max_fraction) * geometry_scale_value, high + eps)
+            band = {
+                "local_rmsd_ang": float(geometry_scale_value),
+                "min": float(hard_min),
+                "low": float(low),
+                "peak": float(peak),
+                "high": float(high),
+                "max": float(hard_max),
+                "scale_source": "geometry_novelty",
+                "geometry_novelty_scale_angstrom": float(geometry_scale_value),
+            }
+            self._movement_band_cache = dict(band)
+            return band
+
         values = []
         for neighbour in self.subspace.neighbours:
             try:
@@ -620,6 +647,12 @@ class SeedLocalAdversarialAcquisition:
             "movement_band_score": float(band_score),
             "movement_progress_score": float(progress_score),
             "movement_direction_source": source,
+            "movement_band_scale_source": str(band.get("scale_source", "local_motion")),
+            "geometry_novelty_scale_angstrom": (
+                None
+                if band.get("geometry_novelty_scale_angstrom") is None
+                else float(band.get("geometry_novelty_scale_angstrom"))
+            ),
             "n_effective_movement_atoms": n_eff,
         }
 
@@ -1216,6 +1249,14 @@ class SeedLocalAdversarialAcquisition:
             movement_direction_source=(
                 None if not movement else str(movement.get("movement_direction_source"))
             ),
+            movement_band_scale_source=(
+                None if not movement else str(movement.get("movement_band_scale_source"))
+            ),
+            geometry_novelty_scale_angstrom=(
+                None
+                if not movement or movement.get("geometry_novelty_scale_angstrom") is None
+                else float(movement.get("geometry_novelty_scale_angstrom"))
+            ),
             n_effective_movement_atoms=(
                 None
                 if not movement or movement.get("n_effective_movement_atoms") is None
@@ -1414,6 +1455,14 @@ class SeedLocalAdversarialAcquisition:
             movement_progress_score=float(movement.get("movement_progress_score", 0.0) or 0.0),
             movement_direction_source=(
                 None if not movement else str(movement.get("movement_direction_source"))
+            ),
+            movement_band_scale_source=(
+                None if not movement else str(movement.get("movement_band_scale_source"))
+            ),
+            geometry_novelty_scale_angstrom=(
+                None
+                if not movement or movement.get("geometry_novelty_scale_angstrom") is None
+                else float(movement.get("geometry_novelty_scale_angstrom"))
             ),
             n_effective_movement_atoms=(
                 None

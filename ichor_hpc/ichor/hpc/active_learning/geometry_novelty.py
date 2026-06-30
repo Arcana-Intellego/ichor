@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
@@ -24,6 +25,9 @@ from .daemon.state import atomic_write_json
 GEOMETRY_NOVELTY_SCALE_SCHEMA_VERSION = 1
 GEOMETRY_NOVELTY_SCALE_FILENAME = "GEOMETRY_NOVELTY_SCALE.json"
 EXACT_DUPLICATE_EPSILON_ANGSTROM = 1.0e-12
+MOVEMENT_UTILITY_LOW_SOFTNESS_FRACTION = 0.10
+MOVEMENT_UTILITY_HIGH_SOFTNESS_FRACTION = 0.40
+FULLSPACE_RMSD_SCALE_MULTIPLIER = 10.0
 
 
 __all__ = [
@@ -32,9 +36,12 @@ __all__ = [
     "GEOMETRY_NOVELTY_SCALE_SCHEMA_VERSION",
     "compute_geometry_novelty_scale",
     "effective_phase_b_min_separation",
+    "ensure_geometry_novelty_scale",
     "geometry_novelty_scale_path",
     "novelty_score",
     "read_geometry_novelty_scale",
+    "resolve_geometry_novelty_consumers",
+    "apply_geometry_novelty_to_acquisition_config",
     "scaled_distances",
     "write_geometry_novelty_scale",
 ]
@@ -316,16 +323,206 @@ def read_geometry_novelty_scale(iter_dir: Union[str, Path]) -> Dict[str, Any]:
     return payload
 
 
+def _campaign_iteration_dir(campaign_dir: Union[str, Path], iteration: int) -> Path:
+    return (
+        Path(campaign_dir)
+        / "7_ACTIVE_LEARNING"
+        / ("iteration-" + str(int(iteration)).zfill(4))
+    )
+
+
+def _config_enabled(config: Any) -> bool:
+    return bool(_normalise_config_value(config, "enabled", True))
+
+
+def _scale_from_payload(scale_payload: Optional[Dict[str, Any]]) -> Optional[float]:
+    if not isinstance(scale_payload, dict):
+        return None
+    return _finite_positive(scale_payload.get("scale_angstrom"))
+
+
+def resolve_geometry_novelty_consumers(
+    config: Any,
+    scale_payload: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Resolve every current geometry-novelty consumer from one scale.
+
+    This is the single HPC-side place where dimensionless campaign settings
+    become Angstrom values. If geometry novelty is disabled, it reports the
+    legacy absolute values instead of changing behaviour.
+    """
+    enabled = _config_enabled(config)
+    scale = _scale_from_payload(scale_payload) if enabled else None
+    mode = "scaled" if scale is not None else "absolute"
+    phase_b_scaled = float(getattr(config.phase_b, "min_separation_scaled", 0.5))
+    phase_b_absolute = float(getattr(config.phase_b, "min_separation", 0.0))
+
+    mb = config.acquisition.movement_band
+    mu = config.acquisition.movement_utility
+    fs = config.acquisition.fullspace_confinement
+
+    if scale is not None:
+        movement_band = {
+            "threshold_mode": "scaled",
+            "scale_angstrom": float(scale),
+            "hard_min_angstrom": float(mb.hard_min_fraction) * float(scale),
+            "target_low_angstrom": float(mb.target_low_fraction) * float(scale),
+            "target_peak_angstrom": float(mb.target_peak_fraction) * float(scale),
+            "target_high_angstrom": float(mb.target_high_fraction) * float(scale),
+            "hard_max_angstrom": float(mb.hard_max_fraction) * float(scale),
+            "fractions": {
+                "hard_min": float(mb.hard_min_fraction),
+                "target_low": float(mb.target_low_fraction),
+                "target_peak": float(mb.target_peak_fraction),
+                "target_high": float(mb.target_high_fraction),
+                "hard_max": float(mb.hard_max_fraction),
+            },
+        }
+        movement_utility = {
+            "threshold_mode": "scaled",
+            "low_softness_angstrom": (
+                MOVEMENT_UTILITY_LOW_SOFTNESS_FRACTION * float(scale)
+            ),
+            "high_softness_angstrom": (
+                MOVEMENT_UTILITY_HIGH_SOFTNESS_FRACTION * float(scale)
+            ),
+            "low_softness_fraction": MOVEMENT_UTILITY_LOW_SOFTNESS_FRACTION,
+            "high_softness_fraction": MOVEMENT_UTILITY_HIGH_SOFTNESS_FRACTION,
+        }
+        fullspace = {
+            "threshold_mode": "scaled",
+            "rmsd_scale_angstrom": FULLSPACE_RMSD_SCALE_MULTIPLIER * float(scale),
+            "rmsd_scale_multiplier": FULLSPACE_RMSD_SCALE_MULTIPLIER,
+        }
+        phase_b = {
+            "threshold_mode": "scaled",
+            "min_separation_scaled": phase_b_scaled,
+            "effective_min_separation_angstrom": phase_b_scaled * float(scale),
+            "legacy_min_separation_angstrom": phase_b_absolute,
+        }
+    else:
+        movement_band = {
+            "threshold_mode": "absolute",
+            "hard_min_angstrom": float(mb.hard_min_floor_ang),
+            "target_low_angstrom": float(mb.target_low_floor_ang),
+            "target_peak_angstrom": float(mb.target_peak_floor_ang),
+            "target_high_angstrom": float(mb.target_high_cap_ang),
+            "hard_max_angstrom": float(mb.hard_max_cap_ang),
+        }
+        movement_utility = {
+            "threshold_mode": "absolute",
+            "low_softness_angstrom": float(mu.low_softness_ang),
+            "high_softness_angstrom": float(mu.high_softness_ang),
+        }
+        fullspace = {
+            "threshold_mode": "absolute",
+            "rmsd_scale_angstrom": float(fs.rmsd_scale_ang),
+        }
+        phase_b = {
+            "threshold_mode": "absolute",
+            "effective_min_separation_angstrom": phase_b_absolute,
+            "legacy_min_separation_angstrom": phase_b_absolute,
+            "min_separation_scaled": phase_b_scaled,
+        }
+
+    return {
+        "schema_version": 1,
+        "enabled": bool(enabled),
+        "threshold_mode": mode,
+        "scale_angstrom": None if scale is None else float(scale),
+        "phase_b": phase_b,
+        "movement_band": movement_band,
+        "movement_utility": movement_utility,
+        "fullspace_confinement": fullspace,
+    }
+
+
+def ensure_geometry_novelty_scale(
+    campaign_dir: Union[str, Path],
+    config: Any,
+    *,
+    iteration: int,
+) -> Dict[str, Any]:
+    """Read or write the per-iteration geometry-novelty scale sidecar.
+
+    The helper is idempotent for restarts, but it also backfills the optional
+    resolved-consumer diagnostics when reading an older schema-v1 sidecar.
+    """
+    iter_dir = _campaign_iteration_dir(campaign_dir, iteration)
+    path = geometry_novelty_scale_path(iter_dir)
+    if path.is_file():
+        try:
+            payload = read_geometry_novelty_scale(iter_dir)
+        except Exception:
+            payload = compute_geometry_novelty_scale(
+                campaign_dir,
+                config,
+                iteration=int(iteration),
+            )
+    else:
+        payload = compute_geometry_novelty_scale(
+            campaign_dir,
+            config,
+            iteration=int(iteration),
+        )
+    payload = dict(payload)
+    payload["resolved_consumers"] = resolve_geometry_novelty_consumers(
+        config,
+        payload,
+    )
+    write_geometry_novelty_scale(iter_dir, payload)
+    return payload
+
+
 def effective_phase_b_min_separation(config: Any, scale_payload: Optional[Dict[str, Any]]) -> Tuple[float, str]:
-    if bool(_normalise_config_value(config, "enabled", True)):
-        if not isinstance(scale_payload, dict):
-            raise ValueError("scaled Phase B threshold requested without a scale payload")
-        scale = _finite_positive(scale_payload.get("scale_angstrom"))
-        if scale is None:
-            raise ValueError("scale_angstrom must be finite and > 0")
-        scaled = float(getattr(config.phase_b, "min_separation_scaled", 0.5))
-        return float(scaled * scale), "scaled"
-    return float(getattr(config.phase_b, "min_separation", 0.0)), "absolute"
+    resolved = resolve_geometry_novelty_consumers(config, scale_payload)
+    phase_b = dict(resolved.get("phase_b") or {})
+    return (
+        float(phase_b.get("effective_min_separation_angstrom", 0.0)),
+        str(phase_b.get("threshold_mode", resolved.get("threshold_mode", "absolute"))),
+    )
+
+
+def apply_geometry_novelty_to_acquisition_config(
+    acquisition_config: Any,
+    config: Any,
+    scale_payload: Optional[Dict[str, Any]],
+) -> Any:
+    """Return an AcquisitionConfig with ARIADNE geometry scales resolved.
+
+    ``ichor_core`` receives plain numeric values only; it does not know about
+    campaign directories or sidecar files.
+    """
+    resolved = resolve_geometry_novelty_consumers(config, scale_payload)
+    if str(resolved.get("threshold_mode")) != "scaled":
+        return acquisition_config
+
+    movement_band = dict(resolved["movement_band"])
+    movement_utility = dict(resolved["movement_utility"])
+    fullspace = dict(resolved["fullspace_confinement"])
+    scale = float(resolved["scale_angstrom"])
+
+    return replace(
+        acquisition_config,
+        movement_band=replace(
+            acquisition_config.movement_band,
+            hard_min_floor_ang=float(movement_band["hard_min_angstrom"]),
+            target_low_floor_ang=float(movement_band["target_low_angstrom"]),
+            target_peak_floor_ang=float(movement_band["target_peak_angstrom"]),
+            target_high_cap_ang=float(movement_band["target_high_angstrom"]),
+            hard_max_cap_ang=float(movement_band["hard_max_angstrom"]),
+            geometry_novelty_scale_angstrom=scale,
+        ),
+        movement_utility=replace(
+            acquisition_config.movement_utility,
+            low_softness_ang=float(movement_utility["low_softness_angstrom"]),
+            high_softness_ang=float(movement_utility["high_softness_angstrom"]),
+        ),
+        fullspace_confinement=replace(
+            acquisition_config.fullspace_confinement,
+            rmsd_scale_ang=float(fullspace["rmsd_scale_angstrom"]),
+        ),
+    )
 
 
 def scaled_distances(distances_angstrom: Iterable[Any], scale_angstrom: Any) -> List[Optional[float]]:

@@ -711,11 +711,18 @@ def _evaluate_landing_candidate(
             "movement_band_score",
             "movement_progress_score",
             "movement_direction_source",
+            "movement_band_scale_source",
+            "geometry_novelty_scale_angstrom",
             "n_effective_movement_atoms",
         ):
             value = getattr(breakdown, key, None)
             metrics[key] = None if value is None else (
-                str(value) if key in ("movement_metric", "movement_direction_source")
+                str(value)
+                if key in (
+                    "movement_metric",
+                    "movement_direction_source",
+                    "movement_band_scale_source",
+                )
                 else float(value)
             )
         metrics["weak_mode_penalty_score"] = float(
@@ -876,6 +883,8 @@ def _selection_prediction_diagnostics(
             "movement_utility_score",
             "movement_progress_score",
             "movement_direction_source",
+            "movement_band_scale_source",
+            "geometry_novelty_scale_angstrom",
         )
         if key in safety_metrics
     }
@@ -2022,7 +2031,32 @@ def main(argv=None) -> int:
             )
             return 3
 
-    acquisition_config = config.to_acquisition_config()
+    try:
+        from ..geometry_novelty import (
+            apply_geometry_novelty_to_acquisition_config,
+            ensure_geometry_novelty_scale,
+        )
+
+        geometry_scale_payload = ensure_geometry_novelty_scale(
+            campaign,
+            config,
+            iteration=int(args.iteration),
+        )
+    except Exception as exc:
+        print(
+            "geometry novelty scale invalid for ARIADNE: "
+            + type(exc).__name__
+            + ": "
+            + str(exc),
+            file=_sys.stderr,
+        )
+        return 3
+
+    acquisition_config = apply_geometry_novelty_to_acquisition_config(
+        config.to_acquisition_config(),
+        config,
+        geometry_scale_payload,
+    )
     ariadne_run_config = config.to_ariadne_run_config()
     error_calibration_model = None
     error_calibration_reason = "disabled"
@@ -2084,6 +2118,7 @@ def main(argv=None) -> int:
     payload["seed_index"] = int(args.seed_index)
     payload["iteration"] = int(args.iteration)
     payload["trajectory_sha256"] = str(pool.sha256)
+    payload["geometry_novelty_scale"] = dict(geometry_scale_payload)
     allow_seed_fallback = bool(
         getattr(getattr(config, "adversarial_safety", None), "allow_seed_fallback", False)
     )
@@ -2112,6 +2147,9 @@ def main(argv=None) -> int:
         payload["selection_diagnostics"]["model_version"] = int(state.models_version)
         payload["selection_diagnostics"]["seed_index"] = int(args.seed_index)
         payload["selection_diagnostics"]["seed_frame_id"] = int(seed_frame_id)
+        payload["selection_diagnostics"]["geometry_novelty_scale"] = dict(
+            geometry_scale_payload
+        )
         payload["selection_diagnostics"]["error_calibration_model_reason"] = str(
             error_calibration_reason
         )

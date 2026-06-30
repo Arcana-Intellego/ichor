@@ -220,6 +220,7 @@ FUTURE_SAFE_EXACT = {
 }
 
 ARIADNE_OUTPUT_INTERPRETATION_PREFIXES = {
+    "geometry_novelty.",
     "adversarial_safety.",
     "ariadne.",
     "acquisition.subspace.",

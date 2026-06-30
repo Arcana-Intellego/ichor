@@ -448,11 +448,10 @@ def _run_phase_b(args, campaign, config):
     from ..daemon.state import atomic_write_json
     from ..geometry_novelty import (
         EXACT_DUPLICATE_EPSILON_ANGSTROM,
-        compute_geometry_novelty_scale,
         effective_phase_b_min_separation,
+        ensure_geometry_novelty_scale,
         novelty_score,
         scaled_distances,
-        write_geometry_novelty_scale,
     )
     from ..handoff_manifests import (
         PHASE_B_SELECTION_SCHEMA_VERSION,
@@ -572,12 +571,11 @@ def _run_phase_b(args, campaign, config):
 
     geometry_scale_payload = None
     try:
-        geometry_scale_payload = compute_geometry_novelty_scale(
+        geometry_scale_payload = ensure_geometry_novelty_scale(
             campaign,
             config,
             iteration=int(args.iteration),
         )
-        write_geometry_novelty_scale(iter_dir, geometry_scale_payload)
         min_sep, threshold_mode = effective_phase_b_min_separation(
             config,
             geometry_scale_payload,

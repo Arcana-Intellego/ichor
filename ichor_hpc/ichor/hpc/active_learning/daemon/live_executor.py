@@ -2380,6 +2380,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 "result_json": str(result_path.resolve()),
                 "landing_safety": dict(landing_safety),
                 "landing_candidates": list(result_dict.get("landing_candidates") or []),
+                "geometry_novelty_scale": (
+                    dict(result_dict["geometry_novelty_scale"])
+                    if isinstance(result_dict.get("geometry_novelty_scale"), dict)
+                    else None
+                ),
                 "task_success": bool(usability.get("usable", False)),
                 "task_success_reason": str(usability.get("reason", "")),
             }
@@ -2664,6 +2669,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 "geometry_quality": dict(geometry_quality.get("metrics") or {}),
                 "landing_safety": dict(landing_safety),
                 "landing_policy": str(landing_safety.get("policy", "unknown")),
+                "geometry_novelty_scale": (
+                    dict(result_dict["geometry_novelty_scale"])
+                    if isinstance(result_dict.get("geometry_novelty_scale"), dict)
+                    else None
+                ),
                 "selection_diagnostics": (
                     dict(selection_diagnostics)
                     if isinstance(selection_diagnostics, dict)

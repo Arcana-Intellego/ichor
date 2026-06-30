@@ -165,6 +165,9 @@ class MovementBandConfig:
     target_peak_fraction: float = 0.40
     target_high_fraction: float = 0.75
     hard_max_fraction: float = 1.25
+    # Internal HPC-side override. When set, ARIADNE uses the dimensionless
+    # fractions above directly against this campaign geometry-novelty scale.
+    geometry_novelty_scale_angstrom: Optional[float] = None
 
 
 @dataclass(frozen=True)

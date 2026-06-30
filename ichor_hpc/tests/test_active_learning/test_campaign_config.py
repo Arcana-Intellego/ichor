@@ -559,6 +559,15 @@ def test_geometry_novelty_config_validated(path, value):
         CampaignConfig.from_dict(payload)
 
 
+def test_movement_band_scaled_fraction_order_validated():
+    payload = CampaignConfig().to_dict()
+    payload["acquisition"]["movement_band"]["target_peak_fraction"] = 0.20
+    payload["acquisition"]["movement_band"]["target_low_fraction"] = 0.25
+
+    with pytest.raises(ConfigValidationError, match="scaled fractions"):
+        CampaignConfig.from_dict(payload)
+
+
 def test_invalid_split_strategy_rejected():
     payload = CampaignConfig().to_dict()
     payload["split"]["strategy"] = "invalid_split"

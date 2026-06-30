@@ -1952,6 +1952,16 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "acquisition.movement_band floor/cap Angstrom values must be strictly ordered"
             )
+        if not (
+            float(move_band.hard_min_fraction)
+            < float(move_band.target_low_fraction)
+            < float(move_band.target_peak_fraction)
+            < float(move_band.target_high_fraction)
+            < float(move_band.hard_max_fraction)
+        ):
+            raise ConfigValidationError(
+                "acquisition.movement_band scaled fractions must be strictly ordered"
+            )
         move_util = self.acquisition.movement_utility
         if not isinstance(move_util.enabled, bool):
             raise ConfigValidationError(
@@ -2279,6 +2289,7 @@ class CampaignConfig:
                 target_peak_fraction=mb.target_peak_fraction,
                 target_high_fraction=mb.target_high_fraction,
                 hard_max_fraction=mb.hard_max_fraction,
+                geometry_novelty_scale_angstrom=None,
             ),
             movement_utility=MovementUtilityConfig(
                 enabled=mu.enabled,

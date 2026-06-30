@@ -1371,6 +1371,11 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
     assert "phase_b.min_separation_scaled: 0.5" in out
     assert "geometry_novelty.enabled: True" in out
     assert "geometry_novelty.scale" in out
+    assert "geometry_novelty.resolved_source: configured_fallback" in out
+    assert "geometry_novelty.resolved_phase_b" in out
+    assert "geometry_novelty.resolved_movement_band" in out
+    assert "geometry_novelty.resolved_movement_utility" in out
+    assert "geometry_novelty.resolved_fullspace_confinement" in out
     assert "aimall.naat: auto" in out
     assert "aimall.boaq: auto" in out
     assert "aimall.iasmesh: fine" in out
@@ -1411,6 +1416,8 @@ def test_daemon_control_sampling_protocol_summary_uses_saved_campaign(tmp_path, 
     assert "acquisition.stencils.weak_mode_gating_enabled: True" in out
     assert "phase_b.min_separation_scaled: 0.5" in out
     assert "geometry_novelty.latest_sidecar: not written yet" in out
+    assert "geometry_novelty.resolved_source: configured_fallback" in out
+    assert "geometry_novelty.resolved_phase_b" in out
     assert "ariadne.trqn_backtransform_mode: geodesic" in out
     assert "ariadne.trqn_geodesic_bt_mode: dense" in out
     assert "ariadne.trqn_backtransform_numerics" in out
