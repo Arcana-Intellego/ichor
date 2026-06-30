@@ -1261,7 +1261,7 @@ def cmd_start(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             print(
-                "  ichor-al-daemon --campaign-dir " + str(campaign) + " --live",
+                "  ichor-al-daemon start --campaign-dir " + str(campaign) + " --live",
                 file=sys.stderr,
             )
             return 8
@@ -2565,17 +2565,16 @@ def _reconcile_valid_candidates(
     contract_status: Dict[str, Any],
     report: Any,
 ) -> List[str]:
-    candidates = [
+    report_candidates = getattr(report, "recovery_candidates", None)
+    if isinstance(report_candidates, list) and report_candidates:
+        return [
+            _format_reconcile_contract_item(campaign, item)
+            for item in report_candidates
+        ]
+    return [
         _format_reconcile_contract_item(campaign, item)
         for item in contract_status.get("trusted_handoffs", [])
     ]
-    if not candidates:
-        phase = str(getattr(report, "last_phase_in_journal", "") or "")
-        iteration = getattr(report, "last_iteration_in_journal", None)
-        if phase in {p.value for p in RETRYABLE_CLEANED_REENTRY_PHASES}:
-            label = phase + "@" + str(iteration if iteration is not None else "?")
-            candidates.append(label)
-    return candidates
 
 
 def _print_reconcile_current_state(campaign: Path) -> None:
@@ -3065,6 +3064,29 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             print("Or apply the safe proposal automatically:")
             print("    ichor-al-daemon reconcile --campaign-dir " + str(campaign) + " --apply")
         return 0
+
+    candidate_labels = _reconcile_valid_candidates(campaign, contract_status, report)
+    hard_blockers = _reconcile_hard_blockers(report, contract_status)
+    cleanable = _reconcile_cleanable_reasons(report)
+    if (
+        report.proposed_state.phase is CampaignPhase.HALTED
+        and candidate_labels
+        and not hard_blockers
+        and not cleanable
+    ):
+        print(
+            "refusing --apply because reconcile found runnable recovery "
+            "candidate(s) but selected HALTED:",
+            file=sys.stderr,
+        )
+        for item in candidate_labels:
+            print("  - " + str(item), file=sys.stderr)
+        print(
+            "This is an internal recovery-selection inconsistency; inspect "
+            "the candidate contracts before restarting.",
+            file=sys.stderr,
+        )
+        return 9
 
     if report.proposed_state.phase is CampaignPhase.DONE:
         print(
@@ -3898,7 +3920,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     if str(pool_summary.get("status")) == "ok":
         print("Next:")
         print("  ichor-al-daemon preflight --campaign-dir " + str(campaign))
-        print("  ichor-al-daemon --campaign-dir " + str(campaign) + " --live")
+        print("  ichor-al-daemon start --campaign-dir " + str(campaign) + " --live")
     else:
         print("Next:")
         print(
@@ -4279,7 +4301,7 @@ Examples:
             "Examples:\n"
             "  ichor-al-daemon init\n"
             "  ichor-al-daemon init -c ~/campaigns/water_001 -s pool.xyz\n"
-            "  ichor-al-daemon --campaign-dir ~/campaigns/water_001 --live"
+            "  ichor-al-daemon start --campaign-dir ~/campaigns/water_001 --live"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

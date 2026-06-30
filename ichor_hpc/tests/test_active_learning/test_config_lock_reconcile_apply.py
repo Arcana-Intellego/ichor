@@ -1146,6 +1146,72 @@ def test_reconcile_apply_cleans_transient_halted_ariadne_reentry(
     assert "Removed stale model staging" in out
 
 
+def test_reconcile_apply_recovers_prebootstrap_phase_a_submission_failure(
+    tmp_path,
+    capsys,
+):
+    campaign = _campaign(tmp_path)
+    _write_pool(campaign)
+    config = CampaignConfig()
+    write_config_lock(campaign, config)
+    _write_config(campaign, config)
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.HALTED
+    state.iteration = 0
+    state.training_set_version = 0
+    state.validation_set_version = 0
+    state.models_version = 0
+    state.pending_jobs[CampaignPhase.PHASE_A_POLUS.value] = None
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    submission_intent.write_pre_submit_intent(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        phase_name=CampaignPhase.PHASE_A_POLUS.value,
+        iteration=0,
+    )
+    submission_intent.mark_failed(
+        campaign,
+        CampaignPhase.PHASE_A_POLUS.value,
+        0,
+        "backend_submission_failed: partition 'multicore_small' is not present",
+    )
+    from ichor.hpc.active_learning.daemon.journal import append_event
+
+    append_event(
+        campaign / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson",
+        "halt",
+        from_phase=CampaignPhase.PHASE_A_POLUS.value,
+        iteration=0,
+        reason="backend_submission_failed: partition 'multicore_small' is not present",
+    )
+
+    rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            allow_fresh_init=False,
+            apply=True,
+            restore_config_from_lock=False,
+            archive_staging=False,
+        )
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    recovered = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
+    assert recovered.phase is CampaignPhase.PHASE_A_POLUS
+    assert recovered.training_set_version == -1
+    assert recovered.validation_set_version == -1
+    assert recovered.models_version == -1
+    assert "Start the daemon with:" in out
+    intent = submission_intent.load_intent(
+        campaign,
+        CampaignPhase.PHASE_A_POLUS.value,
+        0,
+    )
+    assert intent["status"] == "SUPERSEDED"
+    assert intent["reason"] == "reconcile_apply_retry"
+
+
 def test_reconcile_apply_keeps_data_staging_blocked_for_non_ferebus_reentry(tmp_path, capsys):
     campaign = _campaign(tmp_path)
     state = fresh_campaign_state(max_iterations=3)

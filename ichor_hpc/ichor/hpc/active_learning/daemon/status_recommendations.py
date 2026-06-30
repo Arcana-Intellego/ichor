@@ -285,6 +285,14 @@ def _job_recommendations(campaign: Path, payload: Dict[str, Any]) -> List[Status
 def _halt_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusRecommendation:
     reason = _halt_reason(payload)
     upper = reason.upper()
+    if "BACKEND_SUBMISSION_FAILED" in upper:
+        return StatusRecommendation(
+            code="halted_backend_submission_failed",
+            severity="required",
+            primary="fix the configured backend/profile problem, then apply reconcile before restarting",
+            why="backend submission failed before the phase could run: " + _short_error(reason),
+            command=_reconcile_cmd(campaign, apply=True),
+        )
     if any(token in upper for token in ("NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "REVOKED")):
         return StatusRecommendation(
             code="halted_scheduler_transient",

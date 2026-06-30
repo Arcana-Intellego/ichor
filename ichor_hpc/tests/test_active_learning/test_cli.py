@@ -379,6 +379,30 @@ def test_cli_status_reports_initial_ferebus_bootstrap_contract_problem(tmp_path,
     assert "  models status: not required yet" in out
 
 
+def test_cli_status_backend_submission_failure_recommends_reconcile_apply(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.HALTED
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    append_event(
+        data / "journal.ndjson",
+        "halt",
+        from_phase=CampaignPhase.PHASE_A_POLUS.value,
+        iteration=0,
+        reason="backend_submission_failed: partition 'multicore_small' is not present",
+    )
+
+    rc = main(["status", "--campaign-dir", str(campaign)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "fix the configured backend/profile problem" in out
+    assert "ichor-al-daemon reconcile --campaign-dir " in out
+    assert " --apply" in out
+
+
 def test_reconcile_apply_contract_guard_rejects_invalid_state(tmp_path):
     campaign = _campaign_with_config(tmp_path)
     state = fresh_campaign_state(max_iterations=5)

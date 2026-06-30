@@ -27,6 +27,7 @@ from .artifact_contracts import (
 )
 from .journal import iter_events
 from .recovery_contracts import (
+    RecoveryDecision,
     active_iteration_handoff_decisions,
     select_recovery_phase,
     staging_handoff_decisions,
@@ -226,8 +227,41 @@ class ReconciliationReport:
     trusted_artifacts: List[str] = field(default_factory=list)
     blocking_artifacts: List[str] = field(default_factory=list)
     recommended_actions: List[str] = field(default_factory=list)
+    recovery_candidates: List[Dict[str, Any]] = field(default_factory=list)
     bootstrap_handoff: Optional[Dict[str, Any]] = None
     phase_a_handoff: Optional[Dict[str, Any]] = None
+
+
+def _candidate_payload(decision: RecoveryDecision) -> Dict[str, Any]:
+    return {
+        "phase": decision.phase.value,
+        "iteration": int(decision.iteration),
+        "path": str(decision.trusted_artifact or ""),
+        "reason": str(decision.reason),
+    }
+
+
+def _append_recovery_candidate(
+    candidates: List[Dict[str, Any]],
+    decision: Optional[RecoveryDecision],
+) -> None:
+    if decision is None:
+        return
+    payload = _candidate_payload(decision)
+    key = (
+        str(payload.get("phase")),
+        int(payload.get("iteration", 0)),
+        str(payload.get("path") or ""),
+    )
+    for existing in candidates:
+        existing_key = (
+            str(existing.get("phase")),
+            int(existing.get("iteration", 0)),
+            str(existing.get("path") or ""),
+        )
+        if existing_key == key:
+            return
+    candidates.append(payload)
 
 
 def _needs_trajectory_pool_check(
@@ -599,6 +633,7 @@ def propose_recovery(
     trusted_artifacts: List[str] = []
     blocking_artifacts: List[str] = []
     recommended_actions: List[str] = []
+    recovery_candidates: List[Dict[str, Any]] = []
 
     existing: Optional[CampaignState] = None
     existing_loaded = False
@@ -751,6 +786,34 @@ def propose_recovery(
             + str(campaign)
             + " --cancel-jobs"
         )
+    if existing is not None:
+        covered_pending = {
+            (
+                str(intent.get("phase") or ""),
+                str(intent.get("job_id") or ""),
+            )
+            for intent in active_intents
+        }
+        uncovered_pending = []
+        for phase_name, job_id in existing.pending_jobs.items():
+            if job_id is None:
+                continue
+            job_text = str(job_id)
+            if not job_text:
+                continue
+            key = (str(phase_name), job_text)
+            if key in covered_pending:
+                continue
+            uncovered_pending.append(str(phase_name) + " job_id=" + job_text)
+        if uncovered_pending:
+            unsafe_reasons.append(
+                "pending job(s) without active submission intent: "
+                + ", ".join(uncovered_pending)
+            )
+            blocking_artifacts.append("pending_jobs")
+            recommended_actions.append(
+                "Inspect pending_jobs in state.json and Slurm before applying recovery."
+            )
     if script_files:
         unsafe_reasons.append(".DATA/SCRIPTS contains sbatch scripts")
         trusted_artifacts.append(".DATA/SCRIPTS can be archived by reconcile --apply")
@@ -1012,6 +1075,7 @@ def propose_recovery(
         )
     protected_staging_paths = set()
     for decision in protected_staging_handoffs:
+        _append_recovery_candidate(recovery_candidates, decision)
         if decision.trusted_artifact:
             protected_path = (campaign / decision.trusted_artifact).resolve(strict=False)
             protected_staging_paths.add(str(protected_path))
@@ -1062,6 +1126,8 @@ def propose_recovery(
             )
         )
         blocking_artifacts.append("7_ACTIVE_LEARNING")
+    for decision in partial_iteration_handoffs:
+        _append_recovery_candidate(recovery_candidates, decision)
     combined_handoffs = list(protected_staging_handoffs) + list(partial_iteration_handoffs)
     combined_iterations = {int(d.iteration) for d in combined_handoffs}
     if len(combined_iterations) > 1:
@@ -1091,7 +1157,9 @@ def propose_recovery(
             existing_loaded=existing_loaded,
             last_phase=last_phase,
             last_iteration=last_iter,
+            last_phase_retryable=last_phase_retryable,
         )
+        _append_recovery_candidate(recovery_candidates, phase_recovery)
 
     # choose a safe re-entry phase. If we have NOTHING committed, start at
     #  INIT; otherwise rewind to STOP_CHECK so the next tick decides whether
@@ -1130,6 +1198,7 @@ def propose_recovery(
             trusted_artifacts.append(str(phase_recovery.trusted_artifact))
         if not valid_training_versions and not valid_model_versions:
             recovered.training_set_version = -1
+            recovered.validation_set_version = -1
             recovered.models_version = -1
     elif not tv and not mv and initial_handoff_indicated and initial_handoff_valid and not unsafe_reasons:
         handoff_phase = (
@@ -1150,10 +1219,12 @@ def propose_recovery(
                 "re-entry at INITIAL_FEREBUS to commit initial training/model version 0"
             )
         recovered.training_set_version = -1
+        recovered.validation_set_version = -1
         recovered.models_version = -1
     elif not tv and not mv and initial_handoff_indicated:
         recovered.phase = CampaignPhase.HALTED
         recovered.training_set_version = -1
+        recovered.validation_set_version = -1
         recovered.models_version = -1
         if initial_handoff_valid:
             decision = "HALTED: valid initial AIMAll handoff exists but unsafe artefacts need review"
@@ -1180,6 +1251,7 @@ def propose_recovery(
     ):
         recovered.phase = CampaignPhase.INITIAL_GAUSSIAN
         recovered.training_set_version = -1
+        recovered.validation_set_version = -1
         recovered.models_version = -1
         decision = "INITIAL_GAUSSIAN: valid Phase A sample exists without committed models"
         notes.append("re-entry at INITIAL_GAUSSIAN to process the Phase A sample")
@@ -1190,6 +1262,7 @@ def propose_recovery(
     elif not tv and not mv:
         recovered.phase = CampaignPhase.HALTED
         recovered.training_set_version = -1
+        recovered.validation_set_version = -1
         recovered.models_version = -1
         decision = "HALTED: existing state has no committed versions or recoverable initial handoff"
         notes.append(
@@ -1282,6 +1355,7 @@ def propose_recovery(
         trusted_artifacts=trusted_artifacts,
         blocking_artifacts=blocking_artifacts,
         recommended_actions=recommended_actions,
+        recovery_candidates=recovery_candidates,
         bootstrap_handoff=bootstrap_handoff,
         phase_a_handoff=phase_a_handoff,
     )

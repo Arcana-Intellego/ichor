@@ -345,6 +345,90 @@ def test_propose_recovery_never_trusts_stop_check_without_committed_versions(tmp
     assert "no committed versions" in report.decision
 
 
+def test_propose_recovery_halted_phase_a_failure_retries_phase_a(tmp_path):
+    campaign, data, _, _ = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.HALTED
+    state.iteration = 0
+    state.training_set_version = 0
+    state.validation_set_version = 0
+    state.models_version = 0
+    state.pending_jobs[CampaignPhase.PHASE_A_POLUS.value] = None
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    append_event(
+        data / "journal.ndjson",
+        "halt",
+        from_phase=CampaignPhase.PHASE_A_POLUS.value,
+        iteration=0,
+        reason="backend_submission_failed: partition 'multicore_small' is not present",
+    )
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.PHASE_A_POLUS
+    assert report.proposed_state.iteration == 0
+    assert report.proposed_state.training_set_version == -1
+    assert report.proposed_state.validation_set_version == -1
+    assert report.proposed_state.models_version == -1
+    assert report.proposed_state.pending_jobs == {}
+    assert "PHASE_A_POLUS" in report.decision
+    assert any(
+        c.get("phase") == CampaignPhase.PHASE_A_POLUS.value
+        for c in report.recovery_candidates
+    )
+
+
+def test_propose_recovery_halted_phase_a_failure_requires_pool(tmp_path):
+    campaign, data, _, _ = _campaign_dirs(tmp_path)
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.HALTED
+    state.iteration = 0
+    state.training_set_version = 0
+    state.validation_set_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    append_event(
+        data / "journal.ndjson",
+        "halt",
+        from_phase=CampaignPhase.PHASE_A_POLUS.value,
+        iteration=0,
+        reason="backend_submission_failed: partition 'multicore_small' is not present",
+    )
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.HALTED
+    assert not any(
+        c.get("phase") == CampaignPhase.PHASE_A_POLUS.value
+        for c in report.recovery_candidates
+    )
+    assert any("trajectory pool" in reason for reason in report.unsafe_reasons)
+
+
+def test_propose_recovery_blocks_real_pending_job_without_intent(tmp_path):
+    campaign, data, _, _ = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.HALTED
+    state.iteration = 0
+    state.pending_jobs[CampaignPhase.PHASE_A_POLUS.value] = "123456"
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    append_event(
+        data / "journal.ndjson",
+        "halt",
+        from_phase=CampaignPhase.PHASE_A_POLUS.value,
+        iteration=0,
+        reason="scheduler status uncertain",
+    )
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.HALTED
+    assert any("pending job(s) without active submission intent" in r for r in report.unsafe_reasons)
+    assert "pending_jobs" in report.blocking_artifacts
+
+
 def test_propose_recovery_initial_aimall_handoff_reenters_initial_ferebus(tmp_path):
     campaign, data, _, _ = _campaign_dirs(tmp_path)
     _write_pool(campaign)

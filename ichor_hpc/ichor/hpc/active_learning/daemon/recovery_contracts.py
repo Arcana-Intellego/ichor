@@ -622,6 +622,7 @@ def select_recovery_phase(
     existing_loaded: bool,
     last_phase: Optional[str] = None,
     last_iteration: Optional[int] = None,
+    last_phase_retryable: bool = False,
 ) -> Optional[RecoveryDecision]:
     """Choose the furthest safe re-entry phase from producer contracts."""
     campaign = Path(campaign_dir)
@@ -657,6 +658,17 @@ def select_recovery_phase(
                 iteration,
                 "INITIAL_GAUSSIAN: valid Phase A sample exists without committed models",
                 "3_DIVERSITY_SAMPLING/initial/PHASE_A_SAMPLE.json",
+            )
+        if (
+            bool(last_phase_retryable)
+            and str(last_phase or "") == CampaignPhase.PHASE_A_POLUS.value
+            and _ok(_require_pool, campaign)
+        ):
+            return RecoveryDecision(
+                CampaignPhase.PHASE_A_POLUS,
+                iteration,
+                "PHASE_A_POLUS: retryable pre-bootstrap phase has a valid trajectory pool input",
+                ".DATA/TRAJECTORY/pool.xyz",
             )
         if existing_loaded:
             try:
