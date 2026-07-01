@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from ichor.core.adversarial.subspace import LocalSubspace
 from ichor.core.atoms import Atom, Atoms
@@ -108,7 +109,7 @@ def _safety(**overrides):
     return SimpleNamespace(**values)
 
 
-def _select(raw_x, candidate_xs, safety, origins=None, initial_x=0.0):
+def _select(raw_x, candidate_xs, safety, origins=None, initial_x=0.0, scale_model=None):
     seed = _one_atom(0.0)
     acquisition = _FakeAcquisition(seed)
     raw = _copy_atoms_with_coords(seed, np.array([[raw_x, 0.0, 0.0]]))
@@ -128,6 +129,7 @@ def _select(raw_x, candidate_xs, safety, origins=None, initial_x=0.0):
             ariadne_max_displacement_ang=None,
             ariadne_min_pair_distance_ang=None,
         ),
+        scale_model=scale_model,
     )
 
 
@@ -219,6 +221,44 @@ def test_safe_geometry_with_lower_alpha_is_rejected():
     assert safety["raw_final"]["accepted"] is False
     assert safety["raw_final"]["metrics"]["improves_acquisition"] is False
     assert safety["raw_final"]["metrics"]["alpha_delta_from_initial"] < 0.0
+
+
+def test_dimensionless_scale_gate_rejects_over_scaled_atom_move():
+    scale_model = {
+        "schema_version": 1,
+        "model_version": 2,
+        "geometry_motion_scale": {"value_angstrom": 0.10},
+        "aligned_rmsd_scale": {"value_angstrom": 0.10},
+        "residual_fullspace_scale": {"value_angstrom": 1.0},
+        "per_atom_mobility_scales": {
+            "mode": "uniform",
+            "values_angstrom": [0.10],
+        },
+        "pair_distance_reference": {
+            "reference_min_pair_distance_angstrom": 1.0,
+            "ratio_floor": 0.0,
+        },
+        "dimensionless_preset": {
+            "max_scaled_atom_move": 2.0,
+            "max_scaled_rmsd": 100.0,
+            "max_scaled_fullspace_residual": 100.0,
+            "max_scaled_whitened_distance": 100.0,
+            "pair_ratio_floor": 0.0,
+            "normalised_chemistry_penalty_cap": 100.0,
+        },
+    }
+
+    out = _select(
+        raw_x=0.5,
+        candidate_xs=[],
+        safety=_safety(backtrack_to_safe_landing=False),
+        scale_model=scale_model,
+    )
+
+    safety = out["landing_safety"]
+    assert safety["accepted"] is False
+    assert "ariadne_scaled_atom_move_threshold_exceeded" in safety["reasons"]
+    assert safety["raw_final"]["metrics"]["max_per_atom_mobility_ratio"] == pytest.approx(5.0)
 
 
 def test_lower_alpha_raw_final_can_only_fall_back_to_seed_explicitly():

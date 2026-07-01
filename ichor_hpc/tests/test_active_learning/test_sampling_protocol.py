@@ -8,8 +8,10 @@ from ichor.hpc.active_learning.sampling_protocol import (
     hidden_sampling_overrides,
     phase_b_min_separation_from_resolved,
     preview_sampling_protocol,
+    read_sampling_protocol_audit,
     read_sampling_protocol_resolved,
     resolve_sampling_protocol,
+    sampling_protocol_audit_path,
     sampling_protocol_resolved_path,
 )
 from ichor.hpc.active_learning.sampling_scale_model import (
@@ -49,8 +51,16 @@ def test_level_five_preview_matches_current_balanced_defaults():
     assert resolved.acquisition_config.fullspace_confinement.lambda_residual == pytest.approx(
         0.5
     )
+    assert resolved.acquisition_config.movement_band.geometry_novelty_scale_angstrom == pytest.approx(0.05)
+    assert resolved.acquisition_config.fullspace_confinement.rmsd_scale_ang == pytest.approx(0.05)
+    assert resolved.acquisition_config.fullspace_confinement.fixed_residual_scale_ang == pytest.approx(0.5)
     assert resolved.ariadne_run_config.delta0 == pytest.approx(0.10)
     assert resolved.ariadne_run_config.delta_max == pytest.approx(0.40)
+    dimensionless = resolved.scale_model_payload["dimensionless_preset"]
+    assert dimensionless["max_scaled_whitened_distance"] == pytest.approx(10.0)
+    assert dimensionless["max_scaled_atom_move"] == pytest.approx(36.0)
+    assert dimensionless["max_scaled_rmsd"] == pytest.approx(4.2)
+    assert dimensionless["normalised_chemistry_penalty_cap"] == pytest.approx(20.0)
 
 
 def test_aggressiveness_profiles_move_from_conservative_to_exploratory():
@@ -67,6 +77,9 @@ def test_aggressiveness_profiles_move_from_conservative_to_exploratory():
     assert high.profile.lambda_distance < low.profile.lambda_distance
     assert high.profile.ariadne_max_displacement_ang > low.profile.ariadne_max_displacement_ang
     assert high.ariadne_run_config.delta_max > low.ariadne_run_config.delta_max
+    assert high.profile.max_scaled_atom_move > low.profile.max_scaled_atom_move
+    assert high.profile.max_scaled_rmsd > low.profile.max_scaled_rmsd
+    assert high.profile.normalised_chemistry_penalty_cap > low.profile.normalised_chemistry_penalty_cap
 
 
 def test_hidden_low_level_overrides_are_reported_not_applied():
@@ -99,18 +112,29 @@ def test_resolver_writes_round_trippable_manifest(tmp_path):
 
     iter_dir = tmp_path / "7_ACTIVE_LEARNING" / "iteration-0002"
     expected_path = sampling_protocol_resolved_path(iter_dir)
+    audit_path = sampling_protocol_audit_path(iter_dir)
     scale_path = sampling_scale_model_path(iter_dir)
     assert resolved.manifest_path == expected_path
+    assert resolved.audit_manifest_path == audit_path
     assert resolved.scale_model_path == scale_path
     assert expected_path.exists()
+    assert audit_path.exists()
     assert scale_path.exists()
 
     payload = read_sampling_protocol_resolved(iter_dir, expected_iteration=2)
+    audit_payload = read_sampling_protocol_audit(iter_dir, expected_iteration=2)
     scale_payload = read_sampling_scale_model(iter_dir, expected_iteration=2)
     assert payload["schema_version"] == 1
     assert payload["sampling_aggressiveness"] == 5
     assert payload["sampling_scale_model_manifest"] == str(scale_path)
+    assert payload["sampling_protocol_audit_manifest"] == str(audit_path)
+    assert payload["dimensionless_preset"]["max_scaled_atom_move"] == pytest.approx(36.0)
+    assert audit_payload["schema_version"] == 1
+    assert audit_payload["dimensionless_preset"]["max_scaled_atom_move"] == pytest.approx(36.0)
+    assert audit_payload["scheduler_impact"]["new_scheduler_jobs"] == 0
     assert scale_payload["schema_version"] == 1
+    assert scale_payload["model_version"] == 2
+    assert scale_payload["dimensionless_preset"]["max_scaled_rmsd"] == pytest.approx(4.2)
     assert scale_payload["geometry_motion_scale"]["value_angstrom"] == pytest.approx(0.05)
     assert payload["resolved_phase_b"]["effective_min_separation_angstrom"] == pytest.approx(
         PHASE_B_MIN_SEPARATION_SCALE * 0.05
@@ -173,7 +197,11 @@ def test_scale_model_uses_previous_result_json_motion_history(tmp_path):
     assert scale["geometry_motion_scale"]["value_angstrom"] == pytest.approx(0.2)
     assert scale["aligned_rmsd_scale"]["value_angstrom"] == pytest.approx(0.2)
     assert scale["residual_fullspace_scale"]["value_angstrom"] == pytest.approx(0.3)
+    assert resolved.acquisition_config.movement_band.geometry_novelty_scale_angstrom == pytest.approx(0.2)
+    assert resolved.acquisition_config.fullspace_confinement.rmsd_scale_ang == pytest.approx(0.2)
+    assert resolved.acquisition_config.fullspace_confinement.fixed_residual_scale_ang == pytest.approx(0.3)
     assert scale["per_atom_mobility_scales"]["mode"] == "per_atom_index"
     assert scale["per_atom_mobility_scales"]["values_angstrom"] == pytest.approx(
         [0.1, 0.2]
     )
+    assert scale["model_version"] == 2

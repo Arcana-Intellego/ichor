@@ -713,6 +713,10 @@ def _run_phase_b(args, campaign, config):
                 None if resolved_protocol.scale_model_path is None
                 else str(resolved_protocol.scale_model_path.resolve())
             ),
+            "audit_manifest": (
+                None if resolved_protocol.audit_manifest_path is None
+                else str(resolved_protocol.audit_manifest_path.resolve())
+            ),
             "hidden_overrides_detected": list(
                 resolved_protocol.hidden_overrides_detected
             ),

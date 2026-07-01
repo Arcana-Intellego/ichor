@@ -37,7 +37,9 @@ from .geometry_protocol import (
 
 
 SAMPLING_PROTOCOL_SCHEMA_VERSION = 1
+SAMPLING_PROTOCOL_AUDIT_SCHEMA_VERSION = 1
 SAMPLING_PROTOCOL_RESOLVED_FILENAME = "SAMPLING_PROTOCOL_RESOLVED.json"
+SAMPLING_PROTOCOL_AUDIT_FILENAME = "SAMPLING_PROTOCOL_AUDIT.json"
 
 
 @dataclass(frozen=True)
@@ -57,6 +59,16 @@ class AggressivenessProfile:
     trqn_target_initial_grad_rms: float
     trqn_retry_target_initial_grad_rms: float
     trqn_under_move_target_initial_grad_rms: float
+    max_scaled_atom_move: float = 36.0
+    max_scaled_rmsd: float = 4.0
+    max_scaled_fullspace_residual: float = 7.0
+    max_scaled_whitened_distance: float = 10.0
+    pair_ratio_floor: float = 0.0
+    bond_ratio_lower: float = 0.70
+    bond_ratio_upper: float = 1.35
+    angle_ratio_lower: float = 0.65
+    angle_ratio_upper: float = 1.45
+    normalised_chemistry_penalty_cap: float = 20.0
 
 
 _PROFILES: Dict[int, AggressivenessProfile] = {
@@ -70,6 +82,70 @@ _PROFILES: Dict[int, AggressivenessProfile] = {
     8: AggressivenessProfile(0.090, 0.44, 1.23, 13.0, 14, 0.70, 0.35, 0.18, 1.60, 0.60, 0.16, 0.55, 3.5e-4, 7.0e-4, 9.0e-4),
     9: AggressivenessProfile(0.110, 0.42, 1.32, 14.0, 14, 0.60, 0.30, 0.16, 1.70, 0.60, 0.18, 0.60, 4.0e-4, 8.0e-4, 1.0e-3),
     10: AggressivenessProfile(0.130, 0.40, 1.40, 15.0, 12, 0.50, 0.25, 0.14, 1.80, 0.60, 0.20, 0.65, 5.0e-4, 1.0e-3, 1.2e-3),
+}
+
+
+_DIMENSIONLESS_PRESETS: Dict[int, Dict[str, float]] = {
+    1: {
+        "max_scaled_atom_move": 20.0,
+        "max_scaled_rmsd": 2.5,
+        "max_scaled_fullspace_residual": 4.0,
+        "normalised_chemistry_penalty_cap": 10.0,
+    },
+    2: {
+        "max_scaled_atom_move": 24.0,
+        "max_scaled_rmsd": 3.0,
+        "max_scaled_fullspace_residual": 4.8,
+        "normalised_chemistry_penalty_cap": 12.0,
+    },
+    3: {
+        "max_scaled_atom_move": 28.0,
+        "max_scaled_rmsd": 3.4,
+        "max_scaled_fullspace_residual": 5.5,
+        "normalised_chemistry_penalty_cap": 14.0,
+    },
+    4: {
+        "max_scaled_atom_move": 32.0,
+        "max_scaled_rmsd": 3.8,
+        "max_scaled_fullspace_residual": 6.2,
+        "normalised_chemistry_penalty_cap": 17.0,
+    },
+    5: {
+        "max_scaled_atom_move": 36.0,
+        "max_scaled_rmsd": 4.2,
+        "max_scaled_fullspace_residual": 7.0,
+        "normalised_chemistry_penalty_cap": 20.0,
+    },
+    6: {
+        "max_scaled_atom_move": 40.0,
+        "max_scaled_rmsd": 4.8,
+        "max_scaled_fullspace_residual": 7.8,
+        "normalised_chemistry_penalty_cap": 22.0,
+    },
+    7: {
+        "max_scaled_atom_move": 44.0,
+        "max_scaled_rmsd": 5.4,
+        "max_scaled_fullspace_residual": 8.6,
+        "normalised_chemistry_penalty_cap": 24.0,
+    },
+    8: {
+        "max_scaled_atom_move": 48.0,
+        "max_scaled_rmsd": 6.0,
+        "max_scaled_fullspace_residual": 9.4,
+        "normalised_chemistry_penalty_cap": 26.0,
+    },
+    9: {
+        "max_scaled_atom_move": 52.0,
+        "max_scaled_rmsd": 6.6,
+        "max_scaled_fullspace_residual": 10.2,
+        "normalised_chemistry_penalty_cap": 28.0,
+    },
+    10: {
+        "max_scaled_atom_move": 56.0,
+        "max_scaled_rmsd": 7.2,
+        "max_scaled_fullspace_residual": 11.0,
+        "normalised_chemistry_penalty_cap": 30.0,
+    },
 }
 
 
@@ -103,10 +179,15 @@ class ResolvedSamplingProtocol:
     hidden_overrides_detected: List[Dict[str, Any]] = field(default_factory=list)
     manifest_path: Optional[Path] = None
     scale_model_path: Optional[Path] = None
+    audit_manifest_path: Optional[Path] = None
 
 
 def sampling_protocol_resolved_path(iter_dir: Union[str, Path]) -> Path:
     return Path(iter_dir) / SAMPLING_PROTOCOL_RESOLVED_FILENAME
+
+
+def sampling_protocol_audit_path(iter_dir: Union[str, Path]) -> Path:
+    return Path(iter_dir) / SAMPLING_PROTOCOL_AUDIT_FILENAME
 
 
 def _iteration_dir(campaign_dir: Union[str, Path], iteration: int) -> Path:
@@ -120,9 +201,30 @@ def _iteration_dir(campaign_dir: Union[str, Path], iteration: int) -> Path:
 def _profile_for(config: CampaignConfig) -> AggressivenessProfile:
     level = int(config.sampling_protocol.sampling_aggressiveness)
     try:
-        return _PROFILES[level]
+        profile = _PROFILES[level]
     except KeyError as exc:
         raise ValueError("sampling_protocol.sampling_aggressiveness must be in [1, 10]") from exc
+    preset = dict(_DIMENSIONLESS_PRESETS.get(level) or {})
+    preset["max_scaled_whitened_distance"] = float(profile.max_whitened_distance)
+    return replace(profile, **preset)
+
+
+def dimensionless_preset_payload(profile: AggressivenessProfile) -> Dict[str, Any]:
+    """Return the hidden dimensionless policy derived from one public level."""
+    return {
+        "max_scaled_atom_move": float(profile.max_scaled_atom_move),
+        "max_scaled_rmsd": float(profile.max_scaled_rmsd),
+        "max_scaled_fullspace_residual": float(profile.max_scaled_fullspace_residual),
+        "max_scaled_whitened_distance": float(profile.max_scaled_whitened_distance),
+        "pair_ratio_floor": float(profile.pair_ratio_floor),
+        "bond_ratio_lower": float(profile.bond_ratio_lower),
+        "bond_ratio_upper": float(profile.bond_ratio_upper),
+        "angle_ratio_lower": float(profile.angle_ratio_lower),
+        "angle_ratio_upper": float(profile.angle_ratio_upper),
+        "normalised_chemistry_penalty_cap": float(
+            profile.normalised_chemistry_penalty_cap
+        ),
+    }
 
 
 def _flatten(payload: Any, prefix: str = "") -> Dict[str, Any]:
@@ -185,7 +287,9 @@ def _effective_campaign_config(
     effective.adversarial_safety.accept_legacy_missing_landing_safety = bool(
         getattr(config.adversarial_safety, "accept_legacy_missing_landing_safety", False)
     )
-    effective.adversarial_safety.max_whitened_distance = float(profile.max_whitened_distance)
+    effective.adversarial_safety.max_whitened_distance = float(
+        profile.max_scaled_whitened_distance
+    )
     effective.adversarial_safety.backtrack_points = int(profile.backtrack_points)
 
     effective.acquisition.weights.lambda_distance = float(profile.lambda_distance)
@@ -232,6 +336,56 @@ def _apply_profile_to_acquisition_config(acquisition_config: Any, profile: Aggre
             lambda_residual=float(profile.lambda_residual),
             lambda_rmsd=float(profile.lambda_rmsd),
         ),
+    )
+
+
+def _positive_model_value(
+    scale_model_payload: Dict[str, Any],
+    *path: str,
+) -> Optional[float]:
+    cur: Any = scale_model_payload
+    for key in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    try:
+        value = float(cur)
+    except (TypeError, ValueError):
+        return None
+    if value > 0.0:
+        return value
+    return None
+
+
+def _apply_scale_model_to_acquisition_config(
+    acquisition_config: Any,
+    scale_model_payload: Dict[str, Any],
+) -> Any:
+    geom = _positive_model_value(
+        scale_model_payload, "geometry_motion_scale", "value_angstrom"
+    )
+    aligned = _positive_model_value(
+        scale_model_payload, "aligned_rmsd_scale", "value_angstrom"
+    )
+    residual = _positive_model_value(
+        scale_model_payload, "residual_fullspace_scale", "value_angstrom"
+    )
+    movement = acquisition_config.movement_band
+    if geom is not None:
+        movement = replace(movement, geometry_novelty_scale_angstrom=float(geom))
+    fullspace = acquisition_config.fullspace_confinement
+    if aligned is not None:
+        fullspace = replace(fullspace, rmsd_scale_ang=float(aligned))
+    if residual is not None:
+        fullspace = replace(
+            fullspace,
+            residual_scale="fixed",
+            fixed_residual_scale_ang=float(residual),
+        )
+    return replace(
+        acquisition_config,
+        movement_band=movement,
+        fullspace_confinement=fullspace,
     )
 
 
@@ -300,6 +454,11 @@ def _resolved_manifest_payload(resolved: ResolvedSamplingProtocol) -> Dict[str, 
             None if resolved.scale_model_path is None
             else str(resolved.scale_model_path)
         ),
+        "sampling_protocol_audit_manifest": (
+            None if resolved.audit_manifest_path is None
+            else str(resolved.audit_manifest_path)
+        ),
+        "dimensionless_preset": dimensionless_preset_payload(resolved.profile),
         "geometry_novelty_scale": geometry_payload,
         "resolved_geometry_scale_angstrom": scale,
         "resolved_phase_b": phase_b,
@@ -347,6 +506,8 @@ def _resolved_manifest_payload(resolved: ResolvedSamplingProtocol) -> Dict[str, 
             "enabled": bool(resolved.acquisition_config.fullspace_confinement.enabled),
             "lambda_residual": float(resolved.acquisition_config.fullspace_confinement.lambda_residual),
             "lambda_rmsd": float(resolved.acquisition_config.fullspace_confinement.lambda_rmsd),
+            "residual_scale": str(resolved.acquisition_config.fullspace_confinement.residual_scale),
+            "fixed_residual_scale_ang": resolved.acquisition_config.fullspace_confinement.fixed_residual_scale_ang,
             "rmsd_scale_ang": float(resolved.acquisition_config.fullspace_confinement.rmsd_scale_ang),
         },
         "resolved_ariadne": {
@@ -367,6 +528,7 @@ def _resolved_manifest_payload(resolved: ResolvedSamplingProtocol) -> Dict[str, 
             "allow_seed_fallback": False,
             "phase_b_filter_enabled": True,
             "connectivity_barrier": True,
+            "dimensionless_scale_gates": True,
         },
         "hidden_overrides_detected": list(resolved.hidden_overrides_detected),
         "profile": profile,
@@ -407,6 +569,101 @@ def read_sampling_protocol_resolved(
     return payload
 
 
+def _sampling_protocol_audit_payload(resolved: ResolvedSamplingProtocol) -> Dict[str, Any]:
+    scale_model = dict(resolved.scale_model_payload or {})
+    dimensionless = dimensionless_preset_payload(resolved.profile)
+    diagnostics = dict(scale_model.get("diagnostics") or {})
+    history = dict(scale_model.get("history") or {})
+    pair_reference = dict(scale_model.get("pair_distance_reference") or {})
+    bond_angle = dict(scale_model.get("bond_angle_reference") or {})
+    return _json_ready(
+        {
+            "schema_version": SAMPLING_PROTOCOL_AUDIT_SCHEMA_VERSION,
+            "iteration": int(resolved.iteration),
+            "generated_at_iso": datetime.now(timezone.utc).isoformat(),
+            "sampling_aggressiveness": int(resolved.sampling_aggressiveness),
+            "public_user_surface": {
+                "editable_campaign_field": "sampling_protocol.sampling_aggressiveness",
+                "hidden_low_level_blocks": list(_HIDDEN_TOP_LEVEL_BLOCKS),
+            },
+            "dimensionless_preset": dimensionless,
+            "enforced_landing_gates": {
+                "scaled_whitened_distance_max": float(
+                    dimensionless["max_scaled_whitened_distance"]
+                ),
+                "scaled_max_atom_move_max": float(
+                    dimensionless["max_scaled_atom_move"]
+                ),
+                "scaled_aligned_rmsd_max": float(dimensionless["max_scaled_rmsd"]),
+                "scaled_fullspace_residual_max": float(
+                    dimensionless["max_scaled_fullspace_residual"]
+                ),
+                "pair_ratio_floor": float(dimensionless["pair_ratio_floor"]),
+                "normalised_chemistry_penalty_cap": float(
+                    dimensionless["normalised_chemistry_penalty_cap"]
+                ),
+            },
+            "record_only_reference_ranges": {
+                "bond_ratio_lower": float(dimensionless["bond_ratio_lower"]),
+                "bond_ratio_upper": float(dimensionless["bond_ratio_upper"]),
+                "angle_ratio_lower": float(dimensionless["angle_ratio_lower"]),
+                "angle_ratio_upper": float(dimensionless["angle_ratio_upper"]),
+            },
+            "scale_model_summary": {
+                "schema_version": scale_model.get("schema_version"),
+                "model_version": scale_model.get("model_version"),
+                "geometry_motion_scale": scale_model.get("geometry_motion_scale"),
+                "aligned_rmsd_scale": scale_model.get("aligned_rmsd_scale"),
+                "residual_fullspace_scale": scale_model.get("residual_fullspace_scale"),
+                "per_atom_mobility": scale_model.get("per_atom_mobility_scales"),
+                "pair_distance_reference": pair_reference,
+                "bond_angle_reference": bond_angle,
+                "history": {
+                    "window_iterations": history.get("window_iterations"),
+                    "n_records": history.get("n_records"),
+                    "n_result_json": history.get("n_result_json"),
+                },
+            },
+            "fallback_warnings": list(diagnostics.get("fallback_warnings") or []),
+            "hidden_overrides_detected": list(resolved.hidden_overrides_detected),
+            "manifest_paths": {
+                "resolved": None if resolved.manifest_path is None else str(resolved.manifest_path),
+                "scale_model": None if resolved.scale_model_path is None else str(resolved.scale_model_path),
+            },
+            "scheduler_impact": {
+                "new_scheduler_jobs": 0,
+                "uses_only_existing_campaign_data": True,
+            },
+        }
+    )
+
+
+def write_sampling_protocol_audit(
+    iter_dir: Union[str, Path],
+    resolved: ResolvedSamplingProtocol,
+) -> Path:
+    path = sampling_protocol_audit_path(iter_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(path, _sampling_protocol_audit_payload(resolved))
+    return path
+
+
+def read_sampling_protocol_audit(
+    iter_dir: Union[str, Path],
+    *,
+    expected_iteration: Optional[int] = None,
+) -> Dict[str, Any]:
+    path = sampling_protocol_audit_path(iter_dir)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("SAMPLING_PROTOCOL_AUDIT.json must contain an object")
+    if int(payload.get("schema_version", -1)) != SAMPLING_PROTOCOL_AUDIT_SCHEMA_VERSION:
+        raise ValueError("unsupported sampling protocol audit schema")
+    if expected_iteration is not None and int(payload.get("iteration", -1)) != int(expected_iteration):
+        raise ValueError("sampling protocol audit iteration mismatch")
+    return payload
+
+
 def resolve_sampling_protocol(
     campaign_dir: Union[str, Path],
     config: CampaignConfig,
@@ -439,12 +696,21 @@ def resolve_sampling_protocol(
         geometry_scale_payload=dict(geometry_payload),
         write_manifest=write_manifest,
     )
+    scale_model_payload = dict(scale_model_payload)
+    scale_model_payload["dimensionless_preset"] = dimensionless_preset_payload(profile)
+    diagnostics = dict(scale_model_payload.get("diagnostics") or {})
+    diagnostics["size_independence_wave"] = 3
+    scale_model_payload["diagnostics"] = diagnostics
     acquisition_config = apply_geometry_novelty_to_acquisition_config(
         effective.to_acquisition_config(),
         effective,
         geometry_payload,
     )
     acquisition_config = _apply_profile_to_acquisition_config(acquisition_config, profile)
+    acquisition_config = _apply_scale_model_to_acquisition_config(
+        acquisition_config,
+        scale_model_payload,
+    )
     ariadne_run_config = effective.to_ariadne_run_config()
     resolved_consumers = resolve_geometry_novelty_consumers(effective, geometry_payload)
     phase_b = dict(resolved_consumers.get("phase_b") or {})
@@ -476,6 +742,8 @@ def resolve_sampling_protocol(
         sampling_scale_model_path(_iteration_dir(campaign_dir, int(iteration)))
         if write_manifest else None
     )
+    if write_manifest and scale_path is not None:
+        atomic_write_json(scale_path, _json_ready(scale_model_payload))
 
     resolved = ResolvedSamplingProtocol(
         schema_version=SAMPLING_PROTOCOL_SCHEMA_VERSION,
@@ -501,11 +769,12 @@ def resolve_sampling_protocol(
         scale_model_path=scale_path,
     )
     if write_manifest:
-        path = write_sampling_protocol_resolved(
-            _iteration_dir(campaign_dir, int(iteration)),
-            resolved,
-        )
+        iter_dir = _iteration_dir(campaign_dir, int(iteration))
+        path = write_sampling_protocol_resolved(iter_dir, resolved)
         resolved = replace(resolved, manifest_path=path)
+        audit_path = write_sampling_protocol_audit(iter_dir, resolved)
+        resolved = replace(resolved, audit_manifest_path=audit_path)
+        write_sampling_protocol_resolved(iter_dir, resolved)
     return resolved
 
 
@@ -546,12 +815,21 @@ def preview_sampling_protocol(
         geometry_scale_payload=dict(geometry_scale_payload),
         write_manifest=False,
     )
+    scale_model_payload = dict(scale_model_payload)
+    scale_model_payload["dimensionless_preset"] = dimensionless_preset_payload(profile)
+    diagnostics = dict(scale_model_payload.get("diagnostics") or {})
+    diagnostics["size_independence_wave"] = 3
+    scale_model_payload["diagnostics"] = diagnostics
     acquisition_config = apply_geometry_novelty_to_acquisition_config(
         effective.to_acquisition_config(),
         effective,
         geometry_scale_payload,
     )
     acquisition_config = _apply_profile_to_acquisition_config(acquisition_config, profile)
+    acquisition_config = _apply_scale_model_to_acquisition_config(
+        acquisition_config,
+        scale_model_payload,
+    )
     ariadne_run_config = effective.to_ariadne_run_config()
     resolved_consumers = resolve_geometry_novelty_consumers(effective, geometry_scale_payload)
     phase_b = dict(resolved_consumers.get("phase_b") or {})
@@ -614,14 +892,20 @@ def phase_b_min_separation_from_resolved(
 
 
 __all__ = [
+    "SAMPLING_PROTOCOL_AUDIT_FILENAME",
+    "SAMPLING_PROTOCOL_AUDIT_SCHEMA_VERSION",
     "SAMPLING_PROTOCOL_RESOLVED_FILENAME",
     "SAMPLING_PROTOCOL_SCHEMA_VERSION",
     "ResolvedSamplingProtocol",
+    "dimensionless_preset_payload",
     "hidden_sampling_overrides",
     "phase_b_min_separation_from_resolved",
     "preview_sampling_protocol",
+    "read_sampling_protocol_audit",
     "read_sampling_protocol_resolved",
     "resolve_sampling_protocol",
+    "sampling_protocol_audit_path",
     "sampling_protocol_resolved_path",
+    "write_sampling_protocol_audit",
     "write_sampling_protocol_resolved",
 ]

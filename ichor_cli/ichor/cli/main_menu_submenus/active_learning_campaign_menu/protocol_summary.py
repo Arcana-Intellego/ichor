@@ -304,6 +304,7 @@ def format_sampling_protocol_summary(
     try:
         from ichor.hpc.active_learning.sampling_protocol import (
             preview_sampling_protocol,
+            sampling_protocol_audit_path,
             sampling_protocol_resolved_path,
         )
 
@@ -353,11 +354,14 @@ def format_sampling_protocol_summary(
         residual_scale = scale_model.get("residual_fullspace_scale", {})
         mobility = scale_model.get("per_atom_mobility_scales", {})
         pair_ref = scale_model.get("pair_distance_reference", {})
+        dimensionless = scale_model.get("dimensionless_preset", {})
         lines.append(
             _line(
                 "sampling_protocol.scale_model",
                 "schema="
                 + str(scale_model.get("schema_version"))
+                + ", model_version="
+                + str(scale_model.get("model_version"))
                 + ", geometry_source="
                 + str(geom_scale.get("source"))
                 + ", history_records="
@@ -407,6 +411,21 @@ def format_sampling_protocol_summary(
                 + str(pair_ref.get("mode")),
             )
         )
+        lines.append(
+            _line(
+                "sampling_protocol.dimensionless_landing_gates",
+                "max_scaled_atom_move="
+                + str(dimensionless.get("max_scaled_atom_move"))
+                + ", max_scaled_rmsd="
+                + str(dimensionless.get("max_scaled_rmsd"))
+                + ", max_scaled_residual="
+                + str(dimensionless.get("max_scaled_fullspace_residual"))
+                + ", max_scaled_whitened="
+                + str(dimensionless.get("max_scaled_whitened_distance"))
+                + ", chemistry_cap="
+                + str(dimensionless.get("normalised_chemistry_penalty_cap")),
+            )
+        )
         lines.append(_line("sampling_protocol.resolved_movement_band", movement_text))
         lines.append(
             _line(
@@ -454,7 +473,11 @@ def format_sampling_protocol_summary(
                 + ", lambda_residual="
                 + str(acq_cfg.fullspace_confinement.lambda_residual)
                 + ", lambda_rmsd="
-                + str(acq_cfg.fullspace_confinement.lambda_rmsd),
+                + str(acq_cfg.fullspace_confinement.lambda_rmsd)
+                + ", residual_scale="
+                + str(acq_cfg.fullspace_confinement.fixed_residual_scale_ang)
+                + ", rmsd_scale="
+                + str(acq_cfg.fullspace_confinement.rmsd_scale_ang),
             )
         )
         lines.append(
@@ -484,6 +507,12 @@ def format_sampling_protocol_summary(
                 / "iteration-0000"
             )
             lines.append(_line("sampling_protocol.resolved_manifest_example", manifest_path))
+            audit_path = sampling_protocol_audit_path(
+                Path(campaign_dir)
+                / "7_ACTIVE_LEARNING"
+                / "iteration-0000"
+            )
+            lines.append(_line("sampling_protocol.audit_manifest_example", audit_path))
         except Exception:
             pass
     lines.append(

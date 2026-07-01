@@ -706,6 +706,86 @@ def _annotate_sampling_scale_metrics(
             float(chemistry) / float(max(n_atoms, 1))
         )
 
+    preset = (
+        scale_model.get("dimensionless_preset")
+        if isinstance(scale_model.get("dimensionless_preset"), dict)
+        else {}
+    )
+    for key in (
+        "max_scaled_atom_move",
+        "max_scaled_rmsd",
+        "max_scaled_fullspace_residual",
+        "max_scaled_whitened_distance",
+        "pair_ratio_floor",
+        "normalised_chemistry_penalty_cap",
+        "bond_ratio_lower",
+        "bond_ratio_upper",
+        "angle_ratio_lower",
+        "angle_ratio_upper",
+    ):
+        value = _safe_float_or_none(preset.get(key))
+        if value is not None:
+            metrics["sampling_protocol_" + key] = float(value)
+
+
+def _append_reason_once(reasons: List[str], reason: str) -> None:
+    if reason not in reasons:
+        reasons.append(reason)
+
+
+def _apply_dimensionless_sampling_gates(
+    metrics: Dict[str, Any],
+    reasons: List[str],
+    *,
+    scale_model: Optional[Dict[str, Any]],
+) -> None:
+    if not isinstance(scale_model, dict):
+        return
+    preset = scale_model.get("dimensionless_preset")
+    if not isinstance(preset, dict):
+        return
+    checks = (
+        (
+            "max_per_atom_mobility_ratio",
+            "max_scaled_atom_move",
+            "ariadne_scaled_atom_move_threshold_exceeded",
+        ),
+        (
+            "scaled_aligned_rmsd",
+            "max_scaled_rmsd",
+            "ariadne_scaled_rmsd_threshold_exceeded",
+        ),
+        (
+            "scaled_fullspace_residual_distance",
+            "max_scaled_fullspace_residual",
+            "ariadne_scaled_fullspace_residual_threshold_exceeded",
+        ),
+        (
+            "scaled_whitened_distance",
+            "max_scaled_whitened_distance",
+            "ariadne_landing_above_max_scaled_whitened_distance",
+        ),
+        (
+            "normalised_chemistry_penalty",
+            "normalised_chemistry_penalty_cap",
+            "ariadne_normalised_chemistry_penalty_threshold_exceeded",
+        ),
+    )
+    for metric_key, threshold_key, reason in checks:
+        value = _safe_float_or_none(metrics.get(metric_key))
+        threshold = _safe_float_or_none(preset.get(threshold_key))
+        if value is not None and threshold is not None and float(value) > float(threshold):
+            _append_reason_once(reasons, reason)
+    pair_ratio = _safe_float_or_none(metrics.get("scaled_min_pair_ratio"))
+    pair_floor = _safe_float_or_none(preset.get("pair_ratio_floor"))
+    if (
+        pair_ratio is not None
+        and pair_floor is not None
+        and pair_floor > 0.0
+        and float(pair_ratio) < float(pair_floor)
+    ):
+        _append_reason_once(reasons, "ariadne_scaled_pair_ratio_threshold_exceeded")
+
 
 def _candidate_public(candidate: Dict[str, Any]) -> Dict[str, Any]:
     public = {
@@ -980,6 +1060,12 @@ def _evaluate_landing_candidate(
         and float(metrics["chemistry_penalty"]) > max_chem
     ):
         reasons.append("ariadne_landing_chemistry_penalty_threshold_exceeded")
+
+    _apply_dimensionless_sampling_gates(
+        metrics,
+        reasons,
+        scale_model=scale_model,
+    )
 
     return {
         "candidate_index": int(candidate_index),
@@ -2299,6 +2385,10 @@ def main(argv=None) -> int:
         "scale_model_manifest": (
             None if resolved_protocol.scale_model_path is None
             else str(resolved_protocol.scale_model_path.resolve())
+        ),
+        "audit_manifest": (
+            None if resolved_protocol.audit_manifest_path is None
+            else str(resolved_protocol.audit_manifest_path.resolve())
         ),
         "hidden_overrides_detected": list(resolved_protocol.hidden_overrides_detected),
     }

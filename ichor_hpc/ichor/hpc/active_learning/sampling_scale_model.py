@@ -19,6 +19,7 @@ from .geometry_protocol import FULLSPACE_RMSD_SCALE_MULTIPLIER
 
 
 SAMPLING_SCALE_MODEL_SCHEMA_VERSION = 1
+SAMPLING_SCALE_MODEL_MODEL_VERSION = 2
 SAMPLING_SCALE_MODEL_FILENAME = "SAMPLING_SCALE_MODEL.json"
 
 
@@ -244,6 +245,48 @@ def _collect_history(
     }
 
 
+def _current_seed_scale_records(
+    campaign_dir: Path,
+    iteration: int,
+    *,
+    geometry_scale: float,
+    aligned_rmsd_scale: float,
+    residual_scale: float,
+    per_atom_mode: str,
+) -> List[Dict[str, Any]]:
+    path = (
+        campaign_dir
+        / "7_ACTIVE_LEARNING"
+        / ("iteration-" + str(int(iteration)).zfill(4))
+        / "seeds_picked.json"
+    )
+    payload = _json(path)
+    records = payload.get("seeds") if isinstance(payload, dict) else None
+    if not isinstance(records, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for pos, record in enumerate(records):
+        if not isinstance(record, dict):
+            continue
+        seed_index = record.get("seed_index", pos)
+        try:
+            seed_index_i = int(seed_index)
+        except (TypeError, ValueError):
+            seed_index_i = int(pos)
+        out.append(
+            {
+                "seed_index": seed_index_i,
+                "frame_id": record.get("frame_id"),
+                "geometry_motion_scale_angstrom": float(geometry_scale),
+                "aligned_rmsd_scale_angstrom": float(aligned_rmsd_scale),
+                "residual_fullspace_scale_angstrom": float(residual_scale),
+                "per_atom_mobility_mode": str(per_atom_mode),
+                "source": "current_seed_manifest_with_iteration_scale_model",
+            }
+        )
+    return out
+
+
 def _scale_entry(
     value: Optional[float],
     *,
@@ -354,9 +397,32 @@ def build_sampling_scale_model(
             "fallback_used": False,
         }
     }
+    fallback_warnings: List[str] = []
+    if bool(geometry_scale["fallback_used"]):
+        fallback_warnings.append("geometry_motion_scale_fallback")
+    if bool(aligned_rmsd["fallback_used"]):
+        fallback_warnings.append("aligned_rmsd_scale_fallback")
+    if bool(residual["fallback_used"]):
+        fallback_warnings.append("residual_fullspace_scale_fallback")
+    if bool(per_atom_fallback):
+        fallback_warnings.append("per_atom_mobility_uniform_fallback")
+    if observed_pair is None:
+        fallback_warnings.append("pair_reference_quality_gate_floor_fallback")
+    fallback_warnings.append("bond_angle_reference_record_only_fallback")
+    per_seed_scale_model = _current_seed_scale_records(
+        campaign,
+        int(iteration),
+        geometry_scale=geometry_ang,
+        aligned_rmsd_scale=float(aligned_rmsd["value_angstrom"]),
+        residual_scale=float(residual["value_angstrom"]),
+        per_atom_mode=str(
+            "per_atom_index" if not per_atom_fallback else "uniform"
+        ),
+    )
 
     payload = {
         "schema_version": SAMPLING_SCALE_MODEL_SCHEMA_VERSION,
+        "model_version": SAMPLING_SCALE_MODEL_MODEL_VERSION,
         "iteration": int(iteration),
         "generated_at_iso": _now_iso(),
         "geometry_motion_scale": geometry_scale,
@@ -384,8 +450,12 @@ def build_sampling_scale_model(
             "observed_min_pair_summary": _summary(history["min_pair_distances"]),
         },
         "bond_angle_reference": {
-            "source": "not_available_wave2",
+            "source": "geometry_connectivity_not_available_wave3_record_only",
             "fallback_used": True,
+            "bond_ratio_lower": None,
+            "bond_ratio_upper": None,
+            "angle_ratio_lower": None,
+            "angle_ratio_upper": None,
         },
         "gradient_rms_scale": gradient_scale,
         "component_scales": {
@@ -401,10 +471,12 @@ def build_sampling_scale_model(
             "residual_summary": _summary(history["residual_values"]),
             "max_atom_displacement_summary": _summary(history["max_atom_displacements"]),
         },
+        "per_seed_scale_model": per_seed_scale_model,
         "diagnostics": {
-            "size_independence_wave": 2,
+            "size_independence_wave": 3,
             "new_scheduler_jobs": 0,
             "uses_only_existing_campaign_data": True,
+            "fallback_warnings": fallback_warnings,
         },
     }
     if write_manifest:
@@ -440,6 +512,7 @@ def scale_model_value(payload: Optional[Dict[str, Any]], path: Sequence[str], de
 
 __all__ = [
     "SAMPLING_SCALE_MODEL_FILENAME",
+    "SAMPLING_SCALE_MODEL_MODEL_VERSION",
     "SAMPLING_SCALE_MODEL_SCHEMA_VERSION",
     "build_sampling_scale_model",
     "read_sampling_scale_model",

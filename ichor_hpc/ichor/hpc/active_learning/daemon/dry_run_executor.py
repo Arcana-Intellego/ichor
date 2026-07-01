@@ -954,6 +954,8 @@ class DryRunPhaseExecutor:
             self.artefact_log.append(str(resolved_protocol.manifest_path))
         if resolved_protocol.scale_model_path is not None:
             self.artefact_log.append(str(resolved_protocol.scale_model_path))
+        if resolved_protocol.audit_manifest_path is not None:
+            self.artefact_log.append(str(resolved_protocol.audit_manifest_path))
         for k in range(n_seeds):
             seed_record = seed_records[k]
             seed_frame_id = (
@@ -990,6 +992,10 @@ class DryRunPhaseExecutor:
                 "scale_model_manifest": (
                     None if resolved_protocol.scale_model_path is None
                     else str(resolved_protocol.scale_model_path.resolve())
+                ),
+                "audit_manifest": (
+                    None if resolved_protocol.audit_manifest_path is None
+                    else str(resolved_protocol.audit_manifest_path.resolve())
                 ),
                 "hidden_overrides_detected": list(
                     resolved_protocol.hidden_overrides_detected
@@ -1266,6 +1272,8 @@ class DryRunPhaseExecutor:
             self.artefact_log.append(str(resolved_protocol.manifest_path))
         if resolved_protocol.scale_model_path is not None:
             self.artefact_log.append(str(resolved_protocol.scale_model_path))
+        if resolved_protocol.audit_manifest_path is not None:
+            self.artefact_log.append(str(resolved_protocol.audit_manifest_path))
         effective_min_separation, threshold_mode = phase_b_min_separation_from_resolved(
             resolved_protocol
         )
@@ -1293,6 +1301,10 @@ class DryRunPhaseExecutor:
                 "scale_model_manifest": (
                     None if resolved_protocol.scale_model_path is None
                     else str(resolved_protocol.scale_model_path.resolve())
+                ),
+                "audit_manifest": (
+                    None if resolved_protocol.audit_manifest_path is None
+                    else str(resolved_protocol.audit_manifest_path.resolve())
                 ),
                 "hidden_overrides_detected": list(
                     resolved_protocol.hidden_overrides_detected

@@ -1337,6 +1337,7 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
     assert "sampling_protocol.scale_model.aligned_rmsd_scale" in out
     assert "sampling_protocol.scale_model.per_atom_mobility" in out
     assert "sampling_protocol.scale_model.pair_reference" in out
+    assert "sampling_protocol.dimensionless_landing_gates" in out
     assert "sampling_protocol.resolved_movement_band" in out
     assert "sampling_protocol.resolved_phase_b" in out
     assert "sampling_protocol.resolved_safety" in out
@@ -1384,6 +1385,7 @@ def test_daemon_control_sampling_protocol_summary_uses_saved_campaign(tmp_path, 
     assert "sampling_protocol.resolved_safety" in out
     assert "sampling_protocol.resolved_ariadne" in out
     assert "sampling_protocol.resolved_manifest_example" in out
+    assert "sampling_protocol.audit_manifest_example" in out
     assert "seed_selection.strategy: d_optimal" in out
     assert "error_calibration.mode: record_only" in out
 
