@@ -12,7 +12,7 @@ import json
 import math
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from .daemon.state import atomic_write_json
 from .geometry_protocol import FULLSPACE_RMSD_SCALE_MULTIPLIER
@@ -95,29 +95,14 @@ def _json(path: Path) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
-def _records_from_previous_iterations(
-    campaign_dir: Path,
-    iteration: int,
-    *,
-    window: int,
-) -> Iterable[Tuple[Path, Dict[str, Any]]]:
-    if int(iteration) <= 0 or int(window) <= 0:
-        return
-    base = campaign_dir / "7_ACTIVE_LEARNING"
-    start = max(0, int(iteration) - int(window))
-    for previous in range(start, int(iteration)):
-        iter_dir = base / ("iteration-" + str(previous).zfill(4))
-        audit = _json(iter_dir / "ARIADNE_LANDING_AUDIT.json")
-        if isinstance(audit, dict):
-            for record in audit.get("seeds") or []:
-                if isinstance(record, dict):
-                    yield iter_dir, record
-            continue
-        results = _json(iter_dir / "ARIADNE_RESULTS.json")
-        if isinstance(results, dict):
-            for record in results.get("accepted") or []:
-                if isinstance(record, dict):
-                    yield iter_dir, record
+_HISTORY_METRIC_KEYS = (
+    "movement_rmsd_ang",
+    "aligned_mass_weighted_rmsd_ang",
+    "aligned_rmsd_ang",
+    "fullspace_residual_distance",
+    "max_displacement_ang",
+    "min_pair_distance_ang",
+)
 
 
 def _record_metrics(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -127,6 +112,76 @@ def _record_metrics(record: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(record.get("metrics"), dict):
         return dict(record.get("metrics") or {})
     return {}
+
+
+def _has_usable_history_metric(record: Dict[str, Any]) -> bool:
+    metrics = _record_metrics(record)
+    return any(_finite_positive(metrics.get(key)) is not None for key in _HISTORY_METRIC_KEYS)
+
+
+def _history_skip_reason(record: Dict[str, Any], *, source: str) -> Optional[str]:
+    safety = record.get("landing_safety")
+    if source == "audit" and record.get("handoff_accepted") is not True:
+        return "n_skipped_handoff_rejected"
+    if not isinstance(safety, dict):
+        return "n_skipped_missing_landing_safety"
+    if safety.get("accepted") is not True:
+        return "n_skipped_landing_rejected"
+    if not _has_usable_history_metric(record):
+        return "n_skipped_no_usable_metrics"
+    return None
+
+
+def _accepted_history_records_for_iteration(
+    iter_dir: Path,
+) -> Tuple[List[Tuple[Path, Dict[str, Any], str]], Dict[str, int]]:
+    counts = {
+        "n_seen": 0,
+        "n_used": 0,
+        "n_skipped_handoff_rejected": 0,
+        "n_skipped_landing_rejected": 0,
+        "n_skipped_missing_landing_safety": 0,
+        "n_skipped_no_usable_metrics": 0,
+        "n_fallback_results_records_used": 0,
+    }
+    accepted: List[Tuple[Path, Dict[str, Any], str]] = []
+    audit = _json(iter_dir / "ARIADNE_LANDING_AUDIT.json")
+    if isinstance(audit, dict):
+        for record in audit.get("seeds") or []:
+            if not isinstance(record, dict):
+                continue
+            counts["n_seen"] += 1
+            reason = _history_skip_reason(record, source="audit")
+            if reason is not None:
+                counts[reason] += 1
+                continue
+            accepted.append((iter_dir, record, "audit"))
+    if accepted:
+        counts["n_used"] += len(accepted)
+        return accepted, counts
+
+    results = _json(iter_dir / "ARIADNE_RESULTS.json")
+    if isinstance(results, dict):
+        fallback: List[Tuple[Path, Dict[str, Any], str]] = []
+        seen_keys = set()
+        for record in results.get("accepted") or []:
+            if not isinstance(record, dict):
+                continue
+            key = str(record.get("result_json") or record.get("seed_dir") or record.get("seed_index") or len(seen_keys))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            counts["n_seen"] += 1
+            reason = _history_skip_reason(record, source="results")
+            if reason is not None:
+                counts[reason] += 1
+                continue
+            fallback.append((iter_dir, record, "results"))
+        if fallback:
+            counts["n_used"] += len(fallback)
+            counts["n_fallback_results_records_used"] += len(fallback)
+            return fallback, counts
+    return [], counts
 
 
 def _result_path(iter_dir: Path, record: Dict[str, Any]) -> Optional[Path]:
@@ -205,11 +260,26 @@ def _collect_history(
     per_atom_by_index: Dict[int, List[float]] = {}
     n_records = 0
     n_result_json = 0
-    for iter_dir, record in _records_from_previous_iterations(
-        campaign_dir,
-        iteration,
-        window=window,
-    ):
+    history_filter = {
+        "n_seen": 0,
+        "n_used": 0,
+        "n_skipped_handoff_rejected": 0,
+        "n_skipped_landing_rejected": 0,
+        "n_skipped_missing_landing_safety": 0,
+        "n_skipped_no_usable_metrics": 0,
+        "n_fallback_results_records_used": 0,
+    }
+    base = campaign_dir / "7_ACTIVE_LEARNING"
+    start = max(0, int(iteration) - int(window))
+    accepted_history: List[Tuple[Path, Dict[str, Any], str]] = []
+    if int(iteration) > 0 and int(window) > 0:
+        for previous in range(start, int(iteration)):
+            iter_dir = base / ("iteration-" + str(previous).zfill(4))
+            records, counts = _accepted_history_records_for_iteration(iter_dir)
+            accepted_history.extend(records)
+            for key in history_filter:
+                history_filter[key] += int(counts.get(key, 0))
+    for iter_dir, record, _source in accepted_history:
         n_records += 1
         metrics = _record_metrics(record)
         for key, dest in (
@@ -242,6 +312,7 @@ def _collect_history(
         "max_atom_displacements": max_atom_displacements,
         "min_pair_distances": min_pair_distances,
         "per_atom_by_index": per_atom_by_index,
+        "history_filter": history_filter,
     }
 
 
@@ -260,8 +331,16 @@ def _current_seed_scale_records(
         / ("iteration-" + str(int(iteration)).zfill(4))
         / "seeds_picked.json"
     )
-    payload = _json(path)
-    records = payload.get("seeds") if isinstance(payload, dict) else None
+    records = None
+    try:
+        from .handoff_manifests import load_seeds_picked
+
+        payload = load_seeds_picked(path.parent, expected_iteration=int(iteration))
+        records = payload.get("seed_records")
+    except Exception:
+        payload = _json(path)
+        if isinstance(payload, dict):
+            records = payload.get("seed_records") or payload.get("seeds")
     if not isinstance(records, list):
         return []
     out: List[Dict[str, Any]] = []
@@ -470,6 +549,7 @@ def build_sampling_scale_model(
             "aligned_rmsd_summary": _summary(history["rmsd_values"]),
             "residual_summary": _summary(history["residual_values"]),
             "max_atom_displacement_summary": _summary(history["max_atom_displacements"]),
+            "filter": dict(history.get("history_filter") or {}),
         },
         "per_seed_scale_model": per_seed_scale_model,
         "diagnostics": {
@@ -477,6 +557,7 @@ def build_sampling_scale_model(
             "new_scheduler_jobs": 0,
             "uses_only_existing_campaign_data": True,
             "fallback_warnings": fallback_warnings,
+            "history_filter": dict(history.get("history_filter") or {}),
         },
     }
     if write_manifest:

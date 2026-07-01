@@ -116,7 +116,7 @@ def test_edit_campaign_config_menu_items():
     )
     texts = [it.text for it in edit_campaign_config_menu.items]
     for expected in (
-        "Show current in-memory config",
+        "Show dense/internal in-memory config",
         "Show sampling protocol summary",
         "Load from disk",
         "Reset to defaults",
@@ -146,7 +146,7 @@ def test_edit_campaign_config_menu_items():
         "Show config lock review",
         "Show pending config changes",
         "Discard unsaved changes / reload from disk",
-        "Export dense config snapshot",
+        "Export dense/internal config snapshot",
         "Save to disk",
     ):
         assert expected in texts, "missing item: " + expected
@@ -1418,7 +1418,15 @@ def test_campaign_config_menu_covers_every_config_leaf():
     spec_paths.extend("ariadne." + spec.path for spec in ARIADNE_FIELD_SPECS)
 
     assert len(spec_paths) == len(set(spec_paths))
-    expected_editable = set(leaf_paths(CampaignConfig())) - {"schema_version"}
+    resolver_owned_hidden = {
+        "quality_gates.ariadne_max_displacement_ang",
+        "quality_gates.ariadne_min_pair_distance_ang",
+    }
+    expected_editable = (
+        set(leaf_paths(CampaignConfig()))
+        - {"schema_version"}
+        - resolver_owned_hidden
+    )
     actual_editable = {
         spec.path
         for spec in specs
@@ -1428,6 +1436,9 @@ def test_campaign_config_menu_covers_every_config_leaf():
 
     assert read_only == {"schema_version"}
     assert actual_editable == expected_editable
+    quality_rendered = _BLOCK_MENUS_BY_LABEL["Edit quality_gates"].this_menu_options()
+    assert "quality_gates.ariadne_max_displacement_ang" not in quality_rendered
+    assert "quality_gates.ariadne_min_pair_distance_ang" not in quality_rendered
 
 
 def test_ariadne_submenu_shares_block_with_parent():

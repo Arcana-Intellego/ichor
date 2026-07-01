@@ -691,7 +691,11 @@ def _pause():
 class EditCampaignConfigFunctions:
     @staticmethod
     def show_current_config():
-        print("Current in-memory config")
+        print("Dense/internal in-memory config snapshot")
+        print(
+            "This includes internal and hidden fields. Normal sampling control is "
+            "sampling_protocol.sampling_aggressiveness."
+        )
         print("Loaded from: " + edit_campaign_config_menu_options.loaded_from)
         print("Selected campaign: " + edit_campaign_config_menu_options.selected_campaign)
         print("Unsaved changes: " + edit_campaign_config_menu_options.unsaved_changes)
@@ -739,7 +743,12 @@ class EditCampaignConfigFunctions:
             print("Failed to write dense config snapshot: " + str(exc))
             _pause()
             return
-        print("Wrote dense config snapshot to " + str(target))
+        print(
+            "Wrote dense/internal config snapshot to "
+            + str(target)
+            + ". This file includes hidden fields; normal sampling control is "
+            + "sampling_protocol.sampling_aggressiveness."
+        )
         _pause()
 
     @staticmethod
@@ -1772,8 +1781,6 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("quality_gates.ferebus_min_ext_r2", "optional_float"),
             _spec("quality_gates.ferebus_max_ext_rmse_ha", "optional_float"),
             _spec("quality_gates.ferebus_max_condition_number", "optional_float"),
-            _spec("quality_gates.ariadne_max_displacement_ang", "optional_float"),
-            _spec("quality_gates.ariadne_min_pair_distance_ang", "optional_float"),
         ],
     ),
     "Edit runtime": _make_block_menu(
@@ -1835,7 +1842,7 @@ add_items_to_menu(
 
 edit_campaign_config_menu_items = [
     FunctionItem(
-        "Show current in-memory config",
+        "Show dense/internal in-memory config",
         EditCampaignConfigFunctions.show_current_config,
     ),
     FunctionItem(
@@ -1884,7 +1891,7 @@ edit_campaign_config_menu_items = [
         EditCampaignConfigFunctions.discard_unsaved_changes,
     ),
     FunctionItem(
-        "Export dense config snapshot",
+        "Export dense/internal config snapshot",
         EditCampaignConfigFunctions.export_dense_config_snapshot,
     ),
     FunctionItem("Save to disk", EditCampaignConfigFunctions.save_to_disk),

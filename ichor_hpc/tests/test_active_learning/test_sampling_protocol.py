@@ -173,6 +173,7 @@ def test_scale_model_uses_previous_result_json_motion_history(tmp_path):
                         "seed_index": 0,
                         "seed_dir": str(seed_dir),
                         "result_json": str(result_path),
+                        "handoff_accepted": True,
                         "landing_safety": {
                             "accepted": True,
                             "metrics": {
@@ -205,3 +206,175 @@ def test_scale_model_uses_previous_result_json_motion_history(tmp_path):
         [0.1, 0.2]
     )
     assert scale["model_version"] == 2
+
+
+def test_scale_model_ignores_rejected_landing_history(tmp_path):
+    iter0 = tmp_path / "7_ACTIVE_LEARNING" / "iteration-0000"
+    iter0.mkdir(parents=True)
+    (iter0 / "ARIADNE_LANDING_AUDIT.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "iteration": 0,
+                "seeds": [
+                    {
+                        "seed_index": 0,
+                        "handoff_accepted": False,
+                        "landing_safety": {
+                            "accepted": False,
+                            "metrics": {
+                                "movement_rmsd_ang": 9.0,
+                                "aligned_rmsd_ang": 9.0,
+                                "fullspace_residual_distance": 9.0,
+                                "min_pair_distance_ang": 0.1,
+                            },
+                        },
+                    },
+                    {
+                        "seed_index": 1,
+                        "handoff_accepted": True,
+                        "landing_safety": {
+                            "accepted": True,
+                            "metrics": {
+                                "movement_rmsd_ang": 0.2,
+                                "aligned_rmsd_ang": 0.2,
+                                "fullspace_residual_distance": 0.3,
+                                "min_pair_distance_ang": 0.9,
+                            },
+                        },
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resolved = resolve_sampling_protocol(tmp_path, CampaignConfig(), iteration=1)
+    scale = resolved.scale_model_payload
+
+    assert scale["geometry_motion_scale"]["value_angstrom"] == pytest.approx(0.2)
+    assert scale["residual_fullspace_scale"]["value_angstrom"] == pytest.approx(0.3)
+    history_filter = scale["history"]["filter"]
+    assert history_filter["n_seen"] == 2
+    assert history_filter["n_used"] == 1
+    assert history_filter["n_skipped_handoff_rejected"] == 1
+
+
+def test_scale_model_falls_back_to_results_when_audit_has_no_usable_records(tmp_path):
+    iter0 = tmp_path / "7_ACTIVE_LEARNING" / "iteration-0000"
+    iter0.mkdir(parents=True)
+    (iter0 / "ARIADNE_LANDING_AUDIT.json").write_text(
+        json.dumps({"schema_version": 1, "iteration": 0, "seeds": []}),
+        encoding="utf-8",
+    )
+    (iter0 / "ARIADNE_RESULTS.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "iteration": 0,
+                "accepted": [
+                    {
+                        "seed_index": 0,
+                        "landing_safety": {
+                            "accepted": True,
+                            "metrics": {
+                                "movement_rmsd_ang": 0.25,
+                                "aligned_rmsd_ang": 0.25,
+                                "fullspace_residual_distance": 0.35,
+                                "min_pair_distance_ang": 1.0,
+                            },
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resolved = resolve_sampling_protocol(tmp_path, CampaignConfig(), iteration=1)
+    scale = resolved.scale_model_payload
+
+    assert scale["geometry_motion_scale"]["value_angstrom"] == pytest.approx(0.25)
+    assert scale["residual_fullspace_scale"]["value_angstrom"] == pytest.approx(0.35)
+    assert scale["history"]["filter"]["n_fallback_results_records_used"] == 1
+
+
+def test_scale_model_populates_per_seed_records_from_seed_records(tmp_path):
+    iter0 = tmp_path / "7_ACTIVE_LEARNING" / "iteration-0000"
+    iter0.mkdir(parents=True)
+    (iter0 / "seeds_picked.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "iteration": 0,
+                "n_picked": 2,
+                "frame_ids": [10, 20],
+                "indices": [10, 20],
+                "seed_records": [
+                    {
+                        "seed_index": 0,
+                        "frame_id": 10,
+                        "selection_index": 10,
+                        "selection_origin": "bulk",
+                        "variance_at_selection": None,
+                    },
+                    {
+                        "seed_index": 1,
+                        "frame_id": 20,
+                        "selection_index": 20,
+                        "selection_origin": "d_optimal",
+                        "variance_at_selection": 0.4,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resolved = resolve_sampling_protocol(tmp_path, CampaignConfig(), iteration=0)
+    per_seed = resolved.scale_model_payload["per_seed_scale_model"]
+
+    assert [record["seed_index"] for record in per_seed] == [0, 1]
+    assert [record["frame_id"] for record in per_seed] == [10, 20]
+
+
+def test_preview_uses_campaign_history_without_writing_manifests(tmp_path):
+    iter0 = tmp_path / "7_ACTIVE_LEARNING" / "iteration-0000"
+    iter0.mkdir(parents=True)
+    (iter0 / "ARIADNE_LANDING_AUDIT.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "iteration": 0,
+                "seeds": [
+                    {
+                        "seed_index": 0,
+                        "handoff_accepted": True,
+                        "landing_safety": {
+                            "accepted": True,
+                            "metrics": {
+                                "movement_rmsd_ang": 0.22,
+                                "aligned_rmsd_ang": 0.22,
+                                "fullspace_residual_distance": 0.44,
+                                "min_pair_distance_ang": 0.9,
+                            },
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resolved = preview_sampling_protocol(
+        CampaignConfig(),
+        campaign_dir=tmp_path,
+        iteration=1,
+    )
+
+    assert resolved.scale_model_payload["geometry_motion_scale"]["value_angstrom"] == pytest.approx(0.22)
+    assert resolved.scale_model_payload["residual_fullspace_scale"]["value_angstrom"] == pytest.approx(0.44)
+    iter1 = tmp_path / "7_ACTIVE_LEARNING" / "iteration-0001"
+    assert not sampling_scale_model_path(iter1).exists()
+    assert not sampling_protocol_resolved_path(iter1).exists()
+    assert not sampling_protocol_audit_path(iter1).exists()

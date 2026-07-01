@@ -2187,10 +2187,39 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         )
         from ..acquisition.ariadne_runner import ariadne_result_usability_payload
         from .phase_executor import PhaseResult
+        from ..sampling_protocol import preview_sampling_protocol
 
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
         iter_dir = self._iter_dir(state.iteration)
         pool_dir = iter_dir / "pool"
+        geometry_scale_payload = None
+        try:
+            from ..geometry_novelty import read_geometry_novelty_scale
+
+            geometry_scale_payload = read_geometry_novelty_scale(
+                iter_dir,
+                expected_iteration=int(state.iteration),
+            )
+        except Exception:
+            geometry_scale_payload = None
+        try:
+            resolved_protocol = preview_sampling_protocol(
+                self.config,
+                campaign_dir=self.campaign_dir,
+                iteration=int(state.iteration),
+                geometry_scale_payload=geometry_scale_payload,
+            )
+            effective_config = resolved_protocol.effective_config
+        except Exception as exc:
+            return PhaseResult(
+                is_complete=True,
+                failure_reason=(
+                    "sampling_protocol_invalid_for_ariadne_postprocess: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)
+                ),
+            )
         try:
             picked = load_seeds_picked(iter_dir, expected_iteration=int(state.iteration))
         except Exception as exc:
@@ -2413,7 +2442,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
             accept_legacy_missing_landing_safety = bool(
                 getattr(
-                    getattr(self.config, "adversarial_safety", None),
+                    getattr(resolved_protocol, "adversarial_safety", None),
                     "accept_legacy_missing_landing_safety",
                     False,
                 )
@@ -2422,7 +2451,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 result_dict,
                 allow_seed_fallback=bool(
                     getattr(
-                        getattr(self.config, "adversarial_safety", None),
+                        getattr(resolved_protocol, "adversarial_safety", None),
                         "allow_seed_fallback",
                         False,
                     )
@@ -2555,7 +2584,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             geometry_quality = _ariadne_geometry_quality(
                 result_dict,
                 validated,
-                getattr(self.config, "quality_gates", None),
+                resolved_protocol.quality_gates,
             )
             if not bool(geometry_quality.get("accepted")):
                 reason = ";".join(str(r) for r in geometry_quality.get("reasons", []))
@@ -2668,7 +2697,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 d_w_is_synthetic = True
             flag = None
             if d_w is not None:
-                min_d, max_d = anti_overlap_whitened_distance_bounds(self.config)
+                min_d, max_d = anti_overlap_whitened_distance_bounds(effective_config)
                 if d_w < min_d:
                     flag = "moved_too_little"
                 elif d_w > max_d:
@@ -2699,7 +2728,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 # (enforcement is off by default now anyway, see A43.)
                 if (
                     not d_w_is_synthetic
-                    and getattr(self.config.anti_overlap, "enforce_post_ariadne", False)
+                    and getattr(
+                        effective_config.anti_overlap,
+                        "enforce_post_ariadne",
+                        False,
+                    )
                 ):
                     rejected_by_anti_overlap = True
 

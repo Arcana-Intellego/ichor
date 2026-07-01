@@ -622,6 +622,7 @@ def _sampling_protocol_audit_payload(resolved: ResolvedSamplingProtocol) -> Dict
                     "window_iterations": history.get("window_iterations"),
                     "n_records": history.get("n_records"),
                     "n_result_json": history.get("n_result_json"),
+                    "filter": history.get("filter"),
                 },
             },
             "fallback_warnings": list(diagnostics.get("fallback_warnings") or []),
@@ -781,6 +782,7 @@ def resolve_sampling_protocol(
 def preview_sampling_protocol(
     config: CampaignConfig,
     *,
+    campaign_dir: Union[str, Path, None] = None,
     iteration: int = 0,
     geometry_scale_payload: Optional[Dict[str, Any]] = None,
 ) -> ResolvedSamplingProtocol:
@@ -808,8 +810,9 @@ def preview_sampling_protocol(
             "scale_resolution_mode": "preview_profile_fallback",
             "n_values": 0,
         }
+    preview_campaign_dir = Path(campaign_dir) if campaign_dir is not None else Path(".")
     scale_model_payload = build_sampling_scale_model(
-        Path("."),
+        preview_campaign_dir,
         effective,
         int(iteration),
         geometry_scale_payload=dict(geometry_scale_payload),

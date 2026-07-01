@@ -310,6 +310,7 @@ def format_sampling_protocol_summary(
 
         resolved = preview_sampling_protocol(
             config,
+            campaign_dir=campaign_dir,
             geometry_scale_payload=geometry_payload,
         )
         resolved_error = None

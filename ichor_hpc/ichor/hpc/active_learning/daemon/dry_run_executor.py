@@ -1030,6 +1030,7 @@ class DryRunPhaseExecutor:
                 "landing_safety": dict(landing_safety),
                 "landing_candidates": list(result_payload.get("landing_candidates") or []),
                 "geometry_novelty_scale": dict(geometry_scale_payload),
+                "handoff_accepted": True,
             }
             if isinstance(result_payload.get("selection_diagnostics"), dict):
                 audit_record["selection_diagnostics"] = dict(
@@ -1073,7 +1074,9 @@ class DryRunPhaseExecutor:
             d_w = self._synthetic_whitened_distance(result)
             flag = None
             if d_w is not None:
-                min_d, max_d = anti_overlap_whitened_distance_bounds(self.config)
+                min_d, max_d = anti_overlap_whitened_distance_bounds(
+                    resolved_protocol.effective_config
+                )
                 if d_w < min_d:
                     flag = "moved_too_little"
                 elif d_w > max_d:
