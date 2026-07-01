@@ -50,7 +50,6 @@ def _write_pool(campaign):
         src,
         campaign,
         overwrite=True,
-        outlier_filter_enabled=False,
     )
 
 

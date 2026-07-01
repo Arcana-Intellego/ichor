@@ -52,7 +52,7 @@ def test_geometry_novelty_falls_back_when_pool_history_missing(tmp_path):
 
 def test_geometry_novelty_uses_seed_neighbour_motion(tmp_path):
     cfg = CampaignConfig()
-    TrajectoryPool.import_from(FIXTURE, tmp_path, outlier_filter_enabled=False)
+    TrajectoryPool.import_from(FIXTURE, tmp_path)
     iter_dir = _iter_dir(tmp_path)
     (iter_dir / "seeds_picked.json").write_text(
         json.dumps(
@@ -114,7 +114,7 @@ def test_geometry_novelty_nearest_neighbour_fallback_is_not_trajectory_adjacent(
         ),
         encoding="utf-8",
     )
-    TrajectoryPool.import_from(source, tmp_path, outlier_filter_enabled=False)
+    TrajectoryPool.import_from(source, tmp_path)
     iter_dir = _iter_dir(tmp_path)
     (iter_dir / "seeds_picked.json").write_text(
         json.dumps(

@@ -40,11 +40,6 @@ trajectory_pool:
   # Leave this empty unless your code path explicitly consumes it.
   source_path: ""
 
-outlier_filter:
-  enabled: true
-  energy_z_threshold: 3.0
-  per_atom_rmsd_z_threshold: 4.0
-
 # -------------------------------------------------------------------------
 # Active batch and seed selection
 # -------------------------------------------------------------------------

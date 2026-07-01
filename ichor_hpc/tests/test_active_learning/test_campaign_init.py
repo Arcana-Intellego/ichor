@@ -18,14 +18,13 @@ from ichor.hpc.active_learning.daemon.state import (
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "water_tetramer.xyz"
 
 
-def _args(campaign, source=None, *, force=False, no_filter=True):
+def _args(campaign, source=None, *, force=False):
     from argparse import Namespace
 
     return Namespace(
         campaign_dir=str(campaign) if campaign is not None else None,
         source=str(source) if source is not None else None,
         force=force,
-        no_outlier_filter=no_filter,
     )
 
 

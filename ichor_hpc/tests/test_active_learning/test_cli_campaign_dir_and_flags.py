@@ -100,20 +100,23 @@ def test_main_reports_ambiguous_short_cluster_without_traceback(capsys):
 
 
 def test_init_and_journal_short_flags_parse():
-    imp = _parse(["init", "-s", "pool.xyz", "-f", "-O"])
+    imp = _parse(["init", "-s", "pool.xyz", "-f"])
     assert imp.source == "pool.xyz"
     assert imp.force is True
-    assert imp.no_outlier_filter is True
 
-    legacy = _parse(["import-pool", "-s", "pool.xyz", "-f", "-O"])
+    legacy = _parse(["import-pool", "-s", "pool.xyz", "-f"])
     assert legacy.source == "pool.xyz"
     assert legacy.force is True
-    assert legacy.no_outlier_filter is True
 
     journal = _parse(["journal", "-e", "phase_submitted", "-n", "20", "-j"])
     assert journal.event_type == ["phase_submitted"]
     assert journal.last_n == 20
     assert journal.json is True
+
+
+def test_removed_init_filter_flag_is_rejected():
+    with pytest.raises(SystemExit):
+        _parse(["init", "-s", "pool.xyz", "-O"])
 
 
 def test_reconcile_status_stop_and_preflight_short_flags_parse(tmp_path):

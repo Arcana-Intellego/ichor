@@ -35,7 +35,7 @@ import shutil
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 
 from ichor.core.atoms import Atoms
 from ichor.core.files.xyz import Trajectory
@@ -185,18 +185,14 @@ class TrajectoryPool:
         campaign_dir: Union[str, Path],
         *,
         overwrite: bool = False,
-        outlier_filter_enabled: bool = True,
-        energy_z_threshold: float = 3.0,
-        per_atom_rmsd_z_threshold: float = 4.0,
     ) -> "TrajectoryPool":
         """Copy source into the canonical pool path under campaign_dir
         and write the manifest. Refuses to overwrite an existing manifest
         unless overwrite=True (operator opt-in only).
 
-        If outlier_filter_enabled is True (the default), apply
-        the pre-Phase-A outlier filter to the imported frames before
-        pinning the manifest. Rejected frame indices land in rejected.json
-        alongside pool.manifest.json so the operator has a durable record.
+        The import is deliberately verbatim: every source frame is pinned in
+        the campaign pool and downstream selection/safety gates decide which
+        frames are useful.
         """
         source = Path(source)
         if not source.is_file():
@@ -211,54 +207,17 @@ class TrajectoryPool:
                 + " -- refusing to overwrite. Start a new campaign or pass overwrite=True."
             )
         target_dir.mkdir(parents=True, exist_ok=True)
-        #Read source first to enable the outlier filter to operate on the
-        # raw frames before we commit the canonical copy + manifest.
-        raw_traj = Trajectory(source)
-        raw_traj.read()
-        raw_atoms_list: List[Atoms] = [atoms.copy() for atoms in raw_traj]
-        if not raw_atoms_list:
-            raise ValueError("trajectory has zero frames: " + str(source))
-
-        # apply outlier filter pre-canonical-copy.
-        if outlier_filter_enabled:
-            from ..sampling.outlier_filter import filter_initial_trajectory
-            result = filter_initial_trajectory(
-                raw_atoms_list,
-                energies=None,  # energies only available from quantum runs; pre-Phase-A geometry-only.
-                energy_z_threshold=float(energy_z_threshold),
-                rmsd_z_threshold=float(per_atom_rmsd_z_threshold),
-            )
-            kept_atoms_list = [raw_atoms_list[i] for i in result.kept_indices]
-            # rejected.json sits alongside the manifest.
-            rejected_path = target_dir / "rejected.json"
-            atomic_write_json(rejected_path, result.as_json())
-        else:
-            kept_atoms_list = raw_atoms_list
-            result = None
-
-        #write the canonical copy from the FILTERED frames so the SHA pins
-        # exactly what the daemon will consume going forward. write to a temp
-        # path and atomically rename, so a crash mid-write can't leave the
-        # manifest pinning a half-written pool.xyz.
+        # Write to a temp path and atomically rename, so a crash mid-write
+        # cannot leave the manifest pinning a half-written pool.xyz.
         tmp_canonical = canonical_path.with_name(canonical_path.name + ".tmp")
-        if outlier_filter_enabled and result and result.rejected_indices:
-            # Frames got filtered; write a fresh canonical xyz instead of
-            # copying the source verbatim.
-            from ichor.core.files.xyz import Trajectory as _Traj
-            tmp_traj = _Traj(tmp_canonical)
-            for atoms in kept_atoms_list:
-                tmp_traj.add(atoms)
-            tmp_traj.write()
-        else:
-            #untouched -- a verbatim copy keeps file metadata predictable.
-            shutil.copyfile(source, tmp_canonical)
+        shutil.copyfile(source, tmp_canonical)
         os.replace(str(tmp_canonical), str(canonical_path))
         sha = sha256_file(canonical_path)
         traj = Trajectory(canonical_path)
         traj.read()
         atoms_list: List[Atoms] = [atoms.copy() for atoms in traj]
         if not atoms_list:
-            raise ValueError("filtered trajectory has zero frames: " + str(source))
+            raise ValueError("trajectory has zero frames: " + str(source))
         head = atoms_list[0]
         atom_types = tuple(a.type for a in head)
         masses = tuple(float(a.mass) for a in head)

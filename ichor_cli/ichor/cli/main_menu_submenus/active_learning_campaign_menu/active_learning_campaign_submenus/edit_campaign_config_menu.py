@@ -1175,21 +1175,6 @@ class EditCampaignConfigFunctions:
         _sync_options_from_config()
 
     @staticmethod
-    def edit_outlier_filter():
-        of = _campaign_config.outlier_filter
-        of.enabled = user_input_bool(
-            "outlier_filter.enabled: ", of.enabled,
-        )
-        of.energy_z_threshold = user_input_float(
-            "outlier_filter.energy_z_threshold: ", of.energy_z_threshold,
-        )
-        of.per_atom_rmsd_z_threshold = user_input_float(
-            "outlier_filter.per_atom_rmsd_z_threshold: ",
-            of.per_atom_rmsd_z_threshold,
-        )
-        _sync_options_from_config()
-
-    @staticmethod
     def save_to_disk():
         global _last_save_path, _last_error
         try:
@@ -1302,7 +1287,6 @@ for _legacy_editor_name in (
     "edit_acquisition_stencils",
     "edit_acquisition_references",
     "edit_stop",
-    "edit_outlier_filter",
 ):
     setattr(
         EditCampaignConfigFunctions,
@@ -1718,15 +1702,6 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("stop.min_iterations_before_stop", "int"),
         ],
     ),
-    "Edit outlier_filter": _make_block_menu(
-        "Edit outlier_filter",
-        "Pre-Phase-A trajectory outlier filter thresholds.",
-        [
-            _spec("outlier_filter.enabled", "bool"),
-            _spec("outlier_filter.energy_z_threshold", "float"),
-            _spec("outlier_filter.per_atom_rmsd_z_threshold", "float"),
-        ],
-    ),
     "Edit adversarial_safety": _make_block_menu(
         "Edit adversarial_safety",
         "Safe adversarial landing policy and thresholds.",
@@ -1882,7 +1857,6 @@ edit_campaign_config_menu_items = [
         edit_campaign_config_menu,
     ),
     _block_submenu_item("Edit stop"),
-    _block_submenu_item("Edit outlier_filter"),
     _block_submenu_item("Edit adversarial_safety"),
     _block_submenu_item("Edit error_calibration"),
     _block_submenu_item("Edit quality_gates"),

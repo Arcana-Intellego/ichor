@@ -32,7 +32,6 @@ IMPORT_TRAJECTORY_POOL_MENU_DESCRIPTION = MenuDescription(
 @dataclass
 class ImportTrajectoryPoolMenuOptions(MenuOptions):
     source_path: str = ""
-    no_outlier_filter: bool = False
     force_reimport: bool = False
 
 
@@ -78,9 +77,6 @@ class ImportTrajectoryPoolFunctions:
             campaign_dir=str(campaign_dir),
             source=source,
             force=force,
-            no_outlier_filter=bool(
-                import_trajectory_pool_menu_options.no_outlier_filter
-            ),
         )
         rc = cmd_init(ns)
         if rc == 13 and not force:
@@ -97,12 +93,6 @@ IMPORT_TRAJECTORY_POOL_FIELD_SPECS = [
         "clearable_str",
         prompt="Source trajectory path",
         item_text="Set source path (blank uses <campaign>/pool.xyz)",
-    ),
-    spec(
-        "no_outlier_filter",
-        "bool",
-        prompt="Disable trajectory outlier filter (--no-outlier-filter)? ",
-        item_text="Set no-outlier-filter",
     ),
     spec(
         "force_reimport",

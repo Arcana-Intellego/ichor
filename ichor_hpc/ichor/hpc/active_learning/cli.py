@@ -1198,7 +1198,7 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "live_postprocess_refused": "live postprocess refused",
     "effective_config_diff": "config diff recorded",
     "autotune_applied": "autotune applied",
-    "trajectory_pool_filtered": "trajectory pool filtered",
+    "trajectory_pool_imported": "trajectory pool imported",
     "quantum_output_rejected": "QM output rejected",
     "quantum_quality_summary": "QM quality summarised",
     "ferebus_quality_summary": "FEREBUS quality summarised",
@@ -3850,22 +3850,11 @@ def _import_pool_impl(args: argparse.Namespace, campaign: Path, source: Path) ->
     """Pull the operator's MD trajectory into the campaign's canonical
     pool location and write a SHA-pinned manifest next to it.
 
-    Outlier-filter behaviour is layered:
-
-      1. --no-outlier-filter on the command line wins regardless. handy
-         when you want to import a pool verbatim for debugging.
-      2. otherwise the outlier_filter block in campaign.yaml takes effect
-         (enabled flag plus the two z-thresholds), if a campaign.yaml is
-         present and parses cleanly.
-      3. if neither applies (no config, no flag), the dataclass defaults
-         kick in -- filter on, energy z-cap 3.0, per-atom-rmsd z-cap 4.0.
-
     Refuses to overwrite an existing pool unless --force is passed --
     overwriting wipes the SHA the previously-committed iterations were
     pinned to, so we make the operator say it out loud.
     """
     from .acquisition.trajectory_pool import TrajectoryPool
-    from .config import CampaignConfig
 
     if bool(getattr(args, "force", False)):
         existing_manifest = campaign / ".DATA" / "TRAJECTORY" / "pool.manifest.json"
@@ -3894,38 +3883,9 @@ def _import_pool_impl(args: argparse.Namespace, campaign: Path, source: Path) ->
                     print("  ...", file=sys.stderr)
                 return 16
 
-    # work out the outlier settings using the layered precedence above.
-    # start from dataclass defaults; let campaign.yaml override; let the
-    # CLI flag have the final word.
-    cfg_path = campaign / "campaign.yaml"
-    enabled = True
-    energy_z = 3.0
-    per_atom_z = 4.0
-    if cfg_path.is_file():
-        try:
-            campaign_config = CampaignConfig.from_yaml(cfg_path)
-            of = campaign_config.outlier_filter
-            enabled = bool(of.enabled)
-            energy_z = float(of.energy_z_threshold)
-            per_atom_z = float(of.per_atom_rmsd_z_threshold)
-        except Exception as _exc:
-            # bad campaign.yaml shouldn't block import -- just fall back to
-            # the defaults and let the daemon flag the config problem later.
-            print(
-                "warning: campaign.yaml not loaded for outlier-filter "
-                "settings (" + str(_exc)[:80] + "); using defaults",
-                file=sys.stderr,
-            )
-    if bool(getattr(args, "no_outlier_filter", False)):
-        # CLI flag always wins. yes, this is the operator saying "off".
-        enabled = False
-
     try:
         pool = TrajectoryPool.import_from(
             source, campaign, overwrite=bool(args.force),
-            outlier_filter_enabled=enabled,
-            energy_z_threshold=energy_z,
-            per_atom_rmsd_z_threshold=per_atom_z,
         )
     except FileExistsError as exc:
         print(str(exc), file=sys.stderr)
@@ -3934,42 +3894,24 @@ def _import_pool_impl(args: argparse.Namespace, campaign: Path, source: Path) ->
     except (FileNotFoundError, ValueError) as exc:
         print("trajectory import failed: " + str(exc), file=sys.stderr)
         return 14
-    #journal the import + filter outcome so the operator has a
-    #good record of how many frames were rejected and why.
-    # defined before the try so the summary line below can rely on them even
-    # if the journal bookkeeping blows up and gets swallowed.
-    rejected_path = campaign / ".DATA" / "TRAJECTORY" / "rejected.json"
-    n_rejected = 0
+    # Journal the import. This is intentionally verbatim: the daemon no
+    # longer filters the initial trajectory pool during import.
     try:
-        import json as _json
         from .daemon.journal import append_event
-        if rejected_path.is_file():
-            with open(rejected_path, "r", encoding="utf-8") as _rf:
-                rejected_payload = _json.load(_rf) or {}
-            n_rejected = int(rejected_payload.get("rejected_count", 0))
         journal_path = campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson"
         journal_path.parent.mkdir(parents=True, exist_ok=True)
         append_event(
-            journal_path, "trajectory_pool_filtered",
-            n_imported=int(pool.n_frames()) + n_rejected,
-            n_kept=int(pool.n_frames()),
-            n_rejected=int(n_rejected),
-            outlier_filter_enabled=bool(enabled),
-            energy_z_threshold_used=float(energy_z),
-            per_atom_rmsd_z_threshold_used=float(per_atom_z),
+            journal_path, "trajectory_pool_imported",
+            n_imported=int(pool.n_frames()),
         )
     except Exception:
-        #Robust journal write; never block the import on this.
+        # Robust journal write; never block the import on this.
         pass
-    suffix = ""
-    if enabled and rejected_path.is_file() and n_rejected > 0:
-        suffix = " (" + str(n_rejected) + " frames rejected by outlier filter)"
     print(
         "Imported pool: "
         + str(pool.canonical_path)
         + " (" + str(pool.n_frames()) + " frames, "
         + str(pool.manifest.natoms) + " atoms, SHA " + pool.sha256[:12] + "...)"
-        + suffix
     )
     return 0
 
@@ -4584,13 +4526,6 @@ Examples:
             help="Overwrite an existing pool (DANGEROUS: invalidates every committed "
                  "iteration's frame-id provenance).",
         )
-        p.add_argument(
-            "-O",
-            "--no-outlier-filter", action="store_true", dest="no_outlier_filter",
-            help="Skip the pre-Phase-A outlier filter; import every frame verbatim. "
-                 "Default behaviour (filter ON) rejects per-atom z > 4 frames and "
-                 "writes rejected.json alongside pool.manifest.json.",
-        )
 
     p_init = sub.add_parser(
         "init",
@@ -4598,7 +4533,7 @@ Examples:
         description=(
             "Initialise or populate campaign.yaml from the packaged template, "
             "create the fresh daemon state/config lock when safe, and optionally "
-            "copy the operator trajectory into the campaign pool with a "
+            "copy the operator trajectory verbatim into the campaign pool with a "
             "SHA-pinned manifest. From inside a campaign directory, "
             "--campaign-dir and --source can be omitted."
         ),

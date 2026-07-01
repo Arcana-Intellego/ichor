@@ -20,7 +20,7 @@ FIXTURE = Path(__file__).resolve().parent / "fixtures" / "water_tetramer.xyz"
 def _import_pool(campaign, source):
     """Drop a trajectory into the campaign-canonical location."""
     from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
-    TrajectoryPool.import_from(source, campaign, overwrite=True, outlier_filter_enabled=False)
+    TrajectoryPool.import_from(source, campaign, overwrite=True)
 
 
 def _run(args):

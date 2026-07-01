@@ -14,7 +14,8 @@ Two complementary filters:
 
 filter_initial_trajectory(frames, energies=None, ...) chains both filters
 and returns an OutlierFilterResult with per-frame rejection reasons. The
-daemon serialises this result alongside 2_METADYNAMICS_TRAJ/rejected.json.
+active-learning daemon no longer applies this utility during trajectory-pool
+import; it remains available for explicit offline/manual checks.
 """
 
 from __future__ import annotations
@@ -180,7 +181,6 @@ def filter_initial_trajectory(
         energy_z_threshold=energy_z_threshold,
         rmsd_z_threshold=rmsd_z_threshold,
     )
-
 
 
 

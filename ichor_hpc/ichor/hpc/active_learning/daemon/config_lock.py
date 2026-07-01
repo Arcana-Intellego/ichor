@@ -275,9 +275,6 @@ PHASE_LOCAL_EXACT = {
 
 COMMITTED_LOCKED_EXACT = {
     "trajectory_pool.source_path",
-    "outlier_filter.enabled",
-    "outlier_filter.energy_z_threshold",
-    "outlier_filter.per_atom_rmsd_z_threshold",
     "split.strategy",
     "split.train_fraction",
     "split.val_mid_fraction",

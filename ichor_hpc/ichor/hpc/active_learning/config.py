@@ -44,7 +44,6 @@ from .geometry_protocol import (
 __all__ = [
     "CampaignConfig",
     "TrajectoryPoolConfigBlock",
-    "OutlierFilterConfigBlock",
     "BootstrapConfigBlock",
     "ActiveBatchConfigBlock",
     "SeedSelectionConfigBlock",
@@ -452,20 +451,6 @@ class AcquisitionConfigBlock:
 @dataclass
 class TrajectoryPoolConfigBlock:
     source_path: str = ""
-
-
-@dataclass
-class OutlierFilterConfigBlock:
-    """Pre-Phase-A trajectory outlier filter.
-
-    Applied at TrajectoryPool.import_from time to reject frames whose
-    geometry or (if energies are available) energy lies far from the
-    distribution mean. Output: rejected.json next to pool.manifest.json,
-    plus a trajectory_pool_filtered journal event.
-    """
-    enabled: bool = True
-    energy_z_threshold: float = 3.0
-    per_atom_rmsd_z_threshold: float = 4.0
 
 
 @dataclass
@@ -1004,9 +989,6 @@ class CampaignConfig:
 
     trajectory_pool: TrajectoryPoolConfigBlock = field(
         default_factory=TrajectoryPoolConfigBlock
-    )
-    outlier_filter: OutlierFilterConfigBlock = field(
-        default_factory=OutlierFilterConfigBlock
     )
     bootstrap: BootstrapConfigBlock = field(
         default_factory=BootstrapConfigBlock

@@ -685,7 +685,6 @@ def _write_seeds_picked(campaign_dir, iteration, n_seeds):
         pool_source,
         campaign_dir,
         overwrite=True,
-        outlier_filter_enabled=False,
     )
     iter_dir = (
         campaign_dir / "7_ACTIVE_LEARNING"

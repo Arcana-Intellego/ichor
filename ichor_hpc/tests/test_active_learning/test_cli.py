@@ -273,7 +273,6 @@ def test_recovery_dashboard_reports_trajectory_pool_sha_mismatch(tmp_path):
         source,
         campaign,
         overwrite=True,
-        outlier_filter_enabled=False,
     )
     pool_xyz = campaign / ".DATA" / "TRAJECTORY" / "pool.xyz"
     with pool_xyz.open("a", encoding="utf-8") as f:

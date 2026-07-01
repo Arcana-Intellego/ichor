@@ -142,7 +142,6 @@ def test_edit_campaign_config_menu_items():
         "Edit acquisition",
         "Edit ARIADNE Block",
         "Edit stop",
-        "Edit outlier_filter",
         "Edit adversarial_safety",
         "Edit error_calibration",
         "Edit quality_gates",
@@ -1941,7 +1940,7 @@ def test_reconcile_paths_pass_allow_fresh_init_flag(tmp_path, monkeypatch):
     assert calls == [False, True]
 
 
-def test_init_pool_passes_no_outlier_filter_choice(tmp_path, monkeypatch):
+def test_init_pool_passes_verbatim_import_options(tmp_path, monkeypatch):
     import importlib
     from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
         set_selected_campaign_dir,
@@ -1955,7 +1954,6 @@ def test_init_pool_passes_no_outlier_filter_choice(tmp_path, monkeypatch):
 
     set_selected_campaign_dir(tmp_path)
     menu.import_trajectory_pool_menu_options.source_path = "pool.xyz"
-    menu.import_trajectory_pool_menu_options.no_outlier_filter = True
     menu.import_trajectory_pool_menu_options.force_reimport = False
     calls = []
     monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: "")
@@ -1966,7 +1964,6 @@ def test_init_pool_passes_no_outlier_filter_choice(tmp_path, monkeypatch):
     assert calls
     assert calls[0].campaign_dir == str(tmp_path)
     assert calls[0].source == "pool.xyz"
-    assert calls[0].no_outlier_filter is True
     assert calls[0].force is False
 
 
@@ -1984,7 +1981,6 @@ def test_init_pool_force_requires_confirmation_and_resets(tmp_path, monkeypatch)
 
     set_selected_campaign_dir(tmp_path)
     menu.import_trajectory_pool_menu_options.source_path = "pool.xyz"
-    menu.import_trajectory_pool_menu_options.no_outlier_filter = False
     menu.import_trajectory_pool_menu_options.force_reimport = True
     calls = []
     responses = iter(["YES", ""])

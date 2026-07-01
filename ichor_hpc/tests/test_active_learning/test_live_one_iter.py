@@ -282,7 +282,6 @@ def _ensure_live_trajectory_pool(campaign_dir):
         source,
         campaign_dir,
         overwrite=True,
-        outlier_filter_enabled=False,
     )
 
 

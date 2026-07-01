@@ -86,7 +86,7 @@ KNOWN_EVENT_TYPES = (
     "live_postprocess_refused",
     "effective_config_diff",
     "autotune_applied",
-    "trajectory_pool_filtered",
+    "trajectory_pool_imported",
     "sacct_empty_timeout",
     # new additions II:
     "phase_succeeded_live",
