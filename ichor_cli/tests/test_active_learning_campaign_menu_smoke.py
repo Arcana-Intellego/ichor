@@ -1332,6 +1332,11 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
     assert "Sampling protocol summary" in out
     assert "sampling_protocol.sampling_aggressiveness: 6" in out
     assert "sampling_protocol.geometry_scale_source: profile fallback preview" in out
+    assert "sampling_protocol.scale_model" in out
+    assert "sampling_protocol.scale_model.geometry_motion_scale" in out
+    assert "sampling_protocol.scale_model.aligned_rmsd_scale" in out
+    assert "sampling_protocol.scale_model.per_atom_mobility" in out
+    assert "sampling_protocol.scale_model.pair_reference" in out
     assert "sampling_protocol.resolved_movement_band" in out
     assert "sampling_protocol.resolved_phase_b" in out
     assert "sampling_protocol.resolved_safety" in out
@@ -1373,6 +1378,8 @@ def test_daemon_control_sampling_protocol_summary_uses_saved_campaign(tmp_path, 
 
     out = capsys.readouterr().out
     assert "sampling_protocol.sampling_aggressiveness: 8" in out
+    assert "sampling_protocol.scale_model" in out
+    assert "sampling_protocol.scale_model.pair_reference" in out
     assert "sampling_protocol.resolved_phase_b" in out
     assert "sampling_protocol.resolved_safety" in out
     assert "sampling_protocol.resolved_ariadne" in out

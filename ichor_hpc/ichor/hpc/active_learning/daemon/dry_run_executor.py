@@ -952,6 +952,8 @@ class DryRunPhaseExecutor:
         self.artefact_log.append(str(geometry_novelty_scale_path(iter_dir)))
         if resolved_protocol.manifest_path is not None:
             self.artefact_log.append(str(resolved_protocol.manifest_path))
+        if resolved_protocol.scale_model_path is not None:
+            self.artefact_log.append(str(resolved_protocol.scale_model_path))
         for k in range(n_seeds):
             seed_record = seed_records[k]
             seed_frame_id = (
@@ -985,10 +987,17 @@ class DryRunPhaseExecutor:
                     None if resolved_protocol.manifest_path is None
                     else str(resolved_protocol.manifest_path.resolve())
                 ),
+                "scale_model_manifest": (
+                    None if resolved_protocol.scale_model_path is None
+                    else str(resolved_protocol.scale_model_path.resolve())
+                ),
                 "hidden_overrides_detected": list(
                     resolved_protocol.hidden_overrides_detected
                 ),
             }
+            result_payload["sampling_scale_model"] = dict(
+                resolved_protocol.scale_model_payload
+            )
             if isinstance(result_payload.get("selection_diagnostics"), dict):
                 result_payload["selection_diagnostics"]["model_version"] = int(
                     getattr(state, "models_version", -1)
@@ -1255,6 +1264,8 @@ class DryRunPhaseExecutor:
         )
         if resolved_protocol.manifest_path is not None:
             self.artefact_log.append(str(resolved_protocol.manifest_path))
+        if resolved_protocol.scale_model_path is not None:
+            self.artefact_log.append(str(resolved_protocol.scale_model_path))
         effective_min_separation, threshold_mode = phase_b_min_separation_from_resolved(
             resolved_protocol
         )
@@ -1279,10 +1290,15 @@ class DryRunPhaseExecutor:
                     None if resolved_protocol.manifest_path is None
                     else str(resolved_protocol.manifest_path.resolve())
                 ),
+                "scale_model_manifest": (
+                    None if resolved_protocol.scale_model_path is None
+                    else str(resolved_protocol.scale_model_path.resolve())
+                ),
                 "hidden_overrides_detected": list(
                     resolved_protocol.hidden_overrides_detected
                 ),
             },
+            "sampling_scale_model": dict(resolved_protocol.scale_model_payload),
             "relaxation": {"applied": False, "reason": None},
         }
         manifest_path = write_phase_b_selection_manifest(iter_dir, {

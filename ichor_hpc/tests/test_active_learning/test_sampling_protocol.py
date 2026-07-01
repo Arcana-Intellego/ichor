@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from ichor.hpc.active_learning.config import CampaignConfig
@@ -9,6 +11,10 @@ from ichor.hpc.active_learning.sampling_protocol import (
     read_sampling_protocol_resolved,
     resolve_sampling_protocol,
     sampling_protocol_resolved_path,
+)
+from ichor.hpc.active_learning.sampling_scale_model import (
+    read_sampling_scale_model,
+    sampling_scale_model_path,
 )
 
 
@@ -25,6 +31,16 @@ def test_level_five_preview_matches_current_balanced_defaults():
     assert resolved.phase_b["effective_min_separation_angstrom"] == pytest.approx(
         PHASE_B_MIN_SEPARATION_SCALE * 0.05
     )
+    assert resolved.scale_model_payload["geometry_motion_scale"]["value_angstrom"] == pytest.approx(
+        0.05
+    )
+    assert resolved.scale_model_payload["aligned_rmsd_scale"]["value_angstrom"] == pytest.approx(
+        0.05
+    )
+    assert resolved.scale_model_payload["residual_fullspace_scale"]["value_angstrom"] == pytest.approx(
+        0.5
+    )
+    assert resolved.scale_model_payload["per_atom_mobility_scales"]["mode"] == "uniform"
     assert resolved.adversarial_safety.max_whitened_distance == pytest.approx(10.0)
     assert resolved.adversarial_safety.backtrack_points == 16
     assert resolved.quality_gates.ariadne_max_displacement_ang == pytest.approx(1.25)
@@ -83,12 +99,19 @@ def test_resolver_writes_round_trippable_manifest(tmp_path):
 
     iter_dir = tmp_path / "7_ACTIVE_LEARNING" / "iteration-0002"
     expected_path = sampling_protocol_resolved_path(iter_dir)
+    scale_path = sampling_scale_model_path(iter_dir)
     assert resolved.manifest_path == expected_path
+    assert resolved.scale_model_path == scale_path
     assert expected_path.exists()
+    assert scale_path.exists()
 
     payload = read_sampling_protocol_resolved(iter_dir, expected_iteration=2)
+    scale_payload = read_sampling_scale_model(iter_dir, expected_iteration=2)
     assert payload["schema_version"] == 1
     assert payload["sampling_aggressiveness"] == 5
+    assert payload["sampling_scale_model_manifest"] == str(scale_path)
+    assert scale_payload["schema_version"] == 1
+    assert scale_payload["geometry_motion_scale"]["value_angstrom"] == pytest.approx(0.05)
     assert payload["resolved_phase_b"]["effective_min_separation_angstrom"] == pytest.approx(
         PHASE_B_MIN_SEPARATION_SCALE * 0.05
     )
@@ -98,4 +121,59 @@ def test_resolver_writes_round_trippable_manifest(tmp_path):
 
     threshold, mode = phase_b_min_separation_from_resolved(resolved)
     assert threshold == pytest.approx(PHASE_B_MIN_SEPARATION_SCALE * 0.05)
-    assert mode in {"absolute", "scaled_geometry_novelty"}
+    assert mode in {"absolute", "scaled", "scaled_geometry_novelty"}
+
+
+def test_scale_model_uses_previous_result_json_motion_history(tmp_path):
+    iter0 = tmp_path / "7_ACTIVE_LEARNING" / "iteration-0000"
+    seed_dir = iter0 / "pool" / "seed_0000"
+    seed_dir.mkdir(parents=True)
+    result_path = seed_dir / "result.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "seed_coordinates": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+                "final_coordinates": [[0.1, 0.0, 0.0], [1.2, 0.0, 0.0]],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (iter0 / "ARIADNE_LANDING_AUDIT.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "iteration": 0,
+                "summary": {},
+                "seeds": [
+                    {
+                        "seed_index": 0,
+                        "seed_dir": str(seed_dir),
+                        "result_json": str(result_path),
+                        "landing_safety": {
+                            "accepted": True,
+                            "metrics": {
+                                "movement_rmsd_ang": 0.2,
+                                "aligned_rmsd_ang": 0.2,
+                                "fullspace_residual_distance": 0.3,
+                                "min_pair_distance_ang": 0.9,
+                            },
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = CampaignConfig()
+    resolved = resolve_sampling_protocol(tmp_path, cfg, iteration=1)
+
+    scale = resolved.scale_model_payload
+    assert scale["geometry_motion_scale"]["source"] == "ariadne_landing_history"
+    assert scale["geometry_motion_scale"]["value_angstrom"] == pytest.approx(0.2)
+    assert scale["aligned_rmsd_scale"]["value_angstrom"] == pytest.approx(0.2)
+    assert scale["residual_fullspace_scale"]["value_angstrom"] == pytest.approx(0.3)
+    assert scale["per_atom_mobility_scales"]["mode"] == "per_atom_index"
+    assert scale["per_atom_mobility_scales"]["values_angstrom"] == pytest.approx(
+        [0.1, 0.2]
+    )

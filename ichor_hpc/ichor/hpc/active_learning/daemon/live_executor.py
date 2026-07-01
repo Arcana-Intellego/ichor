@@ -907,6 +907,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     None if resolved_protocol.manifest_path is None
                     else str(resolved_protocol.manifest_path)
                 ),
+                scale_model_manifest=(
+                    None if resolved_protocol.scale_model_path is None
+                    else str(resolved_protocol.scale_model_path)
+                ),
             )
             return n
         return None

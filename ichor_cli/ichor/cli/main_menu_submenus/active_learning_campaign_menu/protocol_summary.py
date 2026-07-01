@@ -331,6 +331,7 @@ def format_sampling_protocol_summary(
         gates = resolved.quality_gates
         acq_cfg = resolved.acquisition_config
         ariadne_run = resolved.ariadne_run_config
+        scale_model = dict(resolved.scale_model_payload or {})
         movement = acq_cfg.movement_band
         scale = resolved.resolved_geometry_scale_angstrom
         movement_text = "unavailable"
@@ -347,6 +348,65 @@ def format_sampling_protocol_summary(
             )
         lines.append(_line("sampling_protocol.geometry_scale_source", geometry_source))
         lines.append(_line("sampling_protocol.resolved_geometry_scale_angstrom", scale))
+        geom_scale = scale_model.get("geometry_motion_scale", {})
+        rmsd_scale = scale_model.get("aligned_rmsd_scale", {})
+        residual_scale = scale_model.get("residual_fullspace_scale", {})
+        mobility = scale_model.get("per_atom_mobility_scales", {})
+        pair_ref = scale_model.get("pair_distance_reference", {})
+        lines.append(
+            _line(
+                "sampling_protocol.scale_model",
+                "schema="
+                + str(scale_model.get("schema_version"))
+                + ", geometry_source="
+                + str(geom_scale.get("source"))
+                + ", history_records="
+                + str((scale_model.get("history") or {}).get("n_records")),
+            )
+        )
+        lines.append(
+            _line(
+                "sampling_protocol.scale_model.geometry_motion_scale",
+                str(geom_scale.get("value_angstrom"))
+                + " Angstrom, fallback="
+                + str(geom_scale.get("fallback_used")),
+            )
+        )
+        lines.append(
+            _line(
+                "sampling_protocol.scale_model.aligned_rmsd_scale",
+                str(rmsd_scale.get("value_angstrom"))
+                + " Angstrom, source="
+                + str(rmsd_scale.get("source")),
+            )
+        )
+        lines.append(
+            _line(
+                "sampling_protocol.scale_model.residual_fullspace_scale",
+                str(residual_scale.get("value_angstrom"))
+                + " Angstrom, source="
+                + str(residual_scale.get("source")),
+            )
+        )
+        lines.append(
+            _line(
+                "sampling_protocol.scale_model.per_atom_mobility",
+                "mode="
+                + str(mobility.get("mode"))
+                + ", source="
+                + str(mobility.get("source"))
+                + ", n_values="
+                + str(len(mobility.get("values_angstrom") or [])),
+            )
+        )
+        lines.append(
+            _line(
+                "sampling_protocol.scale_model.pair_reference",
+                str(pair_ref.get("reference_min_pair_distance_angstrom"))
+                + " Angstrom, mode="
+                + str(pair_ref.get("mode")),
+            )
+        )
         lines.append(_line("sampling_protocol.resolved_movement_band", movement_text))
         lines.append(
             _line(
@@ -358,7 +418,9 @@ def format_sampling_protocol_summary(
                 + ", min_separation_angstrom="
                 + str(phase_b.get("effective_min_separation_angstrom"))
                 + ", coefficient="
-                + str(phase_b.get("min_separation_scaled")),
+                + str(phase_b.get("min_separation_scaled"))
+                + ", scale_model_source="
+                + str(phase_b.get("scale_model_source")),
             )
         )
         lines.append(
@@ -379,7 +441,7 @@ def format_sampling_protocol_summary(
                 "sampling_protocol.resolved_quality_gates",
                 "max_displacement_ang="
                 + str(gates.ariadne_max_displacement_ang)
-                + ", min_pair_distance_policy=global_hard_floor("
+                + ", min_pair_distance_policy=scale_model_ratio("
                 + str(gates.ariadne_min_pair_distance_ang)
                 + " Angstrom)",
             )

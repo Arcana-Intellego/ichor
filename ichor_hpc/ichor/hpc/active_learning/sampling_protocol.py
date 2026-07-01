@@ -2,10 +2,9 @@
 
 Normal campaign files expose a single sampling aggressiveness value.  This
 module expands that public value into the lower-level ARIADNE, acquisition,
-Phase-B, and landing-safety controls consumed by the daemon.  Wave 1 is
-intentionally conservative: it uses the existing geometry-novelty sidecar as
-the only campaign-local length-scale producer and records richer future scale
-policies as unavailable rather than inventing unvalidated values.
+Phase-B, and landing-safety controls consumed by the daemon.  Wave 2 keeps the
+public surface unchanged but adds a daemon-owned scale model so those lower
+level controls are resolved from campaign-local, auditable length scales.
 """
 from __future__ import annotations
 
@@ -99,9 +98,11 @@ class ResolvedSamplingProtocol:
     quality_gates: Any
     phase_b: Dict[str, Any]
     anti_overlap: Dict[str, Any]
+    scale_model_payload: Dict[str, Any] = field(default_factory=dict)
     sources: Dict[str, Any] = field(default_factory=dict)
     hidden_overrides_detected: List[Dict[str, Any]] = field(default_factory=list)
     manifest_path: Optional[Path] = None
+    scale_model_path: Optional[Path] = None
 
 
 def sampling_protocol_resolved_path(iter_dir: Union[str, Path]) -> Path:
@@ -154,7 +155,7 @@ def hidden_sampling_overrides(config: CampaignConfig) -> List[Dict[str, Any]]:
                     "path": path,
                     "configured_value": current.get(path),
                     "default_value": defaults.get(path),
-                    "wave1_runtime_policy": "sampling_protocol_resolver_controls_effective_value",
+                    "runtime_policy": "sampling_protocol_resolver_controls_effective_value",
                 }
             )
     return out
@@ -254,6 +255,7 @@ def _canonical_sha(payload: Dict[str, Any]) -> str:
 def _resolved_manifest_payload(resolved: ResolvedSamplingProtocol) -> Dict[str, Any]:
     profile = asdict(resolved.profile)
     geometry_payload = dict(resolved.geometry_scale_payload or {})
+    scale_model = dict(resolved.scale_model_payload or {})
     scale = resolved.resolved_geometry_scale_angstrom
     phase_b = dict(resolved.phase_b)
     movement_band = {}
@@ -286,13 +288,18 @@ def _resolved_manifest_payload(resolved: ResolvedSamplingProtocol) -> Dict[str, 
         "generated_at_iso": datetime.now(timezone.utc).isoformat(),
         "sources": dict(resolved.sources),
         "scale_sources": {
-            "geometry": "geometry_novelty_sidecar_or_profile_fallback",
-            "per_atom_mobility": "not_available_wave1",
-            "pair_reference": "global_hard_floor_wave1",
-            "bond_angle_reference": "not_available_wave1",
-            "gradient_scale": "not_available_wave1",
+            "geometry": "sampling_scale_model.geometry_motion_scale",
+            "per_atom_mobility": "sampling_scale_model.per_atom_mobility_scales",
+            "pair_reference": "sampling_scale_model.pair_distance_reference",
+            "bond_angle_reference": "sampling_scale_model.bond_angle_reference",
+            "gradient_scale": "sampling_scale_model.gradient_rms_scale",
             "component_scale": "existing_reference_scales_only",
         },
+        "sampling_scale_model": scale_model,
+        "sampling_scale_model_manifest": (
+            None if resolved.scale_model_path is None
+            else str(resolved.scale_model_path)
+        ),
         "geometry_novelty_scale": geometry_payload,
         "resolved_geometry_scale_angstrom": scale,
         "resolved_phase_b": phase_b,
@@ -313,14 +320,24 @@ def _resolved_manifest_payload(resolved: ResolvedSamplingProtocol) -> Dict[str, 
             "ariadne_max_displacement_ang": resolved.quality_gates.ariadne_max_displacement_ang,
             "ariadne_min_pair_distance_ang": resolved.quality_gates.ariadne_min_pair_distance_ang,
             "min_pair_distance_policy": {
-                "mode": "global_hard_floor",
+                "mode": "scale_model_minimum_safe_pair_ratio",
                 "hard_floor_angstrom": resolved.quality_gates.ariadne_min_pair_distance_ang,
-                "aggressiveness_scaled": False,
+                "reference_min_pair_distance_angstrom": (
+                    scale_model.get("pair_distance_reference", {})
+                    .get("reference_min_pair_distance_angstrom")
+                ),
+                "ratio_floor": (
+                    scale_model.get("pair_distance_reference", {})
+                    .get("ratio_floor")
+                ),
             },
             "max_displacement_policy": {
-                "mode": "global_cap_wave1",
+                "mode": "scale_model_scaled_atom_move_with_absolute_cap",
                 "cap_angstrom": resolved.quality_gates.ariadne_max_displacement_ang,
-                "aggressiveness_scaled": True,
+                "scale_angstrom": (
+                    scale_model.get("geometry_motion_scale", {})
+                    .get("value_angstrom")
+                ),
             },
         },
         "resolved_acquisition_weights": {
@@ -402,6 +419,10 @@ def resolve_sampling_protocol(
         ensure_geometry_novelty_scale,
         resolve_geometry_novelty_consumers,
     )
+    from .sampling_scale_model import (
+        build_sampling_scale_model,
+        sampling_scale_model_path,
+    )
 
     level = int(config.sampling_protocol.sampling_aggressiveness)
     profile = _profile_for(config)
@@ -410,6 +431,13 @@ def resolve_sampling_protocol(
         campaign_dir,
         effective,
         iteration=int(iteration),
+    )
+    scale_model_payload = build_sampling_scale_model(
+        campaign_dir,
+        effective,
+        int(iteration),
+        geometry_scale_payload=dict(geometry_payload),
+        write_manifest=write_manifest,
     )
     acquisition_config = apply_geometry_novelty_to_acquisition_config(
         effective.to_acquisition_config(),
@@ -426,13 +454,28 @@ def resolve_sampling_protocol(
     except (TypeError, ValueError):
         scale_value = None
     if scale_value is not None and scale_value > 0.0:
+        phase_b_scale = scale_value
+        try:
+            phase_b_scale = float(
+                scale_model_payload.get("aligned_rmsd_scale", {}).get("value_angstrom")
+            )
+        except (TypeError, ValueError):
+            phase_b_scale = scale_value
+        if not (phase_b_scale > 0.0):
+            phase_b_scale = scale_value
         phase_b["scaled_threshold"] = float(profile.phase_b_min_separation_scale)
         phase_b["min_separation_scaled"] = float(profile.phase_b_min_separation_scale)
         phase_b["effective_min_separation_angstrom"] = (
-            float(profile.phase_b_min_separation_scale) * float(scale_value)
+            float(profile.phase_b_min_separation_scale) * float(phase_b_scale)
         )
+        phase_b["scale_model_source"] = "aligned_rmsd_scale"
+        phase_b["scale_model_value_angstrom"] = float(phase_b_scale)
     phase_b["descriptor"] = str(effective.phase_b.descriptor)
     phase_b["beta"] = float(effective.phase_b.beta)
+    scale_path = (
+        sampling_scale_model_path(_iteration_dir(campaign_dir, int(iteration)))
+        if write_manifest else None
+    )
 
     resolved = ResolvedSamplingProtocol(
         schema_version=SAMPLING_PROTOCOL_SCHEMA_VERSION,
@@ -448,12 +491,14 @@ def resolve_sampling_protocol(
         quality_gates=effective.quality_gates,
         phase_b=phase_b,
         anti_overlap=asdict(effective.anti_overlap),
+        scale_model_payload=dict(scale_model_payload),
         sources={
             "level_5_policy": "matches_current_defaults",
-            "geometry_scale": "geometry_novelty",
-            "pair_distance": "global_hard_floor_wave1",
+            "geometry_scale": "sampling_scale_model",
+            "pair_distance": "sampling_scale_model_minimum_safe_pair_ratio",
         },
         hidden_overrides_detected=hidden_sampling_overrides(config),
+        scale_model_path=scale_path,
     )
     if write_manifest:
         path = write_sampling_protocol_resolved(
@@ -480,6 +525,7 @@ def preview_sampling_protocol(
         apply_geometry_novelty_to_acquisition_config,
         resolve_geometry_novelty_consumers,
     )
+    from .sampling_scale_model import build_sampling_scale_model
 
     level = int(config.sampling_protocol.sampling_aggressiveness)
     profile = _profile_for(config)
@@ -493,6 +539,13 @@ def preview_sampling_protocol(
             "scale_resolution_mode": "preview_profile_fallback",
             "n_values": 0,
         }
+    scale_model_payload = build_sampling_scale_model(
+        Path("."),
+        effective,
+        int(iteration),
+        geometry_scale_payload=dict(geometry_scale_payload),
+        write_manifest=False,
+    )
     acquisition_config = apply_geometry_novelty_to_acquisition_config(
         effective.to_acquisition_config(),
         effective,
@@ -508,11 +561,22 @@ def preview_sampling_protocol(
     except (TypeError, ValueError):
         scale_value = None
     if scale_value is not None and scale_value > 0.0:
+        phase_b_scale = scale_value
+        try:
+            phase_b_scale = float(
+                scale_model_payload.get("aligned_rmsd_scale", {}).get("value_angstrom")
+            )
+        except (TypeError, ValueError):
+            phase_b_scale = scale_value
+        if not (phase_b_scale > 0.0):
+            phase_b_scale = scale_value
         phase_b["scaled_threshold"] = float(profile.phase_b_min_separation_scale)
         phase_b["min_separation_scaled"] = float(profile.phase_b_min_separation_scale)
         phase_b["effective_min_separation_angstrom"] = (
-            float(profile.phase_b_min_separation_scale) * float(scale_value)
+            float(profile.phase_b_min_separation_scale) * float(phase_b_scale)
         )
+        phase_b["scale_model_source"] = "aligned_rmsd_scale"
+        phase_b["scale_model_value_angstrom"] = float(phase_b_scale)
     phase_b["descriptor"] = str(effective.phase_b.descriptor)
     phase_b["beta"] = float(effective.phase_b.beta)
     return ResolvedSamplingProtocol(
@@ -529,10 +593,11 @@ def preview_sampling_protocol(
         quality_gates=effective.quality_gates,
         phase_b=phase_b,
         anti_overlap=asdict(effective.anti_overlap),
+        scale_model_payload=dict(scale_model_payload),
         sources={
             "level_5_policy": "matches_current_defaults",
-            "geometry_scale": "preview_or_supplied_geometry_novelty",
-            "pair_distance": "global_hard_floor_wave1",
+            "geometry_scale": "preview_sampling_scale_model",
+            "pair_distance": "sampling_scale_model_minimum_safe_pair_ratio",
         },
         hidden_overrides_detected=hidden_sampling_overrides(config),
     )

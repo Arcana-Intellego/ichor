@@ -709,10 +709,15 @@ def _run_phase_b(args, campaign, config):
                 None if resolved_protocol.manifest_path is None
                 else str(resolved_protocol.manifest_path.resolve())
             ),
+            "scale_model_manifest": (
+                None if resolved_protocol.scale_model_path is None
+                else str(resolved_protocol.scale_model_path.resolve())
+            ),
             "hidden_overrides_detected": list(
                 resolved_protocol.hidden_overrides_detected
             ),
         },
+        "sampling_scale_model": dict(resolved_protocol.scale_model_payload),
         "relaxation": relaxation,
         "n_kept": report.n_kept,
         "n_dropped": report.n_dropped,

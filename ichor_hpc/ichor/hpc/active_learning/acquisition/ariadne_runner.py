@@ -450,6 +450,7 @@ def optimise_seed(
     gradient_backend: str = "process",
     safety_config: Optional[Any] = None,
     quality_gates: Optional[Any] = None,
+    scale_model: Optional[Dict[str, Any]] = None,
     trace_path: Optional[Any] = None,
 ) -> AriadneRunResult:
     """Drive the adversarial descent for a single seed.
@@ -483,6 +484,7 @@ def optimise_seed(
         gradient_backend=gradient_backend,
         safety_config=safety_config,
         quality_gates=quality_gates,
+        scale_model=scale_model,
         trace_path=trace_path,
     )
 
@@ -573,6 +575,138 @@ def _geometry_metrics(seed_coords: np.ndarray, coords: np.ndarray) -> Dict[str, 
     return metrics
 
 
+def _scale_model_value(
+    scale_model: Optional[Dict[str, Any]],
+    *path: str,
+) -> Optional[float]:
+    cur: Any = scale_model
+    for key in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    return _safe_float_or_none(cur)
+
+
+def _active_subspace_dimension(acquisition: Any) -> Optional[int]:
+    subspace = getattr(acquisition, "subspace", None)
+    raw = getattr(subspace, "dimension", None)
+    if callable(raw):
+        try:
+            value = int(raw())
+            return value if value > 0 else None
+        except Exception:
+            return None
+    try:
+        value = int(raw)
+        return value if value > 0 else None
+    except Exception:
+        pass
+    basis = getattr(subspace, "basis", None)
+    try:
+        arr = np.asarray(basis, dtype=float)
+        if arr.ndim == 2 and arr.shape[1] > 0:
+            return int(arr.shape[1])
+    except Exception:
+        return None
+    return None
+
+
+def _annotate_sampling_scale_metrics(
+    metrics: Dict[str, Any],
+    *,
+    seed_coords: np.ndarray,
+    coords: np.ndarray,
+    acquisition: Optional[Any],
+    scale_model: Optional[Dict[str, Any]],
+) -> None:
+    if not isinstance(scale_model, dict):
+        return
+    geom_scale = _scale_model_value(
+        scale_model, "geometry_motion_scale", "value_angstrom"
+    )
+    aligned_scale = _scale_model_value(
+        scale_model, "aligned_rmsd_scale", "value_angstrom"
+    )
+    residual_scale = _scale_model_value(
+        scale_model, "residual_fullspace_scale", "value_angstrom"
+    )
+    pair_ref = _scale_model_value(
+        scale_model, "pair_distance_reference", "reference_min_pair_distance_angstrom"
+    )
+    pair_ratio_floor = _scale_model_value(
+        scale_model, "pair_distance_reference", "ratio_floor"
+    )
+    metrics["sampling_scale_model_schema_version"] = scale_model.get("schema_version")
+    metrics["sampling_scale_geometry_motion_ang"] = geom_scale
+    metrics["sampling_scale_aligned_rmsd_ang"] = aligned_scale
+    metrics["sampling_scale_residual_ang"] = residual_scale
+    metrics["sampling_scale_pair_reference_ang"] = pair_ref
+    metrics["sampling_scale_pair_ratio_floor"] = pair_ratio_floor
+
+    max_disp = _safe_float_or_none(metrics.get("max_displacement_ang"))
+    if max_disp is not None and geom_scale is not None and geom_scale > 0.0:
+        metrics["scaled_max_atom_displacement"] = float(max_disp) / float(geom_scale)
+
+    if seed_coords.shape == coords.shape and np.all(np.isfinite(seed_coords)) and np.all(np.isfinite(coords)):
+        mobility = (
+            scale_model.get("per_atom_mobility_scales", {})
+            if isinstance(scale_model.get("per_atom_mobility_scales"), dict)
+            else {}
+        )
+        raw_values = mobility.get("values_angstrom") or []
+        values: List[float] = []
+        if isinstance(raw_values, list):
+            for value in raw_values:
+                finite = _safe_float_or_none(value)
+                if finite is not None and finite > 0.0:
+                    values.append(float(finite))
+        if values:
+            disp = np.linalg.norm(coords - seed_coords, axis=1)
+            scaled: List[float] = []
+            for index, value in enumerate(disp):
+                scale = values[index] if index < len(values) else values[-1]
+                if scale > 0.0 and np.isfinite(value):
+                    scaled.append(float(value) / float(scale))
+            if scaled:
+                metrics["max_per_atom_mobility_ratio"] = float(max(scaled))
+                metrics["rms_per_atom_mobility_ratio"] = float(
+                    math.sqrt(sum(v * v for v in scaled) / float(len(scaled)))
+                )
+
+    aligned = _safe_float_or_none(
+        metrics.get("aligned_rmsd_ang")
+        if metrics.get("aligned_rmsd_ang") is not None
+        else metrics.get("aligned_mass_weighted_rmsd_ang")
+    )
+    if aligned is not None and aligned_scale is not None and aligned_scale > 0.0:
+        metrics["scaled_aligned_rmsd"] = float(aligned) / float(aligned_scale)
+
+    residual = _safe_float_or_none(metrics.get("fullspace_residual_distance"))
+    if residual is not None and residual_scale is not None and residual_scale > 0.0:
+        metrics["scaled_fullspace_residual_distance"] = (
+            float(residual) / float(residual_scale)
+        )
+
+    min_pair = _safe_float_or_none(metrics.get("min_pair_distance_ang"))
+    if min_pair is not None and pair_ref is not None and pair_ref > 0.0:
+        metrics["scaled_min_pair_ratio"] = float(min_pair) / float(pair_ref)
+
+    whitened = _safe_float_or_none(metrics.get("whitened_distance"))
+    active_dim = _active_subspace_dimension(acquisition) if acquisition is not None else None
+    if whitened is not None and active_dim is not None:
+        metrics["whitened_distance_active_dim"] = int(active_dim)
+        metrics["scaled_whitened_distance"] = float(whitened) / math.sqrt(
+            float(active_dim)
+        )
+
+    chemistry = _safe_float_or_none(metrics.get("chemistry_penalty"))
+    if chemistry is not None:
+        n_atoms = int(coords.shape[0]) if coords.ndim == 2 else 0
+        metrics["normalised_chemistry_penalty"] = (
+            float(chemistry) / float(max(n_atoms, 1))
+        )
+
+
 def _candidate_public(candidate: Dict[str, Any]) -> Dict[str, Any]:
     public = {
         "candidate_index": int(candidate.get("candidate_index", -1)),
@@ -605,6 +739,7 @@ def _evaluate_landing_candidate(
     grad_norm: Optional[float],
     safety_config: Any,
     quality_gates: Any,
+    scale_model: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     reasons: List[str] = []
     record_only: List[str] = []
@@ -623,6 +758,13 @@ def _evaluate_landing_candidate(
 
     if coords.shape != seed_coords.shape or not np.all(np.isfinite(coords)):
         reasons.append("ariadne_landing_geometry_nonfinite")
+    _annotate_sampling_scale_metrics(
+        metrics,
+        seed_coords=seed_coords,
+        coords=coords,
+        acquisition=acquisition,
+        scale_model=scale_model,
+    )
     seed_equivalent = _is_seed_equivalent(seed_coords, coords)
     metrics["seed_equivalent"] = bool(seed_equivalent)
     if seed_equivalent:
@@ -650,6 +792,17 @@ def _evaluate_landing_candidate(
         and float(metrics["min_pair_distance_ang"]) < min_pair
     ):
         reasons.append("ariadne_min_pair_distance_threshold_exceeded")
+    pair_ratio = _safe_float_or_none(metrics.get("scaled_min_pair_ratio"))
+    pair_ratio_floor = _safe_float_or_none(
+        metrics.get("sampling_scale_pair_ratio_floor")
+    )
+    if (
+        pair_ratio is not None
+        and pair_ratio_floor is not None
+        and pair_ratio < pair_ratio_floor
+    ):
+        if "ariadne_min_pair_distance_threshold_exceeded" not in reasons:
+            reasons.append("ariadne_min_pair_distance_threshold_exceeded")
 
     try:
         from ichor.core.adversarial.subspace import whitened_distance_squared
@@ -745,6 +898,13 @@ def _evaluate_landing_candidate(
         metrics["acquisition_fallback_reasons"] = list(breakdown.fallback_reasons)
         metrics["total_score"] = float(breakdown.total)
         metrics["alpha_full"] = float(breakdown.total)
+        _annotate_sampling_scale_metrics(
+            metrics,
+            seed_coords=seed_coords,
+            coords=coords,
+            acquisition=acquisition,
+            scale_model=scale_model,
+        )
         alpha_value = float(breakdown.total)
         informativeness = float(breakdown.informativeness_score)
         risk_penalty = float(breakdown.risk_penalty_score)
@@ -761,13 +921,19 @@ def _evaluate_landing_candidate(
         _cfg_value(safety_config, "enforce_min_whitened_distance", False)
     )
     d_w = metrics.get("whitened_distance")
-    if d_w is not None:
-        if float(d_w) < min_w:
+    d_gate = metrics.get("scaled_whitened_distance")
+    if d_gate is None:
+        d_gate = d_w
+        metrics["whitened_distance_gate_metric"] = "raw_whitened_distance"
+    else:
+        metrics["whitened_distance_gate_metric"] = "scaled_per_sqrt_active_dim"
+    if d_gate is not None:
+        if float(d_gate) < min_w:
             if enforce_min_w:
                 reasons.append("ariadne_landing_below_min_whitened_distance")
             else:
                 record_only.append("ariadne_landing_below_min_whitened_distance")
-        if float(d_w) > max_w:
+        if float(d_gate) > max_w:
             reasons.append("ariadne_landing_above_max_whitened_distance")
 
     if bool(_cfg_value(safety_config, "enforce_movement_band", True)):
@@ -993,6 +1159,7 @@ def _select_safe_landing(
     full_initial_alpha: Optional[float] = None,
     safety_config: Any,
     quality_gates: Any,
+    scale_model: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     if not bool(_cfg_value(safety_config, "enabled", True)):
         return {
@@ -1063,6 +1230,7 @@ def _select_safe_landing(
             ),
             safety_config=safety_config,
             quality_gates=quality_gates,
+            scale_model=scale_model,
         )
         candidate_metrics = dict(candidate.get("metrics") or {})
         candidate_metrics["alpha_full_initial"] = (
@@ -1090,6 +1258,7 @@ def _select_safe_landing(
         grad_norm=None,
         safety_config=safety_config,
         quality_gates=quality_gates,
+        scale_model=scale_model,
     )
     raw_metrics = dict(raw_candidate.get("metrics") or {})
     raw_metrics["alpha_full_initial"] = (
@@ -1130,6 +1299,7 @@ def _select_safe_landing(
                 grad_norm=None,
                 safety_config=safety_config,
                 quality_gates=quality_gates,
+                scale_model=scale_model,
             )
             candidate_metrics = dict(candidate.get("metrics") or {})
             candidate_metrics["alpha_full_initial"] = (
@@ -1387,6 +1557,7 @@ def _select_safe_gradient_band_warm_start(
     seed_atoms: Atoms,
     safety_config: Any,
     quality_gates: Any,
+    scale_model: Optional[Dict[str, Any]] = None,
 ) -> tuple[Optional[np.ndarray], str, List[Dict[str, Any]]]:
     probe_method = getattr(acquisition, "gradient_band_probe_atoms", None)
     if not callable(probe_method):
@@ -1408,6 +1579,7 @@ def _select_safe_gradient_band_warm_start(
                 grad_norm=None,
                 safety_config=safety_config,
                 quality_gates=quality_gates,
+                scale_model=scale_model,
             )
             public = _candidate_public(candidate)
             records.append(public)
@@ -1494,6 +1666,7 @@ def _live_optimise_seed(
     gradient_backend: str = "process",
     safety_config: Optional[Any] = None,
     quality_gates: Optional[Any] = None,
+    scale_model: Optional[Dict[str, Any]] = None,
     trace_path: Optional[Any] = None,
 ) -> AriadneRunResult:
     """Run ARIADNE adversarial descent for one seed against a real
@@ -1572,6 +1745,7 @@ def _live_optimise_seed(
             seed_atoms=acquisition.seed_atoms,
             safety_config=safety_config,
             quality_gates=quality_gates,
+            scale_model=scale_model,
         )
     )
 
@@ -1614,6 +1788,7 @@ def _live_optimise_seed(
         full_initial_alpha=full_initial_alpha,
         safety_config=safety_config,
         quality_gates=quality_gates,
+        scale_model=scale_model,
     )
     if _landing_needs_under_move_retry(
         landing,
@@ -1667,6 +1842,7 @@ def _live_optimise_seed(
             full_initial_alpha=full_initial_alpha_retry,
             safety_config=safety_config,
             quality_gates=quality_gates,
+            scale_model=scale_model,
         )
         opt_result_retry.diagnostics["under_move_retry_attempted"] = True
         opt_result_retry.diagnostics["under_move_retry_target_grad_rms"] = float(
@@ -2090,6 +2266,7 @@ def main(argv=None) -> int:
             gradient_backend=str(config.resources.gradient_parallel_backend),
             safety_config=resolved_protocol.adversarial_safety,
             quality_gates=resolved_protocol.quality_gates,
+            scale_model=resolved_protocol.scale_model_payload,
             trace_path=trace_path,
         )
     except Exception as exc:
@@ -2119,8 +2296,13 @@ def main(argv=None) -> int:
             None if resolved_protocol.manifest_path is None
             else str(resolved_protocol.manifest_path.resolve())
         ),
+        "scale_model_manifest": (
+            None if resolved_protocol.scale_model_path is None
+            else str(resolved_protocol.scale_model_path.resolve())
+        ),
         "hidden_overrides_detected": list(resolved_protocol.hidden_overrides_detected),
     }
+    payload["sampling_scale_model"] = dict(resolved_protocol.scale_model_payload)
     allow_seed_fallback = bool(
         getattr(resolved_protocol.adversarial_safety, "allow_seed_fallback", False)
     )

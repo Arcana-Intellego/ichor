@@ -320,6 +320,8 @@ def _ariadne_outputs_exist(campaign_dir: Union[str, Path], proposed_state: Campa
         "ARIADNE_LANDING_AUDIT.json",
         "ACQUISITION_MATURITY_AUDIT.json",
         "ERROR_CALIBRATION_AUDIT.json",
+        "SAMPLING_SCALE_MODEL.json",
+        "SAMPLING_PROTOCOL_RESOLVED.json",
     ):
         if (iter_dir / name).is_file():
             return True
