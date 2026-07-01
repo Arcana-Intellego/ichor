@@ -808,6 +808,68 @@ def test_ariadne_parser_ignores_hidden_raw_ariadne_quality_gate_override(tmp_pat
     assert manifest["n_rejected"] == 0
 
 
+def test_ariadne_parser_uses_result_resolved_protocol_manifest(tmp_path):
+    ex = _make_executor(tmp_path)
+    pool = _seed_ariadne_pool(tmp_path / "campaign", iteration=4, n_seeds=1)
+    iter_dir = tmp_path / "campaign" / "7_ACTIVE_LEARNING" / "iteration-0004"
+    protocol_path = iter_dir / "SAMPLING_PROTOCOL_RESOLVED.json"
+    protocol_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "iteration": 4,
+                "sampling_aggressiveness": 5,
+                "resolved_quality_gates": {
+                    "ariadne_max_displacement_ang": 1.0e-8,
+                    "ariadne_min_pair_distance_ang": 0.60,
+                },
+                "resolved_adversarial_safety": {
+                    "accept_legacy_missing_landing_safety": False,
+                    "allow_seed_fallback": False,
+                },
+                "sampling_scale_model": {
+                    "schema_version": 1,
+                    "iteration": 4,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    result_path = pool / "seed_0000" / "result.json"
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    payload["task_success"] = True
+    payload["sampling_protocol"] = {
+        "sampling_aggressiveness": 5,
+        "resolved_manifest": str(protocol_path.resolve()),
+    }
+    payload["landing_safety"] = {
+        "accepted": True,
+        "policy": "raw_final",
+        "selected_origin": "raw_final",
+        "reasons": [],
+        "record_only_reasons": [],
+        "metrics": {
+            "max_displacement_ang": 0.01,
+            "min_pair_distance_ang": 0.95,
+        },
+    }
+    result_path.write_text(json.dumps(payload), encoding="utf-8")
+    state = SimpleNamespace(iteration=4, campaign_uid="m16-test")
+
+    result = ex._parse_ariadne_array_postprocess(
+        state, CampaignPhase("ARIADNE_ARRAY"), observations=[],
+    )
+
+    assert result.failure_reason == "ariadne_no_seed_results_parsed: 1"
+    manifest = json.loads((iter_dir / "ARIADNE_RESULTS.json").read_text(encoding="utf-8"))
+    assert manifest["n_accepted"] == 0
+    assert manifest["rejected"][0]["reason"] == "ariadne_max_displacement_threshold_exceeded"
+    audit = json.loads((iter_dir / "ARIADNE_LANDING_AUDIT.json").read_text(encoding="utf-8"))
+    replay = audit["seeds"][0]["sampling_protocol_replay"]
+    assert replay["used_exact_sampling_protocol"] is True
+    assert replay["sampling_protocol_source"] == "result_manifest"
+
+
 def test_ariadne_parser_reconstructs_missing_seed_provenance(tmp_path):
     from ichor.hpc.active_learning.versioning.provenance import (
         PROVENANCE_FILENAME,

@@ -656,6 +656,112 @@ def test_geometry_novelty_change_blocks_after_phase_b_selection_exists(tmp_path)
     assert review.blocked_changes[0].category == "postprocess_locked"
 
 
+def test_sampling_aggressiveness_change_allowed_before_ariadne_outputs(tmp_path):
+    campaign = _campaign(tmp_path)
+    original = CampaignConfig()
+    write_config_lock(campaign, original)
+    changed = CampaignConfig()
+    changed.sampling_protocol.sampling_aggressiveness = 6
+
+    proposed = fresh_campaign_state()
+    proposed.phase = CampaignPhase.ARIADNE_ARRAY
+    proposed.iteration = 0
+    review = review_config_changes(campaign, changed, proposed)
+
+    assert review.allowed
+    assert [c.path for c in review.allowed_changes] == [
+        "sampling_protocol.sampling_aggressiveness"
+    ]
+    assert not review.blocked_changes
+
+
+def test_sampling_aggressiveness_change_blocks_after_protocol_manifest_exists(tmp_path):
+    campaign = _campaign(tmp_path)
+    original = CampaignConfig()
+    write_config_lock(campaign, original)
+    changed = CampaignConfig()
+    changed.sampling_protocol.sampling_aggressiveness = 6
+    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
+    iter_dir.mkdir(parents=True)
+    (iter_dir / "SAMPLING_PROTOCOL_RESOLVED.json").write_text("{}", encoding="utf-8")
+
+    proposed = fresh_campaign_state()
+    proposed.phase = CampaignPhase.ARIADNE_ARRAY
+    proposed.iteration = 0
+    review = review_config_changes(campaign, changed, proposed)
+
+    assert not review.allowed
+    assert [c.path for c in review.blocked_changes] == [
+        "sampling_protocol.sampling_aggressiveness"
+    ]
+    assert review.blocked_changes[0].category == "postprocess_locked"
+    assert "ARIADNE" in review.blocked_changes[0].reason
+
+
+def test_sampling_aggressiveness_change_blocks_after_scale_model_exists(tmp_path):
+    campaign = _campaign(tmp_path)
+    original = CampaignConfig()
+    write_config_lock(campaign, original)
+    changed = CampaignConfig()
+    changed.sampling_protocol.sampling_aggressiveness = 6
+    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
+    iter_dir.mkdir(parents=True)
+    (iter_dir / "SAMPLING_SCALE_MODEL.json").write_text("{}", encoding="utf-8")
+
+    proposed = fresh_campaign_state()
+    proposed.phase = CampaignPhase.ARIADNE_ARRAY
+    proposed.iteration = 0
+    review = review_config_changes(campaign, changed, proposed)
+
+    assert not review.allowed
+    assert [c.path for c in review.blocked_changes] == [
+        "sampling_protocol.sampling_aggressiveness"
+    ]
+    assert review.blocked_changes[0].category == "postprocess_locked"
+
+
+def test_sampling_aggressiveness_change_blocks_after_phase_b_selection_exists(tmp_path):
+    campaign = _campaign(tmp_path)
+    original = CampaignConfig()
+    write_config_lock(campaign, original)
+    changed = CampaignConfig()
+    changed.sampling_protocol.sampling_aggressiveness = 6
+    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
+    iter_dir.mkdir(parents=True)
+    (iter_dir / "PHASE_B_SELECTION.json").write_text("{}", encoding="utf-8")
+
+    proposed = fresh_campaign_state()
+    proposed.phase = CampaignPhase.PHASE_B_POLUS
+    proposed.iteration = 0
+    review = review_config_changes(campaign, changed, proposed)
+
+    assert not review.allowed
+    assert [c.path for c in review.blocked_changes] == [
+        "sampling_protocol.sampling_aggressiveness"
+    ]
+    assert review.blocked_changes[0].category == "postprocess_locked"
+    assert "Phase B" in review.blocked_changes[0].reason
+
+
+def test_sampling_aggressiveness_same_value_is_noop_after_outputs(tmp_path):
+    campaign = _campaign(tmp_path)
+    original = CampaignConfig()
+    write_config_lock(campaign, original)
+    changed = CampaignConfig()
+    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
+    iter_dir.mkdir(parents=True)
+    (iter_dir / "ARIADNE_RESULTS.json").write_text("{}", encoding="utf-8")
+
+    proposed = fresh_campaign_state()
+    proposed.phase = CampaignPhase.ARIADNE_ARRAY
+    proposed.iteration = 0
+    review = review_config_changes(campaign, changed, proposed)
+
+    assert not review.changed
+    assert not review.allowed_changes
+    assert not review.blocked_changes
+
+
 def test_phase_b_config_change_blocks_halted_uncommitted_selection(tmp_path):
     campaign = _campaign(tmp_path)
     original = CampaignConfig()

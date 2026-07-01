@@ -29,6 +29,7 @@ import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from ..config import (
@@ -125,6 +126,211 @@ def _iteration_active_learning_dir(campaign_dir: Path, iteration: int) -> Path:
         / "7_ACTIVE_LEARNING"
         / ("iteration-" + str(int(iteration)).zfill(4))
     )
+
+
+def _object_with_overrides(default_obj: Any, overrides: Any) -> SimpleNamespace:
+    """Return an attribute object using manifest values over current defaults."""
+    values: Dict[str, Any] = {}
+    if default_obj is not None:
+        try:
+            values.update(vars(default_obj))
+        except TypeError:
+            pass
+    if isinstance(overrides, dict):
+        for key, value in overrides.items():
+            values[str(key)] = value
+    return SimpleNamespace(**values)
+
+
+def _campaign_manifest_path(
+    campaign_dir: Path,
+    iter_dir: Path,
+    raw_path: Any,
+    *,
+    field_name: str,
+) -> Path:
+    if raw_path in (None, ""):
+        raise ValueError(field_name + " is empty")
+    path = Path(str(raw_path))
+    campaign = Path(campaign_dir).resolve()
+    if not path.is_absolute():
+        candidates = [iter_dir / path, campaign / path]
+        path = next((candidate for candidate in candidates if candidate.exists()), candidates[0])
+    resolved = path.resolve()
+    try:
+        resolved.relative_to(campaign)
+    except ValueError as exc:
+        raise ValueError(field_name + " points outside campaign directory: " + str(resolved)) from exc
+    if not resolved.is_file():
+        raise ValueError(field_name + " does not exist: " + str(resolved))
+    return resolved
+
+
+def _read_json_object(path: Path, label: str) -> Dict[str, Any]:
+    import json
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(label + " is unreadable: " + type(exc).__name__ + ": " + str(exc)) from exc
+    if not isinstance(payload, dict):
+        raise ValueError(label + " must contain a JSON object")
+    return payload
+
+
+def _sampling_protocol_for_ariadne_result(
+    *,
+    campaign_dir: Path,
+    iter_dir: Path,
+    fallback_protocol: Any,
+    result_dict: Dict[str, Any],
+    iteration: int,
+) -> tuple[SimpleNamespace, Dict[str, Any]]:
+    """Load the exact sampling protocol recorded by an ARIADNE task.
+
+    Live postprocess must not silently reinterpret old seed results with a
+    freshly previewed config.  Per-result manifest pointers win; the
+    iteration manifest is the compatibility fallback; previewed config is
+    used only for true legacy results with no resolved manifest sidecar.
+    """
+    from ..sampling_protocol import (
+        SAMPLING_PROTOCOL_SCHEMA_VERSION,
+        sampling_protocol_resolved_path,
+    )
+    from ..sampling_scale_model import (
+        SAMPLING_SCALE_MODEL_SCHEMA_VERSION,
+        sampling_scale_model_path,
+    )
+
+    sampling = result_dict.get("sampling_protocol")
+    if not isinstance(sampling, dict):
+        sampling = {}
+
+    protocol_source = "preview_fallback"
+    protocol_manifest: Optional[Path] = None
+    protocol_payload: Optional[Dict[str, Any]] = None
+    raw_protocol_manifest = sampling.get("resolved_manifest")
+    if raw_protocol_manifest not in (None, ""):
+        protocol_manifest = _campaign_manifest_path(
+            campaign_dir,
+            iter_dir,
+            raw_protocol_manifest,
+            field_name="sampling_protocol.resolved_manifest",
+        )
+        protocol_source = "result_manifest"
+    else:
+        iter_manifest = sampling_protocol_resolved_path(iter_dir)
+        if iter_manifest.is_file():
+            protocol_manifest = iter_manifest.resolve()
+            protocol_source = "iteration_manifest"
+
+    if protocol_manifest is not None:
+        protocol_payload = _read_json_object(
+            protocol_manifest,
+            "SAMPLING_PROTOCOL_RESOLVED.json",
+        )
+        if int(protocol_payload.get("schema_version", -1)) != int(SAMPLING_PROTOCOL_SCHEMA_VERSION):
+            raise ValueError("unsupported sampling protocol resolved schema")
+        if int(protocol_payload.get("iteration", -1)) != int(iteration):
+            raise ValueError("sampling protocol resolved iteration mismatch")
+        result_level = sampling.get("sampling_aggressiveness")
+        if result_level is not None and int(result_level) != int(
+            protocol_payload.get("sampling_aggressiveness", -1)
+        ):
+            raise ValueError("result sampling aggressiveness does not match resolved manifest")
+
+    scale_source = "preview_fallback"
+    scale_manifest: Optional[Path] = None
+    scale_payload: Optional[Dict[str, Any]] = None
+    raw_scale_manifest = sampling.get("scale_model_manifest")
+    if raw_scale_manifest not in (None, ""):
+        scale_manifest = _campaign_manifest_path(
+            campaign_dir,
+            iter_dir,
+            raw_scale_manifest,
+            field_name="sampling_protocol.scale_model_manifest",
+        )
+        scale_source = "result_manifest"
+    elif protocol_payload is not None and protocol_payload.get("sampling_scale_model_manifest") not in (None, ""):
+        scale_manifest = _campaign_manifest_path(
+            campaign_dir,
+            iter_dir,
+            protocol_payload.get("sampling_scale_model_manifest"),
+            field_name="sampling_scale_model_manifest",
+        )
+        scale_source = "protocol_manifest"
+    elif sampling_scale_model_path(iter_dir).is_file():
+        scale_manifest = sampling_scale_model_path(iter_dir).resolve()
+        scale_source = "iteration_manifest"
+
+    if scale_manifest is not None:
+        scale_payload = _read_json_object(scale_manifest, "SAMPLING_SCALE_MODEL.json")
+        if int(scale_payload.get("schema_version", -1)) != int(SAMPLING_SCALE_MODEL_SCHEMA_VERSION):
+            raise ValueError("unsupported sampling scale model schema")
+        if int(scale_payload.get("iteration", -1)) != int(iteration):
+            raise ValueError("sampling scale model iteration mismatch")
+    elif protocol_payload is not None and isinstance(protocol_payload.get("sampling_scale_model"), dict):
+        scale_payload = dict(protocol_payload.get("sampling_scale_model") or {})
+        scale_source = "protocol_manifest_embedded"
+
+    if protocol_payload is None:
+        diagnostics = {
+            "sampling_protocol_source": "preview_fallback",
+            "sampling_scale_model_source": scale_source,
+            "used_exact_sampling_protocol": False,
+            "fallback_reason": "legacy_missing_sampling_protocol_manifest",
+            "sampling_protocol_manifest": None,
+            "sampling_scale_model_manifest": None if scale_manifest is None else str(scale_manifest),
+        }
+        return SimpleNamespace(
+            schema_version=getattr(fallback_protocol, "schema_version", None),
+            iteration=int(iteration),
+            sampling_aggressiveness=int(getattr(fallback_protocol, "sampling_aggressiveness", 0)),
+            effective_config=fallback_protocol.effective_config,
+            adversarial_safety=fallback_protocol.adversarial_safety,
+            quality_gates=fallback_protocol.quality_gates,
+            scale_model_payload=(
+                dict(scale_payload)
+                if isinstance(scale_payload, dict)
+                else dict(getattr(fallback_protocol, "scale_model_payload", {}) or {})
+            ),
+            manifest_path=None,
+            scale_model_path=scale_manifest,
+            replay_diagnostics=diagnostics,
+        ), diagnostics
+
+    level = int(protocol_payload.get("sampling_aggressiveness"))
+    quality_gates = _object_with_overrides(
+        getattr(fallback_protocol, "quality_gates", None),
+        protocol_payload.get("resolved_quality_gates"),
+    )
+    adversarial_safety = _object_with_overrides(
+        getattr(fallback_protocol, "adversarial_safety", None),
+        protocol_payload.get("resolved_adversarial_safety"),
+    )
+    diagnostics = {
+        "sampling_protocol_source": protocol_source,
+        "sampling_scale_model_source": scale_source,
+        "used_exact_sampling_protocol": True,
+        "sampling_protocol_manifest": str(protocol_manifest) if protocol_manifest is not None else None,
+        "sampling_scale_model_manifest": str(scale_manifest) if scale_manifest is not None else None,
+    }
+    return SimpleNamespace(
+        schema_version=int(protocol_payload.get("schema_version")),
+        iteration=int(iteration),
+        sampling_aggressiveness=level,
+        effective_config=fallback_protocol.effective_config,
+        adversarial_safety=adversarial_safety,
+        quality_gates=quality_gates,
+        scale_model_payload=(
+            dict(scale_payload)
+            if isinstance(scale_payload, dict)
+            else dict(protocol_payload.get("sampling_scale_model") or {})
+        ),
+        manifest_path=protocol_manifest,
+        scale_model_path=scale_manifest,
+        replay_diagnostics=diagnostics,
+    ), diagnostics
 
 
 def clean_stale_ariadne_seed_outputs(campaign_dir, iteration: int) -> List[str]:
@@ -2203,13 +2409,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         except Exception:
             geometry_scale_payload = None
         try:
-            resolved_protocol = preview_sampling_protocol(
+            fallback_protocol = preview_sampling_protocol(
                 self.config,
                 campaign_dir=self.campaign_dir,
                 iteration=int(state.iteration),
                 geometry_scale_payload=geometry_scale_payload,
             )
-            effective_config = resolved_protocol.effective_config
         except Exception as exc:
             return PhaseResult(
                 is_complete=True,
@@ -2440,9 +2645,64 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     n_warnings=int(len(optional_diag_warnings)),
                 )
 
+            try:
+                result_protocol, protocol_replay = _sampling_protocol_for_ariadne_result(
+                    campaign_dir=self.campaign_dir,
+                    iter_dir=iter_dir,
+                    fallback_protocol=fallback_protocol,
+                    result_dict=result_dict,
+                    iteration=int(state.iteration),
+                )
+            except Exception as exc:
+                reason = (
+                    "sampling_protocol_replay_failed: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)
+                )
+                rejected.append({
+                    "seed_index": seed_index,
+                    "seed_dir": str(seed_dir.resolve()),
+                    "result_json": str(result_path.resolve()),
+                    "reason": reason,
+                })
+                landing_audit_records.append({
+                    "seed_index": seed_index,
+                    "seed_dir": str(seed_dir.resolve()),
+                    "result_json": str(result_path.resolve()),
+                    "reason": reason,
+                    "handoff_accepted": False,
+                    "handoff_rejection_reason": reason,
+                })
+                self._journal_event(
+                    "ariadne_sampling_protocol_replay_failed",
+                    phase=phase_name,
+                    iteration=int(state.iteration),
+                    seed_dir=seed_dir.name,
+                    result_json=str(result_path.resolve()),
+                    reason=reason,
+                )
+                self._journal_event(
+                    "quantum_output_rejected",
+                    phase=phase_name,
+                    iteration=int(state.iteration),
+                    pointdir=seed_dir.name,
+                    reason=reason,
+                )
+                continue
+            if not bool(protocol_replay.get("used_exact_sampling_protocol", False)):
+                self._journal_event(
+                    "legacy_sampling_protocol_repreview",
+                    phase=phase_name,
+                    iteration=int(state.iteration),
+                    seed_dir=seed_dir.name,
+                    result_json=str(result_path.resolve()),
+                    reason=str(protocol_replay.get("fallback_reason", "")),
+                )
+
             accept_legacy_missing_landing_safety = bool(
                 getattr(
-                    getattr(resolved_protocol, "adversarial_safety", None),
+                    getattr(result_protocol, "adversarial_safety", None),
                     "accept_legacy_missing_landing_safety",
                     False,
                 )
@@ -2451,7 +2711,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 result_dict,
                 allow_seed_fallback=bool(
                     getattr(
-                        getattr(resolved_protocol, "adversarial_safety", None),
+                        getattr(result_protocol, "adversarial_safety", None),
                         "allow_seed_fallback",
                         False,
                     )
@@ -2490,6 +2750,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 ),
                 "task_success": bool(usability.get("usable", False)),
                 "task_success_reason": str(usability.get("reason", "")),
+                "sampling_protocol_replay": dict(protocol_replay),
             }
             if optional_diag_warnings:
                 audit_record["optional_diagnostic_warnings"] = list(
@@ -2584,7 +2845,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             geometry_quality = _ariadne_geometry_quality(
                 result_dict,
                 validated,
-                resolved_protocol.quality_gates,
+                result_protocol.quality_gates,
             )
             if not bool(geometry_quality.get("accepted")):
                 reason = ";".join(str(r) for r in geometry_quality.get("reasons", []))
@@ -2697,7 +2958,9 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 d_w_is_synthetic = True
             flag = None
             if d_w is not None:
-                min_d, max_d = anti_overlap_whitened_distance_bounds(effective_config)
+                min_d, max_d = anti_overlap_whitened_distance_bounds(
+                    result_protocol.effective_config
+                )
                 if d_w < min_d:
                     flag = "moved_too_little"
                 elif d_w > max_d:
@@ -2729,7 +2992,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 if (
                     not d_w_is_synthetic
                     and getattr(
-                        effective_config.anti_overlap,
+                        result_protocol.effective_config.anti_overlap,
                         "enforce_post_ariadne",
                         False,
                     )
@@ -2786,6 +3049,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     if isinstance(selection_diagnostics, dict)
                     else None
                 ),
+                "sampling_protocol_replay": dict(protocol_replay),
                 "return_code": int(validated["return_code"]),
                 "task_success": bool(usability.get("usable", False)),
                 "task_success_reason": str(usability.get("reason", "")),

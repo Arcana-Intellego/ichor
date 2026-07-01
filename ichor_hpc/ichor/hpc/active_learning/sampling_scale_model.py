@@ -138,10 +138,16 @@ def _accepted_history_records_for_iteration(
     counts = {
         "n_seen": 0,
         "n_used": 0,
+        "n_audit_records_seen": 0,
+        "n_results_records_seen": 0,
+        "n_audit_records_used": 0,
+        "n_results_records_used": 0,
+        "n_skipped_malformed_record": 0,
         "n_skipped_handoff_rejected": 0,
         "n_skipped_landing_rejected": 0,
         "n_skipped_missing_landing_safety": 0,
         "n_skipped_no_usable_metrics": 0,
+        "n_deduplicated_fallback_records": 0,
         "n_fallback_results_records_used": 0,
     }
     accepted: List[Tuple[Path, Dict[str, Any], str]] = []
@@ -149,8 +155,12 @@ def _accepted_history_records_for_iteration(
     if isinstance(audit, dict):
         for record in audit.get("seeds") or []:
             if not isinstance(record, dict):
+                counts["n_seen"] += 1
+                counts["n_audit_records_seen"] += 1
+                counts["n_skipped_malformed_record"] += 1
                 continue
             counts["n_seen"] += 1
+            counts["n_audit_records_seen"] += 1
             reason = _history_skip_reason(record, source="audit")
             if reason is not None:
                 counts[reason] += 1
@@ -158,6 +168,7 @@ def _accepted_history_records_for_iteration(
             accepted.append((iter_dir, record, "audit"))
     if accepted:
         counts["n_used"] += len(accepted)
+        counts["n_audit_records_used"] += len(accepted)
         return accepted, counts
 
     results = _json(iter_dir / "ARIADNE_RESULTS.json")
@@ -166,12 +177,17 @@ def _accepted_history_records_for_iteration(
         seen_keys = set()
         for record in results.get("accepted") or []:
             if not isinstance(record, dict):
+                counts["n_seen"] += 1
+                counts["n_results_records_seen"] += 1
+                counts["n_skipped_malformed_record"] += 1
                 continue
             key = str(record.get("result_json") or record.get("seed_dir") or record.get("seed_index") or len(seen_keys))
             if key in seen_keys:
+                counts["n_deduplicated_fallback_records"] += 1
                 continue
             seen_keys.add(key)
             counts["n_seen"] += 1
+            counts["n_results_records_seen"] += 1
             reason = _history_skip_reason(record, source="results")
             if reason is not None:
                 counts[reason] += 1
@@ -179,6 +195,7 @@ def _accepted_history_records_for_iteration(
             fallback.append((iter_dir, record, "results"))
         if fallback:
             counts["n_used"] += len(fallback)
+            counts["n_results_records_used"] += len(fallback)
             counts["n_fallback_results_records_used"] += len(fallback)
             return fallback, counts
     return [], counts
@@ -263,10 +280,16 @@ def _collect_history(
     history_filter = {
         "n_seen": 0,
         "n_used": 0,
+        "n_audit_records_seen": 0,
+        "n_results_records_seen": 0,
+        "n_audit_records_used": 0,
+        "n_results_records_used": 0,
+        "n_skipped_malformed_record": 0,
         "n_skipped_handoff_rejected": 0,
         "n_skipped_landing_rejected": 0,
         "n_skipped_missing_landing_safety": 0,
         "n_skipped_no_usable_metrics": 0,
+        "n_deduplicated_fallback_records": 0,
         "n_fallback_results_records_used": 0,
     }
     base = campaign_dir / "7_ACTIVE_LEARNING"

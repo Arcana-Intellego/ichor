@@ -211,8 +211,13 @@ def test_phase_b_writes_sample_and_dedup(tmp_path):
     atom_types = ["O", "H", "H"]
     base = [(0.0, 0.0, 0.0), (0.96, 0.0, 0.0), (-0.24, 0.93, 0.0)]
     for i in range(5):
-        # spread the seeds out in x
-        coords = [(c[0] + 0.1 * i, c[1], c[2]) for c in base]
+        # distort the shape rather than only translating it; Phase B anti-overlap
+        # aligns geometries and now also de-duplicates within the selected batch.
+        coords = [
+            (0.0, 0.0, 0.0),
+            (0.96 + 0.20 * i, 0.0, 0.0),
+            (-0.24, 0.93 + 0.15 * i, 0.0),
+        ]
         seed_dir = pool_dir / f"seed_{i:04d}"
         _make_seed_result(seed_dir, atom_types, coords)
         _set_landing_safety(seed_dir, accepted=True)
@@ -314,7 +319,11 @@ def test_phase_b_rejects_all_missing_landing_safety_by_default(tmp_path):
         _make_seed_result(
             pool_dir / f"seed_{i:04d}",
             atom_types,
-            [(c[0] + 0.4 * i, c[1], c[2]) for c in base],
+            [
+                (0.0, 0.0, 0.0),
+                (0.96 + 0.30 * i, 0.0, 0.0),
+                (-0.24, 0.93 + 0.20 * i, 0.0),
+            ],
         )
     _write_ariadne_manifest(iter_dir)
 
@@ -346,7 +355,11 @@ def test_phase_b_accepts_all_missing_landing_safety_with_legacy_override(tmp_pat
         _make_seed_result(
             pool_dir / f"seed_{i:04d}",
             atom_types,
-            [(c[0] + 0.4 * i, c[1], c[2]) for c in base],
+            [
+                (0.0, 0.0, 0.0),
+                (0.96 + 0.30 * i, 0.0, 0.0),
+                (-0.24, 0.93 + 0.20 * i, 0.0),
+            ],
         )
     _write_ariadne_manifest(iter_dir)
 
@@ -420,13 +433,13 @@ def test_phase_b_no_seeds_returns_3(tmp_path):
     assert "ARIADNE results manifest" in result.stderr
 
 
-def test_acquisition_weighted_descriptor_refuses(tmp_path):
-    """acquisition_weighted needs a posterior plumbed in. for now
-    we refuse with a clear message rather than crash."""
+def test_phase_b_ignores_hidden_descriptor_override_single_candidate(tmp_path):
+    """The sampling protocol owns the effective Phase B descriptor."""
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
     cfg.phase_b.descriptor = "acquisition_weighted"
+    cfg.active_batch.final_batch_size = 1
     cfg.to_yaml(campaign / "campaign.yaml")
     iter_dir = (
         campaign / "7_ACTIVE_LEARNING"
@@ -445,5 +458,7 @@ def test_acquisition_weighted_descriptor_refuses(tmp_path):
         "--iteration", "0",
         "--campaign-dir", str(campaign),
     ])
-    assert result.returncode == 3
-    assert "acquisition_weighted" in result.stderr
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads((iter_dir / "PHASE_B_SELECTION.json").read_text(encoding="utf-8"))
+    assert manifest["descriptor"] == "hybrid_alf_rmsd"
+    assert manifest["n_kept"] == 1

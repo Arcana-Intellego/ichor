@@ -299,6 +299,64 @@ def test_scale_model_falls_back_to_results_when_audit_has_no_usable_records(tmp_
     assert scale["history"]["filter"]["n_fallback_results_records_used"] == 1
 
 
+def test_scale_model_reports_malformed_and_duplicate_legacy_history(tmp_path):
+    iter0 = tmp_path / "7_ACTIVE_LEARNING" / "iteration-0000"
+    iter0.mkdir(parents=True)
+    (iter0 / "ARIADNE_LANDING_AUDIT.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "iteration": 0,
+                "seeds": [
+                    "not-a-record",
+                    {
+                        "seed_index": 0,
+                        "handoff_accepted": True,
+                        "landing_safety": {"accepted": False, "metrics": {}},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    usable = {
+        "seed_index": 1,
+        "result_json": "seed_0001/result.json",
+        "landing_safety": {
+            "accepted": True,
+            "metrics": {
+                "movement_rmsd_ang": 0.25,
+                "aligned_rmsd_ang": 0.25,
+                "fullspace_residual_distance": 0.35,
+                "min_pair_distance_ang": 1.0,
+            },
+        },
+    }
+    (iter0 / "ARIADNE_RESULTS.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "iteration": 0,
+                "accepted": [
+                    "not-a-record",
+                    usable,
+                    dict(usable),
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resolved = resolve_sampling_protocol(tmp_path, CampaignConfig(), iteration=1)
+    history_filter = resolved.scale_model_payload["history"]["filter"]
+
+    assert history_filter["n_skipped_malformed_record"] == 2
+    assert history_filter["n_skipped_landing_rejected"] == 1
+    assert history_filter["n_deduplicated_fallback_records"] == 1
+    assert history_filter["n_results_records_used"] == 1
+    assert history_filter["n_fallback_results_records_used"] == 1
+
+
 def test_scale_model_populates_per_seed_records_from_seed_records(tmp_path):
     iter0 = tmp_path / "7_ACTIVE_LEARNING" / "iteration-0000"
     iter0.mkdir(parents=True)

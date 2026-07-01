@@ -361,6 +361,73 @@ def _append_phase_b_journal_event(campaign, event_type, **payload) -> None:
         return
 
 
+def _phase_b_refill_after_anti_overlap(
+    *,
+    ordered_indices,
+    candidate_frames,
+    candidate_records,
+    training,
+    min_separation: float,
+    target_size: int,
+):
+    from .anti_overlap import DedupReport, min_distance_to_training
+
+    considered_indices = []
+    considered_frames = []
+    considered_records = []
+    kept_indices = []
+    dropped_indices = []
+    distances = []
+    kept_frames = []
+
+    for candidate_index in ordered_indices:
+        raw_index = len(considered_indices)
+        cand = candidate_frames[int(candidate_index)]
+        distance = float(
+            min_distance_to_training(cand, list(training) + list(kept_frames))
+        )
+        considered_indices.append(int(candidate_index))
+        considered_frames.append(cand)
+        considered_records.append(candidate_records[int(candidate_index)])
+        distances.append(distance)
+        if distance < float(min_separation):
+            dropped_indices.append(int(raw_index))
+        else:
+            kept_indices.append(int(raw_index))
+            kept_frames.append(cand)
+            if len(kept_indices) >= int(target_size):
+                break
+
+    rejected_distances = [
+        float(distances[i])
+        for i in dropped_indices
+        if i < len(distances) and np.isfinite(float(distances[i]))
+    ]
+    rejected_distances.sort()
+    refill = {
+        "enabled": True,
+        "target_final_batch_size": int(target_size),
+        "reserve_order_size": int(len(ordered_indices)),
+        "reserve_candidates_considered": int(len(considered_indices)),
+        "refill_applied": int(len(considered_indices)) > int(target_size),
+        "rejected_by_anti_overlap": int(len(dropped_indices)),
+        "closest_rejected_distances_angstrom": rejected_distances[:8],
+        "reserve_exhausted": int(len(kept_indices)) < int(target_size),
+    }
+    return (
+        considered_indices,
+        considered_frames,
+        considered_records,
+        DedupReport(
+            kept_indices=tuple(kept_indices),
+            dropped_indices=tuple(dropped_indices),
+            distances_to_nearest=tuple(distances),
+            min_separation=float(min_separation),
+        ),
+        refill,
+    )
+
+
 def _run_phase_a(campaign, config):
     """POLUS Phase-A: pick a diverse subsample from the imported
     trajectory pool to seed the campaign with initial training points.
@@ -457,7 +524,6 @@ def _run_phase_b(args, campaign, config):
     Plus phase_b_dedup.json   -- the DedupReport for journal / reconcile.
     """
     from .descriptors import build_descriptor_from_config
-    from .anti_overlap import filter_candidates_against_training
     from ..daemon.state import atomic_write_json
     from ..geometry_novelty import (
         EXACT_DUPLICATE_EPSILON_ANGSTROM,
@@ -601,14 +667,6 @@ def _run_phase_b(args, campaign, config):
     except Exception as exc:
         print(str(exc), file=_sys.stderr)
         return 3
-    sel = fps_select(matrix, n_select, descriptor_name=descriptor.name)
-    selected_frames = [candidate_frames[i] for i in sel.indices]
-    selected_records = [candidate_records[i] for i in sel.indices]
-
-    iter_dir.mkdir(parents=True, exist_ok=True)
-    raw_path = iter_dir / "phase_b_SAMPLE_raw.xyz"
-    _write_xyz_file(selected_frames, raw_path)
-
     geometry_scale_payload = dict(resolved_protocol.geometry_scale_payload)
     min_sep, threshold_mode = phase_b_min_separation_from_resolved(
         resolved_protocol
@@ -630,9 +688,28 @@ def _run_phase_b(args, campaign, config):
             file=_sys.stderr,
         )
         return 3
-    report = filter_candidates_against_training(
-        selected_frames, training, min_separation=min_sep,
+    ordered_sel = fps_select(
+        matrix,
+        len(candidate_frames),
+        descriptor_name=descriptor.name,
     )
+    (
+        selected_candidate_indices,
+        selected_frames,
+        selected_records,
+        report,
+        refill,
+    ) = _phase_b_refill_after_anti_overlap(
+        ordered_indices=ordered_sel.indices,
+        candidate_frames=candidate_frames,
+        candidate_records=candidate_records,
+        training=training,
+        min_separation=min_sep,
+        target_size=n_select,
+    )
+    iter_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = iter_dir / "phase_b_SAMPLE_raw.xyz"
+    _write_xyz_file(selected_frames, raw_path)
     relaxation = {
         "applied": False,
         "reason": None,
@@ -723,9 +800,13 @@ def _run_phase_b(args, campaign, config):
         },
         "sampling_scale_model": dict(resolved_protocol.scale_model_payload),
         "relaxation": relaxation,
+        "refill": refill,
         "n_kept": report.n_kept,
         "n_dropped": report.n_dropped,
         "n_candidates": len(selected_frames),
+        "n_safe_candidates": len(candidate_frames),
+        "fps_order": [int(i) for i in ordered_sel.indices],
+        "considered_candidate_indices": [int(i) for i in selected_candidate_indices],
         "descriptor_used": descriptor.name,
     }
     atomic_write_json(dedup_path, _phase_b_json_safe(dedup_payload))
@@ -770,6 +851,11 @@ def _run_phase_b(args, campaign, config):
             + str(int(config.active_batch.final_batch_size))
             + ", kept "
             + str(int(report.n_kept))
+            + " after considering "
+            + str(len(selected_frames))
+            + "/"
+            + str(len(candidate_frames))
+            + " safe reserve candidates"
             + "; diagnostics written to "
             + str(dedup_path),
             file=_sys.stderr,
@@ -784,7 +870,7 @@ def _run_phase_b(args, campaign, config):
     final_records = []
     for raw_index, rec in enumerate(selected_records):
         out_rec = dict(rec)
-        out_rec["candidate_index"] = int(sel.indices[raw_index])
+        out_rec["candidate_index"] = int(selected_candidate_indices[raw_index])
         out_rec["raw_index"] = int(raw_index)
         out_rec["kept_after_dedup"] = int(raw_index) in kept_lookup
         out_rec["final_index"] = (
@@ -817,11 +903,13 @@ def _run_phase_b(args, campaign, config):
         "source_ariadne_manifest": str((iter_dir / "ARIADNE_RESULTS.json").resolve()),
         "expected_final_batch_size": int(config.active_batch.final_batch_size),
         "n_candidates": int(len(candidate_frames)),
+        "n_considered_after_refill": int(len(selected_frames)),
         "n_selected_raw": int(len(raw_records)),
         "n_kept": int(len(final_records)),
         "raw": raw_records,
         "final": final_records,
         "dedup": dedup_payload,
+        "refill": refill,
         "safety_filter": safety_filter,
         "source_expected_n": int(ariadne_manifest.get("expected_n", len(candidate_frames))),
     }

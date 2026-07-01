@@ -116,7 +116,7 @@ def test_edit_campaign_config_menu_items():
     )
     texts = [it.text for it in edit_campaign_config_menu.items]
     for expected in (
-        "Show dense/internal in-memory config",
+        "Show dense/internal diagnostic config",
         "Show sampling protocol summary",
         "Load from disk",
         "Reset to defaults",
@@ -146,7 +146,7 @@ def test_edit_campaign_config_menu_items():
         "Show config lock review",
         "Show pending config changes",
         "Discard unsaved changes / reload from disk",
-        "Export dense/internal config snapshot",
+        "Export dense/internal diagnostic snapshot",
         "Save to disk",
     ):
         assert expected in texts, "missing item: " + expected

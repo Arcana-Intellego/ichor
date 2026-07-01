@@ -4,10 +4,16 @@ import pytest
 from ichor.hpc.active_learning.sampling.polus_wrapper import (
     DEFAULT_DESCRIPTORS,
     FPSResult,
+    _phase_b_refill_after_anti_overlap,
     _phase_b_target_size,
     fps_select,
 )
 from ichor.hpc.active_learning.config import CampaignConfig
+from ichor.core.atoms import Atom, Atoms
+
+
+def _h2(length):
+    return Atoms([Atom("H", 0.0, 0.0, 0.0), Atom("H", float(length), 0.0, 0.0)])
 
 
 def test_phase_b_target_size_is_fixed_final_batch_size():
@@ -32,6 +38,51 @@ def test_fps_select_picks_endpoints_first_on_line():
     assert out.indices[0] == 0
     assert out.indices[1] == 4
     assert out.indices[2] == 2
+
+
+def test_phase_b_refill_uses_safe_reserve_before_underfill():
+    frames = [_h2(1.0), _h2(2.0), _h2(3.0)]
+    records = [{"seed_index": i} for i in range(3)]
+
+    indices, considered, considered_records, report, refill = (
+        _phase_b_refill_after_anti_overlap(
+            ordered_indices=[0, 1, 2],
+            candidate_frames=frames,
+            candidate_records=records,
+            training=[_h2(1.0)],
+            min_separation=0.4,
+            target_size=2,
+        )
+    )
+
+    assert indices == [0, 1, 2]
+    assert [rec["seed_index"] for rec in considered_records] == [0, 1, 2]
+    assert len(considered) == 3
+    assert report.kept_indices == (1, 2)
+    assert report.dropped_indices == (0,)
+    assert refill["refill_applied"] is True
+    assert refill["reserve_exhausted"] is False
+    assert refill["rejected_by_anti_overlap"] == 1
+
+
+def test_phase_b_refill_reports_exhausted_reserve():
+    frames = [_h2(1.0), _h2(1.05)]
+    records = [{"seed_index": i} for i in range(2)]
+
+    _indices, _considered, _records, report, refill = (
+        _phase_b_refill_after_anti_overlap(
+            ordered_indices=[0, 1],
+            candidate_frames=frames,
+            candidate_records=records,
+            training=[_h2(1.0)],
+            min_separation=0.5,
+            target_size=1,
+        )
+    )
+
+    assert report.n_kept == 0
+    assert refill["reserve_exhausted"] is True
+    assert refill["rejected_by_anti_overlap"] == 2
 
 
 def test_fps_select_zero_returns_empty():

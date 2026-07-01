@@ -691,10 +691,12 @@ def _pause():
 class EditCampaignConfigFunctions:
     @staticmethod
     def show_current_config():
-        print("Dense/internal in-memory config snapshot")
+        print("Dense/internal diagnostic in-memory config snapshot")
         print(
-            "This includes internal and hidden fields. Normal sampling control is "
-            "sampling_protocol.sampling_aggressiveness."
+            "Diagnostic view only: this includes internal and hidden fields. "
+            "Normal sampling control is sampling_protocol.sampling_aggressiveness; "
+            "manual edits to derived lower-level fields may be rejected by the "
+            "config lock after ARIADNE outputs exist."
         )
         print("Loaded from: " + edit_campaign_config_menu_options.loaded_from)
         print("Selected campaign: " + edit_campaign_config_menu_options.selected_campaign)
@@ -744,10 +746,10 @@ class EditCampaignConfigFunctions:
             _pause()
             return
         print(
-            "Wrote dense/internal config snapshot to "
+            "Wrote dense/internal diagnostic config snapshot to "
             + str(target)
-            + ". This file includes hidden fields; normal sampling control is "
-            + "sampling_protocol.sampling_aggressiveness."
+            + ". Diagnostic view only: this file includes hidden fields; normal "
+            + "sampling control is sampling_protocol.sampling_aggressiveness."
         )
         _pause()
 
@@ -1842,7 +1844,7 @@ add_items_to_menu(
 
 edit_campaign_config_menu_items = [
     FunctionItem(
-        "Show dense/internal in-memory config",
+        "Show dense/internal diagnostic config",
         EditCampaignConfigFunctions.show_current_config,
     ),
     FunctionItem(
@@ -1891,7 +1893,7 @@ edit_campaign_config_menu_items = [
         EditCampaignConfigFunctions.discard_unsaved_changes,
     ),
     FunctionItem(
-        "Export dense/internal config snapshot",
+        "Export dense/internal diagnostic snapshot",
         EditCampaignConfigFunctions.export_dense_config_snapshot,
     ),
     FunctionItem("Save to disk", EditCampaignConfigFunctions.save_to_disk),
