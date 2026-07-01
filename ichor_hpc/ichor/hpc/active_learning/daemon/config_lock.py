@@ -174,22 +174,7 @@ ALWAYS_SAFE_RESOURCE_EXACT = {
 FUTURE_SAFE_PREFIXES = {
     "seed_selection.",
     "active_batch.",
-    "anti_overlap.",
-    "phase_b.",
-    "geometry_novelty.",
-    "adversarial_safety.",
-    "ariadne.",
-    "acquisition.subspace.",
-    "acquisition.barrier.",
-    "acquisition.stencils.",
-    "acquisition.weights.",
-    "acquisition.spectral.",
-    "acquisition.calibrated_energy.",
-    "acquisition.fullspace_confinement.",
-    "acquisition.size_normalisation.",
-    "acquisition.gradient.",
-    "acquisition.references.",
-    "acquisition.driver.",
+    "sampling_protocol.",
 }
 FUTURE_SAFE_EXACT = {
     "resources.defaults.partition",
@@ -213,45 +198,22 @@ FUTURE_SAFE_EXACT = {
     "resources.gaussian.memory_mode",
     "resources.gaussian.link0_mem",
     "resources.gaussian.memory_fraction_of_slurm",
-    "acquisition.use_scaled_posterior_covariance",
-    "acquisition.allow_uniform_posterior_fallback",
 }
 
 ARIADNE_OUTPUT_INTERPRETATION_PREFIXES = {
     "seed_selection.",
-    "geometry_novelty.",
-    "adversarial_safety.",
-    "ariadne.",
-    "acquisition.subspace.",
-    "acquisition.barrier.",
-    "acquisition.stencils.",
-    "acquisition.weights.",
-    "acquisition.spectral.",
-    "acquisition.calibrated_energy.",
-    "acquisition.fullspace_confinement.",
-    "acquisition.size_normalisation.",
-    "acquisition.gradient.",
-    "acquisition.references.",
-    "acquisition.driver.",
+    "sampling_protocol.",
 }
 ARIADNE_OUTPUT_INTERPRETATION_EXACT = {
-    "acquisition.use_scaled_posterior_covariance",
-    "acquisition.allow_uniform_posterior_fallback",
-    "quality_gates.ariadne_max_displacement_ang",
-    "quality_gates.ariadne_min_pair_distance_ang",
     "max_acquisition_grad_per_ang",
     "max_force_per_atom_ha_per_ang",
 }
 
 PHASE_B_OUTPUT_INTERPRETATION_PREFIXES = {
     "active_batch.",
-    "anti_overlap.",
-    "phase_b.",
-    "geometry_novelty.",
+    "sampling_protocol.",
 }
-PHASE_B_OUTPUT_INTERPRETATION_EXACT = {
-    "adversarial_safety.phase_b_filter_enabled",
-}
+PHASE_B_OUTPUT_INTERPRETATION_EXACT = set()
 
 PHASE_LOCAL_EXACT = {
     "ferebus.warmstart",

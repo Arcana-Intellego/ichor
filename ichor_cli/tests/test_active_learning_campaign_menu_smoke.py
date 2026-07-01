@@ -133,16 +133,12 @@ def test_edit_campaign_config_menu_items():
         "Edit FEREBUS resources",
         "Edit Gaussian block",
         "Edit active_batch",
+        "Edit sampling_protocol",
         "Edit seed_selection",
-        "Edit anti_overlap",
-        "Edit phase_b",
         "Edit split",
         "Edit FEREBUS block",
         "Edit robustness",
-        "Edit acquisition",
-        "Edit ARIADNE Block",
         "Edit stop",
-        "Edit adversarial_safety",
         "Edit error_calibration",
         "Edit quality_gates",
         "Edit runtime",
@@ -154,6 +150,15 @@ def test_edit_campaign_config_menu_items():
         "Save to disk",
     ):
         assert expected in texts, "missing item: " + expected
+    for hidden in (
+        "Edit anti_overlap",
+        "Edit phase_b",
+        "Edit geometry_novelty",
+        "Edit acquisition",
+        "Edit ARIADNE Block",
+        "Edit adversarial_safety",
+    ):
+        assert hidden not in texts, "low-level protocol menu still exposed: " + hidden
     assert "Edit acquisition.subspace" not in texts
     assert "Edit acquisition.weights" not in texts
     assert "Edit acquisition.gradient" not in texts
@@ -1269,11 +1274,8 @@ def test_top_three_roi_config_blocks_render_current_values():
     )
     cfg = CampaignConfig()
     cfg.seed_selection.strategy = "d_optimal"
+    cfg.sampling_protocol.sampling_aggressiveness = 7
     cfg.error_calibration.mode = "apply_to_acquisition"
-    cfg.acquisition.spectral.max_modes = 9
-    cfg.acquisition.calibrated_energy.band_low_ha = 0.001
-    cfg.acquisition.fullspace_confinement.lambda_residual = 0.75
-    cfg.geometry_novelty.fallback_scale_angstrom = 0.02
     menu._replace_campaign_config(cfg, loaded_from=None)
 
     seed_rendered = menu._BLOCK_MENUS_BY_LABEL["Edit seed_selection"].this_menu_options()
@@ -1281,37 +1283,16 @@ def test_top_three_roi_config_blocks_render_current_values():
     assert "seed_selection.d_optimal_pool_multiplier" in seed_rendered
     assert "seed_selection.d_optimal_score_power" in seed_rendered
 
+    protocol_rendered = menu._BLOCK_MENUS_BY_LABEL[
+        "Edit sampling_protocol"
+    ].this_menu_options()
+    assert "sampling_protocol.sampling_aggressiveness: 7" in protocol_rendered
+
     calibration_rendered = menu._BLOCK_MENUS_BY_LABEL[
         "Edit error_calibration"
     ].this_menu_options()
     assert "error_calibration.mode: apply_to_acquisition" in calibration_rendered
     assert "error_calibration.apply_strength" in calibration_rendered
-
-    spectral_rendered = menu._BLOCK_MENUS_BY_LABEL[
-        "Edit acquisition.spectral"
-    ].this_menu_options()
-    assert "acquisition.spectral.max_modes: 9" in spectral_rendered
-
-    energy_rendered = menu._BLOCK_MENUS_BY_LABEL[
-        "Edit acquisition.calibrated_energy"
-    ].this_menu_options()
-    assert "acquisition.calibrated_energy.band_low_ha: 0.001" in energy_rendered
-
-    fullspace_rendered = menu._BLOCK_MENUS_BY_LABEL[
-        "Edit acquisition.fullspace_confinement"
-    ].this_menu_options()
-    assert "acquisition.fullspace_confinement.lambda_residual: 0.75" in fullspace_rendered
-
-    phase_b_rendered = menu._BLOCK_MENUS_BY_LABEL["Edit phase_b"].this_menu_options()
-    assert "phase_b.descriptor: hybrid_alf_rmsd" in phase_b_rendered
-    assert "phase_b.beta: 0.5" in phase_b_rendered
-    assert "phase_b.min_separation_scaled" not in phase_b_rendered
-
-    novelty_rendered = menu._BLOCK_MENUS_BY_LABEL[
-        "Edit geometry_novelty"
-    ].this_menu_options()
-    assert "geometry_novelty.fallback_scale_angstrom: 0.02" in novelty_rendered
-    assert "geometry_novelty.scale_source: local_motion" in novelty_rendered
 
 
 def test_legacy_sequential_campaign_editors_are_neutralized():
@@ -1341,10 +1322,7 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
     cfg.seed_selection.strategy = "d_optimal"
     cfg.error_calibration.mode = "apply_to_acquisition"
     cfg.error_calibration.apply_strength = 0.5
-    cfg.acquisition.spectral.mode = "blend"
-    cfg.acquisition.calibrated_energy.utility = "banded"
-    cfg.acquisition.fullspace_confinement.enabled = True
-    cfg.acquisition.driver.enabled = True
+    cfg.sampling_protocol.sampling_aggressiveness = 6
     menu._replace_campaign_config(cfg, loaded_from=None)
     monkeypatch.setattr(menu, "_pause", lambda: None)
 
@@ -1352,37 +1330,23 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
 
     out = capsys.readouterr().out
     assert "Sampling protocol summary" in out
+    assert "sampling_protocol.sampling_aggressiveness: 6" in out
+    assert "sampling_protocol.geometry_scale_source: profile fallback preview" in out
+    assert "sampling_protocol.resolved_movement_band" in out
+    assert "sampling_protocol.resolved_phase_b" in out
+    assert "sampling_protocol.resolved_safety" in out
+    assert "sampling_protocol.resolved_quality_gates" in out
+    assert "sampling_protocol.resolved_acquisition_risk" in out
+    assert "sampling_protocol.resolved_ariadne" in out
     assert "seed_selection.strategy: d_optimal" in out
     assert "error_calibration.mode: apply_to_acquisition" in out
     assert "error_calibration.apply_strength: 0.5" in out
-    assert "acquisition.spectral.mode: blend" in out
-    assert "acquisition.calibrated_energy.utility: banded" in out
-    assert "acquisition.fullspace_confinement.enabled: True" in out
-    assert "acquisition.driver.enabled: True" in out
-    assert "acquisition.driver.objective: cheap_driver" in out
-    assert "acquisition.stencils.weak_mode_gating_enabled: True" in out
-    assert "acquisition.stencils.weak_mode_omega_band" in out
-    assert "acquisition.stencils.anharmonic_caps" in out
     assert "resources.aimall.effective_cpus_per_task: auto" in out
     assert "resources.effective_phase_walltimes" in out
     assert "FEREBUS=24h" in out
-    assert "geometry_novelty.enabled: True" in out
-    assert "geometry_novelty.protocol.phase_b_scale: 0.5" in out
-    assert "geometry_novelty.protocol.movement_band_fractions" in out
-    assert "geometry_novelty.protocol.movement_utility_softness_fractions" in out
-    assert "geometry_novelty.scale" in out
-    assert "geometry_novelty.resolved_source: configured_fallback" in out
-    assert "geometry_novelty.resolved_phase_b" in out
-    assert "geometry_novelty.resolved_movement_band" in out
-    assert "geometry_novelty.resolved_movement_utility" in out
-    assert "geometry_novelty.resolved_fullspace_confinement" in out
     assert "aimall.naat: auto" in out
     assert "aimall.boaq: auto" in out
     assert "aimall.iasmesh: fine" in out
-    assert "ariadne.trqn_backtransform_mode: geodesic" in out
-    assert "ariadne.trqn_geodesic_bt_mode: dense" in out
-    assert "ariadne.trqn_backtransform_numerics" in out
-    assert "max_iter=50" in out
 
 
 def test_daemon_control_sampling_protocol_summary_uses_saved_campaign(tmp_path, monkeypatch, capsys):
@@ -1400,8 +1364,7 @@ def test_daemon_control_sampling_protocol_summary_uses_saved_campaign(tmp_path, 
     cfg = CampaignConfig()
     cfg.seed_selection.strategy = "d_optimal"
     cfg.error_calibration.mode = "record_only"
-    cfg.acquisition.spectral.lambda_spectral = 2.5
-    cfg.acquisition.driver.enabled = True
+    cfg.sampling_protocol.sampling_aggressiveness = 8
     cfg.to_yaml(tmp_path / "campaign.yaml")
     set_selected_campaign_dir(tmp_path)
     monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: "")
@@ -1409,18 +1372,13 @@ def test_daemon_control_sampling_protocol_summary_uses_saved_campaign(tmp_path, 
     menu.DaemonControlFunctions.show_sampling_protocol_summary()
 
     out = capsys.readouterr().out
+    assert "sampling_protocol.sampling_aggressiveness: 8" in out
+    assert "sampling_protocol.resolved_phase_b" in out
+    assert "sampling_protocol.resolved_safety" in out
+    assert "sampling_protocol.resolved_ariadne" in out
+    assert "sampling_protocol.resolved_manifest_example" in out
     assert "seed_selection.strategy: d_optimal" in out
     assert "error_calibration.mode: record_only" in out
-    assert "acquisition.spectral.lambda_spectral: 2.5" in out
-    assert "acquisition.driver.enabled: True" in out
-    assert "acquisition.stencils.weak_mode_gating_enabled: True" in out
-    assert "geometry_novelty.protocol.phase_b_scale: 0.5" in out
-    assert "geometry_novelty.latest_sidecar: not written yet" in out
-    assert "geometry_novelty.resolved_source: configured_fallback" in out
-    assert "geometry_novelty.resolved_phase_b" in out
-    assert "ariadne.trqn_backtransform_mode: geodesic" in out
-    assert "ariadne.trqn_geodesic_bt_mode: dense" in out
-    assert "ariadne.trqn_backtransform_numerics" in out
 
 
 def test_campaign_config_menu_covers_every_config_leaf():

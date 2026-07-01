@@ -290,25 +290,140 @@ def format_sampling_protocol_summary(
 ) -> str:
     seed = config.seed_selection
     calib = config.error_calibration
-    acq = config.acquisition
     resources = config.resources
     gaussian = config.gaussian
     aimall = config.aimall
-    ariadne = config.ariadne
-    spectral = acq.spectral
-    energy = acq.calibrated_energy
-    fullspace = acq.fullspace_confinement
-    size_norm = acq.size_normalisation
-    driver = acq.driver
-    stencils = acq.stencils
-    safety = config.adversarial_safety
-    gates = config.quality_gates
-    phase_b = config.phase_b
-    novelty = config.geometry_novelty
-    anti = config.anti_overlap
     runtime = config.runtime
+    geometry_payload = None
+    geometry_source = "profile fallback preview"
+    sampling_protocol_resolved_path = None
+    if campaign_dir is not None:
+        geometry_payload, geometry_source = _latest_geometry_novelty_payload(
+            Path(campaign_dir)
+        )
+    try:
+        from ichor.hpc.active_learning.sampling_protocol import (
+            preview_sampling_protocol,
+            sampling_protocol_resolved_path,
+        )
+
+        resolved = preview_sampling_protocol(
+            config,
+            geometry_scale_payload=geometry_payload,
+        )
+        resolved_error = None
+    except Exception as exc:
+        resolved = None
+        resolved_error = type(exc).__name__ + ": " + str(exc)
 
     lines = ["Sampling protocol summary:\n"]
+    lines.append(
+        _line(
+            "sampling_protocol.sampling_aggressiveness",
+            config.sampling_protocol.sampling_aggressiveness,
+        )
+    )
+    if resolved is None:
+        lines.append(_line("sampling_protocol.resolution", "unavailable (" + str(resolved_error) + ")"))
+    else:
+        phase_b = dict(resolved.phase_b or {})
+        safety = resolved.adversarial_safety
+        gates = resolved.quality_gates
+        acq_cfg = resolved.acquisition_config
+        ariadne_run = resolved.ariadne_run_config
+        movement = acq_cfg.movement_band
+        scale = resolved.resolved_geometry_scale_angstrom
+        movement_text = "unavailable"
+        if scale is not None:
+            movement_text = (
+                "scale="
+                + str(scale)
+                + ", min/peak/max="
+                + str(float(movement.hard_min_fraction) * float(scale))
+                + "/"
+                + str(float(movement.target_peak_fraction) * float(scale))
+                + "/"
+                + str(float(movement.hard_max_fraction) * float(scale))
+            )
+        lines.append(_line("sampling_protocol.geometry_scale_source", geometry_source))
+        lines.append(_line("sampling_protocol.resolved_geometry_scale_angstrom", scale))
+        lines.append(_line("sampling_protocol.resolved_movement_band", movement_text))
+        lines.append(
+            _line(
+                "sampling_protocol.resolved_phase_b",
+                "descriptor="
+                + str(phase_b.get("descriptor"))
+                + ", beta="
+                + str(phase_b.get("beta"))
+                + ", min_separation_angstrom="
+                + str(phase_b.get("effective_min_separation_angstrom"))
+                + ", coefficient="
+                + str(phase_b.get("min_separation_scaled")),
+            )
+        )
+        lines.append(
+            _line(
+                "sampling_protocol.resolved_safety",
+                "max_whitened_distance="
+                + str(safety.max_whitened_distance)
+                + ", backtrack_points="
+                + str(safety.backtrack_points)
+                + ", reject_unsafe="
+                + str(safety.reject_unsafe_landings)
+                + ", movement_band="
+                + str(safety.enforce_movement_band),
+            )
+        )
+        lines.append(
+            _line(
+                "sampling_protocol.resolved_quality_gates",
+                "max_displacement_ang="
+                + str(gates.ariadne_max_displacement_ang)
+                + ", min_pair_distance_policy=global_hard_floor("
+                + str(gates.ariadne_min_pair_distance_ang)
+                + " Angstrom)",
+            )
+        )
+        lines.append(
+            _line(
+                "sampling_protocol.resolved_acquisition_risk",
+                "lambda_distance="
+                + str(acq_cfg.weights.lambda_distance)
+                + ", lambda_residual="
+                + str(acq_cfg.fullspace_confinement.lambda_residual)
+                + ", lambda_rmsd="
+                + str(acq_cfg.fullspace_confinement.lambda_rmsd),
+            )
+        )
+        lines.append(
+            _line(
+                "sampling_protocol.resolved_ariadne",
+                "delta0="
+                + str(ariadne_run.delta0)
+                + ", delta_max="
+                + str(ariadne_run.delta_max)
+                + ", target_rms="
+                + str(ariadne_run.trqn_target_initial_grad_rms)
+                + ", under_move_target_rms="
+                + str(ariadne_run.trqn_under_move_target_initial_grad_rms),
+            )
+        )
+        lines.append(
+            _line(
+                "sampling_protocol.hidden_overrides_detected",
+                len(resolved.hidden_overrides_detected),
+            )
+        )
+    if campaign_dir is not None:
+        try:
+            manifest_path = sampling_protocol_resolved_path(
+                Path(campaign_dir)
+                / "7_ACTIVE_LEARNING"
+                / "iteration-0000"
+            )
+            lines.append(_line("sampling_protocol.resolved_manifest_example", manifest_path))
+        except Exception:
+            pass
     lines.append(
         _line(
             "bootstrap.initial_labelled_size",
@@ -356,182 +471,6 @@ def format_sampling_protocol_summary(
     )
     lines.append(_line("error_calibration.monotone_estimator", calib.monotone_estimator))
     lines.append(_line("error_calibration.quantile", calib.quantile))
-    lines.append(_line("acquisition.property_name", acq.property_name))
-    lines.append(_line("acquisition.spectral.enabled", spectral.enabled))
-    lines.append(_line("acquisition.spectral.mode", spectral.mode))
-    lines.append(_line("acquisition.spectral.mode_weighting", spectral.mode_weighting))
-    lines.append(_line("acquisition.spectral.lambda_spectral", spectral.lambda_spectral))
-    lines.append(_line("acquisition.calibrated_energy.utility", energy.utility))
-    lines.append(_line("acquisition.calibrated_energy.band_low_ha", energy.band_low_ha))
-    lines.append(
-        _line("acquisition.calibrated_energy.band_high_ha", energy.band_high_ha)
-    )
-    lines.append(
-        _line(
-            "acquisition.calibrated_energy.fallback_to_raw_variance",
-            energy.fallback_to_raw_variance,
-        )
-    )
-    lines.append(_line("acquisition.fullspace_confinement.enabled", fullspace.enabled))
-    lines.append(
-        _line(
-            "acquisition.fullspace_confinement.lambda_residual",
-            fullspace.lambda_residual,
-        )
-    )
-    lines.append(
-        _line("acquisition.fullspace_confinement.lambda_rmsd", fullspace.lambda_rmsd)
-    )
-    lines.append(
-        _line(
-            "acquisition.fullspace_confinement.public_fields",
-            "enabled/lambda_residual/lambda_rmsd; scale and failure policy are protocol constants",
-        )
-    )
-    lines.append(_line("acquisition.size_normalisation.enabled", size_norm.enabled))
-    lines.append(
-        _line(
-            "acquisition.size_normalisation",
-            "energy="
-            + str(size_norm.energy_mode)
-            + ", whitened="
-            + str(size_norm.whitened_distance_mode)
-            + ", chemistry="
-            + str(size_norm.chemistry_barrier_mode),
-        )
-    )
-    lines.append(_line("geometry_novelty.protocol.movement_band", "internal"))
-    lines.append(_line("geometry_novelty.protocol.movement_utility", "internal"))
-    lines.append(_line("acquisition.driver.enabled", driver.enabled))
-    lines.append(_line("acquisition.driver.objective", driver.objective))
-    lines.append(_line("acquisition.driver.gradient_backend", driver.gradient_backend))
-    lines.append(_line("acquisition.driver.include_stencils", driver.include_stencils))
-    lines.append(
-        _line(
-            "acquisition.driver.analytic_terms",
-            "movement="
-            + str(driver.analytic_movement)
-            + ", distance="
-            + str(driver.analytic_whitened_distance)
-            + ", pair_barriers="
-            + str(driver.analytic_pair_barriers)
-            + ", fullspace="
-            + str(driver.analytic_fullspace_rmsd)
-            + ", fd_energy="
-            + str(driver.finite_difference_energy),
-        )
-    )
-    lines.append(
-        _line(
-            "acquisition.driver.weights",
-            "energy="
-            + str(driver.lambda_energy)
-            + ", movement="
-            + str(driver.lambda_movement)
-            + ", distance="
-            + str(driver.lambda_distance)
-            + ", fullspace="
-            + str(driver.lambda_fullspace)
-            + ", chemistry="
-            + str(driver.lambda_chemistry),
-        )
-    )
-    lines.append(
-        _line(
-            "acquisition.stencils.negative_curvature_policy",
-            stencils.negative_curvature_policy,
-        )
-    )
-    lines.append(
-        _line(
-            "acquisition.stencils.lambda_negative_curvature",
-            stencils.lambda_negative_curvature,
-        )
-    )
-    lines.append(
-        _line(
-            "acquisition.stencils.weak_mode_gating_enabled",
-            stencils.weak_mode_gating_enabled,
-        )
-    )
-    lines.append(
-        _line(
-            "acquisition.stencils.weak_mode_omega_band",
-            "low_fraction="
-            + str(stencils.weak_mode_omega_low_fraction)
-            + ", high_fraction="
-            + str(stencils.weak_mode_omega_high_fraction)
-            + ", abs_floor="
-            + str(stencils.weak_mode_abs_omega_floor),
-        )
-    )
-    lines.append(
-        _line(
-            "acquisition.stencils.weak_mode_penalty",
-            stencils.weak_mode_penalty,
-        )
-    )
-    lines.append(
-        _line(
-            "acquisition.stencils.anharmonic_caps",
-            "per_mode="
-            + str(stencils.max_anharmonic_mode_score)
-            + ", total="
-            + str(stencils.max_anharmonic_total_score),
-        )
-    )
-    lines.append(_line("ariadne.optimiser", ariadne.optimiser))
-    lines.append(_line("ariadne.hessian_model", ariadne.hessian_model))
-    lines.append(_line("ariadne.fallback_to_ds", ariadne.fallback_to_ds))
-    lines.append(
-        _line(
-            "ariadne.trqn_objective_scaling",
-            "mode="
-            + str(ariadne.trqn_scale_mode)
-            + ", target="
-            + str(ariadne.trqn_target_initial_grad_norm)
-            + ", target_rms="
-            + str(ariadne.trqn_target_initial_grad_rms)
-            + ", retry_target="
-            + str(ariadne.trqn_retry_target_initial_grad_norm)
-            + ", retry_target_rms="
-            + str(ariadne.trqn_retry_target_initial_grad_rms)
-            + ", under_move_target_rms="
-            + str(ariadne.trqn_under_move_target_initial_grad_rms)
-            + ", scale=["
-            + str(ariadne.trqn_min_objective_scale)
-            + ", "
-            + str(ariadne.trqn_max_objective_scale)
-            + "]",
-        )
-    )
-    lines.append(
-        _line(
-            "ariadne.trqn_retry_on_no_proposal",
-            ariadne.trqn_retry_on_no_proposal,
-        )
-    )
-    lines.append(
-        _line("ariadne.trqn_backtransform_mode", ariadne.trqn_backtransform_mode)
-    )
-    lines.append(
-        _line("ariadne.trqn_geodesic_bt_mode", ariadne.trqn_geodesic_bt_mode)
-    )
-    lines.append(
-        _line(
-            "ariadne.trqn_backtransform_numerics",
-            "dt="
-            + str(ariadne.trqn_geodesic_dt)
-            + ", tol="
-            + str(ariadne.trqn_geodesic_tol)
-            + ", ic_tol="
-            + str(ariadne.trqn_bt_ic_tol)
-            + ", max_iter="
-            + str(ariadne.trqn_max_backtransform_iter)
-            + ", trust_min="
-            + str(ariadne.trqn_trust_min),
-        )
-    )
     lines.append(_line("resources.defaults.partition", resources.defaults.partition))
     lines.append(_line("resources.defaults.walltime_hours", resources.defaults.walltime_hours))
     lines.append(_line("resources.defaults.cpus_per_task", resources.defaults.cpus_per_task))
@@ -590,65 +529,6 @@ def format_sampling_protocol_summary(
         _line(
             "runtime.halt_on_tick_exception",
             runtime.halt_on_tick_exception,
-        )
-    )
-    lines.append(_line("adversarial_safety.enabled", safety.enabled))
-    lines.append(
-        _line("adversarial_safety.reject_unsafe_landings", safety.reject_unsafe_landings)
-    )
-    lines.append(
-        _line(
-            "adversarial_safety.accept_legacy_missing_landing_safety",
-            safety.accept_legacy_missing_landing_safety,
-        )
-    )
-    lines.append(
-        _line("adversarial_safety.max_whitened_distance", safety.max_whitened_distance)
-    )
-    lines.append(_line("adversarial_safety.enforce_movement_band", safety.enforce_movement_band))
-    lines.append(_line("adversarial_safety.under_move_retry", safety.under_move_retry))
-    lines.append(_line("adversarial_safety.reject_over_moved", safety.reject_over_moved))
-    lines.append(
-        _line(
-            "quality_gates.ariadne_max_displacement_ang",
-            gates.ariadne_max_displacement_ang,
-        )
-    )
-    lines.append(
-        _line(
-            "quality_gates.ariadne_min_pair_distance_ang",
-            gates.ariadne_min_pair_distance_ang,
-        )
-    )
-    lines.append(_line("phase_b.descriptor", phase_b.descriptor))
-    lines.append(_line("geometry_novelty.enabled", novelty.enabled))
-    lines.append(
-        _line(
-            "geometry_novelty.scale",
-            "source="
-            + str(novelty.scale_source)
-            + ", statistic="
-            + str(novelty.statistic)
-            + ", fallback_scale_angstrom="
-            + str(novelty.fallback_scale_angstrom)
-            + ", floor="
-            + str(novelty.scale_floor_angstrom),
-        )
-    )
-    if campaign_dir is not None:
-        lines.append(
-            _line(
-                "geometry_novelty.latest_sidecar",
-                _latest_geometry_novelty_scale_summary(Path(campaign_dir)),
-            )
-        )
-    lines.extend(_geometry_novelty_resolved_lines(config, campaign_dir))
-    lines.append(
-        _line(
-            "anti_overlap.post_ariadne_whitened_distance",
-            str(anti.min_post_ariadne_whitened_distance)
-            + " .. "
-            + str(anti.max_post_ariadne_whitened_distance),
         )
     )
     return "".join(lines)

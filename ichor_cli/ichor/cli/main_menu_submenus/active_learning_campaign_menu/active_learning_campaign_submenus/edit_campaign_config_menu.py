@@ -1428,6 +1428,20 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("active_batch.final_batch_size", "int"),
         ],
     ),
+    "Edit sampling_protocol": _make_block_menu(
+        "Edit sampling_protocol",
+        "High-level adversarial sampling aggressiveness.",
+        [
+            _spec(
+                "sampling_protocol.sampling_aggressiveness",
+                "int",
+                prompt=(
+                    "sampling_protocol.sampling_aggressiveness "
+                    "(1 conservative, 5 balanced, 10 exploratory): "
+                ),
+            ),
+        ],
+    ),
     "Edit seed_selection": _make_block_menu(
         "Edit seed_selection",
         "Seed count and uncertainty-evaluation controls.",
@@ -1844,28 +1858,15 @@ edit_campaign_config_menu_items = [
     _block_submenu_item("Edit Gaussian block"),
     _block_submenu_item("Edit AIMAll block"),
     _block_submenu_item("Edit active_batch"),
+    _block_submenu_item("Edit sampling_protocol"),
     _block_submenu_item("Edit seed_selection"),
-    _block_submenu_item("Edit anti_overlap"),
-    _block_submenu_item("Edit phase_b"),
-    _block_submenu_item("Edit geometry_novelty"),
     _block_submenu_item("Edit split"),
     _block_submenu_item("Edit FEREBUS block"),
     _block_submenu_item("Edit robustness"),
-    SubmenuItem(
-        "Edit acquisition",
-        edit_acquisition_config_menu,
-        edit_campaign_config_menu,
-    ),
     _block_submenu_item("Edit stop"),
-    _block_submenu_item("Edit adversarial_safety"),
     _block_submenu_item("Edit error_calibration"),
     _block_submenu_item("Edit quality_gates"),
     _block_submenu_item("Edit runtime"),
-    SubmenuItem(
-        EDIT_ARIADNE_BLOCK_MENU_DESCRIPTION.title,
-        edit_ariadne_block_menu,
-        edit_campaign_config_menu,
-    ),
     FunctionItem(
         "Show unsaved changes",
         EditCampaignConfigFunctions.show_unsaved_changes,

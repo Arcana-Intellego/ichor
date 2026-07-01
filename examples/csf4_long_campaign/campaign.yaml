@@ -15,16 +15,16 @@ seed_selection:
   n_seeds_per_iteration: 16
   bulk_fraction: 0.2
 
+sampling_protocol:
+  # 1 conservative, 5 balanced/current default, 10 exploratory within hard safety gates.
+  sampling_aggressiveness: 5
+
 resources:
   defaults:
     partition: multicore
   gaussian:
     memory_mode: slurm_env
   array_concurrency_limit: 8
-
-adversarial_safety:
-  accept_legacy_missing_landing_safety: false
-  allow_seed_fallback: false
 
 error_calibration:
   mode: record_only

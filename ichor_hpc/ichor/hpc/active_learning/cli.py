@@ -1251,6 +1251,7 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "daemon_lease_stale_recovered": "stale daemon lease recovered",
     "daemon_lease_cleanup_failed": "daemon lease cleanup failed",
     "geometry_novelty_scale_precomputed": "novelty scale computed",
+    "sampling_protocol_resolved": "sampling protocol resolved",
     "phase_b_novelty_threshold_relaxed": "Phase B novelty relaxed",
     "pool_feasibility_checked": "pool feasibility checked",
     "seed_posterior_fallback": "seed posterior fallback",

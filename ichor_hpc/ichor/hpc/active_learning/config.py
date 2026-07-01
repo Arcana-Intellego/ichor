@@ -46,6 +46,7 @@ __all__ = [
     "TrajectoryPoolConfigBlock",
     "BootstrapConfigBlock",
     "ActiveBatchConfigBlock",
+    "SamplingProtocolConfigBlock",
     "SeedSelectionConfigBlock",
     "AntiOverlapConfigBlock",
     "PhaseBConfigBlock",
@@ -461,6 +462,11 @@ class BootstrapConfigBlock:
 @dataclass
 class ActiveBatchConfigBlock:
     final_batch_size: int = 4
+
+
+@dataclass
+class SamplingProtocolConfigBlock:
+    sampling_aggressiveness: int = 5
 
 
 @dataclass
@@ -996,6 +1002,9 @@ class CampaignConfig:
     active_batch: ActiveBatchConfigBlock = field(
         default_factory=ActiveBatchConfigBlock
     )
+    sampling_protocol: SamplingProtocolConfigBlock = field(
+        default_factory=SamplingProtocolConfigBlock
+    )
     seed_selection: SeedSelectionConfigBlock = field(
         default_factory=SeedSelectionConfigBlock
     )
@@ -1212,6 +1221,14 @@ class CampaignConfig:
         if self.active_batch.final_batch_size <= 0:
             raise ConfigValidationError(
                 "active_batch.final_batch_size must be > 0"
+            )
+        if not isinstance(self.sampling_protocol.sampling_aggressiveness, int):
+            raise ConfigValidationError(
+                "sampling_protocol.sampling_aggressiveness must be an integer in [1, 10]"
+            )
+        if not 1 <= self.sampling_protocol.sampling_aggressiveness <= 10:
+            raise ConfigValidationError(
+                "sampling_protocol.sampling_aggressiveness must be in [1, 10]"
             )
         if self.seed_selection.n_seeds_per_iteration <= 0:
             raise ConfigValidationError(

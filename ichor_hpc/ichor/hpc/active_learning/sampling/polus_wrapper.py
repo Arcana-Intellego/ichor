@@ -461,8 +461,6 @@ def _run_phase_b(args, campaign, config):
     from ..daemon.state import atomic_write_json
     from ..geometry_novelty import (
         EXACT_DUPLICATE_EPSILON_ANGSTROM,
-        effective_phase_b_min_separation,
-        ensure_geometry_novelty_scale,
         novelty_score,
         scaled_distances,
     )
@@ -478,6 +476,27 @@ def _run_phase_b(args, campaign, config):
         campaign / "7_ACTIVE_LEARNING"
         / ("iteration-" + str(int(args.iteration)).zfill(4))
     )
+    try:
+        from ..sampling_protocol import (
+            phase_b_min_separation_from_resolved,
+            resolve_sampling_protocol,
+        )
+
+        resolved_protocol = resolve_sampling_protocol(
+            campaign,
+            config,
+            iteration=int(args.iteration),
+        )
+        effective_config = resolved_protocol.effective_config
+    except Exception as exc:
+        print(
+            "Phase B sampling protocol resolution failed: "
+            + type(exc).__name__
+            + ": "
+            + str(exc),
+            file=_sys.stderr,
+        )
+        return 3
     manifest_path = ariadne_results_path(iter_dir)
     if not manifest_path.is_file():
         print(
@@ -488,7 +507,7 @@ def _run_phase_b(args, campaign, config):
 
     accept_legacy_missing_landing_safety = bool(
         getattr(
-            getattr(config, "adversarial_safety", None),
+            getattr(effective_config, "adversarial_safety", None),
             "accept_legacy_missing_landing_safety",
             False,
         )
@@ -521,7 +540,7 @@ def _run_phase_b(args, campaign, config):
         "n_dropped": 0,
         "dropped": [],
     }
-    if bool(getattr(config.adversarial_safety, "phase_b_filter_enabled", True)):
+    if bool(getattr(effective_config.adversarial_safety, "phase_b_filter_enabled", True)):
         try:
             candidate_frames, candidate_records, safety_filter = (
                 _phase_b_landing_safety_filter(
@@ -547,13 +566,13 @@ def _run_phase_b(args, campaign, config):
             return 3
 
     posterior = None
-    if config.phase_b.descriptor == "acquisition_weighted":
+    if effective_config.phase_b.descriptor == "acquisition_weighted":
         try:
-            posterior = _build_phase_b_posterior(campaign, config)
+            posterior = _build_phase_b_posterior(campaign, effective_config)
         except Exception as exc:
             print(
                 "acquisition_weighted descriptor could not load posterior for property "
-                + repr(config.acquisition.property_name)
+                + repr(effective_config.acquisition.property_name)
                 + ": "
                 + type(exc).__name__
                 + ": "
@@ -561,7 +580,7 @@ def _run_phase_b(args, campaign, config):
                 file=_sys.stderr,
             )
             return 3
-    descriptor = build_descriptor_from_config(config, posterior=posterior)
+    descriptor = build_descriptor_from_config(effective_config, posterior=posterior)
     try:
         matrix = descriptor.pairwise_distance_matrix(candidate_frames)
     except Exception as exc:
@@ -575,7 +594,7 @@ def _run_phase_b(args, campaign, config):
         return 3
     try:
         n_select = _phase_b_target_size(
-            config,
+            effective_config,
             len(candidate_frames),
             int(args.iteration),
         )
@@ -590,26 +609,10 @@ def _run_phase_b(args, campaign, config):
     raw_path = iter_dir / "phase_b_SAMPLE_raw.xyz"
     _write_xyz_file(selected_frames, raw_path)
 
-    geometry_scale_payload = None
-    try:
-        geometry_scale_payload = ensure_geometry_novelty_scale(
-            campaign,
-            config,
-            iteration=int(args.iteration),
-        )
-        min_sep, threshold_mode = effective_phase_b_min_separation(
-            config,
-            geometry_scale_payload,
-        )
-    except Exception as exc:
-        print(
-            "Phase B geometry novelty scale failed: "
-            + type(exc).__name__
-            + ": "
-            + str(exc),
-            file=_sys.stderr,
-        )
-        return 3
+    geometry_scale_payload = dict(resolved_protocol.geometry_scale_payload)
+    min_sep, threshold_mode = phase_b_min_separation_from_resolved(
+        resolved_protocol
+    )
 
     # anti-overlap case (d): drop any selected candidate that lands too
     # close to an existing training point. In scaled mode the configured
@@ -698,6 +701,18 @@ def _run_phase_b(args, campaign, config):
         "scaled_distances_to_nearest": list(scaled_nearest),
         "novelty_scores": list(novelty_scores),
         "geometry_novelty_scale": geometry_scale_payload,
+        "sampling_protocol": {
+            "sampling_aggressiveness": int(
+                resolved_protocol.sampling_aggressiveness
+            ),
+            "resolved_manifest": (
+                None if resolved_protocol.manifest_path is None
+                else str(resolved_protocol.manifest_path.resolve())
+            ),
+            "hidden_overrides_detected": list(
+                resolved_protocol.hidden_overrides_detected
+            ),
+        },
         "relaxation": relaxation,
         "n_kept": report.n_kept,
         "n_dropped": report.n_dropped,

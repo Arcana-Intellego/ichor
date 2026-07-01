@@ -2032,19 +2032,17 @@ def main(argv=None) -> int:
             return 3
 
     try:
-        from ..geometry_novelty import (
-            apply_geometry_novelty_to_acquisition_config,
-            ensure_geometry_novelty_scale,
-        )
+        from ..sampling_protocol import resolve_sampling_protocol
 
-        geometry_scale_payload = ensure_geometry_novelty_scale(
+        resolved_protocol = resolve_sampling_protocol(
             campaign,
             config,
             iteration=int(args.iteration),
         )
+        geometry_scale_payload = dict(resolved_protocol.geometry_scale_payload)
     except Exception as exc:
         print(
-            "geometry novelty scale invalid for ARIADNE: "
+            "sampling protocol resolution failed for ARIADNE: "
             + type(exc).__name__
             + ": "
             + str(exc),
@@ -2052,12 +2050,8 @@ def main(argv=None) -> int:
         )
         return 3
 
-    acquisition_config = apply_geometry_novelty_to_acquisition_config(
-        config.to_acquisition_config(),
-        config,
-        geometry_scale_payload,
-    )
-    ariadne_run_config = config.to_ariadne_run_config()
+    acquisition_config = resolved_protocol.acquisition_config
+    ariadne_run_config = resolved_protocol.ariadne_run_config
     error_calibration_model = None
     error_calibration_reason = "disabled"
     try:
@@ -2094,8 +2088,8 @@ def main(argv=None) -> int:
             error_calibration_apply_strength=error_calibration_strength,
             max_acquisition_grad_per_ang=config.effective_max_acquisition_grad_per_ang(),
             gradient_backend=str(config.resources.gradient_parallel_backend),
-            safety_config=getattr(config, "adversarial_safety", None),
-            quality_gates=getattr(config, "quality_gates", None),
+            safety_config=resolved_protocol.adversarial_safety,
+            quality_gates=resolved_protocol.quality_gates,
             trace_path=trace_path,
         )
     except Exception as exc:
@@ -2119,12 +2113,20 @@ def main(argv=None) -> int:
     payload["iteration"] = int(args.iteration)
     payload["trajectory_sha256"] = str(pool.sha256)
     payload["geometry_novelty_scale"] = dict(geometry_scale_payload)
+    payload["sampling_protocol"] = {
+        "sampling_aggressiveness": int(resolved_protocol.sampling_aggressiveness),
+        "resolved_manifest": (
+            None if resolved_protocol.manifest_path is None
+            else str(resolved_protocol.manifest_path.resolve())
+        ),
+        "hidden_overrides_detected": list(resolved_protocol.hidden_overrides_detected),
+    }
     allow_seed_fallback = bool(
-        getattr(getattr(config, "adversarial_safety", None), "allow_seed_fallback", False)
+        getattr(resolved_protocol.adversarial_safety, "allow_seed_fallback", False)
     )
     accept_legacy_missing_landing_safety = bool(
         getattr(
-            getattr(config, "adversarial_safety", None),
+            resolved_protocol.adversarial_safety,
             "accept_legacy_missing_landing_safety",
             False,
         )

@@ -142,6 +142,7 @@ KNOWN_EVENT_TYPES = (
     "ariadne_task_salvaged_from_nonzero_exit",
     "ferebus_quality_summary",
     "geometry_novelty_scale_precomputed",
+    "sampling_protocol_resolved",
     "initial_training_existing_without_bootstrap_handoff",
     "phase_b_novelty_threshold_relaxed",
     "pool_feasibility_checked",

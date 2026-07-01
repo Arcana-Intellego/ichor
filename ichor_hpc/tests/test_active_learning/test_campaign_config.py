@@ -54,6 +54,7 @@ def test_default_campaign_config_is_valid():
     assert c.seed_selection.d_optimal_jitter == 1.0e-12
     assert c.seed_selection.d_optimal_novelty_floor == 1.0e-12
     assert c.seed_selection.d_optimal_score_power == 1.0
+    assert c.sampling_protocol.sampling_aggressiveness == 5
     assert c.geometry_novelty.enabled is True
     assert c.geometry_novelty.scale_source == "local_motion"
     assert c.geometry_novelty.statistic == "median"
@@ -559,6 +560,14 @@ def test_invalid_descriptor_rejected():
     payload = CampaignConfig().to_dict()
     payload["phase_b"]["descriptor"] = "not_a_real_descriptor"
     with pytest.raises(ConfigValidationError):
+        CampaignConfig.from_dict(payload)
+
+
+@pytest.mark.parametrize("value", [0, 11, "5"])
+def test_sampling_aggressiveness_must_be_in_public_range(value):
+    payload = CampaignConfig().to_dict()
+    payload["sampling_protocol"]["sampling_aggressiveness"] = value
+    with pytest.raises(ConfigValidationError, match="sampling_protocol.sampling_aggressiveness"):
         CampaignConfig.from_dict(payload)
 
 

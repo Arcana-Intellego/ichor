@@ -23,6 +23,10 @@ seed_selection:
   n_seeds_per_iteration: 2
   bulk_fraction: 0.5
 
+sampling_protocol:
+  # Keep the walkthrough close to the balanced production default.
+  sampling_aggressiveness: 5
+
 resources:
   defaults:
     partition: multicore

@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import json
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -894,10 +894,8 @@ class DryRunPhaseExecutor:
             AriadneRunConfig,
             optimise_seed,
         )
-        from ..geometry_novelty import (
-            ensure_geometry_novelty_scale,
-            geometry_novelty_scale_path,
-        )
+        from ..geometry_novelty import geometry_novelty_scale_path
+        from ..sampling_protocol import resolve_sampling_protocol
         from ichor.core.atoms import Atom, Atoms as IchorAtoms
         from ..handoff_manifests import (
             ARIADNE_RESULTS_SCHEMA_VERSION,
@@ -945,12 +943,15 @@ class DryRunPhaseExecutor:
         accepted_records = []
         landing_audit_records = []
         flagged_count = 0
-        geometry_scale_payload = ensure_geometry_novelty_scale(
+        resolved_protocol = resolve_sampling_protocol(
             self.campaign_dir,
             self.config,
             iteration=int(state.iteration),
         )
+        geometry_scale_payload = dict(resolved_protocol.geometry_scale_payload)
         self.artefact_log.append(str(geometry_novelty_scale_path(iter_dir)))
+        if resolved_protocol.manifest_path is not None:
+            self.artefact_log.append(str(resolved_protocol.manifest_path))
         for k in range(n_seeds):
             seed_record = seed_records[k]
             seed_frame_id = (
@@ -964,7 +965,10 @@ class DryRunPhaseExecutor:
                 models=None,
                 seed=synthetic_seed,
                 trajectory=[synthetic_seed],
-                run_config=AriadneRunConfig(rng_seed=self.rng_seed + k),
+                run_config=replace(
+                    resolved_protocol.ariadne_run_config,
+                    rng_seed=self.rng_seed + k,
+                ),
                 mock=True,
             )
             result_payload = result.to_dict()
@@ -973,6 +977,18 @@ class DryRunPhaseExecutor:
             result_payload["iteration"] = int(state.iteration)
             result_payload["trajectory_sha256"] = str(picked_payload.get("trajectory_sha256", traj_sha))
             result_payload["geometry_novelty_scale"] = dict(geometry_scale_payload)
+            result_payload["sampling_protocol"] = {
+                "sampling_aggressiveness": int(
+                    resolved_protocol.sampling_aggressiveness
+                ),
+                "resolved_manifest": (
+                    None if resolved_protocol.manifest_path is None
+                    else str(resolved_protocol.manifest_path.resolve())
+                ),
+                "hidden_overrides_detected": list(
+                    resolved_protocol.hidden_overrides_detected
+                ),
+            }
             if isinstance(result_payload.get("selection_diagnostics"), dict):
                 result_payload["selection_diagnostics"]["model_version"] = int(
                     getattr(state, "models_version", -1)
@@ -1141,10 +1157,10 @@ class DryRunPhaseExecutor:
         }
 
     def _post_phase_b_polus(self, state) -> Dict[str, Any]:
-        from ..geometry_novelty import (
-            effective_phase_b_min_separation,
-            ensure_geometry_novelty_scale,
-            geometry_novelty_scale_path,
+        from ..geometry_novelty import geometry_novelty_scale_path
+        from ..sampling_protocol import (
+            phase_b_min_separation_from_resolved,
+            resolve_sampling_protocol,
         )
         from ..handoff_manifests import (
             PHASE_B_SELECTION_SCHEMA_VERSION,
@@ -1156,7 +1172,7 @@ class DryRunPhaseExecutor:
         out = iter_dir / "phase_b_SAMPLE.xyz"
         out.write_text(
             "# DRYRUN POLUS Phase-B sample (iteration " + str(state.iteration) + ")\n"
-            + "# descriptor=" + self.config.phase_b.descriptor + "\n",
+            + "# descriptor=hybrid_alf_rmsd\n",
             encoding="utf-8",
         )
         self.artefact_log.append(str(out))
@@ -1219,7 +1235,7 @@ class DryRunPhaseExecutor:
                     seed_dir,
                     selected_after_fps=True,
                     diversity_rank=rank,
-                    descriptor_used=self.config.phase_b.descriptor,
+                    descriptor_used="hybrid_alf_rmsd",
                 )
         for final_index, rec in enumerate(accepted):
             out_rec = dict(rec)
@@ -1228,17 +1244,19 @@ class DryRunPhaseExecutor:
             out_rec["kept_after_dedup"] = True
             out_rec["drop_reason"] = None
             final_records.append(out_rec)
-        geometry_scale_payload = ensure_geometry_novelty_scale(
+        resolved_protocol = resolve_sampling_protocol(
             self.campaign_dir,
             self.config,
             iteration=int(state.iteration),
         )
+        geometry_scale_payload = dict(resolved_protocol.geometry_scale_payload)
         self.artefact_log.append(
             str(geometry_novelty_scale_path(iter_dir))
         )
-        effective_min_separation, threshold_mode = effective_phase_b_min_separation(
-            self.config,
-            geometry_scale_payload,
+        if resolved_protocol.manifest_path is not None:
+            self.artefact_log.append(str(resolved_protocol.manifest_path))
+        effective_min_separation, threshold_mode = phase_b_min_separation_from_resolved(
+            resolved_protocol
         )
         dedup_payload = {
             "n_candidates": int(len(final_records)),
@@ -1253,6 +1271,18 @@ class DryRunPhaseExecutor:
             "scaled_distances_to_nearest": [],
             "novelty_scores": [],
             "geometry_novelty_scale": geometry_scale_payload,
+            "sampling_protocol": {
+                "sampling_aggressiveness": int(
+                    resolved_protocol.sampling_aggressiveness
+                ),
+                "resolved_manifest": (
+                    None if resolved_protocol.manifest_path is None
+                    else str(resolved_protocol.manifest_path.resolve())
+                ),
+                "hidden_overrides_detected": list(
+                    resolved_protocol.hidden_overrides_detected
+                ),
+            },
             "relaxation": {"applied": False, "reason": None},
         }
         manifest_path = write_phase_b_selection_manifest(iter_dir, {

@@ -878,27 +878,35 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         if phase_name == "ARIADNE_ARRAY":
             n = self._ensure_ariadne_seed_provenance_for_iteration(state)
             try:
-                from ..geometry_novelty import ensure_geometry_novelty_scale
+                from ..sampling_protocol import resolve_sampling_protocol
 
-                payload = ensure_geometry_novelty_scale(
+                resolved_protocol = resolve_sampling_protocol(
                     self.campaign_dir,
                     self.config,
                     iteration=it,
                 )
+                payload = dict(resolved_protocol.geometry_scale_payload)
             except Exception as exc:
                 raise BackendSubmissionError(
-                    "geometry novelty scale precompute failed before ARIADNE_ARRAY "
+                    "sampling protocol resolution failed before ARIADNE_ARRAY "
                     + "submission: "
                     + type(exc).__name__
                     + ": "
                     + str(exc)
                 ) from exc
             self._journal_event(
-                "geometry_novelty_scale_precomputed",
+                "sampling_protocol_resolved",
                 iteration=it,
+                sampling_aggressiveness=int(
+                    resolved_protocol.sampling_aggressiveness
+                ),
                 scale_angstrom=payload.get("scale_angstrom"),
                 scale_resolution_mode=payload.get("scale_resolution_mode"),
                 n_values=payload.get("n_values"),
+                resolved_manifest=(
+                    None if resolved_protocol.manifest_path is None
+                    else str(resolved_protocol.manifest_path)
+                ),
             )
             return n
         return None
@@ -1845,7 +1853,30 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         # has not at the call site.
         anchor_atoms = pool.frame(0)
 
-        acquisition_config = self.config.to_acquisition_config()
+        try:
+            from ..sampling_protocol import resolve_sampling_protocol
+
+            resolved_protocol = resolve_sampling_protocol(
+                self.campaign_dir,
+                self.config,
+                iteration=int(state.iteration),
+            )
+            acquisition_config = resolved_protocol.acquisition_config
+        except Exception as exc:
+            self._journal_event(
+                "reference_scales_computed",
+                iteration=int(state.iteration),
+                policy=str(policy),
+                error="sampling_protocol_failed: " + str(exc)[:80],
+            )
+            if allow_uniform:
+                return False
+            raise BackendSubmissionError(
+                "sampling protocol resolution failed for reference scale computation: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)
+            ) from exc
 
         try:
             # building the acquisition triggers _build_reference_scales as
