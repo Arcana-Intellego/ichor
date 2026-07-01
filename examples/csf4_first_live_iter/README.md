@@ -259,8 +259,10 @@ from the profile above. Gaussian live jobs use the Slurm allocation via
 `%NProcShared` or `%mem` inside every `.gjf`. Gaussian scratch is
 daemon-owned under `.DATA/SCRATCH/GAUSSIAN/<phase>/`; successful Gaussian tasks
 remove their own scratch directory, while failed tasks keep it for diagnosis.
-The first smoke uses `resources.array_concurrency_limit: 4` to be gentle on
-the scheduler. Backend CPU fields default to `auto`; AIMAll combines that with
+The active-learning daemon deliberately ignores `software.gaussian.scratch_root`
+for Gaussian phases so live campaign runtime files stay inside the campaign
+tree. The first smoke uses `resources.array_concurrency_limit: 4` to be gentle
+on the scheduler. Backend CPU fields default to `auto`; AIMAll combines that with
 `aimall.naat: auto` to choose an atom-level parallelism appropriate to the
 staged system size. The example AIMAll block uses `naat: auto`, `boaq:
 auto_gs2`, and `iasmesh: medium` to keep the first integration pass cheap while

@@ -558,7 +558,7 @@ def test_csf3_gaussian_block_uses_configured_module_path_and_scratch(monkeypatch
     assert "export GAUSS_MDEF=6GB" in body
 
 
-def test_gaussian_block_uses_configured_scratch_root(monkeypatch):
+def test_gaussian_block_ignores_configured_scratch_root(monkeypatch):
     _install_fake_global_variables(
         monkeypatch,
         {
@@ -588,11 +588,12 @@ def test_gaussian_block_uses_configured_scratch_root(monkeypatch):
         campaign_uid="campaign:with unsafe/chars",
     )
 
-    assert "export ICHOR_GAUSSIAN_SCRATCH_ROOT=/scratch/$USER" in body
     assert "export ICHOR_CAMPAIGN_UID=campaign_with_unsafe_chars" in body
-    assert 'export GAUSS_SCRDIR="${ICHOR_GAUSSIAN_SCRATCH_ROOT%/}/ichor-gaussian/${ICHOR_CAMPAIGN_UID}/${ICHOR_GAUSSIAN_PHASE}/${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"' in body
-    assert '"$ICHOR_GAUSSIAN_SCRATCH_ROOT%/"' not in body
-    assert '"${ICHOR_GAUSSIAN_SCRATCH_ROOT%/}"/ichor-gaussian/' in body
+    assert 'export GAUSS_SCRDIR="${ICHOR_CAMPAIGN_DIR}/.DATA/SCRATCH/GAUSSIAN/${ICHOR_GAUSSIAN_PHASE}/${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"' in body
+    assert '    "$ICHOR_CAMPAIGN_DIR"/.DATA/SCRATCH/GAUSSIAN/*/"$SLURM_JOB_ID"_*) rm -rf -- "$GAUSS_SCRDIR" ;;' in body
+    assert "ICHOR_GAUSSIAN_SCRATCH_ROOT" not in body
+    assert "ichor-gaussian" not in body
+    assert "/scratch/$USER" not in body
 
 
 def test_default_trqn_scale_mode_is_not_warned():

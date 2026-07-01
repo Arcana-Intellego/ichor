@@ -3499,33 +3499,13 @@ def _gaussian_invocation_block(
     phase_q = _shell_quote(str(phase_name))
     uid = _safe_shell_path_component(campaign_uid)
     uid_q = _shell_quote(uid)
-    scratch_root = profile_value("software", "gaussian", "scratch_root", default=None)
-    scratch_lines: List[str]
-    cleanup_case: str
-    if scratch_root is not None and str(scratch_root).strip():
-        scratch_root_text = str(scratch_root).strip()
-        _reject_shell_control_chars(
-            "configured software.gaussian.scratch_root",
-            scratch_root_text,
-        )
-        scratch_lines = [
-            "export ICHOR_GAUSSIAN_SCRATCH_ROOT="
-            + _shell_executable(scratch_root_text),
-            'export GAUSS_SCRDIR="${ICHOR_GAUSSIAN_SCRATCH_ROOT%/}/ichor-gaussian/${ICHOR_CAMPAIGN_UID}/${ICHOR_GAUSSIAN_PHASE}/${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"',
-        ]
-        cleanup_case = (
-            '    "${ICHOR_GAUSSIAN_SCRATCH_ROOT%/}"/ichor-gaussian/'
-            '"$ICHOR_CAMPAIGN_UID"/"$ICHOR_GAUSSIAN_PHASE"/'
-            '"$SLURM_JOB_ID"_*) rm -rf -- "$GAUSS_SCRDIR" ;;'
-        )
-    else:
-        scratch_lines = [
-            'export GAUSS_SCRDIR="${ICHOR_CAMPAIGN_DIR}/.DATA/SCRATCH/GAUSSIAN/${ICHOR_GAUSSIAN_PHASE}/${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"',
-        ]
-        cleanup_case = (
-            '    "$ICHOR_CAMPAIGN_DIR"/.DATA/SCRATCH/GAUSSIAN/*/'
-            '"$SLURM_JOB_ID"_*) rm -rf -- "$GAUSS_SCRDIR" ;;'
-        )
+    scratch_lines = [
+        'export GAUSS_SCRDIR="${ICHOR_CAMPAIGN_DIR}/.DATA/SCRATCH/GAUSSIAN/${ICHOR_GAUSSIAN_PHASE}/${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"',
+    ]
+    cleanup_case = (
+        '    "$ICHOR_CAMPAIGN_DIR"/.DATA/SCRATCH/GAUSSIAN/*/'
+        '"$SLURM_JOB_ID"_*) rm -rf -- "$GAUSS_SCRDIR" ;;'
+    )
     return [
         *["module load " + m for m in gaussian_modules],
         "",

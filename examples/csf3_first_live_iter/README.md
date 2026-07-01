@@ -248,8 +248,10 @@ The generated Gaussian scripts should use `#!/bin/bash --login`, the CSF3
 Gaussian module, `GAUSS_SCRDIR`, `GAUSS_PDEF`, and `GAUSS_MDEF`. Gaussian
 scratch is daemon-owned under `.DATA/SCRATCH/GAUSSIAN/<phase>/`; successful
 Gaussian tasks remove their own scratch directory, while failed tasks keep it
-for diagnosis. The generated FEREBUS script should come from pyferebus with
-`platform="CSF3"` and the configured executable.
+for diagnosis. The active-learning daemon deliberately ignores
+`software.gaussian.scratch_root` for Gaussian phases so live campaign runtime
+files stay inside the campaign tree. The generated FEREBUS script should come
+from pyferebus with `platform="CSF3"` and the configured executable.
 
 If the journal reports `sacct_rows_missing_but_squeue_active`, the daemon has
 seen that `sacct` is lagging while `squeue` still shows active array tasks, so
