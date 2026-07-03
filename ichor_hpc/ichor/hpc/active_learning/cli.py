@@ -4443,35 +4443,257 @@ def cmd_config_check(args: argparse.Namespace) -> int:
     return 0 if bool(summary["pool_feasibility"].get("ok", False)) else 10
 
 
+def _preflight_mark(ok: Any, *, warn: bool = False) -> str:
+    if warn:
+        return "[WARN]"
+    return "[OK]" if bool(ok) else "[FAIL]"
+
+
+def _preflight_check_line(
+    label: str,
+    ok: Any,
+    detail: Any,
+    *,
+    warn: bool = False,
+) -> str:
+    return "  " + _preflight_mark(ok, warn=warn) + " " + label + ": " + _format_value(detail)
+
+
+def _preflight_payload(
+    campaign: Path,
+    avail: Any,
+    config_summary: Dict[str, Any],
+    feasibility_summary: Dict[str, Any],
+) -> Dict[str, Any]:
+    backend_payload = asdict(avail)
+    config_ok = bool(config_summary.get("ok", False))
+    feasibility_ok = bool(feasibility_summary.get("ok", False))
+    ready = bool(avail.all_present and config_ok and feasibility_ok)
+    payload: Dict[str, Any] = dict(backend_payload)
+    payload.update(
+        {
+            "schema_version": 1,
+            "campaign_dir": str(campaign),
+            "backend_availability": backend_payload,
+            "campaign_config": dict(config_summary),
+            "pool_feasibility": dict(feasibility_summary),
+            "all_backends_present": bool(avail.all_present),
+            "ready": ready,
+            "missing_backends": list(avail.missing),
+            "missing_backend_message": (
+                "" if avail.all_present else missing_backend_message(avail)
+            ),
+            "next_action": (
+                "start live campaign" if ready else "fix failed checks before live start"
+            ),
+        }
+    )
+    return payload
+
+
+def _preflight_failure_details(payload: Dict[str, Any]) -> List[str]:
+    details: List[str] = []
+    missing = payload.get("missing_backends")
+    if isinstance(missing, list):
+        for name in missing:
+            if name == "profile":
+                profile_error = str(payload.get("profile_error") or "").strip()
+                details.append(
+                    "fix active ICHOR profile"
+                    + (": " + profile_error if profile_error else "")
+                )
+            elif name == "sbatch":
+                details.append("make sbatch available on the Slurm login node")
+            elif name == "sacct":
+                details.append("make sacct available; the daemon needs it for polling")
+            elif name == "bc":
+                details.append("make bc available; pyferebus scripts use it")
+            elif name == "gaussian":
+                details.append("configure Gaussian module/executable or make g16 available")
+            elif name == "aimall":
+                details.append("configure an executable AIMAll aimqb.ish path")
+            elif name == "ferebus":
+                details.append("configure or install the FEREBUS executable")
+            elif name == "ariadne":
+                details.append("install/build the ariadne Python module in the active venv")
+            elif name == "polus_rs":
+                details.append("install POLUS so polus.samplers.RS.randomSampling imports")
+            elif name == "pyferebus":
+                details.append("install pyferebus in the active venv")
+    config = payload.get("campaign_config")
+    if isinstance(config, dict) and not bool(config.get("ok", False)):
+        details.append(
+            "fix campaign.yaml: " + str(config.get("error") or "configuration is not readable")
+        )
+    pool = payload.get("pool_feasibility")
+    if isinstance(pool, dict) and not bool(pool.get("ok", False)):
+        details.append(
+            "fix trajectory pool feasibility: "
+            + str(pool.get("error") or pool.get("expression") or "pool is not usable")
+        )
+    return details
+
+
+def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
+    avail = payload.get("backend_availability")
+    if not isinstance(avail, dict):
+        avail = {}
+    config = payload.get("campaign_config")
+    if not isinstance(config, dict):
+        config = {}
+    pool = payload.get("pool_feasibility")
+    if not isinstance(pool, dict):
+        pool = {}
+
+    lines: List[str] = []
+    lines.extend(
+        _section(
+            "Preflight",
+            [
+                ("result", "ready" if payload.get("ready") else "blocked"),
+                ("active profile", avail.get("active_profile") or "<unresolved>"),
+                ("campaign", payload.get("campaign_dir")),
+            ],
+        )
+    )
+    if verbose and avail.get("profile_error"):
+        lines.append("  profile error: " + str(avail.get("profile_error")))
+
+    lines.append("")
+    lines.append("Scheduler")
+    lines.append(_preflight_check_line("sbatch", avail.get("sbatch"), avail.get("sbatch_path") or "not found"))
+    lines.append(_preflight_check_line("sacct", avail.get("sacct"), avail.get("sacct_path") or "not found"))
+    lines.append(_preflight_check_line("bc", avail.get("bc"), avail.get("bc_path") or "not found"))
+
+    lines.append("")
+    lines.append("Python Environment")
+    python_path = avail.get("python_executable") or "not configured in profile"
+    lines.append(
+        _preflight_check_line(
+            "configured python",
+            bool(avail.get("python_executable")),
+            python_path,
+            warn=not bool(avail.get("python_executable")),
+        )
+    )
+    lines.append(_preflight_check_line("ariadne", avail.get("ariadne"), "importable" if avail.get("ariadne") else "not importable"))
+    lines.append(_preflight_check_line("POLUS RS", avail.get("polus_rs"), "importable" if avail.get("polus_rs") else "not importable"))
+    lines.append(_preflight_check_line("pyferebus", avail.get("pyferebus"), "importable" if avail.get("pyferebus") else "not importable"))
+
+    lines.append("")
+    lines.append("Quantum Backends")
+    lines.append(_preflight_check_line("Gaussian", avail.get("gaussian"), avail.get("gaussian_binary") or "not configured"))
+    lines.append(_preflight_check_line("AIMAll", avail.get("aimall"), avail.get("aimall_path") or "not found"))
+
+    lines.append("")
+    lines.append("FEREBUS")
+    lines.append(_preflight_check_line("executable", avail.get("ferebus"), avail.get("ferebus_path") or "not found"))
+
+    lines.append("")
+    lines.append("Campaign Config")
+    if config.get("ok"):
+        lines.append(_preflight_check_line("campaign.yaml", True, "valid"))
+        if config.get("schema_version") is not None:
+            lines.append("  schema version: " + str(config.get("schema_version")))
+        if config.get("system_name"):
+            lines.append("  system: " + str(config.get("system_name")))
+    else:
+        lines.append(
+            _preflight_check_line(
+                "campaign.yaml",
+                False,
+                config.get("error") or "not readable",
+            )
+        )
+
+    lines.append("")
+    lines.append("Trajectory Pool")
+    if pool.get("error"):
+        lines.append(_preflight_check_line("status", False, pool.get("error")))
+    else:
+        pool_ok = bool(pool.get("ok", False))
+        pool_n = pool.get("pool_n_frames")
+        required = pool.get("required_pool_frames")
+        lines.append(_preflight_check_line("frames available", pool_ok, pool_n))
+        lines.append(_preflight_check_line("frames required", pool_ok, required))
+        if pool.get("expression"):
+            lines.append("  requirement: " + str(pool.get("expression")))
+        if pool.get("reserve_after_bootstrap") is not None:
+            lines.append("  reserve after bootstrap: " + str(pool.get("reserve_after_bootstrap")))
+        try:
+            surplus = int(pool_n) - int(required)
+        except Exception:
+            surplus = None
+        if surplus is not None:
+            lines.append(
+                _preflight_check_line(
+                    "surplus frames after planned campaign",
+                    surplus >= 0,
+                    surplus,
+                    warn=surplus == 0,
+                )
+            )
+
+    lines.append("")
+    lines.append("Next Action")
+    if payload.get("ready"):
+        lines.append("  start live campaign:")
+        lines.append(
+            "    ichor-al-daemon start --campaign-dir "
+            + str(payload.get("campaign_dir"))
+            + " --live"
+        )
+    else:
+        lines.append("  fix failed checks before live start")
+        for detail in _preflight_failure_details(payload)[:12]:
+            lines.append("  - " + detail)
+    if verbose and not payload.get("ready") and not payload.get("all_backends_present"):
+        lines.append("")
+        lines.append("Backend Details")
+        for line in str(payload.get("missing_backend_message") or "").splitlines():
+            lines.append("  " + line)
+    return "\n".join(lines) + "\n"
+
+
 def cmd_preflight(args: argparse.Namespace) -> int:
     campaign = resolve_campaign_dir(getattr(args, "campaign_dir", None))
     avail = check_backends()
-    feasibility_ok = True
+    config_summary: Dict[str, Any] = {}
     feasibility_summary: Dict[str, Any] = {}
     try:
         config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
-        feasibility_summary = _pool_feasibility_summary(campaign, config)
-        feasibility_ok = bool(feasibility_summary.get("ok", False))
+        config_summary = {
+            "ok": True,
+            "schema_version": int(config.schema_version),
+            "system_name": str(config.campaign.system_name),
+        }
     except Exception as exc:
-        feasibility_ok = False
-        feasibility_summary = {
+        config_summary = {
             "ok": False,
             "error": type(exc).__name__ + ": " + str(exc),
         }
-    print(json.dumps(asdict(avail), indent=2, sort_keys=True))
-    print("")
-    print(json.dumps({"pool_feasibility": feasibility_summary}, indent=2, sort_keys=True))
-    if avail.all_present and feasibility_ok:
+        feasibility_summary = {
+            "ok": False,
+            "error": "campaign_config_unavailable: "
+            + type(exc).__name__
+            + ": "
+            + str(exc),
+        }
+    else:
+        try:
+            feasibility_summary = _pool_feasibility_summary(campaign, config)
+        except Exception as exc:
+            feasibility_summary = {
+                "ok": False,
+                "error": type(exc).__name__ + ": " + str(exc),
+            }
+    payload = _preflight_payload(campaign, avail, config_summary, feasibility_summary)
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(_format_preflight(payload, verbose=bool(getattr(args, "verbose", False))), end="")
+    if payload["ready"]:
         return 0
-    print("", file=sys.stderr)
-    if not avail.all_present:
-        print(missing_backend_message(avail), file=sys.stderr)
-    if not feasibility_ok:
-        print(
-            "trajectory pool feasibility failed: "
-            + str(feasibility_summary.get("error") or feasibility_summary.get("expression")),
-            file=sys.stderr,
-        )
     return 12
 
 
@@ -4849,15 +5071,24 @@ Examples:
         help="Check configured live Slurm backends.",
         description=(
             "Check the configured Slurm/Gaussian/AIMAll/FEREBUS/ARIADNE "
-            "backend profile. The campaign path is accepted for symmetry but "
-            "is not used by the backend probe."
+            "backend profile, campaign.yaml, and trajectory-pool feasibility."
         ),
     )
     p_pre.add_argument(
         "-c",
         "--campaign-dir",
         default=".",
-        help="Accepted for symmetry with other commands; not used by preflight.",
+        help="Campaign directory containing campaign.yaml and the imported trajectory pool.",
+    )
+    p_pre.add_argument(
+        "--json",
+        action="store_true",
+        help="Print one machine-readable JSON payload instead of the operator summary.",
+    )
+    p_pre.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Include detailed backend guidance for failed checks.",
     )
     p_pre.set_defaults(func=cmd_preflight)
 

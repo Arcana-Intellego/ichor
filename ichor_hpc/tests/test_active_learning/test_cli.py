@@ -133,6 +133,57 @@ def _write_valid_ariadne_results(campaign: Path, iteration: int = 0):
     return iter_dir
 
 
+def _backend_availability(**overrides):
+    from ichor.hpc.active_learning.daemon.preflight import BackendAvailability
+
+    payload = {
+        "profile": True,
+        "sbatch": True,
+        "sacct": True,
+        "gaussian": True,
+        "aimall": True,
+        "ferebus": True,
+        "ariadne": True,
+        "polus_rs": True,
+        "pyferebus": True,
+        "bc": True,
+        "gaussian_binary": "jobscript:$g16root/g16/g16",
+        "sbatch_path": "/usr/bin/sbatch",
+        "sacct_path": "/usr/bin/sacct",
+        "bc_path": "/usr/bin/bc",
+        "aimall_path": "/home/user/AIMAll/aimqb.ish",
+        "ferebus_path": "/home/user/.local/bin/ferebus",
+        "active_profile": "csf3",
+        "profile_error": "",
+        "python_executable": "/home/user/.venv/ichor-csf3/bin/python",
+    }
+    payload.update(overrides)
+    return BackendAvailability(**payload)
+
+
+def _pool_feasibility_payload(
+    *,
+    ok: bool = True,
+    pool_n_frames: int = 1700,
+    required_pool_frames: int = 90,
+) -> dict:
+    return {
+        "pool_n_frames": int(pool_n_frames),
+        "bootstrap_initial_labelled_size": 70,
+        "max_iterations": 2,
+        "n_seeds_per_iteration": 10,
+        "final_batch_size": 10,
+        "skip_training_seeds": True,
+        "required_pool_frames": int(required_pool_frames),
+        "reserve_after_bootstrap": int(pool_n_frames) - 70,
+        "expression": (
+            "bootstrap.initial_labelled_size + "
+            "max_iterations * seed_selection.n_seeds_per_iteration = 70 + 2 * 10 = 90"
+        ),
+        "ok": bool(ok),
+    }
+
+
 def test_build_parser_has_all_subcommands():
     p = build_parser()
     # Parse a known subcommand to confirm registration.
@@ -146,37 +197,105 @@ def test_parser_rejects_missing_subcommand():
         build_parser().parse_args([])
 
 
-def test_cli_preflight_prints_structured_backend_status(capsys, monkeypatch):
-    from ichor.hpc.active_learning.daemon.preflight import BackendAvailability
-
-    avail = BackendAvailability(
-        profile=True,
-        sbatch=True,
-        sacct=True,
-        gaussian=True,
-        aimall=True,
-        ferebus=True,
-        ariadne=True,
-        polus_rs=True,
-        pyferebus=True,
-        bc=True,
-        gaussian_binary="jobscript:$g16root/g16/g16",
-        sbatch_path="/usr/bin/sbatch",
-        sacct_path="/usr/bin/sacct",
-        bc_path="/usr/bin/bc",
-        aimall_path="/home/user/AIMAll/aimqb.ish",
-        ferebus_path="/home/user/.local/bin/ferebus",
-        active_profile="csf3",
-        profile_error="",
-        python_executable="/home/user/.venv/ichor-al-csf3/bin/python",
+def test_cli_preflight_prints_operator_dashboard_by_default(tmp_path, capsys, monkeypatch):
+    campaign = _campaign_with_config(tmp_path)
+    monkeypatch.setattr(cli_mod, "check_backends", _backend_availability)
+    monkeypatch.setattr(
+        cli_mod,
+        "_pool_feasibility_summary",
+        lambda _campaign, _config: _pool_feasibility_payload(),
     )
-    monkeypatch.setattr(cli_mod, "check_backends", lambda: avail)
 
-    rc = main(["preflight", "--campaign-dir", "."])
+    rc = main(["preflight", "--campaign-dir", str(campaign)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Preflight\n" in out
+    assert "  result: ready" in out
+    assert "  active profile: csf3" in out
+    assert "Scheduler\n" in out
+    assert "  [OK] sbatch: /usr/bin/sbatch" in out
+    assert "Python Environment\n" in out
+    assert "  [OK] ariadne: importable" in out
+    assert "Quantum Backends\n" in out
+    assert "  [OK] Gaussian: jobscript:$g16root/g16/g16" in out
+    assert "Trajectory Pool\n" in out
+    assert "  [OK] frames available: 1700" in out
+    assert "  [OK] frames required: 90" in out
+    assert "Next Action\n" in out
+    assert "ichor-al-daemon start --campaign-dir " in out
+    assert not out.lstrip().startswith("{")
+
+
+def test_cli_preflight_json_prints_single_payload(tmp_path, capsys, monkeypatch):
+    campaign = _campaign_with_config(tmp_path)
+    monkeypatch.setattr(cli_mod, "check_backends", _backend_availability)
+    monkeypatch.setattr(
+        cli_mod,
+        "_pool_feasibility_summary",
+        lambda _campaign, _config: _pool_feasibility_payload(),
+    )
+
+    rc = main(["preflight", "--campaign-dir", str(campaign), "--json"])
+
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is True
     assert payload["active_profile"] == "csf3"
-    assert payload["python_executable"].endswith("ichor-al-csf3/bin/python")
+    assert payload["python_executable"].endswith("ichor-csf3/bin/python")
+    assert payload["backend_availability"]["ariadne"] is True
+    assert payload["pool_feasibility"]["pool_n_frames"] == 1700
+
+
+def test_cli_preflight_reports_all_failures_together(tmp_path, capsys, monkeypatch):
+    campaign = _campaign_with_config(tmp_path)
+
+    def bad_availability():
+        return _backend_availability(sacct=False, ariadne=False, sacct_path="")
+
+    monkeypatch.setattr(cli_mod, "check_backends", bad_availability)
+    monkeypatch.setattr(
+        cli_mod,
+        "_pool_feasibility_summary",
+        lambda _campaign, _config: _pool_feasibility_payload(
+            ok=False,
+            pool_n_frames=50,
+            required_pool_frames=90,
+        ),
+    )
+
+    rc = main(["preflight", "--campaign-dir", str(campaign)])
+
+    assert rc == 12
+    out = capsys.readouterr().out
+    assert "  result: blocked" in out
+    assert "  [FAIL] sacct: not found" in out
+    assert "  [FAIL] ariadne: not importable" in out
+    assert "  [FAIL] frames available: 50" in out
+    assert "  [FAIL] frames required: 90" in out
+    assert "fix failed checks before live start" in out
+    assert "install/build the ariadne Python module" in out
+    assert "fix trajectory pool feasibility" in out
+
+
+def test_cli_preflight_warns_when_pool_has_no_surplus(tmp_path, capsys, monkeypatch):
+    campaign = _campaign_with_config(tmp_path)
+    monkeypatch.setattr(cli_mod, "check_backends", _backend_availability)
+    monkeypatch.setattr(
+        cli_mod,
+        "_pool_feasibility_summary",
+        lambda _campaign, _config: _pool_feasibility_payload(
+            ok=True,
+            pool_n_frames=90,
+            required_pool_frames=90,
+        ),
+    )
+
+    rc = main(["preflight", "--campaign-dir", str(campaign)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "  [WARN] surplus frames after planned campaign: 0" in out
 
 
 def test_recovery_dashboard_reports_missing_state(tmp_path):
