@@ -1464,15 +1464,18 @@ def test_cli_journal_default_prints_readable_events(tmp_path, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     lines = [line for line in out.splitlines() if line.strip()]
-    assert len(lines) == 2
+    assert lines[0] == "Timeline"
+    assert len(lines) == 3
     assert "alpha" in out
     assert "beta" in out
     assert "2026-06-27 14:42:55" in out
     assert "2026-06-27 14:43:02" in out
-    assert "iter=1" in lines[0]
-    assert "iter=-" in lines[1]
-    assert lines[0].count("iter=1") == 1
-    assert lines[1].rstrip().endswith("-")
+    assert "[INFO]" in lines[1]
+    assert "[INFO]" in lines[2]
+    assert "iter=1" in lines[1]
+    assert "iter=-" in lines[2]
+    assert lines[1].count("iter=1") == 1
+    assert all(not line.startswith("  raw_event:") for line in lines)
     assert not out.lstrip().startswith("{")
 
 
@@ -1507,20 +1510,69 @@ def test_cli_journal_left_justifies_columns_for_long_events(tmp_path, capsys):
 
     assert rc == 0
     lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
-    assert len(lines) == 2
-    assert lines[0].startswith("2026-06-27 14:32:10")
-    assert lines[1].startswith("2026-06-27 14:42:55")
-    assert lines[0].index("iter=0") == lines[1].index("iter=12")
-    assert lines[0].index("PHASE_A_POLUS") == lines[1].index("INITIAL_GAUSSIAN")
-    assert lines[0].index("job submitted") == lines[1].index("waiting for array accounting")
-    assert "job=16175189" in lines[0]
-    assert "job=16175294" in lines[1]
-    assert "sacct_rows_missing_but_squeue_active" not in lines[1]
-    assert "Slurm job is still active" in lines[1]
-    assert "observed=2" in lines[1]
-    assert "expected=4" in lines[1]
-    assert "missing=2" in lines[1]
-    assert "squeue=active(PD)" in lines[1]
+    assert lines[0] == "Timeline"
+    assert len(lines) == 3
+    assert lines[1].startswith("  2026-06-27 14:32:10")
+    assert lines[2].startswith("  2026-06-27 14:42:55")
+    assert lines[1].index("iter=0") == lines[2].index("iter=12")
+    assert lines[1].index("PHASE_A_POLUS") == lines[2].index("INITIAL_GAUSSIAN")
+    assert lines[1].index("job submitted") == lines[2].index("waiting for accounting")
+    assert "[RUN]" in lines[1]
+    assert "[WAIT]" in lines[2]
+    assert "job=16175189" in lines[1]
+    assert "job=16175294" in lines[2]
+    assert "sacct_rows_missing_but_squeue_active" not in lines[2]
+    assert "Slurm job is still active" not in lines[2]
+    assert "T/C/R/P=4/-/-/-" in lines[2]
+    assert "missing=2" in lines[2]
+
+
+def test_cli_journal_formats_array_progress_tuple_with_squeue_counts(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
+    journal = campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson"
+    append_event(
+        journal,
+        "sacct_rows_missing_but_squeue_active",
+        phase="INITIAL_GAUSSIAN",
+        iteration=0,
+        job_id="1840120",
+        n_expected=70,
+        n_completed=50,
+        n_failed=0,
+        n_missing=10,
+        squeue_state_counts={"R": 10, "PD": 10},
+        ts="2026-07-03T20:15:05+00:00",
+    )
+
+    rc = main(["journal", "--campaign-dir", str(campaign)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Timeline\n" in out
+    assert "[WAIT]" in out
+    assert "waiting for accounting" in out
+    assert "job=1840120" in out
+    assert "T/C/R/P=70/50/10/10" in out
+    assert "missing=10" in out
+
+
+def test_cli_journal_filtered_empty_prints_timeline_message(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
+    journal = campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson"
+    append_event(journal, "alpha", ts="2026-06-27T14:32:10+00:00")
+
+    rc = main([
+        "journal",
+        "--campaign-dir",
+        str(campaign),
+        "--event-type",
+        "halt",
+    ])
+
+    assert rc == 0
+    assert capsys.readouterr().out == "Timeline\n  no matching events\n"
 
 
 def test_cli_journal_json_keeps_raw_event_names(tmp_path, capsys):
@@ -1583,20 +1635,26 @@ def test_cli_journal_verbose_prints_event_details(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "sbatch" in out
     assert "job submitted" in out
-    assert "  raw_event: sbatch" in out
-    assert "  event_label: job submitted" in out
+    lines = [line for line in out.splitlines() if line.strip()]
+    assert lines[0] == "Timeline"
+    assert len(lines) == 2
+    assert "raw=sbatch" in lines[1]
     assert "INITIAL_AIMALL" in out
     assert "not-a-real-timestamp" in out
     assert "iter=0" in out
-    assert "  job_id: 123" in out
-    assert "  expected_tasks: 10" in out
+    assert "job=123" in out
+    assert "T/C/R/P=10/0/-/-" in out
+    assert "  expected_tasks: 10" not in out
     assert "  iteration: 0" not in out
 
 
-def test_cli_journal_returns_4_when_no_journal(tmp_path):
+def test_cli_journal_returns_4_when_no_journal(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
     rc = main(["journal", "--campaign-dir", str(campaign)])
     assert rc == 4
+    out = capsys.readouterr().out
+    assert "Timeline" in out
+    assert "no journal yet at" in out
 
 
 def test_cli_reconcile_writes_proposed_state(tmp_path, capsys):

@@ -1512,16 +1512,146 @@ def _event_int(event: Dict[str, Any], key: str) -> Optional[int]:
         return None
 
 
-def _squeue_activity_summary(event: Dict[str, Any]) -> str:
-    sample = event.get("squeue_rows_sample")
-    state = None
-    if isinstance(sample, list) and sample:
-        first = sample[0]
-        if isinstance(first, dict):
-            state = first.get("state") or first.get("State")
-    if state:
-        return "active(" + str(state) + ")"
-    return "active"
+_JOURNAL_OK_EVENTS = {
+    "phase_succeeded",
+    "phase_succeeded_live",
+    "training_set_committed",
+    "models_committed",
+    "trajectory_pool_imported",
+    "quantum_quality_summary",
+    "ferebus_quality_summary",
+    "error_calibration_summary",
+}
+
+_JOURNAL_RUN_EVENTS = {
+    "daemon_started",
+    "phase_pre_submit_intent",
+    "phase_submitted",
+    "sbatch",
+    "adopted_inflight_job",
+}
+
+_JOURNAL_WAIT_EVENTS = {
+    "sacct_empty_but_squeue_active",
+    "sacct_rows_missing_but_squeue_active",
+    "postprocess_settle_retry",
+    "committed_artifact_settle_retry",
+}
+
+_JOURNAL_WARN_EVENTS = {
+    "quantum_output_rejected",
+    "ariadne_landing_rejected",
+    "ariadne_optional_diagnostics_warning",
+    "phase_b_novelty_threshold_relaxed",
+    "daemon_lease_stale_recovered",
+}
+
+_JOURNAL_FAIL_EVENTS = {
+    "halt",
+    "tick_error",
+    "tick_exception_halted",
+    "state_corrupt",
+    "phase_output_contract_invalid",
+    "required_phase_output_missing_after_failure",
+    "sacct_empty_timeout",
+    "sacct_missing_timeout",
+    "sacct_unknown_timeout",
+    "live_postprocess_refused",
+    "error_calibration_failed",
+    "job_adopt_check_failed",
+}
+
+_SQUEUE_RUNNING_STATES = {"R", "RUNNING", "CG", "COMPLETING"}
+_SQUEUE_PENDING_STATES = {"PD", "PENDING", "CF", "CONFIGURING"}
+
+
+def _journal_event_severity(event: Dict[str, Any]) -> str:
+    raw = str(event.get("event", ""))
+    if raw == "ariadne_landing_summary":
+        rejected = _event_int(event, "rejected")
+        return "WARN" if rejected is not None and rejected > 0 else "OK"
+    if raw == "queue_lifecycle_update":
+        status = str(event.get("status") or "").upper()
+        if status in _SQUEUE_PENDING_STATES:
+            return "WAIT"
+        if status in _SQUEUE_RUNNING_STATES or status:
+            return "RUN"
+        return "INFO"
+    if raw in _JOURNAL_FAIL_EVENTS:
+        return "FAIL"
+    if raw in _JOURNAL_WARN_EVENTS:
+        return "WARN"
+    if raw in _JOURNAL_WAIT_EVENTS:
+        return "WAIT"
+    if raw in _JOURNAL_RUN_EVENTS:
+        return "RUN"
+    if raw in _JOURNAL_OK_EVENTS:
+        return "OK"
+    return "INFO"
+
+
+def _squeue_counts(event: Dict[str, Any]) -> Dict[str, int]:
+    raw_counts = event.get("squeue_state_counts")
+    out: Dict[str, int] = {}
+    if isinstance(raw_counts, dict):
+        for key, value in raw_counts.items():
+            try:
+                out[str(key).upper()] = int(value)
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def _squeue_running_pending(event: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+    counts = _squeue_counts(event)
+    if not counts:
+        return None, None
+    running = sum(count for state, count in counts.items() if state in _SQUEUE_RUNNING_STATES)
+    pending = sum(count for state, count in counts.items() if state in _SQUEUE_PENDING_STATES)
+    return int(running), int(pending)
+
+
+def _format_progress_value(value: Optional[int]) -> str:
+    return "-" if value is None else str(int(value))
+
+
+def _journal_array_progress(event: Dict[str, Any]) -> str:
+    total = (
+        _event_int(event, "n_expected")
+        or _event_int(event, "expected_tasks")
+        or _event_int(event, "n_tasks")
+    )
+    completed = _event_int(event, "n_completed")
+    failed = _event_int(event, "n_failed")
+    missing = _event_int(event, "n_missing")
+    raw = str(event.get("event", ""))
+    if completed is None and raw in {
+        "phase_pre_submit_intent",
+        "phase_submitted",
+        "sbatch",
+        "adopted_inflight_job",
+    }:
+        completed = 0
+    running, pending = _squeue_running_pending(event)
+    if total is None:
+        return ""
+    if total <= 1 and failed in (None, 0) and missing in (None, 0):
+        return ""
+    parts = [
+        "T/C/R/P="
+        + str(int(total))
+        + "/"
+        + _format_progress_value(completed)
+        + "/"
+        + _format_progress_value(running)
+        + "/"
+        + _format_progress_value(pending)
+    ]
+    if failed is not None and failed > 0:
+        parts.append("fail=" + str(int(failed)))
+    if missing is not None and missing > 0:
+        parts.append("missing=" + str(int(missing)))
+    return " ".join(parts)
 
 
 def _sacct_row_summary(event: Dict[str, Any]) -> str:
@@ -1540,55 +1670,31 @@ def _sacct_row_summary(event: Dict[str, Any]) -> str:
 
 def _journal_operator_summary(event: Dict[str, Any]) -> str:
     raw = str(event.get("event", ""))
+    if raw in {"phase_pre_submit_intent", "phase_submitted", "sbatch"}:
+        return "array submitted" if _journal_array_progress(event) else "job submitted"
+    if raw == "queue_lifecycle_update":
+        status = str(event.get("status") or "").upper()
+        if status in _SQUEUE_PENDING_STATES:
+            return "array pending" if _journal_array_progress(event) else "job pending"
+        if status in _SQUEUE_RUNNING_STATES:
+            return "array active" if _journal_array_progress(event) else "job active"
+        return "queue state updated"
+    if raw in {"phase_succeeded", "phase_succeeded_live"}:
+        return "array complete" if _journal_array_progress(event) else "phase succeeded"
+    if raw == "halt":
+        return "halt"
     if raw == "sacct_rows_missing_but_squeue_active":
-        rows = _sacct_row_summary(event)
-        out = "Slurm job is still active"
-        if rows:
-            out += "; sacct rows " + rows
-        out += "; squeue=" + _squeue_activity_summary(event)
-        streak = _event_int(event, "streak")
-        if streak is not None:
-            out += "; streak=" + str(streak)
-        return out
+        return "waiting for accounting"
     if raw == "sacct_empty_but_squeue_active":
-        out = "Slurm job is still active; sacct has no rows yet"
-        out += "; squeue=" + _squeue_activity_summary(event)
-        streak = _event_int(event, "streak")
-        if streak is not None:
-            out += "; streak=" + str(streak)
-        return out
+        return "waiting for accounting"
     if raw in {"sacct_missing_timeout", "sacct_empty_timeout", "sacct_unknown_timeout"}:
-        rows = _sacct_row_summary(event)
-        out = "Slurm accounting did not become conclusive"
-        if rows:
-            out += "; " + rows
-        streak = _event_int(event, "streak")
-        max_ticks = _event_int(event, "max_ticks")
-        if streak is not None and max_ticks is not None:
-            out += "; ticks=" + str(streak) + "/" + str(max_ticks)
-        return out
+        return "accounting timeout"
     if raw == "squeue_liveness_inconclusive":
-        rows = _sacct_row_summary(event)
-        out = "could not prove whether Slurm job is still active"
-        if rows:
-            out += "; " + rows
-        return out
+        return "scheduler liveness unclear"
     if raw == "pool_feasibility_checked":
         frames = event.get("pool_n_frames")
         required = event.get("required_pool_frames")
         return "pool frames=" + str(frames) + " required=" + str(required)
-    if raw == "ariadne_landing_summary":
-        parts = []
-        for key in ("accepted", "rejected", "salvaged", "backtracked"):
-            if key in event:
-                parts.append(key + "=" + str(event.get(key)))
-        return " ".join(parts)
-    if raw in {"quantum_quality_summary", "ferebus_quality_summary"}:
-        parts = []
-        for key in ("accepted", "rejected", "n_kept", "n_rejected", "n_tasks"):
-            if key in event:
-                parts.append(key + "=" + str(event.get(key)))
-        return " ".join(parts)
     if raw == "failure_action":
         failed = event.get("n_failed")
         tasks = event.get("n_tasks")
@@ -1600,74 +1706,128 @@ def _journal_operator_summary(event: Dict[str, Any]) -> str:
 def _compact_event_details(event: Dict[str, Any]) -> str:
     detail_keys = [
         ("job_id", "job"),
-        ("expected_tasks", "tasks"),
+        ("campaign_uid", "uid"),
+        ("accepted", "accepted"),
+        ("rejected", "rejected"),
+        ("salvaged", "salvaged"),
+        ("backtracked", "backtracked"),
         ("n_tasks", "tasks"),
-        ("n_completed", "completed"),
-        ("n_failed", "failed"),
         ("n_kept", "kept"),
         ("n_rejected", "rejected"),
         ("n_frames", "frames"),
+        ("pool_n_frames", "pool"),
+        ("required_pool_frames", "required"),
         ("action", "action"),
         ("reason", "reason"),
+        ("error", "error"),
     ]
     parts: List[str] = []
     for key, label in detail_keys:
         if key in event and event.get(key) is not None:
             value = _format_value(event.get(key))
-            if key == "reason" and len(value) > 90:
+            if key == "campaign_uid" and len(value) > 8:
+                value = value[:8]
+            if key in {"reason", "error"} and len(value) > 90:
                 value = value[:87] + "..."
             parts.append(label + "=" + value)
-    return "  ".join(parts)
+    progress = _journal_array_progress(event)
+    if progress:
+        insert_at = 1 if parts and parts[0].startswith("job=") else 0
+        parts.insert(insert_at, progress)
+    raw = str(event.get("event", ""))
+    if raw in {"sacct_missing_timeout", "sacct_empty_timeout", "sacct_unknown_timeout"}:
+        streak = _event_int(event, "streak")
+        max_ticks = _event_int(event, "max_ticks")
+        if streak is not None and max_ticks is not None:
+            parts.append("ticks=" + str(streak) + "/" + str(max_ticks))
+    return " ".join(parts)
+
+
+def _verbose_event_details(event: Dict[str, Any]) -> str:
+    raw = str(event.get("event", "<missing>"))
+    skip = {
+        "ts",
+        "event",
+        "phase",
+        "to_phase",
+        "from_phase",
+        "iteration",
+        "job_id",
+        "campaign_uid",
+        "accepted",
+        "rejected",
+        "salvaged",
+        "backtracked",
+        "n_tasks",
+        "n_kept",
+        "n_rejected",
+        "n_frames",
+        "pool_n_frames",
+        "required_pool_frames",
+        "action",
+        "reason",
+        "error",
+        "expected_tasks",
+        "n_expected",
+        "n_completed",
+        "n_failed",
+        "n_missing",
+        "squeue_state_counts",
+    }
+    parts = ["raw=" + raw]
+    for key in sorted(event):
+        if key in skip:
+            continue
+        value = _format_value(event[key])
+        if len(value) > 60:
+            value = value[:57] + "..."
+        parts.append(str(key) + "=" + value)
+    return " ".join(parts)
 
 
 def _format_journal_events(events: Sequence[Dict[str, Any]], *, verbose: bool) -> str:
     if not events:
-        return ""
+        return "Timeline\n  no matching events\n"
     rows: List[Tuple[Dict[str, Any], str, str, str, str, str]] = []
     for event in events:
-        event_name = _journal_event_label(event)
+        summary = _journal_operator_summary(event) or _journal_event_label(event)
         phase = _event_phase(event)
-        operator_summary = _journal_operator_summary(event)
-        compact_details = _compact_event_details(event)
-        if operator_summary and compact_details:
-            details = operator_summary + "  " + compact_details
-        else:
-            details = operator_summary or compact_details
         rows.append(
             (
                 event,
                 _event_time(event),
                 _event_iteration(event),
                 phase,
-                event_name,
-                details,
+                _journal_event_severity(event),
+                summary,
             )
         )
     time_width = max(19, max(len(row[1]) for row in rows))
     iteration_width = max(6, max(len(row[2]) for row in rows))
     phase_width = max(18, max(len(row[3]) for row in rows))
-    event_width = max(24, max(len(row[4]) for row in rows))
 
-    lines: List[str] = []
-    for event, event_time, iteration, phase, event_name, details in rows:
-        first_line = (
-            event_time.ljust(time_width)
+    lines: List[str] = ["Timeline"]
+    for event, event_time, iteration, phase, severity, summary in rows:
+        line = (
+            "  "
+            + event_time.ljust(time_width)
             + "  "
-            + iteration.ljust(iteration_width)
+            + ("[" + severity + "]").ljust(7)
             + "  "
             + phase.ljust(phase_width)
             + "  "
-            + event_name.ljust(event_width)
+            + iteration.ljust(iteration_width)
+            + "  "
+            + summary
         )
-        lines.append(first_line + "  " + (details if details else "-"))
+        details = _compact_event_details(event)
+        if details:
+            line += "  " + details
         if verbose:
-            raw_event = str(event.get("event", "<missing>"))
-            lines.append("  raw_event: " + raw_event)
-            lines.append("  event_label: " + event_name)
-            for key in sorted(event):
-                if key in {"ts", "event", "phase", "to_phase", "from_phase", "iteration"}:
-                    continue
-                lines.append("  " + key + ": " + _format_value(event[key]))
+            verbose_details = _verbose_event_details(event)
+            if verbose_details:
+                line += " " + verbose_details
+        lines.append(line)
     return "\n".join(lines) + "\n"
 
 
@@ -4029,7 +4189,8 @@ def cmd_journal(args: argparse.Namespace) -> int:
         return 0
     journal_path = _campaign_paths(campaign)["journal"]
     if not journal_path.exists():
-        print("no journal at " + str(journal_path), file=sys.stderr)
+        print("Timeline")
+        print("  no journal yet at " + str(journal_path))
         return 4
     iterator = read_events(
         journal_path,

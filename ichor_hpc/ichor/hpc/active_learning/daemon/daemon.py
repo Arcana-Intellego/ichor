@@ -715,6 +715,7 @@ class Daemon:
                         matching_sacct_rows_truncated=False,
                         expected_tasks=expected_tasks,
                         squeue_rows_sample=self._queue_rows_sample(liveness),
+                        squeue_state_counts=self._queue_state_counts(liveness),
                     )
                     return TickStatus.SUBMITTED
                 if liveness is not None and bool(getattr(liveness, "inconclusive", False)):
@@ -1447,6 +1448,21 @@ class Daemon:
             out.append({"job_id": str(job), "state": str(state)})
         return out
 
+    @staticmethod
+    def _queue_state_counts(liveness: Any) -> Dict[str, int]:
+        rows = getattr(liveness, "rows", []) or []
+        counts: Dict[str, int] = {}
+        for row in list(rows):
+            try:
+                _job, state = row
+            except Exception:
+                state = getattr(row, "state", "")
+            key = str(state or "").strip().upper()
+            if not key:
+                continue
+            counts[key] = int(counts.get(key, 0)) + 1
+        return counts
+
     def _record_queue_lifecycle(
         self,
         state: CampaignState,
@@ -1812,6 +1828,8 @@ class Daemon:
             "job_id": job_id,
             "n_expected": getattr(summary, "n_expected", None),
             "n_observed": int(getattr(summary, "n_observed", 0)),
+            "n_completed": int(getattr(summary, "n_completed", 0)),
+            "n_failed": int(getattr(summary, "n_failed", 0)),
             "n_missing": int(getattr(summary, "n_missing", 0)),
             "streak": int(streak),
             "accounting_kind": str(kind),
@@ -1824,6 +1842,7 @@ class Daemon:
                 else "sacct_rows_missing_but_squeue_active"
             )
             payload["squeue_rows_sample"] = self._queue_rows_sample(liveness)
+            payload["squeue_state_counts"] = self._queue_state_counts(liveness)
             try:
                 first_state = (
                     payload["squeue_rows_sample"][0].get("state")
