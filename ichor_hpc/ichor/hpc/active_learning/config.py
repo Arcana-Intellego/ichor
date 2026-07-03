@@ -8,6 +8,7 @@ data.
 """
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
