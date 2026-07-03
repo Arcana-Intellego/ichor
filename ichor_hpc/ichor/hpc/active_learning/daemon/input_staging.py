@@ -867,7 +867,6 @@ def stage_ferebus_inputs(campaign_dir, config, training_version, is_initial=Fals
             system,
             atom,
             properties,
-            fractions,
             row_ids=ledger_row_ids,
         )
         counts = dict(split["counts"])

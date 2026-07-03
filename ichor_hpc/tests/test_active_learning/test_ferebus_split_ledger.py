@@ -39,6 +39,26 @@ def test_initial_split_ledger_assigns_exact_planned_counts(tmp_path):
     assert bootstrap["pointdirs"] == names[8:10]
 
 
+def test_initial_split_ledger_uses_absolute_external_size_then_train_internal_fraction(tmp_path):
+    names = _names(70)
+    result = ensure_split_assignments(
+        tmp_path,
+        names,
+        training_version=0,
+        train_internal_fractions=(0.8, 0.2),
+        external_validation_size=20,
+    )
+
+    assert result["counts"] == {
+        "train": 40,
+        "int_val": 10,
+        "ext_val": 20,
+    }
+    assert result["row_ids"]["train"] == list(range(40))
+    assert result["row_ids"]["int_val"] == list(range(40, 50))
+    assert result["row_ids"]["ext_val"] == list(range(50, 70))
+
+
 def test_existing_split_ledger_assignments_never_change(tmp_path):
     first_names = _names(10)
     first = ensure_split_assignments(

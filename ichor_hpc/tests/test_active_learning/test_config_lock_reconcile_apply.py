@@ -903,6 +903,28 @@ def test_system_name_blocks_after_ferebus_staging_exists(tmp_path):
     assert "FEREBUS" in review.blocked_changes[0].reason
 
 
+def test_ferebus_split_fractions_block_after_split_ledger_exists(tmp_path):
+    campaign = _campaign(tmp_path)
+    ledger = campaign / ".DATA" / "ACTIVE_LEARNING" / "ferebus_split_assignments.json"
+    ledger.write_text('{"schema_version": 3, "assignments": {}}', encoding="utf-8")
+    original = CampaignConfig()
+    write_config_lock(campaign, original)
+    changed = CampaignConfig()
+    changed.ferebus.train_fraction = 0.75
+    changed.ferebus.internal_validation_fraction = 0.25
+
+    proposed = fresh_campaign_state()
+    proposed.phase = CampaignPhase.INITIAL_FEREBUS
+    review = review_config_changes(campaign, changed, proposed)
+
+    assert not review.allowed
+    assert {c.path for c in review.blocked_changes} == {
+        "ferebus.train_fraction",
+        "ferebus.internal_validation_fraction",
+    }
+    assert all("FEREBUS" in c.reason for c in review.blocked_changes)
+
+
 def test_split_config_blocks_after_split_json_exists(tmp_path):
     campaign = _campaign(tmp_path)
     iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"

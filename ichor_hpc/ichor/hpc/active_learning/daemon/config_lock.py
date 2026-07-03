@@ -546,6 +546,8 @@ def _ferebus_first_consumed(campaign_dir: Union[str, Path]) -> Optional[str]:
     path = _first_existing_path(
         campaign_dir,
         (
+            ".DATA/ACTIVE_LEARNING/ferebus_split_assignments.json",
+            ".DATA/ACTIVE_LEARNING/bootstrap_external_validation.json",
             "6_TRAINED_MODELS/iteration-staging/FEREBUS_TASKS.json",
             "6_TRAINED_MODELS/iteration-staging/**/*.model",
             "6_TRAINED_MODELS/iteration-*/**/*.model",

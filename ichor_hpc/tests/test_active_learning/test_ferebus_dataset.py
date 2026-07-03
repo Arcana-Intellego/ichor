@@ -156,6 +156,27 @@ def test_split_atom_csv_to_property_dirs_honours_explicit_row_ids(tmp_path):
     ).read_text(encoding="utf-8")
 
 
+def test_split_atom_csv_to_property_dirs_accepts_ledger_row_ids_without_fractions(tmp_path):
+    src = tmp_path / "WATER_O1.csv"
+    with open(src, "w", encoding="utf-8", newline="\n") as f:
+        f.write("f1,f2,f3,iqa,q00\n")
+        for i in range(8):
+            f.write(f"{i},{i+0.2},{i+0.3},{-75.0-i*0.01},{0.2+i*0.001}\n")
+    row_ids = {"train": [0, 1, 2, 3], "int_val": [4, 5], "ext_val": [6, 7]}
+
+    result = split_atom_csv_to_property_dirs(
+        src,
+        {"iqa": tmp_path / "iqa"},
+        "WATER",
+        "O1",
+        ["iqa"],
+        row_ids=row_ids,
+    )
+
+    assert result["counts"] == {"train": 4, "int_val": 2, "ext_val": 2}
+    assert result["row_ids"] == row_ids
+
+
 def test_split_atom_csv_to_property_dirs_rejects_incomplete_explicit_partition(tmp_path):
     src = tmp_path / "WATER_O1.csv"
     _write_csv(src, "f1,f2,f3,iqa,integration_error", 8)
@@ -168,6 +189,33 @@ def test_split_atom_csv_to_property_dirs_rejects_incomplete_explicit_partition(t
             ["iqa"],
             (0.8, 0.1, 0.1),
             row_ids={"train": [0, 1, 2], "int_val": [3, 4], "ext_val": [5]},
+        )
+
+
+def test_split_atom_csv_to_property_dirs_requires_split_source(tmp_path):
+    src = tmp_path / "WATER_O1.csv"
+    _write_csv(src, "f1,f2,f3,iqa,integration_error", 8)
+    with pytest.raises(ValueError, match="row_ids or fractions"):
+        split_atom_csv_to_property_dirs(
+            src,
+            {"iqa": tmp_path / "iqa"},
+            "WATER",
+            "O1",
+            ["iqa"],
+        )
+
+
+def test_split_atom_csv_to_property_dirs_rejects_non_integer_row_ids(tmp_path):
+    src = tmp_path / "WATER_O1.csv"
+    _write_csv(src, "f1,f2,f3,iqa,integration_error", 8)
+    with pytest.raises(ValueError, match="entries must be integers"):
+        split_atom_csv_to_property_dirs(
+            src,
+            {"iqa": tmp_path / "iqa"},
+            "WATER",
+            "O1",
+            ["iqa"],
+            row_ids={"train": [0, 1.5], "int_val": [2, 3], "ext_val": [4, 5, 6, 7]},
         )
 
 

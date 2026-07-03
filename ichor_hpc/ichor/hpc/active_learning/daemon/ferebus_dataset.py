@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .import_utils import quiet_import_module
 
@@ -193,21 +193,39 @@ def validate_ferebus_csv(csv_path: Path, prop: str) -> Dict[str, int]:
     return {"rows": len(rows), "columns": len(cols), "features": len(features)}
 
 
+def _coerce_explicit_row_ids(label: str, values: Sequence[Any]) -> List[int]:
+    out: List[int] = []
+    for raw in values:
+        if isinstance(raw, bool):
+            raise ValueError("explicit FEREBUS row_ids " + label + " entries must be integers")
+        if isinstance(raw, int):
+            out.append(int(raw))
+            continue
+        if isinstance(raw, str):
+            text = raw.strip()
+            if text and (text.isdigit() or (text[0] in "+-" and text[1:].isdigit())):
+                out.append(int(text))
+                continue
+        raise ValueError("explicit FEREBUS row_ids " + label + " entries must be integers")
+    return out
+
+
 def split_atom_csv_to_property_dirs(
     source_csv: Path,
     out_dirs_by_prop: Mapping[str, Path],
     system: str,
     atom: str,
     properties: Sequence[str],
-    fractions: Sequence[float],
+    fractions: Optional[Sequence[float]] = None,
     *,
-    row_ids: Mapping[str, Sequence[int]] = None,
+    row_ids: Optional[Mapping[str, Sequence[int]]] = None,
 ) -> Dict[str, object]:
     """Split one atom CSV once and write the same row partition for every property.
 
     The CSV may contain multiple target columns. FEREBUS selects the active one through `-P` /
     `properties = [...]`, so every property-specific copy keeps the full header and all target
-    columns.
+    columns. The daemon normally supplies persistent ledger ``row_ids``; the ``fractions`` path is
+    retained for the legacy standalone splitter and unit tests.
     """
     props = [str(p) for p in properties]
     if not props:
@@ -229,6 +247,8 @@ def split_atom_csv_to_property_dirs(
             )
 
     if row_ids is None:
+        if fractions is None:
+            raise ValueError("FEREBUS split requires either explicit row_ids or fractions")
         out_root = Path(next(iter(out_dirs_by_prop.values()))).parent
         out_root.mkdir(parents=True, exist_ok=True)
         norm_csv = out_root / (atom + "_normalised_for_split.csv")
@@ -247,11 +267,14 @@ def split_atom_csv_to_property_dirs(
                 pass
     else:
         try:
-            tr = [int(i) for i in row_ids["train"]]
-            iv = [int(i) for i in row_ids["int_val"]]
-            ev = [int(i) for i in row_ids["ext_val"]]
-        except Exception as exc:
+            raw_tr = row_ids["train"]
+            raw_iv = row_ids["int_val"]
+            raw_ev = row_ids["ext_val"]
+        except KeyError as exc:
             raise ValueError("explicit FEREBUS row_ids must contain train/int_val/ext_val") from exc
+        tr = _coerce_explicit_row_ids("train", raw_tr)
+        iv = _coerce_explicit_row_ids("int_val", raw_iv)
+        ev = _coerce_explicit_row_ids("ext_val", raw_ev)
         all_ids = tr + iv + ev
         if len(set(all_ids)) != len(all_ids):
             raise ValueError("explicit FEREBUS row_ids contain duplicates")

@@ -57,6 +57,9 @@ def test_stage_ferebus_inputs_orchestration(tmp_path, monkeypatch):
 
     cfg = CampaignConfig()
     cfg.system_name = "WATER"
+    cfg.bootstrap.external_validation_size = 5
+    cfg.ferebus.train_fraction = 0.8
+    cfg.ferebus.internal_validation_fraction = 0.2
     cfg.ferebus.properties = ["iqa", "q00"]
     staging, n_tasks = stg.stage_ferebus_inputs(campaign, cfg, training_version=0, is_initial=False)
 
@@ -76,11 +79,16 @@ def test_stage_ferebus_inputs_orchestration(tmp_path, monkeypatch):
     assert "q00-O1 " in jd
     manifest = json.loads((staging / stg.FEREBUS_TASK_MANIFEST).read_text(encoding="utf-8"))
     assert manifest["n_tasks"] == 6
+    assert manifest["split_ledger"]["counts"] == {"train": 12, "int_val": 3, "ext_val": 5}
     assert manifest["pointdir_row_order"] == [
         "POINT_" + str(i).zfill(4) + ".pointdir" for i in range(20)
     ]
     assert manifest["degenerate_property_stats"] == []
     assert {task["property"] for task in manifest["tasks"]} == {"iqa", "q00"}
+    assert {
+        tuple(task["row_counts"][key] for key in ("train", "int_val", "ext_val"))
+        for task in manifest["tasks"]
+    } == {(12, 3, 5)}
     assert {tuple(task["alf_1_indexed"]) for task in manifest["tasks"]} >= {(1, 2, 3)}
     assert not list(staging.glob("ferebus_*.toml"))
     # the transient scratch csvs do not survive into the staging dir
