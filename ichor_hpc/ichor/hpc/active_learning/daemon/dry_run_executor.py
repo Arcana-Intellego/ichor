@@ -502,122 +502,58 @@ class DryRunPhaseExecutor:
         # contract with daemon._apply_state_updates strict.
         return {}
     def _inline_split(self, state) -> Dict[str, Any]:
-        """Sort this iteration's candidate set into train,
-        validation and (optionally) holdout buckets using the strategy
-        the operator picked in campaign.yaml split.strategy.
+        """Derive this iteration's append split from the FEREBUS ratios.
 
-        The candidate set is whatever the ARIADNE descent + Phase-B FPS
-        produced -- one row per seed in the iteration pool. Each row has
-        an acquisition alpha attached, which the strategy sorts on.
-
-        Strategies live in sampling/split.py:
-          - stratified_with_holdout (default): top alphas go to train but
-            a fraction of the top tier is held back as validation, so
-            the validation set actually contains the points the model
-            needs to learn from. mid-tier rows also go to validation.
-          - random_80_20: plain uniform random split with train_fraction.
-          - pure_top_k: top fraction to train, rest to validation, no
-            holdout. simplest but validation never sees the hard cases.
-
-        We write split.json with the schema that APPEND and reconcile
-        downstream expect.
+        Schema v7 removes the public ``split`` block. Phase SPLIT remains
+        as a daemon phase for compatibility with APPEND/reconcile, but it
+        now writes a plain train/internal-validation split using the same
+        FEREBUS train/internal fractions that are used for model staging.
         """
-        from ..sampling.split import get_split_strategy
-
         iter_dir = self._iter_dir(state.iteration)
         pool_dir = iter_dir / "pool"
         split_path = iter_dir / "split.json"
 
-        # gather the per-candidate alpha values from each seed result.json.
-        # the result.json files are written by ARIADNE_ARRAY postprocess
-        # earlier in this iteration; if any are missing we fall back to
-        # a default alpha of 0.0 for that row so the split still runs.
+        # Count the Phase-B final rows. The result.json files are written by
+        # ARIADNE_ARRAY postprocess earlier in this iteration.
         seed_dirs = []
         if pool_dir.is_dir():
             seed_dirs = sorted(
                 d for d in pool_dir.iterdir()
                 if d.is_dir() and d.name.startswith("seed_")
             )
-        alphas: List[float] = []
-        for sd in seed_dirs:
-            rj = sd / "result.json"
-            if rj.is_file():
-                try:
-                    with open(rj, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    alpha_f = float(data.get("alpha_final", 0.0) or 0.0)
-                except (OSError, ValueError):
-                    alpha_f = 0.0
-            else:
-                alpha_f = 0.0
-            alphas.append(alpha_f)
+        n_rows = len(seed_dirs) if seed_dirs else int(self.config.active_batch.final_batch_size)
+        n_rows = max(0, int(n_rows))
+        train_fraction = float(self.config.ferebus.train_fraction)
+        internal_fraction = float(self.config.ferebus.internal_validation_fraction)
+        n_train = int(round(float(n_rows) * train_fraction))
+        if n_rows > 0:
+            n_train = max(1, min(n_rows, n_train))
+        if n_rows >= 2 and internal_fraction > 0.0 and n_train == n_rows:
+            n_train = n_rows - 1
+        train_indices = list(range(n_train))
+        val_indices = list(range(n_train, n_rows))
+        holdout_indices: List[int] = []
 
-        # If we ended up with nothing (no seed dirs at all, eg SEED_SELECT
-        # ran without a trajectory pool), fall back to the final active batch
-        # size so APPEND still has something to do in synthetic dry runs.
-        if not alphas:
-            final_batch_size = int(self.config.active_batch.final_batch_size)
-            payload = {
-                "strategy": self.config.split.strategy,
-                "train_fraction": self.config.split.train_fraction,
-                "val_mid_fraction": self.config.split.val_mid_fraction,
-                "high_holdout_fraction": self.config.split.high_holdout_fraction,
-                "iteration": state.iteration,
-                "train_indices": list(range(final_batch_size)),
-                "val_indices": [final_batch_size],
-                "holdout_indices": [],
-            }
-            atomic_write_json(split_path, payload)
-            self.artefact_log.append(str(split_path))
-            return {}
-
-        # dispatch to the configured strategy. each strategy takes the
-        # acquisition values plus the fractions it cares about.
-        strategy_fn = get_split_strategy(self.config.split.strategy)
-        rng_seed = int(self.rng_seed) + int(state.iteration)
-        if self.config.split.strategy == "stratified_with_holdout":
-            result = strategy_fn(
-                alphas,
-                train_fraction=float(self.config.split.train_fraction),
-                val_mid_fraction=float(self.config.split.val_mid_fraction),
-                high_holdout_fraction=float(self.config.split.high_holdout_fraction),
-                rng_seed=rng_seed,
-            )
-        elif self.config.split.strategy == "random_80_20":
-            result = strategy_fn(
-                alphas,
-                train_fraction=float(self.config.split.train_fraction),
-                rng_seed=rng_seed,
-            )
-        elif self.config.split.strategy == "pure_top_k":
-            result = strategy_fn(
-                alphas,
-                train_fraction=float(self.config.split.train_fraction),
-            )
-        else:
-            # _validate caught unknown strategies earlier so we should
-            # never land here -- but fall back to the default rather
-            # than crash if somehow we do.
-            result = strategy_fn(alphas)
-        train_set = set(int(i) for i in result.train_indices)
-        val_set = set(int(i) for i in result.val_indices)
-        holdout_set = set(int(i) for i in result.holdout_indices)
+        train_set = set(int(i) for i in train_indices)
+        val_set = set(int(i) for i in val_indices)
+        holdout_set = set(int(i) for i in holdout_indices)
         if train_set & val_set:
-            raise BackendSubmissionError("split strategy returned overlapping train/val indices")
+            raise BackendSubmissionError("FEREBUS-derived split returned overlapping train/val indices")
         if not holdout_set.issubset(val_set):
-            raise BackendSubmissionError("split strategy returned holdout indices outside validation")
-        if result.n_train <= 0 and len(alphas) > 0:
-            raise BackendSubmissionError("split strategy returned no training rows for non-empty candidates")
+            raise BackendSubmissionError("FEREBUS-derived split returned holdout indices outside validation")
+        if n_rows > 0 and not train_indices:
+            raise BackendSubmissionError("FEREBUS-derived split returned no training rows for non-empty candidates")
 
         payload = {
-            "strategy": result.strategy,
-            "train_fraction": float(self.config.split.train_fraction),
-            "val_mid_fraction": float(self.config.split.val_mid_fraction),
-            "high_holdout_fraction": float(self.config.split.high_holdout_fraction),
+            "strategy": "ferebus_train_internal",
+            "train_fraction": train_fraction,
+            "internal_validation_fraction": internal_fraction,
+            "external_validation_fraction": 0.0,
+            "high_holdout_fraction": 0.0,
             "iteration": int(state.iteration),
-            "train_indices": list(result.train_indices),
-            "val_indices": list(result.val_indices),
-            "holdout_indices": list(result.holdout_indices),
+            "train_indices": train_indices,
+            "val_indices": val_indices,
+            "holdout_indices": holdout_indices,
         }
         atomic_write_json(split_path, payload)
         self.artefact_log.append(str(split_path))

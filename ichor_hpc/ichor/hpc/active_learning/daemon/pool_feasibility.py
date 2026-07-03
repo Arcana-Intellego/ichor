@@ -58,7 +58,7 @@ def evaluate_pool_feasibility(
 ) -> PoolFeasibility:
     pool_n = _pool_frame_count(campaign_dir)
     bootstrap_n = int(config.bootstrap.initial_labelled_size)
-    max_iterations = int(config.max_iterations)
+    max_iterations = int(config.campaign.max_iterations)
     n_seeds = int(config.seed_selection.n_seeds_per_iteration)
     final_batch = int(config.active_batch.final_batch_size)
     skip_training = bool(config.anti_overlap.skip_training_seeds)

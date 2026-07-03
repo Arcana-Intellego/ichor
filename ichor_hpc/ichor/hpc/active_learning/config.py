@@ -1,13 +1,14 @@
-"""Campaign configuration -- schema v6.
+"""Campaign configuration -- schema v7.
 
-Schema v6 makes the active-learning batch protocol explicit: bootstrap
-controls the initial labelled set, seed_selection controls ARIADNE attempts,
-and active_batch controls the fixed final Phase-B batch size.
+Schema v7 keeps the operator-facing campaign protocol compact: campaign
+identifies the run, bootstrap owns the fixed external validation reserve,
+active_batch owns the number of new labels per iteration, and FEREBUS owns the
+train/internal-validation split for all non-external labelled data.
 """
 from __future__ import annotations
 
 import re
-from dataclasses import asdict, dataclass, field, fields, is_dataclass
+from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -43,6 +44,7 @@ from .geometry_protocol import (
 
 __all__ = [
     "CampaignConfig",
+    "CampaignIdentityConfigBlock",
     "TrajectoryPoolConfigBlock",
     "BootstrapConfigBlock",
     "ActiveBatchConfigBlock",
@@ -51,7 +53,6 @@ __all__ = [
     "AntiOverlapConfigBlock",
     "PhaseBConfigBlock",
     "GeometryNoveltyConfigBlock",
-    "SplitConfigBlock",
     "FerebusConfigBlock",
     "AcquisitionSubspaceBlock",
     "AcquisitionBarrierBlock",
@@ -81,7 +82,6 @@ __all__ = [
     "VALID_DESCRIPTORS",
     "VALID_GEOMETRY_NOVELTY_SCALE_SOURCES",
     "VALID_GEOMETRY_NOVELTY_STATISTICS",
-    "VALID_SPLITS",
     "VALID_SEED_SELECTION_STRATEGIES",
     "VALID_GRADIENT_MODES",
     "VALID_MODE_WEIGHTING_POLICIES",
@@ -118,9 +118,6 @@ VALID_GEOMETRY_NOVELTY_SCALE_SOURCES = frozenset({
     "local_motion", "movement_history", "hybrid",
 })
 VALID_GEOMETRY_NOVELTY_STATISTICS = frozenset({"p25", "median", "p75"})
-VALID_SPLITS = frozenset({
-    "stratified_with_holdout", "random_80_20", "pure_top_k",
-})
 VALID_SEED_SELECTION_STRATEGIES = frozenset({"hybrid_variance", "d_optimal"})
 VALID_GRADIENT_MODES = frozenset({"cartesian_fd", "active_fd"})
 VALID_MODE_WEIGHTING_POLICIES = frozenset({"variance", "inverse_frequency", "uniform"})
@@ -421,6 +418,7 @@ class AcquisitionGradientBlock:
     regularization: float = 1.0e-10
     cartesian_step_floor: float = 0.0
     ghost_mass_threshold: float = 0.0
+    max_acquisition_grad_per_ang: float = 50.0
 
 
 @dataclass
@@ -451,12 +449,21 @@ class AcquisitionConfigBlock:
 
 @dataclass
 class TrajectoryPoolConfigBlock:
-    source_path: str = ""
+    source_path: str = "pool.xyz"
+
+
+@dataclass
+class CampaignIdentityConfigBlock:
+    # Short label for the molecular system, used to name per-atom FEREBUS
+    # dataset files (<system>_<atom>_TRAINING_SET.csv and friends).
+    system_name: str = "SYSTEM"
+    max_iterations: int = 50
 
 
 @dataclass
 class BootstrapConfigBlock:
     initial_labelled_size: int = 12
+    external_validation_fraction: float = 0.2
 
 
 @dataclass
@@ -513,14 +520,6 @@ class GeometryNoveltyConfigBlock:
 
 
 @dataclass
-class SplitConfigBlock:
-    strategy: str = "stratified_with_holdout"
-    train_fraction: float = 0.75
-    val_mid_fraction: float = 0.15
-    high_holdout_fraction: float = 0.10
-
-
-@dataclass
 class FerebusConfigBlock:
     # NOT YET IMPLEMENTED. warmstart (reuse the previous iteration's converged hyperparameters as the
     # initial guess) needs a FEREBUS_CPU change to accept a seed-theta -- there is no config-only way
@@ -537,12 +536,11 @@ class FerebusConfigBlock:
     scaling: bool = True
     full_ARD: bool = True
     properties: List[str] = field(default_factory=lambda: ["iqa"])
-    # how the committed training set is carved into the three csvs FEREBUS reads
-    # each retrain: training, internal validation (used during the fit), and
-    # external validation (held-out benchmark). fractions of the current set.
+    # How non-external labelled data is carved into the two trainable FEREBUS
+    # sets. The external validation set is a fixed bootstrap reserve controlled
+    # by bootstrap.external_validation_fraction.
     train_fraction: float = 0.8
-    int_val_fraction: float = 0.1
-    ext_val_fraction: float = 0.1
+    internal_validation_fraction: float = 0.2
 
 
 @dataclass
@@ -633,6 +631,9 @@ class QualityGatesConfigBlock:
 
 @dataclass
 class RuntimeConfigBlock:
+    poll_interval_seconds: int = 60
+    poll_interval_idle_seconds: int = 120
+    poll_sacct_empty_max_ticks: int = 10
     lease_stale_seconds: int = 900
     postprocess_settle_attempts: int = 3
     postprocess_settle_seconds: int = 10
@@ -640,6 +641,7 @@ class RuntimeConfigBlock:
     poll_sacct_unknown_max_ticks: int = 3
     poll_sacct_missing_max_ticks: int = 12
     poll_squeue_inconclusive_max_ticks: int = 10
+    failure_threshold_fraction: float = 0.5
     halt_on_tick_exception: bool = True
 
 
@@ -971,28 +973,13 @@ class AimallConfigBlock:
 
 @dataclass
 class CampaignConfig:
-    """Top-level campaign configuration (schema v6)."""
+    """Top-level campaign configuration (schema v7)."""
 
     schema_version: int = CONFIG_SCHEMA_VERSION
 
-    # short label for the molecular system, used to name the per-atom FEREBUS
-    # dataset files (<system>_<atom>_TRAINING_SET.csv and friends). keep it a
-    # bare token, no spaces.
-    system_name: str = "SYSTEM"
-
-    max_iterations: int = 50
-    poll_interval_seconds: int = 60
-    poll_interval_idle_seconds: int = 120
-    #Number of consecutive ticks of sacct returning n_tasks=0 before
-    #the daemon escalates a pending job to UNKNOWN/failure. SLURM accounting
-    #records can age out after ~24h on CSF4; without this the
-    #daemon would poll indefinitely. Set to 0 to disable the escalation.
-    poll_sacct_empty_max_ticks: int = 10
-
-    failure_threshold_fraction: float = 0.5
-    max_acquisition_grad_per_ang: Optional[float] = None
-    max_force_per_atom_ha_per_ang: float = 50.0
-
+    campaign: CampaignIdentityConfigBlock = field(
+        default_factory=CampaignIdentityConfigBlock
+    )
     trajectory_pool: TrajectoryPoolConfigBlock = field(
         default_factory=TrajectoryPoolConfigBlock
     )
@@ -1015,7 +1002,6 @@ class CampaignConfig:
     geometry_novelty: GeometryNoveltyConfigBlock = field(
         default_factory=GeometryNoveltyConfigBlock
     )
-    split: SplitConfigBlock = field(default_factory=SplitConfigBlock)
     ferebus: FerebusConfigBlock = field(default_factory=FerebusConfigBlock)
     acquisition: AcquisitionConfigBlock = field(
         default_factory=AcquisitionConfigBlock
@@ -1035,6 +1021,116 @@ class CampaignConfig:
     resources: ResourceConfigBlock = field(default_factory=ResourceConfigBlock)
     gaussian: GaussianConfigBlock = field(default_factory=GaussianConfigBlock)
     aimall: AimallConfigBlock = field(default_factory=AimallConfigBlock)
+
+    def __init__(self, **kwargs):
+        moved_aliases = {
+            "system_name": ("campaign", "system_name"),
+            "max_iterations": ("campaign", "max_iterations"),
+            "poll_interval_seconds": ("runtime", "poll_interval_seconds"),
+            "poll_interval_idle_seconds": ("runtime", "poll_interval_idle_seconds"),
+            "poll_sacct_empty_max_ticks": ("runtime", "poll_sacct_empty_max_ticks"),
+            "failure_threshold_fraction": ("runtime", "failure_threshold_fraction"),
+            "max_acquisition_grad_per_ang": (
+                "acquisition.gradient",
+                "max_acquisition_grad_per_ang",
+            ),
+            "max_force_per_atom_ha_per_ang": (
+                "acquisition.gradient",
+                "max_acquisition_grad_per_ang",
+            ),
+        }
+        alias_values = {}
+        for alias, target in moved_aliases.items():
+            if alias in kwargs:
+                alias_values[target] = kwargs.pop(alias)
+        field_names = {f.name for f in fields(type(self))}
+        unknown = sorted(str(k) for k in kwargs if str(k) not in field_names)
+        if unknown:
+            raise TypeError(
+                "CampaignConfig got unexpected keyword argument(s): "
+                + ", ".join(unknown)
+            )
+        for f in fields(type(self)):
+            if f.name in kwargs:
+                value = kwargs.pop(f.name)
+            elif f.default_factory is not MISSING:  # type: ignore[attr-defined]
+                value = f.default_factory()  # type: ignore[misc]
+            elif f.default is not MISSING:
+                value = f.default
+            else:
+                raise TypeError("CampaignConfig field has no default: " + f.name)
+            setattr(self, f.name, value)
+        for (block_path, attr), value in alias_values.items():
+            if value is None and attr == "max_acquisition_grad_per_ang":
+                continue
+            target = self
+            for part in str(block_path).split("."):
+                target = getattr(target, part)
+            setattr(target, attr, value)
+
+    @property
+    def system_name(self) -> str:
+        return self.campaign.system_name
+
+    @system_name.setter
+    def system_name(self, value: str) -> None:
+        self.campaign.system_name = value
+
+    @property
+    def max_iterations(self) -> int:
+        return self.campaign.max_iterations
+
+    @max_iterations.setter
+    def max_iterations(self, value: int) -> None:
+        self.campaign.max_iterations = int(value)
+
+    @property
+    def poll_interval_seconds(self) -> int:
+        return self.runtime.poll_interval_seconds
+
+    @poll_interval_seconds.setter
+    def poll_interval_seconds(self, value: int) -> None:
+        self.runtime.poll_interval_seconds = int(value)
+
+    @property
+    def poll_interval_idle_seconds(self) -> int:
+        return self.runtime.poll_interval_idle_seconds
+
+    @poll_interval_idle_seconds.setter
+    def poll_interval_idle_seconds(self, value: int) -> None:
+        self.runtime.poll_interval_idle_seconds = int(value)
+
+    @property
+    def poll_sacct_empty_max_ticks(self) -> int:
+        return self.runtime.poll_sacct_empty_max_ticks
+
+    @poll_sacct_empty_max_ticks.setter
+    def poll_sacct_empty_max_ticks(self, value: int) -> None:
+        self.runtime.poll_sacct_empty_max_ticks = int(value)
+
+    @property
+    def failure_threshold_fraction(self) -> float:
+        return self.runtime.failure_threshold_fraction
+
+    @failure_threshold_fraction.setter
+    def failure_threshold_fraction(self, value: float) -> None:
+        self.runtime.failure_threshold_fraction = float(value)
+
+    @property
+    def max_acquisition_grad_per_ang(self) -> float:
+        return self.acquisition.gradient.max_acquisition_grad_per_ang
+
+    @max_acquisition_grad_per_ang.setter
+    def max_acquisition_grad_per_ang(self, value: float) -> None:
+        self.acquisition.gradient.max_acquisition_grad_per_ang = float(value)
+
+    @property
+    def max_force_per_atom_ha_per_ang(self) -> float:
+        return self.acquisition.gradient.max_acquisition_grad_per_ang
+
+    @max_force_per_atom_ha_per_ang.setter
+    def max_force_per_atom_ha_per_ang(self, value: float) -> None:
+        self.acquisition.gradient.max_acquisition_grad_per_ang = float(value)
 
     def to_dict(self):
         return asdict(self)
@@ -1092,8 +1188,8 @@ class CampaignConfig:
 
     def _validate(self):
         _validate_token(
-            "system_name",
-            self.system_name,
+            "campaign.system_name",
+            self.campaign.system_name,
             _SYSTEM_NAME_RE,
             "a filename-safe token matching ^[A-Za-z0-9][A-Za-z0-9_-]*$",
         )
@@ -1206,17 +1302,21 @@ class CampaignConfig:
                 "aimall.iasmesh must be one of "
                 + repr(sorted(VALID_AIMALL_IASMESH_VALUES))
             )
-        if self.max_iterations <= 0:
-            raise ConfigValidationError("max_iterations must be > 0")
-        if self.poll_interval_seconds < 1:
-            raise ConfigValidationError("poll_interval_seconds must be >= 1")
-        if self.poll_interval_idle_seconds < 1:
-            raise ConfigValidationError("poll_interval_idle_seconds must be >= 1")
-        if self.poll_sacct_empty_max_ticks < 0:
-            raise ConfigValidationError("poll_sacct_empty_max_ticks must be >= 0")
+        if self.campaign.max_iterations <= 0:
+            raise ConfigValidationError("campaign.max_iterations must be > 0")
+        if self.runtime.poll_interval_seconds < 1:
+            raise ConfigValidationError("runtime.poll_interval_seconds must be >= 1")
+        if self.runtime.poll_interval_idle_seconds < 1:
+            raise ConfigValidationError("runtime.poll_interval_idle_seconds must be >= 1")
+        if self.runtime.poll_sacct_empty_max_ticks < 0:
+            raise ConfigValidationError("runtime.poll_sacct_empty_max_ticks must be >= 0")
         if self.bootstrap.initial_labelled_size <= 0:
             raise ConfigValidationError(
                 "bootstrap.initial_labelled_size must be > 0"
+            )
+        if not 0.0 <= float(self.bootstrap.external_validation_fraction) < 1.0:
+            raise ConfigValidationError(
+                "bootstrap.external_validation_fraction must be in [0, 1)"
             )
         if self.active_batch.final_batch_size <= 0:
             raise ConfigValidationError(
@@ -1267,6 +1367,10 @@ class CampaignConfig:
             _validate_optional_nonnegative_float(name, value)
         if float(self.seed_selection.d_optimal_jitter) <= 0.0:
             raise ConfigValidationError("seed_selection.d_optimal_jitter must be > 0")
+        if not 0.0 <= float(self.runtime.failure_threshold_fraction) <= 1.0:
+            raise ConfigValidationError(
+                "runtime.failure_threshold_fraction must be in [0, 1]"
+            )
         _validate_positive_int("runtime.lease_stale_seconds", self.runtime.lease_stale_seconds)
         _validate_positive_int(
             "runtime.postprocess_settle_attempts",
@@ -1349,22 +1453,6 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "geometry_novelty.fallback_scale_angstrom must be > 0"
             )
-        if self.split.strategy not in VALID_SPLITS:
-            raise ConfigValidationError(
-                "split.strategy must be one of " + repr(sorted(VALID_SPLITS))
-            )
-        for frac_name, frac in (
-            ("split.train_fraction", self.split.train_fraction),
-            ("split.val_mid_fraction", self.split.val_mid_fraction),
-            ("split.high_holdout_fraction", self.split.high_holdout_fraction),
-            ("failure_threshold_fraction", self.failure_threshold_fraction),
-        ):
-            if not 0.0 <= frac <= 1.0:
-                raise ConfigValidationError(frac_name + " must be in [0, 1]")
-        if float(self.split.train_fraction) + float(self.split.val_mid_fraction) > 1.0:
-            raise ConfigValidationError(
-                "split.train_fraction + split.val_mid_fraction must be <= 1"
-            )
         if self.ferebus.warmstart not in VALID_WARMSTART:
             raise ConfigValidationError(
                 "ferebus.warmstart must be one of " + repr(sorted(VALID_WARMSTART))
@@ -1400,19 +1488,20 @@ class CampaignConfig:
             seen_props.add(prop)
         for frac_name, frac in (
             ("ferebus.train_fraction", self.ferebus.train_fraction),
-            ("ferebus.int_val_fraction", self.ferebus.int_val_fraction),
-            ("ferebus.ext_val_fraction", self.ferebus.ext_val_fraction),
+            (
+                "ferebus.internal_validation_fraction",
+                self.ferebus.internal_validation_fraction,
+            ),
         ):
             if not 0.0 <= float(frac) <= 1.0:
                 raise ConfigValidationError(frac_name + " must be in [0, 1]")
         ferebus_sum = (
             float(self.ferebus.train_fraction)
-            + float(self.ferebus.int_val_fraction)
-            + float(self.ferebus.ext_val_fraction)
+            + float(self.ferebus.internal_validation_fraction)
         )
         if abs(ferebus_sum - 1.0) > 1.0e-9:
             raise ConfigValidationError(
-                "ferebus train/internal/external fractions must sum to 1.0"
+                "ferebus train/internal validation fractions must sum to 1.0"
             )
         if self.acquisition.property_name not in seen_props:
             raise ConfigValidationError(
@@ -1546,30 +1635,23 @@ class CampaignConfig:
                 "error_calibration.model_version_policy must be one of "
                 + repr(sorted(VALID_ERROR_CALIBRATION_MODEL_VERSION_POLICIES))
             )
-        if self.max_acquisition_grad_per_ang is not None:
-            _validate_optional_nonnegative_float(
-                "max_acquisition_grad_per_ang",
-                self.max_acquisition_grad_per_ang,
-            )
-            if float(self.max_acquisition_grad_per_ang) <= 0.0:
-                raise ConfigValidationError(
-                    "max_acquisition_grad_per_ang must be > 0"
-                )
-        if self.max_force_per_atom_ha_per_ang <= 0:
-            raise ConfigValidationError(
-                "max_force_per_atom_ha_per_ang must be > 0"
-            )
-        if (
-            self.max_acquisition_grad_per_ang is not None
-            and float(self.max_force_per_atom_ha_per_ang) != 50.0
-            and abs(
-                float(self.max_acquisition_grad_per_ang)
-                - float(self.max_force_per_atom_ha_per_ang)
-            ) > 1.0e-12
+        max_acquisition_grad = (
+            self.acquisition.gradient.max_acquisition_grad_per_ang
+        )
+        if isinstance(max_acquisition_grad, bool) or not isinstance(
+            max_acquisition_grad,
+            (int, float),
         ):
             raise ConfigValidationError(
-                "max_acquisition_grad_per_ang conflicts with deprecated "
-                "max_force_per_atom_ha_per_ang; set only one clamp field"
+                "acquisition.gradient.max_acquisition_grad_per_ang must be a number"
+            )
+        if not math.isfinite(float(max_acquisition_grad)):
+            raise ConfigValidationError(
+                "acquisition.gradient.max_acquisition_grad_per_ang must be finite"
+            )
+        if float(max_acquisition_grad) <= 0.0:
+            raise ConfigValidationError(
+                "acquisition.gradient.max_acquisition_grad_per_ang must be > 0"
             )
         ariadne = self.ariadne
         if str(ariadne.trqn_scale_mode) not in VALID_TRQN_SCALE_MODES:
@@ -1975,9 +2057,7 @@ class CampaignConfig:
                 )
 
     def effective_max_acquisition_grad_per_ang(self) -> float:
-        if self.max_acquisition_grad_per_ang is not None:
-            return float(self.max_acquisition_grad_per_ang)
-        return float(self.max_force_per_atom_ha_per_ang)
+        return float(self.acquisition.gradient.max_acquisition_grad_per_ang)
 
     def to_acquisition_config(self):
         """Materialise an ichor.core AcquisitionConfig from the nested

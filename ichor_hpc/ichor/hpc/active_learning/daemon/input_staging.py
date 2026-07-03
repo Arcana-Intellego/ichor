@@ -810,12 +810,12 @@ def stage_ferebus_inputs(campaign_dir, config, training_version, is_initial=Fals
     if not feature_csvs:
         raise ValueError("PointsDirectory export produced no *_train.csv files for FEREBUS")
 
-    system = str(getattr(config, "system_name", "SYSTEM"))
-    fractions = (
+    system = str(getattr(config.campaign, "system_name", "SYSTEM"))
+    train_internal_fractions = (
         float(f.train_fraction),
-        float(f.int_val_fraction),
-        float(f.ext_val_fraction),
+        float(f.internal_validation_fraction),
     )
+    external_validation_fraction = float(config.bootstrap.external_validation_fraction)
     from . import ferebus_dataset as _fds
     from .ferebus_split_ledger import ensure_split_assignments
 
@@ -823,7 +823,8 @@ def stage_ferebus_inputs(campaign_dir, config, training_version, is_initial=Fals
         campaign,
         pointdir_names,
         training_version=int(training_version),
-        fractions=fractions,
+        train_internal_fractions=train_internal_fractions,
+        external_validation_fraction=external_validation_fraction,
         pointdir_identity=pointdir_identities,
     )
     ledger_row_ids = dict(split_ledger["row_ids"])
@@ -978,6 +979,7 @@ def stage_ferebus_inputs(campaign_dir, config, training_version, is_initial=Fals
             "split_ledger": {
                 "path": str(split_ledger["path"]),
                 "counts": dict(split_ledger["counts"]),
+                "split_policy": dict(split_ledger.get("split_policy") or {}),
             },
             "tasks": tasks,
         },

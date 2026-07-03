@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import math
@@ -1892,7 +1893,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             )
 
         rejection_rate = len(rejected) / float(n_total)
-        threshold = float(self.config.failure_threshold_fraction)
+        threshold = float(self.config.runtime.failure_threshold_fraction)
         if rejection_rate > threshold:
             return PhaseResult(
                 is_complete=True,
@@ -2273,7 +2274,17 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             source_version=source_version, target_version=next_version,
         )
         from . import input_staging as _stg
+        from .model_contract import FEREBUS_COMMITTED_ARTEFACTS_DIRNAME
         manifest = _stg.read_ferebus_manifest(staging)
+        artefacts_root = staged / FEREBUS_COMMITTED_ARTEFACTS_DIRNAME
+        if artefacts_root.exists():
+            if artefacts_root.parent.resolve(strict=False) != staged.resolve(strict=False):
+                return PhaseResult(
+                    is_complete=True,
+                    failure_reason="ferebus_artefact_archive_path_invalid",
+                )
+            shutil.rmtree(artefacts_root)
+        _stg._copytree_no_symlinks(_Path(staging), artefacts_root)
         for task in manifest.get("tasks", []):
             prop = str(task.get("property"))
             atom = str(task.get("atom"))
@@ -3103,7 +3114,9 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         # too many seeds lost (real failures + absentees) against the TRUE submitted count -> fail
         # rather than quietly commit a short batch as if the array had finished. only gated when we
         # actually know the submitted count (seeds_picked.json present); mirrors the quantum phases.
-        if expected_n and (n_rejected / float(expected_n)) > float(self.config.failure_threshold_fraction):
+        if expected_n and (
+            n_rejected / float(expected_n)
+        ) > float(self.config.runtime.failure_threshold_fraction):
             return PhaseResult(
                 is_complete=True,
                 failure_reason=(

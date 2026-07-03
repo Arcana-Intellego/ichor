@@ -6,12 +6,12 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
-from .ferebus_dataset import plan_sizes
 from .state import atomic_write_json
 
 
 FEREBUS_SPLIT_LEDGER_FILENAME = "ferebus_split_assignments.json"
-FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION = 1
+BOOTSTRAP_EXTERNAL_VALIDATION_FILENAME = "bootstrap_external_validation.json"
+FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION = 2
 _LOCK_FILENAME = "ferebus_split_assignments.lock"
 _SPLITS = ("train", "int_val", "ext_val")
 
@@ -33,6 +33,15 @@ def _ledger_lock(campaign_dir: Path):
 
 def ledger_path(campaign_dir: Path) -> Path:
     return Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING" / FEREBUS_SPLIT_LEDGER_FILENAME
+
+
+def bootstrap_external_validation_path(campaign_dir: Path) -> Path:
+    return (
+        Path(campaign_dir)
+        / ".DATA"
+        / "ACTIVE_LEARNING"
+        / BOOTSTRAP_EXTERNAL_VALIDATION_FILENAME
+    )
 
 
 def _empty_payload() -> Dict[str, Any]:
@@ -68,21 +77,72 @@ def _counts(assignments: Mapping[str, Mapping[str, Any]]) -> Dict[str, int]:
     return out
 
 
-def _target_counts(n_rows: int, fractions: Sequence[float]) -> Dict[str, int]:
-    n_tr, n_iv, n_ev = plan_sizes(n_rows, fractions)
-    return {"train": n_tr, "int_val": n_iv, "ext_val": n_ev}
+def _clamp_int(value: int, lower: int, upper: int) -> int:
+    return max(int(lower), min(int(upper), int(value)))
+
+
+def _plan_train_internal(n_rows: int, fractions: Sequence[float]) -> Dict[str, int]:
+    n = int(n_rows)
+    if n <= 0:
+        return {"train": 0, "int_val": 0}
+    train_fraction, internal_fraction = (float(fractions[0]), float(fractions[1]))
+    n_train = int(round(float(n) * train_fraction))
+    n_train = _clamp_int(n_train, 1, n)
+    n_int = n - n_train
+    if n >= 2 and internal_fraction > 0.0 and n_int < 1:
+        n_int = 1
+        n_train = n - 1
+    return {"train": int(n_train), "int_val": int(n_int)}
+
+
+def _initial_target_counts(
+    n_rows: int,
+    train_internal_fractions: Sequence[float],
+    external_validation_fraction: float,
+) -> Dict[str, int]:
+    n = int(n_rows)
+    if n <= 0:
+        return {"train": 0, "int_val": 0, "ext_val": 0}
+    n_ext = int(round(float(n) * float(external_validation_fraction)))
+    n_ext = _clamp_int(n_ext, 0, max(n - 1, 0))
+    internal = _plan_train_internal(n - n_ext, train_internal_fractions)
+    return {
+        "train": internal["train"],
+        "int_val": internal["int_val"],
+        "ext_val": n_ext,
+    }
+
+
+def _target_counts_for_incremental(
+    total_n: int,
+    assignments: Mapping[str, Mapping[str, Any]],
+    train_internal_fractions: Sequence[float],
+) -> Dict[str, int]:
+    counts = _counts(assignments)
+    non_external_n = max(0, int(total_n) - int(counts["ext_val"]))
+    internal = _plan_train_internal(non_external_n, train_internal_fractions)
+    return {
+        "train": internal["train"],
+        "int_val": internal["int_val"],
+        "ext_val": counts["ext_val"],
+    }
 
 
 def _choose_split(
     assignments: Mapping[str, Mapping[str, Any]],
     *,
     n_after: int,
-    fractions: Sequence[float],
+    train_internal_fractions: Sequence[float],
 ) -> str:
     counts = _counts(assignments)
-    targets = _target_counts(n_after, fractions)
-    deficits = {split: targets[split] - counts[split] for split in _SPLITS}
-    return max(_SPLITS, key=lambda split: (deficits[split], split == "train"))
+    targets = _target_counts_for_incremental(
+        n_after,
+        assignments,
+        train_internal_fractions,
+    )
+    candidate_splits = ("train", "int_val")
+    deficits = {split: targets[split] - counts[split] for split in candidate_splits}
+    return max(candidate_splits, key=lambda split: (deficits[split], split == "train"))
 
 
 def ensure_split_assignments(
@@ -90,14 +150,16 @@ def ensure_split_assignments(
     pointdir_names: Sequence[str],
     *,
     training_version: int,
-    fractions: Sequence[float],
+    train_internal_fractions: Sequence[float],
+    external_validation_fraction: float,
     pointdir_identity: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
     """Assign pointdirs to train/internal/external without moving old rows."""
     names = [str(n) for n in pointdir_names]
     if len(set(names)) != len(names):
         raise ValueError("duplicate pointdir names passed to FEREBUS split ledger")
-    fractions_tuple = tuple(float(x) for x in fractions)
+    train_internal_tuple = tuple(float(x) for x in train_internal_fractions)
+    external_fraction = float(external_validation_fraction)
     path = ledger_path(Path(campaign_dir))
     with _ledger_lock(Path(campaign_dir)):
         payload = _load(path)
@@ -121,7 +183,11 @@ def ensure_split_assignments(
                 )
         new_names = [name for name in sorted(names) if name not in assignments]
         if not assignments and new_names:
-            sizes = _target_counts(len(new_names), fractions_tuple)
+            sizes = _initial_target_counts(
+                len(new_names),
+                train_internal_tuple,
+                external_fraction,
+            )
             ordered_splits: List[str] = (
                 ["train"] * sizes["train"]
                 + ["int_val"] * sizes["int_val"]
@@ -132,7 +198,8 @@ def ensure_split_assignments(
                     "split": split,
                     "first_seen_training_version": int(training_version),
                     "assignment_version": 1,
-                    "fractions_at_assignment": list(fractions_tuple),
+                    "train_internal_fractions_at_assignment": list(train_internal_tuple),
+                    "external_validation_fraction_at_assignment": external_fraction,
                     "provenance_sha256": identities.get(name),
                 }
         else:
@@ -140,20 +207,43 @@ def ensure_split_assignments(
                 split = _choose_split(
                     assignments,
                     n_after=len(assignments) + 1,
-                    fractions=fractions_tuple,
+                    train_internal_fractions=train_internal_tuple,
                 )
                 assignments[name] = {
                     "split": split,
                     "first_seen_training_version": int(training_version),
                     "assignment_version": 1,
-                    "fractions_at_assignment": list(fractions_tuple),
+                    "train_internal_fractions_at_assignment": list(train_internal_tuple),
+                    "external_validation_fraction_at_assignment": external_fraction,
                     "provenance_sha256": identities.get(name),
                 }
         payload = {
             "schema_version": FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION,
+            "split_policy": {
+                "bootstrap_external_validation_fraction": external_fraction,
+                "ferebus_train_fraction": train_internal_tuple[0],
+                "ferebus_internal_validation_fraction": train_internal_tuple[1],
+                "external_validation_applies_to_bootstrap_only": True,
+            },
             "assignments": assignments,
         }
         atomic_write_json(path, payload)
+        external_names = [
+            name
+            for name, record in sorted(assignments.items())
+            if str(record.get("split")) == "ext_val"
+        ]
+        atomic_write_json(
+            bootstrap_external_validation_path(Path(campaign_dir)),
+            {
+                "schema_version": 1,
+                "ledger_schema_version": FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION,
+                "external_validation_fraction": external_fraction,
+                "n_external": len(external_names),
+                "pointdirs": external_names,
+                "applies_to_bootstrap_only": True,
+            },
+        )
 
     row_ids = {split: [] for split in _SPLITS}
     missing = []
@@ -173,4 +263,5 @@ def ensure_split_assignments(
         "assignments": assignments,
         "row_ids": row_ids,
         "counts": {split: len(row_ids[split]) for split in _SPLITS},
+        "split_policy": dict(payload.get("split_policy") or {}),
     }

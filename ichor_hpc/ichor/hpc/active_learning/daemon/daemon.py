@@ -420,7 +420,9 @@ class Daemon:
                     + "`. Stateful artefacts: "
                     + ", ".join(artefacts[:8])
                 )
-            state = fresh_campaign_state(max_iterations=self.config.max_iterations)
+            state = fresh_campaign_state(
+                max_iterations=self.config.campaign.max_iterations
+            )
             write_state(sp, state)
             try:
                 from .config_lock import ensure_config_lock
@@ -1281,7 +1283,7 @@ class Daemon:
             return self._postprocess(state, phase, observations, summary)
 
         success_ratio = summary.n_completed / summary.n_tasks
-        failure_threshold = 1.0 - self.config.failure_threshold_fraction
+        failure_threshold = 1.0 - self.config.runtime.failure_threshold_fraction
 
         if summary.is_fully_successful or success_ratio >= failure_threshold:
             return self._postprocess(state, phase, observations, summary)
@@ -2348,9 +2350,9 @@ class Daemon:
             else:
                 idle_streak = 0
             poll = (
-                self.config.poll_interval_idle_seconds
+                self.config.runtime.poll_interval_idle_seconds
                 if idle_streak >= 3
-                else self.config.poll_interval_seconds
+                else self.config.runtime.poll_interval_seconds
             )
             try:
                 state = read_state(self.state_path())

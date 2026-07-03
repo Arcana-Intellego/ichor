@@ -221,13 +221,13 @@ def _pool_feasibility_summary(
         if bool(config.anti_overlap.skip_training_seeds):
             required = (
                 int(config.bootstrap.initial_labelled_size)
-                + int(config.max_iterations)
+                + int(config.campaign.max_iterations)
                 * int(config.seed_selection.n_seeds_per_iteration)
             )
             expression = (
                 str(config.bootstrap.initial_labelled_size)
                 + " + "
-                + str(config.max_iterations)
+                + str(config.campaign.max_iterations)
                 + " * "
                 + str(config.seed_selection.n_seeds_per_iteration)
                 + " = "
@@ -534,7 +534,7 @@ def format_sampling_protocol_summary(
             config.active_batch.final_batch_size,
         )
     )
-    lines.append(_line("max_iterations", config.max_iterations))
+    lines.append(_line("campaign.max_iterations", config.campaign.max_iterations))
     lines.extend(_pool_feasibility_summary(config, campaign_dir))
     lines.append(_line("seed_selection.strategy", seed.strategy))
     lines.append(_line("seed_selection.bulk_fraction", seed.bulk_fraction))

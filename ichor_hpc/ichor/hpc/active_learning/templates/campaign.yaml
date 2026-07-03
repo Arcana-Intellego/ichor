@@ -2,34 +2,25 @@
 # Generic first-live-iteration active-learning campaign for CSF3/CSF4.
 # Intended for a small validation run, not a long production campaign.
 
-schema_version: 6
+schema_version: 7
 
 # -------------------------------------------------------------------------
 # Required system-level identifiers
 # -------------------------------------------------------------------------
 
-# Filename-safe token: letters/numbers/_/-, no spaces.
-system_name: CHANGE_ME_SYSTEM
+campaign:
+  # Filename-safe token: letters/numbers/_/-, no spaces.
+  system_name: CHANGE_ME_SYSTEM
 
-# First live iteration only.
-# This means: bootstrap initial training/model, then run one active-learning loop.
-max_iterations: 1
-
-poll_interval_seconds: 60
-poll_interval_idle_seconds: 120
-poll_sacct_empty_max_ticks: 10
+  # First live iteration only.
+  # This means: bootstrap initial training/model, then run one active-learning loop.
+  max_iterations: 1
 
 # Keep first-live examples small enough to debug quickly. With the default
 # 20-frame smoke pool, 12 + 1 * 8 = 20 frames are required.
 bootstrap:
   initial_labelled_size: 12
-
-failure_threshold_fraction: 0.5
-
-# Prefer the new RMS TRQN scaling and movement gates; leave force clamp unset
-# so the legacy safe default is used through max_force_per_atom_ha_per_ang.
-max_acquisition_grad_per_ang: null
-max_force_per_atom_ha_per_ang: 50.0
+  external_validation_fraction: 0.2
 
 # -------------------------------------------------------------------------
 # Trajectory pool
@@ -37,8 +28,7 @@ max_force_per_atom_ha_per_ang: 50.0
 
 trajectory_pool:
   # The init command writes the canonical pool under .DATA/TRAJECTORY.
-  # Leave this empty unless your code path explicitly consumes it.
-  source_path: ""
+  source_path: pool.xyz
 
 # -------------------------------------------------------------------------
 # Active batch and seed selection
@@ -61,12 +51,6 @@ sampling_protocol:
   # 1 conservative, 5 balanced/current default, 10 exploratory within hard safety gates.
   sampling_aggressiveness: 5
 
-split:
-  strategy: stratified_with_holdout
-  train_fraction: 0.75
-  val_mid_fraction: 0.15
-  high_holdout_fraction: 0.10
-
 # -------------------------------------------------------------------------
 # FEREBUS
 # -------------------------------------------------------------------------
@@ -84,8 +68,7 @@ ferebus:
   properties:
     - iqa
   train_fraction: 0.8
-  int_val_fraction: 0.1
-  ext_val_fraction: 0.1
+  internal_validation_fraction: 0.2
 
 error_calibration:
   enabled: true
@@ -107,23 +90,25 @@ quality_gates:
   require_readable_aimall_geometry: true
   require_finite_iqa: true
   require_finite_integration_error: true
-  max_abs_integration_error: null
-  iqa_energy_recovery_tolerance_ha: null
-  ferebus_min_ext_r2: null
-  ferebus_max_ext_rmse_ha: null
-  ferebus_max_condition_number: null
+  ariadne_max_displacement_ang: 1.25
+  ariadne_min_pair_distance_ang: 0.60
 
 # -------------------------------------------------------------------------
 # Daemon runtime
 # -------------------------------------------------------------------------
 
 runtime:
+  poll_interval_seconds: 60
+  poll_interval_idle_seconds: 120
+  poll_sacct_empty_max_ticks: 10
   lease_stale_seconds: 900
   postprocess_settle_attempts: 3
   postprocess_settle_seconds: 10
   transient_phase_retry_max: 1
   poll_sacct_unknown_max_ticks: 3
   poll_sacct_missing_max_ticks: 12
+  poll_squeue_inconclusive_max_ticks: 10
+  failure_threshold_fraction: 0.5
   halt_on_tick_exception: true
 
 stop:

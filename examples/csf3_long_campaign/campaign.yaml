@@ -1,14 +1,21 @@
-schema_version: 6
-system_name: ICHOR_CSF3_LONG_CAMPAIGN
-max_iterations: 20
+schema_version: 7
+
+campaign:
+  system_name: ICHOR_CSF3_LONG_CAMPAIGN
+  max_iterations: 20
 
 # Production-style starting point. Calibrate thresholds from one first-live
 # campaign before increasing batch sizes further.
 bootstrap:
   initial_labelled_size: 100
+  external_validation_fraction: 0.2
 
 active_batch:
   final_batch_size: 8
+
+ferebus:
+  train_fraction: 0.8
+  internal_validation_fraction: 0.2
 
 seed_selection:
   strategy: d_optimal

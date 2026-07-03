@@ -3,16 +3,20 @@
 # defaults substantially (see ichor_hpc/.../presets/ for spectroscopy and
 # thermodynamics-focused starting points).
 
-schema_version: 6
-system_name: WATER_TETRAMER
+schema_version: 7
+
+campaign:
+  system_name: WATER_TETRAMER
+  max_iterations: 2
 
 # Iteration loop.
-max_iterations: 2
-poll_interval_seconds: 1
+runtime:
+  poll_interval_seconds: 1
 
 # Initial labelled set before active learning.
 bootstrap:
   initial_labelled_size: 6
+  external_validation_fraction: 0.2
 
 # Final labelled batch per active iteration.
 active_batch:
@@ -39,7 +43,7 @@ resources:
     memory_mode: slurm_env
     link0_mem: 8GB
     memory_fraction_of_slurm: 0.85
-  array_concurrency_limit: null
+  array_concurrency_limit: 4
 
 gaussian:
   method: B3LYP
@@ -54,3 +58,5 @@ aimall:
 
 ferebus:
   scaling: false
+  train_fraction: 0.8
+  internal_validation_fraction: 0.2

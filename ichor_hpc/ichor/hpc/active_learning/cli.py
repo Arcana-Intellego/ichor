@@ -1668,7 +1668,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     d = Daemon(**daemon_kwargs)
     if args.poll_interval is not None:
         #override config-loaded poll interval per-invocation.
-        d.config.poll_interval_seconds = int(args.poll_interval)
+        d.config.runtime.poll_interval_seconds = int(args.poll_interval)
     return d.run(max_ticks=args.max_ticks, catch_keyboard_interrupt=True)
 
 
@@ -2658,7 +2658,7 @@ def _apply_runtime_config_to_recovered_state(report, config: Optional[CampaignCo
     if config is None:
         return
     try:
-        configured_max = int(config.max_iterations)
+        configured_max = int(config.campaign.max_iterations)
     except Exception:
         return
     if int(report.proposed_state.max_iterations) != configured_max:
@@ -4035,7 +4035,7 @@ def _bootstrap_fresh_campaign_state(
         review = review_config_changes(
             campaign,
             config,
-            fresh_campaign_state(max_iterations=int(config.max_iterations)),
+            fresh_campaign_state(max_iterations=int(config.campaign.max_iterations)),
             initialise_missing=False,
         )
         if review.changed:
@@ -4050,7 +4050,7 @@ def _bootstrap_fresh_campaign_state(
         ensure_config_lock(campaign, config)
         lock_status = "created"
 
-    state = fresh_campaign_state(max_iterations=int(config.max_iterations))
+    state = fresh_campaign_state(max_iterations=int(config.campaign.max_iterations))
     write_state(state_path, state)
     return {
         "state_status": "created",
@@ -4163,6 +4163,46 @@ def cmd_import_pool(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
     return cmd_init(args)
+
+
+def cmd_config_check(args: argparse.Namespace) -> int:
+    campaign = resolve_campaign_dir(getattr(args, "campaign_dir", None))
+    try:
+        config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+    except Exception as exc:
+        print(
+            "campaign.yaml invalid: " + type(exc).__name__ + ": " + str(exc),
+            file=sys.stderr,
+        )
+        return 2
+    summary = {
+        "schema_version": int(config.schema_version),
+        "campaign": {
+            "system_name": str(config.campaign.system_name),
+            "max_iterations": int(config.campaign.max_iterations),
+        },
+        "bootstrap": {
+            "initial_labelled_size": int(config.bootstrap.initial_labelled_size),
+            "external_validation_fraction": float(
+                config.bootstrap.external_validation_fraction
+            ),
+        },
+        "ferebus": {
+            "train_fraction": float(config.ferebus.train_fraction),
+            "internal_validation_fraction": float(
+                config.ferebus.internal_validation_fraction
+            ),
+        },
+    }
+    try:
+        summary["pool_feasibility"] = _pool_feasibility_summary(campaign, config)
+    except Exception as exc:
+        summary["pool_feasibility"] = {
+            "ok": False,
+            "error": type(exc).__name__ + ": " + str(exc),
+        }
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return 0 if bool(summary["pool_feasibility"].get("ok", False)) else 10
 
 
 def cmd_preflight(args: argparse.Namespace) -> int:
@@ -4582,6 +4622,17 @@ Examples:
         help="Accepted for symmetry with other commands; not used by preflight.",
     )
     p_pre.set_defaults(func=cmd_preflight)
+
+    p_cfg = sub.add_parser(
+        "config-check",
+        help="Validate campaign.yaml and summarise effective split inputs.",
+        description=(
+            "Validate the current campaign.yaml schema and print the key "
+            "campaign/bootstrap/FEREBUS split settings used by the daemon."
+        ),
+    )
+    add_campaign(p_cfg)
+    p_cfg.set_defaults(func=cmd_config_check)
 
     return parser
 

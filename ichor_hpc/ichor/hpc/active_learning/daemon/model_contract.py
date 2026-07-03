@@ -9,6 +9,7 @@ import numpy as np
 
 
 VARIANCE_NEGATIVE_TOLERANCE = 1.0e-10
+FEREBUS_COMMITTED_ARTEFACTS_DIRNAME = "task_artefacts"
 
 
 class ModelContractError(ValueError):
@@ -391,7 +392,16 @@ def validate_ferebus_model_contract(
                 + str(exc)
             ) from exc
 
-    actual_models = {p.resolve() for p in root.rglob("*.model")}
+    actual_models = set()
+    for p in root.rglob("*.model"):
+        if committed:
+            try:
+                rel_parts = p.relative_to(root).parts
+            except ValueError:
+                rel_parts = ()
+            if FEREBUS_COMMITTED_ARTEFACTS_DIRNAME in rel_parts:
+                continue
+        actual_models.add(p.resolve())
     extra_models = actual_models - expected_models
     if extra_models:
         raise ModelContractError(

@@ -15,7 +15,7 @@ from .v4_to_v5 import migrate_v4_to_v5
 from .v5_to_v6 import migrate_v5_to_v6
 
 
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 
 
 class CampaignMigrationError(ValueError):

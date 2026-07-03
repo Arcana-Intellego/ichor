@@ -62,7 +62,6 @@ from ichor.hpc.active_learning.config import (
     VALID_SIZE_NORMALISATION_DISTANCE_MODES,
     VALID_SIZE_NORMALISATION_ENERGY_MODES,
     VALID_SPECTRAL_MODES,
-    VALID_SPLITS,
     VALID_WARMSTART,
 )
 
@@ -471,7 +470,6 @@ class EditCampaignConfigMenuOptions(MenuOptions):
     max_iterations: int = 50
     n_seeds_per_iteration: int = 50
     phase_b_descriptor: str = "hybrid_alf_rmsd"
-    split_strategy: str = "stratified_with_holdout"
     ferebus_warmstart: str = "adaptive"
     ferebus_kernel: str = "rbfc_per"
     acquisition_gradient_mode: str = "cartesian_fd"
@@ -579,13 +577,12 @@ def _sync_options_from_config():
     edit_campaign_config_menu_options.last_error = (
         _last_error[:160] if _last_error else ""
     )
-    edit_campaign_config_menu_options.system_name = _campaign_config.system_name
-    edit_campaign_config_menu_options.max_iterations = _campaign_config.max_iterations
+    edit_campaign_config_menu_options.system_name = _campaign_config.campaign.system_name
+    edit_campaign_config_menu_options.max_iterations = _campaign_config.campaign.max_iterations
     edit_campaign_config_menu_options.n_seeds_per_iteration = (
         _campaign_config.seed_selection.n_seeds_per_iteration
     )
     edit_campaign_config_menu_options.phase_b_descriptor = _campaign_config.phase_b.descriptor
-    edit_campaign_config_menu_options.split_strategy = _campaign_config.split.strategy
     edit_campaign_config_menu_options.ferebus_warmstart = _campaign_config.ferebus.warmstart
     edit_campaign_config_menu_options.ferebus_kernel = _campaign_config.ferebus.kernel
     edit_campaign_config_menu_options.acquisition_gradient_mode = (
@@ -1350,29 +1347,24 @@ edit_campaign_config_menu = ConsoleMenu(
 _BLOCK_MENUS_BY_LABEL = {
     "Edit campaign identity": _make_block_menu(
         "Edit Campaign Identity",
-        "Top-level campaign identity fields.",
-        [_read_only_spec("schema_version"), _spec("system_name", "str")],
+        "Campaign identity and campaign-length fields.",
+        [
+            _read_only_spec("schema_version"),
+            _spec("campaign.system_name", "str"),
+            _spec("campaign.max_iterations", "int"),
+        ],
     ),
     "Edit trajectory_pool": _make_block_menu(
         "Edit trajectory_pool",
         "Trajectory source used when importing the campaign pool.",
         [_spec("trajectory_pool.source_path", "str")],
     ),
-    "Edit iteration control": _make_block_menu(
-        "Edit Iteration Control",
-        "Daemon iteration and polling controls.",
-        [
-            _spec("max_iterations", "int"),
-            _spec("poll_interval_seconds", "int"),
-            _spec("poll_interval_idle_seconds", "int"),
-            _spec("poll_sacct_empty_max_ticks", "int", prompt="poll_sacct_empty_max_ticks (0 disables empty-sacct escalation): "),
-        ],
-    ),
     "Edit bootstrap": _make_block_menu(
         "Edit Bootstrap",
-        "Initial labelled-set size before active learning begins.",
+        "Initial labelled-set size and fixed bootstrap external validation fraction.",
         [
             _spec("bootstrap.initial_labelled_size", "int"),
+            _spec("bootstrap.external_validation_fraction", "float"),
         ],
     ),
     "Edit resource defaults": _make_block_menu(
@@ -1537,16 +1529,6 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("geometry_novelty.fallback_scale_angstrom", "float"),
         ],
     ),
-    "Edit split": _make_block_menu(
-        "Edit split",
-        "High-level train/validation split strategy.",
-        [
-            _spec("split.strategy", "choice", choices=sorted(VALID_SPLITS)),
-            _spec("split.train_fraction", "float", prompt="split.train_fraction (0.0-1.0): "),
-            _spec("split.val_mid_fraction", "float", prompt="split.val_mid_fraction (0.0-1.0): "),
-            _spec("split.high_holdout_fraction", "float", prompt="split.high_holdout_fraction (0.0-1.0): "),
-        ],
-    ),
     "Edit FEREBUS block": _make_block_menu(
         "Edit FEREBUS Block",
         "FEREBUS training and dataset split controls.",
@@ -1562,17 +1544,7 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("ferebus.full_ARD", "bool"),
             _spec("ferebus.properties", "csv_list", prompt="ferebus.properties (comma-separated, e.g. iqa,q00): "),
             _spec("ferebus.train_fraction", "float"),
-            _spec("ferebus.int_val_fraction", "float"),
-            _spec("ferebus.ext_val_fraction", "float"),
-        ],
-    ),
-    "Edit robustness": _make_block_menu(
-        "Edit Robustness",
-        "Global failure and force sanity thresholds.",
-        [
-            _spec("failure_threshold_fraction", "float", prompt="failure_threshold_fraction (0.0-1.0): "),
-            _spec("max_acquisition_grad_per_ang", "optional_float", prompt="max_acquisition_grad_per_ang (acquisition units/Angstrom, null uses deprecated alias): "),
-            _spec("max_force_per_atom_ha_per_ang", "float", prompt="max_force_per_atom_ha_per_ang (deprecated acquisition-gradient alias): "),
+            _spec("ferebus.internal_validation_fraction", "float"),
         ],
     ),
     "Edit acquisition core": _make_block_menu(
@@ -1687,6 +1659,7 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("acquisition.gradient.regularization", "float"),
             _spec("acquisition.gradient.cartesian_step_floor", "float"),
             _spec("acquisition.gradient.ghost_mass_threshold", "float"),
+            _spec("acquisition.gradient.max_acquisition_grad_per_ang", "float"),
         ],
     ),
     "Edit acquisition.barrier": _make_block_menu(
@@ -1822,6 +1795,10 @@ _BLOCK_MENUS_BY_LABEL = {
         "Edit runtime",
         "Daemon runtime resilience and retry controls.",
         [
+            _spec("runtime.poll_interval_seconds", "int"),
+            _spec("runtime.poll_interval_idle_seconds", "int"),
+            _spec("runtime.poll_sacct_empty_max_ticks", "int", prompt="runtime.poll_sacct_empty_max_ticks (0 disables empty-sacct escalation): "),
+            _spec("runtime.failure_threshold_fraction", "float", prompt="runtime.failure_threshold_fraction (0.0-1.0): "),
             _spec("runtime.lease_stale_seconds", "int"),
             _spec("runtime.postprocess_settle_attempts", "int"),
             _spec("runtime.postprocess_settle_seconds", "int"),
@@ -1889,7 +1866,6 @@ edit_campaign_config_menu_items = [
     FunctionItem("Validate current config", EditCampaignConfigFunctions.validate_current_config),
     _block_submenu_item("Edit campaign identity"),
     _block_submenu_item("Edit trajectory_pool"),
-    _block_submenu_item("Edit iteration control"),
     _block_submenu_item("Edit bootstrap"),
     _block_submenu_item("Edit resource defaults"),
     _block_submenu_item("Edit POLUS resources"),
@@ -1905,9 +1881,7 @@ edit_campaign_config_menu_items = [
     _block_submenu_item("Edit anti_overlap"),
     _block_submenu_item("Edit phase_b"),
     _block_submenu_item("Edit geometry_novelty"),
-    _block_submenu_item("Edit split"),
     _block_submenu_item("Edit FEREBUS block"),
-    _block_submenu_item("Edit robustness"),
     SubmenuItem(
         "Edit acquisition",
         edit_acquisition_config_menu,

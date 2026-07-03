@@ -156,11 +156,7 @@ def _matches(path: str, exact: Iterable[str], prefixes: Iterable[str]) -> bool:
 
 
 RUNTIME_SAFE_EXACT = {
-    "max_iterations",
-    "poll_interval_seconds",
-    "poll_interval_idle_seconds",
-    "poll_sacct_empty_max_ticks",
-    "failure_threshold_fraction",
+    "campaign.max_iterations",
 }
 RUNTIME_SAFE_PREFIXES = {
     "runtime.",
@@ -207,11 +203,11 @@ PRE_PHASE_A_EXACT = {"bootstrap.initial_labelled_size"}
 PRE_GAUSSIAN_PREFIXES = {"gaussian."}
 PRE_AIMALL_PREFIXES = {"aimall."}
 PRE_FEREBUS_FIRST_EXACT = {
-    "system_name",
+    "campaign.system_name",
+    "bootstrap.external_validation_fraction",
     "ferebus.properties",
     "ferebus.train_fraction",
-    "ferebus.int_val_fraction",
-    "ferebus.ext_val_fraction",
+    "ferebus.internal_validation_fraction",
     "acquisition.property_name",
 }
 FUTURE_FEREBUS_EXACT = {
@@ -234,8 +230,6 @@ PRE_SEED_SELECT_EXACT = {
 }
 PRE_SEED_SELECT_PREFIXES = {"seed_selection."}
 PRE_ARIADNE_EXACT = {
-    "max_acquisition_grad_per_ang",
-    "max_force_per_atom_ha_per_ang",
     "resources.gradient_parallel_backend",
     "quality_gates.ariadne_max_displacement_ang",
     "quality_gates.ariadne_min_pair_distance_ang",
@@ -254,7 +248,7 @@ PRE_PHASE_B_PREFIXES = {
     "active_batch.",
     "phase_b.",
 }
-PRE_SPLIT_PREFIXES = {"split."}
+PRE_SPLIT_PREFIXES: set[str] = set()
 PRE_AIMALL_QUALITY_EXACT = {
     "quality_gates.require_readable_aimall_geometry",
     "quality_gates.require_finite_iqa",
@@ -281,8 +275,7 @@ ARIADNE_OUTPUT_INTERPRETATION_PREFIXES = {
     "sampling_protocol.",
 }
 ARIADNE_OUTPUT_INTERPRETATION_EXACT = {
-    "max_acquisition_grad_per_ang",
-    "max_force_per_atom_ha_per_ang",
+    "acquisition.gradient.max_acquisition_grad_per_ang",
 }
 
 PHASE_B_OUTPUT_INTERPRETATION_PREFIXES = {
@@ -354,7 +347,6 @@ _POLICIES_PREFIX: Tuple[Tuple[str, ConfigFieldPolicy], ...] = (
     ("active_batch.", ConfigFieldPolicy("pre_phase_b", "pre_phase_b", "editable until Phase B consumes this iteration")),
     ("phase_b.", ConfigFieldPolicy("pre_phase_b", "pre_phase_b", "editable until Phase B consumes this iteration")),
     ("geometry_novelty.", ConfigFieldPolicy("pre_sampling_protocol", "pre_sampling_protocol", "editable until ARIADNE/Phase B consumes this iteration")),
-    ("split.", ConfigFieldPolicy("pre_split", "pre_split", "editable until split.json exists for this iteration")),
     ("acquisition.", ConfigFieldPolicy("pre_ariadne", "pre_ariadne", "editable until ARIADNE consumes this iteration")),
     ("ariadne.", ConfigFieldPolicy("pre_ariadne", "pre_ariadne", "editable until ARIADNE consumes this iteration")),
     ("adversarial_safety.", ConfigFieldPolicy("pre_ariadne", "pre_ariadne", "editable until ARIADNE/Phase B consumes this iteration")),
