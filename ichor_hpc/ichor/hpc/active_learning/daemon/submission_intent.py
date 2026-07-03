@@ -156,6 +156,7 @@ def update_intent_status(
     reason: Optional[str] = None,
     expected_tasks: Optional[int] = None,
     job_ids_seen: Optional[Any] = None,
+    submission_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     path = intent_path(campaign_dir, phase_name, iteration)
     data = load_intent(campaign_dir, phase_name, iteration) or {
@@ -181,6 +182,24 @@ def update_intent_status(
         data["reason"] = str(reason)
     if expected_tasks is not None:
         data["expected_tasks"] = int(expected_tasks)
+    if submission_metadata:
+        metadata = dict(submission_metadata)
+        data["submission_metadata"] = metadata
+        array_recovery = metadata.get("array_recovery")
+        if isinstance(array_recovery, dict):
+            data["array_recovery"] = dict(array_recovery)
+            logical_total = array_recovery.get("logical_total")
+            retry_count = array_recovery.get("n_retry")
+            try:
+                if logical_total is not None:
+                    data["logical_expected_tasks"] = int(logical_total)
+            except (TypeError, ValueError):
+                pass
+            try:
+                if retry_count is not None:
+                    data["retry_expected_tasks"] = int(retry_count)
+            except (TypeError, ValueError):
+                pass
     if job_ids_seen is not None:
         data["job_ids_seen"] = [str(x) for x in list(job_ids_seen)]
     if str(status) == "SUBMITTED":
@@ -286,10 +305,12 @@ def mark_submitted(
     job_id: str,
     *,
     expected_tasks: Optional[int] = None,
+    submission_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     return update_intent_status(
         campaign_dir, phase_name=phase_name, iteration=iteration,
         status="SUBMITTED", job_id=str(job_id), expected_tasks=expected_tasks,
+        submission_metadata=submission_metadata,
     )
 
 

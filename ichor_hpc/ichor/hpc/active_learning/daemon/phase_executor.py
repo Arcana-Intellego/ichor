@@ -84,6 +84,7 @@ class PhaseResult:
     state_updates: Dict[str, Any] = field(default_factory=dict)
     journal_events: List[Dict[str, Any]] = field(default_factory=list)
     failure_reason: Optional[str] = None
+    submission_metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class PhaseExecutor(Protocol):
@@ -166,6 +167,5 @@ class MockPhaseExecutor:
     def operations(self) -> List[str]:
         """Compact list of (operation, phase) pairs for assertions."""
         return [c.operation + ":" + c.phase for c in self.calls]
-
 
 

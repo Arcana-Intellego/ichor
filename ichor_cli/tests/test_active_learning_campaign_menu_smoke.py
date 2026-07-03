@@ -49,6 +49,7 @@ def test_daemon_control_menu_items():
         "Reconcile state",
         "Reconcile --apply",
         "Reconcile --archive-staging --apply",
+        "Reconcile force-resubmit current array",
         "Restore campaign.yaml proposal from config lock",
         "Reconcile state with --allow-fresh-init",
     ):

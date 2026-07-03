@@ -499,11 +499,18 @@ def stage_gaussian_inputs(
             ) from exc
     g = config.gaussian
     staging = bucket_dir(campaign_dir, phase_name, iteration)
-    # clear the bucket first so a same-iteration crash-retry does not leave stale POINT_*.pointdir
-    # from a partial earlier attempt mixed in with the fresh staging. gaussian is the bucket's FIRST
-    # writer so clearing here is safe -- AIMAll staging must NOT clear because it consumes the
-    # Gaussian acceptance manifest and the accepted pointdirs in this same bucket.
+    preserve_existing_layout = False
     if staging.exists():
+        try:
+            preserve_existing_layout = (
+                len(_points_file_names(staging)) == len(frames)
+            )
+        except Exception:
+            preserve_existing_layout = False
+    # Keep an existing same-size layout so partial array recovery can reuse
+    # completed Gaussian outputs.  If the layout is malformed or the task
+    # count changed, clear it before staging fresh inputs.
+    if staging.exists() and not preserve_existing_layout:
         _checked_rmtree(
             staging,
             campaign_dir=Path(campaign_dir),

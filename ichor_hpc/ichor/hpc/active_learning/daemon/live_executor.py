@@ -75,6 +75,11 @@ from .cluster_profile import (
 )
 from .state import CampaignPhase, atomic_write_json
 from .job_names import live_job_name
+from .array_recovery import (
+    compact_array_recovery_summary,
+    prepare_retry_submission,
+    supports_partial_array_recovery,
+)
 
 
 __all__ = [
@@ -334,7 +339,12 @@ def _sampling_protocol_for_ariadne_result(
     ), diagnostics
 
 
-def clean_stale_ariadne_seed_outputs(campaign_dir, iteration: int) -> List[str]:
+def clean_stale_ariadne_seed_outputs(
+    campaign_dir,
+    iteration: int,
+    *,
+    retry_seed_indices: Optional[Sequence[int]] = None,
+) -> List[str]:
     """Remove stale per-seed ARIADNE result files before a retry submission.
 
     Only daemon-owned output files are removed. Seed directories and iteration
@@ -354,7 +364,15 @@ def clean_stale_ariadne_seed_outputs(campaign_dir, iteration: int) -> List[str]:
 
     iter_root = iter_dir.resolve()
     removed: List[str] = []
+    allowed = None
+    if retry_seed_indices is not None:
+        allowed = {
+            "seed_" + str(int(seed_index)).zfill(4)
+            for seed_index in retry_seed_indices
+        }
     for seed_dir in sorted(pool_dir.glob("seed_*")):
+        if allowed is not None and seed_dir.name not in allowed:
+            continue
         if seed_dir.is_symlink():
             raise BackendSubmissionError(
                 "refusing to clean symlinked ARIADNE seed directory: "
@@ -1445,10 +1463,45 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 raise BackendSubmissionError(
                     "nothing to submit for " + phase_name + ": staged 0 points/seeds"
                 )
+            submission_metadata: Dict[str, Any] = {}
+            array_task_map: Optional[Path] = None
+            if supports_partial_array_recovery(phase_name):
+                recovery = prepare_retry_submission(
+                    self.campaign_dir,
+                    phase_name,
+                    int(getattr(state, "iteration", 0)),
+                )
+                recovery_summary = compact_array_recovery_summary(recovery)
+                submission_metadata["array_recovery"] = recovery_summary
+                self._journal_event(
+                    "partial_array_recovery_prepared",
+                    phase=phase_name,
+                    iteration=int(getattr(state, "iteration", 0)),
+                    **recovery_summary,
+                )
+                retry_ids = list(recovery.get("retry_task_ids") or [])
+                if not retry_ids and int(recovery.get("logical_total") or 0) > 0:
+                    self._journal_event(
+                        "partial_array_recovery_postprocess_only",
+                        phase=phase_name,
+                        iteration=int(getattr(state, "iteration", 0)),
+                        **recovery_summary,
+                    )
+                    return self.postprocess(state, phase, [])
+                if retry_ids:
+                    array_size = len(retry_ids)
+                    retry_file = recovery.get("retry_task_file")
+                    if retry_file:
+                        array_task_map = Path(str(retry_file))
             if phase_name == "ARIADNE_ARRAY":
                 removed = clean_stale_ariadne_seed_outputs(
                     self.campaign_dir,
                     int(getattr(state, "iteration", 0)),
+                    retry_seed_indices=(
+                        None
+                        if array_task_map is None
+                        else [int(x) for x in (recovery.get("retry_task_ids") or [])]
+                    ),
                 )
                 if removed:
                     self._journal_event(
@@ -1457,7 +1510,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         removed=int(len(removed)),
                         sample=[str(p) for p in removed[:5]],
                     )
-            script = self._write_real_script(phase_name, state, array_size)
+            script = self._write_real_script(
+                phase_name,
+                state,
+                array_size,
+                array_task_map=array_task_map,
+            )
         except BackendSubmissionError:
             raise
         except Exception as exc:
@@ -1491,11 +1549,19 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             is_complete=False,
             submitted_job_id=job_id,
             expected_tasks=expected_tasks,
+            submission_metadata=submission_metadata,
         )
 
     # --- real script bodies --------------------------------------------
 
-    def _write_real_script(self, phase_name: str, state, array_size=None) -> Path:
+    def _write_real_script(
+        self,
+        phase_name: str,
+        state,
+        array_size=None,
+        *,
+        array_task_map: Optional[Path] = None,
+    ) -> Path:
         self.scripts_dir.mkdir(parents=True, exist_ok=True)
         (self.scripts_dir / "OUTPUTS").mkdir(parents=True, exist_ok=True)
         (self.scripts_dir / "ERRORS").mkdir(parents=True, exist_ok=True)
@@ -1523,6 +1589,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             campaign_dir=self.campaign_dir,
             config=self.config,
             array_size=array_size,
+            array_task_map=array_task_map,
             walltime_hours=self.walltime_hours,
             partition=self.partition,
             campaign_uid=getattr(state, "campaign_uid", None),
@@ -3692,6 +3759,7 @@ def build_sbatch_script(
     campaign_dir: Path,
     config: CampaignConfig,
     array_size: Optional[int] = None,
+    array_task_map: Optional[Path] = None,
     walltime_hours: Optional[float] = None,
     partition: Optional[str] = None,
     campaign_uid: Optional[str] = None,
@@ -3702,7 +3770,9 @@ def build_sbatch_script(
     Resources come from config.resources (partition / walltime / mem /
     cpus-per-task / ntasks); walltime_hours and partition may still be passed
     to override them. array_size, when given, turns the job into a
-    0..array_size-1 SLURM array -- one task per staged point or seed.
+    0..array_size-1 SLURM array. array_task_map, when given, maps that
+    dense Slurm index onto the original logical task id for partial array
+    recovery.
 
     Paths are absolute (resolved campaign dir) so the script does not depend
     on sbatch being launched from any particular directory.
@@ -3797,15 +3867,27 @@ def build_sbatch_script(
             camp,
             config,
             points_file,
+            array_task_map=array_task_map,
             campaign_uid=campaign_uid,
             resolved_resources=resolved,
         )
     elif phase_name in ("INITIAL_AIMALL", "AIMALL"):
-        lines += _aimall_invocation_block(iteration, camp, config, points_file)
+        lines += _aimall_invocation_block(
+            iteration,
+            camp,
+            config,
+            points_file,
+            array_task_map=array_task_map,
+        )
     elif phase_name in ("INITIAL_FEREBUS", "FEREBUS"):
         lines += _ferebus_invocation_block(iteration, camp, config)
     elif phase_name == "ARIADNE_ARRAY":
-        lines += _ariadne_invocation_block(iteration, camp, config)
+        lines += _ariadne_invocation_block(
+            iteration,
+            camp,
+            config,
+            array_task_map=array_task_map,
+        )
     elif phase_name in ("PHASE_A_POLUS", "PHASE_B_POLUS"):
         lines += _polus_invocation_block(phase_name, iteration, camp, config)
     else:
@@ -3816,6 +3898,24 @@ def build_sbatch_script(
     return "\n".join(lines)
 
 
+def _array_task_mapping_lines(array_task_map: Optional[Path]) -> List[str]:
+    if array_task_map is None:
+        return [
+            'ICHOR_LOGICAL_ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID}"',
+        ]
+    task_map = _shell_quote(str(Path(array_task_map).resolve()))
+    return [
+        "if [ ! -f " + task_map + " ]; then echo "
+        + _shell_quote("retry task map missing: " + str(Path(array_task_map).resolve()))
+        + " >&2; exit 1; fi",
+        'ICHOR_LOGICAL_ARRAY_TASK_ID=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" '
+        + task_map
+        + ")",
+        'if [ -z "$ICHOR_LOGICAL_ARRAY_TASK_ID" ]; then echo "no logical task id for retry index $SLURM_ARRAY_TASK_ID" >&2; exit 1; fi',
+        'case "$ICHOR_LOGICAL_ARRAY_TASK_ID" in (*[!0-9]*|"") echo "unsafe logical task id: $ICHOR_LOGICAL_ARRAY_TASK_ID" >&2; exit 1 ;; esac',
+    ]
+
+
 def _gaussian_invocation_block(
     phase_name,
     iteration,
@@ -3823,6 +3923,7 @@ def _gaussian_invocation_block(
     config,
     points_file,
     *,
+    array_task_map: Optional[Path] = None,
     campaign_uid: Optional[str] = None,
     resolved_resources: ResolvedPhaseResources,
 ) -> List[str]:
@@ -3878,8 +3979,9 @@ def _gaussian_invocation_block(
         "if [ ! -f " + points_file_q + " ]; then echo "
         + _shell_quote("POINTS.txt missing: " + points_file)
         + " >&2; exit 1; fi",
-        'POINT_DIR=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" ' + points_file_q + ")",
-        'if [ -z "$POINT_DIR" ]; then echo "no pointdir for index $SLURM_ARRAY_TASK_ID" >&2; exit 1; fi',
+        *_array_task_mapping_lines(array_task_map),
+        'POINT_DIR=$(sed -n "$((ICHOR_LOGICAL_ARRAY_TASK_ID + 1))p" ' + points_file_q + ")",
+        'if [ -z "$POINT_DIR" ]; then echo "no pointdir for logical index $ICHOR_LOGICAL_ARRAY_TASK_ID" >&2; exit 1; fi',
         'case "$POINT_DIR" in "$ICHOR_CAMPAIGN_DIR"/.DATA/STAGING/initial/POINT_*.pointdir|"$ICHOR_CAMPAIGN_DIR"/.DATA/STAGING/iter_"$ICHOR_ITERATION"/POINT_*.pointdir) ;; *) echo "POINT_DIR escapes campaign staging: $POINT_DIR" >&2; exit 1 ;; esac',
         'if [ -L "$POINT_DIR" ]; then echo "POINT_DIR is a symlink: $POINT_DIR" >&2; exit 1; fi',
         'if [ ! -f "$POINT_DIR/input.gjf" ]; then echo "input.gjf missing in $POINT_DIR" >&2; exit 1; fi',
@@ -3942,7 +4044,14 @@ def _configured_backend_modules(backend_name: str, fallback: List[str]) -> List[
     return _normalise_module_list(raw, label=backend_name)
 
 
-def _aimall_invocation_block(iteration, camp, config, points_file) -> List[str]:
+def _aimall_invocation_block(
+    iteration,
+    camp,
+    config,
+    points_file,
+    *,
+    array_task_map: Optional[Path] = None,
+) -> List[str]:
     aimall_path = _configured_backend_path("aimall", "~/AIMAll/aimqb.ish")
     aimall_cfg = getattr(config, "aimall", None)
     args: List[str] = []
@@ -3972,8 +4081,9 @@ def _aimall_invocation_block(iteration, camp, config, points_file) -> List[str]:
         "if [ ! -f " + points_file_q + " ]; then echo "
         + _shell_quote("POINTS.txt missing: " + points_file)
         + " >&2; exit 1; fi",
-        'POINT_DIR=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" ' + points_file_q + ")",
-        'if [ -z "$POINT_DIR" ]; then echo "no pointdir for index $SLURM_ARRAY_TASK_ID" >&2; exit 1; fi',
+        *_array_task_mapping_lines(array_task_map),
+        'POINT_DIR=$(sed -n "$((ICHOR_LOGICAL_ARRAY_TASK_ID + 1))p" ' + points_file_q + ")",
+        'if [ -z "$POINT_DIR" ]; then echo "no pointdir for logical index $ICHOR_LOGICAL_ARRAY_TASK_ID" >&2; exit 1; fi',
         'case "$POINT_DIR" in "$ICHOR_CAMPAIGN_DIR"/.DATA/STAGING/initial/POINT_*.pointdir|"$ICHOR_CAMPAIGN_DIR"/.DATA/STAGING/iter_"$ICHOR_ITERATION"/POINT_*.pointdir) ;; *) echo "POINT_DIR escapes campaign staging: $POINT_DIR" >&2; exit 1 ;; esac',
         'if [ -L "$POINT_DIR" ]; then echo "POINT_DIR is a symlink: $POINT_DIR" >&2; exit 1; fi',
         'if [ ! -f "$POINT_DIR/input.wfn" ]; then echo "input.wfn missing in $POINT_DIR" >&2; exit 1; fi',
@@ -4000,7 +4110,13 @@ def _ferebus_invocation_block(iteration, camp, config) -> List[str]:
     ]
 
 
-def _ariadne_invocation_block(iteration, camp, config) -> List[str]:
+def _ariadne_invocation_block(
+    iteration,
+    camp,
+    config,
+    *,
+    array_task_map: Optional[Path] = None,
+) -> List[str]:
     # single-threaded BLAS so the acquisition-gradient process-pool owns the
     # cores SLURM gave this task.
     python = _python_executable_for_script()
@@ -4009,8 +4125,9 @@ def _ariadne_invocation_block(iteration, camp, config) -> List[str]:
         "# ARIADNE per-seed adversarial attack array.",
         "export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1",
         "cd " + camp_q,
+        *_array_task_mapping_lines(array_task_map),
         python + " -m ichor.hpc.active_learning.acquisition.ariadne_runner \\",
-        "    --seed-index $SLURM_ARRAY_TASK_ID \\",
+        "    --seed-index $ICHOR_LOGICAL_ARRAY_TASK_ID \\",
         "    --iteration " + str(iteration) + " \\",
         "    --campaign-dir " + camp_q,
     ]

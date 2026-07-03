@@ -327,7 +327,11 @@ _POLICIES_EXACT: Dict[str, ConfigFieldPolicy] = {
         for path in PRE_SEED_SELECT_EXACT
     },
     **{
-        path: ConfigFieldPolicy("pre_ariadne", "pre_ariadne", "editable until ARIADNE consumes this iteration")
+        path: ConfigFieldPolicy(
+            "pre_ariadne",
+            "pre_ariadne",
+            "editable until ARIADNE consumes this iteration; current ARIADNE array edits require --force-resubmit-array-tasks",
+        )
         for path in PRE_ARIADNE_EXACT
     },
     **{
@@ -339,17 +343,17 @@ _POLICIES_EXACT: Dict[str, ConfigFieldPolicy] = {
 _POLICIES_PREFIX: Tuple[Tuple[str, ConfigFieldPolicy], ...] = (
     ("runtime.", ConfigFieldPolicy("runtime_safe", "runtime", "safe runtime/future daemon change")),
     ("stop.", ConfigFieldPolicy("runtime_safe", "runtime", "safe future STOP_CHECK change")),
-    ("error_calibration.", ConfigFieldPolicy("runtime_safe", "runtime", "safe future calibration/acquisition change")),
-    ("gaussian.", ConfigFieldPolicy("pre_gaussian", "pre_gaussian_first", "editable until first Gaussian staging/submission")),
-    ("aimall.", ConfigFieldPolicy("pre_aimall", "pre_aimall_first", "editable until first AIMAll staging/submission")),
+    ("error_calibration.", ConfigFieldPolicy("runtime_safe", "runtime", "safe future calibration/acquisition change; current ARIADNE reuse may require force-resubmitting the array")),
+    ("gaussian.", ConfigFieldPolicy("pre_gaussian", "pre_gaussian_first", "editable until first Gaussian staging/submission; current Gaussian array edits require --force-resubmit-array-tasks")),
+    ("aimall.", ConfigFieldPolicy("pre_aimall", "pre_aimall_first", "editable until first AIMAll staging/submission; current AIMAll array edits require --force-resubmit-array-tasks")),
     ("seed_selection.", ConfigFieldPolicy("pre_seed_select", "pre_seed_select", "editable until seed selection for this iteration")),
-    ("sampling_protocol.", ConfigFieldPolicy("pre_sampling_protocol", "pre_sampling_protocol", "editable until ARIADNE/Phase B consumes this iteration")),
+    ("sampling_protocol.", ConfigFieldPolicy("pre_sampling_protocol", "pre_sampling_protocol", "editable until ARIADNE/Phase B consumes this iteration; current ARIADNE array edits require --force-resubmit-array-tasks")),
     ("active_batch.", ConfigFieldPolicy("pre_phase_b", "pre_phase_b", "editable until Phase B consumes this iteration")),
     ("phase_b.", ConfigFieldPolicy("pre_phase_b", "pre_phase_b", "editable until Phase B consumes this iteration")),
-    ("geometry_novelty.", ConfigFieldPolicy("pre_sampling_protocol", "pre_sampling_protocol", "editable until ARIADNE/Phase B consumes this iteration")),
-    ("acquisition.", ConfigFieldPolicy("pre_ariadne", "pre_ariadne", "editable until ARIADNE consumes this iteration")),
-    ("ariadne.", ConfigFieldPolicy("pre_ariadne", "pre_ariadne", "editable until ARIADNE consumes this iteration")),
-    ("adversarial_safety.", ConfigFieldPolicy("pre_ariadne", "pre_ariadne", "editable until ARIADNE/Phase B consumes this iteration")),
+    ("geometry_novelty.", ConfigFieldPolicy("pre_sampling_protocol", "pre_sampling_protocol", "editable until ARIADNE/Phase B consumes this iteration; current ARIADNE array edits require --force-resubmit-array-tasks")),
+    ("acquisition.", ConfigFieldPolicy("pre_ariadne", "pre_ariadne", "editable until ARIADNE consumes this iteration; current ARIADNE array edits require --force-resubmit-array-tasks")),
+    ("ariadne.", ConfigFieldPolicy("pre_ariadne", "pre_ariadne", "editable until ARIADNE consumes this iteration; current ARIADNE array edits require --force-resubmit-array-tasks")),
+    ("adversarial_safety.", ConfigFieldPolicy("pre_ariadne", "pre_ariadne", "editable until ARIADNE/Phase B consumes this iteration; current ARIADNE array edits require --force-resubmit-array-tasks")),
     ("anti_overlap.", ConfigFieldPolicy("pre_ariadne", "pre_ariadne", "editable until ARIADNE consumes this iteration")),
 )
 
@@ -824,8 +828,36 @@ def _consumption_block_reason(
     policy: ConfigFieldPolicy,
     campaign_dir: Union[str, Path],
     proposed_state: CampaignState,
+    *,
+    force_resubmit_array_phase: Optional[CampaignPhase] = None,
+    path: str = "",
 ) -> Optional[str]:
     kind = policy.lock_kind
+    if force_resubmit_array_phase is not None:
+        phase = force_resubmit_array_phase
+        dotted = str(path)
+        if phase in (CampaignPhase.INITIAL_GAUSSIAN, CampaignPhase.GAUSSIAN):
+            if dotted.startswith("gaussian.") or dotted in RESOURCE_FUTURE_EXACT:
+                return None
+        if phase in (CampaignPhase.INITIAL_AIMALL, CampaignPhase.AIMALL):
+            if (
+                dotted.startswith("aimall.")
+                or dotted in PRE_AIMALL_QUALITY_EXACT
+                or dotted in RESOURCE_FUTURE_EXACT
+            ):
+                return None
+        if phase is CampaignPhase.ARIADNE_ARRAY:
+            if (
+                dotted.startswith("acquisition.")
+                or dotted.startswith("ariadne.")
+                or dotted.startswith("adversarial_safety.")
+                or dotted.startswith("sampling_protocol.")
+                or dotted.startswith("geometry_novelty.")
+                or dotted.startswith("error_calibration.")
+                or dotted in PRE_ARIADNE_EXACT
+                or dotted in RESOURCE_FUTURE_EXACT
+            ):
+                return None
     if kind == "immutable":
         return "field is immutable once a campaign config lock exists"
     if kind == "runtime":
@@ -897,6 +929,8 @@ def _classify_change(
     path: str,
     old: Any,
     new: Any,
+    *,
+    force_resubmit_array_phase: Optional[CampaignPhase] = None,
 ) -> ConfigChange:
     policy = field_policy_for_path(path)
     if policy is None:
@@ -908,7 +942,13 @@ def _classify_change(
             False,
             "field has no configured mid-campaign change policy",
         )
-    blocked_reason = _consumption_block_reason(policy, campaign_dir, proposed_state)
+    blocked_reason = _consumption_block_reason(
+        policy,
+        campaign_dir,
+        proposed_state,
+        force_resubmit_array_phase=force_resubmit_array_phase,
+        path=path,
+    )
     if blocked_reason:
         category = (
             "postprocess_locked"
@@ -936,6 +976,7 @@ def review_config_changes(
     proposed_state: CampaignState,
     *,
     initialise_missing: bool = False,
+    force_resubmit_array_phase: Optional[CampaignPhase] = None,
 ) -> ConfigLockReview:
     path = config_lock_path(campaign_dir)
     if not path.is_file():
@@ -990,7 +1031,14 @@ def review_config_changes(
         return review
     review = ConfigLockReview(lock_path=path, lock_existed=True)
     for dotted, old, new in _diff(old_config, new_config):
-        change = _classify_change(campaign_dir, proposed_state, dotted, old, new)
+        change = _classify_change(
+            campaign_dir,
+            proposed_state,
+            dotted,
+            old,
+            new,
+            force_resubmit_array_phase=force_resubmit_array_phase,
+        )
         if change.allowed:
             review.allowed_changes.append(change)
         else:

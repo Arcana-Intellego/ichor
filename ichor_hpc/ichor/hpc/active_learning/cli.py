@@ -83,6 +83,13 @@ from .daemon.reconcile import (
     stateful_campaign_artifacts,
     write_proposed_state,
 )
+from .daemon.array_recovery import (
+    archive_existing_array_task_outputs,
+    compact_array_recovery_summary,
+    read_array_ledger,
+    refresh_array_ledger,
+    supports_partial_array_recovery,
+)
 from .daemon import submission_intent as _submission_intent
 from .daemon.state import (
     CampaignPhase,
@@ -1303,6 +1310,33 @@ def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path
     )
     lines.append("")
     lines.extend(_format_runtime_status(payload, verbose=verbose))
+    partial_array = payload.get("partial_array_recovery")
+    if isinstance(partial_array, dict):
+        lines.append("")
+        lines.extend(
+            _section(
+                "Partial Array Recovery",
+                [
+                    (
+                        "phase",
+                        str(partial_array.get("phase"))
+                        + "@"
+                        + str(partial_array.get("iteration")),
+                    ),
+                    (
+                        "tasks",
+                        "logical="
+                        + str(partial_array.get("logical_total"))
+                        + " reusable="
+                        + str(partial_array.get("n_reuse"))
+                        + " retry="
+                        + str(partial_array.get("n_retry")),
+                    ),
+                    ("force resubmit", partial_array.get("force_resubmit")),
+                    ("ledger", partial_array.get("ledger")),
+                ],
+            )
+        )
     if payload.get("phase") == "HALTED":
         halt = _latest_journal_event(journal_path, "halt")
         lines.append("")
@@ -1457,6 +1491,8 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "required_phase_output_missing_after_failure": "failure output missing",
     "reconcile_applied": "reconcile applied",
     "reconcile_resolved_terminal_intent": "terminal intent resolved",
+    "partial_array_recovery_prepared": "partial array recovery prepared",
+    "partial_array_recovery_postprocess_only": "partial array postprocess ready",
     "committed_artifact_settle_retry": "waiting for committed artefacts",
     "resolved_phase_resources": "resources resolved",
     "operator_cancelled_jobs": "operator cancelled jobs",
@@ -1529,6 +1565,8 @@ _JOURNAL_RUN_EVENTS = {
     "phase_submitted",
     "sbatch",
     "adopted_inflight_job",
+    "partial_array_recovery_prepared",
+    "partial_array_recovery_postprocess_only",
 }
 
 _JOURNAL_WAIT_EVENTS = {
@@ -1620,8 +1658,11 @@ def _journal_array_progress(event: Dict[str, Any]) -> str:
         _event_int(event, "n_expected")
         or _event_int(event, "expected_tasks")
         or _event_int(event, "n_tasks")
+        or _event_int(event, "logical_total")
     )
     completed = _event_int(event, "n_completed")
+    if completed is None and str(event.get("event", "")).startswith("partial_array_"):
+        completed = _event_int(event, "n_reuse")
     failed = _event_int(event, "n_failed")
     missing = _event_int(event, "n_missing")
     raw = str(event.get("event", ""))
@@ -1651,6 +1692,17 @@ def _journal_array_progress(event: Dict[str, Any]) -> str:
         parts.append("fail=" + str(int(failed)))
     if missing is not None and missing > 0:
         parts.append("missing=" + str(int(missing)))
+    recovery = event.get("array_recovery")
+    if isinstance(recovery, dict):
+        reuse = _event_int(recovery, "n_reuse")
+        retry = _event_int(recovery, "n_retry")
+        logical = _event_int(recovery, "logical_total")
+        if reuse is not None:
+            parts.append("reuse=" + str(int(reuse)))
+        if retry is not None:
+            parts.append("retry=" + str(int(retry)))
+        if logical is not None and logical != total:
+            parts.append("logical=" + str(int(logical)))
     return " ".join(parts)
 
 
@@ -2544,6 +2596,31 @@ def format_recovery_dashboard(campaign_dir: Path) -> str:
     recommendation = "start/resume is safe"
     try:
         report = propose_recovery(campaign)
+        partial = getattr(report, "partial_array_recovery", None)
+        if isinstance(partial, dict):
+            lines.extend(
+                _section(
+                    "Partial Array Recovery",
+                    [
+                        (
+                            "phase",
+                            str(partial.get("phase"))
+                            + "@"
+                            + str(partial.get("iteration")),
+                        ),
+                        (
+                            "tasks",
+                            "logical="
+                            + str(partial.get("logical_total"))
+                            + " reusable="
+                            + str(partial.get("n_reuse"))
+                            + " retry="
+                            + str(partial.get("n_retry")),
+                        ),
+                        ("ledger", partial.get("ledger")),
+                    ],
+                )
+            )
         if report.unsafe_reasons:
             recommendation = "run reconcile and inspect unsafe artefacts"
         elif state_invalid:
@@ -2625,6 +2702,13 @@ def cmd_status(args: argparse.Namespace) -> int:
     payload.update(_probe_background_daemon(paths["background_pid"], paths["background_log"]))
     payload["active_submission_intents"] = _load_active_submission_intents(campaign)
     payload["latest_halt_event"] = _latest_journal_event(paths["journal"], "halt")
+    try:
+        if supports_partial_array_recovery(state.phase):
+            ledger = read_array_ledger(campaign, state.phase, int(state.iteration))
+            if isinstance(ledger, dict):
+                payload["partial_array_recovery"] = compact_array_recovery_summary(ledger)
+    except Exception:
+        pass
     try:
         cfg = CampaignConfig.from_yaml(campaign / "campaign.yaml")
         payload["pool_feasibility"] = _pool_feasibility_summary(campaign, cfg)
@@ -3382,6 +3466,11 @@ def _reconcile_decision_payload(
         "cleanable_artifacts": cleanable,
         "safe_cleanup_actions": cleanable,
         "valid_recovery_candidates": candidates,
+        "partial_array_recovery": (
+            compact_array_recovery_summary(getattr(report, "partial_array_recovery", None))
+            if isinstance(getattr(report, "partial_array_recovery", None), dict)
+            else None
+        ),
         "active_submission_intents": list(getattr(report, "active_submission_intents", []) or []),
         "recommended_actions": list(getattr(report, "recommended_actions", []) or []),
         "next_command": next_command,
@@ -3497,6 +3586,10 @@ def _print_reconcile_inspect_commands(campaign: Path) -> None:
 def cmd_reconcile(args: argparse.Namespace) -> int:
     restore_config = bool(getattr(args, "restore_config_from_lock", False))
     archive_staging_requested = bool(getattr(args, "archive_staging", False))
+    force_resubmit_array = bool(getattr(args, "force_resubmit_array_tasks", False))
+    archive_existing_array_outputs = bool(
+        getattr(args, "archive_existing_array_task_outputs", False)
+    )
     campaign = resolve_campaign_dir(
         args.campaign_dir,
         require_campaign_yaml=False,
@@ -3519,6 +3612,20 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         print(
             "refusing --archive-staging without --apply; this option mutates "
             ".DATA/STAGING and must be explicit",
+            file=sys.stderr,
+        )
+        return 2
+    if archive_existing_array_outputs and not bool(getattr(args, "apply", False)):
+        print(
+            "refusing --archive-existing-array-task-outputs without --apply; "
+            "this option mutates existing task outputs",
+            file=sys.stderr,
+        )
+        return 2
+    if archive_existing_array_outputs and not force_resubmit_array:
+        print(
+            "refusing --archive-existing-array-task-outputs without "
+            "--force-resubmit-array-tasks",
             file=sys.stderr,
         )
         return 2
@@ -3571,11 +3678,26 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     if config_path.is_file():
         try:
             config = CampaignConfig.from_yaml(config_path)
+            force_phase = None
+            if force_resubmit_array:
+                partial_for_review = getattr(report, "partial_array_recovery", None)
+                if isinstance(partial_for_review, dict):
+                    try:
+                        candidate_phase = CampaignPhase(str(partial_for_review.get("phase")))
+                    except Exception:
+                        candidate_phase = None
+                    if candidate_phase is not None and supports_partial_array_recovery(candidate_phase):
+                        force_phase = candidate_phase
+                if force_phase is None and supports_partial_array_recovery(
+                    report.proposed_state.phase
+                ):
+                    force_phase = report.proposed_state.phase
             config_review = review_config_changes(
                 campaign,
                 config,
                 report.proposed_state,
                 initialise_missing=False,
+                force_resubmit_array_phase=force_phase,
             )
         except Exception as exc:
             if bool(getattr(args, "apply", False)):
@@ -3651,6 +3773,22 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             }
             for i in report.active_submission_intents
         ]))
+    partial_array = getattr(report, "partial_array_recovery", None)
+    if isinstance(partial_array, dict):
+        print(
+            "Partial array recovery:      "
+            + repr(
+                {
+                    "phase": partial_array.get("phase"),
+                    "iteration": partial_array.get("iteration"),
+                    "logical_total": partial_array.get("logical_total"),
+                    "reusable_complete": partial_array.get("n_reuse"),
+                    "retry_needed": partial_array.get("n_retry"),
+                    "force_resubmit": partial_array.get("force_resubmit"),
+                    "ledger": partial_array.get("ledger"),
+                }
+            )
+        )
     if report.recommended_actions:
         print("Recommended actions:")
         for action in report.recommended_actions:
@@ -3806,6 +3944,36 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         print("refusing --apply because campaign.yaml has locked changes", file=sys.stderr)
         print(format_config_review(config_review), file=sys.stderr)
         return 8
+    partial_array = getattr(report, "partial_array_recovery", None)
+    force_array_phase = report.proposed_state.phase
+    force_array_iteration = int(report.proposed_state.iteration)
+    if isinstance(partial_array, dict):
+        try:
+            force_array_phase = CampaignPhase(str(partial_array.get("phase")))
+            force_array_iteration = int(partial_array.get("iteration"))
+        except Exception:
+            force_array_phase = report.proposed_state.phase
+            force_array_iteration = int(report.proposed_state.iteration)
+    if force_resubmit_array:
+        if not (
+            isinstance(partial_array, dict)
+            and supports_partial_array_recovery(force_array_phase)
+        ):
+            print(
+                "refusing --force-resubmit-array-tasks because reconcile did "
+                "not identify a supported current array phase",
+                file=sys.stderr,
+            )
+            return 9
+        if int(partial_array.get("n_complete") or 0) > 0 and not archive_existing_array_outputs:
+            print(
+                "refusing --force-resubmit-array-tasks because completed task "
+                "outputs already exist; rerun with "
+                "--archive-existing-array-task-outputs to preserve them before "
+                "the full array is resubmitted",
+                file=sys.stderr,
+            )
+            return 9
 
     cleanable_reasons = {
         "dangling model staging directories exist",
@@ -3874,6 +4042,34 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     _print_reconcile_apply_plan(report)
 
     original_report = report
+    archived_array_outputs: List[str] = []
+    if force_resubmit_array and isinstance(partial_array, dict):
+        if archive_existing_array_outputs:
+            archived_array_outputs = archive_existing_array_task_outputs(
+                campaign,
+                force_array_phase,
+                int(force_array_iteration),
+            )
+        refreshed = refresh_array_ledger(
+            campaign,
+            force_array_phase,
+            int(force_array_iteration),
+            force_resubmit=True,
+        )
+        print(
+            "Marked current array for full resubmission: "
+            + str(force_array_phase.value)
+            + "@"
+            + str(int(force_array_iteration))
+            + " retry_tasks="
+            + str(int(refreshed.get("n_retry") or 0))
+        )
+        if archived_array_outputs:
+            print("Archived existing array task outputs:")
+            for path in archived_array_outputs[:8]:
+                print("  - " + str(path))
+            if len(archived_array_outputs) > 8:
+                print("  - ... " + str(len(archived_array_outputs) - 8) + " more")
     archived_scripts = archive_scripts_for_reconcile(
         campaign
     ) if ".DATA/SCRIPTS contains sbatch scripts" in report.unsafe_reasons else []
@@ -3897,6 +4093,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     removed = clean_reentry_staging(campaign, report.proposed_state.phase)
     cleanup_paths_already_done = (
         list(archived_scripts)
+        + list(archived_array_outputs)
         + list(archived)
         + list(removed_model_staging)
         + list(archived_training_staging)
@@ -5104,6 +5301,25 @@ Examples:
             "With --apply, archive non-empty .DATA/STAGING to a timestamped "
             "sibling when no active daemon work or recorded jobs remain. "
             "Never deletes staging contents."
+        ),
+    )
+    p_recon.add_argument(
+        "--force-resubmit-array-tasks",
+        action="store_true",
+        help=(
+            "With --apply, disable partial reuse for the current supported "
+            "array phase and resubmit every logical task. Use only when a "
+            "current-array science setting changed or the whole array must "
+            "be rerun."
+        ),
+    )
+    p_recon.add_argument(
+        "--archive-existing-array-task-outputs",
+        action="store_true",
+        help=(
+            "With --apply --force-resubmit-array-tasks, move existing "
+            "daemon-owned task output files to an archive before the full "
+            "array is resubmitted."
         ),
     )
     p_recon.set_defaults(func=cmd_reconcile)

@@ -224,6 +224,23 @@ class DaemonControlFunctions:
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
+    def _set_reconcile_defaults(ns):
+        ns.allow_fresh_init = bool(getattr(ns, "allow_fresh_init", False))
+        ns.apply = bool(getattr(ns, "apply", False))
+        ns.archive_staging = bool(getattr(ns, "archive_staging", False))
+        ns.restore_config_from_lock = bool(
+            getattr(ns, "restore_config_from_lock", False)
+        )
+        ns.force_resubmit_array_tasks = bool(
+            getattr(ns, "force_resubmit_array_tasks", False)
+        )
+        ns.archive_existing_array_task_outputs = bool(
+            getattr(ns, "archive_existing_array_task_outputs", False)
+        )
+        ns.json = bool(getattr(ns, "json", False))
+        return ns
+
+    @staticmethod
     def reconcile():
         """Write a proposed state.json to .proposed for user review."""
         from ichor.hpc.active_learning.cli import cmd_reconcile
@@ -232,6 +249,7 @@ class DaemonControlFunctions:
         if ns is None:
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
+        ns = DaemonControlFunctions._set_reconcile_defaults(ns)
         ns.allow_fresh_init = False
         ns.apply = False
         rc = cmd_reconcile(ns)
@@ -256,6 +274,7 @@ class DaemonControlFunctions:
             print("Cancelled.")
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
+        ns = DaemonControlFunctions._set_reconcile_defaults(ns)
         ns.allow_fresh_init = False
         ns.apply = True
         ns.archive_staging = False
@@ -282,6 +301,7 @@ class DaemonControlFunctions:
             print("Cancelled.")
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
+        ns = DaemonControlFunctions._set_reconcile_defaults(ns)
         ns.allow_fresh_init = False
         ns.apply = True
         ns.archive_staging = True
@@ -308,6 +328,7 @@ class DaemonControlFunctions:
             print("Cancelled.")
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
+        ns = DaemonControlFunctions._set_reconcile_defaults(ns)
         ns.allow_fresh_init = False
         ns.apply = False
         ns.restore_config_from_lock = True
@@ -333,11 +354,39 @@ class DaemonControlFunctions:
             print("Cancelled.")
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
+        ns = DaemonControlFunctions._set_reconcile_defaults(ns)
         ns.allow_fresh_init = True
         ns.apply = False
         rc = cmd_reconcile(ns)
         if rc != 0:
             print("reconcile returned exit code " + str(rc))
+        user_input_free_flow("Press enter to return to the menu: ", "")
+
+    @staticmethod
+    def reconcile_force_resubmit_array():
+        """Force a full rerun of the current supported array phase."""
+        from ichor.hpc.active_learning.cli import cmd_reconcile
+
+        ns = _guarded_campaign_dir_ns()
+        if ns is None:
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        answer = user_input_free_flow(
+            "Archive existing task outputs and force-resubmit the current array? Type YES: ",
+            "",
+        )
+        if answer != "YES":
+            print("Cancelled.")
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        ns = DaemonControlFunctions._set_reconcile_defaults(ns)
+        ns.allow_fresh_init = False
+        ns.apply = True
+        ns.force_resubmit_array_tasks = True
+        ns.archive_existing_array_task_outputs = True
+        rc = cmd_reconcile(ns)
+        if rc != 0:
+            print("reconcile --force-resubmit-array-tasks returned exit code " + str(rc))
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
@@ -401,6 +450,10 @@ daemon_control_menu_items = [
     FunctionItem(
         "Reconcile --archive-staging --apply",
         DaemonControlFunctions.reconcile_archive_stale_staging,
+    ),
+    FunctionItem(
+        "Reconcile force-resubmit current array",
+        DaemonControlFunctions.reconcile_force_resubmit_array,
     ),
     FunctionItem(
         "Restore campaign.yaml proposal from config lock",

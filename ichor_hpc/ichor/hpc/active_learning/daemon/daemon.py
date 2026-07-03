@@ -807,6 +807,11 @@ class Daemon:
                         int(state.iteration),
                         result.submitted_job_id,
                         expected_tasks=result.expected_tasks,
+                        submission_metadata=getattr(
+                            result,
+                            "submission_metadata",
+                            None,
+                        ),
                     )
                 except Exception as exc:
                     self._journal(
@@ -826,6 +831,9 @@ class Daemon:
                 "sbatch", phase=phase_name, job_id=result.submitted_job_id,
                 iteration=state.iteration,
                 expected_tasks=result.expected_tasks,
+                **(
+                    getattr(result, "submission_metadata", {}) or {}
+                ),
                 submitted_at_iso=(
                     submitted_intent.get("submitted_at_iso")
                     if isinstance(submitted_intent, dict)

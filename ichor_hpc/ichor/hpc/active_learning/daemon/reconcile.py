@@ -34,6 +34,12 @@ from .recovery_contracts import (
     validate_phase_recovery_contract,
 )
 from . import submission_intent as _submission_intent
+from .array_recovery import (
+    compact_array_recovery_summary,
+    discover_partial_array_recovery,
+    refresh_array_ledger,
+    supports_partial_array_recovery,
+)
 from .state import (
     CampaignPhase,
     CampaignState,
@@ -228,6 +234,7 @@ class ReconciliationReport:
     blocking_artifacts: List[str] = field(default_factory=list)
     recommended_actions: List[str] = field(default_factory=list)
     recovery_candidates: List[Dict[str, Any]] = field(default_factory=list)
+    partial_array_recovery: Optional[Dict[str, Any]] = None
     bootstrap_handoff: Optional[Dict[str, Any]] = None
     phase_a_handoff: Optional[Dict[str, Any]] = None
 
@@ -1143,22 +1150,93 @@ def propose_recovery(
             )
         )
         blocking_artifacts.append("active-learning handoff inventory")
+
+    partial_array_recovery: Optional[Dict[str, Any]] = None
+    partial_array_decision: Optional[RecoveryDecision] = None
+    preferred_phase = last_phase
+    preferred_iteration = last_iter
+    if existing is not None and supports_partial_array_recovery(existing.phase):
+        preferred_phase = existing.phase.value
+        preferred_iteration = int(existing.iteration)
+    if preferred_phase is not None and supports_partial_array_recovery(preferred_phase):
+        try:
+            partial_array_recovery = discover_partial_array_recovery(
+                campaign,
+                preferred_phase=preferred_phase,
+                preferred_iteration=(
+                    int(preferred_iteration)
+                    if preferred_iteration is not None
+                    else int(getattr(recovered, "iteration", 0))
+                ),
+            )
+        except Exception as exc:
+            notes.append(
+                "partial array recovery scan failed: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:180]
+            )
+            partial_array_recovery = None
+    if isinstance(partial_array_recovery, dict):
+        try:
+            partial_phase = CampaignPhase(str(partial_array_recovery["phase"]))
+            partial_iteration = int(partial_array_recovery["iteration"])
+            partial_array_decision = RecoveryDecision(
+                phase=partial_phase,
+                iteration=partial_iteration,
+                reason=(
+                    "partial array recovery available: "
+                    + str(int(partial_array_recovery.get("n_complete") or 0))
+                    + "/"
+                    + str(int(partial_array_recovery.get("logical_total") or 0))
+                    + " logical tasks already complete"
+                ),
+                trusted_artifact=str(partial_array_recovery.get("path") or ""),
+            )
+            _append_recovery_candidate(recovery_candidates, partial_array_decision)
+            trusted_artifacts.append(
+                "partial array recovery ledger for "
+                + partial_phase.value
+                + "@"
+                + str(partial_iteration)
+            )
+            bucket = "initial" if partial_phase.value.startswith("INITIAL_") else (
+                "iter_" + str(partial_iteration)
+            )
+            partial_staging = (campaign / ".DATA" / "STAGING" / bucket).resolve(strict=False)
+            unexpected_staging_children = [
+                p
+                for p in unexpected_staging_children
+                if str(p.resolve(strict=False)) != str(partial_staging)
+            ]
+        except Exception as exc:
+            notes.append(
+                "partial array recovery candidate was ignored: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:180]
+            )
+            partial_array_recovery = None
+            partial_array_decision = None
     if unexpected_staging_children:
         unsafe_reasons.append(".DATA/STAGING is non-empty")
         blocking_artifacts.append(".DATA/STAGING")
 
     phase_recovery = None
     if not active_intents and not unsafe_reasons:
-        phase_recovery = select_recovery_phase(
-            campaign,
-            recovered,
-            valid_training_versions=valid_training_versions,
-            valid_model_versions=valid_model_versions,
-            existing_loaded=existing_loaded,
-            last_phase=last_phase,
-            last_iteration=last_iter,
-            last_phase_retryable=last_phase_retryable,
-        )
+        if partial_array_decision is not None:
+            phase_recovery = partial_array_decision
+        else:
+            phase_recovery = select_recovery_phase(
+                campaign,
+                recovered,
+                valid_training_versions=valid_training_versions,
+                valid_model_versions=valid_model_versions,
+                existing_loaded=existing_loaded,
+                last_phase=last_phase,
+                last_iteration=last_iter,
+                last_phase_retryable=last_phase_retryable,
+            )
         _append_recovery_candidate(recovery_candidates, phase_recovery)
 
     # choose a safe re-entry phase. If we have NOTHING committed, start at
@@ -1356,6 +1434,11 @@ def propose_recovery(
         blocking_artifacts=blocking_artifacts,
         recommended_actions=recommended_actions,
         recovery_candidates=recovery_candidates,
+        partial_array_recovery=(
+            compact_array_recovery_summary(partial_array_recovery)
+            if isinstance(partial_array_recovery, dict)
+            else None
+        ),
         bootstrap_handoff=bootstrap_handoff,
         phase_a_handoff=phase_a_handoff,
     )
