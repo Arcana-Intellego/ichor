@@ -52,6 +52,8 @@ START_DAEMON_BACKGROUND_DEFAULTS = {
     "selected_max_ticks": 0,
     "selected_config": "",
     "selected_preset": "",
+    "selected_log_path": "",
+    "selected_pid_path": "",
 }
 
 
@@ -63,6 +65,8 @@ class StartDaemonBackgroundMenuOptions(MenuOptions):
     selected_max_ticks: int
     selected_config: str
     selected_preset: str
+    selected_log_path: str
+    selected_pid_path: str
 
 
 start_daemon_background_menu_options = StartDaemonBackgroundMenuOptions(
@@ -214,6 +218,16 @@ class StartDaemonBackgroundFunctions:
                 ),
                 config=config_override,
                 preset=preset_name,
+                log_path=(
+                    Path(start_daemon_background_menu_options.selected_log_path)
+                    if start_daemon_background_menu_options.selected_log_path
+                    else None
+                ),
+                pid_path=(
+                    Path(start_daemon_background_menu_options.selected_pid_path)
+                    if start_daemon_background_menu_options.selected_pid_path
+                    else None
+                ),
             )
         except Exception as exc:
             print("Failed to launch detached daemon: " + str(exc))
@@ -286,6 +300,20 @@ START_DAEMON_BACKGROUND_FIELD_SPECS = [
         item_text="Set preset",
         display_path="preset",
     ),
+    spec(
+        "selected_log_path",
+        "clearable_str",
+        prompt="Background log path override",
+        item_text="Set background log path",
+        display_path="background_log",
+    ),
+    spec(
+        "selected_pid_path",
+        "clearable_str",
+        prompt="Background PID path override",
+        item_text="Set background PID path",
+        display_path="background_pid",
+    ),
 ]
 
 
@@ -297,4 +325,5 @@ start_daemon_background_menu = make_field_menu(
     _set_value,
     prologue_text="Current launch options:\n",
     extra_items=start_daemon_background_menu_items,
+    status_for_path=lambda _path: "scope: menu-only; applies to next daemon launch",
 )

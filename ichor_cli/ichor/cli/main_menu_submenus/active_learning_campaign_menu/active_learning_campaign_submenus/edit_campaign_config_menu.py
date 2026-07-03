@@ -328,14 +328,13 @@ def _config_lock_change_status(path: str) -> str:
         for change in review.allowed_changes:
             if change.path == path:
                 return "allowed: " + change.reason
-    campaign_dir = _editor_selected_campaign_dir or selected_campaign_dir_or_none()
-    if campaign_dir is None or not _state_path_for_campaign(campaign_dir).is_file():
-        return ""
     from ichor.hpc.active_learning.daemon import config_lock as lock_mod
 
     status = lock_mod.describe_field_editability(path)
-    if status == "unclassified lock policy" or path == "schema_version":
+    if status == "unclassified lock policy":
         return status
+    if path == "schema_version":
+        return "read-only: " + status
     return "window: " + status
 
 
@@ -388,6 +387,41 @@ def format_current_config_lock_review() -> str:
 
     formatted = format_config_review(review)
     return formatted or "No campaign.yaml changes against the config lock."
+
+
+def _iter_campaign_field_specs():
+    seen = set()
+    for label in sorted(_BLOCK_MENUS_BY_LABEL):
+        block_menu = _BLOCK_MENUS_BY_LABEL[label]
+        for spec in block_menu.this_menu_options.fields:
+            if spec.path in seen:
+                continue
+            seen.add(spec.path)
+            yield spec.path, spec
+    try:
+        from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_submenus.edit_campaign_config_submenus.edit_ariadne_block_submenu import (
+            ARIADNE_FIELD_SPECS,
+        )
+    except Exception:
+        return
+    for spec in ARIADNE_FIELD_SPECS:
+        path = "ariadne." + spec.path
+        if path in seen:
+            continue
+        seen.add(path)
+        yield path, spec
+
+
+def _format_editability_line(path: str) -> str:
+    value = _get_config_value(path)
+    return (
+        path
+        + ": "
+        + format_field_value(value)
+        + " ["
+        + _config_lock_change_status(path)
+        + "]"
+    )
 
 
 def saved_config_has_blocked_changes(config_override=None, preset=None) -> bool:
@@ -710,6 +744,16 @@ class EditCampaignConfigFunctions:
     @staticmethod
     def show_config_lock_review():
         print(format_current_config_lock_review())
+        _pause()
+
+    @staticmethod
+    def show_config_editability_windows():
+        print("Config editability windows")
+        print("Source: current in-memory editor config.")
+        if current_config_lock_review() is not None:
+            print("Current lock-review results are included where fields changed.")
+        for path, _spec_obj in _iter_campaign_field_specs():
+            print("  " + _format_editability_line(path))
         _pause()
 
     @staticmethod
@@ -1770,6 +1814,8 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("quality_gates.ferebus_min_ext_r2", "optional_float"),
             _spec("quality_gates.ferebus_max_ext_rmse_ha", "optional_float"),
             _spec("quality_gates.ferebus_max_condition_number", "optional_float"),
+            _spec("quality_gates.ariadne_max_displacement_ang", "optional_float"),
+            _spec("quality_gates.ariadne_min_pair_distance_ang", "optional_float"),
         ],
     ),
     "Edit runtime": _make_block_menu(
@@ -1856,10 +1902,24 @@ edit_campaign_config_menu_items = [
     _block_submenu_item("Edit active_batch"),
     _block_submenu_item("Edit sampling_protocol"),
     _block_submenu_item("Edit seed_selection"),
+    _block_submenu_item("Edit anti_overlap"),
+    _block_submenu_item("Edit phase_b"),
+    _block_submenu_item("Edit geometry_novelty"),
     _block_submenu_item("Edit split"),
     _block_submenu_item("Edit FEREBUS block"),
     _block_submenu_item("Edit robustness"),
+    SubmenuItem(
+        "Edit acquisition",
+        edit_acquisition_config_menu,
+        edit_campaign_config_menu,
+    ),
+    SubmenuItem(
+        EDIT_ARIADNE_BLOCK_MENU_DESCRIPTION.title,
+        edit_ariadne_block_menu,
+        edit_campaign_config_menu,
+    ),
     _block_submenu_item("Edit stop"),
+    _block_submenu_item("Edit adversarial_safety"),
     _block_submenu_item("Edit error_calibration"),
     _block_submenu_item("Edit quality_gates"),
     _block_submenu_item("Edit runtime"),
@@ -1870,6 +1930,10 @@ edit_campaign_config_menu_items = [
     FunctionItem(
         "Show config lock review",
         EditCampaignConfigFunctions.show_config_lock_review,
+    ),
+    FunctionItem(
+        "Show config editability windows",
+        EditCampaignConfigFunctions.show_config_editability_windows,
     ),
     FunctionItem(
         "Show pending config changes",

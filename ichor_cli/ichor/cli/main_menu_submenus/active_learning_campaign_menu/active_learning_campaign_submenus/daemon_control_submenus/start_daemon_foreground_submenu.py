@@ -272,4 +272,5 @@ start_daemon_foreground_menu = make_field_menu(
     _set_value,
     prologue_text="Current launch options:\n",
     extra_items=start_daemon_foreground_menu_items,
+    status_for_path=lambda _path: "scope: menu-only; applies to next daemon launch",
 )

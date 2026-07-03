@@ -39,6 +39,14 @@ def _set_value(path: str, value):
     _set_config_value("ariadne." + path, value)
 
 
+def _status_for_path(path: str) -> str:
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_submenus.edit_campaign_config_menu import (
+        _config_lock_change_status,
+    )
+
+    return _config_lock_change_status("ariadne." + path)
+
+
 def _sync_options_from_block(block):
     """Compatibility no-op; the field menu reads directly from the live block."""
     return None
@@ -177,6 +185,7 @@ edit_ariadne_block_menu = make_field_menu(
     _get_value,
     _set_value,
     prologue_text="Current values for this campaign.yaml block:\n",
+    status_for_path=_status_for_path,
     include_parent_menu_options=False,
 )
 

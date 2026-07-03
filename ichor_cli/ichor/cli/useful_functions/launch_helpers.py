@@ -133,6 +133,8 @@ def launch_daemon_detached_checked(
     max_ticks: Optional[int] = None,
     config: Optional[Path] = None,
     preset: Optional[str] = None,
+    log_path: Optional[Path] = None,
+    pid_path: Optional[Path] = None,
     startup_grace_seconds: float = 0.25,
 ) -> DetachedLaunchResult:
     """Spawn the daemon as a detached child and report immediate startup exit.
@@ -148,8 +150,14 @@ def launch_daemon_detached_checked(
     campaign_dir = Path(campaign_dir).resolve()
     data_dir = campaign_dir / ".DATA" / "ACTIVE_LEARNING"
     data_dir.mkdir(parents=True, exist_ok=True)
-    log_path = data_dir / MENU_LAUNCHED_LOG_FILENAME
-    pid_path = data_dir / MENU_LAUNCHED_PID_FILENAME
+    log_path = Path(log_path).expanduser().resolve() if log_path else (
+        data_dir / MENU_LAUNCHED_LOG_FILENAME
+    )
+    pid_path = Path(pid_path).expanduser().resolve() if pid_path else (
+        data_dir / MENU_LAUNCHED_PID_FILENAME
+    )
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
 
     argv = build_daemon_argv(
         campaign_dir,

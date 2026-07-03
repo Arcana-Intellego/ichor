@@ -119,4 +119,5 @@ import_trajectory_pool_menu = make_field_menu(
     _set_value,
     prologue_text="Current init options:\n",
     extra_items=import_trajectory_pool_menu_items,
+    status_for_path=lambda _path: "scope: menu-only; applies to next init/import command",
 )

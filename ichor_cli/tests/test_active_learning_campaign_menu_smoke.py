@@ -35,8 +35,11 @@ def test_daemon_control_menu_items():
     )
     texts = [it.text for it in daemon_control_menu.items]
     for expected in (
+        "Toggle status JSON output",
+        "Toggle status verbose output",
         "Show status",
         "Show sampling protocol summary",
+        "Show config editability windows",
         "Recovery dashboard",
         "Preflight backends",
         "Initialise Campaign / Import Trajectory Pool",
@@ -44,8 +47,8 @@ def test_daemon_control_menu_items():
         "Start/Resume Daemon (Background)",
         "Stop daemon",
         "Reconcile state",
-        "Reconcile and apply safe proposal",
-        "Archive stale staging",
+        "Reconcile --apply",
+        "Reconcile --archive-staging --apply",
         "Restore campaign.yaml proposal from config lock",
         "Reconcile state with --allow-fresh-init",
     ):
@@ -108,6 +111,34 @@ def test_daemon_control_archive_staging_dispatches_reconcile(monkeypatch):
     }
 
 
+def test_daemon_control_status_passes_visible_display_options(monkeypatch):
+    import ichor.hpc.active_learning.cli as cli_mod
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_submenus import (
+        daemon_control_menu as menu_mod,
+    )
+
+    seen = {}
+
+    def fake_status(ns):
+        seen["json"] = ns.json
+        seen["verbose"] = ns.verbose
+        return 0
+
+    monkeypatch.setattr(
+        menu_mod,
+        "_guarded_campaign_dir_ns",
+        lambda: SimpleNamespace(campaign_dir="/tmp/campaign"),
+    )
+    monkeypatch.setattr(menu_mod, "user_input_free_flow", lambda prompt, default: "")
+    monkeypatch.setattr(cli_mod, "cmd_status", fake_status)
+    menu_mod.daemon_control_menu_options.status_json = True
+    menu_mod.daemon_control_menu_options.status_verbose = True
+
+    menu_mod.DaemonControlFunctions.show_status()
+
+    assert seen == {"json": True, "verbose": True}
+
+
 def test_edit_campaign_config_menu_items():
     from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_submenus.edit_campaign_config_menu import (
         edit_acquisition_config_menu,
@@ -135,30 +166,28 @@ def test_edit_campaign_config_menu_items():
         "Edit active_batch",
         "Edit sampling_protocol",
         "Edit seed_selection",
+        "Edit anti_overlap",
+        "Edit phase_b",
+        "Edit geometry_novelty",
         "Edit split",
         "Edit FEREBUS block",
         "Edit robustness",
+        "Edit acquisition",
+        "Edit ARIADNE Block",
         "Edit stop",
+        "Edit adversarial_safety",
         "Edit error_calibration",
         "Edit quality_gates",
         "Edit runtime",
         "Show unsaved changes",
         "Show config lock review",
+        "Show config editability windows",
         "Show pending config changes",
         "Discard unsaved changes / reload from disk",
         "Export dense/internal diagnostic snapshot",
         "Save to disk",
     ):
         assert expected in texts, "missing item: " + expected
-    for hidden in (
-        "Edit anti_overlap",
-        "Edit phase_b",
-        "Edit geometry_novelty",
-        "Edit acquisition",
-        "Edit ARIADNE Block",
-        "Edit adversarial_safety",
-    ):
-        assert hidden not in texts, "low-level protocol menu still exposed: " + hidden
     assert "Edit acquisition.subspace" not in texts
     assert "Edit acquisition.weights" not in texts
     assert "Edit acquisition.gradient" not in texts
@@ -233,6 +262,24 @@ def test_campaign_config_block_submenus_show_values_and_edit_one_field(monkeypat
     assert cfg.resources.defaults.walltime_hours == 37
     assert cfg.resources.defaults.partition == old_partition
     assert "resources.defaults.walltime_hours: 37" in resources_menu.this_menu_options()
+
+
+def test_campaign_config_fields_show_static_editability_windows_before_start():
+    import importlib
+
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.edit_campaign_config_menu"
+    )
+    menu._replace_campaign_config(CampaignConfig(), loaded_from=None)
+
+    gaussian_menu = menu._BLOCK_MENUS_BY_LABEL["Edit Gaussian block"]
+    rendered = gaussian_menu.this_menu_options()
+
+    assert "gaussian.basis_set" in rendered
+    assert "window: editable until first Gaussian staging/submission" in rendered
 
 
 def test_edit_gaussian_basis_set_saves_to_selected_campaign_yaml(
@@ -1329,6 +1376,7 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
     menu.EditCampaignConfigFunctions.show_sampling_protocol_summary()
 
     out = capsys.readouterr().out
+    assert "Summary source: current in-memory editor config." in out
     assert "Sampling protocol summary" in out
     assert "sampling_protocol.sampling_aggressiveness: 6" in out
     assert "sampling_protocol.geometry_scale_source: profile fallback preview" in out
@@ -1378,6 +1426,7 @@ def test_daemon_control_sampling_protocol_summary_uses_saved_campaign(tmp_path, 
     menu.DaemonControlFunctions.show_sampling_protocol_summary()
 
     out = capsys.readouterr().out
+    assert "Summary source: saved campaign.yaml." in out
     assert "sampling_protocol.sampling_aggressiveness: 8" in out
     assert "sampling_protocol.scale_model" in out
     assert "sampling_protocol.scale_model.pair_reference" in out
@@ -1418,14 +1467,9 @@ def test_campaign_config_menu_covers_every_config_leaf():
     spec_paths.extend("ariadne." + spec.path for spec in ARIADNE_FIELD_SPECS)
 
     assert len(spec_paths) == len(set(spec_paths))
-    resolver_owned_hidden = {
-        "quality_gates.ariadne_max_displacement_ang",
-        "quality_gates.ariadne_min_pair_distance_ang",
-    }
     expected_editable = (
         set(leaf_paths(CampaignConfig()))
         - {"schema_version"}
-        - resolver_owned_hidden
     )
     actual_editable = {
         spec.path
@@ -1437,8 +1481,39 @@ def test_campaign_config_menu_covers_every_config_leaf():
     assert read_only == {"schema_version"}
     assert actual_editable == expected_editable
     quality_rendered = _BLOCK_MENUS_BY_LABEL["Edit quality_gates"].this_menu_options()
-    assert "quality_gates.ariadne_max_displacement_ang" not in quality_rendered
-    assert "quality_gates.ariadne_min_pair_distance_ang" not in quality_rendered
+    assert "quality_gates.ariadne_max_displacement_ang" in quality_rendered
+    assert "quality_gates.ariadne_min_pair_distance_ang" in quality_rendered
+
+
+def test_campaign_config_block_menus_are_reachable():
+    from consolemenu.items import SubmenuItem
+
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_submenus.edit_campaign_config_menu import (
+        _ACQUISITION_BLOCK_LABELS,
+        _BLOCK_MENUS_BY_LABEL,
+        edit_acquisition_config_menu,
+        edit_campaign_config_menu,
+    )
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_submenus.edit_campaign_config_submenus.edit_ariadne_block_submenu import (
+        EDIT_ARIADNE_BLOCK_MENU_DESCRIPTION,
+    )
+
+    top_level_submenus = {
+        item.text
+        for item in edit_campaign_config_menu.items
+        if isinstance(item, SubmenuItem)
+    }
+    acquisition_submenus = {
+        item.text
+        for item in edit_acquisition_config_menu.items
+        if isinstance(item, SubmenuItem)
+    }
+    reachable = set(top_level_submenus) | set(acquisition_submenus)
+
+    assert "Edit acquisition" in top_level_submenus
+    assert EDIT_ARIADNE_BLOCK_MENU_DESCRIPTION.title in top_level_submenus
+    assert set(_ACQUISITION_BLOCK_LABELS).issubset(acquisition_submenus)
+    assert set(_BLOCK_MENUS_BY_LABEL).issubset(reachable)
 
 
 def test_ariadne_submenu_shares_block_with_parent():
@@ -1467,6 +1542,9 @@ def test_ariadne_submenu_shares_block_with_parent():
     assert "Set trqn_max_backtransform_iter" in texts
     assert "Set trqn_trust_min" in texts
     assert "Edit trust radii" not in texts
+    rendered = edit_ariadne_block_menu.this_menu_options()
+    assert "delta0" in rendered
+    assert "window: editable until ARIADNE consumes this iteration" in rendered
 
 
 def test_journal_menu_items():
@@ -1479,19 +1557,27 @@ def test_journal_menu_items():
         "Set since timestamp",
         "Set event types",
         "Set last_n",
+        "Set output mode",
+        "Set verbose",
         "View matching events",
         "View all events",
         "View last N events",
+        "List event types",
         "Clear journal filters",
     ):
         assert expected in texts, "missing item: " + expected
     journal_menu_options.since = "2026-05-23T00:00:00Z"
     journal_menu_options.event_types = ["sbatch", "phase_succeeded"]
     journal_menu_options.last_n = 17
+    journal_menu_options.output_mode = "json"
+    journal_menu_options.verbose = True
     rendered = journal_menu.this_menu_options()
     assert "since: 2026-05-23T00:00:00Z" in rendered
     assert "event_types: sbatch,phase_succeeded" in rendered
     assert "last_n: 17" in rendered
+    assert "output_mode: json" in rendered
+    assert "verbose: True" in rendered
+    assert "scope: menu-only; applies to next journal view" in rendered
 
 
 def test_journal_matching_events_uses_visible_filters(tmp_path, monkeypatch):
@@ -1508,6 +1594,9 @@ def test_journal_matching_events_uses_visible_filters(tmp_path, monkeypatch):
     set_selected_campaign_dir(tmp_path)
     menu.journal_menu_options.since = "2026-05-23T00:00:00Z"
     menu.journal_menu_options.event_types = ["sbatch", "phase_succeeded"]
+    menu.journal_menu_options.last_n = 12
+    menu.journal_menu_options.output_mode = "raw"
+    menu.journal_menu_options.verbose = True
     calls = []
     monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: "")
     monkeypatch.setattr(daemon_cli, "cmd_journal", lambda ns: calls.append(ns) or 0)
@@ -1518,6 +1607,32 @@ def test_journal_matching_events_uses_visible_filters(tmp_path, monkeypatch):
     assert calls[0].campaign_dir == str(tmp_path)
     assert calls[0].since == "2026-05-23T00:00:00Z"
     assert calls[0].event_type == ["sbatch", "phase_succeeded"]
+    assert calls[0].last_n == 12
+    assert calls[0].raw is True
+    assert calls[0].json is False
+    assert calls[0].verbose is True
+
+
+def test_journal_list_event_types_dispatches_cli(tmp_path, monkeypatch):
+    import importlib
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.journal_menu"
+    )
+    import ichor.hpc.active_learning.cli as daemon_cli
+
+    set_selected_campaign_dir(tmp_path)
+    calls = []
+    monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: "")
+    monkeypatch.setattr(daemon_cli, "cmd_journal", lambda ns: calls.append(ns) or 0)
+
+    menu.JournalFunctions.list_event_types()
+
+    assert calls
+    assert calls[0].list_event_types is True
 
 
 def test_journal_clear_filters_resets_visible_state():
@@ -1531,12 +1646,16 @@ def test_journal_clear_filters_resets_visible_state():
     menu.journal_menu_options.since = "2026-05-23T00:00:00Z"
     menu.journal_menu_options.event_types = ["sbatch"]
     menu.journal_menu_options.last_n = 3
+    menu.journal_menu_options.output_mode = "json"
+    menu.journal_menu_options.verbose = True
 
     menu.JournalFunctions.clear_filters()
 
     assert menu.journal_menu_options.since == ""
     assert menu.journal_menu_options.event_types == []
     assert menu.journal_menu_options.last_n == 50
+    assert menu.journal_menu_options.output_mode == "text"
+    assert menu.journal_menu_options.verbose is False
 
 
 def test_top_level_menu_registered_in_main_menu():
@@ -1933,6 +2052,8 @@ def test_init_pool_passes_verbatim_import_options(tmp_path, monkeypatch):
     set_selected_campaign_dir(tmp_path)
     menu.import_trajectory_pool_menu_options.source_path = "pool.xyz"
     menu.import_trajectory_pool_menu_options.force_reimport = False
+    rendered = menu.import_trajectory_pool_menu.this_menu_options()
+    assert "scope: menu-only; applies to next init/import command" in rendered
     calls = []
     monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: "")
     monkeypatch.setattr(daemon_cli, "cmd_init", lambda ns: calls.append(ns) or 0)
@@ -1995,6 +2116,7 @@ def test_foreground_launch_uses_resume_when_selected(tmp_path, monkeypatch):
     assert "command: resume" in rendered
     assert "poll_interval: 3" in rendered
     assert "max_ticks: 2" in rendered
+    assert "scope: menu-only; applies to next daemon launch" in rendered
     calls = []
     monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: "")
     monkeypatch.setattr(daemon_cli, "cmd_start", lambda ns: calls.append(("start", ns)) or 0)
@@ -2031,10 +2153,19 @@ def test_background_launch_reports_checked_result(tmp_path, monkeypatch, capsys)
     menu.start_daemon_background_menu_options.selected_preset = ""
     menu.start_daemon_background_menu_options.selected_poll_interval = 0
     menu.start_daemon_background_menu_options.selected_max_ticks = 0
+    menu.start_daemon_background_menu_options.selected_log_path = str(
+        tmp_path / "daemon.custom.out"
+    )
+    menu.start_daemon_background_menu_options.selected_pid_path = str(
+        tmp_path / "daemon.custom.pid"
+    )
     rendered = menu.start_daemon_background_menu.this_menu_options()
     assert "poll_interval: 0 (campaign default)" in rendered
     assert "max_ticks: 0 (unlimited)" in rendered
     assert "config: <blank>" in rendered
+    assert "background_log: " in rendered
+    assert "background_pid: " in rendered
+    assert "scope: menu-only; applies to next daemon launch" in rendered
     seen = {}
 
     def fake_launch(campaign_dir, **kwargs):
@@ -2053,4 +2184,6 @@ def test_background_launch_reports_checked_result(tmp_path, monkeypatch, capsys)
 
     assert seen["command"] == "resume"
     assert seen["mode"] == "live"
+    assert seen["log_path"] == Path(tmp_path / "daemon.custom.out")
+    assert seen["pid_path"] == Path(tmp_path / "daemon.custom.pid")
     assert "exited during startup" in capsys.readouterr().out

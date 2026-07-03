@@ -38,7 +38,8 @@ DAEMON_CONTROL_MENU_DESCRIPTION = MenuDescription(
 
 @dataclass
 class DaemonControlMenuOptions(MenuOptions):
-    pass
+    status_json: bool = False
+    status_verbose: bool = False
 
 
 daemon_control_menu_options = DaemonControlMenuOptions()
@@ -61,6 +62,18 @@ class DaemonControlFunctions:
     """Static dispatchers into ichor.hpc.active_learning.cli."""
 
     @staticmethod
+    def toggle_status_json():
+        daemon_control_menu_options.status_json = (
+            not bool(daemon_control_menu_options.status_json)
+        )
+
+    @staticmethod
+    def toggle_status_verbose():
+        daemon_control_menu_options.status_verbose = (
+            not bool(daemon_control_menu_options.status_verbose)
+        )
+
+    @staticmethod
     def show_status():
         """Print state.json as JSON (same output as ichor-al-daemon status)."""
         from ichor.hpc.active_learning.cli import cmd_status
@@ -69,6 +82,8 @@ class DaemonControlFunctions:
         if ns is None:
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
+        ns.json = bool(daemon_control_menu_options.status_json)
+        ns.verbose = bool(daemon_control_menu_options.status_verbose)
         rc = cmd_status(ns)
         if rc != 0:
             print("status returned exit code " + str(rc))
@@ -107,7 +122,72 @@ class DaemonControlFunctions:
             print_campaign_selection_error(exc)
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
+        print("Summary source: saved campaign.yaml.")
         print(format_saved_sampling_protocol_summary(campaign_dir))
+        user_input_free_flow("Press enter to return to the menu: ", "")
+
+    @staticmethod
+    def show_saved_config_editability_windows():
+        try:
+            campaign_dir = selected_campaign_dir()
+        except CampaignSelectionError as exc:
+            print_campaign_selection_error(exc)
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        editor = __import__(
+            "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+            "active_learning_campaign_submenus.edit_campaign_config_menu",
+            fromlist=["_iter_campaign_field_specs"],
+        )
+        try:
+            from ichor.cli.main_menu_submenus.active_learning_campaign_menu.field_menu import (
+                format_field_value,
+                get_attr_path,
+            )
+            from ichor.hpc.active_learning.config import CampaignConfig
+            from ichor.hpc.active_learning.daemon import config_lock as lock_mod
+
+            config = CampaignConfig.from_yaml(campaign_dir / "campaign.yaml")
+        except Exception as exc:
+            print(
+                "Could not load saved campaign.yaml from "
+                + str(campaign_dir)
+                + ": "
+                + str(exc)
+            )
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        review = editor.saved_config_lock_review()
+        print("Config editability windows")
+        print("Source: saved campaign.yaml.")
+        for path, _spec_obj in editor._iter_campaign_field_specs():
+            status = None
+            if review is not None:
+                for change in review.blocked_changes:
+                    if change.path == path:
+                        status = "blocked: " + change.reason
+                        break
+                if status is None:
+                    for change in review.allowed_changes:
+                        if change.path == path:
+                            status = "allowed: " + change.reason
+                            break
+            if status is None:
+                window = lock_mod.describe_field_editability(path)
+                status = (
+                    "read-only: " + window
+                    if path == "schema_version"
+                    else "window: " + window
+                )
+            print(
+                "  "
+                + path
+                + ": "
+                + format_field_value(get_attr_path(config, path))
+                + " ["
+                + status
+                + "]"
+            )
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
@@ -178,6 +258,8 @@ class DaemonControlFunctions:
             return
         ns.allow_fresh_init = False
         ns.apply = True
+        ns.archive_staging = False
+        ns.restore_config_from_lock = False
         rc = cmd_reconcile(ns)
         if rc != 0:
             print("reconcile --apply returned exit code " + str(rc))
@@ -279,10 +361,16 @@ daemon_control_menu = ConsoleMenu(
 
 
 daemon_control_menu_items = [
+    FunctionItem("Toggle status JSON output", DaemonControlFunctions.toggle_status_json),
+    FunctionItem("Toggle status verbose output", DaemonControlFunctions.toggle_status_verbose),
     FunctionItem("Show status", DaemonControlFunctions.show_status),
     FunctionItem(
         "Show sampling protocol summary",
         DaemonControlFunctions.show_sampling_protocol_summary,
+    ),
+    FunctionItem(
+        "Show config editability windows",
+        DaemonControlFunctions.show_saved_config_editability_windows,
     ),
     FunctionItem(
         "Recovery dashboard",
@@ -307,11 +395,11 @@ daemon_control_menu_items = [
     FunctionItem("Stop daemon", DaemonControlFunctions.stop_daemon),
     FunctionItem("Reconcile state", DaemonControlFunctions.reconcile),
     FunctionItem(
-        "Reconcile and apply safe proposal",
+        "Reconcile --apply",
         DaemonControlFunctions.reconcile_apply,
     ),
     FunctionItem(
-        "Archive stale staging",
+        "Reconcile --archive-staging --apply",
         DaemonControlFunctions.reconcile_archive_stale_staging,
     ),
     FunctionItem(
