@@ -1734,18 +1734,17 @@ def test_cli_reconcile_cleanable_scripts_reports_candidate_without_manual_mv(
 
     assert rc == 0
     out = capsys.readouterr().out
-    assert "=== Current state ===" in out
-    assert "=== Last failure ===" in out
+    assert "ICHOR Reconcile" in out
+    assert "Result: CLEANUP REQUIRED" in out
+    assert "Current Position" in out
+    assert "Last Failure" in out
     assert "reason: too_many_failures: 1/1" in out
-    assert "=== Script inventory ===" in out
-    assert "=== First-pass recovery proposal ===" in out
-    assert "phase: HALTED" in out
-    assert "Cleanable by --apply:" in out
-    assert ".DATA/SCRIPTS contains sbatch scripts" in out
-    assert "Expected recovery after cleanup" in out
+    assert "Recovery Safety" in out
+    assert "stale sbatch scripts" in out
+    assert "expected recovery after cleanup" in out
     assert "PHASE_B_POLUS@0" in out
     assert "ARIADNE_RESULTS.json" in out
-    assert "Do not manually promote this first-pass HALTED proposal" in out
+    assert "Apply Plan" in out
     assert "=== Recovery guidance ===" not in out
     assert "Operator-review artefacts:" not in out
     assert "mv " not in out
@@ -1830,13 +1829,13 @@ def test_cli_reconcile_apply_prints_final_recomputed_phase(
 
     assert rc == 0
     out = capsys.readouterr().out
-    assert "=== Apply cleanup plan ===" in out
-    assert "=== Recomputed recovery after cleanup ===" in out
-    assert "=== Final applied recovery ===" in out
-    assert "phase: PHASE_B_POLUS" in out
-    assert "contract: ok" in out
+    assert "ICHOR Reconcile" in out
+    assert "Result: APPLIED" in out
+    assert "Applied Changes" in out
+    assert "recover to PHASE_B_POLUS iteration 0" in out
+    assert "final contract: ok" in out
     assert "ARIADNE_RESULTS.json" in out
-    assert "Start the daemon with:" in out
+    assert "ichor-al-daemon start --campaign-dir " + str(campaign) + " --live" in out
 
 
 def test_cli_resume_refuses_halted_state(tmp_path, capsys):

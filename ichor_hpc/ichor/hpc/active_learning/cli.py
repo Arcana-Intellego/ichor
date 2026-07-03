@@ -31,7 +31,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .config import CampaignConfig
 from .daemon.daemon import (
@@ -3296,117 +3296,6 @@ def _reconcile_valid_candidates(
     ]
 
 
-def _print_reconcile_current_state(campaign: Path) -> None:
-    state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
-    print("=== Current state ===")
-    if not state_path.is_file():
-        print("state: missing")
-        print("")
-        return
-    try:
-        state = read_state(state_path)
-    except Exception as exc:
-        print("state: invalid")
-        print("reason: " + type(exc).__name__ + ": " + str(exc))
-        print("")
-        return
-    print("phase: " + state.phase.value)
-    print("iteration: " + str(int(state.iteration)))
-    print("training_set_version: " + str(int(state.training_set_version)))
-    print("models_version: " + str(int(state.models_version)))
-    print("pending_jobs: " + str(len(state.pending_jobs)))
-    print("shutdown_requested: " + str(bool(state.shutdown_requested)).lower())
-    print("campaign_uid: " + str(state.campaign_uid))
-    print("")
-
-
-def _print_reconcile_last_failure(report: Any) -> None:
-    print("=== Last failure ===")
-    event = getattr(report, "last_halt_event", None)
-    if not isinstance(event, dict):
-        print("halt event: none")
-        print("")
-        return
-    print("phase: " + str(event.get("from_phase") or event.get("phase") or "-"))
-    print("iteration: " + str(event.get("iteration", "-")))
-    print("reason: " + str(event.get("reason") or "-"))
-    print("timestamp: " + str(event.get("ts") or "-"))
-    print("")
-
-
-def _print_reconcile_script_inventory(report: Any) -> None:
-    inv = getattr(report, "script_inventory", {}) or {}
-    if not isinstance(inv, dict):
-        return
-    if not inv.get("exists"):
-        return
-    print("=== Script inventory ===")
-    print("status: stale, cleanable by --apply")
-    print("file_count: " + str(int(inv.get("count") or 0)))
-    sample = inv.get("sample")
-    if isinstance(sample, list) and sample:
-        _print_reconcile_bullets("sample", [str(item) for item in sample])
-    if inv.get("error"):
-        print("error: " + str(inv.get("error")))
-    print("")
-
-
-def _print_reconcile_first_pass(
-    campaign: Path,
-    report: Any,
-    contract_status: Dict[str, Any],
-) -> None:
-    print("=== First-pass recovery proposal ===")
-    state = report.proposed_state
-    print("phase: " + state.phase.value)
-    print("iteration: " + str(int(state.iteration)))
-    if report.decision:
-        print("decision: " + str(report.decision))
-    if state.phase is CampaignPhase.HALTED and _reconcile_cleanable_reasons(report):
-        print("reason: cleanable stale artefacts block automatic recovery")
-    print("")
-    _print_reconcile_bullets(
-        "Cleanable by --apply",
-        _reconcile_cleanable_reasons(report),
-    )
-    _print_reconcile_bullets(
-        "Hard blockers",
-        _reconcile_hard_blockers(report, contract_status),
-    )
-    _print_reconcile_bullets(
-        "Protected handoffs",
-        [
-            _format_reconcile_contract_item(campaign, item)
-            for item in contract_status.get("protected_artifacts", [])
-        ],
-    )
-    _print_reconcile_bullets(
-        "Valid recovery candidates",
-        _reconcile_valid_candidates(campaign, contract_status, report),
-    )
-    print("")
-
-
-def _print_reconcile_cleanup_prediction(
-    campaign: Path,
-    report: Any,
-    contract_status: Dict[str, Any],
-) -> None:
-    cleanable = _reconcile_cleanable_reasons(report)
-    hard = _reconcile_hard_blockers(report, contract_status)
-    candidates = _reconcile_valid_candidates(campaign, contract_status, report)
-    if not cleanable or hard or not candidates:
-        return
-    print("=== Expected recovery after cleanup ===")
-    print(
-        "Prediction only: --apply will archive cleanable artefacts, recompute "
-        "recovery, and apply only if the final contract validates."
-    )
-    for item in candidates:
-        print("  - " + item)
-    print("")
-
-
 def _reconcile_decision_payload(
     campaign: Path,
     report: Any,
@@ -3479,93 +3368,6 @@ def _reconcile_decision_payload(
     }
 
 
-def _print_reconcile_apply_plan(report: Any) -> None:
-    cleanable = _reconcile_cleanable_reasons(report)
-    if not cleanable:
-        return
-    print("=== Apply cleanup plan ===")
-    _print_reconcile_bullets("Cleanable artefacts", cleanable)
-    print("What will happen:")
-    print("  1. archive or remove cleanable stale artefacts")
-    print("  2. recompute recovery")
-    print("  3. validate the final state/artefact contract")
-    print("  4. write state.json only if the final recovery is runnable and valid")
-    print("")
-
-
-def _print_reconcile_final_applied(
-    campaign: Path,
-    report: Any,
-    contract_status: Dict[str, Any],
-    *,
-    backup_path: Optional[Path],
-    applied_proposal_path: Optional[Path],
-) -> None:
-    state = report.proposed_state
-    print("=== Final applied recovery ===")
-    print("phase: " + state.phase.value)
-    print("iteration: " + str(int(state.iteration)))
-    print("training_set_version: " + str(int(state.training_set_version)))
-    print("models_version: " + str(int(state.models_version)))
-    if report.decision:
-        print("decision: " + str(report.decision))
-    print("contract: " + ("ok" if contract_status.get("contract_ok") else "invalid"))
-    _print_reconcile_bullets(
-        "trusted inputs",
-        [str(item) for item in contract_status.get("trusted_inputs", [])],
-    )
-    _print_reconcile_bullets(
-        "trusted producer handoffs",
-        _reconcile_valid_candidates(campaign, contract_status, report),
-    )
-    print("state written:")
-    print("  - " + str(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME))
-    print("previous state backup:")
-    print("  - " + (str(backup_path) if backup_path is not None else "none"))
-    print("applied proposal:")
-    print(
-        "  - "
-        + (str(applied_proposal_path) if applied_proposal_path is not None else "none")
-    )
-    print("")
-
-
-def _print_recovery_contract_status(campaign: Path, report: Any) -> Dict[str, Any]:
-    status = recovery_contract_status(campaign, report.proposed_state)
-    print("=== Recovery contract ===")
-    print("selected phase: " + str(status.get("selected_phase")))
-    print("iteration:       " + str(status.get("iteration")))
-    print("contract:        " + ("ok" if status.get("contract_ok") else "invalid"))
-    _print_reconcile_bullets(
-        "Required inputs",
-        [str(item) for item in status.get("required_inputs", [])],
-    )
-    _print_reconcile_bullets(
-        "Trusted inputs",
-        [str(item) for item in status.get("trusted_inputs", [])],
-    )
-    _print_reconcile_bullets(
-        "Missing or invalid inputs",
-        [str(item) for item in status.get("missing_or_invalid_inputs", [])],
-    )
-    _print_reconcile_bullets(
-        "Trusted downstream handoffs",
-        [
-            _format_reconcile_contract_item(campaign, item)
-            for item in status.get("trusted_handoffs", [])
-        ],
-    )
-    _print_reconcile_bullets(
-        "Protected staging handoffs",
-        [
-            _format_reconcile_contract_item(campaign, item)
-            for item in status.get("protected_artifacts", [])
-        ],
-    )
-    print("")
-    return status
-
-
 def _reconcile_apply_command(campaign: Path, report: Any) -> str:
     command = "ichor-al-daemon reconcile --campaign-dir " + str(campaign)
     if ".DATA/STAGING is non-empty" in list(getattr(report, "unsafe_reasons", [])):
@@ -3573,14 +3375,654 @@ def _reconcile_apply_command(campaign: Path, report: Any) -> str:
     return command + " --apply"
 
 
-def _print_reconcile_inspect_commands(campaign: Path) -> None:
-    print("=== Inspect commands ===")
-    print("Inspect commands:")
-    print("  ichor-al-daemon status --campaign-dir " + str(campaign))
-    print("  ichor-al-daemon journal --campaign-dir " + str(campaign) + " --last-n 20")
-    print("  find " + str(campaign / ".DATA" / "STAGING") + " -maxdepth 3 -type f | sort")
-    print("  find " + str(campaign / "7_ACTIVE_LEARNING") + " -maxdepth 3 -type f | sort")
+def _reconcile_human_reason(reason: Any) -> str:
+    text = str(reason)
+    mapping = {
+        ".DATA/SCRIPTS contains sbatch scripts": "stale sbatch scripts",
+        "dangling model staging directories exist": "dangling model staging",
+        "dangling training staging directories exist": "dangling training staging",
+        ".DATA/STAGING is non-empty": ".DATA/STAGING is non-empty",
+        ".DATA/STAGING is non-empty (requires --archive-staging when safe)": (
+            ".DATA/STAGING is non-empty; requires --archive-staging when safe"
+        ),
+        "active submission intent(s) present": "active submission intent(s)",
+    }
+    return mapping.get(text, text)
+
+
+def _reconcile_contract_status_label(
+    state: Any,
+    contract_status: Mapping[str, Any],
+) -> str:
+    phase = getattr(getattr(state, "phase", None), "value", getattr(state, "phase", "UNKNOWN"))
+    if str(phase) == CampaignPhase.DONE.value:
+        return "terminal"
+    if str(phase) == CampaignPhase.HALTED.value:
+        return "not runnable"
+    return "ok" if bool(contract_status.get("contract_ok")) else "invalid"
+
+
+def _reconcile_result_label(
+    report: Any,
+    contract_status: Dict[str, Any],
+    *,
+    apply_mode: bool = False,
+) -> str:
+    if apply_mode:
+        return "APPLIED"
+    state = report.proposed_state
+    cleanable = _reconcile_cleanable_reasons(report)
+    blockers = _reconcile_hard_blockers(report, contract_status)
+    phase = state.phase
+    if blockers:
+        return "BLOCKED"
+    if cleanable:
+        return "CLEANUP REQUIRED"
+    if phase is CampaignPhase.HALTED:
+        return "BLOCKED"
+    if phase is CampaignPhase.DONE:
+        return "INSPECT ONLY"
+    if not bool(contract_status.get("contract_ok")):
+        return "BLOCKED"
+    return "READY"
+
+
+def _reconcile_apply_status(
+    report: Any,
+    contract_status: Dict[str, Any],
+) -> str:
+    result = _reconcile_result_label(report, contract_status)
+    if result == "READY":
+        return "safe"
+    if result == "CLEANUP REQUIRED":
+        return "cleanup required; no hard blockers"
+    if result == "INSPECT ONLY":
+        return "not applicable"
+    return "blocked"
+
+
+def _reconcile_latest_human_reason(report: Any) -> str:
+    decision = str(getattr(report, "decision", "") or "").strip()
+    if not decision:
+        return "-"
+    if ": " in decision:
+        return decision.split(": ", 1)[1]
+    return decision
+
+
+def _reconcile_format_time(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "-"
+    try:
+        from datetime import datetime, timezone
+
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    except Exception:
+        return text
+
+
+def _reconcile_wrap_line(prefix: str, text: str, *, width: int = 100) -> List[str]:
+    import textwrap
+
+    if len(prefix) + len(text) <= width:
+        return [prefix + text]
+    return textwrap.wrap(
+        text,
+        width=width,
+        initial_indent=prefix,
+        subsequent_indent=" " * len(prefix),
+        break_long_words=False,
+        break_on_hyphens=False,
+    ) or [prefix]
+
+
+def _print_reconcile_key_values(items: Sequence[Tuple[str, Any]]) -> None:
+    width = max((len(label) for label, _value in items), default=0)
+    for label, value in items:
+        print("  " + label.ljust(width) + ": " + str(value))
+
+
+def _print_reconcile_list(label: str, items: Sequence[Any], *, indent: str = "  ") -> None:
+    print(indent + label + ":")
+    if not items:
+        print(indent + "  - none")
+        return
+    for item in items:
+        print(indent + "  - " + str(item))
+
+
+def _reconcile_read_current_state_summary(campaign: Path, report: Any) -> Dict[str, Any]:
+    state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
+    if not state_path.is_file():
+        return {"state": "missing"}
+    try:
+        state = read_state(state_path)
+    except Exception as exc:
+        uid_status = "salvaged" if any(
+            "salvaged campaign_uid" in str(note)
+            for note in getattr(report, "notes", [])
+        ) else "unknown"
+        return {
+            "state": "invalid",
+            "reason": type(exc).__name__ + ": " + str(exc),
+            "campaign_uid": uid_status,
+        }
+    active_intents = list(getattr(report, "active_submission_intents", []) or [])
+    pending_count = len(getattr(state, "pending_jobs", {}) or {})
+    if active_intents:
+        job_text = str(len(active_intents)) + " active or unresolved submission intent(s)"
+    elif pending_count:
+        job_text = str(pending_count) + " stale or unresolved state entr"
+        job_text += "y" if pending_count == 1 else "ies"
+    else:
+        job_text = "none"
+    return {
+        "state": state.phase.value + " at iteration " + str(int(state.iteration)),
+        "versions": (
+            "training="
+            + str(int(state.training_set_version))
+            + (
+                " valid"
+                if int(state.training_set_version) in set(getattr(report, "valid_training_versions", []))
+                else ""
+            )
+            + ", models="
+            + (
+                "none"
+                if int(state.models_version) < 0
+                else str(int(state.models_version))
+                + (
+                    " valid"
+                    if int(state.models_version) in set(getattr(report, "valid_model_versions", []))
+                    else ""
+                )
+            )
+        ),
+        "recorded jobs": job_text,
+        "shutdown requested": "yes" if bool(state.shutdown_requested) else "no",
+        "campaign uid": str(state.campaign_uid),
+    }
+
+
+def _reconcile_bootstrap_summary(campaign: Path, report: Any) -> str:
+    handoff = getattr(report, "bootstrap_handoff", None)
+    if not isinstance(handoff, dict):
+        return "none"
+    phase = str(handoff.get("phase") or "UNKNOWN")
+    accepted = handoff.get("accepted_count")
+    total = handoff.get("n_total")
+    prefix = "archived " if bool(handoff.get("archived")) else ""
+    suffix = ""
+    if accepted is not None and total is not None:
+        suffix = " accepted " + str(accepted) + "/" + str(total)
+    path = _reconcile_relative_path(campaign, handoff.get("path"))
+    if path:
+        suffix += " at " + path
+    return prefix + phase + suffix
+
+
+def _reconcile_phase_a_summary(campaign: Path, report: Any) -> str:
+    handoff = getattr(report, "phase_a_handoff", None)
+    if not isinstance(handoff, dict):
+        return "none"
+    path = _reconcile_relative_path(campaign, handoff.get("path"))
+    if path:
+        return "available at " + path
+    return "available"
+
+
+def _reconcile_staging_summary(
+    campaign: Path,
+    contract_status: Dict[str, Any],
+    report: Any,
+) -> str:
+    protected = [
+        _format_reconcile_contract_item(campaign, item)
+        for item in contract_status.get("protected_artifacts", [])
+    ]
+    if protected:
+        return "protected: " + "; ".join(protected)
+    if ".DATA/STAGING is non-empty" in list(getattr(report, "unsafe_reasons", [])):
+        return "non-empty, operator review required"
+    return "none"
+
+
+def _reconcile_scripts_summary(report: Any) -> str:
+    inv = getattr(report, "script_inventory", {}) or {}
+    if not isinstance(inv, dict) or not inv.get("exists"):
+        return "none"
+    count = int(inv.get("count") or 0)
+    if ".DATA/SCRIPTS contains sbatch scripts" in list(getattr(report, "unsafe_reasons", [])):
+        return str(count) + " stale file" + ("" if count == 1 else "s") + ", cleanable"
+    return str(count) + " file" + ("" if count == 1 else "s")
+
+
+def _reconcile_model_staging_summary(report: Any) -> str:
+    if "dangling model staging directories exist" in list(getattr(report, "unsafe_reasons", [])):
+        return "dangling, cleanable"
+    return "none"
+
+
+def _reconcile_training_staging_summary(report: Any) -> str:
+    if "dangling training staging directories exist" in list(getattr(report, "unsafe_reasons", [])):
+        return "dangling, cleanable"
+    return "none"
+
+
+def _print_reconcile_header(campaign: Path, *, mode: str, result: str) -> None:
+    print("ICHOR Reconcile")
+    print("Campaign: " + str(campaign))
+    print("Mode: " + mode)
+    print("Result: " + result)
     print("")
+
+
+def _print_reconcile_recovery_target(
+    report: Any,
+    contract_status: Dict[str, Any],
+) -> None:
+    state = report.proposed_state
+    if state.phase is CampaignPhase.HALTED:
+        decision = "stay HALTED"
+    elif state.phase is CampaignPhase.DONE:
+        decision = "campaign is DONE"
+    else:
+        decision = (
+            "recover to "
+            + state.phase.value
+            + " iteration "
+            + str(int(state.iteration))
+        )
+    print("Recovery Target")
+    _print_reconcile_key_values(
+        [
+            ("decision", decision),
+            ("reason", _reconcile_latest_human_reason(report)),
+            ("apply", _reconcile_apply_status(report, contract_status)),
+        ]
+    )
+    print("")
+
+
+def _print_reconcile_current_position(campaign: Path, report: Any) -> None:
+    print("Current Position")
+    summary = _reconcile_read_current_state_summary(campaign, report)
+    _print_reconcile_key_values(list(summary.items()))
+    print("")
+
+
+def _print_reconcile_last_failure_compact(report: Any) -> None:
+    event = getattr(report, "last_halt_event", None)
+    if not isinstance(event, dict):
+        return
+    print("Last Failure")
+    phase = str(event.get("from_phase") or event.get("phase") or "-")
+    iteration = str(event.get("iteration", "-"))
+    _print_reconcile_key_values(
+        [
+            ("phase", phase + " iteration " + iteration),
+            ("time", _reconcile_format_time(event.get("ts"))),
+        ]
+    )
+    reason = str(event.get("reason") or "-")
+    for line in _reconcile_wrap_line("  reason: ", reason):
+        print(line)
+    print("")
+
+
+def _print_reconcile_safety(
+    campaign: Path,
+    report: Any,
+    contract_status: Dict[str, Any],
+) -> None:
+    cleanable = [_reconcile_human_reason(item) for item in _reconcile_cleanable_reasons(report)]
+    blockers = [_reconcile_human_reason(item) for item in _reconcile_hard_blockers(report, contract_status)]
+    protected = [
+        _format_reconcile_contract_item(campaign, item)
+        for item in contract_status.get("protected_artifacts", [])
+    ]
+    if blockers:
+        status = "blocked"
+    elif cleanable:
+        status = "cleanup required, no hard blockers"
+    else:
+        status = "safe"
+    print("Recovery Safety")
+    _print_reconcile_key_values([("status", status)])
+    _print_reconcile_list("cleanable", cleanable)
+    _print_reconcile_list("protected", protected)
+    _print_reconcile_list("blockers", blockers)
+    print("")
+
+
+def _print_reconcile_artefacts(
+    campaign: Path,
+    report: Any,
+    contract_status: Dict[str, Any],
+    *,
+    verbose: bool = False,
+) -> None:
+    print("Artefacts")
+    _print_reconcile_key_values(
+        [
+            (
+                "training versions",
+                "committed "
+                + repr(getattr(report, "committed_training_versions", []))
+                + ", valid "
+                + repr(getattr(report, "valid_training_versions", [])),
+            ),
+            (
+                "model versions",
+                "committed "
+                + repr(getattr(report, "committed_model_versions", []))
+                + ", valid "
+                + repr(getattr(report, "valid_model_versions", [])),
+            ),
+            ("bootstrap handoff", _reconcile_bootstrap_summary(campaign, report)),
+            ("Phase A handoff", _reconcile_phase_a_summary(campaign, report)),
+            ("scripts", _reconcile_scripts_summary(report)),
+            ("staging", _reconcile_staging_summary(campaign, contract_status, report)),
+            ("model staging", _reconcile_model_staging_summary(report)),
+            ("training staging", _reconcile_training_staging_summary(report)),
+        ]
+    )
+    inv = getattr(report, "script_inventory", {}) or {}
+    sample = inv.get("sample") if isinstance(inv, dict) else None
+    if verbose and isinstance(sample, list) and sample:
+        display = [str(item) for item in sample[:8]]
+        count = int(inv.get("count") or len(display))
+        if count > len(display):
+            display.append("... " + str(count - len(display)) + " more")
+        _print_reconcile_list("script sample", display)
+    if verbose and getattr(report, "notes", []):
+        _print_reconcile_list("diagnostic notes", [str(item) for item in report.notes])
+    if verbose and getattr(report, "trusted_artifacts", []):
+        _print_reconcile_list("trusted artefacts", [str(item) for item in report.trusted_artifacts])
+    if verbose and getattr(report, "blocking_artifacts", []):
+        _print_reconcile_list("artefact inventory", [str(item) for item in report.blocking_artifacts])
+    print("")
+
+
+def _print_reconcile_partial_array(campaign: Path, report: Any) -> None:
+    partial = getattr(report, "partial_array_recovery", None)
+    if not isinstance(partial, dict) or not partial:
+        return
+    print("Partial Array Recovery")
+    phase = str(partial.get("phase") or "UNKNOWN")
+    iteration = str(partial.get("iteration") if partial.get("iteration") is not None else "?")
+    total = int(partial.get("logical_total") or 0)
+    reuse = int(partial.get("n_reuse") or partial.get("n_complete") or 0)
+    retry = int(partial.get("n_retry") or 0)
+    mode = "full resubmission requested" if bool(partial.get("force_resubmit")) else "reuse completed outputs"
+    _print_reconcile_key_values(
+        [
+            ("phase", phase + " iteration " + iteration),
+            ("tasks", "total=" + str(total) + ", reusable=" + str(reuse) + ", retry=" + str(retry)),
+            ("ledger", _reconcile_relative_path(campaign, partial.get("ledger"))),
+            ("retry task file", _reconcile_relative_path(campaign, partial.get("retry_task_file")) or "none"),
+            ("mode", mode),
+        ]
+    )
+    print("")
+
+
+def _print_reconcile_config_changes(config_review: Any) -> None:
+    if config_review is None:
+        return
+    allowed = list(getattr(config_review, "allowed_changes", []) or [])
+    blocked = list(getattr(config_review, "blocked_changes", []) or [])
+    if not allowed and not blocked:
+        print("Config Changes")
+        _print_reconcile_key_values([("status", "no campaign.yaml changes against config lock")])
+        print("")
+        return
+    print("Config Changes")
+    allowed_lines = [
+        str(change.path)
+        + ": "
+        + repr(change.old)
+        + " -> "
+        + repr(change.new)
+        + (" (" + str(change.reason) + ")" if str(change.reason or "") else "")
+        for change in allowed
+    ]
+    blocked_lines = [
+        str(change.path)
+        + ": "
+        + repr(change.old)
+        + " -> "
+        + repr(change.new)
+        + (" (" + str(change.reason) + ")" if str(change.reason or "") else "")
+        for change in blocked
+    ]
+    _print_reconcile_list("allowed", allowed_lines)
+    _print_reconcile_list("blocked", blocked_lines)
+    print("")
+
+
+def _print_reconcile_contract_compact(
+    campaign: Path,
+    report: Any,
+    contract_status: Dict[str, Any],
+) -> None:
+    state = report.proposed_state
+    print("Recovery Contract")
+    _print_reconcile_key_values(
+        [
+            (
+                "selected phase",
+                str(contract_status.get("selected_phase"))
+                + " iteration "
+                + str(contract_status.get("iteration")),
+            ),
+            ("status", _reconcile_contract_status_label(state, contract_status)),
+        ]
+    )
+    _print_reconcile_list(
+        "required",
+        [str(item) for item in contract_status.get("required_inputs", [])],
+    )
+    trusted = [str(item) for item in contract_status.get("trusted_inputs", [])]
+    trusted.extend(
+        _format_reconcile_contract_item(campaign, item)
+        for item in contract_status.get("trusted_handoffs", [])
+    )
+    protected = [
+        _format_reconcile_contract_item(campaign, item)
+        for item in contract_status.get("protected_artifacts", [])
+    ]
+    if protected:
+        trusted.extend("protected " + item for item in protected)
+    _print_reconcile_list("trusted", trusted)
+    _print_reconcile_list(
+        "missing",
+        [str(item) for item in contract_status.get("missing_or_invalid_inputs", [])],
+    )
+    print("")
+
+
+def _print_reconcile_apply_plan_compact(
+    campaign: Path,
+    report: Any,
+    contract_status: Dict[str, Any],
+    *,
+    proposed_state_path: Optional[Path],
+) -> None:
+    cleanable = [_reconcile_human_reason(item) for item in _reconcile_cleanable_reasons(report)]
+    blockers = _reconcile_hard_blockers(report, contract_status)
+    print("Apply Plan")
+    if proposed_state_path is not None:
+        print("  proposed state: " + _reconcile_relative_path(campaign, proposed_state_path))
+    if blockers:
+        print("  apply: blocked")
+        _print_reconcile_list("next action", ["inspect blockers before restarting"])
+        print("")
+        return
+    if cleanable:
+        _print_reconcile_list(
+            "if applied",
+            cleanable
+            + [
+                "recompute recovery",
+                "write recovered state only if the final contract is ok",
+            ],
+        )
+        candidates = _reconcile_valid_candidates(campaign, contract_status, report)
+        if candidates:
+            _print_reconcile_list("expected recovery after cleanup", candidates)
+        print("  command:")
+        print("    " + _reconcile_apply_command(campaign, report))
+        print("")
+        return
+    state = report.proposed_state
+    if state.phase in (CampaignPhase.HALTED, CampaignPhase.DONE):
+        print("  apply: not applicable")
+        print("")
+        return
+    canonical = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
+    if proposed_state_path is not None:
+        print("  manual promote:")
+        print("    mv " + str(proposed_state_path) + " " + str(canonical))
+    print("  safer command:")
+    print("    ichor-al-daemon reconcile --campaign-dir " + str(campaign) + " --apply")
+    print("")
+
+
+def _print_reconcile_inspect_compact(campaign: Path) -> None:
+    print("Inspect")
+    _print_reconcile_key_values(
+        [
+            ("status", "ichor-al-daemon status --campaign-dir " + str(campaign)),
+            ("journal", "ichor-al-daemon journal --campaign-dir " + str(campaign) + " --last-n 20"),
+            ("staging", "find " + str(campaign / ".DATA" / "STAGING") + " -maxdepth 3 -type f | sort"),
+        ]
+    )
+    print("")
+
+
+def _print_reconcile_operator_report(
+    campaign: Path,
+    report: Any,
+    contract_status: Dict[str, Any],
+    *,
+    mode: str,
+    proposed_state_path: Optional[Path],
+    config_review: Any = None,
+    runtime_status: Optional[Dict[str, Any]] = None,
+    verbose: bool = False,
+) -> None:
+    result = _reconcile_result_label(report, contract_status)
+    _print_reconcile_header(campaign, mode=mode, result=result)
+    _print_reconcile_recovery_target(report, contract_status)
+    _print_reconcile_current_position(campaign, report)
+    _print_reconcile_last_failure_compact(report)
+    _print_reconcile_safety(campaign, report, contract_status)
+    _print_reconcile_artefacts(campaign, report, contract_status, verbose=verbose)
+    _print_reconcile_partial_array(campaign, report)
+    _print_reconcile_config_changes(config_review)
+    _print_reconcile_contract_compact(campaign, report, contract_status)
+    if runtime_status and runtime_status.get("reconcile_apply_blockers"):
+        print("Runtime")
+        _print_reconcile_list(
+            "apply blockers",
+            [str(item) for item in runtime_status.get("reconcile_apply_blockers", [])],
+        )
+        print("")
+    if verbose and getattr(report, "recommended_actions", []):
+        _print_reconcile_list(
+            "Recommended Actions",
+            [str(item) for item in report.recommended_actions],
+            indent="",
+        )
+        print("")
+    _print_reconcile_apply_plan_compact(
+        campaign,
+        report,
+        contract_status,
+        proposed_state_path=proposed_state_path,
+    )
+    _print_reconcile_inspect_compact(campaign)
+
+
+def _print_reconcile_applied_operator_report(
+    campaign: Path,
+    report: Any,
+    contract_status: Dict[str, Any],
+    *,
+    backup_path: Optional[Path],
+    applied_proposal_path: Optional[Path],
+    removed: Sequence[str],
+    removed_model_staging: Sequence[str],
+    archived_scripts: Sequence[str],
+    archived: Sequence[str],
+    archived_training_staging: Sequence[str],
+    restored_bootstrap_handoff: Sequence[str],
+) -> None:
+    _print_reconcile_header(campaign, mode="apply", result="APPLIED")
+    _print_reconcile_recovery_target(report, contract_status)
+    print("Applied Changes")
+    cleanup_items: List[str] = []
+    cleanup_items.extend("removed stale artefact: " + _reconcile_relative_path(campaign, item) for item in removed)
+    cleanup_items.extend("removed model staging: " + _reconcile_relative_path(campaign, item) for item in removed_model_staging)
+    cleanup_items.extend("archived stale scripts: " + _reconcile_relative_path(campaign, item) for item in archived_scripts)
+    cleanup_items.extend("archived staging: " + _reconcile_relative_path(campaign, item) for item in archived)
+    cleanup_items.extend("archived training staging: " + _reconcile_relative_path(campaign, item) for item in archived_training_staging)
+    cleanup_items.extend("restored bootstrap staging: " + _reconcile_relative_path(campaign, item) for item in restored_bootstrap_handoff)
+    _print_reconcile_key_values(
+        [
+            ("state written", _reconcile_relative_path(campaign, campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME)),
+            ("previous state backup", _reconcile_relative_path(campaign, backup_path) if backup_path is not None else "none"),
+            ("applied proposal archive", _reconcile_relative_path(campaign, applied_proposal_path) if applied_proposal_path is not None else "none"),
+            ("final contract", "ok" if contract_status.get("contract_ok") else "invalid"),
+        ]
+    )
+    _print_reconcile_list("cleanup", cleanup_items)
+    final_phase = report.proposed_state.phase
+    if bool(contract_status.get("contract_ok")) and final_phase not in {CampaignPhase.HALTED, CampaignPhase.DONE}:
+        _print_reconcile_list(
+            "next",
+            ["ichor-al-daemon start --campaign-dir " + str(campaign) + " --live"],
+        )
+    else:
+        _print_reconcile_list(
+            "next",
+            ["Campaign remains " + final_phase.value + "; do not start the daemon yet."],
+        )
+    print("")
+    _print_reconcile_contract_compact(campaign, report, contract_status)
+
+
+def _print_reconcile_apply_blocked(
+    campaign: Path,
+    *,
+    title: str,
+    reasons: Sequence[Any],
+    next_actions: Sequence[Any] = (),
+) -> None:
+    print("ICHOR Reconcile", file=sys.stderr)
+    print("Campaign: " + str(campaign), file=sys.stderr)
+    print("Mode: apply", file=sys.stderr)
+    print("Result: BLOCKED", file=sys.stderr)
+    print("", file=sys.stderr)
+    print(title, file=sys.stderr)
+    if reasons:
+        print("  blockers:", file=sys.stderr)
+        for reason in reasons:
+            print("    - " + str(reason), file=sys.stderr)
+    else:
+        print("  blockers:", file=sys.stderr)
+        print("    - unknown", file=sys.stderr)
+    if next_actions:
+        print("  next:", file=sys.stderr)
+        for action in next_actions:
+            print("    - " + str(action), file=sys.stderr)
+    print("", file=sys.stderr)
 
 
 def cmd_reconcile(args: argparse.Namespace) -> int:
@@ -3654,18 +4096,33 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 8
-        print("Config proposal written to: " + str(target_config))
-        print(
-            "The proposal is a dense full config snapshot restored from "
-            "config_lock.json."
+        _print_reconcile_header(campaign, mode="restore-config", result="CONFIG PROPOSAL")
+        print("Config Proposal")
+        _print_reconcile_key_values(
+            [
+                ("proposal", _reconcile_relative_path(campaign, target_config)),
+                ("source", ".DATA/ACTIVE_LEARNING/config_lock.json"),
+                ("status", "dense full config snapshot written"),
+            ]
         )
-        print("Review the proposal, then promote it manually:")
+        print("")
+        print("Apply Plan")
+        print("  manual promote:")
         print("    mv " + str(target_config) + " " + str(campaign / "campaign.yaml"))
-        print("Then re-run reconcile:")
+        print("  then run:")
         print("    ichor-al-daemon reconcile --campaign-dir " + str(campaign) + " --apply")
+        print("")
         return 0
     if bool(getattr(args, "apply", False)) and runtime_status.get("reconcile_apply_blockers"):
-        print("refusing --apply because a daemon may still be running", file=sys.stderr)
+        _print_reconcile_apply_blocked(
+            campaign,
+            title="Runtime Safety",
+            reasons=list(runtime_status.get("reconcile_apply_blockers") or []),
+            next_actions=[
+                "stop the daemon or wait for the lock/lease to clear",
+                "rerun reconcile --apply",
+            ],
+        )
         _print_reconcile_runtime_warning(runtime_status, campaign)
         return 9
     report = propose_recovery(
@@ -3722,120 +4179,19 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             )
         )
         return 0
-    print("Proposed state written to: " + str(target))
-    print("")
-    _print_reconcile_current_state(campaign)
-    _print_reconcile_last_failure(report)
-    _print_reconcile_script_inventory(report)
-    print("=== Diagnostic notes ===")
-    for note in report.notes:
-        print("  - " + note)
-    print("")
-    print("Committed training versions: " + repr(report.committed_training_versions))
-    print("Valid training versions:     " + repr(report.valid_training_versions))
-    print("Committed model versions:    " + repr(report.committed_model_versions))
-    print("Valid model versions:        " + repr(report.valid_model_versions))
-    print("Last phase in journal:       " + repr(report.last_phase_in_journal))
-    print("Last iteration in journal:   " + repr(report.last_iteration_in_journal))
-    if getattr(report, "last_phase_event_in_journal", None):
-        print("Last phase event in journal: " + repr(report.last_phase_event_in_journal))
-    if report.decision:
-        print("Recovery decision:           " + str(report.decision))
-    if report.bootstrap_handoff:
-        label = "Archived bootstrap handoff" if report.bootstrap_handoff.get("archived") else "Bootstrap handoff"
-        print(
-            label
-            + ":     "
-            + repr(
-                {
-                    "path": report.bootstrap_handoff.get("path"),
-                    "phase": report.bootstrap_handoff.get("phase"),
-                    "iteration": report.bootstrap_handoff.get("iteration"),
-                    "n_total": report.bootstrap_handoff.get("n_total"),
-                    "accepted_count": report.bootstrap_handoff.get("accepted_count"),
-                }
-            )
-        )
-    if report.trusted_artifacts:
-        print("Trusted artefacts:           " + repr(report.trusted_artifacts))
-    if report.blocking_artifacts:
-        print("Recovery artefact inventory: " + repr(report.blocking_artifacts))
-    if report.unsafe_reasons:
-        print("Unsafe recovery reasons:     " + repr(report.unsafe_reasons))
-    if report.active_submission_intents:
-        print("Active submission intents:   " + repr([
-            {
-                "phase": i.get("phase"),
-                "iteration": i.get("iteration"),
-                "status": i.get("status"),
-                "job_id": i.get("job_id"),
-                "expected_job_name": i.get("expected_job_name"),
-            }
-            for i in report.active_submission_intents
-        ]))
-    partial_array = getattr(report, "partial_array_recovery", None)
-    if isinstance(partial_array, dict):
-        print(
-            "Partial array recovery:      "
-            + repr(
-                {
-                    "phase": partial_array.get("phase"),
-                    "iteration": partial_array.get("iteration"),
-                    "logical_total": partial_array.get("logical_total"),
-                    "reusable_complete": partial_array.get("n_reuse"),
-                    "retry_needed": partial_array.get("n_retry"),
-                    "force_resubmit": partial_array.get("force_resubmit"),
-                    "ledger": partial_array.get("ledger"),
-                }
-            )
-        )
-    if report.recommended_actions:
-        print("Recommended actions:")
-        for action in report.recommended_actions:
-            print("  - " + str(action))
-    print("")
-    contract_status = _print_recovery_contract_status(campaign, report)
-    if not bool(getattr(args, "apply", False)) and runtime_status.get("reconcile_apply_blockers"):
-        _print_reconcile_runtime_warning(runtime_status, campaign)
+    contract_status = recovery_contract_status(campaign, report.proposed_state)
     target_canonical = target.with_name(DEFAULT_STATE_FILENAME)
-    if config_review is not None:
-        print("=== Config lock review ===")
-        formatted = format_config_review(config_review)
-        if formatted:
-            print(formatted)
-        else:
-            print("No campaign.yaml changes against the config lock.")
-        print("")
-    _print_reconcile_first_pass(campaign, report, contract_status)
-    _print_reconcile_cleanup_prediction(campaign, report, contract_status)
-    _print_reconcile_inspect_commands(campaign)
     if not bool(getattr(args, "apply", False)):
-        if report.bootstrap_handoff and report.bootstrap_handoff.get("archived"):
-            print(
-                "This proposal depends on archived bootstrap staging. Use "
-                "--apply so reconcile can restore the handoff before writing "
-                "state.json."
-            )
-            print("")
-            print("Apply the safe proposal automatically:")
-            print("    ichor-al-daemon reconcile --campaign-dir " + str(campaign) + " --apply")
-        elif report.proposed_state.phase is CampaignPhase.HALTED and (
-            _reconcile_cleanable_reasons(report)
-            or getattr(report, "unsafe_reasons", [])
-        ):
-            print(
-                "Do not manually promote this first-pass HALTED proposal unless "
-                "you intend the campaign to remain halted."
-            )
-            print("")
-            print("Let reconcile archive cleanable artefacts and recompute recovery:")
-            print("    " + _reconcile_apply_command(campaign, report))
-        else:
-            print("Review the proposal, then promote it manually:")
-            print("    mv " + str(target) + " " + str(target_canonical))
-            print("")
-            print("Or apply the safe proposal automatically:")
-            print("    ichor-al-daemon reconcile --campaign-dir " + str(campaign) + " --apply")
+        _print_reconcile_operator_report(
+            campaign,
+            report,
+            contract_status,
+            mode="dry-run",
+            proposed_state_path=target,
+            config_review=config_review,
+            runtime_status=runtime_status,
+            verbose=bool(getattr(args, "verbose", False)),
+        )
         return 0
 
     candidate_labels = _reconcile_valid_candidates(campaign, contract_status, report)
@@ -3879,15 +4235,11 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             ),
         )
         if blocking_intents:
-            print(
-                "refusing --apply because active submission intents are still live "
-                "or scheduler status is inconclusive:",
-                file=sys.stderr,
-            )
-            for item in blocking_intents:
-                print(
-                    "  - "
-                    + str(item.get("phase"))
+            _print_reconcile_apply_blocked(
+                campaign,
+                title="Submission Intents",
+                reasons=[
+                    str(item.get("phase"))
                     + "@"
                     + str(item.get("iteration"))
                     + " job_id="
@@ -3895,21 +4247,13 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                     + " expected_job_name="
                     + str(item.get("expected_job_name"))
                     + ": "
-                    + str(item.get("reason")),
-                    file=sys.stderr,
-                )
-            print("Next safe command if these jobs should be cancelled:", file=sys.stderr)
-            print(
-                "  ichor-al-daemon stop --campaign-dir "
-                + str(campaign)
-                + " --cancel-jobs",
-                file=sys.stderr,
-            )
-            print(
-                "  ichor-al-daemon reconcile --campaign-dir "
-                + str(campaign)
-                + " --apply",
-                file=sys.stderr,
+                    + str(item.get("reason"))
+                    for item in blocking_intents
+                ],
+                next_actions=[
+                    "ichor-al-daemon stop --campaign-dir " + str(campaign) + " --cancel-jobs",
+                    "ichor-al-daemon reconcile --campaign-dir " + str(campaign) + " --apply",
+                ],
             )
             return 9
         if resolved_intents:
@@ -4026,20 +4370,32 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         if reason not in cleanable_reasons
     ]
     if uncleanable:
-        print(
-            "refusing --apply because reconcile reported unsafe artefacts "
-            "that cannot be cleaned automatically:",
-            file=sys.stderr,
-        )
-        for reason in uncleanable:
-            print("  - " + reason, file=sys.stderr)
+        reasons = list(uncleanable)
         if archive_staging_refusal_reasons:
-            print("Archive staging blockers:", file=sys.stderr)
-            for reason in archive_staging_refusal_reasons:
-                print("  - " + str(reason), file=sys.stderr)
+            reasons.extend(
+                "archive staging blocker: " + str(reason)
+                for reason in archive_staging_refusal_reasons
+            )
+        _print_reconcile_apply_blocked(
+            campaign,
+            title="Unsafe Artefacts",
+            reasons=reasons,
+            next_actions=["inspect blockers before restarting"],
+        )
         return 9
 
-    _print_reconcile_apply_plan(report)
+    cleanable_now = [_reconcile_human_reason(item) for item in _reconcile_cleanable_reasons(report)]
+    if cleanable_now:
+        print("Apply Plan")
+        _print_reconcile_list(
+            "cleanup before recovery",
+            cleanable_now
+            + [
+                "recompute recovery",
+                "validate the final state/artefact contract",
+            ],
+        )
+        print("")
 
     original_report = report
     archived_array_outputs: List[str] = []
@@ -4144,14 +4500,21 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             _print_cleanup_already_happened(cleanup_paths_already_done)
             return 8
         recomputed_status = recovery_contract_status(campaign, report.proposed_state)
-        print("=== Recomputed recovery after cleanup ===")
-        print("phase: " + report.proposed_state.phase.value)
-        print("iteration: " + str(int(report.proposed_state.iteration)))
-        if report.decision:
-            print("decision: " + str(report.decision))
-        print("contract: " + ("ok" if recomputed_status.get("contract_ok") else "invalid"))
-        _print_reconcile_bullets(
-            "trusted producer handoffs",
+        print("Recovery After Cleanup")
+        _print_reconcile_key_values(
+            [
+                (
+                    "selected phase",
+                    report.proposed_state.phase.value
+                    + " iteration "
+                    + str(int(report.proposed_state.iteration)),
+                ),
+                ("reason", str(report.decision or "-")),
+                ("contract", "ok" if recomputed_status.get("contract_ok") else "invalid"),
+            ]
+        )
+        _print_reconcile_list(
+            "trusted handoffs",
             _reconcile_valid_candidates(campaign, recomputed_status, report),
         )
         print("")
@@ -4174,12 +4537,12 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
 
     contract_error = _reconcile_apply_contract_error(campaign, report.proposed_state)
     if contract_error is not None:
-        print(
-            "refusing --apply because the final proposed state fails the "
-            "state/artefact contract:",
-            file=sys.stderr,
+        _print_reconcile_apply_blocked(
+            campaign,
+            title="Final State/Artefact Contract",
+            reasons=[contract_error],
+            next_actions=["inspect recovery contract before restarting"],
         )
-        print("  - " + contract_error, file=sys.stderr)
         _print_cleanup_already_happened(cleanup_paths_already_done)
         return 9
 
@@ -4328,53 +4691,20 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         )
     except Exception:
         pass
-    print("Applied proposed state: " + str(target_canonical))
-    if backup_path is not None:
-        print("Previous state backup: " + str(backup_path))
-    if applied_proposal_path is not None:
-        print("Applied proposal archive: " + str(applied_proposal_path))
-    if removed:
-        print("Removed stale uncommitted artefacts:")
-        for path in removed:
-            print("  - " + path)
-    if removed_model_staging:
-        print("Removed stale model staging:")
-        for path in removed_model_staging:
-            print("  - " + path)
-    if archived_scripts:
-        print("Archived stale .DATA/SCRIPTS:")
-        for path in archived_scripts:
-            print("  - " + path)
-    if archived:
-        print("Archived stale .DATA/STAGING:")
-        for path in archived:
-            print("  - " + path)
-    if archived_training_staging:
-        print("Archived stale training staging:")
-        for path in archived_training_staging:
-            print("  - " + path)
-    if restored_bootstrap_handoff:
-        print("Restored bootstrap staging from archive:")
-        for path in restored_bootstrap_handoff:
-            print("  - " + path)
-    print("")
     final_contract_status = recovery_contract_status(campaign, report.proposed_state)
-    _print_reconcile_final_applied(
+    _print_reconcile_applied_operator_report(
         campaign,
         report,
         final_contract_status,
         backup_path=backup_path,
         applied_proposal_path=applied_proposal_path,
+        removed=removed,
+        removed_model_staging=removed_model_staging,
+        archived_scripts=archived_scripts,
+        archived=archived,
+        archived_training_staging=archived_training_staging,
+        restored_bootstrap_handoff=restored_bootstrap_handoff,
     )
-    final_phase = report.proposed_state.phase
-    if (
-        bool(final_contract_status.get("contract_ok"))
-        and final_phase not in {CampaignPhase.HALTED, CampaignPhase.DONE}
-    ):
-        print("Start the daemon with:")
-        print("    ichor-al-daemon start --campaign-dir " + str(campaign) + " --live")
-    else:
-        print("Campaign remains " + final_phase.value + "; do not start the daemon yet.")
     return 0
 
 
@@ -5283,6 +5613,14 @@ Examples:
         help=(
             "Print a machine-readable recovery decision payload. Proposal-only; "
             "do not combine with --apply."
+        ),
+    )
+    p_recon.add_argument(
+        "--verbose",
+        action="store_true",
+        help=(
+            "Include detailed diagnostic notes, trusted artefacts, and inventory "
+            "samples in the human-readable reconcile report."
         ),
     )
     p_recon.add_argument(

@@ -204,16 +204,18 @@ def test_reconcile_prints_recovery_contract_and_first_pass_guidance(tmp_path, ca
 
     assert rc == 0
     out = capsys.readouterr().out
-    assert "=== Recovery contract ===" in out
-    assert "selected phase: INITIAL_GAUSSIAN" in out
-    assert "contract:        ok" in out
-    assert "Required inputs:" in out
+    assert "ICHOR Reconcile" in out
+    assert "Result: READY" in out
+    assert "Recovery Contract" in out
+    assert "selected phase: INITIAL_GAUSSIAN iteration 0" in out
+    assert "status: ok" in out
+    assert "required:" in out
     assert "Phase A sample" in out
     assert "=== Recovery guidance ===" not in out
-    assert "=== First-pass recovery proposal ===" in out
-    assert "Valid recovery candidates:" in out
+    assert "Recovery Target" in out
+    assert "Apply Plan" in out
     assert "ichor-al-daemon reconcile --campaign-dir " + str(campaign) + " --apply" in out
-    assert "=== Inspect commands ===" in out
+    assert "Inspect" in out
 
 
 def test_reconcile_prints_protected_staging_handoff(tmp_path, capsys):
@@ -235,12 +237,13 @@ def test_reconcile_prints_protected_staging_handoff(tmp_path, capsys):
 
     assert rc == 0
     out = capsys.readouterr().out
-    assert "Protected staging handoffs:" in out
+    assert "Recovery Safety" in out
+    assert "protected:" in out
     assert "INITIAL_AIMALL@0 -> .DATA\\STAGING\\initial" in out or (
         "INITIAL_AIMALL@0 -> .DATA/STAGING/initial" in out
     )
     assert "Operator-review artefacts:" not in out
-    assert "Hard blockers:" in out
+    assert "blockers:" in out
 
 
 def test_phase_walltime_changes_are_allowed_runtime_changes(tmp_path):
@@ -973,7 +976,9 @@ def test_reconcile_apply_promotes_state_and_cleans_ferebus_staging(tmp_path, cap
     assert state.training_set_version == 0
     assert state.models_version == -1
     assert not stale.exists()
-    assert "Applied proposed state" in out
+    assert "Result: APPLIED" in out
+    assert "Applied Changes" in out
+    assert "state written" in out
     assert not (campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json.proposed").exists()
     assert sorted(
         (campaign / ".DATA" / "ACTIVE_LEARNING").glob(
@@ -1202,7 +1207,8 @@ def test_reconcile_restore_config_from_lock_writes_proposal(tmp_path, capsys):
     proposed = campaign / "campaign.yaml.proposed"
     assert rc == 0
     assert proposed.is_file()
-    assert "Config proposal written" in out
+    assert "Result: CONFIG PROPOSAL" in out
+    assert "Config Proposal" in out
     restored = CampaignConfig.from_yaml(proposed)
     assert restored.system_name == "RESTORED"
 
