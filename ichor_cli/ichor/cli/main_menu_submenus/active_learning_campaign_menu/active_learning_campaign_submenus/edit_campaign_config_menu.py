@@ -333,23 +333,10 @@ def _config_lock_change_status(path: str) -> str:
         return ""
     from ichor.hpc.active_learning.daemon import config_lock as lock_mod
 
-    if path in lock_mod.COMMITTED_LOCKED_EXACT:
-        return "locked after committed artefacts"
-    if path in lock_mod.CAMPAIGN_LOCKED_EXACT:
-        return "locked after campaign start"
-    if path in lock_mod.PHASE_LOCAL_EXACT:
-        return "phase-local"
-    if path in lock_mod.ALWAYS_SAFE_EXACT or path in lock_mod.ALWAYS_SAFE_RESOURCE_EXACT:
-        return "safe runtime change"
-    if any(path.startswith(prefix) for prefix in lock_mod.ALWAYS_SAFE_PREFIXES):
-        return "safe runtime change"
-    if path in lock_mod.FUTURE_SAFE_EXACT:
-        return "future-safe"
-    if any(path.startswith(prefix) for prefix in lock_mod.FUTURE_SAFE_PREFIXES):
-        return "future-safe"
-    if not path.startswith("schema_version"):
-        return "unclassified lock policy"
-    return ""
+    status = lock_mod.describe_field_editability(path)
+    if status == "unclassified lock policy" or path == "schema_version":
+        return status
+    return "window: " + status
 
 
 def _refresh_config_lock_options() -> None:

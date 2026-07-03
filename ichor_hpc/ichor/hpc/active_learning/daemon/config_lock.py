@@ -28,7 +28,7 @@ from .state import CampaignPhase, CampaignState, atomic_write_json
 
 CONFIG_LOCK_SCHEMA_VERSION = 1
 CONFIG_LOCK_FILENAME = "config_lock.json"
-CONFIG_LOCK_POLICY_VERSION = 1
+CONFIG_LOCK_POLICY_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -56,6 +56,13 @@ class ConfigLockReview:
     @property
     def changed(self) -> bool:
         return bool(self.allowed_changes or self.blocked_changes)
+
+
+@dataclass(frozen=True)
+class ConfigFieldPolicy:
+    category: str
+    lock_kind: str
+    description: str
 
 
 def _now_iso() -> str:
@@ -148,57 +155,126 @@ def _matches(path: str, exact: Iterable[str], prefixes: Iterable[str]) -> bool:
     return path in set(exact) or any(path.startswith(prefix) for prefix in prefixes)
 
 
-ALWAYS_SAFE_EXACT = {
+RUNTIME_SAFE_EXACT = {
     "max_iterations",
     "poll_interval_seconds",
     "poll_interval_idle_seconds",
     "poll_sacct_empty_max_ticks",
+    "failure_threshold_fraction",
 }
-ALWAYS_SAFE_PREFIXES = {
+RUNTIME_SAFE_PREFIXES = {
     "runtime.",
     "stop.",
     "error_calibration.",
 }
-ALWAYS_SAFE_RESOURCE_EXACT = {
-    "resources.defaults.walltime_hours",
-    "resources.polus.walltime_hours",
-    "resources.gaussian.walltime_hours",
-    "resources.aimall.walltime_hours",
-    "resources.ariadne.walltime_hours",
-    "resources.ferebus.walltime_hours",
-    "resources.array_concurrency_limit",
-    "resources.gradient_parallel_backend",
-    "resources.fail_on_memory_estimate_exceeds_request",
-}
 
-FUTURE_SAFE_PREFIXES = {
-    "seed_selection.",
-    "active_batch.",
-    "sampling_protocol.",
-}
-FUTURE_SAFE_EXACT = {
+RESOURCE_FUTURE_EXACT = {
     "resources.defaults.partition",
+    "resources.defaults.walltime_hours",
     "resources.defaults.cpus_per_task",
     "resources.defaults.mem_per_cpu",
     "resources.polus.partition",
-    "resources.gaussian.partition",
-    "resources.aimall.partition",
-    "resources.ariadne.partition",
-    "resources.ferebus.partition",
+    "resources.polus.walltime_hours",
     "resources.polus.cpus_per_task",
-    "resources.gaussian.cpus_per_task",
-    "resources.aimall.cpus_per_task",
-    "resources.ariadne.cpus_per_task",
-    "resources.ferebus.cpus_per_task",
     "resources.polus.mem_per_cpu",
+    "resources.gaussian.partition",
+    "resources.gaussian.walltime_hours",
+    "resources.gaussian.cpus_per_task",
     "resources.gaussian.mem_per_cpu",
-    "resources.aimall.mem_per_cpu",
-    "resources.ariadne.mem_per_cpu",
-    "resources.ferebus.mem_per_cpu",
     "resources.gaussian.memory_mode",
     "resources.gaussian.link0_mem",
     "resources.gaussian.memory_fraction_of_slurm",
+    "resources.aimall.partition",
+    "resources.aimall.walltime_hours",
+    "resources.aimall.cpus_per_task",
+    "resources.aimall.mem_per_cpu",
+    "resources.ariadne.partition",
+    "resources.ariadne.walltime_hours",
+    "resources.ariadne.cpus_per_task",
+    "resources.ariadne.mem_per_cpu",
+    "resources.ferebus.partition",
+    "resources.ferebus.walltime_hours",
+    "resources.ferebus.cpus_per_task",
+    "resources.ferebus.mem_per_cpu",
+    "resources.array_concurrency_limit",
+    "resources.fail_on_memory_estimate_exceeds_request",
 }
+
+IMMUTABLE_EXACT = {"schema_version"}
+
+PRE_POOL_EXACT = {"trajectory_pool.source_path"}
+PRE_PHASE_A_EXACT = {"bootstrap.initial_labelled_size"}
+PRE_GAUSSIAN_PREFIXES = {"gaussian."}
+PRE_AIMALL_PREFIXES = {"aimall."}
+PRE_FEREBUS_FIRST_EXACT = {
+    "system_name",
+    "ferebus.properties",
+    "ferebus.train_fraction",
+    "ferebus.int_val_fraction",
+    "ferebus.ext_val_fraction",
+    "acquisition.property_name",
+}
+FUTURE_FEREBUS_EXACT = {
+    "ferebus.warmstart",
+    "ferebus.warmstart_streak",
+    "ferebus.kernel",
+    "ferebus.loss",
+    "ferebus.nagents",
+    "ferebus.maxiter",
+    "ferebus.is_constant_noise",
+    "ferebus.scaling",
+    "ferebus.full_ARD",
+    "quality_gates.ferebus_min_ext_r2",
+    "quality_gates.ferebus_max_ext_rmse_ha",
+    "quality_gates.ferebus_max_condition_number",
+}
+PRE_SEED_SELECT_EXACT = {
+    "anti_overlap.skip_training_seeds",
+    "anti_overlap.recent_seeds_cooldown",
+}
+PRE_SEED_SELECT_PREFIXES = {"seed_selection."}
+PRE_ARIADNE_EXACT = {
+    "max_acquisition_grad_per_ang",
+    "max_force_per_atom_ha_per_ang",
+    "resources.gradient_parallel_backend",
+    "quality_gates.ariadne_max_displacement_ang",
+    "quality_gates.ariadne_min_pair_distance_ang",
+}
+PRE_ARIADNE_PREFIXES = {
+    "acquisition.",
+    "ariadne.",
+    "adversarial_safety.",
+    "anti_overlap.",
+}
+PRE_SAMPLING_PROTOCOL_PREFIXES = {
+    "sampling_protocol.",
+    "geometry_novelty.",
+}
+PRE_PHASE_B_PREFIXES = {
+    "active_batch.",
+    "phase_b.",
+}
+PRE_SPLIT_PREFIXES = {"split."}
+PRE_AIMALL_QUALITY_EXACT = {
+    "quality_gates.require_readable_aimall_geometry",
+    "quality_gates.require_finite_iqa",
+    "quality_gates.require_finite_integration_error",
+    "quality_gates.max_abs_integration_error",
+    "quality_gates.iqa_energy_recovery_tolerance_ha",
+}
+
+
+# Compatibility names retained for the CLI and older tests. New code should go
+# through ``field_policy_for_path`` / ``describe_field_editability``.
+ALWAYS_SAFE_EXACT = set(RUNTIME_SAFE_EXACT)
+ALWAYS_SAFE_PREFIXES = set(RUNTIME_SAFE_PREFIXES)
+ALWAYS_SAFE_RESOURCE_EXACT = set(RESOURCE_FUTURE_EXACT)
+FUTURE_SAFE_EXACT = set(RESOURCE_FUTURE_EXACT)
+FUTURE_SAFE_PREFIXES = (
+    set(PRE_SEED_SELECT_PREFIXES)
+    | set(PRE_PHASE_B_PREFIXES)
+    | set(PRE_SAMPLING_PROTOCOL_PREFIXES)
+)
 
 ARIADNE_OUTPUT_INTERPRETATION_PREFIXES = {
     "seed_selection.",
@@ -215,59 +291,75 @@ PHASE_B_OUTPUT_INTERPRETATION_PREFIXES = {
 }
 PHASE_B_OUTPUT_INTERPRETATION_EXACT = set()
 
-PHASE_LOCAL_EXACT = {
-    "ferebus.warmstart",
-    "ferebus.warmstart_streak",
-    "ferebus.kernel",
-    "ferebus.loss",
-    "ferebus.nagents",
-    "ferebus.maxiter",
-    "ferebus.is_constant_noise",
-    "ferebus.scaling",
-    "ferebus.full_ARD",
-    "quality_gates.ferebus_min_ext_r2",
-    "quality_gates.ferebus_max_ext_rmse_ha",
-    "quality_gates.ferebus_max_condition_number",
-    "aimall.encomp",
-    "aimall.nogui",
-    "aimall.naat",
-    "aimall.boaq",
-    "aimall.iasmesh",
+PHASE_LOCAL_EXACT = set(FUTURE_FEREBUS_EXACT)
+COMMITTED_LOCKED_EXACT = (
+    set(PRE_POOL_EXACT)
+    | set(PRE_FEREBUS_FIRST_EXACT)
+    | set(PRE_AIMALL_QUALITY_EXACT)
+)
+CAMPAIGN_LOCKED_EXACT = set(IMMUTABLE_EXACT)
+
+
+_POLICIES_EXACT: Dict[str, ConfigFieldPolicy] = {
+    **{
+        path: ConfigFieldPolicy("immutable", "immutable", "never editable mid-campaign")
+        for path in IMMUTABLE_EXACT
+    },
+    **{
+        path: ConfigFieldPolicy("runtime_safe", "runtime", "safe runtime/future daemon change")
+        for path in RUNTIME_SAFE_EXACT
+    },
+    **{
+        path: ConfigFieldPolicy("resource_future", "resource_future", "applies to future submissions only")
+        for path in RESOURCE_FUTURE_EXACT
+    },
+    **{
+        path: ConfigFieldPolicy("pre_pool", "pre_pool", "editable until trajectory pool import")
+        for path in PRE_POOL_EXACT
+    },
+    **{
+        path: ConfigFieldPolicy("pre_phase_a", "pre_phase_a", "editable until Phase A POLUS begins")
+        for path in PRE_PHASE_A_EXACT
+    },
+    **{
+        path: ConfigFieldPolicy("pre_ferebus", "pre_ferebus_first", "editable until first FEREBUS staging/submission")
+        for path in PRE_FEREBUS_FIRST_EXACT
+    },
+    **{
+        path: ConfigFieldPolicy("future_ferebus", "future_ferebus", "editable for future unsubmitted FEREBUS fits")
+        for path in FUTURE_FEREBUS_EXACT
+    },
+    **{
+        path: ConfigFieldPolicy("pre_seed_select", "pre_seed_select", "editable until seed selection for this iteration")
+        for path in PRE_SEED_SELECT_EXACT
+    },
+    **{
+        path: ConfigFieldPolicy("pre_ariadne", "pre_ariadne", "editable until ARIADNE consumes this iteration")
+        for path in PRE_ARIADNE_EXACT
+    },
+    **{
+        path: ConfigFieldPolicy("pre_aimall_quality", "pre_aimall_first", "editable until first AIMAll quality postprocess")
+        for path in PRE_AIMALL_QUALITY_EXACT
+    },
 }
 
-COMMITTED_LOCKED_EXACT = {
-    "trajectory_pool.source_path",
-    "split.strategy",
-    "split.train_fraction",
-    "split.val_mid_fraction",
-    "split.high_holdout_fraction",
-    "ferebus.properties",
-    "ferebus.train_fraction",
-    "ferebus.int_val_fraction",
-    "ferebus.ext_val_fraction",
-    "acquisition.property_name",
-    "quality_gates.require_readable_aimall_geometry",
-    "quality_gates.require_finite_iqa",
-    "quality_gates.require_finite_integration_error",
-    "quality_gates.max_abs_integration_error",
-    "quality_gates.iqa_energy_recovery_tolerance_ha",
-    "quality_gates.ariadne_max_displacement_ang",
-    "quality_gates.ariadne_min_pair_distance_ang",
-}
-
-CAMPAIGN_LOCKED_EXACT = {
-    "schema_version",
-    "system_name",
-    "bootstrap.initial_labelled_size",
-    "gaussian.method",
-    "gaussian.basis_set",
-    "gaussian.charge",
-    "gaussian.spin_multiplicity",
-    "gaussian.extra_keywords",
-    "failure_threshold_fraction",
-    "max_acquisition_grad_per_ang",
-    "max_force_per_atom_ha_per_ang",
-}
+_POLICIES_PREFIX: Tuple[Tuple[str, ConfigFieldPolicy], ...] = (
+    ("runtime.", ConfigFieldPolicy("runtime_safe", "runtime", "safe runtime/future daemon change")),
+    ("stop.", ConfigFieldPolicy("runtime_safe", "runtime", "safe future STOP_CHECK change")),
+    ("error_calibration.", ConfigFieldPolicy("runtime_safe", "runtime", "safe future calibration/acquisition change")),
+    ("gaussian.", ConfigFieldPolicy("pre_gaussian", "pre_gaussian_first", "editable until first Gaussian staging/submission")),
+    ("aimall.", ConfigFieldPolicy("pre_aimall", "pre_aimall_first", "editable until first AIMAll staging/submission")),
+    ("seed_selection.", ConfigFieldPolicy("pre_seed_select", "pre_seed_select", "editable until seed selection for this iteration")),
+    ("sampling_protocol.", ConfigFieldPolicy("pre_sampling_protocol", "pre_sampling_protocol", "editable until ARIADNE/Phase B consumes this iteration")),
+    ("active_batch.", ConfigFieldPolicy("pre_phase_b", "pre_phase_b", "editable until Phase B consumes this iteration")),
+    ("phase_b.", ConfigFieldPolicy("pre_phase_b", "pre_phase_b", "editable until Phase B consumes this iteration")),
+    ("geometry_novelty.", ConfigFieldPolicy("pre_sampling_protocol", "pre_sampling_protocol", "editable until ARIADNE/Phase B consumes this iteration")),
+    ("split.", ConfigFieldPolicy("pre_split", "pre_split", "editable until split.json exists for this iteration")),
+    ("acquisition.", ConfigFieldPolicy("pre_ariadne", "pre_ariadne", "editable until ARIADNE consumes this iteration")),
+    ("ariadne.", ConfigFieldPolicy("pre_ariadne", "pre_ariadne", "editable until ARIADNE consumes this iteration")),
+    ("adversarial_safety.", ConfigFieldPolicy("pre_ariadne", "pre_ariadne", "editable until ARIADNE/Phase B consumes this iteration")),
+    ("anti_overlap.", ConfigFieldPolicy("pre_ariadne", "pre_ariadne", "editable until ARIADNE consumes this iteration")),
+)
 
 
 def _committed_model_exists(campaign_dir: Union[str, Path], version: int) -> bool:
@@ -279,6 +371,33 @@ def _committed_model_exists(campaign_dir: Union[str, Path], version: int) -> boo
     except Exception:
         return False
     return int(version) in {int(v) for v in committed}
+
+
+def _any_committed_model_exists(campaign_dir: Union[str, Path]) -> bool:
+    models = Path(campaign_dir) / "6_TRAINED_MODELS"
+    if not models.is_dir():
+        return False
+    try:
+        return bool(TrainingSetVersioning(models).list_committed_versions())
+    except Exception:
+        return False
+
+
+def field_policy_for_path(path: str) -> Optional[ConfigFieldPolicy]:
+    policy = _POLICIES_EXACT.get(str(path))
+    if policy is not None:
+        return policy
+    for prefix, prefix_policy in _POLICIES_PREFIX:
+        if str(path).startswith(prefix):
+            return prefix_policy
+    return None
+
+
+def describe_field_editability(path: str) -> str:
+    policy = field_policy_for_path(path)
+    if policy is None:
+        return "unclassified lock policy"
+    return policy.description
 
 
 def _phase_intent_exists(
@@ -300,6 +419,148 @@ def _phase_intent_exists(
     except Exception:
         # A malformed intent is still evidence that this phase has begun.
         return True
+
+
+def _phase_intent_file_exists(
+    campaign_dir: Union[str, Path],
+    phases: Iterable[CampaignPhase],
+    *,
+    iteration: Optional[int] = None,
+) -> Optional[str]:
+    try:
+        from . import submission_intent as _submission_intent
+
+        if iteration is not None:
+            for phase in phases:
+                path = _submission_intent.intent_path(
+                    campaign_dir,
+                    phase.value,
+                    int(iteration),
+                )
+                if path.is_file():
+                    return str(path)
+            return None
+        root = _submission_intent.intent_dir(campaign_dir)
+        if not root.is_dir():
+            return None
+        phase_names = {phase.value for phase in phases}
+        for path in sorted(root.glob("*.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                phase_name = str(payload.get("phase") or "")
+            except Exception:
+                # A malformed intent is still durable evidence that submission
+                # reached this phase family.
+                return str(path)
+            if phase_name in phase_names:
+                return str(path)
+    except Exception:
+        return "<submission intent lookup failed>"
+    return None
+
+
+def _first_existing_path(campaign_dir: Union[str, Path], patterns: Iterable[str]) -> Optional[str]:
+    campaign = Path(campaign_dir)
+    for pattern in patterns:
+        matches = sorted(campaign.glob(pattern))
+        if matches:
+            return str(matches[0])
+    return None
+
+
+def _trajectory_pool_consumed(campaign_dir: Union[str, Path]) -> Optional[str]:
+    return _first_existing_path(
+        campaign_dir,
+        (
+            ".DATA/TRAJECTORY/pool.xyz",
+            ".DATA/TRAJECTORY/pool.manifest.json",
+        ),
+    )
+
+
+def _phase_a_consumed(campaign_dir: Union[str, Path]) -> Optional[str]:
+    intent = _phase_intent_file_exists(
+        campaign_dir,
+        (CampaignPhase.PHASE_A_POLUS,),
+    )
+    if intent:
+        return "Phase A submission intent exists: " + intent
+    path = _first_existing_path(
+        campaign_dir,
+        (
+            "3_DIVERSITY_SAMPLING/initial/PHASE_A_SAMPLE.json",
+            "3_DIVERSITY_SAMPLING/initial/*SAMPLE*.xyz",
+            "3_DIVERSITY_SAMPLING/initial/*INDEX*.dat",
+        ),
+    )
+    if path:
+        return "Phase A output exists: " + path
+    return None
+
+
+def _gaussian_consumed(campaign_dir: Union[str, Path]) -> Optional[str]:
+    intent = _phase_intent_file_exists(
+        campaign_dir,
+        (CampaignPhase.INITIAL_GAUSSIAN, CampaignPhase.GAUSSIAN),
+    )
+    if intent:
+        return "Gaussian submission intent exists: " + intent
+    path = _first_existing_path(
+        campaign_dir,
+        (
+            ".DATA/STAGING/**/*.pointdir/input.gjf",
+            ".DATA/STAGING/**/*.pointdir/input.wfn",
+            ".DATA/STAGING/**/accepted_pointdirs*.json",
+        ),
+    )
+    if path:
+        return "Gaussian staging or handoff exists: " + path
+    return None
+
+
+def _aimall_consumed(campaign_dir: Union[str, Path]) -> Optional[str]:
+    intent = _phase_intent_file_exists(
+        campaign_dir,
+        (CampaignPhase.INITIAL_AIMALL, CampaignPhase.AIMALL),
+    )
+    if intent:
+        return "AIMAll submission intent exists: " + intent
+    path = _first_existing_path(
+        campaign_dir,
+        (
+            ".DATA/STAGING/**/*.pointdir/AIMALL_TASK.json",
+            ".DATA/STAGING/**/*.pointdir/*.int",
+            ".DATA/STAGING/**/quantum_quality.json",
+            ".DATA/STAGING/**/accepted_pointdirs.INITIAL_AIMALL.json",
+            ".DATA/STAGING/**/accepted_pointdirs.AIMALL.json",
+        ),
+    )
+    if path:
+        return "AIMAll staging, output, or quality manifest exists: " + path
+    return None
+
+
+def _ferebus_first_consumed(campaign_dir: Union[str, Path]) -> Optional[str]:
+    intent = _phase_intent_file_exists(
+        campaign_dir,
+        (CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS),
+    )
+    if intent:
+        return "FEREBUS submission intent exists: " + intent
+    path = _first_existing_path(
+        campaign_dir,
+        (
+            "6_TRAINED_MODELS/iteration-staging/FEREBUS_TASKS.json",
+            "6_TRAINED_MODELS/iteration-staging/**/*.model",
+            "6_TRAINED_MODELS/iteration-*/**/*.model",
+            "6_TRAINED_MODELS/current",
+        ),
+    )
+    if path:
+        return "FEREBUS staging or committed model exists: " + path
+    if _any_committed_model_exists(campaign_dir):
+        return "at least one FEREBUS model version is committed"
+    return None
 
 
 def _iteration_dir(campaign_dir: Union[str, Path], iteration: int) -> Path:
@@ -334,6 +595,55 @@ def _ariadne_outputs_exist(campaign_dir: Union[str, Path], proposed_state: Campa
     return False
 
 
+def _ariadne_consumed_reason(
+    campaign_dir: Union[str, Path],
+    proposed_state: CampaignState,
+) -> Optional[str]:
+    iteration = int(getattr(proposed_state, "iteration", 0))
+    intent = _phase_intent_file_exists(
+        campaign_dir,
+        (CampaignPhase.ARIADNE_ARRAY,),
+        iteration=iteration,
+    )
+    if intent:
+        return "ARIADNE submission intent exists: " + intent
+    iter_dir = _iteration_dir(campaign_dir, iteration)
+    for name in (
+        "ARIADNE_RESULTS.json",
+        "ARIADNE_LANDING_AUDIT.json",
+        "ACQUISITION_MATURITY_AUDIT.json",
+        "ERROR_CALIBRATION_AUDIT.json",
+        "SAMPLING_SCALE_MODEL.json",
+        "SAMPLING_PROTOCOL_RESOLVED.json",
+        "SAMPLING_PROTOCOL_AUDIT.json",
+    ):
+        path = iter_dir / name
+        if path.is_file():
+            return "ARIADNE output exists: " + str(path)
+    pool = iter_dir / "pool"
+    if pool.is_dir():
+        for result in sorted(pool.glob("seed_*/result.json")):
+            if result.is_file():
+                return "ARIADNE seed result exists: " + str(result)
+    return None
+
+
+def _seed_select_consumed_reason(
+    campaign_dir: Union[str, Path],
+    proposed_state: CampaignState,
+) -> Optional[str]:
+    iteration = int(getattr(proposed_state, "iteration", 0))
+    iter_dir = _iteration_dir(campaign_dir, iteration)
+    for name in ("seeds_picked.json", "SEED_SELECTION_DIAGNOSTICS.json"):
+        path = iter_dir / name
+        if path.is_file():
+            return "seed-selection output exists: " + str(path)
+    ariadne_reason = _ariadne_consumed_reason(campaign_dir, proposed_state)
+    if ariadne_reason:
+        return "ARIADNE already consumed seed selection: " + ariadne_reason
+    return None
+
+
 def _phase_b_outputs_exist(campaign_dir: Union[str, Path], proposed_state: CampaignState) -> bool:
     iteration = int(getattr(proposed_state, "iteration", 0))
     iter_dir = _iteration_dir(campaign_dir, iteration)
@@ -348,6 +658,42 @@ def _phase_b_outputs_exist(campaign_dir: Union[str, Path], proposed_state: Campa
         if (iter_dir / name).exists():
             return True
     return False
+
+
+def _phase_b_consumed_reason(
+    campaign_dir: Union[str, Path],
+    proposed_state: CampaignState,
+) -> Optional[str]:
+    iteration = int(getattr(proposed_state, "iteration", 0))
+    intent = _phase_intent_file_exists(
+        campaign_dir,
+        (CampaignPhase.PHASE_B_POLUS,),
+        iteration=iteration,
+    )
+    if intent:
+        return "Phase B submission intent exists: " + intent
+    iter_dir = _iteration_dir(campaign_dir, iteration)
+    for name in (
+        "PHASE_B_SELECTION.json",
+        "phase_b_SAMPLE.xyz",
+        "phase_b_SAMPLE_raw.xyz",
+        "phase_b_dedup.json",
+    ):
+        path = iter_dir / name
+        if path.exists():
+            return "Phase B output exists: " + str(path)
+    return None
+
+
+def _split_consumed_reason(
+    campaign_dir: Union[str, Path],
+    proposed_state: CampaignState,
+) -> Optional[str]:
+    iteration = int(getattr(proposed_state, "iteration", 0))
+    path = _iteration_dir(campaign_dir, iteration) / "split.json"
+    if path.is_file():
+        return "split output exists: " + str(path)
+    return None
 
 
 def _active_iteration_committed(proposed_state: CampaignState, iteration: int) -> bool:
@@ -374,11 +720,12 @@ def _phase_outputs_lock_change(
     iteration = int(getattr(proposed_state, "iteration", 0))
     if not bool(exists_fn(campaign_dir, proposed_state)):
         return False
-    if proposed_state.phase is phase:
-        return True
-    if proposed_state.phase in {CampaignPhase.HALTED, CampaignPhase.STOP_CHECK}:
-        return not _active_iteration_committed(proposed_state, iteration)
-    return False
+    if _active_iteration_committed(proposed_state, iteration):
+        return False
+    # Any current-iteration output that has not yet been appended and retrained
+    # is part of the live handoff contract, even if the daemon state has already
+    # advanced past the phase that produced it.
+    return True
 
 
 def _blocks_existing_phase_outputs(
@@ -441,6 +788,117 @@ def _phase_local_allowed(
     return False, "phase-local field is not recognised for this re-entry phase"
 
 
+def _current_ferebus_consumed_reason(
+    campaign_dir: Union[str, Path],
+    proposed_state: CampaignState,
+) -> Optional[str]:
+    phase = proposed_state.phase
+    if phase not in (CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS):
+        return None
+    iteration = int(getattr(proposed_state, "iteration", 0))
+    intent = _phase_intent_file_exists(campaign_dir, (phase,), iteration=iteration)
+    if intent:
+        return "target FEREBUS submission intent exists: " + intent
+    staging = Path(campaign_dir) / "6_TRAINED_MODELS" / "iteration-staging"
+    if staging.exists():
+        return "target FEREBUS staging exists: " + str(staging)
+    target = int(getattr(proposed_state, "training_set_version", -1))
+    if target >= 0 and _committed_model_exists(campaign_dir, target):
+        return "target FEREBUS model version is already committed"
+    return None
+
+
+def _block_if_uncommitted(
+    campaign_dir: Union[str, Path],
+    proposed_state: CampaignState,
+    reason: Optional[str],
+    *,
+    label: str,
+) -> Optional[str]:
+    if not reason:
+        return None
+    iteration = int(getattr(proposed_state, "iteration", 0))
+    if _active_iteration_committed(proposed_state, iteration):
+        return None
+    return (
+        "field affects in-flight or uncommitted "
+        + label
+        + " outputs; "
+        + reason
+    )
+
+
+def _consumption_block_reason(
+    policy: ConfigFieldPolicy,
+    campaign_dir: Union[str, Path],
+    proposed_state: CampaignState,
+) -> Optional[str]:
+    kind = policy.lock_kind
+    if kind == "immutable":
+        return "field is immutable once a campaign config lock exists"
+    if kind == "runtime":
+        return None
+    if kind == "resource_future":
+        return None
+    if kind == "pre_pool":
+        reason = _trajectory_pool_consumed(campaign_dir)
+        return None if reason is None else "trajectory pool has already been imported: " + reason
+    if kind == "pre_phase_a":
+        return _phase_a_consumed(campaign_dir)
+    if kind == "pre_gaussian_first":
+        return _gaussian_consumed(campaign_dir)
+    if kind == "pre_aimall_first":
+        return _aimall_consumed(campaign_dir)
+    if kind == "pre_ferebus_first":
+        return _ferebus_first_consumed(campaign_dir)
+    if kind == "future_ferebus":
+        return _current_ferebus_consumed_reason(campaign_dir, proposed_state)
+    if kind == "pre_seed_select":
+        return _block_if_uncommitted(
+            campaign_dir,
+            proposed_state,
+            _seed_select_consumed_reason(campaign_dir, proposed_state),
+            label="seed-selection/ARIADNE",
+        )
+    if kind == "pre_ariadne":
+        return _block_if_uncommitted(
+            campaign_dir,
+            proposed_state,
+            _ariadne_consumed_reason(campaign_dir, proposed_state),
+            label="ARIADNE",
+        )
+    if kind == "pre_sampling_protocol":
+        ariadne_reason = _block_if_uncommitted(
+            campaign_dir,
+            proposed_state,
+            _ariadne_consumed_reason(campaign_dir, proposed_state),
+            label="ARIADNE",
+        )
+        if ariadne_reason:
+            return ariadne_reason
+        return _block_if_uncommitted(
+            campaign_dir,
+            proposed_state,
+            _phase_b_consumed_reason(campaign_dir, proposed_state),
+            label="Phase B",
+        )
+    if kind == "pre_phase_b":
+        return _block_if_uncommitted(
+            campaign_dir,
+            proposed_state,
+            _phase_b_consumed_reason(campaign_dir, proposed_state),
+            label="Phase B",
+        )
+    if kind == "pre_split":
+        return _block_if_uncommitted(
+            campaign_dir,
+            proposed_state,
+            _split_consumed_reason(campaign_dir, proposed_state),
+            label="SPLIT",
+        )
+    return "field has no configured mid-campaign change policy"
+
+
 def _classify_change(
     campaign_dir: Union[str, Path],
     proposed_state: CampaignState,
@@ -448,28 +906,36 @@ def _classify_change(
     old: Any,
     new: Any,
 ) -> ConfigChange:
-    if _matches(path, ALWAYS_SAFE_EXACT | ALWAYS_SAFE_RESOURCE_EXACT, ALWAYS_SAFE_PREFIXES):
-        return ConfigChange(path, old, new, "always_safe", True, "safe runtime/diagnostic change")
-    if _matches(path, FUTURE_SAFE_EXACT, FUTURE_SAFE_PREFIXES):
-        blocked_reason = _blocks_existing_phase_outputs(campaign_dir, proposed_state, path)
-        if blocked_reason:
-            return ConfigChange(
-                path,
-                old,
-                new,
-                "postprocess_locked",
-                False,
-                blocked_reason,
-            )
-        return ConfigChange(path, old, new, "future_safe", True, "allowed for future phase execution")
-    if path in PHASE_LOCAL_EXACT:
-        allowed, reason = _phase_local_allowed(campaign_dir, path, proposed_state)
-        return ConfigChange(path, old, new, "phase_local", allowed, reason)
-    if path in COMMITTED_LOCKED_EXACT:
-        return ConfigChange(path, old, new, "committed_locked", False, "field affects committed artefact contracts")
-    if path in CAMPAIGN_LOCKED_EXACT:
-        return ConfigChange(path, old, new, "campaign_locked", False, "field is locked after campaign start")
-    return ConfigChange(path, old, new, "unclassified_locked", False, "field has no configured mid-campaign change policy")
+    policy = field_policy_for_path(path)
+    if policy is None:
+        return ConfigChange(
+            path,
+            old,
+            new,
+            "unclassified_locked",
+            False,
+            "field has no configured mid-campaign change policy",
+        )
+    blocked_reason = _consumption_block_reason(policy, campaign_dir, proposed_state)
+    if blocked_reason:
+        category = (
+            "postprocess_locked"
+            if policy.lock_kind.startswith("pre_")
+            or policy.lock_kind == "future_ferebus"
+            else policy.category
+        )
+        return ConfigChange(path, old, new, category, False, blocked_reason)
+    if policy.category == "runtime_safe":
+        reason = policy.description
+    elif policy.category == "resource_future":
+        reason = "allowed for future submissions; already queued/running jobs keep submitted resources"
+    elif policy.lock_kind.startswith("pre_"):
+        reason = policy.description
+    elif policy.lock_kind == "future_ferebus":
+        reason = policy.description
+    else:
+        reason = policy.description
+    return ConfigChange(path, old, new, policy.category, True, reason)
 
 
 def review_config_changes(

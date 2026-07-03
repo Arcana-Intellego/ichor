@@ -404,7 +404,7 @@ def test_acquisition_driver_default_migration_is_future_safe(tmp_path):
     changed_paths = sorted(c.path for c in review.allowed_changes)
     assert changed_paths
     assert all(path.startswith("acquisition.driver.") for path in changed_paths)
-    assert {c.category for c in review.allowed_changes} == {"future_safe"}
+    assert {c.category for c in review.allowed_changes} == {"pre_ariadne"}
     assert not review.blocked_changes
 
 
@@ -454,7 +454,7 @@ def test_ariadne_backtransform_changes_are_future_safe(tmp_path):
         "ariadne.trqn_max_backtransform_iter",
         "ariadne.trqn_trust_min",
     ]
-    assert {c.category for c in review.allowed_changes} == {"future_safe"}
+    assert {c.category for c in review.allowed_changes} == {"pre_ariadne"}
     assert not review.blocked_changes
 
 
@@ -784,7 +784,7 @@ def test_phase_b_config_change_blocks_halted_uncommitted_selection(tmp_path):
     assert "uncommitted Phase B" in review.blocked_changes[0].reason
 
 
-def test_gaussian_method_change_is_blocked_by_config_lock(tmp_path):
+def test_gaussian_method_change_allowed_before_first_gaussian(tmp_path):
     campaign = _campaign(tmp_path)
     original = CampaignConfig()
     write_config_lock(campaign, original)
@@ -792,11 +792,135 @@ def test_gaussian_method_change_is_blocked_by_config_lock(tmp_path):
     changed.gaussian.method = "PBE0"
 
     proposed = fresh_campaign_state()
+    proposed.phase = CampaignPhase.PHASE_A_POLUS
+    review = review_config_changes(campaign, changed, proposed)
+
+    assert review.allowed
+    assert [c.path for c in review.allowed_changes] == ["gaussian.method"]
+    assert not review.blocked_changes
+
+
+def test_gaussian_basis_change_allowed_after_phase_a_before_gaussian(tmp_path):
+    campaign = _campaign(tmp_path)
+    _write_phase_a_sample(campaign)
+    original = CampaignConfig()
+    write_config_lock(campaign, original)
+    changed = CampaignConfig()
+    changed.gaussian.basis_set = "def2-TZVP"
+
+    proposed = fresh_campaign_state()
+    proposed.phase = CampaignPhase.INITIAL_GAUSSIAN
+    review = review_config_changes(campaign, changed, proposed)
+
+    assert review.allowed
+    assert [c.path for c in review.allowed_changes] == ["gaussian.basis_set"]
+    assert not review.blocked_changes
+
+
+def test_gaussian_basis_change_blocks_after_gaussian_staging_exists(tmp_path):
+    campaign = _campaign(tmp_path)
+    staging = campaign / ".DATA" / "STAGING" / "initial" / "POINT_0000.pointdir"
+    staging.mkdir(parents=True)
+    (staging / "input.gjf").write_text("%chk=input.chk\n", encoding="utf-8")
+    original = CampaignConfig()
+    write_config_lock(campaign, original)
+    changed = CampaignConfig()
+    changed.gaussian.basis_set = "def2-TZVP"
+
+    proposed = fresh_campaign_state()
+    proposed.phase = CampaignPhase.INITIAL_GAUSSIAN
+    review = review_config_changes(campaign, changed, proposed)
+
+    assert not review.allowed
+    assert [c.path for c in review.blocked_changes] == ["gaussian.basis_set"]
+    assert "Gaussian staging" in review.blocked_changes[0].reason
+
+
+def test_trajectory_pool_source_blocks_after_pool_import(tmp_path):
+    campaign = _campaign(tmp_path)
+    _write_pool(campaign)
+    original = CampaignConfig()
+    write_config_lock(campaign, original)
+    changed = CampaignConfig()
+    changed.trajectory_pool.source_path = "other_pool.xyz"
+
+    review = review_config_changes(campaign, changed, fresh_campaign_state())
+
+    assert not review.allowed
+    assert [c.path for c in review.blocked_changes] == ["trajectory_pool.source_path"]
+    assert "trajectory pool" in review.blocked_changes[0].reason
+
+
+def test_bootstrap_size_blocks_after_phase_a_output(tmp_path):
+    campaign = _campaign(tmp_path)
+    _write_phase_a_sample(campaign)
+    original = CampaignConfig()
+    write_config_lock(campaign, original)
+    changed = CampaignConfig()
+    changed.bootstrap.initial_labelled_size = 24
+
+    review = review_config_changes(campaign, changed, fresh_campaign_state())
+
+    assert not review.allowed
+    assert [c.path for c in review.blocked_changes] == [
+        "bootstrap.initial_labelled_size"
+    ]
+    assert "Phase A" in review.blocked_changes[0].reason
+
+
+def test_system_name_allowed_before_first_ferebus(tmp_path):
+    campaign = _campaign(tmp_path)
+    original = CampaignConfig()
+    write_config_lock(campaign, original)
+    changed = CampaignConfig()
+    changed.system_name = "SYSTEM2"
+
+    proposed = fresh_campaign_state()
+    proposed.phase = CampaignPhase.INITIAL_FEREBUS
+    review = review_config_changes(campaign, changed, proposed)
+
+    assert review.allowed
+    assert [c.path for c in review.allowed_changes] == ["system_name"]
+    assert not review.blocked_changes
+
+
+def test_system_name_blocks_after_ferebus_staging_exists(tmp_path):
+    campaign = _campaign(tmp_path)
+    staging = campaign / "6_TRAINED_MODELS" / "iteration-staging"
+    staging.mkdir(parents=True)
+    (staging / "FEREBUS_TASKS.json").write_text("{}", encoding="utf-8")
+    original = CampaignConfig()
+    write_config_lock(campaign, original)
+    changed = CampaignConfig()
+    changed.system_name = "SYSTEM2"
+
+    proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.INITIAL_FEREBUS
     review = review_config_changes(campaign, changed, proposed)
 
     assert not review.allowed
-    assert [c.path for c in review.blocked_changes] == ["gaussian.method"]
+    assert [c.path for c in review.blocked_changes] == ["system_name"]
+    assert "FEREBUS" in review.blocked_changes[0].reason
+
+
+def test_split_config_blocks_after_split_json_exists(tmp_path):
+    campaign = _campaign(tmp_path)
+    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
+    iter_dir.mkdir(parents=True)
+    (iter_dir / "split.json").write_text("{}", encoding="utf-8")
+    original = CampaignConfig()
+    write_config_lock(campaign, original)
+    changed = CampaignConfig()
+    changed.split.train_fraction = 0.70
+
+    proposed = fresh_campaign_state()
+    proposed.phase = CampaignPhase.SPLIT
+    proposed.iteration = 0
+    review = review_config_changes(campaign, changed, proposed)
+
+    assert not review.allowed
+    assert [c.path for c in review.blocked_changes] == ["split.train_fraction"]
+    assert "SPLIT" in review.blocked_changes[0].reason
 
 
 def test_reconcile_apply_promotes_state_and_cleans_ferebus_staging(tmp_path, capsys):
@@ -1573,7 +1697,7 @@ def test_reconcile_apply_refuses_locked_config_change(tmp_path, capsys):
     original = CampaignConfig()
     write_config_lock(campaign, original)
     changed = CampaignConfig()
-    changed.gaussian.method = "PBE0"
+    changed.trajectory_pool.source_path = "other_pool.xyz"
     _write_config(campaign, changed)
 
     rc = cmd_reconcile(
