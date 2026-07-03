@@ -11,7 +11,7 @@ from .state import atomic_write_json
 
 FEREBUS_SPLIT_LEDGER_FILENAME = "ferebus_split_assignments.json"
 BOOTSTRAP_EXTERNAL_VALIDATION_FILENAME = "bootstrap_external_validation.json"
-FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION = 2
+FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION = 3
 _LOCK_FILENAME = "ferebus_split_assignments.lock"
 _SPLITS = ("train", "int_val", "ext_val")
 
@@ -98,13 +98,23 @@ def _plan_train_internal(n_rows: int, fractions: Sequence[float]) -> Dict[str, i
 def _initial_target_counts(
     n_rows: int,
     train_internal_fractions: Sequence[float],
-    external_validation_fraction: float,
+    external_validation_size: int,
 ) -> Dict[str, int]:
     n = int(n_rows)
     if n <= 0:
         return {"train": 0, "int_val": 0, "ext_val": 0}
-    n_ext = int(round(float(n) * float(external_validation_fraction)))
-    n_ext = _clamp_int(n_ext, 0, max(n - 1, 0))
+    if isinstance(external_validation_size, bool) or not isinstance(
+        external_validation_size,
+        int,
+    ):
+        raise ValueError("external_validation_size must be an integer")
+    n_ext = int(external_validation_size)
+    if n_ext < 0:
+        raise ValueError("external_validation_size must be >= 0")
+    if n_ext >= n:
+        raise ValueError(
+            "external_validation_size must be smaller than initial labelled size"
+        )
     internal = _plan_train_internal(n - n_ext, train_internal_fractions)
     return {
         "train": internal["train"],
@@ -151,7 +161,7 @@ def ensure_split_assignments(
     *,
     training_version: int,
     train_internal_fractions: Sequence[float],
-    external_validation_fraction: float,
+    external_validation_size: int,
     pointdir_identity: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
     """Assign pointdirs to train/internal/external without moving old rows."""
@@ -159,7 +169,12 @@ def ensure_split_assignments(
     if len(set(names)) != len(names):
         raise ValueError("duplicate pointdir names passed to FEREBUS split ledger")
     train_internal_tuple = tuple(float(x) for x in train_internal_fractions)
-    external_fraction = float(external_validation_fraction)
+    if isinstance(external_validation_size, bool) or not isinstance(
+        external_validation_size,
+        int,
+    ):
+        raise ValueError("external_validation_size must be an integer")
+    external_size = int(external_validation_size)
     path = ledger_path(Path(campaign_dir))
     with _ledger_lock(Path(campaign_dir)):
         payload = _load(path)
@@ -186,7 +201,7 @@ def ensure_split_assignments(
             sizes = _initial_target_counts(
                 len(new_names),
                 train_internal_tuple,
-                external_fraction,
+                external_size,
             )
             ordered_splits: List[str] = (
                 ["train"] * sizes["train"]
@@ -199,7 +214,7 @@ def ensure_split_assignments(
                     "first_seen_training_version": int(training_version),
                     "assignment_version": 1,
                     "train_internal_fractions_at_assignment": list(train_internal_tuple),
-                    "external_validation_fraction_at_assignment": external_fraction,
+                    "external_validation_size_at_assignment": external_size,
                     "provenance_sha256": identities.get(name),
                 }
         else:
@@ -214,13 +229,13 @@ def ensure_split_assignments(
                     "first_seen_training_version": int(training_version),
                     "assignment_version": 1,
                     "train_internal_fractions_at_assignment": list(train_internal_tuple),
-                    "external_validation_fraction_at_assignment": external_fraction,
+                    "external_validation_size_at_assignment": external_size,
                     "provenance_sha256": identities.get(name),
                 }
         payload = {
             "schema_version": FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION,
             "split_policy": {
-                "bootstrap_external_validation_fraction": external_fraction,
+                "bootstrap_external_validation_size": external_size,
                 "ferebus_train_fraction": train_internal_tuple[0],
                 "ferebus_internal_validation_fraction": train_internal_tuple[1],
                 "external_validation_applies_to_bootstrap_only": True,
@@ -238,7 +253,7 @@ def ensure_split_assignments(
             {
                 "schema_version": 1,
                 "ledger_schema_version": FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION,
-                "external_validation_fraction": external_fraction,
+                "external_validation_size": external_size,
                 "n_external": len(external_names),
                 "pointdirs": external_names,
                 "applies_to_bootstrap_only": True,

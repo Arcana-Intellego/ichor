@@ -1,9 +1,10 @@
-"""Campaign configuration -- schema v7.
+"""Campaign configuration -- schema v8.
 
-Schema v7 keeps the operator-facing campaign protocol compact: campaign
-identifies the run, bootstrap owns the fixed external validation reserve,
-active_batch owns the number of new labels per iteration, and FEREBUS owns the
-train/internal-validation split for all non-external labelled data.
+Schema v8 keeps the operator-facing campaign protocol compact: campaign
+identifies the run, bootstrap owns the fixed external validation reserve as an
+exact size, active_batch owns the number of new labels per iteration, and
+FEREBUS owns the train/internal-validation split for all non-external labelled
+data.
 """
 from __future__ import annotations
 
@@ -463,7 +464,7 @@ class CampaignIdentityConfigBlock:
 @dataclass
 class BootstrapConfigBlock:
     initial_labelled_size: int = 12
-    external_validation_fraction: float = 0.2
+    external_validation_size: int = 2
 
 
 @dataclass
@@ -538,7 +539,7 @@ class FerebusConfigBlock:
     properties: List[str] = field(default_factory=lambda: ["iqa"])
     # How non-external labelled data is carved into the two trainable FEREBUS
     # sets. The external validation set is a fixed bootstrap reserve controlled
-    # by bootstrap.external_validation_fraction.
+    # by bootstrap.external_validation_size.
     train_fraction: float = 0.8
     internal_validation_fraction: float = 0.2
 
@@ -973,7 +974,7 @@ class AimallConfigBlock:
 
 @dataclass
 class CampaignConfig:
-    """Top-level campaign configuration (schema v7)."""
+    """Top-level campaign configuration (schema v8)."""
 
     schema_version: int = CONFIG_SCHEMA_VERSION
 
@@ -1314,9 +1315,21 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "bootstrap.initial_labelled_size must be > 0"
             )
-        if not 0.0 <= float(self.bootstrap.external_validation_fraction) < 1.0:
+        if not isinstance(self.bootstrap.external_validation_size, int) or isinstance(
+            self.bootstrap.external_validation_size,
+            bool,
+        ):
             raise ConfigValidationError(
-                "bootstrap.external_validation_fraction must be in [0, 1)"
+                "bootstrap.external_validation_size must be an integer"
+            )
+        if self.bootstrap.external_validation_size < 0:
+            raise ConfigValidationError(
+                "bootstrap.external_validation_size must be >= 0"
+            )
+        if self.bootstrap.initial_labelled_size <= self.bootstrap.external_validation_size:
+            raise ConfigValidationError(
+                "bootstrap.initial_labelled_size must be greater than "
+                "bootstrap.external_validation_size"
             )
         if self.active_batch.final_batch_size <= 0:
             raise ConfigValidationError(

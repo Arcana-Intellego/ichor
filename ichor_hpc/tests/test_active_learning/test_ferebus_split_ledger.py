@@ -21,7 +21,7 @@ def test_initial_split_ledger_assigns_exact_planned_counts(tmp_path):
         names,
         training_version=0,
         train_internal_fractions=(0.75, 0.25),
-        external_validation_fraction=0.2,
+        external_validation_size=2,
     )
 
     assert result["counts"] == {
@@ -35,6 +35,7 @@ def test_initial_split_ledger_assigns_exact_planned_counts(tmp_path):
     bootstrap = json.loads(
         bootstrap_external_validation_path(tmp_path).read_text(encoding="utf-8")
     )
+    assert bootstrap["external_validation_size"] == 2
     assert bootstrap["pointdirs"] == names[8:10]
 
 
@@ -45,7 +46,7 @@ def test_existing_split_ledger_assignments_never_change(tmp_path):
         first_names,
         training_version=0,
         train_internal_fractions=(0.75, 0.25),
-        external_validation_fraction=0.2,
+        external_validation_size=2,
     )
     first_assignments = dict(first["assignments"])
 
@@ -55,7 +56,7 @@ def test_existing_split_ledger_assignments_never_change(tmp_path):
         grown_names,
         training_version=1,
         train_internal_fractions=(0.75, 0.25),
-        external_validation_fraction=0.2,
+        external_validation_size=2,
     )
 
     for name, record in first_assignments.items():
@@ -63,7 +64,7 @@ def test_existing_split_ledger_assignments_never_change(tmp_path):
     assert second["counts"] == {"train": 14, "int_val": 4, "ext_val": 2}
     assert second["row_ids"]["train"][:6] == [0, 1, 2, 3, 4, 5]
     payload = json.loads(ledger_path(tmp_path).read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
     assert len(payload["assignments"]) == 20
 
 
@@ -74,7 +75,7 @@ def test_split_ledger_rejects_duplicate_pointdir_names(tmp_path):
             ["POINT_0000.pointdir", "POINT_0000.pointdir"],
             training_version=0,
             train_internal_fractions=(0.75, 0.25),
-            external_validation_fraction=0.2,
+            external_validation_size=2,
         )
 
 
@@ -85,7 +86,7 @@ def test_split_ledger_rejects_pointdir_identity_mismatch(tmp_path):
         names,
         training_version=0,
         train_internal_fractions=(0.75, 0.25),
-        external_validation_fraction=0.2,
+        external_validation_size=1,
         pointdir_identity={names[0]: "sha-a"},
     )
 
@@ -95,7 +96,7 @@ def test_split_ledger_rejects_pointdir_identity_mismatch(tmp_path):
             names,
             training_version=1,
             train_internal_fractions=(0.75, 0.25),
-            external_validation_fraction=0.2,
+            external_validation_size=1,
             pointdir_identity={names[0]: "sha-b"},
         )
 
@@ -107,14 +108,14 @@ def test_split_ledger_backfills_missing_pointdir_identity(tmp_path):
         names,
         training_version=0,
         train_internal_fractions=(0.5, 0.5),
-        external_validation_fraction=0.0,
+        external_validation_size=0,
     )
     result = ensure_split_assignments(
         tmp_path,
         names,
         training_version=1,
         train_internal_fractions=(0.5, 0.5),
-        external_validation_fraction=0.0,
+        external_validation_size=0,
         pointdir_identity={names[1]: "sha-later"},
     )
 

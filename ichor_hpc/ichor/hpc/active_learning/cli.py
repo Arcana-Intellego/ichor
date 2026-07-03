@@ -4183,9 +4183,11 @@ def cmd_config_check(args: argparse.Namespace) -> int:
         },
         "bootstrap": {
             "initial_labelled_size": int(config.bootstrap.initial_labelled_size),
-            "external_validation_fraction": float(
-                config.bootstrap.external_validation_fraction
+            "external_validation_size": int(
+                config.bootstrap.external_validation_size
             ),
+            "non_external_bootstrap_size": int(config.bootstrap.initial_labelled_size)
+            - int(config.bootstrap.external_validation_size),
         },
         "ferebus": {
             "train_fraction": float(config.ferebus.train_fraction),

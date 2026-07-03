@@ -815,7 +815,7 @@ def stage_ferebus_inputs(campaign_dir, config, training_version, is_initial=Fals
         float(f.train_fraction),
         float(f.internal_validation_fraction),
     )
-    external_validation_fraction = float(config.bootstrap.external_validation_fraction)
+    external_validation_size = int(config.bootstrap.external_validation_size)
     from . import ferebus_dataset as _fds
     from .ferebus_split_ledger import ensure_split_assignments
 
@@ -824,7 +824,7 @@ def stage_ferebus_inputs(campaign_dir, config, training_version, is_initial=Fals
         pointdir_names,
         training_version=int(training_version),
         train_internal_fractions=train_internal_fractions,
-        external_validation_fraction=external_validation_fraction,
+        external_validation_size=external_validation_size,
         pointdir_identity=pointdir_identities,
     )
     ledger_row_ids = dict(split_ledger["row_ids"])

@@ -1361,10 +1361,10 @@ _BLOCK_MENUS_BY_LABEL = {
     ),
     "Edit bootstrap": _make_block_menu(
         "Edit Bootstrap",
-        "Initial labelled-set size and fixed bootstrap external validation fraction.",
+        "Initial labelled-set size and fixed bootstrap external validation size.",
         [
             _spec("bootstrap.initial_labelled_size", "int"),
-            _spec("bootstrap.external_validation_fraction", "float"),
+            _spec("bootstrap.external_validation_size", "int"),
         ],
     ),
     "Edit resource defaults": _make_block_menu(

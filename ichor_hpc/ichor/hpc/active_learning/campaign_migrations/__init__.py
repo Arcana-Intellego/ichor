@@ -13,9 +13,10 @@ from .v2_to_v3 import migrate_v2_to_v3
 from .v3_to_v4 import migrate_v3_to_v4
 from .v4_to_v5 import migrate_v4_to_v5
 from .v5_to_v6 import migrate_v5_to_v6
+from .v7_to_v8 import migrate_v7_to_v8
 
 
-CURRENT_SCHEMA_VERSION = 7
+CURRENT_SCHEMA_VERSION = 8
 
 
 class CampaignMigrationError(ValueError):
@@ -27,6 +28,7 @@ MIGRATORS: Dict[int, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     3: migrate_v3_to_v4,
     4: migrate_v4_to_v5,
     5: migrate_v5_to_v6,
+    7: migrate_v7_to_v8,
 }
 
 

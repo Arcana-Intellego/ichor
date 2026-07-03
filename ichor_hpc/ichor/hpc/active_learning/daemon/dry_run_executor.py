@@ -548,7 +548,7 @@ class DryRunPhaseExecutor:
             "strategy": "ferebus_train_internal",
             "train_fraction": train_fraction,
             "internal_validation_fraction": internal_fraction,
-            "external_validation_fraction": 0.0,
+            "external_validation_size": 0,
             "high_holdout_fraction": 0.0,
             "iteration": int(state.iteration),
             "train_indices": train_indices,

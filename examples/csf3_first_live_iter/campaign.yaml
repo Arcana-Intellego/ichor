@@ -2,7 +2,7 @@
 # Generic first-live-iteration active-learning campaign for CSF3/CSF4.
 # Intended for a small validation run, not a long production campaign.
 
-schema_version: 7
+schema_version: 8
 
 # -------------------------------------------------------------------------
 # Required system-level identifiers
@@ -20,7 +20,7 @@ campaign:
 # 20-frame smoke pool, 12 + 1 * 8 = 20 frames are required.
 bootstrap:
   initial_labelled_size: 12
-  external_validation_fraction: 0.2
+  external_validation_size: 2
 
 # -------------------------------------------------------------------------
 # Trajectory pool

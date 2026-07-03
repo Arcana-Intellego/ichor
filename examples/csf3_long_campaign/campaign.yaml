@@ -1,4 +1,4 @@
-schema_version: 7
+schema_version: 8
 
 campaign:
   system_name: ICHOR_CSF3_LONG_CAMPAIGN
@@ -8,7 +8,7 @@ campaign:
 # campaign before increasing batch sizes further.
 bootstrap:
   initial_labelled_size: 100
-  external_validation_fraction: 0.2
+  external_validation_size: 20
 
 active_batch:
   final_batch_size: 8

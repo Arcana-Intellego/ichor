@@ -524,6 +524,19 @@ def format_sampling_protocol_summary(
     )
     lines.append(
         _line(
+            "bootstrap.external_validation_size",
+            config.bootstrap.external_validation_size,
+        )
+    )
+    lines.append(
+        _line(
+            "bootstrap.non_external_labelled_size",
+            int(config.bootstrap.initial_labelled_size)
+            - int(config.bootstrap.external_validation_size),
+        )
+    )
+    lines.append(
+        _line(
             "seed_selection.n_seeds_per_iteration",
             seed.n_seeds_per_iteration,
         )

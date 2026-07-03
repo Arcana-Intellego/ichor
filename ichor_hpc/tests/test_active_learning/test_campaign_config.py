@@ -1,4 +1,4 @@
-"""Tests for ichor.hpc.active_learning.config -- schema v6."""
+"""Tests for ichor.hpc.active_learning.config."""
 from pathlib import Path
 
 import pytest
@@ -29,14 +29,15 @@ from ichor.hpc.active_learning.geometry_protocol import (
 )
 
 
-def test_schema_version_is_six():
-    assert CONFIG_SCHEMA_VERSION == 6
+def test_schema_version_is_eight():
+    assert CONFIG_SCHEMA_VERSION == 8
 
 
 def test_default_campaign_config_is_valid():
     c = CampaignConfig()
     c._validate()
     assert c.bootstrap.initial_labelled_size == 12
+    assert c.bootstrap.external_validation_size == 2
     assert c.active_batch.final_batch_size == 4
     assert c.quality_gates.require_readable_aimall_geometry is True
     assert c.quality_gates.require_finite_iqa is True
@@ -81,7 +82,7 @@ def test_default_campaign_config_is_valid():
     assert c.quality_gates.ariadne_max_displacement_ang == 1.25
     assert c.quality_gates.ariadne_min_pair_distance_ang == 0.60
     assert c.adversarial_safety.accept_legacy_missing_landing_safety is False
-    assert c.max_acquisition_grad_per_ang is None
+    assert c.max_acquisition_grad_per_ang == 50.0
     assert c.effective_max_acquisition_grad_per_ang() == 50.0
     assert c.error_calibration.enabled is True
     assert c.error_calibration.mode == "record_only"
@@ -118,10 +119,36 @@ def test_default_campaign_config_is_valid():
     assert c.acquisition.subspace.canonicalise_basis is True
 
 
+def test_bootstrap_external_validation_size_validated():
+    payload = CampaignConfig().to_dict()
+    payload["bootstrap"]["external_validation_size"] = -1
+    with pytest.raises(ConfigValidationError, match="external_validation_size"):
+        CampaignConfig.from_dict(payload)
+    payload = CampaignConfig().to_dict()
+    payload["bootstrap"]["external_validation_size"] = 12
+    with pytest.raises(ConfigValidationError, match="initial_labelled_size"):
+        CampaignConfig.from_dict(payload)
+    payload = CampaignConfig().to_dict()
+    payload["bootstrap"]["external_validation_size"] = 2.5
+    with pytest.raises(ConfigValidationError, match="external_validation_size"):
+        CampaignConfig.from_dict(payload)
+
+
+def test_schema_v7_external_validation_fraction_migrates_to_size():
+    payload = CampaignConfig().to_dict()
+    payload["schema_version"] = 7
+    payload["bootstrap"].pop("external_validation_size", None)
+    payload["bootstrap"]["external_validation_fraction"] = 0.25
+    payload["bootstrap"]["initial_labelled_size"] = 12
+    cfg = CampaignConfig.from_dict(payload)
+    assert cfg.schema_version == CONFIG_SCHEMA_VERSION
+    assert cfg.bootstrap.external_validation_size == 3
+
+
 @pytest.mark.parametrize("name", ["WATER", "nh3_batch_01", "C6H6-AL"])
 def test_system_name_accepts_filename_safe_tokens(name):
     payload = CampaignConfig().to_dict()
-    payload["system_name"] = name
+    payload["campaign"]["system_name"] = name
     cfg = CampaignConfig.from_dict(payload)
     assert cfg.system_name == name
 
@@ -132,7 +159,7 @@ def test_system_name_accepts_filename_safe_tokens(name):
 )
 def test_system_name_rejects_unsafe_tokens(name):
     payload = CampaignConfig().to_dict()
-    payload["system_name"] = name
+    payload["campaign"]["system_name"] = name
     with pytest.raises(ConfigValidationError, match="system_name"):
         CampaignConfig.from_dict(payload)
 
@@ -289,7 +316,7 @@ def test_schema_v3_resources_migrate_to_current_grouped_schema():
         },
     }
     cfg = CampaignConfig.from_dict(payload)
-    assert cfg.schema_version == 6
+    assert cfg.schema_version == CONFIG_SCHEMA_VERSION
     assert cfg.resources.defaults.partition == "multicore"
     assert cfg.resources.defaults.walltime_hours == 12
     assert cfg.resources.polus.walltime_hours == 1
@@ -316,32 +343,16 @@ def test_aimall_fields_validated():
         CampaignConfig.from_dict(payload)
 
 
-def test_preferred_acquisition_gradient_clamp_overrides_legacy_default():
+def test_preferred_acquisition_gradient_clamp_is_nested():
     payload = CampaignConfig().to_dict()
-    payload["max_acquisition_grad_per_ang"] = 7.5
+    payload["acquisition"]["gradient"]["max_acquisition_grad_per_ang"] = 7.5
     cfg = CampaignConfig.from_dict(payload)
     assert cfg.effective_max_acquisition_grad_per_ang() == 7.5
 
 
-def test_legacy_force_clamp_alias_still_supported():
-    payload = CampaignConfig().to_dict()
-    payload["max_force_per_atom_ha_per_ang"] = 6.0
-    cfg = CampaignConfig.from_dict(payload)
-    assert cfg.max_acquisition_grad_per_ang is None
-    assert cfg.effective_max_acquisition_grad_per_ang() == 6.0
-
-
-def test_acquisition_gradient_clamp_rejects_ambiguous_alias_values():
-    payload = CampaignConfig().to_dict()
-    payload["max_acquisition_grad_per_ang"] = 7.5
-    payload["max_force_per_atom_ha_per_ang"] = 6.0
-    with pytest.raises(ConfigValidationError, match="conflicts"):
-        CampaignConfig.from_dict(payload)
-
-
 def test_acquisition_gradient_clamp_must_be_positive():
     payload = CampaignConfig().to_dict()
-    payload["max_acquisition_grad_per_ang"] = 0.0
+    payload["acquisition"]["gradient"]["max_acquisition_grad_per_ang"] = 0.0
     with pytest.raises(ConfigValidationError, match="max_acquisition_grad_per_ang"):
         CampaignConfig.from_dict(payload)
 
@@ -789,8 +800,7 @@ def test_ariadne_block_defaults():
 def test_ferebus_fraction_sum_must_be_one():
     payload = CampaignConfig().to_dict()
     payload["ferebus"]["train_fraction"] = 0.7
-    payload["ferebus"]["int_val_fraction"] = 0.1
-    payload["ferebus"]["ext_val_fraction"] = 0.1
+    payload["ferebus"]["internal_validation_fraction"] = 0.1
     with pytest.raises(ConfigValidationError, match="sum to 1.0"):
         CampaignConfig.from_dict(payload)
 
@@ -798,8 +808,7 @@ def test_ferebus_fraction_sum_must_be_one():
 def test_ferebus_fraction_range_validated():
     payload = CampaignConfig().to_dict()
     payload["ferebus"]["train_fraction"] = -0.1
-    payload["ferebus"]["int_val_fraction"] = 0.2
-    payload["ferebus"]["ext_val_fraction"] = 0.9
+    payload["ferebus"]["internal_validation_fraction"] = 1.1
     with pytest.raises(ConfigValidationError, match="ferebus.train_fraction"):
         CampaignConfig.from_dict(payload)
 

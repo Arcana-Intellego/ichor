@@ -204,7 +204,7 @@ PRE_GAUSSIAN_PREFIXES = {"gaussian."}
 PRE_AIMALL_PREFIXES = {"aimall."}
 PRE_FEREBUS_FIRST_EXACT = {
     "campaign.system_name",
-    "bootstrap.external_validation_fraction",
+    "bootstrap.external_validation_size",
     "ferebus.properties",
     "ferebus.train_fraction",
     "ferebus.internal_validation_fraction",
