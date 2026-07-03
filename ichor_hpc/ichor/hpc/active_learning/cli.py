@@ -845,6 +845,193 @@ def _format_contract_status(contract: Any) -> Optional[str]:
     return "not checked"
 
 
+_PHASE_MEANINGS: Dict[str, str] = {
+    CampaignPhase.INIT.value: "campaign initialised; no sampling phase has run yet",
+    CampaignPhase.PHASE_A_POLUS.value: "initial POLUS diversity sampling is next",
+    CampaignPhase.INITIAL_GAUSSIAN.value: "initial Gaussian labelling is next",
+    CampaignPhase.INITIAL_AIMALL.value: "initial AIMAll postprocessing is next",
+    CampaignPhase.INITIAL_FEREBUS.value: "bootstrap FEREBUS model training is next",
+    CampaignPhase.SEED_SELECT.value: "active-learning seed selection is next",
+    CampaignPhase.ARIADNE_ARRAY.value: "ARIADNE adversarial landing is next",
+    CampaignPhase.PHASE_B_POLUS.value: "Phase B POLUS selection is next",
+    CampaignPhase.SPLIT.value: "accepted active points are being partitioned",
+    CampaignPhase.GAUSSIAN.value: "active Gaussian labelling is next",
+    CampaignPhase.AIMALL.value: "active AIMAll postprocessing is next",
+    CampaignPhase.APPEND.value: "accepted AIMAll outputs are being appended",
+    CampaignPhase.FEREBUS.value: "FEREBUS model retraining is next",
+    CampaignPhase.STOP_CHECK.value: "iteration stop/continue decision is next",
+    CampaignPhase.DONE.value: "campaign is complete",
+    CampaignPhase.HALTED.value: "campaign is halted and needs operator review",
+}
+
+_BOOTSTRAP_NOT_READY_PHASES = {
+    CampaignPhase.INIT.value,
+    CampaignPhase.PHASE_A_POLUS.value,
+    CampaignPhase.INITIAL_GAUSSIAN.value,
+    CampaignPhase.INITIAL_AIMALL.value,
+}
+
+_TRAINING_REQUIRED_PHASES = {
+    CampaignPhase.SEED_SELECT.value,
+    CampaignPhase.ARIADNE_ARRAY.value,
+    CampaignPhase.PHASE_B_POLUS.value,
+    CampaignPhase.SPLIT.value,
+    CampaignPhase.GAUSSIAN.value,
+    CampaignPhase.AIMALL.value,
+    CampaignPhase.APPEND.value,
+    CampaignPhase.FEREBUS.value,
+    CampaignPhase.STOP_CHECK.value,
+}
+
+_MODELS_REQUIRED_PHASES = {
+    CampaignPhase.SEED_SELECT.value,
+    CampaignPhase.ARIADNE_ARRAY.value,
+    CampaignPhase.PHASE_B_POLUS.value,
+    CampaignPhase.SPLIT.value,
+    CampaignPhase.GAUSSIAN.value,
+    CampaignPhase.AIMALL.value,
+    CampaignPhase.APPEND.value,
+    CampaignPhase.STOP_CHECK.value,
+}
+
+
+def _phase_meaning(phase: Any) -> str:
+    return _PHASE_MEANINGS.get(str(phase or ""), "phase is not recognised")
+
+
+def _short_status_error(errors: Iterable[Any], *, limit: int = 180) -> str:
+    for error in errors:
+        text = str(error)
+        if len(text) > limit:
+            return text[: limit - 3] + "..."
+        return text
+    return ""
+
+
+def _product_ok_text(item: Dict[str, Any], *, label: str) -> str:
+    ok = item.get("ok")
+    if ok is True:
+        version_int = _status_version(item)
+        if version_int >= 0:
+            return "ready (v" + str(version_int) + ")"
+        return "not produced yet"
+    if ok is False:
+        error = _short_status_error(item.get("errors") or [])
+        return "problem" + (" - " + error if error else "")
+    return label + " status not checked"
+
+
+def _status_version(item: Dict[str, Any]) -> int:
+    try:
+        return int(item.get("version", -1))
+    except Exception:
+        return -1
+
+
+def _training_product_status(phase: str, item: Dict[str, Any]) -> str:
+    if phase in _BOOTSTRAP_NOT_READY_PHASES:
+        version = _status_version(item)
+        if item.get("ok") is True and version >= 0:
+            return "available early (v" + str(version) + ")"
+        return "not produced yet"
+    if phase == CampaignPhase.INITIAL_FEREBUS.value:
+        version = _status_version(item)
+        if item.get("ok") is True and version >= 0:
+            return "ready for initial FEREBUS (v" + str(version) + ")"
+        return "using initial AIMAll handoff"
+    if phase in _TRAINING_REQUIRED_PHASES:
+        return _product_ok_text(item, label="training")
+    if phase in (CampaignPhase.DONE.value, CampaignPhase.HALTED.value):
+        return _product_ok_text(item, label="training")
+    return _product_ok_text(item, label="training")
+
+
+def _models_product_status(phase: str, item: Dict[str, Any]) -> str:
+    if phase in _BOOTSTRAP_NOT_READY_PHASES:
+        version = _status_version(item)
+        if item.get("ok") is True and version >= 0:
+            return "available early (v" + str(version) + ")"
+        return "not produced yet"
+    if phase == CampaignPhase.INITIAL_FEREBUS.value:
+        version = _status_version(item)
+        if item.get("ok") is True and version >= 0:
+            return "available (v" + str(version) + ")"
+        return "being produced by INITIAL_FEREBUS"
+    if phase == CampaignPhase.FEREBUS.value:
+        version = _status_version(item)
+        if item.get("ok") is True and version >= 0:
+            return "current model ready (v" + str(version) + "); update in progress"
+        return "being produced by FEREBUS"
+    if phase in _MODELS_REQUIRED_PHASES:
+        return _product_ok_text(item, label="models")
+    if phase in (CampaignPhase.DONE.value, CampaignPhase.HALTED.value):
+        return _product_ok_text(item, label="models")
+    return _product_ok_text(item, label="models")
+
+
+def _format_data_products_summary(
+    status: Any,
+    *,
+    state_contract: Any = None,
+    phase: Any = None,
+    verbose: bool,
+) -> List[str]:
+    phase_name = str(phase or "")
+    rows: List[tuple[str, Any]] = []
+    if not isinstance(status, dict):
+        rows.append(("bootstrap training set", "not checked"))
+        rows.append(("FEREBUS models", "not checked"))
+    else:
+        training = status.get("training")
+        if isinstance(training, dict):
+            rows.append(
+                (
+                    "bootstrap training set",
+                    _training_product_status(phase_name, training),
+                )
+            )
+            if (
+                phase_name in _BOOTSTRAP_NOT_READY_PHASES
+                and training.get("ok") is not True
+            ):
+                rows.append(("training expected after", "INITIAL_AIMALL / INITIAL_FEREBUS"))
+            if verbose:
+                rows.append(("training version", training.get("version")))
+                for error in training.get("errors") or []:
+                    rows.append(("training detail", error))
+        else:
+            rows.append(("bootstrap training set", "not checked"))
+
+        models = status.get("models")
+        if isinstance(models, dict):
+            rows.append(("FEREBUS models", _models_product_status(phase_name, models)))
+            if (
+                phase_name in _BOOTSTRAP_NOT_READY_PHASES
+                and models.get("ok") is not True
+            ):
+                rows.append(("models expected after", "INITIAL_FEREBUS"))
+            if verbose:
+                rows.append(("models version", models.get("version")))
+                for error in models.get("errors") or []:
+                    rows.append(("models detail", error))
+        else:
+            rows.append(("FEREBUS models", "not checked"))
+        if status.get("error"):
+            rows.append(("artefact check", "problem - " + str(status.get("error"))))
+
+    contract_text = _format_contract_status(state_contract)
+    if contract_text == "ok":
+        rows.append(("current phase contract", "ready for " + (phase_name or "current phase")))
+    elif contract_text is not None:
+        rows.append(("current phase contract", contract_text))
+    else:
+        rows.append(("current phase contract", "not checked"))
+    if verbose and isinstance(state_contract, dict):
+        for error in state_contract.get("errors") or []:
+            rows.append(("phase contract detail", error))
+    return _section("Data Products", rows)
+
+
 def _format_artifact_summary(
     status: Any,
     *,
@@ -984,64 +1171,85 @@ def _format_recommendations(payload: Dict[str, Any]) -> List[str]:
                         + str(recommendation.get("primary")),
                     )
                 )
-    return _section("Recommendation", rows)
+    return _section("Next Action", rows)
 
 
-def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path) -> str:
-    lines: List[str] = []
-    lines.extend(
-        _section(
-            "Campaign",
-            [
-                ("phase", payload.get("phase")),
-                (
-                    "iteration",
-                    str(payload.get("iteration")) + " / max " + str(payload.get("max_iterations")),
-                ),
-                ("uid", payload.get("campaign_uid")),
-                ("started", payload.get("campaign_started_iso")),
-            ],
-        )
-    )
-    feasibility = payload.get("pool_feasibility")
-    if isinstance(feasibility, dict):
-        pool_rows = []
-        if feasibility.get("error"):
-            pool_rows.append(("status", "unavailable"))
-            pool_rows.append(("error", feasibility.get("error")))
-        else:
-            pool_rows.extend(
-                [
-                    ("status", "ok" if feasibility.get("ok") else "failed"),
-                    ("frames", feasibility.get("pool_n_frames")),
-                    ("required", feasibility.get("required_pool_frames")),
-                    ("expression", feasibility.get("expression")),
-                ]
-            )
-        lines.append("")
-        lines.extend(_section("Pool Feasibility", pool_rows))
-    pending = payload.get("pending_jobs")
-    job_rows = []
-    if isinstance(pending, dict) and pending:
-        for phase, job_id in sorted(pending.items()):
-            job_rows.append(("pending Slurm job " + str(phase), job_id if job_id else "done"))
+def _format_pool_feasibility_status(feasibility: Any) -> List[str]:
+    if not isinstance(feasibility, dict):
+        return []
+    rows: List[tuple[str, Any]] = []
+    if feasibility.get("error"):
+        rows.append(("status", "unavailable"))
+        rows.append(("error", feasibility.get("error")))
     else:
-        job_rows.append(("pending Slurm jobs", "none recorded in state"))
-    job_rows.append(
-        (
-            "active submission intents",
-            _format_active_submission_intents(payload.get("active_submission_intents")),
+        rows.extend(
+            [
+                ("status", "ready" if feasibility.get("ok") else "blocked"),
+                ("frames available", feasibility.get("pool_n_frames")),
+                ("frames required", feasibility.get("required_pool_frames")),
+                ("requirement", feasibility.get("expression")),
+            ]
         )
-    )
-    lines.append("")
-    lines.extend(_section("Jobs", job_rows))
-    lease = "active: " + _heartbeat_summary(payload.get("lease_heartbeat"))
-    if not payload.get("lease_dir_exists"):
-        lease = "none"
-    lines.append("")
-    lines.extend(
-        _section(
-            "Runtime",
+    return _section("Trajectory Pool", rows)
+
+
+def _active_pending_jobs_summary(pending: Any) -> str:
+    if not isinstance(pending, dict) or not pending:
+        return "none recorded in state"
+    active: List[str] = []
+    completed_markers = 0
+    for phase, job_id in sorted(pending.items()):
+        if job_id:
+            active.append(str(phase) + "=" + str(job_id))
+        else:
+            completed_markers += 1
+    if active:
+        text = ", ".join(active[:4])
+        if len(active) > 4:
+            text += " ..."
+        return text
+    return "none active (" + str(completed_markers) + " completed markers)"
+
+
+def _lease_fresh(heartbeat: Any, *, stale_seconds: int = 900) -> bool:
+    if not isinstance(heartbeat, dict):
+        return False
+    try:
+        return time.time() - float(heartbeat.get("time")) <= stale_seconds
+    except Exception:
+        return False
+
+
+def _daemon_activity_status(payload: Dict[str, Any]) -> str:
+    active: List[str] = []
+    if payload.get("lock_held") is True:
+        active.append("foreground lock held")
+    if payload.get("lease_dir_exists") and _lease_fresh(payload.get("lease_heartbeat")):
+        active.append("fresh lease")
+    if payload.get("background_pid_alive") is True:
+        active.append("background pid " + str(payload.get("background_pid")))
+    if active:
+        return "running (" + ", ".join(active) + ")"
+    if payload.get("lock_held") is None:
+        return "unknown (lock probe failed)"
+    return "not running"
+
+
+def _format_runtime_status(payload: Dict[str, Any], *, verbose: bool) -> List[str]:
+    rows: List[tuple[str, Any]] = [
+        ("daemon", _daemon_activity_status(payload)),
+        ("recorded Slurm jobs", _active_pending_jobs_summary(payload.get("pending_jobs"))),
+        (
+            "submission intents",
+            _format_active_submission_intents(payload.get("active_submission_intents")),
+        ),
+        ("shutdown requested", "yes" if payload.get("shutdown_requested") else "no"),
+    ]
+    if verbose:
+        lease = "active: " + _heartbeat_summary(payload.get("lease_heartbeat"))
+        if not payload.get("lease_dir_exists"):
+            lease = "none"
+        rows.extend(
             [
                 ("foreground lock", _lock_summary(payload.get("lock_held"))),
                 ("daemon lease", lease),
@@ -1052,13 +1260,49 @@ def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path
                         payload.get("background_pid_alive"),
                     ),
                 ),
-                (
-                    "shutdown requested",
-                    "yes" if payload.get("shutdown_requested") else "no",
-                ),
+            ]
+        )
+    return _section("Runtime", rows)
+
+
+def _iteration_summary(payload: Dict[str, Any]) -> str:
+    return (
+        str(payload.get("iteration"))
+        + " of "
+        + str(payload.get("max_iterations"))
+        + " active iterations planned"
+    )
+
+
+def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path) -> str:
+    lines: List[str] = []
+    lines.extend(
+        _section(
+            "Campaign",
+            [
+                ("phase", payload.get("phase")),
+                ("meaning", _phase_meaning(payload.get("phase"))),
+                ("iteration", _iteration_summary(payload)),
+                ("uid", payload.get("campaign_uid")),
+                ("initialised", payload.get("campaign_started_iso")),
             ],
         )
     )
+    pool_lines = _format_pool_feasibility_status(payload.get("pool_feasibility"))
+    if pool_lines:
+        lines.append("")
+        lines.extend(pool_lines)
+    lines.append("")
+    lines.extend(
+        _format_data_products_summary(
+            payload.get("artifact_manifest_status"),
+            state_contract=payload.get("state_artifact_contract_status"),
+            phase=payload.get("phase"),
+            verbose=verbose,
+        )
+    )
+    lines.append("")
+    lines.extend(_format_runtime_status(payload, verbose=verbose))
     if payload.get("phase") == "HALTED":
         halt = _latest_journal_event(journal_path, "halt")
         lines.append("")
@@ -1071,14 +1315,6 @@ def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path
                 ],
             )
         )
-    lines.append("")
-    lines.extend(
-        _format_artifact_summary(
-            payload.get("artifact_manifest_status"),
-            state_contract=payload.get("state_artifact_contract_status"),
-            verbose=verbose,
-        )
-    )
     lines.append("")
     lines.extend(_format_recommendations(payload))
     if verbose:

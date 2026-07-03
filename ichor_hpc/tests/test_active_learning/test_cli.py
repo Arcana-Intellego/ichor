@@ -318,6 +318,32 @@ def test_cli_status_json_prints_state_payload(tmp_path, capsys):
     assert payload["next_action"] == payload["recommendations"][0]["primary"]
 
 
+def test_cli_status_init_hides_not_due_committed_artifact_errors(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
+    s = fresh_campaign_state(max_iterations=2)
+    write_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME, s)
+
+    rc = main(["status", "--campaign-dir", str(campaign)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Campaign\n" in out
+    assert "  phase: INIT" in out
+    assert "  meaning: campaign initialised; no sampling phase has run yet" in out
+    assert "  initialised:" in out
+    assert "Trajectory Pool\n" in out
+    assert "Data Products\n" in out
+    assert "  bootstrap training set: not produced yet" in out
+    assert "  FEREBUS models: not produced yet" in out
+    assert "  current phase contract: ready for INIT" in out
+    assert "Runtime\n" in out
+    assert "  daemon: not running" in out
+    assert "Next Action\n" in out
+    assert "CommittedArtifactError" not in out
+    assert "training status: problem" not in out
+
+
 def test_cli_status_default_prints_operator_friendly_summary(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
     (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
@@ -332,22 +358,17 @@ def test_cli_status_default_prints_operator_friendly_summary(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "Campaign\n" in out
     assert "  phase: STOP_CHECK" in out
-    assert "  iteration: 3 / max 5" in out
-    assert "Jobs\n" in out
-    assert "  pending Slurm jobs: none recorded in state" in out
-    assert "  active submission intents: none" in out
+    assert "  iteration: 3 of 5 active iterations planned" in out
+    assert "Data Products\n" in out
+    assert "  current phase contract: problem - CommittedArtifactError:" in out
+    assert "  bootstrap training set: problem - CommittedArtifactError:" in out
+    assert "  FEREBUS models: problem - CommittedArtifactError:" in out
     assert "Runtime\n" in out
-    assert "  foreground lock: free" in out
-    assert "  daemon lease: none" in out
-    assert "  background daemon: not running" in out
+    assert "  daemon: not running" in out
+    assert "  recorded Slurm jobs: none recorded in state" in out
+    assert "  submission intents: none" in out
     assert "  shutdown requested: no" in out
-    assert "Artifacts\n" in out
-    assert "  state contract: problem - CommittedArtifactError:" in out
-    assert "  training version: 0" in out
-    assert "  training status: problem - CommittedArtifactError:" in out
-    assert "  models version: 0" in out
-    assert "  models status: problem - CommittedArtifactError:" in out
-    assert "Recommendation\n" in out
+    assert "Next Action\n" in out
     assert "  severity: required" in out
     assert "  primary: run reconcile; STOP_CHECK needs the latest coherent committed training/model pair" in out
     assert "  why: CommittedArtifactError:" in out
@@ -372,10 +393,11 @@ def test_cli_status_reports_initial_ferebus_bootstrap_contract_problem(tmp_path,
 
     assert rc == 0
     out = capsys.readouterr().out
-    assert "  state contract: problem - CommittedArtifactError:" in out
+    assert "Data Products\n" in out
+    assert "  current phase contract: problem - CommittedArtifactError:" in out
     assert "initial_ferebus_bootstrap_manifest_invalid" in out
-    assert "  training status: not required yet" in out
-    assert "  models status: not required yet" in out
+    assert "  bootstrap training set: using initial AIMAll handoff" in out
+    assert "  FEREBUS models: being produced by INITIAL_FEREBUS" in out
 
 
 def test_cli_status_backend_submission_failure_recommends_reconcile_apply(tmp_path, capsys):
@@ -442,7 +464,7 @@ def test_cli_status_default_summarises_active_submission_intents(tmp_path, capsy
 
     assert rc == 0
     out = capsys.readouterr().out
-    assert "  active submission intents: 1 (GAUSSIAN@0 SUBMITTED job_id=12345)" in out
+    assert "  submission intents: 1 (GAUSSIAN@0 SUBMITTED job_id=12345)" in out
     assert "a submission intent is still active" in out
 
 
@@ -531,7 +553,7 @@ def test_cli_status_returns_4_when_state_missing(tmp_path, capsys):
     rc = main(["status", "--campaign-dir", str(campaign)])
     out = capsys.readouterr().out
     assert rc == 4
-    assert "Recommendation" in out
+    assert "Next Action" in out
     assert "bootstrap the fresh campaign" in out
     assert "fresh init safe: True" in out
 
