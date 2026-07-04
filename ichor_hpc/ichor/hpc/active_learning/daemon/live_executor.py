@@ -148,6 +148,13 @@ def _object_with_overrides(default_obj: Any, overrides: Any) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
+def _without_keys(payload: Any, *keys: str) -> Dict[str, Any]:
+    data = dict(payload) if isinstance(payload, dict) else {}
+    for key in keys:
+        data.pop(str(key), None)
+    return data
+
+
 def _campaign_manifest_path(
     campaign_dir: Path,
     iter_dir: Path,
@@ -1473,11 +1480,16 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 )
                 recovery_summary = compact_array_recovery_summary(recovery)
                 submission_metadata["array_recovery"] = recovery_summary
+                recovery_journal_payload = _without_keys(
+                    recovery_summary,
+                    "phase",
+                    "iteration",
+                )
                 self._journal_event(
                     "partial_array_recovery_prepared",
                     phase=phase_name,
                     iteration=int(getattr(state, "iteration", 0)),
-                    **recovery_summary,
+                    **recovery_journal_payload,
                 )
                 retry_ids = list(recovery.get("retry_task_ids") or [])
                 if not retry_ids and int(recovery.get("logical_total") or 0) > 0:
@@ -1485,7 +1497,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         "partial_array_recovery_postprocess_only",
                         phase=phase_name,
                         iteration=int(getattr(state, "iteration", 0)),
-                        **recovery_summary,
+                        **recovery_journal_payload,
                     )
                     return self.postprocess(state, phase, [])
                 if retry_ids:

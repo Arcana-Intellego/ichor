@@ -301,6 +301,45 @@ def test_tick_submits_sbatch_phase_then_polls(tmp_path):
     assert state.pending_jobs[CampaignPhase.PHASE_A_POLUS.value] is None
 
 
+def test_sbatch_journal_metadata_reserved_keys_do_not_crash_or_override(tmp_path):
+    class MetadataExecutor(MockPhaseExecutor):
+        def __init__(self):
+            super().__init__(treat_as_sbatch=set(_SBATCH_PHASES))
+
+        def submit_or_run(self, state, phase):
+            if phase is CampaignPhase.PHASE_A_POLUS:
+                return PhaseResult(
+                    is_complete=False,
+                    submitted_job_id="123",
+                    expected_tasks=1,
+                    submission_metadata={
+                        "phase": "BAD",
+                        "job_id": "BAD",
+                        "iteration": 999,
+                        "expected_tasks": 999,
+                        "submitted_at_iso": "BAD",
+                        "event": "BAD",
+                        "ts": "BAD",
+                        "array_recovery": {"n_retry": 1},
+                    },
+                )
+            return super().submit_or_run(state, phase)
+
+    d = _make_daemon(tmp_path, executor=MetadataExecutor())
+    d.tick()  # INIT -> PHASE_A_POLUS
+
+    status = d.tick()
+
+    assert status == TickStatus.SUBMITTED
+    events = list(iter_events(d.journal_path()))
+    sbatch = [event for event in events if event["event"] == "sbatch"][-1]
+    assert sbatch["phase"] == CampaignPhase.PHASE_A_POLUS.value
+    assert sbatch["job_id"] == "123"
+    assert sbatch["iteration"] == 0
+    assert sbatch["expected_tasks"] == 1
+    assert sbatch["array_recovery"] == {"n_retry": 1}
+
+
 def test_phase_entry_exception_halts_and_persists_state(tmp_path):
     class RaisingExecutor(MockPhaseExecutor):
         def submit_or_run(self, state, phase):

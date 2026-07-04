@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from ichor.hpc.active_learning.config import CampaignConfig
+from ichor.hpc.active_learning.daemon import live_executor as live_executor_mod
 from ichor.hpc.active_learning.daemon.live_executor import (
     LIVE_POSTPROCESS_IMPLEMENTED,
     LiveBackendsPhaseExecutor,
@@ -1076,6 +1077,108 @@ class _FakeSbatch:
     def __call__(self, args, **kwargs):
         self.calls.append((list(args), dict(kwargs)))
         return SimpleNamespace(returncode=0, stdout="12345\n", stderr="")
+
+
+def test_partial_array_recovery_journal_payload_does_not_duplicate_phase(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = CampaignConfig()
+    runner = _FakeSbatch()
+    campaign = tmp_path / "campaign"
+    ex = LiveBackendsPhaseExecutor(
+        campaign_dir=campaign,
+        config=cfg,
+        backend_check=False,
+        sbatch_runner=runner,
+    )
+    monkeypatch.setattr(ex, "_array_size_after_staging", lambda _phase, _state: 3)
+    monkeypatch.setattr(
+        ex,
+        "_write_real_script",
+        lambda _phase, _state, _array_size, array_task_map=None: campaign / "job.sh",
+    )
+    monkeypatch.setattr(
+        live_executor_mod,
+        "prepare_retry_submission",
+        lambda _campaign, _phase, _iteration: {
+            "phase": "GAUSSIAN",
+            "iteration": 4,
+            "logical_total": 3,
+            "n_complete": 1,
+            "n_reuse": 1,
+            "n_retry": 2,
+            "force_resubmit": False,
+            "retry_task_ids": [1, 2],
+            "path": str(campaign / "ledger.json"),
+            "retry_task_file": None,
+        },
+    )
+
+    result = ex.submit_or_run(
+        SimpleNamespace(iteration=4, campaign_uid="m16-test"),
+        CampaignPhase("GAUSSIAN"),
+    )
+
+    assert result.submitted_job_id == "12345"
+    events = _read_journal_events(campaign)
+    prepared = [
+        event for event in events
+        if event.get("event") == "partial_array_recovery_prepared"
+    ]
+    assert prepared
+    assert prepared[-1]["phase"] == "GAUSSIAN"
+    assert prepared[-1]["iteration"] == 4
+    assert prepared[-1]["n_retry"] == 2
+
+
+def test_partial_array_recovery_postprocess_only_journal_payload_is_safe(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = CampaignConfig()
+    campaign = tmp_path / "campaign"
+    ex = LiveBackendsPhaseExecutor(
+        campaign_dir=campaign,
+        config=cfg,
+        backend_check=False,
+        sbatch_runner=_FakeSbatch(),
+    )
+    sentinel = PhaseResult(is_complete=True, state_updates={"ok": True})
+    monkeypatch.setattr(ex, "_array_size_after_staging", lambda _phase, _state: 3)
+    monkeypatch.setattr(ex, "postprocess", lambda _state, _phase, _obs: sentinel)
+    monkeypatch.setattr(
+        live_executor_mod,
+        "prepare_retry_submission",
+        lambda _campaign, _phase, _iteration: {
+            "phase": "GAUSSIAN",
+            "iteration": 4,
+            "logical_total": 3,
+            "n_complete": 3,
+            "n_reuse": 3,
+            "n_retry": 0,
+            "force_resubmit": False,
+            "retry_task_ids": [],
+            "path": str(campaign / "ledger.json"),
+            "retry_task_file": None,
+        },
+    )
+
+    result = ex.submit_or_run(
+        SimpleNamespace(iteration=4, campaign_uid="m16-test"),
+        CampaignPhase("GAUSSIAN"),
+    )
+
+    assert result is sentinel
+    events = _read_journal_events(campaign)
+    postprocess_ready = [
+        event for event in events
+        if event.get("event") == "partial_array_recovery_postprocess_only"
+    ]
+    assert postprocess_ready
+    assert postprocess_ready[-1]["phase"] == "GAUSSIAN"
+    assert postprocess_ready[-1]["iteration"] == 4
+    assert postprocess_ready[-1]["n_retry"] == 0
 
 
 def test_ariadne_submit_cleans_stale_results_before_sbatch(tmp_path):

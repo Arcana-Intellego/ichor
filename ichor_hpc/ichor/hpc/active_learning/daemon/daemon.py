@@ -119,6 +119,21 @@ class TickStatus(str):
     SHUTDOWN = "SHUTDOWN"
 
 
+def _journal_metadata_payload(payload: Any) -> Dict[str, Any]:
+    data = dict(payload) if isinstance(payload, dict) else {}
+    for key in (
+        "phase",
+        "job_id",
+        "iteration",
+        "expected_tasks",
+        "submitted_at_iso",
+        "event",
+        "ts",
+    ):
+        data.pop(key, None)
+    return data
+
+
 TRANSIENT_RETRY_STATUSES = frozenset({
     "NODE_FAIL",
     "PREEMPTED",
@@ -831,7 +846,7 @@ class Daemon:
                 "sbatch", phase=phase_name, job_id=result.submitted_job_id,
                 iteration=state.iteration,
                 expected_tasks=result.expected_tasks,
-                **(
+                **_journal_metadata_payload(
                     getattr(result, "submission_metadata", {}) or {}
                 ),
                 submitted_at_iso=(
