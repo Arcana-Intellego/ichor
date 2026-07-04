@@ -14,9 +14,11 @@ import pytest
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.daemon import live_executor as live_executor_mod
 from ichor.hpc.active_learning.daemon.live_executor import (
+    FEREBUS_TASK_ARTEFACTS_MANIFEST,
     LIVE_POSTPROCESS_IMPLEMENTED,
     LiveBackendsPhaseExecutor,
     _ariadne_optional_diagnostic_warnings,
+    _write_ferebus_task_artefact_layout,
     clean_stale_ariadne_seed_outputs,
 )
 from ichor.hpc.active_learning.daemon import input_staging as stg
@@ -475,6 +477,11 @@ def _seed_models_staging(campaign_dir):
     _write_metric_csv(train_csv, 5)
     _write_metric_csv(int_csv, 2)
     _write_metric_csv(ext_csv, 2)
+    for suffix in ("opt", "perf", "pred", "scurve", "sol"):
+        (model_dir / ("WATER_iqa_O1." + suffix)).write_text(
+            suffix + "\n",
+            encoding="utf-8",
+        )
     (target / "FEREBUS_QUALITY.json").write_text(
         json.dumps({
             "schema_version": 1,
@@ -595,8 +602,102 @@ def test_ferebus_parser_happy_path_commits_models_version(tmp_path):
     assert (committed_dir / "WATER_iqa_O1.model").is_file()
     assert (committed_dir / stg.FEREBUS_TASK_MANIFEST).is_file()
     assert (committed_dir / "ferebus_iqa_O1.config").is_file()
+    artefact_dir = committed_dir / "task_artefacts" / "iqa" / "O1"
+    assert artefact_dir.is_dir()
+    assert not (artefact_dir / "WATER_iqa_O1.model").exists()
+    assert not (artefact_dir / "ferebus.config").exists()
+    assert (artefact_dir / "WATER_iqa_O1.opt").read_text(encoding="utf-8") == "opt\n"
+    artefact_manifest = json.loads(
+        (committed_dir / "task_artefacts" / FEREBUS_TASK_ARTEFACTS_MANIFEST)
+        .read_text(encoding="utf-8")
+    )
+    assert artefact_manifest["schema_version"] == 1
+    assert artefact_manifest["tasks"] == [{
+        "property": "iqa",
+        "atom": "O1",
+        "directory": "task_artefacts/iqa/O1",
+        "canonical_model": "WATER_iqa_O1.model",
+        "canonical_config": "ferebus_iqa_O1.config",
+        "files": {
+            "opt": "task_artefacts/iqa/O1/WATER_iqa_O1.opt",
+            "perf": "task_artefacts/iqa/O1/WATER_iqa_O1.perf",
+            "pred": "task_artefacts/iqa/O1/WATER_iqa_O1.pred",
+            "scurve": "task_artefacts/iqa/O1/WATER_iqa_O1.scurve",
+            "sol": "task_artefacts/iqa/O1/WATER_iqa_O1.sol",
+        },
+    }]
     events = _read_journal_events(tmp_path / "campaign")
     assert any(e.get("event") == "models_committed" for e in events)
+
+
+def test_ferebus_task_artefact_layout_supports_properties_and_missing_files(tmp_path):
+    staging = tmp_path / "campaign" / "6_TRAINED_MODELS" / "iteration-staging"
+    committed = tmp_path / "campaign" / "6_TRAINED_MODELS" / "iteration-0000"
+    staging.mkdir(parents=True)
+    committed.mkdir(parents=True)
+    tasks = []
+    for prop, atom in (("iqa", "O1"), ("q00", "O1")):
+        task_dir = staging / prop / atom
+        task_dir.mkdir(parents=True)
+        model = task_dir / ("WATER_" + prop + "_" + atom + ".model")
+        config = task_dir / "ferebus.config"
+        model.write_text("model\n", encoding="utf-8")
+        config.write_text("config\n", encoding="utf-8")
+        (task_dir / ("WATER_" + prop + "_" + atom + ".opt")).write_text(
+            prop + "\n",
+            encoding="utf-8",
+        )
+        tasks.append({
+            "property": prop,
+            "atom": atom,
+            "expected_model_path": str(model),
+            "config_path": str(config),
+        })
+
+    _write_ferebus_task_artefact_layout(
+        staging,
+        committed,
+        {"schema_version": 1, "training_version": 0, "tasks": tasks},
+    )
+
+    assert (committed / "task_artefacts" / "iqa" / "O1" / "WATER_iqa_O1.opt").is_file()
+    assert (committed / "task_artefacts" / "q00" / "O1" / "WATER_q00_O1.opt").is_file()
+    assert not (committed / "task_artefacts" / "iqa" / "O1" / "WATER_iqa_O1.model").exists()
+    assert not (committed / "task_artefacts" / "q00" / "O1" / "ferebus.config").exists()
+    artefact_manifest = json.loads(
+        (committed / "task_artefacts" / FEREBUS_TASK_ARTEFACTS_MANIFEST)
+        .read_text(encoding="utf-8")
+    )
+    assert artefact_manifest["n_tasks"] == 2
+    assert artefact_manifest["tasks"][0]["files"]["perf"] is None
+    assert artefact_manifest["tasks"][1]["property"] == "q00"
+
+
+def test_ferebus_task_artefact_layout_rejects_unsafe_tokens(tmp_path):
+    staging = tmp_path / "campaign" / "6_TRAINED_MODELS" / "iteration-staging"
+    committed = tmp_path / "campaign" / "6_TRAINED_MODELS" / "iteration-0000"
+    staging.mkdir(parents=True)
+    committed.mkdir(parents=True)
+    model = staging / "WATER_iqa_O1.model"
+    config = staging / "ferebus.config"
+    model.write_text("model\n", encoding="utf-8")
+    config.write_text("config\n", encoding="utf-8")
+
+    with pytest.raises(BackendSubmissionError, match="safe path token"):
+        _write_ferebus_task_artefact_layout(
+            staging,
+            committed,
+            {
+                "schema_version": 1,
+                "training_version": 0,
+                "tasks": [{
+                    "property": "iqa/bad",
+                    "atom": "O1",
+                    "expected_model_path": str(model),
+                    "config_path": str(config),
+                }],
+            },
+        )
 
 
 def test_initial_ferebus_also_commits_training_set_version_zero(tmp_path):

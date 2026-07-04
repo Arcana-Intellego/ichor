@@ -124,6 +124,8 @@ DEFAULT_DAEMON_RUNTIME_MODULES: List[str] = (
 _MODULE_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/+-]*(?: [A-Za-z0-9][A-Za-z0-9_.:/+-]*)*$")
 _SHEBANG_RE = re.compile(r"^#![A-Za-z0-9_./ -]+$")
 _SHELL_PATH_FRAGMENT_RE = re.compile(r"^[A-Za-z0-9_./${}:+-]+$")
+FEREBUS_TASK_ARTEFACTS_MANIFEST = "FEREBUS_TASK_ARTEFACTS.json"
+FEREBUS_TASK_AUXILIARY_SUFFIXES = ("opt", "perf", "pred", "scurve", "sol")
 
 
 def _iteration_active_learning_dir(campaign_dir: Path, iteration: int) -> Path:
@@ -146,6 +148,196 @@ def _object_with_overrides(default_obj: Any, overrides: Any) -> SimpleNamespace:
         for key, value in overrides.items():
             values[str(key)] = value
     return SimpleNamespace(**values)
+
+
+def _is_relative_to_path(path: Path, root: Path) -> bool:
+    resolved = Path(path).resolve(strict=False)
+    resolved_root = Path(root).resolve(strict=False)
+    return resolved == resolved_root or resolved_root in resolved.parents
+
+
+def _reject_symlinked_path(path: Path, root: Path, label: str) -> None:
+    probe = Path(path)
+    resolved_root = Path(root).resolve(strict=False)
+    while True:
+        if probe.exists() and probe.is_symlink():
+            raise BackendSubmissionError(
+                "refusing symlinked FEREBUS "
+                + label
+                + ": "
+                + str(probe)
+            )
+        if probe.resolve(strict=False) == resolved_root:
+            return
+        parent = probe.parent
+        if parent == probe:
+            return
+        probe = parent
+
+
+def _resolve_ferebus_staging_path(staging: Path, raw_path: Any, label: str) -> Path:
+    raw = Path(str(raw_path))
+    candidate = raw if raw.is_absolute() else Path(staging) / raw
+    if not _is_relative_to_path(candidate, staging):
+        raise BackendSubmissionError(
+            "FEREBUS " + label + " escapes iteration-staging: " + str(raw_path)
+        )
+    _reject_symlinked_path(candidate, staging, label)
+    return candidate
+
+
+def _resolve_ferebus_destination(root: Path, dest: Path, label: str) -> Path:
+    target = Path(dest)
+    if not _is_relative_to_path(target, root):
+        raise BackendSubmissionError(
+            "FEREBUS " + label + " destination escapes committed model directory: "
+            + str(dest)
+        )
+    _reject_symlinked_path(target.parent, root, label + " parent")
+    return target
+
+
+def _dedupe_paths(paths: Sequence[Path]) -> List[Path]:
+    seen = set()
+    ordered: List[Path] = []
+    for path in paths:
+        key = str(Path(path).resolve(strict=False))
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(Path(path))
+    return ordered
+
+
+def _find_ferebus_auxiliary_file(
+    staging: Path,
+    model_file: Path,
+    search_dirs: Sequence[Path],
+    suffix: str,
+) -> Optional[Path]:
+    stem = model_file.stem
+    for directory in search_dirs:
+        candidate = directory / (stem + "." + suffix)
+        if candidate.is_file():
+            return _resolve_ferebus_staging_path(
+                staging,
+                candidate,
+                "auxiliary ." + suffix + " file",
+            )
+    model_dir = model_file.parent
+    if model_dir != Path(staging):
+        matches = sorted(model_dir.glob("*." + suffix))
+        if len(matches) == 1 and matches[0].is_file():
+            return _resolve_ferebus_staging_path(
+                staging,
+                matches[0],
+                "auxiliary ." + suffix + " file",
+            )
+        if len(matches) > 1:
+            raise BackendSubmissionError(
+                "ambiguous FEREBUS auxiliary ." + suffix + " files in " + str(model_dir)
+            )
+    return None
+
+
+def _copy_regular_file_no_symlink(src: Path, dest: Path, root: Path) -> None:
+    if not src.is_file() or src.is_symlink():
+        raise BackendSubmissionError("refusing non-regular FEREBUS artefact: " + str(src))
+    target = _resolve_ferebus_destination(root, dest, "artefact")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(str(src), str(target))
+
+
+def _write_ferebus_task_artefact_layout(
+    staging: Path,
+    committed_dir: Path,
+    manifest: Dict[str, Any],
+) -> Path:
+    """Copy non-canonical FEREBUS diagnostics into a per-task archive tree.
+
+    The flat ``*.model`` and ``ferebus_<property>_<atom>.config`` files remain
+    the only canonical model-loader inputs. This helper archives only
+    ``*.opt``, ``*.perf``, ``*.pred``, ``*.scurve``, and ``*.sol`` files beneath
+    ``task_artefacts/<property>/<atom>/``.
+    """
+    from . import input_staging as _stg
+    from .model_contract import FEREBUS_COMMITTED_ARTEFACTS_DIRNAME
+
+    staging = Path(staging)
+    committed_dir = Path(committed_dir)
+    artefacts_root = committed_dir / FEREBUS_COMMITTED_ARTEFACTS_DIRNAME
+    if artefacts_root.exists():
+        if artefacts_root.parent.resolve(strict=False) != committed_dir.resolve(strict=False):
+            raise BackendSubmissionError("ferebus_artefact_archive_path_invalid")
+        shutil.rmtree(artefacts_root)
+    artefacts_root.mkdir(parents=True, exist_ok=True)
+
+    records: List[Dict[str, Any]] = []
+    for task in manifest.get("tasks", []):
+        prop = str(task.get("property"))
+        atom = str(task.get("atom"))
+        try:
+            _stg.validate_safe_path_token("FEREBUS property", prop)
+            _stg.validate_safe_path_token("FEREBUS atom label", atom)
+        except ValueError as exc:
+            raise BackendSubmissionError(str(exc)) from exc
+        model_file = _resolve_ferebus_staging_path(
+            staging,
+            task["expected_model_path"],
+            "model path",
+        )
+        config_path = _resolve_ferebus_staging_path(
+            staging,
+            task.get("config_path", ""),
+            "config path",
+        )
+        search_dirs = _dedupe_paths([
+            directory
+            for directory in (model_file.parent, config_path.parent, staging)
+            if _is_relative_to_path(directory, staging)
+        ])
+        task_dir = _resolve_ferebus_destination(
+            committed_dir,
+            artefacts_root / prop / atom,
+            "task artefact directory",
+        )
+        task_dir.mkdir(parents=True, exist_ok=True)
+        files: Dict[str, Optional[str]] = {}
+        for suffix in FEREBUS_TASK_AUXILIARY_SUFFIXES:
+            source = _find_ferebus_auxiliary_file(
+                staging,
+                model_file,
+                search_dirs,
+                suffix,
+            )
+            if source is None:
+                files[suffix] = None
+                continue
+            dest = task_dir / source.name
+            _copy_regular_file_no_symlink(source, dest, committed_dir)
+            files[suffix] = dest.relative_to(committed_dir).as_posix()
+        records.append(
+            {
+                "property": prop,
+                "atom": atom,
+                "directory": task_dir.relative_to(committed_dir).as_posix(),
+                "canonical_model": model_file.name,
+                "canonical_config": "ferebus_" + prop + "_" + atom + ".config",
+                "files": files,
+            }
+        )
+
+    manifest_path = artefacts_root / FEREBUS_TASK_ARTEFACTS_MANIFEST
+    atomic_write_json(
+        manifest_path,
+        {
+            "schema_version": 1,
+            "training_version": manifest.get("training_version"),
+            "n_tasks": len(records),
+            "tasks": records,
+        },
+    )
+    return manifest_path
 
 
 def _without_keys(payload: Any, *keys: str) -> Dict[str, Any]:
@@ -2353,27 +2545,83 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             source_version=source_version, target_version=next_version,
         )
         from . import input_staging as _stg
-        from .model_contract import FEREBUS_COMMITTED_ARTEFACTS_DIRNAME
         manifest = _stg.read_ferebus_manifest(staging)
-        artefacts_root = staged / FEREBUS_COMMITTED_ARTEFACTS_DIRNAME
-        if artefacts_root.exists():
-            if artefacts_root.parent.resolve(strict=False) != staged.resolve(strict=False):
-                return PhaseResult(
-                    is_complete=True,
-                    failure_reason="ferebus_artefact_archive_path_invalid",
-                )
-            shutil.rmtree(artefacts_root)
-        _stg._copytree_no_symlinks(_Path(staging), artefacts_root)
         for task in manifest.get("tasks", []):
             prop = str(task.get("property"))
             atom = str(task.get("atom"))
-            model_file = _Path(str(task["expected_model_path"]))
+            try:
+                _stg.validate_safe_path_token("FEREBUS property", prop)
+                _stg.validate_safe_path_token("FEREBUS atom label", atom)
+                model_file = _resolve_ferebus_staging_path(
+                    staging,
+                    task["expected_model_path"],
+                    "model path",
+                )
+            except Exception as exc:
+                return PhaseResult(
+                    is_complete=True,
+                    failure_reason=(
+                        "ferebus_model_copy_failed: "
+                        + type(exc).__name__
+                        + ": "
+                        + str(exc)
+                    ),
+                )
             target_file = staged / model_file.name
-            target_file.write_bytes(model_file.read_bytes())
-            cfg_file = _Path(str(task["config_path"]))
+            try:
+                _copy_regular_file_no_symlink(model_file, target_file, staged)
+            except Exception as exc:
+                return PhaseResult(
+                    is_complete=True,
+                    failure_reason=(
+                        "ferebus_model_copy_failed: "
+                        + type(exc).__name__
+                        + ": "
+                        + str(exc)
+                    ),
+                )
+            try:
+                cfg_file = _resolve_ferebus_staging_path(
+                    staging,
+                    task["config_path"],
+                    "config path",
+                )
+            except Exception as exc:
+                return PhaseResult(
+                    is_complete=True,
+                    failure_reason=(
+                        "ferebus_config_copy_failed: "
+                        + type(exc).__name__
+                        + ": "
+                        + str(exc)
+                    ),
+                )
             if cfg_file.is_file():
                 cfg_target = staged / ("ferebus_" + prop + "_" + atom + ".config")
-                cfg_target.write_bytes(cfg_file.read_bytes())
+                try:
+                    _copy_regular_file_no_symlink(cfg_file, cfg_target, staged)
+                except Exception as exc:
+                    return PhaseResult(
+                        is_complete=True,
+                        failure_reason=(
+                            "ferebus_config_copy_failed: "
+                            + type(exc).__name__
+                            + ": "
+                            + str(exc)
+                        ),
+                    )
+        try:
+            _write_ferebus_task_artefact_layout(staging, staged, manifest)
+        except Exception as exc:
+            return PhaseResult(
+                is_complete=True,
+                failure_reason=(
+                    "ferebus_task_artefact_archive_failed: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)
+                ),
+            )
         for sidecar_name in (
             _stg.FEREBUS_TASK_MANIFEST,
             _stg.FEREBUS_JOB_DETAILS,

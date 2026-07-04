@@ -1118,6 +1118,65 @@ def archive_scripts_for_reconcile(campaign_dir: Union[str, Path]) -> List[str]:
     return [str(target)]
 
 
+def _timestamped_reconcile_sibling(path: Path) -> Path:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    target = path.with_name(path.name + ".before-reconcile-" + stamp)
+    suffix = 1
+    while target.exists():
+        target = path.with_name(
+            path.name + ".before-reconcile-" + stamp + "." + str(suffix)
+        )
+        suffix += 1
+    return target
+
+
+def _model_basenames(root: Path, *, recursive: bool) -> set[str]:
+    basenames: set[str] = set()
+    iterator = Path(root).rglob("*.model") if recursive else Path(root).glob("*.model")
+    for child in iterator:
+        if child.is_symlink():
+            raise ValueError("refusing symlinked model file during reconcile: " + str(child))
+        if child.is_file():
+            basenames.add(child.name)
+    return basenames
+
+
+def _archive_completed_model_iteration_staging(
+    campaign: Path,
+    target: Path,
+    proposed_state: CampaignState,
+) -> Path:
+    try:
+        model_version = int(proposed_state.models_version)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("models_version is not an integer") from exc
+    if model_version < 0:
+        raise ValueError(
+            "completed FEREBUS iteration-staging exists but no committed model "
+            "version is recorded"
+        )
+    committed = campaign / "6_TRAINED_MODELS" / ("iteration-" + f"{model_version:04d}")
+    verify_committed_model_version(campaign, model_version)
+    staged_models = _model_basenames(target, recursive=True)
+    committed_models = _model_basenames(committed, recursive=False)
+    if not staged_models:
+        raise ValueError("completed FEREBUS iteration-staging has no flat .model files")
+    if staged_models != committed_models:
+        raise ValueError(
+            "completed FEREBUS iteration-staging does not match committed model "
+            "version "
+            + str(model_version)
+            + ": staged="
+            + repr(sorted(staged_models))
+            + " committed="
+            + repr(sorted(committed_models))
+        )
+    archive = _timestamped_reconcile_sibling(target)
+    _ensure_inside_campaign(campaign, archive)
+    target.rename(archive)
+    return archive
+
+
 def clean_model_iteration_staging_for_reconcile(
     campaign_dir: Union[str, Path],
     proposed_state: CampaignState,
@@ -1138,10 +1197,12 @@ def clean_model_iteration_staging_for_reconcile(
     except Exception:
         ok, reason = False, "validation unavailable"
     if ok:
-        raise ValueError(
-            "refusing to remove completed FEREBUS iteration-staging; "
-            "postprocess or commit it first"
+        archived = _archive_completed_model_iteration_staging(
+            campaign,
+            target,
+            proposed_state,
         )
+        return [str(archived)]
     if proposed_state.phase not in (CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS):
         try:
             model_version = int(proposed_state.models_version)

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import ichor.hpc.active_learning.cli as cli_mod
 import ichor.hpc.active_learning.daemon.reconcile as reconcile_mod
+import pytest
 from ichor.hpc.active_learning.cli import cmd_reconcile, cmd_start
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
@@ -992,6 +993,87 @@ def test_reconcile_apply_promotes_state_and_cleans_ferebus_staging(tmp_path, cap
     )
     lock = json.loads(config_lock_path(campaign).read_text(encoding="utf-8"))
     assert lock["canonical_config"]["ferebus"]["scaling"] is False
+
+
+def test_completed_ferebus_staging_is_archived_when_committed_models_match(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = _campaign(tmp_path)
+    staging = campaign / "6_TRAINED_MODELS" / "iteration-staging"
+    committed = campaign / "6_TRAINED_MODELS" / "iteration-0000"
+    staging_task = staging / "iqa" / "O1"
+    staging_task.mkdir(parents=True)
+    committed.mkdir(parents=True)
+    (staging_task / "WATER_iqa_O1.model").write_text("staged\n", encoding="utf-8")
+    (committed / "WATER_iqa_O1.model").write_text("committed\n", encoding="utf-8")
+    proposed = fresh_campaign_state()
+    proposed.phase = CampaignPhase.ARIADNE_ARRAY
+    proposed.models_version = 0
+
+    from ichor.hpc.active_learning.daemon import live_executor as live_executor_mod
+
+    monkeypatch.setattr(
+        live_executor_mod,
+        "validate_ferebus_completed",
+        lambda path: (True, "ok"),
+    )
+    monkeypatch.setattr(
+        config_lock_mod,
+        "verify_committed_model_version",
+        lambda *args, **kwargs: None,
+    )
+
+    archived = config_lock_mod.clean_model_iteration_staging_for_reconcile(
+        campaign,
+        proposed,
+    )
+
+    assert len(archived) == 1
+    archived_path = Path(archived[0])
+    assert archived_path.name.startswith("iteration-staging.before-reconcile-")
+    assert not staging.exists()
+    assert (
+        archived_path / "iqa" / "O1" / "WATER_iqa_O1.model"
+    ).read_text(encoding="utf-8") == "staged\n"
+    assert (committed / "WATER_iqa_O1.model").read_text(encoding="utf-8") == "committed\n"
+
+
+def test_completed_ferebus_staging_refuses_archive_when_models_do_not_match(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = _campaign(tmp_path)
+    staging = campaign / "6_TRAINED_MODELS" / "iteration-staging"
+    committed = campaign / "6_TRAINED_MODELS" / "iteration-0000"
+    staging.mkdir(parents=True)
+    committed.mkdir(parents=True)
+    (staging / "WATER_iqa_O1.model").write_text("staged\n", encoding="utf-8")
+    (committed / "WATER_iqa_H2.model").write_text("committed\n", encoding="utf-8")
+    proposed = fresh_campaign_state()
+    proposed.phase = CampaignPhase.ARIADNE_ARRAY
+    proposed.models_version = 0
+
+    from ichor.hpc.active_learning.daemon import live_executor as live_executor_mod
+
+    monkeypatch.setattr(
+        live_executor_mod,
+        "validate_ferebus_completed",
+        lambda path: (True, "ok"),
+    )
+    monkeypatch.setattr(
+        config_lock_mod,
+        "verify_committed_model_version",
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(ValueError, match="does not match committed model version"):
+        config_lock_mod.clean_model_iteration_staging_for_reconcile(
+            campaign,
+            proposed,
+        )
+
+    assert staging.exists()
 
 
 def test_reconcile_apply_write_state_failure_keeps_old_state(
