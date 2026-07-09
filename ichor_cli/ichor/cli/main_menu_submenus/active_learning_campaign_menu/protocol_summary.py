@@ -249,6 +249,8 @@ def _pool_feasibility_summary(
         return [
             _line("pool_feasibility.status", "ok" if result.ok else "failed"),
             _line("pool_feasibility.pool_n_frames", result.pool_n_frames),
+            _line("pool_feasibility.bootstrap_anchor_count", result.bootstrap_anchor_count),
+            _line("pool_feasibility.bootstrap_pool_frame_count", result.bootstrap_pool_frame_count),
             _line("pool_feasibility.required_pool_frames", result.required_pool_frames),
             _line("pool_feasibility.expression", result.expression),
         ]
@@ -528,6 +530,14 @@ def format_sampling_protocol_summary(
             config.bootstrap.external_validation_size,
         )
     )
+    lines.append(
+        _line(
+            "bootstrap.anchor",
+            config.bootstrap.anchor,
+        )
+    )
+    if bool(getattr(config.bootstrap, "anchor", False)):
+        lines.append(_line("bootstrap.anchor_xyz", "anchor.xyz"))
     lines.append(
         _line(
             "bootstrap.non_external_labelled_size",

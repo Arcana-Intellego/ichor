@@ -17,6 +17,7 @@ runtime:
 bootstrap:
   initial_labelled_size: 6
   external_validation_size: 1
+  anchor: false
 
 # Final labelled batch per active iteration.
 active_batch:

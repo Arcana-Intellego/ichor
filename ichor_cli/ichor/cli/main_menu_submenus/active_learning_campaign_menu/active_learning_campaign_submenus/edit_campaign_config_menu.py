@@ -1365,6 +1365,7 @@ _BLOCK_MENUS_BY_LABEL = {
         [
             _spec("bootstrap.initial_labelled_size", "int"),
             _spec("bootstrap.external_validation_size", "int"),
+            _spec("bootstrap.anchor", "bool"),
         ],
     ),
     "Edit resource defaults": _make_block_menu(

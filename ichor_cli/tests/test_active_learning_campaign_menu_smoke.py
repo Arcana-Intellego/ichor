@@ -238,6 +238,15 @@ def test_campaign_config_block_submenus_show_values_and_edit_one_field(monkeypat
     assert "resources.defaults.mem_per_cpu" in rendered
     assert "resources.gradient_parallel_backend" in rendered
 
+    bootstrap_menu = menu._BLOCK_MENUS_BY_LABEL["Edit bootstrap"]
+    bootstrap_rendered = bootstrap_menu.this_menu_options()
+    assert "bootstrap.initial_labelled_size" in bootstrap_rendered
+    assert "bootstrap.external_validation_size" in bootstrap_rendered
+    assert "bootstrap.anchor" in bootstrap_rendered
+    bootstrap_menu.parent = menu.edit_campaign_config_menu
+    bootstrap_prologue = bootstrap_menu.get_prologue_text()
+    assert "bootstrap.anchor" in bootstrap_prologue
+
     texts = [it.text for it in resources_menu.items]
     assert "Set partition" in texts
     assert "Set walltime_hours" in texts
@@ -1394,6 +1403,7 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
     assert "sampling_protocol.resolved_acquisition_risk" in out
     assert "sampling_protocol.resolved_ariadne" in out
     assert "seed_selection.strategy: d_optimal" in out
+    assert "bootstrap.anchor: False" in out
     assert "error_calibration.mode: apply_to_acquisition" in out
     assert "error_calibration.apply_strength: 0.5" in out
     assert "resources.aimall.effective_cpus_per_task: auto" in out
@@ -1437,6 +1447,7 @@ def test_daemon_control_sampling_protocol_summary_uses_saved_campaign(tmp_path, 
     assert "sampling_protocol.resolved_manifest_example" in out
     assert "sampling_protocol.audit_manifest_example" in out
     assert "seed_selection.strategy: d_optimal" in out
+    assert "bootstrap.anchor: False" in out
     assert "error_calibration.mode: record_only" in out
 
 

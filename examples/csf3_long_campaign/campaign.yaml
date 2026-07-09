@@ -9,6 +9,7 @@ campaign:
 bootstrap:
   initial_labelled_size: 100
   external_validation_size: 20
+  anchor: false
 
 active_batch:
   final_batch_size: 8

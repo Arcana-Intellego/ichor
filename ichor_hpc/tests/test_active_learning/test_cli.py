@@ -170,6 +170,8 @@ def _pool_feasibility_payload(
     return {
         "pool_n_frames": int(pool_n_frames),
         "bootstrap_initial_labelled_size": 70,
+        "bootstrap_pool_frame_count": 70,
+        "bootstrap_anchor_count": 0,
         "max_iterations": 2,
         "n_seeds_per_iteration": 10,
         "final_batch_size": 10,
@@ -177,7 +179,7 @@ def _pool_feasibility_payload(
         "required_pool_frames": int(required_pool_frames),
         "reserve_after_bootstrap": int(pool_n_frames) - 70,
         "expression": (
-            "bootstrap.initial_labelled_size + "
+            "bootstrap pool frames after anchors + "
             "max_iterations * seed_selection.n_seeds_per_iteration = 70 + 2 * 10 = 90"
         ),
         "ok": bool(ok),

@@ -23,6 +23,23 @@ def _import_pool(campaign, source):
     TrajectoryPool.import_from(source, campaign, overwrite=True)
 
 
+def _write_anchor_from_fixture(campaign, n_frames=1):
+    from ichor.core.files.xyz import Trajectory
+    from ichor.hpc.active_learning.sampling.polus_wrapper import _write_xyz_file
+
+    traj = Trajectory(FIXTURE)
+    traj.read()
+    frames = []
+    base = [atoms.copy() for atoms in traj][0]
+    for idx in range(int(n_frames)):
+        frame = base.copy()
+        if idx:
+            frame[1].x += 0.1 * idx
+        frames.append(frame)
+    _write_xyz_file(frames, campaign / "anchor.xyz")
+    return frames
+
+
 def _run(args):
     return subprocess.run(
         [sys.executable, "-m", MODULE] + args,
@@ -68,6 +85,74 @@ def test_phase_a_writes_sample_and_index(tmp_path):
     assert manifest["index_path"].endswith(indices[0].name)
     assert len(manifest["selected_indices"]) == 7
     assert manifest["trajectory_sha256"]
+
+
+def test_phase_a_prepends_anchor_geometries_and_fills_remainder_from_pool(tmp_path):
+    campaign = tmp_path / "c"
+    campaign.mkdir()
+    cfg = CampaignConfig()
+    cfg.bootstrap.initial_labelled_size = 7
+    cfg.bootstrap.external_validation_size = 2
+    cfg.bootstrap.anchor = True
+    cfg.max_iterations = 1
+    cfg.seed_selection.n_seeds_per_iteration = 4
+    cfg.to_yaml(campaign / "campaign.yaml")
+    _import_pool(campaign, FIXTURE)
+    _write_anchor_from_fixture(campaign, n_frames=1)
+
+    result = _run([
+        "--descriptor", "rmsd_massweight",
+        "--iteration", "-1",
+        "--campaign-dir", str(campaign),
+    ])
+    assert result.returncode == 0, result.stderr
+
+    outdir = campaign / "3_DIVERSITY_SAMPLING" / "initial"
+    manifest = json.loads((outdir / PHASE_A_SAMPLE_FILENAME).read_text(encoding="utf-8"))
+    assert manifest["n_select"] == 7
+    assert manifest["bootstrap_anchor_enabled"] is True
+    assert manifest["bootstrap_anchor_count"] == 1
+    assert manifest["bootstrap_pool_frame_count"] == 6
+    assert manifest["selected_indices"][0] is None
+    assert len(manifest["selected_pool_indices"]) == 6
+    assert len(manifest["selected_indices"]) == 7
+    assert 0 not in manifest["selected_pool_indices"]
+    assert manifest["excluded_pool_frame_ids"] == [0]
+    anchor_manifest = (
+        campaign
+        / ".DATA"
+        / "ACTIVE_LEARNING"
+        / "bootstrap_anchor.json"
+    )
+    assert anchor_manifest.is_file()
+    anchor_payload = json.loads(anchor_manifest.read_text(encoding="utf-8"))
+    assert anchor_payload["n_anchor"] == 1
+    idx_lines = (outdir / "initial-INDEX-7.dat").read_text(encoding="utf-8").splitlines()
+    assert idx_lines[0] == "anchor:0"
+    assert all(line.strip().isdigit() for line in idx_lines[1:])
+
+
+def test_phase_a_rejects_more_anchors_than_planned_training_split(tmp_path):
+    campaign = tmp_path / "c"
+    campaign.mkdir()
+    cfg = CampaignConfig()
+    cfg.bootstrap.initial_labelled_size = 7
+    cfg.bootstrap.external_validation_size = 2
+    cfg.bootstrap.anchor = True
+    cfg.max_iterations = 1
+    cfg.seed_selection.n_seeds_per_iteration = 4
+    cfg.to_yaml(campaign / "campaign.yaml")
+    _import_pool(campaign, FIXTURE)
+    _write_anchor_from_fixture(campaign, n_frames=5)
+
+    result = _run([
+        "--descriptor", "rmsd_massweight",
+        "--iteration", "-1",
+        "--campaign-dir", str(campaign),
+    ])
+
+    assert result.returncode == 3
+    assert "planned initial FEREBUS training split" in result.stderr
 
 
 def test_phase_a_fails_when_bootstrap_exceeds_pool_size(tmp_path):

@@ -199,7 +199,7 @@ RESOURCE_FUTURE_EXACT = {
 IMMUTABLE_EXACT = {"schema_version"}
 
 PRE_POOL_EXACT = {"trajectory_pool.source_path"}
-PRE_PHASE_A_EXACT = {"bootstrap.initial_labelled_size"}
+PRE_PHASE_A_EXACT = {"bootstrap.initial_labelled_size", "bootstrap.anchor"}
 PRE_GAUSSIAN_PREFIXES = {"gaussian."}
 PRE_AIMALL_PREFIXES = {"aimall."}
 PRE_FEREBUS_FIRST_EXACT = {

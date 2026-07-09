@@ -14,6 +14,8 @@ class PoolFeasibilityError(ValueError):
 class PoolFeasibility:
     pool_n_frames: int
     bootstrap_initial_labelled_size: int
+    bootstrap_pool_frame_count: int
+    bootstrap_anchor_count: int
     max_iterations: int
     n_seeds_per_iteration: int
     final_batch_size: int
@@ -23,7 +25,7 @@ class PoolFeasibility:
 
     @property
     def reserve_after_bootstrap(self) -> int:
-        return int(self.pool_n_frames) - int(self.bootstrap_initial_labelled_size)
+        return int(self.pool_n_frames) - int(self.bootstrap_pool_frame_count)
 
     @property
     def ok(self) -> bool:
@@ -35,6 +37,8 @@ class PoolFeasibility:
             "bootstrap_initial_labelled_size": int(
                 self.bootstrap_initial_labelled_size
             ),
+            "bootstrap_pool_frame_count": int(self.bootstrap_pool_frame_count),
+            "bootstrap_anchor_count": int(self.bootstrap_anchor_count),
             "max_iterations": int(self.max_iterations),
             "n_seeds_per_iteration": int(self.n_seeds_per_iteration),
             "final_batch_size": int(self.final_batch_size),
@@ -56,18 +60,34 @@ def evaluate_pool_feasibility(
     campaign_dir: str | Path,
     config: Any,
 ) -> PoolFeasibility:
-    pool_n = _pool_frame_count(campaign_dir)
+    from ..acquisition.trajectory_pool import TrajectoryPool
+    from ..bootstrap_anchor import plan_bootstrap_anchors
+
+    pool_frames = None
+    if bool(getattr(config.bootstrap, "anchor", False)):
+        pool = TrajectoryPool.load(campaign_dir)
+        pool_frames = pool.to_atoms_list()
+        pool_n = len(pool_frames)
+    else:
+        pool_n = _pool_frame_count(campaign_dir)
     bootstrap_n = int(config.bootstrap.initial_labelled_size)
+    anchor_plan, _anchor_frames = plan_bootstrap_anchors(
+        campaign_dir,
+        config,
+        pool_frames=pool_frames,
+    )
+    bootstrap_pool_n = int(anchor_plan.pool_total_needed)
+    anchor_n = int(anchor_plan.n_anchor)
     max_iterations = int(config.campaign.max_iterations)
     n_seeds = int(config.seed_selection.n_seeds_per_iteration)
     final_batch = int(config.active_batch.final_batch_size)
     skip_training = bool(config.anti_overlap.skip_training_seeds)
     if skip_training:
-        required = bootstrap_n + max_iterations * n_seeds
+        required = bootstrap_pool_n + max_iterations * n_seeds
         expression = (
-            "bootstrap.initial_labelled_size + "
+            "bootstrap pool frames after anchors + "
             "max_iterations * seed_selection.n_seeds_per_iteration = "
-            + str(bootstrap_n)
+            + str(bootstrap_pool_n)
             + " + "
             + str(max_iterations)
             + " * "
@@ -76,15 +96,17 @@ def evaluate_pool_feasibility(
             + str(required)
         )
     else:
-        required = bootstrap_n
+        required = bootstrap_pool_n
         expression = (
-            "bootstrap.initial_labelled_size = "
-            + str(bootstrap_n)
+            "bootstrap pool frames after anchors = "
+            + str(bootstrap_pool_n)
             + " (anti_overlap.skip_training_seeds=false)"
         )
     return PoolFeasibility(
         pool_n_frames=pool_n,
         bootstrap_initial_labelled_size=bootstrap_n,
+        bootstrap_pool_frame_count=bootstrap_pool_n,
+        bootstrap_anchor_count=anchor_n,
         max_iterations=max_iterations,
         n_seeds_per_iteration=n_seeds,
         final_batch_size=final_batch,

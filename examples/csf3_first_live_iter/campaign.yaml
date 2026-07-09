@@ -21,6 +21,7 @@ campaign:
 bootstrap:
   initial_labelled_size: 12
   external_validation_size: 2
+  anchor: false
 
 # -------------------------------------------------------------------------
 # Trajectory pool

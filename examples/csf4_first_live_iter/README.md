@@ -308,13 +308,18 @@ A minimal `campaign.yaml` (also shipped at
 `examples/csf4_first_live_iter/campaign.yaml`):
 
 ```yaml
-schema_version: 6
+schema_version: 8
 
-max_iterations: 1
-poll_interval_seconds: 60
+campaign:
+  max_iterations: 1
+
+runtime:
+  poll_interval_seconds: 60
 
 bootstrap:
   initial_labelled_size: 12
+  external_validation_size: 2
+  anchor: false
 
 active_batch:
   final_batch_size: 4

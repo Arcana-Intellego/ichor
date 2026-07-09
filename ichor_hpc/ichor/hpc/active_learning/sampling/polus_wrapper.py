@@ -178,8 +178,16 @@ def _write_xyz_file(frames, path):
 
 def _write_index_file(indices, path):
     """Write the per-line list of selected frame ids POLUS produces."""
+    lines = []
+    anchor_counter = 0
+    for value in indices:
+        if value is None:
+            lines.append("anchor:" + str(anchor_counter))
+            anchor_counter += 1
+        else:
+            lines.append(str(int(value)))
     Path(path).write_text(
-        chr(10).join(str(int(i)) for i in indices) + chr(10),
+        chr(10).join(lines) + chr(10),
         encoding="utf-8",
     )
 
@@ -459,46 +467,102 @@ def _run_phase_a(campaign, config):
         return 3
 
     try:
+        from ..bootstrap_anchor import (
+            plan_bootstrap_anchors,
+            write_bootstrap_anchor_manifest,
+        )
         from ..daemon.pool_feasibility import require_pool_feasibility
 
+        anchor_plan, anchor_frames = plan_bootstrap_anchors(
+            campaign,
+            config,
+            pool_frames=frames,
+        )
         feasibility = require_pool_feasibility(campaign, config)
     except Exception as exc:
         print(str(exc), file=_sys.stderr)
         return 3
 
-    n_select = int(config.bootstrap.initial_labelled_size)
-    if n_select > len(frames):
+    n_select = int(anchor_plan.initial_labelled_size)
+    pool_select = int(anchor_plan.pool_total_needed)
+    excluded_pool_ids = set(int(i) for i in anchor_plan.excluded_pool_frame_ids)
+    candidate_pool_ids = [
+        int(i) for i in range(len(frames)) if int(i) not in excluded_pool_ids
+    ]
+    if pool_select > len(candidate_pool_ids):
         print(
             "bootstrap_initial_labelled_size_exceeds_pool: "
             + "bootstrap.initial_labelled_size="
             + str(n_select)
-            + ", pool_n_frames="
-            + str(len(frames)),
+            + ", bootstrap.anchor_count="
+            + str(int(anchor_plan.n_anchor))
+            + ", pool_needed_after_anchors="
+            + str(pool_select)
+            + ", available_pool_frames="
+            + str(len(candidate_pool_ids)),
             file=_sys.stderr,
         )
         return 3
 
     descriptor = MassWeightedRMSDDescriptor()
-    matrix = descriptor.pairwise_distance_matrix(frames)
-    sel = fps_select(matrix, n_select, descriptor_name=descriptor.name)
+    selected_pool_indices: List[int] = []
+    diversities: List[float] = []
+    if pool_select > 0:
+        candidate_frames = [frames[i] for i in candidate_pool_ids]
+        matrix = descriptor.pairwise_distance_matrix(candidate_frames)
+        sel = fps_select(matrix, pool_select, descriptor_name=descriptor.name)
+        selected_pool_indices = [int(candidate_pool_ids[i]) for i in sel.indices]
+        diversities = [float(v) for v in sel.diversities]
+    else:
+        sel = FPSResult(
+            indices=[],
+            diversities=[],
+            distance_matrix_shape=(len(candidate_pool_ids), len(candidate_pool_ids)),
+            descriptor_name=descriptor.name,
+        )
+    selected_frames = list(anchor_frames) + [frames[i] for i in selected_pool_indices]
+    selected_indices = [None] * int(anchor_plan.n_anchor) + [
+        int(i) for i in selected_pool_indices
+    ]
 
     outdir = campaign / "3_DIVERSITY_SAMPLING" / "initial"
     outdir.mkdir(parents=True, exist_ok=True)
     sample_path = outdir / ("initial-SAMPLE-" + str(n_select) + ".xyz")
     index_path = outdir / ("initial-INDEX-" + str(n_select) + ".dat")
-    _write_xyz_file([frames[i] for i in sel.indices], sample_path)
-    _write_index_file(sel.indices, index_path)
+    _write_xyz_file(selected_frames, sample_path)
+    _write_index_file(selected_indices, index_path)
+    anchor_manifest_path = None
+    if bool(anchor_plan.enabled):
+        anchor_manifest_path = write_bootstrap_anchor_manifest(
+            campaign,
+            anchor_plan,
+            selected_pool_frame_ids=selected_pool_indices,
+            phase_a_sample_xyz=sample_path,
+            phase_a_index_path=index_path,
+        )
     write_phase_a_sample_manifest(outdir, {
         "phase": "PHASE_A_POLUS",
         "iteration": -1,
         "sample_xyz": str(sample_path.resolve()),
         "index_path": str(index_path.resolve()),
         "n_select": int(n_select),
-        "n_frames": int(n_select),
-        "selected_indices": [int(i) for i in sel.indices],
+        "n_frames": int(len(selected_frames)),
+        "selected_indices": selected_indices,
+        "selected_pool_indices": [int(i) for i in selected_pool_indices],
         "descriptor": str(descriptor.name),
+        "fps_diversities": diversities,
         "n_pool_frames": int(len(frames)),
         "bootstrap_initial_labelled_size": int(n_select),
+        "bootstrap_anchor_enabled": bool(anchor_plan.enabled),
+        "bootstrap_anchor_count": int(anchor_plan.n_anchor),
+        "bootstrap_pool_frame_count": int(pool_select),
+        "bootstrap_anchor_path": str(anchor_plan.anchor_path),
+        "bootstrap_anchor_manifest": (
+            None if anchor_manifest_path is None else str(anchor_manifest_path.resolve())
+        ),
+        "excluded_pool_frame_ids": [
+            int(i) for i in anchor_plan.excluded_pool_frame_ids
+        ],
         "reserve_after_bootstrap": int(feasibility.reserve_after_bootstrap),
         "pool_feasibility": feasibility.to_dict(),
         "trajectory_sha256": str(pool.sha256),

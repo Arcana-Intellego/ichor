@@ -804,6 +804,8 @@ def read_phase_a_sample_manifest(
             raise HandoffManifestError("Phase A selected_indices length mismatch")
         seen = set()
         for value in selected:
+            if value is None:
+                continue
             idx = _required_int(value, "Phase A selected_indices")
             if idx in seen:
                 raise HandoffManifestError("Phase A selected_indices contains duplicates")

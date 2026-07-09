@@ -59,6 +59,46 @@ def test_initial_split_ledger_uses_absolute_external_size_then_train_internal_fr
     assert result["row_ids"]["ext_val"] == list(range(50, 70))
 
 
+def test_initial_split_ledger_forces_anchor_rows_into_training(tmp_path):
+    names = _names(10)
+    result = ensure_split_assignments(
+        tmp_path,
+        names,
+        training_version=0,
+        train_internal_fractions=(0.75, 0.25),
+        external_validation_size=2,
+        forced_splits={
+            names[8]: "train",
+            names[9]: "train",
+        },
+    )
+
+    assert result["counts"] == {
+        "train": 6,
+        "int_val": 2,
+        "ext_val": 2,
+    }
+    assert result["row_ids"]["train"] == [0, 1, 2, 3, 8, 9]
+    assert result["row_ids"]["int_val"] == [4, 5]
+    assert result["row_ids"]["ext_val"] == [6, 7]
+    assert result["assignments"][names[8]]["forced_split"] == "train"
+    assert result["assignments"][names[8]]["forced_split_reason"] == "bootstrap_anchor"
+
+
+def test_initial_split_ledger_rejects_forced_rows_over_split_capacity(tmp_path):
+    names = _names(4)
+
+    with pytest.raises(ValueError, match="forced FEREBUS train rows exceed"):
+        ensure_split_assignments(
+            tmp_path,
+            names,
+            training_version=0,
+            train_internal_fractions=(0.5, 0.5),
+            external_validation_size=1,
+            forced_splits={name: "train" for name in names},
+        )
+
+
 def test_existing_split_ledger_assignments_never_change(tmp_path):
     first_names = _names(10)
     first = ensure_split_assignments(

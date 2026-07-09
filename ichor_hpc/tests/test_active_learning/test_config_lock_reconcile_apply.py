@@ -872,6 +872,21 @@ def test_bootstrap_size_blocks_after_phase_a_output(tmp_path):
     assert "Phase A" in review.blocked_changes[0].reason
 
 
+def test_bootstrap_anchor_blocks_after_phase_a_output(tmp_path):
+    campaign = _campaign(tmp_path)
+    _write_phase_a_sample(campaign)
+    original = CampaignConfig()
+    write_config_lock(campaign, original)
+    changed = CampaignConfig()
+    changed.bootstrap.anchor = True
+
+    review = review_config_changes(campaign, changed, fresh_campaign_state())
+
+    assert not review.allowed
+    assert [c.path for c in review.blocked_changes] == ["bootstrap.anchor"]
+    assert "Phase A" in review.blocked_changes[0].reason
+
+
 def test_system_name_allowed_before_first_ferebus(tmp_path):
     campaign = _campaign(tmp_path)
     original = CampaignConfig()

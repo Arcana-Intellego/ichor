@@ -38,6 +38,7 @@ def test_default_campaign_config_is_valid():
     c._validate()
     assert c.bootstrap.initial_labelled_size == 12
     assert c.bootstrap.external_validation_size == 2
+    assert c.bootstrap.anchor is False
     assert c.active_batch.final_batch_size == 4
     assert c.quality_gates.require_readable_aimall_geometry is True
     assert c.quality_gates.require_finite_iqa is True
@@ -123,6 +124,13 @@ def test_bootstrap_external_validation_size_validated():
     payload = CampaignConfig().to_dict()
     payload["bootstrap"]["external_validation_size"] = -1
     with pytest.raises(ConfigValidationError, match="external_validation_size"):
+        CampaignConfig.from_dict(payload)
+
+
+def test_bootstrap_anchor_must_be_boolean():
+    payload = CampaignConfig().to_dict()
+    payload["bootstrap"]["anchor"] = "yes"
+    with pytest.raises(ConfigValidationError, match="bootstrap.anchor"):
         CampaignConfig.from_dict(payload)
     payload = CampaignConfig().to_dict()
     payload["bootstrap"]["external_validation_size"] = 12

@@ -466,6 +466,7 @@ class CampaignIdentityConfigBlock:
 class BootstrapConfigBlock:
     initial_labelled_size: int = 12
     external_validation_size: int = 2
+    anchor: bool = False
 
 
 @dataclass
@@ -1316,6 +1317,8 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "bootstrap.initial_labelled_size must be > 0"
             )
+        if not isinstance(self.bootstrap.anchor, bool):
+            raise ConfigValidationError("bootstrap.anchor must be a boolean")
         if not isinstance(self.bootstrap.external_validation_size, int) or isinstance(
             self.bootstrap.external_validation_size,
             bool,

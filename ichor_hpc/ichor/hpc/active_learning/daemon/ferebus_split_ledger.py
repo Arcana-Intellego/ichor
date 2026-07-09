@@ -123,6 +123,26 @@ def _initial_target_counts(
     }
 
 
+def plan_initial_split_counts(
+    n_rows: int,
+    train_internal_fractions: Sequence[float],
+    external_validation_size: int,
+) -> Dict[str, int]:
+    """Public wrapper for the bootstrap split-size contract.
+
+    Anchor planning uses the same arithmetic as the ledger so the Phase-A
+    capacity check cannot drift from the actual model-0 train/internal/external
+    row assignment.
+    """
+    return dict(
+        _initial_target_counts(
+            int(n_rows),
+            train_internal_fractions,
+            external_validation_size,
+        )
+    )
+
+
 def _target_counts_for_incremental(
     total_n: int,
     assignments: Mapping[str, Mapping[str, Any]],
@@ -163,11 +183,28 @@ def ensure_split_assignments(
     train_internal_fractions: Sequence[float],
     external_validation_size: int,
     pointdir_identity: Optional[Mapping[str, str]] = None,
+    forced_splits: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
     """Assign pointdirs to train/internal/external without moving old rows."""
     names = [str(n) for n in pointdir_names]
     if len(set(names)) != len(names):
         raise ValueError("duplicate pointdir names passed to FEREBUS split ledger")
+    name_set = set(names)
+    forced_map = {str(k): str(v) for k, v in (forced_splits or {}).items()}
+    unknown_forced = sorted(name for name in forced_map if name not in name_set)
+    if unknown_forced:
+        raise ValueError(
+            "forced FEREBUS split references unknown pointdirs: "
+            + repr(unknown_forced)
+        )
+    for name, split in sorted(forced_map.items()):
+        if split not in _SPLITS:
+            raise ValueError(
+                "forced FEREBUS split for "
+                + name
+                + " must be one of "
+                + repr(_SPLITS)
+            )
     train_internal_tuple = tuple(float(x) for x in train_internal_fractions)
     if isinstance(external_validation_size, bool) or not isinstance(
         external_validation_size,
@@ -196,6 +233,14 @@ def ensure_split_assignments(
                     "FEREBUS split ledger pointdir identity mismatch for "
                     + name
                 )
+        for name, split in sorted(forced_map.items()):
+            if name in assignments and str(assignments[name].get("split")) != split:
+                raise ValueError(
+                    "forced FEREBUS split for "
+                    + name
+                    + " conflicts with existing ledger split "
+                    + repr(assignments[name].get("split"))
+                )
         new_names = [name for name in sorted(names) if name not in assignments]
         if not assignments and new_names:
             sizes = _initial_target_counts(
@@ -203,12 +248,29 @@ def ensure_split_assignments(
                 train_internal_tuple,
                 external_size,
             )
-            ordered_splits: List[str] = (
-                ["train"] * sizes["train"]
-                + ["int_val"] * sizes["int_val"]
-                + ["ext_val"] * sizes["ext_val"]
+            forced_counts = {split: 0 for split in _SPLITS}
+            for name in new_names:
+                if name in forced_map:
+                    forced_counts[forced_map[name]] += 1
+            for split in _SPLITS:
+                if forced_counts[split] > sizes[split]:
+                    raise ValueError(
+                        "forced FEREBUS "
+                        + split
+                        + " rows exceed planned initial split size: "
+                        + str(forced_counts[split])
+                        + " > "
+                        + str(sizes[split])
+                    )
+            remaining_splits: List[str] = (
+                ["train"] * (sizes["train"] - forced_counts["train"])
+                + ["int_val"] * (sizes["int_val"] - forced_counts["int_val"])
+                + ["ext_val"] * (sizes["ext_val"] - forced_counts["ext_val"])
             )
-            for name, split in zip(new_names, ordered_splits):
+            remaining_iter = iter(remaining_splits)
+            for name in new_names:
+                forced_split = forced_map.get(name)
+                split = forced_split if forced_split is not None else next(remaining_iter)
                 assignments[name] = {
                     "split": split,
                     "first_seen_training_version": int(training_version),
@@ -217,13 +279,20 @@ def ensure_split_assignments(
                     "external_validation_size_at_assignment": external_size,
                     "provenance_sha256": identities.get(name),
                 }
+                if forced_split is not None:
+                    assignments[name]["forced_split"] = str(forced_split)
+                    assignments[name]["forced_split_reason"] = "bootstrap_anchor"
         else:
             for name in new_names:
-                split = _choose_split(
-                    assignments,
-                    n_after=len(assignments) + 1,
-                    train_internal_fractions=train_internal_tuple,
-                )
+                forced_split = forced_map.get(name)
+                if forced_split is None:
+                    split = _choose_split(
+                        assignments,
+                        n_after=len(assignments) + 1,
+                        train_internal_fractions=train_internal_tuple,
+                    )
+                else:
+                    split = forced_split
                 assignments[name] = {
                     "split": split,
                     "first_seen_training_version": int(training_version),
@@ -232,6 +301,9 @@ def ensure_split_assignments(
                     "external_validation_size_at_assignment": external_size,
                     "provenance_sha256": identities.get(name),
                 }
+                if forced_split is not None:
+                    assignments[name]["forced_split"] = str(forced_split)
+                    assignments[name]["forced_split_reason"] = "bootstrap_anchor"
         payload = {
             "schema_version": FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION,
             "split_policy": {
@@ -239,6 +311,7 @@ def ensure_split_assignments(
                 "ferebus_train_fraction": train_internal_tuple[0],
                 "ferebus_internal_validation_fraction": train_internal_tuple[1],
                 "external_validation_applies_to_bootstrap_only": True,
+                "forced_split_count": int(len(forced_map)),
             },
             "assignments": assignments,
         }

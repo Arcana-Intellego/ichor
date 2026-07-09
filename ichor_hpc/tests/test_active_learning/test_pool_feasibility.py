@@ -1,7 +1,12 @@
+from pathlib import Path
+
 import pytest
 
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.daemon import pool_feasibility as pf
+
+
+FIXTURE = Path(__file__).resolve().parent / "fixtures" / "water_tetramer.xyz"
 
 
 def _config(*, bootstrap=12, seeds=8, final=4, max_iterations=1, skip=True):
@@ -49,3 +54,30 @@ def test_pool_feasibility_reuse_mode_requires_only_bootstrap(monkeypatch, tmp_pa
 
     assert result.ok is True
     assert result.required_pool_frames == 20
+
+
+def test_pool_feasibility_counts_anchors_outside_pool_requirement(tmp_path):
+    from ichor.core.files.xyz import Trajectory
+    from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
+    from ichor.hpc.active_learning.sampling.polus_wrapper import _write_xyz_file
+
+    campaign = tmp_path / "c"
+    campaign.mkdir()
+    TrajectoryPool.import_from(FIXTURE, campaign, overwrite=True)
+    traj = Trajectory(FIXTURE)
+    traj.read()
+    base = [atoms.copy() for atoms in traj][0]
+    anchors = [base.copy(), base.copy()]
+    anchors[1][1].x += 0.1
+    _write_xyz_file(anchors, campaign / "anchor.xyz")
+    cfg = _config(bootstrap=12, seeds=8, max_iterations=1, skip=True)
+    cfg.bootstrap.external_validation_size = 2
+    cfg.bootstrap.anchor = True
+
+    result = pf.require_pool_feasibility(campaign, cfg)
+
+    assert result.bootstrap_initial_labelled_size == 12
+    assert result.bootstrap_anchor_count == 2
+    assert result.bootstrap_pool_frame_count == 10
+    assert result.required_pool_frames == 18
+    assert result.reserve_after_bootstrap == result.pool_n_frames - 10

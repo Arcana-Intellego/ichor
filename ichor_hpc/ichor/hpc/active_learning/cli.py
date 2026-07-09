@@ -1194,6 +1194,11 @@ def _format_pool_feasibility_status(feasibility: Any) -> List[str]:
                 ("status", "ready" if feasibility.get("ok") else "blocked"),
                 ("frames available", feasibility.get("pool_n_frames")),
                 ("frames required", feasibility.get("required_pool_frames")),
+                ("bootstrap anchors", feasibility.get("bootstrap_anchor_count")),
+                (
+                    "bootstrap pool frames",
+                    feasibility.get("bootstrap_pool_frame_count"),
+                ),
                 ("requirement", feasibility.get("expression")),
             ]
         )
@@ -5304,6 +5309,16 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
         required = pool.get("required_pool_frames")
         lines.append(_preflight_check_line("frames available", pool_ok, pool_n))
         lines.append(_preflight_check_line("frames required", pool_ok, required))
+        if pool.get("bootstrap_anchor_count") is not None:
+            lines.append(
+                "  bootstrap anchors: "
+                + str(pool.get("bootstrap_anchor_count"))
+            )
+        if pool.get("bootstrap_pool_frame_count") is not None:
+            lines.append(
+                "  bootstrap pool frames: "
+                + str(pool.get("bootstrap_pool_frame_count"))
+            )
         if pool.get("expression"):
             lines.append("  requirement: " + str(pool.get("expression")))
         if pool.get("reserve_after_bootstrap") is not None:

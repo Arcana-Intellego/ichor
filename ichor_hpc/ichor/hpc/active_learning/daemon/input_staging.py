@@ -422,6 +422,7 @@ def stage_gaussian_inputs(
     frames = _load_frames(sample_xyz)
     phase_b_records: List[Dict[str, Any]] = []
     initial_seed_frame_ids: List[Optional[int]] = []
+    initial_seed_selection_origins: List[str] = []
     initial_provenance_context: Optional[Dict[str, str]] = None
     if str(phase_name) == "GAUSSIAN":
         from ..handoff_manifests import read_phase_b_selection_manifest
@@ -458,6 +459,10 @@ def stage_gaussian_inputs(
                     int(value) if value is not None else None
                     for value in selected
                 ]
+                initial_seed_selection_origins = [
+                    "bootstrap_anchor" if value is None else "phase_a_polus"
+                    for value in selected
+                ]
                 current_state = read_state(
                     Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
                 )
@@ -468,6 +473,7 @@ def stage_gaussian_inputs(
                 }
         except FileNotFoundError:
             initial_seed_frame_ids = []
+            initial_seed_selection_origins = []
             initial_provenance_context = None
         except Exception as exc:
             raise ValueError(
@@ -563,7 +569,11 @@ def stage_gaussian_inputs(
                 iteration=int(iteration),
                 trajectory_sha256=str(initial_provenance_context["trajectory_sha256"]),
                 seed_frame_id=initial_seed_frame_ids[k],
-                seed_selection_origin="phase_a_polus",
+                seed_selection_origin=(
+                    initial_seed_selection_origins[k]
+                    if k < len(initial_seed_selection_origins)
+                    else "phase_a_polus"
+                ),
                 seed_variance_at_selection=None,
                 subspace_neighbour_frame_ids=[],
                 subspace_dimension=0,
@@ -783,14 +793,21 @@ def stage_ferebus_inputs(campaign_dir, config, training_version, is_initial=Fals
     if not pointdir_names:
         raise ValueError("committed training set contains no pointdirs: " + str(training_dir))
     pointdir_identities: Dict[str, str] = {}
+    forced_ferebus_splits: Dict[str, str] = {}
     try:
         from ..versioning.manifest import sha256_file
-        from ..versioning.provenance import PROVENANCE_FILENAME
+        from ..versioning.provenance import PROVENANCE_FILENAME, read_provenance
 
         for name, pointdir_path in zip(pointdir_names, pointdir_paths):
             sidecar = pointdir_path / PROVENANCE_FILENAME
             if sidecar.is_file():
                 pointdir_identities[name] = "provenance:" + sha256_file(sidecar)
+                provenance = read_provenance(pointdir_path)
+                if (
+                    str((provenance.get("seed") or {}).get("selection_origin"))
+                    == "bootstrap_anchor"
+                ):
+                    forced_ferebus_splits[name] = "train"
             else:
                 pointdir_identities[name] = "pointdir-tree:" + hash_pointdir_tree(pointdir_path)
     except Exception as exc:
@@ -833,6 +850,7 @@ def stage_ferebus_inputs(campaign_dir, config, training_version, is_initial=Fals
         train_internal_fractions=train_internal_fractions,
         external_validation_size=external_validation_size,
         pointdir_identity=pointdir_identities,
+        forced_splits=forced_ferebus_splits,
     )
     ledger_row_ids = dict(split_ledger["row_ids"])
     atom_labels = []
@@ -986,6 +1004,7 @@ def stage_ferebus_inputs(campaign_dir, config, training_version, is_initial=Fals
                 "path": str(split_ledger["path"]),
                 "counts": dict(split_ledger["counts"]),
                 "split_policy": dict(split_ledger.get("split_policy") or {}),
+                "forced_splits": dict(forced_ferebus_splits),
             },
             "tasks": tasks,
         },
