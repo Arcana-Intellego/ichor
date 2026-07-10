@@ -34,7 +34,7 @@ def test_state_roundtrip(tmp_path):
     s.iteration = 7
     s.phase = CampaignPhase.ARIADNE_ARRAY
     s.pending_jobs = {"ARIADNE_ARRAY": "12345", "FEREBUS": None}
-    s.training_set_version = 7
+    s.reference_data_version = 7
     s.last_acquisition_alpha0 = 0.832
     s.stop_streak = 2
     s.replacement_round = 3
@@ -155,7 +155,7 @@ def test_read_state_rejects_non_string_pending_job_value(tmp_path):
     [
         ("iteration", -1, "iteration"),
         ("max_iterations", 0, "max_iterations"),
-        ("training_set_version", -2, "training_set_version"),
+        ("reference_data_version", -2, "reference_data_version"),
         ("validation_set_version", -2, "validation_set_version"),
         ("models_version", -2, "models_version"),
         ("stop_streak", -1, "stop_streak"),
@@ -205,7 +205,7 @@ def test_state_is_terminal_flag():
 
 def test_schema_version_is_four():
     from ichor.hpc.active_learning.daemon.state import SCHEMA_VERSION
-    assert SCHEMA_VERSION == 4
+    assert SCHEMA_VERSION == 5
 
 
 def test_last_n_anti_overlap_flagged_default_and_roundtrip():

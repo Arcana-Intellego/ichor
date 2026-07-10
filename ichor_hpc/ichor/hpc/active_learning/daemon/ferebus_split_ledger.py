@@ -11,7 +11,7 @@ from .state import atomic_write_json
 
 FEREBUS_SPLIT_LEDGER_FILENAME = "ferebus_split_assignments.json"
 BOOTSTRAP_EXTERNAL_VALIDATION_FILENAME = "bootstrap_external_validation.json"
-FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION = 4
+FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION = 5
 _LOCK_FILENAME = "ferebus_split_assignments.lock"
 _SPLITS = ("train", "int_val", "ext_val")
 
@@ -47,7 +47,7 @@ def bootstrap_external_validation_path(campaign_dir: Path) -> Path:
 def _empty_payload() -> Dict[str, Any]:
     return {
         "schema_version": FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION,
-        "allocation_policy": "exact_per_training_version",
+        "allocation_policy": "exact_per_reference_data_version",
         "assignments": {},
         "version_allocations": {},
     }
@@ -64,10 +64,10 @@ def _load(path: Path) -> Dict[str, Any]:
         raise ValueError("FEREBUS split ledger must be a JSON object: " + str(path))
     if int(data.get("schema_version", -1)) != FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION:
         raise ValueError(
-            "unsupported FEREBUS split ledger schema; schema 4 is required: "
+            "unsupported FEREBUS split ledger schema; schema 5 is required: "
             + str(path)
         )
-    if str(data.get("allocation_policy")) != "exact_per_training_version":
+    if str(data.get("allocation_policy")) != "exact_per_reference_data_version":
         raise ValueError("FEREBUS split ledger allocation policy is invalid")
     if not isinstance(data.get("assignments"), dict):
         raise ValueError("FEREBUS split ledger assignments must be an object")
@@ -105,7 +105,8 @@ def ensure_split_assignments(
     campaign_dir: Path,
     pointdir_names: Sequence[str],
     *,
-    training_version: int,
+    reference_data_version: int,
+    reference_data_view_sha256: str,
     expected_new_counts: Mapping[str, int],
     pointdir_identity: Optional[Mapping[str, str]] = None,
     forced_splits: Optional[Mapping[str, str]] = None,
@@ -113,13 +114,32 @@ def ensure_split_assignments(
 ) -> Dict[str, Any]:
     """Assign only the new pointdirs for one version using exact split quotas."""
     campaign = Path(campaign_dir)
-    version = int(training_version)
+    version = int(reference_data_version)
     if version < 0:
-        raise ValueError("training_version must be >= 0")
+        raise ValueError("reference_data_version must be >= 0")
+    view_sha = str(reference_data_view_sha256 or "")
+    if len(view_sha) != 64 or any(character not in "0123456789abcdef" for character in view_sha):
+        raise ValueError("reference_data_view_sha256 must be a lowercase SHA-256")
     names = [str(name) for name in pointdir_names]
     if len(set(names)) != len(names):
         raise ValueError("duplicate pointdir names passed to FEREBUS split ledger")
     identities = {str(key): str(value) for key, value in (pointdir_identity or {}).items()}
+    missing_identities = sorted(set(names) - set(identities))
+    if missing_identities:
+        raise ValueError(
+            "FEREBUS pointdir identities are missing: "
+            + repr(missing_identities[:8])
+        )
+    for name, identity in identities.items():
+        if len(identity) != 64 or any(
+            character not in "0123456789abcdef" for character in identity
+        ):
+            raise ValueError("FEREBUS pointdir identity is not a SHA-256 for " + name)
+    allocation_sha = str(allocation_manifest_sha256 or "")
+    if len(allocation_sha) != 64 or any(
+        character not in "0123456789abcdef" for character in allocation_sha
+    ):
+        raise ValueError("allocation_manifest_sha256 must be a lowercase SHA-256")
     forced = {str(key): str(value) for key, value in (forced_splits or {}).items()}
     expected = _normalise_expected(expected_new_counts)
     if version > 0 and expected["ext_val"] != 0:
@@ -146,7 +166,7 @@ def ensure_split_assignments(
         unknown_existing = sorted(set(assignments) - set(names))
         if unknown_existing:
             raise ValueError(
-                "committed training set no longer contains ledger pointdirs: "
+                "committed reference-data view no longer contains ledger pointdirs: "
                 + repr(unknown_existing[:8])
             )
         for name in names:
@@ -170,14 +190,19 @@ def ensure_split_assignments(
                     "FEREBUS retry allocation counts changed for version " + str(version)
                 )
             recorded_hash = str(existing_version_record.get("allocation_manifest_sha256") or "")
-            if str(allocation_manifest_sha256 or "") != recorded_hash:
+            if allocation_sha != recorded_hash:
                 raise ValueError(
                     "FEREBUS retry allocation manifest hash changed for version "
                     + str(version)
                 )
+            if str(existing_version_record.get("reference_data_view_sha256") or "") != view_sha:
+                raise ValueError(
+                    "FEREBUS retry reference-data view hash changed for version "
+                    + str(version)
+                )
         elif len(new_names) != sum(expected.values()):
             raise ValueError(
-                "new pointdir count does not match exact allocation for training version "
+                "new pointdir count does not match exact allocation for reference-data version "
                 + str(version) + ": expected " + str(sum(expected.values()))
                 + ", found " + str(len(new_names))
             )
@@ -203,27 +228,28 @@ def ensure_split_assignments(
             )
 
         version_record = {
-            "training_version": version,
+            "reference_data_version": version,
+            "reference_data_view_sha256": view_sha,
             "expected_new_counts": dict(expected),
             "actual_new_counts": dict(actual_new),
             "pointdirs": list(new_names),
-            "allocation_manifest_sha256": str(allocation_manifest_sha256 or ""),
+            "allocation_manifest_sha256": allocation_sha,
         }
         if existing_version_record is not None and new_names and existing_version_record != version_record:
             raise ValueError("FEREBUS version allocation is immutable for version " + str(version))
         for name in new_names:
             assignments[name] = {
                 "split": forced[name],
-                "first_seen_training_version": version,
-                "assignment_version": 2,
-                "allocation_manifest_sha256": str(allocation_manifest_sha256 or ""),
+                "first_seen_reference_data_version": version,
+                "assignment_version": 3,
+                "allocation_manifest_sha256": allocation_sha,
                 "provenance_sha256": identities.get(name),
             }
         if existing_version_record is None:
             version_allocations[version_key] = version_record
         payload = {
             "schema_version": FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION,
-            "allocation_policy": "exact_per_training_version",
+            "allocation_policy": "exact_per_reference_data_version",
             "assignments": assignments,
             "version_allocations": version_allocations,
         }
@@ -255,7 +281,7 @@ def ensure_split_assignments(
         "row_ids": row_ids,
         "counts": _counts(assignments),
         "version_allocation": dict(version_allocations[str(version)]),
-        "allocation_policy": "exact_per_training_version",
+        "allocation_policy": "exact_per_reference_data_version",
     }
 
 

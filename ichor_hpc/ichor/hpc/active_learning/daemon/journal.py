@@ -56,7 +56,7 @@ __all__ = [
 #
 #  Later (provenance ledger) additions:
 #  subspace_built          -- per-iteration count of seeds whose subspace was built
-#  training_set_committed  -- {training_set_version, n_committed_points} after APPEND
+#  reference_data_committed  -- {reference_data_version, n_committed_points} after APPEND
 #  seed_selected           -- placeholder
 #  anti_overlap_flagged    -- placeholder
 #  reference_scales_computed -- placeholder
@@ -75,7 +75,7 @@ KNOWN_EVENT_TYPES = (
     "tick_error",
     "tick_exception_halted",
     "subspace_built",
-    "training_set_committed",
+    "reference_data_committed",
     "seed_selected",
     "anti_overlap_flagged",
     "reference_scales_computed",

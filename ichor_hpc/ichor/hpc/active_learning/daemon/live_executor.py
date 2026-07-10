@@ -332,7 +332,13 @@ def _write_ferebus_task_artefact_layout(
         manifest_path,
         {
             "schema_version": 1,
-            "training_version": manifest.get("training_version"),
+            "reference_data_version": manifest.get("reference_data_version"),
+            "reference_data_head_manifest_sha256": manifest.get(
+                "reference_data_head_manifest_sha256"
+            ),
+            "reference_data_view_sha256": manifest.get(
+                "reference_data_view_sha256"
+            ),
             "n_tasks": len(records),
             "tasks": records,
         },
@@ -1397,24 +1403,26 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         from ..submit.pyferebus_wrap import FerebusSubmissionError, submit_ferebus
 
         try:
-            tv = int(getattr(state, "training_set_version", 0))
+            tv = int(getattr(state, "reference_data_version", 0))
             is_initial = phase_name == "INITIAL_FEREBUS"
             state_updates: Dict[str, Any] = {}
             if not is_initial:
-                from ..versioning.training_set import TrainingSetVersioning
+                from ..versioning.reference_data import ReferenceDataVersioning
 
-                v_train = TrainingSetVersioning(Path(self.campaign_dir) / self.training_dir_name)
+                v_train = ReferenceDataVersioning(
+                    Path(self.campaign_dir) / self.reference_data_dir_name
+                )
                 committed = v_train.list_committed_versions()
                 committed_max = max(committed) if committed else -1
                 if committed_max > tv:
                     tv = committed_max
                     v_train.ensure_current(committed_max)
-                    state_updates["training_set_version"] = int(committed_max)
+                    state_updates["reference_data_version"] = int(committed_max)
                 elif committed_max < tv:
                     raise BackendSubmissionError(
-                        "state.training_set_version "
+                        "state.reference_data_version "
                         + str(tv)
-                        + " is ahead of committed training versions "
+                        + " is ahead of committed reference-data versions "
                         + repr(committed)
                     )
             staging, n_tasks = _stg.stage_ferebus_inputs(
@@ -1635,123 +1643,70 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         return super()._inline_seed_select(state)
 
     def _inline_append(self, state):
-        """Commit the exact accepted active allocation into the training set.
-
-        The completed pre-QM point-allocation manifest is authoritative.  Its
-        accepted attempts identify the validated Gaussian/AIMAll pointdirs in
-        ``.DATA/STAGING/iter_<N>`` and preserve each point's intended split.
-        Missing or incomplete allocation evidence is a halt-worthy contract
-        failure.
-
-        Re-commit is idempotent (a crash-retry after commit returns the
-        existing version). The committed points carry whatever provenance the
-        staging tree holds. FEREBUS projects the preserved allocation labels
-        consistently across every atom and property; it does not resplit the
-        committed geometries.
-        """
+        """Commit the exact accepted active allocation as one immutable delta."""
         from . import input_staging as _stg
 
-        v = self._versioning("training")
+        v = self._versioning("reference_data")
         committed = v.list_committed_versions()
-        state_version = int(getattr(state, "training_set_version", 0))
+        state_version = int(getattr(state, "reference_data_version", 0))
         committed_max = max(committed) if committed else -1
         if committed_max > state_version:
             if int(committed_max) != int(state_version) + 1:
                 raise BackendSubmissionError(
-                    "training_set_version_gap: state="
+                    "reference_data_version_gap: state="
                     + str(state_version)
                     + " committed_versions="
                     + repr(committed)
                 )
-            try:
-                _stg.verify_committed_allocation_snapshot(
-                    self.campaign_dir,
-                    training_version=int(committed_max),
-                    context="active",
-                    iteration=int(state.iteration),
-                )
-            except Exception as exc:
-                raise BackendSubmissionError(
-                    "idempotent APPEND allocation verification failed: "
-                    + type(exc).__name__
-                    + ": "
-                    + str(exc)
-                ) from exc
-            v.ensure_current(committed_max)
-            self._journal_event(
-                "training_set_committed",
-                iteration=int(state.iteration),
-                training_set_version=int(committed_max),
-                n_committed_points=0,
-                idempotent_skip=True,
-            )
-            return {"training_set_version": int(committed_max)}
-        if committed_max < state_version:
+            target_version = int(committed_max)
+        elif committed_max < state_version:
             raise BackendSubmissionError(
-                "training_set_version "
+                "reference_data_version "
                 + str(state_version)
-                + " is ahead of committed training versions "
+                + " is ahead of committed reference-data versions "
                 + repr(committed)
             )
-        if committed:
-            v.ensure_current(committed_max)
-
+        else:
+            target_version = int(committed_max) + 1
         try:
-            point_dirs, allocation = _stg.accepted_allocation_pointdirs(
+            view, committed_names, created = _stg.commit_reference_data_delta(
                 self.campaign_dir,
+                reference_data_version=target_version,
                 context="active",
                 iteration=int(state.iteration),
             )
         except Exception as exc:
             raise BackendSubmissionError(
-                "live APPEND requires a complete point allocation: "
-                + type(exc).__name__ + ": " + str(exc)
+                "live APPEND requires a complete point allocation and valid "
+                "reference-data transaction: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)
             ) from exc
-
-        next_version = committed_max + 1
-        v.recover_dangling_staging()
-        source = committed_max if committed_max >= 0 else None
-        staging = v.stage(source_version=source, target_version=next_version)
-
-        committed_names = []
-        next_point_index = _next_pointdir_index(staging)
-        for pd in point_dirs:
-            dest = staging / ("POINT_" + str(next_point_index).zfill(4) + ".pointdir")
-            while dest.exists():
-                next_point_index += 1
-                dest = staging / ("POINT_" + str(next_point_index).zfill(4) + ".pointdir")
-            _stg._copytree_no_symlinks(pd, dest)
-            committed_names.append(dest.name)
-            next_point_index += 1
-        atomic_write_json(staging / "POINT_ALLOCATION.json", allocation)
-        atomic_write_json(
-            staging
-            / ("POINT_ALLOCATION.version-" + str(next_version).zfill(4) + ".json"),
-            allocation,
-        )
-
-        v.commit(next_version)
-        v.update_current(next_version)
         ensure_index(self.campaign_dir)
-        committed_iter_dir = v.iteration_path(next_version)
+        committed_iter_dir = v.iteration_path(target_version)
         for pdir_name in committed_names:
             pdir = committed_iter_dir / pdir_name
             seed_frame_id = self._read_seed_frame_id_from_pointdir(pdir)
             append_to_index(
                 self.campaign_dir,
-                iteration=int(next_version),
+                iteration=int(target_version),
                 pointdir_name=pdir_name,
                 seed_frame_id=seed_frame_id,
             )
         self._journal_event(
-            "training_set_committed",
+            "reference_data_committed",
             iteration=int(state.iteration),
-            training_set_version=int(next_version),
-            n_committed_points=len(committed_names),
+            reference_data_version=int(target_version),
+            n_committed_points=len(committed_names) if created else 0,
+            cumulative_point_count=int(len(view.entries)),
+            head_manifest_sha256=str(view.head_manifest_sha256),
+            cumulative_view_sha256=str(view.cumulative_view_sha256),
             expected_batch_total=int(self.config.point_allocation.batch_total_size),
             source="live_quantum_staging",
+            idempotent_skip=not bool(created),
         )
-        return {"training_set_version": int(next_version)}
+        return {"reference_data_version": int(target_version)}
 
     def submit_or_run(self, state, phase) -> PhaseResult:
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
@@ -2083,7 +2038,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
           - records the combined Gaussian/AIMAll outcome in the exact point
             allocation after AIMAll.
 
-        Does NOT commit anything to 5_TRAINING / 6_TRAINED_MODELS itself --
+        Does NOT commit anything to QM_REFERENCE_DATA / 6_TRAINED_MODELS itself --
         that lives in the subsequent INITIAL_FEREBUS / APPEND / FEREBUS
         phases. Rejection counts are allocation-managed: failed slots proceed
         to bounded reserve replacement instead of tripping a batch-level
@@ -2366,7 +2321,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         FEREBUS writes a .model file (single artefact per training run)
         to this canonical location; the parser validates and atomically
         renames it into 6_TRAINED_MODELS/iteration-NNNN/ via the
-        TrainingSetVersioning helper.
+        VersionedDirectory helper.
         """
         from pathlib import Path as _Path
         return (
@@ -2596,11 +2551,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
     def _parse_ferebus_postprocess(self, state, phase, observations):
         """Parse FEREBUS output, validate the .model file, commit
-        a new 6_TRAINED_MODELS/iteration-NNNN/ via TrainingSetVersioning.
+        a new 6_TRAINED_MODELS/iteration-NNNN/ via VersionedDirectory.
 
-        For INITIAL_FEREBUS this is iteration 0 of both 5_TRAINING and
+        For INITIAL_FEREBUS this is iteration 0 of both QM_REFERENCE_DATA and
         6_TRAINED_MODELS (the initial-quantum stage already produced the
-        pointdirs that go into 5_TRAINING/iteration-0). For FEREBUS this
+        pointdirs that go into QM_REFERENCE_DATA/iteration-0). For FEREBUS this
         is a per iteration commit of 6_TRAINED_MODELS only.
 
         """
@@ -2615,13 +2570,13 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         if is_initial:
             expected_next = 0
         else:
-            expected_next = int(getattr(state, "training_set_version", -1))
+            expected_next = int(getattr(state, "reference_data_version", -1))
             if expected_next < 0:
                 return PhaseResult(
                     is_complete=True,
                     failure_reason=(
-                        "ferebus_training_version_invalid: "
-                        + repr(getattr(state, "training_set_version", None))
+                        "ferebus_reference_data_version_invalid: "
+                        + repr(getattr(state, "reference_data_version", None))
                     ),
                 )
         if expected_next in committed:
@@ -2655,8 +2610,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             state_updates = {"models_version": int(next_version), "validation_set_version": int(next_version)}
             if is_initial:
                 from . import input_staging as _stg
-                _stg.commit_initial_training_set(self.campaign_dir)
-                state_updates["training_set_version"] = 0
+                _stg.commit_initial_reference_data(self.campaign_dir)
+                state_updates["reference_data_version"] = 0
             return PhaseResult(is_complete=True, state_updates=state_updates)
 
         ok, reason = validate_ferebus_completed(staging)
@@ -2863,13 +2818,13 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
         state_updates = {"models_version": int(next_version), "validation_set_version": int(next_version)}
         if is_initial:
-            # iteration-0 of the training set is normally built at INITIAL_FEREBUS staging now
+            # iteration-0 of the QM reference data is normally built at INITIAL_FEREBUS staging now
             # (so the feature export has something to read). call the same helper here too -- it
             # no-ops if staging already did it, and still covers the mock/dry path that never hits
             # the live stager. only THEN advance the version; staging deliberately leaves that to
             # us so a crash between staging and here reconciles cleanly.
-            _stg.commit_initial_training_set(self.campaign_dir)
-            state_updates["training_set_version"] = 0
+            _stg.commit_initial_reference_data(self.campaign_dir)
+            state_updates["reference_data_version"] = 0
 
         self._journal_event(
             "models_committed",

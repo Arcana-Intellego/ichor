@@ -44,7 +44,7 @@ __all__ = [
 ]
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DEFAULT_STATE_FILENAME = "state.json"
 
 
@@ -145,7 +145,7 @@ class CampaignState:
     max_iterations: int = 50
     phase: CampaignPhase = CampaignPhase.INIT
     pending_jobs: Dict[str, Optional[str]] = field(default_factory=dict)
-    training_set_version: int = 0
+    reference_data_version: int = 0
     validation_set_version: int = 0
     models_version: int = 0
     replacement_round: int = 0
@@ -199,7 +199,7 @@ class CampaignState:
 
         required_str = ("campaign_uid", "campaign_started_iso")
         required_int = ("iteration", "max_iterations",
-                         "training_set_version", "validation_set_version",
+                         "reference_data_version", "validation_set_version",
                          "models_version", "replacement_round", "stop_streak")
         for key in required_str:
             if not isinstance(payload.get(key), str) or not payload[key]:
@@ -209,7 +209,7 @@ class CampaignState:
                 raise StateSchemaError("missing or non-int field: " + key)
         iteration = int(payload["iteration"])
         max_iterations = int(payload["max_iterations"])
-        training_set_version = int(payload["training_set_version"])
+        reference_data_version = int(payload["reference_data_version"])
         validation_set_version = int(payload["validation_set_version"])
         models_version = int(payload["models_version"])
         replacement_round = int(payload["replacement_round"])
@@ -218,8 +218,8 @@ class CampaignState:
             raise StateSchemaError("iteration must be >= 0")
         if max_iterations < 1:
             raise StateSchemaError("max_iterations must be >= 1")
-        if training_set_version < -1:
-            raise StateSchemaError("training_set_version must be >= -1")
+        if reference_data_version < -1:
+            raise StateSchemaError("reference_data_version must be >= -1")
         if validation_set_version < -1:
             raise StateSchemaError("validation_set_version must be >= -1")
         if models_version < -1:
@@ -284,7 +284,7 @@ class CampaignState:
             max_iterations=max_iterations,
             phase=phase,
             pending_jobs=dict(pending),
-            training_set_version=training_set_version,
+            reference_data_version=reference_data_version,
             validation_set_version=validation_set_version,
             models_version=models_version,
             replacement_round=replacement_round,

@@ -415,7 +415,7 @@ When the daemon stops normally (state.phase == DONE), check:
 - `iteration: 0` -- ICHOR iteration numbers are zero-indexed, so a
   `max_iterations: 1` campaign exits with `iteration: 0`. A two-
   iteration run would exit with `iteration: 1`, etc.
-- `training_set_version: 1` (INITIAL + 1 iteration of APPEND)
+- `reference_data_version: 1` (INITIAL + 1 iteration of APPEND)
 - `models_version: 1` (INITIAL_FEREBUS + 1 iteration of FEREBUS)
 - `reference_scales` populated with five real-float keys (energy, force,
   omega, anh, anh_std)
@@ -468,7 +468,7 @@ For a clean re-run (wipes all on-disk state, keeps the trajectory pool):
 
 ```
 rm -rf .DATA/ACTIVE_LEARNING
-rm -rf 3_DIVERSITY_SAMPLING 5_TRAINING 6_TRAINED_MODELS 7_ACTIVE_LEARNING
+rm -rf 3_DIVERSITY_SAMPLING QM_REFERENCE_DATA 6_TRAINED_MODELS 7_ACTIVE_LEARNING
 # the trajectory pool at .DATA/TRAJECTORY/ is preserved
 ichor-al-daemon start --live --campaign-dir . --max-ticks 2000
 ```

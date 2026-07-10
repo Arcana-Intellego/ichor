@@ -207,34 +207,29 @@ def _phase_b_target_size(config, n_candidates, iteration=0):
     return target
 
 
-def _load_committed_training_set(campaign_dir):
-    """Read the currently-committed training set as a list of ICHOR
-    Atoms objects, one per committed pointdir.
+def _load_committed_reference_data(campaign_dir):
+    """Read the authoritative cumulative QM reference-data view.
 
     Returns an empty list when nothing has been committed yet, so the
     anti-overlap filter is a clean no-op against a fresh campaign.
     """
-    from ..versioning.training_set import TrainingSetVersioning
+    from ..versioning.reference_data import ReferenceDataVersioning
     from ichor.core.files import PointDirectory
-    v = TrainingSetVersioning(Path(campaign_dir) / "5_TRAINING")
+    v = ReferenceDataVersioning(Path(campaign_dir) / "QM_REFERENCE_DATA")
     cur = v.current_version()
     if cur is None:
         return []
-    iter_dir = v.iteration_path(int(cur))
-    if not iter_dir.is_dir():
-        return []
-    v.verify_committed_training_inputs(int(cur))
+    view = v.resolve(int(cur), verification="metadata")
     atoms_list = []
-    for child in sorted(iter_dir.iterdir()):
-        if not (child.is_dir() and PointDirectory.check_path(child)):
-            continue
+    for entry in view.entries:
         try:
-            pd = PointDirectory(child)
+            pd = PointDirectory(entry.pointdir_path)
             atoms_list.append(pd.atoms)
-        except Exception:
-            # corrupt or partially-written pointdir; skip rather than
-            # block the whole phase.
-            continue
+        except Exception as exc:
+            raise ValueError(
+                "committed QM reference point cannot be parsed: "
+                + str(entry.pointdir_path)
+            ) from exc
     return atoms_list
 
 
@@ -339,7 +334,7 @@ def _phase_b_json_safe(value):
     """Return a JSON-safe copy of Phase B diagnostics.
 
     Anti-overlap diagnostics can legitimately contain infinite nearest
-    distances when no committed training set exists. The manifest writer uses
+    distances when no committed QM reference data exists. The manifest writer uses
     strict JSON, so non-finite diagnostic values are represented as null at the
     serialisation boundary.
     """
@@ -729,7 +724,7 @@ def _run_phase_a(campaign, config):
 def _run_phase_b(args, campaign, config):
     """POLUS Phase-B: pick a diverse subsample from the adversarial
     pool ARIADNE just produced, then run the optional anti-overlap
-    pass against the committed training set.
+    pass against the committed QM reference data.
 
     Two outputs always written:
       phase_b_SAMPLE_raw.xyz  -- the raw FPS selection (whatever POLUS picked).
@@ -892,10 +887,10 @@ def _run_phase_b(args, campaign, config):
     final_path = iter_dir / "phase_b_SAMPLE.xyz"
     dedup_path = iter_dir / "phase_b_dedup.json"
     try:
-        training = _load_committed_training_set(campaign) if min_sep > 0.0 else []
+        training = _load_committed_reference_data(campaign) if min_sep > 0.0 else []
     except Exception as exc:
         print(
-            "committed training set invalid for Phase B anti-overlap: "
+            "committed QM reference data invalid for Phase B anti-overlap: "
             + type(exc).__name__
             + ": "
             + str(exc),

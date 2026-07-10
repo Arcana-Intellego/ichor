@@ -412,13 +412,13 @@ def _sidecar_provenance(campaign_dir: Path, iter_dir: Path, iteration: int) -> D
     seed_path = iter_dir / "seeds_picked.json"
     seed_payload = _load_seed_payload(iter_dir)
     state_path = campaign_dir / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
-    training_version = None
+    reference_data_version = None
     models_version = None
     state_available = False
     if state_path.is_file():
         try:
             state = read_state(state_path)
-            training_version = int(getattr(state, "training_set_version", -1))
+            reference_data_version = int(getattr(state, "reference_data_version", -1))
             models_version = int(getattr(state, "models_version", -1))
             state_available = True
         except Exception:
@@ -431,7 +431,7 @@ def _sidecar_provenance(campaign_dir: Path, iter_dir: Path, iteration: int) -> D
             str(seed_path.resolve()) if seed_path.is_file() else None
         ),
         "seed_selection_sha256": _sha256_file(seed_path),
-        "training_set_version": training_version,
+        "reference_data_version": reference_data_version,
         "models_version": models_version,
         "state_available": bool(state_available),
     }

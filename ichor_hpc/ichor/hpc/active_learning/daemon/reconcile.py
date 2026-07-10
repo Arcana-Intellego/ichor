@@ -4,7 +4,7 @@ The daemon's design treats 'state.json' as the only authoritative checkpoint.
 If it goes missing or fails schema validation, the daemon refuses to auto-
 recover; a silent reconstruction is exactly the bug class we want to avoid.
 
-"reconcile" inspects the on-disk artefacts that DO exist (5_TRAINING/
+"reconcile" inspects the on-disk artefacts that DO exist (QM_REFERENCE_DATA/
 committed iterations, 6_TRAINED_MODELS/, journal entries) and proposes a
 "CampaignState" it believes is consistent with them. The proposal is
 written to "<state_path>.proposed" and the operator must explicitly
@@ -19,10 +19,10 @@ import shutil
 from typing import Any, Dict, List, Optional, Union
 
 from ..acquisition.trajectory_pool import TrajectoryPool
-from ..versioning.training_set import TrainingSetVersioning
+from ..versioning.versioned_directory import VersionedDirectory
 from .artifact_contracts import (
     verify_committed_model_version,
-    verify_committed_training_version,
+    verify_committed_reference_data_version,
     verify_state_referenced_artifacts,
 )
 from .journal import iter_events
@@ -190,7 +190,7 @@ def stateful_campaign_artifacts(campaign_dir: Union[str, Path]) -> List[str]:
         for path in sorted(campaign.glob(pattern)):
             findings.append(str(path.relative_to(campaign)))
 
-    add_matches("5_TRAINING/iteration-*")
+    add_matches("QM_REFERENCE_DATA/iteration-*")
     add_matches("6_TRAINED_MODELS/iteration-*")
     add_matches("7_ACTIVE_LEARNING/iteration-*")
     add_matches("3_DIVERSITY_SAMPLING/initial/PHASE_A_SAMPLE.json")
@@ -241,9 +241,9 @@ class ReconciliationReport:
     """Diagnostic bundle returned by :func: propose_recovery."""
 
     proposed_state: CampaignState
-    committed_training_versions: List[int] = field(default_factory=list)
+    committed_reference_data_versions: List[int] = field(default_factory=list)
     committed_model_versions: List[int] = field(default_factory=list)
-    valid_training_versions: List[int] = field(default_factory=list)
+    valid_reference_data_versions: List[int] = field(default_factory=list)
     valid_model_versions: List[int] = field(default_factory=list)
     last_phase_in_journal: Optional[str] = None
     last_iteration_in_journal: Optional[int] = None
@@ -301,26 +301,26 @@ def _append_recovery_candidate(
 def _needs_trajectory_pool_check(
     *,
     existing_loaded: bool,
-    training_versions: List[int],
+    reference_data_versions: List[int],
     model_versions: List[int],
     active_intents: List[Dict[str, Any]],
     last_phase: Optional[str],
     staging_children: List[Path],
     script_files: List[Path],
-    dangling_training: List[Path],
+    dangling_reference_data: List[Path],
     dangling_models: List[Path],
     has_model_iteration_staging: bool,
 ) -> bool:
     return any(
         (
             existing_loaded,
-            bool(training_versions),
+            bool(reference_data_versions),
             bool(model_versions),
             bool(active_intents),
             bool(last_phase),
             bool(staging_children),
             bool(script_files),
-            bool(dangling_training),
+            bool(dangling_reference_data),
             bool(dangling_models),
             bool(has_model_iteration_staging),
         )
@@ -603,18 +603,18 @@ def _validate_recovered_state_contract(
     phase = CampaignPhase(state.phase)
     if phase in {CampaignPhase.INIT, CampaignPhase.DONE, CampaignPhase.HALTED}:
         return
-    training_version = int(getattr(state, "training_set_version", -1))
+    reference_data_version = int(getattr(state, "reference_data_version", -1))
     model_version = int(getattr(state, "models_version", -1))
     if (
         phase is CampaignPhase.INITIAL_GAUSSIAN
-        and training_version < 0
+        and reference_data_version < 0
         and model_version < 0
     ):
         if isinstance(phase_a_handoff, dict):
             return
     if (
         phase is CampaignPhase.INITIAL_AIMALL
-        and training_version < 0
+        and reference_data_version < 0
         and model_version < 0
         and isinstance(bootstrap_handoff, dict)
         and bootstrap_handoff.get("phase")
@@ -625,7 +625,7 @@ def _validate_recovered_state_contract(
         return
     if (
         phase is CampaignPhase.INITIAL_FEREBUS
-        and training_version < 0
+        and reference_data_version < 0
         and model_version < 0
     ):
         if (
@@ -646,7 +646,7 @@ def _validate_recovered_state_contract(
 def propose_recovery(
     campaign_dir: Union[str, Path],
     *,
-    training_dir_name: str = "5_TRAINING",
+    reference_data_dir_name: str = "QM_REFERENCE_DATA",
     models_dir_name: str = "6_TRAINED_MODELS",
     data_subdir: Union[str, Path] = Path(".DATA") / "ACTIVE_LEARNING",
     iteration_prefix: str = "iteration",
@@ -660,7 +660,7 @@ def propose_recovery(
     next run re-submits rather than blindly polls unknown JobIDs.
 
     Heuristics:
-        - committed training versions in "5_TRAINING/" define the maximum
+        - committed reference-data versions in "QM_REFERENCE_DATA/" define the maximum
           completed iteration; the next iteration to plan from is one past
           that.
         - committed model versions in "6_TRAINED_MODELS/" likewise.
@@ -669,7 +669,10 @@ def propose_recovery(
           "campaign_uid", and "campaign_started_iso" are preserved so the
           recovery does not destroy provenance.
     """
+    from ..layout import reject_legacy_training_layout
+
     campaign = Path(campaign_dir)
+    reject_legacy_training_layout(campaign)
     data = campaign / data_subdir
     state_path = data / DEFAULT_STATE_FILENAME
 
@@ -711,17 +714,17 @@ def propose_recovery(
     else:
         notes.append("no existing state.json")
 
-    #committed training versions
-    training_dir = campaign / training_dir_name
+    #committed reference-data versions
+    training_dir = campaign / reference_data_dir_name
     if training_dir.is_dir():
-        tv = TrainingSetVersioning(training_dir, prefix=iteration_prefix).list_committed_versions()
+        tv = VersionedDirectory(training_dir, prefix=iteration_prefix).list_committed_versions()
     else:
         tv = []
-        notes.append("training dir " + training_dir_name + " missing")
+        notes.append("training dir " + reference_data_dir_name + " missing")
     #committed model versions
     models_dir = campaign / models_dir_name
     if models_dir.is_dir():
-        mv = TrainingSetVersioning(models_dir, prefix=iteration_prefix).list_committed_versions()
+        mv = VersionedDirectory(models_dir, prefix=iteration_prefix).list_committed_versions()
     else:
         mv = []
         notes.append("models dir " + models_dir_name + " missing")
@@ -804,12 +807,12 @@ def propose_recovery(
         p for p in (scripts_root.glob("*.sh") if scripts_root.is_dir() else [])
         if p.is_file()
     ]
-    dangling_training = (
-        TrainingSetVersioning(training_dir, prefix=iteration_prefix).list_dangling_staging()
+    dangling_reference_data = (
+        VersionedDirectory(training_dir, prefix=iteration_prefix).list_dangling_staging()
         if training_dir.is_dir() else []
     )
     dangling_models = (
-        TrainingSetVersioning(models_dir, prefix=iteration_prefix).list_dangling_staging()
+        VersionedDirectory(models_dir, prefix=iteration_prefix).list_dangling_staging()
         if models_dir.is_dir() else []
     )
     model_iteration_staging = models_dir / "iteration-staging"
@@ -862,33 +865,33 @@ def propose_recovery(
     if script_files:
         unsafe_reasons.append(".DATA/SCRIPTS contains sbatch scripts")
         trusted_artifacts.append(".DATA/SCRIPTS can be archived by reconcile --apply")
-    if dangling_training:
-        unsafe_reasons.append("dangling training staging directories exist")
-        blocking_artifacts.append("dangling training staging")
+    if dangling_reference_data:
+        unsafe_reasons.append("dangling reference-data staging directories exist")
+        blocking_artifacts.append("dangling reference-data staging")
     if dangling_models or has_model_iteration_staging:
         unsafe_reasons.append("dangling model staging directories exist")
         blocking_artifacts.append("dangling model staging")
 
-    valid_training_versions: List[int] = []
+    valid_reference_data_versions: List[int] = []
     for version in tv:
         try:
-            verify_committed_training_version(
+            verify_committed_reference_data_version(
                 campaign,
                 int(version),
-                training_dir_name=training_dir_name,
+                reference_data_dir_name=reference_data_dir_name,
             )
-            valid_training_versions.append(int(version))
-            trusted_artifacts.append("training version " + str(version))
+            valid_reference_data_versions.append(int(version))
+            trusted_artifacts.append("reference-data version " + str(version))
         except Exception as exc:
             unsafe_reasons.append(
-                "committed training version "
+                "committed reference-data version "
                 + str(version)
                 + " manifest invalid: "
                 + type(exc).__name__
                 + ": "
                 + str(exc)[:160]
             )
-            blocking_artifacts.append("training version " + str(version))
+            blocking_artifacts.append("reference-data version " + str(version))
     valid_model_versions: List[int] = []
     for version in mv:
         try:
@@ -909,9 +912,9 @@ def propose_recovery(
                 + str(exc)[:160]
             )
             blocking_artifacts.append("model version " + str(version))
-    if tv != valid_training_versions:
+    if tv != valid_reference_data_versions:
         notes.append(
-            "valid training versions differ from discovered committed versions"
+            "valid reference-data versions differ from discovered committed versions"
         )
     if mv != valid_model_versions:
         notes.append(
@@ -920,7 +923,7 @@ def propose_recovery(
 
     if _needs_trajectory_pool_check(
         existing_loaded=existing_loaded,
-        training_versions=tv,
+        reference_data_versions=tv,
         model_versions=mv,
         active_intents=active_intents,
         last_phase=last_phase or (
@@ -934,7 +937,7 @@ def propose_recovery(
         ),
         staging_children=staging_children,
         script_files=script_files,
-        dangling_training=dangling_training,
+        dangling_reference_data=dangling_reference_data,
         dangling_models=dangling_models,
         has_model_iteration_staging=has_model_iteration_staging,
     ):
@@ -961,7 +964,7 @@ def propose_recovery(
             max_iterations=existing.max_iterations,
             phase=existing.phase,
             pending_jobs={},
-            training_set_version=existing.training_set_version,
+            reference_data_version=existing.reference_data_version,
             validation_set_version=existing.validation_set_version,
             models_version=existing.models_version,
             last_acquisition_alpha0=existing.last_acquisition_alpha0,
@@ -987,10 +990,10 @@ def propose_recovery(
             if salvaged_started:
                 recovered.campaign_started_iso = str(salvaged_started)
 
-    coherent_pairs = sorted(set(valid_training_versions).intersection(valid_model_versions))
-    latest_training_only = max(valid_training_versions) if valid_training_versions else None
+    coherent_pairs = sorted(set(valid_reference_data_versions).intersection(valid_model_versions))
+    latest_reference_data_only = max(valid_reference_data_versions) if valid_reference_data_versions else None
     latest_model_only = max(valid_model_versions) if valid_model_versions else None
-    training_model_skew_reentry = False
+    reference_data_model_skew_reentry = False
     no_coherent_pair = False
     initial_handoff_error: Optional[str] = None
     initial_handoff_valid = False
@@ -1033,28 +1036,28 @@ def propose_recovery(
     if coherent_pairs:
         coherent = int(coherent_pairs[-1])
         if (
-            latest_training_only is not None
+            latest_reference_data_only is not None
             and latest_model_only is not None
-            and int(latest_training_only) == coherent + 1
+            and int(latest_reference_data_only) == coherent + 1
             and int(latest_model_only) == coherent
         ):
-            training_model_skew_reentry = True
-        target_training = int(latest_training_only) if training_model_skew_reentry else coherent
-        target_model = int(latest_model_only) if training_model_skew_reentry else coherent
-        if recovered.training_set_version != target_training:
+            reference_data_model_skew_reentry = True
+        target_reference_data = int(latest_reference_data_only) if reference_data_model_skew_reentry else coherent
+        target_model = int(latest_model_only) if reference_data_model_skew_reentry else coherent
+        if recovered.reference_data_version != target_reference_data:
             notes.append(
-                "training_set_version set to recovered committed version "
-                + str(target_training)
+                "reference_data_version set to recovered committed version "
+                + str(target_reference_data)
             )
         if recovered.models_version != target_model:
             notes.append(
                 "models_version set to recovered committed version "
                 + str(target_model)
             )
-        recovered.training_set_version = target_training
+        recovered.reference_data_version = target_reference_data
         recovered.models_version = target_model
         if not existing_loaded:
-            target_iteration = max(0, int(target_training) - 1)
+            target_iteration = max(0, int(target_reference_data) - 1)
             try:
                 current_iteration = int(recovered.iteration)
             except Exception:
@@ -1065,55 +1068,55 @@ def propose_recovery(
                     + str(target_iteration)
                 )
                 recovered.iteration = int(target_iteration)
-        if training_model_skew_reentry:
+        if reference_data_model_skew_reentry:
             notes.append(
-                "valid committed training version "
-                + str(target_training)
+                "valid committed reference-data version "
+                + str(target_reference_data)
                 + " is one ahead of committed model version "
                 + str(target_model)
                 + "; re-entry can train FEREBUS"
             )
         if (
-            latest_training_only is not None
-            and latest_training_only > coherent
-            and not training_model_skew_reentry
+            latest_reference_data_only is not None
+            and latest_reference_data_only > coherent
+            and not reference_data_model_skew_reentry
         ):
             unsafe_reasons.append(
-                "newer committed training version has no matching model: "
-                + str(latest_training_only)
+                "newer committed reference-data version has no matching model: "
+                + str(latest_reference_data_only)
             )
         if (
             latest_model_only is not None
             and latest_model_only > coherent
-            and not training_model_skew_reentry
+            and not reference_data_model_skew_reentry
         ):
             unsafe_reasons.append(
-                "newer committed model version has no matching training set: "
+                "newer committed model version has no matching QM reference data: "
                 + str(latest_model_only)
             )
-    elif valid_training_versions and not valid_model_versions:
-        recovered.training_set_version = int(latest_training_only)
+    elif valid_reference_data_versions and not valid_model_versions:
+        recovered.reference_data_version = int(latest_reference_data_only)
         recovered.models_version = -1
         notes.append(
             "valid training exists without any valid model; re-entry must train FEREBUS"
         )
-    elif valid_training_versions or valid_model_versions:
+    elif valid_reference_data_versions or valid_model_versions:
         no_coherent_pair = True
         unsafe_reasons.append(
-            "no coherent committed training/model version pair exists "
-            + "(training="
-            + repr(valid_training_versions)
+            "no coherent committed reference-data/model version pair exists "
+            + "(reference_data="
+            + repr(valid_reference_data_versions)
             + ", models="
             + repr(valid_model_versions)
             + ")"
         )
     else:
-        if recovered.training_set_version != -1 or recovered.models_version != -1:
+        if recovered.reference_data_version != -1 or recovered.models_version != -1:
             notes.append(
                 "stale state version pointers reset because no committed "
                 "training or model versions were verified"
             )
-        recovered.training_set_version = -1
+        recovered.reference_data_version = -1
         recovered.models_version = -1
 
     try:
@@ -1294,7 +1297,7 @@ def propose_recovery(
             phase_recovery = select_recovery_phase(
                 campaign,
                 recovered,
-                valid_training_versions=valid_training_versions,
+                valid_reference_data_versions=valid_reference_data_versions,
                 valid_model_versions=valid_model_versions,
                 existing_loaded=existing_loaded,
                 last_phase=last_phase,
@@ -1341,8 +1344,8 @@ def propose_recovery(
         notes.append("phase-aware recovery selected " + recovered.phase.value)
         if phase_recovery.trusted_artifact:
             trusted_artifacts.append(str(phase_recovery.trusted_artifact))
-        if not valid_training_versions and not valid_model_versions:
-            recovered.training_set_version = -1
+        if not valid_reference_data_versions and not valid_model_versions:
+            recovered.reference_data_version = -1
             recovered.validation_set_version = -1
             recovered.models_version = -1
     elif not tv and not mv and initial_handoff_indicated and initial_handoff_valid and not unsafe_reasons:
@@ -1361,14 +1364,14 @@ def propose_recovery(
             recovered.phase = CampaignPhase.INITIAL_FEREBUS
             decision = "INITIAL_FEREBUS: valid initial AIMAll handoff exists without committed models"
             notes.append(
-                "re-entry at INITIAL_FEREBUS to commit initial training/model version 0"
+                "re-entry at INITIAL_FEREBUS to commit initial reference-data/model version 0"
             )
-        recovered.training_set_version = -1
+        recovered.reference_data_version = -1
         recovered.validation_set_version = -1
         recovered.models_version = -1
     elif not tv and not mv and initial_handoff_indicated:
         recovered.phase = CampaignPhase.HALTED
-        recovered.training_set_version = -1
+        recovered.reference_data_version = -1
         recovered.validation_set_version = -1
         recovered.models_version = -1
         if initial_handoff_valid:
@@ -1379,7 +1382,7 @@ def propose_recovery(
         else:
             decision = "HALTED: INITIAL_AIMALL completed but initial FEREBUS handoff is missing"
             notes.append(
-                "re-entry HALTED because no committed training/model versions or valid initial AIMAll handoff exist"
+                "re-entry HALTED because no committed reference-data/model versions or valid initial AIMAll handoff exist"
             )
         if initial_handoff_error:
             unsafe_reasons.append(
@@ -1395,7 +1398,7 @@ def propose_recovery(
         and not unsafe_reasons
     ):
         recovered.phase = CampaignPhase.INITIAL_GAUSSIAN
-        recovered.training_set_version = -1
+        recovered.reference_data_version = -1
         recovered.validation_set_version = -1
         recovered.models_version = -1
         decision = "INITIAL_GAUSSIAN: valid Phase A sample exists without committed models"
@@ -1406,31 +1409,31 @@ def propose_recovery(
         notes.append("no committed iterations; re-entry at INIT")
     elif not tv and not mv:
         recovered.phase = CampaignPhase.HALTED
-        recovered.training_set_version = -1
+        recovered.reference_data_version = -1
         recovered.validation_set_version = -1
         recovered.models_version = -1
         decision = "HALTED: existing state has no committed versions or recoverable initial handoff"
         notes.append(
-            "re-entry HALTED because existing state has no committed training/model versions"
+            "re-entry HALTED because existing state has no committed reference-data/model versions"
         )
     elif no_coherent_pair:
         recovered.phase = CampaignPhase.HALTED
-        decision = "HALTED: no coherent committed training/model pair"
-        notes.append("re-entry HALTED because no coherent training/model pair exists")
-    elif valid_training_versions and mv and not valid_model_versions:
+        decision = "HALTED: no coherent committed reference-data/model pair"
+        notes.append("re-entry HALTED because no coherent reference-data/model pair exists")
+    elif valid_reference_data_versions and mv and not valid_model_versions:
         recovered.phase = CampaignPhase.HALTED
         decision = "HALTED: committed model artefacts are present but invalid"
         notes.append(
             "re-entry HALTED because committed model artefacts failed validation"
         )
-    elif valid_training_versions and not valid_model_versions:
-        recovered.phase = CampaignPhase.INITIAL_FEREBUS if recovered.training_set_version == 0 else CampaignPhase.FEREBUS
+    elif valid_reference_data_versions and not valid_model_versions:
+        recovered.phase = CampaignPhase.INITIAL_FEREBUS if recovered.reference_data_version == 0 else CampaignPhase.FEREBUS
         decision = recovered.phase.value + ": valid training exists without a committed model"
         notes.append(
             "re-entry at "
             + recovered.phase.value
             + " to produce model version "
-            + str(recovered.training_set_version)
+            + str(recovered.reference_data_version)
         )
     elif coherent_pairs and unsafe_reasons:
         recovered.phase = CampaignPhase.HALTED
@@ -1438,12 +1441,12 @@ def propose_recovery(
         notes.append(
             "re-entry HALTED because committed artefacts need operator review"
         )
-    elif training_model_skew_reentry:
+    elif reference_data_model_skew_reentry:
         recovered.phase = CampaignPhase.FEREBUS
         decision = "FEREBUS: committed training is one version ahead of committed models"
         notes.append(
             "re-entry at FEREBUS to produce model version "
-            + str(recovered.training_set_version)
+            + str(recovered.reference_data_version)
         )
     elif unsafe_reasons:
         recovered.phase = CampaignPhase.HALTED
@@ -1453,7 +1456,7 @@ def propose_recovery(
         )
     else:
         recovered.phase = CampaignPhase.STOP_CHECK
-        decision = "STOP_CHECK: latest coherent committed training/model pair is trusted"
+        decision = "STOP_CHECK: latest coherent committed reference-data/model pair is trusted"
         notes.append("re-entry at STOP_CHECK (next tick decides loop/terminate)")
     recovered.pending_jobs = {}
     recovered.shutdown_requested = False
@@ -1482,9 +1485,9 @@ def propose_recovery(
 
     return ReconciliationReport(
         proposed_state=recovered,
-        committed_training_versions=tv,
+        committed_reference_data_versions=tv,
         committed_model_versions=mv,
-        valid_training_versions=valid_training_versions,
+        valid_reference_data_versions=valid_reference_data_versions,
         valid_model_versions=valid_model_versions,
         last_phase_in_journal=last_phase,
         last_iteration_in_journal=last_iter,

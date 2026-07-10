@@ -76,7 +76,7 @@ Three execution modes, selected by a single CLI flag:
      - Required backends
    * - :code:`--dry-run`
      - DryRunPhaseExecutor: stubs every external call but writes real
-       on-disk artefacts (scripts, training-set versions, manifests,
+       on-disk artefacts (scripts, reference-data delta versions, manifests,
        journal events, provenance sidecars). The dry-run sacct poller
        returns synthetic COMPLETED observations for every job.
      - None. Works fully off-cluster.
@@ -273,6 +273,33 @@ which prints structured backend/profile diagnostics and exits with code 12 if
 anything required for live mode is missing.
 
 
+QM reference-data storage
+-------------------------
+
+Accepted Gaussian/AIMAll pointdirs are committed under
+:code:`QM_REFERENCE_DATA/`. Each :code:`iteration-NNNN/` is an immutable
+**delta** containing only points first accepted in that reference-data
+version. Older pointdirs are not copied or symlinked into later versions.
+
+Every delta contains :code:`REFERENCE_DATA_VERSION.json`, the exact
+point-allocation snapshot and its generation history, and a generic
+:code:`.manifest.json`. Version manifests form a SHA-256 parent chain and pin
+the deterministic cumulative point order. Pointdir names use one global
+six-digit ordinal, for example :code:`POINT_000137.pointdir`.
+
+All cumulative consumers use the same reference-data resolver. In particular,
+FEREBUS receives resolver-ordered pointdirs and records the reference-data
+version, head-manifest hash, cumulative-view hash, row order, and row count in
+:code:`FEREBUS_TASKS.json`. A committed model is rejected if that binding no
+longer matches the authoritative reference view.
+
+:code:`.DATA/ACTIVE_LEARNING/reference_data_view_cache.json` is a derived cache
+only. It is never authoritative and can be deleted; the next resolution
+rebuilds it from committed version manifests. The old :code:`5_TRAINING/`
+layout is intentionally unsupported. Start a fresh campaign rather than
+mixing the two storage contracts.
+
+
 Recovery + troubleshooting
 --------------------------
 
@@ -292,14 +319,14 @@ fails schema validation, run::
     ichor-al-daemon reconcile --campaign-dir <DIR>
 
 Fresh :code:`state.json` initialisation is allowed only for a clean first-run
-campaign. If daemon-owned artefacts such as committed training/model
+campaign. If daemon-owned artefacts such as committed reference-data/model
 iterations, staging directories, submission intents, scripts, journal entries,
 or :code:`7_ACTIVE_LEARNING/iteration-*` outputs already exist, start refuses
 to create a new state because that could damage provenance. Use reconcile
 instead.
 
 This inspects the on-disk artefacts (committed iterations in
-:code:`5_TRAINING/` and :code:`6_TRAINED_MODELS/`, plus journal events)
+:code:`QM_REFERENCE_DATA/` and :code:`6_TRAINED_MODELS/`, plus journal events)
 and proposes a recovered state at :code:`state.json.proposed`. Plain
 reconcile is diagnostic: it may write the proposal file and warn about a
 live daemon, but it does not alter :code:`state.json`. Review the proposal,
@@ -349,7 +376,7 @@ What reconcile still does not do:
 - it does not harvest uncommitted Gaussian/AIMAll outputs into a training
   version;
 - it does not rebuild committed manifests automatically;
-- it does not roll back one-sided newer training/model versions without
+- it does not roll back one-sided newer reference-data/model versions without
   operator review.
 
 Common failure modes:
@@ -401,7 +428,7 @@ postprocess parser in the daemon process).
      |<-------------------------------------+
      v
    INITIAL_FEREBUS  (sbatch)      First GP fit. Commits iteration-0 to
-     |                            5_TRAINING and 6_TRAINED_MODELS.
+     |                            QM_REFERENCE_DATA and 6_TRAINED_MODELS.
      v
    SEED_SELECT  (inline)  <----+  Pick seeds from the trajectory pool,
      |                         |  forbidding already-trained frames.

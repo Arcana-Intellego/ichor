@@ -1,5 +1,6 @@
 """Tests for ichor.hpc.active_learning.daemon.reconcile."""
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -46,13 +47,13 @@ from ichor.hpc.active_learning.versioning.provenance import (
     enrich_with_point_allocation,
     write_seed_provenance,
 )
-from ichor.hpc.active_learning.versioning.training_set import TrainingSetVersioning
+from ichor.hpc.active_learning.versioning.versioned_directory import VersionedDirectory
 
 
 def _campaign_dirs(tmp_path):
     campaign = tmp_path / "campaign"
     data = campaign / ".DATA" / "ACTIVE_LEARNING"
-    training = campaign / "5_TRAINING"
+    training = campaign / "QM_REFERENCE_DATA"
     models = campaign / "6_TRAINED_MODELS"
     data.mkdir(parents=True, exist_ok=True)
     training.mkdir(parents=True, exist_ok=True)
@@ -95,7 +96,17 @@ def _write_pending_allocation(campaign, *, context, iteration, n):
         iteration=iteration,
         targets=targets,
         primary_candidates=[
-            {"candidate_id": "candidate-" + context + "-" + str(i), "frame_id": i}
+            {
+                "candidate_id": (
+                    "candidate-"
+                    + context
+                    + "-"
+                    + str(iteration)
+                    + "-"
+                    + str(i)
+                ),
+                "frame_id": i,
+            }
             for i in range(int(n))
         ],
         reserve_candidates=[],
@@ -390,13 +401,38 @@ def _write_split(campaign, iteration, *, train, val, holdout=None):
     return iter_dir / "split.json"
 
 
-def _commit_training_and_model_versions(training, models, versions):
-    tv = TrainingSetVersioning(training)
-    mv = TrainingSetVersioning(models)
+def _commit_reference_versions(campaign, versions):
     for version in versions:
-        staged = tv.stage(None, int(version))
-        (staged / "marker.txt").write_text("training " + str(version), encoding="utf-8")
-        tv.commit(int(version))
+        context = "bootstrap" if int(version) == 0 else "active"
+        iteration = 0 if context == "bootstrap" else int(version) - 1
+        staging_name = "initial" if context == "bootstrap" else "iter_" + str(iteration)
+        pointdir = (
+            Path(campaign)
+            / ".DATA"
+            / "STAGING"
+            / staging_name
+            / "POINT_0000.pointdir"
+        )
+        pointdir.mkdir(parents=True, exist_ok=True)
+        _complete_handoff_allocation(
+            campaign,
+            context=context,
+            iteration=iteration,
+            pointdirs=[pointdir],
+        )
+        stg.commit_reference_data_delta(
+            campaign,
+            reference_data_version=int(version),
+            context=context,
+            iteration=iteration,
+        )
+        shutil.rmtree(pointdir.parent)
+
+
+def _commit_training_and_model_versions(training, models, versions):
+    _commit_reference_versions(Path(training).parent, versions)
+    mv = VersionedDirectory(models)
+    for version in versions:
         staged = mv.stage(None, int(version))
         (staged / "marker.txt").write_text("model " + str(version), encoding="utf-8")
         mv.commit(int(version))
@@ -406,9 +442,9 @@ def test_propose_recovery_on_empty_campaign_returns_init(tmp_path):
     campaign, _, _, _ = _campaign_dirs(tmp_path)
     report = propose_recovery(campaign)
     assert report.proposed_state.phase is CampaignPhase.INIT
-    assert report.proposed_state.training_set_version == -1
+    assert report.proposed_state.reference_data_version == -1
     assert report.proposed_state.models_version == -1
-    assert report.committed_training_versions == []
+    assert report.committed_reference_data_versions == []
     assert report.committed_model_versions == []
     assert report.existing_state_loaded is False
 
@@ -458,7 +494,7 @@ def test_active_replacement_recovery_advances_only_with_durable_handoffs(tmp_pat
         ],
     )
     state = fresh_campaign_state(max_iterations=3)
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = 0
 
     decisions = active_iteration_handoff_decisions(campaign, state)
@@ -589,7 +625,7 @@ def test_propose_recovery_phase_a_sample_reenters_initial_gaussian(tmp_path):
     report = propose_recovery(campaign)
 
     assert report.proposed_state.phase is CampaignPhase.INITIAL_GAUSSIAN
-    assert report.proposed_state.training_set_version == -1
+    assert report.proposed_state.reference_data_version == -1
     assert report.proposed_state.models_version == -1
     assert report.phase_a_handoff is not None
     assert "valid Phase A sample" in report.decision
@@ -600,18 +636,18 @@ def test_propose_recovery_never_trusts_stop_check_without_committed_versions(tmp
     _write_pool(campaign)
     state = fresh_campaign_state(max_iterations=50)
     state.phase = CampaignPhase.STOP_CHECK
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
 
     report = propose_recovery(campaign)
 
-    assert report.committed_training_versions == []
+    assert report.committed_reference_data_versions == []
     assert report.committed_model_versions == []
     assert report.proposed_state.phase is CampaignPhase.HALTED
-    assert report.proposed_state.training_set_version == -1
+    assert report.proposed_state.reference_data_version == -1
     assert report.proposed_state.models_version == -1
-    assert "latest coherent committed training/model pair is trusted" not in report.decision
+    assert "latest coherent committed reference-data/model pair is trusted" not in report.decision
     assert "no committed versions" in report.decision
 
 
@@ -621,7 +657,7 @@ def test_propose_recovery_halted_phase_a_failure_retries_phase_a(tmp_path):
     state = fresh_campaign_state(max_iterations=1)
     state.phase = CampaignPhase.HALTED
     state.iteration = 0
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.validation_set_version = 0
     state.models_version = 0
     state.pending_jobs[CampaignPhase.PHASE_A_POLUS.value] = None
@@ -638,7 +674,7 @@ def test_propose_recovery_halted_phase_a_failure_retries_phase_a(tmp_path):
 
     assert report.proposed_state.phase is CampaignPhase.PHASE_A_POLUS
     assert report.proposed_state.iteration == 0
-    assert report.proposed_state.training_set_version == -1
+    assert report.proposed_state.reference_data_version == -1
     assert report.proposed_state.validation_set_version == -1
     assert report.proposed_state.models_version == -1
     assert report.proposed_state.pending_jobs == {}
@@ -654,7 +690,7 @@ def test_propose_recovery_halted_phase_a_failure_requires_pool(tmp_path):
     state = fresh_campaign_state(max_iterations=1)
     state.phase = CampaignPhase.HALTED
     state.iteration = 0
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.validation_set_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
@@ -711,7 +747,7 @@ def test_propose_recovery_initial_aimall_handoff_reenters_initial_ferebus(tmp_pa
     )
     state = fresh_campaign_state(max_iterations=50)
     state.phase = CampaignPhase.STOP_CHECK
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
     _write_valid_initial_aimall_handoff(campaign)
@@ -719,7 +755,7 @@ def test_propose_recovery_initial_aimall_handoff_reenters_initial_ferebus(tmp_pa
     report = propose_recovery(campaign)
 
     assert report.proposed_state.phase is CampaignPhase.INITIAL_FEREBUS
-    assert report.proposed_state.training_set_version == -1
+    assert report.proposed_state.reference_data_version == -1
     assert report.proposed_state.models_version == -1
     assert "exact point allocation is complete" in report.decision
     assert "initial AIMAll acceptance manifest" in report.trusted_artifacts
@@ -737,7 +773,7 @@ def test_propose_recovery_initial_ferebus_journal_handoff_reenters_initial_fereb
     )
     state = fresh_campaign_state(max_iterations=50)
     state.phase = CampaignPhase.STOP_CHECK
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
     _write_valid_initial_aimall_handoff(campaign)
@@ -746,7 +782,7 @@ def test_propose_recovery_initial_ferebus_journal_handoff_reenters_initial_fereb
 
     assert report.last_phase_in_journal == CampaignPhase.INITIAL_FEREBUS.value
     assert report.proposed_state.phase is CampaignPhase.INITIAL_FEREBUS
-    assert report.proposed_state.training_set_version == -1
+    assert report.proposed_state.reference_data_version == -1
     assert report.proposed_state.models_version == -1
 
 
@@ -762,14 +798,14 @@ def test_propose_recovery_initial_aimall_missing_handoff_halts(tmp_path):
     )
     state = fresh_campaign_state(max_iterations=50)
     state.phase = CampaignPhase.STOP_CHECK
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
 
     report = propose_recovery(campaign)
 
     assert report.proposed_state.phase is CampaignPhase.HALTED
-    assert report.proposed_state.training_set_version == -1
+    assert report.proposed_state.reference_data_version == -1
     assert report.proposed_state.models_version == -1
     assert "INITIAL_AIMALL completed" in report.decision
     assert any("initial AIMAll handoff invalid or missing" in r for r in report.unsafe_reasons)
@@ -787,7 +823,7 @@ def test_propose_recovery_archived_initial_gaussian_handoff_reenters_initial_aim
     )
     state = fresh_campaign_state(max_iterations=50)
     state.phase = CampaignPhase.STOP_CHECK
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
     archived = _write_bootstrap_handoff(
@@ -799,7 +835,7 @@ def test_propose_recovery_archived_initial_gaussian_handoff_reenters_initial_aim
     report = propose_recovery(campaign)
 
     assert report.proposed_state.phase is CampaignPhase.INITIAL_AIMALL
-    assert report.proposed_state.training_set_version == -1
+    assert report.proposed_state.reference_data_version == -1
     assert report.proposed_state.models_version == -1
     assert report.bootstrap_handoff is not None
     assert report.bootstrap_handoff["archived"] is True
@@ -812,7 +848,7 @@ def test_propose_recovery_archived_initial_aimall_handoff_reenters_initial_fereb
     _write_pool(campaign)
     state = fresh_campaign_state(max_iterations=50)
     state.phase = CampaignPhase.STOP_CHECK
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
     archived = _write_bootstrap_handoff(
@@ -831,20 +867,9 @@ def test_propose_recovery_archived_initial_aimall_handoff_reenters_initial_fereb
 
 def test_propose_recovery_bootstrap_training_only_reenters_initial_ferebus(
     tmp_path,
-    monkeypatch,
 ):
-    monkeypatch.setattr(reconcile_mod, "verify_committed_training_version", lambda *a, **k: None)
-    monkeypatch.setattr(
-        recovery_contracts_mod,
-        "verify_committed_training_version",
-        lambda *a, **k: None,
-    )
     campaign, data, training, _ = _campaign_dirs(tmp_path)
     _write_pool(campaign)
-    tv = TrainingSetVersioning(training)
-    staged = tv.stage(None, 0)
-    (staged / "marker.txt").write_text("training", encoding="utf-8")
-    tv.commit(0)
     pointdir = campaign / ".DATA" / "STAGING" / "initial" / "POINT_0000.pointdir"
     pointdir.mkdir(parents=True, exist_ok=True)
     _complete_handoff_allocation(
@@ -853,10 +878,16 @@ def test_propose_recovery_bootstrap_training_only_reenters_initial_ferebus(
         iteration=0,
         pointdirs=[pointdir],
     )
+    stg.commit_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )
     state = fresh_campaign_state(max_iterations=50)
     state.phase = CampaignPhase.HALTED
     state.iteration = 0
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = -1
     write_state(data / DEFAULT_STATE_FILENAME, state)
 
@@ -935,16 +966,12 @@ def test_propose_recovery_force_allows_fresh_init_on_nonempty_campaign(tmp_path)
     assert report.proposed_state.phase is CampaignPhase.INIT
 
 
-def test_propose_recovery_finds_committed_training_versions(tmp_path):
+def test_propose_recovery_finds_committed_reference_data_versions(tmp_path):
     campaign, _, training, _ = _campaign_dirs(tmp_path)
-    v = TrainingSetVersioning(training)
-    for i in (0, 1, 2):
-        s = v.stage(None, i)
-        (s / "marker.txt").write_text(str(i))
-        v.commit(i)
+    _commit_reference_versions(campaign, (0, 1, 2))
     report = propose_recovery(campaign)
-    assert report.committed_training_versions == [0, 1, 2]
-    assert report.proposed_state.training_set_version == 2
+    assert report.committed_reference_data_versions == [0, 1, 2]
+    assert report.proposed_state.reference_data_version == 2
     assert report.proposed_state.models_version == -1
     assert report.proposed_state.phase is CampaignPhase.HALTED
     assert any("trajectory pool" in r for r in report.unsafe_reasons)
@@ -952,11 +979,8 @@ def test_propose_recovery_finds_committed_training_versions(tmp_path):
 
 def test_propose_recovery_reports_decision_and_trusted_versions(tmp_path):
     campaign, _, training, models = _campaign_dirs(tmp_path)
-    tv = TrainingSetVersioning(training)
-    mv = TrainingSetVersioning(models)
-    s = tv.stage(None, 0)
-    (s / "marker.txt").write_text("training", encoding="utf-8")
-    tv.commit(0)
+    mv = VersionedDirectory(models)
+    _commit_reference_versions(campaign, (0,))
     s = mv.stage(None, 0)
     (s / "marker.txt").write_text("model", encoding="utf-8")
     mv.commit(0)
@@ -965,7 +989,7 @@ def test_propose_recovery_reports_decision_and_trusted_versions(tmp_path):
 
     assert report.proposed_state.phase is CampaignPhase.HALTED
     assert "committed model artefacts are present but invalid" in report.decision
-    assert "training version 0" in report.trusted_artifacts
+    assert "reference-data version 0" in report.trusted_artifacts
     assert "model version 0" in report.blocking_artifacts
     assert "trajectory pool" in report.blocking_artifacts
 
@@ -975,12 +999,9 @@ def test_propose_recovery_sets_iteration_from_active_version_mapping(tmp_path, m
     monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
     campaign, _, training, models = _campaign_dirs(tmp_path)
     _write_pool(campaign)
-    tv = TrainingSetVersioning(training)
-    mv = TrainingSetVersioning(models)
+    mv = VersionedDirectory(models)
+    _commit_reference_versions(campaign, range(3))
     for version in range(3):
-        s = tv.stage(None, version)
-        (s / "marker.txt").write_text("training " + str(version), encoding="utf-8")
-        tv.commit(version)
         s = mv.stage(None, version)
         (s / "marker.txt").write_text("model " + str(version), encoding="utf-8")
         mv.commit(version)
@@ -988,7 +1009,7 @@ def test_propose_recovery_sets_iteration_from_active_version_mapping(tmp_path, m
     report = propose_recovery(campaign)
 
     assert report.proposed_state.phase is CampaignPhase.STOP_CHECK
-    assert report.proposed_state.training_set_version == 2
+    assert report.proposed_state.reference_data_version == 2
     assert report.proposed_state.models_version == 2
     assert report.proposed_state.iteration == 1
 
@@ -998,12 +1019,8 @@ def test_propose_recovery_training_one_ahead_reenters_ferebus(tmp_path, monkeypa
     monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
     campaign, _, training, models = _campaign_dirs(tmp_path)
     _write_pool(campaign)
-    tv = TrainingSetVersioning(training)
-    mv = TrainingSetVersioning(models)
-    for version in range(3):
-        s = tv.stage(None, version)
-        (s / "marker.txt").write_text("training " + str(version), encoding="utf-8")
-        tv.commit(version)
+    mv = VersionedDirectory(models)
+    _commit_reference_versions(campaign, range(3))
     for version in range(2):
         s = mv.stage(None, version)
         (s / "marker.txt").write_text("model " + str(version), encoding="utf-8")
@@ -1012,10 +1029,10 @@ def test_propose_recovery_training_one_ahead_reenters_ferebus(tmp_path, monkeypa
     report = propose_recovery(campaign)
 
     assert report.proposed_state.phase is CampaignPhase.FEREBUS
-    assert report.proposed_state.training_set_version == 2
+    assert report.proposed_state.reference_data_version == 2
     assert report.proposed_state.models_version == 1
     assert report.proposed_state.iteration == 1
-    assert not any("newer committed training version" in r for r in report.unsafe_reasons)
+    assert not any("newer committed reference-data version" in r for r in report.unsafe_reasons)
 
 
 def test_propose_recovery_preserves_existing_seed_select_cursor(tmp_path, monkeypatch):
@@ -1024,18 +1041,15 @@ def test_propose_recovery_preserves_existing_seed_select_cursor(tmp_path, monkey
     monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
     campaign, data, training, models = _campaign_dirs(tmp_path)
     _write_pool(campaign)
-    tv = TrainingSetVersioning(training)
-    mv = TrainingSetVersioning(models)
-    s = tv.stage(None, 0)
-    (s / "marker.txt").write_text("training", encoding="utf-8")
-    tv.commit(0)
+    mv = VersionedDirectory(models)
+    _commit_reference_versions(campaign, (0,))
     s = mv.stage(None, 0)
     (s / "marker.txt").write_text("model", encoding="utf-8")
     mv.commit(0)
     state = fresh_campaign_state(max_iterations=3)
     state.phase = CampaignPhase.SEED_SELECT
     state.iteration = 0
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
 
@@ -1055,7 +1069,7 @@ def test_propose_recovery_prefers_seeds_over_stale_seed_select(tmp_path, monkeyp
     state = fresh_campaign_state(max_iterations=3)
     state.phase = CampaignPhase.SEED_SELECT
     state.iteration = 0
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
     _write_seeds_picked(campaign, 0)
@@ -1079,7 +1093,7 @@ def test_recovery_rejects_legacy_ariadne_results_without_landing_safety(
     state = fresh_campaign_state(max_iterations=3)
     state.phase = CampaignPhase.SEED_SELECT
     state.iteration = 0
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
     _write_seeds_picked(campaign, 0)
@@ -1105,7 +1119,7 @@ def test_propose_recovery_does_not_preserve_existing_phase_for_committed_iterati
     state = fresh_campaign_state(max_iterations=3)
     state.phase = CampaignPhase.SEED_SELECT
     state.iteration = 0
-    state.training_set_version = 1
+    state.reference_data_version = 1
     state.models_version = 1
     write_state(data / DEFAULT_STATE_FILENAME, state)
 
@@ -1125,7 +1139,7 @@ def test_propose_recovery_prefers_phase_b_over_stale_seed_select(tmp_path, monke
     state = fresh_campaign_state(max_iterations=3)
     state.phase = CampaignPhase.SEED_SELECT
     state.iteration = 0
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
     _write_phase_b_handoff(campaign, 0, n=2)
@@ -1146,7 +1160,7 @@ def test_propose_recovery_prefers_split_over_stale_phase_b(tmp_path, monkeypatch
     state = fresh_campaign_state(max_iterations=3)
     state.phase = CampaignPhase.PHASE_B_POLUS
     state.iteration = 0
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
     _write_phase_b_handoff(campaign, 0, n=2)
@@ -1168,7 +1182,7 @@ def test_propose_recovery_invalid_split_reenters_split(tmp_path, monkeypatch):
     state = fresh_campaign_state(max_iterations=3)
     state.phase = CampaignPhase.SPLIT
     state.iteration = 0
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
     _write_phase_b_handoff(campaign, 0, n=2)
@@ -1196,7 +1210,7 @@ def test_propose_recovery_cross_iteration_partial_handoff_beats_stop_check(
     state = fresh_campaign_state(max_iterations=5)
     state.phase = CampaignPhase.STOP_CHECK
     state.iteration = 7
-    state.training_set_version = 2
+    state.reference_data_version = 2
     state.models_version = 2
     write_state(data / DEFAULT_STATE_FILENAME, state)
     _write_seeds_picked(campaign, 2)
@@ -1213,18 +1227,15 @@ def test_propose_recovery_protects_active_gaussian_handoff(tmp_path, monkeypatch
     monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
     campaign, data, training, models = _campaign_dirs(tmp_path)
     _write_pool(campaign)
-    tv = TrainingSetVersioning(training)
-    mv = TrainingSetVersioning(models)
-    s = tv.stage(None, 0)
-    (s / "marker.txt").write_text("training", encoding="utf-8")
-    tv.commit(0)
+    mv = VersionedDirectory(models)
+    _commit_reference_versions(campaign, (0,))
     s = mv.stage(None, 0)
     (s / "marker.txt").write_text("model", encoding="utf-8")
     mv.commit(0)
     state = fresh_campaign_state(max_iterations=3)
     state.phase = CampaignPhase.HALTED
     state.iteration = 0
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
     staging = campaign / ".DATA" / "STAGING" / "iter_0"
@@ -1261,7 +1272,7 @@ def test_propose_recovery_finds_staging_handoff_in_later_iteration(tmp_path, mon
     state = fresh_campaign_state(max_iterations=4)
     state.phase = CampaignPhase.HALTED
     state.iteration = 0
-    state.training_set_version = 1
+    state.reference_data_version = 1
     state.models_version = 1
     write_state(data / DEFAULT_STATE_FILENAME, state)
     staging = campaign / ".DATA" / "STAGING" / "iter_1"
@@ -1299,7 +1310,7 @@ def test_propose_recovery_halts_on_multiple_valid_staging_handoffs(tmp_path, mon
     state = fresh_campaign_state(max_iterations=4)
     state.phase = CampaignPhase.HALTED
     state.iteration = 0
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
     for iteration in (0, 1):
@@ -1325,11 +1336,8 @@ def test_propose_recovery_halts_on_multiple_valid_staging_handoffs(tmp_path, mon
 def test_propose_recovery_blocks_trajectory_pool_sha_drift(tmp_path):
     campaign, _, training, models = _campaign_dirs(tmp_path)
     _write_pool(campaign)
-    tv = TrainingSetVersioning(training)
-    mv = TrainingSetVersioning(models)
-    s = tv.stage(None, 0)
-    (s / "marker.txt").write_text("training", encoding="utf-8")
-    tv.commit(0)
+    mv = VersionedDirectory(models)
+    _commit_reference_versions(campaign, (0,))
     s = mv.stage(None, 0)
     (s / "marker.txt").write_text("model", encoding="utf-8")
     mv.commit(0)
@@ -1347,23 +1355,21 @@ def test_propose_recovery_blocks_trajectory_pool_sha_drift(tmp_path):
 
 def test_propose_recovery_reports_unmanifested_committed_pointdir(tmp_path):
     campaign, _, training, _ = _campaign_dirs(tmp_path)
-    v = TrainingSetVersioning(training)
-    s = v.stage(None, 0)
-    (s / "marker.txt").write_text("committed", encoding="utf-8")
-    v.commit(0)
+    _commit_reference_versions(campaign, (0,))
+    v = VersionedDirectory(training)
     rogue = v.iteration_path(0) / "POINT_9999.pointdir"
     rogue.mkdir()
     (rogue / "input.gjf").write_text("%chk=x\n", encoding="utf-8")
     report = propose_recovery(campaign)
-    assert report.committed_training_versions == [0]
-    assert report.valid_training_versions == []
-    assert any("committed training version 0" in r for r in report.unsafe_reasons)
+    assert report.committed_reference_data_versions == [0]
+    assert report.valid_reference_data_versions == []
+    assert any("committed reference-data version 0" in r for r in report.unsafe_reasons)
     assert report.proposed_state.phase is CampaignPhase.HALTED
 
 
 def test_propose_recovery_preserves_existing_campaign_uid(tmp_path):
     campaign, data, training, _ = _campaign_dirs(tmp_path)
-    v = TrainingSetVersioning(training)
+    v = VersionedDirectory(training)
     s = v.stage(None, 0); (s / "x.txt").write_text("hi"); v.commit(0)
     existing = fresh_campaign_state(max_iterations=42)
     existing.iteration = 5

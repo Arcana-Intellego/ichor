@@ -1336,18 +1336,51 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
     cfg.resources.ferebus_walltime_hours = 2
     campaign = tmp_path / "campaign"
     campaign.mkdir()
+    for version in range(5):
+        (
+            campaign
+            / "QM_REFERENCE_DATA"
+            / ("iteration-" + str(version).zfill(4))
+        ).mkdir(parents=True)
     staging = campaign / "6_TRAINED_MODELS" / "iteration-staging"
     staging.mkdir(parents=True)
     (staging / stg.FEREBUS_JOB_DETAILS).write_text(
         "system_name WATER\n", encoding="utf-8",
     )
+    (staging / stg.FEREBUS_TASK_MANIFEST).write_text(
+        json.dumps(
+            {
+                "schema_version": stg.FEREBUS_TASK_SCHEMA_VERSION,
+                "reference_data_version": 4,
+                "reference_data_head_manifest_sha256": "a" * 64,
+                "reference_data_view_sha256": "b" * 64,
+                "n_reference_points": 5,
+                "pointdir_row_order": [
+                    "POINT_" + str(index).zfill(6) + ".pointdir"
+                    for index in range(5)
+                ],
+                "n_tasks": 3,
+                "tasks": [
+                    {
+                        "row_counts": {
+                            "train": 3,
+                            "int_val": 1,
+                            "ext_val": 1,
+                        }
+                    }
+                    for _ in range(3)
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
 
     calls = {}
 
-    def fake_stage(campaign_dir, config, training_version, *, is_initial=False):
+    def fake_stage(campaign_dir, config, reference_data_version, *, is_initial=False):
         calls["stage"] = {
             "campaign_dir": Path(campaign_dir),
-            "training_version": training_version,
+            "reference_data_version": reference_data_version,
             "is_initial": is_initial,
         }
         return staging, 3
@@ -1393,12 +1426,12 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
         backend_check=False,
     )
     result = ex.submit_or_run(
-        SimpleNamespace(iteration=0, training_set_version=4),
+        SimpleNamespace(iteration=0, reference_data_version=4),
         "FEREBUS",
     )
 
     assert result.submitted_job_id == "4242"
-    assert calls["stage"]["training_version"] == 4
+    assert calls["stage"]["reference_data_version"] == 4
     assert calls["stage"]["is_initial"] is False
     assert calls["submit"]["jd_file"] == staging / stg.FEREBUS_JOB_DETAILS
     assert calls["submit"]["working_directory"] == staging

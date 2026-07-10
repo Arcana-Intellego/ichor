@@ -42,7 +42,7 @@ POINTDIR_BASENAME_RE = re.compile(r"^POINT_\d{4}\.pointdir$")
 AIMALL_TASK_METADATA = "AIMALL_TASK.json"
 AIMALL_TASK_METADATA_SCHEMA_VERSION = 1
 FEREBUS_TASK_MANIFEST = "FEREBUS_TASKS.json"
-FEREBUS_TASK_SCHEMA_VERSION = 1
+FEREBUS_TASK_SCHEMA_VERSION = 2
 FEREBUS_JOB_DETAILS = "job-details"
 SAFE_PATH_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
@@ -337,9 +337,44 @@ def read_ferebus_manifest(staging_dir: Path) -> Dict[str, Any]:
         raise ValueError("FEREBUS task manifest must be a JSON object: " + str(path))
     if int(data.get("schema_version", -1)) != FEREBUS_TASK_SCHEMA_VERSION:
         raise ValueError("unsupported FEREBUS task manifest schema: " + str(path))
+    try:
+        reference_data_version = int(data["reference_data_version"])
+        n_reference_points = int(data["n_reference_points"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("FEREBUS task manifest reference-data binding is invalid") from exc
+    if reference_data_version < 0 or n_reference_points <= 0:
+        raise ValueError("FEREBUS task manifest reference-data values are invalid")
+    row_order = data.get("pointdir_row_order")
+    if not isinstance(row_order, list) or len(row_order) != n_reference_points:
+        raise ValueError("FEREBUS task manifest row order/count is invalid")
+    for field_name in (
+        "reference_data_head_manifest_sha256",
+        "reference_data_view_sha256",
+    ):
+        value = str(data.get(field_name) or "")
+        if len(value) != 64 or any(
+            character not in "0123456789abcdef" for character in value
+        ):
+            raise ValueError("FEREBUS task manifest " + field_name + " is invalid")
     tasks = data.get("tasks")
     if not isinstance(tasks, list) or not tasks:
         raise ValueError("FEREBUS task manifest has no tasks: " + str(path))
+    for task in tasks:
+        if not isinstance(task, dict):
+            raise ValueError("FEREBUS task manifest contains a non-object task")
+        counts = task.get("row_counts")
+        if not isinstance(counts, dict):
+            raise ValueError("FEREBUS task manifest row_counts is invalid")
+        try:
+            task_total = sum(
+                int(counts[split]) for split in ("train", "int_val", "ext_val")
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("FEREBUS task manifest row_counts is invalid") from exc
+        if task_total != n_reference_points:
+            raise ValueError(
+                "FEREBUS task row count does not match the reference-data view"
+            )
     return data
 
 
@@ -977,29 +1012,17 @@ def accepted_allocation_pointdirs(
 def verify_committed_allocation_snapshot(
     campaign_dir: Path,
     *,
-    training_version: int,
+    reference_data_version: int,
     context: str,
     iteration: int,
 ) -> Dict[str, Any]:
-    """Prove that an idempotent APPEND retry refers to the same allocation.
-
-    A committed version one step ahead of ``state.json`` is expected after a
-    crash between commit and state persistence, but its mere existence is not
-    enough evidence.  The version must pass the normal committed-tree checks,
-    contain the exact allocation snapshot, and contain one provenance record
-    for every accepted candidate in that snapshot.
-    """
-    from ..point_allocation import (
-        accepted_attempts,
-        point_allocation_path,
-        read_point_allocation,
-    )
-    from ..versioning.provenance import read_provenance
-    from ..versioning.training_set import TrainingSetVersioning
+    """Prove that a committed delta reproduces one completed allocation."""
+    from ..point_allocation import accepted_attempts, point_allocation_path, read_point_allocation
+    from ..versioning.reference_data import ReferenceDataVersioning
 
     campaign = Path(campaign_dir)
-    version = int(training_version)
-    versioning = TrainingSetVersioning(campaign / "5_TRAINING")
+    version = int(reference_data_version)
+    versioning = ReferenceDataVersioning(campaign / "QM_REFERENCE_DATA")
     source_path = point_allocation_path(
         campaign,
         context=str(context),
@@ -1014,10 +1037,10 @@ def verify_committed_allocation_snapshot(
     )
     if not snapshot_path.is_file() or snapshot_path.is_symlink():
         raise FileNotFoundError(
-            "committed training version lacks its allocation snapshot: "
+            "committed reference-data version lacks its allocation snapshot: "
             + str(snapshot_path)
         )
-    versioning.verify_committed_training_inputs(version)
+    view = versioning.resolve(version, verification="deep")
     try:
         snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -1025,152 +1048,207 @@ def verify_committed_allocation_snapshot(
             "committed allocation snapshot is unreadable: " + str(snapshot_path)
         ) from exc
     if snapshot != source:
-        raise ValueError(
-            "committed allocation snapshot does not match the current allocation"
-        )
-
+        raise ValueError("committed allocation snapshot does not match the source")
     expected = {
-        str(record["candidate_id"]): (
-            int(record["slot_id"]),
-            str(record["split"]),
-        )
+        str(record["candidate_id"]): (int(record["slot_id"]), str(record["split"]))
         for record in accepted_attempts(source)
     }
-    observed: Dict[str, Tuple[int, str]] = {}
-    for pointdir in sorted(committed_dir.glob("POINT_*.pointdir")):
-        if not pointdir.is_dir() or pointdir.is_symlink():
-            continue
-        provenance = read_provenance(pointdir)
-        allocation = provenance.get("point_allocation")
-        if not isinstance(allocation, dict):
-            continue
-        candidate_id = str(allocation.get("candidate_id") or "")
-        if candidate_id not in expected:
-            continue
-        if candidate_id in observed:
-            raise ValueError(
-                "committed training version duplicates allocation candidate "
-                + candidate_id
-            )
-        observed[candidate_id] = (
-            int(allocation.get("slot_id", -1)),
-            str(allocation.get("split") or ""),
-        )
+    observed = {
+        entry.candidate_id: (entry.slot_id, entry.split)
+        for entry in view.entries
+        if entry.introduced_in_version == version
+    }
     if observed != expected:
         raise ValueError(
-            "committed training version does not reproduce accepted allocation provenance"
+            "committed reference-data delta does not reproduce allocation provenance"
         )
     return source
 
 
-def commit_initial_training_set(campaign_dir) -> bool:
-    """build + commit 5_TRAINING/iteration-0 from the initial quantum staging bucket
-    (.DATA/STAGING/initial/POINT_*). returns True if it actually committed, False if
-    iteration-0 was already there.
-
-    idempotent on purpose -- it gets called at INITIAL_FEREBUS staging (so the feature export
-    has a training set to read) and again at INITIAL_FEREBUS postprocess, and has to be a no-op
-    the second time + safe on a crash-retry. the per-iteration loop never needs this because its
-    inline APPEND commits 5_TRAINING before FEREBUS stages; only the initial bootstrap is missing
-    that step, which is the whole reason this helper exists.
-    """
-    from ..versioning.training_set import TrainingSetVersioning
+def commit_reference_data_delta(
+    campaign_dir: Path,
+    *,
+    reference_data_version: int,
+    context: str,
+    iteration: int,
+) -> Tuple[Any, List[str], bool]:
+    """Commit exactly one immutable QM reference-data delta."""
+    from ..point_allocation import (
+        accepted_attempts,
+        allocation_manifest_sha256,
+        point_allocation_path,
+    )
+    from ..versioning.manifest import sha256_file
+    from ..versioning.provenance import PROVENANCE_FILENAME
+    from ..versioning.reference_data import (
+        POINTDIR_NAME_WIDTH,
+        REFERENCE_DATA_VERSION_FILENAME,
+        ReferenceDataEntry,
+        ReferenceDataVersioning,
+        build_reference_data_version_payload,
+        hash_pointdir_tree as hash_reference_pointdir_tree,
+        seal_reference_data_version,
+    )
 
     campaign = Path(campaign_dir)
-    v_train = TrainingSetVersioning(campaign / "5_TRAINING")
-    allocation_path = (
-        campaign / "3_DIVERSITY_SAMPLING" / "initial" / "POINT_ALLOCATION.json"
+    version = int(reference_data_version)
+    versioning = ReferenceDataVersioning(campaign / "QM_REFERENCE_DATA")
+    allocation_path = point_allocation_path(
+        campaign,
+        context=str(context),
+        iteration=int(iteration),
     )
-    if 0 in v_train.list_committed_versions():
+    committed_versions = versioning.list_committed_versions()
+    if version in committed_versions:
         verify_committed_allocation_snapshot(
             campaign,
-            training_version=0,
-            context="bootstrap",
-            iteration=0,
+            reference_data_version=version,
+            context=str(context),
+            iteration=int(iteration),
         )
-        accepted_pointdirs, allocation = accepted_allocation_pointdirs(
-            campaign,
-            context="bootstrap",
-            iteration=0,
-        )
-        accepted_names = {p.name for p in accepted_pointdirs}
-        committed_dir = v_train.iteration_path(0)
-        committed_names = {
-            child.name
-            for child in committed_dir.iterdir()
-            if child.is_dir() and POINTDIR_BASENAME_RE.fullmatch(child.name)
-        }
-        if committed_names != accepted_names:
-            raise ValueError(
-                "existing initial training set does not match point allocation"
-            )
-        committed_allocation = committed_dir / "POINT_ALLOCATION.version-0000.json"
-        if not committed_allocation.is_file():
-            raise FileNotFoundError(
-                "existing initial training set lacks POINT_ALLOCATION.version-0000.json"
-            )
-        if json.loads(committed_allocation.read_text(encoding="utf-8")) != allocation:
-            raise ValueError("committed initial point allocation does not match source")
-        v_train.ensure_current(0)
-        return False
+        view = versioning.resolve(version, verification="deep")
+        seal_reference_data_version(versioning.iteration_path(version))
+        newest_version = max(committed_versions)
+        if newest_version != version:
+            versioning.resolve(newest_version, verification="deep")
+        versioning.ensure_current(newest_version)
+        names = [
+            entry.pointdir_name
+            for entry in view.entries
+            if entry.introduced_in_version == version
+        ]
+        return view, names, False
     if not allocation_path.is_file():
-        return False
+        raise FileNotFoundError(
+            "point-allocation manifest missing: " + str(allocation_path)
+        )
     accepted_pointdirs, allocation = accepted_allocation_pointdirs(
         campaign,
+        context=str(context),
+        iteration=int(iteration),
+    )
+    attempts = sorted(accepted_attempts(allocation), key=lambda row: int(row["slot_id"]))
+    if len(attempts) != len(accepted_pointdirs):
+        raise ValueError("reference-data allocation/pointdir cardinality mismatch")
+    parent_view = None
+    if version > 0:
+        parent_view = versioning.resolve(version - 1, verification="metadata")
+    elif versioning.list_committed_versions():
+        raise ValueError("reference-data bootstrap is not the first commit")
+    existing_ids = {
+        entry.candidate_id for entry in (parent_view.entries if parent_view else ())
+    }
+    if any(str(attempt["candidate_id"]) in existing_ids for attempt in attempts):
+        raise ValueError("reference-data delta reuses a committed candidate ID")
+
+    versioning.recover_dangling_staging()
+    staging = versioning.stage(source_version=None, target_version=version)
+    first_ordinal = len(parent_view.entries) if parent_view is not None else 0
+    added_entries: List[ReferenceDataEntry] = []
+    added_names: List[str] = []
+    for offset, (source, attempt) in enumerate(zip(accepted_pointdirs, attempts)):
+        ordinal = first_ordinal + offset
+        name = "POINT_" + str(ordinal).zfill(POINTDIR_NAME_WIDTH) + ".pointdir"
+        destination = staging / name
+        _copytree_no_symlinks(source, destination)
+        lock = destination / ".provenance.lock"
+        if lock.exists():
+            lock.unlink()
+        provenance_path = destination / PROVENANCE_FILENAME
+        if not provenance_path.is_file() or provenance_path.is_symlink():
+            raise ValueError("committed reference point lacks provenance: " + str(destination))
+        added_entries.append(
+            ReferenceDataEntry(
+                global_ordinal=int(ordinal),
+                introduced_in_version=version,
+                pointdir_name=name,
+                pointdir_path=destination.resolve(),
+                candidate_id=str(attempt["candidate_id"]),
+                slot_id=int(attempt["slot_id"]),
+                split=str(attempt["split"]),
+                replacement_round=int(attempt.get("round", 0)),
+                pointdir_tree_sha256=hash_reference_pointdir_tree(destination),
+                provenance_sha256=sha256_file(provenance_path),
+            )
+        )
+        added_names.append(name)
+
+    allocation_relative = allocation_path.resolve().relative_to(campaign.resolve()).as_posix()
+    payload = build_reference_data_version_payload(
+        campaign_uid=str(allocation["campaign_uid"]),
+        version=version,
+        source_context=str(context),
+        source_iteration=int(iteration),
+        parent_view=parent_view,
+        point_allocation_manifest=allocation_relative,
+        point_allocation_sha256=allocation_manifest_sha256(allocation_path),
+        added_entries=added_entries,
+    )
+    allocation_history = allocation_path.parent / ".point_allocation_history"
+    if allocation_history.is_dir():
+        _copytree_no_symlinks(
+            allocation_history,
+            staging / ".point_allocation_history",
+        )
+    atomic_write_json(staging / "POINT_ALLOCATION.json", allocation)
+    atomic_write_json(
+        staging / ("POINT_ALLOCATION.version-" + str(version).zfill(4) + ".json"),
+        allocation,
+    )
+    atomic_write_json(staging / REFERENCE_DATA_VERSION_FILENAME, payload)
+    versioning.commit(version)
+    view = versioning.resolve(version, verification="deep")
+    seal_reference_data_version(versioning.iteration_path(version))
+    versioning.update_current(version)
+    return view, added_names, True
+
+
+def commit_initial_reference_data(campaign_dir) -> bool:
+    """Commit the complete bootstrap allocation as reference-data version 0."""
+    allocation_path = (
+        Path(campaign_dir)
+        / "3_DIVERSITY_SAMPLING"
+        / "initial"
+        / "POINT_ALLOCATION.json"
+    )
+    _, _, created = commit_reference_data_delta(
+        Path(campaign_dir),
+        reference_data_version=0,
         context="bootstrap",
         iteration=0,
     )
-    # bin any half-built staging left by a dead attempt, then stage an empty iter-0 and copy
-    # the validated initial pointdirs into it.
-    v_train.recover_dangling_staging()
-    train_staging = v_train.stage(source_version=None, target_version=0)
-    for pdir in accepted_pointdirs:
-        dest = train_staging / pdir.name
-        if dest.exists():
-            _checked_rmtree(
-                dest,
-                campaign_dir=campaign,
-                allowed_roots=[train_staging],
-            )
-        _copytree_no_symlinks(pdir, dest)
-    atomic_write_json(train_staging / "POINT_ALLOCATION.json", allocation)
-    atomic_write_json(
-        train_staging / "POINT_ALLOCATION.version-0000.json",
-        allocation,
-    )
-    v_train.commit(0)
-    v_train.update_current(0)
-    return True
+    return bool(created)
 
 
-def stage_ferebus_inputs(campaign_dir, config, training_version, is_initial=False) -> Tuple[Path, int]:
+def stage_ferebus_inputs(
+    campaign_dir,
+    config,
+    reference_data_version,
+    is_initial=False,
+) -> Tuple[Path, int]:
     """Stage pyferebus/FEREBUS inputs and return (staging_dir, n_tasks).
 
     pyferebus owns the FEREBUS folder/config/command/slurm contract. The daemon stages the flat
     property directories that pyferebus expects, plus the pyferebus job-details file and a daemon
     manifest used for strict postprocess validation.
     """
-    from ichor.core.files import PointsDirectory
+    from ichor.core.files import PointDirectory, PointsDirectory
     from ichor.core.calculators import calculate_alf_atom_sequence
+    from ..versioning.reference_data import ReferenceDataVersioning
 
     campaign = Path(campaign_dir)
-    # the initial bootstrap has no APPEND phase ahead of it, so 5_TRAINING/iteration-0 may not
+    # the initial bootstrap has no APPEND phase ahead of it, so QM_REFERENCE_DATA/iteration-0 may not
     # exist yet when INITIAL_FEREBUS stages. build it from the initial quantum staging so the
     # export has something to read. idempotent; and we only create the dir here -- the
-    # training_set_version bump stays in postprocess so a restart mid-flight reconciles cleanly.
+    # reference_data_version bump stays in postprocess so a restart mid-flight reconciles cleanly.
     if is_initial:
-        training_version = 0
-        commit_initial_training_set(campaign)
-    training_dir = campaign / "5_TRAINING" / ("iteration-" + str(int(training_version)).zfill(4))
-    if not training_dir.is_dir():
-        raise FileNotFoundError(
-            "no committed training set to build a FEREBUS dataset from: "
-            + str(training_dir)
-        )
-    from ..versioning.training_set import TrainingSetVersioning
-    TrainingSetVersioning(campaign / "5_TRAINING").verify_committed_training_inputs(
-        int(training_version)
-    )
+        reference_data_version = 0
+        commit_initial_reference_data(campaign)
+    version = int(reference_data_version)
+    reference_data = ReferenceDataVersioning(campaign / "QM_REFERENCE_DATA")
+    view = reference_data.resolve(version, verification="deep")
+    if not view.entries:
+        raise ValueError("committed QM reference data contains no pointdirs")
 
     staging = campaign / "6_TRAINED_MODELS" / "iteration-staging"
     # iteration-staging is ONE shared scratch dir reused every iteration, so wipe it first.
@@ -1184,37 +1262,23 @@ def stage_ferebus_inputs(campaign_dir, config, training_version, is_initial=Fals
         )
     staging.mkdir(parents=True, exist_ok=True)
 
-    pd = PointsDirectory(training_dir)
-    pointdir_paths = [Path(getattr(p, "path", p)) for p in pd]
-    pointdir_names = [p.name for p in pointdir_paths]
-    if not pointdir_names:
-        raise ValueError("committed training set contains no pointdirs: " + str(training_dir))
-    pointdir_identities: Dict[str, str] = {}
-    forced_ferebus_splits: Dict[str, str] = {}
-    try:
-        from ..versioning.manifest import sha256_file
-        from ..versioning.provenance import PROVENANCE_FILENAME, read_provenance
-
-        for name, pointdir_path in zip(pointdir_names, pointdir_paths):
-            sidecar = pointdir_path / PROVENANCE_FILENAME
-            if sidecar.is_file():
-                pointdir_identities[name] = "provenance:" + sha256_file(sidecar)
-                provenance = read_provenance(pointdir_path)
-                allocation = provenance.get("point_allocation")
-                if not isinstance(allocation, dict):
-                    raise ValueError(
-                        "pointdir provenance is missing point_allocation for " + name
-                    )
-                split = str(allocation.get("split") or "")
-                if split not in {"train", "int_val", "ext_val"}:
-                    raise ValueError(
-                        "pointdir provenance has invalid allocation split for " + name
-                    )
-                forced_ferebus_splits[name] = split
-            else:
-                pointdir_identities[name] = "pointdir-tree:" + hash_pointdir_tree(pointdir_path)
-    except Exception as exc:
-        raise ValueError("failed to build FEREBUS pointdir identity map: " + str(exc)) from exc
+    # PointsDirectory is list-backed, so the daemon can supply the authoritative
+    # cumulative order without materialising a duplicate directory tree.
+    pd = PointsDirectory(campaign / "QM_REFERENCE_DATA", needs_parsing=False)
+    pd.path = campaign / "QM_REFERENCE_DATA"
+    for entry in view.entries:
+        pd.append(PointDirectory(entry.pointdir_path))
+    pointdir_names = [entry.pointdir_name for entry in view.entries]
+    observed_order = [Path(getattr(point, "path", point)).name for point in pd]
+    if observed_order != pointdir_names:
+        raise ValueError("FEREBUS PointsDirectory row order differs from reference-data view")
+    pointdir_identities = {
+        entry.pointdir_name: entry.provenance_sha256
+        for entry in view.entries
+    }
+    forced_ferebus_splits = {
+        entry.pointdir_name: entry.split for entry in view.entries
+    }
     # system ALF defines the per-atom local frame the features are built in.
     system_alf = pd.alf_dict(calculate_alf_atom_sequence)
     f = config.ferebus
@@ -1247,8 +1311,8 @@ def stage_ferebus_inputs(campaign_dir, config, training_version, is_initial=Fals
         read_point_allocation,
     )
 
-    allocation_context = "bootstrap" if int(training_version) == 0 else "active"
-    allocation_iteration = 0 if allocation_context == "bootstrap" else int(training_version) - 1
+    allocation_context = "bootstrap" if version == 0 else "active"
+    allocation_iteration = 0 if allocation_context == "bootstrap" else version - 1
     allocation_path = point_allocation_path(
         campaign,
         context=allocation_context,
@@ -1267,7 +1331,8 @@ def stage_ferebus_inputs(campaign_dir, config, training_version, is_initial=Fals
     split_ledger = ensure_split_assignments(
         campaign,
         pointdir_names,
-        training_version=int(training_version),
+        reference_data_version=version,
+        reference_data_view_sha256=str(view.cumulative_view_sha256),
         expected_new_counts=expected_new_counts,
         pointdir_identity=pointdir_identities,
         forced_splits=forced_ferebus_splits,
@@ -1413,7 +1478,10 @@ def stage_ferebus_inputs(campaign_dir, config, training_version, is_initial=Fals
         {
             "schema_version": FEREBUS_TASK_SCHEMA_VERSION,
             "system": system,
-            "training_version": int(training_version),
+            "reference_data_version": version,
+            "reference_data_head_manifest_sha256": str(view.head_manifest_sha256),
+            "reference_data_view_sha256": str(view.cumulative_view_sha256),
+            "n_reference_points": int(len(view.entries)),
             "pointdir_row_order": list(pointdir_names),
             "properties": properties,
             "atoms": atom_labels,

@@ -214,7 +214,7 @@ FILE_STRUCTURE.add(
 )
 # 4_PROPERTY_CALC is defined as part of pointsdir creation
 FILE_STRUCTURE.add(
-    "5_TRAINING",
+    "QM_REFERENCE_DATA",
     "training",
     type_=FileType.Directory,
     description="""A directory containing test, train and validation sets for ML.""",

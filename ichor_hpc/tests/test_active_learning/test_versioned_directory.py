@@ -1,4 +1,4 @@
-"""Tests for ichor.hpc.active_learning.versioning.training_set."""
+"""Tests for the generic atomic versioned-directory protocol."""
 import os
 import shutil
 from pathlib import Path
@@ -9,21 +9,21 @@ from ichor.hpc.active_learning.versioning.manifest import (
     MANIFEST_FILENAME,
     ManifestMismatchError,
 )
-from ichor.hpc.active_learning.versioning.training_set import (
+from ichor.hpc.active_learning.versioning.versioned_directory import (
     CURRENT_LINK_NAME,
     STAGING_SUFFIX,
-    TrainingSetVersioning,
+    VersionedDirectory,
 )
 
 
-def _new_setup(tmp_path: Path) -> TrainingSetVersioning:
-    parent = tmp_path / "5_TRAINING"
+def _new_setup(tmp_path: Path) -> VersionedDirectory:
+    parent = tmp_path / "QM_REFERENCE_DATA"
     parent.mkdir()
-    return TrainingSetVersioning(parent)
+    return VersionedDirectory(parent)
 
 
 def test_iteration_name_pads_width():
-    v = TrainingSetVersioning(Path("."), prefix="iter", name_width=5)
+    v = VersionedDirectory(Path("."), prefix="iter", name_width=5)
     assert v.iteration_name(7) == "iter-00007"
     assert v.staging_name(7) == "iter-00007.staging"
 
@@ -103,29 +103,6 @@ def test_verify_committed_detects_post_commit_tamper(tmp_path):
     (v.iteration_path(0) / "a.txt").write_text("EVIL")
     with pytest.raises(ManifestMismatchError):
         v.verify_committed(0)
-
-
-def test_verify_committed_training_inputs_rejects_unmanifested_pointdir(tmp_path):
-    v = _new_setup(tmp_path)
-    s = v.stage(None, 0)
-    (s / "marker.txt").write_text("committed")
-    v.commit(0)
-    rogue = v.iteration_path(0) / "POINT_9999.pointdir"
-    rogue.mkdir()
-    (rogue / "input.gjf").write_text("%chk=x\n", encoding="utf-8")
-    with pytest.raises(ManifestMismatchError):
-        v.verify_committed_training_inputs(0)
-
-
-def test_verify_committed_training_inputs_ignores_transient_pointdir_lock(tmp_path):
-    v = _new_setup(tmp_path)
-    s = v.stage(None, 0)
-    point = s / "POINT_0000.pointdir"
-    point.mkdir()
-    (point / "input.gjf").write_text("%chk=x\n", encoding="utf-8")
-    v.commit(0)
-    (v.iteration_path(0) / ".nfs1234").write_text("temporary", encoding="utf-8")
-    v.verify_committed_training_inputs(0)
 
 
 def test_list_committed_versions_orders_ascending(tmp_path):

@@ -1,6 +1,6 @@
 """Per-pointdir provenance ledger.
 
-Every committed `.pointdir` in `5_TRAINING/iteration-NNNN/` carries a
+Every committed `.pointdir` in `QM_REFERENCE_DATA/iteration-NNNN/` carries a
 `.provenance.json` sidecar that traces the point back through the
 adversarial-attack pipeline: which MD frame seeded it, which 50 neighbour
 frames built its local subspace, what ARIADNE did to it, whether the
@@ -12,12 +12,12 @@ In parallel, an append-only flat index lives at
     <campaign>/.DATA/ACTIVE_LEARNING/seed_frame_id_index.json
 
 so the daemon's SEED_SELECT phase can compute "frames already seeded into
-the training set" in O(1) reads rather than O(n) sidecar scans. The fast
+the QM reference data" in O(1) reads rather than O(n) sidecar scans. The fast
 index is updated incrementally on every APPEND (a few records per
 iteration), atomically via tempfile + os.replace.
 
 every sidecar JSON pins back to the campaign uid + iteration, so a sweep
-across the training set can always trace each committed pointdir back to
+across the QM reference data can always trace each committed pointdir back to
 the seed and the MD frame it descended from. the flat index file off to
 the side is the cheap version of the same lookup -- a one-pass read at
 SEED_SELECT time so the daemon can compute which frames are already
@@ -551,76 +551,55 @@ def append_to_index(
         return p
 
 
-def seed_frame_ids_from_committed_pointdirs(training_dir: Union[str, Path]) -> Set[int]:
-    """Scan committed iteration pointdirs for their seed frame_ids by reading
-    the .provenance.json sidecars directly. This is the slow source-of-truth
-    path; the flat index is the fast cache of the same information.
+def _resolved_reference_entries(reference_data_dir: Union[str, Path]):
+    from .reference_data import ReferenceDataVersioning
 
-    Walks <training_dir>/iteration-*/*.pointdir/.provenance.json. Anything that
-    cannot be read or has a null seed frame_id is skipped.
-    """
-    base = Path(training_dir)
+    base = Path(reference_data_dir)
+    versioning = ReferenceDataVersioning(base)
+    current = versioning.current_version()
+    if current is None:
+        return ()
+    return versioning.resolve(current, verification="metadata").entries
+
+
+def seed_frame_ids_from_committed_pointdirs(
+    reference_data_dir: Union[str, Path],
+) -> Set[int]:
+    """Read seed frame IDs from the authoritative cumulative reference view."""
     out: Set[int] = set()
-    if not base.is_dir():
-        return out
-    for iter_dir in base.glob("iteration-*"):
-        if not iter_dir.is_dir():
-            continue
-        for pointdir in iter_dir.glob("*.pointdir"):
-            sidecar = pointdir / PROVENANCE_FILENAME
-            if not sidecar.is_file():
-                continue
-            try:
-                with open(sidecar, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                fid = (data.get("seed") or {}).get("frame_id")
-            except (OSError, ValueError):
-                continue
-            if isinstance(fid, int):
-                out.add(int(fid))
+    for entry in _resolved_reference_entries(reference_data_dir):
+        data = read_provenance(entry.pointdir_path)
+        fid = (data.get("seed") or {}).get("frame_id")
+        if isinstance(fid, int):
+            out.add(int(fid))
     return out
 
 
-def _records_from_committed_pointdirs(training_dir: Union[str, Path]) -> List[Dict[str, Any]]:
-    base = Path(training_dir)
+def _records_from_committed_pointdirs(
+    reference_data_dir: Union[str, Path],
+) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-    if not base.is_dir():
-        return out
-    for iter_dir in sorted(base.glob("iteration-*")):
-        if not iter_dir.is_dir():
-            continue
-        try:
-            iteration = int(iter_dir.name.rsplit("-", 1)[1])
-        except (IndexError, ValueError):
-            continue
-        for pointdir in sorted(iter_dir.glob("*.pointdir")):
-            sidecar = pointdir / PROVENANCE_FILENAME
-            if not sidecar.is_file():
-                continue
-            try:
-                with open(sidecar, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                fid = (data.get("seed") or {}).get("frame_id")
-            except (OSError, ValueError):
-                continue
-            out.append({
-                "iteration": int(iteration),
-                "pointdir_name": pointdir.name,
-                "seed_frame_id": int(fid) if isinstance(fid, int) else None,
-            })
+    for entry in _resolved_reference_entries(reference_data_dir):
+        data = read_provenance(entry.pointdir_path)
+        fid = (data.get("seed") or {}).get("frame_id")
+        out.append({
+            "iteration": int(entry.introduced_in_version),
+            "pointdir_name": entry.pointdir_name,
+            "seed_frame_id": int(fid) if isinstance(fid, int) else None,
+        })
     return out
 
 
 def repair_index_from_committed_pointdirs(
     campaign_dir: Union[str, Path],
-    training_dir: Union[str, Path],
+    reference_data_dir: Union[str, Path],
 ) -> int:
     """Append missing committed pointdir records to seed_frame_id_index.json.
 
     Existing records are keyed by (iteration, pointdir_name), making this
     helper idempotent. Returns the number of records added.
     """
-    truth = _records_from_committed_pointdirs(training_dir)
+    truth = _records_from_committed_pointdirs(reference_data_dir)
     if not truth:
         return 0
     with _index_lock(campaign_dir):
@@ -651,10 +630,10 @@ def repair_index_from_committed_pointdirs(
 
 def load_training_seed_frame_ids(
     campaign_dir: Union[str, Path],
-    training_dir: Optional[Union[str, Path]] = None,
+    reference_data_dir: Optional[Union[str, Path]] = None,
 ) -> Set[int]:
     """Return the set of stable trajectory frame_ids that have already been
-    used as seeds for committed training-set points.
+    used as seeds for committed QM reference-data points.
 
     SEED_SELECT calls this once per iteration to compute its
     `forbidden_frame_ids` set (intersected with the recent-seeds cooldown).
@@ -665,7 +644,7 @@ def load_training_seed_frame_ids(
     index-append loop can leave it short of what is actually committed. When
     `training_dir` is given we also scan the committed pointdir sidecars and
     union them in, so a truncated index can never make SEED_SELECT re-pick a
-    frame that is already in the training set. Reading only -- the index is not
+    frame that is already in the QM reference data. Reading only -- the index is not
     rewritten here.
     """
     data = load_index(campaign_dir)
@@ -674,8 +653,8 @@ def load_training_seed_frame_ids(
         fid = rec.get("seed_frame_id")
         if isinstance(fid, int):
             result.add(int(fid))
-    if training_dir is not None:
-        result |= seed_frame_ids_from_committed_pointdirs(training_dir)
+    if reference_data_dir is not None:
+        result |= seed_frame_ids_from_committed_pointdirs(reference_data_dir)
     return result
 
 

@@ -35,7 +35,7 @@ def _write_seed_select_state(daemon):
     daemon.data_dir().mkdir(parents=True, exist_ok=True)
     state = fresh_campaign_state(max_iterations=2)
     state.phase = CampaignPhase.SEED_SELECT
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = 0
     write_state(daemon.state_path(), state)
     return state
@@ -114,7 +114,7 @@ def test_committed_artifact_verification_non_settle_error_halts_immediately(
 
     def fake_verify(*args, **kwargs):
         calls["n"] += 1
-        raise RuntimeError("state training/model version skew")
+        raise RuntimeError("state reference-data/model version skew")
 
     monkeypatch.setattr(
         "ichor.hpc.active_learning.daemon.artifact_contracts.verify_state_referenced_artifacts",
@@ -129,4 +129,4 @@ def test_committed_artifact_verification_non_settle_error_halts_immediately(
     events = list(iter_events(daemon.journal_path()))
     assert not [e for e in events if e.get("event") == "committed_artifact_settle_retry"]
     halt = [e for e in events if e.get("event") == "halt"][-1]
-    assert "state training/model version skew" in halt["reason"]
+    assert "state reference-data/model version skew" in halt["reason"]

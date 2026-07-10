@@ -47,7 +47,7 @@ from .daemon.config_lock import (
     archive_scripts_for_reconcile,
     archive_data_staging_for_ferebus_reentry,
     archive_data_staging_for_operator_reconcile,
-    archive_training_staging_for_reconcile,
+    archive_reference_data_staging_for_reconcile,
     assert_config_unchanged_for_start,
     clean_model_iteration_staging_for_reconcile,
     clean_reentry_staging,
@@ -57,7 +57,7 @@ from .daemon.config_lock import (
     format_config_review,
     review_config_changes,
     restore_config_from_lock_proposal,
-    training_staging_can_archive_for_reconcile,
+    reference_data_staging_can_archive_for_reconcile,
 )
 from .daemon.dry_run_executor import DryRunPhaseExecutor
 from .daemon.dry_run_sacct import DryRunSacctPoller
@@ -103,7 +103,7 @@ from .daemon.status_recommendations import (
     build_status_recommendations,
     recommendation_dicts,
 )
-from .versioning.training_set import TrainingSetVersioning
+from .versioning.versioned_directory import VersionedDirectory
 
 
 __all__ = [
@@ -956,7 +956,7 @@ def _status_version(item: Dict[str, Any]) -> int:
         return -1
 
 
-def _training_product_status(phase: str, item: Dict[str, Any]) -> str:
+def _reference_data_product_status(phase: str, item: Dict[str, Any]) -> str:
     if phase in _BOOTSTRAP_NOT_READY_PHASES:
         version = _status_version(item)
         if item.get("ok") is True and version >= 0:
@@ -968,10 +968,10 @@ def _training_product_status(phase: str, item: Dict[str, Any]) -> str:
             return "ready for initial FEREBUS (v" + str(version) + ")"
         return "using initial AIMAll handoff"
     if phase in _TRAINING_REQUIRED_PHASES:
-        return _product_ok_text(item, label="training")
+        return _product_ok_text(item, label="QM reference data")
     if phase in (CampaignPhase.DONE.value, CampaignPhase.HALTED.value):
-        return _product_ok_text(item, label="training")
-    return _product_ok_text(item, label="training")
+        return _product_ok_text(item, label="QM reference data")
+    return _product_ok_text(item, label="QM reference data")
 
 
 def _models_product_status(phase: str, item: Dict[str, Any]) -> str:
@@ -1007,28 +1007,28 @@ def _format_data_products_summary(
     phase_name = str(phase or "")
     rows: List[tuple[str, Any]] = []
     if not isinstance(status, dict):
-        rows.append(("bootstrap training set", "not checked"))
+        rows.append(("bootstrap QM reference data", "not checked"))
         rows.append(("FEREBUS models", "not checked"))
     else:
-        training = status.get("training")
-        if isinstance(training, dict):
+        reference_data = status.get("reference_data")
+        if isinstance(reference_data, dict):
             rows.append(
                 (
-                    "bootstrap training set",
-                    _training_product_status(phase_name, training),
+                    "bootstrap QM reference data",
+                    _reference_data_product_status(phase_name, reference_data),
                 )
             )
             if (
                 phase_name in _BOOTSTRAP_NOT_READY_PHASES
-                and training.get("ok") is not True
+                and reference_data.get("ok") is not True
             ):
-                rows.append(("training expected after", "INITIAL_AIMALL / INITIAL_FEREBUS"))
+                rows.append(("reference data expected after", "INITIAL_AIMALL / INITIAL_FEREBUS"))
             if verbose:
-                rows.append(("training version", training.get("version")))
-                for error in training.get("errors") or []:
-                    rows.append(("training detail", error))
+                rows.append(("reference-data version", reference_data.get("version")))
+                for error in reference_data.get("errors") or []:
+                    rows.append(("reference-data detail", error))
         else:
-            rows.append(("bootstrap training set", "not checked"))
+            rows.append(("bootstrap QM reference data", "not checked"))
 
         models = status.get("models")
         if isinstance(models, dict):
@@ -1075,7 +1075,7 @@ def _format_artifact_summary(
         if verbose and isinstance(state_contract, dict):
             for error in state_contract.get("errors") or []:
                 rows.append(("state contract detail", error))
-    for label in ("training", "models"):
+    for label in ("reference_data", "models"):
         item = status.get(label)
         if isinstance(item, dict):
             version = item.get("version")
@@ -1483,7 +1483,7 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "tick_error": "daemon tick error",
     "tick_exception_halted": "daemon halted after exception",
     "subspace_built": "subspace built",
-    "training_set_committed": "training set committed",
+    "reference_data_committed": "QM reference data committed",
     "models_committed": "models committed",
     "seed_selected": "seeds selected",
     "anti_overlap_flagged": "anti-overlap flagged",
@@ -1577,7 +1577,7 @@ def _event_int(event: Dict[str, Any], key: str) -> Optional[int]:
 _JOURNAL_OK_EVENTS = {
     "phase_succeeded",
     "phase_succeeded_live",
-    "training_set_committed",
+    "reference_data_committed",
     "models_committed",
     "trajectory_pool_imported",
     "quantum_quality_summary",
@@ -3198,8 +3198,8 @@ def _reconcile_apply_contract_error(campaign: Path, state: Any) -> Optional[str]
     return (
         "phase="
         + str(status.get("phase"))
-        + " training_set_version="
-        + str(status.get("training_set_version"))
+        + " reference_data_version="
+        + str(status.get("reference_data_version"))
         + " models_version="
         + str(status.get("models_version"))
         + ": "
@@ -3248,8 +3248,8 @@ def _reconcile_cleanable_reasons(report: Any) -> List[str]:
         cleanable.append(".DATA/SCRIPTS contains sbatch scripts")
     if "dangling model staging directories exist" in reasons:
         cleanable.append("dangling model staging directories exist")
-    if "dangling training staging directories exist" in reasons:
-        cleanable.append("dangling training staging directories exist")
+    if "dangling reference-data staging directories exist" in reasons:
+        cleanable.append("dangling reference-data staging directories exist")
     if ".DATA/STAGING is non-empty" in reasons:
         cleanable.append(
             ".DATA/STAGING is non-empty (requires --archive-staging when safe)"
@@ -3264,14 +3264,14 @@ def _reconcile_hard_blockers(
     cleanable_exact = {
         ".DATA/SCRIPTS contains sbatch scripts",
         "dangling model staging directories exist",
-        "dangling training staging directories exist",
+        "dangling reference-data staging directories exist",
     }
     cleanable_blocking_artifacts = set()
     reasons = set(str(reason) for reason in getattr(report, "unsafe_reasons", []))
     if "dangling model staging directories exist" in reasons:
         cleanable_blocking_artifacts.add("dangling model staging")
-    if "dangling training staging directories exist" in reasons:
-        cleanable_blocking_artifacts.add("dangling training staging")
+    if "dangling reference-data staging directories exist" in reasons:
+        cleanable_blocking_artifacts.add("dangling reference-data staging")
     blockers: List[str] = []
     for reason in getattr(report, "unsafe_reasons", []):
         if reason in cleanable_exact:
@@ -3406,7 +3406,7 @@ def _reconcile_human_reason(reason: Any) -> str:
     mapping = {
         ".DATA/SCRIPTS contains sbatch scripts": "stale sbatch scripts",
         "dangling model staging directories exist": "dangling model staging",
-        "dangling training staging directories exist": "dangling training staging",
+        "dangling reference-data staging directories exist": "dangling reference-data staging",
         ".DATA/STAGING is non-empty": ".DATA/STAGING is non-empty",
         ".DATA/STAGING is non-empty (requires --archive-staging when safe)": (
             ".DATA/STAGING is non-empty; requires --archive-staging when safe"
@@ -3550,11 +3550,11 @@ def _reconcile_read_current_state_summary(campaign: Path, report: Any) -> Dict[s
     return {
         "state": state.phase.value + " at iteration " + str(int(state.iteration)),
         "versions": (
-            "training="
-            + str(int(state.training_set_version))
+            "reference_data="
+            + str(int(state.reference_data_version))
             + (
                 " valid"
-                if int(state.training_set_version) in set(getattr(report, "valid_training_versions", []))
+                if int(state.reference_data_version) in set(getattr(report, "valid_reference_data_versions", []))
                 else ""
             )
             + ", models="
@@ -3634,8 +3634,8 @@ def _reconcile_model_staging_summary(report: Any) -> str:
     return "none"
 
 
-def _reconcile_training_staging_summary(report: Any) -> str:
-    if "dangling training staging directories exist" in list(getattr(report, "unsafe_reasons", [])):
+def _reconcile_reference_data_staging_summary(report: Any) -> str:
+    if "dangling reference-data staging directories exist" in list(getattr(report, "unsafe_reasons", [])):
         return "dangling, cleanable"
     return "none"
 
@@ -3737,11 +3737,11 @@ def _print_reconcile_artefacts(
     _print_reconcile_key_values(
         [
             (
-                "training versions",
+                "reference-data versions",
                 "committed "
-                + repr(getattr(report, "committed_training_versions", []))
+                + repr(getattr(report, "committed_reference_data_versions", []))
                 + ", valid "
-                + repr(getattr(report, "valid_training_versions", [])),
+                + repr(getattr(report, "valid_reference_data_versions", [])),
             ),
             (
                 "model versions",
@@ -3755,7 +3755,7 @@ def _print_reconcile_artefacts(
             ("scripts", _reconcile_scripts_summary(report)),
             ("staging", _reconcile_staging_summary(campaign, contract_status, report)),
             ("model staging", _reconcile_model_staging_summary(report)),
-            ("training staging", _reconcile_training_staging_summary(report)),
+            ("reference-data staging", _reconcile_reference_data_staging_summary(report)),
         ]
     )
     inv = getattr(report, "script_inventory", {}) or {}
@@ -3987,7 +3987,7 @@ def _print_reconcile_applied_operator_report(
     removed_model_staging: Sequence[str],
     archived_scripts: Sequence[str],
     archived: Sequence[str],
-    archived_training_staging: Sequence[str],
+    archived_reference_data_staging: Sequence[str],
     restored_bootstrap_handoff: Sequence[str],
 ) -> None:
     _print_reconcile_header(campaign, mode="apply", result="APPLIED")
@@ -3998,7 +3998,7 @@ def _print_reconcile_applied_operator_report(
     cleanup_items.extend("removed model staging: " + _reconcile_relative_path(campaign, item) for item in removed_model_staging)
     cleanup_items.extend("archived stale scripts: " + _reconcile_relative_path(campaign, item) for item in archived_scripts)
     cleanup_items.extend("archived staging: " + _reconcile_relative_path(campaign, item) for item in archived)
-    cleanup_items.extend("archived training staging: " + _reconcile_relative_path(campaign, item) for item in archived_training_staging)
+    cleanup_items.extend("archived reference-data staging: " + _reconcile_relative_path(campaign, item) for item in archived_reference_data_staging)
     cleanup_items.extend("restored bootstrap staging: " + _reconcile_relative_path(campaign, item) for item in restored_bootstrap_handoff)
     _print_reconcile_key_values(
         [
@@ -4378,17 +4378,17 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             report.notes.append(
                 ".DATA/STAGING cannot be archived automatically: " + staging_reason
             )
-    if "dangling training staging directories exist" in report.unsafe_reasons:
-        ok_to_archive_training, training_reason = training_staging_can_archive_for_reconcile(
+    if "dangling reference-data staging directories exist" in report.unsafe_reasons:
+        ok_to_archive_reference_data, reference_data_reason = reference_data_staging_can_archive_for_reconcile(
             campaign,
             report.proposed_state,
         )
-        if ok_to_archive_training:
-            cleanable_reasons.add("dangling training staging directories exist")
+        if ok_to_archive_reference_data:
+            cleanable_reasons.add("dangling reference-data staging directories exist")
         else:
             report.notes.append(
-                "dangling training staging cannot be archived automatically: "
-                + training_reason
+                "dangling reference-data staging cannot be archived automatically: "
+                + reference_data_reason
             )
     uncleanable = [
         reason
@@ -4468,17 +4468,17 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         campaign,
         report.proposed_state,
     ) if "dangling model staging directories exist" in report.unsafe_reasons else []
-    archived_training_staging = archive_training_staging_for_reconcile(
+    archived_reference_data_staging = archive_reference_data_staging_for_reconcile(
         campaign,
         report.proposed_state,
-    ) if "dangling training staging directories exist" in report.unsafe_reasons else []
+    ) if "dangling reference-data staging directories exist" in report.unsafe_reasons else []
     removed = clean_reentry_staging(campaign, report.proposed_state.phase)
     cleanup_paths_already_done = (
         list(archived_scripts)
         + list(archived_array_outputs)
         + list(archived)
         + list(removed_model_staging)
-        + list(archived_training_staging)
+        + list(archived_reference_data_staging)
         + list(removed)
     )
 
@@ -4573,14 +4573,16 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         return 9
 
     try:
-        state_train_version = int(report.proposed_state.training_set_version)
+        state_train_version = int(report.proposed_state.reference_data_version)
         if state_train_version >= 0:
-            TrainingSetVersioning(campaign / "5_TRAINING").ensure_current(
+            from .versioning.reference_data import ReferenceDataVersioning
+
+            ReferenceDataVersioning(campaign / "QM_REFERENCE_DATA").ensure_current(
                 state_train_version
             )
         state_model_version = int(report.proposed_state.models_version)
         if state_model_version >= 0:
-            TrainingSetVersioning(campaign / "6_TRAINED_MODELS").ensure_current(
+            VersionedDirectory(campaign / "6_TRAINED_MODELS").ensure_current(
                 state_model_version
             )
     except Exception as exc:
@@ -4700,9 +4702,9 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 len(config_review.allowed_changes) if config_review is not None else 0
             ),
             n_removed_stale_paths=len(removed) + len(removed_model_staging),
-            n_archived_staging_paths=len(archived) + len(archived_training_staging),
+            n_archived_staging_paths=len(archived) + len(archived_reference_data_staging),
             archived_staging_path=(archived[0] if archived else None),
-            archived_training_staging_paths=archived_training_staging,
+            archived_reference_data_staging_paths=archived_reference_data_staging,
             n_archived_scripts_paths=len(archived_scripts),
             archived_scripts_path=(archived_scripts[0] if archived_scripts else None),
             recomputed_after_transient_cleanup=(
@@ -4728,7 +4730,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         removed_model_staging=removed_model_staging,
         archived_scripts=archived_scripts,
         archived=archived,
-        archived_training_staging=archived_training_staging,
+        archived_reference_data_staging=archived_reference_data_staging,
         restored_bootstrap_handoff=restored_bootstrap_handoff,
     )
     return 0
@@ -4934,6 +4936,9 @@ def _bootstrap_fresh_campaign_state(
     campaign: Path,
     config: CampaignConfig,
 ) -> Dict[str, Any]:
+    from .layout import reject_legacy_training_layout
+
+    reject_legacy_training_layout(campaign)
     paths = _campaign_paths(campaign)
     paths["data"].mkdir(parents=True, exist_ok=True)
     (campaign / ".DATA" / "STAGING").mkdir(parents=True, exist_ok=True)
@@ -5530,7 +5535,7 @@ Examples:
     p_start.add_argument(
         "-d",
         "--dry-run", action="store_true",
-        help="Use DryRunPhaseExecutor: stub all backend calls but produce real on-disk artefacts (scripts, training-set versions, manifests).",
+        help="Use DryRunPhaseExecutor: stub all backend calls but produce real on-disk artefacts (scripts, reference-data delta versions, manifests).",
     )
     p_start.add_argument(
         "-l",

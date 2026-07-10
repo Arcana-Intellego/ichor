@@ -8,9 +8,9 @@
 
 What the dry-run executor DOES exercise (real, no mocking):
 
-    * Directory layout setup (5_TRAINING/, 6_TRAINED_MODELS/, 7_ACTIVE_LEARNING/,
+    * Directory layout setup (QM_REFERENCE_DATA/, 6_TRAINED_MODELS/, 7_ACTIVE_LEARNING/,
       .DATA/SCRIPTS/).
-    * TrainingSetVersioning (stage, commit, update_current, manifest writes,
+    * VersionedDirectory (stage, commit, update_current, manifest writes,
       atomic renames).
     * ".DATA/SCRIPTS/*.sh" stub script creation per SLURM-backed phase.
     * Journal events for every phase entry / postprocess / commit.
@@ -50,7 +50,8 @@ from ..versioning.provenance import (
     load_training_seed_frame_ids,
     write_seed_provenance,
 )
-from ..versioning.training_set import TrainingSetVersioning
+from ..versioning.reference_data import ReferenceDataVersioning
+from ..versioning.versioned_directory import VersionedDirectory
 from .phase_executor import (
     BackendSubmissionError,
     FailureAction,
@@ -85,7 +86,7 @@ class DryRunPhaseExecutor:
     campaign_dir: Path
     config: CampaignConfig
     rng_seed: int = 0
-    training_dir_name: str = "5_TRAINING"
+    reference_data_dir_name: str = "QM_REFERENCE_DATA"
     models_dir_name: str = "6_TRAINED_MODELS"
     diversity_dir_name: str = "3_DIVERSITY_SAMPLING"
     al_dir_name: str = "7_ACTIVE_LEARNING"
@@ -93,10 +94,13 @@ class DryRunPhaseExecutor:
     artefact_log: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        from ..layout import reject_legacy_training_layout
+
         self.campaign_dir = Path(self.campaign_dir)
+        reject_legacy_training_layout(self.campaign_dir)
         self.scripts_dir = self.campaign_dir / ".DATA" / "SCRIPTS"
         self.scripts_dir.mkdir(parents=True, exist_ok=True)
-        (self.campaign_dir / self.training_dir_name).mkdir(parents=True, exist_ok=True)
+        (self.campaign_dir / self.reference_data_dir_name).mkdir(parents=True, exist_ok=True)
         (self.campaign_dir / self.models_dir_name).mkdir(parents=True, exist_ok=True)
         (self.campaign_dir / self.diversity_dir_name).mkdir(parents=True, exist_ok=True)
         (self.campaign_dir / self.al_dir_name).mkdir(parents=True, exist_ok=True)
@@ -146,11 +150,13 @@ class DryRunPhaseExecutor:
         self.artefact_log.append(str(path))
         return path
 
-    def _versioning(self, kind: str) -> TrainingSetVersioning:
-        if kind == "training":
-            return TrainingSetVersioning(self.campaign_dir / self.training_dir_name)
+    def _versioning(self, kind: str) -> VersionedDirectory:
+        if kind == "reference_data":
+            return ReferenceDataVersioning(
+                self.campaign_dir / self.reference_data_dir_name
+            )
         if kind == "models":
-            return TrainingSetVersioning(self.campaign_dir / self.models_dir_name)
+            return VersionedDirectory(self.campaign_dir / self.models_dir_name)
         raise ValueError("unknown versioning kind: " + kind)
 
     # --- internal: inline phases ---------------------------------------
@@ -293,7 +299,7 @@ class DryRunPhaseExecutor:
         if getattr(self.config.anti_overlap, "skip_training_seeds", True):
             training_forbidden = load_training_seed_frame_ids(
                 self.campaign_dir,
-                training_dir=self.campaign_dir / self.training_dir_name,
+                reference_data_dir=self.campaign_dir / self.reference_data_dir_name,
             )
         else:
             training_forbidden = set()
@@ -621,118 +627,69 @@ class DryRunPhaseExecutor:
         return {}
 
     def _inline_append(self, state) -> Dict[str, Any]:
-        """Stage and commit the next training iteration via TrainingSetVersioning.
-
-        The wiring: provenance sidecars from this iteration pool/seed_NNNN/
-        are copied into the committed iteration directory as a synthetic 1:1
-        mapping (POINT_k.pointdir <- seed_k); then the daemon
-        seed_frame_id_index.json grows by one record per committed pointdir.
-
-        Idempotency: if "state.training_set_version + 1" is already
-        a committed version (we crashed between commit() and _persist on
-        the previous run), skip the stage/commit cycle and return the
-        existing version. Prevents orphan-iteration-directory bugs that
-        the persist-before-journal swap would otherwise expose.
-        """
+        """Commit this iteration's accepted QM points as one immutable delta."""
         from . import input_staging as _stg
 
-        v = self._versioning("training")
+        v = self._versioning("reference_data")
         committed = v.list_committed_versions()
-        state_version = int(getattr(state, "training_set_version", 0))
+        state_version = int(getattr(state, "reference_data_version", 0))
         committed_max = max(committed) if committed else -1
         if committed_max > state_version:
             if int(committed_max) != int(state_version) + 1:
                 raise BackendSubmissionError(
-                    "training_set_version_gap: state="
+                    "reference_data_version_gap: state="
                     + str(state_version)
                     + " committed_versions="
                     + repr(committed)
                 )
-            try:
-                _stg.verify_committed_allocation_snapshot(
-                    self.campaign_dir,
-                    training_version=int(committed_max),
-                    context="active",
-                    iteration=int(state.iteration),
-                )
-            except Exception as exc:
-                raise BackendSubmissionError(
-                    "idempotent APPEND allocation verification failed: "
-                    + type(exc).__name__
-                    + ": "
-                    + str(exc)
-                ) from exc
-            #already committed in a previous run; idempotent no-op.
-            self._journal_event(
-                "training_set_committed",
-                iteration=int(state.iteration),
-                training_set_version=int(committed_max),
-                n_committed_points=0,
-                idempotent_skip=True,
-            )
-            v.ensure_current(committed_max)
-            return {"training_set_version": int(committed_max)}
-        if committed_max < state_version:
+            target_version = int(committed_max)
+        elif committed_max < state_version:
             raise BackendSubmissionError(
-                "training_set_version "
+                "reference_data_version "
                 + str(state_version)
-                + " is ahead of committed training versions "
+                + " is ahead of committed reference-data versions "
                 + repr(committed)
             )
-        if committed:
-            v.ensure_current(committed_max)
-        next_version = committed_max + 1
-        v.recover_dangling_staging()
-        source = committed_max if committed_max >= 0 else None
-        staging = v.stage(source_version=source, target_version=next_version)
-        accepted_pointdirs, allocation = _stg.accepted_allocation_pointdirs(
-            self.campaign_dir,
-            context="active",
-            iteration=int(state.iteration),
-        )
-        committed_pointdirs = []
-        next_point_index = max(
-            [
-                int(path.name[6:10])
-                for path in staging.glob("POINT_????.pointdir")
-                if path.is_dir()
-            ]
-            + [-1]
-        ) + 1
-        for source_pointdir in accepted_pointdirs:
-            destination = staging / (
-                "POINT_" + str(next_point_index).zfill(4) + ".pointdir"
+        else:
+            target_version = int(committed_max) + 1
+        try:
+            view, committed_pointdirs, created = _stg.commit_reference_data_delta(
+                self.campaign_dir,
+                reference_data_version=target_version,
+                context="active",
+                iteration=int(state.iteration),
             )
-            _stg._copytree_no_symlinks(source_pointdir, destination)
-            committed_pointdirs.append(destination.name)
-            next_point_index += 1
-        atomic_write_json(staging / "POINT_ALLOCATION.json", allocation)
-        atomic_write_json(
-            staging / ("POINT_ALLOCATION.version-" + str(next_version).zfill(4) + ".json"),
-            allocation,
-        )
-        v.commit(next_version)
-        v.update_current(next_version)
+        except Exception as exc:
+            raise BackendSubmissionError(
+                "reference-data APPEND transaction failed: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)
+            ) from exc
         ensure_index(self.campaign_dir)
-        committed_iter_dir = v.iteration_path(next_version)
+        committed_iter_dir = v.iteration_path(target_version)
         for pdir_name in committed_pointdirs:
             pdir = committed_iter_dir / pdir_name
             seed_frame_id = self._read_seed_frame_id_from_pointdir(pdir)
             append_to_index(
                 self.campaign_dir,
-                iteration=int(next_version),
+                iteration=int(target_version),
                 pointdir_name=pdir_name,
                 seed_frame_id=seed_frame_id,
             )
         self._journal_event(
-            "training_set_committed",
+            "reference_data_committed",
             iteration=int(state.iteration),
-            training_set_version=int(next_version),
-            n_committed_points=int(len(committed_pointdirs)),
+            reference_data_version=int(target_version),
+            n_committed_points=int(len(committed_pointdirs)) if created else 0,
+            cumulative_point_count=int(len(view.entries)),
+            head_manifest_sha256=str(view.head_manifest_sha256),
+            cumulative_view_sha256=str(view.cumulative_view_sha256),
             expected_batch_total=int(self.config.point_allocation.batch_total_size),
+            idempotent_skip=not bool(created),
         )
         self.artefact_log.append(str(self._iter_dir(state.iteration) / "APPEND_marker"))
-        return {"training_set_version": int(next_version)}
+        return {"reference_data_version": int(target_version)}
 
     def _inline_stop_check(self, state):
         """roll the last observed alpha0 into alpha_history and apply the
@@ -1025,18 +982,18 @@ class DryRunPhaseExecutor:
     def _post_initial_ferebus(self, state) -> Dict[str, Any]:
         """Commit the initial training iteration and write a stub model file.
 
-        This is the first time the training set versioning is exercised; the
+        This is the first time the QM reference-data versioning is exercised; the
         committed iteration-0000 holds the initial diverse sample's stub
         PointDirectories.
         """
-        v_train = self._versioning("training")
+        v_train = self._versioning("reference_data")
         v_models = self._versioning("models")
         v_train.recover_dangling_staging()
         v_models.recover_dangling_staging()
 
-        from .input_staging import commit_initial_training_set
+        from .input_staging import commit_initial_reference_data
 
-        commit_initial_training_set(self.campaign_dir)
+        commit_initial_reference_data(self.campaign_dir)
         v_train.ensure_current(0)
 
         #commit models iteration 0.
@@ -1049,7 +1006,7 @@ class DryRunPhaseExecutor:
             v_models.update_current(0)
         else:
             v_models.ensure_current(0)
-        return {"training_set_version": 0, "models_version": 0}
+        return {"reference_data_version": 0, "models_version": 0}
 
     def _post_ariadne_array(self, state) -> Dict[str, Any]:
         """Use the mock ARIADNE runner to produce per-seed result.json files
@@ -1579,16 +1536,16 @@ class DryRunPhaseExecutor:
         )
 
     def _post_ferebus(self, state) -> Dict[str, Any]:
-        """Commit the next models iteration. Training set itself has already
+        """Commit the next models iteration. QM reference data itself has already
         been committed by the inline APPEND phase one step earlier."""
         v_models = self._versioning("models")
         v_models.recover_dangling_staging()
         committed = v_models.list_committed_versions()
-        expected_next = int(getattr(state, "training_set_version", -1))
+        expected_next = int(getattr(state, "reference_data_version", -1))
         if expected_next < 0:
             raise ValueError(
-                "FEREBUS requires a committed training_set_version, got "
-                + repr(getattr(state, "training_set_version", None))
+                "FEREBUS requires a committed reference_data_version, got "
+                + repr(getattr(state, "reference_data_version", None))
             )
         if expected_next in committed:
             repaired_version = int(expected_next)

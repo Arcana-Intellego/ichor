@@ -274,7 +274,7 @@ def test_tick_initialises_state_on_first_call(tmp_path):
 
 def test_tick_refuses_fresh_state_when_campaign_has_committed_artifacts(tmp_path):
     d = _make_daemon(tmp_path)
-    committed = d.campaign_dir / "5_TRAINING" / "iteration-0000"
+    committed = d.campaign_dir / "QM_REFERENCE_DATA" / "iteration-0000"
     committed.mkdir(parents=True)
     (committed / "marker.txt").write_text("training\n", encoding="utf-8")
 
@@ -872,7 +872,7 @@ def test_ferebus_transition_requires_fresh_model_update(tmp_path):
     d = _make_daemon(tmp_path, executor=executor)
     state = fresh_campaign_state(max_iterations=1)
     state.phase = CampaignPhase.FEREBUS
-    state.training_set_version = 1
+    state.reference_data_version = 1
     state.models_version = 0
 
     reason = d._transition_output_contract_error(state, CampaignPhase.FEREBUS, {})
@@ -886,7 +886,7 @@ def test_ferebus_transition_rejects_training_model_skew(tmp_path):
     d = _make_daemon(tmp_path, executor=executor)
     state = fresh_campaign_state(max_iterations=1)
     state.phase = CampaignPhase.FEREBUS
-    state.training_set_version = 2
+    state.reference_data_version = 2
     state.models_version = 1
 
     reason = d._transition_output_contract_error(
@@ -896,7 +896,7 @@ def test_ferebus_transition_rejects_training_model_skew(tmp_path):
     )
 
     assert reason is not None
-    assert "model/training version skew" in reason
+    assert "model/reference-data version skew" in reason
 
 
 def test_journal_records_phase_transitions(tmp_path):

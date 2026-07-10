@@ -8,6 +8,8 @@ The contract enforced here:
     training-set version.
 """
 import json
+import os
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,7 +19,7 @@ from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.daemon.dry_run_executor import DryRunPhaseExecutor
 from ichor.hpc.active_learning.daemon.phase_executor import BackendSubmissionError
 from ichor.hpc.active_learning.daemon.state import CampaignPhase
-from ichor.hpc.active_learning.versioning.training_set import TrainingSetVersioning
+from ichor.hpc.active_learning.versioning.versioned_directory import VersionedDirectory
 
 
 def _make_executor(tmp_path):
@@ -48,33 +50,33 @@ def _prepare_active_quantum_allocation(ex, state):
 
 
 def test_inline_append_idempotent_when_next_version_already_committed(tmp_path):
-    """If state.training_set_version + 1 is already a committed iteration
+    """If state.reference_data_version + 1 is already a committed iteration
     (e.g. we crashed between commit and _persist on the previous run), the
     re-run of APPEND must be a no-op rather than producing a duplicate
     iteration directory."""
     ex = _make_executor(tmp_path)
-    state = SimpleNamespace(iteration=0, campaign_uid="uid", training_set_version=0)
+    state = SimpleNamespace(iteration=0, campaign_uid="uid", reference_data_version=0)
     _prepare_bootstrap(ex, state)
     # First APPEND: commits version 1.
     _prepare_active_quantum_allocation(ex, state)
     result1 = ex.submit_or_run(state, CampaignPhase.APPEND)
-    assert result1.state_updates["training_set_version"] == 1
+    assert result1.state_updates["reference_data_version"] == 1
 
-    v = TrainingSetVersioning(tmp_path / "campaign" / "5_TRAINING")
+    v = VersionedDirectory(tmp_path / "campaign" / "QM_REFERENCE_DATA")
     assert sorted(v.list_committed_versions()) == [0, 1]
 
     # Simulate "crash after commit, before _persist updated state". The
-    # state still reports training_set_version=0; the same APPEND call
+    # state still reports reference_data_version=0; the same APPEND call
     # must NOT produce iteration-0002 because version 1 already exists.
     result2 = ex.submit_or_run(state, CampaignPhase.APPEND)
-    assert result2.state_updates["training_set_version"] == 1
+    assert result2.state_updates["reference_data_version"] == 1
     assert sorted(v.list_committed_versions()) == [0, 1]
     assert v.current_version() == 1
 
 
 def test_inline_append_idempotent_skip_journals_clearly(tmp_path):
     ex = _make_executor(tmp_path)
-    state = SimpleNamespace(iteration=0, campaign_uid="uid", training_set_version=0)
+    state = SimpleNamespace(iteration=0, campaign_uid="uid", reference_data_version=0)
     _prepare_bootstrap(ex, state)
     _prepare_active_quantum_allocation(ex, state)
     ex.submit_or_run(state, CampaignPhase.APPEND)
@@ -86,18 +88,18 @@ def test_inline_append_idempotent_skip_journals_clearly(tmp_path):
         for line in journal_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    commits = [e for e in events if e.get("event") == "training_set_committed"]
+    commits = [e for e in events if e.get("event") == "reference_data_committed"]
     assert any(e.get("idempotent_skip") is True for e in commits)
 
 
 def test_inline_append_idempotent_skip_repairs_current_pointer(tmp_path):
     ex = _make_executor(tmp_path)
-    state = SimpleNamespace(iteration=0, campaign_uid="uid", training_set_version=0)
+    state = SimpleNamespace(iteration=0, campaign_uid="uid", reference_data_version=0)
     _prepare_bootstrap(ex, state)
     _prepare_active_quantum_allocation(ex, state)
     ex.submit_or_run(state, CampaignPhase.APPEND)
 
-    v = TrainingSetVersioning(tmp_path / "campaign" / "5_TRAINING")
+    v = VersionedDirectory(tmp_path / "campaign" / "QM_REFERENCE_DATA")
     v.update_current(0)
     assert v.current_version() == 0
 
@@ -107,7 +109,7 @@ def test_inline_append_idempotent_skip_repairs_current_pointer(tmp_path):
 
 def test_inline_append_idempotent_skip_rejects_mismatched_allocation(tmp_path):
     ex = _make_executor(tmp_path)
-    state = SimpleNamespace(iteration=0, campaign_uid="uid", training_set_version=0)
+    state = SimpleNamespace(iteration=0, campaign_uid="uid", reference_data_version=0)
     _prepare_bootstrap(ex, state)
     _prepare_active_quantum_allocation(ex, state)
     ex.submit_or_run(state, CampaignPhase.APPEND)
@@ -115,38 +117,39 @@ def test_inline_append_idempotent_skip_rejects_mismatched_allocation(tmp_path):
     snapshot = (
         tmp_path
         / "campaign"
-        / "5_TRAINING"
+        / "QM_REFERENCE_DATA"
         / "iteration-0001"
         / "POINT_ALLOCATION.version-0001.json"
     )
     payload = json.loads(snapshot.read_text(encoding="utf-8"))
     payload["iteration"] = 999
+    os.chmod(snapshot, stat.S_IMODE(snapshot.stat().st_mode) | stat.S_IWUSR)
     snapshot.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(
         BackendSubmissionError,
-        match="idempotent APPEND allocation verification failed",
+        match="reference-data APPEND transaction failed",
     ):
         ex.submit_or_run(state, CampaignPhase.APPEND)
 
 
 def test_initial_training_idempotent_skip_repairs_current_pointer(tmp_path):
-    from ichor.hpc.active_learning.daemon.input_staging import commit_initial_training_set
+    from ichor.hpc.active_learning.daemon.input_staging import commit_initial_reference_data
 
     ex = _make_executor(tmp_path)
     campaign = ex.campaign_dir
-    state = SimpleNamespace(iteration=0, campaign_uid="uid", training_set_version=-1)
+    state = SimpleNamespace(iteration=0, campaign_uid="uid", reference_data_version=-1)
     ex.postprocess(state, CampaignPhase.PHASE_A_POLUS, observations=[])
     ex.postprocess(state, CampaignPhase.INITIAL_GAUSSIAN, observations=[])
     ex.postprocess(state, CampaignPhase.INITIAL_AIMALL, observations=[])
-    v = TrainingSetVersioning(campaign / "5_TRAINING")
-    assert commit_initial_training_set(campaign) is True
+    v = VersionedDirectory(campaign / "QM_REFERENCE_DATA")
+    assert commit_initial_reference_data(campaign) is True
     for pointer in (v.current_link_path(), v._pointer_path()):
         if pointer.is_symlink() or pointer.is_file():
             pointer.unlink()
     assert v.current_version() is None
 
-    assert commit_initial_training_set(campaign) is False
+    assert commit_initial_reference_data(campaign) is False
     assert v.current_version() == 0
 
 
@@ -155,17 +158,17 @@ def test_dry_ferebus_idempotent_skip_repairs_model_current_pointer(tmp_path):
     state = SimpleNamespace(
         iteration=1,
         campaign_uid="uid",
-        training_set_version=1,
+        reference_data_version=1,
         models_version=0,
     )
     _prepare_bootstrap(
         ex,
-        SimpleNamespace(iteration=0, campaign_uid="uid", training_set_version=-1),
+        SimpleNamespace(iteration=0, campaign_uid="uid", reference_data_version=-1),
     )
 
     first = ex.postprocess(state, CampaignPhase.FEREBUS, observations=[])
     assert first.state_updates["models_version"] == 1
-    v = TrainingSetVersioning(tmp_path / "campaign" / "6_TRAINED_MODELS")
+    v = VersionedDirectory(tmp_path / "campaign" / "6_TRAINED_MODELS")
     v.update_current(0)
     assert v.current_version() == 0
 

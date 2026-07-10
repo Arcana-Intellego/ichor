@@ -1,4 +1,5 @@
 """Persistent exact pointdir-level FEREBUS split ledger tests."""
+import hashlib
 import json
 
 import pytest
@@ -12,7 +13,7 @@ from ichor.hpc.active_learning.daemon.ferebus_split_ledger import (
 
 
 def _names(n):
-    return ["POINT_" + str(i).zfill(4) + ".pointdir" for i in range(n)]
+    return ["POINT_" + str(i).zfill(6) + ".pointdir" for i in range(n)]
 
 
 def _forced(names, counts):
@@ -26,17 +27,21 @@ def _forced(names, counts):
 
 
 def _ensure(tmp_path, names, *, version, counts, identities=None, digest="allocation"):
+    resolved_identities = identities or {
+        name: format(index + 1, "064x") for index, name in enumerate(names)
+    }
     return ensure_split_assignments(
         tmp_path,
         names,
-        training_version=int(version),
+        reference_data_version=int(version),
+        reference_data_view_sha256=format(int(version) + 1, "064x"),
         expected_new_counts=counts,
         forced_splits=_forced(
             names if version == 0 else names[-sum(counts.values()) :],
             counts,
         ),
-        pointdir_identity=identities,
-        allocation_manifest_sha256=digest,
+        pointdir_identity=resolved_identities,
+        allocation_manifest_sha256=hashlib.sha256(digest.encode("utf-8")).hexdigest(),
     )
 
 
@@ -110,14 +115,17 @@ def test_active_version_cannot_add_external_validation_rows(tmp_path):
 
 
 def test_split_ledger_rejects_duplicate_pointdir_names(tmp_path):
-    names = ["POINT_0000.pointdir", "POINT_0000.pointdir"]
+    names = ["POINT_000000.pointdir", "POINT_000000.pointdir"]
     with pytest.raises(ValueError, match="duplicate"):
         ensure_split_assignments(
             tmp_path,
             names,
-            training_version=0,
+            reference_data_version=0,
+            reference_data_view_sha256="1" * 64,
             expected_new_counts={"train": 1, "int_val": 1, "ext_val": 0},
-            forced_splits={"POINT_0000.pointdir": "train"},
+            pointdir_identity={"POINT_000000.pointdir": "1" * 64},
+            forced_splits={"POINT_000000.pointdir": "train"},
+            allocation_manifest_sha256="a" * 64,
         )
 
 
@@ -129,7 +137,7 @@ def test_split_ledger_rejects_pointdir_identity_mismatch(tmp_path):
         names,
         version=0,
         counts=counts,
-        identities={names[0]: "sha-a"},
+        identities={names[0]: "a" * 64, names[1]: "b" * 64},
     )
 
     with pytest.raises(ValueError, match="identity mismatch"):
@@ -138,7 +146,7 @@ def test_split_ledger_rejects_pointdir_identity_mismatch(tmp_path):
             names,
             version=0,
             counts=counts,
-            identities={names[0]: "sha-b"},
+            identities={names[0]: "c" * 64, names[1]: "b" * 64},
         )
 
 
@@ -148,7 +156,13 @@ def test_split_ledger_requires_authoritative_split_for_every_new_point(tmp_path)
         ensure_split_assignments(
             tmp_path,
             names,
-            training_version=0,
+            reference_data_version=0,
+            reference_data_view_sha256="1" * 64,
             expected_new_counts={"train": 1, "int_val": 1, "ext_val": 0},
+            pointdir_identity={
+                names[0]: "a" * 64,
+                names[1]: "b" * 64,
+            },
             forced_splits={names[0]: "train"},
+            allocation_manifest_sha256="c" * 64,
         )

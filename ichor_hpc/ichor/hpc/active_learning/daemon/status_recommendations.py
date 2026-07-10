@@ -107,7 +107,7 @@ def _artifact_errors(payload: Dict[str, Any]) -> List[str]:
     errors: List[str] = []
     if status.get("error"):
         errors.append(str(status.get("error")))
-    for label in ("training", "models"):
+    for label in ("reference_data", "models"):
         item = status.get(label)
         if isinstance(item, dict):
             errors.extend(str(error) for error in (item.get("errors") or []))
@@ -137,7 +137,7 @@ def _artifact_problem(payload: Dict[str, Any]) -> bool:
         return False
     if status.get("error"):
         return True
-    for label in ("training", "models"):
+    for label in ("reference_data", "models"):
         item = status.get(label)
         if isinstance(item, dict) and item.get("ok") is False:
             return True
@@ -332,7 +332,7 @@ def _halt_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusRecom
             "artefact",
             "artifact",
             "contract",
-            "training_version_invalid",
+            "reference_data_version_invalid",
             "models_version_invalid",
         )
     ):
@@ -376,7 +376,7 @@ def _contract_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusR
         return StatusRecommendation(
             code="stop_check_no_committed_pair",
             severity="required",
-            primary="run reconcile; STOP_CHECK needs the latest coherent committed training/model pair",
+            primary="run reconcile; STOP_CHECK needs the latest coherent committed reference-data/model pair",
             why=error or "state/artifact contract failed at STOP_CHECK",
             command=_reconcile_cmd(campaign),
         )
@@ -384,15 +384,15 @@ def _contract_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusR
         return StatusRecommendation(
             code="version_skew",
             severity="required",
-            primary="run reconcile; training and model versions in state are not mutually coherent",
+            primary="run reconcile; reference-data and model versions in state are not mutually coherent",
             why=error,
             command=_reconcile_cmd(campaign),
         )
-    if "training" in lower:
+    if "reference-data" in lower or "reference_data" in lower:
         return StatusRecommendation(
-            code="training_missing",
+            code="reference_data_missing",
             severity="required",
-            primary="run reconcile; the training version referenced by state is missing or invalid",
+            primary="run reconcile; the reference-data version in state is missing or invalid",
             why=error,
             command=_reconcile_cmd(campaign),
         )
@@ -419,7 +419,7 @@ def _artifact_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusR
     return StatusRecommendation(
         code="committed_artifact_invalid",
         severity="required",
-        primary="run reconcile; committed training/model artefacts are inconsistent with status checks",
+        primary="run reconcile; committed reference-data/model artefacts are inconsistent with status checks",
         why=why,
         command=_reconcile_cmd(campaign),
         details=errors[1:5],
@@ -496,7 +496,7 @@ _PHASE_ACTIONS: Dict[str, tuple[str, str]] = {
         "the next phase is REPLACEMENT_AIMALL",
     ),
     CampaignPhase.APPEND.value: (
-        "start the daemon to append accepted AIMAll pointdirs to the training set",
+        "start the daemon to append accepted AIMAll pointdirs to the QM reference data",
         "the next phase is APPEND",
     ),
     CampaignPhase.FEREBUS.value: (

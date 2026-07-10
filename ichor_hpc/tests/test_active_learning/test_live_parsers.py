@@ -27,6 +27,9 @@ from ichor.hpc.active_learning.daemon.phase_executor import (
     PhaseResult,
 )
 from ichor.hpc.active_learning.daemon.state import CampaignPhase
+from ichor.hpc.active_learning.daemon.ferebus_quality import (
+    FEREBUS_QUALITY_SCHEMA_VERSION,
+)
 from ichor.hpc.active_learning.point_allocation import (
     create_point_allocation,
     pending_attempts,
@@ -37,7 +40,10 @@ from ichor.hpc.active_learning.versioning.provenance import (
     enrich_with_point_allocation,
     write_seed_provenance,
 )
-from ichor.hpc.active_learning.versioning.training_set import TrainingSetVersioning
+from ichor.hpc.active_learning.versioning.versioned_directory import VersionedDirectory
+from ichor.hpc.active_learning.versioning.reference_data import (
+    ReferenceDataVersioning,
+)
 
 
 FIXTURES = (
@@ -85,7 +91,14 @@ def _read_journal_events(campaign_dir):
     ]
 
 
-def _seed_point_allocation(campaign, staging, *, context, iteration):
+def _seed_point_allocation(
+    campaign,
+    staging,
+    *,
+    context,
+    iteration,
+    targets=None,
+):
     pointdirs = sorted(Path(staging).glob("POINT_*.pointdir"))
     candidates = [
         {
@@ -107,12 +120,16 @@ def _seed_point_allocation(campaign, staging, *, context, iteration):
         campaign_uid="m16-test",
         context=context,
         iteration=iteration,
-        targets={
-            "train": len(candidates),
-            "int_val": 0,
-            "ext_val": 0,
-            "total": len(candidates),
-        },
+        targets=(
+            dict(targets)
+            if targets is not None
+            else {
+                "train": len(candidates),
+                "int_val": 0,
+                "ext_val": 0,
+                "total": len(candidates),
+            }
+        ),
         primary_candidates=candidates,
         reserve_candidates=[],
     )
@@ -144,12 +161,20 @@ def _seed_point_allocation(campaign, staging, *, context, iteration):
     return allocation_path, allocation
 
 
-def _complete_point_allocation(campaign, staging, *, context, iteration):
+def _complete_point_allocation(
+    campaign,
+    staging,
+    *,
+    context,
+    iteration,
+    targets=None,
+):
     allocation_path, allocation = _seed_point_allocation(
         campaign,
         staging,
         context=context,
         iteration=iteration,
+        targets=targets,
     )
     pointdirs = {
         pointdir.name: pointdir
@@ -167,6 +192,25 @@ def _complete_point_allocation(campaign, staging, *, context, iteration):
         ],
     )
     return allocation_path
+
+
+def _commit_bootstrap_reference_data(campaign):
+    initial = Path(campaign) / ".DATA" / "STAGING" / "initial"
+    for index in range(9):
+        pointdir = initial / ("POINT_" + str(index).zfill(4) + ".pointdir")
+        pointdir.mkdir(parents=True, exist_ok=True)
+        (pointdir / "input.gjf").write_text("# synthetic\n", encoding="utf-8")
+    _complete_point_allocation(
+        campaign,
+        initial,
+        context="bootstrap",
+        iteration=0,
+        targets={"train": 5, "int_val": 2, "ext_val": 2, "total": 9},
+    )
+    stg.commit_initial_reference_data(campaign)
+    return ReferenceDataVersioning(
+        Path(campaign) / "QM_REFERENCE_DATA"
+    ).resolve(0, verification="deep")
 
 
 def test_ariadne_optional_scale_diagnostics_are_warnings_only():
@@ -224,7 +268,7 @@ def test_initial_gaussian_happy_path(tmp_path):
 def test_iter_gaussian_happy_path(tmp_path):
     ex = _make_executor(tmp_path)
     _bind_staging(ex, FIXTURES / "iter_quantum")
-    state = SimpleNamespace(iteration=3, campaign_uid="m16-test", training_set_version=0)
+    state = SimpleNamespace(iteration=3, campaign_uid="m16-test", reference_data_version=0)
     result = ex._parse_quantum_postprocess(
         state, CampaignPhase("GAUSSIAN"), observations=[],
     )
@@ -363,7 +407,7 @@ def test_high_gaussian_rejection_is_deferred_to_allocation_replacement(tmp_path)
 def test_missing_staging_dir_sets_failure_reason(tmp_path):
     ex = _make_executor(tmp_path)
     _bind_staging(ex, tmp_path / "ghost_staging_that_does_not_exist")
-    state = SimpleNamespace(iteration=2, campaign_uid="m16-test", training_set_version=0)
+    state = SimpleNamespace(iteration=2, campaign_uid="m16-test", reference_data_version=0)
     result = ex._parse_quantum_postprocess(
         state, CampaignPhase("GAUSSIAN"), observations=[],
     )
@@ -420,7 +464,7 @@ def test_postprocess_dispatches_to_quantum_handler(tmp_path):
     assert result.failure_reason is None
 
 
-def test_commit_initial_training_set_rejects_incomplete_allocation(tmp_path):
+def test_commit_initial_reference_data_rejects_incomplete_allocation(tmp_path):
     campaign = tmp_path / "campaign"
     initial = campaign / ".DATA" / "STAGING" / "initial"
     good = initial / "POINT_0001.pointdir"
@@ -467,7 +511,7 @@ def test_commit_initial_training_set_rejects_incomplete_allocation(tmp_path):
     )
 
     with pytest.raises(ValueError, match="point allocation is incomplete"):
-        stg.commit_initial_training_set(campaign)
+        stg.commit_initial_reference_data(campaign)
 
 
 def test_initial_aimall_reader_migrates_legacy_gaussian_alias(tmp_path):
@@ -503,24 +547,16 @@ def test_initial_aimall_reader_migrates_legacy_gaussian_alias(tmp_path):
     assert json.loads(migrated.read_text(encoding="utf-8")) == legacy
 
 
-def test_commit_initial_training_set_rejects_missing_point_allocation(tmp_path):
+def test_commit_initial_reference_data_rejects_missing_point_allocation(tmp_path):
     campaign = tmp_path / "campaign"
-    v_train = TrainingSetVersioning(campaign / "5_TRAINING")
-    staging = v_train.stage(source_version=None, target_version=0)
-    (staging / "POINT_0000.pointdir").mkdir()
-    v_train.commit(0)
 
     with pytest.raises(FileNotFoundError, match="point-allocation manifest missing"):
-        stg.commit_initial_training_set(campaign)
+        stg.commit_initial_reference_data(campaign)
 
 
 def test_live_append_requires_complete_point_allocation(tmp_path):
     ex = _make_executor(tmp_path)
-    v = TrainingSetVersioning(ex.campaign_dir / "5_TRAINING")
-    staging = v.stage(source_version=None, target_version=0)
-    (staging / "POINT_0000.pointdir").mkdir()
-    v.commit(0)
-    v.update_current(0)
+    _commit_bootstrap_reference_data(ex.campaign_dir)
     live_staging = stg.bucket_dir(ex.campaign_dir, "APPEND", 0)
     (live_staging / "POINT_0000.pointdir").mkdir(parents=True)
     _seed_point_allocation(
@@ -529,7 +565,7 @@ def test_live_append_requires_complete_point_allocation(tmp_path):
         context="active",
         iteration=0,
     )
-    state = SimpleNamespace(iteration=0, campaign_uid="uid", training_set_version=0)
+    state = SimpleNamespace(iteration=0, campaign_uid="uid", reference_data_version=0)
 
     with pytest.raises(BackendSubmissionError, match="complete point allocation"):
         ex._inline_append(state)
@@ -537,13 +573,8 @@ def test_live_append_requires_complete_point_allocation(tmp_path):
 
 def test_live_append_commits_global_pointdir_names_from_manifest(tmp_path):
     ex = _make_executor(tmp_path)
-    v = TrainingSetVersioning(ex.campaign_dir / "5_TRAINING")
-    base = v.stage(source_version=None, target_version=0)
-    old_point = base / "POINT_0000.pointdir"
-    old_point.mkdir()
-    (old_point / "old.txt").write_text("old\n", encoding="utf-8")
-    v.commit(0)
-    v.update_current(0)
+    bootstrap_view = _commit_bootstrap_reference_data(ex.campaign_dir)
+    v = ReferenceDataVersioning(ex.campaign_dir / "QM_REFERENCE_DATA")
 
     live_staging = stg.bucket_dir(ex.campaign_dir, "APPEND", 0)
     new_point = live_staging / "POINT_0000.pointdir"
@@ -563,15 +594,20 @@ def test_live_append_commits_global_pointdir_names_from_manifest(tmp_path):
         context="active",
         iteration=0,
     )
-    state = SimpleNamespace(iteration=0, campaign_uid="uid", training_set_version=0)
+    state = SimpleNamespace(iteration=0, campaign_uid="uid", reference_data_version=0)
 
     result = ex._inline_append(state)
 
-    assert result["training_set_version"] == 1
+    assert result["reference_data_version"] == 1
     committed = v.iteration_path(1)
-    assert (committed / "POINT_0000.pointdir" / "old.txt").is_file()
-    assert (committed / "POINT_0001.pointdir" / "new.txt").is_file()
-    assert not (committed / "POINT_0000.pointdir" / "new.txt").exists()
+    assert len(bootstrap_view.entries) == 9
+    assert not list(committed.glob("POINT_00000[0-8].pointdir"))
+    assert (committed / "POINT_000009.pointdir" / "new.txt").is_file()
+    resolved = v.resolve(1, verification="deep")
+    assert [entry.pointdir_name for entry in resolved.entries] == [
+        "POINT_" + str(index).zfill(6) + ".pointdir"
+        for index in range(10)
+    ]
 
 
 # ==================================================================
@@ -606,6 +642,9 @@ def test_handlers_dict_dispatches_all_day3_phases(tmp_path):
 
 def _seed_models_staging(campaign_dir):
     """Create a manifest-backed pyferebus staging tree with one expected model."""
+    reference_view = ReferenceDataVersioning(
+        campaign_dir / "QM_REFERENCE_DATA"
+    ).resolve(0, verification="deep")
     target = campaign_dir / "6_TRAINED_MODELS" / "iteration-staging"
     target.mkdir(parents=True, exist_ok=True)
     model_dir = target / "iqa" / "O1"
@@ -626,8 +665,14 @@ def _seed_models_staging(campaign_dir):
         )
     (target / "FEREBUS_QUALITY.json").write_text(
         json.dumps({
-            "schema_version": 1,
-            "training_version": 0,
+            "schema_version": FEREBUS_QUALITY_SCHEMA_VERSION,
+            "reference_data_version": 0,
+            "reference_data_head_manifest_sha256": (
+                reference_view.head_manifest_sha256
+            ),
+            "reference_data_view_sha256": (
+                reference_view.cumulative_view_sha256
+            ),
             "accepted": True,
             "summary": {},
             "tasks": [],
@@ -638,7 +683,17 @@ def _seed_models_staging(campaign_dir):
         json.dumps({
             "schema_version": stg.FEREBUS_TASK_SCHEMA_VERSION,
             "system": "WATER",
-            "training_version": 0,
+            "reference_data_version": 0,
+            "reference_data_head_manifest_sha256": (
+                reference_view.head_manifest_sha256
+            ),
+            "reference_data_view_sha256": (
+                reference_view.cumulative_view_sha256
+            ),
+            "n_reference_points": len(reference_view.entries),
+            "pointdir_row_order": [
+                entry.pointdir_name for entry in reference_view.entries
+            ],
             "properties": ["iqa"],
             "atoms": ["O1"],
             "n_tasks": 1,
@@ -653,6 +708,11 @@ def _seed_models_staging(campaign_dir):
                 "int_validation_csv": str(int_csv),
                 "ext_validation_csv": str(ext_csv),
                 "row_counts": {"train": 5, "int_val": 2, "ext_val": 2},
+                "row_ids": {
+                    "train": list(range(5)),
+                    "int_val": [5, 6],
+                    "ext_val": [7, 8],
+                },
             }],
         }),
         encoding="utf-8",
@@ -727,8 +787,9 @@ def _write_loadable_model(
 
 def test_ferebus_parser_happy_path_commits_models_version(tmp_path):
     ex = _make_executor(tmp_path)
+    _commit_bootstrap_reference_data(ex.campaign_dir)
     _seed_models_staging(tmp_path / "campaign")
-    state = SimpleNamespace(iteration=3, campaign_uid="m16-test", training_set_version=0)
+    state = SimpleNamespace(iteration=3, campaign_uid="m16-test", reference_data_version=0)
     result = ex._parse_ferebus_postprocess(
         state, CampaignPhase("FEREBUS"), observations=[],
     )
@@ -799,7 +860,7 @@ def test_ferebus_task_artefact_layout_supports_properties_and_missing_files(tmp_
     _write_ferebus_task_artefact_layout(
         staging,
         committed,
-        {"schema_version": 1, "training_version": 0, "tasks": tasks},
+        {"schema_version": 1, "reference_data_version": 0, "tasks": tasks},
     )
 
     assert (committed / "task_artefacts" / "iqa" / "O1" / "WATER_iqa_O1.opt").is_file()
@@ -831,7 +892,7 @@ def test_ferebus_task_artefact_layout_rejects_unsafe_tokens(tmp_path):
             committed,
             {
                 "schema_version": 1,
-                "training_version": 0,
+                "reference_data_version": 0,
                 "tasks": [{
                     "property": "iqa/bad",
                     "atom": "O1",
@@ -842,39 +903,10 @@ def test_ferebus_task_artefact_layout_rejects_unsafe_tokens(tmp_path):
         )
 
 
-def test_initial_ferebus_also_commits_training_set_version_zero(tmp_path):
+def test_initial_ferebus_also_commits_reference_data_version_zero(tmp_path):
     ex = _make_executor(tmp_path)
+    _commit_bootstrap_reference_data(ex.campaign_dir)
     _seed_models_staging(tmp_path / "campaign")
-    # Put one synthetic pointdir in the initial-quantum staging so the parser
-    # has something to copy into 5_TRAINING/iteration-0.
-    initial_staging = tmp_path / "campaign" / ".DATA" / "STAGING" / "initial"
-    initial_staging.mkdir(parents=True, exist_ok=True)
-    src_pdir = FIXTURES / "initial_quantum" / "POINT_0000.pointdir"
-    dst_pdir = initial_staging / "POINT_0000.pointdir"
-    dst_pdir.mkdir(parents=True, exist_ok=True)
-    for child in src_pdir.iterdir():
-        if child.is_file():
-            (dst_pdir / child.name).write_bytes(child.read_bytes())
-        elif child.is_dir():
-            sub = dst_pdir / child.name
-            sub.mkdir(parents=True, exist_ok=True)
-            for s in child.iterdir():
-                if s.is_file():
-                    (sub / s.name).write_bytes(s.read_bytes())
-    stg.write_points_file(initial_staging, [dst_pdir])
-    stg.write_quantum_acceptance_manifest(
-        initial_staging,
-        phase_name="INITIAL_AIMALL",
-        iteration=0,
-        accepted=[dst_pdir],
-        rejected=[],
-    )
-    _complete_point_allocation(
-        ex.campaign_dir,
-        initial_staging,
-        context="bootstrap",
-        iteration=0,
-    )
 
     state = SimpleNamespace(iteration=0, campaign_uid="m16-test")
     result = ex._parse_ferebus_postprocess(
@@ -882,17 +914,17 @@ def test_initial_ferebus_also_commits_training_set_version_zero(tmp_path):
     )
     assert result.failure_reason is None
     assert result.state_updates["models_version"] == 0
-    assert result.state_updates["training_set_version"] == 0
-    train_dir = tmp_path / "campaign" / "5_TRAINING" / "iteration-0000"
+    assert result.state_updates["reference_data_version"] == 0
+    train_dir = tmp_path / "campaign" / "QM_REFERENCE_DATA" / "iteration-0000"
     assert train_dir.is_dir()
-    assert (train_dir / "POINT_0000.pointdir").is_dir()
+    assert (train_dir / "POINT_000000.pointdir").is_dir()
 
 
 def test_ferebus_parser_rejects_empty_staging(tmp_path):
     ex = _make_executor(tmp_path)
     empty = tmp_path / "campaign" / "6_TRAINED_MODELS" / "iteration-staging"
     empty.mkdir(parents=True, exist_ok=True)
-    state = SimpleNamespace(iteration=2, campaign_uid="m16-test", training_set_version=0)
+    state = SimpleNamespace(iteration=2, campaign_uid="m16-test", reference_data_version=0)
     result = ex._parse_ferebus_postprocess(
         state, CampaignPhase("FEREBUS"), observations=[],
     )
@@ -903,7 +935,7 @@ def test_ferebus_parser_rejects_empty_staging(tmp_path):
 def test_ferebus_parser_rejects_missing_staging(tmp_path):
     ex = _make_executor(tmp_path)
     # Do not create the staging dir.
-    state = SimpleNamespace(iteration=2, campaign_uid="m16-test", training_set_version=0)
+    state = SimpleNamespace(iteration=2, campaign_uid="m16-test", reference_data_version=0)
     result = ex._parse_ferebus_postprocess(
         state, CampaignPhase("FEREBUS"), observations=[],
     )

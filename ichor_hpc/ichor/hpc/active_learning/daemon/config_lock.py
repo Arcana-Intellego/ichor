@@ -18,10 +18,10 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 from ..campaign_migrations import migrate_campaign_payload
 from ..config import CampaignConfig
-from ..versioning.training_set import TrainingSetVersioning
+from ..versioning.versioned_directory import VersionedDirectory
 from .artifact_contracts import (
     verify_committed_model_version,
-    verify_committed_training_version,
+    verify_committed_reference_data_version,
 )
 from .state import CampaignPhase, CampaignState, atomic_write_json
 
@@ -374,7 +374,7 @@ def _committed_model_exists(campaign_dir: Union[str, Path], version: int) -> boo
     if not models.is_dir():
         return False
     try:
-        committed = TrainingSetVersioning(models).list_committed_versions()
+        committed = VersionedDirectory(models).list_committed_versions()
     except Exception:
         return False
     return int(version) in {int(v) for v in committed}
@@ -385,7 +385,7 @@ def _any_committed_model_exists(campaign_dir: Union[str, Path]) -> bool:
     if not models.is_dir():
         return False
     try:
-        return bool(TrainingSetVersioning(models).list_committed_versions())
+        return bool(VersionedDirectory(models).list_committed_versions())
     except Exception:
         return False
 
@@ -722,15 +722,15 @@ def _active_iteration_committed(proposed_state: CampaignState, iteration: int) -
     """Return true when active-loop artefacts for ``iteration`` are committed.
 
     The initial diverse set is version 0. Active iteration ``i`` appends a new
-    training/model version ``i + 1``, so ARIADNE/Phase B outputs for iteration
+    reference-data/model version ``i + 1``, so ARIADNE/Phase B outputs for iteration
     ``i`` are historical only once both versions have reached that value.
     """
     try:
-        training_version = int(getattr(proposed_state, "training_set_version", -1))
+        reference_data_version = int(getattr(proposed_state, "reference_data_version", -1))
         models_version = int(getattr(proposed_state, "models_version", -1))
     except (TypeError, ValueError):
         return False
-    return min(training_version, models_version) >= int(iteration) + 1
+    return min(reference_data_version, models_version) >= int(iteration) + 1
 
 
 def _phase_outputs_lock_change(
@@ -795,7 +795,7 @@ def _phase_local_allowed(
     if path.startswith("ferebus.") or path.startswith("quality_gates.ferebus_"):
         if phase not in (CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS):
             return False, "FEREBUS settings may change only when re-entering a FEREBUS phase"
-        target = int(proposed_state.training_set_version)
+        target = int(proposed_state.reference_data_version)
         if _committed_model_exists(campaign_dir, target):
             return False, "target FEREBUS model version is already committed"
         return True, "allowed for uncommitted FEREBUS re-entry"
@@ -834,7 +834,7 @@ def _current_ferebus_consumed_reason(
     staging = Path(campaign_dir) / "6_TRAINED_MODELS" / "iteration-staging"
     if staging.exists():
         return "target FEREBUS staging exists: " + str(staging)
-    target = int(getattr(proposed_state, "training_set_version", -1))
+    target = int(getattr(proposed_state, "reference_data_version", -1))
     if target >= 0 and _committed_model_exists(campaign_dir, target):
         return "target FEREBUS model version is already committed"
     return None
@@ -1268,15 +1268,15 @@ def ferebus_reentry_can_archive_data_staging(
     if proposed_state.pending_jobs:
         return False, "proposed state still has pending jobs"
     try:
-        training_version = int(proposed_state.training_set_version)
+        reference_data_version = int(proposed_state.reference_data_version)
     except (TypeError, ValueError):
-        return False, "training_set_version is not an integer"
-    if training_version < 0:
-        return False, "training_set_version is negative"
+        return False, "reference_data_version is not an integer"
+    if reference_data_version < 0:
+        return False, "reference_data_version is negative"
     try:
-        verify_committed_training_version(campaign_dir, training_version)
+        verify_committed_reference_data_version(campaign_dir, reference_data_version)
     except Exception as exc:
-        return False, "committed training version is invalid: " + str(exc)[:180]
+        return False, "committed reference-data version is invalid: " + str(exc)[:180]
     return True, "verified committed training exists for FEREBUS re-entry"
 
 
@@ -1399,28 +1399,28 @@ def restore_config_from_lock_proposal(campaign_dir: Union[str, Path]) -> Path:
     return target
 
 
-def training_staging_can_archive_for_reconcile(
+def reference_data_staging_can_archive_for_reconcile(
     campaign_dir: Union[str, Path],
     proposed_state: CampaignState,
 ) -> Tuple[bool, str]:
     campaign = Path(campaign_dir)
-    training = campaign / "5_TRAINING"
+    training = campaign / "QM_REFERENCE_DATA"
     if not training.is_dir():
-        return False, "5_TRAINING is missing"
-    tv = TrainingSetVersioning(training)
+        return False, "QM_REFERENCE_DATA is missing"
+    tv = VersionedDirectory(training)
     dangling = tv.list_dangling_staging()
     if not dangling:
-        return True, "no dangling training staging exists"
+        return True, "no dangling reference-data staging exists"
     try:
-        training_version = int(proposed_state.training_set_version)
+        reference_data_version = int(proposed_state.reference_data_version)
     except (TypeError, ValueError):
-        return False, "training_set_version is not an integer"
-    if training_version < 0:
-        return False, "training_set_version is negative"
+        return False, "reference_data_version is not an integer"
+    if reference_data_version < 0:
+        return False, "reference_data_version is negative"
     try:
-        verify_committed_training_version(campaign, training_version)
+        verify_committed_reference_data_version(campaign, reference_data_version)
     except Exception as exc:
-        return False, "committed training version is invalid: " + str(exc)[:180]
+        return False, "committed reference-data version is invalid: " + str(exc)[:180]
     try:
         model_version = int(proposed_state.models_version)
     except (TypeError, ValueError):
@@ -1433,29 +1433,29 @@ def training_staging_can_archive_for_reconcile(
     training_resolved = training.resolve()
     for path in dangling:
         if path.is_symlink():
-            return False, "refusing to archive symlinked training staging: " + str(path)
+            return False, "refusing to archive symlinked reference-data staging: " + str(path)
         if not path.is_dir():
-            return False, "training staging is not a directory: " + str(path)
+            return False, "reference-data staging is not a directory: " + str(path)
         _ensure_inside_campaign(campaign, path)
         resolved = path.resolve()
         if training_resolved not in resolved.parents:
-            return False, "training staging is outside 5_TRAINING: " + str(path)
-    return True, "dangling training staging can be archived"
+            return False, "reference-data staging is outside QM_REFERENCE_DATA: " + str(path)
+    return True, "dangling reference-data staging can be archived"
 
 
-def archive_training_staging_for_reconcile(
+def archive_reference_data_staging_for_reconcile(
     campaign_dir: Union[str, Path],
     proposed_state: CampaignState,
 ) -> List[str]:
-    ok, reason = training_staging_can_archive_for_reconcile(
+    ok, reason = reference_data_staging_can_archive_for_reconcile(
         campaign_dir,
         proposed_state,
     )
     if not ok:
         raise ValueError(reason)
     campaign = Path(campaign_dir)
-    training = campaign / "5_TRAINING"
-    tv = TrainingSetVersioning(training)
+    training = campaign / "QM_REFERENCE_DATA"
+    tv = VersionedDirectory(training)
     archived: List[str] = []
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     for staging in tv.list_dangling_staging():

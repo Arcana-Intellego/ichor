@@ -21,6 +21,7 @@ from ichor.hpc.active_learning.versioning.provenance import (
     ensure_index,
     enrich_with_anti_overlap,
     enrich_with_ariadne,
+    enrich_with_point_allocation,
     enrich_with_phase_b,
     load_index,
     load_training_seed_frame_ids,
@@ -246,12 +247,43 @@ def test_load_training_seed_frame_ids_empty_for_fresh_campaign(tmp_path):
 
 
 def test_repair_index_from_committed_pointdirs_adds_missing_records(tmp_path):
-    training = tmp_path / "5_TRAINING"
-    pdir = training / "iteration-0003" / "POINT_0007.pointdir"
+    from ichor.hpc.active_learning.daemon.input_staging import (
+        commit_reference_data_delta,
+    )
+    from ichor.hpc.active_learning.point_allocation import (
+        create_point_allocation,
+        pending_attempts,
+        point_allocation_path,
+        record_quantum_results,
+    )
+
+    training = tmp_path / "QM_REFERENCE_DATA"
+    allocation_path = point_allocation_path(
+        tmp_path,
+        context="bootstrap",
+        iteration=0,
+    )
+    allocation = create_point_allocation(
+        allocation_path,
+        campaign_uid="X",
+        context="bootstrap",
+        iteration=0,
+        targets={"train": 1, "int_val": 0, "ext_val": 0, "total": 1},
+        primary_candidates=[
+            {
+                "candidate_id": "candidate-42",
+                "frame_id": 42,
+                "pointdir_name": "POINT_0000.pointdir",
+            }
+        ],
+        reserve_candidates=[],
+    )
+    attempt = pending_attempts(allocation)[0]
+    pdir = tmp_path / ".DATA" / "STAGING" / "initial" / "POINT_0000.pointdir"
     write_seed_provenance(
         pdir,
         campaign_uid="X",
-        iteration=3,
+        iteration=0,
         trajectory_sha256="",
         seed_frame_id=42,
         seed_selection_origin="variance",
@@ -260,14 +292,37 @@ def test_repair_index_from_committed_pointdirs_adds_missing_records(tmp_path):
         subspace_dimension=1,
         subspace_eigenvalues=[1.0],
     )
+    enrich_with_point_allocation(
+        pdir,
+        candidate_id=str(attempt["candidate_id"]),
+        context="bootstrap",
+        slot_id=int(attempt["slot_id"]),
+        split=str(attempt["split"]),
+    )
+    record_quantum_results(
+        allocation_path,
+        [
+            {
+                "candidate_id": str(attempt["candidate_id"]),
+                "accepted": True,
+                "pointdir": str(pdir),
+            }
+        ],
+    )
+    commit_reference_data_delta(
+        tmp_path,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )
 
     assert repair_index_from_committed_pointdirs(tmp_path, training) == 1
     assert repair_index_from_committed_pointdirs(tmp_path, training) == 0
     data = load_index(tmp_path)
     assert data["records"] == [
         {
-            "iteration": 3,
-            "pointdir_name": "POINT_0007.pointdir",
+            "iteration": 0,
+            "pointdir_name": "POINT_000000.pointdir",
             "seed_frame_id": 42,
         }
     ]
@@ -286,7 +341,7 @@ def test_full_provenance_chain_through_dry_run_executor(tmp_path):
       * PHASE_B enrich populates the phase_b block in-place,
       * APPEND copies the provenance sidecar into the committed pointdir
         AND emits one record per pointdir into seed_frame_id_index.json,
-      * a training_set_committed journal event is emitted.
+      * a reference_data_committed journal event is emitted.
     """
     from types import SimpleNamespace
 
@@ -295,8 +350,8 @@ def test_full_provenance_chain_through_dry_run_executor(tmp_path):
         DryRunPhaseExecutor,
     )
     from ichor.hpc.active_learning.daemon.state import CampaignPhase
-    from ichor.hpc.active_learning.versioning.training_set import (
-        TrainingSetVersioning,
+    from ichor.hpc.active_learning.versioning.reference_data import (
+        ReferenceDataVersioning,
     )
 
     campaign_dir = tmp_path / "campaign"
@@ -309,7 +364,7 @@ def test_full_provenance_chain_through_dry_run_executor(tmp_path):
         iteration=0,
         campaign_uid="uid-e2e",
         replacement_round=0,
-        training_set_version=-1,
+        reference_data_version=-1,
         models_version=-1,
     )
 
@@ -322,7 +377,7 @@ def test_full_provenance_chain_through_dry_run_executor(tmp_path):
         CampaignPhase.INITIAL_FEREBUS,
         observations=[],
     )
-    state.training_set_version = bootstrap.state_updates["training_set_version"]
+    state.reference_data_version = bootstrap.state_updates["reference_data_version"]
     state.models_version = bootstrap.state_updates["models_version"]
 
     ex.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
@@ -353,10 +408,13 @@ def test_full_provenance_chain_through_dry_run_executor(tmp_path):
     ex.postprocess(state, CampaignPhase.AIMALL, observations=[])
     ex.submit_or_run(state, CampaignPhase.ALLOCATION_CHECK)
     ex.submit_or_run(state, CampaignPhase.APPEND)
-    v = TrainingSetVersioning(campaign_dir / "5_TRAINING")
+    v = ReferenceDataVersioning(campaign_dir / "QM_REFERENCE_DATA")
     assert v.current_version() == 1
     committed_iter = v.iteration_path(1)
-    committed_pdirs = sorted(p for p in committed_iter.iterdir() if p.is_dir())
+    committed_delta = sorted(committed_iter.glob("*.pointdir"))
+    assert len(committed_delta) == cfg.point_allocation.batch_total_size
+    view = v.resolve(1, verification="deep")
+    committed_pdirs = [entry.pointdir_path for entry in view.entries]
     assert len(committed_pdirs) == (
         cfg.point_allocation.bootstrap_total_size
         + cfg.point_allocation.batch_total_size
@@ -367,6 +425,7 @@ def test_full_provenance_chain_through_dry_run_executor(tmp_path):
         if read_provenance(pointdir)["point_allocation"]["context"] == "active"
     ]
     assert len(active_pdirs) == cfg.point_allocation.batch_total_size
+    assert active_pdirs == committed_delta
     for pdir in committed_pdirs:
         data = read_provenance(pdir)
         if data["point_allocation"]["context"] == "active":
@@ -397,9 +456,9 @@ def test_full_provenance_chain_through_dry_run_executor(tmp_path):
         for line in journal_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    commits = [e for e in events if e.get("event") == "training_set_committed"]
-    assert commits, "no training_set_committed event emitted"
-    assert any(e.get("training_set_version") == 1 for e in commits)
+    commits = [e for e in events if e.get("event") == "reference_data_committed"]
+    assert commits, "no reference_data_committed event emitted"
+    assert any(e.get("reference_data_version") == 1 for e in commits)
 
 
 def test_full_provenance_chain_two_iterations_grows_index_monotonically(tmp_path):
@@ -426,7 +485,7 @@ def test_full_provenance_chain_two_iterations_grows_index_monotonically(tmp_path
         iteration=0,
         campaign_uid="uid",
         replacement_round=0,
-        training_set_version=-1,
+        reference_data_version=-1,
         models_version=-1,
     )
     ex.postprocess(bootstrap_state, CampaignPhase.PHASE_A_POLUS, observations=[])
@@ -440,16 +499,16 @@ def test_full_provenance_chain_two_iterations_grows_index_monotonically(tmp_path
     )
 
     # Simulate the daemon's state machine: each loop iteration updates
-    # training_set_version from the APPEND return so the M15 F2 idempotency
+    # reference_data_version from the APPEND return so the M15 F2 idempotency
     # guard in _inline_append sees a fresh expected-next per loop.
-    training_set_version = 0
+    reference_data_version = 0
     for it in (0, 1):
         state_ns = SimpleNamespace(
             iteration=it,
             campaign_uid="uid",
             replacement_round=0,
-            training_set_version=training_set_version,
-            models_version=training_set_version,
+            reference_data_version=reference_data_version,
+            models_version=reference_data_version,
         )
         ex.postprocess(state_ns, CampaignPhase.ARIADNE_ARRAY, observations=[])
         ex.postprocess(state_ns, CampaignPhase.PHASE_B_POLUS, observations=[])
@@ -457,10 +516,10 @@ def test_full_provenance_chain_two_iterations_grows_index_monotonically(tmp_path
         ex.postprocess(state_ns, CampaignPhase.AIMALL, observations=[])
         ex.submit_or_run(state_ns, CampaignPhase.ALLOCATION_CHECK)
         result = ex.submit_or_run(state_ns, CampaignPhase.APPEND)
-        # PhaseResult; pull the updated training_set_version out of it.
+        # PhaseResult; pull the updated reference_data_version out of it.
         if hasattr(result, "state_updates") and result.state_updates:
-            training_set_version = int(
-                result.state_updates.get("training_set_version", training_set_version)
+            reference_data_version = int(
+                result.state_updates.get("reference_data_version", reference_data_version)
             )
 
     idx_data = load_index(campaign_dir)
@@ -570,34 +629,96 @@ def test_load_training_seed_frame_ids_self_heals_from_sidecars(tmp_path):
     # commit() and the index-append loop. passing training_dir should union the
     # committed pointdir sidecars back in so a truncated index can't make
     # SEED_SELECT re-pick an already-trained frame.
-    from ichor.hpc.active_learning.versioning.provenance import (
-        load_training_seed_frame_ids,
-        write_seed_provenance,
-        append_to_index,
-        ensure_index,
+    from ichor.hpc.active_learning.daemon.input_staging import (
+        commit_reference_data_delta,
+    )
+    from ichor.hpc.active_learning.point_allocation import (
+        create_point_allocation,
+        pending_attempts,
+        point_allocation_path,
+        record_quantum_results,
     )
 
     campaign = tmp_path
-    training = campaign / "5_TRAINING"
-    iter0 = training / "iteration-0000"
-    # two committed points with real seed frame ids
-    for k, fid in ((0, 11), (1, 22)):
-        pd = iter0 / ("POINT_000" + str(k) + ".pointdir")
+    training = campaign / "QM_REFERENCE_DATA"
+    allocation_path = point_allocation_path(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+    )
+    allocation = create_point_allocation(
+        allocation_path,
+        campaign_uid="u",
+        context="bootstrap",
+        iteration=0,
+        targets={"train": 1, "int_val": 1, "ext_val": 0, "total": 2},
+        primary_candidates=[
+            {
+                "candidate_id": "candidate-0",
+                "frame_id": 11,
+                "pointdir_name": "POINT_0000.pointdir",
+            },
+            {
+                "candidate_id": "candidate-1",
+                "frame_id": 22,
+                "pointdir_name": "POINT_0001.pointdir",
+            },
+        ],
+        reserve_candidates=[],
+    )
+    results = []
+    for attempt in pending_attempts(allocation):
+        pd = (
+            campaign
+            / ".DATA"
+            / "STAGING"
+            / "initial"
+            / str(attempt["pointdir_name"])
+        )
         pd.mkdir(parents=True)
         write_seed_provenance(
             pd,
             campaign_uid="u", iteration=0, trajectory_sha256="s",
-            seed_frame_id=fid, seed_selection_origin="bulk",
+            seed_frame_id=int(attempt["frame_id"]), seed_selection_origin="bulk",
             seed_variance_at_selection=None,
             subspace_neighbour_frame_ids=[], subspace_dimension=0,
             subspace_eigenvalues=[],
         )
+        enrich_with_point_allocation(
+            pd,
+            candidate_id=str(attempt["candidate_id"]),
+            context="bootstrap",
+            slot_id=int(attempt["slot_id"]),
+            split=str(attempt["split"]),
+        )
+        results.append(
+            {
+                "candidate_id": str(attempt["candidate_id"]),
+                "accepted": True,
+                "pointdir": str(pd),
+            }
+        )
+    record_quantum_results(allocation_path, results)
+    commit_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )
     # index only knows about the first point (simulating a crash before the
     # second append landed).
     ensure_index(campaign)
-    append_to_index(campaign, iteration=0, pointdir_name="POINT_0000.pointdir", seed_frame_id=11)
+    append_to_index(
+        campaign,
+        iteration=0,
+        pointdir_name="POINT_000000.pointdir",
+        seed_frame_id=11,
+    )
 
     # index-only view misses 22
     assert load_training_seed_frame_ids(campaign) == {11}
     # self-healing view recovers it from the sidecar
-    assert load_training_seed_frame_ids(campaign, training_dir=training) == {11, 22}
+    assert load_training_seed_frame_ids(
+        campaign,
+        reference_data_dir=training,
+    ) == {11, 22}

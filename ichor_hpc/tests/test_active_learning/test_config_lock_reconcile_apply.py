@@ -38,13 +38,13 @@ from ichor.hpc.active_learning.versioning.provenance import (
     enrich_with_point_allocation,
     write_seed_provenance,
 )
-from ichor.hpc.active_learning.versioning.training_set import TrainingSetVersioning
+from ichor.hpc.active_learning.versioning.versioned_directory import VersionedDirectory
 
 
 def _campaign(tmp_path):
     campaign = tmp_path / "campaign"
     (campaign / ".DATA" / "ACTIVE_LEARNING").mkdir(parents=True)
-    (campaign / "5_TRAINING").mkdir()
+    (campaign / "QM_REFERENCE_DATA").mkdir()
     (campaign / "6_TRAINED_MODELS").mkdir()
     return campaign
 
@@ -64,9 +64,9 @@ def _write_pool(campaign):
     )
 
 
-def _commit_training_version(campaign, version=0):
+def _commit_reference_data_version(campaign, version=0):
     from ichor.hpc.active_learning.daemon.input_staging import (
-        commit_initial_training_set,
+        commit_initial_reference_data,
     )
 
     if int(version) != 0:
@@ -125,7 +125,7 @@ def _commit_training_version(campaign, version=0):
             }
         ],
     )
-    assert commit_initial_training_set(campaign) is True
+    assert commit_initial_reference_data(campaign) is True
 
 
 def _write_config(campaign, config):
@@ -203,7 +203,7 @@ def _write_halted_pre_ferebus_state(campaign):
     _write_pool(campaign)
     state = fresh_campaign_state(max_iterations=3)
     state.phase = CampaignPhase.HALTED
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = -1
     write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
     return state
@@ -261,7 +261,7 @@ def _write_stale_pre_submit_intent(campaign, phase):
 
 def test_ferebus_scaling_change_allowed_for_uncommitted_initial_ferebus(tmp_path):
     campaign = _campaign(tmp_path)
-    _commit_training_version(campaign, 0)
+    _commit_reference_data_version(campaign, 0)
     state = _write_halted_pre_ferebus_state(campaign)
     original = CampaignConfig()
     write_config_lock(campaign, original)
@@ -271,7 +271,7 @@ def test_ferebus_scaling_change_allowed_for_uncommitted_initial_ferebus(tmp_path
 
     proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.INITIAL_FEREBUS
-    proposed.training_set_version = 0
+    proposed.reference_data_version = 0
     proposed.models_version = -1
     review = review_config_changes(campaign, changed, proposed)
 
@@ -437,10 +437,10 @@ def test_retry_phase_requires_retryable_journal_event():
 
 def test_reconcile_apply_uses_safe_max_iterations_change(tmp_path, capsys):
     campaign = _campaign(tmp_path)
-    _commit_training_version(campaign, 0)
+    _commit_reference_data_version(campaign, 0)
     state = fresh_campaign_state(max_iterations=1)
     state.phase = CampaignPhase.HALTED
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = -1
     write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
     original = CampaignConfig(max_iterations=1)
@@ -594,7 +594,7 @@ def test_ariadne_config_change_blocks_halted_uncommitted_result(tmp_path):
     proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.HALTED
     proposed.iteration = 0
-    proposed.training_set_version = 0
+    proposed.reference_data_version = 0
     proposed.models_version = 0
     review = review_config_changes(campaign, changed, proposed)
 
@@ -618,7 +618,7 @@ def test_ariadne_config_change_allows_committed_historical_result(tmp_path):
     proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.STOP_CHECK
     proposed.iteration = 0
-    proposed.training_set_version = 1
+    proposed.reference_data_version = 1
     proposed.models_version = 1
     review = review_config_changes(campaign, changed, proposed)
 
@@ -876,7 +876,7 @@ def test_phase_b_config_change_blocks_halted_uncommitted_selection(tmp_path):
     proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.HALTED
     proposed.iteration = 0
-    proposed.training_set_version = 0
+    proposed.reference_data_version = 0
     proposed.models_version = 0
     review = review_config_changes(campaign, changed, proposed)
 
@@ -1034,7 +1034,7 @@ def test_removed_post_qm_split_block_is_absent_from_schema(tmp_path):
 
 def test_reconcile_apply_promotes_state_and_cleans_ferebus_staging(tmp_path, capsys):
     campaign = _campaign(tmp_path)
-    _commit_training_version(campaign, 0)
+    _commit_reference_data_version(campaign, 0)
     _write_halted_pre_ferebus_state(campaign)
     original = CampaignConfig()
     write_config_lock(campaign, original)
@@ -1057,7 +1057,7 @@ def test_reconcile_apply_promotes_state_and_cleans_ferebus_staging(tmp_path, cap
     assert rc == 0
     state = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
     assert state.phase is CampaignPhase.INITIAL_FEREBUS
-    assert state.training_set_version == 0
+    assert state.reference_data_version == 0
     assert state.models_version == -1
     assert not stale.exists()
     assert "Result: APPLIED" in out
@@ -1165,7 +1165,7 @@ def test_reconcile_apply_write_state_failure_keeps_old_state(
     monkeypatch,
 ):
     campaign = _campaign(tmp_path)
-    _commit_training_version(campaign, 0)
+    _commit_reference_data_version(campaign, 0)
     old_state = _write_halted_pre_ferebus_state(campaign)
     config = CampaignConfig()
     write_config_lock(campaign, config)
@@ -1190,7 +1190,7 @@ def test_reconcile_apply_write_state_failure_keeps_old_state(
     assert "failed to write recovered state.json" in err
     state = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
     assert state.phase is old_state.phase
-    assert state.training_set_version == old_state.training_set_version
+    assert state.reference_data_version == old_state.reference_data_version
     assert (campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json.proposed").is_file()
 
 
@@ -1200,7 +1200,7 @@ def test_reconcile_apply_config_lock_failure_restores_old_state(
     monkeypatch,
 ):
     campaign = _campaign(tmp_path)
-    _commit_training_version(campaign, 0)
+    _commit_reference_data_version(campaign, 0)
     old_state = _write_halted_pre_ferebus_state(campaign)
     config = CampaignConfig()
     write_config_lock(campaign, config)
@@ -1234,7 +1234,7 @@ def test_reconcile_apply_config_lock_failure_restores_old_state(
     assert "failed to update config lock" in err
     state = read_state(state_path)
     assert state.phase is old_state.phase
-    assert state.training_set_version == old_state.training_set_version
+    assert state.reference_data_version == old_state.reference_data_version
     assert (campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json.proposed").is_file()
     assert write_state_calls.count(state_path) >= 2
 
@@ -1245,7 +1245,7 @@ def test_reconcile_config_lock_failure_reports_prior_staging_archive(
     monkeypatch,
 ):
     campaign = _campaign(tmp_path)
-    _commit_training_version(campaign, 0)
+    _commit_reference_data_version(campaign, 0)
     old_state = _write_halted_pre_ferebus_state(campaign)
     config = CampaignConfig()
     write_config_lock(campaign, config)
@@ -1285,7 +1285,7 @@ def test_reconcile_apply_refuses_when_daemon_lock_may_be_active(
     monkeypatch,
 ):
     campaign = _campaign(tmp_path)
-    _commit_training_version(campaign, 0)
+    _commit_reference_data_version(campaign, 0)
     _write_halted_pre_ferebus_state(campaign)
     config = CampaignConfig()
     write_config_lock(campaign, config)
@@ -1324,7 +1324,7 @@ def test_reconcile_non_apply_warns_when_daemon_lock_may_be_active(
     monkeypatch,
 ):
     campaign = _campaign(tmp_path)
-    _commit_training_version(campaign, 0)
+    _commit_reference_data_version(campaign, 0)
     _write_halted_pre_ferebus_state(campaign)
     monkeypatch.setattr(
         cli_mod,
@@ -1450,7 +1450,7 @@ def test_reconcile_restore_config_from_lock_refuses_existing_campaign_yaml(
 
 def test_reconcile_apply_archives_data_staging_for_ferebus_reentry(tmp_path, capsys):
     campaign = _campaign(tmp_path)
-    _commit_training_version(campaign, 0)
+    _commit_reference_data_version(campaign, 0)
     _write_halted_pre_ferebus_state(campaign)
     changed = CampaignConfig()
     changed.ferebus.scaling = False
@@ -1482,12 +1482,12 @@ def test_reconcile_apply_archives_data_staging_for_ferebus_reentry(tmp_path, cap
 
 def test_reconcile_apply_archives_safe_dangling_training_staging(tmp_path, capsys):
     campaign = _campaign(tmp_path)
-    _commit_training_version(campaign, 0)
+    _commit_reference_data_version(campaign, 0)
     _write_halted_pre_ferebus_state(campaign)
     config = CampaignConfig()
     write_config_lock(campaign, config)
     _write_config(campaign, config)
-    tv = TrainingSetVersioning(campaign / "5_TRAINING")
+    tv = VersionedDirectory(campaign / "QM_REFERENCE_DATA")
     dangling = tv.staging_path(1)
     dangling.mkdir(parents=True)
     (dangling / "partial.txt").write_text("partial\n", encoding="utf-8")
@@ -1503,10 +1503,10 @@ def test_reconcile_apply_archives_safe_dangling_training_staging(tmp_path, capsy
     out = capsys.readouterr().out
 
     assert rc == 0
-    archived = sorted((campaign / "5_TRAINING").glob("iteration-0001.staging.before-reconcile-*"))
+    archived = sorted((campaign / "QM_REFERENCE_DATA").glob("iteration-0001.staging.before-reconcile-*"))
     assert len(archived) == 1
     assert (archived[0] / "partial.txt").read_text(encoding="utf-8") == "partial\n"
-    assert "Archived stale training staging" in out
+    assert "Archived stale reference-data staging" in out
 
 
 def test_reconcile_apply_cleans_transient_halted_ariadne_reentry(
@@ -1520,7 +1520,7 @@ def test_reconcile_apply_cleans_transient_halted_ariadne_reentry(
     _write_config(campaign, config)
     state = fresh_campaign_state(max_iterations=1)
     state.phase = CampaignPhase.HALTED
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = 0
     write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
     scripts = campaign / ".DATA" / "SCRIPTS"
@@ -1537,22 +1537,22 @@ def test_reconcile_apply_cleans_transient_halted_ariadne_reentry(
     committed_model = campaign / "6_TRAINED_MODELS" / "iteration-0000"
     committed_model.mkdir()
     (committed_model / "marker.txt").write_text("committed\n", encoding="utf-8")
-    committed_training = campaign / "5_TRAINING" / "iteration-0000"
+    committed_training = campaign / "QM_REFERENCE_DATA" / "iteration-0000"
     committed_training.mkdir()
     (committed_training / "marker.txt").write_text("committed\n", encoding="utf-8")
 
     first_state = fresh_campaign_state(max_iterations=1)
     first_state.phase = CampaignPhase.HALTED
-    first_state.training_set_version = 0
+    first_state.reference_data_version = 0
     first_state.models_version = 0
     second_state = fresh_campaign_state(max_iterations=1)
     second_state.phase = CampaignPhase.STOP_CHECK
-    second_state.training_set_version = 0
+    second_state.reference_data_version = 0
     second_state.models_version = 0
     reports = iter([
         ReconciliationReport(
             proposed_state=first_state,
-            committed_training_versions=[0],
+            committed_reference_data_versions=[0],
             committed_model_versions=[0],
             last_phase_in_journal=CampaignPhase.ARIADNE_ARRAY.value,
             last_iteration_in_journal=0,
@@ -1566,7 +1566,7 @@ def test_reconcile_apply_cleans_transient_halted_ariadne_reentry(
         ),
         ReconciliationReport(
             proposed_state=second_state,
-            committed_training_versions=[0],
+            committed_reference_data_versions=[0],
             committed_model_versions=[0],
             last_phase_in_journal=CampaignPhase.ARIADNE_ARRAY.value,
             last_iteration_in_journal=0,
@@ -1624,7 +1624,7 @@ def test_reconcile_apply_recovers_prebootstrap_phase_a_submission_failure(
     state = fresh_campaign_state(max_iterations=1)
     state.phase = CampaignPhase.HALTED
     state.iteration = 0
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.validation_set_version = 0
     state.models_version = 0
     state.pending_jobs[CampaignPhase.PHASE_A_POLUS.value] = None
@@ -1665,7 +1665,7 @@ def test_reconcile_apply_recovers_prebootstrap_phase_a_submission_failure(
     assert rc == 0
     recovered = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
     assert recovered.phase is CampaignPhase.PHASE_A_POLUS
-    assert recovered.training_set_version == -1
+    assert recovered.reference_data_version == -1
     assert recovered.validation_set_version == -1
     assert recovered.models_version == -1
     assert "Start the daemon with:" in out
@@ -1682,7 +1682,7 @@ def test_reconcile_apply_keeps_data_staging_blocked_for_non_ferebus_reentry(tmp_
     campaign = _campaign(tmp_path)
     state = fresh_campaign_state(max_iterations=3)
     state.phase = CampaignPhase.HALTED
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = -1
     write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
     cfg = CampaignConfig()
@@ -1717,11 +1717,11 @@ def test_reconcile_apply_archive_staging_explicitly_handles_non_ferebus_reentry(
     write_config_lock(campaign, config)
     _write_config(campaign, config)
 
-    tv = TrainingSetVersioning(campaign / "5_TRAINING")
+    tv = VersionedDirectory(campaign / "QM_REFERENCE_DATA")
     staging = tv.stage(None, 0)
     (staging / "marker.txt").write_text("training", encoding="utf-8")
     tv.commit(0)
-    mv = TrainingSetVersioning(campaign / "6_TRAINED_MODELS")
+    mv = VersionedDirectory(campaign / "6_TRAINED_MODELS")
     staging = mv.stage(None, 0)
     (staging / "marker.txt").write_text("model", encoding="utf-8")
     mv.commit(0)
@@ -1743,7 +1743,7 @@ def test_reconcile_apply_archive_staging_explicitly_handles_non_ferebus_reentry(
 
     state = fresh_campaign_state(max_iterations=3)
     state.phase = CampaignPhase.HALTED
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = 0
     write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
     data_staging = campaign / ".DATA" / "STAGING"
@@ -1782,7 +1782,7 @@ def test_operator_archive_staging_blocks_protected_active_handoff(tmp_path):
     state = fresh_campaign_state(max_iterations=3)
     state.phase = CampaignPhase.HALTED
     state.iteration = 0
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = 0
     write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
     staging = campaign / ".DATA" / "STAGING" / "iter_1"
@@ -1814,7 +1814,7 @@ def test_reconcile_apply_restores_archived_initial_gaussian_handoff(
     _write_config(campaign, config)
     state = fresh_campaign_state(max_iterations=3)
     state.phase = CampaignPhase.STOP_CHECK
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = 0
     write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
     archived = _write_archived_bootstrap_handoff(
@@ -1885,7 +1885,7 @@ def test_reconcile_apply_archive_staging_refuses_pending_job(tmp_path, capsys):
 
 def test_reconcile_apply_refuses_locked_config_change(tmp_path, capsys):
     campaign = _campaign(tmp_path)
-    _commit_training_version(campaign, 0)
+    _commit_reference_data_version(campaign, 0)
     _write_halted_pre_ferebus_state(campaign)
     original = CampaignConfig()
     write_config_lock(campaign, original)
@@ -1914,7 +1914,7 @@ def test_reconcile_apply_resolves_terminal_submission_intent(
     monkeypatch,
 ):
     campaign = _campaign(tmp_path)
-    _commit_training_version(campaign, 0)
+    _commit_reference_data_version(campaign, 0)
     _write_halted_pre_ferebus_state(campaign)
     config = CampaignConfig()
     write_config_lock(campaign, config)
@@ -1967,7 +1967,7 @@ def test_reconcile_apply_resolves_cancelled_intent_when_squeue_invalid_job_id(
     monkeypatch,
 ):
     campaign = _campaign(tmp_path)
-    _commit_training_version(campaign, 0)
+    _commit_reference_data_version(campaign, 0)
     _write_halted_pre_ferebus_state(campaign)
     config = CampaignConfig()
     write_config_lock(campaign, config)
@@ -2019,7 +2019,7 @@ def test_reconcile_apply_supersedes_stale_pre_submit_without_job_id(
     monkeypatch,
 ):
     campaign = _campaign(tmp_path)
-    _commit_training_version(campaign, 0)
+    _commit_reference_data_version(campaign, 0)
     _write_halted_pre_ferebus_state(campaign)
     config = CampaignConfig()
     config.runtime.lease_stale_seconds = 10
@@ -2060,7 +2060,7 @@ def test_reconcile_apply_uses_job_name_accounting_for_ferebus_pre_submit_without
     monkeypatch,
 ):
     campaign = _campaign(tmp_path)
-    _commit_training_version(campaign, 0)
+    _commit_reference_data_version(campaign, 0)
     _write_halted_pre_ferebus_state(campaign)
     config = CampaignConfig()
     config.runtime.lease_stale_seconds = 10
@@ -2105,7 +2105,7 @@ def test_reconcile_apply_blocks_pre_submit_without_job_id_when_accounting_comple
     monkeypatch,
 ):
     campaign = _campaign(tmp_path)
-    _commit_training_version(campaign, 0)
+    _commit_reference_data_version(campaign, 0)
     _write_halted_pre_ferebus_state(campaign)
     config = CampaignConfig()
     config.runtime.lease_stale_seconds = 10
@@ -2148,7 +2148,7 @@ def test_reconcile_apply_marks_failed_pre_submit_without_job_id_from_accounting(
     monkeypatch,
 ):
     campaign = _campaign(tmp_path)
-    _commit_training_version(campaign, 0)
+    _commit_reference_data_version(campaign, 0)
     _write_halted_pre_ferebus_state(campaign)
     config = CampaignConfig()
     config.runtime.lease_stale_seconds = 10
@@ -2192,7 +2192,7 @@ def test_reconcile_apply_blocks_pre_submit_without_job_id_when_job_exists(
     monkeypatch,
 ):
     campaign = _campaign(tmp_path)
-    _commit_training_version(campaign, 0)
+    _commit_reference_data_version(campaign, 0)
     _write_halted_pre_ferebus_state(campaign)
     config = CampaignConfig()
     config.runtime.lease_stale_seconds = 10
@@ -2234,7 +2234,7 @@ def test_reconcile_apply_blocks_pre_submit_without_job_id_on_lookup_failure(
     monkeypatch,
 ):
     campaign = _campaign(tmp_path)
-    _commit_training_version(campaign, 0)
+    _commit_reference_data_version(campaign, 0)
     _write_halted_pre_ferebus_state(campaign)
     config = CampaignConfig()
     config.runtime.lease_stale_seconds = 10
@@ -2275,7 +2275,7 @@ def test_reconcile_apply_refuses_when_submission_intent_job_is_still_active(
     monkeypatch,
 ):
     campaign = _campaign(tmp_path)
-    _commit_training_version(campaign, 0)
+    _commit_reference_data_version(campaign, 0)
     _write_halted_pre_ferebus_state(campaign)
     config = CampaignConfig()
     write_config_lock(campaign, config)
@@ -2316,7 +2316,7 @@ def test_reconcile_apply_refuses_when_terminal_intent_sacct_is_inconclusive(
     monkeypatch,
 ):
     campaign = _campaign(tmp_path)
-    _commit_training_version(campaign, 0)
+    _commit_reference_data_version(campaign, 0)
     _write_halted_pre_ferebus_state(campaign)
     config = CampaignConfig()
     write_config_lock(campaign, config)
@@ -2359,7 +2359,7 @@ def test_reconcile_apply_refuses_completed_intent_without_postprocess_verificati
     monkeypatch,
 ):
     campaign = _campaign(tmp_path)
-    _commit_training_version(campaign, 0)
+    _commit_reference_data_version(campaign, 0)
     _write_halted_pre_ferebus_state(campaign)
     config = CampaignConfig()
     write_config_lock(campaign, config)
@@ -2485,7 +2485,7 @@ def test_start_refuses_missing_state_in_nonempty_campaign(tmp_path, capsys):
     campaign = _campaign(tmp_path)
     config = CampaignConfig()
     _write_config(campaign, config)
-    _commit_training_version(campaign, 0)
+    _commit_reference_data_version(campaign, 0)
 
     rc = cmd_start(
         argparse.Namespace(

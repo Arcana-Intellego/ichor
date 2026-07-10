@@ -297,19 +297,85 @@ def validate_ferebus_model_contract(
     if committed:
         if expected_version is None:
             expected_version = _version_from_iteration_dir(root)
-        manifest_training_version = manifest.get("training_version")
+        manifest_reference_data_version = manifest.get("reference_data_version")
         if expected_version is not None:
             try:
-                parsed_training_version = int(manifest_training_version)
+                parsed_reference_data_version = int(manifest_reference_data_version)
             except (TypeError, ValueError) as exc:
-                raise ModelContractError("ferebus_manifest_training_version_invalid") from exc
-            if parsed_training_version != int(expected_version):
                 raise ModelContractError(
-                    "ferebus_manifest_training_version_mismatch: "
-                    + str(parsed_training_version)
+                    "ferebus_manifest_reference_data_version_invalid"
+                ) from exc
+            if parsed_reference_data_version != int(expected_version):
+                raise ModelContractError(
+                    "ferebus_manifest_reference_data_version_mismatch: "
+                    + str(parsed_reference_data_version)
                     + "!="
                     + str(int(expected_version))
                 )
+            try:
+                from ..versioning.reference_data import ReferenceDataVersioning
+
+                campaign = root.parent.parent
+                reference_view = ReferenceDataVersioning(
+                    campaign / "QM_REFERENCE_DATA"
+                ).resolve(parsed_reference_data_version, verification="deep")
+            except Exception as exc:
+                raise ModelContractError(
+                    "ferebus_reference_data_binding_invalid: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)
+                ) from exc
+            if str(manifest.get("reference_data_head_manifest_sha256") or "") != str(
+                reference_view.head_manifest_sha256
+            ):
+                raise ModelContractError(
+                    "ferebus_reference_data_head_manifest_sha256_mismatch"
+                )
+            if str(manifest.get("reference_data_view_sha256") or "") != str(
+                reference_view.cumulative_view_sha256
+            ):
+                raise ModelContractError("ferebus_reference_data_view_sha256_mismatch")
+            expected_row_order = [
+                entry.pointdir_name for entry in reference_view.entries
+            ]
+            if list(manifest.get("pointdir_row_order") or []) != expected_row_order:
+                raise ModelContractError("ferebus_reference_data_row_order_mismatch")
+            if int(manifest.get("n_reference_points", -1)) != len(expected_row_order):
+                raise ModelContractError("ferebus_reference_data_count_mismatch")
+            expected_split_rows = {
+                split: [
+                    index
+                    for index, entry in enumerate(reference_view.entries)
+                    if entry.split == split
+                ]
+                for split in ("train", "int_val", "ext_val")
+            }
+            expected_split_counts = {
+                split: len(row_ids)
+                for split, row_ids in expected_split_rows.items()
+            }
+            for task in manifest.get("tasks", []):
+                if not isinstance(task, Mapping):
+                    raise ModelContractError("ferebus_manifest_task_invalid")
+                observed_counts = {
+                    split: int((task.get("row_counts") or {}).get(split, -1))
+                    for split in expected_split_counts
+                }
+                if observed_counts != expected_split_counts:
+                    raise ModelContractError(
+                        "ferebus_reference_data_split_count_mismatch"
+                    )
+                observed_rows = task.get("row_ids")
+                if observed_rows is not None:
+                    normalised_rows = {
+                        split: [int(value) for value in observed_rows.get(split, [])]
+                        for split in expected_split_rows
+                    }
+                    if normalised_rows != expected_split_rows:
+                        raise ModelContractError(
+                            "ferebus_reference_data_split_row_mismatch"
+                        )
         try:
             from .ferebus_quality import (
                 FEREBUS_QUALITY_MANIFEST,
@@ -325,8 +391,22 @@ def validate_ferebus_model_contract(
                 raise ModelContractError("ferebus_quality_manifest_invalid")
             if int(quality.get("schema_version", -1)) != FEREBUS_QUALITY_SCHEMA_VERSION:
                 raise ModelContractError("ferebus_quality_manifest_schema_mismatch")
-            if int(quality.get("training_version", -999999)) != int(manifest.get("training_version", -1)):
-                raise ModelContractError("ferebus_quality_training_version_mismatch")
+            if int(quality.get("reference_data_version", -999999)) != int(
+                manifest.get("reference_data_version", -1)
+            ):
+                raise ModelContractError(
+                    "ferebus_quality_reference_data_version_mismatch"
+                )
+            for hash_field in (
+                "reference_data_head_manifest_sha256",
+                "reference_data_view_sha256",
+            ):
+                if str(quality.get(hash_field) or "") != str(
+                    manifest.get(hash_field) or ""
+                ):
+                    raise ModelContractError(
+                        "ferebus_quality_" + hash_field + "_mismatch"
+                    )
             if not bool(quality.get("accepted", False)):
                 raise ModelContractError("ferebus_quality_manifest_rejected")
         except ModelContractError:

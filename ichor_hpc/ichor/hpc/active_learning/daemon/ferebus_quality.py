@@ -12,7 +12,7 @@ from .state import atomic_write_json
 
 
 FEREBUS_QUALITY_MANIFEST = "FEREBUS_QUALITY.json"
-FEREBUS_QUALITY_SCHEMA_VERSION = 1
+FEREBUS_QUALITY_SCHEMA_VERSION = 2
 
 
 def _threshold(gates: Any, name: str) -> Optional[float]:
@@ -176,7 +176,13 @@ def evaluate_ferebus_quality(staging_dir: Path, gates: Any = None) -> Dict[str, 
     return {
         "schema_version": FEREBUS_QUALITY_SCHEMA_VERSION,
         "system": str(manifest.get("system")),
-        "training_version": int(manifest.get("training_version", -1)),
+        "reference_data_version": int(manifest.get("reference_data_version", -1)),
+        "reference_data_head_manifest_sha256": str(
+            manifest.get("reference_data_head_manifest_sha256") or ""
+        ),
+        "reference_data_view_sha256": str(
+            manifest.get("reference_data_view_sha256") or ""
+        ),
         "summary": summary,
         "records": records,
         "accepted": not reasons,

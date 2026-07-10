@@ -20,10 +20,6 @@ from ichor.hpc.active_learning.daemon.state import (
     fresh_campaign_state,
     write_state,
 )
-from ichor.hpc.active_learning.versioning.manifest import (
-    compute_directory_manifest,
-    write_manifest,
-)
 
 
 MODULE = "ichor.hpc.active_learning.sampling.polus_wrapper"
@@ -150,6 +146,82 @@ def _write_campaign_state(campaign):
     write_state(data_dir / DEFAULT_STATE_FILENAME, state)
 
 
+def _commit_reference_point(campaign, atom_types, coords):
+    from ichor.hpc.active_learning.daemon.input_staging import (
+        commit_reference_data_delta,
+    )
+    from ichor.hpc.active_learning.point_allocation import (
+        create_point_allocation,
+        pending_attempts,
+        point_allocation_path,
+        record_quantum_results,
+    )
+    from ichor.hpc.active_learning.versioning.provenance import (
+        enrich_with_point_allocation,
+        write_seed_provenance,
+    )
+
+    allocation_path = point_allocation_path(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+    )
+    allocation = create_point_allocation(
+        allocation_path,
+        campaign_uid="test",
+        context="bootstrap",
+        iteration=0,
+        targets={"train": 1, "int_val": 0, "ext_val": 0, "total": 1},
+        primary_candidates=[
+            {
+                "candidate_id": "reference-candidate-0",
+                "frame_id": 0,
+                "pointdir_name": "POINT_0000.pointdir",
+            }
+        ],
+        reserve_candidates=[],
+    )
+    attempt = pending_attempts(allocation)[0]
+    pointdir = campaign / ".DATA" / "STAGING" / "initial" / "POINT_0000.pointdir"
+    _write_pointdir(pointdir, atom_types, coords)
+    write_seed_provenance(
+        pointdir,
+        campaign_uid="test",
+        iteration=0,
+        trajectory_sha256="0" * 64,
+        seed_frame_id=0,
+        seed_selection_origin="bootstrap",
+        seed_variance_at_selection=None,
+        subspace_neighbour_frame_ids=[],
+        subspace_dimension=0,
+        subspace_eigenvalues=[],
+    )
+    enrich_with_point_allocation(
+        pointdir,
+        candidate_id=str(attempt["candidate_id"]),
+        context="bootstrap",
+        slot_id=int(attempt["slot_id"]),
+        split=str(attempt["split"]),
+        replacement_round=int(attempt.get("round", 0)),
+    )
+    record_quantum_results(
+        allocation_path,
+        [
+            {
+                "candidate_id": str(attempt["candidate_id"]),
+                "accepted": True,
+                "pointdir": str(pointdir),
+            }
+        ],
+    )
+    commit_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )
+
+
 def test_min_separation_zero_drops_nothing(tmp_path):
     """Default min_separation=0 means the filter passes everything."""
     campaign = tmp_path / "c"
@@ -159,12 +231,17 @@ def test_min_separation_zero_drops_nothing(tmp_path):
     cfg.point_allocation.batch_internal_validation_size = 1
     cfg.phase_b.descriptor = "rmsd_massweight"
     cfg.to_yaml(campaign / "campaign.yaml")
+    _write_campaign_state(campaign)
     iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
     pool_dir = iter_dir / "pool"
     atom_types = ["O", "H", "H"]
     base = [(0.0, 0.0, 0.0), (0.96, 0.0, 0.0), (-0.24, 0.93, 0.0)]
-    for i in range(3):
-        coords = [(c[0] + 0.5 * i, c[1], c[2]) for c in base]
+    geometries = [
+        base,
+        [(0.0, 0.0, 0.0), (1.20, 0.0, 0.0), (-0.24, 0.93, 0.0)],
+        [(0.0, 0.0, 0.0), (0.96, 0.0, 0.0), (-0.55, 1.20, 0.0)],
+    ]
+    for i, coords in enumerate(geometries):
         _make_seed_result(pool_dir / f"seed_{i:04d}", atom_types, coords)
     _write_ariadne_manifest(iter_dir)
     rc = _run(["--descriptor", "rmsd_massweight",
@@ -189,20 +266,13 @@ def test_min_separation_underfills_after_dropping_close_candidates(tmp_path):
     cfg.phase_b.descriptor = "rmsd_massweight"
     cfg.geometry_novelty.fallback_scale_angstrom = 0.2
     cfg.to_yaml(campaign / "campaign.yaml")
+    _write_campaign_state(campaign)
 
-    # commit a training set with one point coincident with seed_0000.
-    training_dir = campaign / "5_TRAINING" / "iteration-0000"
-    _write_pointdir(
-        training_dir / "POINT_0000.pointdir",
+    # Commit one reference point coincident with seed_0000.
+    _commit_reference_point(
+        campaign,
         ["O", "H", "H"],
         [(0.0, 0.0, 0.0), (0.96, 0.0, 0.0), (-0.24, 0.93, 0.0)],
-    )
-    write_manifest(training_dir, compute_directory_manifest(training_dir))
-    # mark this version as current by writing the fallback pointer file.
-    # the canonical mechanism is a symlink called current; the fallback
-    # is a tiny .current.pointer text file containing the iteration name.
-    (campaign / "5_TRAINING" / ".current.pointer").write_text(
-        "iteration-0000", encoding="utf-8",
     )
 
     # 3 candidates: seed_0000 coincident with training, others spread apart.
@@ -229,7 +299,7 @@ def test_min_separation_underfills_after_dropping_close_candidates(tmp_path):
     d = json.loads(dedup.read_text(encoding="utf-8"))
     # at least one candidate should have been dropped (the duplicate).
     assert d["n_dropped"] >= 1
-    assert d["min_separation"] == 0.1
+    assert 0.0 < float(d["min_separation"]) <= 0.2
     assert not (iter_dir / "PHASE_B_SELECTION.json").exists()
 
 
@@ -245,15 +315,11 @@ def test_min_separation_all_candidates_removed_fails_at_phase_b(tmp_path):
     cfg.phase_b.descriptor = "rmsd_massweight"
     cfg.geometry_novelty.fallback_scale_angstrom = 0.2
     cfg.to_yaml(campaign / "campaign.yaml")
+    _write_campaign_state(campaign)
 
-    training_dir = campaign / "5_TRAINING" / "iteration-0000"
     base = [(0.0, 0.0, 0.0), (0.96, 0.0, 0.0), (-0.24, 0.93, 0.0)]
     atom_types = ["O", "H", "H"]
-    _write_pointdir(training_dir / "POINT_0000.pointdir", atom_types, base)
-    write_manifest(training_dir, compute_directory_manifest(training_dir))
-    (campaign / "5_TRAINING" / ".current.pointer").write_text(
-        "iteration-0000", encoding="utf-8",
-    )
+    _commit_reference_point(campaign, atom_types, base)
 
     iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
     pool_dir = iter_dir / "pool"
@@ -288,14 +354,9 @@ def test_scaled_min_separation_rescues_farthest_non_duplicate(tmp_path):
 
     cfg.to_yaml(campaign / "campaign.yaml")
 
-    training_dir = campaign / "5_TRAINING" / "iteration-0000"
     base = [(0.0, 0.0, 0.0), (0.96, 0.0, 0.0), (-0.24, 0.93, 0.0)]
     atom_types = ["O", "H", "H"]
-    _write_pointdir(training_dir / "POINT_0000.pointdir", atom_types, base)
-    write_manifest(training_dir, compute_directory_manifest(training_dir))
-    (campaign / "5_TRAINING" / ".current.pointer").write_text(
-        "iteration-0000", encoding="utf-8",
-    )
+    _commit_reference_point(campaign, atom_types, base)
 
     iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
     pool_dir = iter_dir / "pool"

@@ -21,7 +21,7 @@ from ..handoff_manifests import (
 from . import input_staging as _stg
 from .artifact_contracts import (
     verify_committed_model_version,
-    verify_committed_training_version,
+    verify_committed_reference_data_version,
 )
 from .state import CampaignPhase, CampaignState
 
@@ -58,15 +58,29 @@ def active_iteration_committed(state: CampaignState, iteration: int) -> bool:
     """Return true when active iteration ``iteration`` is fully committed.
 
     Version 0 is the bootstrap set.  Active iteration ``i`` is represented by
-    training/model version ``i + 1`` once APPEND and FEREBUS have both
+    reference-data/model version ``i + 1`` once APPEND and FEREBUS have both
     completed.
     """
     try:
-        training_version = int(getattr(state, "training_set_version", -1))
+        reference_data_version = int(getattr(state, "reference_data_version", -1))
         models_version = int(getattr(state, "models_version", -1))
     except (TypeError, ValueError):
         return False
-    return min(training_version, models_version) >= int(iteration) + 1
+    return min(reference_data_version, models_version) >= int(iteration) + 1
+
+
+def active_iteration_reference_data_committed(
+    state: CampaignState,
+    iteration: int,
+) -> bool:
+    """Return true once APPEND has committed this iteration's QM delta."""
+    try:
+        reference_data_version = int(
+            getattr(state, "reference_data_version", -1)
+        )
+    except (TypeError, ValueError):
+        return False
+    return reference_data_version >= int(iteration) + 1
 
 
 def _has_version(versions: Sequence[int], version: int) -> bool:
@@ -209,7 +223,7 @@ def _require_initial_quantum(campaign: Path, phase: CampaignPhase, iteration: in
 def _require_initial_ferebus_input(
     campaign: Path,
     iteration: int,
-    training_version: int,
+    reference_data_version: int,
     model_version: int,
 ) -> None:
     try:
@@ -220,14 +234,14 @@ def _require_initial_ferebus_input(
         )
         return
     except Exception as handoff_error:
-        if int(training_version) == 0 and int(model_version) < 0:
+        if int(reference_data_version) == 0 and int(model_version) < 0:
             try:
-                _require_training_version(campaign, 0)
+                _require_reference_data_version(campaign, 0)
                 return
             except Exception as training_error:
                 raise RecoveryContractError(
                     "INITIAL_FEREBUS requires either a valid initial AIMAll "
-                    "handoff or committed bootstrap training version 0; "
+                    "handoff or committed bootstrap reference-data version 0; "
                     "initial handoff error: "
                     + type(handoff_error).__name__
                     + ": "
@@ -367,8 +381,8 @@ def _require_split(campaign: Path, iteration: int) -> None:
         raise RecoveryContractError("split.json does not reproduce point allocation")
 
 
-def _require_training_version(campaign: Path, version: int) -> None:
-    verify_committed_training_version(campaign, int(version))
+def _require_reference_data_version(campaign: Path, version: int) -> None:
+    verify_committed_reference_data_version(campaign, int(version))
 
 
 def _require_model_version(campaign: Path, version: int) -> None:
@@ -384,21 +398,21 @@ def _require_active_iteration_committed(state: CampaignState, iteration: int) ->
         )
 
 
-def _require_ferebus_needed(campaign: Path, training_version: int, model_version: int) -> None:
-    if int(training_version) < 0:
-        raise RecoveryContractError("FEREBUS requires a non-negative training version")
-    _require_training_version(campaign, int(training_version))
-    if int(model_version) >= int(training_version):
+def _require_ferebus_needed(campaign: Path, reference_data_version: int, model_version: int) -> None:
+    if int(reference_data_version) < 0:
+        raise RecoveryContractError("FEREBUS requires a non-negative reference-data version")
+    _require_reference_data_version(campaign, int(reference_data_version))
+    if int(model_version) >= int(reference_data_version):
         raise RecoveryContractError(
             "FEREBUS model version "
             + str(int(model_version))
-            + " is already at or ahead of training version "
-            + str(int(training_version))
+            + " is already at or ahead of reference-data version "
+            + str(int(reference_data_version))
         )
 
 
-def _active_iteration_for_training_version(training_version: int) -> int:
-    return max(0, int(training_version) - 1)
+def _active_iteration_for_reference_data_version(reference_data_version: int) -> int:
+    return max(0, int(reference_data_version) - 1)
 
 
 def _allocation_recovery_decision(
@@ -500,14 +514,14 @@ def _allocation_recovery_decision(
     )
 
 
-def _require_ferebus_iteration(iteration: int, training_version: int) -> None:
-    expected = _active_iteration_for_training_version(training_version)
+def _require_ferebus_iteration(iteration: int, reference_data_version: int) -> None:
+    expected = _active_iteration_for_reference_data_version(reference_data_version)
     if int(iteration) != expected:
         raise RecoveryContractError(
             "FEREBUS iteration "
             + str(int(iteration))
-            + " does not match training version "
-            + str(int(training_version))
+            + " does not match reference-data version "
+            + str(int(reference_data_version))
         )
 
 
@@ -695,6 +709,11 @@ def active_iteration_handoff_decisions(
             continue
         if active_iteration_committed(state, iteration):
             continue
+        if active_iteration_reference_data_committed(state, iteration):
+            # All per-iteration handoffs through APPEND are now historical.
+            # Recovery must evaluate the reference-data/model skew and select
+            # FEREBUS rather than replaying a completed allocation.
+            continue
         handoff = _best_active_iteration_handoff(campaign, iteration)
         if handoff is not None:
             decisions.append(handoff.decision)
@@ -713,7 +732,7 @@ def _phase_contract_checks(
 ) -> List[Tuple[str, Callable[[], None]]]:
     phase = CampaignPhase(state.phase)
     iteration = int(getattr(state, "iteration", 0))
-    training_version = int(getattr(state, "training_set_version", -1))
+    reference_data_version = int(getattr(state, "reference_data_version", -1))
     model_version = int(getattr(state, "models_version", -1))
 
     checks: Dict[CampaignPhase, List[Tuple[str, Callable[[], None]]]] = {
@@ -775,8 +794,8 @@ def _phase_contract_checks(
         ],
         CampaignPhase.SEED_SELECT: [
             (
-                "committed training version " + str(training_version),
-                lambda: _require_training_version(campaign, training_version),
+                "committed reference-data version " + str(reference_data_version),
+                lambda: _require_reference_data_version(campaign, reference_data_version),
             ),
             (
                 "committed model version " + str(model_version),
@@ -861,16 +880,16 @@ def _phase_contract_checks(
         ],
         CampaignPhase.FEREBUS: [
             (
-                "committed training version ahead of model version",
+                "committed reference-data version ahead of model version",
                 lambda: _require_ferebus_needed(
                     campaign,
-                    training_version,
+                    reference_data_version,
                     model_version,
                 ),
             ),
             (
-                "FEREBUS iteration matches training version",
-                lambda: _require_ferebus_iteration(iteration, training_version),
+                "FEREBUS iteration matches reference-data version",
+                lambda: _require_ferebus_iteration(iteration, reference_data_version),
             ),
         ],
         CampaignPhase.STOP_CHECK: [
@@ -887,7 +906,7 @@ def _existing_phase_recovery(
     campaign: Path,
     state: CampaignState,
     *,
-    valid_training_versions: Sequence[int],
+    valid_reference_data_versions: Sequence[int],
     valid_model_versions: Sequence[int],
 ) -> Optional[RecoveryDecision]:
     phase = CampaignPhase(state.phase)
@@ -916,7 +935,7 @@ def select_recovery_phase(
     campaign_dir: Union[str, Path],
     state: CampaignState,
     *,
-    valid_training_versions: Sequence[int],
+    valid_reference_data_versions: Sequence[int],
     valid_model_versions: Sequence[int],
     existing_loaded: bool,
     last_phase: Optional[str] = None,
@@ -932,11 +951,11 @@ def select_recovery_phase(
         except (TypeError, ValueError):
             pass
 
-    training_version = int(getattr(state, "training_set_version", -1))
+    reference_data_version = int(getattr(state, "reference_data_version", -1))
     model_version = int(getattr(state, "models_version", -1))
 
     # Bootstrap/no-committed-version path.
-    if not valid_training_versions and not valid_model_versions:
+    if not valid_reference_data_versions and not valid_model_versions:
         allocation_decision = _allocation_recovery_decision(
             campaign,
             context="bootstrap",
@@ -998,17 +1017,17 @@ def select_recovery_phase(
     if handoff_decision is not None:
         return handoff_decision
 
-    if training_version == 0 and model_version < 0:
-        if _has_version(valid_training_versions, 0):
+    if reference_data_version == 0 and model_version < 0:
+        if _has_version(valid_reference_data_versions, 0):
             return RecoveryDecision(
                 CampaignPhase.INITIAL_FEREBUS,
                 0,
                 "INITIAL_FEREBUS: committed bootstrap training exists without model version 0",
-                "5_TRAINING/iteration-0000",
+                "QM_REFERENCE_DATA/iteration-0000",
             )
 
-    if training_version == model_version and training_version >= 1:
-        canonical_iteration = _active_iteration_for_training_version(training_version)
+    if reference_data_version == model_version and reference_data_version >= 1:
+        canonical_iteration = _active_iteration_for_reference_data_version(reference_data_version)
         if iteration != canonical_iteration and active_iteration_committed(
             state,
             canonical_iteration,
@@ -1020,7 +1039,7 @@ def select_recovery_phase(
             )
 
     if (
-        training_version >= 0
+        reference_data_version >= 0
         and model_version >= 0
         and active_iteration_committed(state, iteration)
     ):
@@ -1030,20 +1049,20 @@ def select_recovery_phase(
             "STOP_CHECK: active iteration is fully committed",
         )
 
-    if training_version >= 0 and training_version > model_version:
-        if _has_version(valid_training_versions, training_version):
+    if reference_data_version >= 0 and reference_data_version > model_version:
+        if _has_version(valid_reference_data_versions, reference_data_version):
             return RecoveryDecision(
                 CampaignPhase.FEREBUS,
-                max(0, training_version - 1),
+                max(0, reference_data_version - 1),
                 "FEREBUS: committed training is one version ahead of committed models",
-                "5_TRAINING/iteration-" + str(training_version).zfill(4),
+                "QM_REFERENCE_DATA/iteration-" + str(reference_data_version).zfill(4),
             )
 
     if existing_loaded:
         existing = _existing_phase_recovery(
             campaign,
             state,
-            valid_training_versions=valid_training_versions,
+            valid_reference_data_versions=valid_reference_data_versions,
             valid_model_versions=valid_model_versions,
         )
         if existing is not None:
@@ -1053,10 +1072,10 @@ def select_recovery_phase(
     if current_handoff is not None:
         return current_handoff.decision
     if (
-        training_version >= 0
+        reference_data_version >= 0
         and model_version >= 0
-        and training_version == model_version
-        and _has_version(valid_training_versions, training_version)
+        and reference_data_version == model_version
+        and _has_version(valid_reference_data_versions, reference_data_version)
         and _has_version(valid_model_versions, model_version)
         and _ok(_require_pool, campaign)
     ):

@@ -65,7 +65,7 @@ def test_csf4_first_iteration_end_to_end(tmp_path):
       2. ichor-al-daemon init.
       3. copy the example campaign.yaml in.
       4. ichor-al-daemon start --live --max-ticks 2000.
-      5. assert state.phase == DONE, training_set_version >= 1.
+      5. assert state.phase == DONE, reference_data_version >= 1.
     """
     # check preflight one more time so we fail fast if the user did not
     # set up the environment properly before invoking pytest -m live.
@@ -112,7 +112,7 @@ def test_csf4_first_iteration_end_to_end(tmp_path):
     )
     state = read_state(state_path)
     assert str(state.phase) == "CampaignPhase.DONE"
-    assert state.training_set_version >= 1
+    assert state.reference_data_version >= 1
     assert state.models_version >= 1
     # reference scales should be populated with five real-float keys
     assert state.reference_scales is not None

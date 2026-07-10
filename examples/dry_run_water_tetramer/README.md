@@ -2,7 +2,7 @@
 
 A complete runnable example campaign for the ICHOR active learning daemon.
 Drives the daemon through TWO iterations using `--dry-run` which writes on the disk
-real artefacts, .i.e., scripts, training-set versions, manifests,
+real artefacts, .i.e., scripts, reference-data delta versions, manifests,
 journal events, provenance sidecars) without calling Gaussian / AIMAll /
 FEREBUS / ARIADNE / POLUS. Finishes in ~30 seconds.
 
@@ -60,7 +60,7 @@ python -m ichor.hpc.active_learning.cli journal --campaign-dir . | tail -20
 ```
 
 `status` shows the canonical state.json content. You should see
-`phase: DONE`, `iteration: 1`, `training_set_version: 2`,
+`phase: DONE`, `iteration: 1`, `reference_data_version: 2`,
 `models_version: 2`, and an `alpha_history` with two entries.
 
 `journal` prints the full per-phase event stream; the last few lines look
@@ -68,15 +68,19 @@ like `expected_journal_tail.txt` (your timestamps + JobIDs will differ).
 
 ## What to look at next
 
-- `5_TRAINING/iteration-NNNN/` -- committed training set per iteration,
-  each with a SHA-pinned manifest.json and one POINT_NNNN.pointdir per
-  selected seed (the dry-run stubs are 1:1 with `7_ACTIVE_LEARNING/.../pool/seed_NNNN/`).
+- `QM_REFERENCE_DATA/iteration-NNNN/` -- immutable QM reference-data delta for
+  that version. It contains only newly accepted pointdirs, a SHA-pinned
+  `REFERENCE_DATA_VERSION.json`, its point-allocation history, and the generic
+  directory manifest. The authoritative resolver reconstructs cumulative
+  order from versions `0000..NNNN`; it never copies older pointdirs forward.
+- `.DATA/ACTIVE_LEARNING/reference_data_view_cache.json` -- a derived view
+  cache. It may be deleted at any time and is rebuilt from the version chain.
 - `6_TRAINED_MODELS/iteration-NNNN/` -- per-iteration model commit.
 - `7_ACTIVE_LEARNING/iteration-NNNN/pool/seed_*/.provenance.json` -- full
   per-seed provenance trail (which frame_id, which subspace, which ARIADNE
   result, anti-overlap flag, phase-B diversity rank).
 - `.DATA/ACTIVE_LEARNING/seed_frame_id_index.json` -- the O(1) lookup index
-  used by SEED_SELECT to forbid frames already seeded into the training set.
+  used by SEED_SELECT to forbid frames already seeded into the QM reference data.
 - `.DATA/ACTIVE_LEARNING/journal.ndjson` -- the full append-only event log.
 - `.DATA/SCRIPTS/*.sh` -- the sbatch scripts the daemon WOULD have submitted
   in live mode (each contains the module-loads + backend invocation it would
@@ -87,7 +91,7 @@ like `expected_journal_tail.txt` (your timestamps + JobIDs will differ).
 To wipe the dry-run output and start over:
 
 ```
-rm -rf .DATA 3_DIVERSITY_SAMPLING 5_TRAINING 6_TRAINED_MODELS 7_ACTIVE_LEARNING
+rm -rf .DATA 3_DIVERSITY_SAMPLING QM_REFERENCE_DATA 6_TRAINED_MODELS 7_ACTIVE_LEARNING
 ```
 
 Then repeat steps 1-3 above. The .gitignore already excludes these

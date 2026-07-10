@@ -4,7 +4,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Union
 
-from ..versioning.training_set import TrainingSetVersioning
+from ..versioning.versioned_directory import VersionedDirectory
+from ..versioning.reference_data import ReferenceDataVersioning
 from .state import CampaignPhase
 
 
@@ -56,23 +57,23 @@ _COHERENT_TRAINING_MODEL_REQUIRED = {
 }
 
 
-def _versioning(campaign_dir: Union[str, Path], dirname: str) -> TrainingSetVersioning:
-    return TrainingSetVersioning(Path(campaign_dir) / dirname)
+def _versioning(campaign_dir: Union[str, Path], dirname: str) -> VersionedDirectory:
+    return VersionedDirectory(Path(campaign_dir) / dirname)
 
 
-def verify_committed_training_version(
+def verify_committed_reference_data_version(
     campaign_dir: Union[str, Path],
     version: int,
     *,
-    training_dir_name: str = "5_TRAINING",
+    reference_data_dir_name: str = "QM_REFERENCE_DATA",
 ) -> None:
     try:
-        _versioning(campaign_dir, training_dir_name).verify_committed_training_inputs(
-            int(version)
-        )
+        ReferenceDataVersioning(
+            Path(campaign_dir) / reference_data_dir_name
+        ).resolve(int(version), verification="deep")
     except Exception as exc:
         raise CommittedArtifactError(
-            "training_version_invalid:"
+            "reference_data_version_invalid:"
             + str(int(version))
             + ": "
             + type(exc).__name__
@@ -111,7 +112,7 @@ def verify_state_referenced_artifacts(
     campaign_dir: Union[str, Path],
     state: Any,
     *,
-    training_dir_name: str = "5_TRAINING",
+    reference_data_dir_name: str = "QM_REFERENCE_DATA",
     models_dir_name: str = "6_TRAINED_MODELS",
     strict_models: bool = True,
 ) -> None:
@@ -120,7 +121,7 @@ def verify_state_referenced_artifacts(
         return
     campaign = Path(campaign_dir)
 
-    train_version = int(getattr(state, "training_set_version", -1))
+    train_version = int(getattr(state, "reference_data_version", -1))
     if phase is CampaignPhase.INITIAL_FEREBUS and train_version < 0:
         try:
             from ..point_allocation import point_allocation_path, read_point_allocation
@@ -146,24 +147,24 @@ def verify_state_referenced_artifacts(
         raise CommittedArtifactError(
             "phase "
             + phase.value
-            + " requires a committed training version but state has "
+            + " requires a committed reference-data version but state has "
             + str(train_version)
         )
     if train_version >= 0:
         train_dir = (
             campaign
-            / training_dir_name
+            / reference_data_dir_name
             / ("iteration-" + str(train_version).zfill(4))
         )
         if train_dir.is_dir():
-            verify_committed_training_version(
+            verify_committed_reference_data_version(
                 campaign,
                 train_version,
-                training_dir_name=training_dir_name,
+                reference_data_dir_name=reference_data_dir_name,
             )
         elif phase in _TRAINING_REQUIRED:
             raise CommittedArtifactError(
-                "state references missing committed training version "
+                "state references missing committed reference-data version "
                 + str(train_version)
                 + " required by phase "
                 + phase.value
@@ -204,9 +205,9 @@ def verify_state_referenced_artifacts(
     if strict_models and phase in _COHERENT_TRAINING_MODEL_REQUIRED:
         if train_version != model_version:
             raise CommittedArtifactError(
-                "state training/model version skew for phase "
+                "state reference-data/model version skew for phase "
                 + phase.value
-                + ": training_set_version="
+                + ": reference_data_version="
                 + str(train_version)
                 + ", models_version="
                 + str(model_version)
@@ -217,19 +218,19 @@ def artifact_manifest_status(
     campaign_dir: Union[str, Path],
     state: Any,
     *,
-    training_dir_name: str = "5_TRAINING",
+    reference_data_dir_name: str = "QM_REFERENCE_DATA",
     models_dir_name: str = "6_TRAINED_MODELS",
     strict_models: bool = True,
 ) -> Dict[str, Any]:
-    out: Dict[str, Any] = {"training": {}, "models": {}}
+    out: Dict[str, Any] = {"reference_data": {}, "models": {}}
     checks: List[tuple] = [
         (
-            "training",
-            int(getattr(state, "training_set_version", -1)),
-            lambda version: verify_committed_training_version(
+            "reference_data",
+            int(getattr(state, "reference_data_version", -1)),
+            lambda version: verify_committed_reference_data_version(
                 campaign_dir,
                 version,
-                training_dir_name=training_dir_name,
+                reference_data_dir_name=reference_data_dir_name,
             ),
         ),
     ]
@@ -271,7 +272,7 @@ def state_artifact_contract_status(
     campaign_dir: Union[str, Path],
     state: Any,
     *,
-    training_dir_name: str = "5_TRAINING",
+    reference_data_dir_name: str = "QM_REFERENCE_DATA",
     models_dir_name: str = "6_TRAINED_MODELS",
     strict_models: bool = True,
 ) -> Dict[str, Any]:
@@ -280,7 +281,7 @@ def state_artifact_contract_status(
     ``artifact_manifest_status`` reports the independent training and model
     version checks. This helper reports the combined producer/consumer
     contract that the live daemon enforces before phase entry, including
-    bootstrap ``INITIAL_FEREBUS`` handoffs and training/model version skew.
+    bootstrap ``INITIAL_FEREBUS`` handoffs and reference-data/model version skew.
     """
     try:
         phase = CampaignPhase(state.phase).value
@@ -289,7 +290,7 @@ def state_artifact_contract_status(
     payload: Dict[str, Any] = {
         "ok": None,
         "phase": phase,
-        "training_set_version": int(getattr(state, "training_set_version", -1)),
+        "reference_data_version": int(getattr(state, "reference_data_version", -1)),
         "models_version": int(getattr(state, "models_version", -1)),
         "strict_models": bool(strict_models),
         "errors": [],
@@ -298,7 +299,7 @@ def state_artifact_contract_status(
         verify_state_referenced_artifacts(
             campaign_dir,
             state,
-            training_dir_name=training_dir_name,
+            reference_data_dir_name=reference_data_dir_name,
             models_dir_name=models_dir_name,
             strict_models=strict_models,
         )

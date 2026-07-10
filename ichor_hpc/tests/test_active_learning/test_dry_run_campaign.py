@@ -27,7 +27,7 @@ from ichor.hpc.active_learning.versioning.manifest import (
     MANIFEST_FILENAME,
     verify_manifest,
 )
-from ichor.hpc.active_learning.versioning.training_set import TrainingSetVersioning
+from ichor.hpc.active_learning.versioning.versioned_directory import VersionedDirectory
 
 
 _SBATCH_PHASES = (
@@ -83,10 +83,10 @@ def test_dry_run_writes_one_stub_script_per_sbatch_phase_per_iter(tmp_path):
         assert iter_part.isdigit()
 
 
-def test_dry_run_commits_three_training_versions(tmp_path):
+def test_dry_run_commits_three_reference_data_versions(tmp_path):
     """Initial commit (iter 0) + APPEND at iter 0 + APPEND at iter 1."""
     campaign, _, _, _ = _run_two_iter_campaign(tmp_path)
-    v = TrainingSetVersioning(campaign / "5_TRAINING")
+    v = VersionedDirectory(campaign / "QM_REFERENCE_DATA")
     assert sorted(v.list_committed_versions()) == [0, 1, 2]
     assert v.current_version() == 2
 
@@ -94,14 +94,14 @@ def test_dry_run_commits_three_training_versions(tmp_path):
 def test_dry_run_commits_three_models_versions(tmp_path):
     """Initial models (iter 0) + FEREBUS post at iter 0 + FEREBUS at iter 1."""
     campaign, _, _, _ = _run_two_iter_campaign(tmp_path)
-    v = TrainingSetVersioning(campaign / "6_TRAINED_MODELS")
+    v = VersionedDirectory(campaign / "6_TRAINED_MODELS")
     assert sorted(v.list_committed_versions()) == [0, 1, 2]
 
 
 def test_dry_run_every_committed_iteration_has_manifest(tmp_path):
     campaign, _, _, _ = _run_two_iter_campaign(tmp_path)
-    for root in (campaign / "5_TRAINING", campaign / "6_TRAINED_MODELS"):
-        v = TrainingSetVersioning(root)
+    for root in (campaign / "QM_REFERENCE_DATA", campaign / "6_TRAINED_MODELS"):
+        v = VersionedDirectory(root)
         for ver in v.list_committed_versions():
             iter_dir = v.iteration_path(ver)
             assert (iter_dir / MANIFEST_FILENAME).exists()
@@ -175,6 +175,6 @@ def test_dry_run_state_persists_iteration_counter(tmp_path):
     state = read_state(d.state_path())
     # max_iterations=2 -> the last iteration to run is iteration=1.
     assert state.iteration == 1
-    # training_set_version was bumped by the APPEND inline at each iter.
-    assert state.training_set_version == 2
+    # reference_data_version was bumped by the APPEND inline at each iter.
+    assert state.reference_data_version == 2
     assert state.models_version == 2

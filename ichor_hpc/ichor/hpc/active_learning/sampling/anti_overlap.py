@@ -2,7 +2,7 @@
 
 Cases (a)-(c) live in ichor.hpc.active_learning.daemon (seed-side):
 
-  (a) Seed selection vs training set     -> select_seeds + provenance index
+  (a) Seed selection vs QM reference data     -> select_seeds + provenance index
   (b) Recent-seeds cooldown               -> recent_seeds.json
   (c) Post-ARIADNE flag (not filter)      -> _post_ariadne_array
 
@@ -13,7 +13,7 @@ below the configured min-separation threshold.
 
 Why a separate module? The seed side cases need access to the trajectory
 pool + the daemon state. case (d) operates on a fully-formed candidate
-list (post-FPS) and a snapshot of the current training set. Same
+list (post-FPS) and a snapshot of the current QM reference data. Same
 distance metric, different inputs.
 
 The effective min_separation is resolved from the daemon's geometry-novelty

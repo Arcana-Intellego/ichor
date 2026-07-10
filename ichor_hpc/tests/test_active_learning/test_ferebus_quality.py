@@ -81,7 +81,14 @@ def _seed_quality_staging(tmp_path, *, ext_targets=(0.0, 0.0)):
         json.dumps({
             "schema_version": stg.FEREBUS_TASK_SCHEMA_VERSION,
             "system": "WATER",
-            "training_version": 4,
+            "reference_data_version": 4,
+            "reference_data_head_manifest_sha256": "a" * 64,
+            "reference_data_view_sha256": "b" * 64,
+            "n_reference_points": 7,
+            "pointdir_row_order": [
+                "POINT_" + str(index).zfill(6) + ".pointdir"
+                for index in range(7)
+            ],
             "tasks": [{
                 "task_index": 1,
                 "property": "iqa",

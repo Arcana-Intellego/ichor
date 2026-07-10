@@ -26,7 +26,7 @@ from ichor.hpc.active_learning.point_allocation import (
     record_quantum_results,
 )
 from ichor.hpc.active_learning.submit.sacct_poll import JobObservation, JobStatus
-from ichor.hpc.active_learning.versioning.training_set import TrainingSetVersioning
+from ichor.hpc.active_learning.versioning.versioned_directory import VersionedDirectory
 
 
 def _make_exec(tmp_path: Path) -> DryRunPhaseExecutor:
@@ -42,7 +42,7 @@ def _state(iteration=0, **updates):
         "iteration": int(iteration),
         "campaign_uid": "dry-run-test-campaign",
         "replacement_round": 0,
-        "training_set_version": -1,
+        "reference_data_version": -1,
         "models_version": -1,
     }
     values.update(updates)
@@ -63,7 +63,7 @@ def _complete_bootstrap(e):
 def _complete_active_quantum(e, *, iteration=0):
     state = _state(
         iteration,
-        training_set_version=0,
+        reference_data_version=0,
         models_version=0,
     )
     e.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
@@ -78,7 +78,7 @@ def _complete_active_quantum(e, *, iteration=0):
 def test_executor_creates_canonical_subdirs(tmp_path):
     e = _make_exec(tmp_path)
     base = tmp_path / "campaign"
-    assert (base / "5_TRAINING").is_dir()
+    assert (base / "QM_REFERENCE_DATA").is_dir()
     assert (base / "6_TRAINED_MODELS").is_dir()
     assert (base / "3_DIVERSITY_SAMPLING").is_dir()
     assert (base / "7_ACTIVE_LEARNING").is_dir()
@@ -113,7 +113,7 @@ def test_submit_or_run_inline_phase_runs_synchronously(tmp_path):
 def test_initial_ferebus_postprocess_commits_training_iteration_0(tmp_path):
     e = _make_exec(tmp_path)
     _complete_bootstrap(e)
-    v = TrainingSetVersioning(tmp_path / "campaign" / "5_TRAINING")
+    v = VersionedDirectory(tmp_path / "campaign" / "QM_REFERENCE_DATA")
     assert 0 in v.list_committed_versions()
     assert v.current_version() == 0
 
@@ -121,7 +121,7 @@ def test_initial_ferebus_postprocess_commits_training_iteration_0(tmp_path):
 def test_initial_ferebus_postprocess_commits_models_iteration_0(tmp_path):
     e = _make_exec(tmp_path)
     _complete_bootstrap(e)
-    v = TrainingSetVersioning(tmp_path / "campaign" / "6_TRAINED_MODELS")
+    v = VersionedDirectory(tmp_path / "campaign" / "6_TRAINED_MODELS")
     assert 0 in v.list_committed_versions()
 
 
@@ -156,7 +156,7 @@ def test_append_inline_stages_and_commits_next_training_iteration(tmp_path):
     _complete_bootstrap(e)
     state = _complete_active_quantum(e)
     e.submit_or_run(state, CampaignPhase.APPEND)
-    v = TrainingSetVersioning(tmp_path / "campaign" / "5_TRAINING")
+    v = VersionedDirectory(tmp_path / "campaign" / "QM_REFERENCE_DATA")
     assert sorted(v.list_committed_versions()) == [0, 1]
     assert v.current_version() == 1
 
@@ -166,9 +166,9 @@ def test_ferebus_postprocess_commits_next_models_iteration(tmp_path):
     _complete_bootstrap(e)
     state = _complete_active_quantum(e)
     append = e.submit_or_run(state, CampaignPhase.APPEND)
-    state.training_set_version = append.state_updates["training_set_version"]
+    state.reference_data_version = append.state_updates["reference_data_version"]
     e.postprocess(state, CampaignPhase.FEREBUS, observations=[])
-    v = TrainingSetVersioning(tmp_path / "campaign" / "6_TRAINED_MODELS")
+    v = VersionedDirectory(tmp_path / "campaign" / "6_TRAINED_MODELS")
     assert sorted(v.list_committed_versions()) == [0, 1]
 
 
@@ -178,7 +178,7 @@ def test_active_allocation_replaces_failed_candidate_from_finite_reserve(tmp_pat
     cfg.point_allocation.batch_internal_validation_size = 1
     cfg.seed_selection.n_seeds_per_iteration = 3
     e = DryRunPhaseExecutor(campaign_dir=tmp_path / "campaign", config=cfg)
-    state = _state(training_set_version=0, models_version=0)
+    state = _state(reference_data_version=0, models_version=0)
     e.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
     e.postprocess(state, CampaignPhase.PHASE_B_POLUS, observations=[])
 

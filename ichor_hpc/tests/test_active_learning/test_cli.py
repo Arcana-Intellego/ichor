@@ -33,7 +33,7 @@ from ichor.hpc.active_learning.handoff_manifests import (
     write_ariadne_results_manifest,
 )
 from ichor.hpc.active_learning.versioning.provenance import write_seed_provenance
-from ichor.hpc.active_learning.versioning.training_set import TrainingSetVersioning
+from ichor.hpc.active_learning.versioning.versioned_directory import VersionedDirectory
 
 
 def _campaign_with_config(tmp_path) -> Path:
@@ -44,8 +44,8 @@ def _campaign_with_config(tmp_path) -> Path:
 
 
 def _commit_training_and_model_versions(campaign: Path, versions):
-    training = TrainingSetVersioning(campaign / "5_TRAINING")
-    models = TrainingSetVersioning(campaign / "6_TRAINED_MODELS")
+    training = VersionedDirectory(campaign / "QM_REFERENCE_DATA")
+    models = VersionedDirectory(campaign / "6_TRAINED_MODELS")
     for version in versions:
         staged = training.stage(None, int(version))
         (staged / "marker.txt").write_text("training", encoding="utf-8")
@@ -456,7 +456,7 @@ def test_cli_status_init_hides_not_due_committed_artifact_errors(tmp_path, capsy
     assert "  initialised:" in out
     assert "Trajectory Pool\n" in out
     assert "Data Products\n" in out
-    assert "  bootstrap training set: not produced yet" in out
+    assert "  bootstrap QM reference data: not produced yet" in out
     assert "  FEREBUS models: not produced yet" in out
     assert "  current phase contract: ready for INIT" in out
     assert "Runtime\n" in out
@@ -483,7 +483,7 @@ def test_cli_status_default_prints_operator_friendly_summary(tmp_path, capsys):
     assert "  iteration: 3 of 5 active iterations planned" in out
     assert "Data Products\n" in out
     assert "  current phase contract: problem - CommittedArtifactError:" in out
-    assert "  bootstrap training set: problem - CommittedArtifactError:" in out
+    assert "  bootstrap QM reference data: problem - CommittedArtifactError:" in out
     assert "  FEREBUS models: problem - CommittedArtifactError:" in out
     assert "Runtime\n" in out
     assert "  daemon: not running" in out
@@ -492,7 +492,7 @@ def test_cli_status_default_prints_operator_friendly_summary(tmp_path, capsys):
     assert "  shutdown requested: no" in out
     assert "Next Action\n" in out
     assert "  severity: required" in out
-    assert "  primary: run reconcile; STOP_CHECK needs the latest coherent committed training/model pair" in out
+    assert "  primary: run reconcile; STOP_CHECK needs the latest coherent committed reference-data/model pair" in out
     assert "  why: CommittedArtifactError:" in out
     assert "  command: ichor-al-daemon reconcile --campaign-dir " in out
     assert "training v0: problem" not in out
@@ -507,7 +507,7 @@ def test_cli_status_reports_initial_ferebus_bootstrap_contract_problem(tmp_path,
     data.mkdir(parents=True, exist_ok=True)
     s = fresh_campaign_state(max_iterations=5)
     s.phase = CampaignPhase.INITIAL_FEREBUS
-    s.training_set_version = -1
+    s.reference_data_version = -1
     s.models_version = -1
     write_state(data / DEFAULT_STATE_FILENAME, s)
 
@@ -518,7 +518,7 @@ def test_cli_status_reports_initial_ferebus_bootstrap_contract_problem(tmp_path,
     assert "Data Products\n" in out
     assert "  current phase contract: problem - CommittedArtifactError:" in out
     assert "initial_ferebus_point_allocation_invalid" in out
-    assert "  bootstrap training set: using initial AIMAll handoff" in out
+    assert "  bootstrap QM reference data: using initial AIMAll handoff" in out
     assert "  FEREBUS models: being produced by INITIAL_FEREBUS" in out
 
 
@@ -550,16 +550,16 @@ def test_reconcile_apply_contract_guard_rejects_invalid_state(tmp_path):
     campaign = _campaign_with_config(tmp_path)
     state = fresh_campaign_state(max_iterations=5)
     state.phase = CampaignPhase.STOP_CHECK
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = 0
 
     error = cli_mod._reconcile_apply_contract_error(campaign, state)
 
     assert error is not None
     assert "phase=STOP_CHECK" in error
-    assert "training_set_version=0" in error
+    assert "reference_data_version=0" in error
     assert "models_version=0" in error
-    assert "state references missing committed training version" in error
+    assert "state references missing committed reference-data version" in error
 
 
 def test_cli_status_default_summarises_active_submission_intents(tmp_path, capsys):
@@ -829,7 +829,7 @@ def test_status_recommendations_cover_contract_failure_classes(tmp_path):
             "phase": CampaignPhase.GAUSSIAN.value,
             "state_artifact_contract_status": {
                 "ok": False,
-                "error": "CommittedArtifactError: state training/model version skew",
+                "error": "CommittedArtifactError: state reference-data/model version skew",
             },
         },
     ) == ["version_skew"]
@@ -839,10 +839,10 @@ def test_status_recommendations_cover_contract_failure_classes(tmp_path):
             "phase": CampaignPhase.SEED_SELECT.value,
             "state_artifact_contract_status": {
                 "ok": False,
-                "error": "CommittedArtifactError: training_version_invalid:0",
+                "error": "CommittedArtifactError: reference_data_version_invalid:0",
             },
         },
-    ) == ["training_missing"]
+    ) == ["reference_data_missing"]
     assert _recommendation_codes(
         campaign,
         {
@@ -1668,8 +1668,8 @@ def test_cli_reconcile_writes_proposed_state(tmp_path, capsys):
     assert proposed.exists()
     captured = capsys.readouterr()
     assert "Proposed state written" in captured.out
-    assert "Committed training versions:" in captured.out
-    assert "Valid training versions:" in captured.out
+    assert "Committed reference-data versions:" in captured.out
+    assert "Valid reference-data versions:" in captured.out
     assert "Committed model versions:" in captured.out
     assert "Valid model versions:" in captured.out
 
@@ -1717,7 +1717,7 @@ def test_cli_reconcile_cleanable_scripts_reports_candidate_without_manual_mv(
     state = fresh_campaign_state(max_iterations=1)
     state.phase = CampaignPhase.HALTED
     state.iteration = 0
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = 0
     write_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME, state)
     append_event(
@@ -1757,12 +1757,12 @@ def test_reconcile_hard_blockers_filter_cleanable_staging_artifacts():
     report = SimpleNamespace(
         unsafe_reasons=[
             "dangling model staging directories exist",
-            "dangling training staging directories exist",
+            "dangling reference-data staging directories exist",
         ],
         blocking_artifacts=[
             "dangling model staging",
-            "dangling training staging",
-            "training version 3",
+            "dangling reference-data staging",
+            "reference-data version 3",
         ],
         active_submission_intents=[],
     )
@@ -1776,8 +1776,8 @@ def test_reconcile_hard_blockers_filter_cleanable_staging_artifacts():
     )
 
     assert "dangling model staging" not in blockers
-    assert "dangling training staging" not in blockers
-    assert "training version 3" in blockers
+    assert "dangling reference-data staging" not in blockers
+    assert "reference-data version 3" in blockers
 
 
 def test_reconcile_hard_blockers_keep_data_staging_without_archive_staging():
@@ -1812,7 +1812,7 @@ def test_cli_reconcile_apply_prints_final_recomputed_phase(
     state = fresh_campaign_state(max_iterations=1)
     state.phase = CampaignPhase.HALTED
     state.iteration = 0
-    state.training_set_version = 0
+    state.reference_data_version = 0
     state.models_version = 0
     write_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME, state)
     append_event(

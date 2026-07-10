@@ -207,13 +207,29 @@ def _write_loadable_ferebus_model(path, *, atom, alf, ntrain=5, nfeats=3):
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _seed_pyferebus_manifest_staging(campaign_dir, training_version=0):
+def _seed_pyferebus_manifest_staging(campaign_dir, reference_data_version=0):
     """Seed the pyferebus-owned staging layout expected by live validators."""
     import json
     import shutil
     from pathlib import Path
 
     from ichor.hpc.active_learning.daemon import input_staging as stg
+    from ichor.hpc.active_learning.versioning.reference_data import (
+        ReferenceDataVersioning,
+    )
+
+    reference_view = ReferenceDataVersioning(
+        Path(campaign_dir) / "QM_REFERENCE_DATA"
+    ).resolve(int(reference_data_version), verification="deep")
+    row_ids = {
+        split: [
+            index
+            for index, entry in enumerate(reference_view.entries)
+            if entry.split == split
+        ]
+        for split in ("train", "int_val", "ext_val")
+    }
+    row_counts = {split: len(values) for split, values in row_ids.items()}
 
     target = Path(campaign_dir) / "6_TRAINED_MODELS" / "iteration-staging"
     if target.exists():
@@ -230,13 +246,18 @@ def _seed_pyferebus_manifest_staging(campaign_dir, training_version=0):
         config_path = model_dir / "ferebus.config"
         config_path.write_text("name WATER\nproperties [\"iqa\"]\n", encoding="utf-8")
         model_path = model_dir / ("WATER_iqa_" + atom + ".model")
-        _write_loadable_ferebus_model(model_path, atom=atom, alf=alf)
+        _write_loadable_ferebus_model(
+            model_path,
+            atom=atom,
+            alf=alf,
+            ntrain=row_counts["train"],
+        )
         train_csv = model_dir / ("WATER_" + atom + "_TRAINING_SET.csv")
         int_csv = model_dir / ("WATER_" + atom + "_INT_VALIDATION_SET.csv")
         ext_csv = model_dir / ("WATER_" + atom + "_EXT_VALIDATION_SET.csv")
-        _write_ferebus_metric_csv(train_csv, 5)
-        _write_ferebus_metric_csv(int_csv, 2)
-        _write_ferebus_metric_csv(ext_csv, 2)
+        _write_ferebus_metric_csv(train_csv, row_counts["train"])
+        _write_ferebus_metric_csv(int_csv, row_counts["int_val"])
+        _write_ferebus_metric_csv(ext_csv, row_counts["ext_val"])
         tasks.append({
             "task_index": idx,
             "property": "iqa",
@@ -247,13 +268,24 @@ def _seed_pyferebus_manifest_staging(campaign_dir, training_version=0):
             "training_csv": str(train_csv),
             "int_validation_csv": str(int_csv),
             "ext_validation_csv": str(ext_csv),
-            "row_counts": {"train": 5, "int_val": 2, "ext_val": 2},
+            "row_counts": dict(row_counts),
+            "row_ids": dict(row_ids),
         })
     (target / stg.FEREBUS_TASK_MANIFEST).write_text(
         json.dumps({
             "schema_version": stg.FEREBUS_TASK_SCHEMA_VERSION,
             "system": "WATER",
-            "training_version": int(training_version),
+            "reference_data_version": int(reference_data_version),
+            "reference_data_head_manifest_sha256": (
+                reference_view.head_manifest_sha256
+            ),
+            "reference_data_view_sha256": (
+                reference_view.cumulative_view_sha256
+            ),
+            "n_reference_points": len(reference_view.entries),
+            "pointdir_row_order": [
+                entry.pointdir_name for entry in reference_view.entries
+            ],
             "properties": ["iqa"],
             "atoms": list(specs),
             "n_tasks": len(tasks),
@@ -280,7 +312,7 @@ def _ensure_live_trajectory_pool(campaign_dir):
     fixture = _live_smoke_fixtures() / "polus_phase_a" / "initial-SAMPLE-2.xyz"
     source = campaign_dir / "live-smoke-pool.xyz"
     fixture_text = fixture.read_text(encoding="utf-8")
-    source.write_text(fixture_text + fixture_text, encoding="utf-8", newline="\n")
+    source.write_text(fixture_text * 3, encoding="utf-8", newline="\n")
     TrajectoryPool.import_from(
         source,
         campaign_dir,
@@ -294,7 +326,7 @@ def _live_smoke_config(campaign_dir):
     config = CampaignConfig(max_iterations=1, poll_interval_seconds=1)
     config.point_allocation.bootstrap_training_size = 1
     config.point_allocation.bootstrap_internal_validation_size = 1
-    config.point_allocation.bootstrap_external_validation_size = 0
+    config.point_allocation.bootstrap_external_validation_size = 1
     config.point_allocation.batch_training_size = 1
     config.point_allocation.batch_internal_validation_size = 1
     config.seed_selection.n_seeds_per_iteration = 2
@@ -312,10 +344,12 @@ def _patch_ferebus_submit_for_live_smoke(monkeypatch, campaign_dir, call_log):
 
     calls = {"n": 0}
 
-    def fake_stage(campaign_dir_arg, config, training_version, *, is_initial=False):
+    def fake_stage(campaign_dir_arg, config, reference_data_version, *, is_initial=False):
+        if is_initial:
+            stg.commit_initial_reference_data(campaign_dir_arg)
         staging = _seed_pyferebus_manifest_staging(
             campaign_dir_arg,
-            training_version=0 if is_initial else int(training_version),
+            reference_data_version=0 if is_initial else int(reference_data_version),
         )
         return staging, 1
 
@@ -555,10 +589,20 @@ def _live_smoke_seed_for_phase(campaign_dir, phase_name, iteration):
         for f in src.iterdir():
             if f.is_file():
                 (target / f.name).write_bytes(f.read_bytes())
-        sample = target / "initial-SAMPLE-2.xyz"
-        index = target / "initial-INDEX-2.dat"
-        if not index.is_file():
-            index.write_text("0\n1\n", encoding="utf-8")
+        source_sample = target / "initial-SAMPLE-2.xyz"
+        sample = target / "initial-SAMPLE-3.xyz"
+        source_lines = source_sample.read_text(encoding="utf-8").splitlines()
+        block_size = int(source_lines[0]) + 2
+        sample.write_text(
+            "\n".join(source_lines + source_lines[:block_size]) + "\n",
+            encoding="utf-8",
+        )
+        source_sample.unlink()
+        old_index = target / "initial-INDEX-2.dat"
+        if old_index.exists():
+            old_index.unlink()
+        index = target / "initial-INDEX-3.dat"
+        index.write_text("0\n1\n2\n", encoding="utf-8")
         state = read_state(
             campaign_dir / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
         )
@@ -573,14 +617,14 @@ def _live_smoke_seed_for_phase(campaign_dir, phase_name, iteration):
             campaign_uid=str(state.campaign_uid),
             context="bootstrap",
             iteration=0,
-            targets={"train": 1, "int_val": 1, "ext_val": 0, "total": 2},
+            targets={"train": 1, "int_val": 1, "ext_val": 1, "total": 3},
             primary_candidates=[
                 {
                     "candidate_id": "live-phase-a-" + str(i),
                     "source": "phase_a_polus",
                     "frame_id": int(i),
                 }
-                for i in range(2)
+                for i in range(3)
             ],
             reserve_candidates=[
                 {
@@ -589,7 +633,7 @@ def _live_smoke_seed_for_phase(campaign_dir, phase_name, iteration):
                     "frame_id": int(i),
                     "reserve_rank": int(i - 2),
                 }
-                for i in range(2, len(pool))
+                for i in range(3, len(pool))
             ],
         )
         primary = [
@@ -605,20 +649,20 @@ def _live_smoke_seed_for_phase(campaign_dir, phase_name, iteration):
             "iteration": -1,
             "sample_xyz": str(sample.resolve()),
             "index_path": str(index.resolve()),
-            "n_select": 2,
-            "n_frames": 2,
-            "selected_indices": [0, 1],
+            "n_select": 3,
+            "n_frames": 3,
+            "selected_indices": [0, 1, 2],
             "descriptor": "rmsd_massweight",
             "n_pool_frames": int(len(pool)),
-            "bootstrap_total_size": 2,
+            "bootstrap_total_size": 3,
             "point_allocation": {
                 "manifest": str(allocation_path.resolve()),
                 "targets": dict(allocation["targets"]),
                 "primary": primary,
-                "reserve_frame_ids": [int(i) for i in range(2, len(pool))],
-                "reserve_count": max(0, int(len(pool)) - 2),
+                "reserve_frame_ids": [int(i) for i in range(3, len(pool))],
+                "reserve_count": max(0, int(len(pool)) - 3),
             },
-            "reserve_after_bootstrap": max(0, int(len(pool)) - 2),
+            "reserve_after_bootstrap": max(0, int(len(pool)) - 3),
             "trajectory_sha256": str(pool.sha256),
             "source_pool_manifest": str(
                 (campaign_dir / POOL_SUBDIR / POOL_MANIFEST_FILENAME).resolve()
@@ -639,7 +683,7 @@ def _live_smoke_seed_for_phase(campaign_dir, phase_name, iteration):
     elif phase_name in ("INITIAL_FEREBUS", "FEREBUS"):
         _seed_pyferebus_manifest_staging(
             campaign_dir,
-            training_version=0 if phase_name == "INITIAL_FEREBUS" else 1,
+            reference_data_version=0 if phase_name == "INITIAL_FEREBUS" else 1,
         )
     elif phase_name == "ARIADNE_ARRAY":
         target = campaign_dir / "7_ACTIVE_LEARNING" / iter4 / "pool"
@@ -730,7 +774,7 @@ def test_live_one_iter_water_tetramer_after_parsers_land(tmp_path, monkeypatch):
       * No NotImplementedError raised by any live postprocess.
       * Every mandatory submitted phase fired sbatch.
       * Clean allocations do not submit replacement arrays.
-      * Final state.phase is DONE and training_set_version >= 0.
+      * Final state.phase is DONE and reference_data_version >= 0.
       * Final state.iteration shows the iteration loop ran at least once.
       * journal contains at least one phase_succeeded_live event.
     """
@@ -783,8 +827,8 @@ def test_live_one_iter_water_tetramer_after_parsers_land(tmp_path, monkeypatch):
     assert int(state.iteration) >= 0
     # INITIAL_FEREBUS commits initial models 0 + iteration-1 FEREBUS
     # commits models 1, so both versions should be at least 1.
-    assert state.training_set_version >= 1, (
-        "training_set_version=" + str(state.training_set_version)
+    assert state.reference_data_version >= 1, (
+        "reference_data_version=" + str(state.reference_data_version)
         + "; expected at least 1 (initial + 1 iter)"
     )
     assert state.models_version >= 1, (

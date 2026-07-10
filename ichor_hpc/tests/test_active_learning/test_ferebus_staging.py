@@ -35,15 +35,13 @@ from ichor.hpc.active_learning.versioning.provenance import (
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "live_outputs"
 
 
-class _FakePointsDirectory:
+class _FakePointsDirectory(list):
     """stand-in for the real PointsDirectory: instead of reading AIMAll .int files it just emits a
     known per-atom feature/iqa csv (the iqa scale differs per element, as it really would)."""
-    def __init__(self, path):
+    def __init__(self, path, needs_parsing=True):
+        super().__init__()
         self._path = path
-
-    def __iter__(self):
-        for i in range(20):
-            yield self._path / ("POINT_" + str(i).zfill(4) + ".pointdir")
+        self.path = path
 
     def alf_dict(self, _calc):
         return {"O1": (0, 1, 2), "H2": (1, 0, 2), "H3": (2, 0, 1)}
@@ -54,7 +52,7 @@ class _FakePointsDirectory:
         for atom, base in (("O1", -75.0), ("H2", -0.5), ("H3", -0.5)):
             with open(atom + str_to_append_to_fname, "w", encoding="utf-8", newline="\n") as f:
                 f.write("f1,f2,f3,iqa,q00\n")
-                for i in range(20):
+                for i in range(len(self)):
                     f.write(
                         f"{i + 0.1},{i + 0.2},{i + 0.3},"
                         f"{base - i * 0.01},{0.2 + i * 0.001}\n"
@@ -62,8 +60,7 @@ class _FakePointsDirectory:
 
 
 def _prepare_bootstrap_training(campaign, cfg):
-    training_dir = campaign / "5_TRAINING" / "iteration-0000"
-    training_dir.mkdir(parents=True)
+    source_dir = campaign / ".DATA" / "STAGING" / "initial"
     cfg.point_allocation.bootstrap_training_size = 12
     cfg.point_allocation.bootstrap_internal_validation_size = 3
     cfg.point_allocation.bootstrap_external_validation_size = 5
@@ -91,8 +88,8 @@ def _prepare_bootstrap_training(campaign, cfg):
     )
     results = []
     for attempt in pending_attempts(allocation):
-        pointdir = training_dir / str(attempt["pointdir_name"])
-        pointdir.mkdir()
+        pointdir = source_dir / str(attempt["pointdir_name"])
+        pointdir.mkdir(parents=True)
         (pointdir / "input.gjf").write_text("# synthetic\n", encoding="utf-8")
         results.append({
             "candidate_id": attempt["candidate_id"],
@@ -101,7 +98,7 @@ def _prepare_bootstrap_training(campaign, cfg):
         })
     allocation = record_quantum_results(allocation_path, results)
     for attempt in accepted_attempts(allocation):
-        pointdir = training_dir / str(attempt["pointdir_name"])
+        pointdir = source_dir / str(attempt["pointdir_name"])
         write_seed_provenance(
             pointdir,
             campaign_uid="campaign-uid",
@@ -121,8 +118,13 @@ def _prepare_bootstrap_training(campaign, cfg):
             slot_id=int(attempt["slot_id"]),
             split=str(attempt["split"]),
         )
-    write_manifest(training_dir, compute_directory_manifest(training_dir))
-    return training_dir
+    stg.commit_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )
+    return campaign / "QM_REFERENCE_DATA" / "iteration-0000"
 
 
 def test_stage_ferebus_inputs_orchestration(tmp_path, monkeypatch):
@@ -135,7 +137,12 @@ def test_stage_ferebus_inputs_orchestration(tmp_path, monkeypatch):
     cfg.system_name = "WATER"
     cfg.ferebus.properties = ["iqa", "q00"]
     _prepare_bootstrap_training(campaign, cfg)
-    staging, n_tasks = stg.stage_ferebus_inputs(campaign, cfg, training_version=0, is_initial=False)
+    staging, n_tasks = stg.stage_ferebus_inputs(
+        campaign,
+        cfg,
+        reference_data_version=0,
+        is_initial=False,
+    )
 
     assert n_tasks == 6
     assert set((staging / "ATOMS.txt").read_text(encoding="utf-8").split()) == {"O1", "H2", "H3"}
@@ -155,7 +162,7 @@ def test_stage_ferebus_inputs_orchestration(tmp_path, monkeypatch):
     assert manifest["n_tasks"] == 6
     assert manifest["split_ledger"]["counts"] == {"train": 12, "int_val": 3, "ext_val": 5}
     assert manifest["pointdir_row_order"] == [
-        "POINT_" + str(i).zfill(4) + ".pointdir" for i in range(20)
+        "POINT_" + str(i).zfill(6) + ".pointdir" for i in range(20)
     ]
     assert manifest["degenerate_property_stats"] == []
     assert {task["property"] for task in manifest["tasks"]} == {"iqa", "q00"}
@@ -182,7 +189,12 @@ def test_stage_ferebus_inputs_clears_stale_models(tmp_path, monkeypatch):
     (staging / "Zz9_train.csv").write_text("f1,iqa\n0.1,-1.0\n", encoding="utf-8")
     monkeypatch.setattr(core_files, "PointsDirectory", _FakePointsDirectory)
 
-    stg.stage_ferebus_inputs(campaign, cfg, training_version=0, is_initial=False)
+    stg.stage_ferebus_inputs(
+        campaign,
+        cfg,
+        reference_data_version=0,
+        is_initial=False,
+    )
 
     assert not (staging / "STALE.model").exists()
     assert not (staging / "Zz9_train.csv").exists()
@@ -190,17 +202,22 @@ def test_stage_ferebus_inputs_clears_stale_models(tmp_path, monkeypatch):
 
 def test_stage_ferebus_inputs_rejects_unmanifested_committed_pointdir(tmp_path, monkeypatch):
     campaign = tmp_path / "c"
-    training_dir = campaign / "5_TRAINING" / "iteration-0000"
+    cfg = CampaignConfig()
+    cfg.system_name = "WATER"
+    _prepare_bootstrap_training(campaign, cfg)
+    training_dir = campaign / "QM_REFERENCE_DATA" / "iteration-0000"
     rogue = training_dir / "POINT_9999.pointdir"
     rogue.mkdir(parents=True)
     (rogue / "input.gjf").write_text("%chk=x\n", encoding="utf-8")
-    write_manifest(training_dir, {})
     monkeypatch.setattr(core_files, "PointsDirectory", _FakePointsDirectory)
 
-    cfg = CampaignConfig()
-    cfg.system_name = "WATER"
     try:
-        stg.stage_ferebus_inputs(campaign, cfg, training_version=0, is_initial=False)
+        stg.stage_ferebus_inputs(
+            campaign,
+            cfg,
+            reference_data_version=0,
+            is_initial=False,
+        )
     except ManifestMismatchError:
         pass
     else:

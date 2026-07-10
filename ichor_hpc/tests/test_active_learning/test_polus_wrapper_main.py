@@ -344,7 +344,7 @@ def test_phase_b_writes_sample_and_dedup(tmp_path):
     assert final.is_file()
     assert dedup.is_file()
     d = json.loads(dedup.read_text(encoding="utf-8"))
-    # fresh campaign, no committed training set to dedup against, so case (d) drops nothing
+    # fresh campaign, no committed QM reference data to dedup against, so case (d) drops nothing
     # regardless of the geometry novelty-derived default minimum separation.
     assert d["n_dropped"] == 0
     assert d["min_separation"] == 0.025

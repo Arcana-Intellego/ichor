@@ -450,6 +450,9 @@ class Daemon:
     # --- state IO -------------------------------------------------------
 
     def _read_or_initialise_state(self) -> CampaignState:
+        from ..layout import reject_legacy_training_layout
+
+        reject_legacy_training_layout(self.campaign_dir)
         #ensure the data dir exists before any state IO. run() also does thi
         #via _acquire_lock(), but tick() can be called directly in tests.
         self.data_dir().mkdir(parents=True, exist_ok=True)
@@ -496,7 +499,7 @@ class Daemon:
 
             added = repair_index_from_committed_pointdirs(
                 self.campaign_dir,
-                self.campaign_dir / "5_TRAINING",
+                self.campaign_dir / "QM_REFERENCE_DATA",
             )
             if added:
                 self._journal("provenance_index_repaired", records_added=int(added))
@@ -2035,16 +2038,16 @@ class Daemon:
             CampaignPhase.INITIAL_FEREBUS,
             CampaignPhase.FEREBUS,
         ):
-            training_raw = getattr(state, "training_set_version", -1)
+            training_raw = getattr(state, "reference_data_version", -1)
             try:
-                training_version = int(training_raw)
+                reference_data_version = int(training_raw)
             except (TypeError, ValueError):
-                training_version = -1
-            if training_version >= 0:
+                reference_data_version = -1
+            if reference_data_version >= 0:
                 candidate = (
                     self.campaign_dir
                     / "6_TRAINED_MODELS"
-                    / ("iteration-" + str(training_version).zfill(4))
+                    / ("iteration-" + str(reference_data_version).zfill(4))
                 )
                 if candidate.is_dir():
                     return self._halt(
@@ -2191,33 +2194,33 @@ class Daemon:
                 + str(models_version)
             )
         raw_training = state_updates.get(
-            "training_set_version",
-            getattr(state, "training_set_version", -1),
+            "reference_data_version",
+            getattr(state, "reference_data_version", -1),
         )
         try:
-            training_version = int(raw_training)
+            reference_data_version = int(raw_training)
         except (TypeError, ValueError):
             return (
-                "required FEREBUS training version is not an integer for "
+                "required FEREBUS reference-data version is not an integer for "
                 + phase.value
                 + ": "
                 + repr(raw_training)
             )
-        if training_version < 0:
+        if reference_data_version < 0:
             return (
-                "required FEREBUS training version is negative for "
+                "required FEREBUS reference-data version is negative for "
                 + phase.value
                 + ": "
-                + str(training_version)
+                + str(reference_data_version)
             )
-        if models_version != training_version:
+        if models_version != reference_data_version:
             return (
-                "FEREBUS model/training version skew after "
+                "FEREBUS model/reference-data version skew after "
                 + phase.value
                 + ": models_version="
                 + str(models_version)
-                + ", training_set_version="
-                + str(training_version)
+                + ", reference_data_version="
+                + str(reference_data_version)
             )
 
         expected_path = (
@@ -2228,9 +2231,9 @@ class Daemon:
         try:
             from .artifact_contracts import (
                 verify_committed_model_version,
-                verify_committed_training_version,
+                verify_committed_reference_data_version,
             )
-            verify_committed_training_version(self.campaign_dir, training_version)
+            verify_committed_reference_data_version(self.campaign_dir, reference_data_version)
             verify_committed_model_version(self.campaign_dir, models_version)
         except Exception as exc:
             return (
@@ -2329,7 +2332,7 @@ class Daemon:
         if not updates:
             return
         allowed = {
-            "training_set_version", "validation_set_version", "models_version",
+            "reference_data_version", "validation_set_version", "models_version",
             "replacement_round",
             "last_acquisition_alpha0", "stop_streak", "max_iterations",
             #STOP_CHECK extensions:

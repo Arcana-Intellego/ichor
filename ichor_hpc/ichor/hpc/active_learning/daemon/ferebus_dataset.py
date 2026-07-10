@@ -1,6 +1,6 @@
 """Per-atom FEREBUS dataset splitting for the live training step.
 
-ICHOR writes one feature+property csv per atom from the committed training set
+ICHOR writes one feature+property csv per atom from the committed QM reference data
 (f1..fN columns, then property columns like iqa). FEREBUS reads three csvs per
 atom instead:
 

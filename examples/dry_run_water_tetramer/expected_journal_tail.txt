@@ -3,7 +3,7 @@
 # the event sequence + payload shape should match.
 
 {"event": "phase_transition", "from_phase": "AIMALL", "iteration": 1, "to_phase": "APPEND", ...}
-{"event": "training_set_committed", "iteration": 1, "n_committed_points": 2, "training_set_version": 2, ...}
+{"event": "reference_data_committed", "iteration": 1, "n_committed_points": 2, "reference_data_version": 2, ...}
 {"event": "phase_transition", "from_phase": "APPEND", "iteration": 1, "to_phase": "FEREBUS", ...}
 {"event": "sbatch", "iteration": 1, "job_id": "DRYRUN-FEREBUS-1", "phase": "FEREBUS", ...}
 {"event": "phase_succeeded", "iteration": 1, "n_completed": 1, "n_failed": 0, "n_tasks": 1, "phase": "FEREBUS", ...}
@@ -13,7 +13,7 @@
 
 # Anchors to grep for after a successful run:
 #
-#   * exactly TWO `training_set_committed` events (iterations 0 + 1)
+#   * exactly TWO `reference_data_committed` events (iterations 0 + 1)
 #   * exactly TWO `phase_succeeded` events per per-iteration SBATCH phase
 #   * exactly ONE `daemon_stopped` event at the end
 #   * NO `tick_error` or `live_postprocess_refused` events
