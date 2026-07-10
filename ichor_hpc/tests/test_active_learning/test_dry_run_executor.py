@@ -79,7 +79,7 @@ def test_executor_creates_canonical_subdirs(tmp_path):
     e = _make_exec(tmp_path)
     base = tmp_path / "campaign"
     assert (base / "QM_REFERENCE_DATA").is_dir()
-    assert (base / "6_TRAINED_MODELS").is_dir()
+    assert (base / "TRAINED_MODELS").is_dir()
     assert (base / "3_DIVERSITY_SAMPLING").is_dir()
     assert (base / "7_ACTIVE_LEARNING").is_dir()
     assert (base / ".DATA" / "SCRIPTS").is_dir()
@@ -121,7 +121,7 @@ def test_initial_ferebus_postprocess_commits_training_iteration_0(tmp_path):
 def test_initial_ferebus_postprocess_commits_models_iteration_0(tmp_path):
     e = _make_exec(tmp_path)
     _complete_bootstrap(e)
-    v = VersionedDirectory(tmp_path / "campaign" / "6_TRAINED_MODELS")
+    v = VersionedDirectory(tmp_path / "campaign" / "TRAINED_MODELS")
     assert 0 in v.list_committed_versions()
 
 
@@ -168,7 +168,7 @@ def test_ferebus_postprocess_commits_next_models_iteration(tmp_path):
     append = e.submit_or_run(state, CampaignPhase.APPEND)
     state.reference_data_version = append.state_updates["reference_data_version"]
     e.postprocess(state, CampaignPhase.FEREBUS, observations=[])
-    v = VersionedDirectory(tmp_path / "campaign" / "6_TRAINED_MODELS")
+    v = VersionedDirectory(tmp_path / "campaign" / "TRAINED_MODELS")
     assert sorted(v.list_committed_versions()) == [0, 1]
 
 

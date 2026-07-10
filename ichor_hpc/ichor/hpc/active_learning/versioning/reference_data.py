@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
-from ..layout import qm_reference_data_dir
+from ..layout import COMMITTED_VERSION_NAME_WIDTH, qm_reference_data_dir
 from .manifest import (
     ManifestMismatchError,
     read_manifest,
@@ -64,6 +64,7 @@ class ReferenceDataEntry:
 @dataclass(frozen=True)
 class ReferenceDataView:
     version: int
+    campaign_uid: str
     entries: Tuple[ReferenceDataEntry, ...]
     cumulative_view_sha256: str
     head_manifest_sha256: str
@@ -186,6 +187,8 @@ def _safe_sha(value: Any, label: str) -> str:
 def _safe_int(value: Any, label: str, *, minimum: Optional[int] = None) -> int:
     if isinstance(value, bool):
         raise ReferenceDataError(label + " must be an integer")
+    if isinstance(value, float) and not value.is_integer():
+        raise ReferenceDataError(label + " must be an integer")
     try:
         parsed = int(value)
     except (TypeError, ValueError) as exc:
@@ -286,7 +289,9 @@ def _validate_allocation_snapshot(
         minimum=0,
     )
     snapshot = iteration_dir / (
-        "POINT_ALLOCATION.version-" + str(version).zfill(4) + ".json"
+        "POINT_ALLOCATION.version-"
+        + str(version).zfill(COMMITTED_VERSION_NAME_WIDTH)
+        + ".json"
     )
     if not snapshot.is_file() or snapshot.is_symlink():
         raise ReferenceDataError(
@@ -471,6 +476,7 @@ def resolve_reference_data_view(
 
     view = ReferenceDataView(
         version=target_version,
+        campaign_uid=str(campaign_uid),
         entries=tuple(entries),
         cumulative_view_sha256=_view_sha(entries),
         head_manifest_sha256=head_manifest_sha,

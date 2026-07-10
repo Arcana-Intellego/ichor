@@ -68,7 +68,7 @@ def test_missing_models_dir_bails_only_with_explicit_uniform_fallback(tmp_path):
 
 def test_happy_path_writes_sidecar_and_journals(tmp_path):
     ex = _make_executor(tmp_path)
-    models_dir = ex.campaign_dir / "6_TRAINED_MODELS" / "iteration-0000"
+    models_dir = ex.campaign_dir / "TRAINED_MODELS" / "iteration-000000"
     models_dir.mkdir(parents=True, exist_ok=True)
     pool_xyz = ex.campaign_dir / ".DATA" / "TRAJECTORY" / "pool.xyz"
     pool_xyz.parent.mkdir(parents=True, exist_ok=True)
@@ -108,7 +108,11 @@ def test_happy_path_writes_sidecar_and_journals(tmp_path):
     )
     with patch(contract, return_value=None):
         with patch(target, return_value=fake_acq):
-            with patch("ichor.core.models.Models", return_value=None):
+            with patch(
+                "ichor.hpc.active_learning.versioning.trained_models."
+                "load_trained_models",
+                return_value=(SimpleNamespace(), SimpleNamespace()),
+            ):
                 state = _state(iteration=0, models_version=0)
                 refreshed = ex._maybe_refresh_reference_scales(state)
     assert refreshed is True

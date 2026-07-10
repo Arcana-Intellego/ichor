@@ -41,6 +41,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from ..config import CampaignConfig
+from ..layout import trained_models_dir
 from ..submit.sacct_poll import JobObservation, aggregate_states, poll_job
 from .journal import append_event
 from .phase_executor import (
@@ -450,9 +451,9 @@ class Daemon:
     # --- state IO -------------------------------------------------------
 
     def _read_or_initialise_state(self) -> CampaignState:
-        from ..layout import reject_legacy_training_layout
+        from ..layout import reject_legacy_campaign_layout
 
-        reject_legacy_training_layout(self.campaign_dir)
+        reject_legacy_campaign_layout(self.campaign_dir)
         #ensure the data dir exists before any state IO. run() also does thi
         #via _acquire_lock(), but tick() can be called directly in tests.
         self.data_dir().mkdir(parents=True, exist_ok=True)
@@ -1450,8 +1451,7 @@ class Daemon:
                 )
             if phase_name in ("INITIAL_FEREBUS", "FEREBUS"):
                 manifest = (
-                    self.campaign_dir
-                    / "6_TRAINED_MODELS"
+                    trained_models_dir(self.campaign_dir)
                     / "iteration-staging"
                     / "FEREBUS_TASKS.json"
                 )
@@ -2044,11 +2044,12 @@ class Daemon:
             except (TypeError, ValueError):
                 reference_data_version = -1
             if reference_data_version >= 0:
-                candidate = (
-                    self.campaign_dir
-                    / "6_TRAINED_MODELS"
-                    / ("iteration-" + str(reference_data_version).zfill(4))
-                )
+                from ..versioning.trained_models import TrainedModelVersioning
+                from ..layout import trained_models_dir
+
+                candidate = TrainedModelVersioning(
+                    trained_models_dir(self.campaign_dir)
+                ).iteration_path(reference_data_version)
                 if candidate.is_dir():
                     return self._halt(
                         state,
@@ -2223,11 +2224,12 @@ class Daemon:
                 + str(reference_data_version)
             )
 
-        expected_path = (
-            self.campaign_dir
-            / "6_TRAINED_MODELS"
-            / ("iteration-" + str(models_version).zfill(4))
-        )
+        from ..versioning.trained_models import TrainedModelVersioning
+        from ..layout import trained_models_dir
+
+        expected_path = TrainedModelVersioning(
+            trained_models_dir(self.campaign_dir)
+        ).iteration_path(models_version)
         try:
             from .artifact_contracts import (
                 verify_committed_model_version,

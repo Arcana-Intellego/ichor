@@ -17,6 +17,7 @@ Run only the live tests when on the cluster:
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shlex
 import shutil
@@ -1340,17 +1341,41 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
         (
             campaign
             / "QM_REFERENCE_DATA"
-            / ("iteration-" + str(version).zfill(4))
+            / ("iteration-" + str(version).zfill(6))
         ).mkdir(parents=True)
-    staging = campaign / "6_TRAINED_MODELS" / "iteration-staging"
+    staging = campaign / "TRAINED_MODELS" / "iteration-staging"
     staging.mkdir(parents=True)
     (staging / stg.FEREBUS_JOB_DETAILS).write_text(
         "system_name WATER\n", encoding="utf-8",
     )
+    dataset_identities = {}
+    for atom in ("O1", "H2", "H3"):
+        datasets_dir = staging / "iqa" / atom / "datasets"
+        datasets_dir.mkdir(parents=True)
+        records = {}
+        for split, suffix, rows in (
+            ("train", "TRAINING_SET", 3),
+            ("int_val", "INT_VALIDATION_SET", 1),
+            ("ext_val", "EXT_VALIDATION_SET", 1),
+        ):
+            dataset = datasets_dir / ("WATER_" + atom + "_" + suffix + ".csv")
+            dataset.write_text(
+                "f1,f2,f3,iqa\n" + "0.1,0.2,0.3,0.0\n" * rows,
+                encoding="utf-8",
+            )
+            records[split] = {
+                "path": dataset.relative_to(staging).as_posix(),
+                "size": dataset.stat().st_size,
+                "sha256": hashlib.sha256(dataset.read_bytes()).hexdigest(),
+                "rows": rows,
+            }
+        dataset_identities[atom] = records
     (staging / stg.FEREBUS_TASK_MANIFEST).write_text(
         json.dumps(
             {
                 "schema_version": stg.FEREBUS_TASK_SCHEMA_VERSION,
+                "campaign_uid": "backend-smoke",
+                "system": "WATER",
                 "reference_data_version": 4,
                 "reference_data_head_manifest_sha256": "a" * 64,
                 "reference_data_view_sha256": "b" * 64,
@@ -1359,16 +1384,57 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
                     "POINT_" + str(index).zfill(6) + ".pointdir"
                     for index in range(5)
                 ],
+                "properties": ["iqa"],
+                "atoms": ["O1", "H2", "H3"],
+                "n_atoms": 3,
                 "n_tasks": 3,
                 "tasks": [
                     {
+                        "task_index": index,
+                        "property": "iqa",
+                        "atom": atom,
+                        "alf_1_indexed": list(alf),
+                        "alf_cli": "_".join(
+                            str(value) for value in alf
+                        ),
+                        "property_dir": "iqa",
+                        "output_dir": "iqa/" + atom,
+                        "input_dir": "iqa/" + atom + "/datasets",
+                        "config_path": "iqa/" + atom + "/ferebus.config",
+                        "training_csv": "iqa/" + atom + "/datasets/WATER_" + atom + "_TRAINING_SET.csv",
+                        "int_validation_csv": "iqa/" + atom + "/datasets/WATER_" + atom + "_INT_VALIDATION_SET.csv",
+                        "ext_validation_csv": "iqa/" + atom + "/datasets/WATER_" + atom + "_EXT_VALIDATION_SET.csv",
+                        "expected_model_path": "iqa/" + atom + "/WATER_iqa_" + atom + ".model",
+                        "command_args": [
+                            "-c", "iqa/" + atom + "/ferebus.config",
+                            "-I", "iqa/" + atom + "/datasets",
+                            "-O", "iqa/" + atom,
+                            "-P", "iqa",
+                            "-A", atom,
+                            "-ALF", "_".join(
+                                str(value) for value in alf
+                            ),
+                        ],
                         "row_counts": {
                             "train": 3,
                             "int_val": 1,
                             "ext_val": 1,
-                        }
+                        },
+                        "row_ids": {
+                            "train": [0, 1, 2],
+                            "int_val": [3],
+                            "ext_val": [4],
+                        },
+                        "datasets": dataset_identities[atom],
                     }
-                    for _ in range(3)
+                    for index, (atom, alf) in enumerate(
+                        (
+                            ("O1", (1, 2, 3)),
+                            ("H2", (2, 1, 3)),
+                            ("H3", (3, 1, 2)),
+                        ),
+                        start=1,
+                    )
                 ],
             }
         ),

@@ -8,7 +8,7 @@
 
 What the dry-run executor DOES exercise (real, no mocking):
 
-    * Directory layout setup (QM_REFERENCE_DATA/, 6_TRAINED_MODELS/, 7_ACTIVE_LEARNING/,
+    * Directory layout setup (QM_REFERENCE_DATA/, TRAINED_MODELS/, 7_ACTIVE_LEARNING/,
       .DATA/SCRIPTS/).
     * VersionedDirectory (stage, commit, update_current, manifest writes,
       atomic renames).
@@ -51,7 +51,9 @@ from ..versioning.provenance import (
     write_seed_provenance,
 )
 from ..versioning.reference_data import ReferenceDataVersioning
+from ..versioning.trained_models import TrainedModelVersioning
 from ..versioning.versioned_directory import VersionedDirectory
+from ..layout import QM_REFERENCE_DATA_DIRNAME, TRAINED_MODELS_DIRNAME
 from .phase_executor import (
     BackendSubmissionError,
     FailureAction,
@@ -86,18 +88,18 @@ class DryRunPhaseExecutor:
     campaign_dir: Path
     config: CampaignConfig
     rng_seed: int = 0
-    reference_data_dir_name: str = "QM_REFERENCE_DATA"
-    models_dir_name: str = "6_TRAINED_MODELS"
+    reference_data_dir_name: str = QM_REFERENCE_DATA_DIRNAME
+    models_dir_name: str = TRAINED_MODELS_DIRNAME
     diversity_dir_name: str = "3_DIVERSITY_SAMPLING"
     al_dir_name: str = "7_ACTIVE_LEARNING"
     scripts_dir: Path = field(init=False)
     artefact_log: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        from ..layout import reject_legacy_training_layout
+        from ..layout import reject_legacy_campaign_layout
 
         self.campaign_dir = Path(self.campaign_dir)
-        reject_legacy_training_layout(self.campaign_dir)
+        reject_legacy_campaign_layout(self.campaign_dir)
         self.scripts_dir = self.campaign_dir / ".DATA" / "SCRIPTS"
         self.scripts_dir.mkdir(parents=True, exist_ok=True)
         (self.campaign_dir / self.reference_data_dir_name).mkdir(parents=True, exist_ok=True)
@@ -156,8 +158,370 @@ class DryRunPhaseExecutor:
                 self.campaign_dir / self.reference_data_dir_name
             )
         if kind == "models":
-            return VersionedDirectory(self.campaign_dir / self.models_dir_name)
+            return TrainedModelVersioning(self.campaign_dir / self.models_dir_name)
         raise ValueError("unknown versioning kind: " + kind)
+
+    @staticmethod
+    def _write_dry_ferebus_model(
+        path: Path,
+        *,
+        system: str,
+        atom: str,
+        prop: str,
+        alf_1_indexed: Sequence[int],
+        ntrain: int,
+    ) -> None:
+        """Write a small, fully parseable FEREBUS model for dry-run commits."""
+        if int(ntrain) <= 0:
+            raise BackendSubmissionError(
+                "dry-run FEREBUS model requires at least one training row"
+            )
+        nfeatures = 3
+        feature_rows = [
+            [0.1 + row * 0.1 + column * 0.01 for column in range(nfeatures)]
+            for row in range(int(ntrain))
+        ]
+        lines = [
+            "# jitter 1.0e-6",
+            "# likelihood -1.0",
+            "",
+            "[system]",
+            "name " + str(system),
+            "atom " + str(atom),
+            "property " + str(prop),
+            "ALF " + " ".join(str(int(value)) for value in alf_1_indexed),
+            "",
+            "[dimensions]",
+            "number_of_atoms 3",
+            "number_of_features " + str(nfeatures),
+            "number_of_training_points " + str(int(ntrain)),
+            "",
+            "[mean]",
+            "type zero",
+            "",
+            "[kernels]",
+            "number_of_kernels 1",
+            "composition k1",
+            "",
+            "[kernel.k1]",
+            "type rbf",
+            "number_of_dimensions " + str(nfeatures),
+            "active_dimensions 1 2 3",
+            "thetas 1.0 1.0 1.0",
+            "",
+            "[training_data]",
+            "units.x bohr bohr radians",
+            "units.y " + ("Ha" if str(prop) == "iqa" else "unknown"),
+            "",
+            "[training_data.x]",
+        ]
+        lines.extend(" ".join(str(value) for value in row) for row in feature_rows)
+        lines.extend(["", "[training_data.y]"])
+        lines.extend(str(-1.0 - row * 0.01) for row in range(int(ntrain)))
+        lines.extend(["", "[weights]"])
+        lines.extend("0.0" for _ in range(int(ntrain)))
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+
+    @staticmethod
+    def _write_dry_ferebus_csv(
+        path: Path,
+        *,
+        prop: str,
+        nrows: int,
+    ) -> None:
+        lines = ["f1,f2,f3," + str(prop)]
+        for row in range(int(nrows)):
+            lines.append(
+                ",".join(
+                    [
+                        str(0.1 + row * 0.1),
+                        str(0.2 + row * 0.1),
+                        str(0.3 + row * 0.1),
+                        str(-1.0 - row * 0.01),
+                    ]
+                )
+            )
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+
+    def _commit_dry_model_snapshot(self, version: int) -> None:
+        """Commit a dry model snapshot through the live storage contract."""
+        from . import input_staging as _stg
+        from .ferebus_quality import (
+            FEREBUS_QUALITY_MANIFEST,
+            FEREBUS_QUALITY_SCHEMA_VERSION,
+        )
+        from .live_executor import _write_ferebus_task_artefact_layout
+        from .model_contract import validate_ferebus_model_contract
+        from ..versioning.manifest import sha256_file
+        from ..versioning.trained_models import (
+            seal_trained_model_version,
+            trained_models_commit_lock,
+            validate_trained_model_snapshot,
+        )
+
+        target_version = int(version)
+        reference_view = ReferenceDataVersioning(
+            self.campaign_dir / self.reference_data_dir_name
+        ).resolve(target_version, verification="deep")
+        row_ids = {
+            split: [
+                index
+                for index, entry in enumerate(reference_view.entries)
+                if entry.split == split
+            ]
+            for split in ("train", "int_val", "ext_val")
+        }
+        row_counts = {split: len(values) for split, values in row_ids.items()}
+        if row_counts["train"] <= 0:
+            raise BackendSubmissionError(
+                "dry-run FEREBUS snapshot has no training reference points"
+            )
+
+        properties = [str(value) for value in self.config.ferebus.properties]
+        atoms = ["O1", "H2", "H3"]
+        alfs = {
+            "O1": [1, 2, 3],
+            "H2": [2, 1, 3],
+            "H3": [3, 1, 2],
+        }
+        system = str(self.config.campaign.system_name)
+        ferebus_staging = self.campaign_dir / self.models_dir_name / "iteration-staging"
+        if ferebus_staging.exists():
+            _stg._checked_rmtree(
+                ferebus_staging,
+                campaign_dir=self.campaign_dir,
+                allowed_roots=[self.campaign_dir / self.models_dir_name],
+            )
+        ferebus_staging.mkdir(parents=True, exist_ok=False)
+
+        tasks: List[Dict[str, Any]] = []
+        for task_index, (prop, atom) in enumerate(
+            ((prop, atom) for prop in properties for atom in atoms),
+            start=1,
+        ):
+            task_dir = ferebus_staging / prop / atom
+            datasets_dir = task_dir / "datasets"
+            datasets_dir.mkdir(parents=True, exist_ok=False)
+            config_path = task_dir / "ferebus.config"
+            config_path.write_text(
+                "name " + system + "\nproperty " + prop + "\natom " + atom + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            model_path = task_dir / (system + "_" + prop + "_" + atom + ".model")
+            self._write_dry_ferebus_model(
+                model_path,
+                system=system,
+                atom=atom,
+                prop=prop,
+                alf_1_indexed=alfs[atom],
+                ntrain=row_counts["train"],
+            )
+            csv_paths = {
+                "train": datasets_dir / (system + "_" + atom + "_TRAINING_SET.csv"),
+                "int_val": datasets_dir / (
+                    system + "_" + atom + "_INT_VALIDATION_SET.csv"
+                ),
+                "ext_val": datasets_dir / (
+                    system + "_" + atom + "_EXT_VALIDATION_SET.csv"
+                ),
+            }
+            for split, csv_path in csv_paths.items():
+                self._write_dry_ferebus_csv(
+                    csv_path,
+                    prop=prop,
+                    nrows=row_counts[split],
+                )
+            tasks.append(
+                {
+                    "task_index": int(task_index),
+                    "property": prop,
+                    "atom": atom,
+                    "alf_1_indexed": list(alfs[atom]),
+                    "alf_cli": "_".join(str(value) for value in alfs[atom]),
+                    "property_dir": prop,
+                    "output_dir": prop + "/" + atom,
+                    "input_dir": prop + "/" + atom + "/datasets",
+                    "config_path": prop + "/" + atom + "/ferebus.config",
+                    "training_csv": csv_paths["train"].relative_to(
+                        ferebus_staging
+                    ).as_posix(),
+                    "int_validation_csv": csv_paths["int_val"].relative_to(
+                        ferebus_staging
+                    ).as_posix(),
+                    "ext_validation_csv": csv_paths["ext_val"].relative_to(
+                        ferebus_staging
+                    ).as_posix(),
+                    "expected_model_path": model_path.relative_to(
+                        ferebus_staging
+                    ).as_posix(),
+                    "command_args": [
+                        "-c",
+                        prop + "/" + atom + "/ferebus.config",
+                        "-I",
+                        prop + "/" + atom + "/datasets",
+                        "-O",
+                        prop + "/" + atom,
+                        "-P",
+                        prop,
+                        "-A",
+                        atom,
+                        "-ALF",
+                        "_".join(str(value) for value in alfs[atom]),
+                    ],
+                    "row_counts": dict(row_counts),
+                    "row_ids": {key: list(value) for key, value in row_ids.items()},
+                    "datasets": {
+                        split: {
+                            "path": csv_path.relative_to(ferebus_staging).as_posix(),
+                            "size": int(csv_path.stat().st_size),
+                            "sha256": sha256_file(csv_path),
+                            "rows": int(row_counts[split]),
+                        }
+                        for split, csv_path in csv_paths.items()
+                    },
+                    "degenerate_property_stats": False,
+                }
+            )
+
+        task_manifest = {
+            "schema_version": _stg.FEREBUS_TASK_SCHEMA_VERSION,
+            "campaign_uid": str(reference_view.campaign_uid),
+            "system": system,
+            "reference_data_version": target_version,
+            "reference_data_head_manifest_sha256": str(
+                reference_view.head_manifest_sha256
+            ),
+            "reference_data_view_sha256": str(
+                reference_view.cumulative_view_sha256
+            ),
+            "n_reference_points": len(reference_view.entries),
+            "pointdir_row_order": [
+                entry.pointdir_name for entry in reference_view.entries
+            ],
+            "properties": properties,
+            "atoms": atoms,
+            "n_atoms": len(atoms),
+            "n_tasks": len(tasks),
+            "degenerate_property_stats": [],
+            "job_details": "FEREBUS_JOB_DETAILS.txt",
+            "split_ledger": {
+                "path": ".DATA/ACTIVE_LEARNING/ferebus_split_assignments.json",
+                "counts": dict(row_counts),
+                "version_allocation": dict(row_counts),
+                "allocation_policy": "dry_run_reference_binding",
+                "allocation_manifest": "dry-run",
+                "allocation_manifest_sha256": "0" * 64,
+                "forced_splits": {
+                    entry.pointdir_name: entry.split for entry in reference_view.entries
+                },
+            },
+            "tasks": tasks,
+        }
+        atomic_write_json(ferebus_staging / _stg.FEREBUS_TASK_MANIFEST, task_manifest)
+        (ferebus_staging / "ATOMS.txt").write_text(
+            "\n".join(atoms) + "\n", encoding="utf-8", newline="\n"
+        )
+        (ferebus_staging / "PROPERTIES.txt").write_text(
+            "\n".join(properties) + "\n", encoding="utf-8", newline="\n"
+        )
+        quality_records = [
+            {
+                "property": str(task["property"]),
+                "atom": str(task["atom"]),
+                "model_path": str(task["expected_model_path"]),
+                "model_sha256": sha256_file(
+                    _stg.resolve_ferebus_task_path(
+                        ferebus_staging,
+                        task["expected_model_path"],
+                        "expected_model_path",
+                    )
+                ),
+                "row_counts": dict(row_counts),
+                "condition_number": 1.0,
+                "metrics": {
+                    split: {"rmse": 0.0, "mae": 0.0, "r2": 1.0}
+                    for split in ("train", "int_val", "ext_val")
+                },
+                "accepted": True,
+                "reasons": [],
+            }
+            for task in tasks
+        ]
+        quality = {
+            "schema_version": FEREBUS_QUALITY_SCHEMA_VERSION,
+            "campaign_uid": str(reference_view.campaign_uid),
+            "system": system,
+            "reference_data_version": target_version,
+            "reference_data_head_manifest_sha256": str(
+                reference_view.head_manifest_sha256
+            ),
+            "reference_data_view_sha256": str(
+                reference_view.cumulative_view_sha256
+            ),
+            "source_task_manifest_sha256": sha256_file(
+                ferebus_staging / _stg.FEREBUS_TASK_MANIFEST
+            ),
+            "summary": {
+                "n_tasks": len(tasks),
+                "n_accepted": len(tasks),
+                "n_rejected": 0,
+                "mean_ext_rmse": 0.0,
+                "min_ext_r2": 1.0,
+                "max_condition_number": 1.0,
+            },
+            "records": quality_records,
+            "accepted": True,
+            "reasons": [],
+        }
+        atomic_write_json(ferebus_staging / FEREBUS_QUALITY_MANIFEST, quality)
+
+        model_versioning = self._versioning("models")
+        with trained_models_commit_lock(self.campaign_dir):
+            committed = model_versioning.list_committed_versions()
+            if target_version in committed:
+                model_versioning.resolve(target_version, verification="deep")
+                model_versioning.ensure_current(max(committed))
+                return
+            if committed != list(range(target_version)):
+                raise BackendSubmissionError(
+                    "dry-run trained-model versions are not contiguous before "
+                    + str(target_version)
+                )
+            parent = (
+                None
+                if target_version == 0
+                else model_versioning.resolve(target_version - 1, verification="deep")
+            )
+            staged = model_versioning.stage(
+                source_version=None,
+                target_version=target_version,
+            )
+            _write_ferebus_task_artefact_layout(
+                ferebus_staging,
+                staged,
+                _stg.read_ferebus_manifest(ferebus_staging),
+                models_version=target_version,
+                parent_model_set=parent,
+            )
+            staged_set = validate_trained_model_snapshot(
+                self.campaign_dir,
+                staged,
+                target_version,
+                parent=parent,
+                verification="deep",
+            )
+            validate_ferebus_model_contract(
+                staged,
+                committed=True,
+                expected_version=target_version,
+                trained_model_set=staged_set,
+            )
+            model_versioning.commit(target_version)
+            committed_dir = model_versioning.iteration_path(target_version)
+            seal_trained_model_version(committed_dir)
+            model_versioning.resolve(target_version, verification="deep")
+            model_versioning.update_current(target_version)
 
     # --- internal: inline phases ---------------------------------------
 
@@ -980,7 +1344,7 @@ class DryRunPhaseExecutor:
         )
 
     def _post_initial_ferebus(self, state) -> Dict[str, Any]:
-        """Commit the initial training iteration and write a stub model file.
+        """Commit initial reference data and a complete dry model snapshot.
 
         This is the first time the QM reference-data versioning is exercised; the
         committed iteration-0000 holds the initial diverse sample's stub
@@ -996,16 +1360,7 @@ class DryRunPhaseExecutor:
         commit_initial_reference_data(self.campaign_dir)
         v_train.ensure_current(0)
 
-        #commit models iteration 0.
-        if 0 not in v_models.list_committed_versions():
-            staging = v_models.stage(source_version=None, target_version=0)
-            (staging / "model.iqa").write_text(
-                "DRYRUN initial FEREBUS model\n", encoding="utf-8",
-            )
-            v_models.commit(0)
-            v_models.update_current(0)
-        else:
-            v_models.ensure_current(0)
+        self._commit_dry_model_snapshot(0)
         return {"reference_data_version": 0, "models_version": 0}
 
     def _post_ariadne_array(self, state) -> Dict[str, Any]:
@@ -1549,7 +1904,8 @@ class DryRunPhaseExecutor:
             )
         if expected_next in committed:
             repaired_version = int(expected_next)
-            v_models.ensure_current(repaired_version)
+            v_models.resolve(repaired_version, verification="deep")
+            v_models.ensure_current(max(committed))
             self._journal_event(
                 "models_committed",
                 phase="FEREBUS",
@@ -1559,14 +1915,7 @@ class DryRunPhaseExecutor:
             )
             return {"models_version": int(repaired_version)}
         next_version = int(expected_next)
-        staging = v_models.stage(source_version=max(committed) if committed else None,
-                                  target_version=next_version)
-        (staging / "model.iqa").write_text(
-            "DRYRUN FEREBUS model for iteration " + str(state.iteration) + "\n",
-            encoding="utf-8",
-        )
-        v_models.commit(next_version)
-        v_models.update_current(next_version)
+        self._commit_dry_model_snapshot(next_version)
         return {"models_version": int(next_version)}
 
     # --- helpers --------------------------------------------------

@@ -12,7 +12,7 @@ from .state import atomic_write_json
 
 
 FEREBUS_QUALITY_MANIFEST = "FEREBUS_QUALITY.json"
-FEREBUS_QUALITY_SCHEMA_VERSION = 2
+FEREBUS_QUALITY_SCHEMA_VERSION = 3
 
 
 def _threshold(gates: Any, name: str) -> Optional[float]:
@@ -88,6 +88,7 @@ def _condition_number(model: Any) -> float:
 def evaluate_ferebus_quality(staging_dir: Path, gates: Any = None) -> Dict[str, Any]:
     from ichor.core.models import Model
     from . import input_staging as _stg
+    from ..versioning.manifest import sha256_file
 
     staging = Path(staging_dir)
     manifest = _stg.read_ferebus_manifest(staging)
@@ -101,9 +102,14 @@ def evaluate_ferebus_quality(staging_dir: Path, gates: Any = None) -> Dict[str, 
     for task in tasks:
         prop = str(task.get("property"))
         atom = str(task.get("atom"))
-        model_path = Path(str(task.get("expected_model_path")))
+        model_path = _stg.resolve_ferebus_task_path(
+            staging,
+            task.get("expected_model_path"),
+            "expected_model_path",
+        )
         try:
             model = Model(model_path)
+            model_sha256 = sha256_file(model_path)
             cond = _condition_number(model)
             section_metrics: Dict[str, Dict[str, float]] = {}
             row_counts: Dict[str, int] = {}
@@ -112,7 +118,8 @@ def evaluate_ferebus_quality(staging_dir: Path, gates: Any = None) -> Dict[str, 
                 ("int_val", "int_validation_csv"),
                 ("ext_val", "ext_validation_csv"),
             ):
-                X, y = _read_features_and_target(Path(str(task[key])), prop)
+                csv_path = _stg.resolve_ferebus_task_path(staging, task[key], key)
+                X, y = _read_features_and_target(csv_path, prop)
                 pred = np.asarray(model.predict(X), dtype=float).reshape(-1)
                 section_metrics[section] = _metrics(y, pred)
                 row_counts[section] = int(y.shape[0])
@@ -129,7 +136,8 @@ def evaluate_ferebus_quality(staging_dir: Path, gates: Any = None) -> Dict[str, 
                 {
                     "property": prop,
                     "atom": atom,
-                    "model_path": str(model_path.resolve()),
+                    "model_path": _stg.ferebus_relative_path(staging, model_path),
+                    "model_sha256": model_sha256,
                     "row_counts": row_counts,
                     "condition_number": cond,
                     "metrics": section_metrics,
@@ -144,7 +152,7 @@ def evaluate_ferebus_quality(staging_dir: Path, gates: Any = None) -> Dict[str, 
                 {
                     "property": prop,
                     "atom": atom,
-                    "model_path": str(model_path.resolve()),
+                    "model_path": _stg.ferebus_relative_path(staging, model_path),
                     "accepted": False,
                     "reasons": [reason],
                 }
@@ -175,6 +183,7 @@ def evaluate_ferebus_quality(staging_dir: Path, gates: Any = None) -> Dict[str, 
     }
     return {
         "schema_version": FEREBUS_QUALITY_SCHEMA_VERSION,
+        "campaign_uid": str(manifest.get("campaign_uid") or ""),
         "system": str(manifest.get("system")),
         "reference_data_version": int(manifest.get("reference_data_version", -1)),
         "reference_data_head_manifest_sha256": str(
@@ -182,6 +191,9 @@ def evaluate_ferebus_quality(staging_dir: Path, gates: Any = None) -> Dict[str, 
         ),
         "reference_data_view_sha256": str(
             manifest.get("reference_data_view_sha256") or ""
+        ),
+        "source_task_manifest_sha256": sha256_file(
+            _stg.ferebus_manifest_path(staging)
         ),
         "summary": summary,
         "records": records,

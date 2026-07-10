@@ -4,8 +4,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Union
 
-from ..versioning.versioned_directory import VersionedDirectory
 from ..versioning.reference_data import ReferenceDataVersioning
+from ..versioning.trained_models import resolve_trained_model_set
+from ..layout import QM_REFERENCE_DATA_DIRNAME, TRAINED_MODELS_DIRNAME
 from .state import CampaignPhase
 
 
@@ -57,15 +58,11 @@ _COHERENT_TRAINING_MODEL_REQUIRED = {
 }
 
 
-def _versioning(campaign_dir: Union[str, Path], dirname: str) -> VersionedDirectory:
-    return VersionedDirectory(Path(campaign_dir) / dirname)
-
-
 def verify_committed_reference_data_version(
     campaign_dir: Union[str, Path],
     version: int,
     *,
-    reference_data_dir_name: str = "QM_REFERENCE_DATA",
+    reference_data_dir_name: str = QM_REFERENCE_DATA_DIRNAME,
 ) -> None:
     try:
         ReferenceDataVersioning(
@@ -86,16 +83,22 @@ def verify_committed_model_version(
     campaign_dir: Union[str, Path],
     version: int,
     *,
-    models_dir_name: str = "6_TRAINED_MODELS",
+    models_dir_name: str = TRAINED_MODELS_DIRNAME,
 ) -> None:
     try:
-        v_models = _versioning(campaign_dir, models_dir_name)
-        v_models.verify_committed(int(version))
+        model_set = resolve_trained_model_set(
+            campaign_dir,
+            int(version),
+            verification="deep",
+            trained_models_root=Path(campaign_dir) / models_dir_name,
+        )
         from .model_contract import validate_ferebus_model_contract
 
         validate_ferebus_model_contract(
-            v_models.iteration_path(int(version)),
+            model_set.root,
             committed=True,
+            expected_version=int(version),
+            trained_model_set=model_set,
         )
     except Exception as exc:
         raise CommittedArtifactError(
@@ -112,8 +115,8 @@ def verify_state_referenced_artifacts(
     campaign_dir: Union[str, Path],
     state: Any,
     *,
-    reference_data_dir_name: str = "QM_REFERENCE_DATA",
-    models_dir_name: str = "6_TRAINED_MODELS",
+    reference_data_dir_name: str = QM_REFERENCE_DATA_DIRNAME,
+    models_dir_name: str = TRAINED_MODELS_DIRNAME,
     strict_models: bool = True,
 ) -> None:
     phase = CampaignPhase(state.phase)
@@ -151,11 +154,9 @@ def verify_state_referenced_artifacts(
             + str(train_version)
         )
     if train_version >= 0:
-        train_dir = (
-            campaign
-            / reference_data_dir_name
-            / ("iteration-" + str(train_version).zfill(4))
-        )
+        train_dir = ReferenceDataVersioning(
+            campaign / reference_data_dir_name
+        ).iteration_path(train_version)
         if train_dir.is_dir():
             verify_committed_reference_data_version(
                 campaign,
@@ -181,11 +182,11 @@ def verify_state_referenced_artifacts(
             + str(model_version)
         )
     if model_version >= 0:
-        model_dir = (
-            campaign
-            / models_dir_name
-            / ("iteration-" + str(model_version).zfill(4))
-        )
+        from ..versioning.trained_models import TrainedModelVersioning
+
+        model_dir = TrainedModelVersioning(
+            campaign / models_dir_name
+        ).iteration_path(model_version)
         if model_dir.is_dir():
             if strict_models:
                 verify_committed_model_version(
@@ -218,8 +219,8 @@ def artifact_manifest_status(
     campaign_dir: Union[str, Path],
     state: Any,
     *,
-    reference_data_dir_name: str = "QM_REFERENCE_DATA",
-    models_dir_name: str = "6_TRAINED_MODELS",
+    reference_data_dir_name: str = QM_REFERENCE_DATA_DIRNAME,
+    models_dir_name: str = TRAINED_MODELS_DIRNAME,
     strict_models: bool = True,
 ) -> Dict[str, Any]:
     out: Dict[str, Any] = {"reference_data": {}, "models": {}}
@@ -272,8 +273,8 @@ def state_artifact_contract_status(
     campaign_dir: Union[str, Path],
     state: Any,
     *,
-    reference_data_dir_name: str = "QM_REFERENCE_DATA",
-    models_dir_name: str = "6_TRAINED_MODELS",
+    reference_data_dir_name: str = QM_REFERENCE_DATA_DIRNAME,
+    models_dir_name: str = TRAINED_MODELS_DIRNAME,
     strict_models: bool = True,
 ) -> Dict[str, Any]:
     """Return the full state/artefact contract status for operator output.

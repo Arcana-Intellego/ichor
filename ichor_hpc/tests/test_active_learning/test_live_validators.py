@@ -4,6 +4,7 @@ These are the daemon-side defence for the model-corruption cluster: A52 (a parti
 loaded as if complete) and A56 (a truncated .model read into uninitialised np.empty) both live in
 ichor_core/models which we are not allowed to touch, so the validator has to catch them here.
 """
+import hashlib
 from types import SimpleNamespace
 
 from ichor.hpc.active_learning.daemon.live_executor import (
@@ -92,6 +93,7 @@ def _write_loadable_model(
 def _task_root(root, atom="O1", prop="iqa"):
     d = root / prop / atom
     d.mkdir(parents=True, exist_ok=True)
+    (d / "datasets").mkdir(exist_ok=True)
     (d / "ferebus.config").write_text("config\n", encoding="utf-8")
     return d
 
@@ -100,19 +102,72 @@ def _write_manifest(root, atoms):
     tasks = []
     for i, atom in enumerate(atoms, start=1):
         d = root / "iqa" / atom
+        task_dir = "iqa/" + atom
+        input_dir = task_dir + "/datasets"
+        dataset_records = {}
+        for split, suffix, rows in (
+            ("train", "TRAINING_SET", 5),
+            ("int_val", "INT_VALIDATION_SET", 2),
+            ("ext_val", "EXT_VALIDATION_SET", 2),
+        ):
+            path = d / "datasets" / ("WATER_" + atom + "_" + suffix + ".csv")
+            path.write_text(
+                "f1,f2,f3,iqa\n" + "0.1,0.2,0.3,0.0\n" * rows,
+                encoding="utf-8",
+            )
+            dataset_records[split] = {
+                "path": path.relative_to(root).as_posix(),
+                "size": path.stat().st_size,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "rows": rows,
+            }
         tasks.append({
             "task_index": i,
             "property": "iqa",
             "atom": atom,
             "alf_1_indexed": [1, 2, 3],
-            "config_path": str(d / "ferebus.config"),
-            "expected_model_path": str(d / f"WATER_iqa_{atom}.model"),
+            "alf_cli": "1_2_3",
+            "property_dir": "iqa",
+            "output_dir": task_dir,
+            "input_dir": input_dir,
+            "config_path": task_dir + "/ferebus.config",
+            "expected_model_path": task_dir + f"/WATER_iqa_{atom}.model",
+            "training_csv": input_dir + f"/WATER_{atom}_TRAINING_SET.csv",
+            "int_validation_csv": input_dir + f"/WATER_{atom}_INT_VALIDATION_SET.csv",
+            "ext_validation_csv": input_dir + f"/WATER_{atom}_EXT_VALIDATION_SET.csv",
+            "command_args": [
+                "-c", task_dir + "/ferebus.config",
+                "-I", input_dir,
+                "-O", task_dir,
+                "-P", "iqa",
+                "-A", atom,
+                "-ALF", "1_2_3",
+            ],
             "row_counts": {"train": 5, "int_val": 2, "ext_val": 2},
+            "row_ids": {
+                "train": [0, 1, 2, 3, 4],
+                "int_val": [5, 6],
+                "ext_val": [7, 8],
+            },
+            "datasets": dataset_records,
         })
     (root / stg.FEREBUS_TASK_MANIFEST).write_text(
         __import__("json").dumps({
             "schema_version": stg.FEREBUS_TASK_SCHEMA_VERSION,
+            "campaign_uid": "validator-test",
             "system": "WATER",
+            "reference_data_version": 0,
+            "reference_data_head_manifest_sha256": "a" * 64,
+            "reference_data_view_sha256": "b" * 64,
+            "n_reference_points": 9,
+            "pointdir_row_order": [
+                "POINT_" + str(index).zfill(6) + ".pointdir"
+                for index in range(9)
+            ],
+            "properties": ["iqa"],
+            "atoms": list(atoms),
+            "n_atoms": len(atoms),
+            "n_tasks": len(tasks),
             "tasks": tasks,
         }),
         encoding="utf-8",

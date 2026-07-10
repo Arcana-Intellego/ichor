@@ -4,6 +4,7 @@ The daemon stages pyferebus's flat property directories, a pyferebus job-details
 strict daemon manifest. pyferebus itself later moves the CSVs into per-atom datasets folders.
 """
 import csv
+import hashlib
 import json
 import math
 import os
@@ -124,7 +125,7 @@ def _prepare_bootstrap_training(campaign, cfg):
         context="bootstrap",
         iteration=0,
     )
-    return campaign / "QM_REFERENCE_DATA" / "iteration-0000"
+    return campaign / "QM_REFERENCE_DATA" / "iteration-000000"
 
 
 def test_stage_ferebus_inputs_orchestration(tmp_path, monkeypatch):
@@ -159,6 +160,7 @@ def test_stage_ferebus_inputs_orchestration(tmp_path, monkeypatch):
     assert "O1 1 2 3" in jd
     assert "q00-O1 " in jd
     manifest = json.loads((staging / stg.FEREBUS_TASK_MANIFEST).read_text(encoding="utf-8"))
+    assert stg.read_ferebus_manifest(staging) == manifest
     assert manifest["n_tasks"] == 6
     assert manifest["split_ledger"]["counts"] == {"train": 12, "int_val": 3, "ext_val": 5}
     assert manifest["pointdir_row_order"] == [
@@ -171,6 +173,14 @@ def test_stage_ferebus_inputs_orchestration(tmp_path, monkeypatch):
         for task in manifest["tasks"]
     } == {(12, 3, 5)}
     assert {tuple(task["alf_1_indexed"]) for task in manifest["tasks"]} >= {(1, 2, 3)}
+    for task in manifest["tasks"]:
+        assert set(task["datasets"]) == {"train", "int_val", "ext_val"}
+        for split, expected_rows in (("train", 12), ("int_val", 3), ("ext_val", 5)):
+            record = task["datasets"][split]
+            source = staging / task["property"] / Path(record["path"]).name
+            assert record["rows"] == expected_rows
+            assert record["size"] == source.stat().st_size
+            assert record["sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
     assert not list(staging.glob("ferebus_*.toml"))
     # the transient scratch csvs do not survive into the staging dir
     assert not list(staging.glob("*_normalised_for_split.csv"))
@@ -183,7 +193,7 @@ def test_stage_ferebus_inputs_clears_stale_models(tmp_path, monkeypatch):
     cfg = CampaignConfig()
     cfg.system_name = "WATER"
     _prepare_bootstrap_training(campaign, cfg)
-    staging = campaign / "6_TRAINED_MODELS" / "iteration-staging"
+    staging = campaign / "TRAINED_MODELS" / "iteration-staging"
     staging.mkdir(parents=True)
     (staging / "STALE.model").write_text("old model from a previous iteration", encoding="utf-8")
     (staging / "Zz9_train.csv").write_text("f1,iqa\n0.1,-1.0\n", encoding="utf-8")
@@ -205,7 +215,7 @@ def test_stage_ferebus_inputs_rejects_unmanifested_committed_pointdir(tmp_path, 
     cfg = CampaignConfig()
     cfg.system_name = "WATER"
     _prepare_bootstrap_training(campaign, cfg)
-    training_dir = campaign / "QM_REFERENCE_DATA" / "iteration-0000"
+    training_dir = campaign / "QM_REFERENCE_DATA" / "iteration-000000"
     rogue = training_dir / "POINT_9999.pointdir"
     rogue.mkdir(parents=True)
     (rogue / "input.gjf").write_text("%chk=x\n", encoding="utf-8")

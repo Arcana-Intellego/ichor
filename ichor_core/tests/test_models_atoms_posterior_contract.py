@@ -97,3 +97,33 @@ def test_total_energy_posterior_rejects_non_finite_feature_values(tmp_path):
     frame[1].coordinates[0] = float("nan")
     with pytest.raises(ValueError, match="finite"):
         posterior.variance(frame)
+
+
+def test_models_exact_loader_uses_only_manifest_selected_nested_files(tmp_path):
+    selected = tmp_path / "iqa" / "O1" / "WATER_iqa_O1.model"
+    selected.parent.mkdir(parents=True)
+    _write_model(selected, atom="O1", alf=(1, 2, 3))
+    unlisted = tmp_path / "iqa" / "H2" / "WATER_iqa_H2.model"
+    unlisted.parent.mkdir(parents=True)
+    _write_model(unlisted, atom="H2", alf=(2, 1, 3))
+
+    models = Models.from_model_files(
+        tmp_path,
+        ["iqa/O1/WATER_iqa_O1.model"],
+    )
+
+    assert [(model.type, model.atom) for model in models] == [("iqa", "O1")]
+
+
+def test_models_exact_loader_rejects_path_outside_root(tmp_path):
+    outside = tmp_path.parent / (tmp_path.name + "_outside.model")
+    _write_model(outside, atom="O1", alf=(1, 2, 3))
+    with pytest.raises(ValueError, match="escapes the model root"):
+        Models.from_model_files(tmp_path, [outside])
+
+
+def test_models_exact_loader_rejects_duplicate_paths(tmp_path):
+    model = tmp_path / "WATER_iqa_O1.model"
+    _write_model(model, atom="O1", alf=(1, 2, 3))
+    with pytest.raises(ValueError, match="duplicate explicit model path"):
+        Models.from_model_files(tmp_path, [model, model])

@@ -1,7 +1,7 @@
 import re
 from functools import wraps
 from pathlib import Path
-from typing import Dict, List, Union
+from typing import Dict, Iterable, List, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -41,15 +41,62 @@ class Models(Directory, list):
     if the models have been made with per-atom.
     """
 
-    def __init__(self, path):
+    def __init__(
+        self,
+        path,
+        *,
+        model_files: Optional[Iterable[Union[Path, str]]] = None,
+    ):
+        root = Path(path).resolve(strict=False)
+        if model_files is None:
+            self._explicit_model_files = None
+        else:
+            explicit_files = []
+            for model_file in model_files:
+                candidate = Path(model_file)
+                if not candidate.is_absolute():
+                    candidate = root / candidate
+                resolved = candidate.resolve(strict=False)
+                try:
+                    resolved.relative_to(root)
+                except ValueError as exc:
+                    raise ValueError(
+                        "explicit model path escapes the model root: "
+                        + str(model_file)
+                    ) from exc
+                explicit_files.append(candidate)
+            self._explicit_model_files = tuple(explicit_files)
         list.__init__(self)
         Directory.__init__(self, path)
 
     def _parse(self) -> None:
         """Parse a directory and add any `.model` files to the `Models` instance"""
-        for f in self:
+        files = (
+            self.iterdir()
+            if self._explicit_model_files is None
+            else self._explicit_model_files
+        )
+        seen = set()
+        for f in files:
+            resolved = Path(f).resolve(strict=False)
+            if resolved in seen:
+                raise ValueError("duplicate explicit model path: " + str(f))
+            seen.add(resolved)
+            if Path(f).is_symlink():
+                raise ValueError("explicit model path is symlinked: " + str(f))
             if Model.check_path(f):
                 self.append(Model(f))
+            elif self._explicit_model_files is not None:
+                raise ValueError("explicit model path is not a readable .model file: " + str(f))
+
+    @classmethod
+    def from_model_files(
+        cls,
+        root: Union[Path, str],
+        model_files: Iterable[Union[Path, str]],
+    ) -> "Models":
+        """Load exactly the supplied model files in the supplied order."""
+        return cls(root, model_files=model_files)
 
     def dirpattern(self, pattern):
         """A regex pattern used to find directories containing models."""

@@ -71,8 +71,8 @@ def calculate_alf_features(
     min_norm = 1.0e-12
     if not np.isfinite(x_bond_norm) or x_bond_norm <= min_norm:
         raise ValueError(
-            "ALF feature calculation failed: x-axis atom is coincident with "
-            "the central atom."
+            "ALF feature calculation failed: x-axis bond length is non-finite "
+            "or the x-axis atom is coincident with the central atom."
         )
 
     # return array if only 2 atoms, i.e. only 1 feature needed
@@ -90,8 +90,8 @@ def calculate_alf_features(
     xy_bond_norm = np.linalg.norm(xy_plane_vect)
     if not np.isfinite(xy_bond_norm) or xy_bond_norm <= min_norm:
         raise ValueError(
-            "ALF feature calculation failed: xy-plane atom is coincident with "
-            "the central atom."
+            "ALF feature calculation failed: xy-plane bond length is non-finite "
+            "or the xy-plane atom is coincident with the central atom."
         )
 
     angle_ratio = np.dot(x_axis_vect, xy_plane_vect.T) / (x_bond_norm * xy_bond_norm)
@@ -123,8 +123,9 @@ def calculate_alf_features(
             r_vect_norm = np.linalg.norm(r_vect)
             if not np.isfinite(r_vect_norm) or r_vect_norm <= min_norm:
                 raise ValueError(
-                    "ALF feature calculation failed: non-frame atom is coincident "
-                    "with the central atom."
+                    "ALF feature calculation failed: non-frame bond length is "
+                    "non-finite or the non-frame atom is coincident with the "
+                    "central atom."
                 )
             feature_array[i_feat] = r_vect_norm
 

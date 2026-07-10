@@ -103,7 +103,8 @@ from .daemon.status_recommendations import (
     build_status_recommendations,
     recommendation_dicts,
 )
-from .versioning.versioned_directory import VersionedDirectory
+from .versioning.trained_models import TrainedModelVersioning
+from .layout import trained_models_dir
 
 
 __all__ = [
@@ -4582,7 +4583,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             )
         state_model_version = int(report.proposed_state.models_version)
         if state_model_version >= 0:
-            VersionedDirectory(campaign / "6_TRAINED_MODELS").ensure_current(
+            TrainedModelVersioning(trained_models_dir(campaign)).ensure_current(
                 state_model_version
             )
     except Exception as exc:
@@ -4936,9 +4937,9 @@ def _bootstrap_fresh_campaign_state(
     campaign: Path,
     config: CampaignConfig,
 ) -> Dict[str, Any]:
-    from .layout import reject_legacy_training_layout
+    from .layout import reject_legacy_campaign_layout
 
-    reject_legacy_training_layout(campaign)
+    reject_legacy_campaign_layout(campaign)
     paths = _campaign_paths(campaign)
     paths["data"].mkdir(parents=True, exist_ok=True)
     (campaign / ".DATA" / "STAGING").mkdir(parents=True, exist_ok=True)
@@ -5403,6 +5404,21 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     config_summary: Dict[str, Any] = {}
     feasibility_summary: Dict[str, Any] = {}
     try:
+        from .layout import (
+            reject_legacy_campaign_layout,
+            qm_reference_data_dir,
+            trained_models_dir,
+        )
+        from .versioning.reference_data import ReferenceDataVersioning
+        from .versioning.trained_models import TrainedModelVersioning
+
+        reject_legacy_campaign_layout(campaign)
+        reference_versions = ReferenceDataVersioning(qm_reference_data_dir(campaign))
+        model_versions = TrainedModelVersioning(trained_models_dir(campaign))
+        reference_versions.list_committed_versions()
+        reference_versions.current_version()
+        model_versions.list_committed_versions()
+        model_versions.current_version()
         config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
         config_summary = {
             "ok": True,

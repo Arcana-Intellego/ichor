@@ -29,7 +29,10 @@ from ichor.hpc.active_learning.versioning.reference_data import (
     ReferenceDataVersioning,
     reference_data_cache_path,
 )
-from ichor.hpc.active_learning.layout import reject_legacy_training_layout
+from ichor.hpc.active_learning.layout import (
+    reject_legacy_campaign_layout,
+    reject_legacy_training_layout,
+)
 
 
 def _complete_allocation(
@@ -141,8 +144,8 @@ def test_reference_data_versions_store_only_their_delta(tmp_path):
     assert second_created is True
     assert first_names == ["POINT_000000.pointdir", "POINT_000001.pointdir"]
     assert second_names == ["POINT_000002.pointdir", "POINT_000003.pointdir"]
-    assert sorted(path.name for path in (root / "iteration-0000").glob("*.pointdir")) == first_names
-    assert sorted(path.name for path in (root / "iteration-0001").glob("*.pointdir")) == second_names
+    assert sorted(path.name for path in (root / "iteration-000000").glob("*.pointdir")) == first_names
+    assert sorted(path.name for path in (root / "iteration-000001").glob("*.pointdir")) == second_names
     assert [entry.pointdir_name for entry in second.entries] == first_names + second_names
     assert len(first.entries) == 2
     assert len(second.entries) == 4
@@ -155,7 +158,7 @@ def test_reference_data_hash_chain_detects_parent_manifest_tamper(tmp_path):
     manifest = (
         campaign
         / "QM_REFERENCE_DATA"
-        / "iteration-0000"
+        / "iteration-000000"
         / REFERENCE_DATA_VERSION_FILENAME
     )
     os.chmod(manifest, stat.S_IMODE(manifest.stat().st_mode) | stat.S_IWUSR)
@@ -195,7 +198,7 @@ def test_committed_reference_pointdirs_are_read_only(tmp_path):
     pointdir = (
         campaign
         / "QM_REFERENCE_DATA"
-        / "iteration-0001"
+        / "iteration-000001"
         / "POINT_000002.pointdir"
     )
     file_path = pointdir / "input.gjf"
@@ -228,3 +231,20 @@ def test_legacy_training_directory_is_rejected(tmp_path):
 
     with pytest.raises(RuntimeError, match="unsupported legacy reference-data layout"):
         reject_legacy_training_layout(campaign)
+
+
+def test_legacy_trained_models_directory_is_rejected(tmp_path):
+    campaign = tmp_path / "campaign"
+    (campaign / "6_TRAINED_MODELS").mkdir(parents=True)
+
+    with pytest.raises(RuntimeError, match="unsupported legacy trained-model layout"):
+        reject_legacy_campaign_layout(campaign)
+
+
+def test_mixed_legacy_and_canonical_model_roots_are_rejected(tmp_path):
+    campaign = tmp_path / "campaign"
+    (campaign / "6_TRAINED_MODELS").mkdir(parents=True)
+    (campaign / "TRAINED_MODELS").mkdir()
+
+    with pytest.raises(RuntimeError, match="alongside"):
+        reject_legacy_campaign_layout(campaign)

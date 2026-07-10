@@ -1,6 +1,6 @@
 """Per-pointdir provenance ledger.
 
-Every committed `.pointdir` in `QM_REFERENCE_DATA/iteration-NNNN/` carries a
+Every committed `.pointdir` in `QM_REFERENCE_DATA/iteration-NNNNNN/` carries a
 `.provenance.json` sidecar that traces the point back through the
 adversarial-attack pipeline: which MD frame seeded it, which 50 neighbour
 frames built its local subspace, what ARIADNE did to it, whether the

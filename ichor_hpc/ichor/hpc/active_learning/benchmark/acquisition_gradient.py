@@ -13,7 +13,6 @@ from typing import Any, Dict, List, Mapping, Sequence
 import numpy as np
 
 from ichor.core.adversarial.acquisition import SeedLocalAdversarialAcquisition
-from ichor.core.models import Models
 
 from ..acquisition.ase_calculator import AdversarialASECalculator
 from ..acquisition.gradient_diagnostics import (
@@ -92,12 +91,13 @@ def _load_context(campaign_dir: Path, iteration: int, seed_index: int) -> Dict[s
     )
     if int(state.models_version) < 0:
         raise ValueError("state.models_version is negative; no trained model version is committed")
-    models_dir = campaign / "6_TRAINED_MODELS" / (
-        "iteration-" + str(int(state.models_version)).zfill(4)
+    from ..versioning.trained_models import load_trained_models
+
+    _, models = load_trained_models(
+        campaign,
+        int(state.models_version),
+        verification="deep",
     )
-    if not models_dir.is_dir():
-        raise FileNotFoundError("models directory not found: " + str(models_dir))
-    models = Models(models_dir)
     iter_dir = campaign / "7_ACTIVE_LEARNING" / (
         "iteration-" + str(int(iteration)).zfill(4)
     )

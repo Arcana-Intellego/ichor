@@ -1,6 +1,9 @@
 """FEREBUS quality sidecar tests."""
 import json
+import hashlib
 from types import SimpleNamespace
+
+import pytest
 
 from ichor.hpc.active_learning.daemon import input_staging as stg
 from ichor.hpc.active_learning.daemon.ferebus_quality import (
@@ -64,15 +67,25 @@ def _write_dataset(path, targets):
     path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
 
+def _dataset_identity(path, rows, root):
+    return {
+        "path": path.relative_to(root).as_posix(),
+        "size": path.stat().st_size,
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "rows": int(rows),
+    }
+
+
 def _seed_quality_staging(tmp_path, *, ext_targets=(0.0, 0.0)):
     staging = tmp_path / "iteration-staging"
     task_dir = staging / "iqa" / "O1"
-    task_dir.mkdir(parents=True)
+    datasets_dir = task_dir / "datasets"
+    datasets_dir.mkdir(parents=True)
     model = task_dir / "WATER_iqa_O1.model"
     _write_zero_model(model)
-    train_csv = task_dir / "WATER_O1_TRAINING_SET.csv"
-    int_csv = task_dir / "WATER_O1_INT_VALIDATION_SET.csv"
-    ext_csv = task_dir / "WATER_O1_EXT_VALIDATION_SET.csv"
+    train_csv = datasets_dir / "WATER_O1_TRAINING_SET.csv"
+    int_csv = datasets_dir / "WATER_O1_INT_VALIDATION_SET.csv"
+    ext_csv = datasets_dir / "WATER_O1_EXT_VALIDATION_SET.csv"
     _write_dataset(train_csv, (0.0, 0.0, 0.0))
     _write_dataset(int_csv, (0.0, 0.0))
     _write_dataset(ext_csv, ext_targets)
@@ -80,6 +93,7 @@ def _seed_quality_staging(tmp_path, *, ext_targets=(0.0, 0.0)):
     (staging / stg.FEREBUS_TASK_MANIFEST).write_text(
         json.dumps({
             "schema_version": stg.FEREBUS_TASK_SCHEMA_VERSION,
+            "campaign_uid": "quality-test",
             "system": "WATER",
             "reference_data_version": 4,
             "reference_data_head_manifest_sha256": "a" * 64,
@@ -89,17 +103,49 @@ def _seed_quality_staging(tmp_path, *, ext_targets=(0.0, 0.0)):
                 "POINT_" + str(index).zfill(6) + ".pointdir"
                 for index in range(7)
             ],
+            "properties": ["iqa"],
+            "atoms": ["O1"],
+            "n_atoms": 1,
+            "n_tasks": 1,
             "tasks": [{
                 "task_index": 1,
                 "property": "iqa",
                 "atom": "O1",
                 "alf_1_indexed": [1, 2, 3],
-                "config_path": str(task_dir / "ferebus.config"),
-                "expected_model_path": str(model),
-                "training_csv": str(train_csv),
-                "int_validation_csv": str(int_csv),
-                "ext_validation_csv": str(ext_csv),
+                "alf_cli": "1_2_3",
+                "property_dir": "iqa",
+                "output_dir": "iqa/O1",
+                "input_dir": "iqa/O1/datasets",
+                "config_path": "iqa/O1/ferebus.config",
+                "expected_model_path": "iqa/O1/WATER_iqa_O1.model",
+                "training_csv": "iqa/O1/datasets/WATER_O1_TRAINING_SET.csv",
+                "int_validation_csv": "iqa/O1/datasets/WATER_O1_INT_VALIDATION_SET.csv",
+                "ext_validation_csv": "iqa/O1/datasets/WATER_O1_EXT_VALIDATION_SET.csv",
+                "command_args": [
+                    "-c", "iqa/O1/ferebus.config",
+                    "-I", "iqa/O1/datasets",
+                    "-O", "iqa/O1",
+                    "-P", "iqa",
+                    "-A", "O1",
+                    "-ALF", "1_2_3",
+                ],
                 "row_counts": {"train": 3, "int_val": 2, "ext_val": 2},
+                "row_ids": {
+                    "train": [0, 1, 2],
+                    "int_val": [3, 4],
+                    "ext_val": [5, 6],
+                },
+                "datasets": {
+                    "train": _dataset_identity(
+                        train_csv, 3, staging
+                    ),
+                    "int_val": _dataset_identity(
+                        int_csv, 2, staging
+                    ),
+                    "ext_val": _dataset_identity(
+                        ext_csv, 2, staging
+                    ),
+                },
             }],
         }),
         encoding="utf-8",
@@ -132,6 +178,18 @@ def test_ferebus_quality_optional_thresholds_are_enforced(tmp_path):
 
     assert payload["accepted"] is False
     assert "ferebus_ext_rmse_threshold_exceeded" in payload["reasons"]
+
+
+def test_ferebus_manifest_rejects_dataset_hash_drift(tmp_path):
+    staging = _seed_quality_staging(tmp_path)
+    dataset = staging / "iqa" / "O1" / "datasets" / "WATER_O1_TRAINING_SET.csv"
+    dataset.write_text(
+        dataset.read_text(encoding="utf-8") + "0.9,0.9,0.9,0.9\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="dataset (size|SHA-256) mismatch"):
+        stg.read_ferebus_manifest(staging)
 
 
 def test_write_ferebus_quality_manifest(tmp_path):

@@ -55,6 +55,8 @@ Dockerfile
 3_DIVERSITY_SAMPLING/
 5_TRAINING/
 QM_REFERENCE_DATA/
+TRAINED_MODELS/
+# Obsolete runtime root; kept ignored so an old campaign cannot be committed.
 6_TRAINED_MODELS/
 7_ACTIVE_LEARNING/
 .provenance.json

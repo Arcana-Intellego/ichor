@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from .cluster_profile import active_machine, profile_value
 from .phase_executor import BackendSubmissionError
+from ..layout import trained_models_dir
 
 
 @dataclass(frozen=True)
@@ -448,9 +449,17 @@ def _staged_natoms(campaign_dir: Optional[Path], phase_name: str, iteration: int
 def _model_dir_size_gb(campaign_dir: Optional[Path]) -> float:
     if campaign_dir is None:
         return 0.0
-    models = Path(campaign_dir) / "6_TRAINED_MODELS"
-    current = models / "current"
-    root = current if current.exists() else models
+    from ..versioning.trained_models import TrainedModelVersioning
+
+    models = trained_models_dir(campaign_dir)
+    versioning = TrainedModelVersioning(models)
+    version = versioning.current_version()
+    if version is None:
+        committed = versioning.list_committed_versions()
+        version = max(committed) if committed else None
+    if version is None:
+        return 0.0
+    root = versioning.iteration_path(version)
     total = 0
     if root.exists():
         for path in root.rglob("*"):
@@ -490,8 +499,7 @@ def _ferebus_rows_features(campaign_dir: Optional[Path], phase_name: str, iterat
         manifest = None
     else:
         manifest = (
-            Path(campaign_dir)
-            / "6_TRAINED_MODELS"
+            trained_models_dir(campaign_dir)
             / "iteration-staging"
             / "FEREBUS_TASKS.json"
         )

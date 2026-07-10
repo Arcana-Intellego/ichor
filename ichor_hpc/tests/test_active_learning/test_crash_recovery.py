@@ -94,7 +94,7 @@ def test_strict_daemon_halts_on_unmanifested_committed_training_pointdir(tmp_pat
         executor=_StrictExplodingExecutor(),
     )
     d.state_path().parent.mkdir(parents=True, exist_ok=True)
-    training = tmp_path / "QM_REFERENCE_DATA" / "iteration-0000"
+    training = tmp_path / "QM_REFERENCE_DATA" / "iteration-000000"
     rogue = training / "POINT_9999.pointdir"
     rogue.mkdir(parents=True)
     (rogue / "input.gjf").write_text("%chk=x\n", encoding="utf-8")
@@ -117,10 +117,10 @@ def test_strict_daemon_halts_on_invalid_committed_model_version(tmp_path):
         executor=_StrictExplodingExecutor(),
     )
     d.state_path().parent.mkdir(parents=True, exist_ok=True)
-    training = tmp_path / "QM_REFERENCE_DATA" / "iteration-0000"
+    training = tmp_path / "QM_REFERENCE_DATA" / "iteration-000000"
     training.mkdir(parents=True)
     write_manifest(training, {})
-    models = tmp_path / "6_TRAINED_MODELS" / "iteration-0000"
+    models = tmp_path / "TRAINED_MODELS" / "iteration-000000"
     models.mkdir(parents=True)
     write_manifest(models, {})
     state = fresh_campaign_state()
@@ -472,7 +472,7 @@ def test_current_version_none_for_dangling_pointer(tmp_path):
     from ichor.hpc.active_learning.versioning.versioned_directory import VersionedDirectory
     v = VersionedDirectory(tmp_path)
     # pointer (windows-fallback form) names a version whose directory does not exist
-    (tmp_path / ".current.pointer").write_text("iteration-0007\n", encoding="utf-8")
+    (tmp_path / ".current.pointer").write_text("iteration-000007\n", encoding="utf-8")
     assert v.current_version() is None
 
 

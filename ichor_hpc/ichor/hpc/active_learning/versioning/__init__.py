@@ -8,6 +8,14 @@ from .reference_data import (
     resolve_reference_data_view,
 )
 from .versioned_directory import VersionedDirectory
+from .trained_models import (
+    TrainedModelError,
+    TrainedModelSet,
+    TrainedModelTask,
+    TrainedModelVersioning,
+    load_trained_models,
+    resolve_trained_model_set,
+)
 
 __all__ = [
     "ReferenceDataEntry",
@@ -16,4 +24,10 @@ __all__ = [
     "ReferenceDataView",
     "VersionedDirectory",
     "resolve_reference_data_view",
+    "TrainedModelError",
+    "TrainedModelSet",
+    "TrainedModelTask",
+    "TrainedModelVersioning",
+    "load_trained_models",
+    "resolve_trained_model_set",
 ]

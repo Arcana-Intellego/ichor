@@ -210,6 +210,7 @@ def _write_loadable_ferebus_model(path, *, atom, alf, ntrain=5, nfeats=3):
 def _seed_pyferebus_manifest_staging(campaign_dir, reference_data_version=0):
     """Seed the pyferebus-owned staging layout expected by live validators."""
     import json
+    import hashlib
     import shutil
     from pathlib import Path
 
@@ -231,7 +232,7 @@ def _seed_pyferebus_manifest_staging(campaign_dir, reference_data_version=0):
     }
     row_counts = {split: len(values) for split, values in row_ids.items()}
 
-    target = Path(campaign_dir) / "6_TRAINED_MODELS" / "iteration-staging"
+    target = Path(campaign_dir) / "TRAINED_MODELS" / "iteration-staging"
     if target.exists():
         shutil.rmtree(target)
     specs = {
@@ -242,7 +243,8 @@ def _seed_pyferebus_manifest_staging(campaign_dir, reference_data_version=0):
     tasks = []
     for idx, (atom, alf) in enumerate(specs.items(), start=1):
         model_dir = target / "iqa" / atom
-        model_dir.mkdir(parents=True, exist_ok=True)
+        datasets_dir = model_dir / "datasets"
+        datasets_dir.mkdir(parents=True, exist_ok=True)
         config_path = model_dir / "ferebus.config"
         config_path.write_text("name WATER\nproperties [\"iqa\"]\n", encoding="utf-8")
         model_path = model_dir / ("WATER_iqa_" + atom + ".model")
@@ -252,9 +254,9 @@ def _seed_pyferebus_manifest_staging(campaign_dir, reference_data_version=0):
             alf=alf,
             ntrain=row_counts["train"],
         )
-        train_csv = model_dir / ("WATER_" + atom + "_TRAINING_SET.csv")
-        int_csv = model_dir / ("WATER_" + atom + "_INT_VALIDATION_SET.csv")
-        ext_csv = model_dir / ("WATER_" + atom + "_EXT_VALIDATION_SET.csv")
+        train_csv = datasets_dir / ("WATER_" + atom + "_TRAINING_SET.csv")
+        int_csv = datasets_dir / ("WATER_" + atom + "_INT_VALIDATION_SET.csv")
+        ext_csv = datasets_dir / ("WATER_" + atom + "_EXT_VALIDATION_SET.csv")
         _write_ferebus_metric_csv(train_csv, row_counts["train"])
         _write_ferebus_metric_csv(int_csv, row_counts["int_val"])
         _write_ferebus_metric_csv(ext_csv, row_counts["ext_val"])
@@ -263,17 +265,43 @@ def _seed_pyferebus_manifest_staging(campaign_dir, reference_data_version=0):
             "property": "iqa",
             "atom": atom,
             "alf_1_indexed": list(alf),
-            "config_path": str(config_path),
-            "expected_model_path": str(model_path),
-            "training_csv": str(train_csv),
-            "int_validation_csv": str(int_csv),
-            "ext_validation_csv": str(ext_csv),
+            "alf_cli": "_".join(str(value) for value in alf),
+            "property_dir": "iqa",
+            "output_dir": "iqa/" + atom,
+            "input_dir": "iqa/" + atom + "/datasets",
+            "config_path": "iqa/" + atom + "/ferebus.config",
+            "expected_model_path": "iqa/" + atom + "/WATER_iqa_" + atom + ".model",
+            "training_csv": "iqa/" + atom + "/datasets/WATER_" + atom + "_TRAINING_SET.csv",
+            "int_validation_csv": "iqa/" + atom + "/datasets/WATER_" + atom + "_INT_VALIDATION_SET.csv",
+            "ext_validation_csv": "iqa/" + atom + "/datasets/WATER_" + atom + "_EXT_VALIDATION_SET.csv",
+            "command_args": [
+                "-c", "iqa/" + atom + "/ferebus.config",
+                "-I", "iqa/" + atom + "/datasets",
+                "-O", "iqa/" + atom,
+                "-P", "iqa",
+                "-A", atom,
+                "-ALF", "_".join(str(value) for value in alf),
+            ],
             "row_counts": dict(row_counts),
             "row_ids": dict(row_ids),
+            "datasets": {
+                split: {
+                    "path": path.relative_to(target).as_posix(),
+                    "size": path.stat().st_size,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "rows": row_counts[split],
+                }
+                for split, path in (
+                    ("train", train_csv),
+                    ("int_val", int_csv),
+                    ("ext_val", ext_csv),
+                )
+            },
         })
     (target / stg.FEREBUS_TASK_MANIFEST).write_text(
         json.dumps({
             "schema_version": stg.FEREBUS_TASK_SCHEMA_VERSION,
+            "campaign_uid": reference_view.campaign_uid,
             "system": "WATER",
             "reference_data_version": int(reference_data_version),
             "reference_data_head_manifest_sha256": (
@@ -288,6 +316,7 @@ def _seed_pyferebus_manifest_staging(campaign_dir, reference_data_version=0):
             ],
             "properties": ["iqa"],
             "atoms": list(specs),
+            "n_atoms": len(specs),
             "n_tasks": len(tasks),
             "tasks": tasks,
         }),
@@ -835,6 +864,24 @@ def test_live_one_iter_water_tetramer_after_parsers_land(tmp_path, monkeypatch):
         "models_version=" + str(state.models_version)
         + "; expected at least 1 (INITIAL_FEREBUS + FEREBUS)"
     )
+    from ichor.hpc.active_learning.versioning.trained_models import (
+        TrainedModelVersioning,
+    )
+
+    model_versions = TrainedModelVersioning(campaign / "TRAINED_MODELS")
+    assert model_versions.list_committed_versions() == [0, 1]
+    initial_models = model_versions.resolve(0, verification="deep")
+    current_models = model_versions.resolve(1, verification="deep")
+    assert current_models.parent_version == 0
+    assert current_models.parent_manifest_sha256 == initial_models.head_manifest_sha256
+    assert current_models.reference_data_version == state.reference_data_version
+    assert current_models.reference_data_view_sha256
+    assert model_versions.current_version() == 1
+    for model_set in (initial_models, current_models):
+        assert not (model_set.root / "task_artefacts").exists()
+        assert not list(model_set.root.glob("*.model"))
+        assert not list(model_set.root.glob("*.config"))
+        assert all(task.model.path.parent == task.config.path.parent for task in model_set.tasks)
 
     phases_called = {p for p, _ in call_log}
     mandatory_submissions = {

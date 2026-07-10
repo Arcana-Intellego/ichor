@@ -215,15 +215,15 @@ FILE_STRUCTURE.add(
 # 4_PROPERTY_CALC is defined as part of pointsdir creation
 FILE_STRUCTURE.add(
     "QM_REFERENCE_DATA",
-    "training",
+    "reference_data",
     type_=FileType.Directory,
-    description="""A directory containing test, train and validation sets for ML.""",
+    description="""Directory containing immutable QM reference data.""",
 )
 FILE_STRUCTURE.add(
-    "6_TRAINED_MODELS",
-    "training_models",
+    "TRAINED_MODELS",
+    "trained_models",
     type_=FileType.Directory,
-    description="""Directory containing training models.""",
+    description="""Directory containing immutable trained-model snapshots.""",
 )
 
 FILE_STRUCTURE.add("GJF", "dlpoly_gjf", parent="dlpoly", type_=FileType.Directory)

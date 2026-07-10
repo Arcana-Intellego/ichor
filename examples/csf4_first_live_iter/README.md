@@ -468,7 +468,7 @@ For a clean re-run (wipes all on-disk state, keeps the trajectory pool):
 
 ```
 rm -rf .DATA/ACTIVE_LEARNING
-rm -rf 3_DIVERSITY_SAMPLING QM_REFERENCE_DATA 6_TRAINED_MODELS 7_ACTIVE_LEARNING
+rm -rf 3_DIVERSITY_SAMPLING QM_REFERENCE_DATA TRAINED_MODELS 7_ACTIVE_LEARNING
 # the trajectory pool at .DATA/TRAJECTORY/ is preserved
 ichor-al-daemon start --live --campaign-dir . --max-ticks 2000
 ```

@@ -94,13 +94,13 @@ def test_dry_run_commits_three_reference_data_versions(tmp_path):
 def test_dry_run_commits_three_models_versions(tmp_path):
     """Initial models (iter 0) + FEREBUS post at iter 0 + FEREBUS at iter 1."""
     campaign, _, _, _ = _run_two_iter_campaign(tmp_path)
-    v = VersionedDirectory(campaign / "6_TRAINED_MODELS")
+    v = VersionedDirectory(campaign / "TRAINED_MODELS")
     assert sorted(v.list_committed_versions()) == [0, 1, 2]
 
 
 def test_dry_run_every_committed_iteration_has_manifest(tmp_path):
     campaign, _, _, _ = _run_two_iter_campaign(tmp_path)
-    for root in (campaign / "QM_REFERENCE_DATA", campaign / "6_TRAINED_MODELS"):
+    for root in (campaign / "QM_REFERENCE_DATA", campaign / "TRAINED_MODELS"):
         v = VersionedDirectory(root)
         for ver in v.list_committed_versions():
             iter_dir = v.iteration_path(ver)

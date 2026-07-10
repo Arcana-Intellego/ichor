@@ -18,7 +18,13 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 from ..campaign_migrations import migrate_campaign_payload
 from ..config import CampaignConfig
-from ..versioning.versioned_directory import VersionedDirectory
+from ..versioning.reference_data import ReferenceDataVersioning
+from ..versioning.trained_models import (
+    TrainedModelVersioning,
+    resolve_trained_model_set,
+    trained_models_commit_lock,
+)
+from ..layout import trained_models_dir
 from .artifact_contracts import (
     verify_committed_model_version,
     verify_committed_reference_data_version,
@@ -370,22 +376,22 @@ _POLICIES_PREFIX: Tuple[Tuple[str, ConfigFieldPolicy], ...] = (
 
 
 def _committed_model_exists(campaign_dir: Union[str, Path], version: int) -> bool:
-    models = Path(campaign_dir) / "6_TRAINED_MODELS"
+    models = trained_models_dir(campaign_dir)
     if not models.is_dir():
         return False
     try:
-        committed = VersionedDirectory(models).list_committed_versions()
+        committed = TrainedModelVersioning(models).list_committed_versions()
     except Exception:
         return False
     return int(version) in {int(v) for v in committed}
 
 
 def _any_committed_model_exists(campaign_dir: Union[str, Path]) -> bool:
-    models = Path(campaign_dir) / "6_TRAINED_MODELS"
+    models = trained_models_dir(campaign_dir)
     if not models.is_dir():
         return False
     try:
-        return bool(VersionedDirectory(models).list_committed_versions())
+        return bool(TrainedModelVersioning(models).list_committed_versions())
     except Exception:
         return False
 
@@ -570,10 +576,10 @@ def _ferebus_first_consumed(campaign_dir: Union[str, Path]) -> Optional[str]:
         (
             ".DATA/ACTIVE_LEARNING/ferebus_split_assignments.json",
             ".DATA/ACTIVE_LEARNING/bootstrap_external_validation.json",
-            "6_TRAINED_MODELS/iteration-staging/FEREBUS_TASKS.json",
-            "6_TRAINED_MODELS/iteration-staging/**/*.model",
-            "6_TRAINED_MODELS/iteration-*/**/*.model",
-            "6_TRAINED_MODELS/current",
+            "TRAINED_MODELS/iteration-staging/FEREBUS_TASKS.json",
+            "TRAINED_MODELS/iteration-staging/**/*.model",
+            "TRAINED_MODELS/iteration-*/**/*.model",
+            "TRAINED_MODELS/current",
         ),
     )
     if path:
@@ -831,7 +837,7 @@ def _current_ferebus_consumed_reason(
     intent = _phase_intent_file_exists(campaign_dir, (phase,), iteration=iteration)
     if intent:
         return "target FEREBUS submission intent exists: " + intent
-    staging = Path(campaign_dir) / "6_TRAINED_MODELS" / "iteration-staging"
+    staging = trained_models_dir(campaign_dir) / "iteration-staging"
     if staging.exists():
         return "target FEREBUS staging exists: " + str(staging)
     target = int(getattr(proposed_state, "reference_data_version", -1))
@@ -1119,7 +1125,7 @@ def clean_reentry_staging(campaign_dir: Union[str, Path], phase: CampaignPhase) 
     campaign = Path(campaign_dir)
     removed: List[str] = []
     if phase in (CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS):
-        target = campaign / "6_TRAINED_MODELS" / "iteration-staging"
+        target = trained_models_dir(campaign) / "iteration-staging"
         if target.exists():
             _ensure_inside_campaign(campaign, target)
             shutil.rmtree(target)
@@ -1174,15 +1180,23 @@ def _timestamped_reconcile_sibling(path: Path) -> Path:
     return target
 
 
-def _model_basenames(root: Path, *, recursive: bool) -> set[str]:
-    basenames: set[str] = set()
-    iterator = Path(root).rglob("*.model") if recursive else Path(root).glob("*.model")
-    for child in iterator:
-        if child.is_symlink():
-            raise ValueError("refusing symlinked model file during reconcile: " + str(child))
-        if child.is_file():
-            basenames.add(child.name)
-    return basenames
+def _staged_model_hashes_by_task(root: Path) -> Dict[Tuple[str, str], str]:
+    from . import input_staging as _stg
+    from ..versioning.manifest import sha256_file
+
+    manifest = _stg.read_ferebus_manifest(root)
+    hashes: Dict[Tuple[str, str], str] = {}
+    for task in manifest.get("tasks", []):
+        key = (str(task["property"]), str(task["atom"]))
+        model = _stg.resolve_ferebus_task_path(
+            root,
+            task["expected_model_path"],
+            "expected_model_path",
+        )
+        if not model.is_file() or model.is_symlink():
+            raise ValueError("staged FEREBUS model is missing: " + str(model))
+        hashes[key] = sha256_file(model)
+    return hashes
 
 
 def _archive_completed_model_iteration_staging(
@@ -1199,12 +1213,19 @@ def _archive_completed_model_iteration_staging(
             "completed FEREBUS iteration-staging exists but no committed model "
             "version is recorded"
         )
-    committed = campaign / "6_TRAINED_MODELS" / ("iteration-" + f"{model_version:04d}")
+    committed_set = resolve_trained_model_set(
+        campaign,
+        model_version,
+        verification="deep",
+    )
+    committed = committed_set.root
     verify_committed_model_version(campaign, model_version)
-    staged_models = _model_basenames(target, recursive=True)
-    committed_models = _model_basenames(committed, recursive=False)
+    staged_models = _staged_model_hashes_by_task(target)
+    committed_models = {
+        task.key: task.model.sha256 for task in committed_set.tasks
+    }
     if not staged_models:
-        raise ValueError("completed FEREBUS iteration-staging has no flat .model files")
+        raise ValueError("completed FEREBUS iteration-staging has no model files")
     if staged_models != committed_models:
         raise ValueError(
             "completed FEREBUS iteration-staging does not match committed model "
@@ -1226,9 +1247,29 @@ def clean_model_iteration_staging_for_reconcile(
     proposed_state: CampaignState,
 ) -> List[str]:
     campaign = Path(campaign_dir)
-    target = campaign / "6_TRAINED_MODELS" / "iteration-staging"
+    with trained_models_commit_lock(campaign):
+        return _clean_model_iteration_staging_locked(campaign, proposed_state)
+
+
+def _clean_model_iteration_staging_locked(
+    campaign: Path,
+    proposed_state: CampaignState,
+) -> List[str]:
+    model_versioning = TrainedModelVersioning(trained_models_dir(campaign))
+    archived_paths: List[str] = []
+    for dangling in model_versioning.list_dangling_staging():
+        if dangling.is_symlink() or not dangling.is_dir():
+            raise ValueError(
+                "refusing invalid trained-model version staging: " + str(dangling)
+            )
+        _ensure_inside_campaign(campaign, dangling)
+        archive = _timestamped_reconcile_sibling(dangling)
+        dangling.rename(archive)
+        archived_paths.append(str(archive))
+
+    target = model_versioning.parent / "iteration-staging"
     if not target.exists():
-        return []
+        return archived_paths
     if target.is_symlink():
         raise ValueError("refusing to remove symlinked model iteration-staging")
     if not target.is_dir():
@@ -1246,7 +1287,7 @@ def clean_model_iteration_staging_for_reconcile(
             target,
             proposed_state,
         )
-        return [str(archived)]
+        return archived_paths + [str(archived)]
     if proposed_state.phase not in (CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS):
         try:
             model_version = int(proposed_state.models_version)
@@ -1256,7 +1297,7 @@ def clean_model_iteration_staging_for_reconcile(
             raise ValueError("models_version is negative; cannot verify committed model")
         verify_committed_model_version(campaign, model_version)
     shutil.rmtree(target)
-    return [str(target)]
+    return archived_paths + [str(target)]
 
 
 def ferebus_reentry_can_archive_data_staging(
@@ -1407,7 +1448,7 @@ def reference_data_staging_can_archive_for_reconcile(
     training = campaign / "QM_REFERENCE_DATA"
     if not training.is_dir():
         return False, "QM_REFERENCE_DATA is missing"
-    tv = VersionedDirectory(training)
+    tv = ReferenceDataVersioning(training)
     dangling = tv.list_dangling_staging()
     if not dangling:
         return True, "no dangling reference-data staging exists"
@@ -1455,7 +1496,7 @@ def archive_reference_data_staging_for_reconcile(
         raise ValueError(reason)
     campaign = Path(campaign_dir)
     training = campaign / "QM_REFERENCE_DATA"
-    tv = VersionedDirectory(training)
+    tv = ReferenceDataVersioning(training)
     archived: List[str] = []
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     for staging in tv.list_dangling_staging():

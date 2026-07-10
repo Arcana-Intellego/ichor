@@ -44,6 +44,10 @@ from ichor.hpc.active_learning.versioning.versioned_directory import VersionedDi
 from ichor.hpc.active_learning.versioning.reference_data import (
     ReferenceDataVersioning,
 )
+from ichor.hpc.active_learning.versioning.manifest import ManifestMismatchError
+from ichor.hpc.active_learning.versioning.trained_models import (
+    TrainedModelVersioning,
+)
 
 
 FIXTURES = (
@@ -640,80 +644,142 @@ def test_handlers_dict_dispatches_all_day3_phases(tmp_path):
 # --- FEREBUS parser tests ----------------------------------------
 
 
-def _seed_models_staging(campaign_dir):
-    """Create a manifest-backed pyferebus staging tree with one expected model."""
+def _seed_models_staging(campaign_dir, properties=("iqa",)):
+    """Create manifest-backed pyferebus staging with parseable models."""
+    import hashlib
+
+    from ichor.hpc.active_learning.versioning.manifest import sha256_file
+
     reference_view = ReferenceDataVersioning(
         campaign_dir / "QM_REFERENCE_DATA"
     ).resolve(0, verification="deep")
-    target = campaign_dir / "6_TRAINED_MODELS" / "iteration-staging"
+    target = campaign_dir / "TRAINED_MODELS" / "iteration-staging"
     target.mkdir(parents=True, exist_ok=True)
-    model_dir = target / "iqa" / "O1"
-    model_dir.mkdir(parents=True, exist_ok=True)
-    (model_dir / "ferebus.config").write_text("name WATER\nproperties [\"iqa\"]\n", encoding="utf-8")
-    model = model_dir / "WATER_iqa_O1.model"
-    _write_loadable_model(model, atom="O1")
-    train_csv = model_dir / "WATER_O1_TRAINING_SET.csv"
-    int_csv = model_dir / "WATER_O1_INT_VALIDATION_SET.csv"
-    ext_csv = model_dir / "WATER_O1_EXT_VALIDATION_SET.csv"
-    _write_metric_csv(train_csv, 5)
-    _write_metric_csv(int_csv, 2)
-    _write_metric_csv(ext_csv, 2)
-    for suffix in ("opt", "perf", "pred", "scurve", "sol"):
-        (model_dir / ("WATER_iqa_O1." + suffix)).write_text(
-            suffix + "\n",
-            encoding="utf-8",
+    row_ids = {
+        split: [
+            index
+            for index, entry in enumerate(reference_view.entries)
+            if entry.split == split
+        ]
+        for split in ("train", "int_val", "ext_val")
+    }
+    row_counts = {split: len(values) for split, values in row_ids.items()}
+    tasks = []
+    for task_index, prop in enumerate(properties, start=1):
+        model_dir = target / prop / "O1"
+        datasets = model_dir / "datasets"
+        datasets.mkdir(parents=True, exist_ok=True)
+        config = model_dir / "ferebus.config"
+        config.write_text(
+            "name WATER\nproperty " + prop + "\n", encoding="utf-8"
         )
+        model = model_dir / ("WATER_" + prop + "_O1.model")
+        _write_loadable_model(
+            model,
+            atom="O1",
+            prop=prop,
+            ntrain=row_counts["train"],
+        )
+        train_csv = datasets / "WATER_O1_TRAINING_SET.csv"
+        int_csv = datasets / "WATER_O1_INT_VALIDATION_SET.csv"
+        ext_csv = datasets / "WATER_O1_EXT_VALIDATION_SET.csv"
+        _write_metric_csv(train_csv, row_counts["train"], prop=prop)
+        _write_metric_csv(int_csv, row_counts["int_val"], prop=prop)
+        _write_metric_csv(ext_csv, row_counts["ext_val"], prop=prop)
+        suffixes = ("opt", "perf", "pred", "scurve", "sol") if prop == "iqa" else ("opt",)
+        for suffix in suffixes:
+            (model_dir / ("WATER_" + prop + "_O1." + suffix)).write_text(
+                suffix + "\n",
+                encoding="utf-8",
+            )
+        task_dir = prop + "/O1"
+        input_dir = task_dir + "/datasets"
+        tasks.append({
+            "task_index": task_index,
+            "property": prop,
+            "atom": "O1",
+            "alf_1_indexed": [1, 2, 3],
+            "alf_cli": "1_2_3",
+            "property_dir": prop,
+            "output_dir": task_dir,
+            "input_dir": input_dir,
+            "config_path": task_dir + "/ferebus.config",
+            "expected_model_path": task_dir + "/WATER_" + prop + "_O1.model",
+            "training_csv": input_dir + "/WATER_O1_TRAINING_SET.csv",
+            "int_validation_csv": input_dir + "/WATER_O1_INT_VALIDATION_SET.csv",
+            "ext_validation_csv": input_dir + "/WATER_O1_EXT_VALIDATION_SET.csv",
+            "command_args": [
+                "-c", task_dir + "/ferebus.config",
+                "-I", input_dir,
+                "-O", task_dir,
+                "-P", prop,
+                "-A", "O1",
+                "-ALF", "1_2_3",
+            ],
+            "row_counts": dict(row_counts),
+            "row_ids": {key: list(value) for key, value in row_ids.items()},
+            "datasets": {
+                split: {
+                    "path": path.relative_to(target).as_posix(),
+                    "size": path.stat().st_size,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "rows": row_counts[split],
+                }
+                for split, path in (
+                    ("train", train_csv),
+                    ("int_val", int_csv),
+                    ("ext_val", ext_csv),
+                )
+            },
+            "degenerate_property_stats": False,
+        })
+    task_payload = {
+        "schema_version": stg.FEREBUS_TASK_SCHEMA_VERSION,
+        "campaign_uid": reference_view.campaign_uid,
+        "system": "WATER",
+        "reference_data_version": 0,
+        "reference_data_head_manifest_sha256": reference_view.head_manifest_sha256,
+        "reference_data_view_sha256": reference_view.cumulative_view_sha256,
+        "n_reference_points": len(reference_view.entries),
+        "pointdir_row_order": [entry.pointdir_name for entry in reference_view.entries],
+        "properties": list(properties),
+        "atoms": ["O1"],
+        "n_atoms": 1,
+        "n_tasks": len(tasks),
+        "tasks": tasks,
+    }
+    task_path = target / stg.FEREBUS_TASK_MANIFEST
+    task_path.write_text(json.dumps(task_payload), encoding="utf-8")
+    quality_records = []
+    for task in tasks:
+        model_path = target / task["expected_model_path"]
+        quality_records.append({
+            "property": task["property"],
+            "atom": task["atom"],
+            "model_path": task["expected_model_path"],
+            "model_sha256": sha256_file(model_path),
+            "row_counts": dict(row_counts),
+            "condition_number": 1.0,
+            "metrics": {
+                split: {"rmse": 0.0, "mae": 0.0, "r2": 1.0}
+                for split in ("train", "int_val", "ext_val")
+            },
+            "accepted": True,
+            "reasons": [],
+        })
     (target / "FEREBUS_QUALITY.json").write_text(
         json.dumps({
             "schema_version": FEREBUS_QUALITY_SCHEMA_VERSION,
-            "reference_data_version": 0,
-            "reference_data_head_manifest_sha256": (
-                reference_view.head_manifest_sha256
-            ),
-            "reference_data_view_sha256": (
-                reference_view.cumulative_view_sha256
-            ),
-            "accepted": True,
-            "summary": {},
-            "tasks": [],
-        }),
-        encoding="utf-8",
-    )
-    (target / stg.FEREBUS_TASK_MANIFEST).write_text(
-        json.dumps({
-            "schema_version": stg.FEREBUS_TASK_SCHEMA_VERSION,
+            "campaign_uid": reference_view.campaign_uid,
             "system": "WATER",
             "reference_data_version": 0,
-            "reference_data_head_manifest_sha256": (
-                reference_view.head_manifest_sha256
-            ),
-            "reference_data_view_sha256": (
-                reference_view.cumulative_view_sha256
-            ),
-            "n_reference_points": len(reference_view.entries),
-            "pointdir_row_order": [
-                entry.pointdir_name for entry in reference_view.entries
-            ],
-            "properties": ["iqa"],
-            "atoms": ["O1"],
-            "n_tasks": 1,
-            "tasks": [{
-                "task_index": 1,
-                "property": "iqa",
-                "atom": "O1",
-                "alf_1_indexed": [1, 2, 3],
-                "config_path": str(model_dir / "ferebus.config"),
-                "expected_model_path": str(model),
-                "training_csv": str(train_csv),
-                "int_validation_csv": str(int_csv),
-                "ext_validation_csv": str(ext_csv),
-                "row_counts": {"train": 5, "int_val": 2, "ext_val": 2},
-                "row_ids": {
-                    "train": list(range(5)),
-                    "int_val": [5, 6],
-                    "ext_val": [7, 8],
-                },
-            }],
+            "reference_data_head_manifest_sha256": reference_view.head_manifest_sha256,
+            "reference_data_view_sha256": reference_view.cumulative_view_sha256,
+            "source_task_manifest_sha256": sha256_file(task_path),
+            "accepted": True,
+            "summary": {"n_tasks": len(tasks), "n_accepted": len(tasks), "n_rejected": 0},
+            "records": quality_records,
+            "reasons": [],
         }),
         encoding="utf-8",
     )
@@ -722,9 +788,9 @@ def _seed_models_staging(campaign_dir):
     return target
 
 
-def _write_metric_csv(path, n_rows):
+def _write_metric_csv(path, n_rows, *, prop="iqa"):
     with open(path, "w", encoding="utf-8", newline="\n") as f:
-        f.write("f1,f2,f3,iqa\n")
+        f.write("f1,f2,f3," + prop + "\n")
         for i in range(int(n_rows)):
             f.write(f"{0.1+i*0.1},{0.2+i*0.1},{0.3+i*0.1},0.0\n")
 
@@ -797,88 +863,97 @@ def test_ferebus_parser_happy_path_commits_models_version(tmp_path):
     assert result.failure_reason is None
     # validation_set_version now advances alongside models_version each FEREBUS commit (A12)
     assert result.state_updates == {"models_version": 0, "validation_set_version": 0}
-    # The committed iteration-0000 directory should now hold the .model file.
+    # The committed snapshot keeps each task's files together.
     committed_dir = (
-        tmp_path / "campaign" / "6_TRAINED_MODELS" / "iteration-0000"
+        tmp_path / "campaign" / "TRAINED_MODELS" / "iteration-000000"
     )
     assert committed_dir.is_dir()
-    assert (committed_dir / "WATER_iqa_O1.model").is_file()
+    task_dir = committed_dir / "iqa" / "O1"
+    assert (task_dir / "WATER_iqa_O1.model").is_file()
     assert (committed_dir / stg.FEREBUS_TASK_MANIFEST).is_file()
-    assert (committed_dir / "ferebus_iqa_O1.config").is_file()
-    artefact_dir = committed_dir / "task_artefacts" / "iqa" / "O1"
-    assert artefact_dir.is_dir()
-    assert not (artefact_dir / "WATER_iqa_O1.model").exists()
-    assert not (artefact_dir / "ferebus.config").exists()
-    assert (artefact_dir / "WATER_iqa_O1.opt").read_text(encoding="utf-8") == "opt\n"
+    assert (task_dir / "ferebus_iqa_O1.config").is_file()
+    assert (task_dir / "WATER_iqa_O1.opt").read_text(encoding="utf-8") == "opt\n"
+    assert not (committed_dir / "task_artefacts").exists()
     artefact_manifest = json.loads(
-        (committed_dir / "task_artefacts" / FEREBUS_TASK_ARTEFACTS_MANIFEST)
+        (committed_dir / FEREBUS_TASK_ARTEFACTS_MANIFEST)
         .read_text(encoding="utf-8")
     )
-    assert artefact_manifest["schema_version"] == 1
-    assert artefact_manifest["tasks"] == [{
-        "property": "iqa",
-        "atom": "O1",
-        "directory": "task_artefacts/iqa/O1",
-        "canonical_model": "WATER_iqa_O1.model",
-        "canonical_config": "ferebus_iqa_O1.config",
-        "files": {
-            "opt": "task_artefacts/iqa/O1/WATER_iqa_O1.opt",
-            "perf": "task_artefacts/iqa/O1/WATER_iqa_O1.perf",
-            "pred": "task_artefacts/iqa/O1/WATER_iqa_O1.pred",
-            "scurve": "task_artefacts/iqa/O1/WATER_iqa_O1.scurve",
-            "sol": "task_artefacts/iqa/O1/WATER_iqa_O1.sol",
-        },
-    }]
+    assert artefact_manifest["schema_version"] == 2
+    assert artefact_manifest["storage_mode"] == "full_snapshot"
+    assert artefact_manifest["models_version"] == 0
+    assert artefact_manifest["tasks"][0]["directory"] == "iqa/O1"
+    assert artefact_manifest["tasks"][0]["model"]["path"] == (
+        "iqa/O1/WATER_iqa_O1.model"
+    )
+    assert artefact_manifest["tasks"][0]["config"]["path"] == (
+        "iqa/O1/ferebus_iqa_O1.config"
+    )
+    assert artefact_manifest["tasks"][0]["auxiliary"]["opt"]["path"] == (
+        "iqa/O1/WATER_iqa_O1.opt"
+    )
+    import stat
+
+    assert not (stat.S_IMODE(task_dir.stat().st_mode) & stat.S_IWUSR)
+    assert not (
+        stat.S_IMODE((task_dir / "WATER_iqa_O1.model").stat().st_mode)
+        & stat.S_IWUSR
+    )
     events = _read_journal_events(tmp_path / "campaign")
     assert any(e.get("event") == "models_committed" for e in events)
 
 
 def test_ferebus_task_artefact_layout_supports_properties_and_missing_files(tmp_path):
-    staging = tmp_path / "campaign" / "6_TRAINED_MODELS" / "iteration-staging"
-    committed = tmp_path / "campaign" / "6_TRAINED_MODELS" / "iteration-0000"
-    staging.mkdir(parents=True)
-    committed.mkdir(parents=True)
-    tasks = []
-    for prop, atom in (("iqa", "O1"), ("q00", "O1")):
-        task_dir = staging / prop / atom
-        task_dir.mkdir(parents=True)
-        model = task_dir / ("WATER_" + prop + "_" + atom + ".model")
-        config = task_dir / "ferebus.config"
-        model.write_text("model\n", encoding="utf-8")
-        config.write_text("config\n", encoding="utf-8")
-        (task_dir / ("WATER_" + prop + "_" + atom + ".opt")).write_text(
-            prop + "\n",
-            encoding="utf-8",
-        )
-        tasks.append({
-            "property": prop,
-            "atom": atom,
-            "expected_model_path": str(model),
-            "config_path": str(config),
-        })
-
-    _write_ferebus_task_artefact_layout(
-        staging,
-        committed,
-        {"schema_version": 1, "reference_data_version": 0, "tasks": tasks},
+    ex = _make_executor(tmp_path)
+    _commit_bootstrap_reference_data(ex.campaign_dir)
+    _seed_models_staging(ex.campaign_dir, properties=("iqa", "q00"))
+    result = ex._parse_ferebus_postprocess(
+        SimpleNamespace(iteration=0, campaign_uid="m16-test", reference_data_version=0),
+        CampaignPhase("FEREBUS"),
+        observations=[],
     )
-
-    assert (committed / "task_artefacts" / "iqa" / "O1" / "WATER_iqa_O1.opt").is_file()
-    assert (committed / "task_artefacts" / "q00" / "O1" / "WATER_q00_O1.opt").is_file()
-    assert not (committed / "task_artefacts" / "iqa" / "O1" / "WATER_iqa_O1.model").exists()
-    assert not (committed / "task_artefacts" / "q00" / "O1" / "ferebus.config").exists()
+    assert result.failure_reason is None
+    committed = tmp_path / "campaign" / "TRAINED_MODELS" / "iteration-000000"
+    assert (committed / "iqa" / "O1" / "WATER_iqa_O1.model").is_file()
+    assert (committed / "iqa" / "O1" / "ferebus_iqa_O1.config").is_file()
+    assert (committed / "q00" / "O1" / "WATER_q00_O1.model").is_file()
+    assert (committed / "q00" / "O1" / "ferebus_q00_O1.config").is_file()
+    assert not (committed / "task_artefacts").exists()
     artefact_manifest = json.loads(
-        (committed / "task_artefacts" / FEREBUS_TASK_ARTEFACTS_MANIFEST)
-        .read_text(encoding="utf-8")
+        (committed / FEREBUS_TASK_ARTEFACTS_MANIFEST).read_text(encoding="utf-8")
     )
     assert artefact_manifest["n_tasks"] == 2
-    assert artefact_manifest["tasks"][0]["files"]["perf"] is None
+    assert artefact_manifest["tasks"][1]["auxiliary"]["perf"] is None
     assert artefact_manifest["tasks"][1]["property"] == "q00"
 
 
+def test_trained_model_resolver_rejects_post_commit_model_tamper(tmp_path):
+    import stat
+
+    ex = _make_executor(tmp_path)
+    _commit_bootstrap_reference_data(ex.campaign_dir)
+    _seed_models_staging(ex.campaign_dir)
+    result = ex._parse_ferebus_postprocess(
+        SimpleNamespace(iteration=0, campaign_uid="m16-test", reference_data_version=0),
+        CampaignPhase("FEREBUS"),
+        observations=[],
+    )
+    assert result.failure_reason is None
+    versioning = TrainedModelVersioning(ex.campaign_dir / "TRAINED_MODELS")
+    model_set = versioning.resolve(0, verification="deep")
+    model = model_set.tasks[0].model.path
+    model.chmod(stat.S_IMODE(model.stat().st_mode) | stat.S_IWUSR)
+    model.write_text(
+        model.read_text(encoding="utf-8") + "\n# tamper\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ManifestMismatchError):
+        versioning.resolve(0, verification="deep")
+
+
 def test_ferebus_task_artefact_layout_rejects_unsafe_tokens(tmp_path):
-    staging = tmp_path / "campaign" / "6_TRAINED_MODELS" / "iteration-staging"
-    committed = tmp_path / "campaign" / "6_TRAINED_MODELS" / "iteration-0000"
+    staging = tmp_path / "campaign" / "TRAINED_MODELS" / "iteration-staging"
+    committed = tmp_path / "campaign" / "TRAINED_MODELS" / "iteration-000000.staging"
     staging.mkdir(parents=True)
     committed.mkdir(parents=True)
     model = staging / "WATER_iqa_O1.model"
@@ -900,6 +975,8 @@ def test_ferebus_task_artefact_layout_rejects_unsafe_tokens(tmp_path):
                     "config_path": str(config),
                 }],
             },
+            models_version=0,
+            parent_model_set=None,
         )
 
 
@@ -915,14 +992,14 @@ def test_initial_ferebus_also_commits_reference_data_version_zero(tmp_path):
     assert result.failure_reason is None
     assert result.state_updates["models_version"] == 0
     assert result.state_updates["reference_data_version"] == 0
-    train_dir = tmp_path / "campaign" / "QM_REFERENCE_DATA" / "iteration-0000"
+    train_dir = tmp_path / "campaign" / "QM_REFERENCE_DATA" / "iteration-000000"
     assert train_dir.is_dir()
     assert (train_dir / "POINT_000000.pointdir").is_dir()
 
 
 def test_ferebus_parser_rejects_empty_staging(tmp_path):
     ex = _make_executor(tmp_path)
-    empty = tmp_path / "campaign" / "6_TRAINED_MODELS" / "iteration-staging"
+    empty = tmp_path / "campaign" / "TRAINED_MODELS" / "iteration-staging"
     empty.mkdir(parents=True, exist_ok=True)
     state = SimpleNamespace(iteration=2, campaign_uid="m16-test", reference_data_version=0)
     result = ex._parse_ferebus_postprocess(

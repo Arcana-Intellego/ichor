@@ -34,6 +34,12 @@ from .resource_solver import (
     validate_gaussian_link0_memory,
 )
 from .state import atomic_write_json
+from ..layout import (
+    COMMITTED_VERSION_NAME_WIDTH,
+    TRAINED_MODELS_DIRNAME,
+    trained_models_dir,
+)
+from ..versioning.manifest import sha256_file
 
 
 QUANTUM_ACCEPTANCE_MANIFEST = "accepted_pointdirs.json"
@@ -42,7 +48,7 @@ POINTDIR_BASENAME_RE = re.compile(r"^POINT_\d{4}\.pointdir$")
 AIMALL_TASK_METADATA = "AIMALL_TASK.json"
 AIMALL_TASK_METADATA_SCHEMA_VERSION = 1
 FEREBUS_TASK_MANIFEST = "FEREBUS_TASKS.json"
-FEREBUS_TASK_SCHEMA_VERSION = 2
+FEREBUS_TASK_SCHEMA_VERSION = 3
 FEREBUS_JOB_DETAILS = "job-details"
 SAFE_PATH_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
@@ -325,7 +331,43 @@ def ferebus_manifest_path(staging_dir: Path) -> Path:
     return Path(staging_dir) / FEREBUS_TASK_MANIFEST
 
 
-def read_ferebus_manifest(staging_dir: Path) -> Dict[str, Any]:
+def ferebus_relative_path(staging_dir: Path, path: Path) -> str:
+    try:
+        return Path(path).resolve().relative_to(Path(staging_dir).resolve()).as_posix()
+    except ValueError as exc:
+        raise ValueError("FEREBUS task path escapes staging: " + str(path)) from exc
+
+
+def resolve_ferebus_task_path(
+    staging_dir: Path,
+    raw_path: Any,
+    label: str,
+) -> Path:
+    text = str(raw_path or "")
+    if not text or "\\" in text:
+        raise ValueError(label + " must be a non-empty relative POSIX path")
+    relative = Path(*text.split("/"))
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError(label + " is not a safe relative path: " + repr(text))
+    root = Path(staging_dir).resolve(strict=False)
+    path = root / relative
+    try:
+        path.resolve(strict=False).relative_to(root)
+    except ValueError as exc:
+        raise ValueError(label + " escapes FEREBUS staging: " + repr(text)) from exc
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.exists() and current.is_symlink():
+            raise ValueError(label + " contains a symlink: " + str(current))
+    return path
+
+
+def read_ferebus_manifest(
+    staging_dir: Path,
+    *,
+    verify_dataset_files: bool = True,
+) -> Dict[str, Any]:
     path = ferebus_manifest_path(Path(staging_dir))
     if not path.is_file():
         raise FileNotFoundError("FEREBUS task manifest missing: " + str(path))
@@ -337,6 +379,11 @@ def read_ferebus_manifest(staging_dir: Path) -> Dict[str, Any]:
         raise ValueError("FEREBUS task manifest must be a JSON object: " + str(path))
     if int(data.get("schema_version", -1)) != FEREBUS_TASK_SCHEMA_VERSION:
         raise ValueError("unsupported FEREBUS task manifest schema: " + str(path))
+    campaign_uid = str(data.get("campaign_uid") or "")
+    system = str(data.get("system") or "")
+    if not campaign_uid or not system:
+        raise ValueError("FEREBUS task manifest campaign/system identity is invalid")
+    validate_safe_path_token("FEREBUS system", system)
     try:
         reference_data_version = int(data["reference_data_version"])
         n_reference_points = int(data["n_reference_points"])
@@ -359,9 +406,105 @@ def read_ferebus_manifest(staging_dir: Path) -> Dict[str, Any]:
     tasks = data.get("tasks")
     if not isinstance(tasks, list) or not tasks:
         raise ValueError("FEREBUS task manifest has no tasks: " + str(path))
-    for task in tasks:
+    properties = data.get("properties")
+    atoms = data.get("atoms")
+    if not isinstance(properties, list) or not properties:
+        raise ValueError("FEREBUS task manifest properties are invalid")
+    if not isinstance(atoms, list) or not atoms:
+        raise ValueError("FEREBUS task manifest atoms are invalid")
+    property_tokens = [str(value) for value in properties]
+    atom_tokens = [str(value) for value in atoms]
+    for token in property_tokens:
+        validate_safe_path_token("FEREBUS property", token)
+    for token in atom_tokens:
+        validate_safe_path_token("FEREBUS atom label", token)
+    if len({token.casefold() for token in property_tokens}) != len(property_tokens):
+        raise ValueError("FEREBUS properties contain a case-insensitive collision")
+    if len({token.casefold() for token in atom_tokens}) != len(atom_tokens):
+        raise ValueError("FEREBUS atom labels contain a case-insensitive collision")
+    expected_keys = [
+        (prop, atom) for prop in property_tokens for atom in atom_tokens
+    ]
+    observed_keys = []
+    for expected_index, task in enumerate(tasks, start=1):
         if not isinstance(task, dict):
             raise ValueError("FEREBUS task manifest contains a non-object task")
+        prop = str(task.get("property") or "")
+        atom = str(task.get("atom") or "")
+        observed_keys.append((prop, atom))
+        if int(task.get("task_index", -1)) != expected_index:
+            raise ValueError("FEREBUS task indexes are not contiguous")
+        expected_task_dir = prop + "/" + atom
+        expected_input_dir = expected_task_dir + "/datasets"
+        expected_paths = {
+            "property_dir": prop,
+            "output_dir": expected_task_dir,
+            "input_dir": expected_input_dir,
+            "config_path": expected_task_dir + "/ferebus.config",
+            "training_csv": (
+                expected_input_dir + "/" + system + "_" + atom + "_TRAINING_SET.csv"
+            ),
+            "int_validation_csv": (
+                expected_input_dir
+                + "/"
+                + system
+                + "_"
+                + atom
+                + "_INT_VALIDATION_SET.csv"
+            ),
+            "ext_validation_csv": (
+                expected_input_dir
+                + "/"
+                + system
+                + "_"
+                + atom
+                + "_EXT_VALIDATION_SET.csv"
+            ),
+            "expected_model_path": (
+                expected_task_dir
+                + "/"
+                + system
+                + "_"
+                + prop
+                + "_"
+                + atom
+                + ".model"
+            ),
+        }
+        for key in (
+            "property_dir",
+            "output_dir",
+            "input_dir",
+            "config_path",
+            "training_csv",
+            "int_validation_csv",
+            "ext_validation_csv",
+            "expected_model_path",
+        ):
+            resolved = resolve_ferebus_task_path(staging_dir, task.get(key), key)
+            relative = ferebus_relative_path(staging_dir, resolved)
+            if relative != expected_paths[key]:
+                raise ValueError("FEREBUS " + key + " does not match its task")
+        expected_alf_cli = "_".join(
+            str(int(value)) for value in task.get("alf_1_indexed", [])
+        )
+        command_args = task.get("command_args")
+        expected_command_args = [
+            "-c",
+            expected_paths["config_path"],
+            "-I",
+            expected_paths["input_dir"],
+            "-O",
+            expected_paths["output_dir"],
+            "-P",
+            prop,
+            "-A",
+            atom,
+            "-ALF",
+            expected_alf_cli,
+        ]
+        if command_args != expected_command_args:
+            raise ValueError("FEREBUS command_args do not match the task contract")
         counts = task.get("row_counts")
         if not isinstance(counts, dict):
             raise ValueError("FEREBUS task manifest row_counts is invalid")
@@ -375,6 +518,87 @@ def read_ferebus_manifest(staging_dir: Path) -> Dict[str, Any]:
             raise ValueError(
                 "FEREBUS task row count does not match the reference-data view"
             )
+        row_ids = task.get("row_ids")
+        if not isinstance(row_ids, dict):
+            raise ValueError("FEREBUS task manifest row_ids is invalid")
+        try:
+            split_rows = {
+                split: [int(value) for value in row_ids[split]]
+                for split in ("train", "int_val", "ext_val")
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("FEREBUS task manifest row_ids is invalid") from exc
+        for split, indexes in split_rows.items():
+            if len(indexes) != int(counts[split]):
+                raise ValueError(
+                    "FEREBUS task row_ids/count mismatch for " + split
+                )
+        flattened_rows = [
+            index
+            for split in ("train", "int_val", "ext_val")
+            for index in split_rows[split]
+        ]
+        if sorted(flattened_rows) != list(range(n_reference_points)):
+            raise ValueError(
+                "FEREBUS task row_ids do not partition the reference-data rows"
+            )
+        datasets = task.get("datasets")
+        if not isinstance(datasets, dict) or set(datasets) != {
+            "train",
+            "int_val",
+            "ext_val",
+        }:
+            raise ValueError("FEREBUS task dataset identities are invalid")
+        dataset_path_fields = {
+            "train": "training_csv",
+            "int_val": "int_validation_csv",
+            "ext_val": "ext_validation_csv",
+        }
+        for split, path_field in dataset_path_fields.items():
+            record = datasets.get(split)
+            if not isinstance(record, dict):
+                raise ValueError("FEREBUS " + split + " dataset identity is invalid")
+            expected_path = expected_paths[path_field]
+            if str(record.get("path") or "") != expected_path:
+                raise ValueError("FEREBUS " + split + " dataset path mismatch")
+            try:
+                dataset_size = int(record.get("size"))
+                dataset_rows = int(record.get("rows"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "FEREBUS " + split + " dataset identity is invalid"
+                ) from exc
+            dataset_sha = str(record.get("sha256") or "")
+            if dataset_size < 0 or dataset_rows != int(counts[split]):
+                raise ValueError("FEREBUS " + split + " dataset identity is invalid")
+            if len(dataset_sha) != 64 or any(
+                character not in "0123456789abcdef" for character in dataset_sha
+            ):
+                raise ValueError("FEREBUS " + split + " dataset SHA-256 is invalid")
+            if verify_dataset_files:
+                dataset_path = resolve_ferebus_task_path(
+                    staging_dir,
+                    expected_path,
+                    path_field,
+                )
+                if not dataset_path.is_file():
+                    dataset_path = resolve_ferebus_task_path(
+                        staging_dir,
+                        prop + "/" + Path(expected_path).name,
+                        path_field + "_pre_pyferebus",
+                    )
+                if not dataset_path.is_file() or dataset_path.is_symlink():
+                    raise ValueError(
+                        "FEREBUS " + split + " dataset file is missing"
+                    )
+                if int(dataset_path.stat().st_size) != dataset_size:
+                    raise ValueError("FEREBUS " + split + " dataset size mismatch")
+                if sha256_file(dataset_path) != dataset_sha:
+                    raise ValueError("FEREBUS " + split + " dataset SHA-256 mismatch")
+    if observed_keys != expected_keys:
+        raise ValueError("FEREBUS tasks do not match the property/atom product")
+    if int(data.get("n_tasks", -1)) != len(expected_keys):
+        raise ValueError("FEREBUS task manifest n_tasks is invalid")
     return data
 
 
@@ -1033,7 +1257,9 @@ def verify_committed_allocation_snapshot(
         raise ValueError("committed allocation source is incomplete: " + str(source_path))
     committed_dir = versioning.iteration_path(version)
     snapshot_path = committed_dir / (
-        "POINT_ALLOCATION.version-" + str(version).zfill(4) + ".json"
+        "POINT_ALLOCATION.version-"
+        + str(version).zfill(COMMITTED_VERSION_NAME_WIDTH)
+        + ".json"
     )
     if not snapshot_path.is_file() or snapshot_path.is_symlink():
         raise FileNotFoundError(
@@ -1192,7 +1418,12 @@ def commit_reference_data_delta(
         )
     atomic_write_json(staging / "POINT_ALLOCATION.json", allocation)
     atomic_write_json(
-        staging / ("POINT_ALLOCATION.version-" + str(version).zfill(4) + ".json"),
+        staging
+        / (
+            "POINT_ALLOCATION.version-"
+            + str(version).zfill(COMMITTED_VERSION_NAME_WIDTH)
+            + ".json"
+        ),
         allocation,
     )
     atomic_write_json(staging / REFERENCE_DATA_VERSION_FILENAME, payload)
@@ -1250,7 +1481,7 @@ def stage_ferebus_inputs(
     if not view.entries:
         raise ValueError("committed QM reference data contains no pointdirs")
 
-    staging = campaign / "6_TRAINED_MODELS" / "iteration-staging"
+    staging = trained_models_dir(campaign) / "iteration-staging"
     # iteration-staging is ONE shared scratch dir reused every iteration, so wipe it first.
     # otherwise last iteration's *_train.csv / *.model lying around get globbed back in and we
     # either split stale data or re-commit an old model as a fresh version (both silent + nasty).
@@ -1258,7 +1489,7 @@ def stage_ferebus_inputs(
         _checked_rmtree(
             staging,
             campaign_dir=campaign,
-            allowed_roots=[campaign / "6_TRAINED_MODELS"],
+            allowed_roots=[campaign / TRAINED_MODELS_DIRNAME],
         )
     staging.mkdir(parents=True, exist_ok=True)
 
@@ -1302,6 +1533,7 @@ def stage_ferebus_inputs(
         raise ValueError("PointsDirectory export produced no *_train.csv files for FEREBUS")
 
     system = str(getattr(config.campaign, "system_name", "SYSTEM"))
+    validate_safe_path_token("FEREBUS system", system)
     from . import ferebus_dataset as _fds
     from .ferebus_split_ledger import ensure_split_assignments
     from ..point_allocation import (
@@ -1423,6 +1655,12 @@ def stage_ferebus_inputs(
     tasks: List[Dict[str, Any]] = []
     task_index = 1
     for prop in properties:
+        validate_safe_path_token("FEREBUS property", prop)
+    if len({str(prop).casefold() for prop in properties}) != len(properties):
+        raise ValueError("FEREBUS properties contain a case-insensitive collision")
+    if len({str(atom).casefold() for atom in atom_labels}) != len(atom_labels):
+        raise ValueError("FEREBUS atom labels contain a case-insensitive collision")
+    for prop in properties:
         for atom in atom_labels:
             output_dir = staging / prop / atom
             input_dir = output_dir / "datasets"
@@ -1431,21 +1669,10 @@ def stage_ferebus_inputs(
             training_csv = input_dir / (system + "_" + atom + "_TRAINING_SET.csv")
             int_csv = input_dir / (system + "_" + atom + "_INT_VALIDATION_SET.csv")
             ext_csv = input_dir / (system + "_" + atom + "_EXT_VALIDATION_SET.csv")
+            source_training_csv = prop_dirs[prop] / training_csv.name
+            source_int_csv = prop_dirs[prop] / int_csv.name
+            source_ext_csv = prop_dirs[prop] / ext_csv.name
             model_path = output_dir / (system + "_" + prop + "_" + atom + ".model")
-            command = (
-                "-c "
-                + str(config_path)
-                + "  -I "
-                + str(input_dir)
-                + " -O "
-                + str(output_dir)
-                + " -P "
-                + prop
-                + " -A "
-                + atom
-                + " -ALF "
-                + alf_cli
-            )
             tasks.append(
                 {
                     "task_index": int(task_index),
@@ -1453,17 +1680,37 @@ def stage_ferebus_inputs(
                     "atom": atom,
                     "alf_1_indexed": [int(x) for x in alf_by_atom[atom]],
                     "alf_cli": alf_cli,
-                    "property_dir": str((staging / prop).resolve()),
-                    "output_dir": str(output_dir.resolve()),
-                    "input_dir": str(input_dir.resolve()),
-                    "config_path": str(config_path.resolve()),
-                    "training_csv": str(training_csv.resolve()),
-                    "int_validation_csv": str(int_csv.resolve()),
-                    "ext_validation_csv": str(ext_csv.resolve()),
-                    "expected_model_path": str(model_path.resolve()),
-                    "command": command,
+                    "property_dir": ferebus_relative_path(staging, staging / prop),
+                    "output_dir": ferebus_relative_path(staging, output_dir),
+                    "input_dir": ferebus_relative_path(staging, input_dir),
+                    "config_path": ferebus_relative_path(staging, config_path),
+                    "training_csv": ferebus_relative_path(staging, training_csv),
+                    "int_validation_csv": ferebus_relative_path(staging, int_csv),
+                    "ext_validation_csv": ferebus_relative_path(staging, ext_csv),
+                    "expected_model_path": ferebus_relative_path(staging, model_path),
+                    "command_args": [
+                        "-c", ferebus_relative_path(staging, config_path),
+                        "-I", ferebus_relative_path(staging, input_dir),
+                        "-O", ferebus_relative_path(staging, output_dir),
+                        "-P", prop,
+                        "-A", atom,
+                        "-ALF", alf_cli,
+                    ],
                     "row_counts": dict(split_counts[atom]),
                     "row_ids": dict(row_ids_by_atom[atom]),
+                    "datasets": {
+                        split: {
+                            "path": ferebus_relative_path(staging, dataset_path),
+                            "size": int(source_dataset_path.stat().st_size),
+                            "sha256": sha256_file(source_dataset_path),
+                            "rows": int(split_counts[atom][split]),
+                        }
+                        for split, dataset_path, source_dataset_path in (
+                            ("train", training_csv, source_training_csv),
+                            ("int_val", int_csv, source_int_csv),
+                            ("ext_val", ext_csv, source_ext_csv),
+                        )
+                    },
                     "degenerate_property_stats": bool(
                         stats_by_prop_atom.get((prop, atom), {}).get(
                             "degenerate_property_stats", False
@@ -1477,6 +1724,7 @@ def stage_ferebus_inputs(
         staging,
         {
             "schema_version": FEREBUS_TASK_SCHEMA_VERSION,
+            "campaign_uid": str(view.campaign_uid),
             "system": system,
             "reference_data_version": version,
             "reference_data_head_manifest_sha256": str(view.head_manifest_sha256),
@@ -1488,13 +1736,17 @@ def stage_ferebus_inputs(
             "n_atoms": int(n_atoms),
             "n_tasks": int(len(tasks)),
             "degenerate_property_stats": list(degenerate_property_stats),
-            "job_details": str(job_details.resolve()),
+            "job_details": ferebus_relative_path(staging, job_details),
             "split_ledger": {
-                "path": str(split_ledger["path"]),
+                "path": Path(split_ledger["path"]).resolve().relative_to(
+                    campaign.resolve()
+                ).as_posix(),
                 "counts": dict(split_ledger["counts"]),
                 "version_allocation": dict(split_ledger["version_allocation"]),
                 "allocation_policy": str(split_ledger["allocation_policy"]),
-                "allocation_manifest": str(allocation_path.resolve()),
+                "allocation_manifest": allocation_path.resolve().relative_to(
+                    campaign.resolve()
+                ).as_posix(),
                 "allocation_manifest_sha256": str(allocation_hash),
                 "forced_splits": dict(forced_ferebus_splits),
             },

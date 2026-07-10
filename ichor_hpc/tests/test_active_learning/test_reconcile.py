@@ -54,7 +54,7 @@ def _campaign_dirs(tmp_path):
     campaign = tmp_path / "campaign"
     data = campaign / ".DATA" / "ACTIVE_LEARNING"
     training = campaign / "QM_REFERENCE_DATA"
-    models = campaign / "6_TRAINED_MODELS"
+    models = campaign / "TRAINED_MODELS"
     data.mkdir(parents=True, exist_ok=True)
     training.mkdir(parents=True, exist_ok=True)
     models.mkdir(parents=True, exist_ok=True)

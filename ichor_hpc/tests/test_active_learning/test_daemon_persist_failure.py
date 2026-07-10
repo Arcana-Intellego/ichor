@@ -118,8 +118,8 @@ def test_inline_append_idempotent_skip_rejects_mismatched_allocation(tmp_path):
         tmp_path
         / "campaign"
         / "QM_REFERENCE_DATA"
-        / "iteration-0001"
-        / "POINT_ALLOCATION.version-0001.json"
+        / "iteration-000001"
+        / "POINT_ALLOCATION.version-000001.json"
     )
     payload = json.loads(snapshot.read_text(encoding="utf-8"))
     payload["iteration"] = 999
@@ -158,18 +158,28 @@ def test_dry_ferebus_idempotent_skip_repairs_model_current_pointer(tmp_path):
     state = SimpleNamespace(
         iteration=1,
         campaign_uid="uid",
-        reference_data_version=1,
+        reference_data_version=0,
         models_version=0,
     )
     _prepare_bootstrap(
         ex,
         SimpleNamespace(iteration=0, campaign_uid="uid", reference_data_version=-1),
     )
+    _prepare_active_quantum_allocation(ex, state)
+    appended = ex.submit_or_run(state, CampaignPhase.APPEND)
+    state.reference_data_version = int(appended.state_updates["reference_data_version"])
 
     first = ex.postprocess(state, CampaignPhase.FEREBUS, observations=[])
     assert first.state_updates["models_version"] == 1
-    v = VersionedDirectory(tmp_path / "campaign" / "6_TRAINED_MODELS")
-    v.update_current(0)
+    from ichor.hpc.active_learning.versioning.trained_models import (
+        TrainedModelVersioning,
+    )
+
+    v = TrainedModelVersioning(tmp_path / "campaign" / "TRAINED_MODELS")
+    for pointer in (v.current_link_path(), v._pointer_path()):
+        if pointer.is_symlink() or pointer.is_file():
+            pointer.unlink()
+    v._pointer_path().write_text("iteration-000000\n", encoding="utf-8")
     assert v.current_version() == 0
 
     second = ex.postprocess(state, CampaignPhase.FEREBUS, observations=[])

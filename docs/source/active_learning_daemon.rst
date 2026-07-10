@@ -277,7 +277,7 @@ QM reference-data storage
 -------------------------
 
 Accepted Gaussian/AIMAll pointdirs are committed under
-:code:`QM_REFERENCE_DATA/`. Each :code:`iteration-NNNN/` is an immutable
+:code:`QM_REFERENCE_DATA/`. Each :code:`iteration-NNNNNN/` is an immutable
 **delta** containing only points first accepted in that reference-data
 version. Older pointdirs are not copied or symlinked into later versions.
 
@@ -298,6 +298,46 @@ only. It is never authoritative and can be deleted; the next resolution
 rebuilds it from committed version manifests. The old :code:`5_TRAINING/`
 layout is intentionally unsupported. Start a fresh campaign rather than
 mixing the two storage contracts.
+
+
+Trained-model storage
+---------------------
+
+Each successful FEREBUS phase commits one complete immutable snapshot under
+:code:`TRAINED_MODELS/iteration-NNNNNN/`. Task files are grouped by property
+and atom; model and configuration files are never dumped at the version root::
+
+    TRAINED_MODELS/iteration-000001/
+      FEREBUS_TASK_ARTEFACTS.json
+      FEREBUS_TASKS.json
+      FEREBUS_QUALITY.json
+      iqa/O1/
+        SYSTEM_iqa_O1.model
+        ferebus_iqa_O1.config
+        SYSTEM_iqa_O1.opt
+        SYSTEM_iqa_O1.perf
+        SYSTEM_iqa_O1.pred
+        SYSTEM_iqa_O1.scurve
+        SYSTEM_iqa_O1.sol
+      q00/O1/
+        SYSTEM_q00_O1.model
+        ferebus_q00_O1.config
+
+:code:`FEREBUS_TASK_ARTEFACTS.json` is the authoritative model-set manifest.
+It records every expected task file and SHA-256, the exact property/atom
+product, its parent model-manifest hash, and the QM reference-data version,
+head hash, cumulative-view hash, row order, split rows, and exact input CSV
+hashes used by FEREBUS.
+Consumers load exactly the listed model files; recursive model discovery is
+not used. Unknown files, missing files, symlinks, hash drift, task-order drift,
+or a rejected quality manifest make the snapshot unusable.
+
+The :code:`current` pointer is updated only after the new snapshot has been
+committed, deeply verified, and made read-only. It may point only at the newest
+committed model version. :code:`TRAINED_MODELS/iteration-staging/` remains a
+rebuildable FEREBUS working directory and is not authoritative. The former
+:code:`6_TRAINED_MODELS/` and nested :code:`task_artefacts/` layouts are
+intentionally unsupported.
 
 
 Recovery + troubleshooting
@@ -326,7 +366,7 @@ to create a new state because that could damage provenance. Use reconcile
 instead.
 
 This inspects the on-disk artefacts (committed iterations in
-:code:`QM_REFERENCE_DATA/` and :code:`6_TRAINED_MODELS/`, plus journal events)
+:code:`QM_REFERENCE_DATA/` and :code:`TRAINED_MODELS/`, plus journal events)
 and proposes a recovered state at :code:`state.json.proposed`. Plain
 reconcile is diagnostic: it may write the proposal file and warn about a
 live daemon, but it does not alter :code:`state.json`. Review the proposal,
@@ -428,7 +468,7 @@ postprocess parser in the daemon process).
      |<-------------------------------------+
      v
    INITIAL_FEREBUS  (sbatch)      First GP fit. Commits iteration-0 to
-     |                            QM_REFERENCE_DATA and 6_TRAINED_MODELS.
+     |                            QM_REFERENCE_DATA and TRAINED_MODELS.
      v
    SEED_SELECT  (inline)  <----+  Pick seeds from the trajectory pool,
      |                         |  forbidding already-trained frames.

@@ -45,7 +45,7 @@ def _campaign(tmp_path):
     campaign = tmp_path / "campaign"
     (campaign / ".DATA" / "ACTIVE_LEARNING").mkdir(parents=True)
     (campaign / "QM_REFERENCE_DATA").mkdir()
-    (campaign / "6_TRAINED_MODELS").mkdir()
+    (campaign / "TRAINED_MODELS").mkdir()
     return campaign
 
 
@@ -1002,7 +1002,7 @@ def test_system_name_allowed_before_first_ferebus(tmp_path):
 
 def test_system_name_blocks_after_ferebus_staging_exists(tmp_path):
     campaign = _campaign(tmp_path)
-    staging = campaign / "6_TRAINED_MODELS" / "iteration-staging"
+    staging = campaign / "TRAINED_MODELS" / "iteration-staging"
     staging.mkdir(parents=True)
     (staging / "FEREBUS_TASKS.json").write_text("{}", encoding="utf-8")
     original = CampaignConfig()
@@ -1041,7 +1041,7 @@ def test_reconcile_apply_promotes_state_and_cleans_ferebus_staging(tmp_path, cap
     changed = CampaignConfig()
     changed.ferebus.scaling = False
     _write_config(campaign, changed)
-    stale = campaign / "6_TRAINED_MODELS" / "iteration-staging"
+    stale = campaign / "TRAINED_MODELS" / "iteration-staging"
     stale.mkdir(parents=True)
     (stale / "runFerebus.sh").write_text("# stale\n", encoding="utf-8")
 
@@ -1080,32 +1080,16 @@ def test_reconcile_apply_promotes_state_and_cleans_ferebus_staging(tmp_path, cap
 
 def test_completed_ferebus_staging_is_archived_when_committed_models_match(
     tmp_path,
-    monkeypatch,
 ):
     campaign = _campaign(tmp_path)
-    staging = campaign / "6_TRAINED_MODELS" / "iteration-staging"
-    committed = campaign / "6_TRAINED_MODELS" / "iteration-0000"
-    staging_task = staging / "iqa" / "O1"
-    staging_task.mkdir(parents=True)
-    committed.mkdir(parents=True)
-    (staging_task / "WATER_iqa_O1.model").write_text("staged\n", encoding="utf-8")
-    (committed / "WATER_iqa_O1.model").write_text("committed\n", encoding="utf-8")
+    _commit_reference_data_version(campaign, 0)
+    from ichor.hpc.active_learning.daemon.dry_run_executor import DryRunPhaseExecutor
+
+    DryRunPhaseExecutor(campaign, CampaignConfig())._commit_dry_model_snapshot(0)
+    staging = campaign / "TRAINED_MODELS" / "iteration-staging"
     proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.ARIADNE_ARRAY
     proposed.models_version = 0
-
-    from ichor.hpc.active_learning.daemon import live_executor as live_executor_mod
-
-    monkeypatch.setattr(
-        live_executor_mod,
-        "validate_ferebus_completed",
-        lambda path: (True, "ok"),
-    )
-    monkeypatch.setattr(
-        config_lock_mod,
-        "verify_committed_model_version",
-        lambda *args, **kwargs: None,
-    )
 
     archived = config_lock_mod.clean_model_iteration_staging_for_reconcile(
         campaign,
@@ -1117,38 +1101,35 @@ def test_completed_ferebus_staging_is_archived_when_committed_models_match(
     assert archived_path.name.startswith("iteration-staging.before-reconcile-")
     assert not staging.exists()
     assert (
-        archived_path / "iqa" / "O1" / "WATER_iqa_O1.model"
-    ).read_text(encoding="utf-8") == "staged\n"
-    assert (committed / "WATER_iqa_O1.model").read_text(encoding="utf-8") == "committed\n"
+        archived_path / "iqa" / "O1" / "SYSTEM_iqa_O1.model"
+    ).is_file()
+    assert (
+        campaign
+        / "TRAINED_MODELS"
+        / "iteration-000000"
+        / "iqa"
+        / "O1"
+        / "SYSTEM_iqa_O1.model"
+    ).is_file()
 
 
 def test_completed_ferebus_staging_refuses_archive_when_models_do_not_match(
     tmp_path,
-    monkeypatch,
 ):
     campaign = _campaign(tmp_path)
-    staging = campaign / "6_TRAINED_MODELS" / "iteration-staging"
-    committed = campaign / "6_TRAINED_MODELS" / "iteration-0000"
-    staging.mkdir(parents=True)
-    committed.mkdir(parents=True)
-    (staging / "WATER_iqa_O1.model").write_text("staged\n", encoding="utf-8")
-    (committed / "WATER_iqa_H2.model").write_text("committed\n", encoding="utf-8")
+    _commit_reference_data_version(campaign, 0)
+    from ichor.hpc.active_learning.daemon.dry_run_executor import DryRunPhaseExecutor
+
+    DryRunPhaseExecutor(campaign, CampaignConfig())._commit_dry_model_snapshot(0)
+    staging = campaign / "TRAINED_MODELS" / "iteration-staging"
+    staged_model = staging / "iqa" / "O1" / "SYSTEM_iqa_O1.model"
+    staged_model.write_text(
+        staged_model.read_text(encoding="utf-8") + "\n# hash drift\n",
+        encoding="utf-8",
+    )
     proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.ARIADNE_ARRAY
     proposed.models_version = 0
-
-    from ichor.hpc.active_learning.daemon import live_executor as live_executor_mod
-
-    monkeypatch.setattr(
-        live_executor_mod,
-        "validate_ferebus_completed",
-        lambda path: (True, "ok"),
-    )
-    monkeypatch.setattr(
-        config_lock_mod,
-        "verify_committed_model_version",
-        lambda *args, **kwargs: None,
-    )
 
     with pytest.raises(ValueError, match="does not match committed model version"):
         config_lock_mod.clean_model_iteration_staging_for_reconcile(
@@ -1157,6 +1138,26 @@ def test_completed_ferebus_staging_refuses_archive_when_models_do_not_match(
         )
 
     assert staging.exists()
+
+
+def test_reconcile_archives_dangling_trained_model_version_staging(tmp_path):
+    campaign = _campaign(tmp_path)
+    dangling = campaign / "TRAINED_MODELS" / "iteration-000001.staging"
+    dangling.mkdir(parents=True)
+    (dangling / "partial.txt").write_text("partial\n", encoding="utf-8")
+
+    archived = config_lock_mod.clean_model_iteration_staging_for_reconcile(
+        campaign,
+        fresh_campaign_state(),
+    )
+
+    assert len(archived) == 1
+    archived_path = Path(archived[0])
+    assert archived_path.name.startswith(
+        "iteration-000001.staging.before-reconcile-"
+    )
+    assert (archived_path / "partial.txt").is_file()
+    assert not dangling.exists()
 
 
 def test_reconcile_apply_write_state_failure_keeps_old_state(
@@ -1503,7 +1504,7 @@ def test_reconcile_apply_archives_safe_dangling_training_staging(tmp_path, capsy
     out = capsys.readouterr().out
 
     assert rc == 0
-    archived = sorted((campaign / "QM_REFERENCE_DATA").glob("iteration-0001.staging.before-reconcile-*"))
+    archived = sorted((campaign / "QM_REFERENCE_DATA").glob("iteration-000001.staging.before-reconcile-*"))
     assert len(archived) == 1
     assert (archived[0] / "partial.txt").read_text(encoding="utf-8") == "partial\n"
     assert "Archived stale reference-data staging" in out
@@ -1531,13 +1532,13 @@ def test_reconcile_apply_cleans_transient_halted_ariadne_reentry(
         "old error\n",
         encoding="utf-8",
     )
-    model_staging = campaign / "6_TRAINED_MODELS" / "iteration-staging"
+    model_staging = campaign / "TRAINED_MODELS" / "iteration-staging"
     model_staging.mkdir(parents=True)
     (model_staging / "stale.model").write_text("stale\n", encoding="utf-8")
-    committed_model = campaign / "6_TRAINED_MODELS" / "iteration-0000"
+    committed_model = campaign / "TRAINED_MODELS" / "iteration-000000"
     committed_model.mkdir()
     (committed_model / "marker.txt").write_text("committed\n", encoding="utf-8")
-    committed_training = campaign / "QM_REFERENCE_DATA" / "iteration-0000"
+    committed_training = campaign / "QM_REFERENCE_DATA" / "iteration-000000"
     committed_training.mkdir()
     (committed_training / "marker.txt").write_text("committed\n", encoding="utf-8")
 
@@ -1721,7 +1722,7 @@ def test_reconcile_apply_archive_staging_explicitly_handles_non_ferebus_reentry(
     staging = tv.stage(None, 0)
     (staging / "marker.txt").write_text("training", encoding="utf-8")
     tv.commit(0)
-    mv = VersionedDirectory(campaign / "6_TRAINED_MODELS")
+    mv = VersionedDirectory(campaign / "TRAINED_MODELS")
     staging = mv.stage(None, 0)
     (staging / "marker.txt").write_text("model", encoding="utf-8")
     mv.commit(0)

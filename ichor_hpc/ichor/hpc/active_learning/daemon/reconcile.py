@@ -5,7 +5,7 @@ If it goes missing or fails schema validation, the daemon refuses to auto-
 recover; a silent reconstruction is exactly the bug class we want to avoid.
 
 "reconcile" inspects the on-disk artefacts that DO exist (QM_REFERENCE_DATA/
-committed iterations, 6_TRAINED_MODELS/, journal entries) and proposes a
+committed iterations, TRAINED_MODELS/, journal entries) and proposes a
 "CampaignState" it believes is consistent with them. The proposal is
 written to "<state_path>.proposed" and the operator must explicitly
 promote it ("mv state.json.proposed state.json") before restarting the
@@ -19,7 +19,13 @@ import shutil
 from typing import Any, Dict, List, Optional, Union
 
 from ..acquisition.trajectory_pool import TrajectoryPool
-from ..versioning.versioned_directory import VersionedDirectory
+from ..versioning.reference_data import ReferenceDataVersioning
+from ..versioning.trained_models import TrainedModelVersioning
+from ..layout import (
+    QM_REFERENCE_DATA_DIRNAME,
+    TRAINED_MODELS_DIRNAME,
+    reject_legacy_campaign_layout,
+)
 from .artifact_contracts import (
     verify_committed_model_version,
     verify_committed_reference_data_version,
@@ -191,7 +197,7 @@ def stateful_campaign_artifacts(campaign_dir: Union[str, Path]) -> List[str]:
             findings.append(str(path.relative_to(campaign)))
 
     add_matches("QM_REFERENCE_DATA/iteration-*")
-    add_matches("6_TRAINED_MODELS/iteration-*")
+    add_matches("TRAINED_MODELS/iteration-*")
     add_matches("7_ACTIVE_LEARNING/iteration-*")
     add_matches("3_DIVERSITY_SAMPLING/initial/PHASE_A_SAMPLE.json")
     add_matches("3_DIVERSITY_SAMPLING/initial/initial-SAMPLE-*.xyz")
@@ -646,8 +652,8 @@ def _validate_recovered_state_contract(
 def propose_recovery(
     campaign_dir: Union[str, Path],
     *,
-    reference_data_dir_name: str = "QM_REFERENCE_DATA",
-    models_dir_name: str = "6_TRAINED_MODELS",
+    reference_data_dir_name: str = QM_REFERENCE_DATA_DIRNAME,
+    models_dir_name: str = TRAINED_MODELS_DIRNAME,
     data_subdir: Union[str, Path] = Path(".DATA") / "ACTIVE_LEARNING",
     iteration_prefix: str = "iteration",
     allow_fresh_init_on_nonempty: bool = False,
@@ -663,16 +669,14 @@ def propose_recovery(
         - committed reference-data versions in "QM_REFERENCE_DATA/" define the maximum
           completed iteration; the next iteration to plan from is one past
           that.
-        - committed model versions in "6_TRAINED_MODELS/" likewise.
+        - committed model versions in "TRAINED_MODELS/" likewise.
         - journal entries inform "last_phase_in_journal" for the report only.
         - if a prior state.json exists and parses, its "max_iterations",
           "campaign_uid", and "campaign_started_iso" are preserved so the
           recovery does not destroy provenance.
     """
-    from ..layout import reject_legacy_training_layout
-
     campaign = Path(campaign_dir)
-    reject_legacy_training_layout(campaign)
+    reject_legacy_campaign_layout(campaign)
     data = campaign / data_subdir
     state_path = data / DEFAULT_STATE_FILENAME
 
@@ -717,14 +721,20 @@ def propose_recovery(
     #committed reference-data versions
     training_dir = campaign / reference_data_dir_name
     if training_dir.is_dir():
-        tv = VersionedDirectory(training_dir, prefix=iteration_prefix).list_committed_versions()
+        tv = ReferenceDataVersioning(
+            training_dir,
+            prefix=iteration_prefix,
+        ).list_committed_versions()
     else:
         tv = []
         notes.append("training dir " + reference_data_dir_name + " missing")
     #committed model versions
     models_dir = campaign / models_dir_name
     if models_dir.is_dir():
-        mv = VersionedDirectory(models_dir, prefix=iteration_prefix).list_committed_versions()
+        mv = TrainedModelVersioning(
+            models_dir,
+            prefix=iteration_prefix,
+        ).list_committed_versions()
     else:
         mv = []
         notes.append("models dir " + models_dir_name + " missing")
@@ -808,11 +818,17 @@ def propose_recovery(
         if p.is_file()
     ]
     dangling_reference_data = (
-        VersionedDirectory(training_dir, prefix=iteration_prefix).list_dangling_staging()
+        ReferenceDataVersioning(
+            training_dir,
+            prefix=iteration_prefix,
+        ).list_dangling_staging()
         if training_dir.is_dir() else []
     )
     dangling_models = (
-        VersionedDirectory(models_dir, prefix=iteration_prefix).list_dangling_staging()
+        TrainedModelVersioning(
+            models_dir,
+            prefix=iteration_prefix,
+        ).list_dangling_staging()
         if models_dir.is_dir() else []
     )
     model_iteration_staging = models_dir / "iteration-staging"

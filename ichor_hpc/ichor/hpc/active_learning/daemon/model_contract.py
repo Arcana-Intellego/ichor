@@ -9,9 +9,6 @@ import numpy as np
 
 
 VARIANCE_NEGATIVE_TOLERANCE = 1.0e-10
-FEREBUS_COMMITTED_ARTEFACTS_DIRNAME = "task_artefacts"
-
-
 class ModelContractError(ValueError):
     """Raised when a staged or committed FEREBUS model set is not usable."""
 
@@ -281,11 +278,12 @@ def validate_ferebus_model_contract(
     *,
     committed: bool = False,
     expected_version: Optional[int] = None,
+    trained_model_set: Any = None,
 ) -> None:
     """Validate a staged or committed FEREBUS model directory.
 
-    Staged directories use task ``expected_model_path`` and ``config_path``. Committed model
-    versions keep models/configs flat, so task paths are remapped to their committed basenames.
+    Staged directories use paths relative to FEREBUS staging. Committed model
+    versions use the authoritative trained-model set manifest.
     """
     from ichor.core.models import Model, Models
     from . import input_staging as _stg
@@ -293,127 +291,34 @@ def validate_ferebus_model_contract(
     root = Path(root_dir)
     if not root.is_dir():
         raise ModelContractError("ferebus_model_root_missing: " + str(root))
-    manifest = _stg.read_ferebus_manifest(root)
+    manifest = _stg.read_ferebus_manifest(
+        root,
+        verify_dataset_files=not committed,
+    )
+    model_set = trained_model_set
     if committed:
         if expected_version is None:
             expected_version = _version_from_iteration_dir(root)
-        manifest_reference_data_version = manifest.get("reference_data_version")
-        if expected_version is not None:
-            try:
-                parsed_reference_data_version = int(manifest_reference_data_version)
-            except (TypeError, ValueError) as exc:
-                raise ModelContractError(
-                    "ferebus_manifest_reference_data_version_invalid"
-                ) from exc
-            if parsed_reference_data_version != int(expected_version):
-                raise ModelContractError(
-                    "ferebus_manifest_reference_data_version_mismatch: "
-                    + str(parsed_reference_data_version)
-                    + "!="
-                    + str(int(expected_version))
-                )
-            try:
-                from ..versioning.reference_data import ReferenceDataVersioning
-
-                campaign = root.parent.parent
-                reference_view = ReferenceDataVersioning(
-                    campaign / "QM_REFERENCE_DATA"
-                ).resolve(parsed_reference_data_version, verification="deep")
-            except Exception as exc:
-                raise ModelContractError(
-                    "ferebus_reference_data_binding_invalid: "
-                    + type(exc).__name__
-                    + ": "
-                    + str(exc)
-                ) from exc
-            if str(manifest.get("reference_data_head_manifest_sha256") or "") != str(
-                reference_view.head_manifest_sha256
-            ):
-                raise ModelContractError(
-                    "ferebus_reference_data_head_manifest_sha256_mismatch"
-                )
-            if str(manifest.get("reference_data_view_sha256") or "") != str(
-                reference_view.cumulative_view_sha256
-            ):
-                raise ModelContractError("ferebus_reference_data_view_sha256_mismatch")
-            expected_row_order = [
-                entry.pointdir_name for entry in reference_view.entries
-            ]
-            if list(manifest.get("pointdir_row_order") or []) != expected_row_order:
-                raise ModelContractError("ferebus_reference_data_row_order_mismatch")
-            if int(manifest.get("n_reference_points", -1)) != len(expected_row_order):
-                raise ModelContractError("ferebus_reference_data_count_mismatch")
-            expected_split_rows = {
-                split: [
-                    index
-                    for index, entry in enumerate(reference_view.entries)
-                    if entry.split == split
-                ]
-                for split in ("train", "int_val", "ext_val")
-            }
-            expected_split_counts = {
-                split: len(row_ids)
-                for split, row_ids in expected_split_rows.items()
-            }
-            for task in manifest.get("tasks", []):
-                if not isinstance(task, Mapping):
-                    raise ModelContractError("ferebus_manifest_task_invalid")
-                observed_counts = {
-                    split: int((task.get("row_counts") or {}).get(split, -1))
-                    for split in expected_split_counts
-                }
-                if observed_counts != expected_split_counts:
-                    raise ModelContractError(
-                        "ferebus_reference_data_split_count_mismatch"
-                    )
-                observed_rows = task.get("row_ids")
-                if observed_rows is not None:
-                    normalised_rows = {
-                        split: [int(value) for value in observed_rows.get(split, [])]
-                        for split in expected_split_rows
-                    }
-                    if normalised_rows != expected_split_rows:
-                        raise ModelContractError(
-                            "ferebus_reference_data_split_row_mismatch"
-                        )
         try:
-            from .ferebus_quality import (
-                FEREBUS_QUALITY_MANIFEST,
-                FEREBUS_QUALITY_SCHEMA_VERSION,
+            from ..versioning.trained_models import (
+                resolve_trained_model_set,
             )
-            import json as _json
 
-            quality_path = root / FEREBUS_QUALITY_MANIFEST
-            if not quality_path.is_file():
-                raise ModelContractError("ferebus_quality_manifest_missing")
-            quality = _json.loads(quality_path.read_text(encoding="utf-8"))
-            if not isinstance(quality, Mapping):
-                raise ModelContractError("ferebus_quality_manifest_invalid")
-            if int(quality.get("schema_version", -1)) != FEREBUS_QUALITY_SCHEMA_VERSION:
-                raise ModelContractError("ferebus_quality_manifest_schema_mismatch")
-            if int(quality.get("reference_data_version", -999999)) != int(
-                manifest.get("reference_data_version", -1)
-            ):
-                raise ModelContractError(
-                    "ferebus_quality_reference_data_version_mismatch"
+            if expected_version is None:
+                raise ModelContractError("committed_model_version_unparseable")
+            if model_set is None:
+                model_set = resolve_trained_model_set(
+                    root.parent.parent,
+                    int(expected_version),
+                    verification="deep",
                 )
-            for hash_field in (
-                "reference_data_head_manifest_sha256",
-                "reference_data_view_sha256",
-            ):
-                if str(quality.get(hash_field) or "") != str(
-                    manifest.get(hash_field) or ""
-                ):
-                    raise ModelContractError(
-                        "ferebus_quality_" + hash_field + "_mismatch"
-                    )
-            if not bool(quality.get("accepted", False)):
-                raise ModelContractError("ferebus_quality_manifest_rejected")
-        except ModelContractError:
-            raise
+            if int(model_set.version) != int(expected_version):
+                raise ModelContractError("trained_model_set_version_mismatch")
+            if Path(model_set.root).resolve() != root.resolve():
+                raise ModelContractError("trained_model_set_root_mismatch")
         except Exception as exc:
             raise ModelContractError(
-                "ferebus_quality_manifest_invalid: "
+                "trained_model_set_invalid: "
                 + type(exc).__name__
                 + ": "
                 + str(exc)
@@ -436,12 +341,26 @@ def validate_ferebus_model_contract(
             ):
                 if key in raw_task:
                     _resolve_under(root, Path(str(raw_task[key])), "ferebus_" + key)
+    committed_tasks = (
+        {} if model_set is None else {task.key: task for task in model_set.tasks}
+    )
     expected_models = set()
     model_paths: List[Tuple[FerebusTask, Path]] = []
     for task in tasks:
-        config_path = _config_path_for(root, task, committed=committed)
-        model_path = _model_path_for(root, task, committed=committed)
-        if not committed:
+        if committed:
+            committed_task = committed_tasks.get(task.key)
+            if committed_task is None:
+                raise ModelContractError(
+                    "committed_model_task_missing: "
+                    + task.property
+                    + "/"
+                    + task.atom
+                )
+            config_path = committed_task.config.path
+            model_path = committed_task.model.path
+        else:
+            config_path = _config_path_for(root, task, committed=False)
+            model_path = _model_path_for(root, task, committed=False)
             config_path = _resolve_under(root, config_path, "ferebus_config")
             model_path = _resolve_under(root, model_path, "ferebus_model")
         expected_models.add(model_path.resolve())
@@ -472,16 +391,7 @@ def validate_ferebus_model_contract(
                 + str(exc)
             ) from exc
 
-    actual_models = set()
-    for p in root.rglob("*.model"):
-        if committed:
-            try:
-                rel_parts = p.relative_to(root).parts
-            except ValueError:
-                rel_parts = ()
-            if FEREBUS_COMMITTED_ARTEFACTS_DIRNAME in rel_parts:
-                continue
-        actual_models.add(p.resolve())
+    actual_models = {p.resolve() for p in root.rglob("*.model")}
     extra_models = actual_models - expected_models
     if extra_models:
         raise ModelContractError(
@@ -491,7 +401,7 @@ def validate_ferebus_model_contract(
     expected_keys = {task.key for task in tasks}
     if committed:
         try:
-            models = Models(root)
+            models = Models.from_model_files(root, model_set.model_paths)
             loaded = list(models)
         except Exception as exc:
             raise ModelContractError(
@@ -524,11 +434,20 @@ def smoke_total_energy_posterior(
 ) -> Any:
     """Load committed models and prove the total-energy posterior evaluates."""
     from ichor.core.adversarial.posterior import TotalEnergyPosterior
-    from ichor.core.models import Models
+    from ..versioning.trained_models import load_trained_models
 
     root = Path(models_dir)
     try:
-        models = Models(root)
+        version = _version_from_iteration_dir(root)
+        if version is None:
+            raise ModelContractError("posterior_model_version_unparseable")
+        model_set, models = load_trained_models(
+            root.parent.parent,
+            version,
+            verification="deep",
+        )
+        if model_set.root != root.resolve():
+            raise ModelContractError("posterior_model_root_mismatch")
         posterior = TotalEnergyPosterior(models, property_name=str(property_name))
     except Exception as exc:
         raise ModelContractError(

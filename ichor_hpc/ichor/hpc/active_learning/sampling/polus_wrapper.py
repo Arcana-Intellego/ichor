@@ -237,7 +237,7 @@ def _build_phase_b_posterior(campaign, config):
     """Load the current committed FEREBUS models for acquisition_weighted."""
     from ..daemon.state import DEFAULT_STATE_FILENAME, read_state
     from ichor.core.adversarial.posterior import TotalEnergyPosterior
-    from ichor.core.models import Models
+    from ..versioning.trained_models import load_trained_models
 
     state_path = (
         Path(campaign)
@@ -249,18 +249,16 @@ def _build_phase_b_posterior(campaign, config):
     models_version = int(getattr(state, "models_version", -1))
     if models_version < 0:
         raise FileNotFoundError("state has no committed models_version")
-    models_dir = (
-        Path(campaign)
-        / "6_TRAINED_MODELS"
-        / ("iteration-" + str(models_version).zfill(4))
-    )
-    if not models_dir.is_dir():
-        raise FileNotFoundError("models directory not found: " + str(models_dir))
     property_name = str(config.acquisition.property_name)
     from ..daemon.artifact_contracts import verify_committed_model_version
     verify_committed_model_version(campaign, models_version)
+    _, models = load_trained_models(
+        campaign,
+        models_version,
+        verification="deep",
+    )
     return TotalEnergyPosterior(
-        Models(models_dir),
+        models,
         property_name=property_name,
         scaled=bool(config.acquisition.use_scaled_posterior_covariance),
     )

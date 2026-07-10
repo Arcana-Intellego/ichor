@@ -33,7 +33,6 @@ from ichor.hpc.active_learning.handoff_manifests import (
     write_ariadne_results_manifest,
 )
 from ichor.hpc.active_learning.versioning.provenance import write_seed_provenance
-from ichor.hpc.active_learning.versioning.versioned_directory import VersionedDirectory
 
 
 def _campaign_with_config(tmp_path) -> Path:
@@ -44,15 +43,81 @@ def _campaign_with_config(tmp_path) -> Path:
 
 
 def _commit_training_and_model_versions(campaign: Path, versions):
-    training = VersionedDirectory(campaign / "QM_REFERENCE_DATA")
-    models = VersionedDirectory(campaign / "6_TRAINED_MODELS")
-    for version in versions:
-        staged = training.stage(None, int(version))
-        (staged / "marker.txt").write_text("training", encoding="utf-8")
-        training.commit(int(version))
-        staged = models.stage(None, int(version))
-        (staged / "marker.txt").write_text("model", encoding="utf-8")
-        models.commit(int(version))
+    if list(versions) != [0]:
+        raise ValueError("CLI fixture helper currently supports version 0 only")
+    from ichor.hpc.active_learning.daemon import input_staging as stg
+    from ichor.hpc.active_learning.daemon.dry_run_executor import DryRunPhaseExecutor
+    from ichor.hpc.active_learning.point_allocation import (
+        create_point_allocation,
+        pending_attempts,
+        point_allocation_path,
+        record_quantum_results,
+    )
+    from ichor.hpc.active_learning.versioning.provenance import (
+        enrich_with_point_allocation,
+    )
+
+    allocation_path = point_allocation_path(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+    )
+    allocation = create_point_allocation(
+        allocation_path,
+        campaign_uid="cli-test",
+        context="bootstrap",
+        iteration=0,
+        targets={"train": 1, "int_val": 0, "ext_val": 0, "total": 1},
+        primary_candidates=[
+            {
+                "candidate_id": "cli-bootstrap-0",
+                "frame_id": 0,
+                "pointdir_name": "POINT_0000.pointdir",
+            }
+        ],
+        reserve_candidates=[],
+    )
+    attempt = pending_attempts(allocation)[0]
+    pointdir = campaign / ".DATA" / "STAGING" / "initial" / "POINT_0000.pointdir"
+    pointdir.mkdir(parents=True, exist_ok=True)
+    (pointdir / "fixture.txt").write_text("reference\n", encoding="utf-8")
+    write_seed_provenance(
+        pointdir,
+        campaign_uid="cli-test",
+        iteration=0,
+        trajectory_sha256="0" * 64,
+        seed_frame_id=0,
+        seed_selection_origin="cli_fixture",
+        seed_variance_at_selection=None,
+        subspace_neighbour_frame_ids=[],
+        subspace_dimension=0,
+        subspace_eigenvalues=[],
+    )
+    enrich_with_point_allocation(
+        pointdir,
+        candidate_id=str(attempt["candidate_id"]),
+        context="bootstrap",
+        slot_id=int(attempt["slot_id"]),
+        split=str(attempt["split"]),
+    )
+    record_quantum_results(
+        allocation_path,
+        [
+            {
+                "candidate_id": str(attempt["candidate_id"]),
+                "accepted": True,
+                "pointdir": str(pointdir.resolve()),
+            }
+        ],
+    )
+    stg.commit_initial_reference_data(campaign)
+    config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+    DryRunPhaseExecutor(campaign, config)._commit_dry_model_snapshot(0)
+    import shutil
+
+    shutil.rmtree(campaign / "TRAINED_MODELS" / "iteration-staging")
+    shutil.rmtree(campaign / ".DATA" / "SCRIPTS")
+    shutil.rmtree(campaign / ".DATA" / "STAGING" / "initial")
 
 
 def _write_valid_ariadne_results(campaign: Path, iteration: int = 0):

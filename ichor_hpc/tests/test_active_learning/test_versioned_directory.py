@@ -14,6 +14,10 @@ from ichor.hpc.active_learning.versioning.versioned_directory import (
     STAGING_SUFFIX,
     VersionedDirectory,
 )
+from ichor.hpc.active_learning.versioning.trained_models import (
+    TrainedModelError,
+    TrainedModelVersioning,
+)
 
 
 def _new_setup(tmp_path: Path) -> VersionedDirectory:
@@ -26,6 +30,30 @@ def test_iteration_name_pads_width():
     v = VersionedDirectory(Path("."), prefix="iter", name_width=5)
     assert v.iteration_name(7) == "iter-00007"
     assert v.staging_name(7) == "iter-00007.staging"
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [
+        (9, "iteration-000009"),
+        (9999, "iteration-009999"),
+        (10000, "iteration-010000"),
+        (999999, "iteration-999999"),
+        (1000000, "iteration-1000000"),
+    ],
+)
+def test_default_iteration_name_uses_six_digit_minimum(version, expected):
+    assert VersionedDirectory(Path(".")).iteration_name(version) == expected
+
+
+def test_iteration_name_rejects_negative_and_boolean_versions():
+    versioning = VersionedDirectory(Path("."))
+    with pytest.raises(ValueError, match="non-negative integer"):
+        versioning.iteration_name(-1)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        versioning.iteration_name(True)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        versioning.iteration_name(1.5)
 
 
 def test_stage_creates_empty_initial_iteration(tmp_path):
@@ -121,6 +149,13 @@ def test_list_committed_versions_excludes_staging(tmp_path):
     assert v.list_committed_versions() == [0]
 
 
+def test_list_committed_versions_rejects_noncanonical_padding(tmp_path):
+    versioning = _new_setup(tmp_path)
+    (versioning.parent / "iteration-0000").mkdir()
+    with pytest.raises(ValueError, match="non-canonical version directory"):
+        versioning.list_committed_versions()
+
+
 def test_list_dangling_staging_returns_only_staging_dirs(tmp_path):
     v = _new_setup(tmp_path)
     v.stage(None, 0)
@@ -128,7 +163,17 @@ def test_list_dangling_staging_returns_only_staging_dirs(tmp_path):
     # And a committed one which must NOT appear.
     v.stage(None, 2); v.commit(2)
     dangling = v.list_dangling_staging()
-    assert sorted(p.name for p in dangling) == ["iteration-0000.staging", "iteration-0001.staging"]
+    assert sorted(p.name for p in dangling) == [
+        "iteration-000000.staging",
+        "iteration-000001.staging",
+    ]
+
+
+def test_list_dangling_staging_rejects_noncanonical_padding(tmp_path):
+    versioning = _new_setup(tmp_path)
+    (versioning.parent / "iteration-0000.staging").mkdir()
+    with pytest.raises(ValueError, match="non-canonical version staging"):
+        versioning.list_dangling_staging()
 
 
 def test_recover_dangling_staging_removes_them(tmp_path):
@@ -136,7 +181,10 @@ def test_recover_dangling_staging_removes_them(tmp_path):
     v.stage(None, 0)
     v.stage(None, 1)
     removed = v.recover_dangling_staging()
-    assert sorted(p.name for p in removed) == ["iteration-0000.staging", "iteration-0001.staging"]
+    assert sorted(p.name for p in removed) == [
+        "iteration-000000.staging",
+        "iteration-000001.staging",
+    ]
     assert not v.staging_path(0).exists()
     assert not v.staging_path(1).exists()
 
@@ -156,6 +204,25 @@ def test_update_current_and_read_back(tmp_path):
     assert v.current_version() == 0
 
 
+def test_current_pointer_rejects_path_bearing_target(tmp_path):
+    versioning = _new_setup(tmp_path)
+    versioning.stage(None, 0)
+    versioning.commit(0)
+    (versioning.parent / ".current.pointer").write_text(
+        "../iteration-000000\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="version basename"):
+        versioning.current_version()
+
+
+def test_commit_rejects_non_directory_target(tmp_path):
+    versioning = _new_setup(tmp_path)
+    versioning.stage(None, 0)
+    versioning.iteration_path(0).write_text("collision\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="not a regular directory"):
+        versioning.commit(0)
+
+
 def test_update_current_overwrites_previous(tmp_path):
     v = _new_setup(tmp_path)
     v.stage(None, 0); v.commit(0)
@@ -164,6 +231,18 @@ def test_update_current_overwrites_previous(tmp_path):
     assert v.current_version() == 0
     v.update_current(1)
     assert v.current_version() == 1
+
+
+def test_trained_model_current_pointer_cannot_move_backwards(tmp_path):
+    versioning = TrainedModelVersioning(tmp_path / "TRAINED_MODELS")
+    versioning.iteration_path(0).mkdir(parents=True)
+    versioning.iteration_path(1).mkdir()
+
+    with pytest.raises(TrainedModelError, match="only target newest version 1"):
+        versioning.update_current(0)
+
+    versioning.update_current(1)
+    assert versioning.current_version() == 1
 
 
 def test_update_current_raises_when_target_missing(tmp_path):

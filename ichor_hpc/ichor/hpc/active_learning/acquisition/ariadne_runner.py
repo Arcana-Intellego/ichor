@@ -2175,7 +2175,11 @@ def main(argv=None) -> int:
     from ..config import CampaignConfig
     from ..acquisition.trajectory_pool import TrajectoryPool
     from ..daemon.state import read_state, DEFAULT_STATE_FILENAME
-    from ichor.core.models import Models
+    from ..versioning.trained_models import (
+        TrainedModelVersioning,
+        load_trained_models,
+    )
+    from ..layout import trained_models_dir
 
     config = CampaignConfig.from_yaml(cfg_path)
 
@@ -2206,17 +2210,20 @@ def main(argv=None) -> int:
             file=_sys.stderr,
         )
         return 3
-    models_dir = (
-        campaign / "6_TRAINED_MODELS"
-        / ("iteration-" + str(int(state.models_version)).zfill(4))
-    )
+    models_dir = TrainedModelVersioning(
+        trained_models_dir(campaign)
+    ).iteration_path(int(state.models_version))
     if not _await_exists(lambda: models_dir.is_dir()):
         print(
             "models directory not found: " + str(models_dir),
             file=_sys.stderr,
         )
         return 3
-    models = Models(models_dir)
+    _, models = load_trained_models(
+        campaign,
+        int(state.models_version),
+        verification="deep",
+    )
 
     iter_dir = (
         campaign / "7_ACTIVE_LEARNING"

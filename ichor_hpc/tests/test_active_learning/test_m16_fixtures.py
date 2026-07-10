@@ -100,9 +100,11 @@ def test_aimall_validator_accepts_clean_fixture():
 
 
 def test_ferebus_validator_accepts_clean_fixture(tmp_path):
+    import hashlib
+
     root = tmp_path / "ferebus_staging"
     model_dir = root / "iqa" / "O1"
-    model_dir.mkdir(parents=True)
+    (model_dir / "datasets").mkdir(parents=True)
     (model_dir / "ferebus.config").write_text("config\n", encoding="utf-8")
     model = model_dir / "WATER_iqa_O1.model"
     rows = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
@@ -153,17 +155,65 @@ def test_ferebus_validator_accepts_clean_fixture(tmp_path):
         ]) + "\n",
         encoding="utf-8",
     )
+    dataset_records = {}
+    for split, suffix, nrows in (
+        ("train", "TRAINING_SET", 2),
+        ("int_val", "INT_VALIDATION_SET", 0),
+        ("ext_val", "EXT_VALIDATION_SET", 0),
+    ):
+        dataset = model_dir / "datasets" / ("WATER_O1_" + suffix + ".csv")
+        dataset.write_text(
+            "f1,f2,f3,iqa\n" + "0.1,0.2,0.3,0.0\n" * nrows,
+            encoding="utf-8",
+        )
+        dataset_records[split] = {
+            "path": dataset.relative_to(root).as_posix(),
+            "size": dataset.stat().st_size,
+            "sha256": hashlib.sha256(dataset.read_bytes()).hexdigest(),
+            "rows": nrows,
+        }
     (root / stg.FEREBUS_TASK_MANIFEST).write_text(
         __import__("json").dumps({
             "schema_version": stg.FEREBUS_TASK_SCHEMA_VERSION,
+            "campaign_uid": "fixture-test",
             "system": "WATER",
+            "reference_data_version": 0,
+            "reference_data_head_manifest_sha256": "a" * 64,
+            "reference_data_view_sha256": "b" * 64,
+            "n_reference_points": 2,
+            "pointdir_row_order": [
+                "POINT_000000.pointdir",
+                "POINT_000001.pointdir",
+            ],
+            "properties": ["iqa"],
+            "atoms": ["O1"],
+            "n_atoms": 1,
+            "n_tasks": 1,
             "tasks": [{
+                "task_index": 1,
                 "property": "iqa",
                 "atom": "O1",
                 "alf_1_indexed": [1, 2, 3],
-                "config_path": str(model_dir / "ferebus.config"),
-                "expected_model_path": str(model),
-                "row_counts": {"train": 2},
+                "alf_cli": "1_2_3",
+                "property_dir": "iqa",
+                "output_dir": "iqa/O1",
+                "input_dir": "iqa/O1/datasets",
+                "config_path": "iqa/O1/ferebus.config",
+                "expected_model_path": "iqa/O1/WATER_iqa_O1.model",
+                "training_csv": "iqa/O1/datasets/WATER_O1_TRAINING_SET.csv",
+                "int_validation_csv": "iqa/O1/datasets/WATER_O1_INT_VALIDATION_SET.csv",
+                "ext_validation_csv": "iqa/O1/datasets/WATER_O1_EXT_VALIDATION_SET.csv",
+                "command_args": [
+                    "-c", "iqa/O1/ferebus.config",
+                    "-I", "iqa/O1/datasets",
+                    "-O", "iqa/O1",
+                    "-P", "iqa",
+                    "-A", "O1",
+                    "-ALF", "1_2_3",
+                ],
+                "row_counts": {"train": 2, "int_val": 0, "ext_val": 0},
+                "row_ids": {"train": [0, 1], "int_val": [], "ext_val": []},
+                "datasets": dataset_records,
             }],
         }),
         encoding="utf-8",

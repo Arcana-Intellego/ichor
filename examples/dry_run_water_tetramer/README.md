@@ -68,14 +68,17 @@ like `expected_journal_tail.txt` (your timestamps + JobIDs will differ).
 
 ## What to look at next
 
-- `QM_REFERENCE_DATA/iteration-NNNN/` -- immutable QM reference-data delta for
+- `QM_REFERENCE_DATA/iteration-NNNNNN/` -- immutable QM reference-data delta for
   that version. It contains only newly accepted pointdirs, a SHA-pinned
   `REFERENCE_DATA_VERSION.json`, its point-allocation history, and the generic
   directory manifest. The authoritative resolver reconstructs cumulative
-  order from versions `0000..NNNN`; it never copies older pointdirs forward.
+  order from versions `000000..NNNNNN`; it never copies older pointdirs forward.
 - `.DATA/ACTIVE_LEARNING/reference_data_view_cache.json` -- a derived view
   cache. It may be deleted at any time and is rebuilt from the version chain.
-- `6_TRAINED_MODELS/iteration-NNNN/` -- per-iteration model commit.
+- `TRAINED_MODELS/iteration-NNNNNN/` -- immutable complete model snapshot.
+  `FEREBUS_TASK_ARTEFACTS.json` binds the exact models to the reference-data
+  view and split rows; model/config/auxiliary files are colocated under
+  `<property>/<atom>/`.
 - `7_ACTIVE_LEARNING/iteration-NNNN/pool/seed_*/.provenance.json` -- full
   per-seed provenance trail (which frame_id, which subspace, which ARIADNE
   result, anti-overlap flag, phase-B diversity rank).
@@ -91,7 +94,7 @@ like `expected_journal_tail.txt` (your timestamps + JobIDs will differ).
 To wipe the dry-run output and start over:
 
 ```
-rm -rf .DATA 3_DIVERSITY_SAMPLING QM_REFERENCE_DATA 6_TRAINED_MODELS 7_ACTIVE_LEARNING
+rm -rf .DATA 3_DIVERSITY_SAMPLING QM_REFERENCE_DATA TRAINED_MODELS 7_ACTIVE_LEARNING
 ```
 
 Then repeat steps 1-3 above. The .gitignore already excludes these

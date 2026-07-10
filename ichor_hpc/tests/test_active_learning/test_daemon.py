@@ -274,7 +274,7 @@ def test_tick_initialises_state_on_first_call(tmp_path):
 
 def test_tick_refuses_fresh_state_when_campaign_has_committed_artifacts(tmp_path):
     d = _make_daemon(tmp_path)
-    committed = d.campaign_dir / "QM_REFERENCE_DATA" / "iteration-0000"
+    committed = d.campaign_dir / "QM_REFERENCE_DATA" / "iteration-000000"
     committed.mkdir(parents=True)
     (committed / "marker.txt").write_text("training\n", encoding="utf-8")
 

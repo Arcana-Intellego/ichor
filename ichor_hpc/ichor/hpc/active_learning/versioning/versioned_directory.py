@@ -18,6 +18,7 @@ from .manifest import (
     verify_manifest,
     write_manifest,
 )
+from ..layout import COMMITTED_VERSION_NAME_WIDTH
 
 
 DEFAULT_PREFIX = "iteration"
@@ -31,10 +32,24 @@ _VERSION_RE = re.compile(r"^(?P<prefix>[a-zA-Z0-9_-]+)-(?P<version>\d+)$")
 class VersionedDirectory:
     parent: Path
     prefix: str = DEFAULT_PREFIX
-    name_width: int = 4
+    name_width: int = COMMITTED_VERSION_NAME_WIDTH
+
+    def _version(self, version: int) -> int:
+        if isinstance(version, bool):
+            raise ValueError("version must be a non-negative integer")
+        if isinstance(version, float) and not version.is_integer():
+            raise ValueError("version must be a non-negative integer")
+        try:
+            parsed = int(version)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("version must be a non-negative integer") from exc
+        if parsed < 0:
+            raise ValueError("version must be a non-negative integer")
+        return parsed
 
     def iteration_name(self, version: int) -> str:
-        return f"{self.prefix}-{int(version):0{self.name_width}d}"
+        parsed = self._version(version)
+        return f"{self.prefix}-{parsed:0{self.name_width}d}"
 
     def iteration_path(self, version: int) -> Path:
         return Path(self.parent) / self.iteration_name(version)
@@ -56,22 +71,56 @@ class VersionedDirectory:
         if not self.parent.exists():
             return result
         for child in self.parent.iterdir():
-            if not child.is_dir() or child.name.endswith(STAGING_SUFFIX):
+            if child.name.endswith(STAGING_SUFFIX):
                 continue
             match = _VERSION_RE.match(child.name)
             if match is None or match.group("prefix") != self.prefix:
                 continue
-            result.append(int(match.group("version")))
+            if child.is_symlink() or not child.is_dir():
+                raise ValueError(
+                    "version entry is not a regular directory: " + str(child)
+                )
+            version = int(match.group("version"))
+            expected = self.iteration_name(version)
+            if child.name != expected:
+                raise ValueError(
+                    "non-canonical version directory name: "
+                    + child.name
+                    + "; expected "
+                    + expected
+                )
+            result.append(version)
+        if len(result) != len(set(result)):
+            raise ValueError("duplicate numeric versions under " + str(self.parent))
         return sorted(result)
 
     def list_dangling_staging(self) -> List[Path]:
         if not self.parent.exists():
             return []
-        return sorted(
-            child
-            for child in self.parent.iterdir()
-            if child.is_dir() and child.name.endswith(STAGING_SUFFIX)
-        )
+        result: List[Path] = []
+        for child in self.parent.iterdir():
+            if not child.name.endswith(STAGING_SUFFIX):
+                continue
+            base_name = child.name[: -len(STAGING_SUFFIX)]
+            match = _VERSION_RE.match(base_name)
+            if match is None or match.group("prefix") != self.prefix:
+                continue
+            if child.is_symlink() or not child.is_dir():
+                raise ValueError(
+                    "version staging entry is not a regular directory: "
+                    + str(child)
+                )
+            version = int(match.group("version"))
+            expected = self.staging_name(version)
+            if child.name != expected:
+                raise ValueError(
+                    "non-canonical version staging name: "
+                    + child.name
+                    + "; expected "
+                    + expected
+                )
+            result.append(child)
+        return sorted(result)
 
     def current_version(self) -> Optional[int]:
         link = self.current_link_path()
@@ -81,16 +130,24 @@ class VersionedDirectory:
                 target_name = os.readlink(str(link))
             except OSError:
                 target_name = None
+        elif link.exists():
+            raise ValueError("current path is not a symlink")
         if target_name is None:
             pointer = self._pointer_path()
+            if pointer.is_symlink():
+                raise ValueError("current pointer fallback must not be a symlink")
             if pointer.is_file():
                 target_name = pointer.read_text(encoding="utf-8").strip()
         if not target_name:
             return None
+        if Path(target_name).name != target_name:
+            raise ValueError("current pointer target must be a version basename")
         match = _VERSION_RE.match(Path(target_name).name)
         if match is None or match.group("prefix") != self.prefix:
             return None
         version = int(match.group("version"))
+        if Path(target_name).name != self.iteration_name(version):
+            raise ValueError("current pointer uses a non-canonical version name")
         return version if self.iteration_path(version).is_dir() else None
 
     def stage(self, source_version: Optional[int], target_version: int) -> Path:
@@ -121,7 +178,11 @@ class VersionedDirectory:
     ) -> Dict[str, str]:
         staging = self.staging_path(target_version)
         target = self.iteration_path(target_version)
-        if target.is_dir():
+        if target.exists() or target.is_symlink():
+            if target.is_symlink() or not target.is_dir():
+                raise ValueError(
+                    "commit target is not a regular directory: " + str(target)
+                )
             if staging.is_dir():
                 shutil.rmtree(str(staging), ignore_errors=True)
             return read_manifest(target)
@@ -149,6 +210,10 @@ class VersionedDirectory:
         if platform.system() == "Windows":
             from ..daemon.state import atomic_write_text
 
+            if link.is_symlink():
+                link.unlink()
+            elif link.exists():
+                raise ValueError("current path is not a replaceable symlink")
             atomic_write_text(self._pointer_path(), target.name + "\n")
             return
         tmp_link = link.with_name(
@@ -164,6 +229,9 @@ class VersionedDirectory:
         os.replace(str(tmp_link), str(link))
         from ..daemon.state import _fsync_parent_dir
 
+        pointer = self._pointer_path()
+        if pointer.is_file() or pointer.is_symlink():
+            pointer.unlink()
         _fsync_parent_dir(link)
 
     def ensure_current(self, target_version: int) -> bool:

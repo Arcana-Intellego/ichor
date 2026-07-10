@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from ..acquisition.trajectory_pool import TrajectoryPool
+from ..versioning.reference_data import ReferenceDataVersioning
 from ..handoff_manifests import (
     read_ariadne_results_manifest,
     read_phase_a_sample_manifest,
@@ -1023,7 +1024,11 @@ def select_recovery_phase(
                 CampaignPhase.INITIAL_FEREBUS,
                 0,
                 "INITIAL_FEREBUS: committed bootstrap training exists without model version 0",
-                "QM_REFERENCE_DATA/iteration-0000",
+                str(
+                    ReferenceDataVersioning(
+                        campaign / "QM_REFERENCE_DATA"
+                    ).iteration_path(0).relative_to(campaign)
+                ),
             )
 
     if reference_data_version == model_version and reference_data_version >= 1:
@@ -1054,8 +1059,12 @@ def select_recovery_phase(
             return RecoveryDecision(
                 CampaignPhase.FEREBUS,
                 max(0, reference_data_version - 1),
-                "FEREBUS: committed training is one version ahead of committed models",
-                "QM_REFERENCE_DATA/iteration-" + str(reference_data_version).zfill(4),
+                "FEREBUS: committed reference data is one version ahead of committed models",
+                str(
+                    ReferenceDataVersioning(
+                        campaign / "QM_REFERENCE_DATA"
+                    ).iteration_path(reference_data_version)
+                ),
             )
 
     if existing_loaded:

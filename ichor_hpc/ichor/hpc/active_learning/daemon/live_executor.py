@@ -29,6 +29,7 @@ import sys
 import math
 import re
 from dataclasses import dataclass, field
+from functools import wraps
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Sequence
@@ -48,6 +49,10 @@ from ..versioning.provenance import (
     enrich_with_phase_b,
     validate_provenance,
     write_seed_provenance,
+)
+from ..versioning.trained_models import (
+    TRAINED_MODEL_AUXILIARY_SUFFIXES,
+    TRAINED_MODEL_SET_FILENAME,
 )
 from .dry_run_executor import (
     DryRunPhaseExecutor,
@@ -124,8 +129,8 @@ DEFAULT_DAEMON_RUNTIME_MODULES: List[str] = (
 _MODULE_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/+-]*(?: [A-Za-z0-9][A-Za-z0-9_.:/+-]*)*$")
 _SHEBANG_RE = re.compile(r"^#![A-Za-z0-9_./ -]+$")
 _SHELL_PATH_FRAGMENT_RE = re.compile(r"^[A-Za-z0-9_./${}:+-]+$")
-FEREBUS_TASK_ARTEFACTS_MANIFEST = "FEREBUS_TASK_ARTEFACTS.json"
-FEREBUS_TASK_AUXILIARY_SUFFIXES = ("opt", "perf", "pred", "scurve", "sol")
+FEREBUS_TASK_ARTEFACTS_MANIFEST = TRAINED_MODEL_SET_FILENAME
+FEREBUS_TASK_AUXILIARY_SUFFIXES = TRAINED_MODEL_AUXILIARY_SUFFIXES
 
 
 def _iteration_active_learning_dir(campaign_dir: Path, iteration: int) -> Path:
@@ -252,27 +257,23 @@ def _write_ferebus_task_artefact_layout(
     staging: Path,
     committed_dir: Path,
     manifest: Dict[str, Any],
+    *,
+    models_version: int,
+    parent_model_set: Any,
 ) -> Path:
-    """Copy non-canonical FEREBUS diagnostics into a per-task archive tree.
-
-    The flat ``*.model`` and ``ferebus_<property>_<atom>.config`` files remain
-    the only canonical model-loader inputs. This helper archives only
-    ``*.opt``, ``*.perf``, ``*.pred``, ``*.scurve``, and ``*.sol`` files beneath
-    ``task_artefacts/<property>/<atom>/``.
-    """
+    """Build one complete hierarchical committed FEREBUS model snapshot."""
     from . import input_staging as _stg
-    from .model_contract import FEREBUS_COMMITTED_ARTEFACTS_DIRNAME
+    from .ferebus_quality import FEREBUS_QUALITY_MANIFEST
+    from ..versioning.trained_models import (
+        build_trained_model_set_payload,
+        file_record,
+    )
 
     staging = Path(staging)
     committed_dir = Path(committed_dir)
-    artefacts_root = committed_dir / FEREBUS_COMMITTED_ARTEFACTS_DIRNAME
-    if artefacts_root.exists():
-        if artefacts_root.parent.resolve(strict=False) != committed_dir.resolve(strict=False):
-            raise BackendSubmissionError("ferebus_artefact_archive_path_invalid")
-        shutil.rmtree(artefacts_root)
-    artefacts_root.mkdir(parents=True, exist_ok=True)
-
-    records: List[Dict[str, Any]] = []
+    if any(committed_dir.iterdir()):
+        raise BackendSubmissionError("trained-model version staging is not empty")
+    task_records: List[Dict[str, Any]] = []
     for task in manifest.get("tasks", []):
         prop = str(task.get("property"))
         atom = str(task.get("atom"))
@@ -298,11 +299,17 @@ def _write_ferebus_task_artefact_layout(
         ])
         task_dir = _resolve_ferebus_destination(
             committed_dir,
-            artefacts_root / prop / atom,
+            committed_dir / prop / atom,
             "task artefact directory",
         )
         task_dir.mkdir(parents=True, exist_ok=True)
-        files: Dict[str, Optional[str]] = {}
+        committed_model = task_dir / model_file.name
+        committed_config = task_dir / (
+            "ferebus_" + prop + "_" + atom + ".config"
+        )
+        _copy_regular_file_no_symlink(model_file, committed_model, committed_dir)
+        _copy_regular_file_no_symlink(config_path, committed_config, committed_dir)
+        auxiliary: Dict[str, Optional[Dict[str, Any]]] = {}
         for suffix in FEREBUS_TASK_AUXILIARY_SUFFIXES:
             source = _find_ferebus_auxiliary_file(
                 staging,
@@ -311,39 +318,82 @@ def _write_ferebus_task_artefact_layout(
                 suffix,
             )
             if source is None:
-                files[suffix] = None
+                auxiliary[suffix] = None
                 continue
             dest = task_dir / source.name
             _copy_regular_file_no_symlink(source, dest, committed_dir)
-            files[suffix] = dest.relative_to(committed_dir).as_posix()
-        records.append(
+            auxiliary[suffix] = file_record(dest, committed_dir)
+        task_records.append(
             {
+                "task_index": int(task.get("task_index")),
                 "property": prop,
                 "atom": atom,
+                "alf_1_indexed": [int(value) for value in task.get("alf_1_indexed", [])],
                 "directory": task_dir.relative_to(committed_dir).as_posix(),
-                "canonical_model": model_file.name,
-                "canonical_config": "ferebus_" + prop + "_" + atom + ".config",
-                "files": files,
+                "model": file_record(committed_model, committed_dir),
+                "config": file_record(committed_config, committed_dir),
+                "auxiliary": auxiliary,
             }
         )
-
-    manifest_path = artefacts_root / FEREBUS_TASK_ARTEFACTS_MANIFEST
-    atomic_write_json(
-        manifest_path,
-        {
-            "schema_version": 1,
-            "reference_data_version": manifest.get("reference_data_version"),
-            "reference_data_head_manifest_sha256": manifest.get(
-                "reference_data_head_manifest_sha256"
-            ),
-            "reference_data_view_sha256": manifest.get(
-                "reference_data_view_sha256"
-            ),
-            "n_tasks": len(records),
-            "tasks": records,
-        },
+    sidecar_names = (
+        _stg.FEREBUS_TASK_MANIFEST,
+        _stg.FEREBUS_JOB_DETAILS,
+        "commands",
+        "list.txt",
+        "runFerebus.sh",
+        "ATOMS.txt",
+        "PROPERTIES.txt",
+        FEREBUS_QUALITY_MANIFEST,
     )
+    root_records: List[Dict[str, Any]] = []
+    for sidecar_name in sidecar_names:
+        source = staging / sidecar_name
+        if not source.is_file():
+            if sidecar_name in {
+                _stg.FEREBUS_TASK_MANIFEST,
+                FEREBUS_QUALITY_MANIFEST,
+            }:
+                raise BackendSubmissionError(
+                    "required FEREBUS sidecar is missing: " + str(source)
+                )
+            continue
+        destination = committed_dir / sidecar_name
+        _copy_regular_file_no_symlink(source, destination, committed_dir)
+        root_records.append(file_record(destination, committed_dir))
+    root_records.sort(key=lambda record: str(record["path"]))
+    root_record_by_path = {str(record["path"]): record for record in root_records}
+    payload = build_trained_model_set_payload(
+        campaign_uid=str(manifest.get("campaign_uid") or ""),
+        version=int(models_version),
+        system=str(manifest.get("system") or ""),
+        reference_data_head_manifest_sha256=str(
+            manifest.get("reference_data_head_manifest_sha256") or ""
+        ),
+        reference_data_view_sha256=str(
+            manifest.get("reference_data_view_sha256") or ""
+        ),
+        parent=parent_model_set,
+        source_task_manifest=root_record_by_path[_stg.FEREBUS_TASK_MANIFEST],
+        quality_manifest=root_record_by_path[FEREBUS_QUALITY_MANIFEST],
+        properties=[str(value) for value in manifest.get("properties", [])],
+        atoms=[str(value) for value in manifest.get("atoms", [])],
+        tasks=task_records,
+        root_files=root_records,
+    )
+    manifest_path = committed_dir / FEREBUS_TASK_ARTEFACTS_MANIFEST
+    atomic_write_json(manifest_path, payload)
     return manifest_path
+
+
+def _with_trained_models_commit_lock(method):
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        from ..versioning.trained_models import trained_models_commit_lock
+
+        with trained_models_commit_lock(self.campaign_dir):
+            return method(self, *args, **kwargs)
+
+    return locked
 
 
 def _without_keys(payload: Any, *keys: str) -> Dict[str, Any]:
@@ -1589,11 +1639,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             from pathlib import Path as _Path
             from .model_contract import smoke_total_energy_posterior
             from .artifact_contracts import verify_committed_model_version
-            models_dir = (
-                _Path(self.campaign_dir)
-                / self.models_dir_name
-                / ("iteration-" + str(models_version).zfill(4))
-            )
+            from ..versioning.trained_models import TrainedModelVersioning
+
+            models_dir = TrainedModelVersioning(
+                _Path(self.campaign_dir) / self.models_dir_name
+            ).iteration_path(models_version)
             if not models_dir.is_dir():
                 raise BackendSubmissionError(
                     "committed models directory missing for seed selection: "
@@ -2038,7 +2088,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
           - records the combined Gaussian/AIMAll outcome in the exact point
             allocation after AIMAll.
 
-        Does NOT commit anything to QM_REFERENCE_DATA / 6_TRAINED_MODELS itself --
+        Does NOT commit anything to QM_REFERENCE_DATA / TRAINED_MODELS itself --
         that lives in the subsequent INITIAL_FEREBUS / APPEND / FEREBUS
         phases. Rejection counts are allocation-managed: failed slots proceed
         to bounded reserve replacement instead of tripping a batch-level
@@ -2320,7 +2370,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
         FEREBUS writes a .model file (single artefact per training run)
         to this canonical location; the parser validates and atomically
-        renames it into 6_TRAINED_MODELS/iteration-NNNN/ via the
+        renames it into TRAINED_MODELS/iteration-NNNNNN/ via the
         VersionedDirectory helper.
         """
         from pathlib import Path as _Path
@@ -2363,7 +2413,6 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         """
         from ..acquisition.trajectory_pool import TrajectoryPool
         from ichor.core.adversarial.acquisition import SeedLocalAdversarialAcquisition
-        from ichor.core.models import Models
         from pathlib import Path as _Path
         from .model_contract import validate_reference_scales
         from .artifact_contracts import verify_committed_model_version
@@ -2403,11 +2452,14 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         # load the committed models for this iteration. trying to do this
         # before the policy check would be wasted work on the no-refresh
         # branch.
-        models_dir = (
-            _Path(self.campaign_dir)
-            / self.models_dir_name
-            / ("iteration-" + str(models_version).zfill(4))
+        from ..versioning.trained_models import (
+            TrainedModelVersioning,
+            load_trained_models,
         )
+
+        models_dir = TrainedModelVersioning(
+            _Path(self.campaign_dir) / self.models_dir_name
+        ).iteration_path(models_version)
         if not models_dir.is_dir():
             message = "reference scales require committed models: " + str(models_dir)
             if allow_uniform:
@@ -2442,7 +2494,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             ) from exc
 
         try:
-            models = Models(models_dir)
+            _, models = load_trained_models(
+                self.campaign_dir,
+                models_version,
+                verification="deep",
+            )
             pool = TrajectoryPool.load(_Path(self.campaign_dir))
         except Exception as exc:
             self._journal_event(
@@ -2549,17 +2605,17 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
     # --- FEREBUS parser body -------------------------------------------
 
+    @_with_trained_models_commit_lock
     def _parse_ferebus_postprocess(self, state, phase, observations):
         """Parse FEREBUS output, validate the .model file, commit
-        a new 6_TRAINED_MODELS/iteration-NNNN/ via VersionedDirectory.
+        a new TRAINED_MODELS/iteration-NNNNNN/ via VersionedDirectory.
 
         For INITIAL_FEREBUS this is iteration 0 of both QM_REFERENCE_DATA and
-        6_TRAINED_MODELS (the initial-quantum stage already produced the
-        pointdirs that go into QM_REFERENCE_DATA/iteration-0). For FEREBUS this
-        is a per iteration commit of 6_TRAINED_MODELS only.
+        TRAINED_MODELS (the initial-quantum stage already produced the
+        pointdirs that go into QM_REFERENCE_DATA/iteration-000000). For FEREBUS this
+        is a per-iteration commit of TRAINED_MODELS only.
 
         """
-        from pathlib import Path as _Path
         from .phase_executor import PhaseResult
 
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
@@ -2581,15 +2637,25 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 )
         if expected_next in committed:
             next_version = int(expected_next)
-            v_models.ensure_current(next_version)
             committed_dir = v_models.iteration_path(next_version)
             try:
                 from .model_contract import validate_ferebus_model_contract
+                from ..versioning.trained_models import seal_trained_model_version
+
                 validate_ferebus_model_contract(
                     committed_dir,
                     committed=True,
                     expected_version=next_version,
                 )
+                resolved_model_set = v_models.resolve(
+                    next_version,
+                    verification="deep",
+                )
+                seal_trained_model_version(committed_dir)
+                newest_version = max(committed)
+                if newest_version != next_version:
+                    v_models.resolve(newest_version, verification="deep")
+                v_models.ensure_current(newest_version)
             except Exception as exc:
                 return PhaseResult(
                     is_complete=True,
@@ -2605,6 +2671,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 phase=phase_name,
                 iteration=int(state.iteration),
                 models_version=int(next_version),
+                model_set_sha256=str(resolved_model_set.model_set_sha256),
+                model_set_manifest_sha256=str(
+                    resolved_model_set.head_manifest_sha256
+                ),
                 idempotent_skip=True,
             )
             state_updates = {"models_version": int(next_version), "validation_set_version": int(next_version)}
@@ -2666,110 +2736,76 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
         v_models.recover_dangling_staging()
         next_version = int(expected_next)
-        source_version = None if is_initial else (
-            max(committed) if committed else None
-        )
-        staged = v_models.stage(
-            source_version=source_version, target_version=next_version,
-        )
-        from . import input_staging as _stg
-        manifest = _stg.read_ferebus_manifest(staging)
-        for task in manifest.get("tasks", []):
-            prop = str(task.get("property"))
-            atom = str(task.get("atom"))
-            try:
-                _stg.validate_safe_path_token("FEREBUS property", prop)
-                _stg.validate_safe_path_token("FEREBUS atom label", atom)
-                model_file = _resolve_ferebus_staging_path(
-                    staging,
-                    task["expected_model_path"],
-                    "model path",
-                )
-            except Exception as exc:
-                return PhaseResult(
-                    is_complete=True,
-                    failure_reason=(
-                        "ferebus_model_copy_failed: "
-                        + type(exc).__name__
-                        + ": "
-                        + str(exc)
-                    ),
-                )
-            target_file = staged / model_file.name
-            try:
-                _copy_regular_file_no_symlink(model_file, target_file, staged)
-            except Exception as exc:
-                return PhaseResult(
-                    is_complete=True,
-                    failure_reason=(
-                        "ferebus_model_copy_failed: "
-                        + type(exc).__name__
-                        + ": "
-                        + str(exc)
-                    ),
-                )
-            try:
-                cfg_file = _resolve_ferebus_staging_path(
-                    staging,
-                    task["config_path"],
-                    "config path",
-                )
-            except Exception as exc:
-                return PhaseResult(
-                    is_complete=True,
-                    failure_reason=(
-                        "ferebus_config_copy_failed: "
-                        + type(exc).__name__
-                        + ": "
-                        + str(exc)
-                    ),
-                )
-            if cfg_file.is_file():
-                cfg_target = staged / ("ferebus_" + prop + "_" + atom + ".config")
-                try:
-                    _copy_regular_file_no_symlink(cfg_file, cfg_target, staged)
-                except Exception as exc:
-                    return PhaseResult(
-                        is_complete=True,
-                        failure_reason=(
-                            "ferebus_config_copy_failed: "
-                            + type(exc).__name__
-                            + ": "
-                            + str(exc)
-                        ),
-                    )
         try:
-            _write_ferebus_task_artefact_layout(staging, staged, manifest)
+            if next_version == 0:
+                if committed:
+                    raise ValueError("bootstrap model snapshot is not the first commit")
+                parent_model_set = None
+            else:
+                if committed != list(range(next_version)):
+                    raise ValueError(
+                        "committed model versions are not contiguous before "
+                        + str(next_version)
+                    )
+                parent_model_set = v_models.resolve(
+                    next_version - 1,
+                    verification="deep",
+                )
+            staged = v_models.stage(
+                source_version=None,
+                target_version=next_version,
+            )
+            if int(staged.stat().st_dev) != int(Path(v_models.parent).stat().st_dev):
+                raise OSError("trained-model staging and final root are on different filesystems")
         except Exception as exc:
             return PhaseResult(
                 is_complete=True,
                 failure_reason=(
-                    "ferebus_task_artefact_archive_failed: "
+                    "trained_model_staging_failed: "
                     + type(exc).__name__
                     + ": "
                     + str(exc)
                 ),
             )
-        for sidecar_name in (
-            _stg.FEREBUS_TASK_MANIFEST,
-            _stg.FEREBUS_JOB_DETAILS,
-            "commands",
-            "list.txt",
-            "runFerebus.sh",
-            "ATOMS.txt",
-            "PROPERTIES.txt",
-            FEREBUS_QUALITY_MANIFEST,
-        ):
-            sidecar = _Path(staging) / sidecar_name
-            if sidecar.is_file():
-                (staged / sidecar_name).write_bytes(sidecar.read_bytes())
+        from . import input_staging as _stg
+        manifest = _stg.read_ferebus_manifest(staging)
+        try:
+            _write_ferebus_task_artefact_layout(
+                staging,
+                staged,
+                manifest,
+                models_version=next_version,
+                parent_model_set=parent_model_set,
+            )
+        except Exception as exc:
+            return PhaseResult(
+                is_complete=True,
+                failure_reason=(
+                    "ferebus_model_snapshot_build_failed: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)
+                ),
+            )
         try:
             from .model_contract import validate_ferebus_model_contract
+            from ..versioning.trained_models import (
+                seal_trained_model_version,
+                validate_trained_model_snapshot,
+            )
 
+            staged_model_set = validate_trained_model_snapshot(
+                self.campaign_dir,
+                staged,
+                next_version,
+                parent=parent_model_set,
+                verification="deep",
+            )
             validate_ferebus_model_contract(
                 staged,
                 committed=True,
                 expected_version=next_version,
+                trained_model_set=staged_model_set,
             )
         except Exception as exc:
             self._journal_event(
@@ -2789,15 +2825,19 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 ),
             )
         v_models.commit(next_version)
-        v_models.update_current(next_version)
         committed_dir = v_models.iteration_path(next_version)
         try:
-            from .model_contract import validate_ferebus_model_contract
+            seal_trained_model_version(committed_dir)
+            committed_model_set = v_models.resolve(
+                next_version,
+                verification="deep",
+            )
             validate_ferebus_model_contract(
                 committed_dir,
                 committed=True,
                 expected_version=next_version,
             )
+            v_models.update_current(next_version)
         except Exception as exc:
             self._journal_event(
                 "quantum_output_rejected",
@@ -2831,6 +2871,16 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             phase=phase_name,
             iteration=int(state.iteration),
             models_version=int(next_version),
+            model_set_sha256=str(committed_model_set.model_set_sha256),
+            model_set_manifest_sha256=str(
+                committed_model_set.head_manifest_sha256
+            ),
+            n_models=int(len(committed_model_set.tasks)),
+            n_properties=int(len(committed_model_set.properties)),
+            n_atoms=int(len(committed_model_set.atoms)),
+            reference_data_view_sha256=str(
+                committed_model_set.reference_data_view_sha256
+            ),
             idempotent_skip=False,
         )
         self._journal_event(
