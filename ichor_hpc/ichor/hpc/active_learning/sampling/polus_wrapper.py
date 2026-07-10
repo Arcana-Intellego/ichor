@@ -193,12 +193,12 @@ def _write_index_file(indices, path):
 
 
 def _phase_b_target_size(config, n_candidates, iteration=0):
-    """Return the fixed final active batch size for Phase-B FPS."""
+    """Return the exact active point-allocation target for Phase-B FPS."""
     del iteration
-    target = int(config.active_batch.final_batch_size)
+    target = int(config.point_allocation.batch_total_size)
     if int(n_candidates) < target:
         raise ValueError(
-            "active_batch_underfilled: wanted final_batch_size="
+            "point_allocation_underfilled: wanted batch_total_size="
             + str(target)
             + " but only "
             + str(int(n_candidates))
@@ -414,7 +414,7 @@ def _phase_b_refill_after_anti_overlap(
     rejected_distances.sort()
     refill = {
         "enabled": True,
-        "target_final_batch_size": int(target_size),
+        "target_batch_total_size": int(target_size),
         "reserve_order_size": int(len(ordered_indices)),
         "reserve_candidates_considered": int(len(considered_indices)),
         "refill_applied": int(len(considered_indices)) > int(target_size),
@@ -434,6 +434,57 @@ def _phase_b_refill_after_anti_overlap(
         ),
         refill,
     )
+
+
+def _phase_b_build_reserve(
+    *,
+    ordered_indices,
+    already_considered_indices,
+    candidate_frames,
+    candidate_records,
+    training,
+    selected_frames,
+    min_separation: float,
+):
+    """Return the remaining safe FPS candidates in deterministic reserve order."""
+    from .anti_overlap import min_distance_to_training
+
+    considered = {int(value) for value in already_considered_indices}
+    accepted_context = list(selected_frames)
+    reserve_indices = []
+    reserve_frames = []
+    reserve_records = []
+    reserve_distances = []
+    rejected = []
+    for candidate_index in ordered_indices:
+        candidate_index = int(candidate_index)
+        if candidate_index in considered:
+            continue
+        frame = candidate_frames[candidate_index]
+        distance = float(
+            min_distance_to_training(frame, list(training) + accepted_context)
+        )
+        if not np.isfinite(distance) or distance < float(min_separation):
+            rejected.append({
+                "candidate_index": candidate_index,
+                "distance_to_nearest_angstrom": (
+                    float(distance) if np.isfinite(distance) else None
+                ),
+                "reason": "min_separation",
+            })
+            continue
+        reserve_indices.append(candidate_index)
+        reserve_frames.append(frame)
+        reserve_records.append(candidate_records[candidate_index])
+        reserve_distances.append(distance)
+        accepted_context.append(frame)
+    return {
+        "candidate_indices": reserve_indices,
+        "frames": reserve_frames,
+        "records": reserve_records,
+        "distances_to_nearest_angstrom": reserve_distances,
+        "rejected": rejected,
+    }
 
 
 def _run_phase_a(campaign, config):
@@ -483,7 +534,7 @@ def _run_phase_a(campaign, config):
         print(str(exc), file=_sys.stderr)
         return 3
 
-    n_select = int(anchor_plan.initial_labelled_size)
+    n_select = int(anchor_plan.bootstrap_total_size)
     pool_select = int(anchor_plan.pool_total_needed)
     excluded_pool_ids = set(int(i) for i in anchor_plan.excluded_pool_frame_ids)
     candidate_pool_ids = [
@@ -491,10 +542,10 @@ def _run_phase_a(campaign, config):
     ]
     if pool_select > len(candidate_pool_ids):
         print(
-            "bootstrap_initial_labelled_size_exceeds_pool: "
-            + "bootstrap.initial_labelled_size="
+            "point_allocation_bootstrap_total_exceeds_pool: "
+            + "point_allocation.bootstrap_total_size="
             + str(n_select)
-            + ", bootstrap.anchor_count="
+            + ", point_allocation.anchor_count="
             + str(int(anchor_plan.n_anchor))
             + ", pool_needed_after_anchors="
             + str(pool_select)
@@ -506,13 +557,16 @@ def _run_phase_a(campaign, config):
 
     descriptor = MassWeightedRMSDDescriptor()
     selected_pool_indices: List[int] = []
+    reserve_pool_indices: List[int] = []
     diversities: List[float] = []
     if pool_select > 0:
         candidate_frames = [frames[i] for i in candidate_pool_ids]
         matrix = descriptor.pairwise_distance_matrix(candidate_frames)
-        sel = fps_select(matrix, pool_select, descriptor_name=descriptor.name)
-        selected_pool_indices = [int(candidate_pool_ids[i]) for i in sel.indices]
-        diversities = [float(v) for v in sel.diversities]
+        sel = fps_select(matrix, len(candidate_frames), descriptor_name=descriptor.name)
+        ordered_pool_indices = [int(candidate_pool_ids[i]) for i in sel.indices]
+        selected_pool_indices = ordered_pool_indices[:pool_select]
+        reserve_pool_indices = ordered_pool_indices[pool_select:]
+        diversities = [float(v) for v in sel.diversities[:pool_select]]
     else:
         sel = FPSResult(
             indices=[],
@@ -531,6 +585,95 @@ def _run_phase_a(campaign, config):
     index_path = outdir / ("initial-INDEX-" + str(n_select) + ".dat")
     _write_xyz_file(selected_frames, sample_path)
     _write_index_file(selected_indices, index_path)
+    try:
+        from ..daemon.state import DEFAULT_STATE_FILENAME, read_state
+        from ..point_allocation import (
+            allocation_targets,
+            create_point_allocation,
+            point_allocation_path,
+            stable_candidate_id,
+        )
+
+        state = read_state(
+            campaign / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
+        )
+        primary_candidates = []
+        anchor_candidate_ids = []
+        for anchor_index in range(int(anchor_plan.n_anchor)):
+            candidate_id = stable_candidate_id(
+                campaign_uid=str(state.campaign_uid),
+                context="bootstrap",
+                iteration=0,
+                source_identity={"source": "anchor", "anchor_index": int(anchor_index)},
+            )
+            anchor_candidate_ids.append(candidate_id)
+            primary_candidates.append({
+                "candidate_id": candidate_id,
+                "source": "anchor",
+                "anchor_index": int(anchor_index),
+                "frame_id": None,
+            })
+        for frame_id in selected_pool_indices:
+            primary_candidates.append({
+                "candidate_id": stable_candidate_id(
+                    campaign_uid=str(state.campaign_uid),
+                    context="bootstrap",
+                    iteration=0,
+                    source_identity={"source": "phase_a_polus", "frame_id": int(frame_id)},
+                ),
+                "source": "phase_a_polus",
+                "frame_id": int(frame_id),
+            })
+        reserve_candidates = [
+            {
+                "candidate_id": stable_candidate_id(
+                    campaign_uid=str(state.campaign_uid),
+                    context="bootstrap",
+                    iteration=0,
+                    source_identity={"source": "phase_a_reserve", "frame_id": int(frame_id)},
+                ),
+                "source": "phase_a_reserve",
+                "frame_id": int(frame_id),
+                "reserve_rank": int(reserve_rank),
+            }
+            for reserve_rank, frame_id in enumerate(reserve_pool_indices)
+        ]
+        allocation_path = point_allocation_path(
+            campaign,
+            context="bootstrap",
+            iteration=0,
+        )
+        allocation = create_point_allocation(
+            allocation_path,
+            campaign_uid=str(state.campaign_uid),
+            context="bootstrap",
+            iteration=0,
+            targets=allocation_targets(config, "bootstrap"),
+            primary_candidates=primary_candidates,
+            reserve_candidates=reserve_candidates,
+            anchor_candidate_ids=anchor_candidate_ids,
+        )
+        slot_by_candidate = {
+            str(slot["attempts"][0]["candidate_id"]): {
+                "slot_id": int(slot["slot_id"]),
+                "split": str(slot["split"]),
+            }
+            for slot in allocation["slots"]
+        }
+        allocation_records = [
+            {
+                **record,
+                **slot_by_candidate[str(record["candidate_id"])],
+            }
+            for record in primary_candidates
+        ]
+    except Exception as exc:
+        print(
+            "Phase A point allocation failed: "
+            + type(exc).__name__ + ": " + str(exc),
+            file=_sys.stderr,
+        )
+        return 3
     anchor_manifest_path = None
     if bool(anchor_plan.enabled):
         anchor_manifest_path = write_bootstrap_anchor_manifest(
@@ -552,7 +695,14 @@ def _run_phase_a(campaign, config):
         "descriptor": str(descriptor.name),
         "fps_diversities": diversities,
         "n_pool_frames": int(len(frames)),
-        "bootstrap_initial_labelled_size": int(n_select),
+        "bootstrap_total_size": int(n_select),
+        "point_allocation": {
+            "manifest": str(allocation_path.resolve()),
+            "targets": dict(allocation["targets"]),
+            "primary": allocation_records,
+            "reserve_frame_ids": [int(value) for value in reserve_pool_indices],
+            "reserve_count": int(len(reserve_pool_indices)),
+        },
         "bootstrap_anchor_enabled": bool(anchor_plan.enabled),
         "bootstrap_anchor_count": int(anchor_plan.n_anchor),
         "bootstrap_pool_frame_count": int(pool_select),
@@ -909,10 +1059,10 @@ def _run_phase_b(args, campaign, config):
             file=_sys.stderr,
         )
         return 3
-    if int(report.n_kept) < int(config.active_batch.final_batch_size):
+    if int(report.n_kept) < int(config.point_allocation.batch_total_size):
         print(
-            "phase_b_final_batch_underfilled_after_anti_overlap: wanted "
-            + str(int(config.active_batch.final_batch_size))
+            "phase_b_point_allocation_underfilled_after_anti_overlap: wanted "
+            + str(int(config.point_allocation.batch_total_size))
             + ", kept "
             + str(int(report.n_kept))
             + " after considering "
@@ -960,12 +1110,112 @@ def _run_phase_b(args, campaign, config):
         raw_records.append(dict(out_rec))
         if out_rec["kept_after_dedup"]:
             final_records.append(dict(out_rec))
+
+    reserve = _phase_b_build_reserve(
+        ordered_indices=ordered_sel.indices,
+        already_considered_indices=selected_candidate_indices,
+        candidate_frames=candidate_frames,
+        candidate_records=candidate_records,
+        training=training,
+        selected_frames=kept_frames,
+        min_separation=min_sep,
+    )
+    try:
+        import hashlib
+
+        from ..daemon.state import DEFAULT_STATE_FILENAME, read_state
+        from ..point_allocation import (
+            allocation_targets,
+            create_point_allocation,
+            point_allocation_path,
+            stable_candidate_id,
+        )
+
+        state = read_state(
+            campaign / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
+        )
+
+        def allocation_candidate(record, *, reserve_rank=None, distance=None):
+            provenance_path = Path(str(record.get("provenance_json") or ""))
+            if not provenance_path.is_file():
+                raise FileNotFoundError(
+                    "Phase B candidate provenance is missing: " + str(provenance_path)
+                )
+            provenance_sha = hashlib.sha256(provenance_path.read_bytes()).hexdigest()
+            source_identity = {
+                "seed_index": int(record.get("seed_index")),
+                "seed_frame_id": record.get("seed_frame_id"),
+                "result_json": str(record.get("result_json") or ""),
+            }
+            out = dict(record)
+            out["candidate_id"] = stable_candidate_id(
+                campaign_uid=str(state.campaign_uid),
+                context="active",
+                iteration=int(args.iteration),
+                source_identity=source_identity,
+            )
+            out["provenance_sha256"] = provenance_sha
+            if reserve_rank is not None:
+                out["reserve_rank"] = int(reserve_rank)
+            if distance is not None:
+                out["distance_to_nearest_angstrom"] = float(distance)
+            return _phase_b_json_safe(out)
+
+        primary_allocation_records = [
+            allocation_candidate(record)
+            for record in final_records
+        ]
+        reserve_allocation_records = [
+            allocation_candidate(
+                record,
+                reserve_rank=rank,
+                distance=reserve["distances_to_nearest_angstrom"][rank],
+            )
+            for rank, record in enumerate(reserve["records"])
+        ]
+        allocation_path = point_allocation_path(
+            campaign,
+            context="active",
+            iteration=int(args.iteration),
+        )
+        allocation = create_point_allocation(
+            allocation_path,
+            campaign_uid=str(state.campaign_uid),
+            context="active",
+            iteration=int(args.iteration),
+            targets=allocation_targets(config, "active"),
+            primary_candidates=primary_allocation_records,
+            reserve_candidates=reserve_allocation_records,
+        )
+        slot_by_candidate = {
+            str(slot["attempts"][0]["candidate_id"]): {
+                "slot_id": int(slot["slot_id"]),
+                "split": str(slot["split"]),
+            }
+            for slot in allocation["slots"]
+        }
+        final_records = [
+            {**record, **slot_by_candidate[str(record["candidate_id"])]}
+            for record in primary_allocation_records
+        ]
+    except Exception as exc:
+        print(
+            "Phase B point allocation failed: "
+            + type(exc).__name__ + ": " + str(exc),
+            file=_sys.stderr,
+        )
+        return 3
     phase_b_manifest = {
         "schema_version": PHASE_B_SELECTION_SCHEMA_VERSION,
         "iteration": int(args.iteration),
         "descriptor": str(descriptor.name),
         "source_ariadne_manifest": str((iter_dir / "ARIADNE_RESULTS.json").resolve()),
-        "expected_final_batch_size": int(config.active_batch.final_batch_size),
+        "point_allocation": {
+            "manifest": str(allocation_path.resolve()),
+            "targets": dict(allocation["targets"]),
+            "reserve": reserve_allocation_records,
+            "reserve_count": int(len(reserve_allocation_records)),
+        },
         "n_candidates": int(len(candidate_frames)),
         "n_considered_after_refill": int(len(selected_frames)),
         "n_selected_raw": int(len(raw_records)),

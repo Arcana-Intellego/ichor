@@ -1,11 +1,4 @@
-"""Verify _inline_split actually dispatches to the configured strategy.
-
-Before the wiring change _inline_split wrote a fake split.json with
-train_indices = list(range(floor)) regardless of what campaign.yaml said.
-These tests confirm each of the three available strategies is honoured:
-the chosen function is invoked and the resulting indices show up in
-split.json on disk.
-"""
+"""SPLIT is a read-only projection of the exact pre-QM allocation."""
 from __future__ import annotations
 
 import json
@@ -16,72 +9,75 @@ import pytest
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.daemon.dry_run_executor import DryRunPhaseExecutor
 from ichor.hpc.active_learning.daemon.state import fresh_campaign_state
+from ichor.hpc.active_learning.point_allocation import (
+    allocation_targets,
+    create_point_allocation,
+    point_allocation_path,
+)
 
 
-def _seed_pool_with_alphas(campaign_dir: Path, iteration: int, alphas):
-    """Put a per-seed result.json file into the iteration pool so the
-    inline split phase has data to chew on.
-    """
+def _write_allocation(campaign_dir: Path, config: CampaignConfig, iteration: int):
     iter_dir = (
         campaign_dir / "7_ACTIVE_LEARNING"
         / f"iteration-{iteration:04d}"
     )
-    pool_dir = iter_dir / "pool"
-    pool_dir.mkdir(parents=True, exist_ok=True)
-    for i, alpha in enumerate(alphas):
-        seed_dir = pool_dir / f"seed_{i:04d}"
-        seed_dir.mkdir(parents=True, exist_ok=True)
-        (seed_dir / "result.json").write_text(
-            json.dumps({"alpha_final": float(alpha)}),
-            encoding="utf-8",
-        )
+    targets = allocation_targets(config, "active")
+    create_point_allocation(
+        point_allocation_path(
+            campaign_dir,
+            context="active",
+            iteration=iteration,
+        ),
+        campaign_uid="split-test",
+        context="active",
+        iteration=iteration,
+        targets=targets,
+        primary_candidates=[
+            {"candidate_id": "candidate-" + str(index), "seed_index": index}
+            for index in range(targets["total"])
+        ],
+        reserve_candidates=[],
+    )
     return iter_dir
 
 
-@pytest.mark.parametrize(
-    "strategy",
-    ["stratified_with_holdout", "random_80_20", "pure_top_k"],
-)
-def test_inline_split_honours_strategy(tmp_path, strategy):
+def test_inline_split_projects_exact_allocation_slots(tmp_path):
     cfg = CampaignConfig()
-    cfg.split.strategy = strategy
-    cfg.active_batch.final_batch_size = 2
-    cfg.seed_selection.n_seeds_per_iteration = 6
+    cfg.point_allocation.batch_training_size = 2
+    cfg.point_allocation.batch_internal_validation_size = 1
+    cfg.seed_selection.n_seeds_per_iteration = 3
     ex = DryRunPhaseExecutor(campaign_dir=tmp_path / "c", config=cfg)
     state = fresh_campaign_state(max_iterations=1)
     state.iteration = 0
-    iter_dir = _seed_pool_with_alphas(
-        tmp_path / "c", 0,
-        [3.0, 2.0, 5.0, 1.0, 4.0, 0.5],
-    )
+    iter_dir = _write_allocation(tmp_path / "c", cfg, 0)
+
     ex._inline_split(state)
+
     sp = iter_dir / "split.json"
     assert sp.is_file()
     payload = json.loads(sp.read_text(encoding="utf-8"))
-    # the recorded strategy is the registry key so it round-trips back through
-    # get_split_strategy; the actual fraction travels in metadata.
-    strategy_label = payload["strategy"]
-    if strategy == "stratified_with_holdout":
-        assert strategy_label == "stratified_with_holdout"
-    elif strategy == "random_80_20":
-        assert strategy_label == "random_80_20"
-    elif strategy == "pure_top_k":
-        assert strategy_label.startswith("pure_top_k")
+    assert payload["schema_version"] == 2
+    assert payload["strategy"] == "exact_pre_qm_point_allocation"
     assert payload["iteration"] == 0
-    # the train and val partitions should be non-empty and disjoint
-    train = set(payload["train_indices"])
-    val = set(payload["val_indices"])
-    assert train and val
-    assert not (train & val)
+    assert payload["targets"] == {
+        "train": 2,
+        "int_val": 1,
+        "ext_val": 0,
+        "total": 3,
+    }
+    assert [slot["slot_id"] for slot in payload["slots"]] == [0, 1, 2]
+    assert [slot["split"] for slot in payload["slots"]] == [
+        "train",
+        "train",
+        "int_val",
+    ]
+    assert all(slot["candidate_id"].startswith("candidate-") for slot in payload["slots"])
 
 
-def test_inline_split_empty_pool_falls_back_to_floor(tmp_path):
-    """with no seed_*/result.json files, the strategy has nothing to
-    sort on. the inline split returns the floor-based stub layout so APPEND
-    still has something to do. matches the previous behaviour exactly.
-    """
+def test_inline_split_refuses_missing_allocation_manifest(tmp_path):
     cfg = CampaignConfig()
-    cfg.active_batch.final_batch_size = 4
+    cfg.point_allocation.batch_training_size = 3
+    cfg.point_allocation.batch_internal_validation_size = 1
     ex = DryRunPhaseExecutor(campaign_dir=tmp_path / "c", config=cfg)
     state = fresh_campaign_state(max_iterations=1)
     state.iteration = 0
@@ -91,8 +87,7 @@ def test_inline_split_empty_pool_falls_back_to_floor(tmp_path):
         / f"iteration-{0:04d}"
     )
     iter_dir.mkdir(parents=True, exist_ok=True)
-    ex._inline_split(state)
-    payload = json.loads((iter_dir / "split.json").read_text(encoding="utf-8"))
-    assert payload["train_indices"] == [0, 1, 2, 3]
-    assert payload["val_indices"] == [4]
-    assert payload["holdout_indices"] == []
+
+    with pytest.raises(FileNotFoundError, match="point-allocation manifest missing"):
+        ex._inline_split(state)
+    assert not (iter_dir / "split.json").exists()

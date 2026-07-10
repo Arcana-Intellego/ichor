@@ -1307,16 +1307,17 @@ final_checks() {
     local smoke_dir
     smoke_dir="$(mktemp -d)"
     cat > "${smoke_dir}/campaign.yaml" <<'EOF'
-schema_version: 8
+schema_version: 9
 campaign:
   system_name: INSTALLER_SMOKE
   max_iterations: 1
-bootstrap:
-  initial_labelled_size: 12
-  external_validation_size: 2
+point_allocation:
+  bootstrap_training_size: 8
+  bootstrap_internal_validation_size: 2
+  bootstrap_external_validation_size: 2
+  batch_training_size: 3
+  batch_internal_validation_size: 1
   anchor: false
-active_batch:
-  final_batch_size: 4
 seed_selection:
   n_seeds_per_iteration: 8
 EOF

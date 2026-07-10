@@ -199,15 +199,17 @@ RESOURCE_FUTURE_EXACT = {
 IMMUTABLE_EXACT = {"schema_version"}
 
 PRE_POOL_EXACT = {"trajectory_pool.source_path"}
-PRE_PHASE_A_EXACT = {"bootstrap.initial_labelled_size", "bootstrap.anchor"}
+PRE_PHASE_A_EXACT = {
+    "point_allocation.bootstrap_training_size",
+    "point_allocation.bootstrap_internal_validation_size",
+    "point_allocation.bootstrap_external_validation_size",
+    "point_allocation.anchor",
+}
 PRE_GAUSSIAN_PREFIXES = {"gaussian."}
 PRE_AIMALL_PREFIXES = {"aimall."}
 PRE_FEREBUS_FIRST_EXACT = {
     "campaign.system_name",
-    "bootstrap.external_validation_size",
     "ferebus.properties",
-    "ferebus.train_fraction",
-    "ferebus.internal_validation_fraction",
     "acquisition.property_name",
 }
 FUTURE_FEREBUS_EXACT = {
@@ -245,8 +247,11 @@ PRE_SAMPLING_PROTOCOL_PREFIXES = {
     "geometry_novelty.",
 }
 PRE_PHASE_B_PREFIXES = {
-    "active_batch.",
     "phase_b.",
+}
+PRE_PHASE_B_EXACT = {
+    "point_allocation.batch_training_size",
+    "point_allocation.batch_internal_validation_size",
 }
 PRE_SPLIT_PREFIXES: set[str] = set()
 PRE_AIMALL_QUALITY_EXACT = {
@@ -279,10 +284,9 @@ ARIADNE_OUTPUT_INTERPRETATION_EXACT = {
 }
 
 PHASE_B_OUTPUT_INTERPRETATION_PREFIXES = {
-    "active_batch.",
     "sampling_protocol.",
 }
-PHASE_B_OUTPUT_INTERPRETATION_EXACT = set()
+PHASE_B_OUTPUT_INTERPRETATION_EXACT = set(PRE_PHASE_B_EXACT)
 
 PHASE_LOCAL_EXACT = set(FUTURE_FEREBUS_EXACT)
 COMMITTED_LOCKED_EXACT = (
@@ -335,6 +339,14 @@ _POLICIES_EXACT: Dict[str, ConfigFieldPolicy] = {
         for path in PRE_ARIADNE_EXACT
     },
     **{
+        path: ConfigFieldPolicy(
+            "pre_phase_b",
+            "pre_phase_b",
+            "editable until Phase B allocates the current iteration",
+        )
+        for path in PRE_PHASE_B_EXACT
+    },
+    **{
         path: ConfigFieldPolicy("pre_aimall_quality", "pre_aimall_first", "editable until first AIMAll quality postprocess")
         for path in PRE_AIMALL_QUALITY_EXACT
     },
@@ -348,7 +360,6 @@ _POLICIES_PREFIX: Tuple[Tuple[str, ConfigFieldPolicy], ...] = (
     ("aimall.", ConfigFieldPolicy("pre_aimall", "pre_aimall_first", "editable until first AIMAll staging/submission; current AIMAll array edits require --force-resubmit-array-tasks")),
     ("seed_selection.", ConfigFieldPolicy("pre_seed_select", "pre_seed_select", "editable until seed selection for this iteration")),
     ("sampling_protocol.", ConfigFieldPolicy("pre_sampling_protocol", "pre_sampling_protocol", "editable until ARIADNE/Phase B consumes this iteration; current ARIADNE array edits require --force-resubmit-array-tasks")),
-    ("active_batch.", ConfigFieldPolicy("pre_phase_b", "pre_phase_b", "editable until Phase B consumes this iteration")),
     ("phase_b.", ConfigFieldPolicy("pre_phase_b", "pre_phase_b", "editable until Phase B consumes this iteration")),
     ("geometry_novelty.", ConfigFieldPolicy("pre_sampling_protocol", "pre_sampling_protocol", "editable until ARIADNE/Phase B consumes this iteration; current ARIADNE array edits require --force-resubmit-array-tasks")),
     ("acquisition.", ConfigFieldPolicy("pre_ariadne", "pre_ariadne", "editable until ARIADNE consumes this iteration; current ARIADNE array edits require --force-resubmit-array-tasks")),
@@ -487,6 +498,7 @@ def _phase_a_consumed(campaign_dir: Union[str, Path]) -> Optional[str]:
             "3_DIVERSITY_SAMPLING/initial/PHASE_A_SAMPLE.json",
             "3_DIVERSITY_SAMPLING/initial/*SAMPLE*.xyz",
             "3_DIVERSITY_SAMPLING/initial/*INDEX*.dat",
+            "3_DIVERSITY_SAMPLING/initial/POINT_ALLOCATION.json",
         ),
     )
     if path:
@@ -497,7 +509,12 @@ def _phase_a_consumed(campaign_dir: Union[str, Path]) -> Optional[str]:
 def _gaussian_consumed(campaign_dir: Union[str, Path]) -> Optional[str]:
     intent = _phase_intent_file_exists(
         campaign_dir,
-        (CampaignPhase.INITIAL_GAUSSIAN, CampaignPhase.GAUSSIAN),
+        (
+            CampaignPhase.INITIAL_GAUSSIAN,
+            CampaignPhase.GAUSSIAN,
+            CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN,
+            CampaignPhase.REPLACEMENT_GAUSSIAN,
+        ),
     )
     if intent:
         return "Gaussian submission intent exists: " + intent
@@ -517,7 +534,12 @@ def _gaussian_consumed(campaign_dir: Union[str, Path]) -> Optional[str]:
 def _aimall_consumed(campaign_dir: Union[str, Path]) -> Optional[str]:
     intent = _phase_intent_file_exists(
         campaign_dir,
-        (CampaignPhase.INITIAL_AIMALL, CampaignPhase.AIMALL),
+        (
+            CampaignPhase.INITIAL_AIMALL,
+            CampaignPhase.AIMALL,
+            CampaignPhase.INITIAL_REPLACEMENT_AIMALL,
+            CampaignPhase.REPLACEMENT_AIMALL,
+        ),
     )
     if intent:
         return "AIMAll submission intent exists: " + intent
@@ -652,6 +674,7 @@ def _phase_b_outputs_exist(campaign_dir: Union[str, Path], proposed_state: Campa
         "phase_b_SAMPLE.xyz",
         "phase_b_SAMPLE_raw.xyz",
         "phase_b_dedup.json",
+        "POINT_ALLOCATION.json",
     ):
         if (iter_dir / name).exists():
             return True
@@ -676,6 +699,7 @@ def _phase_b_consumed_reason(
         "phase_b_SAMPLE.xyz",
         "phase_b_SAMPLE_raw.xyz",
         "phase_b_dedup.json",
+        "POINT_ALLOCATION.json",
     ):
         path = iter_dir / name
         if path.exists():
@@ -776,11 +800,21 @@ def _phase_local_allowed(
             return False, "target FEREBUS model version is already committed"
         return True, "allowed for uncommitted FEREBUS re-entry"
     if path.startswith("gaussian."):
-        if phase not in (CampaignPhase.INITIAL_GAUSSIAN, CampaignPhase.GAUSSIAN):
+        if phase not in (
+            CampaignPhase.INITIAL_GAUSSIAN,
+            CampaignPhase.GAUSSIAN,
+            CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN,
+            CampaignPhase.REPLACEMENT_GAUSSIAN,
+        ):
             return False, "Gaussian runtime settings may change only when re-entering Gaussian"
         return True, "allowed for Gaussian re-entry before acceptance"
     if path.startswith("aimall."):
-        if phase not in (CampaignPhase.INITIAL_AIMALL, CampaignPhase.AIMALL):
+        if phase not in (
+            CampaignPhase.INITIAL_AIMALL,
+            CampaignPhase.AIMALL,
+            CampaignPhase.INITIAL_REPLACEMENT_AIMALL,
+            CampaignPhase.REPLACEMENT_AIMALL,
+        ):
             return False, "AIMAll settings may change only when re-entering AIMAll"
         return True, "allowed for AIMAll re-entry before acceptance"
     return False, "phase-local field is not recognised for this re-entry phase"
@@ -838,10 +872,20 @@ def _consumption_block_reason(
     if force_resubmit_array_phase is not None:
         phase = force_resubmit_array_phase
         dotted = str(path)
-        if phase in (CampaignPhase.INITIAL_GAUSSIAN, CampaignPhase.GAUSSIAN):
+        if phase in (
+            CampaignPhase.INITIAL_GAUSSIAN,
+            CampaignPhase.GAUSSIAN,
+            CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN,
+            CampaignPhase.REPLACEMENT_GAUSSIAN,
+        ):
             if dotted.startswith("gaussian.") or dotted in RESOURCE_FUTURE_EXACT:
                 return None
-        if phase in (CampaignPhase.INITIAL_AIMALL, CampaignPhase.AIMALL):
+        if phase in (
+            CampaignPhase.INITIAL_AIMALL,
+            CampaignPhase.AIMALL,
+            CampaignPhase.INITIAL_REPLACEMENT_AIMALL,
+            CampaignPhase.REPLACEMENT_AIMALL,
+        ):
             if (
                 dotted.startswith("aimall.")
                 or dotted in PRE_AIMALL_QUALITY_EXACT

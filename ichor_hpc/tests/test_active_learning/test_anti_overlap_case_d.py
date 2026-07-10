@@ -15,6 +15,11 @@ from pathlib import Path
 import pytest
 
 from ichor.hpc.active_learning.config import CampaignConfig
+from ichor.hpc.active_learning.daemon.state import (
+    DEFAULT_STATE_FILENAME,
+    fresh_campaign_state,
+    write_state,
+)
 from ichor.hpc.active_learning.versioning.manifest import (
     compute_directory_manifest,
     write_manifest,
@@ -136,12 +141,22 @@ def _run(args):
     )
 
 
+def _write_campaign_state(campaign):
+    state = fresh_campaign_state()
+    state.campaign_uid = "test"
+    state.models_version = 0
+    data_dir = campaign / ".DATA" / "ACTIVE_LEARNING"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    write_state(data_dir / DEFAULT_STATE_FILENAME, state)
+
+
 def test_min_separation_zero_drops_nothing(tmp_path):
     """Default min_separation=0 means the filter passes everything."""
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
-    cfg.active_batch.final_batch_size = 3
+    cfg.point_allocation.batch_training_size = 2
+    cfg.point_allocation.batch_internal_validation_size = 1
     cfg.phase_b.descriptor = "rmsd_massweight"
     cfg.to_yaml(campaign / "campaign.yaml")
     iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
@@ -169,7 +184,8 @@ def test_min_separation_underfills_after_dropping_close_candidates(tmp_path):
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
-    cfg.active_batch.final_batch_size = 3
+    cfg.point_allocation.batch_training_size = 2
+    cfg.point_allocation.batch_internal_validation_size = 1
     cfg.phase_b.descriptor = "rmsd_massweight"
     cfg.geometry_novelty.fallback_scale_angstrom = 0.2
     cfg.to_yaml(campaign / "campaign.yaml")
@@ -208,7 +224,7 @@ def test_min_separation_underfills_after_dropping_close_candidates(tmp_path):
                "--iteration", "0",
                "--campaign-dir", str(campaign)])
     assert rc.returncode == 3
-    assert "phase_b_final_batch_underfilled_after_anti_overlap" in rc.stderr
+    assert "phase_b_point_allocation_underfilled_after_anti_overlap" in rc.stderr
     dedup = iter_dir / "phase_b_dedup.json"
     d = json.loads(dedup.read_text(encoding="utf-8"))
     # at least one candidate should have been dropped (the duplicate).
@@ -224,7 +240,8 @@ def test_min_separation_all_candidates_removed_fails_at_phase_b(tmp_path):
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
-    cfg.active_batch.final_batch_size = 3
+    cfg.point_allocation.batch_training_size = 2
+    cfg.point_allocation.batch_internal_validation_size = 1
     cfg.phase_b.descriptor = "rmsd_massweight"
     cfg.geometry_novelty.fallback_scale_angstrom = 0.2
     cfg.to_yaml(campaign / "campaign.yaml")
@@ -264,7 +281,8 @@ def test_scaled_min_separation_rescues_farthest_non_duplicate(tmp_path):
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
-    cfg.active_batch.final_batch_size = 1
+    cfg.point_allocation.batch_training_size = 1
+    cfg.point_allocation.batch_internal_validation_size = 0
     cfg.phase_b.descriptor = "rmsd_massweight"
     cfg.geometry_novelty.fallback_scale_angstrom = 10.0
 
@@ -297,6 +315,7 @@ def test_scaled_min_separation_rescues_farthest_non_duplicate(tmp_path):
         [(0.0, 0.0, 0.0), (1.00, 0.0, 0.0), (-0.24, 0.93, 0.0)],
     )
     _write_ariadne_manifest(iter_dir)
+    _write_campaign_state(campaign)
 
     rc = _run(["--descriptor", "rmsd_massweight",
                "--iteration", "0",

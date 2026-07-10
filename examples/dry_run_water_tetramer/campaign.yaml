@@ -3,7 +3,7 @@
 # defaults substantially (see ichor_hpc/.../presets/ for spectroscopy and
 # thermodynamics-focused starting points).
 
-schema_version: 8
+schema_version: 9
 
 campaign:
   system_name: WATER_TETRAMER
@@ -14,14 +14,13 @@ runtime:
   poll_interval_seconds: 1
 
 # Initial labelled set before active learning.
-bootstrap:
-  initial_labelled_size: 6
-  external_validation_size: 1
+point_allocation:
+  bootstrap_training_size: 4
+  bootstrap_internal_validation_size: 1
+  bootstrap_external_validation_size: 1
+  batch_training_size: 1
+  batch_internal_validation_size: 1
   anchor: false
-
-# Final labelled batch per active iteration.
-active_batch:
-  final_batch_size: 2
 
 # Seeds per ARIADNE_ARRAY task.
 seed_selection:
@@ -59,5 +58,3 @@ aimall:
 
 ferebus:
   scaling: false
-  train_fraction: 0.8
-  internal_validation_fraction: 0.2

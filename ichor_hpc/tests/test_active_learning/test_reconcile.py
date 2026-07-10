@@ -16,6 +16,9 @@ from ichor.hpc.active_learning.daemon.reconcile import (
     write_proposed_state,
 )
 from ichor.hpc.active_learning.daemon import input_staging as stg
+from ichor.hpc.active_learning.daemon.recovery_contracts import (
+    active_iteration_handoff_decisions,
+)
 from ichor.hpc.active_learning.daemon.state import (
     CampaignPhase,
     DEFAULT_STATE_FILENAME,
@@ -27,6 +30,21 @@ from ichor.hpc.active_learning.handoff_manifests import (
     ARIADNE_RESULTS_SCHEMA_VERSION,
     PHASE_B_SELECTION_SCHEMA_VERSION,
     write_ariadne_results_manifest,
+)
+from ichor.hpc.active_learning.point_allocation import (
+    create_point_allocation,
+    pending_attempts,
+    point_allocation_path,
+    read_point_allocation,
+    record_quantum_results,
+)
+from ichor.hpc.active_learning.replacement_sampling import (
+    prepare_replacement_round,
+    replacement_round_dir,
+)
+from ichor.hpc.active_learning.versioning.provenance import (
+    enrich_with_point_allocation,
+    write_seed_provenance,
 )
 from ichor.hpc.active_learning.versioning.training_set import TrainingSetVersioning
 
@@ -57,6 +75,79 @@ def _write_pool(campaign):
     )
 
 
+def _write_pending_allocation(campaign, *, context, iteration, n):
+    state_path = campaign / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
+    campaign_uid = (
+        read_state(state_path).campaign_uid
+        if state_path.is_file()
+        else "reconcile-test"
+    )
+    targets = {"train": int(n), "int_val": 0, "ext_val": 0, "total": int(n)}
+    allocation_path = point_allocation_path(
+        campaign,
+        context=context,
+        iteration=iteration,
+    )
+    allocation = create_point_allocation(
+        allocation_path,
+        campaign_uid=campaign_uid,
+        context=context,
+        iteration=iteration,
+        targets=targets,
+        primary_candidates=[
+            {"candidate_id": "candidate-" + context + "-" + str(i), "frame_id": i}
+            for i in range(int(n))
+        ],
+        reserve_candidates=[],
+    )
+    records = []
+    for slot in allocation["slots"]:
+        attempt = slot["attempts"][0]
+        records.append({
+            **attempt,
+            "slot_id": int(slot["slot_id"]),
+            "split": str(slot["split"]),
+        })
+    return allocation_path, allocation, records
+
+
+def _complete_handoff_allocation(campaign, *, context, iteration, pointdirs):
+    allocation_path, allocation, records = _write_pending_allocation(
+        campaign,
+        context=context,
+        iteration=iteration,
+        n=len(pointdirs),
+    )
+    results = []
+    campaign_uid = str(allocation["campaign_uid"])
+    for pointdir, record in zip(pointdirs, records):
+        write_seed_provenance(
+            pointdir,
+            campaign_uid=campaign_uid,
+            iteration=iteration,
+            trajectory_sha256="0" * 64,
+            seed_frame_id=record.get("frame_id"),
+            seed_selection_origin="reconcile_fixture",
+            seed_variance_at_selection=None,
+            subspace_neighbour_frame_ids=[],
+            subspace_dimension=0,
+            subspace_eigenvalues=[],
+        )
+        enrich_with_point_allocation(
+            pointdir,
+            candidate_id=record["candidate_id"],
+            context=context,
+            slot_id=record["slot_id"],
+            split=record["split"],
+        )
+        results.append({
+            "candidate_id": record["candidate_id"],
+            "accepted": True,
+            "pointdir": str(pointdir.resolve()),
+        })
+    return record_quantum_results(allocation_path, results)
+
+
 def _write_valid_initial_aimall_handoff(campaign, *, iteration=0):
     initial = campaign / ".DATA" / "STAGING" / "initial"
     pointdir = initial / "POINT_0000.pointdir"
@@ -68,6 +159,12 @@ def _write_valid_initial_aimall_handoff(campaign, *, iteration=0):
         iteration=iteration,
         accepted=[pointdir],
         rejected=[],
+    )
+    _complete_handoff_allocation(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        pointdirs=[pointdir],
     )
     return initial
 
@@ -90,6 +187,20 @@ def _write_bootstrap_handoff(campaign, *, phase, iteration=0, archived=False, su
         accepted=[pointdir],
         rejected=[],
     )
+    if phase == CampaignPhase.INITIAL_AIMALL.value:
+        _complete_handoff_allocation(
+            campaign,
+            context="bootstrap",
+            iteration=0,
+            pointdirs=[pointdir],
+        )
+    else:
+        _write_pending_allocation(
+            campaign,
+            context="bootstrap",
+            iteration=0,
+            n=1,
+        )
     return initial
 
 
@@ -161,6 +272,23 @@ def _write_phase_b_handoff(campaign, iteration, *, n=2):
         "\n".join(xyz_lines) + "\n",
         encoding="utf-8",
     )
+    allocation_path, allocation, allocation_records = _write_pending_allocation(
+        campaign,
+        context="active",
+        iteration=iteration,
+        n=n,
+    )
+    allocation_by_seed = {
+        int(record["frame_id"]): record for record in allocation_records
+    }
+    for record in raw:
+        allocation_record = allocation_by_seed[int(record["seed_index"])]
+        record.update({
+            "candidate_id": allocation_record["candidate_id"],
+            "slot_id": allocation_record["slot_id"],
+            "split": allocation_record["split"],
+        })
+    final = [dict(record) for record in raw]
     (iter_dir / "PHASE_B_SELECTION.json").write_text(
         json.dumps({
             "schema_version": PHASE_B_SELECTION_SCHEMA_VERSION,
@@ -169,6 +297,11 @@ def _write_phase_b_handoff(campaign, iteration, *, n=2):
             "n_kept": int(n),
             "raw": raw,
             "final": final,
+            "point_allocation": {
+                "manifest": str(allocation_path.resolve()),
+                "targets": dict(allocation["targets"]),
+                "reserve": [],
+            },
         }),
         encoding="utf-8",
     )
@@ -223,13 +356,34 @@ def _write_legacy_ariadne_results_without_landing_safety(campaign, iteration):
 
 def _write_split(campaign, iteration, *, train, val, holdout=None):
     iter_dir = _iter_dir(campaign, iteration)
+    allocation_path = point_allocation_path(
+        campaign,
+        context="active",
+        iteration=iteration,
+    )
+    if not allocation_path.is_file():
+        _write_pending_allocation(
+            campaign,
+            context="active",
+            iteration=iteration,
+            n=len(train) + len(val) + len(holdout or []),
+        )
+    allocation = json.loads(allocation_path.read_text(encoding="utf-8"))
     (iter_dir / "split.json").write_text(
         json.dumps({
+            "schema_version": 2,
             "iteration": int(iteration),
-            "strategy": "fixture",
-            "train_indices": list(train),
-            "val_indices": list(val),
-            "holdout_indices": list(holdout or []),
+            "strategy": "exact_pre_qm_point_allocation",
+            "point_allocation_manifest": str(allocation_path.resolve()),
+            "targets": dict(allocation["targets"]),
+            "slots": [
+                {
+                    "slot_id": int(slot["slot_id"]),
+                    "split": str(slot["split"]),
+                    "candidate_id": str(slot["attempts"][0]["candidate_id"]),
+                }
+                for slot in allocation["slots"]
+            ],
         }),
         encoding="utf-8",
     )
@@ -252,11 +406,112 @@ def test_propose_recovery_on_empty_campaign_returns_init(tmp_path):
     campaign, _, _, _ = _campaign_dirs(tmp_path)
     report = propose_recovery(campaign)
     assert report.proposed_state.phase is CampaignPhase.INIT
-    assert report.proposed_state.training_set_version == 0
-    assert report.proposed_state.models_version == 0
+    assert report.proposed_state.training_set_version == -1
+    assert report.proposed_state.models_version == -1
     assert report.committed_training_versions == []
     assert report.committed_model_versions == []
     assert report.existing_state_loaded is False
+
+
+def test_active_replacement_recovery_advances_only_with_durable_handoffs(tmp_path):
+    campaign, _, _, _ = _campaign_dirs(tmp_path)
+    result_path = campaign / "reserve-result.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "atom_types": ["H"],
+                "final_coordinates": [[0.0, 0.0, 0.0]],
+            }
+        ),
+        encoding="utf-8",
+    )
+    allocation_path = point_allocation_path(
+        campaign,
+        context="active",
+        iteration=0,
+    )
+    allocation = create_point_allocation(
+        allocation_path,
+        campaign_uid="replacement-recovery-test",
+        context="active",
+        iteration=0,
+        targets={"train": 1, "int_val": 0, "ext_val": 0, "total": 1},
+        primary_candidates=[{"candidate_id": "candidate-primary"}],
+        reserve_candidates=[
+            {
+                "candidate_id": "candidate-reserve",
+                "result_json": str(result_path.resolve()),
+                "reserve_rank": 0,
+            }
+        ],
+    )
+    initial_attempt = pending_attempts(allocation)[0]
+    record_quantum_results(
+        allocation_path,
+        [
+            {
+                "candidate_id": str(initial_attempt["candidate_id"]),
+                "accepted": False,
+                "pointdir": "/synthetic/failed.pointdir",
+                "reason": "synthetic failure",
+            }
+        ],
+    )
+    state = fresh_campaign_state(max_iterations=3)
+    state.training_set_version = 0
+    state.models_version = 0
+
+    decisions = active_iteration_handoff_decisions(campaign, state)
+    assert [decision.phase for decision in decisions] == [CampaignPhase.ALLOCATION_CHECK]
+
+    prepare_replacement_round(
+        campaign,
+        context="active",
+        iteration=0,
+        replacement_round=1,
+    )
+    decisions = active_iteration_handoff_decisions(campaign, state)
+    assert [decision.phase for decision in decisions] == [
+        CampaignPhase.REPLACEMENT_GAUSSIAN
+    ]
+    assert decisions[0].replacement_round == 1
+
+    round_dir = replacement_round_dir(
+        campaign,
+        context="active",
+        iteration=0,
+        replacement_round=1,
+    )
+    pointdir = round_dir / "POINT_0001.pointdir"
+    pointdir.mkdir()
+    stg.write_points_file(round_dir, [pointdir])
+    stg.write_quantum_acceptance_manifest(
+        round_dir,
+        phase_name=CampaignPhase.REPLACEMENT_GAUSSIAN.value,
+        iteration=0,
+        accepted=[pointdir],
+        rejected=[],
+    )
+    decisions = active_iteration_handoff_decisions(campaign, state)
+    assert [decision.phase for decision in decisions] == [
+        CampaignPhase.REPLACEMENT_AIMALL
+    ]
+
+    replacement = read_point_allocation(allocation_path)
+    replacement_attempt = pending_attempts(replacement)[0]
+    record_quantum_results(
+        allocation_path,
+        [
+            {
+                "candidate_id": str(replacement_attempt["candidate_id"]),
+                "accepted": True,
+                "pointdir": str(pointdir.resolve()),
+            }
+        ],
+        expected_generation=int(replacement["generation"]),
+    )
+    decisions = active_iteration_handoff_decisions(campaign, state)
+    assert [decision.phase for decision in decisions] == [CampaignPhase.APPEND]
 
 
 def test_recovery_contract_status_marks_halted_state_not_runnable(tmp_path):
@@ -295,14 +550,23 @@ def test_recovery_contract_status_reports_seed_handoff_contract(tmp_path):
 def test_propose_recovery_phase_a_sample_reenters_initial_gaussian(tmp_path):
     from ichor.hpc.active_learning.handoff_manifests import write_phase_a_sample_manifest
 
-    campaign, _, _, _ = _campaign_dirs(tmp_path)
+    campaign, data, _, _ = _campaign_dirs(tmp_path)
     _write_pool(campaign)
+    state = fresh_campaign_state()
+    state.campaign_uid = "reconcile-test"
+    write_state(data / DEFAULT_STATE_FILENAME, state)
     initial = campaign / "3_DIVERSITY_SAMPLING" / "initial"
     initial.mkdir(parents=True)
     sample = initial / "initial-SAMPLE-1.xyz"
     index = initial / "initial-INDEX-1.dat"
     sample.write_text("1\nframe 0\nH 0.0 0.0 0.0\n", encoding="utf-8")
     index.write_text("0\n", encoding="utf-8")
+    allocation_path, allocation, allocation_records = _write_pending_allocation(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        n=1,
+    )
     write_phase_a_sample_manifest(initial, {
         "phase": "PHASE_A_POLUS",
         "iteration": -1,
@@ -313,6 +577,13 @@ def test_propose_recovery_phase_a_sample_reenters_initial_gaussian(tmp_path):
         "selected_indices": [0],
         "descriptor": "mass_weighted_rmsd",
         "n_pool_frames": 1,
+        "point_allocation": {
+            "manifest": str(allocation_path.resolve()),
+            "targets": dict(allocation["targets"]),
+            "primary": allocation_records,
+            "reserve_frame_ids": [],
+            "reserve_count": 0,
+        },
     })
 
     report = propose_recovery(campaign)
@@ -450,7 +721,7 @@ def test_propose_recovery_initial_aimall_handoff_reenters_initial_ferebus(tmp_pa
     assert report.proposed_state.phase is CampaignPhase.INITIAL_FEREBUS
     assert report.proposed_state.training_set_version == -1
     assert report.proposed_state.models_version == -1
-    assert "valid initial AIMAll handoff" in report.decision
+    assert "exact point allocation is complete" in report.decision
     assert "initial AIMAll acceptance manifest" in report.trusted_artifacts
 
 
@@ -555,7 +826,7 @@ def test_propose_recovery_archived_initial_aimall_handoff_reenters_initial_fereb
     assert report.proposed_state.phase is CampaignPhase.INITIAL_FEREBUS
     assert report.bootstrap_handoff is not None
     assert report.bootstrap_handoff["path"] == str(archived)
-    assert "valid initial AIMAll handoff" in report.decision
+    assert "exact point allocation is complete" in report.decision
 
 
 def test_propose_recovery_bootstrap_training_only_reenters_initial_ferebus(
@@ -574,6 +845,14 @@ def test_propose_recovery_bootstrap_training_only_reenters_initial_ferebus(
     staged = tv.stage(None, 0)
     (staged / "marker.txt").write_text("training", encoding="utf-8")
     tv.commit(0)
+    pointdir = campaign / ".DATA" / "STAGING" / "initial" / "POINT_0000.pointdir"
+    pointdir.mkdir(parents=True, exist_ok=True)
+    _complete_handoff_allocation(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        pointdirs=[pointdir],
+    )
     state = fresh_campaign_state(max_iterations=50)
     state.phase = CampaignPhase.HALTED
     state.iteration = 0
@@ -585,7 +864,7 @@ def test_propose_recovery_bootstrap_training_only_reenters_initial_ferebus(
 
     assert report.proposed_state.phase is CampaignPhase.INITIAL_FEREBUS
     assert report.proposed_state.iteration == 0
-    assert "committed bootstrap training exists without model version 0" in report.decision
+    assert "exact point allocation is complete" in report.decision
 
 
 def test_propose_recovery_missing_state_nonempty_staging_halts(tmp_path):
@@ -618,9 +897,10 @@ def test_stateful_campaign_artifacts_include_phase_a_outputs(tmp_path):
 
     findings = stateful_campaign_artifacts(campaign)
 
-    assert "3_DIVERSITY_SAMPLING/initial/PHASE_A_SAMPLE.json" in findings
-    assert "3_DIVERSITY_SAMPLING/initial/initial-SAMPLE-2.xyz" in findings
-    assert "3_DIVERSITY_SAMPLING/initial/initial-INDEX-2.dat" in findings
+    normalised = {Path(value).as_posix() for value in findings}
+    assert "3_DIVERSITY_SAMPLING/initial/PHASE_A_SAMPLE.json" in normalised
+    assert "3_DIVERSITY_SAMPLING/initial/initial-SAMPLE-2.xyz" in normalised
+    assert "3_DIVERSITY_SAMPLING/initial/initial-INDEX-2.dat" in normalised
 
 
 def test_propose_recovery_active_submission_intent_is_adoption_ready(tmp_path):
@@ -666,7 +946,7 @@ def test_propose_recovery_finds_committed_training_versions(tmp_path):
     assert report.committed_training_versions == [0, 1, 2]
     assert report.proposed_state.training_set_version == 2
     assert report.proposed_state.models_version == -1
-    assert report.proposed_state.phase is CampaignPhase.FEREBUS
+    assert report.proposed_state.phase is CampaignPhase.HALTED
     assert any("trajectory pool" in r for r in report.unsafe_reasons)
 
 
@@ -768,6 +1048,7 @@ def test_propose_recovery_preserves_existing_seed_select_cursor(tmp_path, monkey
 
 def test_propose_recovery_prefers_seeds_over_stale_seed_select(tmp_path, monkeypatch):
     monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
     campaign, data, training, models = _campaign_dirs(tmp_path)
     _write_pool(campaign)
     _commit_training_and_model_versions(training, models, [0])
@@ -837,6 +1118,7 @@ def test_propose_recovery_does_not_preserve_existing_phase_for_committed_iterati
 
 def test_propose_recovery_prefers_phase_b_over_stale_seed_select(tmp_path, monkeypatch):
     monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
     campaign, data, training, models = _campaign_dirs(tmp_path)
     _write_pool(campaign)
     _commit_training_and_model_versions(training, models, [0])
@@ -857,6 +1139,7 @@ def test_propose_recovery_prefers_phase_b_over_stale_seed_select(tmp_path, monke
 
 def test_propose_recovery_prefers_split_over_stale_phase_b(tmp_path, monkeypatch):
     monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
     campaign, data, training, models = _campaign_dirs(tmp_path)
     _write_pool(campaign)
     _commit_training_and_model_versions(training, models, [0])
@@ -878,6 +1161,7 @@ def test_propose_recovery_prefers_split_over_stale_phase_b(tmp_path, monkeypatch
 
 def test_propose_recovery_invalid_split_reenters_split(tmp_path, monkeypatch):
     monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
     campaign, data, training, models = _campaign_dirs(tmp_path)
     _write_pool(campaign)
     _commit_training_and_model_versions(training, models, [0])
@@ -888,7 +1172,10 @@ def test_propose_recovery_invalid_split_reenters_split(tmp_path, monkeypatch):
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
     _write_phase_b_handoff(campaign, 0, n=2)
-    _write_split(campaign, 0, train=[0], val=[2])
+    split_path = _write_split(campaign, 0, train=[0], val=[1])
+    split_payload = json.loads(split_path.read_text(encoding="utf-8"))
+    split_payload["slots"][0]["candidate_id"] = "wrong-candidate"
+    split_path.write_text(json.dumps(split_payload), encoding="utf-8")
 
     report = propose_recovery(campaign)
 
@@ -951,6 +1238,12 @@ def test_propose_recovery_protects_active_gaussian_handoff(tmp_path, monkeypatch
         accepted=[pointdir],
         rejected=[],
     )
+    _write_pending_allocation(
+        campaign,
+        context="active",
+        iteration=0,
+        n=1,
+    )
 
     report = propose_recovery(campaign)
 
@@ -981,6 +1274,12 @@ def test_propose_recovery_finds_staging_handoff_in_later_iteration(tmp_path, mon
         iteration=1,
         accepted=[pointdir],
         rejected=[],
+    )
+    _complete_handoff_allocation(
+        campaign,
+        context="active",
+        iteration=1,
+        pointdirs=[pointdir],
     )
 
     report = propose_recovery(campaign)

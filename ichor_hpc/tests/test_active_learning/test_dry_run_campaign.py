@@ -40,7 +40,8 @@ def _make_campaign(tmp_path, *, max_iterations=2):
     campaign = tmp_path / "campaign"
     campaign.mkdir()
     cfg = CampaignConfig(max_iterations=max_iterations, poll_interval_seconds=1)
-    cfg.active_batch.final_batch_size = 2
+    cfg.point_allocation.batch_training_size = 1
+    cfg.point_allocation.batch_internal_validation_size = 1
     cfg.seed_selection.n_seeds_per_iteration = 2
     return campaign, cfg
 
@@ -156,6 +157,7 @@ def test_dry_run_cli_drives_campaign_to_done(tmp_path):
     daemon completes a 2-iteration campaign."""
     campaign, cfg = _make_campaign(tmp_path)
     cfg.to_yaml(campaign / "campaign.yaml")
+    assert cli_main(["init", "--campaign-dir", str(campaign)]) == 0
     rc = cli_main([
         "start",
         "--campaign-dir", str(campaign),

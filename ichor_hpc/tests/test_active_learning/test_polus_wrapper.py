@@ -16,13 +16,14 @@ def _h2(length):
     return Atoms([Atom("H", 0.0, 0.0, 0.0), Atom("H", float(length), 0.0, 0.0)])
 
 
-def test_phase_b_target_size_is_fixed_final_batch_size():
+def test_phase_b_target_size_is_exact_active_allocation_total():
     cfg = CampaignConfig()
-    cfg.active_batch.final_batch_size = 5
+    cfg.point_allocation.batch_training_size = 4
+    cfg.point_allocation.batch_internal_validation_size = 1
     plenty = 1000  # never let the candidate pool be the binding constraint
     assert _phase_b_target_size(cfg, plenty, iteration=0) == 5
     assert _phase_b_target_size(cfg, plenty, iteration=100) == 5
-    with pytest.raises(ValueError, match="active_batch_underfilled"):
+    with pytest.raises(ValueError, match="point_allocation_underfilled"):
         _phase_b_target_size(cfg, 3, iteration=100)
 
 

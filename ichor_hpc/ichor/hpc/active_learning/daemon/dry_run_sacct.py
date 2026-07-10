@@ -53,11 +53,25 @@ class DryRunSacctPoller:
         job_id_str = str(job_id)
         self.invocations.append(job_id_str)
         if job_id_str.startswith(DRYRUN_PREFIX):
-            return [JobObservation(
-                job_id=job_id_str,
-                status=JobStatus.COMPLETED,
-                exit_code=(0, 0),
-                elapsed_seconds=self._elapsed,
-            )]
+            raw_expected = kwargs.get("expected_task_count")
+            try:
+                expected = int(raw_expected) if raw_expected is not None else 1
+            except (TypeError, ValueError) as exc:
+                raise ValueError("expected_task_count must be an integer") from exc
+            if expected <= 0:
+                expected = 1
+            return [
+                JobObservation(
+                    job_id=(
+                        job_id_str
+                        if expected == 1
+                        else job_id_str + "_" + str(task_index)
+                    ),
+                    status=JobStatus.COMPLETED,
+                    exit_code=(0, 0),
+                    elapsed_seconds=self._elapsed,
+                )
+                for task_index in range(expected)
+            ]
         observations = self._fallback(job_id_str, **kwargs)
         return list(observations) if not isinstance(observations, list) else observations

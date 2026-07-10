@@ -44,7 +44,7 @@ __all__ = [
 ]
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_STATE_FILENAME = "state.json"
 
 
@@ -53,6 +53,9 @@ class CampaignPhase(str, Enum):
     PHASE_A_POLUS = "PHASE_A_POLUS"
     INITIAL_GAUSSIAN = "INITIAL_GAUSSIAN"
     INITIAL_AIMALL = "INITIAL_AIMALL"
+    INITIAL_ALLOCATION_CHECK = "INITIAL_ALLOCATION_CHECK"
+    INITIAL_REPLACEMENT_GAUSSIAN = "INITIAL_REPLACEMENT_GAUSSIAN"
+    INITIAL_REPLACEMENT_AIMALL = "INITIAL_REPLACEMENT_AIMALL"
     INITIAL_FEREBUS = "INITIAL_FEREBUS"
     SEED_SELECT = "SEED_SELECT"
     ARIADNE_ARRAY = "ARIADNE_ARRAY"
@@ -60,6 +63,9 @@ class CampaignPhase(str, Enum):
     SPLIT = "SPLIT"
     GAUSSIAN = "GAUSSIAN"
     AIMALL = "AIMALL"
+    ALLOCATION_CHECK = "ALLOCATION_CHECK"
+    REPLACEMENT_GAUSSIAN = "REPLACEMENT_GAUSSIAN"
+    REPLACEMENT_AIMALL = "REPLACEMENT_AIMALL"
     APPEND = "APPEND"
     FEREBUS = "FEREBUS"
     STOP_CHECK = "STOP_CHECK"
@@ -142,6 +148,7 @@ class CampaignState:
     training_set_version: int = 0
     validation_set_version: int = 0
     models_version: int = 0
+    replacement_round: int = 0
     last_acquisition_alpha0: Optional[float] = None
     stop_streak: int = 0
     shutdown_requested: bool = False
@@ -193,7 +200,7 @@ class CampaignState:
         required_str = ("campaign_uid", "campaign_started_iso")
         required_int = ("iteration", "max_iterations",
                          "training_set_version", "validation_set_version",
-                         "models_version", "stop_streak")
+                         "models_version", "replacement_round", "stop_streak")
         for key in required_str:
             if not isinstance(payload.get(key), str) or not payload[key]:
                 raise StateSchemaError("missing or non-string field: " + key)
@@ -205,6 +212,7 @@ class CampaignState:
         training_set_version = int(payload["training_set_version"])
         validation_set_version = int(payload["validation_set_version"])
         models_version = int(payload["models_version"])
+        replacement_round = int(payload["replacement_round"])
         stop_streak = int(payload["stop_streak"])
         if iteration < 0:
             raise StateSchemaError("iteration must be >= 0")
@@ -216,6 +224,8 @@ class CampaignState:
             raise StateSchemaError("validation_set_version must be >= -1")
         if models_version < -1:
             raise StateSchemaError("models_version must be >= -1")
+        if replacement_round < 0:
+            raise StateSchemaError("replacement_round must be >= 0")
         if stop_streak < 0:
             raise StateSchemaError("stop_streak must be >= 0")
 
@@ -277,6 +287,7 @@ class CampaignState:
             training_set_version=training_set_version,
             validation_set_version=validation_set_version,
             models_version=models_version,
+            replacement_round=replacement_round,
             last_acquisition_alpha0=None if alpha0 is None else float(alpha0),
             stop_streak=stop_streak,
             shutdown_requested=bool(payload.get("shutdown_requested", False)),

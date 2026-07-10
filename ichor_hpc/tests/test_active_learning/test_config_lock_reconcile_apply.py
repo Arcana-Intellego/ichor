@@ -27,7 +27,17 @@ from ichor.hpc.active_learning.daemon.state import (
     read_state,
     write_state,
 )
+from ichor.hpc.active_learning.point_allocation import (
+    create_point_allocation,
+    pending_attempts,
+    point_allocation_path,
+    record_quantum_results,
+)
 from ichor.hpc.active_learning.submit import sacct_poll
+from ichor.hpc.active_learning.versioning.provenance import (
+    enrich_with_point_allocation,
+    write_seed_provenance,
+)
 from ichor.hpc.active_learning.versioning.training_set import TrainingSetVersioning
 
 
@@ -55,11 +65,67 @@ def _write_pool(campaign):
 
 
 def _commit_training_version(campaign, version=0):
+    from ichor.hpc.active_learning.daemon.input_staging import (
+        commit_initial_training_set,
+    )
+
+    if int(version) != 0:
+        raise ValueError("fixture helper only supports bootstrap version 0")
     _write_pool(campaign)
-    tv = TrainingSetVersioning(campaign / "5_TRAINING")
-    staging = tv.stage(None, version)
-    (staging / "marker.txt").write_text("training", encoding="utf-8")
-    tv.commit(version)
+    allocation_path = point_allocation_path(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+    )
+    allocation = create_point_allocation(
+        allocation_path,
+        campaign_uid="config-lock-test",
+        context="bootstrap",
+        iteration=0,
+        targets={"train": 1, "int_val": 0, "ext_val": 0, "total": 1},
+        primary_candidates=[
+            {
+                "candidate_id": "bootstrap-candidate-0",
+                "frame_id": 0,
+                "pointdir_name": "POINT_0000.pointdir",
+            }
+        ],
+        reserve_candidates=[],
+    )
+    attempt = pending_attempts(allocation)[0]
+    pointdir = campaign / ".DATA" / "STAGING" / "initial" / "POINT_0000.pointdir"
+    pointdir.mkdir(parents=True, exist_ok=True)
+    (pointdir / "input.gjf").write_text("# fixture\n", encoding="utf-8")
+    write_seed_provenance(
+        pointdir,
+        campaign_uid="config-lock-test",
+        iteration=0,
+        trajectory_sha256="0" * 64,
+        seed_frame_id=0,
+        seed_selection_origin="bootstrap_fixture",
+        seed_variance_at_selection=None,
+        subspace_neighbour_frame_ids=[],
+        subspace_dimension=0,
+        subspace_eigenvalues=[],
+    )
+    enrich_with_point_allocation(
+        pointdir,
+        candidate_id=str(attempt["candidate_id"]),
+        context="bootstrap",
+        slot_id=int(attempt["slot_id"]),
+        split=str(attempt["split"]),
+    )
+    record_quantum_results(
+        allocation_path,
+        [
+            {
+                "candidate_id": str(attempt["candidate_id"]),
+                "accepted": True,
+                "pointdir": str(pointdir.resolve()),
+            }
+        ],
+    )
+    assert commit_initial_training_set(campaign) is True
 
 
 def _write_config(campaign, config):
@@ -75,6 +141,28 @@ def _write_phase_a_sample(campaign):
     index = initial / "initial-INDEX-1.dat"
     sample.write_text("1\nframe 0\nH 0.0 0.0 0.0\n", encoding="utf-8")
     index.write_text("0\n", encoding="utf-8")
+    allocation_path = point_allocation_path(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+    )
+    allocation = create_point_allocation(
+        allocation_path,
+        campaign_uid="config-lock-test",
+        context="bootstrap",
+        iteration=0,
+        targets={"train": 1, "int_val": 0, "ext_val": 0, "total": 1},
+        primary_candidates=[
+            {"candidate_id": "bootstrap-candidate-0", "frame_id": 0}
+        ],
+        reserve_candidates=[],
+    )
+    slot = allocation["slots"][0]
+    primary = [{
+        **slot["attempts"][0],
+        "slot_id": int(slot["slot_id"]),
+        "split": str(slot["split"]),
+    }]
     write_phase_a_sample_manifest(initial, {
         "phase": "PHASE_A_POLUS",
         "iteration": -1,
@@ -85,6 +173,14 @@ def _write_phase_a_sample(campaign):
         "selected_indices": [0],
         "descriptor": "mass_weighted_rmsd",
         "n_pool_frames": 1,
+        "bootstrap_total_size": 1,
+        "point_allocation": {
+            "manifest": str(allocation_path.resolve()),
+            "targets": dict(allocation["targets"]),
+            "primary": primary,
+            "reserve_frame_ids": [],
+            "reserve_count": 0,
+        },
     })
 
 
@@ -268,7 +364,7 @@ def test_phase_walltime_changes_are_allowed_runtime_changes(tmp_path):
     assert not review.blocked_changes
 
 
-def test_schema_v3_config_lock_migrates_before_diff(tmp_path):
+def test_schema_v3_config_lock_is_rejected_without_compatibility_migration(tmp_path):
     campaign = _campaign(tmp_path)
     current = CampaignConfig()
     old_v3 = {
@@ -313,8 +409,9 @@ def test_schema_v3_config_lock_migrates_before_diff(tmp_path):
         encoding="utf-8",
     )
     review = review_config_changes(campaign, current, fresh_campaign_state())
-    assert review.allowed
-    assert not review.changed
+    assert not review.allowed
+    assert [change.path for change in review.blocked_changes] == ["config_lock"]
+    assert "requires schema_version 9" in review.blocked_changes[0].reason
 
 
 def test_retry_phase_requires_retryable_journal_event():
@@ -552,12 +649,12 @@ def test_phase_b_config_change_blocks_after_selection_exists(tmp_path):
     assert review.blocked_changes[0].category == "postprocess_locked"
 
 
-def test_active_batch_change_blocks_after_phase_b_selection_exists(tmp_path):
+def test_batch_allocation_change_blocks_after_phase_b_selection_exists(tmp_path):
     campaign = _campaign(tmp_path)
     original = CampaignConfig()
     write_config_lock(campaign, original)
     changed = CampaignConfig()
-    changed.active_batch.final_batch_size = 5
+    changed.point_allocation.batch_training_size = 5
     iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
     iter_dir.mkdir(parents=True)
     (iter_dir / "PHASE_B_SELECTION.json").write_text("{}", encoding="utf-8")
@@ -569,7 +666,7 @@ def test_active_batch_change_blocks_after_phase_b_selection_exists(tmp_path):
 
     assert not review.allowed
     assert [c.path for c in review.blocked_changes] == [
-        "active_batch.final_batch_size"
+        "point_allocation.batch_training_size"
     ]
     assert "Phase B" in review.blocked_changes[0].reason
 
@@ -861,13 +958,13 @@ def test_bootstrap_size_blocks_after_phase_a_output(tmp_path):
     original = CampaignConfig()
     write_config_lock(campaign, original)
     changed = CampaignConfig()
-    changed.bootstrap.initial_labelled_size = 24
+    changed.point_allocation.bootstrap_training_size = 24
 
     review = review_config_changes(campaign, changed, fresh_campaign_state())
 
     assert not review.allowed
     assert [c.path for c in review.blocked_changes] == [
-        "bootstrap.initial_labelled_size"
+        "point_allocation.bootstrap_training_size"
     ]
     assert "Phase A" in review.blocked_changes[0].reason
 
@@ -878,12 +975,12 @@ def test_bootstrap_anchor_blocks_after_phase_a_output(tmp_path):
     original = CampaignConfig()
     write_config_lock(campaign, original)
     changed = CampaignConfig()
-    changed.bootstrap.anchor = True
+    changed.point_allocation.anchor = True
 
     review = review_config_changes(campaign, changed, fresh_campaign_state())
 
     assert not review.allowed
-    assert [c.path for c in review.blocked_changes] == ["bootstrap.anchor"]
+    assert [c.path for c in review.blocked_changes] == ["point_allocation.anchor"]
     assert "Phase A" in review.blocked_changes[0].reason
 
 
@@ -899,7 +996,7 @@ def test_system_name_allowed_before_first_ferebus(tmp_path):
     review = review_config_changes(campaign, changed, proposed)
 
     assert review.allowed
-    assert [c.path for c in review.allowed_changes] == ["system_name"]
+    assert [c.path for c in review.allowed_changes] == ["campaign.system_name"]
     assert not review.blocked_changes
 
 
@@ -918,50 +1015,21 @@ def test_system_name_blocks_after_ferebus_staging_exists(tmp_path):
     review = review_config_changes(campaign, changed, proposed)
 
     assert not review.allowed
-    assert [c.path for c in review.blocked_changes] == ["system_name"]
+    assert [c.path for c in review.blocked_changes] == ["campaign.system_name"]
     assert "FEREBUS" in review.blocked_changes[0].reason
 
 
-def test_ferebus_split_fractions_block_after_split_ledger_exists(tmp_path):
+def test_removed_fractional_split_controls_are_absent_from_schema(tmp_path):
     campaign = _campaign(tmp_path)
-    ledger = campaign / ".DATA" / "ACTIVE_LEARNING" / "ferebus_split_assignments.json"
-    ledger.write_text('{"schema_version": 3, "assignments": {}}', encoding="utf-8")
-    original = CampaignConfig()
-    write_config_lock(campaign, original)
-    changed = CampaignConfig()
-    changed.ferebus.train_fraction = 0.75
-    changed.ferebus.internal_validation_fraction = 0.25
-
-    proposed = fresh_campaign_state()
-    proposed.phase = CampaignPhase.INITIAL_FEREBUS
-    review = review_config_changes(campaign, changed, proposed)
-
-    assert not review.allowed
-    assert {c.path for c in review.blocked_changes} == {
-        "ferebus.train_fraction",
-        "ferebus.internal_validation_fraction",
-    }
-    assert all("FEREBUS" in c.reason for c in review.blocked_changes)
+    config = CampaignConfig()
+    assert not hasattr(config.ferebus, "train_fraction")
+    assert not hasattr(config.ferebus, "internal_validation_fraction")
+    assert not hasattr(config, "active_batch")
+    assert not hasattr(config, "bootstrap")
 
 
-def test_split_config_blocks_after_split_json_exists(tmp_path):
-    campaign = _campaign(tmp_path)
-    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
-    iter_dir.mkdir(parents=True)
-    (iter_dir / "split.json").write_text("{}", encoding="utf-8")
-    original = CampaignConfig()
-    write_config_lock(campaign, original)
-    changed = CampaignConfig()
-    changed.split.train_fraction = 0.70
-
-    proposed = fresh_campaign_state()
-    proposed.phase = CampaignPhase.SPLIT
-    proposed.iteration = 0
-    review = review_config_changes(campaign, changed, proposed)
-
-    assert not review.allowed
-    assert [c.path for c in review.blocked_changes] == ["split.train_fraction"]
-    assert "SPLIT" in review.blocked_changes[0].reason
+def test_removed_post_qm_split_block_is_absent_from_schema(tmp_path):
+    assert not hasattr(CampaignConfig(), "split")
 
 
 def test_reconcile_apply_promotes_state_and_cleans_ferebus_staging(tmp_path, capsys):

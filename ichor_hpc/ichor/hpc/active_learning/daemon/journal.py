@@ -148,6 +148,14 @@ KNOWN_EVENT_TYPES = (
     "pool_feasibility_checked",
     "quantum_quality_summary",
     "seed_posterior_fallback",
+    "point_allocation_complete",
+    "point_allocation_replacement_prepared",
+    "point_allocation_quantum_recorded",
+    "aimall_skipped_no_gaussian_acceptances",
+    "ariadne_sampling_protocol_replay_failed",
+    "legacy_sampling_protocol_repreview",
+    "partial_array_recovery_postprocess_only",
+    "partial_array_recovery_prepared",
 )
 
 

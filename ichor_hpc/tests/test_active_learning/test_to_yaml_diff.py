@@ -28,18 +28,21 @@ def test_single_nested_edit_serialises_minimally():
     }
 
 
-def test_top_level_edit_appears_at_root():
+def test_campaign_identity_alias_serialises_in_campaign_block():
     c = CampaignConfig()
     c.max_iterations = 999
     d = diff_against_defaults(c)
-    assert d == {"schema_version": CONFIG_SCHEMA_VERSION, "max_iterations": 999}
+    assert d == {
+        "schema_version": CONFIG_SCHEMA_VERSION,
+        "campaign": {"max_iterations": 999},
+    }
 
 
 def test_diff_is_round_trip_loadable(tmp_path):
     c = CampaignConfig()
     c.acquisition.subspace.mode_weighting_policy = "inverse_frequency"
     c.acquisition.weights.lambda_force = 2.5
-    c.split.train_fraction = 0.8
+    c.point_allocation.batch_training_size = 5
     p = tmp_path / "campaign.yaml"
     c.to_yaml(p)
     text = p.read_text(encoding="utf-8")
@@ -49,7 +52,7 @@ def test_diff_is_round_trip_loadable(tmp_path):
     c2 = CampaignConfig.from_yaml(p)
     assert c2.acquisition.subspace.mode_weighting_policy == "inverse_frequency"
     assert c2.acquisition.weights.lambda_force == 2.5
-    assert c2.split.train_fraction == 0.8
+    assert c2.point_allocation.batch_training_size == 5
     assert c2 == c
 
 
@@ -120,7 +123,7 @@ def test_save_load_round_trip_preserves_config(tmp_path):
     that's been through to_yaml -> from_yaml must equal the original."""
     c = CampaignConfig()
     c.phase_b.beta = 0.7
-    c.split.strategy = "random_80_20"
+    c.point_allocation.batch_internal_validation_size = 2
     c.ferebus.kernel = "rbf_per"
     p = tmp_path / "c.yaml"
     c.to_yaml(p)

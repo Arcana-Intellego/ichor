@@ -1,17 +1,17 @@
-"""Persistent pointdir-level FEREBUS split assignments."""
+"""Persistent exact pointdir-level FEREBUS split assignments."""
 from __future__ import annotations
 
 import json
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 from .state import atomic_write_json
 
 
 FEREBUS_SPLIT_LEDGER_FILENAME = "ferebus_split_assignments.json"
 BOOTSTRAP_EXTERNAL_VALIDATION_FILENAME = "bootstrap_external_validation.json"
-FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION = 3
+FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION = 4
 _LOCK_FILENAME = "ferebus_split_assignments.lock"
 _SPLITS = ("train", "int_val", "ext_val")
 
@@ -47,7 +47,9 @@ def bootstrap_external_validation_path(campaign_dir: Path) -> Path:
 def _empty_payload() -> Dict[str, Any]:
     return {
         "schema_version": FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION,
+        "allocation_policy": "exact_per_training_version",
         "assignments": {},
+        "version_allocations": {},
     }
 
 
@@ -61,118 +63,42 @@ def _load(path: Path) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("FEREBUS split ledger must be a JSON object: " + str(path))
     if int(data.get("schema_version", -1)) != FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION:
-        raise ValueError("unsupported FEREBUS split ledger schema: " + str(path))
-    assignments = data.get("assignments")
-    if not isinstance(assignments, dict):
+        raise ValueError(
+            "unsupported FEREBUS split ledger schema; schema 4 is required: "
+            + str(path)
+        )
+    if str(data.get("allocation_policy")) != "exact_per_training_version":
+        raise ValueError("FEREBUS split ledger allocation policy is invalid")
+    if not isinstance(data.get("assignments"), dict):
         raise ValueError("FEREBUS split ledger assignments must be an object")
+    if not isinstance(data.get("version_allocations"), dict):
+        raise ValueError("FEREBUS split ledger version_allocations must be an object")
     return data
 
 
 def _counts(assignments: Mapping[str, Mapping[str, Any]]) -> Dict[str, int]:
-    out = {name: 0 for name in _SPLITS}
+    counts = {split: 0 for split in _SPLITS}
     for record in assignments.values():
         split = str(record.get("split"))
-        if split in out:
-            out[split] += 1
-    return out
+        if split not in counts:
+            raise ValueError("invalid split in FEREBUS ledger: " + repr(split))
+        counts[split] += 1
+    return counts
 
 
-def _clamp_int(value: int, lower: int, upper: int) -> int:
-    return max(int(lower), min(int(upper), int(value)))
-
-
-def _plan_train_internal(n_rows: int, fractions: Sequence[float]) -> Dict[str, int]:
-    n = int(n_rows)
-    if n <= 0:
-        return {"train": 0, "int_val": 0}
-    train_fraction, internal_fraction = (float(fractions[0]), float(fractions[1]))
-    n_train = int(round(float(n) * train_fraction))
-    n_train = _clamp_int(n_train, 1, n)
-    n_int = n - n_train
-    if n >= 2 and internal_fraction > 0.0 and n_int < 1:
-        n_int = 1
-        n_train = n - 1
-    return {"train": int(n_train), "int_val": int(n_int)}
-
-
-def _initial_target_counts(
-    n_rows: int,
-    train_internal_fractions: Sequence[float],
-    external_validation_size: int,
-) -> Dict[str, int]:
-    n = int(n_rows)
-    if n <= 0:
-        return {"train": 0, "int_val": 0, "ext_val": 0}
-    if isinstance(external_validation_size, bool) or not isinstance(
-        external_validation_size,
-        int,
-    ):
-        raise ValueError("external_validation_size must be an integer")
-    n_ext = int(external_validation_size)
-    if n_ext < 0:
-        raise ValueError("external_validation_size must be >= 0")
-    if n_ext >= n:
-        raise ValueError(
-            "external_validation_size must be smaller than initial labelled size"
-        )
-    internal = _plan_train_internal(n - n_ext, train_internal_fractions)
-    return {
-        "train": internal["train"],
-        "int_val": internal["int_val"],
-        "ext_val": n_ext,
-    }
-
-
-def plan_initial_split_counts(
-    n_rows: int,
-    train_internal_fractions: Sequence[float],
-    external_validation_size: int,
-) -> Dict[str, int]:
-    """Public wrapper for the bootstrap split-size contract.
-
-    Anchor planning uses the same arithmetic as the ledger so the Phase-A
-    capacity check cannot drift from the actual model-0 train/internal/external
-    row assignment.
-    """
-    return dict(
-        _initial_target_counts(
-            int(n_rows),
-            train_internal_fractions,
-            external_validation_size,
-        )
-    )
-
-
-def _target_counts_for_incremental(
-    total_n: int,
-    assignments: Mapping[str, Mapping[str, Any]],
-    train_internal_fractions: Sequence[float],
-) -> Dict[str, int]:
-    counts = _counts(assignments)
-    non_external_n = max(0, int(total_n) - int(counts["ext_val"]))
-    internal = _plan_train_internal(non_external_n, train_internal_fractions)
-    return {
-        "train": internal["train"],
-        "int_val": internal["int_val"],
-        "ext_val": counts["ext_val"],
-    }
-
-
-def _choose_split(
-    assignments: Mapping[str, Mapping[str, Any]],
-    *,
-    n_after: int,
-    train_internal_fractions: Sequence[float],
-) -> str:
-    counts = _counts(assignments)
-    targets = _target_counts_for_incremental(
-        n_after,
-        assignments,
-        train_internal_fractions,
-    )
-    candidate_splits = ("train", "int_val")
-    deficits = {split: targets[split] - counts[split] for split in candidate_splits}
-    return max(candidate_splits, key=lambda split: (deficits[split], split == "train"))
+def _normalise_expected(expected_counts: Mapping[str, Any]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for split in _SPLITS:
+        raw = expected_counts.get(split, 0)
+        if isinstance(raw, bool):
+            raise ValueError("expected FEREBUS split counts must be integers")
+        value = int(raw)
+        if value < 0:
+            raise ValueError("expected FEREBUS split count must be >= 0 for " + split)
+        counts[split] = value
+    if counts["train"] <= 0:
+        raise ValueError("every FEREBUS version must add training rows")
+    return counts
 
 
 def ensure_split_assignments(
@@ -180,153 +106,139 @@ def ensure_split_assignments(
     pointdir_names: Sequence[str],
     *,
     training_version: int,
-    train_internal_fractions: Sequence[float],
-    external_validation_size: int,
+    expected_new_counts: Mapping[str, int],
     pointdir_identity: Optional[Mapping[str, str]] = None,
     forced_splits: Optional[Mapping[str, str]] = None,
+    allocation_manifest_sha256: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Assign pointdirs to train/internal/external without moving old rows."""
-    names = [str(n) for n in pointdir_names]
+    """Assign only the new pointdirs for one version using exact split quotas."""
+    campaign = Path(campaign_dir)
+    version = int(training_version)
+    if version < 0:
+        raise ValueError("training_version must be >= 0")
+    names = [str(name) for name in pointdir_names]
     if len(set(names)) != len(names):
         raise ValueError("duplicate pointdir names passed to FEREBUS split ledger")
-    name_set = set(names)
-    forced_map = {str(k): str(v) for k, v in (forced_splits or {}).items()}
-    unknown_forced = sorted(name for name in forced_map if name not in name_set)
-    if unknown_forced:
-        raise ValueError(
-            "forced FEREBUS split references unknown pointdirs: "
-            + repr(unknown_forced)
-        )
-    for name, split in sorted(forced_map.items()):
+    identities = {str(key): str(value) for key, value in (pointdir_identity or {}).items()}
+    forced = {str(key): str(value) for key, value in (forced_splits or {}).items()}
+    expected = _normalise_expected(expected_new_counts)
+    if version > 0 and expected["ext_val"] != 0:
+        raise ValueError("active FEREBUS versions cannot add external-validation rows")
+    if version == 0 and expected["int_val"] <= 0:
+        raise ValueError("bootstrap FEREBUS allocation must include internal-validation rows")
+    for name, split in forced.items():
+        if name not in names:
+            raise ValueError("forced FEREBUS split references unknown pointdir: " + name)
         if split not in _SPLITS:
-            raise ValueError(
-                "forced FEREBUS split for "
-                + name
-                + " must be one of "
-                + repr(_SPLITS)
-            )
-    train_internal_tuple = tuple(float(x) for x in train_internal_fractions)
-    if isinstance(external_validation_size, bool) or not isinstance(
-        external_validation_size,
-        int,
-    ):
-        raise ValueError("external_validation_size must be an integer")
-    external_size = int(external_validation_size)
-    path = ledger_path(Path(campaign_dir))
-    with _ledger_lock(Path(campaign_dir)):
+            raise ValueError("invalid forced FEREBUS split for " + name + ": " + split)
+
+    path = ledger_path(campaign)
+    with _ledger_lock(campaign):
         payload = _load(path)
-        assignments: Dict[str, Dict[str, Any]] = {
-            str(k): dict(v) for k, v in payload.get("assignments", {}).items()
+        assignments = {
+            str(name): dict(record)
+            for name, record in payload["assignments"].items()
         }
-        identities = {str(k): str(v) for k, v in (pointdir_identity or {}).items()}
+        version_allocations = {
+            str(key): dict(value)
+            for key, value in payload["version_allocations"].items()
+        }
+        unknown_existing = sorted(set(assignments) - set(names))
+        if unknown_existing:
+            raise ValueError(
+                "committed training set no longer contains ledger pointdirs: "
+                + repr(unknown_existing[:8])
+            )
         for name in names:
             if name not in assignments:
                 continue
-            current_identity = identities.get(name)
-            if not current_identity:
-                continue
-            recorded_identity = assignments[name].get("provenance_sha256")
-            if recorded_identity is None:
-                assignments[name]["provenance_sha256"] = current_identity
-            elif str(recorded_identity) != current_identity:
+            identity = identities.get(name)
+            recorded = assignments[name].get("provenance_sha256")
+            if identity and recorded and str(identity) != str(recorded):
+                raise ValueError("FEREBUS split ledger pointdir identity mismatch for " + name)
+            if identity and recorded is None:
+                assignments[name]["provenance_sha256"] = identity
+            if name in forced and str(assignments[name].get("split")) != forced[name]:
+                raise ValueError("committed FEREBUS split conflicts with allocation provenance for " + name)
+
+        new_names = [name for name in names if name not in assignments]
+        version_key = str(version)
+        existing_version_record = version_allocations.get(version_key)
+        if not new_names and existing_version_record is not None:
+            if dict(existing_version_record.get("expected_new_counts") or {}) != expected:
                 raise ValueError(
-                    "FEREBUS split ledger pointdir identity mismatch for "
-                    + name
+                    "FEREBUS retry allocation counts changed for version " + str(version)
                 )
-        for name, split in sorted(forced_map.items()):
-            if name in assignments and str(assignments[name].get("split")) != split:
+            recorded_hash = str(existing_version_record.get("allocation_manifest_sha256") or "")
+            if str(allocation_manifest_sha256 or "") != recorded_hash:
                 raise ValueError(
-                    "forced FEREBUS split for "
-                    + name
-                    + " conflicts with existing ledger split "
-                    + repr(assignments[name].get("split"))
+                    "FEREBUS retry allocation manifest hash changed for version "
+                    + str(version)
                 )
-        new_names = [name for name in sorted(names) if name not in assignments]
-        if not assignments and new_names:
-            sizes = _initial_target_counts(
-                len(new_names),
-                train_internal_tuple,
-                external_size,
+        elif len(new_names) != sum(expected.values()):
+            raise ValueError(
+                "new pointdir count does not match exact allocation for training version "
+                + str(version) + ": expected " + str(sum(expected.values()))
+                + ", found " + str(len(new_names))
             )
-            forced_counts = {split: 0 for split in _SPLITS}
-            for name in new_names:
-                if name in forced_map:
-                    forced_counts[forced_map[name]] += 1
-            for split in _SPLITS:
-                if forced_counts[split] > sizes[split]:
-                    raise ValueError(
-                        "forced FEREBUS "
-                        + split
-                        + " rows exceed planned initial split size: "
-                        + str(forced_counts[split])
-                        + " > "
-                        + str(sizes[split])
-                    )
-            remaining_splits: List[str] = (
-                ["train"] * (sizes["train"] - forced_counts["train"])
-                + ["int_val"] * (sizes["int_val"] - forced_counts["int_val"])
-                + ["ext_val"] * (sizes["ext_val"] - forced_counts["ext_val"])
+        missing_forced = sorted(name for name in new_names if name not in forced)
+        if missing_forced:
+            raise ValueError(
+                "new pointdirs are missing authoritative allocation splits: "
+                + repr(missing_forced[:8])
             )
-            remaining_iter = iter(remaining_splits)
-            for name in new_names:
-                forced_split = forced_map.get(name)
-                split = forced_split if forced_split is not None else next(remaining_iter)
-                assignments[name] = {
-                    "split": split,
-                    "first_seen_training_version": int(training_version),
-                    "assignment_version": 1,
-                    "train_internal_fractions_at_assignment": list(train_internal_tuple),
-                    "external_validation_size_at_assignment": external_size,
-                    "provenance_sha256": identities.get(name),
-                }
-                if forced_split is not None:
-                    assignments[name]["forced_split"] = str(forced_split)
-                    assignments[name]["forced_split_reason"] = "bootstrap_anchor"
-        else:
-            for name in new_names:
-                forced_split = forced_map.get(name)
-                if forced_split is None:
-                    split = _choose_split(
-                        assignments,
-                        n_after=len(assignments) + 1,
-                        train_internal_fractions=train_internal_tuple,
-                    )
-                else:
-                    split = forced_split
-                assignments[name] = {
-                    "split": split,
-                    "first_seen_training_version": int(training_version),
-                    "assignment_version": 1,
-                    "train_internal_fractions_at_assignment": list(train_internal_tuple),
-                    "external_validation_size_at_assignment": external_size,
-                    "provenance_sha256": identities.get(name),
-                }
-                if forced_split is not None:
-                    assignments[name]["forced_split"] = str(forced_split)
-                    assignments[name]["forced_split_reason"] = "bootstrap_anchor"
+        actual_new = {split: 0 for split in _SPLITS}
+        for name in new_names:
+            split = forced[name]
+            actual_new[split] += 1
+        if not new_names and existing_version_record is not None:
+            actual_new = {
+                split: int((existing_version_record.get("actual_new_counts") or {}).get(split, 0))
+                for split in _SPLITS
+            }
+        if actual_new != expected:
+            raise ValueError(
+                "new FEREBUS split counts do not match point allocation: expected "
+                + repr(expected) + ", found " + repr(actual_new)
+            )
+
+        version_record = {
+            "training_version": version,
+            "expected_new_counts": dict(expected),
+            "actual_new_counts": dict(actual_new),
+            "pointdirs": list(new_names),
+            "allocation_manifest_sha256": str(allocation_manifest_sha256 or ""),
+        }
+        if existing_version_record is not None and new_names and existing_version_record != version_record:
+            raise ValueError("FEREBUS version allocation is immutable for version " + str(version))
+        for name in new_names:
+            assignments[name] = {
+                "split": forced[name],
+                "first_seen_training_version": version,
+                "assignment_version": 2,
+                "allocation_manifest_sha256": str(allocation_manifest_sha256 or ""),
+                "provenance_sha256": identities.get(name),
+            }
+        if existing_version_record is None:
+            version_allocations[version_key] = version_record
         payload = {
             "schema_version": FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION,
-            "split_policy": {
-                "bootstrap_external_validation_size": external_size,
-                "ferebus_train_fraction": train_internal_tuple[0],
-                "ferebus_internal_validation_fraction": train_internal_tuple[1],
-                "external_validation_applies_to_bootstrap_only": True,
-                "forced_split_count": int(len(forced_map)),
-            },
+            "allocation_policy": "exact_per_training_version",
             "assignments": assignments,
+            "version_allocations": version_allocations,
         }
         atomic_write_json(path, payload)
-        external_names = [
-            name
-            for name, record in sorted(assignments.items())
+
+        external_names = sorted(
+            name for name, record in assignments.items()
             if str(record.get("split")) == "ext_val"
-        ]
+        )
         atomic_write_json(
-            bootstrap_external_validation_path(Path(campaign_dir)),
+            bootstrap_external_validation_path(campaign),
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "ledger_schema_version": FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION,
-                "external_validation_size": external_size,
+                "bootstrap_external_validation_size": len(external_names),
                 "n_external": len(external_names),
                 "pointdirs": external_names,
                 "applies_to_bootstrap_only": True,
@@ -334,22 +246,22 @@ def ensure_split_assignments(
         )
 
     row_ids = {split: [] for split in _SPLITS}
-    missing = []
-    for idx, name in enumerate(names):
-        record = assignments.get(name)
-        if not record:
-            missing.append(name)
-            continue
-        split = str(record.get("split"))
-        if split not in row_ids:
-            raise ValueError("invalid FEREBUS split in ledger for " + name + ": " + split)
-        row_ids[split].append(int(idx))
-    if missing:
-        raise ValueError("FEREBUS split ledger did not assign: " + repr(missing))
+    for row_id, name in enumerate(names):
+        split = str(assignments[name]["split"])
+        row_ids[split].append(int(row_id))
     return {
         "path": str(path),
         "assignments": assignments,
         "row_ids": row_ids,
-        "counts": {split: len(row_ids[split]) for split in _SPLITS},
-        "split_policy": dict(payload.get("split_policy") or {}),
+        "counts": _counts(assignments),
+        "version_allocation": dict(version_allocations[str(version)]),
+        "allocation_policy": "exact_per_training_version",
     }
+
+
+__all__ = [
+    "FEREBUS_SPLIT_LEDGER_FILENAME",
+    "FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION",
+    "ledger_path",
+    "ensure_split_assignments",
+]

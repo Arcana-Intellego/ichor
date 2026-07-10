@@ -105,7 +105,7 @@ The :code:`campaign.yaml` file is a nested block layout. The full
 minimal sparse config overrides only the keys you care about; every other
 field falls back to its dataclass default::
 
-    schema_version: 8
+    schema_version: 9
 
     campaign:
       max_iterations: 50
@@ -113,13 +113,13 @@ field falls back to its dataclass default::
     runtime:
       poll_interval_seconds: 60
 
-    bootstrap:
-      initial_labelled_size: 300
-      external_validation_size: 60
+    point_allocation:
+      bootstrap_training_size: 192
+      bootstrap_internal_validation_size: 48
+      bootstrap_external_validation_size: 60
+      batch_training_size: 8
+      batch_internal_validation_size: 2
       anchor: false
-
-    active_batch:
-      final_batch_size: 10
 
     seed_selection:
       n_seeds_per_iteration: 20
@@ -376,10 +376,9 @@ Architecture sketch
 -------------------
 
 The daemon is a finite-state machine over campaign phases. Each phase
-is either INLINE (runs synchronously in the daemon process; e.g.
-SEED_SELECT, SPLIT, APPEND, STOP_CHECK) or SBATCH (submits via
-:code:`sbatch --parsable`, polls sacct, then runs a postprocess parser
-in the daemon process).
+is either INLINE (runs synchronously in the daemon process) or SBATCH
+(submits via :code:`sbatch --parsable`, polls sacct, then runs a
+postprocess parser in the daemon process).
 
 .. code-block:: text
 
@@ -395,6 +394,12 @@ in the daemon process).
    INITIAL_AIMALL  (sbatch)       IQA decomposition.
      |
      v
+   INITIAL_ALLOCATION_CHECK       Verify exact bootstrap train/internal/
+     |                            external slots. Failed non-anchor slots
+     |----> INITIAL_REPLACEMENT_GAUSSIAN -> INITIAL_REPLACEMENT_AIMALL
+     |                                      | (bounded reserve only)
+     |<-------------------------------------+
+     v
    INITIAL_FEREBUS  (sbatch)      First GP fit. Commits iteration-0 to
      |                            5_TRAINING and 6_TRAINED_MODELS.
      v
@@ -407,14 +412,19 @@ in the daemon process).
    PHASE_B_POLUS  (sbatch)      |  POLUS FPS over the adversarial pool.
      |                         |
      v                         |
-   SPLIT  (inline)              |  Decide train / val / holdout membership
-     |                         |  for selected candidates.
+   SPLIT  (inline)              |  Persist the pre-QM exact train/internal-
+     |                         |  validation slot allocation.
      v                         |
    GAUSSIAN  (sbatch)           |  Per-point energies on selected candidates.
      |                         |
      v                         |
    AIMALL  (sbatch)             |  IQA decomposition.
      |                         |
+     v                         |
+   ALLOCATION_CHECK  (inline)   |  Verify every exact slot is accepted.
+     |----> REPLACEMENT_GAUSSIAN -> REPLACEMENT_AIMALL
+     |                              | (same inherited slot and split)
+     |<-----------------------------+
      v                         |
    APPEND  (inline)             |  Commit accepted AIMAll pointdirs into
      |                         |  the new training-set iteration.

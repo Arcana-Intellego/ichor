@@ -965,22 +965,7 @@ class EditCampaignConfigFunctions:
 
     @staticmethod
     def edit_split():
-        s = _campaign_config.split
-        chosen = user_input_restricted(
-            sorted(VALID_SPLITS), "split.strategy: ", s.strategy,
-        )
-        if chosen is not None:
-            s.strategy = chosen
-        s.train_fraction = user_input_float(
-            "split.train_fraction (0.0-1.0): ", s.train_fraction,
-        )
-        s.val_mid_fraction = user_input_float(
-            "split.val_mid_fraction (0.0-1.0): ", s.val_mid_fraction,
-        )
-        s.high_holdout_fraction = user_input_float(
-            "split.high_holdout_fraction (0.0-1.0): ", s.high_holdout_fraction,
-        )
-        _sync_options_from_config()
+        _unsupported_sequential_field_editor()
 
     @staticmethod
     def edit_ferebus():
@@ -1011,15 +996,6 @@ class EditCampaignConfigFunctions:
             ",".join(f.properties),
         )
         f.properties = [p.strip() for p in str(raw_props).split(",") if p.strip()]
-        f.train_fraction = user_input_float(
-            "ferebus.train_fraction: ", f.train_fraction,
-        )
-        f.int_val_fraction = user_input_float(
-            "ferebus.int_val_fraction: ", f.int_val_fraction,
-        )
-        f.ext_val_fraction = user_input_float(
-            "ferebus.ext_val_fraction: ", f.ext_val_fraction,
-        )
         _sync_options_from_config()
 
     @staticmethod
@@ -1359,13 +1335,16 @@ _BLOCK_MENUS_BY_LABEL = {
         "Trajectory source used when importing the campaign pool.",
         [_spec("trajectory_pool.source_path", "str")],
     ),
-    "Edit bootstrap": _make_block_menu(
-        "Edit Bootstrap",
-        "Initial labelled-set size and fixed bootstrap external validation size.",
+    "Edit point_allocation": _make_block_menu(
+        "Edit Point Allocation",
+        "Exact bootstrap and per-iteration training/validation slot counts.",
         [
-            _spec("bootstrap.initial_labelled_size", "int"),
-            _spec("bootstrap.external_validation_size", "int"),
-            _spec("bootstrap.anchor", "bool"),
+            _spec("point_allocation.bootstrap_training_size", "int"),
+            _spec("point_allocation.bootstrap_internal_validation_size", "int"),
+            _spec("point_allocation.bootstrap_external_validation_size", "int"),
+            _spec("point_allocation.batch_training_size", "int"),
+            _spec("point_allocation.batch_internal_validation_size", "int"),
+            _spec("point_allocation.anchor", "bool"),
         ],
     ),
     "Edit resource defaults": _make_block_menu(
@@ -1456,13 +1435,6 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("aimall.iasmesh", "choice", choices=sorted(VALID_AIMALL_IASMESH_VALUES)),
         ],
     ),
-    "Edit active_batch": _make_block_menu(
-        "Edit active_batch",
-        "Fixed final Phase-B batch size for active-learning iterations.",
-        [
-            _spec("active_batch.final_batch_size", "int"),
-        ],
-    ),
     "Edit sampling_protocol": _make_block_menu(
         "Edit sampling_protocol",
         "High-level adversarial sampling aggressiveness.",
@@ -1532,7 +1504,7 @@ _BLOCK_MENUS_BY_LABEL = {
     ),
     "Edit FEREBUS block": _make_block_menu(
         "Edit FEREBUS Block",
-        "FEREBUS training and dataset split controls.",
+        "FEREBUS model-training controls; dataset slots come from point_allocation.",
         [
             _spec("ferebus.warmstart", "choice", choices=sorted(VALID_WARMSTART)),
             _spec("ferebus.warmstart_streak", "int"),
@@ -1544,8 +1516,6 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("ferebus.scaling", "bool"),
             _spec("ferebus.full_ARD", "bool"),
             _spec("ferebus.properties", "csv_list", prompt="ferebus.properties (comma-separated, e.g. iqa,q00): "),
-            _spec("ferebus.train_fraction", "float"),
-            _spec("ferebus.internal_validation_fraction", "float"),
         ],
     ),
     "Edit acquisition core": _make_block_menu(
@@ -1867,7 +1837,7 @@ edit_campaign_config_menu_items = [
     FunctionItem("Validate current config", EditCampaignConfigFunctions.validate_current_config),
     _block_submenu_item("Edit campaign identity"),
     _block_submenu_item("Edit trajectory_pool"),
-    _block_submenu_item("Edit bootstrap"),
+    _block_submenu_item("Edit point_allocation"),
     _block_submenu_item("Edit resource defaults"),
     _block_submenu_item("Edit POLUS resources"),
     _block_submenu_item("Edit Gaussian runtime resources"),
@@ -1876,7 +1846,6 @@ edit_campaign_config_menu_items = [
     _block_submenu_item("Edit FEREBUS resources"),
     _block_submenu_item("Edit Gaussian block"),
     _block_submenu_item("Edit AIMAll block"),
-    _block_submenu_item("Edit active_batch"),
     _block_submenu_item("Edit sampling_protocol"),
     _block_submenu_item("Edit seed_selection"),
     _block_submenu_item("Edit anti_overlap"),

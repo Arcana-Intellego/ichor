@@ -36,6 +36,7 @@ class RecoveryDecision:
     iteration: int
     reason: str
     trusted_artifact: Optional[str] = None
+    replacement_round: int = 0
 
 
 @dataclass(frozen=True)
@@ -98,6 +99,100 @@ def _require_phase_a(campaign: Path) -> None:
     read_phase_a_sample_manifest(
         campaign / "3_DIVERSITY_SAMPLING" / "initial",
         require_nonempty=True,
+    )
+
+
+def _require_point_allocation(
+    campaign: Path,
+    *,
+    context: str,
+    iteration: int,
+    complete: Optional[bool] = None,
+) -> Dict[str, Any]:
+    from ..point_allocation import point_allocation_path, read_point_allocation
+
+    path = point_allocation_path(
+        campaign,
+        context=str(context),
+        iteration=int(iteration),
+    )
+    payload = read_point_allocation(path)
+    is_complete = bool((payload.get("summary") or {}).get("complete", False))
+    if complete is not None and is_complete != bool(complete):
+        raise RecoveryContractError(
+            "point allocation is "
+            + ("complete" if is_complete else "incomplete")
+            + " but this phase requires it to be "
+            + ("complete" if complete else "incomplete")
+        )
+    return payload
+
+
+def _require_replacement_sample(
+    campaign: Path,
+    *,
+    context: str,
+    iteration: int,
+    replacement_round: int,
+) -> Path:
+    from ..replacement_sampling import read_replacement_sample, replacement_round_dir
+
+    path = replacement_round_dir(
+        campaign,
+        context=str(context),
+        iteration=int(iteration),
+        replacement_round=int(replacement_round),
+    )
+    read_replacement_sample(path)
+    return path
+
+
+def _require_allocation_check_ready(
+    campaign: Path,
+    *,
+    context: str,
+    iteration: int,
+) -> None:
+    from ..point_allocation import pending_attempts
+
+    payload = _require_point_allocation(
+        campaign,
+        context=str(context),
+        iteration=int(iteration),
+    )
+    pending = pending_attempts(payload)
+    if pending:
+        rounds = {int(record.get("round", -1)) for record in pending}
+        if rounds == {0}:
+            raise RecoveryContractError(
+                "primary QM outcomes have not yet been recorded in point allocation"
+            )
+
+
+def _require_replacement_gaussian_handoff(
+    campaign: Path,
+    *,
+    context: str,
+    iteration: int,
+    replacement_round: int,
+) -> None:
+    round_dir = _require_replacement_sample(
+        campaign,
+        context=str(context),
+        iteration=int(iteration),
+        replacement_round=int(replacement_round),
+    )
+    phase = (
+        CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN
+        if context == "bootstrap"
+        else CampaignPhase.REPLACEMENT_GAUSSIAN
+    )
+    _stg.read_quantum_acceptance_manifest(
+        round_dir,
+        expected_phase=phase.value,
+        expected_iteration=int(iteration),
+        require_nonempty=False,
+        require_points_file_membership=True,
     )
 
 
@@ -236,41 +331,40 @@ def _require_split(campaign: Path, iteration: int) -> None:
         raise RecoveryContractError("split.json unreadable: " + str(path)) from exc
     if not isinstance(data, dict):
         raise RecoveryContractError("split.json must be a JSON object")
+    if int(data.get("schema_version", -1)) != 2:
+        raise RecoveryContractError("split.json schema 2 is required")
     if int(data.get("iteration")) != int(iteration):
         raise RecoveryContractError("split.json iteration mismatch")
-    train = data.get("train_indices")
-    val = data.get("val_indices")
-    holdout = data.get("holdout_indices")
-    if not isinstance(train, list) or not isinstance(val, list) or not isinstance(holdout, list):
-        raise RecoveryContractError("split.json train/val/holdout indices must be lists")
-    def _index_set(values: Sequence[object], label: str) -> set:
-        out = set()
-        for value in values:
-            if isinstance(value, bool):
-                raise RecoveryContractError("split.json " + label + " indices must be integers")
-            try:
-                idx = int(value)
-            except (TypeError, ValueError) as exc:
-                raise RecoveryContractError("split.json " + label + " indices must be integers") from exc
-            out.add(idx)
-        if len(out) != len(values):
-            raise RecoveryContractError("split.json " + label + " indices contain duplicates")
-        return out
-
-    train_set = _index_set(train, "train")
-    val_set = _index_set(val, "validation")
-    holdout_set = _index_set(holdout, "holdout")
-    if train_set & val_set:
-        raise RecoveryContractError("split.json train and validation indices overlap")
-    if not holdout_set.issubset(val_set):
-        raise RecoveryContractError("split.json holdout indices must be a subset of validation")
-    n_final = _phase_b_final_count(campaign, int(iteration))
-    allowed = set(range(int(n_final)))
-    assigned = train_set | val_set
-    if not assigned.issubset(allowed):
-        raise RecoveryContractError("split.json indices are outside Phase B final record range")
-    if assigned != allowed:
-        raise RecoveryContractError("split.json train/validation indices do not cover every Phase B final record")
+    if str(data.get("strategy")) != "exact_pre_qm_point_allocation":
+        raise RecoveryContractError("split.json strategy is invalid")
+    allocation = _require_point_allocation(
+        campaign,
+        context="active",
+        iteration=int(iteration),
+    )
+    slots = data.get("slots")
+    if not isinstance(slots, list) or len(slots) != int(allocation["targets"]["total"]):
+        raise RecoveryContractError("split.json slots do not match point allocation")
+    expected = {
+        int(slot["slot_id"]): (
+            str(slot["split"]),
+            str(slot["attempts"][0]["candidate_id"]),
+        )
+        for slot in allocation["slots"]
+    }
+    observed: Dict[int, Tuple[str, str]] = {}
+    for record in slots:
+        if not isinstance(record, dict):
+            raise RecoveryContractError("split.json slot record is invalid")
+        slot_id = int(record.get("slot_id", -1))
+        if slot_id in observed:
+            raise RecoveryContractError("split.json slot IDs contain duplicates")
+        observed[slot_id] = (
+            str(record.get("split") or ""),
+            str(record.get("candidate_id") or ""),
+        )
+    if observed != expected:
+        raise RecoveryContractError("split.json does not reproduce point allocation")
 
 
 def _require_training_version(campaign: Path, version: int) -> None:
@@ -307,6 +401,105 @@ def _active_iteration_for_training_version(training_version: int) -> int:
     return max(0, int(training_version) - 1)
 
 
+def _allocation_recovery_decision(
+    campaign: Path,
+    *,
+    context: str,
+    iteration: int,
+) -> Optional[RecoveryDecision]:
+    from ..point_allocation import pending_attempts
+
+    try:
+        allocation = _require_point_allocation(
+            campaign,
+            context=str(context),
+            iteration=int(iteration),
+        )
+    except Exception:
+        return None
+    summary = dict(allocation.get("summary") or {})
+    allocation_artifact = (
+        "3_DIVERSITY_SAMPLING/initial/POINT_ALLOCATION.json"
+        if context == "bootstrap"
+        else "7_ACTIVE_LEARNING/iteration-"
+        + str(int(iteration)).zfill(4)
+        + "/POINT_ALLOCATION.json"
+    )
+    if bool(summary.get("complete", False)):
+        return RecoveryDecision(
+            CampaignPhase.INITIAL_FEREBUS if context == "bootstrap" else CampaignPhase.APPEND,
+            int(iteration),
+            ("INITIAL_FEREBUS" if context == "bootstrap" else "APPEND")
+            + ": exact point allocation is complete",
+            allocation_artifact,
+        )
+    pending = pending_attempts(allocation)
+    if not pending:
+        return RecoveryDecision(
+            CampaignPhase.INITIAL_ALLOCATION_CHECK
+            if context == "bootstrap"
+            else CampaignPhase.ALLOCATION_CHECK,
+            int(iteration),
+            "point-allocation check: labelled slots are underfilled and no QM attempt is pending",
+            allocation_artifact,
+        )
+    rounds = {int(record.get("round", -1)) for record in pending}
+    if len(rounds) != 1:
+        return None
+    replacement_round = next(iter(rounds))
+    if replacement_round <= 0:
+        return None
+    try:
+        round_dir = _require_replacement_sample(
+            campaign,
+            context=str(context),
+            iteration=int(iteration),
+            replacement_round=int(replacement_round),
+        )
+    except Exception:
+        return RecoveryDecision(
+            CampaignPhase.INITIAL_ALLOCATION_CHECK
+            if context == "bootstrap"
+            else CampaignPhase.ALLOCATION_CHECK,
+            int(iteration),
+            "point-allocation check: pending replacement allocation needs sample repair",
+            allocation_artifact,
+            replacement_round=int(replacement_round),
+        )
+    gaussian_phase = (
+        CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN
+        if context == "bootstrap"
+        else CampaignPhase.REPLACEMENT_GAUSSIAN
+    )
+    aimall_phase = (
+        CampaignPhase.INITIAL_REPLACEMENT_AIMALL
+        if context == "bootstrap"
+        else CampaignPhase.REPLACEMENT_AIMALL
+    )
+    if _ok(
+        _stg.read_quantum_acceptance_manifest,
+        round_dir,
+        expected_phase=gaussian_phase.value,
+        expected_iteration=int(iteration),
+        require_nonempty=False,
+        require_points_file_membership=True,
+    ):
+        return RecoveryDecision(
+            aimall_phase,
+            int(iteration),
+            aimall_phase.value + ": valid replacement Gaussian handoff exists",
+            str(round_dir.relative_to(campaign)),
+            replacement_round=int(replacement_round),
+        )
+    return RecoveryDecision(
+        gaussian_phase,
+        int(iteration),
+        gaussian_phase.value + ": replacement sample is ready",
+        str(round_dir.relative_to(campaign)),
+        replacement_round=int(replacement_round),
+    )
+
+
 def _require_ferebus_iteration(iteration: int, training_version: int) -> None:
     expected = _active_iteration_for_training_version(training_version)
     if int(iteration) != expected:
@@ -325,11 +518,29 @@ def protected_staging_handoff(
 ) -> Optional[RecoveryDecision]:
     """Return the consumer phase for a valid active quantum staging handoff."""
     campaign = Path(campaign_dir)
+    allocation_decision = _allocation_recovery_decision(
+        campaign,
+        context="active",
+        iteration=int(iteration),
+    )
+    if allocation_decision is not None and allocation_decision.phase in {
+        CampaignPhase.ALLOCATION_CHECK,
+        CampaignPhase.REPLACEMENT_GAUSSIAN,
+        CampaignPhase.REPLACEMENT_AIMALL,
+        CampaignPhase.APPEND,
+    }:
+        return RecoveryDecision(
+            allocation_decision.phase,
+            allocation_decision.iteration,
+            allocation_decision.reason,
+            ".DATA/STAGING/iter_" + str(int(iteration)),
+            replacement_round=int(allocation_decision.replacement_round),
+        )
     if _ok(_require_iter_quantum, campaign, CampaignPhase.AIMALL, int(iteration)):
         return RecoveryDecision(
-            CampaignPhase.APPEND,
+            CampaignPhase.AIMALL,
             int(iteration),
-            "APPEND: valid iterative AIMAll handoff exists",
+            "AIMALL: acceptance handoff exists and point-allocation recording must be verified",
             ".DATA/STAGING/iter_" + str(int(iteration)),
         )
     if _ok(_require_iter_quantum, campaign, CampaignPhase.GAUSSIAN, int(iteration)):
@@ -353,12 +564,27 @@ def staging_handoff_decisions(
     decisions: List[RecoveryDecision] = []
     models_version = int(getattr(state, "models_version", -1))
     if include_committed or models_version < 0:
-        if _ok(_require_initial_quantum, campaign, CampaignPhase.INITIAL_AIMALL, 0):
+        allocation_decision = _allocation_recovery_decision(
+            campaign,
+            context="bootstrap",
+            iteration=0,
+        )
+        if allocation_decision is not None:
             decisions.append(
                 RecoveryDecision(
-                    CampaignPhase.INITIAL_FEREBUS,
+                    allocation_decision.phase,
+                    allocation_decision.iteration,
+                    allocation_decision.reason,
+                    ".DATA/STAGING/initial",
+                    replacement_round=int(allocation_decision.replacement_round),
+                )
+            )
+        elif _ok(_require_initial_quantum, campaign, CampaignPhase.INITIAL_AIMALL, 0):
+            decisions.append(
+                RecoveryDecision(
+                    CampaignPhase.INITIAL_AIMALL,
                     0,
-                    "INITIAL_FEREBUS: valid initial AIMAll handoff exists",
+                    "INITIAL_AIMALL: acceptance handoff exists and point-allocation recording must be verified",
                     ".DATA/STAGING/initial",
                 )
             )
@@ -391,6 +617,17 @@ def staging_handoff_decisions(
 
 
 def _best_active_iteration_handoff(campaign: Path, iteration: int) -> Optional[RecoveryHandoff]:
+    allocation_decision = _allocation_recovery_decision(
+        campaign,
+        context="active",
+        iteration=int(iteration),
+    )
+    if allocation_decision is not None:
+        return RecoveryHandoff(
+            allocation_decision,
+            50,
+            "point_allocation",
+        )
     if _ok(_require_split, campaign, int(iteration)):
         return RecoveryHandoff(
             RecoveryDecision(
@@ -496,14 +733,43 @@ def _phase_contract_checks(
                 ),
             ),
         ],
+        CampaignPhase.INITIAL_ALLOCATION_CHECK: [
+            (
+                "bootstrap point allocation",
+                lambda: _require_allocation_check_ready(
+                    campaign,
+                    context="bootstrap",
+                    iteration=0,
+                ),
+            ),
+        ],
+        CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN: [
+            (
+                "bootstrap replacement sample",
+                lambda: _require_replacement_sample(
+                    campaign,
+                    context="bootstrap",
+                    iteration=0,
+                    replacement_round=int(getattr(state, "replacement_round", 0)),
+                ),
+            ),
+        ],
+        CampaignPhase.INITIAL_REPLACEMENT_AIMALL: [
+            (
+                "bootstrap replacement Gaussian handoff",
+                lambda: _require_replacement_gaussian_handoff(
+                    campaign,
+                    context="bootstrap",
+                    iteration=0,
+                    replacement_round=int(getattr(state, "replacement_round", 0)),
+                ),
+            ),
+        ],
         CampaignPhase.INITIAL_FEREBUS: [
             (
-                "initial AIMAll handoff or committed bootstrap training version 0",
-                lambda: _require_initial_ferebus_input(
-                    campaign,
-                    iteration,
-                    training_version,
-                    model_version,
+                "complete bootstrap point allocation",
+                lambda: _require_point_allocation(
+                    campaign, context="bootstrap", iteration=0, complete=True,
                 ),
             ),
         ],
@@ -550,13 +816,46 @@ def _phase_contract_checks(
                 ),
             ),
         ],
+        CampaignPhase.ALLOCATION_CHECK: [
+            (
+                "active point allocation",
+                lambda: _require_allocation_check_ready(
+                    campaign,
+                    context="active",
+                    iteration=iteration,
+                ),
+            ),
+        ],
+        CampaignPhase.REPLACEMENT_GAUSSIAN: [
+            (
+                "active replacement sample",
+                lambda: _require_replacement_sample(
+                    campaign,
+                    context="active",
+                    iteration=iteration,
+                    replacement_round=int(getattr(state, "replacement_round", 0)),
+                ),
+            ),
+        ],
+        CampaignPhase.REPLACEMENT_AIMALL: [
+            (
+                "active replacement Gaussian handoff",
+                lambda: _require_replacement_gaussian_handoff(
+                    campaign,
+                    context="active",
+                    iteration=iteration,
+                    replacement_round=int(getattr(state, "replacement_round", 0)),
+                ),
+            ),
+        ],
         CampaignPhase.APPEND: [
             (
-                "iterative AIMAll handoff",
-                lambda: _require_iter_quantum(
+                "complete active point allocation",
+                lambda: _require_point_allocation(
                     campaign,
-                    CampaignPhase.AIMALL,
-                    iteration,
+                    context="active",
+                    iteration=iteration,
+                    complete=True,
                 ),
             ),
         ],
@@ -638,11 +937,18 @@ def select_recovery_phase(
 
     # Bootstrap/no-committed-version path.
     if not valid_training_versions and not valid_model_versions:
+        allocation_decision = _allocation_recovery_decision(
+            campaign,
+            context="bootstrap",
+            iteration=0,
+        )
+        if allocation_decision is not None:
+            return allocation_decision
         if _ok(_require_initial_quantum, campaign, CampaignPhase.INITIAL_AIMALL, iteration):
             return RecoveryDecision(
-                CampaignPhase.INITIAL_FEREBUS,
+                CampaignPhase.INITIAL_AIMALL,
                 iteration,
-                "INITIAL_FEREBUS: valid initial AIMAll handoff exists without committed models",
+                "INITIAL_AIMALL: acceptance exists and point-allocation recording must be verified",
                 ".DATA/STAGING/initial",
             )
         if _ok(_require_initial_quantum, campaign, CampaignPhase.INITIAL_GAUSSIAN, iteration):
@@ -802,6 +1108,7 @@ def recovery_contract_status(
                 "phase": decision.phase.value,
                 "iteration": int(decision.iteration),
                 "path": str(decision.trusted_artifact or ""),
+                "replacement_round": int(decision.replacement_round),
             })
     except Exception as exc:
         protected_artifacts.append({
@@ -831,6 +1138,7 @@ def recovery_contract_status(
             "phase": decision.phase.value,
             "iteration": int(decision.iteration),
             "path": str(decision.trusted_artifact or ""),
+            "replacement_round": int(decision.replacement_round),
         })
 
     if not required_inputs and phase in {CampaignPhase.HALTED, CampaignPhase.DONE}:

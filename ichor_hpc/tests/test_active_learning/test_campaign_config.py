@@ -29,17 +29,21 @@ from ichor.hpc.active_learning.geometry_protocol import (
 )
 
 
-def test_schema_version_is_eight():
-    assert CONFIG_SCHEMA_VERSION == 8
+def test_schema_version_is_nine():
+    assert CONFIG_SCHEMA_VERSION == 9
 
 
 def test_default_campaign_config_is_valid():
     c = CampaignConfig()
     c._validate()
-    assert c.bootstrap.initial_labelled_size == 12
-    assert c.bootstrap.external_validation_size == 2
-    assert c.bootstrap.anchor is False
-    assert c.active_batch.final_batch_size == 4
+    assert c.point_allocation.bootstrap_training_size == 8
+    assert c.point_allocation.bootstrap_internal_validation_size == 2
+    assert c.point_allocation.bootstrap_external_validation_size == 2
+    assert c.point_allocation.bootstrap_total_size == 12
+    assert c.point_allocation.batch_training_size == 3
+    assert c.point_allocation.batch_internal_validation_size == 1
+    assert c.point_allocation.batch_total_size == 4
+    assert c.point_allocation.anchor is False
     assert c.quality_gates.require_readable_aimall_geometry is True
     assert c.quality_gates.require_finite_iqa is True
     assert c.quality_gates.require_finite_integration_error is True
@@ -120,37 +124,33 @@ def test_default_campaign_config_is_valid():
     assert c.acquisition.subspace.canonicalise_basis is True
 
 
-def test_bootstrap_external_validation_size_validated():
+def test_point_allocation_external_validation_size_validated():
     payload = CampaignConfig().to_dict()
-    payload["bootstrap"]["external_validation_size"] = -1
-    with pytest.raises(ConfigValidationError, match="external_validation_size"):
+    payload["point_allocation"]["bootstrap_external_validation_size"] = -1
+    with pytest.raises(ConfigValidationError, match="bootstrap_external_validation_size"):
         CampaignConfig.from_dict(payload)
 
 
-def test_bootstrap_anchor_must_be_boolean():
+def test_point_allocation_anchor_and_integer_sizes_are_validated():
     payload = CampaignConfig().to_dict()
-    payload["bootstrap"]["anchor"] = "yes"
-    with pytest.raises(ConfigValidationError, match="bootstrap.anchor"):
+    payload["point_allocation"]["anchor"] = "yes"
+    with pytest.raises(ConfigValidationError, match="point_allocation.anchor"):
         CampaignConfig.from_dict(payload)
     payload = CampaignConfig().to_dict()
-    payload["bootstrap"]["external_validation_size"] = 12
-    with pytest.raises(ConfigValidationError, match="initial_labelled_size"):
+    payload["point_allocation"]["bootstrap_training_size"] = 0
+    with pytest.raises(ConfigValidationError, match="bootstrap_training_size"):
         CampaignConfig.from_dict(payload)
     payload = CampaignConfig().to_dict()
-    payload["bootstrap"]["external_validation_size"] = 2.5
-    with pytest.raises(ConfigValidationError, match="external_validation_size"):
+    payload["point_allocation"]["bootstrap_external_validation_size"] = 2.5
+    with pytest.raises(ConfigValidationError, match="bootstrap_external_validation_size"):
         CampaignConfig.from_dict(payload)
 
 
-def test_schema_v7_external_validation_fraction_migrates_to_size():
+def test_pre_v9_schema_is_rejected_without_migration():
     payload = CampaignConfig().to_dict()
     payload["schema_version"] = 7
-    payload["bootstrap"].pop("external_validation_size", None)
-    payload["bootstrap"]["external_validation_fraction"] = 0.25
-    payload["bootstrap"]["initial_labelled_size"] = 12
-    cfg = CampaignConfig.from_dict(payload)
-    assert cfg.schema_version == CONFIG_SCHEMA_VERSION
-    assert cfg.bootstrap.external_validation_size == 3
+    with pytest.raises(ConfigValidationError, match="requires schema_version 9"):
+        CampaignConfig.from_dict(payload)
 
 
 @pytest.mark.parametrize("name", ["WATER", "nh3_batch_01", "C6H6-AL"])
@@ -309,7 +309,7 @@ def test_gaussian_link0_mem_must_leave_slurm_headroom():
         CampaignConfig.from_dict(payload)
 
 
-def test_schema_v3_resources_migrate_to_current_grouped_schema():
+def test_schema_v3_resources_are_rejected_without_migration():
     payload = {
         "schema_version": 3,
         "system_name": "MIGRATE",
@@ -323,14 +323,8 @@ def test_schema_v3_resources_migrate_to_current_grouped_schema():
             "gaussian_link0_mem": "8GB",
         },
     }
-    cfg = CampaignConfig.from_dict(payload)
-    assert cfg.schema_version == CONFIG_SCHEMA_VERSION
-    assert cfg.resources.defaults.partition == "multicore"
-    assert cfg.resources.defaults.walltime_hours == 12
-    assert cfg.resources.polus.walltime_hours == 1
-    assert cfg.resources.gaussian.cpus_per_task == 6
-    assert cfg.resources.gaussian.mem_per_cpu == "4G"
-    assert cfg.resources.gaussian.memory_mode == "link0"
+    with pytest.raises(ConfigValidationError, match="requires schema_version 9"):
+        CampaignConfig.from_dict(payload)
 
 
 def test_schema_v4_rejects_old_flat_resource_fields():
@@ -499,12 +493,14 @@ def test_gradient_parallel_backend_rejects_unknown_values():
 def test_dict_roundtrip_preserves_nested_fields():
     c = CampaignConfig(max_iterations=3)
     c.phase_b.descriptor = "hybrid_alf_rmsd"
-    c.split.strategy = "random_80_20"
+    c.point_allocation.batch_training_size = 5
+    c.point_allocation.batch_internal_validation_size = 2
     c.ferebus.warmstart = "never"
     c2 = CampaignConfig.from_dict(c.to_dict())
     assert c2.max_iterations == 3
     assert c2.phase_b.descriptor == "hybrid_alf_rmsd"
-    assert c2.split.strategy == "random_80_20"
+    assert c2.point_allocation.batch_training_size == 5
+    assert c2.point_allocation.batch_internal_validation_size == 2
     assert c2.ferebus.warmstart == "never"
 
 
@@ -548,7 +544,6 @@ def test_aimall_grid_and_naat_values_roundtrip():
     ("field", "value", "message"),
     [
         ("naat", "sometimes", "aimall.naat"),
-        ("naat", 99, "aimall.naat"),
         ("boaq", "unknown_grid", "aimall.boaq"),
         ("iasmesh", "tiny", "aimall.iasmesh"),
     ],
@@ -607,7 +602,7 @@ def test_geometry_novelty_config_validated(path, value):
         CampaignConfig.from_dict(payload)
 
 
-def test_schema_v4_geometry_knobs_migrate_out_of_public_config():
+def test_schema_v4_geometry_payload_is_rejected_without_migration():
     payload = CampaignConfig().to_dict()
     payload["schema_version"] = 4
     payload["phase_b"]["min_separation"] = 0.20
@@ -621,15 +616,8 @@ def test_schema_v4_geometry_knobs_migrate_out_of_public_config():
     }
     payload["acquisition"]["fullspace_confinement"]["rmsd_scale_ang"] = 99.0
 
-    cfg = CampaignConfig.from_dict(payload)
-
-    assert cfg.schema_version == 6
-    assert not hasattr(cfg.phase_b, "min_separation")
-    assert not hasattr(cfg.phase_b, "min_separation_scaled")
-    assert not hasattr(cfg.geometry_novelty, "score_transform")
-    assert not hasattr(cfg.acquisition, "movement_band")
-    assert not hasattr(cfg.acquisition, "movement_utility")
-    assert not hasattr(cfg.acquisition.fullspace_confinement, "rmsd_scale_ang")
+    with pytest.raises(ConfigValidationError, match="requires schema_version 9"):
+        CampaignConfig.from_dict(payload)
 
 
 def test_schema_v5_rejects_removed_geometry_knobs():
@@ -640,7 +628,7 @@ def test_schema_v5_rejects_removed_geometry_knobs():
         CampaignConfig.from_dict(payload)
 
 
-def test_schema_v5_bootstrap_and_batch_fields_migrate_to_v6():
+def test_schema_v5_bootstrap_and_batch_fields_are_rejected():
     payload = CampaignConfig().to_dict()
     payload["schema_version"] = 5
     payload.pop("bootstrap", None)
@@ -653,20 +641,14 @@ def test_schema_v5_bootstrap_and_batch_fields_migrate_to_v6():
         "cap": 30,
     }
 
-    cfg = CampaignConfig.from_dict(payload)
-
-    assert cfg.schema_version == 6
-    assert cfg.bootstrap.initial_labelled_size == 30
-    assert cfg.active_batch.final_batch_size == 5
-    assert not hasattr(cfg, "initial_train_size")
-    assert not hasattr(cfg, "initial_val_size")
-    assert not hasattr(cfg, "batch_sizing")
+    with pytest.raises(ConfigValidationError, match="requires schema_version 9"):
+        CampaignConfig.from_dict(payload)
 
 
-def test_invalid_split_strategy_rejected():
+def test_removed_split_block_is_rejected():
     payload = CampaignConfig().to_dict()
-    payload["split"]["strategy"] = "invalid_split"
-    with pytest.raises(ConfigValidationError):
+    payload["split"] = {"strategy": "random_80_20"}
+    with pytest.raises(ConfigValidationError, match="unknown keys"):
         CampaignConfig.from_dict(payload)
 
 
@@ -722,9 +704,6 @@ def test_invalid_warmstart_rejected():
 
 def test_fraction_ranges_validated():
     cases = [
-        ("split", "train_fraction"),
-        ("split", "val_mid_fraction"),
-        ("split", "high_holdout_fraction"),
         ("seed_selection", "bulk_fraction"),
         ("phase_b", "beta"),
     ]
@@ -749,11 +728,12 @@ def test_max_iterations_must_be_positive():
         CampaignConfig.from_dict(payload)
 
 
-def test_active_batch_cannot_exceed_ariadne_seed_count():
+def test_batch_point_allocation_cannot_exceed_ariadne_seed_count():
     payload = CampaignConfig().to_dict()
     payload["seed_selection"]["n_seeds_per_iteration"] = 3
-    payload["active_batch"]["final_batch_size"] = 4
-    with pytest.raises(ConfigValidationError, match="active_batch.final_batch_size"):
+    payload["point_allocation"]["batch_training_size"] = 3
+    payload["point_allocation"]["batch_internal_validation_size"] = 1
+    with pytest.raises(ConfigValidationError, match="n_seeds_per_iteration"):
         CampaignConfig.from_dict(payload)
 
 
@@ -805,19 +785,18 @@ def test_ariadne_block_defaults():
     assert ab.trqn_trust_min == pytest.approx(1.0e-4)
 
 
-def test_ferebus_fraction_sum_must_be_one():
+def test_removed_ferebus_fraction_fields_are_rejected():
     payload = CampaignConfig().to_dict()
     payload["ferebus"]["train_fraction"] = 0.7
     payload["ferebus"]["internal_validation_fraction"] = 0.1
-    with pytest.raises(ConfigValidationError, match="sum to 1.0"):
+    with pytest.raises(ConfigValidationError, match="unknown keys"):
         CampaignConfig.from_dict(payload)
 
 
-def test_ferebus_fraction_range_validated():
+def test_exact_point_allocation_sizes_must_be_positive_integers():
     payload = CampaignConfig().to_dict()
-    payload["ferebus"]["train_fraction"] = -0.1
-    payload["ferebus"]["internal_validation_fraction"] = 1.1
-    with pytest.raises(ConfigValidationError, match="ferebus.train_fraction"):
+    payload["point_allocation"]["batch_training_size"] = -1
+    with pytest.raises(ConfigValidationError, match="batch_training_size"):
         CampaignConfig.from_dict(payload)
 
 
@@ -902,12 +881,11 @@ def test_seed_selection_d_optimal_fields_reject_bad_values(field, value, match):
         CampaignConfig.from_dict(payload)
 
 
-def test_split_train_and_mid_validation_fraction_sum_validated():
+def test_bootstrap_external_validation_size_may_be_zero():
     payload = CampaignConfig().to_dict()
-    payload["split"]["train_fraction"] = 0.9
-    payload["split"]["val_mid_fraction"] = 0.2
-    with pytest.raises(ConfigValidationError, match="train_fraction \\+ split.val_mid_fraction"):
-        CampaignConfig.from_dict(payload)
+    payload["point_allocation"]["bootstrap_external_validation_size"] = 0
+    cfg = CampaignConfig.from_dict(payload)
+    assert cfg.point_allocation.bootstrap_external_validation_size == 0
 
 
 def test_barrier_new_safety_terms_validated():

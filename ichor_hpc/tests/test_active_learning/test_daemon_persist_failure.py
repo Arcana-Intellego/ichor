@@ -15,15 +15,36 @@ import pytest
 
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.daemon.dry_run_executor import DryRunPhaseExecutor
+from ichor.hpc.active_learning.daemon.phase_executor import BackendSubmissionError
 from ichor.hpc.active_learning.daemon.state import CampaignPhase
 from ichor.hpc.active_learning.versioning.training_set import TrainingSetVersioning
 
 
 def _make_executor(tmp_path):
     cfg = CampaignConfig(max_iterations=3)
-    cfg.active_batch.final_batch_size = 2
+    cfg.point_allocation.batch_training_size = 1
+    cfg.point_allocation.batch_internal_validation_size = 1
     cfg.seed_selection.n_seeds_per_iteration = 2
     return DryRunPhaseExecutor(campaign_dir=tmp_path / "campaign", config=cfg)
+
+
+def _prepare_bootstrap(ex, state):
+    ex.postprocess(state, CampaignPhase.PHASE_A_POLUS, observations=[])
+    ex.postprocess(state, CampaignPhase.INITIAL_GAUSSIAN, observations=[])
+    ex.postprocess(state, CampaignPhase.INITIAL_AIMALL, observations=[])
+    result = ex.submit_or_run(state, CampaignPhase.INITIAL_ALLOCATION_CHECK)
+    assert result.next_phase_override == CampaignPhase.INITIAL_FEREBUS.value
+    ex.postprocess(state, CampaignPhase.INITIAL_FEREBUS, observations=[])
+
+
+def _prepare_active_quantum_allocation(ex, state):
+    ex.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
+    ex.postprocess(state, CampaignPhase.PHASE_B_POLUS, observations=[])
+    ex.submit_or_run(state, CampaignPhase.SPLIT)
+    ex.postprocess(state, CampaignPhase.GAUSSIAN, observations=[])
+    ex.postprocess(state, CampaignPhase.AIMALL, observations=[])
+    result = ex.submit_or_run(state, CampaignPhase.ALLOCATION_CHECK)
+    assert result.next_phase_override == CampaignPhase.APPEND.value
 
 
 def test_inline_append_idempotent_when_next_version_already_committed(tmp_path):
@@ -33,10 +54,9 @@ def test_inline_append_idempotent_when_next_version_already_committed(tmp_path):
     iteration directory."""
     ex = _make_executor(tmp_path)
     state = SimpleNamespace(iteration=0, campaign_uid="uid", training_set_version=0)
-    # Bootstrap iteration 0 via INITIAL_FEREBUS
-    ex.postprocess(state, CampaignPhase.INITIAL_FEREBUS, observations=[])
+    _prepare_bootstrap(ex, state)
     # First APPEND: commits version 1.
-    ex.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
+    _prepare_active_quantum_allocation(ex, state)
     result1 = ex.submit_or_run(state, CampaignPhase.APPEND)
     assert result1.state_updates["training_set_version"] == 1
 
@@ -55,8 +75,8 @@ def test_inline_append_idempotent_when_next_version_already_committed(tmp_path):
 def test_inline_append_idempotent_skip_journals_clearly(tmp_path):
     ex = _make_executor(tmp_path)
     state = SimpleNamespace(iteration=0, campaign_uid="uid", training_set_version=0)
-    ex.postprocess(state, CampaignPhase.INITIAL_FEREBUS, observations=[])
-    ex.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
+    _prepare_bootstrap(ex, state)
+    _prepare_active_quantum_allocation(ex, state)
     ex.submit_or_run(state, CampaignPhase.APPEND)
     # Second call should land an idempotent_skip=True in the journal.
     ex.submit_or_run(state, CampaignPhase.APPEND)
@@ -73,8 +93,8 @@ def test_inline_append_idempotent_skip_journals_clearly(tmp_path):
 def test_inline_append_idempotent_skip_repairs_current_pointer(tmp_path):
     ex = _make_executor(tmp_path)
     state = SimpleNamespace(iteration=0, campaign_uid="uid", training_set_version=0)
-    ex.postprocess(state, CampaignPhase.INITIAL_FEREBUS, observations=[])
-    ex.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
+    _prepare_bootstrap(ex, state)
+    _prepare_active_quantum_allocation(ex, state)
     ex.submit_or_run(state, CampaignPhase.APPEND)
 
     v = TrainingSetVersioning(tmp_path / "campaign" / "5_TRAINING")
@@ -85,14 +105,45 @@ def test_inline_append_idempotent_skip_repairs_current_pointer(tmp_path):
     assert v.current_version() == 1
 
 
+def test_inline_append_idempotent_skip_rejects_mismatched_allocation(tmp_path):
+    ex = _make_executor(tmp_path)
+    state = SimpleNamespace(iteration=0, campaign_uid="uid", training_set_version=0)
+    _prepare_bootstrap(ex, state)
+    _prepare_active_quantum_allocation(ex, state)
+    ex.submit_or_run(state, CampaignPhase.APPEND)
+
+    snapshot = (
+        tmp_path
+        / "campaign"
+        / "5_TRAINING"
+        / "iteration-0001"
+        / "POINT_ALLOCATION.version-0001.json"
+    )
+    payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    payload["iteration"] = 999
+    snapshot.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(
+        BackendSubmissionError,
+        match="idempotent APPEND allocation verification failed",
+    ):
+        ex.submit_or_run(state, CampaignPhase.APPEND)
+
+
 def test_initial_training_idempotent_skip_repairs_current_pointer(tmp_path):
     from ichor.hpc.active_learning.daemon.input_staging import commit_initial_training_set
 
-    campaign = tmp_path / "campaign"
+    ex = _make_executor(tmp_path)
+    campaign = ex.campaign_dir
+    state = SimpleNamespace(iteration=0, campaign_uid="uid", training_set_version=-1)
+    ex.postprocess(state, CampaignPhase.PHASE_A_POLUS, observations=[])
+    ex.postprocess(state, CampaignPhase.INITIAL_GAUSSIAN, observations=[])
+    ex.postprocess(state, CampaignPhase.INITIAL_AIMALL, observations=[])
     v = TrainingSetVersioning(campaign / "5_TRAINING")
-    staging = v.stage(None, 0)
-    (staging / "marker.txt").write_text("initial", encoding="utf-8")
-    v.commit(0)
+    assert commit_initial_training_set(campaign) is True
+    for pointer in (v.current_link_path(), v._pointer_path()):
+        if pointer.is_symlink() or pointer.is_file():
+            pointer.unlink()
     assert v.current_version() is None
 
     assert commit_initial_training_set(campaign) is False
@@ -107,7 +158,10 @@ def test_dry_ferebus_idempotent_skip_repairs_model_current_pointer(tmp_path):
         training_set_version=1,
         models_version=0,
     )
-    ex.postprocess(SimpleNamespace(iteration=0, campaign_uid="uid"), CampaignPhase.INITIAL_FEREBUS, observations=[])
+    _prepare_bootstrap(
+        ex,
+        SimpleNamespace(iteration=0, campaign_uid="uid", training_set_version=-1),
+    )
 
     first = ex.postprocess(state, CampaignPhase.FEREBUS, observations=[])
     assert first.state_updates["models_version"] == 1

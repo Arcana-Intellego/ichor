@@ -64,6 +64,32 @@ __all__ = [
 
 RECONCILE_SUFFIX = ".proposed"
 
+_RECOVERY_PHASE_PROGRESS = {
+    phase: rank
+    for rank, phase in enumerate((
+        CampaignPhase.INIT,
+        CampaignPhase.PHASE_A_POLUS,
+        CampaignPhase.INITIAL_GAUSSIAN,
+        CampaignPhase.INITIAL_AIMALL,
+        CampaignPhase.INITIAL_ALLOCATION_CHECK,
+        CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN,
+        CampaignPhase.INITIAL_REPLACEMENT_AIMALL,
+        CampaignPhase.INITIAL_FEREBUS,
+        CampaignPhase.SEED_SELECT,
+        CampaignPhase.ARIADNE_ARRAY,
+        CampaignPhase.PHASE_B_POLUS,
+        CampaignPhase.SPLIT,
+        CampaignPhase.GAUSSIAN,
+        CampaignPhase.AIMALL,
+        CampaignPhase.ALLOCATION_CHECK,
+        CampaignPhase.REPLACEMENT_GAUSSIAN,
+        CampaignPhase.REPLACEMENT_AIMALL,
+        CampaignPhase.APPEND,
+        CampaignPhase.FEREBUS,
+        CampaignPhase.STOP_CHECK,
+    ))
+}
+
 
 def _iso_from_timestamp(value: float) -> str:
     from datetime import datetime, timezone
@@ -245,6 +271,7 @@ def _candidate_payload(decision: RecoveryDecision) -> Dict[str, Any]:
         "iteration": int(decision.iteration),
         "path": str(decision.trusted_artifact or ""),
         "reason": str(decision.reason),
+        "replacement_round": int(getattr(decision, "replacement_round", 0)),
     }
 
 
@@ -585,6 +612,17 @@ def _validate_recovered_state_contract(
     ):
         if isinstance(phase_a_handoff, dict):
             return
+    if (
+        phase is CampaignPhase.INITIAL_AIMALL
+        and training_version < 0
+        and model_version < 0
+        and isinstance(bootstrap_handoff, dict)
+        and bootstrap_handoff.get("phase")
+        == CampaignPhase.INITIAL_GAUSSIAN.value
+        and int(bootstrap_handoff.get("iteration", -1))
+        == int(getattr(state, "iteration", 0))
+    ):
+        return
     if (
         phase is CampaignPhase.INITIAL_FEREBUS
         and training_version < 0
@@ -1069,6 +1107,14 @@ def propose_recovery(
             + repr(valid_model_versions)
             + ")"
         )
+    else:
+        if recovered.training_set_version != -1 or recovered.models_version != -1:
+            notes.append(
+                "stale state version pointers reset because no committed "
+                "training or model versions were verified"
+            )
+        recovered.training_set_version = -1
+        recovered.models_version = -1
 
     try:
         protected_staging_handoffs = staging_handoff_decisions(campaign, recovered)
@@ -1224,8 +1270,26 @@ def propose_recovery(
 
     phase_recovery = None
     if not active_intents and not unsafe_reasons:
-        if partial_array_decision is not None:
+        handoff_recovery = None
+        if combined_handoffs:
+            handoff_recovery = max(
+                combined_handoffs,
+                key=lambda decision: _RECOVERY_PHASE_PROGRESS.get(
+                    decision.phase,
+                    -1,
+                ),
+            )
+        if (
+            partial_array_decision is not None
+            and (
+                handoff_recovery is None
+                or _RECOVERY_PHASE_PROGRESS.get(partial_array_decision.phase, -1)
+                >= _RECOVERY_PHASE_PROGRESS.get(handoff_recovery.phase, -1)
+            )
+        ):
             phase_recovery = partial_array_decision
+        elif handoff_recovery is not None:
+            phase_recovery = handoff_recovery
         else:
             phase_recovery = select_recovery_phase(
                 campaign,
@@ -1270,6 +1334,9 @@ def propose_recovery(
     elif phase_recovery is not None:
         recovered.phase = phase_recovery.phase
         recovered.iteration = int(phase_recovery.iteration)
+        recovered.replacement_round = int(
+            getattr(phase_recovery, "replacement_round", 0)
+        )
         decision = phase_recovery.reason
         notes.append("phase-aware recovery selected " + recovered.phase.value)
         if phase_recovery.trusted_artifact:

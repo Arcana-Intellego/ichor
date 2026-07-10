@@ -308,7 +308,7 @@ A minimal `campaign.yaml` (also shipped at
 `examples/csf4_first_live_iter/campaign.yaml`):
 
 ```yaml
-schema_version: 8
+schema_version: 9
 
 campaign:
   max_iterations: 1
@@ -316,13 +316,13 @@ campaign:
 runtime:
   poll_interval_seconds: 60
 
-bootstrap:
-  initial_labelled_size: 12
-  external_validation_size: 2
+point_allocation:
+  bootstrap_training_size: 8
+  bootstrap_internal_validation_size: 2
+  bootstrap_external_validation_size: 2
+  batch_training_size: 3
+  batch_internal_validation_size: 1
   anchor: false
-
-active_batch:
-  final_batch_size: 4
 
 seed_selection:
   n_seeds_per_iteration: 8
@@ -442,7 +442,10 @@ should have:
 **sampling outputs** at the iteration directory:
 
 - `phase_b_SAMPLE.xyz` exists with the expected frame count
-  (`active_batch.final_batch_size` = 4)
+  (`batch_training_size + batch_internal_validation_size` = 4)
+- `POINT_ALLOCATION.json` records three training slots and one internal
+  validation slot; failed QM candidates consume the finite Phase-B reserve
+  without changing those slot assignments
 - `phase_b_dedup.json` exists; `n_dropped` is 0 by default (min_separation
   = 0.0 means the filter is off)
 
@@ -477,8 +480,9 @@ at 50; if individual seed descents still take too long, lower it. Real
 campaigns use 200; we use 50 here just for the smoke.
 
 **FEREBUS training fails to converge**. usually means the initial training
-set is too small or too clustered. bump `bootstrap.initial_labelled_size` and try
-again. or check that the Gaussian + AIMAll outputs in the pointdirs look
+set is too small or too clustered. Increase
+`point_allocation.bootstrap_training_size` and try again, preserving suitable
+internal/external validation counts. Also check that the Gaussian + AIMAll outputs in the pointdirs look
 reasonable.
 
 **Phase A POLUS picks all-coincident frames**. happens when the input

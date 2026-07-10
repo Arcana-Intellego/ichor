@@ -13,7 +13,23 @@ import ichor.core.files as core_files
 
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.daemon import input_staging as stg
-from ichor.hpc.active_learning.versioning.manifest import ManifestMismatchError, write_manifest
+from ichor.hpc.active_learning.point_allocation import (
+    accepted_attempts,
+    allocation_targets,
+    create_point_allocation,
+    pending_attempts,
+    point_allocation_path,
+    record_quantum_results,
+)
+from ichor.hpc.active_learning.versioning.manifest import (
+    ManifestMismatchError,
+    compute_directory_manifest,
+    write_manifest,
+)
+from ichor.hpc.active_learning.versioning.provenance import (
+    enrich_with_point_allocation,
+    write_seed_provenance,
+)
 
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "live_outputs"
@@ -45,22 +61,80 @@ class _FakePointsDirectory:
                     )
 
 
-def test_stage_ferebus_inputs_orchestration(tmp_path, monkeypatch):
-    campaign = tmp_path / "c"
-    # the (real) is_dir() guard needs a committed training dir to exist.
+def _prepare_bootstrap_training(campaign, cfg):
     training_dir = campaign / "5_TRAINING" / "iteration-0000"
     training_dir.mkdir(parents=True)
-    write_manifest(training_dir, {})
+    cfg.point_allocation.bootstrap_training_size = 12
+    cfg.point_allocation.bootstrap_internal_validation_size = 3
+    cfg.point_allocation.bootstrap_external_validation_size = 5
+    candidates = [
+        {
+            "candidate_id": "candidate-" + str(i),
+            "frame_id": i,
+            "pointdir_name": "POINT_" + str(i).zfill(4) + ".pointdir",
+        }
+        for i in range(20)
+    ]
+    allocation_path = point_allocation_path(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+    )
+    allocation = create_point_allocation(
+        allocation_path,
+        campaign_uid="campaign-uid",
+        context="bootstrap",
+        iteration=0,
+        targets=allocation_targets(cfg, "bootstrap"),
+        primary_candidates=candidates,
+        reserve_candidates=[],
+    )
+    results = []
+    for attempt in pending_attempts(allocation):
+        pointdir = training_dir / str(attempt["pointdir_name"])
+        pointdir.mkdir()
+        (pointdir / "input.gjf").write_text("# synthetic\n", encoding="utf-8")
+        results.append({
+            "candidate_id": attempt["candidate_id"],
+            "accepted": True,
+            "pointdir": str(pointdir),
+        })
+    allocation = record_quantum_results(allocation_path, results)
+    for attempt in accepted_attempts(allocation):
+        pointdir = training_dir / str(attempt["pointdir_name"])
+        write_seed_provenance(
+            pointdir,
+            campaign_uid="campaign-uid",
+            iteration=0,
+            trajectory_sha256="a" * 64,
+            seed_frame_id=int(attempt["frame_id"]),
+            seed_selection_origin="bootstrap",
+            seed_variance_at_selection=None,
+            subspace_neighbour_frame_ids=[],
+            subspace_dimension=0,
+            subspace_eigenvalues=[],
+        )
+        enrich_with_point_allocation(
+            pointdir,
+            candidate_id=str(attempt["candidate_id"]),
+            context="bootstrap",
+            slot_id=int(attempt["slot_id"]),
+            split=str(attempt["split"]),
+        )
+    write_manifest(training_dir, compute_directory_manifest(training_dir))
+    return training_dir
+
+
+def test_stage_ferebus_inputs_orchestration(tmp_path, monkeypatch):
+    campaign = tmp_path / "c"
     # stub only the cluster-only export. the function does `from ichor.core.files import
     # PointsDirectory` at call time, so patching the module attribute takes effect.
     monkeypatch.setattr(core_files, "PointsDirectory", _FakePointsDirectory)
 
     cfg = CampaignConfig()
     cfg.system_name = "WATER"
-    cfg.bootstrap.external_validation_size = 5
-    cfg.ferebus.train_fraction = 0.8
-    cfg.ferebus.internal_validation_fraction = 0.2
     cfg.ferebus.properties = ["iqa", "q00"]
+    _prepare_bootstrap_training(campaign, cfg)
     staging, n_tasks = stg.stage_ferebus_inputs(campaign, cfg, training_version=0, is_initial=False)
 
     assert n_tasks == 6
@@ -99,17 +173,15 @@ def test_stage_ferebus_inputs_clears_stale_models(tmp_path, monkeypatch):
     # A14/A15: a stale .model / *_train.csv from a previous iteration in the shared staging dir must
     # be wiped before this run, not globbed back in.
     campaign = tmp_path / "c"
-    training_dir = campaign / "5_TRAINING" / "iteration-0000"
-    training_dir.mkdir(parents=True)
-    write_manifest(training_dir, {})
+    cfg = CampaignConfig()
+    cfg.system_name = "WATER"
+    _prepare_bootstrap_training(campaign, cfg)
     staging = campaign / "6_TRAINED_MODELS" / "iteration-staging"
     staging.mkdir(parents=True)
     (staging / "STALE.model").write_text("old model from a previous iteration", encoding="utf-8")
     (staging / "Zz9_train.csv").write_text("f1,iqa\n0.1,-1.0\n", encoding="utf-8")
     monkeypatch.setattr(core_files, "PointsDirectory", _FakePointsDirectory)
 
-    cfg = CampaignConfig()
-    cfg.system_name = "WATER"
     stg.stage_ferebus_inputs(campaign, cfg, training_version=0, is_initial=False)
 
     assert not (staging / "STALE.model").exists()

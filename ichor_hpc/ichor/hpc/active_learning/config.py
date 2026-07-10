@@ -1,10 +1,8 @@
-"""Campaign configuration -- schema v8.
+"""Campaign configuration -- schema v9.
 
-Schema v8 keeps the operator-facing campaign protocol compact: campaign
-identifies the run, bootstrap owns the fixed external validation reserve as an
-exact size, active_batch owns the number of new labels per iteration, and
-FEREBUS owns the train/internal-validation split for all non-external labelled
-data.
+Schema v9 expresses bootstrap and iterative point allocation as exact integer
+quotas.  Point allocation is therefore an explicit scientific contract rather
+than a cumulative fraction inferred later by FEREBUS staging.
 """
 from __future__ import annotations
 
@@ -48,8 +46,7 @@ __all__ = [
     "CampaignConfig",
     "CampaignIdentityConfigBlock",
     "TrajectoryPoolConfigBlock",
-    "BootstrapConfigBlock",
-    "ActiveBatchConfigBlock",
+    "PointAllocationConfigBlock",
     "SamplingProtocolConfigBlock",
     "SeedSelectionConfigBlock",
     "AntiOverlapConfigBlock",
@@ -463,15 +460,25 @@ class CampaignIdentityConfigBlock:
 
 
 @dataclass
-class BootstrapConfigBlock:
-    initial_labelled_size: int = 12
-    external_validation_size: int = 2
+class PointAllocationConfigBlock:
+    bootstrap_training_size: int = 8
+    bootstrap_internal_validation_size: int = 2
+    bootstrap_external_validation_size: int = 2
+    batch_training_size: int = 3
+    batch_internal_validation_size: int = 1
     anchor: bool = False
 
+    @property
+    def bootstrap_total_size(self) -> int:
+        return (
+            int(self.bootstrap_training_size)
+            + int(self.bootstrap_internal_validation_size)
+            + int(self.bootstrap_external_validation_size)
+        )
 
-@dataclass
-class ActiveBatchConfigBlock:
-    final_batch_size: int = 4
+    @property
+    def batch_total_size(self) -> int:
+        return int(self.batch_training_size) + int(self.batch_internal_validation_size)
 
 
 @dataclass
@@ -539,11 +546,6 @@ class FerebusConfigBlock:
     scaling: bool = True
     full_ARD: bool = True
     properties: List[str] = field(default_factory=lambda: ["iqa"])
-    # How non-external labelled data is carved into the two trainable FEREBUS
-    # sets. The external validation set is a fixed bootstrap reserve controlled
-    # by bootstrap.external_validation_size.
-    train_fraction: float = 0.8
-    internal_validation_fraction: float = 0.2
 
 
 @dataclass
@@ -712,9 +714,9 @@ class ResourceConfigBlock:
     def backend_for_phase(self, phase_name: str) -> str:
         if phase_name in ("PHASE_A_POLUS", "PHASE_B_POLUS"):
             return "polus"
-        if phase_name in ("INITIAL_GAUSSIAN", "GAUSSIAN"):
+        if "GAUSSIAN" in phase_name:
             return "gaussian"
-        if phase_name in ("INITIAL_AIMALL", "AIMALL"):
+        if "AIMALL" in phase_name:
             return "aimall"
         if phase_name == "ARIADNE_ARRAY":
             return "ariadne"
@@ -976,7 +978,7 @@ class AimallConfigBlock:
 
 @dataclass
 class CampaignConfig:
-    """Top-level campaign configuration (schema v8)."""
+    """Top-level campaign configuration (schema v9)."""
 
     schema_version: int = CONFIG_SCHEMA_VERSION
 
@@ -986,11 +988,8 @@ class CampaignConfig:
     trajectory_pool: TrajectoryPoolConfigBlock = field(
         default_factory=TrajectoryPoolConfigBlock
     )
-    bootstrap: BootstrapConfigBlock = field(
-        default_factory=BootstrapConfigBlock
-    )
-    active_batch: ActiveBatchConfigBlock = field(
-        default_factory=ActiveBatchConfigBlock
+    point_allocation: PointAllocationConfigBlock = field(
+        default_factory=PointAllocationConfigBlock
     )
     sampling_protocol: SamplingProtocolConfigBlock = field(
         default_factory=SamplingProtocolConfigBlock
@@ -1313,32 +1312,44 @@ class CampaignConfig:
             raise ConfigValidationError("runtime.poll_interval_idle_seconds must be >= 1")
         if self.runtime.poll_sacct_empty_max_ticks < 0:
             raise ConfigValidationError("runtime.poll_sacct_empty_max_ticks must be >= 0")
-        if self.bootstrap.initial_labelled_size <= 0:
-            raise ConfigValidationError(
-                "bootstrap.initial_labelled_size must be > 0"
-            )
-        if not isinstance(self.bootstrap.anchor, bool):
-            raise ConfigValidationError("bootstrap.anchor must be a boolean")
-        if not isinstance(self.bootstrap.external_validation_size, int) or isinstance(
-            self.bootstrap.external_validation_size,
-            bool,
+        allocation = self.point_allocation
+        for allocation_name in (
+            "bootstrap_training_size",
+            "bootstrap_internal_validation_size",
+            "batch_training_size",
+        ):
+            value = getattr(allocation, allocation_name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ConfigValidationError(
+                    "point_allocation." + allocation_name + " must be an integer"
+                )
+            if value <= 0:
+                raise ConfigValidationError(
+                    "point_allocation." + allocation_name + " must be > 0"
+                )
+        batch_internal_size = allocation.batch_internal_validation_size
+        if (
+            isinstance(batch_internal_size, bool)
+            or not isinstance(batch_internal_size, int)
         ):
             raise ConfigValidationError(
-                "bootstrap.external_validation_size must be an integer"
+                "point_allocation.batch_internal_validation_size must be an integer"
             )
-        if self.bootstrap.external_validation_size < 0:
+        if batch_internal_size < 0:
             raise ConfigValidationError(
-                "bootstrap.external_validation_size must be >= 0"
+                "point_allocation.batch_internal_validation_size must be >= 0"
             )
-        if self.bootstrap.initial_labelled_size <= self.bootstrap.external_validation_size:
+        external_size = allocation.bootstrap_external_validation_size
+        if isinstance(external_size, bool) or not isinstance(external_size, int):
             raise ConfigValidationError(
-                "bootstrap.initial_labelled_size must be greater than "
-                "bootstrap.external_validation_size"
+                "point_allocation.bootstrap_external_validation_size must be an integer"
             )
-        if self.active_batch.final_batch_size <= 0:
+        if external_size < 0:
             raise ConfigValidationError(
-                "active_batch.final_batch_size must be > 0"
+                "point_allocation.bootstrap_external_validation_size must be >= 0"
             )
+        if not isinstance(allocation.anchor, bool):
+            raise ConfigValidationError("point_allocation.anchor must be a boolean")
         if not isinstance(self.sampling_protocol.sampling_aggressiveness, int):
             raise ConfigValidationError(
                 "sampling_protocol.sampling_aggressiveness must be an integer in [1, 10]"
@@ -1353,11 +1364,12 @@ class CampaignConfig:
             )
         if (
             int(self.seed_selection.n_seeds_per_iteration)
-            < int(self.active_batch.final_batch_size)
+            < int(allocation.batch_total_size)
         ):
             raise ConfigValidationError(
                 "seed_selection.n_seeds_per_iteration must be >= "
-                "active_batch.final_batch_size"
+                "point_allocation.batch_training_size + "
+                "point_allocation.batch_internal_validation_size"
             )
         if not 0.0 <= self.seed_selection.bulk_fraction <= 1.0:
             raise ConfigValidationError(
@@ -1503,23 +1515,6 @@ class CampaignConfig:
                     + repr(sorted(valid_ferebus_props))
                 )
             seen_props.add(prop)
-        for frac_name, frac in (
-            ("ferebus.train_fraction", self.ferebus.train_fraction),
-            (
-                "ferebus.internal_validation_fraction",
-                self.ferebus.internal_validation_fraction,
-            ),
-        ):
-            if not 0.0 <= float(frac) <= 1.0:
-                raise ConfigValidationError(frac_name + " must be in [0, 1]")
-        ferebus_sum = (
-            float(self.ferebus.train_fraction)
-            + float(self.ferebus.internal_validation_fraction)
-        )
-        if abs(ferebus_sum - 1.0) > 1.0e-9:
-            raise ConfigValidationError(
-                "ferebus train/internal validation fractions must sum to 1.0"
-            )
         if self.acquisition.property_name not in seen_props:
             raise ConfigValidationError(
                 "acquisition.property_name "

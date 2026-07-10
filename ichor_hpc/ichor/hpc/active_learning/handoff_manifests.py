@@ -19,9 +19,9 @@ ARIADNE_RESULTS_SCHEMA_VERSION = 1
 ARIADNE_LANDING_AUDIT_FILENAME = "ARIADNE_LANDING_AUDIT.json"
 ARIADNE_LANDING_AUDIT_SCHEMA_VERSION = 1
 PHASE_A_SAMPLE_FILENAME = "PHASE_A_SAMPLE.json"
-PHASE_A_SAMPLE_SCHEMA_VERSION = 1
+PHASE_A_SAMPLE_SCHEMA_VERSION = 2
 PHASE_B_SELECTION_FILENAME = "PHASE_B_SELECTION.json"
-PHASE_B_SELECTION_SCHEMA_VERSION = 1
+PHASE_B_SELECTION_SCHEMA_VERSION = 2
 SEED_SELECTION_DIAGNOSTICS_FILENAME = "SEED_SELECTION_DIAGNOSTICS.json"
 SEED_SELECTION_DIAGNOSTICS_SCHEMA_VERSION = 1
 ACQUISITION_MATURITY_AUDIT_FILENAME = "ACQUISITION_MATURITY_AUDIT.json"
@@ -810,10 +810,24 @@ def read_phase_a_sample_manifest(
             if idx in seen:
                 raise HandoffManifestError("Phase A selected_indices contains duplicates")
             seen.add(idx)
+    allocation = data.get("point_allocation")
+    if not isinstance(allocation, dict):
+        raise HandoffManifestError("Phase A point_allocation must be an object")
+    allocation_manifest = resolve_handoff_path(
+        root,
+        allocation.get("manifest", ""),
+        kind="Phase A point-allocation manifest",
+    )
+    primary = allocation.get("primary")
+    if not isinstance(primary, list) or len(primary) != n_select:
+        raise HandoffManifestError("Phase A point-allocation primary count mismatch")
+    allocation = dict(allocation)
+    allocation["manifest"] = str(allocation_manifest)
     out = dict(data)
     out["n_select"] = n_select
     out["sample_xyz"] = str(sample)
     out["index_path"] = str(index_path)
+    out["point_allocation"] = allocation
     return out
 
 
@@ -864,6 +878,18 @@ def read_phase_b_selection_manifest(
         )
     if require_nonempty and not final:
         raise HandoffManifestError("Phase B selection manifest final list is empty")
+    allocation = data.get("point_allocation")
+    if not isinstance(allocation, dict):
+        raise HandoffManifestError("Phase B point_allocation must be an object")
+    allocation_manifest = resolve_handoff_path(
+        path.parent,
+        allocation.get("manifest", ""),
+        kind="Phase B point-allocation manifest",
+    )
+    targets = allocation.get("targets")
+    reserve = allocation.get("reserve")
+    if not isinstance(targets, dict) or not isinstance(reserve, list):
+        raise HandoffManifestError("Phase B point-allocation targets/reserve are invalid")
     seen_raw = set()
     normalised_raw = []
     raw_kept_final_indexes = set()
@@ -934,6 +960,9 @@ def read_phase_b_selection_manifest(
     out = dict(data)
     out["raw"] = normalised_raw
     out["final"] = normalised_final
+    normalised_allocation = dict(allocation)
+    normalised_allocation["manifest"] = str(allocation_manifest)
+    out["point_allocation"] = normalised_allocation
     if source_manifest is not None:
         out["source_ariadne_manifest"] = str(source_manifest)
     return out

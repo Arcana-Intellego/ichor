@@ -57,9 +57,12 @@ def test_daemon_control_menu_items():
 
 
 def test_daemon_control_stop_can_request_job_cancellation(monkeypatch):
+    import importlib
+
     import ichor.hpc.active_learning.cli as cli_mod
-    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_submenus import (
-        daemon_control_menu as menu_mod,
+    menu_mod = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.daemon_control_menu"
     )
 
     seen = {}
@@ -82,9 +85,12 @@ def test_daemon_control_stop_can_request_job_cancellation(monkeypatch):
 
 
 def test_daemon_control_archive_staging_dispatches_reconcile(monkeypatch):
+    import importlib
+
     import ichor.hpc.active_learning.cli as cli_mod
-    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_submenus import (
-        daemon_control_menu as menu_mod,
+    menu_mod = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.daemon_control_menu"
     )
 
     seen = {}
@@ -113,9 +119,12 @@ def test_daemon_control_archive_staging_dispatches_reconcile(monkeypatch):
 
 
 def test_daemon_control_status_passes_visible_display_options(monkeypatch):
+    import importlib
+
     import ichor.hpc.active_learning.cli as cli_mod
-    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_submenus import (
-        daemon_control_menu as menu_mod,
+    menu_mod = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.daemon_control_menu"
     )
 
     seen = {}
@@ -155,8 +164,7 @@ def test_edit_campaign_config_menu_items():
         "Validate current config",
         "Edit campaign identity",
         "Edit trajectory_pool",
-        "Edit iteration control",
-        "Edit bootstrap",
+        "Edit point_allocation",
         "Edit resource defaults",
         "Edit POLUS resources",
         "Edit Gaussian runtime resources",
@@ -164,15 +172,12 @@ def test_edit_campaign_config_menu_items():
         "Edit ARIADNE resources",
         "Edit FEREBUS resources",
         "Edit Gaussian block",
-        "Edit active_batch",
         "Edit sampling_protocol",
         "Edit seed_selection",
         "Edit anti_overlap",
         "Edit phase_b",
         "Edit geometry_novelty",
-        "Edit split",
         "Edit FEREBUS block",
-        "Edit robustness",
         "Edit acquisition",
         "Edit ARIADNE Block",
         "Edit stop",
@@ -238,14 +243,17 @@ def test_campaign_config_block_submenus_show_values_and_edit_one_field(monkeypat
     assert "resources.defaults.mem_per_cpu" in rendered
     assert "resources.gradient_parallel_backend" in rendered
 
-    bootstrap_menu = menu._BLOCK_MENUS_BY_LABEL["Edit bootstrap"]
-    bootstrap_rendered = bootstrap_menu.this_menu_options()
-    assert "bootstrap.initial_labelled_size" in bootstrap_rendered
-    assert "bootstrap.external_validation_size" in bootstrap_rendered
-    assert "bootstrap.anchor" in bootstrap_rendered
-    bootstrap_menu.parent = menu.edit_campaign_config_menu
-    bootstrap_prologue = bootstrap_menu.get_prologue_text()
-    assert "bootstrap.anchor" in bootstrap_prologue
+    allocation_menu = menu._BLOCK_MENUS_BY_LABEL["Edit point_allocation"]
+    allocation_rendered = allocation_menu.this_menu_options()
+    assert "point_allocation.bootstrap_training_size" in allocation_rendered
+    assert "point_allocation.bootstrap_internal_validation_size" in allocation_rendered
+    assert "point_allocation.bootstrap_external_validation_size" in allocation_rendered
+    assert "point_allocation.batch_training_size" in allocation_rendered
+    assert "point_allocation.batch_internal_validation_size" in allocation_rendered
+    assert "point_allocation.anchor" in allocation_rendered
+    allocation_menu.parent = menu.edit_campaign_config_menu
+    allocation_prologue = allocation_menu.get_prologue_text()
+    assert "point_allocation.anchor" in allocation_prologue
 
     texts = [it.text for it in resources_menu.items]
     assert "Set partition" in texts
@@ -532,8 +540,7 @@ def test_save_validation_failure_keeps_dirty_state(tmp_path, monkeypatch):
     monkeypatch.setattr(menu, "_pause", lambda: None)
 
     menu._set_config_value("gaussian.basis_set", "6-31+G(d,p)")
-    menu._set_config_value("split.train_fraction", 0.9)
-    menu._set_config_value("split.val_mid_fraction", 0.9)
+    menu._set_config_value("point_allocation.batch_training_size", 0)
 
     menu.EditCampaignConfigFunctions.save_to_disk()
 
@@ -684,6 +691,9 @@ def _write_started_campaign_with_lock(campaign, config):
     data.mkdir(parents=True, exist_ok=True)
     write_state(data / "state.json", fresh_campaign_state())
     write_config_lock(campaign, config)
+    pointdir = campaign / ".DATA" / "STAGING" / "initial" / "point-0000.pointdir"
+    pointdir.mkdir(parents=True, exist_ok=True)
+    (pointdir / "input.gjf").write_text("# synthetic staged Gaussian input\n", encoding="utf-8")
 
 
 def test_config_lock_status_renders_in_field_menu(tmp_path):
@@ -1167,6 +1177,7 @@ def test_acquisition_gradient_menu_exposes_active_fd_controls():
         "acquisition.gradient.regularization",
         "acquisition.gradient.cartesian_step_floor",
         "acquisition.gradient.ghost_mass_threshold",
+        "acquisition.gradient.max_acquisition_grad_per_ang",
     }
     assert set(field_specs["acquisition.gradient.mode"].choices) == set(VALID_GRADIENT_MODES)
     assert "active_fd" in rendered
@@ -1403,7 +1414,7 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
     assert "sampling_protocol.resolved_acquisition_risk" in out
     assert "sampling_protocol.resolved_ariadne" in out
     assert "seed_selection.strategy: d_optimal" in out
-    assert "bootstrap.anchor: False" in out
+    assert "point_allocation.anchor: False" in out
     assert "error_calibration.mode: apply_to_acquisition" in out
     assert "error_calibration.apply_strength: 0.5" in out
     assert "resources.aimall.effective_cpus_per_task: auto" in out
@@ -1447,7 +1458,7 @@ def test_daemon_control_sampling_protocol_summary_uses_saved_campaign(tmp_path, 
     assert "sampling_protocol.resolved_manifest_example" in out
     assert "sampling_protocol.audit_manifest_example" in out
     assert "seed_selection.strategy: d_optimal" in out
-    assert "bootstrap.anchor: False" in out
+    assert "point_allocation.anchor: False" in out
     assert "error_calibration.mode: record_only" in out
 
 
@@ -1912,7 +1923,6 @@ def test_campaign_context_refuses_implicit_cwd(monkeypatch):
 
 def test_campaign_config_load_edit_save_preserves_hidden_fields(tmp_path, monkeypatch):
     import importlib
-    import yaml
     from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
         set_selected_campaign_dir,
     )
@@ -1923,39 +1933,23 @@ def test_campaign_config_load_edit_save_preserves_hidden_fields(tmp_path, monkey
     from ichor.hpc.active_learning.config import CampaignConfig
 
     set_selected_campaign_dir(tmp_path)
-    payload = {
-        "schema_version": 2,
-        "system_name": "WATER",
-        "resources": {
-            "partition": "multicore",
-            "walltime_hours": 12,
-            "mem_per_cpu": "5G",
-            "cpus_per_task": 4,
-            "ntasks": 1,
-            "aimall_cpus_per_task": 6,
-            "ariadne_cpus_per_task": 4,
-            "gradient_parallel_backend": "serial",
-        },
-        "gaussian": {
-            "method": "PBE0",
-            "basis_set": "def2-SVP",
-            "charge": 0,
-            "spin_multiplicity": 1,
-            "extra_keywords": "scf=tight",
-            "nproc": 2,
-            "mem": "6GB",
-        },
-        "ferebus": {
-            "properties": ["iqa", "q00"],
-            "scaling": False,
-            "full_ARD": False,
-        },
-        "acquisition": {
-            "property_name": "iqa",
-            "allow_uniform_posterior_fallback": True,
-        },
-    }
-    (tmp_path / "campaign.yaml").write_text(yaml.safe_dump(payload), encoding="utf-8")
+    original = CampaignConfig()
+    original.system_name = "WATER"
+    original.resources.defaults.walltime_hours = 12
+    original.resources.defaults.mem_per_cpu = "5G"
+    original.resources.polus.cpus_per_task = 4
+    original.resources.ferebus.cpus_per_task = 4
+    original.resources.gaussian.cpus_per_task = 2
+    original.resources.aimall.cpus_per_task = 6
+    original.resources.ariadne.cpus_per_task = 4
+    original.resources.gradient_parallel_backend = "serial"
+    original.gaussian.method = "PBE0"
+    original.gaussian.basis_set = "def2-SVP"
+    original.resources.gaussian.link0_mem = "6GB"
+    original.ferebus.properties = ["iqa", "q00"]
+    original.ferebus.scaling = False
+    original.acquisition.allow_uniform_posterior_fallback = True
+    original.to_yaml(tmp_path / "campaign.yaml")
     monkeypatch.setattr(menu, "_pause", lambda: None)
 
     assert menu.load_config_for_campaign_dir(tmp_path, quiet=True, prompt_if_dirty=False)
@@ -2121,7 +2115,7 @@ def test_foreground_launch_uses_resume_when_selected(tmp_path, monkeypatch):
     menu.start_daemon_foreground_menu_options.selected_command = "resume"
     menu.start_daemon_foreground_menu_options.selected_mode = "dry-run"
     menu.start_daemon_foreground_menu_options.selected_config = ""
-    menu.start_daemon_foreground_menu_options.selected_preset = "csf4"
+    menu.start_daemon_foreground_menu_options.selected_preset = "balanced"
     menu.start_daemon_foreground_menu_options.selected_poll_interval = 3
     menu.start_daemon_foreground_menu_options.selected_max_ticks = 2
     rendered = menu.start_daemon_foreground_menu.this_menu_options()
@@ -2140,7 +2134,7 @@ def test_foreground_launch_uses_resume_when_selected(tmp_path, monkeypatch):
     ns = calls[0][1]
     assert ns.campaign_dir == str(tmp_path)
     assert ns.dry_run is True
-    assert ns.preset == "csf4"
+    assert ns.preset == "balanced"
     assert ns.poll_interval == 3
     assert ns.max_ticks == 2
 

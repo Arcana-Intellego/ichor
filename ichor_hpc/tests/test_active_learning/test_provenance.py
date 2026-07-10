@@ -301,12 +301,29 @@ def test_full_provenance_chain_through_dry_run_executor(tmp_path):
 
     campaign_dir = tmp_path / "campaign"
     cfg = CampaignConfig(max_iterations=2)
-    cfg.active_batch.final_batch_size = 2
+    cfg.point_allocation.batch_training_size = 1
+    cfg.point_allocation.batch_internal_validation_size = 1
     cfg.seed_selection.n_seeds_per_iteration = 3
     ex = DryRunPhaseExecutor(campaign_dir=campaign_dir, config=cfg)
-    state = SimpleNamespace(iteration=0, campaign_uid="uid-e2e")
+    state = SimpleNamespace(
+        iteration=0,
+        campaign_uid="uid-e2e",
+        replacement_round=0,
+        training_set_version=-1,
+        models_version=-1,
+    )
 
-    ex.postprocess(state, CampaignPhase.INITIAL_FEREBUS, observations=[])
+    ex.postprocess(state, CampaignPhase.PHASE_A_POLUS, observations=[])
+    ex.postprocess(state, CampaignPhase.INITIAL_GAUSSIAN, observations=[])
+    ex.postprocess(state, CampaignPhase.INITIAL_AIMALL, observations=[])
+    ex.submit_or_run(state, CampaignPhase.INITIAL_ALLOCATION_CHECK)
+    bootstrap = ex.postprocess(
+        state,
+        CampaignPhase.INITIAL_FEREBUS,
+        observations=[],
+    )
+    state.training_set_version = bootstrap.state_updates["training_set_version"]
+    state.models_version = bootstrap.state_updates["models_version"]
 
     ex.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
     iter_dir = campaign_dir / "7_ACTIVE_LEARNING" / "iteration-0000"
@@ -324,26 +341,46 @@ def test_full_provenance_chain_through_dry_run_executor(tmp_path):
         assert data["phase_b"] is None
 
     ex.postprocess(state, CampaignPhase.PHASE_B_POLUS, observations=[])
+    selected_after_fps = 0
     for sd in seed_dirs:
         data = read_provenance(sd)
         assert data["phase_b"] is not None
-        assert data["phase_b"]["selected_after_fps"] is True
+        selected_after_fps += int(bool(data["phase_b"]["selected_after_fps"]))
         assert data["phase_b"]["descriptor_used"] == cfg.phase_b.descriptor
+    assert selected_after_fps == cfg.point_allocation.batch_total_size
 
+    ex.postprocess(state, CampaignPhase.GAUSSIAN, observations=[])
+    ex.postprocess(state, CampaignPhase.AIMALL, observations=[])
+    ex.submit_or_run(state, CampaignPhase.ALLOCATION_CHECK)
     ex.submit_or_run(state, CampaignPhase.APPEND)
     v = TrainingSetVersioning(campaign_dir / "5_TRAINING")
     assert v.current_version() == 1
     committed_iter = v.iteration_path(1)
     committed_pdirs = sorted(p for p in committed_iter.iterdir() if p.is_dir())
-    assert len(committed_pdirs) == len(seed_dirs)
+    assert len(committed_pdirs) == (
+        cfg.point_allocation.bootstrap_total_size
+        + cfg.point_allocation.batch_total_size
+    )
+    active_pdirs = [
+        pointdir
+        for pointdir in committed_pdirs
+        if read_provenance(pointdir)["point_allocation"]["context"] == "active"
+    ]
+    assert len(active_pdirs) == cfg.point_allocation.batch_total_size
     for pdir in committed_pdirs:
         data = read_provenance(pdir)
-        assert data["ariadne"] is not None
-        assert data["anti_overlap"] is not None
-        assert data["phase_b"] is not None
+        if data["point_allocation"]["context"] == "active":
+            assert data["ariadne"] is not None
+            assert data["anti_overlap"] is not None
+            assert data["phase_b"] is not None
+        else:
+            assert data["point_allocation"]["context"] == "bootstrap"
+            assert data["ariadne"] is None
+            assert data["anti_overlap"] is None
+            assert data["phase_b"] is None
 
     idx_data = load_index(campaign_dir)
-    assert len(idx_data["records"]) == len(committed_pdirs)
+    assert len(idx_data["records"]) == len(active_pdirs)
     for rec in idx_data["records"]:
         assert rec["iteration"] == 1
         assert rec["pointdir_name"].startswith("POINT_")
@@ -380,12 +417,27 @@ def test_full_provenance_chain_two_iterations_grows_index_monotonically(tmp_path
 
     campaign_dir = tmp_path / "campaign"
     cfg = CampaignConfig(max_iterations=3)
-    cfg.active_batch.final_batch_size = 2
+    cfg.point_allocation.batch_training_size = 1
+    cfg.point_allocation.batch_internal_validation_size = 1
     cfg.seed_selection.n_seeds_per_iteration = 2
     ex = DryRunPhaseExecutor(campaign_dir=campaign_dir, config=cfg)
 
-    ex.postprocess(SimpleNamespace(iteration=0, campaign_uid="uid"),
-                   CampaignPhase.INITIAL_FEREBUS, observations=[])
+    bootstrap_state = SimpleNamespace(
+        iteration=0,
+        campaign_uid="uid",
+        replacement_round=0,
+        training_set_version=-1,
+        models_version=-1,
+    )
+    ex.postprocess(bootstrap_state, CampaignPhase.PHASE_A_POLUS, observations=[])
+    ex.postprocess(bootstrap_state, CampaignPhase.INITIAL_GAUSSIAN, observations=[])
+    ex.postprocess(bootstrap_state, CampaignPhase.INITIAL_AIMALL, observations=[])
+    ex.submit_or_run(bootstrap_state, CampaignPhase.INITIAL_ALLOCATION_CHECK)
+    ex.postprocess(
+        bootstrap_state,
+        CampaignPhase.INITIAL_FEREBUS,
+        observations=[],
+    )
 
     # Simulate the daemon's state machine: each loop iteration updates
     # training_set_version from the APPEND return so the M15 F2 idempotency
@@ -395,10 +447,15 @@ def test_full_provenance_chain_two_iterations_grows_index_monotonically(tmp_path
         state_ns = SimpleNamespace(
             iteration=it,
             campaign_uid="uid",
+            replacement_round=0,
             training_set_version=training_set_version,
+            models_version=training_set_version,
         )
         ex.postprocess(state_ns, CampaignPhase.ARIADNE_ARRAY, observations=[])
         ex.postprocess(state_ns, CampaignPhase.PHASE_B_POLUS, observations=[])
+        ex.postprocess(state_ns, CampaignPhase.GAUSSIAN, observations=[])
+        ex.postprocess(state_ns, CampaignPhase.AIMALL, observations=[])
+        ex.submit_or_run(state_ns, CampaignPhase.ALLOCATION_CHECK)
         result = ex.submit_or_run(state_ns, CampaignPhase.APPEND)
         # PhaseResult; pull the updated training_set_version out of it.
         if hasattr(result, "state_updates") and result.state_updates:

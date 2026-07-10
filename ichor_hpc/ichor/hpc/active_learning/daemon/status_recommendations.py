@@ -123,6 +123,9 @@ def _artifact_problem(payload: Dict[str, Any]) -> bool:
         CampaignPhase.SPLIT.value,
         CampaignPhase.GAUSSIAN.value,
         CampaignPhase.AIMALL.value,
+        CampaignPhase.ALLOCATION_CHECK.value,
+        CampaignPhase.REPLACEMENT_GAUSSIAN.value,
+        CampaignPhase.REPLACEMENT_AIMALL.value,
         CampaignPhase.APPEND.value,
         CampaignPhase.FEREBUS.value,
         CampaignPhase.STOP_CHECK.value,
@@ -293,7 +296,7 @@ def _halt_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusRecom
             why="seed selection exhausted eligible trajectory frames: " + _short_error(reason),
             command=_journal_cmd(campaign) + " --event-type halt --last-n 5",
             details=[
-                "lowering bootstrap.initial_labelled_size after bootstrap has committed does not remove already-labelled provenance",
+                "changing bootstrap point-allocation sizes after bootstrap has committed cannot remove already-labelled provenance",
                 "for plumbing-only debugging, anti_overlap.skip_training_seeds=false can allow reseeding",
             ],
         )
@@ -440,6 +443,18 @@ _PHASE_ACTIONS: Dict[str, tuple[str, str]] = {
         "start the daemon to submit or postprocess initial AIMAll jobs",
         "the next phase is INITIAL_AIMALL",
     ),
+    CampaignPhase.INITIAL_ALLOCATION_CHECK.value: (
+        "start the daemon to verify bootstrap slot completion or allocate reserve replacements",
+        "the next phase is INITIAL_ALLOCATION_CHECK",
+    ),
+    CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN.value: (
+        "start the daemon to label the allocated bootstrap replacements with Gaussian",
+        "the next phase is INITIAL_REPLACEMENT_GAUSSIAN",
+    ),
+    CampaignPhase.INITIAL_REPLACEMENT_AIMALL.value: (
+        "start the daemon to postprocess the bootstrap replacements with AIMAll",
+        "the next phase is INITIAL_REPLACEMENT_AIMALL",
+    ),
     CampaignPhase.INITIAL_FEREBUS.value: (
         "start the daemon to build or postprocess initial FEREBUS models",
         "the next phase is INITIAL_FEREBUS",
@@ -457,7 +472,7 @@ _PHASE_ACTIONS: Dict[str, tuple[str, str]] = {
         "the next phase is PHASE_B_POLUS",
     ),
     CampaignPhase.SPLIT.value: (
-        "start the daemon to write the train/validation/holdout split",
+        "start the daemon to verify the exact pre-QM slot allocation",
         "the next phase is SPLIT",
     ),
     CampaignPhase.GAUSSIAN.value: (
@@ -467,6 +482,18 @@ _PHASE_ACTIONS: Dict[str, tuple[str, str]] = {
     CampaignPhase.AIMALL.value: (
         "start the daemon to submit or postprocess active AIMAll jobs",
         "the next phase is AIMALL",
+    ),
+    CampaignPhase.ALLOCATION_CHECK.value: (
+        "start the daemon to verify active slot completion or allocate reserve replacements",
+        "the next phase is ALLOCATION_CHECK",
+    ),
+    CampaignPhase.REPLACEMENT_GAUSSIAN.value: (
+        "start the daemon to label the allocated active replacements with Gaussian",
+        "the next phase is REPLACEMENT_GAUSSIAN",
+    ),
+    CampaignPhase.REPLACEMENT_AIMALL.value: (
+        "start the daemon to postprocess the active replacements with AIMAll",
+        "the next phase is REPLACEMENT_AIMALL",
     ),
     CampaignPhase.APPEND.value: (
         "start the daemon to append accepted AIMAll pointdirs to the training set",

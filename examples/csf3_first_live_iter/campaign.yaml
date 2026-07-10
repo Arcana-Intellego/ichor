@@ -2,7 +2,7 @@
 # Generic first-live-iteration active-learning campaign for CSF3/CSF4.
 # Intended for a small validation run, not a long production campaign.
 
-schema_version: 8
+schema_version: 9
 
 # -------------------------------------------------------------------------
 # Required system-level identifiers
@@ -18,9 +18,12 @@ campaign:
 
 # Keep first-live examples small enough to debug quickly. With the default
 # 20-frame smoke pool, 12 + 1 * 8 = 20 frames are required.
-bootstrap:
-  initial_labelled_size: 12
-  external_validation_size: 2
+point_allocation:
+  bootstrap_training_size: 8
+  bootstrap_internal_validation_size: 2
+  bootstrap_external_validation_size: 2
+  batch_training_size: 3
+  batch_internal_validation_size: 1
   anchor: false
 
 # -------------------------------------------------------------------------
@@ -34,9 +37,6 @@ trajectory_pool:
 # -------------------------------------------------------------------------
 # Active batch and seed selection
 # -------------------------------------------------------------------------
-
-active_batch:
-  final_batch_size: 4
 
 seed_selection:
   n_seeds_per_iteration: 8
@@ -68,8 +68,6 @@ ferebus:
   full_ARD: true
   properties:
     - iqa
-  train_fraction: 0.8
-  internal_validation_fraction: 0.2
 
 error_calibration:
   enabled: true

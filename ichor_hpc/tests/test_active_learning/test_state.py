@@ -26,6 +26,7 @@ def test_fresh_state_has_defaults():
     assert s.schema_version == SCHEMA_VERSION
     assert s.campaign_uid
     assert s.campaign_started_iso
+    assert s.replacement_round == 0
 
 
 def test_state_roundtrip(tmp_path):
@@ -36,6 +37,7 @@ def test_state_roundtrip(tmp_path):
     s.training_set_version = 7
     s.last_acquisition_alpha0 = 0.832
     s.stop_streak = 2
+    s.replacement_round = 3
     target = tmp_path / "state.json"
     write_state(target, s)
     loaded = read_state(target)
@@ -44,6 +46,7 @@ def test_state_roundtrip(tmp_path):
     assert loaded.pending_jobs == {"ARIADNE_ARRAY": "12345", "FEREBUS": None}
     assert loaded.last_acquisition_alpha0 == pytest.approx(0.832)
     assert loaded.stop_streak == 2
+    assert loaded.replacement_round == 3
 
 
 def test_atomic_write_text_does_not_leave_tmp_on_success(tmp_path):
@@ -103,6 +106,7 @@ def test_read_state_rejects_wrong_schema_version(tmp_path):
         ("schema_version", None, "schema_version"),
         ("reference_scales_iteration", None, "reference_scales_iteration"),
         ("last_n_anti_overlap_flagged", "abc", "last_n_anti_overlap_flagged"),
+        ("replacement_round", None, "replacement_round"),
     ],
 )
 def test_read_state_wraps_malformed_integer_fields(field, value, match):
@@ -199,9 +203,9 @@ def test_state_is_terminal_flag():
 # --- M15 F3: schema bump + new state fields ----------------------------
 
 
-def test_schema_version_is_three():
+def test_schema_version_is_four():
     from ichor.hpc.active_learning.daemon.state import SCHEMA_VERSION
-    assert SCHEMA_VERSION == 3
+    assert SCHEMA_VERSION == 4
 
 
 def test_last_n_anti_overlap_flagged_default_and_roundtrip():

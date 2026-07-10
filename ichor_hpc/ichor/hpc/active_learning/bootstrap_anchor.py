@@ -32,11 +32,10 @@ class BootstrapAnchorPlan:
     enabled: bool
     anchor_path: str
     n_anchor: int
-    initial_labelled_size: int
-    external_validation_size: int
-    non_external_labelled_size: int
-    planned_train_size: int
-    planned_internal_validation_size: int
+    bootstrap_total_size: int
+    bootstrap_training_size: int
+    bootstrap_internal_validation_size: int
+    bootstrap_external_validation_size: int
     pool_total_needed: int
     pool_train_needed: int
     pool_internal_validation_needed: int
@@ -51,12 +50,13 @@ class BootstrapAnchorPlan:
             "enabled": bool(self.enabled),
             "anchor_path": str(self.anchor_path),
             "n_anchor": int(self.n_anchor),
-            "initial_labelled_size": int(self.initial_labelled_size),
-            "external_validation_size": int(self.external_validation_size),
-            "non_external_labelled_size": int(self.non_external_labelled_size),
-            "planned_train_size": int(self.planned_train_size),
-            "planned_internal_validation_size": int(
-                self.planned_internal_validation_size
+            "bootstrap_total_size": int(self.bootstrap_total_size),
+            "bootstrap_training_size": int(self.bootstrap_training_size),
+            "bootstrap_internal_validation_size": int(
+                self.bootstrap_internal_validation_size
+            ),
+            "bootstrap_external_validation_size": int(
+                self.bootstrap_external_validation_size
             ),
             "pool_total_needed": int(self.pool_total_needed),
             "pool_train_needed": int(self.pool_train_needed),
@@ -93,10 +93,12 @@ def bootstrap_anchor_manifest_path(campaign_dir: str | Path) -> Path:
 def load_anchor_frames(campaign_dir: str | Path) -> List[Atoms]:
     path = anchor_xyz_path(campaign_dir)
     if path.is_symlink():
-        raise ValueError("bootstrap.anchor refuses symlinked anchor.xyz: " + str(path))
+        raise ValueError(
+            "point_allocation.anchor refuses symlinked anchor.xyz: " + str(path)
+        )
     if not path.is_file():
         raise FileNotFoundError(
-            "bootstrap.anchor is true but anchor.xyz is missing: " + str(path)
+            "point_allocation.anchor is true but anchor.xyz is missing: " + str(path)
         )
     try:
         traj = Trajectory(path)
@@ -179,22 +181,11 @@ def plan_bootstrap_anchors(
     The plan is anchor-aware even when anchors are disabled so callers can use
     the same fields for pool-feasibility maths and manifest diagnostics.
     """
-    from .daemon.ferebus_split_ledger import plan_initial_split_counts
-
-    initial_n = int(config.bootstrap.initial_labelled_size)
-    external_n = int(config.bootstrap.external_validation_size)
-    train_internal = (
-        float(config.ferebus.train_fraction),
-        float(config.ferebus.internal_validation_fraction),
-    )
-    counts = plan_initial_split_counts(
-        initial_n,
-        train_internal,
-        external_n,
-    )
-    planned_train = int(counts["train"])
-    planned_internal = int(counts["int_val"])
-    non_external = initial_n - external_n
+    allocation = config.point_allocation
+    initial_n = int(allocation.bootstrap_total_size)
+    planned_train = int(allocation.bootstrap_training_size)
+    planned_internal = int(allocation.bootstrap_internal_validation_size)
+    external_n = int(allocation.bootstrap_external_validation_size)
 
     pool_frames_list = list(pool_frames or [])
     expected_atom_types: tuple[str, ...] = ()
@@ -210,7 +201,7 @@ def plan_bootstrap_anchors(
     anchor_frames: List[Atoms] = []
     excluded_pool_ids: tuple[int, ...] = ()
     duplicate_by_anchor: tuple[tuple[int, ...], ...] = ()
-    if bool(getattr(config.bootstrap, "anchor", False)):
+    if bool(getattr(config.point_allocation, "anchor", False)):
         anchor_frames = load_anchor_frames(campaign_dir)
         if not expected_atom_types:
             expected_atom_types = _atom_types(anchor_frames[0])
@@ -234,12 +225,13 @@ def plan_bootstrap_anchors(
     n_anchor = len(anchor_frames)
     if n_anchor > planned_train:
         raise ValueError(
-            "bootstrap.anchor has "
+            "point_allocation.anchor has "
             + str(n_anchor)
             + " geometries but the planned initial FEREBUS training split "
             + "can hold only "
             + str(planned_train)
-            + " rows; reduce anchor.xyz or increase bootstrap/ferebus training size"
+            + " rows; reduce anchor.xyz or increase "
+            + "point_allocation.bootstrap_training_size"
         )
     pool_total_needed = initial_n - n_anchor
     available_pool = len(pool_frames_list) - len(excluded_pool_ids)
@@ -252,14 +244,13 @@ def plan_bootstrap_anchors(
             + " non-anchor pool geometries are available"
         )
     plan = BootstrapAnchorPlan(
-        enabled=bool(getattr(config.bootstrap, "anchor", False)),
+        enabled=bool(getattr(config.point_allocation, "anchor", False)),
         anchor_path=str(anchor_xyz_path(campaign_dir).resolve(strict=False)),
         n_anchor=int(n_anchor),
-        initial_labelled_size=int(initial_n),
-        external_validation_size=int(external_n),
-        non_external_labelled_size=int(non_external),
-        planned_train_size=int(planned_train),
-        planned_internal_validation_size=int(planned_internal),
+        bootstrap_total_size=int(initial_n),
+        bootstrap_training_size=int(planned_train),
+        bootstrap_internal_validation_size=int(planned_internal),
+        bootstrap_external_validation_size=int(external_n),
         pool_total_needed=int(pool_total_needed),
         pool_train_needed=int(planned_train - n_anchor),
         pool_internal_validation_needed=int(planned_internal),

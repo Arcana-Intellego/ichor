@@ -421,9 +421,50 @@ def stage_gaussian_inputs(
 
     frames = _load_frames(sample_xyz)
     phase_b_records: List[Dict[str, Any]] = []
+    allocation_records: List[Dict[str, Any]] = []
+    allocation_manifest_hash: Optional[str] = None
     initial_seed_frame_ids: List[Optional[int]] = []
     initial_seed_selection_origins: List[str] = []
     initial_provenance_context: Optional[Dict[str, str]] = None
+    replacement_context: Optional[str] = None
+    is_replacement = str(phase_name) in {
+        "INITIAL_REPLACEMENT_GAUSSIAN",
+        "REPLACEMENT_GAUSSIAN",
+    }
+    if is_replacement:
+        from ..replacement_sampling import read_replacement_sample
+
+        replacement_manifest = read_replacement_sample(
+            Path(sample_xyz).parent,
+            verify_allocation=True,
+        )
+        replacement_context = str(replacement_manifest["context"])
+        allocation_records = list(replacement_manifest["records"])
+        allocation_manifest_hash = str(
+            replacement_manifest["point_allocation_sha256"]
+        )
+        if len(allocation_records) != len(frames):
+            raise ValueError(
+                "replacement allocation record count does not match sample"
+            )
+        if replacement_context == "active":
+            phase_b_records = list(allocation_records)
+        elif replacement_context == "bootstrap":
+            from .state import read_state, DEFAULT_STATE_FILENAME
+            from ..acquisition.trajectory_pool import TrajectoryPool
+
+            current_state = read_state(
+                Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
+            )
+            pool = TrajectoryPool.load(campaign_dir)
+            initial_provenance_context = {
+                "campaign_uid": str(current_state.campaign_uid),
+                "trajectory_sha256": str(pool.sha256),
+            }
+            initial_seed_frame_ids = [int(record["frame_id"]) for record in allocation_records]
+            initial_seed_selection_origins = ["phase_a_replacement"] * len(allocation_records)
+        else:
+            raise ValueError("replacement sample context is invalid")
     if str(phase_name) == "GAUSSIAN":
         from ..handoff_manifests import read_phase_b_selection_manifest
 
@@ -439,6 +480,12 @@ def stage_gaussian_inputs(
                 + " != sample frame count "
                 + str(len(frames))
             )
+        allocation_records = list(phase_b_records)
+        from ..point_allocation import allocation_manifest_sha256
+
+        allocation_manifest_hash = allocation_manifest_sha256(
+            phase_b_manifest["point_allocation"]["manifest"]
+        )
     if str(phase_name) == "INITIAL_GAUSSIAN":
         try:
             from .state import read_state, DEFAULT_STATE_FILENAME
@@ -471,6 +518,18 @@ def stage_gaussian_inputs(
                     "campaign_uid": str(current_state.campaign_uid),
                     "trajectory_sha256": str(pool.sha256),
                 }
+                allocation_records = list(
+                    phase_a_manifest["point_allocation"]["primary"]
+                )
+                if len(allocation_records) != len(frames):
+                    raise ValueError(
+                        "Phase A point-allocation record count does not match sample"
+                    )
+                from ..point_allocation import allocation_manifest_sha256
+
+                allocation_manifest_hash = allocation_manifest_sha256(
+                    phase_a_manifest["point_allocation"]["manifest"]
+                )
         except FileNotFoundError:
             initial_seed_frame_ids = []
             initial_seed_selection_origins = []
@@ -504,7 +563,11 @@ def stage_gaussian_inputs(
                 + str(exc)
             ) from exc
     g = config.gaussian
-    staging = bucket_dir(campaign_dir, phase_name, iteration)
+    staging = (
+        Path(sample_xyz).parent
+        if is_replacement
+        else bucket_dir(campaign_dir, phase_name, iteration)
+    )
     preserve_existing_layout = False
     if staging.exists():
         try:
@@ -542,7 +605,12 @@ def stage_gaussian_inputs(
 
     pointdirs: List[Path] = []
     for k, atoms in enumerate(frames):
-        pd = staging / ("POINT_" + str(k).zfill(4) + ".pointdir")
+        point_index = (
+            int(allocation_records[k].get("pointdir_index", k))
+            if is_replacement and allocation_records
+            else int(k)
+        )
+        pd = staging / ("POINT_" + str(point_index).zfill(4) + ".pointdir")
         pd.mkdir(parents=True, exist_ok=True)
         gjf = GJF(
             pd / "input.gjf",
@@ -581,7 +649,11 @@ def stage_gaussian_inputs(
                 mode_weighting_policy="phase_a_diversity",
             )
         if phase_b_records:
-            from ..versioning.provenance import PROVENANCE_FILENAME, validate_provenance
+            from ..versioning.provenance import (
+                PROVENANCE_FILENAME,
+                enrich_with_phase_b,
+                validate_provenance,
+            )
 
             src_prov = Path(str(phase_b_records[k].get("provenance_json", "")))
             if not src_prov.is_file():
@@ -590,6 +662,15 @@ def stage_gaussian_inputs(
                     + str(k)
                     + ": "
                     + str(src_prov)
+                )
+            if is_replacement:
+                enrich_with_phase_b(
+                    src_prov.parent,
+                    selected_after_fps=True,
+                    diversity_rank=phase_b_records[k].get("reserve_rank"),
+                    descriptor_used="replacement_reserve",
+                    candidate_id=str(phase_b_records[k]["candidate_id"]),
+                    reserve_candidate=True,
                 )
             validate_provenance(
                 src_prov.parent,
@@ -600,6 +681,25 @@ def stage_gaussian_inputs(
                 require_phase_b_selected=True,
             )
             shutil.copy2(str(src_prov), str(pd / PROVENANCE_FILENAME))
+        if allocation_records:
+            from ..versioning.provenance import enrich_with_point_allocation
+
+            allocation_record = allocation_records[k]
+            enrich_with_point_allocation(
+                pd,
+                candidate_id=str(allocation_record["candidate_id"]),
+                context=(
+                    replacement_context
+                    if is_replacement
+                    else ("bootstrap" if str(phase_name) == "INITIAL_GAUSSIAN" else "active")
+                ),
+                slot_id=int(allocation_record["slot_id"]),
+                split=str(allocation_record["split"]),
+                replacement_round=(
+                    int(allocation_record.get("round", 0)) if is_replacement else 0
+                ),
+                allocation_manifest_sha256=allocation_manifest_hash,
+            )
         pointdirs.append(pd)
 
     write_points_file(staging, pointdirs)
@@ -613,16 +713,26 @@ def stage_aimall_inputs(
     iteration,
     *,
     partition_override: Optional[str] = None,
+    staging_override: Optional[Path] = None,
+    expected_gaussian_phase: Optional[str] = None,
 ) -> Tuple[Path, int]:
     """AIMAll runs on the .wfn files Gaussian produced in the same bucket. The
     pointdirs already exist; rewrite POINTS.txt over the Gaussian-accepted
     pointdirs so the array only indexes ready points. Returns (dir, n_points)."""
-    staging = bucket_dir(campaign_dir, phase_name, iteration)
-    expected_phase = "INITIAL_GAUSSIAN" if phase_name.startswith("INITIAL_") else "GAUSSIAN"
+    staging = (
+        Path(staging_override)
+        if staging_override is not None
+        else bucket_dir(campaign_dir, phase_name, iteration)
+    )
+    expected_phase = str(
+        expected_gaussian_phase
+        or ("INITIAL_GAUSSIAN" if phase_name.startswith("INITIAL_") else "GAUSSIAN")
+    )
     pointdirs, _manifest = read_quantum_acceptance_manifest(
         staging,
         expected_phase=expected_phase,
         expected_iteration=int(iteration),
+        require_nonempty=False,
         require_points_file_membership=True,
     )
     aimall_resources = resolve_phase_resources(
@@ -672,6 +782,287 @@ def stage_aimall_inputs(
     return staging, len(pointdirs)
 
 
+def record_allocation_quantum_results(
+    campaign_dir: Path,
+    *,
+    context: str,
+    iteration: int,
+    staging_dir: Path,
+    gaussian_phase: str,
+    aimall_phase: str,
+) -> Dict[str, Any]:
+    """Join Gaussian and AIMAll outcomes into one exact allocation update."""
+    from ..point_allocation import (
+        pending_attempts,
+        point_allocation_path,
+        read_point_allocation,
+        record_quantum_results,
+    )
+    from ..versioning.provenance import read_provenance, validate_provenance
+
+    campaign = Path(campaign_dir)
+    staging = Path(staging_dir)
+    allocation_path = point_allocation_path(
+        campaign,
+        context=str(context),
+        iteration=int(iteration),
+    )
+    allocation = read_point_allocation(allocation_path)
+    pending = pending_attempts(allocation)
+    gaussian_accepted, gaussian_manifest = read_quantum_acceptance_manifest(
+        staging,
+        expected_phase=str(gaussian_phase),
+        expected_iteration=int(iteration),
+        require_nonempty=False,
+        require_points_file_membership=True,
+    )
+    pending_ids = {str(record["candidate_id"]) for record in pending}
+    submitted_names = [Path(path).name for path in gaussian_accepted]
+    submitted_names.extend(
+        str(record.get("pointdir"))
+        for record in list(gaussian_manifest.get("rejected") or [])
+        if isinstance(record, dict)
+    )
+    if len(submitted_names) != len(set(submitted_names)):
+        raise ValueError("Gaussian allocation handoff contains duplicate pointdirs")
+    if len(submitted_names) != len(pending_ids):
+        raise ValueError(
+            "quantum staging task count does not match pending point allocation: "
+            + str(len(submitted_names))
+            + " staged, "
+            + str(len(pending_ids))
+            + " pending"
+        )
+    try:
+        aimall_accepted, aimall_manifest = read_quantum_acceptance_manifest(
+            staging,
+            expected_phase=str(aimall_phase),
+            expected_iteration=int(iteration),
+            require_nonempty=False,
+            require_points_file_membership=False,
+        )
+    except FileNotFoundError:
+        if gaussian_accepted:
+            raise
+        aimall_accepted = []
+        aimall_manifest = {"rejected": []}
+
+    gaussian_accepted_names = {Path(path).name for path in gaussian_accepted}
+    aimall_accepted_names = {Path(path).name for path in aimall_accepted}
+    gaussian_rejected = {
+        str(record.get("pointdir")): str(record.get("reason") or "gaussian_rejected")
+        for record in list(gaussian_manifest.get("rejected") or [])
+        if isinstance(record, dict)
+    }
+    aimall_rejected = {
+        str(record.get("pointdir")): str(record.get("reason") or "aimall_rejected")
+        for record in list(aimall_manifest.get("rejected") or [])
+        if isinstance(record, dict)
+    }
+    results: List[Dict[str, Any]] = []
+    observed_ids: set[str] = set()
+    pending_by_id = {str(record["candidate_id"]): record for record in pending}
+    for name in submitted_names:
+        pointdir = staging / name
+        provenance = read_provenance(pointdir)
+        allocation_provenance = provenance.get("point_allocation")
+        if not isinstance(allocation_provenance, dict):
+            raise ValueError("staged pointdir lacks allocation provenance: " + name)
+        candidate_id = str(allocation_provenance.get("candidate_id") or "")
+        if candidate_id not in pending_by_id or candidate_id in observed_ids:
+            raise ValueError(
+                "staged pointdir candidate does not match pending allocation: " + name
+            )
+        attempt = pending_by_id[candidate_id]
+        validate_provenance(
+            pointdir,
+            allocation_candidate_id=candidate_id,
+            allocation_context=str(context),
+            allocation_slot_id=int(attempt["slot_id"]),
+            allocation_split=str(attempt["split"]),
+        )
+        observed_ids.add(candidate_id)
+        if name in aimall_accepted_names:
+            accepted = True
+            reason = None
+        elif name in gaussian_rejected:
+            accepted = False
+            reason = gaussian_rejected[name]
+        elif name in aimall_rejected:
+            accepted = False
+            reason = aimall_rejected[name]
+        elif name in gaussian_accepted_names:
+            accepted = False
+            reason = "aimall_result_missing"
+        else:
+            accepted = False
+            reason = "gaussian_result_missing"
+        results.append(
+            {
+                "candidate_id": candidate_id,
+                "accepted": bool(accepted),
+                "pointdir": str(pointdir.resolve()),
+                "reason": reason,
+                "quality_manifest": str(
+                    (staging / "quantum_quality.json").resolve(strict=False)
+                ),
+            }
+        )
+    if observed_ids != pending_ids:
+        raise ValueError("quantum staging does not cover every pending allocation candidate")
+    return record_quantum_results(
+        allocation_path,
+        results,
+        expected_generation=int(allocation.get("generation", 0)),
+    )
+
+
+def accepted_allocation_pointdirs(
+    campaign_dir: Path,
+    *,
+    context: str,
+    iteration: int,
+) -> Tuple[List[Path], Dict[str, Any]]:
+    """Resolve and verify the exact accepted slot set for a commit."""
+    from ..point_allocation import (
+        accepted_attempts,
+        point_allocation_path,
+        read_point_allocation,
+    )
+    from ..versioning.provenance import validate_provenance
+
+    campaign = Path(campaign_dir).resolve(strict=False)
+    allocation_path = point_allocation_path(
+        campaign,
+        context=str(context),
+        iteration=int(iteration),
+    )
+    allocation = read_point_allocation(allocation_path)
+    if not bool((allocation.get("summary") or {}).get("complete", False)):
+        raise ValueError("point allocation is incomplete: " + str(allocation_path))
+    attempts = sorted(accepted_attempts(allocation), key=lambda row: int(row["slot_id"]))
+    target_total = int(allocation["targets"]["total"])
+    if len(attempts) != target_total:
+        raise ValueError("complete point allocation has the wrong accepted count")
+    staging_root = (campaign / ".DATA" / "STAGING").resolve(strict=False)
+    pointdirs: List[Path] = []
+    seen: set[Path] = set()
+    for attempt in attempts:
+        pointdir = Path(str(attempt.get("pointdir") or ""))
+        resolved = pointdir.resolve(strict=False)
+        if resolved in seen:
+            raise ValueError("point allocation reuses an accepted pointdir")
+        if staging_root not in resolved.parents:
+            raise ValueError(
+                "accepted allocation pointdir is outside daemon staging: "
+                + str(pointdir)
+            )
+        if not resolved.is_dir() or resolved.is_symlink():
+            raise FileNotFoundError(
+                "accepted allocation pointdir is missing or symlinked: "
+                + str(pointdir)
+            )
+        validate_provenance(
+            resolved,
+            allocation_candidate_id=str(attempt["candidate_id"]),
+            allocation_context=str(context),
+            allocation_slot_id=int(attempt["slot_id"]),
+            allocation_split=str(attempt["split"]),
+        )
+        seen.add(resolved)
+        pointdirs.append(resolved)
+    return pointdirs, allocation
+
+
+def verify_committed_allocation_snapshot(
+    campaign_dir: Path,
+    *,
+    training_version: int,
+    context: str,
+    iteration: int,
+) -> Dict[str, Any]:
+    """Prove that an idempotent APPEND retry refers to the same allocation.
+
+    A committed version one step ahead of ``state.json`` is expected after a
+    crash between commit and state persistence, but its mere existence is not
+    enough evidence.  The version must pass the normal committed-tree checks,
+    contain the exact allocation snapshot, and contain one provenance record
+    for every accepted candidate in that snapshot.
+    """
+    from ..point_allocation import (
+        accepted_attempts,
+        point_allocation_path,
+        read_point_allocation,
+    )
+    from ..versioning.provenance import read_provenance
+    from ..versioning.training_set import TrainingSetVersioning
+
+    campaign = Path(campaign_dir)
+    version = int(training_version)
+    versioning = TrainingSetVersioning(campaign / "5_TRAINING")
+    source_path = point_allocation_path(
+        campaign,
+        context=str(context),
+        iteration=int(iteration),
+    )
+    source = read_point_allocation(source_path)
+    if not bool((source.get("summary") or {}).get("complete", False)):
+        raise ValueError("committed allocation source is incomplete: " + str(source_path))
+    committed_dir = versioning.iteration_path(version)
+    snapshot_path = committed_dir / (
+        "POINT_ALLOCATION.version-" + str(version).zfill(4) + ".json"
+    )
+    if not snapshot_path.is_file() or snapshot_path.is_symlink():
+        raise FileNotFoundError(
+            "committed training version lacks its allocation snapshot: "
+            + str(snapshot_path)
+        )
+    versioning.verify_committed_training_inputs(version)
+    try:
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            "committed allocation snapshot is unreadable: " + str(snapshot_path)
+        ) from exc
+    if snapshot != source:
+        raise ValueError(
+            "committed allocation snapshot does not match the current allocation"
+        )
+
+    expected = {
+        str(record["candidate_id"]): (
+            int(record["slot_id"]),
+            str(record["split"]),
+        )
+        for record in accepted_attempts(source)
+    }
+    observed: Dict[str, Tuple[int, str]] = {}
+    for pointdir in sorted(committed_dir.glob("POINT_*.pointdir")):
+        if not pointdir.is_dir() or pointdir.is_symlink():
+            continue
+        provenance = read_provenance(pointdir)
+        allocation = provenance.get("point_allocation")
+        if not isinstance(allocation, dict):
+            continue
+        candidate_id = str(allocation.get("candidate_id") or "")
+        if candidate_id not in expected:
+            continue
+        if candidate_id in observed:
+            raise ValueError(
+                "committed training version duplicates allocation candidate "
+                + candidate_id
+            )
+        observed[candidate_id] = (
+            int(allocation.get("slot_id", -1)),
+            str(allocation.get("split") or ""),
+        )
+    if observed != expected:
+        raise ValueError(
+            "committed training version does not reproduce accepted allocation provenance"
+        )
+    return source
+
+
 def commit_initial_training_set(campaign_dir) -> bool:
     """build + commit 5_TRAINING/iteration-0 from the initial quantum staging bucket
     (.DATA/STAGING/initial/POINT_*). returns True if it actually committed, False if
@@ -687,46 +1078,47 @@ def commit_initial_training_set(campaign_dir) -> bool:
 
     campaign = Path(campaign_dir)
     v_train = TrainingSetVersioning(campaign / "5_TRAINING")
-    initial_staging = campaign / ".DATA" / "STAGING" / "initial"
+    allocation_path = (
+        campaign / "3_DIVERSITY_SAMPLING" / "initial" / "POINT_ALLOCATION.json"
+    )
     if 0 in v_train.list_committed_versions():
-        try:
-            accepted_pointdirs, _manifest = read_quantum_acceptance_manifest(
-                initial_staging,
-                expected_phase="INITIAL_AIMALL",
-                expected_iteration=0,
-                require_points_file_membership=True,
+        verify_committed_allocation_snapshot(
+            campaign,
+            training_version=0,
+            context="bootstrap",
+            iteration=0,
+        )
+        accepted_pointdirs, allocation = accepted_allocation_pointdirs(
+            campaign,
+            context="bootstrap",
+            iteration=0,
+        )
+        accepted_names = {p.name for p in accepted_pointdirs}
+        committed_dir = v_train.iteration_path(0)
+        committed_names = {
+            child.name
+            for child in committed_dir.iterdir()
+            if child.is_dir() and POINTDIR_BASENAME_RE.fullmatch(child.name)
+        }
+        if committed_names != accepted_names:
+            raise ValueError(
+                "existing initial training set does not match point allocation"
             )
-            accepted_names = {p.name for p in accepted_pointdirs}
-            committed_dir = v_train.iteration_path(0)
-            committed_names = {
-                child.name
-                for child in committed_dir.iterdir()
-                if child.is_dir() and POINTDIR_BASENAME_RE.fullmatch(child.name)
-            }
-            if committed_names != accepted_names:
-                raise ValueError(
-                    "existing initial training set does not match initial AIMAll handoff"
-                )
-        except FileNotFoundError as exc:
-            try:
-                from .journal import append_event
-
-                append_event(
-                    campaign / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson",
-                    "initial_training_existing_without_bootstrap_handoff",
-                    iteration=0,
-                    training_version=0,
-                    reason=str(exc)[:200],
-                )
-            except Exception:
-                pass
+        committed_allocation = committed_dir / "POINT_ALLOCATION.version-0000.json"
+        if not committed_allocation.is_file():
+            raise FileNotFoundError(
+                "existing initial training set lacks POINT_ALLOCATION.version-0000.json"
+            )
+        if json.loads(committed_allocation.read_text(encoding="utf-8")) != allocation:
+            raise ValueError("committed initial point allocation does not match source")
         v_train.ensure_current(0)
         return False
-    accepted_pointdirs, _manifest = read_quantum_acceptance_manifest(
-        initial_staging,
-        expected_phase="INITIAL_AIMALL",
-        expected_iteration=0,
-        require_points_file_membership=True,
+    if not allocation_path.is_file():
+        return False
+    accepted_pointdirs, allocation = accepted_allocation_pointdirs(
+        campaign,
+        context="bootstrap",
+        iteration=0,
     )
     # bin any half-built staging left by a dead attempt, then stage an empty iter-0 and copy
     # the validated initial pointdirs into it.
@@ -741,6 +1133,11 @@ def commit_initial_training_set(campaign_dir) -> bool:
                 allowed_roots=[train_staging],
             )
         _copytree_no_symlinks(pdir, dest)
+    atomic_write_json(train_staging / "POINT_ALLOCATION.json", allocation)
+    atomic_write_json(
+        train_staging / "POINT_ALLOCATION.version-0000.json",
+        allocation,
+    )
     v_train.commit(0)
     v_train.update_current(0)
     return True
@@ -803,11 +1200,17 @@ def stage_ferebus_inputs(campaign_dir, config, training_version, is_initial=Fals
             if sidecar.is_file():
                 pointdir_identities[name] = "provenance:" + sha256_file(sidecar)
                 provenance = read_provenance(pointdir_path)
-                if (
-                    str((provenance.get("seed") or {}).get("selection_origin"))
-                    == "bootstrap_anchor"
-                ):
-                    forced_ferebus_splits[name] = "train"
+                allocation = provenance.get("point_allocation")
+                if not isinstance(allocation, dict):
+                    raise ValueError(
+                        "pointdir provenance is missing point_allocation for " + name
+                    )
+                split = str(allocation.get("split") or "")
+                if split not in {"train", "int_val", "ext_val"}:
+                    raise ValueError(
+                        "pointdir provenance has invalid allocation split for " + name
+                    )
+                forced_ferebus_splits[name] = split
             else:
                 pointdir_identities[name] = "pointdir-tree:" + hash_pointdir_tree(pointdir_path)
     except Exception as exc:
@@ -835,22 +1238,40 @@ def stage_ferebus_inputs(campaign_dir, config, training_version, is_initial=Fals
         raise ValueError("PointsDirectory export produced no *_train.csv files for FEREBUS")
 
     system = str(getattr(config.campaign, "system_name", "SYSTEM"))
-    train_internal_fractions = (
-        float(f.train_fraction),
-        float(f.internal_validation_fraction),
-    )
-    external_validation_size = int(config.bootstrap.external_validation_size)
     from . import ferebus_dataset as _fds
     from .ferebus_split_ledger import ensure_split_assignments
+    from ..point_allocation import (
+        allocation_manifest_sha256,
+        allocation_targets,
+        point_allocation_path,
+        read_point_allocation,
+    )
+
+    allocation_context = "bootstrap" if int(training_version) == 0 else "active"
+    allocation_iteration = 0 if allocation_context == "bootstrap" else int(training_version) - 1
+    allocation_path = point_allocation_path(
+        campaign,
+        context=allocation_context,
+        iteration=allocation_iteration,
+    )
+    allocation_payload = read_point_allocation(allocation_path)
+    if not bool((allocation_payload.get("summary") or {}).get("complete", False)):
+        raise ValueError(
+            "FEREBUS staging requires a complete point allocation: "
+            + str(allocation_path)
+        )
+    allocation_hash = allocation_manifest_sha256(allocation_path)
+    expected_new_counts = allocation_targets(config, allocation_context)
+    expected_new_counts.pop("total", None)
 
     split_ledger = ensure_split_assignments(
         campaign,
         pointdir_names,
         training_version=int(training_version),
-        train_internal_fractions=train_internal_fractions,
-        external_validation_size=external_validation_size,
+        expected_new_counts=expected_new_counts,
         pointdir_identity=pointdir_identities,
         forced_splits=forced_ferebus_splits,
+        allocation_manifest_sha256=allocation_hash,
     )
     ledger_row_ids = dict(split_ledger["row_ids"])
     atom_labels = []
@@ -1003,7 +1424,10 @@ def stage_ferebus_inputs(campaign_dir, config, training_version, is_initial=Fals
             "split_ledger": {
                 "path": str(split_ledger["path"]),
                 "counts": dict(split_ledger["counts"]),
-                "split_policy": dict(split_ledger.get("split_policy") or {}),
+                "version_allocation": dict(split_ledger["version_allocation"]),
+                "allocation_policy": str(split_ledger["allocation_policy"]),
+                "allocation_manifest": str(allocation_path.resolve()),
+                "allocation_manifest_sha256": str(allocation_hash),
                 "forced_splits": dict(forced_ferebus_splits),
             },
             "tasks": tasks,

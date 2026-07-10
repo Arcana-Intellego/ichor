@@ -113,13 +113,17 @@ class DryRunPhaseExecutor:
             )
             return PhaseResult(is_complete=False, submitted_job_id=job_id)
         # inline phases produce their artefacts synchronously.
-        updates = self._run_inline(state, phase_name)
-        return PhaseResult(is_complete=True, state_updates=updates)
+        inline_result = self._run_inline(state, phase_name)
+        if isinstance(inline_result, PhaseResult):
+            return inline_result
+        return PhaseResult(is_complete=True, state_updates=inline_result)
 
     def postprocess(self, state, phase, observations: Sequence[Any]) -> PhaseResult:
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
-        updates = self._postprocess_phase(state, phase_name)
-        return PhaseResult(is_complete=True, state_updates=updates)
+        postprocess_result = self._postprocess_phase(state, phase_name)
+        if isinstance(postprocess_result, PhaseResult):
+            return postprocess_result
+        return PhaseResult(is_complete=True, state_updates=postprocess_result)
 
     def handle_failure(self, state, phase, observations) -> FailureAction:
         # in dry-run we never produce failed jobs, but provide a sensible default
@@ -160,6 +164,8 @@ class DryRunPhaseExecutor:
 
     def _inline_handlers(self):
         return {
+            "INITIAL_ALLOCATION_CHECK": self._inline_initial_allocation_check,
+            "ALLOCATION_CHECK": self._inline_allocation_check,
             "SEED_SELECT": self._inline_seed_select,
             "SPLIT": self._inline_split,
             "APPEND": self._inline_append,
@@ -368,6 +374,7 @@ class DryRunPhaseExecutor:
             for row in selection.selection_diagnostics
             if isinstance(row, dict) and row.get("selection_index") is not None
         }
+
         for seed_index, frame_id in enumerate(selection.frame_ids):
             selection_index = int(selection.indices[seed_index])
             if seed_index < len(selection.selection_origins):
@@ -427,10 +434,6 @@ class DryRunPhaseExecutor:
                 else "posterior_variance"
             ),
             "score_source_reason": str(score_transform_reason),
-            # pin the trajectory this selection was made against. frame ids are positional, so if
-            # the pool ever got re-imported/swapped underneath the campaign, frame 7 would now be a
-            # different geometry -- ARIADNE on the compute node cross-checks this and refuses rather
-            # than silently attack the wrong point (A30).
             "trajectory_sha256": pool.sha256,
         }
         atomic_write_json(seeds_picked_path, seeds_picked_payload)
@@ -496,64 +499,122 @@ class DryRunPhaseExecutor:
             forbidden_set_size=int(len(forbidden)),
             skipped_unknown_provenance=int(selection.skipped_unknown_provenance),
         )
-        #seeds_picked + forbidden_set_size live in the journal
-        #("seed_selected" event above) and the seeds_picked.json sidecar;
-        # they are not persisted state. The empty return keeps the
-        # contract with daemon._apply_state_updates strict.
         return {}
-    def _inline_split(self, state) -> Dict[str, Any]:
-        """Derive this iteration's append split from the FEREBUS ratios.
 
-        Schema v7 removes the public ``split`` block. Phase SPLIT remains
-        as a daemon phase for compatibility with APPEND/reconcile, but it
-        now writes a plain train/internal-validation split using the same
-        FEREBUS train/internal fractions that are used for model staging.
-        """
-        iter_dir = self._iter_dir(state.iteration)
-        pool_dir = iter_dir / "pool"
-        split_path = iter_dir / "split.json"
+    def _allocation_check(self, state, *, context: str) -> PhaseResult:
+        from ..point_allocation import pending_attempts, point_allocation_path, read_point_allocation
+        from ..replacement_sampling import prepare_replacement_round
 
-        # Count the Phase-B final rows. The result.json files are written by
-        # ARIADNE_ARRAY postprocess earlier in this iteration.
-        seed_dirs = []
-        if pool_dir.is_dir():
-            seed_dirs = sorted(
-                d for d in pool_dir.iterdir()
-                if d.is_dir() and d.name.startswith("seed_")
+        iteration = 0 if str(context) == "bootstrap" else int(state.iteration)
+        path = point_allocation_path(
+            self.campaign_dir,
+            context=str(context),
+            iteration=int(iteration),
+        )
+        allocation = read_point_allocation(path)
+        summary = dict(allocation.get("summary") or {})
+        if bool(allocation.get("mandatory_anchor_failed", False)):
+            raise BackendSubmissionError(
+                "mandatory_bootstrap_anchor_failed: anchor slots cannot be replaced"
             )
-        n_rows = len(seed_dirs) if seed_dirs else int(self.config.active_batch.final_batch_size)
-        n_rows = max(0, int(n_rows))
-        train_fraction = float(self.config.ferebus.train_fraction)
-        internal_fraction = float(self.config.ferebus.internal_validation_fraction)
-        n_train = int(round(float(n_rows) * train_fraction))
-        if n_rows > 0:
-            n_train = max(1, min(n_rows, n_train))
-        if n_rows >= 2 and internal_fraction > 0.0 and n_train == n_rows:
-            n_train = n_rows - 1
-        train_indices = list(range(n_train))
-        val_indices = list(range(n_train, n_rows))
-        holdout_indices: List[int] = []
+        if bool(summary.get("complete", False)):
+            next_phase = "INITIAL_FEREBUS" if context == "bootstrap" else "APPEND"
+            self._journal_event(
+                "point_allocation_complete",
+                context=str(context),
+                iteration=int(iteration),
+                accepted=dict(summary.get("accepted") or {}),
+                accepted_total=int(summary.get("accepted_total", 0)),
+                replacement_round=int(getattr(state, "replacement_round", 0)),
+            )
+            return PhaseResult(
+                is_complete=True,
+                state_updates={"replacement_round": 0},
+                next_phase_override=next_phase,
+            )
+        pending = pending_attempts(allocation)
+        if pending:
+            rounds = {int(record.get("round", -1)) for record in pending}
+            if len(rounds) != 1 or min(rounds) <= 0:
+                raise BackendSubmissionError(
+                    "point_allocation_pending_state_invalid: " + repr(sorted(rounds))
+                )
+            replacement_round = next(iter(rounds))
+        else:
+            replacement_round = max(
+                [
+                    int(attempt.get("round", 0))
+                    for slot in allocation["slots"]
+                    for attempt in slot.get("attempts", [])
+                ]
+                + [0]
+            ) + 1
+        try:
+            replacement = prepare_replacement_round(
+                self.campaign_dir,
+                context=str(context),
+                iteration=int(iteration),
+                replacement_round=int(replacement_round),
+            )
+        except Exception as exc:
+            raise BackendSubmissionError(
+                "point_allocation_replacement_unavailable: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)
+            ) from exc
+        next_phase = (
+            "INITIAL_REPLACEMENT_GAUSSIAN"
+            if context == "bootstrap"
+            else "REPLACEMENT_GAUSSIAN"
+        )
+        self._journal_event(
+            "point_allocation_replacement_prepared",
+            context=str(context),
+            iteration=int(iteration),
+            replacement_round=int(replacement_round),
+            n_candidates=int(replacement.get("n_candidates", 0)),
+            reserve_available=int(summary.get("reserve_available", 0)),
+        )
+        return PhaseResult(
+            is_complete=True,
+            state_updates={"replacement_round": int(replacement_round)},
+            next_phase_override=next_phase,
+        )
 
-        train_set = set(int(i) for i in train_indices)
-        val_set = set(int(i) for i in val_indices)
-        holdout_set = set(int(i) for i in holdout_indices)
-        if train_set & val_set:
-            raise BackendSubmissionError("FEREBUS-derived split returned overlapping train/val indices")
-        if not holdout_set.issubset(val_set):
-            raise BackendSubmissionError("FEREBUS-derived split returned holdout indices outside validation")
-        if n_rows > 0 and not train_indices:
-            raise BackendSubmissionError("FEREBUS-derived split returned no training rows for non-empty candidates")
+    def _inline_initial_allocation_check(self, state) -> PhaseResult:
+        return self._allocation_check(state, context="bootstrap")
 
+    def _inline_allocation_check(self, state) -> PhaseResult:
+        return self._allocation_check(state, context="active")
+
+    def _inline_split(self, state) -> Dict[str, Any]:
+        """Persist a read-only view of the pre-QM exact slot allocation."""
+        from ..point_allocation import point_allocation_path, read_point_allocation
+
+        iter_dir = self._iter_dir(state.iteration)
+        split_path = iter_dir / "split.json"
+        allocation_path = point_allocation_path(
+            self.campaign_dir,
+            context="active",
+            iteration=int(state.iteration),
+        )
+        allocation = read_point_allocation(allocation_path)
+        slots = [
+            {
+                "slot_id": int(slot["slot_id"]),
+                "split": str(slot["split"]),
+                "candidate_id": str(slot["attempts"][0]["candidate_id"]),
+            }
+            for slot in allocation["slots"]
+        ]
         payload = {
-            "strategy": "ferebus_train_internal",
-            "train_fraction": train_fraction,
-            "internal_validation_fraction": internal_fraction,
-            "external_validation_size": 0,
-            "high_holdout_fraction": 0.0,
+            "schema_version": 2,
+            "strategy": "exact_pre_qm_point_allocation",
             "iteration": int(state.iteration),
-            "train_indices": train_indices,
-            "val_indices": val_indices,
-            "holdout_indices": holdout_indices,
+            "point_allocation_manifest": str(allocation_path.resolve()),
+            "targets": dict(allocation["targets"]),
+            "slots": slots,
         }
         atomic_write_json(split_path, payload)
         self.artefact_log.append(str(split_path))
@@ -573,7 +634,7 @@ class DryRunPhaseExecutor:
         existing version. Prevents orphan-iteration-directory bugs that
         the persist-before-journal swap would otherwise expose.
         """
-        import shutil as _shutil
+        from . import input_staging as _stg
 
         v = self._versioning("training")
         committed = v.list_committed_versions()
@@ -587,6 +648,20 @@ class DryRunPhaseExecutor:
                     + " committed_versions="
                     + repr(committed)
                 )
+            try:
+                _stg.verify_committed_allocation_snapshot(
+                    self.campaign_dir,
+                    training_version=int(committed_max),
+                    context="active",
+                    iteration=int(state.iteration),
+                )
+            except Exception as exc:
+                raise BackendSubmissionError(
+                    "idempotent APPEND allocation verification failed: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)
+                ) from exc
             #already committed in a previous run; idempotent no-op.
             self._journal_event(
                 "training_set_committed",
@@ -610,27 +685,32 @@ class DryRunPhaseExecutor:
         v.recover_dangling_staging()
         source = committed_max if committed_max >= 0 else None
         staging = v.stage(source_version=source, target_version=next_version)
-        marker = staging / ("DRYRUN_iter_" + str(state.iteration) + ".txt")
-        marker.write_text(
-            "DRYRUN training append at iteration " + str(state.iteration) + "\n"
-            + "next_version=" + str(next_version) + "\n",
-            encoding="utf-8",
+        accepted_pointdirs, allocation = _stg.accepted_allocation_pointdirs(
+            self.campaign_dir,
+            context="active",
+            iteration=int(state.iteration),
         )
-        pool_dir = self._iter_dir(state.iteration) / "pool"
         committed_pointdirs = []
-        if pool_dir.is_dir():
-            for seed_dir in sorted(d for d in pool_dir.iterdir() if d.is_dir()):
-                k = seed_dir.name.split("_")[-1]
-                pdir = staging / ("POINT_" + k + ".pointdir")
-                pdir.mkdir(exist_ok=True)
-                src_prov = seed_dir / PROVENANCE_FILENAME
-                if src_prov.is_file():
-                    _shutil.copyfile(src_prov, pdir / PROVENANCE_FILENAME)
-                (pdir / ("DRYRUN_POINT_iter_" + str(state.iteration) + ".txt")).write_text(
-                    "DRYRUN committed point for iteration " + str(state.iteration) + "\n",
-                    encoding="utf-8",
-                )
-                committed_pointdirs.append(pdir.name)
+        next_point_index = max(
+            [
+                int(path.name[6:10])
+                for path in staging.glob("POINT_????.pointdir")
+                if path.is_dir()
+            ]
+            + [-1]
+        ) + 1
+        for source_pointdir in accepted_pointdirs:
+            destination = staging / (
+                "POINT_" + str(next_point_index).zfill(4) + ".pointdir"
+            )
+            _stg._copytree_no_symlinks(source_pointdir, destination)
+            committed_pointdirs.append(destination.name)
+            next_point_index += 1
+        atomic_write_json(staging / "POINT_ALLOCATION.json", allocation)
+        atomic_write_json(
+            staging / ("POINT_ALLOCATION.version-" + str(next_version).zfill(4) + ".json"),
+            allocation,
+        )
         v.commit(next_version)
         v.update_current(next_version)
         ensure_index(self.campaign_dir)
@@ -649,7 +729,7 @@ class DryRunPhaseExecutor:
             iteration=int(state.iteration),
             training_set_version=int(next_version),
             n_committed_points=int(len(committed_pointdirs)),
-            expected_final_batch_size=int(self.config.active_batch.final_batch_size),
+            expected_batch_total=int(self.config.point_allocation.batch_total_size),
         )
         self.artefact_log.append(str(self._iter_dir(state.iteration) / "APPEND_marker"))
         return {"training_set_version": int(next_version)}
@@ -739,29 +819,162 @@ class DryRunPhaseExecutor:
             "PHASE_A_POLUS": self._post_phase_a_polus,
             "INITIAL_GAUSSIAN": self._post_initial_gaussian,
             "INITIAL_AIMALL": self._post_initial_aimall,
+            "INITIAL_REPLACEMENT_GAUSSIAN": self._post_initial_replacement_gaussian,
+            "INITIAL_REPLACEMENT_AIMALL": self._post_initial_replacement_aimall,
             "INITIAL_FEREBUS": self._post_initial_ferebus,
             "ARIADNE_ARRAY": self._post_ariadne_array,
             "PHASE_B_POLUS": self._post_phase_b_polus,
             "GAUSSIAN": self._post_gaussian,
             "AIMALL": self._post_aimall,
+            "REPLACEMENT_GAUSSIAN": self._post_replacement_gaussian,
+            "REPLACEMENT_AIMALL": self._post_replacement_aimall,
             "FEREBUS": self._post_ferebus,
         }
 
     # --- per-phase postprocess handlers --------------------------------
 
     def _post_phase_a_polus(self, state) -> Dict[str, Any]:
+        from ..bootstrap_anchor import plan_bootstrap_anchors
         from ..handoff_manifests import write_phase_a_sample_manifest
+        from ..point_allocation import (
+            allocation_targets,
+            create_point_allocation,
+            point_allocation_path,
+            stable_candidate_id,
+        )
 
         outdir = self.campaign_dir / self.diversity_dir_name / "initial"
         outdir.mkdir(parents=True, exist_ok=True)
-        n = int(self.config.bootstrap.initial_labelled_size)
+        n = int(self.config.point_allocation.bootstrap_total_size)
+        frames = []
+        trajectory_sha = ""
+        try:
+            from ..acquisition.trajectory_pool import TrajectoryPool
+
+            pool = TrajectoryPool.load(self.campaign_dir)
+            frames = pool.to_atoms_list()
+            trajectory_sha = str(pool.sha256)
+        except Exception:
+            from ichor.core.atoms import Atom, Atoms
+
+            frames = [Atoms([Atom("H", float(i) * 0.01, 0.0, 0.0)]) for i in range(n)]
+        anchor_plan, anchor_frames = plan_bootstrap_anchors(
+            self.campaign_dir,
+            self.config,
+            pool_frames=frames,
+        )
+        excluded_pool_ids = set(int(value) for value in anchor_plan.excluded_pool_frame_ids)
+        available_pool_ids = [
+            index for index in range(len(frames)) if index not in excluded_pool_ids
+        ]
+        pool_needed = int(anchor_plan.pool_total_needed)
+        if len(available_pool_ids) < pool_needed:
+            raise BackendSubmissionError(
+                "dry-run bootstrap pool has fewer frames than the point-allocation target"
+            )
+        selected_pool_indices = available_pool_ids[:pool_needed]
+        reserve_indices = available_pool_ids[pool_needed:]
+        selected_frames = list(anchor_frames) + [frames[index] for index in selected_pool_indices]
+        selected_indices = [None] * len(anchor_frames) + selected_pool_indices
         sample = outdir / ("initial-SAMPLE-" + str(n) + ".xyz")
-        sample.write_text(
-            "# DRYRUN POLUS Phase-A sample (n=" + str(n) + ")\n",
+        xyz_lines = []
+        for sample_index, frame in enumerate(selected_frames):
+            frame_id = selected_indices[sample_index]
+            label = "anchor" if frame_id is None else "pool frame " + str(frame_id)
+            xyz_lines.extend([str(len(frame)), "dry-run bootstrap " + label])
+            for atom in frame:
+                xyz_lines.append(
+                    str(atom.type)
+                    + " "
+                    + str(float(atom.x))
+                    + " "
+                    + str(float(atom.y))
+                    + " "
+                    + str(float(atom.z))
+                )
+        sample.write_text("\n".join(xyz_lines) + "\n", encoding="utf-8", newline="\n")
+        index = outdir / ("initial-INDEX-" + str(n) + ".dat")
+        index_lines = []
+        anchor_index = 0
+        for value in selected_indices:
+            if value is None:
+                index_lines.append("anchor:" + str(anchor_index))
+                anchor_index += 1
+            else:
+                index_lines.append(str(value))
+        index.write_text(
+            "\n".join(index_lines) + "\n",
             encoding="utf-8",
         )
-        index = outdir / ("initial-INDEX-" + str(n) + ".dat")
-        index.write_text("\n".join(str(i) for i in range(n)) + "\n", encoding="utf-8")
+        anchor_primary = [
+            {
+                "candidate_id": stable_candidate_id(
+                    campaign_uid=str(state.campaign_uid),
+                    context="bootstrap",
+                    iteration=0,
+                    source_identity={"source": "anchor", "anchor_index": int(index)},
+                ),
+                "source": "anchor",
+                "anchor_index": int(index),
+                "frame_id": None,
+            }
+            for index in range(len(anchor_frames))
+        ]
+        primary = anchor_primary + [
+            {
+                "candidate_id": stable_candidate_id(
+                    campaign_uid=str(state.campaign_uid),
+                    context="bootstrap",
+                    iteration=0,
+                    source_identity={"source": "dry_run_phase_a", "frame_id": int(i)},
+                ),
+                "source": "dry_run_phase_a",
+                "frame_id": int(i),
+            }
+            for i in selected_pool_indices
+        ]
+        reserve = [
+            {
+                "candidate_id": stable_candidate_id(
+                    campaign_uid=str(state.campaign_uid),
+                    context="bootstrap",
+                    iteration=0,
+                    source_identity={"source": "dry_run_phase_a_reserve", "frame_id": int(i)},
+                ),
+                "source": "dry_run_phase_a_reserve",
+                "frame_id": int(i),
+                "reserve_rank": int(rank),
+            }
+            for rank, i in enumerate(reserve_indices)
+        ]
+        allocation_path = point_allocation_path(
+            self.campaign_dir,
+            context="bootstrap",
+            iteration=0,
+        )
+        allocation = create_point_allocation(
+            allocation_path,
+            campaign_uid=str(state.campaign_uid),
+            context="bootstrap",
+            iteration=0,
+            targets=allocation_targets(self.config, "bootstrap"),
+            primary_candidates=primary,
+            reserve_candidates=reserve,
+            anchor_candidate_ids=[
+                str(record["candidate_id"]) for record in anchor_primary
+            ],
+        )
+        slot_by_candidate = {
+            str(slot["attempts"][0]["candidate_id"]): {
+                "slot_id": int(slot["slot_id"]),
+                "split": str(slot["split"]),
+            }
+            for slot in allocation["slots"]
+        }
+        primary_records = [
+            {**record, **slot_by_candidate[str(record["candidate_id"])]}
+            for record in primary
+        ]
         manifest = write_phase_a_sample_manifest(outdir, {
             "phase": "PHASE_A_POLUS",
             "iteration": -1,
@@ -769,12 +982,21 @@ class DryRunPhaseExecutor:
             "index_path": str(index.resolve()),
             "n_select": int(n),
             "n_frames": int(n),
-            "selected_indices": [int(i) for i in range(n)],
+            "selected_indices": [
+                None if value is None else int(value) for value in selected_indices
+            ],
             "descriptor": "rmsd_massweight",
-            "n_pool_frames": int(n),
-            "bootstrap_initial_labelled_size": int(n),
-            "reserve_after_bootstrap": 0,
-            "trajectory_sha256": "",
+            "n_pool_frames": int(len(frames)),
+            "bootstrap_total_size": int(n),
+            "point_allocation": {
+                "manifest": str(allocation_path.resolve()),
+                "targets": dict(allocation["targets"]),
+                "primary": primary_records,
+                "reserve_frame_ids": reserve_indices,
+                "reserve_count": int(len(reserve)),
+            },
+            "reserve_after_bootstrap": int(len(reserve)),
+            "trajectory_sha256": trajectory_sha,
             "source_pool_manifest": "",
         })
         self.artefact_log.extend([str(sample), str(index), str(manifest)])
@@ -785,6 +1007,20 @@ class DryRunPhaseExecutor:
 
     def _post_initial_aimall(self, state) -> Dict[str, Any]:
         return self._stub_quantum_outputs(state, stage="AIMALL", initial=True)
+
+    def _post_initial_replacement_gaussian(self, state) -> Dict[str, Any]:
+        return self._stub_quantum_outputs(
+            state, stage="GAUSSIAN", initial=True, replacement=True,
+        )
+
+    def _post_initial_replacement_aimall(self, state) -> PhaseResult:
+        self._stub_quantum_outputs(
+            state, stage="AIMALL", initial=True, replacement=True,
+        )
+        return PhaseResult(
+            is_complete=True,
+            next_phase_override="INITIAL_ALLOCATION_CHECK",
+        )
 
     def _post_initial_ferebus(self, state) -> Dict[str, Any]:
         """Commit the initial training iteration and write a stub model file.
@@ -798,16 +1034,10 @@ class DryRunPhaseExecutor:
         v_train.recover_dangling_staging()
         v_models.recover_dangling_staging()
 
-        #commit training iteration 0 if it does not exist yet.
-        if 0 not in v_train.list_committed_versions():
-            staging = v_train.stage(source_version=None, target_version=0)
-            (staging / "initial_marker.txt").write_text(
-                "DRYRUN initial training iteration\n", encoding="utf-8",
-            )
-            v_train.commit(0)
-            v_train.update_current(0)
-        else:
-            v_train.ensure_current(0)
+        from .input_staging import commit_initial_training_set
+
+        commit_initial_training_set(self.campaign_dir)
+        v_train.ensure_current(0)
 
         #commit models iteration 0.
         if 0 not in v_models.list_committed_versions():
@@ -1163,40 +1393,95 @@ class DryRunPhaseExecutor:
                             "variance_at_selection": None,
                             "alpha_final": None,
                         })
+        from ..point_allocation import (
+            allocation_targets,
+            create_point_allocation,
+            point_allocation_path,
+            stable_candidate_id,
+        )
+
         final_records = []
-        final_batch_size = int(self.config.active_batch.final_batch_size)
+        batch_total = int(self.config.point_allocation.batch_total_size)
         n_accepted_candidates = len(accepted)
-        if n_accepted_candidates < final_batch_size:
+        if n_accepted_candidates < batch_total:
             raise BackendSubmissionError(
-                "active_batch_underfilled: wanted final_batch_size="
-                + str(final_batch_size)
+                "point_allocation_underfilled: wanted batch_total_size="
+                + str(batch_total)
                 + " but only "
                 + str(n_accepted_candidates)
                 + " safe ARIADNE candidates are available"
             )
-        accepted = accepted[:final_batch_size]
-        if pool_dir.is_dir():
-            for seed_dir in sorted(pool_dir.iterdir()):
-                if not seed_dir.is_dir():
-                    continue
-                if not (seed_dir / PROVENANCE_FILENAME).is_file():
-                    continue
-                try:
-                    rank = int(seed_dir.name.split("_")[-1])
-                except (ValueError, IndexError):
-                    rank = None
-                enrich_with_phase_b(
-                    seed_dir,
-                    selected_after_fps=True,
-                    diversity_rank=rank,
-                    descriptor_used="hybrid_alf_rmsd",
+        primary_source = accepted[:batch_total]
+        reserve_source = accepted[batch_total:]
+
+        def allocation_record(rec, *, reserve_rank=None):
+            candidate_id = stable_candidate_id(
+                campaign_uid=str(state.campaign_uid),
+                context="active",
+                iteration=int(state.iteration),
+                source_identity={
+                    "seed_index": int(rec.get("seed_index", 0)),
+                    "seed_frame_id": rec.get("seed_frame_id"),
+                    "result_json": str(rec.get("result_json") or ""),
+                },
+            )
+            out_rec = dict(rec)
+            out_rec["candidate_id"] = candidate_id
+            if reserve_rank is not None:
+                out_rec["reserve_rank"] = int(reserve_rank)
+            provenance_path = Path(str(out_rec.get("provenance_json") or ""))
+            if not provenance_path.is_file():
+                raise BackendSubmissionError(
+                    "dry-run Phase B candidate provenance is missing: "
+                    + str(provenance_path)
                 )
-        for final_index, rec in enumerate(accepted):
+            enrich_with_phase_b(
+                provenance_path.parent,
+                selected_after_fps=reserve_rank is None,
+                diversity_rank=(
+                    int(rec.get("seed_index", 0))
+                    if reserve_rank is None
+                    else int(reserve_rank)
+                ),
+                descriptor_used="hybrid_alf_rmsd",
+                candidate_id=candidate_id,
+                reserve_candidate=reserve_rank is not None,
+            )
+            return out_rec
+
+        primary_records = [allocation_record(rec) for rec in primary_source]
+        reserve_records = [
+            allocation_record(rec, reserve_rank=rank)
+            for rank, rec in enumerate(reserve_source)
+        ]
+        allocation_path = point_allocation_path(
+            self.campaign_dir,
+            context="active",
+            iteration=int(state.iteration),
+        )
+        allocation = create_point_allocation(
+            allocation_path,
+            campaign_uid=str(state.campaign_uid),
+            context="active",
+            iteration=int(state.iteration),
+            targets=allocation_targets(self.config, "active"),
+            primary_candidates=primary_records,
+            reserve_candidates=reserve_records,
+        )
+        slots_by_candidate = {
+            str(slot["attempts"][0]["candidate_id"]): {
+                "slot_id": int(slot["slot_id"]),
+                "split": str(slot["split"]),
+            }
+            for slot in allocation["slots"]
+        }
+        for final_index, rec in enumerate(primary_records):
             out_rec = dict(rec)
             out_rec["raw_index"] = int(final_index)
             out_rec["final_index"] = int(final_index)
             out_rec["kept_after_dedup"] = True
             out_rec["drop_reason"] = None
+            out_rec.update(slots_by_candidate[str(out_rec["candidate_id"])])
             final_records.append(out_rec)
         resolved_protocol = resolve_sampling_protocol(
             self.campaign_dir,
@@ -1257,7 +1542,12 @@ class DryRunPhaseExecutor:
             "iteration": int(state.iteration),
             "descriptor": str(self.config.phase_b.descriptor),
             "source_ariadne_manifest": ariadne_manifest_path,
-            "expected_final_batch_size": int(final_batch_size),
+            "point_allocation": {
+                "manifest": str(allocation_path.resolve()),
+                "targets": dict(allocation["targets"]),
+                "reserve": reserve_records,
+                "reserve_count": int(len(reserve_records)),
+            },
             "n_candidates": int(n_accepted_candidates),
             "n_selected_raw": int(len(final_records)),
             "n_kept": int(len(final_records)),
@@ -1273,6 +1563,20 @@ class DryRunPhaseExecutor:
 
     def _post_aimall(self, state) -> Dict[str, Any]:
         return self._stub_quantum_outputs(state, stage="AIMALL", initial=False)
+
+    def _post_replacement_gaussian(self, state) -> Dict[str, Any]:
+        return self._stub_quantum_outputs(
+            state, stage="GAUSSIAN", initial=False, replacement=True,
+        )
+
+    def _post_replacement_aimall(self, state) -> PhaseResult:
+        self._stub_quantum_outputs(
+            state, stage="AIMALL", initial=False, replacement=True,
+        )
+        return PhaseResult(
+            is_complete=True,
+            next_phase_override="ALLOCATION_CHECK",
+        )
 
     def _post_ferebus(self, state) -> Dict[str, Any]:
         """Commit the next models iteration. Training set itself has already
@@ -1468,30 +1772,118 @@ class DryRunPhaseExecutor:
         )
         return True
 
-    def _stub_quantum_outputs(self, state, *, stage: str, initial: bool) -> Dict[str, Any]:
+    def _stub_quantum_outputs(
+        self,
+        state,
+        *,
+        stage: str,
+        initial: bool,
+        replacement: bool = False,
+    ) -> Dict[str, Any]:
         """Create stub PointDirectories so APPEND has content to stage. We
         write into a transient staging area under .DATA/STAGING/quantum/ that
         the APPEND step copies into the next training iteration.
         """
-        staging_root = (
-            self.campaign_dir / ".DATA" / "STAGING"
-            / ("initial" if initial else ("iter_" + str(state.iteration)))
+        from . import input_staging as _stg
+        from ..point_allocation import (
+            pending_attempts,
+            point_allocation_path,
+            read_point_allocation,
         )
+        from ..versioning.provenance import enrich_with_point_allocation
+
+        context = "bootstrap" if initial else "active"
+        allocation_iteration = 0 if initial else int(state.iteration)
+        allocation_path = point_allocation_path(
+            self.campaign_dir,
+            context=context,
+            iteration=allocation_iteration,
+        )
+        allocation = read_point_allocation(allocation_path)
+        pending = pending_attempts(allocation)
+        expected_round = int(getattr(state, "replacement_round", 0)) if replacement else 0
+        attempts = [
+            attempt for attempt in pending
+            if int(attempt.get("round", -1)) == expected_round
+        ]
+        if len(attempts) != len(pending):
+            raise BackendSubmissionError(
+                "dry-run quantum phase does not match pending allocation round"
+            )
+        if replacement:
+            from ..replacement_sampling import replacement_round_dir
+
+            staging_root = replacement_round_dir(
+                self.campaign_dir,
+                context=context,
+                iteration=allocation_iteration,
+                replacement_round=expected_round,
+            )
+        else:
+            staging_root = (
+                self.campaign_dir / ".DATA" / "STAGING"
+                / ("initial" if initial else ("iter_" + str(state.iteration)))
+            )
         staging_root.mkdir(parents=True, exist_ok=True)
-        n_points = (
-            int(self.config.bootstrap.initial_labelled_size)
-            if bool(initial)
-            else int(self.config.active_batch.final_batch_size)
-        )
-        for i in range(n_points):
-            point_dir = staging_root / ("POINT_" + str(i).zfill(4) + ".pointdir")
+        n_points = len(attempts)
+        pointdirs = []
+        for i, attempt in enumerate(attempts):
+            point_index = (
+                int(allocation["targets"]["total"])
+                + int(attempt.get("reserve_rank", i))
+                if replacement
+                else i
+            )
+            point_dir = staging_root / ("POINT_" + str(point_index).zfill(4) + ".pointdir")
             point_dir.mkdir(exist_ok=True)
+            provenance_source = Path(str(attempt.get("provenance_json") or ""))
+            provenance_dest = point_dir / PROVENANCE_FILENAME
+            if not provenance_dest.is_file() and provenance_source.is_file():
+                import shutil
+
+                shutil.copy2(provenance_source, provenance_dest)
+            if not provenance_dest.is_file():
+                write_seed_provenance(
+                    point_dir,
+                    campaign_uid=str(state.campaign_uid),
+                    iteration=int(state.iteration),
+                    trajectory_sha256=self._trajectory_sha256_if_available(),
+                    seed_frame_id=attempt.get("frame_id"),
+                    seed_selection_origin=str(attempt.get("source", "dry_run_quantum")),
+                    seed_variance_at_selection=None,
+                    subspace_neighbour_frame_ids=[],
+                    subspace_dimension=0,
+                    subspace_eigenvalues=[],
+                    mode_weighting_policy="dry_run",
+                )
+            enrich_with_point_allocation(
+                point_dir,
+                candidate_id=str(attempt["candidate_id"]),
+                context=context,
+                slot_id=int(attempt["slot_id"]),
+                split=str(attempt["split"]),
+                replacement_round=int(attempt.get("round", 0)),
+            )
             artefact_name = "stub_" + stage + ".txt"
             (point_dir / artefact_name).write_text(
                 "DRYRUN " + stage + " output for point " + str(i) + "\n",
                 encoding="utf-8",
             )
             self.artefact_log.append(str(point_dir / artefact_name))
+            pointdirs.append(point_dir)
+        _stg.write_points_file(staging_root, pointdirs)
+        phase_name = (
+            ("INITIAL_REPLACEMENT_" if initial else "REPLACEMENT_") + stage
+            if replacement
+            else (("INITIAL_" if initial else "") + stage)
+        )
+        _stg.write_quantum_acceptance_manifest(
+            staging_root,
+            phase_name=phase_name,
+            iteration=int(state.iteration),
+            accepted=pointdirs,
+            rejected=[],
+        )
         if stage == "AIMALL":
             from .quantum_quality import write_quantum_quality_manifest
 
@@ -1519,12 +1911,29 @@ class DryRunPhaseExecutor:
             ]
             manifest = write_quantum_quality_manifest(
                 staging_root,
-                phase_name="INITIAL_AIMALL" if initial else "AIMALL",
+                phase_name=phase_name,
                 iteration=int(state.iteration),
                 records=records,
                 gates=getattr(self.config, "quality_gates", None),
             )
             self.artefact_log.append(str(manifest))
+            gaussian_phase = (
+                "INITIAL_REPLACEMENT_GAUSSIAN"
+                if initial and replacement
+                else "REPLACEMENT_GAUSSIAN"
+                if replacement
+                else "INITIAL_GAUSSIAN"
+                if initial
+                else "GAUSSIAN"
+            )
+            _stg.record_allocation_quantum_results(
+                self.campaign_dir,
+                context=context,
+                iteration=allocation_iteration,
+                staging_dir=staging_root,
+                gaussian_phase=gaussian_phase,
+                aimall_phase=phase_name,
+            )
             if not initial and bool(getattr(self.config.error_calibration, "enabled", True)):
                 from .error_calibration import (
                     append_records,

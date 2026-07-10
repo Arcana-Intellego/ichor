@@ -1,9 +1,10 @@
-"""Persistent pointdir-level FEREBUS split ledger tests."""
+"""Persistent exact pointdir-level FEREBUS split ledger tests."""
 import json
 
 import pytest
 
 from ichor.hpc.active_learning.daemon.ferebus_split_ledger import (
+    FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION,
     bootstrap_external_validation_path,
     ensure_split_assignments,
     ledger_path,
@@ -14,169 +15,140 @@ def _names(n):
     return ["POINT_" + str(i).zfill(4) + ".pointdir" for i in range(n)]
 
 
-def test_initial_split_ledger_assigns_exact_planned_counts(tmp_path):
-    names = _names(10)
-    result = ensure_split_assignments(
+def _forced(names, counts):
+    out = {}
+    offset = 0
+    for split in ("train", "int_val", "ext_val"):
+        for name in names[offset : offset + int(counts[split])]:
+            out[name] = split
+        offset += int(counts[split])
+    return out
+
+
+def _ensure(tmp_path, names, *, version, counts, identities=None, digest="allocation"):
+    return ensure_split_assignments(
         tmp_path,
         names,
-        training_version=0,
-        train_internal_fractions=(0.75, 0.25),
-        external_validation_size=2,
+        training_version=int(version),
+        expected_new_counts=counts,
+        forced_splits=_forced(
+            names if version == 0 else names[-sum(counts.values()) :],
+            counts,
+        ),
+        pointdir_identity=identities,
+        allocation_manifest_sha256=digest,
     )
 
-    assert result["counts"] == {
-        "train": 6,
-        "int_val": 2,
-        "ext_val": 2,
-    }
-    assert result["row_ids"]["train"] == [0, 1, 2, 3, 4, 5]
+
+def test_initial_split_ledger_uses_exact_allocation_counts(tmp_path):
+    names = _names(10)
+    counts = {"train": 6, "int_val": 2, "ext_val": 2}
+    result = _ensure(tmp_path, names, version=0, counts=counts)
+
+    assert result["counts"] == counts
+    assert result["row_ids"]["train"] == list(range(6))
     assert result["row_ids"]["int_val"] == [6, 7]
     assert result["row_ids"]["ext_val"] == [8, 9]
     bootstrap = json.loads(
         bootstrap_external_validation_path(tmp_path).read_text(encoding="utf-8")
     )
-    assert bootstrap["external_validation_size"] == 2
+    assert bootstrap["bootstrap_external_validation_size"] == 2
     assert bootstrap["pointdirs"] == names[8:10]
 
 
-def test_initial_split_ledger_uses_absolute_external_size_then_train_internal_fraction(tmp_path):
-    names = _names(70)
-    result = ensure_split_assignments(
-        tmp_path,
-        names,
-        training_version=0,
-        train_internal_fractions=(0.8, 0.2),
-        external_validation_size=20,
-    )
-
-    assert result["counts"] == {
-        "train": 40,
-        "int_val": 10,
-        "ext_val": 20,
-    }
-    assert result["row_ids"]["train"] == list(range(40))
-    assert result["row_ids"]["int_val"] == list(range(40, 50))
-    assert result["row_ids"]["ext_val"] == list(range(50, 70))
-
-
-def test_initial_split_ledger_forces_anchor_rows_into_training(tmp_path):
-    names = _names(10)
-    result = ensure_split_assignments(
-        tmp_path,
-        names,
-        training_version=0,
-        train_internal_fractions=(0.75, 0.25),
-        external_validation_size=2,
-        forced_splits={
-            names[8]: "train",
-            names[9]: "train",
-        },
-    )
-
-    assert result["counts"] == {
-        "train": 6,
-        "int_val": 2,
-        "ext_val": 2,
-    }
-    assert result["row_ids"]["train"] == [0, 1, 2, 3, 8, 9]
-    assert result["row_ids"]["int_val"] == [4, 5]
-    assert result["row_ids"]["ext_val"] == [6, 7]
-    assert result["assignments"][names[8]]["forced_split"] == "train"
-    assert result["assignments"][names[8]]["forced_split_reason"] == "bootstrap_anchor"
-
-
-def test_initial_split_ledger_rejects_forced_rows_over_split_capacity(tmp_path):
-    names = _names(4)
-
-    with pytest.raises(ValueError, match="forced FEREBUS train rows exceed"):
-        ensure_split_assignments(
-            tmp_path,
-            names,
-            training_version=0,
-            train_internal_fractions=(0.5, 0.5),
-            external_validation_size=1,
-            forced_splits={name: "train" for name in names},
-        )
-
-
-def test_existing_split_ledger_assignments_never_change(tmp_path):
+def test_existing_assignments_never_change_and_new_version_is_exact(tmp_path):
     first_names = _names(10)
-    first = ensure_split_assignments(
-        tmp_path,
-        first_names,
-        training_version=0,
-        train_internal_fractions=(0.75, 0.25),
-        external_validation_size=2,
-    )
+    first_counts = {"train": 6, "int_val": 2, "ext_val": 2}
+    first = _ensure(tmp_path, first_names, version=0, counts=first_counts)
     first_assignments = dict(first["assignments"])
 
-    grown_names = _names(20)
-    second = ensure_split_assignments(
+    grown_names = _names(14)
+    second_counts = {"train": 3, "int_val": 1, "ext_val": 0}
+    second = _ensure(
         tmp_path,
         grown_names,
-        training_version=1,
-        train_internal_fractions=(0.75, 0.25),
-        external_validation_size=2,
+        version=1,
+        counts=second_counts,
+        digest="allocation-v1",
     )
 
     for name, record in first_assignments.items():
         assert second["assignments"][name]["split"] == record["split"]
-    assert second["counts"] == {"train": 14, "int_val": 4, "ext_val": 2}
-    assert second["row_ids"]["train"][:6] == [0, 1, 2, 3, 4, 5]
+    assert second["counts"] == {"train": 9, "int_val": 3, "ext_val": 2}
+    assert second["version_allocation"]["actual_new_counts"] == second_counts
     payload = json.loads(ledger_path(tmp_path).read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 3
-    assert len(payload["assignments"]) == 20
+    assert payload["schema_version"] == FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION
+    assert len(payload["assignments"]) == 14
+
+
+def test_retry_is_idempotent(tmp_path):
+    names = _names(4)
+    counts = {"train": 3, "int_val": 1, "ext_val": 0}
+    first = _ensure(tmp_path, names, version=0, counts=counts)
+    second = _ensure(tmp_path, names, version=0, counts=counts)
+
+    assert second["assignments"] == first["assignments"]
+    assert second["version_allocation"] == first["version_allocation"]
+
+
+def test_active_version_cannot_add_external_validation_rows(tmp_path):
+    first = _names(3)
+    _ensure(
+        tmp_path,
+        first,
+        version=0,
+        counts={"train": 1, "int_val": 1, "ext_val": 1},
+    )
+    with pytest.raises(ValueError, match="cannot add external-validation"):
+        _ensure(
+            tmp_path,
+            _names(6),
+            version=1,
+            counts={"train": 2, "int_val": 0, "ext_val": 1},
+            digest="allocation-v1",
+        )
 
 
 def test_split_ledger_rejects_duplicate_pointdir_names(tmp_path):
+    names = ["POINT_0000.pointdir", "POINT_0000.pointdir"]
     with pytest.raises(ValueError, match="duplicate"):
         ensure_split_assignments(
             tmp_path,
-            ["POINT_0000.pointdir", "POINT_0000.pointdir"],
+            names,
             training_version=0,
-            train_internal_fractions=(0.75, 0.25),
-            external_validation_size=2,
+            expected_new_counts={"train": 1, "int_val": 1, "ext_val": 0},
+            forced_splits={"POINT_0000.pointdir": "train"},
         )
 
 
 def test_split_ledger_rejects_pointdir_identity_mismatch(tmp_path):
-    names = _names(3)
-    ensure_split_assignments(
+    names = _names(2)
+    counts = {"train": 1, "int_val": 1, "ext_val": 0}
+    _ensure(
         tmp_path,
         names,
-        training_version=0,
-        train_internal_fractions=(0.75, 0.25),
-        external_validation_size=1,
-        pointdir_identity={names[0]: "sha-a"},
+        version=0,
+        counts=counts,
+        identities={names[0]: "sha-a"},
     )
 
     with pytest.raises(ValueError, match="identity mismatch"):
-        ensure_split_assignments(
+        _ensure(
             tmp_path,
             names,
-            training_version=1,
-            train_internal_fractions=(0.75, 0.25),
-            external_validation_size=1,
-            pointdir_identity={names[0]: "sha-b"},
+            version=0,
+            counts=counts,
+            identities={names[0]: "sha-b"},
         )
 
 
-def test_split_ledger_backfills_missing_pointdir_identity(tmp_path):
+def test_split_ledger_requires_authoritative_split_for_every_new_point(tmp_path):
     names = _names(2)
-    ensure_split_assignments(
-        tmp_path,
-        names,
-        training_version=0,
-        train_internal_fractions=(0.5, 0.5),
-        external_validation_size=0,
-    )
-    result = ensure_split_assignments(
-        tmp_path,
-        names,
-        training_version=1,
-        train_internal_fractions=(0.5, 0.5),
-        external_validation_size=0,
-        pointdir_identity={names[1]: "sha-later"},
-    )
-
-    assert result["assignments"][names[1]]["provenance_sha256"] == "sha-later"
+    with pytest.raises(ValueError, match="missing authoritative"):
+        ensure_split_assignments(
+            tmp_path,
+            names,
+            training_version=0,
+            expected_new_counts={"train": 1, "int_val": 1, "ext_val": 0},
+            forced_splits={names[0]: "train"},
+        )

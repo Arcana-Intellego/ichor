@@ -109,6 +109,7 @@ __all__ = [
     "write_seed_provenance",
     "enrich_with_ariadne",
     "enrich_with_phase_b",
+    "enrich_with_point_allocation",
     "enrich_with_anti_overlap",
     "enrich_with_error_calibration_input",
     "read_provenance",
@@ -126,7 +127,7 @@ __all__ = [
 
 
 PROVENANCE_FILENAME = ".provenance.json"
-PROVENANCE_SCHEMA_VERSION = 1
+PROVENANCE_SCHEMA_VERSION = 2
 
 # Index lives under <campaign>/.DATA/ACTIVE_LEARNING/
 SEED_FRAME_ID_INDEX_FILENAME = "seed_frame_id_index.json"
@@ -190,6 +191,7 @@ def write_seed_provenance(
         "anti_overlap": None,
         "error_calibration_input": None,
         "phase_b": None,
+        "point_allocation": None,
     }
     p = _provenance_path(pointdir)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -234,6 +236,10 @@ def validate_provenance(
     trajectory_sha256: Optional[str] = None,
     seed_frame_id: Optional[int] = None,
     require_phase_b_selected: Optional[bool] = None,
+    allocation_split: Optional[str] = None,
+    allocation_slot_id: Optional[int] = None,
+    allocation_candidate_id: Optional[str] = None,
+    allocation_context: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Read provenance and validate the campaign/seed handoff contract."""
     data = read_provenance(pointdir)
@@ -288,6 +294,45 @@ def validate_provenance(
         selected = bool(phase_b.get("selected_after_fps", False))
         if selected != bool(require_phase_b_selected):
             raise ProvenanceError("provenance phase_b.selected_after_fps mismatch")
+    allocation = data.get("point_allocation")
+    if (
+        allocation_split is not None
+        or allocation_slot_id is not None
+        or allocation_candidate_id is not None
+        or allocation_context is not None
+    ):
+        if not isinstance(allocation, dict):
+            raise ProvenanceError("provenance point_allocation block must be an object")
+        split = str(allocation.get("split") or "")
+        if split not in {"train", "int_val", "ext_val"}:
+            raise ProvenanceError("provenance point_allocation.split is invalid")
+        if allocation_split is not None and split != str(allocation_split):
+            raise ProvenanceError("provenance point_allocation.split mismatch")
+        slot_id = _expect_int_or_none(
+            allocation.get("slot_id"),
+            "provenance point_allocation.slot_id",
+        )
+        if slot_id is None or slot_id < 0:
+            raise ProvenanceError("provenance point_allocation.slot_id must be >= 0")
+        if allocation_slot_id is not None and slot_id != int(allocation_slot_id):
+            raise ProvenanceError("provenance point_allocation.slot_id mismatch")
+        candidate_id = allocation.get("candidate_id")
+        if not isinstance(candidate_id, str) or not candidate_id:
+            raise ProvenanceError(
+                "provenance point_allocation.candidate_id is invalid"
+            )
+        if (
+            allocation_candidate_id is not None
+            and candidate_id != str(allocation_candidate_id)
+        ):
+            raise ProvenanceError(
+                "provenance point_allocation.candidate_id mismatch"
+            )
+        context = allocation.get("context")
+        if context not in {"bootstrap", "active"}:
+            raise ProvenanceError("provenance point_allocation.context is invalid")
+        if allocation_context is not None and context != str(allocation_context):
+            raise ProvenanceError("provenance point_allocation.context mismatch")
     return data
 
 
@@ -375,14 +420,45 @@ def enrich_with_phase_b(
     selected_after_fps: bool,
     diversity_rank: Optional[int],
     descriptor_used: str,
+    candidate_id: Optional[str] = None,
+    reserve_candidate: bool = False,
 ) -> Path:
     """Append the Phase-B (post-FPS) record."""
     payload: Dict[str, Any] = {
         "selected_after_fps": bool(selected_after_fps),
         "diversity_rank": (None if diversity_rank is None else int(diversity_rank)),
         "descriptor_used": str(descriptor_used),
+        "reserve_candidate": bool(reserve_candidate),
     }
+    if candidate_id is not None:
+        payload["candidate_id"] = str(candidate_id)
     return _merge_section(pointdir, "phase_b", payload)
+
+
+def enrich_with_point_allocation(
+    pointdir: Union[str, Path],
+    *,
+    candidate_id: str,
+    context: str,
+    slot_id: int,
+    split: str,
+    replacement_round: int = 0,
+    allocation_manifest_sha256: Optional[str] = None,
+) -> Path:
+    """Attach the pre-QM allocation slot consumed by this candidate."""
+    split_name = str(split)
+    if split_name not in {"train", "int_val", "ext_val"}:
+        raise ValueError("point-allocation split is invalid: " + repr(split))
+    payload: Dict[str, Any] = {
+        "candidate_id": str(candidate_id),
+        "context": str(context),
+        "slot_id": int(slot_id),
+        "split": split_name,
+        "replacement_round": int(replacement_round),
+    }
+    if allocation_manifest_sha256 is not None:
+        payload["allocation_manifest_sha256"] = str(allocation_manifest_sha256)
+    return _merge_section(pointdir, "point_allocation", payload)
 
 
 # ---------------------------------------------------------------------------

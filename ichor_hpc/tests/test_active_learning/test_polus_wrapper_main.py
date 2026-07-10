@@ -34,13 +34,29 @@ def _write_anchor_from_fixture(campaign, n_frames=1):
     for idx in range(int(n_frames)):
         frame = base.copy()
         if idx:
-            frame[1].x += 0.1 * idx
+            frame[1].coordinates = [
+                frame[1].x + 0.1 * idx,
+                frame[1].y,
+                frame[1].z,
+            ]
         frames.append(frame)
     _write_xyz_file(frames, campaign / "anchor.xyz")
     return frames
 
 
 def _run(args):
+    if "--campaign-dir" in args:
+        from ichor.hpc.active_learning.daemon.state import (
+            DEFAULT_STATE_FILENAME,
+            fresh_campaign_state,
+            write_state,
+        )
+
+        campaign = Path(args[args.index("--campaign-dir") + 1])
+        state_path = campaign / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
+        if not state_path.is_file():
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            write_state(state_path, fresh_campaign_state())
     return subprocess.run(
         [sys.executable, "-m", MODULE] + args,
         capture_output=True, text=True, timeout=120,
@@ -53,7 +69,9 @@ def test_phase_a_writes_sample_and_index(tmp_path):
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
-    cfg.bootstrap.initial_labelled_size = 7
+    cfg.point_allocation.bootstrap_training_size = 4
+    cfg.point_allocation.bootstrap_internal_validation_size = 1
+    cfg.point_allocation.bootstrap_external_validation_size = 2
     cfg.max_iterations = 1
     cfg.seed_selection.n_seeds_per_iteration = 4
     cfg.to_yaml(campaign / "campaign.yaml")
@@ -71,7 +89,7 @@ def test_phase_a_writes_sample_and_index(tmp_path):
     indices = list(outdir.glob("initial-INDEX-*.dat"))
     assert len(samples) == 1
     assert len(indices) == 1
-    # n_select = bootstrap.initial_labelled_size = 7.
+    # n_select is the sum of the exact bootstrap slot counts (7).
     idx_lines = indices[0].read_text(encoding="utf-8").strip().splitlines()
     assert len(idx_lines) == 7
     for ln in idx_lines:
@@ -91,9 +109,10 @@ def test_phase_a_prepends_anchor_geometries_and_fills_remainder_from_pool(tmp_pa
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
-    cfg.bootstrap.initial_labelled_size = 7
-    cfg.bootstrap.external_validation_size = 2
-    cfg.bootstrap.anchor = True
+    cfg.point_allocation.bootstrap_training_size = 4
+    cfg.point_allocation.bootstrap_internal_validation_size = 1
+    cfg.point_allocation.bootstrap_external_validation_size = 2
+    cfg.point_allocation.anchor = True
     cfg.max_iterations = 1
     cfg.seed_selection.n_seeds_per_iteration = 4
     cfg.to_yaml(campaign / "campaign.yaml")
@@ -136,9 +155,10 @@ def test_phase_a_rejects_more_anchors_than_planned_training_split(tmp_path):
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
-    cfg.bootstrap.initial_labelled_size = 7
-    cfg.bootstrap.external_validation_size = 2
-    cfg.bootstrap.anchor = True
+    cfg.point_allocation.bootstrap_training_size = 4
+    cfg.point_allocation.bootstrap_internal_validation_size = 1
+    cfg.point_allocation.bootstrap_external_validation_size = 2
+    cfg.point_allocation.anchor = True
     cfg.max_iterations = 1
     cfg.seed_selection.n_seeds_per_iteration = 4
     cfg.to_yaml(campaign / "campaign.yaml")
@@ -160,7 +180,9 @@ def test_phase_a_fails_when_bootstrap_exceeds_pool_size(tmp_path):
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
-    cfg.bootstrap.initial_labelled_size = 100
+    cfg.point_allocation.bootstrap_training_size = 96
+    cfg.point_allocation.bootstrap_internal_validation_size = 2
+    cfg.point_allocation.bootstrap_external_validation_size = 2
     cfg.max_iterations = 1
     cfg.seed_selection.n_seeds_per_iteration = 4
     cfg.to_yaml(campaign / "campaign.yaml")
@@ -171,7 +193,7 @@ def test_phase_a_fails_when_bootstrap_exceeds_pool_size(tmp_path):
         "--campaign-dir", str(campaign),
     ])
     assert result.returncode == 3
-    assert "pool_feasibility_failed" in result.stderr
+    assert "bootstrap requires 100 pool geometries" in result.stderr
     outdir = campaign / "3_DIVERSITY_SAMPLING" / "initial"
     assert not list(outdir.glob("initial-SAMPLE-*.xyz"))
 
@@ -281,7 +303,8 @@ def test_phase_b_writes_sample_and_dedup(tmp_path):
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
-    cfg.active_batch.final_batch_size = 2
+    cfg.point_allocation.batch_training_size = 1
+    cfg.point_allocation.batch_internal_validation_size = 1
     # synthetic geometries lack ALF assignment so default hybrid_alf_rmsd
     # would crash on the feature extractor. mass-weighted RMSD is the
     # safe choice for unit tests.
@@ -335,7 +358,8 @@ def test_phase_b_rejects_unsafe_accepted_landing_before_fps(tmp_path):
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
-    cfg.active_batch.final_batch_size = 3
+    cfg.point_allocation.batch_training_size = 2
+    cfg.point_allocation.batch_internal_validation_size = 1
     cfg.phase_b.descriptor = "rmsd_massweight"
     cfg.to_yaml(campaign / "campaign.yaml")
 
@@ -428,7 +452,8 @@ def test_phase_b_accepts_all_missing_landing_safety_with_legacy_override(tmp_pat
     campaign.mkdir()
     cfg = CampaignConfig()
     cfg.phase_b.descriptor = "rmsd_massweight"
-    cfg.active_batch.final_batch_size = 2
+    cfg.point_allocation.batch_training_size = 1
+    cfg.point_allocation.batch_internal_validation_size = 1
     cfg.adversarial_safety.accept_legacy_missing_landing_safety = True
     cfg.to_yaml(campaign / "campaign.yaml")
 
@@ -524,7 +549,8 @@ def test_phase_b_ignores_hidden_descriptor_override_single_candidate(tmp_path):
     campaign.mkdir()
     cfg = CampaignConfig()
     cfg.phase_b.descriptor = "acquisition_weighted"
-    cfg.active_batch.final_batch_size = 1
+    cfg.point_allocation.batch_training_size = 1
+    cfg.point_allocation.batch_internal_validation_size = 0
     cfg.to_yaml(campaign / "campaign.yaml")
     iter_dir = (
         campaign / "7_ACTIVE_LEARNING"

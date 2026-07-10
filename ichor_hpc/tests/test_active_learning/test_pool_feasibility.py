@@ -11,9 +11,14 @@ FIXTURE = Path(__file__).resolve().parent / "fixtures" / "water_tetramer.xyz"
 
 def _config(*, bootstrap=12, seeds=8, final=4, max_iterations=1, skip=True):
     cfg = CampaignConfig()
-    cfg.bootstrap.initial_labelled_size = int(bootstrap)
+    cfg.point_allocation.bootstrap_external_validation_size = 2
+    cfg.point_allocation.bootstrap_internal_validation_size = 2
+    cfg.point_allocation.bootstrap_training_size = int(bootstrap) - 4
     cfg.seed_selection.n_seeds_per_iteration = int(seeds)
-    cfg.active_batch.final_batch_size = int(final)
+    cfg.point_allocation.batch_internal_validation_size = 1 if int(final) > 1 else 0
+    cfg.point_allocation.batch_training_size = (
+        int(final) - cfg.point_allocation.batch_internal_validation_size
+    )
     cfg.max_iterations = int(max_iterations)
     cfg.anti_overlap.skip_training_seeds = bool(skip)
     cfg._validate()
@@ -68,15 +73,19 @@ def test_pool_feasibility_counts_anchors_outside_pool_requirement(tmp_path):
     traj.read()
     base = [atoms.copy() for atoms in traj][0]
     anchors = [base.copy(), base.copy()]
-    anchors[1][1].x += 0.1
+    anchors[1][1].coordinates = [
+        anchors[1][1].x + 0.1,
+        anchors[1][1].y,
+        anchors[1][1].z,
+    ]
     _write_xyz_file(anchors, campaign / "anchor.xyz")
     cfg = _config(bootstrap=12, seeds=8, max_iterations=1, skip=True)
-    cfg.bootstrap.external_validation_size = 2
-    cfg.bootstrap.anchor = True
+    cfg.point_allocation.bootstrap_external_validation_size = 2
+    cfg.point_allocation.anchor = True
 
     result = pf.require_pool_feasibility(campaign, cfg)
 
-    assert result.bootstrap_initial_labelled_size == 12
+    assert result.bootstrap_total_size == 12
     assert result.bootstrap_anchor_count == 2
     assert result.bootstrap_pool_frame_count == 10
     assert result.required_pool_frames == 18

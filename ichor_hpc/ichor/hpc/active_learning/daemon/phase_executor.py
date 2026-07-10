@@ -53,11 +53,14 @@ class BackendSubmissionError(RuntimeError):
 #treats every phase as inline, so this set is only consulted by real
 #executors.
 INLINE_PHASES = frozenset({
-    "INIT", "SEED_SELECT", "SPLIT", "APPEND", "STOP_CHECK", "DONE", "HALTED",
+    "INIT", "INITIAL_ALLOCATION_CHECK", "ALLOCATION_CHECK", "SEED_SELECT",
+    "SPLIT", "APPEND", "STOP_CHECK", "DONE", "HALTED",
 })
 SBATCH_PHASES = frozenset({
     "PHASE_A_POLUS", "INITIAL_GAUSSIAN", "INITIAL_AIMALL", "INITIAL_FEREBUS",
-    "ARIADNE_ARRAY", "PHASE_B_POLUS", "GAUSSIAN", "AIMALL", "FEREBUS",
+    "INITIAL_REPLACEMENT_GAUSSIAN", "INITIAL_REPLACEMENT_AIMALL",
+    "ARIADNE_ARRAY", "PHASE_B_POLUS", "GAUSSIAN", "AIMALL",
+    "REPLACEMENT_GAUSSIAN", "REPLACEMENT_AIMALL", "FEREBUS",
 })
 
 
@@ -85,6 +88,7 @@ class PhaseResult:
     journal_events: List[Dict[str, Any]] = field(default_factory=list)
     failure_reason: Optional[str] = None
     submission_metadata: Dict[str, Any] = field(default_factory=dict)
+    next_phase_override: Optional[str] = None
 
 
 class PhaseExecutor(Protocol):
@@ -167,5 +171,4 @@ class MockPhaseExecutor:
     def operations(self) -> List[str]:
         """Compact list of (operation, phase) pairs for assertions."""
         return [c.operation + ":" + c.phase for c in self.calls]
-
 

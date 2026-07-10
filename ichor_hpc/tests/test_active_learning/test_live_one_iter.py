@@ -277,12 +277,29 @@ def _ensure_live_trajectory_pool(campaign_dir):
     """Import a tiny pool so live SEED_SELECT can emit seeds_picked.json."""
     from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
 
-    source = _live_smoke_fixtures() / "polus_phase_a" / "initial-SAMPLE-2.xyz"
+    fixture = _live_smoke_fixtures() / "polus_phase_a" / "initial-SAMPLE-2.xyz"
+    source = campaign_dir / "live-smoke-pool.xyz"
+    fixture_text = fixture.read_text(encoding="utf-8")
+    source.write_text(fixture_text + fixture_text, encoding="utf-8", newline="\n")
     TrajectoryPool.import_from(
         source,
         campaign_dir,
         overwrite=True,
     )
+
+
+def _live_smoke_config(campaign_dir):
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    config = CampaignConfig(max_iterations=1, poll_interval_seconds=1)
+    config.point_allocation.bootstrap_training_size = 1
+    config.point_allocation.bootstrap_internal_validation_size = 1
+    config.point_allocation.bootstrap_external_validation_size = 0
+    config.point_allocation.batch_training_size = 1
+    config.point_allocation.batch_internal_validation_size = 1
+    config.seed_selection.n_seeds_per_iteration = 2
+    _ensure_live_trajectory_pool(campaign_dir)
+    return config
 
 
 def _patch_ferebus_submit_for_live_smoke(monkeypatch, campaign_dir, call_log):
@@ -365,6 +382,18 @@ def _annotate_ariadne_fixture_results(campaign_dir, iteration):
         data["seed_index"] = seed_index
         data["seed_frame_id"] = int(rec["frame_id"])
         data["trajectory_sha256"] = str(picked.get("trajectory_sha256", ""))
+        data["task_success"] = True
+        data["landing_safety"] = {
+            "accepted": True,
+            "policy": "raw_final",
+            "selected_origin": "raw_final",
+            "reasons": [],
+            "record_only_reasons": [],
+            "metrics": {
+                "max_displacement_ang": 0.02,
+                "min_pair_distance_ang": 0.90,
+            },
+        }
         result_path.write_text(_json.dumps(data, indent=2), encoding="utf-8")
 
 
@@ -375,6 +404,17 @@ def _write_phase_b_selection_for_live_smoke(campaign_dir, iteration):
         PHASE_B_SELECTION_SCHEMA_VERSION,
         read_ariadne_results_manifest,
         write_phase_b_selection_manifest,
+    )
+    from ichor.hpc.active_learning.daemon.state import (
+        DEFAULT_STATE_FILENAME,
+        read_state,
+    )
+    from ichor.hpc.active_learning.point_allocation import (
+        create_point_allocation,
+        point_allocation_path,
+    )
+    from ichor.hpc.active_learning.versioning.provenance import (
+        enrich_with_point_allocation,
     )
 
     iter_dir = (
@@ -396,6 +436,7 @@ def _write_phase_b_selection_for_live_smoke(campaign_dir, iteration):
         rec["final_index"] = int(final_index)
         rec["kept_after_dedup"] = True
         rec["drop_reason"] = None
+        rec["candidate_id"] = "live-phase-b-" + str(int(final_index))
         records.append(rec)
         result = _json.loads(Path(str(rec["result_json"])).read_text(encoding="utf-8"))
         atom_types = [str(x) for x in result["atom_types"]]
@@ -411,12 +452,62 @@ def _write_phase_b_selection_for_live_smoke(campaign_dir, iteration):
                     z=float(coord[2]),
                 )
             )
+    state = read_state(
+        campaign_dir / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
+    )
+    allocation_path = point_allocation_path(
+        campaign_dir,
+        context="active",
+        iteration=int(iteration),
+    )
+    allocation = create_point_allocation(
+        allocation_path,
+        campaign_uid=str(state.campaign_uid),
+        context="active",
+        iteration=int(iteration),
+        targets={
+            "train": 1,
+            "int_val": max(0, int(len(records)) - 1),
+            "ext_val": 0,
+            "total": int(len(records)),
+        },
+        primary_candidates=[
+            {
+                "candidate_id": str(record["candidate_id"]),
+                "seed_index": int(record["seed_index"]),
+                "frame_id": int(record["seed_frame_id"]),
+            }
+            for record in records
+        ],
+        reserve_candidates=[],
+    )
+    slot_by_candidate = {
+        str(slot["attempts"][0]["candidate_id"]): slot
+        for slot in allocation["slots"]
+    }
+    for record in records:
+        slot = slot_by_candidate[str(record["candidate_id"])]
+        record["slot_id"] = int(slot["slot_id"])
+        record["split"] = str(slot["split"])
+        enrich_with_point_allocation(
+            Path(str(record["seed_dir"])),
+            candidate_id=str(record["candidate_id"]),
+            context="active",
+            slot_id=int(slot["slot_id"]),
+            split=str(slot["split"]),
+        )
     final_sample.write_text("\n".join(xyz_lines) + "\n", encoding="utf-8")
     write_phase_b_selection_manifest(iter_dir, {
         "schema_version": PHASE_B_SELECTION_SCHEMA_VERSION,
         "iteration": int(iteration),
         "descriptor": "hybrid_alf_rmsd",
         "source_ariadne_manifest": str((iter_dir / "ARIADNE_RESULTS.json").resolve()),
+        "point_allocation": {
+            "manifest": str(allocation_path.resolve()),
+            "targets": dict(allocation["targets"]),
+            "reserve": [],
+            "reserve_count": 0,
+        },
         "n_candidates": int(len(ariadne_manifest["accepted"])),
         "n_selected_raw": int(len(records)),
         "n_kept": int(len(records)),
@@ -444,6 +535,19 @@ def _live_smoke_seed_for_phase(campaign_dir, phase_name, iteration):
 
     if phase_name == "PHASE_A_POLUS":
         from ichor.hpc.active_learning.handoff_manifests import write_phase_a_sample_manifest
+        from ichor.hpc.active_learning.acquisition.trajectory_pool import (
+            POOL_MANIFEST_FILENAME,
+            POOL_SUBDIR,
+            TrajectoryPool,
+        )
+        from ichor.hpc.active_learning.daemon.state import (
+            DEFAULT_STATE_FILENAME,
+            read_state,
+        )
+        from ichor.hpc.active_learning.point_allocation import (
+            create_point_allocation,
+            point_allocation_path,
+        )
 
         target = campaign_dir / "3_DIVERSITY_SAMPLING" / "initial"
         target.mkdir(parents=True, exist_ok=True)
@@ -455,6 +559,47 @@ def _live_smoke_seed_for_phase(campaign_dir, phase_name, iteration):
         index = target / "initial-INDEX-2.dat"
         if not index.is_file():
             index.write_text("0\n1\n", encoding="utf-8")
+        state = read_state(
+            campaign_dir / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
+        )
+        pool = TrajectoryPool.load(campaign_dir)
+        allocation_path = point_allocation_path(
+            campaign_dir,
+            context="bootstrap",
+            iteration=0,
+        )
+        allocation = create_point_allocation(
+            allocation_path,
+            campaign_uid=str(state.campaign_uid),
+            context="bootstrap",
+            iteration=0,
+            targets={"train": 1, "int_val": 1, "ext_val": 0, "total": 2},
+            primary_candidates=[
+                {
+                    "candidate_id": "live-phase-a-" + str(i),
+                    "source": "phase_a_polus",
+                    "frame_id": int(i),
+                }
+                for i in range(2)
+            ],
+            reserve_candidates=[
+                {
+                    "candidate_id": "live-phase-a-reserve-" + str(i),
+                    "source": "phase_a_reserve",
+                    "frame_id": int(i),
+                    "reserve_rank": int(i - 2),
+                }
+                for i in range(2, len(pool))
+            ],
+        )
+        primary = [
+            {
+                **slot["attempts"][0],
+                "slot_id": int(slot["slot_id"]),
+                "split": str(slot["split"]),
+            }
+            for slot in allocation["slots"]
+        ]
         write_phase_a_sample_manifest(target, {
             "phase": "PHASE_A_POLUS",
             "iteration": -1,
@@ -464,11 +609,20 @@ def _live_smoke_seed_for_phase(campaign_dir, phase_name, iteration):
             "n_frames": 2,
             "selected_indices": [0, 1],
             "descriptor": "rmsd_massweight",
-            "n_pool_frames": 2,
-            "bootstrap_initial_labelled_size": 2,
-            "reserve_after_bootstrap": 0,
-            "trajectory_sha256": "0" * 64,
-            "source_pool_manifest": "",
+            "n_pool_frames": int(len(pool)),
+            "bootstrap_total_size": 2,
+            "point_allocation": {
+                "manifest": str(allocation_path.resolve()),
+                "targets": dict(allocation["targets"]),
+                "primary": primary,
+                "reserve_frame_ids": [int(i) for i in range(2, len(pool))],
+                "reserve_count": max(0, int(len(pool)) - 2),
+            },
+            "reserve_after_bootstrap": max(0, int(len(pool)) - 2),
+            "trajectory_sha256": str(pool.sha256),
+            "source_pool_manifest": str(
+                (campaign_dir / POOL_SUBDIR / POOL_MANIFEST_FILENAME).resolve()
+            ),
         })
     elif phase_name in ("INITIAL_GAUSSIAN", "INITIAL_AIMALL"):
         target = campaign_dir / ".DATA" / "STAGING" / "initial"
@@ -574,7 +728,8 @@ def test_live_one_iter_water_tetramer_after_parsers_land(tmp_path, monkeypatch):
     Asserts:
       * Daemon finishes a 1-iteration campaign with rc == 0.
       * No NotImplementedError raised by any live postprocess.
-      * Every SBATCH phase fired sbatch (a non-empty call log).
+      * Every mandatory submitted phase fired sbatch.
+      * Clean allocations do not submit replacement arrays.
       * Final state.phase is DONE and training_set_version >= 0.
       * Final state.iteration shows the iteration loop ran at least once.
       * journal contains at least one phase_succeeded_live event.
@@ -596,9 +751,7 @@ def test_live_one_iter_water_tetramer_after_parsers_land(tmp_path, monkeypatch):
 
     campaign = tmp_path / "campaign"
     campaign.mkdir()
-    cfg = CampaignConfig(max_iterations=1, poll_interval_seconds=1)
-    cfg.active_batch.final_batch_size = 2
-    cfg.seed_selection.n_seeds_per_iteration = 2
+    cfg = _live_smoke_config(campaign)
 
     call_log = []
     _patch_ferebus_submit_for_live_smoke(monkeypatch, campaign, call_log)
@@ -639,13 +792,27 @@ def test_live_one_iter_water_tetramer_after_parsers_land(tmp_path, monkeypatch):
         + "; expected at least 1 (INITIAL_FEREBUS + FEREBUS)"
     )
 
-    # Every SBATCH phase fired sbatch at least once.
-    phases_called = sorted({p for p, _ in call_log})
-    assert set(phases_called) == set(SBATCH_PHASES), (
-        "unexpected SBATCH coverage; got "
-        + str(phases_called) + " missing "
-        + str(sorted(set(SBATCH_PHASES) - set(phases_called)))
+    phases_called = {p for p, _ in call_log}
+    mandatory_submissions = {
+        "PHASE_A_POLUS",
+        "INITIAL_GAUSSIAN",
+        "INITIAL_FEREBUS",
+        "ARIADNE_ARRAY",
+        "PHASE_B_POLUS",
+        "GAUSSIAN",
+        "FEREBUS",
+    }
+    assert mandatory_submissions.issubset(phases_called), (
+        "mandatory sbatch phases missing: "
+        + str(sorted(mandatory_submissions - phases_called))
     )
+    replacement_phases = {
+        "INITIAL_REPLACEMENT_GAUSSIAN",
+        "INITIAL_REPLACEMENT_AIMALL",
+        "REPLACEMENT_GAUSSIAN",
+        "REPLACEMENT_AIMALL",
+    }
+    assert phases_called.isdisjoint(replacement_phases)
 
     # Live parsers emitted phase_succeeded_live events.
     journal_path = (
@@ -735,9 +902,7 @@ def test_live_one_iter_whitened_distance_fallback(tmp_path, monkeypatch):
 
     campaign = tmp_path / "campaign"
     campaign.mkdir()
-    cfg = CampaignConfig(max_iterations=1, poll_interval_seconds=1)
-    cfg.active_batch.final_batch_size = 2
-    cfg.seed_selection.n_seeds_per_iteration = 2
+    cfg = _live_smoke_config(campaign)
 
     call_log = []
     _patch_ferebus_submit_for_live_smoke(monkeypatch, campaign, call_log)
@@ -831,9 +996,7 @@ def test_live_one_iter_prefers_dedup_filtered_sample(tmp_path, monkeypatch):
 
     campaign = tmp_path / "campaign"
     campaign.mkdir()
-    cfg = CampaignConfig(max_iterations=1, poll_interval_seconds=1)
-    cfg.active_batch.final_batch_size = 2
-    cfg.seed_selection.n_seeds_per_iteration = 2
+    cfg = _live_smoke_config(campaign)
 
     call_log = []
     _patch_ferebus_submit_for_live_smoke(monkeypatch, campaign, call_log)

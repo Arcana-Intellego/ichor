@@ -169,12 +169,13 @@ def _pool_feasibility_payload(
 ) -> dict:
     return {
         "pool_n_frames": int(pool_n_frames),
-        "bootstrap_initial_labelled_size": 70,
+        "bootstrap_total_size": 70,
         "bootstrap_pool_frame_count": 70,
         "bootstrap_anchor_count": 0,
         "max_iterations": 2,
         "n_seeds_per_iteration": 10,
-        "final_batch_size": 10,
+        "batch_total_size": 10,
+        "configured_seed_surplus": 0,
         "skip_training_seeds": True,
         "required_pool_frames": int(required_pool_frames),
         "reserve_after_bootstrap": int(pool_n_frames) - 70,
@@ -516,7 +517,7 @@ def test_cli_status_reports_initial_ferebus_bootstrap_contract_problem(tmp_path,
     out = capsys.readouterr().out
     assert "Data Products\n" in out
     assert "  current phase contract: problem - CommittedArtifactError:" in out
-    assert "initial_ferebus_bootstrap_manifest_invalid" in out
+    assert "initial_ferebus_point_allocation_invalid" in out
     assert "  bootstrap training set: using initial AIMAll handoff" in out
     assert "  FEREBUS models: being produced by INITIAL_FEREBUS" in out
 

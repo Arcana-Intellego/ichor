@@ -47,8 +47,9 @@ def test_init_fills_sparse_campaign_yaml_preserving_user_override(tmp_path):
         pytest.skip("water_tetramer.xyz fixture missing")
     shutil.copy(FIXTURE, tmp_path / "pool.xyz")
     (tmp_path / "campaign.yaml").write_text(
-        "schema_version: 3\n"
-        "system_name: MY_SYSTEM\n"
+        "schema_version: 9\n"
+        "campaign:\n"
+        "  system_name: MY_SYSTEM\n"
         "gaussian:\n"
         "  basis_set: def2-SVP\n",
         encoding="utf-8",
@@ -71,12 +72,15 @@ def test_init_refuses_infeasible_pool_before_state_creation(tmp_path, capsys):
         pytest.skip("water_tetramer.xyz fixture missing")
     shutil.copy(FIXTURE, tmp_path / "pool.xyz")
     (tmp_path / "campaign.yaml").write_text(
-        "schema_version: 6\n"
-        "max_iterations: 2\n"
-        "bootstrap:\n"
-        "  initial_labelled_size: 12\n"
-        "active_batch:\n"
-        "  final_batch_size: 4\n"
+        "schema_version: 9\n"
+        "campaign:\n"
+        "  max_iterations: 2\n"
+        "point_allocation:\n"
+        "  bootstrap_training_size: 8\n"
+        "  bootstrap_internal_validation_size: 2\n"
+        "  bootstrap_external_validation_size: 2\n"
+        "  batch_training_size: 3\n"
+        "  batch_internal_validation_size: 1\n"
         "seed_selection:\n"
         "  n_seeds_per_iteration: 8\n",
         encoding="utf-8",
@@ -96,8 +100,14 @@ def test_init_refuses_infeasible_pool_before_state_creation(tmp_path, capsys):
 def test_init_reports_missing_default_pool(tmp_path, capsys):
     rc = cmd_init(_args(tmp_path))
 
-    assert rc == 2
-    assert "Put pool.xyz in the campaign directory" in capsys.readouterr().err
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "trajectory pool: missing" in out
+    assert "--source /path/to/pool.xyz" in out
+    assert (tmp_path / "campaign.yaml").is_file()
+    assert (
+        tmp_path / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
+    ).is_file()
 
 
 def test_import_pool_deprecated_alias_calls_init(tmp_path, capsys):

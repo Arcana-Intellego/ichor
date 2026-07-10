@@ -19,6 +19,9 @@ _TRAINING_REQUIRED = {
     CampaignPhase.SPLIT,
     CampaignPhase.GAUSSIAN,
     CampaignPhase.AIMALL,
+    CampaignPhase.ALLOCATION_CHECK,
+    CampaignPhase.REPLACEMENT_GAUSSIAN,
+    CampaignPhase.REPLACEMENT_AIMALL,
     CampaignPhase.APPEND,
     CampaignPhase.FEREBUS,
     CampaignPhase.STOP_CHECK,
@@ -31,6 +34,9 @@ _MODELS_REQUIRED = {
     CampaignPhase.SPLIT,
     CampaignPhase.GAUSSIAN,
     CampaignPhase.AIMALL,
+    CampaignPhase.ALLOCATION_CHECK,
+    CampaignPhase.REPLACEMENT_GAUSSIAN,
+    CampaignPhase.REPLACEMENT_AIMALL,
     CampaignPhase.APPEND,
     CampaignPhase.STOP_CHECK,
 }
@@ -42,6 +48,9 @@ _COHERENT_TRAINING_MODEL_REQUIRED = {
     CampaignPhase.SPLIT,
     CampaignPhase.GAUSSIAN,
     CampaignPhase.AIMALL,
+    CampaignPhase.ALLOCATION_CHECK,
+    CampaignPhase.REPLACEMENT_GAUSSIAN,
+    CampaignPhase.REPLACEMENT_AIMALL,
     CampaignPhase.APPEND,
     CampaignPhase.STOP_CHECK,
 }
@@ -113,20 +122,21 @@ def verify_state_referenced_artifacts(
 
     train_version = int(getattr(state, "training_set_version", -1))
     if phase is CampaignPhase.INITIAL_FEREBUS and train_version < 0:
-        staging = campaign / ".DATA" / "STAGING" / "initial"
         try:
-            from .input_staging import read_quantum_acceptance_manifest
+            from ..point_allocation import point_allocation_path, read_point_allocation
 
-            read_quantum_acceptance_manifest(
-                staging,
-                expected_phase="INITIAL_AIMALL",
-                expected_iteration=int(getattr(state, "iteration", 0)),
-                require_nonempty=True,
-                require_points_file_membership=True,
+            allocation = read_point_allocation(
+                point_allocation_path(
+                    campaign,
+                    context="bootstrap",
+                    iteration=0,
+                )
             )
+            if not bool((allocation.get("summary") or {}).get("complete", False)):
+                raise ValueError("bootstrap point allocation is incomplete")
         except Exception as exc:
             raise CommittedArtifactError(
-                "initial_ferebus_bootstrap_manifest_invalid: "
+                "initial_ferebus_point_allocation_invalid: "
                 + type(exc).__name__
                 + ": "
                 + str(exc)

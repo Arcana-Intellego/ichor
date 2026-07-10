@@ -220,12 +220,12 @@ def _pool_feasibility_summary(
     if campaign_dir is None:
         if bool(config.anti_overlap.skip_training_seeds):
             required = (
-                int(config.bootstrap.initial_labelled_size)
+                int(config.point_allocation.bootstrap_total_size)
                 + int(config.campaign.max_iterations)
                 * int(config.seed_selection.n_seeds_per_iteration)
             )
             expression = (
-                str(config.bootstrap.initial_labelled_size)
+                str(config.point_allocation.bootstrap_total_size)
                 + " + "
                 + str(config.campaign.max_iterations)
                 + " * "
@@ -234,7 +234,7 @@ def _pool_feasibility_summary(
                 + str(required)
             )
         else:
-            required = int(config.bootstrap.initial_labelled_size)
+            required = int(config.point_allocation.bootstrap_total_size)
             expression = str(required)
         return [
             _line("pool_feasibility.imported_pool", "not available"),
@@ -520,31 +520,49 @@ def format_sampling_protocol_summary(
             pass
     lines.append(
         _line(
-            "bootstrap.initial_labelled_size",
-            config.bootstrap.initial_labelled_size,
+            "point_allocation.bootstrap_training_size",
+            config.point_allocation.bootstrap_training_size,
         )
     )
     lines.append(
         _line(
-            "bootstrap.external_validation_size",
-            config.bootstrap.external_validation_size,
+            "point_allocation.bootstrap_internal_validation_size",
+            config.point_allocation.bootstrap_internal_validation_size,
         )
     )
     lines.append(
         _line(
-            "bootstrap.anchor",
-            config.bootstrap.anchor,
+            "point_allocation.bootstrap_external_validation_size",
+            config.point_allocation.bootstrap_external_validation_size,
         )
     )
-    if bool(getattr(config.bootstrap, "anchor", False)):
-        lines.append(_line("bootstrap.anchor_xyz", "anchor.xyz"))
     lines.append(
         _line(
-            "bootstrap.non_external_labelled_size",
-            int(config.bootstrap.initial_labelled_size)
-            - int(config.bootstrap.external_validation_size),
+            "point_allocation.bootstrap_total_size",
+            int(config.point_allocation.bootstrap_total_size),
         )
     )
+    lines.append(
+        _line(
+            "point_allocation.batch_training_size",
+            config.point_allocation.batch_training_size,
+        )
+    )
+    lines.append(
+        _line(
+            "point_allocation.batch_internal_validation_size",
+            config.point_allocation.batch_internal_validation_size,
+        )
+    )
+    lines.append(
+        _line(
+            "point_allocation.batch_total_size",
+            int(config.point_allocation.batch_total_size),
+        )
+    )
+    lines.append(_line("point_allocation.anchor", config.point_allocation.anchor))
+    if bool(getattr(config.point_allocation, "anchor", False)):
+        lines.append(_line("point_allocation.anchor_xyz", "anchor.xyz"))
     lines.append(
         _line(
             "seed_selection.n_seeds_per_iteration",
@@ -553,8 +571,9 @@ def format_sampling_protocol_summary(
     )
     lines.append(
         _line(
-            "active_batch.final_batch_size",
-            config.active_batch.final_batch_size,
+            "point_allocation.seed_surplus",
+            int(seed.n_seeds_per_iteration)
+            - int(config.point_allocation.batch_total_size),
         )
     )
     lines.append(_line("campaign.max_iterations", config.campaign.max_iterations))

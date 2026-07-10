@@ -321,23 +321,42 @@ def test_phase_b_beta_reaches_descriptor_factory():
     assert d.beta == pytest.approx(0.42)
 
 
-def test_split_val_mid_and_high_holdout_consumed_by_executor(tmp_path):
+def test_exact_point_allocation_consumed_by_split_executor(tmp_path):
     import json
     from types import SimpleNamespace
     from ichor.hpc.active_learning.daemon.dry_run_executor import (
         DryRunPhaseExecutor,
     )
     from ichor.hpc.active_learning.daemon.state import CampaignPhase
+    from ichor.hpc.active_learning.point_allocation import (
+        allocation_targets,
+        create_point_allocation,
+        point_allocation_path,
+    )
 
     c = CampaignConfig()
-    c.split.val_mid_fraction = 0.22
-    c.split.high_holdout_fraction = 0.07
+    c.point_allocation.batch_training_size = 2
+    c.point_allocation.batch_internal_validation_size = 1
+    c.seed_selection.n_seeds_per_iteration = 3
     ex = DryRunPhaseExecutor(campaign_dir=tmp_path, config=c)
+    targets = allocation_targets(c, "active")
+    create_point_allocation(
+        point_allocation_path(tmp_path, context="active", iteration=0),
+        campaign_uid="config-test",
+        context="active",
+        iteration=0,
+        targets=targets,
+        primary_candidates=[
+            {"candidate_id": "candidate-" + str(index)}
+            for index in range(targets["total"])
+        ],
+        reserve_candidates=[],
+    )
     ex.submit_or_run(SimpleNamespace(iteration=0), CampaignPhase.SPLIT)
     split_json = tmp_path / "7_ACTIVE_LEARNING" / "iteration-0000" / "split.json"
     payload = json.loads(split_json.read_text(encoding="utf-8"))
-    assert payload["val_mid_fraction"] == pytest.approx(0.22)
-    assert payload["high_holdout_fraction"] == pytest.approx(0.07)
+    assert payload["strategy"] == "exact_pre_qm_point_allocation"
+    assert payload["targets"] == targets
 
 
 def test_seed_selection_bulk_fraction_consumed_by_executor(tmp_path):

@@ -90,6 +90,9 @@ PHASE_ORDER: Tuple[CampaignPhase, ...] = (
     CampaignPhase.PHASE_A_POLUS,
     CampaignPhase.INITIAL_GAUSSIAN,
     CampaignPhase.INITIAL_AIMALL,
+    CampaignPhase.INITIAL_ALLOCATION_CHECK,
+    CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN,
+    CampaignPhase.INITIAL_REPLACEMENT_AIMALL,
     CampaignPhase.INITIAL_FEREBUS,
     CampaignPhase.SEED_SELECT,
     CampaignPhase.ARIADNE_ARRAY,
@@ -97,6 +100,9 @@ PHASE_ORDER: Tuple[CampaignPhase, ...] = (
     CampaignPhase.SPLIT,
     CampaignPhase.GAUSSIAN,
     CampaignPhase.AIMALL,
+    CampaignPhase.ALLOCATION_CHECK,
+    CampaignPhase.REPLACEMENT_GAUSSIAN,
+    CampaignPhase.REPLACEMENT_AIMALL,
     CampaignPhase.APPEND,
     CampaignPhase.FEREBUS,
     CampaignPhase.STOP_CHECK,
@@ -143,6 +149,23 @@ TRANSIENT_RETRY_STATUSES = frozenset({
 
 _STRICT_FAILURE_REQUIRES_POSTPROCESS = frozenset(SBATCH_PHASES)
 
+_ALLOWED_PHASE_OVERRIDES = {
+    CampaignPhase.INITIAL_ALLOCATION_CHECK: frozenset({
+        CampaignPhase.INITIAL_FEREBUS,
+        CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN,
+    }),
+    CampaignPhase.INITIAL_REPLACEMENT_AIMALL: frozenset({
+        CampaignPhase.INITIAL_ALLOCATION_CHECK,
+    }),
+    CampaignPhase.ALLOCATION_CHECK: frozenset({
+        CampaignPhase.APPEND,
+        CampaignPhase.REPLACEMENT_GAUSSIAN,
+    }),
+    CampaignPhase.REPLACEMENT_AIMALL: frozenset({
+        CampaignPhase.ALLOCATION_CHECK,
+    }),
+}
+
 
 def next_phase(current: CampaignPhase, iteration: int, max_iterations: int) -> Tuple[CampaignPhase, int]:
     """Return (next_phase, next_iteration).
@@ -156,6 +179,14 @@ def next_phase(current: CampaignPhase, iteration: int, max_iterations: int) -> T
         if next_iter >= max_iterations:
             return CampaignPhase.DONE, iteration
         return CampaignPhase.SEED_SELECT, next_iter
+    if current is CampaignPhase.INITIAL_ALLOCATION_CHECK:
+        return CampaignPhase.INITIAL_FEREBUS, iteration
+    if current is CampaignPhase.ALLOCATION_CHECK:
+        return CampaignPhase.APPEND, iteration
+    if current is CampaignPhase.INITIAL_REPLACEMENT_AIMALL:
+        return CampaignPhase.INITIAL_ALLOCATION_CHECK, iteration
+    if current is CampaignPhase.REPLACEMENT_AIMALL:
+        return CampaignPhase.ALLOCATION_CHECK, iteration
     try:
         idx = PHASE_ORDER.index(current)
     except ValueError as exc:
@@ -858,9 +889,30 @@ class Daemon:
             return TickStatus.SUBMITTED
         if result.is_complete:
             #inline phase, or executor decided no submission needed.
+            if intent_written and phase_name in SBATCH_PHASES:
+                try:
+                    _submission_intent.mark_completed(
+                        self.campaign_dir,
+                        phase_name,
+                        int(state.iteration),
+                    )
+                except Exception as exc:
+                    return self._halt(
+                        state,
+                        phase,
+                        "submission_intent_complete_failed: "
+                        + type(exc).__name__
+                        + ": "
+                        + str(exc)[:160],
+                    )
             return (
                 TickStatus.ADVANCED
-                if self._advance(state, phase, result.state_updates)
+                if self._advance(
+                    state,
+                    phase,
+                    result.state_updates,
+                    next_phase_override=result.next_phase_override,
+                )
                 else TickStatus.HALTED
             )
         #defensive: executor returned neither a JobID nor completion.
@@ -1685,7 +1737,12 @@ class Daemon:
         )
         return (
             TickStatus.ADVANCED
-            if self._advance(state, phase, result.state_updates)
+            if self._advance(
+                state,
+                phase,
+                result.state_updates,
+                next_phase_override=result.next_phase_override,
+            )
             else TickStatus.HALTED
         )
 
@@ -2190,7 +2247,14 @@ class Daemon:
             )
         return None
 
-    def _advance(self, state: CampaignState, phase: CampaignPhase, state_updates: Dict[str, Any]) -> bool:
+    def _advance(
+        self,
+        state: CampaignState,
+        phase: CampaignPhase,
+        state_updates: Dict[str, Any],
+        *,
+        next_phase_override: Optional[str] = None,
+    ) -> bool:
         #NB:STOP_CHECK ghost-iteration fix. When _inline_stop_check
         #returns {"shutdown_requested": True}, the daemon must NOT also
         #advance phase + iteration -- otherwise state.json snapshots show
@@ -2227,6 +2291,25 @@ class Daemon:
             return False
 
         new_phase, new_iter = next_phase(phase, state.iteration, state.max_iterations)
+        if next_phase_override is not None:
+            try:
+                requested_phase = CampaignPhase(str(next_phase_override))
+            except ValueError as exc:
+                self._halt(
+                    state,
+                    phase,
+                    "invalid next-phase override: " + repr(next_phase_override),
+                )
+                return False
+            if requested_phase not in _ALLOWED_PHASE_OVERRIDES.get(phase, frozenset()):
+                self._halt(
+                    state,
+                    phase,
+                    "disallowed next-phase override "
+                    + phase.value + " -> " + requested_phase.value,
+                )
+                return False
+            new_phase = requested_phase
         prior_iter = state.iteration
         state.phase = new_phase
         state.iteration = new_iter
@@ -2247,6 +2330,7 @@ class Daemon:
             return
         allowed = {
             "training_set_version", "validation_set_version", "models_version",
+            "replacement_round",
             "last_acquisition_alpha0", "stop_streak", "max_iterations",
             #STOP_CHECK extensions:
             "alpha_history", "shutdown_requested",

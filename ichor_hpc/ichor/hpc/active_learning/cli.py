@@ -241,6 +241,9 @@ RETRYABLE_CLEANED_REENTRY_PHASES = {
     CampaignPhase.PHASE_A_POLUS,
     CampaignPhase.INITIAL_GAUSSIAN,
     CampaignPhase.INITIAL_AIMALL,
+    CampaignPhase.INITIAL_ALLOCATION_CHECK,
+    CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN,
+    CampaignPhase.INITIAL_REPLACEMENT_AIMALL,
     CampaignPhase.INITIAL_FEREBUS,
     CampaignPhase.SEED_SELECT,
     CampaignPhase.ARIADNE_ARRAY,
@@ -248,6 +251,9 @@ RETRYABLE_CLEANED_REENTRY_PHASES = {
     CampaignPhase.SPLIT,
     CampaignPhase.GAUSSIAN,
     CampaignPhase.AIMALL,
+    CampaignPhase.ALLOCATION_CHECK,
+    CampaignPhase.REPLACEMENT_GAUSSIAN,
+    CampaignPhase.REPLACEMENT_AIMALL,
     CampaignPhase.APPEND,
     CampaignPhase.FEREBUS,
 }
@@ -857,13 +863,19 @@ _PHASE_MEANINGS: Dict[str, str] = {
     CampaignPhase.PHASE_A_POLUS.value: "initial POLUS diversity sampling is next",
     CampaignPhase.INITIAL_GAUSSIAN.value: "initial Gaussian labelling is next",
     CampaignPhase.INITIAL_AIMALL.value: "initial AIMAll postprocessing is next",
+    CampaignPhase.INITIAL_ALLOCATION_CHECK.value: "bootstrap point-allocation completeness is being checked",
+    CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN.value: "replacement bootstrap Gaussian labelling is next",
+    CampaignPhase.INITIAL_REPLACEMENT_AIMALL.value: "replacement bootstrap AIMAll postprocessing is next",
     CampaignPhase.INITIAL_FEREBUS.value: "bootstrap FEREBUS model training is next",
     CampaignPhase.SEED_SELECT.value: "active-learning seed selection is next",
     CampaignPhase.ARIADNE_ARRAY.value: "ARIADNE adversarial landing is next",
     CampaignPhase.PHASE_B_POLUS.value: "Phase B POLUS selection is next",
-    CampaignPhase.SPLIT.value: "accepted active points are being partitioned",
+    CampaignPhase.SPLIT.value: "the pre-QM exact slot allocation is being verified",
     CampaignPhase.GAUSSIAN.value: "active Gaussian labelling is next",
     CampaignPhase.AIMALL.value: "active AIMAll postprocessing is next",
+    CampaignPhase.ALLOCATION_CHECK.value: "active point-allocation completeness is being checked",
+    CampaignPhase.REPLACEMENT_GAUSSIAN.value: "replacement active Gaussian labelling is next",
+    CampaignPhase.REPLACEMENT_AIMALL.value: "replacement active AIMAll postprocessing is next",
     CampaignPhase.APPEND.value: "accepted AIMAll outputs are being appended",
     CampaignPhase.FEREBUS.value: "FEREBUS model retraining is next",
     CampaignPhase.STOP_CHECK.value: "iteration stop/continue decision is next",
@@ -876,6 +888,9 @@ _BOOTSTRAP_NOT_READY_PHASES = {
     CampaignPhase.PHASE_A_POLUS.value,
     CampaignPhase.INITIAL_GAUSSIAN.value,
     CampaignPhase.INITIAL_AIMALL.value,
+    CampaignPhase.INITIAL_ALLOCATION_CHECK.value,
+    CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN.value,
+    CampaignPhase.INITIAL_REPLACEMENT_AIMALL.value,
 }
 
 _TRAINING_REQUIRED_PHASES = {
@@ -885,6 +900,9 @@ _TRAINING_REQUIRED_PHASES = {
     CampaignPhase.SPLIT.value,
     CampaignPhase.GAUSSIAN.value,
     CampaignPhase.AIMALL.value,
+    CampaignPhase.ALLOCATION_CHECK.value,
+    CampaignPhase.REPLACEMENT_GAUSSIAN.value,
+    CampaignPhase.REPLACEMENT_AIMALL.value,
     CampaignPhase.APPEND.value,
     CampaignPhase.FEREBUS.value,
     CampaignPhase.STOP_CHECK.value,
@@ -897,6 +915,9 @@ _MODELS_REQUIRED_PHASES = {
     CampaignPhase.SPLIT.value,
     CampaignPhase.GAUSSIAN.value,
     CampaignPhase.AIMALL.value,
+    CampaignPhase.ALLOCATION_CHECK.value,
+    CampaignPhase.REPLACEMENT_GAUSSIAN.value,
+    CampaignPhase.REPLACEMENT_AIMALL.value,
     CampaignPhase.APPEND.value,
     CampaignPhase.STOP_CHECK.value,
 }
@@ -4888,9 +4909,13 @@ def _print_pool_summary(summary: Dict[str, Any]) -> None:
         print("  trajectory pool: invalid - " + str(summary.get("error", "unknown")))
 
 
-def _print_pool_feasibility(summary: Dict[str, Any]) -> None:
+def _print_pool_feasibility(summary: Dict[str, Any], *, file=None) -> None:
+    stream = sys.stdout if file is None else file
     if summary.get("error"):
-        print("  pool feasibility: unavailable - " + str(summary.get("error")))
+        print(
+            "  pool feasibility: unavailable - " + str(summary.get("error")),
+            file=stream,
+        )
         return
     print(
         "  pool feasibility: "
@@ -4898,10 +4923,11 @@ def _print_pool_feasibility(summary: Dict[str, Any]) -> None:
         + ", frames="
         + str(summary.get("pool_n_frames"))
         + ", required="
-        + str(summary.get("required_pool_frames"))
+        + str(summary.get("required_pool_frames")),
+        file=stream,
     )
     if summary.get("expression"):
-        print("    " + str(summary.get("expression")))
+        print("    " + str(summary.get("expression")), file=stream)
 
 
 def _bootstrap_fresh_campaign_state(
@@ -5048,7 +5074,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         feasibility_summary = _pool_feasibility_summary(campaign, config)
         if not bool(feasibility_summary.get("ok", False)):
             print("campaign bootstrap failed: trajectory pool is infeasible", file=sys.stderr)
-            _print_pool_feasibility(feasibility_summary)
+            _print_pool_feasibility(feasibility_summary, file=sys.stderr)
             return 17
 
     try:
@@ -5110,19 +5136,27 @@ def cmd_config_check(args: argparse.Namespace) -> int:
             "system_name": str(config.campaign.system_name),
             "max_iterations": int(config.campaign.max_iterations),
         },
-        "bootstrap": {
-            "initial_labelled_size": int(config.bootstrap.initial_labelled_size),
-            "external_validation_size": int(
-                config.bootstrap.external_validation_size
+        "point_allocation": {
+            "bootstrap_training_size": int(
+                config.point_allocation.bootstrap_training_size
             ),
-            "non_external_bootstrap_size": int(config.bootstrap.initial_labelled_size)
-            - int(config.bootstrap.external_validation_size),
-        },
-        "ferebus": {
-            "train_fraction": float(config.ferebus.train_fraction),
-            "internal_validation_fraction": float(
-                config.ferebus.internal_validation_fraction
+            "bootstrap_internal_validation_size": int(
+                config.point_allocation.bootstrap_internal_validation_size
             ),
+            "bootstrap_external_validation_size": int(
+                config.point_allocation.bootstrap_external_validation_size
+            ),
+            "bootstrap_total_size": int(
+                config.point_allocation.bootstrap_total_size
+            ),
+            "batch_training_size": int(
+                config.point_allocation.batch_training_size
+            ),
+            "batch_internal_validation_size": int(
+                config.point_allocation.batch_internal_validation_size
+            ),
+            "batch_total_size": int(config.point_allocation.batch_total_size),
+            "anchor": bool(config.point_allocation.anchor),
         },
     }
     try:

@@ -1184,12 +1184,15 @@ def test_array_staging_receives_executor_partition_override(monkeypatch, tmp_pat
         iteration,
         *,
         partition_override=None,
+        staging_override=None,
+        **_kwargs,
     ):
         calls["aimall"] = {
             "campaign_dir": Path(campaign_dir),
             "phase_name": phase_name,
             "iteration": iteration,
             "partition_override": partition_override,
+            "staging_override": staging_override,
         }
         return campaign / "aimall-stage", 2
 
@@ -1202,7 +1205,11 @@ def test_array_staging_receives_executor_partition_override(monkeypatch, tmp_pat
         backend_check=False,
         partition="override-partition",
     )
-    monkeypatch.setattr(ex, "_locate_sample_xyz", lambda phase_name, iteration: sample)
+    monkeypatch.setattr(
+        ex,
+        "_locate_sample_xyz",
+        lambda phase_name, iteration, **_kwargs: sample,
+    )
 
     assert ex._array_size_after_staging("GAUSSIAN", SimpleNamespace(iteration=4)) == 3
     assert ex._array_size_after_staging("AIMALL", SimpleNamespace(iteration=4)) == 2

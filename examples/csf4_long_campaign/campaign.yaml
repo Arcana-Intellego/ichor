@@ -1,4 +1,4 @@
-schema_version: 8
+schema_version: 9
 
 campaign:
   system_name: ICHOR_CSF4_LONG_CAMPAIGN
@@ -6,17 +6,13 @@ campaign:
 
 # Production-style starting point. Calibrate thresholds from one first-live
 # campaign before increasing batch sizes further.
-bootstrap:
-  initial_labelled_size: 100
-  external_validation_size: 20
+point_allocation:
+  bootstrap_training_size: 64
+  bootstrap_internal_validation_size: 16
+  bootstrap_external_validation_size: 20
+  batch_training_size: 6
+  batch_internal_validation_size: 2
   anchor: false
-
-active_batch:
-  final_batch_size: 8
-
-ferebus:
-  train_fraction: 0.8
-  internal_validation_fraction: 0.2
 
 seed_selection:
   strategy: d_optimal

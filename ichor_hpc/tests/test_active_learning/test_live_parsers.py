@@ -27,6 +27,16 @@ from ichor.hpc.active_learning.daemon.phase_executor import (
     PhaseResult,
 )
 from ichor.hpc.active_learning.daemon.state import CampaignPhase
+from ichor.hpc.active_learning.point_allocation import (
+    create_point_allocation,
+    pending_attempts,
+    point_allocation_path,
+    record_quantum_results,
+)
+from ichor.hpc.active_learning.versioning.provenance import (
+    enrich_with_point_allocation,
+    write_seed_provenance,
+)
 from ichor.hpc.active_learning.versioning.training_set import TrainingSetVersioning
 
 
@@ -73,6 +83,90 @@ def _read_journal_events(campaign_dir):
         for line in journal_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+
+
+def _seed_point_allocation(campaign, staging, *, context, iteration):
+    pointdirs = sorted(Path(staging).glob("POINT_*.pointdir"))
+    candidates = [
+        {
+            "candidate_id": (
+                str(context) + "-" + str(int(iteration)) + "-" + pointdir.name
+            ),
+            "frame_id": index,
+            "pointdir_name": pointdir.name,
+        }
+        for index, pointdir in enumerate(pointdirs)
+    ]
+    allocation_path = point_allocation_path(
+        campaign,
+        context=context,
+        iteration=iteration,
+    )
+    allocation = create_point_allocation(
+        allocation_path,
+        campaign_uid="m16-test",
+        context=context,
+        iteration=iteration,
+        targets={
+            "train": len(candidates),
+            "int_val": 0,
+            "ext_val": 0,
+            "total": len(candidates),
+        },
+        primary_candidates=candidates,
+        reserve_candidates=[],
+    )
+    attempts_by_name = {
+        str(attempt["pointdir_name"]): attempt
+        for attempt in pending_attempts(allocation)
+    }
+    for pointdir in pointdirs:
+        attempt = attempts_by_name[pointdir.name]
+        write_seed_provenance(
+            pointdir,
+            campaign_uid="m16-test",
+            iteration=iteration,
+            trajectory_sha256="0" * 64,
+            seed_frame_id=attempt.get("frame_id"),
+            seed_selection_origin="live_parser_fixture",
+            seed_variance_at_selection=None,
+            subspace_neighbour_frame_ids=[],
+            subspace_dimension=0,
+            subspace_eigenvalues=[],
+        )
+        enrich_with_point_allocation(
+            pointdir,
+            candidate_id=str(attempt["candidate_id"]),
+            context=context,
+            slot_id=int(attempt["slot_id"]),
+            split=str(attempt["split"]),
+        )
+    return allocation_path, allocation
+
+
+def _complete_point_allocation(campaign, staging, *, context, iteration):
+    allocation_path, allocation = _seed_point_allocation(
+        campaign,
+        staging,
+        context=context,
+        iteration=iteration,
+    )
+    pointdirs = {
+        pointdir.name: pointdir
+        for pointdir in sorted(Path(staging).glob("POINT_*.pointdir"))
+    }
+    record_quantum_results(
+        allocation_path,
+        [
+            {
+                "candidate_id": str(attempt["candidate_id"]),
+                "accepted": True,
+                "pointdir": str(pointdirs[str(attempt["pointdir_name"])]),
+            }
+            for attempt in pending_attempts(allocation)
+        ],
+    )
+    return allocation_path
 
 
 def test_ariadne_optional_scale_diagnostics_are_warnings_only():
@@ -141,6 +235,12 @@ def test_iter_gaussian_happy_path(tmp_path):
 def test_initial_aimall_happy_path(tmp_path):
     ex = _make_executor(tmp_path)
     staging = _bind_staging(ex, FIXTURES / "initial_quantum")
+    _seed_point_allocation(
+        ex.campaign_dir,
+        staging,
+        context="bootstrap",
+        iteration=0,
+    )
     stg.write_quantum_acceptance_manifest(
         staging,
         phase_name="INITIAL_GAUSSIAN",
@@ -198,6 +298,12 @@ def test_stage_aimall_inputs_writes_resolved_naat_metadata(tmp_path):
 def test_aimall_parser_only_consumes_gaussian_accepted_pointdirs(tmp_path):
     ex = _make_executor(tmp_path)
     staging = _bind_staging(ex, FIXTURES / "initial_quantum")
+    _seed_point_allocation(
+        ex.campaign_dir,
+        staging,
+        context="bootstrap",
+        iteration=0,
+    )
     accepted = [staging / "POINT_0000.pointdir", staging / "POINT_0001.pointdir"]
     stg.write_quantum_acceptance_manifest(
         staging,
@@ -238,17 +344,20 @@ def test_partial_rejection_below_threshold_still_succeeds(tmp_path):
     assert rejected[-1]["reason"] == "scf_nonconvergence_or_crash"
 
 
-def test_above_threshold_rejection_sets_failure_reason(tmp_path):
+def test_high_gaussian_rejection_is_deferred_to_allocation_replacement(tmp_path):
     ex = _make_executor(tmp_path, failure_threshold=0.3)
-    _bind_staging(ex, FIXTURES / "iter_quantum_scf_failure")
+    staging = _bind_staging(ex, FIXTURES / "iter_quantum_scf_failure")
     state = SimpleNamespace(iteration=5, campaign_uid="m16-test")
     result = ex._parse_quantum_postprocess(
         state, CampaignPhase("GAUSSIAN"), observations=[],
     )
     assert result.is_complete is True
-    assert result.failure_reason is not None
-    assert "too_many_rejected" in result.failure_reason
-    assert "1/2" in result.failure_reason
+    assert result.failure_reason is None
+    manifest = json.loads(
+        (staging / stg.QUANTUM_ACCEPTANCE_MANIFEST).read_text(encoding="utf-8")
+    )
+    assert len(manifest["accepted_pointdirs"]) == 1
+    assert len(manifest["rejected"]) == 1
 
 
 def test_missing_staging_dir_sets_failure_reason(tmp_path):
@@ -311,7 +420,7 @@ def test_postprocess_dispatches_to_quantum_handler(tmp_path):
     assert result.failure_reason is None
 
 
-def test_commit_initial_training_set_uses_aimall_acceptance_manifest(tmp_path):
+def test_commit_initial_training_set_rejects_incomplete_allocation(tmp_path):
     campaign = tmp_path / "campaign"
     initial = campaign / ".DATA" / "STAGING" / "initial"
     good = initial / "POINT_0001.pointdir"
@@ -328,11 +437,37 @@ def test_commit_initial_training_set_uses_aimall_acceptance_manifest(tmp_path):
         accepted=[good],
         rejected=[("POINT_0000.pointdir", "missing_atomicfiles_dir")],
     )
+    allocation_path, allocation = _seed_point_allocation(
+        campaign,
+        initial,
+        context="bootstrap",
+        iteration=0,
+    )
+    attempts = pending_attempts(allocation)
+    accepted_id = next(
+        str(attempt["candidate_id"])
+        for attempt in attempts
+        if str(attempt["pointdir_name"]) == good.name
+    )
+    record_quantum_results(
+        allocation_path,
+        [
+            {
+                "candidate_id": str(attempt["candidate_id"]),
+                "accepted": str(attempt["candidate_id"]) == accepted_id,
+                "pointdir": str(initial / str(attempt["pointdir_name"])),
+                "reason": (
+                    None
+                    if str(attempt["candidate_id"]) == accepted_id
+                    else "missing_atomicfiles_dir"
+                ),
+            }
+            for attempt in attempts
+        ],
+    )
 
-    assert stg.commit_initial_training_set(campaign) is True
-    committed = campaign / "5_TRAINING" / "iteration-0000"
-    assert (committed / "POINT_0001.pointdir" / "accepted.txt").is_file()
-    assert not (committed / "POINT_0000.pointdir").exists()
+    with pytest.raises(ValueError, match="point allocation is incomplete"):
+        stg.commit_initial_training_set(campaign)
 
 
 def test_initial_aimall_reader_migrates_legacy_gaussian_alias(tmp_path):
@@ -368,23 +503,18 @@ def test_initial_aimall_reader_migrates_legacy_gaussian_alias(tmp_path):
     assert json.loads(migrated.read_text(encoding="utf-8")) == legacy
 
 
-def test_commit_initial_training_set_journals_missing_bootstrap_handoff(tmp_path):
+def test_commit_initial_training_set_rejects_missing_point_allocation(tmp_path):
     campaign = tmp_path / "campaign"
     v_train = TrainingSetVersioning(campaign / "5_TRAINING")
     staging = v_train.stage(source_version=None, target_version=0)
     (staging / "POINT_0000.pointdir").mkdir()
     v_train.commit(0)
 
-    assert stg.commit_initial_training_set(campaign) is False
-
-    events = _read_journal_events(campaign)
-    assert any(
-        e.get("event") == "initial_training_existing_without_bootstrap_handoff"
-        for e in events
-    )
+    with pytest.raises(FileNotFoundError, match="point-allocation manifest missing"):
+        stg.commit_initial_training_set(campaign)
 
 
-def test_live_append_requires_aimall_acceptance_manifest(tmp_path):
+def test_live_append_requires_complete_point_allocation(tmp_path):
     ex = _make_executor(tmp_path)
     v = TrainingSetVersioning(ex.campaign_dir / "5_TRAINING")
     staging = v.stage(source_version=None, target_version=0)
@@ -393,9 +523,15 @@ def test_live_append_requires_aimall_acceptance_manifest(tmp_path):
     v.update_current(0)
     live_staging = stg.bucket_dir(ex.campaign_dir, "APPEND", 0)
     (live_staging / "POINT_0000.pointdir").mkdir(parents=True)
+    _seed_point_allocation(
+        ex.campaign_dir,
+        live_staging,
+        context="active",
+        iteration=0,
+    )
     state = SimpleNamespace(iteration=0, campaign_uid="uid", training_set_version=0)
 
-    with pytest.raises(BackendSubmissionError, match="acceptance manifest"):
+    with pytest.raises(BackendSubmissionError, match="complete point allocation"):
         ex._inline_append(state)
 
 
@@ -420,6 +556,12 @@ def test_live_append_commits_global_pointdir_names_from_manifest(tmp_path):
         iteration=0,
         accepted=[new_point],
         rejected=[],
+    )
+    _complete_point_allocation(
+        ex.campaign_dir,
+        live_staging,
+        context="active",
+        iteration=0,
     )
     state = SimpleNamespace(iteration=0, campaign_uid="uid", training_set_version=0)
 
@@ -727,6 +869,12 @@ def test_initial_ferebus_also_commits_training_set_version_zero(tmp_path):
         accepted=[dst_pdir],
         rejected=[],
     )
+    _complete_point_allocation(
+        ex.campaign_dir,
+        initial_staging,
+        context="bootstrap",
+        iteration=0,
+    )
 
     state = SimpleNamespace(iteration=0, campaign_uid="m16-test")
     result = ex._parse_ferebus_postprocess(
@@ -849,6 +997,21 @@ def _seed_ariadne_pool(campaign_dir, iteration, *, n_seeds=3):
             payload["seed_index"] = int(i)
             payload["seed_frame_id"] = int(i)
             payload["trajectory_sha256"] = trajectory_sha256
+            payload.setdefault("task_success", True)
+            payload.setdefault(
+                "landing_safety",
+                {
+                    "accepted": True,
+                    "policy": "raw_final",
+                    "selected_origin": "raw_final",
+                    "reasons": [],
+                    "record_only_reasons": [],
+                    "metrics": {
+                        "max_displacement_ang": 0.02,
+                        "min_pair_distance_ang": 0.90,
+                    },
+                },
+            )
             (target / "result.json").write_text(
                 json.dumps(payload, indent=2),
                 encoding="utf-8",
@@ -1074,8 +1237,16 @@ def test_ariadne_parser_rejects_explicit_unsuccessful_task(tmp_path):
     manifest = json.loads((iter_dir / "ARIADNE_RESULTS.json").read_text(encoding="utf-8"))
     assert manifest["n_accepted"] == 0
     assert manifest["n_rejected"] == 1
-    assert manifest["rejected"][0]["reason"] == "runner_failed_after_result_write"
-    assert manifest["rejected"][0]["task_success"] is False
+    assert manifest["rejected"][0]["reason"] == (
+        "ariadne_unusable:runner_failed_after_result_write"
+    )
+    audit = json.loads(
+        (iter_dir / "ARIADNE_LANDING_AUDIT.json").read_text(encoding="utf-8")
+    )
+    assert audit["seeds"][0]["handoff_accepted"] is False
+    assert audit["seeds"][0]["handoff_rejection_reason"] == (
+        "ariadne_unusable:runner_failed_after_result_write"
+    )
 
 
 def test_ariadne_parser_missing_pool_dir(tmp_path):
@@ -1282,7 +1453,7 @@ def test_partial_array_recovery_postprocess_only_journal_payload_is_safe(
     assert postprocess_ready[-1]["n_retry"] == 0
 
 
-def test_ariadne_submit_cleans_stale_results_before_sbatch(tmp_path):
+def test_ariadne_submit_reuses_complete_existing_results(tmp_path):
     from ichor.hpc.active_learning.versioning.provenance import (
         PROVENANCE_FILENAME,
         read_provenance,
@@ -1305,17 +1476,22 @@ def test_ariadne_submit_cleans_stale_results_before_sbatch(tmp_path):
         CampaignPhase("ARIADNE_ARRAY"),
     )
 
-    assert result.submitted_job_id == "12345"
-    assert runner.calls
-    assert not stale_result.exists()
+    assert result.is_complete is True
+    assert result.submitted_job_id is None
+    assert not runner.calls
+    assert stale_result.is_file()
     prov_path = pool / "seed_0000" / PROVENANCE_FILENAME
     assert prov_path.is_file()
     prov = read_provenance(pool / "seed_0000")
     assert prov["seed"]["frame_id"] == 0
     events = _read_journal_events(tmp_path / "campaign")
-    cleaned = [e for e in events if e.get("event") == "ariadne_stale_outputs_cleaned"]
-    assert cleaned
-    assert cleaned[-1]["removed"] >= 1
+    reused = [
+        event
+        for event in events
+        if event.get("event") == "partial_array_recovery_postprocess_only"
+    ]
+    assert reused
+    assert reused[-1]["phase"] == "ARIADNE_ARRAY"
 
 
 def test_ariadne_submit_rejects_invalid_existing_seed_provenance(tmp_path):
@@ -1367,6 +1543,39 @@ def _seed_phase_a_sample(campaign_dir, *, n_frames=2):
     dst.write_bytes(src.read_bytes())
     index = target / ("initial-INDEX-" + str(n_frames) + ".dat")
     index.write_text("\n".join(str(i) for i in range(n_frames)) + "\n", encoding="utf-8")
+    allocation_path = point_allocation_path(
+        campaign_dir,
+        context="bootstrap",
+        iteration=0,
+    )
+    allocation = create_point_allocation(
+        allocation_path,
+        campaign_uid="m16-test",
+        context="bootstrap",
+        iteration=0,
+        targets={
+            "train": int(n_frames),
+            "int_val": 0,
+            "ext_val": 0,
+            "total": int(n_frames),
+        },
+        primary_candidates=[
+            {
+                "candidate_id": "phase-a-candidate-" + str(i),
+                "frame_id": int(i),
+            }
+            for i in range(int(n_frames))
+        ],
+        reserve_candidates=[],
+    )
+    primary = [
+        {
+            **slot["attempts"][0],
+            "slot_id": int(slot["slot_id"]),
+            "split": str(slot["split"]),
+        }
+        for slot in allocation["slots"]
+    ]
     write_phase_a_sample_manifest(target, {
         "phase": "PHASE_A_POLUS",
         "iteration": -1,
@@ -1377,7 +1586,14 @@ def _seed_phase_a_sample(campaign_dir, *, n_frames=2):
         "selected_indices": [int(i) for i in range(n_frames)],
         "descriptor": "rmsd_massweight",
         "n_pool_frames": int(n_frames),
-        "bootstrap_initial_labelled_size": int(n_frames),
+        "bootstrap_total_size": int(n_frames),
+        "point_allocation": {
+            "manifest": str(allocation_path.resolve()),
+            "targets": dict(allocation["targets"]),
+            "primary": primary,
+            "reserve_frame_ids": [],
+            "reserve_count": 0,
+        },
         "reserve_after_bootstrap": 0,
         "trajectory_sha256": "0" * 64,
         "source_pool_manifest": "",
@@ -1405,6 +1621,7 @@ def _write_phase_b_manifest(iter_dir, *, n_final=1, write_sample=True):
     )
     from ichor.hpc.active_learning.versioning.provenance import (
         PROVENANCE_FILENAME,
+        enrich_with_point_allocation,
         write_seed_provenance,
     )
 
@@ -1453,6 +1670,7 @@ def _write_phase_b_manifest(iter_dir, *, n_final=1, write_sample=True):
             mode_weighting_policy="variance",
         )
         records.append({
+            "candidate_id": "phase-b-candidate-" + str(i),
             "seed_index": int(i),
             "seed_dir": str(seed_dir.resolve()),
             "result_json": str(result_path.resolve()),
@@ -1475,6 +1693,47 @@ def _write_phase_b_manifest(iter_dir, *, n_final=1, write_sample=True):
             "H " + " ".join(str(x) for x in coords[1]),
             "H " + " ".join(str(x) for x in coords[2]),
         ])
+    iteration = int(iter_dir.name.split("-")[-1])
+    campaign = iter_dir.parent.parent
+    allocation_path = point_allocation_path(
+        campaign,
+        context="active",
+        iteration=iteration,
+    )
+    allocation = create_point_allocation(
+        allocation_path,
+        campaign_uid="m16-test",
+        context="active",
+        iteration=iteration,
+        targets={
+            "train": int(n_final),
+            "int_val": 0,
+            "ext_val": 0,
+            "total": int(n_final),
+        },
+        primary_candidates=[
+            {
+                "candidate_id": str(record["candidate_id"]),
+                "seed_index": int(record["seed_index"]),
+                "frame_id": int(record["seed_frame_id"]),
+            }
+            for record in records
+        ],
+        reserve_candidates=[],
+    )
+    slot_by_candidate = {
+        str(slot["attempts"][0]["candidate_id"]): slot
+        for slot in allocation["slots"]
+    }
+    for record in records:
+        slot = slot_by_candidate[str(record["candidate_id"])]
+        enrich_with_point_allocation(
+            Path(record["seed_dir"]),
+            candidate_id=str(record["candidate_id"]),
+            context="active",
+            slot_id=int(slot["slot_id"]),
+            split=str(slot["split"]),
+        )
     if write_sample:
         (iter_dir / "phase_b_SAMPLE.xyz").write_text(
             "\n".join(xyz_lines) + "\n",
@@ -1486,6 +1745,12 @@ def _write_phase_b_manifest(iter_dir, *, n_final=1, write_sample=True):
         "iteration": int(iter_dir.name.split("-")[-1]),
         "descriptor": "hybrid_alf_rmsd",
         "source_ariadne_manifest": "",
+        "point_allocation": {
+            "manifest": str(allocation_path.resolve()),
+            "targets": dict(allocation["targets"]),
+            "reserve": [],
+            "reserve_count": 0,
+        },
         "n_candidates": int(n_final),
         "n_selected_raw": int(n_final),
         "n_kept": int(n_final),
@@ -1569,6 +1834,9 @@ def test_polus_phase_a_manifest_count_mismatch_fails(tmp_path):
     outdir = _seed_phase_a_sample(tmp_path / "campaign", n_frames=2)
     sample = outdir / "initial-SAMPLE-2.xyz"
     index = outdir / "initial-INDEX-2.dat"
+    existing = json.loads((outdir / "PHASE_A_SAMPLE.json").read_text(encoding="utf-8"))
+    allocation = dict(existing["point_allocation"])
+    allocation["primary"] = list(allocation["primary"][:1])
     write_phase_a_sample_manifest(outdir, {
         "phase": "PHASE_A_POLUS",
         "iteration": -1,
@@ -1578,6 +1846,7 @@ def test_polus_phase_a_manifest_count_mismatch_fails(tmp_path):
         "n_frames": 1,
         "selected_indices": [0],
         "descriptor": "rmsd_massweight",
+        "point_allocation": allocation,
     })
     state = SimpleNamespace(iteration=0, campaign_uid="m16-test")
     result = ex._parse_polus_postprocess(

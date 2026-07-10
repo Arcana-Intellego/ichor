@@ -610,6 +610,8 @@ def clean_stale_ariadne_seed_outputs(
 LIVE_POSTPROCESS_IMPLEMENTED: frozenset = frozenset({
     "INITIAL_GAUSSIAN", "GAUSSIAN",
     "INITIAL_AIMALL", "AIMALL",
+    "INITIAL_REPLACEMENT_GAUSSIAN", "REPLACEMENT_GAUSSIAN",
+    "INITIAL_REPLACEMENT_AIMALL", "REPLACEMENT_AIMALL",
     "INITIAL_FEREBUS", "FEREBUS",
     "ARIADNE_ARRAY",
     "PHASE_A_POLUS", "PHASE_B_POLUS",
@@ -1034,8 +1036,30 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
     # --- SBATCH submission ---------------------------------------------
 
-    def _locate_sample_xyz(self, phase_name, iteration):
+    def _locate_sample_xyz(self, phase_name, iteration, replacement_round=0):
         camp = Path(self.campaign_dir)
+        if phase_name in {
+            "INITIAL_REPLACEMENT_GAUSSIAN",
+            "REPLACEMENT_GAUSSIAN",
+        }:
+            from ..replacement_sampling import (
+                read_replacement_sample,
+                replacement_round_dir,
+            )
+
+            context = (
+                "bootstrap"
+                if phase_name == "INITIAL_REPLACEMENT_GAUSSIAN"
+                else "active"
+            )
+            round_dir = replacement_round_dir(
+                camp,
+                context=context,
+                iteration=0 if context == "bootstrap" else int(iteration),
+                replacement_round=int(replacement_round),
+            )
+            manifest = read_replacement_sample(round_dir)
+            return Path(str(manifest["sample_xyz"]))
         if phase_name == "INITIAL_GAUSSIAN":
             from ..handoff_manifests import read_phase_a_sample_manifest
 
@@ -1275,8 +1299,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 **feasibility.to_dict(),
             )
             return None
-        if phase_name in ("INITIAL_GAUSSIAN", "GAUSSIAN"):
-            sample = self._locate_sample_xyz(phase_name, it)
+        if "GAUSSIAN" in phase_name:
+            sample = self._locate_sample_xyz(
+                phase_name,
+                it,
+                replacement_round=int(getattr(state, "replacement_round", 0)),
+            )
             if sample is None:
                 raise BackendSubmissionError(
                     "no POLUS sample to stage for " + phase_name
@@ -1290,13 +1318,34 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 partition_override=effective_partition,
             )
             return n
-        if phase_name in ("INITIAL_AIMALL", "AIMALL"):
+        if "AIMALL" in phase_name:
+            is_replacement = "REPLACEMENT" in phase_name
+            if is_replacement:
+                from ..replacement_sampling import replacement_round_dir
+
+                context = "bootstrap" if phase_name.startswith("INITIAL_") else "active"
+                staging_override = replacement_round_dir(
+                    camp,
+                    context=context,
+                    iteration=0 if context == "bootstrap" else it,
+                    replacement_round=int(getattr(state, "replacement_round", 0)),
+                )
+                expected_gaussian_phase = (
+                    "INITIAL_REPLACEMENT_GAUSSIAN"
+                    if context == "bootstrap"
+                    else "REPLACEMENT_GAUSSIAN"
+                )
+            else:
+                staging_override = None
+                expected_gaussian_phase = None
             _, n = _stg.stage_aimall_inputs(
                 camp,
                 self.config,
                 phase_name,
                 it,
                 partition_override=effective_partition,
+                staging_override=staging_override,
+                expected_gaussian_phase=expected_gaussian_phase,
             )
             return n
         if phase_name == "ARIADNE_ARRAY":
@@ -1471,6 +1520,54 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             state_updates=state_updates,
         )
 
+    def _complete_empty_aimall_phase(self, state, phase_name: str) -> PhaseResult:
+        """Complete an AIMAll handoff when Gaussian accepted no candidates."""
+        from . import input_staging as _stg
+
+        staging = self._quantum_staging_path(state, phase_name)
+        _stg.write_quantum_acceptance_manifest(
+            staging,
+            phase_name=phase_name,
+            iteration=int(state.iteration),
+            accepted=[],
+            rejected=[],
+        )
+        context = "bootstrap" if phase_name.startswith("INITIAL_") else "active"
+        gaussian_phase = (
+            "INITIAL_REPLACEMENT_GAUSSIAN"
+            if phase_name == "INITIAL_REPLACEMENT_AIMALL"
+            else "REPLACEMENT_GAUSSIAN"
+            if phase_name == "REPLACEMENT_AIMALL"
+            else "INITIAL_GAUSSIAN"
+            if phase_name == "INITIAL_AIMALL"
+            else "GAUSSIAN"
+        )
+        allocation = _stg.record_allocation_quantum_results(
+            self.campaign_dir,
+            context=context,
+            iteration=0 if context == "bootstrap" else int(state.iteration),
+            staging_dir=staging,
+            gaussian_phase=gaussian_phase,
+            aimall_phase=phase_name,
+        )
+        self._journal_event(
+            "aimall_skipped_no_gaussian_acceptances",
+            phase=phase_name,
+            iteration=int(state.iteration),
+            allocation_summary=dict(allocation.get("summary") or {}),
+        )
+        override = (
+            "INITIAL_ALLOCATION_CHECK"
+            if phase_name == "INITIAL_REPLACEMENT_AIMALL"
+            else "ALLOCATION_CHECK"
+            if phase_name == "REPLACEMENT_AIMALL"
+            else None
+        )
+        return PhaseResult(
+            is_complete=True,
+            next_phase_override=override,
+        )
+
     def _seed_selection_posterior(self, state, training_atoms):
         """Live seed selection ranks the exploit half by the real GP posterior
         variance, so the most uncertain pool frames get attacked."""
@@ -1538,18 +1635,19 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         return super()._inline_seed_select(state)
 
     def _inline_append(self, state):
-        """Live APPEND: commit the validated quantum outputs staged at
-        .DATA/STAGING/iter_<N>/POINT_* into the training set -- the real
-        Gaussian/AIMAll results -- instead of the ARIADNE pool seeds the
-        dry-run path commits. Live mode requires the AIMAll acceptance
-        manifest; missing live staging is a halt-worthy contract failure.
+        """Commit the exact accepted active allocation into the training set.
+
+        The completed pre-QM point-allocation manifest is authoritative.  Its
+        accepted attempts identify the validated Gaussian/AIMAll pointdirs in
+        ``.DATA/STAGING/iter_<N>`` and preserve each point's intended split.
+        Missing or incomplete allocation evidence is a halt-worthy contract
+        failure.
 
         Re-commit is idempotent (a crash-retry after commit returns the
         existing version). The committed points carry whatever provenance the
-        staging tree holds. APPEND commits every validated point into the one
-        cumulative training set; the train / internal-val / external-val split
-        is done later, per atom, at FEREBUS staging -- not here. (FEREBUS reads
-        the pre-split csvs; it does not split internally.)
+        staging tree holds. FEREBUS projects the preserved allocation labels
+        consistently across every atom and property; it does not resplit the
+        committed geometries.
         """
         from . import input_staging as _stg
 
@@ -1565,6 +1663,20 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     + " committed_versions="
                     + repr(committed)
                 )
+            try:
+                _stg.verify_committed_allocation_snapshot(
+                    self.campaign_dir,
+                    training_version=int(committed_max),
+                    context="active",
+                    iteration=int(state.iteration),
+                )
+            except Exception as exc:
+                raise BackendSubmissionError(
+                    "idempotent APPEND allocation verification failed: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)
+                ) from exc
             v.ensure_current(committed_max)
             self._journal_event(
                 "training_set_committed",
@@ -1584,17 +1696,15 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         if committed:
             v.ensure_current(committed_max)
 
-        staging_root = _stg.bucket_dir(self.campaign_dir, "APPEND", int(state.iteration))
         try:
-            point_dirs, _manifest = _stg.read_quantum_acceptance_manifest(
-                staging_root,
-                expected_phase="AIMALL",
-                expected_iteration=int(state.iteration),
-                require_points_file_membership=True,
+            point_dirs, allocation = _stg.accepted_allocation_pointdirs(
+                self.campaign_dir,
+                context="active",
+                iteration=int(state.iteration),
             )
         except Exception as exc:
             raise BackendSubmissionError(
-                "live APPEND requires valid AIMAll acceptance manifest: "
+                "live APPEND requires a complete point allocation: "
                 + type(exc).__name__ + ": " + str(exc)
             ) from exc
 
@@ -1613,6 +1723,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             _stg._copytree_no_symlinks(pd, dest)
             committed_names.append(dest.name)
             next_point_index += 1
+        atomic_write_json(staging / "POINT_ALLOCATION.json", allocation)
+        atomic_write_json(
+            staging
+            / ("POINT_ALLOCATION.version-" + str(next_version).zfill(4) + ".json"),
+            allocation,
+        )
 
         v.commit(next_version)
         v.update_current(next_version)
@@ -1632,7 +1748,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             iteration=int(state.iteration),
             training_set_version=int(next_version),
             n_committed_points=len(committed_names),
-            expected_final_batch_size=int(self.config.active_batch.final_batch_size),
+            expected_batch_total=int(self.config.point_allocation.batch_total_size),
             source="live_quantum_staging",
         )
         return {"training_set_version": int(next_version)}
@@ -1659,6 +1775,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         try:
             array_size = self._array_size_after_staging(phase_name, state)
             if array_size is not None and array_size <= 0:
+                if "AIMALL" in phase_name:
+                    return self._complete_empty_aimall_phase(state, phase_name)
                 raise BackendSubmissionError(
                     "nothing to submit for " + phase_name + ": staged 0 points/seeds"
                 )
@@ -1797,6 +1915,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             walltime_hours=self.walltime_hours,
             partition=self.partition,
             campaign_uid=getattr(state, "campaign_uid", None),
+            replacement_round=int(getattr(state, "replacement_round", 0)),
             resolved_resources=resolved,
         )
         path.write_text(body, encoding="utf-8")
@@ -1909,6 +2028,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             "GAUSSIAN":         self._parse_quantum_postprocess,
             "INITIAL_AIMALL":   self._parse_quantum_postprocess,
             "AIMALL":           self._parse_quantum_postprocess,
+            "INITIAL_REPLACEMENT_GAUSSIAN": self._parse_quantum_postprocess,
+            "REPLACEMENT_GAUSSIAN": self._parse_quantum_postprocess,
+            "INITIAL_REPLACEMENT_AIMALL": self._parse_quantum_postprocess,
+            "REPLACEMENT_AIMALL": self._parse_quantum_postprocess,
             "INITIAL_FEREBUS":  self._parse_ferebus_postprocess,
             "FEREBUS":          self._parse_ferebus_postprocess,
             "ARIADNE_ARRAY":    self._parse_ariadne_array_postprocess,
@@ -1925,6 +2048,16 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         GAUSSIAN / AIMALL share ".DATA/STAGING/iter_<N>/" (per-iteration).
         """
         from pathlib import Path as _Path
+        if "REPLACEMENT" in str(phase_name):
+            from ..replacement_sampling import replacement_round_dir
+
+            context = "bootstrap" if str(phase_name).startswith("INITIAL_") else "active"
+            return replacement_round_dir(
+                self.campaign_dir,
+                context=context,
+                iteration=0 if context == "bootstrap" else int(state.iteration),
+                replacement_round=int(getattr(state, "replacement_round", 0)),
+            )
         initial = phase_name.startswith("INITIAL_")
         subdir = "initial" if initial else ("iter_" + str(int(state.iteration)))
         return _Path(self.campaign_dir) / ".DATA" / "STAGING" / subdir
@@ -1947,13 +2080,14 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         applies the per-phase validator(s) to each POINT_*.pointdir/, and:
           - journals quantum_output_rejected per rejected pointdir.
           - journals phase_succeeded_live on overall success.
-          - returns PhaseResult with failure_reason set when rejection
-            rate exceeds config.failure_threshold_fraction (or when no
-            pointdirs are found at all).
+          - records the combined Gaussian/AIMAll outcome in the exact point
+            allocation after AIMAll.
 
         Does NOT commit anything to 5_TRAINING / 6_TRAINED_MODELS itself --
         that lives in the subsequent INITIAL_FEREBUS / APPEND / FEREBUS
-        phases. This parser is a pure validator + observability/report hook.
+        phases. Rejection counts are allocation-managed: failed slots proceed
+        to bounded reserve replacement instead of tripping a batch-level
+        percentage threshold here.
         """
         from .phase_executor import PhaseResult
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
@@ -1976,7 +2110,15 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 write_quantum_quality_manifest,
             )
 
-            expected_phase = "INITIAL_GAUSSIAN" if phase_name.startswith("INITIAL_") else "GAUSSIAN"
+            expected_phase = (
+                "INITIAL_REPLACEMENT_GAUSSIAN"
+                if phase_name == "INITIAL_REPLACEMENT_AIMALL"
+                else "REPLACEMENT_GAUSSIAN"
+                if phase_name == "REPLACEMENT_AIMALL"
+                else "INITIAL_GAUSSIAN"
+                if phase_name.startswith("INITIAL_")
+                else "GAUSSIAN"
+            )
             try:
                 gaussian_accepted, _gaussian_manifest = _stg.read_quantum_acceptance_manifest(
                     staging_root,
@@ -2052,7 +2194,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 n_total=int(len(quality_records)),
                 n_rejected=int(sum(1 for r in quality_records if not bool(r.get("accepted")))),
             )
-            if phase_name == "AIMALL":
+            if phase_name in ("AIMALL", "REPLACEMENT_AIMALL"):
                 try:
                     from .error_calibration import (
                         ERROR_CALIBRATION_AUDIT_FILENAME,
@@ -2135,6 +2277,45 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             rejected=rejected,
         )
 
+        allocation_payload = None
+        if "AIMALL" in phase_name:
+            context = "bootstrap" if phase_name.startswith("INITIAL_") else "active"
+            gaussian_phase = (
+                "INITIAL_REPLACEMENT_GAUSSIAN"
+                if phase_name == "INITIAL_REPLACEMENT_AIMALL"
+                else "REPLACEMENT_GAUSSIAN"
+                if phase_name == "REPLACEMENT_AIMALL"
+                else "INITIAL_GAUSSIAN"
+                if phase_name == "INITIAL_AIMALL"
+                else "GAUSSIAN"
+            )
+            try:
+                allocation_payload = _stg.record_allocation_quantum_results(
+                    self.campaign_dir,
+                    context=context,
+                    iteration=0 if context == "bootstrap" else int(state.iteration),
+                    staging_dir=staging_root,
+                    gaussian_phase=gaussian_phase,
+                    aimall_phase=phase_name,
+                )
+            except Exception as exc:
+                return PhaseResult(
+                    is_complete=True,
+                    failure_reason=(
+                        "point_allocation_quantum_join_failed: "
+                        + type(exc).__name__
+                        + ": "
+                        + str(exc)[:180]
+                    ),
+                )
+            self._journal_event(
+                "point_allocation_quantum_recorded",
+                phase=phase_name,
+                context=context,
+                iteration=int(state.iteration),
+                summary=dict(allocation_payload.get("summary") or {}),
+            )
+
         for pdir_name, reason in rejected:
             self._journal_event(
                 "quantum_quality_rejected" if "quality" in str(reason) or "iqa_" in str(reason) or "integration_" in str(reason) else "quantum_output_rejected",
@@ -2144,46 +2325,38 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 reason=reason,
             )
 
-        n_total = len(kept) + len(rejected)
-        if n_total == 0:
+        if "AIMALL" in phase_name:
+            override = (
+                "INITIAL_ALLOCATION_CHECK"
+                if phase_name == "INITIAL_REPLACEMENT_AIMALL"
+                else "ALLOCATION_CHECK"
+                if phase_name == "REPLACEMENT_AIMALL"
+                else None
+            )
+            self._journal_event(
+                "phase_succeeded_live",
+                phase=phase_name,
+                iteration=int(state.iteration),
+                n_kept=int(len(kept)),
+                n_rejected=int(len(rejected)),
+                allocation_managed=True,
+            )
             return PhaseResult(
                 is_complete=True,
-                failure_reason=(
-                    "no_pointdirs_in_staging: " + str(staging_root)
-                ),
+                state_updates={},
+                next_phase_override=override,
             )
-        if len(kept) == 0:
-            return PhaseResult(
-                is_complete=True,
-                failure_reason=(
-                    "no_quantum_outputs_accepted: "
-                    + str(len(rejected))
-                    + "/"
-                    + str(n_total)
-                ),
+        if "GAUSSIAN" in phase_name:
+            self._journal_event(
+                "phase_succeeded_live",
+                phase=phase_name,
+                iteration=int(state.iteration),
+                n_kept=int(len(kept)),
+                n_rejected=int(len(rejected)),
+                allocation_managed=True,
             )
-
-        rejection_rate = len(rejected) / float(n_total)
-        threshold = float(self.config.runtime.failure_threshold_fraction)
-        if rejection_rate > threshold:
-            return PhaseResult(
-                is_complete=True,
-                failure_reason=(
-                    "too_many_rejected: " + str(len(rejected))
-                    + "/" + str(n_total)
-                    + " (rate=" + format(rejection_rate, ".2f")
-                    + " > threshold=" + format(threshold, ".2f") + ")"
-                ),
-            )
-
-        self._journal_event(
-            "phase_succeeded_live",
-            phase=phase_name,
-            iteration=int(state.iteration),
-            n_kept=int(len(kept)),
-            n_rejected=int(len(rejected)),
-        )
-        return PhaseResult(is_complete=True, state_updates={})
+            return PhaseResult(is_complete=True, state_updates={})
+        raise AssertionError("unhandled quantum phase: " + phase_name)
 
     # ---helpers ---------------------------------------------
 
@@ -3596,6 +3769,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     selected_after_fps=True,
                     diversity_rank=int(rec["final_index"]),
                     descriptor_used=str(phase_b_manifest.get("descriptor", self.config.phase_b.descriptor)),
+                    candidate_id=str(rec.get("candidate_id") or ""),
+                    reserve_candidate=False,
                 )
 
         # if the Phase-B dedup ran, surface its counts in the journal.
@@ -4023,6 +4198,7 @@ def build_sbatch_script(
     walltime_hours: Optional[float] = None,
     partition: Optional[str] = None,
     campaign_uid: Optional[str] = None,
+    replacement_round: int = 0,
     resolved_resources: Optional[ResolvedPhaseResources] = None,
 ) -> str:
     """Return the body of an sbatch script for the given phase.
@@ -4053,7 +4229,7 @@ def build_sbatch_script(
     cpus = int(resolved.cpus_per_task)
     ntasks = int(resolved.ntasks)
     mem_per_cpu = str(resolved.mem_per_cpu)
-    if phase_name in ("INITIAL_GAUSSIAN", "GAUSSIAN"):
+    if "GAUSSIAN" in phase_name:
         validate_gaussian_link0_memory(config, resolved)
     camp = str(Path(campaign_dir).resolve())
     try:
@@ -4118,9 +4294,19 @@ def build_sbatch_script(
         "",
     ]
     bucket = "initial" if phase_name.startswith("INITIAL_") else ("iter_" + str(iteration))
-    points_file = camp + "/.DATA/STAGING/" + bucket + "/POINTS.txt"
+    if "REPLACEMENT" in phase_name:
+        points_file = (
+            camp
+            + "/.DATA/STAGING/"
+            + bucket
+            + "/replacement_round_"
+            + str(int(replacement_round)).zfill(4)
+            + "/POINTS.txt"
+        )
+    else:
+        points_file = camp + "/.DATA/STAGING/" + bucket + "/POINTS.txt"
 
-    if phase_name in ("INITIAL_GAUSSIAN", "GAUSSIAN"):
+    if "GAUSSIAN" in phase_name:
         lines += _gaussian_invocation_block(
             phase_name,
             iteration,
@@ -4131,7 +4317,7 @@ def build_sbatch_script(
             campaign_uid=campaign_uid,
             resolved_resources=resolved,
         )
-    elif phase_name in ("INITIAL_AIMALL", "AIMALL"):
+    elif "AIMALL" in phase_name:
         lines += _aimall_invocation_block(
             iteration,
             camp,

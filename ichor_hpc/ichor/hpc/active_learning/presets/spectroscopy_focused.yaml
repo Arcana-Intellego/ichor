@@ -29,7 +29,7 @@
 # not in the posterior. A future extension to something like TotalEnergyPosterior to
 # include multipole moments would be required for intensity targeting.
 
-schema_version: 6
+schema_version: 9
 
 acquisition:
   subspace:

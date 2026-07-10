@@ -62,9 +62,9 @@ _SLURM_MEM_RE = re.compile(r"^([1-9][0-9]*)([KMGT]?)$", re.IGNORECASE)
 def backend_for_phase(phase_name: str) -> str:
     if phase_name in ("PHASE_A_POLUS", "PHASE_B_POLUS"):
         return "polus"
-    if phase_name in ("INITIAL_GAUSSIAN", "GAUSSIAN"):
+    if "GAUSSIAN" in phase_name:
         return "gaussian"
-    if phase_name in ("INITIAL_AIMALL", "AIMALL"):
+    if "AIMALL" in phase_name:
         return "aimall"
     if phase_name == "ARIADNE_ARRAY":
         return "ariadne"
