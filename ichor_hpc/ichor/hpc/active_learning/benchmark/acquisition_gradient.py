@@ -59,7 +59,9 @@ def _parse_gradient_modes(text: str) -> List[str]:
 
 
 def _load_reference_scales(iter_dir: Path) -> Dict[str, float] | None:
-    path = iter_dir / "reference_scales.json"
+    from ..layout import active_protocol_dir
+
+    path = active_protocol_dir(iter_dir) / "reference_scales.json"
     if not path.is_file():
         return None
     with open(path, "r", encoding="utf-8") as handle:
@@ -82,7 +84,7 @@ def _load_reference_scales(iter_dir: Path) -> Dict[str, float] | None:
     return out
 
 
-def _load_context(campaign_dir: Path, iteration: int, seed_index: int) -> Dict[str, Any]:
+def _load_context(campaign_dir: Path, iteration: int, seed_id: int) -> Dict[str, Any]:
     campaign = campaign_dir.resolve()
     config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
     pool = TrajectoryPool.load(campaign)
@@ -98,20 +100,23 @@ def _load_context(campaign_dir: Path, iteration: int, seed_index: int) -> Dict[s
         int(state.models_version),
         verification="deep",
     )
-    iter_dir = campaign / "7_ACTIVE_LEARNING" / (
-        "iteration-" + str(int(iteration)).zfill(4)
-    )
+    from ..layout import active_iteration_dir
+
+    iter_dir = active_iteration_dir(campaign, int(iteration))
     picked = load_seeds_picked(iter_dir, expected_iteration=int(iteration))
     seed_records = list(picked.get("seed_records") or [])
-    if not 0 <= int(seed_index) < len(seed_records):
+    if not 1 <= int(seed_id) <= len(seed_records):
         raise IndexError(
-            "seed-index "
-            + str(seed_index)
+            "seed-id "
+            + str(seed_id)
             + " out of range of "
             + str(len(seed_records))
             + " picked seeds"
         )
-    frame_id = int(seed_records[int(seed_index)]["frame_id"])
+    record = seed_records[int(seed_id) - 1]
+    if int(record["seed_id"]) != int(seed_id):
+        raise ValueError("seed selection is not ordered by seed_id")
+    frame_id = int(record["frame_id"])
     return {
         "campaign": campaign,
         "config": config,
@@ -189,7 +194,7 @@ def run_benchmark(
     *,
     campaign_dir: Path,
     iteration: int,
-    seed_index: int,
+    seed_id: int,
     gradient_modes: Sequence[str],
     repeat: int,
     gradient_backend: str = "direct",
@@ -197,7 +202,7 @@ def run_benchmark(
     driver_gradient_backend: str | None = None,
     workers: int | None = None,
 ) -> Dict[str, Any]:
-    context = _load_context(campaign_dir, int(iteration), int(seed_index))
+    context = _load_context(campaign_dir, int(iteration), int(seed_id))
     runs: List[Dict[str, Any]] = []
     gradients_by_mode: Dict[str, np.ndarray] = {}
     median_by_mode: Dict[str, float] = {}
@@ -308,7 +313,7 @@ def run_benchmark(
         "schema_version": 1,
         "campaign_dir": str(context["campaign"]),
         "iteration": int(iteration),
-        "seed_index": int(seed_index),
+        "seed_id": int(seed_id),
         "seed_frame_id": int(context["seed_frame_id"]),
         "models_version": int(context["state"].models_version),
         "natoms": int(len(seed_atoms)),
@@ -351,7 +356,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--campaign-dir", required=True, help="Campaign root directory.")
     parser.add_argument("--iteration", required=True, type=int, help="Campaign iteration.")
-    parser.add_argument("--seed-index", required=True, type=int, help="Seed index in seeds_picked.json.")
+    parser.add_argument("--seed-id", required=True, type=int, help="One-based seed ID in seed_selection/SELECTION.json.")
     parser.add_argument(
         "--gradient-mode",
         default="cartesian_fd,active_fd",
@@ -391,7 +396,7 @@ def main(argv=None) -> int:
         payload = run_benchmark(
             campaign_dir=Path(args.campaign_dir),
             iteration=int(args.iteration),
-            seed_index=int(args.seed_index),
+            seed_id=int(args.seed_id),
             gradient_modes=modes,
             repeat=int(args.repeat),
             gradient_backend=str(args.gradient_backend),

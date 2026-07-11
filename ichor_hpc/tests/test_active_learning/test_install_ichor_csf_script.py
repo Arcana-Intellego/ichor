@@ -90,7 +90,7 @@ def test_install_script_is_present():
     assert "/opt/apps/etc/profile.d/modules.sh" in lib_text
     assert "/opt/apps/lmod/lmod/init/bash" in lib_text
     assert '[[ "$(type -t module' in lib_text
-    assert "cannot mutate this script's PATH" in text
+    assert "cannot mutate this script's PATH" in lib_text
     assert "import ssl; print(ssl.OPENSSL_VERSION)" in text
     assert "command -v \"${cmd}\"" in text
     assert "resolve_ariadne_compilers()" in text

@@ -4,7 +4,6 @@ import pytest
 
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.daemon.error_calibration import (
-    ERROR_CALIBRATION_AUDIT_FILENAME,
     append_records,
     build_calibration_model,
     load_calibration_model_for_acquisition,
@@ -31,7 +30,8 @@ def _record(i, *, atom_type="C", raw=None, err=None):
         "iteration": 1,
         "model_version": 0,
         "pointdir": "POINT_" + str(i).zfill(4) + ".pointdir",
-        "seed_index": i,
+        "seed_id": i + 1,
+        "seed_uid": format(i + 1, "064x"),
         "atom": "C1",
         "atom_type": atom_type,
         "property": "iqa",
@@ -54,7 +54,8 @@ def _atom_record(point, atom, *, model_version=0, raw_atom=1.0, raw_total=10.0, 
         "iteration": 1,
         "model_version": int(model_version),
         "pointdir": "POINT_" + str(point).zfill(4) + ".pointdir",
-        "seed_index": int(point),
+        "seed_id": int(point) + 1,
+        "seed_uid": format(int(point) + 1, "064x"),
         "atom": atom,
         "atom_type": atom[0],
         "property": "iqa",
@@ -318,16 +319,21 @@ def test_malformed_calibration_model_is_quarantined_before_acquisition(tmp_path)
 
 
 def test_update_from_aimall_acceptance_joins_provenance_and_quality(tmp_path):
+    from ichor.hpc.active_learning.layout import active_iteration_dir
+
     campaign = tmp_path
-    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0001"
+    iter_dir = active_iteration_dir(campaign, 1)
     pointdir = campaign / ".DATA" / "STAGING" / "iter_1" / "POINT_0000.pointdir"
     pointdir.mkdir(parents=True)
     write_seed_provenance(
         pointdir,
         campaign_uid="uid",
         iteration=1,
-        trajectory_sha256="sha",
+        trajectory_sha256="a" * 64,
         seed_frame_id=5,
+        seed_id=3,
+        seed_uid="c" * 64,
+        array_task_id_zero_based=2,
         seed_selection_origin="variance",
         seed_variance_at_selection=2.0,
         subspace_neighbour_frame_ids=[],
@@ -340,8 +346,15 @@ def test_update_from_aimall_acceptance_joins_provenance_and_quality(tmp_path):
             "schema_version": 1,
             "property": "iqa",
             "model_version": 0,
-            "seed_index": 3,
-            "result_json": str(iter_dir / "pool" / "seed_0003" / "result.json"),
+            "seed_id": 3,
+            "seed_uid": "c" * 64,
+            "result_json": str(
+                iter_dir
+                / "ariadne"
+                / "seeds"
+                / "seed-000003"
+                / "result.json"
+            ),
             "total_energy_variance": 2.0,
             "raw_total_score": 1.5,
             "landing_policy": "raw_final",
@@ -380,6 +393,10 @@ def test_update_from_aimall_acceptance_joins_provenance_and_quality(tmp_path):
     records = load_records(campaign)
     assert records[0]["abs_error_ha"] == 0.125
     assert records[0]["raw_uncertainty"] == 2.0
-    assert (iter_dir / ERROR_CALIBRATION_AUDIT_FILENAME).is_file()
-    audit_payload = json.loads((iter_dir / ERROR_CALIBRATION_AUDIT_FILENAME).read_text())
+    assert records[0]["seed_id"] == 3
+    assert records[0]["seed_uid"] == "c" * 64
+    from ichor.hpc.active_learning.daemon.error_calibration import audit_path
+
+    assert audit_path(iter_dir).is_file()
+    audit_payload = json.loads(audit_path(iter_dir).read_text())
     assert audit_payload["n_total_records"] == 1

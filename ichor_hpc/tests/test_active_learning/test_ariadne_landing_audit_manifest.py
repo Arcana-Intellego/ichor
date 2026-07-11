@@ -11,9 +11,9 @@ from ichor.hpc.active_learning.handoff_manifests import (
 
 
 def test_ariadne_landing_audit_roundtrip(tmp_path):
-    iter_dir = tmp_path / "iteration-0000"
+    iter_dir = tmp_path / "iteration-000001"
     payload = {
-        "iteration": 0,
+        "iteration": 1,
         "summary": {
             "accepted": 1,
             "salvaged": 0,
@@ -23,8 +23,9 @@ def test_ariadne_landing_audit_roundtrip(tmp_path):
             "policies": {"raw_final": 1},
         },
         "seeds": [{
-            "seed_index": 0,
-            "seed_dir": str((iter_dir / "pool" / "seed_0000").resolve()),
+            "seed_id": 1,
+            "seed_uid": "seed-uid-1",
+            "seed_dir": "seeds/seed-000001",
             "landing_safety": {
                 "accepted": True,
                 "policy": "raw_final",
@@ -34,31 +35,32 @@ def test_ariadne_landing_audit_roundtrip(tmp_path):
         }],
     }
     path = write_ariadne_landing_audit(iter_dir, payload)
-    assert path.name == "ARIADNE_LANDING_AUDIT.json"
-    loaded = read_ariadne_landing_audit(iter_dir, expected_iteration=0)
-    assert loaded["schema_version"] == 1
+    assert path.name == "AUDIT.json"
+    loaded = read_ariadne_landing_audit(iter_dir, expected_iteration=1)
+    assert loaded["schema_version"] == 2
     assert loaded["summary"]["accepted"] == 1
-    assert loaded["seeds"][0]["seed_index"] == 0
+    assert loaded["seeds"][0]["seed_id"] == 1
 
 
-def test_ariadne_landing_audit_rejects_duplicate_seed_index(tmp_path):
-    iter_dir = tmp_path / "iteration-0000"
+def test_ariadne_landing_audit_rejects_duplicate_seed_id(tmp_path):
+    iter_dir = tmp_path / "iteration-000001"
     write_ariadne_landing_audit(iter_dir, {
-        "iteration": 0,
+        "iteration": 1,
         "summary": {},
-        "seeds": [{"seed_index": 0}, {"seed_index": 0}],
+        "seeds": [{"seed_id": 1}, {"seed_id": 1}],
     })
     with pytest.raises(HandoffManifestError, match="duplicate"):
-        read_ariadne_landing_audit(iter_dir, expected_iteration=0)
+        read_ariadne_landing_audit(iter_dir, expected_iteration=1)
 
 
 def test_acquisition_maturity_audit_roundtrip(tmp_path):
-    iter_dir = tmp_path / "iteration-0000"
+    iter_dir = tmp_path / "iteration-000001"
     payload = acquisition_maturity_audit_payload(
-        iteration=0,
+        iteration=1,
         seed_records=[{
-            "seed_index": 0,
-            "result_json": str((iter_dir / "pool" / "seed_0000" / "result.json").resolve()),
+            "seed_id": 1,
+            "seed_uid": "seed-uid-1",
+            "result_json": "seeds/seed-000001/result.json",
             "landing_safety": {
                 "policy": "raw_final",
                 "metrics": {"whitened_distance": 0.5},
@@ -82,10 +84,11 @@ def test_acquisition_maturity_audit_roundtrip(tmp_path):
         }],
     )
     path = write_acquisition_maturity_audit(iter_dir, payload)
-    assert path.name == "ACQUISITION_MATURITY_AUDIT.json"
-    loaded = read_acquisition_maturity_audit(iter_dir, expected_iteration=0)
-    assert loaded["schema_version"] == 1
-    assert loaded["summary"]["n_candidates_with_spectral"] == 1
-    assert loaded["summary"]["n_candidates_with_fullspace_residual"] == 1
-    assert loaded["summary"]["n_candidates_with_banded_energy"] == 1
-    assert loaded["seeds"][0]["landing_candidates"][0]["metrics"]["total_score"] == 1.0
+    assert path.name == "AUDIT.json"
+    loaded = read_acquisition_maturity_audit(iter_dir, expected_iteration=1)
+    assert loaded["schema_version"] == 2
+    maturity = loaded["maturity"]
+    assert maturity["summary"]["n_candidates_with_spectral"] == 1
+    assert maturity["summary"]["n_candidates_with_fullspace_residual"] == 1
+    assert maturity["summary"]["n_candidates_with_banded_energy"] == 1
+    assert maturity["seeds"][0]["landing_candidates"][0]["metrics"]["total_score"] == 1.0

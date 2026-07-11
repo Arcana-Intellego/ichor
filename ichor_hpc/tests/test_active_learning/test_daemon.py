@@ -241,25 +241,27 @@ def test_pre_submit_intent_without_accounted_job_halts_instead_of_resubmitting(t
 
 def test_next_phase_progression_through_first_iteration():
     cur = CampaignPhase.INIT
+    iteration = 0
     seen = [cur]
     while cur is not CampaignPhase.STOP_CHECK:
-        cur, _ = next_phase(cur, 0, 3)
+        cur, iteration = next_phase(cur, iteration, 3)
         seen.append(cur)
     # All 14 phases visited
     assert seen[0] is CampaignPhase.INIT
     assert seen[-1] is CampaignPhase.STOP_CHECK
+    assert iteration == 1
 
 
 def test_next_phase_stop_check_loops_when_iteration_below_max():
-    nxt, ni = next_phase(CampaignPhase.STOP_CHECK, iteration=0, max_iterations=3)
+    nxt, ni = next_phase(CampaignPhase.STOP_CHECK, iteration=1, max_iterations=3)
     assert nxt is CampaignPhase.SEED_SELECT
-    assert ni == 1
-
-
-def test_next_phase_stop_check_terminates_when_iteration_at_max_minus_one():
-    nxt, ni = next_phase(CampaignPhase.STOP_CHECK, iteration=2, max_iterations=3)
-    assert nxt is CampaignPhase.DONE
     assert ni == 2
+
+
+def test_next_phase_stop_check_terminates_when_iteration_reaches_max():
+    nxt, ni = next_phase(CampaignPhase.STOP_CHECK, iteration=3, max_iterations=3)
+    assert nxt is CampaignPhase.DONE
+    assert ni == 3
 
 
 def test_tick_initialises_state_on_first_call(tmp_path):

@@ -30,6 +30,17 @@ from ichor.hpc.active_learning.daemon.state import CampaignPhase
 from ichor.hpc.active_learning.daemon.ferebus_quality import (
     FEREBUS_QUALITY_SCHEMA_VERSION,
 )
+from ichor.hpc.active_learning.handoff_manifests import (
+    ariadne_landing_audit_path,
+    ariadne_results_path,
+    seeds_picked_path,
+)
+from ichor.hpc.active_learning.layout import (
+    active_iteration_dir,
+    ariadne_seed_dir,
+    ariadne_seeds_dir,
+)
+from ichor.hpc.active_learning.sampling_protocol import sampling_protocol_resolved_path
 from ichor.hpc.active_learning.point_allocation import (
     create_point_allocation,
     pending_attempts,
@@ -149,6 +160,21 @@ def _seed_point_allocation(
             iteration=iteration,
             trajectory_sha256="0" * 64,
             seed_frame_id=attempt.get("frame_id"),
+            seed_id=(
+                int(attempt["slot_id"]) + 1
+                if str(context) == "active"
+                else None
+            ),
+            seed_uid=(
+                format(int(attempt["slot_id"]) + 1, "064x")
+                if str(context) == "active"
+                else None
+            ),
+            array_task_id_zero_based=(
+                int(attempt["slot_id"])
+                if str(context) == "active"
+                else None
+            ),
             seed_selection_origin="live_parser_fixture",
             seed_variance_at_selection=None,
             subspace_neighbour_frame_ids=[],
@@ -161,6 +187,9 @@ def _seed_point_allocation(
             context=context,
             slot_id=int(attempt["slot_id"]),
             split=str(attempt["split"]),
+            allocation_slot_assignment_sha256=str(
+                allocation["slot_assignment_sha256"]
+            ),
         )
     return allocation_path, allocation
 
@@ -561,15 +590,19 @@ def test_commit_initial_reference_data_rejects_missing_point_allocation(tmp_path
 def test_live_append_requires_complete_point_allocation(tmp_path):
     ex = _make_executor(tmp_path)
     _commit_bootstrap_reference_data(ex.campaign_dir)
-    live_staging = stg.bucket_dir(ex.campaign_dir, "APPEND", 0)
+    live_staging = stg.bucket_dir(ex.campaign_dir, "APPEND", 1)
     (live_staging / "POINT_0000.pointdir").mkdir(parents=True)
     _seed_point_allocation(
         ex.campaign_dir,
         live_staging,
         context="active",
-        iteration=0,
+        iteration=1,
     )
-    state = SimpleNamespace(iteration=0, campaign_uid="uid", reference_data_version=0)
+    state = SimpleNamespace(
+        iteration=1,
+        campaign_uid="m16-test",
+        reference_data_version=0,
+    )
 
     with pytest.raises(BackendSubmissionError, match="complete point allocation"):
         ex._inline_append(state)
@@ -580,7 +613,7 @@ def test_live_append_commits_global_pointdir_names_from_manifest(tmp_path):
     bootstrap_view = _commit_bootstrap_reference_data(ex.campaign_dir)
     v = ReferenceDataVersioning(ex.campaign_dir / "QM_REFERENCE_DATA")
 
-    live_staging = stg.bucket_dir(ex.campaign_dir, "APPEND", 0)
+    live_staging = stg.bucket_dir(ex.campaign_dir, "APPEND", 1)
     new_point = live_staging / "POINT_0000.pointdir"
     new_point.mkdir(parents=True)
     (new_point / "new.txt").write_text("new\n", encoding="utf-8")
@@ -588,7 +621,7 @@ def test_live_append_commits_global_pointdir_names_from_manifest(tmp_path):
     stg.write_quantum_acceptance_manifest(
         live_staging,
         phase_name="AIMALL",
-        iteration=0,
+        iteration=1,
         accepted=[new_point],
         rejected=[],
     )
@@ -596,9 +629,13 @@ def test_live_append_commits_global_pointdir_names_from_manifest(tmp_path):
         ex.campaign_dir,
         live_staging,
         context="active",
-        iteration=0,
+        iteration=1,
     )
-    state = SimpleNamespace(iteration=0, campaign_uid="uid", reference_data_version=0)
+    state = SimpleNamespace(
+        iteration=1,
+        campaign_uid="m16-test",
+        reference_data_version=0,
+    )
 
     result = ex._inline_append(state)
 
@@ -983,6 +1020,7 @@ def test_ferebus_task_artefact_layout_rejects_unsafe_tokens(tmp_path):
 def test_initial_ferebus_also_commits_reference_data_version_zero(tmp_path):
     ex = _make_executor(tmp_path)
     _commit_bootstrap_reference_data(ex.campaign_dir)
+    _seed_phase_a_sample(ex.campaign_dir, n_frames=9)
     _seed_models_staging(tmp_path / "campaign")
 
     state = SimpleNamespace(iteration=0, campaign_uid="m16-test")
@@ -1026,6 +1064,14 @@ def test_ferebus_parser_rejects_missing_staging(tmp_path):
 
 def _write_seeds_picked(campaign_dir, iteration, n_seeds):
     from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
+    from ichor.hpc.active_learning.daemon.state import atomic_write_json
+    from ichor.hpc.active_learning.handoff_manifests import seeds_picked_path
+    from ichor.hpc.active_learning.layout import active_iteration_dir
+    from ichor.hpc.active_learning.seed_identity import (
+        deterministic_seed_uid,
+        selection_fingerprint_sha256,
+        write_ariadne_task_map,
+    )
 
     campaign_dir.mkdir(parents=True, exist_ok=True)
     pool_source = campaign_dir / "_test_pool.xyz"
@@ -1045,67 +1091,121 @@ def _write_seeds_picked(campaign_dir, iteration, n_seeds):
         campaign_dir,
         overwrite=True,
     )
-    iter_dir = (
-        campaign_dir / "7_ACTIVE_LEARNING"
-        / ("iteration-" + str(iteration).zfill(4))
-    )
-    iter_dir.mkdir(parents=True, exist_ok=True)
+    iter_dir = active_iteration_dir(campaign_dir, int(iteration))
     frame_ids = list(range(int(n_seeds)))
-    (iter_dir / "seeds_picked.json").write_text(
-        json.dumps({
-            "schema_version": 1,
-            "iteration": int(iteration),
-            "n_picked": int(n_seeds),
-            "frame_ids": frame_ids,
-            "indices": frame_ids,
-            "bulk_indices": frame_ids,
-            "variance_indices": [],
-            "variances": [0.0 for _ in frame_ids],
-            "seed_records": [
-                {
-                    "seed_index": int(i),
-                    "frame_id": int(i),
-                    "selection_index": int(i),
-                    "selection_origin": "bulk",
-                    "variance_at_selection": 0.0,
-                }
-                for i in frame_ids
-            ],
-            "trajectory_sha256": str(pool.sha256),
-        }),
-        encoding="utf-8",
-    )
+    payload = {
+        "schema_version": 2,
+        "campaign_uid": "m16-test",
+        "iteration": int(iteration),
+        "models_version": 0,
+        "model_manifest_sha256": "c" * 64,
+        "trajectory_sha256": str(pool.sha256),
+        "n_picked": int(n_seeds),
+        "seed_records": [
+            {
+                "seed_id": i + 1,
+                "frame_id": i,
+                "pool_row_index_zero_based": i,
+                "selection_origin": "bulk",
+                "variance_at_selection": 0.0,
+            }
+            for i in frame_ids
+        ],
+    }
+    fingerprint = selection_fingerprint_sha256(payload)
+    payload["selection_fingerprint_sha256"] = fingerprint
+    for record in payload["seed_records"]:
+        record["seed_uid"] = deterministic_seed_uid(
+            campaign_uid="m16-test",
+            iteration=int(iteration),
+            seed_id=int(record["seed_id"]),
+            frame_id=int(record["frame_id"]),
+            models_version=0,
+            model_manifest_sha256="c" * 64,
+            selection_fingerprint_sha256_value=fingerprint,
+        )
+    selection_path = seeds_picked_path(iter_dir)
+    selection_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(selection_path, payload)
+    write_ariadne_task_map(iter_dir, payload)
     return iter_dir
 
 
 def _seed_ariadne_pool(campaign_dir, iteration, *, n_seeds=3):
-    """Copy fixture per-seed result.json files into the iter_dir / pool."""
-    _write_seeds_picked(campaign_dir, iteration, n_seeds)
-    pool_dir = (
-        campaign_dir / "7_ACTIVE_LEARNING"
-        / ("iteration-" + str(iteration).zfill(4)) / "pool"
+    """Copy fixture results into canonical, integrity-bound seed outputs."""
+    from ichor.hpc.active_learning.ariadne_outputs import (
+        write_optimisation_trajectory,
+        write_seed_output_manifest,
     )
+    from ichor.hpc.active_learning.daemon.state import atomic_write_json
+    from ichor.hpc.active_learning.handoff_manifests import load_seeds_picked
+    from ichor.hpc.active_learning.layout import ariadne_seed_dir, ariadne_seeds_dir
+    from ichor.hpc.active_learning.sampling_protocol import resolve_sampling_protocol
+    from ichor.hpc.active_learning.versioning.manifest import sha256_file
+
+    iter_dir = _write_seeds_picked(campaign_dir, iteration, n_seeds)
+    pool_dir = ariadne_seeds_dir(iter_dir)
     pool_dir.mkdir(parents=True, exist_ok=True)
     src = FIXTURES / "ariadne_pool"
-    seeds_manifest = json.loads(
-        (
-            campaign_dir / "7_ACTIVE_LEARNING"
-            / ("iteration-" + str(iteration).zfill(4))
-            / "seeds_picked.json"
-        ).read_text(encoding="utf-8")
+    seeds_manifest = load_seeds_picked(
+        iter_dir,
+        expected_iteration=int(iteration),
     )
     trajectory_sha256 = str(seeds_manifest["trajectory_sha256"])
+    campaign_config_path = Path(campaign_dir) / "campaign.yaml"
+    campaign_config = (
+        CampaignConfig.from_yaml(campaign_config_path)
+        if campaign_config_path.is_file()
+        else CampaignConfig()
+    )
+    resolved_protocol = resolve_sampling_protocol(
+        campaign_dir,
+        campaign_config,
+        iteration=int(iteration),
+    )
+
+    def protocol_binding(path):
+        resolved = path.resolve()
+        return (
+            resolved.relative_to(campaign_dir.resolve()).as_posix(),
+            sha256_file(resolved),
+        )
+
+    resolved_manifest, resolved_manifest_sha256 = protocol_binding(
+        resolved_protocol.manifest_path
+    )
+    scale_manifest, scale_manifest_sha256 = protocol_binding(
+        resolved_protocol.scale_model_path
+    )
+    audit_manifest, audit_manifest_sha256 = protocol_binding(
+        resolved_protocol.audit_manifest_path
+    )
     for i in range(n_seeds):
-        name = "seed_" + str(i).zfill(4)
-        target = pool_dir / name
+        source_name = "seed_" + str(i).zfill(4)
+        seed_id = i + 1
+        seed_uid = str(seeds_manifest["seed_records"][i]["seed_uid"])
+        target = ariadne_seed_dir(iter_dir, seed_id)
         target.mkdir(exist_ok=True)
-        result_src = src / name / "result.json"
+        result_src = src / source_name / "result.json"
         if result_src.is_file():
             payload = json.loads(result_src.read_text(encoding="utf-8"))
             payload["iteration"] = int(iteration)
-            payload["seed_index"] = int(i)
+            payload["seed_id"] = seed_id
+            payload["seed_uid"] = seed_uid
+            payload["array_task_id"] = i
             payload["seed_frame_id"] = int(i)
             payload["trajectory_sha256"] = trajectory_sha256
+            payload["sampling_protocol"] = {
+                "sampling_aggressiveness": int(
+                    resolved_protocol.sampling_aggressiveness
+                ),
+                "resolved_manifest": resolved_manifest,
+                "resolved_manifest_sha256": resolved_manifest_sha256,
+                "scale_model_manifest": scale_manifest,
+                "scale_model_manifest_sha256": scale_manifest_sha256,
+                "audit_manifest": audit_manifest,
+                "audit_manifest_sha256": audit_manifest_sha256,
+            }
             payload.setdefault("task_success", True)
             payload.setdefault(
                 "landing_safety",
@@ -1121,24 +1221,68 @@ def _seed_ariadne_pool(campaign_dir, iteration, *, n_seeds=3):
                     },
                 },
             )
-            (target / "result.json").write_text(
-                json.dumps(payload, indent=2),
-                encoding="utf-8",
+            atomic_write_json(target / "result.json", payload)
+            coordinates = payload.get("final_coordinates") or [
+                [0.0, 0.0, 0.0],
+                [0.96, 0.0, 0.0],
+                [-0.24, 0.93, 0.0],
+            ]
+            write_optimisation_trajectory(
+                target,
+                atom_types=payload.get("atom_types") or ["O", "H", "H"],
+                coordinate_frames=[coordinates],
+                alpha_values=[payload.get("alpha_final")],
+                gradient_norms=[0.0],
+                origins=["raw_final"],
+            )
+            task_success = bool(payload.get("task_success", True))
+            write_seed_output_manifest(
+                target,
+                campaign_uid="m16-test",
+                iteration=int(iteration),
+                seed_id=seed_id,
+                seed_uid=seed_uid,
+                array_task_id=i,
+                task_success=task_success,
+                task_exit_code=int(
+                    payload.get("task_exit_code", 0 if task_success else 4)
+                ),
             )
     return pool_dir
+
+
+def _rewrite_seed_result(seed_dir, payload):
+    from ichor.hpc.active_learning.ariadne_outputs import write_seed_output_manifest
+    from ichor.hpc.active_learning.daemon.state import atomic_write_json
+
+    atomic_write_json(seed_dir / "result.json", payload)
+    task_success = bool(payload.get("task_success", True))
+    write_seed_output_manifest(
+        seed_dir,
+        campaign_uid="m16-test",
+        iteration=int(payload["iteration"]),
+        seed_id=int(payload["seed_id"]),
+        seed_uid=str(payload["seed_uid"]),
+        array_task_id=int(payload["array_task_id"]),
+        task_success=task_success,
+        task_exit_code=int(
+            payload.get("task_exit_code", 0 if task_success else 4)
+        ),
+    )
 
 
 def test_ariadne_parser_happy_path(tmp_path):
     ex = _make_executor(tmp_path)
     _seed_ariadne_pool(tmp_path / "campaign", iteration=4)
-    state = SimpleNamespace(iteration=4, campaign_uid="m16-test")
+    state = SimpleNamespace(iteration=4, campaign_uid="m16-test", models_version=0)
     result = ex._parse_ariadne_array_postprocess(
         state, CampaignPhase("ARIADNE_ARRAY"), observations=[],
     )
     assert result.is_complete is True
     assert result.failure_reason is None
     # Fixture has alpha_final values 2.13, 1.87, 2.40. Max is 2.40 (or 2.13 if
-    # only seed_0000 in fixture). Just assert > 0 to be fixture-robust.
+    # only one historical source seed in the fixture). Just assert > 0 to be
+    # fixture-robust.
     assert result.state_updates["last_acquisition_alpha0"] > 0.0
     assert "last_n_anti_overlap_flagged" in result.state_updates
     events = _read_journal_events(tmp_path / "campaign")
@@ -1153,7 +1297,8 @@ def test_ariadne_parser_ignores_hidden_raw_ariadne_quality_gate_override(tmp_pat
     ex.config.anti_overlap.enforce_post_ariadne = True
     ex.config.anti_overlap.max_post_ariadne_whitened_distance = 1.0e-8
     pool = _seed_ariadne_pool(tmp_path / "campaign", iteration=4, n_seeds=1)
-    result_path = pool / "seed_0000" / "result.json"
+    seed_dir = ariadne_seed_dir(active_iteration_dir(tmp_path / "campaign", 4), 1)
+    result_path = seed_dir / "result.json"
     payload = json.loads(result_path.read_text(encoding="utf-8"))
     payload["task_success"] = True
     payload["landing_safety"] = {
@@ -1167,8 +1312,8 @@ def test_ariadne_parser_ignores_hidden_raw_ariadne_quality_gate_override(tmp_pat
             "min_pair_distance_ang": 0.95,
         },
     }
-    result_path.write_text(json.dumps(payload), encoding="utf-8")
-    state = SimpleNamespace(iteration=4, campaign_uid="m16-test")
+    _rewrite_seed_result(seed_dir, payload)
+    state = SimpleNamespace(iteration=4, campaign_uid="m16-test", models_version=0)
 
     result = ex._parse_ariadne_array_postprocess(
         state, CampaignPhase("ARIADNE_ARRAY"), observations=[],
@@ -1176,17 +1321,20 @@ def test_ariadne_parser_ignores_hidden_raw_ariadne_quality_gate_override(tmp_pat
 
     assert result.is_complete is True
     assert result.failure_reason is None
-    iter_dir = tmp_path / "campaign" / "7_ACTIVE_LEARNING" / "iteration-0004"
-    manifest = json.loads((iter_dir / "ARIADNE_RESULTS.json").read_text(encoding="utf-8"))
+    iter_dir = active_iteration_dir(tmp_path / "campaign", 4)
+    manifest = json.loads(ariadne_results_path(iter_dir).read_text(encoding="utf-8"))
     assert manifest["n_accepted"] == 1
     assert manifest["n_rejected"] == 0
 
 
 def test_ariadne_parser_uses_result_resolved_protocol_manifest(tmp_path):
+    from ichor.hpc.active_learning.versioning.manifest import sha256_file
+
     ex = _make_executor(tmp_path)
     pool = _seed_ariadne_pool(tmp_path / "campaign", iteration=4, n_seeds=1)
-    iter_dir = tmp_path / "campaign" / "7_ACTIVE_LEARNING" / "iteration-0004"
-    protocol_path = iter_dir / "SAMPLING_PROTOCOL_RESOLVED.json"
+    iter_dir = active_iteration_dir(tmp_path / "campaign", 4)
+    protocol_path = sampling_protocol_resolved_path(iter_dir)
+    protocol_path.parent.mkdir(parents=True, exist_ok=True)
     protocol_path.write_text(
         json.dumps(
             {
@@ -1201,6 +1349,13 @@ def test_ariadne_parser_uses_result_resolved_protocol_manifest(tmp_path):
                     "accept_legacy_missing_landing_safety": False,
                     "allow_seed_fallback": False,
                 },
+                "resolved_anti_overlap": {
+                    "skip_training_seeds": True,
+                    "recent_seeds_cooldown": 3,
+                    "min_post_ariadne_whitened_distance": 0.01,
+                    "max_post_ariadne_whitened_distance": 10.0,
+                    "enforce_post_ariadne": False,
+                },
                 "sampling_scale_model": {
                     "schema_version": 1,
                     "iteration": 4,
@@ -1209,13 +1364,17 @@ def test_ariadne_parser_uses_result_resolved_protocol_manifest(tmp_path):
         ),
         encoding="utf-8",
     )
-    result_path = pool / "seed_0000" / "result.json"
+    seed_dir = ariadne_seed_dir(iter_dir, 1)
+    result_path = seed_dir / "result.json"
     payload = json.loads(result_path.read_text(encoding="utf-8"))
     payload["task_success"] = True
-    payload["sampling_protocol"] = {
-        "sampling_aggressiveness": 5,
-        "resolved_manifest": str(protocol_path.resolve()),
-    }
+    payload["sampling_protocol"]["sampling_aggressiveness"] = 5
+    payload["sampling_protocol"]["resolved_manifest"] = str(
+        protocol_path.resolve()
+    )
+    payload["sampling_protocol"]["resolved_manifest_sha256"] = sha256_file(
+        protocol_path
+    )
     payload["landing_safety"] = {
         "accepted": True,
         "policy": "raw_final",
@@ -1227,21 +1386,52 @@ def test_ariadne_parser_uses_result_resolved_protocol_manifest(tmp_path):
             "min_pair_distance_ang": 0.95,
         },
     }
-    result_path.write_text(json.dumps(payload), encoding="utf-8")
-    state = SimpleNamespace(iteration=4, campaign_uid="m16-test")
+    _rewrite_seed_result(seed_dir, payload)
+    state = SimpleNamespace(iteration=4, campaign_uid="m16-test", models_version=0)
 
     result = ex._parse_ariadne_array_postprocess(
         state, CampaignPhase("ARIADNE_ARRAY"), observations=[],
     )
 
     assert result.failure_reason == "ariadne_no_seed_results_parsed: 1"
-    manifest = json.loads((iter_dir / "ARIADNE_RESULTS.json").read_text(encoding="utf-8"))
+    manifest = json.loads(ariadne_results_path(iter_dir).read_text(encoding="utf-8"))
     assert manifest["n_accepted"] == 0
     assert manifest["rejected"][0]["reason"] == "ariadne_max_displacement_threshold_exceeded"
-    audit = json.loads((iter_dir / "ARIADNE_LANDING_AUDIT.json").read_text(encoding="utf-8"))
+    audit = json.loads(ariadne_landing_audit_path(iter_dir).read_text(encoding="utf-8"))
     replay = audit["seeds"][0]["sampling_protocol_replay"]
     assert replay["used_exact_sampling_protocol"] is True
     assert replay["sampling_protocol_source"] == "result_manifest"
+
+
+def test_ariadne_parser_rejects_sampling_protocol_hash_drift(tmp_path):
+    ex = _make_executor(tmp_path)
+    _seed_ariadne_pool(tmp_path / "campaign", iteration=4, n_seeds=1)
+    iter_dir = active_iteration_dir(tmp_path / "campaign", 4)
+    protocol_path = sampling_protocol_resolved_path(iter_dir)
+    protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+    protocol["sampling_aggressiveness"] = int(
+        protocol["sampling_aggressiveness"]
+    ) + 1
+    protocol_path.write_text(json.dumps(protocol), encoding="utf-8")
+
+    state = SimpleNamespace(
+        iteration=4,
+        campaign_uid="m16-test",
+        models_version=0,
+    )
+    result = ex._parse_ariadne_array_postprocess(
+        state,
+        CampaignPhase("ARIADNE_ARRAY"),
+        observations=[],
+    )
+
+    assert result.failure_reason == "ariadne_no_seed_results_parsed: 1"
+    manifest = json.loads(
+        ariadne_results_path(iter_dir).read_text(encoding="utf-8")
+    )
+    assert "resolved_manifest SHA-256 mismatch" in manifest["rejected"][0][
+        "reason"
+    ]
 
 
 def test_ariadne_parser_reconstructs_missing_seed_provenance(tmp_path):
@@ -1252,11 +1442,12 @@ def test_ariadne_parser_reconstructs_missing_seed_provenance(tmp_path):
 
     ex = _make_executor(tmp_path)
     pool = _seed_ariadne_pool(tmp_path / "campaign", iteration=4, n_seeds=1)
-    seed_dir = pool / "seed_0000"
+    iter_dir = active_iteration_dir(tmp_path / "campaign", 4)
+    seed_dir = ariadne_seed_dir(iter_dir, 1)
     prov_path = seed_dir / PROVENANCE_FILENAME
     assert not prov_path.exists()
 
-    state = SimpleNamespace(iteration=4, campaign_uid="m16-test")
+    state = SimpleNamespace(iteration=4, campaign_uid="m16-test", models_version=0)
     result = ex._parse_ariadne_array_postprocess(
         state, CampaignPhase("ARIADNE_ARRAY"), observations=[],
     )
@@ -1268,14 +1459,15 @@ def test_ariadne_parser_reconstructs_missing_seed_provenance(tmp_path):
     assert prov["ariadne"] is not None
     assert prov["anti_overlap"] is not None
 
-    iter_dir = tmp_path / "campaign" / "7_ACTIVE_LEARNING" / "iteration-0004"
-    manifest = json.loads((iter_dir / "ARIADNE_RESULTS.json").read_text(encoding="utf-8"))
+    manifest = json.loads(ariadne_results_path(iter_dir).read_text(encoding="utf-8"))
     assert manifest["n_accepted"] == 1
     assert manifest["n_rejected"] == 0
-    assert manifest["accepted"][0]["provenance_json"] == str(prov_path.resolve())
-    audit = json.loads((iter_dir / "ARIADNE_LANDING_AUDIT.json").read_text(encoding="utf-8"))
+    assert manifest["accepted"][0]["provenance_json"].endswith(
+        "seeds/seed-000001/provenance.json"
+    )
+    audit = json.loads(ariadne_landing_audit_path(iter_dir).read_text(encoding="utf-8"))
     assert len(audit["seeds"]) == 1
-    assert audit["seeds"][0]["provenance_reconstructed"] is True
+    assert audit["seeds"][0]["provenance_created"] is True
     assert audit["summary"]["handoff_accepted"] == 1
     events = _read_journal_events(tmp_path / "campaign")
     assert any(e.get("event") == "ariadne_provenance_reconstructed" for e in events)
@@ -1284,7 +1476,8 @@ def test_ariadne_parser_reconstructs_missing_seed_provenance(tmp_path):
 def test_ariadne_parser_accepts_safe_max_iteration_result(tmp_path):
     ex = _make_executor(tmp_path)
     pool = _seed_ariadne_pool(tmp_path / "campaign", iteration=4, n_seeds=1)
-    result_path = pool / "seed_0000" / "result.json"
+    seed_dir = ariadne_seed_dir(active_iteration_dir(tmp_path / "campaign", 4), 1)
+    result_path = seed_dir / "result.json"
     payload = json.loads(result_path.read_text(encoding="utf-8"))
     payload["return_code"] = 1
     payload["optimiser_diagnostics"] = {
@@ -1299,8 +1492,8 @@ def test_ariadne_parser_accepts_safe_max_iteration_result(tmp_path):
         "record_only_reasons": [],
         "metrics": {},
     }
-    result_path.write_text(json.dumps(payload), encoding="utf-8")
-    state = SimpleNamespace(iteration=4, campaign_uid="m16-test")
+    _rewrite_seed_result(seed_dir, payload)
+    state = SimpleNamespace(iteration=4, campaign_uid="m16-test", models_version=0)
 
     result = ex._parse_ariadne_array_postprocess(
         state, CampaignPhase("ARIADNE_ARRAY"), observations=[],
@@ -1321,7 +1514,8 @@ def test_ariadne_parser_accepts_safe_max_iteration_result(tmp_path):
 def test_ariadne_parser_rejects_explicit_unsuccessful_task(tmp_path):
     ex = _make_executor(tmp_path)
     pool = _seed_ariadne_pool(tmp_path / "campaign", iteration=4, n_seeds=1)
-    result_path = pool / "seed_0000" / "result.json"
+    seed_dir = ariadne_seed_dir(active_iteration_dir(tmp_path / "campaign", 4), 1)
+    result_path = seed_dir / "result.json"
     payload = json.loads(result_path.read_text(encoding="utf-8"))
     payload["return_code"] = 0
     payload["task_success"] = False
@@ -1334,23 +1528,23 @@ def test_ariadne_parser_rejects_explicit_unsuccessful_task(tmp_path):
         "record_only_reasons": [],
         "metrics": {},
     }
-    result_path.write_text(json.dumps(payload), encoding="utf-8")
-    state = SimpleNamespace(iteration=4, campaign_uid="m16-test")
+    _rewrite_seed_result(seed_dir, payload)
+    state = SimpleNamespace(iteration=4, campaign_uid="m16-test", models_version=0)
 
     result = ex._parse_ariadne_array_postprocess(
         state, CampaignPhase("ARIADNE_ARRAY"), observations=[],
     )
 
     assert result.failure_reason == "ariadne_no_seed_results_parsed: 1"
-    iter_dir = tmp_path / "campaign" / "7_ACTIVE_LEARNING" / "iteration-0004"
-    manifest = json.loads((iter_dir / "ARIADNE_RESULTS.json").read_text(encoding="utf-8"))
+    iter_dir = active_iteration_dir(tmp_path / "campaign", 4)
+    manifest = json.loads(ariadne_results_path(iter_dir).read_text(encoding="utf-8"))
     assert manifest["n_accepted"] == 0
     assert manifest["n_rejected"] == 1
     assert manifest["rejected"][0]["reason"] == (
         "ariadne_unusable:runner_failed_after_result_write"
     )
     audit = json.loads(
-        (iter_dir / "ARIADNE_LANDING_AUDIT.json").read_text(encoding="utf-8")
+        ariadne_landing_audit_path(iter_dir).read_text(encoding="utf-8")
     )
     assert audit["seeds"][0]["handoff_accepted"] is False
     assert audit["seeds"][0]["handoff_rejection_reason"] == (
@@ -1362,22 +1556,20 @@ def test_ariadne_parser_missing_pool_dir(tmp_path):
     ex = _make_executor(tmp_path)
     # Do not seed the pool dir.
     _write_seeds_picked(tmp_path / "campaign", 4, 3)
-    state = SimpleNamespace(iteration=4, campaign_uid="m16-test")
+    state = SimpleNamespace(iteration=4, campaign_uid="m16-test", models_version=0)
     result = ex._parse_ariadne_array_postprocess(
         state, CampaignPhase("ARIADNE_ARRAY"), observations=[],
     )
     assert result.failure_reason is not None
-    assert "ariadne_pool_missing" in result.failure_reason
+    assert "ariadne_seeds_directory_missing" in result.failure_reason
 
 
 def test_ariadne_parser_no_seeds_in_pool(tmp_path):
     ex = _make_executor(tmp_path)
     _write_seeds_picked(tmp_path / "campaign", 4, 1)
-    iter_dir = (
-        tmp_path / "campaign" / "7_ACTIVE_LEARNING" / "iteration-0004" / "pool"
-    )
-    iter_dir.mkdir(parents=True, exist_ok=True)
-    state = SimpleNamespace(iteration=4, campaign_uid="m16-test")
+    iter_dir = active_iteration_dir(tmp_path / "campaign", 4)
+    ariadne_seeds_dir(iter_dir).mkdir(parents=True, exist_ok=True)
+    state = SimpleNamespace(iteration=4, campaign_uid="m16-test", models_version=0)
     result = ex._parse_ariadne_array_postprocess(
         state, CampaignPhase("ARIADNE_ARRAY"), observations=[],
     )
@@ -1389,16 +1581,20 @@ def test_ariadne_parser_handles_missing_result_json(tmp_path):
     ex = _make_executor(tmp_path)
     pool = _seed_ariadne_pool(tmp_path / "campaign", iteration=4)
     # Remove one result.json so the parser sees a half-missing pool.
-    (pool / "seed_0001" / "result.json").unlink()
-    state = SimpleNamespace(iteration=4, campaign_uid="m16-test")
+    (ariadne_seed_dir(active_iteration_dir(tmp_path / "campaign", 4), 2) / "result.json").unlink()
+    state = SimpleNamespace(iteration=4, campaign_uid="m16-test", models_version=0)
     result = ex._parse_ariadne_array_postprocess(
         state, CampaignPhase("ARIADNE_ARRAY"), observations=[],
     )
     # Two seeds still have a valid result -> succeeds.
     assert result.failure_reason is None
     events = _read_journal_events(tmp_path / "campaign")
-    rejected = [e for e in events if e.get("event") == "quantum_output_rejected"]
-    assert any(e.get("reason") == "missing_result_json" for e in rejected)
+    rejected = [
+        event
+        for event in events
+        if event.get("event") == "ariadne_task_rejected_invalid_output"
+    ]
+    assert any("result.json" in str(event.get("reason")) for event in rejected)
 
 
 def test_ariadne_parser_all_results_unreadable_fails(tmp_path):
@@ -1409,7 +1605,7 @@ def test_ariadne_parser_all_results_unreadable_fails(tmp_path):
             r = seed_dir / "result.json"
             if r.is_file():
                 r.unlink()
-    state = SimpleNamespace(iteration=4, campaign_uid="m16-test")
+    state = SimpleNamespace(iteration=4, campaign_uid="m16-test", models_version=0)
     result = ex._parse_ariadne_array_postprocess(
         state, CampaignPhase("ARIADNE_ARRAY"), observations=[],
     )
@@ -1417,38 +1613,46 @@ def test_ariadne_parser_all_results_unreadable_fails(tmp_path):
     assert "ariadne_no_seed_results_parsed" in result.failure_reason
 
 
-def test_clean_stale_ariadne_seed_outputs_removes_only_results(tmp_path):
+def test_clean_stale_ariadne_seed_outputs_quarantines_selected_task(tmp_path):
     campaign = tmp_path / "campaign"
     pool = _seed_ariadne_pool(campaign, iteration=4)
-    seed_dir = pool / "seed_0000"
+    iter_dir = active_iteration_dir(campaign, 4)
+    seed_dir = ariadne_seed_dir(iter_dir, 1)
     tmp_result = seed_dir / "result.json.1234.abcd.tmp"
     tmp_result.write_text("partial", encoding="utf-8")
-    trace = seed_dir / "ARIADNE_TRACE.jsonl"
+    trace = seed_dir / "trajectory" / "trace.jsonl"
     trace.write_text('{"event":"old"}\n', encoding="utf-8")
-    protected = pool.parent / "seeds_picked.json"
+    protected = seeds_picked_path(iter_dir)
     assert protected.is_file()
 
-    removed = clean_stale_ariadne_seed_outputs(campaign, 4)
+    removed = clean_stale_ariadne_seed_outputs(
+        campaign,
+        4,
+        retry_array_task_ids=[0],
+    )
 
-    assert str(seed_dir / "result.json") in removed
-    assert str(tmp_result) in removed
-    assert str(trace) in removed
-    assert not (seed_dir / "result.json").exists()
-    assert not tmp_result.exists()
-    assert not trace.exists()
+    assert len(removed) == 1
+    quarantined = Path(removed[0])
+    assert (quarantined / "result.json").is_file()
+    assert (quarantined / tmp_result.name).is_file()
+    assert (quarantined / "trajectory" / trace.name).is_file()
     assert protected.is_file()
-    assert seed_dir.is_dir()
+    assert not seed_dir.exists()
 
 
 def test_clean_stale_ariadne_seed_outputs_rejects_non_regular_result(tmp_path):
     campaign = tmp_path / "campaign"
     pool = _seed_ariadne_pool(campaign, iteration=4)
-    result = pool / "seed_0000" / "result.json"
-    result.unlink()
-    result.mkdir()
+    seed_dir = ariadne_seed_dir(active_iteration_dir(campaign, 4), 1)
+    shutil.rmtree(seed_dir)
+    seed_dir.write_text("not a directory\n", encoding="utf-8")
 
-    with pytest.raises(BackendSubmissionError, match="non-regular ARIADNE output"):
-        clean_stale_ariadne_seed_outputs(campaign, 4)
+    with pytest.raises(BackendSubmissionError, match="non-directory ARIADNE output"):
+        clean_stale_ariadne_seed_outputs(
+            campaign,
+            4,
+            retry_array_task_ids=[0],
+        )
 
 
 class _FakeSbatch:
@@ -1577,21 +1781,24 @@ def test_ariadne_submit_reuses_complete_existing_results(tmp_path):
         sbatch_runner=runner,
     )
     pool = _seed_ariadne_pool(tmp_path / "campaign", iteration=4)
-    stale_result = pool / "seed_0000" / "result.json"
+    iter_dir = active_iteration_dir(tmp_path / "campaign", 4)
+    seed_dir = ariadne_seed_dir(iter_dir, 1)
+    stale_result = seed_dir / "result.json"
     assert stale_result.is_file()
 
     result = ex.submit_or_run(
-        SimpleNamespace(iteration=4, campaign_uid="m16-test"),
+        SimpleNamespace(iteration=4, campaign_uid="m16-test", models_version=0),
         CampaignPhase("ARIADNE_ARRAY"),
     )
 
     assert result.is_complete is True
     assert result.submitted_job_id is None
+    assert result.failure_reason is None
     assert not runner.calls
     assert stale_result.is_file()
-    prov_path = pool / "seed_0000" / PROVENANCE_FILENAME
+    prov_path = seed_dir / PROVENANCE_FILENAME
     assert prov_path.is_file()
-    prov = read_provenance(pool / "seed_0000")
+    prov = read_provenance(seed_dir)
     assert prov["seed"]["frame_id"] == 0
     events = _read_journal_events(tmp_path / "campaign")
     reused = [
@@ -1615,12 +1822,17 @@ def test_ariadne_submit_rejects_invalid_existing_seed_provenance(tmp_path):
         sbatch_runner=runner,
     )
     pool = _seed_ariadne_pool(tmp_path / "campaign", iteration=4, n_seeds=1)
+    seed_dir = ariadne_seed_dir(active_iteration_dir(tmp_path / "campaign", 4), 1)
+    selection = json.loads(seeds_picked_path(active_iteration_dir(tmp_path / "campaign", 4)).read_text(encoding="utf-8"))
     write_seed_provenance(
-        pool / "seed_0000",
+        seed_dir,
         campaign_uid="wrong-campaign",
         iteration=4,
         trajectory_sha256="0" * 64,
         seed_frame_id=0,
+        seed_id=1,
+        seed_uid=str(selection["seed_records"][0]["seed_uid"]),
+        array_task_id_zero_based=0,
         seed_selection_origin="bulk",
         seed_variance_at_selection=0.0,
         subspace_neighbour_frame_ids=[],
@@ -1629,11 +1841,23 @@ def test_ariadne_submit_rejects_invalid_existing_seed_provenance(tmp_path):
         mode_weighting_policy="variance",
     )
 
-    with pytest.raises(BackendSubmissionError, match="ARIADNE seed provenance invalid"):
-        ex.submit_or_run(
-            SimpleNamespace(iteration=4, campaign_uid="m16-test"),
-            CampaignPhase("ARIADNE_ARRAY"),
-        )
+    result = ex.submit_or_run(
+        SimpleNamespace(
+            iteration=4,
+            campaign_uid="m16-test",
+            models_version=0,
+        ),
+        CampaignPhase("ARIADNE_ARRAY"),
+    )
+
+    assert result.failure_reason == "ariadne_no_seed_results_parsed: 1"
+    manifest = json.loads(
+        ariadne_results_path(
+            active_iteration_dir(tmp_path / "campaign", 4)
+        ).read_text(encoding="utf-8")
+    )
+    assert "ariadne_provenance_missing" in manifest["rejected"][0]["reason"]
+    assert "campaign_uid mismatch" in manifest["rejected"][0]["reason"]
     assert not runner.calls
 
 
@@ -1642,41 +1866,44 @@ def test_ariadne_submit_rejects_invalid_existing_seed_provenance(tmp_path):
 
 
 def _seed_phase_a_sample(campaign_dir, *, n_frames=2):
-    """Copy fixture POLUS Phase-A xyz into 3_DIVERSITY_SAMPLING/initial/."""
+    """Publish a canonical Phase-A handoff from the legacy-named fixture."""
     from ichor.hpc.active_learning.handoff_manifests import write_phase_a_sample_manifest
+    from ichor.hpc.active_learning.layout import bootstrap_selection_dir
 
-    target = campaign_dir / "3_DIVERSITY_SAMPLING" / "initial"
+    target = bootstrap_selection_dir(campaign_dir)
     target.mkdir(parents=True, exist_ok=True)
-    src = FIXTURES / "polus_phase_a" / ("initial-SAMPLE-" + str(n_frames) + ".xyz")
-    dst = target / src.name
-    dst.write_bytes(src.read_bytes())
-    index = target / ("initial-INDEX-" + str(n_frames) + ".dat")
-    index.write_text("\n".join(str(i) for i in range(n_frames)) + "\n", encoding="utf-8")
+    dst = target / "selected.xyz"
+    index = target / "selected_indices.dat"
     allocation_path = point_allocation_path(
         campaign_dir,
         context="bootstrap",
         iteration=0,
     )
-    allocation = create_point_allocation(
-        allocation_path,
-        campaign_uid="m16-test",
-        context="bootstrap",
-        iteration=0,
-        targets={
-            "train": int(n_frames),
-            "int_val": 0,
-            "ext_val": 0,
-            "total": int(n_frames),
-        },
-        primary_candidates=[
-            {
-                "candidate_id": "phase-a-candidate-" + str(i),
-                "frame_id": int(i),
-            }
-            for i in range(int(n_frames))
-        ],
-        reserve_candidates=[],
-    )
+    if allocation_path.is_file():
+        from ichor.hpc.active_learning.point_allocation import read_point_allocation
+
+        allocation = read_point_allocation(allocation_path)
+    else:
+        allocation = create_point_allocation(
+            allocation_path,
+            campaign_uid="m16-test",
+            context="bootstrap",
+            iteration=0,
+            targets={
+                "train": int(n_frames),
+                "int_val": 0,
+                "ext_val": 0,
+                "total": int(n_frames),
+            },
+            primary_candidates=[
+                {
+                    "candidate_id": "phase-a-candidate-" + str(i),
+                    "frame_id": int(i),
+                }
+                for i in range(int(n_frames))
+            ],
+            reserve_candidates=[],
+        )
     primary = [
         {
             **slot["attempts"][0],
@@ -1685,14 +1912,36 @@ def _seed_phase_a_sample(campaign_dir, *, n_frames=2):
         }
         for slot in allocation["slots"]
     ]
+    selected_indices = [int(record["frame_id"]) for record in primary]
+    source_lines = (
+        FIXTURES / "polus_phase_a" / "initial-SAMPLE-2.xyz"
+    ).read_text(encoding="utf-8").splitlines()
+    frame_size = int(source_lines[0]) + 2
+    frames = [
+        source_lines[offset : offset + frame_size]
+        for offset in range(0, len(source_lines), frame_size)
+    ]
+    selected_frames = []
+    for frame_id in selected_indices:
+        frame = list(frames[frame_id % len(frames)])
+        frame[1] = "frame " + str(frame_id)
+        selected_frames.append(frame)
+    dst.write_text(
+        "\n".join(line for frame in selected_frames for line in frame) + "\n",
+        encoding="utf-8",
+    )
+    index.write_text(
+        "\n".join(str(frame_id) for frame_id in selected_indices) + "\n",
+        encoding="utf-8",
+    )
     write_phase_a_sample_manifest(target, {
         "phase": "PHASE_A_POLUS",
-        "iteration": -1,
+        "iteration": 0,
         "sample_xyz": str(dst.resolve()),
         "index_path": str(index.resolve()),
         "n_select": int(n_frames),
         "n_frames": int(n_frames),
-        "selected_indices": [int(i) for i in range(n_frames)],
+        "selected_indices": selected_indices,
         "descriptor": "rmsd_massweight",
         "n_pool_frames": int(n_frames),
         "bootstrap_total_size": int(n_frames),
@@ -1711,168 +1960,85 @@ def _seed_phase_a_sample(campaign_dir, *, n_frames=2):
 
 
 def _seed_phase_b_sample(campaign_dir, iteration):
-    """Copy fixture POLUS Phase-B xyz into the iter_dir."""
-    iter_dir = (
-        campaign_dir / "7_ACTIVE_LEARNING"
-        / ("iteration-" + str(iteration).zfill(4))
-    )
-    iter_dir.mkdir(parents=True, exist_ok=True)
-    src = FIXTURES / "polus_phase_b" / "phase_b_SAMPLE.xyz"
-    dst = iter_dir / "phase_b_SAMPLE.xyz"
-    dst.write_bytes(src.read_bytes())
-    return iter_dir
+    """Return the canonical active iteration used by Phase B fixtures."""
+    return active_iteration_dir(campaign_dir, int(iteration))
 
 
 def _write_phase_b_manifest(iter_dir, *, n_final=1, write_sample=True):
+    from ichor.hpc.active_learning.daemon.state import (
+        DEFAULT_STATE_FILENAME,
+        CampaignPhase as _CampaignPhase,
+        fresh_campaign_state,
+        write_state,
+    )
     from ichor.hpc.active_learning.handoff_manifests import (
-        PHASE_B_SELECTION_SCHEMA_VERSION,
-        write_phase_b_selection_manifest,
+        phase_b_selection_path,
+        read_phase_b_selection_manifest,
     )
-    from ichor.hpc.active_learning.versioning.provenance import (
-        PROVENANCE_FILENAME,
-        enrich_with_point_allocation,
-        write_seed_provenance,
-    )
+    from ichor.hpc.active_learning.layout import active_phase_b_dir
+    from ichor.hpc.active_learning.sampling.polus_wrapper import main as polus_main
 
-    records = []
-    xyz_lines = []
-    pool_dir = iter_dir / "pool"
-    pool_dir.mkdir(parents=True, exist_ok=True)
-    for i in range(int(n_final)):
-        coords = [
-            [0.0, 0.0, 0.0],
-            [0.96 + i * 0.01, 0.0, 0.0],
-            [-0.24, 0.93 + i * 0.01, 0.0],
-        ]
-        seed_dir = pool_dir / ("seed_" + str(i).zfill(4))
-        seed_dir.mkdir(parents=True, exist_ok=True)
-        result_path = seed_dir / "result.json"
-        result_path.write_text(
-            json.dumps({
-                "iteration": int(iter_dir.name.split("-")[-1]),
-                "seed_index": int(i),
-                "seed_frame_id": int(i),
-                "trajectory_sha256": "0" * 64,
-                "atom_types": ["O", "H", "H"],
-                "final_coordinates": coords,
-                "alpha_initial": 0.0,
-                "alpha_final": 1.0,
-                "alpha_trajectory": [0.0, 1.0],
-                "n_evaluations": 1,
-                "return_code": 0,
-                "wall_seconds": 1.0,
-            }),
-            encoding="utf-8",
-        )
-        prov_path = seed_dir / PROVENANCE_FILENAME
-        write_seed_provenance(
-            seed_dir,
-            campaign_uid="m16-test",
-            iteration=int(iter_dir.name.split("-")[-1]),
-            trajectory_sha256="0" * 64,
-            seed_frame_id=i,
-            seed_selection_origin="variance",
-            seed_variance_at_selection=0.001,
-            subspace_neighbour_frame_ids=[],
-            subspace_dimension=0,
-            subspace_eigenvalues=[],
-            mode_weighting_policy="variance",
-        )
-        records.append({
-            "candidate_id": "phase-b-candidate-" + str(i),
-            "seed_index": int(i),
-            "seed_dir": str(seed_dir.resolve()),
-            "result_json": str(result_path.resolve()),
-            "provenance_json": str(prov_path.resolve()),
-            "seed_frame_id": int(i),
-            "selection_index": int(i),
-            "selection_origin": "variance",
-            "variance_at_selection": 0.001,
-            "alpha_final": 1.0,
-            "candidate_index": int(i),
-            "raw_index": int(i),
-            "final_index": int(i),
-            "kept_after_dedup": True,
-            "drop_reason": None,
-        })
-        xyz_lines.extend([
-            "3",
-            "seed_" + str(i).zfill(4),
-            "O " + " ".join(str(x) for x in coords[0]),
-            "H " + " ".join(str(x) for x in coords[1]),
-            "H " + " ".join(str(x) for x in coords[2]),
-        ])
     iteration = int(iter_dir.name.split("-")[-1])
     campaign = iter_dir.parent.parent
-    allocation_path = point_allocation_path(
-        campaign,
-        context="active",
-        iteration=iteration,
+    cfg = CampaignConfig(max_iterations=max(1, iteration))
+    cfg.phase_b.descriptor = "rmsd_massweight"
+    cfg.point_allocation.batch_training_size = int(n_final)
+    cfg.point_allocation.batch_internal_validation_size = 0
+    cfg.seed_selection.n_seeds_per_iteration = int(n_final)
+    cfg.to_yaml(campaign / "campaign.yaml")
+    state = fresh_campaign_state(max_iterations=max(1, iteration))
+    state.campaign_uid = "m16-test"
+    state.phase = _CampaignPhase.ARIADNE_ARRAY
+    state.iteration = iteration
+    state.reference_data_version = 0
+    state.models_version = 0
+    state_path = campaign / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    write_state(state_path, state)
+    _seed_ariadne_pool(campaign, iteration=iteration, n_seeds=int(n_final))
+    for seed_index in range(int(n_final)):
+        seed_dir = ariadne_seed_dir(iter_dir, seed_index + 1)
+        result_path = seed_dir / "result.json"
+        result_payload = json.loads(result_path.read_text(encoding="utf-8"))
+        coordinates = [list(row) for row in result_payload["final_coordinates"]]
+        coordinates[1][0] += 0.60 * seed_index
+        coordinates[2][1] += 0.40 * seed_index
+        result_payload["final_coordinates"] = coordinates
+        result_payload["landing_safety"]["metrics"][
+            "max_displacement_ang"
+        ] = 0.60 * seed_index
+        _rewrite_seed_result(seed_dir, result_payload)
+    executor = LiveBackendsPhaseExecutor(
+        campaign_dir=campaign,
+        config=cfg,
+        backend_check=False,
     )
-    allocation = create_point_allocation(
-        allocation_path,
-        campaign_uid="m16-test",
-        context="active",
-        iteration=iteration,
-        targets={
-            "train": int(n_final),
-            "int_val": 0,
-            "ext_val": 0,
-            "total": int(n_final),
-        },
-        primary_candidates=[
-            {
-                "candidate_id": str(record["candidate_id"]),
-                "seed_index": int(record["seed_index"]),
-                "frame_id": int(record["seed_frame_id"]),
-            }
-            for record in records
-        ],
-        reserve_candidates=[],
+    parsed = executor._parse_ariadne_array_postprocess(
+        state,
+        _CampaignPhase.ARIADNE_ARRAY,
+        observations=[],
     )
-    slot_by_candidate = {
-        str(slot["attempts"][0]["candidate_id"]): slot
-        for slot in allocation["slots"]
-    }
-    for record in records:
-        slot = slot_by_candidate[str(record["candidate_id"])]
-        enrich_with_point_allocation(
-            Path(record["seed_dir"]),
-            candidate_id=str(record["candidate_id"]),
-            context="active",
-            slot_id=int(slot["slot_id"]),
-            split=str(slot["split"]),
-        )
-    if write_sample:
-        (iter_dir / "phase_b_SAMPLE.xyz").write_text(
-            "\n".join(xyz_lines) + "\n",
-            encoding="utf-8",
-            newline="\n",
-        )
-    write_phase_b_selection_manifest(iter_dir, {
-        "schema_version": PHASE_B_SELECTION_SCHEMA_VERSION,
-        "iteration": int(iter_dir.name.split("-")[-1]),
-        "descriptor": "hybrid_alf_rmsd",
-        "source_ariadne_manifest": "",
-        "point_allocation": {
-            "manifest": str(allocation_path.resolve()),
-            "targets": dict(allocation["targets"]),
-            "reserve": [],
-            "reserve_count": 0,
-        },
-        "n_candidates": int(n_final),
-        "n_selected_raw": int(n_final),
-        "n_kept": int(n_final),
-        "raw": records,
-        "final": records,
-        "dedup": {
-            "n_candidates": int(n_final),
-            "n_kept": int(n_final),
-            "n_dropped": 0,
-            "min_separation": 0.05,
-        },
-    })
-    return records
+    assert parsed.failure_reason is None
+    state.phase = _CampaignPhase.PHASE_B_POLUS
+    write_state(state_path, state)
+    rc = polus_main([
+        "--descriptor",
+        "rmsd_massweight",
+        "--iteration",
+        str(iteration),
+        "--campaign-dir",
+        str(campaign),
+    ])
+    assert rc == 0
+    payload = read_phase_b_selection_manifest(
+        iter_dir,
+        expected_iteration=iteration,
+    )
+    if not write_sample:
+        selected = active_phase_b_dir(iter_dir) / "selected.xyz"
+        selected.unlink()
+    assert phase_b_selection_path(iter_dir).is_file()
+    return list(payload["final"])
 
 
 def test_polus_phase_a_happy_path(tmp_path):
@@ -1893,11 +2059,11 @@ def test_polus_phase_a_happy_path(tmp_path):
 
 def test_polus_phase_a_missing_outdir(tmp_path):
     ex = _make_executor(tmp_path)
-    # 3_DIVERSITY_SAMPLING dir does NOT yet exist. The executor __post_init__
+    # BOOTSTRAP dir does NOT yet exist. The executor __post_init__
     # in fact creates it, so synthesise a stricter no-dir scenario by binding
     # diversity_dir_name to a known-empty alternate.
     import shutil
-    target = tmp_path / "campaign" / "3_DIVERSITY_SAMPLING" / "initial"
+    target = tmp_path / "campaign" / "BOOTSTRAP" / "selection"
     if target.exists():
         shutil.rmtree(target.parent)
     state = SimpleNamespace(iteration=0, campaign_uid="m16-test")
@@ -1912,7 +2078,7 @@ def test_polus_phase_a_no_sample_in_outdir(tmp_path):
     ex = _make_executor(tmp_path)
     # The diversity dir is created at __post_init__ time but no sample yet.
     state = SimpleNamespace(iteration=0, campaign_uid="m16-test")
-    target = tmp_path / "campaign" / "3_DIVERSITY_SAMPLING" / "initial"
+    target = tmp_path / "campaign" / "BOOTSTRAP" / "selection"
     target.mkdir(parents=True, exist_ok=True)
     result = ex._parse_polus_postprocess(
         state, CampaignPhase("PHASE_A_POLUS"), observations=[],
@@ -1924,7 +2090,7 @@ def test_polus_phase_a_no_sample_in_outdir(tmp_path):
 def test_polus_phase_a_uses_manifest_not_lexical_last(tmp_path):
     ex = _make_executor(tmp_path)
     outdir = _seed_phase_a_sample(tmp_path / "campaign", n_frames=2)
-    stale = outdir / "initial-SAMPLE-999.xyz"
+    stale = outdir / "retired-sample-name.xyz"
     stale.write_text("garbage no frames here", encoding="utf-8")
     state = SimpleNamespace(iteration=0, campaign_uid="m16-test")
     result = ex._parse_polus_postprocess(
@@ -1933,7 +2099,7 @@ def test_polus_phase_a_uses_manifest_not_lexical_last(tmp_path):
     assert result.failure_reason is None
     events = _read_journal_events(tmp_path / "campaign")
     succeeded = [e for e in events if e.get("event") == "phase_succeeded_live"]
-    assert succeeded[-1]["sample_path"].endswith("initial-SAMPLE-2.xyz")
+    assert succeeded[-1]["sample_path"].endswith("selected.xyz")
 
 
 def test_polus_phase_a_manifest_count_mismatch_fails(tmp_path):
@@ -1941,14 +2107,14 @@ def test_polus_phase_a_manifest_count_mismatch_fails(tmp_path):
 
     ex = _make_executor(tmp_path)
     outdir = _seed_phase_a_sample(tmp_path / "campaign", n_frames=2)
-    sample = outdir / "initial-SAMPLE-2.xyz"
-    index = outdir / "initial-INDEX-2.dat"
-    existing = json.loads((outdir / "PHASE_A_SAMPLE.json").read_text(encoding="utf-8"))
+    sample = outdir / "selected.xyz"
+    index = outdir / "selected_indices.dat"
+    existing = json.loads((outdir / "SELECTION.json").read_text(encoding="utf-8"))
     allocation = dict(existing["point_allocation"])
     allocation["primary"] = list(allocation["primary"][:1])
     write_phase_a_sample_manifest(outdir, {
         "phase": "PHASE_A_POLUS",
-        "iteration": -1,
+        "iteration": 0,
         "sample_xyz": str(sample.resolve()),
         "index_path": str(index.resolve()),
         "n_select": 1,
@@ -1962,7 +2128,7 @@ def test_polus_phase_a_manifest_count_mismatch_fails(tmp_path):
         state, CampaignPhase("PHASE_A_POLUS"), observations=[],
     )
     assert result.failure_reason is not None
-    assert "phase_a_sample_count_mismatch" in result.failure_reason
+    assert "Phase A sample XYZ frame count mismatch" in result.failure_reason
 
 
 def test_polus_phase_b_happy_path(tmp_path):
@@ -1983,34 +2149,26 @@ def test_polus_phase_b_happy_path(tmp_path):
 
 def test_polus_phase_b_missing_sample(tmp_path):
     ex = _make_executor(tmp_path)
-    iter_dir = (
-        tmp_path / "campaign" / "7_ACTIVE_LEARNING" / "iteration-0005"
-    )
-    iter_dir.mkdir(parents=True, exist_ok=True)
+    iter_dir = active_iteration_dir(tmp_path / "campaign", 5)
     _write_phase_b_manifest(iter_dir, n_final=1, write_sample=False)
     state = SimpleNamespace(iteration=5, campaign_uid="m16-test")
     result = ex._parse_polus_postprocess(
         state, CampaignPhase("PHASE_B_POLUS"), observations=[],
     )
     assert result.failure_reason is not None
-    assert "phase_b_sample_missing" in result.failure_reason
+    assert "phase_b_selection_manifest_invalid" in result.failure_reason
 
 
 def test_polus_phase_b_raw_sample_only_is_rejected(tmp_path):
     ex = _make_executor(tmp_path)
-    iter_dir = (
-        tmp_path / "campaign" / "7_ACTIVE_LEARNING" / "iteration-0005"
-    )
-    iter_dir.mkdir(parents=True, exist_ok=True)
-    src = FIXTURES / "polus_phase_b" / "phase_b_SAMPLE.xyz"
-    (iter_dir / "phase_b_SAMPLE_raw.xyz").write_bytes(src.read_bytes())
+    iter_dir = active_iteration_dir(tmp_path / "campaign", 5)
     _write_phase_b_manifest(iter_dir, n_final=1, write_sample=False)
     state = SimpleNamespace(iteration=5, campaign_uid="m16-test")
     result = ex._parse_polus_postprocess(
         state, CampaignPhase("PHASE_B_POLUS"), observations=[],
     )
     assert result.failure_reason is not None
-    assert "phase_b_sample_missing" in result.failure_reason
+    assert "phase_b_selection_manifest_invalid" in result.failure_reason
 
 
 def test_polus_phase_b_enriches_seed_provenance(tmp_path):
@@ -2021,25 +2179,8 @@ def test_polus_phase_b_enriches_seed_provenance(tmp_path):
     )
     ex = _make_executor(tmp_path)
     iter_dir = _seed_phase_b_sample(tmp_path / "campaign", iteration=5)
-    _write_phase_b_manifest(iter_dir, n_final=2)
-    pool_dir = iter_dir / "pool"
-    pool_dir.mkdir(parents=True, exist_ok=True)
-    # Write a synthetic seed_0000 with provenance.
-    seed_dir = pool_dir / "seed_0000"
-    seed_dir.mkdir(parents=True, exist_ok=True)
-    write_seed_provenance(
-        seed_dir,
-        campaign_uid="m16-test",
-        iteration=5,
-        trajectory_sha256="0" * 64,
-        seed_frame_id=42,
-        seed_selection_origin="variance",
-        seed_variance_at_selection=0.001,
-        subspace_neighbour_frame_ids=[],
-        subspace_dimension=0,
-        subspace_eigenvalues=[],
-        mode_weighting_policy="variance",
-    )
+    records = _write_phase_b_manifest(iter_dir, n_final=2)
+    seed_dir = Path(records[0]["seed_dir"])
     state = SimpleNamespace(iteration=5, campaign_uid="m16-test")
     result = ex._parse_polus_postprocess(
         state, CampaignPhase("PHASE_B_POLUS"), observations=[],
@@ -2048,17 +2189,25 @@ def test_polus_phase_b_enriches_seed_provenance(tmp_path):
     prov = read_provenance(seed_dir)
     assert prov["phase_b"] is not None
     assert prov["phase_b"]["selected_after_fps"] is True
-    assert prov["phase_b"]["diversity_rank"] == 0
+    assert prov["phase_b"]["diversity_rank"] == 1
 
 
 def test_polus_phase_b_unreadable_sample_fails(tmp_path):
     ex = _make_executor(tmp_path)
-    iter_dir = (
-        tmp_path / "campaign" / "7_ACTIVE_LEARNING" / "iteration-0005"
-    )
-    iter_dir.mkdir(parents=True, exist_ok=True)
-    (iter_dir / "phase_b_SAMPLE.xyz").write_text("garbage no frames here", encoding="utf-8")
-    _write_phase_b_manifest(iter_dir, n_final=1, write_sample=False)
+    from ichor.hpc.active_learning.daemon.state import atomic_write_json
+    from ichor.hpc.active_learning.handoff_manifests import phase_b_selection_path
+    from ichor.hpc.active_learning.layout import active_phase_b_dir
+    from ichor.hpc.active_learning.versioning.manifest import sha256_file
+
+    iter_dir = active_iteration_dir(tmp_path / "campaign", 5)
+    _write_phase_b_manifest(iter_dir, n_final=1, write_sample=True)
+    sample = active_phase_b_dir(iter_dir) / "selected.xyz"
+    sample.write_text("garbage no frames here", encoding="utf-8")
+    manifest_path = phase_b_selection_path(iter_dir)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["selected_xyz"]["size"] = int(sample.stat().st_size)
+    manifest["selected_xyz"]["sha256"] = sha256_file(sample)
+    atomic_write_json(manifest_path, manifest)
     state = SimpleNamespace(iteration=5, campaign_uid="m16-test")
     result = ex._parse_polus_postprocess(
         state, CampaignPhase("PHASE_B_POLUS"), observations=[],

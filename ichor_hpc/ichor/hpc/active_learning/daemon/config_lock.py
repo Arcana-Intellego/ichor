@@ -501,10 +501,10 @@ def _phase_a_consumed(campaign_dir: Union[str, Path]) -> Optional[str]:
     path = _first_existing_path(
         campaign_dir,
         (
-            "3_DIVERSITY_SAMPLING/initial/PHASE_A_SAMPLE.json",
-            "3_DIVERSITY_SAMPLING/initial/*SAMPLE*.xyz",
-            "3_DIVERSITY_SAMPLING/initial/*INDEX*.dat",
-            "3_DIVERSITY_SAMPLING/initial/POINT_ALLOCATION.json",
+            "BOOTSTRAP/selection/SELECTION.json",
+            "BOOTSTRAP/selection/selected.xyz",
+            "BOOTSTRAP/selection/selected_indices.dat",
+            "BOOTSTRAP/allocation/POINT_ALLOCATION.json",
         ),
     )
     if path:
@@ -590,32 +590,34 @@ def _ferebus_first_consumed(campaign_dir: Union[str, Path]) -> Optional[str]:
 
 
 def _iteration_dir(campaign_dir: Union[str, Path], iteration: int) -> Path:
-    return (
-        Path(campaign_dir)
-        / "7_ACTIVE_LEARNING"
-        / ("iteration-" + str(int(iteration)).zfill(4))
-    )
+    from ..layout import active_iteration_dir
+
+    return active_iteration_dir(campaign_dir, int(iteration))
 
 
 def _ariadne_outputs_exist(campaign_dir: Union[str, Path], proposed_state: CampaignState) -> bool:
     iteration = int(getattr(proposed_state, "iteration", 0))
+    if iteration < 1:
+        return False
     iter_dir = _iteration_dir(campaign_dir, iteration)
     if _phase_intent_exists(campaign_dir, CampaignPhase.ARIADNE_ARRAY, iteration):
         return True
-    for name in (
-        "ARIADNE_RESULTS.json",
-        "ARIADNE_LANDING_AUDIT.json",
-        "ACQUISITION_MATURITY_AUDIT.json",
-        "ERROR_CALIBRATION_AUDIT.json",
-        "SAMPLING_SCALE_MODEL.json",
-        "SAMPLING_PROTOCOL_RESOLVED.json",
-        "SAMPLING_PROTOCOL_AUDIT.json",
+    from ..layout import active_ariadne_dir, active_calibration_dir, active_protocol_dir, ariadne_seeds_dir
+
+    for path in (
+        active_ariadne_dir(iter_dir) / "RESULTS.json",
+        active_ariadne_dir(iter_dir) / "AUDIT.json",
+        active_ariadne_dir(iter_dir) / "TASK_MAP.json",
+        active_calibration_dir(iter_dir) / "ERROR_CALIBRATION_AUDIT.json",
+        active_protocol_dir(iter_dir) / "SAMPLING_SCALE_MODEL.json",
+        active_protocol_dir(iter_dir) / "SAMPLING_PROTOCOL_RESOLVED.json",
+        active_protocol_dir(iter_dir) / "SAMPLING_PROTOCOL_AUDIT.json",
     ):
-        if (iter_dir / name).is_file():
+        if path.is_file():
             return True
-    pool = iter_dir / "pool"
-    if pool.is_dir():
-        for result in pool.glob("seed_*/result.json"):
+    seeds = ariadne_seeds_dir(iter_dir)
+    if seeds.is_dir():
+        for result in seeds.glob("seed-*/result.json"):
             if result.is_file():
                 return True
     return False
@@ -626,6 +628,8 @@ def _ariadne_consumed_reason(
     proposed_state: CampaignState,
 ) -> Optional[str]:
     iteration = int(getattr(proposed_state, "iteration", 0))
+    if iteration < 1:
+        return None
     intent = _phase_intent_file_exists(
         campaign_dir,
         (CampaignPhase.ARIADNE_ARRAY,),
@@ -634,21 +638,22 @@ def _ariadne_consumed_reason(
     if intent:
         return "ARIADNE submission intent exists: " + intent
     iter_dir = _iteration_dir(campaign_dir, iteration)
-    for name in (
-        "ARIADNE_RESULTS.json",
-        "ARIADNE_LANDING_AUDIT.json",
-        "ACQUISITION_MATURITY_AUDIT.json",
-        "ERROR_CALIBRATION_AUDIT.json",
-        "SAMPLING_SCALE_MODEL.json",
-        "SAMPLING_PROTOCOL_RESOLVED.json",
-        "SAMPLING_PROTOCOL_AUDIT.json",
+    from ..layout import active_ariadne_dir, active_calibration_dir, active_protocol_dir, ariadne_seeds_dir
+
+    for path in (
+        active_ariadne_dir(iter_dir) / "RESULTS.json",
+        active_ariadne_dir(iter_dir) / "AUDIT.json",
+        active_ariadne_dir(iter_dir) / "TASK_MAP.json",
+        active_calibration_dir(iter_dir) / "ERROR_CALIBRATION_AUDIT.json",
+        active_protocol_dir(iter_dir) / "SAMPLING_SCALE_MODEL.json",
+        active_protocol_dir(iter_dir) / "SAMPLING_PROTOCOL_RESOLVED.json",
+        active_protocol_dir(iter_dir) / "SAMPLING_PROTOCOL_AUDIT.json",
     ):
-        path = iter_dir / name
         if path.is_file():
             return "ARIADNE output exists: " + str(path)
-    pool = iter_dir / "pool"
-    if pool.is_dir():
-        for result in sorted(pool.glob("seed_*/result.json")):
+    seeds = ariadne_seeds_dir(iter_dir)
+    if seeds.is_dir():
+        for result in sorted(seeds.glob("seed-*/result.json")):
             if result.is_file():
                 return "ARIADNE seed result exists: " + str(result)
     return None
@@ -659,11 +664,14 @@ def _seed_select_consumed_reason(
     proposed_state: CampaignState,
 ) -> Optional[str]:
     iteration = int(getattr(proposed_state, "iteration", 0))
+    if iteration < 1:
+        return None
     iter_dir = _iteration_dir(campaign_dir, iteration)
-    for name in ("seeds_picked.json", "SEED_SELECTION_DIAGNOSTICS.json"):
-        path = iter_dir / name
-        if path.is_file():
-            return "seed-selection output exists: " + str(path)
+    from ..handoff_manifests import seeds_picked_path
+
+    path = seeds_picked_path(iter_dir)
+    if path.is_file():
+        return "seed-selection output exists: " + str(path)
     ariadne_reason = _ariadne_consumed_reason(campaign_dir, proposed_state)
     if ariadne_reason:
         return "ARIADNE already consumed seed selection: " + ariadne_reason
@@ -672,17 +680,20 @@ def _seed_select_consumed_reason(
 
 def _phase_b_outputs_exist(campaign_dir: Union[str, Path], proposed_state: CampaignState) -> bool:
     iteration = int(getattr(proposed_state, "iteration", 0))
+    if iteration < 1:
+        return False
     iter_dir = _iteration_dir(campaign_dir, iteration)
     if _phase_intent_exists(campaign_dir, CampaignPhase.PHASE_B_POLUS, iteration):
         return True
-    for name in (
-        "PHASE_B_SELECTION.json",
-        "phase_b_SAMPLE.xyz",
-        "phase_b_SAMPLE_raw.xyz",
-        "phase_b_dedup.json",
-        "POINT_ALLOCATION.json",
+    from ..layout import active_allocation_dir, active_phase_b_dir
+
+    for path in (
+        active_phase_b_dir(iter_dir) / "SELECTION.json",
+        active_phase_b_dir(iter_dir) / "selected.xyz",
+        active_phase_b_dir(iter_dir) / "selected_raw.xyz",
+        active_allocation_dir(iter_dir) / "POINT_ALLOCATION.json",
     ):
-        if (iter_dir / name).exists():
+        if path.exists():
             return True
     return False
 
@@ -692,6 +703,8 @@ def _phase_b_consumed_reason(
     proposed_state: CampaignState,
 ) -> Optional[str]:
     iteration = int(getattr(proposed_state, "iteration", 0))
+    if iteration < 1:
+        return None
     intent = _phase_intent_file_exists(
         campaign_dir,
         (CampaignPhase.PHASE_B_POLUS,),
@@ -700,14 +713,14 @@ def _phase_b_consumed_reason(
     if intent:
         return "Phase B submission intent exists: " + intent
     iter_dir = _iteration_dir(campaign_dir, iteration)
-    for name in (
-        "PHASE_B_SELECTION.json",
-        "phase_b_SAMPLE.xyz",
-        "phase_b_SAMPLE_raw.xyz",
-        "phase_b_dedup.json",
-        "POINT_ALLOCATION.json",
+    from ..layout import active_allocation_dir, active_phase_b_dir
+
+    for path in (
+        active_phase_b_dir(iter_dir) / "SELECTION.json",
+        active_phase_b_dir(iter_dir) / "selected.xyz",
+        active_phase_b_dir(iter_dir) / "selected_raw.xyz",
+        active_allocation_dir(iter_dir) / "POINT_ALLOCATION.json",
     ):
-        path = iter_dir / name
         if path.exists():
             return "Phase B output exists: " + str(path)
     return None
@@ -718,7 +731,13 @@ def _split_consumed_reason(
     proposed_state: CampaignState,
 ) -> Optional[str]:
     iteration = int(getattr(proposed_state, "iteration", 0))
-    path = _iteration_dir(campaign_dir, iteration) / "split.json"
+    if iteration < 1:
+        return None
+    from ..layout import active_allocation_dir
+
+    path = active_allocation_dir(
+        _iteration_dir(campaign_dir, iteration)
+    ) / "SPLIT_RECEIPT.json"
     if path.is_file():
         return "split output exists: " + str(path)
     return None
@@ -727,16 +746,15 @@ def _split_consumed_reason(
 def _active_iteration_committed(proposed_state: CampaignState, iteration: int) -> bool:
     """Return true when active-loop artefacts for ``iteration`` are committed.
 
-    The initial diverse set is version 0. Active iteration ``i`` appends a new
-    reference-data/model version ``i + 1``, so ARIADNE/Phase B outputs for iteration
-    ``i`` are historical only once both versions have reached that value.
+    Bootstrap is version 0. Active iteration ``i`` consumes version ``i - 1``
+    and commits reference-data/model version ``i``.
     """
     try:
         reference_data_version = int(getattr(proposed_state, "reference_data_version", -1))
         models_version = int(getattr(proposed_state, "models_version", -1))
     except (TypeError, ValueError):
         return False
-    return min(reference_data_version, models_version) >= int(iteration) + 1
+    return min(reference_data_version, models_version) >= int(iteration)
 
 
 def _phase_outputs_lock_change(

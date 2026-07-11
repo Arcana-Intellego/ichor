@@ -80,6 +80,21 @@ def _complete_allocation(
             iteration=iteration,
             trajectory_sha256="a" * 64,
             seed_frame_id=int(attempt["frame_id"]),
+            seed_id=(
+                int(attempt["slot_id"]) + 1
+                if context == "active"
+                else None
+            ),
+            seed_uid=(
+                format(int(attempt["slot_id"]) + 1, "064x")
+                if context == "active"
+                else None
+            ),
+            array_task_id_zero_based=(
+                int(attempt["slot_id"])
+                if context == "active"
+                else None
+            ),
             seed_selection_origin="bootstrap" if context == "bootstrap" else "variance",
             seed_variance_at_selection=None,
             subspace_neighbour_frame_ids=[],
@@ -93,6 +108,9 @@ def _complete_allocation(
             slot_id=int(attempt["slot_id"]),
             split=str(attempt["split"]),
             replacement_round=int(attempt.get("round", 0)),
+            allocation_slot_assignment_sha256=str(
+                allocation["slot_assignment_sha256"]
+            ),
         )
         results.append(
             {
@@ -121,14 +139,14 @@ def _commit_two_versions(campaign: Path):
     _complete_allocation(
         campaign,
         context="active",
-        iteration=0,
+        iteration=1,
         first_frame_id=10,
     )
     second, second_names, second_created = commit_reference_data_delta(
         campaign,
         reference_data_version=1,
         context="active",
-        iteration=0,
+        iteration=1,
     )
     return first, first_names, first_created, second, second_names, second_created
 

@@ -28,8 +28,8 @@ def _run(args, **kw):
 def test_main_bad_campaign_dir_exits_2(tmp_path):
     """missing campaign-dir -> exit 2."""
     bad = tmp_path / "no_such_dir"
-    result = _run(["--seed-index", "0",
-                   "--iteration", "0",
+    result = _run(["--array-task-id", "0",
+                   "--iteration", "1",
                    "--campaign-dir", str(bad)])
     assert result.returncode == 2
     assert "campaign-dir does not exist" in result.stderr
@@ -39,8 +39,8 @@ def test_main_missing_campaign_yaml_exits_2(tmp_path):
     """directory exists but campaign.yaml is missing -> exit 2."""
     campaign = tmp_path / "c"
     campaign.mkdir()
-    result = _run(["--seed-index", "0",
-                   "--iteration", "0",
+    result = _run(["--array-task-id", "0",
+                   "--iteration", "1",
                    "--campaign-dir", str(campaign)])
     assert result.returncode == 2
     assert "campaign.yaml not found" in result.stderr
@@ -55,8 +55,8 @@ def test_main_missing_state_exits_3(tmp_path):
     campaign.mkdir()
     cfg = CampaignConfig()
     cfg.to_yaml(campaign / "campaign.yaml")
-    result = _run(["--seed-index", "0",
-                   "--iteration", "0",
+    result = _run(["--array-task-id", "0",
+                   "--iteration", "1",
                    "--campaign-dir", str(campaign)])
     assert result.returncode == 3
     # the error message should mention something about the missing

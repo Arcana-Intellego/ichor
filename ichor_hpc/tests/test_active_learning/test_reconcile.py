@@ -29,8 +29,15 @@ from ichor.hpc.active_learning.daemon.state import (
 )
 from ichor.hpc.active_learning.handoff_manifests import (
     ARIADNE_RESULTS_SCHEMA_VERSION,
-    PHASE_B_SELECTION_SCHEMA_VERSION,
+    SEED_SELECTION_SCHEMA_VERSION,
+    seeds_picked_path,
     write_ariadne_results_manifest,
+)
+from ichor.hpc.active_learning.layout import (
+    active_allocation_dir,
+    active_ariadne_dir,
+    active_iteration_dir,
+    ariadne_seed_dir,
 )
 from ichor.hpc.active_learning.point_allocation import (
     create_point_allocation,
@@ -138,6 +145,21 @@ def _complete_handoff_allocation(campaign, *, context, iteration, pointdirs):
             iteration=iteration,
             trajectory_sha256="0" * 64,
             seed_frame_id=record.get("frame_id"),
+            seed_id=(
+                int(record["slot_id"]) + 1
+                if str(context) == "active"
+                else None
+            ),
+            seed_uid=(
+                format(int(record["slot_id"]) + 1, "064x")
+                if str(context) == "active"
+                else None
+            ),
+            array_task_id_zero_based=(
+                int(record["slot_id"])
+                if str(context) == "active"
+                else None
+            ),
             seed_selection_origin="reconcile_fixture",
             seed_variance_at_selection=None,
             subspace_neighbour_frame_ids=[],
@@ -150,6 +172,9 @@ def _complete_handoff_allocation(campaign, *, context, iteration, pointdirs):
             context=context,
             slot_id=record["slot_id"],
             split=record["split"],
+            allocation_slot_assignment_sha256=str(
+                allocation["slot_assignment_sha256"]
+            ),
         )
         results.append({
             "candidate_id": record["candidate_id"],
@@ -216,122 +241,102 @@ def _write_bootstrap_handoff(campaign, *, phase, iteration=0, archived=False, su
 
 
 def _iter_dir(campaign, iteration):
-    path = campaign / "7_ACTIVE_LEARNING" / ("iteration-" + str(int(iteration)).zfill(4))
+    path = active_iteration_dir(campaign, int(iteration))
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def _write_seeds_picked(campaign, iteration, *, n=1):
+    from ichor.hpc.active_learning.daemon.state import atomic_write_json
+    from ichor.hpc.active_learning.seed_identity import (
+        deterministic_seed_uid,
+        selection_fingerprint_sha256,
+        write_ariadne_task_map,
+    )
+
     iter_dir = _iter_dir(campaign, iteration)
     frame_ids = list(range(int(n)))
-    (iter_dir / "seeds_picked.json").write_text(
-        json.dumps({
-            "schema_version": 1,
-            "iteration": int(iteration),
-            "n_picked": int(n),
-            "frame_ids": frame_ids,
-            "indices": frame_ids,
-            "bulk_indices": frame_ids,
-            "variance_indices": [],
-            "variances": [0.0 for _ in frame_ids],
-            "seed_records": [
-                {
-                    "seed_index": int(i),
-                    "frame_id": int(i),
-                    "selection_index": int(i),
-                    "selection_origin": "bulk",
-                    "variance_at_selection": 0.0,
-                }
-                for i in frame_ids
-            ],
-        }),
-        encoding="utf-8",
-    )
-    return iter_dir
-
-
-def _write_phase_b_handoff(campaign, iteration, *, n=2):
-    iter_dir = _iter_dir(campaign, iteration)
-    pool = iter_dir / "pool"
-    raw = []
-    final = []
-    xyz_lines = []
-    for i in range(int(n)):
-        seed_dir = pool / ("seed_" + str(i).zfill(4))
-        seed_dir.mkdir(parents=True, exist_ok=True)
-        result = seed_dir / "result.json"
-        provenance = seed_dir / ".provenance.json"
-        result.write_text("{}", encoding="utf-8")
-        provenance.write_text("{}", encoding="utf-8")
-        record = {
-            "raw_index": int(i),
-            "final_index": int(i),
-            "seed_index": int(i),
-            "seed_dir": str(seed_dir),
-            "result_json": str(result),
-            "provenance_json": str(provenance),
-            "kept_after_dedup": True,
-        }
-        raw.append(dict(record))
-        final.append(dict(record))
-        xyz_lines.extend([
-            "1",
-            "frame " + str(i),
-            "H " + str(float(i)) + " 0.0 0.0",
-        ])
-    (iter_dir / "phase_b_SAMPLE.xyz").write_text(
-        "\n".join(xyz_lines) + "\n",
-        encoding="utf-8",
-    )
-    allocation_path, allocation, allocation_records = _write_pending_allocation(
-        campaign,
-        context="active",
-        iteration=iteration,
-        n=n,
-    )
-    allocation_by_seed = {
-        int(record["frame_id"]): record for record in allocation_records
+    state_path = campaign / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
+    state = read_state(state_path) if state_path.is_file() else fresh_campaign_state()
+    campaign_uid = str(state.campaign_uid or "reconcile-test")
+    model_version = max(0, int(state.models_version))
+    model_manifest_sha256 = "c" * 64
+    trajectory_sha256 = "0" * 64
+    payload = {
+        "schema_version": SEED_SELECTION_SCHEMA_VERSION,
+        "campaign_uid": campaign_uid,
+        "iteration": int(iteration),
+        "models_version": model_version,
+        "model_manifest_sha256": model_manifest_sha256,
+        "trajectory_sha256": trajectory_sha256,
+        "selection_strategy": "hybrid_variance",
+        "n_picked": int(n),
+        "seed_records": [
+            {
+                "seed_id": int(i + 1),
+                "frame_id": int(i),
+                "pool_row_index_zero_based": int(i),
+                "selection_origin": "bulk",
+                "variance_at_selection": 0.0,
+            }
+            for i in frame_ids
+        ],
     }
-    for record in raw:
-        allocation_record = allocation_by_seed[int(record["seed_index"])]
-        record.update({
-            "candidate_id": allocation_record["candidate_id"],
-            "slot_id": allocation_record["slot_id"],
-            "split": allocation_record["split"],
-        })
-    final = [dict(record) for record in raw]
-    (iter_dir / "PHASE_B_SELECTION.json").write_text(
-        json.dumps({
-            "schema_version": PHASE_B_SELECTION_SCHEMA_VERSION,
-            "iteration": int(iteration),
-            "n_selected_raw": int(n),
-            "n_kept": int(n),
-            "raw": raw,
-            "final": final,
-            "point_allocation": {
-                "manifest": str(allocation_path.resolve()),
-                "targets": dict(allocation["targets"]),
-                "reserve": [],
-            },
-        }),
-        encoding="utf-8",
-    )
+    fingerprint = selection_fingerprint_sha256(payload)
+    payload["selection_fingerprint_sha256"] = fingerprint
+    for record in payload["seed_records"]:
+        record["seed_uid"] = deterministic_seed_uid(
+            campaign_uid=campaign_uid,
+            iteration=int(iteration),
+            seed_id=int(record["seed_id"]),
+            frame_id=int(record["frame_id"]),
+            models_version=model_version,
+            model_manifest_sha256=model_manifest_sha256,
+            selection_fingerprint_sha256_value=fingerprint,
+        )
+    selection_path = seeds_picked_path(iter_dir)
+    selection_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(selection_path, payload)
+    write_ariadne_task_map(iter_dir, payload)
     return iter_dir
 
 
-def _write_legacy_ariadne_results_without_landing_safety(campaign, iteration):
-    iter_dir = _iter_dir(campaign, iteration)
-    seed_dir = iter_dir / "pool" / "seed_0000"
-    seed_dir.mkdir(parents=True, exist_ok=True)
-    result_path = seed_dir / "result.json"
-    result_path.write_text(
-        json.dumps({
+def _write_ariadne_handoff(campaign, iteration, *, n=2, include_safety=True):
+    from ichor.hpc.active_learning.ariadne_outputs import (
+        write_optimisation_trajectory,
+        write_seed_output_manifest,
+    )
+    from ichor.hpc.active_learning.daemon.state import atomic_write_json
+    from ichor.hpc.active_learning.seed_identity import read_ariadne_task_map
+    from ichor.hpc.active_learning.versioning.manifest import sha256_file
+    from ichor.hpc.active_learning.versioning.provenance import PROVENANCE_FILENAME
+
+    iter_dir = _write_seeds_picked(campaign, iteration, n=n)
+    task_map = read_ariadne_task_map(
+        iter_dir,
+        expected_iteration=int(iteration),
+    )
+    ariadne_root = active_ariadne_dir(iter_dir)
+    accepted = []
+    for task in task_map["tasks"]:
+        seed_id = int(task["seed_id"])
+        array_task_id = int(task["array_task_id"])
+        seed_uid = str(task["seed_uid"])
+        seed_dir = ariadne_seed_dir(iter_dir, seed_id)
+        seed_dir.mkdir(parents=True, exist_ok=False)
+        result = {
             "iteration": int(iteration),
-            "seed_index": 0,
-            "seed_frame_id": 0,
+            "seed_id": seed_id,
+            "seed_uid": seed_uid,
+            "array_task_id": array_task_id,
+            "seed_frame_id": array_task_id,
             "trajectory_sha256": "0" * 64,
-            "atom_types": ["H"],
-            "final_coordinates": [[0.0, 0.0, 0.0]],
+            "atom_types": ["O", "H", "H"],
+            "final_coordinates": [
+                [0.0, 0.0, 0.0],
+                [0.96 + 0.40 * (array_task_id + 1), 0.0, 0.0],
+                [-0.24, 0.93 + 0.30 * (array_task_id + 1), 0.0],
+            ],
             "alpha_trajectory": [0.0, 1.0],
             "alpha_initial": 0.0,
             "alpha_final": 1.0,
@@ -340,32 +345,124 @@ def _write_legacy_ariadne_results_without_landing_safety(campaign, iteration):
             "wall_seconds": 1.0,
             "fell_back_to_ds": False,
             "whitened_distance_final": 0.5,
-        }),
-        encoding="utf-8",
-    )
-    provenance_path = seed_dir / ".provenance.json"
-    provenance_path.write_text("{}", encoding="utf-8")
+            "task_success": True,
+        }
+        if include_safety:
+            result["landing_safety"] = {
+                "accepted": True,
+                "policy": "raw_final",
+                "selected_origin": "raw_final",
+                "reasons": [],
+            }
+        result_path = seed_dir / "result.json"
+        atomic_write_json(result_path, result)
+        write_optimisation_trajectory(
+            seed_dir,
+            atom_types=result["atom_types"],
+            coordinate_frames=[result["final_coordinates"]],
+            alpha_values=[result["alpha_final"]],
+            gradient_norms=[0.0],
+            origins=["raw_final"],
+        )
+        output_manifest = write_seed_output_manifest(
+            seed_dir,
+            campaign_uid=str(task_map["campaign_uid"]),
+            iteration=int(iteration),
+            seed_id=seed_id,
+            seed_uid=seed_uid,
+            array_task_id=array_task_id,
+            task_success=True,
+            task_exit_code=0,
+        )
+        provenance_path = write_seed_provenance(
+            seed_dir,
+            campaign_uid=str(task_map["campaign_uid"]),
+            iteration=int(iteration),
+            trajectory_sha256="0" * 64,
+            seed_frame_id=array_task_id,
+            seed_id=seed_id,
+            seed_uid=seed_uid,
+            array_task_id_zero_based=array_task_id,
+            seed_selection_origin="bulk",
+            seed_variance_at_selection=0.0,
+            subspace_neighbour_frame_ids=[],
+            subspace_dimension=0,
+            subspace_eigenvalues=[],
+        )
+        record = {
+            "seed_id": seed_id,
+            "seed_uid": seed_uid,
+            "array_task_id": array_task_id,
+            "seed_dir": seed_dir.relative_to(ariadne_root).as_posix(),
+            "result_json": result_path.relative_to(ariadne_root).as_posix(),
+            "provenance_json": provenance_path.relative_to(ariadne_root).as_posix(),
+            "output_manifest": output_manifest.relative_to(ariadne_root).as_posix(),
+            "seed_frame_id": array_task_id,
+            "pool_row_index_zero_based": array_task_id,
+            "selection_origin": "bulk",
+            "variance_at_selection": 0.0,
+            "alpha_initial": 0.0,
+            "alpha_final": 1.0,
+            "whitened_distance_final": 0.5,
+            "return_code": 0,
+            "result_sha256": sha256_file(result_path),
+            "provenance_sha256": sha256_file(
+                seed_dir / PROVENANCE_FILENAME
+            ),
+            "output_manifest_sha256": sha256_file(output_manifest),
+        }
+        if include_safety:
+            record["landing_safety"] = dict(result["landing_safety"])
+        accepted.append(record)
     write_ariadne_results_manifest(iter_dir, {
         "schema_version": ARIADNE_RESULTS_SCHEMA_VERSION,
+        "campaign_uid": str(task_map["campaign_uid"]),
         "iteration": int(iteration),
         "trajectory_sha256": "0" * 64,
-        "expected_n": 1,
-        "n_accepted": 1,
+        "task_map": {
+            "path": "TASK_MAP.json",
+            "sha256": sha256_file(ariadne_root / "TASK_MAP.json"),
+        },
+        "expected_n": int(n),
+        "n_accepted": int(n),
         "n_rejected": 0,
-        "accepted": [{
-            "seed_index": 0,
-            "seed_frame_id": 0,
-            "seed_dir": str(seed_dir.resolve()),
-            "result_json": str(result_path.resolve()),
-            "provenance_json": str(provenance_path.resolve()),
-            "return_code": 0,
-        }],
+        "accepted": accepted,
         "rejected": [],
     })
     return iter_dir
 
 
-def _write_split(campaign, iteration, *, train, val, holdout=None):
+def _write_phase_b_handoff(campaign, iteration, *, n=2):
+    from types import SimpleNamespace
+
+    from ichor.hpc.active_learning.config import CampaignConfig
+    from ichor.hpc.active_learning.sampling.polus_wrapper import _run_phase_b
+
+    iter_dir = _write_ariadne_handoff(campaign, iteration, n=n)
+    config = CampaignConfig()
+    config.phase_b.descriptor = "rmsd_massweight"
+    config.point_allocation.batch_training_size = 1
+    config.point_allocation.batch_internal_validation_size = int(n) - 1
+    from ichor.hpc.active_learning.sampling_protocol import (
+        resolve_sampling_protocol,
+    )
+
+    resolve_sampling_protocol(
+        campaign,
+        config,
+        iteration=int(iteration),
+    )
+    assert _run_phase_b(
+        SimpleNamespace(iteration=int(iteration)),
+        Path(campaign),
+        config,
+    ) == 0
+    return iter_dir
+
+
+def _write_split(campaign, iteration):
+    from ichor.hpc.active_learning.daemon.state import atomic_write_json
+
     iter_dir = _iter_dir(campaign, iteration)
     allocation_path = point_allocation_path(
         campaign,
@@ -377,34 +474,34 @@ def _write_split(campaign, iteration, *, train, val, holdout=None):
             campaign,
             context="active",
             iteration=iteration,
-            n=len(train) + len(val) + len(holdout or []),
+            n=1,
         )
     allocation = json.loads(allocation_path.read_text(encoding="utf-8"))
-    (iter_dir / "split.json").write_text(
-        json.dumps({
-            "schema_version": 2,
-            "iteration": int(iteration),
-            "strategy": "exact_pre_qm_point_allocation",
-            "point_allocation_manifest": str(allocation_path.resolve()),
-            "targets": dict(allocation["targets"]),
-            "slots": [
-                {
-                    "slot_id": int(slot["slot_id"]),
-                    "split": str(slot["split"]),
-                    "candidate_id": str(slot["attempts"][0]["candidate_id"]),
-                }
-                for slot in allocation["slots"]
-            ],
-        }),
-        encoding="utf-8",
-    )
-    return iter_dir / "split.json"
+    split_path = active_allocation_dir(iter_dir) / "SPLIT_RECEIPT.json"
+    split_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(split_path, {
+        "schema_version": 3,
+        "iteration": int(iteration),
+        "strategy": "exact_pre_qm_point_allocation",
+        "point_allocation_manifest": str(allocation_path.resolve()),
+        "slot_assignment_sha256": str(allocation["slot_assignment_sha256"]),
+        "targets": dict(allocation["targets"]),
+        "slots": [
+            {
+                "slot_id": int(slot["slot_id"]),
+                "split": str(slot["split"]),
+                "candidate_id": str(slot["attempts"][0]["candidate_id"]),
+            }
+            for slot in allocation["slots"]
+        ],
+    })
+    return split_path
 
 
 def _commit_reference_versions(campaign, versions):
     for version in versions:
         context = "bootstrap" if int(version) == 0 else "active"
-        iteration = 0 if context == "bootstrap" else int(version) - 1
+        iteration = 0 if context == "bootstrap" else int(version)
         staging_name = "initial" if context == "bootstrap" else "iter_" + str(iteration)
         pointdir = (
             Path(campaign)
@@ -414,6 +511,20 @@ def _commit_reference_versions(campaign, versions):
             / "POINT_0000.pointdir"
         )
         pointdir.mkdir(parents=True, exist_ok=True)
+        (pointdir / "input.gjf").write_text(
+            "#p hf/sto-3g\n\nreconcile fixture\n\n0 1\n"
+            "O 0.000000 0.000000 0.000000\n"
+            "H 0.960000 0.000000 0.000000\n"
+            "H -0.240000 0.930000 0.000000\n\n",
+            encoding="utf-8",
+        )
+        (pointdir / "geometry.xyz").write_text(
+            "3\nreconcile fixture\n"
+            "O 0.000000 0.000000 0.000000\n"
+            "H 0.960000 0.000000 0.000000\n"
+            "H -0.240000 0.930000 0.000000\n",
+            encoding="utf-8",
+        )
         _complete_handoff_allocation(
             campaign,
             context=context,
@@ -464,13 +575,13 @@ def test_active_replacement_recovery_advances_only_with_durable_handoffs(tmp_pat
     allocation_path = point_allocation_path(
         campaign,
         context="active",
-        iteration=0,
+        iteration=1,
     )
     allocation = create_point_allocation(
         allocation_path,
         campaign_uid="replacement-recovery-test",
         context="active",
-        iteration=0,
+        iteration=1,
         targets={"train": 1, "int_val": 0, "ext_val": 0, "total": 1},
         primary_candidates=[{"candidate_id": "candidate-primary"}],
         reserve_candidates=[
@@ -494,6 +605,7 @@ def test_active_replacement_recovery_advances_only_with_durable_handoffs(tmp_pat
         ],
     )
     state = fresh_campaign_state(max_iterations=3)
+    state.iteration = 1
     state.reference_data_version = 0
     state.models_version = 0
 
@@ -503,7 +615,7 @@ def test_active_replacement_recovery_advances_only_with_durable_handoffs(tmp_pat
     prepare_replacement_round(
         campaign,
         context="active",
-        iteration=0,
+        iteration=1,
         replacement_round=1,
     )
     decisions = active_iteration_handoff_decisions(campaign, state)
@@ -515,7 +627,7 @@ def test_active_replacement_recovery_advances_only_with_durable_handoffs(tmp_pat
     round_dir = replacement_round_dir(
         campaign,
         context="active",
-        iteration=0,
+        iteration=1,
         replacement_round=1,
     )
     pointdir = round_dir / "POINT_0001.pointdir"
@@ -524,7 +636,7 @@ def test_active_replacement_recovery_advances_only_with_durable_handoffs(tmp_pat
     stg.write_quantum_acceptance_manifest(
         round_dir,
         phase_name=CampaignPhase.REPLACEMENT_GAUSSIAN.value,
-        iteration=0,
+        iteration=1,
         accepted=[pointdir],
         rejected=[],
     )
@@ -578,8 +690,8 @@ def test_recovery_contract_status_reports_seed_handoff_contract(tmp_path):
     assert status["selected_phase"] == CampaignPhase.ARIADNE_ARRAY.value
     assert status["iteration"] == 2
     assert status["contract_ok"] is True
-    assert status["required_inputs"] == ["seeds_picked.json"]
-    assert status["trusted_inputs"] == ["seeds_picked.json"]
+    assert status["required_inputs"] == ["seed_selection/SELECTION.json"]
+    assert status["trusted_inputs"] == ["seed_selection/SELECTION.json"]
     assert status["missing_or_invalid_inputs"] == []
 
 
@@ -591,10 +703,12 @@ def test_propose_recovery_phase_a_sample_reenters_initial_gaussian(tmp_path):
     state = fresh_campaign_state()
     state.campaign_uid = "reconcile-test"
     write_state(data / DEFAULT_STATE_FILENAME, state)
-    initial = campaign / "3_DIVERSITY_SAMPLING" / "initial"
+    from ichor.hpc.active_learning.layout import bootstrap_selection_dir
+
+    initial = bootstrap_selection_dir(campaign)
     initial.mkdir(parents=True)
-    sample = initial / "initial-SAMPLE-1.xyz"
-    index = initial / "initial-INDEX-1.dat"
+    sample = initial / "selected.xyz"
+    index = initial / "selected_indices.dat"
     sample.write_text("1\nframe 0\nH 0.0 0.0 0.0\n", encoding="utf-8")
     index.write_text("0\n", encoding="utf-8")
     allocation_path, allocation, allocation_records = _write_pending_allocation(
@@ -605,7 +719,7 @@ def test_propose_recovery_phase_a_sample_reenters_initial_gaussian(tmp_path):
     )
     write_phase_a_sample_manifest(initial, {
         "phase": "PHASE_A_POLUS",
-        "iteration": -1,
+        "iteration": 0,
         "sample_xyz": str(sample.resolve()),
         "index_path": str(index.resolve()),
         "n_select": 1,
@@ -636,6 +750,7 @@ def test_propose_recovery_never_trusts_stop_check_without_committed_versions(tmp
     _write_pool(campaign)
     state = fresh_campaign_state(max_iterations=50)
     state.phase = CampaignPhase.STOP_CHECK
+    state.iteration = 1
     state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
@@ -747,6 +862,7 @@ def test_propose_recovery_initial_aimall_handoff_reenters_initial_ferebus(tmp_pa
     )
     state = fresh_campaign_state(max_iterations=50)
     state.phase = CampaignPhase.STOP_CHECK
+    state.iteration = 1
     state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
@@ -758,7 +874,10 @@ def test_propose_recovery_initial_aimall_handoff_reenters_initial_ferebus(tmp_pa
     assert report.proposed_state.reference_data_version == -1
     assert report.proposed_state.models_version == -1
     assert "exact point allocation is complete" in report.decision
-    assert "initial AIMAll acceptance manifest" in report.trusted_artifacts
+    assert any(
+        "protected active staging handoff for INITIAL_FEREBUS" in artefact
+        for artefact in report.trusted_artifacts
+    )
 
 
 def test_propose_recovery_initial_ferebus_journal_handoff_reenters_initial_ferebus(tmp_path):
@@ -773,6 +892,7 @@ def test_propose_recovery_initial_ferebus_journal_handoff_reenters_initial_fereb
     )
     state = fresh_campaign_state(max_iterations=50)
     state.phase = CampaignPhase.STOP_CHECK
+    state.iteration = 1
     state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
@@ -798,6 +918,7 @@ def test_propose_recovery_initial_aimall_missing_handoff_halts(tmp_path):
     )
     state = fresh_campaign_state(max_iterations=50)
     state.phase = CampaignPhase.STOP_CHECK
+    state.iteration = 1
     state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
@@ -823,6 +944,7 @@ def test_propose_recovery_archived_initial_gaussian_handoff_reenters_initial_aim
     )
     state = fresh_campaign_state(max_iterations=50)
     state.phase = CampaignPhase.STOP_CHECK
+    state.iteration = 1
     state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
@@ -848,6 +970,7 @@ def test_propose_recovery_archived_initial_aimall_handoff_reenters_initial_fereb
     _write_pool(campaign)
     state = fresh_campaign_state(max_iterations=50)
     state.phase = CampaignPhase.STOP_CHECK
+    state.iteration = 1
     state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
@@ -900,7 +1023,7 @@ def test_propose_recovery_bootstrap_training_only_reenters_initial_ferebus(
 
 def test_propose_recovery_missing_state_nonempty_staging_halts(tmp_path):
     campaign, _, _, _ = _campaign_dirs(tmp_path)
-    staging = campaign / ".DATA" / "STAGING" / "iter_0"
+    staging = campaign / ".DATA" / "STAGING" / "iter_1"
     staging.mkdir(parents=True)
     (staging / "POINTS.txt").write_text("", encoding="utf-8")
     report = propose_recovery(campaign)
@@ -920,18 +1043,18 @@ def test_stateful_campaign_artifacts_include_config_lock(tmp_path):
 
 def test_stateful_campaign_artifacts_include_phase_a_outputs(tmp_path):
     campaign, _, _, _ = _campaign_dirs(tmp_path)
-    phase_a = campaign / "3_DIVERSITY_SAMPLING" / "initial"
+    phase_a = campaign / "BOOTSTRAP" / "selection"
     phase_a.mkdir(parents=True)
-    (phase_a / "PHASE_A_SAMPLE.json").write_text("{}", encoding="utf-8")
-    (phase_a / "initial-SAMPLE-2.xyz").write_text("sample\n", encoding="utf-8")
-    (phase_a / "initial-INDEX-2.dat").write_text("0\n", encoding="utf-8")
+    (phase_a / "SELECTION.json").write_text("{}", encoding="utf-8")
+    (phase_a / "selected.xyz").write_text("sample\n", encoding="utf-8")
+    (phase_a / "selected_indices.dat").write_text("0\n", encoding="utf-8")
 
     findings = stateful_campaign_artifacts(campaign)
 
     normalised = {Path(value).as_posix() for value in findings}
-    assert "3_DIVERSITY_SAMPLING/initial/PHASE_A_SAMPLE.json" in normalised
-    assert "3_DIVERSITY_SAMPLING/initial/initial-SAMPLE-2.xyz" in normalised
-    assert "3_DIVERSITY_SAMPLING/initial/initial-INDEX-2.dat" in normalised
+    assert "BOOTSTRAP/selection/SELECTION.json" in normalised
+    assert "BOOTSTRAP/selection/selected.xyz" in normalised
+    assert "BOOTSTRAP/selection/selected_indices.dat" in normalised
 
 
 def test_propose_recovery_active_submission_intent_is_adoption_ready(tmp_path):
@@ -959,7 +1082,7 @@ def test_propose_recovery_active_submission_intent_is_adoption_ready(tmp_path):
 
 def test_propose_recovery_force_allows_fresh_init_on_nonempty_campaign(tmp_path):
     campaign, _, _, _ = _campaign_dirs(tmp_path)
-    staging = campaign / ".DATA" / "STAGING" / "iter_0"
+    staging = campaign / ".DATA" / "STAGING" / "iter_1"
     staging.mkdir(parents=True)
     (staging / "POINTS.txt").write_text("", encoding="utf-8")
     report = propose_recovery(campaign, allow_fresh_init_on_nonempty=True)
@@ -1011,7 +1134,7 @@ def test_propose_recovery_sets_iteration_from_active_version_mapping(tmp_path, m
     assert report.proposed_state.phase is CampaignPhase.STOP_CHECK
     assert report.proposed_state.reference_data_version == 2
     assert report.proposed_state.models_version == 2
-    assert report.proposed_state.iteration == 1
+    assert report.proposed_state.iteration == 2
 
 
 def test_propose_recovery_training_one_ahead_reenters_ferebus(tmp_path, monkeypatch):
@@ -1031,7 +1154,7 @@ def test_propose_recovery_training_one_ahead_reenters_ferebus(tmp_path, monkeypa
     assert report.proposed_state.phase is CampaignPhase.FEREBUS
     assert report.proposed_state.reference_data_version == 2
     assert report.proposed_state.models_version == 1
-    assert report.proposed_state.iteration == 1
+    assert report.proposed_state.iteration == 2
     assert not any("newer committed reference-data version" in r for r in report.unsafe_reasons)
 
 
@@ -1048,7 +1171,7 @@ def test_propose_recovery_preserves_existing_seed_select_cursor(tmp_path, monkey
     mv.commit(0)
     state = fresh_campaign_state(max_iterations=3)
     state.phase = CampaignPhase.SEED_SELECT
-    state.iteration = 0
+    state.iteration = 1
     state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
@@ -1056,8 +1179,10 @@ def test_propose_recovery_preserves_existing_seed_select_cursor(tmp_path, monkey
     report = propose_recovery(campaign)
 
     assert report.proposed_state.phase is CampaignPhase.SEED_SELECT
-    assert report.proposed_state.iteration == 0
-    assert "existing state phase has a valid input contract" in report.decision
+    assert report.proposed_state.iteration == 1
+    assert report.decision == (
+        "SEED_SELECT: bootstrap reference data and models are committed"
+    )
 
 
 def test_propose_recovery_prefers_seeds_over_stale_seed_select(tmp_path, monkeypatch):
@@ -1068,20 +1193,20 @@ def test_propose_recovery_prefers_seeds_over_stale_seed_select(tmp_path, monkeyp
     _commit_training_and_model_versions(training, models, [0])
     state = fresh_campaign_state(max_iterations=3)
     state.phase = CampaignPhase.SEED_SELECT
-    state.iteration = 0
+    state.iteration = 1
     state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
-    _write_seeds_picked(campaign, 0)
+    _write_seeds_picked(campaign, 1)
 
     report = propose_recovery(campaign)
 
     assert report.proposed_state.phase is CampaignPhase.ARIADNE_ARRAY
-    assert report.proposed_state.iteration == 0
+    assert report.proposed_state.iteration == 1
     assert "valid seed-selection handoff" in report.decision
 
 
-def test_recovery_rejects_legacy_ariadne_results_without_landing_safety(
+def test_recovery_rejects_ariadne_results_without_landing_safety(
     tmp_path,
     monkeypatch,
 ):
@@ -1092,17 +1217,16 @@ def test_recovery_rejects_legacy_ariadne_results_without_landing_safety(
     _commit_training_and_model_versions(training, models, [0])
     state = fresh_campaign_state(max_iterations=3)
     state.phase = CampaignPhase.SEED_SELECT
-    state.iteration = 0
+    state.iteration = 1
     state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
-    _write_seeds_picked(campaign, 0)
-    _write_legacy_ariadne_results_without_landing_safety(campaign, 0)
+    _write_ariadne_handoff(campaign, 1, n=1, include_safety=False)
 
     report = propose_recovery(campaign)
 
     assert report.proposed_state.phase is CampaignPhase.ARIADNE_ARRAY
-    assert report.proposed_state.iteration == 0
+    assert report.proposed_state.iteration == 1
     assert "valid seed-selection handoff" in report.decision
     assert "valid ARIADNE results handoff" not in report.decision
 
@@ -1118,7 +1242,7 @@ def test_propose_recovery_does_not_preserve_existing_phase_for_committed_iterati
     _commit_training_and_model_versions(training, models, [0, 1])
     state = fresh_campaign_state(max_iterations=3)
     state.phase = CampaignPhase.SEED_SELECT
-    state.iteration = 0
+    state.iteration = 1
     state.reference_data_version = 1
     state.models_version = 1
     write_state(data / DEFAULT_STATE_FILENAME, state)
@@ -1126,7 +1250,7 @@ def test_propose_recovery_does_not_preserve_existing_phase_for_committed_iterati
     report = propose_recovery(campaign)
 
     assert report.proposed_state.phase is CampaignPhase.STOP_CHECK
-    assert report.proposed_state.iteration == 0
+    assert report.proposed_state.iteration == 1
     assert "active iteration is fully committed" in report.decision
 
 
@@ -1138,16 +1262,16 @@ def test_propose_recovery_prefers_phase_b_over_stale_seed_select(tmp_path, monke
     _commit_training_and_model_versions(training, models, [0])
     state = fresh_campaign_state(max_iterations=3)
     state.phase = CampaignPhase.SEED_SELECT
-    state.iteration = 0
+    state.iteration = 1
     state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
-    _write_phase_b_handoff(campaign, 0, n=2)
+    _write_phase_b_handoff(campaign, 1, n=2)
 
     report = propose_recovery(campaign)
 
     assert report.proposed_state.phase is CampaignPhase.SPLIT
-    assert report.proposed_state.iteration == 0
+    assert report.proposed_state.iteration == 1
     assert "valid Phase B handoff" in report.decision
 
 
@@ -1159,17 +1283,17 @@ def test_propose_recovery_prefers_split_over_stale_phase_b(tmp_path, monkeypatch
     _commit_training_and_model_versions(training, models, [0])
     state = fresh_campaign_state(max_iterations=3)
     state.phase = CampaignPhase.PHASE_B_POLUS
-    state.iteration = 0
+    state.iteration = 1
     state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
-    _write_phase_b_handoff(campaign, 0, n=2)
-    _write_split(campaign, 0, train=[0], val=[1])
+    _write_phase_b_handoff(campaign, 1, n=2)
+    _write_split(campaign, 1)
 
     report = propose_recovery(campaign)
 
     assert report.proposed_state.phase is CampaignPhase.GAUSSIAN
-    assert report.proposed_state.iteration == 0
+    assert report.proposed_state.iteration == 1
     assert "valid split handoff" in report.decision
 
 
@@ -1181,12 +1305,12 @@ def test_propose_recovery_invalid_split_reenters_split(tmp_path, monkeypatch):
     _commit_training_and_model_versions(training, models, [0])
     state = fresh_campaign_state(max_iterations=3)
     state.phase = CampaignPhase.SPLIT
-    state.iteration = 0
+    state.iteration = 1
     state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
-    _write_phase_b_handoff(campaign, 0, n=2)
-    split_path = _write_split(campaign, 0, train=[0], val=[1])
+    _write_phase_b_handoff(campaign, 1, n=2)
+    split_path = _write_split(campaign, 1)
     split_payload = json.loads(split_path.read_text(encoding="utf-8"))
     split_payload["slots"][0]["candidate_id"] = "wrong-candidate"
     split_path.write_text(json.dumps(split_payload), encoding="utf-8")
@@ -1194,7 +1318,7 @@ def test_propose_recovery_invalid_split_reenters_split(tmp_path, monkeypatch):
     report = propose_recovery(campaign)
 
     assert report.proposed_state.phase is CampaignPhase.SPLIT
-    assert report.proposed_state.iteration == 0
+    assert report.proposed_state.iteration == 1
     assert "valid Phase B handoff" in report.decision
 
 
@@ -1213,12 +1337,12 @@ def test_propose_recovery_cross_iteration_partial_handoff_beats_stop_check(
     state.reference_data_version = 2
     state.models_version = 2
     write_state(data / DEFAULT_STATE_FILENAME, state)
-    _write_seeds_picked(campaign, 2)
+    _write_seeds_picked(campaign, 3)
 
     report = propose_recovery(campaign)
 
     assert report.proposed_state.phase is CampaignPhase.ARIADNE_ARRAY
-    assert report.proposed_state.iteration == 2
+    assert report.proposed_state.iteration == 3
     assert "valid seed-selection handoff" in report.decision
 
 
@@ -1234,25 +1358,25 @@ def test_propose_recovery_protects_active_gaussian_handoff(tmp_path, monkeypatch
     mv.commit(0)
     state = fresh_campaign_state(max_iterations=3)
     state.phase = CampaignPhase.HALTED
-    state.iteration = 0
+    state.iteration = 1
     state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
-    staging = campaign / ".DATA" / "STAGING" / "iter_0"
+    staging = campaign / ".DATA" / "STAGING" / "iter_1"
     pointdir = staging / "POINT_0000.pointdir"
     pointdir.mkdir(parents=True, exist_ok=True)
     stg.write_points_file(staging, [pointdir])
     stg.write_quantum_acceptance_manifest(
         staging,
         phase_name=CampaignPhase.GAUSSIAN.value,
-        iteration=0,
+        iteration=1,
         accepted=[pointdir],
         rejected=[],
     )
     _write_pending_allocation(
         campaign,
         context="active",
-        iteration=0,
+        iteration=1,
         n=1,
     )
 
@@ -1271,32 +1395,32 @@ def test_propose_recovery_finds_staging_handoff_in_later_iteration(tmp_path, mon
     _commit_training_and_model_versions(training, models, [0, 1])
     state = fresh_campaign_state(max_iterations=4)
     state.phase = CampaignPhase.HALTED
-    state.iteration = 0
+    state.iteration = 2
     state.reference_data_version = 1
     state.models_version = 1
     write_state(data / DEFAULT_STATE_FILENAME, state)
-    staging = campaign / ".DATA" / "STAGING" / "iter_1"
+    staging = campaign / ".DATA" / "STAGING" / "iter_2"
     pointdir = staging / "POINT_0000.pointdir"
     pointdir.mkdir(parents=True, exist_ok=True)
     stg.write_points_file(staging, [pointdir])
     stg.write_quantum_acceptance_manifest(
         staging,
         phase_name=CampaignPhase.AIMALL.value,
-        iteration=1,
+        iteration=2,
         accepted=[pointdir],
         rejected=[],
     )
     _complete_handoff_allocation(
         campaign,
         context="active",
-        iteration=1,
+        iteration=2,
         pointdirs=[pointdir],
     )
 
     report = propose_recovery(campaign)
 
     assert report.proposed_state.phase is CampaignPhase.APPEND
-    assert report.proposed_state.iteration == 1
+    assert report.proposed_state.iteration == 2
     assert ".DATA/STAGING is non-empty" not in report.unsafe_reasons
     assert any("protected active staging handoff" in item for item in report.trusted_artifacts)
 
@@ -1309,11 +1433,11 @@ def test_propose_recovery_halts_on_multiple_valid_staging_handoffs(tmp_path, mon
     _commit_training_and_model_versions(training, models, [0])
     state = fresh_campaign_state(max_iterations=4)
     state.phase = CampaignPhase.HALTED
-    state.iteration = 0
+    state.iteration = 1
     state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
-    for iteration in (0, 1):
+    for iteration in (1, 2):
         staging = campaign / ".DATA" / "STAGING" / ("iter_" + str(iteration))
         pointdir = staging / "POINT_0000.pointdir"
         pointdir.mkdir(parents=True, exist_ok=True)
@@ -1373,6 +1497,7 @@ def test_propose_recovery_preserves_existing_campaign_uid(tmp_path):
     s = v.stage(None, 0); (s / "x.txt").write_text("hi"); v.commit(0)
     existing = fresh_campaign_state(max_iterations=42)
     existing.iteration = 5
+    existing.phase = CampaignPhase.STOP_CHECK
     existing.last_acquisition_alpha0 = 0.41
     write_state(data / DEFAULT_STATE_FILENAME, existing)
     report = propose_recovery(campaign)

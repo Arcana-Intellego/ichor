@@ -73,6 +73,13 @@ class _StrictExplodingExecutor(_ExplodingExecutor):
     strict_committed_artifact_verification = True
 
 
+def _active_state(phase):
+    state = fresh_campaign_state()
+    state.phase = phase
+    state.iteration = 1
+    return state
+
+
 def test_daemon_adopts_inflight_sbatch_job(tmp_path):
     d = Daemon(
         campaign_dir=tmp_path, config=CampaignConfig(),
@@ -80,8 +87,7 @@ def test_daemon_adopts_inflight_sbatch_job(tmp_path):
         job_finder=lambda state, phase: "987654",  # pretend this phase already has a running job
     )
     d.state_path().parent.mkdir(parents=True, exist_ok=True)  # the daemon makes this at campaign start
-    state = fresh_campaign_state()
-    state.phase = CampaignPhase.FEREBUS  # an sbatch phase
+    state = _active_state(CampaignPhase.FEREBUS)
     status = d._on_phase_entry(state, state.phase)
     assert status == TickStatus.SUBMITTED
     assert state.pending_jobs["FEREBUS"] == "987654"  # adopted, not resubmitted
@@ -99,8 +105,7 @@ def test_strict_daemon_halts_on_unmanifested_committed_training_pointdir(tmp_pat
     rogue.mkdir(parents=True)
     (rogue / "input.gjf").write_text("%chk=x\n", encoding="utf-8")
     write_manifest(training, {})
-    state = fresh_campaign_state()
-    state.phase = CampaignPhase.SEED_SELECT
+    state = _active_state(CampaignPhase.SEED_SELECT)
     state.reference_data_version = 0
     state.models_version = -1
     write_state(d.state_path(), state)
@@ -123,8 +128,7 @@ def test_strict_daemon_halts_on_invalid_committed_model_version(tmp_path):
     models = tmp_path / "TRAINED_MODELS" / "iteration-000000"
     models.mkdir(parents=True)
     write_manifest(models, {})
-    state = fresh_campaign_state()
-    state.phase = CampaignPhase.SEED_SELECT
+    state = _active_state(CampaignPhase.SEED_SELECT)
     state.reference_data_version = 0
     state.models_version = 0
     write_state(d.state_path(), state)
@@ -141,13 +145,12 @@ def test_daemon_submits_when_no_inflight_job(tmp_path):
         job_finder=lambda state, phase: None,  # nothing running -> submit as normal
     )
     d.state_path().parent.mkdir(parents=True, exist_ok=True)  # the daemon makes this at campaign start
-    state = fresh_campaign_state()
-    state.phase = CampaignPhase.FEREBUS
+    state = _active_state(CampaignPhase.FEREBUS)
     status = d._on_phase_entry(state, state.phase)
     assert status == TickStatus.SUBMITTED
     assert state.pending_jobs["FEREBUS"] == "111"  # the freshly-submitted id
     from ichor.hpc.active_learning.daemon.submission_intent import load_intent
-    intent = load_intent(tmp_path, "FEREBUS", 0)
+    intent = load_intent(tmp_path, "FEREBUS", 1)
     assert intent["status"] == "SUBMITTED"
     assert intent["job_id"] == "111"
 
@@ -159,8 +162,7 @@ def test_submission_intent_exists_before_executor_calls_sbatch(tmp_path):
         job_finder=lambda state, phase: None,
     )
     d.state_path().parent.mkdir(parents=True, exist_ok=True)
-    state = fresh_campaign_state()
-    state.phase = CampaignPhase.FEREBUS
+    state = _active_state(CampaignPhase.FEREBUS)
     status = d._on_phase_entry(state, state.phase)
     assert status == TickStatus.SUBMITTED
 
@@ -177,18 +179,17 @@ def test_active_submission_intent_requires_successful_adoption_check(tmp_path):
         job_finder=lambda state, phase: (_ for _ in ()).throw(RuntimeError("sacct down")),
     )
     d.state_path().parent.mkdir(parents=True, exist_ok=True)
-    state = fresh_campaign_state()
-    state.phase = CampaignPhase.FEREBUS
+    state = _active_state(CampaignPhase.FEREBUS)
     write_pre_submit_intent(
         tmp_path,
         campaign_uid=state.campaign_uid,
         phase_name="FEREBUS",
-        iteration=0,
+        iteration=1,
     )
     status = d._on_phase_entry(state, state.phase)
     assert status == TickStatus.HALTED
     assert read_state(d.state_path()).phase is CampaignPhase.HALTED
-    intent = load_intent(tmp_path, "FEREBUS", 0)
+    intent = load_intent(tmp_path, "FEREBUS", 1)
     assert intent["status"] == "PRE_SUBMIT"
 
 
@@ -220,21 +221,20 @@ def test_active_submission_intent_terminal_job_is_adopted_for_postprocess(tmp_pa
         ],
     )
     d.state_path().parent.mkdir(parents=True, exist_ok=True)
-    state = fresh_campaign_state()
-    state.phase = CampaignPhase.FEREBUS
+    state = _active_state(CampaignPhase.FEREBUS)
     write_pre_submit_intent(
         tmp_path,
         campaign_uid=state.campaign_uid,
         phase_name="FEREBUS",
-        iteration=0,
+        iteration=1,
     )
-    mark_submitted(tmp_path, "FEREBUS", 0, "333", expected_tasks=1)
+    mark_submitted(tmp_path, "FEREBUS", 1, "333", expected_tasks=1)
 
     status = d._on_phase_entry(state, state.phase)
 
     assert status == TickStatus.SUBMITTED
     assert state.pending_jobs["FEREBUS"] == "333"
-    intent = load_intent(tmp_path, "FEREBUS", 0)
+    intent = load_intent(tmp_path, "FEREBUS", 1)
     assert intent["status"] == "ADOPTED"
     assert intent["job_id"] == "333"
 
@@ -259,20 +259,19 @@ def test_active_submission_intent_with_no_accounting_rows_halts_before_resubmit(
         sacct_poller=lambda job_id: [],
     )
     d.state_path().parent.mkdir(parents=True, exist_ok=True)
-    state = fresh_campaign_state()
-    state.phase = CampaignPhase.FEREBUS
+    state = _active_state(CampaignPhase.FEREBUS)
     write_pre_submit_intent(
         tmp_path,
         campaign_uid=state.campaign_uid,
         phase_name="FEREBUS",
-        iteration=0,
+        iteration=1,
     )
-    mark_submitted(tmp_path, "FEREBUS", 0, "333", expected_tasks=1)
+    mark_submitted(tmp_path, "FEREBUS", 1, "333", expected_tasks=1)
 
     status = d._on_phase_entry(state, state.phase)
 
     assert status == TickStatus.HALTED
-    intent = load_intent(tmp_path, "FEREBUS", 0)
+    intent = load_intent(tmp_path, "FEREBUS", 1)
     assert intent["status"] == "SUBMITTED"
     assert "FEREBUS" not in state.pending_jobs
 
@@ -314,8 +313,7 @@ def test_submission_intent_records_job_id_even_if_state_persist_fails(monkeypatc
         job_finder=lambda state, phase: None,
     )
     d.state_path().parent.mkdir(parents=True, exist_ok=True)
-    state = fresh_campaign_state()
-    state.phase = CampaignPhase.FEREBUS
+    state = _active_state(CampaignPhase.FEREBUS)
 
     def failing_persist(_state):
         raise OSError("simulated persist failure")
@@ -325,7 +323,7 @@ def test_submission_intent_records_job_id_even_if_state_persist_fails(monkeypatc
         d._on_phase_entry(state, state.phase)
 
     from ichor.hpc.active_learning.daemon.submission_intent import load_intent
-    intent = load_intent(tmp_path, "FEREBUS", 0)
+    intent = load_intent(tmp_path, "FEREBUS", 1)
     assert intent["status"] == "SUBMITTED"
     assert intent["job_id"] == "111"
 
@@ -344,8 +342,7 @@ def test_daemon_does_not_adopt_for_inline_phase(tmp_path):
         executor=_InlineExecutor(), job_finder=finder,
     )
     d.state_path().parent.mkdir(parents=True, exist_ok=True)  # the daemon makes this at campaign start
-    state = fresh_campaign_state()
-    state.phase = CampaignPhase.SEED_SELECT  # inline
+    state = _active_state(CampaignPhase.SEED_SELECT)
     d._on_phase_entry(state, state.phase)
     assert seen["n"] == 0
     assert state.pending_jobs.get("SEED_SELECT") != "999"

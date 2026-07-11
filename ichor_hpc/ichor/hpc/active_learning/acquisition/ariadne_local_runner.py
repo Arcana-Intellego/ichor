@@ -667,9 +667,9 @@ def _compute_trqn_objective_scale(
                 n_effective = max(1, n_live)
                 raw_rms = float(raw_norm / np.sqrt(float(n_effective)))
         else:
-            n_live = None
-            n_effective = 1
-            raw_rms = raw_norm
+            n_live = None if raw_flat is None else int(raw_flat.size)
+            n_effective = 1 if raw_flat is None else max(1, int(raw_flat.size))
+            raw_rms = float(raw_norm / np.sqrt(float(n_effective)))
         if not np.isfinite(raw_rms):
             raise RuntimeError("TRQN initial raw gradient RMS is non-finite")
         if raw_rms <= 0.0:

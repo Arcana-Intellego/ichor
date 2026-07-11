@@ -44,7 +44,7 @@ def intent_dir(campaign_dir: Union[str, Path]) -> Path:
 def intent_path(campaign_dir: Union[str, Path], phase_name: str, iteration: int) -> Path:
     safe_phase = str(phase_name).replace("/", "_").replace("\\", "_")
     return intent_dir(campaign_dir) / (
-        safe_phase + "-" + str(int(iteration)).zfill(4) + ".json"
+        safe_phase + "-" + str(int(iteration)).zfill(6) + ".json"
     )
 
 

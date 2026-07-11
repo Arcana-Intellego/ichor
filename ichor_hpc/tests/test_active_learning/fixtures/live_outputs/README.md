@@ -14,7 +14,9 @@ executor parsers consume.
   file existence + non-empty size. CSF4 manual smoke tests the
   real pyferebus loader.
 - `ferebus_staging_empty/` -- missing .model failure path.
-- `ariadne_pool/seed_*/result.json` -- per-seed ARIADNE results,
-  matching the dry-run mock schema in ariadne_runner.py.
-- `polus_phase_a/` and `polus_phase_b/` -- POLUS output samples
-  (xyz + selected-index dat).
+- `ariadne_pool/seed_*/result.json` -- source-only per-seed ARIADNE results.
+  Tests translate these historical fixture names into canonical
+  `ariadne/seeds/seed-NNNNNN/` task outputs before invoking daemon readers.
+- `polus_phase_a/` and `polus_phase_b/` -- source-only POLUS samples. Tests
+  publish them under the canonical `BOOTSTRAP/selection/` and `phase_b/`
+  contracts before postprocessing.

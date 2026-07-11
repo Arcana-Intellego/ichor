@@ -38,8 +38,7 @@ def test_env_script_contains_required_runtime_contracts():
     assert "unset CC CXX FC F77 F90" in text
     assert 'export ICHOR_MACHINE="${machine}"' in text
     assert "PLUMED_KERNEL" in text
-    assert "ichor-csf3" in text
-    assert "ichor-csf4" in text
+    assert 'venv="${HOME}/.venv/ichor-${machine}"' in text
     assert "ichor_csf_deactivate_existing_venv" in text
     assert "ichor_csf_warn_path_hazards" in text
     assert "ichor_csf_path_inside" in text

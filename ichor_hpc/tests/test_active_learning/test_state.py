@@ -203,9 +203,9 @@ def test_state_is_terminal_flag():
 # --- M15 F3: schema bump + new state fields ----------------------------
 
 
-def test_schema_version_is_four():
+def test_schema_version_is_six():
     from ichor.hpc.active_learning.daemon.state import SCHEMA_VERSION
-    assert SCHEMA_VERSION == 5
+    assert SCHEMA_VERSION == 6
 
 
 def test_last_n_anti_overlap_flagged_default_and_roundtrip():

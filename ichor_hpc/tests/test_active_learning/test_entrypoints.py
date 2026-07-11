@@ -50,7 +50,7 @@ def test_ariadne_runner_missing_campaign_dir(tmp_path):
     result = subprocess.run(
         [sys.executable, "-m",
          "ichor.hpc.active_learning.acquisition.ariadne_runner",
-         "--seed-index", "0", "--iteration", "0",
+         "--array-task-id", "0", "--iteration", "1",
          "--campaign-dir", str(bad)],
         capture_output=True, text=True, timeout=30,
     )

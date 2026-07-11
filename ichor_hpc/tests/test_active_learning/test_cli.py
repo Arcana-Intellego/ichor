@@ -53,6 +53,10 @@ def _commit_training_and_model_versions(campaign: Path, versions):
         point_allocation_path,
         record_quantum_results,
     )
+    from ichor.hpc.active_learning.handoff_manifests import (
+        write_phase_a_sample_manifest,
+    )
+    from ichor.hpc.active_learning.layout import bootstrap_selection_dir
     from ichor.hpc.active_learning.versioning.provenance import (
         enrich_with_point_allocation,
     )
@@ -78,6 +82,35 @@ def _commit_training_and_model_versions(campaign: Path, versions):
         reserve_candidates=[],
     )
     attempt = pending_attempts(allocation)[0]
+    selection_dir = bootstrap_selection_dir(campaign)
+    selection_dir.mkdir(parents=True, exist_ok=True)
+    (selection_dir / "selected.xyz").write_text(
+        "1\nbootstrap fixture\nH 0.0 0.0 0.0\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    (selection_dir / "selected_indices.dat").write_text(
+        "0\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    write_phase_a_sample_manifest(selection_dir, {
+        "phase": "PHASE_A_POLUS",
+        "iteration": 0,
+        "sample_xyz": "selection/selected.xyz",
+        "index_path": "selection/selected_indices.dat",
+        "n_select": 1,
+        "selected_indices": [0],
+        "point_allocation": {
+            "manifest": "allocation/POINT_ALLOCATION.json",
+            "primary": [{
+                "candidate_id": str(attempt["candidate_id"]),
+                "frame_id": 0,
+                "slot_id": int(attempt["slot_id"]),
+                "split": str(attempt["split"]),
+            }],
+        },
+    })
     pointdir = campaign / ".DATA" / "STAGING" / "initial" / "POINT_0000.pointdir"
     pointdir.mkdir(parents=True, exist_ok=True)
     (pointdir / "fixture.txt").write_text("reference\n", encoding="utf-8")
@@ -99,6 +132,9 @@ def _commit_training_and_model_versions(campaign: Path, versions):
         context="bootstrap",
         slot_id=int(attempt["slot_id"]),
         split=str(attempt["split"]),
+        allocation_slot_assignment_sha256=str(
+            allocation["slot_assignment_sha256"]
+        ),
     )
     record_quantum_results(
         allocation_path,
@@ -113,6 +149,11 @@ def _commit_training_and_model_versions(campaign: Path, versions):
     stg.commit_initial_reference_data(campaign)
     config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
     DryRunPhaseExecutor(campaign, config)._commit_dry_model_snapshot(0)
+    from ichor.hpc.active_learning.versioning.sampling_iterations import (
+        finalise_bootstrap,
+    )
+
+    finalise_bootstrap(campaign, "cli-test")
     import shutil
 
     shutil.rmtree(campaign / "TRAINED_MODELS" / "iteration-staging")
@@ -120,16 +161,95 @@ def _commit_training_and_model_versions(campaign: Path, versions):
     shutil.rmtree(campaign / ".DATA" / "STAGING" / "initial")
 
 
-def _write_valid_ariadne_results(campaign: Path, iteration: int = 0):
-    iter_dir = campaign / "7_ACTIVE_LEARNING" / ("iteration-" + str(iteration).zfill(4))
-    seed_dir = iter_dir / "pool" / "seed_0000"
+def _write_valid_ariadne_results(campaign: Path, iteration: int = 1):
+    from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
+    from ichor.hpc.active_learning.ariadne_outputs import (
+        write_optimisation_trajectory,
+        write_seed_output_manifest,
+    )
+    from ichor.hpc.active_learning.daemon.state import atomic_write_json
+    from ichor.hpc.active_learning.handoff_manifests import seeds_picked_path
+    from ichor.hpc.active_learning.layout import (
+        active_ariadne_dir,
+        active_iteration_dir,
+        ariadne_seed_dir,
+    )
+    from ichor.hpc.active_learning.seed_identity import (
+        deterministic_seed_uid,
+        selection_fingerprint_sha256,
+        write_ariadne_task_map,
+    )
+    from ichor.hpc.active_learning.versioning.manifest import sha256_file
+
+    try:
+        pool = TrajectoryPool.load(campaign)
+    except FileNotFoundError:
+        source = campaign / ".reconcile_pool_source.xyz"
+        source.write_text(
+            "1\nreconcile fixture frame\nH 0.0 0.0 0.0\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        pool = TrajectoryPool.import_from(source, campaign)
+        source.unlink()
+    trajectory_sha = str(pool.sha256)
+    iter_dir = active_iteration_dir(campaign, iteration)
+    selection = {
+        "schema_version": 2,
+        "campaign_uid": "cli-test",
+        "iteration": int(iteration),
+        "models_version": 0,
+        "model_manifest_sha256": "0" * 64,
+        "trajectory_sha256": trajectory_sha,
+        "selection_strategy": "hybrid_variance",
+        "n_picked": 1,
+        "seed_records": [{
+            "seed_id": 1,
+            "frame_id": 0,
+            "pool_row_index_zero_based": 0,
+            "selection_origin": "bulk",
+            "variance_at_selection": 0.0,
+        }],
+    }
+    fingerprint = selection_fingerprint_sha256(selection)
+    seed_uid = deterministic_seed_uid(
+        campaign_uid="cli-test",
+        iteration=iteration,
+        seed_id=1,
+        frame_id=0,
+        models_version=0,
+        model_manifest_sha256="0" * 64,
+        selection_fingerprint_sha256_value=fingerprint,
+    )
+    selection["selection_fingerprint_sha256"] = fingerprint
+    selection["seed_records"][0]["seed_uid"] = seed_uid
+    selection_path = seeds_picked_path(iter_dir)
+    selection_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(selection_path, selection)
+    task_map_path = write_ariadne_task_map(iter_dir, selection)
+
+    seed_dir = ariadne_seed_dir(iter_dir, 1)
     seed_dir.mkdir(parents=True, exist_ok=True)
     result_path = seed_dir / "result.json"
-    result_path.write_text(json.dumps({
+    landing_safety = {
+        "accepted": True,
+        "policy": "raw_final",
+        "selected_origin": "raw_final",
+        "selected_candidate_index": 0,
+        "reasons": [],
+        "record_only_reasons": [],
+        "metrics": {"whitened_distance": 0.5},
+        "raw_final": {},
+        "n_candidates_evaluated": 1,
+        "n_safe_candidates": 1,
+    }
+    atomic_write_json(result_path, {
         "iteration": int(iteration),
-        "seed_index": 0,
+        "seed_id": 1,
+        "seed_uid": seed_uid,
+        "array_task_id": 0,
         "seed_frame_id": 0,
-        "trajectory_sha256": "0" * 64,
+        "trajectory_sha256": trajectory_sha,
         "atom_types": ["H"],
         "final_coordinates": [[0.0, 0.0, 0.0]],
         "alpha_trajectory": [0.0, 1.0],
@@ -140,25 +260,35 @@ def _write_valid_ariadne_results(campaign: Path, iteration: int = 0):
         "wall_seconds": 1.0,
         "fell_back_to_ds": False,
         "whitened_distance_final": 0.5,
-        "landing_safety": {
-            "accepted": True,
-            "policy": "raw_final",
-            "selected_origin": "raw_final",
-            "selected_candidate_index": 0,
-            "reasons": [],
-            "record_only_reasons": [],
-            "metrics": {"whitened_distance": 0.5},
-            "raw_final": {},
-            "n_candidates_evaluated": 1,
-            "n_safe_candidates": 1,
-        },
-    }), encoding="utf-8")
+        "landing_safety": landing_safety,
+    })
+    write_optimisation_trajectory(
+        seed_dir,
+        atom_types=["H"],
+        coordinate_frames=[[[0.0, 0.0, 0.0]]],
+        alpha_values=[1.0],
+        gradient_norms=[0.0],
+        origins=["raw_final"],
+    )
+    output_manifest = write_seed_output_manifest(
+        seed_dir,
+        campaign_uid="cli-test",
+        iteration=iteration,
+        seed_id=1,
+        seed_uid=seed_uid,
+        array_task_id=0,
+        task_success=True,
+        task_exit_code=0,
+    )
     prov_path = write_seed_provenance(
         seed_dir,
-        campaign_uid="test",
+        campaign_uid="cli-test",
         iteration=int(iteration),
-        trajectory_sha256="0" * 64,
+        trajectory_sha256=trajectory_sha,
         seed_frame_id=0,
+        seed_id=1,
+        seed_uid=seed_uid,
+        array_task_id_zero_based=0,
         seed_selection_origin="bulk",
         seed_variance_at_selection=0.0,
         subspace_neighbour_frame_ids=[],
@@ -166,32 +296,33 @@ def _write_valid_ariadne_results(campaign: Path, iteration: int = 0):
         subspace_eigenvalues=[],
         mode_weighting_policy="variance",
     )
+    ariadne_root = active_ariadne_dir(iter_dir)
     write_ariadne_results_manifest(iter_dir, {
         "schema_version": ARIADNE_RESULTS_SCHEMA_VERSION,
+        "campaign_uid": "cli-test",
         "iteration": int(iteration),
-        "trajectory_sha256": "0" * 64,
+        "trajectory_sha256": trajectory_sha,
         "expected_n": 1,
         "n_accepted": 1,
         "n_rejected": 0,
+        "task_map": {
+            "path": task_map_path.relative_to(ariadne_root).as_posix(),
+            "sha256": sha256_file(task_map_path),
+        },
         "accepted": [{
-            "seed_index": 0,
+            "seed_id": 1,
+            "seed_uid": seed_uid,
+            "array_task_id": 0,
             "seed_frame_id": 0,
-            "seed_dir": str(seed_dir.resolve()),
-            "result_json": str(result_path.resolve()),
-            "provenance_json": str(Path(prov_path).resolve()),
+            "seed_dir": seed_dir.relative_to(ariadne_root).as_posix(),
+            "result_json": result_path.relative_to(ariadne_root).as_posix(),
+            "provenance_json": Path(prov_path).relative_to(ariadne_root).as_posix(),
+            "output_manifest": output_manifest.relative_to(ariadne_root).as_posix(),
             "return_code": 0,
-            "landing_safety": {
-                "accepted": True,
-                "policy": "raw_final",
-                "selected_origin": "raw_final",
-                "selected_candidate_index": 0,
-                "reasons": [],
-                "record_only_reasons": [],
-                "metrics": {"whitened_distance": 0.5},
-                "raw_final": {},
-                "n_candidates_evaluated": 1,
-                "n_safe_candidates": 1,
-            },
+            "landing_safety": landing_safety,
+            "result_sha256": sha256_file(result_path),
+            "provenance_sha256": sha256_file(prov_path),
+            "output_manifest_sha256": sha256_file(output_manifest),
         }],
         "rejected": [],
     })
@@ -486,13 +617,12 @@ def test_cli_status_json_prints_state_payload(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
     (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
     s = fresh_campaign_state(max_iterations=5)
-    s.iteration = 3
     write_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME, s)
     rc = main(["status", "--campaign-dir", str(campaign), "--json"])
     assert rc == 0
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
-    assert payload["iteration"] == 3
+    assert payload["iteration"] == 0
     assert payload["max_iterations"] == 5
     assert payload["state_path"].endswith(DEFAULT_STATE_FILENAME)
     assert payload["lock_file_exists"] is False
@@ -548,8 +678,8 @@ def test_cli_status_default_prints_operator_friendly_summary(tmp_path, capsys):
     assert "  iteration: 3 of 5 active iterations planned" in out
     assert "Data Products\n" in out
     assert "  current phase contract: problem - CommittedArtifactError:" in out
-    assert "  bootstrap QM reference data: problem - CommittedArtifactError:" in out
-    assert "  FEREBUS models: problem - CommittedArtifactError:" in out
+    assert "  bootstrap QM reference data: not produced yet" in out
+    assert "  FEREBUS models: not produced yet" in out
     assert "Runtime\n" in out
     assert "  daemon: not running" in out
     assert "  recorded Slurm jobs: none recorded in state" in out
@@ -742,7 +872,7 @@ def test_cli_status_returns_4_when_state_missing(tmp_path, capsys):
     assert rc == 4
     assert "Next Action" in out
     assert "bootstrap the fresh campaign" in out
-    assert "fresh init safe: True" in out
+    assert "fresh init safe: true" in out
 
 
 def test_cli_status_returns_json_recommendation_when_state_missing(tmp_path, capsys):
@@ -761,7 +891,7 @@ def test_cli_status_recommends_reconcile_when_state_missing_with_artefacts(
     capsys,
 ):
     campaign = _campaign_with_config(tmp_path)
-    (campaign / "7_ACTIVE_LEARNING" / "iteration-0000").mkdir(parents=True)
+    (campaign / "ACTIVE_LEARNING" / "iteration-000001").mkdir(parents=True)
 
     rc = main(["status", "--campaign-dir", str(campaign), "--json"])
 
@@ -805,7 +935,7 @@ def test_cli_init_rerun_preserves_existing_campaign_uid(tmp_path, capsys):
 
 def test_cli_init_refuses_missing_state_with_stateful_artefacts(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
-    (campaign / "7_ACTIVE_LEARNING" / "iteration-0000").mkdir(parents=True)
+    (campaign / "ACTIVE_LEARNING" / "iteration-000001").mkdir(parents=True)
 
     rc = main(["init", "--campaign-dir", str(campaign)])
 
@@ -816,7 +946,11 @@ def test_cli_init_refuses_missing_state_with_stateful_artefacts(tmp_path, capsys
 
 
 def _recommendation_codes(campaign: Path, payload: dict) -> list[str]:
-    return [item.code for item in build_status_recommendations(campaign, payload)]
+    complete_payload = {"lock_held": False, **payload}
+    return [
+        item.code
+        for item in build_status_recommendations(campaign, complete_payload)
+    ]
 
 
 def test_status_recommendations_cover_runtime_and_job_blockers(tmp_path):
@@ -1323,6 +1457,9 @@ def test_cli_resume_explicitly_clears_shutdown_flag(tmp_path):
 
 def test_cli_start_background_spawns_child_without_shell(tmp_path, monkeypatch, capsys):
     campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    write_state(data / DEFAULT_STATE_FILENAME, fresh_campaign_state())
     calls = []
 
     class FakePopen:
@@ -1410,6 +1547,9 @@ def test_cli_resume_background_clears_shutdown_and_spawns_resume(tmp_path, monke
 
 def test_cli_background_refuses_recursive_child(tmp_path, monkeypatch, capsys):
     campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    write_state(data / DEFAULT_STATE_FILENAME, fresh_campaign_state())
     monkeypatch.setenv(cli_mod.BACKGROUND_CHILD_ENV, "1")
 
     rc = main([
@@ -1428,6 +1568,7 @@ def test_cli_background_refuses_live_pid_file(tmp_path, monkeypatch, capsys):
     campaign = _campaign_with_config(tmp_path)
     data = campaign / DEFAULT_DATA_SUBDIR
     data.mkdir(parents=True, exist_ok=True)
+    write_state(data / DEFAULT_STATE_FILENAME, fresh_campaign_state())
     pid_path = data / cli_mod.BACKGROUND_PID_FILENAME
     pid_path.write_text(
         json.dumps({"pid": 99999, "schema_version": 1}),
@@ -1702,7 +1843,7 @@ def test_cli_journal_verbose_prints_event_details(tmp_path, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "sbatch" in out
-    assert "job submitted" in out
+    assert "array submitted" in out
     lines = [line for line in out.splitlines() if line.strip()]
     assert lines[0] == "Timeline"
     assert len(lines) == 2
@@ -1732,11 +1873,11 @@ def test_cli_reconcile_writes_proposed_state(tmp_path, capsys):
     proposed = campaign / DEFAULT_DATA_SUBDIR / (DEFAULT_STATE_FILENAME + ".proposed")
     assert proposed.exists()
     captured = capsys.readouterr()
-    assert "Proposed state written" in captured.out
-    assert "Committed reference-data versions:" in captured.out
-    assert "Valid reference-data versions:" in captured.out
-    assert "Committed model versions:" in captured.out
-    assert "Valid model versions:" in captured.out
+    assert "proposed state:" in captured.out
+    assert "state.json.proposed" in captured.out
+    assert "reference-data versions: committed" in captured.out
+    assert "model versions" in captured.out
+    assert "committed [], valid []" in captured.out
 
 
 def test_cli_reconcile_json_outputs_machine_readable_decision(tmp_path, capsys):
@@ -1781,21 +1922,22 @@ def test_cli_reconcile_cleanable_scripts_reports_candidate_without_manual_mv(
     _commit_training_and_model_versions(campaign, [0])
     state = fresh_campaign_state(max_iterations=1)
     state.phase = CampaignPhase.HALTED
-    state.iteration = 0
+    state.iteration = 1
     state.reference_data_version = 0
     state.models_version = 0
+    state.campaign_uid = "cli-test"
     write_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME, state)
     append_event(
         campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
         "halt",
         from_phase="PHASE_B_POLUS",
-        iteration=0,
+        iteration=1,
         reason="too_many_failures: 1/1",
     )
-    _write_valid_ariadne_results(campaign, iteration=0)
+    _write_valid_ariadne_results(campaign, iteration=1)
     scripts = campaign / ".DATA" / "SCRIPTS"
     scripts.mkdir(parents=True)
-    (scripts / "PHASE_B_POLUS-0.sh").write_text("#!/bin/bash\n", encoding="utf-8")
+    (scripts / "PHASE_B_POLUS-1.sh").write_text("#!/bin/bash\n", encoding="utf-8")
     monkeypatch.setattr(cli_mod, "_reconcile_runtime_status", lambda campaign: {})
 
     rc = main(["reconcile", "--campaign-dir", str(campaign)])
@@ -1810,8 +1952,8 @@ def test_cli_reconcile_cleanable_scripts_reports_candidate_without_manual_mv(
     assert "Recovery Safety" in out
     assert "stale sbatch scripts" in out
     assert "expected recovery after cleanup" in out
-    assert "PHASE_B_POLUS@0" in out
-    assert "ARIADNE_RESULTS.json" in out
+    assert "PHASE_B_POLUS@1" in out
+    assert "RESULTS.json" in out
     assert "Apply Plan" in out
     assert "=== Recovery guidance ===" not in out
     assert "Operator-review artefacts:" not in out
@@ -1876,21 +2018,22 @@ def test_cli_reconcile_apply_prints_final_recomputed_phase(
     _commit_training_and_model_versions(campaign, [0])
     state = fresh_campaign_state(max_iterations=1)
     state.phase = CampaignPhase.HALTED
-    state.iteration = 0
+    state.iteration = 1
     state.reference_data_version = 0
     state.models_version = 0
+    state.campaign_uid = "cli-test"
     write_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME, state)
     append_event(
         campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
         "halt",
         from_phase="PHASE_B_POLUS",
-        iteration=0,
+        iteration=1,
         reason="too_many_failures: 1/1",
     )
-    _write_valid_ariadne_results(campaign, iteration=0)
+    _write_valid_ariadne_results(campaign, iteration=1)
     scripts = campaign / ".DATA" / "SCRIPTS"
     scripts.mkdir(parents=True)
-    (scripts / "PHASE_B_POLUS-0.sh").write_text("#!/bin/bash\n", encoding="utf-8")
+    (scripts / "PHASE_B_POLUS-1.sh").write_text("#!/bin/bash\n", encoding="utf-8")
     monkeypatch.setattr(cli_mod, "_reconcile_runtime_status", lambda campaign: {})
 
     rc = main(["reconcile", "--campaign-dir", str(campaign), "--apply"])
@@ -1900,9 +2043,10 @@ def test_cli_reconcile_apply_prints_final_recomputed_phase(
     assert "ICHOR Reconcile" in out
     assert "Result: APPLIED" in out
     assert "Applied Changes" in out
-    assert "recover to PHASE_B_POLUS iteration 0" in out
-    assert "final contract: ok" in out
-    assert "ARIADNE_RESULTS.json" in out
+    assert "recover to PHASE_B_POLUS iteration 1" in out
+    assert "Recovery Contract" in out
+    assert "status        : ok" in out
+    assert "RESULTS.json" in out
     assert "ichor-al-daemon start --campaign-dir " + str(campaign) + " --live" in out
 
 
@@ -1967,7 +2111,7 @@ def test_cli_start_missing_state_with_artefacts_recommends_reconcile(
     capsys,
 ):
     campaign = _campaign_with_config(tmp_path)
-    (campaign / "7_ACTIVE_LEARNING" / "iteration-0000").mkdir(parents=True)
+    (campaign / "ACTIVE_LEARNING" / "iteration-000001").mkdir(parents=True)
 
     rc = main(["start", "--campaign-dir", str(campaign), "--live"])
 

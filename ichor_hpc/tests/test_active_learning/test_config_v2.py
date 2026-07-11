@@ -341,10 +341,10 @@ def test_exact_point_allocation_consumed_by_split_executor(tmp_path):
     ex = DryRunPhaseExecutor(campaign_dir=tmp_path, config=c)
     targets = allocation_targets(c, "active")
     create_point_allocation(
-        point_allocation_path(tmp_path, context="active", iteration=0),
+        point_allocation_path(tmp_path, context="active", iteration=1),
         campaign_uid="config-test",
         context="active",
-        iteration=0,
+        iteration=1,
         targets=targets,
         primary_candidates=[
             {"candidate_id": "candidate-" + str(index)}
@@ -352,8 +352,14 @@ def test_exact_point_allocation_consumed_by_split_executor(tmp_path):
         ],
         reserve_candidates=[],
     )
-    ex.submit_or_run(SimpleNamespace(iteration=0), CampaignPhase.SPLIT)
-    split_json = tmp_path / "7_ACTIVE_LEARNING" / "iteration-0000" / "split.json"
+    ex.submit_or_run(SimpleNamespace(iteration=1), CampaignPhase.SPLIT)
+    split_json = (
+        tmp_path
+        / "ACTIVE_LEARNING"
+        / "iteration-000001"
+        / "allocation"
+        / "SPLIT_RECEIPT.json"
+    )
     payload = json.loads(split_json.read_text(encoding="utf-8"))
     assert payload["strategy"] == "exact_pre_qm_point_allocation"
     assert payload["targets"] == targets
@@ -377,13 +383,52 @@ def test_seed_selection_bulk_fraction_consumed_by_executor(tmp_path):
         Path(__file__).resolve().parent / "fixtures" / "water_tetramer.xyz"
     )
     c = CampaignConfig()
+    c.max_iterations = 1
     c.seed_selection.n_seeds_per_iteration = 4
     c.seed_selection.bulk_fraction = 0.0  # pure variance pick
     ex = DryRunPhaseExecutor(campaign_dir=tmp_path, config=c)
     TrajectoryPool.import_from(FIXTURE, tmp_path)
-    ex.submit_or_run(SimpleNamespace(iteration=0), CampaignPhase.SEED_SELECT)
+    bootstrap_state = SimpleNamespace(
+        iteration=0,
+        campaign_uid="config-test",
+        replacement_round=0,
+        reference_data_version=-1,
+        models_version=-1,
+    )
+    ex.postprocess(bootstrap_state, CampaignPhase.PHASE_A_POLUS, observations=[])
+    ex.postprocess(
+        bootstrap_state,
+        CampaignPhase.INITIAL_GAUSSIAN,
+        observations=[],
+    )
+    ex.postprocess(
+        bootstrap_state,
+        CampaignPhase.INITIAL_AIMALL,
+        observations=[],
+    )
+    ex.submit_or_run(bootstrap_state, CampaignPhase.INITIAL_ALLOCATION_CHECK)
+    ex.postprocess(
+        bootstrap_state,
+        CampaignPhase.INITIAL_FEREBUS,
+        observations=[],
+    )
+    ex.submit_or_run(
+        SimpleNamespace(
+            iteration=1,
+            campaign_uid="config-test",
+            reference_data_version=0,
+            models_version=0,
+        ),
+        CampaignPhase.SEED_SELECT,
+    )
     picked = json.loads(
-        (tmp_path / "7_ACTIVE_LEARNING" / "iteration-0000" / "seeds_picked.json")
+        (
+            tmp_path
+            / "ACTIVE_LEARNING"
+            / "iteration-000001"
+            / "seed_selection"
+            / "SELECTION.json"
+        )
         .read_text(encoding="utf-8")
     )
     # bulk_fraction=0 means every pick is variance-based; bulk_indices empty.

@@ -60,7 +60,9 @@ __all__ = [
 
 
 def geometry_novelty_scale_path(iter_dir: Union[str, Path]) -> Path:
-    return Path(iter_dir) / GEOMETRY_NOVELTY_SCALE_FILENAME
+    from .layout import active_protocol_dir
+
+    return active_protocol_dir(iter_dir) / GEOMETRY_NOVELTY_SCALE_FILENAME
 
 
 def _now_iso() -> str:
@@ -129,13 +131,12 @@ def _summary(values: Sequence[float]) -> Dict[str, Any]:
 
 
 def _load_seed_payload(iter_dir: Path) -> Dict[str, Any]:
-    path = iter_dir / "seeds_picked.json"
+    from .handoff_manifests import load_seeds_picked, seeds_picked_path
+
+    path = seeds_picked_path(iter_dir)
     if not path.is_file():
         return {}
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        return {}
-    return data
+    return load_seeds_picked(iter_dir)
 
 
 def _load_raw_seed_records(iter_dir: Path) -> List[Dict[str, Any]]:
@@ -143,13 +144,7 @@ def _load_raw_seed_records(iter_dir: Path) -> List[Dict[str, Any]]:
     raw = data.get("seed_records")
     if isinstance(raw, list):
         return [dict(rec) for rec in raw if isinstance(rec, dict)]
-    frame_ids = data.get("frame_ids")
-    if not isinstance(frame_ids, list):
-        return []
-    return [
-        {"seed_index": int(i), "frame_id": _safe_int(frame_id)}
-        for i, frame_id in enumerate(frame_ids)
-    ]
+    return []
 
 
 def _manifest_neighbour_ids_for_seed(
@@ -332,10 +327,12 @@ def _ariadne_movement_history_values(
     iteration: int,
     window: int,
 ) -> Tuple[List[float], Dict[str, Any]]:
-    if int(window) <= 0 or int(iteration) <= 0:
+    if int(window) <= 0 or int(iteration) <= 1:
         return [], {"n_history_files": 0}
-    base = campaign_dir / "7_ACTIVE_LEARNING"
-    start = max(0, int(iteration) - int(window))
+    from .handoff_manifests import ariadne_landing_audit_path, ariadne_results_path
+    from .layout import active_iteration_dir
+
+    start = max(1, int(iteration) - int(window))
     values: List[float] = []
     n_files = 0
     n_audit_files = 0
@@ -344,9 +341,9 @@ def _ariadne_movement_history_values(
     n_skipped_rejected = 0
     n_skipped_nonfinite = 0
     for previous in range(start, int(iteration)):
-        iter_dir = base / ("iteration-" + str(previous).zfill(4))
-        audit_path = iter_dir / "ARIADNE_LANDING_AUDIT.json"
-        results_path = iter_dir / "ARIADNE_RESULTS.json"
+        iter_dir = active_iteration_dir(campaign_dir, previous)
+        audit_path = ariadne_landing_audit_path(iter_dir)
+        results_path = ariadne_results_path(iter_dir)
         source_records = None
         source_kind = None
         try:
@@ -409,7 +406,9 @@ def _ariadne_movement_history_values(
 
 
 def _sidecar_provenance(campaign_dir: Path, iter_dir: Path, iteration: int) -> Dict[str, Any]:
-    seed_path = iter_dir / "seeds_picked.json"
+    from .handoff_manifests import seeds_picked_path
+
+    seed_path = seeds_picked_path(iter_dir)
     seed_payload = _load_seed_payload(iter_dir)
     state_path = campaign_dir / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
     reference_data_version = None
@@ -477,25 +476,26 @@ def _history_source_fingerprints(
     iteration: int,
     history_window: int,
 ) -> List[Dict[str, Any]]:
-    if int(history_window) <= 0 or int(iteration) <= 0:
+    if int(history_window) <= 0 or int(iteration) <= 1:
         return []
-    base = campaign_dir / "7_ACTIVE_LEARNING"
-    start = max(0, int(iteration) - int(history_window))
+    from .handoff_manifests import ariadne_landing_audit_path, ariadne_results_path
+    from .layout import active_iteration_dir
+
+    start = max(1, int(iteration) - int(history_window))
     out: List[Dict[str, Any]] = []
     for previous in range(start, int(iteration)):
-        iter_dir = base / ("iteration-" + str(previous).zfill(4))
-        for kind, filename in (
-            ("ariadne_landing_audit", "ARIADNE_LANDING_AUDIT.json"),
-            ("ariadne_results", "ARIADNE_RESULTS.json"),
+        iter_dir = active_iteration_dir(campaign_dir, previous)
+        for kind, path in (
+            ("ariadne_landing_audit", ariadne_landing_audit_path(iter_dir)),
+            ("ariadne_results", ariadne_results_path(iter_dir)),
         ):
-            path = iter_dir / filename
             if not path.is_file():
                 continue
             out.append(
                 {
                     "iteration": int(previous),
                     "kind": kind,
-                    "filename": filename,
+                    "filename": path.relative_to(iter_dir).as_posix(),
                     "sha256": _sha256_file(path),
                 }
             )
@@ -516,7 +516,9 @@ def geometry_novelty_input_fingerprint(
     """
     campaign = Path(campaign_dir)
     iter_dir = _campaign_iteration_dir(campaign, int(iteration))
-    seed_path = iter_dir / "seeds_picked.json"
+    from .handoff_manifests import seeds_picked_path
+
+    seed_path = seeds_picked_path(iter_dir)
     seed_payload = _load_seed_payload(iter_dir)
     novelty_config = _geometry_novelty_config_fingerprint(config)
     scale_source = str(novelty_config.get("scale_source", "local_motion"))
@@ -596,7 +598,9 @@ def compute_geometry_novelty_scale(
     using campaign data or the conservative configured default.
     """
     campaign = Path(campaign_dir)
-    iter_dir = campaign / "7_ACTIVE_LEARNING" / ("iteration-" + str(int(iteration)).zfill(4))
+    from .layout import active_iteration_dir
+
+    iter_dir = active_iteration_dir(campaign, int(iteration))
     enabled = bool(_normalise_config_value(config, "enabled", True))
     scale_source = str(_normalise_config_value(config, "scale_source", "local_motion"))
     statistic = str(_normalise_config_value(config, "statistic", "median"))
@@ -732,11 +736,9 @@ def read_geometry_novelty_scale(
 
 
 def _campaign_iteration_dir(campaign_dir: Union[str, Path], iteration: int) -> Path:
-    return (
-        Path(campaign_dir)
-        / "7_ACTIVE_LEARNING"
-        / ("iteration-" + str(int(iteration)).zfill(4))
-    )
+    from .layout import active_iteration_dir
+
+    return active_iteration_dir(campaign_dir, int(iteration))
 
 
 def _config_enabled(config: Any) -> bool:

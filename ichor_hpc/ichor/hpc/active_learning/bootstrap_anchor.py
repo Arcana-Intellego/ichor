@@ -22,7 +22,7 @@ from .sampling.descriptors import mass_weighted_rmsd
 
 
 ANCHOR_XYZ_FILENAME = "anchor.xyz"
-BOOTSTRAP_ANCHOR_MANIFEST_FILENAME = "bootstrap_anchor.json"
+BOOTSTRAP_ANCHOR_MANIFEST_FILENAME = "ANCHOR.json"
 BOOTSTRAP_ANCHOR_SCHEMA_VERSION = 1
 ANCHOR_DUPLICATE_RMSD_ANGSTROM = 1.0e-8
 
@@ -82,12 +82,9 @@ def anchor_xyz_path(campaign_dir: str | Path) -> Path:
 
 
 def bootstrap_anchor_manifest_path(campaign_dir: str | Path) -> Path:
-    return (
-        Path(campaign_dir)
-        / ".DATA"
-        / "ACTIVE_LEARNING"
-        / BOOTSTRAP_ANCHOR_MANIFEST_FILENAME
-    )
+    from .layout import bootstrap_selection_dir
+
+    return bootstrap_selection_dir(campaign_dir) / BOOTSTRAP_ANCHOR_MANIFEST_FILENAME
 
 
 def load_anchor_frames(campaign_dir: str | Path) -> List[Atoms]:
@@ -274,10 +271,15 @@ def write_bootstrap_anchor_manifest(
     payload["selected_pool_frame_ids"] = [
         int(i) for i in selected_pool_frame_ids
     ]
-    payload["phase_a_sample_xyz"] = str(Path(phase_a_sample_xyz).resolve(strict=False))
-    payload["phase_a_index_path"] = str(Path(phase_a_index_path).resolve(strict=False))
     path = bootstrap_anchor_manifest_path(campaign_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
+    root = path.parent
+    payload["phase_a_sample_xyz"] = Path(phase_a_sample_xyz).resolve(
+        strict=False
+    ).relative_to(root.resolve()).as_posix()
+    payload["phase_a_index_path"] = Path(phase_a_index_path).resolve(
+        strict=False
+    ).relative_to(root.resolve()).as_posix()
     atomic_write_json(path, payload)
     return path
 

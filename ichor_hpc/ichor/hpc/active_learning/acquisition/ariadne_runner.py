@@ -90,6 +90,8 @@ class AriadneRunResult:
     warm_start_alpha_delta_from_seed: Optional[float] = None
     alpha_trajectory: List[float] = field(default_factory=list)
     grad_norm_trajectory: List[float] = field(default_factory=list)
+    optimisation_trajectory_coordinates: List[Any] = field(default_factory=list)
+    optimisation_trajectory_origins: List[str] = field(default_factory=list)
     n_evaluations: int = 0
     return_code: int = 0
     wall_seconds: float = 0.0
@@ -961,11 +963,12 @@ def _evaluate_landing_candidate(
         metrics["weak_mode_penalty_score"] = float(
             getattr(breakdown, "weak_mode_penalty_score", 0.0)
         )
+        legacy_anharmonic_risk = getattr(breakdown, "anharmonic_risk", 0.0)
         metrics["anharmonic_risk_raw"] = float(
-            getattr(breakdown, "anharmonic_risk_raw", breakdown.anharmonic_risk)
+            getattr(breakdown, "anharmonic_risk_raw", legacy_anharmonic_risk)
         )
         metrics["anharmonic_risk_capped"] = float(
-            getattr(breakdown, "anharmonic_risk_capped", breakdown.anharmonic_risk)
+            getattr(breakdown, "anharmonic_risk_capped", legacy_anharmonic_risk)
         )
         metrics["observable_score"] = (
             None if breakdown.observable_score is None
@@ -1422,6 +1425,37 @@ def _select_safe_landing(
             policy = "salvaged_iterate"
         accepted = True
         reasons: List[str] = []
+    elif bool(_cfg_value(safety_config, "allow_seed_fallback", False)):
+        fallback_candidates = [
+            candidate
+            for candidate in candidates
+            if bool(candidate.get("metrics", {}).get("seed_equivalent", False))
+            and set(candidate.get("reasons") or [])
+            <= {"ariadne_landing_under_moved"}
+        ]
+        if fallback_candidates:
+            selected = dict(max(fallback_candidates, key=_rank_landing_candidate))
+            selected["reasons"] = []
+            selected["record_only_reasons"] = list(
+                dict.fromkeys(
+                    list(selected.get("record_only_reasons") or [])
+                    + ["seed_fallback_under_moved"]
+                )
+            )
+            selected_origin = "seed_fallback"
+            policy = "seed_fallback"
+            accepted = True
+            reasons = []
+        else:
+            selected = raw_candidate
+            selected_origin = "raw_final"
+            policy = "unsafe_raw_final"
+            accepted = not bool(
+                _cfg_value(safety_config, "reject_unsafe_landings", True)
+            )
+            reasons = ["no_safe_non_seed_landing"]
+            if accepted:
+                policy = "unsafe_raw_final_record_only"
     else:
         selected = raw_candidate
         selected_origin = "raw_final"
@@ -1558,6 +1592,13 @@ def _mock_optimise_seed(
     seed_coords = np.asarray(seed.coordinates, dtype=float)
     perturbation = rng.normal(0.0, float(run_config.mock_perturbation_angstrom), size=seed_coords.shape)
     final = _copy_atoms_with_coords(seed, seed_coords + perturbation)
+    optimisation_coordinates = [
+        (
+            seed_coords
+            + (float(step) / float(max(n_iters - 1, 1))) * perturbation
+        ).tolist()
+        for step in range(n_iters)
+    ]
 
     wall = max(time.perf_counter() - t0, 1.0e-6)
     landing_safety = _mock_landing_safety(seed, final)
@@ -1619,6 +1660,11 @@ def _mock_optimise_seed(
         final_atoms=final,
         alpha_trajectory=alpha_values,
         grad_norm_trajectory=grad_values,
+        optimisation_trajectory_coordinates=optimisation_coordinates,
+        optimisation_trajectory_origins=[
+            "seed" if step == 0 else "mock_accepted_iterate"
+            for step in range(n_iters)
+        ],
         n_evaluations=2 * n_iters,
         return_code=0,
         wall_seconds=float(wall),
@@ -2047,6 +2093,13 @@ def _live_optimise_seed(
         final_atoms=landing["selected_atoms"],
         alpha_trajectory=list(opt_result.alpha_trajectory),
         grad_norm_trajectory=list(opt_result.grad_norm_trajectory),
+        optimisation_trajectory_coordinates=[
+            np.asarray(coords, dtype=float).reshape(-1, 3).tolist()
+            for coords in opt_result.candidate_positions_angstrom
+        ],
+        optimisation_trajectory_origins=[
+            str(origin) for origin in opt_result.candidate_origins
+        ],
         n_evaluations=int(opt_result.n_evaluations),
         return_code=int(opt_result.return_code),
         wall_seconds=float(opt_result.wall_seconds),
@@ -2119,11 +2172,12 @@ def main(argv=None) -> int:
     """Command-line entrypoint for a single per-seed ARIADNE run.
 
     The daemon submits a SLURM array job for the ARIADNE_ARRAY phase;
-    each array task invokes this with a different --seed-index.
-    The task picks the matching seed out of seeds_picked.json,
+    each array task invokes this with a different zero-based --array-task-id.
+    The task resolves the matching one-based seed through TASK_MAP.json,
     loads the trained FEREBUS Models for the current iteration, builds
     the adversarial acquisition + calculator, drives ARIADNE, and
-    writes 7_ACTIVE_LEARNING/iteration-NNNN/pool/seed_NNNN/result.json.
+    atomically publishes ACTIVE_LEARNING/iteration-NNNNNN/ariadne/seeds/
+    seed-NNNNNN/.
 
     Exit codes:
       0 -- success, result.json written.
@@ -2140,12 +2194,12 @@ def main(argv=None) -> int:
         prog="python -m ichor.hpc.active_learning.acquisition.ariadne_runner",
         description=(
             "Run ARIADNE adversarial descent for a single seed picked at "
-            "SEED_SELECT. Writes result.json into the per-seed pool dir."
+            "SEED_SELECT. Publishes one hash-bound per-seed output directory."
         ),
     )
     parser.add_argument(
-        "--seed-index", type=int, required=True,
-        help="Row in seeds_picked.json for this array task.",
+        "--array-task-id", type=int, required=True,
+        help="Zero-based Slurm array task ID resolved through TASK_MAP.json.",
     )
     parser.add_argument(
         "--iteration", type=int, required=True,
@@ -2175,11 +2229,10 @@ def main(argv=None) -> int:
     from ..config import CampaignConfig
     from ..acquisition.trajectory_pool import TrajectoryPool
     from ..daemon.state import read_state, DEFAULT_STATE_FILENAME
-    from ..versioning.trained_models import (
-        TrainedModelVersioning,
-        load_trained_models,
-    )
-    from ..layout import trained_models_dir
+    from ..handoff_manifests import load_seeds_picked
+    from ..layout import active_iteration_dir, active_protocol_dir, ariadne_seed_dir
+    from ..seed_identity import read_ariadne_task_map, task_for_array_task_id
+    from ..versioning.trained_models import load_trained_models
 
     config = CampaignConfig.from_yaml(cfg_path)
 
@@ -2210,75 +2263,96 @@ def main(argv=None) -> int:
             file=_sys.stderr,
         )
         return 3
-    models_dir = TrainedModelVersioning(
-        trained_models_dir(campaign)
-    ).iteration_path(int(state.models_version))
-    if not _await_exists(lambda: models_dir.is_dir()):
-        print(
-            "models directory not found: " + str(models_dir),
-            file=_sys.stderr,
-        )
-        return 3
-    _, models = load_trained_models(
-        campaign,
-        int(state.models_version),
-        verification="deep",
-    )
-
-    iter_dir = (
-        campaign / "7_ACTIVE_LEARNING"
-        / ("iteration-" + str(int(args.iteration)).zfill(4))
-    )
-    sp_path = iter_dir / "seeds_picked.json"
-    if not sp_path.is_file():
-        print(
-            "seeds_picked.json not found at " + str(sp_path)
-            + "; SEED_SELECT must run before ARIADNE_ARRAY.",
-            file=_sys.stderr,
-        )
+    try:
+        iter_dir = active_iteration_dir(campaign, int(args.iteration))
+    except ValueError as exc:
+        print(str(exc), file=_sys.stderr)
         return 3
     try:
-        from ..handoff_manifests import load_seeds_picked
         sp = load_seeds_picked(iter_dir, expected_iteration=int(args.iteration))
+        task_map = read_ariadne_task_map(
+            iter_dir,
+            expected_iteration=int(args.iteration),
+        )
+        task = task_for_array_task_id(task_map, int(args.array_task_id))
     except Exception as exc:
         print(
-            "seeds_picked.json invalid: " + type(exc).__name__ + ": " + str(exc),
+            "ARIADNE seed/task mapping invalid: "
+            + type(exc).__name__
+            + ": "
+            + str(exc),
             file=_sys.stderr,
         )
         return 3
     # the seed list was picked against a specific pool. frame ids are positional, so if the pool on
     # disk is not the one SEED_SELECT chose against (a re-import, a partial swap, a botched reconcile)
     # then frame N is now a different geometry and we'd attack the wrong point silently. refuse.
-    # only checked when the field is present, so older seeds_picked.json still run (A30).
     picked_sha = sp.get("trajectory_sha256")
-    if picked_sha and picked_sha != pool.sha256:
+    if str(picked_sha or "") != str(pool.sha256):
         print(
-            "pool sha256 mismatch: seeds_picked.json was made against " + str(picked_sha)
+            "pool SHA-256 mismatch: seed_selection/SELECTION.json was made against "
+            + str(picked_sha)
             + " but the pool on disk is " + str(pool.sha256)
             + "; the trajectory changed under the campaign -- refusing to attack the wrong frame.",
             file=_sys.stderr,
         )
         return 3
     seed_records = list(sp.get("seed_records") or [])
-    if not 0 <= args.seed_index < len(seed_records):
+    seed_id = int(task["seed_id"])
+    seed_uid = str(task["seed_uid"])
+    seed_record = seed_records[seed_id - 1]
+    if int(seed_record["seed_id"]) != seed_id:
+        print("seed selection/task-map identity mismatch", file=_sys.stderr)
+        return 3
+    seed_frame_raw = task.get("frame_id")
+    if seed_frame_raw is None:
         print(
-            "seed-index " + str(args.seed_index)
-            + " out of range of " + str(len(seed_records))
-            + " picked seeds",
+            "seed " + str(seed_id) + " has no frame_id",
             file=_sys.stderr,
         )
         return 3
-    seed_frame_raw = seed_records[args.seed_index].get("frame_id")
-    if seed_frame_raw is None:
-        print(
-            "seed-index " + str(args.seed_index) + " has no frame_id",
-            file=_sys.stderr,
-        )
+    if seed_record.get("frame_id") != seed_frame_raw:
+        print("seed frame/task-map mismatch", file=_sys.stderr)
         return 3
     seed_frame_id = int(seed_frame_raw)
     seed_atoms = pool.frame(seed_frame_id)
 
-    rs_path = iter_dir / "reference_scales.json"
+    models_version = int(task_map["models_version"])
+    if int(state.models_version) != models_version:
+        print(
+            "state/model task-map mismatch: state="
+            + str(state.models_version)
+            + " task-map="
+            + str(models_version),
+            file=_sys.stderr,
+        )
+        return 3
+    try:
+        model_set, models = load_trained_models(
+            campaign,
+            models_version,
+            verification="deep",
+        )
+    except Exception as exc:
+        print(
+            "trained models are not loadable: "
+            + type(exc).__name__
+            + ": "
+            + str(exc),
+            file=_sys.stderr,
+        )
+        return 3
+    if str(model_set.campaign_uid) != str(task_map.get("campaign_uid") or ""):
+        print("model/task-map campaign UID mismatch", file=_sys.stderr)
+        return 3
+    if str(model_set.head_manifest_sha256) != str(
+        task_map.get("model_manifest_sha256") or ""
+    ):
+        print("model/task-map manifest SHA mismatch", file=_sys.stderr)
+        return 3
+
+    protocol_dir = active_protocol_dir(iter_dir)
+    rs_path = protocol_dir / "reference_scales.json"
     external_reference_scales = None
     if rs_path.is_file():
         try:
@@ -2301,14 +2375,35 @@ def main(argv=None) -> int:
             return 3
 
     try:
-        from ..sampling_protocol import resolve_sampling_protocol
+        from ..sampling_protocol import load_sampling_protocol
 
-        resolved_protocol = resolve_sampling_protocol(
+        resolved_protocol = load_sampling_protocol(
             campaign,
             config,
             iteration=int(args.iteration),
         )
         geometry_scale_payload = dict(resolved_protocol.geometry_scale_payload)
+
+        from ..versioning.manifest import sha256_file
+
+        def protocol_binding(path):
+            if path is None:
+                raise ValueError("resolved sampling protocol artefact is missing")
+            resolved = path.resolve()
+            return (
+                resolved.relative_to(campaign).as_posix(),
+                sha256_file(resolved),
+            )
+
+        resolved_manifest, resolved_manifest_sha256 = protocol_binding(
+            resolved_protocol.manifest_path
+        )
+        scale_model_manifest, scale_model_manifest_sha256 = protocol_binding(
+            resolved_protocol.scale_model_path
+        )
+        audit_manifest, audit_manifest_sha256 = protocol_binding(
+            resolved_protocol.audit_manifest_path
+        )
     except Exception as exc:
         print(
             "sampling protocol resolution failed for ARIADNE: "
@@ -2337,11 +2432,53 @@ def main(argv=None) -> int:
         if error_calibration_model is not None
         else 0.0
     )
-    seed_dir = (
-        iter_dir / "pool"
-        / ("seed_" + str(int(args.seed_index)).zfill(4))
+    import os as _os
+    import shutil as _shutil
+
+    from ..ariadne_outputs import (
+        SEED_RESULT_FILENAME,
+        TRAJECTORY_DIRNAME,
+        TRAJECTORY_TRACE_FILENAME,
+        validate_seed_output,
+        write_optimisation_trajectory,
+        write_seed_output_manifest,
     )
-    trace_path = seed_dir / "ARIADNE_TRACE.jsonl"
+
+    seed_dir = ariadne_seed_dir(iter_dir, seed_id)
+    if seed_dir.exists() or seed_dir.is_symlink():
+        try:
+            existing = validate_seed_output(
+                seed_dir,
+                expected_campaign_uid=str(state.campaign_uid),
+                expected_iteration=int(args.iteration),
+                expected_seed_id=seed_id,
+                expected_seed_uid=seed_uid,
+                expected_array_task_id=int(args.array_task_id),
+            )
+        except Exception as exc:
+            print(
+                "existing ARIADNE seed output is invalid: "
+                + type(exc).__name__
+                + ": "
+                + str(exc),
+                file=_sys.stderr,
+            )
+            return 3
+        return int(existing.get("task_exit_code", 0))
+    seed_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging_dir = seed_dir.parent / (
+        "."
+        + seed_dir.name
+        + ".partial-task-"
+        + str(int(args.array_task_id))
+        + "-pid-"
+        + str(_os.getpid())
+    )
+    if staging_dir.exists() or staging_dir.is_symlink():
+        print("ARIADNE staging directory already exists: " + str(staging_dir), file=_sys.stderr)
+        return 3
+    (staging_dir / TRAJECTORY_DIRNAME).mkdir(parents=True, exist_ok=False)
+    trace_path = staging_dir / TRAJECTORY_DIRNAME / TRAJECTORY_TRACE_FILENAME
 
     try:
         result = optimise_seed(
@@ -2376,30 +2513,24 @@ def main(argv=None) -> int:
             trqn_geodesic_bt_mode=ariadne_run_config.trqn_geodesic_bt_mode,
         )
 
-    seed_dir.mkdir(parents=True, exist_ok=True)
     payload = result.to_dict()
     payload["seed_frame_id"] = seed_frame_id
-    payload["seed_index"] = int(args.seed_index)
+    payload["seed_id"] = int(seed_id)
+    payload["seed_uid"] = seed_uid
+    payload["array_task_id"] = int(args.array_task_id)
     payload["iteration"] = int(args.iteration)
     payload["trajectory_sha256"] = str(pool.sha256)
-    payload["geometry_novelty_scale"] = dict(geometry_scale_payload)
+
     payload["sampling_protocol"] = {
         "sampling_aggressiveness": int(resolved_protocol.sampling_aggressiveness),
-        "resolved_manifest": (
-            None if resolved_protocol.manifest_path is None
-            else str(resolved_protocol.manifest_path.resolve())
-        ),
-        "scale_model_manifest": (
-            None if resolved_protocol.scale_model_path is None
-            else str(resolved_protocol.scale_model_path.resolve())
-        ),
-        "audit_manifest": (
-            None if resolved_protocol.audit_manifest_path is None
-            else str(resolved_protocol.audit_manifest_path.resolve())
-        ),
+        "resolved_manifest": resolved_manifest,
+        "resolved_manifest_sha256": resolved_manifest_sha256,
+        "scale_model_manifest": scale_model_manifest,
+        "scale_model_manifest_sha256": scale_model_manifest_sha256,
+        "audit_manifest": audit_manifest,
+        "audit_manifest_sha256": audit_manifest_sha256,
         "hidden_overrides_detected": list(resolved_protocol.hidden_overrides_detected),
     }
-    payload["sampling_scale_model"] = dict(resolved_protocol.scale_model_payload)
     allow_seed_fallback = bool(
         getattr(resolved_protocol.adversarial_safety, "allow_seed_fallback", False)
     )
@@ -2425,12 +2556,11 @@ def main(argv=None) -> int:
         )
         payload["selected_landing_usable"] = bool(usability["usable"])
     if isinstance(payload.get("selection_diagnostics"), dict):
-        payload["selection_diagnostics"]["model_version"] = int(state.models_version)
-        payload["selection_diagnostics"]["seed_index"] = int(args.seed_index)
+        payload["selection_diagnostics"]["model_version"] = int(models_version)
+        payload["selection_diagnostics"]["seed_id"] = int(seed_id)
+        payload["selection_diagnostics"]["seed_uid"] = seed_uid
+        payload["selection_diagnostics"]["array_task_id"] = int(args.array_task_id)
         payload["selection_diagnostics"]["seed_frame_id"] = int(seed_frame_id)
-        payload["selection_diagnostics"]["geometry_novelty_scale"] = dict(
-            geometry_scale_payload
-        )
         payload["selection_diagnostics"]["error_calibration_model_reason"] = str(
             error_calibration_reason
         )
@@ -2446,7 +2576,40 @@ def main(argv=None) -> int:
         payload["optimiser_diagnostics"] = diag
     from ..daemon.state import atomic_write_json
 
-    atomic_write_json(seed_dir / "result.json", payload)
+    trajectory_coordinates = list(result.optimisation_trajectory_coordinates)
+    if not trajectory_coordinates:
+        trajectory_coordinates = [
+            np.asarray(seed_atoms.coordinates, dtype=float).tolist()
+        ]
+    trajectory_origins = list(result.optimisation_trajectory_origins)
+    atomic_write_json(staging_dir / SEED_RESULT_FILENAME, payload)
+    write_optimisation_trajectory(
+        staging_dir,
+        atom_types=[str(atom.type) for atom in seed_atoms],
+        coordinate_frames=trajectory_coordinates,
+        alpha_values=list(result.alpha_trajectory),
+        gradient_norms=list(result.grad_norm_trajectory),
+        origins=trajectory_origins,
+    )
+    write_seed_output_manifest(
+        staging_dir,
+        campaign_uid=str(state.campaign_uid),
+        iteration=int(args.iteration),
+        seed_id=seed_id,
+        seed_uid=seed_uid,
+        array_task_id=int(args.array_task_id),
+        task_success=bool(usability["usable"]),
+        task_exit_code=int(usability["task_exit_code"]),
+    )
+    try:
+        _os.replace(staging_dir, seed_dir)
+        from ..daemon.state import _fsync_parent_dir
+
+        _fsync_parent_dir(seed_dir)
+    except Exception:
+        if staging_dir.exists() and not staging_dir.is_symlink():
+            _shutil.rmtree(staging_dir)
+        raise
     return int(usability["task_exit_code"])
 
 

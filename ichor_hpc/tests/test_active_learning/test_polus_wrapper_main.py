@@ -10,11 +10,25 @@ from pathlib import Path
 import pytest
 
 from ichor.hpc.active_learning.config import CampaignConfig
-from ichor.hpc.active_learning.handoff_manifests import PHASE_A_SAMPLE_FILENAME
+from ichor.hpc.active_learning.handoff_manifests import (
+    HandoffManifestError,
+    PHASE_A_SAMPLE_FILENAME,
+    read_phase_a_sample_manifest,
+)
+from ichor.hpc.active_learning.layout import (
+    active_iteration_dir,
+    active_phase_b_dir,
+    ariadne_seed_dir,
+    ariadne_seeds_dir,
+)
 
 
 MODULE = "ichor.hpc.active_learning.sampling.polus_wrapper"
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "water_tetramer.xyz"
+
+
+def _active_iter(campaign):
+    return active_iteration_dir(campaign, 1)
 
 
 def _import_pool(campaign, source):
@@ -56,7 +70,17 @@ def _run(args):
         state_path = campaign / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
         if not state_path.is_file():
             state_path.parent.mkdir(parents=True, exist_ok=True)
-            write_state(state_path, fresh_campaign_state())
+            state = fresh_campaign_state()
+            iteration = int(args[args.index("--iteration") + 1])
+            if iteration >= 1:
+                from ichor.hpc.active_learning.daemon.state import CampaignPhase
+
+                state.campaign_uid = "test"
+                state.phase = CampaignPhase.PHASE_B_POLUS
+                state.iteration = iteration
+                state.reference_data_version = 0
+                state.models_version = 0
+            write_state(state_path, state)
     return subprocess.run(
         [sys.executable, "-m", MODULE] + args,
         capture_output=True, text=True, timeout=120,
@@ -65,7 +89,7 @@ def _run(args):
 
 def test_phase_a_writes_sample_and_index(tmp_path):
     """Phase A reads the trajectory pool and writes the canonical
-    initial-SAMPLE-N.xyz + initial-INDEX-N.dat files."""
+    BOOTSTRAP/selection sample, index, and manifest files."""
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
@@ -79,14 +103,14 @@ def test_phase_a_writes_sample_and_index(tmp_path):
 
     result = _run([
         "--descriptor", "rmsd_massweight",
-        "--iteration", "-1",
+        "--iteration", "0",
         "--campaign-dir", str(campaign),
     ])
     assert result.returncode == 0, result.stderr
 
-    outdir = campaign / "3_DIVERSITY_SAMPLING" / "initial"
-    samples = list(outdir.glob("initial-SAMPLE-*.xyz"))
-    indices = list(outdir.glob("initial-INDEX-*.dat"))
+    outdir = campaign / "BOOTSTRAP" / "selection"
+    samples = list(outdir.glob("selected.xyz"))
+    indices = list(outdir.glob("selected_indices.dat"))
     assert len(samples) == 1
     assert len(indices) == 1
     # n_select is the sum of the exact bootstrap slot counts (7).
@@ -96,13 +120,45 @@ def test_phase_a_writes_sample_and_index(tmp_path):
         assert ln.strip().isdigit()
     manifest = json.loads((outdir / PHASE_A_SAMPLE_FILENAME).read_text(encoding="utf-8"))
     assert manifest["phase"] == "PHASE_A_POLUS"
-    assert manifest["iteration"] == -1
+    assert manifest["iteration"] == 0
     assert manifest["n_select"] == 7
     assert manifest["n_frames"] == 7
     assert manifest["sample_xyz"].endswith(samples[0].name)
     assert manifest["index_path"].endswith(indices[0].name)
     assert len(manifest["selected_indices"]) == 7
     assert manifest["trajectory_sha256"]
+    assert len(manifest["sample_xyz_sha256"]) == 64
+    assert len(manifest["index_sha256"]) == 64
+    assert len(manifest["point_allocation"]["slot_assignment_sha256"]) == 64
+    read_phase_a_sample_manifest(outdir)
+
+
+def test_phase_a_manifest_rejects_sample_drift(tmp_path):
+    campaign = tmp_path / "c"
+    campaign.mkdir()
+    cfg = CampaignConfig()
+    cfg.point_allocation.bootstrap_training_size = 2
+    cfg.point_allocation.bootstrap_internal_validation_size = 1
+    cfg.point_allocation.bootstrap_external_validation_size = 1
+    cfg.max_iterations = 1
+    cfg.seed_selection.n_seeds_per_iteration = 4
+    cfg.to_yaml(campaign / "campaign.yaml")
+    _import_pool(campaign, FIXTURE)
+    result = _run([
+        "--descriptor", "rmsd_massweight",
+        "--iteration", "0",
+        "--campaign-dir", str(campaign),
+    ])
+    assert result.returncode == 0, result.stderr
+    outdir = campaign / "BOOTSTRAP" / "selection"
+    sample = outdir / "selected.xyz"
+    sample.write_text(
+        sample.read_text(encoding="utf-8") + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(HandoffManifestError, match="sample XYZ (size|hash) mismatch"):
+        read_phase_a_sample_manifest(outdir)
 
 
 def test_phase_a_prepends_anchor_geometries_and_fills_remainder_from_pool(tmp_path):
@@ -121,12 +177,12 @@ def test_phase_a_prepends_anchor_geometries_and_fills_remainder_from_pool(tmp_pa
 
     result = _run([
         "--descriptor", "rmsd_massweight",
-        "--iteration", "-1",
+        "--iteration", "0",
         "--campaign-dir", str(campaign),
     ])
     assert result.returncode == 0, result.stderr
 
-    outdir = campaign / "3_DIVERSITY_SAMPLING" / "initial"
+    outdir = campaign / "BOOTSTRAP" / "selection"
     manifest = json.loads((outdir / PHASE_A_SAMPLE_FILENAME).read_text(encoding="utf-8"))
     assert manifest["n_select"] == 7
     assert manifest["bootstrap_anchor_enabled"] is True
@@ -139,14 +195,14 @@ def test_phase_a_prepends_anchor_geometries_and_fills_remainder_from_pool(tmp_pa
     assert manifest["excluded_pool_frame_ids"] == [0]
     anchor_manifest = (
         campaign
-        / ".DATA"
-        / "ACTIVE_LEARNING"
-        / "bootstrap_anchor.json"
+        / "BOOTSTRAP"
+        / "selection"
+        / "ANCHOR.json"
     )
     assert anchor_manifest.is_file()
     anchor_payload = json.loads(anchor_manifest.read_text(encoding="utf-8"))
     assert anchor_payload["n_anchor"] == 1
-    idx_lines = (outdir / "initial-INDEX-7.dat").read_text(encoding="utf-8").splitlines()
+    idx_lines = (outdir / "selected_indices.dat").read_text(encoding="utf-8").splitlines()
     assert idx_lines[0] == "anchor:0"
     assert all(line.strip().isdigit() for line in idx_lines[1:])
 
@@ -167,7 +223,7 @@ def test_phase_a_rejects_more_anchors_than_planned_training_split(tmp_path):
 
     result = _run([
         "--descriptor", "rmsd_massweight",
-        "--iteration", "-1",
+        "--iteration", "0",
         "--campaign-dir", str(campaign),
     ])
 
@@ -189,19 +245,19 @@ def test_phase_a_fails_when_bootstrap_exceeds_pool_size(tmp_path):
     _import_pool(campaign, FIXTURE)
     result = _run([
         "--descriptor", "rmsd_massweight",
-        "--iteration", "-1",
+        "--iteration", "0",
         "--campaign-dir", str(campaign),
     ])
     assert result.returncode == 3
     assert "bootstrap requires 100 pool geometries" in result.stderr
-    outdir = campaign / "3_DIVERSITY_SAMPLING" / "initial"
-    assert not list(outdir.glob("initial-SAMPLE-*.xyz"))
+    outdir = campaign / "BOOTSTRAP" / "selection"
+    assert not (outdir / "selected.xyz").is_file()
 
 
 def _make_seed_result(seed_dir, atom_types, final_coords, alpha_final=1.0):
-    """Drop a synthetic result.json into a per-seed pool dir."""
+    """Drop a synthetic result into a canonical one-based seed directory."""
     seed_dir.mkdir(parents=True, exist_ok=True)
-    seed_index = int(seed_dir.name.split("_")[-1])
+    seed_id = int(seed_dir.name.split("-")[-1])
     payload = {
         "atom_types": atom_types,
         "final_coordinates": [list(c) for c in final_coords],
@@ -213,36 +269,118 @@ def _make_seed_result(seed_dir, atom_types, final_coords, alpha_final=1.0):
         "wall_seconds": 1.0,
         "fell_back_to_ds": False,
         "whitened_distance_final": 0.5,
-        "iteration": 0,
-        "seed_index": seed_index,
-        "seed_frame_id": seed_index,
+        "iteration": 1,
+        "seed_id": seed_id,
+        "seed_frame_id": seed_id - 1,
     }
     (seed_dir / "result.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
 def _write_ariadne_manifest(iter_dir):
+    from ichor.hpc.active_learning.ariadne_outputs import (
+        write_optimisation_trajectory,
+        write_seed_output_manifest,
+    )
+    from ichor.hpc.active_learning.daemon.state import atomic_write_json
     from ichor.hpc.active_learning.handoff_manifests import (
         ARIADNE_RESULTS_SCHEMA_VERSION,
+        seeds_picked_path,
         write_ariadne_results_manifest,
     )
+    from ichor.hpc.active_learning.layout import active_ariadne_dir
+    from ichor.hpc.active_learning.seed_identity import (
+        deterministic_seed_uid,
+        selection_fingerprint_sha256,
+        write_ariadne_task_map,
+    )
+    from ichor.hpc.active_learning.versioning.manifest import sha256_file
     from ichor.hpc.active_learning.versioning.provenance import (
         PROVENANCE_FILENAME,
         write_seed_provenance,
     )
 
+    ariadne_root = active_ariadne_dir(iter_dir)
+    seed_dirs = sorted((ariadne_root / "seeds").glob("seed-*"))
+    selection = {
+        "schema_version": 2,
+        "campaign_uid": "test",
+        "iteration": 1,
+        "models_version": 0,
+        "model_manifest_sha256": "c" * 64,
+        "trajectory_sha256": "0" * 64,
+        "selection_strategy": "hybrid_variance",
+        "n_picked": len(seed_dirs),
+        "seed_records": [
+            {
+                "seed_id": seed_id,
+                "frame_id": seed_id - 1,
+                "pool_row_index_zero_based": seed_id - 1,
+                "selection_origin": "bulk",
+                "variance_at_selection": 0.0,
+            }
+            for seed_id in range(1, len(seed_dirs) + 1)
+        ],
+    }
+    fingerprint = selection_fingerprint_sha256(selection)
+    selection["selection_fingerprint_sha256"] = fingerprint
+    for record in selection["seed_records"]:
+        record["seed_uid"] = deterministic_seed_uid(
+            campaign_uid="test",
+            iteration=1,
+            seed_id=int(record["seed_id"]),
+            frame_id=int(record["frame_id"]),
+            models_version=0,
+            model_manifest_sha256="c" * 64,
+            selection_fingerprint_sha256_value=fingerprint,
+        )
+    selection_path = seeds_picked_path(iter_dir)
+    selection_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(selection_path, selection)
+    task_map_path = write_ariadne_task_map(iter_dir, selection)
+
     accepted = []
-    pool_dir = iter_dir / "pool"
-    for seed_dir in sorted(pool_dir.glob("seed_*")):
-        seed_index = int(seed_dir.name.split("_")[-1])
+    for array_task_id, seed_dir in enumerate(seed_dirs):
+        seed_id = array_task_id + 1
+        seed_uid = str(selection["seed_records"][array_task_id]["seed_uid"])
         result_path = seed_dir / "result.json"
         result = json.loads(result_path.read_text(encoding="utf-8"))
+        result.update({
+            "iteration": 1,
+            "seed_id": seed_id,
+            "seed_uid": seed_uid,
+            "array_task_id": array_task_id,
+            "seed_frame_id": array_task_id,
+            "trajectory_sha256": "0" * 64,
+        })
+        atomic_write_json(result_path, result)
+        write_optimisation_trajectory(
+            seed_dir,
+            atom_types=result["atom_types"],
+            coordinate_frames=[result["final_coordinates"]],
+            alpha_values=[result["alpha_final"]],
+            gradient_norms=[0.0],
+            origins=["raw_final"],
+        )
+        output_manifest = write_seed_output_manifest(
+            seed_dir,
+            campaign_uid="test",
+            iteration=1,
+            seed_id=seed_id,
+            seed_uid=seed_uid,
+            array_task_id=array_task_id,
+            task_success=True,
+            task_exit_code=0,
+        )
         prov_path = seed_dir / PROVENANCE_FILENAME
         write_seed_provenance(
             seed_dir,
             campaign_uid="test",
-            iteration=0,
+            iteration=1,
             trajectory_sha256="0" * 64,
-            seed_frame_id=seed_index,
+            seed_frame_id=array_task_id,
+            seed_id=seed_id,
+            seed_uid=seed_uid,
+            array_task_id_zero_based=array_task_id,
             seed_selection_origin="bulk",
             seed_variance_at_selection=0.0,
             subspace_neighbour_frame_ids=[],
@@ -251,32 +389,59 @@ def _write_ariadne_manifest(iter_dir):
             mode_weighting_policy="variance",
         )
         rec = {
-            "seed_index": seed_index,
-            "seed_dir": str(seed_dir.resolve()),
-            "result_json": str(result_path.resolve()),
-            "provenance_json": str(prov_path.resolve()),
-            "seed_frame_id": seed_index,
-            "selection_index": seed_index,
+            "seed_id": seed_id,
+            "seed_uid": seed_uid,
+            "array_task_id": array_task_id,
+            "seed_dir": seed_dir.relative_to(ariadne_root).as_posix(),
+            "result_json": result_path.relative_to(ariadne_root).as_posix(),
+            "provenance_json": prov_path.relative_to(ariadne_root).as_posix(),
+            "output_manifest": output_manifest.relative_to(ariadne_root).as_posix(),
+            "seed_frame_id": array_task_id,
+            "pool_row_index_zero_based": array_task_id,
             "selection_origin": "bulk",
             "variance_at_selection": 0.0,
             "alpha_initial": float(result["alpha_initial"]),
             "alpha_final": float(result["alpha_final"]),
             "whitened_distance_final": float(result["whitened_distance_final"]),
             "return_code": 0,
+            "result_sha256": sha256_file(result_path),
+            "provenance_sha256": sha256_file(prov_path),
+            "output_manifest_sha256": sha256_file(output_manifest),
         }
         if isinstance(result.get("landing_safety"), dict):
             rec["landing_safety"] = dict(result["landing_safety"])
         accepted.append(rec)
     write_ariadne_results_manifest(iter_dir, {
         "schema_version": ARIADNE_RESULTS_SCHEMA_VERSION,
-        "iteration": 0,
+        "campaign_uid": "test",
+        "iteration": 1,
         "trajectory_sha256": "0" * 64,
+        "task_map": {
+            "path": task_map_path.relative_to(ariadne_root).as_posix(),
+            "sha256": sha256_file(task_map_path),
+        },
         "expected_n": len(accepted),
         "n_accepted": len(accepted),
         "n_rejected": 0,
         "accepted": accepted,
         "rejected": [],
     })
+    from ichor.hpc.active_learning.sampling_protocol import (
+        resolve_sampling_protocol,
+    )
+
+    campaign = iter_dir.parent.parent
+    config_path = campaign / "campaign.yaml"
+    config = (
+        CampaignConfig.from_yaml(config_path)
+        if config_path.is_file()
+        else CampaignConfig()
+    )
+    resolve_sampling_protocol(
+        campaign,
+        config,
+        iteration=1,
+    )
 
 
 def _set_landing_safety(seed_dir, accepted, reasons=None, policy="raw_final"):
@@ -311,11 +476,8 @@ def test_phase_b_writes_sample_and_dedup(tmp_path):
     cfg.phase_b.descriptor = "rmsd_massweight"
     cfg.to_yaml(campaign / "campaign.yaml")
     # build 5 candidate seeds with distinct geometries.
-    iter_dir = (
-        campaign / "7_ACTIVE_LEARNING"
-        / "iteration-0000"
-    )
-    pool_dir = iter_dir / "pool"
+    iter_dir = _active_iter(campaign)
+    pool_dir = ariadne_seeds_dir(iter_dir)
     atom_types = ["O", "H", "H"]
     base = [(0.0, 0.0, 0.0), (0.96, 0.0, 0.0), (-0.24, 0.93, 0.0)]
     for i in range(5):
@@ -326,29 +488,30 @@ def test_phase_b_writes_sample_and_dedup(tmp_path):
             (0.96 + 0.20 * i, 0.0, 0.0),
             (-0.24, 0.93 + 0.15 * i, 0.0),
         ]
-        seed_dir = pool_dir / f"seed_{i:04d}"
+        seed_dir = ariadne_seed_dir(iter_dir, i + 1)
         _make_seed_result(seed_dir, atom_types, coords)
         _set_landing_safety(seed_dir, accepted=True)
     _write_ariadne_manifest(iter_dir)
 
     result = _run([
         "--descriptor", "rmsd_massweight",
-        "--iteration", "0",
+        "--iteration", "1",
         "--campaign-dir", str(campaign),
     ])
     assert result.returncode == 0, result.stderr
-    raw = iter_dir / "phase_b_SAMPLE_raw.xyz"
-    final = iter_dir / "phase_b_SAMPLE.xyz"
-    dedup = iter_dir / "phase_b_dedup.json"
+    phase_b_dir = active_phase_b_dir(iter_dir)
+    raw = phase_b_dir / "selected_raw.xyz"
+    final = phase_b_dir / "selected.xyz"
+    dedup = phase_b_dir / "SELECTION.json"
     assert raw.is_file()
     assert final.is_file()
     assert dedup.is_file()
-    d = json.loads(dedup.read_text(encoding="utf-8"))
+    manifest = json.loads(dedup.read_text(encoding="utf-8"))
+    d = manifest["dedup"]
     # fresh campaign, no committed QM reference data to dedup against, so case (d) drops nothing
     # regardless of the geometry novelty-derived default minimum separation.
     assert d["n_dropped"] == 0
     assert d["min_separation"] == 0.025
-    manifest = json.loads((iter_dir / "PHASE_B_SELECTION.json").read_text(encoding="utf-8"))
     assert "distance_to_nearest_angstrom" in manifest["raw"][0]
     assert "scaled_distance_to_nearest" in manifest["raw"][0]
     assert "novelty_score" in manifest["raw"][0]
@@ -363,13 +526,13 @@ def test_phase_b_rejects_unsafe_accepted_landing_before_fps(tmp_path):
     cfg.phase_b.descriptor = "rmsd_massweight"
     cfg.to_yaml(campaign / "campaign.yaml")
 
-    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
-    pool_dir = iter_dir / "pool"
+    iter_dir = _active_iter(campaign)
+    pool_dir = ariadne_seeds_dir(iter_dir)
     atom_types = ["O", "H", "H"]
     base = [(0.0, 0.0, 0.0), (0.96, 0.0, 0.0), (-0.24, 0.93, 0.0)]
     for i in range(3):
         coords = [(c[0] + 0.4 * i, c[1], c[2]) for c in base]
-        seed_dir = pool_dir / f"seed_{i:04d}"
+        seed_dir = ariadne_seed_dir(iter_dir, i + 1)
         _make_seed_result(seed_dir, atom_types, coords)
         _set_landing_safety(seed_dir, accepted=(i != 1),
                             reasons=["no_safe_non_seed_landing"] if i == 1 else [])
@@ -377,12 +540,12 @@ def test_phase_b_rejects_unsafe_accepted_landing_before_fps(tmp_path):
 
     result = _run([
         "--descriptor", "rmsd_massweight",
-        "--iteration", "0",
+        "--iteration", "1",
         "--campaign-dir", str(campaign),
     ])
     assert result.returncode == 3
     assert "no_safe_non_seed_landing" in result.stderr
-    assert not (iter_dir / "phase_b_SAMPLE_raw.xyz").exists()
+    assert not (active_phase_b_dir(iter_dir) / "selected_raw.xyz").exists()
 
 
 def test_phase_b_rejects_partial_missing_landing_safety(tmp_path):
@@ -392,21 +555,21 @@ def test_phase_b_rejects_partial_missing_landing_safety(tmp_path):
     cfg.phase_b.descriptor = "rmsd_massweight"
     cfg.to_yaml(campaign / "campaign.yaml")
 
-    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
-    pool_dir = iter_dir / "pool"
+    iter_dir = _active_iter(campaign)
+    pool_dir = ariadne_seeds_dir(iter_dir)
     atom_types = ["O", "H", "H"]
     base = [(0.0, 0.0, 0.0), (0.96, 0.0, 0.0), (-0.24, 0.93, 0.0)]
-    _make_seed_result(pool_dir / "seed_0000", atom_types, base)
-    _set_landing_safety(pool_dir / "seed_0000", accepted=True)
+    _make_seed_result(ariadne_seed_dir(iter_dir, 1), atom_types, base)
+    _set_landing_safety(ariadne_seed_dir(iter_dir, 1), accepted=True)
     _make_seed_result(
-        pool_dir / "seed_0001", atom_types,
+        ariadne_seed_dir(iter_dir, 2), atom_types,
         [(c[0] + 0.4, c[1], c[2]) for c in base],
     )
     _write_ariadne_manifest(iter_dir)
 
     result = _run([
         "--descriptor", "rmsd_massweight",
-        "--iteration", "0",
+        "--iteration", "1",
         "--campaign-dir", str(campaign),
     ])
     assert result.returncode == 3
@@ -420,13 +583,13 @@ def test_phase_b_rejects_all_missing_landing_safety_by_default(tmp_path):
     cfg.phase_b.descriptor = "rmsd_massweight"
     cfg.to_yaml(campaign / "campaign.yaml")
 
-    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
-    pool_dir = iter_dir / "pool"
+    iter_dir = _active_iter(campaign)
+    pool_dir = ariadne_seeds_dir(iter_dir)
     atom_types = ["O", "H", "H"]
     base = [(0.0, 0.0, 0.0), (0.96, 0.0, 0.0), (-0.24, 0.93, 0.0)]
     for i in range(2):
         _make_seed_result(
-            pool_dir / f"seed_{i:04d}",
+            ariadne_seed_dir(iter_dir, i + 1),
             atom_types,
             [
                 (0.0, 0.0, 0.0),
@@ -438,13 +601,13 @@ def test_phase_b_rejects_all_missing_landing_safety_by_default(tmp_path):
 
     result = _run([
         "--descriptor", "rmsd_massweight",
-        "--iteration", "0",
+        "--iteration", "1",
         "--campaign-dir", str(campaign),
     ])
 
     assert result.returncode == 3
     assert "missing_landing_safety" in result.stderr
-    assert not (iter_dir / "phase_b_SAMPLE_raw.xyz").exists()
+    assert not (active_phase_b_dir(iter_dir) / "selected_raw.xyz").exists()
 
 
 def test_phase_b_accepts_all_missing_landing_safety_with_legacy_override(tmp_path):
@@ -457,13 +620,13 @@ def test_phase_b_accepts_all_missing_landing_safety_with_legacy_override(tmp_pat
     cfg.adversarial_safety.accept_legacy_missing_landing_safety = True
     cfg.to_yaml(campaign / "campaign.yaml")
 
-    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
-    pool_dir = iter_dir / "pool"
+    iter_dir = _active_iter(campaign)
+    pool_dir = ariadne_seeds_dir(iter_dir)
     atom_types = ["O", "H", "H"]
     base = [(0.0, 0.0, 0.0), (0.96, 0.0, 0.0), (-0.24, 0.93, 0.0)]
     for i in range(2):
         _make_seed_result(
-            pool_dir / f"seed_{i:04d}",
+            ariadne_seed_dir(iter_dir, i + 1),
             atom_types,
             [
                 (0.0, 0.0, 0.0),
@@ -475,13 +638,13 @@ def test_phase_b_accepts_all_missing_landing_safety_with_legacy_override(tmp_pat
 
     result = _run([
         "--descriptor", "rmsd_massweight",
-        "--iteration", "0",
+        "--iteration", "1",
         "--campaign-dir", str(campaign),
     ])
 
     assert result.returncode == 0, result.stderr
     manifest = json.loads(
-        (iter_dir / "PHASE_B_SELECTION.json").read_text(encoding="utf-8")
+        (active_phase_b_dir(iter_dir) / "SELECTION.json").read_text(encoding="utf-8")
     )
     assert manifest["safety_filter"]["legacy_missing_safety"] is True
 
@@ -493,12 +656,12 @@ def test_phase_b_all_unsafe_candidates_halts_before_gaussian_handoff(tmp_path):
     cfg.phase_b.descriptor = "rmsd_massweight"
     cfg.to_yaml(campaign / "campaign.yaml")
 
-    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
-    pool_dir = iter_dir / "pool"
+    iter_dir = _active_iter(campaign)
+    pool_dir = ariadne_seeds_dir(iter_dir)
     atom_types = ["O", "H", "H"]
     base = [(0.0, 0.0, 0.0), (0.96, 0.0, 0.0), (-0.24, 0.93, 0.0)]
     for i in range(2):
-        seed_dir = pool_dir / f"seed_{i:04d}"
+        seed_dir = ariadne_seed_dir(iter_dir, i + 1)
         _make_seed_result(
             seed_dir,
             atom_types,
@@ -514,13 +677,13 @@ def test_phase_b_all_unsafe_candidates_halts_before_gaussian_handoff(tmp_path):
 
     result = _run([
         "--descriptor", "rmsd_massweight",
-        "--iteration", "0",
+        "--iteration", "1",
         "--campaign-dir", str(campaign),
     ])
 
     assert result.returncode == 3
     assert "no_safe_non_seed_landing" in result.stderr
-    assert not (iter_dir / "phase_b_SAMPLE_raw.xyz").exists()
+    assert not (active_phase_b_dir(iter_dir) / "selected_raw.xyz").exists()
 
 
 def test_phase_b_no_seeds_returns_3(tmp_path):
@@ -529,14 +692,11 @@ def test_phase_b_no_seeds_returns_3(tmp_path):
     campaign.mkdir()
     cfg = CampaignConfig()
     cfg.to_yaml(campaign / "campaign.yaml")
-    iter_dir = (
-        campaign / "7_ACTIVE_LEARNING"
-        / "iteration-0000"
-    )
-    (iter_dir / "pool").mkdir(parents=True)
+    iter_dir = _active_iter(campaign)
+    ariadne_seeds_dir(iter_dir).mkdir(parents=True)
     result = _run([
         "--descriptor", "rmsd_massweight",
-        "--iteration", "0",
+        "--iteration", "1",
         "--campaign-dir", str(campaign),
     ])
     assert result.returncode == 3
@@ -552,24 +712,23 @@ def test_phase_b_ignores_hidden_descriptor_override_single_candidate(tmp_path):
     cfg.point_allocation.batch_training_size = 1
     cfg.point_allocation.batch_internal_validation_size = 0
     cfg.to_yaml(campaign / "campaign.yaml")
-    iter_dir = (
-        campaign / "7_ACTIVE_LEARNING"
-        / "iteration-0000"
-    )
-    pool_dir = iter_dir / "pool"
+    iter_dir = _active_iter(campaign)
+    pool_dir = ariadne_seeds_dir(iter_dir)
     _make_seed_result(
-        pool_dir / "seed_0000",
+        ariadne_seed_dir(iter_dir, 1),
         ["O", "H", "H"],
         [(0.0, 0.0, 0.0), (0.96, 0.0, 0.0), (-0.24, 0.93, 0.0)],
     )
-    _set_landing_safety(pool_dir / "seed_0000", accepted=True)
+    _set_landing_safety(ariadne_seed_dir(iter_dir, 1), accepted=True)
     _write_ariadne_manifest(iter_dir)
     result = _run([
         "--descriptor", "acquisition_weighted",
-        "--iteration", "0",
+        "--iteration", "1",
         "--campaign-dir", str(campaign),
     ])
     assert result.returncode == 0, result.stderr
-    manifest = json.loads((iter_dir / "PHASE_B_SELECTION.json").read_text(encoding="utf-8"))
+    manifest = json.loads(
+        (active_phase_b_dir(iter_dir) / "SELECTION.json").read_text(encoding="utf-8")
+    )
     assert manifest["descriptor"] == "hybrid_alf_rmsd"
     assert manifest["n_kept"] == 1

@@ -56,6 +56,8 @@ ichor_csf_initialise_modules() {
         return 0
     fi
 
+    # An external module wrapper cannot mutate this script's PATH after load.
+    # Resolve a shell function before accepting the module environment.
     local init_file
     for init_file in \
         /etc/profile.d/modules.sh \

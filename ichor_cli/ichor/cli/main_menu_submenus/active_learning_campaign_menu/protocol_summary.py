@@ -12,6 +12,7 @@ from ichor.cli.main_menu_submenus.active_learning_campaign_menu.field_menu impor
     format_field_value,
 )
 from ichor.hpc.active_learning.config import CampaignConfig
+from ichor.hpc.active_learning.layout import active_learning_dir
 
 
 def _line(label: str, value) -> str:
@@ -25,13 +26,15 @@ def _latest_geometry_novelty_payload(campaign_dir: Path):
         )
     except Exception as exc:
         return None, "unavailable (" + type(exc).__name__ + ": " + str(exc) + ")"
-    base = Path(campaign_dir) / "7_ACTIVE_LEARNING"
+    base = active_learning_dir(campaign_dir)
     if not base.is_dir():
         return None, "not written yet"
-    candidates = sorted(base.glob("iteration-*/GEOMETRY_NOVELTY_SCALE.json"))
+    candidates = sorted(
+        base.glob("iteration-*/protocol/GEOMETRY_NOVELTY_SCALE.json")
+    )
     if not candidates:
         return None, "not written yet"
-    latest = candidates[-1].parent
+    latest = candidates[-1].parent.parent
     try:
         payload = read_geometry_novelty_scale(latest)
     except Exception as exc:
@@ -303,6 +306,12 @@ def format_sampling_protocol_summary(
         geometry_payload, geometry_source = _latest_geometry_novelty_payload(
             Path(campaign_dir)
         )
+    preview_iteration = 1
+    if isinstance(geometry_payload, dict):
+        try:
+            preview_iteration = max(1, int(geometry_payload.get("iteration", 1)))
+        except (TypeError, ValueError):
+            preview_iteration = 1
     try:
         from ichor.hpc.active_learning.sampling_protocol import (
             preview_sampling_protocol,
@@ -313,6 +322,7 @@ def format_sampling_protocol_summary(
         resolved = preview_sampling_protocol(
             config,
             campaign_dir=campaign_dir,
+            iteration=preview_iteration,
             geometry_scale_payload=geometry_payload,
         )
         resolved_error = None
@@ -504,16 +514,15 @@ def format_sampling_protocol_summary(
         )
     if campaign_dir is not None:
         try:
+            from ichor.hpc.active_learning.layout import active_iteration_dir
+
+            example_iteration = active_iteration_dir(Path(campaign_dir), 1)
             manifest_path = sampling_protocol_resolved_path(
-                Path(campaign_dir)
-                / "7_ACTIVE_LEARNING"
-                / "iteration-0000"
+                example_iteration
             )
             lines.append(_line("sampling_protocol.resolved_manifest_example", manifest_path))
             audit_path = sampling_protocol_audit_path(
-                Path(campaign_dir)
-                / "7_ACTIVE_LEARNING"
-                / "iteration-0000"
+                example_iteration
             )
             lines.append(_line("sampling_protocol.audit_manifest_example", audit_path))
         except Exception:

@@ -12,6 +12,8 @@ acceptance test from the migration plan:
 The test runs locally in pytest's tmp_path, but the file-system flow is
 the same one CSF4 would exercise.
 """
+import json
+import stat
 from pathlib import Path
 
 import pytest
@@ -25,9 +27,17 @@ from ichor.hpc.active_learning.daemon.journal import iter_events
 from ichor.hpc.active_learning.daemon.state import CampaignPhase, read_state
 from ichor.hpc.active_learning.versioning.manifest import (
     MANIFEST_FILENAME,
+    sha256_file,
     verify_manifest,
 )
 from ichor.hpc.active_learning.versioning.versioned_directory import VersionedDirectory
+from ichor.hpc.active_learning.versioning.sampling_iterations import (
+    SamplingIterationError,
+    active_iteration_manifest_path,
+    bootstrap_manifest_path,
+    verify_active_iteration,
+    verify_sampling_chain,
+)
 
 
 _SBATCH_PHASES = (
@@ -84,7 +94,7 @@ def test_dry_run_writes_one_stub_script_per_sbatch_phase_per_iter(tmp_path):
 
 
 def test_dry_run_commits_three_reference_data_versions(tmp_path):
-    """Initial commit (iter 0) + APPEND at iter 0 + APPEND at iter 1."""
+    """Bootstrap version 0 plus active iterations 1 and 2."""
     campaign, _, _, _ = _run_two_iter_campaign(tmp_path)
     v = VersionedDirectory(campaign / "QM_REFERENCE_DATA")
     assert sorted(v.list_committed_versions()) == [0, 1, 2]
@@ -92,7 +102,7 @@ def test_dry_run_commits_three_reference_data_versions(tmp_path):
 
 
 def test_dry_run_commits_three_models_versions(tmp_path):
-    """Initial models (iter 0) + FEREBUS post at iter 0 + FEREBUS at iter 1."""
+    """Bootstrap models 0 plus active iterations 1 and 2."""
     campaign, _, _, _ = _run_two_iter_campaign(tmp_path)
     v = VersionedDirectory(campaign / "TRAINED_MODELS")
     assert sorted(v.list_committed_versions()) == [0, 1, 2]
@@ -110,18 +120,62 @@ def test_dry_run_every_committed_iteration_has_manifest(tmp_path):
 
 def test_dry_run_active_learning_dirs_have_seeds_pool_and_phase_b(tmp_path):
     campaign, _, _, _ = _run_two_iter_campaign(tmp_path)
-    for i in (0, 1):
-        d = campaign / "7_ACTIVE_LEARNING" / ("iteration-" + str(i).zfill(4))
+    bootstrap_manifest = bootstrap_manifest_path(campaign)
+    assert bootstrap_manifest.is_file()
+    for i in (1, 2):
+        d = campaign / "ACTIVE_LEARNING" / ("iteration-" + str(i).zfill(6))
         assert d.is_dir()
-        assert (d / "seeds.xyz").exists()
-        assert (d / "pool").is_dir()
-        assert (d / "phase_b_SAMPLE.xyz").exists()
-        assert (d / "split.json").exists()
-        # Every seed has a result.json
-        seed_dirs = list((d / "pool").iterdir())
+        assert (d / "seed_selection" / "seeds.xyz").is_file()
+        assert (d / "seed_selection" / "SELECTION.json").is_file()
+        assert (d / "ariadne" / "TASK_MAP.json").is_file()
+        assert (d / "ariadne" / "RESULTS.json").is_file()
+        assert (d / "ariadne" / "AUDIT.json").is_file()
+        assert (d / "phase_b" / "selected.xyz").is_file()
+        assert (d / "phase_b" / "SELECTION.json").is_file()
+        assert (d / "allocation" / "SPLIT_RECEIPT.json").is_file()
+        assert (d / "ITERATION_MANIFEST.json").is_file()
+        seed_dirs = sorted((d / "ariadne" / "seeds").iterdir())
         assert seed_dirs
-        for sd in seed_dirs:
-            assert (sd / "result.json").exists()
+        assert [seed_dir.name for seed_dir in seed_dirs] == [
+            "seed-" + str(seed_id).zfill(6)
+            for seed_id in range(1, len(seed_dirs) + 1)
+        ]
+        for seed_dir in seed_dirs:
+            assert (seed_dir / "result.json").is_file()
+            assert (seed_dir / "provenance.json").is_file()
+            assert (seed_dir / "ARIADNE_OUTPUT_MANIFEST.json").is_file()
+            assert (seed_dir / "trajectory" / "trajectory.xyz").is_file()
+            assert (seed_dir / "trajectory" / "metrics.jsonl").is_file()
+            assert (seed_dir / "trajectory" / "MANIFEST.json").is_file()
+        manifest_path = active_iteration_manifest_path(campaign, i)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        expected_parent = (
+            bootstrap_manifest
+            if i == 1
+            else active_iteration_manifest_path(campaign, i - 1)
+        )
+        assert manifest["parent"]["sha256"] == sha256_file(expected_parent)
+        assert manifest["input_head"]["version"] == i - 1
+        assert manifest["output_head"]["version"] == i
+        assert any(
+            record["path"] == "phase_b/selected.xyz"
+            and record["role"] == "derived_cache"
+            for record in manifest["files"]
+        )
+        assert not (stat.S_IMODE(d.stat().st_mode) & stat.S_IWUSR)
+    verify_sampling_chain(campaign, 2)
+
+    first_iteration = campaign / "ACTIVE_LEARNING" / "iteration-000001"
+    first_iteration.chmod(first_iteration.stat().st_mode | stat.S_IWUSR)
+    rogue = first_iteration / "rogue.txt"
+    rogue.write_text("not in the sealed inventory\n", encoding="utf-8")
+    with pytest.raises(SamplingIterationError, match="exact inventory mismatch"):
+        verify_active_iteration(campaign, 1)
+    rogue.unlink()
+    interrupted = first_iteration / ".tmp-interrupted-write"
+    interrupted.write_text("partial\n", encoding="utf-8")
+    with pytest.raises(SamplingIterationError, match="incomplete artefact"):
+        verify_active_iteration(campaign, 1)
 
 
 def test_dry_run_journal_records_all_phases(tmp_path):
@@ -173,8 +227,8 @@ def test_dry_run_cli_drives_campaign_to_done(tmp_path):
 def test_dry_run_state_persists_iteration_counter(tmp_path):
     campaign, d, _, _ = _run_two_iter_campaign(tmp_path)
     state = read_state(d.state_path())
-    # max_iterations=2 -> the last iteration to run is iteration=1.
-    assert state.iteration == 1
-    # reference_data_version was bumped by the APPEND inline at each iter.
+    # Active iterations are one-based; bootstrap alone is iteration 0.
+    assert state.iteration == 2
+    # Reference and model versions match the completed active iteration.
     assert state.reference_data_version == 2
     assert state.models_version == 2

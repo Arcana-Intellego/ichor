@@ -44,7 +44,7 @@ __all__ = [
 ]
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 DEFAULT_STATE_FILENAME = "state.json"
 
 
@@ -145,9 +145,9 @@ class CampaignState:
     max_iterations: int = 50
     phase: CampaignPhase = CampaignPhase.INIT
     pending_jobs: Dict[str, Optional[str]] = field(default_factory=dict)
-    reference_data_version: int = 0
-    validation_set_version: int = 0
-    models_version: int = 0
+    reference_data_version: int = -1
+    validation_set_version: int = -1
+    models_version: int = -1
     replacement_round: int = 0
     last_acquisition_alpha0: Optional[float] = None
     stop_streak: int = 0
@@ -216,6 +216,34 @@ class CampaignState:
         stop_streak = int(payload["stop_streak"])
         if iteration < 0:
             raise StateSchemaError("iteration must be >= 0")
+        bootstrap_phases = {
+            CampaignPhase.INIT,
+            CampaignPhase.PHASE_A_POLUS,
+            CampaignPhase.INITIAL_GAUSSIAN,
+            CampaignPhase.INITIAL_AIMALL,
+            CampaignPhase.INITIAL_ALLOCATION_CHECK,
+            CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN,
+            CampaignPhase.INITIAL_REPLACEMENT_AIMALL,
+            CampaignPhase.INITIAL_FEREBUS,
+        }
+        active_phases = {
+            CampaignPhase.SEED_SELECT,
+            CampaignPhase.ARIADNE_ARRAY,
+            CampaignPhase.PHASE_B_POLUS,
+            CampaignPhase.SPLIT,
+            CampaignPhase.GAUSSIAN,
+            CampaignPhase.AIMALL,
+            CampaignPhase.ALLOCATION_CHECK,
+            CampaignPhase.REPLACEMENT_GAUSSIAN,
+            CampaignPhase.REPLACEMENT_AIMALL,
+            CampaignPhase.APPEND,
+            CampaignPhase.FEREBUS,
+            CampaignPhase.STOP_CHECK,
+        }
+        if phase in bootstrap_phases and iteration != 0:
+            raise StateSchemaError("bootstrap phase requires iteration 0")
+        if phase in active_phases and iteration < 1:
+            raise StateSchemaError("active-learning phase requires iteration >= 1")
         if max_iterations < 1:
             raise StateSchemaError("max_iterations must be >= 1")
         if reference_data_version < -1:
@@ -350,18 +378,20 @@ def atomic_write_text(target: Union[str, Path], text: str) -> None:
     target = Path(target)
     if not target.parent.exists():
         raise FileNotFoundError("parent directory does not exist: " + str(target.parent))
-    tmp = target.with_name(
-        target.name + "." + str(os.getpid()) + "." + uuid.uuid4().hex + ".tmp"
-    )
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
-        f.flush()
-        try:
-            os.fsync(f.fileno())
-        except (OSError, NotImplementedError):
-            #Just to be sure - fsync may be unsupported on some filesystems (tmpfs/test envs).
-            pass
-    os.replace(str(tmp), str(target))
+    tmp = target.parent / (".tmp-" + uuid.uuid4().hex)
+    try:
+        with open(tmp, "x", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except (OSError, NotImplementedError):
+                # fsync may be unsupported on some filesystems (tmpfs/test environments).
+                pass
+        os.replace(str(tmp), str(target))
+    finally:
+        if tmp.exists():
+            tmp.unlink()
     _fsync_parent_dir(target)
 
 

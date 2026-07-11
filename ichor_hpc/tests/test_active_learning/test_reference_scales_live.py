@@ -113,14 +113,14 @@ def test_happy_path_writes_sidecar_and_journals(tmp_path):
                 "load_trained_models",
                 return_value=(SimpleNamespace(), SimpleNamespace()),
             ):
-                state = _state(iteration=0, models_version=0)
+                state = _state(iteration=1, models_version=0)
                 refreshed = ex._maybe_refresh_reference_scales(state)
     assert refreshed is True
     assert state.reference_scales == fake_scales
-    assert state.reference_scales_iteration == 0
+    assert state.reference_scales_iteration == 1
     sidecar = (
-        ex.campaign_dir / "7_ACTIVE_LEARNING"
-        / "iteration-0000" / "reference_scales.json"
+        ex.campaign_dir / "ACTIVE_LEARNING"
+        / "iteration-000001" / "protocol" / "reference_scales.json"
     )
     assert sidecar.is_file()
     persisted = json.loads(sidecar.read_text(encoding="utf-8"))
@@ -143,7 +143,7 @@ def test_happy_path_writes_sidecar_and_journals(tmp_path):
 def test_dry_path_still_returns_synthetic_stub(tmp_path):
     cfg = CampaignConfig()
     ex = DryRunPhaseExecutor(campaign_dir=tmp_path / "c", config=cfg)
-    state = _state(iteration=0, models_version=0)
+    state = _state(iteration=1, models_version=0)
     refreshed = ex._maybe_refresh_reference_scales_dry(state)
     assert refreshed is True
     assert set(state.reference_scales.keys()) == {

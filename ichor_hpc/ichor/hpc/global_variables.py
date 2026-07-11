@@ -207,7 +207,7 @@ FILE_STRUCTURE.add(
     description="""Directory containing metadynamics trajectory calculations""",
 )
 FILE_STRUCTURE.add(
-    "3_DIVERSITY_SAMPLING",
+    "BOOTSTRAP",
     "diversity_sampling",
     type_=FileType.Directory,
     description="""Directory containing diversity sampled trajectory""",

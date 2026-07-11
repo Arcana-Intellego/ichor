@@ -52,13 +52,23 @@ Dockerfile
 # campaign root subtrees that hold committed iterations and the
 # per-pointdir sidecars that live outside .DATA/.
 
-3_DIVERSITY_SAMPLING/
-5_TRAINING/
-QM_REFERENCE_DATA/
-TRAINED_MODELS/
+/BOOTSTRAP/
+/3_DIVERSITY_SAMPLING/
+/5_TRAINING/
+/QM_REFERENCE_DATA/
+/TRAINED_MODELS/
 # Obsolete runtime root; kept ignored so an old campaign cannot be committed.
-6_TRAINED_MODELS/
-7_ACTIVE_LEARNING/
+/6_TRAINED_MODELS/
+/ACTIVE_LEARNING/
+/7_ACTIVE_LEARNING/
+/examples/**/BOOTSTRAP/
+/examples/**/3_DIVERSITY_SAMPLING/
+/examples/**/5_TRAINING/
+/examples/**/QM_REFERENCE_DATA/
+/examples/**/TRAINED_MODELS/
+/examples/**/6_TRAINED_MODELS/
+/examples/**/ACTIVE_LEARNING/
+/examples/**/7_ACTIVE_LEARNING/
 .provenance.json
 .provenance.lock
 daemon.lock

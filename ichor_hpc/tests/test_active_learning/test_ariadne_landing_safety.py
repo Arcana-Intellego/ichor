@@ -41,7 +41,7 @@ class _FakeAcquisition:
         )
         self.posterior = _Posterior()
 
-    def components(self, atoms):
+    def components(self, atoms, **_kwargs):
         x = float(np.asarray(atoms.coordinates, dtype=float)[0, 0])
         return SimpleNamespace(
             total=x,

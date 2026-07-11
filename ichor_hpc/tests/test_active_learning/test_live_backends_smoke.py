@@ -355,8 +355,12 @@ def test_slurm_env_gaussian_memory_still_uses_environment_contract(monkeypatch):
         config=cfg,
     )
 
+    memory_lines = [
+        line for line in body.splitlines()
+        if "GAUSS_" in line or "--mem" in line
+    ]
     assert "#SBATCH --mem-per-cpu=4G" in body
-    assert "export GAUSS_MDEF=3GB" in body
+    assert "export GAUSS_MDEF=13GB" in body, memory_lines
     assert "%mem" not in body.lower()
 
 
@@ -549,14 +553,15 @@ def test_csf3_gaussian_block_uses_configured_module_path_and_scratch(monkeypatch
     assert body.startswith("#!/bin/bash --login")
     assert "module load apps/binapps/gaussian/g16c01_em64t_detectcpu" in body
     assert "$g16root/g16/g16 < input.gjf > input.gau" in body
-    assert "export ICHOR_CAMPAIGN_DIR=/scratch/campaign" in body
+    expected_campaign = shlex.quote(str(Path("/scratch/campaign").resolve()))
+    assert "export ICHOR_CAMPAIGN_DIR=" + expected_campaign in body
     assert "export ICHOR_GAUSSIAN_PHASE=INITIAL_GAUSSIAN" in body
     assert 'export GAUSS_SCRDIR="${ICHOR_CAMPAIGN_DIR}/.DATA/SCRATCH/GAUSSIAN/${ICHOR_GAUSSIAN_PHASE}/${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"' in body
     assert 'rm -rf -- "$GAUSS_SCRDIR"' in body
     assert "Gaussian failed; keeping scratch at $GAUSS_SCRDIR" in body
     assert "ichor_gaussian_${SLURM_JOB_ID}" not in body
     assert 'export GAUSS_PDEF="${SLURM_CPUS_PER_TASK:-1}"' in body
-    assert "export GAUSS_MDEF=6GB" in body
+    assert "export GAUSS_MDEF=27GB" in body
 
 
 def test_gaussian_block_ignores_configured_scratch_root(monkeypatch):
@@ -607,7 +612,7 @@ def test_default_trqn_scale_mode_is_not_warned():
     assert "trqn_scale_mode_unknown" not in warnings
 
 
-def test_ariadne_seed_provenance_legacy_invalid_is_repaired(tmp_path):
+def test_ariadne_seed_provenance_is_created_with_canonical_identity(tmp_path):
     from ichor.hpc.active_learning.versioning.provenance import (
         PROVENANCE_FILENAME,
         validate_provenance,
@@ -617,11 +622,12 @@ def test_ariadne_seed_provenance_legacy_invalid_is_repaired(tmp_path):
     ex = LiveBackendsPhaseExecutor.__new__(LiveBackendsPhaseExecutor)
     ex.campaign_dir = campaign
     ex.config = CampaignConfig()
-    ex.al_dir_name = "7_ACTIVE_LEARNING"
+    ex.al_dir_name = "ACTIVE_LEARNING"
     ex.artefact_log = []
-    state = SimpleNamespace(iteration=0, campaign_uid="test-campaign")
+    state = SimpleNamespace(iteration=1, campaign_uid="test-campaign")
     seed_record = {
-        "seed_index": 0,
+        "seed_id": 1,
+        "seed_uid": "b" * 64,
         "frame_id": 7,
         "selection_origin": "d_optimal",
         "variance_at_selection": 1.0,
@@ -630,44 +636,43 @@ def test_ariadne_seed_provenance_legacy_invalid_is_repaired(tmp_path):
         "subspace_eigenvalues": [1.0, 0.5],
     }
     picked = {"trajectory_sha256": "a" * 64}
-    seed_dir = ex._seed_dir_for_record(0, seed_record)
+    seed_dir = ex._seed_dir_for_record(1, seed_record)
     seed_dir.mkdir(parents=True)
     prov_path = seed_dir / PROVENANCE_FILENAME
-    prov_path.write_text(
-        '{"campaign_uid":"test-campaign","iteration":0,"seed":{"frame_id":7}}',
-        encoding="utf-8",
-    )
 
-    repaired_path, created = ex._ensure_ariadne_seed_provenance(
+    created_path, created = ex._ensure_ariadne_seed_provenance(
         state,
         picked,
         seed_record,
     )
 
-    assert repaired_path == prov_path
+    assert created_path == prov_path
     assert created is True
-    assert list(seed_dir.glob(PROVENANCE_FILENAME + ".legacy_invalid.*"))
     validate_provenance(
         seed_dir,
         campaign_uid="test-campaign",
-        iteration=0,
+        iteration=1,
         trajectory_sha256="a" * 64,
         seed_frame_id=7,
+        seed_id=1,
+        seed_uid="b" * 64,
+        array_task_id_zero_based=0,
     )
 
 
 def test_ariadne_seed_provenance_identity_mismatch_still_fails(tmp_path):
-    from ichor.hpc.active_learning.versioning.provenance import PROVENANCE_FILENAME
+    from ichor.hpc.active_learning.versioning.provenance import write_seed_provenance
 
     campaign = tmp_path / "campaign"
     ex = LiveBackendsPhaseExecutor.__new__(LiveBackendsPhaseExecutor)
     ex.campaign_dir = campaign
     ex.config = CampaignConfig()
-    ex.al_dir_name = "7_ACTIVE_LEARNING"
+    ex.al_dir_name = "ACTIVE_LEARNING"
     ex.artefact_log = []
-    state = SimpleNamespace(iteration=0, campaign_uid="test-campaign")
+    state = SimpleNamespace(iteration=1, campaign_uid="test-campaign")
     seed_record = {
-        "seed_index": 0,
+        "seed_id": 1,
+        "seed_uid": "b" * 64,
         "frame_id": 7,
         "selection_origin": "bulk",
         "variance_at_selection": 1.0,
@@ -675,13 +680,22 @@ def test_ariadne_seed_provenance_identity_mismatch_still_fails(tmp_path):
         "subspace_dimension": 0,
         "subspace_eigenvalues": [],
     }
-    seed_dir = ex._seed_dir_for_record(0, seed_record)
+    seed_dir = ex._seed_dir_for_record(1, seed_record)
     seed_dir.mkdir(parents=True)
-    (seed_dir / PROVENANCE_FILENAME).write_text(
-        '{"campaign_uid":"wrong","iteration":0,'
-        '"trajectory_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
-        '"seed":{"frame_id":7},"subspace":{"dimension":0,"neighbour_frame_ids":[]}}',
-        encoding="utf-8",
+    write_seed_provenance(
+        seed_dir,
+        campaign_uid="wrong",
+        iteration=1,
+        trajectory_sha256="a" * 64,
+        seed_frame_id=7,
+        seed_id=1,
+        seed_uid="b" * 64,
+        array_task_id_zero_based=0,
+        seed_selection_origin="bulk",
+        seed_variance_at_selection=1.0,
+        subspace_neighbour_frame_ids=[],
+        subspace_dimension=0,
+        subspace_eigenvalues=[],
     )
 
     with pytest.raises(BackendSubmissionError, match="campaign_uid mismatch"):
@@ -988,7 +1002,7 @@ def test_configured_array_task_limit_rejects_too_large_array(monkeypatch):
 def test_build_sbatch_script_uses_yaml_scheduler_resources_by_default():
     cfg = CampaignConfig()
     cfg.resources.partition = "csf4-debug"
-    cfg.resources.default_walltime_hours = 7
+    cfg.resources.polus_walltime_hours = 7
     body = build_sbatch_script(
         phase_name="PHASE_A_POLUS",
         iteration=0,
@@ -1091,7 +1105,7 @@ def test_ariadne_auto_cpus_match_active_fd_worker_count(monkeypatch):
         config=cfg,
         partition="multicore",
         campaign_dir=None,
-        iteration=0,
+        iteration=1,
     )
 
     assert resolved.cpus_per_task == 6
@@ -1113,7 +1127,7 @@ def test_ariadne_auto_cpus_match_cartesian_fd_component_count(monkeypatch, tmp_p
         },
         "csf3",
     )
-    staging = tmp_path / ".DATA" / "STAGING" / "iter_0"
+    staging = tmp_path / ".DATA" / "STAGING" / "iter_1"
     pointdir = staging / "POINT_0000.pointdir"
     pointdir.mkdir(parents=True)
     (pointdir / "input.gjf").write_text(
@@ -1142,7 +1156,7 @@ def test_ariadne_auto_cpus_match_cartesian_fd_component_count(monkeypatch, tmp_p
         config=cfg,
         partition="multicore",
         campaign_dir=tmp_path,
-        iteration=0,
+        iteration=1,
     )
 
     assert resolved.cpus_per_task == 12
@@ -1220,25 +1234,57 @@ def test_array_staging_receives_executor_partition_override(monkeypatch, tmp_pat
     assert calls["aimall"]["partition_override"] == "override-partition"
 
 
+def _write_minimal_ariadne_task_map(iter_dir):
+    from ichor.hpc.active_learning.daemon.state import atomic_write_json
+    from ichor.hpc.active_learning.handoff_manifests import seeds_picked_path
+    from ichor.hpc.active_learning.seed_identity import (
+        deterministic_seed_uid,
+        selection_fingerprint_sha256,
+        write_ariadne_task_map,
+    )
+
+    payload = {
+        "schema_version": 2,
+        "campaign_uid": "uid",
+        "iteration": 1,
+        "models_version": 0,
+        "model_manifest_sha256": "c" * 64,
+        "trajectory_sha256": "d" * 64,
+        "n_picked": 1,
+        "seed_records": [{
+            "seed_id": 1,
+            "frame_id": 0,
+            "pool_row_index_zero_based": 0,
+            "selection_origin": "bulk",
+            "variance_at_selection": 0.0,
+        }],
+    }
+    fingerprint = selection_fingerprint_sha256(payload)
+    payload["selection_fingerprint_sha256"] = fingerprint
+    payload["seed_records"][0]["seed_uid"] = deterministic_seed_uid(
+        campaign_uid="uid",
+        iteration=1,
+        seed_id=1,
+        frame_id=0,
+        models_version=0,
+        model_manifest_sha256="c" * 64,
+        selection_fingerprint_sha256_value=fingerprint,
+    )
+    selection_path = seeds_picked_path(iter_dir)
+    selection_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(selection_path, payload)
+    write_ariadne_task_map(iter_dir, payload)
+
+
 def test_ariadne_array_staging_precomputes_geometry_novelty_scale(tmp_path, monkeypatch):
     from ichor.hpc.active_learning import geometry_novelty
 
     cfg = CampaignConfig()
     campaign = tmp_path / "campaign"
-    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
-    iter_dir.mkdir(parents=True)
-    (iter_dir / "seeds_picked.json").write_text(
-        json.dumps(
-            {
-                "iteration": 0,
-                "n_picked": 0,
-                "frame_ids": [],
-                "indices": [],
-                "trajectory_sha256": "c" * 64,
-            }
-        ),
-        encoding="utf-8",
-    )
+    from ichor.hpc.active_learning.layout import active_iteration_dir
+
+    iter_dir = active_iteration_dir(campaign, 1)
+    _write_minimal_ariadne_task_map(iter_dir)
     calls = []
 
     def fake_ensure(campaign_dir, config, *, iteration):
@@ -1263,11 +1309,11 @@ def test_ariadne_array_staging_precomputes_geometry_novelty_scale(tmp_path, monk
 
     n = ex._array_size_after_staging(
         "ARIADNE_ARRAY",
-        SimpleNamespace(iteration=0, campaign_uid="uid"),
+        SimpleNamespace(iteration=1, campaign_uid="uid"),
     )
 
-    assert n == 0
-    assert calls == [(campaign, cfg, 0)]
+    assert n == 1
+    assert calls == [(campaign, cfg, 1)]
 
 
 def test_ariadne_array_staging_fails_before_submit_when_scale_precompute_fails(
@@ -1278,19 +1324,10 @@ def test_ariadne_array_staging_fails_before_submit_when_scale_precompute_fails(
 
     cfg = CampaignConfig()
     campaign = tmp_path / "campaign"
-    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
-    iter_dir.mkdir(parents=True)
-    (iter_dir / "seeds_picked.json").write_text(
-        json.dumps(
-            {
-                "iteration": 0,
-                "n_picked": 0,
-                "frame_ids": [],
-                "indices": [],
-            }
-        ),
-        encoding="utf-8",
-    )
+    from ichor.hpc.active_learning.layout import active_iteration_dir
+
+    iter_dir = active_iteration_dir(campaign, 1)
+    _write_minimal_ariadne_task_map(iter_dir)
 
     def fake_ensure(campaign_dir, config, *, iteration):
         raise RuntimeError("boom")
@@ -1307,10 +1344,13 @@ def test_ariadne_array_staging_fails_before_submit_when_scale_precompute_fails(
         backend_check=False,
     )
 
-    with pytest.raises(BackendSubmissionError, match="precompute failed"):
+    with pytest.raises(
+        BackendSubmissionError,
+        match="sampling protocol resolution failed",
+    ):
         ex._array_size_after_staging(
             "ARIADNE_ARRAY",
-            SimpleNamespace(iteration=0, campaign_uid="uid"),
+            SimpleNamespace(iteration=1, campaign_uid="uid"),
         )
 
 
@@ -1549,7 +1589,7 @@ def test_build_sbatch_script_renders_ariadne_block(monkeypatch):
     assert "ariadne_runner" in body
     assert shlex.quote(python_path) + " -m ichor.hpc.active_learning.acquisition.ariadne_runner" in body
     assert "\npython -m ichor.hpc.active_learning.acquisition.ariadne_runner" not in body
-    assert "--seed-index $SLURM_ARRAY_TASK_ID" in body
+    assert "--array-task-id $ICHOR_LOGICAL_ARRAY_TASK_ID" in body
     assert "--iteration 2" in body
 
 
@@ -1570,7 +1610,7 @@ def test_build_sbatch_script_renders_polus_block_with_configured_descriptor(monk
     assert "--iteration 4" in body
 
 
-def test_build_sbatch_script_renders_phase_a_polus_as_negative_iteration():
+def test_build_sbatch_script_renders_phase_a_polus_as_bootstrap_iteration_zero():
     body = build_sbatch_script(
         phase_name="PHASE_A_POLUS",
         iteration=0,
@@ -1579,7 +1619,7 @@ def test_build_sbatch_script_renders_phase_a_polus_as_negative_iteration():
     )
     assert "polus_wrapper" in body
     assert "--descriptor rmsd_massweight" in body
-    assert "--iteration -1" in body
+    assert "--iteration 0" in body
 
 
 def test_write_real_script_creates_sbatch_log_dirs(tmp_path):

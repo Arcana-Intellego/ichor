@@ -48,7 +48,7 @@ def _create(
         path,
         campaign_uid="campaign-uid",
         context=context,
-        iteration=0,
+        iteration=0 if str(context) == "bootstrap" else 1,
         targets=targets,
         primary_candidates=primary,
         reserve_candidates=reserve,
@@ -232,7 +232,7 @@ def test_quantum_result_retry_is_idempotent(tmp_path):
 
     assert second == first
     assert second["generation"] == 1
-    history = tmp_path / ".point_allocation_history" / "generation-000000.json"
+    history = tmp_path / "history" / "generation-000000.json"
     assert history.is_file()
 
 
@@ -248,7 +248,7 @@ def test_history_chain_is_verified_on_read(tmp_path):
 
     assert read_point_allocation(path)["generation"] == 2
 
-    history = tmp_path / ".point_allocation_history" / "generation-000000.json"
+    history = tmp_path / "history" / "generation-000000.json"
     corrupted = json.loads(history.read_text(encoding="utf-8"))
     corrupted["campaign_uid"] = "tampered-campaign"
     history.write_text(json.dumps(corrupted), encoding="utf-8")
@@ -258,7 +258,7 @@ def test_history_chain_is_verified_on_read(tmp_path):
 
 def test_crash_window_archive_of_current_generation_is_retryable(tmp_path):
     path, payload = _create(tmp_path)
-    history_dir = tmp_path / ".point_allocation_history"
+    history_dir = tmp_path / "history"
     history_dir.mkdir()
     (history_dir / "generation-000000.json").write_text(
         path.read_text(encoding="utf-8"),
@@ -286,7 +286,7 @@ def test_create_retry_accepts_same_candidate_universe_after_mutation(tmp_path):
         path,
         campaign_uid="campaign-uid",
         context="active",
-        iteration=0,
+        iteration=1,
         targets={"train": 2, "int_val": 1, "ext_val": 0, "total": 3},
         primary_candidates=[_candidate(i) for i in range(3)],
         reserve_candidates=[_candidate(3 + i, reserve=True) for i in range(3)],
@@ -306,7 +306,7 @@ def test_create_retry_rejects_changed_candidate_evidence(tmp_path):
             path,
             campaign_uid="campaign-uid",
             context="active",
-            iteration=0,
+            iteration=1,
             targets={"train": 2, "int_val": 1, "ext_val": 0, "total": 3},
             primary_candidates=changed_primary,
             reserve_candidates=[
@@ -322,7 +322,7 @@ def test_candidate_diagnostics_are_strict_json_safe(tmp_path):
         path,
         campaign_uid="campaign-uid",
         context="active",
-        iteration=0,
+        iteration=1,
         targets={"train": 1, "int_val": 0, "ext_val": 0, "total": 1},
         primary_candidates=[
             {

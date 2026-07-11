@@ -11,9 +11,14 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .daemon.state import atomic_write_json
+from .layout import (
+    active_allocation_dir,
+    active_iteration_dir,
+    bootstrap_allocation_dir,
+)
 
 
-POINT_ALLOCATION_SCHEMA_VERSION = 1
+POINT_ALLOCATION_SCHEMA_VERSION = 2
 POINT_ALLOCATION_FILENAME = "POINT_ALLOCATION.json"
 POINT_ALLOCATION_LOCK_FILENAME = "POINT_ALLOCATION.lock"
 VALID_CONTEXTS = frozenset({"bootstrap", "active"})
@@ -34,6 +39,26 @@ def _generation_sha256(payload: Mapping[str, Any]) -> str:
     return _sha256_json(canonical)
 
 
+def slot_assignment_sha256(payload: Mapping[str, Any]) -> str:
+    """Hash the immutable initial candidate-to-split slot assignment."""
+    slots = payload.get("slots")
+    if not isinstance(slots, list):
+        raise ValueError("point-allocation slots must be a list")
+    assignment = []
+    for slot in slots:
+        attempts = slot.get("attempts") if isinstance(slot, Mapping) else None
+        if not isinstance(attempts, list) or not attempts:
+            raise ValueError("point-allocation slot lacks an initial attempt")
+        assignment.append(
+            {
+                "slot_id": int(slot["slot_id"]),
+                "split": str(slot["split"]),
+                "candidate_id": str(attempts[0]["candidate_id"]),
+            }
+        )
+    return _sha256_json(assignment)
+
+
 def point_allocation_path(
     campaign_dir: str | Path,
     *,
@@ -42,14 +67,13 @@ def point_allocation_path(
 ) -> Path:
     campaign = Path(campaign_dir)
     if str(context) == "bootstrap":
-        return campaign / "3_DIVERSITY_SAMPLING" / "initial" / POINT_ALLOCATION_FILENAME
+        if int(iteration) != 0:
+            raise ValueError("bootstrap point allocation requires iteration 0")
+        return bootstrap_allocation_dir(campaign) / POINT_ALLOCATION_FILENAME
     if str(context) == "active":
-        return (
-            campaign
-            / "7_ACTIVE_LEARNING"
-            / ("iteration-" + str(int(iteration)).zfill(4))
-            / POINT_ALLOCATION_FILENAME
-        )
+        return active_allocation_dir(
+            active_iteration_dir(campaign, int(iteration))
+        ) / POINT_ALLOCATION_FILENAME
     raise ValueError("point-allocation context must be bootstrap or active")
 
 
@@ -237,7 +261,11 @@ def _validate_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
     if context not in VALID_CONTEXTS:
         raise ValueError("point-allocation manifest context is invalid")
     iteration = int(data.get("iteration", -1))
-    if iteration < 0 or (context == "bootstrap" and iteration != 0):
+    if (
+        iteration < 0
+        or (context == "bootstrap" and iteration != 0)
+        or (context == "active" and iteration < 1)
+    ):
         raise ValueError("point-allocation manifest iteration is invalid")
     data["iteration"] = iteration
     generation = int(data.get("generation", -1))
@@ -335,6 +363,10 @@ def _validate_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
     reserve_ids = [str(record.get("candidate_id")) for record in reserve]
     if len(set(reserve_ids)) != len(reserve_ids):
         raise ValueError("point-allocation reserve candidate IDs must be unique")
+    assignment_sha = str(data.get("slot_assignment_sha256") or "")
+    expected_assignment_sha = slot_assignment_sha256(data)
+    if assignment_sha != expected_assignment_sha:
+        raise ValueError("point-allocation slot assignment SHA mismatch")
     _refresh_summary(data)
     return data
 
@@ -350,9 +382,14 @@ def _read_payload_file(path: Path) -> Dict[str, Any]:
     return _validate_payload(raw)
 
 
-def _verify_history_chain(path: Path, current: Mapping[str, Any]) -> None:
+def _verify_history_chain(
+    path: Path,
+    current: Mapping[str, Any],
+    *,
+    history_dir: Optional[Path] = None,
+) -> None:
     generation = int(current["generation"])
-    history_dir = path.parent / ".point_allocation_history"
+    history_dir = path.parent / "history" if history_dir is None else Path(history_dir)
     history_files = {
         int(candidate.stem.split("-")[-1]): candidate
         for candidate in history_dir.glob("generation-*.json")
@@ -397,10 +434,18 @@ def _verify_history_chain(path: Path, current: Mapping[str, Any]) -> None:
             )
 
 
-def read_point_allocation(path: str | Path) -> Dict[str, Any]:
+def read_point_allocation(
+    path: str | Path,
+    *,
+    history_dir: Optional[str | Path] = None,
+) -> Dict[str, Any]:
     manifest = Path(path)
     payload = _read_payload_file(manifest)
-    _verify_history_chain(manifest, payload)
+    _verify_history_chain(
+        manifest,
+        payload,
+        history_dir=None if history_dir is None else Path(history_dir),
+    )
     return payload
 
 
@@ -471,6 +516,7 @@ def create_point_allocation(
         "slots": slots,
         "reserve": [{**record, "status": "available"} for record in reserve],
     }
+    payload["slot_assignment_sha256"] = slot_assignment_sha256(payload)
     payload = _validate_payload(payload)
     manifest.parent.mkdir(parents=True, exist_ok=True)
     with _allocation_lock(manifest):
@@ -558,7 +604,7 @@ def _mutate_manifest(path: Path, mutator, *, expected_generation: Optional[int] 
         updated["previous_generation_sha256"] = _generation_sha256(previous)
         updated["generation"] = generation + 1
         updated = _validate_payload(updated)
-        history_dir = path.parent / ".point_allocation_history"
+        history_dir = path.parent / "history"
         history_dir.mkdir(parents=True, exist_ok=True)
         history_path = history_dir / (
             "generation-" + str(generation).zfill(6) + ".json"
@@ -722,6 +768,7 @@ __all__ = [
     "POINT_ALLOCATION_SCHEMA_VERSION",
     "POINT_ALLOCATION_FILENAME",
     "allocation_targets",
+    "slot_assignment_sha256",
     "stable_candidate_id",
     "point_allocation_path",
     "create_point_allocation",

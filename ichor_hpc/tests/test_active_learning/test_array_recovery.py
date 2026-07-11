@@ -91,5 +91,130 @@ def test_sbatch_retry_map_uses_logical_task_id_for_ariadne(tmp_path, monkeypatch
     )
 
     assert "ICHOR_LOGICAL_ARRAY_TASK_ID" in script
-    assert "--seed-index $ICHOR_LOGICAL_ARRAY_TASK_ID" in script
+    assert "--array-task-id $ICHOR_LOGICAL_ARRAY_TASK_ID" in script
     assert "#SBATCH --array=0-1" in script
+
+
+def _patch_ariadne_recovery_identity(monkeypatch):
+    task_map = {
+        "campaign_uid": "campaign-uid",
+        "tasks": [
+            {
+                "array_task_id": 0,
+                "seed_id": 1,
+                "seed_uid": "seed-uid",
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.seed_identity.read_ariadne_task_map",
+        lambda _iter_dir, expected_iteration=None: task_map,
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.seed_identity.task_for_array_task_id",
+        lambda payload, task_id: payload["tasks"][int(task_id)],
+    )
+
+
+def test_ariadne_recovery_reuses_only_successful_zero_exit_output(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = tmp_path / "campaign"
+    _patch_ariadne_recovery_identity(monkeypatch)
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.ariadne_outputs.validate_seed_output",
+        lambda *_args, **_kwargs: {
+            "task_success": True,
+            "task_exit_code": 0,
+        },
+    )
+
+    reusable, reason, _path = array_recovery._validate_ariadne_task(
+        campaign,
+        1,
+        0,
+    )
+
+    assert reusable is True
+    assert reason == ""
+
+
+def test_ariadne_recovery_rejects_hash_valid_failed_output(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = tmp_path / "campaign"
+    _patch_ariadne_recovery_identity(monkeypatch)
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.ariadne_outputs.validate_seed_output",
+        lambda *_args, **_kwargs: {
+            "task_success": False,
+            "task_exit_code": 7,
+        },
+    )
+
+    reusable, reason, _path = array_recovery._validate_ariadne_task(
+        campaign,
+        1,
+        0,
+    )
+
+    assert reusable is False
+    assert reason == "task_success_false"
+
+
+def test_ariadne_recovery_rejects_nonzero_task_exit_code(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = tmp_path / "campaign"
+    _patch_ariadne_recovery_identity(monkeypatch)
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.ariadne_outputs.validate_seed_output",
+        lambda *_args, **_kwargs: {
+            "task_success": True,
+            "task_exit_code": 9,
+        },
+    )
+
+    reusable, reason, _path = array_recovery._validate_ariadne_task(
+        campaign,
+        1,
+        0,
+    )
+
+    assert reusable is False
+    assert reason == "task_exit_code_9"
+
+
+def test_ariadne_retry_archives_complete_seed_directory_and_partial_output(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.layout import (
+        active_iteration_dir,
+        ariadne_seed_dir,
+    )
+
+    campaign = tmp_path / "campaign"
+    _patch_ariadne_recovery_identity(monkeypatch)
+    iter_dir = active_iteration_dir(campaign, 1)
+    seed_dir = ariadne_seed_dir(iter_dir, 1)
+    seed_dir.mkdir(parents=True)
+    (seed_dir / "result.json").write_text("{}\n", encoding="utf-8")
+    partial = seed_dir.parent / ".seed-000001.partial-task-0-pid-12"
+    partial.mkdir()
+    (partial / "partial.txt").write_text("partial\n", encoding="utf-8")
+
+    archived = array_recovery.archive_existing_array_task_outputs(
+        campaign,
+        "ARIADNE_ARRAY",
+        1,
+        task_ids=[0],
+    )
+
+    assert not seed_dir.exists()
+    assert not partial.exists()
+    assert len(archived) == 2
+    assert all(Path(path).exists() for path in archived)

@@ -367,14 +367,18 @@ def _campaign_pool_size(campaign_dir: Optional[Path]) -> Tuple[int, Optional[int
 def _iter_dir(campaign_dir: Optional[Path], iteration: int) -> Optional[Path]:
     if campaign_dir is None:
         return None
-    return Path(campaign_dir) / "7_ACTIVE_LEARNING" / ("iteration-" + str(int(iteration)).zfill(4))
+    from ..layout import active_iteration_dir
+
+    return active_iteration_dir(campaign_dir, int(iteration))
 
 
 def _phase_b_candidate_count(campaign_dir: Optional[Path], iteration: int) -> int:
     idir = _iter_dir(campaign_dir, iteration)
     if idir is None:
         return 0
-    path = idir / "ARIADNE_RESULTS.json"
+    from ..handoff_manifests import ariadne_results_path
+
+    path = ariadne_results_path(idir)
     if not path.is_file():
         return 0
     try:

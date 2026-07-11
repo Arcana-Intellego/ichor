@@ -23,7 +23,7 @@ def _replacement_fixture(tmp_path):
         allocation_path,
         campaign_uid="replacement-test",
         context="active",
-        iteration=0,
+        iteration=1,
         targets={"train": 1, "int_val": 0, "ext_val": 0, "total": 1},
         primary_candidates=[{"candidate_id": "candidate-primary"}],
         reserve_candidates=[],
@@ -39,7 +39,7 @@ def _replacement_fixture(tmp_path):
     payload = {
         "schema_version": 1,
         "context": "active",
-        "iteration": 0,
+        "iteration": 1,
         "replacement_round": 1,
         "sample_xyz": str(sample.resolve()),
         "n_candidates": 1,

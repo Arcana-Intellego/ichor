@@ -31,7 +31,7 @@ from ichor.hpc.active_learning.acquisition.ariadne_runner import AriadneRunConfi
 
 
 def test_append_trace_event_writes_jsonl(tmp_path):
-    trace = tmp_path / "seed_0000" / "ARIADNE_TRACE.jsonl"
+    trace = tmp_path / "seed-000001" / "trajectory" / "trace.jsonl"
 
     _append_trace_event(
         trace,

@@ -213,6 +213,25 @@ def verify_state_referenced_artifacts(
                 + ", models_version="
                 + str(model_version)
             )
+    if strict_models and min(train_version, model_version) >= 0:
+        completed_through = min(train_version, model_version)
+        if phase is CampaignPhase.STOP_CHECK and int(state.iteration) == completed_through:
+            completed_through -= 1
+        try:
+            from ..versioning.sampling_iterations import verify_sampling_chain
+
+            verify_sampling_chain(
+                campaign,
+                completed_through,
+                expected_campaign_uid=str(state.campaign_uid),
+            )
+        except Exception as exc:
+            raise CommittedArtifactError(
+                "sampling_iteration_chain_invalid: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)
+            ) from exc
 
 
 def artifact_manifest_status(

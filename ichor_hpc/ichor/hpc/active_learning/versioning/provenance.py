@@ -1,7 +1,7 @@
 """Per-pointdir provenance ledger.
 
 Every committed `.pointdir` in `QM_REFERENCE_DATA/iteration-NNNNNN/` carries a
-`.provenance.json` sidecar that traces the point back through the
+`provenance.json` sidecar that traces the point back through the
 adversarial-attack pipeline: which MD frame seeded it, which 50 neighbour
 frames built its local subspace, what ARIADNE did to it, whether the
 post-descent geometry passed the anti-overlap check, and where Phase-B
@@ -40,7 +40,7 @@ from ..daemon.state import atomic_write_json
 
 # the read-modify-write helpers below need an actual lock, not just the
 # atomic-rename trick atomic_write_json gives us. two enrich callers
-# racing on the same .provenance.json would both read the old file, each
+# racing on the same provenance.json would both read the old file, each
 # would compute its own update, and whichever wrote last would silently
 # bin the other's work. wrapping the load->modify->store body in a
 # portalocker flock closes that window. portalocker is already pulled in
@@ -55,7 +55,7 @@ _DEFAULT_LOCK_TIMEOUT_SECONDS = 30.0
 @contextmanager
 def _pointdir_lock(pointdir, timeout: float = _DEFAULT_LOCK_TIMEOUT_SECONDS):
     """Exclusive lock for read-modify-write of a single pointdir's
-    .provenance.json. Lockfile lives inside the pointdir."""
+    provenance.json. Lockfile lives inside the pointdir."""
     import portalocker
     pointdir = Path(pointdir)
     pointdir.mkdir(parents=True, exist_ok=True)
@@ -126,8 +126,8 @@ __all__ = [
 ]
 
 
-PROVENANCE_FILENAME = ".provenance.json"
-PROVENANCE_SCHEMA_VERSION = 2
+PROVENANCE_FILENAME = "provenance.json"
+PROVENANCE_SCHEMA_VERSION = 3
 
 # Index lives under <campaign>/.DATA/ACTIVE_LEARNING/
 SEED_FRAME_ID_INDEX_FILENAME = "seed_frame_id_index.json"
@@ -152,6 +152,9 @@ def write_seed_provenance(
     iteration: int,
     trajectory_sha256: str,
     seed_frame_id: Optional[int],
+    seed_id: Optional[int] = None,
+    seed_uid: Optional[str] = None,
+    array_task_id_zero_based: Optional[int] = None,
     seed_selection_origin: str,
     seed_variance_at_selection: Optional[float],
     subspace_neighbour_frame_ids: Sequence[int],
@@ -171,6 +174,13 @@ def write_seed_provenance(
         "iteration": int(iteration),
         "trajectory_sha256": str(trajectory_sha256),
         "seed": {
+            "seed_id": None if seed_id is None else int(seed_id),
+            "seed_uid": None if seed_uid is None else str(seed_uid),
+            "array_task_id_zero_based": (
+                None
+                if array_task_id_zero_based is None
+                else int(array_task_id_zero_based)
+            ),
             "frame_id": (
                 int(seed_frame_id) if seed_frame_id is not None else None
             ),
@@ -235,11 +245,15 @@ def validate_provenance(
     iteration: Optional[int] = None,
     trajectory_sha256: Optional[str] = None,
     seed_frame_id: Optional[int] = None,
+    seed_id: Optional[int] = None,
+    seed_uid: Optional[str] = None,
+    array_task_id_zero_based: Optional[int] = None,
     require_phase_b_selected: Optional[bool] = None,
     allocation_split: Optional[str] = None,
     allocation_slot_id: Optional[int] = None,
     allocation_candidate_id: Optional[str] = None,
     allocation_context: Optional[str] = None,
+    allocation_slot_assignment_sha256: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Read provenance and validate the campaign/seed handoff contract."""
     data = read_provenance(pointdir)
@@ -271,6 +285,31 @@ def validate_provenance(
         raise ProvenanceError("provenance seed.frame_id mismatch")
     if "selection_origin" in seed and not isinstance(seed.get("selection_origin"), str):
         raise ProvenanceError("provenance seed.selection_origin must be a string")
+    observed_seed_id = _expect_int_or_none(
+        seed.get("seed_id"),
+        "provenance seed.seed_id",
+    )
+    observed_array_task_id = _expect_int_or_none(
+        seed.get("array_task_id_zero_based"),
+        "provenance seed.array_task_id_zero_based",
+    )
+    observed_seed_uid = seed.get("seed_uid")
+    if prov_iteration >= 1:
+        if observed_seed_id is None or observed_seed_id < 1:
+            raise ProvenanceError("active provenance seed.seed_id must be >= 1")
+        if observed_array_task_id != observed_seed_id - 1:
+            raise ProvenanceError("active provenance array task/seed mismatch")
+        if not isinstance(observed_seed_uid, str) or len(observed_seed_uid) != 64:
+            raise ProvenanceError("active provenance seed.seed_uid is invalid")
+    if seed_id is not None and observed_seed_id != int(seed_id):
+        raise ProvenanceError("provenance seed.seed_id mismatch")
+    if seed_uid is not None and str(observed_seed_uid or "") != str(seed_uid):
+        raise ProvenanceError("provenance seed.seed_uid mismatch")
+    if (
+        array_task_id_zero_based is not None
+        and observed_array_task_id != int(array_task_id_zero_based)
+    ):
+        raise ProvenanceError("provenance seed.array_task_id_zero_based mismatch")
 
     subspace = data.get("subspace")
     if not isinstance(subspace, dict):
@@ -300,6 +339,7 @@ def validate_provenance(
         or allocation_slot_id is not None
         or allocation_candidate_id is not None
         or allocation_context is not None
+        or allocation_slot_assignment_sha256 is not None
     ):
         if not isinstance(allocation, dict):
             raise ProvenanceError("provenance point_allocation block must be an object")
@@ -333,6 +373,18 @@ def validate_provenance(
             raise ProvenanceError("provenance point_allocation.context is invalid")
         if allocation_context is not None and context != str(allocation_context):
             raise ProvenanceError("provenance point_allocation.context mismatch")
+        assignment_sha = str(allocation.get("slot_assignment_sha256") or "")
+        if len(assignment_sha) != 64:
+            raise ProvenanceError(
+                "provenance point_allocation.slot_assignment_sha256 is invalid"
+            )
+        if (
+            allocation_slot_assignment_sha256 is not None
+            and assignment_sha != str(allocation_slot_assignment_sha256)
+        ):
+            raise ProvenanceError(
+                "provenance point_allocation.slot_assignment_sha256 mismatch"
+            )
     return data
 
 
@@ -443,7 +495,7 @@ def enrich_with_point_allocation(
     slot_id: int,
     split: str,
     replacement_round: int = 0,
-    allocation_manifest_sha256: Optional[str] = None,
+    allocation_slot_assignment_sha256: Optional[str] = None,
 ) -> Path:
     """Attach the pre-QM allocation slot consumed by this candidate."""
     split_name = str(split)
@@ -456,8 +508,10 @@ def enrich_with_point_allocation(
         "split": split_name,
         "replacement_round": int(replacement_round),
     }
-    if allocation_manifest_sha256 is not None:
-        payload["allocation_manifest_sha256"] = str(allocation_manifest_sha256)
+    if allocation_slot_assignment_sha256 is not None:
+        payload["slot_assignment_sha256"] = str(
+            allocation_slot_assignment_sha256
+        )
     return _merge_section(pointdir, "point_allocation", payload)
 
 

@@ -60,7 +60,7 @@ python -m ichor.hpc.active_learning.cli journal --campaign-dir . | tail -20
 ```
 
 `status` shows the canonical state.json content. You should see
-`phase: DONE`, `iteration: 1`, `reference_data_version: 2`,
+`phase: DONE`, `iteration: 2`, `reference_data_version: 2`,
 `models_version: 2`, and an `alpha_history` with two entries.
 
 `journal` prints the full per-phase event stream; the last few lines look
@@ -79,9 +79,16 @@ like `expected_journal_tail.txt` (your timestamps + JobIDs will differ).
   `FEREBUS_TASK_ARTEFACTS.json` binds the exact models to the reference-data
   view and split rows; model/config/auxiliary files are colocated under
   `<property>/<atom>/`.
-- `7_ACTIVE_LEARNING/iteration-NNNN/pool/seed_*/.provenance.json` -- full
-  per-seed provenance trail (which frame_id, which subspace, which ARIADNE
-  result, anti-overlap flag, phase-B diversity rank).
+- `BOOTSTRAP/selection/` and `BOOTSTRAP/allocation/` -- the one-off Phase-A
+  selection and exact bootstrap allocation. Bootstrap alone uses iteration 0.
+- `ACTIVE_LEARNING/iteration-NNNNNN/` -- one immutable, hash-chained sampling
+  iteration. Active iterations start at 1. Protocol snapshots, seed selection,
+  ARIADNE outputs, Phase-B selection, allocation, and calibration each have a
+  dedicated subdirectory.
+- `ACTIVE_LEARNING/iteration-NNNNNN/ariadne/seeds/seed-NNNNNN/` -- full
+  per-seed provenance, the selected result, a hash-bound output manifest, and
+  `trajectory/trajectory.xyz` plus per-frame optimisation metrics. Scientific
+  seed IDs start at 1; `array_task_id` remains explicitly zero-based.
 - `.DATA/ACTIVE_LEARNING/seed_frame_id_index.json` -- the O(1) lookup index
   used by SEED_SELECT to forbid frames already seeded into the QM reference data.
 - `.DATA/ACTIVE_LEARNING/journal.ndjson` -- the full append-only event log.
@@ -94,7 +101,7 @@ like `expected_journal_tail.txt` (your timestamps + JobIDs will differ).
 To wipe the dry-run output and start over:
 
 ```
-rm -rf .DATA 3_DIVERSITY_SAMPLING QM_REFERENCE_DATA TRAINED_MODELS 7_ACTIVE_LEARNING
+rm -rf .DATA BOOTSTRAP QM_REFERENCE_DATA TRAINED_MODELS ACTIVE_LEARNING
 ```
 
 Then repeat steps 1-3 above. The .gitignore already excludes these

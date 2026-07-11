@@ -25,6 +25,12 @@ from ichor.hpc.active_learning.point_allocation import (
     read_point_allocation,
     record_quantum_results,
 )
+from ichor.hpc.active_learning.layout import (
+    active_iteration_dir,
+    active_phase_b_dir,
+    active_seed_selection_dir,
+    ariadne_seeds_dir,
+)
 from ichor.hpc.active_learning.submit.sacct_poll import JobObservation, JobStatus
 from ichor.hpc.active_learning.versioning.versioned_directory import VersionedDirectory
 
@@ -60,12 +66,13 @@ def _complete_bootstrap(e):
     return state
 
 
-def _complete_active_quantum(e, *, iteration=0):
+def _complete_active_quantum(e, *, iteration=1):
     state = _state(
         iteration,
         reference_data_version=0,
         models_version=0,
     )
+    e.submit_or_run(state, CampaignPhase.SEED_SELECT)
     e.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
     e.postprocess(state, CampaignPhase.PHASE_B_POLUS, observations=[])
     e.postprocess(state, CampaignPhase.GAUSSIAN, observations=[])
@@ -80,8 +87,8 @@ def test_executor_creates_canonical_subdirs(tmp_path):
     base = tmp_path / "campaign"
     assert (base / "QM_REFERENCE_DATA").is_dir()
     assert (base / "TRAINED_MODELS").is_dir()
-    assert (base / "3_DIVERSITY_SAMPLING").is_dir()
-    assert (base / "7_ACTIVE_LEARNING").is_dir()
+    assert (base / "BOOTSTRAP").is_dir()
+    assert (base / "ACTIVE_LEARNING").is_dir()
     assert (base / ".DATA" / "SCRIPTS").is_dir()
 
 
@@ -101,12 +108,14 @@ def test_submit_or_run_sbatch_phase_writes_stub_script(tmp_path):
 
 def test_submit_or_run_inline_phase_runs_synchronously(tmp_path):
     e = _make_exec(tmp_path)
-    state = SimpleNamespace(iteration=0)
+    _complete_bootstrap(e)
+    state = _state(1, reference_data_version=0, models_version=0)
     result = e.submit_or_run(state, CampaignPhase.SEED_SELECT)
     assert result.is_complete is True
     assert result.submitted_job_id is None
-    # Seeds file should now exist in 7_ACTIVE_LEARNING/iteration-0000/
-    seeds = tmp_path / "campaign" / "7_ACTIVE_LEARNING" / "iteration-0000" / "seeds.xyz"
+    seeds = active_seed_selection_dir(
+        active_iteration_dir(tmp_path / "campaign", 1)
+    ) / "seeds.xyz"
     assert seeds.exists()
 
 
@@ -127,11 +136,15 @@ def test_initial_ferebus_postprocess_commits_models_iteration_0(tmp_path):
 
 def test_ariadne_postprocess_writes_per_seed_results(tmp_path):
     e = _make_exec(tmp_path)
-    state = SimpleNamespace(iteration=3)
+    _complete_bootstrap(e)
+    state = _state(1, reference_data_version=0, models_version=0)
+    e.submit_or_run(state, CampaignPhase.SEED_SELECT)
     e.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
-    pool = tmp_path / "campaign" / "7_ACTIVE_LEARNING" / "iteration-0003" / "pool"
-    assert pool.is_dir()
-    seed_dirs = sorted(pool.iterdir())
+    seeds_dir = ariadne_seeds_dir(
+        active_iteration_dir(tmp_path / "campaign", 1)
+    )
+    assert seeds_dir.is_dir()
+    seed_dirs = sorted(seeds_dir.iterdir())
     assert seed_dirs
     for sd in seed_dirs:
         result_json = sd / "result.json"
@@ -143,12 +156,19 @@ def test_ariadne_postprocess_writes_per_seed_results(tmp_path):
 
 def test_phase_b_polus_postprocess_writes_sample_xyz(tmp_path):
     e = _make_exec(tmp_path)
-    state = _state(2)
+    _complete_bootstrap(e)
+    state = _state(1, reference_data_version=0, models_version=0)
+    e.submit_or_run(state, CampaignPhase.SEED_SELECT)
     e.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
     e.postprocess(state, CampaignPhase.PHASE_B_POLUS, observations=[])
-    sample = tmp_path / "campaign" / "7_ACTIVE_LEARNING" / "iteration-0002" / "phase_b_SAMPLE.xyz"
+    sample = active_phase_b_dir(
+        active_iteration_dir(tmp_path / "campaign", 1)
+    ) / "selected.xyz"
     assert sample.exists()
-    assert "descriptor=hybrid_alf_rmsd" in sample.read_text()
+    manifest = json.loads(
+        (sample.parent / "SELECTION.json").read_text(encoding="utf-8")
+    )
+    assert manifest["descriptor"] == "hybrid_alf_rmsd"
 
 
 def test_append_inline_stages_and_commits_next_training_iteration(tmp_path):
@@ -178,14 +198,16 @@ def test_active_allocation_replaces_failed_candidate_from_finite_reserve(tmp_pat
     cfg.point_allocation.batch_internal_validation_size = 1
     cfg.seed_selection.n_seeds_per_iteration = 3
     e = DryRunPhaseExecutor(campaign_dir=tmp_path / "campaign", config=cfg)
-    state = _state(reference_data_version=0, models_version=0)
+    _complete_bootstrap(e)
+    state = _state(1, reference_data_version=0, models_version=0)
+    e.submit_or_run(state, CampaignPhase.SEED_SELECT)
     e.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
     e.postprocess(state, CampaignPhase.PHASE_B_POLUS, observations=[])
 
     allocation_path = point_allocation_path(
         e.campaign_dir,
         context="active",
-        iteration=0,
+        iteration=1,
     )
     allocation = read_point_allocation(allocation_path)
     attempts = pending_attempts(allocation)
@@ -200,7 +222,7 @@ def test_active_allocation_replaces_failed_candidate_from_finite_reserve(tmp_pat
                     e.campaign_dir
                     / ".DATA"
                     / "STAGING"
-                    / "iter_0"
+                    / "iter_1"
                     / ("synthetic-" + str(attempt["slot_id"]) + ".pointdir")
                 ),
                 "reason": (
@@ -235,7 +257,7 @@ def test_active_allocation_replaces_failed_candidate_from_finite_reserve(tmp_pat
 
 def test_handle_failure_returns_scrub_and_continue(tmp_path):
     e = _make_exec(tmp_path)
-    action = e.handle_failure(SimpleNamespace(iteration=0), CampaignPhase.GAUSSIAN, observations=[])
+    action = e.handle_failure(SimpleNamespace(iteration=1), CampaignPhase.GAUSSIAN, observations=[])
     assert action is FailureAction.SCRUB_AND_CONTINUE
 
 

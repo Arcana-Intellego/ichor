@@ -24,7 +24,9 @@ SAMPLING_SCALE_MODEL_FILENAME = "SAMPLING_SCALE_MODEL.json"
 
 
 def sampling_scale_model_path(iter_dir: Union[str, Path]) -> Path:
-    return Path(iter_dir) / SAMPLING_SCALE_MODEL_FILENAME
+    from .layout import active_protocol_dir
+
+    return active_protocol_dir(iter_dir) / SAMPLING_SCALE_MODEL_FILENAME
 
 
 def _now_iso() -> str:
@@ -151,7 +153,9 @@ def _accepted_history_records_for_iteration(
         "n_fallback_results_records_used": 0,
     }
     accepted: List[Tuple[Path, Dict[str, Any], str]] = []
-    audit = _json(iter_dir / "ARIADNE_LANDING_AUDIT.json")
+    from .handoff_manifests import ariadne_landing_audit_path, ariadne_results_path
+
+    audit = _json(ariadne_landing_audit_path(iter_dir))
     if isinstance(audit, dict):
         for record in audit.get("seeds") or []:
             if not isinstance(record, dict):
@@ -171,7 +175,7 @@ def _accepted_history_records_for_iteration(
         counts["n_audit_records_used"] += len(accepted)
         return accepted, counts
 
-    results = _json(iter_dir / "ARIADNE_RESULTS.json")
+    results = _json(ariadne_results_path(iter_dir))
     if isinstance(results, dict):
         fallback: List[Tuple[Path, Dict[str, Any], str]] = []
         seen_keys = set()
@@ -181,7 +185,7 @@ def _accepted_history_records_for_iteration(
                 counts["n_results_records_seen"] += 1
                 counts["n_skipped_malformed_record"] += 1
                 continue
-            key = str(record.get("result_json") or record.get("seed_dir") or record.get("seed_index") or len(seen_keys))
+            key = str(record.get("result_json") or record.get("seed_dir") or record.get("seed_id") or len(seen_keys))
             if key in seen_keys:
                 counts["n_deduplicated_fallback_records"] += 1
                 continue
@@ -202,17 +206,20 @@ def _accepted_history_records_for_iteration(
 
 
 def _result_path(iter_dir: Path, record: Dict[str, Any]) -> Optional[Path]:
+    from .layout import active_ariadne_dir
+
+    root = active_ariadne_dir(iter_dir)
     raw = record.get("result_json")
     if raw:
         path = Path(str(raw))
         if not path.is_absolute():
-            path = iter_dir / path
+            path = root / path
         return path
     seed_dir = record.get("seed_dir")
     if seed_dir:
         path = Path(str(seed_dir))
         if not path.is_absolute():
-            path = iter_dir / path
+            path = root / path
         return path / "result.json"
     return None
 
@@ -292,12 +299,13 @@ def _collect_history(
         "n_deduplicated_fallback_records": 0,
         "n_fallback_results_records_used": 0,
     }
-    base = campaign_dir / "7_ACTIVE_LEARNING"
-    start = max(0, int(iteration) - int(window))
+    from .layout import active_iteration_dir
+
+    start = max(1, int(iteration) - int(window))
     accepted_history: List[Tuple[Path, Dict[str, Any], str]] = []
     if int(iteration) > 0 and int(window) > 0:
         for previous in range(start, int(iteration)):
-            iter_dir = base / ("iteration-" + str(previous).zfill(4))
+            iter_dir = active_iteration_dir(campaign_dir, previous)
             records, counts = _accepted_history_records_for_iteration(iter_dir)
             accepted_history.extend(records)
             for key in history_filter:
@@ -348,12 +356,11 @@ def _current_seed_scale_records(
     residual_scale: float,
     per_atom_mode: str,
 ) -> List[Dict[str, Any]]:
-    path = (
-        campaign_dir
-        / "7_ACTIVE_LEARNING"
-        / ("iteration-" + str(int(iteration)).zfill(4))
-        / "seeds_picked.json"
-    )
+    from .handoff_manifests import seeds_picked_path
+    from .layout import active_iteration_dir
+
+    iter_dir = active_iteration_dir(campaign_dir, int(iteration))
+    path = seeds_picked_path(iter_dir)
     records = None
     try:
         from .handoff_manifests import load_seeds_picked
@@ -370,14 +377,15 @@ def _current_seed_scale_records(
     for pos, record in enumerate(records):
         if not isinstance(record, dict):
             continue
-        seed_index = record.get("seed_index", pos)
+        seed_id = record.get("seed_id", pos + 1)
         try:
-            seed_index_i = int(seed_index)
+            seed_id_i = int(seed_id)
         except (TypeError, ValueError):
-            seed_index_i = int(pos)
+            seed_id_i = int(pos) + 1
         out.append(
             {
-                "seed_index": seed_index_i,
+                "seed_id": seed_id_i,
+                "seed_uid": record.get("seed_uid"),
                 "frame_id": record.get("frame_id"),
                 "geometry_motion_scale_angstrom": float(geometry_scale),
                 "aligned_rmsd_scale_angstrom": float(aligned_rmsd_scale),
@@ -419,7 +427,9 @@ def build_sampling_scale_model(
 ) -> Dict[str, Any]:
     """Build the daemon-owned scale model for one active-learning iteration."""
     campaign = Path(campaign_dir)
-    iter_dir = campaign / "7_ACTIVE_LEARNING" / ("iteration-" + str(int(iteration)).zfill(4))
+    from .layout import active_iteration_dir
+
+    iter_dir = active_iteration_dir(campaign, int(iteration))
     fallback_geometry = _finite_positive(
         getattr(getattr(config, "geometry_novelty", None), "fallback_scale_angstrom", None)
     ) or 0.05
@@ -584,8 +594,9 @@ def build_sampling_scale_model(
         },
     }
     if write_manifest:
-        iter_dir.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(sampling_scale_model_path(iter_dir), payload)
+        path = sampling_scale_model_path(iter_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(path, payload)
     return payload
 
 

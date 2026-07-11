@@ -9,6 +9,7 @@ import pytest
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.daemon.dry_run_executor import DryRunPhaseExecutor
 from ichor.hpc.active_learning.daemon.state import fresh_campaign_state
+from ichor.hpc.active_learning.layout import active_allocation_dir, active_iteration_dir
 from ichor.hpc.active_learning.point_allocation import (
     allocation_targets,
     create_point_allocation,
@@ -17,10 +18,7 @@ from ichor.hpc.active_learning.point_allocation import (
 
 
 def _write_allocation(campaign_dir: Path, config: CampaignConfig, iteration: int):
-    iter_dir = (
-        campaign_dir / "7_ACTIVE_LEARNING"
-        / f"iteration-{iteration:04d}"
-    )
+    iter_dir = active_iteration_dir(campaign_dir, iteration)
     targets = allocation_targets(config, "active")
     create_point_allocation(
         point_allocation_path(
@@ -33,7 +31,11 @@ def _write_allocation(campaign_dir: Path, config: CampaignConfig, iteration: int
         iteration=iteration,
         targets=targets,
         primary_candidates=[
-            {"candidate_id": "candidate-" + str(index), "seed_index": index}
+            {
+                "candidate_id": "candidate-" + str(index),
+                "seed_id": index + 1,
+                "array_task_id": index,
+            }
             for index in range(targets["total"])
         ],
         reserve_candidates=[],
@@ -48,17 +50,17 @@ def test_inline_split_projects_exact_allocation_slots(tmp_path):
     cfg.seed_selection.n_seeds_per_iteration = 3
     ex = DryRunPhaseExecutor(campaign_dir=tmp_path / "c", config=cfg)
     state = fresh_campaign_state(max_iterations=1)
-    state.iteration = 0
-    iter_dir = _write_allocation(tmp_path / "c", cfg, 0)
+    state.iteration = 1
+    iter_dir = _write_allocation(tmp_path / "c", cfg, 1)
 
     ex._inline_split(state)
 
-    sp = iter_dir / "split.json"
+    sp = active_allocation_dir(iter_dir) / "SPLIT_RECEIPT.json"
     assert sp.is_file()
     payload = json.loads(sp.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
     assert payload["strategy"] == "exact_pre_qm_point_allocation"
-    assert payload["iteration"] == 0
+    assert payload["iteration"] == 1
     assert payload["targets"] == {
         "train": 2,
         "int_val": 1,
@@ -80,14 +82,10 @@ def test_inline_split_refuses_missing_allocation_manifest(tmp_path):
     cfg.point_allocation.batch_internal_validation_size = 1
     ex = DryRunPhaseExecutor(campaign_dir=tmp_path / "c", config=cfg)
     state = fresh_campaign_state(max_iterations=1)
-    state.iteration = 0
-    iter_dir = (
-        tmp_path / "c"
-        / "7_ACTIVE_LEARNING"
-        / f"iteration-{0:04d}"
-    )
+    state.iteration = 1
+    iter_dir = active_iteration_dir(tmp_path / "c", 1)
     iter_dir.mkdir(parents=True, exist_ok=True)
 
     with pytest.raises(FileNotFoundError, match="point-allocation manifest missing"):
         ex._inline_split(state)
-    assert not (iter_dir / "split.json").exists()
+    assert not (active_allocation_dir(iter_dir) / "SPLIT_RECEIPT.json").exists()

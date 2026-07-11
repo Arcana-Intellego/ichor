@@ -340,6 +340,71 @@ rebuildable FEREBUS working directory and is not authoritative. The former
 intentionally unsupported.
 
 
+Sampling storage and identities
+-------------------------------
+
+Bootstrap selection is not an active-learning iteration. Its selected XYZ,
+selected pool-row indices, Phase-A manifest, and allocation manifest live under
+:code:`BOOTSTRAP/selection/` and :code:`BOOTSTRAP/allocation/`. Bootstrap is the
+only scientific stage identified by iteration and committed version zero.
+
+Active iterations start at one and use six-digit canonical names. Active
+iteration :code:`N` consumes committed reference/model version :code:`N-1` and,
+after successful QM labelling and FEREBUS training, commits version :code:`N`::
+
+    ACTIVE_LEARNING/iteration-000001/
+      ITERATION_MANIFEST.json
+      protocol/
+        SAMPLING_PROTOCOL_RESOLVED.json
+        SAMPLING_PROTOCOL_AUDIT.json
+        SAMPLING_SCALE_MODEL.json
+        reference_scales.json
+      seed_selection/
+        SELECTION.json
+        seeds.xyz
+      ariadne/
+        TASK_MAP.json
+        RESULTS.json
+        AUDIT.json
+        seeds/
+          seed-000001/
+            result.json
+            provenance.json
+            ARIADNE_OUTPUT_MANIFEST.json
+            trajectory/
+              trajectory.xyz
+              metrics.jsonl
+              trace.jsonl  (optional detailed optimiser trace)
+              MANIFEST.json
+      phase_b/
+        selected_raw.xyz
+        selected.xyz
+        SELECTION.json
+      allocation/
+        POINT_ALLOCATION.json
+        SPLIT_RECEIPT.json
+      calibration/
+        ERROR_CALIBRATION_AUDIT.json  (when calibration is enabled)
+
+Scientific seed IDs are one-based and contiguous. Scheduler array task IDs and
+trajectory-pool row indices remain explicitly zero-based. :code:`TASK_MAP.json`
+is the sole mapping between those domains; code must not infer one from a
+directory name or array position.
+
+Every completed active iteration is sealed by :code:`ITERATION_MANIFEST.json`.
+The manifest records an exact recursive file inventory, SHA-256 bindings,
+iteration/model/reference-data identities, and the parent iteration-manifest
+hash. Extra files, missing files, hash drift, symlinks, partial output markers,
+or a broken parent chain make the iteration invalid. Committed iteration
+artefacts are made read-only. The daemon may rebuild explicitly documented
+derived caches, but authoritative manifests and task outputs are immutable.
+
+The former :code:`3_DIVERSITY_SAMPLING/`, :code:`7_ACTIVE_LEARNING/`, flat
+iteration files, four-digit active iteration names, :code:`pool/seed_*/`, and
+zero-based scientific seed directories are intentionally unsupported. Start a
+fresh campaign rather than mixing storage contracts.
+
+
 Recovery + troubleshooting
 --------------------------
 
@@ -361,7 +426,7 @@ fails schema validation, run::
 Fresh :code:`state.json` initialisation is allowed only for a clean first-run
 campaign. If daemon-owned artefacts such as committed reference-data/model
 iterations, staging directories, submission intents, scripts, journal entries,
-or :code:`7_ACTIVE_LEARNING/iteration-*` outputs already exist, start refuses
+or :code:`ACTIVE_LEARNING/iteration-*` outputs already exist, start refuses
 to create a new state because that could damage provenance. Use reconcile
 instead.
 
@@ -467,7 +532,7 @@ postprocess parser in the daemon process).
      |                                      | (bounded reserve only)
      |<-------------------------------------+
      v
-   INITIAL_FEREBUS  (sbatch)      First GP fit. Commits iteration-0 to
+   INITIAL_FEREBUS  (sbatch)      First GP fit. Commits bootstrap version 0 to
      |                            QM_REFERENCE_DATA and TRAINED_MODELS.
      v
    SEED_SELECT  (inline)  <----+  Pick seeds from the trajectory pool,

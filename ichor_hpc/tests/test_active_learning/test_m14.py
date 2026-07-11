@@ -34,9 +34,20 @@ def _water(offset=(0.0, 0.0, 0.0)):
 def _stretched_water():
     return Atoms([
         Atom("O", 0.0, 0.0, 0.0),
-        Atom("H", 1.20, 0.0, 0.0),
-        Atom("H", -0.30, 1.20, 0.0),
+        Atom("H", 2.00, 0.0, 0.0),
+        Atom("H", -0.50, 1.80, 0.0),
     ])
+
+
+@pytest.fixture(autouse=True)
+def _isolate_stop_rule_from_sampling_finalisation(monkeypatch, tmp_path):
+    from ichor.hpc.active_learning.versioning import sampling_iterations
+
+    monkeypatch.setattr(
+        sampling_iterations,
+        "finalise_active_iteration",
+        lambda *_args, **_kwargs: tmp_path / "ITERATION_MANIFEST.json",
+    )
 
 
 # --- STOP_CHECK alpha-trend ------------------------------------------
@@ -52,6 +63,8 @@ def test_stop_check_streak_rule_fires(tmp_path):
     for alpha in (0.04, 0.03, 0.02):
         state.last_acquisition_alpha0 = alpha
         state.iteration += 1
+        state.reference_data_version = state.iteration
+        state.models_version = state.iteration
         updates = ex._inline_stop_check(state)
         state.alpha_history = updates["alpha_history"]
         state.shutdown_requested = bool(updates.get("shutdown_requested", False))
@@ -69,6 +82,8 @@ def test_stop_check_streak_does_not_fire_above_threshold(tmp_path):
     for alpha in (0.04, 0.06, 0.02):
         state.last_acquisition_alpha0 = alpha
         state.iteration += 1
+        state.reference_data_version = state.iteration
+        state.models_version = state.iteration
         updates = ex._inline_stop_check(state)
         state.alpha_history = updates["alpha_history"]
         state.shutdown_requested = bool(updates.get("shutdown_requested", False))
@@ -90,6 +105,8 @@ def test_stop_check_high_plateau_does_not_converge(tmp_path):
     for alpha in (1.0, 0.99, 0.98, 0.97):
         state.last_acquisition_alpha0 = alpha
         state.iteration += 1
+        state.reference_data_version = state.iteration
+        state.models_version = state.iteration
         updates = ex._inline_stop_check(state)
         state.alpha_history = updates["alpha_history"]
         state.shutdown_requested = bool(updates.get("shutdown_requested", False))
@@ -110,6 +127,8 @@ def test_stop_check_low_plateau_converges(tmp_path):
     for alpha in (0.010, 0.0099, 0.0098, 0.0097):
         state.last_acquisition_alpha0 = alpha
         state.iteration += 1
+        state.reference_data_version = state.iteration
+        state.models_version = state.iteration
         updates = ex._inline_stop_check(state)
         state.alpha_history = updates["alpha_history"]
         state.shutdown_requested = bool(updates.get("shutdown_requested", False))
@@ -130,6 +149,8 @@ def test_stop_check_rising_alpha_does_not_converge(tmp_path):
     for alpha in (0.5, 0.6, 0.7, 0.8):  # rising ~20% a step
         state.last_acquisition_alpha0 = alpha
         state.iteration += 1
+        state.reference_data_version = state.iteration
+        state.models_version = state.iteration
         updates = ex._inline_stop_check(state)
         state.alpha_history = updates["alpha_history"]
         state.shutdown_requested = bool(updates.get("shutdown_requested", False))
@@ -146,6 +167,8 @@ def test_stop_check_min_iterations_before_stop_blocks_early(tmp_path):
     for alpha in (0.01, 0.01, 0.01):
         state.last_acquisition_alpha0 = alpha
         state.iteration += 1
+        state.reference_data_version = state.iteration
+        state.models_version = state.iteration
         updates = ex._inline_stop_check(state)
         state.alpha_history = updates["alpha_history"]
         state.shutdown_requested = bool(updates.get("shutdown_requested", False))
@@ -171,6 +194,8 @@ def test_stop_check_caps_history_length(tmp_path):
     for alpha in [0.5] * 20:
         state.last_acquisition_alpha0 = alpha
         state.iteration += 1
+        state.reference_data_version = state.iteration
+        state.models_version = state.iteration
         updates = ex._inline_stop_check(state)
         state.alpha_history = updates["alpha_history"]
     # cap = max(3, 2) + 1 = 4

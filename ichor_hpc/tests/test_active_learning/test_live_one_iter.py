@@ -14,6 +14,8 @@ Two flavours:
      register themselves in LIVE_POSTPROCESS_IMPLEMENTED. Unskipping the
      test on a CSF4 worker proves the first real iteration completes.
 """
+import json
+
 import pytest
 
 from ichor.hpc.active_learning.daemon.phase_executor import SBATCH_PHASES
@@ -335,7 +337,7 @@ def _write_ferebus_metric_csv(path, n_rows):
 
 
 def _ensure_live_trajectory_pool(campaign_dir):
-    """Import a tiny pool so live SEED_SELECT can emit seeds_picked.json."""
+    """Import a tiny pool so live seed selection can publish its manifest."""
     from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
 
     fixture = _live_smoke_fixtures() / "polus_phase_a" / "initial-SAMPLE-2.xyz"
@@ -359,6 +361,7 @@ def _live_smoke_config(campaign_dir):
     config.point_allocation.batch_training_size = 1
     config.point_allocation.batch_internal_validation_size = 1
     config.seed_selection.n_seeds_per_iteration = 2
+    config.phase_b.descriptor = "rmsd_massweight"
     _ensure_live_trajectory_pool(campaign_dir)
     return config
 
@@ -387,13 +390,14 @@ def _patch_ferebus_submit_for_live_smoke(monkeypatch, campaign_dir, call_log):
         script = working / "runFerebus.sh"
         script.write_text("#!/bin/sh\n# fixture pyferebus submit\n", encoding="utf-8")
         phase_name = "INITIAL_FEREBUS" if calls["n"] == 0 else "FEREBUS"
-        if phase_name == "INITIAL_FEREBUS":
-            _ensure_live_trajectory_pool(campaign_dir)
-        call_log.append((phase_name, 0))
+        phase_iteration = 0 if phase_name == "INITIAL_FEREBUS" else 1
+        call_log.append((phase_name, phase_iteration))
         calls["n"] += 1
         assert kwargs["overwrite_workdir"] is False
         assert kwargs["move_dataset_files"] is True
-        assert str(kwargs["expected_job_name"]).endswith("-" + phase_name + "-0")
+        assert str(kwargs["expected_job_name"]).endswith(
+            "-" + phase_name + "-" + str(phase_iteration)
+        )
         assert int(kwargs["expected_tasks"]) >= 1
         return FerebusSubmission(
             job_id=str(19000 + calls["n"]),
@@ -407,45 +411,64 @@ def _patch_ferebus_submit_for_live_smoke(monkeypatch, campaign_dir, call_log):
     monkeypatch.setattr(pyferebus_wrap, "submit_ferebus", fake_submit)
 
 
-def _count_xyz_frames(path):
-    lines = path.read_text(encoding="utf-8").splitlines()
-    i = 0
-    count = 0
-    while i < len(lines):
-        try:
-            natoms = int(lines[i].strip())
-        except ValueError:
-            i += 1
-            continue
-        i += 2 + natoms
-        count += 1
-    return count
-
-
 def _annotate_ariadne_fixture_results(campaign_dir, iteration):
     import json as _json
-
-    iter_dir = (
-        campaign_dir / "7_ACTIVE_LEARNING"
-        / ("iteration-" + str(int(iteration)).zfill(4))
+    from ichor.hpc.active_learning.ariadne_outputs import (
+        write_optimisation_trajectory,
+        write_seed_output_manifest,
     )
-    seeds_path = iter_dir / "seeds_picked.json"
-    if not seeds_path.is_file():
-        return
-    picked = _json.loads(seeds_path.read_text(encoding="utf-8"))
-    records = picked.get("seed_records") or []
-    pool_dir = iter_dir / "pool"
-    for rec in records:
-        seed_index = int(rec["seed_index"])
-        result_path = pool_dir / ("seed_" + str(seed_index).zfill(4)) / "result.json"
-        if not result_path.is_file():
-            continue
-        data = _json.loads(result_path.read_text(encoding="utf-8"))
+    from ichor.hpc.active_learning.daemon.state import atomic_write_json
+    from ichor.hpc.active_learning.layout import active_iteration_dir, ariadne_seed_dir
+    from ichor.hpc.active_learning.sampling_protocol import (
+        sampling_protocol_audit_path,
+        sampling_protocol_resolved_path,
+    )
+    from ichor.hpc.active_learning.sampling_scale_model import (
+        sampling_scale_model_path,
+    )
+    from ichor.hpc.active_learning.seed_identity import read_ariadne_task_map
+    from ichor.hpc.active_learning.versioning.manifest import sha256_file
+
+    iter_dir = active_iteration_dir(campaign_dir, int(iteration))
+    task_map = read_ariadne_task_map(iter_dir, expected_iteration=int(iteration))
+    resolved_path = sampling_protocol_resolved_path(iter_dir)
+    scale_path = sampling_scale_model_path(iter_dir)
+    audit_path = sampling_protocol_audit_path(iter_dir)
+    resolved_payload = _json.loads(resolved_path.read_text(encoding="utf-8"))
+
+    def protocol_path(path):
+        return path.resolve().relative_to(campaign_dir.resolve()).as_posix()
+
+    fixture_root = _live_smoke_fixtures() / "ariadne_pool"
+    for task in task_map["tasks"]:
+        array_task_id = int(task["array_task_id"])
+        seed_id = int(task["seed_id"])
+        source = fixture_root / ("seed_" + str(array_task_id).zfill(4)) / "result.json"
+        seed_dir = ariadne_seed_dir(iter_dir, seed_id)
+        seed_dir.mkdir(parents=True, exist_ok=False)
+        data = _json.loads(source.read_text(encoding="utf-8"))
+        coordinates = [list(row) for row in data["final_coordinates"]]
+        coordinates[1][0] += 0.40 * (array_task_id + 1)
+        coordinates[2][1] += 0.30 * (array_task_id + 1)
+        data["final_coordinates"] = coordinates
         data["iteration"] = int(iteration)
-        data["seed_index"] = seed_index
-        data["seed_frame_id"] = int(rec["frame_id"])
-        data["trajectory_sha256"] = str(picked.get("trajectory_sha256", ""))
+        data["seed_id"] = seed_id
+        data["seed_uid"] = str(task["seed_uid"])
+        data["array_task_id"] = array_task_id
+        data["seed_frame_id"] = int(task["frame_id"])
+        data["trajectory_sha256"] = str(task_map["trajectory_sha256"])
         data["task_success"] = True
+        data["sampling_protocol"] = {
+            "sampling_aggressiveness": int(
+                resolved_payload["sampling_aggressiveness"]
+            ),
+            "resolved_manifest": protocol_path(resolved_path),
+            "resolved_manifest_sha256": sha256_file(resolved_path),
+            "scale_model_manifest": protocol_path(scale_path),
+            "scale_model_manifest_sha256": sha256_file(scale_path),
+            "audit_manifest": protocol_path(audit_path),
+            "audit_manifest_sha256": sha256_file(audit_path),
+        }
         data["landing_safety"] = {
             "accepted": True,
             "policy": "raw_final",
@@ -453,136 +476,29 @@ def _annotate_ariadne_fixture_results(campaign_dir, iteration):
             "reasons": [],
             "record_only_reasons": [],
             "metrics": {
-                "max_displacement_ang": 0.02,
+                "max_displacement_ang": 0.40 * (array_task_id + 1),
                 "min_pair_distance_ang": 0.90,
             },
         }
-        result_path.write_text(_json.dumps(data, indent=2), encoding="utf-8")
-
-
-def _write_phase_b_selection_for_live_smoke(campaign_dir, iteration):
-    import json as _json
-    from pathlib import Path
-    from ichor.hpc.active_learning.handoff_manifests import (
-        PHASE_B_SELECTION_SCHEMA_VERSION,
-        read_ariadne_results_manifest,
-        write_phase_b_selection_manifest,
-    )
-    from ichor.hpc.active_learning.daemon.state import (
-        DEFAULT_STATE_FILENAME,
-        read_state,
-    )
-    from ichor.hpc.active_learning.point_allocation import (
-        create_point_allocation,
-        point_allocation_path,
-    )
-    from ichor.hpc.active_learning.versioning.provenance import (
-        enrich_with_point_allocation,
-    )
-
-    iter_dir = (
-        campaign_dir / "7_ACTIVE_LEARNING"
-        / ("iteration-" + str(int(iteration)).zfill(4))
-    )
-    final_sample = iter_dir / "phase_b_SAMPLE.xyz"
-    n_final = _count_xyz_frames(final_sample)
-    ariadne_manifest = read_ariadne_results_manifest(
-        iter_dir,
-        expected_iteration=int(iteration),
-    )
-    records = []
-    xyz_lines = []
-    for final_index, source in enumerate(ariadne_manifest["accepted"][:n_final]):
-        rec = dict(source)
-        rec["candidate_index"] = int(final_index)
-        rec["raw_index"] = int(final_index)
-        rec["final_index"] = int(final_index)
-        rec["kept_after_dedup"] = True
-        rec["drop_reason"] = None
-        rec["candidate_id"] = "live-phase-b-" + str(int(final_index))
-        records.append(rec)
-        result = _json.loads(Path(str(rec["result_json"])).read_text(encoding="utf-8"))
-        atom_types = [str(x) for x in result["atom_types"]]
-        coords = result["final_coordinates"]
-        xyz_lines.append(str(len(atom_types)))
-        xyz_lines.append("fixture phase_b final " + str(final_index))
-        for atom, coord in zip(atom_types, coords):
-            xyz_lines.append(
-                "{atom} {x:.6f} {y:.6f} {z:.6f}".format(
-                    atom=atom,
-                    x=float(coord[0]),
-                    y=float(coord[1]),
-                    z=float(coord[2]),
-                )
-            )
-    state = read_state(
-        campaign_dir / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
-    )
-    allocation_path = point_allocation_path(
-        campaign_dir,
-        context="active",
-        iteration=int(iteration),
-    )
-    allocation = create_point_allocation(
-        allocation_path,
-        campaign_uid=str(state.campaign_uid),
-        context="active",
-        iteration=int(iteration),
-        targets={
-            "train": 1,
-            "int_val": max(0, int(len(records)) - 1),
-            "ext_val": 0,
-            "total": int(len(records)),
-        },
-        primary_candidates=[
-            {
-                "candidate_id": str(record["candidate_id"]),
-                "seed_index": int(record["seed_index"]),
-                "frame_id": int(record["seed_frame_id"]),
-            }
-            for record in records
-        ],
-        reserve_candidates=[],
-    )
-    slot_by_candidate = {
-        str(slot["attempts"][0]["candidate_id"]): slot
-        for slot in allocation["slots"]
-    }
-    for record in records:
-        slot = slot_by_candidate[str(record["candidate_id"])]
-        record["slot_id"] = int(slot["slot_id"])
-        record["split"] = str(slot["split"])
-        enrich_with_point_allocation(
-            Path(str(record["seed_dir"])),
-            candidate_id=str(record["candidate_id"]),
-            context="active",
-            slot_id=int(slot["slot_id"]),
-            split=str(slot["split"]),
+        atomic_write_json(seed_dir / "result.json", data)
+        write_optimisation_trajectory(
+            seed_dir,
+            atom_types=data["atom_types"],
+            coordinate_frames=[data["final_coordinates"]],
+            alpha_values=[data["alpha_final"]],
+            gradient_norms=[0.0],
+            origins=["raw_final"],
         )
-    final_sample.write_text("\n".join(xyz_lines) + "\n", encoding="utf-8")
-    write_phase_b_selection_manifest(iter_dir, {
-        "schema_version": PHASE_B_SELECTION_SCHEMA_VERSION,
-        "iteration": int(iteration),
-        "descriptor": "hybrid_alf_rmsd",
-        "source_ariadne_manifest": str((iter_dir / "ARIADNE_RESULTS.json").resolve()),
-        "point_allocation": {
-            "manifest": str(allocation_path.resolve()),
-            "targets": dict(allocation["targets"]),
-            "reserve": [],
-            "reserve_count": 0,
-        },
-        "n_candidates": int(len(ariadne_manifest["accepted"])),
-        "n_selected_raw": int(len(records)),
-        "n_kept": int(len(records)),
-        "raw": records,
-        "final": records,
-        "dedup": {
-            "n_candidates": int(len(records)),
-            "n_kept": int(len(records)),
-            "n_dropped": 0,
-            "min_separation": 0.05,
-        },
-    })
+        write_seed_output_manifest(
+            seed_dir,
+            campaign_uid=str(task_map["campaign_uid"]),
+            iteration=int(iteration),
+            seed_id=seed_id,
+            seed_uid=str(task["seed_uid"]),
+            array_task_id=array_task_id,
+            task_success=True,
+            task_exit_code=0,
+        )
 
 
 def _live_smoke_seed_for_phase(campaign_dir, phase_name, iteration):
@@ -594,110 +510,28 @@ def _live_smoke_seed_for_phase(campaign_dir, phase_name, iteration):
     from pathlib import Path
     fixtures = _live_smoke_fixtures()
     campaign_dir = Path(campaign_dir)
-    iter4 = "iteration-" + str(int(iteration)).zfill(4)
 
-    if phase_name == "PHASE_A_POLUS":
-        from ichor.hpc.active_learning.handoff_manifests import write_phase_a_sample_manifest
-        from ichor.hpc.active_learning.acquisition.trajectory_pool import (
-            POOL_MANIFEST_FILENAME,
-            POOL_SUBDIR,
-            TrajectoryPool,
-        )
-        from ichor.hpc.active_learning.daemon.state import (
-            DEFAULT_STATE_FILENAME,
-            read_state,
-        )
-        from ichor.hpc.active_learning.point_allocation import (
-            create_point_allocation,
-            point_allocation_path,
-        )
+    if phase_name in ("PHASE_A_POLUS", "PHASE_B_POLUS"):
+        from ichor.hpc.active_learning.sampling.polus_wrapper import main as polus_main
 
-        target = campaign_dir / "3_DIVERSITY_SAMPLING" / "initial"
-        target.mkdir(parents=True, exist_ok=True)
-        src = fixtures / "polus_phase_a"
-        for f in src.iterdir():
-            if f.is_file():
-                (target / f.name).write_bytes(f.read_bytes())
-        source_sample = target / "initial-SAMPLE-2.xyz"
-        sample = target / "initial-SAMPLE-3.xyz"
-        source_lines = source_sample.read_text(encoding="utf-8").splitlines()
-        block_size = int(source_lines[0]) + 2
-        sample.write_text(
-            "\n".join(source_lines + source_lines[:block_size]) + "\n",
-            encoding="utf-8",
-        )
-        source_sample.unlink()
-        old_index = target / "initial-INDEX-2.dat"
-        if old_index.exists():
-            old_index.unlink()
-        index = target / "initial-INDEX-3.dat"
-        index.write_text("0\n1\n2\n", encoding="utf-8")
-        state = read_state(
-            campaign_dir / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
-        )
-        pool = TrajectoryPool.load(campaign_dir)
-        allocation_path = point_allocation_path(
-            campaign_dir,
-            context="bootstrap",
-            iteration=0,
-        )
-        allocation = create_point_allocation(
-            allocation_path,
-            campaign_uid=str(state.campaign_uid),
-            context="bootstrap",
-            iteration=0,
-            targets={"train": 1, "int_val": 1, "ext_val": 1, "total": 3},
-            primary_candidates=[
-                {
-                    "candidate_id": "live-phase-a-" + str(i),
-                    "source": "phase_a_polus",
-                    "frame_id": int(i),
-                }
-                for i in range(3)
-            ],
-            reserve_candidates=[
-                {
-                    "candidate_id": "live-phase-a-reserve-" + str(i),
-                    "source": "phase_a_reserve",
-                    "frame_id": int(i),
-                    "reserve_rank": int(i - 2),
-                }
-                for i in range(3, len(pool))
-            ],
-        )
-        primary = [
-            {
-                **slot["attempts"][0],
-                "slot_id": int(slot["slot_id"]),
-                "split": str(slot["split"]),
-            }
-            for slot in allocation["slots"]
-        ]
-        write_phase_a_sample_manifest(target, {
-            "phase": "PHASE_A_POLUS",
-            "iteration": -1,
-            "sample_xyz": str(sample.resolve()),
-            "index_path": str(index.resolve()),
-            "n_select": 3,
-            "n_frames": 3,
-            "selected_indices": [0, 1, 2],
-            "descriptor": "rmsd_massweight",
-            "n_pool_frames": int(len(pool)),
-            "bootstrap_total_size": 3,
-            "point_allocation": {
-                "manifest": str(allocation_path.resolve()),
-                "targets": dict(allocation["targets"]),
-                "primary": primary,
-                "reserve_frame_ids": [int(i) for i in range(3, len(pool))],
-                "reserve_count": max(0, int(len(pool)) - 3),
-            },
-            "reserve_after_bootstrap": max(0, int(len(pool)) - 3),
-            "trajectory_sha256": str(pool.sha256),
-            "source_pool_manifest": str(
-                (campaign_dir / POOL_SUBDIR / POOL_MANIFEST_FILENAME).resolve()
-            ),
-        })
-    elif phase_name in ("INITIAL_GAUSSIAN", "INITIAL_AIMALL"):
+        rc = polus_main([
+            "--descriptor",
+            "rmsd_massweight",
+            "--iteration",
+            "0" if phase_name == "PHASE_A_POLUS" else str(int(iteration)),
+            "--campaign-dir",
+            str(campaign_dir),
+        ])
+        if rc != 0:
+            raise RuntimeError(
+                "POLUS fixture generation failed for "
+                + phase_name
+                + " with exit "
+                + str(rc)
+            )
+        return
+
+    if phase_name in ("INITIAL_GAUSSIAN", "INITIAL_AIMALL"):
         target = campaign_dir / ".DATA" / "STAGING" / "initial"
         _copy_tree(fixtures / "initial_quantum", target)
         _ensure_live_quantum_contract_names(target)
@@ -715,17 +549,7 @@ def _live_smoke_seed_for_phase(campaign_dir, phase_name, iteration):
             reference_data_version=0 if phase_name == "INITIAL_FEREBUS" else 1,
         )
     elif phase_name == "ARIADNE_ARRAY":
-        target = campaign_dir / "7_ACTIVE_LEARNING" / iter4 / "pool"
-        _copy_tree(fixtures / "ariadne_pool", target)
         _annotate_ariadne_fixture_results(campaign_dir, iteration)
-    elif phase_name == "PHASE_B_POLUS":
-        target = campaign_dir / "7_ACTIVE_LEARNING" / iter4
-        target.mkdir(parents=True, exist_ok=True)
-        src = fixtures / "polus_phase_b"
-        for f in src.iterdir():
-            if f.is_file():
-                (target / f.name).write_bytes(f.read_bytes())
-        _write_phase_b_selection_for_live_smoke(campaign_dir, iteration)
 
 
 def _build_live_smoke_sbatch_runner(campaign_dir, call_log):
@@ -825,6 +649,7 @@ def test_live_one_iter_water_tetramer_after_parsers_land(tmp_path, monkeypatch):
     campaign = tmp_path / "campaign"
     campaign.mkdir()
     cfg = _live_smoke_config(campaign)
+    cfg.to_yaml(campaign / "campaign.yaml")
 
     call_log = []
     _patch_ferebus_submit_for_live_smoke(monkeypatch, campaign, call_log)
@@ -851,9 +676,8 @@ def test_live_one_iter_water_tetramer_after_parsers_land(tmp_path, monkeypatch):
     assert state.phase is CampaignPhase.DONE, (
         "expected DONE, got " + str(state.phase)
     )
-    # max_iterations=1 runs the iteration loop exactly once at iter 0
-    # then transitions DONE. iteration stays at 0 by convention.
-    assert int(state.iteration) >= 0
+    # max_iterations=1 runs active iteration 1 exactly once, then finishes.
+    assert int(state.iteration) == 1
     # INITIAL_FEREBUS commits initial models 0 + iteration-1 FEREBUS
     # commits models 1, so both versions should be at least 1.
     assert state.reference_data_version >= 1, (
@@ -950,21 +774,37 @@ def _build_no_wd_sbatch_runner(campaign_dir, call_log):
         # every per-seed result.json so the parser is forced through the
         # synthetic fallback branch.
         if phase_name == "ARIADNE_ARRAY":
-            iter4 = "iteration-" + str(iteration).zfill(4)
-            pool = (
-                campaign_dir / "7_ACTIVE_LEARNING"
-                / iter4 / "pool"
+            from ichor.hpc.active_learning.ariadne_outputs import (
+                SEED_OUTPUT_MANIFEST_FILENAME,
+                write_seed_output_manifest,
             )
-            if pool.is_dir():
-                for sd in pool.iterdir():
-                    rj = sd / "result.json"
-                    if rj.is_file():
-                        try:
-                            data = _json.loads(rj.read_text(encoding="utf-8"))
-                            data.pop("whitened_distance_final", None)
-                            rj.write_text(_json.dumps(data, indent=2), encoding="utf-8")
-                        except (OSError, ValueError):
-                            pass
+            from ichor.hpc.active_learning.daemon.state import atomic_write_json
+            from ichor.hpc.active_learning.layout import (
+                active_iteration_dir,
+                ariadne_seeds_dir,
+            )
+
+            iter_dir = active_iteration_dir(campaign_dir, iteration)
+            for seed_dir in ariadne_seeds_dir(iter_dir).iterdir():
+                result_path = seed_dir / "result.json"
+                output_path = seed_dir / SEED_OUTPUT_MANIFEST_FILENAME
+                try:
+                    data = _json.loads(result_path.read_text(encoding="utf-8"))
+                    output = _json.loads(output_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                data.pop("whitened_distance_final", None)
+                atomic_write_json(result_path, data)
+                write_seed_output_manifest(
+                    seed_dir,
+                    campaign_uid=str(output["campaign_uid"]),
+                    iteration=int(output["iteration"]),
+                    seed_id=int(output["seed_id"]),
+                    seed_uid=str(output["seed_uid"]),
+                    array_task_id=int(output["array_task_id"]),
+                    task_success=bool(output["task_success"]),
+                    task_exit_code=int(output["task_exit_code"]),
+                )
 
         n = len(call_log)
         return SimpleNamespace(
@@ -994,6 +834,7 @@ def test_live_one_iter_whitened_distance_fallback(tmp_path, monkeypatch):
     campaign = tmp_path / "campaign"
     campaign.mkdir()
     cfg = _live_smoke_config(campaign)
+    cfg.to_yaml(campaign / "campaign.yaml")
 
     call_log = []
     _patch_ferebus_submit_for_live_smoke(monkeypatch, campaign, call_log)
@@ -1021,11 +862,11 @@ def test_live_one_iter_whitened_distance_fallback(tmp_path, monkeypatch):
 
 def _build_both_phase_b_sbatch_runner(campaign_dir, call_log):
     """Like the standard live-smoke runner but after PHASE_B_POLUS
-    standard seeding, additionally writes a phase_b_SAMPLE_raw.xyz with
+    standard seeding, additionally writes a different selected_raw.xyz with
     a deliberately different frame count.
 
     Used by the dedup-naming test to verify that the parser picks the
-    dedup-filtered file (phase_b_SAMPLE.xyz) rather than the raw one.
+    deduplicated selected.xyz rather than the raw one.
     """
     from pathlib import Path
     from types import SimpleNamespace
@@ -1043,13 +884,13 @@ def _build_both_phase_b_sbatch_runner(campaign_dir, call_log):
         _live_smoke_seed_for_phase(campaign_dir, phase_name, iteration)
 
         if phase_name == "PHASE_B_POLUS":
-            iter4 = "iteration-" + str(iteration).zfill(4)
-            iter_dir = campaign_dir / "7_ACTIVE_LEARNING" / iter4
-            # The fixture pack copies a 2-frame phase_b_SAMPLE.xyz from
-            # polus_phase_b. add a 4-frame raw file alongside it -- if the
-            # parser preferred the raw one, the journal would record 4
-            # frames; if it prefers SAMPLE.xyz it records 2.
-            raw = iter_dir / "phase_b_SAMPLE_raw.xyz"
+            from ichor.hpc.active_learning.daemon.state import atomic_write_json
+            from ichor.hpc.active_learning.handoff_manifests import phase_b_selection_path
+            from ichor.hpc.active_learning.layout import active_iteration_dir, active_phase_b_dir
+            from ichor.hpc.active_learning.versioning.manifest import sha256_file
+
+            iter_dir = active_iteration_dir(campaign_dir, iteration)
+            raw = active_phase_b_dir(iter_dir) / "selected_raw.xyz"
             xyz_lines = []
             for k in range(4):
                 xyz_lines.append("3")
@@ -1058,6 +899,11 @@ def _build_both_phase_b_sbatch_runner(campaign_dir, call_log):
                 xyz_lines.append("H 0.96 0.0 0.0")
                 xyz_lines.append("H -0.24 0.93 0.0")
             raw.write_text(chr(10).join(xyz_lines) + chr(10), encoding="utf-8")
+            manifest_path = phase_b_selection_path(iter_dir)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["selected_raw_xyz"]["size"] = int(raw.stat().st_size)
+            manifest["selected_raw_xyz"]["sha256"] = sha256_file(raw)
+            atomic_write_json(manifest_path, manifest)
 
         n = len(call_log)
         return SimpleNamespace(
@@ -1070,9 +916,9 @@ def _build_both_phase_b_sbatch_runner(campaign_dir, call_log):
 
 @pytest.mark.live
 def test_live_one_iter_prefers_dedup_filtered_sample(tmp_path, monkeypatch):
-    """When both phase_b_SAMPLE.xyz and phase_b_SAMPLE_raw.xyz exist
+    """When both selected.xyz and selected_raw.xyz exist
     (with different frame counts), the live parser should pick the
-    dedup-filtered SAMPLE.xyz -- that is the canonical name the daemon
+    deduplicated selected.xyz -- that is the canonical name the daemon
     main always writes; raw is only retained as a debugging artefact.
     """
     from ichor.hpc.active_learning.config import CampaignConfig
@@ -1088,6 +934,7 @@ def test_live_one_iter_prefers_dedup_filtered_sample(tmp_path, monkeypatch):
     campaign = tmp_path / "campaign"
     campaign.mkdir()
     cfg = _live_smoke_config(campaign)
+    cfg.to_yaml(campaign / "campaign.yaml")
 
     call_log = []
     _patch_ferebus_submit_for_live_smoke(monkeypatch, campaign, call_log)
@@ -1109,8 +956,7 @@ def test_live_one_iter_prefers_dedup_filtered_sample(tmp_path, monkeypatch):
     assert state.phase is CampaignPhase.DONE
 
     # inspect the journal for PHASE_B_POLUS phase_succeeded_live event.
-    # its sample_path field should end with phase_b_SAMPLE.xyz (the
-    # dedup-filtered file from the fixture), NOT phase_b_SAMPLE_raw.xyz.
+    # its sample_path field should end with selected.xyz, not selected_raw.xyz.
     journal_path = (
         campaign / ".DATA" / "ACTIVE_LEARNING"
         / "journal.ndjson"
@@ -1124,8 +970,8 @@ def test_live_one_iter_prefers_dedup_filtered_sample(tmp_path, monkeypatch):
     assert phase_b_events, "no PHASE_B_POLUS phase_succeeded_live event"
     last = phase_b_events[-1]
     sample_path = str(last.get("sample_path"))
-    assert sample_path.endswith("phase_b_SAMPLE.xyz"), (
-        "expected SAMPLE.xyz but got " + sample_path
+    assert sample_path.endswith("selected.xyz"), (
+        "expected selected.xyz but got " + sample_path
     )
     # also confirm the fixture-supplied frame count (2) was parsed, not the
     # 4-frame raw file we deliberately also wrote.

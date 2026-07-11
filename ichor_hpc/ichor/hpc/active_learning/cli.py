@@ -104,7 +104,7 @@ from .daemon.status_recommendations import (
     recommendation_dicts,
 )
 from .versioning.trained_models import TrainedModelVersioning
-from .layout import trained_models_dir
+from .layout import active_learning_dir, trained_models_dir
 
 
 __all__ = [
@@ -4152,6 +4152,12 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         )
         _print_reconcile_runtime_warning(runtime_status, campaign)
         return 9
+    if (
+        not bool(getattr(args, "apply", False))
+        and not bool(getattr(args, "json", False))
+        and runtime_status.get("reconcile_apply_blockers")
+    ):
+        _print_reconcile_runtime_warning(runtime_status, campaign)
     report = propose_recovery(
         campaign,
         allow_fresh_init_on_nonempty=bool(getattr(args, "allow_fresh_init", False)),
@@ -4939,11 +4945,21 @@ def _bootstrap_fresh_campaign_state(
 ) -> Dict[str, Any]:
     from .layout import reject_legacy_campaign_layout
 
-    reject_legacy_campaign_layout(campaign)
+    try:
+        reject_legacy_campaign_layout(campaign)
+    except RuntimeError as exc:
+        raise CampaignBootstrapError(
+            "campaign uses a rejected legacy or mixed sampling layout; "
+            "start a new campaign or inspect it with `ichor-al-daemon reconcile "
+            "--campaign-dir "
+            + str(campaign)
+            + "`: "
+            + str(exc)
+        ) from exc
     paths = _campaign_paths(campaign)
     paths["data"].mkdir(parents=True, exist_ok=True)
     (campaign / ".DATA" / "STAGING").mkdir(parents=True, exist_ok=True)
-    (campaign / "7_ACTIVE_LEARNING").mkdir(parents=True, exist_ok=True)
+    active_learning_dir(campaign).mkdir(parents=True, exist_ok=True)
 
     state_path = paths["state"]
     if state_path.is_file():

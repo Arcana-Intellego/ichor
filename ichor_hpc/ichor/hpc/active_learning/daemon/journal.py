@@ -156,6 +156,9 @@ KNOWN_EVENT_TYPES = (
     "legacy_sampling_protocol_repreview",
     "partial_array_recovery_postprocess_only",
     "partial_array_recovery_prepared",
+    "active_iteration_finalised",
+    "ariadne_task_rejected_invalid_output",
+    "dry_run_trajectory_pool_created",
 )
 
 

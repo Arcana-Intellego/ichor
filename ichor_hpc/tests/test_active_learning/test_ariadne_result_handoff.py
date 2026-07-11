@@ -1,15 +1,39 @@
 import json
+from pathlib import Path
 
 import pytest
 
+from ichor.hpc.active_learning.ariadne_outputs import (
+    AriadneOutputError,
+    SEED_OUTPUT_MANIFEST_FILENAME,
+    write_optimisation_trajectory,
+    write_seed_output_manifest,
+)
+from ichor.hpc.active_learning.daemon.state import atomic_write_json
 from ichor.hpc.active_learning.handoff_manifests import (
     ARIADNE_RESULTS_SCHEMA_VERSION,
     HandoffManifestError,
     ariadne_candidate_frames,
     read_ariadne_results_manifest,
+    seeds_picked_path,
     validate_ariadne_result,
     write_ariadne_results_manifest,
 )
+from ichor.hpc.active_learning.layout import active_ariadne_dir, ariadne_seed_dir
+from ichor.hpc.active_learning.seed_identity import (
+    SeedIdentityError,
+    deterministic_seed_uid,
+    read_ariadne_task_map,
+    selection_fingerprint_sha256,
+    write_ariadne_task_map,
+)
+from ichor.hpc.active_learning.versioning.manifest import sha256_file
+from ichor.hpc.active_learning.versioning.provenance import write_seed_provenance
+
+
+TRAJECTORY_SHA = "a" * 64
+MODEL_SHA = "c" * 64
+CAMPAIGN_UID = "canonical-handoff-test"
 
 
 def _landing_safety(*, accepted=True):
@@ -28,15 +52,19 @@ def _landing_safety(*, accepted=True):
 
 
 def _result_payload(
+    seed_uid,
     *,
-    trajectory_sha256=None,
+    trajectory_sha256=TRAJECTORY_SHA,
     include_landing_safety=True,
     landing_safety_accepted=True,
 ):
     payload = {
-        "iteration": 0,
-        "seed_index": 0,
+        "iteration": 1,
+        "seed_id": 1,
+        "seed_uid": str(seed_uid),
+        "array_task_id": 0,
         "seed_frame_id": 2,
+        "trajectory_sha256": str(trajectory_sha256),
         "atom_types": ["O", "H", "H"],
         "final_coordinates": [
             [0.0, 0.0, 0.0],
@@ -52,8 +80,6 @@ def _result_payload(
         "fell_back_to_ds": False,
         "whitened_distance_final": 0.5,
     }
-    if trajectory_sha256 is not None:
-        payload["trajectory_sha256"] = str(trajectory_sha256)
     if include_landing_safety:
         payload["landing_safety"] = _landing_safety(
             accepted=bool(landing_safety_accepted),
@@ -61,206 +87,327 @@ def _result_payload(
     return payload
 
 
-def _seed_record():
-    return {"seed_index": 0, "frame_id": 2}
+def _selection_payload():
+    payload = {
+        "schema_version": 2,
+        "campaign_uid": CAMPAIGN_UID,
+        "iteration": 1,
+        "models_version": 0,
+        "model_manifest_sha256": MODEL_SHA,
+        "trajectory_sha256": TRAJECTORY_SHA,
+        "selection_strategy": "hybrid_variance",
+        "n_picked": 1,
+        "seed_records": [{
+            "seed_id": 1,
+            "frame_id": 2,
+            "pool_row_index_zero_based": 2,
+            "selection_origin": "bulk",
+            "variance_at_selection": 0.1,
+        }],
+    }
+    fingerprint = selection_fingerprint_sha256(payload)
+    seed_uid = deterministic_seed_uid(
+        campaign_uid=CAMPAIGN_UID,
+        iteration=1,
+        seed_id=1,
+        frame_id=2,
+        models_version=0,
+        model_manifest_sha256=MODEL_SHA,
+        selection_fingerprint_sha256_value=fingerprint,
+    )
+    payload["selection_fingerprint_sha256"] = fingerprint
+    payload["seed_records"][0]["seed_uid"] = seed_uid
+    return payload
 
 
-def _write_manifest_for_result(tmp_path, result_payload):
-    iter_dir = tmp_path / "iteration-0000"
-    seed_dir = iter_dir / "pool" / "seed_0000"
-    seed_dir.mkdir(parents=True)
+def _write_canonical_handoff(
+    tmp_path,
+    *,
+    result_trajectory_sha=TRAJECTORY_SHA,
+    include_landing_safety=True,
+    landing_safety_accepted=True,
+):
+    iter_dir = tmp_path / "iteration-000001"
+    selection = _selection_payload()
+    selection_path = seeds_picked_path(iter_dir)
+    selection_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(selection_path, selection)
+    task_map_path = write_ariadne_task_map(iter_dir, selection)
+    seed_uid = str(selection["seed_records"][0]["seed_uid"])
+
+    seed_dir = ariadne_seed_dir(iter_dir, 1)
+    seed_dir.mkdir(parents=True, exist_ok=True)
     result_path = seed_dir / "result.json"
-    result_path.write_text(json.dumps(result_payload), encoding="utf-8")
-    provenance_path = seed_dir / ".provenance.json"
-    provenance_path.write_text("{}", encoding="utf-8")
-
+    result = _result_payload(
+        seed_uid,
+        trajectory_sha256=result_trajectory_sha,
+        include_landing_safety=include_landing_safety,
+        landing_safety_accepted=landing_safety_accepted,
+    )
+    atomic_write_json(result_path, result)
+    write_optimisation_trajectory(
+        seed_dir,
+        atom_types=result["atom_types"],
+        coordinate_frames=[result["final_coordinates"]],
+        alpha_values=[1.0],
+        gradient_norms=[0.0],
+        origins=["raw_final"],
+    )
+    output_manifest = write_seed_output_manifest(
+        seed_dir,
+        campaign_uid=CAMPAIGN_UID,
+        iteration=1,
+        seed_id=1,
+        seed_uid=seed_uid,
+        array_task_id=0,
+        task_success=bool(landing_safety_accepted),
+        task_exit_code=0 if landing_safety_accepted else 5,
+    )
+    provenance_path = write_seed_provenance(
+        seed_dir,
+        campaign_uid=CAMPAIGN_UID,
+        iteration=1,
+        trajectory_sha256=TRAJECTORY_SHA,
+        seed_frame_id=2,
+        seed_id=1,
+        seed_uid=seed_uid,
+        array_task_id_zero_based=0,
+        seed_selection_origin="bulk",
+        seed_variance_at_selection=0.1,
+        subspace_neighbour_frame_ids=[],
+        subspace_dimension=0,
+        subspace_eigenvalues=[],
+        mode_weighting_policy="variance",
+    )
+    ariadne_root = active_ariadne_dir(iter_dir)
+    accepted_record = {
+        "seed_id": 1,
+        "seed_uid": seed_uid,
+        "array_task_id": 0,
+        "seed_frame_id": 2,
+        "seed_dir": seed_dir.relative_to(ariadne_root).as_posix(),
+        "result_json": result_path.relative_to(ariadne_root).as_posix(),
+        "provenance_json": Path(provenance_path).relative_to(ariadne_root).as_posix(),
+        "output_manifest": output_manifest.relative_to(ariadne_root).as_posix(),
+        "return_code": 0,
+        "landing_safety": result.get("landing_safety"),
+        "result_sha256": sha256_file(result_path),
+        "provenance_sha256": sha256_file(provenance_path),
+        "output_manifest_sha256": sha256_file(output_manifest),
+    }
     write_ariadne_results_manifest(iter_dir, {
         "schema_version": ARIADNE_RESULTS_SCHEMA_VERSION,
-        "iteration": 0,
-        "trajectory_sha256": "a" * 64,
+        "campaign_uid": CAMPAIGN_UID,
+        "iteration": 1,
+        "trajectory_sha256": TRAJECTORY_SHA,
+        "task_map": {
+            "path": task_map_path.relative_to(ariadne_root).as_posix(),
+            "sha256": sha256_file(task_map_path),
+        },
         "expected_n": 1,
         "n_accepted": 1,
         "n_rejected": 0,
-        "accepted": [{
-            "seed_index": 0,
-            "seed_frame_id": 2,
-            "seed_dir": str(seed_dir.resolve()),
-            "result_json": str(result_path.resolve()),
-            "provenance_json": str(provenance_path.resolve()),
-            "return_code": int(result_payload.get("return_code", 0)),
-        }],
+        "accepted": [accepted_record],
         "rejected": [],
     })
-    return iter_dir
+    return iter_dir, selection, result_path
 
 
-def test_validate_ariadne_result_accepts_matching_trajectory_sha():
-    payload = _result_payload(trajectory_sha256="a" * 64)
+def test_validate_ariadne_result_accepts_canonical_identity():
+    selection = _selection_payload()
+    seed_uid = selection["seed_records"][0]["seed_uid"]
+    payload = _result_payload(seed_uid)
 
     out = validate_ariadne_result(
         payload,
-        expected_iteration=0,
-        seed_record=_seed_record(),
-        expected_trajectory_sha256="a" * 64,
+        expected_iteration=1,
+        seed_record={"seed_id": 1, "seed_uid": seed_uid, "frame_id": 2},
+        expected_trajectory_sha256=TRAJECTORY_SHA,
     )
 
-    assert out["trajectory_sha256"] == "a" * 64
-    assert out["legacy_missing_trajectory_sha256"] is False
+    assert out["seed_id"] == 1
+    assert out["array_task_id"] == 0
+    assert out["trajectory_sha256"] == TRAJECTORY_SHA
 
 
 def test_validate_ariadne_result_rejects_wrong_trajectory_sha():
-    payload = _result_payload(trajectory_sha256="b" * 64)
+    selection = _selection_payload()
+    seed_uid = selection["seed_records"][0]["seed_uid"]
+    payload = _result_payload(seed_uid, trajectory_sha256="b" * 64)
 
     with pytest.raises(HandoffManifestError, match="wrong_trajectory_sha256"):
         validate_ariadne_result(
             payload,
-            expected_iteration=0,
-            seed_record=_seed_record(),
-            expected_trajectory_sha256="a" * 64,
+            expected_iteration=1,
+            seed_record={"seed_id": 1, "seed_uid": seed_uid, "frame_id": 2},
+            expected_trajectory_sha256=TRAJECTORY_SHA,
         )
 
 
-def test_validate_ariadne_result_accepts_legacy_missing_result_sha():
-    payload = _result_payload()
-
-    out = validate_ariadne_result(
-        payload,
-        expected_iteration=0,
-        seed_record=_seed_record(),
-        expected_trajectory_sha256="a" * 64,
-    )
-
-    assert out["trajectory_sha256"] == "a" * 64
-    assert out["legacy_missing_trajectory_sha256"] is True
-
-
-def test_validate_ariadne_result_rejects_missing_landing_safety_by_default():
-    payload = _result_payload(include_landing_safety=False)
+def test_validate_ariadne_result_rejects_missing_landing_safety():
+    selection = _selection_payload()
+    seed_uid = selection["seed_records"][0]["seed_uid"]
+    payload = _result_payload(seed_uid, include_landing_safety=False)
 
     with pytest.raises(HandoffManifestError, match="missing_landing_safety"):
         validate_ariadne_result(
             payload,
-            expected_iteration=0,
-            seed_record=_seed_record(),
+            expected_iteration=1,
+            seed_record={"seed_id": 1, "seed_uid": seed_uid, "frame_id": 2},
         )
 
 
-def test_validate_ariadne_result_accepts_missing_landing_safety_for_legacy():
-    payload = _result_payload(include_landing_safety=False)
-
-    out = validate_ariadne_result(
-        payload,
-        expected_iteration=0,
-        seed_record=_seed_record(),
-        accept_legacy_missing_landing_safety=True,
-    )
-
-    assert out["return_code"] == 0
-
-
-def test_validate_ariadne_result_rejects_unsafe_landing_safety():
-    payload = _result_payload(landing_safety_accepted=False)
+def test_validate_ariadne_result_rejects_unsafe_landing():
+    selection = _selection_payload()
+    seed_uid = selection["seed_records"][0]["seed_uid"]
+    payload = _result_payload(seed_uid, landing_safety_accepted=False)
 
     with pytest.raises(HandoffManifestError, match="landing_safety_rejected"):
         validate_ariadne_result(
             payload,
-            expected_iteration=0,
-            seed_record=_seed_record(),
+            expected_iteration=1,
+            seed_record={"seed_id": 1, "seed_uid": seed_uid, "frame_id": 2},
         )
 
 
-def test_read_ariadne_manifest_accepts_legacy_result_sha_from_manifest(tmp_path):
-    iter_dir = _write_manifest_for_result(tmp_path, _result_payload())
+def test_read_ariadne_manifest_and_reconstruct_candidates(tmp_path):
+    iter_dir, selection, _ = _write_canonical_handoff(tmp_path)
 
-    manifest = read_ariadne_results_manifest(iter_dir, expected_iteration=0)
+    manifest = read_ariadne_results_manifest(iter_dir, expected_iteration=1)
+    _, frames, records = ariadne_candidate_frames(iter_dir, expected_iteration=1)
 
-    assert manifest["accepted"][0]["trajectory_sha256"] == "a" * 64
-    assert manifest["accepted"][0]["legacy_missing_trajectory_sha256"] is True
-    assert manifest["accepted"][0]["landing_safety"]["accepted"] is True
-    _, frames, records = ariadne_candidate_frames(iter_dir, expected_iteration=0)
+    assert manifest["accepted"][0]["seed_id"] == 1
+    assert manifest["accepted"][0]["seed_uid"] == selection["seed_records"][0]["seed_uid"]
     assert len(frames) == 1
-    assert records[0]["legacy_missing_trajectory_sha256"] is True
+    assert records[0]["seed_id"] == 1
     assert records[0]["landing_safety"]["accepted"] is True
 
 
-def test_read_ariadne_manifest_rejects_missing_landing_safety_by_default(tmp_path):
-    iter_dir = _write_manifest_for_result(
+def test_read_ariadne_manifest_rejects_wrong_result_trajectory_sha(tmp_path):
+    iter_dir, _, _ = _write_canonical_handoff(
         tmp_path,
-        _result_payload(include_landing_safety=False),
-    )
-
-    with pytest.raises(HandoffManifestError, match="missing_landing_safety"):
-        read_ariadne_results_manifest(iter_dir, expected_iteration=0)
-
-
-def test_read_ariadne_manifest_accepts_missing_landing_safety_for_legacy(tmp_path):
-    iter_dir = _write_manifest_for_result(
-        tmp_path,
-        _result_payload(include_landing_safety=False),
-    )
-
-    manifest = read_ariadne_results_manifest(
-        iter_dir,
-        expected_iteration=0,
-        accept_legacy_missing_landing_safety=True,
-    )
-    _, frames, records = ariadne_candidate_frames(
-        iter_dir,
-        expected_iteration=0,
-        accept_legacy_missing_landing_safety=True,
-    )
-
-    assert len(manifest["accepted"]) == 1
-    assert len(frames) == 1
-    assert records[0]["seed_index"] == 0
-
-
-def test_read_ariadne_manifest_rejects_unsafe_landing_safety(tmp_path):
-    iter_dir = _write_manifest_for_result(
-        tmp_path,
-        _result_payload(landing_safety_accepted=False),
-    )
-
-    with pytest.raises(HandoffManifestError, match="landing_safety_rejected"):
-        read_ariadne_results_manifest(iter_dir, expected_iteration=0)
-
-
-def test_read_ariadne_manifest_still_rejects_wrong_result_sha(tmp_path):
-    iter_dir = _write_manifest_for_result(
-        tmp_path,
-        _result_payload(trajectory_sha256="b" * 64),
+        result_trajectory_sha="b" * 64,
     )
 
     with pytest.raises(HandoffManifestError, match="wrong_trajectory_sha256"):
-        read_ariadne_results_manifest(iter_dir, expected_iteration=0)
+        read_ariadne_results_manifest(iter_dir, expected_iteration=1)
 
 
-def test_read_ariadne_manifest_wraps_malformed_integer_fields(tmp_path):
-    iter_dir = tmp_path / "iteration-0000"
-    seed_dir = iter_dir / "pool" / "seed_0000"
-    seed_dir.mkdir(parents=True)
-    result_path = seed_dir / "result.json"
-    result_path.write_text(json.dumps(_result_payload()), encoding="utf-8")
-    provenance_path = seed_dir / ".provenance.json"
-    provenance_path.write_text("{}", encoding="utf-8")
+def test_read_ariadne_manifest_rejects_tampered_result(tmp_path):
+    iter_dir, _, result_path = _write_canonical_handoff(tmp_path)
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    payload["alpha_final"] = 99.0
+    atomic_write_json(result_path, payload)
 
+    with pytest.raises(Exception, match="(size|hash) mismatch"):
+        read_ariadne_results_manifest(iter_dir, expected_iteration=1)
+
+
+def test_seed_output_writer_rejects_inconsistent_success_status(tmp_path):
+    _iter_dir, selection, result_path = _write_canonical_handoff(tmp_path)
+
+    with pytest.raises(AriadneOutputError, match="must agree"):
+        write_seed_output_manifest(
+            result_path.parent,
+            campaign_uid=CAMPAIGN_UID,
+            iteration=1,
+            seed_id=1,
+            seed_uid=str(selection["seed_records"][0]["seed_uid"]),
+            array_task_id=0,
+            task_success=False,
+            task_exit_code=0,
+        )
+
+
+def test_accepted_ariadne_record_rejects_failed_output_status(tmp_path):
+    iter_dir, _, result_path = _write_canonical_handoff(tmp_path)
+    output_path = result_path.parent / SEED_OUTPUT_MANIFEST_FILENAME
+    output = json.loads(output_path.read_text(encoding="utf-8"))
+    output["task_success"] = False
+    output["task_exit_code"] = 5
+    atomic_write_json(output_path, output)
+
+    with pytest.raises(HandoffManifestError, match="records task failure"):
+        read_ariadne_results_manifest(iter_dir, expected_iteration=1)
+
+
+def test_ariadne_results_rejects_task_map_binding_drift(tmp_path):
+    iter_dir, _, _ = _write_canonical_handoff(tmp_path)
+    results_path = active_ariadne_dir(iter_dir) / "RESULTS.json"
+    results = json.loads(results_path.read_text(encoding="utf-8"))
+    results["task_map"]["sha256"] = "f" * 64
+    atomic_write_json(results_path, results)
+
+    with pytest.raises(HandoffManifestError, match="task-map hash mismatch"):
+        read_ariadne_results_manifest(iter_dir, expected_iteration=1)
+
+
+def test_task_map_makes_scheduler_and_seed_numbering_explicit(tmp_path):
+    iter_dir, selection, _ = _write_canonical_handoff(tmp_path)
+
+    task_map = read_ariadne_task_map(iter_dir, expected_iteration=1)
+
+    assert task_map["n_tasks"] == 1
+    assert task_map["tasks"][0]["array_task_id"] == 0
+    assert task_map["tasks"][0]["seed_id"] == 1
+    assert task_map["tasks"][0]["seed_uid"] == selection["seed_records"][0][
+        "seed_uid"
+    ]
+    assert task_map["tasks"][0]["seed_directory"] == (
+        "ariadne/seeds/seed-000001"
+    )
+
+
+def test_task_map_rejects_selection_manifest_drift(tmp_path):
+    iter_dir, _, _ = _write_canonical_handoff(tmp_path)
+    selection_path = seeds_picked_path(iter_dir)
+    selection = json.loads(selection_path.read_text(encoding="utf-8"))
+    selection["diagnostic_tamper"] = True
+    atomic_write_json(selection_path, selection)
+
+    with pytest.raises(SeedIdentityError, match="selection (size|SHA-256) mismatch"):
+        read_ariadne_task_map(iter_dir, expected_iteration=1)
+
+
+def test_ariadne_manifest_rejects_tampered_trajectory(tmp_path):
+    iter_dir, _, _ = _write_canonical_handoff(tmp_path)
+    trajectory = (
+        iter_dir
+        / "ariadne"
+        / "seeds"
+        / "seed-000001"
+        / "trajectory"
+        / "trajectory.xyz"
+    )
+    trajectory.write_text(
+        trajectory.read_text(encoding="utf-8") + "# tamper\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(Exception, match="(size|hash) mismatch"):
+        read_ariadne_results_manifest(iter_dir, expected_iteration=1)
+
+
+def test_ariadne_manifest_rejects_noncanonical_orphan_seed_directory(tmp_path):
+    iter_dir, _, _ = _write_canonical_handoff(tmp_path)
+    (active_ariadne_dir(iter_dir) / "seeds" / "seed_0001").mkdir()
+
+    with pytest.raises(HandoffManifestError, match="invalid seed directory name"):
+        read_ariadne_results_manifest(iter_dir, expected_iteration=1)
+
+
+def test_read_ariadne_manifest_wraps_malformed_iteration(tmp_path):
+    iter_dir = tmp_path / "iteration-000001"
     write_ariadne_results_manifest(iter_dir, {
         "schema_version": ARIADNE_RESULTS_SCHEMA_VERSION,
         "iteration": "not-an-int",
-        "trajectory_sha256": "a" * 64,
-        "expected_n": 1,
-        "n_accepted": 1,
-        "n_rejected": 0,
-        "accepted": [{
-            "seed_index": 0,
-            "seed_frame_id": 2,
-            "seed_dir": str(seed_dir.resolve()),
-            "result_json": str(result_path.resolve()),
-            "provenance_json": str(provenance_path.resolve()),
-            "return_code": 0,
-        }],
+        "accepted": [],
         "rejected": [],
     })
 
     with pytest.raises(HandoffManifestError, match="ARIADNE results iteration"):
-        read_ariadne_results_manifest(iter_dir, expected_iteration=0)
+        read_ariadne_results_manifest(
+            iter_dir,
+            expected_iteration=1,
+            require_nonempty=False,
+        )

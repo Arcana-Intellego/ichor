@@ -1400,6 +1400,14 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
     assert "Summary source: current in-memory editor config." in out
     assert "Sampling protocol summary" in out
     assert "sampling_protocol.sampling_aggressiveness: 6" in out
+    protocol_lines = [
+        line for line in out.splitlines()
+        if "sampling_protocol." in line
+    ]
+    assert not any(
+        "sampling_protocol.resolution: unavailable" in line
+        for line in protocol_lines
+    ), protocol_lines
     assert "sampling_protocol.geometry_scale_source: profile fallback preview" in out
     assert "sampling_protocol.scale_model" in out
     assert "sampling_protocol.scale_model.geometry_motion_scale" in out
@@ -1423,6 +1431,32 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
     assert "aimall.naat: auto" in out
     assert "aimall.boaq: auto" in out
     assert "aimall.iasmesh: fine" in out
+
+
+def test_protocol_summary_reads_latest_structured_geometry_novelty_sidecar(
+    tmp_path,
+):
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.protocol_summary import (
+        _latest_geometry_novelty_payload,
+    )
+    from ichor.hpc.active_learning.geometry_novelty import (
+        GEOMETRY_NOVELTY_SCALE_SCHEMA_VERSION,
+        write_geometry_novelty_scale,
+    )
+    from ichor.hpc.active_learning.layout import active_iteration_dir
+
+    payload = {
+        "schema_version": GEOMETRY_NOVELTY_SCALE_SCHEMA_VERSION,
+        "iteration": 1,
+        "scale_angstrom": 0.125,
+    }
+    write_geometry_novelty_scale(active_iteration_dir(tmp_path, 1), payload)
+
+    observed, status = _latest_geometry_novelty_payload(tmp_path)
+
+    assert status == "latest_sidecar"
+    assert observed["iteration"] == 1
+    assert observed["scale_angstrom"] == 0.125
 
 
 def test_daemon_control_sampling_protocol_summary_uses_saved_campaign(tmp_path, monkeypatch, capsys):

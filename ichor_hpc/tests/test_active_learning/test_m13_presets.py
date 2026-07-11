@@ -42,7 +42,7 @@ def test_deep_merge_overlay_wins_on_explicit_keys():
 def test_apply_preset_sparse_overlay_keeps_preset_defaults():
     from ichor.hpc.active_learning.preset_loader import apply_preset
     from ichor.hpc.active_learning.config import CampaignConfig
-    sparse = {"schema_version": 2, "acquisition": {"weights": {"lambda_force": 7.5}}}
+    sparse = {"schema_version": 9, "acquisition": {"weights": {"lambda_force": 7.5}}}
     eff, _preset = apply_preset("spectroscopy_focused", sparse)
     c = CampaignConfig.from_dict(eff)
     assert c.acquisition.weights.lambda_force == 7.5
@@ -54,7 +54,7 @@ def test_apply_preset_sparse_overlay_keeps_preset_defaults():
 def test_spectroscopy_preset_passes_subspace_dim_guard():
     from ichor.hpc.active_learning.preset_loader import apply_preset
     from ichor.hpc.active_learning.config import CampaignConfig
-    eff, _ = apply_preset("spectroscopy_focused", {"schema_version": 2})
+    eff, _ = apply_preset("spectroscopy_focused", {"schema_version": 9})
     c = CampaignConfig.from_dict(eff)
     ac = c.to_acquisition_config()
     assert ac.subspace.max_subspace_dim == 10
@@ -64,7 +64,7 @@ def test_spectroscopy_preset_passes_subspace_dim_guard():
 def test_thermodynamics_preset_emphasises_force():
     from ichor.hpc.active_learning.preset_loader import apply_preset
     from ichor.hpc.active_learning.config import CampaignConfig
-    eff, _ = apply_preset("thermodynamics_focused", {"schema_version": 2})
+    eff, _ = apply_preset("thermodynamics_focused", {"schema_version": 9})
     c = CampaignConfig.from_dict(eff)
     assert c.acquisition.weights.lambda_force == 1.5
     assert c.acquisition.weights.lambda_energy == 0.5

@@ -171,13 +171,19 @@ _ALLOWED_PHASE_OVERRIDES = {
 def next_phase(current: CampaignPhase, iteration: int, max_iterations: int) -> Tuple[CampaignPhase, int]:
     """Return (next_phase, next_iteration).
 
-    INIT -> PHASE_A_POLUS, then forward through PHASE_ORDER. STOP_CHECK loops
-    back to SEED_SELECT with iteration+1, unless that exceeds max_iterations
-    in which case the next phase is DONE.
+    Bootstrap phases use iteration 0. INITIAL_FEREBUS advances to active
+    SEED_SELECT iteration 1. STOP_CHECK loops to the next one-based active
+    iteration until max_iterations active cycles have completed.
     """
+    if current is CampaignPhase.INITIAL_FEREBUS:
+        if int(iteration) != 0:
+            raise ValueError("INITIAL_FEREBUS requires bootstrap iteration 0")
+        return CampaignPhase.SEED_SELECT, 1
     if current is CampaignPhase.STOP_CHECK:
+        if int(iteration) < 1:
+            raise ValueError("STOP_CHECK requires active iteration >= 1")
         next_iter = iteration + 1
-        if next_iter >= max_iterations:
+        if iteration >= max_iterations:
             return CampaignPhase.DONE, iteration
         return CampaignPhase.SEED_SELECT, next_iter
     if current is CampaignPhase.INITIAL_ALLOCATION_CHECK:
@@ -1465,20 +1471,17 @@ class Daemon:
                     if isinstance(tasks, list) and tasks:
                         return len(tasks)
             if phase_name == "ARIADNE_ARRAY":
-                seeds = (
-                    self.campaign_dir
-                    / "7_ACTIVE_LEARNING"
-                    / ("iteration-" + str(int(state.iteration)).zfill(4))
-                    / "seeds_picked.json"
+                from ..layout import active_iteration_dir
+                from ..seed_identity import read_ariadne_task_map
+
+                task_map = read_ariadne_task_map(
+                    active_iteration_dir(
+                        self.campaign_dir,
+                        int(state.iteration),
+                    ),
+                    expected_iteration=int(state.iteration),
                 )
-                if seeds.is_file():
-                    data = json.loads(seeds.read_text(encoding="utf-8"))
-                    records = data.get("seed_records")
-                    if isinstance(records, list) and records:
-                        return len(records)
-                    frame_ids = data.get("frame_ids")
-                    if isinstance(frame_ids, list) and frame_ids:
-                        return len(frame_ids)
+                return int(task_map["n_tasks"])
         except Exception as exc:
             self._journal(
                 "expected_tasks_inference_failed",
@@ -2222,6 +2225,16 @@ class Daemon:
                 + str(models_version)
                 + ", reference_data_version="
                 + str(reference_data_version)
+            )
+        expected_version = 0 if phase is CampaignPhase.INITIAL_FEREBUS else int(state.iteration)
+        if models_version != expected_version:
+            return (
+                "FEREBUS committed the wrong daemon iteration version after "
+                + phase.value
+                + ": expected="
+                + str(expected_version)
+                + ", observed="
+                + str(models_version)
             )
 
         from ..versioning.trained_models import TrainedModelVersioning

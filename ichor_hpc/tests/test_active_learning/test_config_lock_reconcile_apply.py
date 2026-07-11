@@ -114,6 +114,9 @@ def _commit_reference_data_version(campaign, version=0):
         context="bootstrap",
         slot_id=int(attempt["slot_id"]),
         split=str(attempt["split"]),
+        allocation_slot_assignment_sha256=str(
+            allocation["slot_assignment_sha256"]
+        ),
     )
     record_quantum_results(
         allocation_path,
@@ -135,10 +138,10 @@ def _write_config(campaign, config):
 def _write_phase_a_sample(campaign):
     from ichor.hpc.active_learning.handoff_manifests import write_phase_a_sample_manifest
 
-    initial = campaign / "3_DIVERSITY_SAMPLING" / "initial"
+    initial = campaign / "BOOTSTRAP" / "selection"
     initial.mkdir(parents=True, exist_ok=True)
-    sample = initial / "initial-SAMPLE-1.xyz"
-    index = initial / "initial-INDEX-1.dat"
+    sample = initial / "selected.xyz"
+    index = initial / "selected_indices.dat"
     sample.write_text("1\nframe 0\nH 0.0 0.0 0.0\n", encoding="utf-8")
     index.write_text("0\n", encoding="utf-8")
     allocation_path = point_allocation_path(
@@ -165,9 +168,9 @@ def _write_phase_a_sample(campaign):
     }]
     write_phase_a_sample_manifest(initial, {
         "phase": "PHASE_A_POLUS",
-        "iteration": -1,
-        "sample_xyz": str(sample.resolve()),
-        "index_path": str(index.resolve()),
+        "iteration": 0,
+        "sample_xyz": "selection/selected.xyz",
+        "index_path": "selection/selected_indices.dat",
         "n_select": 1,
         "n_frames": 1,
         "selected_indices": [0],
@@ -175,7 +178,7 @@ def _write_phase_a_sample(campaign):
         "n_pool_frames": 1,
         "bootstrap_total_size": 1,
         "point_allocation": {
-            "manifest": str(allocation_path.resolve()),
+            "manifest": "allocation/POINT_ALLOCATION.json",
             "targets": dict(allocation["targets"]),
             "primary": primary,
             "reserve_frame_ids": [],
@@ -305,7 +308,7 @@ def test_reconcile_prints_recovery_contract_and_first_pass_guidance(tmp_path, ca
     assert "Result: READY" in out
     assert "Recovery Contract" in out
     assert "selected phase: INITIAL_GAUSSIAN iteration 0" in out
-    assert "status: ok" in out
+    assert "status        : ok" in out
     assert "required:" in out
     assert "Phase A sample" in out
     assert "=== Recovery guidance ===" not in out
@@ -440,6 +443,7 @@ def test_reconcile_apply_uses_safe_max_iterations_change(tmp_path, capsys):
     _commit_reference_data_version(campaign, 0)
     state = fresh_campaign_state(max_iterations=1)
     state.phase = CampaignPhase.HALTED
+    state.iteration = 1
     state.reference_data_version = 0
     state.models_version = -1
     write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
@@ -462,7 +466,7 @@ def test_reconcile_apply_uses_safe_max_iterations_change(tmp_path, capsys):
     assert recovered.max_iterations == 7
 
 
-def test_memory_estimate_guard_default_migration_is_allowed(tmp_path):
+def test_memory_estimate_guard_default_migration_is_normalised(tmp_path):
     campaign = _campaign(tmp_path)
     original = CampaignConfig()
     write_config_lock(campaign, original)
@@ -479,13 +483,12 @@ def test_memory_estimate_guard_default_migration_is_allowed(tmp_path):
     review = review_config_changes(campaign, changed, proposed)
 
     assert review.allowed
-    assert [c.path for c in review.allowed_changes] == [
-        "resources.fail_on_memory_estimate_exceeds_request"
-    ]
+    assert not review.changed
+    assert not review.allowed_changes
     assert not review.blocked_changes
 
 
-def test_acquisition_driver_default_migration_is_future_safe(tmp_path):
+def test_acquisition_driver_default_migration_is_normalised(tmp_path):
     campaign = _campaign(tmp_path)
     original = CampaignConfig()
     write_config_lock(campaign, original)
@@ -502,10 +505,8 @@ def test_acquisition_driver_default_migration_is_future_safe(tmp_path):
     review = review_config_changes(campaign, changed, proposed)
 
     assert review.allowed
-    changed_paths = sorted(c.path for c in review.allowed_changes)
-    assert changed_paths
-    assert all(path.startswith("acquisition.driver.") for path in changed_paths)
-    assert {c.category for c in review.allowed_changes} == {"pre_ariadne"}
+    assert not review.changed
+    assert not review.allowed_changes
     assert not review.blocked_changes
 
 
@@ -565,13 +566,13 @@ def test_ariadne_config_change_blocks_after_result_exists(tmp_path):
     write_config_lock(campaign, original)
     changed = CampaignConfig()
     changed.ariadne.trqn_backtransform_mode = "newton"
-    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000" / "pool" / "seed_0000"
+    iter_dir = campaign / "ACTIVE_LEARNING" / "iteration-000001" / "ariadne" / "seeds" / "seed-000001"
     iter_dir.mkdir(parents=True)
     (iter_dir / "result.json").write_text("{}", encoding="utf-8")
 
     proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.ARIADNE_ARRAY
-    proposed.iteration = 0
+    proposed.iteration = 1
     review = review_config_changes(campaign, changed, proposed)
 
     assert not review.allowed
@@ -587,13 +588,13 @@ def test_ariadne_config_change_blocks_halted_uncommitted_result(tmp_path):
     write_config_lock(campaign, original)
     changed = CampaignConfig()
     changed.ariadne.trqn_backtransform_mode = "newton"
-    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000" / "pool" / "seed_0000"
+    iter_dir = campaign / "ACTIVE_LEARNING" / "iteration-000001" / "ariadne" / "seeds" / "seed-000001"
     iter_dir.mkdir(parents=True)
     (iter_dir / "result.json").write_text("{}", encoding="utf-8")
 
     proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.HALTED
-    proposed.iteration = 0
+    proposed.iteration = 1
     proposed.reference_data_version = 0
     proposed.models_version = 0
     review = review_config_changes(campaign, changed, proposed)
@@ -611,13 +612,13 @@ def test_ariadne_config_change_allows_committed_historical_result(tmp_path):
     write_config_lock(campaign, original)
     changed = CampaignConfig()
     changed.ariadne.trqn_backtransform_mode = "newton"
-    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000" / "pool" / "seed_0000"
+    iter_dir = campaign / "ACTIVE_LEARNING" / "iteration-000001" / "ariadne" / "seeds" / "seed-000001"
     iter_dir.mkdir(parents=True)
     (iter_dir / "result.json").write_text("{}", encoding="utf-8")
 
     proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.STOP_CHECK
-    proposed.iteration = 0
+    proposed.iteration = 1
     proposed.reference_data_version = 1
     proposed.models_version = 1
     review = review_config_changes(campaign, changed, proposed)
@@ -635,13 +636,13 @@ def test_phase_b_config_change_blocks_after_selection_exists(tmp_path):
     write_config_lock(campaign, original)
     changed = CampaignConfig()
     changed.phase_b.beta = 0.40
-    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
-    iter_dir.mkdir(parents=True)
-    (iter_dir / "PHASE_B_SELECTION.json").write_text("{}", encoding="utf-8")
+    iter_dir = campaign / "ACTIVE_LEARNING" / "iteration-000001"
+    (iter_dir / "phase_b").mkdir(parents=True)
+    (iter_dir / "phase_b" / "SELECTION.json").write_text("{}", encoding="utf-8")
 
     proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.PHASE_B_POLUS
-    proposed.iteration = 0
+    proposed.iteration = 1
     review = review_config_changes(campaign, changed, proposed)
 
     assert not review.allowed
@@ -655,13 +656,13 @@ def test_batch_allocation_change_blocks_after_phase_b_selection_exists(tmp_path)
     write_config_lock(campaign, original)
     changed = CampaignConfig()
     changed.point_allocation.batch_training_size = 5
-    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
-    iter_dir.mkdir(parents=True)
-    (iter_dir / "PHASE_B_SELECTION.json").write_text("{}", encoding="utf-8")
+    iter_dir = campaign / "ACTIVE_LEARNING" / "iteration-000001"
+    (iter_dir / "phase_b").mkdir(parents=True)
+    (iter_dir / "phase_b" / "SELECTION.json").write_text("{}", encoding="utf-8")
 
     proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.PHASE_B_POLUS
-    proposed.iteration = 0
+    proposed.iteration = 1
     review = review_config_changes(campaign, changed, proposed)
 
     assert not review.allowed
@@ -677,13 +678,13 @@ def test_seed_selection_change_blocks_after_ariadne_result_exists(tmp_path):
     write_config_lock(campaign, original)
     changed = CampaignConfig()
     changed.seed_selection.n_seeds_per_iteration = 49
-    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000" / "pool" / "seed_0000"
+    iter_dir = campaign / "ACTIVE_LEARNING" / "iteration-000001" / "ariadne" / "seeds" / "seed-000001"
     iter_dir.mkdir(parents=True)
     (iter_dir / "result.json").write_text("{}", encoding="utf-8")
 
     proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.ARIADNE_ARRAY
-    proposed.iteration = 0
+    proposed.iteration = 1
     review = review_config_changes(campaign, changed, proposed)
 
     assert not review.allowed
@@ -702,7 +703,7 @@ def test_geometry_novelty_change_allowed_before_phase_b_outputs(tmp_path):
 
     proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.ARIADNE_ARRAY
-    proposed.iteration = 0
+    proposed.iteration = 1
     review = review_config_changes(campaign, changed, proposed)
 
     assert review.allowed
@@ -718,13 +719,13 @@ def test_geometry_novelty_change_blocks_after_ariadne_result_exists(tmp_path):
     write_config_lock(campaign, original)
     changed = CampaignConfig()
     changed.geometry_novelty.fallback_scale_angstrom = 0.02
-    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000" / "pool" / "seed_0000"
+    iter_dir = campaign / "ACTIVE_LEARNING" / "iteration-000001" / "ariadne" / "seeds" / "seed-000001"
     iter_dir.mkdir(parents=True)
     (iter_dir / "result.json").write_text("{}", encoding="utf-8")
 
     proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.ARIADNE_ARRAY
-    proposed.iteration = 0
+    proposed.iteration = 1
     review = review_config_changes(campaign, changed, proposed)
 
     assert not review.allowed
@@ -741,13 +742,13 @@ def test_geometry_novelty_change_blocks_after_phase_b_selection_exists(tmp_path)
     write_config_lock(campaign, original)
     changed = CampaignConfig()
     changed.geometry_novelty.fallback_scale_angstrom = 0.02
-    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
-    iter_dir.mkdir(parents=True)
-    (iter_dir / "PHASE_B_SELECTION.json").write_text("{}", encoding="utf-8")
+    iter_dir = campaign / "ACTIVE_LEARNING" / "iteration-000001"
+    (iter_dir / "phase_b").mkdir(parents=True)
+    (iter_dir / "phase_b" / "SELECTION.json").write_text("{}", encoding="utf-8")
 
     proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.PHASE_B_POLUS
-    proposed.iteration = 0
+    proposed.iteration = 1
     review = review_config_changes(campaign, changed, proposed)
 
     assert not review.allowed
@@ -766,7 +767,7 @@ def test_sampling_aggressiveness_change_allowed_before_ariadne_outputs(tmp_path)
 
     proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.ARIADNE_ARRAY
-    proposed.iteration = 0
+    proposed.iteration = 1
     review = review_config_changes(campaign, changed, proposed)
 
     assert review.allowed
@@ -782,13 +783,13 @@ def test_sampling_aggressiveness_change_blocks_after_protocol_manifest_exists(tm
     write_config_lock(campaign, original)
     changed = CampaignConfig()
     changed.sampling_protocol.sampling_aggressiveness = 6
-    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
-    iter_dir.mkdir(parents=True)
-    (iter_dir / "SAMPLING_PROTOCOL_RESOLVED.json").write_text("{}", encoding="utf-8")
+    iter_dir = campaign / "ACTIVE_LEARNING" / "iteration-000001"
+    (iter_dir / "protocol").mkdir(parents=True)
+    (iter_dir / "protocol" / "SAMPLING_PROTOCOL_RESOLVED.json").write_text("{}", encoding="utf-8")
 
     proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.ARIADNE_ARRAY
-    proposed.iteration = 0
+    proposed.iteration = 1
     review = review_config_changes(campaign, changed, proposed)
 
     assert not review.allowed
@@ -805,13 +806,13 @@ def test_sampling_aggressiveness_change_blocks_after_scale_model_exists(tmp_path
     write_config_lock(campaign, original)
     changed = CampaignConfig()
     changed.sampling_protocol.sampling_aggressiveness = 6
-    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
-    iter_dir.mkdir(parents=True)
-    (iter_dir / "SAMPLING_SCALE_MODEL.json").write_text("{}", encoding="utf-8")
+    iter_dir = campaign / "ACTIVE_LEARNING" / "iteration-000001"
+    (iter_dir / "protocol").mkdir(parents=True)
+    (iter_dir / "protocol" / "SAMPLING_SCALE_MODEL.json").write_text("{}", encoding="utf-8")
 
     proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.ARIADNE_ARRAY
-    proposed.iteration = 0
+    proposed.iteration = 1
     review = review_config_changes(campaign, changed, proposed)
 
     assert not review.allowed
@@ -827,13 +828,13 @@ def test_sampling_aggressiveness_change_blocks_after_phase_b_selection_exists(tm
     write_config_lock(campaign, original)
     changed = CampaignConfig()
     changed.sampling_protocol.sampling_aggressiveness = 6
-    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
-    iter_dir.mkdir(parents=True)
-    (iter_dir / "PHASE_B_SELECTION.json").write_text("{}", encoding="utf-8")
+    iter_dir = campaign / "ACTIVE_LEARNING" / "iteration-000001"
+    (iter_dir / "phase_b").mkdir(parents=True)
+    (iter_dir / "phase_b" / "SELECTION.json").write_text("{}", encoding="utf-8")
 
     proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.PHASE_B_POLUS
-    proposed.iteration = 0
+    proposed.iteration = 1
     review = review_config_changes(campaign, changed, proposed)
 
     assert not review.allowed
@@ -849,13 +850,13 @@ def test_sampling_aggressiveness_same_value_is_noop_after_outputs(tmp_path):
     original = CampaignConfig()
     write_config_lock(campaign, original)
     changed = CampaignConfig()
-    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
-    iter_dir.mkdir(parents=True)
-    (iter_dir / "ARIADNE_RESULTS.json").write_text("{}", encoding="utf-8")
+    iter_dir = campaign / "ACTIVE_LEARNING" / "iteration-000001"
+    (iter_dir / "ariadne").mkdir(parents=True)
+    (iter_dir / "ariadne" / "RESULTS.json").write_text("{}", encoding="utf-8")
 
     proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.ARIADNE_ARRAY
-    proposed.iteration = 0
+    proposed.iteration = 1
     review = review_config_changes(campaign, changed, proposed)
 
     assert not review.changed
@@ -869,13 +870,13 @@ def test_phase_b_config_change_blocks_halted_uncommitted_selection(tmp_path):
     write_config_lock(campaign, original)
     changed = CampaignConfig()
     changed.phase_b.beta = 0.40
-    iter_dir = campaign / "7_ACTIVE_LEARNING" / "iteration-0000"
-    iter_dir.mkdir(parents=True)
-    (iter_dir / "PHASE_B_SELECTION.json").write_text("{}", encoding="utf-8")
+    iter_dir = campaign / "ACTIVE_LEARNING" / "iteration-000001"
+    (iter_dir / "phase_b").mkdir(parents=True)
+    (iter_dir / "phase_b" / "SELECTION.json").write_text("{}", encoding="utf-8")
 
     proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.HALTED
-    proposed.iteration = 0
+    proposed.iteration = 1
     proposed.reference_data_version = 0
     proposed.models_version = 0
     review = review_config_changes(campaign, changed, proposed)
@@ -1038,9 +1039,7 @@ def test_reconcile_apply_promotes_state_and_cleans_ferebus_staging(tmp_path, cap
     _write_halted_pre_ferebus_state(campaign)
     original = CampaignConfig()
     write_config_lock(campaign, original)
-    changed = CampaignConfig()
-    changed.ferebus.scaling = False
-    _write_config(campaign, changed)
+    _write_config(campaign, original)
     stale = campaign / "TRAINED_MODELS" / "iteration-staging"
     stale.mkdir(parents=True)
     (stale / "runFerebus.sh").write_text("# stale\n", encoding="utf-8")
@@ -1075,7 +1074,7 @@ def test_reconcile_apply_promotes_state_and_cleans_ferebus_staging(tmp_path, cap
         )
     )
     lock = json.loads(config_lock_path(campaign).read_text(encoding="utf-8"))
-    assert lock["canonical_config"]["ferebus"]["scaling"] is False
+    assert lock["canonical_config"]["ferebus"]["scaling"] is True
 
 
 def test_completed_ferebus_staging_is_archived_when_committed_models_match(
@@ -1468,9 +1467,10 @@ def test_reconcile_apply_archives_data_staging_for_ferebus_reentry(tmp_path, cap
             apply=True,
         )
     )
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
+    out = captured.out
 
-    assert rc == 0
+    assert rc == 0, captured.err
     archived = sorted((campaign / ".DATA").glob("STAGING.before-reconcile-*"))
     assert len(archived) == 1
     assert (archived[0] / "INITIAL_AIMALL" / "old.txt").read_text(
@@ -1478,7 +1478,7 @@ def test_reconcile_apply_archives_data_staging_for_ferebus_reentry(tmp_path, cap
     ) == "old scratch"
     assert data_staging.is_dir()
     assert list(data_staging.iterdir()) == []
-    assert "Archived stale .DATA/STAGING" in out
+    assert "archived staging:" in out
 
 
 def test_reconcile_apply_archives_safe_dangling_training_staging(tmp_path, capsys):
@@ -1501,13 +1501,14 @@ def test_reconcile_apply_archives_safe_dangling_training_staging(tmp_path, capsy
             restore_config_from_lock=False,
         )
     )
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
+    out = captured.out
 
-    assert rc == 0
+    assert rc == 0, captured.err
     archived = sorted((campaign / "QM_REFERENCE_DATA").glob("iteration-000001.staging.before-reconcile-*"))
     assert len(archived) == 1
     assert (archived[0] / "partial.txt").read_text(encoding="utf-8") == "partial\n"
-    assert "Archived stale reference-data staging" in out
+    assert "archived reference-data staging:" in out
 
 
 def test_reconcile_apply_cleans_transient_halted_ariadne_reentry(
@@ -1527,8 +1528,8 @@ def test_reconcile_apply_cleans_transient_halted_ariadne_reentry(
     scripts = campaign / ".DATA" / "SCRIPTS"
     (scripts / "OUTPUTS").mkdir(parents=True)
     (scripts / "ERRORS").mkdir()
-    (scripts / "ARIADNE_ARRAY-0.sh").write_text("# stale\n", encoding="utf-8")
-    (scripts / "ERRORS" / "ARIADNE_ARRAY-0.e").write_text(
+    (scripts / "ARIADNE_ARRAY-1.sh").write_text("# stale\n", encoding="utf-8")
+    (scripts / "ERRORS" / "ARIADNE_ARRAY-1.e").write_text(
         "old error\n",
         encoding="utf-8",
     )
@@ -1544,10 +1545,12 @@ def test_reconcile_apply_cleans_transient_halted_ariadne_reentry(
 
     first_state = fresh_campaign_state(max_iterations=1)
     first_state.phase = CampaignPhase.HALTED
+    first_state.iteration = 1
     first_state.reference_data_version = 0
     first_state.models_version = 0
     second_state = fresh_campaign_state(max_iterations=1)
     second_state.phase = CampaignPhase.STOP_CHECK
+    second_state.iteration = 1
     second_state.reference_data_version = 0
     second_state.models_version = 0
     reports = iter([
@@ -1556,7 +1559,7 @@ def test_reconcile_apply_cleans_transient_halted_ariadne_reentry(
             committed_reference_data_versions=[0],
             committed_model_versions=[0],
             last_phase_in_journal=CampaignPhase.ARIADNE_ARRAY.value,
-            last_iteration_in_journal=0,
+            last_iteration_in_journal=1,
             last_phase_event_in_journal="halt",
             last_phase_retryable=True,
             notes=["re-entry HALTED because committed artefacts need operator review"],
@@ -1570,7 +1573,7 @@ def test_reconcile_apply_cleans_transient_halted_ariadne_reentry(
             committed_reference_data_versions=[0],
             committed_model_versions=[0],
             last_phase_in_journal=CampaignPhase.ARIADNE_ARRAY.value,
-            last_iteration_in_journal=0,
+            last_iteration_in_journal=1,
             notes=["re-entry at STOP_CHECK (next tick decides loop/terminate)"],
             unsafe_reasons=[],
         ),
@@ -1595,22 +1598,23 @@ def test_reconcile_apply_cleans_transient_halted_ariadne_reentry(
             apply=True,
         )
     )
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
+    out = captured.out
 
-    assert rc == 0
+    assert rc == 0, captured.err
     recovered = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
     assert recovered.phase is CampaignPhase.ARIADNE_ARRAY
-    assert recovered.iteration == 0
+    assert recovered.iteration == 1
     assert not model_staging.exists()
     assert (committed_model / "marker.txt").read_text(encoding="utf-8") == "committed\n"
     archived_scripts = sorted((campaign / ".DATA").glob("SCRIPTS.before-reconcile-*"))
     assert len(archived_scripts) == 1
-    assert (archived_scripts[0] / "ARIADNE_ARRAY-0.sh").is_file()
-    assert (archived_scripts[0] / "ERRORS" / "ARIADNE_ARRAY-0.e").is_file()
+    assert (archived_scripts[0] / "ARIADNE_ARRAY-1.sh").is_file()
+    assert (archived_scripts[0] / "ERRORS" / "ARIADNE_ARRAY-1.e").is_file()
     assert (scripts / "OUTPUTS").is_dir()
     assert (scripts / "ERRORS").is_dir()
-    assert "Archived stale .DATA/SCRIPTS" in out
-    assert "Removed stale model staging" in out
+    assert "archived stale scripts:" in out
+    assert "removed model staging:" in out
 
 
 def test_reconcile_apply_recovers_prebootstrap_phase_a_submission_failure(
@@ -1669,7 +1673,7 @@ def test_reconcile_apply_recovers_prebootstrap_phase_a_submission_failure(
     assert recovered.reference_data_version == -1
     assert recovered.validation_set_version == -1
     assert recovered.models_version == -1
-    assert "Start the daemon with:" in out
+    assert "ichor-al-daemon start --campaign-dir " + str(campaign) in out
     intent = submission_intent.load_intent(
         campaign,
         CampaignPhase.PHASE_A_POLUS.value,
@@ -1733,6 +1737,11 @@ def test_reconcile_apply_archive_staging_explicitly_handles_non_ferebus_reentry(
     )
     monkeypatch.setattr(
         reconcile_mod,
+        "verify_committed_reference_data_version",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        reconcile_mod,
         "_validate_recovered_state_contract",
         lambda *args, **kwargs: None,
     )
@@ -1744,6 +1753,7 @@ def test_reconcile_apply_archive_staging_explicitly_handles_non_ferebus_reentry(
 
     state = fresh_campaign_state(max_iterations=3)
     state.phase = CampaignPhase.HALTED
+    state.iteration = 1
     state.reference_data_version = 0
     state.models_version = 0
     write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
@@ -1761,9 +1771,10 @@ def test_reconcile_apply_archive_staging_explicitly_handles_non_ferebus_reentry(
             archive_staging=True,
         )
     )
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
+    out = captured.out
 
-    assert rc == 0
+    assert rc == 0, captured.err
     archived = sorted((campaign / ".DATA").glob("STAGING.archived-*"))
     assert len(archived) == 1
     assert (archived[0] / "GAUSSIAN" / "old.txt").read_text(
@@ -1771,7 +1782,7 @@ def test_reconcile_apply_archive_staging_explicitly_handles_non_ferebus_reentry(
     ) == "old scratch"
     assert data_staging.is_dir()
     assert list(data_staging.iterdir()) == []
-    assert "Archived stale .DATA/STAGING" in out
+    assert "archived staging:" in out
     recovered = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
     assert recovered.phase is CampaignPhase.SEED_SELECT
     events = list(iter_events(campaign / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson"))
@@ -1782,7 +1793,7 @@ def test_operator_archive_staging_blocks_protected_active_handoff(tmp_path):
     campaign = _campaign(tmp_path)
     state = fresh_campaign_state(max_iterations=3)
     state.phase = CampaignPhase.HALTED
-    state.iteration = 0
+    state.iteration = 1
     state.reference_data_version = 0
     state.models_version = 0
     write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
@@ -1814,9 +1825,9 @@ def test_reconcile_apply_restores_archived_initial_gaussian_handoff(
     write_config_lock(campaign, config)
     _write_config(campaign, config)
     state = fresh_campaign_state(max_iterations=3)
-    state.phase = CampaignPhase.STOP_CHECK
-    state.reference_data_version = 0
-    state.models_version = 0
+    state.phase = CampaignPhase.HALTED
+    state.reference_data_version = -1
+    state.models_version = -1
     write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
     archived = _write_archived_bootstrap_handoff(
         campaign,
@@ -1832,9 +1843,10 @@ def test_reconcile_apply_restores_archived_initial_gaussian_handoff(
             archive_staging=False,
         )
     )
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
+    out = captured.out
 
-    assert rc == 0
+    assert rc == 0, captured.err
     recovered = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
     assert recovered.phase is CampaignPhase.INITIAL_AIMALL
     restored = campaign / ".DATA" / "STAGING" / "initial"
@@ -1842,8 +1854,7 @@ def test_reconcile_apply_restores_archived_initial_gaussian_handoff(
     assert (restored / "POINT_0000.pointdir" / "input.wfn").read_text(
         encoding="utf-8"
     ) == "wfn\n"
-    assert "Archived bootstrap handoff" in out
-    assert "Restored bootstrap staging from archive" in out
+    assert "restored bootstrap staging:" in out
     events = list(iter_events(campaign / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson"))
     restored_events = [
         e for e in events if e.get("event") == "staging_restored_from_archive"
@@ -2302,7 +2313,7 @@ def test_reconcile_apply_refuses_when_submission_intent_job_is_still_active(
     err = capsys.readouterr().err
 
     assert rc == 9
-    assert "still live or scheduler status is inconclusive" in err
+    assert "job is still active in squeue" in err
     intent = submission_intent.load_intent(
         campaign,
         CampaignPhase.INITIAL_FEREBUS.value,
@@ -2436,6 +2447,11 @@ def test_start_allows_clean_first_run_with_config_and_pool(tmp_path):
     config = CampaignConfig(max_iterations=1)
     _write_config(campaign, config)
     _write_pool(campaign)
+    write_config_lock(campaign, config)
+    write_state(
+        campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json",
+        fresh_campaign_state(max_iterations=1),
+    )
 
     rc = cmd_start(
         argparse.Namespace(

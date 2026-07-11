@@ -46,7 +46,6 @@ from ..versioning.provenance import (
     enrich_with_anti_overlap,
     enrich_with_ariadne,
     enrich_with_error_calibration_input,
-    enrich_with_phase_b,
     validate_provenance,
     write_seed_provenance,
 )
@@ -134,11 +133,9 @@ FEREBUS_TASK_AUXILIARY_SUFFIXES = TRAINED_MODEL_AUXILIARY_SUFFIXES
 
 
 def _iteration_active_learning_dir(campaign_dir: Path, iteration: int) -> Path:
-    return (
-        Path(campaign_dir)
-        / "7_ACTIVE_LEARNING"
-        / ("iteration-" + str(int(iteration)).zfill(4))
-    )
+    from ..layout import active_iteration_dir
+
+    return active_iteration_dir(campaign_dir, int(iteration))
 
 
 def _object_with_overrides(default_obj: Any, overrides: Any) -> SimpleNamespace:
@@ -449,116 +446,81 @@ def _sampling_protocol_for_ariadne_result(
 ) -> tuple[SimpleNamespace, Dict[str, Any]]:
     """Load the exact sampling protocol recorded by an ARIADNE task.
 
-    Live postprocess must not silently reinterpret old seed results with a
-    freshly previewed config.  Per-result manifest pointers win; the
-    iteration manifest is the compatibility fallback; previewed config is
-    used only for true legacy results with no resolved manifest sidecar.
+    Live postprocess must not reinterpret a seed result with mutable sidecars.
+    Every required protocol artefact is therefore named and SHA-bound by the
+    per-seed result.
     """
     from ..sampling_protocol import (
         SAMPLING_PROTOCOL_SCHEMA_VERSION,
-        sampling_protocol_resolved_path,
     )
     from ..sampling_scale_model import (
         SAMPLING_SCALE_MODEL_SCHEMA_VERSION,
-        sampling_scale_model_path,
     )
+    from ..versioning.manifest import sha256_file
 
     sampling = result_dict.get("sampling_protocol")
     if not isinstance(sampling, dict):
-        sampling = {}
+        raise ValueError("ARIADNE result sampling_protocol binding is missing")
 
-    protocol_source = "preview_fallback"
-    protocol_manifest: Optional[Path] = None
-    protocol_payload: Optional[Dict[str, Any]] = None
-    raw_protocol_manifest = sampling.get("resolved_manifest")
-    if raw_protocol_manifest not in (None, ""):
-        protocol_manifest = _campaign_manifest_path(
+    def bound_manifest(field_name: str) -> Path:
+        raw_path = sampling.get(field_name)
+        if raw_path in (None, ""):
+            raise ValueError("sampling_protocol." + field_name + " is missing")
+        path = _campaign_manifest_path(
             campaign_dir,
             iter_dir,
-            raw_protocol_manifest,
-            field_name="sampling_protocol.resolved_manifest",
+            raw_path,
+            field_name="sampling_protocol." + field_name,
         )
-        protocol_source = "result_manifest"
-    else:
-        iter_manifest = sampling_protocol_resolved_path(iter_dir)
-        if iter_manifest.is_file():
-            protocol_manifest = iter_manifest.resolve()
-            protocol_source = "iteration_manifest"
+        expected_sha = str(sampling.get(field_name + "_sha256") or "")
+        if len(expected_sha) != 64:
+            raise ValueError(
+                "sampling_protocol." + field_name + "_sha256 is invalid"
+            )
+        if sha256_file(path) != expected_sha:
+            raise ValueError(
+                "sampling_protocol." + field_name + " SHA-256 mismatch"
+            )
+        return path
 
-    if protocol_manifest is not None:
-        protocol_payload = _read_json_object(
-            protocol_manifest,
-            "SAMPLING_PROTOCOL_RESOLVED.json",
+    protocol_manifest = bound_manifest("resolved_manifest")
+    scale_manifest = bound_manifest("scale_model_manifest")
+    audit_manifest = bound_manifest("audit_manifest")
+
+    protocol_payload = _read_json_object(
+        protocol_manifest,
+        "SAMPLING_PROTOCOL_RESOLVED.json",
+    )
+    if int(protocol_payload.get("schema_version", -1)) != int(
+        SAMPLING_PROTOCOL_SCHEMA_VERSION
+    ):
+        raise ValueError("unsupported sampling protocol resolved schema")
+    if int(protocol_payload.get("iteration", -1)) != int(iteration):
+        raise ValueError("sampling protocol resolved iteration mismatch")
+    result_level = sampling.get("sampling_aggressiveness")
+    if result_level is None or int(result_level) != int(
+        protocol_payload.get("sampling_aggressiveness", -1)
+    ):
+        raise ValueError(
+            "result sampling aggressiveness does not match resolved manifest"
         )
-        if int(protocol_payload.get("schema_version", -1)) != int(SAMPLING_PROTOCOL_SCHEMA_VERSION):
-            raise ValueError("unsupported sampling protocol resolved schema")
-        if int(protocol_payload.get("iteration", -1)) != int(iteration):
-            raise ValueError("sampling protocol resolved iteration mismatch")
-        result_level = sampling.get("sampling_aggressiveness")
-        if result_level is not None and int(result_level) != int(
-            protocol_payload.get("sampling_aggressiveness", -1)
-        ):
-            raise ValueError("result sampling aggressiveness does not match resolved manifest")
 
-    scale_source = "preview_fallback"
-    scale_manifest: Optional[Path] = None
-    scale_payload: Optional[Dict[str, Any]] = None
-    raw_scale_manifest = sampling.get("scale_model_manifest")
-    if raw_scale_manifest not in (None, ""):
-        scale_manifest = _campaign_manifest_path(
-            campaign_dir,
-            iter_dir,
-            raw_scale_manifest,
-            field_name="sampling_protocol.scale_model_manifest",
-        )
-        scale_source = "result_manifest"
-    elif protocol_payload is not None and protocol_payload.get("sampling_scale_model_manifest") not in (None, ""):
-        scale_manifest = _campaign_manifest_path(
-            campaign_dir,
-            iter_dir,
-            protocol_payload.get("sampling_scale_model_manifest"),
-            field_name="sampling_scale_model_manifest",
-        )
-        scale_source = "protocol_manifest"
-    elif sampling_scale_model_path(iter_dir).is_file():
-        scale_manifest = sampling_scale_model_path(iter_dir).resolve()
-        scale_source = "iteration_manifest"
-
-    if scale_manifest is not None:
-        scale_payload = _read_json_object(scale_manifest, "SAMPLING_SCALE_MODEL.json")
-        if int(scale_payload.get("schema_version", -1)) != int(SAMPLING_SCALE_MODEL_SCHEMA_VERSION):
-            raise ValueError("unsupported sampling scale model schema")
-        if int(scale_payload.get("iteration", -1)) != int(iteration):
-            raise ValueError("sampling scale model iteration mismatch")
-    elif protocol_payload is not None and isinstance(protocol_payload.get("sampling_scale_model"), dict):
-        scale_payload = dict(protocol_payload.get("sampling_scale_model") or {})
-        scale_source = "protocol_manifest_embedded"
-
-    if protocol_payload is None:
-        diagnostics = {
-            "sampling_protocol_source": "preview_fallback",
-            "sampling_scale_model_source": scale_source,
-            "used_exact_sampling_protocol": False,
-            "fallback_reason": "legacy_missing_sampling_protocol_manifest",
-            "sampling_protocol_manifest": None,
-            "sampling_scale_model_manifest": None if scale_manifest is None else str(scale_manifest),
-        }
-        return SimpleNamespace(
-            schema_version=getattr(fallback_protocol, "schema_version", None),
-            iteration=int(iteration),
-            sampling_aggressiveness=int(getattr(fallback_protocol, "sampling_aggressiveness", 0)),
-            effective_config=fallback_protocol.effective_config,
-            adversarial_safety=fallback_protocol.adversarial_safety,
-            quality_gates=fallback_protocol.quality_gates,
-            scale_model_payload=(
-                dict(scale_payload)
-                if isinstance(scale_payload, dict)
-                else dict(getattr(fallback_protocol, "scale_model_payload", {}) or {})
-            ),
-            manifest_path=None,
-            scale_model_path=scale_manifest,
-            replay_diagnostics=diagnostics,
-        ), diagnostics
+    scale_payload = _read_json_object(
+        scale_manifest,
+        "SAMPLING_SCALE_MODEL.json",
+    )
+    if int(scale_payload.get("schema_version", -1)) != int(
+        SAMPLING_SCALE_MODEL_SCHEMA_VERSION
+    ):
+        raise ValueError("unsupported sampling scale model schema")
+    if int(scale_payload.get("iteration", -1)) != int(iteration):
+        raise ValueError("sampling scale model iteration mismatch")
+    audit_payload = _read_json_object(
+        audit_manifest,
+        "SAMPLING_PROTOCOL_AUDIT.json",
+    )
+    if int(audit_payload.get("iteration", -1)) != int(iteration):
+        raise ValueError("sampling protocol audit iteration mismatch")
 
     level = int(protocol_payload.get("sampling_aggressiveness"))
     quality_gates = _object_with_overrides(
@@ -569,25 +531,32 @@ def _sampling_protocol_for_ariadne_result(
         getattr(fallback_protocol, "adversarial_safety", None),
         protocol_payload.get("resolved_adversarial_safety"),
     )
+    anti_overlap_values = protocol_payload.get("resolved_anti_overlap")
+    if not isinstance(anti_overlap_values, dict):
+        raise ValueError("resolved sampling protocol anti-overlap block is missing")
+    import copy
+
+    effective_config = copy.copy(fallback_protocol.effective_config)
+    effective_config.anti_overlap = _object_with_overrides(
+        getattr(fallback_protocol.effective_config, "anti_overlap", None),
+        anti_overlap_values,
+    )
     diagnostics = {
-        "sampling_protocol_source": protocol_source,
-        "sampling_scale_model_source": scale_source,
+        "sampling_protocol_source": "result_manifest",
+        "sampling_scale_model_source": "result_manifest",
         "used_exact_sampling_protocol": True,
-        "sampling_protocol_manifest": str(protocol_manifest) if protocol_manifest is not None else None,
-        "sampling_scale_model_manifest": str(scale_manifest) if scale_manifest is not None else None,
+        "sampling_protocol_manifest": str(protocol_manifest),
+        "sampling_scale_model_manifest": str(scale_manifest),
+        "sampling_protocol_audit_manifest": str(audit_manifest),
     }
     return SimpleNamespace(
         schema_version=int(protocol_payload.get("schema_version")),
         iteration=int(iteration),
         sampling_aggressiveness=level,
-        effective_config=fallback_protocol.effective_config,
+        effective_config=effective_config,
         adversarial_safety=adversarial_safety,
         quality_gates=quality_gates,
-        scale_model_payload=(
-            dict(scale_payload)
-            if isinstance(scale_payload, dict)
-            else dict(protocol_payload.get("sampling_scale_model") or {})
-        ),
+        scale_model_payload=dict(scale_payload),
         manifest_path=protocol_manifest,
         scale_model_path=scale_manifest,
         replay_diagnostics=diagnostics,
@@ -598,64 +567,74 @@ def clean_stale_ariadne_seed_outputs(
     campaign_dir,
     iteration: int,
     *,
-    retry_seed_indices: Optional[Sequence[int]] = None,
+    retry_array_task_ids: Optional[Sequence[int]] = None,
 ) -> List[str]:
-    """Remove stale per-seed ARIADNE result files before a retry submission.
+    """Quarantine incomplete task directories before a bounded retry."""
+    from datetime import datetime, timezone
 
-    Only daemon-owned output files are removed. Seed directories and iteration
-    manifests remain intact, so a retry can still use the same seed list while
-    early Fortran/Python aborts cannot leave misleading old result.json payloads
-    behind.
-    """
-    iter_dir = _iteration_active_learning_dir(Path(campaign_dir), int(iteration))
-    pool_dir = iter_dir / "pool"
-    if not pool_dir.exists():
+    from ..layout import (
+        active_iteration_dir,
+        active_iteration_name,
+        ariadne_seed_dir,
+        ariadne_seeds_dir,
+    )
+    from ..seed_identity import read_ariadne_task_map, task_for_array_task_id
+
+    campaign = Path(campaign_dir)
+    iter_dir = active_iteration_dir(campaign, int(iteration))
+    seeds_dir = ariadne_seeds_dir(iter_dir)
+    if not seeds_dir.exists():
         return []
-    if pool_dir.is_symlink() or not pool_dir.is_dir():
+    if seeds_dir.is_symlink() or not seeds_dir.is_dir():
         raise BackendSubmissionError(
-            "refusing to clean ARIADNE pool that is not a real directory: "
-            + str(pool_dir)
+            "refusing to clean ARIADNE seeds path that is not a real directory: "
+            + str(seeds_dir)
         )
-
-    iter_root = iter_dir.resolve()
-    removed: List[str] = []
-    allowed = None
-    if retry_seed_indices is not None:
-        allowed = {
-            "seed_" + str(int(seed_index)).zfill(4)
-            for seed_index in retry_seed_indices
-        }
-    for seed_dir in sorted(pool_dir.glob("seed_*")):
-        if allowed is not None and seed_dir.name not in allowed:
+    task_map = read_ariadne_task_map(iter_dir, expected_iteration=int(iteration))
+    task_ids = (
+        [int(value) for value in retry_array_task_ids]
+        if retry_array_task_ids is not None
+        else []
+    )
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+    quarantine = (
+        campaign
+        / ".DATA"
+        / "ACTIVE_LEARNING"
+        / "ariadne_retry_quarantine"
+        / active_iteration_name(int(iteration))
+        / stamp
+    )
+    moved: List[str] = []
+    candidates: List[Path] = []
+    for task_id in task_ids:
+        task = task_for_array_task_id(task_map, task_id)
+        candidates.append(ariadne_seed_dir(iter_dir, int(task["seed_id"])))
+    candidates.extend(sorted(seeds_dir.glob(".seed-*.partial-*")))
+    for candidate in candidates:
+        if not candidate.exists() and not candidate.is_symlink():
             continue
-        if seed_dir.is_symlink():
+        if candidate.is_symlink() or not candidate.is_dir():
             raise BackendSubmissionError(
-                "refusing to clean symlinked ARIADNE seed directory: "
-                + str(seed_dir)
+                "refusing to quarantine non-directory ARIADNE output: "
+                + str(candidate)
             )
-        if not seed_dir.is_dir():
-            continue
-        candidates = [seed_dir / "result.json", seed_dir / "ARIADNE_TRACE.jsonl"]
-        candidates.extend(sorted(seed_dir.glob("result.json.*.tmp")))
-        for target in candidates:
-            if not target.exists() and not target.is_symlink():
-                continue
-            resolved = target.resolve()
-            try:
-                resolved.relative_to(iter_root)
-            except ValueError as exc:
-                raise BackendSubmissionError(
-                    "refusing to clean ARIADNE output outside iteration dir: "
-                    + str(target)
-                ) from exc
-            if target.is_symlink() or not target.is_file():
-                raise BackendSubmissionError(
-                    "refusing to remove non-regular ARIADNE output: "
-                    + str(target)
-                )
-            target.unlink()
-            removed.append(str(target))
-    return removed
+        try:
+            candidate.resolve().relative_to(seeds_dir.resolve())
+        except ValueError as exc:
+            raise BackendSubmissionError(
+                "refusing to quarantine ARIADNE output outside seeds directory: "
+                + str(candidate)
+            ) from exc
+        quarantine.mkdir(parents=True, exist_ok=True)
+        target = quarantine / candidate.name
+        suffix = 1
+        while target.exists():
+            target = quarantine / (candidate.name + "." + str(suffix))
+            suffix += 1
+        shutil.move(str(candidate), str(target))
+        moved.append(str(target))
+    return moved
 
 #  SBATCH-phase postprocess refusal guard.
 #
@@ -960,7 +939,7 @@ def _ariadne_landing_audit_summary(seed_records: List[Dict[str, Any]]) -> Dict[s
     }
     unique_records: Dict[str, Dict[str, Any]] = {}
     for pos, rec in enumerate(seed_records):
-        key = str(rec.get("seed_index", "__pos_" + str(pos)))
+        key = str(rec.get("seed_id", "__pos_" + str(pos)))
         unique_records[key] = rec
     for rec in unique_records.values():
         safety = rec.get("landing_safety")
@@ -1119,7 +1098,9 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         if phase_name == "INITIAL_GAUSSIAN":
             from ..handoff_manifests import read_phase_a_sample_manifest
 
-            outdir = camp / "3_DIVERSITY_SAMPLING" / "initial"
+            from ..layout import bootstrap_selection_dir
+
+            outdir = bootstrap_selection_dir(camp)
             try:
                 manifest = read_phase_a_sample_manifest(outdir)
             except Exception as exc:
@@ -1130,28 +1111,32 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     + str(exc)
                 ) from exc
             return Path(str(manifest["sample_xyz"]))
-        iter_dir = camp / "7_ACTIVE_LEARNING" / ("iteration-" + str(int(iteration)).zfill(4))
-        candidate = iter_dir / "phase_b_SAMPLE.xyz"
+        from ..layout import active_iteration_dir, active_phase_b_dir
+
+        iter_dir = active_iteration_dir(camp, int(iteration))
+        candidate = active_phase_b_dir(iter_dir) / "selected.xyz"
         return candidate if candidate.is_file() else None
 
     def _count_seeds(self, iteration):
         from ..handoff_manifests import load_seeds_picked
 
-        iter_dir = Path(self.campaign_dir) / "7_ACTIVE_LEARNING" / ("iteration-" + str(int(iteration)).zfill(4))
+        from ..layout import active_iteration_dir
+
+        iter_dir = active_iteration_dir(self.campaign_dir, int(iteration))
         try:
             data = load_seeds_picked(iter_dir, expected_iteration=int(iteration))
         except Exception as exc:
-            raise BackendSubmissionError("seeds_picked.json unreadable: " + str(exc))
+            raise BackendSubmissionError(
+                "seed_selection/SELECTION.json unreadable: " + str(exc)
+            )
         return int(data.get("n_picked", 0))
 
     def _seed_dir_for_record(self, iteration: int, seed_record: Dict[str, Any]) -> Path:
-        seed_index = int(seed_record["seed_index"])
-        return (
-            Path(self.campaign_dir)
-            / "7_ACTIVE_LEARNING"
-            / ("iteration-" + str(int(iteration)).zfill(4))
-            / "pool"
-            / ("seed_" + str(seed_index).zfill(4))
+        from ..layout import active_iteration_dir, ariadne_seed_dir
+
+        return ariadne_seed_dir(
+            active_iteration_dir(self.campaign_dir, int(iteration)),
+            int(seed_record["seed_id"]),
         )
 
     @staticmethod
@@ -1220,6 +1205,9 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         seed_dir = self._seed_dir_for_record(iteration, seed_record)
         prov_path = seed_dir / PROVENANCE_FILENAME
         seed_frame_id = self._seed_record_frame_id(seed_record)
+        seed_id = int(seed_record["seed_id"])
+        seed_uid = str(seed_record["seed_uid"])
+        array_task_id = seed_id - 1
         trajectory_sha = str(picked.get("trajectory_sha256", "") or "")
         trajectory_sha_for_validation = trajectory_sha if trajectory_sha else None
         if prov_path.is_file():
@@ -1230,51 +1218,19 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     iteration=iteration,
                     trajectory_sha256=trajectory_sha_for_validation,
                     seed_frame_id=seed_frame_id,
+                    seed_id=seed_id,
+                    seed_uid=seed_uid,
+                    array_task_id_zero_based=array_task_id,
                 )
             except Exception as exc:
-                reason = type(exc).__name__ + ": " + str(exc)
-                if "mismatch" in str(exc):
-                    raise BackendSubmissionError(
-                        "ARIADNE seed provenance invalid for "
-                        + seed_dir.name
-                        + ": "
-                        + reason
-                    ) from exc
-                quarantine = prov_path.with_name(
-                    prov_path.name
-                    + ".legacy_invalid."
-                    + str(os.getpid())
-                )
-                counter = 0
-                while quarantine.exists():
-                    counter += 1
-                    quarantine = prov_path.with_name(
-                        prov_path.name
-                        + ".legacy_invalid."
-                        + str(os.getpid())
-                        + "."
-                        + str(counter)
-                    )
-                try:
-                    os.replace(prov_path, quarantine)
-                except OSError as move_exc:
-                    raise BackendSubmissionError(
-                        "ARIADNE seed provenance invalid and could not be "
-                        "quarantined for "
-                        + seed_dir.name
-                        + ": "
-                        + type(move_exc).__name__
-                        + ": "
-                        + str(move_exc)
-                    ) from move_exc
-                self._journal_event(
-                    "ariadne_seed_provenance_repaired",
-                    iteration=iteration,
-                    seed_index=seed_record.get("seed_index"),
-                    seed_dir=seed_dir.name,
-                    reason=reason[:240],
-                    quarantined_path=str(quarantine),
-                )
+                raise BackendSubmissionError(
+                    "ARIADNE seed provenance invalid for "
+                    + seed_dir.name
+                    + ": "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)
+                ) from exc
             else:
                 return prov_path, False
 
@@ -1286,6 +1242,9 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 iteration=iteration,
                 trajectory_sha256=trajectory_sha,
                 seed_frame_id=seed_frame_id,
+                seed_id=seed_id,
+                seed_uid=seed_uid,
+                array_task_id_zero_based=array_task_id,
                 seed_selection_origin=str(seed_record.get("selection_origin", "unknown")),
                 seed_variance_at_selection=self._seed_record_variance(seed_record),
                 subspace_neighbour_frame_ids=neighbours,
@@ -1306,17 +1265,16 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
     def _ensure_ariadne_seed_provenance_for_iteration(self, state) -> int:
         from ..handoff_manifests import load_seeds_picked
+        from ..layout import active_iteration_dir
 
         iteration = int(state.iteration)
-        iter_dir = (
-            Path(self.campaign_dir)
-            / "7_ACTIVE_LEARNING"
-            / ("iteration-" + str(iteration).zfill(4))
-        )
+        iter_dir = active_iteration_dir(self.campaign_dir, iteration)
         try:
             picked = load_seeds_picked(iter_dir, expected_iteration=iteration)
         except Exception as exc:
-            raise BackendSubmissionError("seeds_picked.json unreadable: " + str(exc))
+            raise BackendSubmissionError(
+                "seed_selection/SELECTION.json unreadable: " + str(exc)
+            )
         created = 0
         for seed_record in list(picked.get("seed_records", [])):
             _path, was_created = self._ensure_ariadne_seed_provenance(
@@ -1405,11 +1363,20 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             )
             return n
         if phase_name == "ARIADNE_ARRAY":
-            n = self._ensure_ariadne_seed_provenance_for_iteration(state)
-            try:
-                from ..sampling_protocol import resolve_sampling_protocol
+            from ..layout import active_iteration_dir
+            from ..seed_identity import read_ariadne_task_map
 
-                resolved_protocol = resolve_sampling_protocol(
+            task_map = read_ariadne_task_map(
+                active_iteration_dir(self.campaign_dir, it),
+                expected_iteration=it,
+            )
+            n = int(task_map["n_tasks"])
+            if n < 1:
+                raise BackendSubmissionError("ARIADNE task map is empty")
+            try:
+                from ..sampling_protocol import resolve_or_load_sampling_protocol
+
+                resolved_protocol = resolve_or_load_sampling_protocol(
                     self.campaign_dir,
                     self.config,
                     iteration=it,
@@ -1824,7 +1791,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 removed = clean_stale_ariadne_seed_outputs(
                     self.campaign_dir,
                     int(getattr(state, "iteration", 0)),
-                    retry_seed_indices=(
+                    retry_array_task_ids=(
                         None
                         if array_task_map is None
                         else [int(x) for x in (recovery.get("retry_task_ids") or [])]
@@ -2202,8 +2169,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             if phase_name in ("AIMALL", "REPLACEMENT_AIMALL"):
                 try:
                     from .error_calibration import (
-                        ERROR_CALIBRATION_AUDIT_FILENAME,
                         ERROR_CALIBRATION_MODEL_FILENAME,
+                        audit_path as error_calibration_audit_path,
                         update_from_aimall_acceptance,
                     )
 
@@ -2218,7 +2185,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         quality_records=quality_records,
                     )
                     self.artefact_log.append(
-                        str((iter_dir / ERROR_CALIBRATION_AUDIT_FILENAME).resolve())
+                        str(error_calibration_audit_path(iter_dir).resolve())
                     )
                     self.artefact_log.append(
                         str(
@@ -2518,15 +2485,15 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
         # pick a representative anchor geometry to fit the local subspace
         # around. the first frame in the trajectory pool is a fine choice;
-        # using a seed from seeds_picked.json would be more principled but
+        # using a seed from seed_selection/SELECTION.json would be more principled but
         # requires SEED_SELECT to have already written that file which it
         # has not at the call site.
         anchor_atoms = pool.frame(0)
 
         try:
-            from ..sampling_protocol import resolve_sampling_protocol
+            from ..sampling_protocol import resolve_or_load_sampling_protocol
 
-            resolved_protocol = resolve_sampling_protocol(
+            resolved_protocol = resolve_or_load_sampling_protocol(
                 self.campaign_dir,
                 self.config,
                 iteration=int(state.iteration),
@@ -2579,18 +2546,13 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         # persist to the per-iteration sidecar that ARIADNE_ARRAY tasks
         # read at the top of their main. saves them ~480 GP evaluations
         # per seed.
-        iter_dir = (
-            _Path(self.campaign_dir)
-            / self.al_dir_name
-            / ("iteration-" + str(int(state.iteration)).zfill(4))
-        )
-        iter_dir.mkdir(parents=True, exist_ok=True)
-        sidecar = iter_dir / "reference_scales.json"
-        try:
-            atomic_write_json(sidecar, scales)
-        except OSError:
-            # disk issue; do not crash the daemon mid-tick.
-            pass
+        from ..layout import active_iteration_dir, active_protocol_dir
+
+        iter_dir = active_iteration_dir(self.campaign_dir, int(state.iteration))
+        protocol_dir = active_protocol_dir(iter_dir)
+        protocol_dir.mkdir(parents=True, exist_ok=True)
+        sidecar = protocol_dir / "reference_scales.json"
+        atomic_write_json(sidecar, scales)
 
         state.reference_scales = scales
         state.reference_scales_iteration = int(state.iteration)
@@ -2680,8 +2642,25 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             state_updates = {"models_version": int(next_version), "validation_set_version": int(next_version)}
             if is_initial:
                 from . import input_staging as _stg
+                from ..versioning.sampling_iterations import finalise_bootstrap
+
                 _stg.commit_initial_reference_data(self.campaign_dir)
                 state_updates["reference_data_version"] = 0
+                try:
+                    finalise_bootstrap(
+                        self.campaign_dir,
+                        str(state.campaign_uid),
+                    )
+                except Exception as exc:
+                    return PhaseResult(
+                        is_complete=True,
+                        failure_reason=(
+                            "bootstrap_finalisation_failed: "
+                            + type(exc).__name__
+                            + ": "
+                            + str(exc)
+                        ),
+                    )
             return PhaseResult(is_complete=True, state_updates=state_updates)
 
         ok, reason = validate_ferebus_completed(staging)
@@ -2858,13 +2837,30 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
         state_updates = {"models_version": int(next_version), "validation_set_version": int(next_version)}
         if is_initial:
-            # iteration-0 of the QM reference data is normally built at INITIAL_FEREBUS staging now
+            # iteration-000000 of the QM reference data is normally built at INITIAL_FEREBUS staging now
             # (so the feature export has something to read). call the same helper here too -- it
             # no-ops if staging already did it, and still covers the mock/dry path that never hits
             # the live stager. only THEN advance the version; staging deliberately leaves that to
             # us so a crash between staging and here reconciles cleanly.
             _stg.commit_initial_reference_data(self.campaign_dir)
             state_updates["reference_data_version"] = 0
+            from ..versioning.sampling_iterations import finalise_bootstrap
+
+            try:
+                finalise_bootstrap(
+                    self.campaign_dir,
+                    str(state.campaign_uid),
+                )
+            except Exception as exc:
+                return PhaseResult(
+                    is_complete=True,
+                    failure_reason=(
+                        "bootstrap_finalisation_failed: "
+                        + type(exc).__name__
+                        + ": "
+                        + str(exc)
+                    ),
+                )
 
         self._journal_event(
             "models_committed",
@@ -2895,7 +2891,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
     # --- ARIADNE_ARRAY parser body -------------------------------------
 
     def _parse_ariadne_array_postprocess(self, state, phase, observations):
-        """Validate per-seed ARIADNE results and publish ARIADNE_RESULTS.json."""
+        """Validate per-seed ARIADNE results and publish ariadne/RESULTS.json."""
         from pathlib import Path as _Path
         import json as _json
         from ..handoff_manifests import (
@@ -2908,12 +2904,20 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             write_ariadne_results_manifest,
         )
         from ..acquisition.ariadne_runner import ariadne_result_usability_payload
+        from ..ariadne_outputs import (
+            SEED_OUTPUT_MANIFEST_FILENAME,
+            validate_seed_output,
+        )
+        from ..layout import active_ariadne_dir, ariadne_seed_dir, ariadne_seeds_dir
+        from ..seed_identity import read_ariadne_task_map
+        from ..versioning.manifest import sha256_file
         from .phase_executor import PhaseResult
         from ..sampling_protocol import preview_sampling_protocol
 
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
         iter_dir = self._iter_dir(state.iteration)
-        pool_dir = iter_dir / "pool"
+        ariadne_root = active_ariadne_dir(iter_dir)
+        seeds_root = ariadne_seeds_dir(iter_dir)
         geometry_scale_payload = None
         try:
             from ..geometry_novelty import read_geometry_novelty_scale
@@ -2943,6 +2947,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             )
         try:
             picked = load_seeds_picked(iter_dir, expected_iteration=int(state.iteration))
+            task_map = read_ariadne_task_map(
+                iter_dir,
+                expected_iteration=int(state.iteration),
+            )
         except Exception as exc:
             return PhaseResult(
                 is_complete=True,
@@ -2954,25 +2962,37 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 ),
             )
 
-        seed_records = list(picked.get("seed_records", []))
-        expected_n = int(picked.get("n_picked", len(seed_records)))
-        trajectory_pool = None
+        seed_records = list(picked["seed_records"])
+        task_records = list(task_map["tasks"])
+        expected_n = int(task_map["n_tasks"])
+        if len(seed_records) != expected_n:
+            return PhaseResult(
+                is_complete=True,
+                failure_reason="ARIADNE task-map/selection count mismatch",
+            )
+        if int(task_map["models_version"]) != int(state.models_version):
+            return PhaseResult(
+                is_complete=True,
+                failure_reason="ARIADNE task-map/state model version mismatch",
+            )
         try:
             from ..acquisition.trajectory_pool import TrajectoryPool
 
             trajectory_pool = TrajectoryPool.load(self.campaign_dir)
         except Exception as exc:
-            self._journal_event(
-                "ariadne_optional_diagnostics_warning",
-                phase=phase_name,
-                iteration=int(state.iteration),
-                seed_dir="pool",
-                reason=(
-                    "trajectory_pool_unavailable_for_atom_order_check: "
+            return PhaseResult(
+                is_complete=True,
+                failure_reason=(
+                    "trajectory_pool_unavailable_for_ariadne_validation: "
                     + type(exc).__name__
                     + ": "
-                    + str(exc)[:160]
+                    + str(exc)
                 ),
+            )
+        if str(trajectory_pool.sha256) != str(picked["trajectory_sha256"]):
+            return PhaseResult(
+                is_complete=True,
+                failure_reason="trajectory pool/seed selection SHA mismatch",
             )
         kept_alphas = []
         flagged_count = 0
@@ -2980,20 +3000,23 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         rejected = []
         landing_audit_records = []
 
-        if not pool_dir.is_dir():
-            for seed_record in seed_records:
-                seed_dir = pool_dir / ("seed_" + str(int(seed_record["seed_index"])).zfill(4))
+        if not seeds_root.is_dir():
+            for task in task_records:
+                seed_id = int(task["seed_id"])
+                seed_dir = ariadne_seed_dir(iter_dir, seed_id)
                 rejected.append({
-                    "seed_index": int(seed_record["seed_index"]),
-                    "seed_dir": str(seed_dir.resolve()),
-                    "reason": "ariadne_pool_missing",
+                    "seed_id": seed_id,
+                    "seed_uid": str(task["seed_uid"]),
+                    "seed_dir": seed_dir.relative_to(ariadne_root).as_posix(),
+                    "reason": "ariadne_seeds_directory_missing",
                 })
                 landing_audit_records.append({
-                    "seed_index": int(seed_record["seed_index"]),
-                    "seed_dir": str(seed_dir.resolve()),
-                    "reason": "ariadne_pool_missing",
+                    "seed_id": seed_id,
+                    "seed_uid": str(task["seed_uid"]),
+                    "seed_dir": seed_dir.relative_to(ariadne_root).as_posix(),
+                    "reason": "ariadne_seeds_directory_missing",
                     "handoff_accepted": False,
-                    "handoff_rejection_reason": "ariadne_pool_missing",
+                    "handoff_rejection_reason": "ariadne_seeds_directory_missing",
                 })
             write_ariadne_landing_audit(iter_dir, {
                 "iteration": int(state.iteration),
@@ -3009,8 +3032,13 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             )
             write_ariadne_results_manifest(iter_dir, {
                 "schema_version": ARIADNE_RESULTS_SCHEMA_VERSION,
+                "campaign_uid": str(state.campaign_uid),
                 "iteration": int(state.iteration),
                 "trajectory_sha256": str(picked.get("trajectory_sha256", "")),
+                "task_map": {
+                    "path": "TASK_MAP.json",
+                    "sha256": sha256_file(ariadne_root / "TASK_MAP.json"),
+                },
                 "expected_n": int(expected_n),
                 "n_accepted": 0,
                 "n_rejected": int(len(rejected)),
@@ -3019,24 +3047,109 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             })
             return PhaseResult(
                 is_complete=True,
-                failure_reason="ariadne_pool_missing: " + str(pool_dir),
+                failure_reason="ariadne_seeds_directory_missing: " + str(seeds_root),
             )
 
-        for seed_record in seed_records:
-            seed_index = int(seed_record["seed_index"])
-            seed_dir = pool_dir / ("seed_" + str(seed_index).zfill(4))
+        for task, seed_record in zip(task_records, seed_records):
+            seed_id = int(task["seed_id"])
+            seed_uid = str(task["seed_uid"])
+            array_task_id = int(task["array_task_id"])
+            seed_dir = ariadne_seed_dir(iter_dir, seed_id)
             result_path = seed_dir / "result.json"
+            output_manifest_path = seed_dir / SEED_OUTPUT_MANIFEST_FILENAME
+            seed_dir_rel = seed_dir.relative_to(ariadne_root).as_posix()
+            result_path_rel = result_path.relative_to(ariadne_root).as_posix()
+            provenance_path_rel = (
+                seed_dir / PROVENANCE_FILENAME
+            ).relative_to(ariadne_root).as_posix()
+            output_manifest_rel = output_manifest_path.relative_to(
+                ariadne_root
+            ).as_posix()
+            try:
+                output_payload = validate_seed_output(
+                    seed_dir,
+                    expected_campaign_uid=str(state.campaign_uid),
+                    expected_iteration=int(state.iteration),
+                    expected_seed_id=seed_id,
+                    expected_seed_uid=seed_uid,
+                    expected_array_task_id=array_task_id,
+                )
+            except Exception as exc:
+                reason = "seed_output_invalid: " + type(exc).__name__ + ": " + str(exc)
+                rejected.append({
+                    "seed_id": seed_id,
+                    "seed_uid": seed_uid,
+                    "array_task_id": array_task_id,
+                    "seed_dir": seed_dir_rel,
+                    "reason": reason,
+                })
+                landing_audit_records.append({
+                    "seed_id": seed_id,
+                    "seed_uid": seed_uid,
+                    "seed_dir": seed_dir_rel,
+                    "reason": reason,
+                    "handoff_accepted": False,
+                    "handoff_rejection_reason": reason,
+                })
+                self._journal_event(
+                    "ariadne_task_rejected_invalid_output",
+                    phase=phase_name,
+                    iteration=int(state.iteration),
+                    seed_id=seed_id,
+                    seed_uid=seed_uid,
+                    seed_dir=seed_dir.name,
+                    reason=reason[:320],
+                )
+                continue
+            if not bool(output_payload["task_success"]) or int(
+                output_payload["task_exit_code"]
+            ) != 0:
+                failure_detail = str(
+                    output_payload.get("task_failure_reason")
+                    or (
+                        "exit_code="
+                        + str(output_payload["task_exit_code"])
+                    )
+                )
+                reason = "ariadne_unusable:" + failure_detail
+                rejected.append({
+                    "seed_id": seed_id,
+                    "seed_uid": seed_uid,
+                    "array_task_id": array_task_id,
+                    "seed_dir": seed_dir_rel,
+                    "reason": reason,
+                })
+                landing_audit_records.append({
+                    "seed_id": seed_id,
+                    "seed_uid": seed_uid,
+                    "seed_dir": seed_dir_rel,
+                    "reason": reason,
+                    "handoff_accepted": False,
+                    "handoff_rejection_reason": reason,
+                })
+                self._journal_event(
+                    "ariadne_task_rejected_invalid_output",
+                    phase=phase_name,
+                    iteration=int(state.iteration),
+                    seed_id=seed_id,
+                    seed_uid=seed_uid,
+                    seed_dir=seed_dir.name,
+                    reason=reason,
+                )
+                continue
             if not result_path.is_file():
                 rejected.append({
-                    "seed_index": seed_index,
-                    "seed_dir": str(seed_dir.resolve()),
-                    "result_json": str(result_path.resolve()),
+                    "seed_id": seed_id,
+                    "seed_uid": seed_uid,
+                    "seed_dir": seed_dir_rel,
+                    "result_json": result_path_rel,
                     "reason": "missing_result_json",
                 })
                 landing_audit_records.append({
-                    "seed_index": seed_index,
-                    "seed_dir": str(seed_dir.resolve()),
-                    "result_json": str(result_path.resolve()),
+                    "seed_id": seed_id,
+                    "seed_uid": seed_uid,
+                    "seed_dir": seed_dir_rel,
+                    "result_json": result_path_rel,
                     "reason": "missing_result_json",
                     "handoff_accepted": False,
                     "handoff_rejection_reason": "missing_result_json",
@@ -3046,7 +3159,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     phase=phase_name,
                     iteration=int(state.iteration),
                     seed_dir=seed_dir.name,
-                    result_json=str(result_path.resolve()),
+                    result_json=result_path_rel,
                 )
                 self._journal_event(
                     "quantum_output_rejected",
@@ -3061,15 +3174,17 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     result_dict = _json.load(f)
             except (OSError, ValueError):
                 rejected.append({
-                    "seed_index": seed_index,
-                    "seed_dir": str(seed_dir.resolve()),
-                    "result_json": str(result_path.resolve()),
+                    "seed_id": seed_id,
+                    "seed_uid": seed_uid,
+                    "seed_dir": seed_dir_rel,
+                    "result_json": result_path_rel,
                     "reason": "result_json_parse_failure",
                 })
                 landing_audit_records.append({
-                    "seed_index": seed_index,
-                    "seed_dir": str(seed_dir.resolve()),
-                    "result_json": str(result_path.resolve()),
+                    "seed_id": seed_id,
+                    "seed_uid": seed_uid,
+                    "seed_dir": seed_dir_rel,
+                    "result_json": result_path_rel,
                     "reason": "result_json_parse_failure",
                     "handoff_accepted": False,
                     "handoff_rejection_reason": "result_json_parse_failure",
@@ -3079,7 +3194,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     phase=phase_name,
                     iteration=int(state.iteration),
                     seed_dir=seed_dir.name,
-                    result_json=str(result_path.resolve()),
+                    result_json=result_path_rel,
                     reason="result_json_parse_failure",
                 )
                 self._journal_event(
@@ -3107,15 +3222,17 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             except Exception as exc:
                 reason = str(exc) or type(exc).__name__
                 rejected.append({
-                    "seed_index": seed_index,
-                    "seed_dir": str(seed_dir.resolve()),
-                    "result_json": str(result_path.resolve()),
+                    "seed_id": seed_id,
+                    "seed_uid": seed_uid,
+                    "seed_dir": seed_dir_rel,
+                    "result_json": result_path_rel,
                     "reason": reason,
                 })
                 landing_audit_records.append({
-                    "seed_index": seed_index,
-                    "seed_dir": str(seed_dir.resolve()),
-                    "result_json": str(result_path.resolve()),
+                    "seed_id": seed_id,
+                    "seed_uid": seed_uid,
+                    "seed_dir": seed_dir_rel,
+                    "result_json": result_path_rel,
                     "reason": reason,
                     "handoff_accepted": False,
                     "handoff_rejection_reason": reason,
@@ -3125,7 +3242,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     phase=phase_name,
                     iteration=int(state.iteration),
                     seed_dir=seed_dir.name,
-                    result_json=str(result_path.resolve()),
+                    result_json=result_path_rel,
                     reason=reason,
                 )
                 self._journal_event(
@@ -3138,25 +3255,13 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 continue
 
             optional_diag_warnings = _ariadne_optional_diagnostic_warnings(result_dict)
-            legacy_missing_trajectory_sha256 = bool(
-                validated.get("legacy_missing_trajectory_sha256", False)
-            )
-            if legacy_missing_trajectory_sha256:
-                self._journal_event(
-                    "ariadne_legacy_missing_trajectory_sha256",
-                    phase=phase_name,
-                    iteration=int(state.iteration),
-                    seed_dir=seed_dir.name,
-                    result_json=str(result_path.resolve()),
-                    trajectory_sha256=str(validated.get("trajectory_sha256", "")),
-                )
             if optional_diag_warnings:
                 self._journal_event(
                     "ariadne_optional_diagnostics_warning",
                     phase=phase_name,
                     iteration=int(state.iteration),
                     seed_dir=seed_dir.name,
-                    result_json=str(result_path.resolve()),
+                    result_json=result_path_rel,
                     warnings=list(optional_diag_warnings[:8]),
                     n_warnings=int(len(optional_diag_warnings)),
                 )
@@ -3177,15 +3282,17 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     + str(exc)
                 )
                 rejected.append({
-                    "seed_index": seed_index,
-                    "seed_dir": str(seed_dir.resolve()),
-                    "result_json": str(result_path.resolve()),
+                    "seed_id": seed_id,
+                    "seed_uid": seed_uid,
+                    "seed_dir": seed_dir_rel,
+                    "result_json": result_path_rel,
                     "reason": reason,
                 })
                 landing_audit_records.append({
-                    "seed_index": seed_index,
-                    "seed_dir": str(seed_dir.resolve()),
-                    "result_json": str(result_path.resolve()),
+                    "seed_id": seed_id,
+                    "seed_uid": seed_uid,
+                    "seed_dir": seed_dir_rel,
+                    "result_json": result_path_rel,
                     "reason": reason,
                     "handoff_accepted": False,
                     "handoff_rejection_reason": reason,
@@ -3195,7 +3302,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     phase=phase_name,
                     iteration=int(state.iteration),
                     seed_dir=seed_dir.name,
-                    result_json=str(result_path.resolve()),
+                    result_json=result_path_rel,
                     reason=reason,
                 )
                 self._journal_event(
@@ -3207,22 +3314,25 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 )
                 continue
             if not bool(protocol_replay.get("used_exact_sampling_protocol", False)):
-                self._journal_event(
-                    "legacy_sampling_protocol_repreview",
-                    phase=phase_name,
-                    iteration=int(state.iteration),
-                    seed_dir=seed_dir.name,
-                    result_json=str(result_path.resolve()),
-                    reason=str(protocol_replay.get("fallback_reason", "")),
-                )
+                reason = "ARIADNE result does not bind the exact sampling protocol"
+                rejected.append({
+                    "seed_id": seed_id,
+                    "seed_uid": seed_uid,
+                    "seed_dir": seed_dir_rel,
+                    "result_json": result_path_rel,
+                    "reason": reason,
+                })
+                landing_audit_records.append({
+                    "seed_id": seed_id,
+                    "seed_uid": seed_uid,
+                    "seed_dir": seed_dir_rel,
+                    "result_json": result_path_rel,
+                    "reason": reason,
+                    "handoff_accepted": False,
+                    "handoff_rejection_reason": reason,
+                })
+                continue
 
-            accept_legacy_missing_landing_safety = bool(
-                getattr(
-                    getattr(result_protocol, "adversarial_safety", None),
-                    "accept_legacy_missing_landing_safety",
-                    False,
-                )
-            )
             usability = ariadne_result_usability_payload(
                 result_dict,
                 allow_seed_fallback=bool(
@@ -3232,38 +3342,31 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         False,
                     )
                 ),
-                accept_legacy_missing_landing_safety=accept_legacy_missing_landing_safety,
+                accept_legacy_missing_landing_safety=False,
             )
 
             landing_safety = result_dict.get("landing_safety")
             if not isinstance(landing_safety, dict):
                 landing_safety = {
-                    "accepted": bool(accept_legacy_missing_landing_safety),
-                    "policy": "legacy_missing_safety",
-                    "selected_origin": "legacy_result",
+                    "accepted": False,
+                    "policy": "missing_safety",
+                    "selected_origin": None,
                     "selected_candidate_index": None,
-                    "reasons": (
-                        []
-                        if accept_legacy_missing_landing_safety
-                        else ["missing_landing_safety"]
-                    ),
-                    "record_only_reasons": ["legacy_missing_landing_safety"],
+                    "reasons": ["missing_landing_safety"],
+                    "record_only_reasons": [],
                     "metrics": {},
                     "raw_final": {},
                     "n_candidates_evaluated": 0,
                     "n_safe_candidates": 0,
                 }
             audit_record = {
-                "seed_index": seed_index,
-                "seed_dir": str(seed_dir.resolve()),
-                "result_json": str(result_path.resolve()),
+                "seed_id": seed_id,
+                "seed_uid": seed_uid,
+                "seed_dir": seed_dir_rel,
+                "result_json": result_path_rel,
+                "output_manifest": output_manifest_rel,
                 "landing_safety": dict(landing_safety),
                 "landing_candidates": list(result_dict.get("landing_candidates") or []),
-                "geometry_novelty_scale": (
-                    dict(result_dict["geometry_novelty_scale"])
-                    if isinstance(result_dict.get("geometry_novelty_scale"), dict)
-                    else None
-                ),
                 "task_success": bool(usability.get("usable", False)),
                 "task_success_reason": str(usability.get("reason", "")),
                 "sampling_protocol_replay": dict(protocol_replay),
@@ -3272,20 +3375,16 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 audit_record["optional_diagnostic_warnings"] = list(
                     optional_diag_warnings
                 )
-            if legacy_missing_trajectory_sha256:
-                audit_record["legacy_missing_trajectory_sha256"] = True
-                audit_record["trajectory_sha256"] = str(
-                    validated.get("trajectory_sha256", "")
-                )
             landing_audit_records.append(audit_record)
             if not bool(usability.get("usable", False)):
                 reason = str(usability.get("reason", "ariadne_result_unusable"))
                 audit_record["handoff_accepted"] = False
                 audit_record["handoff_rejection_reason"] = reason
                 rejected.append({
-                    "seed_index": seed_index,
-                    "seed_dir": str(seed_dir.resolve()),
-                    "result_json": str(result_path.resolve()),
+                    "seed_id": seed_id,
+                    "seed_uid": seed_uid,
+                    "seed_dir": seed_dir_rel,
+                    "result_json": result_path_rel,
                     "reason": reason,
                     "landing_safety": dict(landing_safety),
                     "task_success": False,
@@ -3296,7 +3395,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     phase=phase_name,
                     iteration=int(state.iteration),
                     seed_dir=seed_dir.name,
-                    result_json=str(result_path.resolve()),
+                    result_json=result_path_rel,
                     return_code=int(validated["return_code"]),
                     reason=reason,
                     policy=str(landing_safety.get("policy", "unknown")),
@@ -3315,9 +3414,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 audit_record["handoff_accepted"] = False
                 audit_record["handoff_rejection_reason"] = reason
                 rejected.append({
-                    "seed_index": seed_index,
-                    "seed_dir": str(seed_dir.resolve()),
-                    "result_json": str(result_path.resolve()),
+                    "seed_id": seed_id,
+                    "seed_uid": seed_uid,
+                    "seed_dir": seed_dir_rel,
+                    "result_json": result_path_rel,
                     "reason": reason,
                     "landing_safety": dict(landing_safety),
                 })
@@ -3326,7 +3426,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     phase=phase_name,
                     iteration=int(state.iteration),
                     seed_dir=seed_dir.name,
-                    result_json=str(result_path.resolve()),
+                    result_json=result_path_rel,
                     reason=reason,
                     policy=str(landing_safety.get("policy", "unknown")),
                 )
@@ -3352,7 +3452,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     phase=phase_name,
                     iteration=int(state.iteration),
                     seed_dir=seed_dir.name,
-                    result_json=str(result_path.resolve()),
+                    result_json=result_path_rel,
                     return_code=int(validated["return_code"]),
                     reason=str(usability.get("reason", "")),
                     policy=str(landing_safety.get("policy", "unknown")),
@@ -3368,9 +3468,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 audit_record["handoff_accepted"] = False
                 audit_record["handoff_rejection_reason"] = reason
                 rejected.append({
-                    "seed_index": seed_index,
-                    "seed_dir": str(seed_dir.resolve()),
-                    "result_json": str(result_path.resolve()),
+                    "seed_id": seed_id,
+                    "seed_uid": seed_uid,
+                    "seed_dir": seed_dir_rel,
+                    "result_json": result_path_rel,
                     "reason": reason,
                     "geometry_quality": dict(geometry_quality.get("metrics") or {}),
                 })
@@ -3398,10 +3499,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 audit_record["handoff_accepted"] = False
                 audit_record["handoff_rejection_reason"] = reason
                 rejected.append({
-                    "seed_index": seed_index,
-                    "seed_dir": str(seed_dir.resolve()),
-                    "result_json": str(result_path.resolve()),
-                    "provenance_json": str((seed_dir / PROVENANCE_FILENAME).resolve()),
+                    "seed_id": seed_id,
+                    "seed_uid": seed_uid,
+                    "seed_dir": seed_dir_rel,
+                    "result_json": result_path_rel,
+                    "provenance_json": provenance_path_rel,
                     "reason": reason,
                 })
                 self._journal_event(
@@ -3412,15 +3514,15 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     reason=reason,
                 )
                 continue
-            audit_record["provenance_json"] = str(prov_path.resolve())
-            audit_record["provenance_reconstructed"] = bool(provenance_reconstructed)
+            audit_record["provenance_json"] = provenance_path_rel
+            audit_record["provenance_created"] = bool(provenance_reconstructed)
             if provenance_reconstructed:
                 self._journal_event(
                     "ariadne_provenance_reconstructed",
                     phase=phase_name,
                     iteration=int(state.iteration),
                     seed_dir=seed_dir.name,
-                    provenance_json=str(prov_path.resolve()),
+                    provenance_json=provenance_path_rel,
                 )
 
             enrich_with_ariadne(
@@ -3436,9 +3538,13 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             if isinstance(selection_diagnostics, dict):
                 diag_payload = dict(selection_diagnostics)
                 diag_payload["model_version"] = int(getattr(state, "models_version", -1))
-                diag_payload["seed_index"] = int(seed_index)
+                diag_payload["seed_id"] = seed_id
+                diag_payload["seed_uid"] = seed_uid
+                diag_payload["array_task_id"] = array_task_id
                 diag_payload["seed_frame_id"] = seed_record.get("frame_id")
-                diag_payload["result_json"] = str(result_path.resolve())
+                diag_payload["result_json"] = result_path.resolve().relative_to(
+                    Path(self.campaign_dir).resolve()
+                ).as_posix()
                 diag_payload["landing_policy"] = str(
                     landing_safety.get(
                         "policy",
@@ -3519,10 +3625,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 audit_record["handoff_accepted"] = False
                 audit_record["handoff_rejection_reason"] = str(flag)
                 rejected.append({
-                    "seed_index": seed_index,
-                    "seed_dir": str(seed_dir.resolve()),
-                    "result_json": str(result_path.resolve()),
-                    "provenance_json": str(prov_path.resolve()),
+                    "seed_id": seed_id,
+                    "seed_uid": seed_uid,
+                    "seed_dir": seed_dir_rel,
+                    "result_json": result_path_rel,
+                    "provenance_json": provenance_path_rel,
                     "reason": str(flag),
                 })
                 self._journal_event(
@@ -3537,29 +3644,26 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             audit_record["handoff_accepted"] = True
             kept_alphas.append(float(validated["alpha_final"]))
             accepted.append({
-                "seed_index": seed_index,
-                "seed_dir": str(seed_dir.resolve()),
-                "result_json": str(result_path.resolve()),
-                "provenance_json": str(prov_path.resolve()),
+                "seed_id": seed_id,
+                "seed_uid": seed_uid,
+                "array_task_id": array_task_id,
+                "seed_dir": seed_dir_rel,
+                "result_json": result_path_rel,
+                "provenance_json": provenance_path_rel,
+                "output_manifest": output_manifest_rel,
                 "seed_frame_id": seed_record.get("frame_id"),
-                "selection_index": int(seed_record.get("selection_index", seed_index)),
+                "pool_row_index_zero_based": int(
+                    seed_record["pool_row_index_zero_based"]
+                ),
                 "selection_origin": str(seed_record.get("selection_origin", "unknown")),
                 "variance_at_selection": seed_record.get("variance_at_selection"),
                 "alpha_initial": float(validated["alpha_initial"]),
                 "alpha_final": float(validated["alpha_final"]),
                 "trajectory_sha256": str(validated.get("trajectory_sha256", "")),
-                "legacy_missing_trajectory_sha256": bool(
-                    legacy_missing_trajectory_sha256
-                ),
                 "whitened_distance_final": d_w,
                 "geometry_quality": dict(geometry_quality.get("metrics") or {}),
                 "landing_safety": dict(landing_safety),
                 "landing_policy": str(landing_safety.get("policy", "unknown")),
-                "geometry_novelty_scale": (
-                    dict(result_dict["geometry_novelty_scale"])
-                    if isinstance(result_dict.get("geometry_novelty_scale"), dict)
-                    else None
-                ),
                 "selection_diagnostics": (
                     dict(selection_diagnostics)
                     if isinstance(selection_diagnostics, dict)
@@ -3569,6 +3673,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 "return_code": int(validated["return_code"]),
                 "task_success": bool(usability.get("usable", False)),
                 "task_success_reason": str(usability.get("reason", "")),
+                "result_sha256": sha256_file(result_path),
+                "output_manifest_sha256": sha256_file(output_manifest_path),
             })
 
         n_kept = len(accepted)
@@ -3590,8 +3696,13 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         self.artefact_log.append(str(maturity_path))
         manifest_path = write_ariadne_results_manifest(iter_dir, {
             "schema_version": ARIADNE_RESULTS_SCHEMA_VERSION,
+            "campaign_uid": str(state.campaign_uid),
             "iteration": int(state.iteration),
             "trajectory_sha256": str(picked.get("trajectory_sha256", "")),
+            "task_map": {
+                "path": "TASK_MAP.json",
+                "sha256": sha256_file(ariadne_root / "TASK_MAP.json"),
+            },
             "expected_n": int(expected_n),
             "n_accepted": int(n_kept),
             "n_rejected": int(n_rejected),
@@ -3618,7 +3729,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
         # too many seeds lost (real failures + absentees) against the TRUE submitted count -> fail
         # rather than quietly commit a short batch as if the array had finished. only gated when we
-        # actually know the submitted count (seeds_picked.json present); mirrors the quantum phases.
+        # actually know the submitted count (SELECTION.json present); mirrors the quantum phases.
         if expected_n and (
             n_rejected / float(expected_n)
         ) > float(self.config.runtime.failure_threshold_fraction):
@@ -3656,10 +3767,9 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
     def _parse_polus_postprocess(self, state, phase, observations):
         """Parse the POLUS Phase-A or Phase-B sample output.
 
-        Phase A reads 3_DIVERSITY_SAMPLING/initial/PHASE_A_SAMPLE.json.
-        Phase B reads 7_ACTIVE_LEARNING/iteration-N/phase_b_SAMPLE.xyz and
-        additionally enriches every seed_*/.provenance.json with the
-        phase_b block (selected_after_fps + diversity_rank).
+        Phase A reads BOOTSTRAP/selection/SELECTION.json. Phase B validates
+        ACTIVE_LEARNING/iteration-NNNNNN/phase_b/SELECTION.json and its
+        hash-bound selected geometry and finalised provenance records.
 
         Validation is presence + parseability via _count_xyz_frames. If the
         sample xyz is empty or unreadable, return a failure reason and
@@ -3671,9 +3781,9 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
 
         if phase_name == "PHASE_A_POLUS":
-            outdir = (
-                _Path(self.campaign_dir) / self.diversity_dir_name / "initial"
-            )
+            from ..layout import bootstrap_selection_dir
+
+            outdir = bootstrap_selection_dir(self.campaign_dir)
             if not outdir.is_dir():
                 return PhaseResult(
                     is_complete=True,
@@ -3711,13 +3821,13 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         + str(exc)
                     ),
                 )
-            sample = iter_dir / "phase_b_SAMPLE.xyz"
+            sample = _Path(str(phase_b_manifest["selected_xyz"]["path"]))
             if not sample.is_file():
                 return PhaseResult(
                     is_complete=True,
                     failure_reason=(
                         "phase_b_sample_missing: "
-                        + str(iter_dir / "phase_b_SAMPLE.xyz")
+                        + str(sample)
                     ),
                 )
 
@@ -3767,15 +3877,27 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     is_complete=True,
                     failure_reason="phase_b_selection_content_mismatch: " + coordinate_error,
                 )
+            from ..versioning.provenance import validate_provenance
+
             for rec in final_records:
-                seed_dir = _Path(str(rec["seed_dir"]))
-                enrich_with_phase_b(
-                    seed_dir,
-                    selected_after_fps=True,
-                    diversity_rank=int(rec["final_index"]),
-                    descriptor_used=str(phase_b_manifest.get("descriptor", self.config.phase_b.descriptor)),
-                    candidate_id=str(rec.get("candidate_id") or ""),
-                    reserve_candidate=False,
+                validate_provenance(
+                    _Path(str(rec["seed_dir"])),
+                    campaign_uid=str(state.campaign_uid),
+                    iteration=int(state.iteration),
+                    seed_frame_id=rec.get("seed_frame_id"),
+                    seed_id=int(rec["seed_id"]),
+                    seed_uid=str(rec["seed_uid"]),
+                    array_task_id_zero_based=int(rec["array_task_id"]),
+                    require_phase_b_selected=True,
+                    allocation_split=str(rec["split"]),
+                    allocation_slot_id=int(rec["slot_id"]),
+                    allocation_candidate_id=str(rec["candidate_id"]),
+                    allocation_context="active",
+                    allocation_slot_assignment_sha256=str(
+                        phase_b_manifest["point_allocation"][
+                            "slot_assignment_sha256"
+                        ]
+                    ),
                 )
 
         # if the Phase-B dedup ran, surface its counts in the journal.
@@ -4578,7 +4700,7 @@ def _ariadne_invocation_block(
         "cd " + camp_q,
         *_array_task_mapping_lines(array_task_map),
         python + " -m ichor.hpc.active_learning.acquisition.ariadne_runner \\",
-        "    --seed-index $ICHOR_LOGICAL_ARRAY_TASK_ID \\",
+        "    --array-task-id $ICHOR_LOGICAL_ARRAY_TASK_ID \\",
         "    --iteration " + str(iteration) + " \\",
         "    --campaign-dir " + camp_q,
     ]
@@ -4590,7 +4712,7 @@ def _polus_invocation_block(phase_name, iteration, camp, config) -> List[str]:
         if phase_name == "PHASE_A_POLUS"
         else config.phase_b.descriptor
     )
-    wrapper_iteration = -1 if phase_name == "PHASE_A_POLUS" else int(iteration)
+    wrapper_iteration = 0 if phase_name == "PHASE_A_POLUS" else int(iteration)
     python = _python_executable_for_script()
     camp_q = _shell_quote(camp)
     return [

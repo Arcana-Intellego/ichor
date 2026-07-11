@@ -31,15 +31,36 @@ def _make_executor(tmp_path):
 
 
 def _prepare_bootstrap(ex, state):
-    ex.postprocess(state, CampaignPhase.PHASE_A_POLUS, observations=[])
-    ex.postprocess(state, CampaignPhase.INITIAL_GAUSSIAN, observations=[])
-    ex.postprocess(state, CampaignPhase.INITIAL_AIMALL, observations=[])
-    result = ex.submit_or_run(state, CampaignPhase.INITIAL_ALLOCATION_CHECK)
+    bootstrap_state = SimpleNamespace(
+        iteration=0,
+        campaign_uid=str(getattr(state, "campaign_uid", "uid")),
+        reference_data_version=-1,
+        models_version=-1,
+        replacement_round=0,
+    )
+    ex.postprocess(bootstrap_state, CampaignPhase.PHASE_A_POLUS, observations=[])
+    ex.postprocess(bootstrap_state, CampaignPhase.INITIAL_GAUSSIAN, observations=[])
+    ex.postprocess(bootstrap_state, CampaignPhase.INITIAL_AIMALL, observations=[])
+    result = ex.submit_or_run(
+        bootstrap_state,
+        CampaignPhase.INITIAL_ALLOCATION_CHECK,
+    )
     assert result.next_phase_override == CampaignPhase.INITIAL_FEREBUS.value
-    ex.postprocess(state, CampaignPhase.INITIAL_FEREBUS, observations=[])
+    ex.postprocess(bootstrap_state, CampaignPhase.INITIAL_FEREBUS, observations=[])
+
+
+def _active_state():
+    return SimpleNamespace(
+        iteration=1,
+        campaign_uid="uid",
+        reference_data_version=0,
+        models_version=0,
+        replacement_round=0,
+    )
 
 
 def _prepare_active_quantum_allocation(ex, state):
+    ex.submit_or_run(state, CampaignPhase.SEED_SELECT)
     ex.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
     ex.postprocess(state, CampaignPhase.PHASE_B_POLUS, observations=[])
     ex.submit_or_run(state, CampaignPhase.SPLIT)
@@ -55,7 +76,7 @@ def test_inline_append_idempotent_when_next_version_already_committed(tmp_path):
     re-run of APPEND must be a no-op rather than producing a duplicate
     iteration directory."""
     ex = _make_executor(tmp_path)
-    state = SimpleNamespace(iteration=0, campaign_uid="uid", reference_data_version=0)
+    state = _active_state()
     _prepare_bootstrap(ex, state)
     # First APPEND: commits version 1.
     _prepare_active_quantum_allocation(ex, state)
@@ -67,7 +88,7 @@ def test_inline_append_idempotent_when_next_version_already_committed(tmp_path):
 
     # Simulate "crash after commit, before _persist updated state". The
     # state still reports reference_data_version=0; the same APPEND call
-    # must NOT produce iteration-0002 because version 1 already exists.
+    # must NOT produce iteration-000002 because version 1 already exists.
     result2 = ex.submit_or_run(state, CampaignPhase.APPEND)
     assert result2.state_updates["reference_data_version"] == 1
     assert sorted(v.list_committed_versions()) == [0, 1]
@@ -76,7 +97,7 @@ def test_inline_append_idempotent_when_next_version_already_committed(tmp_path):
 
 def test_inline_append_idempotent_skip_journals_clearly(tmp_path):
     ex = _make_executor(tmp_path)
-    state = SimpleNamespace(iteration=0, campaign_uid="uid", reference_data_version=0)
+    state = _active_state()
     _prepare_bootstrap(ex, state)
     _prepare_active_quantum_allocation(ex, state)
     ex.submit_or_run(state, CampaignPhase.APPEND)
@@ -94,7 +115,7 @@ def test_inline_append_idempotent_skip_journals_clearly(tmp_path):
 
 def test_inline_append_idempotent_skip_repairs_current_pointer(tmp_path):
     ex = _make_executor(tmp_path)
-    state = SimpleNamespace(iteration=0, campaign_uid="uid", reference_data_version=0)
+    state = _active_state()
     _prepare_bootstrap(ex, state)
     _prepare_active_quantum_allocation(ex, state)
     ex.submit_or_run(state, CampaignPhase.APPEND)
@@ -109,7 +130,7 @@ def test_inline_append_idempotent_skip_repairs_current_pointer(tmp_path):
 
 def test_inline_append_idempotent_skip_rejects_mismatched_allocation(tmp_path):
     ex = _make_executor(tmp_path)
-    state = SimpleNamespace(iteration=0, campaign_uid="uid", reference_data_version=0)
+    state = _active_state()
     _prepare_bootstrap(ex, state)
     _prepare_active_quantum_allocation(ex, state)
     ex.submit_or_run(state, CampaignPhase.APPEND)

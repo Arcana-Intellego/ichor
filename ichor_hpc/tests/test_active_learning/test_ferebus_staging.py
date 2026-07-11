@@ -118,6 +118,9 @@ def _prepare_bootstrap_training(campaign, cfg):
             context="bootstrap",
             slot_id=int(attempt["slot_id"]),
             split=str(attempt["split"]),
+            allocation_slot_assignment_sha256=str(
+                allocation["slot_assignment_sha256"]
+            ),
         )
     stg.commit_reference_data_delta(
         campaign,

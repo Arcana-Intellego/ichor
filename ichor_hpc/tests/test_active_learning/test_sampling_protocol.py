@@ -4,12 +4,22 @@ import pytest
 
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.geometry_protocol import PHASE_B_MIN_SEPARATION_SCALE
+from ichor.hpc.active_learning.handoff_manifests import (
+    ariadne_landing_audit_path,
+    ariadne_results_path,
+    seeds_picked_path,
+)
+from ichor.hpc.active_learning.layout import (
+    active_iteration_dir,
+    ariadne_seed_dir,
+)
 from ichor.hpc.active_learning.sampling_protocol import (
     hidden_sampling_overrides,
     phase_b_min_separation_from_resolved,
     preview_sampling_protocol,
     read_sampling_protocol_audit,
     read_sampling_protocol_resolved,
+    resolve_or_load_sampling_protocol,
     resolve_sampling_protocol,
     sampling_protocol_audit_path,
     sampling_protocol_resolved_path,
@@ -110,7 +120,7 @@ def test_resolver_writes_round_trippable_manifest(tmp_path):
 
     resolved = resolve_sampling_protocol(tmp_path, cfg, iteration=2)
 
-    iter_dir = tmp_path / "7_ACTIVE_LEARNING" / "iteration-0002"
+    iter_dir = active_iteration_dir(tmp_path, 2)
     expected_path = sampling_protocol_resolved_path(iter_dir)
     audit_path = sampling_protocol_audit_path(iter_dir)
     scale_path = sampling_scale_model_path(iter_dir)
@@ -148,9 +158,37 @@ def test_resolver_writes_round_trippable_manifest(tmp_path):
     assert mode in {"absolute", "scaled", "scaled_geometry_novelty"}
 
 
+def test_resolve_or_load_preserves_immutable_protocol_bytes(tmp_path):
+    cfg = CampaignConfig()
+    resolve_sampling_protocol(tmp_path, cfg, iteration=1)
+    iter_dir = active_iteration_dir(tmp_path, 1)
+    paths = (
+        sampling_protocol_resolved_path(iter_dir),
+        sampling_protocol_audit_path(iter_dir),
+        sampling_scale_model_path(iter_dir),
+    )
+    before = {path: path.read_bytes() for path in paths}
+
+    loaded = resolve_or_load_sampling_protocol(tmp_path, cfg, iteration=1)
+
+    assert loaded.iteration == 1
+    assert {path: path.read_bytes() for path in paths} == before
+
+
+def test_resolve_or_load_rejects_partial_protocol_snapshot(tmp_path):
+    cfg = CampaignConfig()
+    iter_dir = active_iteration_dir(tmp_path, 1)
+    resolved_path = sampling_protocol_resolved_path(iter_dir)
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_path.write_text("{}\n", encoding="utf-8", newline="\n")
+
+    with pytest.raises(ValueError, match="snapshot is incomplete"):
+        resolve_or_load_sampling_protocol(tmp_path, cfg, iteration=1)
+
+
 def test_scale_model_uses_previous_result_json_motion_history(tmp_path):
-    iter0 = tmp_path / "7_ACTIVE_LEARNING" / "iteration-0000"
-    seed_dir = iter0 / "pool" / "seed_0000"
+    iter1 = active_iteration_dir(tmp_path, 1)
+    seed_dir = ariadne_seed_dir(iter1, 1)
     seed_dir.mkdir(parents=True)
     result_path = seed_dir / "result.json"
     result_path.write_text(
@@ -162,15 +200,15 @@ def test_scale_model_uses_previous_result_json_motion_history(tmp_path):
         ),
         encoding="utf-8",
     )
-    (iter0 / "ARIADNE_LANDING_AUDIT.json").write_text(
+    ariadne_landing_audit_path(iter1).write_text(
         json.dumps(
             {
                 "schema_version": 1,
-                "iteration": 0,
+                "iteration": 1,
                 "summary": {},
                 "seeds": [
                     {
-                        "seed_index": 0,
+                        "seed_id": 1,
                         "seed_dir": str(seed_dir),
                         "result_json": str(result_path),
                         "handoff_accepted": True,
@@ -191,7 +229,7 @@ def test_scale_model_uses_previous_result_json_motion_history(tmp_path):
     )
 
     cfg = CampaignConfig()
-    resolved = resolve_sampling_protocol(tmp_path, cfg, iteration=1)
+    resolved = resolve_sampling_protocol(tmp_path, cfg, iteration=2)
 
     scale = resolved.scale_model_payload
     assert scale["geometry_motion_scale"]["source"] == "ariadne_landing_history"
@@ -209,16 +247,17 @@ def test_scale_model_uses_previous_result_json_motion_history(tmp_path):
 
 
 def test_scale_model_ignores_rejected_landing_history(tmp_path):
-    iter0 = tmp_path / "7_ACTIVE_LEARNING" / "iteration-0000"
-    iter0.mkdir(parents=True)
-    (iter0 / "ARIADNE_LANDING_AUDIT.json").write_text(
+    iter1 = active_iteration_dir(tmp_path, 1)
+    iter1.mkdir(parents=True)
+    ariadne_landing_audit_path(iter1).parent.mkdir(parents=True, exist_ok=True)
+    ariadne_landing_audit_path(iter1).write_text(
         json.dumps(
             {
                 "schema_version": 1,
-                "iteration": 0,
+                "iteration": 1,
                 "seeds": [
                     {
-                        "seed_index": 0,
+                        "seed_id": 1,
                         "handoff_accepted": False,
                         "landing_safety": {
                             "accepted": False,
@@ -231,7 +270,7 @@ def test_scale_model_ignores_rejected_landing_history(tmp_path):
                         },
                     },
                     {
-                        "seed_index": 1,
+                        "seed_id": 2,
                         "handoff_accepted": True,
                         "landing_safety": {
                             "accepted": True,
@@ -249,7 +288,7 @@ def test_scale_model_ignores_rejected_landing_history(tmp_path):
         encoding="utf-8",
     )
 
-    resolved = resolve_sampling_protocol(tmp_path, CampaignConfig(), iteration=1)
+    resolved = resolve_sampling_protocol(tmp_path, CampaignConfig(), iteration=2)
     scale = resolved.scale_model_payload
 
     assert scale["geometry_motion_scale"]["value_angstrom"] == pytest.approx(0.2)
@@ -261,20 +300,21 @@ def test_scale_model_ignores_rejected_landing_history(tmp_path):
 
 
 def test_scale_model_falls_back_to_results_when_audit_has_no_usable_records(tmp_path):
-    iter0 = tmp_path / "7_ACTIVE_LEARNING" / "iteration-0000"
-    iter0.mkdir(parents=True)
-    (iter0 / "ARIADNE_LANDING_AUDIT.json").write_text(
-        json.dumps({"schema_version": 1, "iteration": 0, "seeds": []}),
+    iter1 = active_iteration_dir(tmp_path, 1)
+    iter1.mkdir(parents=True)
+    ariadne_landing_audit_path(iter1).parent.mkdir(parents=True, exist_ok=True)
+    ariadne_landing_audit_path(iter1).write_text(
+        json.dumps({"schema_version": 2, "iteration": 1, "seeds": []}),
         encoding="utf-8",
     )
-    (iter0 / "ARIADNE_RESULTS.json").write_text(
+    ariadne_results_path(iter1).write_text(
         json.dumps(
             {
                 "schema_version": 1,
-                "iteration": 0,
+                "iteration": 1,
                 "accepted": [
                     {
-                        "seed_index": 0,
+                        "seed_id": 1,
                         "landing_safety": {
                             "accepted": True,
                             "metrics": {
@@ -291,7 +331,7 @@ def test_scale_model_falls_back_to_results_when_audit_has_no_usable_records(tmp_
         encoding="utf-8",
     )
 
-    resolved = resolve_sampling_protocol(tmp_path, CampaignConfig(), iteration=1)
+    resolved = resolve_sampling_protocol(tmp_path, CampaignConfig(), iteration=2)
     scale = resolved.scale_model_payload
 
     assert scale["geometry_motion_scale"]["value_angstrom"] == pytest.approx(0.25)
@@ -300,17 +340,18 @@ def test_scale_model_falls_back_to_results_when_audit_has_no_usable_records(tmp_
 
 
 def test_scale_model_reports_malformed_and_duplicate_legacy_history(tmp_path):
-    iter0 = tmp_path / "7_ACTIVE_LEARNING" / "iteration-0000"
-    iter0.mkdir(parents=True)
-    (iter0 / "ARIADNE_LANDING_AUDIT.json").write_text(
+    iter1 = active_iteration_dir(tmp_path, 1)
+    iter1.mkdir(parents=True)
+    ariadne_landing_audit_path(iter1).parent.mkdir(parents=True, exist_ok=True)
+    ariadne_landing_audit_path(iter1).write_text(
         json.dumps(
             {
                 "schema_version": 1,
-                "iteration": 0,
+                "iteration": 1,
                 "seeds": [
                     "not-a-record",
                     {
-                        "seed_index": 0,
+                        "seed_id": 1,
                         "handoff_accepted": True,
                         "landing_safety": {"accepted": False, "metrics": {}},
                     },
@@ -320,8 +361,8 @@ def test_scale_model_reports_malformed_and_duplicate_legacy_history(tmp_path):
         encoding="utf-8",
     )
     usable = {
-        "seed_index": 1,
-        "result_json": "seed_0001/result.json",
+        "seed_id": 2,
+        "result_json": "seeds/seed-000002/result.json",
         "landing_safety": {
             "accepted": True,
             "metrics": {
@@ -332,11 +373,11 @@ def test_scale_model_reports_malformed_and_duplicate_legacy_history(tmp_path):
             },
         },
     }
-    (iter0 / "ARIADNE_RESULTS.json").write_text(
+    ariadne_results_path(iter1).write_text(
         json.dumps(
             {
                 "schema_version": 1,
-                "iteration": 0,
+                "iteration": 1,
                 "accepted": [
                     "not-a-record",
                     usable,
@@ -347,7 +388,7 @@ def test_scale_model_reports_malformed_and_duplicate_legacy_history(tmp_path):
         encoding="utf-8",
     )
 
-    resolved = resolve_sampling_protocol(tmp_path, CampaignConfig(), iteration=1)
+    resolved = resolve_sampling_protocol(tmp_path, CampaignConfig(), iteration=2)
     history_filter = resolved.scale_model_payload["history"]["filter"]
 
     assert history_filter["n_skipped_malformed_record"] == 2
@@ -358,28 +399,35 @@ def test_scale_model_reports_malformed_and_duplicate_legacy_history(tmp_path):
 
 
 def test_scale_model_populates_per_seed_records_from_seed_records(tmp_path):
-    iter0 = tmp_path / "7_ACTIVE_LEARNING" / "iteration-0000"
-    iter0.mkdir(parents=True)
-    (iter0 / "seeds_picked.json").write_text(
+    iter1 = active_iteration_dir(tmp_path, 1)
+    iter1.mkdir(parents=True)
+    seeds_picked_path(iter1).parent.mkdir(parents=True, exist_ok=True)
+    seeds_picked_path(iter1).write_text(
         json.dumps(
             {
-                "schema_version": 1,
-                "iteration": 0,
+                "schema_version": 2,
+                "campaign_uid": "sampling-protocol-test",
+                "iteration": 1,
+                "models_version": 0,
+                "model_manifest_sha256": "a" * 64,
+                "trajectory_sha256": "b" * 64,
                 "n_picked": 2,
                 "frame_ids": [10, 20],
                 "indices": [10, 20],
                 "seed_records": [
                     {
-                        "seed_index": 0,
+                        "seed_id": 1,
+                        "seed_uid": "c" * 64,
                         "frame_id": 10,
-                        "selection_index": 10,
+                        "pool_row_index_zero_based": 10,
                         "selection_origin": "bulk",
                         "variance_at_selection": None,
                     },
                     {
-                        "seed_index": 1,
+                        "seed_id": 2,
+                        "seed_uid": "d" * 64,
                         "frame_id": 20,
-                        "selection_index": 20,
+                        "pool_row_index_zero_based": 20,
                         "selection_origin": "d_optimal",
                         "variance_at_selection": 0.4,
                     },
@@ -389,24 +437,25 @@ def test_scale_model_populates_per_seed_records_from_seed_records(tmp_path):
         encoding="utf-8",
     )
 
-    resolved = resolve_sampling_protocol(tmp_path, CampaignConfig(), iteration=0)
+    resolved = resolve_sampling_protocol(tmp_path, CampaignConfig(), iteration=1)
     per_seed = resolved.scale_model_payload["per_seed_scale_model"]
 
-    assert [record["seed_index"] for record in per_seed] == [0, 1]
+    assert [record["seed_id"] for record in per_seed] == [1, 2]
     assert [record["frame_id"] for record in per_seed] == [10, 20]
 
 
 def test_preview_uses_campaign_history_without_writing_manifests(tmp_path):
-    iter0 = tmp_path / "7_ACTIVE_LEARNING" / "iteration-0000"
-    iter0.mkdir(parents=True)
-    (iter0 / "ARIADNE_LANDING_AUDIT.json").write_text(
+    iter1 = active_iteration_dir(tmp_path, 1)
+    iter1.mkdir(parents=True)
+    ariadne_landing_audit_path(iter1).parent.mkdir(parents=True, exist_ok=True)
+    ariadne_landing_audit_path(iter1).write_text(
         json.dumps(
             {
                 "schema_version": 1,
-                "iteration": 0,
+                "iteration": 1,
                 "seeds": [
                     {
-                        "seed_index": 0,
+                        "seed_id": 1,
                         "handoff_accepted": True,
                         "landing_safety": {
                             "accepted": True,
@@ -427,12 +476,12 @@ def test_preview_uses_campaign_history_without_writing_manifests(tmp_path):
     resolved = preview_sampling_protocol(
         CampaignConfig(),
         campaign_dir=tmp_path,
-        iteration=1,
+        iteration=2,
     )
 
     assert resolved.scale_model_payload["geometry_motion_scale"]["value_angstrom"] == pytest.approx(0.22)
     assert resolved.scale_model_payload["residual_fullspace_scale"]["value_angstrom"] == pytest.approx(0.44)
-    iter1 = tmp_path / "7_ACTIVE_LEARNING" / "iteration-0001"
-    assert not sampling_scale_model_path(iter1).exists()
-    assert not sampling_protocol_resolved_path(iter1).exists()
-    assert not sampling_protocol_audit_path(iter1).exists()
+    iter2 = active_iteration_dir(tmp_path, 2)
+    assert not sampling_scale_model_path(iter2).exists()
+    assert not sampling_protocol_resolved_path(iter2).exists()
+    assert not sampling_protocol_audit_path(iter2).exists()

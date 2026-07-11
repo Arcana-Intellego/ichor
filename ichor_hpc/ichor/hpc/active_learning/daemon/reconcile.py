@@ -17,11 +17,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import shutil
 from typing import Any, Dict, List, Optional, Union
+import uuid
 
 from ..acquisition.trajectory_pool import TrajectoryPool
 from ..versioning.reference_data import ReferenceDataVersioning
 from ..versioning.trained_models import TrainedModelVersioning
 from ..layout import (
+    ACTIVE_LEARNING_DIRNAME,
+    BOOTSTRAP_DIRNAME,
     QM_REFERENCE_DATA_DIRNAME,
     TRAINED_MODELS_DIRNAME,
     reject_legacy_campaign_layout,
@@ -53,6 +56,7 @@ from .state import (
     StateSchemaError,
     fresh_campaign_state,
     read_state,
+    atomic_write_text,
     write_state,
 )
 
@@ -198,10 +202,11 @@ def stateful_campaign_artifacts(campaign_dir: Union[str, Path]) -> List[str]:
 
     add_matches("QM_REFERENCE_DATA/iteration-*")
     add_matches("TRAINED_MODELS/iteration-*")
-    add_matches("7_ACTIVE_LEARNING/iteration-*")
-    add_matches("3_DIVERSITY_SAMPLING/initial/PHASE_A_SAMPLE.json")
-    add_matches("3_DIVERSITY_SAMPLING/initial/initial-SAMPLE-*.xyz")
-    add_matches("3_DIVERSITY_SAMPLING/initial/initial-INDEX-*.dat")
+    add_matches(ACTIVE_LEARNING_DIRNAME + "/iteration-*")
+    add_matches(BOOTSTRAP_DIRNAME + "/selection/SELECTION.json")
+    add_matches(BOOTSTRAP_DIRNAME + "/selection/selected.xyz")
+    add_matches(BOOTSTRAP_DIRNAME + "/selection/selected_indices.dat")
+    add_matches(BOOTSTRAP_DIRNAME + "/allocation/POINT_ALLOCATION.json")
     config_lock = campaign / ".DATA" / "ACTIVE_LEARNING" / "config_lock.json"
     pool_manifest = campaign / ".DATA" / "TRAJECTORY" / "pool.manifest.json"
     if config_lock.is_file() and not pool_manifest.is_file():
@@ -487,7 +492,7 @@ def _read_bootstrap_handoff_at(
             expected_phase=phase,
             expected_iteration=int(expected_iteration),
             require_nonempty=True,
-            require_points_file_membership=True,
+            require_points_file_membership=not archived,
         )
     except Exception:
         return None
@@ -537,18 +542,22 @@ def _find_bootstrap_handoff(
 
 
 def _find_phase_a_handoff(campaign_dir: Union[str, Path]) -> Optional[Dict[str, Any]]:
-    from ..handoff_manifests import read_phase_a_sample_manifest
+    from ..handoff_manifests import (
+        phase_a_sample_manifest_path,
+        read_phase_a_sample_manifest,
+    )
+    from ..layout import bootstrap_selection_dir
 
-    initial = Path(campaign_dir) / "3_DIVERSITY_SAMPLING" / "initial"
+    initial = bootstrap_selection_dir(Path(campaign_dir))
     try:
         manifest = read_phase_a_sample_manifest(initial, require_nonempty=True)
     except Exception:
         return None
     return {
         "path": str(initial),
-        "manifest_path": str(initial / "PHASE_A_SAMPLE.json"),
+        "manifest_path": str(phase_a_sample_manifest_path(initial)),
         "phase": CampaignPhase.PHASE_A_POLUS.value,
-        "iteration": -1,
+        "iteration": 0,
         "n_select": int(manifest.get("n_select", 0)),
         "sample_xyz": str(manifest.get("sample_xyz", "")),
         "index_path": str(manifest.get("index_path", "")),
@@ -565,6 +574,8 @@ def restore_archived_bootstrap_handoff(
     campaign = Path(campaign_dir)
     source = Path(str(handoff.get("path") or ""))
     target = campaign / ".DATA" / "STAGING" / "initial"
+    phase = str(handoff.get("phase") or "")
+    iteration = int(handoff.get("iteration", 0))
     if not source.is_dir():
         raise FileNotFoundError("archived bootstrap handoff is missing: " + str(source))
     if source.is_symlink():
@@ -582,6 +593,16 @@ def restore_archived_bootstrap_handoff(
             "refusing to restore bootstrap handoff outside campaign: "
             + str(source)
         )
+    from .input_staging import read_quantum_acceptance_manifest
+
+    source_pointdirs, _manifest = read_quantum_acceptance_manifest(
+        source,
+        expected_phase=phase,
+        expected_iteration=iteration,
+        require_nonempty=True,
+        require_points_file_membership=False,
+    )
+    pointdir_names = [path.name for path in source_pointdirs]
     if target.exists():
         if target.is_symlink():
             raise ValueError("refusing to restore over symlinked .DATA/STAGING/initial")
@@ -595,7 +616,35 @@ def restore_archived_bootstrap_handoff(
             )
         target.rmdir()
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(str(source), str(target), symlinks=False)
+    temporary = target.with_name(
+        target.name + ".restore-" + uuid.uuid4().hex
+    )
+    created_target = False
+    try:
+        shutil.copytree(str(source), str(temporary), symlinks=False)
+        points_body = "\n".join(
+            str((target / name).resolve(strict=False))
+            for name in pointdir_names
+        )
+        atomic_write_text(
+            temporary / "POINTS.txt",
+            points_body + ("\n" if points_body else ""),
+        )
+        temporary.replace(target)
+        created_target = True
+        read_quantum_acceptance_manifest(
+            target,
+            expected_phase=phase,
+            expected_iteration=iteration,
+            require_nonempty=True,
+            require_points_file_membership=True,
+        )
+    except Exception:
+        if temporary.exists():
+            shutil.rmtree(str(temporary), ignore_errors=False)
+        if created_target and target.exists():
+            shutil.rmtree(str(target), ignore_errors=False)
+        raise
     return [str(target)]
 
 
@@ -756,14 +805,9 @@ def propose_recovery(
                 last_iter = event.get("iteration", last_iter)
             if str(event.get("event") or "") == "halt":
                 last_halt_event = dict(event)
-    try:
-        bootstrap_iteration = int(
-            getattr(existing, "iteration", 0)
-            if existing is not None
-            else (last_iter if last_iter is not None else 0)
-        )
-    except Exception:
-        bootstrap_iteration = 0
+    # Bootstrap is the only sampling transaction that uses iteration zero.
+    # A stale active-loop state must never redirect recovery away from it.
+    bootstrap_iteration = 0
     bootstrap_handoff = _find_bootstrap_handoff(
         campaign,
         iteration=bootstrap_iteration,
@@ -1073,7 +1117,7 @@ def propose_recovery(
         recovered.reference_data_version = target_reference_data
         recovered.models_version = target_model
         if not existing_loaded:
-            target_iteration = max(0, int(target_reference_data) - 1)
+            target_iteration = int(target_reference_data)
             try:
                 current_iteration = int(recovered.iteration)
             except Exception:
@@ -1197,7 +1241,7 @@ def propose_recovery(
                 for d in partial_iteration_handoffs
             )
         )
-        blocking_artifacts.append("7_ACTIVE_LEARNING")
+        blocking_artifacts.append(ACTIVE_LEARNING_DIRNAME)
     for decision in partial_iteration_handoffs:
         _append_recovery_candidate(recovery_candidates, decision)
     combined_handoffs = list(protected_staging_handoffs) + list(partial_iteration_handoffs)
@@ -1372,12 +1416,14 @@ def propose_recovery(
         )
         if handoff_phase == CampaignPhase.INITIAL_GAUSSIAN.value:
             recovered.phase = CampaignPhase.INITIAL_AIMALL
+            recovered.iteration = 0
             decision = "INITIAL_AIMALL: valid initial Gaussian handoff exists without committed models"
             notes.append(
                 "re-entry at INITIAL_AIMALL to process the initial Gaussian handoff"
             )
         else:
             recovered.phase = CampaignPhase.INITIAL_FEREBUS
+            recovered.iteration = 0
             decision = "INITIAL_FEREBUS: valid initial AIMAll handoff exists without committed models"
             notes.append(
                 "re-entry at INITIAL_FEREBUS to commit initial reference-data/model version 0"

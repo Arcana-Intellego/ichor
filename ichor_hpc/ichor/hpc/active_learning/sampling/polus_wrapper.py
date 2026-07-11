@@ -309,8 +309,9 @@ def _phase_b_landing_safety_filter(
             kept_records.append(rec)
         else:
             dropped.append({
-                "candidate_index": int(i),
-                "seed_index": int(rec.get("seed_index", i)),
+                "candidate_pool_index_zero_based": int(i),
+                "seed_id": int(rec.get("seed_id", i + 1)),
+                "seed_uid": rec.get("seed_uid"),
                 "policy": str(safety.get("policy", "unknown")),
                 "reasons": [str(r) for r in safety.get("reasons", [])],
             })
@@ -459,7 +460,7 @@ def _phase_b_build_reserve(
         )
         if not np.isfinite(distance) or distance < float(min_separation):
             rejected.append({
-                "candidate_index": candidate_index,
+                "candidate_pool_index_zero_based": candidate_index,
                 "distance_to_nearest_angstrom": (
                     float(distance) if np.isfinite(distance) else None
                 ),
@@ -572,10 +573,12 @@ def _run_phase_a(campaign, config):
         int(i) for i in selected_pool_indices
     ]
 
-    outdir = campaign / "3_DIVERSITY_SAMPLING" / "initial"
+    from ..layout import bootstrap_selection_dir
+
+    outdir = bootstrap_selection_dir(campaign)
     outdir.mkdir(parents=True, exist_ok=True)
-    sample_path = outdir / ("initial-SAMPLE-" + str(n_select) + ".xyz")
-    index_path = outdir / ("initial-INDEX-" + str(n_select) + ".dat")
+    sample_path = outdir / "selected.xyz"
+    index_path = outdir / "selected_indices.dat"
     _write_xyz_file(selected_frames, sample_path)
     _write_index_file(selected_indices, index_path)
     try:
@@ -678,9 +681,9 @@ def _run_phase_a(campaign, config):
         )
     write_phase_a_sample_manifest(outdir, {
         "phase": "PHASE_A_POLUS",
-        "iteration": -1,
-        "sample_xyz": str(sample_path.resolve()),
-        "index_path": str(index_path.resolve()),
+        "iteration": 0,
+        "sample_xyz": sample_path.resolve().relative_to(outdir.parent.resolve()).as_posix(),
+        "index_path": index_path.resolve().relative_to(outdir.parent.resolve()).as_posix(),
         "n_select": int(n_select),
         "n_frames": int(len(selected_frames)),
         "selected_indices": selected_indices,
@@ -690,7 +693,9 @@ def _run_phase_a(campaign, config):
         "n_pool_frames": int(len(frames)),
         "bootstrap_total_size": int(n_select),
         "point_allocation": {
-            "manifest": str(allocation_path.resolve()),
+            "manifest": allocation_path.resolve().relative_to(
+                outdir.parent.resolve()
+            ).as_posix(),
             "targets": dict(allocation["targets"]),
             "primary": allocation_records,
             "reserve_frame_ids": [int(value) for value in reserve_pool_indices],
@@ -701,7 +706,11 @@ def _run_phase_a(campaign, config):
         "bootstrap_pool_frame_count": int(pool_select),
         "bootstrap_anchor_path": str(anchor_plan.anchor_path),
         "bootstrap_anchor_manifest": (
-            None if anchor_manifest_path is None else str(anchor_manifest_path.resolve())
+            None
+            if anchor_manifest_path is None
+            else anchor_manifest_path.resolve().relative_to(
+                outdir.parent.resolve()
+            ).as_posix()
         ),
         "excluded_pool_frame_ids": [
             int(i) for i in anchor_plan.excluded_pool_frame_ids
@@ -709,7 +718,9 @@ def _run_phase_a(campaign, config):
         "reserve_after_bootstrap": int(feasibility.reserve_after_bootstrap),
         "pool_feasibility": feasibility.to_dict(),
         "trajectory_sha256": str(pool.sha256),
-        "source_pool_manifest": str((campaign / POOL_SUBDIR / POOL_MANIFEST_FILENAME).resolve()),
+        "source_pool_manifest": (campaign / POOL_SUBDIR / POOL_MANIFEST_FILENAME).resolve().relative_to(
+            campaign.resolve()
+        ).as_posix(),
     })
 
     print(
@@ -724,11 +735,11 @@ def _run_phase_b(args, campaign, config):
     pool ARIADNE just produced, then run the optional anti-overlap
     pass against the committed QM reference data.
 
-    Two outputs always written:
-      phase_b_SAMPLE_raw.xyz  -- the raw FPS selection (whatever POLUS picked).
-      phase_b_SAMPLE.xyz      -- the dedup-filtered final selection.
-                                  identical to RAW when min_separation is 0.
-    Plus phase_b_dedup.json   -- the DedupReport for journal / reconcile.
+    Two outputs are always written under ``phase_b/``:
+      selected_raw.xyz -- the raw FPS selection.
+      selected.xyz     -- the deduplicated final selection; identical to the
+                          raw selection when the minimum separation is zero.
+    ``SELECTION.json`` binds both files and records deduplication diagnostics.
     """
     from .descriptors import build_descriptor_from_config
     from ..daemon.state import atomic_write_json
@@ -745,17 +756,24 @@ def _run_phase_b(args, campaign, config):
     )
     import sys as _sys
 
-    iter_dir = (
-        campaign / "7_ACTIVE_LEARNING"
-        / ("iteration-" + str(int(args.iteration)).zfill(4))
-    )
+    from ..layout import active_iteration_dir, active_phase_b_dir
+
+    iter_dir = active_iteration_dir(campaign, int(args.iteration))
+    phase_b_dir = active_phase_b_dir(iter_dir)
+    manifest_path = ariadne_results_path(iter_dir)
+    if not manifest_path.is_file():
+        print(
+            "ARIADNE results manifest not found: " + str(manifest_path),
+            file=_sys.stderr,
+        )
+        return 3
     try:
         from ..sampling_protocol import (
+            load_sampling_protocol,
             phase_b_min_separation_from_resolved,
-            resolve_sampling_protocol,
         )
 
-        resolved_protocol = resolve_sampling_protocol(
+        resolved_protocol = load_sampling_protocol(
             campaign,
             config,
             iteration=int(args.iteration),
@@ -767,13 +785,6 @@ def _run_phase_b(args, campaign, config):
             + type(exc).__name__
             + ": "
             + str(exc),
-            file=_sys.stderr,
-        )
-        return 3
-    manifest_path = ariadne_results_path(iter_dir)
-    if not manifest_path.is_file():
-        print(
-            "ARIADNE results manifest not found: " + str(manifest_path),
             file=_sys.stderr,
         )
         return 3
@@ -805,6 +816,7 @@ def _run_phase_b(args, campaign, config):
     if not candidate_frames:
         print("ARIADNE results manifest has no accepted candidates", file=_sys.stderr)
         return 3
+    all_ariadne_candidate_records = [dict(record) for record in candidate_records]
 
     safety_filter = {
         "enabled": False,
@@ -882,8 +894,8 @@ def _run_phase_b(args, campaign, config):
     # anti-overlap case (d): drop any selected candidate that lands too
     # close to an existing training point. In scaled mode the configured
     # threshold is dimensionless and is multiplied by the iteration scale.
-    final_path = iter_dir / "phase_b_SAMPLE.xyz"
-    dedup_path = iter_dir / "phase_b_dedup.json"
+    final_path = phase_b_dir / "selected.xyz"
+    manifest_diagnostic_path = phase_b_dir / "SELECTION.json"
     try:
         training = _load_committed_reference_data(campaign) if min_sep > 0.0 else []
     except Exception as exc:
@@ -914,8 +926,8 @@ def _run_phase_b(args, campaign, config):
         min_separation=min_sep,
         target_size=n_select,
     )
-    iter_dir.mkdir(parents=True, exist_ok=True)
-    raw_path = iter_dir / "phase_b_SAMPLE_raw.xyz"
+    phase_b_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = phase_b_dir / "selected_raw.xyz"
     _write_xyz_file(selected_frames, raw_path)
     relaxation = {
         "applied": False,
@@ -976,47 +988,46 @@ def _run_phase_b(args, campaign, config):
         else []
     )
     dedup_payload = {
-        "kept_indices": list(report.kept_indices),
-        "dropped_indices": list(report.dropped_indices),
+        "kept_raw_indexes_zero_based": list(report.kept_indices),
+        "dropped_raw_indexes_zero_based": list(report.dropped_indices),
         "distances_to_nearest": list(report.distances_to_nearest),
         "min_separation": report.min_separation,
         "threshold_mode": threshold_mode,
         "effective_min_separation_angstrom": float(min_sep),
         "scaled_distances_to_nearest": list(scaled_nearest),
         "novelty_scores": list(novelty_scores),
-        "geometry_novelty_scale": geometry_scale_payload,
-        "sampling_protocol": {
-            "sampling_aggressiveness": int(
-                resolved_protocol.sampling_aggressiveness
-            ),
-            "resolved_manifest": (
-                None if resolved_protocol.manifest_path is None
-                else str(resolved_protocol.manifest_path.resolve())
-            ),
-            "scale_model_manifest": (
-                None if resolved_protocol.scale_model_path is None
-                else str(resolved_protocol.scale_model_path.resolve())
-            ),
-            "audit_manifest": (
-                None if resolved_protocol.audit_manifest_path is None
-                else str(resolved_protocol.audit_manifest_path.resolve())
-            ),
-            "hidden_overrides_detected": list(
-                resolved_protocol.hidden_overrides_detected
-            ),
-        },
-        "sampling_scale_model": dict(resolved_protocol.scale_model_payload),
         "relaxation": relaxation,
         "refill": refill,
         "n_kept": report.n_kept,
         "n_dropped": report.n_dropped,
         "n_candidates": len(selected_frames),
         "n_safe_candidates": len(candidate_frames),
-        "fps_order": [int(i) for i in ordered_sel.indices],
-        "considered_candidate_indices": [int(i) for i in selected_candidate_indices],
+        "fps_candidate_pool_indexes_zero_based": [int(i) for i in ordered_sel.indices],
+        "considered_candidate_pool_indexes_zero_based": [
+            int(i) for i in selected_candidate_indices
+        ],
         "descriptor_used": descriptor.name,
     }
-    atomic_write_json(dedup_path, _phase_b_json_safe(dedup_payload))
+    def write_phase_b_failure(reason: str) -> Path:
+        return write_phase_b_selection_manifest(
+            iter_dir,
+            _phase_b_json_safe({
+                "schema_version": PHASE_B_SELECTION_SCHEMA_VERSION,
+                "iteration": int(args.iteration),
+                "status": "failed",
+                "failure_reason": str(reason),
+                "descriptor": str(descriptor.name),
+                "source_ariadne_manifest": "ariadne/RESULTS.json",
+                "n_candidates": int(len(candidate_frames)),
+                "n_selected_raw": 0,
+                "n_kept": 0,
+                "raw": [],
+                "final": [],
+                "dedup": dedup_payload,
+                "refill": refill,
+                "safety_filter": safety_filter,
+            }),
+        )
     if bool(relaxation.get("applied", False)):
         _append_phase_b_journal_event(
             campaign,
@@ -1031,6 +1042,7 @@ def _run_phase_b(args, campaign, config):
             n_candidates=int(len(selected_frames)),
         )
     if int(report.n_kept) <= 0:
+        write_phase_b_failure("no_non_duplicate_candidate")
         if threshold_mode == "scaled":
             print(
                 "phase_b_geometry_novelty_no_non_duplicate_candidate: "
@@ -1039,7 +1051,7 @@ def _run_phase_b(args, campaign, config):
                 + " candidates; every candidate was an exact duplicate, "
                 + "non-finite, or below the scaled novelty threshold; "
                 + "diagnostics written to "
-                + str(dedup_path),
+                + str(manifest_diagnostic_path),
                 file=_sys.stderr,
             )
             return 3
@@ -1048,11 +1060,12 @@ def _run_phase_b(args, campaign, config):
             + "kept 0/"
             + str(len(selected_frames))
             + " candidates after anti-overlap; diagnostics written to "
-            + str(dedup_path),
+            + str(manifest_diagnostic_path),
             file=_sys.stderr,
         )
         return 3
     if int(report.n_kept) < int(config.point_allocation.batch_total_size):
+        write_phase_b_failure("point_allocation_underfilled_after_anti_overlap")
         print(
             "phase_b_point_allocation_underfilled_after_anti_overlap: wanted "
             + str(int(config.point_allocation.batch_total_size))
@@ -1064,7 +1077,7 @@ def _run_phase_b(args, campaign, config):
             + str(len(candidate_frames))
             + " safe reserve candidates"
             + "; diagnostics written to "
-            + str(dedup_path),
+            + str(manifest_diagnostic_path),
             file=_sys.stderr,
         )
         return 3
@@ -1077,11 +1090,13 @@ def _run_phase_b(args, campaign, config):
     final_records = []
     for raw_index, rec in enumerate(selected_records):
         out_rec = dict(rec)
-        out_rec["candidate_index"] = int(selected_candidate_indices[raw_index])
-        out_rec["raw_index"] = int(raw_index)
+        out_rec["candidate_pool_index_zero_based"] = int(
+            selected_candidate_indices[raw_index]
+        )
+        out_rec["raw_rank"] = int(raw_index) + 1
         out_rec["kept_after_dedup"] = int(raw_index) in kept_lookup
-        out_rec["final_index"] = (
-            int(kept_lookup[int(raw_index)])
+        out_rec["final_rank"] = (
+            int(kept_lookup[int(raw_index)]) + 1
             if int(raw_index) in kept_lookup else None
         )
         out_rec["drop_reason"] = None if out_rec["kept_after_dedup"] else "min_separation"
@@ -1123,10 +1138,56 @@ def _run_phase_b(args, campaign, config):
             point_allocation_path,
             stable_candidate_id,
         )
+        from ..versioning.provenance import (
+            enrich_with_phase_b,
+            enrich_with_point_allocation,
+        )
 
         state = read_state(
             campaign / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
         )
+
+        def candidate_id_for(record):
+            source_identity = {
+                "seed_id": int(record["seed_id"]),
+                "seed_uid": str(record["seed_uid"]),
+                "seed_frame_id": record.get("seed_frame_id"),
+                "result_sha256": str(record.get("result_sha256") or ""),
+            }
+            return stable_candidate_id(
+                campaign_uid=str(state.campaign_uid),
+                context="active",
+                iteration=int(args.iteration),
+                source_identity=source_identity,
+            )
+
+        primary_rank_by_uid = {
+            str(record["seed_uid"]): rank
+            for rank, record in enumerate(final_records, start=1)
+        }
+        reserve_rank_by_uid = {
+            str(record["seed_uid"]): rank
+            for rank, record in enumerate(reserve["records"], start=1)
+        }
+        candidate_id_by_uid = {
+            str(record["seed_uid"]): candidate_id_for(record)
+            for record in all_ariadne_candidate_records
+        }
+        for record in all_ariadne_candidate_records:
+            uid = str(record["seed_uid"])
+            seed_dir = Path(str(record.get("seed_dir") or ""))
+            if not seed_dir.is_dir() or seed_dir.is_symlink():
+                raise FileNotFoundError(
+                    "Phase B candidate seed directory is invalid: " + str(seed_dir)
+                )
+            enrich_with_phase_b(
+                seed_dir,
+                selected_after_fps=(uid in primary_rank_by_uid),
+                diversity_rank=primary_rank_by_uid.get(uid),
+                descriptor_used=str(descriptor.name),
+                candidate_id=candidate_id_by_uid[uid],
+                reserve_candidate=(uid in reserve_rank_by_uid),
+            )
 
         def allocation_candidate(record, *, reserve_rank=None, distance=None):
             provenance_path = Path(str(record.get("provenance_json") or ""))
@@ -1134,22 +1195,10 @@ def _run_phase_b(args, campaign, config):
                 raise FileNotFoundError(
                     "Phase B candidate provenance is missing: " + str(provenance_path)
                 )
-            provenance_sha = hashlib.sha256(provenance_path.read_bytes()).hexdigest()
-            source_identity = {
-                "seed_index": int(record.get("seed_index")),
-                "seed_frame_id": record.get("seed_frame_id"),
-                "result_json": str(record.get("result_json") or ""),
-            }
             out = dict(record)
-            out["candidate_id"] = stable_candidate_id(
-                campaign_uid=str(state.campaign_uid),
-                context="active",
-                iteration=int(args.iteration),
-                source_identity=source_identity,
-            )
-            out["provenance_sha256"] = provenance_sha
+            out["candidate_id"] = candidate_id_by_uid[str(record["seed_uid"])]
             if reserve_rank is not None:
-                out["reserve_rank"] = int(reserve_rank)
+                out["reserve_rank"] = int(reserve_rank) + 1
             if distance is not None:
                 out["distance_to_nearest_angstrom"] = float(distance)
             return _phase_b_json_safe(out)
@@ -1187,9 +1236,61 @@ def _run_phase_b(args, campaign, config):
             }
             for slot in allocation["slots"]
         }
-        final_records = [
+        final_records_with_slots = [
             {**record, **slot_by_candidate[str(record["candidate_id"])]}
             for record in primary_allocation_records
+        ]
+        assignment_sha = str(allocation["slot_assignment_sha256"])
+        final_records = []
+        for record in final_records_with_slots:
+            seed_dir = Path(str(record["seed_dir"]))
+            enrich_with_point_allocation(
+                seed_dir,
+                candidate_id=str(record["candidate_id"]),
+                context="active",
+                slot_id=int(record["slot_id"]),
+                split=str(record["split"]),
+                replacement_round=0,
+                allocation_slot_assignment_sha256=assignment_sha,
+            )
+            provenance_path = Path(str(record["provenance_json"]))
+            final_records.append({
+                **record,
+                "provenance_sha256": hashlib.sha256(
+                    provenance_path.read_bytes()
+                ).hexdigest(),
+            })
+        final_by_uid = {
+            str(record["seed_uid"]): dict(record) for record in final_records
+        }
+        raw_records = [
+            {
+                **record,
+                "candidate_id": candidate_id_by_uid[str(record["seed_uid"])],
+                "provenance_sha256": hashlib.sha256(
+                    Path(str(record["provenance_json"])).read_bytes()
+                ).hexdigest(),
+            }
+            for record in raw_records
+        ]
+
+        def iteration_relative_record(record):
+            out = dict(record)
+            for key in ("seed_dir", "result_json", "provenance_json", "output_manifest"):
+                if out.get(key):
+                    out[key] = Path(str(out[key])).resolve().relative_to(
+                        iter_dir.resolve()
+                    ).as_posix()
+            return out
+
+        raw_records = [iteration_relative_record(record) for record in raw_records]
+        final_records = [
+            iteration_relative_record(final_by_uid[str(record["seed_uid"])])
+            for record in final_records
+        ]
+        reserve_allocation_records = [
+            iteration_relative_record(record)
+            for record in reserve_allocation_records
         ]
     except Exception as exc:
         print(
@@ -1198,13 +1299,47 @@ def _run_phase_b(args, campaign, config):
             file=_sys.stderr,
         )
         return 3
+    def protocol_file_binding(path: Path) -> Dict[str, Any]:
+        resolved = Path(path).resolve()
+        return {
+            "path": resolved.relative_to(iter_dir.resolve()).as_posix(),
+            "size": int(resolved.stat().st_size),
+            "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest(),
+        }
+
     phase_b_manifest = {
         "schema_version": PHASE_B_SELECTION_SCHEMA_VERSION,
+        "status": "complete",
+        "campaign_uid": str(state.campaign_uid),
         "iteration": int(args.iteration),
         "descriptor": str(descriptor.name),
-        "source_ariadne_manifest": str((iter_dir / "ARIADNE_RESULTS.json").resolve()),
+        "sampling_protocol": {
+            "sampling_aggressiveness": int(
+                resolved_protocol.sampling_aggressiveness
+            ),
+            "resolved": protocol_file_binding(resolved_protocol.manifest_path),
+            "audit": protocol_file_binding(resolved_protocol.audit_manifest_path),
+            "scale_model": protocol_file_binding(resolved_protocol.scale_model_path),
+        },
+        "source_ariadne_manifest": "ariadne/RESULTS.json",
+        "source_ariadne_manifest_sha256": hashlib.sha256(
+            manifest_path.read_bytes()
+        ).hexdigest(),
+        "selected_raw_xyz": {
+            "path": raw_path.resolve().relative_to(iter_dir.resolve()).as_posix(),
+            "size": int(raw_path.stat().st_size),
+            "sha256": hashlib.sha256(raw_path.read_bytes()).hexdigest(),
+        },
+        "selected_xyz": {
+            "path": final_path.resolve().relative_to(iter_dir.resolve()).as_posix(),
+            "size": int(final_path.stat().st_size),
+            "sha256": hashlib.sha256(final_path.read_bytes()).hexdigest(),
+        },
         "point_allocation": {
-            "manifest": str(allocation_path.resolve()),
+            "manifest": allocation_path.resolve().relative_to(
+                iter_dir.resolve()
+            ).as_posix(),
+            "slot_assignment_sha256": str(allocation["slot_assignment_sha256"]),
             "targets": dict(allocation["targets"]),
             "reserve": reserve_allocation_records,
             "reserve_count": int(len(reserve_allocation_records)),
@@ -1242,8 +1377,8 @@ def main(argv=None) -> int:
     (initial pool sub-sample, run once at the start of a campaign) and
     Phase B (per-iteration sub-sample over the adversarial pool).
 
-    --iteration < 0 means Phase A on the trajectory pool.
-    --iteration >= 0 means Phase B for that iteration.
+    --iteration 0 means Phase A on the trajectory pool.
+    --iteration >= 1 means Phase B for that active iteration.
 
     Exit codes:
       0 -- success, sample xyz + index files written.
@@ -1259,7 +1394,7 @@ def main(argv=None) -> int:
         description=(
             "Run POLUS diversity sub-sampling for either the initial "
             "pool (Phase A) or the per-iteration adversarial pool "
-            "(Phase B). Negative --iteration means Phase A."
+            "(Phase B). Iteration zero means Phase A."
         ),
     )
     parser.add_argument(
@@ -1269,7 +1404,7 @@ def main(argv=None) -> int:
     )
     parser.add_argument(
         "--iteration", type=int, required=True,
-        help="Campaign iteration. Negative value means Phase A on the initial pool.",
+        help="Campaign iteration. Zero means Phase A; positive values mean Phase B.",
     )
     parser.add_argument(
         "--campaign-dir", type=str, required=True,
@@ -1306,8 +1441,11 @@ def main(argv=None) -> int:
             file=_sys.stderr,
         )
 
-    if int(args.iteration) < 0:
+    if int(args.iteration) == 0:
         return _run_phase_a(campaign, config)
+    if int(args.iteration) < 0:
+        print("iteration must be >= 0", file=_sys.stderr)
+        return 2
     return _run_phase_b(args, campaign, config)
 
 

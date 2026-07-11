@@ -8,7 +8,7 @@
 
 What the dry-run executor DOES exercise (real, no mocking):
 
-    * Directory layout setup (QM_REFERENCE_DATA/, TRAINED_MODELS/, 7_ACTIVE_LEARNING/,
+    * Directory layout setup (QM_REFERENCE_DATA/, TRAINED_MODELS/, ACTIVE_LEARNING/,
       .DATA/SCRIPTS/).
     * VersionedDirectory (stage, commit, update_current, manifest writes,
       atomic renames).
@@ -50,10 +50,23 @@ from ..versioning.provenance import (
     load_training_seed_frame_ids,
     write_seed_provenance,
 )
+from ..versioning.manifest import sha256_file
 from ..versioning.reference_data import ReferenceDataVersioning
 from ..versioning.trained_models import TrainedModelVersioning
 from ..versioning.versioned_directory import VersionedDirectory
-from ..layout import QM_REFERENCE_DATA_DIRNAME, TRAINED_MODELS_DIRNAME
+from ..layout import (
+    ACTIVE_LEARNING_DIRNAME,
+    BOOTSTRAP_DIRNAME,
+    QM_REFERENCE_DATA_DIRNAME,
+    TRAINED_MODELS_DIRNAME,
+    active_iteration_dir,
+    active_learning_dir,
+    active_seed_selection_dir,
+    ariadne_seed_dir,
+    ariadne_seeds_dir,
+    bootstrap_dir,
+    bootstrap_selection_dir,
+)
 from .phase_executor import (
     BackendSubmissionError,
     FailureAction,
@@ -61,7 +74,7 @@ from .phase_executor import (
     PhaseResult,
     SBATCH_PHASES,
 )
-from .state import CampaignPhase, atomic_write_json
+from .state import CampaignPhase, atomic_write_json, atomic_write_text
 
 
 __all__ = [
@@ -81,6 +94,24 @@ def anti_overlap_whitened_distance_bounds(config: CampaignConfig) -> tuple[float
     )
 
 
+def _frames_to_xyz(frames: Sequence[Any], comments: Sequence[str]) -> str:
+    if len(frames) != len(comments):
+        raise ValueError("XYZ frame/comment count mismatch")
+    lines: List[str] = []
+    for frame, comment in zip(frames, comments):
+        lines.extend((str(len(frame)), str(comment)))
+        for atom in frame:
+            lines.append(
+                "{atom} {x:.12f} {y:.12f} {z:.12f}".format(
+                    atom=str(atom.type),
+                    x=float(atom.x),
+                    y=float(atom.y),
+                    z=float(atom.z),
+                )
+            )
+    return "\n".join(lines) + "\n"
+
+
 @dataclass
 class DryRunPhaseExecutor:
     """PhaseExecutor that drives the full file-system flow with stub artefacts."""
@@ -90,8 +121,8 @@ class DryRunPhaseExecutor:
     rng_seed: int = 0
     reference_data_dir_name: str = QM_REFERENCE_DATA_DIRNAME
     models_dir_name: str = TRAINED_MODELS_DIRNAME
-    diversity_dir_name: str = "3_DIVERSITY_SAMPLING"
-    al_dir_name: str = "7_ACTIVE_LEARNING"
+    diversity_dir_name: str = BOOTSTRAP_DIRNAME
+    al_dir_name: str = ACTIVE_LEARNING_DIRNAME
     scripts_dir: Path = field(init=False)
     artefact_log: List[str] = field(default_factory=list)
 
@@ -104,8 +135,8 @@ class DryRunPhaseExecutor:
         self.scripts_dir.mkdir(parents=True, exist_ok=True)
         (self.campaign_dir / self.reference_data_dir_name).mkdir(parents=True, exist_ok=True)
         (self.campaign_dir / self.models_dir_name).mkdir(parents=True, exist_ok=True)
-        (self.campaign_dir / self.diversity_dir_name).mkdir(parents=True, exist_ok=True)
-        (self.campaign_dir / self.al_dir_name).mkdir(parents=True, exist_ok=True)
+        bootstrap_dir(self.campaign_dir).mkdir(parents=True, exist_ok=True)
+        active_learning_dir(self.campaign_dir).mkdir(parents=True, exist_ok=True)
         self._rng = random.Random(self.rng_seed)
 
     # --- PhaseExecutor protocol ----------------------------------------
@@ -252,7 +283,6 @@ class DryRunPhaseExecutor:
         )
         from .live_executor import _write_ferebus_task_artefact_layout
         from .model_contract import validate_ferebus_model_contract
-        from ..versioning.manifest import sha256_file
         from ..versioning.trained_models import (
             seal_trained_model_version,
             trained_models_commit_lock,
@@ -582,37 +612,144 @@ class DryRunPhaseExecutor:
         except Exception as exc:
             return None, "error:" + type(exc).__name__
 
+    def _ensure_dry_run_trajectory_pool(self):
+        """Create a deterministic canonical pool when a dry campaign has none."""
+        from ..acquisition.trajectory_pool import TrajectoryPool
+
+        try:
+            return TrajectoryPool.load(self.campaign_dir)
+        except FileNotFoundError:
+            pass
+
+        bootstrap_total = int(self.config.point_allocation.bootstrap_total_size)
+        active_total = (
+            int(self.config.max_iterations)
+            * int(self.config.seed_selection.n_seeds_per_iteration)
+        )
+        n_frames = max(32, bootstrap_total + active_total)
+        source = (
+            self.campaign_dir
+            / ".DATA"
+            / "STAGING"
+            / "dry_run_trajectory_pool.xyz"
+        )
+        source.parent.mkdir(parents=True, exist_ok=True)
+        lines = []
+        for frame_id in range(n_frames):
+            bond_shift = 0.001 * float(frame_id % 7)
+            bend_shift = 0.002 * float(frame_id % 11)
+            out_of_plane = 0.003 * float((frame_id % 3) - 1)
+            lines.extend(
+                [
+                    "3",
+                    "dry-run synthetic water frame " + str(frame_id),
+                    "O 0.0 0.0 0.0",
+                    "H " + str(0.9572 + bond_shift) + " 0.0 0.0",
+                    "H "
+                    + str(-0.2399872 + bend_shift)
+                    + " "
+                    + str(0.927297 + bond_shift)
+                    + " "
+                    + str(out_of_plane),
+                ]
+            )
+        atomic_write_text(source, "\n".join(lines) + "\n")
+        pool = TrajectoryPool.import_from(source, self.campaign_dir)
+        self._journal_event(
+            "dry_run_trajectory_pool_created",
+            n_frames=int(pool.n_frames()),
+            trajectory_sha256=str(pool.sha256),
+        )
+        return pool
+
     def _inline_seed_select(self, state) -> Dict[str, Any]:
         """Current wiring: SEED_SELECT invokes :func:'select_seeds' against the
         canonical trajectory pool (if imported) with 'forbidden_frame_ids' =
         (committed-training seeds) | (recent-seeds cooldown cache).
 
         Behaviour:
-          * If no trajectory pool is present (legacy dry-run without
-            'ichor-al-daemon init'), writes a placeholder seeds.xyz
-            and journals 'seed_selected' with 'pool_available=False'. This
-            preserves the existing test_dry_run_executor.py contract.
+          * If no trajectory pool is present, imports a deterministic synthetic
+            water pool through the canonical immutable-pool contract.
           * If a pool IS present, treats every frame as an eligible seed
             row, uses a uniform-variance stub posterior (the real
             TotalEnergyPosterior only kicks in once the live executor
             has real FEREBUS models to lean on), and
-            writes a seeds_picked.json artefact in the iteration dir so
+            writes the seed_selection/SELECTION.json artefact so
             ARIADNE post-processing can stamp the real seed_frame_id into
             the per-pointdir provenance.
         """
         from ..acquisition.seed_selection import select_seeds
         from ..acquisition.trajectory_pool import TrajectoryPool
+        from ..handoff_manifests import (
+            SEED_SELECTION_SCHEMA_VERSION,
+            seeds_picked_path,
+        )
 
         iter_dir = self._iter_dir(state.iteration)
-        seeds_path = iter_dir / "seeds.xyz"
+        selection_dir = active_seed_selection_dir(iter_dir)
+        selection_dir.mkdir(parents=True, exist_ok=True)
+        seeds_path = selection_dir / "seeds.xyz"
+        selection_path = seeds_picked_path(iter_dir)
         # re-entry guard: if this iteration's seeds were already picked (a
-        # crash-retry after seeds_picked.json was written) don't pick again --
+        # crash retry after SELECTION.json was written) do not pick again --
         # re-selecting would choose different frames and burn cooldown slots on
         # the abandoned ones. selection stays idempotent on re-run.
-        if (iter_dir / "seeds_picked.json").is_file():
+        if selection_path.is_file():
             from ..handoff_manifests import load_seeds_picked
+            from ..seed_identity import (
+                read_ariadne_task_map,
+                write_ariadne_task_map,
+            )
 
             picked = load_seeds_picked(iter_dir, expected_iteration=int(state.iteration))
+            if str(picked["campaign_uid"]) != str(state.campaign_uid):
+                raise BackendSubmissionError(
+                    "existing seed selection campaign UID does not match state"
+                )
+            if int(picked["models_version"]) != int(state.models_version):
+                raise BackendSubmissionError(
+                    "existing seed selection model version does not match state"
+                )
+            pool = self._ensure_dry_run_trajectory_pool()
+            if str(picked["trajectory_sha256"]) != str(pool.sha256):
+                raise BackendSubmissionError(
+                    "existing seed selection trajectory SHA does not match the pool"
+                )
+            pool_frames = pool.to_atoms_list()
+            picked_records = list(picked["seed_records"])
+            try:
+                selected_frames = [
+                    pool_frames[int(record["pool_row_index_zero_based"])]
+                    for record in picked_records
+                ]
+            except (IndexError, KeyError, TypeError, ValueError) as exc:
+                raise BackendSubmissionError(
+                    "existing seed selection contains an invalid pool row"
+                ) from exc
+            if seeds_path.is_symlink():
+                raise BackendSubmissionError(
+                    "refusing to replace symlinked seed-selection XYZ"
+                )
+            comments = [
+                "active iteration "
+                + str(int(state.iteration))
+                + " seed "
+                + str(int(record["seed_id"]))
+                + " frame_id="
+                + str(record.get("frame_id"))
+                for record in picked_records
+            ]
+            atomic_write_text(seeds_path, _frames_to_xyz(selected_frames, comments))
+            from ..handoff_manifests import ariadne_task_map_path
+
+            task_map_path = ariadne_task_map_path(iter_dir)
+            if task_map_path.is_file() or task_map_path.is_symlink():
+                read_ariadne_task_map(
+                    iter_dir,
+                    expected_iteration=int(state.iteration),
+                )
+            else:
+                write_ariadne_task_map(iter_dir, picked)
             history = load_recent_seeds_payload(self.campaign_dir).get("history", [])
             has_current = any(
                 isinstance(entry, dict)
@@ -635,26 +772,7 @@ class DryRunPhaseExecutor:
         # refresh reference scales per acquisition.references.refresh_policy.
         self._maybe_refresh_reference_scales(state)
 
-        try:
-            pool = TrajectoryPool.load(self.campaign_dir)
-        except FileNotFoundError:
-            seeds_path.write_text(
-                "# DRYRUN seed selection for iteration "
-                + str(state.iteration) + "\n"
-                + "# n_seeds_per_iteration = "
-                + str(self.config.seed_selection.n_seeds_per_iteration) + "\n"
-                + "# pool_available=False (no .DATA/TRAJECTORY/pool.xyz imported)\n",
-                encoding="utf-8",
-            )
-            self.artefact_log.append(str(seeds_path))
-            self._journal_event(
-                "seed_selected",
-                iteration=int(state.iteration),
-                pool_available=False,
-                n_picked=0,
-                forbidden_set_size=0,
-            )
-            return {}
+        pool = self._ensure_dry_run_trajectory_pool()
 
         # anti-overlap case (a): forbid frame_ids already used to seed a committed training point.
         # honour the config switch -- it used to be hardcoded on, so an operator setting
@@ -745,10 +863,11 @@ class DryRunPhaseExecutor:
             if isinstance(row, dict) and row.get("selection_index") is not None
         }
 
-        for seed_index, frame_id in enumerate(selection.frame_ids):
-            selection_index = int(selection.indices[seed_index])
-            if seed_index < len(selection.selection_origins):
-                origin = str(selection.selection_origins[seed_index])
+        for seed_position, frame_id in enumerate(selection.frame_ids):
+            seed_id = int(seed_position) + 1
+            selection_index = int(selection.indices[seed_position])
+            if seed_position < len(selection.selection_origins):
+                origin = str(selection.selection_origins[seed_position])
             elif selection_index in bulk_set:
                 origin = "bulk"
             elif selection_index in variance_set:
@@ -756,12 +875,12 @@ class DryRunPhaseExecutor:
             else:
                 origin = "unknown"
             variance_value = None
-            if seed_index < len(selection.variances):
-                variance_value = float(selection.variances[seed_index])
+            if seed_position < len(selection.variances):
+                variance_value = float(selection.variances[seed_position])
             record = {
-                "seed_index": int(seed_index),
+                "seed_id": int(seed_id),
                 "frame_id": frame_id if isinstance(frame_id, int) else None,
-                "selection_index": selection_index,
+                "pool_row_index_zero_based": selection_index,
                 "selection_origin": origin,
                 "variance_at_selection": variance_value,
             }
@@ -779,10 +898,20 @@ class DryRunPhaseExecutor:
                     record[key] = diag[key]
             seed_records.append(record)
 
-        seeds_picked_path = iter_dir / "seeds_picked.json"
+        model_version = int(getattr(state, "models_version", -1))
+        if model_version < 0:
+            raise BackendSubmissionError(
+                "seed selection requires a committed model version"
+            )
+        model_set = TrainedModelVersioning(
+            self.campaign_dir / self.models_dir_name
+        ).resolve(model_version, verification="deep")
         seeds_picked_payload = {
-            "schema_version": 1,
+            "schema_version": SEED_SELECTION_SCHEMA_VERSION,
+            "campaign_uid": str(state.campaign_uid),
             "iteration": int(state.iteration),
+            "models_version": int(model_version),
+            "model_manifest_sha256": str(model_set.head_manifest_sha256),
             "selection_strategy": str(self.config.seed_selection.strategy),
             "n_picked": int(selection.n),
             "frame_ids": list(selection.frame_ids),
@@ -790,7 +919,7 @@ class DryRunPhaseExecutor:
             "bulk_indices": list(selection.bulk_indices),
             "variance_indices": list(selection.variance_indices),
             "d_optimal_indices": [
-                int(rec["selection_index"])
+                int(rec["pool_row_index_zero_based"])
                 for rec in seed_records
                 if rec.get("selection_origin") == "d_optimal"
             ],
@@ -806,9 +935,6 @@ class DryRunPhaseExecutor:
             "score_source_reason": str(score_transform_reason),
             "trajectory_sha256": pool.sha256,
         }
-        atomic_write_json(seeds_picked_path, seeds_picked_payload)
-        from ..handoff_manifests import write_seed_selection_diagnostics
-
         diagnostics_payload = {
             "iteration": int(state.iteration),
             "strategy": str(self.config.seed_selection.strategy),
@@ -831,21 +957,42 @@ class DryRunPhaseExecutor:
             "selected": seed_records,
             "summary": dict(selection.diagnostics),
         }
-        seed_diag_path = write_seed_selection_diagnostics(iter_dir, diagnostics_payload)
+        seeds_picked_payload["diagnostics"] = diagnostics_payload
+        from ..seed_identity import (
+            deterministic_seed_uid,
+            selection_fingerprint_sha256,
+            write_ariadne_task_map,
+        )
 
-        lines_out = [
-            "# DRYRUN seed selection for iteration " + str(state.iteration),
-            "# pool_available=True n_picked=" + str(selection.n)
-            + " forbidden_set_size=" + str(len(forbidden))
-            + " skipped_unknown_provenance="
-            + str(selection.skipped_unknown_provenance),
+        fingerprint = selection_fingerprint_sha256(seeds_picked_payload)
+        seeds_picked_payload["selection_fingerprint_sha256"] = fingerprint
+        for record in seed_records:
+            record["seed_uid"] = deterministic_seed_uid(
+                campaign_uid=str(state.campaign_uid),
+                iteration=int(state.iteration),
+                seed_id=int(record["seed_id"]),
+                frame_id=record.get("frame_id"),
+                models_version=int(model_version),
+                model_manifest_sha256=str(model_set.head_manifest_sha256),
+                selection_fingerprint_sha256_value=fingerprint,
+            )
+        selected_frames = [training_atoms[int(index)] for index in selection.indices]
+        comments = [
+            "active iteration "
+            + str(int(state.iteration))
+            + " seed "
+            + str(seed_id)
+            + " frame_id="
+            + str(selection.frame_ids[seed_id - 1])
+            for seed_id in range(1, int(selection.n) + 1)
         ]
-        for k, fid in enumerate(selection.frame_ids):
-            lines_out.append("# seed[" + str(k) + "].frame_id = " + str(fid))
-        seeds_path.write_text("\n".join(lines_out) + "\n", encoding="utf-8")
+        atomic_write_text(seeds_path, _frames_to_xyz(selected_frames, comments))
+        selection_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(selection_path, seeds_picked_payload)
+        task_map_path = write_ariadne_task_map(iter_dir, seeds_picked_payload)
         self.artefact_log.append(str(seeds_path))
-        self.artefact_log.append(str(seeds_picked_path))
-        self.artefact_log.append(str(seed_diag_path))
+        self.artefact_log.append(str(selection_path))
+        self.artefact_log.append(str(task_map_path))
 
         append_recent_seeds(
             self.campaign_dir,
@@ -960,10 +1107,12 @@ class DryRunPhaseExecutor:
 
     def _inline_split(self, state) -> Dict[str, Any]:
         """Persist a read-only view of the pre-QM exact slot allocation."""
+        from ..layout import active_allocation_dir
         from ..point_allocation import point_allocation_path, read_point_allocation
+        from ..versioning.manifest import sha256_file
 
         iter_dir = self._iter_dir(state.iteration)
-        split_path = iter_dir / "split.json"
+        split_path = active_allocation_dir(iter_dir) / "SPLIT_RECEIPT.json"
         allocation_path = point_allocation_path(
             self.campaign_dir,
             context="active",
@@ -979,13 +1128,17 @@ class DryRunPhaseExecutor:
             for slot in allocation["slots"]
         ]
         payload = {
-            "schema_version": 2,
+            "schema_version": 3,
             "strategy": "exact_pre_qm_point_allocation",
             "iteration": int(state.iteration),
-            "point_allocation_manifest": str(allocation_path.resolve()),
+            "point_allocation_manifest": allocation_path.resolve().relative_to(
+                iter_dir.resolve()
+            ).as_posix(),
+            "slot_assignment_sha256": str(allocation["slot_assignment_sha256"]),
             "targets": dict(allocation["targets"]),
             "slots": slots,
         }
+        split_path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_json(split_path, payload)
         self.artefact_log.append(str(split_path))
         return {}
@@ -996,26 +1149,28 @@ class DryRunPhaseExecutor:
 
         v = self._versioning("reference_data")
         committed = v.list_committed_versions()
-        state_version = int(getattr(state, "reference_data_version", 0))
+        iteration = int(state.iteration)
+        if iteration < 1:
+            raise BackendSubmissionError("APPEND requires active iteration >= 1")
+        state_version = int(getattr(state, "reference_data_version", -1))
         committed_max = max(committed) if committed else -1
-        if committed_max > state_version:
-            if int(committed_max) != int(state_version) + 1:
-                raise BackendSubmissionError(
-                    "reference_data_version_gap: state="
-                    + str(state_version)
-                    + " committed_versions="
-                    + repr(committed)
-                )
-            target_version = int(committed_max)
-        elif committed_max < state_version:
+        if committed != list(range(committed_max + 1)):
             raise BackendSubmissionError(
-                "reference_data_version "
-                + str(state_version)
-                + " is ahead of committed reference-data versions "
+                "reference_data_version_gap: committed_versions=" + repr(committed)
+            )
+        if committed_max not in (iteration - 1, iteration):
+            raise BackendSubmissionError(
+                "APPEND reference-data head must be active iteration - 1 or iteration: "
                 + repr(committed)
             )
-        else:
-            target_version = int(committed_max) + 1
+        if state_version not in (iteration - 1, iteration):
+            raise BackendSubmissionError(
+                "APPEND state/reference-data version mismatch: state="
+                + str(state_version)
+                + " iteration="
+                + str(iteration)
+            )
+        target_version = iteration
         try:
             view, committed_pointdirs, created = _stg.commit_reference_data_delta(
                 self.campaign_dir,
@@ -1052,7 +1207,6 @@ class DryRunPhaseExecutor:
             expected_batch_total=int(self.config.point_allocation.batch_total_size),
             idempotent_skip=not bool(created),
         )
-        self.artefact_log.append(str(self._iter_dir(state.iteration) / "APPEND_marker"))
         return {"reference_data_version": int(target_version)}
 
     def _inline_stop_check(self, state):
@@ -1067,6 +1221,29 @@ class DryRunPhaseExecutor:
 
         Both gated by stop.min_iterations_before_stop.
         """
+        iteration = int(state.iteration)
+        if iteration < 1:
+            raise BackendSubmissionError("STOP_CHECK requires active iteration >= 1")
+        if (
+            int(state.reference_data_version) != iteration
+            or int(state.models_version) != iteration
+        ):
+            raise BackendSubmissionError(
+                "STOP_CHECK requires reference-data/model version equal to active iteration"
+            )
+        from ..versioning.sampling_iterations import finalise_active_iteration
+
+        iteration_manifest = finalise_active_iteration(
+            self.campaign_dir,
+            iteration,
+            str(state.campaign_uid),
+        )
+        self.artefact_log.append(str(iteration_manifest))
+        self._journal_event(
+            "active_iteration_finalised",
+            iteration=iteration,
+            manifest=str(iteration_manifest),
+        )
         stop = self.config.stop
         history = list(getattr(state, "alpha_history", None) or [])
         latest = getattr(state, "last_acquisition_alpha0", None)
@@ -1082,7 +1259,7 @@ class DryRunPhaseExecutor:
 
         shutdown = False
         reason = None
-        if int(state.iteration) + 1 >= int(stop.min_iterations_before_stop):
+        if int(state.iteration) >= int(stop.min_iterations_before_stop):
             n_streak = int(stop.alpha0_streak_length)
             if n_streak > 0 and len(history) >= n_streak:
                 tail = history[-n_streak:]
@@ -1123,7 +1300,7 @@ class DryRunPhaseExecutor:
         return updates
 
     def _iter_dir(self, iteration: int) -> Path:
-        d = self.campaign_dir / self.al_dir_name / ("iteration-" + str(iteration).zfill(4))
+        d = active_iteration_dir(self.campaign_dir, int(iteration))
         d.mkdir(parents=True, exist_ok=True)
         return d
 
@@ -1164,21 +1341,14 @@ class DryRunPhaseExecutor:
             stable_candidate_id,
         )
 
-        outdir = self.campaign_dir / self.diversity_dir_name / "initial"
+        outdir = bootstrap_selection_dir(self.campaign_dir)
         outdir.mkdir(parents=True, exist_ok=True)
         n = int(self.config.point_allocation.bootstrap_total_size)
         frames = []
         trajectory_sha = ""
-        try:
-            from ..acquisition.trajectory_pool import TrajectoryPool
-
-            pool = TrajectoryPool.load(self.campaign_dir)
-            frames = pool.to_atoms_list()
-            trajectory_sha = str(pool.sha256)
-        except Exception:
-            from ichor.core.atoms import Atom, Atoms
-
-            frames = [Atoms([Atom("H", float(i) * 0.01, 0.0, 0.0)]) for i in range(n)]
+        pool = self._ensure_dry_run_trajectory_pool()
+        frames = pool.to_atoms_list()
+        trajectory_sha = str(pool.sha256)
         anchor_plan, anchor_frames = plan_bootstrap_anchors(
             self.campaign_dir,
             self.config,
@@ -1197,7 +1367,7 @@ class DryRunPhaseExecutor:
         reserve_indices = available_pool_ids[pool_needed:]
         selected_frames = list(anchor_frames) + [frames[index] for index in selected_pool_indices]
         selected_indices = [None] * len(anchor_frames) + selected_pool_indices
-        sample = outdir / ("initial-SAMPLE-" + str(n) + ".xyz")
+        sample = outdir / "selected.xyz"
         xyz_lines = []
         for sample_index, frame in enumerate(selected_frames):
             frame_id = selected_indices[sample_index]
@@ -1214,7 +1384,7 @@ class DryRunPhaseExecutor:
                     + str(float(atom.z))
                 )
         sample.write_text("\n".join(xyz_lines) + "\n", encoding="utf-8", newline="\n")
-        index = outdir / ("initial-INDEX-" + str(n) + ".dat")
+        index = outdir / "selected_indices.dat"
         index_lines = []
         anchor_index = 0
         for value in selected_indices:
@@ -1298,9 +1468,9 @@ class DryRunPhaseExecutor:
         ]
         manifest = write_phase_a_sample_manifest(outdir, {
             "phase": "PHASE_A_POLUS",
-            "iteration": -1,
-            "sample_xyz": str(sample.resolve()),
-            "index_path": str(index.resolve()),
+            "iteration": 0,
+            "sample_xyz": sample.resolve().relative_to(outdir.parent.resolve()).as_posix(),
+            "index_path": index.resolve().relative_to(outdir.parent.resolve()).as_posix(),
             "n_select": int(n),
             "n_frames": int(n),
             "selected_indices": [
@@ -1310,7 +1480,9 @@ class DryRunPhaseExecutor:
             "n_pool_frames": int(len(frames)),
             "bootstrap_total_size": int(n),
             "point_allocation": {
-                "manifest": str(allocation_path.resolve()),
+                "manifest": allocation_path.resolve().relative_to(
+                    outdir.parent.resolve()
+                ).as_posix(),
                 "targets": dict(allocation["targets"]),
                 "primary": primary_records,
                 "reserve_frame_ids": reserve_indices,
@@ -1318,7 +1490,9 @@ class DryRunPhaseExecutor:
             },
             "reserve_after_bootstrap": int(len(reserve)),
             "trajectory_sha256": trajectory_sha,
-            "source_pool_manifest": "",
+            "source_pool_manifest": (
+                ".DATA/TRAJECTORY/pool.manifest.json"
+            ),
         })
         self.artefact_log.extend([str(sample), str(index), str(manifest)])
         return {}
@@ -1347,7 +1521,7 @@ class DryRunPhaseExecutor:
         """Commit initial reference data and a complete dry model snapshot.
 
         This is the first time the QM reference-data versioning is exercised; the
-        committed iteration-0000 holds the initial diverse sample's stub
+        committed iteration-000000 holds the initial diverse sample's stub
         PointDirectories.
         """
         v_train = self._versioning("reference_data")
@@ -1361,20 +1535,30 @@ class DryRunPhaseExecutor:
         v_train.ensure_current(0)
 
         self._commit_dry_model_snapshot(0)
+        from ..versioning.sampling_iterations import finalise_bootstrap
+
+        bootstrap_manifest = finalise_bootstrap(
+            self.campaign_dir,
+            str(state.campaign_uid),
+        )
+        self.artefact_log.append(str(bootstrap_manifest))
         return {"reference_data_version": 0, "models_version": 0}
 
     def _post_ariadne_array(self, state) -> Dict[str, Any]:
-        """Use the mock ARIADNE runner to produce per-seed result.json files
-        AND write a per-seed .provenance.json that the APPEND phase later
-        copies into the committed training pointdir."""
-        #ocal imports to avoid circular dependencies at module load time.
-        from ..acquisition.ariadne_runner import (
-            AriadneRunConfig,
-            optimise_seed,
+        """Publish mock seed outputs through the live ARIADNE contracts."""
+        import json
+        import os
+        import shutil
+
+        from ..acquisition.ariadne_runner import optimise_seed
+        from ..acquisition.trajectory_pool import TrajectoryPool
+        from ..ariadne_outputs import (
+            SEED_OUTPUT_MANIFEST_FILENAME,
+            SEED_RESULT_FILENAME,
+            validate_seed_output,
+            write_optimisation_trajectory,
+            write_seed_output_manifest,
         )
-        from ..geometry_novelty import geometry_novelty_scale_path
-        from ..sampling_protocol import resolve_sampling_protocol
-        from ichor.core.atoms import Atom, Atoms as IchorAtoms
         from ..handoff_manifests import (
             ARIADNE_RESULTS_SCHEMA_VERSION,
             acquisition_maturity_audit_payload,
@@ -1383,131 +1567,178 @@ class DryRunPhaseExecutor:
             write_ariadne_landing_audit,
             write_ariadne_results_manifest,
         )
+        from ..layout import active_ariadne_dir, ariadne_seed_dir
+        from ..sampling_protocol import resolve_or_load_sampling_protocol
+        from ..seed_identity import read_ariadne_task_map
+        from ..versioning.manifest import sha256_file
 
-        n_seeds = max(1, min(self.config.seed_selection.n_seeds_per_iteration, 4))
         iter_dir = self._iter_dir(state.iteration)
-        pool_dir = iter_dir / "pool"
-        pool_dir.mkdir(parents=True, exist_ok=True)
-        synthetic_seed = IchorAtoms([
-            Atom("O", 0.0, 0.0, 0.0),
-            Atom("H", 0.96, 0.0, 0.0),
-            Atom("H", -0.24, 0.93, 0.0),
-        ])
+        ariadne_root = active_ariadne_dir(iter_dir)
+        ariadne_root.mkdir(parents=True, exist_ok=True)
+        picked_payload = load_seeds_picked(
+            iter_dir,
+            expected_iteration=int(state.iteration),
+        )
+        task_map = read_ariadne_task_map(
+            iter_dir,
+            expected_iteration=int(state.iteration),
+        )
+        seed_records = list(picked_payload["seed_records"])
+        tasks = list(task_map["tasks"])
+        if len(seed_records) != len(tasks):
+            raise BackendSubmissionError("ARIADNE task map/selection count mismatch")
+        pool = TrajectoryPool.load(self.campaign_dir)
+        if str(pool.sha256) != str(picked_payload["trajectory_sha256"]):
+            raise BackendSubmissionError("ARIADNE dry-run trajectory SHA mismatch")
+
         last_alpha = 0.0
-        traj_sha = self._trajectory_sha256_if_available()
         campaign_uid = str(getattr(state, "campaign_uid", "") or "")
-        picked_frame_ids = self._read_picked_seed_frame_ids(state.iteration)
-        try:
-            picked_payload = load_seeds_picked(iter_dir, expected_iteration=int(state.iteration))
-            seed_records = list(picked_payload["seed_records"])
-            if seed_records:
-                n_seeds = min(n_seeds, len(seed_records))
-        except Exception:
-            picked_payload = {}
-            seed_records = [
-                {
-                    "seed_index": int(k),
-                    "frame_id": (
-                        picked_frame_ids[k]
-                        if k < len(picked_frame_ids) and isinstance(picked_frame_ids[k], int)
-                        else None
-                    ),
-                    "selection_index": int(k),
-                    "selection_origin": "bulk" if k % 2 == 0 else "variance",
-                    "variance_at_selection": None,
-                }
-                for k in range(n_seeds)
-            ]
         accepted_records = []
         landing_audit_records = []
         flagged_count = 0
-        resolved_protocol = resolve_sampling_protocol(
+        resolved_protocol = resolve_or_load_sampling_protocol(
             self.campaign_dir,
             self.config,
             iteration=int(state.iteration),
         )
-        geometry_scale_payload = dict(resolved_protocol.geometry_scale_payload)
-        self.artefact_log.append(str(geometry_novelty_scale_path(iter_dir)))
         if resolved_protocol.manifest_path is not None:
             self.artefact_log.append(str(resolved_protocol.manifest_path))
         if resolved_protocol.scale_model_path is not None:
             self.artefact_log.append(str(resolved_protocol.scale_model_path))
         if resolved_protocol.audit_manifest_path is not None:
             self.artefact_log.append(str(resolved_protocol.audit_manifest_path))
-        for k in range(n_seeds):
-            seed_record = seed_records[k]
-            seed_frame_id = (
-                seed_record.get("frame_id")
-                if isinstance(seed_record.get("frame_id"), int)
-                else None
-            )
-            seed_dir = pool_dir / ("seed_" + str(k).zfill(4))
-            seed_dir.mkdir(exist_ok=True)
-            result = optimise_seed(
-                models=None,
-                seed=synthetic_seed,
-                trajectory=[synthetic_seed],
-                run_config=replace(
-                    resolved_protocol.ariadne_run_config,
-                    rng_seed=self.rng_seed + k,
-                ),
-                mock=True,
-            )
-            result_payload = result.to_dict()
-            result_payload["seed_frame_id"] = seed_frame_id
-            result_payload["seed_index"] = int(k)
-            result_payload["iteration"] = int(state.iteration)
-            result_payload["trajectory_sha256"] = str(picked_payload.get("trajectory_sha256", traj_sha))
-            result_payload["geometry_novelty_scale"] = dict(geometry_scale_payload)
-            result_payload["sampling_protocol"] = {
-                "sampling_aggressiveness": int(
-                    resolved_protocol.sampling_aggressiveness
-                ),
-                "resolved_manifest": (
-                    None if resolved_protocol.manifest_path is None
-                    else str(resolved_protocol.manifest_path.resolve())
-                ),
-                "scale_model_manifest": (
-                    None if resolved_protocol.scale_model_path is None
-                    else str(resolved_protocol.scale_model_path.resolve())
-                ),
-                "audit_manifest": (
-                    None if resolved_protocol.audit_manifest_path is None
-                    else str(resolved_protocol.audit_manifest_path.resolve())
-                ),
-                "hidden_overrides_detected": list(
-                    resolved_protocol.hidden_overrides_detected
-                ),
-            }
-            result_payload["sampling_scale_model"] = dict(
-                resolved_protocol.scale_model_payload
-            )
-            if isinstance(result_payload.get("selection_diagnostics"), dict):
-                result_payload["selection_diagnostics"]["model_version"] = int(
-                    getattr(state, "models_version", -1)
+
+        def protocol_binding(path):
+            if path is None:
+                raise BackendSubmissionError(
+                    "resolved sampling protocol artefact is missing"
                 )
-                result_payload["selection_diagnostics"]["seed_index"] = int(k)
-                result_payload["selection_diagnostics"]["seed_frame_id"] = seed_frame_id
-                result_payload["selection_diagnostics"]["result_json"] = str(
-                    (seed_dir / "result.json").resolve()
+            resolved = path.resolve()
+            return (
+                resolved.relative_to(self.campaign_dir.resolve()).as_posix(),
+                sha256_file(resolved),
+            )
+
+        resolved_manifest, resolved_manifest_sha256 = protocol_binding(
+            resolved_protocol.manifest_path
+        )
+        scale_model_manifest, scale_model_manifest_sha256 = protocol_binding(
+            resolved_protocol.scale_model_path
+        )
+        audit_manifest, audit_manifest_sha256 = protocol_binding(
+            resolved_protocol.audit_manifest_path
+        )
+        for array_task_id, (task, seed_record) in enumerate(zip(tasks, seed_records)):
+            seed_id = int(task["seed_id"])
+            seed_uid = str(task["seed_uid"])
+            if int(task["array_task_id"]) != array_task_id:
+                raise BackendSubmissionError("ARIADNE task IDs are not contiguous")
+            seed_frame_id = int(task["frame_id"])
+            seed_atoms = pool.frame(seed_frame_id)
+            seed_dir = ariadne_seed_dir(iter_dir, seed_id)
+            result_path = seed_dir / SEED_RESULT_FILENAME
+            if seed_dir.exists() or seed_dir.is_symlink():
+                existing_output = validate_seed_output(
+                    seed_dir,
+                    expected_campaign_uid=campaign_uid,
+                    expected_iteration=int(state.iteration),
+                    expected_seed_id=seed_id,
+                    expected_seed_uid=seed_uid,
+                    expected_array_task_id=array_task_id,
                 )
-                result_payload["selection_diagnostics"]["geometry_novelty_scale"] = dict(
-                    geometry_scale_payload
+                if not bool(existing_output["task_success"]) or int(
+                    existing_output["task_exit_code"]
+                ) != 0:
+                    raise BackendSubmissionError(
+                        "existing dry-run ARIADNE seed output records task failure"
+                    )
+                result_payload = json.loads(result_path.read_text(encoding="utf-8"))
+                result = None
+            else:
+                result = optimise_seed(
+                    models=None,
+                    seed=seed_atoms,
+                    trajectory=[seed_atoms],
+                    run_config=replace(
+                        resolved_protocol.ariadne_run_config,
+                        rng_seed=self.rng_seed + array_task_id,
+                    ),
+                    mock=True,
                 )
+                result_payload = result.to_dict()
+                result_payload.update({
+                    "seed_frame_id": seed_frame_id,
+                    "seed_id": seed_id,
+                    "seed_uid": seed_uid,
+                    "array_task_id": array_task_id,
+                    "iteration": int(state.iteration),
+                    "trajectory_sha256": str(picked_payload["trajectory_sha256"]),
+                    "sampling_protocol": {
+                        "sampling_aggressiveness": int(
+                            resolved_protocol.sampling_aggressiveness
+                        ),
+                        "resolved_manifest": resolved_manifest,
+                        "resolved_manifest_sha256": resolved_manifest_sha256,
+                        "scale_model_manifest": scale_model_manifest,
+                        "scale_model_manifest_sha256": scale_model_manifest_sha256,
+                        "audit_manifest": audit_manifest,
+                        "audit_manifest_sha256": audit_manifest_sha256,
+                        "hidden_overrides_detected": list(
+                            resolved_protocol.hidden_overrides_detected
+                        ),
+                    },
+                })
+                if isinstance(result_payload.get("selection_diagnostics"), dict):
+                    result_payload["selection_diagnostics"].update({
+                        "model_version": int(state.models_version),
+                        "seed_id": seed_id,
+                        "seed_uid": seed_uid,
+                        "array_task_id": array_task_id,
+                        "seed_frame_id": seed_frame_id,
+                    })
+                staging_dir = seed_dir.parent / ("." + seed_dir.name + ".partial-dry")
+                if staging_dir.exists() and not staging_dir.is_symlink():
+                    shutil.rmtree(staging_dir)
+                staging_dir.mkdir(parents=True, exist_ok=False)
+                atomic_write_json(staging_dir / SEED_RESULT_FILENAME, result_payload)
+                trajectory_coordinates = list(result.optimisation_trajectory_coordinates)
+                if not trajectory_coordinates:
+                    trajectory_coordinates = [
+                        np.asarray(seed_atoms.coordinates, dtype=float).tolist()
+                    ]
+                write_optimisation_trajectory(
+                    staging_dir,
+                    atom_types=[str(atom.type) for atom in seed_atoms],
+                    coordinate_frames=trajectory_coordinates,
+                    alpha_values=list(result.alpha_trajectory),
+                    gradient_norms=list(result.grad_norm_trajectory),
+                    origins=list(result.optimisation_trajectory_origins),
+                )
+                write_seed_output_manifest(
+                    staging_dir,
+                    campaign_uid=campaign_uid,
+                    iteration=int(state.iteration),
+                    seed_id=seed_id,
+                    seed_uid=seed_uid,
+                    array_task_id=array_task_id,
+                    task_success=True,
+                    task_exit_code=0,
+                )
+                os.replace(staging_dir, seed_dir)
             landing_safety = result_payload.get("landing_safety") or {
                 "accepted": True,
-                "policy": "mock_legacy_safe",
+                "policy": "mock_safe",
                 "reasons": [],
                 "record_only_reasons": ["synthetic_mock_safety_metrics"],
                 "metrics": {},
             }
             audit_record = {
-                "seed_index": int(k),
-                "seed_dir": str(seed_dir.resolve()),
-                "result_json": str((seed_dir / "result.json").resolve()),
+                "seed_id": seed_id,
+                "seed_uid": seed_uid,
+                "seed_dir": seed_dir.relative_to(ariadne_root).as_posix(),
+                "result_json": result_path.relative_to(ariadne_root).as_posix(),
                 "landing_safety": dict(landing_safety),
                 "landing_candidates": list(result_payload.get("landing_candidates") or []),
-                "geometry_novelty_scale": dict(geometry_scale_payload),
                 "handoff_accepted": True,
             }
             if isinstance(result_payload.get("selection_diagnostics"), dict):
@@ -1515,31 +1746,31 @@ class DryRunPhaseExecutor:
                     result_payload["selection_diagnostics"]
                 )
             landing_audit_records.append(audit_record)
-            atomic_write_json(seed_dir / "result.json", result_payload)
-            #initial provenance sidecar -- seed_frame_id is None in dry-run
-            #(synthetic seed; no pool involvement). Current wiring replaces None
-            #with the real frame_id chosen by select_seeds().
-            write_seed_provenance(
-                seed_dir,
-                campaign_uid=campaign_uid,
-                iteration=int(state.iteration),
-                trajectory_sha256=traj_sha,
-                seed_frame_id=seed_frame_id,
-                seed_selection_origin=str(seed_record.get("selection_origin", "unknown")),
-                seed_variance_at_selection=seed_record.get("variance_at_selection"),
-                subspace_neighbour_frame_ids=[],
-                subspace_dimension=0,
-                subspace_eigenvalues=[],
-                mode_weighting_policy=self._mode_weighting_policy_or_default(),
-            )
+            if not (seed_dir / PROVENANCE_FILENAME).is_file():
+                write_seed_provenance(
+                    seed_dir,
+                    campaign_uid=campaign_uid,
+                    iteration=int(state.iteration),
+                    trajectory_sha256=str(picked_payload["trajectory_sha256"]),
+                    seed_frame_id=seed_frame_id,
+                    seed_id=seed_id,
+                    seed_uid=seed_uid,
+                    array_task_id_zero_based=array_task_id,
+                    seed_selection_origin=str(seed_record["selection_origin"]),
+                    seed_variance_at_selection=seed_record.get("variance_at_selection"),
+                    subspace_neighbour_frame_ids=[],
+                    subspace_dimension=0,
+                    subspace_eigenvalues=[],
+                    mode_weighting_policy=self._mode_weighting_policy_or_default(),
+                )
             enrich_with_ariadne(
                 seed_dir,
-                alpha_initial=float(getattr(result, "alpha_initial", 0.0) or 0.0),
-                alpha_final=float(getattr(result, "alpha_final", 0.0) or 0.0),
-                n_evaluations=int(getattr(result, "n_evaluations", 0) or 0),
-                fell_back_to_ds=bool(getattr(result, "fell_back_to_ds", False)),
-                wall_seconds=float(getattr(result, "wall_seconds", 0.0) or 0.0),
-                return_code=int(getattr(result, "return_code", 0) or 0),
+                alpha_initial=float(result_payload.get("alpha_initial") or 0.0),
+                alpha_final=float(result_payload.get("alpha_final") or 0.0),
+                n_evaluations=int(result_payload.get("n_evaluations") or 0),
+                fell_back_to_ds=bool(result_payload.get("fell_back_to_ds", False)),
+                wall_seconds=float(result_payload.get("wall_seconds") or 0.0),
+                return_code=int(result_payload.get("return_code") or 0),
             )
             if isinstance(result_payload.get("selection_diagnostics"), dict):
                 enrich_with_error_calibration_input(
@@ -1549,7 +1780,9 @@ class DryRunPhaseExecutor:
             #synthesise a placeholder whitened distance from the
             # alpha change during ARIADNE descent; threshold against the
             # trust-region bounds. Live executor swaps in the real metric.
-            d_w = self._synthetic_whitened_distance(result)
+            d_w = result_payload.get("whitened_distance_final")
+            if d_w is None and result is not None:
+                d_w = self._synthetic_whitened_distance(result)
             flag = None
             if d_w is not None:
                 min_d, max_d = anti_overlap_whitened_distance_bounds(
@@ -1567,40 +1800,45 @@ class DryRunPhaseExecutor:
             )
             if flag is not None:
                 flagged_count += 1
-                _picked = picked_frame_ids[k] if k < len(picked_frame_ids) else None
                 self._journal_event(
                     "anti_overlap_flagged",
                     iteration=int(state.iteration),
-                    seed_index=int(k),
-                    seed_frame_id=(_picked if isinstance(_picked, int) else -1),
+                    seed_id=seed_id,
+                    seed_frame_id=seed_frame_id,
                     whitened_distance=float(d_w if d_w is not None else 0.0),
                     flag=str(flag),
                 )
-            if result.alpha_final is not None:
-                last_alpha = max(last_alpha, float(result.alpha_final))
-            self.artefact_log.append(str(seed_dir / "result.json"))
+            if result_payload.get("alpha_final") is not None:
+                last_alpha = max(last_alpha, float(result_payload["alpha_final"]))
+            self.artefact_log.append(str(result_path))
             self.artefact_log.append(str(seed_dir / PROVENANCE_FILENAME))
             accepted_records.append({
-                "seed_index": int(k),
-                "seed_dir": str(seed_dir.resolve()),
-                "result_json": str((seed_dir / "result.json").resolve()),
-                "provenance_json": str((seed_dir / PROVENANCE_FILENAME).resolve()),
+                "seed_id": seed_id,
+                "seed_uid": seed_uid,
+                "array_task_id": array_task_id,
+                "seed_dir": seed_dir.relative_to(ariadne_root).as_posix(),
+                "result_json": result_path.relative_to(ariadne_root).as_posix(),
+                "provenance_json": (seed_dir / PROVENANCE_FILENAME).relative_to(ariadne_root).as_posix(),
+                "output_manifest": (seed_dir / SEED_OUTPUT_MANIFEST_FILENAME).relative_to(ariadne_root).as_posix(),
                 "seed_frame_id": seed_frame_id,
-                "selection_index": int(seed_record.get("selection_index", k)),
-                "selection_origin": str(seed_record.get("selection_origin", "unknown")),
+                "pool_row_index_zero_based": int(seed_record["pool_row_index_zero_based"]),
+                "selection_origin": str(seed_record["selection_origin"]),
                 "variance_at_selection": seed_record.get("variance_at_selection"),
-                "alpha_initial": float(getattr(result, "alpha_initial", 0.0) or 0.0),
-                "alpha_final": float(getattr(result, "alpha_final", 0.0) or 0.0),
+                "alpha_initial": float(result_payload.get("alpha_initial") or 0.0),
+                "alpha_final": float(result_payload.get("alpha_final") or 0.0),
                 "whitened_distance_final": d_w,
                 "landing_safety": dict(landing_safety),
                 "landing_policy": str(landing_safety.get("policy", "unknown")),
-                "geometry_novelty_scale": dict(geometry_scale_payload),
                 "selection_diagnostics": (
                     dict(result_payload["selection_diagnostics"])
                     if isinstance(result_payload.get("selection_diagnostics"), dict)
                     else None
                 ),
-                "return_code": int(getattr(result, "return_code", 0) or 0),
+                "return_code": int(result_payload.get("return_code") or 0),
+                "result_sha256": sha256_file(result_path),
+                "output_manifest_sha256": sha256_file(
+                    seed_dir / SEED_OUTPUT_MANIFEST_FILENAME
+                ),
             })
         policies = {}
         for rec in landing_audit_records:
@@ -1630,9 +1868,14 @@ class DryRunPhaseExecutor:
         self.artefact_log.append(str(maturity_path))
         manifest_path = write_ariadne_results_manifest(iter_dir, {
             "schema_version": ARIADNE_RESULTS_SCHEMA_VERSION,
+            "campaign_uid": campaign_uid,
             "iteration": int(state.iteration),
-            "trajectory_sha256": str(picked_payload.get("trajectory_sha256", traj_sha)),
-            "expected_n": int(n_seeds),
+            "trajectory_sha256": str(picked_payload["trajectory_sha256"]),
+            "task_map": {
+                "path": "TASK_MAP.json",
+                "sha256": sha256_file(ariadne_root / "TASK_MAP.json"),
+            },
+            "expected_n": int(len(tasks)),
             "n_accepted": int(len(accepted_records)),
             "n_rejected": 0,
             "accepted": accepted_records,
@@ -1642,7 +1885,7 @@ class DryRunPhaseExecutor:
         self._journal_event(
             "subspace_built",
             iteration=int(state.iteration),
-            n_seeds=int(n_seeds),
+            n_seeds=int(len(tasks)),
         )
         return {
             "last_acquisition_alpha0": float(last_alpha),
@@ -1653,66 +1896,37 @@ class DryRunPhaseExecutor:
         }
 
     def _post_phase_b_polus(self, state) -> Dict[str, Any]:
-        from ..geometry_novelty import geometry_novelty_scale_path
-        from ..sampling_protocol import (
-            phase_b_min_separation_from_resolved,
-            resolve_sampling_protocol,
-        )
+        import hashlib
+
         from ..handoff_manifests import (
             PHASE_B_SELECTION_SCHEMA_VERSION,
-            read_ariadne_results_manifest,
+            ariadne_candidate_frames,
+            ariadne_results_path,
             write_phase_b_selection_manifest,
         )
-
-        iter_dir = self._iter_dir(state.iteration)
-        out = iter_dir / "phase_b_SAMPLE.xyz"
-        out.write_text(
-            "# DRYRUN POLUS Phase-B sample (iteration " + str(state.iteration) + ")\n"
-            + "# descriptor=hybrid_alf_rmsd\n",
-            encoding="utf-8",
-        )
-        self.artefact_log.append(str(out))
-        pool_dir = iter_dir / "pool"
-        accepted = []
-        try:
-            ariadne_manifest = read_ariadne_results_manifest(
-                iter_dir,
-                expected_iteration=int(state.iteration),
-            )
-            accepted = list(ariadne_manifest.get("accepted", []))
-            ariadne_manifest_path = str((iter_dir / "ARIADNE_RESULTS.json").resolve())
-        except Exception:
-            ariadne_manifest_path = ""
-            if pool_dir.is_dir():
-                for seed_dir in sorted(pool_dir.iterdir()):
-                    if not seed_dir.is_dir():
-                        continue
-                    result_path = seed_dir / "result.json"
-                    prov_path = seed_dir / PROVENANCE_FILENAME
-                    if result_path.is_file() and prov_path.is_file():
-                        try:
-                            seed_index = int(seed_dir.name.split("_")[-1])
-                        except (ValueError, IndexError):
-                            seed_index = len(accepted)
-                        accepted.append({
-                            "seed_index": seed_index,
-                            "seed_dir": str(seed_dir.resolve()),
-                            "result_json": str(result_path.resolve()),
-                            "provenance_json": str(prov_path.resolve()),
-                            "seed_frame_id": None,
-                            "selection_index": seed_index,
-                            "selection_origin": "unknown",
-                            "variance_at_selection": None,
-                            "alpha_final": None,
-                        })
+        from ..layout import active_phase_b_dir
         from ..point_allocation import (
             allocation_targets,
             create_point_allocation,
             point_allocation_path,
             stable_candidate_id,
         )
+        from ..sampling_protocol import (
+            phase_b_min_separation_from_resolved,
+            resolve_sampling_protocol,
+        )
+        from ..versioning.provenance import (
+            enrich_with_phase_b,
+            enrich_with_point_allocation,
+        )
 
-        final_records = []
+        iter_dir = self._iter_dir(state.iteration)
+        phase_b_dir = active_phase_b_dir(iter_dir)
+        phase_b_dir.mkdir(parents=True, exist_ok=True)
+        ariadne_manifest, candidate_frames, accepted = ariadne_candidate_frames(
+            iter_dir,
+            expected_iteration=int(state.iteration),
+        )
         batch_total = int(self.config.point_allocation.batch_total_size)
         n_accepted_candidates = len(accepted)
         if n_accepted_candidates < batch_total:
@@ -1726,15 +1940,16 @@ class DryRunPhaseExecutor:
         primary_source = accepted[:batch_total]
         reserve_source = accepted[batch_total:]
 
-        def allocation_record(rec, *, reserve_rank=None):
+        def allocation_record(rec, *, primary_rank=None, reserve_rank=None):
             candidate_id = stable_candidate_id(
                 campaign_uid=str(state.campaign_uid),
                 context="active",
                 iteration=int(state.iteration),
                 source_identity={
-                    "seed_index": int(rec.get("seed_index", 0)),
+                    "seed_id": int(rec["seed_id"]),
+                    "seed_uid": str(rec["seed_uid"]),
                     "seed_frame_id": rec.get("seed_frame_id"),
-                    "result_json": str(rec.get("result_json") or ""),
+                    "result_sha256": str(rec.get("result_sha256") or ""),
                 },
             )
             out_rec = dict(rec)
@@ -1750,21 +1965,20 @@ class DryRunPhaseExecutor:
             enrich_with_phase_b(
                 provenance_path.parent,
                 selected_after_fps=reserve_rank is None,
-                diversity_rank=(
-                    int(rec.get("seed_index", 0))
-                    if reserve_rank is None
-                    else int(reserve_rank)
-                ),
+                diversity_rank=primary_rank,
                 descriptor_used="hybrid_alf_rmsd",
                 candidate_id=candidate_id,
                 reserve_candidate=reserve_rank is not None,
             )
             return out_rec
 
-        primary_records = [allocation_record(rec) for rec in primary_source]
+        primary_records = [
+            allocation_record(rec, primary_rank=rank)
+            for rank, rec in enumerate(primary_source, start=1)
+        ]
         reserve_records = [
             allocation_record(rec, reserve_rank=rank)
-            for rank, rec in enumerate(reserve_source)
+            for rank, rec in enumerate(reserve_source, start=1)
         ]
         allocation_path = point_allocation_path(
             self.campaign_dir,
@@ -1787,22 +2001,36 @@ class DryRunPhaseExecutor:
             }
             for slot in allocation["slots"]
         }
-        for final_index, rec in enumerate(primary_records):
+        final_records = []
+        for final_rank, rec in enumerate(primary_records, start=1):
             out_rec = dict(rec)
-            out_rec["raw_index"] = int(final_index)
-            out_rec["final_index"] = int(final_index)
+            out_rec["candidate_pool_index_zero_based"] = int(final_rank - 1)
+            out_rec["raw_rank"] = int(final_rank)
+            out_rec["final_rank"] = int(final_rank)
             out_rec["kept_after_dedup"] = True
             out_rec["drop_reason"] = None
             out_rec.update(slots_by_candidate[str(out_rec["candidate_id"])])
+            enrich_with_point_allocation(
+                Path(str(out_rec["seed_dir"])),
+                candidate_id=str(out_rec["candidate_id"]),
+                context="active",
+                slot_id=int(out_rec["slot_id"]),
+                split=str(out_rec["split"]),
+                replacement_round=0,
+                allocation_slot_assignment_sha256=str(
+                    allocation["slot_assignment_sha256"]
+                ),
+            )
+            out_rec["provenance_sha256"] = hashlib.sha256(
+                Path(str(out_rec["provenance_json"])).read_bytes()
+            ).hexdigest()
             final_records.append(out_rec)
-        resolved_protocol = resolve_sampling_protocol(
+        from ..sampling_protocol import load_sampling_protocol
+
+        resolved_protocol = load_sampling_protocol(
             self.campaign_dir,
             self.config,
             iteration=int(state.iteration),
-        )
-        geometry_scale_payload = dict(resolved_protocol.geometry_scale_payload)
-        self.artefact_log.append(
-            str(geometry_novelty_scale_path(iter_dir))
         )
         if resolved_protocol.manifest_path is not None:
             self.artefact_log.append(str(resolved_protocol.manifest_path))
@@ -1817,45 +2045,83 @@ class DryRunPhaseExecutor:
             "n_candidates": int(len(final_records)),
             "n_kept": int(len(final_records)),
             "n_dropped": 0,
-            "kept_indices": [int(i) for i in range(len(final_records))],
-            "dropped_indices": [],
+            "kept_raw_indexes_zero_based": [
+                int(i) for i in range(len(final_records))
+            ],
+            "dropped_raw_indexes_zero_based": [],
             "distances_to_nearest": [],
             "min_separation": float(effective_min_separation),
             "threshold_mode": str(threshold_mode),
             "effective_min_separation_angstrom": float(effective_min_separation),
             "scaled_distances_to_nearest": [],
             "novelty_scores": [],
-            "geometry_novelty_scale": geometry_scale_payload,
+            "relaxation": {"applied": False, "reason": None},
+        }
+        raw_path = phase_b_dir / "selected_raw.xyz"
+        selected_path = phase_b_dir / "selected.xyz"
+        selected_frames = candidate_frames[:batch_total]
+        comments = [
+            "active iteration " + str(int(state.iteration)) + " Phase B rank " + str(rank)
+            for rank in range(1, len(selected_frames) + 1)
+        ]
+        atomic_write_text(raw_path, _frames_to_xyz(selected_frames, comments))
+        atomic_write_text(selected_path, _frames_to_xyz(selected_frames, comments))
+
+        def iteration_relative(record):
+            out_rec = dict(record)
+            for key in ("seed_dir", "result_json", "provenance_json", "output_manifest"):
+                if out_rec.get(key):
+                    out_rec[key] = Path(str(out_rec[key])).resolve().relative_to(
+                        iter_dir.resolve()
+                    ).as_posix()
+            return out_rec
+
+        final_records = [iteration_relative(record) for record in final_records]
+        reserve_records = [
+            iteration_relative(record)
+            for record in reserve_records
+        ]
+        def protocol_binding(path):
+            resolved = Path(path).resolve()
+            return {
+                "path": resolved.relative_to(iter_dir.resolve()).as_posix(),
+                "size": int(resolved.stat().st_size),
+                "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest(),
+            }
+
+        manifest_path = write_phase_b_selection_manifest(iter_dir, {
+            "schema_version": PHASE_B_SELECTION_SCHEMA_VERSION,
+            "status": "complete",
+            "campaign_uid": str(state.campaign_uid),
+            "iteration": int(state.iteration),
+            "descriptor": str(self.config.phase_b.descriptor),
             "sampling_protocol": {
                 "sampling_aggressiveness": int(
                     resolved_protocol.sampling_aggressiveness
                 ),
-                "resolved_manifest": (
-                    None if resolved_protocol.manifest_path is None
-                    else str(resolved_protocol.manifest_path.resolve())
-                ),
-                "scale_model_manifest": (
-                    None if resolved_protocol.scale_model_path is None
-                    else str(resolved_protocol.scale_model_path.resolve())
-                ),
-                "audit_manifest": (
-                    None if resolved_protocol.audit_manifest_path is None
-                    else str(resolved_protocol.audit_manifest_path.resolve())
-                ),
-                "hidden_overrides_detected": list(
-                    resolved_protocol.hidden_overrides_detected
-                ),
+                "resolved": protocol_binding(resolved_protocol.manifest_path),
+                "audit": protocol_binding(resolved_protocol.audit_manifest_path),
+                "scale_model": protocol_binding(resolved_protocol.scale_model_path),
             },
-            "sampling_scale_model": dict(resolved_protocol.scale_model_payload),
-            "relaxation": {"applied": False, "reason": None},
-        }
-        manifest_path = write_phase_b_selection_manifest(iter_dir, {
-            "schema_version": PHASE_B_SELECTION_SCHEMA_VERSION,
-            "iteration": int(state.iteration),
-            "descriptor": str(self.config.phase_b.descriptor),
-            "source_ariadne_manifest": ariadne_manifest_path,
+            "source_ariadne_manifest": "ariadne/RESULTS.json",
+            "source_ariadne_manifest_sha256": hashlib.sha256(
+                ariadne_results_path(iter_dir).read_bytes()
+            ).hexdigest(),
+            "selected_raw_xyz": {
+                "path": raw_path.relative_to(iter_dir).as_posix(),
+                "size": int(raw_path.stat().st_size),
+                "sha256": hashlib.sha256(raw_path.read_bytes()).hexdigest(),
+            },
+            "selected_xyz": {
+                "path": selected_path.relative_to(iter_dir).as_posix(),
+                "size": int(selected_path.stat().st_size),
+                "sha256": hashlib.sha256(selected_path.read_bytes()).hexdigest(),
+            },
             "point_allocation": {
-                "manifest": str(allocation_path.resolve()),
+                "manifest": allocation_path.resolve().relative_to(
+                    iter_dir.resolve()
+                ).as_posix(),
+                "slot_assignment_sha256": str(allocation["slot_assignment_sha256"]),
                 "targets": dict(allocation["targets"]),
                 "reserve": reserve_records,
                 "reserve_count": int(len(reserve_records)),
@@ -1867,6 +2133,7 @@ class DryRunPhaseExecutor:
             "final": list(final_records),
             "dedup": dedup_payload,
         })
+        self.artefact_log.extend([str(raw_path), str(selected_path)])
         self.artefact_log.append(str(manifest_path))
         return {}
 
@@ -1954,20 +2221,20 @@ class DryRunPhaseExecutor:
     def _read_picked_seed_frame_ids(self, iteration):
         """Return the list of seed_frame_ids written by SEED_SELECT.
 
-        Loads seeds_picked.json from the iteration dir and returns its
-        frame_ids field. Returns an empty list on missing file or any
-        decode error."""
-        path = self._iter_dir(iteration) / "seeds_picked.json"
+        Loads seed_selection/SELECTION.json and returns its
+        frame_ids field. A missing file returns an empty list; a malformed
+        manifest is a hard contract error."""
+        from ..handoff_manifests import load_seeds_picked, seeds_picked_path
+
+        iter_dir = self._iter_dir(iteration)
+        path = seeds_picked_path(iter_dir)
         if not path.is_file():
             return []
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            return []
-        fids = data.get("frame_ids", [])
-        if not isinstance(fids, list):
-            return []
+        data = load_seeds_picked(
+            iter_dir,
+            expected_iteration=int(iteration),
+        )
+        fids = data["frame_ids"]
         return [int(f) if isinstance(f, int) else None for f in fids]
 
     def _synthetic_whitened_distance(self, result):
@@ -1986,7 +2253,7 @@ class DryRunPhaseExecutor:
             return None
 
     def _read_seed_frame_id_from_pointdir(self, pointdir: Path):
-        """Read .provenance.json from a committed pointdir and return its
+        """Read provenance.json from a committed pointdir and return its
         seed.frame_id (or None if absent / malformed)."""
         import json as _json
         from ..versioning.provenance import PROVENANCE_FILENAME as _PFN
@@ -2037,7 +2304,7 @@ class DryRunPhaseExecutor:
         Policies:
           every_iteration:      recompute on every call
           every_n_iterations:   recompute when iteration % refresh_period == 0
-          never:                only on the very first call (iteration 0)
+          never:                only on the first active-iteration call
 
         In dry-run we cannot actually evaluate GP posteriors, so the scales
         we cache here are a stub payload. The wiring path is identical to
@@ -2169,6 +2436,9 @@ class DryRunPhaseExecutor:
                 slot_id=int(attempt["slot_id"]),
                 split=str(attempt["split"]),
                 replacement_round=int(attempt.get("round", 0)),
+                allocation_slot_assignment_sha256=str(
+                    allocation["slot_assignment_sha256"]
+                ),
             )
             artefact_name = "stub_" + stage + ".txt"
             (point_dir / artefact_name).write_text(

@@ -17,15 +17,22 @@ from ichor.hpc.active_learning.daemon.phase_executor import BackendSubmissionErr
 from ichor.hpc.active_learning.daemon.state import CampaignPhase
 from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
 from ichor.hpc.active_learning.handoff_manifests import (
+    ariadne_task_map_path,
     load_seeds_picked,
     read_seed_selection_diagnostics,
     write_seed_selection_diagnostics,
+)
+from ichor.hpc.active_learning.layout import (
+    active_iteration_dir,
+    active_seed_selection_dir,
+    ariadne_seeds_dir,
 )
 from ichor.hpc.active_learning.versioning.provenance import (
     append_recent_seeds,
     append_to_index,
     load_recent_seed_frame_ids,
     load_recent_seeds_payload,
+    load_training_seed_frame_ids,
     read_provenance,
 )
 
@@ -48,25 +55,53 @@ def _read_journal_events(campaign_dir):
     ]
 
 
+def _active_state(iteration=1):
+    return SimpleNamespace(
+        iteration=int(iteration),
+        campaign_uid="seed-wiring-test",
+        reference_data_version=0,
+        models_version=0,
+        replacement_round=0,
+    )
+
+
+def _select(ex, *, iteration=1):
+    models_root = ex.campaign_dir / "TRAINED_MODELS" / "iteration-000000"
+    if not models_root.is_dir():
+        bootstrap_state = SimpleNamespace(
+            iteration=0,
+            campaign_uid="seed-wiring-test",
+            reference_data_version=-1,
+            models_version=-1,
+            replacement_round=0,
+        )
+        ex._post_phase_a_polus(bootstrap_state)
+        ex._post_initial_gaussian(bootstrap_state)
+        ex._post_initial_aimall(bootstrap_state)
+        ex._post_initial_ferebus(bootstrap_state)
+    state = _active_state(iteration)
+    return state, ex.submit_or_run(state, CampaignPhase.SEED_SELECT)
+
+
 # --- (case a) training-set + (case b) recent-seeds cooldown wiring -----
 
 
-def test_inline_seed_select_with_no_pool_falls_back_to_placeholder(tmp_path):
+def test_dry_seed_select_bootstraps_a_missing_trajectory_pool(tmp_path):
     cd = tmp_path / "campaign"
     cfg = CampaignConfig()
     cfg.seed_selection.n_seeds_per_iteration = 3
     ex = DryRunPhaseExecutor(campaign_dir=cd, config=cfg)
-    ex.submit_or_run(SimpleNamespace(iteration=0), CampaignPhase.SEED_SELECT)
-    seeds_path = cd / "7_ACTIVE_LEARNING" / "iteration-0000" / "seeds.xyz"
+    _state, _result = _select(ex)
+    iter_dir = active_iteration_dir(cd, 1)
+    seeds_path = active_seed_selection_dir(iter_dir) / "seeds.xyz"
     assert seeds_path.is_file()
-    assert "pool_available=False" in seeds_path.read_text(encoding="utf-8")
-    assert not (cd / "7_ACTIVE_LEARNING" / "iteration-0000"
-                / "seeds_picked.json").is_file()
+    assert (active_seed_selection_dir(iter_dir) / "SELECTION.json").is_file()
+    assert TrajectoryPool.load(cd).n_frames() >= 3
     events = _read_journal_events(cd)
     picked = [e for e in events if e.get("event") == "seed_selected"]
     assert picked
-    assert picked[-1]["pool_available"] is False
-    assert picked[-1]["n_picked"] == 0
+    assert picked[-1]["pool_available"] is True
+    assert picked[-1]["n_picked"] == 3
 
 
 def test_inline_seed_select_with_pool_writes_seeds_picked_json(tmp_path):
@@ -75,11 +110,13 @@ def test_inline_seed_select_with_pool_writes_seeds_picked_json(tmp_path):
     cfg.seed_selection.n_seeds_per_iteration = 4
     ex = DryRunPhaseExecutor(campaign_dir=cd, config=cfg)
     TrajectoryPool.import_from(FIXTURE, cd)
-    ex.submit_or_run(SimpleNamespace(iteration=0), CampaignPhase.SEED_SELECT)
-    seeds_picked = cd / "7_ACTIVE_LEARNING" / "iteration-0000" / "seeds_picked.json"
+    _state, _result = _select(ex)
+    seeds_picked = active_seed_selection_dir(
+        active_iteration_dir(cd, 1)
+    ) / "SELECTION.json"
     assert seeds_picked.is_file()
     payload = json.loads(seeds_picked.read_text(encoding="utf-8"))
-    assert payload["iteration"] == 0
+    assert payload["iteration"] == 1
     assert payload["n_picked"] == 4
     assert len(payload["frame_ids"]) == 4
     pool = TrajectoryPool.load(cd)
@@ -97,10 +134,10 @@ def test_d_optimal_seed_select_writes_diagnostics_manifest(tmp_path):
     ex = DryRunPhaseExecutor(campaign_dir=cd, config=cfg)
     TrajectoryPool.import_from(FIXTURE, cd)
 
-    ex.submit_or_run(SimpleNamespace(iteration=0), CampaignPhase.SEED_SELECT)
+    _state, _result = _select(ex)
 
-    iter_dir = cd / "7_ACTIVE_LEARNING" / "iteration-0000"
-    picked = load_seeds_picked(iter_dir, expected_iteration=0)
+    iter_dir = active_iteration_dir(cd, 1)
+    picked = load_seeds_picked(iter_dir, expected_iteration=1)
     assert all(
         rec["selection_origin"] == "d_optimal"
         for rec in picked["seed_records"]
@@ -108,23 +145,29 @@ def test_d_optimal_seed_select_writes_diagnostics_manifest(tmp_path):
     assert picked["d_optimal_indices"] == picked["indices"]
     assert all("d_optimal_gain" in rec for rec in picked["seed_records"])
 
-    diagnostics = read_seed_selection_diagnostics(iter_dir, expected_iteration=0)
+    diagnostics = read_seed_selection_diagnostics(iter_dir, expected_iteration=1)
     assert diagnostics["strategy"] == "d_optimal"
     assert diagnostics["n_picked"] == 4
     assert len(diagnostics["selected"]) == 4
 
 
 def test_seed_selection_diagnostics_manifest_roundtrips(tmp_path):
-    iter_dir = tmp_path / "iteration-0000"
+    cd = tmp_path / "campaign"
+    cfg = CampaignConfig()
+    cfg.seed_selection.n_seeds_per_iteration = 1
+    ex = DryRunPhaseExecutor(campaign_dir=cd, config=cfg)
+    TrajectoryPool.import_from(FIXTURE, cd)
+    _state, _result = _select(ex)
+    iter_dir = active_iteration_dir(cd, 1)
     path = write_seed_selection_diagnostics(
         iter_dir,
         {
-            "iteration": 0,
+            "iteration": 1,
             "strategy": "d_optimal",
             "n_picked": 1,
             "selected": [
                 {
-                    "seed_index": 0,
+                    "seed_id": 1,
                     "selection_origin": "d_optimal",
                     "d_optimal_gain": 1.0,
                 }
@@ -132,9 +175,8 @@ def test_seed_selection_diagnostics_manifest_roundtrips(tmp_path):
         },
     )
 
-    assert path.name == "SEED_SELECTION_DIAGNOSTICS.json"
-    data = read_seed_selection_diagnostics(iter_dir, expected_iteration=0)
-    assert data["schema_version"] == 1
+    assert path.name == "SELECTION.json"
+    data = read_seed_selection_diagnostics(iter_dir, expected_iteration=1)
     assert data["selected"][0]["selection_origin"] == "d_optimal"
 
 
@@ -152,14 +194,21 @@ def test_inline_seed_select_skips_training_pool_frame_ids(tmp_path):
             pointdir_name=f"POINT_dummy_{fid}.pointdir",
             seed_frame_id=int(fid),
         )
-    ex.submit_or_run(SimpleNamespace(iteration=0), CampaignPhase.SEED_SELECT)
-    seeds_picked = cd / "7_ACTIVE_LEARNING" / "iteration-0000" / "seeds_picked.json"
+    _state, _result = _select(ex)
+    seeds_picked = active_seed_selection_dir(
+        active_iteration_dir(cd, 1)
+    ) / "SELECTION.json"
     payload = json.loads(seeds_picked.read_text(encoding="utf-8"))
     for fid in payload["frame_ids"]:
         assert fid not in forbidden
     events = _read_journal_events(cd)
     picked = [e for e in events if e.get("event") == "seed_selected"]
-    assert picked[-1]["forbidden_set_size"] == 5
+    expected_forbidden = load_training_seed_frame_ids(
+        cd,
+        reference_data_dir=cd / "QM_REFERENCE_DATA",
+    )
+    assert set(forbidden).issubset(expected_forbidden)
+    assert picked[-1]["forbidden_set_size"] == len(expected_forbidden)
 
 
 def test_inline_seed_select_skips_recent_cooldown_frames(tmp_path):
@@ -171,15 +220,18 @@ def test_inline_seed_select_skips_recent_cooldown_frames(tmp_path):
     pool = TrajectoryPool.load(cd)
     recent = list(pool.frame_ids())[:3]
     append_recent_seeds(cd, iteration=-1, frame_ids=recent, cooldown=3)
-    ex.submit_or_run(SimpleNamespace(iteration=0), CampaignPhase.SEED_SELECT)
+    _state, _result = _select(ex)
     payload = json.loads(
-        (cd / "7_ACTIVE_LEARNING" / "iteration-0000" / "seeds_picked.json")
+        (
+            active_seed_selection_dir(active_iteration_dir(cd, 1))
+            / "SELECTION.json"
+        )
         .read_text(encoding="utf-8")
     )
     for fid in payload["frame_ids"]:
         assert fid not in recent
     cache = load_recent_seeds_payload(cd)
-    assert cache["history"][-1]["iteration"] == 0
+    assert cache["history"][-1]["iteration"] == 1
 
 
 def test_inline_seed_select_updates_recent_seeds_cache_on_each_run(tmp_path):
@@ -188,11 +240,11 @@ def test_inline_seed_select_updates_recent_seeds_cache_on_each_run(tmp_path):
     cfg.seed_selection.n_seeds_per_iteration = 2
     ex = DryRunPhaseExecutor(campaign_dir=cd, config=cfg)
     TrajectoryPool.import_from(FIXTURE, cd)
-    for it in range(4):
-        ex.submit_or_run(SimpleNamespace(iteration=it), CampaignPhase.SEED_SELECT)
+    for it in range(1, 5):
+        _select(ex, iteration=it)
     cache = load_recent_seeds_payload(cd)
     iters = [e["iteration"] for e in cache["history"]]
-    assert iters == [1, 2, 3]
+    assert iters == [2, 3, 4]
 
 
 def test_inline_seed_select_uses_configured_recent_seed_cooldown(tmp_path):
@@ -202,11 +254,11 @@ def test_inline_seed_select_uses_configured_recent_seed_cooldown(tmp_path):
     cfg.anti_overlap.recent_seeds_cooldown = 1
     ex = DryRunPhaseExecutor(campaign_dir=cd, config=cfg)
     TrajectoryPool.import_from(FIXTURE, cd)
-    ex.submit_or_run(SimpleNamespace(iteration=0), CampaignPhase.SEED_SELECT)
-    ex.submit_or_run(SimpleNamespace(iteration=1), CampaignPhase.SEED_SELECT)
+    _select(ex, iteration=1)
+    _select(ex, iteration=2)
     cache = load_recent_seeds_payload(cd)
     assert cache["cooldown"] == 1
-    assert [e["iteration"] for e in cache["history"]] == [1]
+    assert [e["iteration"] for e in cache["history"]] == [2]
 
 
 def test_seed_select_reentry_repairs_recent_seed_history(tmp_path):
@@ -215,14 +267,33 @@ def test_seed_select_reentry_repairs_recent_seed_history(tmp_path):
     cfg.seed_selection.n_seeds_per_iteration = 2
     ex = DryRunPhaseExecutor(campaign_dir=cd, config=cfg)
     TrajectoryPool.import_from(FIXTURE, cd)
-    state = SimpleNamespace(iteration=0)
-    ex.submit_or_run(state, CampaignPhase.SEED_SELECT)
+    state, _result = _select(ex)
     recent_path = cd / ".DATA" / "ACTIVE_LEARNING" / "recent_seeds.json"
     recent_path.unlink()
 
     ex.submit_or_run(state, CampaignPhase.SEED_SELECT)
     cache = load_recent_seeds_payload(cd)
-    assert [e["iteration"] for e in cache["history"]] == [0]
+    assert [e["iteration"] for e in cache["history"]] == [1]
+
+
+def test_seed_select_reentry_repairs_incomplete_published_handoff(tmp_path):
+    cd = tmp_path / "campaign"
+    cfg = CampaignConfig()
+    cfg.seed_selection.n_seeds_per_iteration = 2
+    ex = DryRunPhaseExecutor(campaign_dir=cd, config=cfg)
+    TrajectoryPool.import_from(FIXTURE, cd)
+    state, _result = _select(ex)
+    iter_dir = active_iteration_dir(cd, 1)
+    task_map = ariadne_task_map_path(iter_dir)
+    seeds_xyz = active_seed_selection_dir(iter_dir) / "seeds.xyz"
+    task_map.unlink()
+    seeds_xyz.unlink()
+
+    ex.submit_or_run(state, CampaignPhase.SEED_SELECT)
+
+    assert task_map.is_file()
+    assert seeds_xyz.is_file()
+    assert "active iteration 1 seed 1" in seeds_xyz.read_text(encoding="utf-8")
 
 
 def test_live_seed_selection_requires_models_by_default(tmp_path):
@@ -232,7 +303,7 @@ def test_live_seed_selection_requires_models_by_default(tmp_path):
         config=cfg,
         backend_check=False,
     )
-    state = SimpleNamespace(iteration=0, models_version=0)
+    state = _active_state()
     with pytest.raises(BackendSubmissionError, match="committed models"):
         ex._seed_selection_posterior(state, [object()])
 
@@ -245,7 +316,7 @@ def test_live_seed_select_requires_imported_trajectory_pool(tmp_path):
         config=cfg,
         backend_check=False,
     )
-    state = SimpleNamespace(iteration=0, models_version=0)
+    state = _active_state()
 
     with pytest.raises(BackendSubmissionError, match="imported trajectory pool"):
         ex.submit_or_run(state, CampaignPhase.SEED_SELECT)
@@ -259,7 +330,7 @@ def test_live_seed_selection_uniform_fallback_requires_explicit_config(tmp_path)
         config=cfg,
         backend_check=False,
     )
-    state = SimpleNamespace(iteration=0, models_version=0)
+    state = _active_state()
     posterior = ex._seed_selection_posterior(state, [object()])
     assert posterior.variance(object()) == 1.0
 
@@ -273,7 +344,7 @@ def test_seed_pool_exhaustion_halts_when_no_eligible_frames(tmp_path):
     pool = TrajectoryPool.load(cd)
     append_recent_seeds(cd, iteration=-1, frame_ids=list(pool.frame_ids()), cooldown=3)
     with pytest.raises(BackendSubmissionError, match="seed_pool_exhausted"):
-        ex.submit_or_run(SimpleNamespace(iteration=0), CampaignPhase.SEED_SELECT)
+        _select(ex)
 
 
 def test_partial_seed_batch_halts_instead_of_silent_smaller_batch(tmp_path):
@@ -284,7 +355,7 @@ def test_partial_seed_batch_halts_instead_of_silent_smaller_batch(tmp_path):
     pool = TrajectoryPool.load(cd)
     cfg.seed_selection.n_seeds_per_iteration = pool.n_frames() + 1
     with pytest.raises(BackendSubmissionError, match="only .* eligible"):
-        ex.submit_or_run(SimpleNamespace(iteration=0), CampaignPhase.SEED_SELECT)
+        _select(ex)
 
 
 # --- (case c) post-ARIADNE anti-overlap flag ---------------------------
@@ -295,9 +366,10 @@ def test_anti_overlap_passes_when_distance_within_band(tmp_path):
     cfg = CampaignConfig()
     cfg.seed_selection.n_seeds_per_iteration = 2
     ex = DryRunPhaseExecutor(campaign_dir=cd, config=cfg)
-    state = SimpleNamespace(iteration=0)
+    TrajectoryPool.import_from(FIXTURE, cd)
+    state, _result = _select(ex)
     ex.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
-    pool_dir = cd / "7_ACTIVE_LEARNING" / "iteration-0000" / "pool"
+    pool_dir = ariadne_seeds_dir(active_iteration_dir(cd, 1))
     seed_dirs = sorted(d for d in pool_dir.iterdir() if d.is_dir())
     assert seed_dirs
     any_flagged = False
@@ -317,9 +389,11 @@ def test_anti_overlap_uses_campaign_whitened_distance_bounds(tmp_path):
     cfg.anti_overlap.min_post_ariadne_whitened_distance = 100.0
     cfg.anti_overlap.max_post_ariadne_whitened_distance = 200.0
     ex = DryRunPhaseExecutor(campaign_dir=cd, config=cfg)
-    ex.postprocess(SimpleNamespace(iteration=0), CampaignPhase.ARIADNE_ARRAY, observations=[])
+    TrajectoryPool.import_from(FIXTURE, cd)
+    state, _result = _select(ex)
+    ex.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
 
-    pool_dir = cd / "7_ACTIVE_LEARNING" / "iteration-0000" / "pool"
+    pool_dir = ariadne_seeds_dir(active_iteration_dir(cd, 1))
     seed_dirs = sorted(d for d in pool_dir.iterdir() if d.is_dir())
     assert seed_dirs
     for sd in seed_dirs:
@@ -351,14 +425,10 @@ def test_post_ariadne_uses_picked_seed_frame_ids_when_present(tmp_path):
     cfg.seed_selection.n_seeds_per_iteration = 3
     ex = DryRunPhaseExecutor(campaign_dir=cd, config=cfg)
     TrajectoryPool.import_from(FIXTURE, cd)
-    state = SimpleNamespace(iteration=0, campaign_uid="uid")
-    ex.submit_or_run(state, CampaignPhase.SEED_SELECT)
-    picked = json.loads(
-        (cd / "7_ACTIVE_LEARNING" / "iteration-0000" / "seeds_picked.json")
-        .read_text(encoding="utf-8")
-    )
+    state, _result = _select(ex)
+    picked = load_seeds_picked(active_iteration_dir(cd, 1), expected_iteration=1)
     ex.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
-    pool_dir = cd / "7_ACTIVE_LEARNING" / "iteration-0000" / "pool"
+    pool_dir = ariadne_seeds_dir(active_iteration_dir(cd, 1))
     seed_dirs = sorted(d for d in pool_dir.iterdir() if d.is_dir())
     expected = picked["frame_ids"][:len(seed_dirs)]
     for sd, exp_fid in zip(seed_dirs, expected):

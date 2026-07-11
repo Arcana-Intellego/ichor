@@ -681,7 +681,7 @@ def stage_gaussian_inputs(
     frames = _load_frames(sample_xyz)
     phase_b_records: List[Dict[str, Any]] = []
     allocation_records: List[Dict[str, Any]] = []
-    allocation_manifest_hash: Optional[str] = None
+    allocation_assignment_hash: Optional[str] = None
     initial_seed_frame_ids: List[Optional[int]] = []
     initial_seed_selection_origins: List[str] = []
     initial_provenance_context: Optional[Dict[str, str]] = None
@@ -699,8 +699,13 @@ def stage_gaussian_inputs(
         )
         replacement_context = str(replacement_manifest["context"])
         allocation_records = list(replacement_manifest["records"])
-        allocation_manifest_hash = str(
-            replacement_manifest["point_allocation_sha256"]
+        from ..point_allocation import read_point_allocation
+
+        replacement_allocation = read_point_allocation(
+            replacement_manifest["point_allocation_manifest"]
+        )
+        allocation_assignment_hash = str(
+            replacement_allocation["slot_assignment_sha256"]
         )
         if len(allocation_records) != len(frames):
             raise ValueError(
@@ -728,7 +733,7 @@ def stage_gaussian_inputs(
         from ..handoff_manifests import read_phase_b_selection_manifest
 
         phase_b_manifest = read_phase_b_selection_manifest(
-            Path(sample_xyz).parent,
+            Path(sample_xyz).parent.parent,
             expected_iteration=int(iteration),
         )
         phase_b_records = list(phase_b_manifest.get("final", []))
@@ -740,10 +745,8 @@ def stage_gaussian_inputs(
                 + str(len(frames))
             )
         allocation_records = list(phase_b_records)
-        from ..point_allocation import allocation_manifest_sha256
-
-        allocation_manifest_hash = allocation_manifest_sha256(
-            phase_b_manifest["point_allocation"]["manifest"]
+        allocation_assignment_hash = str(
+            phase_b_manifest["point_allocation"]["slot_assignment_sha256"]
         )
     if str(phase_name) == "INITIAL_GAUSSIAN":
         try:
@@ -784,10 +787,13 @@ def stage_gaussian_inputs(
                     raise ValueError(
                         "Phase A point-allocation record count does not match sample"
                     )
-                from ..point_allocation import allocation_manifest_sha256
+                from ..point_allocation import read_point_allocation
 
-                allocation_manifest_hash = allocation_manifest_sha256(
+                bootstrap_allocation = read_point_allocation(
                     phase_a_manifest["point_allocation"]["manifest"]
+                )
+                allocation_assignment_hash = str(
+                    bootstrap_allocation["slot_assignment_sha256"]
                 )
         except FileNotFoundError:
             initial_seed_frame_ids = []
@@ -937,7 +943,27 @@ def stage_gaussian_inputs(
                 iteration=int(iteration),
                 trajectory_sha256=str(provenance_context["trajectory_sha256"]),
                 seed_frame_id=phase_b_records[k].get("seed_frame_id"),
+                seed_id=int(phase_b_records[k]["seed_id"]),
+                seed_uid=str(phase_b_records[k]["seed_uid"]),
+                array_task_id_zero_based=int(
+                    phase_b_records[k]["array_task_id"]
+                ),
                 require_phase_b_selected=True,
+                allocation_split=(
+                    None if is_replacement else str(phase_b_records[k]["split"])
+                ),
+                allocation_slot_id=(
+                    None if is_replacement else int(phase_b_records[k]["slot_id"])
+                ),
+                allocation_candidate_id=(
+                    None
+                    if is_replacement
+                    else str(phase_b_records[k]["candidate_id"])
+                ),
+                allocation_context=(None if is_replacement else "active"),
+                allocation_slot_assignment_sha256=(
+                    None if is_replacement else allocation_assignment_hash
+                ),
             )
             shutil.copy2(str(src_prov), str(pd / PROVENANCE_FILENAME))
         if allocation_records:
@@ -957,7 +983,7 @@ def stage_gaussian_inputs(
                 replacement_round=(
                     int(allocation_record.get("round", 0)) if is_replacement else 0
                 ),
-                allocation_manifest_sha256=allocation_manifest_hash,
+                allocation_slot_assignment_sha256=allocation_assignment_hash,
             )
         pointdirs.append(pd)
 
@@ -1410,7 +1436,7 @@ def commit_reference_data_delta(
         point_allocation_sha256=allocation_manifest_sha256(allocation_path),
         added_entries=added_entries,
     )
-    allocation_history = allocation_path.parent / ".point_allocation_history"
+    allocation_history = allocation_path.parent / "history"
     if allocation_history.is_dir():
         _copytree_no_symlinks(
             allocation_history,
@@ -1436,12 +1462,6 @@ def commit_reference_data_delta(
 
 def commit_initial_reference_data(campaign_dir) -> bool:
     """Commit the complete bootstrap allocation as reference-data version 0."""
-    allocation_path = (
-        Path(campaign_dir)
-        / "3_DIVERSITY_SAMPLING"
-        / "initial"
-        / "POINT_ALLOCATION.json"
-    )
     _, _, created = commit_reference_data_delta(
         Path(campaign_dir),
         reference_data_version=0,
@@ -1468,8 +1488,9 @@ def stage_ferebus_inputs(
     from ..versioning.reference_data import ReferenceDataVersioning
 
     campaign = Path(campaign_dir)
-    # the initial bootstrap has no APPEND phase ahead of it, so QM_REFERENCE_DATA/iteration-0 may not
-    # exist yet when INITIAL_FEREBUS stages. build it from the initial quantum staging so the
+    # The initial bootstrap has no APPEND phase ahead of it, so
+    # QM_REFERENCE_DATA/iteration-000000 may not exist when INITIAL_FEREBUS
+    # stages. Build it from the initial quantum staging so the
     # export has something to read. idempotent; and we only create the dir here -- the
     # reference_data_version bump stays in postprocess so a restart mid-flight reconciles cleanly.
     if is_initial:
@@ -1544,7 +1565,7 @@ def stage_ferebus_inputs(
     )
 
     allocation_context = "bootstrap" if version == 0 else "active"
-    allocation_iteration = 0 if allocation_context == "bootstrap" else version - 1
+    allocation_iteration = 0 if allocation_context == "bootstrap" else version
     allocation_path = point_allocation_path(
         campaign,
         context=allocation_context,
@@ -1748,6 +1769,10 @@ def stage_ferebus_inputs(
                     campaign.resolve()
                 ).as_posix(),
                 "allocation_manifest_sha256": str(allocation_hash),
+                "allocation_iteration": int(allocation_iteration),
+                "slot_assignment_sha256": str(
+                    allocation_payload["slot_assignment_sha256"]
+                ),
                 "forced_splits": dict(forced_ferebus_splits),
             },
             "tasks": tasks,

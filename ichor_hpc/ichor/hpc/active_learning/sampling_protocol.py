@@ -183,19 +183,21 @@ class ResolvedSamplingProtocol:
 
 
 def sampling_protocol_resolved_path(iter_dir: Union[str, Path]) -> Path:
-    return Path(iter_dir) / SAMPLING_PROTOCOL_RESOLVED_FILENAME
+    from .layout import active_protocol_dir
+
+    return active_protocol_dir(iter_dir) / SAMPLING_PROTOCOL_RESOLVED_FILENAME
 
 
 def sampling_protocol_audit_path(iter_dir: Union[str, Path]) -> Path:
-    return Path(iter_dir) / SAMPLING_PROTOCOL_AUDIT_FILENAME
+    from .layout import active_protocol_dir
+
+    return active_protocol_dir(iter_dir) / SAMPLING_PROTOCOL_AUDIT_FILENAME
 
 
 def _iteration_dir(campaign_dir: Union[str, Path], iteration: int) -> Path:
-    return (
-        Path(campaign_dir)
-        / "7_ACTIVE_LEARNING"
-        / ("iteration-" + str(int(iteration)).zfill(4))
-    )
+    from .layout import active_iteration_dir
+
+    return active_iteration_dir(campaign_dir, int(iteration))
 
 
 def _profile_for(config: CampaignConfig) -> AggressivenessProfile:
@@ -462,6 +464,7 @@ def _resolved_manifest_payload(resolved: ResolvedSamplingProtocol) -> Dict[str, 
         "geometry_novelty_scale": geometry_payload,
         "resolved_geometry_scale_angstrom": scale,
         "resolved_phase_b": phase_b,
+        "resolved_anti_overlap": dict(resolved.anti_overlap),
         "resolved_movement_band": movement_band,
         "resolved_adversarial_safety": {
             "reject_unsafe_landings": bool(resolved.adversarial_safety.reject_unsafe_landings),
@@ -744,6 +747,7 @@ def resolve_sampling_protocol(
         if write_manifest else None
     )
     if write_manifest and scale_path is not None:
+        scale_path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_json(scale_path, _json_ready(scale_model_payload))
 
     resolved = ResolvedSamplingProtocol(
@@ -779,11 +783,201 @@ def resolve_sampling_protocol(
     return resolved
 
 
+def load_sampling_protocol(
+    campaign_dir: Union[str, Path],
+    config: CampaignConfig,
+    iteration: int,
+) -> ResolvedSamplingProtocol:
+    """Load one immutable protocol snapshot without rewriting its sidecars."""
+    from .geometry_novelty import (
+        apply_geometry_novelty_to_acquisition_config,
+        resolve_geometry_novelty_consumers,
+    )
+    from .sampling_scale_model import (
+        read_sampling_scale_model,
+        sampling_scale_model_path,
+    )
+
+    campaign = Path(campaign_dir)
+    iter_dir = _iteration_dir(campaign, int(iteration))
+    protocol_path = sampling_protocol_resolved_path(iter_dir)
+    audit_path = sampling_protocol_audit_path(iter_dir)
+    scale_path = sampling_scale_model_path(iter_dir)
+    for label, path in (
+        ("resolved sampling protocol", protocol_path),
+        ("sampling protocol audit", audit_path),
+        ("sampling scale model", scale_path),
+    ):
+        if path.is_symlink() or not path.is_file():
+            raise FileNotFoundError(label + " is not a regular file: " + str(path))
+
+    protocol_payload = read_sampling_protocol_resolved(
+        iter_dir,
+        expected_iteration=int(iteration),
+    )
+    read_sampling_protocol_audit(
+        iter_dir,
+        expected_iteration=int(iteration),
+    )
+    scale_model_payload = read_sampling_scale_model(
+        iter_dir,
+        expected_iteration=int(iteration),
+    )
+    if protocol_payload.get("sampling_scale_model") != scale_model_payload:
+        raise ValueError(
+            "resolved sampling protocol does not match its scale-model sidecar"
+        )
+    geometry_payload = protocol_payload.get("geometry_novelty_scale")
+    if not isinstance(geometry_payload, dict):
+        raise ValueError(
+            "resolved sampling protocol geometry novelty scale is missing"
+        )
+
+    level = int(config.sampling_protocol.sampling_aggressiveness)
+    if int(protocol_payload.get("sampling_aggressiveness", -1)) != level:
+        raise ValueError(
+            "resolved sampling protocol aggressiveness does not match campaign config"
+        )
+    profile = _profile_for(config)
+    effective = _effective_campaign_config(config, profile)
+    acquisition_config = apply_geometry_novelty_to_acquisition_config(
+        effective.to_acquisition_config(),
+        effective,
+        geometry_payload,
+    )
+    acquisition_config = _apply_profile_to_acquisition_config(
+        acquisition_config,
+        profile,
+    )
+    acquisition_config = _apply_scale_model_to_acquisition_config(
+        acquisition_config,
+        scale_model_payload,
+    )
+    ariadne_run_config = effective.to_ariadne_run_config()
+    resolved_consumers = resolve_geometry_novelty_consumers(
+        effective,
+        geometry_payload,
+    )
+    phase_b = dict(resolved_consumers.get("phase_b") or {})
+    scale_raw = geometry_payload.get("scale_angstrom")
+    try:
+        scale_value = float(scale_raw)
+    except (TypeError, ValueError):
+        scale_value = None
+    if scale_value is not None and scale_value > 0.0:
+        phase_b_scale = scale_value
+        try:
+            phase_b_scale = float(
+                scale_model_payload.get("aligned_rmsd_scale", {}).get(
+                    "value_angstrom"
+                )
+            )
+        except (TypeError, ValueError):
+            phase_b_scale = scale_value
+        if not (phase_b_scale > 0.0):
+            phase_b_scale = scale_value
+        phase_b["scaled_threshold"] = float(
+            profile.phase_b_min_separation_scale
+        )
+        phase_b["min_separation_scaled"] = float(
+            profile.phase_b_min_separation_scale
+        )
+        phase_b["effective_min_separation_angstrom"] = float(
+            profile.phase_b_min_separation_scale
+        ) * float(phase_b_scale)
+        phase_b["scale_model_source"] = "aligned_rmsd_scale"
+        phase_b["scale_model_value_angstrom"] = float(phase_b_scale)
+    phase_b["descriptor"] = str(effective.phase_b.descriptor)
+    phase_b["beta"] = float(effective.phase_b.beta)
+
+    resolved = ResolvedSamplingProtocol(
+        schema_version=SAMPLING_PROTOCOL_SCHEMA_VERSION,
+        iteration=int(iteration),
+        sampling_aggressiveness=level,
+        profile=profile,
+        effective_config=effective,
+        geometry_scale_payload=dict(geometry_payload),
+        resolved_geometry_scale_angstrom=scale_value,
+        acquisition_config=acquisition_config,
+        ariadne_run_config=ariadne_run_config,
+        adversarial_safety=effective.adversarial_safety,
+        quality_gates=effective.quality_gates,
+        phase_b=phase_b,
+        anti_overlap=asdict(effective.anti_overlap),
+        scale_model_payload=dict(scale_model_payload),
+        sources={
+            "level_5_policy": "matches_current_defaults",
+            "geometry_scale": "sampling_scale_model",
+            "pair_distance": "sampling_scale_model_minimum_safe_pair_ratio",
+        },
+        hidden_overrides_detected=hidden_sampling_overrides(config),
+        manifest_path=protocol_path,
+        scale_model_path=scale_path,
+        audit_manifest_path=audit_path,
+    )
+    expected_payload = _resolved_manifest_payload(resolved)
+    invariant_fields = (
+        "sampling_aggressiveness",
+        "profile",
+        "dimensionless_preset",
+        "geometry_novelty_scale",
+        "sampling_scale_model",
+        "resolved_acquisition_weights",
+        "resolved_fullspace_confinement",
+        "resolved_movement_band",
+        "resolved_adversarial_safety",
+        "resolved_quality_gates",
+        "resolved_phase_b",
+        "resolved_anti_overlap",
+        "resolved_ariadne",
+        "hard_safety_rails",
+        "hidden_overrides_detected",
+    )
+    for field_name in invariant_fields:
+        if protocol_payload.get(field_name) != expected_payload.get(field_name):
+            raise ValueError(
+                "resolved sampling protocol/config mismatch: " + field_name
+            )
+    stored_fingerprint = dict(protocol_payload.get("input_fingerprint") or {}).get(
+        "sha256"
+    )
+    expected_fingerprint = dict(expected_payload.get("input_fingerprint") or {}).get(
+        "sha256"
+    )
+    if stored_fingerprint != expected_fingerprint:
+        raise ValueError("resolved sampling protocol input fingerprint mismatch")
+    return resolved
+
+
+def resolve_or_load_sampling_protocol(
+    campaign_dir: Union[str, Path],
+    config: CampaignConfig,
+    iteration: int,
+) -> ResolvedSamplingProtocol:
+    """Resolve a protocol once, then reuse the immutable snapshot."""
+    from .sampling_scale_model import sampling_scale_model_path
+
+    iter_dir = _iteration_dir(campaign_dir, int(iteration))
+    paths = (
+        sampling_protocol_resolved_path(iter_dir),
+        sampling_protocol_audit_path(iter_dir),
+        sampling_scale_model_path(iter_dir),
+    )
+    present = [path.is_file() or path.is_symlink() for path in paths]
+    if any(present):
+        if not all(present):
+            raise ValueError(
+                "sampling protocol snapshot is incomplete; refusing to regenerate it"
+            )
+        return load_sampling_protocol(campaign_dir, config, int(iteration))
+    return resolve_sampling_protocol(campaign_dir, config, int(iteration))
+
+
 def preview_sampling_protocol(
     config: CampaignConfig,
     *,
     campaign_dir: Union[str, Path, None] = None,
-    iteration: int = 0,
+    iteration: int = 1,
     geometry_scale_payload: Optional[Dict[str, Any]] = None,
 ) -> ResolvedSamplingProtocol:
     """Resolve the sampling protocol without writing sidecars.
@@ -902,10 +1096,12 @@ __all__ = [
     "ResolvedSamplingProtocol",
     "dimensionless_preset_payload",
     "hidden_sampling_overrides",
+    "load_sampling_protocol",
     "phase_b_min_separation_from_resolved",
     "preview_sampling_protocol",
     "read_sampling_protocol_audit",
     "read_sampling_protocol_resolved",
+    "resolve_or_load_sampling_protocol",
     "resolve_sampling_protocol",
     "sampling_protocol_audit_path",
     "sampling_protocol_resolved_path",

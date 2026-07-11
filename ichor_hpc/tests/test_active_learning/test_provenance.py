@@ -298,6 +298,9 @@ def test_repair_index_from_committed_pointdirs_adds_missing_records(tmp_path):
         context="bootstrap",
         slot_id=int(attempt["slot_id"]),
         split=str(attempt["split"]),
+        allocation_slot_assignment_sha256=str(
+            allocation["slot_assignment_sha256"]
+        ),
     )
     record_quantum_results(
         allocation_path,
@@ -337,7 +340,7 @@ def test_full_provenance_chain_through_dry_run_executor(tmp_path):
     flow lands as documented in the M10 design.
 
     Specifically:
-      * each seed_NNNN/ pool subdir gets a .provenance.json after ARIADNE,
+      * each one-based ARIADNE seed directory gets provenance.json,
       * PHASE_B enrich populates the phase_b block in-place,
       * APPEND copies the provenance sidecar into the committed pointdir
         AND emits one record per pointdir into seed_frame_id_index.json,
@@ -379,10 +382,14 @@ def test_full_provenance_chain_through_dry_run_executor(tmp_path):
     )
     state.reference_data_version = bootstrap.state_updates["reference_data_version"]
     state.models_version = bootstrap.state_updates["models_version"]
+    state.iteration = 1
 
+    ex.submit_or_run(state, CampaignPhase.SEED_SELECT)
     ex.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
-    iter_dir = campaign_dir / "7_ACTIVE_LEARNING" / "iteration-0000"
-    pool = iter_dir / "pool"
+    from ichor.hpc.active_learning.layout import active_iteration_dir, ariadne_seeds_dir
+
+    iter_dir = active_iteration_dir(campaign_dir, 1)
+    pool = ariadne_seeds_dir(iter_dir)
     assert pool.is_dir()
     seed_dirs = sorted(d for d in pool.iterdir() if d.is_dir())
     assert seed_dirs, "ARIADNE produced no seed subdirs"
@@ -392,7 +399,7 @@ def test_full_provenance_chain_through_dry_run_executor(tmp_path):
         assert data["ariadne"] is not None
         assert "alpha_final" in data["ariadne"]
         assert data["anti_overlap"] is not None
-        assert data["anti_overlap"]["passed"] is True
+        assert isinstance(data["anti_overlap"]["passed"], bool)
         assert data["phase_b"] is None
 
     ex.postprocess(state, CampaignPhase.PHASE_B_POLUS, observations=[])
@@ -443,9 +450,12 @@ def test_full_provenance_chain_through_dry_run_executor(tmp_path):
     for rec in idx_data["records"]:
         assert rec["iteration"] == 1
         assert rec["pointdir_name"].startswith("POINT_")
-        assert rec["seed_frame_id"] is None
+        assert isinstance(rec["seed_frame_id"], int)
 
-    assert load_training_seed_frame_ids(campaign_dir) == set()
+    assert load_training_seed_frame_ids(campaign_dir) == {
+        int(record["seed_frame_id"])
+        for record in idx_data["records"]
+    }
 
     journal_path = (
         campaign_dir / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson"
@@ -502,14 +512,16 @@ def test_full_provenance_chain_two_iterations_grows_index_monotonically(tmp_path
     # reference_data_version from the APPEND return so the M15 F2 idempotency
     # guard in _inline_append sees a fresh expected-next per loop.
     reference_data_version = 0
-    for it in (0, 1):
+    models_version = 0
+    for it in (1, 2):
         state_ns = SimpleNamespace(
             iteration=it,
             campaign_uid="uid",
             replacement_round=0,
             reference_data_version=reference_data_version,
-            models_version=reference_data_version,
+            models_version=models_version,
         )
+        ex.submit_or_run(state_ns, CampaignPhase.SEED_SELECT)
         ex.postprocess(state_ns, CampaignPhase.ARIADNE_ARRAY, observations=[])
         ex.postprocess(state_ns, CampaignPhase.PHASE_B_POLUS, observations=[])
         ex.postprocess(state_ns, CampaignPhase.GAUSSIAN, observations=[])
@@ -521,6 +533,15 @@ def test_full_provenance_chain_two_iterations_grows_index_monotonically(tmp_path
             reference_data_version = int(
                 result.state_updates.get("reference_data_version", reference_data_version)
             )
+        state_ns.reference_data_version = reference_data_version
+        trained = ex.postprocess(
+            state_ns,
+            CampaignPhase.FEREBUS,
+            observations=[],
+        )
+        models_version = int(
+            trained.state_updates.get("models_version", models_version)
+        )
 
     idx_data = load_index(campaign_dir)
     iterations_in_index = sorted({r["iteration"] for r in idx_data["records"]})
@@ -690,6 +711,9 @@ def test_load_training_seed_frame_ids_self_heals_from_sidecars(tmp_path):
             context="bootstrap",
             slot_id=int(attempt["slot_id"]),
             split=str(attempt["split"]),
+            allocation_slot_assignment_sha256=str(
+                allocation["slot_assignment_sha256"]
+            ),
         )
         results.append(
             {

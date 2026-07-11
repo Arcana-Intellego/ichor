@@ -19,6 +19,7 @@ from ..handoff_manifests import (
     read_phase_a_sample_manifest,
     read_phase_b_selection_manifest,
 )
+from ..layout import active_learning_dir
 from . import input_staging as _stg
 from .artifact_contracts import (
     verify_committed_model_version,
@@ -48,26 +49,23 @@ class RecoveryHandoff:
 
 
 def iteration_dir(campaign_dir: Union[str, Path], iteration: int) -> Path:
-    return (
-        Path(campaign_dir)
-        / "7_ACTIVE_LEARNING"
-        / ("iteration-" + str(int(iteration)).zfill(4))
-    )
+    from ..layout import active_iteration_dir
+
+    return active_iteration_dir(campaign_dir, int(iteration))
 
 
 def active_iteration_committed(state: CampaignState, iteration: int) -> bool:
     """Return true when active iteration ``iteration`` is fully committed.
 
-    Version 0 is the bootstrap set.  Active iteration ``i`` is represented by
-    reference-data/model version ``i + 1`` once APPEND and FEREBUS have both
-    completed.
+    Version 0 is bootstrap. Active iteration ``i`` commits reference-data and
+    model version ``i``.
     """
     try:
         reference_data_version = int(getattr(state, "reference_data_version", -1))
         models_version = int(getattr(state, "models_version", -1))
     except (TypeError, ValueError):
         return False
-    return min(reference_data_version, models_version) >= int(iteration) + 1
+    return min(reference_data_version, models_version) >= int(iteration)
 
 
 def active_iteration_reference_data_committed(
@@ -81,7 +79,7 @@ def active_iteration_reference_data_committed(
         )
     except (TypeError, ValueError):
         return False
-    return reference_data_version >= int(iteration) + 1
+    return reference_data_version >= int(iteration)
 
 
 def _has_version(versions: Sequence[int], version: int) -> bool:
@@ -111,8 +109,10 @@ def _require_pool(campaign: Path) -> None:
 
 
 def _require_phase_a(campaign: Path) -> None:
+    from ..layout import bootstrap_selection_dir
+
     read_phase_a_sample_manifest(
-        campaign / "3_DIVERSITY_SAMPLING" / "initial",
+        bootstrap_selection_dir(campaign),
         require_nonempty=True,
     )
 
@@ -317,7 +317,7 @@ def _phase_b_final_count(campaign: Path, iteration: int) -> int:
         expected_iteration=int(iteration),
         require_nonempty=True,
     )
-    sample = idir / "phase_b_SAMPLE.xyz"
+    sample = Path(str(manifest["selected_xyz"]["path"]))
     if not sample.is_file():
         raise FileNotFoundError("Phase B sample xyz missing: " + str(sample))
     n_frames = _count_xyz_frames(sample)
@@ -337,21 +337,25 @@ def _require_phase_b(campaign: Path, iteration: int) -> None:
 
 
 def _require_split(campaign: Path, iteration: int) -> None:
-    path = iteration_dir(campaign, iteration) / "split.json"
+    from ..layout import active_allocation_dir
+    from ..point_allocation import point_allocation_path
+
+    idir = iteration_dir(campaign, iteration)
+    path = active_allocation_dir(idir) / "SPLIT_RECEIPT.json"
     if not path.is_file():
-        raise FileNotFoundError("split.json missing: " + str(path))
+        raise FileNotFoundError("SPLIT_RECEIPT.json missing: " + str(path))
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        raise RecoveryContractError("split.json unreadable: " + str(path)) from exc
+        raise RecoveryContractError("SPLIT_RECEIPT.json unreadable: " + str(path)) from exc
     if not isinstance(data, dict):
-        raise RecoveryContractError("split.json must be a JSON object")
-    if int(data.get("schema_version", -1)) != 2:
-        raise RecoveryContractError("split.json schema 2 is required")
+        raise RecoveryContractError("SPLIT_RECEIPT.json must be a JSON object")
+    if int(data.get("schema_version", -1)) != 3:
+        raise RecoveryContractError("SPLIT_RECEIPT.json schema 3 is required")
     if int(data.get("iteration")) != int(iteration):
-        raise RecoveryContractError("split.json iteration mismatch")
+        raise RecoveryContractError("SPLIT_RECEIPT.json iteration mismatch")
     if str(data.get("strategy")) != "exact_pre_qm_point_allocation":
-        raise RecoveryContractError("split.json strategy is invalid")
+        raise RecoveryContractError("SPLIT_RECEIPT.json strategy is invalid")
     allocation = _require_point_allocation(
         campaign,
         context="active",
@@ -359,7 +363,22 @@ def _require_split(campaign: Path, iteration: int) -> None:
     )
     slots = data.get("slots")
     if not isinstance(slots, list) or len(slots) != int(allocation["targets"]["total"]):
-        raise RecoveryContractError("split.json slots do not match point allocation")
+        raise RecoveryContractError("SPLIT_RECEIPT.json slots do not match point allocation")
+    if str(data.get("slot_assignment_sha256") or "") != str(
+        allocation.get("slot_assignment_sha256") or ""
+    ):
+        raise RecoveryContractError("SPLIT_RECEIPT.json assignment hash mismatch")
+    allocation_path = Path(
+        str(data.get("point_allocation_manifest") or "")
+    )
+    if not allocation_path.is_absolute():
+        allocation_path = idir / allocation_path
+    if allocation_path.resolve() != point_allocation_path(
+        campaign,
+        context="active",
+        iteration=int(iteration),
+    ).resolve():
+        raise RecoveryContractError("SPLIT_RECEIPT.json allocation path mismatch")
     expected = {
         int(slot["slot_id"]): (
             str(slot["split"]),
@@ -370,16 +389,16 @@ def _require_split(campaign: Path, iteration: int) -> None:
     observed: Dict[int, Tuple[str, str]] = {}
     for record in slots:
         if not isinstance(record, dict):
-            raise RecoveryContractError("split.json slot record is invalid")
+            raise RecoveryContractError("SPLIT_RECEIPT.json slot record is invalid")
         slot_id = int(record.get("slot_id", -1))
         if slot_id in observed:
-            raise RecoveryContractError("split.json slot IDs contain duplicates")
+            raise RecoveryContractError("SPLIT_RECEIPT.json slot IDs contain duplicates")
         observed[slot_id] = (
             str(record.get("split") or ""),
             str(record.get("candidate_id") or ""),
         )
     if observed != expected:
-        raise RecoveryContractError("split.json does not reproduce point allocation")
+        raise RecoveryContractError("SPLIT_RECEIPT.json does not reproduce point allocation")
 
 
 def _require_reference_data_version(campaign: Path, version: int) -> None:
@@ -413,7 +432,7 @@ def _require_ferebus_needed(campaign: Path, reference_data_version: int, model_v
 
 
 def _active_iteration_for_reference_data_version(reference_data_version: int) -> int:
-    return max(0, int(reference_data_version) - 1)
+    return int(reference_data_version)
 
 
 def _allocation_recovery_decision(
@@ -433,13 +452,13 @@ def _allocation_recovery_decision(
     except Exception:
         return None
     summary = dict(allocation.get("summary") or {})
-    allocation_artifact = (
-        "3_DIVERSITY_SAMPLING/initial/POINT_ALLOCATION.json"
-        if context == "bootstrap"
-        else "7_ACTIVE_LEARNING/iteration-"
-        + str(int(iteration)).zfill(4)
-        + "/POINT_ALLOCATION.json"
-    )
+    from ..point_allocation import point_allocation_path
+
+    allocation_artifact = point_allocation_path(
+        campaign,
+        context=str(context),
+        iteration=int(iteration),
+    ).relative_to(campaign).as_posix()
     if bool(summary.get("complete", False)):
         return RecoveryDecision(
             CampaignPhase.INITIAL_FEREBUS if context == "bootstrap" else CampaignPhase.APPEND,
@@ -644,45 +663,56 @@ def _best_active_iteration_handoff(campaign: Path, iteration: int) -> Optional[R
             "point_allocation",
         )
     if _ok(_require_split, campaign, int(iteration)):
+        from ..layout import active_allocation_dir
+
         return RecoveryHandoff(
             RecoveryDecision(
                 CampaignPhase.GAUSSIAN,
                 int(iteration),
                 "GAUSSIAN: valid split handoff exists",
-                str(iteration_dir(campaign, iteration) / "split.json"),
+                str(
+                    active_allocation_dir(iteration_dir(campaign, iteration))
+                    / "SPLIT_RECEIPT.json"
+                ),
             ),
             40,
             "split",
         )
     if _ok(_require_phase_b, campaign, int(iteration)):
+        from ..handoff_manifests import phase_b_selection_path
+
         return RecoveryHandoff(
             RecoveryDecision(
                 CampaignPhase.SPLIT,
                 int(iteration),
                 "SPLIT: valid Phase B handoff exists",
-                str(iteration_dir(campaign, iteration) / "PHASE_B_SELECTION.json"),
+                str(phase_b_selection_path(iteration_dir(campaign, iteration))),
             ),
             30,
             "phase_b",
         )
     if _ok(_require_ariadne_results, campaign, int(iteration)):
+        from ..handoff_manifests import ariadne_results_path
+
         return RecoveryHandoff(
             RecoveryDecision(
                 CampaignPhase.PHASE_B_POLUS,
                 int(iteration),
                 "PHASE_B_POLUS: valid ARIADNE results handoff exists",
-                str(iteration_dir(campaign, iteration) / "ARIADNE_RESULTS.json"),
+                str(ariadne_results_path(iteration_dir(campaign, iteration))),
             ),
             20,
             "ariadne_results",
         )
     if _ok(_require_seeds, campaign, int(iteration)):
+        from ..handoff_manifests import seeds_picked_path
+
         return RecoveryHandoff(
             RecoveryDecision(
                 CampaignPhase.ARIADNE_ARRAY,
                 int(iteration),
                 "ARIADNE_ARRAY: valid seed-selection handoff exists",
-                str(iteration_dir(campaign, iteration) / "seeds_picked.json"),
+                str(seeds_picked_path(iteration_dir(campaign, iteration))),
             ),
             10,
             "seeds",
@@ -696,16 +726,17 @@ def active_iteration_handoff_decisions(
 ) -> List[RecoveryDecision]:
     """Return the furthest valid AL handoff for each uncommitted iteration."""
     campaign = Path(campaign_dir)
-    root = campaign / "7_ACTIVE_LEARNING"
+    root = active_learning_dir(campaign)
     if not root.is_dir():
         return []
     decisions: List[RecoveryDecision] = []
+    from ..layout import parse_active_iteration_name
+
     for path in sorted(root.glob("iteration-*")):
         if not path.is_dir() or path.is_symlink():
             continue
-        suffix = path.name[len("iteration-"):]
         try:
-            iteration = int(suffix)
+            iteration = parse_active_iteration_name(path.name)
         except ValueError:
             continue
         if active_iteration_committed(state, iteration):
@@ -805,11 +836,11 @@ def _phase_contract_checks(
             ("trajectory pool", lambda: _require_pool(campaign)),
         ],
         CampaignPhase.ARIADNE_ARRAY: [
-            ("seeds_picked.json", lambda: _require_seeds(campaign, iteration)),
+            ("seed_selection/SELECTION.json", lambda: _require_seeds(campaign, iteration)),
         ],
         CampaignPhase.PHASE_B_POLUS: [
             (
-                "ARIADNE_RESULTS.json",
+                "ariadne/RESULTS.json",
                 lambda: _require_ariadne_results(campaign, iteration),
             ),
         ],
@@ -824,7 +855,7 @@ def _phase_contract_checks(
                 "Phase B selection/sample",
                 lambda: _require_phase_b(campaign, iteration),
             ),
-            ("split.json", lambda: _require_split(campaign, iteration)),
+            ("allocation/SPLIT_RECEIPT.json", lambda: _require_split(campaign, iteration)),
         ],
         CampaignPhase.AIMALL: [
             (
@@ -983,7 +1014,7 @@ def select_recovery_phase(
                 CampaignPhase.INITIAL_GAUSSIAN,
                 iteration,
                 "INITIAL_GAUSSIAN: valid Phase A sample exists without committed models",
-                "3_DIVERSITY_SAMPLING/initial/PHASE_A_SAMPLE.json",
+                "BOOTSTRAP/selection/SELECTION.json",
             )
         if (
             bool(last_phase_retryable)
@@ -1031,6 +1062,14 @@ def select_recovery_phase(
                 ),
             )
 
+    if reference_data_version == 0 and model_version == 0:
+        return RecoveryDecision(
+            CampaignPhase.SEED_SELECT,
+            1,
+            "SEED_SELECT: bootstrap reference data and models are committed",
+            "BOOTSTRAP/BOOTSTRAP_MANIFEST.json",
+        )
+
     if reference_data_version == model_version and reference_data_version >= 1:
         canonical_iteration = _active_iteration_for_reference_data_version(reference_data_version)
         if iteration != canonical_iteration and active_iteration_committed(
@@ -1058,7 +1097,7 @@ def select_recovery_phase(
         if _has_version(valid_reference_data_versions, reference_data_version):
             return RecoveryDecision(
                 CampaignPhase.FEREBUS,
-                max(0, reference_data_version - 1),
+                int(reference_data_version),
                 "FEREBUS: committed reference data is one version ahead of committed models",
                 str(
                     ReferenceDataVersioning(

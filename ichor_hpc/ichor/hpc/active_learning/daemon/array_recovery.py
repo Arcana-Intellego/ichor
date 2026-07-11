@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -52,7 +53,7 @@ def array_ledger_path(
     phase = str(getattr(phase_name, "value", phase_name))
     safe_phase = phase.replace("/", "_").replace("\\", "_")
     return array_recovery_dir(campaign_dir) / (
-        safe_phase + "-" + str(int(iteration)).zfill(4) + ".json"
+        safe_phase + "-" + str(int(iteration)).zfill(6) + ".json"
     )
 
 
@@ -67,7 +68,7 @@ def retry_task_file_path(
         Path(campaign_dir)
         / ".DATA"
         / "ACTIVE_LEARNING"
-        / (RETRY_TASKS_FILENAME_PREFIX + "." + safe_phase + "." + str(int(iteration)).zfill(4) + ".txt")
+        / (RETRY_TASKS_FILENAME_PREFIX + "." + safe_phase + "." + str(int(iteration)).zfill(6) + ".txt")
     )
 
 
@@ -102,25 +103,6 @@ def _read_point_paths(points_file: Path) -> List[Path]:
     return out
 
 
-def _load_seed_records(campaign_dir: Union[str, Path], iteration: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    from ..handoff_manifests import load_seeds_picked
-
-    iter_dir = (
-        Path(campaign_dir)
-        / "7_ACTIVE_LEARNING"
-        / ("iteration-" + str(int(iteration)).zfill(4))
-    )
-    picked = load_seeds_picked(iter_dir, expected_iteration=int(iteration))
-    records = list(picked.get("seed_records") or [])
-    if not records:
-        frame_ids = list(picked.get("frame_ids") or [])
-        records = [
-            {"seed_index": int(i), "frame_id": frame_id}
-            for i, frame_id in enumerate(frame_ids)
-        ]
-    return records, picked
-
-
 def logical_task_ids(
     campaign_dir: Union[str, Path],
     phase_name: Any,
@@ -130,14 +112,14 @@ def logical_task_ids(
     if not supports_partial_array_recovery(phase):
         return []
     if phase == "ARIADNE_ARRAY":
-        records, _picked = _load_seed_records(campaign_dir, int(iteration))
-        ids: List[int] = []
-        for record in records:
-            try:
-                ids.append(int(record.get("seed_index")))
-            except (TypeError, ValueError):
-                continue
-        return sorted(set(ids))
+        from ..layout import active_iteration_dir
+        from ..seed_identity import read_ariadne_task_map
+
+        task_map = read_ariadne_task_map(
+            active_iteration_dir(campaign_dir, int(iteration)),
+            expected_iteration=int(iteration),
+        )
+        return [int(task["array_task_id"]) for task in task_map["tasks"]]
     points = _read_point_paths(_points_file(campaign_dir, phase, int(iteration)))
     return list(range(len(points)))
 
@@ -180,38 +162,41 @@ def _validate_ariadne_task(
     iteration: int,
     task_id: int,
 ) -> Tuple[bool, str, str]:
-    iter_dir = (
-        Path(campaign_dir)
-        / "7_ACTIVE_LEARNING"
-        / ("iteration-" + str(int(iteration)).zfill(4))
-    )
-    seed_dir = iter_dir / "pool" / ("seed_" + str(int(task_id)).zfill(4))
-    result_path = seed_dir / "result.json"
-    if not result_path.is_file():
-        return False, "missing_result_json", str(result_path.resolve(strict=False))
-    try:
-        from ..handoff_manifests import validate_ariadne_result
+    from ..ariadne_outputs import validate_seed_output
+    from ..layout import active_iteration_dir, ariadne_seed_dir
+    from ..seed_identity import read_ariadne_task_map, task_for_array_task_id
 
-        records, picked = _load_seed_records(campaign_dir, int(iteration))
-        by_seed = {
-            int(record.get("seed_index")): dict(record)
-            for record in records
-            if record.get("seed_index") is not None
-        }
-        seed_record = by_seed.get(int(task_id))
-        if seed_record is None:
-            return False, "seed_record_missing", str(result_path.resolve(strict=False))
-        payload = json.loads(result_path.read_text(encoding="utf-8"))
-        validate_ariadne_result(
-            payload,
+    iter_dir = active_iteration_dir(campaign_dir, int(iteration))
+    try:
+        task_map = read_ariadne_task_map(
+            iter_dir,
             expected_iteration=int(iteration),
-            seed_record=seed_record,
-            expected_trajectory_sha256=str(picked.get("trajectory_sha256") or ""),
-            accept_legacy_missing_landing_safety=True,
         )
-        return True, "", str(result_path.resolve(strict=False))
+        task = task_for_array_task_id(task_map, int(task_id))
+        seed_dir = ariadne_seed_dir(iter_dir, int(task["seed_id"]))
+        output = validate_seed_output(
+            seed_dir,
+            expected_campaign_uid=str(task_map["campaign_uid"]),
+            expected_iteration=int(iteration),
+            expected_seed_id=int(task["seed_id"]),
+            expected_seed_uid=str(task["seed_uid"]),
+            expected_array_task_id=int(task_id),
+        )
+        if not bool(output.get("task_success", False)):
+            return False, "task_success_false", str(seed_dir.resolve(strict=False))
+        try:
+            task_exit_code = int(output.get("task_exit_code", 1))
+        except (TypeError, ValueError):
+            return False, "task_exit_code_invalid", str(seed_dir.resolve(strict=False))
+        if task_exit_code != 0:
+            return (
+                False,
+                "task_exit_code_" + str(task_exit_code),
+                str(seed_dir.resolve(strict=False)),
+            )
+        return True, "", str(seed_dir.resolve(strict=False))
     except Exception as exc:
-        return False, type(exc).__name__ + ": " + str(exc)[:160], str(result_path.resolve(strict=False))
+        return False, type(exc).__name__ + ": " + str(exc)[:160], str(iter_dir.resolve(strict=False))
 
 
 def _validate_task(
@@ -397,32 +382,39 @@ def archive_existing_array_task_outputs(
     if not supports_partial_array_recovery(phase):
         raise ValueError("phase does not support array output archive: " + phase)
     campaign = Path(campaign_dir)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    stamp = (
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        + "-"
+        + uuid.uuid4().hex[:8]
+    )
     archive_root = (
         campaign
         / ".DATA"
         / "ACTIVE_LEARNING"
-        / "array_task_archives"
-        / (phase + "-" + str(int(iteration)).zfill(4) + "-" + stamp)
+        / "arr"
+        / phase
+        / (str(int(iteration)).zfill(6) + "-" + stamp)
     )
     ids = [int(x) for x in (task_ids if task_ids is not None else logical_task_ids(campaign, phase, int(iteration)))]
     archived: List[str] = []
     for task_id in ids:
-        task_archive = archive_root / ("task_" + str(int(task_id)).zfill(4))
+        task_archive = archive_root / str(int(task_id)).zfill(6)
         if phase == "ARIADNE_ARRAY":
-            seed_dir = (
-                campaign
-                / "7_ACTIVE_LEARNING"
-                / ("iteration-" + str(int(iteration)).zfill(4))
-                / "pool"
-                / ("seed_" + str(int(task_id)).zfill(4))
+            from ..layout import active_iteration_dir, ariadne_seed_dir
+            from ..seed_identity import read_ariadne_task_map, task_for_array_task_id
+
+            iter_dir = active_iteration_dir(campaign, int(iteration))
+            task_map = read_ariadne_task_map(
+                iter_dir,
+                expected_iteration=int(iteration),
             )
-            for candidate in [seed_dir / "result.json", seed_dir / "ARIADNE_TRACE.jsonl"]:
-                moved = _move_if_exists(candidate, task_archive, campaign)
-                if moved:
-                    archived.append(moved)
-            tmp_candidates = sorted(seed_dir.glob("result.json.*.tmp")) if seed_dir.is_dir() else []
-            for candidate in tmp_candidates:
+            task = task_for_array_task_id(task_map, int(task_id))
+            seed_dir = ariadne_seed_dir(iter_dir, int(task["seed_id"]))
+            moved = _move_if_exists(seed_dir, task_archive, campaign)
+            if moved:
+                archived.append(moved)
+            partial_pattern = "." + seed_dir.name + ".partial-*"
+            for candidate in sorted(seed_dir.parent.glob(partial_pattern)):
                 moved = _move_if_exists(candidate, task_archive, campaign)
                 if moved:
                     archived.append(moved)

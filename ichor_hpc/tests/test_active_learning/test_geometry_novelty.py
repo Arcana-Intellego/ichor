@@ -6,6 +6,17 @@ import pytest
 from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.geometry_protocol import PHASE_B_MIN_SEPARATION_SCALE
+from ichor.hpc.active_learning.handoff_manifests import (
+    ariadne_landing_audit_path,
+    ariadne_results_path,
+    seeds_picked_path,
+)
+from ichor.hpc.active_learning.layout import active_iteration_dir
+from ichor.hpc.active_learning.seed_identity import (
+    deterministic_seed_uid,
+    selection_fingerprint_sha256,
+)
+from ichor.hpc.active_learning.daemon.state import atomic_write_json
 from ichor.hpc.active_learning.geometry_novelty import (
     apply_geometry_novelty_to_acquisition_config,
     compute_geometry_novelty_scale,
@@ -28,9 +39,51 @@ FIXTURE = (
 )
 
 
-def _iter_dir(campaign, iteration=0):
-    path = campaign / "7_ACTIVE_LEARNING" / ("iteration-" + str(iteration).zfill(4))
+def _iter_dir(campaign, iteration=1):
+    path = active_iteration_dir(campaign, iteration)
     path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _write_seed_selection(iter_dir, frame_ids, *, trajectory_sha256="a" * 64, neighbours=None):
+    iteration = int(iter_dir.name.split("-")[-1])
+    records = []
+    for seed_id, frame_id in enumerate(frame_ids, start=1):
+        record = {
+            "seed_id": seed_id,
+            "frame_id": int(frame_id),
+            "pool_row_index_zero_based": int(frame_id),
+            "selection_origin": "bulk",
+            "variance_at_selection": 0.0,
+        }
+        if neighbours and int(frame_id) in neighbours:
+            record["subspace_neighbour_frame_ids"] = list(neighbours[int(frame_id)])
+        records.append(record)
+    payload = {
+        "schema_version": 2,
+        "campaign_uid": "geometry-novelty-test",
+        "iteration": iteration,
+        "models_version": 0,
+        "model_manifest_sha256": "c" * 64,
+        "trajectory_sha256": str(trajectory_sha256),
+        "n_picked": len(records),
+        "seed_records": records,
+    }
+    fingerprint = selection_fingerprint_sha256(payload)
+    payload["selection_fingerprint_sha256"] = fingerprint
+    for record in records:
+        record["seed_uid"] = deterministic_seed_uid(
+            campaign_uid="geometry-novelty-test",
+            iteration=iteration,
+            seed_id=int(record["seed_id"]),
+            frame_id=int(record["frame_id"]),
+            models_version=0,
+            model_manifest_sha256="c" * 64,
+            selection_fingerprint_sha256_value=fingerprint,
+        )
+    path = seeds_picked_path(iter_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(path, payload)
     return path
 
 
@@ -39,7 +92,7 @@ def test_geometry_novelty_falls_back_when_pool_history_missing(tmp_path):
     cfg.geometry_novelty.fallback_scale_angstrom = 0.04
     iter_dir = _iter_dir(tmp_path)
 
-    payload = compute_geometry_novelty_scale(tmp_path, cfg, iteration=0)
+    payload = compute_geometry_novelty_scale(tmp_path, cfg, iteration=1)
     path = write_geometry_novelty_scale(iter_dir, payload)
     loaded = read_geometry_novelty_scale(iter_dir)
 
@@ -54,29 +107,9 @@ def test_geometry_novelty_uses_seed_neighbour_motion(tmp_path):
     cfg = CampaignConfig()
     TrajectoryPool.import_from(FIXTURE, tmp_path)
     iter_dir = _iter_dir(tmp_path)
-    (iter_dir / "seeds_picked.json").write_text(
-        json.dumps(
-            {
-                "iteration": 0,
-                "n_picked": 1,
-                "frame_ids": [0],
-                "indices": [0],
-                "seed_records": [
-                    {
-                        "seed_index": 0,
-                        "frame_id": 0,
-                        "selection_index": 0,
-                        "selection_origin": "bulk",
-                        "variance_at_selection": 0.0,
-                        "subspace_neighbour_frame_ids": [1, 2],
-                    }
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
+    _write_seed_selection(iter_dir, [0], neighbours={0: [1, 2]})
 
-    payload = compute_geometry_novelty_scale(tmp_path, cfg, iteration=0)
+    payload = compute_geometry_novelty_scale(tmp_path, cfg, iteration=1)
 
     assert payload["fallback_used"] is False
     assert payload["n_values"] == 2
@@ -116,19 +149,9 @@ def test_geometry_novelty_nearest_neighbour_fallback_is_not_trajectory_adjacent(
     )
     TrajectoryPool.import_from(source, tmp_path)
     iter_dir = _iter_dir(tmp_path)
-    (iter_dir / "seeds_picked.json").write_text(
-        json.dumps(
-            {
-                "iteration": 0,
-                "n_picked": 1,
-                "frame_ids": [0],
-                "indices": [0],
-            }
-        ),
-        encoding="utf-8",
-    )
+    _write_seed_selection(iter_dir, [0])
 
-    payload = compute_geometry_novelty_scale(tmp_path, cfg, iteration=0)
+    payload = compute_geometry_novelty_scale(tmp_path, cfg, iteration=1)
 
     assert payload["fallback_used"] is False
     assert payload["n_values"] == 1
@@ -141,30 +164,31 @@ def test_geometry_novelty_nearest_neighbour_fallback_is_not_trajectory_adjacent(
 def test_geometry_novelty_movement_history_reads_ariadne_landing_audit(tmp_path):
     cfg = CampaignConfig()
     cfg.geometry_novelty.scale_source = "movement_history"
-    iter0 = _iter_dir(tmp_path, iteration=0)
-    (iter0 / "ARIADNE_LANDING_AUDIT.json").write_text(
+    iter1 = _iter_dir(tmp_path, iteration=1)
+    ariadne_landing_audit_path(iter1).parent.mkdir(parents=True, exist_ok=True)
+    ariadne_landing_audit_path(iter1).write_text(
         json.dumps(
             {
                 "schema_version": 1,
-                "iteration": 0,
+                "iteration": 1,
                 "summary": {},
                 "seeds": [
                     {
-                        "seed_index": 0,
+                        "seed_id": 1,
                         "landing_safety": {
                             "accepted": True,
                             "metrics": {"movement_rmsd_ang": 0.07},
                         },
                     },
                     {
-                        "seed_index": 1,
+                        "seed_id": 2,
                         "landing_safety": {
                             "accepted": False,
                             "metrics": {"movement_rmsd_ang": 9.0},
                         },
                     },
                     {
-                        "seed_index": 2,
+                        "seed_id": 3,
                         "handoff_accepted": False,
                         "landing_safety": {
                             "accepted": True,
@@ -177,7 +201,7 @@ def test_geometry_novelty_movement_history_reads_ariadne_landing_audit(tmp_path)
         encoding="utf-8",
     )
 
-    payload = compute_geometry_novelty_scale(tmp_path, cfg, iteration=1)
+    payload = compute_geometry_novelty_scale(tmp_path, cfg, iteration=2)
 
     assert payload["fallback_used"] is False
     assert payload["scale_angstrom"] == pytest.approx(0.07)
@@ -191,15 +215,16 @@ def test_geometry_novelty_movement_history_reads_ariadne_landing_audit(tmp_path)
 def test_geometry_novelty_movement_history_falls_back_to_ariadne_results(tmp_path):
     cfg = CampaignConfig()
     cfg.geometry_novelty.scale_source = "movement_history"
-    iter0 = _iter_dir(tmp_path, iteration=0)
-    (iter0 / "ARIADNE_RESULTS.json").write_text(
+    iter1 = _iter_dir(tmp_path, iteration=1)
+    ariadne_results_path(iter1).parent.mkdir(parents=True, exist_ok=True)
+    ariadne_results_path(iter1).write_text(
         json.dumps(
             {
                 "schema_version": 1,
-                "iteration": 0,
+                "iteration": 1,
                 "accepted": [
                     {
-                        "seed_index": 0,
+                        "seed_id": 1,
                         "landing_safety": {
                             "accepted": True,
                             "metrics": {"aligned_mass_weighted_rmsd_ang": 0.09},
@@ -212,7 +237,7 @@ def test_geometry_novelty_movement_history_falls_back_to_ariadne_results(tmp_pat
         encoding="utf-8",
     )
 
-    payload = compute_geometry_novelty_scale(tmp_path, cfg, iteration=1)
+    payload = compute_geometry_novelty_scale(tmp_path, cfg, iteration=2)
 
     assert payload["fallback_used"] is False
     assert payload["scale_angstrom"] == pytest.approx(0.09)
@@ -272,14 +297,14 @@ def test_ensure_geometry_novelty_scale_recomputes_sidecar_without_fingerprint(tm
         iter_dir,
         {
             "schema_version": 1,
-            "iteration": 0,
+            "iteration": 1,
             "scale_angstrom": 0.04,
             "fallback_used": True,
             "n_values": 0,
         },
     )
 
-    payload = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=0)
+    payload = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=1)
     loaded = read_geometry_novelty_scale(iter_dir)
 
     assert payload["scale_angstrom"] == pytest.approx(0.04)
@@ -292,10 +317,10 @@ def test_ensure_geometry_novelty_scale_backfills_current_sidecar_resolved_consum
     cfg = CampaignConfig()
     cfg.geometry_novelty.fallback_scale_angstrom = 0.04
     iter_dir = _iter_dir(tmp_path)
-    payload = compute_geometry_novelty_scale(tmp_path, cfg, iteration=0)
+    payload = compute_geometry_novelty_scale(tmp_path, cfg, iteration=1)
     write_geometry_novelty_scale(iter_dir, payload)
 
-    loaded = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=0)
+    loaded = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=1)
 
     assert "input_fingerprint_mismatch_recomputed" not in loaded["reasons"]
     assert "missing_input_fingerprint_recomputed" not in loaded["reasons"]
@@ -308,9 +333,9 @@ def test_ensure_geometry_novelty_scale_reuses_current_sidecar_without_rewrite(tm
     cfg.geometry_novelty.fallback_scale_angstrom = 0.04
     iter_dir = _iter_dir(tmp_path)
 
-    first = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=0)
+    first = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=1)
     before = geometry_novelty_scale_path(iter_dir).read_text(encoding="utf-8")
-    second = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=0)
+    second = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=1)
     after = geometry_novelty_scale_path(iter_dir).read_text(encoding="utf-8")
 
     assert second == first
@@ -321,34 +346,19 @@ def test_geometry_novelty_recomputes_when_seed_selection_changes(tmp_path):
     cfg = CampaignConfig()
     cfg.geometry_novelty.fallback_scale_angstrom = 0.04
     iter_dir = _iter_dir(tmp_path)
-    seed_path = iter_dir / "seeds_picked.json"
-    seed_path.write_text(
-        json.dumps(
-            {
-                "iteration": 0,
-                "n_picked": 1,
-                "frame_ids": [0],
-                "indices": [0],
-                "trajectory_sha256": "a" * 64,
-            }
-        ),
-        encoding="utf-8",
+    seed_path = _write_seed_selection(
+        iter_dir,
+        [0],
+        trajectory_sha256="a" * 64,
     )
-    first = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=0)
+    first = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=1)
 
-    seed_path.write_text(
-        json.dumps(
-            {
-                "iteration": 0,
-                "n_picked": 1,
-                "frame_ids": [0],
-                "indices": [0],
-                "trajectory_sha256": "b" * 64,
-            }
-        ),
-        encoding="utf-8",
+    _write_seed_selection(
+        iter_dir,
+        [0],
+        trajectory_sha256="b" * 64,
     )
-    second = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=0)
+    second = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=1)
 
     assert second["input_fingerprint"]["trajectory_sha256"] == "b" * 64
     assert second["input_fingerprint"] != first["input_fingerprint"]
@@ -361,10 +371,10 @@ def test_geometry_novelty_recomputes_when_seed_selection_changes(tmp_path):
 def test_geometry_novelty_recomputes_when_config_changes(tmp_path):
     cfg = CampaignConfig()
     cfg.geometry_novelty.fallback_scale_angstrom = 0.04
-    ensure_geometry_novelty_scale(tmp_path, cfg, iteration=0)
+    ensure_geometry_novelty_scale(tmp_path, cfg, iteration=1)
 
     cfg.geometry_novelty.statistic = "p75"
-    payload = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=0)
+    payload = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=1)
 
     assert payload["statistic"] == "p75"
     assert "input_fingerprint_mismatch_recomputed" in payload["reasons"]
@@ -375,13 +385,14 @@ def test_geometry_novelty_recomputes_when_config_changes(tmp_path):
 def test_geometry_novelty_fingerprint_omits_history_for_local_motion(tmp_path):
     cfg = CampaignConfig()
     cfg.geometry_novelty.scale_source = "local_motion"
-    iter0 = _iter_dir(tmp_path, iteration=0)
-    (iter0 / "ARIADNE_LANDING_AUDIT.json").write_text(
+    iter1 = _iter_dir(tmp_path, iteration=1)
+    ariadne_landing_audit_path(iter1).parent.mkdir(parents=True, exist_ok=True)
+    ariadne_landing_audit_path(iter1).write_text(
         json.dumps({"schema_version": 1, "seeds": []}),
         encoding="utf-8",
     )
 
-    fingerprint = geometry_novelty_input_fingerprint(tmp_path, cfg, iteration=1)
+    fingerprint = geometry_novelty_input_fingerprint(tmp_path, cfg, iteration=2)
 
     assert fingerprint["history_source_files"] == []
 
@@ -389,16 +400,17 @@ def test_geometry_novelty_fingerprint_omits_history_for_local_motion(tmp_path):
 def test_geometry_novelty_recomputes_when_history_file_changes(tmp_path):
     cfg = CampaignConfig()
     cfg.geometry_novelty.scale_source = "movement_history"
-    iter0 = _iter_dir(tmp_path, iteration=0)
-    audit = iter0 / "ARIADNE_LANDING_AUDIT.json"
+    iter1 = _iter_dir(tmp_path, iteration=1)
+    ariadne_landing_audit_path(iter1).parent.mkdir(parents=True, exist_ok=True)
+    audit = ariadne_landing_audit_path(iter1)
     audit.write_text(
         json.dumps(
             {
                 "schema_version": 1,
-                "iteration": 0,
+                "iteration": 1,
                 "seeds": [
                     {
-                        "seed_index": 0,
+                        "seed_id": 1,
                         "landing_safety": {
                             "accepted": True,
                             "metrics": {"movement_rmsd_ang": 0.07},
@@ -409,17 +421,17 @@ def test_geometry_novelty_recomputes_when_history_file_changes(tmp_path):
         ),
         encoding="utf-8",
     )
-    first = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=1)
+    first = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=2)
     assert first["scale_angstrom"] == pytest.approx(0.07)
 
     audit.write_text(
         json.dumps(
             {
                 "schema_version": 1,
-                "iteration": 0,
+                "iteration": 1,
                 "seeds": [
                     {
-                        "seed_index": 0,
+                        "seed_id": 1,
                         "landing_safety": {
                             "accepted": True,
                             "metrics": {"movement_rmsd_ang": 0.11},
@@ -430,7 +442,7 @@ def test_geometry_novelty_recomputes_when_history_file_changes(tmp_path):
         ),
         encoding="utf-8",
     )
-    second = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=1)
+    second = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=2)
 
     assert second["scale_angstrom"] == pytest.approx(0.11)
     assert "input_fingerprint_mismatch_recomputed" in second["reasons"]
@@ -441,28 +453,18 @@ def test_geometry_novelty_recomputes_when_history_file_changes(tmp_path):
 def test_geometry_novelty_sidecar_records_provenance_and_checks_iteration(tmp_path):
     cfg = CampaignConfig()
     iter_dir = _iter_dir(tmp_path)
-    (iter_dir / "seeds_picked.json").write_text(
-        json.dumps(
-            {
-                "iteration": 0,
-                "n_picked": 1,
-                "frame_ids": [0],
-                "indices": [0],
-                "trajectory_sha256": "a" * 64,
-            }
-        ),
-        encoding="utf-8",
-    )
+    _write_seed_selection(iter_dir, [0], trajectory_sha256="a" * 64)
 
-    payload = compute_geometry_novelty_scale(tmp_path, cfg, iteration=0)
+    payload = compute_geometry_novelty_scale(tmp_path, cfg, iteration=1)
     write_geometry_novelty_scale(iter_dir, payload)
-    loaded = read_geometry_novelty_scale(iter_dir, expected_iteration=0)
+    loaded = read_geometry_novelty_scale(iter_dir, expected_iteration=1)
 
     assert loaded["provenance"]["trajectory_sha256"] == "a" * 64
-    assert loaded["provenance"]["seed_selection_manifest"].endswith("seeds_picked.json")
+    selection_path = Path(loaded["provenance"]["seed_selection_manifest"])
+    assert selection_path.parts[-2:] == ("seed_selection", "SELECTION.json")
     assert len(loaded["provenance"]["seed_selection_sha256"]) == 64
     with pytest.raises(ValueError, match="iteration mismatch"):
-        read_geometry_novelty_scale(iter_dir, expected_iteration=1)
+        read_geometry_novelty_scale(iter_dir, expected_iteration=2)
 
 
 def test_geometry_novelty_applies_to_core_acquisition_config():

@@ -7,6 +7,7 @@ AIMAll batch.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import time
@@ -40,7 +41,9 @@ def model_path(campaign_dir: Any) -> Path:
 
 
 def audit_path(iter_dir: Any) -> Path:
-    return Path(iter_dir) / ERROR_CALIBRATION_AUDIT_FILENAME
+    from ..layout import active_calibration_dir
+
+    return active_calibration_dir(iter_dir) / ERROR_CALIBRATION_AUDIT_FILENAME
 
 
 def _cfg_value(config: Any, name: str, default: Any) -> Any:
@@ -346,7 +349,8 @@ def _total_error_records(records: Sequence[Mapping[str, Any]]) -> List[Dict[str,
             record.get("iteration"),
             record.get("model_version"),
             record.get("pointdir"),
-            record.get("seed_index"),
+            record.get("seed_id"),
+            record.get("seed_uid"),
             record.get("property", "iqa"),
         )
         grouped.setdefault(key, []).append(record)
@@ -369,14 +373,15 @@ def _total_error_records(records: Sequence[Mapping[str, Any]]) -> List[Dict[str,
             n_atoms += 1
         if n_atoms <= 0:
             continue
-        iteration, model_version, pointdir, seed_index, prop = key
+        iteration, model_version, pointdir, seed_id, seed_uid, prop = key
         totals.append(
             {
                 "schema_version": ERROR_CALIBRATION_SCHEMA_VERSION,
                 "iteration": iteration,
                 "model_version": model_version,
                 "pointdir": pointdir,
-                "seed_index": seed_index,
+                "seed_id": seed_id,
+                "seed_uid": seed_uid,
                 "property": prop,
                 "n_atoms": int(n_atoms),
                 "predicted_total_iqa_ha": float(pred_sum),
@@ -699,11 +704,12 @@ def _build_records_for_pointdir(
         model_version = int(model_version_raw)
     except (TypeError, ValueError):
         model_version = int(fallback_model_version)
-    seed_index = source.get("seed_index")
+    seed_id = source.get("seed_id")
     try:
-        seed_index_value = None if seed_index is None else int(seed_index)
+        seed_id_value = None if seed_id is None else int(seed_id)
     except (TypeError, ValueError):
-        seed_index_value = None
+        seed_id_value = None
+    seed_uid = str(source.get("seed_uid") or "") or None
 
     records: List[Dict[str, Any]] = []
     for q_atom in quality_atoms:
@@ -728,7 +734,8 @@ def _build_records_for_pointdir(
             "iteration": int(iteration),
             "model_version": int(model_version),
             "pointdir": pointdir.name,
-            "seed_index": seed_index_value,
+            "seed_id": seed_id_value,
+            "seed_uid": seed_uid,
             "atom": atom,
             "atom_type": str(pred.get("atom_type", "")),
             "property": str(pred.get("property", source.get("property", "iqa"))),
@@ -839,7 +846,10 @@ def synthetic_dry_records(
             "iteration": int(iteration),
             "model_version": int(models_version),
             "pointdir": "POINT_" + str(i).zfill(4) + ".pointdir",
-            "seed_index": int(i),
+            "seed_id": int(i) + 1,
+            "seed_uid": hashlib.sha256(
+                (str(iteration) + ":" + str(i + 1)).encode("ascii")
+            ).hexdigest(),
             "atom": "X1",
             "atom_type": "X",
             "property": "iqa",

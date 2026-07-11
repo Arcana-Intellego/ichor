@@ -26,7 +26,7 @@ def _daemon(tmp_path, *, attempts=2, settle_seconds=7, sleep_calls=None):
         campaign_dir=tmp_path / "campaign",
         config=cfg,
         executor=_StrictExecutor(treat_as_sbatch=set()),
-        sacct_poller=DryRunSacctPoller().poll,
+        sacct_poller=DryRunSacctPoller(),
         sleep_fn=lambda seconds: sleep_calls.append(seconds),
     )
 
@@ -34,6 +34,7 @@ def _daemon(tmp_path, *, attempts=2, settle_seconds=7, sleep_calls=None):
 def _write_seed_select_state(daemon):
     daemon.data_dir().mkdir(parents=True, exist_ok=True)
     state = fresh_campaign_state(max_iterations=2)
+    state.iteration = 1
     state.phase = CampaignPhase.SEED_SELECT
     state.reference_data_version = 0
     state.models_version = 0

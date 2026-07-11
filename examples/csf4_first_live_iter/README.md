@@ -412,9 +412,8 @@ When the daemon stops normally (state.phase == DONE), check:
 **state.json** should show:
 
 - `phase: DONE`
-- `iteration: 0` -- ICHOR iteration numbers are zero-indexed, so a
-  `max_iterations: 1` campaign exits with `iteration: 0`. A two-
-  iteration run would exit with `iteration: 1`, etc.
+- `iteration: 1` -- bootstrap is iteration 0; the first adversarial sampling
+  loop is active iteration 1. A two-iteration run exits with `iteration: 2`.
 - `reference_data_version: 1` (INITIAL + 1 iteration of APPEND)
 - `models_version: 1` (INITIAL_FEREBUS + 1 iteration of FEREBUS)
 - `reference_scales` populated with five real-float keys (energy, force,
@@ -431,7 +430,8 @@ expect at least 9 (one per SBATCH phase). more is also fine -- some
 phases run twice.
 
 **per-seed result.json** files should be at
-`7_ACTIVE_LEARNING/iteration-0000/pool/seed_NNNN/result.json`. each
+`ACTIVE_LEARNING/iteration-000001/ariadne/seeds/seed-000001/result.json`
+(and subsequent one-based seed directories). Each
 should have:
 
 - `wall_seconds` non-zero (real ARIADNE descent took time)
@@ -439,15 +439,20 @@ should have:
   rather than the synthetic alpha-delta fallback)
 - `alpha_trajectory` is non-empty (the descent made at least one step)
 
-**sampling outputs** at the iteration directory:
+**sampling outputs** under the active iteration:
 
-- `phase_b_SAMPLE.xyz` exists with the expected frame count
+- `phase_b/selected.xyz` exists with the expected frame count
   (`batch_training_size + batch_internal_validation_size` = 4)
-- `POINT_ALLOCATION.json` records three training slots and one internal
+- `allocation/POINT_ALLOCATION.json` records three training slots and one internal
   validation slot; failed QM candidates consume the finite Phase-B reserve
   without changing those slot assignments
-- `phase_b_dedup.json` exists; `n_dropped` is 0 by default (min_separation
-  = 0.0 means the filter is off)
+- `phase_b/SELECTION.json` binds both XYZ files, records the deduplication
+  decision, and points at the exact allocation and sampling-protocol manifests
+- every `ariadne/seeds/seed-NNNNNN/trajectory/` contains `trajectory.xyz`,
+  `metrics.jsonl`, and `MANIFEST.json`; the optional `trace.jsonl` carries the
+  detailed optimiser event stream
+- `ITERATION_MANIFEST.json` seals the exact recursive inventory and links to
+  the preceding active iteration manifest when one exists
 
 ## 9. tear-down and restart
 
@@ -468,7 +473,7 @@ For a clean re-run (wipes all on-disk state, keeps the trajectory pool):
 
 ```
 rm -rf .DATA/ACTIVE_LEARNING
-rm -rf 3_DIVERSITY_SAMPLING QM_REFERENCE_DATA TRAINED_MODELS 7_ACTIVE_LEARNING
+rm -rf BOOTSTRAP QM_REFERENCE_DATA TRAINED_MODELS ACTIVE_LEARNING
 # the trajectory pool at .DATA/TRAJECTORY/ is preserved
 ichor-al-daemon start --live --campaign-dir . --max-ticks 2000
 ```
@@ -501,9 +506,10 @@ as `~/.venv/ichor-csf4/bin/activate` was sourced before `ichor-al-daemon
 start --live`, the worker will find ariadne in the venv site-packages.
 Source the venv and re-launch.
 
-**phase_b_SAMPLE.xyz is empty**. probably means all the ARIADNE descents
-collapsed to the same geometry. inspect `7_ACTIVE_LEARNING/iteration-0000/
-pool/seed_*/result.json` to see if `whitened_distance_final` is suspiciously
+**`phase_b/selected.xyz` is empty**. This probably means all the ARIADNE
+descents collapsed to the same geometry. Inspect `ACTIVE_LEARNING/
+iteration-000001/ariadne/seeds/seed-*/result.json` and the corresponding
+`trajectory/trajectory.xyz` files to see if `whitened_distance_final` is suspiciously
 small across the board. if so, the acquisition might be miscalibrated for
 your system; try a different `phase_b.descriptor` or relax the
 `anti_overlap.*` thresholds.

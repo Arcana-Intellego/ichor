@@ -281,7 +281,11 @@ def _validate_allocation_snapshot(
     payload: Mapping[str, Any],
     added: Sequence[ReferenceDataEntry],
 ) -> None:
-    from ..point_allocation import accepted_attempts, read_point_allocation
+    from ..point_allocation import (
+        accepted_attempts,
+        point_allocation_path,
+        read_point_allocation,
+    )
 
     version = _safe_int(
         payload.get("reference_data_version"),
@@ -304,7 +308,10 @@ def _validate_allocation_snapshot(
     if sha256_file(snapshot) != expected_sha:
         raise ReferenceDataError("reference-data allocation snapshot SHA mismatch")
     try:
-        allocation = read_point_allocation(snapshot)
+        allocation = read_point_allocation(
+            snapshot,
+            history_dir=iteration_dir / ".point_allocation_history",
+        )
     except Exception as exc:
         raise ReferenceDataError(
             "reference-data allocation snapshot is invalid: " + str(snapshot)
@@ -323,13 +330,12 @@ def _validate_allocation_snapshot(
     )
     if observed_header != expected_header:
         raise ReferenceDataError("reference-data allocation snapshot header mismatch")
-    expected_source_path = (
-        "3_DIVERSITY_SAMPLING/initial/POINT_ALLOCATION.json"
-        if expected_header[1] == "bootstrap"
-        else "7_ACTIVE_LEARNING/iteration-"
-        + str(expected_header[2]).zfill(4)
-        + "/POINT_ALLOCATION.json"
-    )
+    campaign_dir = iteration_dir.parent.parent
+    expected_source_path = point_allocation_path(
+        campaign_dir,
+        context=expected_header[1],
+        iteration=expected_header[2],
+    ).relative_to(campaign_dir).as_posix()
     if str(payload.get("point_allocation_manifest") or "") != expected_source_path:
         raise ReferenceDataError("reference-data allocation source path mismatch")
     expected_entries = [

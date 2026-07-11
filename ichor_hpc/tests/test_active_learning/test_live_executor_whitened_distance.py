@@ -13,6 +13,7 @@ import pytest
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.daemon.live_executor import LiveBackendsPhaseExecutor
 from ichor.hpc.active_learning.daemon.state import CampaignPhase
+from ichor.hpc.active_learning.layout import active_iteration_dir, ariadne_seed_dir
 from ichor.hpc.active_learning.versioning.provenance import (
     PROVENANCE_FILENAME, write_seed_provenance,
 )
@@ -21,19 +22,119 @@ from ichor.hpc.active_learning.versioning.provenance import (
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "live_outputs"
 
 
-def _seed_iter_pool(campaign_dir, iteration, results):
-    """Drop synthetic per-seed result.json files into the iteration pool."""
-    iter_dir = (
-        campaign_dir / "7_ACTIVE_LEARNING"
-        / f"iteration-{iteration:04d}"
+def _seed_iter_pool(campaign_dir, iteration, results, *, config=None):
+    """Publish synthetic results through the canonical ARIADNE handoff."""
+    from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
+    from ichor.hpc.active_learning.ariadne_outputs import (
+        write_optimisation_trajectory,
+        write_seed_output_manifest,
     )
-    pool_dir = iter_dir / "pool"
-    pool_dir.mkdir(parents=True, exist_ok=True)
+    from ichor.hpc.active_learning.daemon.state import atomic_write_json
+    from ichor.hpc.active_learning.handoff_manifests import (
+        ARIADNE_RESULTS_SCHEMA_VERSION,
+        seeds_picked_path,
+        write_ariadne_results_manifest,
+    )
+    from ichor.hpc.active_learning.layout import (
+        active_ariadne_dir,
+        active_iteration_dir,
+        ariadne_seed_dir,
+    )
+    from ichor.hpc.active_learning.seed_identity import (
+        deterministic_seed_uid,
+        selection_fingerprint_sha256,
+        write_ariadne_task_map,
+    )
+    from ichor.hpc.active_learning.sampling_protocol import resolve_sampling_protocol
+    from ichor.hpc.active_learning.versioning.manifest import sha256_file
+
+    campaign_dir.mkdir(parents=True, exist_ok=True)
+    pool_source = campaign_dir / "whitened-distance-pool.xyz"
+    pool_lines = []
+    for frame_id in range(len(results)):
+        offset = 0.01 * float(frame_id)
+        pool_lines.extend([
+            "3",
+            "frame " + str(frame_id),
+            "O " + str(offset) + " 0.0 0.0",
+            "H " + str(0.96 + offset) + " 0.0 0.0",
+            "H " + str(-0.24 + offset) + " 0.93 0.0",
+        ])
+    pool_source.write_text("\n".join(pool_lines) + "\n", encoding="utf-8")
+    trajectory_pool = TrajectoryPool.import_from(
+        pool_source,
+        campaign_dir,
+        overwrite=True,
+    )
+    iter_dir = active_iteration_dir(campaign_dir, int(iteration))
+    ariadne_root = active_ariadne_dir(iter_dir)
     frame_ids = []
     seed_records = []
-    for idx, payload in enumerate(results):
-        sd = pool_dir / f"seed_{idx:04d}"
-        sd.mkdir()
+    for array_task_id, _payload in enumerate(results):
+        seed_id = array_task_id + 1
+        frame_ids.append(array_task_id)
+        seed_records.append({
+            "seed_id": seed_id,
+            "frame_id": array_task_id,
+            "pool_row_index_zero_based": array_task_id,
+            "selection_origin": "bulk",
+            "variance_at_selection": 0.0,
+        })
+    selection = {
+        "schema_version": 2,
+        "campaign_uid": "u",
+        "iteration": int(iteration),
+        "models_version": 0,
+        "model_manifest_sha256": "c" * 64,
+        "trajectory_sha256": str(trajectory_pool.sha256),
+        "n_picked": len(seed_records),
+        "seed_records": seed_records,
+    }
+    fingerprint = selection_fingerprint_sha256(selection)
+    selection["selection_fingerprint_sha256"] = fingerprint
+    for record in seed_records:
+        record["seed_uid"] = deterministic_seed_uid(
+            campaign_uid="u",
+            iteration=int(iteration),
+            seed_id=int(record["seed_id"]),
+            frame_id=int(record["frame_id"]),
+            models_version=0,
+            model_manifest_sha256="c" * 64,
+            selection_fingerprint_sha256_value=fingerprint,
+        )
+    selection_path = seeds_picked_path(iter_dir)
+    selection_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(selection_path, selection)
+    task_map_path = write_ariadne_task_map(iter_dir, selection)
+    resolved_protocol = resolve_sampling_protocol(
+        campaign_dir,
+        CampaignConfig() if config is None else config,
+        iteration=int(iteration),
+    )
+
+    def protocol_binding(path):
+        resolved = path.resolve()
+        return (
+            resolved.relative_to(campaign_dir.resolve()).as_posix(),
+            sha256_file(resolved),
+        )
+
+    resolved_manifest, resolved_manifest_sha256 = protocol_binding(
+        resolved_protocol.manifest_path
+    )
+    scale_manifest, scale_manifest_sha256 = protocol_binding(
+        resolved_protocol.scale_model_path
+    )
+    audit_manifest, audit_manifest_sha256 = protocol_binding(
+        resolved_protocol.audit_manifest_path
+    )
+
+    accepted = []
+    for array_task_id, payload in enumerate(results):
+        seed_id = array_task_id + 1
+        seed_uid = str(seed_records[array_task_id]["seed_uid"])
+        sd = ariadne_seed_dir(iter_dir, seed_id)
+        sd.mkdir(parents=True, exist_ok=False)
         payload = dict(payload)
         payload.setdefault("atom_types", ["O", "H", "H"])
         payload.setdefault(
@@ -42,44 +143,107 @@ def _seed_iter_pool(campaign_dir, iteration, results):
         )
         payload.setdefault("alpha_trajectory", [payload["alpha_initial"], payload["alpha_final"]])
         payload["iteration"] = int(iteration)
-        payload["seed_index"] = int(idx)
-        payload["seed_frame_id"] = int(idx)
-        payload.setdefault("trajectory_sha256", "0" * 64)
-        (sd / "result.json").write_text(json.dumps(payload), encoding="utf-8")
-        # write the provenance sidecar that enrich_with_anti_overlap needs
+        payload["seed_id"] = seed_id
+        payload["seed_uid"] = seed_uid
+        payload["array_task_id"] = array_task_id
+        payload["seed_frame_id"] = array_task_id
+        payload.setdefault("trajectory_sha256", str(trajectory_pool.sha256))
+        payload.setdefault("task_success", True)
+        payload.setdefault(
+            "landing_safety",
+            {
+                "accepted": True,
+                "policy": "raw_final",
+                "selected_origin": "raw_final",
+                "reasons": [],
+                "record_only_reasons": [],
+                "metrics": {
+                    "max_displacement_ang": 0.01,
+                    "min_pair_distance_ang": 0.90,
+                },
+            },
+        )
+        payload["sampling_protocol"] = {
+            "sampling_aggressiveness": int(
+                resolved_protocol.sampling_aggressiveness
+            ),
+            "resolved_manifest": resolved_manifest,
+            "resolved_manifest_sha256": resolved_manifest_sha256,
+            "scale_model_manifest": scale_manifest,
+            "scale_model_manifest_sha256": scale_manifest_sha256,
+            "audit_manifest": audit_manifest,
+            "audit_manifest_sha256": audit_manifest_sha256,
+        }
+        result_path = sd / "result.json"
+        atomic_write_json(result_path, payload)
+        write_optimisation_trajectory(
+            sd,
+            atom_types=payload["atom_types"],
+            coordinate_frames=[payload["final_coordinates"]],
+            alpha_values=[payload["alpha_final"]],
+            gradient_norms=[0.0],
+            origins=["raw_final"],
+        )
+        output_manifest = write_seed_output_manifest(
+            sd,
+            campaign_uid="u",
+            iteration=int(iteration),
+            seed_id=seed_id,
+            seed_uid=seed_uid,
+            array_task_id=array_task_id,
+            task_success=True,
+            task_exit_code=0,
+        )
         write_seed_provenance(
             sd, campaign_uid="u", iteration=iteration,
-            trajectory_sha256="0" * 64,
-            seed_frame_id=idx,
+            trajectory_sha256=str(trajectory_pool.sha256),
+            seed_frame_id=array_task_id,
+            seed_id=seed_id,
+            seed_uid=seed_uid,
+            array_task_id_zero_based=array_task_id,
             seed_selection_origin="test",
             seed_variance_at_selection=0.0,
             subspace_neighbour_frame_ids=[],
             subspace_dimension=0,
             subspace_eigenvalues=[],
         )
-        frame_ids.append(int(idx))
-        seed_records.append({
-            "seed_index": int(idx),
-            "frame_id": int(idx),
-            "selection_index": int(idx),
+        provenance_path = sd / PROVENANCE_FILENAME
+        accepted.append({
+            "seed_id": seed_id,
+            "seed_uid": seed_uid,
+            "array_task_id": array_task_id,
+            "seed_dir": sd.relative_to(ariadne_root).as_posix(),
+            "result_json": result_path.relative_to(ariadne_root).as_posix(),
+            "provenance_json": provenance_path.relative_to(ariadne_root).as_posix(),
+            "output_manifest": output_manifest.relative_to(ariadne_root).as_posix(),
+            "seed_frame_id": array_task_id,
+            "pool_row_index_zero_based": array_task_id,
             "selection_origin": "bulk",
             "variance_at_selection": 0.0,
+            "alpha_initial": float(payload["alpha_initial"]),
+            "alpha_final": float(payload["alpha_final"]),
+            "whitened_distance_final": payload.get("whitened_distance_final"),
+            "return_code": int(payload["return_code"]),
+            "landing_safety": payload.get("landing_safety"),
+            "result_sha256": sha256_file(result_path),
+            "provenance_sha256": sha256_file(provenance_path),
+            "output_manifest_sha256": sha256_file(output_manifest),
         })
-    (iter_dir / "seeds_picked.json").write_text(
-        json.dumps({
-            "schema_version": 1,
-            "iteration": int(iteration),
-            "n_picked": len(results),
-            "frame_ids": frame_ids,
-            "indices": frame_ids,
-            "bulk_indices": frame_ids,
-            "variance_indices": [],
-            "variances": [0.0 for _ in results],
-            "seed_records": seed_records,
-            "trajectory_sha256": "0" * 64,
-        }),
-        encoding="utf-8",
-    )
+    write_ariadne_results_manifest(iter_dir, {
+        "schema_version": ARIADNE_RESULTS_SCHEMA_VERSION,
+        "campaign_uid": "u",
+        "iteration": int(iteration),
+        "trajectory_sha256": str(trajectory_pool.sha256),
+        "task_map": {
+            "path": task_map_path.relative_to(ariadne_root).as_posix(),
+            "sha256": sha256_file(task_map_path),
+        },
+        "expected_n": len(accepted),
+        "n_accepted": len(accepted),
+        "n_rejected": 0,
+        "accepted": accepted,
+        "rejected": [],
+    })
     return iter_dir
 
 
@@ -97,30 +261,29 @@ def test_postprocess_prefers_json_whitened_distance(tmp_path):
     # flagged for anti-overlap. that is fine for this test -- we just
     # want to confirm the JSON value gets read.
     _seed_iter_pool(
-        tmp_path / "campaign", 0,
+        tmp_path / "campaign", 1,
         [{"alpha_initial": 0.5, "alpha_final": 1.0,
           "whitened_distance_final": 0.42,
           "n_evaluations": 1, "return_code": 0,
           "wall_seconds": 1.0, "fell_back_to_ds": False}],
     )
-    state = SimpleNamespace(iteration=0, campaign_uid="u")
+    state = SimpleNamespace(iteration=1, campaign_uid="u", models_version=0)
     result = ex._parse_ariadne_array_postprocess(
         state, CampaignPhase("ARIADNE_ARRAY"), observations=[],
     )
     assert result.is_complete is True
     # the seed provenance should now have anti_overlap with d ~= 0.42
     from ichor.hpc.active_learning.versioning.provenance import read_provenance
-    pool_dir = (
-        tmp_path / "campaign"
-        / "7_ACTIVE_LEARNING" / "iteration-0000" / "pool"
-    )
-    prov = read_provenance(pool_dir / "seed_0000")
+    seed_dir = ariadne_seed_dir(active_iteration_dir(tmp_path / "campaign", 1), 1)
+    prov = read_provenance(seed_dir)
     assert prov["anti_overlap"] is not None
     d = prov["anti_overlap"]["min_whitened_distance_to_training"]
     assert d == pytest.approx(0.42, abs=1.0e-6)
 
 
-def test_postprocess_uses_campaign_anti_overlap_bounds(tmp_path):
+def test_postprocess_ignores_hidden_anti_overlap_bounds_and_records_override(
+    tmp_path,
+):
     cfg = CampaignConfig()
     cfg.anti_overlap.min_post_ariadne_whitened_distance = 0.5
     cfg.anti_overlap.max_post_ariadne_whitened_distance = 2.0
@@ -130,23 +293,35 @@ def test_postprocess_uses_campaign_anti_overlap_bounds(tmp_path):
         backend_check=False,
     )
     _seed_iter_pool(
-        tmp_path / "campaign", 0,
+        tmp_path / "campaign", 1,
         [{"alpha_initial": 0.5, "alpha_final": 1.0,
           "whitened_distance_final": 0.42,
           "n_evaluations": 1, "return_code": 0,
           "wall_seconds": 1.0, "fell_back_to_ds": False}],
+        config=cfg,
     )
     result = ex._parse_ariadne_array_postprocess(
-        SimpleNamespace(iteration=0, campaign_uid="u"),
+        SimpleNamespace(iteration=1, campaign_uid="u", models_version=0),
         CampaignPhase("ARIADNE_ARRAY"),
         observations=[],
     )
     assert result.is_complete is True
     from ichor.hpc.active_learning.versioning.provenance import read_provenance
     prov = read_provenance(
-        tmp_path / "campaign" / "7_ACTIVE_LEARNING" / "iteration-0000" / "pool" / "seed_0000"
+        ariadne_seed_dir(active_iteration_dir(tmp_path / "campaign", 1), 1)
     )
-    assert prov["anti_overlap"]["flag"] == "moved_too_little"
+    assert prov["anti_overlap"]["flag"] is None
+    resolved = json.loads(
+        (
+            active_iteration_dir(tmp_path / "campaign", 1)
+            / "protocol"
+            / "SAMPLING_PROTOCOL_RESOLVED.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert any(
+        str(record.get("path", "")).startswith("anti_overlap.")
+        for record in resolved["hidden_overrides_detected"]
+    )
 
 
 def test_postprocess_falls_back_to_synthetic_when_field_missing(tmp_path):
@@ -154,22 +329,19 @@ def test_postprocess_falls_back_to_synthetic_when_field_missing(tmp_path):
     # NO whitened_distance_final key -- the parser should fall back to
     # the synthetic |alpha_final - alpha_initial| = 0.5 proxy.
     _seed_iter_pool(
-        tmp_path / "campaign", 0,
+        tmp_path / "campaign", 1,
         [{"alpha_initial": 0.5, "alpha_final": 1.0,
           "n_evaluations": 1, "return_code": 0,
           "wall_seconds": 1.0, "fell_back_to_ds": False}],
     )
-    state = SimpleNamespace(iteration=0, campaign_uid="u")
+    state = SimpleNamespace(iteration=1, campaign_uid="u", models_version=0)
     result = ex._parse_ariadne_array_postprocess(
         state, CampaignPhase("ARIADNE_ARRAY"), observations=[],
     )
     assert result.is_complete is True
     from ichor.hpc.active_learning.versioning.provenance import read_provenance
-    pool_dir = (
-        tmp_path / "campaign"
-        / "7_ACTIVE_LEARNING" / "iteration-0000" / "pool"
-    )
-    prov = read_provenance(pool_dir / "seed_0000")
+    seed_dir = ariadne_seed_dir(active_iteration_dir(tmp_path / "campaign", 1), 1)
+    prov = read_provenance(seed_dir)
     d = prov["anti_overlap"]["min_whitened_distance_to_training"]
     assert d == pytest.approx(0.5, abs=1.0e-6)
 
@@ -177,7 +349,7 @@ def test_postprocess_falls_back_to_synthetic_when_field_missing(tmp_path):
 def test_postprocess_rejects_explicit_unsafe_landing(tmp_path):
     ex = _make_executor(tmp_path)
     iter_dir = _seed_iter_pool(
-        tmp_path / "campaign", 0,
+        tmp_path / "campaign", 1,
         [{
             "alpha_initial": 0.5,
             "alpha_final": 1.0,
@@ -195,7 +367,7 @@ def test_postprocess_rejects_explicit_unsafe_landing(tmp_path):
             },
         }],
     )
-    state = SimpleNamespace(iteration=0, campaign_uid="u")
+    state = SimpleNamespace(iteration=1, campaign_uid="u", models_version=0)
     result = ex._parse_ariadne_array_postprocess(
         state, CampaignPhase("ARIADNE_ARRAY"), observations=[],
     )
@@ -205,10 +377,12 @@ def test_postprocess_rejects_explicit_unsafe_landing(tmp_path):
         read_ariadne_landing_audit,
         read_ariadne_results_manifest,
     )
-    audit = read_ariadne_landing_audit(iter_dir, expected_iteration=0)
+    audit = read_ariadne_landing_audit(iter_dir, expected_iteration=1)
     assert audit["summary"]["rejected"] == 1
     manifest = read_ariadne_results_manifest(
-        iter_dir, expected_iteration=0, require_nonempty=False,
+        iter_dir, expected_iteration=1, require_nonempty=False,
     )
     assert manifest["accepted"] == []
-    assert manifest["rejected"][0]["reason"] == "no_safe_non_seed_landing"
+    assert manifest["rejected"][0]["reason"] == (
+        "ariadne_unusable:no_safe_non_seed_landing"
+    )

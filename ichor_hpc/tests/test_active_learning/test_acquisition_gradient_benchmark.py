@@ -92,7 +92,7 @@ def test_run_benchmark_uses_context_and_reports_mode_comparison(monkeypatch, tmp
         "pool": SimpleNamespace(),
         "state": SimpleNamespace(models_version=7),
         "models": object(),
-        "iter_dir": tmp_path / "7_ACTIVE_LEARNING" / "iteration-0000",
+        "iter_dir": tmp_path / "ACTIVE_LEARNING" / "iteration-000001",
         "seed_frame_id": 12,
         "seed_atoms": _FakeAtoms(),
         "trajectory": [_FakeAtoms()],
@@ -101,7 +101,7 @@ def test_run_benchmark_uses_context_and_reports_mode_comparison(monkeypatch, tmp
     monkeypatch.setattr(
         bench,
         "_load_context",
-        lambda campaign_dir, iteration, seed_index: fake_context,
+        lambda campaign_dir, iteration, seed_id: fake_context,
     )
     monkeypatch.setattr(
         bench,
@@ -111,8 +111,8 @@ def test_run_benchmark_uses_context_and_reports_mode_comparison(monkeypatch, tmp
 
     payload = bench.run_benchmark(
         campaign_dir=tmp_path,
-        iteration=0,
-        seed_index=0,
+        iteration=1,
+        seed_id=1,
         gradient_modes=("cartesian_fd", "active_fd"),
         repeat=2,
     )
@@ -162,9 +162,9 @@ def test_main_writes_json_payload(monkeypatch, tmp_path, capsys):
         "--campaign-dir",
         str(tmp_path),
         "--iteration",
-        "0",
-        "--seed-index",
-        "0",
+        "1",
+        "--seed-id",
+        "1",
         "--gradient-mode",
         "active_fd",
         "--gradient-backend",
