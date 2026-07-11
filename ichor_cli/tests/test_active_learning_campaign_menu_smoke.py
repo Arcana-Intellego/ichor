@@ -42,7 +42,7 @@ def test_daemon_control_menu_items():
         "Show config editability windows",
         "Recovery dashboard",
         "Preflight backends",
-        "Initialise Campaign / Import Trajectory Pool",
+        "Initialise Campaign / Import Inputs",
         "Start/Resume Daemon (Foreground)",
         "Start/Resume Daemon (Background)",
         "Stop daemon",
@@ -162,8 +162,7 @@ def test_edit_campaign_config_menu_items():
         "Load from disk",
         "Reset to defaults",
         "Validate current config",
-        "Edit campaign identity",
-        "Edit trajectory_pool",
+        "Edit campaign",
         "Edit point_allocation",
         "Edit resource defaults",
         "Edit POLUS resources",
@@ -172,7 +171,6 @@ def test_edit_campaign_config_menu_items():
         "Edit ARIADNE resources",
         "Edit FEREBUS resources",
         "Edit Gaussian block",
-        "Edit sampling_protocol",
         "Edit seed_selection",
         "Edit anti_overlap",
         "Edit phase_b",
@@ -1342,7 +1340,7 @@ def test_top_three_roi_config_blocks_render_current_values():
     )
     cfg = CampaignConfig()
     cfg.seed_selection.strategy = "d_optimal"
-    cfg.sampling_protocol.sampling_aggressiveness = 7
+    cfg.campaign.sampling_aggressiveness = 7
     cfg.error_calibration.mode = "apply_to_acquisition"
     menu._replace_campaign_config(cfg, loaded_from=None)
 
@@ -1351,16 +1349,19 @@ def test_top_three_roi_config_blocks_render_current_values():
     assert "seed_selection.d_optimal_pool_multiplier" in seed_rendered
     assert "seed_selection.d_optimal_score_power" in seed_rendered
 
-    protocol_rendered = menu._BLOCK_MENUS_BY_LABEL[
-        "Edit sampling_protocol"
-    ].this_menu_options()
-    assert "sampling_protocol.sampling_aggressiveness: 7" in protocol_rendered
+    campaign_rendered = menu._BLOCK_MENUS_BY_LABEL["Edit campaign"].this_menu_options()
+    assert "campaign.sampling_aggressiveness: 7" in campaign_rendered
+    assert "campaign.source_path: pool.xyz" in campaign_rendered
+    assert "campaign.anchor_path: anchor.xyz" in campaign_rendered
 
     calibration_rendered = menu._BLOCK_MENUS_BY_LABEL[
         "Edit error_calibration"
     ].this_menu_options()
     assert "error_calibration.mode: apply_to_acquisition" in calibration_rendered
     assert "error_calibration.apply_strength" in calibration_rendered
+    assert "error_calibration.model_version_policy: rolling_normalised" in calibration_rendered
+    assert "error_calibration.aggressiveness_match_required: True" in calibration_rendered
+    assert "seed_selection.d_optimal_degenerate_policy" in seed_rendered
 
 
 def test_legacy_sequential_campaign_editors_are_neutralized():
@@ -1390,7 +1391,7 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
     cfg.seed_selection.strategy = "d_optimal"
     cfg.error_calibration.mode = "apply_to_acquisition"
     cfg.error_calibration.apply_strength = 0.5
-    cfg.sampling_protocol.sampling_aggressiveness = 6
+    cfg.campaign.sampling_aggressiveness = 6
     menu._replace_campaign_config(cfg, loaded_from=None)
     monkeypatch.setattr(menu, "_pause", lambda: None)
 
@@ -1399,7 +1400,12 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
     out = capsys.readouterr().out
     assert "Summary source: current in-memory editor config." in out
     assert "Sampling protocol summary" in out
-    assert "sampling_protocol.sampling_aggressiveness: 6" in out
+    assert "campaign.sampling_aggressiveness: 6" in out
+    assert "campaign.source_path: pool.xyz" in out
+    assert "campaign.anchor_path: anchor.xyz" in out
+    assert "degenerate_policy=score_backfill" in out
+    assert "error_calibration.model_version_policy: rolling_normalised" in out
+    assert "sampling_protocol.size_normalised_trust_radius" in out
     protocol_lines = [
         line for line in out.splitlines()
         if "sampling_protocol." in line
@@ -1474,7 +1480,7 @@ def test_daemon_control_sampling_protocol_summary_uses_saved_campaign(tmp_path, 
     cfg = CampaignConfig()
     cfg.seed_selection.strategy = "d_optimal"
     cfg.error_calibration.mode = "record_only"
-    cfg.sampling_protocol.sampling_aggressiveness = 8
+    cfg.campaign.sampling_aggressiveness = 8
     cfg.to_yaml(tmp_path / "campaign.yaml")
     set_selected_campaign_dir(tmp_path)
     monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: "")
@@ -1483,7 +1489,7 @@ def test_daemon_control_sampling_protocol_summary_uses_saved_campaign(tmp_path, 
 
     out = capsys.readouterr().out
     assert "Summary source: saved campaign.yaml." in out
-    assert "sampling_protocol.sampling_aggressiveness: 8" in out
+    assert "campaign.sampling_aggressiveness: 8" in out
     assert "sampling_protocol.scale_model" in out
     assert "sampling_protocol.scale_model.pair_reference" in out
     assert "sampling_protocol.resolved_phase_b" in out
@@ -2091,9 +2097,11 @@ def test_init_pool_passes_verbatim_import_options(tmp_path, monkeypatch):
 
     set_selected_campaign_dir(tmp_path)
     menu.import_trajectory_pool_menu_options.source_path = "pool.xyz"
+    menu.import_trajectory_pool_menu_options.anchor_source_path = "anchor.xyz"
     menu.import_trajectory_pool_menu_options.force_reimport = False
     rendered = menu.import_trajectory_pool_menu.this_menu_options()
     assert "scope: menu-only; applies to next init/import command" in rendered
+    assert "anchor_source_path: anchor.xyz" in rendered
     calls = []
     monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: "")
     monkeypatch.setattr(daemon_cli, "cmd_init", lambda ns: calls.append(ns) or 0)
@@ -2103,6 +2111,7 @@ def test_init_pool_passes_verbatim_import_options(tmp_path, monkeypatch):
     assert calls
     assert calls[0].campaign_dir == str(tmp_path)
     assert calls[0].source == "pool.xyz"
+    assert calls[0].anchor_source == "anchor.xyz"
     assert calls[0].force is False
 
 
@@ -2120,6 +2129,7 @@ def test_init_pool_force_requires_confirmation_and_resets(tmp_path, monkeypatch)
 
     set_selected_campaign_dir(tmp_path)
     menu.import_trajectory_pool_menu_options.source_path = "pool.xyz"
+    menu.import_trajectory_pool_menu_options.anchor_source_path = ""
     menu.import_trajectory_pool_menu_options.force_reimport = True
     calls = []
     responses = iter(["YES", ""])

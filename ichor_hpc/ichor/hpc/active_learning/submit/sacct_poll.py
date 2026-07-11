@@ -154,10 +154,18 @@ class ArrayJobSummary:
     n_observed: int = 0
     n_missing: int = 0
     failure_indices: List[int] = field(default_factory=list)
+    conflicting_task_indices: List[int] = field(default_factory=list)
+    out_of_range_task_indices: List[int] = field(default_factory=list)
 
     @property
     def is_terminal(self) -> bool:
-        return self.n_pending_or_running == 0 and self.n_tasks > 0
+        return (
+            self.n_pending_or_running == 0
+            and self.n_unknown == 0
+            and not self.conflicting_task_indices
+            and not self.out_of_range_task_indices
+            and self.n_tasks > 0
+        )
 
     @property
     def is_fully_successful(self) -> bool:
@@ -258,23 +266,72 @@ def aggregate_states(
     Task rows have job_id like '<parent>_<task_index>'. We pick out tasks
     belonging to 'parent_job_id' and count terminal vs non-terminal states.
     """
-    prefix = str(parent_job_id) + "_"
-    task_obs = [
-        o for o in observations
-        if o.job_id == str(parent_job_id) or o.job_id.startswith(prefix)
-    ]
-    #drop the parent summary row when we have explicit task rows.
-    has_tasks = any(o.job_id.startswith(prefix) for o in task_obs)
-    if has_tasks:
-        task_obs = [o for o in task_obs if o.job_id.startswith(prefix)]
-    observed_count = len(task_obs)
     expected = None if expected_task_count is None else max(0, int(expected_task_count))
+    parent = str(parent_job_id)
+    prefix = parent + "_"
+    parent_rows = [o for o in observations if o.job_id == parent]
+    saw_array_row = any(o.job_id.startswith(prefix) for o in observations)
+    grouped: Dict[int, List[JobObservation]] = {}
+    out_of_range: List[int] = []
+    for observation in observations:
+        if not observation.job_id.startswith(prefix):
+            continue
+        suffix = observation.job_id[len(prefix):]
+        if not suffix.isdigit():
+            continue
+        task_id = int(suffix)
+        if expected is not None and not 0 <= task_id < expected:
+            out_of_range.append(task_id)
+            continue
+        grouped.setdefault(task_id, []).append(observation)
+
+    collapsed: List[JobObservation] = []
+    conflicts: List[int] = []
+    for task_id in sorted(grouped):
+        rows = grouped[task_id]
+        outcomes = {(row.status, row.exit_code) for row in rows}
+        if len(outcomes) != 1:
+            conflicts.append(task_id)
+            collapsed.append(
+                JobObservation(
+                    job_id=prefix + str(task_id),
+                    status=JobStatus.UNKNOWN,
+                    exit_code=None,
+                    elapsed_seconds=max(
+                        (int(row.elapsed_seconds) for row in rows if row.elapsed_seconds is not None),
+                        default=None,
+                    ),
+                )
+            )
+            continue
+        exemplar = rows[0]
+        collapsed.append(
+            JobObservation(
+                job_id=prefix + str(task_id),
+                status=exemplar.status,
+                exit_code=exemplar.exit_code,
+                elapsed_seconds=max(
+                    (int(row.elapsed_seconds) for row in rows if row.elapsed_seconds is not None),
+                    default=None,
+                ),
+            )
+        )
+
+    # A non-array job is represented by its parent allocation row. For an
+    # array, parent summaries are never allowed to stand in for logical tasks.
+    use_task_rows = bool(grouped) or saw_array_row or bool(expected is not None and expected > 1)
+    task_obs = collapsed if use_task_rows else list(parent_rows[:1])
+    observed_count = len(collapsed) if use_task_rows else len(task_obs)
     missing = 0
     if expected is not None and expected > observed_count:
         missing = expected - observed_count
     n_completed = sum(1 for o in task_obs if o.is_success)
     n_failed = sum(1 for o in task_obs if o.is_failure)
-    n_unknown = sum(1 for o in task_obs if o.status == JobStatus.UNKNOWN)
+    unique_out_of_range = sorted(set(out_of_range))
+    n_unknown = (
+        sum(1 for o in task_obs if o.status == JobStatus.UNKNOWN)
+        + len(unique_out_of_range)
+    )
     n_pending = sum(1 for o in task_obs if not o.is_terminal) + missing
     failure_indices: List[int] = []
     for o in task_obs:
@@ -296,6 +353,8 @@ def aggregate_states(
         n_observed=observed_count,
         n_missing=missing,
         failure_indices=sorted(failure_indices),
+        conflicting_task_indices=sorted(conflicts),
+        out_of_range_task_indices=unique_out_of_range,
     )
 
 

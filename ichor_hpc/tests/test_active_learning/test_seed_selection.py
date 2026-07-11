@@ -469,6 +469,52 @@ def test_d_optimal_requires_covariance_contract():
         )
 
 
+def test_d_optimal_score_backfill_is_deterministic_for_rank_one_pool():
+    atoms = [object() for _ in range(4)]
+    posterior = _CovariancePosterior(atoms, np.ones((4, 4), dtype=float))
+
+    output = select_seeds(
+        atoms,
+        posterior,
+        n_seeds=3,
+        bulk_fraction=0.0,
+        strategy="d_optimal",
+        d_optimal_pool_multiplier=4,
+        d_optimal_score_power=0.0,
+        d_optimal_degenerate_policy="score_backfill",
+    )
+
+    assert output.indices == [0, 1, 2]
+    assert output.selection_origins == [
+        "d_optimal",
+        "d_optimal_backfill",
+        "d_optimal_backfill",
+    ]
+    assert output.diagnostics["d_optimal_selected"] == 1
+    assert output.diagnostics["d_optimal_backfilled"] == 2
+    assert all(
+        row.get("d_optimal_backfill_reason") == "model_space_degeneracy"
+        for row in output.selection_diagnostics[1:]
+    )
+
+
+def test_d_optimal_fail_policy_reports_model_space_degeneracy():
+    atoms = [object() for _ in range(3)]
+    posterior = _CovariancePosterior(atoms, np.ones((3, 3), dtype=float))
+
+    with pytest.raises(ValueError, match="model-space degeneracy selected 1 of 2"):
+        select_seeds(
+            atoms,
+            posterior,
+            n_seeds=2,
+            bulk_fraction=0.0,
+            strategy="d_optimal",
+            d_optimal_pool_multiplier=3,
+            d_optimal_score_power=0.0,
+            d_optimal_degenerate_policy="fail",
+        )
+
+
 def test_invalid_seed_selection_strategy_raises():
     atoms, posterior, _ = _atoms_with_indexed_variances(6)
     with pytest.raises(ValueError, match="strategy"):

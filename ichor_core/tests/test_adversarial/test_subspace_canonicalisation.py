@@ -121,3 +121,30 @@ def test_canonicalisation_preserves_orthonormality():
     out = _canonicalise_basis(basis, eigs, degeneracy_tolerance=1.0e-3)
     gram = out.T @ out
     np.testing.assert_allclose(gram, np.eye(5), atol=1.0e-10)
+
+
+def test_degenerate_block_is_stable_when_leading_cartesian_probes_have_zero_rank():
+    basis = np.zeros((8, 2), dtype=float)
+    basis[5, 0] = 1.0
+    basis[7, 1] = 1.0
+    eigenvalues = np.array([2.0, 2.0])
+    angle = 0.731
+    rotation = np.array(
+        [
+            [np.cos(angle), -np.sin(angle)],
+            [np.sin(angle), np.cos(angle)],
+        ]
+    )
+
+    canonical = _canonicalise_basis(
+        basis,
+        eigenvalues,
+        degeneracy_tolerance=1.0e-3,
+    )
+    rotated = _canonicalise_basis(
+        basis @ rotation,
+        eigenvalues,
+        degeneracy_tolerance=1.0e-3,
+    )
+
+    np.testing.assert_allclose(canonical, rotated, atol=1.0e-12)

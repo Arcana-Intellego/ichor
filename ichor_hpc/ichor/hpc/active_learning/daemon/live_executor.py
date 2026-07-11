@@ -1055,13 +1055,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         DryRunPhaseExecutor.__post_init__(self)
         if self.backend_check:
             avail = check_backends()
-            if not avail.profile:
+            if not avail.all_present:
                 raise LiveBackendNotAvailableError(missing_backend_message(avail))
-            if not avail.sbatch:
-                raise LiveBackendNotAvailableError(
-                    "sbatch is not on PATH; LiveBackendsPhaseExecutor cannot "
-                    "submit jobs. Use --dry-run or --mock-ariadne off-cluster."
-                )
 
     def handle_failure(self, state, phase, observations) -> FailureAction:
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
@@ -1078,8 +1073,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             "REPLACEMENT_GAUSSIAN",
         }:
             from ..replacement_sampling import (
-                read_replacement_sample,
-                replacement_round_dir,
+                read_replacement_sample_strict,
             )
 
             context = (
@@ -1087,13 +1081,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 if phase_name == "INITIAL_REPLACEMENT_GAUSSIAN"
                 else "active"
             )
-            round_dir = replacement_round_dir(
+            manifest = read_replacement_sample_strict(
                 camp,
                 context=context,
                 iteration=0 if context == "bootstrap" else int(iteration),
                 replacement_round=int(replacement_round),
             )
-            manifest = read_replacement_sample(round_dir)
             return Path(str(manifest["sample_xyz"]))
         if phase_name == "INITIAL_GAUSSIAN":
             from ..handoff_manifests import read_phase_a_sample_manifest
@@ -1483,10 +1476,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             ferebus_platform = _configured_ferebus_platform()
             ferebus_manifest = _stg.read_ferebus_manifest(staging)
             expected_ferebus_tasks = int(ferebus_manifest.get("n_tasks", 0))
-            expected_job_name = live_job_name(
-                getattr(state, "campaign_uid", None),
+            expected_job_name = _current_submission_job_name(
+                self.campaign_dir,
                 phase_name,
                 int(getattr(state, "iteration", 0)),
+                campaign_uid=getattr(state, "campaign_uid", None),
             )
             effective_walltime = (
                 self.walltime_hours
@@ -1859,7 +1853,22 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         self.scripts_dir.mkdir(parents=True, exist_ok=True)
         (self.scripts_dir / "OUTPUTS").mkdir(parents=True, exist_ok=True)
         (self.scripts_dir / "ERRORS").mkdir(parents=True, exist_ok=True)
-        path = self.scripts_dir / (phase_name + "-" + str(state.iteration) + ".sh")
+        script_stem = phase_name + "-" + str(state.iteration)
+        try:
+            from . import submission_intent as _submission_intent
+
+            active_intent = _submission_intent.load_active_intent(
+                self.campaign_dir,
+                phase_name,
+                int(state.iteration),
+            )
+        except Exception:
+            active_intent = None
+        if isinstance(active_intent, dict) and active_intent.get("submission_identity"):
+            script_stem += "-" + _safe_shell_path_component(
+                active_intent["submission_identity"]
+            )
+        path = self.scripts_dir / (script_stem + ".sh")
         effective_partition = (
             str(self.partition)
             if self.partition is not None
@@ -1872,6 +1881,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             campaign_dir=self.campaign_dir,
             iteration=int(state.iteration),
             array_size=array_size,
+            replacement_round=int(getattr(state, "replacement_round", 0)),
+            staging_dir=(
+                self._quantum_staging_path(state, phase_name)
+                if "GAUSSIAN" in phase_name or "AIMALL" in phase_name
+                else None
+            ),
         )
         self._journal_event(
             "resolved_phase_resources",
@@ -4054,7 +4069,42 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 # ---module level: sbatch script builder -----------------
 
 
-def make_live_job_finder(sacct_runner=None, squeue_runner=None):
+def _current_submission_job_name(
+    campaign_dir: Path,
+    phase_name: str,
+    iteration: int,
+    *,
+    campaign_uid: Optional[str],
+) -> str:
+    """Return the durable attempt name when a submission intent is active."""
+    try:
+        from . import submission_intent as _submission_intent
+
+        intent = _submission_intent.load_active_intent(
+            campaign_dir,
+            phase_name,
+            int(iteration),
+        )
+    except Exception as exc:
+        raise BackendSubmissionError(
+            "cannot render a Slurm job name from the active submission intent: "
+            + type(exc).__name__
+            + ": "
+            + str(exc)[:160]
+        ) from exc
+    if isinstance(intent, dict):
+        expected = intent.get("expected_job_name")
+        if isinstance(expected, str) and expected:
+            return expected
+    return live_job_name(campaign_uid, phase_name, iteration)
+
+
+def make_live_job_finder(
+    sacct_runner=None,
+    squeue_runner=None,
+    *,
+    campaign_dir: Optional[Path] = None,
+):
     """the job_finder the daemon uses in live mode: given (state, phase) return the JobID of an
     already-running job for that exact phase+iteration, or None. lets the daemon adopt a job a crash
     orphaned rather than double-submit (A24/A25)."""
@@ -4064,13 +4114,36 @@ def make_live_job_finder(sacct_runner=None, squeue_runner=None):
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
         uid = getattr(state, "campaign_uid", None)
         iteration = getattr(state, "iteration", 0)
-        names = [
-            live_job_name(uid, phase_name, iteration),
-        ]
-        if uid:
+        intent = None
+        if campaign_dir is not None:
+            try:
+                from . import submission_intent as _submission_intent
+
+                intent = _submission_intent.load_active_intent(
+                    campaign_dir,
+                    phase_name,
+                    int(iteration),
+                )
+            except Exception:
+                intent = None
+        intent_name = (
+            str(intent.get("expected_job_name") or "")
+            if isinstance(intent, dict)
+            else ""
+        )
+        names = (
+            [intent_name]
+            if intent_name
+            else [live_job_name(uid, phase_name, iteration)]
+        )
+        is_identified_attempt = bool(
+            isinstance(intent, dict) and intent.get("submission_identity")
+        )
+        if uid and not is_identified_attempt:
             legacy = str(uid)[:8] + "-" + str(phase_name) + "-" + str(int(iteration))
             if legacy not in names:
                 names.append(legacy)
+        names = [name for name in names if name]
         inconclusive: Optional[JobNameLookup] = None
         last_lookup = JobNameLookup(None, inconclusive=False)
         use_squeue_fallback = squeue_runner is not None or sacct_runner is None
@@ -4101,10 +4174,12 @@ def make_live_job_accounting_finder(sacct_runner=None, squeue_runner=None):
         iteration = getattr(state, "iteration", 0)
         expected_tasks = active_intent.get("expected_tasks")
         names = [str(active_intent.get("expected_job_name") or "")]
-        live_name = live_job_name(uid, phase_name, iteration)
-        if live_name not in names:
-            names.append(live_name)
-        if uid:
+        is_identified_attempt = bool(active_intent.get("submission_identity"))
+        if not is_identified_attempt:
+            live_name = live_job_name(uid, phase_name, iteration)
+            if live_name not in names:
+                names.append(live_name)
+        if uid and not is_identified_attempt:
             legacy = str(uid)[:8] + "-" + str(phase_name) + "-" + str(int(iteration))
             if legacy not in names:
                 names.append(legacy)
@@ -4350,6 +4425,7 @@ def build_sbatch_script(
         campaign_dir=campaign_dir,
         iteration=int(iteration),
         array_size=array_size,
+        replacement_round=int(replacement_round),
     )
     wall = walltime_hours if walltime_hours is not None else res.walltime_for(phase_name)
     validate_partition_walltime(str(resolved.partition), wall)
@@ -4360,7 +4436,12 @@ def build_sbatch_script(
         validate_gaussian_link0_memory(config, resolved)
     camp = str(Path(campaign_dir).resolve())
     try:
-        job_name = live_job_name(campaign_uid, phase_name, iteration)
+        job_name = _current_submission_job_name(
+            Path(campaign_dir),
+            phase_name,
+            iteration,
+            campaign_uid=campaign_uid,
+        )
     except ValueError as exc:
         raise BackendSubmissionError(str(exc)) from exc
     _reject_shell_control_chars("Slurm job name", job_name)
@@ -4489,6 +4570,36 @@ def _array_task_mapping_lines(array_task_map: Optional[Path]) -> List[str]:
     ]
 
 
+def _pointdir_selection_lines(
+    points_file: str,
+    *,
+    required_filename: str,
+) -> List[str]:
+    """Select one direct child of the exact daemon-owned staging directory."""
+    points_path = Path(points_file).resolve(strict=False)
+    points_file_q = _shell_quote(str(points_path))
+    staging_root_q = _shell_quote(str(points_path.parent))
+    return [
+        "export ICHOR_STAGING_ROOT=" + staging_root_q,
+        "if [ ! -f " + points_file_q + " ]; then echo "
+        + _shell_quote("POINTS.txt missing: " + str(points_path))
+        + " >&2; exit 1; fi",
+        'POINT_DIR=$(sed -n "$((ICHOR_LOGICAL_ARRAY_TASK_ID + 1))p" '
+        + points_file_q
+        + ")",
+        'if [ -z "$POINT_DIR" ]; then echo "no pointdir for logical index $ICHOR_LOGICAL_ARRAY_TASK_ID" >&2; exit 1; fi',
+        'if [ -L "$POINT_DIR" ]; then echo "POINT_DIR is a symlink: $POINT_DIR" >&2; exit 1; fi',
+        'if [ "$(dirname -- "$POINT_DIR")" != "$ICHOR_STAGING_ROOT" ]; then echo "POINT_DIR escapes exact campaign staging round: $POINT_DIR" >&2; exit 1; fi',
+        'case "$(basename -- "$POINT_DIR")" in POINT_*.pointdir) ;; *) echo "unsafe staged pointdir name: $POINT_DIR" >&2; exit 1 ;; esac',
+        'if [ ! -d "$POINT_DIR" ]; then echo "POINT_DIR is not a directory: $POINT_DIR" >&2; exit 1; fi',
+        'if [ ! -f "$POINT_DIR/'
+        + str(required_filename)
+        + '" ]; then echo "'
+        + str(required_filename)
+        + ' missing in $POINT_DIR" >&2; exit 1; fi',
+    ]
+
+
 def _gaussian_invocation_block(
     phase_name,
     iteration,
@@ -4517,7 +4628,6 @@ def _gaussian_invocation_block(
         memory_lines = [
             "# Gaussian Link0 memory/core directives are written in input.gjf.",
         ]
-    points_file_q = _shell_quote(points_file)
     camp_q = _shell_quote(camp)
     phase_q = _shell_quote(str(phase_name))
     uid = _safe_shell_path_component(campaign_uid)
@@ -4547,17 +4657,8 @@ def _gaussian_invocation_block(
         '    *) echo "Refusing to remove unexpected Gaussian scratch path: $GAUSS_SCRDIR" >&2 ;;',
         "  esac",
         "}",
-        # check the file FIRST -- under set -e a failing sed (missing POINTS.txt) aborts the
-        # assignment before the friendly -z guard below ever runs, leaving just a bare sed error.
-        "if [ ! -f " + points_file_q + " ]; then echo "
-        + _shell_quote("POINTS.txt missing: " + points_file)
-        + " >&2; exit 1; fi",
         *_array_task_mapping_lines(array_task_map),
-        'POINT_DIR=$(sed -n "$((ICHOR_LOGICAL_ARRAY_TASK_ID + 1))p" ' + points_file_q + ")",
-        'if [ -z "$POINT_DIR" ]; then echo "no pointdir for logical index $ICHOR_LOGICAL_ARRAY_TASK_ID" >&2; exit 1; fi',
-        'case "$POINT_DIR" in "$ICHOR_CAMPAIGN_DIR"/.DATA/STAGING/initial/POINT_*.pointdir|"$ICHOR_CAMPAIGN_DIR"/.DATA/STAGING/iter_"$ICHOR_ITERATION"/POINT_*.pointdir) ;; *) echo "POINT_DIR escapes campaign staging: $POINT_DIR" >&2; exit 1 ;; esac',
-        'if [ -L "$POINT_DIR" ]; then echo "POINT_DIR is a symlink: $POINT_DIR" >&2; exit 1; fi',
-        'if [ ! -f "$POINT_DIR/input.gjf" ]; then echo "input.gjf missing in $POINT_DIR" >&2; exit 1; fi',
+        *_pointdir_selection_lines(points_file, required_filename="input.gjf"),
         'cd "$POINT_DIR"',
         "GAUSSIAN_EXIT=0",
         gaussian_exe + " < input.gjf > input.gau || GAUSSIAN_EXIT=$?",
@@ -4642,24 +4743,14 @@ def _aimall_invocation_block(
     if iasmesh not in VALID_AIMALL_IASMESH_VALUES:
         raise BackendSubmissionError("aimall.iasmesh is invalid: " + repr(iasmesh))
     args.append("-iasmesh=" + iasmesh)
-    points_file_q = _shell_quote(points_file)
     camp_q = _shell_quote(camp)
     python = _python_executable_for_script()
     return [
         "# per-point AIMAll array over the .wfn files gaussian produced.",
         "export ICHOR_CAMPAIGN_DIR=" + camp_q,
         "export ICHOR_ITERATION=" + str(int(iteration)),
-        # check the file FIRST -- under set -e a failing sed (missing POINTS.txt) aborts the
-        # assignment before the friendly -z guard below ever runs, leaving just a bare sed error.
-        "if [ ! -f " + points_file_q + " ]; then echo "
-        + _shell_quote("POINTS.txt missing: " + points_file)
-        + " >&2; exit 1; fi",
         *_array_task_mapping_lines(array_task_map),
-        'POINT_DIR=$(sed -n "$((ICHOR_LOGICAL_ARRAY_TASK_ID + 1))p" ' + points_file_q + ")",
-        'if [ -z "$POINT_DIR" ]; then echo "no pointdir for logical index $ICHOR_LOGICAL_ARRAY_TASK_ID" >&2; exit 1; fi',
-        'case "$POINT_DIR" in "$ICHOR_CAMPAIGN_DIR"/.DATA/STAGING/initial/POINT_*.pointdir|"$ICHOR_CAMPAIGN_DIR"/.DATA/STAGING/iter_"$ICHOR_ITERATION"/POINT_*.pointdir) ;; *) echo "POINT_DIR escapes campaign staging: $POINT_DIR" >&2; exit 1 ;; esac',
-        'if [ -L "$POINT_DIR" ]; then echo "POINT_DIR is a symlink: $POINT_DIR" >&2; exit 1; fi',
-        'if [ ! -f "$POINT_DIR/input.wfn" ]; then echo "input.wfn missing in $POINT_DIR" >&2; exit 1; fi',
+        *_pointdir_selection_lines(points_file, required_filename="input.wfn"),
         'cd "$POINT_DIR"',
         'if [ ! -f AIMALL_TASK.json ]; then echo "AIMALL_TASK.json missing in $POINT_DIR" >&2; exit 1; fi',
         "AIMALL_NAAT=$("

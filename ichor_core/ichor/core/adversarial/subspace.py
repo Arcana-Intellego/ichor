@@ -59,10 +59,9 @@ def _canonicalise_basis(
     The canonicalisation has two stages applied in order:
 
     1. Within each block of consecutive columns whose eigenvalue gap is less
-       than 'degeneracy_tolerance * max(eigenvalues)', apply a Procrustes
-       rotation against the first 'k' Cartesian unit vectors. This picks the
-       within-block rotation that maximises alignment with a fixed reference
-       frame and is therefore reproducible across runs.
+       than 'degeneracy_tolerance * max(eigenvalues)', construct a basis from
+       the block projector using deterministic pivoted Cartesian probes. The
+       projector is invariant to the eigensolver's arbitrary block rotation.
 
     2. For each column, multiply by -1 if the first component whose absolute
        value exceeds 'sign_threshold' is negative.
@@ -79,13 +78,13 @@ def _canonicalise_basis(
     lam_max = float(np.max(eigenvalues)) if eigenvalues.size else 1.0
     threshold = float(degeneracy_tolerance) * max(lam_max, 1.0e-30)
 
-    # 1. Procrustes rotation within near-degenerate blocks.
+    # 1. Projector-derived basis within near-degenerate blocks.
     block_start = 0
     for i in range(1, r):
         if abs(float(eigenvalues[i]) - float(eigenvalues[i - 1])) >= threshold:
-            _procrustes_align_block(canonical, block_start, i, n_coords)
+            _canonicalise_projector_block(canonical, block_start, i)
             block_start = i
-    _procrustes_align_block(canonical, block_start, r, n_coords)
+    _canonicalise_projector_block(canonical, block_start, r)
 
     # 2. Sign convention column-by-column.
     for j in range(r):
@@ -100,27 +99,49 @@ def _canonicalise_basis(
 
 
 
-def _procrustes_align_block(basis: np.ndarray, start: int, end: int, n_coords: int) -> None:
-    """In-place rotate columns [start:end] of 'basis' to align with the
-    first 'k = end - start' Cartesian unit vectors via Procrustes.
-
-    No-op for single-column blocks (the sign-convention stage handles those).
-    """
+def _canonicalise_projector_block(
+    basis: np.ndarray,
+    start: int,
+    end: int,
+) -> None:
+    """Replace one eigenvalue block with a projector-derived canonical basis."""
     k = end - start
-    if k <= 1:
+    if k <= 0:
         return
-    block = basis[:, start:end]
-    #Reference: first k Cartesian unit vectors (3N x k with identity prefix).
-    ref = np.zeros((n_coords, k), dtype=float)
-    diag_len = min(n_coords, k)
-    ref[np.arange(diag_len), np.arange(diag_len)] = 1.0
-    overlap = block.T @ ref
-    try:
-        U, _, Vt = np.linalg.svd(overlap, full_matrices=False)
-    except np.linalg.LinAlgError:
-        return
-    rotation = U @ Vt
-    basis[:, start:end] = block @ rotation
+    block = np.asarray(basis[:, start:end], dtype=float)
+    projector = block @ block.T
+    selected: List[np.ndarray] = []
+    used: set[int] = set()
+    numerical_floor = max(
+        1.0e-14,
+        np.finfo(float).eps * max(1, projector.shape[0]) * 32.0,
+    )
+    for _column in range(k):
+        residuals: List[np.ndarray] = []
+        scores = np.full(projector.shape[0], -np.inf, dtype=float)
+        for coordinate in range(projector.shape[0]):
+            if coordinate in used:
+                residuals.append(np.zeros(projector.shape[0], dtype=float))
+                continue
+            probe = np.asarray(projector[:, coordinate], dtype=float).copy()
+            for vector in selected:
+                probe -= float(np.dot(vector, probe)) * vector
+            for vector in selected:
+                probe -= float(np.dot(vector, probe)) * vector
+            residuals.append(probe)
+            scores[coordinate] = float(np.dot(probe, probe))
+        best = float(np.max(scores))
+        if not np.isfinite(best) or best <= numerical_floor:
+            raise ValueError(
+                "cannot construct a deterministic basis from a degenerate projector block"
+            )
+        tie_tolerance = max(numerical_floor, abs(best) * 1.0e-12)
+        pivots = np.flatnonzero(scores >= best - tie_tolerance)
+        pivot = int(pivots[0])
+        vector = residuals[pivot] / float(np.sqrt(scores[pivot]))
+        selected.append(vector)
+        used.add(pivot)
+    basis[:, start:end] = np.column_stack(selected)
 
 
 

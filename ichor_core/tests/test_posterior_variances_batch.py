@@ -8,7 +8,12 @@ vectorised diagonal matches the scalar path frame by frame, scaled and unscaled.
 import numpy as np
 import pytest
 
-from ichor.core.adversarial.posterior import TotalEnergyPosterior
+from ichor.core.adversarial.posterior import (
+    VARIANCE_NEGATIVE_TOLERANCE,
+    TotalEnergyPosterior,
+    _check_variance_array,
+    variance_clip_diagnostics,
+)
 from ichor.core.adversarial.stencils import directional_all_stencils
 from ichor.core.atoms import Atom, Atoms
 
@@ -344,3 +349,25 @@ def test_fused_stencils_use_batched_posterior_blocks():
     assert post.diagnostics["n_covariance_matrix_batched_calls"] >= 1
     assert post.diagnostics["n_means_scalar_fallbacks"] == 0
     assert post.diagnostics["n_covariance_matrix_scalar_fallbacks"] == 0
+
+
+def test_tolerated_negative_variances_are_clipped_and_reported():
+    variance_clip_diagnostics(reset=True)
+
+    checked = _check_variance_array(
+        [-0.5 * VARIANCE_NEGATIVE_TOLERANCE, 0.0, 2.0],
+        "test variance",
+    )
+
+    np.testing.assert_array_equal(checked, np.array([0.0, 0.0, 2.0]))
+    diagnostics = variance_clip_diagnostics(reset=True)
+    assert diagnostics["clipped_tiny_negative_variances"] == 1
+    assert variance_clip_diagnostics()["clipped_tiny_negative_variances"] == 0
+
+
+def test_materially_negative_variance_still_fails():
+    with pytest.raises(ValueError, match="materially negative"):
+        _check_variance_array(
+            [-2.0 * VARIANCE_NEGATIVE_TOLERANCE],
+            "test variance",
+        )

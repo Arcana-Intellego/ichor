@@ -691,13 +691,23 @@ def stage_gaussian_inputs(
         "REPLACEMENT_GAUSSIAN",
     }
     if is_replacement:
-        from ..replacement_sampling import read_replacement_sample
+        from ..replacement_sampling import read_replacement_sample_strict
 
-        replacement_manifest = read_replacement_sample(
-            Path(sample_xyz).parent,
-            verify_allocation=True,
+        replacement_context = (
+            "bootstrap"
+            if str(phase_name) == "INITIAL_REPLACEMENT_GAUSSIAN"
+            else "active"
         )
-        replacement_context = str(replacement_manifest["context"])
+        try:
+            replacement_round = int(Path(sample_xyz).parent.name.rsplit("_", 1)[1])
+        except (IndexError, ValueError) as exc:
+            raise ValueError("replacement sample is outside a numbered round directory") from exc
+        replacement_manifest = read_replacement_sample_strict(
+            campaign_dir,
+            context=replacement_context,
+            iteration=(0 if replacement_context == "bootstrap" else int(iteration)),
+            replacement_round=replacement_round,
+        )
         allocation_records = list(replacement_manifest["records"])
         from ..point_allocation import read_point_allocation
 
@@ -865,6 +875,8 @@ def stage_gaussian_inputs(
             campaign_dir=campaign_dir,
             iteration=int(iteration),
             array_size=len(frames),
+            staging_dir=staging,
+            n_atoms_override=len(frames[0]),
         )
         validate_gaussian_link0_memory(config, gaussian_resources)
 
@@ -1027,6 +1039,7 @@ def stage_aimall_inputs(
         campaign_dir=campaign_dir,
         iteration=int(iteration),
         array_size=len(pointdirs),
+        staging_dir=staging,
     )
     aimall_cpus = int(aimall_resources.cpus_per_task)
     raw_naat = getattr(config.aimall, "naat", "auto")

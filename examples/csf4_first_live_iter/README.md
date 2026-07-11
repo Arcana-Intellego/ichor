@@ -308,10 +308,14 @@ A minimal `campaign.yaml` (also shipped at
 `examples/csf4_first_live_iter/campaign.yaml`):
 
 ```yaml
-schema_version: 9
+schema_version: 10
 
 campaign:
+  system_name: CHANGE_ME_SYSTEM
   max_iterations: 1
+  source_path: pool.xyz
+  anchor_path: anchor.xyz
+  sampling_aggressiveness: 5
 
 runtime:
   poll_interval_seconds: 60
@@ -326,7 +330,9 @@ point_allocation:
 
 seed_selection:
   n_seeds_per_iteration: 8
-  bulk_fraction: 0.5
+  bulk_fraction: 0.2
+  strategy: d_optimal
+  d_optimal_degenerate_policy: score_backfill
 
 resources:
   defaults:

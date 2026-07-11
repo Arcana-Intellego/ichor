@@ -45,9 +45,7 @@ from .geometry_protocol import (
 __all__ = [
     "CampaignConfig",
     "CampaignIdentityConfigBlock",
-    "TrajectoryPoolConfigBlock",
     "PointAllocationConfigBlock",
-    "SamplingProtocolConfigBlock",
     "SeedSelectionConfigBlock",
     "AntiOverlapConfigBlock",
     "PhaseBConfigBlock",
@@ -82,6 +80,7 @@ __all__ = [
     "VALID_GEOMETRY_NOVELTY_SCALE_SOURCES",
     "VALID_GEOMETRY_NOVELTY_STATISTICS",
     "VALID_SEED_SELECTION_STRATEGIES",
+    "VALID_D_OPTIMAL_DEGENERATE_POLICIES",
     "VALID_GRADIENT_MODES",
     "VALID_MODE_WEIGHTING_POLICIES",
     "VALID_SPECTRAL_MODES",
@@ -118,11 +117,14 @@ VALID_GEOMETRY_NOVELTY_SCALE_SOURCES = frozenset({
 })
 VALID_GEOMETRY_NOVELTY_STATISTICS = frozenset({"p25", "median", "p75"})
 VALID_SEED_SELECTION_STRATEGIES = frozenset({"hybrid_variance", "d_optimal"})
+VALID_D_OPTIMAL_DEGENERATE_POLICIES = frozenset({"fail", "score_backfill"})
 VALID_GRADIENT_MODES = frozenset({"cartesian_fd", "active_fd"})
 VALID_MODE_WEIGHTING_POLICIES = frozenset({"variance", "inverse_frequency", "uniform"})
 VALID_GRADIENT_PARALLEL_BACKENDS = frozenset({"serial", "thread", "process"})
 VALID_ERROR_CALIBRATION_MODES = frozenset({"record_only", "apply_to_acquisition"})
-VALID_ERROR_CALIBRATION_MODEL_VERSION_POLICIES = frozenset({"current", "all"})
+VALID_ERROR_CALIBRATION_MODEL_VERSION_POLICIES = frozenset(
+    {"current", "all", "rolling_normalised"}
+)
 VALID_SPECTRAL_MODES = frozenset({"off", "record_only", "blend"})
 VALID_CALIBRATED_ENERGY_UTILITIES = frozenset({"log", "banded"})
 VALID_SIZE_NORMALISATION_ENERGY_MODES = frozenset({"raw_total", "per_sqrt_atom"})
@@ -447,16 +449,14 @@ class AcquisitionConfigBlock:
 
 
 @dataclass
-class TrajectoryPoolConfigBlock:
-    source_path: str = "pool.xyz"
-
-
-@dataclass
 class CampaignIdentityConfigBlock:
     # Short label for the molecular system, used to name per-atom FEREBUS
     # dataset files (<system>_<atom>_TRAINING_SET.csv and friends).
     system_name: str = "SYSTEM"
     max_iterations: int = 50
+    source_path: str = "pool.xyz"
+    anchor_path: str = "anchor.xyz"
+    sampling_aggressiveness: int = 5
 
 
 @dataclass
@@ -482,20 +482,16 @@ class PointAllocationConfigBlock:
 
 
 @dataclass
-class SamplingProtocolConfigBlock:
-    sampling_aggressiveness: int = 5
-
-
-@dataclass
 class SeedSelectionConfigBlock:
     n_seeds_per_iteration: int = 50
     bulk_fraction: float = 0.5
     variance_chunk_size: int = 512
-    strategy: str = "hybrid_variance"
+    strategy: str = "d_optimal"
     d_optimal_pool_multiplier: int = 8
     d_optimal_jitter: float = 1.0e-12
     d_optimal_novelty_floor: float = 1.0e-12
     d_optimal_score_power: float = 1.0
+    d_optimal_degenerate_policy: str = "score_backfill"
 
 
 @dataclass
@@ -607,6 +603,7 @@ class ErrorCalibrationConfigBlock:
     enabled: bool = True
     mode: str = "record_only"
     min_records_to_apply: int = 100
+    min_model_versions_to_apply: int = 2
     n_bins: int = 10
     min_bin_records: int = 8
     max_records: int = 5000
@@ -616,7 +613,8 @@ class ErrorCalibrationConfigBlock:
     apply_strength: float = 0.0
     group_by_atom_type: bool = True
     group_by_landing_policy: bool = False
-    model_version_policy: str = "current"
+    model_version_policy: str = "rolling_normalised"
+    aggressiveness_match_required: bool = True
     output_units: str = "ha"
 
 
@@ -978,21 +976,15 @@ class AimallConfigBlock:
 
 @dataclass
 class CampaignConfig:
-    """Top-level campaign configuration (schema v9)."""
+    """Top-level campaign configuration (schema v10)."""
 
     schema_version: int = CONFIG_SCHEMA_VERSION
 
     campaign: CampaignIdentityConfigBlock = field(
         default_factory=CampaignIdentityConfigBlock
     )
-    trajectory_pool: TrajectoryPoolConfigBlock = field(
-        default_factory=TrajectoryPoolConfigBlock
-    )
     point_allocation: PointAllocationConfigBlock = field(
         default_factory=PointAllocationConfigBlock
-    )
-    sampling_protocol: SamplingProtocolConfigBlock = field(
-        default_factory=SamplingProtocolConfigBlock
     )
     seed_selection: SeedSelectionConfigBlock = field(
         default_factory=SeedSelectionConfigBlock
@@ -1350,13 +1342,26 @@ class CampaignConfig:
             )
         if not isinstance(allocation.anchor, bool):
             raise ConfigValidationError("point_allocation.anchor must be a boolean")
-        if not isinstance(self.sampling_protocol.sampling_aggressiveness, int):
+        for path_name in ("source_path", "anchor_path"):
+            value = getattr(self.campaign, path_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ConfigValidationError(
+                    "campaign." + path_name + " must be a non-empty path string"
+                )
+            if "\x00" in value:
+                raise ConfigValidationError(
+                    "campaign." + path_name + " must not contain NUL characters"
+                )
+        if isinstance(self.campaign.sampling_aggressiveness, bool) or not isinstance(
+            self.campaign.sampling_aggressiveness,
+            int,
+        ):
             raise ConfigValidationError(
-                "sampling_protocol.sampling_aggressiveness must be an integer in [1, 10]"
+                "campaign.sampling_aggressiveness must be an integer in [1, 10]"
             )
-        if not 1 <= self.sampling_protocol.sampling_aggressiveness <= 10:
+        if not 1 <= self.campaign.sampling_aggressiveness <= 10:
             raise ConfigValidationError(
-                "sampling_protocol.sampling_aggressiveness must be in [1, 10]"
+                "campaign.sampling_aggressiveness must be in [1, 10]"
             )
         if self.seed_selection.n_seeds_per_iteration <= 0:
             raise ConfigValidationError(
@@ -1383,6 +1388,14 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "seed_selection.strategy must be one of "
                 + repr(sorted(VALID_SEED_SELECTION_STRATEGIES))
+            )
+        if (
+            self.seed_selection.d_optimal_degenerate_policy
+            not in VALID_D_OPTIMAL_DEGENERATE_POLICIES
+        ):
+            raise ConfigValidationError(
+                "seed_selection.d_optimal_degenerate_policy must be one of "
+                + repr(sorted(VALID_D_OPTIMAL_DEGENERATE_POLICIES))
             )
         _validate_positive_int(
             "seed_selection.d_optimal_pool_multiplier",
@@ -1602,6 +1615,10 @@ class CampaignConfig:
             "error_calibration.min_records_to_apply",
             calib.min_records_to_apply,
         )
+        _validate_positive_int(
+            "error_calibration.min_model_versions_to_apply",
+            calib.min_model_versions_to_apply,
+        )
         _validate_positive_int("error_calibration.n_bins", calib.n_bins)
         _validate_positive_int(
             "error_calibration.min_bin_records",
@@ -1646,6 +1663,10 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "error_calibration.model_version_policy must be one of "
                 + repr(sorted(VALID_ERROR_CALIBRATION_MODEL_VERSION_POLICIES))
+            )
+        if not isinstance(calib.aggressiveness_match_required, bool):
+            raise ConfigValidationError(
+                "error_calibration.aggressiveness_match_required must be a boolean"
             )
         max_acquisition_grad = (
             self.acquisition.gradient.max_acquisition_grad_per_ang

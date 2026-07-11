@@ -395,7 +395,12 @@ def test_full_provenance_chain_through_dry_run_executor(tmp_path):
     assert seed_dirs, "ARIADNE produced no seed subdirs"
     for sd in seed_dirs:
         data = read_provenance(sd)
-        assert data["seed"]["selection_origin"] in {"bulk", "variance"}
+        assert data["seed"]["selection_origin"] in {
+            "bulk",
+            "variance",
+            "d_optimal",
+            "d_optimal_backfill",
+        }
         assert data["ariadne"] is not None
         assert "alpha_final" in data["ariadne"]
         assert data["anti_overlap"] is not None

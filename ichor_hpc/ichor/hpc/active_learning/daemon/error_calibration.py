@@ -142,6 +142,17 @@ def _record_key(record: Mapping[str, Any]) -> str:
     )
 
 
+def _frame_key(record: Mapping[str, Any]) -> Tuple[Any, ...]:
+    return (
+        record.get("iteration"),
+        record.get("model_version"),
+        record.get("pointdir"),
+        record.get("seed_id"),
+        record.get("seed_uid"),
+        record.get("property", "iqa"),
+    )
+
+
 def append_records(
     campaign_dir: Any,
     new_records: Sequence[Mapping[str, Any]],
@@ -173,7 +184,25 @@ def append_records(
         )
     )
     if max_records is not None and int(max_records) > 0 and len(merged) > int(max_records):
-        merged = merged[-int(max_records):]
+        grouped: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
+        for record in merged:
+            grouped.setdefault(_frame_key(record), []).append(record)
+        retained_groups: List[List[Dict[str, Any]]] = []
+        retained_count = 0
+        ordered_groups = sorted(
+            grouped.values(),
+            key=lambda group: (
+                int(group[0].get("iteration", -1)),
+                str(group[0].get("pointdir", "")),
+                str(group[0].get("property", "")),
+            ),
+        )
+        for group in reversed(ordered_groups):
+            if retained_groups and retained_count + len(group) > int(max_records):
+                continue
+            retained_groups.append(group)
+            retained_count += len(group)
+        merged = [record for group in reversed(retained_groups) for record in group]
     write_records(campaign_dir, merged)
     return merged, added, skipped
 
@@ -307,7 +336,7 @@ def _filter_records_by_model_version(
     policy: str,
     current_model_version: Optional[int],
 ) -> List[Dict[str, Any]]:
-    if str(policy) == "all":
+    if str(policy) in {"all", "rolling_normalised"}:
         return [dict(r) for r in records]
     version = current_model_version
     if version is None:
@@ -322,6 +351,58 @@ def _filter_records_by_model_version(
         except (TypeError, ValueError):
             continue
     return out
+
+
+def _normalise_total_uncertainty_by_model(
+    records: Sequence[Mapping[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    grouped: Dict[int, List[Mapping[str, Any]]] = {}
+    for record in records:
+        try:
+            version = int(record.get("model_version"))
+        except (TypeError, ValueError):
+            continue
+        grouped.setdefault(version, []).append(record)
+    normalised: List[Dict[str, Any]] = []
+    diagnostics: Dict[str, Dict[str, Any]] = {}
+    for version in sorted(grouped):
+        group = grouped[version]
+        raw_values = sorted(
+            float(value)
+            for value in (
+                _finite_float(record.get("raw_uncertainty")) for record in group
+            )
+            if value is not None and float(value) >= 0.0
+        )
+        positive = [value for value in raw_values if value > 0.0]
+        scale = float(median(positive)) if positive else 1.0
+        scale = max(scale, 1.0e-18)
+        errors = sorted(
+            float(value)
+            for value in (
+                _finite_float(record.get("abs_error_ha")) for record in group
+            )
+            if value is not None
+        )
+        diagnostics[str(version)] = {
+            "n_total_frames": int(len(group)),
+            "raw_uncertainty_median": float(scale),
+            "raw_uncertainty_min": float(min(raw_values)) if raw_values else None,
+            "raw_uncertainty_max": float(max(raw_values)) if raw_values else None,
+            "realised_error_median_ha": (
+                float(median(errors)) if errors else None
+            ),
+        }
+        for record in group:
+            raw = _finite_float(record.get("raw_uncertainty"))
+            if raw is None:
+                continue
+            item = dict(record)
+            item["raw_uncertainty_unnormalised"] = float(raw)
+            item["raw_uncertainty"] = float(raw) / scale
+            item["model_uncertainty_scale"] = float(scale)
+            normalised.append(item)
+    return normalised, diagnostics
 
 
 def _filter_records_by_age(
@@ -345,33 +426,59 @@ def _filter_records_by_age(
 def _total_error_records(records: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
     grouped: Dict[Tuple[Any, ...], List[Mapping[str, Any]]] = {}
     for record in records:
-        key = (
-            record.get("iteration"),
-            record.get("model_version"),
-            record.get("pointdir"),
-            record.get("seed_id"),
-            record.get("seed_uid"),
-            record.get("property", "iqa"),
-        )
-        grouped.setdefault(key, []).append(record)
+        grouped.setdefault(_frame_key(record), []).append(record)
 
     totals: List[Dict[str, Any]] = []
     for key, group in grouped.items():
-        raw_total = _finite_float(group[0].get("raw_total_energy_variance"))
-        if raw_total is None:
+        try:
+            expected_atoms = int(group[0].get("frame_atom_count"))
+        except (TypeError, ValueError):
+            continue
+        atom_names = [str(record.get("atom") or "") for record in group]
+        frame_counts: List[int] = []
+        for record in group:
+            try:
+                frame_counts.append(int(record.get("frame_atom_count", -1)))
+            except (TypeError, ValueError):
+                frame_counts.append(-1)
+        identity_hashes = {
+            str(record.get("frame_atom_identity_sha256") or "")
+            for record in group
+        }
+        if (
+            expected_atoms <= 0
+            or len(group) != expected_atoms
+            or len(set(atom_names)) != expected_atoms
+            or any(not atom for atom in atom_names)
+            or any(value != expected_atoms for value in frame_counts)
+            or len(identity_hashes) != 1
+            or "" in identity_hashes
+        ):
+            continue
+        raw_totals = [
+            _finite_float(record.get("raw_total_energy_variance"))
+            for record in group
+        ]
+        if any(value is None for value in raw_totals):
+            continue
+        raw_total = float(raw_totals[0])
+        if any(
+            not math.isclose(float(value), raw_total, rel_tol=1.0e-12, abs_tol=1.0e-15)
+            for value in raw_totals[1:]
+        ):
             continue
         pred_sum = 0.0
         truth_sum = 0.0
-        n_atoms = 0
+        complete = True
         for record in group:
             pred = _finite_float(record.get("predicted_iqa_ha"))
             truth = _finite_float(record.get("true_iqa_ha"))
             if pred is None or truth is None:
-                continue
+                complete = False
+                break
             pred_sum += float(pred)
             truth_sum += float(truth)
-            n_atoms += 1
-        if n_atoms <= 0:
+        if not complete:
             continue
         iteration, model_version, pointdir, seed_id, seed_uid, prop = key
         totals.append(
@@ -383,7 +490,7 @@ def _total_error_records(records: Sequence[Mapping[str, Any]]) -> List[Dict[str,
                 "seed_id": seed_id,
                 "seed_uid": seed_uid,
                 "property": prop,
-                "n_atoms": int(n_atoms),
+                "n_atoms": int(expected_atoms),
                 "predicted_total_iqa_ha": float(pred_sum),
                 "true_total_iqa_ha": float(truth_sum),
                 "abs_error_ha": float(abs(pred_sum - truth_sum)),
@@ -391,6 +498,7 @@ def _total_error_records(records: Sequence[Mapping[str, Any]]) -> List[Dict[str,
                 "raw_total_energy_variance": float(raw_total),
                 "raw_total_score": _finite_float(group[0].get("raw_total_score")),
                 "landing_policy": str(group[0].get("landing_policy", "unknown")),
+                "sampling_aggressiveness": group[0].get("sampling_aggressiveness"),
             }
         )
     totals.sort(
@@ -414,12 +522,23 @@ def build_calibration_model(
     n_bins = int(_cfg_value(block, "n_bins", 10))
     min_bin_records = int(_cfg_value(block, "min_bin_records", 8))
     min_records_to_apply = int(_cfg_value(block, "min_records_to_apply", 100))
+    min_model_versions_to_apply = int(
+        _cfg_value(block, "min_model_versions_to_apply", 2)
+    )
     max_model_age_iterations = int(_cfg_value(block, "max_model_age_iterations", 10))
     monotone_estimator = bool(_cfg_value(block, "monotone_estimator", True))
     quantile = float(_cfg_value(block, "quantile", 0.75))
     group_by_atom_type = bool(_cfg_value(block, "group_by_atom_type", True))
     group_by_landing_policy = bool(_cfg_value(block, "group_by_landing_policy", False))
-    model_version_policy = str(_cfg_value(block, "model_version_policy", "current"))
+    model_version_policy = str(
+        _cfg_value(block, "model_version_policy", "rolling_normalised")
+    )
+    aggressiveness_match_required = bool(
+        _cfg_value(block, "aggressiveness_match_required", True)
+    )
+    sampling_aggressiveness = int(
+        getattr(getattr(config, "campaign", object()), "sampling_aggressiveness", 5)
+    )
 
     current_version = (
         current_model_version
@@ -444,6 +563,19 @@ def build_calibration_model(
         iteration=int(iteration),
         max_age_iterations=max_model_age_iterations,
     )
+    n_aggressiveness_mismatch = 0
+    if aggressiveness_match_required:
+        matched: List[Dict[str, Any]] = []
+        for record in candidate_records:
+            try:
+                matches = int(record.get("sampling_aggressiveness")) == sampling_aggressiveness
+            except (TypeError, ValueError):
+                matches = False
+            if matches:
+                matched.append(record)
+            else:
+                n_aggressiveness_mismatch += 1
+        candidate_records = matched
     n_records_by_iteration: Dict[str, int] = {}
     for record in candidate_records:
         try:
@@ -459,6 +591,21 @@ def build_calibration_model(
         and _finite_float(r.get("abs_error_ha")) is not None
     ]
     total_records = _total_error_records(finite_records)
+    uncertainty_axis = "raw"
+    model_normalisation: Dict[str, Dict[str, Any]] = {}
+    table_total_records = total_records
+    if model_version_policy == "rolling_normalised":
+        table_total_records, model_normalisation = (
+            _normalise_total_uncertainty_by_model(total_records)
+        )
+        uncertainty_axis = "model_normalised"
+    contributing_versions_set: set[int] = set()
+    for record in table_total_records:
+        try:
+            contributing_versions_set.add(int(record.get("model_version")))
+        except (TypeError, ValueError):
+            continue
+    contributing_model_versions = sorted(contributing_versions_set)
     tables: Dict[str, Any] = {
         "global": _make_table(
             finite_records,
@@ -468,7 +615,7 @@ def build_calibration_model(
             quantile=quantile,
         ),
         "global_total": _make_table(
-            total_records,
+            table_total_records,
             n_bins=n_bins,
             min_bin_records=min_bin_records,
             monotone=monotone_estimator,
@@ -516,6 +663,11 @@ def build_calibration_model(
         activation_blockers.append("zero_apply_strength")
     if len(total_records) < min_records_to_apply:
         activation_blockers.append("not_enough_total_records")
+    if (
+        model_version_policy == "rolling_normalised"
+        and len(contributing_model_versions) < min_model_versions_to_apply
+    ):
+        activation_blockers.append("not_enough_model_versions")
     if not global_usable:
         activation_blockers.append("global_total_unusable")
     usable_for_acquisition = not activation_blockers
@@ -529,6 +681,14 @@ def build_calibration_model(
         "n_records_by_model_version": n_records_by_model_version,
         "n_records_by_iteration_window": n_records_by_iteration,
         "model_version_policy": str(model_version_policy),
+        "uncertainty_axis": uncertainty_axis,
+        "model_uncertainty_normalisation": model_normalisation,
+        "contributing_model_versions": contributing_model_versions,
+        "n_contributing_model_versions": int(len(contributing_model_versions)),
+        "min_model_versions_to_apply": int(min_model_versions_to_apply),
+        "sampling_aggressiveness": int(sampling_aggressiveness),
+        "aggressiveness_match_required": bool(aggressiveness_match_required),
+        "n_aggressiveness_mismatch_excluded": int(n_aggressiveness_mismatch),
         "current_model_version": (
             None
             if current_version is None
@@ -582,6 +742,9 @@ def mark_calibration_model_stale(
 def load_calibration_model_for_acquisition(
     campaign_dir: Any,
     config: Any,
+    *,
+    current_model_version: Optional[int] = None,
+    current_iteration: Optional[int] = None,
 ) -> Tuple[Optional[Dict[str, Any]], str]:
     block = _block(config)
     if not _enabled(config):
@@ -608,6 +771,60 @@ def load_calibration_model_for_acquisition(
     except ErrorCalibrationError as exc:
         _quarantine_model_file(campaign_dir, str(exc))
         return None, "malformed_model"
+    configured_policy = str(
+        _cfg_value(block, "model_version_policy", "rolling_normalised")
+    )
+    if str(data.get("model_version_policy")) != configured_policy:
+        return None, "model_version_policy_changed"
+    if current_model_version is None:
+        try:
+            from ..versioning.trained_models import TrainedModelVersioning
+
+            current_model_version = TrainedModelVersioning(
+                Path(campaign_dir) / "6_TRAINED_MODELS"
+            ).current_version()
+        except Exception:
+            current_model_version = None
+    if configured_policy == "current":
+        try:
+            calibrated_version = int(data.get("current_model_version"))
+        except (TypeError, ValueError):
+            return None, "calibrated_model_version_missing"
+        if current_model_version is None or calibrated_version != int(current_model_version):
+            return None, "calibrated_model_version_mismatch"
+    elif configured_policy == "rolling_normalised":
+        versions = data.get("contributing_model_versions")
+        if not isinstance(versions, list):
+            return None, "normalised_model_versions_missing"
+        try:
+            version_values = sorted({int(value) for value in versions})
+        except (TypeError, ValueError):
+            return None, "normalised_model_versions_malformed"
+        required_versions = int(
+            _cfg_value(block, "min_model_versions_to_apply", 2)
+        )
+        if len(version_values) < required_versions:
+            return None, "not_enough_model_versions"
+        if current_model_version is None:
+            return None, "current_model_version_unavailable"
+        if version_values and int(current_model_version) < max(version_values):
+            return None, "calibration_is_ahead_of_current_model"
+    if bool(_cfg_value(block, "aggressiveness_match_required", True)):
+        try:
+            model_aggressiveness = int(data.get("sampling_aggressiveness"))
+            current_aggressiveness = int(config.campaign.sampling_aggressiveness)
+        except (AttributeError, TypeError, ValueError):
+            return None, "sampling_aggressiveness_unavailable"
+        if model_aggressiveness != current_aggressiveness:
+            return None, "sampling_aggressiveness_mismatch"
+    if current_iteration is not None:
+        try:
+            age = int(current_iteration) - int(data.get("iteration"))
+        except (TypeError, ValueError):
+            return None, "calibration_iteration_missing"
+        max_age = int(_cfg_value(block, "max_model_age_iterations", 10))
+        if age < 0 or age > max_age:
+            return None, "calibration_model_too_old"
     return data, "loaded"
 
 
@@ -616,6 +833,7 @@ def lookup_calibrated_abs_error(
     raw_uncertainty: Any,
     *,
     table_key: str = "global_total",
+    application_uncertainty_scale: Optional[float] = None,
 ) -> Optional[float]:
     """Return calibrated absolute IQA error for a raw uncertainty value.
 
@@ -626,6 +844,11 @@ def lookup_calibrated_abs_error(
     raw = _finite_float(raw_uncertainty)
     if raw is None:
         return None
+    if str(model.get("uncertainty_axis", "raw")) == "model_normalised":
+        scale = _finite_float(application_uncertainty_scale)
+        if scale is None or scale <= 0.0:
+            return None
+        raw = float(raw) / float(scale)
     tables = model.get("tables") if isinstance(model, Mapping) else None
     if not isinstance(tables, Mapping):
         return None
@@ -676,6 +899,7 @@ def _build_records_for_pointdir(
     *,
     iteration: int,
     fallback_model_version: int,
+    sampling_aggressiveness: int,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     from ..versioning.provenance import PROVENANCE_FILENAME, read_provenance
 
@@ -690,14 +914,26 @@ def _build_records_for_pointdir(
     per_atom_raw = source.get("per_atom")
     if not isinstance(per_atom_raw, list):
         return [], ["missing_per_atom_prediction_diagnostics"]
-    predicted_by_atom = {
-        str(row.get("atom")): row
-        for row in per_atom_raw
-        if isinstance(row, Mapping) and row.get("atom") is not None
-    }
     quality_atoms = quality_record.get("per_atom")
     if not isinstance(quality_atoms, list):
         return [], ["missing_quality_per_atom"]
+    predicted_rows = [row for row in per_atom_raw if isinstance(row, Mapping)]
+    quality_rows = [row for row in quality_atoms if isinstance(row, Mapping)]
+    predicted_names = [str(row.get("atom") or "") for row in predicted_rows]
+    quality_names = [str(row.get("atom") or "") for row in quality_rows]
+    if (
+        len(predicted_rows) != len(per_atom_raw)
+        or len(quality_rows) != len(quality_atoms)
+        or not predicted_names
+        or any(not name for name in predicted_names + quality_names)
+        or len(set(predicted_names)) != len(predicted_names)
+        or len(set(quality_names)) != len(quality_names)
+        or set(predicted_names) != set(quality_names)
+    ):
+        return [], ["incomplete_or_mismatched_atom_identity"]
+    predicted_by_atom = {
+        name: row for name, row in zip(predicted_names, predicted_rows)
+    }
 
     model_version_raw = source.get("model_version", fallback_model_version)
     try:
@@ -710,25 +946,21 @@ def _build_records_for_pointdir(
     except (TypeError, ValueError):
         seed_id_value = None
     seed_uid = str(source.get("seed_uid") or "") or None
+    total_variance = _finite_float(source.get("total_energy_variance"))
+    raw_total_score = _finite_float(source.get("raw_total_score"))
+    atom_identity_sha = hashlib.sha256(
+        json.dumps(quality_names, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
     records: List[Dict[str, Any]] = []
-    for q_atom in quality_atoms:
-        if not isinstance(q_atom, Mapping):
-            skipped.append("malformed_quality_atom")
-            continue
+    for q_atom in quality_rows:
         atom = str(q_atom.get("atom"))
         pred = predicted_by_atom.get(atom)
-        if not isinstance(pred, Mapping):
-            skipped.append("missing_prediction_for_atom:" + atom)
-            continue
         true_iqa = _finite_float(q_atom.get("iqa_ha"))
         predicted_iqa = _finite_float(pred.get("predicted_iqa_ha"))
         raw_uncertainty = _finite_float(pred.get("raw_variance"))
-        total_variance = _finite_float(source.get("total_energy_variance"))
-        raw_total_score = _finite_float(source.get("raw_total_score"))
         if true_iqa is None or predicted_iqa is None or raw_uncertainty is None:
-            skipped.append("nonfinite_prediction_truth_or_uncertainty:" + atom)
-            continue
+            return [], ["nonfinite_prediction_truth_or_uncertainty:" + atom]
         record = {
             "schema_version": ERROR_CALIBRATION_SCHEMA_VERSION,
             "iteration": int(iteration),
@@ -736,6 +968,9 @@ def _build_records_for_pointdir(
             "pointdir": pointdir.name,
             "seed_id": seed_id_value,
             "seed_uid": seed_uid,
+            "sampling_aggressiveness": int(sampling_aggressiveness),
+            "frame_atom_count": int(len(quality_names)),
+            "frame_atom_identity_sha256": atom_identity_sha,
             "atom": atom,
             "atom_type": str(pred.get("atom_type", "")),
             "property": str(pred.get("property", source.get("property", "iqa"))),
@@ -796,6 +1031,9 @@ def update_from_aimall_acceptance(
             q_record,
             iteration=int(iteration),
             fallback_model_version=int(models_version),
+            sampling_aggressiveness=int(
+                config.campaign.sampling_aggressiveness
+            ),
         )
         new_records.extend(built)
         for reason in reasons:
@@ -836,6 +1074,7 @@ def synthetic_dry_records(
     iteration: int,
     models_version: int,
     n_points: int,
+    sampling_aggressiveness: int = 5,
 ) -> List[Dict[str, Any]]:
     records = []
     for i in range(int(n_points)):
@@ -850,6 +1089,9 @@ def synthetic_dry_records(
             "seed_uid": hashlib.sha256(
                 (str(iteration) + ":" + str(i + 1)).encode("ascii")
             ).hexdigest(),
+            "sampling_aggressiveness": int(sampling_aggressiveness),
+            "frame_atom_count": 1,
+            "frame_atom_identity_sha256": hashlib.sha256(b'["X1"]').hexdigest(),
             "atom": "X1",
             "atom_type": "X",
             "property": "iqa",

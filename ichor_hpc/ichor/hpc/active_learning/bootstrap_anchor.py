@@ -8,6 +8,8 @@ first predictive mean rather than as holdout scoring rows.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -17,11 +19,13 @@ import numpy as np
 from ichor.core.atoms import Atoms
 from ichor.core.files.xyz import Trajectory
 
-from .daemon.state import atomic_write_json
+from .daemon.state import atomic_write_json, atomic_write_text
+from .operator_paths import resolve_campaign_input_path
 from .sampling.descriptors import mass_weighted_rmsd
 
 
 ANCHOR_XYZ_FILENAME = "anchor.xyz"
+ANCHOR_SOURCE_MANIFEST_FILENAME = "ANCHOR_SOURCE.json"
 BOOTSTRAP_ANCHOR_MANIFEST_FILENAME = "ANCHOR.json"
 BOOTSTRAP_ANCHOR_SCHEMA_VERSION = 1
 ANCHOR_DUPLICATE_RMSD_ANGSTROM = 1.0e-8
@@ -78,7 +82,109 @@ class BootstrapAnchorPlan:
 
 
 def anchor_xyz_path(campaign_dir: str | Path) -> Path:
-    return Path(campaign_dir) / ANCHOR_XYZ_FILENAME
+    return Path(campaign_dir) / ".DATA" / "TRAJECTORY" / ANCHOR_XYZ_FILENAME
+
+
+def anchor_source_manifest_path(campaign_dir: str | Path) -> Path:
+    return (
+        Path(campaign_dir)
+        / ".DATA"
+        / "TRAJECTORY"
+        / ANCHOR_SOURCE_MANIFEST_FILENAME
+    )
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def import_anchor_source(
+    campaign_dir: str | Path,
+    configured_path: str | Path,
+    *,
+    overwrite: bool = False,
+) -> Dict[str, Any]:
+    """Import an operator anchor into immutable campaign-owned storage."""
+    campaign = Path(campaign_dir).resolve()
+    source = resolve_campaign_input_path(campaign, configured_path)
+    if source.is_symlink():
+        raise ValueError("campaign.anchor_path refuses a symlink: " + str(source))
+    if not source.is_file():
+        raise FileNotFoundError("campaign.anchor_path is not a file: " + str(source))
+    try:
+        text = source.read_text(encoding="utf-8")
+        trajectory = Trajectory(source)
+        trajectory.read()
+        frames = [atoms.copy() for atoms in trajectory]
+    except Exception as exc:
+        raise ValueError("failed to read campaign.anchor_path: " + str(source)) from exc
+    if not frames:
+        raise ValueError("campaign.anchor_path contains no geometries: " + str(source))
+    expected = _atom_types(frames[0])
+    for index, frame in enumerate(frames):
+        _validate_geometry(
+            frame,
+            label="anchor frame " + str(index),
+            expected_atom_types=expected,
+        )
+
+    canonical = anchor_xyz_path(campaign)
+    manifest = anchor_source_manifest_path(campaign)
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    source_sha = _sha256(source)
+    canonical_sha = _sha256_bytes(text.encode("utf-8"))
+    if canonical.exists() and not overwrite:
+        if canonical.is_symlink() or _sha256(canonical) != canonical_sha:
+            raise FileExistsError(
+                "canonical anchor already exists with different contents: "
+                + str(canonical)
+            )
+    else:
+        atomic_write_text(canonical, text)
+    payload = {
+        "schema_version": 1,
+        "configured_path": str(configured_path),
+        "resolved_source_path": str(source),
+        "canonical_path": str(canonical.resolve()),
+        "sha256": _sha256(canonical),
+        "source_sha256": source_sha,
+        "n_frames": int(len(frames)),
+        "atom_types": list(expected),
+    }
+    atomic_write_json(manifest, payload)
+    return payload
+
+
+def read_anchor_source_manifest(campaign_dir: str | Path) -> Dict[str, Any]:
+    path = anchor_source_manifest_path(campaign_dir)
+    if not path.is_file() or path.is_symlink():
+        raise FileNotFoundError("anchor source manifest missing: " + str(path))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError("anchor source manifest is unreadable: " + str(path)) from exc
+    if not isinstance(payload, dict) or int(payload.get("schema_version", -1)) != 1:
+        raise ValueError("anchor source manifest schema is invalid: " + str(path))
+    canonical_path = anchor_xyz_path(campaign_dir)
+    canonical = canonical_path.resolve(strict=False)
+    if Path(str(payload.get("canonical_path") or "")).resolve(strict=False) != canonical:
+        raise ValueError("anchor source manifest canonical path is invalid")
+    recorded_sha = str(payload.get("sha256") or "")
+    if (
+        not canonical_path.is_file()
+        or canonical_path.is_symlink()
+        or _sha256(canonical_path) != recorded_sha
+    ):
+        raise ValueError("canonical anchor SHA does not match its source manifest")
+    return payload
 
 
 def bootstrap_anchor_manifest_path(campaign_dir: str | Path) -> Path:
@@ -91,11 +197,12 @@ def load_anchor_frames(campaign_dir: str | Path) -> List[Atoms]:
     path = anchor_xyz_path(campaign_dir)
     if path.is_symlink():
         raise ValueError(
-            "point_allocation.anchor refuses symlinked anchor.xyz: " + str(path)
+            "point_allocation.anchor refuses a symlinked canonical anchor: " + str(path)
         )
     if not path.is_file():
         raise FileNotFoundError(
-            "point_allocation.anchor is true but anchor.xyz is missing: " + str(path)
+            "point_allocation.anchor is true but the canonical anchor is missing: "
+            + str(path)
         )
     try:
         traj = Trajectory(path)
@@ -288,8 +395,6 @@ def read_bootstrap_anchor_manifest(campaign_dir: str | Path) -> Dict[str, Any]:
     path = bootstrap_anchor_manifest_path(campaign_dir)
     if not path.is_file():
         raise FileNotFoundError("bootstrap anchor manifest missing: " + str(path))
-    import json
-
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:

@@ -2112,7 +2112,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         sacct_poller = None
         # live mode: let the daemon spot + adopt an orphaned in-flight job on (re)entry rather than
         # double-submitting after a crash or reconcile (A24/A25).
-        job_finder = make_live_job_finder()
+        job_finder = make_live_job_finder(campaign_dir=campaign_dir)
         job_name_accounting_finder = make_live_job_accounting_finder()
         job_liveness_checker = make_live_job_liveness_checker()
     elif getattr(args, "dry_run", False):
@@ -4790,16 +4790,22 @@ def _resolve_init_campaign_dir(raw_campaign_dir: Optional[str]) -> Path:
     return campaign
 
 
-def _resolve_init_source(campaign: Path, raw_source: Optional[str]) -> Path:
-    if raw_source:
-        source = Path(raw_source).expanduser().resolve()
-    else:
-        source = campaign / "pool.xyz"
+def _resolve_init_source(
+    campaign: Path,
+    raw_source: Optional[str],
+    configured_source: str,
+) -> Path:
+    from .operator_paths import resolve_campaign_input_path
+
+    source = resolve_campaign_input_path(
+        campaign,
+        raw_source if raw_source else configured_source,
+    )
     if not source.exists():
         raise FileNotFoundError(
             "source trajectory does not exist: "
             + str(source)
-            + ". Put pool.xyz in the campaign directory or pass --source PATH."
+            + ". Update campaign.source_path or pass --source PATH."
         )
     if not source.is_file():
         raise FileNotFoundError("source trajectory is not a file: " + str(source))
@@ -5059,16 +5065,22 @@ def cmd_init(args: argparse.Namespace) -> int:
     pool_summary: Dict[str, Any]
     raw_source = getattr(args, "source", None)
     source: Optional[Path] = None
-    if raw_source:
+    existing_pool = False
+    if raw_source is None and not bool(getattr(args, "force", False)):
         try:
-            source = _resolve_init_source(campaign, raw_source)
+            existing_pool = _trajectory_pool_summary(campaign).get("status") == "ok"
+        except Exception:
+            existing_pool = False
+    if not existing_pool:
+        try:
+            source = _resolve_init_source(
+                campaign,
+                raw_source,
+                config.campaign.source_path,
+            )
         except FileNotFoundError as exc:
             print(str(exc), file=sys.stderr)
             return 2
-    else:
-        default_source = campaign / "pool.xyz"
-        if default_source.is_file():
-            source = default_source.resolve()
 
     if source is not None:
         state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
@@ -5081,6 +5093,42 @@ def cmd_init(args: argparse.Namespace) -> int:
         import_rc = _import_pool_impl(args, campaign, source)
         if import_rc != 0:
             return import_rc
+
+    anchor_summary: Dict[str, Any] = {"status": "disabled"}
+    if bool(config.point_allocation.anchor):
+        from .bootstrap_anchor import (
+            import_anchor_source,
+            load_anchor_frames,
+            read_anchor_source_manifest,
+        )
+
+        anchor_source = getattr(args, "anchor_source", None) or config.campaign.anchor_path
+        try:
+            use_existing_anchor = bool(
+                getattr(args, "anchor_source", None) is None
+                and not bool(getattr(args, "force", False))
+                and (campaign / ".DATA" / "TRAJECTORY" / "anchor.xyz").is_file()
+            )
+            if use_existing_anchor:
+                anchor_summary = read_anchor_source_manifest(campaign)
+                anchor_summary["n_frames"] = len(load_anchor_frames(campaign))
+                anchor_summary["status"] = "existing"
+            else:
+                anchor_summary = import_anchor_source(
+                    campaign,
+                    anchor_source,
+                    overwrite=bool(getattr(args, "force", False)),
+                )
+                anchor_summary["status"] = "ok"
+        except Exception as exc:
+            print(
+                "campaign bootstrap anchor import failed: "
+                + type(exc).__name__
+                + ": "
+                + str(exc),
+                file=sys.stderr,
+            )
+            return 18
 
     try:
         pool_summary = _trajectory_pool_summary(campaign)
@@ -5110,6 +5158,15 @@ def cmd_init(args: argparse.Namespace) -> int:
     print("  campaign: " + str(campaign))
     print("  campaign.yaml: ok, schema v" + str(config.schema_version))
     _print_pool_summary(pool_summary)
+    print(
+        "  bootstrap anchor: "
+        + str(anchor_summary.get("status"))
+        + (
+            ", " + str(anchor_summary.get("canonical_path"))
+            if anchor_summary.get("canonical_path")
+            else ""
+        )
+    )
     if feasibility_summary:
         _print_pool_feasibility(feasibility_summary)
     print(
@@ -5312,6 +5369,7 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
     lines.append("Scheduler")
     lines.append(_preflight_check_line("sbatch", avail.get("sbatch"), avail.get("sbatch_path") or "not found"))
     lines.append(_preflight_check_line("sacct", avail.get("sacct"), avail.get("sacct_path") or "not found"))
+    lines.append(_preflight_check_line("squeue", avail.get("squeue"), avail.get("squeue_path") or "not found"))
     lines.append(_preflight_check_line("bc", avail.get("bc"), avail.get("bc_path") or "not found"))
 
     lines.append("")
@@ -5320,9 +5378,13 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
     lines.append(
         _preflight_check_line(
             "configured python",
-            bool(avail.get("python_executable")),
-            python_path,
-            warn=not bool(avail.get("python_executable")),
+            bool(avail.get("batch_python")),
+            (
+                python_path
+                + (" (" + str(avail.get("batch_python_version")) + ")" if avail.get("batch_python_version") else "")
+                + (": " + str(avail.get("batch_python_error")) if avail.get("batch_python_error") else "")
+            ),
+            warn=not bool(avail.get("batch_python")),
         )
     )
     lines.append(_preflight_check_line("ariadne", avail.get("ariadne"), "importable" if avail.get("ariadne") else "not importable"))
@@ -5505,7 +5567,6 @@ Examples:
                 "when it contains campaign.yaml."
             ),
         )
-
     def add_background_options(p):
         p.add_argument(
             "-b",
@@ -5817,9 +5878,17 @@ Examples:
             required=source_required,
             default=None,
             help=(
-                "Path to the operator's MD trajectory (.xyz). If omitted, "
-                "<campaign-dir>/pool.xyz is imported when present; otherwise "
-                "init still bootstraps campaign state and reports the missing pool."
+                "One-run override for campaign.source_path. Relative paths are "
+                "resolved from the campaign directory."
+            ),
+        )
+        p.add_argument(
+            "--anchor-source",
+            default=None,
+            help=(
+                "One-run override for campaign.anchor_path. Used only when "
+                "point_allocation.anchor is true; relative paths are resolved "
+                "from the campaign directory."
             ),
         )
         p.add_argument(
@@ -5831,13 +5900,13 @@ Examples:
 
     p_init = sub.add_parser(
         "init",
-        help="Bootstrap campaign.yaml, daemon state, config lock, and optionally pool.xyz.",
+        help="Bootstrap campaign.yaml, daemon state, config lock, and campaign inputs.",
         description=(
             "Initialise or populate campaign.yaml from the packaged template, "
-            "create the fresh daemon state/config lock when safe, and optionally "
-            "copy the operator trajectory verbatim into the campaign pool with a "
+            "create the fresh daemon state/config lock when safe, and import "
+            "the operator trajectory into the campaign pool with a "
             "SHA-pinned manifest. From inside a campaign directory, "
-            "--campaign-dir and --source can be omitted."
+            "--campaign-dir, --source, and --anchor-source can be omitted."
         ),
         epilog=(
             "Examples:\n"

@@ -1,8 +1,11 @@
-schema_version: 9
+schema_version: 10
 
 campaign:
   system_name: ICHOR_CSF4_LONG_CAMPAIGN
   max_iterations: 20
+  source_path: pool.xyz
+  anchor_path: anchor.xyz
+  sampling_aggressiveness: 5
 
 # Production-style starting point. Calibrate thresholds from one first-live
 # campaign before increasing batch sizes further.
@@ -18,10 +21,7 @@ seed_selection:
   strategy: d_optimal
   n_seeds_per_iteration: 16
   bulk_fraction: 0.2
-
-sampling_protocol:
-  # 1 conservative, 5 balanced/current default, 10 exploratory within hard safety gates.
-  sampling_aggressiveness: 5
+  d_optimal_degenerate_policy: score_backfill
 
 resources:
   defaults:
@@ -32,4 +32,6 @@ resources:
 
 error_calibration:
   mode: record_only
-  model_version_policy: current
+  min_model_versions_to_apply: 2
+  model_version_policy: rolling_normalised
+  aggressiveness_match_required: true

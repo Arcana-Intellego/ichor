@@ -811,6 +811,9 @@ class Daemon:
                     campaign_uid=str(getattr(state, "campaign_uid", "")),
                     phase_name=phase_name,
                     iteration=int(state.iteration),
+                    replacement_round=int(
+                        getattr(state, "replacement_round", 0)
+                    ),
                 )
                 intent_written = True
             except Exception as exc:
@@ -1443,6 +1446,41 @@ class Daemon:
         if phase_name in ("PHASE_A_POLUS", "PHASE_B_POLUS"):
             return 1
         try:
+            if phase_name in {
+                "INITIAL_REPLACEMENT_GAUSSIAN",
+                "INITIAL_REPLACEMENT_AIMALL",
+                "REPLACEMENT_GAUSSIAN",
+                "REPLACEMENT_AIMALL",
+            }:
+                from ..replacement_sampling import (
+                    read_replacement_sample_strict,
+                    replacement_round_dir,
+                )
+
+                context = (
+                    "bootstrap" if phase_name.startswith("INITIAL_") else "active"
+                )
+                iteration = 0 if context == "bootstrap" else int(state.iteration)
+                replacement_round = int(getattr(state, "replacement_round", 0))
+                manifest = read_replacement_sample_strict(
+                    self.campaign_dir,
+                    context=context,
+                    iteration=iteration,
+                    replacement_round=replacement_round,
+                )
+                round_dir = replacement_round_dir(
+                    self.campaign_dir,
+                    context=context,
+                    iteration=iteration,
+                    replacement_round=replacement_round,
+                )
+                staged_count = self._count_nonempty_lines(round_dir / "POINTS.txt")
+                manifest_count = int(manifest.get("n_candidates", 0))
+                if staged_count != manifest_count or manifest_count <= 0:
+                    raise ValueError(
+                        "replacement POINTS.txt count does not match its strict sample manifest"
+                    )
+                return manifest_count
             if phase_name in ("INITIAL_GAUSSIAN", "INITIAL_AIMALL"):
                 return self._count_nonempty_lines(
                     self.campaign_dir / ".DATA" / "STAGING" / "initial" / "POINTS.txt"

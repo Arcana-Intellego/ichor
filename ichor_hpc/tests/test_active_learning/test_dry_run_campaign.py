@@ -211,6 +211,14 @@ def test_dry_run_cli_drives_campaign_to_done(tmp_path):
     daemon completes a 2-iteration campaign."""
     campaign, cfg = _make_campaign(tmp_path)
     cfg.to_yaml(campaign / "campaign.yaml")
+    (campaign / "pool.xyz").write_text(
+        "".join(
+            "1\nframe " + str(index) + "\nH 0.0 0.0 0.0\n"
+            for index in range(32)
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
     assert cli_main(["init", "--campaign-dir", str(campaign)]) == 0
     rc = cli_main([
         "start",

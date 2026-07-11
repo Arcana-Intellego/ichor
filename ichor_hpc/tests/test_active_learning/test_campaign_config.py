@@ -29,8 +29,8 @@ from ichor.hpc.active_learning.geometry_protocol import (
 )
 
 
-def test_schema_version_is_nine():
-    assert CONFIG_SCHEMA_VERSION == 9
+def test_schema_version_is_ten():
+    assert CONFIG_SCHEMA_VERSION == 10
 
 
 def test_default_campaign_config_is_valid():
@@ -55,12 +55,15 @@ def test_default_campaign_config_is_valid():
     assert c.runtime.poll_sacct_missing_max_ticks == 12
     assert c.runtime.halt_on_tick_exception is True
     assert c.seed_selection.variance_chunk_size == 512
-    assert c.seed_selection.strategy == "hybrid_variance"
+    assert c.seed_selection.strategy == "d_optimal"
     assert c.seed_selection.d_optimal_pool_multiplier == 8
     assert c.seed_selection.d_optimal_jitter == 1.0e-12
     assert c.seed_selection.d_optimal_novelty_floor == 1.0e-12
     assert c.seed_selection.d_optimal_score_power == 1.0
-    assert c.sampling_protocol.sampling_aggressiveness == 5
+    assert c.seed_selection.d_optimal_degenerate_policy == "score_backfill"
+    assert c.campaign.source_path == "pool.xyz"
+    assert c.campaign.anchor_path == "anchor.xyz"
+    assert c.campaign.sampling_aggressiveness == 5
     assert c.geometry_novelty.enabled is True
     assert c.geometry_novelty.scale_source == "local_motion"
     assert c.geometry_novelty.statistic == "median"
@@ -92,6 +95,7 @@ def test_default_campaign_config_is_valid():
     assert c.error_calibration.enabled is True
     assert c.error_calibration.mode == "record_only"
     assert c.error_calibration.min_records_to_apply == 100
+    assert c.error_calibration.min_model_versions_to_apply == 2
     assert c.error_calibration.n_bins == 10
     assert c.error_calibration.min_bin_records == 8
     assert c.error_calibration.max_records == 5000
@@ -101,7 +105,8 @@ def test_default_campaign_config_is_valid():
     assert c.error_calibration.apply_strength == 0.0
     assert c.error_calibration.group_by_atom_type is True
     assert c.error_calibration.group_by_landing_policy is False
-    assert c.error_calibration.model_version_policy == "current"
+    assert c.error_calibration.model_version_policy == "rolling_normalised"
+    assert c.error_calibration.aggressiveness_match_required is True
     assert c.error_calibration.output_units == "ha"
     assert c.acquisition.spectral.enabled is True
     assert c.acquisition.spectral.mode == "blend"
@@ -146,10 +151,10 @@ def test_point_allocation_anchor_and_integer_sizes_are_validated():
         CampaignConfig.from_dict(payload)
 
 
-def test_pre_v9_schema_is_rejected_without_migration():
+def test_pre_v10_schema_is_rejected_without_migration():
     payload = CampaignConfig().to_dict()
     payload["schema_version"] = 7
-    with pytest.raises(ConfigValidationError, match="requires schema_version 9"):
+    with pytest.raises(ConfigValidationError, match="requires schema_version 10"):
         CampaignConfig.from_dict(payload)
 
 
@@ -323,7 +328,7 @@ def test_schema_v3_resources_are_rejected_without_migration():
             "gaussian_link0_mem": "8GB",
         },
     }
-    with pytest.raises(ConfigValidationError, match="requires schema_version 9"):
+    with pytest.raises(ConfigValidationError, match="requires schema_version 10"):
         CampaignConfig.from_dict(payload)
 
 
@@ -570,6 +575,48 @@ def test_wrong_schema_version_rejected():
         CampaignConfig.from_dict(payload)
 
 
+@pytest.mark.parametrize("removed_block", ["trajectory_pool", "sampling_protocol"])
+def test_schema_ten_rejects_removed_top_level_blocks(removed_block):
+    payload = CampaignConfig().to_dict()
+    payload[removed_block] = {"legacy": True}
+
+    with pytest.raises(ConfigValidationError, match="unknown keys"):
+        CampaignConfig.from_dict(payload)
+
+
+def test_schema_ten_campaign_block_owns_operator_input_fields():
+    payload = CampaignConfig().to_dict()
+
+    assert set(payload["campaign"]) == {
+        "system_name",
+        "max_iterations",
+        "source_path",
+        "anchor_path",
+        "sampling_aggressiveness",
+    }
+    assert "trajectory_pool" not in payload
+    assert "sampling_protocol" not in payload
+
+
+def test_all_shipped_campaign_templates_and_examples_parse_as_schema_ten():
+    repo_root = Path(__file__).resolve().parents[3]
+    paths = [
+        repo_root
+        / "ichor_hpc"
+        / "ichor"
+        / "hpc"
+        / "active_learning"
+        / "templates"
+        / "campaign.yaml",
+        *sorted((repo_root / "examples").glob("**/campaign.yaml")),
+    ]
+
+    assert paths
+    for path in paths:
+        config = CampaignConfig.from_yaml(path)
+        assert config.schema_version == 10, str(path)
+
+
 def test_invalid_descriptor_rejected():
     payload = CampaignConfig().to_dict()
     payload["phase_b"]["descriptor"] = "not_a_real_descriptor"
@@ -580,8 +627,8 @@ def test_invalid_descriptor_rejected():
 @pytest.mark.parametrize("value", [0, 11, "5"])
 def test_sampling_aggressiveness_must_be_in_public_range(value):
     payload = CampaignConfig().to_dict()
-    payload["sampling_protocol"]["sampling_aggressiveness"] = value
-    with pytest.raises(ConfigValidationError, match="sampling_protocol.sampling_aggressiveness"):
+    payload["campaign"]["sampling_aggressiveness"] = value
+    with pytest.raises(ConfigValidationError, match="campaign.sampling_aggressiveness"):
         CampaignConfig.from_dict(payload)
 
 
@@ -616,7 +663,7 @@ def test_schema_v4_geometry_payload_is_rejected_without_migration():
     }
     payload["acquisition"]["fullspace_confinement"]["rmsd_scale_ang"] = 99.0
 
-    with pytest.raises(ConfigValidationError, match="requires schema_version 9"):
+    with pytest.raises(ConfigValidationError, match="requires schema_version 10"):
         CampaignConfig.from_dict(payload)
 
 
@@ -641,7 +688,7 @@ def test_schema_v5_bootstrap_and_batch_fields_are_rejected():
         "cap": 30,
     }
 
-    with pytest.raises(ConfigValidationError, match="requires schema_version 9"):
+    with pytest.raises(ConfigValidationError, match="requires schema_version 10"):
         CampaignConfig.from_dict(payload)
 
 
@@ -854,6 +901,7 @@ def test_seed_selection_d_optimal_fields_validate_and_roundtrip():
     payload["seed_selection"]["d_optimal_jitter"] = 1.0e-10
     payload["seed_selection"]["d_optimal_novelty_floor"] = 0.0
     payload["seed_selection"]["d_optimal_score_power"] = 0.5
+    payload["seed_selection"]["d_optimal_degenerate_policy"] = "fail"
 
     cfg = CampaignConfig.from_dict(payload)
 
@@ -862,6 +910,7 @@ def test_seed_selection_d_optimal_fields_validate_and_roundtrip():
     assert cfg.seed_selection.d_optimal_jitter == 1.0e-10
     assert cfg.seed_selection.d_optimal_novelty_floor == 0.0
     assert cfg.seed_selection.d_optimal_score_power == 0.5
+    assert cfg.seed_selection.d_optimal_degenerate_policy == "fail"
 
 
 @pytest.mark.parametrize(
@@ -872,6 +921,7 @@ def test_seed_selection_d_optimal_fields_validate_and_roundtrip():
         ("d_optimal_jitter", 0.0, "d_optimal_jitter"),
         ("d_optimal_novelty_floor", -1.0, "d_optimal_novelty_floor"),
         ("d_optimal_score_power", -0.1, "d_optimal_score_power"),
+        ("d_optimal_degenerate_policy", "silent", "d_optimal_degenerate_policy"),
     ],
 )
 def test_seed_selection_d_optimal_fields_reject_bad_values(field, value, match):

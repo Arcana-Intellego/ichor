@@ -339,3 +339,33 @@ def test_candidate_diagnostics_are_strict_json_safe(tmp_path):
     assert attempt["nested"]["score"] is None
     assert "Infinity" not in path.read_text(encoding="utf-8")
     assert "NaN" not in path.read_text(encoding="utf-8")
+
+
+def test_consumed_reserve_round_must_match_exact_replacement_attempt(tmp_path):
+    path, payload = _create(tmp_path)
+    initial = pending_attempts(payload)
+    rejected = record_quantum_results(path, _results(initial, set()))
+    allocate_replacements(
+        path,
+        replacement_round=1,
+        expected_generation=int(rejected["generation"]),
+    )
+    tampered = json.loads(path.read_text(encoding="utf-8"))
+    consumed = next(
+        record for record in tampered["reserve"] if record["status"] == "consumed"
+    )
+    consumed["consumed_round"] = 2
+    path.write_text(json.dumps(tampered), encoding="utf-8", newline="\n")
+
+    with pytest.raises(ValueError, match="consumed reserve round"):
+        read_point_allocation(path)
+
+
+def test_allocation_reader_rejects_stale_derived_summary(tmp_path):
+    path, _payload = _create(tmp_path)
+    tampered = json.loads(path.read_text(encoding="utf-8"))
+    tampered["summary"]["pending"] = 0
+    path.write_text(json.dumps(tampered), encoding="utf-8", newline="\n")
+
+    with pytest.raises(ValueError, match="summary is inconsistent"):
+        read_point_allocation(path)

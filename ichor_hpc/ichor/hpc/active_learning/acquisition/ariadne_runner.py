@@ -1088,23 +1088,14 @@ def _evaluate_landing_candidate(
 
 
 def _rank_landing_candidate(candidate: Dict[str, Any]) -> float:
-    value = _safe_float_or_none(candidate.get("alpha"))
+    value = _safe_float_or_none(
+        candidate.get("metrics", {}).get("total_score")
+    )
     if value is None:
-        value = _safe_float_or_none(
-            candidate.get("metrics", {}).get("total_score")
-        )
+        value = _safe_float_or_none(candidate.get("alpha"))
     if value is None:
         return -math.inf
-    metrics = candidate.get("metrics", {}) or {}
-    r = _safe_float_or_none(metrics.get("movement_rmsd_ang"))
-    peak = _safe_float_or_none(metrics.get("movement_band_peak_ang"))
-    low = _safe_float_or_none(metrics.get("movement_band_low_ang"))
-    high = _safe_float_or_none(metrics.get("movement_band_high_ang"))
-    if r is None or peak is None or low is None or high is None:
-        return float(value)
-    width = max(float(high) - float(low), 1.0e-12)
-    tie = 0.05 * ((float(r) - float(peak)) / width) ** 2
-    return float(value) - float(tie)
+    return float(value)
 
 
 def _selection_prediction_diagnostics(
@@ -1781,6 +1772,152 @@ def _landing_needs_under_move_retry(
     return under > 0 and blocking == 0
 
 
+def _size_normalised_trust_radius(
+    acquisition: SeedLocalAdversarialAcquisition,
+    run_config: AriadneRunConfig,
+    scale_model: Optional[Dict[str, Any]],
+) -> tuple[AriadneRunConfig, Dict[str, Any]]:
+    policy = (
+        dict(scale_model.get("trust_radius_policy") or {})
+        if isinstance(scale_model, dict)
+        else {}
+    )
+    if not bool(policy.get("enabled", False)):
+        return run_config, {
+            "enabled": False,
+            "reason": "trust_radius_policy_unavailable",
+            "resolved_delta0": float(run_config.delta0),
+            "resolved_delta_max": float(run_config.delta_max),
+        }
+    from ichor.core.adversarial.subspace import active_participation_weights
+
+    weights = np.asarray(
+        active_participation_weights(acquisition.subspace),
+        dtype=float,
+    )
+    weight_sum = float(np.sum(weights))
+    weight_square_sum = float(np.sum(np.square(weights)))
+    if (
+        not np.isfinite(weight_sum)
+        or weight_sum <= 0.0
+        or not np.isfinite(weight_square_sum)
+        or weight_square_sum <= 0.0
+    ):
+        weights = np.ones(len(acquisition.seed_atoms), dtype=float)
+        weight_sum = float(len(weights))
+        weight_square_sum = float(len(weights))
+    n_effective_atoms = float(
+        np.clip(
+            (weight_sum * weight_sum) / weight_square_sum,
+            1.0,
+            float(max(1, len(acquisition.seed_atoms))),
+        )
+    )
+    geometry_scale = _scale_model_value(
+        scale_model,
+        "geometry_motion_scale",
+        "value_angstrom",
+    )
+    if geometry_scale is None or geometry_scale <= 0.0:
+        geometry_scale = 0.05
+    mobility_block = (
+        scale_model.get("per_atom_mobility_scales", {})
+        if isinstance(scale_model, dict)
+        else {}
+    )
+    mobility_values_raw = (
+        mobility_block.get("values_angstrom", [])
+        if isinstance(mobility_block, dict)
+        else []
+    )
+    mobility_values = []
+    for value in mobility_values_raw if isinstance(mobility_values_raw, list) else []:
+        parsed = _safe_float_or_none(value)
+        mobility_values.append(
+            float(parsed) if parsed is not None and parsed > 0.0 else float(geometry_scale)
+        )
+    if len(mobility_values) == 1:
+        mobility_values = mobility_values * len(weights)
+    elif len(mobility_values) != len(weights):
+        mobility_values = [float(geometry_scale)] * len(weights)
+    normalised_weights = weights / weight_sum
+    weighted_mobility = float(
+        np.sqrt(
+            np.sum(
+                normalised_weights * np.square(np.asarray(mobility_values, dtype=float))
+            )
+        )
+    )
+    multiplier = _safe_float_or_none(policy.get("aggressiveness_multiplier"))
+    if multiplier is None or multiplier <= 0.0:
+        multiplier = 1.0
+    trust0 = max(
+        float(getattr(run_config, "trqn_trust_min", 1.0e-4)),
+        weighted_mobility * math.sqrt(n_effective_atoms) * float(multiplier),
+    )
+    legacy_ratio = float(run_config.delta_max) / max(float(run_config.delta0), 1.0e-12)
+    policy_ratio = _safe_float_or_none(policy.get("max_to_initial_ratio"))
+    ratio = max(1.0, float(policy_ratio or legacy_ratio))
+    trust_max = max(trust0, trust0 * ratio)
+    resolved = replace(run_config, delta0=float(trust0), delta_max=float(trust_max))
+    diagnostics = {
+        "enabled": True,
+        "normalisation": str(policy.get("normalisation")),
+        "n_atoms": int(len(acquisition.seed_atoms)),
+        "n_effective_movement_atoms": float(n_effective_atoms),
+        "active_subspace_dimension": int(acquisition.subspace.dimension),
+        "geometry_motion_scale_angstrom": float(geometry_scale),
+        "weighted_per_atom_mobility_angstrom": float(weighted_mobility),
+        "aggressiveness_multiplier": float(multiplier),
+        "legacy_delta0": float(run_config.delta0),
+        "legacy_delta_max": float(run_config.delta_max),
+        "resolved_delta0": float(trust0),
+        "resolved_delta_max": float(trust_max),
+        "max_to_initial_ratio": float(ratio),
+        "formula": str(policy.get("formula", "")),
+    }
+    return resolved, diagnostics
+
+
+def _under_move_trust_feedback(
+    landing: Dict[str, Any],
+    trust_diagnostics: Dict[str, Any],
+    scale_model: Optional[Dict[str, Any]],
+) -> tuple[float, Dict[str, Any]]:
+    policy = (
+        dict(scale_model.get("trust_radius_policy") or {})
+        if isinstance(scale_model, dict)
+        else {}
+    )
+    movements: List[float] = []
+    targets: List[float] = []
+    for candidate in landing.get("landing_candidates") or []:
+        if "ariadne_landing_under_moved" not in set(candidate.get("reasons") or []):
+            continue
+        metrics = candidate.get("metrics") or {}
+        movement = _safe_float_or_none(metrics.get("movement_rmsd_ang"))
+        target = _safe_float_or_none(metrics.get("movement_band_peak_ang"))
+        if movement is not None and movement >= 0.0:
+            movements.append(float(movement))
+        if target is not None and target > 0.0:
+            targets.append(float(target))
+    observed = max(movements) if movements else 0.0
+    target = max(targets) if targets else float(
+        trust_diagnostics.get("weighted_per_atom_mobility_angstrom", 0.0)
+    )
+    minimum = max(1.0, float(policy.get("under_move_feedback_min_factor", 1.0)))
+    maximum = max(minimum, float(policy.get("under_move_feedback_max_factor", 2.0)))
+    denominator = max(observed, target * 1.0e-3, 1.0e-12)
+    factor = float(np.clip(target / denominator, minimum, maximum))
+    return factor, {
+        "applied": True,
+        "observed_movement_rmsd_ang": float(observed),
+        "target_movement_rmsd_ang": float(target),
+        "factor": float(factor),
+        "factor_bounds": [float(minimum), float(maximum)],
+    }
+
+
 def _live_optimise_seed(
     models,
     seed: Atoms,
@@ -1832,6 +1969,11 @@ def _live_optimise_seed(
         external_reference_scales=external_reference_scales,
         error_calibration_model=error_calibration_model,
         error_calibration_apply_strength=error_calibration_apply_strength,
+    )
+    run_config, trust_radius_diagnostics = _size_normalised_trust_radius(
+        acquisition,
+        run_config,
+        scale_model,
     )
     seed_alpha = float(acquisition.components(acquisition.seed_atoms).total)
     driver_cfg = getattr(acquisition_config, "driver", None)
@@ -1890,6 +2032,9 @@ def _live_optimise_seed(
         initial_origin=initial_origin,
         warm_start_records=warm_start_records,
     )
+    opt_result.diagnostics["trust_radius_resolution"] = dict(
+        trust_radius_diagnostics
+    )
 
     raw_final_atoms = _make_ichor_from_positions(
         acquisition.seed_atoms, opt_result.final_positions_angstrom,
@@ -1927,8 +2072,15 @@ def _live_optimise_seed(
         safety_config=safety_config,
         run_config=run_config,
     ):
+        trust_feedback_factor, trust_feedback = _under_move_trust_feedback(
+            landing,
+            trust_radius_diagnostics,
+            scale_model,
+        )
         retry_config = replace(
             run_config,
+            delta0=float(run_config.delta0) * float(trust_feedback_factor),
+            delta_max=float(run_config.delta_max) * float(trust_feedback_factor),
             trqn_target_initial_grad_rms=float(
                 getattr(run_config, "trqn_under_move_target_initial_grad_rms", 6.0e-4)
             ),
@@ -1977,6 +2129,12 @@ def _live_optimise_seed(
             scale_model=scale_model,
         )
         opt_result_retry.diagnostics["under_move_retry_attempted"] = True
+        opt_result_retry.diagnostics["trust_radius_resolution"] = dict(
+            trust_radius_diagnostics
+        )
+        opt_result_retry.diagnostics["trust_radius_feedback"] = dict(
+            trust_feedback
+        )
         opt_result_retry.diagnostics["under_move_retry_target_grad_rms"] = float(
             getattr(run_config, "trqn_under_move_target_initial_grad_rms", 6.0e-4)
         )
@@ -2422,7 +2580,12 @@ def main(argv=None) -> int:
         from ..daemon.error_calibration import load_calibration_model_for_acquisition
 
         error_calibration_model, error_calibration_reason = (
-            load_calibration_model_for_acquisition(campaign, config)
+            load_calibration_model_for_acquisition(
+                campaign,
+                config,
+                current_model_version=int(state.models_version),
+                current_iteration=int(args.iteration),
+            )
         )
     except Exception:
         error_calibration_model = None

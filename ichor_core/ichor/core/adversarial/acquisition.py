@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import math
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -150,6 +151,7 @@ def _lookup_calibrated_error(
     atom_variances: Optional[Mapping[str, float]],
     atom_types: Sequence[str],
     total_variance: float,
+    application_uncertainty_scale: Optional[float] = None,
 ) -> Optional[float]:
     if not isinstance(model, Mapping):
         return None
@@ -159,7 +161,13 @@ def _lookup_calibrated_error(
 
     total_table = tables.get("global_total")
     if isinstance(total_table, Mapping):
-        total_value = _lookup_table_error(total_table, float(total_variance))
+        lookup_variance = float(total_variance)
+        if str(model.get("uncertainty_axis", "raw")) == "model_normalised":
+            scale = _finite_positive_float(application_uncertainty_scale)
+            if scale is None:
+                return None
+            lookup_variance /= float(scale)
+        total_value = _lookup_table_error(total_table, lookup_variance)
         if total_value is not None:
             return float(total_value)
     return None
@@ -439,8 +447,9 @@ class SeedLocalAdversarialAcquisition:
         return out
 
     def movement_band(self) -> Dict[str, float]:
-        if self._movement_band_cache is not None:
-            return dict(self._movement_band_cache)
+        cached = getattr(self, "_movement_band_cache", None)
+        if cached is not None:
+            return dict(cached)
         cfg = self.config.movement_band
 
         geometry_scale = getattr(cfg, "geometry_novelty_scale_angstrom", None)
@@ -690,7 +699,10 @@ class SeedLocalAdversarialAcquisition:
     def _curvature_floor(self, curvature: float) -> float:
         floor = self.config.stencils.curvature_floor
         beta = self.config.stencils.softplus_scale
-        return float(floor + beta * self._softplus(abs(float(curvature)) / beta))
+        positive_curvature = max(0.0, float(curvature))
+        return float(
+            floor + beta * self._softplus(positive_curvature / beta)
+        )
 
     def _negative_curvature_penalty(self, mode_evals, weights) -> float:
         if str(getattr(self.config.stencils, "negative_curvature_policy", "ignore")) != "penalise":
@@ -852,9 +864,10 @@ class SeedLocalAdversarialAcquisition:
                 pass
             for mode_eval in self._mode_metrics(atoms):
                 force_vals.append(mode_eval.force_std)
-                omega_vals.append(mode_eval.omega_std)
-                anh_vals.append(mode_eval.anharmonicity)
-                anh_std_vals.append(mode_eval.anharmonicity_std)
+                if float(mode_eval.curvature_mean) >= 0.0:
+                    omega_vals.append(mode_eval.omega_std)
+                    anh_vals.append(mode_eval.anharmonicity)
+                    anh_std_vals.append(mode_eval.anharmonicity_std)
 
         floor = self.config.references.floor
 
@@ -930,16 +943,25 @@ class SeedLocalAdversarialAcquisition:
         mode_evals = tuple(mode_evals)
         if cfg.max_modes is not None and int(cfg.max_modes) > 0:
             mode_evals = mode_evals[: int(cfg.max_modes)]
+        stable = np.asarray(
+            [float(mode.curvature_mean) >= 0.0 for mode in mode_evals],
+            dtype=float,
+        )
         policy = str(getattr(cfg, "mode_weighting", "inverse_frequency"))
         if policy == "variance":
-            raw = np.asarray(self.subspace.mode_weights[: len(mode_evals)], dtype=float)
+            raw = (
+                np.asarray(self.subspace.mode_weights[: len(mode_evals)], dtype=float)
+                * stable
+            )
             total = float(raw.sum())
             if not np.isfinite(total) or total <= 0.0:
-                return tuple(1.0 / len(mode_evals) for _ in mode_evals)
+                return tuple(0.0 for _ in mode_evals)
             return tuple(float(x / total) for x in raw)
         if policy == "uniform":
-            base = self._effective_mode_weights(mode_evals, policy=policy)
-            return tuple(float(x) for x in base)
+            total = float(stable.sum())
+            if total <= 0.0:
+                return tuple(0.0 for _ in mode_evals)
+            return tuple(float(x / total) for x in stable)
         if policy != "inverse_frequency":
             raise ValueError("unknown spectral.mode_weighting: " + repr(policy))
         omega_floor = max(float(cfg.omega_floor), 1.0e-12)
@@ -947,10 +969,10 @@ class SeedLocalAdversarialAcquisition:
         inv = np.array(
             [1.0 / ((float(m.omega) + omega_floor) ** power) for m in mode_evals],
             dtype=float,
-        )
+        ) * stable
         total = float(inv.sum())
         if not np.isfinite(total) or total <= 0.0:
-            return tuple(1.0 / len(mode_evals) for _ in mode_evals)
+            return tuple(0.0 for _ in mode_evals)
         return tuple(float(x / total) for x in inv)
 
     def components(
@@ -997,12 +1019,18 @@ class SeedLocalAdversarialAcquisition:
         )
         for weight, mode in zip(legacy_weights, mode_evals):
             force_risk += float(weight) * self._phi(mode.force_std / self.reference_scales["force"])
-            legacy_frequency_risk += float(weight) * self._phi(mode.omega_std / self.reference_scales["omega"])
+            curvature_informative = float(mode.curvature_mean) >= 0.0
+            if curvature_informative:
+                legacy_frequency_risk += float(weight) * self._phi(
+                    mode.omega_std / self.reference_scales["omega"]
+                )
             reliability, omega_low, omega_high = self._weak_mode_reliability(mode.omega)
-            raw_anh = (
-                self._phi(mode.anharmonicity / self.reference_scales["anh"])
-                * self._phi(mode.anharmonicity_std / self.reference_scales["anh_std"])
-            )
+            raw_anh = 0.0
+            if curvature_informative:
+                raw_anh = (
+                    self._phi(mode.anharmonicity / self.reference_scales["anh"])
+                    * self._phi(mode.anharmonicity_std / self.reference_scales["anh_std"])
+                )
             if gating_enabled:
                 capped_anh = self._saturating_cap(
                     raw_anh,
@@ -1012,7 +1040,7 @@ class SeedLocalAdversarialAcquisition:
                 weak_penalty = (
                     (1.0 - float(reliability))
                     * float(self.config.stencils.weak_mode_penalty)
-                )
+                ) if curvature_informative else 0.0
             else:
                 capped_anh = float(raw_anh)
                 safe_anh = float(raw_anh)
@@ -1049,7 +1077,7 @@ class SeedLocalAdversarialAcquisition:
                 reliability
                 * spectral_weight
                 * self._phi(mode.omega_std / spectral_scale)
-            )
+            ) if float(mode.curvature_mean) >= 0.0 else 0.0
             spectral_frequency_risk += observable
             annotated_modes.append(
                 replace(
@@ -1122,6 +1150,9 @@ class SeedLocalAdversarialAcquisition:
                 atom_variances,
                 atom_types,
                 float(energy_var),
+                application_uncertainty_scale=(
+                    float(self.reference_scales["energy"]) * float(energy_norm)
+                ),
             )
             if calibrated_error is not None:
                 scale = _finite_positive_float(
@@ -1154,7 +1185,15 @@ class SeedLocalAdversarialAcquisition:
             and str(getattr(self.config.size_normalisation, "whitened_distance_mode", "per_subspace_dim"))
             == "per_subspace_dim"
         ):
-            distance_penalty = float(distance_penalty) / max(1, int(self.subspace.dimension))
+            dimension = getattr(self.subspace, "dimension", None)
+            if dimension is None:
+                basis = getattr(self.subspace, "basis", None)
+                dimension = (
+                    int(np.asarray(basis).shape[1])
+                    if basis is not None and np.asarray(basis).ndim == 2
+                    else 1
+                )
+            distance_penalty = float(distance_penalty) / max(1, int(dimension))
         chemistry_penalty = chemistry_barrier_value(
             atoms,
             self.barrier_state,
@@ -1322,6 +1361,9 @@ class SeedLocalAdversarialAcquisition:
                 atom_variances,
                 atom_types,
                 float(energy_var),
+                application_uncertainty_scale=(
+                    float(self.reference_scales["energy"]) * float(energy_norm)
+                ),
             )
             if calibrated_error is not None:
                 scale = _finite_positive_float(

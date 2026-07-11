@@ -53,22 +53,32 @@ def _acquisition(*, model=None, strength=0.0):
 
 def test_record_only_strength_zero_leaves_energy_risk_unchanged(monkeypatch):
     monkeypatch.setattr(acquisition_mod, "whitened_distance_squared", lambda *args: 0.0)
-    monkeypatch.setattr(acquisition_mod, "chemistry_barrier_value", lambda *args: 0.0)
+    monkeypatch.setattr(
+        acquisition_mod,
+        "chemistry_barrier_value",
+        lambda *args, **kwargs: 0.0,
+    )
     monkeypatch.setattr(SeedLocalAdversarialAcquisition, "_mode_metrics", lambda self, atoms, mean_energy: ())
 
     atoms = Atoms([Atom("C", 0, 0, 0), Atom("H", 1, 0, 0)])
     acq = _acquisition(model={"tables": {}}, strength=0.0)
 
-    breakdown = acq.components(atoms)
+    breakdown = acq.components(atoms, include_movement=False)
 
     assert breakdown.calibration_applied is False
-    assert breakdown.energy_risk == pytest.approx(math.log1p(4.0 / 2.0))
+    assert breakdown.energy_risk == pytest.approx(
+        math.log1p((4.0 / math.sqrt(len(atoms))) / 2.0)
+    )
     assert breakdown.total == pytest.approx(breakdown.energy_risk)
 
 
 def test_apply_to_acquisition_replaces_energy_risk_when_strength_one(monkeypatch):
     monkeypatch.setattr(acquisition_mod, "whitened_distance_squared", lambda *args: 0.0)
-    monkeypatch.setattr(acquisition_mod, "chemistry_barrier_value", lambda *args: 0.0)
+    monkeypatch.setattr(
+        acquisition_mod,
+        "chemistry_barrier_value",
+        lambda *args, **kwargs: 0.0,
+    )
     monkeypatch.setattr(SeedLocalAdversarialAcquisition, "_mode_metrics", lambda self, atoms, mean_energy: ())
     model = {
         "reference_error_ha": 0.1,
@@ -88,17 +98,25 @@ def test_apply_to_acquisition_replaces_energy_risk_when_strength_one(monkeypatch
     atoms = Atoms([Atom("C", 0, 0, 0), Atom("H", 1, 0, 0)])
     acq = _acquisition(model=model, strength=1.0)
 
-    breakdown = acq.components(atoms)
+    breakdown = acq.components(atoms, include_movement=False)
 
     assert breakdown.calibration_applied is True
-    assert breakdown.raw_energy_risk == pytest.approx(math.log1p(4.0 / 2.0))
+    assert breakdown.raw_energy_risk == pytest.approx(
+        math.log1p((4.0 / math.sqrt(len(atoms))) / 2.0)
+    )
     assert breakdown.calibrated_expected_iqa_error_ha == pytest.approx(0.3)
-    assert breakdown.energy_risk == pytest.approx(math.log1p(0.3 / 0.1))
+    assert breakdown.energy_risk == pytest.approx(
+        math.log1p((0.3 / math.sqrt(len(atoms))) / 0.1)
+    )
 
 
 def test_apply_to_acquisition_requires_global_total_table(monkeypatch):
     monkeypatch.setattr(acquisition_mod, "whitened_distance_squared", lambda *args: 0.0)
-    monkeypatch.setattr(acquisition_mod, "chemistry_barrier_value", lambda *args: 0.0)
+    monkeypatch.setattr(
+        acquisition_mod,
+        "chemistry_barrier_value",
+        lambda *args, **kwargs: 0.0,
+    )
     monkeypatch.setattr(SeedLocalAdversarialAcquisition, "_mode_metrics", lambda self, atoms, mean_energy: ())
     legacy_atom_only_model = {
         "reference_error_ha": 0.1,
@@ -118,8 +136,10 @@ def test_apply_to_acquisition_requires_global_total_table(monkeypatch):
     atoms = Atoms([Atom("C", 0, 0, 0), Atom("H", 1, 0, 0)])
     acq = _acquisition(model=legacy_atom_only_model, strength=1.0)
 
-    breakdown = acq.components(atoms)
+    breakdown = acq.components(atoms, include_movement=False)
 
     assert breakdown.calibration_applied is False
     assert breakdown.calibrated_expected_iqa_error_ha is None
-    assert breakdown.energy_risk == pytest.approx(math.log1p(4.0 / 2.0))
+    assert breakdown.energy_risk == pytest.approx(
+        math.log1p((4.0 / math.sqrt(len(atoms))) / 2.0)
+    )

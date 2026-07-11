@@ -3,11 +3,15 @@
 # defaults substantially (see ichor_hpc/.../presets/ for spectroscopy and
 # thermodynamics-focused starting points).
 
-schema_version: 9
+schema_version: 10
 
 campaign:
   system_name: WATER_TETRAMER
   max_iterations: 2
+  source_path: pool.xyz
+  anchor_path: anchor.xyz
+  # Keep the walkthrough close to the balanced production default.
+  sampling_aggressiveness: 5
 
 # Iteration loop.
 runtime:
@@ -25,11 +29,9 @@ point_allocation:
 # Seeds per ARIADNE_ARRAY task.
 seed_selection:
   n_seeds_per_iteration: 2
-  bulk_fraction: 0.5
-
-sampling_protocol:
-  # Keep the walkthrough close to the balanced production default.
-  sampling_aggressiveness: 5
+  bulk_fraction: 0.2
+  strategy: d_optimal
+  d_optimal_degenerate_policy: score_backfill
 
 resources:
   defaults:

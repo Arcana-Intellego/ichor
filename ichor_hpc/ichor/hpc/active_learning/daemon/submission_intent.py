@@ -19,6 +19,7 @@ from .state import atomic_write_json
 
 INTENT_SCHEMA_VERSION = 1
 INTENT_DIR_NAME = "submission_intents"
+INTENT_HISTORY_DIR_NAME = "history"
 ACTIVE_STATUSES = frozenset({"PRE_SUBMIT", "SUBMITTED", "ADOPTED"})
 
 
@@ -48,8 +49,23 @@ def intent_path(campaign_dir: Union[str, Path], phase_name: str, iteration: int)
     )
 
 
-def expected_job_name(campaign_uid: Optional[str], phase_name: str, iteration: int) -> str:
-    return live_job_name(campaign_uid, phase_name, iteration)
+def expected_job_name(
+    campaign_uid: Optional[str],
+    phase_name: str,
+    iteration: int,
+    *,
+    replacement_round: int = 0,
+    attempt_sequence: Optional[int] = None,
+    attempt_id: Optional[str] = None,
+) -> str:
+    return live_job_name(
+        campaign_uid,
+        phase_name,
+        iteration,
+        replacement_round=replacement_round,
+        attempt_sequence=attempt_sequence,
+        attempt_id=attempt_id,
+    )
 
 
 def load_intent(
@@ -99,6 +115,28 @@ def load_intent(
         raise ValueError(
             "submission intent expected_job_name must be a string: " + str(path)
         )
+    identity = data.get("submission_identity")
+    if identity is not None:
+        if not isinstance(identity, str) or not identity:
+            raise ValueError("submission intent identity must be a non-empty string")
+        try:
+            sequence = int(data.get("attempt_sequence"))
+            replacement_round = int(data.get("replacement_round", 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("submission intent attempt identity is malformed") from exc
+        attempt_id = str(data.get("attempt_id") or "")
+        if sequence <= 0 or replacement_round < 0 or not attempt_id:
+            raise ValueError("submission intent attempt identity is invalid")
+        recomputed = expected_job_name(
+            data.get("campaign_uid"),
+            phase_name,
+            int(iteration),
+            replacement_round=replacement_round,
+            attempt_sequence=sequence,
+            attempt_id=attempt_id,
+        )
+        if expected != recomputed:
+            raise ValueError("submission intent expected job name does not match identity")
     return data
 
 
@@ -130,15 +168,62 @@ def write_pre_submit_intent(
     campaign_uid: str,
     phase_name: str,
     iteration: int,
+    replacement_round: int = 0,
 ) -> Dict[str, Any]:
     path = intent_path(campaign_dir, phase_name, iteration)
+    previous = load_intent(campaign_dir, phase_name, iteration)
+    previous_sequence = 0
+    if previous is not None:
+        try:
+            previous_sequence = max(0, int(previous.get("attempt_sequence", 0)))
+        except (TypeError, ValueError):
+            previous_sequence = 0
+        previous_attempt = str(previous.get("attempt_id") or "legacy")
+        safe_attempt = "".join(ch for ch in previous_attempt if ch.isalnum())[:32]
+        if not safe_attempt:
+            safe_attempt = "legacy"
+        history_path = (
+            intent_dir(campaign_dir)
+            / INTENT_HISTORY_DIR_NAME
+            / (
+                str(phase_name).replace("/", "_").replace("\\", "_")
+                + "-"
+                + str(int(iteration)).zfill(6)
+                + "-"
+                + safe_attempt
+                + ".json"
+            )
+        )
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(history_path, previous)
+    attempt_sequence = previous_sequence + 1
+    attempt_id = uuid.uuid4().hex
+    round_number = max(0, int(replacement_round))
+    identity = (
+        "r"
+        + str(round_number).zfill(4)
+        + "-a"
+        + str(attempt_sequence).zfill(4)
+        + "-"
+        + attempt_id[:8]
+    )
     payload: Dict[str, Any] = {
         "schema_version": INTENT_SCHEMA_VERSION,
-        "attempt_id": uuid.uuid4().hex,
+        "attempt_id": attempt_id,
+        "attempt_sequence": int(attempt_sequence),
+        "replacement_round": int(round_number),
+        "submission_identity": identity,
         "campaign_uid": str(campaign_uid),
         "phase": str(phase_name),
         "iteration": int(iteration),
-        "expected_job_name": expected_job_name(campaign_uid, phase_name, iteration),
+        "expected_job_name": expected_job_name(
+            campaign_uid,
+            phase_name,
+            iteration,
+            replacement_round=round_number,
+            attempt_sequence=attempt_sequence,
+            attempt_id=attempt_id,
+        ),
         "status": "PRE_SUBMIT",
         "job_id": None,
         "created_iso": _now_iso(),

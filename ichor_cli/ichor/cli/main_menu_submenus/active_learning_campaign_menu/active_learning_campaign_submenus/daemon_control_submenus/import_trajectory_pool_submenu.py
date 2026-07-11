@@ -1,4 +1,4 @@
-"""Initialise campaign and import trajectory pool option submenu."""
+"""Initialise a campaign and import its configured operator inputs."""
 import argparse
 from dataclasses import dataclass
 
@@ -20,11 +20,11 @@ from ichor.cli.useful_functions import user_input_free_flow
 
 
 IMPORT_TRAJECTORY_POOL_MENU_DESCRIPTION = MenuDescription(
-    "Initialise Campaign / Import Trajectory Pool",
+    "Initialise Campaign / Import Inputs",
     subtitle=(
         "Populate campaign.yaml from the active-learning template and import "
-        "the source MD trajectory into the selected campaign's canonical pool "
-        "location.\n"
+        "the configured MD trajectory and optional bootstrap anchor into "
+        "campaign-owned storage.\n"
     ),
 )
 
@@ -32,6 +32,7 @@ IMPORT_TRAJECTORY_POOL_MENU_DESCRIPTION = MenuDescription(
 @dataclass
 class ImportTrajectoryPoolMenuOptions(MenuOptions):
     source_path: str = ""
+    anchor_source_path: str = ""
     force_reimport: bool = False
 
 
@@ -62,6 +63,9 @@ class ImportTrajectoryPoolFunctions:
             _pause()
             return
         source = import_trajectory_pool_menu_options.source_path or None
+        anchor_source = (
+            import_trajectory_pool_menu_options.anchor_source_path or None
+        )
         force = bool(import_trajectory_pool_menu_options.force_reimport)
         if force:
             answer = user_input_free_flow(
@@ -76,6 +80,7 @@ class ImportTrajectoryPoolFunctions:
         ns = argparse.Namespace(
             campaign_dir=str(campaign_dir),
             source=source,
+            anchor_source=anchor_source,
             force=force,
         )
         rc = cmd_init(ns)
@@ -92,7 +97,13 @@ IMPORT_TRAJECTORY_POOL_FIELD_SPECS = [
         "source_path",
         "clearable_str",
         prompt="Source trajectory path",
-        item_text="Set source path (blank uses <campaign>/pool.xyz)",
+        item_text="Set source path (blank uses campaign.source_path)",
+    ),
+    spec(
+        "anchor_source_path",
+        "clearable_str",
+        prompt="Bootstrap anchor path",
+        item_text="Set anchor path (blank uses campaign.anchor_path)",
     ),
     spec(
         "force_reimport",
@@ -105,7 +116,7 @@ IMPORT_TRAJECTORY_POOL_FIELD_SPECS = [
 
 import_trajectory_pool_menu_items = [
     FunctionItem(
-        "Initialise campaign / import trajectory pool",
+        "Initialise campaign / import configured inputs",
         ImportTrajectoryPoolFunctions.run_import,
     ),
 ]

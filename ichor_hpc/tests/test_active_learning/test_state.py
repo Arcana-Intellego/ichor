@@ -123,6 +123,15 @@ def test_read_state_wraps_malformed_sacct_empty_streak_value():
         CampaignState.from_dict(payload)
 
 
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None])
+def test_read_state_requires_json_boolean_for_shutdown_requested(value):
+    payload = fresh_campaign_state().to_dict()
+    payload["shutdown_requested"] = value
+
+    with pytest.raises(StateSchemaError, match="shutdown_requested"):
+        CampaignState.from_dict(payload)
+
+
 def test_read_state_rejects_unknown_phase(tmp_path):
     p = tmp_path / "state.json"
     bad = fresh_campaign_state().to_dict()

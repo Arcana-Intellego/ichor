@@ -1,9 +1,8 @@
 """Campaign schema version gate.
 
-Schema 9 intentionally replaces ratio-based point allocation with exact
-integer quotas.  That is a scientific protocol change rather than a safe
-syntax migration, so older campaign files are rejected instead of being
-silently reinterpreted.
+Schema 10 is an intentional clean break in the operator configuration.  The
+trajectory source, anchor source, and sampling aggressiveness now belong to
+the campaign block.  Older files are rejected rather than silently rewritten.
 """
 from __future__ import annotations
 
@@ -11,7 +10,7 @@ import copy
 from typing import Any, Dict, Mapping
 
 
-CURRENT_SCHEMA_VERSION = 9
+CURRENT_SCHEMA_VERSION = 10
 
 
 class CampaignMigrationError(ValueError):
@@ -36,7 +35,8 @@ def migrate_campaign_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
             + str(version)
             + " is unsupported; this release requires schema_version "
             + str(CURRENT_SCHEMA_VERSION)
-            + " with the point_allocation block"
+            + " with source_path, anchor_path, and sampling_aggressiveness "
+            + "under the campaign block"
         )
     return data
 

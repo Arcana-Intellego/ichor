@@ -64,6 +64,7 @@ def test_pool_feasibility_reuse_mode_requires_only_bootstrap(monkeypatch, tmp_pa
 def test_pool_feasibility_counts_anchors_outside_pool_requirement(tmp_path):
     from ichor.core.files.xyz import Trajectory
     from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
+    from ichor.hpc.active_learning.bootstrap_anchor import import_anchor_source
     from ichor.hpc.active_learning.sampling.polus_wrapper import _write_xyz_file
 
     campaign = tmp_path / "c"
@@ -78,7 +79,9 @@ def test_pool_feasibility_counts_anchors_outside_pool_requirement(tmp_path):
         anchors[1][1].y,
         anchors[1][1].z,
     ]
-    _write_xyz_file(anchors, campaign / "anchor.xyz")
+    anchor_source = campaign / "anchor.xyz"
+    _write_xyz_file(anchors, anchor_source)
+    import_anchor_source(campaign, anchor_source, overwrite=True)
     cfg = _config(bootstrap=12, seeds=8, max_iterations=1, skip=True)
     cfg.point_allocation.bootstrap_external_validation_size = 2
     cfg.point_allocation.anchor = True

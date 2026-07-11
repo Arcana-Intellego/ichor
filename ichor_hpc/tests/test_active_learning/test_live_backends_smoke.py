@@ -1622,6 +1622,285 @@ def test_build_sbatch_script_renders_phase_a_polus_as_bootstrap_iteration_zero()
     assert "--iteration 0" in body
 
 
+@pytest.mark.parametrize("bucket", ["initial", "iter_1"])
+@pytest.mark.parametrize("required_filename", ["input.gjf", "input.wfn"])
+def test_replacement_pointdir_guard_is_rooted_at_exact_round(
+    tmp_path,
+    bucket,
+    required_filename,
+):
+    round_dir = (
+        tmp_path
+        / ".DATA"
+        / "STAGING"
+        / bucket
+        / "replacement_round_0002"
+    )
+    points = round_dir / "POINTS.txt"
+    lines = live_executor_mod._pointdir_selection_lines(
+        str(points),
+        required_filename=required_filename,
+    )
+    rendered = "\n".join(lines)
+
+    assert "export ICHOR_STAGING_ROOT=" + shlex.quote(str(round_dir.resolve())) in rendered
+    assert "if [ ! -f " + shlex.quote(str(points.resolve())) + " ]; then" in rendered
+    assert "POINT_DIR escapes exact campaign staging round" in rendered
+
+
+@pytest.mark.parametrize(
+    "phase_name,required_filename",
+    [
+        ("REPLACEMENT_GAUSSIAN", "input.gjf"),
+        ("REPLACEMENT_AIMALL", "input.wfn"),
+        ("INITIAL_REPLACEMENT_GAUSSIAN", "input.gjf"),
+        ("INITIAL_REPLACEMENT_AIMALL", "input.wfn"),
+    ],
+)
+def test_replacement_sbatch_uses_exact_nested_points_file(
+    tmp_path,
+    monkeypatch,
+    phase_name,
+    required_filename,
+):
+    campaign = tmp_path / "campaign"
+    iteration = 0 if phase_name.startswith("INITIAL_") else 1
+    bucket = "initial" if iteration == 0 else "iter_1"
+    round_dir = (
+        campaign
+        / ".DATA"
+        / "STAGING"
+        / bucket
+        / "replacement_round_0002"
+    )
+    pointdir = round_dir / "POINT_0012.pointdir"
+    pointdir.mkdir(parents=True)
+    (pointdir / "input.gjf").write_text(
+        "# test\n\ntitle\n\n0 1\nH 0.0 0.0 0.0\n\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    (pointdir / "input.wfn").write_text("fixture\n", encoding="utf-8")
+    (round_dir / "POINTS.txt").write_text(
+        str(pointdir.resolve()) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    monkeypatch.setattr(live_executor_mod, "_configured_scheduler", lambda: "slurm")
+    monkeypatch.setattr(
+        live_executor_mod,
+        "_configured_daemon_runtime_modules",
+        lambda: [],
+    )
+    monkeypatch.setattr(
+        live_executor_mod,
+        "_configured_backend_modules",
+        lambda backend, fallback: [],
+    )
+
+    body = build_sbatch_script(
+        phase_name=phase_name,
+        iteration=iteration,
+        campaign_dir=campaign,
+        config=CampaignConfig(),
+        array_size=1,
+        replacement_round=2,
+    )
+
+    assert str((round_dir / "POINTS.txt").resolve()) in body
+    assert "export ICHOR_STAGING_ROOT=" + shlex.quote(str(round_dir.resolve())) in body
+    assert required_filename + ' missing in $POINT_DIR' in body
+
+
+@pytest.mark.skipif(not _which("bash"), reason="bash is required for shell guard execution")
+@pytest.mark.parametrize("required_filename", ["input.gjf", "input.wfn"])
+def test_replacement_pointdir_guard_executes_valid_round_and_rejects_sibling(
+    tmp_path,
+    required_filename,
+):
+    round_dir = (
+        tmp_path
+        / ".DATA"
+        / "STAGING"
+        / "iter_1"
+        / "replacement_round_0002"
+    )
+    pointdir = round_dir / "POINT_0004.pointdir"
+    pointdir.mkdir(parents=True)
+    (pointdir / required_filename).write_text("fixture\n", encoding="utf-8")
+    points = round_dir / "POINTS.txt"
+    points.write_text(str(pointdir.resolve()) + "\n", encoding="utf-8", newline="\n")
+    fragment = "\n".join(
+        [
+            "set -eu",
+            "ICHOR_LOGICAL_ARRAY_TASK_ID=0",
+            *live_executor_mod._pointdir_selection_lines(
+                str(points),
+                required_filename=required_filename,
+            ),
+            'printf "%s\\n" "$POINT_DIR"',
+        ]
+    )
+
+    accepted = subprocess.run(
+        ["bash", "-c", fragment],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert accepted.returncode == 0, accepted.stderr
+    assert accepted.stdout.strip() == str(pointdir.resolve())
+
+    sibling = round_dir.parent / "replacement_round_0001" / pointdir.name
+    sibling.mkdir(parents=True)
+    (sibling / required_filename).write_text("fixture\n", encoding="utf-8")
+    points.write_text(str(sibling.resolve()) + "\n", encoding="utf-8", newline="\n")
+    rejected = subprocess.run(
+        ["bash", "-c", fragment],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert rejected.returncode != 0
+    assert "escapes exact campaign staging round" in rejected.stderr
+
+
+def test_configured_batch_python_probe_uses_exact_interpreter(monkeypatch):
+    from ichor.hpc.active_learning.daemon import preflight
+
+    executable = "/home/user/.venv/ichor-csf3/bin/python"
+    calls = []
+    monkeypatch.setattr(preflight.os.path, "isfile", lambda value: value == executable)
+    monkeypatch.setattr(preflight.os, "access", lambda value, mode: value == executable)
+
+    def fake_run(command, **kwargs):
+        calls.append((list(command), dict(kwargs)))
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {"executable": executable, "version": [3, 11, 15]}
+            ) + "\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(preflight.subprocess, "run", fake_run)
+
+    ok, version, error = preflight._probe_configured_python(executable)
+
+    assert ok is True
+    assert version == "3.11.15"
+    assert error == ""
+    assert calls[0][0][0] == executable
+    assert "ariadne" in calls[0][0][2]
+    assert "polus.samplers.RS.randomSampling" in calls[0][0][2]
+    assert "pyferebus.executors.trainer" in calls[0][0][2]
+
+
+def test_configured_batch_python_probe_rejects_wrong_version(monkeypatch):
+    from ichor.hpc.active_learning.daemon import preflight
+
+    executable = "/home/user/.venv/wrong/bin/python"
+    monkeypatch.setattr(preflight.os.path, "isfile", lambda value: value == executable)
+    monkeypatch.setattr(preflight.os, "access", lambda value, mode: value == executable)
+    monkeypatch.setattr(
+        preflight.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {"executable": executable, "version": [3, 13, 1]}
+            ) + "\n",
+            stderr="",
+        ),
+    )
+
+    ok, version, error = preflight._probe_configured_python(executable)
+
+    assert ok is False
+    assert version == "3.13.1"
+    assert "Python 3.11" in error
+
+
+def test_replacement_resource_solver_uses_nested_round_atom_count(
+    monkeypatch,
+    tmp_path,
+):
+    from ichor.hpc.active_learning.daemon.resource_solver import resolve_phase_resources
+
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf3": {
+                "hpc": {
+                    "parallel_environments": {"multicore": [1, 64]},
+                    "memory_per_core_gb_by_partition": {"multicore": 8},
+                }
+            }
+        },
+        "csf3",
+    )
+    root = tmp_path / ".DATA" / "STAGING" / "iter_1"
+    round_dir = root / "replacement_round_0002"
+    pointdir = round_dir / "POINT_0012.pointdir"
+    pointdir.mkdir(parents=True)
+    geometry = ["C " + str(index) + ".0 0.0 0.0" for index in range(18)]
+    (pointdir / "input.gjf").write_text(
+        "\n".join(["# test", "", "title", "", "0 1", *geometry, ""]),
+        encoding="utf-8",
+        newline="\n",
+    )
+    (round_dir / "POINTS.txt").write_text(
+        str(pointdir.resolve()) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    cfg = CampaignConfig()
+
+    resolved = resolve_phase_resources(
+        phase_name="REPLACEMENT_AIMALL",
+        config=cfg,
+        partition="multicore",
+        campaign_dir=tmp_path,
+        iteration=1,
+        replacement_round=2,
+    )
+
+    assert resolved.extra["n_atoms"] == 18
+
+
+def test_replacement_resource_solver_refuses_missing_round_evidence(
+    monkeypatch,
+    tmp_path,
+):
+    from ichor.hpc.active_learning.daemon.resource_solver import resolve_phase_resources
+
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf3": {
+                "hpc": {
+                    "parallel_environments": {"multicore": [1, 64]},
+                    "memory_per_core_gb_by_partition": {"multicore": 8},
+                }
+            }
+        },
+        "csf3",
+    )
+
+    with pytest.raises(
+        BackendSubmissionError,
+        match="exact replacement staging round",
+    ):
+        resolve_phase_resources(
+            phase_name="REPLACEMENT_GAUSSIAN",
+            config=CampaignConfig(),
+            partition="multicore",
+            campaign_dir=tmp_path,
+            iteration=1,
+            replacement_round=1,
+        )
+
+
 def test_write_real_script_creates_sbatch_log_dirs(tmp_path):
     ex = LiveBackendsPhaseExecutor(
         campaign_dir=tmp_path / "campaign",

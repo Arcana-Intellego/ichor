@@ -605,8 +605,16 @@ class DryRunPhaseExecutor:
             if model is None:
                 return None, reason
 
-            def _transform(_selection_index: int, posterior_variance: float):
-                return lookup_calibrated_abs_error(model, posterior_variance)
+            def _transform(
+                _selection_index: int,
+                posterior_variance: float,
+                population_variance_scale: float,
+            ):
+                return lookup_calibrated_abs_error(
+                    model,
+                    posterior_variance,
+                    application_uncertainty_scale=population_variance_scale,
+                )
 
             return _transform, "loaded"
         except Exception as exc:
@@ -817,6 +825,9 @@ class DryRunPhaseExecutor:
             d_optimal_score_power=float(
                 self.config.seed_selection.d_optimal_score_power
             ),
+            d_optimal_degenerate_policy=str(
+                self.config.seed_selection.d_optimal_degenerate_policy
+            ),
             score_transform=score_transform,
         )
         requested_n = int(self.config.seed_selection.n_seeds_per_iteration)
@@ -889,10 +900,12 @@ class DryRunPhaseExecutor:
                 "raw_variance",
                 "raw_score",
                 "d_optimal_conditional_variance",
+                "d_optimal_raw_conditional_variance",
                 "d_optimal_gain",
                 "d_optimal_prefilter_rank",
                 "d_optimal_max_correlation_to_selected",
                 "variance_rank",
+                "d_optimal_backfill_reason",
             ):
                 if key in diag:
                     record[key] = diag[key]
@@ -921,7 +934,15 @@ class DryRunPhaseExecutor:
             "d_optimal_indices": [
                 int(rec["pool_row_index_zero_based"])
                 for rec in seed_records
-                if rec.get("selection_origin") == "d_optimal"
+                if rec.get("selection_origin") in {
+                    "d_optimal",
+                    "d_optimal_backfill",
+                }
+            ],
+            "d_optimal_backfill_indices": [
+                int(rec["pool_row_index_zero_based"])
+                for rec in seed_records
+                if rec.get("selection_origin") == "d_optimal_backfill"
             ],
             "variances": [float(v) for v in selection.variances],
             "seed_records": seed_records,
@@ -2525,6 +2546,9 @@ class DryRunPhaseExecutor:
                         iteration=int(state.iteration),
                         models_version=int(getattr(state, "models_version", -1)),
                         n_points=n_points,
+                        sampling_aggressiveness=int(
+                            self.config.campaign.sampling_aggressiveness
+                        ),
                     )
                     all_records, added, duplicate = append_records(
                         self.campaign_dir,

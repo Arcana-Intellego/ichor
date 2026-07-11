@@ -53,6 +53,12 @@ def test_level_five_preview_matches_current_balanced_defaults():
         0.5
     )
     assert resolved.scale_model_payload["per_atom_mobility_scales"]["mode"] == "uniform"
+    trust_policy = resolved.scale_model_payload["trust_radius_policy"]
+    assert trust_policy["enabled"] is True
+    assert trust_policy["normalisation"] == (
+        "weighted_mobility_sqrt_effective_atoms"
+    )
+    assert "sqrt(n_effective_movement_atoms)" in trust_policy["formula"]
     assert resolved.adversarial_safety.max_whitened_distance == pytest.approx(10.0)
     assert resolved.adversarial_safety.backtrack_points == 16
     assert resolved.quality_gates.ariadne_max_displacement_ang == pytest.approx(1.25)
@@ -75,9 +81,9 @@ def test_level_five_preview_matches_current_balanced_defaults():
 
 def test_aggressiveness_profiles_move_from_conservative_to_exploratory():
     conservative = CampaignConfig()
-    conservative.sampling_protocol.sampling_aggressiveness = 1
+    conservative.campaign.sampling_aggressiveness = 1
     exploratory = CampaignConfig()
-    exploratory.sampling_protocol.sampling_aggressiveness = 10
+    exploratory.campaign.sampling_aggressiveness = 10
 
     low = preview_sampling_protocol(conservative)
     high = preview_sampling_protocol(exploratory)
@@ -87,6 +93,14 @@ def test_aggressiveness_profiles_move_from_conservative_to_exploratory():
     assert high.profile.lambda_distance < low.profile.lambda_distance
     assert high.profile.ariadne_max_displacement_ang > low.profile.ariadne_max_displacement_ang
     assert high.ariadne_run_config.delta_max > low.ariadne_run_config.delta_max
+    assert (
+        high.scale_model_payload["trust_radius_policy"][
+            "aggressiveness_multiplier"
+        ]
+        > low.scale_model_payload["trust_radius_policy"][
+            "aggressiveness_multiplier"
+        ]
+    )
     assert high.profile.max_scaled_atom_move > low.profile.max_scaled_atom_move
     assert high.profile.max_scaled_rmsd > low.profile.max_scaled_rmsd
     assert high.profile.normalised_chemistry_penalty_cap > low.profile.normalised_chemistry_penalty_cap

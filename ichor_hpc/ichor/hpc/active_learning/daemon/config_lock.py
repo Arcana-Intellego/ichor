@@ -204,7 +204,8 @@ RESOURCE_FUTURE_EXACT = {
 
 IMMUTABLE_EXACT = {"schema_version"}
 
-PRE_POOL_EXACT = {"trajectory_pool.source_path"}
+PRE_POOL_EXACT = {"campaign.source_path"}
+PRE_ANCHOR_EXACT = {"campaign.anchor_path"}
 PRE_PHASE_A_EXACT = {
     "point_allocation.bootstrap_training_size",
     "point_allocation.bootstrap_internal_validation_size",
@@ -249,9 +250,9 @@ PRE_ARIADNE_PREFIXES = {
     "anti_overlap.",
 }
 PRE_SAMPLING_PROTOCOL_PREFIXES = {
-    "sampling_protocol.",
     "geometry_novelty.",
 }
+PRE_SAMPLING_PROTOCOL_EXACT = {"campaign.sampling_aggressiveness"}
 PRE_PHASE_B_PREFIXES = {
     "phase_b.",
 }
@@ -283,22 +284,23 @@ FUTURE_SAFE_PREFIXES = (
 
 ARIADNE_OUTPUT_INTERPRETATION_PREFIXES = {
     "seed_selection.",
-    "sampling_protocol.",
 }
 ARIADNE_OUTPUT_INTERPRETATION_EXACT = {
     "acquisition.gradient.max_acquisition_grad_per_ang",
+    "campaign.sampling_aggressiveness",
 }
 
-PHASE_B_OUTPUT_INTERPRETATION_PREFIXES = {
-    "sampling_protocol.",
-}
-PHASE_B_OUTPUT_INTERPRETATION_EXACT = set(PRE_PHASE_B_EXACT)
+PHASE_B_OUTPUT_INTERPRETATION_PREFIXES: set[str] = set()
+PHASE_B_OUTPUT_INTERPRETATION_EXACT = (
+    set(PRE_PHASE_B_EXACT) | set(PRE_SAMPLING_PROTOCOL_EXACT)
+)
 
 PHASE_LOCAL_EXACT = set(FUTURE_FEREBUS_EXACT)
 COMMITTED_LOCKED_EXACT = (
     set(PRE_POOL_EXACT)
     | set(PRE_FEREBUS_FIRST_EXACT)
     | set(PRE_AIMALL_QUALITY_EXACT)
+    | set(PRE_ANCHOR_EXACT)
 )
 CAMPAIGN_LOCKED_EXACT = set(IMMUTABLE_EXACT)
 
@@ -319,6 +321,14 @@ _POLICIES_EXACT: Dict[str, ConfigFieldPolicy] = {
     **{
         path: ConfigFieldPolicy("pre_pool", "pre_pool", "editable until trajectory pool import")
         for path in PRE_POOL_EXACT
+    },
+    **{
+        path: ConfigFieldPolicy(
+            "pre_anchor",
+            "pre_anchor",
+            "editable until bootstrap anchor import",
+        )
+        for path in PRE_ANCHOR_EXACT
     },
     **{
         path: ConfigFieldPolicy("pre_phase_a", "pre_phase_a", "editable until Phase A POLUS begins")
@@ -356,6 +366,14 @@ _POLICIES_EXACT: Dict[str, ConfigFieldPolicy] = {
         path: ConfigFieldPolicy("pre_aimall_quality", "pre_aimall_first", "editable until first AIMAll quality postprocess")
         for path in PRE_AIMALL_QUALITY_EXACT
     },
+    **{
+        path: ConfigFieldPolicy(
+            "pre_sampling_protocol",
+            "pre_sampling_protocol",
+            "editable until ARIADNE/Phase B consumes this iteration; current ARIADNE array edits require --force-resubmit-array-tasks",
+        )
+        for path in PRE_SAMPLING_PROTOCOL_EXACT
+    },
 }
 
 _POLICIES_PREFIX: Tuple[Tuple[str, ConfigFieldPolicy], ...] = (
@@ -365,7 +383,6 @@ _POLICIES_PREFIX: Tuple[Tuple[str, ConfigFieldPolicy], ...] = (
     ("gaussian.", ConfigFieldPolicy("pre_gaussian", "pre_gaussian_first", "editable until first Gaussian staging/submission; current Gaussian array edits require --force-resubmit-array-tasks")),
     ("aimall.", ConfigFieldPolicy("pre_aimall", "pre_aimall_first", "editable until first AIMAll staging/submission; current AIMAll array edits require --force-resubmit-array-tasks")),
     ("seed_selection.", ConfigFieldPolicy("pre_seed_select", "pre_seed_select", "editable until seed selection for this iteration")),
-    ("sampling_protocol.", ConfigFieldPolicy("pre_sampling_protocol", "pre_sampling_protocol", "editable until ARIADNE/Phase B consumes this iteration; current ARIADNE array edits require --force-resubmit-array-tasks")),
     ("phase_b.", ConfigFieldPolicy("pre_phase_b", "pre_phase_b", "editable until Phase B consumes this iteration")),
     ("geometry_novelty.", ConfigFieldPolicy("pre_sampling_protocol", "pre_sampling_protocol", "editable until ARIADNE/Phase B consumes this iteration; current ARIADNE array edits require --force-resubmit-array-tasks")),
     ("acquisition.", ConfigFieldPolicy("pre_ariadne", "pre_ariadne", "editable until ARIADNE consumes this iteration; current ARIADNE array edits require --force-resubmit-array-tasks")),
@@ -487,6 +504,16 @@ def _trajectory_pool_consumed(campaign_dir: Union[str, Path]) -> Optional[str]:
         (
             ".DATA/TRAJECTORY/pool.xyz",
             ".DATA/TRAJECTORY/pool.manifest.json",
+        ),
+    )
+
+
+def _bootstrap_anchor_consumed(campaign_dir: Union[str, Path]) -> Optional[str]:
+    return _first_existing_path(
+        campaign_dir,
+        (
+            ".DATA/TRAJECTORY/anchor.xyz",
+            ".DATA/TRAJECTORY/ANCHOR_SOURCE.json",
         ),
     )
 
@@ -921,7 +948,7 @@ def _consumption_block_reason(
                 dotted.startswith("acquisition.")
                 or dotted.startswith("ariadne.")
                 or dotted.startswith("adversarial_safety.")
-                or dotted.startswith("sampling_protocol.")
+                or dotted == "campaign.sampling_aggressiveness"
                 or dotted.startswith("geometry_novelty.")
                 or dotted.startswith("error_calibration.")
                 or dotted in PRE_ARIADNE_EXACT
@@ -937,6 +964,9 @@ def _consumption_block_reason(
     if kind == "pre_pool":
         reason = _trajectory_pool_consumed(campaign_dir)
         return None if reason is None else "trajectory pool has already been imported: " + reason
+    if kind == "pre_anchor":
+        reason = _bootstrap_anchor_consumed(campaign_dir)
+        return None if reason is None else "bootstrap anchor has already been imported: " + reason
     if kind == "pre_phase_a":
         return _phase_a_consumed(campaign_dir)
     if kind == "pre_gaussian_first":

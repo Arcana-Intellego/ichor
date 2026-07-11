@@ -39,6 +39,14 @@ def _campaign_with_config(tmp_path) -> Path:
     campaign = tmp_path / "campaign"
     campaign.mkdir()
     CampaignConfig(max_iterations=2).to_yaml(campaign / "campaign.yaml")
+    (campaign / "pool.xyz").write_text(
+        "".join(
+            "1\nframe " + str(index) + "\nH 0.0 0.0 0.0\n"
+            for index in range(128)
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
     return campaign
 
 
@@ -336,6 +344,10 @@ def _backend_availability(**overrides):
         "profile": True,
         "sbatch": True,
         "sacct": True,
+        "squeue": True,
+        "batch_python": True,
+        "batch_python_version": "3.11.15",
+        "batch_python_error": "",
         "gaussian": True,
         "aimall": True,
         "ferebus": True,
@@ -346,6 +358,7 @@ def _backend_availability(**overrides):
         "gaussian_binary": "jobscript:$g16root/g16/g16",
         "sbatch_path": "/usr/bin/sbatch",
         "sacct_path": "/usr/bin/sacct",
+        "squeue_path": "/usr/bin/squeue",
         "bc_path": "/usr/bin/bc",
         "aimall_path": "/home/user/AIMAll/aimqb.ish",
         "ferebus_path": "/home/user/.local/bin/ferebus",
@@ -911,13 +924,13 @@ def test_cli_init_bootstraps_fresh_state_and_config_lock(tmp_path, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "Campaign initialised" in out
-    assert "trajectory pool: missing" in out
+    assert "Imported pool:" in out
     state = read_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME)
     assert state.phase is CampaignPhase.INIT
     assert state.max_iterations == 2
     assert (campaign / DEFAULT_DATA_SUBDIR / "config_lock.json").is_file()
-    assert "ichor-al-daemon --campaign-dir " + str(campaign) + " --live" not in out
-    assert "ichor-al-daemon init --campaign-dir " + str(campaign) + " --source" in out
+    assert "ichor-al-daemon start --campaign-dir " + str(campaign) + " --live" in out
+    assert "ichor-al-daemon init --campaign-dir " + str(campaign) + " --source" not in out
 
 
 def test_cli_init_rerun_preserves_existing_campaign_uid(tmp_path, capsys):
@@ -1205,11 +1218,11 @@ def test_cli_stop_cancel_jobs_cancels_ferebus_intent_with_expected_job_name(
         "456",
         expected_tasks=12,
     )
-    expected_name = live_job_name(
-        state.campaign_uid,
+    expected_name = submission_intent.load_intent(
+        campaign,
         CampaignPhase.INITIAL_FEREBUS.value,
         0,
-    )
+    )["expected_job_name"]
     cancelled = []
     monkeypatch.setattr(
         cli_mod,
@@ -1254,7 +1267,11 @@ def test_cli_stop_cancel_jobs_uses_intents_when_state_missing(
         iteration=0,
     )
     submission_intent.mark_submitted(campaign, phase, 0, "999")
-    expected_name = live_job_name("uid123456789", phase, 0)
+    expected_name = submission_intent.load_intent(
+        campaign,
+        phase,
+        0,
+    )["expected_job_name"]
     cancelled = []
     monkeypatch.setattr(
         cli_mod,
@@ -1300,7 +1317,11 @@ def test_cli_stop_cancel_jobs_uses_intents_when_state_corrupt(
         iteration=0,
     )
     submission_intent.mark_submitted(campaign, phase, 0, "1001")
-    expected_name = live_job_name("uid123456789", phase, 0)
+    expected_name = submission_intent.load_intent(
+        campaign,
+        phase,
+        0,
+    )["expected_job_name"]
     cancelled = []
     monkeypatch.setattr(
         cli_mod,

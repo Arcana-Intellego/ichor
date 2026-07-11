@@ -172,6 +172,7 @@ def _d_optimal_select(
     jitter: float,
     novelty_floor: float,
     score_power: float,
+    degenerate_policy: str,
     variance_chunk_size: Optional[int],
 ) -> Tuple[List[int], List[Dict[str, Any]], Dict[str, Any]]:
     """Greedy D-optimal pick from a bounded high-variance candidate pool."""
@@ -201,15 +202,26 @@ def _d_optimal_select(
         for rank, pos in enumerate(order)
     }
 
+    if degenerate_policy not in {"fail", "score_backfill"}:
+        raise ValueError("unknown D-optimal degenerate policy: " + repr(degenerate_policy))
     selected = [int(i) for i in selected_context]
     picked: List[int] = []
     picked_diag: List[Dict[str, Any]] = []
     gain_floor = float(max(0.0, novelty_floor))
     power = float(score_power)
-    pivot_eps = max(float(jitter), 1.0e-300)
-    diag_eps = max(gain_floor, pivot_eps)
-    degenerate_candidates = set()
-    selected_inv: Optional[np.ndarray] = None
+    variance_scale = max(
+        float(np.max(candidate_vars)) if candidate_vars.size else 0.0,
+        1.0,
+    )
+    pivot_eps = max(
+        10.0 * float(jitter),
+        np.finfo(float).eps * variance_scale * 64.0,
+    )
+    diagnostic_floor = max(gain_floor, pivot_eps)
+    degenerate_candidates: set[int] = set()
+    last_conditional: Dict[int, float] = {}
+    last_correlation: Dict[int, float] = {}
+    selected_cholesky: Optional[np.ndarray] = None
     selected_diag = np.zeros(0, dtype=float)
     k_xs = np.zeros((len(candidate_indices), 0), dtype=float)
     if selected:
@@ -223,10 +235,10 @@ def _d_optimal_select(
         selected_cov = 0.5 * (selected_cov + selected_cov.T)
         selected_cov = selected_cov + np.eye(selected_cov.shape[0], dtype=float) * float(jitter)
         try:
-            selected_inv = np.linalg.inv(selected_cov)
+            selected_cholesky = np.linalg.cholesky(selected_cov)
         except np.linalg.LinAlgError as exc:
-            raise ValueError("D-optimal seed covariance inverse failed") from exc
-        selected_diag = np.maximum(np.diag(selected_cov), diag_eps)
+            raise ValueError("D-optimal seed covariance Cholesky factor failed") from exc
+        selected_diag = np.maximum(np.diag(selected_cov), diagnostic_floor)
         k_xs = _posterior_cross_covariances(
             posterior,
             [training_atoms[i] for i in candidate_indices],
@@ -235,10 +247,13 @@ def _d_optimal_select(
         )
 
     while candidate_indices and len(picked) < int(n_select):
-        if selected_inv is not None and k_xs.shape[1] > 0:
-            solved = selected_inv @ k_xs.T
-            conditional = candidate_vars - np.einsum("ij,ji->i", k_xs, solved)
-            denom = np.sqrt(np.maximum(candidate_vars, diag_eps)[:, None] * selected_diag[None, :])
+        if selected_cholesky is not None and k_xs.shape[1] > 0:
+            projected = np.linalg.solve(selected_cholesky, k_xs.T)
+            conditional = candidate_vars - np.sum(np.square(projected), axis=0)
+            denom = np.sqrt(
+                np.maximum(candidate_vars, diagnostic_floor)[:, None]
+                * selected_diag[None, :]
+            )
             max_corr = np.max(np.abs(k_xs) / denom, axis=1)
         else:
             conditional = np.array(candidate_vars, dtype=float)
@@ -252,7 +267,9 @@ def _d_optimal_select(
         raw_scores = np.maximum(candidate_scores, 0.0) ** power
         conditional_floor = np.maximum(conditional, gain_floor)
         usable = conditional > pivot_eps
-        for idx, is_usable in zip(candidate_indices, usable):
+        for position, (idx, is_usable) in enumerate(zip(candidate_indices, usable)):
+            last_conditional[int(idx)] = float(conditional[position])
+            last_correlation[int(idx)] = float(max_corr[position])
             if not bool(is_usable):
                 degenerate_candidates.add(int(idx))
         gains = np.where(usable, raw_scores * conditional_floor, -np.inf)
@@ -274,6 +291,38 @@ def _d_optimal_select(
             else np.zeros(0, dtype=float)
         )
         pick_variance_with_jitter = float(candidate_vars[pick_pos]) + float(jitter)
+        if selected_cholesky is None or selected_cholesky.size == 0:
+            schur = pick_variance_with_jitter
+            if not np.isfinite(schur) or schur <= pivot_eps:
+                degenerate_candidates.add(pick_index)
+                del candidate_indices[pick_pos]
+                candidate_vars = np.delete(candidate_vars, pick_pos)
+                candidate_scores = np.delete(candidate_scores, pick_pos)
+                continue
+            selected_cholesky = np.array([[float(np.sqrt(schur))]], dtype=float)
+        else:
+            projected_pick = np.linalg.solve(
+                selected_cholesky,
+                pick_cov_to_selected,
+            )
+            schur = float(
+                pick_variance_with_jitter
+                - float(np.dot(projected_pick, projected_pick))
+            )
+            if not np.isfinite(schur) or schur <= pivot_eps:
+                degenerate_candidates.add(pick_index)
+                del candidate_indices[pick_pos]
+                candidate_vars = np.delete(candidate_vars, pick_pos)
+                candidate_scores = np.delete(candidate_scores, pick_pos)
+                if k_xs.size:
+                    k_xs = np.delete(k_xs, pick_pos, axis=0)
+                continue
+            old_size = int(selected_cholesky.shape[0])
+            expanded = np.zeros((old_size + 1, old_size + 1), dtype=float)
+            expanded[:old_size, :old_size] = selected_cholesky
+            expanded[old_size, :old_size] = projected_pick
+            expanded[old_size, old_size] = float(np.sqrt(schur))
+            selected_cholesky = expanded
         picked.append(pick_index)
         selected.append(pick_index)
         picked_diag.append({
@@ -281,35 +330,16 @@ def _d_optimal_select(
             "selection_origin": "d_optimal",
             "raw_variance": float(candidate_vars[pick_pos]),
             "raw_score": float(candidate_scores[pick_pos]),
-            "d_optimal_conditional_variance": float(conditional_floor[pick_pos]),
+            "d_optimal_conditional_variance": float(max(conditional[pick_pos], 0.0)),
             "d_optimal_raw_conditional_variance": float(conditional[pick_pos]),
             "d_optimal_gain": float(gains[pick_pos]),
             "d_optimal_prefilter_rank": int(candidate_rank[pick_index]),
             "d_optimal_max_correlation_to_selected": float(max_corr[pick_pos]),
         })
-        if selected_inv is None or selected_inv.size == 0:
-            selected_inv = np.array([[1.0 / max(pick_variance_with_jitter, pivot_eps)]], dtype=float)
-        else:
-            inv_b = selected_inv @ pick_cov_to_selected.reshape(-1, 1)
-            explained = (pick_cov_to_selected.reshape(1, -1) @ inv_b).item()
-            schur = float(pick_variance_with_jitter - float(explained))
-            if not np.isfinite(schur) or schur <= pivot_eps:
-                degenerate_candidates.add(pick_index)
-                picked.pop()
-                selected.pop()
-                picked_diag.pop()
-                del candidate_indices[pick_pos]
-                candidate_vars = np.delete(candidate_vars, pick_pos)
-                candidate_scores = np.delete(candidate_scores, pick_pos)
-                if k_xs.size:
-                    k_xs = np.delete(k_xs, pick_pos, axis=0)
-                continue
-            schur = max(schur, pivot_eps)
-            top_left = selected_inv + (inv_b @ inv_b.T) / schur
-            top_right = -inv_b / schur
-            bottom = np.array([[1.0 / schur]], dtype=float)
-            selected_inv = np.block([[top_left, top_right], [top_right.T, bottom]])
-        selected_diag = np.append(selected_diag, max(pick_variance_with_jitter, diag_eps))
+        selected_diag = np.append(
+            selected_diag,
+            max(pick_variance_with_jitter, diagnostic_floor),
+        )
         new_col = None
         if len(candidate_indices) > 1:
             new_col = _posterior_cross_covariances(
@@ -327,10 +357,57 @@ def _d_optimal_select(
             new_col = np.delete(new_col, pick_pos, axis=0)
             k_xs = np.hstack([k_xs, new_col]) if k_xs.size else new_col
 
+    n_d_optimal = len(picked)
+    n_backfill = max(0, int(n_select) - n_d_optimal)
+    if n_backfill:
+        if degenerate_policy == "fail":
+            raise ValueError(
+                "D-optimal model-space degeneracy selected "
+                + str(n_d_optimal)
+                + " of "
+                + str(int(n_select))
+                + " requested seeds"
+            )
+        remaining_by_score = _quantised_descending_order(
+            remaining_scores,
+            remaining_indices,
+        )
+        picked_set = set(picked)
+        backfill_positions = [
+            int(position)
+            for position in remaining_by_score
+            if int(remaining_indices[int(position)]) not in picked_set
+        ][:n_backfill]
+        if len(backfill_positions) != n_backfill:
+            raise ValueError("D-optimal score backfill could not satisfy requested seed count")
+        for position in backfill_positions:
+            index = int(remaining_indices[position])
+            picked.append(index)
+            picked_diag.append({
+                "selection_index": index,
+                "selection_origin": "d_optimal_backfill",
+                "raw_variance": float(remaining_variances[position]),
+                "raw_score": float(remaining_scores[position]),
+                "d_optimal_conditional_variance": (
+                    max(0.0, float(last_conditional[index]))
+                    if index in last_conditional
+                    else None
+                ),
+                "d_optimal_raw_conditional_variance": last_conditional.get(index),
+                "d_optimal_gain": None,
+                "d_optimal_prefilter_rank": int(candidate_rank.get(index, position)),
+                "d_optimal_max_correlation_to_selected": last_correlation.get(index),
+                "d_optimal_backfill_reason": "model_space_degeneracy",
+            })
+
     return picked, picked_diag, {
         "prefilter_pool_size": int(n_pool),
         "d_optimal_requested": int(n_select),
-        "d_optimal_selected": int(len(picked)),
+        "d_optimal_selected": int(n_d_optimal),
+        "d_optimal_backfilled": int(n_backfill),
+        "d_optimal_total_selected": int(len(picked)),
+        "d_optimal_degenerate_policy": str(degenerate_policy),
+        "d_optimal_pivot_floor": float(pivot_eps),
         "d_optimal_skipped_degenerate": int(len(degenerate_candidates)),
     }
 
@@ -370,7 +447,8 @@ def select_seeds(
     d_optimal_jitter: float = 1.0e-12,
     d_optimal_novelty_floor: float = 1.0e-12,
     d_optimal_score_power: float = 1.0,
-    score_transform: Optional[Callable[[int, float], Optional[float]]] = None,
+    d_optimal_degenerate_policy: str = "score_backfill",
+    score_transform: Optional[Callable[..., Optional[float]]] = None,
 ) -> SeedSelection:
     """Return n_seeds seeds from training_atoms.
 
@@ -415,8 +493,10 @@ def select_seeds(
         replaces only that non-random path with the greedy model-space selector.
     score_transform
         Optional cheap transform for D-optimal ranking/gain scores. It receives
-        ``(training_index, posterior_variance)`` and should return a finite,
-        non-negative score. ``None``/non-finite values fall back to variance.
+        ``(training_index, posterior_variance, population_variance_scale)``
+        and should return a finite, non-negative score. Two-argument legacy
+        callables remain accepted. ``None``/non-finite values fall back to
+        variance.
 
     Returns
     -------
@@ -438,6 +518,10 @@ def select_seeds(
         raise ValueError("d_optimal_novelty_floor must be >= 0")
     if float(d_optimal_score_power) < 0.0:
         raise ValueError("d_optimal_score_power must be >= 0")
+    if str(d_optimal_degenerate_policy) not in {"fail", "score_backfill"}:
+        raise ValueError(
+            "d_optimal_degenerate_policy must be 'fail' or 'score_backfill'"
+        )
 
     n_total = len(training_atoms)
     if n_total <= 0:
@@ -554,9 +638,24 @@ def select_seeds(
     remaining_vars = _finite_variances(remaining_vars, context="seed ranking")
     remaining_scores = np.array(remaining_vars, dtype=float)
     if score_transform is not None:
+        positive_variances = remaining_vars[remaining_vars > 0.0]
+        population_scale = (
+            float(np.median(positive_variances))
+            if positive_variances.size
+            else 1.0
+        )
         transformed = []
         for idx, var in zip(remaining, remaining_vars):
-            value = score_transform(int(idx), float(var))
+            try:
+                value = score_transform(
+                    int(idx),
+                    float(var),
+                    population_scale,
+                )
+            except TypeError as exc:
+                if "positional" not in str(exc) and "argument" not in str(exc):
+                    raise
+                value = score_transform(int(idx), float(var))
             try:
                 score = float(value) if value is not None else float(var)
             except (TypeError, ValueError):
@@ -595,6 +694,7 @@ def select_seeds(
                 jitter=float(d_optimal_jitter),
                 novelty_floor=float(d_optimal_novelty_floor),
                 score_power=float(d_optimal_score_power),
+                degenerate_policy=str(d_optimal_degenerate_policy),
                 variance_chunk_size=variance_chunk_size,
             )
             selection_diag_by_index.update({int(d["selection_index"]): dict(d) for d in dopt_diags})
@@ -630,8 +730,12 @@ def select_seeds(
                 "raw_variance": float(variance_by_idx[int(idx)]),
             }
         else:
-            origin = "d_optimal" if strategy == "d_optimal" else "variance"
             diag = dict(selection_diag_by_index.get(int(idx), {}))
+            origin = (
+                str(diag.get("selection_origin") or "d_optimal")
+                if strategy == "d_optimal"
+                else "variance"
+            )
             diag.setdefault("selection_index", int(idx))
             diag.setdefault("selection_origin", origin)
             diag.setdefault("raw_variance", float(variance_by_idx[int(idx)]))

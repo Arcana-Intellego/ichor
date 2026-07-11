@@ -150,7 +150,10 @@ def _require_replacement_sample(
     iteration: int,
     replacement_round: int,
 ) -> Path:
-    from ..replacement_sampling import read_replacement_sample, replacement_round_dir
+    from ..replacement_sampling import (
+        read_replacement_sample_strict,
+        replacement_round_dir,
+    )
 
     path = replacement_round_dir(
         campaign,
@@ -158,7 +161,12 @@ def _require_replacement_sample(
         iteration=int(iteration),
         replacement_round=int(replacement_round),
     )
-    read_replacement_sample(path)
+    read_replacement_sample_strict(
+        campaign,
+        context=str(context),
+        iteration=int(iteration),
+        replacement_round=int(replacement_round),
+    )
     return path
 
 

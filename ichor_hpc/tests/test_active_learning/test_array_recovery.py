@@ -218,3 +218,63 @@ def test_ariadne_retry_archives_complete_seed_directory_and_partial_output(
     assert not partial.exists()
     assert len(archived) == 2
     assert all(Path(path).exists() for path in archived)
+
+
+def test_replacement_phases_support_round_specific_partial_recovery(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = tmp_path / "campaign"
+    round_dir = (
+        campaign
+        / ".DATA"
+        / "STAGING"
+        / "iter_2"
+        / "replacement_round_0003"
+    )
+    round_dir.mkdir(parents=True)
+    pointdirs = []
+    for index in range(3):
+        pointdir = round_dir / ("POINT_" + str(index + 4).zfill(4) + ".pointdir")
+        pointdir.mkdir()
+        pointdirs.append(pointdir)
+    (round_dir / "POINTS.txt").write_text(
+        "\n".join(str(path.resolve()) for path in pointdirs) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    monkeypatch.setattr(
+        array_recovery,
+        "_replacement_identity",
+        lambda *args, **kwargs: (3, round_dir),
+    )
+    monkeypatch.setattr(
+        array_recovery,
+        "_validate_task",
+        lambda _campaign, _phase, _iteration, task_id: (
+            int(task_id) == 1,
+            "" if int(task_id) == 1 else "missing",
+            "output",
+        ),
+    )
+
+    payload = array_recovery.prepare_retry_submission(
+        campaign,
+        "REPLACEMENT_GAUSSIAN",
+        2,
+    )
+
+    assert payload["replacement_round"] == 3
+    assert payload["retry_task_ids"] == [0, 2]
+    assert "-r0003.json" in payload["path"]
+    assert ".r0003.txt" in payload["retry_task_file"]
+
+
+def test_all_replacement_quantum_phases_advertise_partial_recovery():
+    for phase in (
+        "INITIAL_REPLACEMENT_GAUSSIAN",
+        "INITIAL_REPLACEMENT_AIMALL",
+        "REPLACEMENT_GAUSSIAN",
+        "REPLACEMENT_AIMALL",
+    ):
+        assert array_recovery.supports_partial_array_recovery(phase)

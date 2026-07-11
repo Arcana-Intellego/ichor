@@ -12,6 +12,7 @@ from ichor.core.models.models import Models
 GeometryInput = Union[Atoms, Dict[str, np.ndarray], np.ndarray]
 VARIANCE_NEGATIVE_TOLERANCE = 1.0e-10
 POSTERIOR_CACHE_MAX_SIZE = 4096
+_VARIANCE_CLIPPED_COUNT = 0
 
 
 
@@ -32,10 +33,24 @@ def _check_finite_array(values, label: str) -> np.ndarray:
 
 
 def _check_variance_array(values, label: str) -> np.ndarray:
+    global _VARIANCE_CLIPPED_COUNT
     arr = _check_finite_array(values, label)
     if np.any(arr < -VARIANCE_NEGATIVE_TOLERANCE):
         raise ValueError(label + " is materially negative")
+    clipped = int(np.count_nonzero(arr < 0.0))
+    if clipped:
+        _VARIANCE_CLIPPED_COUNT += clipped
+        arr = np.maximum(arr, 0.0)
     return arr
+
+
+def variance_clip_diagnostics(*, reset: bool = False) -> Dict[str, int]:
+    """Return the cumulative count of tolerated variances clipped to zero."""
+    global _VARIANCE_CLIPPED_COUNT
+    payload = {"clipped_tiny_negative_variances": int(_VARIANCE_CLIPPED_COUNT)}
+    if reset:
+        _VARIANCE_CLIPPED_COUNT = 0
+    return payload
 
 
 def _check_kernel_active_dims(model, nfeats: int, label: str) -> None:

@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 from ichor.core.atoms import Atom, Atoms
 
-from .daemon.state import atomic_write_json
+from .daemon.state import atomic_write_json, atomic_write_text
 from .point_allocation import (
     allocate_replacements,
     allocation_manifest_sha256,
@@ -60,7 +60,8 @@ def _write_xyz(frames: Sequence[Atoms], path: Path) -> None:
                     z=coordinates[2],
                 )
             )
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(path, "\n".join(lines) + "\n")
 
 
 def _active_frame(attempt: Mapping[str, Any]) -> Atoms:
@@ -299,9 +300,80 @@ def read_replacement_sample(
     return out
 
 
+def read_replacement_sample_strict(
+    campaign_dir: str | Path,
+    *,
+    context: str,
+    iteration: int,
+    replacement_round: int,
+) -> Dict[str, Any]:
+    """Read a replacement sample and join it exactly to current allocation."""
+    campaign = Path(campaign_dir)
+    canonical_round_dir = replacement_round_dir(
+        campaign,
+        context=context,
+        iteration=int(iteration),
+        replacement_round=int(replacement_round),
+    )
+    data = read_replacement_sample(
+        canonical_round_dir,
+        verify_allocation=True,
+    )
+    if str(data.get("context")) != str(context):
+        raise ValueError("replacement sample context does not match its campaign phase")
+    if int(data.get("iteration", -1)) != int(iteration):
+        raise ValueError("replacement sample iteration does not match its campaign phase")
+    if int(data.get("replacement_round", -1)) != int(replacement_round):
+        raise ValueError("replacement sample round does not match its campaign phase")
+    allocation_path = point_allocation_path(
+        campaign,
+        context=context,
+        iteration=int(iteration),
+    ).resolve(strict=False)
+    if Path(str(data["point_allocation_manifest"])).resolve(strict=False) != allocation_path:
+        raise ValueError("replacement sample references a non-canonical allocation manifest")
+    allocation = read_point_allocation(allocation_path)
+    expected_attempts = [
+        attempt
+        for attempt in pending_attempts(allocation)
+        if int(attempt.get("round", -1)) == int(replacement_round)
+    ]
+    records = list(data.get("records") or [])
+    if len(records) != len(expected_attempts) or not records:
+        raise ValueError(
+            "replacement sample does not cover exactly the current pending attempts"
+        )
+    target_total = int(allocation["targets"]["total"])
+    for sample_index, (record, expected) in enumerate(
+        zip(records, expected_attempts)
+    ):
+        core = {
+            key: value
+            for key, value in dict(record).items()
+            if key not in {"sample_index", "pointdir_index"}
+        }
+        if core != expected:
+            raise ValueError(
+                "replacement sample record does not match allocation attempt at index "
+                + str(sample_index)
+            )
+        expected_pointdir_index = target_total + int(expected["reserve_rank"])
+        if int(record.get("pointdir_index", -1)) != expected_pointdir_index:
+            raise ValueError(
+                "replacement sample pointdir index does not match reserve rank"
+            )
+    expected_sample = (canonical_round_dir / "replacement-SAMPLE.xyz").resolve(
+        strict=False
+    )
+    if Path(str(data["sample_xyz"])).resolve(strict=False) != expected_sample:
+        raise ValueError("replacement sample XYZ is not the canonical round artefact")
+    return data
+
+
 __all__ = [
     "REPLACEMENT_SAMPLE_FILENAME",
     "replacement_round_dir",
     "prepare_replacement_round",
     "read_replacement_sample",
+    "read_replacement_sample_strict",
 ]

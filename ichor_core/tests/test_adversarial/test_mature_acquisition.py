@@ -141,9 +141,45 @@ def test_negative_curvature_is_not_rewarded_by_default():
     acq = _stub_acq()
     positive = acq._curvature_floor(4.0)
     negative = acq._curvature_floor(-4.0)
-    assert negative == pytest.approx(positive)
+    assert negative < positive
     mode = ModeEvaluation(0, 0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     assert acq._negative_curvature_penalty((mode,), (1.0,)) == 0.0
+
+
+def test_negative_curvature_contributes_no_frequency_or_anharmonic_reward(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "ichor.core.adversarial.acquisition.whitened_distance_squared",
+        lambda *args, **kwargs: 0.0,
+    )
+    monkeypatch.setattr(
+        "ichor.core.adversarial.acquisition.chemistry_barrier_value",
+        lambda *args, **kwargs: 0.0,
+    )
+    unstable = ModeEvaluation(
+        index=0,
+        force_std=0.0,
+        curvature_mean=-4.0,
+        curvature_std=100.0,
+        omega=2.0,
+        omega_std=100.0,
+        cubic_mean=10.0,
+        cubic_std=10.0,
+        quartic_mean=10.0,
+        quartic_std=10.0,
+        anharmonicity=100.0,
+        anharmonicity_std=100.0,
+    )
+
+    breakdown = _component_stub(unstable).components(
+        Atoms([Atom("O", 0.0, 0.0, 0.0)]),
+        include_movement=False,
+    )
+
+    assert breakdown.legacy_frequency_risk == 0.0
+    assert breakdown.spectral_frequency_risk == 0.0
+    assert breakdown.anharmonic_risk == 0.0
 
 
 def test_negative_curvature_penalise_mode_is_bounded():
@@ -200,11 +236,14 @@ def test_weak_mode_gating_blocks_singular_anharmonic_reward(monkeypatch):
         anharmonicity_std=15105.939507675506,
     )
     atoms = Atoms([Atom("O", 0.0, 0.0, 0.0)])
-    gated = _component_stub(pathological).components(atoms)
+    gated = _component_stub(pathological).components(atoms, include_movement=False)
     ungated_cfg = AcquisitionConfig(
         stencils=StencilConfig(weak_mode_gating_enabled=False)
     )
-    ungated = _component_stub(pathological, ungated_cfg).components(atoms)
+    ungated = _component_stub(pathological, ungated_cfg).components(
+        atoms,
+        include_movement=False,
+    )
 
     assert gated.mode_evaluations[0].weak_mode_reliability == 0.0
     assert gated.anharmonic_risk < 1.0
@@ -238,7 +277,8 @@ def test_finite_frequency_anharmonic_signal_survives_gating(monkeypatch):
     )
 
     breakdown = _component_stub(mode).components(
-        Atoms([Atom("O", 0.0, 0.0, 0.0)])
+        Atoms([Atom("O", 0.0, 0.0, 0.0)]),
+        include_movement=False,
     )
 
     assert breakdown.mode_evaluations[0].weak_mode_reliability == 1.0

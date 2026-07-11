@@ -391,11 +391,27 @@ def _phase_b_candidate_count(campaign_dir: Optional[Path], iteration: int) -> in
     return len(records) if isinstance(records, list) else 0
 
 
-def _staging_dir(campaign_dir: Optional[Path], phase_name: str, iteration: int) -> Optional[Path]:
+def _staging_dir(
+    campaign_dir: Optional[Path],
+    phase_name: str,
+    iteration: int,
+    *,
+    replacement_round: int = 0,
+    staging_dir: Optional[Path] = None,
+) -> Optional[Path]:
+    if staging_dir is not None:
+        return Path(staging_dir)
     if campaign_dir is None:
         return None
     bucket = "initial" if str(phase_name).startswith("INITIAL_") else "iter_" + str(int(iteration))
-    return Path(campaign_dir) / ".DATA" / "STAGING" / bucket
+    staging = Path(campaign_dir) / ".DATA" / "STAGING" / bucket
+    if "REPLACEMENT" in str(phase_name):
+        if int(replacement_round) <= 0:
+            return None
+        staging = staging / (
+            "replacement_round_" + str(int(replacement_round)).zfill(4)
+        )
+    return staging
 
 
 def _pointdirs_from_points_file(staging: Optional[Path]) -> List[Path]:
@@ -441,8 +457,21 @@ def _natoms_from_gjf(path: Path) -> Optional[int]:
     return count or None
 
 
-def _staged_natoms(campaign_dir: Optional[Path], phase_name: str, iteration: int) -> Optional[int]:
-    staging = _staging_dir(campaign_dir, phase_name, iteration)
+def _staged_natoms(
+    campaign_dir: Optional[Path],
+    phase_name: str,
+    iteration: int,
+    *,
+    replacement_round: int = 0,
+    staging_dir: Optional[Path] = None,
+) -> Optional[int]:
+    staging = _staging_dir(
+        campaign_dir,
+        phase_name,
+        iteration,
+        replacement_round=replacement_round,
+        staging_dir=staging_dir,
+    )
     for pd in _pointdirs_from_points_file(staging):
         natoms = _natoms_from_gjf(pd / "input.gjf")
         if natoms:
@@ -548,6 +577,9 @@ def _estimate_backend_memory_gb(
     iteration: int,
     candidate_cpus: int,
     partition_gb: float,
+    replacement_round: int = 0,
+    staging_dir: Optional[Path] = None,
+    n_atoms_override: Optional[int] = None,
 ) -> Tuple[float, str, Dict[str, Any]]:
     extra: Dict[str, Any] = {}
     if backend == "polus":
@@ -572,7 +604,17 @@ def _estimate_backend_memory_gb(
         total_gb = max(float(candidate_cpus) * float(partition_gb), 1.0)
         return total_gb, "gaussian_partition_memory_for_gauss_mdef", extra
     if backend == "aimall":
-        n_atoms = int(_staged_natoms(campaign_dir, phase_name, iteration) or 12)
+        n_atoms = int(
+            n_atoms_override
+            or _staged_natoms(
+                campaign_dir,
+                phase_name,
+                iteration,
+                replacement_round=replacement_round,
+                staging_dir=staging_dir,
+            )
+            or 12
+        )
         n_primitives = None
         regime = _aimall_regime(n_atoms, n_primitives)
         if regime == "small":
@@ -635,16 +677,26 @@ def _auto_cpu_target(
     partition_min: int,
     partition_max: int,
     partition_gb: float,
+    replacement_round: int = 0,
+    staging_dir: Optional[Path] = None,
+    n_atoms_override: Optional[int] = None,
 ) -> Tuple[int, str, Dict[str, Any], float, str]:
     extra: Dict[str, Any] = {}
     if backend == "polus":
         estimated, mem_reason, mem_extra = _estimate_backend_memory_gb(
-            backend, phase_name, config, campaign_dir, iteration, partition_min, partition_gb
+            backend, phase_name, config, campaign_dir, iteration, partition_min,
+            partition_gb, replacement_round, staging_dir, n_atoms_override
         )
         target = max(partition_min, int(math.ceil(estimated / max(partition_gb, 1.0e-9))))
         return min(target, partition_max), "partition_min_plus_polus_memory_fit", mem_extra, estimated, mem_reason
     if backend == "gaussian":
-        n_atoms = _staged_natoms(campaign_dir, phase_name, iteration)
+        n_atoms = n_atoms_override or _staged_natoms(
+            campaign_dir,
+            phase_name,
+            iteration,
+            replacement_round=replacement_round,
+            staging_dir=staging_dir,
+        )
         if n_atoms is None:
             _nframes, n_atoms = _campaign_pool_size(campaign_dir)
         n_atoms = int(n_atoms or 12)
@@ -660,7 +712,17 @@ def _auto_cpu_target(
         extra.update({"n_atoms": int(n_atoms), "gaussian_weighted_size": float(weighted)})
         return min(max(target, partition_min), partition_max), "gaussian_size_basis_throughput", extra, 0.0, "gaussian_partition_memory_for_gauss_mdef"
     if backend == "aimall":
-        n_atoms = int(_staged_natoms(campaign_dir, phase_name, iteration) or 12)
+        n_atoms = int(
+            n_atoms_override
+            or _staged_natoms(
+                campaign_dir,
+                phase_name,
+                iteration,
+                replacement_round=replacement_round,
+                staging_dir=staging_dir,
+            )
+            or 12
+        )
         n_primitives = None
         regime = _aimall_regime(n_atoms, n_primitives)
         if regime == "small":
@@ -674,13 +736,15 @@ def _auto_cpu_target(
         target = min(max(target, partition_min), partition_max)
         extra.update({"n_atoms": int(n_atoms), "n_primitives": n_primitives, "aimall_regime": regime})
         estimated, mem_reason, mem_extra = _estimate_backend_memory_gb(
-            backend, phase_name, config, campaign_dir, iteration, target, partition_gb
+            backend, phase_name, config, campaign_dir, iteration, target,
+            partition_gb, replacement_round, staging_dir, n_atoms_override
         )
         extra.update(mem_extra)
         if estimated > target * partition_gb and target < partition_max:
             target = min(partition_max, max(target, int(math.ceil(estimated / max(partition_gb, 1.0e-9)))))
             estimated, mem_reason, mem_extra = _estimate_backend_memory_gb(
-                backend, phase_name, config, campaign_dir, iteration, target, partition_gb
+                backend, phase_name, config, campaign_dir, iteration, target,
+                partition_gb, replacement_round, staging_dir, n_atoms_override
             )
             extra.update(mem_extra)
         return target, "aimall_wavefunction_size_parallel_atoms", extra, estimated, mem_reason
@@ -695,7 +759,17 @@ def _auto_cpu_target(
             target = dim
             reason = "ariadne_active_fd_direction_workers"
         else:
-            n_atoms = int(_staged_natoms(campaign_dir, phase_name, iteration) or 12)
+            n_atoms = int(
+                n_atoms_override
+                or _staged_natoms(
+                    campaign_dir,
+                    phase_name,
+                    iteration,
+                    replacement_round=replacement_round,
+                    staging_dir=staging_dir,
+                )
+                or 12
+            )
             target = 3 * n_atoms
             reason = "ariadne_cartesian_fd_component_workers"
             extra["n_atoms"] = int(n_atoms)
@@ -724,6 +798,9 @@ def resolve_phase_resources(
     campaign_dir: Optional[Any] = None,
     iteration: int = 0,
     array_size: Optional[int] = None,
+    replacement_round: int = 0,
+    staging_dir: Optional[Any] = None,
+    n_atoms_override: Optional[int] = None,
 ) -> ResolvedPhaseResources:
     resources = config.resources
     backend = backend_for_phase(phase_name)
@@ -733,6 +810,25 @@ def resolve_phase_resources(
     partition_min, partition_max = _partition_min_max(part)
     partition_gb = partition_memory_per_core_gb(part)
     campaign_path = Path(campaign_dir) if campaign_dir is not None else None
+    if n_atoms_override is not None and int(n_atoms_override) <= 0:
+        raise BackendSubmissionError("n_atoms_override must be > 0")
+    staged_atoms = _staged_natoms(
+        campaign_path,
+        phase_name,
+        int(iteration),
+        replacement_round=int(replacement_round),
+        staging_dir=(None if staging_dir is None else Path(staging_dir)),
+    )
+    if (
+        "REPLACEMENT" in str(phase_name)
+        and backend in {"gaussian", "aimall"}
+        and n_atoms_override is None
+        and staged_atoms is None
+    ):
+        raise BackendSubmissionError(
+            "replacement resource resolution requires atom-count evidence from "
+            "the exact replacement staging round"
+        )
     warnings: List[str] = []
     extra: Dict[str, Any] = {}
     estimated_from_cpu = 0.0
@@ -748,6 +844,9 @@ def resolve_phase_resources(
             partition_min,
             partition_max,
             partition_gb,
+            int(replacement_round),
+            None if staging_dir is None else Path(staging_dir),
+            n_atoms_override,
         )
         extra.update(cpu_extra)
         _validate_core_count("resources." + backend + ".cpus_per_task", int(cpus), part)
@@ -770,6 +869,9 @@ def resolve_phase_resources(
             int(iteration),
             int(cpus),
             float(partition_gb),
+            int(replacement_round),
+            None if staging_dir is None else Path(staging_dir),
+            n_atoms_override,
         )
     extra.update(mem_extra)
 
@@ -844,7 +946,18 @@ def resolve_phase_resources(
             )
         warnings.append("estimated memory exceeds requested allocation")
     if backend == "aimall":
-        n_atoms = int(extra.get("n_atoms") or _staged_natoms(campaign_path, phase_name, int(iteration)) or 1)
+        n_atoms = int(
+            extra.get("n_atoms")
+            or n_atoms_override
+            or _staged_natoms(
+                campaign_path,
+                phase_name,
+                int(iteration),
+                replacement_round=int(replacement_round),
+                staging_dir=(None if staging_dir is None else Path(staging_dir)),
+            )
+            or 1
+        )
         extra["naat_resolved"] = int(resolve_aimall_naat(config, int(cpus), n_atoms, extra.get("n_primitives")))
     return ResolvedPhaseResources(
         backend=backend,

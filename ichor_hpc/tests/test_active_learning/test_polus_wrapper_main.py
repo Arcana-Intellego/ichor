@@ -39,6 +39,7 @@ def _import_pool(campaign, source):
 
 def _write_anchor_from_fixture(campaign, n_frames=1):
     from ichor.core.files.xyz import Trajectory
+    from ichor.hpc.active_learning.bootstrap_anchor import import_anchor_source
     from ichor.hpc.active_learning.sampling.polus_wrapper import _write_xyz_file
 
     traj = Trajectory(FIXTURE)
@@ -54,7 +55,9 @@ def _write_anchor_from_fixture(campaign, n_frames=1):
                 frame[1].z,
             ]
         frames.append(frame)
-    _write_xyz_file(frames, campaign / "anchor.xyz")
+    source = campaign / "anchor.xyz"
+    _write_xyz_file(frames, source)
+    import_anchor_source(campaign, source, overwrite=True)
     return frames
 
 

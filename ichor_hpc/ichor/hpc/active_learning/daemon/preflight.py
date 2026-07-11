@@ -18,7 +18,10 @@ a daemon that cannot submit anything.
 from __future__ import annotations
 
 import importlib
+import json
+import os
 import shutil
+import subprocess
 from dataclasses import dataclass
 from typing import List
 
@@ -59,11 +62,17 @@ class BackendAvailability:
     active_profile: str
     profile_error: str
     python_executable: str
+    squeue: bool = False
+    squeue_path: str = ""
+    batch_python: bool = False
+    batch_python_version: str = ""
+    batch_python_error: str = ""
 
     @property
     def all_present(self) -> bool:
         return (
-            self.profile and self.sbatch and self.sacct and self.gaussian and
+            self.profile and self.sbatch and self.sacct and self.squeue and
+            self.batch_python and self.gaussian and
             self.aimall and self.ferebus and self.ariadne and
             self.polus_rs and self.pyferebus and self.bc
         )
@@ -72,7 +81,8 @@ class BackendAvailability:
     def missing(self) -> List[str]:
         out: List[str] = []
         for attr in (
-            "profile", "sbatch", "sacct", "gaussian", "aimall", "ferebus",
+            "profile", "sbatch", "sacct", "squeue", "batch_python",
+            "gaussian", "aimall", "ferebus",
             "ariadne", "polus_rs", "pyferebus", "bc",
         ):
             if not getattr(self, attr):
@@ -166,9 +176,52 @@ def _pyferebus_importable() -> bool:
     return True
 
 
+def _probe_configured_python(python_executable: str) -> tuple[bool, str, str]:
+    """Run the submitted-job import contract under the configured interpreter."""
+    executable = str(python_executable or "").strip()
+    if not executable:
+        return False, "", "software.python.python_path is not configured"
+    if not os.path.isfile(executable):
+        return False, "", "configured Python is not a file: " + executable
+    if not os.access(executable, os.X_OK):
+        return False, "", "configured Python is not executable: " + executable
+    probe = (
+        "import importlib,json,sys;"
+        "mods=['ichor.core','ichor.hpc','ariadne',"
+        "'polus.samplers.RS.randomSampling',"
+        "'pyferebus.executors.trainer'];"
+        "[importlib.import_module(name) for name in mods];"
+        "print(json.dumps({'executable':sys.executable,"
+        "'version':list(sys.version_info[:3])},sort_keys=True))"
+    )
+    try:
+        completed = subprocess.run(
+            [executable, "-c", probe],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception as exc:
+        return False, "", type(exc).__name__ + ": " + str(exc)
+    if int(completed.returncode) != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        return False, "", "configured Python import probe failed: " + detail[:500]
+    try:
+        payload = json.loads((completed.stdout or "").strip().splitlines()[-1])
+        version_values = tuple(int(value) for value in payload["version"])
+    except Exception as exc:
+        return False, "", "configured Python returned malformed probe output: " + str(exc)
+    version = ".".join(str(value) for value in version_values)
+    if version_values[:2] != (3, 11):
+        return False, version, "configured batch Python must be Python 3.11"
+    return True, version, ""
+
+
 def check_backends() -> BackendAvailability:
     sbatch = _which("sbatch")
     sacct = _which("sacct")
+    squeue = _which("squeue")
     bc = _which("bc")
     profile_error = ""
     try:
@@ -182,10 +235,17 @@ def check_backends() -> BackendAvailability:
     gauss = _gaussian_binary()
     aim = _from_config_or_path("aimall", "aimqb.ish", "aimqb")
     fer = _from_config_or_path("ferebus", "FEREBUS", "ferebus")
+    python_executable = expanded_profile_value(
+        "software", "python", "python_path", default=""
+    ) or ""
+    batch_python, batch_python_version, batch_python_error = (
+        _probe_configured_python(str(python_executable))
+    )
     return BackendAvailability(
         profile=profile_ok,
         sbatch=bool(sbatch),
         sacct=bool(sacct),
+        squeue=bool(squeue),
         gaussian=bool(gauss),
         aimall=bool(aim),
         ferebus=bool(fer),
@@ -196,14 +256,16 @@ def check_backends() -> BackendAvailability:
         gaussian_binary=gauss,
         sbatch_path=sbatch,
         sacct_path=sacct,
+        squeue_path=squeue,
         bc_path=bc,
         aimall_path=aim,
         ferebus_path=fer,
         active_profile=machine,
         profile_error=profile_error,
-        python_executable=expanded_profile_value(
-            "software", "python", "python_path", default=""
-        ) or "",
+        python_executable=str(python_executable),
+        batch_python=batch_python,
+        batch_python_version=batch_python_version,
+        batch_python_error=batch_python_error,
     )
 
 
@@ -229,6 +291,13 @@ def missing_backend_message(avail: BackendAvailability) -> str:
         lines.append("  - sbatch (SLURM submit). Are you on a Slurm login node?")
     if not avail.sacct:
         lines.append("  - sacct (SLURM accounting).")
+    if not avail.squeue:
+        lines.append("  - squeue (SLURM liveness and throttled-array visibility).")
+    if not avail.batch_python:
+        lines.append(
+            "  - configured batch Python (batch_python). "
+            + (avail.batch_python_error or "The configured interpreter probe failed.")
+        )
     if not avail.gaussian:
         lines.append(
             "  - Gaussian. Either g16 must be on PATH, or ~/ichor_config.yaml "

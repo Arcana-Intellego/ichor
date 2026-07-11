@@ -1,3 +1,4 @@
+import hashlib
 import json
 
 import pytest
@@ -45,10 +46,25 @@ def _record(i, *, atom_type="C", raw=None, err=None):
         "landing_policy": "raw_final",
         "safety_metrics": {},
         "provenance": {},
+        "sampling_aggressiveness": 5,
+        "frame_atom_count": 1,
+        "frame_atom_identity_sha256": hashlib.sha256(b'["C1"]').hexdigest(),
     }
 
 
-def _atom_record(point, atom, *, model_version=0, raw_atom=1.0, raw_total=10.0, pred=-1.0, truth=-1.1):
+def _atom_record(
+    point,
+    atom,
+    *,
+    model_version=0,
+    raw_atom=1.0,
+    raw_total=10.0,
+    pred=-1.0,
+    truth=-1.1,
+    frame_atoms=None,
+):
+    frame_atoms = tuple(frame_atoms or (atom,))
+    identity = json.dumps(list(frame_atoms), separators=(",", ":")).encode("utf-8")
     return {
         "schema_version": 1,
         "iteration": 1,
@@ -69,6 +85,9 @@ def _atom_record(point, atom, *, model_version=0, raw_atom=1.0, raw_total=10.0, 
         "landing_policy": "raw_final",
         "safety_metrics": {},
         "provenance": {},
+        "sampling_aggressiveness": 5,
+        "frame_atom_count": len(frame_atoms),
+        "frame_atom_identity_sha256": hashlib.sha256(identity).hexdigest(),
     }
 
 
@@ -208,11 +227,12 @@ def test_calibration_global_total_table_uses_total_variance_and_total_error():
     cfg = CampaignConfig()
     cfg.error_calibration.n_bins = 2
     cfg.error_calibration.min_bin_records = 1
+    cfg.error_calibration.model_version_policy = "current"
     records = [
-        _atom_record(0, "C1", raw_atom=1.0, raw_total=20.0, pred=-1.0, truth=-1.5),
-        _atom_record(0, "H2", raw_atom=1.0, raw_total=20.0, pred=-1.0, truth=-0.8),
-        _atom_record(1, "C1", raw_atom=2.0, raw_total=40.0, pred=-1.0, truth=-1.1),
-        _atom_record(1, "H2", raw_atom=2.0, raw_total=40.0, pred=-1.0, truth=-1.2),
+        _atom_record(0, "C1", raw_atom=1.0, raw_total=20.0, pred=-1.0, truth=-1.5, frame_atoms=("C1", "H2")),
+        _atom_record(0, "H2", raw_atom=1.0, raw_total=20.0, pred=-1.0, truth=-0.8, frame_atoms=("C1", "H2")),
+        _atom_record(1, "C1", raw_atom=2.0, raw_total=40.0, pred=-1.0, truth=-1.1, frame_atoms=("C1", "H2")),
+        _atom_record(1, "H2", raw_atom=2.0, raw_total=40.0, pred=-1.0, truth=-1.2, frame_atoms=("C1", "H2")),
     ]
 
     model = build_calibration_model(records, cfg, iteration=1, current_model_version=0)
@@ -248,6 +268,7 @@ def test_acquisition_lookup_does_not_fall_back_to_per_atom_global_table():
 def test_calibration_model_defaults_to_current_model_version():
     cfg = CampaignConfig()
     cfg.error_calibration.min_bin_records = 1
+    cfg.error_calibration.model_version_policy = "current"
     old_records = [
         _atom_record(0, "C1", model_version=0, raw_atom=1.0, raw_total=1.0, pred=-1.0, truth=-3.0),
     ]
@@ -273,7 +294,11 @@ def test_load_calibration_model_for_acquisition_requires_apply_mode_and_records(
     cfg.error_calibration.mode = "record_only"
     model = build_calibration_model(synthetic_dry_records(iteration=1, models_version=0, n_points=4), cfg, iteration=1)
     write_calibration_model(tmp_path, model)
-    loaded, reason = load_calibration_model_for_acquisition(tmp_path, cfg)
+    loaded, reason = load_calibration_model_for_acquisition(
+        tmp_path,
+        cfg,
+        current_model_version=0,
+    )
     assert loaded is None
     assert reason == "record_only"
 
@@ -281,9 +306,14 @@ def test_load_calibration_model_for_acquisition_requires_apply_mode_and_records(
     cfg.error_calibration.apply_strength = 0.5
     cfg.error_calibration.min_records_to_apply = 2
     cfg.error_calibration.min_bin_records = 2
+    cfg.error_calibration.min_model_versions_to_apply = 1
     model = build_calibration_model(synthetic_dry_records(iteration=1, models_version=0, n_points=4), cfg, iteration=1)
     write_calibration_model(tmp_path, model)
-    loaded, reason = load_calibration_model_for_acquisition(tmp_path, cfg)
+    loaded, reason = load_calibration_model_for_acquisition(
+        tmp_path,
+        cfg,
+        current_model_version=0,
+    )
     assert reason == "loaded"
     assert loaded["usable_for_acquisition"] is True
     assert loaded["activation_reason"] == "usable"
@@ -400,3 +430,151 @@ def test_update_from_aimall_acceptance_joins_provenance_and_quality(tmp_path):
     assert audit_path(iter_dir).is_file()
     audit_payload = json.loads(audit_path(iter_dir).read_text())
     assert audit_payload["n_total_records"] == 1
+
+
+def test_total_calibration_excludes_incomplete_molecular_frames():
+    cfg = CampaignConfig()
+    cfg.error_calibration.min_bin_records = 1
+    incomplete = _atom_record(
+        0,
+        "C1",
+        raw_total=20.0,
+        frame_atoms=("C1", "H2"),
+    )
+
+    model = build_calibration_model(
+        [incomplete],
+        cfg,
+        iteration=1,
+        current_model_version=0,
+    )
+
+    assert model["n_records"] == 1
+    assert model["n_total_error_records"] == 0
+    assert model["tables"]["global_total"]["usable"] is False
+
+
+def test_record_retention_keeps_complete_frame_groups(tmp_path):
+    frame_atoms = ("C1", "H2")
+    records = [
+        _atom_record(point, atom, frame_atoms=frame_atoms)
+        for point in (0, 1)
+        for atom in frame_atoms
+    ]
+
+    retained, added, skipped = append_records(
+        tmp_path,
+        records,
+        max_records=3,
+    )
+
+    assert added == 4
+    assert skipped == 0
+    assert len(retained) == 2
+    assert {record["pointdir"] for record in retained} == {
+        "POINT_0001.pointdir"
+    }
+    assert {record["atom"] for record in retained} == set(frame_atoms)
+
+
+def test_rolling_calibration_normalises_each_model_uncertainty_axis():
+    cfg = CampaignConfig()
+    cfg.error_calibration.mode = "apply_to_acquisition"
+    cfg.error_calibration.apply_strength = 1.0
+    cfg.error_calibration.min_records_to_apply = 2
+    cfg.error_calibration.min_model_versions_to_apply = 2
+    cfg.error_calibration.min_bin_records = 1
+    first = _atom_record(
+        0,
+        "C1",
+        model_version=0,
+        raw_total=100.0,
+        pred=-1.0,
+        truth=-1.2,
+    )
+    second = _atom_record(
+        1,
+        "C1",
+        model_version=1,
+        raw_total=2.0,
+        pred=-1.0,
+        truth=-1.2,
+    )
+    first["iteration"] = 1
+    second["iteration"] = 2
+
+    model = build_calibration_model(
+        [first, second],
+        cfg,
+        iteration=2,
+        current_model_version=1,
+    )
+
+    assert model["model_version_policy"] == "rolling_normalised"
+    assert model["uncertainty_axis"] == "model_normalised"
+    assert model["model_uncertainty_normalisation"]["0"][
+        "raw_uncertainty_median"
+    ] == pytest.approx(100.0)
+    assert model["model_uncertainty_normalisation"]["1"][
+        "raw_uncertainty_median"
+    ] == pytest.approx(2.0)
+    assert model["contributing_model_versions"] == [0, 1]
+    assert model["usable_for_acquisition"] is True
+    assert lookup_calibrated_abs_error(
+        model,
+        4.0,
+        application_uncertainty_scale=4.0,
+    ) == pytest.approx(0.2)
+
+
+def test_calibration_excludes_records_from_other_aggressiveness_levels():
+    cfg = CampaignConfig()
+    cfg.error_calibration.min_bin_records = 1
+    matching = _record(0)
+    mismatching = _record(1)
+    mismatching["sampling_aggressiveness"] = 8
+
+    model = build_calibration_model(
+        [matching, mismatching],
+        cfg,
+        iteration=1,
+    )
+
+    assert model["n_records"] == 1
+    assert model["n_aggressiveness_mismatch_excluded"] == 1
+
+
+def test_current_policy_refuses_calibration_after_model_retraining(tmp_path):
+    cfg = CampaignConfig()
+    cfg.error_calibration.mode = "apply_to_acquisition"
+    cfg.error_calibration.apply_strength = 1.0
+    cfg.error_calibration.model_version_policy = "current"
+    cfg.error_calibration.min_records_to_apply = 1
+    cfg.error_calibration.min_bin_records = 1
+    model = build_calibration_model(
+        [_record(0)],
+        cfg,
+        iteration=1,
+        current_model_version=0,
+    )
+    write_calibration_model(tmp_path, model)
+
+    loaded, reason = load_calibration_model_for_acquisition(
+        tmp_path,
+        cfg,
+        current_model_version=1,
+    )
+
+    assert loaded is None
+    assert reason == "calibrated_model_version_mismatch"
+
+
+def test_synthetic_dry_records_use_campaign_aggressiveness():
+    records = synthetic_dry_records(
+        iteration=3,
+        models_version=2,
+        n_points=2,
+        sampling_aggressiveness=9,
+    )
+
+    assert {row["sampling_aggressiveness"] for row in records} == {9}

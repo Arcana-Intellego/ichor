@@ -26,8 +26,12 @@ PARTIAL_RECOVERY_PHASES = frozenset(
     {
         "INITIAL_GAUSSIAN",
         "INITIAL_AIMALL",
+        "INITIAL_REPLACEMENT_GAUSSIAN",
+        "INITIAL_REPLACEMENT_AIMALL",
         "GAUSSIAN",
         "AIMALL",
+        "REPLACEMENT_GAUSSIAN",
+        "REPLACEMENT_AIMALL",
         "ARIADNE_ARRAY",
     }
 )
@@ -52,8 +56,16 @@ def array_ledger_path(
 ) -> Path:
     phase = str(getattr(phase_name, "value", phase_name))
     safe_phase = phase.replace("/", "_").replace("\\", "_")
+    round_suffix = ""
+    if "REPLACEMENT" in phase:
+        replacement_round, _round_dir = _replacement_identity(
+            campaign_dir,
+            phase,
+            int(iteration),
+        )
+        round_suffix = "-r" + str(replacement_round).zfill(4)
     return array_recovery_dir(campaign_dir) / (
-        safe_phase + "-" + str(int(iteration)).zfill(6) + ".json"
+        safe_phase + "-" + str(int(iteration)).zfill(6) + round_suffix + ".json"
     )
 
 
@@ -64,11 +76,19 @@ def retry_task_file_path(
 ) -> Path:
     phase = str(getattr(phase_name, "value", phase_name))
     safe_phase = phase.replace("/", "_").replace("\\", "_")
+    round_suffix = ""
+    if "REPLACEMENT" in phase:
+        replacement_round, _round_dir = _replacement_identity(
+            campaign_dir,
+            phase,
+            int(iteration),
+        )
+        round_suffix = ".r" + str(replacement_round).zfill(4)
     return (
         Path(campaign_dir)
         / ".DATA"
         / "ACTIVE_LEARNING"
-        / (RETRY_TASKS_FILENAME_PREFIX + "." + safe_phase + "." + str(int(iteration)).zfill(6) + ".txt")
+        / (RETRY_TASKS_FILENAME_PREFIX + "." + safe_phase + "." + str(int(iteration)).zfill(6) + round_suffix + ".txt")
     )
 
 
@@ -83,7 +103,58 @@ def _sha_payload(payload: Dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def _replacement_identity(
+    campaign_dir: Union[str, Path],
+    phase_name: str,
+    iteration: int,
+) -> Tuple[int, Path]:
+    from ..point_allocation import (
+        pending_attempts,
+        point_allocation_path,
+        read_point_allocation,
+    )
+    from ..replacement_sampling import (
+        read_replacement_sample_strict,
+        replacement_round_dir,
+    )
+
+    context = "bootstrap" if str(phase_name).startswith("INITIAL_") else "active"
+    allocation_iteration = 0 if context == "bootstrap" else int(iteration)
+    allocation = read_point_allocation(
+        point_allocation_path(
+            campaign_dir,
+            context=context,
+            iteration=allocation_iteration,
+        )
+    )
+    rounds = {
+        int(attempt.get("round", -1)) for attempt in pending_attempts(allocation)
+    }
+    if len(rounds) != 1 or next(iter(rounds)) <= 0:
+        raise ValueError("replacement recovery cannot resolve one pending round")
+    replacement_round = next(iter(rounds))
+    read_replacement_sample_strict(
+        campaign_dir,
+        context=context,
+        iteration=allocation_iteration,
+        replacement_round=replacement_round,
+    )
+    return replacement_round, replacement_round_dir(
+        campaign_dir,
+        context=context,
+        iteration=allocation_iteration,
+        replacement_round=replacement_round,
+    )
+
+
 def _bucket_dir(campaign_dir: Union[str, Path], phase_name: str, iteration: int) -> Path:
+    if "REPLACEMENT" in str(phase_name):
+        _replacement_round, round_dir = _replacement_identity(
+            campaign_dir,
+            phase_name,
+            int(iteration),
+        )
+        return round_dir
     bucket = "initial" if str(phase_name).startswith("INITIAL_") else "iter_" + str(int(iteration))
     return Path(campaign_dir) / ".DATA" / "STAGING" / bucket
 
@@ -262,6 +333,11 @@ def scan_array_tasks(
         "schema_version": ARRAY_RECOVERY_SCHEMA_VERSION,
         "phase": phase,
         "iteration": int(iteration),
+        "replacement_round": (
+            _replacement_identity(campaign_dir, phase, int(iteration))[0]
+            if "REPLACEMENT" in phase
+            else 0
+        ),
         "updated_at_iso": _now_iso(),
         "force_resubmit": bool(force_resubmit),
         "logical_total": int(len(task_ids)),

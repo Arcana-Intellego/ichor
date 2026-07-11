@@ -9,8 +9,11 @@ from ichor.hpc.active_learning.acquisition.ariadne_runner import (
     AriadneRunConfig,
     _copy_atoms_with_coords,
     _landing_needs_under_move_retry,
+    _rank_landing_candidate,
     _select_safe_gradient_band_warm_start,
     _select_safe_landing,
+    _size_normalised_trust_radius,
+    _under_move_trust_feedback,
 )
 
 
@@ -334,3 +337,111 @@ def test_under_move_retry_reads_top_level_landing_candidates():
         safety_config=_safety(),
         run_config=AriadneRunConfig(),
     ) is True
+
+
+def test_safe_landing_rank_uses_full_total_without_hidden_reweighting():
+    high_information_lower_total = {
+        "alpha": 100.0,
+        "informativeness_score": 100.0,
+        "metrics": {"total_score": 5.0, "movement_band_score": 1.0},
+    }
+    lower_information_higher_total = {
+        "alpha": 1.0,
+        "informativeness_score": 1.0,
+        "metrics": {"total_score": 6.0, "movement_band_score": 0.0},
+    }
+
+    assert _rank_landing_candidate(lower_information_higher_total) > (
+        _rank_landing_candidate(high_information_lower_total)
+    )
+
+
+def _trust_acquisition(n_atoms, *, localised=False):
+    atoms = Atoms(
+        [Atom("H", float(index), 0.0, 0.0) for index in range(n_atoms)]
+    )
+    if localised:
+        basis = np.zeros((3 * n_atoms, 1), dtype=float)
+        basis[0, 0] = 1.0
+    else:
+        basis = np.eye(3 * n_atoms, dtype=float)
+    dimension = basis.shape[1]
+    subspace = LocalSubspace(
+        seed_atoms=atoms,
+        neighbours=[],
+        covariance=np.eye(3 * n_atoms),
+        basis=basis,
+        eigenvalues=np.ones(dimension),
+        mode_weights=np.ones(dimension) / float(dimension),
+        mass_vector=np.ones(3 * n_atoms),
+        active_covariance=np.eye(dimension),
+        neighbour_weights=np.array([]),
+    )
+    return SimpleNamespace(seed_atoms=atoms, subspace=subspace)
+
+
+def _trust_scale_model(n_atoms):
+    return {
+        "geometry_motion_scale": {"value_angstrom": 0.1},
+        "per_atom_mobility_scales": {
+            "values_angstrom": [0.1] * n_atoms,
+        },
+        "trust_radius_policy": {
+            "enabled": True,
+            "normalisation": "weighted_mobility_sqrt_effective_atoms",
+            "aggressiveness_multiplier": 1.5,
+            "max_to_initial_ratio": 4.0,
+            "under_move_feedback_min_factor": 1.0,
+            "under_move_feedback_max_factor": 2.0,
+        },
+    }
+
+
+def test_trust_radius_preserves_per_effective_atom_motion_across_system_sizes():
+    per_atom_trust = []
+    for n_atoms in (3, 30):
+        resolved, diagnostics = _size_normalised_trust_radius(
+            _trust_acquisition(n_atoms),
+            AriadneRunConfig(delta0=0.1, delta_max=0.4),
+            _trust_scale_model(n_atoms),
+        )
+        per_atom_trust.append(
+            resolved.delta0
+            / np.sqrt(diagnostics["n_effective_movement_atoms"])
+        )
+        assert resolved.delta_max == pytest.approx(4.0 * resolved.delta0)
+
+    assert per_atom_trust == pytest.approx([0.15, 0.15])
+
+
+def test_trust_radius_uses_active_atoms_not_total_molecule_size():
+    resolved, diagnostics = _size_normalised_trust_radius(
+        _trust_acquisition(40, localised=True),
+        AriadneRunConfig(delta0=0.1, delta_max=0.4),
+        _trust_scale_model(40),
+    )
+
+    assert diagnostics["n_atoms"] == 40
+    assert diagnostics["n_effective_movement_atoms"] == pytest.approx(1.0)
+    assert resolved.delta0 == pytest.approx(0.15)
+
+
+def test_under_move_trust_feedback_is_bounded_by_policy():
+    factor, diagnostics = _under_move_trust_feedback(
+        {
+            "landing_candidates": [
+                {
+                    "reasons": ["ariadne_landing_under_moved"],
+                    "metrics": {
+                        "movement_rmsd_ang": 0.1,
+                        "movement_band_peak_ang": 0.5,
+                    },
+                }
+            ]
+        },
+        {"weighted_per_atom_mobility_angstrom": 0.1},
+        _trust_scale_model(1),
+    )
+
+    assert factor == pytest.approx(2.0)
+    assert diagnostics["factor_bounds"] == [1.0, 2.0]

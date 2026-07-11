@@ -201,11 +201,11 @@ def _iteration_dir(campaign_dir: Union[str, Path], iteration: int) -> Path:
 
 
 def _profile_for(config: CampaignConfig) -> AggressivenessProfile:
-    level = int(config.sampling_protocol.sampling_aggressiveness)
+    level = int(config.campaign.sampling_aggressiveness)
     try:
         profile = _PROFILES[level]
     except KeyError as exc:
-        raise ValueError("sampling_protocol.sampling_aggressiveness must be in [1, 10]") from exc
+        raise ValueError("campaign.sampling_aggressiveness must be in [1, 10]") from exc
     preset = dict(_DIMENSIONLESS_PRESETS.get(level) or {})
     preset["max_scaled_whitened_distance"] = float(profile.max_whitened_distance)
     return replace(profile, **preset)
@@ -389,6 +389,29 @@ def _apply_scale_model_to_acquisition_config(
         movement_band=movement,
         fullspace_confinement=fullspace,
     )
+
+
+def _attach_trust_radius_policy(
+    scale_model_payload: Dict[str, Any],
+    profile: AggressivenessProfile,
+) -> Dict[str, Any]:
+    payload = dict(scale_model_payload)
+    payload["trust_radius_policy"] = {
+        "enabled": True,
+        "normalisation": "weighted_mobility_sqrt_effective_atoms",
+        "aggressiveness_multiplier": float(profile.movement_fraction_scale),
+        "profile_delta0_legacy_reference": float(profile.delta0),
+        "profile_delta_max_legacy_reference": float(profile.delta_max),
+        "max_to_initial_ratio": float(profile.delta_max)
+        / max(float(profile.delta0), 1.0e-12),
+        "under_move_feedback_min_factor": 1.0,
+        "under_move_feedback_max_factor": 2.0,
+        "formula": (
+            "trust0 = weighted_per_atom_mobility_angstrom * "
+            "sqrt(n_effective_movement_atoms) * aggressiveness_multiplier"
+        ),
+    }
+    return payload
 
 
 def _json_ready(value: Any) -> Any:
@@ -586,7 +609,7 @@ def _sampling_protocol_audit_payload(resolved: ResolvedSamplingProtocol) -> Dict
             "generated_at_iso": datetime.now(timezone.utc).isoformat(),
             "sampling_aggressiveness": int(resolved.sampling_aggressiveness),
             "public_user_surface": {
-                "editable_campaign_field": "sampling_protocol.sampling_aggressiveness",
+                "editable_campaign_field": "campaign.sampling_aggressiveness",
                 "hidden_low_level_blocks": list(_HIDDEN_TOP_LEVEL_BLOCKS),
             },
             "dimensionless_preset": dimensionless,
@@ -685,7 +708,7 @@ def resolve_sampling_protocol(
         sampling_scale_model_path,
     )
 
-    level = int(config.sampling_protocol.sampling_aggressiveness)
+    level = int(config.campaign.sampling_aggressiveness)
     profile = _profile_for(config)
     effective = _effective_campaign_config(config, profile)
     geometry_payload = ensure_geometry_novelty_scale(
@@ -701,6 +724,10 @@ def resolve_sampling_protocol(
         write_manifest=write_manifest,
     )
     scale_model_payload = dict(scale_model_payload)
+    scale_model_payload = _attach_trust_radius_policy(
+        scale_model_payload,
+        profile,
+    )
     scale_model_payload["dimensionless_preset"] = dimensionless_preset_payload(profile)
     diagnostics = dict(scale_model_payload.get("diagnostics") or {})
     diagnostics["size_independence_wave"] = 3
@@ -833,7 +860,7 @@ def load_sampling_protocol(
             "resolved sampling protocol geometry novelty scale is missing"
         )
 
-    level = int(config.sampling_protocol.sampling_aggressiveness)
+    level = int(config.campaign.sampling_aggressiveness)
     if int(protocol_payload.get("sampling_aggressiveness", -1)) != level:
         raise ValueError(
             "resolved sampling protocol aggressiveness does not match campaign config"
@@ -992,7 +1019,7 @@ def preview_sampling_protocol(
     )
     from .sampling_scale_model import build_sampling_scale_model
 
-    level = int(config.sampling_protocol.sampling_aggressiveness)
+    level = int(config.campaign.sampling_aggressiveness)
     profile = _profile_for(config)
     effective = _effective_campaign_config(config, profile)
     if geometry_scale_payload is None:
@@ -1013,6 +1040,10 @@ def preview_sampling_protocol(
         write_manifest=False,
     )
     scale_model_payload = dict(scale_model_payload)
+    scale_model_payload = _attach_trust_radius_policy(
+        scale_model_payload,
+        profile,
+    )
     scale_model_payload["dimensionless_preset"] = dimensionless_preset_payload(profile)
     diagnostics = dict(scale_model_payload.get("diagnostics") or {})
     diagnostics["size_independence_wave"] = 3

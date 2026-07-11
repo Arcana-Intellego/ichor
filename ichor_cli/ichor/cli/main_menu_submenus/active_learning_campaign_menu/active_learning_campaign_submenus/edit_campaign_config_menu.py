@@ -57,6 +57,7 @@ from ichor.hpc.active_learning.config import (
     VALID_GRADIENT_PARALLEL_BACKENDS,
     VALID_MODE_WEIGHTING_POLICIES,
     VALID_NEGATIVE_CURVATURE_POLICIES,
+    VALID_D_OPTIMAL_DEGENERATE_POLICIES,
     VALID_SEED_SELECTION_STRATEGIES,
     VALID_SIZE_NORMALISATION_BARRIER_MODES,
     VALID_SIZE_NORMALISATION_DISTANCE_MODES,
@@ -712,7 +713,7 @@ class EditCampaignConfigFunctions:
         print("Dense/internal diagnostic in-memory config snapshot")
         print(
             "Diagnostic view only: this includes internal and hidden fields. "
-            "Normal sampling control is sampling_protocol.sampling_aggressiveness; "
+            "Normal sampling control is campaign.sampling_aggressiveness; "
             "manual edits to derived lower-level fields may be rejected by the "
             "config lock after ARIADNE outputs exist."
         )
@@ -777,7 +778,7 @@ class EditCampaignConfigFunctions:
             "Wrote dense/internal diagnostic config snapshot to "
             + str(target)
             + ". Diagnostic view only: this file includes hidden fields; normal "
-            + "sampling control is sampling_protocol.sampling_aggressiveness."
+            + "sampling control is campaign.sampling_aggressiveness."
         )
         _pause()
 
@@ -860,14 +861,6 @@ class EditCampaignConfigFunctions:
     def edit_campaign_identity():
         _campaign_config.system_name = user_input_free_flow(
             "system_name: ", _campaign_config.system_name,
-        )
-        _sync_options_from_config()
-
-    @staticmethod
-    def edit_trajectory_pool():
-        _campaign_config.trajectory_pool.source_path = user_input_free_flow(
-            "trajectory_pool.source_path: ",
-            _campaign_config.trajectory_pool.source_path,
         )
         _sync_options_from_config()
 
@@ -1284,7 +1277,6 @@ def _unsupported_sequential_field_editor():
 
 for _legacy_editor_name in (
     "edit_campaign_identity",
-    "edit_trajectory_pool",
     "edit_iteration_control",
     "edit_resources",
     "edit_gaussian",
@@ -1321,19 +1313,24 @@ edit_campaign_config_menu = ConsoleMenu(
 
 
 _BLOCK_MENUS_BY_LABEL = {
-    "Edit campaign identity": _make_block_menu(
-        "Edit Campaign Identity",
-        "Campaign identity and campaign-length fields.",
+    "Edit campaign": _make_block_menu(
+        "Edit Campaign",
+        "Campaign identity, operator inputs, length, and sampling control.",
         [
             _read_only_spec("schema_version"),
             _spec("campaign.system_name", "str"),
             _spec("campaign.max_iterations", "int"),
+            _spec("campaign.source_path", "str"),
+            _spec("campaign.anchor_path", "str"),
+            _spec(
+                "campaign.sampling_aggressiveness",
+                "int",
+                prompt=(
+                    "campaign.sampling_aggressiveness "
+                    "(1 conservative, 5 balanced, 10 exploratory): "
+                ),
+            ),
         ],
-    ),
-    "Edit trajectory_pool": _make_block_menu(
-        "Edit trajectory_pool",
-        "Trajectory source used when importing the campaign pool.",
-        [_spec("trajectory_pool.source_path", "str")],
     ),
     "Edit point_allocation": _make_block_menu(
         "Edit Point Allocation",
@@ -1435,20 +1432,6 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("aimall.iasmesh", "choice", choices=sorted(VALID_AIMALL_IASMESH_VALUES)),
         ],
     ),
-    "Edit sampling_protocol": _make_block_menu(
-        "Edit sampling_protocol",
-        "High-level adversarial sampling aggressiveness.",
-        [
-            _spec(
-                "sampling_protocol.sampling_aggressiveness",
-                "int",
-                prompt=(
-                    "sampling_protocol.sampling_aggressiveness "
-                    "(1 conservative, 5 balanced, 10 exploratory): "
-                ),
-            ),
-        ],
-    ),
     "Edit seed_selection": _make_block_menu(
         "Edit seed_selection",
         "Seed count and uncertainty-evaluation controls.",
@@ -1461,6 +1444,11 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("seed_selection.d_optimal_jitter", "float"),
             _spec("seed_selection.d_optimal_novelty_floor", "float"),
             _spec("seed_selection.d_optimal_score_power", "float"),
+            _spec(
+                "seed_selection.d_optimal_degenerate_policy",
+                "choice",
+                choices=sorted(VALID_D_OPTIMAL_DEGENERATE_POLICIES),
+            ),
         ],
     ),
     "Edit anti_overlap": _make_block_menu(
@@ -1733,6 +1721,7 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("error_calibration.enabled", "bool"),
             _spec("error_calibration.mode", "choice", choices=sorted(VALID_ERROR_CALIBRATION_MODES)),
             _spec("error_calibration.min_records_to_apply", "int"),
+            _spec("error_calibration.min_model_versions_to_apply", "int"),
             _spec("error_calibration.n_bins", "int"),
             _spec("error_calibration.min_bin_records", "int"),
             _spec("error_calibration.max_records", "int"),
@@ -1743,6 +1732,7 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("error_calibration.group_by_atom_type", "bool"),
             _spec("error_calibration.group_by_landing_policy", "bool"),
             _spec("error_calibration.model_version_policy", "choice", choices=sorted(VALID_ERROR_CALIBRATION_MODEL_VERSION_POLICIES)),
+            _spec("error_calibration.aggressiveness_match_required", "bool"),
             _spec("error_calibration.output_units", "choice", choices=["ha"]),
         ],
     ),
@@ -1835,8 +1825,7 @@ edit_campaign_config_menu_items = [
     FunctionItem("Load from disk", EditCampaignConfigFunctions.load_from_disk),
     FunctionItem("Reset to defaults", EditCampaignConfigFunctions.reset_to_defaults),
     FunctionItem("Validate current config", EditCampaignConfigFunctions.validate_current_config),
-    _block_submenu_item("Edit campaign identity"),
-    _block_submenu_item("Edit trajectory_pool"),
+    _block_submenu_item("Edit campaign"),
     _block_submenu_item("Edit point_allocation"),
     _block_submenu_item("Edit resource defaults"),
     _block_submenu_item("Edit POLUS resources"),
@@ -1846,7 +1835,6 @@ edit_campaign_config_menu_items = [
     _block_submenu_item("Edit FEREBUS resources"),
     _block_submenu_item("Edit Gaussian block"),
     _block_submenu_item("Edit AIMAll block"),
-    _block_submenu_item("Edit sampling_protocol"),
     _block_submenu_item("Edit seed_selection"),
     _block_submenu_item("Edit anti_overlap"),
     _block_submenu_item("Edit phase_b"),

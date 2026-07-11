@@ -527,3 +527,38 @@ def test_daemon_persist_preserves_external_shutdown_request(tmp_path):
     stale_state.phase = CampaignPhase.PHASE_A_POLUS
     d._persist(stale_state)
     assert read_state(d.state_path()).shutdown_requested is True
+
+
+def test_submission_attempt_identity_changes_across_replacement_rounds(tmp_path):
+    from ichor.hpc.active_learning.daemon.submission_intent import (
+        INTENT_HISTORY_DIR_NAME,
+        intent_dir,
+        load_intent,
+        write_pre_submit_intent,
+    )
+
+    first = write_pre_submit_intent(
+        tmp_path,
+        campaign_uid="campaign-uid",
+        phase_name="REPLACEMENT_GAUSSIAN",
+        iteration=3,
+        replacement_round=1,
+    )
+    second = write_pre_submit_intent(
+        tmp_path,
+        campaign_uid="campaign-uid",
+        phase_name="REPLACEMENT_GAUSSIAN",
+        iteration=3,
+        replacement_round=2,
+    )
+
+    assert first["attempt_sequence"] == 1
+    assert second["attempt_sequence"] == 2
+    assert first["attempt_id"] != second["attempt_id"]
+    assert first["submission_identity"] != second["submission_identity"]
+    assert "-r0001-" in first["expected_job_name"]
+    assert "-r0002-" in second["expected_job_name"]
+    assert load_intent(tmp_path, "REPLACEMENT_GAUSSIAN", 3) == second
+    history = intent_dir(tmp_path) / INTENT_HISTORY_DIR_NAME
+    archived = list(history.glob("REPLACEMENT_GAUSSIAN-000003-*.json"))
+    assert len(archived) == 1

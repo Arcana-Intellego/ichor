@@ -1307,10 +1307,13 @@ final_checks() {
     local smoke_dir
     smoke_dir="$(mktemp -d)"
     cat > "${smoke_dir}/campaign.yaml" <<'EOF'
-schema_version: 9
+schema_version: 10
 campaign:
   system_name: INSTALLER_SMOKE
   max_iterations: 1
+  source_path: pool.xyz
+  anchor_path: anchor.xyz
+  sampling_aggressiveness: 5
 point_allocation:
   bootstrap_training_size: 8
   bootstrap_internal_validation_size: 2
@@ -1320,6 +1323,9 @@ point_allocation:
   anchor: false
 seed_selection:
   n_seeds_per_iteration: 8
+  bulk_fraction: 0.2
+  strategy: d_optimal
+  d_optimal_degenerate_policy: score_backfill
 EOF
     mkdir -p "${smoke_dir}/.DATA/TRAJECTORY"
     : > "${smoke_dir}/.DATA/TRAJECTORY/pool.xyz"

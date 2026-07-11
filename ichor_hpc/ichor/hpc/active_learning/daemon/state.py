@@ -306,6 +306,9 @@ class CampaignState:
         if last_n_anti_overlap_flagged < 0:
             raise StateSchemaError("last_n_anti_overlap_flagged must be >= 0")
         sacct_empty_streak = _coerce_sacct_empty_streak(payload)
+        shutdown_requested = payload.get("shutdown_requested", False)
+        if not isinstance(shutdown_requested, bool):
+            raise StateSchemaError("shutdown_requested must be a JSON boolean")
 
         return cls(
             iteration=iteration,
@@ -318,7 +321,7 @@ class CampaignState:
             replacement_round=replacement_round,
             last_acquisition_alpha0=None if alpha0 is None else float(alpha0),
             stop_streak=stop_streak,
-            shutdown_requested=bool(payload.get("shutdown_requested", False)),
+            shutdown_requested=shutdown_requested,
             reference_scales=payload.get("reference_scales"),
             reference_scales_iteration=reference_scales_iteration,
             alpha_history=_coerce_alpha_history(payload),

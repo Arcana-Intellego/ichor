@@ -333,8 +333,8 @@ def format_sampling_protocol_summary(
     lines = ["Sampling protocol summary:\n"]
     lines.append(
         _line(
-            "sampling_protocol.sampling_aggressiveness",
-            config.sampling_protocol.sampling_aggressiveness,
+            "campaign.sampling_aggressiveness",
+            config.campaign.sampling_aggressiveness,
         )
     )
     if resolved is None:
@@ -496,14 +496,28 @@ def format_sampling_protocol_summary(
         lines.append(
             _line(
                 "sampling_protocol.resolved_ariadne",
-                "delta0="
+                "legacy_profile_delta0="
                 + str(ariadne_run.delta0)
-                + ", delta_max="
+                + ", legacy_profile_delta_max="
                 + str(ariadne_run.delta_max)
                 + ", target_rms="
                 + str(ariadne_run.trqn_target_initial_grad_rms)
                 + ", under_move_target_rms="
                 + str(ariadne_run.trqn_under_move_target_initial_grad_rms),
+            )
+        )
+        trust_policy = scale_model.get("trust_radius_policy", {})
+        lines.append(
+            _line(
+                "sampling_protocol.size_normalised_trust_radius",
+                "enabled="
+                + str(trust_policy.get("enabled"))
+                + ", normalisation="
+                + str(trust_policy.get("normalisation"))
+                + ", aggressiveness_multiplier="
+                + str(trust_policy.get("aggressiveness_multiplier"))
+                + ", retry_factor_max="
+                + str(trust_policy.get("under_move_feedback_max_factor")),
             )
         )
         lines.append(
@@ -569,9 +583,11 @@ def format_sampling_protocol_summary(
             int(config.point_allocation.batch_total_size),
         )
     )
+    lines.append(_line("campaign.source_path", config.campaign.source_path))
+    lines.append(_line("campaign.anchor_path", config.campaign.anchor_path))
     lines.append(_line("point_allocation.anchor", config.point_allocation.anchor))
     if bool(getattr(config.point_allocation, "anchor", False)):
-        lines.append(_line("point_allocation.anchor_xyz", "anchor.xyz"))
+        lines.append(_line("point_allocation.anchor_xyz", config.campaign.anchor_path))
     lines.append(
         _line(
             "seed_selection.n_seeds_per_iteration",
@@ -595,7 +611,9 @@ def format_sampling_protocol_summary(
             "pool_multiplier="
             + str(seed.d_optimal_pool_multiplier)
             + ", score_power="
-            + str(seed.d_optimal_score_power),
+            + str(seed.d_optimal_score_power)
+            + ", degenerate_policy="
+            + str(seed.d_optimal_degenerate_policy),
         )
     )
     lines.append(_line("error_calibration.enabled", calib.enabled))
@@ -604,6 +622,18 @@ def format_sampling_protocol_summary(
     lines.append(_line("error_calibration.model_version_policy", calib.model_version_policy))
     lines.append(
         _line("error_calibration.min_records_to_apply", calib.min_records_to_apply)
+    )
+    lines.append(
+        _line(
+            "error_calibration.min_model_versions_to_apply",
+            calib.min_model_versions_to_apply,
+        )
+    )
+    lines.append(
+        _line(
+            "error_calibration.aggressiveness_match_required",
+            calib.aggressiveness_match_required,
+        )
     )
     lines.append(_line("error_calibration.max_records", calib.max_records))
     lines.append(

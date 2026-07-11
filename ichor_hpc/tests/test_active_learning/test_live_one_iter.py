@@ -15,6 +15,8 @@ Two flavours:
      test on a CSF4 worker proves the first real iteration completes.
 """
 import json
+import re
+from pathlib import Path
 
 import pytest
 
@@ -395,8 +397,9 @@ def _patch_ferebus_submit_for_live_smoke(monkeypatch, campaign_dir, call_log):
         calls["n"] += 1
         assert kwargs["overwrite_workdir"] is False
         assert kwargs["move_dataset_files"] is True
-        assert str(kwargs["expected_job_name"]).endswith(
-            "-" + phase_name + "-" + str(phase_iteration)
+        assert (
+            "-" + phase_name + "-" + str(phase_iteration) + "-"
+            in str(kwargs["expected_job_name"])
         )
         assert int(kwargs["expected_tasks"]) >= 1
         return FerebusSubmission(
@@ -552,6 +555,23 @@ def _live_smoke_seed_for_phase(campaign_dir, phase_name, iteration):
         _annotate_ariadne_fixture_results(campaign_dir, iteration)
 
 
+def _phase_iteration_from_script(script):
+    stem = Path(script).stem
+    attempt_match = re.fullmatch(
+        r"(?P<phase>.+)-(?P<iteration>\d+)-r\d{4}-a\d{4}-[0-9a-f]+",
+        stem,
+    )
+    if attempt_match is not None:
+        return (
+            attempt_match.group("phase"),
+            int(attempt_match.group("iteration")),
+        )
+    phase_name, separator, iteration_text = stem.rpartition("-")
+    if separator and iteration_text.isdigit():
+        return phase_name, int(iteration_text)
+    return stem, 0
+
+
 def _build_live_smoke_sbatch_runner(campaign_dir, call_log):
     """Return a callable suitable for LiveBackendsPhaseExecutor.sbatch_runner.
 
@@ -563,13 +583,7 @@ def _build_live_smoke_sbatch_runner(campaign_dir, call_log):
 
     def runner(cmd, **kwargs):
         script = Path(cmd[-1])
-        stem = script.stem  # e.g. "PHASE_A_POLUS-0"
-        try:
-            phase_name, _, iter_part = stem.rpartition("-")
-            iteration = int(iter_part)
-        except ValueError:
-            phase_name = stem
-            iteration = 0
+        phase_name, iteration = _phase_iteration_from_script(script)
         call_log.append((phase_name, iteration))
         _live_smoke_seed_for_phase(campaign_dir, phase_name, iteration)
         n = len(call_log)
@@ -760,13 +774,7 @@ def _build_no_wd_sbatch_runner(campaign_dir, call_log):
 
     def runner(cmd, **kwargs):
         script = Path(cmd[-1])
-        stem = script.stem
-        try:
-            phase_name, _, iter_part = stem.rpartition("-")
-            iteration = int(iter_part)
-        except ValueError:
-            phase_name = stem
-            iteration = 0
+        phase_name, iteration = _phase_iteration_from_script(script)
         call_log.append((phase_name, iteration))
         _live_smoke_seed_for_phase(campaign_dir, phase_name, iteration)
 
@@ -873,13 +881,7 @@ def _build_both_phase_b_sbatch_runner(campaign_dir, call_log):
 
     def runner(cmd, **kwargs):
         script = Path(cmd[-1])
-        stem = script.stem
-        try:
-            phase_name, _, iter_part = stem.rpartition("-")
-            iteration = int(iter_part)
-        except ValueError:
-            phase_name = stem
-            iteration = 0
+        phase_name, iteration = _phase_iteration_from_script(script)
         call_log.append((phase_name, iteration))
         _live_smoke_seed_for_phase(campaign_dir, phase_name, iteration)
 

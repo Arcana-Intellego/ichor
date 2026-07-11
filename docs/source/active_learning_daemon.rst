@@ -105,10 +105,14 @@ The :code:`campaign.yaml` file is a nested block layout. The full
 minimal sparse config overrides only the keys you care about; every other
 field falls back to its dataclass default::
 
-    schema_version: 9
+    schema_version: 10
 
     campaign:
+      system_name: CHANGE_ME_SYSTEM
       max_iterations: 50
+      source_path: pool.xyz
+      anchor_path: anchor.xyz
+      sampling_aggressiveness: 5
 
     runtime:
       poll_interval_seconds: 60
@@ -123,7 +127,9 @@ field falls back to its dataclass default::
 
     seed_selection:
       n_seeds_per_iteration: 20
-      bulk_fraction: 0.5
+      bulk_fraction: 0.2
+      strategy: d_optimal
+      d_optimal_degenerate_policy: score_backfill
 
     anti_overlap:
       skip_training_seeds: true
@@ -151,6 +157,12 @@ field falls back to its dataclass default::
       alpha0_streak_threshold: 1.0e-2
       alpha0_streak_length: 5
       min_iterations_before_stop: 8
+
+Schema 10 is intentionally strict. Older campaign files are rejected rather
+than migrated implicitly. ``source_path`` and ``anchor_path`` are operator
+inputs resolved relative to the campaign directory; ``init`` imports them
+into campaign-owned storage. ``sampling_aggressiveness`` is a dimensionless
+campaign control whose ARIADNE trust radius is normalised for molecular size.
 
 Use the :code:`ichor` CLI menu (Active-learning campaign -> Edit campaign
 config) to navigate the nested blocks interactively; every field has its

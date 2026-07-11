@@ -195,6 +195,70 @@ def test_expected_task_count_marks_missing_array_rows_pending():
     assert not summary.is_terminal
 
 
+def test_duplicate_identical_task_rows_do_not_fill_a_missing_task():
+    observations = [
+        JobObservation("777_0", JobStatus.COMPLETED, (0, 0), 90),
+        JobObservation("777_0", JobStatus.COMPLETED, (0, 0), 91),
+    ]
+
+    summary = aggregate_states("777", observations, expected_task_count=2)
+
+    assert summary.n_observed == 1
+    assert summary.n_missing == 1
+    assert summary.n_completed == 1
+    assert not summary.is_terminal
+    assert not summary.is_fully_successful
+
+
+def test_conflicting_duplicate_task_rows_are_inconclusive():
+    observations = [
+        JobObservation("777_0", JobStatus.COMPLETED, (0, 0), 90),
+        JobObservation("777_0", JobStatus.FAILED, (1, 0), 91),
+        JobObservation("777_1", JobStatus.COMPLETED, (0, 0), 92),
+    ]
+
+    summary = aggregate_states("777", observations, expected_task_count=2)
+
+    assert summary.n_observed == 2
+    assert summary.n_unknown == 1
+    assert summary.conflicting_task_indices == [0]
+    assert not summary.is_terminal
+    assert not summary.is_fully_successful
+
+
+def test_out_of_range_array_task_is_not_counted_as_expected_work():
+    observations = [
+        JobObservation("777_0", JobStatus.COMPLETED, (0, 0), 90),
+        JobObservation("777_2", JobStatus.COMPLETED, (0, 0), 91),
+    ]
+
+    summary = aggregate_states("777", observations, expected_task_count=2)
+
+    assert summary.n_observed == 1
+    assert summary.n_missing == 1
+    assert summary.n_unknown == 1
+    assert summary.out_of_range_task_indices == [2]
+    assert not summary.is_terminal
+
+
+def test_out_of_range_array_task_is_unknown_even_when_expected_rows_are_complete():
+    observations = [
+        JobObservation("777_0", JobStatus.COMPLETED, (0, 0), 90),
+        JobObservation("777_1", JobStatus.COMPLETED, (0, 0), 91),
+        JobObservation("777_2", JobStatus.COMPLETED, (0, 0), 92),
+    ]
+
+    summary = aggregate_states("777", observations, expected_task_count=2)
+
+    assert summary.n_observed == 2
+    assert summary.n_missing == 0
+    assert summary.n_pending_or_running == 0
+    assert summary.n_unknown == 1
+    assert summary.out_of_range_task_indices == [2]
+    assert not summary.is_terminal
+    assert not summary.is_fully_successful
+
+
 def test_poll_job_invokes_sacct_with_correct_flags():
     runner = _StubRunner(result=_StubResult(stdout="42|COMPLETED|0:0|00:00:01\n"))
     obs = poll_job("42", sacct_runner=runner)

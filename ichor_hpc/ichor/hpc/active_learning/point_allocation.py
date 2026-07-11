@@ -302,6 +302,7 @@ def _validate_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
     if not isinstance(reserve, list):
         raise ValueError("point-allocation reserve must be a list")
     attempt_candidate_ids: set[str] = set()
+    attempt_locations: Dict[str, Tuple[int, str, Dict[str, Any]]] = {}
     split_counts = {split: 0 for split in VALID_SPLITS}
     for index, slot in enumerate(slots):
         if not isinstance(slot, dict) or int(slot.get("slot_id", -1)) != index:
@@ -315,6 +316,7 @@ def _validate_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
             raise ValueError("point-allocation slot must contain at least one attempt")
         accepted_indexes = []
         pending_indexes = []
+        previous_round = -1
         for attempt_index, attempt in enumerate(attempts):
             if not isinstance(attempt, dict):
                 raise ValueError("point-allocation attempt must be an object")
@@ -329,8 +331,23 @@ def _validate_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
                 accepted_indexes.append(attempt_index)
             elif status == "pending":
                 pending_indexes.append(attempt_index)
-            if int(attempt.get("round", -1)) < 0:
+            attempt_round = int(attempt.get("round", -1))
+            if attempt_round < 0:
                 raise ValueError("point-allocation attempt round must be >= 0")
+            if attempt_index == 0 and attempt_round != 0:
+                raise ValueError("point-allocation primary attempt must be round zero")
+            if attempt_round <= previous_round:
+                raise ValueError(
+                    "point-allocation attempt rounds must increase strictly per slot"
+                )
+            if bool(attempt.get("mandatory_anchor", False)) and (
+                attempt_index != 0 or attempt_round != 0 or split != "train"
+            ):
+                raise ValueError(
+                    "mandatory anchor attempts must be round-zero training candidates"
+                )
+            previous_round = attempt_round
+            attempt_locations[candidate_id] = (index, split, attempt)
         if len(pending_indexes) > 1 or (
             pending_indexes and pending_indexes[0] != len(attempts) - 1
         ):
@@ -347,6 +364,7 @@ def _validate_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
             raise ValueError("accepted point-allocation attempt must be final")
     if split_counts != {split: int(targets[split]) for split in VALID_SPLITS}:
         raise ValueError("point-allocation slot split counts do not match targets")
+    consumed_ids: set[str] = set()
     for record in reserve:
         if not isinstance(record, dict):
             raise ValueError("point-allocation reserve record must be an object")
@@ -360,14 +378,50 @@ def _validate_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
             raise ValueError("consumed reserve candidate is not assigned to a slot")
         if status not in {"available", "consumed"}:
             raise ValueError("point-allocation reserve status is invalid")
+        if status == "consumed":
+            consumed_round = int(record.get("consumed_round", -1))
+            if consumed_round <= 0:
+                raise ValueError("consumed reserve candidate must record a positive round")
+            slot_id, split, attempt = attempt_locations[candidate_id]
+            if int(attempt.get("round", -1)) != consumed_round:
+                raise ValueError("consumed reserve round does not match its exact attempt")
+            if _immutable_candidate_payload(record) != _immutable_candidate_payload(attempt):
+                raise ValueError("consumed reserve payload does not match its exact attempt")
+            if int(slot_id) < 0 or split not in VALID_SPLITS:
+                raise ValueError("consumed reserve attempt has an invalid slot assignment")
+            consumed_ids.add(candidate_id)
     reserve_ids = [str(record.get("candidate_id")) for record in reserve]
     if len(set(reserve_ids)) != len(reserve_ids):
         raise ValueError("point-allocation reserve candidate IDs must be unique")
+    replacement_attempt_ids = {
+        candidate_id
+        for candidate_id, (_slot_id, _split, attempt) in attempt_locations.items()
+        if int(attempt.get("round", 0)) > 0
+    }
+    if replacement_attempt_ids != consumed_ids:
+        raise ValueError(
+            "point-allocation replacement attempts do not exactly match consumed reserve"
+        )
+    mandatory_failures = [
+        attempt
+        for _candidate_id, (_slot_id, split, attempt) in attempt_locations.items()
+        if bool(attempt.get("mandatory_anchor", False))
+        and str(attempt.get("status")) == "rejected"
+        and split == "train"
+    ]
+    mandatory_flag = data.get("mandatory_anchor_failed", False)
+    if not isinstance(mandatory_flag, bool):
+        raise ValueError("point-allocation mandatory_anchor_failed must be a boolean")
+    if bool(mandatory_flag) != bool(mandatory_failures):
+        raise ValueError("point-allocation mandatory-anchor failure flag is inconsistent")
     assignment_sha = str(data.get("slot_assignment_sha256") or "")
     expected_assignment_sha = slot_assignment_sha256(data)
     if assignment_sha != expected_assignment_sha:
         raise ValueError("point-allocation slot assignment SHA mismatch")
+    provided_summary = copy.deepcopy(data.get("summary"))
     _refresh_summary(data)
+    if provided_summary is not None and provided_summary != data["summary"]:
+        raise ValueError("point-allocation summary is inconsistent with allocation records")
     return data
 
 
@@ -601,6 +655,9 @@ def _mutate_manifest(path: Path, mutator, *, expected_generation: Optional[int] 
         updated = mutator(copy.deepcopy(payload))
         if updated == payload:
             return payload
+        # The mutator changes authoritative records. Recompute their derived
+        # summary during validation instead of comparing against the stale copy.
+        updated.pop("summary", None)
         updated["previous_generation_sha256"] = _generation_sha256(previous)
         updated["generation"] = generation + 1
         updated = _validate_payload(updated)

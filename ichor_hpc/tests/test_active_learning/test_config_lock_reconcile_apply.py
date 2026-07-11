@@ -414,7 +414,7 @@ def test_schema_v3_config_lock_is_rejected_without_compatibility_migration(tmp_p
     review = review_config_changes(campaign, current, fresh_campaign_state())
     assert not review.allowed
     assert [change.path for change in review.blocked_changes] == ["config_lock"]
-    assert "requires schema_version 9" in review.blocked_changes[0].reason
+    assert "requires schema_version 10" in review.blocked_changes[0].reason
 
 
 def test_retry_phase_requires_retryable_journal_event():
@@ -763,7 +763,7 @@ def test_sampling_aggressiveness_change_allowed_before_ariadne_outputs(tmp_path)
     original = CampaignConfig()
     write_config_lock(campaign, original)
     changed = CampaignConfig()
-    changed.sampling_protocol.sampling_aggressiveness = 6
+    changed.campaign.sampling_aggressiveness = 6
 
     proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.ARIADNE_ARRAY
@@ -772,7 +772,7 @@ def test_sampling_aggressiveness_change_allowed_before_ariadne_outputs(tmp_path)
 
     assert review.allowed
     assert [c.path for c in review.allowed_changes] == [
-        "sampling_protocol.sampling_aggressiveness"
+        "campaign.sampling_aggressiveness"
     ]
     assert not review.blocked_changes
 
@@ -782,7 +782,7 @@ def test_sampling_aggressiveness_change_blocks_after_protocol_manifest_exists(tm
     original = CampaignConfig()
     write_config_lock(campaign, original)
     changed = CampaignConfig()
-    changed.sampling_protocol.sampling_aggressiveness = 6
+    changed.campaign.sampling_aggressiveness = 6
     iter_dir = campaign / "ACTIVE_LEARNING" / "iteration-000001"
     (iter_dir / "protocol").mkdir(parents=True)
     (iter_dir / "protocol" / "SAMPLING_PROTOCOL_RESOLVED.json").write_text("{}", encoding="utf-8")
@@ -794,7 +794,7 @@ def test_sampling_aggressiveness_change_blocks_after_protocol_manifest_exists(tm
 
     assert not review.allowed
     assert [c.path for c in review.blocked_changes] == [
-        "sampling_protocol.sampling_aggressiveness"
+        "campaign.sampling_aggressiveness"
     ]
     assert review.blocked_changes[0].category == "postprocess_locked"
     assert "ARIADNE" in review.blocked_changes[0].reason
@@ -805,7 +805,7 @@ def test_sampling_aggressiveness_change_blocks_after_scale_model_exists(tmp_path
     original = CampaignConfig()
     write_config_lock(campaign, original)
     changed = CampaignConfig()
-    changed.sampling_protocol.sampling_aggressiveness = 6
+    changed.campaign.sampling_aggressiveness = 6
     iter_dir = campaign / "ACTIVE_LEARNING" / "iteration-000001"
     (iter_dir / "protocol").mkdir(parents=True)
     (iter_dir / "protocol" / "SAMPLING_SCALE_MODEL.json").write_text("{}", encoding="utf-8")
@@ -817,7 +817,7 @@ def test_sampling_aggressiveness_change_blocks_after_scale_model_exists(tmp_path
 
     assert not review.allowed
     assert [c.path for c in review.blocked_changes] == [
-        "sampling_protocol.sampling_aggressiveness"
+        "campaign.sampling_aggressiveness"
     ]
     assert review.blocked_changes[0].category == "postprocess_locked"
 
@@ -827,7 +827,7 @@ def test_sampling_aggressiveness_change_blocks_after_phase_b_selection_exists(tm
     original = CampaignConfig()
     write_config_lock(campaign, original)
     changed = CampaignConfig()
-    changed.sampling_protocol.sampling_aggressiveness = 6
+    changed.campaign.sampling_aggressiveness = 6
     iter_dir = campaign / "ACTIVE_LEARNING" / "iteration-000001"
     (iter_dir / "phase_b").mkdir(parents=True)
     (iter_dir / "phase_b" / "SELECTION.json").write_text("{}", encoding="utf-8")
@@ -839,7 +839,7 @@ def test_sampling_aggressiveness_change_blocks_after_phase_b_selection_exists(tm
 
     assert not review.allowed
     assert [c.path for c in review.blocked_changes] == [
-        "sampling_protocol.sampling_aggressiveness"
+        "campaign.sampling_aggressiveness"
     ]
     assert review.blocked_changes[0].category == "postprocess_locked"
     assert "Phase B" in review.blocked_changes[0].reason
@@ -944,13 +944,30 @@ def test_trajectory_pool_source_blocks_after_pool_import(tmp_path):
     original = CampaignConfig()
     write_config_lock(campaign, original)
     changed = CampaignConfig()
-    changed.trajectory_pool.source_path = "other_pool.xyz"
+    changed.campaign.source_path = "other_pool.xyz"
 
     review = review_config_changes(campaign, changed, fresh_campaign_state())
 
     assert not review.allowed
-    assert [c.path for c in review.blocked_changes] == ["trajectory_pool.source_path"]
+    assert [c.path for c in review.blocked_changes] == ["campaign.source_path"]
     assert "trajectory pool" in review.blocked_changes[0].reason
+
+
+def test_anchor_source_blocks_after_anchor_import(tmp_path):
+    campaign = _campaign(tmp_path)
+    canonical_anchor = campaign / ".DATA" / "TRAJECTORY" / "anchor.xyz"
+    canonical_anchor.parent.mkdir(parents=True, exist_ok=True)
+    canonical_anchor.write_text("1\nanchor\nH 0 0 0\n", encoding="utf-8")
+    original = CampaignConfig()
+    write_config_lock(campaign, original)
+    changed = CampaignConfig()
+    changed.campaign.anchor_path = "other_anchor.xyz"
+
+    review = review_config_changes(campaign, changed, fresh_campaign_state())
+
+    assert not review.allowed
+    assert [c.path for c in review.blocked_changes] == ["campaign.anchor_path"]
+    assert "bootstrap anchor" in review.blocked_changes[0].reason
 
 
 def test_bootstrap_size_blocks_after_phase_a_output(tmp_path):
@@ -1902,7 +1919,7 @@ def test_reconcile_apply_refuses_locked_config_change(tmp_path, capsys):
     original = CampaignConfig()
     write_config_lock(campaign, original)
     changed = CampaignConfig()
-    changed.trajectory_pool.source_path = "other_pool.xyz"
+    changed.campaign.source_path = "other_pool.xyz"
     _write_config(campaign, changed)
 
     rc = cmd_reconcile(
