@@ -60,6 +60,7 @@ def test_stop_check_streak_rule_fires(tmp_path):
     cfg.stop.min_iterations_before_stop = 0
     ex = DryRunPhaseExecutor(campaign_dir=tmp_path, config=cfg)
     state = fresh_campaign_state(max_iterations=20)
+    completion_reason = None
     for alpha in (0.04, 0.03, 0.02):
         state.last_acquisition_alpha0 = alpha
         state.iteration += 1
@@ -68,7 +69,9 @@ def test_stop_check_streak_rule_fires(tmp_path):
         updates = ex._inline_stop_check(state)
         state.alpha_history = updates["alpha_history"]
         state.shutdown_requested = bool(updates.get("shutdown_requested", False))
-    assert state.shutdown_requested is True
+        completion_reason = updates.get("campaign_completion_reason")
+    assert state.shutdown_requested is False
+    assert completion_reason == "alpha0_streak"
 
 
 def test_stop_check_streak_does_not_fire_above_threshold(tmp_path):
@@ -78,6 +81,7 @@ def test_stop_check_streak_does_not_fire_above_threshold(tmp_path):
     cfg.stop.min_iterations_before_stop = 0
     ex = DryRunPhaseExecutor(campaign_dir=tmp_path, config=cfg)
     state = fresh_campaign_state(max_iterations=20)
+    completion_reason = None
     # One iteration is over threshold; streak broken.
     for alpha in (0.04, 0.06, 0.02):
         state.last_acquisition_alpha0 = alpha
@@ -132,7 +136,9 @@ def test_stop_check_low_plateau_converges(tmp_path):
         updates = ex._inline_stop_check(state)
         state.alpha_history = updates["alpha_history"]
         state.shutdown_requested = bool(updates.get("shutdown_requested", False))
-    assert state.shutdown_requested is True
+        completion_reason = updates.get("campaign_completion_reason")
+    assert state.shutdown_requested is False
+    assert completion_reason == "rel_alpha_improvement_plateau"
 
 
 def test_stop_check_rising_alpha_does_not_converge(tmp_path):

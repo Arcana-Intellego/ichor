@@ -637,6 +637,7 @@ class RuntimeConfigBlock:
     poll_interval_seconds: int = 60
     poll_interval_idle_seconds: int = 120
     poll_sacct_empty_max_ticks: int = 10
+    poll_sacct_error_max_ticks: int = 10
     lease_stale_seconds: int = 900
     postprocess_settle_attempts: int = 3
     postprocess_settle_seconds: int = 10
@@ -1304,6 +1305,10 @@ class CampaignConfig:
             raise ConfigValidationError("runtime.poll_interval_idle_seconds must be >= 1")
         if self.runtime.poll_sacct_empty_max_ticks < 0:
             raise ConfigValidationError("runtime.poll_sacct_empty_max_ticks must be >= 0")
+        _validate_positive_int(
+            "runtime.poll_sacct_error_max_ticks",
+            self.runtime.poll_sacct_error_max_ticks,
+        )
         allocation = self.point_allocation
         for allocation_name in (
             "bootstrap_training_size",

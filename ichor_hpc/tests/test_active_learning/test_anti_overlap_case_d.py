@@ -207,11 +207,32 @@ def _write_ariadne_manifest(iter_dir):
         "accepted": accepted,
         "rejected": [],
     })
+    from ichor.hpc.active_learning.daemon.config_lock import (
+        canonical_config,
+        config_fingerprint,
+    )
+    from ichor.hpc.active_learning.handoff_manifests import (
+        write_ariadne_batch_decision,
+    )
+
+    campaign = iter_dir.parent.parent
+    config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+    write_ariadne_batch_decision(
+        iter_dir,
+        campaign_uid="test",
+        iteration=1,
+        config_sha256=config_fingerprint(canonical_config(config)),
+        failure_threshold_fraction=float(config.runtime.failure_threshold_fraction),
+        expected_n=len(accepted),
+        n_accepted=len(accepted),
+        n_rejected=0,
+        accepted=True,
+        reasons=[],
+    )
     from ichor.hpc.active_learning.sampling_protocol import (
         resolve_sampling_protocol,
     )
 
-    campaign = iter_dir.parent.parent
     resolve_sampling_protocol(
         campaign,
         CampaignConfig.from_yaml(campaign / "campaign.yaml"),

@@ -694,6 +694,12 @@ def format_sampling_protocol_summary(
     lines.append(_line("gaussian.basis_set", gaussian.basis_set))
     lines.append(
         _line(
+            "runtime.poll_sacct_error_max_ticks",
+            runtime.poll_sacct_error_max_ticks,
+        )
+    )
+    lines.append(
+        _line(
             "runtime.poll_sacct_missing_max_ticks",
             runtime.poll_sacct_missing_max_ticks,
         )

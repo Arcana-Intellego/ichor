@@ -44,6 +44,7 @@ from .daemon.daemon import (
 from .daemon.journal import KNOWN_EVENT_TYPES, iter_events, read_events
 from .daemon.config_lock import (
     apply_config_lock_update,
+    archive_ferebus_iteration_staging_for_retrain,
     archive_scripts_for_reconcile,
     archive_data_staging_for_ferebus_reentry,
     archive_data_staging_for_operator_reconcile,
@@ -71,6 +72,7 @@ from .daemon.live_executor import (
 )
 from .daemon.phase_executor import MockPhaseExecutor
 from .daemon.preflight import check_backends, missing_backend_message
+from .daemon.submitted_environment_smoke import run_submitted_environment_smoke
 from .daemon.recovery_contracts import (
     recovery_contract_status,
     staging_handoff_decisions,
@@ -98,6 +100,7 @@ from .daemon.state import (
     fresh_campaign_state,
     read_state,
     write_state,
+    make_lifecycle_context,
 )
 from .daemon.status_recommendations import (
     build_status_recommendations,
@@ -1299,6 +1302,26 @@ def _format_runtime_status(payload: Dict[str, Any], *, verbose: bool) -> List[st
     return _section("Runtime", rows)
 
 
+def _format_lifecycle_status(payload: Dict[str, Any]) -> List[str]:
+    context = payload.get("lifecycle_context")
+    if not isinstance(context, dict):
+        return []
+    rows: List[tuple[str, Any]] = [
+        ("disposition", context.get("disposition")),
+        ("reason code", context.get("reason_code")),
+        ("message", context.get("message")),
+        ("recorded from", str(context.get("from_phase")) + " iteration " + str(context.get("iteration"))),
+        ("recorded at", context.get("timestamp_iso")),
+    ]
+    if context.get("job_id"):
+        rows.append(("job id", context.get("job_id")))
+    if context.get("scheduler_uncertain"):
+        rows.append(("scheduler state", "uncertain; pending job identity preserved"))
+    if context.get("recovery_action"):
+        rows.append(("recovery action", context.get("recovery_action")))
+    return _section("Lifecycle", rows)
+
+
 def _iteration_summary(payload: Dict[str, Any]) -> str:
     return (
         str(payload.get("iteration"))
@@ -1337,6 +1360,7 @@ def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path
     )
     lines.append("")
     lines.extend(_format_runtime_status(payload, verbose=verbose))
+    lines.extend(_format_lifecycle_status(payload))
     partial_array = payload.get("partial_array_recovery")
     if isinstance(partial_array, dict):
         lines.append("")
@@ -1471,11 +1495,15 @@ def _event_phase(event: Dict[str, Any]) -> str:
 
 JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "campaign_started": "campaign started",
+    "campaign_completed": "campaign completed",
+    "campaign_reopened": "completed campaign reopened",
+    "scientific_convergence_reached": "scientific convergence reached",
     "phase_transition": "phase transition",
     "sbatch": "job submitted",
     "phase_succeeded": "phase completed",
     "phase_succeeded_live": "live phase accepted outputs",
     "sacct_error": "Slurm accounting error",
+    "sacct_error_timeout": "Slurm accounting error timeout",
     "shutdown_requested": "shutdown requested",
     "daemon_started": "daemon started",
     "daemon_stopped": "daemon stopped",
@@ -1538,6 +1566,8 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "submission_intent_expected_tasks_invalid": "expected task count invalid",
     "submission_intent_update_failed": "submission intent update failed",
     "submission_intent_read_failed": "submission intent read failed",
+    "submission_intent_completion_deferred": "intent completion persistence deferred",
+    "phase_completion_replayed": "phase completion replayed",
     "provenance_index_repaired": "provenance index repaired",
     "provenance_index_repair_failed": "provenance index repair failed",
     "postprocess_settle_retry": "waiting for filesystem visibility",
@@ -1576,13 +1606,13 @@ def _event_int(event: Dict[str, Any], key: str) -> Optional[int]:
 
 
 _JOURNAL_OK_EVENTS = {
+    "campaign_completed",
+    "scientific_convergence_reached",
     "phase_succeeded",
     "phase_succeeded_live",
     "reference_data_committed",
     "models_committed",
     "trajectory_pool_imported",
-    "quantum_quality_summary",
-    "ferebus_quality_summary",
     "error_calibration_summary",
 }
 
@@ -1604,6 +1634,10 @@ _JOURNAL_WAIT_EVENTS = {
 }
 
 _JOURNAL_WARN_EVENTS = {
+    "campaign_reopened",
+    "phase_completion_replayed",
+    "submission_intent_completion_deferred",
+    "sacct_error",
     "quantum_output_rejected",
     "ariadne_landing_rejected",
     "ariadne_optional_diagnostics_warning",
@@ -1621,6 +1655,7 @@ _JOURNAL_FAIL_EVENTS = {
     "sacct_empty_timeout",
     "sacct_missing_timeout",
     "sacct_unknown_timeout",
+    "sacct_error_timeout",
     "live_postprocess_refused",
     "error_calibration_failed",
     "job_adopt_check_failed",
@@ -1637,11 +1672,40 @@ def _journal_event_severity(event: Dict[str, Any]) -> str:
         return "WARN" if rejected is not None and rejected > 0 else "OK"
     if raw == "queue_lifecycle_update":
         status = str(event.get("status") or "").upper()
+        if status in {
+            "FAILED",
+            "FAILURE",
+            "CANCELLED",
+            "TIMEOUT",
+            "OUT_OF_MEMORY",
+            "NODE_FAIL",
+        }:
+            return "FAIL"
+        if status in {"SUCCEEDED", "SUCCESS", "COMPLETED"}:
+            return "OK"
         if status in _SQUEUE_PENDING_STATES:
             return "WAIT"
-        if status in _SQUEUE_RUNNING_STATES or status:
+        if status in _SQUEUE_RUNNING_STATES:
             return "RUN"
         return "INFO"
+    if raw == "failure_action":
+        action = str(event.get("action") or "").upper()
+        if action == "HALT":
+            return "FAIL"
+        if action in {"SCRUB", "RETRY", "CONTINUE"}:
+            return "WARN"
+        return "INFO"
+    if raw in {"quantum_quality_summary", "ferebus_quality_summary"}:
+        accepted = event.get("accepted")
+        rejected = _event_int(event, "n_rejected")
+        total = _event_int(event, "n_total")
+        if accepted is False or (
+            total is not None and total > 0 and rejected is not None and rejected >= total
+        ):
+            return "FAIL"
+        if rejected is not None and rejected > 0:
+            return "WARN"
+        return "OK"
     if raw in _JOURNAL_FAIL_EVENTS:
         return "FAIL"
     if raw in _JOURNAL_WARN_EVENTS:
@@ -1996,6 +2060,39 @@ def cmd_start(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 5
+        if state_for_lock.phase is CampaignPhase.HALTED:
+            context = state_for_lock.lifecycle_context or {}
+            print(
+                "campaign is HALTED"
+                + (
+                    ": " + str(context.get("message"))
+                    if context.get("message")
+                    else ""
+                ),
+                file=sys.stderr,
+            )
+            print(
+                "Run `ichor-al-daemon reconcile --campaign-dir "
+                + str(campaign)
+                + "` and apply only a validated recovery proposal.",
+                file=sys.stderr,
+            )
+            return 20
+        if state_for_lock.phase is CampaignPhase.DONE:
+            print(
+                "campaign is DONE; ordinary start cannot reopen a completed campaign. "
+                "Use resume --reopen-converged only after increasing "
+                "campaign.max_iterations.",
+                file=sys.stderr,
+            )
+            return 6
+        if state_for_lock.shutdown_requested:
+            print(
+                "campaign has an operator stop request; use `ichor-al-daemon resume` "
+                "rather than start so the stop is cleared explicitly.",
+                file=sys.stderr,
+            )
+            return 6
     if bool(getattr(args, "background", False)):
         return _launch_background_daemon(args, campaign)
     #Fix: --preset overlays the operator-supplied campaign.yaml on top of the
@@ -2098,8 +2195,13 @@ def cmd_start(args: argparse.Namespace) -> int:
     job_liveness_checker = None
     if getattr(args, "live", False):
         avail = check_backends()
-        if not avail.all_present:
-            print(missing_backend_message(avail), file=sys.stderr)
+        preflight = evaluate_campaign_preflight(
+            campaign,
+            config=config,
+            avail=avail,
+        )
+        if not bool(preflight.get("ready", False)):
+            print(_format_preflight(preflight, verbose=True), file=sys.stderr, end="")
             return 12
         try:
             executor = LiveBackendsPhaseExecutor(
@@ -2112,7 +2214,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         sacct_poller = None
         # live mode: let the daemon spot + adopt an orphaned in-flight job on (re)entry rather than
         # double-submitting after a crash or reconcile (A24/A25).
-        job_finder = make_live_job_finder(campaign_dir=campaign_dir)
+        job_finder = make_live_job_finder(campaign_dir=campaign)
         job_name_accounting_finder = make_live_job_accounting_finder()
         job_liveness_checker = make_live_job_liveness_checker()
     elif getattr(args, "dry_run", False):
@@ -2457,7 +2559,19 @@ def cmd_stop(args: argparse.Namespace) -> int:
             return 10 if cancel_summary.get("failed") else 0
         print("state.json invalid: " + str(exc), file=sys.stderr)
         return 5
+    stopped_from_phase = state.phase
     state.shutdown_requested = True
+    state.lifecycle_context = make_lifecycle_context(
+        disposition="stopped",
+        reason_code="operator_stop_request",
+        message="operator requested an orderly campaign stop",
+        from_phase=stopped_from_phase,
+        iteration=int(state.iteration),
+        source="cli_stop",
+        scheduler_uncertain=any(bool(value) for value in state.pending_jobs.values()),
+        recovery_action="use resume to continue from the recorded phase",
+        details={"cancel_jobs_requested": bool(getattr(args, "cancel_jobs", False))},
+    )
     cancel_summary = None
     if bool(getattr(args, "cancel_jobs", False)):
         cancel_summary = _cancel_recorded_slurm_jobs(campaign, state)
@@ -2799,8 +2913,89 @@ def cmd_resume(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 6
-        if state.shutdown_requested:
+        if state.phase is CampaignPhase.DONE:
+            if not bool(getattr(args, "reopen_converged", False)):
+                print(
+                    "campaign is DONE; rerun resume with --reopen-converged "
+                    "only after deliberately increasing campaign.max_iterations",
+                    file=sys.stderr,
+                )
+                return 6
+            config_path = (
+                Path(args.config).expanduser().resolve()
+                if getattr(args, "config", None)
+                else campaign / "campaign.yaml"
+            )
+            try:
+                config = CampaignConfig.from_yaml(config_path)
+            except Exception as exc:
+                print("campaign config could not be loaded: " + str(exc), file=sys.stderr)
+                return 2
+            try:
+                lock_review = assert_config_unchanged_for_start(
+                    campaign,
+                    config,
+                    state,
+                )
+            except Exception as exc:
+                print("config lock check failed: " + str(exc), file=sys.stderr)
+                return 7
+            if lock_review.changed:
+                print(
+                    "campaign.yaml changed since the config lock was written; "
+                    "run reconcile --apply before reopening a completed campaign",
+                    file=sys.stderr,
+                )
+                formatted = format_config_review(lock_review)
+                if formatted:
+                    print(formatted, file=sys.stderr)
+                return 7
+            configured_max = int(config.campaign.max_iterations)
+            if configured_max <= int(state.iteration):
+                print(
+                    "--reopen-converged requires campaign.max_iterations greater "
+                    "than the completed iteration ("
+                    + str(int(state.iteration))
+                    + ")",
+                    file=sys.stderr,
+                )
+                return 6
+            completed_iteration = int(state.iteration)
+            state.phase = CampaignPhase.SEED_SELECT
+            state.iteration = completed_iteration + 1
+            state.max_iterations = configured_max
             state.shutdown_requested = False
+            state.lifecycle_context = None
+            state.last_completion_receipt = None
+            write_state(state_path, state)
+            try:
+                from .daemon.journal import append_event
+
+                append_event(
+                    _campaign_paths(campaign)["journal"],
+                    "campaign_reopened",
+                    completed_iteration=completed_iteration,
+                    next_iteration=int(state.iteration),
+                    max_iterations=configured_max,
+                    explicit_reopen=True,
+                )
+            except Exception:
+                pass
+            print(
+                "reopened completed campaign at SEED_SELECT iteration "
+                + str(int(state.iteration))
+            )
+        if state.shutdown_requested:
+            context = state.lifecycle_context or {}
+            if context and str(context.get("disposition") or "") != "stopped":
+                print(
+                    "shutdown_requested is not recorded as an operator stop; "
+                    "run reconcile before resuming",
+                    file=sys.stderr,
+                )
+                return 6
+            state.shutdown_requested = False
+            state.lifecycle_context = None
             write_state(state_path, state)
             print("shutdown_requested=false set in " + str(state_path))
     return cmd_start(args)
@@ -2926,6 +3121,17 @@ def _resolve_terminal_submission_intents_for_apply(
                     )
                 except (TypeError, ValueError):
                     expected_tasks = None
+                if expected_tasks is None:
+                    from .daemon.scheduler_contracts import (
+                        infer_expected_tasks_from_artifacts,
+                    )
+
+                    expected_tasks = infer_expected_tasks_from_artifacts(
+                        campaign,
+                        phase=phase,
+                        iteration=int(iteration),
+                        replacement_round=int(intent.get("replacement_round", 0) or 0),
+                    )
                 lookup = sacct_poll.find_accounted_job_by_name_detailed(
                     expected_job_name,
                     expected_task_count=expected_tasks,
@@ -4059,6 +4265,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     archive_existing_array_outputs = bool(
         getattr(args, "archive_existing_array_task_outputs", False)
     )
+    retrain_ferebus = bool(getattr(args, "retrain_ferebus", False))
     campaign = resolve_campaign_dir(
         args.campaign_dir,
         require_campaign_yaml=False,
@@ -4095,6 +4302,13 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         print(
             "refusing --archive-existing-array-task-outputs without "
             "--force-resubmit-array-tasks",
+            file=sys.stderr,
+        )
+        return 2
+    if retrain_ferebus and not bool(getattr(args, "apply", False)):
+        print(
+            "refusing --retrain-ferebus without --apply; complete model "
+            "output is archived before a new fit is submitted",
             file=sys.stderr,
         )
         return 2
@@ -4188,6 +4402,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 report.proposed_state,
                 initialise_missing=False,
                 force_resubmit_array_phase=force_phase,
+                force_retrain_ferebus=retrain_ferebus,
             )
         except Exception as exc:
             if bool(getattr(args, "apply", False)):
@@ -4321,6 +4536,16 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         print("refusing --apply because campaign.yaml has locked changes", file=sys.stderr)
         print(format_config_review(config_review), file=sys.stderr)
         return 8
+    if retrain_ferebus and report.proposed_state.phase not in (
+        CampaignPhase.INITIAL_FEREBUS,
+        CampaignPhase.FEREBUS,
+    ):
+        print(
+            "refusing --retrain-ferebus because reconcile did not select a "
+            "FEREBUS recovery phase",
+            file=sys.stderr,
+        )
+        return 9
     partial_array = getattr(report, "partial_array_recovery", None)
     force_array_phase = report.proposed_state.phase
     force_array_iteration = int(report.proposed_state.iteration)
@@ -4430,6 +4655,24 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         )
         print("")
 
+    ferebus_retrain_archive: List[str] = []
+    if retrain_ferebus:
+        try:
+            archived_ferebus = archive_ferebus_iteration_staging_for_retrain(
+                campaign,
+                report.proposed_state,
+            )
+        except Exception as exc:
+            print(
+                "could not archive FEREBUS staging for retraining: " + str(exc),
+                file=sys.stderr,
+            )
+            return 9
+        if archived_ferebus is not None:
+            ferebus_retrain_archive.append(str(archived_ferebus))
+            print("Archived FEREBUS output for explicit retraining:")
+            print("  - " + str(archived_ferebus))
+
     original_report = report
     archived_array_outputs: List[str] = []
     if force_resubmit_array and isinstance(partial_array, dict):
@@ -4486,6 +4729,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         + list(archived)
         + list(removed_model_staging)
         + list(archived_reference_data_staging)
+        + list(ferebus_retrain_archive)
         + list(removed)
     )
 
@@ -4504,6 +4748,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                     config,
                     report.proposed_state,
                     initialise_missing=False,
+                    force_retrain_ferebus=retrain_ferebus,
                 )
             except Exception as exc:
                 print("campaign config could not be reviewed: " + str(exc), file=sys.stderr)
@@ -5270,11 +5515,14 @@ def _preflight_payload(
     avail: Any,
     config_summary: Dict[str, Any],
     feasibility_summary: Dict[str, Any],
+    state_summary: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     backend_payload = asdict(avail)
     config_ok = bool(config_summary.get("ok", False))
     feasibility_ok = bool(feasibility_summary.get("ok", False))
-    ready = bool(avail.all_present and config_ok and feasibility_ok)
+    state_payload = dict(state_summary or {"ok": True})
+    state_ok = bool(state_payload.get("ok", False))
+    ready = bool(avail.all_present and config_ok and feasibility_ok and state_ok)
     payload: Dict[str, Any] = dict(backend_payload)
     payload.update(
         {
@@ -5283,6 +5531,7 @@ def _preflight_payload(
             "backend_availability": backend_payload,
             "campaign_config": dict(config_summary),
             "pool_feasibility": dict(feasibility_summary),
+            "campaign_state": state_payload,
             "all_backends_present": bool(avail.all_present),
             "ready": ready,
             "missing_backends": list(avail.missing),
@@ -5321,11 +5570,17 @@ def _preflight_failure_details(payload: Dict[str, Any]) -> List[str]:
             elif name == "ferebus":
                 details.append("configure or install the FEREBUS executable")
             elif name == "ariadne":
-                details.append("install/build the ariadne Python module in the active venv")
+                details.append(
+                    "install/build ariadne in the configured submitted Python venv"
+                )
             elif name == "polus_rs":
-                details.append("install POLUS so polus.samplers.RS.randomSampling imports")
+                details.append(
+                    "install POLUS in the configured submitted Python venv"
+                )
             elif name == "pyferebus":
-                details.append("install pyferebus in the active venv")
+                details.append(
+                    "install pyferebus in the configured submitted Python venv"
+                )
     config = payload.get("campaign_config")
     if isinstance(config, dict) and not bool(config.get("ok", False)):
         details.append(
@@ -5336,6 +5591,18 @@ def _preflight_failure_details(payload: Dict[str, Any]) -> List[str]:
         details.append(
             "fix trajectory pool feasibility: "
             + str(pool.get("error") or pool.get("expression") or "pool is not usable")
+        )
+    state = payload.get("campaign_state")
+    if isinstance(state, dict) and not bool(state.get("ok", False)):
+        details.append(
+            "fix campaign state readiness: "
+            + str(state.get("error") or state.get("phase") or "state is not runnable")
+        )
+    submitted_smoke = payload.get("submitted_environment_smoke")
+    if isinstance(submitted_smoke, dict) and not bool(submitted_smoke.get("ok", False)):
+        details.append(
+            "fix submitted environment smoke: "
+            + str(submitted_smoke.get("error") or "submitted job did not verify its runtime")
         )
     return details
 
@@ -5350,6 +5617,9 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
     pool = payload.get("pool_feasibility")
     if not isinstance(pool, dict):
         pool = {}
+    state = payload.get("campaign_state")
+    if not isinstance(state, dict):
+        state = {}
 
     lines: List[str] = []
     lines.extend(
@@ -5387,18 +5657,75 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
             warn=not bool(avail.get("batch_python")),
         )
     )
-    lines.append(_preflight_check_line("ariadne", avail.get("ariadne"), "importable" if avail.get("ariadne") else "not importable"))
-    lines.append(_preflight_check_line("POLUS RS", avail.get("polus_rs"), "importable" if avail.get("polus_rs") else "not importable"))
-    lines.append(_preflight_check_line("pyferebus", avail.get("pyferebus"), "importable" if avail.get("pyferebus") else "not importable"))
+    runtime_modules = avail.get("batch_runtime_modules")
+    if isinstance(runtime_modules, (list, tuple)):
+        lines.append(
+            "  submitted module stack: "
+            + (", ".join(str(value) for value in runtime_modules) or "<none>")
+        )
+    lines.append(
+        _preflight_check_line(
+            "ariadne",
+            avail.get("ariadne"),
+            "importable in submitted environment"
+            if avail.get("ariadne")
+            else avail.get("ariadne_probe_error") or "not importable",
+        )
+    )
+    lines.append(
+        _preflight_check_line(
+            "POLUS RS",
+            avail.get("polus_rs"),
+            "importable in submitted environment"
+            if avail.get("polus_rs")
+            else avail.get("polus_rs_probe_error") or "not importable",
+        )
+    )
+    lines.append(
+        _preflight_check_line(
+            "pyferebus",
+            avail.get("pyferebus"),
+            "importable in submitted environment"
+            if avail.get("pyferebus")
+            else avail.get("pyferebus_probe_error") or "not importable",
+        )
+    )
 
     lines.append("")
     lines.append("Quantum Backends")
-    lines.append(_preflight_check_line("Gaussian", avail.get("gaussian"), avail.get("gaussian_binary") or "not configured"))
+    lines.append(
+        _preflight_check_line(
+            "Gaussian submitted environment",
+            avail.get("gaussian_verified"),
+            avail.get("gaussian_binary")
+            or avail.get("gaussian_probe_error")
+            or "not configured",
+        )
+    )
     lines.append(_preflight_check_line("AIMAll", avail.get("aimall"), avail.get("aimall_path") or "not found"))
 
     lines.append("")
     lines.append("FEREBUS")
     lines.append(_preflight_check_line("executable", avail.get("ferebus"), avail.get("ferebus_path") or "not found"))
+
+    submitted_smoke = payload.get("submitted_environment_smoke")
+    if isinstance(submitted_smoke, dict):
+        lines.append("")
+        lines.append("Submitted Environment Smoke")
+        smoke_detail = (
+            "job " + str(submitted_smoke.get("job_id"))
+            if submitted_smoke.get("job_id")
+            else str(submitted_smoke.get("error") or "not submitted")
+        )
+        lines.append(
+            _preflight_check_line(
+                "compute-node runtime",
+                submitted_smoke.get("ok"),
+                smoke_detail,
+            )
+        )
+        if submitted_smoke.get("output_path"):
+            lines.append("  output: " + str(submitted_smoke.get("output_path")))
 
     lines.append("")
     lines.append("Campaign Config")
@@ -5416,6 +5743,23 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
                 config.get("error") or "not readable",
             )
         )
+
+    lines.append("")
+    lines.append("Campaign State")
+    lines.append(
+        _preflight_check_line(
+            "runnable state",
+            state.get("ok"),
+            state.get("error")
+            or (
+                str(state.get("phase"))
+                + " iteration "
+                + str(state.get("iteration"))
+            ),
+        )
+    )
+    if state.get("contract_error"):
+        lines.append("  contract error: " + str(state.get("contract_error")))
 
     lines.append("")
     lines.append("Trajectory Pool")
@@ -5476,11 +5820,19 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
     return "\n".join(lines) + "\n"
 
 
-def cmd_preflight(args: argparse.Namespace) -> int:
-    campaign = resolve_campaign_dir(getattr(args, "campaign_dir", None))
-    avail = check_backends()
-    config_summary: Dict[str, Any] = {}
-    feasibility_summary: Dict[str, Any] = {}
+def evaluate_campaign_preflight(
+    campaign: Path,
+    *,
+    config: Optional[CampaignConfig] = None,
+    avail: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Return the one authoritative campaign-aware live readiness result."""
+    campaign = Path(campaign).expanduser().resolve()
+    availability = check_backends() if avail is None else avail
+    config_summary: Dict[str, Any]
+    feasibility_summary: Dict[str, Any]
+    state_summary: Dict[str, Any]
+    loaded_config = config
     try:
         from .layout import (
             reject_legacy_campaign_layout,
@@ -5497,11 +5849,12 @@ def cmd_preflight(args: argparse.Namespace) -> int:
         reference_versions.current_version()
         model_versions.list_committed_versions()
         model_versions.current_version()
-        config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+        if loaded_config is None:
+            loaded_config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
         config_summary = {
             "ok": True,
-            "schema_version": int(config.schema_version),
-            "system_name": str(config.campaign.system_name),
+            "schema_version": int(loaded_config.schema_version),
+            "system_name": str(loaded_config.campaign.system_name),
         }
     except Exception as exc:
         config_summary = {
@@ -5517,13 +5870,96 @@ def cmd_preflight(args: argparse.Namespace) -> int:
         }
     else:
         try:
-            feasibility_summary = _pool_feasibility_summary(campaign, config)
+            feasibility_summary = _pool_feasibility_summary(campaign, loaded_config)
         except Exception as exc:
             feasibility_summary = {
                 "ok": False,
                 "error": type(exc).__name__ + ": " + str(exc),
             }
-    payload = _preflight_payload(campaign, avail, config_summary, feasibility_summary)
+
+    state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
+    if not state_path.is_file():
+        state_summary = {
+            "ok": False,
+            "error": "state.json is missing; initialise the campaign before live start",
+        }
+    else:
+        try:
+            state = read_state(state_path)
+            if state.phase is CampaignPhase.HALTED:
+                raise ValueError("campaign is HALTED and requires reconcile")
+            if state.phase is CampaignPhase.DONE:
+                raise ValueError("campaign is DONE")
+            if state.shutdown_requested:
+                raise ValueError("campaign has an operator stop request")
+            from .daemon.artifact_contracts import state_artifact_contract_status
+
+            contract = state_artifact_contract_status(campaign, state)
+            if not bool(contract.get("ok", False)):
+                raise ValueError(str(contract.get("error") or "artefact contract invalid"))
+            if loaded_config is not None:
+                review = review_config_changes(
+                    campaign,
+                    loaded_config,
+                    state,
+                    initialise_missing=False,
+                )
+                if review.changed:
+                    raise ValueError("campaign config differs from its lock")
+            state_summary = {
+                "ok": True,
+                "phase": state.phase.value,
+                "iteration": int(state.iteration),
+            }
+        except Exception as exc:
+            state_summary = {
+                "ok": False,
+                "error": type(exc).__name__ + ": " + str(exc),
+            }
+    return _preflight_payload(
+        campaign,
+        availability,
+        config_summary,
+        feasibility_summary,
+        state_summary,
+    )
+
+
+def cmd_preflight(args: argparse.Namespace) -> int:
+    campaign = resolve_campaign_dir(getattr(args, "campaign_dir", None))
+    availability = check_backends()
+    payload = evaluate_campaign_preflight(campaign, avail=availability)
+    if bool(getattr(args, "submit_environment_smoke", False)):
+        if bool(payload.get("ready", False)):
+            try:
+                config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+                smoke = run_submitted_environment_smoke(
+                    campaign_dir=campaign,
+                    config=config,
+                    availability=availability,
+                )
+            except Exception as exc:
+                smoke = {
+                    "schema_version": 1,
+                    "submitted": False,
+                    "ok": False,
+                    "job_id": "",
+                    "output_path": "",
+                    "error": type(exc).__name__ + ": " + str(exc),
+                }
+        else:
+            smoke = {
+                "schema_version": 1,
+                "submitted": False,
+                "ok": False,
+                "job_id": "",
+                "output_path": "",
+                "error": "ordinary campaign preflight is blocked; no job was submitted",
+            }
+        payload["submitted_environment_smoke"] = smoke
+        payload["ready"] = bool(payload.get("ready", False)) and bool(
+            smoke.get("ok", False)
+        )
     if bool(getattr(args, "json", False)):
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
@@ -5722,6 +6158,14 @@ Examples:
     p_resume.add_argument("-p", "--poll-interval", type=int, default=None)
     p_resume.add_argument("-t", "--max-ticks", type=int, default=None)
     p_resume.add_argument("-P", "--preset", default=None)
+    p_resume.add_argument(
+        "--reopen-converged",
+        action="store_true",
+        help=(
+            "Explicitly reopen a DONE campaign at the next SEED_SELECT after "
+            "campaign.max_iterations has been increased."
+        ),
+    )
     add_background_options(p_resume)
     p_resume.set_defaults(func=cmd_resume)
 
@@ -5739,8 +6183,9 @@ Examples:
         "--allow-fresh-init",
         action="store_true",
         help=(
-            "Allow reconcile to propose INIT even when non-state campaign "
-            "artifacts are present. Default is conservative HALTED/adoption-ready recovery."
+            "Allow reconcile to propose INIT over non-state campaign artefacts "
+            "only when campaign identity remains trusted. This never permits "
+            "minting a replacement UID for a non-empty campaign."
         ),
     )
     p_recon.add_argument(
@@ -5805,6 +6250,16 @@ Examples:
             "With --apply --force-resubmit-array-tasks, move existing "
             "daemon-owned task output files to an archive before the full "
             "array is resubmitted."
+        ),
+    )
+    p_recon.add_argument(
+        "--retrain-ferebus",
+        action="store_true",
+        help=(
+            "With --apply in a FEREBUS recovery phase, losslessly archive "
+            "complete uncommitted FEREBUS output and submit a new fit. "
+            "Without this flag, threshold-only changes re-evaluate the "
+            "existing immutable quality evidence."
         ),
     )
     p_recon.set_defaults(func=cmd_reconcile)
@@ -5959,6 +6414,15 @@ Examples:
         "--verbose",
         action="store_true",
         help="Include detailed backend guidance for failed checks.",
+    )
+    p_pre.add_argument(
+        "--submit-environment-smoke",
+        action="store_true",
+        help=(
+            "After ordinary preflight passes, submit one five-minute, one-core "
+            "Slurm job that verifies the compute-node module, Python-import, "
+            "and executable environment without running scientific work."
+        ),
     )
     p_pre.set_defaults(func=cmd_preflight)
 

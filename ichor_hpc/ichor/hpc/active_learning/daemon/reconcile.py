@@ -13,7 +13,9 @@ daemon.
 """
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
+import json
 from pathlib import Path
 import shutil
 from typing import Any, Dict, List, Optional, Union
@@ -55,6 +57,7 @@ from .state import (
     DEFAULT_STATE_FILENAME,
     StateSchemaError,
     fresh_campaign_state,
+    make_lifecycle_context,
     read_state,
     atomic_write_text,
     write_state,
@@ -504,6 +507,7 @@ def _read_bootstrap_handoff_at(
         "n_total": int(manifest.get("n_total", len(pointdirs))),
         "accepted_count": len(pointdirs),
         "archived": bool(archived),
+        "campaign_uid": str(manifest.get("campaign_uid") or ""),
     }
 
 
@@ -561,6 +565,7 @@ def _find_phase_a_handoff(campaign_dir: Union[str, Path]) -> Optional[Dict[str, 
         "n_select": int(manifest.get("n_select", 0)),
         "sample_xyz": str(manifest.get("sample_xyz", "")),
         "index_path": str(manifest.get("index_path", "")),
+        "campaign_uid": str(manifest.get("campaign_uid") or ""),
     }
 
 
@@ -646,6 +651,82 @@ def restore_archived_bootstrap_handoff(
             shutil.rmtree(str(target), ignore_errors=False)
         raise
     return [str(target)]
+
+
+def _trusted_campaign_uid_sources(
+    campaign: Path,
+    *,
+    reference_data_dir_name: str,
+    models_dir_name: str,
+    valid_reference_data_versions: List[int],
+    valid_model_versions: List[int],
+    bootstrap_handoff: Optional[Dict[str, Any]],
+    phase_a_handoff: Optional[Dict[str, Any]],
+) -> List[Dict[str, str]]:
+    """Collect campaign identities only from independently validated artefacts."""
+    from .completion_receipts import (
+        receipt_dir,
+        receipt_reference,
+        validate_completion_reference,
+    )
+
+    sources: List[Dict[str, str]] = []
+
+    def add(label: str, value: Any) -> None:
+        uid = str(value or "")
+        if uid:
+            sources.append({"source": str(label), "campaign_uid": uid})
+
+    reference_versions = ReferenceDataVersioning(
+        campaign / reference_data_dir_name
+    )
+    for version in valid_reference_data_versions:
+        try:
+            view = reference_versions.resolve(int(version), verification="deep")
+        except Exception:
+            continue
+        add("reference-data version " + str(int(version)), view.campaign_uid)
+    model_versions = TrainedModelVersioning(campaign / models_dir_name)
+    for version in valid_model_versions:
+        try:
+            model_set = model_versions.resolve(int(version), verification="deep")
+        except Exception:
+            continue
+        add("model version " + str(int(version)), model_set.campaign_uid)
+    for label, handoff in (
+        ("bootstrap handoff", bootstrap_handoff),
+        ("Phase A handoff", phase_a_handoff),
+    ):
+        if isinstance(handoff, dict):
+            add(label, handoff.get("campaign_uid"))
+
+    intent_root = _submission_intent.intent_dir(campaign)
+    if intent_root.is_dir():
+        for path in sorted(intent_root.glob("*.json")):
+            try:
+                import json as _json
+
+                raw = _json.loads(path.read_text(encoding="utf-8"))
+                intent = _submission_intent.load_intent(
+                    campaign,
+                    str(raw.get("phase") or ""),
+                    int(raw.get("iteration")),
+                )
+            except Exception:
+                continue
+            if intent is not None:
+                add("submission intent " + path.name, intent.get("campaign_uid"))
+
+    receipts = receipt_dir(campaign)
+    if receipts.is_dir():
+        for path in sorted(receipts.glob("*.json")):
+            try:
+                reference = receipt_reference(campaign, path)
+                receipt = validate_completion_reference(campaign, reference)
+            except Exception:
+                continue
+            add("phase completion " + path.name, receipt.get("campaign_uid"))
+    return sources
 
 
 def _validate_recovered_state_contract(
@@ -758,14 +839,77 @@ def propose_recovery(
                 if salvaged_uid:
                     notes.append("salvaged campaign_uid from the unparsable state.json")
                 else:
-                    notes.append("WARNING: no campaign_uid to salvage; a fresh one will be minted")
+                    notes.append(
+                        "no campaign_uid could be salvaged; trusted artefacts "
+                        "must provide a unanimous identity"
+                    )
             except Exception:
-                notes.append("WARNING: state.json not even json; a fresh campaign_uid will be minted")
+                notes.append(
+                    "state.json is not JSON; trusted artefacts must provide a "
+                    "unanimous campaign identity"
+                )
         except Exception as exc:
             notes.append("existing state.json unreadable: " + type(exc).__name__)
-            notes.append("WARNING: a fresh campaign_uid will be minted; restore a good state.json to keep provenance")
+            notes.append(
+                "restore state.json or recover a unanimous campaign_uid from "
+                "trusted artefacts"
+            )
     else:
         notes.append("no existing state.json")
+
+    if existing is not None:
+        try:
+            from .completion_receipts import (
+                replayable_completion_receipts,
+                validate_completion_reference,
+            )
+            from .config_lock import config_lock_path
+
+            if isinstance(existing.last_completion_receipt, dict):
+                validate_completion_reference(
+                    campaign,
+                    existing.last_completion_receipt,
+                    expected_campaign_uid=str(existing.campaign_uid),
+                )
+                trusted_artifacts.append("state-referenced phase completion receipt")
+            lock_payload = json.loads(
+                config_lock_path(campaign).read_text(encoding="utf-8")
+            )
+            locked_fingerprint = str(lock_payload.get("fingerprint_sha256") or "")
+            if locked_fingerprint:
+                replayable = replayable_completion_receipts(
+                    campaign,
+                    existing,
+                    expected_config_sha256=locked_fingerprint,
+                )
+                if len(replayable) > 1:
+                    unsafe_reasons.append(
+                        "multiple phase-completion receipts match state.json"
+                    )
+                    blocking_artifacts.append("phase completion receipts")
+                elif len(replayable) == 1:
+                    match = replayable[0]
+                    existing = CampaignState.from_dict(
+                        dict(match["payload"]["state_after"])
+                    )
+                    existing.last_completion_receipt = dict(match["reference"])
+                    notes.append(
+                        "replayed phase-completion receipt in recovery proposal: "
+                        + str(match["payload"].get("phase"))
+                        + "@"
+                        + str(match["payload"].get("iteration"))
+                    )
+                    trusted_artifacts.append("replayable phase completion receipt")
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            unsafe_reasons.append(
+                "phase-completion receipt validation failed: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:180]
+            )
+            blocking_artifacts.append("phase completion receipt")
 
     #committed reference-data versions
     training_dir = campaign / reference_data_dir_name
@@ -877,6 +1021,26 @@ def propose_recovery(
     )
     model_iteration_staging = models_dir / "iteration-staging"
     has_model_iteration_staging = model_iteration_staging.is_dir()
+    recoverable_ferebus_staging = False
+    recoverable_ferebus_reason = ""
+    if has_model_iteration_staging and not model_iteration_staging.is_symlink():
+        try:
+            from .ferebus_quality import validate_ferebus_quality_evidence
+            from .live_executor import validate_ferebus_completed
+
+            staging_ok, staging_reason = validate_ferebus_completed(
+                model_iteration_staging
+            )
+            if not staging_ok:
+                raise ValueError(staging_reason)
+            quality = validate_ferebus_quality_evidence(model_iteration_staging)
+            recoverable_ferebus_staging = True
+            recoverable_ferebus_reason = (
+                "complete FEREBUS staging for reference-data version "
+                + str(int(quality.get("reference_data_version", -1)))
+            )
+        except Exception as exc:
+            recoverable_ferebus_reason = type(exc).__name__ + ": " + str(exc)[:180]
 
     if active_intents:
         unsafe_reasons.append(
@@ -928,9 +1092,20 @@ def propose_recovery(
     if dangling_reference_data:
         unsafe_reasons.append("dangling reference-data staging directories exist")
         blocking_artifacts.append("dangling reference-data staging")
-    if dangling_models or has_model_iteration_staging:
+    if recoverable_ferebus_staging:
+        trusted_artifacts.append(recoverable_ferebus_reason)
+        notes.append(
+            "complete FEREBUS staging is protected for quality-policy "
+            "reevaluation or idempotent commit"
+        )
+    if dangling_models or (has_model_iteration_staging and not recoverable_ferebus_staging):
         unsafe_reasons.append("dangling model staging directories exist")
         blocking_artifacts.append("dangling model staging")
+        if has_model_iteration_staging and recoverable_ferebus_reason:
+            notes.append(
+                "FEREBUS iteration-staging is not recoverable: "
+                + recoverable_ferebus_reason
+            )
 
     valid_reference_data_versions: List[int] = []
     for version in tv:
@@ -980,6 +1155,72 @@ def propose_recovery(
         notes.append(
             "valid model versions differ from discovered committed versions"
         )
+
+    trusted_uid_sources: List[Dict[str, str]] = []
+    try:
+        trusted_uid_sources = _trusted_campaign_uid_sources(
+            campaign,
+            reference_data_dir_name=reference_data_dir_name,
+            models_dir_name=models_dir_name,
+            valid_reference_data_versions=valid_reference_data_versions,
+            valid_model_versions=valid_model_versions,
+            bootstrap_handoff=bootstrap_handoff,
+            phase_a_handoff=phase_a_handoff,
+        )
+    except Exception as exc:
+        unsafe_reasons.append(
+            "campaign identity inventory failed: "
+            + type(exc).__name__
+            + ": "
+            + str(exc)[:180]
+        )
+        blocking_artifacts.append("campaign identity")
+    trusted_uids = sorted(
+        {str(item["campaign_uid"]) for item in trusted_uid_sources}
+    )
+    state_uid = (
+        str(existing.campaign_uid)
+        if existing is not None
+        else (str(salvaged_uid) if salvaged_uid else "")
+    )
+    recovered_uid: Optional[str] = None
+    if len(trusted_uids) > 1:
+        unsafe_reasons.append(
+            "trusted campaign identity disagreement: "
+            + ", ".join(trusted_uids)
+        )
+        blocking_artifacts.append("campaign identity disagreement")
+    elif trusted_uids:
+        recovered_uid = trusted_uids[0]
+        if state_uid and state_uid != recovered_uid:
+            unsafe_reasons.append(
+                "state campaign_uid disagrees with trusted artefacts: state="
+                + state_uid
+                + " trusted="
+                + recovered_uid
+            )
+            blocking_artifacts.append("campaign identity disagreement")
+        else:
+            notes.append(
+                "campaign_uid recovered from "
+                + str(len(trusted_uid_sources))
+                + " agreeing trusted artefact(s)"
+            )
+            trusted_artifacts.extend(
+                str(item["source"])
+                + " campaign_uid="
+                + str(item["campaign_uid"])
+                for item in trusted_uid_sources
+            )
+    elif state_uid:
+        recovered_uid = state_uid
+        notes.append("campaign_uid retained from state because no artefact identity was available")
+    elif stateful_campaign_artifacts(campaign):
+        unsafe_reasons.append(
+            "non-empty campaign has no recoverable trusted campaign_uid; refusing "
+            "to mint a replacement identity"
+        )
+        blocking_artifacts.append("campaign identity unavailable")
 
     if _needs_trajectory_pool_check(
         existing_loaded=existing_loaded,
@@ -1038,6 +1279,16 @@ def propose_recovery(
             # anti-overlap diagnostic + sacct stale-job streak counters:
             last_n_anti_overlap_flagged=existing.last_n_anti_overlap_flagged,
             sacct_empty_streak=dict(existing.sacct_empty_streak),
+            lifecycle_context=(
+                copy.deepcopy(existing.lifecycle_context)
+                if isinstance(existing.lifecycle_context, dict)
+                else None
+            ),
+            last_completion_receipt=(
+                dict(existing.last_completion_receipt)
+                if isinstance(existing.last_completion_receipt, dict)
+                else None
+            ),
             campaign_uid=existing.campaign_uid,
             campaign_started_iso=existing.campaign_started_iso,
         )
@@ -1049,6 +1300,8 @@ def propose_recovery(
             recovered.campaign_uid = str(salvaged_uid)
             if salvaged_started:
                 recovered.campaign_started_iso = str(salvaged_started)
+    if recovered_uid is not None:
+        recovered.campaign_uid = str(recovered_uid)
 
     coherent_pairs = sorted(set(valid_reference_data_versions).intersection(valid_model_versions))
     latest_reference_data_only = max(valid_reference_data_versions) if valid_reference_data_versions else None
@@ -1331,6 +1584,55 @@ def propose_recovery(
         unsafe_reasons.append(".DATA/STAGING is non-empty")
         blocking_artifacts.append(".DATA/STAGING")
 
+    cleanup_only_blockers = {
+        ".DATA/STAGING",
+        "dangling reference-data staging",
+        "dangling model staging",
+    }
+    existing_contract_valid = False
+    if existing is not None and (
+        existing.phase is CampaignPhase.DONE or existing.shutdown_requested
+    ):
+        try:
+            verify_state_referenced_artifacts(campaign, existing)
+        except Exception as exc:
+            reason = (
+                "existing state artefact contract invalid: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:180]
+            )
+            if reason not in unsafe_reasons:
+                unsafe_reasons.append(reason)
+            if "existing state artefact contract" not in blocking_artifacts:
+                blocking_artifacts.append("existing state artefact contract")
+        else:
+            existing_contract_valid = True
+    non_cleanup_blockers = [
+        blocker
+        for blocker in blocking_artifacts
+        if blocker not in cleanup_only_blockers
+    ]
+    preserve_completed_state = bool(
+        existing is not None
+        and existing.phase is CampaignPhase.DONE
+        and not existing.shutdown_requested
+        and existing_contract_valid
+        and not non_cleanup_blockers
+        and not active_intents
+    )
+    preserve_stopped_state = bool(
+        existing is not None
+        and existing.shutdown_requested
+        and existing_contract_valid
+        and not non_cleanup_blockers
+        and not active_intents
+    )
+    identity_recovery_blocked = any(
+        str(blocker).startswith("campaign identity")
+        for blocker in blocking_artifacts
+    )
+
     phase_recovery = None
     if not active_intents and not unsafe_reasons:
         handoff_recovery = None
@@ -1369,7 +1671,28 @@ def propose_recovery(
     # choose a safe re-entry phase. If we have NOTHING committed, start at
     #  INIT; otherwise rewind to STOP_CHECK so the next tick decides whether
     # to loop or terminate.
-    if not tv and not mv and not existing_loaded and unsafe_reasons and not allow_fresh_init_on_nonempty:
+    if preserve_completed_state:
+        recovered.phase = CampaignPhase.DONE
+        recovered.iteration = int(existing.iteration)
+        decision = "DONE: existing completed lifecycle and artefact chain are trusted"
+        notes.append(
+            "preserved completed campaign; only resume --reopen-converged may reopen it"
+        )
+    elif preserve_stopped_state:
+        recovered.phase = CampaignPhase(existing.phase)
+        recovered.iteration = int(existing.iteration)
+        decision = "STOPPED: existing operator stop request remains authoritative"
+        notes.append(
+            "preserved operator stop request; only resume may clear it"
+        )
+    elif identity_recovery_blocked:
+        recovered.phase = CampaignPhase.HALTED
+        decision = "HALTED: campaign identity cannot be recovered unambiguously"
+        notes.append(
+            "re-entry HALTED because the non-empty campaign has identity "
+            "evidence that is missing, conflicting, or unreadable"
+        )
+    elif not tv and not mv and not existing_loaded and unsafe_reasons and not allow_fresh_init_on_nonempty:
         recovered.phase = CampaignPhase.HALTED
         decision = "HALTED: non-empty campaign has no valid state or committed versions"
         notes.append(
@@ -1489,8 +1812,21 @@ def propose_recovery(
             "re-entry HALTED because committed model artefacts failed validation"
         )
     elif valid_reference_data_versions and not valid_model_versions:
-        recovered.phase = CampaignPhase.INITIAL_FEREBUS if recovered.reference_data_version == 0 else CampaignPhase.FEREBUS
-        decision = recovered.phase.value + ": valid training exists without a committed model"
+        recovered.phase = (
+            CampaignPhase.INITIAL_FEREBUS
+            if recovered.reference_data_version == 0
+            else CampaignPhase.FEREBUS
+        )
+        if recovered.phase is CampaignPhase.INITIAL_FEREBUS:
+            # Bootstrap phases are always iteration zero, even when the stale
+            # state was halted after an operator increased max_iterations.
+            recovered.iteration = 0
+        decision = (
+            "INITIAL_FEREBUS: exact point allocation is complete and valid "
+            "bootstrap training exists without a committed model"
+            if recovered.phase is CampaignPhase.INITIAL_FEREBUS
+            else "FEREBUS: valid training exists without a committed model"
+        )
         notes.append(
             "re-entry at "
             + recovered.phase.value
@@ -1521,7 +1857,7 @@ def propose_recovery(
         decision = "STOP_CHECK: latest coherent committed reference-data/model pair is trusted"
         notes.append("re-entry at STOP_CHECK (next tick decides loop/terminate)")
     recovered.pending_jobs = {}
-    recovered.shutdown_requested = False
+    recovered.shutdown_requested = bool(preserve_stopped_state)
     if recovered.phase is not CampaignPhase.HALTED and not active_intents:
         try:
             _validate_recovered_state_contract(
@@ -1544,6 +1880,66 @@ def propose_recovery(
             notes.append("re-entry HALTED because proposed state failed final contract validation")
     if recovered.phase is CampaignPhase.HALTED and not recommended_actions:
         recommended_actions.append("Inspect unsafe recovery reasons before applying.")
+    if recovered.phase is CampaignPhase.HALTED:
+        origin_phase = (
+            existing.phase
+            if existing is not None
+            else CampaignPhase.HALTED
+        )
+        recovered.lifecycle_context = make_lifecycle_context(
+            disposition="halted",
+            reason_code="reconcile_unsafe",
+            message=(
+                str(decision)
+                + (
+                    ": " + "; ".join(str(reason) for reason in unsafe_reasons[:3])
+                    if unsafe_reasons
+                    else ""
+                )
+            )[:500],
+            from_phase=origin_phase,
+            iteration=int(recovered.iteration),
+            source="reconcile",
+            recovery_action=(
+                str(recommended_actions[0])
+                if recommended_actions
+                else "inspect unsafe recovery reasons"
+            ),
+            details={"unsafe_reason_count": len(unsafe_reasons)},
+        )
+    elif preserve_completed_state:
+        if not (
+            isinstance(recovered.lifecycle_context, dict)
+            and recovered.lifecycle_context.get("disposition") == "completed"
+        ):
+            recovered.lifecycle_context = make_lifecycle_context(
+                disposition="completed",
+                reason_code="recovered_completed_state",
+                message="completed campaign lifecycle preserved by reconcile",
+                from_phase=CampaignPhase.DONE,
+                iteration=int(recovered.iteration),
+                source="reconcile",
+                recovery_action=(
+                    "use resume --reopen-converged only after deliberately "
+                    "increasing max_iterations"
+                ),
+            )
+    elif preserve_stopped_state:
+        if not (
+            isinstance(recovered.lifecycle_context, dict)
+            and recovered.lifecycle_context.get("disposition") == "stopped"
+        ):
+            recovered.lifecycle_context = make_lifecycle_context(
+                disposition="stopped",
+                reason_code="recovered_stop_request",
+                message="existing campaign stop request preserved by reconcile",
+                from_phase=recovered.phase,
+                iteration=int(recovered.iteration),
+                source="reconcile",
+                recovery_action="use resume to continue from the recorded phase",
+            )
+    else:
+        recovered.lifecycle_context = None
 
     return ReconciliationReport(
         proposed_state=recovered,

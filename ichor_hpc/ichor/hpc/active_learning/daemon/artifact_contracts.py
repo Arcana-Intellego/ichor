@@ -120,8 +120,18 @@ def verify_state_referenced_artifacts(
     strict_models: bool = True,
 ) -> None:
     phase = CampaignPhase(state.phase)
-    if phase in (CampaignPhase.DONE, CampaignPhase.HALTED):
-        return
+    required_phase = (
+        CampaignPhase.STOP_CHECK if phase is CampaignPhase.DONE else phase
+    )
+    completion_reference = getattr(state, "last_completion_receipt", None)
+    if isinstance(completion_reference, dict):
+        from .completion_receipts import validate_completion_reference
+
+        validate_completion_reference(
+            campaign_dir,
+            completion_reference,
+            expected_campaign_uid=str(getattr(state, "campaign_uid", "")),
+        )
     campaign = Path(campaign_dir)
 
     train_version = int(getattr(state, "reference_data_version", -1))
@@ -146,7 +156,7 @@ def verify_state_referenced_artifacts(
                 + str(exc)
             ) from exc
 
-    if phase in _TRAINING_REQUIRED and train_version < 0:
+    if required_phase in _TRAINING_REQUIRED and train_version < 0:
         raise CommittedArtifactError(
             "phase "
             + phase.value
@@ -163,7 +173,7 @@ def verify_state_referenced_artifacts(
                 train_version,
                 reference_data_dir_name=reference_data_dir_name,
             )
-        elif phase in _TRAINING_REQUIRED:
+        elif required_phase in _TRAINING_REQUIRED:
             raise CommittedArtifactError(
                 "state references missing committed reference-data version "
                 + str(train_version)
@@ -174,7 +184,7 @@ def verify_state_referenced_artifacts(
             )
 
     model_version = int(getattr(state, "models_version", -1))
-    if strict_models and phase in _MODELS_REQUIRED and model_version < 0:
+    if strict_models and required_phase in _MODELS_REQUIRED and model_version < 0:
         raise CommittedArtifactError(
             "phase "
             + phase.value
@@ -194,7 +204,7 @@ def verify_state_referenced_artifacts(
                     model_version,
                     models_dir_name=models_dir_name,
                 )
-        elif strict_models and phase in _MODELS_REQUIRED:
+        elif strict_models and required_phase in _MODELS_REQUIRED:
             raise CommittedArtifactError(
                 "state references missing committed model version "
                 + str(model_version)
@@ -203,7 +213,7 @@ def verify_state_referenced_artifacts(
                 + ": "
                 + str(model_dir)
             )
-    if strict_models and phase in _COHERENT_TRAINING_MODEL_REQUIRED:
+    if strict_models and required_phase in _COHERENT_TRAINING_MODEL_REQUIRED:
         if train_version != model_version:
             raise CommittedArtifactError(
                 "state reference-data/model version skew for phase "

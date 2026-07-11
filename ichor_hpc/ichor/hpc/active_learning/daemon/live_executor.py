@@ -84,6 +84,13 @@ from .array_recovery import (
     prepare_retry_submission,
     supports_partial_array_recovery,
 )
+from .runtime_environment import (
+    DEFAULT_DAEMON_ARIADNE_RUNTIME_MODULES,
+    DEFAULT_DAEMON_PYTHON_MODULES,
+    DEFAULT_DAEMON_RUNTIME_MODULES,
+    configured_daemon_runtime_modules,
+    normalise_module_list,
+)
 
 
 __all__ = [
@@ -96,11 +103,6 @@ __all__ = [
     "make_live_job_liveness_checker",
     "LIVE_POSTPROCESS_IMPLEMENTED",
 ]
-
-DEFAULT_DAEMON_PYTHON_MODULES: List[str] = [
-    "python/3.11.3-gcccore-12.3.0",
-]
-
 
 def _format_slurm_walltime_hours(hours: Any) -> str:
     try:
@@ -115,17 +117,6 @@ def _format_slurm_walltime_hours(hours: Any) -> str:
     clock = f"{hh:02d}:{mm:02d}:{ss:02d}"
     return str(days) + "-" + clock if days else clock
 
-DEFAULT_DAEMON_ARIADNE_RUNTIME_MODULES: List[str] = [
-    "compilers/oneapi/2024.2.0",
-    "compiler-rt tbb compiler",
-    "mkl/2024.2",
-]
-
-DEFAULT_DAEMON_RUNTIME_MODULES: List[str] = (
-    DEFAULT_DAEMON_PYTHON_MODULES + DEFAULT_DAEMON_ARIADNE_RUNTIME_MODULES
-)
-
-_MODULE_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/+-]*(?: [A-Za-z0-9][A-Za-z0-9_.:/+-]*)*$")
 _SHEBANG_RE = re.compile(r"^#![A-Za-z0-9_./ -]+$")
 _SHELL_PATH_FRAGMENT_RE = re.compile(r"^[A-Za-z0-9_./${}:+-]+$")
 FEREBUS_TASK_ARTEFACTS_MANIFEST = TRAINED_MODEL_SET_FILENAME
@@ -260,7 +251,10 @@ def _write_ferebus_task_artefact_layout(
 ) -> Path:
     """Build one complete hierarchical committed FEREBUS model snapshot."""
     from . import input_staging as _stg
-    from .ferebus_quality import FEREBUS_QUALITY_MANIFEST
+    from .ferebus_quality import (
+        FEREBUS_QUALITY_DECISION_MANIFEST,
+        FEREBUS_QUALITY_MANIFEST,
+    )
     from ..versioning.trained_models import (
         build_trained_model_set_payload,
         file_record,
@@ -341,6 +335,7 @@ def _write_ferebus_task_artefact_layout(
         "ATOMS.txt",
         "PROPERTIES.txt",
         FEREBUS_QUALITY_MANIFEST,
+        FEREBUS_QUALITY_DECISION_MANIFEST,
     )
     root_records: List[Dict[str, Any]] = []
     for sidecar_name in sidecar_names:
@@ -349,6 +344,7 @@ def _write_ferebus_task_artefact_layout(
             if sidecar_name in {
                 _stg.FEREBUS_TASK_MANIFEST,
                 FEREBUS_QUALITY_MANIFEST,
+                FEREBUS_QUALITY_DECISION_MANIFEST,
             }:
                 raise BackendSubmissionError(
                     "required FEREBUS sidecar is missing: " + str(source)
@@ -1050,6 +1046,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
     partition: Optional[str] = None
     backend_check: bool = True
     strict_committed_artifact_verification: bool = True
+    strict_completion_receipt_evidence: bool = True
 
     def __post_init__(self) -> None:
         DryRunPhaseExecutor.__post_init__(self)
@@ -2696,26 +2693,46 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             from .ferebus_quality import (
                 FEREBUS_QUALITY_MANIFEST,
                 evaluate_ferebus_quality,
+                read_ferebus_quality_decision,
+                write_ferebus_quality_decision,
                 write_ferebus_quality_manifest,
             )
+            from .config_lock import canonical_config, config_fingerprint
 
             quality = evaluate_ferebus_quality(
                 staging,
                 getattr(self.config, "quality_gates", None),
             )
             quality_path = write_ferebus_quality_manifest(staging, quality)
+            config_sha = config_fingerprint(canonical_config(self.config))
+            decision_path = write_ferebus_quality_decision(
+                staging,
+                config_sha256=config_sha,
+                gates=getattr(self.config, "quality_gates", None),
+            )
+            decision = read_ferebus_quality_decision(
+                staging,
+                expected_config_sha256=config_sha,
+                require_accepted=False,
+            )
+            current_decision = dict(decision.get("current_evaluation") or {})
             self._journal_event(
                 "ferebus_quality_summary",
                 phase=phase_name,
                 iteration=int(state.iteration),
                 manifest=str(quality_path),
                 **dict(quality.get("summary") or {}),
+                decision_manifest=str(decision_path),
+                accepted=bool(current_decision.get("accepted")),
+                n_total=int(current_decision.get("n_tasks", 0)),
             )
-            if not bool(quality.get("accepted")):
+            if not bool(current_decision.get("accepted")):
                 return PhaseResult(
                     is_complete=True,
                     failure_reason="ferebus_quality_failed: "
-                    + ";".join(str(r) for r in quality.get("reasons", []))[:300],
+                    + ";".join(
+                        str(r) for r in current_decision.get("reasons", [])
+                    )[:300],
                 )
         except Exception as exc:
             return PhaseResult(
@@ -2916,6 +2933,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             validate_ariadne_result,
             write_acquisition_maturity_audit,
             write_ariadne_landing_audit,
+            write_ariadne_batch_decision,
             write_ariadne_results_manifest,
         )
         from ..acquisition.ariadne_runner import ariadne_result_usability_payload
@@ -2980,6 +2998,33 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         seed_records = list(picked["seed_records"])
         task_records = list(task_map["tasks"])
         expected_n = int(task_map["n_tasks"])
+        from .config_lock import canonical_config, config_fingerprint
+
+        config_sha256 = config_fingerprint(canonical_config(self.config))
+
+        def publish_batch_decision(
+            *,
+            n_accepted: int,
+            n_rejected: int,
+            accepted_batch: bool,
+            reasons,
+        ):
+            path = write_ariadne_batch_decision(
+                iter_dir,
+                campaign_uid=str(state.campaign_uid),
+                iteration=int(state.iteration),
+                config_sha256=str(config_sha256),
+                failure_threshold_fraction=float(
+                    self.config.runtime.failure_threshold_fraction
+                ),
+                expected_n=int(expected_n),
+                n_accepted=int(n_accepted),
+                n_rejected=int(n_rejected),
+                accepted=bool(accepted_batch),
+                reasons=[str(reason) for reason in reasons],
+            )
+            self.artefact_log.append(str(path))
+            return path
         if len(seed_records) != expected_n:
             return PhaseResult(
                 is_complete=True,
@@ -3060,6 +3105,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 "accepted": [],
                 "rejected": rejected,
             })
+            publish_batch_decision(
+                n_accepted=0,
+                n_rejected=len(rejected),
+                accepted_batch=False,
+                reasons=["ariadne_seeds_directory_missing"],
+            )
             return PhaseResult(
                 is_complete=True,
                 failure_reason="ariadne_seeds_directory_missing: " + str(seeds_root),
@@ -3734,6 +3785,24 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             rejected=int(audit_summary.get("rejected", 0)),
         )
 
+        decision_reasons = []
+        if n_kept == 0:
+            decision_reasons.append(
+                "ariadne_no_seed_results_parsed: " + str(n_rejected)
+            )
+        if expected_n and (
+            n_rejected / float(expected_n)
+        ) > float(self.config.runtime.failure_threshold_fraction):
+            decision_reasons.append(
+                "too_many_seeds_failed: " + str(n_rejected) + "/" + str(expected_n)
+            )
+        publish_batch_decision(
+            n_accepted=n_kept,
+            n_rejected=n_rejected,
+            accepted_batch=not bool(decision_reasons),
+            reasons=decision_reasons,
+        )
+
         if n_kept == 0:
             return PhaseResult(
                 is_complete=True,
@@ -3745,9 +3814,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         # too many seeds lost (real failures + absentees) against the TRUE submitted count -> fail
         # rather than quietly commit a short batch as if the array had finished. only gated when we
         # actually know the submitted count (SELECTION.json present); mirrors the quantum phases.
-        if expected_n and (
-            n_rejected / float(expected_n)
-        ) > float(self.config.runtime.failure_threshold_fraction):
+        if any(reason.startswith("too_many_seeds_failed:") for reason in decision_reasons):
             return PhaseResult(
                 is_complete=True,
                 failure_reason=(
@@ -3820,17 +3887,18 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             sample = _Path(str(phase_a_manifest["sample_xyz"]))
         else:
             iter_dir = self._iter_dir(state.iteration)
-            from ..handoff_manifests import read_phase_b_selection_manifest
+            from ..handoff_manifests import validate_phase_b_handoff
             try:
-                phase_b_manifest = read_phase_b_selection_manifest(
+                phase_b_manifest = validate_phase_b_handoff(
                     iter_dir,
                     expected_iteration=int(state.iteration),
+                    expected_campaign_uid=str(state.campaign_uid),
                 )
             except Exception as exc:
                 return PhaseResult(
                     is_complete=True,
                     failure_reason=(
-                        "phase_b_selection_manifest_invalid: "
+                        "phase_b_handoff_invalid: "
                         + type(exc).__name__
                         + ": "
                         + str(exc)
@@ -3881,37 +3949,6 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         + str(int(n_frames))
                         + " manifest_final="
                         + str(len(final_records))
-                    ),
-                )
-            coordinate_error = self._phase_b_sample_coordinate_mismatch(
-                sample,
-                final_records,
-            )
-            if coordinate_error is not None:
-                return PhaseResult(
-                    is_complete=True,
-                    failure_reason="phase_b_selection_content_mismatch: " + coordinate_error,
-                )
-            from ..versioning.provenance import validate_provenance
-
-            for rec in final_records:
-                validate_provenance(
-                    _Path(str(rec["seed_dir"])),
-                    campaign_uid=str(state.campaign_uid),
-                    iteration=int(state.iteration),
-                    seed_frame_id=rec.get("seed_frame_id"),
-                    seed_id=int(rec["seed_id"]),
-                    seed_uid=str(rec["seed_uid"]),
-                    array_task_id_zero_based=int(rec["array_task_id"]),
-                    require_phase_b_selected=True,
-                    allocation_split=str(rec["split"]),
-                    allocation_slot_id=int(rec["slot_id"]),
-                    allocation_candidate_id=str(rec["candidate_id"]),
-                    allocation_context="active",
-                    allocation_slot_assignment_sha256=str(
-                        phase_b_manifest["point_allocation"][
-                            "slot_assignment_sha256"
-                        ]
                     ),
                 )
 
@@ -4253,32 +4290,10 @@ def _python_executable_for_script() -> str:
 
 
 def _normalise_module_list(raw: Any, *, label: str) -> List[str]:
-    if raw is None:
-        return []
-    if isinstance(raw, str):
-        values = [raw]
-    else:
-        try:
-            values = list(raw)
-        except TypeError as exc:
-            raise BackendSubmissionError(
-                "configured " + label + " modules must be a string or list"
-            ) from exc
-    modules: List[str] = []
-    for value in values:
-        module = str(value).strip()
-        if not module:
-            continue
-        _reject_shell_control_chars("configured " + label + " module", module)
-        if not _MODULE_TOKEN_RE.fullmatch(module):
-            raise BackendSubmissionError(
-                "configured "
-                + label
-                + " module contains unsafe characters: "
-                + repr(module)
-            )
-        modules.append(module)
-    return modules
+    try:
+        return normalise_module_list(raw, label=label)
+    except ValueError as exc:
+        raise BackendSubmissionError(str(exc)) from exc
 
 
 def _configured_jobscript_shebang() -> str:
@@ -4363,30 +4378,9 @@ def _configured_daemon_runtime_modules() -> List[str]:
     FEREBUS phases.
     """
     try:
-        python_modules = profile_value(
-            "software", "python", "modules", default=None
-        )
-        ariadne_modules = profile_value(
-            "software", "ariadne_runtime", "modules", default=None
-        )
-    except Exception:
-        return list(DEFAULT_DAEMON_RUNTIME_MODULES)
-
-    machine = (active_machine() or "").lower()
-    legacy_defaults = (not machine) or machine == "csf4"
-    default_python_modules = (
-        list(DEFAULT_DAEMON_PYTHON_MODULES) if legacy_defaults else []
-    )
-    default_ariadne_modules = (
-        list(DEFAULT_DAEMON_ARIADNE_RUNTIME_MODULES) if legacy_defaults else []
-    )
-    modules = (
-        (_normalise_module_list(python_modules, label="python")
-         if python_modules is not None else default_python_modules)
-        + (_normalise_module_list(ariadne_modules, label="ariadne_runtime")
-           if ariadne_modules is not None else default_ariadne_modules)
-    )
-    return modules
+        return configured_daemon_runtime_modules()
+    except Exception as exc:
+        raise BackendSubmissionError(str(exc)) from exc
 
 
 def build_sbatch_script(

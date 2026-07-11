@@ -361,6 +361,32 @@ def test_find_active_job_by_name_multiple_active_rows_is_inconclusive():
     assert "multiple active jobs" in str(lookup.error)
 
 
+def test_accounted_name_lookup_does_not_treat_partial_terminal_array_as_terminal():
+    from ichor.hpc.active_learning.submit.sacct_poll import (
+        find_accounted_job_by_name_detailed,
+    )
+
+    sacct_runner = _StubRunner(
+        result=_StubResult(stdout="123_0|FAILED|1:0|00:00:01\n")
+    )
+    squeue_runner = _StubRunner(
+        result=_StubResult(stdout="123_1|PENDING|camp-GAUSSIAN-1\n")
+    )
+
+    lookup = find_accounted_job_by_name_detailed(
+        "camp-GAUSSIAN-1",
+        expected_task_count=None,
+        sacct_runner=sacct_runner,
+        squeue_runner=squeue_runner,
+        use_squeue_fallback=True,
+    )
+
+    assert lookup.job_id == "123"
+    assert lookup.terminal is False
+    assert lookup.failed is False
+    assert squeue_runner.calls
+
+
 def test_find_running_job_by_name_can_fallback_to_squeue_when_sacct_empty():
     sacct_runner = _StubRunner(result=_StubResult(stdout=""))
     squeue_runner = _StubRunner(

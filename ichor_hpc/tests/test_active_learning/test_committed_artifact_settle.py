@@ -15,6 +15,9 @@ from ichor.hpc.active_learning.daemon.state import (
 
 class _StrictExecutor(MockPhaseExecutor):
     strict_committed_artifact_verification = True
+    # This fixture isolates committed-version settle behaviour and deliberately
+    # does not produce phase handoff artefacts.
+    strict_completion_receipt_evidence = False
 
 
 def _daemon(tmp_path, *, attempts=2, settle_seconds=7, sleep_calls=None):

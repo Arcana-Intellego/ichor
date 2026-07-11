@@ -212,9 +212,66 @@ def test_state_is_terminal_flag():
 # --- M15 F3: schema bump + new state fields ----------------------------
 
 
-def test_schema_version_is_six():
+def test_schema_version_is_seven():
     from ichor.hpc.active_learning.daemon.state import SCHEMA_VERSION
-    assert SCHEMA_VERSION == 6
+    assert SCHEMA_VERSION == 7
+
+
+def test_schema_six_payload_is_upgraded_on_read():
+    payload = CampaignState().to_dict()
+    payload["schema_version"] = 6
+
+    loaded = CampaignState.from_dict(payload)
+
+    assert loaded.schema_version == 7
+    assert loaded.lifecycle_context is None
+    assert loaded.last_completion_receipt is None
+
+
+def test_lifecycle_context_roundtrip_for_halt():
+    state = CampaignState()
+    state.phase = CampaignPhase.HALTED
+    state.lifecycle_context = {
+        "disposition": "halted",
+        "reason_code": "test_failure",
+        "message": "test failure",
+        "from_phase": CampaignPhase.INIT.value,
+        "iteration": 0,
+        "timestamp_iso": "2026-07-11T00:00:00+00:00",
+    }
+
+    loaded = CampaignState.from_dict(state.to_dict())
+
+    assert loaded.lifecycle_context == state.lifecycle_context
+
+
+def test_lifecycle_context_disposition_must_match_phase():
+    payload = CampaignState().to_dict()
+    payload["lifecycle_context"] = {
+        "disposition": "halted",
+        "reason_code": "test_failure",
+        "message": "test failure",
+        "from_phase": CampaignPhase.INIT.value,
+        "iteration": 0,
+        "timestamp_iso": "2026-07-11T00:00:00+00:00",
+    }
+
+    with pytest.raises(StateSchemaError, match="requires phase HALTED"):
+        CampaignState.from_dict(payload)
+
+
+def test_done_state_still_requires_committed_training_and_models(tmp_path):
+    from ichor.hpc.active_learning.daemon.artifact_contracts import (
+        CommittedArtifactError,
+        verify_state_referenced_artifacts,
+    )
+
+    state = CampaignState()
+    state.phase = CampaignPhase.DONE
+    state.iteration = 1
+
+    with pytest.raises(CommittedArtifactError, match="phase DONE requires"):
+        verify_state_referenced_artifacts(tmp_path, state)
 
 
 def test_last_n_anti_overlap_flagged_default_and_roundtrip():

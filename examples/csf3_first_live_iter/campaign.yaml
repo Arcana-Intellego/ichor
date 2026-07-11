@@ -105,6 +105,7 @@ runtime:
   postprocess_settle_seconds: 10
   transient_phase_retry_max: 1
   poll_sacct_unknown_max_ticks: 3
+  poll_sacct_error_max_ticks: 10
   poll_sacct_missing_max_ticks: 12
   poll_squeue_inconclusive_max_ticks: 10
   failure_threshold_fraction: 0.5

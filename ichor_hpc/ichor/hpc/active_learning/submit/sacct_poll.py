@@ -613,6 +613,27 @@ def find_accounted_job_by_name_detailed(
         observations,
         expected_task_count=expected_task_count,
     )
+    if use_squeue_fallback and (
+        expected_task_count is None or int(summary.n_missing) > 0
+    ):
+        active = find_active_job_by_name_detailed(
+            name,
+            squeue_runner=squeue_runner,
+        )
+        if active.job_id:
+            return JobNameAccountingLookup(
+                active.job_id,
+                terminal=False,
+                inconclusive=False,
+                rows=list(active.rows),
+            )
+        if active.inconclusive:
+            return JobNameAccountingLookup(
+                None,
+                inconclusive=True,
+                rows=rows + list(active.rows),
+                error=active.error,
+            )
     if int(summary.n_unknown) > 0:
         return JobNameAccountingLookup(
             None,

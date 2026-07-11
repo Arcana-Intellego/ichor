@@ -17,21 +17,26 @@ a daemon that cannot submit anything.
 """
 from __future__ import annotations
 
-import importlib
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass
-from typing import List
+from typing import Dict, List, Optional
 
-from .import_utils import quiet_import_module
 from .cluster_profile import (
     ClusterProfileError,
     active_machine,
     expanded_profile_value,
     profile_value,
     require_cluster_profile,
+)
+from .runtime_environment import (
+    SUBMITTED_PYTHON_IMPORTS,
+    configured_daemon_runtime_modules,
+    normalise_module_list,
 )
 
 __all__ = [
@@ -67,6 +72,12 @@ class BackendAvailability:
     batch_python: bool = False
     batch_python_version: str = ""
     batch_python_error: str = ""
+    batch_runtime_modules: tuple = ()
+    gaussian_verified: bool = False
+    gaussian_probe_error: str = ""
+    ariadne_probe_error: str = ""
+    polus_rs_probe_error: str = ""
+    pyferebus_probe_error: str = ""
 
     @property
     def all_present(self) -> bool:
@@ -146,76 +157,188 @@ def _gaussian_binary() -> str:
     return ""
 
 
-def _ariadne_importable() -> bool:
-    try:
-        importlib.import_module("ariadne")
-    except Exception:
-        return False
-    return True
+def _run_login_shell(script: str, *, timeout: int = 30) -> subprocess.CompletedProcess:
+    bash = shutil.which("bash")
+    if not bash:
+        raise FileNotFoundError("bash is unavailable for submitted-environment probe")
+    return subprocess.run(
+        [bash, "--login", "-c", str(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=int(timeout),
+    )
 
 
-def _polus_rs_importable() -> bool:
-    # the FEREBUS-dataset split only needs the dependency-light RS sampler
-    # subtree, not the full polus package (managers/descriptors drag in
-    # sklearn/torch). probe exactly what we import.
-    try:
-        quiet_import_module("polus.samplers.RS.randomSampling")
-    except Exception:
-        return False
-    return True
-
-
-def _pyferebus_importable() -> bool:
-    try:
-        importlib.import_module("pyferebus.executors.trainer")
-        importlib.import_module("pyferebus.writers.config_file")
-        importlib.import_module("pyferebus.writers.commands_file")
-        importlib.import_module("pyferebus.writers.submission_script")
-    except Exception:
-        return False
-    return True
-
-
-def _probe_configured_python(python_executable: str) -> tuple[bool, str, str]:
-    """Run the submitted-job import contract under the configured interpreter."""
+def _probe_configured_python_details(
+    python_executable: str,
+    modules: Optional[List[str]] = None,
+) -> tuple[bool, str, str, Dict[str, Dict[str, object]]]:
+    """Probe each required import under the exact submitted Python environment."""
+    import_status = {
+        label: {"ok": False, "error": "probe did not run"}
+        for label in SUBMITTED_PYTHON_IMPORTS
+    }
     executable = str(python_executable or "").strip()
     if not executable:
-        return False, "", "software.python.python_path is not configured"
+        return (
+            False,
+            "",
+            "software.python.python_path is not configured",
+            import_status,
+        )
     if not os.path.isfile(executable):
-        return False, "", "configured Python is not a file: " + executable
+        return (
+            False,
+            "",
+            "configured Python is not a file: " + executable,
+            import_status,
+        )
     if not os.access(executable, os.X_OK):
-        return False, "", "configured Python is not executable: " + executable
-    probe = (
-        "import importlib,json,sys;"
-        "mods=['ichor.core','ichor.hpc','ariadne',"
-        "'polus.samplers.RS.randomSampling',"
-        "'pyferebus.executors.trainer'];"
-        "[importlib.import_module(name) for name in mods];"
-        "print(json.dumps({'executable':sys.executable,"
-        "'version':list(sys.version_info[:3])},sort_keys=True))"
+        return (
+            False,
+            "",
+            "configured Python is not executable: " + executable,
+            import_status,
+        )
+    probe = "\n".join(
+        [
+            "import importlib, json, sys",
+            "modules = " + repr(SUBMITTED_PYTHON_IMPORTS),
+            "results = {}",
+            "for label, names in modules.items():",
+            "    try:",
+            "        for name in names:",
+            "            importlib.import_module(name)",
+            "    except Exception as exc:",
+            "        results[label] = {'ok': False, 'error': type(exc).__name__ + ': ' + str(exc)[:300]}",
+            "    else:",
+            "        results[label] = {'ok': True, 'error': ''}",
+            "print(json.dumps({'executable': sys.executable, 'version': list(sys.version_info[:3]), 'modules': results}, sort_keys=True))",
+        ]
     )
     try:
-        completed = subprocess.run(
-            [executable, "-c", probe],
-            check=False,
-            capture_output=True,
-            text=True,
+        module_lines = ["module load " + module for module in (modules or [])]
+        script = "\n".join(
+            ["set -euo pipefail", *module_lines]
+            + ["exec " + shlex.quote(executable) + " -c " + shlex.quote(probe)]
+        )
+        completed = _run_login_shell(script, timeout=30)
+    except Exception as exc:
+        return (
+            False,
+            "",
+            type(exc).__name__ + ": " + str(exc),
+            import_status,
+        )
+    if int(completed.returncode) != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        return (
+            False,
+            "",
+            "configured Python import probe failed: " + detail[:500],
+            import_status,
+        )
+    try:
+        payload = json.loads((completed.stdout or "").strip().splitlines()[-1])
+        version_values = tuple(int(value) for value in payload["version"])
+        raw_modules = payload["modules"]
+        if not isinstance(raw_modules, dict):
+            raise TypeError("modules is not an object")
+        parsed_status: Dict[str, Dict[str, object]] = {}
+        for label in SUBMITTED_PYTHON_IMPORTS:
+            raw_status = raw_modules.get(label)
+            if not isinstance(raw_status, dict) or not isinstance(
+                raw_status.get("ok"), bool
+            ):
+                raise TypeError("module status is invalid for " + label)
+            parsed_status[label] = {
+                "ok": bool(raw_status["ok"]),
+                "error": str(raw_status.get("error") or ""),
+            }
+    except Exception as exc:
+        return (
+            False,
+            "",
+            "configured Python returned malformed probe output: " + str(exc),
+            import_status,
+        )
+    version = ".".join(str(value) for value in version_values)
+    if version_values[:2] != (3, 11):
+        return (
+            False,
+            version,
+            "configured batch Python must be Python 3.11",
+            parsed_status,
+        )
+    return True, version, "", parsed_status
+
+
+def _probe_configured_python(
+    python_executable: str,
+    modules: Optional[List[str]] = None,
+) -> tuple[bool, str, str]:
+    """Compatibility wrapper requiring Python 3.11 and every runtime import."""
+    interpreter_ok, version, error, import_status = (
+        _probe_configured_python_details(python_executable, modules)
+    )
+    missing = [
+        label
+        for label, status in import_status.items()
+        if not bool(status.get("ok", False))
+    ]
+    if interpreter_ok and missing:
+        details = "; ".join(
+            label + ": " + str(import_status[label].get("error") or "import failed")
+            for label in missing
+        )
+        return False, version, "configured Python import probe failed: " + details
+    return interpreter_ok, version, error
+
+
+def _probe_gaussian_environment() -> tuple[bool, str, str]:
+    """Resolve Gaussian under the same module block used by its jobs."""
+    raw_modules = profile_value("software", "gaussian", "modules", default=None)
+    try:
+        gaussian_modules = normalise_module_list(raw_modules, label="gaussian")
+        runtime_modules = configured_daemon_runtime_modules()
+    except (ValueError, ClusterProfileError) as exc:
+        return False, "", str(exc)
+    modules = list(runtime_modules)
+    for module in gaussian_modules:
+        if module not in modules:
+            modules.append(module)
+    executable = str(
+        profile_value("software", "gaussian", "executable_path", default="") or ""
+    ).strip()
+    if not modules and not executable:
+        found = _which("g16")
+        return bool(found), found, "" if found else "Gaussian is not configured"
+    if executable and not re.fullmatch(r"[A-Za-z0-9_./${}:+~-]+", executable):
+        return False, "", "configured Gaussian executable path is unsafe"
+    module_lines = ["module load " + module for module in modules]
+    if executable:
+        command = (
+            "candidate="
+            + shlex.quote(executable)
+            + "; candidate=$(eval \"printf '%s' \\\"$candidate\\\"\"); "
+            + "test -x \"$candidate\"; printf '%s\\n' \"$candidate\""
+        )
+    else:
+        command = "command -v g16"
+    try:
+        completed = _run_login_shell(
+            "\n".join(["set -euo pipefail", *module_lines, command]),
             timeout=30,
         )
     except Exception as exc:
         return False, "", type(exc).__name__ + ": " + str(exc)
-    if int(completed.returncode) != 0:
+    resolved = (completed.stdout or "").strip().splitlines()
+    resolved_path = resolved[-1] if resolved else ""
+    if int(completed.returncode) != 0 or not resolved_path:
         detail = (completed.stderr or completed.stdout or "").strip()
-        return False, "", "configured Python import probe failed: " + detail[:500]
-    try:
-        payload = json.loads((completed.stdout or "").strip().splitlines()[-1])
-        version_values = tuple(int(value) for value in payload["version"])
-    except Exception as exc:
-        return False, "", "configured Python returned malformed probe output: " + str(exc)
-    version = ".".join(str(value) for value in version_values)
-    if version_values[:2] != (3, 11):
-        return False, version, "configured batch Python must be Python 3.11"
-    return True, version, ""
+        return False, "", "Gaussian module/path probe failed: " + detail[:500]
+    return True, resolved_path, ""
 
 
 def check_backends() -> BackendAvailability:
@@ -232,26 +355,54 @@ def check_backends() -> BackendAvailability:
         machine = active_machine() or ""
         profile_ok = False
         profile_error = str(exc)
-    gauss = _gaussian_binary()
-    aim = _from_config_or_path("aimall", "aimqb.ish", "aimqb")
-    fer = _from_config_or_path("ferebus", "FEREBUS", "ferebus")
-    python_executable = expanded_profile_value(
-        "software", "python", "python_path", default=""
-    ) or ""
-    batch_python, batch_python_version, batch_python_error = (
-        _probe_configured_python(str(python_executable))
-    )
+    try:
+        gauss_ok, gauss, gaussian_probe_error = _probe_gaussian_environment()
+        aim = _from_config_or_path("aimall", "aimqb.ish", "aimqb")
+        fer = _from_config_or_path("ferebus", "FEREBUS", "ferebus")
+        python_executable = expanded_profile_value(
+            "software", "python", "python_path", default=""
+        ) or ""
+    except Exception as exc:
+        gauss_ok, gauss = False, ""
+        gaussian_probe_error = type(exc).__name__ + ": " + str(exc)
+        aim = ""
+        fer = ""
+        python_executable = ""
+    try:
+        runtime_modules = configured_daemon_runtime_modules()
+    except Exception as exc:
+        runtime_modules = []
+        batch_python = False
+        batch_python_version = ""
+        batch_python_error = "runtime module configuration invalid: " + str(exc)
+        submitted_imports = {
+            label: {"ok": False, "error": batch_python_error}
+            for label in SUBMITTED_PYTHON_IMPORTS
+        }
+    else:
+        (
+            batch_python,
+            batch_python_version,
+            batch_python_error,
+            submitted_imports,
+        ) = _probe_configured_python_details(
+            str(python_executable),
+            runtime_modules,
+        )
+    ariadne_status = submitted_imports["ariadne"]
+    polus_status = submitted_imports["polus_rs"]
+    pyferebus_status = submitted_imports["pyferebus"]
     return BackendAvailability(
         profile=profile_ok,
         sbatch=bool(sbatch),
         sacct=bool(sacct),
         squeue=bool(squeue),
-        gaussian=bool(gauss),
+        gaussian=bool(gauss_ok),
         aimall=bool(aim),
         ferebus=bool(fer),
-        ariadne=_ariadne_importable(),
-        polus_rs=_polus_rs_importable(),
-        pyferebus=_pyferebus_importable(),
+        ariadne=bool(batch_python and ariadne_status["ok"]),
+        polus_rs=bool(batch_python and polus_status["ok"]),
+        pyferebus=bool(batch_python and pyferebus_status["ok"]),
         bc=bool(bc),
         gaussian_binary=gauss,
         sbatch_path=sbatch,
@@ -266,6 +417,12 @@ def check_backends() -> BackendAvailability:
         batch_python=batch_python,
         batch_python_version=batch_python_version,
         batch_python_error=batch_python_error,
+        batch_runtime_modules=tuple(runtime_modules),
+        gaussian_verified=bool(gauss_ok),
+        gaussian_probe_error=str(gaussian_probe_error),
+        ariadne_probe_error=str(ariadne_status.get("error") or ""),
+        polus_rs_probe_error=str(polus_status.get("error") or ""),
+        pyferebus_probe_error=str(pyferebus_status.get("error") or ""),
     )
 
 
@@ -321,15 +478,27 @@ def missing_backend_message(avail: BackendAvailability) -> str:
         )
     if not avail.ariadne:
         lines.append(
-            "  - ariadne (Python). pip install ariadne into the active venv."
+            "  - ariadne in the submitted Python environment. "
+            + (
+                avail.ariadne_probe_error
+                or "Install ARIADNE into the configured batch venv."
+            )
         )
     if not avail.polus_rs:
         lines.append(
-            "  - polus_rs: polus.samplers.RS.randomSampling (Python). Install POLUS in the active venv."
+            "  - polus_rs in the submitted Python environment. "
+            + (
+                avail.polus_rs_probe_error
+                or "Install POLUS into the configured batch venv."
+            )
         )
     if not avail.pyferebus:
         lines.append(
-            "  - pyferebus (Python). Install the local pyferebus package in the active venv."
+            "  - pyferebus in the submitted Python environment. "
+            + (
+                avail.pyferebus_probe_error
+                or "Install pyferebus into the configured batch venv."
+            )
         )
     if not avail.bc:
         lines.append(

@@ -41,10 +41,12 @@ __all__ = [
     "read_state",
     "write_state",
     "fresh_campaign_state",
+    "make_lifecycle_context",
 ]
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
+READABLE_SCHEMA_VERSIONS = frozenset({6, SCHEMA_VERSION})
 DEFAULT_STATE_FILENAME = "state.json"
 
 
@@ -75,6 +77,41 @@ class CampaignPhase(str, Enum):
 
 class StateSchemaError(ValueError):
     """Raised when state.json fails to validate."""
+
+
+def make_lifecycle_context(
+    *,
+    disposition: str,
+    reason_code: str,
+    message: str,
+    from_phase: Union[CampaignPhase, str],
+    iteration: int,
+    source: str,
+    job_id: Optional[str] = None,
+    scheduler_uncertain: bool = False,
+    recovery_action: Optional[str] = None,
+    details: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    phase_name = (
+        from_phase.value if isinstance(from_phase, CampaignPhase) else str(from_phase)
+    )
+    payload: Dict[str, Any] = {
+        "disposition": str(disposition),
+        "reason_code": str(reason_code),
+        "message": str(message),
+        "from_phase": phase_name,
+        "iteration": int(iteration),
+        "timestamp_iso": datetime.now(timezone.utc).isoformat(),
+        "source": str(source),
+        "scheduler_uncertain": bool(scheduler_uncertain),
+    }
+    if job_id is not None:
+        payload["job_id"] = str(job_id)
+    if recovery_action is not None:
+        payload["recovery_action"] = str(recovery_action)
+    if details is not None:
+        payload["details"] = dict(details)
+    return payload
 
 
 def _coerce_alpha_history(payload):
@@ -131,6 +168,71 @@ def _coerce_sacct_empty_streak(payload: Dict[str, Any]) -> Dict[str, int]:
     return parsed
 
 
+def _coerce_lifecycle_context(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    raw = payload.get("lifecycle_context")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise StateSchemaError("lifecycle_context must be an object or null")
+    required = ("disposition", "reason_code", "message", "from_phase", "iteration", "timestamp_iso")
+    parsed = dict(raw)
+    for key in required:
+        if key == "iteration":
+            continue
+        if not isinstance(parsed.get(key), str) or not parsed[key]:
+            raise StateSchemaError("lifecycle_context." + key + " must be a non-empty string")
+    if parsed["disposition"] not in {"halted", "stopped", "completed"}:
+        raise StateSchemaError(
+            "lifecycle_context.disposition must be halted, stopped, or completed"
+        )
+    if parsed["from_phase"] not in {phase.value for phase in CampaignPhase}:
+        raise StateSchemaError("lifecycle_context.from_phase is not a known phase")
+    if isinstance(parsed.get("iteration"), bool):
+        raise StateSchemaError("lifecycle_context.iteration must be an integer")
+    try:
+        parsed["iteration"] = int(parsed.get("iteration"))
+    except (TypeError, ValueError) as exc:
+        raise StateSchemaError("lifecycle_context.iteration must be an integer") from exc
+    if parsed["iteration"] < 0:
+        raise StateSchemaError("lifecycle_context.iteration must be >= 0")
+    for key in ("job_id", "exception_type", "source", "recovery_action"):
+        value = parsed.get(key)
+        if value is not None and (not isinstance(value, str) or not value):
+            raise StateSchemaError("lifecycle_context." + key + " must be a string or null")
+    scheduler_uncertain = parsed.get("scheduler_uncertain")
+    if scheduler_uncertain is not None and not isinstance(scheduler_uncertain, bool):
+        raise StateSchemaError(
+            "lifecycle_context.scheduler_uncertain must be a boolean or null"
+        )
+    details = parsed.get("details")
+    if details is not None and not isinstance(details, dict):
+        raise StateSchemaError("lifecycle_context.details must be an object or null")
+    return parsed
+
+
+def _coerce_completion_reference(payload: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    raw = payload.get("last_completion_receipt")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise StateSchemaError("last_completion_receipt must be an object or null")
+    path = raw.get("path")
+    digest = raw.get("sha256")
+    receipt_id = raw.get("receipt_id")
+    if not isinstance(path, str) or not path or Path(path).is_absolute():
+        raise StateSchemaError("last_completion_receipt.path must be a relative path")
+    if ".." in Path(path).parts:
+        raise StateSchemaError("last_completion_receipt.path must stay inside the campaign")
+    for key, value in (("sha256", digest), ("receipt_id", receipt_id)):
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(ch not in "0123456789abcdef" for ch in value.lower())
+        ):
+            raise StateSchemaError("last_completion_receipt." + key + " must be SHA256")
+    return {"path": path, "sha256": str(digest).lower(), "receipt_id": str(receipt_id).lower()}
+
+
 @dataclass
 class CampaignState:
     """One snapshot of the daemon's campaign state.
@@ -171,6 +273,8 @@ class CampaignState:
     #UNKNOWN and proceeds to failure handling. Reset to 0 on any non-empty
     #sacct response.
     sacct_empty_streak: Dict[str, int] = field(default_factory=dict)
+    lifecycle_context: Optional[Dict[str, Any]] = None
+    last_completion_receipt: Optional[Dict[str, str]] = None
     schema_version: int = SCHEMA_VERSION
     campaign_uid: str = field(default_factory=lambda: str(uuid.uuid4()))
     campaign_started_iso: str = field(
@@ -187,10 +291,10 @@ class CampaignState:
         if not isinstance(payload, dict):
             raise StateSchemaError("state.json must contain a JSON object")
         schema = _coerce_state_int(payload, "schema_version", -1)
-        if schema != SCHEMA_VERSION:
+        if schema not in READABLE_SCHEMA_VERSIONS:
             raise StateSchemaError(
-                "state.json schema_version " + str(schema)
-                + " != " + str(SCHEMA_VERSION) + " (expected)"
+                "unsupported state.json schema_version " + str(schema)
+                + "; readable versions are " + repr(sorted(READABLE_SCHEMA_VERSIONS))
             )
         try:
             phase = CampaignPhase(payload["phase"])
@@ -309,6 +413,16 @@ class CampaignState:
         shutdown_requested = payload.get("shutdown_requested", False)
         if not isinstance(shutdown_requested, bool):
             raise StateSchemaError("shutdown_requested must be a JSON boolean")
+        lifecycle_context = _coerce_lifecycle_context(payload)
+        completion_reference = _coerce_completion_reference(payload)
+        if lifecycle_context is not None:
+            disposition = str(lifecycle_context["disposition"])
+            if disposition == "halted" and phase is not CampaignPhase.HALTED:
+                raise StateSchemaError("halted lifecycle_context requires phase HALTED")
+            if disposition == "completed" and phase is not CampaignPhase.DONE:
+                raise StateSchemaError("completed lifecycle_context requires phase DONE")
+            if disposition == "stopped" and not shutdown_requested:
+                raise StateSchemaError("stopped lifecycle_context requires shutdown_requested=true")
 
         return cls(
             iteration=iteration,
@@ -327,7 +441,11 @@ class CampaignState:
             alpha_history=_coerce_alpha_history(payload),
             last_n_anti_overlap_flagged=last_n_anti_overlap_flagged,
             sacct_empty_streak=sacct_empty_streak,
-            schema_version=schema,
+            lifecycle_context=lifecycle_context,
+            last_completion_receipt=completion_reference,
+            # Schema 6 is accepted as an input migration only.  Any later
+            # write emits the current schema atomically.
+            schema_version=SCHEMA_VERSION,
             campaign_uid=str(payload["campaign_uid"]),
             campaign_started_iso=str(payload["campaign_started_iso"]),
         )

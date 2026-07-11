@@ -720,6 +720,86 @@ def test_postprocess_settle_retries_initially_missing_artifacts(tmp_path):
     assert any(e.get("event") == "postprocess_settle_retry" for e in events)
 
 
+def test_phase_entry_complete_failure_halts_instead_of_advancing(tmp_path):
+    class FailedInlineExecutor(MockPhaseExecutor):
+        def submit_or_run(self, state, phase):
+            return PhaseResult(
+                is_complete=True,
+                failure_reason="postprocess_only_validation_failed",
+            )
+
+    d = _make_daemon(tmp_path, executor=FailedInlineExecutor())
+    d.data_dir().mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.SEED_SELECT
+    state.iteration = 1
+    write_state(d.state_path(), state)
+
+    status = d.tick()
+
+    assert status == TickStatus.HALTED
+    recovered = read_state(d.state_path())
+    assert recovered.phase is CampaignPhase.HALTED
+    events = list(iter_events(d.journal_path()))
+    assert events[-1]["event"] == "halt"
+    assert events[-1]["reason"] == "postprocess_only_validation_failed"
+
+
+def test_scientific_convergence_transitions_to_done_with_durable_context(tmp_path):
+    d = _make_daemon(tmp_path)
+    d.data_dir().mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state(max_iterations=10)
+    state.phase = CampaignPhase.STOP_CHECK
+    state.iteration = 3
+    state.reference_data_version = 3
+    state.models_version = 3
+    write_state(d.state_path(), state)
+
+    advanced = d._advance(
+        state,
+        CampaignPhase.STOP_CHECK,
+        {"campaign_completion_reason": "alpha0_streak"},
+    )
+
+    assert advanced is True
+    completed = read_state(d.state_path())
+    assert completed.phase is CampaignPhase.DONE
+    assert completed.shutdown_requested is False
+    assert completed.lifecycle_context["disposition"] == "completed"
+    assert completed.lifecycle_context["reason_code"] == "scientific_convergence"
+    assert completed.lifecycle_context["details"]["criterion"] == "alpha0_streak"
+    assert completed.last_completion_receipt is not None
+
+
+def test_max_iterations_transitions_to_done_with_distinct_reason(tmp_path):
+    d = _make_daemon(tmp_path)
+    d.data_dir().mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state(max_iterations=2)
+    state.phase = CampaignPhase.STOP_CHECK
+    state.iteration = 2
+    state.reference_data_version = 2
+    state.models_version = 2
+    write_state(d.state_path(), state)
+
+    assert d._advance(state, CampaignPhase.STOP_CHECK, {}) is True
+
+    completed = read_state(d.state_path())
+    assert completed.phase is CampaignPhase.DONE
+    assert completed.iteration == 2
+    assert completed.lifecycle_context["reason_code"] == "max_iterations_reached"
+    assert completed.last_completion_receipt is not None
+
+
+def test_run_loop_returns_nonzero_for_preexisting_halted_state(tmp_path):
+    d = _make_daemon(tmp_path)
+    d.data_dir().mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.HALTED
+    write_state(d.state_path(), state)
+
+    assert d._run_loop(max_ticks=1) == 20
+
+
 def test_generic_tick_exception_writes_last_exception_sidecar_and_halts(tmp_path):
     d = _make_daemon(tmp_path)
     state = fresh_campaign_state(max_iterations=1)
@@ -732,7 +812,7 @@ def test_generic_tick_exception_writes_last_exception_sidecar_and_halts(tmp_path
 
     d.tick = raise_tick
 
-    assert d._run_loop(max_ticks=1) == 0
+    assert d._run_loop(max_ticks=1) == 21
 
     payload = json.loads(d.last_exception_path().read_text(encoding="utf-8"))
     assert payload["schema_version"] == 1

@@ -46,6 +46,7 @@ START_DAEMON_FOREGROUND_DEFAULTS = {
     "selected_poll_interval": 0,         # 0 = use config default
     "selected_config": "",
     "selected_preset": "",
+    "reopen_converged": False,
 }
 
 
@@ -57,6 +58,7 @@ class StartDaemonForegroundMenuOptions(MenuOptions):
     selected_poll_interval: int
     selected_config: str
     selected_preset: str
+    reopen_converged: bool
 
 
 start_daemon_foreground_menu_options = StartDaemonForegroundMenuOptions(
@@ -182,6 +184,13 @@ class StartDaemonForegroundFunctions:
             return
         from ichor.hpc.active_learning.cli import cmd_resume, cmd_start
 
+        if (
+            start_daemon_foreground_menu_options.reopen_converged
+            and start_daemon_foreground_menu_options.selected_command != "resume"
+        ):
+            print("Completed-campaign reopen is valid only with the resume command.")
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
         mode = start_daemon_foreground_menu_options.selected_mode
         ns = argparse.Namespace(
             campaign_dir=str(campaign_dir),
@@ -200,6 +209,9 @@ class StartDaemonForegroundFunctions:
                 else None
             ),
             preset=preset_name,
+            reopen_converged=bool(
+                start_daemon_foreground_menu_options.reopen_converged
+            ),
         )
         if start_daemon_foreground_menu_options.selected_command == "resume":
             rc = cmd_resume(ns)
@@ -260,6 +272,13 @@ START_DAEMON_FOREGROUND_FIELD_SPECS = [
         prompt="Preset name",
         item_text="Set preset",
         display_path="preset",
+    ),
+    spec(
+        "reopen_converged",
+        "bool",
+        prompt="Explicitly reopen a completed campaign? ",
+        item_text="Set explicit completed-campaign reopen",
+        display_path="reopen_converged",
     ),
 ]
 

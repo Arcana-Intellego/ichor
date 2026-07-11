@@ -64,6 +64,7 @@ def build_daemon_argv(
     max_ticks: Optional[int] = None,
     config: Optional[Path] = None,
     preset: Optional[str] = None,
+    reopen_converged: bool = False,
 ) -> List[str]:
     """Construct the daemon CLI argv for ``start`` or ``resume``."""
     if command not in ("start", "resume"):
@@ -72,6 +73,8 @@ def build_daemon_argv(
         raise ValueError(
             "mode must be one of: mock-ariadne / dry-run / live; got " + repr(mode)
         )
+    if reopen_converged and command != "resume":
+        raise ValueError("reopen_converged is valid only with the resume command")
     argv: List[str] = [
         sys.executable,
         "-m", "ichor.hpc.active_learning.cli",
@@ -87,6 +90,8 @@ def build_daemon_argv(
         argv += ["--poll-interval", str(int(poll_interval))]
     if max_ticks is not None:
         argv += ["--max-ticks", str(int(max_ticks))]
+    if reopen_converged:
+        argv.append("--reopen-converged")
     return argv
 
 
@@ -133,6 +138,7 @@ def launch_daemon_detached_checked(
     max_ticks: Optional[int] = None,
     config: Optional[Path] = None,
     preset: Optional[str] = None,
+    reopen_converged: bool = False,
     log_path: Optional[Path] = None,
     pid_path: Optional[Path] = None,
     startup_grace_seconds: float = 0.25,
@@ -167,6 +173,7 @@ def launch_daemon_detached_checked(
         max_ticks=max_ticks,
         config=config,
         preset=preset,
+        reopen_converged=bool(reopen_converged),
     )
 
     child = _popen_detached(argv, log_path)

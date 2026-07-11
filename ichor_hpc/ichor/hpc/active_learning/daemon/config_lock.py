@@ -891,6 +891,40 @@ def _current_ferebus_consumed_reason(
     return None
 
 
+def _ferebus_quality_can_be_reevaluated(
+    campaign_dir: Union[str, Path],
+    proposed_state: CampaignState,
+) -> bool:
+    """Return true only for complete, immutable, non-running FEREBUS output."""
+    phase = proposed_state.phase
+    if phase not in (CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS):
+        return False
+    try:
+        from . import submission_intent as _submission_intent
+        from .ferebus_quality import validate_ferebus_quality_evidence
+        from .live_executor import validate_ferebus_completed
+
+        intent = _submission_intent.load_intent(
+            campaign_dir,
+            phase.value,
+            int(proposed_state.iteration),
+        )
+        if intent is not None and str(intent.get("status") or "") not in {
+            "FAILED",
+            "SUPERSEDED",
+            "COMPLETED",
+        }:
+            return False
+        staging = trained_models_dir(campaign_dir) / "iteration-staging"
+        ok, _ = validate_ferebus_completed(staging)
+        if not ok:
+            return False
+        validate_ferebus_quality_evidence(staging)
+        return True
+    except Exception:
+        return False
+
+
 def _block_if_uncommitted(
     campaign_dir: Union[str, Path],
     proposed_state: CampaignState,
@@ -917,9 +951,16 @@ def _consumption_block_reason(
     proposed_state: CampaignState,
     *,
     force_resubmit_array_phase: Optional[CampaignPhase] = None,
+    force_retrain_ferebus: bool = False,
     path: str = "",
 ) -> Optional[str]:
     kind = policy.lock_kind
+    if (
+        force_retrain_ferebus
+        and proposed_state.phase in (CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS)
+        and kind == "future_ferebus"
+    ):
+        return None
     if force_resubmit_array_phase is not None:
         phase = force_resubmit_array_phase
         dotted = str(path)
@@ -976,6 +1017,11 @@ def _consumption_block_reason(
     if kind == "pre_ferebus_first":
         return _ferebus_first_consumed(campaign_dir)
     if kind == "future_ferebus":
+        if (
+            str(path).startswith("quality_gates.ferebus_")
+            and _ferebus_quality_can_be_reevaluated(campaign_dir, proposed_state)
+        ):
+            return None
         return _current_ferebus_consumed_reason(campaign_dir, proposed_state)
     if kind == "pre_seed_select":
         return _block_if_uncommitted(
@@ -1031,6 +1077,7 @@ def _classify_change(
     new: Any,
     *,
     force_resubmit_array_phase: Optional[CampaignPhase] = None,
+    force_retrain_ferebus: bool = False,
 ) -> ConfigChange:
     policy = field_policy_for_path(path)
     if policy is None:
@@ -1047,6 +1094,7 @@ def _classify_change(
         campaign_dir,
         proposed_state,
         force_resubmit_array_phase=force_resubmit_array_phase,
+        force_retrain_ferebus=force_retrain_ferebus,
         path=path,
     )
     if blocked_reason:
@@ -1077,6 +1125,7 @@ def review_config_changes(
     *,
     initialise_missing: bool = False,
     force_resubmit_array_phase: Optional[CampaignPhase] = None,
+    force_retrain_ferebus: bool = False,
 ) -> ConfigLockReview:
     path = config_lock_path(campaign_dir)
     if not path.is_file():
@@ -1138,12 +1187,41 @@ def review_config_changes(
             old,
             new,
             force_resubmit_array_phase=force_resubmit_array_phase,
+            force_retrain_ferebus=force_retrain_ferebus,
         )
         if change.allowed:
             review.allowed_changes.append(change)
         else:
             review.blocked_changes.append(change)
     return review
+
+
+def archive_ferebus_iteration_staging_for_retrain(
+    campaign_dir: Union[str, Path],
+    proposed_state: CampaignState,
+) -> Optional[str]:
+    """Losslessly archive complete FEREBUS output before explicit retraining."""
+    if proposed_state.phase not in (CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS):
+        raise ValueError("--retrain-ferebus requires FEREBUS recovery phase")
+    if any(value for value in proposed_state.pending_jobs.values()):
+        raise ValueError("cannot retrain FEREBUS while state records pending jobs")
+    campaign = Path(campaign_dir)
+    target = trained_models_dir(campaign) / "iteration-staging"
+    if not target.exists():
+        return None
+    if target.is_symlink() or not target.is_dir():
+        raise ValueError("refusing invalid FEREBUS iteration-staging")
+    from .ferebus_quality import validate_ferebus_quality_evidence
+    from .live_executor import validate_ferebus_completed
+
+    ok, reason = validate_ferebus_completed(target)
+    if not ok:
+        raise ValueError("FEREBUS staging is not complete: " + str(reason))
+    validate_ferebus_quality_evidence(target)
+    archive = _timestamped_reconcile_sibling(target)
+    _ensure_inside_campaign(campaign, archive)
+    target.rename(archive)
+    return str(archive)
 
 
 def assert_config_unchanged_for_start(

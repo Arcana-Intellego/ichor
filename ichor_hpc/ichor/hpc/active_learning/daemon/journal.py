@@ -63,10 +63,14 @@ __all__ = [
 #  preset_loaded           -- placeholder
 KNOWN_EVENT_TYPES = (
     "campaign_started",
+    "campaign_completed",
+    "campaign_reopened",
+    "scientific_convergence_reached",
     "phase_transition",
     "sbatch",
     "phase_succeeded",
     "sacct_error",
+    "sacct_error_timeout",
     "shutdown_requested",
     "daemon_started",
     "daemon_stopped",
@@ -121,6 +125,8 @@ KNOWN_EVENT_TYPES = (
     "submission_intent_expected_tasks_invalid",
     "submission_intent_update_failed",
     "submission_intent_read_failed",
+    "submission_intent_completion_deferred",
+    "phase_completion_replayed",
     "provenance_index_repaired",
     "provenance_index_repair_failed",
     "postprocess_settle_retry",

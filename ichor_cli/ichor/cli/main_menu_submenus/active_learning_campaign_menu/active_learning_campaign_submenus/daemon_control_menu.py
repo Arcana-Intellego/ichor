@@ -91,27 +91,44 @@ class DaemonControlFunctions:
 
     @staticmethod
     def preflight_backends():
-        """Probe sbatch / sacct / Gaussian / AIMAll / FEREBUS / ariadne and
-        print a human-readable availability report."""
-        from ichor.hpc.active_learning.daemon.preflight import (
-            check_backends,
-            missing_backend_message,
-        )
+        """Run the same campaign-aware readiness gate as live start."""
+        from ichor.hpc.active_learning.cli import cmd_preflight
 
-        avail = check_backends()
-        if avail.all_present:
-            print("All live backends present.")
-            print("  sbatch:   " + avail.sbatch_path)
-            print("  sacct:    " + avail.sacct_path)
-            print("  gaussian: " + avail.gaussian_binary)
-            print("  aimall:   " + avail.aimall_path)
-            print("  ferebus:  " + avail.ferebus_path)
-            print("  ariadne:  importable")
-            print("  polus_rs: importable")
-            print("  pyferebus: importable")
-            print("  bc:       " + avail.bc_path)
-        else:
-            print(missing_backend_message(avail))
+        ns = _guarded_campaign_dir_ns()
+        if ns is None:
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        ns.json = False
+        ns.verbose = True
+        ns.submit_environment_smoke = False
+        rc = cmd_preflight(ns)
+        if rc != 0:
+            print("campaign preflight returned exit code " + str(rc))
+        user_input_free_flow("Press enter to return to the menu: ", "")
+
+    @staticmethod
+    def submitted_environment_smoke():
+        """Run ordinary preflight, then submit the opt-in compute-node smoke."""
+        from ichor.hpc.active_learning.cli import cmd_preflight
+
+        ns = _guarded_campaign_dir_ns()
+        if ns is None:
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        answer = user_input_free_flow(
+            "Submit one five-minute, one-core environment smoke job? Type YES: ",
+            "",
+        )
+        if str(answer).strip() != "YES":
+            print("Cancelled.")
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        ns.json = False
+        ns.verbose = True
+        ns.submit_environment_smoke = True
+        rc = cmd_preflight(ns)
+        if rc != 0:
+            print("submitted environment smoke returned exit code " + str(rc))
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
@@ -237,6 +254,7 @@ class DaemonControlFunctions:
         ns.archive_existing_array_task_outputs = bool(
             getattr(ns, "archive_existing_array_task_outputs", False)
         )
+        ns.retrain_ferebus = bool(getattr(ns, "retrain_ferebus", False))
         ns.json = bool(getattr(ns, "json", False))
         return ns
 
@@ -339,7 +357,7 @@ class DaemonControlFunctions:
 
     @staticmethod
     def reconcile_allow_fresh_init():
-        """Dangerous reconcile mode matching --allow-fresh-init."""
+        """Reconcile mode matching identity-preserving --allow-fresh-init."""
         from ichor.hpc.active_learning.cli import cmd_reconcile
 
         ns = _guarded_campaign_dir_ns()
@@ -347,7 +365,8 @@ class DaemonControlFunctions:
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
         answer = user_input_free_flow(
-            "Allow fresh INIT over non-empty campaign data? This is dangerous. Type YES: ",
+            "Allow fresh INIT only if existing campaign identity remains trusted? "
+            "This cannot mint a UID for a non-empty campaign. Type YES: ",
             "",
         )
         if answer != "YES":
@@ -390,6 +409,31 @@ class DaemonControlFunctions:
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
+    def reconcile_retrain_ferebus():
+        """Archive complete rejected FEREBUS output and request a new fit."""
+        from ichor.hpc.active_learning.cli import cmd_reconcile
+
+        ns = _guarded_campaign_dir_ns()
+        if ns is None:
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        answer = user_input_free_flow(
+            "Archive complete FEREBUS output and retrain from scratch? Type YES: ",
+            "",
+        )
+        if answer != "YES":
+            print("Cancelled.")
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        ns = DaemonControlFunctions._set_reconcile_defaults(ns)
+        ns.apply = True
+        ns.retrain_ferebus = True
+        rc = cmd_reconcile(ns)
+        if rc != 0:
+            print("reconcile --retrain-ferebus returned exit code " + str(rc))
+        user_input_free_flow("Press enter to return to the menu: ", "")
+
+    @staticmethod
     def import_trajectory_pool():
         """Compatibility dispatcher for the init/import option submenu."""
         from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_submenus.daemon_control_submenus.import_trajectory_pool_submenu import (
@@ -425,7 +469,11 @@ daemon_control_menu_items = [
         "Recovery dashboard",
         DaemonControlFunctions.show_recovery_dashboard,
     ),
-    FunctionItem("Preflight backends", DaemonControlFunctions.preflight_backends),
+    FunctionItem("Campaign live preflight", DaemonControlFunctions.preflight_backends),
+    FunctionItem(
+        "Submit compute-node environment smoke",
+        DaemonControlFunctions.submitted_environment_smoke,
+    ),
     SubmenuItem(
         IMPORT_TRAJECTORY_POOL_MENU_DESCRIPTION.title,
         import_trajectory_pool_menu,
@@ -454,6 +502,10 @@ daemon_control_menu_items = [
     FunctionItem(
         "Reconcile force-resubmit current array",
         DaemonControlFunctions.reconcile_force_resubmit_array,
+    ),
+    FunctionItem(
+        "Reconcile and retrain FEREBUS",
+        DaemonControlFunctions.reconcile_retrain_ferebus,
     ),
     FunctionItem(
         "Restore campaign.yaml proposal from config lock",

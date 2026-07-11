@@ -440,6 +440,26 @@ def _write_ariadne_manifest(iter_dir):
         if config_path.is_file()
         else CampaignConfig()
     )
+    from ichor.hpc.active_learning.daemon.config_lock import (
+        canonical_config,
+        config_fingerprint,
+    )
+    from ichor.hpc.active_learning.handoff_manifests import (
+        write_ariadne_batch_decision,
+    )
+
+    write_ariadne_batch_decision(
+        iter_dir,
+        campaign_uid="test",
+        iteration=1,
+        config_sha256=config_fingerprint(canonical_config(config)),
+        failure_threshold_fraction=float(config.runtime.failure_threshold_fraction),
+        expected_n=len(accepted),
+        n_accepted=len(accepted),
+        n_rejected=0,
+        accepted=True,
+        reasons=[],
+    )
     resolve_sampling_protocol(
         campaign,
         config,

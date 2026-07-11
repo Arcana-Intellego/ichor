@@ -392,8 +392,17 @@ or thermodynamics preset.
 ## 7. launch the daemon
 
 ```
+ichor-al-daemon preflight --campaign-dir . --verbose
+ichor-al-daemon preflight --campaign-dir . --verbose --submit-environment-smoke
 ichor-al-daemon start --live --campaign-dir . --max-ticks 2000
 ```
+
+The second preflight command is an explicit commissioning gate. It submits one
+five-minute, one-core job which imports the configured daemon stack and resolves
+Gaussian, AIMAll, FEREBUS and `bc` on a compute node. It does not run scientific
+work. Inspect the reported output path and require a successful result before
+the first live campaign; ordinary preflight and daemon start never submit this
+smoke automatically.
 
 Leave it running. `--max-ticks 2000` is a safety net (the daemon will
 not run forever even if something hangs). You can tail the journal in
@@ -469,20 +478,30 @@ If the run failed mid-iteration:
 ichor-al-daemon journal --campaign-dir . | tail -n 50
 ichor-al-daemon status --campaign-dir .
 
-# if state.json is inconsistent / corrupt:
+# if state.json is inconsistent, corrupt, or HALTED:
 ichor-al-daemon reconcile --campaign-dir .
-# review the proposed state, then promote manually:
-# mv .DATA/ACTIVE_LEARNING/state.json.proposed .DATA/ACTIVE_LEARNING/state.json
+# Review the recovery target, contract checks, protected artefacts, and config
+# decision. Apply only when the dry-run report is safe:
+ichor-al-daemon reconcile --campaign-dir . --apply
 ```
 
-For a clean re-run (wipes all on-disk state, keeps the trajectory pool):
+Do not move `state.json.proposed` over `state.json` manually. `--apply` holds the
+daemon lock, rechecks scheduler intent evidence, archives safe stale staging,
+updates the config lock, and verifies the final recovery contract.
+
+`DONE` is a successful terminal lifecycle, not a stopped daemon. To extend a
+completed campaign deliberately, first increase `campaign.max_iterations`, run
+and review `reconcile --apply`, then use the explicit reopen command:
 
 ```
-rm -rf .DATA/ACTIVE_LEARNING
-rm -rf BOOTSTRAP QM_REFERENCE_DATA TRAINED_MODELS ACTIVE_LEARNING
-# the trajectory pool at .DATA/TRAJECTORY/ is preserved
-ichor-al-daemon start --live --campaign-dir . --max-ticks 2000
+ichor-al-daemon resume --live --campaign-dir . --reopen-converged --max-ticks 2000
 ```
+
+Never delete versioned campaign directories to force a rerun. For a genuinely
+fresh run, create a new campaign directory and initialise it from the intended
+pool/anchor. A failed mandatory anchor or an exhausted immutable replacement
+reserve cannot be repaired in place; start a new campaign with a valid anchor,
+a larger reserve, or a smaller required batch.
 
 ## 10. common failure modes
 

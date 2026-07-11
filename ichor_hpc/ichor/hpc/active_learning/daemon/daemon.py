@@ -29,6 +29,7 @@ state-machine progression.
 from __future__ import annotations
 
 import os
+import copy
 import json
 import signal
 import socket
@@ -61,6 +62,7 @@ from .state import (
     StateSchemaError,
     atomic_write_json,
     fresh_campaign_state,
+    make_lifecycle_context,
     read_state,
     write_state,
 )
@@ -201,6 +203,37 @@ def next_phase(current: CampaignPhase, iteration: int, max_iterations: int) -> T
     if idx + 1 >= len(PHASE_ORDER):
         return CampaignPhase.DONE, iteration
     return PHASE_ORDER[idx + 1], iteration
+
+
+def _halt_reason_code(reason: str) -> str:
+    text = str(reason)
+    lower = text.lower()
+    if "mandatory bootstrap anchor failed" in lower:
+        return "mandatory_anchor_failed"
+    if "point-allocation reserve exhausted" in lower:
+        return "replacement_reserve_exhausted"
+    prefix = text.split(":", 1)[0].strip().lower()
+    cleaned = "".join(ch if ch.isalnum() else "_" for ch in prefix).strip("_")
+    return cleaned[:80] or "daemon_halt"
+
+
+def _halt_recovery_action(reason_code: str) -> str:
+    if reason_code == "mandatory_anchor_failed":
+        return (
+            "inspect the failed anchor quantum output; correct the anchor or "
+            "start a new campaign because mandatory anchors cannot be replaced"
+        )
+    if reason_code == "replacement_reserve_exhausted":
+        return (
+            "the immutable allocation cannot be repaired in place; start a new "
+            "campaign with a larger pre-QM candidate reserve or a smaller required batch"
+        )
+    if reason_code == "ferebus_quality_failed":
+        return (
+            "inspect FEREBUS_QUALITY.json; adjust only justified quality "
+            "thresholds and reconcile, or use reconcile --retrain-ferebus --apply"
+        )
+    return "inspect the recorded reason and run reconcile before restarting"
 
 
 @dataclass
@@ -564,7 +597,14 @@ class Daemon:
         if state.shutdown_requested:
             return TickStatus.SHUTDOWN
         if state.is_terminal:
+            receipt_status = self._recover_phase_completion(state)
+            if receipt_status is not None:
+                return receipt_status
             return TickStatus.TERMINAL
+
+        receipt_status = self._recover_phase_completion(state)
+        if receipt_status is not None:
+            return receipt_status
 
         phase = state.phase
         pending = state.pending_jobs.get(phase.value)
@@ -572,6 +612,101 @@ class Daemon:
         if pending is None:
             return self._on_phase_entry(state, phase)
         return self._on_pending(state, phase, pending)
+
+    def _recover_phase_completion(self, state: CampaignState) -> Optional[str]:
+        """Validate the latest receipt or replay one written before state advance."""
+        from .completion_receipts import (
+            CompletionReceiptError,
+            replayable_completion_receipts,
+            validate_completion_reference,
+        )
+        from .config_lock import canonical_config, config_fingerprint
+
+        reference = getattr(state, "last_completion_receipt", None)
+        if isinstance(reference, dict):
+            try:
+                payload = validate_completion_reference(
+                    self.campaign_dir,
+                    reference,
+                    expected_campaign_uid=str(state.campaign_uid),
+                )
+            except Exception as exc:
+                return self._halt(
+                    state,
+                    state.phase,
+                    "completion_receipt_invalid: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)[:180],
+                )
+            intent = _submission_intent.load_intent(
+                self.campaign_dir,
+                str(payload["phase"]),
+                int(payload["iteration"]),
+            )
+            if intent is not None and str(intent.get("status") or "") not in {
+                "COMPLETED",
+                "FAILED",
+                "SUPERSEDED",
+            }:
+                try:
+                    _submission_intent.mark_completed(
+                        self.campaign_dir,
+                        str(payload["phase"]),
+                        int(payload["iteration"]),
+                        completion_receipt=dict(reference),
+                    )
+                except Exception as exc:
+                    self._journal(
+                        "submission_intent_completion_deferred",
+                        phase=str(payload.get("phase") or ""),
+                        iteration=int(payload.get("iteration", 0)),
+                        error=type(exc).__name__ + ": " + str(exc)[:180],
+                        completion_receipt=dict(reference),
+                    )
+
+        config_sha = config_fingerprint(canonical_config(self.config))
+        try:
+            matches = replayable_completion_receipts(
+                self.campaign_dir,
+                state,
+                expected_config_sha256=config_sha,
+            )
+        except CompletionReceiptError as exc:
+            return self._halt(
+                state,
+                state.phase,
+                "completion_receipt_recovery_failed: " + str(exc)[:200],
+            )
+        if not matches:
+            return None
+        if len(matches) != 1:
+            return self._halt(
+                state,
+                state.phase,
+                "completion_receipt_recovery_ambiguous: found "
+                + str(len(matches))
+                + " receipts for the same authoritative state",
+            )
+        match = matches[0]
+        payload = dict(match["payload"])
+        recovered = CampaignState.from_dict(dict(payload["state_after"]))
+        recovered.last_completion_receipt = dict(match["reference"])
+        self._persist(recovered)
+        self._complete_intent_after_advance(
+            str(payload["phase"]),
+            int(payload["iteration"]),
+            recovered.last_completion_receipt,
+        )
+        self._journal(
+            "phase_completion_replayed",
+            phase=str(payload["phase"]),
+            iteration=int(payload["iteration"]),
+            to_phase=recovered.phase.value,
+            to_iteration=int(recovered.iteration),
+            completion_receipt=dict(recovered.last_completion_receipt),
+        )
+        return TickStatus.ADVANCED
 
     def _verify_committed_artifacts_if_enabled(
         self,
@@ -806,6 +941,10 @@ class Daemon:
         intent_written = False
         if phase_name in SBATCH_PHASES:
             try:
+                planned_expected_tasks = self._infer_expected_tasks_from_artifacts(
+                    state,
+                    phase,
+                )
                 _submission_intent.write_pre_submit_intent(
                     self.campaign_dir,
                     campaign_uid=str(getattr(state, "campaign_uid", "")),
@@ -814,6 +953,7 @@ class Daemon:
                     replacement_round=int(
                         getattr(state, "replacement_round", 0)
                     ),
+                    expected_tasks=planned_expected_tasks,
                 )
                 intent_written = True
             except Exception as exc:
@@ -901,33 +1041,37 @@ class Daemon:
             )
             return TickStatus.SUBMITTED
         if result.is_complete:
-            #inline phase, or executor decided no submission needed.
-            if intent_written and phase_name in SBATCH_PHASES:
-                try:
-                    _submission_intent.mark_completed(
-                        self.campaign_dir,
-                        phase_name,
-                        int(state.iteration),
-                    )
-                except Exception as exc:
-                    return self._halt(
-                        state,
-                        phase,
-                        "submission_intent_complete_failed: "
-                        + type(exc).__name__
-                        + ": "
-                        + str(exc)[:160],
-                    )
-            return (
-                TickStatus.ADVANCED
-                if self._advance(
-                    state,
-                    phase,
-                    result.state_updates,
-                    next_phase_override=result.next_phase_override,
-                )
-                else TickStatus.HALTED
+            # Inline phase, postprocess-only recovery, or an executor that
+            # decided no submission was needed.  This path must honour the
+            # same failure contract as ordinary terminal-job postprocessing.
+            if result.failure_reason:
+                if intent_written and phase_name in SBATCH_PHASES:
+                    try:
+                        _submission_intent.mark_failed(
+                            self.campaign_dir,
+                            phase_name,
+                            int(state.iteration),
+                            str(result.failure_reason)[:200],
+                        )
+                    except Exception:
+                        pass
+                return self._halt(state, phase, str(result.failure_reason))
+            completed_iteration = int(state.iteration)
+            advanced = self._advance(
+                state,
+                phase,
+                result.state_updates,
+                next_phase_override=result.next_phase_override,
             )
+            if not advanced:
+                return TickStatus.HALTED
+            if intent_written and phase_name in SBATCH_PHASES:
+                self._complete_intent_after_advance(
+                    phase_name,
+                    completed_iteration,
+                    state.last_completion_receipt,
+                )
+            return TickStatus.ADVANCED
         #defensive: executor returned neither a JobID nor completion.
         raise RuntimeError(
             "executor returned no submitted_job_id and is_complete=False for "
@@ -1172,13 +1316,50 @@ class Daemon:
                 expected_task_count=expected_tasks,
             )
         except RuntimeError as exc:
-            # sacct hiccup -- log and keep polling next tick. Don't escalate
-            #immediately because transient sacct failures are common.
+            error_key = str(job_id) + ":ERROR"
+            current = int(state.sacct_empty_streak.get(error_key, 0)) + 1
+            state.sacct_empty_streak[error_key] = current
+            self._persist(state)
+            liveness = self._check_job_liveness(job_id)
+            max_errors = int(
+                getattr(self.config.runtime, "poll_sacct_error_max_ticks", 10)
+            )
             self._journal(
                 "sacct_error", phase=phase.value, job_id=job_id,
                 error=str(exc)[:200],
+                streak=int(current),
+                max_ticks=int(max_errors),
+                squeue_active=(
+                    None if liveness is None else bool(getattr(liveness, "active", False))
+                ),
+                squeue_inconclusive=(
+                    None if liveness is None else bool(getattr(liveness, "inconclusive", False))
+                ),
             )
+            if current >= max_errors:
+                self._journal(
+                    "sacct_error_timeout",
+                    phase=phase.value,
+                    iteration=int(state.iteration),
+                    job_id=str(job_id),
+                    streak=int(current),
+                    max_ticks=int(max_errors),
+                )
+                return self._halt_scheduler_uncertain(
+                    state,
+                    phase,
+                    "sacct_error_timeout: "
+                    + str(current)
+                    + "/"
+                    + str(max_errors)
+                    + " accounting calls failed for job_id="
+                    + str(job_id),
+                )
             return TickStatus.POLLING
+        error_key = str(job_id) + ":ERROR"
+        if error_key in state.sacct_empty_streak:
+            state.sacct_empty_streak.pop(error_key, None)
+            self._persist(state)
         summary = aggregate_states(
             job_id,
             observations,
@@ -1442,93 +1623,25 @@ class Daemon:
         state: CampaignState,
         phase: CampaignPhase,
     ) -> Optional[int]:
+        from .scheduler_contracts import infer_expected_tasks_from_artifacts
+
         phase_name = phase.value
-        if phase_name in ("PHASE_A_POLUS", "PHASE_B_POLUS"):
-            return 1
-        try:
-            if phase_name in {
-                "INITIAL_REPLACEMENT_GAUSSIAN",
-                "INITIAL_REPLACEMENT_AIMALL",
-                "REPLACEMENT_GAUSSIAN",
-                "REPLACEMENT_AIMALL",
-            }:
-                from ..replacement_sampling import (
-                    read_replacement_sample_strict,
-                    replacement_round_dir,
-                )
 
-                context = (
-                    "bootstrap" if phase_name.startswith("INITIAL_") else "active"
-                )
-                iteration = 0 if context == "bootstrap" else int(state.iteration)
-                replacement_round = int(getattr(state, "replacement_round", 0))
-                manifest = read_replacement_sample_strict(
-                    self.campaign_dir,
-                    context=context,
-                    iteration=iteration,
-                    replacement_round=replacement_round,
-                )
-                round_dir = replacement_round_dir(
-                    self.campaign_dir,
-                    context=context,
-                    iteration=iteration,
-                    replacement_round=replacement_round,
-                )
-                staged_count = self._count_nonempty_lines(round_dir / "POINTS.txt")
-                manifest_count = int(manifest.get("n_candidates", 0))
-                if staged_count != manifest_count or manifest_count <= 0:
-                    raise ValueError(
-                        "replacement POINTS.txt count does not match its strict sample manifest"
-                    )
-                return manifest_count
-            if phase_name in ("INITIAL_GAUSSIAN", "INITIAL_AIMALL"):
-                return self._count_nonempty_lines(
-                    self.campaign_dir / ".DATA" / "STAGING" / "initial" / "POINTS.txt"
-                )
-            if phase_name in ("GAUSSIAN", "AIMALL"):
-                return self._count_nonempty_lines(
-                    self.campaign_dir
-                    / ".DATA"
-                    / "STAGING"
-                    / ("iter_" + str(int(state.iteration)))
-                    / "POINTS.txt"
-                )
-            if phase_name in ("INITIAL_FEREBUS", "FEREBUS"):
-                manifest = (
-                    trained_models_dir(self.campaign_dir)
-                    / "iteration-staging"
-                    / "FEREBUS_TASKS.json"
-                )
-                if manifest.is_file():
-                    data = json.loads(manifest.read_text(encoding="utf-8"))
-                    raw = data.get("n_tasks")
-                    if raw is not None:
-                        value = int(raw)
-                        return value if value > 0 else None
-                    tasks = data.get("tasks")
-                    if isinstance(tasks, list) and tasks:
-                        return len(tasks)
-            if phase_name == "ARIADNE_ARRAY":
-                from ..layout import active_iteration_dir
-                from ..seed_identity import read_ariadne_task_map
-
-                task_map = read_ariadne_task_map(
-                    active_iteration_dir(
-                        self.campaign_dir,
-                        int(state.iteration),
-                    ),
-                    expected_iteration=int(state.iteration),
-                )
-                return int(task_map["n_tasks"])
-        except Exception as exc:
+        def record_error(exc: Exception) -> None:
             self._journal(
                 "expected_tasks_inference_failed",
                 phase=phase_name,
                 iteration=int(state.iteration),
                 error=type(exc).__name__ + ": " + str(exc)[:160],
             )
-            return None
-        return None
+
+        return infer_expected_tasks_from_artifacts(
+            self.campaign_dir,
+            phase=phase,
+            iteration=int(state.iteration),
+            replacement_round=int(getattr(state, "replacement_round", 0)),
+            on_error=record_error,
+        )
 
     @staticmethod
     def _count_nonempty_lines(path: Path) -> Optional[int]:
@@ -1761,34 +1874,37 @@ class Daemon:
                 n_observed=int(getattr(summary, "n_observed", 0)),
                 n_missing=int(getattr(summary, "n_missing", 0)),
             )
-            try:
-                _submission_intent.mark_completed(
-                    self.campaign_dir, phase.value, completed_iteration,
-                )
-            except Exception as exc:
-                self._journal(
-                    "submission_intent_update_failed",
-                    phase=phase.value,
-                    iteration=completed_iteration,
-                    error=str(exc)[:200],
-                )
-        #clear the pending job and advance.
+        # Clear the pending job in the prospective state and advance it
+        # before making the submission intent inactive.  The write-ahead
+        # completion receipt makes either crash window replayable.
         state.pending_jobs[phase.value] = None
+        advanced = self._advance(
+            state,
+            phase,
+            result.state_updates,
+            next_phase_override=result.next_phase_override,
+            job_id=str(summary.parent_job_id),
+            expected_tasks=getattr(summary, "n_expected", None),
+        )
+        if not advanced:
+            return TickStatus.HALTED
+        if phase.value in SBATCH_PHASES:
+            self._complete_intent_after_advance(
+                phase.value,
+                completed_iteration,
+                state.last_completion_receipt,
+            )
         self._journal(
-            "phase_succeeded", phase=phase.value, iteration=state.iteration,
+            "phase_succeeded", phase=phase.value, iteration=completed_iteration,
             n_completed=summary.n_completed, n_failed=summary.n_failed,
             n_tasks=summary.n_tasks,
+            completion_receipt=(
+                dict(state.last_completion_receipt)
+                if isinstance(state.last_completion_receipt, dict)
+                else None
+            ),
         )
-        return (
-            TickStatus.ADVANCED
-            if self._advance(
-                state,
-                phase,
-                result.state_updates,
-                next_phase_override=result.next_phase_override,
-            )
-            else TickStatus.HALTED
-        )
+        return TickStatus.ADVANCED
 
     def _handle_failure(
         self,
@@ -1884,7 +2000,17 @@ class Daemon:
                 phase,
                 "required_phase_output_missing_after_failure: " + contract_error,
             )
-        return TickStatus.SCRUBBED if self._advance(state, phase, {}) else TickStatus.HALTED
+        return (
+            TickStatus.SCRUBBED
+            if self._advance(
+                state,
+                phase,
+                {},
+                job_id=str(summary.parent_job_id),
+                expected_tasks=getattr(summary, "n_expected", None),
+            )
+            else TickStatus.HALTED
+        )
 
     def _clear_sacct_streaks(self, state: CampaignState, job_id: str) -> None:
         state.sacct_empty_streak.pop(str(job_id), None)
@@ -1892,6 +2018,37 @@ class Daemon:
         state.sacct_empty_streak.pop(str(job_id) + ":MISSING", None)
         state.sacct_empty_streak.pop(str(job_id) + ":SQUEUE_INCONCLUSIVE:empty", None)
         state.sacct_empty_streak.pop(str(job_id) + ":SQUEUE_INCONCLUSIVE:missing", None)
+        state.sacct_empty_streak.pop(str(job_id) + ":ERROR", None)
+
+    def _complete_intent_after_advance(
+        self,
+        phase_name: str,
+        iteration: int,
+        completion_receipt: Optional[Dict[str, Any]],
+    ) -> None:
+        try:
+            _submission_intent.mark_completed(
+                self.campaign_dir,
+                phase_name,
+                int(iteration),
+                completion_receipt=(
+                    dict(completion_receipt)
+                    if isinstance(completion_receipt, dict)
+                    else None
+                ),
+            )
+        except Exception as exc:
+            self._journal(
+                "submission_intent_completion_deferred",
+                phase=phase_name,
+                iteration=int(iteration),
+                error=type(exc).__name__ + ": " + str(exc)[:180],
+                completion_receipt=(
+                    dict(completion_receipt)
+                    if isinstance(completion_receipt, dict)
+                    else None
+                ),
+            )
 
     def _liveness_blocks_accounting_timeout(self, liveness: Optional[Any]) -> bool:
         return liveness is not None and bool(getattr(liveness, "active", False))
@@ -2143,10 +2300,26 @@ class Daemon:
             except Exception:
                 pass
             state.pending_jobs[phase.value] = None
+        reason_code = _halt_reason_code(reason)
+        state.lifecycle_context = make_lifecycle_context(
+            disposition="halted",
+            reason_code=reason_code,
+            message=str(reason),
+            from_phase=phase,
+            iteration=int(state.iteration),
+            source="daemon",
+            recovery_action=_halt_recovery_action(reason_code),
+        )
         state.phase = CampaignPhase.HALTED
         self._persist(state)
-        self._journal("halt", from_phase=phase.value, reason=reason,
-                      iteration=state.iteration)
+        self._journal(
+            "halt",
+            from_phase=phase.value,
+            reason=reason,
+            reason_code=reason_code,
+            recovery_action=_halt_recovery_action(reason_code),
+            iteration=state.iteration,
+        )
         return TickStatus.HALTED
 
     def _halt_scheduler_uncertain(
@@ -2155,12 +2328,29 @@ class Daemon:
         phase: CampaignPhase,
         reason: str,
     ) -> str:
+        reason_code = _halt_reason_code(reason)
+        pending_job = state.pending_jobs.get(phase.value)
+        state.lifecycle_context = make_lifecycle_context(
+            disposition="halted",
+            reason_code=reason_code,
+            message=str(reason),
+            from_phase=phase,
+            iteration=int(state.iteration),
+            source="daemon",
+            job_id=None if pending_job is None else str(pending_job),
+            scheduler_uncertain=True,
+            recovery_action=(
+                "inspect sacct and squeue for the preserved job, then reconcile; "
+                "do not resubmit until job liveness is conclusive"
+            ),
+        )
         state.phase = CampaignPhase.HALTED
         self._persist(state)
         self._journal(
             "halt",
             from_phase=phase.value,
             reason=reason,
+            reason_code=reason_code,
             scheduler_uncertain=True,
             preserves_pending_jobs=True,
             preserves_submission_intent=True,
@@ -2181,6 +2371,19 @@ class Daemon:
         except Exception:
             return False
         prior_phase = state.phase
+        state.lifecycle_context = make_lifecycle_context(
+            disposition="halted",
+            reason_code="tick_exception",
+            message=type(exc).__name__ + ": " + str(exc)[:200],
+            from_phase=prior_phase,
+            iteration=int(state.iteration),
+            source="daemon",
+            scheduler_uncertain=any(bool(value) for value in state.pending_jobs.values()),
+            recovery_action=(
+                "inspect LAST_EXCEPTION.json and any preserved Slurm jobs, then reconcile"
+            ),
+            details={"exception_type": type(exc).__name__},
+        )
         state.phase = CampaignPhase.HALTED
         try:
             self._persist(state)
@@ -2310,7 +2513,55 @@ class Daemon:
         state_updates: Dict[str, Any],
         *,
         next_phase_override: Optional[str] = None,
+        job_id: Optional[str] = None,
+        expected_tasks: Optional[int] = None,
     ) -> bool:
+        completion_reason = state_updates.get("campaign_completion_reason")
+        applied_updates = {
+            key: value
+            for key, value in state_updates.items()
+            if key != "campaign_completion_reason"
+        }
+        if completion_reason is not None:
+            before = self._authoritative_state_before_transition(state)
+            after = copy.deepcopy(state)
+            self._apply_state_updates(after, applied_updates)
+            after.phase = CampaignPhase.DONE
+            after.lifecycle_context = make_lifecycle_context(
+                disposition="completed",
+                reason_code="scientific_convergence",
+                message="scientific convergence criterion reached: "
+                + str(completion_reason),
+                from_phase=phase,
+                iteration=int(state.iteration),
+                source="daemon",
+                recovery_action=(
+                    "campaign is complete; use resume --reopen-converged only "
+                    "after deliberately increasing max_iterations"
+                ),
+                details={"criterion": str(completion_reason)},
+            )
+            self._persist_transition_with_receipt(
+                state,
+                before,
+                after,
+                phase,
+                dict(state_updates),
+                next_phase=CampaignPhase.DONE,
+                next_iteration=int(state.iteration),
+                job_id=job_id,
+                expected_tasks=expected_tasks,
+            )
+            self._journal(
+                "campaign_completed",
+                from_phase=phase.value,
+                iteration=int(state.iteration),
+                reason_code="scientific_convergence",
+                criterion=str(completion_reason),
+                completion_receipt=dict(state.last_completion_receipt or {}),
+            )
+            return True
+
         #NB:STOP_CHECK ghost-iteration fix. When _inline_stop_check
         #returns {"shutdown_requested": True}, the daemon must NOT also
         #advance phase + iteration -- otherwise state.json snapshots show
@@ -2319,8 +2570,29 @@ class Daemon:
         #Persist the flag + journal a shutdown_requested event; next tick
         #exits cleanly via state.shutdown_requested.
         if bool(state_updates.get("shutdown_requested", False)):
-            self._apply_state_updates(state, state_updates)
-            self._persist(state)
+            before = self._authoritative_state_before_transition(state)
+            after = copy.deepcopy(state)
+            self._apply_state_updates(after, applied_updates)
+            after.lifecycle_context = make_lifecycle_context(
+                disposition="stopped",
+                reason_code="executor_stop_request",
+                message="executor requested an orderly campaign stop",
+                from_phase=phase,
+                iteration=int(state.iteration),
+                source="daemon",
+                recovery_action="use resume to clear the operator-style stop request",
+            )
+            self._persist_transition_with_receipt(
+                state,
+                before,
+                after,
+                phase,
+                state_updates,
+                next_phase=phase,
+                next_iteration=int(state.iteration),
+                job_id=job_id,
+                expected_tasks=expected_tasks,
+            )
             self._journal(
                 "shutdown_requested", from_phase=phase.value,
                 iteration=int(state.iteration),
@@ -2330,7 +2602,7 @@ class Daemon:
         contract_error = self._transition_output_contract_error(
             state,
             phase,
-            state_updates,
+            applied_updates,
         )
         if contract_error is not None:
             self._journal(
@@ -2367,19 +2639,257 @@ class Daemon:
                 return False
             new_phase = requested_phase
         prior_iter = state.iteration
-        state.phase = new_phase
-        state.iteration = new_iter
-        self._apply_state_updates(state, state_updates)
-        #NB:persist before journal -- state.json is authoritative; the
-        # journal is best-effort observability. A persist failure here would
-        #otherwise leave the journal claiming a transition that did not
-        # actually happen on disk, triggering duplicate work on restart.
-        self._persist(state)
+        before = self._authoritative_state_before_transition(state)
+        after = copy.deepcopy(state)
+        after.phase = new_phase
+        after.iteration = new_iter
+        self._apply_state_updates(after, applied_updates)
+        if new_phase is CampaignPhase.DONE:
+            after.lifecycle_context = make_lifecycle_context(
+                disposition="completed",
+                reason_code="max_iterations_reached",
+                message="configured maximum active-learning iterations reached",
+                from_phase=phase,
+                iteration=int(state.iteration),
+                source="daemon",
+                recovery_action=(
+                    "campaign is complete; increase campaign.max_iterations and "
+                    "use resume --reopen-converged only after reviewing campaign quality"
+                ),
+            )
+        self._persist_transition_with_receipt(
+            state,
+            before,
+            after,
+            phase,
+            state_updates,
+            next_phase=new_phase,
+            next_iteration=int(new_iter),
+            job_id=job_id,
+            expected_tasks=expected_tasks,
+        )
         self._journal(
             "phase_transition", from_phase=phase.value, to_phase=new_phase.value,
             iteration=new_iter, prior_iteration=prior_iter,
+            completion_receipt=(
+                dict(state.last_completion_receipt)
+                if isinstance(state.last_completion_receipt, dict)
+                else None
+            ),
         )
+        if new_phase is CampaignPhase.DONE:
+            self._journal(
+                "campaign_completed",
+                from_phase=phase.value,
+                iteration=int(new_iter),
+                reason_code="max_iterations_reached",
+                completion_receipt=dict(state.last_completion_receipt or {}),
+            )
         return True
+
+    def _authoritative_state_before_transition(self, state: CampaignState) -> CampaignState:
+        try:
+            before = read_state(self.state_path())
+        except FileNotFoundError:
+            before = copy.deepcopy(state)
+        if before.phase is not state.phase or int(before.iteration) != int(state.iteration):
+            raise RuntimeError(
+                "state changed while preparing phase completion: on_disk="
+                + before.phase.value
+                + "@"
+                + str(int(before.iteration))
+                + " in_memory="
+                + state.phase.value
+                + "@"
+                + str(int(state.iteration))
+            )
+        return before
+
+    def _phase_completion_evidence_paths(
+        self,
+        state: CampaignState,
+        phase: CampaignPhase,
+        state_updates: Dict[str, Any],
+    ) -> List[Path]:
+        from ..handoff_manifests import (
+            ariadne_results_path,
+            phase_a_sample_manifest_path,
+            phase_b_selection_path,
+            seeds_picked_path,
+        )
+        from ..layout import (
+            active_allocation_dir,
+            active_iteration_dir,
+            bootstrap_selection_dir,
+            trained_models_dir as canonical_trained_models_dir,
+        )
+
+        campaign = self.campaign_dir
+        iteration = int(state.iteration)
+        paths: List[Path] = []
+        if phase is CampaignPhase.PHASE_A_POLUS:
+            paths.append(phase_a_sample_manifest_path(bootstrap_selection_dir(campaign)))
+        elif phase is CampaignPhase.SEED_SELECT:
+            paths.append(seeds_picked_path(active_iteration_dir(campaign, iteration)))
+        elif phase is CampaignPhase.ARIADNE_ARRAY:
+            from ..handoff_manifests import ariadne_batch_decision_path
+
+            iter_dir = active_iteration_dir(campaign, iteration)
+            paths.extend(
+                [
+                    ariadne_results_path(iter_dir),
+                    ariadne_batch_decision_path(iter_dir),
+                ]
+            )
+        elif phase is CampaignPhase.PHASE_B_POLUS:
+            paths.append(phase_b_selection_path(active_iteration_dir(campaign, iteration)))
+        elif phase is CampaignPhase.SPLIT:
+            paths.append(
+                active_allocation_dir(active_iteration_dir(campaign, iteration))
+                / "SPLIT_RECEIPT.json"
+            )
+        elif phase in (
+            CampaignPhase.INITIAL_ALLOCATION_CHECK,
+            CampaignPhase.ALLOCATION_CHECK,
+            CampaignPhase.INITIAL_REPLACEMENT_AIMALL,
+            CampaignPhase.REPLACEMENT_AIMALL,
+        ):
+            from ..point_allocation import point_allocation_path
+
+            context = "bootstrap" if phase.value.startswith("INITIAL_") else "active"
+            paths.append(
+                point_allocation_path(
+                    campaign,
+                    context=context,
+                    iteration=0 if context == "bootstrap" else iteration,
+                )
+            )
+        elif phase in (
+            CampaignPhase.INITIAL_GAUSSIAN,
+            CampaignPhase.INITIAL_AIMALL,
+            CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN,
+            CampaignPhase.GAUSSIAN,
+            CampaignPhase.AIMALL,
+            CampaignPhase.REPLACEMENT_GAUSSIAN,
+        ):
+            from .input_staging import quantum_acceptance_manifest_path
+            from ..replacement_sampling import replacement_round_dir
+
+            if "REPLACEMENT" in phase.value:
+                context = "bootstrap" if phase.value.startswith("INITIAL_") else "active"
+                staging = replacement_round_dir(
+                    campaign,
+                    context=context,
+                    iteration=0 if context == "bootstrap" else iteration,
+                    replacement_round=int(getattr(state, "replacement_round", 0)),
+                )
+            else:
+                staging = campaign / ".DATA" / "STAGING" / (
+                    "initial" if phase.value.startswith("INITIAL_") else "iter_" + str(iteration)
+                )
+            paths.append(
+                quantum_acceptance_manifest_path(staging, phase_name=phase.value)
+            )
+        elif phase is CampaignPhase.APPEND:
+            from ..versioning.reference_data import reference_data_version_path
+            from ..versioning.reference_data import ReferenceDataVersioning
+            from ..layout import qm_reference_data_dir
+
+            version = int(state_updates.get("reference_data_version", state.reference_data_version))
+            if version >= 0:
+                paths.append(
+                    reference_data_version_path(
+                        ReferenceDataVersioning(qm_reference_data_dir(campaign)).iteration_path(version)
+                    )
+                )
+        elif phase in (CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS):
+            from ..versioning.trained_models import trained_model_set_path
+            from ..versioning.trained_models import TrainedModelVersioning
+
+            version = int(state_updates.get("models_version", state.models_version))
+            if version >= 0:
+                paths.append(
+                    trained_model_set_path(
+                        TrainedModelVersioning(canonical_trained_models_dir(campaign)).iteration_path(version)
+                    )
+                )
+        return paths
+
+    def _persist_transition_with_receipt(
+        self,
+        destination: CampaignState,
+        before: CampaignState,
+        after: CampaignState,
+        phase: CampaignPhase,
+        state_updates: Dict[str, Any],
+        *,
+        next_phase: CampaignPhase,
+        next_iteration: int,
+        job_id: Optional[str],
+        expected_tasks: Optional[int],
+    ) -> None:
+        from .completion_receipts import (
+            evidence_records,
+            receipt_reference,
+            write_completion_receipt,
+        )
+        from .config_lock import canonical_config, config_fingerprint
+
+        intent = _submission_intent.load_intent(
+            self.campaign_dir,
+            phase.value,
+            int(before.iteration),
+        )
+        evidence_paths = self._phase_completion_evidence_paths(
+            before,
+            phase,
+            state_updates,
+        )
+        if not bool(
+            getattr(
+                self.executor,
+                "strict_completion_receipt_evidence",
+                getattr(
+                    self.executor,
+                    "strict_committed_artifact_verification",
+                    False,
+                ),
+            )
+        ):
+            # The pure FSM mock deliberately creates no handoff artefacts.  Keep
+            # its receipts useful for transition tests without weakening the
+            # fail-closed evidence contract used by live execution.
+            evidence_paths = [path for path in evidence_paths if path.exists()]
+        evidence = evidence_records(self.campaign_dir, evidence_paths)
+        receipt_path = write_completion_receipt(
+            self.campaign_dir,
+            campaign_uid=str(before.campaign_uid),
+            phase=phase.value,
+            iteration=int(before.iteration),
+            replacement_round=int(getattr(before, "replacement_round", 0)),
+            config_sha256=config_fingerprint(canonical_config(self.config)),
+            state_before=before,
+            state_after=after,
+            next_phase=next_phase.value,
+            next_iteration=int(next_iteration),
+            state_updates=state_updates,
+            evidence=evidence,
+            job_id=job_id or (str(intent.get("job_id")) if intent and intent.get("job_id") else None),
+            expected_tasks=(
+                expected_tasks
+                if expected_tasks is not None
+                else (int(intent["expected_tasks"]) if intent and intent.get("expected_tasks") is not None else None)
+            ),
+            submission_identity=(
+                str(intent.get("submission_identity"))
+                if intent and intent.get("submission_identity")
+                else None
+            ),
+        )
+        after.last_completion_receipt = receipt_reference(self.campaign_dir, receipt_path)
+        self._persist(after)
+        destination.__dict__.clear()
+        destination.__dict__.update(copy.deepcopy(after.__dict__))
 
     def _apply_state_updates(self, state: CampaignState, updates: Dict[str, Any]) -> None:
         if not updates:
@@ -2434,6 +2944,15 @@ class Daemon:
         try:
             state = read_state(self.state_path())
             state.shutdown_requested = True
+            state.lifecycle_context = make_lifecycle_context(
+                disposition="stopped",
+                reason_code="operator_stop_request",
+                message="operator requested an orderly daemon stop",
+                from_phase=state.phase,
+                iteration=int(state.iteration),
+                source="daemon_api",
+                recovery_action="use resume to continue from the recorded phase",
+            )
             self._persist(state)
         except (FileNotFoundError, StateSchemaError, json.JSONDecodeError):
             pass
@@ -2500,6 +3019,15 @@ class Daemon:
                 try:
                     state = read_state(self.state_path())
                     state.shutdown_requested = True
+                    state.lifecycle_context = make_lifecycle_context(
+                        disposition="stopped",
+                        reason_code="signal_stop_request",
+                        message="daemon received SIGINT or SIGTERM",
+                        from_phase=state.phase,
+                        iteration=int(state.iteration),
+                        source="signal",
+                        recovery_action="use resume to continue from the recorded phase",
+                    )
                     self._persist(state)
                 except (FileNotFoundError, StateSchemaError):
                     pass
@@ -2522,10 +3050,18 @@ class Daemon:
                 self._write_last_exception(exc)
                 if bool(getattr(self.config.runtime, "halt_on_tick_exception", True)):
                     if self._halt_after_tick_exception(exc):
-                        return 0
+                        return 21
                 raise
 
-            if status in (TickStatus.TERMINAL, TickStatus.HALTED, TickStatus.SHUTDOWN):
+            if status == TickStatus.HALTED:
+                return 20
+            if status == TickStatus.TERMINAL:
+                try:
+                    terminal_state = read_state(self.state_path())
+                except Exception:
+                    return 22
+                return 20 if terminal_state.phase is CampaignPhase.HALTED else 0
+            if status == TickStatus.SHUTDOWN:
                 return 0
             if status == TickStatus.POLLING:
                 idle_streak += 1

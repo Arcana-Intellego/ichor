@@ -23,7 +23,7 @@ from ichor.hpc.active_learning.daemon import input_staging as stg
 from ichor.hpc.active_learning.daemon import submission_intent
 from ichor.hpc.active_learning.daemon.state import (
     CampaignPhase,
-    fresh_campaign_state,
+    fresh_campaign_state as _fresh_campaign_state,
     read_state,
     write_state,
 )
@@ -39,6 +39,15 @@ from ichor.hpc.active_learning.versioning.provenance import (
     write_seed_provenance,
 )
 from ichor.hpc.active_learning.versioning.versioned_directory import VersionedDirectory
+
+
+_FIXTURE_CAMPAIGN_UID = "config-lock-test"
+
+
+def fresh_campaign_state(**kwargs):
+    """Create fixture state under the same identity as committed artefacts."""
+    kwargs.setdefault("campaign_uid", _FIXTURE_CAMPAIGN_UID)
+    return _fresh_campaign_state(**kwargs)
 
 
 def _campaign(tmp_path):
@@ -284,7 +293,10 @@ def test_ferebus_scaling_change_allowed_for_uncommitted_initial_ferebus(tmp_path
     assert state.phase is CampaignPhase.HALTED
 
 
-def test_reconcile_prints_recovery_contract_and_first_pass_guidance(tmp_path, capsys):
+def test_reconcile_refuses_phase_a_handoff_without_trusted_campaign_identity(
+    tmp_path,
+    capsys,
+):
     campaign = _campaign(tmp_path)
     _write_pool(campaign)
     _write_phase_a_sample(campaign)
@@ -305,16 +317,15 @@ def test_reconcile_prints_recovery_contract_and_first_pass_guidance(tmp_path, ca
     assert rc == 0
     out = capsys.readouterr().out
     assert "ICHOR Reconcile" in out
-    assert "Result: READY" in out
+    assert "Result: BLOCKED" in out
     assert "Recovery Contract" in out
-    assert "selected phase: INITIAL_GAUSSIAN iteration 0" in out
-    assert "status        : ok" in out
-    assert "required:" in out
-    assert "Phase A sample" in out
+    assert "no recoverable trusted campaign_uid" in out
+    assert "selected phase: HALTED iteration 0" in out
+    assert "status        : not runnable" in out
     assert "=== Recovery guidance ===" not in out
     assert "Recovery Target" in out
     assert "Apply Plan" in out
-    assert "ichor-al-daemon reconcile --campaign-dir " + str(campaign) + " --apply" in out
+    assert "apply: blocked" in out
     assert "Inspect" in out
 
 
@@ -2455,8 +2466,9 @@ def test_start_refuses_config_drift_without_reconcile_apply(tmp_path, capsys):
     )
     err = capsys.readouterr().err
 
-    assert rc == 7
-    assert "campaign.yaml changed" in err
+    assert rc == 20
+    assert "campaign is HALTED" in err
+    assert "reconcile" in err
 
 
 def test_start_allows_clean_first_run_with_config_and_pool(tmp_path):

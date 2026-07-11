@@ -53,7 +53,39 @@ def _setup_daemon_with_pending_job(
 
 def test_default_poll_sacct_empty_max_ticks_is_ten():
     assert CampaignConfig().poll_sacct_empty_max_ticks == 10
+    assert CampaignConfig().runtime.poll_sacct_error_max_ticks == 10
     assert CampaignConfig().runtime.poll_sacct_missing_max_ticks == 12
+
+
+def test_repeated_sacct_command_errors_halt_scheduler_uncertain(tmp_path):
+    def broken_poller(job_id):
+        raise RuntimeError("sacct unavailable")
+
+    daemon, state_path = _setup_daemon_with_pending_job(
+        tmp_path,
+        broken_poller,
+        max_ticks=10,
+        job_liveness_checker=lambda job_id: SimpleNamespace(
+            active=True,
+            inconclusive=False,
+            rows=[(str(job_id) + "_0", "RUNNING")],
+            error=None,
+        ),
+    )
+    daemon.config.runtime.poll_sacct_error_max_ticks = 2
+
+    assert daemon.tick() == TickStatus.POLLING
+    assert daemon.tick() == TickStatus.HALTED
+
+    state = read_state(state_path)
+    assert state.phase is CampaignPhase.HALTED
+    assert state.pending_jobs[CampaignPhase.GAUSSIAN.value] == "99999"
+    events = [
+        json.loads(line)
+        for line in daemon.journal_path().read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(event.get("event") == "sacct_error_timeout" for event in events)
 
 
 def test_empty_sacct_increments_streak(tmp_path):

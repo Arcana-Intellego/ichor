@@ -2156,7 +2156,7 @@ def test_polus_phase_b_missing_sample(tmp_path):
         state, CampaignPhase("PHASE_B_POLUS"), observations=[],
     )
     assert result.failure_reason is not None
-    assert "phase_b_selection_manifest_invalid" in result.failure_reason
+    assert "phase_b_handoff_invalid" in result.failure_reason
 
 
 def test_polus_phase_b_raw_sample_only_is_rejected(tmp_path):
@@ -2168,7 +2168,7 @@ def test_polus_phase_b_raw_sample_only_is_rejected(tmp_path):
         state, CampaignPhase("PHASE_B_POLUS"), observations=[],
     )
     assert result.failure_reason is not None
-    assert "phase_b_selection_manifest_invalid" in result.failure_reason
+    assert "phase_b_handoff_invalid" in result.failure_reason
 
 
 def test_polus_phase_b_enriches_seed_provenance(tmp_path):
@@ -2213,7 +2213,7 @@ def test_polus_phase_b_unreadable_sample_fails(tmp_path):
         state, CampaignPhase("PHASE_B_POLUS"), observations=[],
     )
     assert result.failure_reason is not None
-    assert "polus_sample_unreadable_or_empty" in result.failure_reason
+    assert "phase_b_handoff_invalid" in result.failure_reason
 
 
 # --- count_xyz_frames helper -------------------------------------

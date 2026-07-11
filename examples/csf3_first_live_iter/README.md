@@ -228,10 +228,16 @@ writes `%NProcShared` and `%mem` into `.gjf` files.
 export ICHOR_MACHINE=csf3
 source ~/projects/ichor-active-learning/scripts/env_ichor_csf.sh csf3 --smoke
 
-ichor-al-daemon preflight --campaign-dir .
 ichor-al-daemon init
+ichor-al-daemon preflight --campaign-dir . --verbose
+ichor-al-daemon preflight --campaign-dir . --verbose --submit-environment-smoke
 ichor-al-daemon start --live --campaign-dir . --max-ticks 200
 ```
+
+The submitted preflight is an explicit commissioning check: one five-minute,
+one-core Slurm job imports the configured daemon Python stack and verifies
+Gaussian, AIMAll, FEREBUS and `bc` from a compute node. It performs no
+scientific work and is not submitted by ordinary preflight or daemon start.
 
 The smoke config throttles Slurm arrays with
 `resources.array_concurrency_limit: 4` to be gentle on the scheduler. Backend
@@ -256,3 +262,11 @@ from pyferebus with `platform="CSF3"` and the configured executable.
 If the journal reports `sacct_rows_missing_but_squeue_active`, the daemon has
 seen that `sacct` is lagging while `squeue` still shows active array tasks, so
 it will keep polling rather than halting the campaign.
+
+If the campaign becomes `HALTED`, inspect `status` and `journal`, run
+`ichor-al-daemon reconcile --campaign-dir .` as a dry run, and use
+`reconcile --apply` only after its recovery contract is safe. Do not overwrite
+`state.json` with the proposal manually. A `DONE` campaign remains terminal;
+after deliberately increasing `campaign.max_iterations` and applying that
+config change through reconcile, extend it only with
+`resume --reopen-converged --live`.

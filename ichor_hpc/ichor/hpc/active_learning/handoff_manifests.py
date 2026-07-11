@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -24,6 +25,8 @@ from .layout import (
 
 ARIADNE_RESULTS_FILENAME = "RESULTS.json"
 ARIADNE_RESULTS_SCHEMA_VERSION = 2
+ARIADNE_BATCH_DECISION_FILENAME = "ARIADNE_BATCH_DECISION.json"
+ARIADNE_BATCH_DECISION_SCHEMA_VERSION = 1
 ARIADNE_LANDING_AUDIT_FILENAME = "AUDIT.json"
 ARIADNE_LANDING_AUDIT_SCHEMA_VERSION = 2
 PHASE_A_SAMPLE_FILENAME = "SELECTION.json"
@@ -44,6 +47,32 @@ class HandoffManifestError(ValueError):
     """Raised when a phase handoff manifest is missing or violates contract."""
 
 
+def _ariadne_results_counts(payload: Dict[str, Any]) -> Tuple[int, int, int]:
+    accepted = payload.get("accepted")
+    rejected = payload.get("rejected")
+    if not isinstance(accepted, list) or not isinstance(rejected, list):
+        raise HandoffManifestError(
+            "ARIADNE results accepted/rejected records must be lists"
+        )
+    expected = _required_int(payload.get("expected_n"), "ARIADNE expected_n")
+    n_accepted = _required_int(
+        payload.get("n_accepted"),
+        "ARIADNE n_accepted",
+    )
+    n_rejected = _required_int(
+        payload.get("n_rejected"),
+        "ARIADNE n_rejected",
+    )
+    if (
+        expected <= 0
+        or n_accepted != len(accepted)
+        or n_rejected != len(rejected)
+        or n_accepted + n_rejected != expected
+    ):
+        raise HandoffManifestError("ARIADNE results counts are inconsistent")
+    return expected, n_accepted, n_rejected
+
+
 def iteration_dir(campaign_dir: Any, iteration: int) -> Path:
     return active_iteration_dir(campaign_dir, iteration)
 
@@ -62,6 +91,249 @@ def acquisition_maturity_audit_path(iter_dir: Any) -> Path:
 
 def ariadne_results_path(iter_dir: Any) -> Path:
     return active_ariadne_dir(iter_dir) / ARIADNE_RESULTS_FILENAME
+
+
+def ariadne_batch_decision_path(iter_dir: Any) -> Path:
+    return active_ariadne_dir(iter_dir) / ARIADNE_BATCH_DECISION_FILENAME
+
+
+def write_ariadne_batch_decision(
+    iter_dir: Any,
+    *,
+    campaign_uid: str,
+    iteration: int,
+    config_sha256: str,
+    failure_threshold_fraction: float,
+    expected_n: int,
+    n_accepted: int,
+    n_rejected: int,
+    accepted: bool,
+    reasons: Sequence[str],
+) -> Path:
+    from .daemon.completion_receipts import canonical_sha256
+    from .versioning.manifest import sha256_file
+
+    results_path = ariadne_results_path(iter_dir)
+    if results_path.is_symlink() or not results_path.is_file():
+        raise HandoffManifestError(
+            "ARIADNE batch decision requires a regular RESULTS.json"
+        )
+    try:
+        results_payload = json.loads(results_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise HandoffManifestError("ARIADNE RESULTS.json is unreadable") from exc
+    if not isinstance(results_payload, dict) or str(
+        results_payload.get("campaign_uid") or ""
+    ) != str(campaign_uid):
+        raise HandoffManifestError("ARIADNE batch decision/results campaign UID mismatch")
+    if _required_int(
+        results_payload.get("schema_version"),
+        "ARIADNE results schema",
+    ) != ARIADNE_RESULTS_SCHEMA_VERSION:
+        raise HandoffManifestError("ARIADNE batch decision requires current RESULTS schema")
+    if _required_int(
+        results_payload.get("iteration"),
+        "ARIADNE results iteration",
+    ) != int(iteration):
+        raise HandoffManifestError("ARIADNE batch decision/results iteration mismatch")
+    result_expected, result_accepted, result_rejected = _ariadne_results_counts(
+        results_payload
+    )
+    expected = int(expected_n)
+    accepted_count = int(n_accepted)
+    rejected_count = int(n_rejected)
+    if expected <= 0 or accepted_count < 0 or rejected_count < 0:
+        raise HandoffManifestError("ARIADNE batch decision counts are invalid")
+    if accepted_count + rejected_count != expected:
+        raise HandoffManifestError("ARIADNE batch decision counts do not cover expected tasks")
+    if (expected, accepted_count, rejected_count) != (
+        result_expected,
+        result_accepted,
+        result_rejected,
+    ):
+        raise HandoffManifestError(
+            "ARIADNE batch decision counts do not match RESULTS.json"
+        )
+    threshold = float(failure_threshold_fraction)
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise HandoffManifestError("ARIADNE failure threshold must be in [0, 1]")
+    fraction = rejected_count / float(expected)
+    policy_accepts = accepted_count > 0 and fraction <= threshold
+    if bool(accepted) != bool(policy_accepts):
+        raise HandoffManifestError(
+            "ARIADNE batch decision accepted flag disagrees with its policy"
+        )
+    evaluation = {
+        "config_sha256": str(config_sha256),
+        "failure_threshold_fraction": threshold,
+        "expected_n": expected,
+        "n_accepted": accepted_count,
+        "n_rejected": rejected_count,
+        "rejection_fraction": fraction,
+        "accepted": bool(accepted),
+        "reasons": [str(reason) for reason in reasons],
+    }
+    evaluation["evaluation_sha256"] = canonical_sha256(evaluation)
+    path = ariadne_batch_decision_path(iter_dir)
+    evaluations: List[Dict[str, Any]] = []
+    if path.is_file() and not path.is_symlink():
+        existing = read_ariadne_batch_decision(
+            iter_dir,
+            expected_iteration=int(iteration),
+            require_accepted=False,
+            verify_current_config=False,
+        )
+        if str(existing["campaign_uid"]) != str(campaign_uid):
+            raise HandoffManifestError("ARIADNE batch decision campaign UID changed")
+        if str(existing["results"]["sha256"]) != sha256_file(results_path):
+            raise HandoffManifestError("ARIADNE results changed since prior batch decision")
+        evaluations = [dict(item) for item in existing["evaluations"]]
+    if not any(
+        str(item.get("evaluation_sha256")) == str(evaluation["evaluation_sha256"])
+        for item in evaluations
+    ):
+        evaluation["evaluated_at_iso"] = datetime.now(timezone.utc).isoformat()
+        evaluations.append(evaluation)
+    payload = {
+        "schema_version": ARIADNE_BATCH_DECISION_SCHEMA_VERSION,
+        "campaign_uid": str(campaign_uid),
+        "iteration": int(iteration),
+        "results": {
+            "path": ARIADNE_RESULTS_FILENAME,
+            "size": int(results_path.stat().st_size),
+            "sha256": sha256_file(results_path),
+        },
+        "evaluations": evaluations,
+        "current_evaluation_sha256": str(evaluation["evaluation_sha256"]),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(path, payload)
+    return path
+
+
+def read_ariadne_batch_decision(
+    iter_dir: Any,
+    *,
+    expected_iteration: Optional[int] = None,
+    expected_campaign_uid: Optional[str] = None,
+    expected_config_sha256: Optional[str] = None,
+    require_accepted: bool = True,
+    verify_current_config: bool = True,
+) -> Dict[str, Any]:
+    from .daemon.completion_receipts import canonical_sha256
+    from .versioning.manifest import sha256_file
+
+    path = ariadne_batch_decision_path(iter_dir)
+    if path.is_symlink() or not path.is_file():
+        raise FileNotFoundError("ARIADNE batch decision missing: " + str(path))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise HandoffManifestError("ARIADNE batch decision unreadable: " + str(path)) from exc
+    if not isinstance(payload, dict):
+        raise HandoffManifestError("ARIADNE batch decision must be an object")
+    if _required_int(payload.get("schema_version"), "ARIADNE batch decision schema") != ARIADNE_BATCH_DECISION_SCHEMA_VERSION:
+        raise HandoffManifestError("unsupported ARIADNE batch decision schema")
+    iteration = _required_int(payload.get("iteration"), "ARIADNE batch decision iteration")
+    if expected_iteration is not None and iteration != int(expected_iteration):
+        raise HandoffManifestError("ARIADNE batch decision iteration mismatch")
+    campaign_uid = str(payload.get("campaign_uid") or "")
+    if not campaign_uid:
+        raise HandoffManifestError("ARIADNE batch decision campaign UID is missing")
+    if expected_campaign_uid is not None and campaign_uid != str(expected_campaign_uid):
+        raise HandoffManifestError("ARIADNE batch decision campaign UID mismatch")
+    binding = payload.get("results")
+    if not isinstance(binding, dict):
+        raise HandoffManifestError("ARIADNE batch decision results binding is missing")
+    results_path = resolve_handoff_path(
+        active_ariadne_dir(iter_dir),
+        binding.get("path", ""),
+        kind="ARIADNE batch decision results",
+    )
+    if results_path != ariadne_results_path(iter_dir).resolve():
+        raise HandoffManifestError("ARIADNE batch decision binds a noncanonical results path")
+    if int(binding.get("size", -1)) != int(results_path.stat().st_size):
+        raise HandoffManifestError("ARIADNE batch decision results size mismatch")
+    if str(binding.get("sha256") or "") != sha256_file(results_path):
+        raise HandoffManifestError("ARIADNE batch decision results hash mismatch")
+    try:
+        results_payload = json.loads(results_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise HandoffManifestError("ARIADNE batch decision results are unreadable") from exc
+    if not isinstance(results_payload, dict) or str(
+        results_payload.get("campaign_uid") or ""
+    ) != campaign_uid:
+        raise HandoffManifestError("ARIADNE batch decision/results campaign UID mismatch")
+    if _required_int(
+        results_payload.get("schema_version"),
+        "ARIADNE results schema",
+    ) != ARIADNE_RESULTS_SCHEMA_VERSION:
+        raise HandoffManifestError("ARIADNE batch decision requires current RESULTS schema")
+    if _required_int(
+        results_payload.get("iteration"),
+        "ARIADNE results iteration",
+    ) != iteration:
+        raise HandoffManifestError("ARIADNE batch decision/results iteration mismatch")
+    result_counts = _ariadne_results_counts(results_payload)
+    evaluations = payload.get("evaluations")
+    if not isinstance(evaluations, list) or not evaluations:
+        raise HandoffManifestError("ARIADNE batch decision evaluations are empty")
+    by_digest: Dict[str, Dict[str, Any]] = {}
+    for raw in evaluations:
+        if not isinstance(raw, dict):
+            raise HandoffManifestError("ARIADNE batch evaluation must be an object")
+        evaluation = dict(raw)
+        declared = str(evaluation.pop("evaluation_sha256", ""))
+        evaluation.pop("evaluated_at_iso", None)
+        actual = canonical_sha256(evaluation)
+        if declared != actual or declared in by_digest:
+            raise HandoffManifestError("ARIADNE batch evaluation digest is invalid")
+        full = dict(raw)
+        expected = _required_int(full.get("expected_n"), "ARIADNE decision expected_n")
+        n_accepted = _required_int(full.get("n_accepted"), "ARIADNE decision n_accepted")
+        n_rejected = _required_int(full.get("n_rejected"), "ARIADNE decision n_rejected")
+        if expected <= 0 or n_accepted + n_rejected != expected:
+            raise HandoffManifestError("ARIADNE decision counts are inconsistent")
+        if (expected, n_accepted, n_rejected) != result_counts:
+            raise HandoffManifestError(
+                "ARIADNE decision counts do not match RESULTS.json"
+            )
+        threshold = _finite_float(full.get("failure_threshold_fraction"))
+        if threshold is None or not 0.0 <= threshold <= 1.0:
+            raise HandoffManifestError("ARIADNE decision threshold is invalid")
+        fraction = n_rejected / float(expected)
+        declared_fraction = _finite_float(full.get("rejection_fraction"))
+        if declared_fraction is None or not math.isclose(
+            declared_fraction,
+            fraction,
+            rel_tol=0.0,
+            abs_tol=1.0e-15,
+        ):
+            raise HandoffManifestError("ARIADNE decision rejection fraction is invalid")
+        if bool(full.get("accepted", False)) != bool(
+            n_accepted > 0 and fraction <= threshold
+        ):
+            raise HandoffManifestError(
+                "ARIADNE decision accepted flag disagrees with its policy"
+            )
+        by_digest[declared] = full
+    current_digest = str(payload.get("current_evaluation_sha256") or "")
+    if current_digest not in by_digest:
+        raise HandoffManifestError("ARIADNE current batch evaluation is missing")
+    current = by_digest[current_digest]
+    if verify_current_config and expected_config_sha256 is not None and str(
+        current.get("config_sha256") or ""
+    ) != str(expected_config_sha256):
+        raise HandoffManifestError("ARIADNE batch decision config digest mismatch")
+    if require_accepted and not bool(current.get("accepted", False)):
+        raise HandoffManifestError(
+            "ARIADNE batch decision rejected: "
+            + ";".join(str(reason) for reason in current.get("reasons", []))
+        )
+    out = dict(payload)
+    out["results"] = {**binding, "path": str(results_path)}
+    out["current_evaluation"] = current
+    return out
 
 
 def ariadne_landing_audit_path(iter_dir: Any) -> Path:
@@ -836,10 +1108,19 @@ def ariadne_candidate_frames(
     *,
     expected_iteration: Optional[int] = None,
     accept_legacy_missing_landing_safety: bool = False,
+    expected_config_sha256: Optional[str] = None,
+    require_batch_decision: bool = True,
 ) -> Tuple[Dict[str, Any], List[Any], List[Dict[str, Any]]]:
     """Return accepted ARIADNE geometries as ICHOR Atoms plus manifest records."""
     from ichor.core.atoms import Atom, Atoms
 
+    if require_batch_decision:
+        read_ariadne_batch_decision(
+            iter_dir,
+            expected_iteration=expected_iteration,
+            expected_config_sha256=expected_config_sha256,
+            require_accepted=True,
+        )
     manifest = read_ariadne_results_manifest(
         iter_dir,
         expected_iteration=expected_iteration,
@@ -1309,3 +1590,123 @@ def read_phase_b_selection_manifest(
     if source_manifest is not None:
         out["source_ariadne_manifest"] = str(source_manifest)
     return out
+
+
+def _read_xyz_geometry_records(path: Path) -> List[Dict[str, Any]]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise HandoffManifestError("Phase B selected XYZ is unreadable: " + str(path)) from exc
+    records: List[Dict[str, Any]] = []
+    position = 0
+    while position < len(lines):
+        if not lines[position].strip():
+            position += 1
+            continue
+        try:
+            n_atoms = int(lines[position].strip())
+        except ValueError as exc:
+            raise HandoffManifestError("Phase B selected XYZ atom count is invalid") from exc
+        end = position + 2 + n_atoms
+        if n_atoms <= 0 or end > len(lines):
+            raise HandoffManifestError("Phase B selected XYZ frame is truncated")
+        atom_types: List[str] = []
+        coordinates: List[List[float]] = []
+        for line in lines[position + 2 : end]:
+            parts = line.split()
+            if len(parts) < 4:
+                raise HandoffManifestError("Phase B selected XYZ atom line is invalid")
+            atom_types.append(str(parts[0]))
+            coordinates.append(
+                [
+                    float(_finite_float(parts[1])),
+                    float(_finite_float(parts[2])),
+                    float(_finite_float(parts[3])),
+                ]
+            )
+        records.append({"atom_types": atom_types, "coordinates": coordinates})
+        position = end
+    if not records:
+        raise HandoffManifestError("Phase B selected XYZ contains no frames")
+    return records
+
+
+def validate_phase_b_handoff(
+    iter_dir: Any,
+    *,
+    expected_iteration: Optional[int] = None,
+    expected_campaign_uid: Optional[str] = None,
+    coordinate_tolerance: float = 5.0e-6,
+) -> Dict[str, Any]:
+    """Validate the complete Phase B geometry and provenance handoff."""
+    from .versioning.provenance import validate_provenance
+
+    manifest = read_phase_b_selection_manifest(
+        iter_dir,
+        expected_iteration=expected_iteration,
+        require_nonempty=True,
+    )
+    campaign_uid = str(manifest.get("campaign_uid") or "")
+    if not campaign_uid:
+        raise HandoffManifestError("Phase B campaign_uid is missing")
+    if expected_campaign_uid is not None and campaign_uid != str(expected_campaign_uid):
+        raise HandoffManifestError("Phase B campaign UID mismatch")
+    iteration = int(manifest["iteration"])
+    frames = _read_xyz_geometry_records(Path(str(manifest["selected_xyz"]["path"])))
+    final_records = list(manifest.get("final") or [])
+    if len(frames) != len(final_records):
+        raise HandoffManifestError("Phase B selected XYZ/final record count mismatch")
+    tolerance = float(coordinate_tolerance)
+    if not math.isfinite(tolerance) or tolerance < 0.0:
+        raise HandoffManifestError("Phase B coordinate tolerance is invalid")
+    allocation = dict(manifest.get("point_allocation") or {})
+    assignment_sha = str(allocation.get("slot_assignment_sha256") or "")
+    for index, (frame, record) in enumerate(zip(frames, final_records)):
+        result_path = Path(str(record.get("result_json") or ""))
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise HandoffManifestError(
+                "Phase B selected result is unreadable at index " + str(index)
+            ) from exc
+        atom_types = [str(value) for value in (result.get("atom_types") or [])]
+        coordinates = result.get("final_coordinates") or []
+        if atom_types != frame["atom_types"] or len(coordinates) != len(atom_types):
+            raise HandoffManifestError(
+                "Phase B selected geometry atom ordering mismatch at index " + str(index)
+            )
+        for atom_index, (observed, expected) in enumerate(
+            zip(frame["coordinates"], coordinates)
+        ):
+            if not isinstance(expected, list) or len(expected) != 3:
+                raise HandoffManifestError("Phase B result coordinate shape is invalid")
+            for axis, (observed_value, expected_value) in enumerate(zip(observed, expected)):
+                expected_float = float(_finite_float(expected_value))
+                if abs(float(observed_value) - expected_float) > tolerance:
+                    raise HandoffManifestError(
+                        "Phase B selected geometry differs from ARIADNE result at frame "
+                        + str(index)
+                        + " atom "
+                        + str(atom_index)
+                        + " axis "
+                        + str(axis)
+                    )
+        validate_provenance(
+            Path(str(record["seed_dir"])),
+            campaign_uid=campaign_uid,
+            iteration=iteration,
+            seed_frame_id=_int_or_none(record.get("seed_frame_id")),
+            seed_id=_required_int(record.get("seed_id"), "Phase B seed_id"),
+            seed_uid=str(record.get("seed_uid") or ""),
+            array_task_id_zero_based=_required_int(
+                record.get("array_task_id"),
+                "Phase B array_task_id",
+            ),
+            require_phase_b_selected=True,
+            allocation_split=str(record.get("split") or ""),
+            allocation_slot_id=_required_int(record.get("slot_id"), "Phase B slot_id"),
+            allocation_candidate_id=str(record.get("candidate_id") or ""),
+            allocation_context="active",
+            allocation_slot_assignment_sha256=assignment_sha,
+        )
+    return manifest

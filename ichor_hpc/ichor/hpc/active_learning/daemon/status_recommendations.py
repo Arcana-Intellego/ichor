@@ -161,6 +161,9 @@ def _phase_name(value: str) -> str:
 
 
 def _halt_reason(payload: Dict[str, Any]) -> str:
+    context = payload.get("lifecycle_context")
+    if isinstance(context, dict) and context.get("message"):
+        return str(context.get("message"))
     event = payload.get("latest_halt_event")
     if isinstance(event, dict):
         return str(event.get("reason") or "")
@@ -287,7 +290,54 @@ def _job_recommendations(campaign: Path, payload: Dict[str, Any]) -> List[Status
 
 def _halt_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusRecommendation:
     reason = _halt_reason(payload)
+    context = payload.get("lifecycle_context")
+    reason_code = (
+        str(context.get("reason_code") or "")
+        if isinstance(context, dict)
+        else ""
+    )
     upper = reason.upper()
+    if reason_code == "mandatory_anchor_failed":
+        return StatusRecommendation(
+            code="halted_mandatory_anchor_failed",
+            severity="blocked",
+            primary=(
+                "inspect the failed anchor calculation; correct the anchor or "
+                "start a new campaign because mandatory anchors cannot be replaced"
+            ),
+            why=_short_error(reason),
+            command=_journal_cmd(campaign) + " --event-type halt --last-n 5",
+        )
+    if reason_code == "replacement_reserve_exhausted":
+        return StatusRecommendation(
+            code="halted_replacement_reserve_exhausted",
+            severity="blocked",
+            primary=(
+                "the exact allocation cannot be completed in place; start a new "
+                "campaign with a larger reserve or a smaller required batch"
+            ),
+            why=_short_error(reason),
+            command=_journal_cmd(campaign) + " --event-type halt --last-n 5",
+            details=[
+                "reconcile cannot invent candidates outside the immutable point-allocation ledger",
+                "do not delete or rewrite the exhausted allocation by hand",
+            ],
+        )
+    if reason_code == "ferebus_quality_failed":
+        return StatusRecommendation(
+            code="halted_ferebus_quality_failed",
+            severity="required",
+            primary=(
+                "inspect FEREBUS quality evidence, then either re-evaluate "
+                "justified thresholds or explicitly retrain"
+            ),
+            why=_short_error(reason),
+            command=_reconcile_cmd(campaign),
+            details=[
+                "threshold-only edits reuse hash-bound model evidence",
+                "use reconcile --retrain-ferebus --apply to discard no output silently",
+            ],
+        )
     if "SEED_POOL_EXHAUSTED" in upper:
         return StatusRecommendation(
             code="halted_seed_pool_exhausted",
@@ -513,6 +563,37 @@ _PHASE_ACTIONS: Dict[str, tuple[str, str]] = {
 def _phase_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusRecommendation:
     phase = _phase(payload)
     if phase == CampaignPhase.DONE.value:
+        context = payload.get("lifecycle_context")
+        reason_code = (
+            str(context.get("reason_code") or "")
+            if isinstance(context, dict)
+            else ""
+        )
+        message = (
+            str(context.get("message") or "")
+            if isinstance(context, dict)
+            else ""
+        )
+        if reason_code == "scientific_convergence":
+            return StatusRecommendation(
+                code="campaign_completed_scientific_convergence",
+                severity="info",
+                primary="campaign reached its scientific convergence criterion; no restart is needed",
+                why=message or "state phase is DONE after scientific convergence",
+                command=_journal_cmd(campaign) + " --event-type campaign_completed",
+            )
+        if reason_code == "max_iterations_reached":
+            return StatusRecommendation(
+                code="campaign_completed_max_iterations",
+                severity="info",
+                primary="campaign reached its configured iteration limit; review quality before extending it",
+                why=message or "state phase is DONE at max_iterations",
+                command=_journal_cmd(campaign) + " --event-type campaign_completed",
+                details=[
+                    "increase campaign.max_iterations through reconcile, then use "
+                    "resume --reopen-converged only for a deliberate extension"
+                ],
+            )
         return StatusRecommendation(
             code="campaign_done",
             severity="info",
@@ -626,13 +707,29 @@ def build_status_recommendations(
     stale_pid = _stale_pid_recommendation(campaign, payload)
 
     if payload.get("shutdown_requested"):
+        context = payload.get("lifecycle_context")
+        stopped = isinstance(context, dict) and str(
+            context.get("disposition") or ""
+        ) == "stopped"
         return [
             StatusRecommendation(
                 code="shutdown_requested",
                 severity="required",
-                primary="clear the stop request with reconcile before restarting",
-                why="state.json has shutdown_requested=true",
-                command=_reconcile_cmd(campaign, apply=True),
+                primary=(
+                    "resume the campaign to clear the explicit operator stop"
+                    if stopped
+                    else "run reconcile before clearing an unclassified stop request"
+                ),
+                why=(
+                    str(context.get("message"))
+                    if stopped
+                    else "state.json has shutdown_requested=true without a stopped lifecycle"
+                ),
+                command=(
+                    _cmd(campaign, "resume")
+                    if stopped
+                    else _reconcile_cmd(campaign, apply=True)
+                ),
             )
         ] + stale_pid
 

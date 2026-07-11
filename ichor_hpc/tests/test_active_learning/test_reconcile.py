@@ -23,6 +23,7 @@ from ichor.hpc.active_learning.daemon.recovery_contracts import (
 from ichor.hpc.active_learning.daemon.state import (
     CampaignPhase,
     DEFAULT_STATE_FILENAME,
+    atomic_write_json,
     fresh_campaign_state,
     read_state,
     write_state,
@@ -429,6 +430,29 @@ def _write_ariadne_handoff(campaign, iteration, *, n=2, include_safety=True):
         "accepted": accepted,
         "rejected": [],
     })
+    from ichor.hpc.active_learning.config import CampaignConfig
+    from ichor.hpc.active_learning.daemon.config_lock import (
+        canonical_config,
+        config_fingerprint,
+    )
+    from ichor.hpc.active_learning.handoff_manifests import (
+        write_ariadne_batch_decision,
+    )
+
+    config_path = campaign / "campaign.yaml"
+    config = CampaignConfig.from_yaml(config_path) if config_path.is_file() else CampaignConfig()
+    write_ariadne_batch_decision(
+        iter_dir,
+        campaign_uid=str(task_map["campaign_uid"]),
+        iteration=int(iteration),
+        config_sha256=config_fingerprint(canonical_config(config)),
+        failure_threshold_fraction=float(config.runtime.failure_threshold_fraction),
+        expected_n=int(n),
+        n_accepted=int(n),
+        n_rejected=0,
+        accepted=True,
+        reasons=[],
+    )
     return iter_dir
 
 
@@ -443,6 +467,27 @@ def _write_phase_b_handoff(campaign, iteration, *, n=2):
     config.phase_b.descriptor = "rmsd_massweight"
     config.point_allocation.batch_training_size = 1
     config.point_allocation.batch_internal_validation_size = int(n) - 1
+    config.to_yaml(Path(campaign) / "campaign.yaml")
+    from ichor.hpc.active_learning.daemon.config_lock import (
+        canonical_config,
+        config_fingerprint,
+    )
+    from ichor.hpc.active_learning.handoff_manifests import (
+        write_ariadne_batch_decision,
+    )
+
+    write_ariadne_batch_decision(
+        iter_dir,
+        campaign_uid="reconcile-test",
+        iteration=int(iteration),
+        config_sha256=config_fingerprint(canonical_config(config)),
+        failure_threshold_fraction=float(config.runtime.failure_threshold_fraction),
+        expected_n=int(n),
+        n_accepted=int(n),
+        n_rejected=0,
+        accepted=True,
+        reasons=[],
+    )
     from ichor.hpc.active_learning.sampling_protocol import (
         resolve_sampling_protocol,
     )
@@ -1007,7 +1052,10 @@ def test_propose_recovery_bootstrap_training_only_reenters_initial_ferebus(
         context="bootstrap",
         iteration=0,
     )
-    state = fresh_campaign_state(max_iterations=50)
+    state = fresh_campaign_state(
+        max_iterations=50,
+        campaign_uid="reconcile-test",
+    )
     state.phase = CampaignPhase.HALTED
     state.iteration = 0
     state.reference_data_version = 0
@@ -1080,13 +1128,17 @@ def test_propose_recovery_active_submission_intent_is_adoption_ready(tmp_path):
     assert "expected_job_name=uid-FEREBUS-3" in reason
 
 
-def test_propose_recovery_force_allows_fresh_init_on_nonempty_campaign(tmp_path):
+def test_propose_recovery_force_cannot_mint_uid_for_nonempty_campaign(tmp_path):
     campaign, _, _, _ = _campaign_dirs(tmp_path)
     staging = campaign / ".DATA" / "STAGING" / "iter_1"
     staging.mkdir(parents=True)
     (staging / "POINTS.txt").write_text("", encoding="utf-8")
     report = propose_recovery(campaign, allow_fresh_init_on_nonempty=True)
-    assert report.proposed_state.phase is CampaignPhase.INIT
+    assert report.proposed_state.phase is CampaignPhase.HALTED
+    assert any(
+        "no recoverable trusted campaign_uid" in reason
+        for reason in report.unsafe_reasons
+    )
 
 
 def test_propose_recovery_finds_committed_reference_data_versions(tmp_path):
@@ -1170,6 +1222,7 @@ def test_propose_recovery_preserves_existing_seed_select_cursor(tmp_path, monkey
     (s / "marker.txt").write_text("model", encoding="utf-8")
     mv.commit(0)
     state = fresh_campaign_state(max_iterations=3)
+    state.campaign_uid = "reconcile-test"
     state.phase = CampaignPhase.SEED_SELECT
     state.iteration = 1
     state.reference_data_version = 0
@@ -1192,6 +1245,7 @@ def test_propose_recovery_prefers_seeds_over_stale_seed_select(tmp_path, monkeyp
     _write_pool(campaign)
     _commit_training_and_model_versions(training, models, [0])
     state = fresh_campaign_state(max_iterations=3)
+    state.campaign_uid = "reconcile-test"
     state.phase = CampaignPhase.SEED_SELECT
     state.iteration = 1
     state.reference_data_version = 0
@@ -1216,6 +1270,7 @@ def test_recovery_rejects_ariadne_results_without_landing_safety(
     _write_pool(campaign)
     _commit_training_and_model_versions(training, models, [0])
     state = fresh_campaign_state(max_iterations=3)
+    state.campaign_uid = "reconcile-test"
     state.phase = CampaignPhase.SEED_SELECT
     state.iteration = 1
     state.reference_data_version = 0
@@ -1231,6 +1286,69 @@ def test_recovery_rejects_ariadne_results_without_landing_safety(
     assert "valid ARIADNE results handoff" not in report.decision
 
 
+def test_recovery_cannot_advance_from_rejected_ariadne_batch(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.config import CampaignConfig
+    from ichor.hpc.active_learning.daemon.config_lock import (
+        canonical_config,
+        config_fingerprint,
+    )
+    from ichor.hpc.active_learning.handoff_manifests import (
+        ariadne_batch_decision_path,
+        ariadne_results_path,
+        write_ariadne_batch_decision,
+    )
+
+    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    monkeypatch.setattr(recovery_contracts_mod, "verify_committed_model_version", lambda *a, **k: None)
+    monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_training_and_model_versions(training, models, [0])
+    state = fresh_campaign_state(max_iterations=3, campaign_uid="reconcile-test")
+    state.phase = CampaignPhase.SEED_SELECT
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    iter_dir = _write_ariadne_handoff(campaign, 1, n=2)
+    results_path = ariadne_results_path(iter_dir)
+    results = json.loads(results_path.read_text(encoding="utf-8"))
+    rejected_record = results["accepted"].pop()
+    results["rejected"] = [{
+        "seed_id": int(rejected_record["seed_id"]),
+        "seed_uid": str(rejected_record["seed_uid"]),
+        "array_task_id": int(rejected_record["array_task_id"]),
+        "reason": "synthetic task rejection",
+    }]
+    results["n_accepted"] = 1
+    results["n_rejected"] = 1
+    write_ariadne_results_manifest(iter_dir, results)
+    ariadne_batch_decision_path(iter_dir).unlink()
+    config = CampaignConfig()
+    config.runtime.failure_threshold_fraction = 0.0
+    config.to_yaml(campaign / "campaign.yaml")
+    write_ariadne_batch_decision(
+        iter_dir,
+        campaign_uid="reconcile-test",
+        iteration=1,
+        config_sha256=config_fingerprint(canonical_config(config)),
+        failure_threshold_fraction=0.0,
+        expected_n=2,
+        n_accepted=1,
+        n_rejected=1,
+        accepted=False,
+        reasons=["too_many_failures: 1/2"],
+    )
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.ARIADNE_ARRAY
+    assert "valid ARIADNE results handoff" not in report.decision
+
+
 def test_propose_recovery_does_not_preserve_existing_phase_for_committed_iteration(
     tmp_path,
     monkeypatch,
@@ -1241,6 +1359,7 @@ def test_propose_recovery_does_not_preserve_existing_phase_for_committed_iterati
     _write_pool(campaign)
     _commit_training_and_model_versions(training, models, [0, 1])
     state = fresh_campaign_state(max_iterations=3)
+    state.campaign_uid = "reconcile-test"
     state.phase = CampaignPhase.SEED_SELECT
     state.iteration = 1
     state.reference_data_version = 1
@@ -1261,6 +1380,7 @@ def test_propose_recovery_prefers_phase_b_over_stale_seed_select(tmp_path, monke
     _write_pool(campaign)
     _commit_training_and_model_versions(training, models, [0])
     state = fresh_campaign_state(max_iterations=3)
+    state.campaign_uid = "reconcile-test"
     state.phase = CampaignPhase.SEED_SELECT
     state.iteration = 1
     state.reference_data_version = 0
@@ -1275,6 +1395,47 @@ def test_propose_recovery_prefers_phase_b_over_stale_seed_select(tmp_path, monke
     assert "valid Phase B handoff" in report.decision
 
 
+def test_recovery_rejects_phase_b_geometry_drift_even_when_hash_is_rewritten(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.config import CampaignConfig
+    from ichor.hpc.active_learning.handoff_manifests import phase_b_selection_path
+    from ichor.hpc.active_learning.versioning.manifest import sha256_file
+
+    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    monkeypatch.setattr(recovery_contracts_mod, "verify_committed_model_version", lambda *a, **k: None)
+    monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    CampaignConfig().to_yaml(campaign / "campaign.yaml")
+    _commit_training_and_model_versions(training, models, [0])
+    state = fresh_campaign_state(max_iterations=3, campaign_uid="reconcile-test")
+    state.phase = CampaignPhase.SEED_SELECT
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    iter_dir = _write_phase_b_handoff(campaign, 1, n=2)
+    manifest_path = phase_b_selection_path(iter_dir)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    selected = (iter_dir / manifest["selected_xyz"]["path"]).resolve()
+    lines = selected.read_text(encoding="utf-8").splitlines()
+    atom = lines[2].split()
+    atom[1] = str(float(atom[1]) + 0.25)
+    lines[2] = " ".join(atom)
+    selected.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    manifest["selected_xyz"]["size"] = int(selected.stat().st_size)
+    manifest["selected_xyz"]["sha256"] = sha256_file(selected)
+    atomic_write_json(manifest_path, manifest)
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.PHASE_B_POLUS
+    assert "valid Phase B handoff" not in report.decision
+    assert "valid ARIADNE results handoff" in report.decision
+
+
 def test_propose_recovery_prefers_split_over_stale_phase_b(tmp_path, monkeypatch):
     monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
     monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
@@ -1282,6 +1443,7 @@ def test_propose_recovery_prefers_split_over_stale_phase_b(tmp_path, monkeypatch
     _write_pool(campaign)
     _commit_training_and_model_versions(training, models, [0])
     state = fresh_campaign_state(max_iterations=3)
+    state.campaign_uid = "reconcile-test"
     state.phase = CampaignPhase.PHASE_B_POLUS
     state.iteration = 1
     state.reference_data_version = 0
@@ -1304,6 +1466,7 @@ def test_propose_recovery_invalid_split_reenters_split(tmp_path, monkeypatch):
     _write_pool(campaign)
     _commit_training_and_model_versions(training, models, [0])
     state = fresh_campaign_state(max_iterations=3)
+    state.campaign_uid = "reconcile-test"
     state.phase = CampaignPhase.SPLIT
     state.iteration = 1
     state.reference_data_version = 0
@@ -1332,6 +1495,7 @@ def test_propose_recovery_cross_iteration_partial_handoff_beats_stop_check(
     _write_pool(campaign)
     _commit_training_and_model_versions(training, models, [0, 1, 2])
     state = fresh_campaign_state(max_iterations=5)
+    state.campaign_uid = "reconcile-test"
     state.phase = CampaignPhase.STOP_CHECK
     state.iteration = 7
     state.reference_data_version = 2
@@ -1357,6 +1521,7 @@ def test_propose_recovery_protects_active_gaussian_handoff(tmp_path, monkeypatch
     (s / "marker.txt").write_text("model", encoding="utf-8")
     mv.commit(0)
     state = fresh_campaign_state(max_iterations=3)
+    state.campaign_uid = "reconcile-test"
     state.phase = CampaignPhase.HALTED
     state.iteration = 1
     state.reference_data_version = 0
@@ -1394,6 +1559,7 @@ def test_propose_recovery_finds_staging_handoff_in_later_iteration(tmp_path, mon
     _write_pool(campaign)
     _commit_training_and_model_versions(training, models, [0, 1])
     state = fresh_campaign_state(max_iterations=4)
+    state.campaign_uid = "reconcile-test"
     state.phase = CampaignPhase.HALTED
     state.iteration = 2
     state.reference_data_version = 1
@@ -1432,6 +1598,7 @@ def test_propose_recovery_halts_on_multiple_valid_staging_handoffs(tmp_path, mon
     _write_pool(campaign)
     _commit_training_and_model_versions(training, models, [0])
     state = fresh_campaign_state(max_iterations=4)
+    state.campaign_uid = "reconcile-test"
     state.phase = CampaignPhase.HALTED
     state.iteration = 1
     state.reference_data_version = 0
@@ -1558,6 +1725,125 @@ def test_propose_recovery_corrupt_state_does_not_crash(tmp_path):
     # Falls through to a fresh state since existing did not load.
     assert report.existing_state_loaded is False
     assert any("failed validation" in n or "unreadable" in n for n in report.notes)
+
+
+def test_propose_recovery_recovers_uid_from_valid_committed_data_after_non_json_state(
+    tmp_path,
+):
+    campaign, data, _, _ = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_reference_versions(campaign, (0,))
+    (data / DEFAULT_STATE_FILENAME).write_text("{not valid json", encoding="utf-8")
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.campaign_uid == "reconcile-test"
+    assert report.proposed_state.phase is CampaignPhase.INITIAL_FEREBUS
+    assert not any(
+        "no recoverable trusted campaign_uid" in reason
+        for reason in report.unsafe_reasons
+    )
+
+
+def test_propose_recovery_refuses_state_uid_disagreement_with_committed_data(tmp_path):
+    campaign, data, _, _ = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_reference_versions(campaign, (0,))
+    state = fresh_campaign_state(campaign_uid="different-campaign")
+    state.phase = CampaignPhase.HALTED
+    state.reference_data_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.HALTED
+    assert any(
+        "state campaign_uid disagrees with trusted artefacts" in reason
+        for reason in report.unsafe_reasons
+    )
+
+
+def test_reconcile_preserves_completed_lifecycle_until_explicit_reopen(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon.state import make_lifecycle_context
+
+    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    monkeypatch.setattr(
+        reconcile_mod,
+        "verify_state_referenced_artifacts",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        reconcile_mod,
+        "_validate_recovered_state_contract",
+        lambda *a, **k: None,
+    )
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_training_and_model_versions(training, models, [0])
+    state = fresh_campaign_state(max_iterations=1, campaign_uid="reconcile-test")
+    state.phase = CampaignPhase.DONE
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.models_version = 0
+    state.lifecycle_context = make_lifecycle_context(
+        disposition="completed",
+        reason_code="max_iterations_reached",
+        message="campaign complete",
+        from_phase=CampaignPhase.STOP_CHECK,
+        iteration=1,
+        source="daemon",
+    )
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.DONE
+    assert report.proposed_state.lifecycle_context["disposition"] == "completed"
+    assert "only resume --reopen-converged" in " ".join(report.notes)
+
+
+def test_reconcile_preserves_operator_stop_until_resume(tmp_path, monkeypatch):
+    from ichor.hpc.active_learning.daemon.state import make_lifecycle_context
+
+    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    monkeypatch.setattr(
+        reconcile_mod,
+        "verify_state_referenced_artifacts",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        reconcile_mod,
+        "_validate_recovered_state_contract",
+        lambda *a, **k: None,
+    )
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_training_and_model_versions(training, models, [0])
+    state = fresh_campaign_state(max_iterations=3, campaign_uid="reconcile-test")
+    state.phase = CampaignPhase.SEED_SELECT
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.models_version = 0
+    state.shutdown_requested = True
+    state.lifecycle_context = make_lifecycle_context(
+        disposition="stopped",
+        reason_code="operator_stop_request",
+        message="operator requested stop",
+        from_phase=CampaignPhase.SEED_SELECT,
+        iteration=1,
+        source="operator",
+    )
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.SEED_SELECT
+    assert report.proposed_state.shutdown_requested is True
+    assert report.proposed_state.lifecycle_context["disposition"] == "stopped"
+    assert "only resume may clear it" in " ".join(report.notes)
 
 
 def test_write_proposed_state_creates_proposed_file(tmp_path):

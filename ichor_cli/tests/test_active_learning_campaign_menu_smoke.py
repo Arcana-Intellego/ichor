@@ -41,7 +41,8 @@ def test_daemon_control_menu_items():
         "Show sampling protocol summary",
         "Show config editability windows",
         "Recovery dashboard",
-        "Preflight backends",
+        "Campaign live preflight",
+        "Submit compute-node environment smoke",
         "Initialise Campaign / Import Inputs",
         "Start/Resume Daemon (Foreground)",
         "Start/Resume Daemon (Background)",
@@ -50,6 +51,7 @@ def test_daemon_control_menu_items():
         "Reconcile --apply",
         "Reconcile --archive-staging --apply",
         "Reconcile force-resubmit current array",
+        "Reconcile and retrain FEREBUS",
         "Restore campaign.yaml proposal from config lock",
         "Reconcile state with --allow-fresh-init",
     ):
@@ -1774,6 +1776,34 @@ def test_launch_helpers_builds_resume_argv_with_preset_and_config(tmp_path):
     assert argv[argv.index("--preset") + 1] == "csf4"
 
 
+def test_launch_helpers_builds_explicit_completed_campaign_reopen_argv(tmp_path):
+    from ichor.cli.useful_functions.launch_helpers import build_daemon_argv
+
+    argv = build_daemon_argv(
+        tmp_path,
+        command="resume",
+        mode="live",
+        reopen_converged=True,
+    )
+
+    assert argv[3] == "resume"
+    assert "--reopen-converged" in argv
+
+
+def test_launch_helpers_rejects_completed_campaign_reopen_with_start(tmp_path):
+    import pytest
+
+    from ichor.cli.useful_functions.launch_helpers import build_daemon_argv
+
+    with pytest.raises(ValueError, match="resume"):
+        build_daemon_argv(
+            tmp_path,
+            command="start",
+            mode="live",
+            reopen_converged=True,
+        )
+
+
 def test_launch_helpers_rejects_unknown_mode():
     import pytest
 
@@ -2032,33 +2062,76 @@ def test_config_save_rejects_invalid_without_writing(tmp_path, monkeypatch):
     assert not (tmp_path / "campaign.yaml").exists()
 
 
-def test_preflight_success_reports_all_current_dependencies(monkeypatch, capsys):
+def test_preflight_menu_dispatches_campaign_aware_command(
+    tmp_path,
+    monkeypatch,
+):
     import importlib
-    from types import SimpleNamespace
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
     menu = importlib.import_module(
         "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
         "active_learning_campaign_submenus.daemon_control_menu"
     )
-    import ichor.hpc.active_learning.daemon.preflight as preflight
+    import ichor.hpc.active_learning.cli as daemon_cli
 
-    fake = SimpleNamespace(
-        all_present=True,
-        sbatch_path="/bin/sbatch",
-        sacct_path="/bin/sacct",
-        gaussian_binary="/bin/g16",
-        aimall_path="/bin/aimqb.ish",
-        ferebus_path="/bin/ferebus",
-        bc_path="/bin/bc",
-    )
-    monkeypatch.setattr(preflight, "check_backends", lambda: fake)
+    set_selected_campaign_dir(tmp_path)
+    seen = {}
+
+    def fake_preflight(ns):
+        seen["campaign_dir"] = ns.campaign_dir
+        seen["json"] = ns.json
+        seen["verbose"] = ns.verbose
+        return 0
+
+    monkeypatch.setattr(daemon_cli, "cmd_preflight", fake_preflight)
     monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: "")
 
     menu.DaemonControlFunctions.preflight_backends()
 
-    out = capsys.readouterr().out
-    assert "polus_rs" in out
-    assert "pyferebus" in out
-    assert "bc:" in out
+    assert seen == {
+        "campaign_dir": str(tmp_path.absolute()),
+        "json": False,
+        "verbose": True,
+    }
+
+
+def test_submitted_environment_smoke_menu_requires_confirmation(
+    tmp_path, monkeypatch,
+):
+    import importlib
+
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.daemon_control_menu"
+    )
+    import ichor.hpc.active_learning.cli as daemon_cli
+
+    set_selected_campaign_dir(tmp_path)
+    calls = []
+    responses = iter(["YES", ""])
+    monkeypatch.setattr(
+        menu,
+        "user_input_free_flow",
+        lambda *args, **kwargs: next(responses),
+    )
+    monkeypatch.setattr(
+        daemon_cli,
+        "cmd_preflight",
+        lambda ns: calls.append(ns) or 0,
+    )
+
+    menu.DaemonControlFunctions.submitted_environment_smoke()
+
+    assert len(calls) == 1
+    assert calls[0].campaign_dir == str(tmp_path.absolute())
+    assert calls[0].submit_environment_smoke is True
+    assert calls[0].verbose is True
 
 
 def test_reconcile_paths_pass_allow_fresh_init_flag(tmp_path, monkeypatch):
@@ -2162,10 +2235,12 @@ def test_foreground_launch_uses_resume_when_selected(tmp_path, monkeypatch):
     menu.start_daemon_foreground_menu_options.selected_preset = "balanced"
     menu.start_daemon_foreground_menu_options.selected_poll_interval = 3
     menu.start_daemon_foreground_menu_options.selected_max_ticks = 2
+    menu.start_daemon_foreground_menu_options.reopen_converged = True
     rendered = menu.start_daemon_foreground_menu.this_menu_options()
     assert "command: resume" in rendered
     assert "poll_interval: 3" in rendered
     assert "max_ticks: 2" in rendered
+    assert "reopen_converged: True" in rendered
     assert "scope: menu-only; applies to next daemon launch" in rendered
     calls = []
     monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: "")
@@ -2181,6 +2256,34 @@ def test_foreground_launch_uses_resume_when_selected(tmp_path, monkeypatch):
     assert ns.preset == "balanced"
     assert ns.poll_interval == 3
     assert ns.max_ticks == 2
+    assert ns.reopen_converged is True
+
+
+def test_foreground_launch_rejects_completed_campaign_reopen_with_start(
+    tmp_path, monkeypatch, capsys,
+):
+    import importlib
+
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.daemon_control_submenus."
+        "start_daemon_foreground_submenu"
+    )
+    set_selected_campaign_dir(tmp_path)
+    menu.start_daemon_foreground_menu_options.selected_command = "start"
+    menu.start_daemon_foreground_menu_options.selected_mode = "dry-run"
+    menu.start_daemon_foreground_menu_options.selected_config = ""
+    menu.start_daemon_foreground_menu_options.selected_preset = ""
+    menu.start_daemon_foreground_menu_options.reopen_converged = True
+    monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: "")
+
+    menu.StartDaemonForegroundFunctions.launch()
+
+    assert "valid only with the resume command" in capsys.readouterr().out
 
 
 def test_background_launch_reports_checked_result(tmp_path, monkeypatch, capsys):
@@ -2203,6 +2306,7 @@ def test_background_launch_reports_checked_result(tmp_path, monkeypatch, capsys)
     menu.start_daemon_background_menu_options.selected_preset = ""
     menu.start_daemon_background_menu_options.selected_poll_interval = 0
     menu.start_daemon_background_menu_options.selected_max_ticks = 0
+    menu.start_daemon_background_menu_options.reopen_converged = True
     menu.start_daemon_background_menu_options.selected_log_path = str(
         tmp_path / "daemon.custom.out"
     )
@@ -2215,6 +2319,7 @@ def test_background_launch_reports_checked_result(tmp_path, monkeypatch, capsys)
     assert "config: <blank>" in rendered
     assert "background_log: " in rendered
     assert "background_pid: " in rendered
+    assert "reopen_converged: True" in rendered
     assert "scope: menu-only; applies to next daemon launch" in rendered
     seen = {}
 
@@ -2236,4 +2341,5 @@ def test_background_launch_reports_checked_result(tmp_path, monkeypatch, capsys)
     assert seen["mode"] == "live"
     assert seen["log_path"] == Path(tmp_path / "daemon.custom.out")
     assert seen["pid_path"] == Path(tmp_path / "daemon.custom.pid")
+    assert seen["reopen_converged"] is True
     assert "exited during startup" in capsys.readouterr().out

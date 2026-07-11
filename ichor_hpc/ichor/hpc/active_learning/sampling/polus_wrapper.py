@@ -798,10 +798,13 @@ def _run_phase_b(args, campaign, config):
     )
 
     try:
+        from ..daemon.config_lock import canonical_config, config_fingerprint
+
         ariadne_manifest, candidate_frames, candidate_records = ariadne_candidate_frames(
             iter_dir,
             expected_iteration=int(args.iteration),
             accept_legacy_missing_landing_safety=accept_legacy_missing_landing_safety,
+            expected_config_sha256=config_fingerprint(canonical_config(config)),
         )
     except Exception as exc:
         print(

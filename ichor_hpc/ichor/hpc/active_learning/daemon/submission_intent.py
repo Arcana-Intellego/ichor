@@ -169,6 +169,7 @@ def write_pre_submit_intent(
     phase_name: str,
     iteration: int,
     replacement_round: int = 0,
+    expected_tasks: Optional[int] = None,
 ) -> Dict[str, Any]:
     path = intent_path(campaign_dir, phase_name, iteration)
     previous = load_intent(campaign_dir, phase_name, iteration)
@@ -228,6 +229,11 @@ def write_pre_submit_intent(
         "job_id": None,
         "created_iso": _now_iso(),
     }
+    if expected_tasks is not None:
+        parsed_expected = int(expected_tasks)
+        if parsed_expected <= 0:
+            raise ValueError("submission intent expected_tasks must be > 0")
+        payload["expected_tasks"] = parsed_expected
     return _write_payload(path, payload)
 
 
@@ -242,6 +248,7 @@ def update_intent_status(
     expected_tasks: Optional[int] = None,
     job_ids_seen: Optional[Any] = None,
     submission_metadata: Optional[Dict[str, Any]] = None,
+    completion_receipt: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     path = intent_path(campaign_dir, phase_name, iteration)
     data = load_intent(campaign_dir, phase_name, iteration) or {
@@ -287,6 +294,8 @@ def update_intent_status(
                 pass
     if job_ids_seen is not None:
         data["job_ids_seen"] = [str(x) for x in list(job_ids_seen)]
+    if completion_receipt is not None:
+        data["completion_receipt"] = dict(completion_receipt)
     if str(status) == "SUBMITTED":
         submitted_at = data.get("submitted_at_iso") or _now_iso()
         data["submitted_at_iso"] = str(submitted_at)
@@ -413,10 +422,17 @@ def mark_adopted(
     )
 
 
-def mark_completed(campaign_dir: Union[str, Path], phase_name: str, iteration: int) -> Dict[str, Any]:
+def mark_completed(
+    campaign_dir: Union[str, Path],
+    phase_name: str,
+    iteration: int,
+    *,
+    completion_receipt: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     return update_intent_status(
         campaign_dir, phase_name=phase_name, iteration=iteration,
         status="COMPLETED",
+        completion_receipt=completion_receipt,
     )
 
 

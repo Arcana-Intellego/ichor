@@ -123,6 +123,7 @@ class DryRunPhaseExecutor:
     models_dir_name: str = TRAINED_MODELS_DIRNAME
     diversity_dir_name: str = BOOTSTRAP_DIRNAME
     al_dir_name: str = ACTIVE_LEARNING_DIRNAME
+    strict_completion_receipt_evidence: bool = True
     scripts_dir: Path = field(init=False)
     artefact_log: List[str] = field(default_factory=list)
 
@@ -280,7 +281,9 @@ class DryRunPhaseExecutor:
         from .ferebus_quality import (
             FEREBUS_QUALITY_MANIFEST,
             FEREBUS_QUALITY_SCHEMA_VERSION,
+            write_ferebus_quality_decision,
         )
+        from .config_lock import canonical_config, config_fingerprint
         from .live_executor import _write_ferebus_task_artefact_layout
         from .model_contract import validate_ferebus_model_contract
         from ..versioning.trained_models import (
@@ -505,6 +508,11 @@ class DryRunPhaseExecutor:
             "reasons": [],
         }
         atomic_write_json(ferebus_staging / FEREBUS_QUALITY_MANIFEST, quality)
+        write_ferebus_quality_decision(
+            ferebus_staging,
+            config_sha256=config_fingerprint(canonical_config(self.config)),
+            gates=getattr(self.config, "quality_gates", None),
+        )
 
         model_versioning = self._versioning("models")
         with trained_models_commit_lock(self.campaign_dir):
@@ -1311,9 +1319,9 @@ class DryRunPhaseExecutor:
 
         updates = {"alpha_history": history}
         if shutdown:
-            updates["shutdown_requested"] = True
+            updates["campaign_completion_reason"] = str(reason)
             self._journal_event(
-                "shutdown_requested",
+                "scientific_convergence_reached",
                 iteration=int(state.iteration),
                 reason=str(reason),
                 history_tail=[float(x) for x in history[-min(len(history), 8):]],
@@ -1586,6 +1594,7 @@ class DryRunPhaseExecutor:
             load_seeds_picked,
             write_acquisition_maturity_audit,
             write_ariadne_landing_audit,
+            write_ariadne_batch_decision,
             write_ariadne_results_manifest,
         )
         from ..layout import active_ariadne_dir, ariadne_seed_dir
@@ -1903,6 +1912,23 @@ class DryRunPhaseExecutor:
             "rejected": [],
         })
         self.artefact_log.append(str(manifest_path))
+        from .config_lock import canonical_config, config_fingerprint
+
+        decision_path = write_ariadne_batch_decision(
+            iter_dir,
+            campaign_uid=str(campaign_uid),
+            iteration=int(state.iteration),
+            config_sha256=config_fingerprint(canonical_config(self.config)),
+            failure_threshold_fraction=float(
+                self.config.runtime.failure_threshold_fraction
+            ),
+            expected_n=int(len(tasks)),
+            n_accepted=int(len(accepted_records)),
+            n_rejected=0,
+            accepted=True,
+            reasons=[],
+        )
+        self.artefact_log.append(str(decision_path))
         self._journal_event(
             "subspace_built",
             iteration=int(state.iteration),
@@ -1944,9 +1970,12 @@ class DryRunPhaseExecutor:
         iter_dir = self._iter_dir(state.iteration)
         phase_b_dir = active_phase_b_dir(iter_dir)
         phase_b_dir.mkdir(parents=True, exist_ok=True)
+        from .config_lock import canonical_config, config_fingerprint
+
         ariadne_manifest, candidate_frames, accepted = ariadne_candidate_frames(
             iter_dir,
             expected_iteration=int(state.iteration),
+            expected_config_sha256=config_fingerprint(canonical_config(self.config)),
         )
         batch_total = int(self.config.point_allocation.batch_total_size)
         n_accepted_candidates = len(accepted)

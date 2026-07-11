@@ -43,6 +43,14 @@ from ichor.hpc.active_learning.daemon.preflight import (
     check_backends,
     missing_backend_message,
 )
+from ichor.hpc.active_learning.daemon.submitted_environment_smoke import (
+    SMOKE_SUCCESS_MARKER,
+    render_submitted_environment_smoke_script,
+    run_submitted_environment_smoke,
+)
+from ichor.hpc.active_learning.daemon.runtime_environment import (
+    SUBMITTED_PYTHON_IMPORTS,
+)
 
 
 # --- skip-if-absent helpers ------------------------------------------------
@@ -241,6 +249,106 @@ def test_missing_backend_message_names_rendered_gaussian_module():
     assert "Active ICHOR profile: csf3" in msg
     assert "cluster-specific" in msg
     assert "gaussian/g16`" not in msg
+
+
+def test_submitted_environment_smoke_renders_exact_runtime_contract(
+    tmp_path, monkeypatch,
+):
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf3": {
+                "hpc": {
+                    "scheduler": "slurm",
+                    "jobscript_shebang": "#!/bin/bash --login",
+                    "memory_per_core_gb_by_partition": {"multicore": 8},
+                },
+                "software": {
+                    "gaussian": {"modules": ["gaussian/test"]},
+                },
+            }
+        },
+        "csf3",
+    )
+    availability = SimpleNamespace(
+        active_profile="csf3",
+        batch_runtime_modules=("python/test", "mkl/test"),
+        python_executable="/home/user/.venv/ichor-csf3/bin/python",
+        gaussian_binary="/opt/gaussian/g16",
+        aimall_path="/home/user/AIMAll/aimqb.ish",
+        ferebus_path="/home/user/.local/bin/ferebus",
+        bc_path="/usr/bin/bc",
+    )
+
+    body = render_submitted_environment_smoke_script(
+        config=CampaignConfig(),
+        availability=availability,
+        output_path=tmp_path / "smoke.out",
+    )
+
+    assert body.startswith("#!/bin/bash --login\n")
+    assert "#SBATCH --partition=multicore" in body
+    assert "#SBATCH --mem-per-cpu=8G" in body
+    assert body.index("module load python/test") < body.index("module load gaussian/test")
+    assert "pyferebus.executors.trainer" in body
+    assert "test -x /opt/gaussian/g16" in body
+    assert "test -x /home/user/AIMAll/aimqb.ish" in body
+    assert SMOKE_SUCCESS_MARKER in body
+
+
+def test_submitted_environment_smoke_records_success(tmp_path, monkeypatch):
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf4": {
+                "hpc": {
+                    "scheduler": "slurm",
+                    "jobscript_shebang": "#!/bin/bash --login",
+                    "memory_per_core_gb_by_partition": {"multicore": 4},
+                },
+                "software": {"gaussian": {"modules": ["gaussian/test"]}},
+            }
+        },
+        "csf4",
+    )
+    availability = SimpleNamespace(
+        all_present=True,
+        active_profile="csf4",
+        sbatch_path="/usr/bin/sbatch",
+        batch_runtime_modules=("python/test", "mkl/test"),
+        python_executable="/home/user/.venv/ichor-csf4/bin/python",
+        gaussian_binary="/opt/gaussian/g16",
+        aimall_path="/home/user/AIMAll/aimqb.ish",
+        ferebus_path="/home/user/.local/bin/ferebus",
+        bc_path="/usr/bin/bc",
+    )
+
+    def fake_runner(argv, **kwargs):
+        script_path = Path(argv[-1])
+        output_line = next(
+            line
+            for line in script_path.read_text(encoding="utf-8").splitlines()
+            if line.startswith("#SBATCH --output=")
+        )
+        Path(output_line.split("=", 1)[1]).write_text(
+            SMOKE_SUCCESS_MARKER + "\n",
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0, stdout="12345\n", stderr="")
+
+    result = run_submitted_environment_smoke(
+        campaign_dir=tmp_path,
+        config=CampaignConfig(),
+        availability=availability,
+        runner=fake_runner,
+        settle_seconds=0,
+    )
+
+    assert result["ok"] is True
+    assert result["submitted"] is True
+    assert result["job_id"] == "12345"
+    assert Path(result["script_path"]).is_file()
+    assert json.loads(Path(result["result_path"]).read_text(encoding="utf-8"))["ok"] is True
 
 
 def test_live_executor_refuses_when_sbatch_absent_on_windows():
@@ -1772,28 +1880,43 @@ def test_configured_batch_python_probe_uses_exact_interpreter(monkeypatch):
     calls = []
     monkeypatch.setattr(preflight.os.path, "isfile", lambda value: value == executable)
     monkeypatch.setattr(preflight.os, "access", lambda value, mode: value == executable)
+    monkeypatch.setattr(preflight.shutil, "which", lambda name: "/bin/bash" if name == "bash" else None)
 
     def fake_run(command, **kwargs):
         calls.append((list(command), dict(kwargs)))
         return SimpleNamespace(
             returncode=0,
             stdout=json.dumps(
-                {"executable": executable, "version": [3, 11, 15]}
+                {
+                    "executable": executable,
+                    "version": [3, 11, 15],
+                    "modules": {
+                        label: {"ok": True, "error": ""}
+                        for label in SUBMITTED_PYTHON_IMPORTS
+                    },
+                }
             ) + "\n",
             stderr="",
         )
 
     monkeypatch.setattr(preflight.subprocess, "run", fake_run)
 
-    ok, version, error = preflight._probe_configured_python(executable)
+    ok, version, error = preflight._probe_configured_python(
+        executable,
+        ["python/3.11", "mkl/2024.2"],
+    )
 
     assert ok is True
     assert version == "3.11.15"
     assert error == ""
-    assert calls[0][0][0] == executable
-    assert "ariadne" in calls[0][0][2]
-    assert "polus.samplers.RS.randomSampling" in calls[0][0][2]
-    assert "pyferebus.executors.trainer" in calls[0][0][2]
+    assert calls[0][0][:3] == ["/bin/bash", "--login", "-c"]
+    script = calls[0][0][3]
+    assert "module load python/3.11" in script
+    assert "module load mkl/2024.2" in script
+    assert executable in script
+    assert "ariadne" in script
+    assert "polus.samplers.RS.randomSampling" in script
+    assert "pyferebus.executors.trainer" in script
 
 
 def test_configured_batch_python_probe_rejects_wrong_version(monkeypatch):
@@ -1802,13 +1925,21 @@ def test_configured_batch_python_probe_rejects_wrong_version(monkeypatch):
     executable = "/home/user/.venv/wrong/bin/python"
     monkeypatch.setattr(preflight.os.path, "isfile", lambda value: value == executable)
     monkeypatch.setattr(preflight.os, "access", lambda value, mode: value == executable)
+    monkeypatch.setattr(preflight.shutil, "which", lambda name: "/bin/bash" if name == "bash" else None)
     monkeypatch.setattr(
         preflight.subprocess,
         "run",
         lambda *args, **kwargs: SimpleNamespace(
             returncode=0,
             stdout=json.dumps(
-                {"executable": executable, "version": [3, 13, 1]}
+                {
+                    "executable": executable,
+                    "version": [3, 13, 1],
+                    "modules": {
+                        label: {"ok": True, "error": ""}
+                        for label in SUBMITTED_PYTHON_IMPORTS
+                    },
+                }
             ) + "\n",
             stderr="",
         ),
@@ -1819,6 +1950,101 @@ def test_configured_batch_python_probe_rejects_wrong_version(monkeypatch):
     assert ok is False
     assert version == "3.13.1"
     assert "Python 3.11" in error
+
+
+def test_configured_batch_python_probe_reports_submitted_import_failure(monkeypatch):
+    from ichor.hpc.active_learning.daemon import preflight
+
+    executable = "/home/user/.venv/ichor-csf3/bin/python"
+    monkeypatch.setattr(preflight.os.path, "isfile", lambda value: value == executable)
+    monkeypatch.setattr(preflight.os, "access", lambda value, mode: value == executable)
+    monkeypatch.setattr(
+        preflight.shutil,
+        "which",
+        lambda name: "/bin/bash" if name == "bash" else None,
+    )
+    statuses = {
+        label: {"ok": True, "error": ""}
+        for label in SUBMITTED_PYTHON_IMPORTS
+    }
+    statuses["ariadne"] = {
+        "ok": False,
+        "error": "ImportError: libmkl_rt.so not found",
+    }
+    monkeypatch.setattr(
+        preflight.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "executable": executable,
+                    "version": [3, 11, 15],
+                    "modules": statuses,
+                }
+            )
+            + "\n",
+            stderr="",
+        ),
+    )
+
+    interpreter_ok, version, error, imports = (
+        preflight._probe_configured_python_details(executable, ["mkl/2024.2"])
+    )
+    contract_ok, _, contract_error = preflight._probe_configured_python(
+        executable,
+        ["mkl/2024.2"],
+    )
+
+    assert interpreter_ok is True
+    assert version == "3.11.15"
+    assert error == ""
+    assert imports["ariadne"]["ok"] is False
+    assert contract_ok is False
+    assert "libmkl_rt.so" in contract_error
+
+
+def test_gaussian_probe_uses_combined_submitted_runtime_module_stack(monkeypatch):
+    from ichor.hpc.active_learning.daemon import preflight
+
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf3": {
+                "hpc": {"scheduler": "slurm"},
+                "software": {
+                    "python": {"modules": ["python/3.11"]},
+                    "ariadne_runtime": {"modules": ["mkl/2025.0"]},
+                    "gaussian": {
+                        "modules": ["apps/gaussian/g16"],
+                        "executable_path": "$g16root/g16/g16",
+                    },
+                },
+            }
+        },
+        "csf3",
+    )
+    scripts = []
+
+    def fake_login_shell(script, *, timeout=30):
+        scripts.append(script)
+        return SimpleNamespace(
+            returncode=0,
+            stdout="/opt/gaussian/g16\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(preflight, "_run_login_shell", fake_login_shell)
+
+    ok, resolved, error = preflight._probe_gaussian_environment()
+
+    assert ok is True
+    assert resolved == "/opt/gaussian/g16"
+    assert error == ""
+    assert scripts[0].index("module load python/3.11") < scripts[0].index(
+        "module load apps/gaussian/g16"
+    )
+    assert "module load mkl/2025.0" in scripts[0]
 
 
 def test_replacement_resource_solver_uses_nested_round_atom_count(

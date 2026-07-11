@@ -16,7 +16,7 @@ from ichor.hpc.active_learning.daemon.daemon import (
 )
 from ichor.hpc.active_learning.daemon import submission_intent
 from ichor.hpc.active_learning.daemon.job_names import live_job_name
-from ichor.hpc.active_learning.daemon.journal import append_event
+from ichor.hpc.active_learning.daemon.journal import append_event, iter_events
 from ichor.hpc.active_learning.daemon.state import (
     CampaignPhase,
     DEFAULT_STATE_FILENAME,
@@ -30,6 +30,7 @@ from ichor.hpc.active_learning.daemon.status_recommendations import (
 )
 from ichor.hpc.active_learning.handoff_manifests import (
     ARIADNE_RESULTS_SCHEMA_VERSION,
+    write_ariadne_batch_decision,
     write_ariadne_results_manifest,
 )
 from ichor.hpc.active_learning.versioning.provenance import write_seed_provenance
@@ -334,6 +335,24 @@ def _write_valid_ariadne_results(campaign: Path, iteration: int = 1):
         }],
         "rejected": [],
     })
+    from ichor.hpc.active_learning.daemon.config_lock import (
+        canonical_config,
+        config_fingerprint,
+    )
+
+    config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+    write_ariadne_batch_decision(
+        iter_dir,
+        campaign_uid="cli-test",
+        iteration=int(iteration),
+        config_sha256=config_fingerprint(canonical_config(config)),
+        failure_threshold_fraction=float(config.runtime.failure_threshold_fraction),
+        expected_n=1,
+        n_accepted=1,
+        n_rejected=0,
+        accepted=True,
+        reasons=[],
+    )
     return iter_dir
 
 
@@ -349,6 +368,8 @@ def _backend_availability(**overrides):
         "batch_python_version": "3.11.15",
         "batch_python_error": "",
         "gaussian": True,
+        "gaussian_verified": True,
+        "gaussian_probe_error": "",
         "aimall": True,
         "ferebus": True,
         "ariadne": True,
@@ -411,6 +432,9 @@ def test_parser_rejects_missing_subcommand():
 
 def test_cli_preflight_prints_operator_dashboard_by_default(tmp_path, capsys, monkeypatch):
     campaign = _campaign_with_config(tmp_path)
+    state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    write_state(state_path, fresh_campaign_state(max_iterations=2))
     monkeypatch.setattr(cli_mod, "check_backends", _backend_availability)
     monkeypatch.setattr(
         cli_mod,
@@ -430,7 +454,7 @@ def test_cli_preflight_prints_operator_dashboard_by_default(tmp_path, capsys, mo
     assert "Python Environment\n" in out
     assert "  [OK] ariadne: importable" in out
     assert "Quantum Backends\n" in out
-    assert "  [OK] Gaussian: jobscript:$g16root/g16/g16" in out
+    assert "  [OK] Gaussian submitted environment: jobscript:$g16root/g16/g16" in out
     assert "Trajectory Pool\n" in out
     assert "  [OK] frames available: 1700" in out
     assert "  [OK] frames required: 90" in out
@@ -441,6 +465,9 @@ def test_cli_preflight_prints_operator_dashboard_by_default(tmp_path, capsys, mo
 
 def test_cli_preflight_json_prints_single_payload(tmp_path, capsys, monkeypatch):
     campaign = _campaign_with_config(tmp_path)
+    state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    write_state(state_path, fresh_campaign_state(max_iterations=2))
     monkeypatch.setattr(cli_mod, "check_backends", _backend_availability)
     monkeypatch.setattr(
         cli_mod,
@@ -457,6 +484,51 @@ def test_cli_preflight_json_prints_single_payload(tmp_path, capsys, monkeypatch)
     assert payload["python_executable"].endswith("ichor-csf3/bin/python")
     assert payload["backend_availability"]["ariadne"] is True
     assert payload["pool_feasibility"]["pool_n_frames"] == 1700
+
+
+def test_cli_preflight_can_submit_explicit_environment_smoke(
+    tmp_path, capsys, monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    write_state(state_path, fresh_campaign_state(max_iterations=2))
+    monkeypatch.setattr(cli_mod, "check_backends", _backend_availability)
+    monkeypatch.setattr(
+        cli_mod,
+        "_pool_feasibility_summary",
+        lambda _campaign, _config: _pool_feasibility_payload(),
+    )
+    calls = []
+
+    def fake_smoke(**kwargs):
+        calls.append(kwargs)
+        return {
+            "schema_version": 1,
+            "submitted": True,
+            "ok": True,
+            "job_id": "12345",
+            "output_path": str(campaign / "smoke.out"),
+            "error": "",
+        }
+
+    monkeypatch.setattr(cli_mod, "run_submitted_environment_smoke", fake_smoke)
+
+    rc = main(
+        [
+            "preflight",
+            "--campaign-dir",
+            str(campaign),
+            "--submit-environment-smoke",
+        ]
+    )
+
+    assert rc == 0
+    assert len(calls) == 1
+    assert calls[0]["campaign_dir"] == campaign
+    out = capsys.readouterr().out
+    assert "Submitted Environment Smoke" in out
+    assert "[OK] compute-node runtime: job 12345" in out
 
 
 def test_cli_preflight_reports_all_failures_together(tmp_path, capsys, monkeypatch):
@@ -486,12 +558,15 @@ def test_cli_preflight_reports_all_failures_together(tmp_path, capsys, monkeypat
     assert "  [FAIL] frames available: 50" in out
     assert "  [FAIL] frames required: 90" in out
     assert "fix failed checks before live start" in out
-    assert "install/build the ariadne Python module" in out
+    assert "install/build ariadne in the configured submitted Python venv" in out
     assert "fix trajectory pool feasibility" in out
 
 
 def test_cli_preflight_warns_when_pool_has_no_surplus(tmp_path, capsys, monkeypatch):
     campaign = _campaign_with_config(tmp_path)
+    state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    write_state(state_path, fresh_campaign_state(max_iterations=2))
     monkeypatch.setattr(cli_mod, "check_backends", _backend_availability)
     monkeypatch.setattr(
         cli_mod,
@@ -1020,6 +1095,62 @@ def test_status_recommendations_cover_halted_reason_classes(tmp_path):
             "latest_halt_event": {"reason": "campaign.yaml changed"},
         },
     ) == ["halted_config_changed"]
+
+
+@pytest.mark.parametrize(
+    ("reason_code", "expected_code"),
+    [
+        ("mandatory_anchor_failed", "halted_mandatory_anchor_failed"),
+        (
+            "replacement_reserve_exhausted",
+            "halted_replacement_reserve_exhausted",
+        ),
+        ("ferebus_quality_failed", "halted_ferebus_quality_failed"),
+    ],
+)
+def test_status_recommendations_use_authoritative_lifecycle_reason(
+    tmp_path,
+    reason_code,
+    expected_code,
+):
+    campaign = _campaign_with_config(tmp_path)
+
+    assert _recommendation_codes(
+        campaign,
+        {
+            "phase": CampaignPhase.HALTED.value,
+            "lifecycle_context": {
+                "disposition": "halted",
+                "reason_code": reason_code,
+                "message": "authoritative current failure",
+                "from_phase": CampaignPhase.ALLOCATION_CHECK.value,
+                "iteration": 1,
+                "timestamp_iso": "2026-07-11T00:00:00+00:00",
+            },
+            "latest_halt_event": {"reason": "stale historical NODE_FAIL"},
+        },
+    ) == [expected_code]
+
+
+def test_status_recommendations_report_scientific_completion_not_stop(tmp_path):
+    campaign = _campaign_with_config(tmp_path)
+
+    codes = _recommendation_codes(
+        campaign,
+        {
+            "phase": CampaignPhase.DONE.value,
+            "lifecycle_context": {
+                "disposition": "completed",
+                "reason_code": "scientific_convergence",
+                "message": "scientific convergence criterion reached",
+                "from_phase": CampaignPhase.STOP_CHECK.value,
+                "iteration": 3,
+                "timestamp_iso": "2026-07-11T00:00:00+00:00",
+            },
+        },
+    )
+
+    assert codes == ["campaign_completed_scientific_convergence"]
 
 
 def test_status_recommendations_cover_contract_failure_classes(tmp_path):
@@ -1642,6 +1773,44 @@ def test_cli_stop_when_no_state_returns_4(tmp_path):
     assert rc == 4
 
 
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        ({"event": "queue_lifecycle_update", "status": "FAILED"}, "FAIL"),
+        ({"event": "queue_lifecycle_update", "status": "COMPLETED"}, "OK"),
+        ({"event": "queue_lifecycle_update", "status": "PENDING"}, "WAIT"),
+        ({"event": "queue_lifecycle_update", "status": "RUNNING"}, "RUN"),
+        ({"event": "failure_action", "action": "HALT"}, "FAIL"),
+        ({"event": "failure_action", "action": "RETRY"}, "WARN"),
+        ({"event": "quantum_quality_summary", "accepted": False}, "FAIL"),
+        (
+            {
+                "event": "quantum_quality_summary",
+                "accepted": True,
+                "n_total": 3,
+                "n_rejected": 1,
+            },
+            "WARN",
+        ),
+        (
+            {
+                "event": "ferebus_quality_summary",
+                "accepted": True,
+                "n_total": 4,
+                "n_rejected": 0,
+            },
+            "OK",
+        ),
+        ({"event": "sacct_error"}, "WARN"),
+        ({"event": "sacct_error_timeout"}, "FAIL"),
+        ({"event": "campaign_completed"}, "OK"),
+        ({"event": "phase_completion_replayed"}, "WARN"),
+    ],
+)
+def test_journal_event_severity_uses_event_semantics(event, expected):
+    assert cli_mod._journal_event_severity(event) == expected
+
+
 def test_cli_journal_json_prints_filtered_events(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
     (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
@@ -2085,6 +2254,87 @@ def test_cli_resume_refuses_halted_state(tmp_path, capsys):
     assert "campaign is HALTED" in capsys.readouterr().err
 
 
+def test_cli_resume_refuses_done_without_explicit_reopen(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state(max_iterations=2)
+    state.phase = CampaignPhase.DONE
+    state.iteration = 2
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+
+    rc = main(["resume", "--campaign-dir", str(campaign), "--mock-ariadne"])
+
+    assert rc == 6
+    assert "campaign is DONE" in capsys.readouterr().err
+    assert read_state(data / DEFAULT_STATE_FILENAME).phase is CampaignPhase.DONE
+
+
+def test_cli_reopen_done_requires_config_lock_reconcile_first(tmp_path, capsys):
+    from ichor.hpc.active_learning.daemon.config_lock import write_config_lock
+
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    original = CampaignConfig(max_iterations=2)
+    write_config_lock(campaign, original)
+    CampaignConfig(max_iterations=3).to_yaml(campaign / "campaign.yaml")
+    state = fresh_campaign_state(max_iterations=2)
+    state.phase = CampaignPhase.DONE
+    state.iteration = 2
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+
+    rc = main([
+        "resume",
+        "--campaign-dir",
+        str(campaign),
+        "--mock-ariadne",
+        "--reopen-converged",
+        "--max-ticks",
+        "0",
+    ])
+
+    assert rc == 7
+    assert "reconcile --apply" in capsys.readouterr().err
+    unchanged = read_state(data / DEFAULT_STATE_FILENAME)
+    assert unchanged.phase is CampaignPhase.DONE
+    assert unchanged.iteration == 2
+
+
+def test_cli_reopen_done_is_explicit_and_advances_one_iteration(tmp_path):
+    from ichor.hpc.active_learning.daemon.config_lock import write_config_lock
+
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    config = CampaignConfig(max_iterations=3)
+    config.to_yaml(campaign / "campaign.yaml")
+    write_config_lock(campaign, config)
+    state = fresh_campaign_state(max_iterations=2)
+    state.phase = CampaignPhase.DONE
+    state.iteration = 2
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+
+    rc = main([
+        "resume",
+        "--campaign-dir",
+        str(campaign),
+        "--mock-ariadne",
+        "--reopen-converged",
+        "--max-ticks",
+        "0",
+    ])
+
+    assert rc == 0
+    reopened = read_state(data / DEFAULT_STATE_FILENAME)
+    assert reopened.phase is CampaignPhase.SEED_SELECT
+    assert reopened.iteration == 3
+    assert reopened.max_iterations == 3
+    assert reopened.lifecycle_context is None
+    events = list(iter_events(data / "journal.ndjson"))
+    assert any(event.get("event") == "campaign_reopened" for event in events)
+
+
 def test_cli_start_with_mock_ariadne_drives_state_machine(tmp_path):
     campaign = _campaign_with_config(tmp_path)
     assert main(["init", "--campaign-dir", str(campaign)]) == 0
@@ -2169,3 +2419,50 @@ def test_cli_start_live_on_windows_refuses_with_exit_12(tmp_path, capsys):
     assert rc == 12
     captured = capsys.readouterr()
     assert "backends are not available" in captured.err
+
+
+def test_cli_start_live_reaches_daemon_with_all_backends_present(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
+
+    campaign = _campaign_with_config(tmp_path)
+    TrajectoryPool.import_from(campaign / "pool.xyz", campaign)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    write_state(data / DEFAULT_STATE_FILENAME, fresh_campaign_state())
+    captured = {}
+
+    class FakeExecutor:
+        strict_committed_artifact_verification = True
+
+        def __init__(self, *, campaign_dir, config):
+            captured["executor_campaign"] = campaign_dir
+
+    class FakeDaemon:
+        def __init__(self, **kwargs):
+            captured["daemon_kwargs"] = kwargs
+
+        def run(self, **kwargs):
+            captured["run_kwargs"] = kwargs
+            return 0
+
+    monkeypatch.setattr(cli_mod, "check_backends", _backend_availability)
+    monkeypatch.setattr(cli_mod, "LiveBackendsPhaseExecutor", FakeExecutor)
+    monkeypatch.setattr(cli_mod, "Daemon", FakeDaemon)
+    monkeypatch.setattr(
+        cli_mod,
+        "make_live_job_finder",
+        lambda *, campaign_dir: ("finder", campaign_dir),
+    )
+    monkeypatch.setattr(cli_mod, "make_live_job_accounting_finder", lambda: "accounting")
+    monkeypatch.setattr(cli_mod, "make_live_job_liveness_checker", lambda: "liveness")
+
+    rc = main(["start", "--campaign-dir", str(campaign), "--live", "--max-ticks", "0"])
+
+    assert rc == 0
+    assert captured["executor_campaign"] == campaign.resolve()
+    assert captured["daemon_kwargs"]["job_finder"] == ("finder", campaign.resolve())
+    assert captured["daemon_kwargs"]["job_name_accounting_finder"] == "accounting"
+    assert captured["daemon_kwargs"]["job_liveness_checker"] == "liveness"

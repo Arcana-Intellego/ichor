@@ -18,6 +18,7 @@ from ichor.hpc.active_learning.handoff_manifests import (
     seeds_picked_path,
     validate_ariadne_result,
     write_ariadne_results_manifest,
+    write_ariadne_batch_decision,
 )
 from ichor.hpc.active_learning.layout import active_ariadne_dir, ariadne_seed_dir
 from ichor.hpc.active_learning.seed_identity import (
@@ -210,6 +211,18 @@ def _write_canonical_handoff(
         "accepted": [accepted_record],
         "rejected": [],
     })
+    write_ariadne_batch_decision(
+        iter_dir,
+        campaign_uid=CAMPAIGN_UID,
+        iteration=1,
+        config_sha256="test-config",
+        failure_threshold_fraction=0.0,
+        expected_n=1,
+        n_accepted=1,
+        n_rejected=0,
+        accepted=True,
+        reasons=[],
+    )
     return iter_dir, selection, result_path
 
 
@@ -281,6 +294,42 @@ def test_read_ariadne_manifest_and_reconstruct_candidates(tmp_path):
     assert len(frames) == 1
     assert records[0]["seed_id"] == 1
     assert records[0]["landing_safety"]["accepted"] is True
+
+
+def test_ariadne_batch_decision_must_match_immutable_result_counts(tmp_path):
+    iter_dir, _, _ = _write_canonical_handoff(tmp_path)
+
+    with pytest.raises(HandoffManifestError, match="counts do not match"):
+        write_ariadne_batch_decision(
+            iter_dir,
+            campaign_uid=CAMPAIGN_UID,
+            iteration=1,
+            config_sha256="different-policy",
+            failure_threshold_fraction=0.0,
+            expected_n=1,
+            n_accepted=0,
+            n_rejected=1,
+            accepted=False,
+            reasons=["synthetic rejection"],
+        )
+
+
+def test_ariadne_batch_decision_boolean_is_derived_from_policy(tmp_path):
+    iter_dir, _, _ = _write_canonical_handoff(tmp_path)
+
+    with pytest.raises(HandoffManifestError, match="accepted flag disagrees"):
+        write_ariadne_batch_decision(
+            iter_dir,
+            campaign_uid=CAMPAIGN_UID,
+            iteration=1,
+            config_sha256="different-policy",
+            failure_threshold_fraction=0.0,
+            expected_n=1,
+            n_accepted=1,
+            n_rejected=0,
+            accepted=False,
+            reasons=["synthetic inconsistent decision"],
+        )
 
 
 def test_read_ariadne_manifest_rejects_wrong_result_trajectory_sha(tmp_path):

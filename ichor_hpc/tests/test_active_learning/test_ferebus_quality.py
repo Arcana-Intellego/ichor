@@ -7,8 +7,11 @@ import pytest
 
 from ichor.hpc.active_learning.daemon import input_staging as stg
 from ichor.hpc.active_learning.daemon.ferebus_quality import (
+    FEREBUS_QUALITY_DECISION_MANIFEST,
     FEREBUS_QUALITY_MANIFEST,
     evaluate_ferebus_quality,
+    read_ferebus_quality_decision,
+    write_ferebus_quality_decision,
     write_ferebus_quality_manifest,
 )
 
@@ -199,3 +202,57 @@ def test_write_ferebus_quality_manifest(tmp_path):
 
     assert path.name == FEREBUS_QUALITY_MANIFEST
     assert json.loads(path.read_text(encoding="utf-8")) == payload
+
+
+def test_quality_decision_reuses_immutable_metrics_for_threshold_change(tmp_path):
+    staging = _seed_quality_staging(tmp_path, ext_targets=(1.0, 1.0))
+    strict = SimpleNamespace(ferebus_max_ext_rmse_ha=0.5)
+    quality = evaluate_ferebus_quality(staging, gates=strict)
+    write_ferebus_quality_manifest(staging, quality)
+    model = staging / "iqa" / "O1" / "WATER_iqa_O1.model"
+    model_bytes = model.read_bytes()
+
+    decision_path = write_ferebus_quality_decision(
+        staging,
+        config_sha256="strict-config",
+        gates=strict,
+    )
+    rejected = read_ferebus_quality_decision(
+        staging,
+        expected_config_sha256="strict-config",
+        require_accepted=False,
+    )
+    assert rejected["current_evaluation"]["accepted"] is False
+
+    write_ferebus_quality_decision(
+        staging,
+        config_sha256="relaxed-config",
+        gates=SimpleNamespace(),
+    )
+    accepted = read_ferebus_quality_decision(
+        staging,
+        expected_config_sha256="relaxed-config",
+        require_accepted=True,
+    )
+    assert accepted["current_evaluation"]["accepted"] is True
+    assert len(accepted["evaluations"]) == 2
+    assert model.read_bytes() == model_bytes
+    assert decision_path.name == FEREBUS_QUALITY_DECISION_MANIFEST
+
+
+def test_quality_decision_rejects_model_drift(tmp_path):
+    staging = _seed_quality_staging(tmp_path)
+    write_ferebus_quality_manifest(staging, evaluate_ferebus_quality(staging))
+    write_ferebus_quality_decision(
+        staging,
+        config_sha256="config-a",
+        gates=SimpleNamespace(),
+    )
+    model = staging / "iqa" / "O1" / "WATER_iqa_O1.model"
+    model.write_bytes(model.read_bytes() + b"\n# tampered\n")
+
+    with pytest.raises(ValueError, match="model hash mismatch"):
+        read_ferebus_quality_decision(
+            staging,
+            expected_config_sha256="config-a",
+        )

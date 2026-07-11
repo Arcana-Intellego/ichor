@@ -17,7 +17,6 @@ from ..versioning.reference_data import ReferenceDataVersioning
 from ..handoff_manifests import (
     read_ariadne_results_manifest,
     read_phase_a_sample_manifest,
-    read_phase_b_selection_manifest,
 )
 from ..layout import active_learning_dir
 from . import input_staging as _stg
@@ -279,12 +278,28 @@ def _require_seeds(campaign: Path, iteration: int) -> None:
     load_seeds_picked(iteration_dir(campaign, iteration), expected_iteration=int(iteration))
 
 
-def _require_ariadne_results(campaign: Path, iteration: int) -> None:
+def _require_ariadne_results(
+    campaign: Path,
+    iteration: int,
+    expected_campaign_uid: Optional[str] = None,
+) -> None:
+    from ..config import CampaignConfig
+    from .config_lock import canonical_config, config_fingerprint
+    from ..handoff_manifests import read_ariadne_batch_decision
+
     read_ariadne_results_manifest(
         iteration_dir(campaign, iteration),
         expected_iteration=int(iteration),
         require_nonempty=True,
         accept_legacy_missing_landing_safety=False,
+    )
+    config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+    read_ariadne_batch_decision(
+        iteration_dir(campaign, iteration),
+        expected_iteration=int(iteration),
+        expected_campaign_uid=expected_campaign_uid,
+        expected_config_sha256=config_fingerprint(canonical_config(config)),
+        require_accepted=True,
     )
 
 
@@ -318,30 +333,33 @@ def _count_xyz_frames(path: Path) -> int:
     return n_frames
 
 
-def _phase_b_final_count(campaign: Path, iteration: int) -> int:
+def _phase_b_final_count(
+    campaign: Path,
+    iteration: int,
+    expected_campaign_uid: Optional[str] = None,
+) -> int:
     idir = iteration_dir(campaign, iteration)
-    manifest = read_phase_b_selection_manifest(
+    from ..handoff_manifests import validate_phase_b_handoff
+
+    manifest = validate_phase_b_handoff(
         idir,
         expected_iteration=int(iteration),
-        require_nonempty=True,
+        expected_campaign_uid=expected_campaign_uid,
     )
-    sample = Path(str(manifest["selected_xyz"]["path"]))
-    if not sample.is_file():
-        raise FileNotFoundError("Phase B sample xyz missing: " + str(sample))
-    n_frames = _count_xyz_frames(sample)
     n_final = len(list(manifest.get("final") or []))
-    if int(n_frames) != int(n_final):
-        raise RecoveryContractError(
-            "Phase B sample frame count "
-            + str(int(n_frames))
-            + " does not match final record count "
-            + str(int(n_final))
-        )
     return int(n_final)
 
 
-def _require_phase_b(campaign: Path, iteration: int) -> None:
-    _phase_b_final_count(campaign, int(iteration))
+def _require_phase_b(
+    campaign: Path,
+    iteration: int,
+    expected_campaign_uid: Optional[str] = None,
+) -> None:
+    _phase_b_final_count(
+        campaign,
+        int(iteration),
+        expected_campaign_uid=expected_campaign_uid,
+    )
 
 
 def _require_split(campaign: Path, iteration: int) -> None:
@@ -849,19 +867,31 @@ def _phase_contract_checks(
         CampaignPhase.PHASE_B_POLUS: [
             (
                 "ariadne/RESULTS.json",
-                lambda: _require_ariadne_results(campaign, iteration),
+                lambda: _require_ariadne_results(
+                    campaign,
+                    iteration,
+                    str(state.campaign_uid),
+                ),
             ),
         ],
         CampaignPhase.SPLIT: [
             (
                 "Phase B selection/sample",
-                lambda: _require_phase_b(campaign, iteration),
+                lambda: _require_phase_b(
+                    campaign,
+                    iteration,
+                    str(state.campaign_uid),
+                ),
             ),
         ],
         CampaignPhase.GAUSSIAN: [
             (
                 "Phase B selection/sample",
-                lambda: _require_phase_b(campaign, iteration),
+                lambda: _require_phase_b(
+                    campaign,
+                    iteration,
+                    str(state.campaign_uid),
+                ),
             ),
             ("allocation/SPLIT_RECEIPT.json", lambda: _require_split(campaign, iteration)),
         ],
@@ -1062,7 +1092,7 @@ def select_recovery_phase(
             return RecoveryDecision(
                 CampaignPhase.INITIAL_FEREBUS,
                 0,
-                "INITIAL_FEREBUS: committed bootstrap training exists without model version 0",
+                "INITIAL_FEREBUS: exact point allocation is complete and committed bootstrap training exists without model version 0",
                 str(
                     ReferenceDataVersioning(
                         campaign / "QM_REFERENCE_DATA"
