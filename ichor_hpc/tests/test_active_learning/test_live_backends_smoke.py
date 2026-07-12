@@ -1479,8 +1479,12 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
     from ichor.hpc.active_learning.daemon import input_staging as stg
     from ichor.hpc.active_learning.submit import pyferebus_wrap
     from ichor.hpc.active_learning.submit.pyferebus_wrap import FerebusSubmission
+    from ichor.hpc.active_learning.ferebus_prior import (
+        resolve_ferebus_prior_contract,
+    )
 
     cfg = CampaignConfig()
+    prior = resolve_ferebus_prior_contract(cfg)
     cfg.resources.default_walltime_hours = 9
     cfg.resources.ferebus_walltime_hours = 2
     campaign = tmp_path / "campaign"
@@ -1536,11 +1540,13 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
                 "atoms": ["O1", "H2", "H3"],
                 "n_atoms": 3,
                 "n_tasks": 3,
+                "prior_mean_contract": prior.to_dict(),
                 "tasks": [
                     {
                         "task_index": index,
                         "property": "iqa",
                         "atom": atom,
+                        "prior_mean": prior.task_payload("iqa", atom),
                         "alf_1_indexed": list(alf),
                         "alf_cli": "_".join(
                             str(value) for value in alf

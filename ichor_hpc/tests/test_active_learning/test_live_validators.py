@@ -12,6 +12,14 @@ from ichor.hpc.active_learning.daemon.live_executor import (
     validate_ferebus_completed,
 )
 from ichor.hpc.active_learning.daemon import input_staging as stg
+from ichor.hpc.active_learning.config import CampaignConfig
+from ichor.hpc.active_learning.ferebus_prior import (
+    resolve_ferebus_prior_contract,
+    validate_ferebus_config_contract,
+)
+
+
+PRIOR = resolve_ferebus_prior_contract(CampaignConfig())
 
 
 def _write_model(path, ntrain, nrows, nfeats=3):
@@ -38,6 +46,7 @@ def _write_loadable_model(
     ntrain=5,
     nfeats=3,
 ):
+    prior_mean = PRIOR.expected_mean_ha(prop, atom)
     rows = [
         [0.1 + i * 0.1 + j * 0.01 for j in range(nfeats)]
         for i in range(ntrain)
@@ -58,7 +67,8 @@ def _write_loadable_model(
         "number_of_training_points " + str(ntrain),
         "",
         "[mean]",
-        "type zero",
+        "type constant",
+        "value " + repr(prior_mean),
         "",
         "[kernels]",
         "number_of_kernels 1",
@@ -94,7 +104,13 @@ def _task_root(root, atom="O1", prop="iqa"):
     d = root / prop / atom
     d.mkdir(parents=True, exist_ok=True)
     (d / "datasets").mkdir(exist_ok=True)
-    (d / "ferebus.config").write_text("config\n", encoding="utf-8")
+    (d / "ferebus.config").write_text(
+        "mean_type = 21\n"
+        + 'level_of_theory = "' + PRIOR.level_of_theory + '"\n'
+        + "iqaDeviationFactor = 1.0\nscaling = 1\n"
+        + "scale_feats = 1\nscale_prop = 0\n",
+        encoding="utf-8",
+    )
     return d
 
 
@@ -125,6 +141,7 @@ def _write_manifest(root, atoms):
             "task_index": i,
             "property": "iqa",
             "atom": atom,
+            "prior_mean": PRIOR.task_payload("iqa", atom),
             "alf_1_indexed": [1, 2, 3],
             "alf_cli": "1_2_3",
             "property_dir": "iqa",
@@ -150,6 +167,17 @@ def _write_manifest(root, atoms):
                 "ext_val": [7, 8],
             },
             "datasets": dataset_records,
+            "generated_config": {
+                "path": task_dir + "/ferebus.config",
+                "size": (d / "ferebus.config").stat().st_size,
+                "sha256": hashlib.sha256(
+                    (d / "ferebus.config").read_bytes()
+                ).hexdigest(),
+                "parsed_contract": validate_ferebus_config_contract(
+                    d / "ferebus.config", PRIOR
+                ),
+                "prior_mean_contract_sha256": PRIOR.contract_sha256,
+            },
         })
     (root / stg.FEREBUS_TASK_MANIFEST).write_text(
         __import__("json").dumps({
@@ -168,6 +196,7 @@ def _write_manifest(root, atoms):
             "atoms": list(atoms),
             "n_atoms": len(atoms),
             "n_tasks": len(tasks),
+            "prior_mean_contract": PRIOR.to_dict(),
             "tasks": tasks,
         }),
         encoding="utf-8",

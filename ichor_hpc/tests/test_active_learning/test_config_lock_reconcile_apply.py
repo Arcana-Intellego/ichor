@@ -278,14 +278,14 @@ def _write_stale_pre_submit_intent(campaign, phase):
     return payload
 
 
-def test_ferebus_scaling_change_allowed_for_uncommitted_initial_ferebus(tmp_path):
+def test_ferebus_feature_scaling_change_allowed_for_uncommitted_initial_ferebus(tmp_path):
     campaign = _campaign(tmp_path)
     _commit_reference_data_version(campaign, 0)
     state = _write_halted_pre_ferebus_state(campaign)
     original = CampaignConfig()
     write_config_lock(campaign, original)
     changed = CampaignConfig()
-    changed.ferebus.scaling = False
+    changed.ferebus.feature_scaling = False
     _write_config(campaign, changed)
 
     proposed = fresh_campaign_state()
@@ -295,9 +295,35 @@ def test_ferebus_scaling_change_allowed_for_uncommitted_initial_ferebus(tmp_path
     review = review_config_changes(campaign, changed, proposed)
 
     assert review.allowed
-    assert [c.path for c in review.allowed_changes] == ["ferebus.scaling"]
+    assert [c.path for c in review.allowed_changes] == ["ferebus.feature_scaling"]
     assert not review.blocked_changes
     assert state.phase is CampaignPhase.HALTED
+
+
+def test_physical_prior_contract_is_locked_after_first_ferebus_model(tmp_path):
+    campaign = _campaign(tmp_path)
+    _commit_reference_data_version(campaign, 0)
+    original = CampaignConfig()
+    write_config_lock(campaign, original)
+    from ichor.hpc.active_learning.daemon.dry_run_executor import (
+        DryRunPhaseExecutor,
+    )
+
+    DryRunPhaseExecutor(campaign, original)._commit_dry_model_snapshot(0)
+    changed = CampaignConfig()
+    changed.ferebus.prior_mean_iqa_deviation_factor = 0.99
+
+    proposed = fresh_campaign_state()
+    proposed.phase = CampaignPhase.SEED_SELECT
+    proposed.models_version = 0
+    review = review_config_changes(campaign, changed, proposed)
+
+    assert not review.allowed
+    assert [c.path for c in review.blocked_changes] == [
+        "ferebus.prior_mean_iqa_deviation_factor"
+    ]
+    assert review.blocked_changes[0].category == "postprocess_locked"
+    assert "FEREBUS" in review.blocked_changes[0].reason
 
 
 def test_reconcile_refuses_nonempty_campaign_without_trusted_campaign_identity(
@@ -437,7 +463,7 @@ def test_schema_v3_config_lock_is_rejected_without_compatibility_migration(tmp_p
     review = review_config_changes(campaign, current, fresh_campaign_state())
     assert not review.allowed
     assert [change.path for change in review.blocked_changes] == ["config_lock"]
-    assert "requires schema_version 11" in review.blocked_changes[0].reason
+    assert "requires schema_version 12" in review.blocked_changes[0].reason
 
 
 def test_retry_phase_requires_retryable_journal_event():
@@ -965,7 +991,7 @@ def test_gaussian_method_change_allowed_before_first_gaussian(tmp_path):
     original = CampaignConfig()
     write_config_lock(campaign, original)
     changed = CampaignConfig()
-    changed.gaussian.method = "PBE0"
+    changed.gaussian.method = "b3lyp"
 
     proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.PHASE_A_POLUS
@@ -1133,7 +1159,7 @@ def test_reconcile_apply_promotes_state_and_cleans_ferebus_staging(tmp_path, cap
         )
     )
     lock = json.loads(config_lock_path(campaign).read_text(encoding="utf-8"))
-    assert lock["canonical_config"]["ferebus"]["scaling"] is True
+    assert lock["canonical_config"]["ferebus"]["feature_scaling"] is True
 
 
 def test_completed_ferebus_staging_is_archived_when_committed_models_match(
@@ -1513,7 +1539,7 @@ def test_reconcile_apply_archives_data_staging_for_ferebus_reentry(tmp_path, cap
     _write_halted_pre_ferebus_state(campaign)
     write_config_lock(campaign, CampaignConfig())
     changed = CampaignConfig()
-    changed.ferebus.scaling = False
+    changed.ferebus.feature_scaling = False
     _write_config(campaign, changed)
     data_staging = campaign / ".DATA" / "STAGING"
     stale_file = data_staging / "INITIAL_AIMALL" / "old.txt"
@@ -2483,7 +2509,7 @@ def test_start_refuses_config_drift_without_reconcile_apply(tmp_path, capsys):
     original = CampaignConfig()
     write_config_lock(campaign, original)
     changed = CampaignConfig()
-    changed.ferebus.scaling = False
+    changed.ferebus.feature_scaling = False
     _write_config(campaign, changed)
 
     rc = cmd_start(

@@ -27,7 +27,7 @@ import shlex
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 
 __all__ = [
@@ -69,7 +69,7 @@ _DEFAULT_MODEL_KWARGS: Dict[str, Any] = {
     "maxWN": 1.0e-3,
     "nilTest": 0,
     "cmeanRangeFactor": 5.0,
-    "meanType": 15,
+    "meanType": 21,
     "is_constant_noise": True,
     "regNoise": 1.0e-4,
     "max_reg_weight": 10.0,
@@ -85,9 +85,11 @@ _DEFAULT_MODEL_KWARGS: Dict[str, Any] = {
     "full_seeding": True,
     "nsources": 4,
     "seedRNG": False,
-    "level_of_theory": "b3lyp/6-31+g(d,p)",
+    "level_of_theory": "b3lyp/aug-cc-pvtz",
     "iqa_deviation_factor": 1.0,
     "scaling": True,
+    "scale_feats": True,
+    "scale_prop": False,
     "full_ARD": True,
 }
 
@@ -106,6 +108,7 @@ class FerebusSubmission:
     sbatch_stdout: str = ""
     sbatch_stderr: str = ""
     pyferebus_kwargs: Mapping[str, Any] = field(default_factory=dict)
+    generated_configs: Tuple[Mapping[str, Any], ...] = ()
 
 
 _REQUIRED_COMMAND_FLAGS = ("-c", "-I", "-O", "-P", "-A", "-ALF")
@@ -397,7 +400,11 @@ def _resolve_model_kwargs(
     nagents: int,
     maxiter: int,
     full_ARD: bool,
-    scaling: bool,
+    prior_mean_type: int,
+    prior_mean_level_of_theory: str,
+    prior_mean_iqa_deviation_factor: float,
+    feature_scaling: bool,
+    property_scaling: bool,
     overwrite_workdir: bool,
     move_dataset_files: bool,
     extra: Optional[Mapping[str, Any]],
@@ -412,7 +419,12 @@ def _resolve_model_kwargs(
     merged["nagents"] = int(nagents)
     merged["maxiter"] = int(maxiter)
     merged["full_ARD"] = bool(full_ARD)
-    merged["scaling"] = bool(scaling)
+    merged["meanType"] = int(prior_mean_type)
+    merged["level_of_theory"] = str(prior_mean_level_of_theory)
+    merged["iqa_deviation_factor"] = float(prior_mean_iqa_deviation_factor)
+    merged["scaling"] = bool(feature_scaling or property_scaling)
+    merged["scale_feats"] = bool(feature_scaling)
+    merged["scale_prop"] = bool(property_scaling)
     merged["overwriteWD"] = bool(overwrite_workdir)
     merged["moveDatasetFiles"] = bool(move_dataset_files)
     if extra:
@@ -422,6 +434,8 @@ def _resolve_model_kwargs(
         reserved = {
             "submitToComputeNode", "platform", "workingDirectory", "jdFile",
             "overwriteWD", "moveDatasetFiles", "pathToExecutable",
+            "meanType", "level_of_theory", "iqa_deviation_factor",
+            "scaling", "scale_feats", "scale_prop",
         }
         clash = set(extra) & reserved
         if clash:
@@ -436,6 +450,140 @@ def _resolve_model_kwargs(
             )
         merged.update(extra)
     return merged
+
+
+_PRIOR_CONFIG_FIELDS = {
+    "mean_type": ("mean_type", None),
+    "level_of_theory": ("level_of_theory", None),
+    "iqadeviationfactor": ("iqaDeviationFactor", None),
+    "scaling": ("scaling", None),
+    "scale_feats": ("scale_feats", None),
+    "scale_prop": ("scale_prop", None),
+}
+
+
+def _patch_one_generated_config(script_path: Path, contract: Any) -> Dict[str, Any]:
+    """Patch one pyferebus config and prove its physical-prior contract."""
+    from ..daemon.state import atomic_write_text
+    from ..ferebus_prior import validate_ferebus_config_contract
+    from ..versioning.manifest import sha256_file
+
+    path = Path(script_path)
+    if path.is_symlink() or not path.is_file():
+        raise FerebusSubmissionError(
+            "pyferebus did not produce a regular ferebus.config: " + str(path)
+        )
+    replacements = {
+        "mean_type": str(int(contract.mean_type)),
+        "level_of_theory": '"' + str(contract.level_of_theory) + '"',
+        "iqadeviationfactor": repr(float(contract.iqa_deviation_factor)),
+        "scaling": "1" if (contract.feature_scaling or contract.property_scaling) else "0",
+        "scale_feats": "1" if contract.feature_scaling else "0",
+        "scale_prop": "1" if contract.property_scaling else "0",
+    }
+    lines = path.read_text(encoding="utf-8").splitlines()
+    seen = set()
+    patched_lines: List[str] = []
+    for raw in lines:
+        match = re.match(r"^(\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*=).*$", raw)
+        if match is None:
+            patched_lines.append(raw)
+            continue
+        folded = match.group(2).casefold()
+        if folded not in replacements:
+            patched_lines.append(raw)
+            continue
+        if folded in seen:
+            raise FerebusSubmissionError(
+                "pyferebus config contains duplicate managed field "
+                + repr(match.group(2))
+                + ": "
+                + str(path)
+            )
+        seen.add(folded)
+        canonical_name = _PRIOR_CONFIG_FIELDS[folded][0]
+        patched_lines.append(
+            match.group(1) + canonical_name + " = " + replacements[folded]
+        )
+    for folded, (canonical_name, _unused) in _PRIOR_CONFIG_FIELDS.items():
+        if folded not in seen:
+            patched_lines.append(canonical_name + " = " + replacements[folded])
+    atomic_write_text(
+        path,
+        "\n".join(patched_lines) + "\n",
+    )
+    try:
+        parsed = validate_ferebus_config_contract(path, contract)
+    except Exception as exc:
+        raise FerebusSubmissionError(
+            "generated FEREBUS config violates the physical-prior contract: "
+            + str(path)
+            + ": "
+            + str(exc)
+        ) from exc
+    return {
+        "path": str(path.resolve()),
+        "size": int(path.stat().st_size),
+        "sha256": sha256_file(path),
+        "parsed_contract": parsed,
+        "prior_mean_contract_sha256": contract.contract_sha256,
+    }
+
+
+def _patch_generated_configs(working_dir: Path, contract: Any) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for folder in _read_required_nonempty_lines(working_dir / "list.txt", "list.txt"):
+        raw = Path(folder)
+        task_dir = raw if raw.is_absolute() else working_dir / raw
+        records.append(_patch_one_generated_config(task_dir / "ferebus.config", contract))
+    return records
+
+
+def _bind_generated_configs_to_task_manifest(
+    working_dir: Path,
+    records: Sequence[Mapping[str, Any]],
+) -> None:
+    """Bind generated config bytes into FEREBUS_TASKS before scheduler submission."""
+    import json
+
+    from ..daemon.state import atomic_write_json
+
+    manifest_path = working_dir / "FEREBUS_TASKS.json"
+    if not manifest_path.is_file():
+        return
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise FerebusSubmissionError(
+            "cannot bind generated configs to FEREBUS_TASKS.json"
+        ) from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("tasks"), list):
+        raise FerebusSubmissionError("FEREBUS_TASKS.json is invalid during config binding")
+    by_relative: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        path = Path(str(record["path"]))
+        try:
+            relative = path.resolve().relative_to(working_dir.resolve()).as_posix()
+        except ValueError as exc:
+            raise FerebusSubmissionError(
+                "generated FEREBUS config escapes its working directory"
+            ) from exc
+        bound = dict(record)
+        bound["path"] = relative
+        by_relative[relative] = bound
+    for task in payload["tasks"]:
+        if not isinstance(task, dict):
+            raise FerebusSubmissionError("FEREBUS_TASKS.json contains an invalid task")
+        relative = str(task.get("config_path") or "")
+        record = by_relative.get(relative)
+        if record is None:
+            raise FerebusSubmissionError(
+                "generated FEREBUS config does not match task " + repr(relative)
+            )
+        task["generated_config"] = record
+    if len(by_relative) != len(payload["tasks"]):
+        raise FerebusSubmissionError("generated FEREBUS config/task coverage mismatch")
+    atomic_write_json(manifest_path, payload)
 
 
 def submit_ferebus(
@@ -456,7 +604,11 @@ def submit_ferebus(
     nagents: int = 20,
     maxiter: int = 200,
     full_ARD: bool = True,
-    scaling: bool = True,
+    prior_mean_type: int = 21,
+    prior_mean_level_of_theory: str = "b3lyp/aug-cc-pvtz",
+    prior_mean_iqa_deviation_factor: float = 1.0,
+    feature_scaling: bool = True,
+    property_scaling: bool = False,
     overwrite_workdir: bool = False,
     move_dataset_files: bool = True,
     path_to_executable: Optional[Union[str, Path]] = None,
@@ -501,6 +653,26 @@ def submit_ferebus(
     if submit_runner is None:
         submit_runner = subprocess.run
 
+    from ..ferebus_prior import FerebusPriorContract, contract_from_payload
+
+    prior_contract = FerebusPriorContract(
+        mean_type=int(prior_mean_type),
+        level_of_theory=str(prior_mean_level_of_theory),
+        iqa_deviation_factor=float(prior_mean_iqa_deviation_factor),
+        feature_scaling=bool(feature_scaling),
+        property_scaling=bool(property_scaling),
+    )
+    try:
+        prior_contract = contract_from_payload(prior_contract.to_dict())
+    except Exception as exc:
+        raise FerebusSubmissionError(
+            "invalid active-learning FEREBUS physical-prior contract: " + str(exc)
+        ) from exc
+    if prior_contract.mean_type != 21 or prior_contract.property_scaling:
+        raise FerebusSubmissionError(
+            "active-learning FEREBUS requires mean type 21 with property scaling disabled"
+        )
+
     model_kwargs = _resolve_model_kwargs(
         transfer_learning=transfer_learning,
         walltime_hours=walltime_hours,
@@ -511,7 +683,11 @@ def submit_ferebus(
         nagents=nagents,
         maxiter=maxiter,
         full_ARD=full_ARD,
-        scaling=scaling,
+        prior_mean_type=prior_contract.mean_type,
+        prior_mean_level_of_theory=prior_contract.level_of_theory,
+        prior_mean_iqa_deviation_factor=prior_contract.iqa_deviation_factor,
+        feature_scaling=prior_contract.feature_scaling,
+        property_scaling=prior_contract.property_scaling,
         overwrite_workdir=overwrite_workdir,
         move_dataset_files=move_dataset_files,
         extra=extra,
@@ -539,6 +715,8 @@ def submit_ferebus(
         working_dir,
         expected_tasks=expected_tasks,
     )
+    generated_configs = _patch_generated_configs(working_dir, prior_contract)
+    _bind_generated_configs_to_task_manifest(working_dir, generated_configs)
     _harden_generated_script(
         script,
         walltime_hours=walltime_hours,
@@ -577,4 +755,5 @@ def submit_ferebus(
         sbatch_stdout=stdout,
         sbatch_stderr=stderr,
         pyferebus_kwargs=dict(model_kwargs),
+        generated_configs=tuple(generated_configs),
     )

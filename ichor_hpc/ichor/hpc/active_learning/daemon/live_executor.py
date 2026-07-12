@@ -1453,6 +1453,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 raise BackendSubmissionError("nothing to submit for " + phase_name + ": staged 0 tasks")
             f = self.config.ferebus
             ferebus_manifest = _stg.read_ferebus_manifest(staging)
+            from ..ferebus_prior import contract_from_payload
+
+            prior_contract = contract_from_payload(
+                ferebus_manifest.get("prior_mean_contract")
+            )
             if is_initial and isinstance(
                 ferebus_manifest.get("model_bootstrap"), dict
             ):
@@ -1542,7 +1547,13 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 nagents=int(f.nagents),
                 maxiter=int(f.maxiter),
                 full_ARD=bool(getattr(f, "full_ARD", True)),
-                scaling=bool(getattr(f, "scaling", True)),
+                prior_mean_type=int(prior_contract.mean_type),
+                prior_mean_level_of_theory=str(prior_contract.level_of_theory),
+                prior_mean_iqa_deviation_factor=float(
+                    prior_contract.iqa_deviation_factor
+                ),
+                feature_scaling=bool(prior_contract.feature_scaling),
+                property_scaling=bool(prior_contract.property_scaling),
                 overwrite_workdir=False,
                 move_dataset_files=True,
                 path_to_executable=path_to_executable,
@@ -3043,6 +3054,37 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 ),
             )
         try:
+            from ..ferebus_prior import contract_from_payload
+            from ..versioning.trained_models import TrainedModelVersioning
+            from .input_staging import read_ferebus_manifest
+
+            model_root = TrainedModelVersioning(
+                _Path(self.campaign_dir) / self.models_dir_name
+            ).iteration_path(int(state.models_version))
+            prior_contract_hash = contract_from_payload(
+                read_ferebus_manifest(
+                    model_root,
+                    verify_dataset_files=False,
+                ).get("prior_mean_contract")
+            ).contract_sha256
+        except Exception as exc:
+            if not bool(self.backend_check):
+                from ..ferebus_prior import resolve_ferebus_prior_contract
+
+                prior_contract_hash = resolve_ferebus_prior_contract(
+                    self.config
+                ).contract_sha256
+            else:
+                return PhaseResult(
+                    is_complete=True,
+                    failure_reason=(
+                        "ferebus_prior_contract_unavailable_for_ariadne_postprocess: "
+                        + type(exc).__name__
+                        + ": "
+                        + str(exc)
+                    ),
+                )
+        try:
             picked = load_seeds_picked(iter_dir, expected_iteration=int(state.iteration))
             task_map = read_ariadne_task_map(
                 iter_dir,
@@ -3668,6 +3710,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             if isinstance(selection_diagnostics, dict):
                 diag_payload = dict(selection_diagnostics)
                 diag_payload["model_version"] = int(getattr(state, "models_version", -1))
+                diag_payload["prior_mean_contract_sha256"] = prior_contract_hash
                 diag_payload["seed_id"] = seed_id
                 diag_payload["seed_uid"] = seed_uid
                 diag_payload["array_task_id"] = array_task_id

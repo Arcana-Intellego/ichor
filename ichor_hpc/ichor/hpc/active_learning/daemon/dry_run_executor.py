@@ -204,6 +204,7 @@ class DryRunPhaseExecutor:
         prop: str,
         alf_1_indexed: Sequence[int],
         ntrain: int,
+        prior_mean_ha: float,
         feature_rows: Optional[Sequence[Sequence[float]]] = None,
         target_rows: Optional[Sequence[float]] = None,
     ) -> None:
@@ -256,7 +257,8 @@ class DryRunPhaseExecutor:
             "number_of_training_points " + str(int(ntrain)),
             "",
             "[mean]",
-            "type zero",
+            "type constant",
+            "value " + repr(float(prior_mean_ha)),
             "",
             "[kernels]",
             "number_of_kernels 1",
@@ -308,8 +310,14 @@ class DryRunPhaseExecutor:
         import shutil
 
         from . import input_staging as _stg
+        from ..ferebus_prior import (
+            contract_from_payload,
+            validate_ferebus_config_contract,
+        )
+        from ..versioning.manifest import sha256_file
 
         manifest = _stg.read_ferebus_manifest(staging)
+        prior_contract = contract_from_payload(manifest.get("prior_mean_contract"))
         for task in manifest["tasks"]:
             prop = str(task["property"])
             atom = str(task["atom"])
@@ -356,10 +364,34 @@ class DryRunPhaseExecutor:
                 "config_path",
             )
             config_path.write_text(
-                "# Dry-run deterministic FEREBUS output.\n",
+                "# Dry-run deterministic FEREBUS output.\n"
+                + "mean_type = 21\n"
+                + 'level_of_theory = "'
+                + prior_contract.level_of_theory
+                + '"\n'
+                + "iqaDeviationFactor = "
+                + repr(prior_contract.iqa_deviation_factor)
+                + "\n"
+                + "scaling = "
+                + ("1" if prior_contract.feature_scaling else "0")
+                + "\n"
+                + "scale_feats = "
+                + ("1" if prior_contract.feature_scaling else "0")
+                + "\nscale_prop = 0\n",
                 encoding="utf-8",
                 newline="\n",
             )
+            parsed_contract = validate_ferebus_config_contract(
+                config_path,
+                prior_contract,
+            )
+            task["generated_config"] = {
+                "path": str(task["config_path"]),
+                "size": int(config_path.stat().st_size),
+                "sha256": sha256_file(config_path),
+                "parsed_contract": parsed_contract,
+                "prior_mean_contract_sha256": prior_contract.contract_sha256,
+            }
             model_path = _stg.resolve_ferebus_task_path(
                 staging,
                 task["expected_model_path"],
@@ -372,9 +404,11 @@ class DryRunPhaseExecutor:
                 prop=prop,
                 alf_1_indexed=task["alf_1_indexed"],
                 ntrain=len(features),
+                prior_mean_ha=prior_contract.expected_mean_ha(prop, atom),
                 feature_rows=features,
                 target_rows=targets,
             )
+        _stg._write_ferebus_manifest(staging, manifest)
         return _stg.read_ferebus_manifest(staging, verify_dataset_files=True)
 
     def _commit_dry_model_snapshot(self, version: int) -> None:
@@ -420,6 +454,15 @@ class DryRunPhaseExecutor:
             "H3": [3, 1, 2],
         }
         system = str(self.config.campaign.system_name)
+        from ..ferebus_prior import (
+            resolve_ferebus_prior_contract,
+            validate_ferebus_config_contract,
+        )
+
+        prior_contract = resolve_ferebus_prior_contract(
+            self.config,
+            atom_labels=atoms,
+        )
         ferebus_staging = self.campaign_dir / self.models_dir_name / "iteration-staging"
         if ferebus_staging.exists():
             _stg._checked_rmtree(
@@ -439,9 +482,22 @@ class DryRunPhaseExecutor:
             datasets_dir.mkdir(parents=True, exist_ok=False)
             config_path = task_dir / "ferebus.config"
             config_path.write_text(
-                "name " + system + "\nproperty " + prop + "\natom " + atom + "\n",
+                "name = \"" + system + "\"\nproperty = \"" + prop
+                + "\"\natom = \"" + atom + "\"\nmean_type = 21\n"
+                + 'level_of_theory = "' + prior_contract.level_of_theory + '"\n'
+                + "iqaDeviationFactor = "
+                + repr(prior_contract.iqa_deviation_factor)
+                + "\nscaling = "
+                + ("1" if prior_contract.feature_scaling else "0")
+                + "\nscale_feats = "
+                + ("1" if prior_contract.feature_scaling else "0")
+                + "\nscale_prop = 0\n",
                 encoding="utf-8",
                 newline="\n",
+            )
+            parsed_contract = validate_ferebus_config_contract(
+                config_path,
+                prior_contract,
             )
             model_path = task_dir / (system + "_" + prop + "_" + atom + ".model")
             self._write_dry_ferebus_model(
@@ -451,6 +507,7 @@ class DryRunPhaseExecutor:
                 prop=prop,
                 alf_1_indexed=alfs[atom],
                 ntrain=row_counts["train"],
+                prior_mean_ha=prior_contract.expected_mean_ha(prop, atom),
             )
             csv_paths = {
                 "train": datasets_dir / (system + "_" + atom + "_TRAINING_SET.csv"),
@@ -472,6 +529,7 @@ class DryRunPhaseExecutor:
                     "task_index": int(task_index),
                     "property": prop,
                     "atom": atom,
+                    "prior_mean": prior_contract.task_payload(prop, atom),
                     "alf_1_indexed": list(alfs[atom]),
                     "alf_cli": "_".join(str(value) for value in alfs[atom]),
                     "property_dir": prop,
@@ -516,6 +574,13 @@ class DryRunPhaseExecutor:
                         for split, csv_path in csv_paths.items()
                     },
                     "degenerate_property_stats": False,
+                    "generated_config": {
+                        "path": prop + "/" + atom + "/ferebus.config",
+                        "size": int(config_path.stat().st_size),
+                        "sha256": sha256_file(config_path),
+                        "parsed_contract": parsed_contract,
+                        "prior_mean_contract_sha256": prior_contract.contract_sha256,
+                    },
                 }
             )
 
@@ -538,6 +603,7 @@ class DryRunPhaseExecutor:
             "atoms": atoms,
             "n_atoms": len(atoms),
             "n_tasks": len(tasks),
+            "prior_mean_contract": prior_contract.to_dict(),
             "degenerate_property_stats": [],
             "job_details": "FEREBUS_JOB_DETAILS.txt",
             "split_ledger": {
@@ -572,6 +638,16 @@ class DryRunPhaseExecutor:
                         "expected_model_path",
                     )
                 ),
+                "prior_mean": {
+                    "contract_sha256": prior_contract.contract_sha256,
+                    "expected_mean_ha": prior_contract.expected_mean_ha(
+                        task["property"], task["atom"]
+                    ),
+                    "observed_mean_ha": prior_contract.expected_mean_ha(
+                        task["property"], task["atom"]
+                    ),
+                    "units": "ha",
+                },
                 "row_counts": dict(row_counts),
                 "condition_number": 1.0,
                 "metrics": {
@@ -597,6 +673,7 @@ class DryRunPhaseExecutor:
             "source_task_manifest_sha256": sha256_file(
                 ferebus_staging / _stg.FEREBUS_TASK_MANIFEST
             ),
+            "prior_mean_contract": prior_contract.to_dict(),
             "summary": {
                 "n_tasks": len(tasks),
                 "n_accepted": len(tasks),
@@ -1054,12 +1131,24 @@ class DryRunPhaseExecutor:
         model_set = TrainedModelVersioning(
             self.campaign_dir / self.models_dir_name
         ).resolve(model_version, verification="deep")
+        from .input_staging import read_ferebus_manifest
+        from ..ferebus_prior import contract_from_payload
+
+        prior_contract_hash = contract_from_payload(
+            read_ferebus_manifest(
+                model_set.root,
+                verify_dataset_files=False,
+            ).get("prior_mean_contract")
+        ).contract_sha256
+        for record in seed_records:
+            record["prior_mean_contract_sha256"] = prior_contract_hash
         seeds_picked_payload = {
             "schema_version": SEED_SELECTION_SCHEMA_VERSION,
             "campaign_uid": str(state.campaign_uid),
             "iteration": int(state.iteration),
             "models_version": int(model_version),
             "model_manifest_sha256": str(model_set.head_manifest_sha256),
+            "prior_mean_contract_sha256": prior_contract_hash,
             "selection_strategy": str(self.config.seed_selection.strategy),
             "n_picked": int(selection.n),
             "frame_ids": list(selection.frame_ids),
@@ -1091,6 +1180,7 @@ class DryRunPhaseExecutor:
             ),
             "score_source_reason": str(score_transform_reason),
             "trajectory_sha256": pool.sha256,
+            "prior_mean_contract_sha256": prior_contract_hash,
         }
         diagnostics_payload = {
             "iteration": int(state.iteration),
@@ -1743,8 +1833,13 @@ class DryRunPhaseExecutor:
                     },
                 })
                 if isinstance(result_payload.get("selection_diagnostics"), dict):
+                    from ..ferebus_prior import resolve_ferebus_prior_contract
+
                     result_payload["selection_diagnostics"].update({
                         "model_version": int(state.models_version),
+                        "prior_mean_contract_sha256": (
+                            resolve_ferebus_prior_contract(self.config).contract_sha256
+                        ),
                         "seed_id": seed_id,
                         "seed_uid": seed_uid,
                         "array_task_id": array_task_id,
@@ -2614,6 +2709,7 @@ class DryRunPhaseExecutor:
                     write_calibration_model,
                     write_iteration_audit,
                 )
+                from ..ferebus_prior import resolve_ferebus_prior_contract
 
                 try:
                     synthetic = synthetic_dry_records(
@@ -2622,6 +2718,9 @@ class DryRunPhaseExecutor:
                         n_points=n_points,
                         sampling_aggressiveness=int(
                             self.config.campaign.sampling_aggressiveness
+                        ),
+                        prior_mean_contract_sha256=(
+                            resolve_ferebus_prior_contract(self.config).contract_sha256
                         ),
                     )
                     all_records, added, duplicate = append_records(

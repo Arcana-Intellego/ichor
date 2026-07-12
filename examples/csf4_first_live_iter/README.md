@@ -309,7 +309,7 @@ A minimal `campaign.yaml` (also shipped at
 `examples/csf4_first_live_iter/campaign.yaml`):
 
 ```yaml
-schema_version: 11
+schema_version: 12
 
 campaign:
   system_name: CHANGE_ME_SYSTEM
@@ -372,7 +372,11 @@ ariadne:
   trqn_trust_min: 1.0e-4
 
 ferebus:
-  scaling: false
+  prior_mean_type: 21
+  prior_mean_level_of_theory: auto
+  prior_mean_iqa_deviation_factor: 1.0
+  feature_scaling: false
+  property_scaling: false
 
 runtime:
   poll_sacct_missing_max_ticks: 30

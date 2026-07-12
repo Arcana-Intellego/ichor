@@ -2,7 +2,7 @@
 # Generic first-live-iteration active-learning campaign for CSF3/CSF4.
 # Intended for a small validation run, not a long production campaign.
 
-schema_version: 11
+schema_version: 12
 
 # -------------------------------------------------------------------------
 # Required system-level identifiers
@@ -60,7 +60,11 @@ ferebus:
   nagents: 20
   maxiter: 200
   is_constant_noise: true
-  scaling: true
+  prior_mean_type: 21
+  prior_mean_level_of_theory: auto
+  prior_mean_iqa_deviation_factor: 1.0
+  feature_scaling: true
+  property_scaling: false
   full_ARD: true
   properties:
     - iqa

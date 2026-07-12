@@ -1,9 +1,10 @@
-"""Campaign configuration -- schema v11.
+"""Campaign configuration -- schema v12.
 
-Schema v11 expresses bootstrap and iterative point allocation as exact integer
-quotas, with fixed campaign-relative pool/bootstrap inputs admitted by
-``ichor-al-daemon init``. Point allocation is therefore an explicit scientific
-contract rather than a cumulative fraction inferred later by FEREBUS staging.
+Schema v12 adds the physical FEREBUS prior contract to the schema-v11 bootstrap
+and exact point-allocation model. Fixed campaign-relative pool/bootstrap inputs
+are admitted by ``ichor-al-daemon init``. Point allocation is therefore an
+explicit scientific contract rather than a cumulative fraction inferred later
+by FEREBUS staging.
 """
 from __future__ import annotations
 
@@ -538,7 +539,11 @@ class FerebusConfigBlock:
     nagents: int = 20
     maxiter: int = 200
     is_constant_noise: bool = True
-    scaling: bool = True
+    prior_mean_type: int = 21
+    prior_mean_level_of_theory: str = "auto"
+    prior_mean_iqa_deviation_factor: float = 1.0
+    feature_scaling: bool = True
+    property_scaling: bool = False
     full_ARD: bool = True
     properties: List[str] = field(default_factory=lambda: ["iqa"])
 
@@ -976,7 +981,7 @@ class AimallConfigBlock:
 
 @dataclass
 class CampaignConfig:
-    """Top-level campaign configuration (schema v11)."""
+    """Top-level campaign configuration (schema v12)."""
 
     schema_version: int = CONFIG_SCHEMA_VERSION
 
@@ -1496,6 +1501,15 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "ferebus.warmstart must be one of " + repr(sorted(VALID_WARMSTART))
             )
+        try:
+            from .ferebus_prior import (
+                FerebusPriorError,
+                resolve_ferebus_prior_contract,
+            )
+
+            resolve_ferebus_prior_contract(self)
+        except FerebusPriorError as exc:
+            raise ConfigValidationError(str(exc)) from exc
         try:
             from ichor.core.common.constants import multipole_names
             valid_ferebus_props = {"iqa", *multipole_names}

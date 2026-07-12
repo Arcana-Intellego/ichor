@@ -100,6 +100,12 @@ def evaluate_ferebus_quality(staging_dir: Path, gates: Any = None) -> Dict[str, 
 
     staging = Path(staging_dir)
     manifest = _stg.read_ferebus_manifest(staging)
+    from ..ferebus_prior import (
+        contract_from_payload,
+        validate_model_prior_mean,
+    )
+
+    prior_contract = contract_from_payload(manifest.get("prior_mean_contract"))
     tasks = list(manifest.get("tasks", []))
     records: List[Dict[str, Any]] = []
     reasons: List[str] = []
@@ -118,6 +124,12 @@ def evaluate_ferebus_quality(staging_dir: Path, gates: Any = None) -> Dict[str, 
         try:
             model = Model(model_path)
             model_sha256 = sha256_file(model_path)
+            prior_evidence = validate_model_prior_mean(
+                model,
+                contract=prior_contract,
+                property_name=prop,
+                atom=atom,
+            )
             cond = _condition_number(model)
             section_metrics: Dict[str, Dict[str, float]] = {}
             row_counts: Dict[str, int] = {}
@@ -150,6 +162,7 @@ def evaluate_ferebus_quality(staging_dir: Path, gates: Any = None) -> Dict[str, 
                     "atom": atom,
                     "model_path": _stg.ferebus_relative_path(staging, model_path),
                     "model_sha256": model_sha256,
+                    "prior_mean": prior_evidence,
                     "row_counts": row_counts,
                     "condition_number": cond,
                     "metrics": section_metrics,
@@ -207,6 +220,7 @@ def evaluate_ferebus_quality(staging_dir: Path, gates: Any = None) -> Dict[str, 
         "source_task_manifest_sha256": sha256_file(
             _stg.ferebus_manifest_path(staging)
         ),
+        "prior_mean_contract": prior_contract.to_dict(),
         "summary": summary,
         "records": records,
         "accepted": not reasons,

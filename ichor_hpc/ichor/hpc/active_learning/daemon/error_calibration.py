@@ -138,7 +138,14 @@ def _quarantine_model_file(campaign_dir: Any, reason: str) -> Optional[Path]:
 def _record_key(record: Mapping[str, Any]) -> str:
     return "|".join(
         str(record.get(k, ""))
-        for k in ("iteration", "model_version", "pointdir", "atom", "property")
+        for k in (
+            "iteration",
+            "model_version",
+            "prior_mean_contract_sha256",
+            "pointdir",
+            "atom",
+            "property",
+        )
     )
 
 
@@ -149,6 +156,7 @@ def _frame_key(record: Mapping[str, Any]) -> Tuple[Any, ...]:
         record.get("pointdir"),
         record.get("seed_id"),
         record.get("seed_uid"),
+        record.get("prior_mean_contract_sha256"),
         record.get("property", "iqa"),
     )
 
@@ -480,12 +488,21 @@ def _total_error_records(records: Sequence[Mapping[str, Any]]) -> List[Dict[str,
             truth_sum += float(truth)
         if not complete:
             continue
-        iteration, model_version, pointdir, seed_id, seed_uid, prop = key
+        (
+            iteration,
+            model_version,
+            pointdir,
+            seed_id,
+            seed_uid,
+            prior_contract_hash,
+            prop,
+        ) = key
         totals.append(
             {
                 "schema_version": ERROR_CALIBRATION_SCHEMA_VERSION,
                 "iteration": iteration,
                 "model_version": model_version,
+                "prior_mean_contract_sha256": prior_contract_hash,
                 "pointdir": pointdir,
                 "seed_id": seed_id,
                 "seed_uid": seed_uid,
@@ -539,6 +556,14 @@ def build_calibration_model(
     sampling_aggressiveness = int(
         getattr(getattr(config, "campaign", object()), "sampling_aggressiveness", 5)
     )
+    try:
+        from ..ferebus_prior import resolve_ferebus_prior_contract
+
+        prior_contract_hash = resolve_ferebus_prior_contract(config).contract_sha256
+    except Exception as exc:
+        raise ErrorCalibrationError(
+            "cannot resolve FEREBUS prior contract for calibration: " + str(exc)
+        ) from exc
 
     current_version = (
         current_model_version
@@ -563,6 +588,14 @@ def build_calibration_model(
         iteration=int(iteration),
         max_age_iterations=max_model_age_iterations,
     )
+    prior_matched = [
+        dict(record)
+        for record in candidate_records
+        if str(record.get("prior_mean_contract_sha256") or "")
+        == prior_contract_hash
+    ]
+    n_prior_contract_mismatch = len(candidate_records) - len(prior_matched)
+    candidate_records = prior_matched
     n_aggressiveness_mismatch = 0
     if aggressiveness_match_required:
         matched: List[Dict[str, Any]] = []
@@ -687,6 +720,8 @@ def build_calibration_model(
         "n_contributing_model_versions": int(len(contributing_model_versions)),
         "min_model_versions_to_apply": int(min_model_versions_to_apply),
         "sampling_aggressiveness": int(sampling_aggressiveness),
+        "prior_mean_contract_sha256": prior_contract_hash,
+        "n_prior_contract_mismatch_excluded": int(n_prior_contract_mismatch),
         "aggressiveness_match_required": bool(aggressiveness_match_required),
         "n_aggressiveness_mismatch_excluded": int(n_aggressiveness_mismatch),
         "current_model_version": (
@@ -776,6 +811,14 @@ def load_calibration_model_for_acquisition(
     )
     if str(data.get("model_version_policy")) != configured_policy:
         return None, "model_version_policy_changed"
+    try:
+        from ..ferebus_prior import resolve_ferebus_prior_contract
+
+        current_prior_hash = resolve_ferebus_prior_contract(config).contract_sha256
+    except Exception:
+        return None, "prior_mean_contract_unavailable"
+    if str(data.get("prior_mean_contract_sha256") or "") != current_prior_hash:
+        return None, "prior_mean_contract_mismatch"
     if current_model_version is None:
         try:
             from ..versioning.trained_models import TrainedModelVersioning
@@ -948,6 +991,9 @@ def _build_records_for_pointdir(
     seed_uid = str(source.get("seed_uid") or "") or None
     total_variance = _finite_float(source.get("total_energy_variance"))
     raw_total_score = _finite_float(source.get("raw_total_score"))
+    prior_contract_hash = str(source.get("prior_mean_contract_sha256") or "")
+    if len(prior_contract_hash) != 64:
+        return [], ["missing_or_invalid_prior_mean_contract_sha256"]
     atom_identity_sha = hashlib.sha256(
         json.dumps(quality_names, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -965,6 +1011,7 @@ def _build_records_for_pointdir(
             "schema_version": ERROR_CALIBRATION_SCHEMA_VERSION,
             "iteration": int(iteration),
             "model_version": int(model_version),
+            "prior_mean_contract_sha256": prior_contract_hash,
             "pointdir": pointdir.name,
             "seed_id": seed_id_value,
             "seed_uid": seed_uid,
@@ -1075,7 +1122,18 @@ def synthetic_dry_records(
     models_version: int,
     n_points: int,
     sampling_aggressiveness: int = 5,
+    prior_mean_contract_sha256: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
+    if prior_mean_contract_sha256 is None:
+        from ..ferebus_prior import FerebusPriorContract
+
+        prior_mean_contract_sha256 = FerebusPriorContract(
+            mean_type=21,
+            level_of_theory="b3lyp/aug-cc-pvtz",
+            iqa_deviation_factor=1.0,
+            feature_scaling=True,
+            property_scaling=False,
+        ).contract_sha256
     records = []
     for i in range(int(n_points)):
         predicted = -1.0 - 1.0e-4 * i
@@ -1084,6 +1142,7 @@ def synthetic_dry_records(
             "schema_version": ERROR_CALIBRATION_SCHEMA_VERSION,
             "iteration": int(iteration),
             "model_version": int(models_version),
+            "prior_mean_contract_sha256": str(prior_mean_contract_sha256),
             "pointdir": "POINT_" + str(i).zfill(4) + ".pointdir",
             "seed_id": int(i) + 1,
             "seed_uid": hashlib.sha256(

@@ -101,11 +101,25 @@ def test_aimall_validator_accepts_clean_fixture():
 
 def test_ferebus_validator_accepts_clean_fixture(tmp_path):
     import hashlib
+    from ichor.hpc.active_learning.config import CampaignConfig
+    from ichor.hpc.active_learning.ferebus_prior import (
+        resolve_ferebus_prior_contract,
+        validate_ferebus_config_contract,
+    )
+
+    prior = resolve_ferebus_prior_contract(CampaignConfig())
 
     root = tmp_path / "ferebus_staging"
     model_dir = root / "iqa" / "O1"
     (model_dir / "datasets").mkdir(parents=True)
-    (model_dir / "ferebus.config").write_text("config\n", encoding="utf-8")
+    config_path = model_dir / "ferebus.config"
+    config_path.write_text(
+        "mean_type = 21\n"
+        + 'level_of_theory = "' + prior.level_of_theory + '"\n'
+        + "iqaDeviationFactor = 1.0\nscaling = 1\n"
+        + "scale_feats = 1\nscale_prop = 0\n",
+        encoding="utf-8",
+    )
     model = model_dir / "WATER_iqa_O1.model"
     rows = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
     model.write_text(
@@ -125,7 +139,8 @@ def test_ferebus_validator_accepts_clean_fixture(tmp_path):
             "number_of_features 3",
             "",
             "[mean]",
-            "type zero",
+            "type constant",
+            "value " + repr(prior.expected_mean_ha("iqa", "O1")),
             "",
             "[kernels]",
             "number_of_kernels 1",
@@ -189,10 +204,12 @@ def test_ferebus_validator_accepts_clean_fixture(tmp_path):
             "atoms": ["O1"],
             "n_atoms": 1,
             "n_tasks": 1,
+            "prior_mean_contract": prior.to_dict(),
             "tasks": [{
                 "task_index": 1,
                 "property": "iqa",
                 "atom": "O1",
+                "prior_mean": prior.task_payload("iqa", "O1"),
                 "alf_1_indexed": [1, 2, 3],
                 "alf_cli": "1_2_3",
                 "property_dir": "iqa",
@@ -214,6 +231,15 @@ def test_ferebus_validator_accepts_clean_fixture(tmp_path):
                 "row_counts": {"train": 2, "int_val": 0, "ext_val": 0},
                 "row_ids": {"train": [0, 1], "int_val": [], "ext_val": []},
                 "datasets": dataset_records,
+                "generated_config": {
+                    "path": "iqa/O1/ferebus.config",
+                    "size": config_path.stat().st_size,
+                    "sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+                    "parsed_contract": validate_ferebus_config_contract(
+                        config_path, prior
+                    ),
+                    "prior_mean_contract_sha256": prior.contract_sha256,
+                },
             }],
         }),
         encoding="utf-8",

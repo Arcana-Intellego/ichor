@@ -35,7 +35,7 @@ from .state import CampaignPhase, CampaignState, atomic_write_json
 CONFIG_LOCK_SCHEMA_VERSION = 2
 CONFIG_LOCK_LEGACY_SCHEMA_VERSION = 1
 CONFIG_LOCK_FILENAME = "config_lock.json"
-CONFIG_LOCK_POLICY_VERSION = 2
+CONFIG_LOCK_POLICY_VERSION = 3
 CONFIG_LOCK_HISTORY_SCHEMA_VERSION = 1
 CONFIG_LOCK_HISTORY_DIRNAME = "config_lock_history"
 
@@ -523,6 +523,11 @@ PRE_AIMALL_PREFIXES = {"aimall."}
 PRE_FEREBUS_FIRST_EXACT = {
     "campaign.system_name",
     "ferebus.properties",
+    "ferebus.prior_mean_type",
+    "ferebus.prior_mean_level_of_theory",
+    "ferebus.prior_mean_iqa_deviation_factor",
+    "ferebus.feature_scaling",
+    "ferebus.property_scaling",
     "acquisition.property_name",
 }
 FUTURE_FEREBUS_EXACT = {
@@ -531,7 +536,6 @@ FUTURE_FEREBUS_EXACT = {
     "ferebus.nagents",
     "ferebus.maxiter",
     "ferebus.is_constant_noise",
-    "ferebus.scaling",
     "ferebus.full_ARD",
     "quality_gates.ferebus_min_ext_r2",
     "quality_gates.ferebus_max_ext_rmse_ha",

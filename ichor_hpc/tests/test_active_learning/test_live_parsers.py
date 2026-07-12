@@ -687,6 +687,13 @@ def _seed_models_staging(campaign_dir, properties=("iqa",)):
     import hashlib
 
     from ichor.hpc.active_learning.versioning.manifest import sha256_file
+    from ichor.hpc.active_learning.config import CampaignConfig
+    from ichor.hpc.active_learning.ferebus_prior import (
+        resolve_ferebus_prior_contract,
+        validate_ferebus_config_contract,
+    )
+
+    prior = resolve_ferebus_prior_contract(CampaignConfig())
 
     reference_view = ReferenceDataVersioning(
         campaign_dir / "QM_REFERENCE_DATA"
@@ -709,8 +716,14 @@ def _seed_models_staging(campaign_dir, properties=("iqa",)):
         datasets.mkdir(parents=True, exist_ok=True)
         config = model_dir / "ferebus.config"
         config.write_text(
-            "name WATER\nproperty " + prop + "\n", encoding="utf-8"
+            "name = \"WATER\"\nproperty = \"" + prop + "\"\n"
+            + "mean_type = 21\n"
+            + 'level_of_theory = "' + prior.level_of_theory + '"\n'
+            + "iqaDeviationFactor = 1.0\nscaling = 1\n"
+            + "scale_feats = 1\nscale_prop = 0\n",
+            encoding="utf-8",
         )
+        parsed_config = validate_ferebus_config_contract(config, prior)
         model = model_dir / ("WATER_" + prop + "_O1.model")
         _write_loadable_model(
             model,
@@ -736,6 +749,7 @@ def _seed_models_staging(campaign_dir, properties=("iqa",)):
             "task_index": task_index,
             "property": prop,
             "atom": "O1",
+            "prior_mean": prior.task_payload(prop, "O1"),
             "alf_1_indexed": [1, 2, 3],
             "alf_cli": "1_2_3",
             "property_dir": prop,
@@ -770,6 +784,13 @@ def _seed_models_staging(campaign_dir, properties=("iqa",)):
                 )
             },
             "degenerate_property_stats": False,
+            "generated_config": {
+                "path": task_dir + "/ferebus.config",
+                "size": config.stat().st_size,
+                "sha256": sha256_file(config),
+                "parsed_contract": parsed_config,
+                "prior_mean_contract_sha256": prior.contract_sha256,
+            },
         })
     task_payload = {
         "schema_version": stg.FEREBUS_TASK_SCHEMA_VERSION,
@@ -784,6 +805,7 @@ def _seed_models_staging(campaign_dir, properties=("iqa",)):
         "atoms": ["O1"],
         "n_atoms": 1,
         "n_tasks": len(tasks),
+        "prior_mean_contract": prior.to_dict(),
         "tasks": tasks,
     }
     task_path = target / stg.FEREBUS_TASK_MANIFEST
@@ -796,6 +818,16 @@ def _seed_models_staging(campaign_dir, properties=("iqa",)):
             "atom": task["atom"],
             "model_path": task["expected_model_path"],
             "model_sha256": sha256_file(model_path),
+            "prior_mean": {
+                "contract_sha256": prior.contract_sha256,
+                "expected_mean_ha": prior.expected_mean_ha(
+                    task["property"], task["atom"]
+                ),
+                "observed_mean_ha": prior.expected_mean_ha(
+                    task["property"], task["atom"]
+                ),
+                "units": "ha",
+            },
             "row_counts": dict(row_counts),
             "condition_number": 1.0,
             "metrics": {
@@ -814,6 +846,7 @@ def _seed_models_staging(campaign_dir, properties=("iqa",)):
             "reference_data_head_manifest_sha256": reference_view.head_manifest_sha256,
             "reference_data_view_sha256": reference_view.cumulative_view_sha256,
             "source_task_manifest_sha256": sha256_file(task_path),
+            "prior_mean_contract": prior.to_dict(),
             "accepted": True,
             "summary": {"n_tasks": len(tasks), "n_accepted": len(tasks), "n_rejected": 0},
             "records": quality_records,
@@ -843,6 +876,14 @@ def _write_loadable_model(
     ntrain=5,
     nfeats=3,
 ):
+    from ichor.hpc.active_learning.config import CampaignConfig
+    from ichor.hpc.active_learning.ferebus_prior import (
+        resolve_ferebus_prior_contract,
+    )
+
+    prior_mean = resolve_ferebus_prior_contract(
+        CampaignConfig()
+    ).expected_mean_ha(prop, atom)
     rows = [
         [0.1 + i * 0.1 + j * 0.01 for j in range(nfeats)]
         for i in range(ntrain)
@@ -863,7 +904,8 @@ def _write_loadable_model(
         "number_of_training_points " + str(ntrain),
         "",
         "[mean]",
-        "type zero",
+        "type constant",
+        "value " + repr(prior_mean),
         "",
         "[kernels]",
         "number_of_kernels 1",

@@ -513,7 +513,7 @@ def _validate_source_and_quality(
 ) -> None:
     source = _read_json_object(root / "FEREBUS_TASKS.json", "FEREBUS task manifest")
     quality = _read_json_object(root / "FEREBUS_QUALITY.json", "FEREBUS quality manifest")
-    if _safe_int(source.get("schema_version"), "FEREBUS task schema_version") != 3:
+    if _safe_int(source.get("schema_version"), "FEREBUS task schema_version") != 4:
         raise TrainedModelError("unsupported committed FEREBUS task schema")
     if _safe_int(quality.get("schema_version"), "FEREBUS quality schema_version") != 3:
         raise TrainedModelError("unsupported committed FEREBUS quality schema")

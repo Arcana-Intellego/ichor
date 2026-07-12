@@ -107,7 +107,7 @@ The :code:`campaign.yaml` file is a nested block layout. The full
 minimal sparse config overrides only the keys you care about; every other
 field falls back to its dataclass default::
 
-    schema_version: 11
+    schema_version: 12
 
     campaign:
       system_name: CHANGE_ME_SYSTEM
@@ -130,6 +130,13 @@ field falls back to its dataclass default::
       bulk_fraction: 0.2
       strategy: d_optimal
       d_optimal_degenerate_policy: score_backfill
+
+    ferebus:
+      prior_mean_type: 21
+      prior_mean_level_of_theory: auto
+      prior_mean_iqa_deviation_factor: 1.0
+      feature_scaling: true
+      property_scaling: false
 
     anti_overlap:
       skip_training_seeds: true
@@ -158,7 +165,14 @@ field falls back to its dataclass default::
       alpha0_streak_length: 5
       min_iterations_before_stop: 8
 
-Schema 11 is intentionally strict. Older campaign files are rejected rather
+Active-learning FEREBUS models use mean type 21. For IQA models this is the
+isolated-atom IQA energy in Hartree; auxiliary-property models retain a zero
+prior mean. ``prior_mean_level_of_theory: auto`` resolves to the configured
+Gaussian method and basis set. Property scaling must remain disabled so that
+the physical prior and IQA targets have the same units. Feature scaling is an
+independent setting.
+
+Schema 12 is intentionally strict. Older campaign files are rejected rather
 than migrated implicitly. The source pool has the fixed campaign path
 ``pool.xyz``. ``ichor-al-daemon init --source /path/to/source.xyz`` copies an
 external source to that path before SHA-pinning it in daemon-owned metadata.

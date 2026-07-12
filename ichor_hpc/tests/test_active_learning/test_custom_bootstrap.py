@@ -301,6 +301,27 @@ def test_model_bootstrap_requires_every_configured_property_and_atom(tmp_path, m
     config.campaign.custom_bootstrap = True
     config.ferebus.properties = ["iqa", "q00"]
 
+    from ichor.hpc.active_learning.ferebus_prior import (
+        resolve_ferebus_prior_contract,
+    )
+
+    prior = resolve_ferebus_prior_contract(config)
+
+    class FakeMean:
+        def __init__(self, value):
+            self._value = value
+
+        def value(self, x):
+            return np.full((len(x),), self._value)
+
+    original_init = FakeModel.__init__
+
+    def init_with_physical_prior(self, path):
+        original_init(self, path)
+        self.mean = FakeMean(prior.expected_mean_ha(self.type, self.atom))
+
+    FakeModel.__init__ = init_with_physical_prior
+
     with pytest.raises(BootstrapInputError, match="coverage mismatch") as error:
         _inspect(tmp_path, config, frames)
     assert "q00" in str(error.value)

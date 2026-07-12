@@ -51,7 +51,7 @@ POINTDIR_BASENAME_RE = re.compile(r"^POINT_\d{4}\.pointdir$")
 AIMALL_TASK_METADATA = "AIMALL_TASK.json"
 AIMALL_TASK_METADATA_SCHEMA_VERSION = 1
 FEREBUS_TASK_MANIFEST = "FEREBUS_TASKS.json"
-FEREBUS_TASK_SCHEMA_VERSION = 3
+FEREBUS_TASK_SCHEMA_VERSION = 4
 FEREBUS_JOB_DETAILS = "job-details"
 SAFE_PATH_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
@@ -439,6 +439,16 @@ def read_ferebus_manifest(
         raise ValueError("FEREBUS properties contain a case-insensitive collision")
     if len({token.casefold() for token in atom_tokens}) != len(atom_tokens):
         raise ValueError("FEREBUS atom labels contain a case-insensitive collision")
+    try:
+        from ..ferebus_prior import contract_from_payload
+
+        prior_contract = contract_from_payload(data.get("prior_mean_contract"))
+        for atom in atom_tokens:
+            prior_contract.expected_mean_ha("iqa", atom)
+    except Exception as exc:
+        raise ValueError(
+            "FEREBUS task manifest physical-prior contract is invalid: " + str(exc)
+        ) from exc
     expected_keys = [
         (prop, atom) for prop in property_tokens for atom in atom_tokens
     ]
@@ -469,6 +479,37 @@ def read_ferebus_manifest(
         observed_keys.append((prop, atom))
         if int(task.get("task_index", -1)) != expected_index:
             raise ValueError("FEREBUS task indexes are not contiguous")
+        expected_prior = prior_contract.task_payload(prop, atom)
+        if task.get("prior_mean") != expected_prior:
+            raise ValueError(
+                "FEREBUS task physical-prior contract mismatch for "
+                + prop
+                + "/"
+                + atom
+            )
+        generated_config = task.get("generated_config")
+        if generated_config is not None:
+            if not isinstance(generated_config, dict):
+                raise ValueError("FEREBUS generated_config record is invalid")
+            if str(generated_config.get("path") or "") != str(task.get("config_path") or ""):
+                raise ValueError("FEREBUS generated_config path mismatch")
+            if str(generated_config.get("prior_mean_contract_sha256") or "") != (
+                prior_contract.contract_sha256
+            ):
+                raise ValueError("FEREBUS generated_config prior hash mismatch")
+            parsed = generated_config.get("parsed_contract")
+            expected_parsed = {
+                "mean_type": int(prior_contract.mean_type),
+                "level_of_theory": prior_contract.level_of_theory,
+                "iqa_deviation_factor": float(prior_contract.iqa_deviation_factor),
+                "scaling": bool(
+                    prior_contract.feature_scaling or prior_contract.property_scaling
+                ),
+                "scale_feats": bool(prior_contract.feature_scaling),
+                "scale_prop": bool(prior_contract.property_scaling),
+            }
+            if parsed != expected_parsed:
+                raise ValueError("FEREBUS generated_config parsed contract mismatch")
         expected_task_dir = prop + "/" + atom
         expected_input_dir = expected_task_dir + "/datasets"
         expected_paths = {
@@ -2009,6 +2050,21 @@ def stage_ferebus_inputs(
                     "range": float(stats["range"]),
                 })
     n_atoms = len(atom_labels)
+    try:
+        from ..ferebus_prior import resolve_ferebus_prior_contract
+
+        prior_contract = resolve_ferebus_prior_contract(
+            config,
+            atom_labels=atom_labels,
+        )
+    except Exception as exc:
+        raise ValueError("FEREBUS physical-prior contract is invalid: " + str(exc)) from exc
+    if model_bootstrap is not None and model_bootstrap["model"].get(
+        "prior_mean_contract"
+    ) != prior_contract.to_dict():
+        raise ValueError(
+            "imported model bootstrap physical-prior contract does not match campaign"
+        )
     atoms_file = staging / "ATOMS.txt"
     atoms_file.write_text(
         chr(10).join(atom_labels) + (chr(10) if atom_labels else ""),
@@ -2057,6 +2113,7 @@ def stage_ferebus_inputs(
                     "task_index": int(task_index),
                     "property": prop,
                     "atom": atom,
+                    "prior_mean": prior_contract.task_payload(prop, atom),
                     "alf_1_indexed": [int(x) for x in alf_by_atom[atom]],
                     "alf_cli": alf_cli,
                     "property_dir": ferebus_relative_path(staging, staging / prop),
@@ -2126,6 +2183,7 @@ def stage_ferebus_inputs(
             "atoms": atom_labels,
             "n_atoms": int(n_atoms),
             "n_tasks": int(len(tasks)),
+            "prior_mean_contract": prior_contract.to_dict(),
             "degenerate_property_stats": list(degenerate_property_stats),
             "model_bootstrap": (
                 None if model_bootstrap is None else {
@@ -2170,6 +2228,12 @@ def prepare_imported_model_bootstrap(staging_dir: Path) -> Dict[str, Any]:
     """
     staging = Path(staging_dir)
     manifest = read_ferebus_manifest(staging)
+    from ..ferebus_prior import (
+        contract_from_payload,
+        validate_ferebus_config_contract,
+    )
+
+    prior_contract = contract_from_payload(manifest.get("prior_mean_contract"))
     model_binding = manifest.get("model_bootstrap")
     if not isinstance(model_binding, dict):
         raise ValueError("FEREBUS staging is not bound to an imported model set")
@@ -2235,8 +2299,33 @@ def prepare_imported_model_bootstrap(staging_dir: Path) -> Dict[str, Any]:
             "# Imported model bootstrap; no version-0 FEREBUS optimisation was run.\n"
             + "system = " + str(manifest["system"]) + "\n"
             + "property = " + prop + "\n"
-            + "atom = " + atom + "\n",
+            + "atom = " + atom + "\n"
+            + "mean_type = " + str(prior_contract.mean_type) + "\n"
+            + 'level_of_theory = "' + prior_contract.level_of_theory + '"\n'
+            + "iqaDeviationFactor = "
+            + repr(prior_contract.iqa_deviation_factor)
+            + "\n"
+            + "scaling = "
+            + ("1" if prior_contract.feature_scaling else "0")
+            + "\n"
+            + "scale_feats = "
+            + ("1" if prior_contract.feature_scaling else "0")
+            + "\n"
+            + "scale_prop = 0\n",
         )
+        parsed_contract = validate_ferebus_config_contract(
+            config_path,
+            prior_contract,
+        )
+        task["generated_config"] = {
+            "path": str(task["config_path"]),
+            "size": int(config_path.stat().st_size),
+            "sha256": sha256_file(config_path),
+            "parsed_contract": parsed_contract,
+            "prior_mean_contract_sha256": prior_contract.contract_sha256,
+        }
+
+    _write_ferebus_manifest(staging, manifest)
 
     # Re-read with full dataset verification and validate the model parser
     # contract before the caller evaluates held-out quality.

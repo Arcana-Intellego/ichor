@@ -65,6 +65,7 @@ from ichor.hpc.active_learning.config import (
     VALID_SPECTRAL_MODES,
     VALID_WARMSTART,
 )
+from ichor.hpc.active_learning.ferebus_prior import SUPPORTED_LEVELS
 
 
 EDIT_CAMPAIGN_CONFIG_MENU_DESCRIPTION = MenuDescription(
@@ -964,34 +965,7 @@ class EditCampaignConfigFunctions:
 
     @staticmethod
     def edit_ferebus():
-        f = _campaign_config.ferebus
-        chosen = user_input_restricted(
-            sorted(VALID_WARMSTART), "ferebus.warmstart: ", f.warmstart,
-        )
-        if chosen is not None:
-            f.warmstart = chosen
-        f.warmstart_streak = user_input_int(
-            "ferebus.warmstart_streak: ", f.warmstart_streak,
-        )
-        f.kernel = user_input_free_flow(
-            "ferebus.kernel (e.g. rbfc_per, rbf_per): ", f.kernel,
-        )
-        f.loss = user_input_free_flow(
-            "ferebus.loss (e.g. huber, mse, mae): ", f.loss,
-        )
-        f.nagents = user_input_int("ferebus.nagents: ", f.nagents)
-        f.maxiter = user_input_int("ferebus.maxiter: ", f.maxiter)
-        f.is_constant_noise = user_input_bool(
-            "ferebus.is_constant_noise: ", f.is_constant_noise,
-        )
-        f.scaling = user_input_bool("ferebus.scaling: ", f.scaling)
-        f.full_ARD = user_input_bool("ferebus.full_ARD: ", f.full_ARD)
-        raw_props = user_input_free_flow(
-            "ferebus.properties (comma-separated, e.g. iqa,q00): ",
-            ",".join(f.properties),
-        )
-        f.properties = [p.strip() for p in str(raw_props).split(",") if p.strip()]
-        _sync_options_from_config()
+        _unsupported_sequential_field_editor()
 
     @staticmethod
     def edit_acquisition_core():
@@ -1501,7 +1475,15 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("ferebus.nagents", "int"),
             _spec("ferebus.maxiter", "int"),
             _spec("ferebus.is_constant_noise", "bool"),
-            _spec("ferebus.scaling", "bool"),
+            _read_only_spec("ferebus.prior_mean_type"),
+            _spec(
+                "ferebus.prior_mean_level_of_theory",
+                "choice",
+                choices=["auto", *sorted(SUPPORTED_LEVELS)],
+            ),
+            _spec("ferebus.prior_mean_iqa_deviation_factor", "float"),
+            _spec("ferebus.feature_scaling", "bool"),
+            _read_only_spec("ferebus.property_scaling"),
             _spec("ferebus.full_ARD", "bool"),
             _spec("ferebus.properties", "csv_list", prompt="ferebus.properties (comma-separated, e.g. iqa,q00): "),
         ],

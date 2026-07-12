@@ -246,6 +246,11 @@ def test_model_bootstrap_stages_exact_historical_training_prefix(
     cfg.campaign.system_name = "WATER"
     cfg.campaign.custom_bootstrap = True
     cfg.ferebus.properties = ["iqa"]
+    from ichor.hpc.active_learning.ferebus_prior import (
+        resolve_ferebus_prior_contract,
+    )
+
+    prior = resolve_ferebus_prior_contract(cfg)
     cfg.point_allocation.bootstrap_training_size = 8
     cfg.point_allocation.bootstrap_internal_validation_size = 2
     cfg.point_allocation.bootstrap_external_validation_size = 2
@@ -276,6 +281,7 @@ def test_model_bootstrap_stages_exact_historical_training_prefix(
             prop="iqa",
             alf_1_indexed=[int(value) + 1 for value in alf],
             ntrain=2,
+            prior_mean_ha=prior.expected_mean_ha("iqa", atom_name),
             feature_rows=features,
             target_rows=targets,
         )

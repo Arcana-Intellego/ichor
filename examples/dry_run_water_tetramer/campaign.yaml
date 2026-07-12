@@ -3,7 +3,7 @@
 # defaults substantially (see ichor_hpc/.../presets/ for spectroscopy and
 # thermodynamics-focused starting points).
 
-schema_version: 11
+schema_version: 12
 
 campaign:
   system_name: WATER_TETRAMER
@@ -57,4 +57,5 @@ aimall:
   iasmesh: medium
 
 ferebus:
-  scaling: false
+  feature_scaling: false
+  property_scaling: false

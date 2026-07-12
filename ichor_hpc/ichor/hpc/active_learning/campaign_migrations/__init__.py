@@ -1,9 +1,9 @@
 """Campaign schema version gate.
 
-Schema 11 is an intentional clean break in the bootstrap configuration.  Pool
-and bootstrap inputs now use fixed campaign-relative names and are admitted by
-``ichor-al-daemon init`` only after inspection and operator confirmation.
-Older files are rejected rather than silently rewritten.
+Schema 12 is an intentional clean break in the FEREBUS prior contract.  Active
+learning now requires the isolated-atom IQA prior (mean type 21), unscaled
+properties, and explicit feature/property scaling fields.  Older files are
+rejected rather than silently reinterpreted with different scientific units.
 """
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import copy
 from typing import Any, Dict, Mapping
 
 
-CURRENT_SCHEMA_VERSION = 11
+CURRENT_SCHEMA_VERSION = 12
 
 
 class CampaignMigrationError(ValueError):
@@ -36,8 +36,8 @@ def migrate_campaign_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
             + str(version)
             + " is unsupported; this release requires schema_version "
             + str(CURRENT_SCHEMA_VERSION)
-            + " with campaign.custom_bootstrap and fixed campaign-relative "
-            + "pool/bootstrap inputs"
+            + " with the physical FEREBUS prior_mean_* and explicit "
+            + "feature_scaling/property_scaling fields"
         )
     return data
 

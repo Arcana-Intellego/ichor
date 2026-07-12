@@ -69,11 +69,11 @@ def test_init_fills_sparse_campaign_yaml_preserving_user_override(tmp_path):
         pytest.skip("water_tetramer.xyz fixture missing")
     shutil.copy(FIXTURE, tmp_path / "pool.xyz")
     (tmp_path / "campaign.yaml").write_text(
-        "schema_version: 11\n"
+        "schema_version: 12\n"
         "campaign:\n"
         "  system_name: MY_SYSTEM\n"
         "gaussian:\n"
-        "  basis_set: def2-SVP\n",
+        "  basis_set: def2-TZVP\n",
         encoding="utf-8",
     )
 
@@ -82,7 +82,7 @@ def test_init_fills_sparse_campaign_yaml_preserving_user_override(tmp_path):
     assert rc == 0
     cfg = CampaignConfig.from_yaml(tmp_path / "campaign.yaml")
     assert cfg.system_name == "MY_SYSTEM"
-    assert cfg.gaussian.basis_set == "def2-SVP"
+    assert cfg.gaussian.basis_set == "def2-TZVP"
     assert cfg.seed_selection.n_seeds_per_iteration == 8
     raw = (tmp_path / "campaign.yaml").read_text(encoding="utf-8")
     assert "# campaign.yaml" in raw
@@ -94,7 +94,7 @@ def test_init_refuses_infeasible_pool_before_state_creation(tmp_path, capsys):
         pytest.skip("water_tetramer.xyz fixture missing")
     shutil.copy(FIXTURE, tmp_path / "pool.xyz")
     (tmp_path / "campaign.yaml").write_text(
-        "schema_version: 11\n"
+        "schema_version: 12\n"
         "campaign:\n"
         "  max_iterations: 2\n"
         "point_allocation:\n"

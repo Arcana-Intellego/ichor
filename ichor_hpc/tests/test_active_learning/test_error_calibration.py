@@ -21,6 +21,12 @@ from ichor.hpc.active_learning.versioning.provenance import (
     enrich_with_error_calibration_input,
     write_seed_provenance,
 )
+from ichor.hpc.active_learning.ferebus_prior import (
+    resolve_ferebus_prior_contract,
+)
+
+
+PRIOR_HASH = resolve_ferebus_prior_contract(CampaignConfig()).contract_sha256
 
 
 def _record(i, *, atom_type="C", raw=None, err=None):
@@ -30,6 +36,7 @@ def _record(i, *, atom_type="C", raw=None, err=None):
         "schema_version": 1,
         "iteration": 1,
         "model_version": 0,
+        "prior_mean_contract_sha256": PRIOR_HASH,
         "pointdir": "POINT_" + str(i).zfill(4) + ".pointdir",
         "seed_id": i + 1,
         "seed_uid": format(i + 1, "064x"),
@@ -69,6 +76,7 @@ def _atom_record(
         "schema_version": 1,
         "iteration": 1,
         "model_version": int(model_version),
+        "prior_mean_contract_sha256": PRIOR_HASH,
         "pointdir": "POINT_" + str(point).zfill(4) + ".pointdir",
         "seed_id": int(point) + 1,
         "seed_uid": format(int(point) + 1, "064x"),
@@ -376,6 +384,7 @@ def test_update_from_aimall_acceptance_joins_provenance_and_quality(tmp_path):
             "schema_version": 1,
             "property": "iqa",
             "model_version": 0,
+            "prior_mean_contract_sha256": PRIOR_HASH,
             "seed_id": 3,
             "seed_uid": "c" * 64,
             "result_json": str(

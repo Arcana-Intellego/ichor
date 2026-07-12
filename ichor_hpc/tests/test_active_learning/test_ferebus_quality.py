@@ -15,6 +15,14 @@ from ichor.hpc.active_learning.daemon.ferebus_quality import (
     write_ferebus_quality_decision,
     write_ferebus_quality_manifest,
 )
+from ichor.hpc.active_learning.config import CampaignConfig
+from ichor.hpc.active_learning.ferebus_prior import (
+    resolve_ferebus_prior_contract,
+)
+
+
+PRIOR = resolve_ferebus_prior_contract(CampaignConfig())
+OXYGEN_PRIOR = PRIOR.expected_mean_ha("iqa", "O1")
 
 
 def _write_zero_model(path, *, atom="O1", ntrain=3, nfeats=3):
@@ -38,7 +46,8 @@ def _write_zero_model(path, *, atom="O1", ntrain=3, nfeats=3):
         "number_of_training_points " + str(ntrain),
         "",
         "[mean]",
-        "type zero",
+        "type constant",
+        "value " + repr(OXYGEN_PRIOR),
         "",
         "[kernels]",
         "number_of_kernels 1",
@@ -80,7 +89,9 @@ def _dataset_identity(path, rows, root):
     }
 
 
-def _seed_quality_staging(tmp_path, *, ext_targets=(0.0, 0.0)):
+def _seed_quality_staging(tmp_path, *, ext_targets=None):
+    if ext_targets is None:
+        ext_targets = (OXYGEN_PRIOR, OXYGEN_PRIOR)
     staging = tmp_path / "iteration-staging"
     task_dir = staging / "iqa" / "O1"
     datasets_dir = task_dir / "datasets"
@@ -90,8 +101,8 @@ def _seed_quality_staging(tmp_path, *, ext_targets=(0.0, 0.0)):
     train_csv = datasets_dir / "WATER_O1_TRAINING_SET.csv"
     int_csv = datasets_dir / "WATER_O1_INT_VALIDATION_SET.csv"
     ext_csv = datasets_dir / "WATER_O1_EXT_VALIDATION_SET.csv"
-    _write_dataset(train_csv, (0.0, 0.0, 0.0))
-    _write_dataset(int_csv, (0.0, 0.0))
+    _write_dataset(train_csv, (OXYGEN_PRIOR,) * 3)
+    _write_dataset(int_csv, (OXYGEN_PRIOR,) * 2)
     _write_dataset(ext_csv, ext_targets)
     (task_dir / "ferebus.config").write_text("config\n", encoding="utf-8")
     (staging / stg.FEREBUS_TASK_MANIFEST).write_text(
@@ -111,10 +122,12 @@ def _seed_quality_staging(tmp_path, *, ext_targets=(0.0, 0.0)):
             "atoms": ["O1"],
             "n_atoms": 1,
             "n_tasks": 1,
+            "prior_mean_contract": PRIOR.to_dict(),
             "tasks": [{
                 "task_index": 1,
                 "property": "iqa",
                 "atom": "O1",
+                "prior_mean": PRIOR.task_payload("iqa", "O1"),
                 "alf_1_indexed": [1, 2, 3],
                 "alf_cli": "1_2_3",
                 "property_dir": "iqa",

@@ -28,6 +28,8 @@ from ichor.core.common.units import AtomicDistance
 from ichor.core.files.xyz import Trajectory
 
 from .daemon.state import atomic_write_json, atomic_write_text
+from .campaign_migrations import CURRENT_SCHEMA_VERSION
+from .ferebus_prior import contract_from_payload
 from .sampling.descriptors import mass_weighted_rmsd
 from .versioning.manifest import sha256_file
 
@@ -76,6 +78,7 @@ class ModelBootstrap:
     properties: Tuple[str, ...]
     atoms: Tuple[str, ...]
     system: str
+    prior_mean_contract: Dict[str, Any]
 
 
 @dataclass
@@ -441,6 +444,20 @@ def _model_metadata(
     expected_properties = tuple(
         sorted({"iqa"} | {str(value) for value in config.ferebus.properties})
     )
+    try:
+        from .ferebus_prior import (
+            resolve_ferebus_prior_contract,
+            validate_model_prior_mean,
+        )
+
+        prior_contract = resolve_ferebus_prior_contract(
+            config,
+            atom_labels=expected_atoms,
+        )
+    except Exception as exc:
+        raise BootstrapInputError(
+            "cannot resolve the campaign FEREBUS physical prior: " + str(exc)
+        ) from exc
     by_key: Dict[Tuple[str, str], Tuple[Any, Path]] = {}
     system_name: Optional[str] = None
     ntrain: Optional[int] = None
@@ -459,6 +476,12 @@ def _model_metadata(
             y = np.asarray(model.y, dtype=float).reshape(-1)
             weights = np.asarray(model.weights, dtype=float).reshape(-1)
             ialf = tuple(int(value) for value in np.asarray(model.ialf, dtype=int).reshape(-1))
+            prior_evidence = validate_model_prior_mean(
+                model,
+                contract=prior_contract,
+                property_name=prop,
+                atom=atom,
+            )
         except Exception as exc:
             raise BootstrapInputError(
                 "failed to parse imported model " + str(path) + ": " + str(exc)
@@ -505,6 +528,7 @@ def _model_metadata(
             "ntrain": task_ntrain,
             "nfeatures": nfeats,
             "alf_zero_indexed": list(ialf),
+            "prior_mean": prior_evidence,
         })
     expected_keys = {
         (prop, atom) for prop in expected_properties for atom in expected_atoms
@@ -527,6 +551,7 @@ def _model_metadata(
                 atom=atom,
                 alf_zero_indexed=np.asarray(model.ialf, dtype=int).reshape(-1),
                 train_rows=int(model.ntrain),
+                prior_contract=prior_contract,
             )
         except Exception as exc:
             raise BootstrapInputError(
@@ -574,6 +599,7 @@ def _model_metadata(
         properties=expected_properties,
         atoms=expected_atoms,
         system=str(system_name or ""),
+        prior_mean_contract=prior_contract.to_dict(),
     )
 
 
@@ -911,6 +937,9 @@ def commit_bootstrap_plan(plan: BootstrapPlan) -> Dict[str, Any]:
                         atom=str(record["atom"]),
                         alf_zero_indexed=record["alf_zero_indexed"],
                         train_rows=int(record["ntrain"]),
+                        prior_contract=contract_from_payload(
+                            plan.model.prior_mean_contract
+                        ),
                     )
                 except Exception as exc:
                     raise BootstrapInputError(
@@ -929,6 +958,7 @@ def commit_bootstrap_plan(plan: BootstrapPlan) -> Dict[str, Any]:
                 "properties": list(plan.model.properties),
                 "atoms": list(plan.model.atoms),
                 "training_count": int(plan.model.training_count),
+                "prior_mean_contract": dict(plan.model.prior_mean_contract),
                 "files": copied_records,
                 "model_set_sha256": _sha256_directory_records(copied_records),
                 "reconstructed_training_xyz": model_xyz.relative_to(staging).as_posix(),
@@ -937,7 +967,7 @@ def commit_bootstrap_plan(plan: BootstrapPlan) -> Dict[str, Any]:
             atomic_write_json(staging / MODEL_BOOTSTRAP_MANIFEST, model_payload)
         payload = {
             "schema_version": CUSTOM_BOOTSTRAP_SCHEMA_VERSION,
-            "campaign_schema_version": 11,
+            "campaign_schema_version": CURRENT_SCHEMA_VERSION,
             "custom_bootstrap": bool(plan.custom_enabled),
             "pool_sha256": str(plan.pool_sha256),
             "configured_targets": dict(plan.configured_targets),
@@ -981,6 +1011,9 @@ def _plan_identity(plan: BootstrapPlan) -> str:
         "model": (
             None if plan.model is None else {
                 "training_count": plan.model.training_count,
+                "prior_mean_contract_sha256": str(
+                    plan.model.prior_mean_contract.get("contract_sha256") or ""
+                ),
                 "files": [
                     (record["property"], record["atom"], record["sha256"])
                     for record in plan.model.files

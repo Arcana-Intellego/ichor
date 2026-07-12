@@ -5793,6 +5793,9 @@ def cmd_config_check(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    from .ferebus_prior import resolve_ferebus_prior_contract
+
+    prior = resolve_ferebus_prior_contract(config)
     summary = {
         "schema_version": int(config.schema_version),
         "campaign": {
@@ -5824,9 +5827,30 @@ def cmd_config_check(args: argparse.Namespace) -> int:
             ),
             "batch_total_size": int(config.point_allocation.batch_total_size),
         },
+        "ferebus_physical_prior": {
+            "mean_type": int(prior.mean_type),
+            "configured_level_of_theory": str(
+                config.ferebus.prior_mean_level_of_theory
+            ),
+            "resolved_level_of_theory": prior.level_of_theory,
+            "iqa_deviation_factor": float(prior.iqa_deviation_factor),
+            "units": "ha",
+            "feature_scaling": bool(prior.feature_scaling),
+            "property_scaling": bool(prior.property_scaling),
+            "contract_sha256": prior.contract_sha256,
+        },
     }
     try:
         summary["pool_feasibility"] = _pool_feasibility_summary(campaign, config)
+        from .acquisition.trajectory_pool import TrajectoryPool
+
+        pool_manifest = campaign / ".DATA" / "TRAJECTORY" / "pool.manifest.json"
+        if pool_manifest.is_file():
+            pool = TrajectoryPool.load(campaign)
+            resolve_ferebus_prior_contract(
+                config,
+                atom_labels=pool.manifest.atom_types,
+            )
     except Exception as exc:
         summary["pool_feasibility"] = {
             "ok": False,
@@ -6077,6 +6101,25 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
             lines.append("  schema version: " + str(config.get("schema_version")))
         if config.get("system_name"):
             lines.append("  system: " + str(config.get("system_name")))
+        if config.get("prior_mean_level_of_theory"):
+            lines.append(
+                "  FEREBUS prior: type "
+                + str(config.get("prior_mean_type"))
+                + ", level "
+                + str(config.get("prior_mean_level_of_theory"))
+                + ", units "
+                + str(config.get("prior_mean_units"))
+            )
+            lines.append(
+                "  FEREBUS scaling: features="
+                + str(config.get("feature_scaling"))
+                + ", properties="
+                + str(config.get("property_scaling"))
+            )
+            lines.append(
+                "  FEREBUS prior contract: "
+                + str(config.get("prior_mean_contract_sha256"))
+            )
     else:
         lines.append(
             _preflight_check_line(
@@ -6198,10 +6241,19 @@ def evaluate_campaign_preflight(
         model_versions.current_version()
         if loaded_config is None:
             loaded_config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+        from .ferebus_prior import resolve_ferebus_prior_contract
+
+        prior = resolve_ferebus_prior_contract(loaded_config)
         config_summary = {
             "ok": True,
             "schema_version": int(loaded_config.schema_version),
             "system_name": str(loaded_config.campaign.system_name),
+            "prior_mean_type": int(prior.mean_type),
+            "prior_mean_level_of_theory": prior.level_of_theory,
+            "prior_mean_units": "ha",
+            "prior_mean_contract_sha256": prior.contract_sha256,
+            "feature_scaling": bool(prior.feature_scaling),
+            "property_scaling": bool(prior.property_scaling),
         }
     except Exception as exc:
         config_summary = {
@@ -6218,6 +6270,18 @@ def evaluate_campaign_preflight(
     else:
         try:
             feasibility_summary = _pool_feasibility_summary(campaign, loaded_config)
+            from .acquisition.trajectory_pool import TrajectoryPool
+            from .ferebus_prior import resolve_ferebus_prior_contract
+
+            pool_manifest = (
+                campaign / ".DATA" / "TRAJECTORY" / "pool.manifest.json"
+            )
+            if pool_manifest.is_file():
+                pool = TrajectoryPool.load(campaign)
+                resolve_ferebus_prior_contract(
+                    loaded_config,
+                    atom_labels=pool.manifest.atom_types,
+                )
         except Exception as exc:
             feasibility_summary = {
                 "ok": False,

@@ -165,6 +165,14 @@ def _live_smoke_fixtures():
 
 
 def _write_loadable_ferebus_model(path, *, atom, alf, ntrain=5, nfeats=3):
+    from ichor.hpc.active_learning.config import CampaignConfig
+    from ichor.hpc.active_learning.ferebus_prior import (
+        resolve_ferebus_prior_contract,
+    )
+
+    prior_mean = resolve_ferebus_prior_contract(
+        CampaignConfig()
+    ).expected_mean_ha("iqa", atom)
     rows = [
         [0.1 + i * 0.1 + j * 0.01 for j in range(nfeats)]
         for i in range(ntrain)
@@ -185,7 +193,8 @@ def _write_loadable_ferebus_model(path, *, atom, alf, ntrain=5, nfeats=3):
         "number_of_training_points " + str(ntrain),
         "",
         "[mean]",
-        "type zero",
+        "type constant",
+        "value " + repr(prior_mean),
         "",
         "[kernels]",
         "number_of_kernels 1",
@@ -222,6 +231,13 @@ def _seed_pyferebus_manifest_staging(campaign_dir, reference_data_version=0):
     from ichor.hpc.active_learning.versioning.reference_data import (
         ReferenceDataVersioning,
     )
+    from ichor.hpc.active_learning.config import CampaignConfig
+    from ichor.hpc.active_learning.ferebus_prior import (
+        resolve_ferebus_prior_contract,
+        validate_ferebus_config_contract,
+    )
+
+    prior = resolve_ferebus_prior_contract(CampaignConfig())
 
     reference_view = ReferenceDataVersioning(
         Path(campaign_dir) / "QM_REFERENCE_DATA"
@@ -250,7 +266,14 @@ def _seed_pyferebus_manifest_staging(campaign_dir, reference_data_version=0):
         datasets_dir = model_dir / "datasets"
         datasets_dir.mkdir(parents=True, exist_ok=True)
         config_path = model_dir / "ferebus.config"
-        config_path.write_text("name WATER\nproperties [\"iqa\"]\n", encoding="utf-8")
+        config_path.write_text(
+            "name = \"WATER\"\nproperties = [\"iqa\"]\nmean_type = 21\n"
+            + 'level_of_theory = "' + prior.level_of_theory + '"\n'
+            + "iqaDeviationFactor = 1.0\nscaling = 1\n"
+            + "scale_feats = 1\nscale_prop = 0\n",
+            encoding="utf-8",
+        )
+        parsed_config = validate_ferebus_config_contract(config_path, prior)
         model_path = model_dir / ("WATER_iqa_" + atom + ".model")
         _write_loadable_ferebus_model(
             model_path,
@@ -268,6 +291,7 @@ def _seed_pyferebus_manifest_staging(campaign_dir, reference_data_version=0):
             "task_index": idx,
             "property": "iqa",
             "atom": atom,
+            "prior_mean": prior.task_payload("iqa", atom),
             "alf_1_indexed": list(alf),
             "alf_cli": "_".join(str(value) for value in alf),
             "property_dir": "iqa",
@@ -301,6 +325,13 @@ def _seed_pyferebus_manifest_staging(campaign_dir, reference_data_version=0):
                     ("ext_val", ext_csv),
                 )
             },
+            "generated_config": {
+                "path": "iqa/" + atom + "/ferebus.config",
+                "size": config_path.stat().st_size,
+                "sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+                "parsed_contract": parsed_config,
+                "prior_mean_contract_sha256": prior.contract_sha256,
+            },
         })
     (target / stg.FEREBUS_TASK_MANIFEST).write_text(
         json.dumps({
@@ -322,6 +353,7 @@ def _seed_pyferebus_manifest_staging(campaign_dir, reference_data_version=0):
             "atoms": list(specs),
             "n_atoms": len(specs),
             "n_tasks": len(tasks),
+            "prior_mean_contract": prior.to_dict(),
             "tasks": tasks,
         }),
         encoding="utf-8",

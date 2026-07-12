@@ -2,7 +2,7 @@
 
 The summary is intentionally read-only. It gives an operator one compact view
 of the knobs that materially affect seed choice, adversarial landing, and
-Phase-B safety before a CSF4 daemon launch.
+Phase-B safety before a configured Slurm daemon launch.
 """
 from __future__ import annotations
 
@@ -301,6 +301,7 @@ def format_sampling_protocol_summary(
     calib = config.error_calibration
     resources = config.resources
     gaussian = config.gaussian
+    ferebus = config.ferebus
     aimall = config.aimall
     runtime = config.runtime
     geometry_payload = None
@@ -694,6 +695,38 @@ def format_sampling_protocol_summary(
     lines.append(_line("aimall.iasmesh", aimall.iasmesh))
     lines.append(_line("gaussian.method", gaussian.method))
     lines.append(_line("gaussian.basis_set", gaussian.basis_set))
+    lines.append(_line("ferebus.prior_mean_type", ferebus.prior_mean_type))
+    lines.append(
+        _line(
+            "ferebus.prior_mean_level_of_theory",
+            ferebus.prior_mean_level_of_theory,
+        )
+    )
+    lines.append(
+        _line(
+            "ferebus.prior_mean_iqa_deviation_factor",
+            ferebus.prior_mean_iqa_deviation_factor,
+        )
+    )
+    try:
+        from ichor.hpc.active_learning.ferebus_prior import (
+            resolve_ferebus_prior_contract,
+        )
+
+        prior = resolve_ferebus_prior_contract(config)
+        prior_summary = (
+            "resolved_level="
+            + prior.level_of_theory
+            + ", units=ha, hash="
+            + prior.contract_sha256[:12]
+            + ", feature_scaling="
+            + str(prior.feature_scaling)
+            + ", property_scaling="
+            + str(prior.property_scaling)
+        )
+    except Exception as exc:
+        prior_summary = "invalid (" + type(exc).__name__ + ": " + str(exc) + ")"
+    lines.append(_line("ferebus.physical_prior_contract", prior_summary))
     lines.append(
         _line(
             "runtime.poll_sacct_error_max_ticks",

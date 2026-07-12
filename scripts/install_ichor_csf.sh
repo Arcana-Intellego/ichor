@@ -1307,7 +1307,7 @@ final_checks() {
     local smoke_dir
     smoke_dir="$(mktemp -d)"
     cat > "${smoke_dir}/campaign.yaml" <<'EOF'
-schema_version: 11
+schema_version: 12
 campaign:
   system_name: INSTALLER_SMOKE
   max_iterations: 1
@@ -1324,6 +1324,12 @@ seed_selection:
   bulk_fraction: 0.2
   strategy: d_optimal
   d_optimal_degenerate_policy: score_backfill
+ferebus:
+  prior_mean_type: 21
+  prior_mean_level_of_theory: auto
+  prior_mean_iqa_deviation_factor: 1.0
+  feature_scaling: true
+  property_scaling: false
 EOF
     : > "${smoke_dir}/pool.xyz"
     for _ichor_i in $(seq 1 20); do

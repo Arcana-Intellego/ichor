@@ -44,6 +44,16 @@ class _StubModel:
         self.run_calls += 1
         task_dir = self.workdir / "iqa" / "O1"
         task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / "ferebus.config").write_text(
+            "mean_type = 15\n"
+            'level_of_theory = "b3lyp/6-31+g(d,p)"\n'
+            "iqaDeviationFactor = 0.975\n"
+            "scaling = 1\n"
+            "scale_feats = 1\n"
+            "scale_prop = 1\n",
+            encoding="utf-8",
+            newline="\n",
+        )
         if self.write_script:
             (self.workdir / "runFerebus.sh").write_text(
                 self.script_text,
@@ -142,7 +152,7 @@ def test_submit_ferebus_happy_path(tmp_path):
         nagents=10,
         maxiter=50,
         full_ARD=False,
-        scaling=False,
+        feature_scaling=False,
         model_class=model_class,
         submit_runner=runner,
     )
@@ -167,6 +177,15 @@ def test_submit_ferebus_happy_path(tmp_path):
     assert captured[0].kwargs["maxiter"] == 50
     assert captured[0].kwargs["full_ARD"] is False
     assert captured[0].kwargs["scaling"] is False
+    assert captured[0].kwargs["scale_feats"] is False
+    assert captured[0].kwargs["scale_prop"] is False
+    assert captured[0].kwargs["meanType"] == 21
+    assert captured[0].kwargs["level_of_theory"] == "b3lyp/aug-cc-pvtz"
+    config_text = (tmp_path / "iqa" / "O1" / "ferebus.config").read_text(
+        encoding="utf-8"
+    )
+    assert "mean_type = 21" in config_text
+    assert "scale_prop = 0" in config_text
     script = (tmp_path / "runFerebus.sh").read_text(encoding="utf-8")
     assert "#SBATCH --time=12:00:00" in script
     assert "set -eo pipefail" in script
@@ -587,6 +606,19 @@ def test_submit_ferebus_extra_rejects_managed_kwargs(tmp_path):
             jd,
             tmp_path,
             extra={"overwriteWD": True},
+            model_class=_make_model_class([]),
+            submit_runner=_StubRunner(),
+        )
+
+
+def test_submit_ferebus_extra_cannot_override_physical_prior(tmp_path):
+    jd = tmp_path / "job.json"
+    jd.write_text("{}")
+    with pytest.raises(ValueError, match="managed by the wrapper"):
+        submit_ferebus(
+            jd,
+            tmp_path,
+            extra={"meanType": 15},
             model_class=_make_model_class([]),
             submit_runner=_StubRunner(),
         )

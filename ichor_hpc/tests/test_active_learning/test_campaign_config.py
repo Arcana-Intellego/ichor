@@ -29,8 +29,8 @@ from ichor.hpc.active_learning.geometry_protocol import (
 )
 
 
-def test_schema_version_is_eleven():
-    assert CONFIG_SCHEMA_VERSION == 11
+def test_schema_version_is_twelve():
+    assert CONFIG_SCHEMA_VERSION == 12
 
 
 def test_default_campaign_config_is_valid():
@@ -62,6 +62,11 @@ def test_default_campaign_config_is_valid():
     assert c.seed_selection.d_optimal_novelty_floor == 1.0e-12
     assert c.seed_selection.d_optimal_score_power == 1.0
     assert c.seed_selection.d_optimal_degenerate_policy == "score_backfill"
+    assert c.ferebus.prior_mean_type == 21
+    assert c.ferebus.prior_mean_level_of_theory == "auto"
+    assert c.ferebus.prior_mean_iqa_deviation_factor == 1.0
+    assert c.ferebus.feature_scaling is True
+    assert c.ferebus.property_scaling is False
     assert c.campaign.sampling_aggressiveness == 5
     assert c.geometry_novelty.enabled is True
     assert c.geometry_novelty.scale_source == "local_motion"
@@ -150,10 +155,22 @@ def test_custom_bootstrap_and_point_allocation_integer_sizes_are_validated():
         CampaignConfig.from_dict(payload)
 
 
-def test_pre_v11_schema_is_rejected_without_migration():
+def test_pre_v12_schema_is_rejected_without_migration():
     payload = CampaignConfig().to_dict()
     payload["schema_version"] = 7
-    with pytest.raises(ConfigValidationError, match="requires schema_version 11"):
+    with pytest.raises(ConfigValidationError, match="requires schema_version 12"):
+        CampaignConfig.from_dict(payload)
+
+
+def test_schema_eleven_and_removed_ferebus_scaling_field_are_rejected():
+    payload = CampaignConfig().to_dict()
+    payload["schema_version"] = 11
+    with pytest.raises(ConfigValidationError, match="requires schema_version 12"):
+        CampaignConfig.from_dict(payload)
+
+    payload = CampaignConfig().to_dict()
+    payload["ferebus"]["scaling"] = True
+    with pytest.raises(ConfigValidationError, match="unknown keys"):
         CampaignConfig.from_dict(payload)
 
 
@@ -327,7 +344,7 @@ def test_schema_v3_resources_are_rejected_without_migration():
             "gaussian_link0_mem": "8GB",
         },
     }
-    with pytest.raises(ConfigValidationError, match="requires schema_version 11"):
+    with pytest.raises(ConfigValidationError, match="requires schema_version 12"):
         CampaignConfig.from_dict(payload)
 
 
@@ -613,7 +630,7 @@ def test_schema_eleven_rejects_removed_point_allocation_anchor():
         CampaignConfig.from_dict(payload)
 
 
-def test_all_shipped_campaign_templates_and_examples_parse_as_schema_eleven():
+def test_all_shipped_campaign_templates_and_examples_parse_as_schema_twelve():
     repo_root = Path(__file__).resolve().parents[3]
     paths = [
         repo_root
@@ -629,7 +646,7 @@ def test_all_shipped_campaign_templates_and_examples_parse_as_schema_eleven():
     assert paths
     for path in paths:
         config = CampaignConfig.from_yaml(path)
-        assert config.schema_version == 11, str(path)
+        assert config.schema_version == 12, str(path)
 
 
 def test_invalid_descriptor_rejected():
@@ -678,7 +695,7 @@ def test_schema_v4_geometry_payload_is_rejected_without_migration():
     }
     payload["acquisition"]["fullspace_confinement"]["rmsd_scale_ang"] = 99.0
 
-    with pytest.raises(ConfigValidationError, match="requires schema_version 11"):
+    with pytest.raises(ConfigValidationError, match="requires schema_version 12"):
         CampaignConfig.from_dict(payload)
 
 
@@ -703,7 +720,7 @@ def test_schema_v5_bootstrap_and_batch_fields_are_rejected():
         "cap": 30,
     }
 
-    with pytest.raises(ConfigValidationError, match="requires schema_version 11"):
+    with pytest.raises(ConfigValidationError, match="requires schema_version 12"):
         CampaignConfig.from_dict(payload)
 
 

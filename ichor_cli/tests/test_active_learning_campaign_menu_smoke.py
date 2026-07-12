@@ -376,7 +376,7 @@ def test_select_campaign_directory_auto_loads_campaign_yaml(tmp_path, monkeypatc
         "active_learning_campaign_submenus.edit_campaign_config_menu"
     )
     cfg = CampaignConfig()
-    cfg.gaussian.basis_set = "def2-SVP"
+    cfg.gaussian.basis_set = "def2-TZVP"
     cfg.to_yaml(tmp_path / "campaign.yaml")
 
     monkeypatch.setattr(top, "user_input_path", lambda prompt, default_path: tmp_path)
@@ -384,7 +384,7 @@ def test_select_campaign_directory_auto_loads_campaign_yaml(tmp_path, monkeypatc
 
     top.ActiveLearningCampaignFunctions.select_campaign_directory()
 
-    assert menu.get_campaign_config().gaussian.basis_set == "def2-SVP"
+    assert menu.get_campaign_config().gaussian.basis_set == "def2-TZVP"
     assert str(tmp_path / "campaign.yaml") == menu.edit_campaign_config_menu_options.loaded_from
     assert not menu.has_unsaved_config_changes()
 
@@ -405,7 +405,7 @@ def test_active_learning_menu_auto_adopts_valid_campaign_cwd(tmp_path, monkeypat
         "active_learning_campaign_submenus.edit_campaign_config_menu"
     )
     cfg = CampaignConfig()
-    cfg.gaussian.basis_set = "def2-SVP"
+    cfg.gaussian.basis_set = "def2-TZVP"
     cfg.to_yaml(tmp_path / "campaign.yaml")
     monkeypatch.setattr(campaign_context, "_explicit_selection", False)
     monkeypatch.setattr(
@@ -422,7 +422,7 @@ def test_active_learning_menu_auto_adopts_valid_campaign_cwd(tmp_path, monkeypat
     assert str(tmp_path) in rendered
     assert "(none)" not in rendered
     assert campaign_context.selected_campaign_dir() == tmp_path
-    assert menu.get_campaign_config().gaussian.basis_set == "def2-SVP"
+    assert menu.get_campaign_config().gaussian.basis_set == "def2-TZVP"
     assert str(tmp_path / "campaign.yaml") == menu.edit_campaign_config_menu_options.loaded_from
 
 
@@ -509,14 +509,14 @@ def test_switch_campaign_auto_loads_new_yaml_without_reusing_old_state(tmp_path)
     cfg1.gaussian.basis_set = "6-31+G(d,p)"
     cfg1.to_yaml(c1 / "campaign.yaml")
     cfg2 = CampaignConfig()
-    cfg2.gaussian.basis_set = "def2-SVP"
+    cfg2.gaussian.basis_set = "def2-TZVP"
     cfg2.to_yaml(c2 / "campaign.yaml")
 
     assert menu.load_config_for_campaign_dir(c1, quiet=True)
     assert menu.get_campaign_config().gaussian.basis_set == "6-31+G(d,p)"
 
     assert menu.load_config_for_campaign_dir(c2, quiet=True)
-    assert menu.get_campaign_config().gaussian.basis_set == "def2-SVP"
+    assert menu.get_campaign_config().gaussian.basis_set == "def2-TZVP"
 
 
 def test_save_validation_failure_keeps_dirty_state(tmp_path, monkeypatch):
@@ -561,7 +561,7 @@ def test_save_reload_failure_leaves_existing_campaign_yaml_untouched(tmp_path, m
         "active_learning_campaign_submenus.edit_campaign_config_menu"
     )
     original = CampaignConfig()
-    original.gaussian.basis_set = "def2-SVP"
+    original.gaussian.basis_set = "def2-TZVP"
     original.to_yaml(tmp_path / "campaign.yaml")
     original_text = (tmp_path / "campaign.yaml").read_text(encoding="utf-8")
     set_selected_campaign_dir(tmp_path)
@@ -583,7 +583,7 @@ def test_save_reload_failure_leaves_existing_campaign_yaml_untouched(tmp_path, m
 
     assert (tmp_path / "campaign.yaml").read_text(encoding="utf-8") == original_text
     loaded = real_from_yaml(tmp_path / "campaign.yaml")
-    assert loaded.gaussian.basis_set == "def2-SVP"
+    assert loaded.gaussian.basis_set == "def2-TZVP"
     assert menu.has_unsaved_config_changes()
     assert "reload failed before write" in menu.edit_campaign_config_menu_options.last_error
     assert not list(tmp_path.glob("*.verify.*.tmp"))
@@ -602,7 +602,7 @@ def test_dirty_paths_clear_when_field_is_reverted(tmp_path):
         "active_learning_campaign_submenus.edit_campaign_config_menu"
     )
     cfg = CampaignConfig()
-    cfg.gaussian.basis_set = "def2-SVP"
+    cfg.gaussian.basis_set = "def2-TZVP"
     cfg.to_yaml(tmp_path / "campaign.yaml")
     set_selected_campaign_dir(tmp_path)
     assert menu.load_config_for_campaign_dir(tmp_path, quiet=True)
@@ -610,7 +610,7 @@ def test_dirty_paths_clear_when_field_is_reverted(tmp_path):
     menu._set_config_value("gaussian.basis_set", "6-31+G(d,p)")
     assert "gaussian.basis_set" in menu.dirty_paths()
 
-    menu._set_config_value("gaussian.basis_set", "def2-SVP")
+    menu._set_config_value("gaussian.basis_set", "def2-TZVP")
 
     assert not menu.has_unsaved_config_changes()
     assert menu.dirty_paths() == []
@@ -849,7 +849,7 @@ def test_daemon_launch_refuses_saved_blocked_config_change(
     original = CampaignConfig()
     _write_started_campaign_with_lock(tmp_path, original)
     changed = CampaignConfig()
-    changed.gaussian.method = "PBE0"
+    changed.gaussian.method = "b3lyp"
     changed.to_yaml(tmp_path / "campaign.yaml")
     set_selected_campaign_dir(tmp_path)
     edit_menu.load_config_for_campaign_dir(tmp_path, quiet=True)
@@ -911,7 +911,7 @@ def test_foreground_launch_reviews_selected_config_override(
     original = CampaignConfig()
     _write_started_campaign_with_lock(tmp_path, original)
     override = CampaignConfig()
-    override.gaussian.method = "PBE0"
+    override.gaussian.method = "b3lyp"
     override_path = tmp_path / "override.yaml"
     override.to_yaml(override_path)
     set_selected_campaign_dir(tmp_path)
@@ -1039,7 +1039,7 @@ def test_foreground_launch_allows_clean_override_when_campaign_yaml_is_dirty_on_
     clean_override_path = tmp_path / "clean_override.yaml"
     original.to_yaml(clean_override_path)
     changed_campaign = CampaignConfig()
-    changed_campaign.gaussian.method = "PBE0"
+    changed_campaign.gaussian.method = "b3lyp"
     changed_campaign.to_yaml(tmp_path / "campaign.yaml")
     set_selected_campaign_dir(tmp_path)
     edit_menu.load_config_for_campaign_dir(tmp_path, quiet=True)
@@ -1080,7 +1080,7 @@ def test_background_launch_reviews_selected_config_override(
     original = CampaignConfig()
     _write_started_campaign_with_lock(tmp_path, original)
     override = CampaignConfig()
-    override.gaussian.method = "PBE0"
+    override.gaussian.method = "b3lyp"
     override_path = tmp_path / "override.yaml"
     override.to_yaml(override_path)
     set_selected_campaign_dir(tmp_path)
@@ -1532,7 +1532,13 @@ def test_campaign_config_menu_covers_every_config_leaf():
     assert len(spec_paths) == len(set(spec_paths))
     expected_editable = (
         set(leaf_paths(CampaignConfig()))
-        - {"schema_version", "ferebus.warmstart", "ferebus.warmstart_streak"}
+        - {
+            "schema_version",
+            "ferebus.warmstart",
+            "ferebus.warmstart_streak",
+            "ferebus.prior_mean_type",
+            "ferebus.property_scaling",
+        }
     )
     actual_editable = {
         spec.path
@@ -1545,6 +1551,8 @@ def test_campaign_config_menu_covers_every_config_leaf():
         "schema_version",
         "ferebus.warmstart",
         "ferebus.warmstart_streak",
+        "ferebus.prior_mean_type",
+        "ferebus.property_scaling",
     }
     assert actual_editable == expected_editable
     quality_rendered = _BLOCK_MENUS_BY_LABEL["Edit quality_gates"].this_menu_options()
@@ -2018,11 +2026,11 @@ def test_campaign_config_load_edit_save_preserves_hidden_fields(tmp_path, monkey
     original.resources.aimall.cpus_per_task = 6
     original.resources.ariadne.cpus_per_task = 4
     original.resources.gradient_parallel_backend = "serial"
-    original.gaussian.method = "PBE0"
-    original.gaussian.basis_set = "def2-SVP"
+    original.gaussian.method = "B3LYP"
+    original.gaussian.basis_set = "def2-TZVP"
     original.resources.gaussian.link0_mem = "6GB"
     original.ferebus.properties = ["iqa", "q00"]
-    original.ferebus.scaling = False
+    original.ferebus.feature_scaling = False
     original.acquisition.allow_uniform_posterior_fallback = True
     original.to_yaml(tmp_path / "campaign.yaml")
     monkeypatch.setattr(menu, "_pause", lambda: None)
@@ -2041,9 +2049,9 @@ def test_campaign_config_load_edit_save_preserves_hidden_fields(tmp_path, monkey
     assert reloaded.resources.ariadne_cpus_per_task == 4
     assert reloaded.resources.gaussian_link0_mem == "6GB"
     assert reloaded.resources.gradient_parallel_backend == "serial"
-    assert reloaded.gaussian.method == "PBE0"
+    assert reloaded.gaussian.method == "B3LYP"
     assert reloaded.ferebus.properties == ["iqa", "q00"]
-    assert reloaded.ferebus.scaling is False
+    assert reloaded.ferebus.feature_scaling is False
     assert reloaded.acquisition.allow_uniform_posterior_fallback is True
 
 

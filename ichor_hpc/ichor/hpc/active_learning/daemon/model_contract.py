@@ -281,6 +281,7 @@ def validate_imported_model_file(
     atom: str,
     alf_zero_indexed: Sequence[int],
     train_rows: int,
+    prior_contract: Any = None,
 ) -> None:
     """Apply the complete runtime model contract during bootstrap admission."""
     from ichor.core.models import Model
@@ -297,6 +298,15 @@ def validate_imported_model_file(
     try:
         model = Model(path)
         _validate_model_object(model, Path(path), task, str(system))
+        if prior_contract is not None:
+            from ..ferebus_prior import validate_model_prior_mean
+
+            validate_model_prior_mean(
+                model,
+                contract=prior_contract,
+                property_name=property_name,
+                atom=atom,
+            )
     except ModelContractError:
         raise
     except Exception as exc:
@@ -330,6 +340,19 @@ def validate_ferebus_model_contract(
         root,
         verify_dataset_files=not committed,
     )
+    from ..ferebus_prior import (
+        contract_from_payload,
+        validate_ferebus_config_contract,
+        validate_model_prior_mean,
+    )
+    from ..versioning.manifest import sha256_file
+
+    try:
+        prior_contract = contract_from_payload(manifest.get("prior_mean_contract"))
+    except Exception as exc:
+        raise ModelContractError(
+            "ferebus_prior_contract_invalid:" + type(exc).__name__ + ":" + str(exc)
+        ) from exc
     model_set = trained_model_set
     if committed:
         if expected_version is None:
@@ -381,6 +404,11 @@ def validate_ferebus_model_contract(
     )
     expected_models = set()
     model_paths: List[Tuple[FerebusTask, Path]] = []
+    raw_tasks_by_key = {
+        (str(item.get("property")), str(item.get("atom"))): item
+        for item in manifest.get("tasks", [])
+        if isinstance(item, Mapping)
+    }
     for task in tasks:
         if committed:
             committed_task = committed_tasks.get(task.key)
@@ -401,6 +429,29 @@ def validate_ferebus_model_contract(
         expected_models.add(model_path.resolve())
         if not config_path.is_file():
             raise ModelContractError("ferebus_config_missing: " + str(config_path))
+        try:
+            validate_ferebus_config_contract(config_path, prior_contract)
+        except Exception as exc:
+            raise ModelContractError(
+                "ferebus_config_prior_contract_invalid:"
+                + task.property
+                + "/"
+                + task.atom
+                + ":"
+                + str(exc)
+            ) from exc
+        generated = raw_tasks_by_key.get(task.key, {}).get("generated_config")
+        if not isinstance(generated, Mapping):
+            raise ModelContractError(
+                "ferebus_generated_config_binding_missing:"
+                + task.property
+                + "/"
+                + task.atom
+            )
+        if int(generated.get("size", -1)) != int(config_path.stat().st_size):
+            raise ModelContractError("ferebus_generated_config_size_mismatch")
+        if str(generated.get("sha256") or "") != sha256_file(config_path):
+            raise ModelContractError("ferebus_generated_config_sha_mismatch")
         if not model_path.is_file():
             raise ModelContractError("expected_model_missing: " + str(model_path))
         if model_path.stat().st_size <= 0:
@@ -415,6 +466,12 @@ def validate_ferebus_model_contract(
         try:
             model = Model(model_path)
             _validate_model_object(model, model_path, task, system)
+            validate_model_prior_mean(
+                model,
+                contract=prior_contract,
+                property_name=task.property,
+                atom=task.atom,
+            )
             parsed_models[task.key] = model
         except ModelContractError:
             raise
