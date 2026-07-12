@@ -1340,9 +1340,10 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "point_allocation.bootstrap_external_validation_size must be an integer"
             )
-        if external_size < 0:
+        if external_size <= 0:
             raise ConfigValidationError(
-                "point_allocation.bootstrap_external_validation_size must be >= 0"
+                "point_allocation.bootstrap_external_validation_size must be > 0 "
+                "because FEREBUS quality requires external-validation evidence"
             )
         if not isinstance(self.campaign.custom_bootstrap, bool):
             raise ConfigValidationError(

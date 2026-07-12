@@ -424,6 +424,13 @@ def test_phase_entry_adopts_active_intent_job_id_when_squeue_active(tmp_path):
     d.data_dir().mkdir(parents=True, exist_ok=True)
     state = fresh_campaign_state(max_iterations=1)
     state.phase = CampaignPhase.INITIAL_GAUSSIAN
+    submission_intent.write_pre_submit_intent(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        phase_name=CampaignPhase.INITIAL_GAUSSIAN.value,
+        iteration=0,
+        expected_tasks=5,
+    )
     submission_intent.mark_submitted(
         campaign,
         CampaignPhase.INITIAL_GAUSSIAN.value,

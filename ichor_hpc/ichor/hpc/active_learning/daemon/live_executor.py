@@ -1091,12 +1091,19 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             return Path(str(manifest["sample_xyz"]))
         if phase_name == "INITIAL_GAUSSIAN":
             from ..handoff_manifests import read_phase_a_sample_manifest
+            from .state import DEFAULT_STATE_FILENAME, read_state
 
             from ..layout import bootstrap_selection_dir
 
             outdir = bootstrap_selection_dir(camp)
             try:
-                manifest = read_phase_a_sample_manifest(outdir)
+                current_state = read_state(
+                    camp / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
+                )
+                manifest = read_phase_a_sample_manifest(
+                    outdir,
+                    expected_campaign_uid=str(current_state.campaign_uid),
+                )
             except Exception as exc:
                 raise BackendSubmissionError(
                     "phase_a_sample_manifest_invalid: "
@@ -1893,6 +1900,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 self.campaign_dir,
                 phase_name,
                 int(state.iteration),
+                expected_campaign_uid=str(state.campaign_uid),
             )
         except Exception:
             active_intent = None
@@ -2213,63 +2221,6 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 n_total=int(len(quality_records)),
                 n_rejected=int(sum(1 for r in quality_records if not bool(r.get("accepted")))),
             )
-            if phase_name in ("AIMALL", "REPLACEMENT_AIMALL"):
-                try:
-                    from .error_calibration import (
-                        ERROR_CALIBRATION_MODEL_FILENAME,
-                        audit_path as error_calibration_audit_path,
-                        update_from_aimall_acceptance,
-                    )
-
-                    iter_dir = self._iter_dir(state.iteration)
-                    audit = update_from_aimall_acceptance(
-                        campaign_dir=self.campaign_dir,
-                        iter_dir=iter_dir,
-                        config=self.config,
-                        iteration=int(state.iteration),
-                        models_version=int(getattr(state, "models_version", -1)),
-                        accepted_pointdirs=kept,
-                        quality_records=quality_records,
-                    )
-                    self.artefact_log.append(
-                        str(error_calibration_audit_path(iter_dir).resolve())
-                    )
-                    self.artefact_log.append(
-                        str(
-                            (
-                                Path(self.campaign_dir)
-                                / ".DATA" / "ACTIVE_LEARNING"
-                                / ERROR_CALIBRATION_MODEL_FILENAME
-                            ).resolve()
-                        )
-                    )
-                    self._journal_event(
-                        "error_calibration_summary",
-                        phase=phase_name,
-                        iteration=int(state.iteration),
-                        n_added_records=int(audit.get("n_added_records", 0)),
-                        n_total_records=int(audit.get("n_total_records", 0)),
-                        usable_for_acquisition=bool(
-                            audit.get("usable_for_acquisition", False)
-                        ),
-                    )
-                except Exception as exc:
-                    try:
-                        from .error_calibration import mark_calibration_model_stale
-
-                        mark_calibration_model_stale(
-                            self.campaign_dir,
-                            reason=type(exc).__name__ + ": " + str(exc)[:240],
-                            iteration=int(state.iteration),
-                        )
-                    except Exception:
-                        pass
-                    self._journal_event(
-                        "error_calibration_failed",
-                        phase=phase_name,
-                        iteration=int(state.iteration),
-                        reason=type(exc).__name__ + ": " + str(exc)[:240],
-                    )
         else:
             try:
                 allowed_names = _stg._points_file_names(staging_root)
@@ -2334,6 +2285,84 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 iteration=int(state.iteration),
                 summary=dict(allocation_payload.get("summary") or {}),
             )
+            if phase_name in ("AIMALL", "REPLACEMENT_AIMALL"):
+                joined_names = {
+                    Path(str(attempt.get("pointdir") or "")).name
+                    for slot in list(allocation_payload.get("slots") or [])
+                    if isinstance(slot, dict)
+                    for attempt in list(slot.get("attempts") or [])
+                    if isinstance(attempt, dict)
+                    and str(attempt.get("status") or "") == "accepted"
+                }
+                calibration_pointdirs = [
+                    pdir
+                    for pdir in kept
+                    if Path(getattr(pdir, "path", pdir)).name in joined_names
+                ]
+                if len(calibration_pointdirs) != len(kept):
+                    return PhaseResult(
+                        is_complete=True,
+                        failure_reason=(
+                            "error_calibration_allocation_join_mismatch: accepted AIMAll "
+                            "pointdirs are not exactly represented by the allocation update"
+                        ),
+                    )
+                try:
+                    from .error_calibration import (
+                        ERROR_CALIBRATION_MODEL_FILENAME,
+                        audit_path as error_calibration_audit_path,
+                        update_from_aimall_acceptance,
+                    )
+
+                    iter_dir = self._iter_dir(state.iteration)
+                    audit = update_from_aimall_acceptance(
+                        campaign_dir=self.campaign_dir,
+                        iter_dir=iter_dir,
+                        config=self.config,
+                        iteration=int(state.iteration),
+                        models_version=int(getattr(state, "models_version", -1)),
+                        accepted_pointdirs=calibration_pointdirs,
+                        quality_records=quality_records,
+                    )
+                    self.artefact_log.append(
+                        str(error_calibration_audit_path(iter_dir).resolve())
+                    )
+                    self.artefact_log.append(
+                        str(
+                            (
+                                Path(self.campaign_dir)
+                                / ".DATA" / "ACTIVE_LEARNING"
+                                / ERROR_CALIBRATION_MODEL_FILENAME
+                            ).resolve()
+                        )
+                    )
+                    self._journal_event(
+                        "error_calibration_summary",
+                        phase=phase_name,
+                        iteration=int(state.iteration),
+                        n_added_records=int(audit.get("n_added_records", 0)),
+                        n_total_records=int(audit.get("n_total_records", 0)),
+                        usable_for_acquisition=bool(
+                            audit.get("usable_for_acquisition", False)
+                        ),
+                    )
+                except Exception as exc:
+                    try:
+                        from .error_calibration import mark_calibration_model_stale
+
+                        mark_calibration_model_stale(
+                            self.campaign_dir,
+                            reason=type(exc).__name__ + ": " + str(exc)[:240],
+                            iteration=int(state.iteration),
+                        )
+                    except Exception:
+                        pass
+                    self._journal_event(
+                        "error_calibration_failed",
+                        phase=phase_name,
+                        iteration=int(state.iteration),
+                        reason=type(exc).__name__ + ": " + str(exc)[:240],
+                    )
 
         for pdir_name, reason in rejected:
             self._journal_event(
@@ -3908,7 +3937,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 )
             from ..handoff_manifests import read_phase_a_sample_manifest
             try:
-                phase_a_manifest = read_phase_a_sample_manifest(outdir)
+                phase_a_manifest = read_phase_a_sample_manifest(
+                    outdir,
+                    expected_campaign_uid=str(state.campaign_uid),
+                )
             except Exception as exc:
                 return PhaseResult(
                     is_complete=True,
@@ -4156,6 +4188,9 @@ def _current_submission_job_name(
             campaign_dir,
             phase_name,
             int(iteration),
+            expected_campaign_uid=(
+                None if campaign_uid is None else str(campaign_uid)
+            ),
         )
     except Exception as exc:
         raise BackendSubmissionError(
@@ -4195,6 +4230,7 @@ def make_live_job_finder(
                     campaign_dir,
                     phase_name,
                     int(iteration),
+                    expected_campaign_uid=(None if uid is None else str(uid)),
                 )
             except Exception:
                 intent = None

@@ -10,6 +10,7 @@ from ichor.hpc.active_learning.daemon.ferebus_quality import (
     FEREBUS_QUALITY_DECISION_MANIFEST,
     FEREBUS_QUALITY_MANIFEST,
     evaluate_ferebus_quality,
+    evaluate_ferebus_quality_decision,
     read_ferebus_quality_decision,
     write_ferebus_quality_decision,
     write_ferebus_quality_manifest,
@@ -181,6 +182,19 @@ def test_ferebus_quality_optional_thresholds_are_enforced(tmp_path):
 
     assert payload["accepted"] is False
     assert "ferebus_ext_rmse_threshold_exceeded" in payload["reasons"]
+
+
+def test_hartree_rmse_threshold_is_not_applied_to_multipoles(tmp_path):
+    staging = _seed_quality_staging(tmp_path, ext_targets=(1.0, 1.0))
+    quality = evaluate_ferebus_quality(staging)
+    quality["records"][0]["property"] = "q00"
+
+    decision = evaluate_ferebus_quality_decision(
+        quality,
+        SimpleNamespace(ferebus_max_ext_rmse_ha=0.01),
+    )
+
+    assert decision["accepted"] is True
 
 
 def test_ferebus_manifest_rejects_dataset_hash_drift(tmp_path):

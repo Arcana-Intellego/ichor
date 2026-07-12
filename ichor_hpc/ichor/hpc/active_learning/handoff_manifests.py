@@ -1224,6 +1224,11 @@ def write_phase_a_sample_manifest(initial_dir: Any, payload: Dict[str, Any]) -> 
         kind="Phase A point-allocation manifest",
     )
     allocation_payload = read_point_allocation(allocation_path)
+    supplied_uid = str(data.get("campaign_uid") or "")
+    allocation_uid = str(allocation_payload["campaign_uid"])
+    if supplied_uid and supplied_uid != allocation_uid:
+        raise HandoffManifestError("Phase A sample manifest campaign UID mismatch")
+    data["campaign_uid"] = allocation_uid
     allocation_binding = dict(allocation_binding)
     allocation_binding["slot_assignment_sha256"] = str(
         allocation_payload["slot_assignment_sha256"]
@@ -1264,6 +1269,7 @@ def read_phase_a_sample_manifest(
     initial_dir: Any,
     *,
     require_nonempty: bool = True,
+    expected_campaign_uid: Optional[str] = None,
 ) -> Dict[str, Any]:
     path = phase_a_sample_manifest_path(initial_dir)
     if not path.is_file():
@@ -1278,6 +1284,12 @@ def read_phase_a_sample_manifest(
         raise HandoffManifestError("unsupported Phase A sample manifest schema")
     if str(data.get("phase")) != "PHASE_A_POLUS":
         raise HandoffManifestError("Phase A sample manifest phase mismatch")
+    if (
+        expected_campaign_uid is not None
+        and data.get("campaign_uid") not in (None, "")
+        and str(data.get("campaign_uid")) != str(expected_campaign_uid)
+    ):
+        raise HandoffManifestError("Phase A sample manifest campaign UID mismatch")
     if _required_int(data.get("iteration"), "Phase A iteration") != 0:
         raise HandoffManifestError("Phase A sample manifest iteration must be 0")
     n_select = _required_int(data.get("n_select"), "Phase A n_select")
@@ -1353,7 +1365,14 @@ def read_phase_a_sample_manifest(
     )
     from .point_allocation import read_point_allocation
 
-    allocation_payload = read_point_allocation(allocation_manifest)
+    allocation_payload = read_point_allocation(
+        allocation_manifest,
+        expected_campaign_uid=expected_campaign_uid,
+    )
+    if str(data.get("campaign_uid") or allocation_payload["campaign_uid"]) != str(
+        allocation_payload["campaign_uid"]
+    ):
+        raise HandoffManifestError("Phase A sample/allocation campaign UID mismatch")
     if str(allocation.get("slot_assignment_sha256") or "") != str(
         allocation_payload.get("slot_assignment_sha256") or ""
     ):
@@ -1442,6 +1461,7 @@ def read_phase_a_sample_manifest(
                 "Phase A custom-bootstrap manifest hash mismatch"
             )
     out = dict(data)
+    out["campaign_uid"] = str(allocation_payload["campaign_uid"])
     out["n_select"] = n_select
     out["sample_xyz"] = str(sample)
     out["index_path"] = str(index_path)
@@ -1461,6 +1481,7 @@ def read_phase_b_selection_manifest(
     *,
     expected_iteration: Optional[int] = None,
     require_nonempty: bool = True,
+    expected_campaign_uid: Optional[str] = None,
 ) -> Dict[str, Any]:
     path = phase_b_selection_path(iter_dir)
     if not path.is_file():
@@ -1476,6 +1497,10 @@ def read_phase_b_selection_manifest(
     iteration = _required_int(data.get("iteration"), "Phase B iteration")
     if expected_iteration is not None and iteration != int(expected_iteration):
         raise HandoffManifestError("Phase B selection manifest iteration mismatch")
+    if expected_campaign_uid is not None and str(data.get("campaign_uid") or "") != str(
+        expected_campaign_uid
+    ):
+        raise HandoffManifestError("Phase B selection manifest campaign UID mismatch")
     if str(data.get("status") or "") != "complete":
         raise HandoffManifestError(
             "Phase B selection did not complete: "
@@ -1521,7 +1546,10 @@ def read_phase_b_selection_manifest(
         raise HandoffManifestError("Phase B point-allocation targets/reserve are invalid")
     from .point_allocation import read_point_allocation
 
-    allocation_payload = read_point_allocation(allocation_manifest)
+    allocation_payload = read_point_allocation(
+        allocation_manifest,
+        expected_campaign_uid=expected_campaign_uid,
+    )
     if str(allocation.get("slot_assignment_sha256") or "") != str(
         allocation_payload.get("slot_assignment_sha256") or ""
     ):

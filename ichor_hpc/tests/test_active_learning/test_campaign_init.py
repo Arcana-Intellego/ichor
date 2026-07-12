@@ -125,7 +125,7 @@ def test_init_reports_missing_default_pool(tmp_path, capsys):
     assert rc == 2
     err = capsys.readouterr().err
     assert "Place pool.xyz in the campaign directory or pass --source" in err
-    assert (tmp_path / "campaign.yaml").is_file()
+    assert not (tmp_path / "campaign.yaml").exists()
     assert not (
         tmp_path / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
     ).is_file()

@@ -513,13 +513,14 @@ class Daemon:
             state = fresh_campaign_state(
                 max_iterations=self.config.campaign.max_iterations
             )
-            write_state(sp, state)
-            try:
-                from .config_lock import ensure_config_lock
+            from .config_lock import ensure_config_lock
 
-                ensure_config_lock(self.campaign_dir, self.config)
-            except Exception:
-                pass
+            ensure_config_lock(
+                self.campaign_dir,
+                self.config,
+                campaign_uid=str(state.campaign_uid),
+            )
+            write_state(sp, state)
             self._journal(
                 "campaign_started",
                 campaign_uid=state.campaign_uid,
@@ -644,6 +645,7 @@ class Daemon:
                 self.campaign_dir,
                 str(payload["phase"]),
                 int(payload["iteration"]),
+                expected_campaign_uid=str(state.campaign_uid),
             )
             if intent is not None and str(intent.get("status") or "") not in {
                 "COMPLETED",
@@ -769,6 +771,7 @@ class Daemon:
             try:
                 active_intent = _submission_intent.load_active_intent(
                     self.campaign_dir, phase_name, int(state.iteration),
+                    expected_campaign_uid=str(state.campaign_uid),
                 )
             except Exception as exc:
                 return self._halt(
@@ -1573,6 +1576,7 @@ class Daemon:
                 self.campaign_dir,
                 phase.value,
                 int(state.iteration),
+                expected_campaign_uid=str(state.campaign_uid),
             )
         except Exception as exc:
             self._journal(
@@ -2791,6 +2795,8 @@ class Daemon:
             paths.append(
                 quantum_acceptance_manifest_path(staging, phase_name=phase.value)
             )
+            if "AIMALL" in phase.value:
+                paths.append(staging / "quantum_quality.json")
         elif phase is CampaignPhase.APPEND:
             from ..versioning.reference_data import reference_data_version_path
             from ..versioning.reference_data import ReferenceDataVersioning
@@ -2814,6 +2820,10 @@ class Daemon:
                         TrainedModelVersioning(canonical_trained_models_dir(campaign)).iteration_path(version)
                     )
                 )
+        elif phase is CampaignPhase.STOP_CHECK:
+            from ..versioning.sampling_iterations import active_iteration_manifest_path
+
+            paths.append(active_iteration_manifest_path(campaign, iteration))
         return paths
 
     def _persist_transition_with_receipt(
@@ -2840,6 +2850,7 @@ class Daemon:
             self.campaign_dir,
             phase.value,
             int(before.iteration),
+            expected_campaign_uid=str(before.campaign_uid),
         )
         evidence_paths = self._phase_completion_evidence_paths(
             before,

@@ -15,6 +15,7 @@ from ichor.hpc.active_learning.daemon.daemon import (
     DEFAULT_DATA_SUBDIR,
 )
 from ichor.hpc.active_learning.daemon import submission_intent
+from ichor.hpc.active_learning.daemon.config_lock import write_config_lock
 from ichor.hpc.active_learning.daemon.job_names import live_job_name
 from ichor.hpc.active_learning.daemon.journal import append_event, iter_events
 from ichor.hpc.active_learning.daemon.state import (
@@ -49,6 +50,17 @@ def _campaign_with_config(tmp_path) -> Path:
         newline="\n",
     )
     return campaign
+
+
+def _write_locked_state(campaign: Path, state) -> None:
+    state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    write_state(state_path, state)
+    write_config_lock(
+        campaign,
+        CampaignConfig.from_yaml(campaign / "campaign.yaml"),
+        campaign_uid=str(state.campaign_uid),
+    )
 
 
 def _commit_training_and_model_versions(campaign: Path, versions):
@@ -436,7 +448,7 @@ def test_cli_preflight_prints_operator_dashboard_by_default(tmp_path, capsys, mo
     campaign = _campaign_with_config(tmp_path)
     state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    write_state(state_path, fresh_campaign_state(max_iterations=2))
+    _write_locked_state(campaign, fresh_campaign_state(max_iterations=2))
     monkeypatch.setattr(cli_mod, "check_backends", _backend_availability)
     monkeypatch.setattr(
         cli_mod,
@@ -469,7 +481,7 @@ def test_cli_preflight_json_prints_single_payload(tmp_path, capsys, monkeypatch)
     campaign = _campaign_with_config(tmp_path)
     state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    write_state(state_path, fresh_campaign_state(max_iterations=2))
+    _write_locked_state(campaign, fresh_campaign_state(max_iterations=2))
     monkeypatch.setattr(cli_mod, "check_backends", _backend_availability)
     monkeypatch.setattr(
         cli_mod,
@@ -494,7 +506,7 @@ def test_cli_preflight_can_submit_explicit_environment_smoke(
     campaign = _campaign_with_config(tmp_path)
     state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    write_state(state_path, fresh_campaign_state(max_iterations=2))
+    _write_locked_state(campaign, fresh_campaign_state(max_iterations=2))
     monkeypatch.setattr(cli_mod, "check_backends", _backend_availability)
     monkeypatch.setattr(
         cli_mod,
@@ -568,7 +580,7 @@ def test_cli_preflight_warns_when_pool_has_no_surplus(tmp_path, capsys, monkeypa
     campaign = _campaign_with_config(tmp_path)
     state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    write_state(state_path, fresh_campaign_state(max_iterations=2))
+    _write_locked_state(campaign, fresh_campaign_state(max_iterations=2))
     monkeypatch.setattr(cli_mod, "check_backends", _backend_availability)
     monkeypatch.setattr(
         cli_mod,
@@ -871,7 +883,8 @@ def test_cli_status_default_summarises_active_submission_intents(tmp_path, capsy
 
     assert rc == 0
     out = capsys.readouterr().out
-    assert "  submission intents: 1 (GAUSSIAN@0 SUBMITTED job_id=12345)" in out
+    assert "GAUSSIAN@0 SUBMITTED job_id=12345" in out
+    assert "expected=20" in out
     assert "a submission intent is still active" in out
 
 
@@ -1602,7 +1615,7 @@ def test_cli_resume_explicitly_clears_shutdown_flag(tmp_path):
     (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
     state = fresh_campaign_state()
     state.shutdown_requested = True
-    write_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME, state)
+    _write_locked_state(campaign, state)
     rc = main([
         "resume", "--campaign-dir", str(campaign),
         "--mock-ariadne", "--max-ticks", "0", "--foreground",
@@ -2122,6 +2135,11 @@ def test_cli_reconcile_cleanable_scripts_reports_candidate_without_manual_mv(
     state.models_version = 0
     state.campaign_uid = "cli-test"
     write_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME, state)
+    write_config_lock(
+        campaign,
+        CampaignConfig.from_yaml(campaign / "campaign.yaml"),
+        campaign_uid=state.campaign_uid,
+    )
     append_event(
         campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
         "halt",
@@ -2218,6 +2236,11 @@ def test_cli_reconcile_apply_prints_final_recomputed_phase(
     state.models_version = 0
     state.campaign_uid = "cli-test"
     write_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME, state)
+    write_config_lock(
+        campaign,
+        CampaignConfig.from_yaml(campaign / "campaign.yaml"),
+        campaign_uid=state.campaign_uid,
+    )
     append_event(
         campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
         "halt",
@@ -2447,7 +2470,7 @@ def test_cli_start_live_reaches_daemon_with_all_backends_present(
     TrajectoryPool.import_from(campaign / "pool.xyz", campaign)
     data = campaign / DEFAULT_DATA_SUBDIR
     data.mkdir(parents=True, exist_ok=True)
-    write_state(data / DEFAULT_STATE_FILENAME, fresh_campaign_state())
+    _write_locked_state(campaign, fresh_campaign_state())
     captured = {}
 
     class FakeExecutor:

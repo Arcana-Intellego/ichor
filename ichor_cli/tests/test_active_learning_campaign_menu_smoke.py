@@ -1532,7 +1532,7 @@ def test_campaign_config_menu_covers_every_config_leaf():
     assert len(spec_paths) == len(set(spec_paths))
     expected_editable = (
         set(leaf_paths(CampaignConfig()))
-        - {"schema_version"}
+        - {"schema_version", "ferebus.warmstart", "ferebus.warmstart_streak"}
     )
     actual_editable = {
         spec.path
@@ -1541,7 +1541,11 @@ def test_campaign_config_menu_covers_every_config_leaf():
     } | {"ariadne." + spec.path for spec in ARIADNE_FIELD_SPECS}
     read_only = {spec.path for spec in specs if spec.read_only}
 
-    assert read_only == {"schema_version"}
+    assert read_only == {
+        "schema_version",
+        "ferebus.warmstart",
+        "ferebus.warmstart_streak",
+    }
     assert actual_editable == expected_editable
     quality_rendered = _BLOCK_MENUS_BY_LABEL["Edit quality_gates"].this_menu_options()
     assert "quality_gates.ariadne_max_displacement_ang" in quality_rendered
@@ -1654,6 +1658,7 @@ def test_journal_matching_events_uses_visible_filters(tmp_path, monkeypatch):
     )
     import ichor.hpc.active_learning.cli as daemon_cli
 
+    (tmp_path / "campaign.yaml").write_text("{}\n", encoding="utf-8")
     set_selected_campaign_dir(tmp_path)
     menu.journal_menu_options.since = "2026-05-23T00:00:00Z"
     menu.journal_menu_options.event_types = ["sbatch", "phase_succeeded"]
@@ -1687,6 +1692,7 @@ def test_journal_list_event_types_dispatches_cli(tmp_path, monkeypatch):
     )
     import ichor.hpc.active_learning.cli as daemon_cli
 
+    (tmp_path / "campaign.yaml").write_text("{}\n", encoding="utf-8")
     set_selected_campaign_dir(tmp_path)
     calls = []
     monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: "")
@@ -2000,6 +2006,7 @@ def test_campaign_config_load_edit_save_preserves_hidden_fields(tmp_path, monkey
     )
     from ichor.hpc.active_learning.config import CampaignConfig
 
+    (tmp_path / "campaign.yaml").write_text("{}\n", encoding="utf-8")
     set_selected_campaign_dir(tmp_path)
     original = CampaignConfig()
     original.system_name = "WATER"
@@ -2074,6 +2081,7 @@ def test_preflight_menu_dispatches_campaign_aware_command(
     )
     import ichor.hpc.active_learning.cli as daemon_cli
 
+    (tmp_path / "campaign.yaml").write_text("{}\n", encoding="utf-8")
     set_selected_campaign_dir(tmp_path)
     seen = {}
 
@@ -2110,6 +2118,7 @@ def test_submitted_environment_smoke_menu_requires_confirmation(
     )
     import ichor.hpc.active_learning.cli as daemon_cli
 
+    (tmp_path / "campaign.yaml").write_text("{}\n", encoding="utf-8")
     set_selected_campaign_dir(tmp_path)
     calls = []
     responses = iter(["YES", ""])
@@ -2143,6 +2152,7 @@ def test_reconcile_paths_pass_allow_fresh_init_flag(tmp_path, monkeypatch):
     )
     import ichor.hpc.active_learning.cli as daemon_cli
 
+    (tmp_path / "campaign.yaml").write_text("{}\n", encoding="utf-8")
     set_selected_campaign_dir(tmp_path)
     calls = []
     monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: "YES")

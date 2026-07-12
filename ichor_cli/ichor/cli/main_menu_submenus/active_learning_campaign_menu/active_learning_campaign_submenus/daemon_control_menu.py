@@ -40,6 +40,9 @@ DAEMON_CONTROL_MENU_DESCRIPTION = MenuDescription(
 class DaemonControlMenuOptions(MenuOptions):
     status_json: bool = False
     status_verbose: bool = False
+    preflight_json: bool = False
+    reconcile_json: bool = False
+    reconcile_verbose: bool = False
 
 
 daemon_control_menu_options = DaemonControlMenuOptions()
@@ -52,7 +55,14 @@ def _campaign_dir_ns():
 
 def _guarded_campaign_dir_ns():
     try:
-        return _campaign_dir_ns()
+        ns = _campaign_dir_ns()
+        campaign = selected_campaign_dir()
+        if not (campaign / "campaign.yaml").is_file():
+            raise CampaignSelectionError(
+                "Selected campaign has no campaign.yaml. Save or initialise the campaign first: "
+                + str(campaign)
+            )
+        return ns
     except CampaignSelectionError as exc:
         print_campaign_selection_error(exc)
         return None
@@ -71,6 +81,24 @@ class DaemonControlFunctions:
     def toggle_status_verbose():
         daemon_control_menu_options.status_verbose = (
             not bool(daemon_control_menu_options.status_verbose)
+        )
+
+    @staticmethod
+    def toggle_preflight_json():
+        daemon_control_menu_options.preflight_json = not bool(
+            daemon_control_menu_options.preflight_json
+        )
+
+    @staticmethod
+    def toggle_reconcile_json():
+        daemon_control_menu_options.reconcile_json = not bool(
+            daemon_control_menu_options.reconcile_json
+        )
+
+    @staticmethod
+    def toggle_reconcile_verbose():
+        daemon_control_menu_options.reconcile_verbose = not bool(
+            daemon_control_menu_options.reconcile_verbose
         )
 
     @staticmethod
@@ -98,12 +126,29 @@ class DaemonControlFunctions:
         if ns is None:
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
-        ns.json = False
+        ns.json = bool(daemon_control_menu_options.preflight_json)
         ns.verbose = True
         ns.submit_environment_smoke = False
         rc = cmd_preflight(ns)
         if rc != 0:
             print("campaign preflight returned exit code " + str(rc))
+        user_input_free_flow("Press enter to return to the menu: ", "")
+
+    @staticmethod
+    def config_check():
+        from ichor.hpc.active_learning.cli import cmd_config_check
+
+        ns = _guarded_campaign_dir_ns()
+        if ns is None:
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        try:
+            rc = cmd_config_check(ns)
+        except Exception as exc:
+            print("config-check failed: " + type(exc).__name__ + ": " + str(exc))
+            rc = 2
+        if rc != 0:
+            print("config-check returned exit code " + str(rc))
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
@@ -248,6 +293,9 @@ class DaemonControlFunctions:
         ns.restore_config_from_lock = bool(
             getattr(ns, "restore_config_from_lock", False)
         )
+        ns.restore_config_lock_history = bool(
+            getattr(ns, "restore_config_lock_history", False)
+        )
         ns.force_resubmit_array_tasks = bool(
             getattr(ns, "force_resubmit_array_tasks", False)
         )
@@ -256,6 +304,7 @@ class DaemonControlFunctions:
         )
         ns.retrain_ferebus = bool(getattr(ns, "retrain_ferebus", False))
         ns.json = bool(getattr(ns, "json", False))
+        ns.verbose = bool(getattr(ns, "verbose", False))
         return ns
 
     @staticmethod
@@ -270,6 +319,8 @@ class DaemonControlFunctions:
         ns = DaemonControlFunctions._set_reconcile_defaults(ns)
         ns.allow_fresh_init = False
         ns.apply = False
+        ns.json = bool(daemon_control_menu_options.reconcile_json)
+        ns.verbose = bool(daemon_control_menu_options.reconcile_verbose)
         rc = cmd_reconcile(ns)
         if rc != 0:
             print("reconcile returned exit code " + str(rc))
@@ -353,6 +404,32 @@ class DaemonControlFunctions:
         rc = cmd_reconcile(ns)
         if rc != 0:
             print("reconcile --restore-config-from-lock returned exit code " + str(rc))
+        user_input_free_flow("Press enter to return to the menu: ", "")
+
+    @staticmethod
+    def reconcile_restore_config_lock_history():
+        """Restore a missing current lock from verified immutable history."""
+        from ichor.hpc.active_learning.cli import cmd_reconcile
+
+        ns = _guarded_campaign_dir_ns()
+        if ns is None:
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        answer = user_input_free_flow(
+            "Restore missing config_lock.json from verified history? Type YES: ",
+            "",
+        )
+        if answer != "YES":
+            print("Cancelled.")
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        ns = DaemonControlFunctions._set_reconcile_defaults(ns)
+        ns.apply = False
+        ns.restore_config_from_lock = False
+        ns.restore_config_lock_history = True
+        rc = cmd_reconcile(ns)
+        if rc != 0:
+            print("reconcile --restore-config-lock-history returned exit code " + str(rc))
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
@@ -456,7 +533,11 @@ daemon_control_menu = ConsoleMenu(
 daemon_control_menu_items = [
     FunctionItem("Toggle status JSON output", DaemonControlFunctions.toggle_status_json),
     FunctionItem("Toggle status verbose output", DaemonControlFunctions.toggle_status_verbose),
+    FunctionItem("Toggle preflight JSON output", DaemonControlFunctions.toggle_preflight_json),
+    FunctionItem("Toggle reconcile JSON output", DaemonControlFunctions.toggle_reconcile_json),
+    FunctionItem("Toggle reconcile verbose output", DaemonControlFunctions.toggle_reconcile_verbose),
     FunctionItem("Show status", DaemonControlFunctions.show_status),
+    FunctionItem("Validate campaign config", DaemonControlFunctions.config_check),
     FunctionItem(
         "Show sampling protocol summary",
         DaemonControlFunctions.show_sampling_protocol_summary,
@@ -510,6 +591,10 @@ daemon_control_menu_items = [
     FunctionItem(
         "Restore campaign.yaml proposal from config lock",
         DaemonControlFunctions.reconcile_restore_config_from_lock,
+    ),
+    FunctionItem(
+        "Restore missing config lock from verified history",
+        DaemonControlFunctions.reconcile_restore_config_lock_history,
     ),
     FunctionItem(
         "Reconcile state with --allow-fresh-init",

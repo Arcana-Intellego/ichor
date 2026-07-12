@@ -375,6 +375,7 @@ def resolve_reference_data_view(
     *,
     verification: str = "metadata",
     reference_data_root: Optional[Union[str, Path]] = None,
+    expected_campaign_uid: Optional[str] = None,
 ) -> ReferenceDataView:
     if verification not in {"metadata", "deep"}:
         raise ValueError("reference-data verification must be metadata or deep")
@@ -452,6 +453,27 @@ def resolve_reference_data_view(
         if len(added) != len(records):
             raise ReferenceDataError("reference-data point record must be an object")
         _validate_allocation_snapshot(iteration_dir, payload, added)
+        quality_status = str(payload.get("quantum_quality_evidence_status") or "legacy_missing")
+        quality_records = payload.get("quantum_quality_evidence", [])
+        if not isinstance(quality_records, list):
+            raise ReferenceDataError("reference-data quantum-quality evidence must be a list")
+        if quality_status == "committed" and not quality_records:
+            raise ReferenceDataError("committed quantum-quality evidence is empty")
+        if quality_status not in {"committed", "legacy_missing"}:
+            raise ReferenceDataError("reference-data quantum-quality evidence status is invalid")
+        for record in quality_records:
+            if not isinstance(record, Mapping):
+                raise ReferenceDataError("quantum-quality evidence record must be an object")
+            relative = Path(str(record.get("path") or ""))
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ReferenceDataError("quantum-quality evidence path escapes its version")
+            evidence_path = iteration_dir / relative
+            if evidence_path.is_symlink() or not evidence_path.is_file():
+                raise ReferenceDataError("quantum-quality evidence file is missing")
+            if sha256_file(evidence_path) != _safe_sha(
+                record.get("sha256"), "quantum_quality_evidence.sha256"
+            ):
+                raise ReferenceDataError("quantum-quality evidence SHA mismatch")
         entries.extend(added)
         if [entry.global_ordinal for entry in entries] != list(range(len(entries))):
             raise ReferenceDataError("reference-data global ordinals are not contiguous")
@@ -487,6 +509,10 @@ def resolve_reference_data_view(
         cumulative_view_sha256=_view_sha(entries),
         head_manifest_sha256=head_manifest_sha,
     )
+    if expected_campaign_uid is not None and view.campaign_uid != str(
+        expected_campaign_uid
+    ):
+        raise ReferenceDataError("reference-data campaign UID does not match state")
     _write_reference_data_cache(campaign, view)
     return view
 
@@ -518,6 +544,7 @@ def build_reference_data_version_payload(
     point_allocation_manifest: str,
     point_allocation_sha256: str,
     added_entries: Sequence[ReferenceDataEntry],
+    quantum_quality_evidence: Sequence[Mapping[str, Any]] = (),
 ) -> Dict[str, Any]:
     if source_context not in {"bootstrap", "active"}:
         raise ValueError("reference-data source context must be bootstrap or active")
@@ -546,6 +573,10 @@ def build_reference_data_version_payload(
             None if not added_entries else int(added_entries[-1].global_ordinal)
         ),
         "added_pointdirs": [entry.identity_payload() for entry in added_entries],
+        "quantum_quality_evidence": [dict(record) for record in quantum_quality_evidence],
+        "quantum_quality_evidence_status": (
+            "committed" if quantum_quality_evidence else "legacy_missing"
+        ),
         "cumulative_view_sha256": _view_sha(all_entries),
     }
 

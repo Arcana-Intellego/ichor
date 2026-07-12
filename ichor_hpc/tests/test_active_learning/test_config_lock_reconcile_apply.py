@@ -12,8 +12,10 @@ from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
 from ichor.hpc.active_learning.daemon import config_lock as config_lock_mod
 from ichor.hpc.active_learning.daemon.config_lock import (
+    config_fingerprint,
     config_lock_path,
     review_config_changes,
+    restore_config_lock_from_history,
     restore_config_from_lock_proposal,
     write_config_lock,
 )
@@ -298,13 +300,18 @@ def test_ferebus_scaling_change_allowed_for_uncommitted_initial_ferebus(tmp_path
     assert state.phase is CampaignPhase.HALTED
 
 
-def test_reconcile_refuses_phase_a_handoff_without_trusted_campaign_identity(
+def test_reconcile_refuses_nonempty_campaign_without_trusted_campaign_identity(
     tmp_path,
     capsys,
 ):
     campaign = _campaign(tmp_path)
     _write_pool(campaign)
-    _write_phase_a_sample(campaign)
+    selection = bootstrap_selection_dir(campaign)
+    selection.mkdir(parents=True, exist_ok=True)
+    (selection / "selected.xyz").write_text(
+        "1\nframe 0\nH 0.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
     config = CampaignConfig()
     _write_config(campaign, config)
     write_config_lock(campaign, config)
@@ -421,7 +428,7 @@ def test_schema_v3_config_lock_is_rejected_without_compatibility_migration(tmp_p
                 "created_at_iso": "2026-01-01T00:00:00+00:00",
                 "last_checked_at_iso": "2026-01-01T00:00:00+00:00",
                 "canonical_config": old_v3,
-                "fingerprint_sha256": "legacy",
+                "fingerprint_sha256": config_fingerprint(old_v3),
                 "field_policy_version": 1,
             }
         ),
@@ -489,6 +496,11 @@ def test_memory_estimate_guard_default_migration_is_normalised(tmp_path):
     path = config_lock_path(campaign)
     payload = json.loads(path.read_text(encoding="utf-8"))
     del payload["canonical_config"]["resources"]["fail_on_memory_estimate_exceeds_request"]
+    payload["schema_version"] = 1
+    payload["fingerprint_sha256"] = config_fingerprint(payload["canonical_config"])
+    payload.pop("campaign_uid", None)
+    payload.pop("history_sequence", None)
+    payload.pop("history_entry_sha256", None)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     changed = CampaignConfig()
@@ -504,6 +516,47 @@ def test_memory_estimate_guard_default_migration_is_normalised(tmp_path):
     assert not review.blocked_changes
 
 
+def test_missing_current_lock_restores_only_from_verified_history(tmp_path):
+    campaign = _campaign(tmp_path)
+    state = fresh_campaign_state()
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    config = CampaignConfig()
+    write_config_lock(campaign, config)
+    config_lock_path(campaign).unlink()
+
+    restored = restore_config_lock_from_history(
+        campaign,
+        expected_campaign_uid=state.campaign_uid,
+    )
+
+    payload = json.loads(restored.read_text(encoding="utf-8"))
+    assert payload["campaign_uid"] == state.campaign_uid
+    assert payload["fingerprint_sha256"] == config_fingerprint(config.to_dict())
+
+
+def test_config_lock_history_restore_rejects_fork(tmp_path):
+    campaign = _campaign(tmp_path)
+    state = fresh_campaign_state()
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    write_config_lock(campaign, CampaignConfig())
+    root = config_lock_path(campaign).parent / "config_lock_history"
+    original = next(root.glob("*.json"))
+    fork = json.loads(original.read_text(encoding="utf-8"))
+    fork["reason"] = "fork"
+    fork["entry_sha256"] = config_lock_mod._history_entry_sha256(fork)
+    (root / ("00000000-" + fork["entry_sha256"] + ".json")).write_text(
+        json.dumps(fork),
+        encoding="utf-8",
+    )
+    config_lock_path(campaign).unlink()
+
+    with pytest.raises(ValueError, match="one root|forked"):
+        restore_config_lock_from_history(
+            campaign,
+            expected_campaign_uid=state.campaign_uid,
+        )
+
+
 def test_acquisition_driver_default_migration_is_normalised(tmp_path):
     campaign = _campaign(tmp_path)
     original = CampaignConfig()
@@ -511,6 +564,11 @@ def test_acquisition_driver_default_migration_is_normalised(tmp_path):
     path = config_lock_path(campaign)
     payload = json.loads(path.read_text(encoding="utf-8"))
     del payload["canonical_config"]["acquisition"]["driver"]
+    payload["schema_version"] = 1
+    payload["fingerprint_sha256"] = config_fingerprint(payload["canonical_config"])
+    payload.pop("campaign_uid", None)
+    payload.pop("history_sequence", None)
+    payload.pop("history_entry_sha256", None)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     changed = CampaignConfig()
@@ -1453,6 +1511,7 @@ def test_reconcile_apply_archives_data_staging_for_ferebus_reentry(tmp_path, cap
     campaign = _campaign(tmp_path)
     _commit_reference_data_version(campaign, 0)
     _write_halted_pre_ferebus_state(campaign)
+    write_config_lock(campaign, CampaignConfig())
     changed = CampaignConfig()
     changed.ferebus.scaling = False
     _write_config(campaign, changed)
@@ -1692,6 +1751,7 @@ def test_reconcile_apply_keeps_data_staging_blocked_for_non_ferebus_reentry(tmp_
     state.models_version = -1
     write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
     cfg = CampaignConfig()
+    write_config_lock(campaign, cfg)
     _write_config(campaign, cfg)
     data_staging = campaign / ".DATA" / "STAGING"
     stale_file = data_staging / "INITIAL_GAUSSIAN" / "old.txt"

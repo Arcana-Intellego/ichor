@@ -32,9 +32,12 @@ from .artifact_contracts import (
 from .state import CampaignPhase, CampaignState, atomic_write_json
 
 
-CONFIG_LOCK_SCHEMA_VERSION = 1
+CONFIG_LOCK_SCHEMA_VERSION = 2
+CONFIG_LOCK_LEGACY_SCHEMA_VERSION = 1
 CONFIG_LOCK_FILENAME = "config_lock.json"
 CONFIG_LOCK_POLICY_VERSION = 2
+CONFIG_LOCK_HISTORY_SCHEMA_VERSION = 1
+CONFIG_LOCK_HISTORY_DIRNAME = "config_lock_history"
 
 
 @dataclass(frozen=True)
@@ -84,6 +87,10 @@ def config_lock_path(campaign_dir: Union[str, Path]) -> Path:
     )
 
 
+def config_lock_history_dir(campaign_dir: Union[str, Path]) -> Path:
+    return config_lock_path(campaign_dir).parent / CONFIG_LOCK_HISTORY_DIRNAME
+
+
 def canonical_config(config: CampaignConfig) -> Dict[str, Any]:
     return config.to_dict()
 
@@ -101,7 +108,14 @@ def config_fingerprint(config_payload: Dict[str, Any]) -> str:
     return hashlib.sha256(_canonical_json(config_payload).encode("utf-8")).hexdigest()
 
 
-def _lock_payload(config: CampaignConfig, *, created_at_iso: Optional[str] = None) -> Dict[str, Any]:
+def _lock_payload(
+    config: CampaignConfig,
+    *,
+    campaign_uid: Optional[str],
+    created_at_iso: Optional[str] = None,
+    history_sequence: Optional[int] = None,
+    history_entry_sha256: Optional[str] = None,
+) -> Dict[str, Any]:
     payload = canonical_config(config)
     now = _now_iso()
     return {
@@ -112,27 +126,321 @@ def _lock_payload(config: CampaignConfig, *, created_at_iso: Optional[str] = Non
         "canonical_config": payload,
         "fingerprint_sha256": config_fingerprint(payload),
         "field_policy_version": CONFIG_LOCK_POLICY_VERSION,
+        "campaign_uid": None if not campaign_uid else str(campaign_uid),
+        "history_sequence": history_sequence,
+        "history_entry_sha256": history_entry_sha256,
     }
 
 
-def write_config_lock(campaign_dir: Union[str, Path], config: CampaignConfig) -> Path:
-    path = config_lock_path(campaign_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    created = None
-    if path.is_file():
+def _history_entry_sha256(payload: Dict[str, Any]) -> str:
+    value = dict(payload)
+    value.pop("entry_sha256", None)
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _read_json_object(path: Path, label: str) -> Dict[str, Any]:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(label + " is not a regular file: " + str(path))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(label + " is unreadable: " + str(path)) from exc
+    if not isinstance(payload, dict):
+        raise ValueError(label + " must contain a JSON object")
+    return payload
+
+
+def _validate_lock_payload(
+    payload: Dict[str, Any],
+    *,
+    expected_campaign_uid: Optional[str] = None,
+) -> Dict[str, Any]:
+    try:
+        schema_version = int(payload.get("schema_version", -1))
+        campaign_schema_version = int(payload.get("campaign_schema_version", -1))
+        policy_version = int(payload.get("field_policy_version", -1))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("config lock version fields are invalid") from exc
+    if schema_version not in (
+        CONFIG_LOCK_LEGACY_SCHEMA_VERSION,
+        CONFIG_LOCK_SCHEMA_VERSION,
+    ):
+        raise ValueError("unsupported config lock schema version: " + str(schema_version))
+    if (
+        policy_version != CONFIG_LOCK_POLICY_VERSION
+        and not (
+            schema_version == CONFIG_LOCK_LEGACY_SCHEMA_VERSION
+            and policy_version == 1
+        )
+    ):
+        raise ValueError("unsupported config lock field-policy version: " + str(policy_version))
+    canonical = payload.get("canonical_config")
+    if not isinstance(canonical, dict):
+        raise ValueError("config lock canonical_config is missing")
+    if campaign_schema_version != int(canonical.get("schema_version", -2)):
+        raise ValueError("config lock campaign schema version mismatch")
+    expected_fingerprint = config_fingerprint(canonical)
+    if str(payload.get("fingerprint_sha256") or "") != expected_fingerprint:
+        raise ValueError("config lock canonical fingerprint mismatch")
+    lock_uid = str(payload.get("campaign_uid") or "")
+    if expected_campaign_uid is not None:
+        expected_uid = str(expected_campaign_uid)
+        if lock_uid and lock_uid != expected_uid:
+            raise ValueError("config lock campaign UID mismatch")
+    return payload
+
+
+def read_config_lock(
+    campaign_dir: Union[str, Path],
+    *,
+    expected_campaign_uid: Optional[str] = None,
+) -> Dict[str, Any]:
+    payload = _read_json_object(config_lock_path(campaign_dir), "config lock")
+    validated = _validate_lock_payload(
+        payload,
+        expected_campaign_uid=expected_campaign_uid,
+    )
+    if int(validated.get("schema_version", -1)) == CONFIG_LOCK_SCHEMA_VERSION:
         try:
-            existing = json.loads(path.read_text(encoding="utf-8"))
-            created = str(existing.get("created_at_iso") or "") or None
-        except Exception:
-            created = None
-    atomic_write_json(path, _lock_payload(config, created_at_iso=created))
+            sequence = int(validated.get("history_sequence"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("config lock history sequence is invalid") from exc
+        entry_sha = str(validated.get("history_entry_sha256") or "")
+        matches = list(
+            config_lock_history_dir(campaign_dir).glob(
+                f"{sequence:08d}-" + entry_sha + ".json"
+            )
+        )
+        if len(matches) != 1:
+            raise ValueError("config lock history reference is missing or ambiguous")
+        entry = _read_json_object(matches[0], "config lock history entry")
+        if int(entry.get("schema_version", -1)) != CONFIG_LOCK_HISTORY_SCHEMA_VERSION:
+            raise ValueError("unsupported config lock history schema")
+        if str(entry.get("entry_sha256") or "") != _history_entry_sha256(entry):
+            raise ValueError("config lock history entry digest mismatch")
+        if str(entry.get("entry_sha256") or "") != entry_sha:
+            raise ValueError("config lock history reference digest mismatch")
+        if str(entry.get("fingerprint_sha256") or "") != str(
+            validated.get("fingerprint_sha256") or ""
+        ):
+            raise ValueError("config lock and history fingerprints differ")
+        if str(entry.get("campaign_uid") or "") != str(
+            validated.get("campaign_uid") or ""
+        ):
+            raise ValueError("config lock and history campaign UIDs differ")
+    return validated
+
+
+def restore_config_lock_from_history(
+    campaign_dir: Union[str, Path],
+    *,
+    expected_campaign_uid: str,
+) -> Path:
+    """Restore a missing current lock from one complete linear history chain."""
+    path = config_lock_path(campaign_dir)
+    if path.exists():
+        raise FileExistsError("current config lock already exists")
+    root = config_lock_history_dir(campaign_dir)
+    entries: Dict[str, Dict[str, Any]] = {}
+    for candidate in sorted(root.glob("*.json")):
+        entry = _read_json_object(candidate, "config lock history entry")
+        if int(entry.get("schema_version", -1)) != CONFIG_LOCK_HISTORY_SCHEMA_VERSION:
+            raise ValueError("unsupported config lock history schema")
+        digest = str(entry.get("entry_sha256") or "")
+        if not digest or digest != _history_entry_sha256(entry):
+            raise ValueError("config lock history entry digest mismatch")
+        if digest in entries:
+            raise ValueError("duplicate config lock history entry digest")
+        entries[digest] = entry
+    if not entries:
+        raise FileNotFoundError("no config lock history entries are available")
+    children: Dict[Optional[str], List[str]] = {}
+    for digest, entry in entries.items():
+        previous = entry.get("previous_entry_sha256")
+        previous_key = None if previous in (None, "") else str(previous)
+        if previous_key is not None and previous_key not in entries:
+            raise ValueError("config lock history chain has a missing predecessor")
+        children.setdefault(previous_key, []).append(digest)
+    if len(children.get(None, [])) != 1:
+        raise ValueError("config lock history does not have one root")
+    for digests in children.values():
+        if len(digests) > 1:
+            raise ValueError("config lock history is forked")
+    current = children[None][0]
+    visited = set()
+    while current is not None:
+        if current in visited:
+            raise ValueError("config lock history contains a cycle")
+        visited.add(current)
+        next_values = children.get(current, [])
+        current = next_values[0] if next_values else None
+    if visited != set(entries):
+        raise ValueError("config lock history contains disconnected entries")
+    latest_sha = max(
+        entries,
+        key=lambda digest: int(entries[digest].get("sequence", -1)),
+    )
+    latest = entries[latest_sha]
+    if str(latest.get("campaign_uid") or "") != str(expected_campaign_uid):
+        raise ValueError("latest config lock history campaign UID mismatch")
+    config_payload = latest.get("canonical_config")
+    if not isinstance(config_payload, dict):
+        raise ValueError("latest config lock history has no canonical config")
+    config = CampaignConfig.from_dict(migrate_campaign_payload(config_payload))
+    atomic_write_json(
+        path,
+        _lock_payload(
+            config,
+            campaign_uid=str(expected_campaign_uid),
+            history_sequence=int(latest["sequence"]),
+            history_entry_sha256=latest_sha,
+        ),
+    )
+    read_config_lock(campaign_dir, expected_campaign_uid=expected_campaign_uid)
     return path
 
 
-def ensure_config_lock(campaign_dir: Union[str, Path], config: CampaignConfig) -> Path:
+def _write_history_entry(
+    campaign_dir: Union[str, Path],
+    config: CampaignConfig,
+    *,
+    campaign_uid: Optional[str],
+    previous: Optional[Dict[str, Any]],
+    reason: str,
+) -> Tuple[int, str]:
+    root = config_lock_history_dir(campaign_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    previous_sequence = None if previous is None else previous.get("history_sequence")
+    previous_sha = None if previous is None else previous.get("history_entry_sha256")
+    sequence = 0 if previous_sequence is None else int(previous_sequence) + 1
+    entry: Dict[str, Any] = {
+        "schema_version": CONFIG_LOCK_HISTORY_SCHEMA_VERSION,
+        "sequence": sequence,
+        "campaign_uid": None if not campaign_uid else str(campaign_uid),
+        "campaign_schema_version": int(config.schema_version),
+        "field_policy_version": CONFIG_LOCK_POLICY_VERSION,
+        "canonical_config": canonical_config(config),
+        "fingerprint_sha256": config_fingerprint(canonical_config(config)),
+        "previous_entry_sha256": previous_sha,
+        "reason": str(reason),
+        "created_at_iso": _now_iso(),
+    }
+    entry["entry_sha256"] = _history_entry_sha256(entry)
+    path = root / (f"{sequence:08d}-" + str(entry["entry_sha256"]) + ".json")
+    if path.exists():
+        existing = _read_json_object(path, "config lock history entry")
+        if existing != entry:
+            raise ValueError("config lock history identity collision")
+    else:
+        atomic_write_json(path, entry)
+    return sequence, str(entry["entry_sha256"])
+
+
+def write_config_lock(
+    campaign_dir: Union[str, Path],
+    config: CampaignConfig,
+    *,
+    campaign_uid: Optional[str] = None,
+    reason: str = "config_lock_update",
+) -> Path:
+    path = config_lock_path(campaign_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    created = None
+    existing: Optional[Dict[str, Any]] = None
+    if path.is_file():
+        try:
+            existing = read_config_lock(campaign_dir)
+            created = str(existing.get("created_at_iso") or "") or None
+        except Exception:
+            raise ValueError("refusing to overwrite an invalid config lock")
+    inferred_uid = None
+    if campaign_uid is None:
+        state_path = path.parent / "state.json"
+        if state_path.is_file() and not state_path.is_symlink():
+            try:
+                state_payload = _read_json_object(state_path, "campaign state")
+                inferred_uid = str(state_payload.get("campaign_uid") or "") or None
+            except Exception:
+                inferred_uid = None
+    effective_uid = str(
+        campaign_uid
+        or inferred_uid
+        or (existing or {}).get("campaign_uid")
+        or ""
+    ) or None
+    new_fingerprint = config_fingerprint(canonical_config(config))
+    if (
+        existing is not None
+        and str(existing.get("fingerprint_sha256") or "") == new_fingerprint
+        and str(existing.get("campaign_uid") or "") == str(effective_uid or "")
+        and int(existing.get("schema_version", -1)) == CONFIG_LOCK_SCHEMA_VERSION
+    ):
+        refreshed = dict(existing)
+        refreshed["last_checked_at_iso"] = _now_iso()
+        atomic_write_json(path, refreshed)
+        return path
+    history_previous = existing
+    if existing is not None and existing.get("history_sequence") is None:
+        legacy_config = CampaignConfig.from_dict(
+            migrate_campaign_payload(existing["canonical_config"])
+        )
+        legacy_sequence, legacy_sha = _write_history_entry(
+            campaign_dir,
+            legacy_config,
+            campaign_uid=effective_uid,
+            previous=None,
+            reason="legacy_config_lock_migration",
+        )
+        history_previous = dict(existing)
+        history_previous["history_sequence"] = legacy_sequence
+        history_previous["history_entry_sha256"] = legacy_sha
+        if config_fingerprint(legacy_config.to_dict()) == new_fingerprint:
+            atomic_write_json(
+                path,
+                _lock_payload(
+                    config,
+                    campaign_uid=effective_uid,
+                    created_at_iso=created,
+                    history_sequence=legacy_sequence,
+                    history_entry_sha256=legacy_sha,
+                ),
+            )
+            return path
+    sequence, entry_sha = _write_history_entry(
+        campaign_dir,
+        config,
+        campaign_uid=effective_uid,
+        previous=history_previous,
+        reason=reason,
+    )
+    atomic_write_json(
+        path,
+        _lock_payload(
+            config,
+            campaign_uid=effective_uid,
+            created_at_iso=created,
+            history_sequence=sequence,
+            history_entry_sha256=entry_sha,
+        ),
+    )
+    return path
+
+
+def ensure_config_lock(
+    campaign_dir: Union[str, Path],
+    config: CampaignConfig,
+    *,
+    campaign_uid: Optional[str] = None,
+) -> Path:
     path = config_lock_path(campaign_dir)
     if not path.is_file():
-        return write_config_lock(campaign_dir, config)
+        return write_config_lock(
+            campaign_dir,
+            config,
+            campaign_uid=campaign_uid,
+            reason="initial_config_lock",
+        )
+    read_config_lock(campaign_dir, expected_campaign_uid=campaign_uid)
     return path
 
 
@@ -218,8 +526,6 @@ PRE_FEREBUS_FIRST_EXACT = {
     "acquisition.property_name",
 }
 FUTURE_FEREBUS_EXACT = {
-    "ferebus.warmstart",
-    "ferebus.warmstart_streak",
     "ferebus.kernel",
     "ferebus.loss",
     "ferebus.nagents",
@@ -230,6 +536,10 @@ FUTURE_FEREBUS_EXACT = {
     "quality_gates.ferebus_min_ext_r2",
     "quality_gates.ferebus_max_ext_rmse_ha",
     "quality_gates.ferebus_max_condition_number",
+}
+UNSUPPORTED_FEREBUS_EXACT = {
+    "ferebus.warmstart",
+    "ferebus.warmstart_streak",
 }
 PRE_SEED_SELECT_EXACT = {
     "anti_overlap.skip_training_seeds",
@@ -251,6 +561,16 @@ PRE_SAMPLING_PROTOCOL_PREFIXES = {
     "geometry_novelty.",
 }
 PRE_SAMPLING_PROTOCOL_EXACT = {"campaign.sampling_aggressiveness"}
+PRE_SAMPLING_PROTOCOL_CALIBRATION_EXACT = {
+    "error_calibration.enabled",
+    "error_calibration.mode",
+    "error_calibration.min_records_to_apply",
+    "error_calibration.min_model_versions_to_apply",
+    "error_calibration.apply_strength",
+    "error_calibration.max_model_age_iterations",
+    "error_calibration.model_version_policy",
+    "error_calibration.aggressiveness_match_required",
+}
 PRE_PHASE_B_PREFIXES = {
     "phase_b.",
 }
@@ -302,6 +622,14 @@ CAMPAIGN_LOCKED_EXACT = set(IMMUTABLE_EXACT)
 
 
 _POLICIES_EXACT: Dict[str, ConfigFieldPolicy] = {
+    **{
+        path: ConfigFieldPolicy(
+            "unsupported",
+            "unsupported",
+            "unsupported pending FEREBUS-side implementation; no runtime effect",
+        )
+        for path in UNSUPPORTED_FEREBUS_EXACT
+    },
     **{
         path: ConfigFieldPolicy("immutable", "immutable", "never editable mid-campaign")
         for path in IMMUTABLE_EXACT
@@ -356,7 +684,10 @@ _POLICIES_EXACT: Dict[str, ConfigFieldPolicy] = {
             "pre_sampling_protocol",
             "editable until ARIADNE/Phase B consumes this iteration; current ARIADNE array edits require --force-resubmit-array-tasks",
         )
-        for path in PRE_SAMPLING_PROTOCOL_EXACT
+        for path in (
+            set(PRE_SAMPLING_PROTOCOL_EXACT)
+            | set(PRE_SAMPLING_PROTOCOL_CALIBRATION_EXACT)
+        )
     },
 }
 
@@ -874,6 +1205,7 @@ def _ferebus_quality_can_be_reevaluated(
             campaign_dir,
             phase.value,
             int(proposed_state.iteration),
+            expected_campaign_uid=str(proposed_state.campaign_uid),
         )
         if intent is not None and str(intent.get("status") or "") not in {
             "FAILED",
@@ -964,6 +1296,8 @@ def _consumption_block_reason(
                 return None
     if kind == "immutable":
         return "field is immutable once a campaign config lock exists"
+    if kind == "unsupported":
+        return "field is unsupported and has no runtime effect"
     if kind == "runtime":
         return None
     if kind == "resource_future":
@@ -1075,6 +1409,8 @@ def _classify_change(
         reason = policy.description
     else:
         reason = policy.description
+    if policy.category != "resource_future":
+        reason += "; requires reconcile and daemon restart; current process unchanged"
     return ConfigChange(path, old, new, policy.category, True, reason)
 
 
@@ -1090,17 +1426,23 @@ def review_config_changes(
     path = config_lock_path(campaign_dir)
     if not path.is_file():
         review = ConfigLockReview(lock_path=path, lock_existed=False)
-        if initialise_missing:
-            write_config_lock(campaign_dir, config)
-            review.notes.append("config lock was missing and has been initialised from current campaign.yaml")
-        else:
-            review.notes.append("config lock is missing")
+        review.blocked_changes.append(
+            ConfigChange(
+                "config_lock",
+                "<missing>",
+                "<current>",
+                "lock_missing",
+                False,
+                "config lock is missing for an existing campaign; run reconcile to restore it from verified lock history",
+            )
+        )
         return review
     try:
-        lock = json.loads(path.read_text(encoding="utf-8"))
+        lock = read_config_lock(
+            campaign_dir,
+            expected_campaign_uid=str(proposed_state.campaign_uid),
+        )
         old_config = lock.get("canonical_config")
-        if not isinstance(old_config, dict):
-            raise ValueError("canonical_config missing")
     except Exception as exc:
         review = ConfigLockReview(lock_path=path, lock_existed=True)
         review.blocked_changes.append(
@@ -1192,11 +1534,16 @@ def assert_config_unchanged_for_start(
     if state is None:
         ensure_config_lock(campaign_dir, config)
         return ConfigLockReview(lock_path=config_lock_path(campaign_dir), lock_existed=True)
-    review = review_config_changes(campaign_dir, config, state, initialise_missing=True)
+    review = review_config_changes(campaign_dir, config, state, initialise_missing=False)
     if review.changed:
         return review
     if review.lock_existed:
-        write_config_lock(campaign_dir, config)
+        write_config_lock(
+            campaign_dir,
+            config,
+            campaign_uid=str(state.campaign_uid),
+            reason="start_validation",
+        )
     return review
 
 
@@ -1479,8 +1826,15 @@ def archive_data_staging_for_operator_reconcile(
 def apply_config_lock_update(
     campaign_dir: Union[str, Path],
     config: CampaignConfig,
+    *,
+    campaign_uid: Optional[str] = None,
 ) -> Path:
-    return write_config_lock(campaign_dir, config)
+    return write_config_lock(
+        campaign_dir,
+        config,
+        campaign_uid=campaign_uid,
+        reason="reconcile_config_update",
+    )
 
 
 def restore_config_from_lock_proposal(campaign_dir: Union[str, Path]) -> Path:
@@ -1499,7 +1853,7 @@ def restore_config_from_lock_proposal(campaign_dir: Union[str, Path]) -> Path:
     if not path.is_file():
         raise FileNotFoundError("config lock not found at " + str(path))
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = read_config_lock(campaign)
     except Exception as exc:
         raise ValueError(
             "config lock is unreadable: "

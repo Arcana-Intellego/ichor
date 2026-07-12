@@ -301,6 +301,23 @@ def _validate_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
         raise ValueError("point-allocation slot count does not match target")
     if not isinstance(reserve, list):
         raise ValueError("point-allocation reserve must be a list")
+    applied_batches = data.get("applied_quantum_batches", [])
+    if not isinstance(applied_batches, list):
+        raise ValueError("point-allocation applied quantum batches must be a list")
+    batch_ids: set[str] = set()
+    for record in applied_batches:
+        if not isinstance(record, dict):
+            raise ValueError("point-allocation quantum batch record must be an object")
+        batch_id = str(record.get("batch_identity") or "")
+        fingerprint = str(record.get("result_fingerprint") or "")
+        if len(batch_id) != 64 or len(fingerprint) != 64 or batch_id in batch_ids:
+            raise ValueError("point-allocation quantum batch identity is invalid")
+        batch_ids.add(batch_id)
+        if int(record.get("source_generation", -1)) < 0:
+            raise ValueError("point-allocation quantum batch source generation is invalid")
+        candidate_ids = record.get("candidate_ids")
+        if not isinstance(candidate_ids, list) or not candidate_ids:
+            raise ValueError("point-allocation quantum batch candidate IDs are invalid")
     attempt_candidate_ids: set[str] = set()
     attempt_locations: Dict[str, Tuple[int, str, Dict[str, Any]]] = {}
     split_counts = {split: 0 for split in VALID_SPLITS}
@@ -491,6 +508,7 @@ def read_point_allocation(
     path: str | Path,
     *,
     history_dir: Optional[str | Path] = None,
+    expected_campaign_uid: Optional[str] = None,
 ) -> Dict[str, Any]:
     manifest = Path(path)
     payload = _read_payload_file(manifest)
@@ -499,6 +517,10 @@ def read_point_allocation(
         payload,
         history_dir=None if history_dir is None else Path(history_dir),
     )
+    if expected_campaign_uid is not None and str(payload["campaign_uid"]) != str(
+        expected_campaign_uid
+    ):
+        raise ValueError("point-allocation campaign UID mismatch")
     return payload
 
 
@@ -704,6 +726,8 @@ def record_quantum_results(
     results: Sequence[Mapping[str, Any]],
     *,
     expected_generation: Optional[int] = None,
+    batch_identity: Optional[str] = None,
+    result_fingerprint: Optional[str] = None,
 ) -> Dict[str, Any]:
     manifest = Path(path)
     normalised = {str(record.get("candidate_id") or ""): dict(record) for record in results}
@@ -711,6 +735,21 @@ def record_quantum_results(
         raise ValueError("quantum result candidate IDs must be unique and non-empty")
 
     def mutate(payload):
+        applied_batches = payload.setdefault("applied_quantum_batches", [])
+        if not isinstance(applied_batches, list):
+            raise ValueError("point-allocation applied quantum batches must be a list")
+        if batch_identity is not None:
+            matching = [
+                record for record in applied_batches
+                if isinstance(record, Mapping)
+                and str(record.get("batch_identity") or "") == str(batch_identity)
+            ]
+            if matching:
+                if len(matching) != 1 or str(
+                    matching[0].get("result_fingerprint") or ""
+                ) != str(result_fingerprint or ""):
+                    raise ValueError("quantum result batch identity conflicts with allocation history")
+                return payload
         pending_by_id: Dict[str, Tuple[Dict[str, Any], int, Dict[str, Any]]] = {}
         terminal_by_id: Dict[str, Dict[str, Any]] = {}
         for slot in payload["slots"]:
@@ -757,6 +796,15 @@ def record_quantum_results(
                 slot["accepted_attempt"] = int(attempt_index)
             elif bool(attempt.get("mandatory_custom", False)):
                 payload["mandatory_custom_failed"] = True
+        if batch_identity is not None:
+            applied_batches.append(
+                {
+                    "batch_identity": str(batch_identity),
+                    "result_fingerprint": str(result_fingerprint or ""),
+                    "source_generation": int(payload.get("generation", 0)),
+                    "candidate_ids": sorted(normalised),
+                }
+            )
         return payload
 
     return _mutate_manifest(

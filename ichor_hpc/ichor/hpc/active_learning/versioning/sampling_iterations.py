@@ -274,9 +274,13 @@ def finalise_bootstrap(campaign_dir: Path, campaign_uid: str) -> Path:
         verify_bootstrap(campaign, expected_campaign_uid=campaign_uid)
         _seal(root)
         return path
-    read_phase_a_sample_manifest(bootstrap_selection_dir(campaign))
+    read_phase_a_sample_manifest(
+        bootstrap_selection_dir(campaign),
+        expected_campaign_uid=campaign_uid,
+    )
     allocation = read_point_allocation(
-        point_allocation_path(campaign, context="bootstrap", iteration=0)
+        point_allocation_path(campaign, context="bootstrap", iteration=0),
+        expected_campaign_uid=campaign_uid,
     )
     if not bool((allocation.get("summary") or {}).get("complete", False)):
         raise SamplingIterationError("bootstrap allocation is incomplete")
@@ -356,9 +360,14 @@ def finalise_active_iteration(
 
     read_ariadne_results_manifest(root, expected_iteration=value)
     read_ariadne_landing_audit(root, expected_iteration=value)
-    read_phase_b_selection_manifest(root, expected_iteration=value)
+    read_phase_b_selection_manifest(
+        root,
+        expected_iteration=value,
+        expected_campaign_uid=campaign_uid,
+    )
     allocation = read_point_allocation(
-        point_allocation_path(campaign, context="active", iteration=value)
+        point_allocation_path(campaign, context="active", iteration=value),
+        expected_campaign_uid=campaign_uid,
     )
     if not bool((allocation.get("summary") or {}).get("complete", False)):
         raise SamplingIterationError("active point allocation is incomplete")

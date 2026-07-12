@@ -175,6 +175,9 @@ def launch_daemon_detached_checked(
         preset=preset,
         reopen_converged=bool(reopen_converged),
     )
+    # This helper has already detached the process. Run the daemon itself in
+    # foreground mode so it does not create an untracked grandchild.
+    argv.append("--foreground")
 
     child = _popen_detached(argv, log_path)
 

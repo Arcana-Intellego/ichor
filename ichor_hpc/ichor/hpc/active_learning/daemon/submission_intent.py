@@ -72,6 +72,8 @@ def load_intent(
     campaign_dir: Union[str, Path],
     phase_name: str,
     iteration: int,
+    *,
+    expected_campaign_uid: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     path = intent_path(campaign_dir, phase_name, iteration)
     if not path.is_file():
@@ -137,6 +139,10 @@ def load_intent(
         )
         if expected != recomputed:
             raise ValueError("submission intent expected job name does not match identity")
+    if expected_campaign_uid is not None and str(data.get("campaign_uid") or "") != str(
+        expected_campaign_uid
+    ):
+        raise ValueError("submission intent campaign UID mismatch")
     return data
 
 
@@ -144,8 +150,15 @@ def load_active_intent(
     campaign_dir: Union[str, Path],
     phase_name: str,
     iteration: int,
+    *,
+    expected_campaign_uid: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    data = load_intent(campaign_dir, phase_name, iteration)
+    data = load_intent(
+        campaign_dir,
+        phase_name,
+        iteration,
+        expected_campaign_uid=expected_campaign_uid,
+    )
     if data is None:
         return None
     if str(data.get("status")) in ACTIVE_STATUSES:
@@ -258,6 +271,16 @@ def update_intent_status(
         "iteration": int(iteration),
         "created_iso": _now_iso(),
     }
+    if not str(data.get("campaign_uid") or ""):
+        state_path = Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING" / "state.json"
+        if state_path.is_file() and not state_path.is_symlink():
+            try:
+                state_payload = json.loads(state_path.read_text(encoding="utf-8"))
+                state_uid = str(state_payload.get("campaign_uid") or "")
+                if state_uid:
+                    data["campaign_uid"] = state_uid
+            except (OSError, ValueError, AttributeError):
+                pass
     data["status"] = str(status)
     lifecycle = data.get("queue_lifecycle")
     if not isinstance(lifecycle, dict):

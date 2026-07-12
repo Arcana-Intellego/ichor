@@ -151,6 +151,20 @@ def _copytree_no_symlinks(src: Path, dest: Path) -> None:
     shutil.copytree(str(src), str(dest), symlinks=False)
 
 
+def _copy_atomic_checked_file(source: Path, destination: Path) -> None:
+    if source.is_symlink() or not source.is_file():
+        raise ValueError("refusing non-regular evidence file: " + str(source))
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name("." + destination.name + ".tmp")
+    if temporary.exists():
+        temporary.unlink()
+    shutil.copy2(source, temporary)
+    if sha256_file(temporary) != sha256_file(source):
+        temporary.unlink(missing_ok=True)
+        raise ValueError("evidence file copy verification failed: " + str(source))
+    os.replace(temporary, destination)
+
+
 def _validate_pointdir_basename(name: str) -> str:
     text = str(name).strip()
     if Path(text).name != text or not POINTDIR_BASENAME_RE.fullmatch(text):
@@ -795,10 +809,16 @@ def stage_gaussian_inputs(
             raise ValueError("replacement sample context is invalid")
     if str(phase_name) == "GAUSSIAN":
         from ..handoff_manifests import read_phase_b_selection_manifest
+        from .state import DEFAULT_STATE_FILENAME, read_state
+
+        current_state = read_state(
+            Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
+        )
 
         phase_b_manifest = read_phase_b_selection_manifest(
             Path(sample_xyz).parent.parent,
             expected_iteration=int(iteration),
+            expected_campaign_uid=str(current_state.campaign_uid),
         )
         phase_b_records = list(phase_b_manifest.get("final", []))
         if len(phase_b_records) != len(frames):
@@ -818,7 +838,13 @@ def stage_gaussian_inputs(
             from ..acquisition.trajectory_pool import TrajectoryPool
             from ..handoff_manifests import read_phase_a_sample_manifest
 
-            phase_a_manifest = read_phase_a_sample_manifest(Path(sample_xyz).parent)
+            current_state = read_state(
+                Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
+            )
+            phase_a_manifest = read_phase_a_sample_manifest(
+                Path(sample_xyz).parent,
+                expected_campaign_uid=str(current_state.campaign_uid),
+            )
             selected = phase_a_manifest.get("selected_indices")
             if isinstance(selected, list):
                 if len(selected) != len(frames):
@@ -836,9 +862,6 @@ def stage_gaussian_inputs(
                     "custom_bootstrap" if value is None else "phase_a_polus"
                     for value in selected
                 ]
-                current_state = read_state(
-                    Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
-                )
                 pool = TrajectoryPool.load(campaign_dir)
                 initial_provenance_context = {
                     "campaign_uid": str(current_state.campaign_uid),
@@ -1169,6 +1192,15 @@ def record_allocation_quantum_results(
         require_points_file_membership=True,
     )
     pending_ids = {str(record["candidate_id"]) for record in pending}
+    attempts_by_id = {
+        str(attempt["candidate_id"]): {
+            **attempt,
+            "slot_id": int(slot["slot_id"]),
+            "split": str(slot["split"]),
+        }
+        for slot in allocation["slots"]
+        for attempt in list(slot.get("attempts") or [])
+    }
     submitted_names = [Path(path).name for path in gaussian_accepted]
     submitted_names.extend(
         str(record.get("pointdir"))
@@ -1177,7 +1209,7 @@ def record_allocation_quantum_results(
     )
     if len(submitted_names) != len(set(submitted_names)):
         raise ValueError("Gaussian allocation handoff contains duplicate pointdirs")
-    if len(submitted_names) != len(pending_ids):
+    if pending_ids and len(submitted_names) != len(pending_ids):
         raise ValueError(
             "quantum staging task count does not match pending point allocation: "
             + str(len(submitted_names))
@@ -1221,13 +1253,16 @@ def record_allocation_quantum_results(
         if not isinstance(allocation_provenance, dict):
             raise ValueError("staged pointdir lacks allocation provenance: " + name)
         candidate_id = str(allocation_provenance.get("candidate_id") or "")
-        if candidate_id not in pending_by_id or candidate_id in observed_ids:
+        if candidate_id not in attempts_by_id or candidate_id in observed_ids:
             raise ValueError(
-                "staged pointdir candidate does not match pending allocation: " + name
+                "staged pointdir candidate does not match point allocation: " + name
             )
-        attempt = pending_by_id[candidate_id]
+        attempt = attempts_by_id[candidate_id]
+        if pending_ids and candidate_id not in pending_by_id:
+            raise ValueError("staged pointdir does not belong to the pending allocation round: " + name)
         validate_provenance(
             pointdir,
+            campaign_uid=str(allocation["campaign_uid"]),
             allocation_candidate_id=candidate_id,
             allocation_context=str(context),
             allocation_slot_id=int(attempt["slot_id"]),
@@ -1256,16 +1291,57 @@ def record_allocation_quantum_results(
                 "pointdir": str(pointdir.resolve()),
                 "reason": reason,
                 "quality_manifest": str(
-                    (staging / "quantum_quality.json").resolve(strict=False)
+                    (staging / "quantum_quality.json")
+                    .resolve(strict=False)
+                    .relative_to(campaign.resolve())
+                    .as_posix()
                 ),
             }
         )
-    if observed_ids != pending_ids:
+    if pending_ids and observed_ids != pending_ids:
         raise ValueError("quantum staging does not cover every pending allocation candidate")
+    if not pending_ids and not observed_ids:
+        raise ValueError("quantum result replay contains no allocation candidates")
+    quality_path = staging / "quantum_quality.json"
+    acceptance_paths = [
+        quantum_acceptance_manifest_path(staging, phase_name=str(gaussian_phase)),
+    ]
+    aimall_path = quantum_acceptance_manifest_path(staging, phase_name=str(aimall_phase))
+    if aimall_path.is_file():
+        acceptance_paths.append(aimall_path)
+    source_identity = {
+        "campaign_uid": str(allocation["campaign_uid"]),
+        "context": str(context),
+        "iteration": int(iteration),
+        "staging": staging.resolve().relative_to(campaign.resolve()).as_posix(),
+        "gaussian_phase": str(gaussian_phase),
+        "aimall_phase": str(aimall_phase),
+        "manifest_sha256": [sha256_file(path) for path in acceptance_paths],
+        "quality_sha256": sha256_file(quality_path) if quality_path.is_file() else None,
+    }
+    batch_identity = hashlib.sha256(
+        json.dumps(source_identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    result_identity = [
+        {
+            "candidate_id": str(record["candidate_id"]),
+            "accepted": bool(record["accepted"]),
+            "pointdir": str(record["pointdir"]),
+            "reason": record.get("reason"),
+        }
+        for record in sorted(results, key=lambda item: str(item["candidate_id"]))
+    ]
+    result_fingerprint = hashlib.sha256(
+        json.dumps(result_identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     return record_quantum_results(
         allocation_path,
         results,
-        expected_generation=int(allocation.get("generation", 0)),
+        expected_generation=(
+            int(allocation.get("generation", 0)) if pending_ids else None
+        ),
+        batch_identity=batch_identity,
+        result_fingerprint=result_fingerprint,
     )
 
 
@@ -1493,6 +1569,38 @@ def commit_reference_data_delta(
         added_names.append(name)
 
     allocation_relative = allocation_path.relative_to(campaign).as_posix()
+    quality_sources: Dict[str, Path] = {}
+    missing_quality = 0
+    for attempt in attempts:
+        raw_quality = str(attempt.get("quality_manifest") or "")
+        if not raw_quality:
+            missing_quality += 1
+            continue
+        candidate = Path(raw_quality)
+        source_quality = candidate if candidate.is_absolute() else campaign / candidate
+        resolved_quality = source_quality.resolve(strict=False)
+        if campaign.resolve() not in resolved_quality.parents:
+            raise ValueError("quantum-quality evidence is outside the campaign")
+        if resolved_quality.is_symlink() or not resolved_quality.is_file():
+            raise FileNotFoundError(
+                "quantum-quality evidence is missing: " + str(resolved_quality)
+            )
+        quality_sources[str(resolved_quality)] = resolved_quality
+    if missing_quality and quality_sources:
+        raise ValueError("accepted allocation has incomplete quantum-quality evidence")
+    quality_evidence: List[Dict[str, Any]] = []
+    for index, source_quality in enumerate(sorted(quality_sources.values())):
+        destination_quality = (
+            staging / "quality_evidence" / ("quantum_quality_" + str(index).zfill(4) + ".json")
+        )
+        _copy_atomic_checked_file(source_quality, destination_quality)
+        quality_evidence.append(
+            {
+                "path": destination_quality.relative_to(staging).as_posix(),
+                "sha256": sha256_file(destination_quality),
+                "source_path": source_quality.relative_to(campaign.resolve()).as_posix(),
+            }
+        )
     payload = build_reference_data_version_payload(
         campaign_uid=str(allocation["campaign_uid"]),
         version=version,
@@ -1502,6 +1610,7 @@ def commit_reference_data_delta(
         point_allocation_manifest=allocation_relative,
         point_allocation_sha256=allocation_manifest_sha256(allocation_path),
         added_entries=added_entries,
+        quantum_quality_evidence=quality_evidence,
     )
     allocation_history = allocation_path.parent / "history"
     if allocation_history.is_dir():

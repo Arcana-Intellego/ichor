@@ -2574,24 +2574,17 @@ def main(argv=None) -> int:
 
     acquisition_config = resolved_protocol.acquisition_config
     ariadne_run_config = resolved_protocol.ariadne_run_config
-    error_calibration_model = None
-    error_calibration_reason = "disabled"
-    try:
-        from ..daemon.error_calibration import load_calibration_model_for_acquisition
-
-        error_calibration_model, error_calibration_reason = (
-            load_calibration_model_for_acquisition(
-                campaign,
-                config,
-                current_model_version=int(state.models_version),
-                current_iteration=int(args.iteration),
-            )
-        )
-    except Exception:
-        error_calibration_model = None
-        error_calibration_reason = "malformed_model"
+    calibration_snapshot = dict(resolved_protocol.error_calibration_snapshot or {})
+    snapshot_model = calibration_snapshot.get("model")
+    error_calibration_model = (
+        dict(snapshot_model) if isinstance(snapshot_model, dict) else None
+    )
+    error_calibration_reason = str(
+        calibration_snapshot.get("model_reason") or "disabled"
+    )
+    frozen_calibration = resolved_protocol.effective_config.error_calibration
     error_calibration_strength = (
-        float(config.error_calibration.apply_strength)
+        float(frozen_calibration.apply_strength)
         if error_calibration_model is not None
         else 0.0
     )

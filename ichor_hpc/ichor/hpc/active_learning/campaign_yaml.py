@@ -119,14 +119,22 @@ def initialise_campaign_yaml(campaign_dir: str | Path) -> CampaignConfig:
     Existing operator values override template values. Comments and key order
     are preserved where possible by ruamel.yaml's round-trip loader.
     """
-    campaign = Path(campaign_dir).expanduser().resolve()
+    campaign, config, text = prepare_campaign_yaml(campaign_dir)
     campaign.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(campaign / "campaign.yaml", text)
+    return config
+
+
+def prepare_campaign_yaml(
+    campaign_dir: str | Path,
+) -> tuple[Path, CampaignConfig, str]:
+    """Validate the merged campaign YAML without changing campaign files."""
+    campaign = Path(campaign_dir).expanduser().resolve()
     target = campaign / "campaign.yaml"
     user_payload = load_campaign_yaml(target)
     merged = merge_template_with_user(user_payload)
     config = CampaignConfig.from_dict(_to_plain(merged))
-    write_roundtrip_yaml(target, merged)
-    return config
+    return campaign, config, _dump_yaml_to_text(merged)
 
 
 def set_path(payload, path: str, value: Any) -> None:

@@ -135,7 +135,11 @@ def evaluate_ferebus_quality(staging_dir: Path, gates: Any = None) -> Dict[str, 
             ext = section_metrics["ext_val"]
             if min_ext_r2 is not None and float(ext["r2"]) < min_ext_r2:
                 task_reasons.append("ferebus_ext_r2_below_threshold")
-            if max_ext_rmse is not None and float(ext["rmse"]) > max_ext_rmse:
+            if (
+                prop == "iqa"
+                and max_ext_rmse is not None
+                and float(ext["rmse"]) > max_ext_rmse
+            ):
                 task_reasons.append("ferebus_ext_rmse_threshold_exceeded")
             if max_cond is not None and cond > max_cond:
                 task_reasons.append("ferebus_condition_number_threshold_exceeded")
@@ -332,7 +336,11 @@ def evaluate_ferebus_quality_decision(
             condition = _finite_metric(record, "condition_number")
             if min_ext_r2 is not None and ext_r2 < min_ext_r2:
                 reasons.append("ferebus_ext_r2_below_threshold")
-            if max_ext_rmse is not None and ext_rmse > max_ext_rmse:
+            if (
+                str(record.get("property") or "") == "iqa"
+                and max_ext_rmse is not None
+                and ext_rmse > max_ext_rmse
+            ):
                 reasons.append("ferebus_ext_rmse_threshold_exceeded")
             if max_cond is not None and condition > max_cond:
                 reasons.append("ferebus_condition_number_threshold_exceeded")

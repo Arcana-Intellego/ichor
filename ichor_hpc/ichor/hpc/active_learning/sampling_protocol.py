@@ -26,6 +26,7 @@ from .config import (
     PhaseBConfigBlock,
 )
 from .daemon.state import atomic_write_json
+from .versioning.manifest import sha256_file
 from .geometry_protocol import (
     MOVEMENT_BAND_HARD_MAX_FRACTION,
     MOVEMENT_BAND_HARD_MIN_FRACTION,
@@ -40,6 +41,7 @@ SAMPLING_PROTOCOL_SCHEMA_VERSION = 1
 SAMPLING_PROTOCOL_AUDIT_SCHEMA_VERSION = 1
 SAMPLING_PROTOCOL_RESOLVED_FILENAME = "SAMPLING_PROTOCOL_RESOLVED.json"
 SAMPLING_PROTOCOL_AUDIT_FILENAME = "SAMPLING_PROTOCOL_AUDIT.json"
+SAMPLING_PROTOCOL_CALIBRATION_FILENAME = "ERROR_CALIBRATION_MODEL.json"
 
 
 @dataclass(frozen=True)
@@ -174,6 +176,7 @@ class ResolvedSamplingProtocol:
     quality_gates: Any
     phase_b: Dict[str, Any]
     anti_overlap: Dict[str, Any]
+    error_calibration_snapshot: Dict[str, Any] = field(default_factory=dict)
     scale_model_payload: Dict[str, Any] = field(default_factory=dict)
     sources: Dict[str, Any] = field(default_factory=dict)
     hidden_overrides_detected: List[Dict[str, Any]] = field(default_factory=list)
@@ -488,6 +491,7 @@ def _resolved_manifest_payload(resolved: ResolvedSamplingProtocol) -> Dict[str, 
         "resolved_geometry_scale_angstrom": scale,
         "resolved_phase_b": phase_b,
         "resolved_anti_overlap": dict(resolved.anti_overlap),
+        "resolved_error_calibration": dict(resolved.error_calibration_snapshot),
         "resolved_movement_band": movement_band,
         "resolved_adversarial_safety": {
             "reject_unsafe_landings": bool(resolved.adversarial_safety.reject_unsafe_landings),
@@ -566,10 +570,74 @@ def _resolved_manifest_payload(resolved: ResolvedSamplingProtocol) -> Dict[str, 
                 "profile": profile,
                 "geometry_input_fingerprint": geometry_payload.get("input_fingerprint"),
                 "hidden_overrides": resolved.hidden_overrides_detected,
+                "error_calibration": resolved.error_calibration_snapshot,
             }
         )
     }
     return _json_ready(payload)
+
+
+def _resolve_error_calibration_snapshot(
+    campaign_dir: Union[str, Path],
+    config: CampaignConfig,
+    iteration: int,
+    *,
+    write_manifest: bool,
+) -> Dict[str, Any]:
+    from .daemon.error_calibration import load_calibration_model_for_acquisition
+    from .layout import active_protocol_dir
+
+    settings = asdict(config.error_calibration)
+    model, reason = load_calibration_model_for_acquisition(
+        campaign_dir,
+        config,
+        current_model_version=int(iteration) - 1,
+        current_iteration=int(iteration),
+    )
+    snapshot: Dict[str, Any] = {
+        "settings": settings,
+        "model_reason": str(reason),
+        "model_path": None,
+        "model_sha256": None,
+        "model": None if model is None else dict(model),
+    }
+    if write_manifest and model is not None:
+        path = active_protocol_dir(_iteration_dir(campaign_dir, int(iteration))) / (
+            SAMPLING_PROTOCOL_CALIBRATION_FILENAME
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(path, dict(model))
+        snapshot["model_path"] = path.name
+        snapshot["model_sha256"] = sha256_file(path)
+    return snapshot
+
+
+def _load_error_calibration_snapshot(
+    iter_dir: Path,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    snapshot = payload.get("resolved_error_calibration")
+    if not isinstance(snapshot, dict):
+        # Legacy iteration protocols predate calibration freezing. They remain
+        # readable only when calibration cannot affect acquisition.
+        return {"settings": {}, "model_reason": "legacy_not_frozen", "model": None}
+    out = dict(snapshot)
+    model_path = out.get("model_path")
+    if model_path is None:
+        out["model"] = None
+        return out
+    if Path(str(model_path)).name != str(model_path):
+        raise ValueError("resolved calibration snapshot path is invalid")
+    path = sampling_protocol_resolved_path(iter_dir).parent / str(model_path)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("resolved calibration model snapshot is missing")
+    if sha256_file(path) != str(out.get("model_sha256") or ""):
+        raise ValueError("resolved calibration model snapshot SHA mismatch")
+    model = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(model, dict):
+        raise ValueError("resolved calibration model snapshot must be an object")
+    out["model"] = model
+    return out
 
 
 def write_sampling_protocol_resolved(iter_dir: Union[str, Path], resolved: ResolvedSamplingProtocol) -> Path:
@@ -711,6 +779,12 @@ def resolve_sampling_protocol(
     level = int(config.campaign.sampling_aggressiveness)
     profile = _profile_for(config)
     effective = _effective_campaign_config(config, profile)
+    calibration_snapshot = _resolve_error_calibration_snapshot(
+        campaign_dir,
+        effective,
+        int(iteration),
+        write_manifest=write_manifest,
+    )
     geometry_payload = ensure_geometry_novelty_scale(
         campaign_dir,
         effective,
@@ -791,6 +865,7 @@ def resolve_sampling_protocol(
         quality_gates=effective.quality_gates,
         phase_b=phase_b,
         anti_overlap=asdict(effective.anti_overlap),
+        error_calibration_snapshot=calibration_snapshot,
         scale_model_payload=dict(scale_model_payload),
         sources={
             "level_5_policy": "matches_current_defaults",
@@ -842,6 +917,7 @@ def load_sampling_protocol(
         iter_dir,
         expected_iteration=int(iteration),
     )
+    calibration_snapshot = _load_error_calibration_snapshot(iter_dir, protocol_payload)
     read_sampling_protocol_audit(
         iter_dir,
         expected_iteration=int(iteration),
@@ -867,6 +943,11 @@ def load_sampling_protocol(
         )
     profile = _profile_for(config)
     effective = _effective_campaign_config(config, profile)
+    frozen_settings = calibration_snapshot.get("settings")
+    if isinstance(frozen_settings, dict) and frozen_settings:
+        effective_payload = effective.to_dict()
+        effective_payload["error_calibration"] = dict(frozen_settings)
+        effective = CampaignConfig.from_dict(effective_payload)
     acquisition_config = apply_geometry_novelty_to_acquisition_config(
         effective.to_acquisition_config(),
         effective,
@@ -931,6 +1012,7 @@ def load_sampling_protocol(
         quality_gates=effective.quality_gates,
         phase_b=phase_b,
         anti_overlap=asdict(effective.anti_overlap),
+        error_calibration_snapshot=calibration_snapshot,
         scale_model_payload=dict(scale_model_payload),
         sources={
             "level_5_policy": "matches_current_defaults",
@@ -956,6 +1038,7 @@ def load_sampling_protocol(
         "resolved_quality_gates",
         "resolved_phase_b",
         "resolved_anti_overlap",
+        "resolved_error_calibration",
         "resolved_ariadne",
         "hard_safety_rails",
         "hidden_overrides_detected",

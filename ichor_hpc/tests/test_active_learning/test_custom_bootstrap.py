@@ -127,6 +127,22 @@ def test_duplicate_format_for_one_split_is_rejected(tmp_path):
 
 
 @pytest.mark.skipif(not FIXTURE.is_file(), reason="water fixture missing")
+def test_confirmed_bootstrap_source_change_is_rejected_before_commit(tmp_path):
+    shutil.copy2(FIXTURE, tmp_path / "pool.xyz")
+    frames = _pool_frames()
+    source = tmp_path / "bootstrap" / "training_set_bootstrap.xyz"
+    _write_xyz(source, [frames[0]])
+    config = CampaignConfig()
+    config.campaign.custom_bootstrap = True
+    plan = _inspect(tmp_path, config, frames)
+
+    _write_xyz(source, [frames[1]])
+
+    with pytest.raises(BootstrapInputError, match="changed after inspection"):
+        commit_bootstrap_plan(plan)
+
+
+@pytest.mark.skipif(not FIXTURE.is_file(), reason="water fixture missing")
 def test_model_directory_and_training_split_source_are_rejected(tmp_path):
     shutil.copy2(FIXTURE, tmp_path / "pool.xyz")
     frames = _pool_frames()

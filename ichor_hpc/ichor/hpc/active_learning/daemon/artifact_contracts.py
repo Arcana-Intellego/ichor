@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 from ..versioning.reference_data import ReferenceDataVersioning
 from ..versioning.trained_models import resolve_trained_model_set
@@ -63,11 +63,16 @@ def verify_committed_reference_data_version(
     version: int,
     *,
     reference_data_dir_name: str = QM_REFERENCE_DATA_DIRNAME,
+    expected_campaign_uid: Optional[str] = None,
 ) -> None:
     try:
-        ReferenceDataVersioning(
+        view = ReferenceDataVersioning(
             Path(campaign_dir) / reference_data_dir_name
         ).resolve(int(version), verification="deep")
+        if expected_campaign_uid is not None and view.campaign_uid != str(
+            expected_campaign_uid
+        ):
+            raise ValueError("reference-data campaign UID does not match state")
     except Exception as exc:
         raise CommittedArtifactError(
             "reference_data_version_invalid:"
@@ -84,6 +89,7 @@ def verify_committed_model_version(
     version: int,
     *,
     models_dir_name: str = TRAINED_MODELS_DIRNAME,
+    expected_campaign_uid: Optional[str] = None,
 ) -> None:
     try:
         model_set = resolve_trained_model_set(
@@ -92,6 +98,10 @@ def verify_committed_model_version(
             verification="deep",
             trained_models_root=Path(campaign_dir) / models_dir_name,
         )
+        if expected_campaign_uid is not None and model_set.campaign_uid != str(
+            expected_campaign_uid
+        ):
+            raise ValueError("trained-model campaign UID does not match state")
         from .model_contract import validate_ferebus_model_contract
 
         validate_ferebus_model_contract(
@@ -144,7 +154,8 @@ def verify_state_referenced_artifacts(
                     campaign,
                     context="bootstrap",
                     iteration=0,
-                )
+                ),
+                expected_campaign_uid=str(state.campaign_uid),
             )
             if not bool((allocation.get("summary") or {}).get("complete", False)):
                 raise ValueError("bootstrap point allocation is incomplete")
@@ -172,6 +183,7 @@ def verify_state_referenced_artifacts(
                 campaign,
                 train_version,
                 reference_data_dir_name=reference_data_dir_name,
+                expected_campaign_uid=str(state.campaign_uid),
             )
         elif required_phase in _TRAINING_REQUIRED:
             raise CommittedArtifactError(
@@ -203,6 +215,7 @@ def verify_state_referenced_artifacts(
                     campaign,
                     model_version,
                     models_dir_name=models_dir_name,
+                    expected_campaign_uid=str(state.campaign_uid),
                 )
         elif strict_models and required_phase in _MODELS_REQUIRED:
             raise CommittedArtifactError(
@@ -261,6 +274,7 @@ def artifact_manifest_status(
                 campaign_dir,
                 version,
                 reference_data_dir_name=reference_data_dir_name,
+                expected_campaign_uid=str(state.campaign_uid),
             ),
         ),
     ]
@@ -273,6 +287,7 @@ def artifact_manifest_status(
                     campaign_dir,
                     version,
                     models_dir_name=models_dir_name,
+                    expected_campaign_uid=str(state.campaign_uid),
                 ),
             )
         )

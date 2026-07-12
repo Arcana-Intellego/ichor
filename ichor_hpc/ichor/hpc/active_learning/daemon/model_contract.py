@@ -273,6 +273,41 @@ def _validate_model_object(model: Any, path: Path, task: FerebusTask, system: st
         raise ModelContractError("model_variance_negative")
 
 
+def validate_imported_model_file(
+    path: Path,
+    *,
+    system: str,
+    property_name: str,
+    atom: str,
+    alf_zero_indexed: Sequence[int],
+    train_rows: int,
+) -> None:
+    """Apply the complete runtime model contract during bootstrap admission."""
+    from ichor.core.models import Model
+
+    zero_indexed = tuple(int(value) for value in alf_zero_indexed)
+    task = FerebusTask(
+        property=str(property_name),
+        atom=str(atom),
+        alf_1_indexed=tuple(value + 1 for value in zero_indexed),  # type: ignore[arg-type]
+        config_path=Path("<bootstrap>"),
+        expected_model_path=Path(path),
+        train_rows=int(train_rows),
+    )
+    try:
+        model = Model(path)
+        _validate_model_object(model, Path(path), task, str(system))
+    except ModelContractError:
+        raise
+    except Exception as exc:
+        raise ModelContractError(
+            "imported_model_validation_failed:"
+            + type(exc).__name__
+            + ": "
+            + str(exc)
+        ) from exc
+
+
 def validate_ferebus_model_contract(
     root_dir: Path,
     *,

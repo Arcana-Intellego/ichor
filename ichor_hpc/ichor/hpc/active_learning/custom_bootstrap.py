@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -487,6 +488,8 @@ def _model_metadata(
             raise BootstrapInputError("imported models disagree on training-row count")
         if nfeats != _expected_feature_count(len(pool_frame)):
             raise BootstrapInputError("imported model feature count does not match pool.xyz")
+        if task_ntrain <= 0:
+            raise BootstrapInputError("imported model has no training rows: " + str(path))
         if x.shape != (task_ntrain, nfeats) or y.size != task_ntrain or weights.size != task_ntrain:
             raise BootstrapInputError("imported model training array shape is invalid: " + str(path))
         if not all(np.all(np.isfinite(value)) for value in (x, y, weights)):
@@ -513,6 +516,25 @@ def _model_metadata(
             "imported model atom/property coverage mismatch: missing="
             + repr(missing) + " extra=" + repr(extra)
         )
+    for (prop, atom), (model, path) in sorted(by_key.items()):
+        try:
+            from .daemon.model_contract import validate_imported_model_file
+
+            validate_imported_model_file(
+                path,
+                system=str(model.system_name),
+                property_name=prop,
+                atom=atom,
+                alf_zero_indexed=np.asarray(model.ialf, dtype=int).reshape(-1),
+                train_rows=int(model.ntrain),
+            )
+        except Exception as exc:
+            raise BootstrapInputError(
+                "imported model fails the full runtime contract: "
+                + str(path)
+                + ": "
+                + str(exc)
+            ) from exc
     canonical_key = ("iqa", expected_atoms[0])
     canonical_model = by_key[canonical_key][0]
     canonical_alf = tuple(
@@ -728,13 +750,69 @@ def _xyz_text(frames: Sequence[Atoms]) -> str:
     return "\n".join(lines) + ("\n" if lines else "")
 
 
-def _copy_atomic(source: Path, destination: Path) -> None:
+def _copy_atomic_checked(
+    source: Path,
+    destination: Path,
+    *,
+    expected_sha256: str,
+) -> None:
+    """Copy the inspected regular-file inode and verify its confirmed bytes."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(
         "." + destination.name + "." + uuid4().hex[:8] + ".tmp"
     )
-    shutil.copy2(source, temporary)
-    os.replace(temporary, destination)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor: Optional[int] = None
+    try:
+        if source.is_symlink() or not source.is_file():
+            raise BootstrapInputError(
+                "bootstrap source changed and is no longer a regular file: " + str(source)
+            )
+        descriptor = os.open(source, flags)
+        opened_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            raise BootstrapInputError("bootstrap source is not a regular file: " + str(source))
+        with os.fdopen(descriptor, "rb", closefd=True) as input_file:
+            descriptor = None
+            with open(temporary, "xb") as output_file:
+                shutil.copyfileobj(input_file, output_file)
+                output_file.flush()
+                os.fsync(output_file.fileno())
+        copied_sha = sha256_file(temporary)
+        if copied_sha != str(expected_sha256):
+            raise BootstrapInputError(
+                "bootstrap source changed after inspection: " + str(source)
+            )
+        os.replace(temporary, destination)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _validate_copied_source(source: BootstrapSource, copied: Path, pool_frame: Atoms) -> None:
+    if source.kind == "xyz":
+        frames = _load_xyz(copied, pool_frame.types_extended)
+    elif source.kind == "csv":
+        if source.alf_zero_indexed is None:
+            raise BootstrapInputError("copied CSV bootstrap has no confirmed ALF")
+        frames, copied_alf, _extra = _read_csv_geometry(
+            copied,
+            pool_frame=pool_frame,
+            alf_1_indexed=[int(value) + 1 for value in source.alf_zero_indexed],
+        )
+        if tuple(copied_alf) != tuple(source.alf_zero_indexed):
+            raise BootstrapInputError("copied CSV bootstrap ALF changed")
+    else:
+        raise BootstrapInputError("unknown bootstrap source kind: " + str(source.kind))
+    if len(frames) != len(source.frames):
+        raise BootstrapInputError("copied bootstrap frame count changed")
+    for index, (observed, expected) in enumerate(zip(frames, source.frames)):
+        if float(mass_weighted_rmsd(observed, expected)) > BOOTSTRAP_DUPLICATE_RMSD_ANGSTROM:
+            raise BootstrapInputError(
+                "copied bootstrap geometry changed at frame " + str(index)
+            )
 
 
 def commit_bootstrap_plan(plan: BootstrapPlan) -> Dict[str, Any]:
@@ -781,7 +859,12 @@ def commit_bootstrap_plan(plan: BootstrapPlan) -> Dict[str, Any]:
                 source_records[split] = None
                 continue
             raw_destination = staging / "sources" / source.path.name
-            _copy_atomic(source.path, raw_destination)
+            _copy_atomic_checked(
+                source.path,
+                raw_destination,
+                expected_sha256=source.sha256,
+            )
+            _validate_copied_source(source, raw_destination, plan.pool_frames[0])
             canonical_xyz = staging / "canonical" / (SPLIT_STEMS[split] + ".xyz")
             canonical_xyz.parent.mkdir(parents=True, exist_ok=True)
             atomic_write_text(canonical_xyz, _xyz_text(source.frames))
@@ -809,10 +892,33 @@ def commit_bootstrap_plan(plan: BootstrapPlan) -> Dict[str, Any]:
             for record in plan.model.files:
                 source = Path(str(record["source_path"]))
                 target = staging / MODEL_DIRECTORY_NAME / str(record["source_relative_path"])
-                _copy_atomic(source, target)
+                expected_sha = str(record["sha256"])
+                _copy_atomic_checked(
+                    source,
+                    target,
+                    expected_sha256=expected_sha,
+                )
                 copied = dict(record)
                 copied["path"] = target.relative_to(staging).as_posix()
-                copied["sha256"] = sha256_file(target)
+                copied["sha256"] = expected_sha
+                try:
+                    from .daemon.model_contract import validate_imported_model_file
+
+                    validate_imported_model_file(
+                        target,
+                        system=plan.model.system,
+                        property_name=str(record["property"]),
+                        atom=str(record["atom"]),
+                        alf_zero_indexed=record["alf_zero_indexed"],
+                        train_rows=int(record["ntrain"]),
+                    )
+                except Exception as exc:
+                    raise BootstrapInputError(
+                        "copied imported model fails the runtime contract: "
+                        + str(target)
+                        + ": "
+                        + str(exc)
+                    ) from exc
                 copied_records.append(copied)
             model_xyz = staging / "canonical" / "model_training_reconstructed.xyz"
             model_xyz.parent.mkdir(parents=True, exist_ok=True)

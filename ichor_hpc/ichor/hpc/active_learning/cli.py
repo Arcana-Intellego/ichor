@@ -55,10 +55,12 @@ from .daemon.config_lock import (
     clean_reentry_staging,
     config_lock_path,
     ensure_config_lock,
+    read_config_lock,
     ferebus_reentry_can_archive_data_staging,
     format_config_review,
     review_config_changes,
     restore_config_from_lock_proposal,
+    restore_config_lock_from_history,
     reference_data_staging_can_archive_for_reconcile,
 )
 from .daemon.dry_run_executor import DryRunPhaseExecutor
@@ -1143,6 +1145,18 @@ def _format_active_submission_intents(value: Any) -> str:
                     + str(round(float(lifecycle["postprocess_seconds"]), 1))
                     + "s"
                 )
+            expected = lifecycle.get("n_expected", intent.get("expected_tasks"))
+            observed = lifecycle.get("n_observed")
+            missing = lifecycle.get("n_missing")
+            if expected is not None:
+                lifecycle_bits.append("expected=" + str(expected))
+            if observed is not None:
+                lifecycle_bits.append("observed=" + str(observed))
+            if missing is not None:
+                lifecycle_bits.append("missing=" + str(missing))
+        replacement_round = intent.get("replacement_round")
+        if replacement_round is not None:
+            lifecycle_bits.append("round=" + str(replacement_round))
         if job_id:
             text = phase + "@" + iteration + " " + status + " job_id=" + str(job_id)
         else:
@@ -1284,6 +1298,15 @@ def _format_runtime_status(payload: Dict[str, Any], *, verbose: bool) -> List[st
         ),
         ("shutdown requested", "yes" if payload.get("shutdown_requested") else "no"),
     ]
+    allocation = payload.get("point_allocation_summary")
+    if isinstance(allocation, dict):
+        rows.extend(
+            [
+                ("allocation accepted", allocation.get("accepted_total")),
+                ("allocation deficit", allocation.get("deficit_total")),
+                ("allocation reserve available", allocation.get("reserve_available")),
+            ]
+        )
     if verbose:
         lease = "active: " + _heartbeat_summary(payload.get("lease_heartbeat"))
         if not payload.get("lease_dir_exists"):
@@ -2873,6 +2896,25 @@ def cmd_status(args: argparse.Namespace) -> int:
     payload.update(_probe_daemon_lease(paths["lease"]))
     payload.update(_probe_background_daemon(paths["background_pid"], paths["background_log"]))
     payload["active_submission_intents"] = _load_active_submission_intents(campaign)
+    try:
+        from .point_allocation import point_allocation_path, read_point_allocation
+
+        allocation_context = "bootstrap" if int(state.iteration) == 0 else "active"
+        allocation_path = point_allocation_path(
+            campaign,
+            context=allocation_context,
+            iteration=0 if allocation_context == "bootstrap" else int(state.iteration),
+        )
+        if allocation_path.is_file():
+            allocation = read_point_allocation(
+                allocation_path,
+                expected_campaign_uid=str(state.campaign_uid),
+            )
+            payload["point_allocation_summary"] = dict(allocation.get("summary") or {})
+    except Exception as exc:
+        payload["point_allocation_summary"] = {
+            "error": type(exc).__name__ + ": " + str(exc)
+        }
     payload["latest_halt_event"] = _latest_journal_event(paths["journal"], "halt")
     try:
         if supports_partial_array_recovery(state.phase):
@@ -4291,6 +4333,7 @@ def _print_reconcile_apply_blocked(
 
 def cmd_reconcile(args: argparse.Namespace) -> int:
     restore_config = bool(getattr(args, "restore_config_from_lock", False))
+    restore_lock = bool(getattr(args, "restore_config_lock_history", False))
     archive_staging_requested = bool(getattr(args, "archive_staging", False))
     force_resubmit_array = bool(getattr(args, "force_resubmit_array_tasks", False))
     archive_existing_array_outputs = bool(
@@ -4302,6 +4345,29 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         require_campaign_yaml=False,
     )
     runtime_status = _reconcile_runtime_status(campaign)
+    if restore_lock:
+        if restore_config or bool(getattr(args, "apply", False)):
+            print(
+                "refusing --restore-config-lock-history with another reconcile mutation",
+                file=sys.stderr,
+            )
+            return 2
+        if runtime_status.get("reconcile_apply_blockers"):
+            _print_reconcile_runtime_warning(runtime_status, campaign)
+            return 9
+        try:
+            state = read_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME)
+            restored = restore_config_lock_from_history(
+                campaign,
+                expected_campaign_uid=str(state.campaign_uid),
+            )
+        except Exception as exc:
+            print("could not restore config lock from history: " + str(exc), file=sys.stderr)
+            return 8
+        _print_reconcile_header(campaign, mode="restore-lock", result="RESTORED")
+        print("  config lock: " + _reconcile_relative_path(campaign, restored))
+        print("  campaign UID: " + str(state.campaign_uid))
+        return 0
     if bool(getattr(args, "json", False)) and bool(getattr(args, "apply", False)):
         print(
             json.dumps(
@@ -4895,7 +4961,11 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         _print_cleanup_already_happened(cleanup_paths_already_done)
         return 9
     try:
-        apply_config_lock_update(campaign, config)
+        apply_config_lock_update(
+            campaign,
+            config,
+            campaign_uid=str(report.proposed_state.campaign_uid),
+        )
     except Exception as exc:
         try:
             _restore_state_from_backup_atomic(target_canonical, backup_path)
@@ -5462,10 +5532,15 @@ def _bootstrap_fresh_campaign_state(
 
     lock_path = config_lock_path(campaign)
     if lock_path.is_file():
+        lock_payload = read_config_lock(campaign)
+        state = fresh_campaign_state(max_iterations=int(config.campaign.max_iterations))
+        lock_uid = str(lock_payload.get("campaign_uid") or "")
+        if lock_uid:
+            state.campaign_uid = lock_uid
         review = review_config_changes(
             campaign,
             config,
-            fresh_campaign_state(max_iterations=int(config.campaign.max_iterations)),
+            state,
             initialise_missing=False,
         )
         if review.changed:
@@ -5477,10 +5552,15 @@ def _bootstrap_fresh_campaign_state(
             )
         lock_status = "ok"
     else:
-        ensure_config_lock(campaign, config)
+        # The first lock and state share one campaign identity. The lock is
+        # published first so a failed write cannot leave an unlocked state.
+        state = fresh_campaign_state(max_iterations=int(config.campaign.max_iterations))
+        ensure_config_lock(
+            campaign,
+            config,
+            campaign_uid=str(state.campaign_uid),
+        )
         lock_status = "created"
-
-    state = fresh_campaign_state(max_iterations=int(config.campaign.max_iterations))
     write_state(state_path, state)
     return {
         "state_status": "created",
@@ -5499,9 +5579,9 @@ def cmd_init(args: argparse.Namespace) -> int:
         print(str(exc), file=sys.stderr)
         return 2
     try:
-        from .campaign_yaml import CampaignYamlError, initialise_campaign_yaml
+        from .campaign_yaml import CampaignYamlError, prepare_campaign_yaml
 
-        config = initialise_campaign_yaml(campaign)
+        _campaign, config, prepared_campaign_yaml = prepare_campaign_yaml(campaign)
     except CampaignYamlError as exc:
         print("campaign.yaml initialisation failed: " + str(exc), file=sys.stderr)
         return 15
@@ -5559,8 +5639,12 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     _print_bootstrap_plan(plan)
     if not _confirm_bootstrap_plan(assume_yes=bool(getattr(args, "yes", False))):
-        print("Campaign initialisation cancelled; no bootstrap plan was accepted.")
+        print("Campaign initialisation cancelled; no campaign files were changed.")
         return 19
+
+    from .daemon.state import atomic_write_text
+
+    atomic_write_text(campaign / "campaign.yaml", prepared_campaign_yaml)
 
     if source is not None:
         state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
@@ -6493,6 +6577,14 @@ Examples:
             "When campaign.yaml is missing, write campaign.yaml.proposed from "
             "the locked canonical config. Proposal-only; never overwrites "
             "campaign.yaml."
+        ),
+    )
+    p_recon.add_argument(
+        "--restore-config-lock-history",
+        action="store_true",
+        help=(
+            "Restore a missing config_lock.json from the unique latest verified "
+            "history-chain entry matching state.json. Refuses an existing lock."
         ),
     )
     p_recon.add_argument(

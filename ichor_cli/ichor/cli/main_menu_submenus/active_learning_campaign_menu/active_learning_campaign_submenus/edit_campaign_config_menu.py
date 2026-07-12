@@ -320,6 +320,8 @@ def _summarise_paths(paths) -> str:
 
 
 def _config_lock_change_status(path: str) -> str:
+    if path in {"ferebus.warmstart", "ferebus.warmstart_streak"}:
+        return "unsupported: retained for compatibility; no runtime effect"
     review = current_config_lock_review()
     if review is not None:
         for change in review.blocked_changes:
@@ -1492,8 +1494,8 @@ _BLOCK_MENUS_BY_LABEL = {
         "Edit FEREBUS Block",
         "FEREBUS model-training controls; dataset slots come from point_allocation.",
         [
-            _spec("ferebus.warmstart", "choice", choices=sorted(VALID_WARMSTART)),
-            _spec("ferebus.warmstart_streak", "int"),
+            _read_only_spec("ferebus.warmstart"),
+            _read_only_spec("ferebus.warmstart_streak"),
             _spec("ferebus.kernel", "str", prompt="ferebus.kernel (e.g. rbfc_per, rbf_per): "),
             _spec("ferebus.loss", "str", prompt="ferebus.loss (e.g. huber, mse, mae): "),
             _spec("ferebus.nagents", "int"),

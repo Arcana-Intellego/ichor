@@ -148,6 +148,38 @@ def test_replacement_inherits_failed_slot_and_split(tmp_path):
     assert replacement[0]["round"] == 1
 
 
+def test_quantum_result_batch_replay_is_idempotent_and_conflicts_fail(tmp_path):
+    path, payload = _create(tmp_path)
+    attempts = pending_attempts(payload)
+    results = _results(attempts, {row["candidate_id"] for row in attempts})
+    first = record_quantum_results(
+        path,
+        results,
+        expected_generation=0,
+        batch_identity="a" * 64,
+        result_fingerprint="b" * 64,
+    )
+    replayed = record_quantum_results(
+        path,
+        results,
+        batch_identity="a" * 64,
+        result_fingerprint="b" * 64,
+    )
+
+    assert replayed == first
+    assert replayed["generation"] == 1
+    assert replayed["applied_quantum_batches"][0]["candidate_ids"] == sorted(
+        row["candidate_id"] for row in attempts
+    )
+    with pytest.raises(ValueError, match="batch identity conflicts"):
+        record_quantum_results(
+            path,
+            results,
+            batch_identity="a" * 64,
+            result_fingerprint="c" * 64,
+        )
+
+
 def test_replacement_completion_preserves_exact_counts(tmp_path):
     path, payload = _create(tmp_path)
     initial = pending_attempts(payload)

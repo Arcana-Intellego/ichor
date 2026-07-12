@@ -946,11 +946,11 @@ def test_seed_selection_d_optimal_fields_reject_bad_values(field, value, match):
         CampaignConfig.from_dict(payload)
 
 
-def test_bootstrap_external_validation_size_may_be_zero():
+def test_bootstrap_external_validation_size_must_support_quality_evidence():
     payload = CampaignConfig().to_dict()
     payload["point_allocation"]["bootstrap_external_validation_size"] = 0
-    cfg = CampaignConfig.from_dict(payload)
-    assert cfg.point_allocation.bootstrap_external_validation_size == 0
+    with pytest.raises(ConfigValidationError, match="must be > 0"):
+        CampaignConfig.from_dict(payload)
 
 
 def test_barrier_new_safety_terms_validated():
