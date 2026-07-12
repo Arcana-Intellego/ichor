@@ -336,6 +336,7 @@ def _write_ferebus_task_artefact_layout(
         "PROPERTIES.txt",
         FEREBUS_QUALITY_MANIFEST,
         FEREBUS_QUALITY_DECISION_MANIFEST,
+        "MODEL_BOOTSTRAP.json",
     )
     root_records: List[Dict[str, Any]] = []
     for sidecar_name in sidecar_names:
@@ -345,7 +346,10 @@ def _write_ferebus_task_artefact_layout(
                 _stg.FEREBUS_TASK_MANIFEST,
                 FEREBUS_QUALITY_MANIFEST,
                 FEREBUS_QUALITY_DECISION_MANIFEST,
-            }:
+            } or (
+                sidecar_name == "MODEL_BOOTSTRAP.json"
+                and isinstance(manifest.get("model_bootstrap"), dict)
+            ):
                 raise BackendSubmissionError(
                     "required FEREBUS sidecar is missing: " + str(source)
                 )
@@ -1441,6 +1445,38 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             if int(n_tasks) <= 0:
                 raise BackendSubmissionError("nothing to submit for " + phase_name + ": staged 0 tasks")
             f = self.config.ferebus
+            ferebus_manifest = _stg.read_ferebus_manifest(staging)
+            if is_initial and isinstance(
+                ferebus_manifest.get("model_bootstrap"), dict
+            ):
+                imported_manifest = _stg.prepare_imported_model_bootstrap(staging)
+                self._journal_event(
+                    "model_bootstrap_staged",
+                    phase=phase_name,
+                    iteration=int(getattr(state, "iteration", 0)),
+                    n_models=int(imported_manifest.get("n_tasks", 0)),
+                    historical_training_rows=int(
+                        imported_manifest["model_bootstrap"][
+                            "historical_training_rows"
+                        ]
+                    ),
+                )
+                result = self._parse_ferebus_postprocess(
+                    state,
+                    phase_name,
+                    [],
+                )
+                if result.failure_reason is None:
+                    self._journal_event(
+                        "model_bootstrap_committed",
+                        phase=phase_name,
+                        iteration=int(getattr(state, "iteration", 0)),
+                        models_version=int(
+                            (result.state_updates or {}).get("models_version", 0)
+                        ),
+                        scheduler_jobs_submitted=0,
+                    )
+                return result
             resources = getattr(self.config, "resources", None)
             effective_partition = (
                 str(self.partition)
@@ -1471,7 +1507,6 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 )
             path_to_executable = None if ferebus_path == "ferebus" else ferebus_path
             ferebus_platform = _configured_ferebus_platform()
-            ferebus_manifest = _stg.read_ferebus_manifest(staging)
             expected_ferebus_tasks = int(ferebus_manifest.get("n_tasks", 0))
             expected_job_name = _current_submission_job_name(
                 self.campaign_dir,
@@ -3849,7 +3884,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
     def _parse_polus_postprocess(self, state, phase, observations):
         """Parse the POLUS Phase-A or Phase-B sample output.
 
-        Phase A reads BOOTSTRAP/selection/SELECTION.json. Phase B validates
+        Phase A reads .DATA/BOOTSTRAP/selection/SELECTION.json. Phase B validates
         ACTIVE_LEARNING/iteration-NNNNNN/phase_b/SELECTION.json and its
         hash-bound selected geometry and finalised provenance records.
 

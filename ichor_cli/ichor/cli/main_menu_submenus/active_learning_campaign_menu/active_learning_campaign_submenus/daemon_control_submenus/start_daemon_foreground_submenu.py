@@ -41,7 +41,7 @@ START_DAEMON_FOREGROUND_MENU_DESCRIPTION = MenuDescription(
 
 START_DAEMON_FOREGROUND_DEFAULTS = {
     "selected_command": "start",
-    "selected_mode": "dry-run",
+    "selected_mode": "live",
     "selected_max_ticks": 0,            # 0 = unset
     "selected_poll_interval": 0,         # 0 = use config default
     "selected_config": "",
@@ -212,6 +212,11 @@ class StartDaemonForegroundFunctions:
             reopen_converged=bool(
                 start_daemon_foreground_menu_options.reopen_converged
             ),
+            foreground=True,
+            background=False,
+            background_child=False,
+            background_log=None,
+            background_pid=None,
         )
         if start_daemon_foreground_menu_options.selected_command == "resume":
             rc = cmd_resume(ns)

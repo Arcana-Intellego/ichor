@@ -219,6 +219,7 @@ def split_atom_csv_to_property_dirs(
     fractions: Optional[Sequence[float]] = None,
     *,
     row_ids: Optional[Mapping[str, Sequence[int]]] = None,
+    allow_empty_splits: Sequence[str] = (),
 ) -> Dict[str, object]:
     """Split one atom CSV once and write the same row partition for every property.
 
@@ -296,13 +297,30 @@ def split_atom_csv_to_property_dirs(
         "ext_val": [int(i) for i in ev],
     }
     validation: Dict[str, Dict[str, int]] = {}
+    empty_allowed = {str(value) for value in allow_empty_splits}
+    if not empty_allowed.issubset({"train", "int_val", "ext_val"}):
+        raise ValueError("allow_empty_splits contains an invalid split")
     for prop in props:
         out_dir = Path(out_dirs_by_prop[prop])
         for name, ids in targets:
             _write_subset(header_bare, body, ids, out_dir / name)
         for name, _ids in targets:
-            info = validate_ferebus_csv(out_dir / name, prop)
-            validation[prop + ":" + name] = info
+            split_name = (
+                "train" if "_TRAINING_SET" in name
+                else "int_val" if "_INT_VALIDATION_SET" in name
+                else "ext_val"
+            )
+            if not _ids and split_name in empty_allowed:
+                validation[prop + ":" + name] = {
+                    "rows": 0,
+                    "columns": len(cols),
+                    "features": sum(
+                        1 for column in cols if re.fullmatch(r"f\d+", column)
+                    ),
+                }
+            else:
+                info = validate_ferebus_csv(out_dir / name, prop)
+                validation[prop + ":" + name] = info
     return {"counts": counts, "row_ids": row_ids, "validation": validation}
 
 

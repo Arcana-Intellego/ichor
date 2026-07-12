@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 
 import ichor.core.files as core_files
+import numpy as np
 
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.daemon import input_staging as stg
@@ -50,28 +51,49 @@ class _FakePointsDirectory(list):
     def features_with_properties_to_csv(self, _alf, str_to_append_to_fname="_train.csv",
                                         property_types=None):
         # stage_ferebus_inputs has chdir'd into the staging dir, so a bare filename lands there.
+        properties = [str(value) for value in (property_types or ["iqa"])]
         for atom, base in (("O1", -75.0), ("H2", -0.5), ("H3", -0.5)):
             with open(atom + str_to_append_to_fname, "w", encoding="utf-8", newline="\n") as f:
-                f.write("f1,f2,f3,iqa,q00\n")
+                f.write("f1,f2,f3," + ",".join(properties) + "\n")
                 for i in range(len(self)):
+                    values = {
+                        "iqa": base - i * 0.01,
+                        "q00": 0.2 + i * 0.001,
+                    }
                     f.write(
                         f"{i + 0.1},{i + 0.2},{i + 0.3},"
-                        f"{base - i * 0.01},{0.2 + i * 0.001}\n"
+                        + ",".join(str(values[prop]) for prop in properties)
+                        + "\n"
                     )
 
 
-def _prepare_bootstrap_training(campaign, cfg):
+def _prepare_bootstrap_training(
+    campaign,
+    cfg,
+    *,
+    n_train=12,
+    n_int_val=3,
+    n_ext_val=5,
+):
     source_dir = campaign / ".DATA" / "STAGING" / "initial"
-    cfg.point_allocation.bootstrap_training_size = 12
-    cfg.point_allocation.bootstrap_internal_validation_size = 3
-    cfg.point_allocation.bootstrap_external_validation_size = 5
+    if int(n_train) > 0:
+        cfg.point_allocation.bootstrap_training_size = int(n_train)
+    cfg.point_allocation.bootstrap_internal_validation_size = int(n_int_val)
+    cfg.point_allocation.bootstrap_external_validation_size = int(n_ext_val)
+    n_total = int(n_train) + int(n_int_val) + int(n_ext_val)
+    targets = {
+        "train": int(n_train),
+        "int_val": int(n_int_val),
+        "ext_val": int(n_ext_val),
+        "total": int(n_total),
+    }
     candidates = [
         {
             "candidate_id": "candidate-" + str(i),
             "frame_id": i,
             "pointdir_name": "POINT_" + str(i).zfill(4) + ".pointdir",
         }
-        for i in range(20)
+        for i in range(n_total)
     ]
     allocation_path = point_allocation_path(
         campaign,
@@ -83,7 +105,7 @@ def _prepare_bootstrap_training(campaign, cfg):
         campaign_uid="campaign-uid",
         context="bootstrap",
         iteration=0,
-        targets=allocation_targets(cfg, "bootstrap"),
+        targets=(allocation_targets(cfg, "bootstrap") if int(n_train) > 0 else targets),
         primary_candidates=candidates,
         reserve_candidates=[],
     )
@@ -187,6 +209,157 @@ def test_stage_ferebus_inputs_orchestration(tmp_path, monkeypatch):
     assert not list(staging.glob("ferebus_*.toml"))
     # the transient scratch csvs do not survive into the staging dir
     assert not list(staging.glob("*_normalised_for_split.csv"))
+
+
+def test_model_bootstrap_stages_exact_historical_training_prefix(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.core.calculators import (
+        calculate_alf_atom_sequence,
+        calculate_alf_features,
+    )
+    from ichor.core.files.xyz import Trajectory
+    from ichor.core.models import Model
+    from ichor.hpc.active_learning.custom_bootstrap import (
+        commit_bootstrap_plan,
+        inspect_bootstrap_inputs,
+    )
+    from ichor.hpc.active_learning.daemon.dry_run_executor import (
+        DryRunPhaseExecutor,
+    )
+    from ichor.hpc.active_learning.daemon.live_executor import (
+        LiveBackendsPhaseExecutor,
+    )
+    from ichor.hpc.active_learning.daemon.state import fresh_campaign_state
+
+    campaign = tmp_path / "c"
+    pool_frames = []
+    for xyz_path in sorted((FIXTURES / "initial_quantum").glob("*.pointdir/*.xyz")):
+        trajectory = Trajectory(xyz_path)
+        trajectory.read()
+        pool_frames.extend(frame.copy() for frame in trajectory)
+    assert len(pool_frames) >= 4
+    pool_frames = pool_frames[:4]
+
+    cfg = CampaignConfig()
+    cfg.campaign.system_name = "WATER"
+    cfg.campaign.custom_bootstrap = True
+    cfg.ferebus.properties = ["iqa"]
+    cfg.point_allocation.bootstrap_training_size = 8
+    cfg.point_allocation.bootstrap_internal_validation_size = 2
+    cfg.point_allocation.bootstrap_external_validation_size = 2
+    model_frames = [pool_frames[0].copy(), pool_frames[1].copy()]
+    model_frames[0][1].coordinates[0] += 0.015
+    model_frames[1][2].coordinates[1] -= 0.020
+    model_dir = campaign / "bootstrap" / "model_krig"
+    model_dir.mkdir(parents=True)
+    baseline_by_atom = {}
+    for atom_index, atom_name in enumerate(model_frames[0].atom_names):
+        alf = calculate_alf_atom_sequence(model_frames[0][atom_index])
+        features = np.asarray(
+            [
+                calculate_alf_features(frame[atom_index], alf)
+                for frame in model_frames
+            ],
+            dtype=float,
+        )
+        targets = np.asarray(
+            [-75.0 - atom_index * 0.1, -75.01 - atom_index * 0.1],
+            dtype=float,
+        )
+        model_path = model_dir / ("WATER_iqa_" + atom_name + ".model")
+        DryRunPhaseExecutor._write_dry_ferebus_model(
+            model_path,
+            system="WATER",
+            atom=atom_name,
+            prop="iqa",
+            alf_1_indexed=[int(value) + 1 for value in alf],
+            ntrain=2,
+            feature_rows=features,
+            target_rows=targets,
+        )
+        baseline_by_atom[atom_name] = (features, targets)
+
+    plan = inspect_bootstrap_inputs(
+        campaign,
+        cfg,
+        pool_frames,
+        pool_sha256="a" * 64,
+    )
+    assert plan.model is not None
+    assert plan.model.training_count == 2
+    assert plan.polus_deficits == {"train": 0, "int_val": 2, "ext_val": 2}
+    commit_bootstrap_plan(plan)
+    _prepare_bootstrap_training(
+        campaign,
+        cfg,
+        n_train=0,
+        n_int_val=2,
+        n_ext_val=2,
+    )
+    monkeypatch.setattr(core_files, "PointsDirectory", _FakePointsDirectory)
+
+    staging, n_tasks = stg.stage_ferebus_inputs(
+        campaign,
+        cfg,
+        reference_data_version=0,
+        is_initial=False,
+    )
+    manifest = stg.prepare_imported_model_bootstrap(staging)
+
+    assert n_tasks == 3
+    assert manifest["model_bootstrap"]["historical_training_rows"] == 2
+    for task in manifest["tasks"]:
+        assert task["row_counts"] == {"train": 2, "int_val": 2, "ext_val": 2}
+        model = Model(
+            stg.resolve_ferebus_task_path(
+                staging,
+                task["expected_model_path"],
+                "expected_model_path",
+            )
+        )
+        expected_x, expected_y = baseline_by_atom[str(task["atom"])]
+        assert np.allclose(np.asarray(model.x, dtype=float), expected_x)
+        assert np.allclose(np.asarray(model.y, dtype=float).reshape(-1), expected_y)
+        training_csv = stg.resolve_ferebus_task_path(
+            staging,
+            task["training_csv"],
+            "training_csv",
+        )
+        with training_csv.open("r", encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        assert len(rows) == 2
+        assert np.allclose(
+            [[float(row["f1"]), float(row["f2"]), float(row["f3"])] for row in rows],
+            expected_x,
+        )
+        assert np.allclose([float(row["iqa"]) for row in rows], expected_y)
+
+    executor = DryRunPhaseExecutor(campaign_dir=campaign, config=cfg)
+    state = fresh_campaign_state(campaign_uid="campaign-uid")
+    state.reference_data_version = 0
+    result = LiveBackendsPhaseExecutor._parse_ferebus_postprocess(
+        executor,
+        state,
+        "FEREBUS",
+        [],
+    )
+
+    assert result.failure_reason is None
+    assert result.state_updates["models_version"] == 0
+    committed = campaign / "TRAINED_MODELS" / "iteration-000000"
+    assert committed.is_dir()
+    for task in manifest["tasks"]:
+        model = Model(
+            committed
+            / str(task["property"])
+            / str(task["atom"])
+            / Path(str(task["expected_model_path"])).name
+        )
+        expected_x, expected_y = baseline_by_atom[str(task["atom"])]
+        assert np.allclose(np.asarray(model.x, dtype=float), expected_x)
+        assert np.allclose(np.asarray(model.y, dtype=float).reshape(-1), expected_y)
 
 
 def test_stage_ferebus_inputs_clears_stale_models(tmp_path, monkeypatch):

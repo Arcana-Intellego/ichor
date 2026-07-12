@@ -83,6 +83,11 @@ def test_start_clustered_boolean_flags_expand_to_individual_flags():
     assert ns.max_ticks == 10
 
 
+def test_start_and_resume_foreground_short_flag_parse():
+    assert _parse(["start", "-f"]).foreground is True
+    assert _parse(["resume", "-f"]).foreground is True
+
+
 def test_cluster_expansion_does_not_split_value_taking_options():
     with pytest.raises(cli.ShortFlagClusterError):
         cli.expand_boolean_short_flag_clusters(["start", "-cthing"])
@@ -100,9 +105,10 @@ def test_main_reports_ambiguous_short_cluster_without_traceback(capsys):
 
 
 def test_init_and_journal_short_flags_parse():
-    imp = _parse(["init", "-s", "pool.xyz", "-f"])
+    imp = _parse(["init", "-s", "pool.xyz", "-fy"])
     assert imp.source == "pool.xyz"
     assert imp.force is True
+    assert imp.yes is True
 
     legacy = _parse(["import-pool", "-s", "pool.xyz", "-f"])
     assert legacy.source == "pool.xyz"

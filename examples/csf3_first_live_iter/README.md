@@ -231,7 +231,7 @@ source ~/projects/ichor-active-learning/scripts/env_ichor_csf.sh csf3 --smoke
 ichor-al-daemon init
 ichor-al-daemon preflight --campaign-dir . --verbose
 ichor-al-daemon preflight --campaign-dir . --verbose --submit-environment-smoke
-ichor-al-daemon start --live --campaign-dir . --max-ticks 200
+ichor-al-daemon start --campaign-dir . --max-ticks 200
 ```
 
 The submitted preflight is an explicit commissioning check: one five-minute,

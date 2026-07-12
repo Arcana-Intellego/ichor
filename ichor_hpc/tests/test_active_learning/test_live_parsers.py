@@ -39,6 +39,7 @@ from ichor.hpc.active_learning.layout import (
     active_iteration_dir,
     ariadne_seed_dir,
     ariadne_seeds_dir,
+    bootstrap_selection_dir,
 )
 from ichor.hpc.active_learning.sampling_protocol import sampling_protocol_resolved_path
 from ichor.hpc.active_learning.point_allocation import (
@@ -2059,11 +2060,10 @@ def test_polus_phase_a_happy_path(tmp_path):
 
 def test_polus_phase_a_missing_outdir(tmp_path):
     ex = _make_executor(tmp_path)
-    # BOOTSTRAP dir does NOT yet exist. The executor __post_init__
-    # in fact creates it, so synthesise a stricter no-dir scenario by binding
-    # diversity_dir_name to a known-empty alternate.
+    # The executor creates the daemon bootstrap root, so remove it to exercise
+    # the missing-output path explicitly.
     import shutil
-    target = tmp_path / "campaign" / "BOOTSTRAP" / "selection"
+    target = bootstrap_selection_dir(tmp_path / "campaign")
     if target.exists():
         shutil.rmtree(target.parent)
     state = SimpleNamespace(iteration=0, campaign_uid="m16-test")
@@ -2078,7 +2078,7 @@ def test_polus_phase_a_no_sample_in_outdir(tmp_path):
     ex = _make_executor(tmp_path)
     # The diversity dir is created at __post_init__ time but no sample yet.
     state = SimpleNamespace(iteration=0, campaign_uid="m16-test")
-    target = tmp_path / "campaign" / "BOOTSTRAP" / "selection"
+    target = bootstrap_selection_dir(tmp_path / "campaign")
     target.mkdir(parents=True, exist_ok=True)
     result = ex._parse_polus_postprocess(
         state, CampaignPhase("PHASE_A_POLUS"), observations=[],

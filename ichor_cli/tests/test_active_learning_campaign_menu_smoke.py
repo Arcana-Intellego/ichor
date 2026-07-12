@@ -250,10 +250,9 @@ def test_campaign_config_block_submenus_show_values_and_edit_one_field(monkeypat
     assert "point_allocation.bootstrap_external_validation_size" in allocation_rendered
     assert "point_allocation.batch_training_size" in allocation_rendered
     assert "point_allocation.batch_internal_validation_size" in allocation_rendered
-    assert "point_allocation.anchor" in allocation_rendered
     allocation_menu.parent = menu.edit_campaign_config_menu
     allocation_prologue = allocation_menu.get_prologue_text()
-    assert "point_allocation.anchor" in allocation_prologue
+    assert "point_allocation.anchor" not in allocation_prologue
 
     texts = [it.text for it in resources_menu.items]
     assert "Set partition" in texts
@@ -1353,8 +1352,7 @@ def test_top_three_roi_config_blocks_render_current_values():
 
     campaign_rendered = menu._BLOCK_MENUS_BY_LABEL["Edit campaign"].this_menu_options()
     assert "campaign.sampling_aggressiveness: 7" in campaign_rendered
-    assert "campaign.source_path: pool.xyz" in campaign_rendered
-    assert "campaign.anchor_path: anchor.xyz" in campaign_rendered
+    assert "campaign.custom_bootstrap: False" in campaign_rendered
 
     calibration_rendered = menu._BLOCK_MENUS_BY_LABEL[
         "Edit error_calibration"
@@ -1403,8 +1401,9 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
     assert "Summary source: current in-memory editor config." in out
     assert "Sampling protocol summary" in out
     assert "campaign.sampling_aggressiveness: 6" in out
-    assert "campaign.source_path: pool.xyz" in out
-    assert "campaign.anchor_path: anchor.xyz" in out
+    assert "campaign.pool_path: pool.xyz (fixed campaign input)" in out
+    assert "campaign.custom_bootstrap: False" in out
+    assert "campaign.bootstrap_path: bootstrap/ (fixed campaign input)" in out
     assert "degenerate_policy=score_backfill" in out
     assert "error_calibration.model_version_policy: rolling_normalised" in out
     assert "sampling_protocol.size_normalised_trust_radius" in out
@@ -1430,7 +1429,6 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
     assert "sampling_protocol.resolved_acquisition_risk" in out
     assert "sampling_protocol.resolved_ariadne" in out
     assert "seed_selection.strategy: d_optimal" in out
-    assert "point_allocation.anchor: False" in out
     assert "error_calibration.mode: apply_to_acquisition" in out
     assert "error_calibration.apply_strength: 0.5" in out
     assert "resources.aimall.effective_cpus_per_task: auto" in out
@@ -1500,7 +1498,7 @@ def test_daemon_control_sampling_protocol_summary_uses_saved_campaign(tmp_path, 
     assert "sampling_protocol.resolved_manifest_example" in out
     assert "sampling_protocol.audit_manifest_example" in out
     assert "seed_selection.strategy: d_optimal" in out
-    assert "point_allocation.anchor: False" in out
+    assert "campaign.custom_bootstrap: False" in out
     assert "error_calibration.mode: record_only" in out
 
 
@@ -2169,12 +2167,11 @@ def test_init_pool_passes_verbatim_import_options(tmp_path, monkeypatch):
     import ichor.hpc.active_learning.cli as daemon_cli
 
     set_selected_campaign_dir(tmp_path)
-    menu.import_trajectory_pool_menu_options.source_path = "pool.xyz"
-    menu.import_trajectory_pool_menu_options.anchor_source_path = "anchor.xyz"
+    menu.import_trajectory_pool_menu_options.source = "pool.xyz"
     menu.import_trajectory_pool_menu_options.force_reimport = False
     rendered = menu.import_trajectory_pool_menu.this_menu_options()
     assert "scope: menu-only; applies to next init/import command" in rendered
-    assert "anchor_source_path: anchor.xyz" in rendered
+    assert "source: pool.xyz" in rendered
     calls = []
     monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: "")
     monkeypatch.setattr(daemon_cli, "cmd_init", lambda ns: calls.append(ns) or 0)
@@ -2184,8 +2181,8 @@ def test_init_pool_passes_verbatim_import_options(tmp_path, monkeypatch):
     assert calls
     assert calls[0].campaign_dir == str(tmp_path)
     assert calls[0].source == "pool.xyz"
-    assert calls[0].anchor_source == "anchor.xyz"
     assert calls[0].force is False
+    assert calls[0].yes is False
 
 
 def test_init_pool_force_requires_confirmation_and_resets(tmp_path, monkeypatch):
@@ -2201,8 +2198,7 @@ def test_init_pool_force_requires_confirmation_and_resets(tmp_path, monkeypatch)
     import ichor.hpc.active_learning.cli as daemon_cli
 
     set_selected_campaign_dir(tmp_path)
-    menu.import_trajectory_pool_menu_options.source_path = "pool.xyz"
-    menu.import_trajectory_pool_menu_options.anchor_source_path = ""
+    menu.import_trajectory_pool_menu_options.source = "pool.xyz"
     menu.import_trajectory_pool_menu_options.force_reimport = True
     calls = []
     responses = iter(["YES", ""])

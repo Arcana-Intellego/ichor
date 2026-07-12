@@ -1,8 +1,9 @@
-"""Campaign configuration -- schema v9.
+"""Campaign configuration -- schema v11.
 
-Schema v9 expresses bootstrap and iterative point allocation as exact integer
-quotas.  Point allocation is therefore an explicit scientific contract rather
-than a cumulative fraction inferred later by FEREBUS staging.
+Schema v11 expresses bootstrap and iterative point allocation as exact integer
+quotas, with fixed campaign-relative pool/bootstrap inputs admitted by
+``ichor-al-daemon init``. Point allocation is therefore an explicit scientific
+contract rather than a cumulative fraction inferred later by FEREBUS staging.
 """
 from __future__ import annotations
 
@@ -454,9 +455,8 @@ class CampaignIdentityConfigBlock:
     # dataset files (<system>_<atom>_TRAINING_SET.csv and friends).
     system_name: str = "SYSTEM"
     max_iterations: int = 50
-    source_path: str = "pool.xyz"
-    anchor_path: str = "anchor.xyz"
     sampling_aggressiveness: int = 5
+    custom_bootstrap: bool = False
 
 
 @dataclass
@@ -466,7 +466,6 @@ class PointAllocationConfigBlock:
     bootstrap_external_validation_size: int = 2
     batch_training_size: int = 3
     batch_internal_validation_size: int = 1
-    anchor: bool = False
 
     @property
     def bootstrap_total_size(self) -> int:
@@ -977,7 +976,7 @@ class AimallConfigBlock:
 
 @dataclass
 class CampaignConfig:
-    """Top-level campaign configuration (schema v10)."""
+    """Top-level campaign configuration (schema v11)."""
 
     schema_version: int = CONFIG_SCHEMA_VERSION
 
@@ -1345,18 +1344,10 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "point_allocation.bootstrap_external_validation_size must be >= 0"
             )
-        if not isinstance(allocation.anchor, bool):
-            raise ConfigValidationError("point_allocation.anchor must be a boolean")
-        for path_name in ("source_path", "anchor_path"):
-            value = getattr(self.campaign, path_name)
-            if not isinstance(value, str) or not value.strip():
-                raise ConfigValidationError(
-                    "campaign." + path_name + " must be a non-empty path string"
-                )
-            if "\x00" in value:
-                raise ConfigValidationError(
-                    "campaign." + path_name + " must not contain NUL characters"
-                )
+        if not isinstance(self.campaign.custom_bootstrap, bool):
+            raise ConfigValidationError(
+                "campaign.custom_bootstrap must be a boolean"
+            )
         if isinstance(self.campaign.sampling_aggressiveness, bool) or not isinstance(
             self.campaign.sampling_aggressiveness,
             int,

@@ -252,7 +252,11 @@ def _pool_feasibility_summary(
         return [
             _line("pool_feasibility.status", "ok" if result.ok else "failed"),
             _line("pool_feasibility.pool_n_frames", result.pool_n_frames),
-            _line("pool_feasibility.bootstrap_anchor_count", result.bootstrap_anchor_count),
+            _line("pool_feasibility.bootstrap_custom_count", result.bootstrap_custom_count),
+            _line(
+                "pool_feasibility.bootstrap_model_training_count",
+                result.bootstrap_model_training_count,
+            ),
             _line("pool_feasibility.bootstrap_pool_frame_count", result.bootstrap_pool_frame_count),
             _line("pool_feasibility.required_pool_frames", result.required_pool_frames),
             _line("pool_feasibility.expression", result.expression),
@@ -583,11 +587,9 @@ def format_sampling_protocol_summary(
             int(config.point_allocation.batch_total_size),
         )
     )
-    lines.append(_line("campaign.source_path", config.campaign.source_path))
-    lines.append(_line("campaign.anchor_path", config.campaign.anchor_path))
-    lines.append(_line("point_allocation.anchor", config.point_allocation.anchor))
-    if bool(getattr(config.point_allocation, "anchor", False)):
-        lines.append(_line("point_allocation.anchor_xyz", config.campaign.anchor_path))
+    lines.append(_line("campaign.pool_path", "pool.xyz (fixed campaign input)"))
+    lines.append(_line("campaign.custom_bootstrap", config.campaign.custom_bootstrap))
+    lines.append(_line("campaign.bootstrap_path", "bootstrap/ (fixed campaign input)"))
     lines.append(
         _line(
             "seed_selection.n_seeds_per_iteration",

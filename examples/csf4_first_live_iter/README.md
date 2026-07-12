@@ -292,30 +292,30 @@ cd ~/scratch/ichor_live_smoke
 # frames; for a real smoke you want ~200 -- enough to give POLUS Phase-A
 # something to pick a diverse initial set from.
 cp ~/projects/ichor-active-learning/ichor_hpc/tests/test_active_learning/fixtures/water_tetramer.xyz pool.xyz
-
+cp ~/projects/ichor-active-learning/examples/csf4_first_live_iter/campaign.yaml campaign.yaml
+# Edit campaign.system_name, then inspect the complete init summary.
 ichor-al-daemon init
 ```
 
-The init subcommand populates campaign.yaml when needed, then copies the trajectory into
-`.DATA/TRAJECTORY/pool.xyz` and writes a SHA-pinned manifest next to it.
-Once imported the SHA is the anchor every iteration descends from, so do
-not delete or re-import the pool unless you really mean to start a new
-campaign.
+The init subcommand populates campaign.yaml when needed, validates the
+campaign-local `pool.xyz`, and writes its SHA-pinned manifest under
+`.DATA/TRAJECTORY/`. Once imported the SHA is the immutable identity every
+iteration uses, so do not edit, delete, or replace the pool unless you really
+mean to start a new campaign.
 
-## 6. drop in a one-iteration campaign config
+## 6. review the one-iteration campaign config
 
 A minimal `campaign.yaml` (also shipped at
 `examples/csf4_first_live_iter/campaign.yaml`):
 
 ```yaml
-schema_version: 10
+schema_version: 11
 
 campaign:
   system_name: CHANGE_ME_SYSTEM
   max_iterations: 1
-  source_path: pool.xyz
-  anchor_path: anchor.xyz
   sampling_aggressiveness: 5
+  custom_bootstrap: false
 
 runtime:
   poll_interval_seconds: 60
@@ -326,7 +326,6 @@ point_allocation:
   bootstrap_external_validation_size: 2
   batch_training_size: 3
   batch_internal_validation_size: 1
-  anchor: false
 
 seed_selection:
   n_seeds_per_iteration: 8
@@ -394,7 +393,7 @@ or thermodynamics preset.
 ```
 ichor-al-daemon preflight --campaign-dir . --verbose
 ichor-al-daemon preflight --campaign-dir . --verbose --submit-environment-smoke
-ichor-al-daemon start --live --campaign-dir . --max-ticks 2000
+ichor-al-daemon start --campaign-dir . --max-ticks 2000
 ```
 
 The second preflight command is an explicit commissioning gate. It submits one
@@ -494,14 +493,14 @@ completed campaign deliberately, first increase `campaign.max_iterations`, run
 and review `reconcile --apply`, then use the explicit reopen command:
 
 ```
-ichor-al-daemon resume --live --campaign-dir . --reopen-converged --max-ticks 2000
+ichor-al-daemon resume --campaign-dir . --reopen-converged --max-ticks 2000
 ```
 
 Never delete versioned campaign directories to force a rerun. For a genuinely
 fresh run, create a new campaign directory and initialise it from the intended
-pool/anchor. A failed mandatory anchor or an exhausted immutable replacement
-reserve cannot be repaired in place; start a new campaign with a valid anchor,
-a larger reserve, or a smaller required batch.
+pool/bootstrap inputs. A failed mandatory custom geometry or an exhausted
+immutable replacement reserve cannot be repaired in place; start a new campaign
+with valid bootstrap inputs, a larger reserve, or a smaller required batch.
 
 ## 10. common failure modes
 
@@ -528,7 +527,7 @@ shows active Slurm array jobs. The daemon keeps polling in this state.
 operator did not activate the venv before invoking the daemon. SLURM
 copies the submission shell's environment to worker nodes, so as long
 as `~/.venv/ichor-csf4/bin/activate` was sourced before `ichor-al-daemon
-start --live`, the worker will find ariadne in the venv site-packages.
+start`, the worker will find ariadne in the venv site-packages.
 Source the venv and re-launch.
 
 **`phase_b/selected.xyz` is empty**. This probably means all the ARIADNE

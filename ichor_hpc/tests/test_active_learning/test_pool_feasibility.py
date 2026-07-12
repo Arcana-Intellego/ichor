@@ -61,10 +61,13 @@ def test_pool_feasibility_reuse_mode_requires_only_bootstrap(monkeypatch, tmp_pa
     assert result.required_pool_frames == 20
 
 
-def test_pool_feasibility_counts_anchors_outside_pool_requirement(tmp_path):
+def test_pool_feasibility_counts_custom_geometry_topups_and_pool_exclusions(tmp_path):
     from ichor.core.files.xyz import Trajectory
     from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
-    from ichor.hpc.active_learning.bootstrap_anchor import import_anchor_source
+    from ichor.hpc.active_learning.custom_bootstrap import (
+        commit_bootstrap_plan,
+        inspect_bootstrap_inputs,
+    )
     from ichor.hpc.active_learning.sampling.polus_wrapper import _write_xyz_file
 
     campaign = tmp_path / "c"
@@ -79,17 +82,26 @@ def test_pool_feasibility_counts_anchors_outside_pool_requirement(tmp_path):
         anchors[1][1].y,
         anchors[1][1].z,
     ]
-    anchor_source = campaign / "anchor.xyz"
-    _write_xyz_file(anchors, anchor_source)
-    import_anchor_source(campaign, anchor_source, overwrite=True)
+    source = campaign / "bootstrap" / "training_set_bootstrap.xyz"
+    source.parent.mkdir()
+    _write_xyz_file(anchors, source)
     cfg = _config(bootstrap=12, seeds=8, max_iterations=1, skip=True)
-    cfg.point_allocation.bootstrap_external_validation_size = 2
-    cfg.point_allocation.anchor = True
+    cfg.campaign.custom_bootstrap = True
+    pool = TrajectoryPool.load(campaign)
+    commit_bootstrap_plan(
+        inspect_bootstrap_inputs(
+            campaign,
+            cfg,
+            pool.to_atoms_list(),
+            pool_sha256=pool.sha256,
+        )
+    )
 
     result = pf.require_pool_feasibility(campaign, cfg)
 
     assert result.bootstrap_total_size == 12
-    assert result.bootstrap_anchor_count == 2
+    assert result.bootstrap_custom_count == 2
     assert result.bootstrap_pool_frame_count == 10
-    assert result.required_pool_frames == 18
-    assert result.reserve_after_bootstrap == result.pool_n_frames - 10
+    assert result.excluded_pool_frame_count == 1
+    assert result.required_pool_frames == 19
+    assert result.reserve_after_bootstrap == result.pool_n_frames - 11

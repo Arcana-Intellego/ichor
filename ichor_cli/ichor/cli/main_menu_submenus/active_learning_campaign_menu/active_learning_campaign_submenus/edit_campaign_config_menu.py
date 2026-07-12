@@ -1320,8 +1320,7 @@ _BLOCK_MENUS_BY_LABEL = {
             _read_only_spec("schema_version"),
             _spec("campaign.system_name", "str"),
             _spec("campaign.max_iterations", "int"),
-            _spec("campaign.source_path", "str"),
-            _spec("campaign.anchor_path", "str"),
+            _spec("campaign.custom_bootstrap", "bool"),
             _spec(
                 "campaign.sampling_aggressiveness",
                 "int",
@@ -1341,7 +1340,6 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("point_allocation.bootstrap_external_validation_size", "int"),
             _spec("point_allocation.batch_training_size", "int"),
             _spec("point_allocation.batch_internal_validation_size", "int"),
-            _spec("point_allocation.anchor", "bool"),
         ],
     ),
     "Edit resource defaults": _make_block_menu(

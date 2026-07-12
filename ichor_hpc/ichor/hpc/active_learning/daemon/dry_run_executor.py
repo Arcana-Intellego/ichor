@@ -28,6 +28,7 @@ can assert exact counts of artefacts produced.
 """
 from __future__ import annotations
 
+import csv
 import json
 import random
 from dataclasses import dataclass, field, replace
@@ -56,7 +57,6 @@ from ..versioning.trained_models import TrainedModelVersioning
 from ..versioning.versioned_directory import VersionedDirectory
 from ..layout import (
     ACTIVE_LEARNING_DIRNAME,
-    BOOTSTRAP_DIRNAME,
     QM_REFERENCE_DATA_DIRNAME,
     TRAINED_MODELS_DIRNAME,
     active_iteration_dir,
@@ -121,7 +121,6 @@ class DryRunPhaseExecutor:
     rng_seed: int = 0
     reference_data_dir_name: str = QM_REFERENCE_DATA_DIRNAME
     models_dir_name: str = TRAINED_MODELS_DIRNAME
-    diversity_dir_name: str = BOOTSTRAP_DIRNAME
     al_dir_name: str = ACTIVE_LEARNING_DIRNAME
     strict_completion_receipt_evidence: bool = True
     scripts_dir: Path = field(init=False)
@@ -193,6 +192,9 @@ class DryRunPhaseExecutor:
             return TrainedModelVersioning(self.campaign_dir / self.models_dir_name)
         raise ValueError("unknown versioning kind: " + kind)
 
+    def _models_staging_path(self) -> Path:
+        return self.campaign_dir / self.models_dir_name / "iteration-staging"
+
     @staticmethod
     def _write_dry_ferebus_model(
         path: Path,
@@ -202,17 +204,42 @@ class DryRunPhaseExecutor:
         prop: str,
         alf_1_indexed: Sequence[int],
         ntrain: int,
+        feature_rows: Optional[Sequence[Sequence[float]]] = None,
+        target_rows: Optional[Sequence[float]] = None,
     ) -> None:
         """Write a small, fully parseable FEREBUS model for dry-run commits."""
         if int(ntrain) <= 0:
             raise BackendSubmissionError(
                 "dry-run FEREBUS model requires at least one training row"
             )
-        nfeatures = 3
-        feature_rows = [
-            [0.1 + row * 0.1 + column * 0.01 for column in range(nfeatures)]
-            for row in range(int(ntrain))
-        ]
+        if feature_rows is None:
+            nfeatures = 3
+            resolved_feature_rows = [
+                [0.1 + row * 0.1 + column * 0.01 for column in range(nfeatures)]
+                for row in range(int(ntrain))
+            ]
+        else:
+            resolved_feature_rows = [
+                [float(value) for value in row] for row in feature_rows
+            ]
+            if len(resolved_feature_rows) != int(ntrain):
+                raise BackendSubmissionError(
+                    "dry-run FEREBUS feature-row count does not match ntrain"
+                )
+            nfeatures = len(resolved_feature_rows[0])
+            if nfeatures <= 0 or any(
+                len(row) != nfeatures for row in resolved_feature_rows
+            ):
+                raise BackendSubmissionError("dry-run FEREBUS feature rows are ragged")
+        resolved_targets = (
+            [float(-1.0 - row * 0.01) for row in range(int(ntrain))]
+            if target_rows is None
+            else [float(value) for value in target_rows]
+        )
+        if len(resolved_targets) != int(ntrain):
+            raise BackendSubmissionError(
+                "dry-run FEREBUS target-row count does not match ntrain"
+            )
         lines = [
             "# jitter 1.0e-6",
             "# likelihood -1.0",
@@ -238,18 +265,19 @@ class DryRunPhaseExecutor:
             "[kernel.k1]",
             "type rbf",
             "number_of_dimensions " + str(nfeatures),
-            "active_dimensions 1 2 3",
-            "thetas 1.0 1.0 1.0",
+            "active_dimensions "
+            + " ".join(str(index) for index in range(1, nfeatures + 1)),
+            "thetas " + " ".join("1.0" for _ in range(nfeatures)),
             "",
             "[training_data]",
-            "units.x bohr bohr radians",
+            "units.x " + " ".join("unknown" for _ in range(nfeatures)),
             "units.y " + ("Ha" if str(prop) == "iqa" else "unknown"),
             "",
             "[training_data.x]",
         ]
-        lines.extend(" ".join(str(value) for value in row) for row in feature_rows)
+        lines.extend(" ".join(str(value) for value in row) for row in resolved_feature_rows)
         lines.extend(["", "[training_data.y]"])
-        lines.extend(str(-1.0 - row * 0.01) for row in range(int(ntrain)))
+        lines.extend(str(value) for value in resolved_targets)
         lines.extend(["", "[weights]"])
         lines.extend("0.0" for _ in range(int(ntrain)))
         path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
@@ -274,6 +302,80 @@ class DryRunPhaseExecutor:
                 )
             )
         path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+
+    def _prepare_dry_staged_models(self, staging: Path) -> Dict[str, Any]:
+        """Create deterministic dry models from the exact staged CSV rows."""
+        import shutil
+
+        from . import input_staging as _stg
+
+        manifest = _stg.read_ferebus_manifest(staging)
+        for task in manifest["tasks"]:
+            prop = str(task["property"])
+            atom = str(task["atom"])
+            for field in (
+                "training_csv",
+                "int_validation_csv",
+                "ext_validation_csv",
+            ):
+                destination = _stg.resolve_ferebus_task_path(staging, task[field], field)
+                source = staging / prop / destination.name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+            training_csv = _stg.resolve_ferebus_task_path(
+                staging,
+                task["training_csv"],
+                "training_csv",
+            )
+            with training_csv.open("r", encoding="utf-8", newline="") as handle:
+                rows = list(csv.reader(handle))
+            header = [str(value).strip() for value in rows[0]]
+            feature_indexes = [
+                index
+                for index, value in enumerate(header)
+                if value.startswith("f") and value[1:].isdigit()
+            ]
+            if prop not in header or not feature_indexes:
+                raise BackendSubmissionError(
+                    "dry-run staged FEREBUS CSV contract is invalid"
+                )
+            target_index = header.index(prop)
+            features = [
+                [float(row[index]) for index in feature_indexes]
+                for row in rows[1:]
+                if row and any(str(value).strip() for value in row)
+            ]
+            targets = [
+                float(row[target_index])
+                for row in rows[1:]
+                if row and any(str(value).strip() for value in row)
+            ]
+            config_path = _stg.resolve_ferebus_task_path(
+                staging,
+                task["config_path"],
+                "config_path",
+            )
+            config_path.write_text(
+                "# Dry-run deterministic FEREBUS output.\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            model_path = _stg.resolve_ferebus_task_path(
+                staging,
+                task["expected_model_path"],
+                "expected_model_path",
+            )
+            self._write_dry_ferebus_model(
+                model_path,
+                system=str(manifest["system"]),
+                atom=atom,
+                prop=prop,
+                alf_1_indexed=task["alf_1_indexed"],
+                ntrain=len(features),
+                feature_rows=features,
+                target_rows=targets,
+            )
+        return _stg.read_ferebus_manifest(staging, verify_dataset_files=True)
 
     def _commit_dry_model_snapshot(self, version: int) -> None:
         """Commit a dry model snapshot through the live storage contract."""
@@ -681,7 +783,8 @@ class DryRunPhaseExecutor:
     def _inline_seed_select(self, state) -> Dict[str, Any]:
         """Current wiring: SEED_SELECT invokes :func:'select_seeds' against the
         canonical trajectory pool (if imported) with 'forbidden_frame_ids' =
-        (committed-training seeds) | (recent-seeds cooldown cache).
+        (bootstrap/model matches) | (committed-training seeds) |
+        (recent-seeds cooldown cache).
 
         Behaviour:
           * If no trajectory pool is present, imports a deterministic synthetic
@@ -790,6 +893,24 @@ class DryRunPhaseExecutor:
 
         pool = self._ensure_dry_run_trajectory_pool()
 
+        from ..custom_bootstrap import read_custom_bootstrap_manifest
+
+        bootstrap_payload = read_custom_bootstrap_manifest(self.campaign_dir)
+        bootstrap_forbidden = {
+            int(value)
+            for value in bootstrap_payload.get("excluded_pool_frame_ids", [])
+        }
+        invalid_bootstrap_ids = sorted(
+            value
+            for value in bootstrap_forbidden
+            if value < 0 or value >= int(pool.n_frames())
+        )
+        if invalid_bootstrap_ids:
+            raise BackendSubmissionError(
+                "custom bootstrap excluded pool-frame IDs are outside the "
+                "current trajectory pool: " + repr(invalid_bootstrap_ids[:20])
+            )
+
         # anti-overlap case (a): forbid frame_ids already used to seed a committed training point.
         # honour the config switch -- it used to be hardcoded on, so an operator setting
         # skip_training_seeds: false (e.g. to allow re-seeding training frames on a tiny system) was
@@ -802,7 +923,9 @@ class DryRunPhaseExecutor:
         else:
             training_forbidden = set()
         recent_forbidden = load_recent_seed_frame_ids(self.campaign_dir)
-        forbidden = frozenset(training_forbidden | recent_forbidden)
+        forbidden = frozenset(
+            bootstrap_forbidden | training_forbidden | recent_forbidden
+        )
 
         training_atoms = pool.to_atoms_list()
         training_frame_ids = list(pool.frame_ids())
@@ -846,6 +969,8 @@ class DryRunPhaseExecutor:
                 + str(requested_n)
                 + ", training_forbidden="
                 + str(len(training_forbidden))
+                + ", bootstrap_forbidden="
+                + str(len(bootstrap_forbidden))
                 + ", recent_forbidden="
                 + str(len(recent_forbidden))
                 + ", forbidden_union="
@@ -863,6 +988,8 @@ class DryRunPhaseExecutor:
                 + str(requested_n)
                 + "; training_forbidden="
                 + str(len(training_forbidden))
+                + ", bootstrap_forbidden="
+                + str(len(bootstrap_forbidden))
                 + ", recent_forbidden="
                 + str(len(recent_forbidden))
                 + ", forbidden_union="
@@ -955,6 +1082,7 @@ class DryRunPhaseExecutor:
             "variances": [float(v) for v in selection.variances],
             "seed_records": seed_records,
             "forbidden_set_size": int(len(forbidden)),
+            "bootstrap_forbidden_set_size": int(len(bootstrap_forbidden)),
             "skipped_unknown_provenance": int(selection.skipped_unknown_provenance),
             "score_source": (
                 "error_calibration"
@@ -975,6 +1103,7 @@ class DryRunPhaseExecutor:
             "n_ranked": int(len(selection.variance_indices)),
             "prefilter_pool_size": int(selection.diagnostics.get("prefilter_pool_size", 0)),
             "forbidden_set_size": int(len(forbidden)),
+            "bootstrap_forbidden_set_size": int(len(bootstrap_forbidden)),
             "skipped_unknown_provenance": int(selection.skipped_unknown_provenance),
             "score_source": (
                 "error_calibration"
@@ -1043,6 +1172,7 @@ class DryRunPhaseExecutor:
             score_source_reason=str(score_transform_reason),
             n_picked=int(selection.n),
             forbidden_set_size=int(len(forbidden)),
+            bootstrap_forbidden_set_size=int(len(bootstrap_forbidden)),
             skipped_unknown_provenance=int(selection.skipped_unknown_provenance),
         )
         return {}
@@ -1059,9 +1189,9 @@ class DryRunPhaseExecutor:
         )
         allocation = read_point_allocation(path)
         summary = dict(allocation.get("summary") or {})
-        if bool(allocation.get("mandatory_anchor_failed", False)):
+        if bool(allocation.get("mandatory_custom_failed", False)):
             raise BackendSubmissionError(
-                "mandatory_bootstrap_anchor_failed: anchor slots cannot be replaced"
+                "mandatory_custom_bootstrap_failed: supplied slots cannot be replaced"
             )
         if bool(summary.get("complete", False)):
             next_phase = "INITIAL_FEREBUS" if context == "bootstrap" else "APPEND"
@@ -1361,169 +1491,41 @@ class DryRunPhaseExecutor:
     # --- per-phase postprocess handlers --------------------------------
 
     def _post_phase_a_polus(self, state) -> Dict[str, Any]:
-        from ..bootstrap_anchor import plan_bootstrap_anchors
-        from ..handoff_manifests import write_phase_a_sample_manifest
-        from ..point_allocation import (
-            allocation_targets,
-            create_point_allocation,
-            point_allocation_path,
-            stable_candidate_id,
+        from ..sampling.polus_wrapper import _run_phase_a
+        from ..custom_bootstrap import (
+            commit_bootstrap_plan,
+            custom_bootstrap_manifest_path,
+            inspect_bootstrap_inputs,
         )
 
-        outdir = bootstrap_selection_dir(self.campaign_dir)
-        outdir.mkdir(parents=True, exist_ok=True)
-        n = int(self.config.point_allocation.bootstrap_total_size)
-        frames = []
-        trajectory_sha = ""
         pool = self._ensure_dry_run_trajectory_pool()
-        frames = pool.to_atoms_list()
-        trajectory_sha = str(pool.sha256)
-        anchor_plan, anchor_frames = plan_bootstrap_anchors(
-            self.campaign_dir,
-            self.config,
-            pool_frames=frames,
-        )
-        excluded_pool_ids = set(int(value) for value in anchor_plan.excluded_pool_frame_ids)
-        available_pool_ids = [
-            index for index in range(len(frames)) if index not in excluded_pool_ids
-        ]
-        pool_needed = int(anchor_plan.pool_total_needed)
-        if len(available_pool_ids) < pool_needed:
-            raise BackendSubmissionError(
-                "dry-run bootstrap pool has fewer frames than the point-allocation target"
-            )
-        selected_pool_indices = available_pool_ids[:pool_needed]
-        reserve_indices = available_pool_ids[pool_needed:]
-        selected_frames = list(anchor_frames) + [frames[index] for index in selected_pool_indices]
-        selected_indices = [None] * len(anchor_frames) + selected_pool_indices
-        sample = outdir / "selected.xyz"
-        xyz_lines = []
-        for sample_index, frame in enumerate(selected_frames):
-            frame_id = selected_indices[sample_index]
-            label = "anchor" if frame_id is None else "pool frame " + str(frame_id)
-            xyz_lines.extend([str(len(frame)), "dry-run bootstrap " + label])
-            for atom in frame:
-                xyz_lines.append(
-                    str(atom.type)
-                    + " "
-                    + str(float(atom.x))
-                    + " "
-                    + str(float(atom.y))
-                    + " "
-                    + str(float(atom.z))
+        if not custom_bootstrap_manifest_path(self.campaign_dir).is_file():
+            commit_bootstrap_plan(
+                inspect_bootstrap_inputs(
+                    self.campaign_dir,
+                    self.config,
+                    pool.to_atoms_list(),
+                    pool_sha256=str(pool.sha256),
                 )
-        sample.write_text("\n".join(xyz_lines) + "\n", encoding="utf-8", newline="\n")
-        index = outdir / "selected_indices.dat"
-        index_lines = []
-        anchor_index = 0
-        for value in selected_indices:
-            if value is None:
-                index_lines.append("anchor:" + str(anchor_index))
-                anchor_index += 1
-            else:
-                index_lines.append(str(value))
-        index.write_text(
-            "\n".join(index_lines) + "\n",
-            encoding="utf-8",
+            )
+        return_code = int(
+            _run_phase_a(
+                self.campaign_dir,
+                self.config,
+                campaign_uid=str(getattr(state, "campaign_uid", "")),
+            )
         )
-        anchor_primary = [
-            {
-                "candidate_id": stable_candidate_id(
-                    campaign_uid=str(state.campaign_uid),
-                    context="bootstrap",
-                    iteration=0,
-                    source_identity={"source": "anchor", "anchor_index": int(index)},
-                ),
-                "source": "anchor",
-                "anchor_index": int(index),
-                "frame_id": None,
-            }
-            for index in range(len(anchor_frames))
-        ]
-        primary = anchor_primary + [
-            {
-                "candidate_id": stable_candidate_id(
-                    campaign_uid=str(state.campaign_uid),
-                    context="bootstrap",
-                    iteration=0,
-                    source_identity={"source": "dry_run_phase_a", "frame_id": int(i)},
-                ),
-                "source": "dry_run_phase_a",
-                "frame_id": int(i),
-            }
-            for i in selected_pool_indices
-        ]
-        reserve = [
-            {
-                "candidate_id": stable_candidate_id(
-                    campaign_uid=str(state.campaign_uid),
-                    context="bootstrap",
-                    iteration=0,
-                    source_identity={"source": "dry_run_phase_a_reserve", "frame_id": int(i)},
-                ),
-                "source": "dry_run_phase_a_reserve",
-                "frame_id": int(i),
-                "reserve_rank": int(rank),
-            }
-            for rank, i in enumerate(reserve_indices)
-        ]
-        allocation_path = point_allocation_path(
-            self.campaign_dir,
-            context="bootstrap",
-            iteration=0,
-        )
-        allocation = create_point_allocation(
-            allocation_path,
-            campaign_uid=str(state.campaign_uid),
-            context="bootstrap",
-            iteration=0,
-            targets=allocation_targets(self.config, "bootstrap"),
-            primary_candidates=primary,
-            reserve_candidates=reserve,
-            anchor_candidate_ids=[
-                str(record["candidate_id"]) for record in anchor_primary
-            ],
-        )
-        slot_by_candidate = {
-            str(slot["attempts"][0]["candidate_id"]): {
-                "slot_id": int(slot["slot_id"]),
-                "split": str(slot["split"]),
-            }
-            for slot in allocation["slots"]
-        }
-        primary_records = [
-            {**record, **slot_by_candidate[str(record["candidate_id"])]}
-            for record in primary
-        ]
-        manifest = write_phase_a_sample_manifest(outdir, {
-            "phase": "PHASE_A_POLUS",
-            "iteration": 0,
-            "sample_xyz": sample.resolve().relative_to(outdir.parent.resolve()).as_posix(),
-            "index_path": index.resolve().relative_to(outdir.parent.resolve()).as_posix(),
-            "n_select": int(n),
-            "n_frames": int(n),
-            "selected_indices": [
-                None if value is None else int(value) for value in selected_indices
-            ],
-            "descriptor": "rmsd_massweight",
-            "n_pool_frames": int(len(frames)),
-            "bootstrap_total_size": int(n),
-            "point_allocation": {
-                "manifest": allocation_path.resolve().relative_to(
-                    outdir.parent.resolve()
-                ).as_posix(),
-                "targets": dict(allocation["targets"]),
-                "primary": primary_records,
-                "reserve_frame_ids": reserve_indices,
-                "reserve_count": int(len(reserve)),
-            },
-            "reserve_after_bootstrap": int(len(reserve)),
-            "trajectory_sha256": trajectory_sha,
-            "source_pool_manifest": (
-                ".DATA/TRAJECTORY/pool.manifest.json"
-            ),
-        })
-        self.artefact_log.extend([str(sample), str(index), str(manifest)])
+        if return_code != 0:
+            raise BackendSubmissionError(
+                "dry-run Phase A bootstrap planning failed with code "
+                + str(return_code)
+            )
+        outdir = bootstrap_selection_dir(self.campaign_dir)
+        self.artefact_log.extend([
+            str(outdir / "selected.xyz"),
+            str(outdir / "selected_indices.dat"),
+            str(outdir / "PHASE_A_SAMPLE.json"),
+        ])
         return {}
 
     def _post_initial_gaussian(self, state) -> Dict[str, Any]:
@@ -1553,6 +1555,28 @@ class DryRunPhaseExecutor:
         committed iteration-000000 holds the initial diverse sample's stub
         PointDirectories.
         """
+        from . import input_staging as _stg
+
+        if _stg._model_bootstrap_context(self.campaign_dir) is not None:
+            staging, _n_tasks = _stg.stage_ferebus_inputs(
+                self.campaign_dir,
+                self.config,
+                0,
+                is_initial=True,
+            )
+            _stg.prepare_imported_model_bootstrap(staging)
+            from .live_executor import LiveBackendsPhaseExecutor
+
+            result = LiveBackendsPhaseExecutor._parse_ferebus_postprocess(
+                self,
+                state,
+                "INITIAL_FEREBUS",
+                [],
+            )
+            if result.failure_reason is not None:
+                raise BackendSubmissionError(result.failure_reason)
+            return dict(result.state_updates or {})
+
         v_train = self._versioning("reference_data")
         v_models = self._versioning("models")
         v_train.recover_dangling_staging()
@@ -2232,6 +2256,27 @@ class DryRunPhaseExecutor:
             )
             return {"models_version": int(repaired_version)}
         next_version = int(expected_next)
+        from . import input_staging as _stg
+
+        if _stg._model_bootstrap_context(self.campaign_dir) is not None:
+            staging, _n_tasks = _stg.stage_ferebus_inputs(
+                self.campaign_dir,
+                self.config,
+                next_version,
+                is_initial=False,
+            )
+            self._prepare_dry_staged_models(staging)
+            from .live_executor import LiveBackendsPhaseExecutor
+
+            result = LiveBackendsPhaseExecutor._parse_ferebus_postprocess(
+                self,
+                state,
+                "FEREBUS",
+                [],
+            )
+            if result.failure_reason is not None:
+                raise BackendSubmissionError(result.failure_reason)
+            return dict(result.state_updates or {})
         self._commit_dry_model_snapshot(next_version)
         return {"models_version": int(next_version)}
 

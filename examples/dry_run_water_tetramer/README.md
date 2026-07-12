@@ -25,14 +25,14 @@ Run from this directory.
 ```
 python -m ichor.hpc.active_learning.cli init \
     --campaign-dir . \
-    --source pool.xyz
+    --yes
 ```
 
-The CLI copies `pool.xyz` to `.DATA/TRAJECTORY/pool.xyz` and writes a
-SHA-pinned manifest. Output (your SHA will differ):
+The CLI validates the campaign-local `pool.xyz` and writes a SHA-pinned
+manifest. Output (your SHA will differ):
 
 ```
-Imported pool: ./.DATA/TRAJECTORY/pool.xyz (20 frames, 12 atoms, SHA e006ddc6...)
+Imported pool: ./pool.xyz (20 frames, 12 atoms, SHA e006ddc6...)
 ```
 
 ### 2. Start the daemon in dry-run mode
@@ -40,6 +40,7 @@ Imported pool: ./.DATA/TRAJECTORY/pool.xyz (20 frames, 12 atoms, SHA e006ddc6...
 ```
 python -m ichor.hpc.active_learning.cli start \
     --dry-run \
+    --foreground \
     --campaign-dir . \
     --max-ticks 200
 ```
@@ -79,7 +80,7 @@ like `expected_journal_tail.txt` (your timestamps + JobIDs will differ).
   `FEREBUS_TASK_ARTEFACTS.json` binds the exact models to the reference-data
   view and split rows; model/config/auxiliary files are colocated under
   `<property>/<atom>/`.
-- `BOOTSTRAP/selection/` and `BOOTSTRAP/allocation/` -- the one-off Phase-A
+- `.DATA/BOOTSTRAP/selection/` and `.DATA/BOOTSTRAP/allocation/` -- the one-off Phase-A
   selection and exact bootstrap allocation. Bootstrap alone uses iteration 0.
 - `ACTIVE_LEARNING/iteration-NNNNNN/` -- one immutable, hash-chained sampling
   iteration. Active iterations start at 1. Protocol snapshots, seed selection,
@@ -101,7 +102,7 @@ like `expected_journal_tail.txt` (your timestamps + JobIDs will differ).
 To wipe the dry-run output and start over:
 
 ```
-rm -rf .DATA BOOTSTRAP QM_REFERENCE_DATA TRAINED_MODELS ACTIVE_LEARNING
+rm -rf .DATA QM_REFERENCE_DATA TRAINED_MODELS ACTIVE_LEARNING
 ```
 
 Then repeat steps 1-3 above. The .gitignore already excludes these

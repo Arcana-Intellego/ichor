@@ -18,7 +18,7 @@ from .layout import (
 )
 
 
-POINT_ALLOCATION_SCHEMA_VERSION = 2
+POINT_ALLOCATION_SCHEMA_VERSION = 3
 POINT_ALLOCATION_FILENAME = "POINT_ALLOCATION.json"
 POINT_ALLOCATION_LOCK_FILENAME = "POINT_ALLOCATION.lock"
 VALID_CONTEXTS = frozenset({"bootstrap", "active"})
@@ -340,11 +340,11 @@ def _validate_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
                 raise ValueError(
                     "point-allocation attempt rounds must increase strictly per slot"
                 )
-            if bool(attempt.get("mandatory_anchor", False)) and (
-                attempt_index != 0 or attempt_round != 0 or split != "train"
+            if bool(attempt.get("mandatory_custom", False)) and (
+                attempt_index != 0 or attempt_round != 0
             ):
                 raise ValueError(
-                    "mandatory anchor attempts must be round-zero training candidates"
+                    "mandatory custom attempts must be round-zero candidates"
                 )
             previous_round = attempt_round
             attempt_locations[candidate_id] = (index, split, attempt)
@@ -404,16 +404,15 @@ def _validate_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
         )
     mandatory_failures = [
         attempt
-        for _candidate_id, (_slot_id, split, attempt) in attempt_locations.items()
-        if bool(attempt.get("mandatory_anchor", False))
+        for _candidate_id, (_slot_id, _split, attempt) in attempt_locations.items()
+        if bool(attempt.get("mandatory_custom", False))
         and str(attempt.get("status")) == "rejected"
-        and split == "train"
     ]
-    mandatory_flag = data.get("mandatory_anchor_failed", False)
+    mandatory_flag = data.get("mandatory_custom_failed", False)
     if not isinstance(mandatory_flag, bool):
-        raise ValueError("point-allocation mandatory_anchor_failed must be a boolean")
+        raise ValueError("point-allocation mandatory_custom_failed must be a boolean")
     if bool(mandatory_flag) != bool(mandatory_failures):
-        raise ValueError("point-allocation mandatory-anchor failure flag is inconsistent")
+        raise ValueError("point-allocation mandatory-custom failure flag is inconsistent")
     assignment_sha = str(data.get("slot_assignment_sha256") or "")
     expected_assignment_sha = slot_assignment_sha256(data)
     if assignment_sha != expected_assignment_sha:
@@ -512,7 +511,8 @@ def create_point_allocation(
     targets: Mapping[str, int],
     primary_candidates: Sequence[Mapping[str, Any]],
     reserve_candidates: Sequence[Mapping[str, Any]],
-    anchor_candidate_ids: Sequence[str] = (),
+    forced_candidate_splits: Optional[Mapping[str, str]] = None,
+    mandatory_candidate_ids: Sequence[str] = (),
 ) -> Dict[str, Any]:
     manifest = Path(path)
     primary = [_normalise_candidate(record) for record in primary_candidates]
@@ -526,23 +526,44 @@ def create_point_allocation(
     all_ids = [record["candidate_id"] for record in primary + reserve]
     if len(set(all_ids)) != len(all_ids):
         raise ValueError("point-allocation candidate IDs contain duplicates")
-    anchors = [str(value) for value in anchor_candidate_ids]
+    forced = {
+        str(candidate_id): str(split)
+        for candidate_id, split in (forced_candidate_splits or {}).items()
+    }
+    mandatory = [str(value) for value in mandatory_candidate_ids]
     primary_by_id = {record["candidate_id"]: record for record in primary}
-    if any(candidate_id not in primary_by_id for candidate_id in anchors):
-        raise ValueError("anchor candidate IDs must be primary candidates")
-    if len(anchors) > int(targets["train"]):
-        raise ValueError("anchor candidates exceed bootstrap training allocation")
+    if any(candidate_id not in primary_by_id for candidate_id in forced):
+        raise ValueError("forced candidate IDs must be primary candidates")
+    if any(candidate_id not in primary_by_id for candidate_id in mandatory):
+        raise ValueError("mandatory candidate IDs must be primary candidates")
+    if any(candidate_id not in forced for candidate_id in mandatory):
+        raise ValueError("mandatory candidates must have an authoritative split")
+    forced_counts = {split: 0 for split in VALID_SPLITS}
+    for split in forced.values():
+        if split not in VALID_SPLITS:
+            raise ValueError("forced candidate split is invalid: " + repr(split))
+        forced_counts[split] += 1
+    for split in VALID_SPLITS:
+        if forced_counts[split] > int(targets[split]):
+            raise ValueError("forced candidates exceed " + split + " allocation")
 
     slots = [
         {"slot_id": index, "split": split, "attempts": [], "accepted_attempt": None}
         for index, split in enumerate(_ordered_slot_splits(targets))
     ]
-    free_train = [slot for slot in slots if slot["split"] == "train"]
-    for candidate_id, slot in zip(anchors, free_train):
-        candidate = primary_by_id.pop(candidate_id)
-        slot["attempts"].append(
-            {**candidate, "round": 0, "status": "pending", "mandatory_anchor": True}
-        )
+    mandatory_set = set(mandatory)
+    for split in VALID_SPLITS:
+        split_slots = [slot for slot in slots if slot["split"] == split]
+        split_ids = [
+            record["candidate_id"] for record in primary
+            if forced.get(record["candidate_id"]) == split
+        ]
+        for candidate_id, slot in zip(split_ids, split_slots):
+            candidate = primary_by_id.pop(candidate_id)
+            attempt = {**candidate, "round": 0, "status": "pending"}
+            if candidate_id in mandatory_set:
+                attempt["mandatory_custom"] = True
+            slot["attempts"].append(attempt)
     available_slots = [slot for slot in slots if not slot["attempts"]]
     ordered_ids = _assignment_order(
         primary_by_id,
@@ -586,7 +607,7 @@ def create_point_allocation(
                 str(attempt["candidate_id"]): (
                     int(slot["slot_id"]),
                     str(slot["split"]),
-                    bool(attempt.get("mandatory_anchor", False)),
+                    bool(attempt.get("mandatory_custom", False)),
                 )
                 for slot in existing["slots"]
                 for attempt in list(slot.get("attempts") or [])
@@ -596,7 +617,7 @@ def create_point_allocation(
                 str(attempt["candidate_id"]): (
                     int(slot["slot_id"]),
                     str(slot["split"]),
-                    bool(attempt.get("mandatory_anchor", False)),
+                    bool(attempt.get("mandatory_custom", False)),
                 )
                 for slot in payload["slots"]
                 for attempt in list(slot.get("attempts") or [])
@@ -734,8 +755,8 @@ def record_quantum_results(
                 if slot.get("accepted_attempt") is not None:
                     raise ValueError("point-allocation slot already has an accepted attempt")
                 slot["accepted_attempt"] = int(attempt_index)
-            elif bool(attempt.get("mandatory_anchor", False)):
-                payload["mandatory_anchor_failed"] = True
+            elif bool(attempt.get("mandatory_custom", False)):
+                payload["mandatory_custom_failed"] = True
         return payload
 
     return _mutate_manifest(
@@ -756,8 +777,8 @@ def allocate_replacements(
     manifest = Path(path)
 
     def mutate(payload):
-        if bool(payload.get("mandatory_anchor_failed", False)):
-            raise ValueError("mandatory bootstrap anchor failed; replacement is forbidden")
+        if bool(payload.get("mandatory_custom_failed", False)):
+            raise ValueError("mandatory custom bootstrap geometry failed; replacement is forbidden")
         vacant = []
         for slot in payload["slots"]:
             if slot.get("accepted_attempt") is not None:

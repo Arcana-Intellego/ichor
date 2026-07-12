@@ -2,7 +2,7 @@
 # Generic first-live-iteration active-learning campaign for CSF3/CSF4.
 # Intended for a small validation run, not a long production campaign.
 
-schema_version: 10
+schema_version: 11
 
 # -------------------------------------------------------------------------
 # Required system-level identifiers
@@ -16,14 +16,13 @@ campaign:
   # This means: bootstrap initial training/model, then run one active-learning loop.
   max_iterations: 1
 
-  # Operator inputs are resolved relative to this campaign directory and then
-  # imported into immutable campaign-owned storage by `ichor-al-daemon init`.
-  source_path: pool.xyz
-  anchor_path: anchor.xyz
-
   # 1 conservative, 5 balanced/current default, 10 exploratory. Runtime trust
   # radii are normalised for molecular size and remain bounded by safety gates.
   sampling_aggressiveness: 5
+
+  # When true, init inspects the campaign-relative bootstrap/ directory for
+  # split-specific XYZ/CSV inputs or a model_krig training baseline.
+  custom_bootstrap: false
 
 # Keep first-live examples small enough to debug quickly. With the default
 # 20-frame smoke pool, 12 + 1 * 8 = 20 frames are required.
@@ -33,7 +32,6 @@ point_allocation:
   bootstrap_external_validation_size: 2
   batch_training_size: 3
   batch_internal_validation_size: 1
-  anchor: false
 
 # -------------------------------------------------------------------------
 # Active batch and seed selection

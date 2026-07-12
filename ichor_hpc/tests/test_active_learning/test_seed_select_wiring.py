@@ -104,6 +104,48 @@ def test_dry_seed_select_bootstraps_a_missing_trajectory_pool(tmp_path):
     assert picked[-1]["n_picked"] == 3
 
 
+def test_seed_selection_permanently_excludes_pool_matched_bootstrap_geometry(
+    tmp_path,
+):
+    cd = tmp_path / "campaign"
+    cd.mkdir()
+    pool = TrajectoryPool.import_from(FIXTURE, cd)
+    frame = pool.frame(0)
+    bootstrap = cd / "bootstrap"
+    bootstrap.mkdir()
+    lines = [str(len(frame)), "operator bootstrap frame 0"]
+    lines.extend(
+        str(atom.type)
+        + " "
+        + format(float(atom.x), ".16g")
+        + " "
+        + format(float(atom.y), ".16g")
+        + " "
+        + format(float(atom.z), ".16g")
+        for atom in frame
+    )
+    (bootstrap / "training_set_bootstrap.xyz").write_text(
+        "\n".join(lines) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    cfg = CampaignConfig()
+    cfg.campaign.custom_bootstrap = True
+    cfg.seed_selection.n_seeds_per_iteration = 3
+    cfg.anti_overlap.skip_training_seeds = False
+    ex = DryRunPhaseExecutor(campaign_dir=cd, config=cfg)
+
+    _state, _result = _select(ex)
+
+    payload = load_seeds_picked(
+        active_iteration_dir(cd, 1),
+        expected_iteration=1,
+    )
+    assert 0 not in payload["frame_ids"]
+    assert payload["bootstrap_forbidden_set_size"] == 1
+    assert payload["diagnostics"]["bootstrap_forbidden_set_size"] == 1
+
+
 def test_inline_seed_select_with_pool_writes_seeds_picked_json(tmp_path):
     cd = tmp_path / "campaign"
     cfg = CampaignConfig()

@@ -3,7 +3,7 @@
 Console entry point 'ichor-al-daemon' registered in
 'ichor_cli/setup.cfg'. Subcommands available:
 
-    start      Start the daemon in the foreground, or use --background to detach.
+    start      Start the live daemon detached by default; use --foreground to block.
     stop       Set shutdown_requested=true in state.json; running daemon picks
                it up on next tick.
     status     Print the current state snapshot.
@@ -28,6 +28,7 @@ import json
 import subprocess
 import sys
 import time
+import numpy as np
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -182,8 +183,8 @@ _BOOLEAN_SHORT_CLUSTERS = {
     "status": frozenset({"j", "v"}),
     "reconcile": frozenset({"a", "F"}),
     "journal": frozenset({"j", "r", "v"}),
-    "init": frozenset({"f", "O"}),
-    "import-pool": frozenset({"f", "O"}),
+    "init": frozenset({"f", "y"}),
+    "import-pool": frozenset({"f", "y"}),
 }
 
 
@@ -1219,7 +1220,8 @@ def _format_pool_feasibility_status(feasibility: Any) -> List[str]:
                 ("status", "ready" if feasibility.get("ok") else "blocked"),
                 ("frames available", feasibility.get("pool_n_frames")),
                 ("frames required", feasibility.get("required_pool_frames")),
-                ("bootstrap anchors", feasibility.get("bootstrap_anchor_count")),
+                ("bootstrap custom geometries", feasibility.get("bootstrap_custom_count")),
+                ("bootstrap model training rows", feasibility.get("bootstrap_model_training_count")),
                 (
                     "bootstrap pool frames",
                     feasibility.get("bootstrap_pool_frame_count"),
@@ -1524,6 +1526,9 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "effective_config_diff": "config diff recorded",
     "autotune_applied": "autotune applied",
     "trajectory_pool_imported": "trajectory pool imported",
+    "bootstrap_inputs_confirmed": "bootstrap inputs confirmed",
+    "model_bootstrap_staged": "imported models staged",
+    "model_bootstrap_committed": "imported models committed",
     "quantum_output_rejected": "QM output rejected",
     "quantum_quality_summary": "QM quality summarised",
     "ferebus_quality_summary": "FEREBUS quality summarised",
@@ -1613,6 +1618,8 @@ _JOURNAL_OK_EVENTS = {
     "reference_data_committed",
     "models_committed",
     "trajectory_pool_imported",
+    "bootstrap_inputs_confirmed",
+    "model_bootstrap_committed",
     "error_calibration_summary",
 }
 
@@ -1997,11 +2004,35 @@ def cmd_start(args: argparse.Namespace) -> int:
         )
         return 2
     if mode_count == 0:
-        print("no execution mode selected. Pick one of:", file=sys.stderr)
-        print("  --live          run against configured Slurm backends (requires sbatch + Gaussian + AIMAll + FEREBUS + ariadne)", file=sys.stderr)
-        print("  --dry-run       stub backends, real file-system flow", file=sys.stderr)
-        print("  --mock-ariadne  pure state-machine progression test", file=sys.stderr)
-        return 3
+        args.live = True
+    if bool(getattr(args, "foreground", False)) and bool(
+        getattr(args, "background", False)
+    ):
+        print("--foreground and --background are mutually exclusive", file=sys.stderr)
+        return 2
+    if bool(getattr(args, "foreground", False)) and (
+        getattr(args, "background_log", None)
+        or getattr(args, "background_pid", None)
+    ):
+        print(
+            "--background-log and --background-pid cannot be used with --foreground",
+            file=sys.stderr,
+        )
+        return 2
+    if os.environ.get(BACKGROUND_CHILD_ENV) == "1" and bool(
+        getattr(args, "background", False)
+    ):
+        print(
+            "--background is not allowed inside a background child process",
+            file=sys.stderr,
+        )
+        return 2
+    if os.environ.get(BACKGROUND_CHILD_ENV) == "1":
+        args.background = False
+    elif not bool(getattr(args, "foreground", False)) and not bool(
+        getattr(args, "background", False)
+    ):
+        args.background = True
 
     state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
     state_for_lock = None
@@ -2023,7 +2054,7 @@ def cmd_start(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             print(
-                "  ichor-al-daemon start --campaign-dir " + str(campaign) + " --live",
+                "  ichor-al-daemon start --campaign-dir " + str(campaign),
                 file=sys.stderr,
             )
             return 8
@@ -4220,7 +4251,7 @@ def _print_reconcile_applied_operator_report(
     if bool(contract_status.get("contract_ok")) and final_phase not in {CampaignPhase.HALTED, CampaignPhase.DONE}:
         _print_reconcile_list(
             "next",
-            ["ichor-al-daemon start --campaign-dir " + str(campaign) + " --live"],
+            ["ichor-al-daemon start --campaign-dir " + str(campaign)],
         )
     else:
         _print_reconcile_list(
@@ -5038,23 +5069,194 @@ def _resolve_init_campaign_dir(raw_campaign_dir: Optional[str]) -> Path:
 def _resolve_init_source(
     campaign: Path,
     raw_source: Optional[str],
-    configured_source: str,
 ) -> Path:
     from .operator_paths import resolve_campaign_input_path
 
     source = resolve_campaign_input_path(
         campaign,
-        raw_source if raw_source else configured_source,
+        raw_source if raw_source else "pool.xyz",
     )
     if not source.exists():
         raise FileNotFoundError(
             "source trajectory does not exist: "
             + str(source)
-            + ". Update campaign.source_path or pass --source PATH."
+            + ". Place pool.xyz in the campaign directory or pass --source PATH."
         )
     if not source.is_file():
         raise FileNotFoundError("source trajectory is not a file: " + str(source))
     return source
+
+
+def _read_pool_candidate(source: Path) -> tuple[List[Any], str]:
+    from ichor.core.files.xyz import Trajectory
+    from .versioning.manifest import sha256_file
+
+    if source.is_symlink():
+        raise ValueError("pool source refuses a symlink: " + str(source))
+    try:
+        trajectory = Trajectory(source)
+        trajectory.read()
+        frames = [frame.copy() for frame in trajectory]
+    except Exception as exc:
+        raise ValueError("pool source is unreadable: " + str(source)) from exc
+    if not frames:
+        raise ValueError("pool source contains no geometries: " + str(source))
+    expected = tuple(str(value) for value in frames[0].types_extended)
+    for index, frame in enumerate(frames):
+        observed = tuple(str(value) for value in frame.types_extended)
+        coordinates = np.asarray(frame.coordinates, dtype=float)
+        if observed != expected:
+            raise ValueError(
+                "pool frame " + str(index) + " atom order/type mismatch"
+            )
+        if coordinates.shape != (len(expected), 3) or not np.all(np.isfinite(coordinates)):
+            raise ValueError("pool frame " + str(index) + " has invalid coordinates")
+    return frames, sha256_file(source)
+
+
+def _prompt_bootstrap_alf(
+    split: str,
+    path: Path,
+    atom_names: Sequence[str],
+) -> Sequence[int]:
+    print("")
+    print("Detected bootstrap CSV: " + str(path))
+    print("Molecule atom order:")
+    for index, atom_name in enumerate(atom_names, start=1):
+        print("  " + str(index).rjust(3) + "  " + str(atom_name))
+    required = 2 if len(atom_names) == 2 else 3
+    print(
+        "Enter " + str(required) + " 1-based ALF atom numbers for " + split
+        + " (central, x-axis" + (", xy-plane" if required == 3 else "") + "):"
+    )
+    try:
+        raw = input("> ").strip()
+    except EOFError as exc:
+        raise ValueError(
+            "CSV bootstrap requires an ALF; provide bootstrap/alf.yaml for "
+            "non-interactive initialisation"
+        ) from exc
+    values = raw.split()
+    if len(values) != required:
+        raise ValueError(
+            "CSV bootstrap ALF must contain exactly " + str(required) + " integers"
+        )
+    try:
+        return [int(value) for value in values]
+    except ValueError as exc:
+        raise ValueError("CSV bootstrap ALF entries must be integers") from exc
+
+
+def _print_bootstrap_plan(plan: Any) -> None:
+    labels = {
+        "train": "Training",
+        "int_val": "Internal validation",
+        "ext_val": "External validation",
+    }
+    print("Bootstrap discovery complete")
+    print("")
+    print("  custom bootstrap: " + ("enabled" if plan.custom_enabled else "disabled"))
+    print("  pool SHA-256: " + str(plan.pool_sha256))
+    for split in ("train", "int_val", "ext_val"):
+        source = plan.sources.get(split)
+        print("")
+        print(labels[split] + ":")
+        if split == "train" and plan.model is not None:
+            print("  source: bootstrap/model_krig")
+            print("  model files: " + str(len(plan.model.files)))
+            print("  model rows: " + str(plan.model.training_count))
+            print("  atoms: " + ", ".join(str(value) for value in plan.model.atoms))
+            print(
+                "  properties: "
+                + ", ".join(str(value) for value in plan.model.properties)
+            )
+            print("  configured target: ignored")
+            print("  POLUS top-up: 0")
+            continue
+        print("  source: " + ("POLUS" if source is None else str(source.path)))
+        print("  supplied: " + str(0 if source is None else source.count))
+        print("  configured target: " + str(plan.configured_targets[split]))
+        print("  POLUS top-up: " + str(plan.polus_deficits[split]))
+        if source is not None and source.alf_zero_indexed is not None:
+            print(
+                "  ALF (1-based): "
+                + repr([int(value) + 1 for value in source.alf_zero_indexed])
+            )
+    print("")
+    print(
+        "Final planned allocation: training="
+        + str(plan.effective_training_count)
+        + ", internal_validation="
+        + str(plan.configured_targets["int_val"])
+        + ", external_validation="
+        + str(plan.configured_targets["ext_val"])
+    )
+
+
+def _confirm_bootstrap_plan(*, assume_yes: bool) -> bool:
+    if assume_yes:
+        print("Bootstrap plan accepted by --yes.")
+        return True
+    try:
+        response = input("Proceed? [y/N] ").strip().lower()
+    except EOFError:
+        return False
+    return response in {"y", "yes"}
+
+
+def _copy_pool_to_campaign(
+    source: Path,
+    campaign: Path,
+    *,
+    allow_replace: bool = False,
+) -> Path:
+    destination = campaign / "pool.xyz"
+    if destination.is_symlink():
+        raise ValueError(
+            "campaign pool destination must not be a symlink: "
+            + str(destination)
+        )
+    if source.resolve() == destination.resolve(strict=False):
+        return destination
+    from .versioning.manifest import sha256_file
+
+    if destination.is_file() and sha256_file(source) == sha256_file(destination):
+        return destination
+    if destination.exists() and not destination.is_file():
+        raise ValueError("campaign pool destination is not a regular file: " + str(destination))
+    if destination.is_file():
+        state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
+        stateful = stateful_campaign_artifacts(campaign)
+        manifest = campaign / ".DATA" / "TRAJECTORY" / "pool.manifest.json"
+        if state_path.is_file() or stateful:
+            raise ValueError(
+                "refusing to replace campaign pool.xyz after stateful daemon "
+                "artefacts exist; create a new campaign directory"
+            )
+        if manifest.is_file() and not allow_replace:
+            raise ValueError(
+                "refusing to replace an imported campaign pool without --force"
+            )
+    from .daemon.state import _fsync_parent_dir
+
+    try:
+        payload = source.read_bytes()
+    except OSError as exc:
+        raise ValueError("pool source is unreadable: " + str(source)) from exc
+    temporary = destination.with_name(
+        ".pool.xyz." + str(os.getpid()) + ".tmp"
+    )
+    try:
+        with temporary.open("wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+        _fsync_parent_dir(destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return destination
 
 
 def _import_pool_impl(args: argparse.Namespace, campaign: Path, source: Path) -> int:
@@ -5290,7 +5492,7 @@ def _bootstrap_fresh_campaign_state(
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    """Bootstrap campaign.yaml, daemon state, config lock, and trajectory pool."""
+    """Inspect, confirm, and atomically admit campaign bootstrap inputs."""
     try:
         campaign = _resolve_init_campaign_dir(getattr(args, "campaign_dir", None))
     except CampaignDirResolutionError as exc:
@@ -5307,6 +5509,12 @@ def cmd_init(args: argparse.Namespace) -> int:
         print("campaign.yaml initialisation failed: " + str(exc), file=sys.stderr)
         return 15
 
+    from .custom_bootstrap import (
+        BootstrapInputError,
+        commit_bootstrap_plan,
+        inspect_bootstrap_inputs,
+    )
+
     pool_summary: Dict[str, Any]
     raw_source = getattr(args, "source", None)
     source: Optional[Path] = None
@@ -5321,11 +5529,38 @@ def cmd_init(args: argparse.Namespace) -> int:
             source = _resolve_init_source(
                 campaign,
                 raw_source,
-                config.campaign.source_path,
             )
         except FileNotFoundError as exc:
             print(str(exc), file=sys.stderr)
             return 2
+
+    try:
+        if source is None:
+            from .acquisition.trajectory_pool import TrajectoryPool
+
+            existing = TrajectoryPool.load(campaign)
+            pool_frames = existing.to_atoms_list()
+            pool_sha = str(existing.sha256)
+        else:
+            pool_frames, pool_sha = _read_pool_candidate(source)
+        plan = inspect_bootstrap_inputs(
+            campaign,
+            config,
+            pool_frames,
+            pool_sha256=pool_sha,
+            alf_prompt=(
+                None if bool(getattr(args, "yes", False))
+                else _prompt_bootstrap_alf
+            ),
+        )
+    except (BootstrapInputError, ValueError, FileNotFoundError) as exc:
+        print("campaign bootstrap inspection failed: " + str(exc), file=sys.stderr)
+        return 18
+
+    _print_bootstrap_plan(plan)
+    if not _confirm_bootstrap_plan(assume_yes=bool(getattr(args, "yes", False))):
+        print("Campaign initialisation cancelled; no bootstrap plan was accepted.")
+        return 19
 
     if source is not None:
         state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
@@ -5335,45 +5570,18 @@ def cmd_init(args: argparse.Namespace) -> int:
             except CampaignBootstrapError as exc:
                 print("campaign bootstrap failed: " + str(exc), file=sys.stderr)
                 return 16
+        try:
+            source = _copy_pool_to_campaign(
+                source,
+                campaign,
+                allow_replace=bool(getattr(args, "force", False)),
+            )
+        except ValueError as exc:
+            print("trajectory import failed: " + str(exc), file=sys.stderr)
+            return 14
         import_rc = _import_pool_impl(args, campaign, source)
         if import_rc != 0:
             return import_rc
-
-    anchor_summary: Dict[str, Any] = {"status": "disabled"}
-    if bool(config.point_allocation.anchor):
-        from .bootstrap_anchor import (
-            import_anchor_source,
-            load_anchor_frames,
-            read_anchor_source_manifest,
-        )
-
-        anchor_source = getattr(args, "anchor_source", None) or config.campaign.anchor_path
-        try:
-            use_existing_anchor = bool(
-                getattr(args, "anchor_source", None) is None
-                and not bool(getattr(args, "force", False))
-                and (campaign / ".DATA" / "TRAJECTORY" / "anchor.xyz").is_file()
-            )
-            if use_existing_anchor:
-                anchor_summary = read_anchor_source_manifest(campaign)
-                anchor_summary["n_frames"] = len(load_anchor_frames(campaign))
-                anchor_summary["status"] = "existing"
-            else:
-                anchor_summary = import_anchor_source(
-                    campaign,
-                    anchor_source,
-                    overwrite=bool(getattr(args, "force", False)),
-                )
-                anchor_summary["status"] = "ok"
-        except Exception as exc:
-            print(
-                "campaign bootstrap anchor import failed: "
-                + type(exc).__name__
-                + ": "
-                + str(exc),
-                file=sys.stderr,
-            )
-            return 18
 
     try:
         pool_summary = _trajectory_pool_summary(campaign)
@@ -5386,11 +5594,44 @@ def cmd_init(args: argparse.Namespace) -> int:
         }
     feasibility_summary: Dict[str, Any] = {}
     if str(pool_summary.get("status")) == "ok":
-        feasibility_summary = _pool_feasibility_summary(campaign, config)
+        if str(pool_summary.get("sha256") or "") != str(plan.pool_sha256):
+            print(
+                "campaign bootstrap failed: imported pool SHA does not match the "
+                "confirmed bootstrap plan",
+                file=sys.stderr,
+            )
+            return 14
+        from .daemon.pool_feasibility import evaluate_pool_feasibility_manifest
+
+        feasibility_summary = evaluate_pool_feasibility_manifest(
+            int(pool_summary["frames"]),
+            config,
+            {
+                "effective_qm_targets": plan.effective_qm_targets,
+                "polus_deficits": dict(plan.polus_deficits),
+                "supplied_counts": plan.supplied_counts,
+                "excluded_pool_frame_ids": list(plan.excluded_pool_frame_ids),
+                "model": (
+                    None if plan.model is None else {
+                        "training_count": int(plan.model.training_count)
+                    }
+                ),
+            },
+        ).to_dict()
         if not bool(feasibility_summary.get("ok", False)):
             print("campaign bootstrap failed: trajectory pool is infeasible", file=sys.stderr)
             _print_pool_feasibility(feasibility_summary, file=sys.stderr)
             return 17
+
+    try:
+        bootstrap_manifest = commit_bootstrap_plan(plan)
+    except Exception as exc:
+        print(
+            "campaign bootstrap evidence commit failed: "
+            + type(exc).__name__ + ": " + str(exc),
+            file=sys.stderr,
+        )
+        return 18
 
     try:
         bootstrap = _bootstrap_fresh_campaign_state(campaign, config)
@@ -5399,18 +5640,32 @@ def cmd_init(args: argparse.Namespace) -> int:
         return 16
 
     state = bootstrap["state"]
+    try:
+        from .daemon.journal import append_event
+
+        append_event(
+            campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
+            "bootstrap_inputs_confirmed",
+            custom_bootstrap=bool(config.campaign.custom_bootstrap),
+            plan_identity_sha256=str(
+                bootstrap_manifest.get("plan_identity_sha256") or ""
+            ),
+            supplied_counts=dict(bootstrap_manifest.get("supplied_counts") or {}),
+            polus_deficits=dict(bootstrap_manifest.get("polus_deficits") or {}),
+            model_training_rows=int(
+                (bootstrap_manifest.get("model") or {}).get("training_count", 0)
+            ),
+        )
+    except Exception:
+        pass
     print("Campaign initialised")
     print("  campaign: " + str(campaign))
     print("  campaign.yaml: ok, schema v" + str(config.schema_version))
     _print_pool_summary(pool_summary)
     print(
-        "  bootstrap anchor: "
-        + str(anchor_summary.get("status"))
-        + (
-            ", " + str(anchor_summary.get("canonical_path"))
-            if anchor_summary.get("canonical_path")
-            else ""
-        )
+        "  bootstrap inputs: confirmed, identity="
+        + str(bootstrap_manifest.get("plan_identity_sha256", ""))[:12]
+        + "..."
     )
     if feasibility_summary:
         _print_pool_feasibility(feasibility_summary)
@@ -5425,7 +5680,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     if str(pool_summary.get("status")) == "ok":
         print("Next:")
         print("  ichor-al-daemon preflight --campaign-dir " + str(campaign))
-        print("  ichor-al-daemon start --campaign-dir " + str(campaign) + " --live")
+        print("  ichor-al-daemon start --campaign-dir " + str(campaign))
     else:
         print("Next:")
         print(
@@ -5459,6 +5714,10 @@ def cmd_config_check(args: argparse.Namespace) -> int:
         "campaign": {
             "system_name": str(config.campaign.system_name),
             "max_iterations": int(config.campaign.max_iterations),
+            "sampling_aggressiveness": int(
+                config.campaign.sampling_aggressiveness
+            ),
+            "custom_bootstrap": bool(config.campaign.custom_bootstrap),
         },
         "point_allocation": {
             "bootstrap_training_size": int(
@@ -5480,7 +5739,6 @@ def cmd_config_check(args: argparse.Namespace) -> int:
                 config.point_allocation.batch_internal_validation_size
             ),
             "batch_total_size": int(config.point_allocation.batch_total_size),
-            "anchor": bool(config.point_allocation.anchor),
         },
     }
     try:
@@ -5771,10 +6029,15 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
         required = pool.get("required_pool_frames")
         lines.append(_preflight_check_line("frames available", pool_ok, pool_n))
         lines.append(_preflight_check_line("frames required", pool_ok, required))
-        if pool.get("bootstrap_anchor_count") is not None:
+        if pool.get("bootstrap_custom_count") is not None:
             lines.append(
-                "  bootstrap anchors: "
-                + str(pool.get("bootstrap_anchor_count"))
+                "  bootstrap custom geometries: "
+                + str(pool.get("bootstrap_custom_count"))
+            )
+        if pool.get("bootstrap_model_training_count") is not None:
+            lines.append(
+                "  bootstrap model training rows: "
+                + str(pool.get("bootstrap_model_training_count"))
             )
         if pool.get("bootstrap_pool_frame_count") is not None:
             lines.append(
@@ -6004,7 +6267,8 @@ Examples:
             ),
         )
     def add_background_options(p):
-        p.add_argument(
+        process_group = p.add_mutually_exclusive_group()
+        process_group.add_argument(
             "-b",
             "--background",
             action="store_true",
@@ -6013,6 +6277,12 @@ Examples:
                 "command validates the campaign, writes a PID file, and appends logs "
                 "under .DATA/ACTIVE_LEARNING by default."
             ),
+        )
+        process_group.add_argument(
+            "-f",
+            "--foreground",
+            action="store_true",
+            help="Run in the invoking terminal instead of detaching.",
         )
         p.add_argument(
             "-o",
@@ -6037,15 +6307,16 @@ Examples:
         "start",
         help="Start the daemon.",
         description=(
-            "Start a campaign daemon. From inside a campaign directory, "
-            "--campaign-dir can be omitted."
+            "Start a campaign daemon. The default is --live --background. "
+            "From inside a campaign directory, --campaign-dir can be omitted."
         ),
         epilog=(
             "Examples:\n"
             "  ichor-al-daemon start -d -t 10\n"
-            "  ichor-al-daemon start -l\n"
+            "  ichor-al-daemon start\n"
             "  ichor-al-daemon start -lb\n"
-            "  ichor-al-daemon start -c ~/campaigns/water_001 --live"
+            "  ichor-al-daemon start --foreground\n"
+            "  ichor-al-daemon start -d -f -t 10"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -6333,17 +6604,8 @@ Examples:
             required=source_required,
             default=None,
             help=(
-                "One-run override for campaign.source_path. Relative paths are "
-                "resolved from the campaign directory."
-            ),
-        )
-        p.add_argument(
-            "--anchor-source",
-            default=None,
-            help=(
-                "One-run override for campaign.anchor_path. Used only when "
-                "point_allocation.anchor is true; relative paths are resolved "
-                "from the campaign directory."
+                "Copy this trajectory to <campaign>/pool.xyz before immutable "
+                "pool import. Without it, <campaign>/pool.xyz is required."
             ),
         )
         p.add_argument(
@@ -6352,22 +6614,31 @@ Examples:
             help="Overwrite an existing pool (DANGEROUS: invalidates every committed "
                  "iteration's frame-id provenance).",
         )
+        p.add_argument(
+            "-y",
+            "--yes",
+            action="store_true",
+            help=(
+                "Accept the validated bootstrap summary non-interactively. "
+                "CSV inputs still require bootstrap/alf.yaml."
+            ),
+        )
 
     p_init = sub.add_parser(
         "init",
         help="Bootstrap campaign.yaml, daemon state, config lock, and campaign inputs.",
         description=(
             "Initialise or populate campaign.yaml from the packaged template, "
-            "create the fresh daemon state/config lock when safe, and import "
-            "the operator trajectory into the campaign pool with a "
-            "SHA-pinned manifest. From inside a campaign directory, "
-            "--campaign-dir, --source, and --anchor-source can be omitted."
+            "inspect fixed campaign-relative pool/bootstrap inputs, require "
+            "operator confirmation, and create SHA-pinned daemon state and "
+            "manifests. From inside a campaign directory, --campaign-dir and "
+            "--source can be omitted."
         ),
         epilog=(
             "Examples:\n"
             "  ichor-al-daemon init\n"
             "  ichor-al-daemon init -c ~/campaigns/water_001 -s pool.xyz\n"
-            "  ichor-al-daemon start --campaign-dir ~/campaigns/water_001 --live"
+            "  ichor-al-daemon start --campaign-dir ~/campaigns/water_001"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

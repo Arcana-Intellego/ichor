@@ -18,7 +18,7 @@
 #    modes typically carry most of the force-error signal.
 #  * Everything else stays at the balanced defaults.
 
-schema_version: 10
+schema_version: 11
 
 acquisition:
   subspace:

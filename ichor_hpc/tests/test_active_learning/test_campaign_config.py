@@ -29,8 +29,8 @@ from ichor.hpc.active_learning.geometry_protocol import (
 )
 
 
-def test_schema_version_is_ten():
-    assert CONFIG_SCHEMA_VERSION == 10
+def test_schema_version_is_eleven():
+    assert CONFIG_SCHEMA_VERSION == 11
 
 
 def test_default_campaign_config_is_valid():
@@ -43,7 +43,7 @@ def test_default_campaign_config_is_valid():
     assert c.point_allocation.batch_training_size == 3
     assert c.point_allocation.batch_internal_validation_size == 1
     assert c.point_allocation.batch_total_size == 4
-    assert c.point_allocation.anchor is False
+    assert c.campaign.custom_bootstrap is False
     assert c.quality_gates.require_readable_aimall_geometry is True
     assert c.quality_gates.require_finite_iqa is True
     assert c.quality_gates.require_finite_integration_error is True
@@ -62,8 +62,6 @@ def test_default_campaign_config_is_valid():
     assert c.seed_selection.d_optimal_novelty_floor == 1.0e-12
     assert c.seed_selection.d_optimal_score_power == 1.0
     assert c.seed_selection.d_optimal_degenerate_policy == "score_backfill"
-    assert c.campaign.source_path == "pool.xyz"
-    assert c.campaign.anchor_path == "anchor.xyz"
     assert c.campaign.sampling_aggressiveness == 5
     assert c.geometry_novelty.enabled is True
     assert c.geometry_novelty.scale_source == "local_motion"
@@ -137,10 +135,10 @@ def test_point_allocation_external_validation_size_validated():
         CampaignConfig.from_dict(payload)
 
 
-def test_point_allocation_anchor_and_integer_sizes_are_validated():
+def test_custom_bootstrap_and_point_allocation_integer_sizes_are_validated():
     payload = CampaignConfig().to_dict()
-    payload["point_allocation"]["anchor"] = "yes"
-    with pytest.raises(ConfigValidationError, match="point_allocation.anchor"):
+    payload["campaign"]["custom_bootstrap"] = "yes"
+    with pytest.raises(ConfigValidationError, match="campaign.custom_bootstrap"):
         CampaignConfig.from_dict(payload)
     payload = CampaignConfig().to_dict()
     payload["point_allocation"]["bootstrap_training_size"] = 0
@@ -152,10 +150,10 @@ def test_point_allocation_anchor_and_integer_sizes_are_validated():
         CampaignConfig.from_dict(payload)
 
 
-def test_pre_v10_schema_is_rejected_without_migration():
+def test_pre_v11_schema_is_rejected_without_migration():
     payload = CampaignConfig().to_dict()
     payload["schema_version"] = 7
-    with pytest.raises(ConfigValidationError, match="requires schema_version 10"):
+    with pytest.raises(ConfigValidationError, match="requires schema_version 11"):
         CampaignConfig.from_dict(payload)
 
 
@@ -329,7 +327,7 @@ def test_schema_v3_resources_are_rejected_without_migration():
             "gaussian_link0_mem": "8GB",
         },
     }
-    with pytest.raises(ConfigValidationError, match="requires schema_version 10"):
+    with pytest.raises(ConfigValidationError, match="requires schema_version 11"):
         CampaignConfig.from_dict(payload)
 
 
@@ -577,7 +575,7 @@ def test_wrong_schema_version_rejected():
 
 
 @pytest.mark.parametrize("removed_block", ["trajectory_pool", "sampling_protocol"])
-def test_schema_ten_rejects_removed_top_level_blocks(removed_block):
+def test_schema_eleven_rejects_removed_top_level_blocks(removed_block):
     payload = CampaignConfig().to_dict()
     payload[removed_block] = {"legacy": True}
 
@@ -585,21 +583,37 @@ def test_schema_ten_rejects_removed_top_level_blocks(removed_block):
         CampaignConfig.from_dict(payload)
 
 
-def test_schema_ten_campaign_block_owns_operator_input_fields():
+def test_schema_eleven_campaign_block_owns_bootstrap_and_sampling_fields():
     payload = CampaignConfig().to_dict()
 
     assert set(payload["campaign"]) == {
         "system_name",
         "max_iterations",
-        "source_path",
-        "anchor_path",
+        "custom_bootstrap",
         "sampling_aggressiveness",
     }
     assert "trajectory_pool" not in payload
     assert "sampling_protocol" not in payload
 
 
-def test_all_shipped_campaign_templates_and_examples_parse_as_schema_ten():
+@pytest.mark.parametrize("legacy_field", ["source_path", "anchor_path"])
+def test_schema_eleven_rejects_removed_campaign_path_fields(legacy_field):
+    payload = CampaignConfig().to_dict()
+    payload["campaign"][legacy_field] = "legacy.xyz"
+
+    with pytest.raises(ConfigValidationError, match="unknown keys"):
+        CampaignConfig.from_dict(payload)
+
+
+def test_schema_eleven_rejects_removed_point_allocation_anchor():
+    payload = CampaignConfig().to_dict()
+    payload["point_allocation"]["anchor"] = True
+
+    with pytest.raises(ConfigValidationError, match="unknown keys"):
+        CampaignConfig.from_dict(payload)
+
+
+def test_all_shipped_campaign_templates_and_examples_parse_as_schema_eleven():
     repo_root = Path(__file__).resolve().parents[3]
     paths = [
         repo_root
@@ -615,7 +629,7 @@ def test_all_shipped_campaign_templates_and_examples_parse_as_schema_ten():
     assert paths
     for path in paths:
         config = CampaignConfig.from_yaml(path)
-        assert config.schema_version == 10, str(path)
+        assert config.schema_version == 11, str(path)
 
 
 def test_invalid_descriptor_rejected():
@@ -664,7 +678,7 @@ def test_schema_v4_geometry_payload_is_rejected_without_migration():
     }
     payload["acquisition"]["fullspace_confinement"]["rmsd_scale_ang"] = 99.0
 
-    with pytest.raises(ConfigValidationError, match="requires schema_version 10"):
+    with pytest.raises(ConfigValidationError, match="requires schema_version 11"):
         CampaignConfig.from_dict(payload)
 
 
@@ -689,7 +703,7 @@ def test_schema_v5_bootstrap_and_batch_fields_are_rejected():
         "cap": 30,
     }
 
-    with pytest.raises(ConfigValidationError, match="requires schema_version 10"):
+    with pytest.raises(ConfigValidationError, match="requires schema_version 11"):
         CampaignConfig.from_dict(payload)
 
 

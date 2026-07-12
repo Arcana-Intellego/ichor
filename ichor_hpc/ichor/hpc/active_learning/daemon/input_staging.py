@@ -17,12 +17,15 @@ Layout, matching what the postprocess parsers expect:
 from __future__ import annotations
 
 import json
+import csv
 import os  # stage_ferebus_inputs cd's into the staging dir to export csvs; this was missing and only bit on a live run
 import re
 import shutil
 import hashlib
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+import numpy as np
 
 from ichor.core.atoms import Atoms
 from ichor.core.files import PointDirectory
@@ -33,7 +36,7 @@ from .resource_solver import (
     resolve_phase_resources,
     validate_gaussian_link0_memory,
 )
-from .state import atomic_write_json
+from .state import atomic_write_json, atomic_write_text
 from ..layout import (
     COMMITTED_VERSION_NAME_WIDTH,
     TRAINED_MODELS_DIRNAME,
@@ -425,6 +428,24 @@ def read_ferebus_manifest(
     expected_keys = [
         (prop, atom) for prop in property_tokens for atom in atom_tokens
     ]
+    model_bootstrap = data.get("model_bootstrap")
+    if model_bootstrap is None:
+        manifest_historical_training_rows = 0
+    elif isinstance(model_bootstrap, dict):
+        try:
+            manifest_historical_training_rows = int(
+                model_bootstrap.get("historical_training_rows", -1)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "FEREBUS model-bootstrap training-row count is invalid"
+            ) from exc
+        if manifest_historical_training_rows <= 0:
+            raise ValueError(
+                "FEREBUS model-bootstrap training-row count is invalid"
+            )
+    else:
+        raise ValueError("FEREBUS model_bootstrap record is invalid")
     observed_keys = []
     for expected_index, task in enumerate(tasks, start=1):
         if not isinstance(task, dict):
@@ -509,14 +530,44 @@ def read_ferebus_manifest(
         if not isinstance(counts, dict):
             raise ValueError("FEREBUS task manifest row_counts is invalid")
         try:
+            historical_training_rows = int(
+                task.get("historical_training_rows", 0)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "FEREBUS task historical training-row count is invalid"
+            ) from exc
+        if historical_training_rows < 0:
+            raise ValueError(
+                "FEREBUS task historical training-row count is invalid"
+            )
+        if historical_training_rows != manifest_historical_training_rows:
+            raise ValueError(
+                "FEREBUS task historical training-row count disagrees with the manifest"
+            )
+        try:
+            historical_ids = [
+                int(value)
+                for value in task.get("historical_training_row_ids", [])
+            ]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "FEREBUS task historical training-row IDs are invalid"
+            ) from exc
+        if historical_ids != list(range(historical_training_rows)):
+            raise ValueError(
+                "FEREBUS task historical training-row IDs are invalid"
+            )
+        try:
             task_total = sum(
                 int(counts[split]) for split in ("train", "int_val", "ext_val")
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("FEREBUS task manifest row_counts is invalid") from exc
-        if task_total != n_reference_points:
+        if task_total != n_reference_points + historical_training_rows:
             raise ValueError(
-                "FEREBUS task row count does not match the reference-data view"
+                "FEREBUS task row count does not match the reference-data view "
+                "plus its historical model baseline"
             )
         row_ids = task.get("row_ids")
         if not isinstance(row_ids, dict):
@@ -529,7 +580,10 @@ def read_ferebus_manifest(
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("FEREBUS task manifest row_ids is invalid") from exc
         for split, indexes in split_rows.items():
-            if len(indexes) != int(counts[split]):
+            expected_index_count = int(counts[split]) - (
+                historical_training_rows if split == "train" else 0
+            )
+            if expected_index_count < 0 or len(indexes) != expected_index_count:
                 raise ValueError(
                     "FEREBUS task row_ids/count mismatch for " + split
                 )
@@ -779,7 +833,7 @@ def stage_gaussian_inputs(
                     for value in selected
                 ]
                 initial_seed_selection_origins = [
-                    "bootstrap_anchor" if value is None else "phase_a_polus"
+                    "custom_bootstrap" if value is None else "phase_a_polus"
                     for value in selected
                 ]
                 current_state = read_state(
@@ -1438,7 +1492,7 @@ def commit_reference_data_delta(
         )
         added_names.append(name)
 
-    allocation_relative = allocation_path.resolve().relative_to(campaign.resolve()).as_posix()
+    allocation_relative = allocation_path.relative_to(campaign).as_posix()
     payload = build_reference_data_version_payload(
         campaign_uid=str(allocation["campaign_uid"]),
         version=version,
@@ -1482,6 +1536,149 @@ def commit_initial_reference_data(campaign_dir) -> bool:
         iteration=0,
     )
     return bool(created)
+
+
+def _model_bootstrap_context(campaign: Path) -> Optional[Dict[str, Any]]:
+    """Return verified immutable model-bootstrap metadata, when configured."""
+    from ..custom_bootstrap import (
+        bootstrap_inputs_dir,
+        custom_bootstrap_manifest_path,
+        read_custom_bootstrap_manifest,
+    )
+
+    pointer = custom_bootstrap_manifest_path(campaign)
+    if not pointer.exists():
+        return None
+    if pointer.is_symlink() or not pointer.is_file():
+        raise ValueError("custom bootstrap manifest is not a regular file")
+    payload = read_custom_bootstrap_manifest(campaign)
+    model = payload.get("model")
+    if not isinstance(model, dict):
+        return None
+    root = bootstrap_inputs_dir(campaign)
+    model_manifest = root / "MODEL_BOOTSTRAP.json"
+    if not model_manifest.is_file() or model_manifest.is_symlink():
+        raise ValueError("model-bootstrap manifest is missing from immutable inputs")
+    if int(model.get("training_count", 0)) <= 0:
+        raise ValueError("model-bootstrap training count must be positive")
+    return {"root": root, "manifest_path": model_manifest, "model": model}
+
+
+def _load_model_bootstrap_tasks(
+    context: Mapping[str, Any],
+) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    from ichor.core.models import Model
+
+    root = Path(context["root"])
+    records = list(context["model"].get("files") or [])
+    tasks: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("model-bootstrap file record must be an object")
+        path = root / str(record.get("path") or "")
+        if not path.is_file() or path.is_symlink():
+            raise ValueError("model-bootstrap model is missing: " + str(path))
+        if sha256_file(path) != str(record.get("sha256") or ""):
+            raise ValueError("model-bootstrap model SHA mismatch: " + str(path))
+        model = Model(path)
+        key = (str(model.type), str(model.atom))
+        if key in tasks:
+            raise ValueError("duplicate model-bootstrap task: " + repr(key))
+        tasks[key] = {"model": model, "path": path, "record": record}
+    return tasks
+
+
+def _model_bootstrap_system_alf(
+    context: Mapping[str, Any],
+    task_models: Mapping[Tuple[str, str], Mapping[str, Any]],
+    properties: Sequence[str],
+) -> Dict[str, Any]:
+    from ichor.core.atoms import ALF
+
+    atoms = [str(value) for value in context["model"].get("atoms", [])]
+    if not atoms:
+        raise ValueError("model-bootstrap atom list is empty")
+    primary_property = "iqa" if "iqa" in properties else str(properties[0])
+    out: Dict[str, Any] = {}
+    for atom in atoms:
+        task = task_models.get((primary_property, atom))
+        if task is None:
+            raise ValueError("model-bootstrap lacks ALF task for " + atom)
+        values = [
+            int(value)
+            for value in getattr(task["model"], "ialf")
+            if value is not None
+        ]
+        if len(values) == 2:
+            out[atom] = ALF(values[0], values[1], None)
+        elif len(values) == 3:
+            out[atom] = ALF(values[0], values[1], values[2])
+        else:
+            raise ValueError("model-bootstrap ALF has an invalid length for " + atom)
+        for prop in properties:
+            other = task_models.get((str(prop), atom))
+            if other is None:
+                raise ValueError("model-bootstrap task is missing: " + str(prop) + "/" + atom)
+            other_values = tuple(
+                int(value)
+                for value in getattr(other["model"], "ialf")
+                if value is not None
+            )
+            if other_values != tuple(values):
+                raise ValueError("model-bootstrap properties disagree on ALF for " + atom)
+    return out
+
+
+def _prepend_model_bootstrap_training_rows(
+    csv_path: Path,
+    *,
+    atom: str,
+    properties: Sequence[str],
+    task_models: Mapping[Tuple[str, str], Mapping[str, Any]],
+) -> Tuple[int, str]:
+    """Prepend immutable per-task model rows to one generated training CSV."""
+    models = []
+    for prop in properties:
+        task = task_models.get((str(prop), str(atom)))
+        if task is None:
+            raise ValueError("model-bootstrap task is missing: " + str(prop) + "/" + str(atom))
+        models.append(task["model"])
+    reference_x = np.asarray(models[0].x, dtype=float)
+    for prop, model in zip(properties[1:], models[1:]):
+        if not np.allclose(
+            np.asarray(model.x, dtype=float),
+            reference_x,
+            rtol=1.0e-10,
+            atol=1.0e-10,
+        ):
+            raise ValueError(
+                "model-bootstrap feature rows disagree for " + str(prop) + "/" + str(atom)
+            )
+    with csv_path.open("r", encoding="utf-8", newline="") as handle:
+        existing = list(csv.reader(handle))
+    if not existing:
+        raise ValueError("generated FEREBUS training CSV is empty: " + str(csv_path))
+    feature_headers = ["f" + str(index) for index in range(1, reference_x.shape[1] + 1)]
+    expected_header = feature_headers + [str(prop) for prop in properties]
+    if [str(value).strip() for value in existing[0]] != expected_header:
+        raise ValueError(
+            "generated FEREBUS CSV header cannot accept model baseline: " + str(csv_path)
+        )
+    baseline_rows: List[List[str]] = []
+    target_arrays = [np.asarray(model.y, dtype=float).reshape(-1) for model in models]
+    for row_index, feature_row in enumerate(reference_x):
+        baseline_rows.append(
+            [format(float(value), ".17g") for value in feature_row]
+            + [format(float(values[row_index]), ".17g") for values in target_arrays]
+        )
+    temporary = csv_path.with_name("." + csv_path.name + ".baseline.tmp")
+    with temporary.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(expected_header)
+        writer.writerows(baseline_rows)
+        writer.writerows(existing[1:])
+    os.replace(temporary, csv_path)
+    return len(baseline_rows), sha256_file(csv_path)
 
 
 def stage_ferebus_inputs(
@@ -1544,12 +1741,26 @@ def stage_ferebus_inputs(
     forced_ferebus_splits = {
         entry.pointdir_name: entry.split for entry in view.entries
     }
-    # system ALF defines the per-atom local frame the features are built in.
-    system_alf = pd.alf_dict(calculate_alf_atom_sequence)
     f = config.ferebus
     properties = [str(p) for p in getattr(f, "properties", ["iqa"])]
     if not properties:
         raise ValueError("ferebus.properties must contain at least one property")
+    model_bootstrap = _model_bootstrap_context(campaign)
+    model_tasks = (
+        {} if model_bootstrap is None
+        else _load_model_bootstrap_tasks(model_bootstrap)
+    )
+    # Imported baselines must retain the ALFs used to encode their X rows.
+    # Ordinary campaigns continue to use ICHOR's deterministic sequence ALFs.
+    system_alf = (
+        pd.alf_dict(calculate_alf_atom_sequence)
+        if model_bootstrap is None
+        else _model_bootstrap_system_alf(
+            model_bootstrap,
+            model_tasks,
+            properties,
+        )
+    )
 
     # write one <atom>_train.csv per atom containing every configured target property.
     cwd = os.getcwd()
@@ -1572,7 +1783,6 @@ def stage_ferebus_inputs(
     from .ferebus_split_ledger import ensure_split_assignments
     from ..point_allocation import (
         allocation_manifest_sha256,
-        allocation_targets,
         point_allocation_path,
         read_point_allocation,
     )
@@ -1591,8 +1801,14 @@ def stage_ferebus_inputs(
             + str(allocation_path)
         )
     allocation_hash = allocation_manifest_sha256(allocation_path)
-    expected_new_counts = allocation_targets(config, allocation_context)
-    expected_new_counts.pop("total", None)
+    expected_new_counts = {
+        split: int((allocation_payload.get("targets") or {}).get(split, 0))
+        for split in ("train", "int_val", "ext_val")
+    }
+    historical_training_rows = (
+        0 if model_bootstrap is None
+        else int(model_bootstrap["model"].get("training_count", 0))
+    )
 
     split_ledger = ensure_split_assignments(
         campaign,
@@ -1603,6 +1819,7 @@ def stage_ferebus_inputs(
         pointdir_identity=pointdir_identities,
         forced_splits=forced_ferebus_splits,
         allocation_manifest_sha256=allocation_hash,
+        historical_training_rows=historical_training_rows,
     )
     ledger_row_ids = dict(split_ledger["row_ids"])
     atom_labels = []
@@ -1638,8 +1855,27 @@ def stage_ferebus_inputs(
             atom,
             properties,
             row_ids=ledger_row_ids,
+            allow_empty_splits=("train",) if historical_training_rows else (),
         )
         counts = dict(split["counts"])
+        if historical_training_rows:
+            for prop in properties:
+                train_csv = prop_dirs[prop] / (
+                    system + "_" + atom + "_TRAINING_SET.csv"
+                )
+                baseline_count, merged_hash = _prepend_model_bootstrap_training_rows(
+                    train_csv,
+                    atom=atom,
+                    properties=properties,
+                    task_models=model_tasks,
+                )
+                if baseline_count != historical_training_rows:
+                    raise ValueError(
+                        "model-bootstrap training-row count changed while staging"
+                    )
+                if not merged_hash:
+                    raise ValueError("model-bootstrap merged training CSV hash is empty")
+            counts["train"] = int(counts["train"]) + historical_training_rows
         atom_labels.append(atom)
         split_counts[atom] = counts
         row_ids_by_atom[atom] = dict(split["row_ids"])
@@ -1732,6 +1968,10 @@ def stage_ferebus_inputs(
                     ],
                     "row_counts": dict(split_counts[atom]),
                     "row_ids": dict(row_ids_by_atom[atom]),
+                    "historical_training_rows": int(historical_training_rows),
+                    "historical_training_row_ids": list(
+                        range(historical_training_rows)
+                    ),
                     "datasets": {
                         split: {
                             "path": ferebus_relative_path(staging, dataset_path),
@@ -1754,6 +1994,14 @@ def stage_ferebus_inputs(
             )
             task_index += 1
 
+    if model_bootstrap is not None:
+        copied_model_manifest = staging / "MODEL_BOOTSTRAP.json"
+        shutil.copy2(model_bootstrap["manifest_path"], copied_model_manifest)
+        if sha256_file(copied_model_manifest) != sha256_file(
+            model_bootstrap["manifest_path"]
+        ):
+            raise ValueError("model-bootstrap manifest copy verification failed")
+
     _write_ferebus_manifest(
         staging,
         {
@@ -1770,6 +2018,15 @@ def stage_ferebus_inputs(
             "n_atoms": int(n_atoms),
             "n_tasks": int(len(tasks)),
             "degenerate_property_stats": list(degenerate_property_stats),
+            "model_bootstrap": (
+                None if model_bootstrap is None else {
+                    "manifest": Path(model_bootstrap["manifest_path"]).resolve().relative_to(
+                        campaign.resolve()
+                    ).as_posix(),
+                    "manifest_sha256": sha256_file(model_bootstrap["manifest_path"]),
+                    "historical_training_rows": int(historical_training_rows),
+                }
+            ),
             "job_details": ferebus_relative_path(staging, job_details),
             "split_ledger": {
                 "path": Path(split_ledger["path"]).resolve().relative_to(
@@ -1792,3 +2049,90 @@ def stage_ferebus_inputs(
         },
     )
     return staging, len(tasks)
+
+
+def prepare_imported_model_bootstrap(staging_dir: Path) -> Dict[str, Any]:
+    """Materialise an imported model set as completed initial FEREBUS output.
+
+    The ordinary staging path has already generated the exact train/internal/
+    external CSV contract.  This helper only installs the operator-confirmed
+    models and copies those datasets into the per-task layout that pyferebus
+    would otherwise create.  It never retrains or rewrites a model.
+    """
+    staging = Path(staging_dir)
+    manifest = read_ferebus_manifest(staging)
+    model_binding = manifest.get("model_bootstrap")
+    if not isinstance(model_binding, dict):
+        raise ValueError("FEREBUS staging is not bound to an imported model set")
+    # Derive the campaign root from the immutable manifest path rather than
+    # relying on a caller-provided directory.
+    manifest_path_text = str(model_binding.get("manifest") or "")
+    if not manifest_path_text:
+        raise ValueError("model-bootstrap manifest binding is missing")
+    campaign = staging.parent.parent
+    context = _model_bootstrap_context(campaign)
+    if context is None:
+        raise ValueError("immutable model-bootstrap inputs are missing")
+    bound_manifest = Path(context["manifest_path"])
+    if bound_manifest.resolve().relative_to(campaign.resolve()).as_posix() != manifest_path_text:
+        raise ValueError("model-bootstrap manifest path binding mismatch")
+    if sha256_file(bound_manifest) != str(model_binding.get("manifest_sha256") or ""):
+        raise ValueError("model-bootstrap manifest SHA mismatch")
+    model_tasks = _load_model_bootstrap_tasks(context)
+
+    dataset_fields = (
+        "training_csv",
+        "int_validation_csv",
+        "ext_validation_csv",
+    )
+    for task in manifest.get("tasks", []):
+        prop = str(task["property"])
+        atom = str(task["atom"])
+        imported = model_tasks.get((prop, atom))
+        if imported is None:
+            raise ValueError("imported model task is missing: " + prop + "/" + atom)
+        model_destination = resolve_ferebus_task_path(
+            staging,
+            task["expected_model_path"],
+            "expected_model_path",
+        )
+        if model_destination.exists():
+            raise ValueError(
+                "refusing to overwrite an existing staged model: "
+                + str(model_destination)
+            )
+        model_destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(imported["path"], model_destination)
+        if sha256_file(model_destination) != sha256_file(imported["path"]):
+            raise ValueError("imported model copy verification failed: " + prop + "/" + atom)
+
+        for field in dataset_fields:
+            destination = resolve_ferebus_task_path(staging, task[field], field)
+            source = staging / prop / destination.name
+            if not source.is_file() or source.is_symlink():
+                raise ValueError("staged FEREBUS dataset is missing: " + str(source))
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            if sha256_file(destination) != sha256_file(source):
+                raise ValueError("FEREBUS dataset copy verification failed: " + str(destination))
+
+        config_path = resolve_ferebus_task_path(
+            staging,
+            task["config_path"],
+            "config_path",
+        )
+        atomic_write_text(
+            config_path,
+            "# Imported model bootstrap; no version-0 FEREBUS optimisation was run.\n"
+            + "system = " + str(manifest["system"]) + "\n"
+            + "property = " + prop + "\n"
+            + "atom = " + atom + "\n",
+        )
+
+    # Re-read with full dataset verification and validate the model parser
+    # contract before the caller evaluates held-out quality.
+    verified = read_ferebus_manifest(staging, verify_dataset_files=True)
+    from .model_contract import validate_ferebus_model_contract
+
+    validate_ferebus_model_contract(staging, committed=False)
+    return verified

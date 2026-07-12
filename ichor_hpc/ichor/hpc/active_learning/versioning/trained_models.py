@@ -553,6 +553,33 @@ def _validate_source_and_quality(
         ]
         for split in ("train", "int_val", "ext_val")
     }
+    model_bootstrap = source.get("model_bootstrap")
+    if model_bootstrap is None:
+        historical_training_rows = 0
+    elif isinstance(model_bootstrap, Mapping):
+        historical_training_rows = _safe_int(
+            model_bootstrap.get("historical_training_rows"),
+            "FEREBUS historical_training_rows",
+            minimum=1,
+        )
+        copied_model_manifest = root / "MODEL_BOOTSTRAP.json"
+        if not copied_model_manifest.is_file() or copied_model_manifest.is_symlink():
+            raise TrainedModelError(
+                "committed model-bootstrap manifest is missing"
+            )
+        if sha256_file(copied_model_manifest) != _safe_sha(
+            model_bootstrap.get("manifest_sha256"),
+            "model-bootstrap manifest SHA-256",
+        ):
+            raise TrainedModelError("model-bootstrap manifest SHA mismatch")
+    else:
+        raise TrainedModelError("FEREBUS model_bootstrap record is invalid")
+    expected_counts = {
+        split: len(rows) + (
+            historical_training_rows if split == "train" else 0
+        )
+        for split, rows in expected_split_rows.items()
+    }
     dataset_path_fields = {
         "train": "training_csv",
         "int_val": "int_validation_csv",
@@ -572,11 +599,28 @@ def _validate_source_and_quality(
             )
             for split in expected_split_rows
         }
-        expected_counts = {
-            split: len(rows) for split, rows in expected_split_rows.items()
-        }
         if observed_counts != expected_counts:
             raise TrainedModelError("FEREBUS task manifest split count mismatch")
+        if _safe_int(
+            task.get("historical_training_rows", 0),
+            "FEREBUS task historical_training_rows",
+            minimum=0,
+        ) != historical_training_rows:
+            raise TrainedModelError(
+                "FEREBUS task historical training-row count mismatch"
+            )
+        historical_ids = task.get("historical_training_row_ids", [])
+        if not isinstance(historical_ids, list) or [
+            _safe_int(
+                value,
+                "FEREBUS historical training-row index",
+                minimum=0,
+            )
+            for value in historical_ids
+        ] != list(range(historical_training_rows)):
+            raise TrainedModelError(
+                "FEREBUS task historical training-row IDs are invalid"
+            )
         row_ids = task.get("row_ids") or {}
         if not isinstance(row_ids, Mapping):
             raise TrainedModelError("FEREBUS task manifest split rows are invalid")
@@ -674,9 +718,6 @@ def _validate_source_and_quality(
             raise TrainedModelError(
                 task.property + "/" + task.atom + ":quality model SHA mismatch"
             )
-        expected_counts = {
-            split: len(rows) for split, rows in expected_split_rows.items()
-        }
         try:
             quality_counts = {
                 split: _safe_int(

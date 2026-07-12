@@ -42,7 +42,7 @@ def trained_models_dir(campaign_dir: Union[str, Path]) -> Path:
 
 
 def bootstrap_dir(campaign_dir: Union[str, Path]) -> Path:
-    return Path(campaign_dir) / BOOTSTRAP_DIRNAME
+    return Path(campaign_dir) / ".DATA" / BOOTSTRAP_DIRNAME
 
 
 def bootstrap_selection_dir(campaign_dir: Union[str, Path]) -> Path:
@@ -177,6 +177,7 @@ def reject_legacy_sampling_layout(campaign_dir: Union[str, Path]) -> None:
                 + str(legacy)
                 + qualifier
                 + "; start a fresh campaign using "
+                + ".DATA/"
                 + BOOTSTRAP_DIRNAME
                 + " and "
                 + ACTIVE_LEARNING_DIRNAME

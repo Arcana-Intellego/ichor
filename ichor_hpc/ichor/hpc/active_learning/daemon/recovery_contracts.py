@@ -1052,7 +1052,7 @@ def select_recovery_phase(
                 CampaignPhase.INITIAL_GAUSSIAN,
                 iteration,
                 "INITIAL_GAUSSIAN: valid Phase A sample exists without committed models",
-                "BOOTSTRAP/selection/SELECTION.json",
+                ".DATA/BOOTSTRAP/selection/SELECTION.json",
             )
         if (
             bool(last_phase_retryable)
@@ -1063,7 +1063,7 @@ def select_recovery_phase(
                 CampaignPhase.PHASE_A_POLUS,
                 iteration,
                 "PHASE_A_POLUS: retryable pre-bootstrap phase has a valid trajectory pool input",
-                ".DATA/TRAJECTORY/pool.xyz",
+                "pool.xyz",
             )
         if existing_loaded:
             try:
@@ -1075,7 +1075,7 @@ def select_recovery_phase(
                     CampaignPhase.PHASE_A_POLUS,
                     iteration,
                     "PHASE_A_POLUS: existing phase has a valid trajectory pool input",
-                    ".DATA/TRAJECTORY/pool.xyz",
+                    "pool.xyz",
                 )
         return None
 
@@ -1105,7 +1105,7 @@ def select_recovery_phase(
             CampaignPhase.SEED_SELECT,
             1,
             "SEED_SELECT: bootstrap reference data and models are committed",
-            "BOOTSTRAP/BOOTSTRAP_MANIFEST.json",
+            ".DATA/BOOTSTRAP/BOOTSTRAP_MANIFEST.json",
         )
 
     if reference_data_version == model_version and reference_data_version >= 1:
@@ -1169,7 +1169,7 @@ def select_recovery_phase(
             CampaignPhase.SEED_SELECT,
             iteration,
             "SEED_SELECT: coherent committed models and trajectory pool are ready",
-            ".DATA/TRAJECTORY/pool.xyz",
+            "pool.xyz",
         )
     return None
 

@@ -1,5 +1,6 @@
 """Tests for ichor.hpc.active_learning.acquisition.trajectory_pool (M9)."""
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -30,7 +31,7 @@ def test_fixture_exists():
 
 def test_import_from_writes_canonical_xyz_and_manifest(tmp_path):
     pool = TrajectoryPool.import_from(FIXTURE, tmp_path)
-    canonical = tmp_path / POOL_SUBDIR / POOL_XYZ_FILENAME
+    canonical = tmp_path / POOL_XYZ_FILENAME
     manifest_path = tmp_path / POOL_SUBDIR / POOL_MANIFEST_FILENAME
     assert canonical.is_file()
     assert manifest_path.is_file()
@@ -50,10 +51,32 @@ def test_imported_manifest_round_trips_through_disk(tmp_path):
     assert parsed.schema_version == POOL_SCHEMA_VERSION
 
 
+def test_load_rejects_manifest_bound_to_a_different_pool_path(tmp_path):
+    TrajectoryPool.import_from(FIXTURE, tmp_path)
+    manifest_path = tmp_path / POOL_SUBDIR / POOL_MANIFEST_FILENAME
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["canonical_path"] = str(tmp_path / "elsewhere.xyz")
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="canonical_path"):
+        TrajectoryPool.load(tmp_path)
+
+
 def test_import_refuses_overwrite_without_force(tmp_path):
     TrajectoryPool.import_from(FIXTURE, tmp_path)
     with pytest.raises(FileExistsError):
         TrajectoryPool.import_from(FIXTURE, tmp_path)
+
+
+def test_import_refuses_symlinked_source(tmp_path):
+    source = tmp_path / "linked-pool.xyz"
+    try:
+        os.symlink(FIXTURE, source)
+    except OSError:
+        pytest.skip("symlink creation is unavailable on this host")
+
+    with pytest.raises(ValueError, match="symlink"):
+        TrajectoryPool.import_from(source, tmp_path / "campaign")
 
 
 def test_import_overwrites_when_force_true(tmp_path):

@@ -355,6 +355,11 @@ def _ensure_live_trajectory_pool(campaign_dir):
 
 def _live_smoke_config(campaign_dir):
     from ichor.hpc.active_learning.config import CampaignConfig
+    from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
+    from ichor.hpc.active_learning.custom_bootstrap import (
+        commit_bootstrap_plan,
+        inspect_bootstrap_inputs,
+    )
 
     config = CampaignConfig(max_iterations=1, poll_interval_seconds=1)
     config.point_allocation.bootstrap_training_size = 1
@@ -365,6 +370,15 @@ def _live_smoke_config(campaign_dir):
     config.seed_selection.n_seeds_per_iteration = 2
     config.phase_b.descriptor = "rmsd_massweight"
     _ensure_live_trajectory_pool(campaign_dir)
+    pool = TrajectoryPool.load(campaign_dir)
+    commit_bootstrap_plan(
+        inspect_bootstrap_inputs(
+            campaign_dir,
+            config,
+            pool.to_atoms_list(),
+            pool_sha256=str(pool.sha256),
+        )
+    )
     return config
 
 

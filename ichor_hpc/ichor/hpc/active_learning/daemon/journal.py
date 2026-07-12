@@ -91,6 +91,9 @@ KNOWN_EVENT_TYPES = (
     "effective_config_diff",
     "autotune_applied",
     "trajectory_pool_imported",
+    "bootstrap_inputs_confirmed",
+    "model_bootstrap_staged",
+    "model_bootstrap_committed",
     "sacct_empty_timeout",
     # new additions II:
     "phase_succeeded_live",

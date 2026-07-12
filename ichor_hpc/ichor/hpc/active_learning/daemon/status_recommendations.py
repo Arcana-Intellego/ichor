@@ -297,13 +297,14 @@ def _halt_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusRecom
         else ""
     )
     upper = reason.upper()
-    if reason_code == "mandatory_anchor_failed":
+    if reason_code == "mandatory_custom_bootstrap_failed":
         return StatusRecommendation(
-            code="halted_mandatory_anchor_failed",
+            code="halted_mandatory_custom_bootstrap_failed",
             severity="blocked",
             primary=(
-                "inspect the failed anchor calculation; correct the anchor or "
-                "start a new campaign because mandatory anchors cannot be replaced"
+                "inspect the failed supplied bootstrap calculation; correct the "
+                "operator input or start a new campaign because mandatory custom "
+                "geometries cannot be replaced"
             ),
             why=_short_error(reason),
             command=_journal_cmd(campaign) + " --event-type halt --last-n 5",

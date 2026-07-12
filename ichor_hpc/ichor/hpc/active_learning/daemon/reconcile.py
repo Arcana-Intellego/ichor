@@ -206,10 +206,10 @@ def stateful_campaign_artifacts(campaign_dir: Union[str, Path]) -> List[str]:
     add_matches("QM_REFERENCE_DATA/iteration-*")
     add_matches("TRAINED_MODELS/iteration-*")
     add_matches(ACTIVE_LEARNING_DIRNAME + "/iteration-*")
-    add_matches(BOOTSTRAP_DIRNAME + "/selection/SELECTION.json")
-    add_matches(BOOTSTRAP_DIRNAME + "/selection/selected.xyz")
-    add_matches(BOOTSTRAP_DIRNAME + "/selection/selected_indices.dat")
-    add_matches(BOOTSTRAP_DIRNAME + "/allocation/POINT_ALLOCATION.json")
+    add_matches(".DATA/" + BOOTSTRAP_DIRNAME + "/selection/SELECTION.json")
+    add_matches(".DATA/" + BOOTSTRAP_DIRNAME + "/selection/selected.xyz")
+    add_matches(".DATA/" + BOOTSTRAP_DIRNAME + "/selection/selected_indices.dat")
+    add_matches(".DATA/" + BOOTSTRAP_DIRNAME + "/allocation/POINT_ALLOCATION.json")
     config_lock = campaign / ".DATA" / "ACTIVE_LEARNING" / "config_lock.json"
     pool_manifest = campaign / ".DATA" / "TRAJECTORY" / "pool.manifest.json"
     if config_lock.is_file() and not pool_manifest.is_file():

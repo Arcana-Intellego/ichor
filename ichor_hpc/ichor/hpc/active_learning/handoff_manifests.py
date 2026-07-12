@@ -19,6 +19,7 @@ from .layout import (
     active_phase_b_dir,
     active_seed_selection_dir,
     ariadne_seeds_dir,
+    bootstrap_selection_dir,
     parse_seed_directory_name,
 )
 
@@ -30,7 +31,7 @@ ARIADNE_BATCH_DECISION_SCHEMA_VERSION = 1
 ARIADNE_LANDING_AUDIT_FILENAME = "AUDIT.json"
 ARIADNE_LANDING_AUDIT_SCHEMA_VERSION = 2
 PHASE_A_SAMPLE_FILENAME = "SELECTION.json"
-PHASE_A_SAMPLE_SCHEMA_VERSION = 3
+PHASE_A_SAMPLE_SCHEMA_VERSION = 4
 PHASE_B_SELECTION_FILENAME = "SELECTION.json"
 PHASE_B_SELECTION_SCHEMA_VERSION = 3
 SEED_SELECTION_FILENAME = "SELECTION.json"
@@ -45,6 +46,22 @@ ARIADNE_TASK_MAP_SCHEMA_VERSION = 1
 
 class HandoffManifestError(ValueError):
     """Raised when a phase handoff manifest is missing or violates contract."""
+
+
+def _phase_a_campaign_root(selection_root: Any) -> Path:
+    resolved = Path(selection_root).resolve()
+    try:
+        campaign = resolved.parents[2]
+    except IndexError as exc:
+        raise HandoffManifestError(
+            "Phase A selection directory is outside the canonical campaign layout"
+        ) from exc
+    if bootstrap_selection_dir(campaign).resolve() != resolved:
+        raise HandoffManifestError(
+            "Phase A selection directory is outside .DATA/BOOTSTRAP/selection: "
+            + str(resolved)
+        )
+    return campaign
 
 
 def _ariadne_results_counts(payload: Dict[str, Any]) -> Tuple[int, int, int]:
@@ -1178,7 +1195,9 @@ def write_phase_a_sample_manifest(initial_dir: Any, payload: Dict[str, Any]) -> 
     path.parent.mkdir(parents=True, exist_ok=True)
     data = dict(payload)
     data["schema_version"] = PHASE_A_SAMPLE_SCHEMA_VERSION
-    root = path.parent.parent
+    selection_root = path.parent.resolve()
+    campaign = _phase_a_campaign_root(selection_root)
+    root = selection_root.parent
     from .point_allocation import read_point_allocation
     from .versioning.manifest import sha256_file
 
@@ -1217,7 +1236,6 @@ def write_phase_a_sample_manifest(initial_dir: Any, payload: Dict[str, Any]) -> 
     data["point_allocation"] = allocation_binding
     source_pool_raw = data.get("source_pool_manifest")
     if source_pool_raw:
-        campaign = root.parent
         source_pool = resolve_handoff_path(
             campaign,
             source_pool_raw,
@@ -1225,6 +1243,19 @@ def write_phase_a_sample_manifest(initial_dir: Any, payload: Dict[str, Any]) -> 
         )
         data["source_pool_manifest_size"] = int(source_pool.stat().st_size)
         data["source_pool_manifest_sha256"] = sha256_file(source_pool)
+    custom_bootstrap_raw = data.get("custom_bootstrap_manifest")
+    if custom_bootstrap_raw:
+        custom_bootstrap = resolve_handoff_path(
+            campaign,
+            custom_bootstrap_raw,
+            kind="Phase A custom-bootstrap manifest",
+        )
+        data["custom_bootstrap_manifest_size"] = int(
+            custom_bootstrap.stat().st_size
+        )
+        data["custom_bootstrap_manifest_sha256"] = sha256_file(
+            custom_bootstrap
+        )
     atomic_write_json(path, data)
     return path
 
@@ -1252,7 +1283,8 @@ def read_phase_a_sample_manifest(
     n_select = _required_int(data.get("n_select"), "Phase A n_select")
     if require_nonempty and n_select <= 0:
         raise HandoffManifestError("Phase A sample manifest n_select must be positive")
-    selection_root = Path(initial_dir)
+    selection_root = Path(initial_dir).resolve()
+    campaign = _phase_a_campaign_root(selection_root)
     root = selection_root.parent
     sample = resolve_handoff_path(
         root,
@@ -1299,11 +1331,11 @@ def read_phase_a_sample_manifest(
                 raise HandoffManifestError("Phase A selected_indices contains duplicates")
             seen.add(idx)
         expected_index_lines = []
-        anchor_number = 0
+        custom_number = 0
         for value in selected:
             if value is None:
-                expected_index_lines.append("anchor:" + str(anchor_number))
-                anchor_number += 1
+                expected_index_lines.append("custom:" + str(custom_number))
+                custom_number += 1
             else:
                 expected_index_lines.append(str(int(value)))
         observed_index_lines = index_path.read_text(encoding="utf-8").splitlines()
@@ -1375,7 +1407,6 @@ def read_phase_a_sample_manifest(
     allocation["manifest"] = str(allocation_manifest)
     source_pool_raw = data.get("source_pool_manifest")
     if source_pool_raw:
-        campaign = selection_root.parent.parent
         source_pool = resolve_handoff_path(
             campaign,
             source_pool_raw,
@@ -1390,6 +1421,26 @@ def read_phase_a_sample_manifest(
             source_pool
         ):
             raise HandoffManifestError("Phase A source pool hash mismatch")
+    custom_bootstrap_raw = data.get("custom_bootstrap_manifest")
+    if custom_bootstrap_raw:
+        custom_bootstrap = resolve_handoff_path(
+            campaign,
+            custom_bootstrap_raw,
+            kind="Phase A custom-bootstrap manifest",
+        )
+        if _required_int(
+            data.get("custom_bootstrap_manifest_size"),
+            "Phase A custom_bootstrap_manifest_size",
+        ) != int(custom_bootstrap.stat().st_size):
+            raise HandoffManifestError(
+                "Phase A custom-bootstrap manifest size mismatch"
+            )
+        if str(
+            data.get("custom_bootstrap_manifest_sha256") or ""
+        ) != sha256_file(custom_bootstrap):
+            raise HandoffManifestError(
+                "Phase A custom-bootstrap manifest hash mismatch"
+            )
     out = dict(data)
     out["n_select"] = n_select
     out["sample_xyz"] = str(sample)

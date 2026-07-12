@@ -208,8 +208,8 @@ def next_phase(current: CampaignPhase, iteration: int, max_iterations: int) -> T
 def _halt_reason_code(reason: str) -> str:
     text = str(reason)
     lower = text.lower()
-    if "mandatory bootstrap anchor failed" in lower:
-        return "mandatory_anchor_failed"
+    if "mandatory custom bootstrap" in lower:
+        return "mandatory_custom_bootstrap_failed"
     if "point-allocation reserve exhausted" in lower:
         return "replacement_reserve_exhausted"
     prefix = text.split(":", 1)[0].strip().lower()
@@ -218,10 +218,11 @@ def _halt_reason_code(reason: str) -> str:
 
 
 def _halt_recovery_action(reason_code: str) -> str:
-    if reason_code == "mandatory_anchor_failed":
+    if reason_code == "mandatory_custom_bootstrap_failed":
         return (
-            "inspect the failed anchor quantum output; correct the anchor or "
-            "start a new campaign because mandatory anchors cannot be replaced"
+            "inspect the failed supplied bootstrap quantum output; correct the "
+            "operator input or start a new campaign because mandatory custom "
+            "geometries cannot be replaced"
         )
     if reason_code == "replacement_reserve_exhausted":
         return (

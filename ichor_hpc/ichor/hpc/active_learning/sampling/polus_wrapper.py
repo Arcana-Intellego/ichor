@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -168,7 +168,7 @@ def _write_xyz_file(frames, path):
         out_lines.append("frame " + str(k))
         for atom in frame:
             out_lines.append(
-                "{symbol} {x:.6f} {y:.6f} {z:.6f}".format(
+                "{symbol} {x:.16g} {y:.16g} {z:.16g}".format(
                     symbol=atom.type, x=float(atom.x),
                     y=float(atom.y), z=float(atom.z),
                 )
@@ -179,11 +179,11 @@ def _write_xyz_file(frames, path):
 def _write_index_file(indices, path):
     """Write the per-line list of selected frame ids POLUS produces."""
     lines = []
-    anchor_counter = 0
+    custom_counter = 0
     for value in indices:
         if value is None:
-            lines.append("anchor:" + str(anchor_counter))
-            anchor_counter += 1
+            lines.append("custom:" + str(custom_counter))
+            custom_counter += 1
         else:
             lines.append(str(int(value)))
     Path(path).write_text(
@@ -481,7 +481,7 @@ def _phase_b_build_reserve(
     }
 
 
-def _run_phase_a(campaign, config):
+def _run_phase_a(campaign, config, *, campaign_uid: Optional[str] = None):
     """POLUS Phase-A: pick a diverse subsample from the imported
     trajectory pool to seed the campaign with initial training points.
 
@@ -512,36 +512,39 @@ def _run_phase_a(campaign, config):
         return 3
 
     try:
-        from ..bootstrap_anchor import (
-            plan_bootstrap_anchors,
-            write_bootstrap_anchor_manifest,
-        )
-        from ..daemon.pool_feasibility import require_pool_feasibility
+        from ..custom_bootstrap import load_committed_bootstrap_frames
 
-        anchor_plan, anchor_frames = plan_bootstrap_anchors(
-            campaign,
-            config,
-            pool_frames=frames,
+        custom_frames_by_split, bootstrap_manifest = load_committed_bootstrap_frames(
+            campaign
         )
-        feasibility = require_pool_feasibility(campaign, config)
     except Exception as exc:
         print(str(exc), file=_sys.stderr)
         return 3
 
-    n_select = int(anchor_plan.bootstrap_total_size)
-    pool_select = int(anchor_plan.pool_total_needed)
-    excluded_pool_ids = set(int(i) for i in anchor_plan.excluded_pool_frame_ids)
+    effective_targets = {
+        split: int(value)
+        for split, value in dict(bootstrap_manifest["effective_qm_targets"]).items()
+        if split in {"train", "int_val", "ext_val"}
+    }
+    effective_targets["total"] = sum(effective_targets.values())
+    deficits = {
+        split: int(value)
+        for split, value in dict(bootstrap_manifest["polus_deficits"]).items()
+    }
+    n_select = int(effective_targets["total"])
+    pool_select = int(sum(deficits.values()))
+    excluded_pool_ids = set(
+        int(i) for i in bootstrap_manifest.get("excluded_pool_frame_ids", [])
+    )
     candidate_pool_ids = [
         int(i) for i in range(len(frames)) if int(i) not in excluded_pool_ids
     ]
     if pool_select > len(candidate_pool_ids):
         print(
             "point_allocation_bootstrap_total_exceeds_pool: "
-            + "point_allocation.bootstrap_total_size="
+            + "effective bootstrap QM target="
             + str(n_select)
-            + ", point_allocation.anchor_count="
-            + str(int(anchor_plan.n_anchor))
-            + ", pool_needed_after_anchors="
+            + ", pool top-up needed="
             + str(pool_select)
             + ", available_pool_frames="
             + str(len(candidate_pool_ids)),
@@ -568,10 +571,28 @@ def _run_phase_a(campaign, config):
             distance_matrix_shape=(len(candidate_pool_ids), len(candidate_pool_ids)),
             descriptor_name=descriptor.name,
         )
-    selected_frames = list(anchor_frames) + [frames[i] for i in selected_pool_indices]
-    selected_indices = [None] * int(anchor_plan.n_anchor) + [
-        int(i) for i in selected_pool_indices
-    ]
+    selected_pool_by_split: Dict[str, List[int]] = {
+        split: [] for split in ("train", "int_val", "ext_val")
+    }
+    pool_cursor = 0
+    for split in ("train", "int_val", "ext_val"):
+        count = int(deficits[split])
+        selected_pool_by_split[split] = selected_pool_indices[
+            pool_cursor:pool_cursor + count
+        ]
+        pool_cursor += count
+    selected_frames: List[Atoms] = []
+    selected_indices: List[Optional[int]] = []
+    selected_origins: List[Tuple[str, str, Optional[int]]] = []
+    for split in ("train", "int_val", "ext_val"):
+        for custom_index, frame in enumerate(custom_frames_by_split[split]):
+            selected_frames.append(frame)
+            selected_indices.append(None)
+            selected_origins.append((split, "custom_bootstrap", int(custom_index)))
+        for frame_id in selected_pool_by_split[split]:
+            selected_frames.append(frames[frame_id])
+            selected_indices.append(int(frame_id))
+            selected_origins.append((split, "phase_a_polus", int(frame_id)))
 
     from ..layout import bootstrap_selection_dir
 
@@ -584,46 +605,56 @@ def _run_phase_a(campaign, config):
     try:
         from ..daemon.state import DEFAULT_STATE_FILENAME, read_state
         from ..point_allocation import (
-            allocation_targets,
             create_point_allocation,
             point_allocation_path,
             stable_candidate_id,
         )
 
-        state = read_state(
-            campaign / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
-        )
+        resolved_campaign_uid = str(campaign_uid or "").strip()
+        if not resolved_campaign_uid:
+            state = read_state(
+                campaign / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
+            )
+            resolved_campaign_uid = str(state.campaign_uid)
+        if not resolved_campaign_uid:
+            raise ValueError("Phase A requires a non-empty campaign UID")
         primary_candidates = []
-        anchor_candidate_ids = []
-        for anchor_index in range(int(anchor_plan.n_anchor)):
+        forced_candidate_splits = {}
+        mandatory_candidate_ids = []
+        for split, source, source_index in selected_origins:
+            identity = {
+                "source": source,
+                "split": split,
+                "source_index": source_index,
+                "bootstrap_identity": str(
+                    bootstrap_manifest.get("plan_identity_sha256") or ""
+                ),
+            }
             candidate_id = stable_candidate_id(
-                campaign_uid=str(state.campaign_uid),
+                campaign_uid=resolved_campaign_uid,
                 context="bootstrap",
                 iteration=0,
-                source_identity={"source": "anchor", "anchor_index": int(anchor_index)},
+                source_identity=identity,
             )
-            anchor_candidate_ids.append(candidate_id)
-            primary_candidates.append({
+            record = {
                 "candidate_id": candidate_id,
-                "source": "anchor",
-                "anchor_index": int(anchor_index),
-                "frame_id": None,
-            })
-        for frame_id in selected_pool_indices:
-            primary_candidates.append({
-                "candidate_id": stable_candidate_id(
-                    campaign_uid=str(state.campaign_uid),
-                    context="bootstrap",
-                    iteration=0,
-                    source_identity={"source": "phase_a_polus", "frame_id": int(frame_id)},
+                "source": source,
+                "bootstrap_split": split,
+                "frame_id": (
+                    int(source_index) if source == "phase_a_polus" else None
                 ),
-                "source": "phase_a_polus",
-                "frame_id": int(frame_id),
-            })
+                "custom_index": (
+                    int(source_index) if source == "custom_bootstrap" else None
+                ),
+            }
+            primary_candidates.append(record)
+            forced_candidate_splits[candidate_id] = split
+            if source == "custom_bootstrap":
+                mandatory_candidate_ids.append(candidate_id)
         reserve_candidates = [
             {
                 "candidate_id": stable_candidate_id(
-                    campaign_uid=str(state.campaign_uid),
+                    campaign_uid=resolved_campaign_uid,
                     context="bootstrap",
                     iteration=0,
                     source_identity={"source": "phase_a_reserve", "frame_id": int(frame_id)},
@@ -641,13 +672,14 @@ def _run_phase_a(campaign, config):
         )
         allocation = create_point_allocation(
             allocation_path,
-            campaign_uid=str(state.campaign_uid),
+            campaign_uid=resolved_campaign_uid,
             context="bootstrap",
             iteration=0,
-            targets=allocation_targets(config, "bootstrap"),
+            targets=effective_targets,
             primary_candidates=primary_candidates,
             reserve_candidates=reserve_candidates,
-            anchor_candidate_ids=anchor_candidate_ids,
+            forced_candidate_splits=forced_candidate_splits,
+            mandatory_candidate_ids=mandatory_candidate_ids,
         )
         slot_by_candidate = {
             str(slot["attempts"][0]["candidate_id"]): {
@@ -670,14 +702,19 @@ def _run_phase_a(campaign, config):
             file=_sys.stderr,
         )
         return 3
-    anchor_manifest_path = None
-    if bool(anchor_plan.enabled):
-        anchor_manifest_path = write_bootstrap_anchor_manifest(
-            campaign,
-            anchor_plan,
-            selected_pool_frame_ids=selected_pool_indices,
-            phase_a_sample_xyz=sample_path,
-            phase_a_index_path=index_path,
+    final_split_dir = campaign / ".DATA" / "TRAJECTORY" / "bootstrap" / "final"
+    final_split_dir.mkdir(parents=True, exist_ok=True)
+    for split in ("train", "int_val", "ext_val"):
+        final_frames = list(custom_frames_by_split[split]) + [
+            frames[index] for index in selected_pool_by_split[split]
+        ]
+        _write_xyz_file(
+            final_frames,
+            final_split_dir / ({
+                "train": "training_set_bootstrap.xyz",
+                "int_val": "internal_validation_set_bootstrap.xyz",
+                "ext_val": "external_validation_set_bootstrap.xyz",
+            }[split]),
         )
     write_phase_a_sample_manifest(outdir, {
         "phase": "PHASE_A_POLUS",
@@ -701,22 +738,23 @@ def _run_phase_a(campaign, config):
             "reserve_frame_ids": [int(value) for value in reserve_pool_indices],
             "reserve_count": int(len(reserve_pool_indices)),
         },
-        "bootstrap_anchor_enabled": bool(anchor_plan.enabled),
-        "bootstrap_anchor_count": int(anchor_plan.n_anchor),
+        "custom_bootstrap": bool(bootstrap_manifest.get("custom_bootstrap", False)),
+        "custom_bootstrap_manifest": (
+            campaign / ".DATA" / "ACTIVE_LEARNING" / "CUSTOM_BOOTSTRAP.json"
+        ).resolve().relative_to(campaign.resolve()).as_posix(),
+        "custom_bootstrap_counts": dict(bootstrap_manifest.get("supplied_counts") or {}),
         "bootstrap_pool_frame_count": int(pool_select),
-        "bootstrap_anchor_path": str(anchor_plan.anchor_path),
-        "bootstrap_anchor_manifest": (
-            None
-            if anchor_manifest_path is None
-            else anchor_manifest_path.resolve().relative_to(
-                outdir.parent.resolve()
-            ).as_posix()
-        ),
         "excluded_pool_frame_ids": [
-            int(i) for i in anchor_plan.excluded_pool_frame_ids
+            int(i) for i in bootstrap_manifest.get("excluded_pool_frame_ids", [])
         ],
-        "reserve_after_bootstrap": int(feasibility.reserve_after_bootstrap),
-        "pool_feasibility": feasibility.to_dict(),
+        "reserve_after_bootstrap": int(len(candidate_pool_ids) - pool_select),
+        "pool_feasibility": {
+            "ok": True,
+            "pool_frames": int(len(frames)),
+            "bootstrap_pool_needed": int(pool_select),
+            "excluded_pool_frame_count": int(len(excluded_pool_ids)),
+            "reserve_after_bootstrap": int(len(candidate_pool_ids) - pool_select),
+        },
         "trajectory_sha256": str(pool.sha256),
         "source_pool_manifest": (campaign / POOL_SUBDIR / POOL_MANIFEST_FILENAME).resolve().relative_to(
             campaign.resolve()

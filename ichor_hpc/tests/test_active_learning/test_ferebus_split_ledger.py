@@ -61,6 +61,31 @@ def test_initial_split_ledger_uses_exact_allocation_counts(tmp_path):
     assert bootstrap["pointdirs"] == names[8:10]
 
 
+def test_model_bootstrap_allows_zero_new_training_rows_and_tracks_baseline(tmp_path):
+    names = _names(4)
+    counts = {"train": 0, "int_val": 2, "ext_val": 2}
+    identities = {
+        name: format(index + 1, "064x") for index, name in enumerate(names)
+    }
+    result = ensure_split_assignments(
+        tmp_path,
+        names,
+        reference_data_version=0,
+        reference_data_view_sha256="1" * 64,
+        expected_new_counts=counts,
+        forced_splits=_forced(names, counts),
+        pointdir_identity=identities,
+        allocation_manifest_sha256="a" * 64,
+        historical_training_rows=25,
+    )
+
+    assert result["counts"] == counts
+    assert result["historical_training_rows"] == 25
+    assert result["row_ids"]["train"] == []
+    payload = json.loads(ledger_path(tmp_path).read_text(encoding="utf-8"))
+    assert payload["historical_training_rows"] == 25
+
+
 def test_existing_assignments_never_change_and_new_version_is_exact(tmp_path):
     first_names = _names(10)
     first_counts = {"train": 6, "int_val": 2, "ext_val": 2}

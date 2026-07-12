@@ -219,11 +219,12 @@ def test_dry_run_cli_drives_campaign_to_done(tmp_path):
         encoding="utf-8",
         newline="\n",
     )
-    assert cli_main(["init", "--campaign-dir", str(campaign)]) == 0
+    assert cli_main(["init", "--campaign-dir", str(campaign), "--yes"]) == 0
     rc = cli_main([
         "start",
         "--campaign-dir", str(campaign),
         "--dry-run",
+        "--foreground",
         "--poll-interval", "1",
         "--max-ticks", "500",
     ])

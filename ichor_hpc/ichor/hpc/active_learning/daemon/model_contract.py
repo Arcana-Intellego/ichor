@@ -372,6 +372,7 @@ def validate_ferebus_model_contract(
             raise ModelContractError("model_file_empty")
         model_paths.append((task, model_path))
 
+    parsed_models: Dict[Tuple[str, str], Any] = {}
     for task, model_path in model_paths:
         declared_ntrain = _declared_ntrain(model_path)
         if declared_ntrain is not None:
@@ -379,6 +380,7 @@ def validate_ferebus_model_contract(
         try:
             model = Model(model_path)
             _validate_model_object(model, model_path, task, system)
+            parsed_models[task.key] = model
         except ModelContractError:
             raise
         except Exception as exc:
@@ -390,6 +392,81 @@ def validate_ferebus_model_contract(
                 + ": "
                 + str(exc)
             ) from exc
+
+    model_bootstrap = manifest.get("model_bootstrap")
+    if isinstance(model_bootstrap, Mapping):
+        import json
+
+        from ..versioning.manifest import sha256_file
+
+        copied_manifest = root / "MODEL_BOOTSTRAP.json"
+        if copied_manifest.is_symlink() or not copied_manifest.is_file():
+            raise ModelContractError("model_bootstrap_manifest_missing")
+        if sha256_file(copied_manifest) != str(
+            model_bootstrap.get("manifest_sha256") or ""
+        ):
+            raise ModelContractError("model_bootstrap_manifest_sha_mismatch")
+        try:
+            bootstrap_payload = json.loads(
+                copied_manifest.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError) as exc:
+            raise ModelContractError(
+                "model_bootstrap_manifest_unreadable"
+            ) from exc
+        if not isinstance(bootstrap_payload, Mapping):
+            raise ModelContractError("model_bootstrap_manifest_invalid")
+        historical_rows = int(
+            model_bootstrap.get("historical_training_rows", -1)
+        )
+        records = bootstrap_payload.get("files")
+        if historical_rows <= 0 or not isinstance(records, list):
+            raise ModelContractError("model_bootstrap_manifest_invalid")
+        campaign = root.parent.parent
+        immutable_root = (
+            campaign / ".DATA" / "ACTIVE_LEARNING" / "bootstrap_inputs"
+        )
+        baseline_by_key: Dict[Tuple[str, str], Any] = {}
+        for record in records:
+            if not isinstance(record, Mapping):
+                raise ModelContractError("model_bootstrap_file_record_invalid")
+            key = (str(record.get("property")), str(record.get("atom")))
+            source = immutable_root / str(record.get("path") or "")
+            try:
+                source.resolve(strict=False).relative_to(immutable_root.resolve())
+            except ValueError as exc:
+                raise ModelContractError("model_bootstrap_path_escapes_inputs") from exc
+            if source.is_symlink() or not source.is_file():
+                raise ModelContractError("model_bootstrap_source_missing:" + repr(key))
+            if sha256_file(source) != str(record.get("sha256") or ""):
+                raise ModelContractError("model_bootstrap_source_sha_mismatch:" + repr(key))
+            if key in baseline_by_key:
+                raise ModelContractError("model_bootstrap_duplicate_task:" + repr(key))
+            baseline_by_key[key] = Model(source)
+        if set(baseline_by_key) != set(parsed_models):
+            raise ModelContractError("model_bootstrap_task_coverage_mismatch")
+        for key, trained in parsed_models.items():
+            baseline = baseline_by_key[key]
+            baseline_x = np.asarray(baseline.x, dtype=float)
+            baseline_y = np.asarray(baseline.y, dtype=float).reshape(-1)
+            trained_x = np.asarray(trained.x, dtype=float)
+            trained_y = np.asarray(trained.y, dtype=float).reshape(-1)
+            if baseline_x.shape[0] != historical_rows or baseline_y.size != historical_rows:
+                raise ModelContractError("model_bootstrap_row_count_mismatch:" + repr(key))
+            if trained_x.shape[0] < historical_rows or trained_y.size < historical_rows:
+                raise ModelContractError("model_bootstrap_prefix_missing:" + repr(key))
+            if not np.allclose(
+                trained_x[:historical_rows],
+                baseline_x,
+                rtol=1.0e-12,
+                atol=1.0e-12,
+            ) or not np.allclose(
+                trained_y[:historical_rows],
+                baseline_y,
+                rtol=1.0e-12,
+                atol=1.0e-12,
+            ):
+                raise ModelContractError("model_bootstrap_prefix_changed:" + repr(key))
 
     actual_models = {p.resolve() for p in root.rglob("*.model")}
     extra_models = actual_models - expected_models

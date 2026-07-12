@@ -7,8 +7,8 @@ transitively prove descendance from.
 
 Layout on disk under <campaign_dir>:
 
+    pool.xyz                    # canonical operator trajectory
     .DATA/TRAJECTORY/
-        pool.xyz                # canonical copy of the operator MD trajectory
         pool.manifest.json      # SHA + n_frames + atom_types + masses + imported_iso
 
 Frame IDs are the stable load-order positions in the canonical pool.xyz,
@@ -70,7 +70,7 @@ class TrajectoryPoolManifest:
     """
 
     source_path: str          # original path; recorded but not authoritative
-    canonical_path: str       #<campaign>/.DATA/TRAJECTORY/pool.xyz
+    canonical_path: str       # <campaign>/pool.xyz
     sha256: str               #of the canonical file
     n_frames: int
     natoms: int
@@ -195,23 +195,41 @@ class TrajectoryPool:
         frames are useful.
         """
         source = Path(source)
+        if source.is_symlink():
+            raise ValueError("trajectory source must not be a symlink: " + str(source))
         if not source.is_file():
             raise FileNotFoundError("trajectory source does not exist: " + str(source))
         campaign_dir = Path(campaign_dir)
         target_dir = campaign_dir / POOL_SUBDIR
         manifest_path = target_dir / POOL_MANIFEST_FILENAME
-        canonical_path = target_dir / POOL_XYZ_FILENAME
+        canonical_path = campaign_dir / POOL_XYZ_FILENAME
+        if manifest_path.is_symlink():
+            raise ValueError("pool manifest must not be a symlink: " + str(manifest_path))
+        if canonical_path.is_symlink():
+            raise ValueError("campaign pool must not be a symlink: " + str(canonical_path))
         if manifest_path.exists() and not overwrite:
             raise FileExistsError(
                 "pool manifest already exists at " + str(manifest_path)
                 + " -- refusing to overwrite. Start a new campaign or pass overwrite=True."
             )
         target_dir.mkdir(parents=True, exist_ok=True)
-        # Write to a temp path and atomically rename, so a crash mid-write
-        # cannot leave the manifest pinning a half-written pool.xyz.
-        tmp_canonical = canonical_path.with_name(canonical_path.name + ".tmp")
-        shutil.copyfile(source, tmp_canonical)
-        os.replace(str(tmp_canonical), str(canonical_path))
+        source_is_canonical = source.resolve() == canonical_path.resolve(strict=False)
+        if not source_is_canonical:
+            if canonical_path.exists() and not overwrite:
+                raise FileExistsError(
+                    "campaign pool already exists at "
+                    + str(canonical_path)
+                    + " -- refusing to overwrite"
+                )
+            # Write to a temporary path and atomically rename, so a crash
+            # cannot leave the manifest pinning a half-written pool.xyz.
+            tmp_canonical = canonical_path.with_name(canonical_path.name + ".tmp")
+            try:
+                shutil.copyfile(source, tmp_canonical)
+                os.replace(str(tmp_canonical), str(canonical_path))
+            finally:
+                if tmp_canonical.exists():
+                    tmp_canonical.unlink()
         sha = sha256_file(canonical_path)
         traj = Trajectory(canonical_path)
         traj.read()
@@ -231,7 +249,7 @@ class TrajectoryPool:
                 )
         manifest = TrajectoryPoolManifest(
             source_path=str(source.resolve()),
-            canonical_path=str(canonical_path),
+            canonical_path=str(canonical_path.resolve()),
             sha256=sha,
             n_frames=len(atoms_list),
             natoms=len(head),
@@ -244,12 +262,17 @@ class TrajectoryPool:
 
     @classmethod
     def load(cls, campaign_dir: Union[str, Path]) -> "TrajectoryPool":
-        """Load the pool from <campaign_dir>/.DATA/TRAJECTORY/. Re-verifies
-        the SHA-256 of the canonical copy against the manifest and raises
+        """Load ``<campaign_dir>/pool.xyz`` using its daemon manifest.
+
+        Re-verifies the SHA-256 of the canonical pool against the manifest and raises
         if drift is detected (someone touched the file under us)."""
         campaign_dir = Path(campaign_dir)
         manifest_path = campaign_dir / POOL_SUBDIR / POOL_MANIFEST_FILENAME
-        canonical_path = campaign_dir / POOL_SUBDIR / POOL_XYZ_FILENAME
+        canonical_path = campaign_dir / POOL_XYZ_FILENAME
+        if manifest_path.is_symlink():
+            raise RuntimeError("pool manifest must not be a symlink: " + str(manifest_path))
+        if canonical_path.is_symlink():
+            raise RuntimeError("canonical pool xyz must not be a symlink: " + str(canonical_path))
         if not manifest_path.is_file():
             raise FileNotFoundError("pool manifest not found at " + str(manifest_path))
         if not canonical_path.is_file():
@@ -257,6 +280,11 @@ class TrajectoryPool:
         with open(manifest_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         manifest = TrajectoryPoolManifest.from_dict(data)
+        if Path(manifest.canonical_path).resolve() != canonical_path.resolve():
+            raise RuntimeError(
+                "pool manifest canonical_path does not identify campaign pool.xyz: "
+                + str(manifest.canonical_path)
+            )
         on_disk_sha = sha256_file(canonical_path)
         if on_disk_sha != manifest.sha256:
             raise RuntimeError(

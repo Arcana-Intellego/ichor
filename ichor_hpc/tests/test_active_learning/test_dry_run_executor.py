@@ -87,7 +87,7 @@ def test_executor_creates_canonical_subdirs(tmp_path):
     base = tmp_path / "campaign"
     assert (base / "QM_REFERENCE_DATA").is_dir()
     assert (base / "TRAINED_MODELS").is_dir()
-    assert (base / "BOOTSTRAP").is_dir()
+    assert (base / ".DATA" / "BOOTSTRAP").is_dir()
     assert (base / "ACTIVE_LEARNING").is_dir()
     assert (base / ".DATA" / "SCRIPTS").is_dir()
 

@@ -11,7 +11,7 @@ from .state import atomic_write_json
 
 FEREBUS_SPLIT_LEDGER_FILENAME = "ferebus_split_assignments.json"
 BOOTSTRAP_EXTERNAL_VALIDATION_FILENAME = "bootstrap_external_validation.json"
-FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION = 5
+FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION = 6
 _LOCK_FILENAME = "ferebus_split_assignments.lock"
 _SPLITS = ("train", "int_val", "ext_val")
 
@@ -48,6 +48,7 @@ def _empty_payload() -> Dict[str, Any]:
     return {
         "schema_version": FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION,
         "allocation_policy": "exact_per_reference_data_version",
+        "historical_training_rows": 0,
         "assignments": {},
         "version_allocations": {},
     }
@@ -64,7 +65,7 @@ def _load(path: Path) -> Dict[str, Any]:
         raise ValueError("FEREBUS split ledger must be a JSON object: " + str(path))
     if int(data.get("schema_version", -1)) != FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION:
         raise ValueError(
-            "unsupported FEREBUS split ledger schema; schema 5 is required: "
+            "unsupported FEREBUS split ledger schema; schema 6 is required: "
             + str(path)
         )
     if str(data.get("allocation_policy")) != "exact_per_reference_data_version":
@@ -96,8 +97,6 @@ def _normalise_expected(expected_counts: Mapping[str, Any]) -> Dict[str, int]:
         if value < 0:
             raise ValueError("expected FEREBUS split count must be >= 0 for " + split)
         counts[split] = value
-    if counts["train"] <= 0:
-        raise ValueError("every FEREBUS version must add training rows")
     return counts
 
 
@@ -111,6 +110,7 @@ def ensure_split_assignments(
     pointdir_identity: Optional[Mapping[str, str]] = None,
     forced_splits: Optional[Mapping[str, str]] = None,
     allocation_manifest_sha256: Optional[str] = None,
+    historical_training_rows: int = 0,
 ) -> Dict[str, Any]:
     """Assign only the new pointdirs for one version using exact split quotas."""
     campaign = Path(campaign_dir)
@@ -142,6 +142,16 @@ def ensure_split_assignments(
         raise ValueError("allocation_manifest_sha256 must be a lowercase SHA-256")
     forced = {str(key): str(value) for key, value in (forced_splits or {}).items()}
     expected = _normalise_expected(expected_new_counts)
+    if isinstance(historical_training_rows, bool):
+        raise ValueError("historical_training_rows must be an integer")
+    historical_rows = int(historical_training_rows)
+    if historical_rows < 0:
+        raise ValueError("historical_training_rows must be >= 0")
+    if expected["train"] <= 0 and not (version == 0 and historical_rows > 0):
+        raise ValueError(
+            "every FEREBUS version must add training rows unless version 0 "
+            "has an imported model-backed training baseline"
+        )
     if version > 0 and expected["ext_val"] != 0:
         raise ValueError("active FEREBUS versions cannot add external-validation rows")
     if version == 0 and expected["int_val"] <= 0:
@@ -155,6 +165,9 @@ def ensure_split_assignments(
     path = ledger_path(campaign)
     with _ledger_lock(campaign):
         payload = _load(path)
+        recorded_historical = int(payload.get("historical_training_rows", 0))
+        if payload.get("assignments") and recorded_historical != historical_rows:
+            raise ValueError("FEREBUS historical training-row count is immutable")
         assignments = {
             str(name): dict(record)
             for name, record in payload["assignments"].items()
@@ -188,6 +201,11 @@ def ensure_split_assignments(
             if dict(existing_version_record.get("expected_new_counts") or {}) != expected:
                 raise ValueError(
                     "FEREBUS retry allocation counts changed for version " + str(version)
+                )
+            if int(existing_version_record.get("historical_training_rows", 0)) != historical_rows:
+                raise ValueError(
+                    "FEREBUS retry historical training-row count changed for version "
+                    + str(version)
                 )
             recorded_hash = str(existing_version_record.get("allocation_manifest_sha256") or "")
             if allocation_sha != recorded_hash:
@@ -234,6 +252,7 @@ def ensure_split_assignments(
             "actual_new_counts": dict(actual_new),
             "pointdirs": list(new_names),
             "allocation_manifest_sha256": allocation_sha,
+            "historical_training_rows": int(historical_rows),
         }
         if existing_version_record is not None and new_names and existing_version_record != version_record:
             raise ValueError("FEREBUS version allocation is immutable for version " + str(version))
@@ -250,6 +269,7 @@ def ensure_split_assignments(
         payload = {
             "schema_version": FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION,
             "allocation_policy": "exact_per_reference_data_version",
+            "historical_training_rows": int(historical_rows),
             "assignments": assignments,
             "version_allocations": version_allocations,
         }
@@ -280,6 +300,11 @@ def ensure_split_assignments(
         "assignments": assignments,
         "row_ids": row_ids,
         "counts": _counts(assignments),
+        "effective_counts": {
+            **_counts(assignments),
+            "train": int(_counts(assignments)["train"]) + int(historical_rows),
+        },
+        "historical_training_rows": int(historical_rows),
         "version_allocation": dict(version_allocations[str(version)]),
         "allocation_policy": "exact_per_reference_data_version",
     }

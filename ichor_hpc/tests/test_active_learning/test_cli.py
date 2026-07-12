@@ -193,14 +193,14 @@ def _write_valid_ariadne_results(campaign: Path, iteration: int = 1):
     try:
         pool = TrajectoryPool.load(campaign)
     except FileNotFoundError:
-        source = campaign / ".reconcile_pool_source.xyz"
-        source.write_text(
-            "1\nreconcile fixture frame\nH 0.0 0.0 0.0\n",
-            encoding="utf-8",
-            newline="\n",
-        )
+        source = campaign / "pool.xyz"
+        if not source.is_file():
+            source.write_text(
+                "1\nreconcile fixture frame\nH 0.0 0.0 0.0\n",
+                encoding="utf-8",
+                newline="\n",
+            )
         pool = TrajectoryPool.import_from(source, campaign)
-        source.unlink()
     trajectory_sha = str(pool.sha256)
     iter_dir = active_iteration_dir(campaign, iteration)
     selection = {
@@ -401,7 +401,9 @@ def _pool_feasibility_payload(
         "pool_n_frames": int(pool_n_frames),
         "bootstrap_total_size": 70,
         "bootstrap_pool_frame_count": 70,
-        "bootstrap_anchor_count": 0,
+        "bootstrap_custom_count": 0,
+        "bootstrap_model_training_count": 0,
+        "excluded_pool_frame_count": 0,
         "max_iterations": 2,
         "n_seeds_per_iteration": 10,
         "batch_total_size": 10,
@@ -410,7 +412,7 @@ def _pool_feasibility_payload(
         "required_pool_frames": int(required_pool_frames),
         "reserve_after_bootstrap": int(pool_n_frames) - 70,
         "expression": (
-            "bootstrap pool frames after anchors + "
+            "bootstrap pool frames after custom inputs + "
             "max_iterations * seed_selection.n_seeds_per_iteration = 70 + 2 * 10 = 90"
         ),
         "ok": bool(ok),
@@ -680,7 +682,7 @@ def test_recovery_dashboard_reports_trajectory_pool_sha_mismatch(tmp_path):
         campaign,
         overwrite=True,
     )
-    pool_xyz = campaign / ".DATA" / "TRAJECTORY" / "pool.xyz"
+    pool_xyz = campaign / "pool.xyz"
     with pool_xyz.open("a", encoding="utf-8") as f:
         f.write("# drift\n")
 
@@ -994,7 +996,7 @@ def test_cli_status_recommends_reconcile_when_state_missing_with_artefacts(
 def test_cli_init_bootstraps_fresh_state_and_config_lock(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
 
-    rc = main(["init", "--campaign-dir", str(campaign)])
+    rc = main(["init", "--campaign-dir", str(campaign), "--yes"])
 
     assert rc == 0
     out = capsys.readouterr().out
@@ -1004,17 +1006,17 @@ def test_cli_init_bootstraps_fresh_state_and_config_lock(tmp_path, capsys):
     assert state.phase is CampaignPhase.INIT
     assert state.max_iterations == 2
     assert (campaign / DEFAULT_DATA_SUBDIR / "config_lock.json").is_file()
-    assert "ichor-al-daemon start --campaign-dir " + str(campaign) + " --live" in out
+    assert "ichor-al-daemon start --campaign-dir " + str(campaign) in out
     assert "ichor-al-daemon init --campaign-dir " + str(campaign) + " --source" not in out
 
 
 def test_cli_init_rerun_preserves_existing_campaign_uid(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
-    assert main(["init", "--campaign-dir", str(campaign)]) == 0
+    assert main(["init", "--campaign-dir", str(campaign), "--yes"]) == 0
     first = read_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME)
     capsys.readouterr()
 
-    assert main(["init", "--campaign-dir", str(campaign)]) == 0
+    assert main(["init", "--campaign-dir", str(campaign), "--yes"]) == 0
     second = read_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME)
 
     assert second.campaign_uid == first.campaign_uid
@@ -1025,7 +1027,7 @@ def test_cli_init_refuses_missing_state_with_stateful_artefacts(tmp_path, capsys
     campaign = _campaign_with_config(tmp_path)
     (campaign / "ACTIVE_LEARNING" / "iteration-000001").mkdir(parents=True)
 
-    rc = main(["init", "--campaign-dir", str(campaign)])
+    rc = main(["init", "--campaign-dir", str(campaign), "--yes"])
 
     assert rc == 16
     err = capsys.readouterr().err
@@ -1100,7 +1102,10 @@ def test_status_recommendations_cover_halted_reason_classes(tmp_path):
 @pytest.mark.parametrize(
     ("reason_code", "expected_code"),
     [
-        ("mandatory_anchor_failed", "halted_mandatory_anchor_failed"),
+        (
+            "mandatory_custom_bootstrap_failed",
+            "halted_mandatory_custom_bootstrap_failed",
+        ),
         (
             "replacement_reserve_exhausted",
             "halted_replacement_reserve_exhausted",
@@ -1600,7 +1605,7 @@ def test_cli_resume_explicitly_clears_shutdown_flag(tmp_path):
     write_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME, state)
     rc = main([
         "resume", "--campaign-dir", str(campaign),
-        "--mock-ariadne", "--max-ticks", "0",
+        "--mock-ariadne", "--max-ticks", "0", "--foreground",
     ])
     assert rc == 0
     s = read_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME)
@@ -2237,7 +2242,7 @@ def test_cli_reconcile_apply_prints_final_recomputed_phase(
     assert "Recovery Contract" in out
     assert "status        : ok" in out
     assert "RESULTS.json" in out
-    assert "ichor-al-daemon start --campaign-dir " + str(campaign) + " --live" in out
+    assert "ichor-al-daemon start --campaign-dir " + str(campaign) in out
 
 
 def test_cli_resume_refuses_halted_state(tmp_path, capsys):
@@ -2292,6 +2297,7 @@ def test_cli_reopen_done_requires_config_lock_reconcile_first(tmp_path, capsys):
         "--reopen-converged",
         "--max-ticks",
         "0",
+        "--foreground",
     ])
 
     assert rc == 7
@@ -2323,6 +2329,7 @@ def test_cli_reopen_done_is_explicit_and_advances_one_iteration(tmp_path):
         "--reopen-converged",
         "--max-ticks",
         "0",
+        "--foreground",
     ])
 
     assert rc == 0
@@ -2337,11 +2344,12 @@ def test_cli_reopen_done_is_explicit_and_advances_one_iteration(tmp_path):
 
 def test_cli_start_with_mock_ariadne_drives_state_machine(tmp_path):
     campaign = _campaign_with_config(tmp_path)
-    assert main(["init", "--campaign-dir", str(campaign)]) == 0
+    assert main(["init", "--campaign-dir", str(campaign), "--yes"]) == 0
     rc = main([
         "start", "--campaign-dir", str(campaign),
         "--mock-ariadne", "--max-ticks", "5",
         "--poll-interval", "1",
+        "--foreground",
     ])
     assert rc == 0
     # state.json should now exist and be parseable.
@@ -2350,19 +2358,27 @@ def test_cli_start_with_mock_ariadne_drives_state_machine(tmp_path):
     assert state.phase.value != "INIT"
 
 
-def test_cli_start_without_mode_refuses(tmp_path, capsys):
-    """With no --live / --dry-run / --mock-ariadne flag the CLI must refuse
-    rather than silently pick a default. Exit 3 + a message listing the
-    three available modes."""
+def test_cli_start_without_flags_defaults_to_live_background(tmp_path, monkeypatch):
     campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    write_state(data / DEFAULT_STATE_FILENAME, fresh_campaign_state())
+    observed = {}
+    monkeypatch.setattr(
+        cli_mod,
+        "_launch_background_daemon",
+        lambda args, resolved_campaign: observed.update(
+            args=args, campaign=resolved_campaign
+        ) or 0,
+    )
+
     rc = main(["start", "--campaign-dir", str(campaign)])
-    assert rc == 3
-    captured = capsys.readouterr()
-    assert "no execution mode selected" in captured.err
-    # Each available mode is named in the help text.
-    assert "--live" in captured.err
-    assert "--dry-run" in captured.err
-    assert "--mock-ariadne" in captured.err
+
+    assert rc == 0
+    assert observed["campaign"] == campaign.resolve()
+    assert observed["args"].live is True
+    assert observed["args"].background is True
+    assert observed["args"].foreground is False
 
 
 def test_cli_start_missing_state_for_clean_campaign_recommends_init(tmp_path, capsys):
@@ -2406,9 +2422,9 @@ def test_cli_start_live_on_windows_refuses_with_exit_12(tmp_path, capsys):
     case), the CLI must refuse with exit 12 and a message naming the missing
     binaries -- not silently spin a daemon."""
     campaign = _campaign_with_config(tmp_path)
-    assert main(["init", "--campaign-dir", str(campaign)]) == 0
+    assert main(["init", "--campaign-dir", str(campaign), "--yes"]) == 0
     capsys.readouterr()
-    rc = main(["start", "--campaign-dir", str(campaign), "--live"])
+    rc = main(["start", "--campaign-dir", str(campaign), "--live", "--foreground"])
     # On a CSF4 host with all binaries present this test would skip; in our
     # CI / Windows environment, the backends are absent and exit 12 is the
     # expected refusal code.
@@ -2459,7 +2475,10 @@ def test_cli_start_live_reaches_daemon_with_all_backends_present(
     monkeypatch.setattr(cli_mod, "make_live_job_accounting_finder", lambda: "accounting")
     monkeypatch.setattr(cli_mod, "make_live_job_liveness_checker", lambda: "liveness")
 
-    rc = main(["start", "--campaign-dir", str(campaign), "--live", "--max-ticks", "0"])
+    rc = main([
+        "start", "--campaign-dir", str(campaign), "--live",
+        "--max-ticks", "0", "--foreground",
+    ])
 
     assert rc == 0
     assert captured["executor_campaign"] == campaign.resolve()

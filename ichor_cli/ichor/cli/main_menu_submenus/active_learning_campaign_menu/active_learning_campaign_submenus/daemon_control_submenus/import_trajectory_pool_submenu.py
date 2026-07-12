@@ -23,7 +23,7 @@ IMPORT_TRAJECTORY_POOL_MENU_DESCRIPTION = MenuDescription(
     "Initialise Campaign / Import Inputs",
     subtitle=(
         "Populate campaign.yaml from the active-learning template and import "
-        "the configured MD trajectory and optional bootstrap anchor into "
+        "pool.xyz and any configured bootstrap/ inputs into "
         "campaign-owned storage.\n"
     ),
 )
@@ -31,8 +31,7 @@ IMPORT_TRAJECTORY_POOL_MENU_DESCRIPTION = MenuDescription(
 
 @dataclass
 class ImportTrajectoryPoolMenuOptions(MenuOptions):
-    source_path: str = ""
-    anchor_source_path: str = ""
+    source: str = ""
     force_reimport: bool = False
 
 
@@ -62,10 +61,7 @@ class ImportTrajectoryPoolFunctions:
             print_campaign_selection_error(exc)
             _pause()
             return
-        source = import_trajectory_pool_menu_options.source_path or None
-        anchor_source = (
-            import_trajectory_pool_menu_options.anchor_source_path or None
-        )
+        source = import_trajectory_pool_menu_options.source or None
         force = bool(import_trajectory_pool_menu_options.force_reimport)
         if force:
             answer = user_input_free_flow(
@@ -80,8 +76,8 @@ class ImportTrajectoryPoolFunctions:
         ns = argparse.Namespace(
             campaign_dir=str(campaign_dir),
             source=source,
-            anchor_source=anchor_source,
             force=force,
+            yes=False,
         )
         rc = cmd_init(ns)
         if rc == 13 and not force:
@@ -94,16 +90,10 @@ class ImportTrajectoryPoolFunctions:
 
 IMPORT_TRAJECTORY_POOL_FIELD_SPECS = [
     spec(
-        "source_path",
+        "source",
         "clearable_str",
         prompt="Source trajectory path",
-        item_text="Set source path (blank uses campaign.source_path)",
-    ),
-    spec(
-        "anchor_source_path",
-        "clearable_str",
-        prompt="Bootstrap anchor path",
-        item_text="Set anchor path (blank uses campaign.anchor_path)",
+        item_text="Set source path (blank uses campaign pool.xyz)",
     ),
     spec(
         "force_reimport",

@@ -34,7 +34,8 @@ def _create(
     context: str = "active",
     targets=None,
     n_reserve: int = 3,
-    anchors=(),
+    mandatory=(),
+    forced_splits=None,
 ):
     if targets is None:
         targets = {"train": 2, "int_val": 1, "ext_val": 0, "total": 3}
@@ -52,7 +53,8 @@ def _create(
         targets=targets,
         primary_candidates=primary,
         reserve_candidates=reserve,
-        anchor_candidate_ids=list(anchors),
+        mandatory_candidate_ids=list(mandatory),
+        forced_candidate_splits=dict(forced_splits or {}),
     )
     return path, payload
 
@@ -91,29 +93,30 @@ def test_config_targets_are_exact_integer_counts():
     }
 
 
-def test_anchor_candidates_are_forced_into_training_slots(tmp_path):
+def test_custom_candidates_are_forced_into_declared_slots(tmp_path):
     targets = {"train": 2, "int_val": 1, "ext_val": 1, "total": 4}
     path, payload = _create(
         tmp_path,
         context="bootstrap",
         targets=targets,
-        anchors=("candidate-0", "candidate-1"),
+        mandatory=("candidate-0", "candidate-1"),
+        forced_splits={"candidate-0": "train", "candidate-1": "train"},
     )
 
-    anchor_attempts = [
+    custom_attempts = [
         attempt
         for slot in payload["slots"]
         for attempt in slot["attempts"]
-        if attempt.get("mandatory_anchor")
+        if attempt.get("mandatory_custom")
     ]
-    assert {attempt["candidate_id"] for attempt in anchor_attempts} == {
+    assert {attempt["candidate_id"] for attempt in custom_attempts} == {
         "candidate-0",
         "candidate-1",
     }
     assert all(
         slot["split"] == "train"
         for slot in read_point_allocation(path)["slots"]
-        if slot["attempts"][0].get("mandatory_anchor")
+        if slot["attempts"][0].get("mandatory_custom")
     )
 
 
@@ -173,13 +176,14 @@ def test_replacement_completion_preserves_exact_counts(tmp_path):
     assert len(accepted_attempts(complete)) == 3
 
 
-def test_mandatory_anchor_failure_forbids_replacement(tmp_path):
+def test_mandatory_custom_failure_forbids_replacement(tmp_path):
     targets = {"train": 2, "int_val": 1, "ext_val": 1, "total": 4}
     path, payload = _create(
         tmp_path,
         context="bootstrap",
         targets=targets,
-        anchors=("candidate-0",),
+        mandatory=("candidate-0",),
+        forced_splits={"candidate-0": "train"},
     )
     attempts = pending_attempts(payload)
     after_qm = record_quantum_results(
@@ -194,8 +198,36 @@ def test_mandatory_anchor_failure_forbids_replacement(tmp_path):
         ),
     )
 
-    assert after_qm["mandatory_anchor_failed"] is True
-    with pytest.raises(ValueError, match="anchor failed"):
+    assert after_qm["mandatory_custom_failed"] is True
+    with pytest.raises(ValueError, match="custom bootstrap geometry failed"):
+        allocate_replacements(
+            path,
+            replacement_round=1,
+            expected_generation=int(after_qm["generation"]),
+        )
+
+
+def test_mandatory_validation_geometry_failure_remains_readable(tmp_path):
+    targets = {"train": 2, "int_val": 1, "ext_val": 1, "total": 4}
+    path, payload = _create(
+        tmp_path,
+        context="bootstrap",
+        targets=targets,
+        mandatory=("candidate-0",),
+        forced_splits={"candidate-0": "int_val"},
+    )
+    attempts = pending_attempts(payload)
+    accepted = {
+        attempt["candidate_id"]
+        for attempt in attempts
+        if attempt["candidate_id"] != "candidate-0"
+    }
+
+    after_qm = record_quantum_results(path, _results(attempts, accepted))
+
+    assert after_qm["mandatory_custom_failed"] is True
+    assert read_point_allocation(path)["mandatory_custom_failed"] is True
+    with pytest.raises(ValueError, match="custom bootstrap geometry failed"):
         allocate_replacements(
             path,
             replacement_round=1,

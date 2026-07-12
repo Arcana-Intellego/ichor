@@ -3,13 +3,12 @@
 # defaults substantially (see ichor_hpc/.../presets/ for spectroscopy and
 # thermodynamics-focused starting points).
 
-schema_version: 10
+schema_version: 11
 
 campaign:
   system_name: WATER_TETRAMER
   max_iterations: 2
-  source_path: pool.xyz
-  anchor_path: anchor.xyz
+  custom_bootstrap: false
   # Keep the walkthrough close to the balanced production default.
   sampling_aggressiveness: 5
 
@@ -24,7 +23,6 @@ point_allocation:
   bootstrap_external_validation_size: 1
   batch_training_size: 1
   batch_internal_validation_size: 1
-  anchor: false
 
 # Seeds per ARIADNE_ARRAY task.
 seed_selection:

@@ -67,10 +67,12 @@ def test_missing_models_dir_bails_only_with_explicit_uniform_fallback(tmp_path):
 
 
 def test_happy_path_writes_sidecar_and_journals(tmp_path):
+    from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
+
     ex = _make_executor(tmp_path)
     models_dir = ex.campaign_dir / "TRAINED_MODELS" / "iteration-000000"
     models_dir.mkdir(parents=True, exist_ok=True)
-    pool_xyz = ex.campaign_dir / ".DATA" / "TRAJECTORY" / "pool.xyz"
+    pool_xyz = ex.campaign_dir / "pool.xyz"
     pool_xyz.parent.mkdir(parents=True, exist_ok=True)
     xyz_content = "3" + chr(10)
     xyz_content += "frame 0" + chr(10)
@@ -78,21 +80,7 @@ def test_happy_path_writes_sidecar_and_journals(tmp_path):
     xyz_content += "H 0.96 0.0 0.0" + chr(10)
     xyz_content += "H -0.24 0.93 0.0" + chr(10)
     pool_xyz.write_text(xyz_content, encoding="utf-8")
-    import hashlib as _h
-    sha = _h.sha256(pool_xyz.read_bytes()).hexdigest()
-    manifest_path = pool_xyz.parent / "pool.manifest.json"
-    manifest = {
-        "schema_version": 1,
-        "source_path": str(pool_xyz),
-        "canonical_path": str(pool_xyz),
-        "sha256": sha,
-        "n_frames": 1,
-        "natoms": 3,
-        "atom_types": ["O", "H", "H"],
-        "masses": [15.999, 1.008, 1.008],
-        "imported_iso": "",
-    }
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    TrajectoryPool.import_from(pool_xyz, ex.campaign_dir)
     fake_scales = {
         "energy": 0.001,
         "force": 0.5,

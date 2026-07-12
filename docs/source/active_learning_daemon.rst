@@ -44,8 +44,8 @@ Run the bundled example to confirm the install works (~30 seconds on a
 laptop, no cluster required)::
 
     cd examples/dry_run_water_tetramer
-    ichor-al-daemon init
-    ichor-al-daemon start -d -t 200
+    ichor-al-daemon init --yes
+    ichor-al-daemon start -d -f -t 200
     ichor-al-daemon status
 
 After the third command you should see :code:`"phase": "DONE"` and
@@ -58,14 +58,16 @@ and what to look at next.
 Most daemon commands accept :code:`-c/--campaign-dir`. If it is omitted, the
 current directory is used when it contains :code:`campaign.yaml`; otherwise the
 command exits with a usage error. Common flags also have short aliases, so a
-foreground live launch can be written as :code:`ichor-al-daemon start -l`, and a
-background live launch can be written as :code:`ichor-al-daemon start -lb`.
+live background launch is now the default (:code:`ichor-al-daemon start`). Use
+:code:`ichor-al-daemon start -f` for a foreground live launch. Explicit
+:code:`-l` and :code:`-b` flags remain available and may be combined as
+:code:`-lb`.
 
 
 Modes
 -----
 
-Three execution modes, selected by a single CLI flag:
+Three execution modes are available. With no mode flag, live mode is selected:
 
 .. list-table::
    :header-rows: 1
@@ -105,14 +107,13 @@ The :code:`campaign.yaml` file is a nested block layout. The full
 minimal sparse config overrides only the keys you care about; every other
 field falls back to its dataclass default::
 
-    schema_version: 10
+    schema_version: 11
 
     campaign:
       system_name: CHANGE_ME_SYSTEM
       max_iterations: 50
-      source_path: pool.xyz
-      anchor_path: anchor.xyz
       sampling_aggressiveness: 5
+      custom_bootstrap: false
 
     runtime:
       poll_interval_seconds: 60
@@ -123,7 +124,6 @@ field falls back to its dataclass default::
       bootstrap_external_validation_size: 60
       batch_training_size: 8
       batch_internal_validation_size: 2
-      anchor: false
 
     seed_selection:
       n_seeds_per_iteration: 20
@@ -158,11 +158,50 @@ field falls back to its dataclass default::
       alpha0_streak_length: 5
       min_iterations_before_stop: 8
 
-Schema 10 is intentionally strict. Older campaign files are rejected rather
-than migrated implicitly. ``source_path`` and ``anchor_path`` are operator
-inputs resolved relative to the campaign directory; ``init`` imports them
-into campaign-owned storage. ``sampling_aggressiveness`` is a dimensionless
-campaign control whose ARIADNE trust radius is normalised for molecular size.
+Schema 11 is intentionally strict. Older campaign files are rejected rather
+than migrated implicitly. The source pool has the fixed campaign path
+``pool.xyz``. ``ichor-al-daemon init --source /path/to/source.xyz`` copies an
+external source to that path before SHA-pinning it in daemon-owned metadata.
+``sampling_aggressiveness`` is a dimensionless campaign control whose ARIADNE
+trust radius is normalised for molecular size.
+
+Custom bootstrap inputs
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Set ``campaign.custom_bootstrap: true`` to enable discovery under the fixed
+``bootstrap/`` directory. The recognised split files are
+``training_set_bootstrap.xyz|csv``,
+``internal_validation_set_bootstrap.xyz|csv``, and
+``external_validation_set_bootstrap.xyz|csv``. Formats may be mixed between
+splits, but supplying both formats for one split is an error. Every supplied
+split may contain at most its matching ``point_allocation.bootstrap_*_size``;
+POLUS Phase A fills any deficit. Supplied geometries are mandatory and cannot
+be silently replaced if Gaussian or AIMAll rejects them.
+
+CSV files must begin with the complete consecutive ``f1..f(3N-6)`` ALF feature
+prefix. Unique finite numeric columns after that prefix, such as ``iqa`` or
+``q00``, are accepted but ignored as scientific labels. ``init`` asks for one
+1-based ALF per detected CSV. For unattended ``init --yes``, put those values
+in ``bootstrap/alf.yaml`` under ``train``, ``int_val``, or ``ext_val``.
+Gaussian/AIMAll always regenerate the authoritative labels.
+
+Alternatively, ``bootstrap/model_krig/`` may provide the initial training
+baseline. It is mutually exclusive with a training-set XYZ/CSV. The directory
+must contain exactly one model for every molecule atom and every required
+property: IQA plus all entries in ``ferebus.properties``. Model training-row
+count replaces ``bootstrap_training_size``; only missing internal/external
+validation slots are filled by POLUS. Imported models become immutable model
+version 0 without a FEREBUS optimisation job, and their original X/Y rows are
+prepended and verified during every later retraining.
+
+The lower-case ``bootstrap/`` directory is operator-owned input. The
+``.DATA/BOOTSTRAP/`` directory is daemon-owned Phase A output; do not put
+operator files there. ``bootstrap/model_krig/`` must contain regular
+``.model`` files only, with no symlinks or unrelated sidecar files.
+
+Every ``init`` prints the complete discovery and top-up summary and asks
+``Proceed? [y/N]`` before committing evidence. ``--yes`` bypasses only that
+final confirmation; it does not invent missing CSV ALFs.
 
 Use the :code:`ichor` CLI menu (Active-learning campaign -> Edit campaign
 config) to navigate the nested blocks interactively; every field has its
@@ -183,7 +222,7 @@ Three YAML presets ship under
 :code:`--preset NAME` at start time; :code:`campaign.yaml` wins for every
 explicitly-set key, so the preset acts as a strong default::
 
-    ichor-al-daemon start --live --campaign-dir . \
+    ichor-al-daemon start --campaign-dir . \
         --preset spectroscopy_focused
 
 .. list-table::
@@ -357,7 +396,8 @@ Sampling storage and identities
 
 Bootstrap selection is not an active-learning iteration. Its selected XYZ,
 selected pool-row indices, Phase-A manifest, and allocation manifest live under
-:code:`BOOTSTRAP/selection/` and :code:`BOOTSTRAP/allocation/`. Bootstrap is the
+:code:`.DATA/BOOTSTRAP/selection/` and
+:code:`.DATA/BOOTSTRAP/allocation/`. Bootstrap is the
 only scientific stage identified by iteration and committed version zero.
 
 Active iterations start at one and use six-digit canonical names. Active
@@ -470,9 +510,9 @@ nothing is committed) and clears any pending jobs so the next run
 re-submits rather than blindly polls unknown JobIDs.
 
 Reconcile also verifies the trajectory-pool contract for non-empty campaigns:
-:code:`.DATA/TRAJECTORY/pool.xyz` and
-:code:`.DATA/TRAJECTORY/pool.manifest.json` must exist and the SHA-256 in the
-manifest must match the canonical pool. Pool corruption or deletion is reported
+:code:`pool.xyz` and :code:`.DATA/TRAJECTORY/pool.manifest.json` must exist,
+and the SHA-256 in the manifest must match the campaign-local pool. Pool
+corruption or deletion is reported
 as unsafe; reconcile does not automatically repair the pool because it is
 provenance-critical.
 
@@ -539,13 +579,15 @@ postprocess parser in the daemon process).
      |
      v
    INITIAL_ALLOCATION_CHECK       Verify exact bootstrap train/internal/
-     |                            external slots. Failed non-anchor slots
+     |                            external slots. Failed non-custom slots
      |----> INITIAL_REPLACEMENT_GAUSSIAN -> INITIAL_REPLACEMENT_AIMALL
      |                                      | (bounded reserve only)
      |<-------------------------------------+
      v
-   INITIAL_FEREBUS  (sbatch)      First GP fit. Commits bootstrap version 0 to
-     |                            QM_REFERENCE_DATA and TRAINED_MODELS.
+   INITIAL_FEREBUS  (sbatch*)     First GP fit. Commits bootstrap version 0 to
+     |                            QM_REFERENCE_DATA and TRAINED_MODELS. With
+     |                            model_krig, validated models are imported
+     |                            directly and no scheduler job is submitted.
      v
    SEED_SELECT  (inline)  <----+  Pick seeds from the trajectory pool,
      |                         |  forbidding already-trained frames.

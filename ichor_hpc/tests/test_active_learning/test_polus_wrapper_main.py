@@ -20,6 +20,7 @@ from ichor.hpc.active_learning.layout import (
     active_phase_b_dir,
     ariadne_seed_dir,
     ariadne_seeds_dir,
+    bootstrap_selection_dir,
 )
 
 
@@ -34,12 +35,25 @@ def _active_iter(campaign):
 def _import_pool(campaign, source):
     """Drop a trajectory into the campaign-canonical location."""
     from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
-    TrajectoryPool.import_from(source, campaign, overwrite=True)
+    from ichor.hpc.active_learning.custom_bootstrap import (
+        commit_bootstrap_plan,
+        inspect_bootstrap_inputs,
+    )
+
+    pool = TrajectoryPool.import_from(source, campaign, overwrite=True)
+    config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+    commit_bootstrap_plan(
+        inspect_bootstrap_inputs(
+            campaign,
+            config,
+            pool.to_atoms_list(),
+            pool_sha256=pool.sha256,
+        )
+    )
 
 
-def _write_anchor_from_fixture(campaign, n_frames=1):
+def _write_custom_training_from_fixture(campaign, n_frames=1):
     from ichor.core.files.xyz import Trajectory
-    from ichor.hpc.active_learning.bootstrap_anchor import import_anchor_source
     from ichor.hpc.active_learning.sampling.polus_wrapper import _write_xyz_file
 
     traj = Trajectory(FIXTURE)
@@ -55,9 +69,9 @@ def _write_anchor_from_fixture(campaign, n_frames=1):
                 frame[1].z,
             ]
         frames.append(frame)
-    source = campaign / "anchor.xyz"
+    source = campaign / "bootstrap" / "training_set_bootstrap.xyz"
+    source.parent.mkdir(parents=True, exist_ok=True)
     _write_xyz_file(frames, source)
-    import_anchor_source(campaign, source, overwrite=True)
     return frames
 
 
@@ -92,7 +106,7 @@ def _run(args):
 
 def test_phase_a_writes_sample_and_index(tmp_path):
     """Phase A reads the trajectory pool and writes the canonical
-    BOOTSTRAP/selection sample, index, and manifest files."""
+    .DATA/BOOTSTRAP/selection sample, index, and manifest files."""
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
@@ -111,7 +125,7 @@ def test_phase_a_writes_sample_and_index(tmp_path):
     ])
     assert result.returncode == 0, result.stderr
 
-    outdir = campaign / "BOOTSTRAP" / "selection"
+    outdir = bootstrap_selection_dir(campaign)
     samples = list(outdir.glob("selected.xyz"))
     indices = list(outdir.glob("selected_indices.dat"))
     assert len(samples) == 1
@@ -153,7 +167,7 @@ def test_phase_a_manifest_rejects_sample_drift(tmp_path):
         "--campaign-dir", str(campaign),
     ])
     assert result.returncode == 0, result.stderr
-    outdir = campaign / "BOOTSTRAP" / "selection"
+    outdir = bootstrap_selection_dir(campaign)
     sample = outdir / "selected.xyz"
     sample.write_text(
         sample.read_text(encoding="utf-8") + "\n",
@@ -164,19 +178,19 @@ def test_phase_a_manifest_rejects_sample_drift(tmp_path):
         read_phase_a_sample_manifest(outdir)
 
 
-def test_phase_a_prepends_anchor_geometries_and_fills_remainder_from_pool(tmp_path):
+def test_phase_a_preserves_custom_training_geometry_and_fills_remainder_from_pool(tmp_path):
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
     cfg.point_allocation.bootstrap_training_size = 4
     cfg.point_allocation.bootstrap_internal_validation_size = 1
     cfg.point_allocation.bootstrap_external_validation_size = 2
-    cfg.point_allocation.anchor = True
+    cfg.campaign.custom_bootstrap = True
     cfg.max_iterations = 1
     cfg.seed_selection.n_seeds_per_iteration = 4
     cfg.to_yaml(campaign / "campaign.yaml")
+    _write_custom_training_from_fixture(campaign, n_frames=1)
     _import_pool(campaign, FIXTURE)
-    _write_anchor_from_fixture(campaign, n_frames=1)
 
     result = _run([
         "--descriptor", "rmsd_massweight",
@@ -185,57 +199,59 @@ def test_phase_a_prepends_anchor_geometries_and_fills_remainder_from_pool(tmp_pa
     ])
     assert result.returncode == 0, result.stderr
 
-    outdir = campaign / "BOOTSTRAP" / "selection"
+    outdir = bootstrap_selection_dir(campaign)
     manifest = json.loads((outdir / PHASE_A_SAMPLE_FILENAME).read_text(encoding="utf-8"))
     assert manifest["n_select"] == 7
-    assert manifest["bootstrap_anchor_enabled"] is True
-    assert manifest["bootstrap_anchor_count"] == 1
+    assert manifest["custom_bootstrap"] is True
+    assert manifest["custom_bootstrap_counts"]["train"] == 1
     assert manifest["bootstrap_pool_frame_count"] == 6
     assert manifest["selected_indices"][0] is None
     assert len(manifest["selected_pool_indices"]) == 6
     assert len(manifest["selected_indices"]) == 7
     assert 0 not in manifest["selected_pool_indices"]
     assert manifest["excluded_pool_frame_ids"] == [0]
-    anchor_manifest = (
+    custom_manifest = (
         campaign
-        / "BOOTSTRAP"
-        / "selection"
-        / "ANCHOR.json"
+        / ".DATA"
+        / "ACTIVE_LEARNING"
+        / "CUSTOM_BOOTSTRAP.json"
     )
-    assert anchor_manifest.is_file()
-    anchor_payload = json.loads(anchor_manifest.read_text(encoding="utf-8"))
-    assert anchor_payload["n_anchor"] == 1
+    assert custom_manifest.is_file()
     idx_lines = (outdir / "selected_indices.dat").read_text(encoding="utf-8").splitlines()
-    assert idx_lines[0] == "anchor:0"
+    assert idx_lines[0] == "custom:0"
     assert all(line.strip().isdigit() for line in idx_lines[1:])
 
+    read_phase_a_sample_manifest(outdir)
+    custom_manifest.write_text(
+        custom_manifest.read_text(encoding="utf-8") + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        HandoffManifestError,
+        match="custom-bootstrap manifest (size|hash) mismatch",
+    ):
+        read_phase_a_sample_manifest(outdir)
 
-def test_phase_a_rejects_more_anchors_than_planned_training_split(tmp_path):
+
+def test_bootstrap_discovery_rejects_more_custom_training_rows_than_target(tmp_path):
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
     cfg.point_allocation.bootstrap_training_size = 4
     cfg.point_allocation.bootstrap_internal_validation_size = 1
     cfg.point_allocation.bootstrap_external_validation_size = 2
-    cfg.point_allocation.anchor = True
+    cfg.campaign.custom_bootstrap = True
     cfg.max_iterations = 1
     cfg.seed_selection.n_seeds_per_iteration = 4
     cfg.to_yaml(campaign / "campaign.yaml")
-    _import_pool(campaign, FIXTURE)
-    _write_anchor_from_fixture(campaign, n_frames=5)
+    _write_custom_training_from_fixture(campaign, n_frames=5)
 
-    result = _run([
-        "--descriptor", "rmsd_massweight",
-        "--iteration", "0",
-        "--campaign-dir", str(campaign),
-    ])
-
-    assert result.returncode == 3
-    assert "planned initial FEREBUS training split" in result.stderr
+    with pytest.raises(ValueError, match="permits at most 4"):
+        _import_pool(campaign, FIXTURE)
 
 
-def test_phase_a_fails_when_bootstrap_exceeds_pool_size(tmp_path):
-    """If the bootstrap target exceeds the pool, Phase A fails fast."""
+def test_bootstrap_inspection_fails_when_target_exceeds_pool_size(tmp_path):
+    """If the bootstrap target exceeds the pool, initialisation fails fast."""
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
@@ -245,15 +261,9 @@ def test_phase_a_fails_when_bootstrap_exceeds_pool_size(tmp_path):
     cfg.max_iterations = 1
     cfg.seed_selection.n_seeds_per_iteration = 4
     cfg.to_yaml(campaign / "campaign.yaml")
-    _import_pool(campaign, FIXTURE)
-    result = _run([
-        "--descriptor", "rmsd_massweight",
-        "--iteration", "0",
-        "--campaign-dir", str(campaign),
-    ])
-    assert result.returncode == 3
-    assert "bootstrap requires 100 pool geometries" in result.stderr
-    outdir = campaign / "BOOTSTRAP" / "selection"
+    with pytest.raises(ValueError, match="need 100, available 20"):
+        _import_pool(campaign, FIXTURE)
+    outdir = bootstrap_selection_dir(campaign)
     assert not (outdir / "selected.xyz").is_file()
 
 

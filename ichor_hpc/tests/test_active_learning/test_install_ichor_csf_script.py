@@ -73,6 +73,8 @@ def test_install_script_is_present():
     assert "ARIADNE" in text
     assert "FEREBUS_CPU" in text
     assert "from xtb.ase.calculator import XTB" in text
+    assert 'init --campaign-dir "${smoke_dir}" --yes' in text
+    assert ': > "${smoke_dir}/pool.xyz"' in text
     assert "pyferebus_platform\": \"CSF3\"" in text
     assert "pyferebus_platform\": \"CSF4\"" in text
     assert "libs/gcc/openssl/1.1.1w" in text

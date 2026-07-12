@@ -39,6 +39,7 @@ from ichor.hpc.active_learning.layout import (
     active_ariadne_dir,
     active_iteration_dir,
     ariadne_seed_dir,
+    bootstrap_selection_dir,
 )
 from ichor.hpc.active_learning.point_allocation import (
     create_point_allocation,
@@ -1091,7 +1092,7 @@ def test_stateful_campaign_artifacts_include_config_lock(tmp_path):
 
 def test_stateful_campaign_artifacts_include_phase_a_outputs(tmp_path):
     campaign, _, _, _ = _campaign_dirs(tmp_path)
-    phase_a = campaign / "BOOTSTRAP" / "selection"
+    phase_a = bootstrap_selection_dir(campaign)
     phase_a.mkdir(parents=True)
     (phase_a / "SELECTION.json").write_text("{}", encoding="utf-8")
     (phase_a / "selected.xyz").write_text("sample\n", encoding="utf-8")
@@ -1100,9 +1101,9 @@ def test_stateful_campaign_artifacts_include_phase_a_outputs(tmp_path):
     findings = stateful_campaign_artifacts(campaign)
 
     normalised = {Path(value).as_posix() for value in findings}
-    assert "BOOTSTRAP/selection/SELECTION.json" in normalised
-    assert "BOOTSTRAP/selection/selected.xyz" in normalised
-    assert "BOOTSTRAP/selection/selected_indices.dat" in normalised
+    assert ".DATA/BOOTSTRAP/selection/SELECTION.json" in normalised
+    assert ".DATA/BOOTSTRAP/selection/selected.xyz" in normalised
+    assert ".DATA/BOOTSTRAP/selection/selected_indices.dat" in normalised
 
 
 def test_propose_recovery_active_submission_intent_is_adoption_ready(tmp_path):
@@ -1633,7 +1634,7 @@ def test_propose_recovery_blocks_trajectory_pool_sha_drift(tmp_path):
     (s / "marker.txt").write_text("model", encoding="utf-8")
     mv.commit(0)
 
-    pool_xyz = campaign / ".DATA" / "TRAJECTORY" / "pool.xyz"
+    pool_xyz = campaign / "pool.xyz"
     with pool_xyz.open("a", encoding="utf-8") as f:
         f.write("# drift\n")
 

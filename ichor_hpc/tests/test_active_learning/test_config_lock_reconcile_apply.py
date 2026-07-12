@@ -31,8 +31,10 @@ from ichor.hpc.active_learning.point_allocation import (
     create_point_allocation,
     pending_attempts,
     point_allocation_path,
+    read_point_allocation,
     record_quantum_results,
 )
+from ichor.hpc.active_learning.layout import bootstrap_selection_dir
 from ichor.hpc.active_learning.submit import sacct_poll
 from ichor.hpc.active_learning.versioning.provenance import (
     enrich_with_point_allocation,
@@ -147,7 +149,7 @@ def _write_config(campaign, config):
 def _write_phase_a_sample(campaign):
     from ichor.hpc.active_learning.handoff_manifests import write_phase_a_sample_manifest
 
-    initial = campaign / "BOOTSTRAP" / "selection"
+    initial = bootstrap_selection_dir(campaign)
     initial.mkdir(parents=True, exist_ok=True)
     sample = initial / "selected.xyz"
     index = initial / "selected_indices.dat"
@@ -158,17 +160,20 @@ def _write_phase_a_sample(campaign):
         context="bootstrap",
         iteration=0,
     )
-    allocation = create_point_allocation(
-        allocation_path,
-        campaign_uid="config-lock-test",
-        context="bootstrap",
-        iteration=0,
-        targets={"train": 1, "int_val": 0, "ext_val": 0, "total": 1},
-        primary_candidates=[
-            {"candidate_id": "bootstrap-candidate-0", "frame_id": 0}
-        ],
-        reserve_candidates=[],
-    )
+    if allocation_path.is_file():
+        allocation = read_point_allocation(allocation_path)
+    else:
+        allocation = create_point_allocation(
+            allocation_path,
+            campaign_uid="config-lock-test",
+            context="bootstrap",
+            iteration=0,
+            targets={"train": 1, "int_val": 0, "ext_val": 0, "total": 1},
+            primary_candidates=[
+                {"candidate_id": "bootstrap-candidate-0", "frame_id": 0}
+            ],
+            reserve_candidates=[],
+        )
     slot = allocation["slots"][0]
     primary = [{
         **slot["attempts"][0],
@@ -425,7 +430,7 @@ def test_schema_v3_config_lock_is_rejected_without_compatibility_migration(tmp_p
     review = review_config_changes(campaign, current, fresh_campaign_state())
     assert not review.allowed
     assert [change.path for change in review.blocked_changes] == ["config_lock"]
-    assert "requires schema_version 10" in review.blocked_changes[0].reason
+    assert "requires schema_version 11" in review.blocked_changes[0].reason
 
 
 def test_retry_phase_requires_retryable_journal_event():
@@ -949,38 +954,6 @@ def test_gaussian_basis_change_blocks_after_gaussian_staging_exists(tmp_path):
     assert "Gaussian staging" in review.blocked_changes[0].reason
 
 
-def test_trajectory_pool_source_blocks_after_pool_import(tmp_path):
-    campaign = _campaign(tmp_path)
-    _write_pool(campaign)
-    original = CampaignConfig()
-    write_config_lock(campaign, original)
-    changed = CampaignConfig()
-    changed.campaign.source_path = "other_pool.xyz"
-
-    review = review_config_changes(campaign, changed, fresh_campaign_state())
-
-    assert not review.allowed
-    assert [c.path for c in review.blocked_changes] == ["campaign.source_path"]
-    assert "trajectory pool" in review.blocked_changes[0].reason
-
-
-def test_anchor_source_blocks_after_anchor_import(tmp_path):
-    campaign = _campaign(tmp_path)
-    canonical_anchor = campaign / ".DATA" / "TRAJECTORY" / "anchor.xyz"
-    canonical_anchor.parent.mkdir(parents=True, exist_ok=True)
-    canonical_anchor.write_text("1\nanchor\nH 0 0 0\n", encoding="utf-8")
-    original = CampaignConfig()
-    write_config_lock(campaign, original)
-    changed = CampaignConfig()
-    changed.campaign.anchor_path = "other_anchor.xyz"
-
-    review = review_config_changes(campaign, changed, fresh_campaign_state())
-
-    assert not review.allowed
-    assert [c.path for c in review.blocked_changes] == ["campaign.anchor_path"]
-    assert "bootstrap anchor" in review.blocked_changes[0].reason
-
-
 def test_bootstrap_size_blocks_after_phase_a_output(tmp_path):
     campaign = _campaign(tmp_path)
     _write_phase_a_sample(campaign)
@@ -998,18 +971,18 @@ def test_bootstrap_size_blocks_after_phase_a_output(tmp_path):
     assert "Phase A" in review.blocked_changes[0].reason
 
 
-def test_bootstrap_anchor_blocks_after_phase_a_output(tmp_path):
+def test_custom_bootstrap_flag_blocks_after_phase_a_output(tmp_path):
     campaign = _campaign(tmp_path)
     _write_phase_a_sample(campaign)
     original = CampaignConfig()
     write_config_lock(campaign, original)
     changed = CampaignConfig()
-    changed.point_allocation.anchor = True
+    changed.campaign.custom_bootstrap = True
 
     review = review_config_changes(campaign, changed, fresh_campaign_state())
 
     assert not review.allowed
-    assert [c.path for c in review.blocked_changes] == ["point_allocation.anchor"]
+    assert [c.path for c in review.blocked_changes] == ["campaign.custom_bootstrap"]
     assert "Phase A" in review.blocked_changes[0].reason
 
 
@@ -1930,7 +1903,8 @@ def test_reconcile_apply_refuses_locked_config_change(tmp_path, capsys):
     original = CampaignConfig()
     write_config_lock(campaign, original)
     changed = CampaignConfig()
-    changed.campaign.source_path = "other_pool.xyz"
+    changed.campaign.custom_bootstrap = True
+    _write_phase_a_sample(campaign)
     _write_config(campaign, changed)
 
     rc = cmd_reconcile(
@@ -2493,6 +2467,7 @@ def test_start_allows_clean_first_run_with_config_and_pool(tmp_path):
             poll_interval=None,
             max_ticks=1,
             background=False,
+            foreground=True,
         )
     )
 

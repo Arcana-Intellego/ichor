@@ -1,10 +1,9 @@
-schema_version: 10
+schema_version: 11
 
 campaign:
   system_name: ICHOR_CSF4_LONG_CAMPAIGN
   max_iterations: 20
-  source_path: pool.xyz
-  anchor_path: anchor.xyz
+  custom_bootstrap: false
   sampling_aggressiveness: 5
 
 # Production-style starting point. Calibrate thresholds from one first-live
@@ -15,7 +14,6 @@ point_allocation:
   bootstrap_external_validation_size: 20
   batch_training_size: 6
   batch_internal_validation_size: 2
-  anchor: false
 
 seed_selection:
   strategy: d_optimal

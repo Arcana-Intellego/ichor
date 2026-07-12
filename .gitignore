@@ -5,6 +5,7 @@ venv/
 !scripts/install_ichor_csf.sh
 !scripts/env_ichor_csf.sh
 *.csv
+!**/bootstrap/*.csv
 wily*
 rmsd*
 *.log
@@ -38,6 +39,7 @@ dist
 test.*
 .pytest_cache
 .pytest-tmp*/
+.tmp/
 output.txt
 docs/build
 Dockerfile
@@ -52,7 +54,6 @@ Dockerfile
 # campaign root subtrees that hold committed iterations and the
 # per-pointdir sidecars that live outside .DATA/.
 
-/BOOTSTRAP/
 /3_DIVERSITY_SAMPLING/
 /5_TRAINING/
 /QM_REFERENCE_DATA/
@@ -61,7 +62,6 @@ Dockerfile
 /6_TRAINED_MODELS/
 /ACTIVE_LEARNING/
 /7_ACTIVE_LEARNING/
-/examples/**/BOOTSTRAP/
 /examples/**/3_DIVERSITY_SAMPLING/
 /examples/**/5_TRAINING/
 /examples/**/QM_REFERENCE_DATA/

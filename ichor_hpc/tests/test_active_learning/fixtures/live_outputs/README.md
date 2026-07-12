@@ -18,5 +18,5 @@ executor parsers consume.
   Tests translate these historical fixture names into canonical
   `ariadne/seeds/seed-NNNNNN/` task outputs before invoking daemon readers.
 - `polus_phase_a/` and `polus_phase_b/` -- source-only POLUS samples. Tests
-  publish them under the canonical `BOOTSTRAP/selection/` and `phase_b/`
+  publish them under the canonical `.DATA/BOOTSTRAP/selection/` and `phase_b/`
   contracts before postprocessing.

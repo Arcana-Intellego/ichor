@@ -47,7 +47,7 @@ START_DAEMON_BACKGROUND_MENU_DESCRIPTION = MenuDescription(
 
 START_DAEMON_BACKGROUND_DEFAULTS = {
     "selected_command": "start",
-    "selected_mode": "dry-run",
+    "selected_mode": "live",
     "selected_poll_interval": 0,
     "selected_max_ticks": 0,
     "selected_config": "",

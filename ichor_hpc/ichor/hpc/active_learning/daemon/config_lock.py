@@ -204,13 +204,11 @@ RESOURCE_FUTURE_EXACT = {
 
 IMMUTABLE_EXACT = {"schema_version"}
 
-PRE_POOL_EXACT = {"campaign.source_path"}
-PRE_ANCHOR_EXACT = {"campaign.anchor_path"}
 PRE_PHASE_A_EXACT = {
+    "campaign.custom_bootstrap",
     "point_allocation.bootstrap_training_size",
     "point_allocation.bootstrap_internal_validation_size",
     "point_allocation.bootstrap_external_validation_size",
-    "point_allocation.anchor",
 }
 PRE_GAUSSIAN_PREFIXES = {"gaussian."}
 PRE_AIMALL_PREFIXES = {"aimall."}
@@ -297,10 +295,8 @@ PHASE_B_OUTPUT_INTERPRETATION_EXACT = (
 
 PHASE_LOCAL_EXACT = set(FUTURE_FEREBUS_EXACT)
 COMMITTED_LOCKED_EXACT = (
-    set(PRE_POOL_EXACT)
-    | set(PRE_FEREBUS_FIRST_EXACT)
+    set(PRE_FEREBUS_FIRST_EXACT)
     | set(PRE_AIMALL_QUALITY_EXACT)
-    | set(PRE_ANCHOR_EXACT)
 )
 CAMPAIGN_LOCKED_EXACT = set(IMMUTABLE_EXACT)
 
@@ -317,18 +313,6 @@ _POLICIES_EXACT: Dict[str, ConfigFieldPolicy] = {
     **{
         path: ConfigFieldPolicy("resource_future", "resource_future", "applies to future submissions only")
         for path in RESOURCE_FUTURE_EXACT
-    },
-    **{
-        path: ConfigFieldPolicy("pre_pool", "pre_pool", "editable until trajectory pool import")
-        for path in PRE_POOL_EXACT
-    },
-    **{
-        path: ConfigFieldPolicy(
-            "pre_anchor",
-            "pre_anchor",
-            "editable until bootstrap anchor import",
-        )
-        for path in PRE_ANCHOR_EXACT
     },
     **{
         path: ConfigFieldPolicy("pre_phase_a", "pre_phase_a", "editable until Phase A POLUS begins")
@@ -498,26 +482,6 @@ def _first_existing_path(campaign_dir: Union[str, Path], patterns: Iterable[str]
     return None
 
 
-def _trajectory_pool_consumed(campaign_dir: Union[str, Path]) -> Optional[str]:
-    return _first_existing_path(
-        campaign_dir,
-        (
-            ".DATA/TRAJECTORY/pool.xyz",
-            ".DATA/TRAJECTORY/pool.manifest.json",
-        ),
-    )
-
-
-def _bootstrap_anchor_consumed(campaign_dir: Union[str, Path]) -> Optional[str]:
-    return _first_existing_path(
-        campaign_dir,
-        (
-            ".DATA/TRAJECTORY/anchor.xyz",
-            ".DATA/TRAJECTORY/ANCHOR_SOURCE.json",
-        ),
-    )
-
-
 def _phase_a_consumed(campaign_dir: Union[str, Path]) -> Optional[str]:
     intent = _phase_intent_file_exists(
         campaign_dir,
@@ -528,10 +492,11 @@ def _phase_a_consumed(campaign_dir: Union[str, Path]) -> Optional[str]:
     path = _first_existing_path(
         campaign_dir,
         (
-            "BOOTSTRAP/selection/SELECTION.json",
-            "BOOTSTRAP/selection/selected.xyz",
-            "BOOTSTRAP/selection/selected_indices.dat",
-            "BOOTSTRAP/allocation/POINT_ALLOCATION.json",
+            ".DATA/ACTIVE_LEARNING/CUSTOM_BOOTSTRAP.json",
+            ".DATA/BOOTSTRAP/selection/SELECTION.json",
+            ".DATA/BOOTSTRAP/selection/selected.xyz",
+            ".DATA/BOOTSTRAP/selection/selected_indices.dat",
+            ".DATA/BOOTSTRAP/allocation/POINT_ALLOCATION.json",
         ),
     )
     if path:
@@ -601,6 +566,7 @@ def _ferebus_first_consumed(campaign_dir: Union[str, Path]) -> Optional[str]:
     path = _first_existing_path(
         campaign_dir,
         (
+            ".DATA/ACTIVE_LEARNING/bootstrap_inputs/MODEL_BOOTSTRAP.json",
             ".DATA/ACTIVE_LEARNING/ferebus_split_assignments.json",
             ".DATA/ACTIVE_LEARNING/bootstrap_external_validation.json",
             "TRAINED_MODELS/iteration-staging/FEREBUS_TASKS.json",
@@ -1002,12 +968,6 @@ def _consumption_block_reason(
         return None
     if kind == "resource_future":
         return None
-    if kind == "pre_pool":
-        reason = _trajectory_pool_consumed(campaign_dir)
-        return None if reason is None else "trajectory pool has already been imported: " + reason
-    if kind == "pre_anchor":
-        reason = _bootstrap_anchor_consumed(campaign_dir)
-        return None if reason is None else "bootstrap anchor has already been imported: " + reason
     if kind == "pre_phase_a":
         return _phase_a_consumed(campaign_dir)
     if kind == "pre_gaussian_first":
