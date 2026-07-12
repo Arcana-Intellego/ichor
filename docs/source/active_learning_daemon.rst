@@ -474,7 +474,48 @@ fresh campaign rather than mixing storage contracts.
 Recovery + troubleshooting
 --------------------------
 
-The daemon writes two artefacts you care about during recovery:
+Stopping and resuming
+~~~~~~~~~~~~~~~~~~~~~
+
+Operator stops use a separate atomic control file rather than allowing the
+CLI process to rewrite ``state.json`` while the daemon owns it. The default
+stop is immediate at the next daemon tick; it does not cancel Slurm jobs::
+
+    ichor-al-daemon stop --campaign-dir .
+
+Two receipt-backed drain modes are available::
+
+    ichor-al-daemon stop --campaign-dir . --after-phase
+    ichor-al-daemon stop --campaign-dir . --after-iteration
+    ichor-al-daemon stop --campaign-dir . --after-iteration 12
+
+``--after-phase`` finishes the current phase only when durable evidence shows
+that the phase has started. Otherwise it stops before entering that phase.
+``--after-iteration`` stops after the current iteration by default, or after
+the explicitly numbered future iteration. Phase and iteration drains are
+completed only alongside the daemon's normal phase-completion receipt, so a
+restart cannot guess that a boundary was crossed.
+
+Job cancellation is deliberately restricted to immediate stops::
+
+    ichor-al-daemon stop --campaign-dir . --immediate --cancel-jobs
+
+The cancellation result is recorded in the stop control before the daemon
+clears matching pending-job and submission-intent metadata. If the CLI is
+interrupted while cancellation is in progress, rerun the same command.
+
+Use ``status`` and ``journal`` to monitor a drain. Once the boundary has been
+reached, ordinary ``resume`` archives the completed request and clears the
+stopped lifecycle. An unfinished drain survives a daemon crash and is still
+honoured by ordinary ``resume``. Withdraw it explicitly only when intended::
+
+    ichor-al-daemon resume --campaign-dir . --cancel-stop-request
+
+The control file lives at
+``.DATA/ACTIVE_LEARNING/stop_request.json``. Archived requests are retained
+under ``.DATA/ACTIVE_LEARNING/stop_request_history/`` for operator provenance.
+
+The daemon writes three artefacts you care about during recovery:
 
 - :code:`<campaign>/.DATA/ACTIVE_LEARNING/state.json` -- the canonical
   state checkpoint. Authoritative. If this file is missing or corrupt
@@ -483,6 +524,9 @@ The daemon writes two artefacts you care about during recovery:
 - :code:`<campaign>/.DATA/ACTIVE_LEARNING/journal.ndjson` -- append-only
   per-phase event log. Best-effort; you can drop the file and the
   daemon still works, you just lose post-mortem provenance.
+- :code:`<campaign>/.DATA/ACTIVE_LEARNING/stop_request.json` -- current
+  operator stop control. A malformed file is fail-closed and must be reviewed
+  before reconcile can be applied.
 
 If the daemon refuses to start because :code:`state.json` is missing or
 fails schema validation, run::

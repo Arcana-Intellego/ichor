@@ -197,6 +197,8 @@ def stateful_campaign_artifacts(campaign_dir: Union[str, Path]) -> List[str]:
         "reconcile_applied",
         "adopted_inflight_job",
         "tick_exception_halted",
+        "operator_stop_requested",
+        "operator_stop_boundary_reached",
     }
 
     def add_matches(pattern: str) -> None:
@@ -210,6 +212,8 @@ def stateful_campaign_artifacts(campaign_dir: Union[str, Path]) -> List[str]:
     add_matches(".DATA/" + BOOTSTRAP_DIRNAME + "/selection/selected.xyz")
     add_matches(".DATA/" + BOOTSTRAP_DIRNAME + "/selection/selected_indices.dat")
     add_matches(".DATA/" + BOOTSTRAP_DIRNAME + "/allocation/POINT_ALLOCATION.json")
+    add_matches(".DATA/ACTIVE_LEARNING/stop_request.json")
+    add_matches(".DATA/ACTIVE_LEARNING/stop_request_history/*.json")
     config_lock = campaign / ".DATA" / "ACTIVE_LEARNING" / "config_lock.json"
     pool_manifest = campaign / ".DATA" / "TRAJECTORY" / "pool.manifest.json"
     if config_lock.is_file() and not pool_manifest.is_file():

@@ -65,6 +65,7 @@ def build_daemon_argv(
     config: Optional[Path] = None,
     preset: Optional[str] = None,
     reopen_converged: bool = False,
+    cancel_stop_request: bool = False,
 ) -> List[str]:
     """Construct the daemon CLI argv for ``start`` or ``resume``."""
     if command not in ("start", "resume"):
@@ -75,6 +76,8 @@ def build_daemon_argv(
         )
     if reopen_converged and command != "resume":
         raise ValueError("reopen_converged is valid only with the resume command")
+    if cancel_stop_request and command != "resume":
+        raise ValueError("cancel_stop_request is valid only with the resume command")
     argv: List[str] = [
         sys.executable,
         "-m", "ichor.hpc.active_learning.cli",
@@ -92,6 +95,8 @@ def build_daemon_argv(
         argv += ["--max-ticks", str(int(max_ticks))]
     if reopen_converged:
         argv.append("--reopen-converged")
+    if cancel_stop_request:
+        argv.append("--cancel-stop-request")
     return argv
 
 
@@ -139,6 +144,7 @@ def launch_daemon_detached_checked(
     config: Optional[Path] = None,
     preset: Optional[str] = None,
     reopen_converged: bool = False,
+    cancel_stop_request: bool = False,
     log_path: Optional[Path] = None,
     pid_path: Optional[Path] = None,
     startup_grace_seconds: float = 0.25,
@@ -174,6 +180,7 @@ def launch_daemon_detached_checked(
         config=config,
         preset=preset,
         reopen_converged=bool(reopen_converged),
+        cancel_stop_request=bool(cancel_stop_request),
     )
     # This helper has already detached the process. Run the daemon itself in
     # foreground mode so it does not create an untracked grandchild.

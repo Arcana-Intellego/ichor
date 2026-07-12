@@ -1847,6 +1847,23 @@ def test_reconcile_preserves_operator_stop_until_resume(tmp_path, monkeypatch):
     assert "only resume may clear it" in " ".join(report.notes)
 
 
+def test_stop_control_makes_missing_state_a_recovery_case(tmp_path):
+    from ichor.hpc.active_learning.daemon.reconcile import stateful_campaign_artifacts
+    from ichor.hpc.active_learning.daemon.stop_control import (
+        build_stop_request,
+        install_stop_request,
+    )
+
+    campaign = tmp_path / "campaign"
+    campaign.mkdir()
+    state = fresh_campaign_state(max_iterations=2, campaign_uid="stop-control-test")
+    install_stop_request(campaign, build_stop_request(state, mode="immediate"))
+
+    assert str(Path(".DATA") / "ACTIVE_LEARNING" / "stop_request.json") in (
+        stateful_campaign_artifacts(campaign)
+    )
+
+
 def test_write_proposed_state_creates_proposed_file(tmp_path):
     campaign, data, _, _ = _campaign_dirs(tmp_path)
     report = propose_recovery(campaign)

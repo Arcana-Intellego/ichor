@@ -267,19 +267,46 @@ class DaemonControlFunctions:
 
     @staticmethod
     def stop_daemon():
-        """Set shutdown_requested=true in state.json so the running daemon
-        finishes its current tick and exits cleanly on the next."""
+        """Record an immediate, phase-boundary, or iteration-boundary stop."""
         from ichor.hpc.active_learning.cli import cmd_stop
 
         ns = _guarded_campaign_dir_ns()
         if ns is None:
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
-        answer = user_input_free_flow(
-            "Cancel active Slurm jobs too? Type YES to confirm: ",
-            "",
-        )
-        ns.cancel_jobs = str(answer).strip() == "YES"
+        answer = str(
+            user_input_free_flow(
+                "Stop mode: 1=immediate, 2=after current phase, "
+                "3=after iteration [1]: ",
+                "1",
+            )
+        ).strip().lower()
+        ns.after_iteration = None
+        if answer in {"2", "after-phase", "after_phase", "phase"}:
+            ns.stop_mode = "after_phase"
+        elif answer in {"3", "after-iteration", "after_iteration", "iteration"}:
+            ns.stop_mode = "immediate"
+            target = str(
+                user_input_free_flow(
+                    "Iteration number, or blank for the current iteration: ",
+                    "",
+                )
+            ).strip()
+            try:
+                ns.after_iteration = -1 if not target else int(target)
+            except ValueError:
+                print("Invalid iteration number; stop request was not submitted.")
+                user_input_free_flow("Press enter to return to the menu: ", "")
+                return
+        else:
+            ns.stop_mode = "immediate"
+        ns.cancel_jobs = False
+        if ns.stop_mode == "immediate" and ns.after_iteration is None:
+            cancel = user_input_free_flow(
+                "Cancel active Slurm jobs too? Type YES to confirm: ",
+                "",
+            )
+            ns.cancel_jobs = str(cancel).strip() == "YES"
         rc = cmd_stop(ns)
         if rc != 0:
             print("stop returned exit code " + str(rc))

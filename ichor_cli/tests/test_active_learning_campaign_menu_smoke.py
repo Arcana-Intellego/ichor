@@ -71,6 +71,8 @@ def test_daemon_control_stop_can_request_job_cancellation(monkeypatch):
 
     def fake_stop(ns):
         seen["cancel_jobs"] = ns.cancel_jobs
+        seen["stop_mode"] = ns.stop_mode
+        seen["after_iteration"] = ns.after_iteration
         return 0
 
     monkeypatch.setattr(
@@ -84,6 +86,42 @@ def test_daemon_control_stop_can_request_job_cancellation(monkeypatch):
     menu_mod.DaemonControlFunctions.stop_daemon()
 
     assert seen["cancel_jobs"] is True
+    assert seen["stop_mode"] == "immediate"
+    assert seen["after_iteration"] is None
+
+
+def test_daemon_control_stop_exposes_boundary_modes(monkeypatch):
+    import importlib
+
+    import ichor.hpc.active_learning.cli as cli_mod
+    menu_mod = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.daemon_control_menu"
+    )
+    calls = []
+    answers = iter(["2", "", "3", "4", ""])
+
+    monkeypatch.setattr(
+        menu_mod,
+        "_guarded_campaign_dir_ns",
+        lambda: SimpleNamespace(campaign_dir="/tmp/campaign"),
+    )
+    monkeypatch.setattr(
+        menu_mod,
+        "user_input_free_flow",
+        lambda prompt, default: next(answers),
+    )
+    monkeypatch.setattr(cli_mod, "cmd_stop", lambda ns: calls.append(ns) or 0)
+
+    menu_mod.DaemonControlFunctions.stop_daemon()
+    menu_mod.DaemonControlFunctions.stop_daemon()
+
+    assert calls[0].stop_mode == "after_phase"
+    assert calls[0].after_iteration is None
+    assert calls[0].cancel_jobs is False
+    assert calls[1].stop_mode == "immediate"
+    assert calls[1].after_iteration == 4
+    assert calls[1].cancel_jobs is False
 
 
 def test_daemon_control_archive_staging_dispatches_reconcile(monkeypatch):
@@ -1802,6 +1840,29 @@ def test_launch_helpers_builds_explicit_completed_campaign_reopen_argv(tmp_path)
     assert "--reopen-converged" in argv
 
 
+def test_launch_helpers_builds_stop_request_cancellation_argv(tmp_path):
+    from ichor.cli.useful_functions.launch_helpers import build_daemon_argv
+
+    argv = build_daemon_argv(
+        tmp_path,
+        command="resume",
+        mode="live",
+        cancel_stop_request=True,
+    )
+
+    assert "--cancel-stop-request" in argv
+
+    import pytest
+
+    with pytest.raises(ValueError, match="resume"):
+        build_daemon_argv(
+            tmp_path,
+            command="start",
+            mode="live",
+            cancel_stop_request=True,
+        )
+
+
 def test_launch_helpers_rejects_completed_campaign_reopen_with_start(tmp_path):
     import pytest
 
@@ -2250,11 +2311,13 @@ def test_foreground_launch_uses_resume_when_selected(tmp_path, monkeypatch):
     menu.start_daemon_foreground_menu_options.selected_poll_interval = 3
     menu.start_daemon_foreground_menu_options.selected_max_ticks = 2
     menu.start_daemon_foreground_menu_options.reopen_converged = True
+    menu.start_daemon_foreground_menu_options.cancel_stop_request = True
     rendered = menu.start_daemon_foreground_menu.this_menu_options()
     assert "command: resume" in rendered
     assert "poll_interval: 3" in rendered
     assert "max_ticks: 2" in rendered
     assert "reopen_converged: True" in rendered
+    assert "cancel_stop_request: True" in rendered
     assert "scope: menu-only; applies to next daemon launch" in rendered
     calls = []
     monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: "")
@@ -2271,6 +2334,7 @@ def test_foreground_launch_uses_resume_when_selected(tmp_path, monkeypatch):
     assert ns.poll_interval == 3
     assert ns.max_ticks == 2
     assert ns.reopen_converged is True
+    assert ns.cancel_stop_request is True
 
 
 def test_foreground_launch_rejects_completed_campaign_reopen_with_start(
@@ -2293,6 +2357,7 @@ def test_foreground_launch_rejects_completed_campaign_reopen_with_start(
     menu.start_daemon_foreground_menu_options.selected_config = ""
     menu.start_daemon_foreground_menu_options.selected_preset = ""
     menu.start_daemon_foreground_menu_options.reopen_converged = True
+    menu.start_daemon_foreground_menu_options.cancel_stop_request = False
     monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: "")
 
     menu.StartDaemonForegroundFunctions.launch()
@@ -2321,6 +2386,7 @@ def test_background_launch_reports_checked_result(tmp_path, monkeypatch, capsys)
     menu.start_daemon_background_menu_options.selected_poll_interval = 0
     menu.start_daemon_background_menu_options.selected_max_ticks = 0
     menu.start_daemon_background_menu_options.reopen_converged = True
+    menu.start_daemon_background_menu_options.cancel_stop_request = True
     menu.start_daemon_background_menu_options.selected_log_path = str(
         tmp_path / "daemon.custom.out"
     )
@@ -2334,6 +2400,7 @@ def test_background_launch_reports_checked_result(tmp_path, monkeypatch, capsys)
     assert "background_log: " in rendered
     assert "background_pid: " in rendered
     assert "reopen_converged: True" in rendered
+    assert "cancel_stop_request: True" in rendered
     assert "scope: menu-only; applies to next daemon launch" in rendered
     seen = {}
 
@@ -2356,4 +2423,5 @@ def test_background_launch_reports_checked_result(tmp_path, monkeypatch, capsys)
     assert seen["log_path"] == Path(tmp_path / "daemon.custom.out")
     assert seen["pid_path"] == Path(tmp_path / "daemon.custom.pid")
     assert seen["reopen_converged"] is True
+    assert seen["cancel_stop_request"] is True
     assert "exited during startup" in capsys.readouterr().out

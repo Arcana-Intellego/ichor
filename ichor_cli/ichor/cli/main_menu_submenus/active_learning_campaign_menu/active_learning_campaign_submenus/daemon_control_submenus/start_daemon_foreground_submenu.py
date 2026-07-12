@@ -47,6 +47,7 @@ START_DAEMON_FOREGROUND_DEFAULTS = {
     "selected_config": "",
     "selected_preset": "",
     "reopen_converged": False,
+    "cancel_stop_request": False,
 }
 
 
@@ -59,6 +60,7 @@ class StartDaemonForegroundMenuOptions(MenuOptions):
     selected_config: str
     selected_preset: str
     reopen_converged: bool
+    cancel_stop_request: bool
 
 
 start_daemon_foreground_menu_options = StartDaemonForegroundMenuOptions(
@@ -191,6 +193,13 @@ class StartDaemonForegroundFunctions:
             print("Completed-campaign reopen is valid only with the resume command.")
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
+        if (
+            start_daemon_foreground_menu_options.cancel_stop_request
+            and start_daemon_foreground_menu_options.selected_command != "resume"
+        ):
+            print("Stop-request cancellation is valid only with the resume command.")
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
         mode = start_daemon_foreground_menu_options.selected_mode
         ns = argparse.Namespace(
             campaign_dir=str(campaign_dir),
@@ -211,6 +220,9 @@ class StartDaemonForegroundFunctions:
             preset=preset_name,
             reopen_converged=bool(
                 start_daemon_foreground_menu_options.reopen_converged
+            ),
+            cancel_stop_request=bool(
+                start_daemon_foreground_menu_options.cancel_stop_request
             ),
             foreground=True,
             background=False,
@@ -284,6 +296,13 @@ START_DAEMON_FOREGROUND_FIELD_SPECS = [
         prompt="Explicitly reopen a completed campaign? ",
         item_text="Set explicit completed-campaign reopen",
         display_path="reopen_converged",
+    ),
+    spec(
+        "cancel_stop_request",
+        "bool",
+        prompt="Withdraw a pending stop request before resume? ",
+        item_text="Set pending stop-request cancellation",
+        display_path="cancel_stop_request",
     ),
 ]
 

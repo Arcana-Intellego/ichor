@@ -4,8 +4,7 @@ Console entry point 'ichor-al-daemon' registered in
 'ichor_cli/setup.cfg'. Subcommands available:
 
     start      Start the live daemon detached by default; use --foreground to block.
-    stop       Set shutdown_requested=true in state.json; running daemon picks
-               it up on next tick.
+    stop       Write a durable immediate or boundary stop request.
     status     Print the current state snapshot.
     resume     Equivalent to start when state.json already exists.
     reconcile  Inspect on-disk artefacts and propose a recovered state.
@@ -276,6 +275,30 @@ def _campaign_paths(campaign_dir: Path):
         "journal": data / "journal.ndjson",
         "background_log": data / BACKGROUND_LOG_FILENAME,
         "background_pid": data / BACKGROUND_PID_FILENAME,
+        "stop_request": data / "stop_request.json",
+    }
+
+
+def _stop_control_status(
+    campaign: Path,
+    *,
+    expected_campaign_uid: Optional[str] = None,
+) -> Dict[str, Any]:
+    from .daemon.stop_control import read_stop_request, stop_request_summary
+
+    try:
+        request = read_stop_request(
+            campaign,
+            expected_campaign_uid=expected_campaign_uid,
+        )
+    except Exception as exc:
+        return {
+            "stop_request": None,
+            "stop_control_error": type(exc).__name__ + ": " + str(exc),
+        }
+    return {
+        "stop_request": stop_request_summary(request),
+        "stop_control_error": None,
     }
 
 
@@ -422,6 +445,22 @@ def _reconcile_runtime_status(campaign: Path) -> Dict[str, Any]:
             + str(status.get("background_pid"))
             + " appears alive"
         )
+    expected_uid = None
+    try:
+        expected_uid = str(read_state(paths["state"]).campaign_uid)
+    except Exception:
+        pass
+    status.update(
+        _stop_control_status(
+            campaign,
+            expected_campaign_uid=expected_uid,
+        )
+    )
+    if status.get("stop_control_error"):
+        blockers.append(
+            "stop-control metadata is invalid: "
+            + str(status.get("stop_control_error"))
+        )
     status["reconcile_apply_blockers"] = blockers
     return status
 
@@ -430,28 +469,40 @@ def _print_reconcile_runtime_warning(status: Dict[str, Any], campaign: Path) -> 
     blockers = list(status.get("reconcile_apply_blockers") or [])
     if not blockers:
         return
-    print("WARNING: a daemon may still be running for this campaign.", file=sys.stderr)
-    for blocker in blockers:
-        print("  - " + str(blocker), file=sys.stderr)
-    print("Lock: " + _lock_summary(status.get("lock_held")), file=sys.stderr)
-    print("Lease: " + _heartbeat_summary(status.get("lease_heartbeat")), file=sys.stderr)
-    print(
-        "Background pid: "
-        + str(status.get("background_pid"))
-        + " alive="
-        + str(status.get("background_pid_alive")),
-        file=sys.stderr,
-    )
-    print(
-        "Do not apply recovery while the daemon is active. If this daemon should stop, run:",
-        file=sys.stderr,
-    )
-    print(
-        "  ichor-al-daemon stop --campaign-dir "
-        + str(campaign)
-        + " --cancel-jobs",
-        file=sys.stderr,
-    )
+    daemon_blockers = [
+        blocker
+        for blocker in blockers
+        if not str(blocker).startswith("stop-control metadata is invalid:")
+    ]
+    if daemon_blockers:
+        print("WARNING: a daemon may still be running for this campaign.", file=sys.stderr)
+        for blocker in daemon_blockers:
+            print("  - " + str(blocker), file=sys.stderr)
+        print("Lock: " + _lock_summary(status.get("lock_held")), file=sys.stderr)
+        print("Lease: " + _heartbeat_summary(status.get("lease_heartbeat")), file=sys.stderr)
+        print(
+            "Background pid: "
+            + str(status.get("background_pid"))
+            + " alive="
+            + str(status.get("background_pid_alive")),
+            file=sys.stderr,
+        )
+        print(
+            "Do not apply recovery while the daemon is active. If this daemon should stop, run:",
+            file=sys.stderr,
+        )
+        print(
+            "  ichor-al-daemon stop --campaign-dir "
+            + str(campaign)
+            + " --cancel-jobs",
+            file=sys.stderr,
+        )
+    if status.get("stop_control_error"):
+        print(
+            "WARNING: operator stop control is invalid: "
+            + str(status.get("stop_control_error")),
+            file=sys.stderr,
+        )
 
 
 def _read_last_exception_summary(campaign: Path) -> str:
@@ -1289,6 +1340,30 @@ def _daemon_activity_status(payload: Dict[str, Any]) -> str:
 
 
 def _format_runtime_status(payload: Dict[str, Any], *, verbose: bool) -> List[str]:
+    stop_request = payload.get("stop_request")
+    if isinstance(stop_request, dict):
+        target = "next tick"
+        if stop_request.get("target_phase") is not None:
+            target = (
+                str(stop_request.get("target_phase"))
+                + "@"
+                + str(stop_request.get("target_iteration"))
+                + " round="
+                + str(stop_request.get("target_replacement_round"))
+            )
+        elif stop_request.get("target_iteration") is not None:
+            target = "iteration " + str(stop_request.get("target_iteration"))
+        stop_summary = (
+            str(stop_request.get("mode"))
+            + " / "
+            + str(stop_request.get("status"))
+            + " / target "
+            + target
+        )
+    elif payload.get("stop_control_error"):
+        stop_summary = "invalid: " + str(payload.get("stop_control_error"))
+    else:
+        stop_summary = "none"
     rows: List[tuple[str, Any]] = [
         ("daemon", _daemon_activity_status(payload)),
         ("recorded Slurm jobs", _active_pending_jobs_summary(payload.get("pending_jobs"))),
@@ -1296,6 +1371,7 @@ def _format_runtime_status(payload: Dict[str, Any], *, verbose: bool) -> List[st
             "submission intents",
             _format_active_submission_intents(payload.get("active_submission_intents")),
         ),
+        ("operator stop control", stop_summary),
         ("shutdown requested", "yes" if payload.get("shutdown_requested") else "no"),
     ]
     allocation = payload.get("point_allocation_summary")
@@ -1320,6 +1396,14 @@ def _format_runtime_status(payload: Dict[str, Any], *, verbose: bool) -> List[st
                     _format_background_daemon(
                         payload.get("background_pid"),
                         payload.get("background_pid_alive"),
+                    ),
+                ),
+                (
+                    "stop request id",
+                    (
+                        stop_request.get("request_id")
+                        if isinstance(stop_request, dict)
+                        else None
                     ),
                 ),
             ]
@@ -1438,6 +1522,7 @@ def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path
                     ("lease", payload.get("lease_path")),
                     ("background_log", payload.get("background_log_path")),
                     ("background_pid_file", payload.get("background_pid_path")),
+                    ("stop_request", payload.get("stop_request_path")),
                 ],
             )
         )
@@ -1476,6 +1561,27 @@ def _format_status_unavailable(payload: Dict[str, Any]) -> str:
     if payload.get("state_error"):
         lines.append("")
         lines.extend(_section("State", [("error", payload.get("state_error"))]))
+    if payload.get("stop_request") or payload.get("stop_control_error"):
+        lines.append("")
+        stop_request = payload.get("stop_request")
+        lines.extend(
+            _section(
+                "Operator Stop Control",
+                [
+                    (
+                        "request",
+                        (
+                            str(stop_request.get("mode"))
+                            + " / "
+                            + str(stop_request.get("status"))
+                            if isinstance(stop_request, dict)
+                            else "invalid"
+                        ),
+                    ),
+                    ("error", payload.get("stop_control_error")),
+                ],
+            )
+        )
     lines.append("")
     lines.extend(_format_recommendations(payload))
     return "\n".join(lines) + "\n"
@@ -1579,6 +1685,11 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "committed_artifact_settle_retry": "waiting for committed artefacts",
     "resolved_phase_resources": "resources resolved",
     "operator_cancelled_jobs": "operator cancelled jobs",
+    "operator_stop_requested": "operator stop requested",
+    "operator_stop_boundary_reached": "operator stop boundary reached",
+    "operator_stop_control_invalid": "operator stop control invalid",
+    "operator_stop_request_cancelled": "operator stop request cancelled",
+    "operator_stop_resumed": "operator stop resumed",
     "sacct_empty_timeout": "Slurm accounting empty timeout",
     "sacct_missing_timeout": "Slurm accounting timeout",
     "sacct_unknown_timeout": "Slurm UNKNOWN timeout",
@@ -1644,6 +1755,8 @@ _JOURNAL_OK_EVENTS = {
     "bootstrap_inputs_confirmed",
     "model_bootstrap_committed",
     "error_calibration_summary",
+    "operator_stop_boundary_reached",
+    "operator_stop_resumed",
 }
 
 _JOURNAL_RUN_EVENTS = {
@@ -1661,6 +1774,7 @@ _JOURNAL_WAIT_EVENTS = {
     "sacct_rows_missing_but_squeue_active",
     "postprocess_settle_retry",
     "committed_artifact_settle_retry",
+    "operator_stop_requested",
 }
 
 _JOURNAL_WARN_EVENTS = {
@@ -1673,6 +1787,7 @@ _JOURNAL_WARN_EVENTS = {
     "ariadne_optional_diagnostics_warning",
     "phase_b_novelty_threshold_relaxed",
     "daemon_lease_stale_recovered",
+    "operator_stop_request_cancelled",
 }
 
 _JOURNAL_FAIL_EVENTS = {
@@ -1689,6 +1804,7 @@ _JOURNAL_FAIL_EVENTS = {
     "live_postprocess_refused",
     "error_calibration_failed",
     "job_adopt_check_failed",
+    "operator_stop_control_invalid",
 }
 
 _SQUEUE_RUNNING_STATES = {"R", "RUNNING", "CG", "COMPLETING"}
@@ -2501,25 +2617,37 @@ def _cancel_recorded_slurm_jobs(campaign: Path, state: Any) -> Dict[str, Any]:
         cancelled.append({
             "job_id": job_id,
             "phases": phases,
+            "intent_keys": [
+                {"phase": str(phase_name), "iteration": int(iteration)}
+                for phase_name, iteration in sorted(item.get("intent_keys", set()))
+            ],
         })
-        for phase in phases:
-            if state.pending_jobs.get(phase) == job_id:
-                state.pending_jobs[phase] = None
-        for phase_name, iteration in sorted(item.get("intent_keys", set())):
-            try:
-                _submission_intent.mark_failed(
-                    campaign,
-                    str(phase_name),
-                    int(iteration),
-                    "operator_cancelled_via_stop",
-                )
-            except Exception:
-                pass
     return {
         "cancelled": cancelled,
         "skipped": skipped,
         "failed": failed,
     }
+
+
+def _mark_cancelled_intents_without_state(
+    campaign: Path,
+    summary: Mapping[str, Any],
+) -> None:
+    for item in (summary.get("cancelled") or []):
+        if not isinstance(item, Mapping):
+            continue
+        for key in (item.get("intent_keys") or []):
+            if not isinstance(key, Mapping):
+                continue
+            try:
+                _submission_intent.mark_failed(
+                    campaign,
+                    str(key["phase"]),
+                    int(key["iteration"]),
+                    "operator_cancelled_via_stop",
+                )
+            except Exception:
+                pass
 
 
 def _journal_cancel_jobs_summary(journal_path: Path, summary: Dict[str, Any]) -> None:
@@ -2587,6 +2715,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
                 iteration=0,
             )
             cancel_summary = _cancel_recorded_slurm_jobs(campaign, fallback_state)
+            _mark_cancelled_intents_without_state(campaign, cancel_summary)
             _journal_cancel_jobs_summary(paths["journal"], cancel_summary)
             _print_cancel_jobs_summary(cancel_summary)
             return 10 if cancel_summary.get("failed") else 0
@@ -2608,31 +2737,115 @@ def cmd_stop(args: argparse.Namespace) -> int:
                 iteration=0,
             )
             cancel_summary = _cancel_recorded_slurm_jobs(campaign, fallback_state)
+            _mark_cancelled_intents_without_state(campaign, cancel_summary)
             _journal_cancel_jobs_summary(paths["journal"], cancel_summary)
             _print_cancel_jobs_summary(cancel_summary)
             return 10 if cancel_summary.get("failed") else 0
         print("state.json invalid: " + str(exc), file=sys.stderr)
         return 5
-    stopped_from_phase = state.phase
-    state.shutdown_requested = True
-    state.lifecycle_context = make_lifecycle_context(
-        disposition="stopped",
-        reason_code="operator_stop_request",
-        message="operator requested an orderly campaign stop",
-        from_phase=stopped_from_phase,
-        iteration=int(state.iteration),
-        source="cli_stop",
-        scheduler_uncertain=any(bool(value) for value in state.pending_jobs.values()),
-        recovery_action="use resume to continue from the recorded phase",
-        details={"cancel_jobs_requested": bool(getattr(args, "cancel_jobs", False))},
+    if state.is_terminal:
+        print(
+            "campaign is already "
+            + state.phase.value
+            + "; no daemon stop request was recorded",
+            file=sys.stderr,
+        )
+        return 6
+    from .daemon.stop_control import (
+        StopControlError,
+        build_stop_request,
+        install_stop_request,
+        update_stop_request,
     )
+
+    after_iteration = getattr(args, "after_iteration", None)
+    mode = (
+        "after_iteration"
+        if after_iteration is not None
+        else str(getattr(args, "stop_mode", "immediate") or "immediate")
+    )
+    cancel_jobs = bool(getattr(args, "cancel_jobs", False))
+    if cancel_jobs and mode != "immediate":
+        print("--cancel-jobs is valid only with --immediate", file=sys.stderr)
+        return 2
+    phase_started = bool(state.pending_jobs.get(state.phase.value))
+    try:
+        intent = _submission_intent.load_intent(
+            campaign,
+            state.phase.value,
+            int(state.iteration),
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+    except Exception:
+        intent = None
+    if isinstance(intent, dict):
+        try:
+            phase_started = phase_started or int(
+                intent.get("replacement_round", 0)
+            ) == int(state.replacement_round)
+        except (TypeError, ValueError):
+            phase_started = True
+    target_iteration = None
+    if mode == "after_iteration" and after_iteration not in (None, -1):
+        target_iteration = int(after_iteration)
+    try:
+        requested = build_stop_request(
+            state,
+            mode=mode,
+            target_iteration=target_iteration,
+            phase_started=phase_started,
+            cancel_jobs=cancel_jobs,
+        )
+        request, disposition = install_stop_request(campaign, requested)
+    except StopControlError as exc:
+        print("stop request rejected: " + str(exc), file=sys.stderr)
+        return 2
+    try:
+        from .daemon.journal import append_event
+
+        append_event(
+            paths["journal"],
+            "operator_stop_requested",
+            request_id=str(request.get("request_id")),
+            mode=str(request.get("mode")),
+            status=str(request.get("status")),
+            phase=state.phase.value,
+            iteration=int(state.iteration),
+            target_phase=request.get("target_phase"),
+            target_iteration=request.get("target_iteration"),
+            target_replacement_round=request.get("target_replacement_round"),
+            phase_started=bool(request.get("phase_started_at_request")),
+            disposition=str(disposition),
+        )
+    except Exception:
+        pass
     cancel_summary = None
-    if bool(getattr(args, "cancel_jobs", False)):
+    if cancel_jobs:
         cancel_summary = _cancel_recorded_slurm_jobs(campaign, state)
-    write_state(paths["state"], state)
+        updated = update_stop_request(
+            campaign,
+            str(request.get("request_id")),
+            status="requested",
+            cancellation_summary=cancel_summary,
+        )
+        if updated is not None:
+            request = updated
     if cancel_summary is not None:
         _journal_cancel_jobs_summary(paths["journal"], cancel_summary)
-    print("shutdown_requested=true set in " + str(paths["state"]))
+    print("stop request recorded: " + str(paths["stop_request"]))
+    print("request id: " + str(request.get("request_id")))
+    print("mode: " + str(request.get("mode")))
+    if request.get("target_phase") is not None:
+        print(
+            "target: "
+            + str(request.get("target_phase"))
+            + "@"
+            + str(request.get("target_iteration"))
+            + " replacement_round="
+            + str(request.get("target_replacement_round"))
+        )
+    elif request.get("target_iteration") is not None:
+        print("target iteration: " + str(request.get("target_iteration")))
     background = _probe_background_daemon(
         paths["background_pid"],
         paths["background_log"],
@@ -2679,6 +2892,31 @@ def format_recovery_dashboard(campaign_dir: Path) -> str:
                 + str(exc)[:120]
             )
     lines.extend(_section("State", [("state.json", state_status)]))
+    stop_status = _stop_control_status(
+        campaign,
+        expected_campaign_uid=(
+            str(state.campaign_uid) if state is not None else None
+        ),
+    )
+    stop_request = stop_status.get("stop_request")
+    lines.extend(
+        _section(
+            "Operator stop control",
+            [
+                (
+                    "request",
+                    (
+                        str(stop_request.get("mode"))
+                        + " / "
+                        + str(stop_request.get("status"))
+                        if isinstance(stop_request, dict)
+                        else "none"
+                    ),
+                ),
+                ("error", stop_status.get("stop_control_error")),
+            ],
+        )
+    )
     lines.extend(
         _section(
             "Last exception",
@@ -2850,7 +3088,9 @@ def cmd_status(args: argparse.Namespace) -> int:
             "status_error": "state_missing",
             "state_path": str(paths["state"]),
             "campaign_dir": str(campaign),
+            "stop_request_path": str(paths["stop_request"]),
         }
+        payload.update(_stop_control_status(campaign))
         payload.update(_missing_state_context(campaign))
         try:
             cfg = CampaignConfig.from_yaml(campaign / "campaign.yaml")
@@ -2878,7 +3118,9 @@ def cmd_status(args: argparse.Namespace) -> int:
             "state_error": type(exc).__name__ + ": " + str(exc),
             "state_path": str(paths["state"]),
             "campaign_dir": str(campaign),
+            "stop_request_path": str(paths["stop_request"]),
         }
+        payload.update(_stop_control_status(campaign))
         payload["recommendations"] = recommendation_dicts(
             build_status_recommendations(campaign, payload, paths["journal"])
         )
@@ -2892,6 +3134,13 @@ def cmd_status(args: argparse.Namespace) -> int:
     payload = state.to_dict()
     payload["state_path"] = str(paths["state"])
     payload["lock_path"] = str(paths["lock"])
+    payload["stop_request_path"] = str(paths["stop_request"])
+    payload.update(
+        _stop_control_status(
+            campaign,
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+    )
     payload.update(_probe_daemon_lock(paths["lock"]))
     payload.update(_probe_daemon_lease(paths["lease"]))
     payload.update(_probe_background_daemon(paths["background_pid"], paths["background_log"]))
@@ -2971,7 +3220,8 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_resume(args: argparse.Namespace) -> int:
     campaign = resolve_campaign_dir(args.campaign_dir)
-    state_path = _campaign_paths(campaign)["state"]
+    paths = _campaign_paths(campaign)
+    state_path = paths["state"]
     if state_path.exists():
         try:
             state = read_state(state_path)
@@ -2986,6 +3236,57 @@ def cmd_resume(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 6
+        try:
+            from .daemon.stop_control import (
+                archive_and_clear_stop_request,
+                read_stop_request,
+            )
+
+            stop_request = read_stop_request(
+                campaign,
+                expected_campaign_uid=str(state.campaign_uid),
+            )
+        except Exception as exc:
+            print(
+                "stop-control metadata is invalid; run status and reconcile "
+                "before resuming: " + str(exc),
+                file=sys.stderr,
+            )
+            return 7
+
+        def archive_stop_request(status: str, event_type: str) -> bool:
+            nonlocal stop_request
+            if stop_request is None:
+                return True
+            archived_request = dict(stop_request)
+            try:
+                archived = archive_and_clear_stop_request(
+                    campaign,
+                    status=status,
+                    expected_request_id=str(archived_request.get("request_id")),
+                )
+            except Exception as exc:
+                print(
+                    "could not archive operator stop request: " + str(exc),
+                    file=sys.stderr,
+                )
+                return False
+            stop_request = None
+            try:
+                from .daemon.journal import append_event
+
+                append_event(
+                    paths["journal"],
+                    event_type,
+                    request_id=str(archived_request.get("request_id")),
+                    mode=str(archived_request.get("mode")),
+                    prior_status=str(archived_request.get("status")),
+                    archive_path=(None if archived is None else str(archived)),
+                )
+            except Exception:
+                pass
+            return True
+
         if state.phase is CampaignPhase.DONE:
             if not bool(getattr(args, "reopen_converged", False)):
                 print(
@@ -3058,6 +3359,15 @@ def cmd_resume(args: argparse.Namespace) -> int:
                 "reopened completed campaign at SEED_SELECT iteration "
                 + str(int(state.iteration))
             )
+            if not archive_stop_request(
+                "cancelled" if bool(getattr(args, "cancel_stop_request", False)) else "resumed",
+                (
+                    "operator_stop_request_cancelled"
+                    if bool(getattr(args, "cancel_stop_request", False))
+                    else "operator_stop_resumed"
+                ),
+            ):
+                return 7
         if state.shutdown_requested:
             context = state.lifecycle_context or {}
             if context and str(context.get("disposition") or "") != "stopped":
@@ -3071,6 +3381,28 @@ def cmd_resume(args: argparse.Namespace) -> int:
             state.lifecycle_context = None
             write_state(state_path, state)
             print("shutdown_requested=false set in " + str(state_path))
+            if not archive_stop_request(
+                "cancelled" if bool(getattr(args, "cancel_stop_request", False)) else "resumed",
+                (
+                    "operator_stop_request_cancelled"
+                    if bool(getattr(args, "cancel_stop_request", False))
+                    else "operator_stop_resumed"
+                ),
+            ):
+                return 7
+        elif bool(getattr(args, "cancel_stop_request", False)):
+            if not archive_stop_request(
+                "cancelled",
+                "operator_stop_request_cancelled",
+            ):
+                return 7
+        elif stop_request is not None:
+            print(
+                "active stop request retained; the resumed daemon will honour "
+                + str(stop_request.get("mode"))
+                + " request "
+                + str(stop_request.get("request_id"))
+            )
     return cmd_start(args)
 
 
@@ -6519,13 +6851,40 @@ Examples:
 
     p_stop = sub.add_parser(
         "stop",
-        help="Request a graceful shutdown.",
+        help="Request an immediate or receipt-backed boundary stop.",
         description=(
-            "Request daemon shutdown for the resolved campaign. Plain stop does "
-            "not cancel Slurm jobs unless --cancel-jobs is supplied."
+            "Request daemon shutdown for the resolved campaign. Plain stop is "
+            "immediate at the next tick and does not cancel Slurm jobs."
         ),
     )
     add_campaign(p_stop)
+    stop_modes = p_stop.add_mutually_exclusive_group()
+    stop_modes.add_argument(
+        "--immediate",
+        dest="stop_mode",
+        action="store_const",
+        const="immediate",
+        help="Stop at the next daemon tick (default).",
+    )
+    stop_modes.add_argument(
+        "--after-phase",
+        dest="stop_mode",
+        action="store_const",
+        const="after_phase",
+        help="Finish the current started phase and stop before the next phase.",
+    )
+    stop_modes.add_argument(
+        "--after-iteration",
+        nargs="?",
+        const=-1,
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Finish the current iteration, or explicit iteration N, then stop "
+            "before the next iteration."
+        ),
+    )
     p_stop.add_argument(
         "-x",
         "--cancel-jobs",
@@ -6535,7 +6894,7 @@ Examples:
             "Plain stop only requests daemon shutdown and leaves jobs alone."
         ),
     )
-    p_stop.set_defaults(func=cmd_stop)
+    p_stop.set_defaults(func=cmd_stop, stop_mode="immediate")
 
     p_status = sub.add_parser(
         "status",
@@ -6583,6 +6942,14 @@ Examples:
         help=(
             "Explicitly reopen a DONE campaign at the next SEED_SELECT after "
             "campaign.max_iterations has been increased."
+        ),
+    )
+    p_resume.add_argument(
+        "--cancel-stop-request",
+        action="store_true",
+        help=(
+            "Archive and cancel an unfinished boundary stop request before "
+            "resuming. A completed operator stop is cleared by ordinary resume."
         ),
     )
     add_background_options(p_resume)

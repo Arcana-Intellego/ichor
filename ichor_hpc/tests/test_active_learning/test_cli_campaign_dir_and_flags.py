@@ -132,6 +132,17 @@ def test_reconcile_status_stop_and_preflight_short_flags_parse(tmp_path):
     stop = _parse(["stop", "-c", str(campaign), "-x"])
     assert stop.campaign_dir == str(campaign)
     assert stop.cancel_jobs is True
+    assert stop.stop_mode == "immediate"
+    assert stop.after_iteration is None
+
+    after_phase = _parse(["stop", "-c", str(campaign), "--after-phase"])
+    assert after_phase.stop_mode == "after_phase"
+    assert after_phase.after_iteration is None
+
+    after_iteration = _parse(
+        ["stop", "-c", str(campaign), "--after-iteration", "7"]
+    )
+    assert after_iteration.after_iteration == 7
 
     status = _parse(["status", "-c", str(campaign), "-j", "-v"])
     assert status.json is True

@@ -29,6 +29,15 @@ from ichor.hpc.active_learning.daemon.status_recommendations import (
     build_status_recommendations,
     recommendation_dicts,
 )
+from ichor.hpc.active_learning.daemon.stop_control import (
+    archive_and_clear_stop_request,
+    build_stop_request,
+    complete_stop_request,
+    install_stop_request,
+    read_stop_request,
+    stop_request_history_dir,
+    stop_request_path,
+)
 from ichor.hpc.active_learning.handoff_manifests import (
     ARIADNE_RESULTS_SCHEMA_VERSION,
     write_ariadne_batch_decision,
@@ -1273,14 +1282,36 @@ def test_status_recommendation_dicts_are_json_ready(tmp_path):
     assert "primary" in data[0]
 
 
-def test_cli_stop_sets_shutdown_flag(tmp_path):
+def test_status_recommends_repeating_incomplete_job_cancellation(tmp_path):
+    campaign = _campaign_with_config(tmp_path)
+    recommendations = build_status_recommendations(
+        campaign,
+        {
+            "shutdown_requested": False,
+            "stop_request": {
+                "request_id": "request-1",
+                "mode": "immediate",
+                "status": "cancelling",
+            },
+        },
+    )
+
+    assert recommendations[0].code == "operator_stop_cancellation_incomplete"
+    assert "--immediate --cancel-jobs" in str(recommendations[0].command)
+
+
+def test_cli_stop_records_request_without_rewriting_state(tmp_path):
     campaign = _campaign_with_config(tmp_path)
     (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
     write_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME, fresh_campaign_state())
     rc = main(["stop", "--campaign-dir", str(campaign)])
     assert rc == 0
     s = read_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME)
-    assert s.shutdown_requested is True
+    assert s.shutdown_requested is False
+    request = read_stop_request(campaign, expected_campaign_uid=s.campaign_uid)
+    assert request is not None
+    assert request["mode"] == "immediate"
+    assert request["status"] == "requested"
 
 
 def test_cli_stop_without_cancel_jobs_does_not_call_scancel(tmp_path, monkeypatch):
@@ -1299,11 +1330,70 @@ def test_cli_stop_without_cancel_jobs_does_not_call_scancel(tmp_path, monkeypatc
 
     assert rc == 0
     stopped = read_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME)
-    assert stopped.shutdown_requested is True
+    assert stopped.shutdown_requested is False
     assert stopped.pending_jobs[CampaignPhase.INITIAL_GAUSSIAN.value] == "123"
 
 
-def test_cli_stop_cancel_jobs_cancels_pending_job_and_clears_state(
+def test_cli_stop_records_phase_and_iteration_boundaries(tmp_path):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state(max_iterations=2)
+    state.phase = CampaignPhase.AIMALL
+    state.iteration = 1
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+
+    assert main(["stop", "--campaign-dir", str(campaign), "--after-phase"]) == 0
+    phase_request = read_stop_request(campaign)
+    assert phase_request["mode"] == "after_phase"
+    assert phase_request["target_phase"] == CampaignPhase.AIMALL.value
+    assert phase_request["target_iteration"] == 1
+
+    assert main(["stop", "--campaign-dir", str(campaign), "--immediate"]) == 0
+    archive_and_clear_stop_request(campaign, status="test_reset")
+
+    assert main(
+        ["stop", "--campaign-dir", str(campaign), "--after-iteration"]
+    ) == 0
+    iteration_request = read_stop_request(campaign)
+    assert iteration_request["mode"] == "after_iteration"
+    assert iteration_request["target_iteration"] == 1
+
+
+def test_cli_rejects_job_cancellation_for_boundary_stop(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    write_state(data / DEFAULT_STATE_FILENAME, fresh_campaign_state())
+
+    rc = main(
+        [
+            "stop",
+            "--campaign-dir",
+            str(campaign),
+            "--after-phase",
+            "--cancel-jobs",
+        ]
+    )
+
+    assert rc == 2
+    assert "valid only with --immediate" in capsys.readouterr().err
+
+
+def test_cli_stop_rejects_already_terminal_campaign(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state()
+    state.phase = CampaignPhase.DONE
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+
+    assert main(["stop", "--campaign-dir", str(campaign)]) == 6
+    assert "already DONE" in capsys.readouterr().err
+    assert not stop_request_path(campaign).exists()
+
+
+def test_cli_stop_cancel_jobs_records_cancellation_without_rewriting_state(
     tmp_path,
     capsys,
     monkeypatch,
@@ -1340,12 +1430,15 @@ def test_cli_stop_cancel_jobs_cancels_pending_job_and_clears_state(
     assert rc == 0
     assert cancelled == ["123"]
     stopped = read_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME)
-    assert stopped.shutdown_requested is True
-    assert stopped.pending_jobs[phase] is None
+    assert stopped.shutdown_requested is False
+    assert stopped.pending_jobs[phase] == "123"
+    request = read_stop_request(campaign, expected_campaign_uid=state.campaign_uid)
+    assert request["status"] == "requested"
+    assert request["cancellation_summary"]["cancelled"][0]["job_id"] == "123"
     assert "Cancelled Slurm jobs" in out
 
 
-def test_cli_stop_cancel_jobs_cancels_ferebus_intent_with_expected_job_name(
+def test_cli_stop_cancel_jobs_records_ferebus_intent_for_daemon_cleanup(
     tmp_path,
     monkeypatch,
 ):
@@ -1398,8 +1491,7 @@ def test_cli_stop_cancel_jobs_cancels_ferebus_intent_with_expected_job_name(
         CampaignPhase.INITIAL_FEREBUS.value,
         0,
     )
-    assert intent["status"] == "FAILED"
-    assert intent["reason"] == "operator_cancelled_via_stop"
+    assert intent["status"] == "SUBMITTED"
 
 
 def test_cli_stop_cancel_jobs_uses_intents_when_state_missing(
@@ -1532,7 +1624,7 @@ def test_cli_stop_cancel_jobs_refuses_inconclusive_scheduler_lookup(
     assert rc == 10
     assert "squeue lookup inconclusive" in err
     stopped = read_state(data / DEFAULT_STATE_FILENAME)
-    assert stopped.shutdown_requested is True
+    assert stopped.shutdown_requested is False
     assert stopped.pending_jobs[CampaignPhase.INITIAL_GAUSSIAN.value] == "789"
 
 
@@ -1569,7 +1661,7 @@ def test_cli_stop_cancel_jobs_skips_invalid_squeue_job_id(
     assert "Skipped Slurm jobs" in out
     assert "not active in squeue" in out
     stopped = read_state(data / DEFAULT_STATE_FILENAME)
-    assert stopped.shutdown_requested is True
+    assert stopped.shutdown_requested is False
     assert stopped.pending_jobs[CampaignPhase.INITIAL_GAUSSIAN.value] == "789"
 
 
@@ -1614,6 +1706,11 @@ def test_cli_resume_explicitly_clears_shutdown_flag(tmp_path):
     campaign = _campaign_with_config(tmp_path)
     (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
     state = fresh_campaign_state()
+    request, _ = install_stop_request(
+        campaign,
+        build_stop_request(state, mode="immediate"),
+    )
+    complete_stop_request(campaign, request["request_id"], reason="immediate")
     state.shutdown_requested = True
     _write_locked_state(campaign, state)
     rc = main([
@@ -1623,6 +1720,44 @@ def test_cli_resume_explicitly_clears_shutdown_flag(tmp_path):
     assert rc == 0
     s = read_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME)
     assert s.shutdown_requested is False
+    assert not stop_request_path(campaign).exists()
+    assert (stop_request_history_dir(campaign) / (request["request_id"] + ".json")).is_file()
+
+
+def test_cli_status_reports_pending_stop_request(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state(max_iterations=2)
+    state.phase = CampaignPhase.SEED_SELECT
+    state.iteration = 1
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    install_stop_request(
+        campaign,
+        build_stop_request(state, mode="after_iteration"),
+    )
+
+    assert main(["status", "--campaign-dir", str(campaign), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["stop_request"]["mode"] == "after_iteration"
+    assert payload["stop_request"]["target_iteration"] == 1
+    assert payload["next_action"] == (
+        "resume the daemon so it can honour the pending stop boundary"
+    )
+
+
+def test_reconcile_apply_refuses_malformed_stop_control(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    _write_locked_state(campaign, fresh_campaign_state())
+    stop_request_path(campaign).write_text("{bad json", encoding="utf-8")
+
+    rc = main(["reconcile", "--campaign-dir", str(campaign), "--apply"])
+
+    assert rc == 9
+    captured = capsys.readouterr()
+    assert "stop-control metadata is invalid" in captured.err
 
 
 def test_cli_start_background_spawns_child_without_shell(tmp_path, monkeypatch, capsys):

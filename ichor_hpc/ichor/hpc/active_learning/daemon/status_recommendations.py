@@ -629,6 +629,16 @@ def build_status_recommendations(
     """Return ordered operator recommendations for a status payload."""
     del journal_path  # reserved for future journal-dependent detail expansion
     campaign = Path(campaign_dir)
+    if payload.get("stop_control_error"):
+        return [
+            StatusRecommendation(
+                code="stop_control_invalid",
+                severity="required",
+                primary="inspect and reconcile the malformed operator stop control before continuing",
+                why=_short_error(payload.get("stop_control_error")),
+                command=_reconcile_cmd(campaign),
+            )
+        ]
     feasibility = payload.get("pool_feasibility")
     feasibility_error = (
         str(feasibility.get("error") or "")
@@ -698,6 +708,71 @@ def build_status_recommendations(
                 primary="run reconcile; do not restart until state.json is repaired",
                 why=_short_error(payload.get("state_error")),
                 command=_reconcile_cmd(campaign),
+            )
+        ]
+
+    stop_request = payload.get("stop_request")
+    if isinstance(stop_request, dict) and not payload.get("shutdown_requested"):
+        if str(stop_request.get("status")) == "cancelling":
+            return [
+                StatusRecommendation(
+                    code="operator_stop_cancellation_incomplete",
+                    severity="required",
+                    primary="rerun the immediate stop command to finish recorded Slurm cancellation",
+                    why=(
+                        "the daemon is waiting for the CLI cancellation summary "
+                        "for request " + str(stop_request.get("request_id"))
+                    ),
+                    command=(
+                        _cmd(campaign, "stop")
+                        + " --immediate --cancel-jobs"
+                    ),
+                )
+            ]
+        request_completed = str(stop_request.get("status")) == "completed"
+        daemon_active = (
+            payload.get("lock_held") is True
+            or payload.get("background_pid_alive") is True
+            or _lease_is_fresh(payload.get("lease_heartbeat"))
+        )
+        target = "the next daemon tick"
+        if stop_request.get("target_phase") is not None:
+            target = (
+                str(stop_request.get("target_phase"))
+                + "@"
+                + str(stop_request.get("target_iteration"))
+            )
+        elif stop_request.get("target_iteration") is not None:
+            target = "iteration " + str(stop_request.get("target_iteration"))
+        return [
+            StatusRecommendation(
+                code="operator_stop_draining",
+                severity="watch" if daemon_active else "required",
+                primary=(
+                    "resume the campaign to finalise the completed operator stop"
+                    if request_completed
+                    else (
+                        "wait for the daemon to reach the requested stop boundary"
+                        if daemon_active
+                        else "resume the daemon so it can honour the pending stop boundary"
+                    )
+                ),
+                why=(
+                    str(stop_request.get("mode"))
+                    + " stop request is "
+                    + str(stop_request.get("status"))
+                    + "; target is "
+                    + target
+                ),
+                command=(
+                    _cmd(campaign, "resume")
+                    if request_completed or not daemon_active
+                    else _journal_cmd(campaign)
+                ),
+                details=[
+                    "request_id=" + str(stop_request.get("request_id")),
+                    "use resume --cancel-stop-request only to withdraw this request",
+                ],
             )
         ]
 

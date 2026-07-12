@@ -55,6 +55,7 @@ START_DAEMON_BACKGROUND_DEFAULTS = {
     "selected_log_path": "",
     "selected_pid_path": "",
     "reopen_converged": False,
+    "cancel_stop_request": False,
 }
 
 
@@ -69,6 +70,7 @@ class StartDaemonBackgroundMenuOptions(MenuOptions):
     selected_log_path: str
     selected_pid_path: str
     reopen_converged: bool
+    cancel_stop_request: bool
 
 
 start_daemon_background_menu_options = StartDaemonBackgroundMenuOptions(
@@ -210,6 +212,13 @@ class StartDaemonBackgroundFunctions:
             print("Completed-campaign reopen is valid only with the resume command.")
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
+        if (
+            start_daemon_background_menu_options.cancel_stop_request
+            and start_daemon_background_menu_options.selected_command != "resume"
+        ):
+            print("Stop-request cancellation is valid only with the resume command.")
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
         try:
             result = launch_daemon_detached_checked(
                 campaign_dir,
@@ -229,6 +238,9 @@ class StartDaemonBackgroundFunctions:
                 preset=preset_name,
                 reopen_converged=bool(
                     start_daemon_background_menu_options.reopen_converged
+                ),
+                cancel_stop_request=bool(
+                    start_daemon_background_menu_options.cancel_stop_request
                 ),
                 log_path=(
                     Path(start_daemon_background_menu_options.selected_log_path)
@@ -332,6 +344,13 @@ START_DAEMON_BACKGROUND_FIELD_SPECS = [
         prompt="Explicitly reopen a completed campaign? ",
         item_text="Set explicit completed-campaign reopen",
         display_path="reopen_converged",
+    ),
+    spec(
+        "cancel_stop_request",
+        "bool",
+        prompt="Withdraw a pending stop request before resume? ",
+        item_text="Set pending stop-request cancellation",
+        display_path="cancel_stop_request",
     ),
 ]
 

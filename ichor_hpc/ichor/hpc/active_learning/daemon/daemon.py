@@ -1,7 +1,7 @@
 """Long-running campaign daemon (login-node, single-process).
 
 This module wires everything into one state machine. The
-production deployment is a single Python process on a CSF4 login node that:
+production deployment is a single Python process on a configured CSF login node that:
 
     1. Acquires an exclusive flock on .DATA/ACTIVE_LEARNING/daemon.lock.
        Refuses to start (with a clear message) if the lock is held by
@@ -39,7 +39,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from ..config import CampaignConfig
 from ..layout import trained_models_dir
@@ -597,16 +597,39 @@ class Daemon:
         self._write_lease_heartbeat(state)
 
         if state.shutdown_requested:
+            try:
+                request = self._read_stop_control(state)
+                if request is not None and str(request.get("status")) != "completed":
+                    from .stop_control import complete_stop_request
+
+                    complete_stop_request(
+                        self.campaign_dir,
+                        str(request.get("request_id")),
+                        reason="shutdown_state_recovered",
+                        completion_receipt=state.last_completion_receipt,
+                    )
+            except Exception as exc:
+                self._journal(
+                    "operator_stop_control_invalid",
+                    phase=state.phase.value,
+                    iteration=int(state.iteration),
+                    error=type(exc).__name__ + ": " + str(exc)[:180],
+                )
             return TickStatus.SHUTDOWN
         if state.is_terminal:
             receipt_status = self._recover_phase_completion(state)
             if receipt_status is not None:
                 return receipt_status
+            self._handle_stop_control_before_phase(state)
             return TickStatus.TERMINAL
 
         receipt_status = self._recover_phase_completion(state)
         if receipt_status is not None:
             return receipt_status
+
+        stop_status = self._handle_stop_control_before_phase(state)
+        if stop_status is not None:
+            return stop_status
 
         phase = state.phase
         pending = state.pending_jobs.get(phase.value)
@@ -614,6 +637,308 @@ class Daemon:
         if pending is None:
             return self._on_phase_entry(state, phase)
         return self._on_pending(state, phase, pending)
+
+    def _read_stop_control(self, state: CampaignState) -> Optional[Dict[str, Any]]:
+        from .stop_control import read_stop_request
+
+        return read_stop_request(
+            self.campaign_dir,
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+
+    def _phase_has_started(
+        self,
+        state: CampaignState,
+        request: Mapping[str, Any],
+    ) -> bool:
+        if bool(request.get("phase_started_at_request", False)):
+            return True
+        phase_name = str(request.get("target_phase") or "")
+        if state.pending_jobs.get(phase_name):
+            return True
+        try:
+            intent = _submission_intent.load_intent(
+                self.campaign_dir,
+                phase_name,
+                int(request.get("target_iteration", -1)),
+                expected_campaign_uid=str(state.campaign_uid),
+            )
+        except Exception:
+            intent = None
+        if isinstance(intent, dict):
+            try:
+                return int(intent.get("replacement_round", 0)) == int(
+                    request.get("target_replacement_round", 0)
+                )
+            except (TypeError, ValueError):
+                return True
+        return False
+
+    def _matching_stop_boundary_receipt(
+        self,
+        state: CampaignState,
+        request: Mapping[str, Any],
+    ) -> Optional[Dict[str, str]]:
+        from .completion_receipts import (
+            read_completion_receipt,
+            receipt_dir,
+            receipt_reference,
+            validate_completion_reference,
+        )
+
+        mode = str(request.get("mode") or "")
+        if mode == "after_phase":
+            expected_phase = str(request.get("target_phase") or "")
+            expected_iteration = int(request.get("target_iteration", -1))
+            expected_round: Optional[int] = int(
+                request.get("target_replacement_round", 0)
+            )
+        elif mode == "after_iteration":
+            expected_iteration = int(request.get("target_iteration", -1))
+            expected_phase = (
+                CampaignPhase.INITIAL_FEREBUS.value
+                if expected_iteration == 0
+                else CampaignPhase.STOP_CHECK.value
+            )
+            expected_round = None
+        else:
+            return None
+        matches: List[Tuple[str, Path]] = []
+        root = receipt_dir(self.campaign_dir)
+        if not root.is_dir():
+            return None
+        for path in root.glob("*.json"):
+            try:
+                payload = read_completion_receipt(path)
+                if str(payload.get("campaign_uid")) != str(state.campaign_uid):
+                    continue
+                if str(payload.get("phase")) != expected_phase:
+                    continue
+                if int(payload.get("iteration", -1)) != expected_iteration:
+                    continue
+                if expected_round is not None and int(
+                    payload.get("replacement_round", -1)
+                ) != expected_round:
+                    continue
+                reference = receipt_reference(self.campaign_dir, path)
+                validate_completion_reference(
+                    self.campaign_dir,
+                    reference,
+                    expected_campaign_uid=str(state.campaign_uid),
+                )
+                matches.append((str(payload.get("created_at_iso") or ""), path))
+            except Exception:
+                continue
+        if not matches:
+            return None
+        return receipt_reference(
+            self.campaign_dir,
+            max(matches, key=lambda item: item[0])[1],
+        )
+
+    def _apply_cancelled_jobs_from_request(
+        self,
+        state: CampaignState,
+        request: Mapping[str, Any],
+    ) -> None:
+        summary = request.get("cancellation_summary")
+        if not isinstance(summary, Mapping):
+            return
+        cancelled_ids = {
+            str(item.get("job_id"))
+            for item in (summary.get("cancelled") or [])
+            if isinstance(item, Mapping) and str(item.get("job_id") or "")
+        }
+        if not cancelled_ids:
+            return
+        intent_keys = {
+            (str(key.get("phase")), int(key.get("iteration")))
+            for item in (summary.get("cancelled") or [])
+            if isinstance(item, Mapping)
+            for key in (item.get("intent_keys") or [])
+            if isinstance(key, Mapping)
+            and key.get("phase") is not None
+            and key.get("iteration") is not None
+        }
+        for phase_name, iteration in sorted(intent_keys):
+            _submission_intent.mark_failed(
+                self.campaign_dir,
+                phase_name,
+                iteration,
+                "operator_cancelled_via_stop",
+            )
+        for phase_name, job_id in list(state.pending_jobs.items()):
+            if job_id is not None and str(job_id) in cancelled_ids:
+                state.pending_jobs[phase_name] = None
+                self._clear_sacct_streaks(state, str(job_id))
+
+    def _latch_stop_request(
+        self,
+        state: CampaignState,
+        request: Mapping[str, Any],
+        *,
+        reason: str,
+        completion_receipt: Optional[Mapping[str, Any]] = None,
+    ) -> str:
+        from .stop_control import complete_stop_request
+
+        self._apply_cancelled_jobs_from_request(state, request)
+        state.shutdown_requested = True
+        state.lifecycle_context = make_lifecycle_context(
+            disposition="stopped",
+            reason_code="operator_stop_request",
+            message="operator stop boundary reached: " + str(reason),
+            from_phase=state.phase,
+            iteration=int(state.iteration),
+            source="daemon_stop_control",
+            scheduler_uncertain=any(bool(value) for value in state.pending_jobs.values()),
+            recovery_action="use resume to continue from the recorded phase",
+            details={
+                "request_id": str(request.get("request_id")),
+                "mode": str(request.get("mode")),
+                "target_phase": request.get("target_phase"),
+                "target_iteration": request.get("target_iteration"),
+                "target_replacement_round": request.get("target_replacement_round"),
+            },
+        )
+        self._persist(state)
+        if str(request.get("status")) == "completed":
+            completed = dict(request)
+        else:
+            completed = complete_stop_request(
+                self.campaign_dir,
+                str(request.get("request_id")),
+                reason=str(reason),
+                completion_receipt=completion_receipt,
+            )
+        self._journal(
+            "operator_stop_boundary_reached",
+            request_id=str(request.get("request_id")),
+            mode=str(request.get("mode")),
+            phase=state.phase.value,
+            iteration=int(state.iteration),
+            reason=str(reason),
+            completion_receipt=(
+                dict(completion_receipt)
+                if isinstance(completion_receipt, Mapping)
+                else None
+            ),
+            control_updated=bool(completed is not None),
+        )
+        self._journal(
+            "shutdown_requested",
+            from_phase=state.phase.value,
+            iteration=int(state.iteration),
+            stop_mode=str(request.get("mode")),
+            request_id=str(request.get("request_id")),
+        )
+        return TickStatus.SHUTDOWN
+
+    def _handle_stop_control_before_phase(
+        self,
+        state: CampaignState,
+    ) -> Optional[str]:
+        try:
+            request = self._read_stop_control(state)
+        except Exception as exc:
+            self._journal(
+                "operator_stop_control_invalid",
+                phase=state.phase.value,
+                iteration=int(state.iteration),
+                error=type(exc).__name__ + ": " + str(exc)[:180],
+            )
+            if state.is_terminal:
+                return None
+            return self._halt_scheduler_uncertain(
+                state,
+                state.phase,
+                "stop_control_invalid: " + type(exc).__name__ + ": " + str(exc)[:180],
+            )
+        if request is None:
+            return None
+        mode = str(request.get("mode"))
+        if state.is_terminal:
+            from .stop_control import complete_stop_request
+
+            complete_stop_request(
+                self.campaign_dir,
+                str(request.get("request_id")),
+                reason="campaign_terminal",
+                completion_receipt=state.last_completion_receipt,
+            )
+            return None
+        if mode == "immediate" and str(request.get("status")) == "cancelling":
+            # The CLI records this state before calling scancel and then adds
+            # the cancellation summary. Waiting here prevents the daemon from
+            # racing ahead and persisting stale pending-job metadata.
+            return TickStatus.POLLING
+        if mode == "immediate" or str(request.get("status")) == "completed":
+            return self._latch_stop_request(
+                state,
+                request,
+                reason="immediate",
+                completion_receipt=request.get("completion_receipt"),
+            )
+        if mode == "after_phase":
+            target_key = (
+                str(request.get("target_phase")),
+                int(request.get("target_iteration", -1)),
+                int(request.get("target_replacement_round", -1)),
+            )
+            current_key = (
+                state.phase.value,
+                int(state.iteration),
+                int(state.replacement_round),
+            )
+            if current_key != target_key:
+                boundary_receipt = self._matching_stop_boundary_receipt(
+                    state,
+                    request,
+                )
+                if boundary_receipt is not None:
+                    return self._latch_stop_request(
+                        state,
+                        request,
+                        reason="boundary_already_completed",
+                        completion_receipt=boundary_receipt,
+                    )
+                return self._halt_scheduler_uncertain(
+                    state,
+                    state.phase,
+                    "after_phase_target_passed_without_receipt: target="
+                    + repr(target_key)
+                    + " current="
+                    + repr(current_key),
+                )
+            if not self._phase_has_started(state, request):
+                return self._latch_stop_request(
+                    state,
+                    request,
+                    reason="phase_not_started",
+                )
+            return None
+        target_iteration = int(request.get("target_iteration", -1))
+        if int(state.iteration) > target_iteration:
+            boundary_receipt = self._matching_stop_boundary_receipt(
+                state,
+                request,
+            )
+            if boundary_receipt is not None:
+                return self._latch_stop_request(
+                    state,
+                    request,
+                    reason="boundary_already_completed",
+                    completion_receipt=boundary_receipt,
+                )
+            return self._halt_scheduler_uncertain(
+                state,
+                state.phase,
+                "after_iteration_target_passed_without_receipt: target="
+                + str(target_iteration)
+                + " current="
+                + str(int(state.iteration)),
+            )
+        return None
 
     def _recover_phase_completion(self, state: CampaignState) -> Optional[str]:
         """Validate the latest receipt or replay one written before state advance."""
@@ -2826,6 +3151,91 @@ class Daemon:
             paths.append(active_iteration_manifest_path(campaign, iteration))
         return paths
 
+    def _stop_request_satisfied_by_transition(
+        self,
+        request: Mapping[str, Any],
+        *,
+        before: CampaignState,
+        after: CampaignState,
+        phase: CampaignPhase,
+    ) -> Optional[str]:
+        if after.phase in {CampaignPhase.DONE, CampaignPhase.HALTED}:
+            return "campaign_terminal"
+        mode = str(request.get("mode") or "")
+        if mode == "immediate":
+            return "immediate_after_current_tick"
+        if mode == "after_phase":
+            if (
+                phase.value == str(request.get("target_phase") or "")
+                and int(before.iteration) == int(request.get("target_iteration", -1))
+                and int(before.replacement_round)
+                == int(request.get("target_replacement_round", -1))
+            ):
+                return "phase_completed"
+            return None
+        if mode != "after_iteration":
+            return None
+        target = int(request.get("target_iteration", -1))
+        if target == 0:
+            if (
+                phase is CampaignPhase.INITIAL_FEREBUS
+                and int(before.iteration) == 0
+            ):
+                return "bootstrap_iteration_completed"
+            return None
+        if phase is CampaignPhase.STOP_CHECK and int(before.iteration) == target:
+            return "active_iteration_completed"
+        return None
+
+    def _prepare_stop_control_for_transition(
+        self,
+        *,
+        before: CampaignState,
+        after: CampaignState,
+        phase: CampaignPhase,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        request = self._read_stop_control(before)
+        if request is None:
+            return None, None
+        if (
+            str(request.get("mode")) == "immediate"
+            and str(request.get("status")) == "cancelling"
+        ):
+            return None, None
+        reason = self._stop_request_satisfied_by_transition(
+            request,
+            before=before,
+            after=after,
+            phase=phase,
+        )
+        if reason is None:
+            return None, None
+        if after.phase not in {CampaignPhase.DONE, CampaignPhase.HALTED}:
+            self._apply_cancelled_jobs_from_request(after, request)
+            after.shutdown_requested = True
+            after.lifecycle_context = make_lifecycle_context(
+                disposition="stopped",
+                reason_code="operator_stop_boundary_reached",
+                message="operator stop boundary reached: " + str(reason),
+                from_phase=phase,
+                iteration=int(before.iteration),
+                source="daemon_stop_control",
+                scheduler_uncertain=any(
+                    bool(value) for value in after.pending_jobs.values()
+                ),
+                recovery_action="use resume to continue from the recorded phase",
+                details={
+                    "request_id": str(request.get("request_id")),
+                    "mode": str(request.get("mode")),
+                    "target_phase": request.get("target_phase"),
+                    "target_iteration": request.get("target_iteration"),
+                    "target_replacement_round": request.get(
+                        "target_replacement_round"
+                    ),
+                },
+            )
+        return request, reason
+
     def _persist_transition_with_receipt(
         self,
         destination: CampaignState,
@@ -2856,6 +3266,11 @@ class Daemon:
             before,
             phase,
             state_updates,
+        )
+        stop_request, stop_reason = self._prepare_stop_control_for_transition(
+            before=before,
+            after=after,
+            phase=phase,
         )
         if not bool(
             getattr(
@@ -2902,6 +3317,26 @@ class Daemon:
         self._persist(after)
         destination.__dict__.clear()
         destination.__dict__.update(copy.deepcopy(after.__dict__))
+        if stop_request is not None and stop_reason is not None:
+            from .stop_control import complete_stop_request
+
+            complete_stop_request(
+                self.campaign_dir,
+                str(stop_request.get("request_id")),
+                reason=str(stop_reason),
+                completion_receipt=after.last_completion_receipt,
+            )
+            self._journal(
+                "operator_stop_boundary_reached",
+                request_id=str(stop_request.get("request_id")),
+                mode=str(stop_request.get("mode")),
+                phase=phase.value,
+                iteration=int(before.iteration),
+                resulting_phase=after.phase.value,
+                resulting_iteration=int(after.iteration),
+                reason=str(stop_reason),
+                completion_receipt=dict(after.last_completion_receipt or {}),
+            )
 
     def _apply_state_updates(self, state: CampaignState, updates: Dict[str, Any]) -> None:
         if not updates:
@@ -2947,10 +3382,9 @@ class Daemon:
     def request_shutdown(self) -> None:
         """Set the in-process shutdown flag and persist it to disk.
 
-        Callers from outside the daemon process should write
-        shutdown_requested = true directly into state.json via
-        :func: "write_state" so the running daemon picks it up on its next
-        tick. This in-process method is for signal handlers and tests.
+        Callers outside the daemon process must use the CLI stop-control
+        manifest rather than rewriting ``state.json``. This in-process method
+        is reserved for signal handlers and tests.
         """
         self._shutdown_requested = True
         try:
@@ -3074,6 +3508,12 @@ class Daemon:
                     return 22
                 return 20 if terminal_state.phase is CampaignPhase.HALTED else 0
             if status == TickStatus.SHUTDOWN:
+                return 0
+            try:
+                latest_state = read_state(self.state_path())
+            except Exception:
+                latest_state = None
+            if latest_state is not None and bool(latest_state.shutdown_requested):
                 return 0
             if status == TickStatus.POLLING:
                 idle_streak += 1
