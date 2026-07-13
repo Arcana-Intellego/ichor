@@ -112,6 +112,8 @@ KNOWN_EVENT_TYPES = (
     "ariadne_legacy_missing_trajectory_sha256",
     "ariadne_provenance_reconstructed",
     "resolved_phase_resources",
+    "scheduler_usage_recorded",
+    "scheduler_usage_warning",
     "reconcile_resolved_terminal_intent",
     "operator_cancelled_jobs",
     "operator_stop_requested",

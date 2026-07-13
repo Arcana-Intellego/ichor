@@ -16,6 +16,7 @@ BOOTSTRAP_DIRNAME = "BOOTSTRAP"
 LEGACY_BOOTSTRAP_DIRNAME = "3_DIVERSITY_SAMPLING"
 ACTIVE_LEARNING_DIRNAME = "ACTIVE_LEARNING"
 LEGACY_ACTIVE_LEARNING_DIRNAME = "7_ACTIVE_LEARNING"
+STAGING_DIRNAME = "STAGING"
 COMMITTED_VERSION_NAME_WIDTH = 6
 ACTIVE_ITERATION_NAME_WIDTH = 6
 SEED_ID_NAME_WIDTH = 6
@@ -101,6 +102,39 @@ def active_allocation_dir(iteration_dir: Union[str, Path]) -> Path:
 
 def active_calibration_dir(iteration_dir: Union[str, Path]) -> Path:
     return Path(iteration_dir) / "calibration"
+
+
+def staging_root(campaign_dir: Union[str, Path]) -> Path:
+    return Path(campaign_dir) / ".DATA" / STAGING_DIRNAME
+
+
+def staging_context_dir(
+    campaign_dir: Union[str, Path],
+    *,
+    context: str,
+    iteration: int,
+) -> Path:
+    value = str(context)
+    if value == "bootstrap":
+        bucket = "initial"
+    elif value == "active":
+        bucket = "iter_" + str(int(iteration))
+    else:
+        raise ValueError("staging context must be bootstrap or active")
+    return staging_root(campaign_dir) / bucket
+
+
+def staging_phase_dir(
+    campaign_dir: Union[str, Path],
+    phase_name: str,
+    iteration: int,
+) -> Path:
+    context = "bootstrap" if str(phase_name).startswith("INITIAL_") else "active"
+    return staging_context_dir(
+        campaign_dir,
+        context=context,
+        iteration=int(iteration),
+    )
 
 
 def seed_directory_name(seed_id: int) -> str:
@@ -215,6 +249,7 @@ __all__ = [
     "LEGACY_BOOTSTRAP_DIRNAME",
     "ACTIVE_LEARNING_DIRNAME",
     "LEGACY_ACTIVE_LEARNING_DIRNAME",
+    "STAGING_DIRNAME",
     "COMMITTED_VERSION_NAME_WIDTH",
     "ACTIVE_ITERATION_NAME_WIDTH",
     "SEED_ID_NAME_WIDTH",
@@ -233,6 +268,9 @@ __all__ = [
     "active_phase_b_dir",
     "active_allocation_dir",
     "active_calibration_dir",
+    "staging_root",
+    "staging_context_dir",
+    "staging_phase_dir",
     "seed_directory_name",
     "parse_seed_directory_name",
     "ariadne_seeds_dir",

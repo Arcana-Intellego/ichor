@@ -346,7 +346,14 @@ def test_stage_aimall_inputs_writes_resolved_naat_metadata(tmp_path):
     staging = campaign / ".DATA" / "STAGING" / "initial"
     shutil.copytree(str(FIXTURES / "initial_quantum"), str(staging))
     accepted = sorted(staging.glob("POINT_*.pointdir"))[:1]
-    (accepted[0] / "input.wfn").write_text("synthetic wfn\n", encoding="utf-8")
+    shutil.copy2(
+        next(accepted[0].glob("*.gjf")),
+        accepted[0] / "input.gjf",
+    )
+    (accepted[0] / "input.wfn").write_text(
+        "Synthetic wavefunction   3 MOL ORBITALS   10 PRIMITIVES   3 NUCLEI\n",
+        encoding="utf-8",
+    )
     stg.write_points_file(staging, sorted(staging.glob("POINT_*.pointdir")))
     stg.write_quantum_acceptance_manifest(
         staging,
@@ -371,6 +378,22 @@ def test_stage_aimall_inputs_writes_resolved_naat_metadata(tmp_path):
     assert task["atom_count"] == 3
     assert task["nproc"] == 8
     assert task["naat"] == 3
+
+    from ichor.hpc.active_learning.daemon.resource_solver import (
+        resolve_phase_resources,
+    )
+
+    resolved = resolve_phase_resources(
+        phase_name="INITIAL_AIMALL",
+        config=cfg,
+        campaign_dir=campaign,
+        iteration=0,
+        staging_dir=staging,
+        array_size=1,
+        require_evidence=True,
+    )
+    assert resolved.extra["aimall_task_naat"] == [3]
+    assert resolved.extra["evidence"]["aimall_task_naat"] == [3]
 
 
 def test_aimall_parser_only_consumes_gaussian_accepted_pointdirs(tmp_path):

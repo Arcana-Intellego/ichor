@@ -137,6 +137,7 @@ csf3:
     scheduler: slurm
     jobscript_shebang: "#!/bin/bash --login"
     max_array_task_id: 25000
+    max_job_log_files_per_directory: 5000
     memory_per_core_gb: 8
     memory_per_core_gb_by_partition:
       multicore: 8
@@ -231,6 +232,7 @@ source ~/projects/ichor-active-learning/scripts/env_ichor_csf.sh csf3 --smoke
 ichor-al-daemon init
 ichor-al-daemon preflight --campaign-dir . --verbose
 ichor-al-daemon preflight --campaign-dir . --verbose --submit-environment-smoke
+ichor-al-daemon resource-plan --campaign-dir . --all
 ichor-al-daemon start --campaign-dir . --max-ticks 200
 ```
 
@@ -238,6 +240,9 @@ The submitted preflight is an explicit commissioning check: one five-minute,
 one-core Slurm job imports the configured daemon Python stack and verifies
 Gaussian, AIMAll, FEREBUS and `bc` from a compute node. It performs no
 scientific work and is not submitted by ordinary preflight or daemon start.
+The resource plan is read-only. Before the first submission it should resolve
+Phase A from the manifest-verified root `pool.xyz`; later phases may report
+`evidence_not_yet_produced` until their producer handoffs exist.
 
 The smoke config throttles Slurm arrays with
 `resources.array_concurrency_limit: 4` to be gentle on the scheduler. Backend

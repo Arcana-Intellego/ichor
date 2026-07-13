@@ -277,6 +277,9 @@ class Daemon:
     # missing sacct array rows from throttled jobs that are still visible in
     # squeue.
     job_liveness_checker: Optional[Callable[[str], Any]] = None
+    # Live-mode only advisory collector. It is injected by the CLI so mock and
+    # dry-run daemons never contact Slurm for accounting telemetry.
+    resource_usage_collector: Optional[Callable[..., Dict[str, Any]]] = None
 
     #internal flags; not part of the public dataclass surface.
     _shutdown_requested: bool = field(default=False, init=False, repr=False)
@@ -1875,6 +1878,7 @@ class Daemon:
             n_observed=int(getattr(summary, "n_observed", 0)),
             n_missing=int(getattr(summary, "n_missing", 0)),
         )
+        self._collect_terminal_resource_usage(state, phase, job_id)
 
         #Job has reached terminal state(s). Decide between postprocess and
         #failure handling based on the success ratio.
@@ -1887,6 +1891,54 @@ class Daemon:
         if summary.is_fully_successful or success_ratio >= failure_threshold:
             return self._postprocess(state, phase, observations, summary)
         return self._handle_failure(state, phase, observations, summary)
+
+    def _collect_terminal_resource_usage(
+        self,
+        state: CampaignState,
+        phase: CampaignPhase,
+        job_id: str,
+    ) -> None:
+        if not bool(getattr(self.config.resources, "scheduler_usage_telemetry", True)):
+            return
+        collector = self.resource_usage_collector
+        if collector is None:
+            return
+        try:
+            intent = _submission_intent.load_intent(
+                self.campaign_dir,
+                phase.value,
+                int(state.iteration),
+                expected_campaign_uid=str(state.campaign_uid),
+            )
+            if not isinstance(intent, dict):
+                raise ValueError("submission intent is unavailable")
+            if str(intent.get("job_id") or "") != str(job_id):
+                raise ValueError("submission intent JobID does not match terminal job")
+            summary = collector(
+                self.campaign_dir,
+                intent=intent,
+                history_limit=int(
+                    getattr(self.config.resources, "scheduler_usage_history_limit", 5000)
+                ),
+            )
+            self._journal(
+                "scheduler_usage_recorded",
+                phase=phase.value,
+                iteration=int(state.iteration),
+                job_id=str(job_id),
+                attempt_id=str(intent.get("attempt_id") or ""),
+                n_rows=int(summary.get("n_rows", 0)),
+                p95_rss_mib=summary.get("p95_rss_mib"),
+                p95_elapsed_seconds=summary.get("p95_elapsed_seconds"),
+            )
+        except Exception as exc:
+            self._journal(
+                "scheduler_usage_warning",
+                phase=phase.value,
+                iteration=int(state.iteration),
+                job_id=str(job_id),
+                error=type(exc).__name__ + ": " + str(exc)[:300],
+            )
 
     def _expected_tasks_for_pending(
         self,
@@ -3114,9 +3166,9 @@ class Daemon:
                     replacement_round=int(getattr(state, "replacement_round", 0)),
                 )
             else:
-                staging = campaign / ".DATA" / "STAGING" / (
-                    "initial" if phase.value.startswith("INITIAL_") else "iter_" + str(iteration)
-                )
+                from ..layout import staging_phase_dir
+
+                staging = staging_phase_dir(campaign, phase.value, iteration)
             paths.append(
                 quantum_acceptance_manifest_path(staging, phase_name=phase.value)
             )

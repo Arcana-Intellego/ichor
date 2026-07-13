@@ -89,7 +89,11 @@ def _gradient_mp_disabled() -> bool:
 
 
 def _slurm_cpu_cap() -> int:
-    env = os.environ.get("SLURM_CPUS_PER_TASK")
+    # Resource resolution may allocate extra CPUs for memory only. Those CPUs
+    # must not silently enlarge the scientific process pool.
+    env = os.environ.get("ICHOR_ACTIVE_WORKERS") or os.environ.get(
+        "SLURM_CPUS_PER_TASK"
+    )
     if env:
         try:
             return max(1, int(env))

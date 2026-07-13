@@ -471,6 +471,105 @@ zero-based scientific seed directories are intentionally unsupported. Start a
 fresh campaign rather than mixing storage contracts.
 
 
+Resource evidence, scripts, and scratch
+---------------------------------------
+
+Live resource requests are resolved from producer-owned evidence after exact
+staging. The daemon does not substitute guessed frame, atom, feature, or row
+counts. Examples include the SHA-pinned root :code:`pool.xyz` for POLUS Phase
+A, :code:`ARIADNE_RESULTS.json` for Phase B, exact :code:`POINTS.txt` and
+GJF/WFN dimensions for Gaussian and AIMAll, the ARIADNE task/model manifests,
+and the FEREBUS task manifest plus split CSV hashes. Missing evidence halts an
+actual submission with a precise error.
+
+Every submission attempt receives an immutable schema-v1 resource record::
+
+    .DATA/ACTIVE_LEARNING/resource_resolutions/
+      PHASE_A_POLUS/iteration-000000/r0000-a0001-1234abcd.json
+
+The record is bound by SHA-256 to the submission intent and job script. It
+contains formula inputs, active scientific workers, any CPUs allocated only
+for memory, per-task and peak allocation, array concurrency, evidence paths
+and hashes, and scratch requirements. A retry gets a new attempt identity and
+does not overwrite the previous record.
+
+Submitted scripts and logs are retained as operational evidence in
+self-contained bundles::
+
+    .DATA/SCRIPTS/JOBS/
+      GAUSSIAN/GAUSSIAN/iteration-000001/<submission-identity>/
+        job.sh
+        array_task_map.json   # partial-array retries only
+        OUTPUTS/
+        ERRORS/
+
+An array member writes
+:code:`OUTPUTS/<parent-job-id>_<array-task-id>.o` and the matching
+:code:`ERRORS/...e`. Therefore a 200-task array creates 200 files in each
+directory. :code:`hpc.max_job_log_files_per_directory` in
+:code:`~/ichor_config.yaml` caps each directory independently; submission is
+refused before :code:`sbatch` when the cap would be exceeded. A partial retry
+uses a dense Slurm index and preserves the dense-to-logical mapping in the
+attempt bundle.
+
+Scratch is campaign-owned and lazy::
+
+    .DATA/SCRATCH/<BACKEND>/<PHASE>/iteration-NNNNNN/
+      <submission-identity>/job-<job-id>/task-<array-id-or-0>/
+
+Each task atomically writes :code:`TASK.json`, exports
+:code:`ICHOR_JOB_SCRATCH`, :code:`TMPDIR`, :code:`TMP`, and :code:`TEMP`, and
+removes its leaf on success. Failed or abruptly interrupted task scratch is
+retained. AIMAll :code:`.int` files, ARIADNE results, FEREBUS models/CSVs, and
+all other scientific handoffs remain in their canonical directories; scratch
+is never a scientific input and is not needed to validate completed work.
+
+Inspect retained scratch before deleting anything::
+
+    ichor-al-daemon reconcile --campaign-dir . --clean-scratch
+    ichor-al-daemon reconcile --campaign-dir . --clean-scratch \
+        --scratch-attempt r0000-a0001-1234abcd --apply
+
+Clean-up refuses active jobs, scheduler-inconclusive ownership, symlinks,
+path escapes, and malformed task metadata. The CLI menu performs a preview
+and requires an explicit confirmation before applying clean-up.
+
+Resource planning and telemetry
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use the same production resolver without writing state or submitting work::
+
+    ichor-al-daemon resource-plan --campaign-dir .
+    ichor-al-daemon resource-plan --campaign-dir . --phase AIMALL
+    ichor-al-daemon resource-plan --campaign-dir . --all
+    ichor-al-daemon resource-plan --campaign-dir . --all --json
+
+The default is the current phase and iteration. Submitted or completed work
+shows its immutable resource record; ready work is previewed from validated
+evidence; local phases report no Slurm resources. Under :code:`--all`, future
+evidence that has not yet been produced is informational. Explicitly
+requesting such a phase returns exit code 14.
+
+When :code:`resources.scheduler_usage_telemetry` is enabled, terminal jobs
+record bounded Slurm accounting summaries in
+:code:`.DATA/ACTIVE_LEARNING/resource_usage_records.json`. The record includes
+RSS/VM and elapsed-time quantiles, maxima, failure and outlier samples, plus
+advisory :code:`p95 * 1.25` memory and :code:`p95 * 1.5` walltime values.
+Telemetry never modifies later requests automatically and a telemetry failure
+does not invalidate scientific output.
+
+POLUS stores exact float64 condensed pair distances. It uses blockwise process
+workers with one BLAS thread each, so it never constructs full
+:code:`N x N` or :code:`N x N x F` arrays. If the condensed store exceeds the
+configured in-memory fraction, it is placed in the task scratch leaf and free
+space is checked both before submission and at job start.
+
+Manchester CSF scratch is unbacked and subject to retention policy. Keep the
+campaign on an appropriate project/scratch filesystem, monitor free space,
+and copy important committed results to backed-up storage periodically. The
+daemon warns when a live campaign root is under :code:`$HOME`.
+
+
 Recovery + troubleshooting
 --------------------------
 

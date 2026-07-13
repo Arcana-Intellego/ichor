@@ -32,14 +32,16 @@ from ichor.core.files import PointDirectory
 from ichor.core.files.xyz import Trajectory
 
 from .resource_solver import (
-    resolve_aimall_naat,
     resolve_phase_resources,
     validate_gaussian_link0_memory,
+    wfn_primitive_count,
 )
 from .state import atomic_write_json, atomic_write_text
 from ..layout import (
     COMMITTED_VERSION_NAME_WIDTH,
     TRAINED_MODELS_DIRNAME,
+    staging_phase_dir,
+    staging_root,
     trained_models_dir,
 )
 from ..versioning.manifest import sha256_file
@@ -57,8 +59,7 @@ SAFE_PATH_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
 def bucket_dir(campaign_dir, phase_name: str, iteration: int) -> Path:
-    bucket = "initial" if phase_name.startswith("INITIAL_") else ("iter_" + str(iteration))
-    return Path(campaign_dir) / ".DATA" / "STAGING" / bucket
+    return staging_phase_dir(campaign_dir, phase_name, int(iteration))
 
 
 def _load_frames(sample_xyz) -> List[Atoms]:
@@ -976,27 +977,13 @@ def stage_gaussian_inputs(
         _checked_rmtree(
             staging,
             campaign_dir=Path(campaign_dir),
-            allowed_roots=[Path(campaign_dir) / ".DATA" / "STAGING"],
+            allowed_roots=[staging_root(campaign_dir)],
         )
     staging.mkdir(parents=True, exist_ok=True)
 
     keywords = ["nosymm", "output=wfn", "force", "geom=notest"]
     if str(g.extra_keywords).strip():
         keywords += str(g.extra_keywords).split()
-
-    gaussian_resources = None
-    if str(config.resources.gaussian_memory_mode_for()) == "link0":
-        gaussian_resources = resolve_phase_resources(
-            phase_name=str(phase_name),
-            config=config,
-            partition=str(partition_override or config.resources.partition_for(str(phase_name))),
-            campaign_dir=campaign_dir,
-            iteration=int(iteration),
-            array_size=len(frames),
-            staging_dir=staging,
-            n_atoms_override=len(frames[0]),
-        )
-        validate_gaussian_link0_memory(config, gaussian_resources)
 
     pointdirs: List[Path] = []
     for k, atoms in enumerate(frames):
@@ -1016,9 +1003,6 @@ def stage_gaussian_inputs(
             spin_multiplicity=int(g.spin_multiplicity),
             atoms=atoms,
         )
-        if gaussian_resources is not None:
-            gjf.set_nproc(int(gaussian_resources.cpus_per_task))
-            gjf.set_mem(str(config.resources.gaussian_link0_mem_for()))
         gjf.write()
         if (
             initial_provenance_context is not None
@@ -1118,6 +1102,35 @@ def stage_gaussian_inputs(
         pointdirs.append(pd)
 
     write_points_file(staging, pointdirs)
+    if str(config.resources.gaussian_memory_mode_for()) == "link0":
+        gaussian_resources = resolve_phase_resources(
+            phase_name=str(phase_name),
+            config=config,
+            partition=str(
+                partition_override
+                or config.resources.partition_for(str(phase_name))
+            ),
+            campaign_dir=campaign_dir,
+            iteration=int(iteration),
+            array_size=len(frames),
+            staging_dir=staging,
+            n_atoms_override=len(frames[0]),
+            require_evidence=True,
+        )
+        validate_gaussian_link0_memory(config, gaussian_resources)
+        for atoms, pointdir in zip(frames, pointdirs):
+            gjf = GJF(
+                pointdir / "input.gjf",
+                method=str(g.method),
+                basis_set=str(g.basis_set),
+                keywords=list(keywords),
+                charge=int(g.charge),
+                spin_multiplicity=int(g.spin_multiplicity),
+                atoms=atoms,
+            )
+            gjf.set_nproc(int(gaussian_resources.cpus_per_task))
+            gjf.set_mem(str(config.resources.gaussian_link0_mem_for()))
+            gjf.write()
     return staging, len(pointdirs)
 
 
@@ -1150,19 +1163,13 @@ def stage_aimall_inputs(
         require_nonempty=False,
         require_points_file_membership=True,
     )
-    aimall_resources = resolve_phase_resources(
-        phase_name=str(phase_name),
-        config=config,
-        partition=str(partition_override or config.resources.partition_for(str(phase_name))),
-        campaign_dir=campaign_dir,
-        iteration=int(iteration),
-        array_size=len(pointdirs),
-        staging_dir=staging,
-    )
-    aimall_cpus = int(aimall_resources.cpus_per_task)
-    raw_naat = getattr(config.aimall, "naat", "auto")
+    if not pointdirs:
+        write_points_file(staging, [])
+        return staging, 0
+    dimensions = []
     for pointdir in pointdirs:
-        if not (pointdir / "input.wfn").is_file():
+        wfn = pointdir / "input.wfn"
+        if wfn.is_symlink() or not wfn.is_file():
             raise FileNotFoundError(
                 "Gaussian-accepted pointdir is missing input.wfn: " + str(pointdir)
             )
@@ -1174,8 +1181,30 @@ def stage_aimall_inputs(
             ) from exc
         if atom_count <= 0:
             raise ValueError("AIMAll pointdir has no atoms: " + str(pointdir))
+        dimensions.append((pointdir, atom_count, wfn_primitive_count(wfn)))
+    write_points_file(staging, pointdirs)
+    aimall_resources = resolve_phase_resources(
+        phase_name=str(phase_name),
+        config=config,
+        partition=str(partition_override or config.resources.partition_for(str(phase_name))),
+        campaign_dir=campaign_dir,
+        iteration=int(iteration),
+        array_size=len(pointdirs),
+        staging_dir=staging,
+        require_evidence=True,
+    )
+    aimall_cpus = int(aimall_resources.cpus_per_task)
+    raw_naat = getattr(config.aimall, "naat", "auto")
+    snapshotted_naat = list(
+        aimall_resources.extra.get("aimall_task_naat") or []
+    )
+    if len(snapshotted_naat) != len(dimensions):
+        raise ValueError(
+            "AIMAll resource resolution does not cover every staged task"
+        )
+    for task_index, (pointdir, atom_count, primitive_count) in enumerate(dimensions):
         if isinstance(raw_naat, str) and raw_naat.strip().lower() == "auto":
-            resolved_naat = resolve_aimall_naat(config, aimall_cpus, atom_count)
+            resolved_naat = int(snapshotted_naat[task_index])
         else:
             resolved_naat = int(raw_naat)
             if resolved_naat < 1 or resolved_naat > int(aimall_cpus):
@@ -1187,6 +1216,7 @@ def stage_aimall_inputs(
             {
                 "schema_version": AIMALL_TASK_METADATA_SCHEMA_VERSION,
                 "atom_count": int(atom_count),
+                "primitive_count": int(primitive_count),
                 "nproc": int(aimall_cpus),
                 "naat": int(resolved_naat),
                 "resource_resolution": aimall_resources.journal_payload(
@@ -1194,7 +1224,6 @@ def stage_aimall_inputs(
                 ),
             },
         )
-    write_points_file(staging, pointdirs)
     return staging, len(pointdirs)
 
 
@@ -1413,7 +1442,7 @@ def accepted_allocation_pointdirs(
     target_total = int(allocation["targets"]["total"])
     if len(attempts) != target_total:
         raise ValueError("complete point allocation has the wrong accepted count")
-    staging_root = (campaign / ".DATA" / "STAGING").resolve(strict=False)
+    canonical_staging_root = staging_root(campaign).resolve(strict=False)
     pointdirs: List[Path] = []
     seen: set[Path] = set()
     for attempt in attempts:
@@ -1421,7 +1450,7 @@ def accepted_allocation_pointdirs(
         resolved = pointdir.resolve(strict=False)
         if resolved in seen:
             raise ValueError("point allocation reuses an accepted pointdir")
-        if staging_root not in resolved.parents:
+        if canonical_staging_root not in resolved.parents:
             raise ValueError(
                 "accepted allocation pointdir is outside daemon staging: "
                 + str(pointdir)

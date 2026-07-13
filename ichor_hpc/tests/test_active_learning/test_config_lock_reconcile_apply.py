@@ -1693,12 +1693,14 @@ def test_reconcile_apply_cleans_transient_halted_ariadne_reentry(
     assert recovered.iteration == 1
     assert not model_staging.exists()
     assert (committed_model / "marker.txt").read_text(encoding="utf-8") == "committed\n"
-    archived_scripts = sorted((campaign / ".DATA").glob("SCRIPTS.before-reconcile-*"))
+    archived_scripts = sorted(
+        (scripts / "LEGACY_BEFORE_RECONCILE").glob("*")
+    )
     assert len(archived_scripts) == 1
     assert (archived_scripts[0] / "ARIADNE_ARRAY-1.sh").is_file()
     assert (archived_scripts[0] / "ERRORS" / "ARIADNE_ARRAY-1.e").is_file()
-    assert (scripts / "OUTPUTS").is_dir()
-    assert (scripts / "ERRORS").is_dir()
+    assert not (scripts / "OUTPUTS").exists()
+    assert not (scripts / "ERRORS").exists()
     assert "archived stale scripts:" in out
     assert "removed model staging:" in out
 

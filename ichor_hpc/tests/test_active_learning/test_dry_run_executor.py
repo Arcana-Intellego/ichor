@@ -99,9 +99,21 @@ def test_submit_or_run_sbatch_phase_writes_stub_script(tmp_path):
     assert isinstance(result, PhaseResult)
     assert not result.is_complete
     assert result.submitted_job_id == DRYRUN_JOB_PREFIX + "PHASE_A_POLUS-0"
-    script = tmp_path / "campaign" / ".DATA" / "SCRIPTS" / "PHASE_A_POLUS-0.sh"
-    assert script.exists()
-    content = script.read_text()
+    scripts = list(
+        (
+            tmp_path
+            / "campaign"
+            / ".DATA"
+            / "SCRIPTS"
+            / "JOBS"
+            / "POLUS"
+            / "PHASE_A_POLUS"
+            / "iteration-000000"
+        ).glob("*/job.sh")
+    )
+    assert len(scripts) == 1
+    script = scripts[0]
+    content = script.read_text(encoding="utf-8")
     assert "DRYRUN" in content
     assert "iteration=0" in content
 

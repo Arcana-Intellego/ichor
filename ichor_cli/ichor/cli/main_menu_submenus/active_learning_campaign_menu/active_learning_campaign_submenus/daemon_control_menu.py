@@ -24,6 +24,8 @@ from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_
     START_DAEMON_BACKGROUND_MENU_DESCRIPTION,
     start_daemon_foreground_menu,
     START_DAEMON_FOREGROUND_MENU_DESCRIPTION,
+    RESOURCE_PLAN_MENU,
+    RESOURCE_PLAN_MENU_DESCRIPTION,
 )
 from ichor.cli.menu_description import MenuDescription
 from ichor.cli.menu_options import MenuOptions
@@ -317,6 +319,8 @@ class DaemonControlFunctions:
         ns.allow_fresh_init = bool(getattr(ns, "allow_fresh_init", False))
         ns.apply = bool(getattr(ns, "apply", False))
         ns.archive_staging = bool(getattr(ns, "archive_staging", False))
+        ns.clean_scratch = bool(getattr(ns, "clean_scratch", False))
+        ns.scratch_attempt = list(getattr(ns, "scratch_attempt", None) or [])
         ns.restore_config_from_lock = bool(
             getattr(ns, "restore_config_from_lock", False)
         )
@@ -405,6 +409,38 @@ class DaemonControlFunctions:
         rc = cmd_reconcile(ns)
         if rc != 0:
             print("reconcile --archive-staging --apply returned exit code " + str(rc))
+        user_input_free_flow("Press enter to return to the menu: ", "")
+
+    @staticmethod
+    def reconcile_clean_scratch():
+        """Inspect, confirm, and clean conclusively inactive scratch attempts."""
+        from ichor.hpc.active_learning.cli import cmd_reconcile
+
+        ns = _guarded_campaign_dir_ns()
+        if ns is None:
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        ns = DaemonControlFunctions._set_reconcile_defaults(ns)
+        ns.clean_scratch = True
+        ns.apply = False
+        ns.json = False
+        preview_rc = cmd_reconcile(ns)
+        if preview_rc != 0:
+            print("scratch inventory returned exit code " + str(preview_rc))
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        answer = user_input_free_flow(
+            "Delete all conclusively inactive scratch attempts listed above? Type YES: ",
+            "",
+        )
+        if answer != "YES":
+            print("Cancelled.")
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        ns.apply = True
+        rc = cmd_reconcile(ns)
+        if rc != 0:
+            print("reconcile --clean-scratch --apply returned exit code " + str(rc))
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
@@ -577,6 +613,11 @@ daemon_control_menu_items = [
         "Recovery dashboard",
         DaemonControlFunctions.show_recovery_dashboard,
     ),
+    SubmenuItem(
+        RESOURCE_PLAN_MENU_DESCRIPTION.title,
+        RESOURCE_PLAN_MENU,
+        daemon_control_menu,
+    ),
     FunctionItem("Campaign live preflight", DaemonControlFunctions.preflight_backends),
     FunctionItem(
         "Submit compute-node environment smoke",
@@ -606,6 +647,10 @@ daemon_control_menu_items = [
     FunctionItem(
         "Reconcile --archive-staging --apply",
         DaemonControlFunctions.reconcile_archive_stale_staging,
+    ),
+    FunctionItem(
+        "Inspect and clean retained scratch",
+        DaemonControlFunctions.reconcile_clean_scratch,
     ),
     FunctionItem(
         "Reconcile force-resubmit current array",

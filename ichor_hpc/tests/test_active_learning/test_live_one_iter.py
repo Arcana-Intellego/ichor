@@ -602,7 +602,15 @@ def _live_smoke_seed_for_phase(campaign_dir, phase_name, iteration):
 
 
 def _phase_iteration_from_script(script):
-    stem = Path(script).stem
+    path = Path(script)
+    if path.name == "job.sh":
+        iteration_token = path.parent.parent.name
+        phase_name = path.parent.parent.parent.name
+        if iteration_token.startswith("iteration-"):
+            iteration_text = iteration_token.removeprefix("iteration-")
+            if iteration_text.isdigit():
+                return phase_name, int(iteration_text)
+    stem = path.stem
     attempt_match = re.fullmatch(
         r"(?P<phase>.+)-(?P<iteration>\d+)-r\d{4}-a\d{4}-[0-9a-f]+",
         stem,

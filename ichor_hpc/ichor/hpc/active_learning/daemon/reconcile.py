@@ -251,6 +251,18 @@ def stateful_campaign_artifacts(campaign_dir: Union[str, Path]) -> List[str]:
     if scripts.is_dir():
         for path in sorted(scripts.glob("*.sh")):
             findings.append(str(path.relative_to(campaign)))
+        jobs = scripts / "JOBS"
+        if jobs.is_dir():
+            for path in sorted(jobs.rglob("job.sh")):
+                findings.append(str(path.relative_to(campaign)))
+    scratch = campaign / ".DATA" / "SCRATCH"
+    if scratch.is_dir():
+        scratch_tasks = sorted(scratch.rglob("TASK.json"))
+        if scratch_tasks:
+            for path in scratch_tasks:
+                findings.append(str(path.relative_to(campaign)))
+        elif any(scratch.iterdir()):
+            findings.append(".DATA/SCRATCH")
     return findings
 
 
@@ -370,6 +382,12 @@ def _scripts_inventory(campaign: Path) -> Dict[str, Any]:
         "is_dir": scripts.is_dir(),
         "count": 0,
         "sample": [],
+        "legacy_flat_script_count": 0,
+        "attempt_bundle_count": 0,
+        "attempt_bundles": [],
+        "has_symlink": False,
+        "symlink_entries": [],
+        "invalid_bundle_entries": [],
         "error": None,
     }
     if not scripts.exists():
@@ -378,8 +396,16 @@ def _scripts_inventory(campaign: Path) -> Dict[str, Any]:
         payload["error"] = ".DATA/SCRIPTS exists but is not a directory"
         return payload
     try:
+        symlinks = sorted(
+            [path for path in scripts.rglob("*") if path.is_symlink()],
+            key=lambda path: str(path.relative_to(scripts)),
+        )
+        payload["has_symlink"] = bool(symlinks)
+        payload["symlink_entries"] = [
+            str(path.relative_to(campaign)) for path in symlinks[:20]
+        ]
         files = sorted(
-            [p for p in scripts.rglob("*") if p.is_file()],
+            [p for p in scripts.rglob("*") if p.is_file() and not p.is_symlink()],
             key=lambda p: str(p.relative_to(scripts)),
         )
         payload["count"] = len(files)
@@ -387,6 +413,81 @@ def _scripts_inventory(campaign: Path) -> Dict[str, Any]:
             str(p.relative_to(campaign))
             for p in files[:5]
         ]
+        payload["legacy_flat_script_count"] = len(
+            [path for path in scripts.glob("*.sh") if path.is_file()]
+        )
+        intent_status_by_identity: Dict[str, str] = {}
+        intents_root = campaign / ".DATA" / "ACTIVE_LEARNING" / "submission_intents"
+        if intents_root.is_dir() and not intents_root.is_symlink():
+            for intent_path in sorted(intents_root.glob("*.json")):
+                try:
+                    intent_payload = json.loads(
+                        intent_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, ValueError):
+                    continue
+                if not isinstance(intent_payload, dict):
+                    continue
+                identity = str(intent_payload.get("submission_identity") or "")
+                if identity:
+                    intent_status_by_identity[identity] = str(
+                        intent_payload.get("status") or ""
+                    )
+        bundles = []
+        jobs_root = scripts / "JOBS"
+        if jobs_root.is_dir() and not jobs_root.is_symlink():
+            for job_script in sorted(jobs_root.rglob("job.sh")):
+                if job_script.is_symlink() or not job_script.is_file():
+                    continue
+                try:
+                    backend, phase, iteration_token, identity, filename = (
+                        job_script.relative_to(jobs_root).parts
+                    )
+                except ValueError:
+                    payload["invalid_bundle_entries"].append(
+                        str(job_script.relative_to(campaign))
+                    )
+                    continue
+                if filename != "job.sh":
+                    continue
+                bundle = job_script.parent
+                outputs = bundle / "OUTPUTS"
+                errors = bundle / "ERRORS"
+                if (
+                    outputs.is_symlink()
+                    or errors.is_symlink()
+                    or not outputs.is_dir()
+                    or not errors.is_dir()
+                ):
+                    payload["invalid_bundle_entries"].append(
+                        str(bundle.relative_to(campaign))
+                    )
+                    continue
+                output_count = (
+                    len([path for path in outputs.iterdir() if path.is_file()])
+                    if outputs.is_dir() and not outputs.is_symlink()
+                    else 0
+                )
+                error_count = (
+                    len([path for path in errors.iterdir() if path.is_file()])
+                    if errors.is_dir() and not errors.is_symlink()
+                    else 0
+                )
+                bundles.append(
+                    {
+                        "backend": backend,
+                        "phase": phase,
+                        "iteration": iteration_token,
+                        "submission_identity": identity,
+                        "path": str(bundle.relative_to(campaign)),
+                        "intent_status": intent_status_by_identity.get(identity),
+                        "output_log_count": output_count,
+                        "error_log_count": error_count,
+                        "has_array_task_map": (bundle / "array_task_map.json").is_file(),
+                    }
+                )
+        payload["attempt_bundle_count"] = len(bundles)
+        payload["attempt_bundles"] = bundles
     except Exception as exc:
         payload["error"] = type(exc).__name__ + ": " + str(exc)[:180]
     return payload
@@ -1005,10 +1106,31 @@ def propose_recovery(
         ]
     scripts_root = campaign / ".DATA" / "SCRIPTS"
     script_inventory = _scripts_inventory(campaign)
+    # Persistent attempt bundles under SCRIPTS/JOBS are immutable operational
+    # evidence, not stale re-entry artefacts. Only legacy flat scripts retain
+    # the old reconcile-cleanable meaning.
     script_files = [
         p for p in (scripts_root.glob("*.sh") if scripts_root.is_dir() else [])
         if p.is_file()
     ]
+    if script_inventory.get("error"):
+        unsafe_reasons.append(
+            "submission script inventory failed: "
+            + str(script_inventory.get("error"))
+        )
+        blocking_artifacts.append("submission script inventory")
+    if bool(script_inventory.get("has_symlink")):
+        unsafe_reasons.append(
+            "submission script hierarchy contains symlinks: "
+            + ", ".join(script_inventory.get("symlink_entries") or [])
+        )
+        blocking_artifacts.append("symlinked submission script evidence")
+    if script_inventory.get("invalid_bundle_entries"):
+        unsafe_reasons.append(
+            "submission attempt bundle hierarchy is malformed: "
+            + ", ".join(script_inventory.get("invalid_bundle_entries") or [])
+        )
+        blocking_artifacts.append("malformed submission attempt bundle")
     dangling_reference_data = (
         ReferenceDataVersioning(
             training_dir,

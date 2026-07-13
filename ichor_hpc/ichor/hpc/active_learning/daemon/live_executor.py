@@ -71,6 +71,19 @@ from .resource_solver import (
     validate_gaussian_link0_memory,
     validate_partition_walltime,
 )
+from .resource_records import (
+    resolution_payload,
+    write_resolution,
+)
+from .script_bundles import (
+    AttemptBundle,
+    bundle_root,
+    prepare_attempt_bundle,
+    read_source_array_task_ids,
+    slurm_log_paths,
+    write_attempt_script,
+)
+from .scratch import scratch_path_template
 from .preflight import BackendAvailability, check_backends, missing_backend_message
 from .cluster_profile import (
     active_machine,
@@ -1501,10 +1514,72 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 partition=effective_partition,
                 campaign_dir=self.campaign_dir,
                 iteration=int(getattr(state, "iteration", 0)),
+                expected_reference_data_version=int(
+                    0
+                    if phase_name == "INITIAL_FEREBUS"
+                    else getattr(state, "reference_data_version", -1)
+                ),
+                require_evidence=True,
+            )
+            from . import submission_intent as _submission_intent
+
+            active_intent = _submission_intent.load_active_intent(
+                self.campaign_dir,
+                phase_name,
+                int(getattr(state, "iteration", 0)),
+                expected_campaign_uid=str(state.campaign_uid),
+            )
+            if not isinstance(active_intent, dict) or str(
+                active_intent.get("status")
+            ) != "PRE_SUBMIT":
+                raise BackendSubmissionError(
+                    "live FEREBUS submission requires an active PRE_SUBMIT intent"
+                )
+            identity = str(active_intent["submission_identity"])
+            bundle = prepare_attempt_bundle(
+                self.campaign_dir,
+                phase_name,
+                int(getattr(state, "iteration", 0)),
+                identity,
+                array_size=None,
+                max_log_files_per_directory=(
+                    _configured_max_job_log_files_per_directory()
+                ),
+            )
+            scratch_template = scratch_path_template(
+                self.campaign_dir,
+                phase_name,
+                int(getattr(state, "iteration", 0)),
+                identity,
+            )
+            resource_payload = resolution_payload(
+                campaign_uid=str(state.campaign_uid),
+                phase_name=phase_name,
+                iteration=int(getattr(state, "iteration", 0)),
+                attempt_id=str(active_intent["attempt_id"]),
+                submission_identity=identity,
+                resolved=resolved,
+                evidence=dict(resolved.extra.get("evidence") or {}),
+                scratch_path_template=scratch_template,
+            )
+            resolution_binding = write_resolution(
+                self.campaign_dir, resource_payload
+            )
+            _submission_intent.bind_resource_resolution(
+                self.campaign_dir,
+                phase_name,
+                int(getattr(state, "iteration", 0)),
+                path=str(resolution_binding["path"]),
+                sha256=str(resolution_binding["sha256"]),
+                formula_version=str(resolution_binding["formula_version"]),
+                scratch_path_template=scratch_template,
+                expected_tasks=1,
             )
             self._journal_event(
                 "resolved_phase_resources",
                 **resolved.journal_payload(phase_name=phase_name),
+                resource_resolution_path=str(resolution_binding["path"]),
+                resource_resolution_sha256=str(resolution_binding["sha256"]),
             )
             ferebus_path = _configured_backend_path("ferebus", "ferebus")
             allow_bare_ferebus = (
@@ -1536,7 +1611,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 staging,
                 platform=ferebus_platform,
                 walltime_hours=effective_walltime,
-                ncores=max(1, int(resolved.cpus_per_task)),
+                ncores=max(
+                    1,
+                    int(resolved.extra.get("active_workers", f.nagents)),
+                ),
                 partition=str(resolved.partition),
                 mem_per_cpu=str(resolved.mem_per_cpu),
                 cpus_per_task=int(resolved.cpus_per_task),
@@ -1560,6 +1638,24 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 expected_tasks=expected_ferebus_tasks,
                 expected_job_name=expected_job_name,
                 submit_runner=self.sbatch_runner,
+                submission_script_path=bundle.script,
+                output_path=slurm_log_paths(bundle, is_array=False)["output"],
+                error_path=slurm_log_paths(bundle, is_array=False)["error"],
+                runtime_preamble=[
+                    "export ICHOR_ACTIVE_WORKERS="
+                    + str(int(resolved.extra.get("active_workers", f.nagents))),
+                    "export ICHOR_MEMORY_ONLY_CPUS="
+                    + str(int(resolved.extra.get("memory_only_cpus", 0))),
+                    "export OMP_NUM_THREADS="
+                    + str(int(resolved.extra.get("active_workers", f.nagents))),
+                    *_job_scratch_preamble(
+                        campaign_dir=self.campaign_dir,
+                        phase_name=phase_name,
+                        iteration=int(getattr(state, "iteration", 0)),
+                        submission_intent=active_intent,
+                        resource_resolution_binding=resolution_binding,
+                    ),
+                ],
             )
         except BackendSubmissionError:
             raise
@@ -1585,8 +1681,19 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         return PhaseResult(
             is_complete=False,
             submitted_job_id=str(submission.job_id),
-            expected_tasks=int(n_tasks),
+            # pyferebus runs every validated model command inside one
+            # submitted batch script; this is not a Slurm array.
+            expected_tasks=1,
             state_updates=state_updates,
+            submission_metadata={
+                "resource_resolution_path": str(resolution_binding["path"]),
+                "resource_resolution_sha256": str(resolution_binding["sha256"]),
+                "resource_formula_version": str(
+                    resolution_binding["formula_version"]
+                ),
+                "scratch_path_template": scratch_template,
+                "script_bundle": str(bundle.root.resolve()),
+            },
         )
 
     def _complete_empty_aimall_phase(self, state, phase_name: str) -> PhaseResult:
@@ -1854,6 +1961,30 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 array_size,
                 array_task_map=array_task_map,
             )
+            from . import submission_intent as _submission_intent
+
+            bound_intent = _submission_intent.load_active_intent(
+                self.campaign_dir,
+                phase_name,
+                int(getattr(state, "iteration", 0)),
+                expected_campaign_uid=str(state.campaign_uid),
+            )
+            if isinstance(bound_intent, dict):
+                submission_metadata.update({
+                    "resource_resolution_path": bound_intent.get(
+                        "resource_resolution_path"
+                    ),
+                    "resource_resolution_sha256": bound_intent.get(
+                        "resource_resolution_sha256"
+                    ),
+                    "resource_formula_version": bound_intent.get(
+                        "resource_formula_version"
+                    ),
+                    "scratch_path_template": bound_intent.get(
+                        "scratch_path_template"
+                    ),
+                    "script_bundle": str(script.parent.resolve()),
+                })
         except BackendSubmissionError:
             raise
         except Exception as exc:
@@ -1900,10 +2031,6 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         *,
         array_task_map: Optional[Path] = None,
     ) -> Path:
-        self.scripts_dir.mkdir(parents=True, exist_ok=True)
-        (self.scripts_dir / "OUTPUTS").mkdir(parents=True, exist_ok=True)
-        (self.scripts_dir / "ERRORS").mkdir(parents=True, exist_ok=True)
-        script_stem = phase_name + "-" + str(state.iteration)
         try:
             from . import submission_intent as _submission_intent
 
@@ -1913,18 +2040,33 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 int(state.iteration),
                 expected_campaign_uid=str(state.campaign_uid),
             )
-        except Exception:
-            active_intent = None
-        if isinstance(active_intent, dict) and active_intent.get("submission_identity"):
-            script_stem += "-" + _safe_shell_path_component(
-                active_intent["submission_identity"]
+        except Exception as exc:
+            raise BackendSubmissionError(
+                "cannot load PRE_SUBMIT intent for resource resolution: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)
+            ) from exc
+        if not isinstance(active_intent, dict) or str(
+            active_intent.get("status")
+        ) != "PRE_SUBMIT":
+            raise BackendSubmissionError(
+                "live submission requires an active PRE_SUBMIT intent"
             )
-        path = self.scripts_dir / (script_stem + ".sh")
+        identity = str(active_intent["submission_identity"])
         effective_partition = (
             str(self.partition)
             if self.partition is not None
             else str(self.config.resources.partition_for(phase_name))
         )
+        try:
+            submitted_task_ids = (
+                list(read_source_array_task_ids(array_task_map))
+                if array_task_map is not None
+                else None
+            )
+        except ValueError as exc:
+            raise BackendSubmissionError(str(exc)) from exc
         resolved = resolve_phase_resources(
             phase_name=phase_name,
             config=self.config,
@@ -1938,10 +2080,85 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 if "GAUSSIAN" in phase_name or "AIMALL" in phase_name
                 else None
             ),
+            expected_models_version=(
+                int(state.models_version)
+                if phase_name == "ARIADNE_ARRAY"
+                else None
+            ),
+            submitted_task_ids=submitted_task_ids,
+            require_evidence=True,
         )
+        try:
+            bundle = prepare_attempt_bundle(
+                self.campaign_dir,
+                phase_name,
+                int(state.iteration),
+                identity,
+                array_size=array_size,
+                max_log_files_per_directory=(
+                    _configured_max_job_log_files_per_directory()
+                ),
+                source_array_task_map=array_task_map,
+            )
+            resolution_evidence = dict(resolved.extra.get("evidence") or {})
+            if bundle.array_task_map is not None:
+                from .script_bundles import read_array_task_map
+                from ..versioning.manifest import sha256_file
+
+                copied_ids = [
+                    int(task_id)
+                    for task_id in read_array_task_map(bundle.array_task_map)
+                ]
+                if copied_ids != list(submitted_task_ids or []):
+                    raise ValueError(
+                        "attempt array task map does not match resolved retry tasks"
+                    )
+                resolution_evidence["submitted_array_task_map"] = {
+                    "path": str(bundle.array_task_map.resolve()),
+                    "size": int(bundle.array_task_map.stat().st_size),
+                    "sha256": sha256_file(bundle.array_task_map),
+                }
+        except ValueError as exc:
+            raise BackendSubmissionError(str(exc)) from exc
+        scratch_template = scratch_path_template(
+            self.campaign_dir,
+            phase_name,
+            int(state.iteration),
+            identity,
+        )
+        payload = resolution_payload(
+            campaign_uid=str(state.campaign_uid),
+            phase_name=phase_name,
+            iteration=int(state.iteration),
+            attempt_id=str(active_intent["attempt_id"]),
+            submission_identity=identity,
+            resolved=resolved,
+            evidence=resolution_evidence,
+            scratch_path_template=scratch_template,
+        )
+        try:
+            resolution_binding = write_resolution(self.campaign_dir, payload)
+            _submission_intent.bind_resource_resolution(
+                self.campaign_dir,
+                phase_name,
+                int(state.iteration),
+                path=str(resolution_binding["path"]),
+                sha256=str(resolution_binding["sha256"]),
+                formula_version=str(resolution_binding["formula_version"]),
+                scratch_path_template=scratch_template,
+                expected_tasks=(
+                    int(array_size) if array_size is not None else 1
+                ),
+            )
+        except (OSError, ValueError) as exc:
+            raise BackendSubmissionError(
+                "cannot persist immutable resource resolution: " + str(exc)
+            ) from exc
         self._journal_event(
             "resolved_phase_resources",
             **resolved.journal_payload(phase_name=phase_name),
+            resource_resolution_path=str(resolution_binding["path"]),
+            resource_resolution_sha256=str(resolution_binding["sha256"]),
         )
         body = build_sbatch_script(
             phase_name=phase_name,
@@ -1949,19 +2166,17 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             campaign_dir=self.campaign_dir,
             config=self.config,
             array_size=array_size,
-            array_task_map=array_task_map,
+            array_task_map=bundle.array_task_map,
             walltime_hours=self.walltime_hours,
             partition=self.partition,
             campaign_uid=getattr(state, "campaign_uid", None),
             replacement_round=int(getattr(state, "replacement_round", 0)),
             resolved_resources=resolved,
+            attempt_bundle=bundle,
+            submission_intent=active_intent,
+            resource_resolution_binding=resolution_binding,
         )
-        path.write_text(body, encoding="utf-8")
-        try:
-            os.chmod(path, 0o755)
-        except OSError:
-            pass
-        return path
+        return write_attempt_script(bundle, body)
 
     # --- postprocess (CSF4-only implementation) -------------------------
 
@@ -2085,7 +2300,6 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         INITIAL_GAUSSIAN / INITIAL_AIMALL share ".DATA/STAGING/initial/";
         GAUSSIAN / AIMALL share ".DATA/STAGING/iter_<N>/" (per-iteration).
         """
-        from pathlib import Path as _Path
         if "REPLACEMENT" in str(phase_name):
             from ..replacement_sampling import replacement_round_dir
 
@@ -2096,9 +2310,13 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 iteration=0 if context == "bootstrap" else int(state.iteration),
                 replacement_round=int(getattr(state, "replacement_round", 0)),
             )
-        initial = phase_name.startswith("INITIAL_")
-        subdir = "initial" if initial else ("iter_" + str(int(state.iteration)))
-        return _Path(self.campaign_dir) / ".DATA" / "STAGING" / subdir
+        from ..layout import staging_phase_dir
+
+        return staging_phase_dir(
+            self.campaign_dir,
+            str(phase_name),
+            int(state.iteration),
+        )
 
     def _validators_for(self, phase_name):
         """Pick the right validator tuple for the phase. Gaussian / AIMAll
@@ -2436,8 +2654,9 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
     def _initial_quantum_staging_path(self):
         """Path the initial diversity sample staging dir lives at."""
-        from pathlib import Path as _Path
-        return _Path(self.campaign_dir) / ".DATA" / "STAGING" / "initial"
+        from ..layout import staging_phase_dir
+
+        return staging_phase_dir(self.campaign_dir, "INITIAL_GAUSSIAN", 0)
 
 
     # --- reference scales from a real GP posterior ----------------------
@@ -4427,6 +4646,12 @@ def _configured_max_array_task_id() -> Optional[int]:
     raw = profile_value("hpc", "max_array_task_id", default=None)
     if raw is None:
         return None
+    if isinstance(raw, bool) or (
+        isinstance(raw, float) and not raw.is_integer()
+    ):
+        raise BackendSubmissionError(
+            "configured hpc.max_array_task_id must be an integer"
+        )
     try:
         value = int(raw)
     except (TypeError, ValueError) as exc:
@@ -4436,6 +4661,29 @@ def _configured_max_array_task_id() -> Optional[int]:
     if value < 0:
         raise BackendSubmissionError(
             "configured hpc.max_array_task_id must be >= 0"
+        )
+    return value
+
+
+def _configured_max_job_log_files_per_directory() -> int:
+    raw = profile_value(
+        "hpc", "max_job_log_files_per_directory", default=5000
+    )
+    if isinstance(raw, bool) or (
+        isinstance(raw, float) and not raw.is_integer()
+    ):
+        raise BackendSubmissionError(
+            "configured hpc.max_job_log_files_per_directory must be an integer"
+        )
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise BackendSubmissionError(
+            "configured hpc.max_job_log_files_per_directory must be an integer"
+        ) from exc
+    if value <= 0:
+        raise BackendSubmissionError(
+            "configured hpc.max_job_log_files_per_directory must be > 0"
         )
     return value
 
@@ -4497,6 +4745,72 @@ def _configured_daemon_runtime_modules() -> List[str]:
         raise BackendSubmissionError(str(exc)) from exc
 
 
+def _job_scratch_preamble(
+    *,
+    campaign_dir: Path,
+    phase_name: str,
+    iteration: int,
+    submission_intent: Dict[str, Any],
+    resource_resolution_binding: Dict[str, Any],
+) -> List[str]:
+    python = _python_executable_for_script()
+    camp = str(Path(campaign_dir).resolve())
+    identity = str(submission_intent["submission_identity"])
+    resolution_path = str(resource_resolution_binding["path"])
+    resolution_sha = str(resource_resolution_binding["sha256"])
+    return [
+        "# Verify immutable resource evidence before creating task scratch.",
+        "export ICHOR_RESOURCE_RESOLUTION=" + _shell_quote(resolution_path),
+        "export ICHOR_RESOURCE_RESOLUTION_SHA256=" + _shell_quote(resolution_sha),
+        python
+        + " -c "
+        + _shell_quote(
+            "import sys; from ichor.hpc.active_learning.daemon.resource_records "
+            "import verify_resolution; verify_resolution(sys.argv[1], sys.argv[2])"
+        )
+        + ' "$ICHOR_RESOURCE_RESOLUTION" "$ICHOR_RESOURCE_RESOLUTION_SHA256"',
+        "ICHOR_JOB_SCRATCH=$("
+        + python
+        + " -m ichor.hpc.active_learning.daemon.scratch prepare"
+        + " --campaign-dir "
+        + _shell_quote(camp)
+        + " --campaign-uid "
+        + _shell_quote(str(submission_intent.get("campaign_uid") or ""))
+        + " --phase "
+        + _shell_quote(phase_name)
+        + " --iteration "
+        + str(int(iteration))
+        + " --attempt-id "
+        + _shell_quote(str(submission_intent.get("attempt_id") or ""))
+        + " --submission-identity "
+        + _shell_quote(identity)
+        + ' --job-id "${SLURM_JOB_ID}"'
+        + ' --array-task-id "${SLURM_ARRAY_TASK_ID:-0}"'
+        + ' --resource-resolution "$ICHOR_RESOURCE_RESOLUTION"'
+        + ' --resource-resolution-sha256 "$ICHOR_RESOURCE_RESOLUTION_SHA256"'
+        + ")",
+        "export ICHOR_JOB_SCRATCH",
+        'export TMPDIR="$ICHOR_JOB_SCRATCH" TMP="$ICHOR_JOB_SCRATCH" TEMP="$ICHOR_JOB_SCRATCH"',
+        "ichor_finish_scratch() {",
+        "  status=$?",
+        "  trap - EXIT",
+        '  if [ "$status" -eq 0 ]; then',
+        "    "
+        + python
+        + ' -m ichor.hpc.active_learning.daemon.scratch finish --path "$ICHOR_JOB_SCRATCH" --success || '
+        + 'echo "WARNING: could not clean ICHOR task scratch" >&2',
+        "  else",
+        "    "
+        + python
+        + ' -m ichor.hpc.active_learning.daemon.scratch finish --path "$ICHOR_JOB_SCRATCH" || true',
+        "  fi",
+        '  exit "$status"',
+        "}",
+        "trap ichor_finish_scratch EXIT",
+        "",
+    ]
+
+
 def build_sbatch_script(
     *,
     phase_name: str,
@@ -4510,6 +4824,9 @@ def build_sbatch_script(
     campaign_uid: Optional[str] = None,
     replacement_round: int = 0,
     resolved_resources: Optional[ResolvedPhaseResources] = None,
+    attempt_bundle: Optional[AttemptBundle] = None,
+    submission_intent: Optional[Dict[str, Any]] = None,
+    resource_resolution_binding: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Return the body of an sbatch script for the given phase.
 
@@ -4526,6 +4843,17 @@ def build_sbatch_script(
     _configured_scheduler()
     res = config.resources
     part = str(partition if partition is not None else res.partition_for(phase_name))
+    is_array = array_size is not None and int(array_size) > 0
+    if is_array:
+        max_array_task_id = _configured_max_array_task_id()
+        highest_task_id = int(array_size) - 1
+        if max_array_task_id is not None and highest_task_id > max_array_task_id:
+            raise BackendSubmissionError(
+                "array task id "
+                + str(highest_task_id)
+                + " exceeds configured hpc.max_array_task_id "
+                + str(max_array_task_id)
+            )
     resolved = resolved_resources or resolve_phase_resources(
         phase_name=phase_name,
         config=config,
@@ -4534,6 +4862,7 @@ def build_sbatch_script(
         iteration=int(iteration),
         array_size=array_size,
         replacement_round=int(replacement_round),
+        require_evidence=False,
     )
     wall = walltime_hours if walltime_hours is not None else res.walltime_for(phase_name)
     validate_partition_walltime(str(resolved.partition), wall)
@@ -4553,19 +4882,26 @@ def build_sbatch_script(
     except ValueError as exc:
         raise BackendSubmissionError(str(exc)) from exc
     _reject_shell_control_chars("Slurm job name", job_name)
-    logs = camp + "/.DATA/SCRIPTS"
-    is_array = array_size is not None and int(array_size) > 0
-    if is_array:
-        max_array_task_id = _configured_max_array_task_id()
-        highest_task_id = int(array_size) - 1
-        if max_array_task_id is not None and highest_task_id > max_array_task_id:
-            raise BackendSubmissionError(
-                "array task id "
-                + str(highest_task_id)
-                + " exceeds configured hpc.max_array_task_id "
-                + str(max_array_task_id)
-            )
-    tag = ".%A_%a" if is_array else ".%j"
+    identity = str(
+        (submission_intent or {}).get("submission_identity")
+        or "unbound-preview"
+    )
+    bundle = attempt_bundle
+    if bundle is None:
+        root = bundle_root(
+            campaign_dir,
+            phase_name,
+            int(iteration),
+            identity,
+        )
+        bundle = AttemptBundle(
+            root=root,
+            script=root / "job.sh",
+            outputs=root / "OUTPUTS",
+            errors=root / "ERRORS",
+            array_task_map=array_task_map,
+        )
+    log_paths = slurm_log_paths(bundle, is_array=is_array)
     lines: List[str] = [
         _configured_jobscript_shebang(),
         "#SBATCH --job-name=" + job_name,
@@ -4593,8 +4929,8 @@ def build_sbatch_script(
             array_spec += "%" + str(throttle_i)
         lines.append("#SBATCH --array=" + array_spec)
     lines += [
-        "#SBATCH --output=" + logs + "/OUTPUTS/" + job_name + tag + ".o",
-        "#SBATCH --error="  + logs + "/ERRORS/"  + job_name + tag + ".e",
+        "#SBATCH --output=" + log_paths["output"],
+        "#SBATCH --error=" + log_paths["error"],
         "",
         "# Resolved ICHOR resources: backend="
         + str(resolved.backend)
@@ -4602,6 +4938,10 @@ def build_sbatch_script(
         + str(resolved.cpu_reason)
         + " memory_reason="
         + str(resolved.memory_reason),
+        "export ICHOR_ACTIVE_WORKERS="
+        + str(int(resolved.extra.get("active_workers", resolved.cpus_per_task))),
+        "export ICHOR_MEMORY_ONLY_CPUS="
+        + str(int(resolved.extra.get("memory_only_cpus", 0))),
         "set -euo pipefail",
         "export LC_ALL=C",
         "export LC_NUMERIC=C",
@@ -4609,18 +4949,41 @@ def build_sbatch_script(
         *["module load " + m for m in _configured_daemon_runtime_modules()],
         "",
     ]
-    bucket = "initial" if phase_name.startswith("INITIAL_") else ("iter_" + str(iteration))
+    if str(resolved.backend) == "polus":
+        lines += [
+            "export ICHOR_POLUS_DISTANCE_STORE_MODE="
+            + _shell_quote(str(resolved.extra.get("distance_store_mode", "memory"))),
+            "export ICHOR_POLUS_SCRATCH_REQUIRED_BYTES="
+            + str(
+                int(
+                    resolved.extra.get("scratch_required_bytes", 0)
+                )
+            ),
+            "",
+        ]
+    if resource_resolution_binding is not None and submission_intent is not None:
+        lines += _job_scratch_preamble(
+            campaign_dir=campaign_dir,
+            phase_name=phase_name,
+            iteration=int(iteration),
+            submission_intent=submission_intent,
+            resource_resolution_binding=resource_resolution_binding,
+        )
     if "REPLACEMENT" in phase_name:
-        points_file = (
-            camp
-            + "/.DATA/STAGING/"
-            + bucket
-            + "/replacement_round_"
-            + str(int(replacement_round)).zfill(4)
-            + "/POINTS.txt"
+        from ..replacement_sampling import replacement_round_dir
+
+        context = "bootstrap" if phase_name.startswith("INITIAL_") else "active"
+        points_path = replacement_round_dir(
+            campaign_dir,
+            context=context,
+            iteration=0 if context == "bootstrap" else int(iteration),
+            replacement_round=int(replacement_round),
         )
     else:
-        points_file = camp + "/.DATA/STAGING/" + bucket + "/POINTS.txt"
+        from ..layout import staging_phase_dir
+
+        points_path = staging_phase_dir(campaign_dir, phase_name, int(iteration))
+    points_file = str((points_path / "POINTS.txt").resolve())
 
     if "GAUSSIAN" in phase_name:
         lines += _gaussian_invocation_block(
@@ -4666,13 +5029,38 @@ def _array_task_mapping_lines(array_task_map: Optional[Path]) -> List[str]:
             'ICHOR_LOGICAL_ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID}"',
         ]
     task_map = _shell_quote(str(Path(array_task_map).resolve()))
+    python = _python_executable_for_script()
+    from ..versioning.manifest import sha256_file
+
+    expected_sha256 = sha256_file(Path(array_task_map))
     return [
         "if [ ! -f " + task_map + " ]; then echo "
         + _shell_quote("retry task map missing: " + str(Path(array_task_map).resolve()))
         + " >&2; exit 1; fi",
-        'ICHOR_LOGICAL_ARRAY_TASK_ID=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" '
+        "if ! "
+        + python
+        + " -c "
+        + _shell_quote(
+            "import hashlib,sys; observed=hashlib.sha256(open(sys.argv[1], 'rb').read()).hexdigest(); "
+            "raise SystemExit(0 if observed == sys.argv[2] else 1)"
+        )
+        + " "
         + task_map
-        + ")",
+        + " "
+        + _shell_quote(expected_sha256)
+        + "; then echo "
+        + _shell_quote("retry task map SHA-256 mismatch")
+        + " >&2; exit 1; fi",
+        "ICHOR_LOGICAL_ARRAY_TASK_ID=$("
+        + python
+        + " -c "
+        + _shell_quote(
+            "import json,sys; data=json.load(open(sys.argv[1], encoding='utf-8')); "
+            "print(int(data['dense_to_logical'][int(sys.argv[2])]))"
+        )
+        + " "
+        + task_map
+        + ' "$SLURM_ARRAY_TASK_ID")',
         'if [ -z "$ICHOR_LOGICAL_ARRAY_TASK_ID" ]; then echo "no logical task id for retry index $SLURM_ARRAY_TASK_ID" >&2; exit 1; fi',
         'case "$ICHOR_LOGICAL_ARRAY_TASK_ID" in (*[!0-9]*|"") echo "unsafe logical task id: $ICHOR_LOGICAL_ARRAY_TASK_ID" >&2; exit 1 ;; esac',
     ]
@@ -4740,13 +5128,6 @@ def _gaussian_invocation_block(
     phase_q = _shell_quote(str(phase_name))
     uid = _safe_shell_path_component(campaign_uid)
     uid_q = _shell_quote(uid)
-    scratch_lines = [
-        'export GAUSS_SCRDIR="${ICHOR_CAMPAIGN_DIR}/.DATA/SCRATCH/GAUSSIAN/${ICHOR_GAUSSIAN_PHASE}/${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"',
-    ]
-    cleanup_case = (
-        '    "$ICHOR_CAMPAIGN_DIR"/.DATA/SCRATCH/GAUSSIAN/*/'
-        '"$SLURM_JOB_ID"_*) rm -rf -- "$GAUSS_SCRDIR" ;;'
-    )
     return [
         *["module load " + m for m in gaussian_modules],
         "",
@@ -4755,27 +5136,14 @@ def _gaussian_invocation_block(
         "export ICHOR_CAMPAIGN_UID=" + uid_q,
         "export ICHOR_GAUSSIAN_PHASE=" + phase_q,
         "export ICHOR_ITERATION=" + str(int(iteration)),
-        *scratch_lines,
+        'export GAUSS_SCRDIR="$ICHOR_JOB_SCRATCH/gaussian"',
         *memory_lines,
         'mkdir -p "$GAUSS_SCRDIR"',
         'echo "GAUSS_SCRDIR=$GAUSS_SCRDIR"',
-        "cleanup_gaussian_scratch_success() {",
-        '  case "$GAUSS_SCRDIR" in',
-        cleanup_case,
-        '    *) echo "Refusing to remove unexpected Gaussian scratch path: $GAUSS_SCRDIR" >&2 ;;',
-        "  esac",
-        "}",
         *_array_task_mapping_lines(array_task_map),
         *_pointdir_selection_lines(points_file, required_filename="input.gjf"),
         'cd "$POINT_DIR"',
-        "GAUSSIAN_EXIT=0",
-        gaussian_exe + " < input.gjf > input.gau || GAUSSIAN_EXIT=$?",
-        'if [ "$GAUSSIAN_EXIT" -eq 0 ]; then',
-        "  cleanup_gaussian_scratch_success",
-        "else",
-        '  echo "Gaussian failed; keeping scratch at $GAUSS_SCRDIR" >&2',
-        '  exit "$GAUSSIAN_EXIT"',
-        "fi",
+        gaussian_exe + " < input.gjf > input.gau",
     ]
 
 
@@ -4916,9 +5284,12 @@ def _polus_invocation_block(phase_name, iteration, camp, config) -> List[str]:
     camp_q = _shell_quote(camp)
     return [
         "# POLUS diversity sub-sample (" + phase_name + ").",
+        "export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1",
         "cd " + camp_q,
         python + " -m ichor.hpc.active_learning.sampling.polus_wrapper \\",
         "    --descriptor " + _shell_quote(descriptor) + " \\",
         "    --iteration " + str(wrapper_iteration) + " \\",
-        "    --campaign-dir " + camp_q,
+        "    --campaign-dir " + camp_q + " \\",
+        '    --workers "$ICHOR_ACTIVE_WORKERS" \\',
+        '    --distance-store "$ICHOR_JOB_SCRATCH/polus-condensed.float64"',
     ]

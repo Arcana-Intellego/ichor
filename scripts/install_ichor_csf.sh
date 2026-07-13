@@ -1127,6 +1127,7 @@ if machine == "csf3":
             "scheduler": "slurm",
             "jobscript_shebang": "#!/bin/bash --login",
             "max_array_task_id": 25000,
+            "max_job_log_files_per_directory": 5000,
             "memory_per_core_gb": 8,
             "memory_per_core_gb_by_partition": {
                 "multicore": 8,
@@ -1204,6 +1205,7 @@ else:
             "scheduler": "slurm",
             "jobscript_shebang": "#!/bin/bash",
             "max_array_task_id": 25000,
+            "max_job_log_files_per_directory": 5000,
             "memory_per_core_gb": 4,
             "memory_per_core_gb_by_partition": {
                 "serial": 4,

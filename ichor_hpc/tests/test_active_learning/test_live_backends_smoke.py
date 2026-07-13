@@ -496,6 +496,9 @@ def test_build_sbatch_script_uses_configured_runtime_modules(monkeypatch):
     fake_global_variables = ModuleType("ichor.hpc.global_variables")
     fake_global_variables.ICHOR_CONFIG = {
         "csf4": {
+            "hpc": {
+                "memory_per_core_gb_by_partition": {"multicore": 4},
+            },
             "software": {
                 "python": {"modules": ["python/custom"]},
                 "ariadne_runtime": {"modules": ["oneapi/custom", "mkl/custom"]},
@@ -534,7 +537,12 @@ def test_build_sbatch_script_uses_configured_runtime_modules(monkeypatch):
 def test_build_sbatch_script_rejects_unsafe_configured_module(monkeypatch):
     fake_global_variables = ModuleType("ichor.hpc.global_variables")
     fake_global_variables.ICHOR_CONFIG = {
-        "csf4": {"software": {"python": {"modules": ["python,custom"]}}}
+        "csf4": {
+            "hpc": {
+                "memory_per_core_gb_by_partition": {"multicore": 4},
+            },
+            "software": {"python": {"modules": ["python,custom"]}},
+        }
     }
     fake_global_variables.MACHINE = "csf4"
 
@@ -664,9 +672,8 @@ def test_csf3_gaussian_block_uses_configured_module_path_and_scratch(monkeypatch
     expected_campaign = shlex.quote(str(Path("/scratch/campaign").resolve()))
     assert "export ICHOR_CAMPAIGN_DIR=" + expected_campaign in body
     assert "export ICHOR_GAUSSIAN_PHASE=INITIAL_GAUSSIAN" in body
-    assert 'export GAUSS_SCRDIR="${ICHOR_CAMPAIGN_DIR}/.DATA/SCRATCH/GAUSSIAN/${ICHOR_GAUSSIAN_PHASE}/${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"' in body
-    assert 'rm -rf -- "$GAUSS_SCRDIR"' in body
-    assert "Gaussian failed; keeping scratch at $GAUSS_SCRDIR" in body
+    assert 'export GAUSS_SCRDIR="$ICHOR_JOB_SCRATCH/gaussian"' in body
+    assert 'rm -rf -- "$GAUSS_SCRDIR"' not in body
     assert "ichor_gaussian_${SLURM_JOB_ID}" not in body
     assert 'export GAUSS_PDEF="${SLURM_CPUS_PER_TASK:-1}"' in body
     assert "export GAUSS_MDEF=27GB" in body
@@ -703,8 +710,8 @@ def test_gaussian_block_ignores_configured_scratch_root(monkeypatch):
     )
 
     assert "export ICHOR_CAMPAIGN_UID=campaign_with_unsafe_chars" in body
-    assert 'export GAUSS_SCRDIR="${ICHOR_CAMPAIGN_DIR}/.DATA/SCRATCH/GAUSSIAN/${ICHOR_GAUSSIAN_PHASE}/${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"' in body
-    assert '    "$ICHOR_CAMPAIGN_DIR"/.DATA/SCRATCH/GAUSSIAN/*/"$SLURM_JOB_ID"_*) rm -rf -- "$GAUSS_SCRDIR" ;;' in body
+    assert 'export GAUSS_SCRDIR="$ICHOR_JOB_SCRATCH/gaussian"' in body
+    assert 'rm -rf -- "$GAUSS_SCRDIR"' not in body
     assert "ICHOR_GAUSSIAN_SCRATCH_ROOT" not in body
     assert "ichor-gaussian" not in body
     assert "/scratch/$USER" not in body
@@ -849,6 +856,9 @@ def test_multicore_one_core_request_fails_before_sbatch(monkeypatch, machine, ma
                 "hpc": {
                     "scheduler": "slurm",
                     "parallel_environments": {"multicore": [2, max_cores]},
+                    "memory_per_core_gb_by_partition": {
+                        "multicore": 8 if machine == "csf3" else 4,
+                    },
                 }
             }
         },
@@ -875,6 +885,7 @@ def test_multicore_two_core_request_passes_profile_range_check(monkeypatch):
                 "hpc": {
                     "scheduler": "slurm",
                     "parallel_environments": {"multicore": [2, 168]},
+                    "memory_per_core_gb_by_partition": {"multicore": 8},
                 }
             }
         },
@@ -903,6 +914,7 @@ def test_serial_one_core_request_passes_profile_range_check(monkeypatch):
                 "hpc": {
                     "scheduler": "slurm",
                     "parallel_environments": {"serial": [1, 1]},
+                    "memory_per_core_gb_by_partition": {"serial": 5},
                 }
             }
         },
@@ -1214,6 +1226,7 @@ def test_ariadne_auto_cpus_match_active_fd_worker_count(monkeypatch):
         partition="multicore",
         campaign_dir=None,
         iteration=1,
+        require_evidence=False,
     )
 
     assert resolved.cpus_per_task == 6
@@ -1263,8 +1276,10 @@ def test_ariadne_auto_cpus_match_cartesian_fd_component_count(monkeypatch, tmp_p
         phase_name="ARIADNE_ARRAY",
         config=cfg,
         partition="multicore",
-        campaign_dir=tmp_path,
+        campaign_dir=None,
         iteration=1,
+        n_atoms_override=4,
+        require_evidence=False,
     )
 
     assert resolved.cpus_per_task == 12
@@ -1627,6 +1642,9 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
         monkeypatch,
         {
             "csf3": {
+                "hpc": {
+                    "memory_per_core_gb_by_partition": {"multicore": 8},
+                },
                 "software": {
                     "ferebus": {
                         "executable_path": "$HOME/.local/bin/ferebus",
@@ -1645,12 +1663,37 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
         sbatch_runner=runner,
         backend_check=False,
     )
+    from ichor.hpc.active_learning.daemon.submission_intent import (
+        write_pre_submit_intent,
+    )
+    from ichor.hpc.active_learning.daemon.scheduler_contracts import (
+        infer_expected_tasks_from_artifacts,
+    )
+
+    assert infer_expected_tasks_from_artifacts(
+        campaign,
+        phase="FEREBUS",
+        iteration=0,
+    ) == 1
+
+    write_pre_submit_intent(
+        campaign,
+        campaign_uid="campaign-uid",
+        phase_name="FEREBUS",
+        iteration=0,
+        expected_tasks=1,
+    )
     result = ex.submit_or_run(
-        SimpleNamespace(iteration=0, reference_data_version=4),
+        SimpleNamespace(
+            iteration=0,
+            reference_data_version=4,
+            campaign_uid="campaign-uid",
+        ),
         "FEREBUS",
     )
 
     assert result.submitted_job_id == "4242"
+    assert result.expected_tasks == 1
     assert calls["stage"]["reference_data_version"] == 4
     assert calls["stage"]["is_initial"] is False
     assert calls["submit"]["jd_file"] == staging / stg.FEREBUS_JOB_DETAILS
@@ -1664,6 +1707,7 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
     assert calls["submit"]["kwargs"]["cpus_per_task"] == cfg.ferebus.nagents
     assert calls["submit"]["kwargs"]["ncores"] == cfg.ferebus.nagents
     assert calls["submit"]["kwargs"]["ntasks"] == 1
+    assert calls["submit"]["kwargs"]["expected_tasks"] == 3
     assert calls["submit"]["kwargs"]["mem_per_cpu"].endswith("G")
 
 
@@ -1734,6 +1778,7 @@ def test_build_sbatch_script_renders_phase_a_polus_as_bootstrap_iteration_zero()
     assert "polus_wrapper" in body
     assert "--descriptor rmsd_massweight" in body
     assert "--iteration 0" in body
+    assert "OPENBLAS_NUM_THREADS=1" in body
 
 
 @pytest.mark.parametrize("bucket", ["initial", "iter_1"])
@@ -1797,6 +1842,11 @@ def test_replacement_sbatch_uses_exact_nested_points_file(
     (pointdir / "input.wfn").write_text("fixture\n", encoding="utf-8")
     (round_dir / "POINTS.txt").write_text(
         str(pointdir.resolve()) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    (pointdir / "input.wfn").write_text(
+        "TEST WAVEFUNCTION 18 PRIMITIVES\n",
         encoding="utf-8",
         newline="\n",
     )
@@ -2086,6 +2136,11 @@ def test_replacement_resource_solver_uses_nested_round_atom_count(
         encoding="utf-8",
         newline="\n",
     )
+    (pointdir / "input.wfn").write_text(
+        "TEST WAVEFUNCTION 18 PRIMITIVES\n",
+        encoding="utf-8",
+        newline="\n",
+    )
     cfg = CampaignConfig()
 
     resolved = resolve_phase_resources(
@@ -2121,7 +2176,7 @@ def test_replacement_resource_solver_refuses_missing_round_evidence(
 
     with pytest.raises(
         BackendSubmissionError,
-        match="exact replacement staging round",
+        match="resource evidence not yet produced",
     ):
         resolve_phase_resources(
             phase_name="REPLACEMENT_GAUSSIAN",
@@ -2134,17 +2189,40 @@ def test_replacement_resource_solver_refuses_missing_round_evidence(
 
 
 def test_write_real_script_creates_sbatch_log_dirs(tmp_path):
+    from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
+    from ichor.hpc.active_learning.daemon.submission_intent import (
+        write_pre_submit_intent,
+    )
+
+    campaign = tmp_path / "campaign"
+    campaign.mkdir()
+    source = tmp_path / "pool-source.xyz"
+    source.write_text(
+        "1\nframe 0\nH 0 0 0\n1\nframe 1\nH 0 0 0.1\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    TrajectoryPool.import_from(source, campaign)
+    write_pre_submit_intent(
+        campaign,
+        campaign_uid="uid",
+        phase_name="PHASE_A_POLUS",
+        iteration=0,
+        expected_tasks=1,
+    )
     ex = LiveBackendsPhaseExecutor(
-        campaign_dir=tmp_path / "campaign",
+        campaign_dir=campaign,
         config=CampaignConfig(),
         backend_check=False,
     )
-    ex._write_real_script(
+    script = ex._write_real_script(
         "PHASE_A_POLUS",
         SimpleNamespace(iteration=0, campaign_uid="uid"),
     )
-    assert (tmp_path / "campaign" / ".DATA" / "SCRIPTS" / "OUTPUTS").is_dir()
-    assert (tmp_path / "campaign" / ".DATA" / "SCRIPTS" / "ERRORS").is_dir()
+    assert script.name == "job.sh"
+    assert script.parent.parent.name == "iteration-000000"
+    assert (script.parent / "OUTPUTS").is_dir()
+    assert (script.parent / "ERRORS").is_dir()
 
 
 # --- live binaries (skipped off-cluster) ----------------------------------

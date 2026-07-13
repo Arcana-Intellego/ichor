@@ -73,6 +73,7 @@ __all__ = [
     "StopConfigBlock",
     "ResourceDefaultsBlock",
     "BackendResourceBlock",
+    "PolusResourceBlock",
     "GaussianResourceBlock",
     "CONFIG_SCHEMA_VERSION",
     "ConfigValidationError",
@@ -679,6 +680,15 @@ class BackendResourceBlock:
 
 
 @dataclass
+class PolusResourceBlock(BackendResourceBlock):
+    """POLUS worker and condensed-distance storage limits."""
+
+    auto_max_workers: int = 16
+    target_pairs_per_worker: int = 5_000_000
+    in_memory_distance_store_fraction: float = 0.35
+
+
+@dataclass
 class GaussianResourceBlock:
     partition: Optional[str] = None
     walltime_hours: Optional[Union[int, float]] = None
@@ -695,7 +705,9 @@ class ResourceConfigBlock:
     # overrides while keeping defaults explicit. A backend value of None means
     # "inherit from resources.defaults".
     defaults: ResourceDefaultsBlock = field(default_factory=ResourceDefaultsBlock)
-    polus: BackendResourceBlock = field(default_factory=lambda: BackendResourceBlock(walltime_hours=2))
+    polus: PolusResourceBlock = field(
+        default_factory=lambda: PolusResourceBlock(walltime_hours=2)
+    )
     gaussian: GaussianResourceBlock = field(default_factory=lambda: GaussianResourceBlock(walltime_hours=24))
     aimall: BackendResourceBlock = field(default_factory=BackendResourceBlock)
     ariadne: BackendResourceBlock = field(default_factory=BackendResourceBlock)
@@ -703,6 +715,9 @@ class ResourceConfigBlock:
 
     array_concurrency_limit: Optional[int] = None
     fail_on_memory_estimate_exceeds_request: bool = True
+    memory_estimate_safety_factor: float = 1.25
+    scheduler_usage_telemetry: bool = True
+    scheduler_usage_history_limit: int = 5000
     # "process" -> node-local process pool sized to the task's cpus-per-task.
     # "serial"  -> force single-core (off-cluster / debugging).
     gradient_parallel_backend: str = "process"
@@ -1243,6 +1258,48 @@ class CampaignConfig:
                 "resources.array_concurrency_limit",
                 self.resources.array_concurrency_limit,
             )
+        _validate_positive_int(
+            "resources.polus.auto_max_workers",
+            self.resources.polus.auto_max_workers,
+        )
+        _validate_positive_int(
+            "resources.polus.target_pairs_per_worker",
+            self.resources.polus.target_pairs_per_worker,
+        )
+        if isinstance(
+            self.resources.polus.in_memory_distance_store_fraction, bool
+        ) or not isinstance(
+            self.resources.polus.in_memory_distance_store_fraction,
+            (int, float),
+        ):
+            raise ConfigValidationError(
+                "resources.polus.in_memory_distance_store_fraction must be a number"
+            )
+        if not 0.0 < float(
+            self.resources.polus.in_memory_distance_store_fraction
+        ) <= 1.0:
+            raise ConfigValidationError(
+                "resources.polus.in_memory_distance_store_fraction must be in (0, 1]"
+            )
+        if isinstance(self.resources.memory_estimate_safety_factor, bool) or not isinstance(
+            self.resources.memory_estimate_safety_factor, (int, float)
+        ):
+            raise ConfigValidationError(
+                "resources.memory_estimate_safety_factor must be a number"
+            )
+        safety_factor = float(self.resources.memory_estimate_safety_factor)
+        if not math.isfinite(safety_factor) or safety_factor < 1.0:
+            raise ConfigValidationError(
+                "resources.memory_estimate_safety_factor must be finite and >= 1.0"
+            )
+        if not isinstance(self.resources.scheduler_usage_telemetry, bool):
+            raise ConfigValidationError(
+                "resources.scheduler_usage_telemetry must be a boolean"
+            )
+        _validate_positive_int(
+            "resources.scheduler_usage_history_limit",
+            self.resources.scheduler_usage_history_limit,
+        )
         if self.resources.gradient_parallel_backend not in VALID_GRADIENT_PARALLEL_BACKENDS:
             raise ConfigValidationError(
                 "resources.gradient_parallel_backend must be one of "

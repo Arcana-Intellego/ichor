@@ -10,6 +10,10 @@ from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_
     import_trajectory_pool_menu,
     IMPORT_TRAJECTORY_POOL_MENU_DESCRIPTION,
 )
+from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_submenus.daemon_control_submenus.resource_plan_submenu import (
+    RESOURCE_PLAN_MENU,
+    RESOURCE_PLAN_MENU_DESCRIPTION,
+)
 
 
 __all__ = [
@@ -19,4 +23,6 @@ __all__ = [
     "START_DAEMON_BACKGROUND_MENU_DESCRIPTION",
     "import_trajectory_pool_menu",
     "IMPORT_TRAJECTORY_POOL_MENU_DESCRIPTION",
+    "RESOURCE_PLAN_MENU",
+    "RESOURCE_PLAN_MENU_DESCRIPTION",
 ]

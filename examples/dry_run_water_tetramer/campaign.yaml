@@ -37,6 +37,10 @@ resources:
     walltime_hours: 1
     cpus_per_task: auto
     mem_per_cpu: auto
+  polus:
+    auto_max_workers: 16
+    target_pairs_per_worker: 5000000
+    in_memory_distance_store_fraction: 0.35
   ariadne:
     cpus_per_task: 2
   gaussian:
@@ -44,6 +48,9 @@ resources:
     link0_mem: 8GB
     memory_fraction_of_slurm: 0.85
   array_concurrency_limit: 4
+  memory_estimate_safety_factor: 1.25
+  scheduler_usage_telemetry: true
+  scheduler_usage_history_limit: 5000
 
 gaussian:
   method: B3LYP

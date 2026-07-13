@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
-from ..layout import active_iteration_dir, trained_models_dir
+from ..layout import active_iteration_dir, staging_phase_dir, trained_models_dir
 from .state import CampaignPhase
 
 
@@ -64,14 +64,12 @@ def infer_expected_tasks_from_artifacts(
             return manifest_count
         if phase_name in {"INITIAL_GAUSSIAN", "INITIAL_AIMALL"}:
             return _count_nonempty_lines(
-                campaign / ".DATA" / "STAGING" / "initial" / "POINTS.txt"
+                staging_phase_dir(campaign, phase_name, int(iteration))
+                / "POINTS.txt"
             )
         if phase_name in {"GAUSSIAN", "AIMALL"}:
             return _count_nonempty_lines(
-                campaign
-                / ".DATA"
-                / "STAGING"
-                / ("iter_" + str(int(iteration)))
+                staging_phase_dir(campaign, phase_name, int(iteration))
                 / "POINTS.txt"
             )
         if phase_name in {"INITIAL_FEREBUS", "FEREBUS"}:
@@ -81,10 +79,18 @@ def infer_expected_tasks_from_artifacts(
                 raw = data.get("n_tasks")
                 if raw is not None:
                     value = int(raw)
-                    return value if value > 0 else None
-                tasks = data.get("tasks")
-                if isinstance(tasks, list) and tasks:
-                    return len(tasks)
+                    if value <= 0:
+                        raise ValueError("FEREBUS task manifest contains no model commands")
+                else:
+                    tasks = data.get("tasks")
+                    if not isinstance(tasks, list) or not tasks:
+                        raise ValueError("FEREBUS task manifest contains no model commands")
+            else:
+                return None
+            # pyferebus executes all validated model commands serially inside
+            # one submitted batch script.  The manifest count is therefore a
+            # scientific command count, not a Slurm array task count.
+            return 1
         if phase_name == "ARIADNE_ARRAY":
             from ..seed_identity import read_ariadne_task_map
 

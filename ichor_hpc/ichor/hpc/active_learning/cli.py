@@ -95,6 +95,7 @@ from .daemon.array_recovery import (
     supports_partial_array_recovery,
 )
 from .daemon import submission_intent as _submission_intent
+from .daemon import scratch as _scratch
 from .daemon.state import (
     CampaignPhase,
     DEFAULT_STATE_FILENAME,
@@ -2363,6 +2364,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     job_finder = None  # set in the live branch below; mock/dry leave it None (no adopt check)
     job_name_accounting_finder = None
     job_liveness_checker = None
+    resource_usage_collector = None
     if getattr(args, "live", False):
         avail = check_backends()
         preflight = evaluate_campaign_preflight(
@@ -2387,6 +2389,9 @@ def cmd_start(args: argparse.Namespace) -> int:
         job_finder = make_live_job_finder(campaign_dir=campaign)
         job_name_accounting_finder = make_live_job_accounting_finder()
         job_liveness_checker = make_live_job_liveness_checker()
+        from .daemon.resource_usage import collect_usage
+
+        resource_usage_collector = collect_usage
     elif getattr(args, "dry_run", False):
         executor = DryRunPhaseExecutor(
             campaign_dir=campaign,
@@ -2412,6 +2417,8 @@ def cmd_start(args: argparse.Namespace) -> int:
         daemon_kwargs["job_name_accounting_finder"] = job_name_accounting_finder
     if job_liveness_checker is not None:
         daemon_kwargs["job_liveness_checker"] = job_liveness_checker
+    if resource_usage_collector is not None:
+        daemon_kwargs["resource_usage_collector"] = resource_usage_collector
     d = Daemon(**daemon_kwargs)
     if args.poll_interval is not None:
         #override config-loaded poll interval per-invocation.
@@ -4663,7 +4670,289 @@ def _print_reconcile_apply_blocked(
     print("", file=sys.stderr)
 
 
+def _scratch_intent_index(campaign: Path) -> Dict[str, Dict[str, Any]]:
+    index: Dict[str, Dict[str, Any]] = {}
+    root = _submission_intent.intent_dir(campaign)
+    if not root.is_dir():
+        return index
+    for path in sorted(root.rglob("*.json")):
+        if path.is_symlink():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        for key in ("attempt_id", "submission_identity"):
+            value = str(payload.get(key) or "")
+            if value:
+                index[value] = payload
+    return index
+
+
+def _scratch_scheduler_state(
+    job_id: str,
+    expected_task_count: Optional[int] = None,
+) -> Tuple[str, str]:
+    """Return active, inactive, or inconclusive for one recorded Slurm job."""
+    from .submit import sacct_poll
+
+    try:
+        queue = sacct_poll.find_active_job_by_id_detailed(str(job_id))
+    except Exception as exc:
+        return "inconclusive", type(exc).__name__ + ": " + str(exc)
+    if bool(getattr(queue, "inconclusive", False)):
+        return "inconclusive", str(getattr(queue, "error", None) or "squeue lookup failed")
+    if bool(getattr(queue, "active", False)):
+        return "active", "squeue reports active rows"
+    try:
+        observations = sacct_poll.poll_job(str(job_id))
+    except Exception as exc:
+        return "inconclusive", "sacct lookup failed: " + type(exc).__name__ + ": " + str(exc)
+    if not observations:
+        return "inconclusive", "sacct returned no rows"
+    matching = _matching_sacct_observations(str(job_id), observations)
+    if not matching:
+        return "inconclusive", "sacct returned no matching task rows"
+    summary = sacct_poll.aggregate_states(
+        str(job_id),
+        matching,
+        expected_task_count=expected_task_count,
+    )
+    if summary.conflicting_task_indices:
+        return "inconclusive", "sacct returned conflicting task rows"
+    if summary.out_of_range_task_indices:
+        return "inconclusive", "sacct returned out-of-range task rows"
+    if summary.n_missing:
+        return (
+            "inconclusive",
+            "sacct is missing "
+            + str(summary.n_missing)
+            + " of "
+            + str(summary.n_expected)
+            + " expected task rows",
+        )
+    states = [observation.status for observation in summary.observations]
+    if any(state in sacct_poll.NON_TERMINAL_STATES for state in states):
+        return "active", "sacct reports non-terminal rows"
+    if any(state == sacct_poll.JobStatus.UNKNOWN for state in states):
+        return "inconclusive", "sacct reports UNKNOWN rows"
+    if not all(state in sacct_poll.TERMINAL_STATES for state in states):
+        return "inconclusive", "sacct rows are not conclusively terminal"
+    return "inactive", "squeue absent and sacct rows are terminal"
+
+
+def _scratch_attempt_report(campaign: Path) -> List[Dict[str, Any]]:
+    records = _scratch.inventory(campaign)
+    invalid = [record for record in records if record.get("status") == "invalid"]
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        if record.get("status") == "invalid":
+            continue
+        key = str(record.get("attempt_path") or record.get("submission_identity") or "")
+        group = grouped.setdefault(
+            key,
+            {
+                "attempt_id": str(record.get("attempt_id") or ""),
+                "submission_identity": str(record.get("submission_identity") or ""),
+                "phase": str(record.get("phase") or ""),
+                "iteration": int(record.get("iteration", 0)),
+                "path": str(record.get("attempt_path") or ""),
+                "task_count": 0,
+                "task_statuses": set(),
+                "job_ids": set(),
+            },
+        )
+        group["task_count"] += 1
+        group["task_statuses"].add(str(record.get("status") or "prepared"))
+        group["job_ids"].add(str(record.get("job_id") or ""))
+    intent_index = _scratch_intent_index(campaign)
+    scheduler_cache: Dict[Tuple[str, Optional[int]], Tuple[str, str]] = {}
+    output: List[Dict[str, Any]] = [dict(item) for item in invalid]
+    for group in grouped.values():
+        attempt_id = str(group["attempt_id"])
+        identity = str(group["submission_identity"])
+        intent = intent_index.get(attempt_id) or intent_index.get(identity) or {}
+        expected_tasks: Optional[int] = None
+        expected_tasks_error: Optional[str] = None
+        if intent.get("expected_tasks") is not None:
+            try:
+                if isinstance(intent["expected_tasks"], bool):
+                    raise ValueError
+                expected_tasks = int(intent["expected_tasks"])
+            except (TypeError, ValueError):
+                expected_tasks_error = (
+                    "submission intent expected_tasks is malformed"
+                )
+            if expected_tasks is not None and expected_tasks <= 0:
+                expected_tasks_error = (
+                    "submission intent expected_tasks must be > 0"
+                )
+                expected_tasks = None
+        job_states: Dict[str, str] = {}
+        scheduler_reasons: Dict[str, str] = {}
+        for job_id in sorted(group["job_ids"]):
+            if expected_tasks_error is not None:
+                job_states[job_id] = "inconclusive"
+                scheduler_reasons[job_id] = expected_tasks_error
+                continue
+            cache_key = (job_id, expected_tasks)
+            if cache_key not in scheduler_cache:
+                scheduler_cache[cache_key] = _scratch_scheduler_state(
+                    job_id,
+                    expected_task_count=expected_tasks,
+                )
+            scheduler_state, reason = scheduler_cache[cache_key]
+            job_states[job_id] = scheduler_state
+            scheduler_reasons[job_id] = reason
+        intent_status = str(intent.get("status") or "")
+        states = set(job_states.values())
+        task_statuses = set(group["task_statuses"])
+        if "active" in states:
+            classification = "active"
+            cleanable = False
+        elif "inconclusive" in states:
+            classification = "scheduler_inconclusive"
+            cleanable = False
+        elif "failed_retained" in task_statuses:
+            classification = "retained_failure"
+            cleanable = True
+        elif task_statuses == {"completed"} or intent_status == "COMPLETED":
+            classification = "completed_leftover"
+            cleanable = True
+        elif intent_status == "PRE_SUBMIT":
+            classification = "stale_pre_submit"
+            cleanable = True
+        elif intent:
+            classification = "interrupted"
+            cleanable = True
+        else:
+            classification = "orphaned"
+            cleanable = True
+        output.append(
+            {
+                "status": classification,
+                "cleanable": bool(cleanable),
+                "attempt_id": attempt_id,
+                "submission_identity": identity,
+                "phase": group["phase"],
+                "iteration": group["iteration"],
+                "path": group["path"],
+                "task_count": int(group["task_count"]),
+                "task_statuses": sorted(task_statuses),
+                "job_states": job_states,
+                "scheduler_reasons": scheduler_reasons,
+                "intent_status": intent_status or None,
+            }
+        )
+    return output
+
+
+def _cmd_reconcile_scratch(
+    campaign: Path,
+    *,
+    apply: bool,
+    json_output: bool,
+    selected_attempts: Sequence[str],
+) -> int:
+    records = _scratch_attempt_report(campaign)
+    invalid = [item for item in records if item.get("status") == "invalid"]
+    attempts = [item for item in records if item.get("status") != "invalid"]
+    selected = {str(value) for value in selected_attempts}
+    known = {
+        str(item.get("submission_identity") or "")
+        for item in attempts
+    } | {str(item.get("attempt_id") or "") for item in attempts}
+    missing = sorted(selected - known)
+    if missing:
+        print(
+            "unknown scratch attempt selector(s): " + ", ".join(missing),
+            file=sys.stderr,
+        )
+        return 2
+    considered = [
+        item
+        for item in attempts
+        if not selected
+        or str(item.get("submission_identity")) in selected
+        or str(item.get("attempt_id")) in selected
+    ]
+    cleanable = [item for item in considered if bool(item.get("cleanable"))]
+    blocked = [item for item in considered if not bool(item.get("cleanable"))]
+    payload: Dict[str, Any] = {
+        "schema_version": 1,
+        "campaign_dir": str(campaign),
+        "mode": "apply" if apply else "proposal",
+        "invalid": invalid,
+        "cleanable_attempts": cleanable,
+        "blocked_attempts": blocked,
+        "removed": [],
+    }
+    if invalid:
+        if json_output:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            print("Scratch clean-up is blocked by invalid ownership evidence:", file=sys.stderr)
+            for item in invalid:
+                print("  - " + str(item.get("path")) + ": " + str(item.get("reason")), file=sys.stderr)
+        return 9
+    if apply and selected and blocked:
+        print("refusing to clean selected active or scheduler-inconclusive attempt(s):", file=sys.stderr)
+        for item in blocked:
+            print("  - " + str(item.get("submission_identity")) + " (" + str(item.get("status")) + ")", file=sys.stderr)
+        return 9
+    if apply and cleanable:
+        allowed = [str(item["submission_identity"]) for item in cleanable]
+        protected_jobs = {
+            job_id
+            for item in blocked
+            for job_id in dict(item.get("job_states") or {})
+        }
+        payload["removed"] = _scratch.clean_inactive_attempts(
+            campaign,
+            active_job_ids=protected_jobs,
+            allowed_attempts=allowed,
+        )
+    if json_output:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+    _print_reconcile_header(
+        campaign,
+        mode="scratch-apply" if apply else "scratch-proposal",
+        result="CLEANED" if apply else "INSPECT",
+    )
+    if cleanable:
+        print("Conclusively inactive scratch attempts:")
+        for item in cleanable:
+            print(
+                "  - "
+                + str(item.get("submission_identity"))
+                + " "
+                + str(item.get("status"))
+                + " tasks="
+                + str(item.get("task_count"))
+            )
+    else:
+        print("No conclusively inactive scratch attempts were found.")
+    if blocked:
+        print("Protected scratch attempts:")
+        for item in blocked:
+            print("  - " + str(item.get("submission_identity")) + " " + str(item.get("status")))
+    if apply:
+        print("Removed scratch attempt directories: " + str(len(payload["removed"])))
+    else:
+        print("Rerun with --clean-scratch --apply to remove the listed inactive attempts.")
+    return 0
+
+
 def cmd_reconcile(args: argparse.Namespace) -> int:
+    clean_scratch = bool(getattr(args, "clean_scratch", False))
+    scratch_attempts = [
+        str(value)
+        for value in (getattr(args, "scratch_attempt", None) or [])
+        if str(value)
+    ]
     restore_config = bool(getattr(args, "restore_config_from_lock", False))
     restore_lock = bool(getattr(args, "restore_config_lock_history", False))
     archive_staging_requested = bool(getattr(args, "archive_staging", False))
@@ -4677,6 +4966,27 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         require_campaign_yaml=False,
     )
     runtime_status = _reconcile_runtime_status(campaign)
+    if scratch_attempts and not clean_scratch:
+        print("refusing --scratch-attempt without --clean-scratch", file=sys.stderr)
+        return 2
+    if clean_scratch:
+        incompatible = [
+            name
+            for name, enabled in (
+                ("--restore-config-from-lock", restore_config),
+                ("--restore-config-lock-history", restore_lock),
+                ("--archive-staging", archive_staging_requested),
+                ("--force-resubmit-array-tasks", force_resubmit_array),
+                ("--retrain-ferebus", retrain_ferebus),
+            )
+            if enabled
+        ]
+        if incompatible:
+            print(
+                "refusing --clean-scratch with " + ", ".join(incompatible),
+                file=sys.stderr,
+            )
+            return 2
     if restore_lock:
         if restore_config or bool(getattr(args, "apply", False)):
             print(
@@ -4795,6 +5105,13 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         )
         _print_reconcile_runtime_warning(runtime_status, campaign)
         return 9
+    if clean_scratch:
+        return _cmd_reconcile_scratch(
+            campaign,
+            apply=bool(getattr(args, "apply", False)),
+            json_output=bool(getattr(args, "json", False)),
+            selected_attempts=scratch_attempts,
+        )
     if (
         not bool(getattr(args, "apply", False))
         and not bool(getattr(args, "json", False))
@@ -6712,6 +7029,50 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     return 12
 
 
+def cmd_resource_plan(args: argparse.Namespace) -> int:
+    """Print a read-only production resource resolution preview."""
+    from .daemon.resource_plan import build_resource_plan, format_resource_plan
+
+    campaign = resolve_campaign_dir(args.campaign_dir)
+    config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+    state_path = campaign / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
+    if not state_path.is_file():
+        print("resource-plan requires daemon state.json", file=sys.stderr)
+        return 2
+    state = read_state(state_path)
+    phase_name = getattr(args, "phase", None)
+    if phase_name is not None and str(phase_name) not in {
+        phase.value for phase in CampaignPhase
+    }:
+        print("unknown campaign phase: " + str(phase_name), file=sys.stderr)
+        return 2
+    payload = build_resource_plan(
+        campaign,
+        config,
+        current_phase=state.phase.value,
+        current_iteration=int(state.iteration),
+        phase_name=phase_name,
+        iteration=getattr(args, "iteration", None),
+        all_phases=bool(getattr(args, "all", False)),
+        replacement_round=int(getattr(state, "replacement_round", 0)),
+        current_models_version=int(getattr(state, "models_version", 0)),
+        current_reference_data_version=int(
+            getattr(state, "reference_data_version", 0)
+        ),
+    )
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(format_resource_plan(payload), end="")
+    unavailable = any(
+        str(plan.get("status")) == "evidence_not_yet_produced"
+        for plan in payload["plans"]
+    )
+    if unavailable and not bool(getattr(args, "all", False)):
+        return 14
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     examples = """\
 Campaign directory:
@@ -7028,6 +7389,26 @@ Examples:
         ),
     )
     p_recon.add_argument(
+        "--clean-scratch",
+        action="store_true",
+        help=(
+            "Inventory campaign-owned scratch and, with --apply, remove only "
+            "conclusively inactive valid attempt directories. Active, "
+            "scheduler-inconclusive, symlinked, or malformed scratch is never "
+            "removed."
+        ),
+    )
+    p_recon.add_argument(
+        "--scratch-attempt",
+        action="append",
+        default=None,
+        metavar="ID",
+        help=(
+            "Restrict --clean-scratch to a submission identity or attempt ID. "
+            "Repeat this option to select more than one attempt."
+        ),
+    )
+    p_recon.add_argument(
         "--force-resubmit-array-tasks",
         action="store_true",
         help=(
@@ -7219,6 +7600,40 @@ Examples:
         ),
     )
     p_pre.set_defaults(func=cmd_preflight)
+
+    p_resource = sub.add_parser(
+        "resource-plan",
+        help="Inspect submitted or prospective resources without changing state.",
+        description=(
+            "Use the production resource resolver in read-only mode for the "
+            "current phase, one named phase, or every applicable phase."
+        ),
+    )
+    add_campaign(p_resource)
+    selection = p_resource.add_mutually_exclusive_group()
+    selection.add_argument(
+        "--phase",
+        choices=[phase.value for phase in CampaignPhase],
+        default=None,
+        help="Inspect one explicit campaign phase.",
+    )
+    selection.add_argument(
+        "--all",
+        action="store_true",
+        help="Show every applicable bootstrap or active-cycle phase.",
+    )
+    p_resource.add_argument(
+        "--iteration",
+        type=int,
+        default=None,
+        help="Inspect this iteration instead of the current state iteration.",
+    )
+    p_resource.add_argument(
+        "--json",
+        action="store_true",
+        help="Print schema-v1 machine-readable JSON.",
+    )
+    p_resource.set_defaults(func=cmd_resource_plan)
 
     p_cfg = sub.add_parser(
         "config-check",

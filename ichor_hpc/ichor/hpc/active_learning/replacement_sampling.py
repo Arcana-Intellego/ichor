@@ -16,6 +16,7 @@ from .point_allocation import (
     point_allocation_path,
     read_point_allocation,
 )
+from .layout import staging_context_dir
 
 
 REPLACEMENT_SAMPLE_FILENAME = "REPLACEMENT_SAMPLE.json"
@@ -29,12 +30,12 @@ def replacement_round_dir(
     iteration: int,
     replacement_round: int,
 ) -> Path:
-    bucket = "initial" if str(context) == "bootstrap" else "iter_" + str(int(iteration))
     return (
-        Path(campaign_dir)
-        / ".DATA"
-        / "STAGING"
-        / bucket
+        staging_context_dir(
+            campaign_dir,
+            context=str(context),
+            iteration=int(iteration),
+        )
         / ("replacement_round_" + str(int(replacement_round)).zfill(4))
     )
 

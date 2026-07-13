@@ -471,6 +471,8 @@ def _matches(path: str, exact: Iterable[str], prefixes: Iterable[str]) -> bool:
 
 RUNTIME_SAFE_EXACT = {
     "campaign.max_iterations",
+    "resources.scheduler_usage_telemetry",
+    "resources.scheduler_usage_history_limit",
 }
 RUNTIME_SAFE_PREFIXES = {
     "runtime.",
@@ -487,6 +489,9 @@ RESOURCE_FUTURE_EXACT = {
     "resources.polus.walltime_hours",
     "resources.polus.cpus_per_task",
     "resources.polus.mem_per_cpu",
+    "resources.polus.auto_max_workers",
+    "resources.polus.target_pairs_per_worker",
+    "resources.polus.in_memory_distance_store_fraction",
     "resources.gaussian.partition",
     "resources.gaussian.walltime_hours",
     "resources.gaussian.cpus_per_task",
@@ -508,6 +513,7 @@ RESOURCE_FUTURE_EXACT = {
     "resources.ferebus.mem_per_cpu",
     "resources.array_concurrency_limit",
     "resources.fail_on_memory_estimate_exceeds_request",
+    "resources.memory_estimate_safety_factor",
 }
 
 IMMUTABLE_EXACT = {"schema_version"}
@@ -1578,6 +1584,7 @@ def clean_reentry_staging(campaign_dir: Union[str, Path], phase: CampaignPhase) 
 
 
 def archive_scripts_for_reconcile(campaign_dir: Union[str, Path]) -> List[str]:
+    """Archive legacy flat scripts without touching immutable job bundles."""
     campaign = Path(campaign_dir)
     scripts = campaign / ".DATA" / "SCRIPTS"
     if not scripts.exists():
@@ -1586,22 +1593,27 @@ def archive_scripts_for_reconcile(campaign_dir: Union[str, Path]) -> List[str]:
         raise ValueError("refusing to archive symlinked .DATA/SCRIPTS")
     if not scripts.is_dir():
         raise ValueError(".DATA/SCRIPTS is not a directory")
-    children = [p for p in scripts.iterdir() if p.name not in (".", "..")]
-    if not children:
+    legacy_children = [
+        path
+        for path in scripts.iterdir()
+        if path.name != "JOBS" and (
+            path.suffix == ".sh" or path.name in {"OUTPUTS", "ERRORS"}
+        )
+    ]
+    if not legacy_children:
         return []
     _ensure_inside_campaign(campaign, scripts)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    target = scripts.with_name(scripts.name + ".before-reconcile-" + stamp)
+    archive_root = scripts / "LEGACY_BEFORE_RECONCILE"
+    target = archive_root / stamp
     suffix = 1
     while target.exists():
-        target = scripts.with_name(
-            scripts.name + ".before-reconcile-" + stamp + "." + str(suffix)
-        )
+        target = archive_root / (stamp + "." + str(suffix))
         suffix += 1
-    scripts.rename(target)
-    scripts.mkdir(parents=True, exist_ok=True)
-    (scripts / "OUTPUTS").mkdir(exist_ok=True)
-    (scripts / "ERRORS").mkdir(exist_ok=True)
+    target.mkdir(parents=True, exist_ok=False)
+    for child in legacy_children:
+        _ensure_inside_campaign(campaign, child)
+        child.rename(target / child.name)
     return [str(target)]
 
 

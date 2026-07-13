@@ -80,17 +80,24 @@ def test_dry_run_finishes_in_DONE(tmp_path):
 
 def test_dry_run_writes_one_stub_script_per_sbatch_phase_per_iter(tmp_path):
     campaign, _, _, _ = _run_two_iter_campaign(tmp_path)
-    scripts_dir = campaign / ".DATA" / "SCRIPTS"
-    scripts = sorted(scripts_dir.iterdir())
+    scripts_dir = campaign / ".DATA" / "SCRIPTS" / "JOBS"
+    scripts = sorted(scripts_dir.rglob("job.sh"))
     # 4 initial sbatch phases at iter 0 + 5 per-iteration phases x 2 iters = 14
     assert len(scripts) == 4 + 5 * 2
-    # Every name follows PHASE-iter.sh
+    identities = set()
     for s in scripts:
-        assert s.suffix == ".sh"
-        stem = s.stem
-        phase_name, _, iter_part = stem.rpartition("-")
+        backend, phase_name, iteration_token, identity, filename = (
+            s.relative_to(scripts_dir).parts
+        )
+        assert backend
         assert phase_name in _SBATCH_PHASES
-        assert iter_part.isdigit()
+        assert iteration_token.startswith("iteration-")
+        assert iteration_token.removeprefix("iteration-").isdigit()
+        assert filename == "job.sh"
+        assert (s.parent / "OUTPUTS").is_dir()
+        assert (s.parent / "ERRORS").is_dir()
+        identities.add(identity)
+    assert len(identities) == len(scripts)
 
 
 def test_dry_run_commits_three_reference_data_versions(tmp_path):

@@ -143,6 +143,34 @@ def load_intent(
         expected_campaign_uid
     ):
         raise ValueError("submission intent campaign UID mismatch")
+    for key in (
+        "resource_resolution_path",
+        "resource_formula_version",
+        "scratch_path_template",
+    ):
+        value = data.get(key)
+        if value is not None and (not isinstance(value, str) or not value):
+            raise ValueError("submission intent " + key + " must be a non-empty string")
+    digest = data.get("resource_resolution_sha256")
+    if digest is not None and (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(ch not in "0123456789abcdef" for ch in digest)
+    ):
+        raise ValueError("submission intent resource_resolution_sha256 is invalid")
+    expected_tasks = data.get("expected_tasks")
+    if expected_tasks is not None:
+        if isinstance(expected_tasks, bool):
+            raise ValueError("submission intent expected_tasks is malformed")
+        try:
+            parsed_expected_tasks = int(expected_tasks)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "submission intent expected_tasks is malformed"
+            ) from exc
+        if parsed_expected_tasks <= 0:
+            raise ValueError("submission intent expected_tasks must be > 0")
+        data["expected_tasks"] = parsed_expected_tasks
     return data
 
 
@@ -429,6 +457,48 @@ def mark_submitted(
         status="SUBMITTED", job_id=str(job_id), expected_tasks=expected_tasks,
         submission_metadata=submission_metadata,
     )
+
+
+def bind_resource_resolution(
+    campaign_dir: Union[str, Path],
+    phase_name: str,
+    iteration: int,
+    *,
+    path: str,
+    sha256: str,
+    formula_version: str,
+    scratch_path_template: str,
+    expected_tasks: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Bind immutable resource and scheduler evidence before submission."""
+    intent = load_active_intent(campaign_dir, phase_name, int(iteration))
+    if intent is None or str(intent.get("status")) != "PRE_SUBMIT":
+        raise ValueError("resource resolution requires an active PRE_SUBMIT intent")
+    digest = str(sha256)
+    if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+        raise ValueError("resource-resolution SHA-256 is invalid")
+    updates = {
+        "resource_resolution_path": str(path),
+        "resource_resolution_sha256": digest,
+        "resource_formula_version": str(formula_version),
+        "scratch_path_template": str(scratch_path_template),
+    }
+    for key, value in updates.items():
+        previous = intent.get(key)
+        if previous is not None and previous != value:
+            raise ValueError("submission intent " + key + " is already bound differently")
+        intent[key] = value
+    if expected_tasks is not None:
+        if isinstance(expected_tasks, bool):
+            raise ValueError("submission intent expected_tasks is malformed")
+        parsed_expected_tasks = int(expected_tasks)
+        if parsed_expected_tasks <= 0:
+            raise ValueError("submission intent expected_tasks must be > 0")
+        # The initial PRE_SUBMIT value can describe the unrecovered logical
+        # array.  Once staging has produced a dense retry array, this field
+        # must snapshot the task count that Slurm will actually report.
+        intent["expected_tasks"] = parsed_expected_tasks
+    return _write_payload(intent_path(campaign_dir, phase_name, int(iteration)), intent)
 
 
 def mark_adopted(

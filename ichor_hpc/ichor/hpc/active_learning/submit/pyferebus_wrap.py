@@ -264,6 +264,9 @@ def _harden_generated_script(
     cpus_per_task: Optional[int],
     ntasks: Optional[int],
     expected_job_name: Optional[str] = None,
+    output_path: Optional[str] = None,
+    error_path: Optional[str] = None,
+    runtime_preamble: Optional[Sequence[str]] = None,
 ) -> None:
     text = script.read_text(encoding="utf-8")
     if expected_job_name is not None:
@@ -299,6 +302,14 @@ def _harden_generated_script(
             r"^#SBATCH\s+(?:-J\b|--job-name(?:=|\b))", stripped
         ):
             return True
+        if output_path is not None and re.match(
+            r"^#SBATCH\s+(?:-o\b|--output(?:=|\b))", stripped
+        ):
+            return True
+        if error_path is not None and re.match(
+            r"^#SBATCH\s+(?:-e\b|--error(?:=|\b))", stripped
+        ):
+            return True
         return False
 
     lines = [
@@ -326,11 +337,15 @@ def _harden_generated_script(
         directives.append("#SBATCH --cpus-per-task=" + str(int(cpus_per_task)))
     if ntasks is not None:
         directives.append("#SBATCH --ntasks=" + str(int(ntasks)))
+    if output_path is not None:
+        directives.append("#SBATCH --output=" + str(output_path))
+    if error_path is not None:
+        directives.append("#SBATCH --error=" + str(error_path))
     lines[sbatch_insert_at:sbatch_insert_at] = directives + [
         "set -eo pipefail",
         "export LC_ALL=C",
         "export LC_NUMERIC=C",
-    ]
+    ] + list(runtime_preamble or [])
     script.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
     if expected_job_name is not None:
         patched = script.read_text(encoding="utf-8")
@@ -617,6 +632,10 @@ def submit_ferebus(
     extra: Optional[Mapping[str, Any]] = None,
     model_class: Optional[Any] = None,
     submit_runner: Optional[Any] = None,
+    submission_script_path: Optional[Union[str, Path]] = None,
+    output_path: Optional[str] = None,
+    error_path: Optional[str] = None,
+    runtime_preamble: Optional[Sequence[str]] = None,
 ) -> FerebusSubmission:
     """Generate the FEREBUS submission script via pyferebus, then submit it
     ourselves through sbatch --parsable so we capture the JobID.
@@ -725,12 +744,41 @@ def submit_ferebus(
         cpus_per_task=cpus_per_task,
         ntasks=ntasks,
         expected_job_name=expected_job_name,
+        output_path=output_path,
+        error_path=error_path,
+        runtime_preamble=runtime_preamble,
     )
     if path_to_executable:
         _patch_generated_executable(script, path_to_executable)
 
+    if submission_script_path is not None:
+        from ..daemon.state import atomic_write_text
+
+        submitted_script = Path(submission_script_path)
+        submitted_body = script.read_text(encoding="utf-8")
+        if submitted_script.exists() or submitted_script.is_symlink():
+            if submitted_script.is_symlink() or not submitted_script.is_file():
+                raise FerebusSubmissionError(
+                    "FEREBUS attempt script is not a regular file: "
+                    + str(submitted_script)
+                )
+            if submitted_script.read_text(encoding="utf-8") != submitted_body:
+                raise FerebusSubmissionError(
+                    "FEREBUS attempt script already exists with different content"
+                )
+        else:
+            atomic_write_text(submitted_script, submitted_body)
+        try:
+            submitted_script.chmod(0o700)
+        except OSError:
+            pass
+        script = submitted_script
+
+    submitted_argument = (
+        str(script) if submission_script_path is not None else script.name
+    )
     completed = submit_runner(
-        ["sbatch", "--parsable", script.name],
+        ["sbatch", "--parsable", submitted_argument],
         check=False,
         capture_output=True,
         text=True,

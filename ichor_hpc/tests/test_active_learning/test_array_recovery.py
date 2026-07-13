@@ -91,6 +91,7 @@ def test_sbatch_retry_map_uses_logical_task_id_for_ariadne(tmp_path, monkeypatch
     )
 
     assert "ICHOR_LOGICAL_ARRAY_TASK_ID" in script
+    assert "retry task map SHA-256 mismatch" in script
     assert "--array-task-id $ICHOR_LOGICAL_ARRAY_TASK_ID" in script
     assert "#SBATCH --array=0-1" in script
 

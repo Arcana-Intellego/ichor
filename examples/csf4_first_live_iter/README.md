@@ -190,6 +190,7 @@ csf4:
   hpc:
     scheduler: slurm
     max_array_task_id: 25000
+    max_job_log_files_per_directory: 5000
     memory_per_core_gb: 4
     memory_per_core_gb_by_partition:
       serial: 4
@@ -397,6 +398,7 @@ or thermodynamics preset.
 ```
 ichor-al-daemon preflight --campaign-dir . --verbose
 ichor-al-daemon preflight --campaign-dir . --verbose --submit-environment-smoke
+ichor-al-daemon resource-plan --campaign-dir . --all
 ichor-al-daemon start --campaign-dir . --max-ticks 2000
 ```
 
@@ -406,6 +408,9 @@ Gaussian, AIMAll, FEREBUS and `bc` on a compute node. It does not run scientific
 work. Inspect the reported output path and require a successful result before
 the first live campaign; ordinary preflight and daemon start never submit this
 smoke automatically.
+The resource plan is read-only. Before the first submission it should resolve
+Phase A from the manifest-verified root `pool.xyz`; later phases may report
+`evidence_not_yet_produced` until their producer handoffs exist.
 
 Leave it running. `--max-ticks 2000` is a safety net (the daemon will
 not run forever even if something hangs). You can tail the journal in

@@ -687,6 +687,37 @@ def format_sampling_protocol_summary(
             resources.fail_on_memory_estimate_exceeds_request,
         )
     )
+    lines.append(
+        _line(
+            "resources.memory_estimate_safety_factor",
+            resources.memory_estimate_safety_factor,
+        )
+    )
+    lines.append(
+        _line(
+            "resources.scheduler_usage_telemetry",
+            resources.scheduler_usage_telemetry,
+        )
+    )
+    lines.append(
+        _line(
+            "resources.scheduler_usage_history_limit",
+            resources.scheduler_usage_history_limit,
+        )
+    )
+    lines.append(_line("resources.polus.auto_max_workers", resources.polus.auto_max_workers))
+    lines.append(
+        _line(
+            "resources.polus.target_pairs_per_worker",
+            resources.polus.target_pairs_per_worker,
+        )
+    )
+    lines.append(
+        _line(
+            "resources.polus.in_memory_distance_store_fraction",
+            resources.polus.in_memory_distance_store_fraction,
+        )
+    )
     lines.append(_line("resources.gradient_parallel_backend", resources.gradient_parallel_backend))
     lines.append(_line("resources.aimall.effective_cpus_per_task", resources.cpus_for("AIMALL")))
     lines.append(_line("aimall.naat", aimall.naat))

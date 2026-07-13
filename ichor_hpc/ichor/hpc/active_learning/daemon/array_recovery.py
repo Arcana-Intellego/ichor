@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from .state import atomic_write_json
+from ..layout import staging_phase_dir
 
 
 ARRAY_RECOVERY_SCHEMA_VERSION = 1
@@ -155,8 +156,7 @@ def _bucket_dir(campaign_dir: Union[str, Path], phase_name: str, iteration: int)
             int(iteration),
         )
         return round_dir
-    bucket = "initial" if str(phase_name).startswith("INITIAL_") else "iter_" + str(int(iteration))
-    return Path(campaign_dir) / ".DATA" / "STAGING" / bucket
+    return staging_phase_dir(campaign_dir, phase_name, int(iteration))
 
 
 def _points_file(campaign_dir: Union[str, Path], phase_name: str, iteration: int) -> Path:

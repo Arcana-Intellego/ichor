@@ -86,6 +86,12 @@ def test_default_campaign_config_is_valid():
     assert c.resources.array_concurrency_limit is None
     assert c.resources.gaussian.memory_mode == "slurm_env"
     assert c.resources.gaussian.memory_fraction_of_slurm == 0.85
+    assert c.resources.memory_estimate_safety_factor == 1.25
+    assert c.resources.scheduler_usage_telemetry is True
+    assert c.resources.scheduler_usage_history_limit == 5000
+    assert c.resources.polus.auto_max_workers == 16
+    assert c.resources.polus.target_pairs_per_worker == 5_000_000
+    assert c.resources.polus.in_memory_distance_store_fraction == 0.35
     assert c.aimall.encomp == 3
     assert c.aimall.nogui is True
     assert c.aimall.naat == "auto"
@@ -131,6 +137,16 @@ def test_default_campaign_config_is_valid():
     assert c.acquisition.stencils.max_anharmonic_mode_score == 6.0
     assert c.acquisition.stencils.max_anharmonic_total_score == 15.0
     assert c.acquisition.subspace.canonicalise_basis is True
+
+
+def test_resource_memory_safety_factor_must_be_finite():
+    config = CampaignConfig()
+    config.resources.memory_estimate_safety_factor = float("nan")
+    with pytest.raises(
+        ConfigValidationError,
+        match="memory_estimate_safety_factor must be finite",
+    ):
+        config._validate()
 
 
 def test_point_allocation_external_validation_size_validated():

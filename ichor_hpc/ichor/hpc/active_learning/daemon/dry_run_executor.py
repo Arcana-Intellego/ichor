@@ -12,7 +12,8 @@ What the dry-run executor DOES exercise (real, no mocking):
       .DATA/SCRIPTS/).
     * VersionedDirectory (stage, commit, update_current, manifest writes,
       atomic renames).
-    * ".DATA/SCRIPTS/*.sh" stub script creation per SLURM-backed phase.
+    * Immutable ``.DATA/SCRIPTS/JOBS/.../job.sh`` attempt bundles per
+      Slurm-backed phase.
     * Journal events for every phase entry / postprocess / commit.
 
 What it DOES NOT do (stubbed):
@@ -75,6 +76,7 @@ from .phase_executor import (
     SBATCH_PHASES,
 )
 from .state import CampaignPhase, atomic_write_json, atomic_write_text
+from .script_bundles import prepare_attempt_bundle, write_attempt_script
 
 
 __all__ = [
@@ -170,7 +172,22 @@ class DryRunPhaseExecutor:
     # --- internal: script stubbing -------------------------------------
 
     def _write_stub_script(self, phase_name: str, iteration: int) -> Path:
-        path = self.scripts_dir / (phase_name + "-" + str(iteration) + ".sh")
+        from .submission_intent import load_active_intent
+
+        intent = load_active_intent(self.campaign_dir, phase_name, int(iteration))
+        identity = (
+            str(intent.get("submission_identity"))
+            if isinstance(intent, dict) and intent.get("submission_identity")
+            else "dry-run"
+        )
+        bundle = prepare_attempt_bundle(
+            self.campaign_dir,
+            phase_name,
+            int(iteration),
+            identity,
+            array_size=None,
+            max_log_files_per_directory=5000,
+        )
         lines = [
             "#!/bin/sh",
             "# DRY-RUN stub for phase " + phase_name + ", iteration " + str(iteration),
@@ -179,7 +196,7 @@ class DryRunPhaseExecutor:
             "exit 0",
             "",
         ]
-        path.write_text("\n".join(lines), encoding="utf-8")
+        path = write_attempt_script(bundle, "\n".join(lines))
         self.artefact_log.append(str(path))
         return path
 
@@ -2583,9 +2600,12 @@ class DryRunPhaseExecutor:
                 replacement_round=expected_round,
             )
         else:
-            staging_root = (
-                self.campaign_dir / ".DATA" / "STAGING"
-                / ("initial" if initial else ("iter_" + str(state.iteration)))
+            from ..layout import staging_context_dir
+
+            staging_root = staging_context_dir(
+                self.campaign_dir,
+                context=context,
+                iteration=allocation_iteration,
             )
         staging_root.mkdir(parents=True, exist_ok=True)
         n_points = len(attempts)

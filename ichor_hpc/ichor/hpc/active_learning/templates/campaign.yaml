@@ -137,6 +137,9 @@ resources:
     walltime_hours: 2
     cpus_per_task: auto
     mem_per_cpu: auto
+    auto_max_workers: 16
+    target_pairs_per_worker: 5000000
+    in_memory_distance_store_fraction: 0.35
 
   gaussian:
     partition: multicore
@@ -164,6 +167,10 @@ resources:
     walltime_hours: 24
     cpus_per_task: auto
     mem_per_cpu: auto
+
+  memory_estimate_safety_factor: 1.25
+  scheduler_usage_telemetry: true
+  scheduler_usage_history_limit: 5000
 
   # Keep the first live example gentle on the scheduler.
   # For larger campaigns, increase or remove this.

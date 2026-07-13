@@ -24,12 +24,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+import os
+import shutil
 
 import numpy as np
 
 from ichor.core.atoms import Atoms
 
-from .descriptors import Descriptor, MassWeightedRMSDDescriptor
+from .descriptors import (
+    Descriptor,
+    MassWeightedRMSDDescriptor,
+    build_condensed_distance_store,
+)
 
 
 __all__ = [
@@ -44,6 +50,38 @@ DEFAULT_DESCRIPTORS = {
     "rmsd_massweight": MassWeightedRMSDDescriptor,
 }
 FPS_TIE_QUANTISATION = 1.0e-12
+
+
+def _runtime_distance_store(
+    descriptor: Descriptor,
+    frames: Sequence[Atoms],
+    *,
+    workers: int,
+    distance_store_path: Optional[Path],
+):
+    mode = str(os.environ.get("ICHOR_POLUS_DISTANCE_STORE_MODE", "memory")).strip().lower()
+    if mode not in {"memory", "file"}:
+        raise ValueError("ICHOR_POLUS_DISTANCE_STORE_MODE must be memory or file")
+    target = None
+    if mode == "file":
+        if distance_store_path is None:
+            raise ValueError("file-backed POLUS requires --distance-store")
+        required = int(os.environ.get("ICHOR_POLUS_SCRATCH_REQUIRED_BYTES", "0"))
+        free = int(shutil.disk_usage(distance_store_path.parent).free)
+        if required > 0 and free < required:
+            raise OSError(
+                "file-backed POLUS requires "
+                + str(required)
+                + " free bytes at job start; available="
+                + str(free)
+            )
+        target = distance_store_path
+    return build_condensed_distance_store(
+        descriptor,
+        frames,
+        path=target,
+        workers=max(1, int(workers)),
+    )
 
 
 
@@ -63,17 +101,30 @@ class FPSResult:
 
 
 def fps_select(
-    distance_matrix: np.ndarray,
+    distance_matrix: Any,
     n_select: int,
     seed_index: Optional[int] = None,
     descriptor_name: str = "unknown",
 ) -> FPSResult:
-    D = np.asarray(distance_matrix, dtype=float)
-    if D.ndim != 2 or D.shape[0] != D.shape[1]:
-        raise ValueError(f"distance_matrix must be square 2D; got shape {D.shape}")
-    if not np.allclose(D, D.T, atol=1.0e-9):
-        raise ValueError("distance_matrix must be symmetric")
-    n = D.shape[0]
+    from .descriptors import CondensedDistanceStore
+
+    if isinstance(distance_matrix, CondensedDistanceStore):
+        D = distance_matrix
+        n = int(D.n)
+        row = D.row
+        row_sums = D.row_sums
+    else:
+        dense = np.asarray(distance_matrix, dtype=float)
+        if dense.ndim != 2 or dense.shape[0] != dense.shape[1]:
+            raise ValueError(
+                f"distance_matrix must be square 2D; got shape {dense.shape}"
+            )
+        if not np.allclose(dense, dense.T, atol=1.0e-9):
+            raise ValueError("distance_matrix must be symmetric")
+        D = dense
+        n = int(dense.shape[0])
+        row = lambda index: dense[int(index)]
+        row_sums = lambda: dense.sum(axis=1)
     if n_select <= 0:
         return FPSResult(
             indices=[],
@@ -85,8 +136,8 @@ def fps_select(
         raise ValueError(f"n_select {n_select} > n {n}")
 
     if seed_index is None:
-        row_sums = D.sum(axis=1)
-        ranked = np.round(row_sums / FPS_TIE_QUANTISATION) * FPS_TIE_QUANTISATION
+        sums = row_sums()
+        ranked = np.round(sums / FPS_TIE_QUANTISATION) * FPS_TIE_QUANTISATION
         seed = int(np.lexsort((np.arange(n, dtype=int), ranked))[0])
     else:
         if not 0 <= int(seed_index) < n:
@@ -94,12 +145,14 @@ def fps_select(
         seed = int(seed_index)
 
     selected = [seed]
-    min_dists = D[seed].copy()
+    selected_mask = np.zeros(n, dtype=bool)
+    selected_mask[seed] = True
+    min_dists = np.asarray(row(seed), dtype=float).copy()
     min_dists[seed] = 0.0
     diversities: List[float] = [0.0]
 
     for _ in range(1, n_select):
-        candidates = np.where(np.isin(np.arange(n), selected, invert=True))[0]
+        candidates = np.flatnonzero(~selected_mask)
         if candidates.size == 0:
             break
         scores = min_dists[candidates]
@@ -108,7 +161,8 @@ def fps_select(
         nxt = int(candidates[best_local])
         diversities.append(float(scores[best_local]))
         selected.append(nxt)
-        new_dists = D[nxt]
+        selected_mask[nxt] = True
+        new_dists = np.asarray(row(nxt), dtype=float)
         min_dists = np.minimum(min_dists, new_dists)
         min_dists[nxt] = 0.0
 
@@ -481,7 +535,14 @@ def _phase_b_build_reserve(
     }
 
 
-def _run_phase_a(campaign, config, *, campaign_uid: Optional[str] = None):
+def _run_phase_a(
+    campaign,
+    config,
+    *,
+    campaign_uid: Optional[str] = None,
+    workers: int = 1,
+    distance_store_path: Optional[Path] = None,
+):
     """POLUS Phase-A: pick a diverse subsample from the imported
     trajectory pool to seed the campaign with initial training points.
 
@@ -558,7 +619,12 @@ def _run_phase_a(campaign, config, *, campaign_uid: Optional[str] = None):
     diversities: List[float] = []
     if pool_select > 0:
         candidate_frames = [frames[i] for i in candidate_pool_ids]
-        matrix = descriptor.pairwise_distance_matrix(candidate_frames)
+        matrix = _runtime_distance_store(
+            descriptor,
+            candidate_frames,
+            workers=int(workers),
+            distance_store_path=distance_store_path,
+        )
         sel = fps_select(matrix, len(candidate_frames), descriptor_name=descriptor.name)
         ordered_pool_indices = [int(candidate_pool_ids[i]) for i in sel.indices]
         selected_pool_indices = ordered_pool_indices[:pool_select]
@@ -908,7 +974,16 @@ def _run_phase_b(args, campaign, config):
             return 3
     descriptor = build_descriptor_from_config(effective_config, posterior=posterior)
     try:
-        matrix = descriptor.pairwise_distance_matrix(candidate_frames)
+        matrix = _runtime_distance_store(
+            descriptor,
+            candidate_frames,
+            workers=int(getattr(args, "workers", 1)),
+            distance_store_path=(
+                None
+                if getattr(args, "distance_store", None) is None
+                else Path(args.distance_store)
+            ),
+        )
     except Exception as exc:
         print(
             "Phase B descriptor failed: "
@@ -1451,6 +1526,18 @@ def main(argv=None) -> int:
         "--campaign-dir", type=str, required=True,
         help="Path to the campaign root (where campaign.yaml lives).",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Snapshotted number of scientific POLUS distance workers.",
+    )
+    parser.add_argument(
+        "--distance-store",
+        type=str,
+        default=None,
+        help="Campaign scratch path for a file-backed condensed distance store.",
+    )
     args = parser.parse_args(argv)
 
     campaign = _Path(args.campaign_dir).resolve()
@@ -1483,7 +1570,14 @@ def main(argv=None) -> int:
         )
 
     if int(args.iteration) == 0:
-        return _run_phase_a(campaign, config)
+        return _run_phase_a(
+            campaign,
+            config,
+            workers=int(args.workers),
+            distance_store_path=(
+                None if args.distance_store is None else _Path(args.distance_store)
+            ),
+        )
     if int(args.iteration) < 0:
         print("iteration must be >= 0", file=_sys.stderr)
         return 2
