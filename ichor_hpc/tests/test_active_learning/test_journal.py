@@ -7,10 +7,13 @@ from pathlib import Path
 
 import pytest
 
+import ichor.hpc.active_learning.daemon.journal as journal_module
+
 from ichor.hpc.active_learning.daemon.journal import (
     EventTooLargeError,
     JOURNAL_LINE_LIMIT_BYTES,
     KNOWN_EVENT_TYPES,
+    JournalCorruptionError,
     append_event,
     iter_events,
     read_events,
@@ -69,11 +72,11 @@ def test_event_at_limit_does_not_raise(tmp_path):
     assert len(events) == 1
 
 
-def test_iter_events_skips_corrupt_lines(tmp_path):
+def test_iter_events_reports_interior_corruption(tmp_path):
     j = tmp_path / "journal.ndjson"
     j.write_text('{"ts":"2026-01-01T00:00:00Z","event":"ok"}\nbroken\n{"event":"ok2","ts":"2026-01-01T00:00:01Z"}\n')
-    events = list(iter_events(j))
-    assert [e["event"] for e in events] == ["ok", "ok2"]
+    with pytest.raises(JournalCorruptionError, match="line 2"):
+        list(iter_events(j))
 
 
 def test_iter_events_returns_nothing_for_missing_file(tmp_path):
@@ -97,6 +100,54 @@ def test_read_events_filters_by_since(tmp_path):
     append_event(j, "c", x=3, ts="2026-12-01T00:00:00Z")
     out = list(read_events(j, since="2026-05-01T00:00:00Z"))
     assert [e["event"] for e in out] == ["b", "c"]
+
+
+def test_append_event_retries_short_writes(monkeypatch, tmp_path):
+    journal = tmp_path / "journal.ndjson"
+    real_write = os.write
+    calls = {"count": 0}
+
+    def short_write(fd, data):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return real_write(fd, data[: max(1, len(data) // 2)])
+        return real_write(fd, data)
+
+    monkeypatch.setattr(journal_module.os, "write", short_write)
+    append_event(journal, "short_write", value=7)
+
+    assert calls["count"] >= 2
+    assert list(iter_events(journal))[0]["value"] == 7
+
+
+def test_rotation_retains_bounded_complete_segments(tmp_path):
+    journal = tmp_path / "journal.ndjson"
+    for index in range(8):
+        append_event(
+            journal,
+            "rotate",
+            index=index,
+            payload="x" * 80,
+            max_bytes=220,
+            retained_files=3,
+        )
+
+    segments = sorted(tmp_path.glob("journal.segment.*.ndjson"))
+    assert len(segments) <= 2
+    assert journal.is_file()
+    events = list(iter_events(journal))
+    assert events
+    assert events[-1]["index"] == 7
+
+
+def test_since_filter_compares_instants_not_iso_text(tmp_path):
+    journal = tmp_path / "journal.ndjson"
+    append_event(journal, "before", ts="2026-01-01T01:00:00+02:00")
+    append_event(journal, "after", ts="2026-01-01T00:30:00+00:00")
+
+    events = list(read_events(journal, since="2026-01-01T00:00:00Z"))
+
+    assert [event["event"] for event in events] == ["after"]
 
 
 def test_known_event_types_cover_static_literal_emitters():

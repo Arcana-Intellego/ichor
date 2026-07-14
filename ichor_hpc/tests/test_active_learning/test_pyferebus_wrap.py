@@ -132,6 +132,21 @@ def test_parse_sbatch_parsable_non_numeric_raises():
         parse_sbatch_parsable_output("OOPS\n")
 
 
+@pytest.mark.parametrize(
+    "output",
+    [
+        "12345\nwarning\n",
+        "12345;cluster;extra\n",
+        "12345;bad cluster\n",
+        "0\n",
+        "+12345\n",
+    ],
+)
+def test_parse_sbatch_parsable_rejects_noncanonical_output(output):
+    with pytest.raises(FerebusSubmissionError):
+        parse_sbatch_parsable_output(output)
+
+
 def test_submit_ferebus_happy_path(tmp_path):
     captured: List[_StubModel] = []
     model_class = _make_model_class(captured)

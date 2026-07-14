@@ -2118,7 +2118,10 @@ def test_reconcile_apply_resolves_cancelled_intent_when_squeue_invalid_job_id(
         if cmd[0] == "sacct":
             return SimpleNamespace(
                 returncode=0,
-                stdout="16218598_[1-12]|CANCELLED by 494098|0:0|00:00:00\n",
+                stdout="".join(
+                    "16218598_" + str(index) + "|CANCELLED by 494098|0:0|00:00:00\n"
+                    for index in range(12)
+                ),
                 stderr="",
             )
         raise AssertionError("unexpected command: " + repr(cmd))
@@ -2157,6 +2160,8 @@ def test_reconcile_apply_supersedes_stale_pre_submit_without_job_id(
     _write_halted_pre_ferebus_state(campaign)
     config = CampaignConfig()
     config.runtime.lease_stale_seconds = 10
+    config.runtime.lease_heartbeat_seconds = 1
+    config.runtime.lease_heartbeat_failure_max = 3
     write_config_lock(campaign, config)
     _write_config(campaign, config)
     phase = CampaignPhase.GAUSSIAN.value
@@ -2198,6 +2203,8 @@ def test_reconcile_apply_uses_job_name_accounting_for_ferebus_pre_submit_without
     _write_halted_pre_ferebus_state(campaign)
     config = CampaignConfig()
     config.runtime.lease_stale_seconds = 10
+    config.runtime.lease_heartbeat_seconds = 1
+    config.runtime.lease_heartbeat_failure_max = 3
     write_config_lock(campaign, config)
     _write_config(campaign, config)
     phase = CampaignPhase.INITIAL_FEREBUS.value
@@ -2243,6 +2250,8 @@ def test_reconcile_apply_blocks_pre_submit_without_job_id_when_accounting_comple
     _write_halted_pre_ferebus_state(campaign)
     config = CampaignConfig()
     config.runtime.lease_stale_seconds = 10
+    config.runtime.lease_heartbeat_seconds = 1
+    config.runtime.lease_heartbeat_failure_max = 3
     write_config_lock(campaign, config)
     _write_config(campaign, config)
     phase = CampaignPhase.GAUSSIAN.value
@@ -2286,6 +2295,8 @@ def test_reconcile_apply_marks_failed_pre_submit_without_job_id_from_accounting(
     _write_halted_pre_ferebus_state(campaign)
     config = CampaignConfig()
     config.runtime.lease_stale_seconds = 10
+    config.runtime.lease_heartbeat_seconds = 1
+    config.runtime.lease_heartbeat_failure_max = 3
     write_config_lock(campaign, config)
     _write_config(campaign, config)
     phase = CampaignPhase.GAUSSIAN.value
@@ -2330,6 +2341,8 @@ def test_reconcile_apply_blocks_pre_submit_without_job_id_when_job_exists(
     _write_halted_pre_ferebus_state(campaign)
     config = CampaignConfig()
     config.runtime.lease_stale_seconds = 10
+    config.runtime.lease_heartbeat_seconds = 1
+    config.runtime.lease_heartbeat_failure_max = 3
     write_config_lock(campaign, config)
     _write_config(campaign, config)
     phase = CampaignPhase.GAUSSIAN.value
@@ -2372,6 +2385,8 @@ def test_reconcile_apply_blocks_pre_submit_without_job_id_on_lookup_failure(
     _write_halted_pre_ferebus_state(campaign)
     config = CampaignConfig()
     config.runtime.lease_stale_seconds = 10
+    config.runtime.lease_heartbeat_seconds = 1
+    config.runtime.lease_heartbeat_failure_max = 3
     write_config_lock(campaign, config)
     _write_config(campaign, config)
     phase = CampaignPhase.GAUSSIAN.value

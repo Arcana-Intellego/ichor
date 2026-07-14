@@ -29,6 +29,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
+from .slurm_contracts import (
+    parse_sbatch_parsable_output as _parse_sbatch_parsable_output,
+    run_scheduler_command,
+)
+
 
 __all__ = [
     "FerebusSubmission",
@@ -118,23 +123,15 @@ def parse_sbatch_parsable_output(stdout: str) -> Tuple[str, Optional[str]]:
     """Parse "sbatch --parsable" stdout into (job_id, cluster).
 
     SLURM emits one line of the form "<JOBID>" or "<JOBID>;<CLUSTER>".
-    We are lenient about surrounding whitespace and ignore empty trailing
-    lines. Raises FerebusSubmissionError on empty / non-numeric output.
+    Surrounding whitespace is accepted, but all other output must match the
+    documented one-line Slurm contract exactly.
     """
-    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
-    if not lines:
+    try:
+        return _parse_sbatch_parsable_output(stdout)
+    except ValueError as exc:
         raise FerebusSubmissionError(
-            "sbatch produced no parsable stdout; got: " + repr(stdout)
-        )
-    head = lines[0]
-    parts = head.split(";")
-    job_id = parts[0].strip()
-    if not job_id or not job_id[0].isdigit():
-        raise FerebusSubmissionError(
-            "sbatch --parsable did not yield a JobID; first token: " + repr(head)
-        )
-    cluster = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
-    return job_id, cluster
+            "sbatch --parsable output is invalid: " + str(exc)
+        ) from exc
 
 
 def _ensure_path(value: Union[str, Path]) -> Path:
@@ -636,6 +633,7 @@ def submit_ferebus(
     output_path: Optional[str] = None,
     error_path: Optional[str] = None,
     runtime_preamble: Optional[Sequence[str]] = None,
+    scheduler_timeout_seconds: int = 60,
 ) -> FerebusSubmission:
     """Generate the FEREBUS submission script via pyferebus, then submit it
     ourselves through sbatch --parsable so we capture the JobID.
@@ -777,8 +775,10 @@ def submit_ferebus(
     submitted_argument = (
         str(script) if submission_script_path is not None else script.name
     )
-    completed = submit_runner(
+    completed = run_scheduler_command(
+        submit_runner,
         ["sbatch", "--parsable", submitted_argument],
+        timeout_seconds=int(scheduler_timeout_seconds),
         check=False,
         capture_output=True,
         text=True,

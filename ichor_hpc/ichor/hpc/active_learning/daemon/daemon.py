@@ -30,12 +30,15 @@ from __future__ import annotations
 
 import os
 import copy
+import hashlib
 import inspect
+import secrets
 from ..strict_json import strict_json as json
 import signal
 import socket
 import sys
 import time
+import threading
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -69,6 +72,11 @@ from .state import (
 )
 from .filesystem import operational_data_dir
 from . import submission_intent as _submission_intent
+from .lease import (
+    LeaseHeartbeatError,
+    evaluate_lease_liveness,
+    validate_lease_heartbeat,
+)
 
 
 __all__ = [
@@ -117,6 +125,10 @@ PHASE_ORDER: Tuple[CampaignPhase, ...] = (
 class DaemonAlreadyRunningError(RuntimeError):
     """Raised when the flock cannot be acquired because another daemon
     holds it."""
+
+
+class DaemonLeaseOwnershipError(RuntimeError):
+    """Raised when this process can no longer prove lease ownership."""
 
 
 class TickStatus(str):
@@ -282,14 +294,36 @@ class Daemon:
     # Live-mode only advisory collector. It is injected by the CLI so mock and
     # dry-run daemons never contact Slurm for accounting telemetry.
     resource_usage_collector: Optional[Callable[..., Dict[str, Any]]] = None
+    scheduler_identity_kind: Optional[str] = None
 
     #internal flags; not part of the public dataclass surface.
     _shutdown_requested: bool = field(default=False, init=False, repr=False)
     _lock_held: Optional[Any] = field(default=None, init=False, repr=False)
     _provenance_index_repair_attempted: bool = field(default=False, init=False, repr=False)
+    _lease_owner_token: Optional[str] = field(default=None, init=False, repr=False)
+    _lease_heartbeat_thread: Optional[threading.Thread] = field(
+        default=None, init=False, repr=False
+    )
+    _lease_heartbeat_stop: threading.Event = field(
+        default_factory=threading.Event, init=False, repr=False
+    )
+    _lease_io_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
+    _lease_state_snapshot: Optional[Dict[str, Any]] = field(
+        default=None, init=False, repr=False
+    )
+    _lease_heartbeat_failures: int = field(default=0, init=False, repr=False)
+    _lease_failure_message: Optional[str] = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.campaign_dir = Path(self.campaign_dir)
+        if self.scheduler_identity_kind is None:
+            self.scheduler_identity_kind = str(
+                getattr(self.executor, "scheduler_identity_kind", "synthetic")
+            )
+        if self.scheduler_identity_kind not in {"synthetic", "slurm"}:
+            raise ValueError("scheduler_identity_kind must be synthetic or slurm")
 
     # --- path helpers ---------------------------------------------------
 
@@ -361,17 +395,22 @@ class Daemon:
             return None
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-            return payload if isinstance(payload, dict) else None
-        except Exception:
+            return validate_lease_heartbeat(payload)
+        except (OSError, ValueError):
             return None
 
     def _lease_age_seconds(self) -> float:
         heartbeat = self._read_heartbeat()
         if heartbeat is not None:
-            try:
-                return max(0.0, time.time() - float(heartbeat.get("time", 0.0)))
-            except Exception:
-                pass
+            liveness = evaluate_lease_liveness(
+                heartbeat,
+                stale_seconds=int(self.config.runtime.lease_stale_seconds),
+                clock_skew_tolerance_seconds=int(
+                    self.config.runtime.clock_skew_tolerance_seconds
+                ),
+            )
+            if liveness.age_seconds is not None:
+                return max(0.0, float(liveness.age_seconds))
         try:
             return max(0.0, time.time() - self.lease_path().stat().st_mtime)
         except OSError:
@@ -381,13 +420,33 @@ class Daemon:
     def _acquire_lease(self):
         self.data_dir().mkdir(parents=True, exist_ok=True)
         lease = self.lease_path()
-        stale_after = float(getattr(self.config.runtime, "lease_stale_seconds", 900))
+        stale_after = int(getattr(self.config.runtime, "lease_stale_seconds", 900))
+        skew = int(getattr(self.config.runtime, "clock_skew_tolerance_seconds", 60))
         try:
             os.mkdir(str(lease))
         except FileExistsError:
-            age = self._lease_age_seconds()
-            heartbeat = self._read_heartbeat() or {}
-            if age < stale_after:
+            raw_heartbeat: Any = None
+            heartbeat_error: Optional[str] = None
+            try:
+                raw_heartbeat = json.loads(
+                    self.heartbeat_path().read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError) as exc:
+                heartbeat_error = type(exc).__name__ + ": " + str(exc)
+            liveness = evaluate_lease_liveness(
+                raw_heartbeat,
+                stale_seconds=stale_after,
+                clock_skew_tolerance_seconds=skew,
+            )
+            heartbeat = raw_heartbeat if isinstance(raw_heartbeat, dict) else {}
+            age = (
+                self._lease_age_seconds()
+                if liveness.age_seconds is None
+                else max(0.0, float(liveness.age_seconds))
+            )
+            if liveness.disposition in {"fresh", "clock_skew"} or (
+                liveness.disposition == "invalid" and age < stale_after
+            ):
                 self._journal(
                     "daemon_lease_conflict",
                     host=str(heartbeat.get("host", "?")),
@@ -396,9 +455,11 @@ class Daemon:
                     iteration=str(heartbeat.get("iteration", "?")),
                     age_seconds=float(age),
                     stale_after_seconds=float(stale_after),
+                    lease_disposition=liveness.disposition,
+                    lease_error=str(liveness.error or heartbeat_error or "")[:180],
                 )
                 raise DaemonAlreadyRunningError(
-                    "daemon lease is fresh; refuse to start "
+                    "daemon lease is active or inconclusive; refuse to start "
                     + "(host="
                     + str(heartbeat.get("host", "?"))
                     + ", pid="
@@ -429,49 +490,128 @@ class Daemon:
                 stale_after_seconds=float(stale_after),
             )
             os.mkdir(str(lease))
-        self._write_lease_heartbeat()
+        self._lease_owner_token = secrets.token_hex(16)
+        self._lease_heartbeat_stop.clear()
+        self._lease_heartbeat_failures = 0
+        self._lease_failure_message = None
+        self._write_lease_heartbeat(initial=True)
+        self._start_lease_heartbeat_thread()
         try:
             yield
         finally:
+            self._stop_lease_heartbeat_thread()
+            token = self._lease_owner_token
             try:
-                self.heartbeat_path().unlink()
-            except OSError as exc:
-                self._journal(
-                    "daemon_lease_cleanup_failed",
-                    path=str(self.heartbeat_path()),
-                    operation="unlink_heartbeat",
-                    error=type(exc).__name__ + ": " + str(exc)[:160],
-                )
-            try:
-                os.rmdir(str(lease))
-            except OSError as exc:
+                with self._lease_io_lock:
+                    current = self._read_heartbeat()
+                    validate_lease_heartbeat(
+                        current,
+                        expected_owner_token=token,
+                    )
+                    self.heartbeat_path().unlink()
+                    os.rmdir(str(lease))
+            except (OSError, ValueError) as exc:
                 self._journal(
                     "daemon_lease_cleanup_failed",
                     path=str(lease),
-                    operation="remove_lease_dir",
+                    operation="compare_and_remove_owned_lease",
                     error=type(exc).__name__ + ": " + str(exc)[:160],
                 )
+            finally:
+                self._lease_owner_token = None
+                self._lease_state_snapshot = None
 
-    def _write_lease_heartbeat(self, state: Optional[CampaignState] = None) -> None:
+    def _record_lease_heartbeat_failure(self, exc: Exception) -> None:
+        self._lease_heartbeat_failures += 1
+        self._lease_failure_message = type(exc).__name__ + ": " + str(exc)
+        self._journal(
+            "daemon_lease_heartbeat_failed",
+            failure_count=int(self._lease_heartbeat_failures),
+            failure_max=int(self.config.runtime.lease_heartbeat_failure_max),
+            error=self._lease_failure_message[:180],
+        )
+
+    def _write_lease_heartbeat(
+        self,
+        state: Optional[CampaignState] = None,
+        *,
+        initial: bool = False,
+    ) -> None:
         lease = self.lease_path()
-        if not lease.is_dir():
+        token = self._lease_owner_token
+        if not lease.is_dir() or token is None:
             return
+        if state is not None:
+            self._lease_state_snapshot = {
+                "phase": state.phase.value,
+                "iteration": int(state.iteration),
+                "campaign_uid": str(getattr(state, "campaign_uid", "")),
+            }
         payload: Dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
+            "owner_token": token,
             "time": time.time(),
             "pid": os.getpid(),
             "host": socket.gethostname(),
         }
-        if state is not None:
-            payload.update({
-                "phase": state.phase.value,
-                "iteration": int(state.iteration),
-                "campaign_uid": str(getattr(state, "campaign_uid", "")),
-            })
+        if self._lease_state_snapshot is not None:
+            payload.update(dict(self._lease_state_snapshot))
         try:
-            atomic_write_json(self.heartbeat_path(), payload)
-        except Exception:
-            pass
+            with self._lease_io_lock:
+                if not initial:
+                    current = self._read_heartbeat()
+                    validate_lease_heartbeat(
+                        current,
+                        expected_owner_token=token,
+                    )
+                atomic_write_json(self.heartbeat_path(), payload)
+            if self._lease_heartbeat_failures:
+                self._journal(
+                    "daemon_lease_heartbeat_recovered",
+                    prior_failure_count=int(self._lease_heartbeat_failures),
+                )
+            self._lease_heartbeat_failures = 0
+            self._lease_failure_message = None
+        except Exception as exc:
+            self._record_lease_heartbeat_failure(exc)
+            if isinstance(exc, LeaseHeartbeatError):
+                self._lease_heartbeat_failures = int(
+                    self.config.runtime.lease_heartbeat_failure_max
+                )
+            self._assert_lease_healthy()
+
+    def _lease_heartbeat_worker(self) -> None:
+        interval = float(self.config.runtime.lease_heartbeat_seconds)
+        while not self._lease_heartbeat_stop.wait(interval):
+            try:
+                self._write_lease_heartbeat()
+            except DaemonLeaseOwnershipError:
+                return
+
+    def _start_lease_heartbeat_thread(self) -> None:
+        thread = threading.Thread(
+            target=self._lease_heartbeat_worker,
+            name="ichor-daemon-lease-heartbeat",
+            daemon=True,
+        )
+        self._lease_heartbeat_thread = thread
+        thread.start()
+
+    def _stop_lease_heartbeat_thread(self) -> None:
+        self._lease_heartbeat_stop.set()
+        thread = self._lease_heartbeat_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(1.0, float(self.config.runtime.lease_heartbeat_seconds) + 1.0))
+        self._lease_heartbeat_thread = None
+
+    def _assert_lease_healthy(self) -> None:
+        if self._lease_heartbeat_failures >= int(
+            self.config.runtime.lease_heartbeat_failure_max
+        ):
+            raise DaemonLeaseOwnershipError(
+                "daemon lease heartbeat failed repeatedly; scientific progression "
+                "has stopped: " + str(self._lease_failure_message or "unknown failure")
+            )
 
     def _write_pid(self) -> None:
         self.pid_path().write_text(str(os.getpid()) + "\n", encoding="utf-8")
@@ -558,7 +698,16 @@ class Daemon:
 
     def _journal(self, event_type: str, **payload: Any) -> None:
         try:
-            append_event(self.journal_path(), event_type, **payload)
+            append_event(
+                self.journal_path(),
+                event_type,
+                max_bytes=int(self.config.runtime.journal_max_bytes),
+                retained_files=int(self.config.runtime.journal_retained_files),
+                lock_timeout_seconds=int(
+                    self.config.runtime.ledger_lock_timeout_seconds
+                ),
+                **payload,
+            )
         except Exception:
             # Journal writes are best-effort; never let logging crash the daemon.
             pass
@@ -598,6 +747,7 @@ class Daemon:
         on-disk state at the previous snapshot, so the next start re-runs
         the same step.
         """
+        self._assert_lease_healthy()
         state = self._read_or_initialise_state()
         self._write_lease_heartbeat(state)
 
@@ -1301,6 +1451,7 @@ class Daemon:
                     ),
                     expected_tasks=planned_expected_tasks,
                     decision_contract=self._submission_decision_contract(),
+                    scheduler_identity_kind=self.scheduler_identity_kind,
                 )
                 intent_written = True
             except Exception as exc:
@@ -1437,20 +1588,28 @@ class Daemon:
             signature = inspect.signature(self.sacct_poller)
         except (TypeError, ValueError):
             accepts_expected = True
+            accepts_timeout = True
         else:
+            has_kwargs = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
+            )
             accepts_expected = (
                 "expected_task_count" in signature.parameters
-                or any(
-                    parameter.kind is inspect.Parameter.VAR_KEYWORD
-                    for parameter in signature.parameters.values()
-                )
+                or has_kwargs
             )
+            accepts_timeout = (
+                "timeout_seconds" in signature.parameters
+                or has_kwargs
+            )
+        kwargs: Dict[str, Any] = {}
         if accepts_expected:
-            return self.sacct_poller(
-                str(job_id),
-                expected_task_count=expected_task_count,
+            kwargs["expected_task_count"] = expected_task_count
+        if accepts_timeout:
+            kwargs["timeout_seconds"] = int(
+                self.config.runtime.scheduler_command_timeout_seconds
             )
-        return self.sacct_poller(str(job_id))
+        return self.sacct_poller(str(job_id), **kwargs)
 
     def _adopt_accounted_intent_job(
         self,
@@ -1492,6 +1651,8 @@ class Daemon:
             str(job_id),
             observations,
             expected_task_count=expected_tasks,
+            submission_kind=str(active_intent.get("submission_kind")),
+            strict_parent_job_id=(self.scheduler_identity_kind == "slurm"),
         )
         if not observations or int(getattr(summary, "n_tasks", 0)) <= 0:
             return self._halt_scheduler_uncertain(
@@ -1723,6 +1884,10 @@ class Daemon:
             job_id,
             observations,
             expected_task_count=expected_tasks,
+            submission_kind=_submission_intent.submission_kind_for_phase(
+                phase.value
+            ),
+            strict_parent_job_id=(self.scheduler_identity_kind == "slurm"),
         )
         if observations:
             first_status = getattr(observations[0].status, "value", observations[0].status)
@@ -1766,7 +1931,9 @@ class Daemon:
                     summary=summary,
                     accounting_streak=current,
                 )
-            max_ticks = int(getattr(self.config, "poll_sacct_empty_max_ticks", 10))
+            max_ticks = int(
+                getattr(self.config.runtime, "poll_sacct_empty_max_ticks", 10)
+            )
             if max_ticks > 0 and current >= max_ticks:
                 self._journal(
                     "sacct_empty_timeout",
@@ -1782,10 +1949,12 @@ class Daemon:
                     ),
                     iteration=state.iteration,
                 )
-                #treat as a full failure of every task in the array. Route
-                #through the standard failure handler so executor policy
-                #(SCRUB_AND_CONTINUE vs HALT) still applies.
-                return self._handle_failure(state, phase, observations, summary)
+                return self._halt_scheduler_uncertain(
+                    state,
+                    phase,
+                    "sacct_empty_timeout: no conclusive accounting evidence for "
+                    + str(job_id),
+                )
             return TickStatus.POLLING
 
         #Non-empty response - clear the streak.
@@ -1802,6 +1971,7 @@ class Daemon:
                 getattr(self.config.runtime, "poll_sacct_unknown_max_ticks", 3)
             )
             if max_unknown > 0 and current >= max_unknown:
+                liveness = self._check_job_liveness(job_id)
                 self._journal(
                     "sacct_unknown_timeout",
                     phase=phase.value,
@@ -1809,8 +1979,16 @@ class Daemon:
                     streak=int(current),
                     max_ticks=int(max_unknown),
                     iteration=state.iteration,
+                    squeue_active=(
+                        None if liveness is None
+                        else bool(getattr(liveness, "active", False))
+                    ),
+                    squeue_inconclusive=(
+                        None if liveness is None
+                        else bool(getattr(liveness, "inconclusive", False))
+                    ),
                 )
-                return self._halt(
+                return self._halt_scheduler_uncertain(
                     state,
                     phase,
                     "sacct_unknown_timeout: "
@@ -1874,7 +2052,7 @@ class Daemon:
                     ),
                     iteration=state.iteration,
                 )
-                return self._halt(
+                return self._halt_scheduler_uncertain(
                     state,
                     phase,
                     "sacct_missing_timeout: "
@@ -1973,13 +2151,33 @@ class Daemon:
                 raise ValueError("submission intent is unavailable")
             if str(intent.get("job_id") or "") != str(job_id):
                 raise ValueError("submission intent JobID does not match terminal job")
-            summary = collector(
-                self.campaign_dir,
-                intent=intent,
-                history_limit=int(
-                    getattr(self.config.resources, "scheduler_usage_history_limit", 5000)
+            collector_kwargs: Dict[str, Any] = {
+                "intent": intent,
+                "history_limit": int(
+                    getattr(
+                        self.config.resources,
+                        "scheduler_usage_history_limit",
+                        5000,
+                    )
                 ),
-            )
+            }
+            try:
+                collector_signature = inspect.signature(collector)
+            except (TypeError, ValueError):
+                accepts_timeout = True
+            else:
+                accepts_timeout = (
+                    "timeout_seconds" in collector_signature.parameters
+                    or any(
+                        parameter.kind is inspect.Parameter.VAR_KEYWORD
+                        for parameter in collector_signature.parameters.values()
+                    )
+                )
+            if accepts_timeout:
+                collector_kwargs["timeout_seconds"] = int(
+                    self.config.runtime.scheduler_command_timeout_seconds
+                )
+            summary = collector(self.campaign_dir, **collector_kwargs)
             self._journal(
                 "scheduler_usage_recorded",
                 phase=phase.value,
@@ -2647,33 +2845,65 @@ class Daemon:
     def _load_transient_retry_ledger(self) -> Dict[str, Any]:
         path = self.transient_retry_ledger_path()
         if not path.is_file():
-            return {"schema_version": 1, "attempts": {}}
+            return {"schema_version": 2, "attempts": {}}
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception as exc:
             raise ValueError(
                 "transient retry ledger is unreadable: " + str(path)
             ) from exc
-        if not isinstance(data, dict) or int(data.get("schema_version", -1)) != 1:
+        if (
+            not isinstance(data, dict)
+            or isinstance(data.get("schema_version"), bool)
+            or data.get("schema_version") != 2
+        ):
             raise ValueError("transient retry ledger has an unsupported schema")
         attempts = data.get("attempts")
         if not isinstance(attempts, dict):
             raise ValueError("transient retry ledger attempts must be an object")
         for key, value in attempts.items():
-            try:
-                count = int(value)
-            except (TypeError, ValueError) as exc:
+            if isinstance(value, bool) or not isinstance(value, int):
                 raise ValueError(
                     "transient retry ledger attempt is not an integer for " + str(key)
-                ) from exc
+                )
+            count = value
             if count < 0:
                 raise ValueError(
                     "transient retry ledger attempt is negative for " + str(key)
                 )
-        return {"schema_version": 1, "attempts": attempts}
+        return {"schema_version": 2, "attempts": attempts}
 
-    def _retry_key(self, phase: CampaignPhase, iteration: int) -> str:
-        return phase.value + "@" + str(int(iteration))
+    def _retry_key(self, state: CampaignState, phase: CampaignPhase) -> str:
+        intent = _submission_intent.load_active_intent(
+            self.campaign_dir,
+            phase.value,
+            int(state.iteration),
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+        if not isinstance(intent, dict):
+            raise ValueError("transient retry requires an active submission intent")
+        metadata = intent.get("submission_metadata")
+        task_set_digest = (
+            str(metadata.get("logical_task_set_sha256") or "")
+            if isinstance(metadata, dict)
+            else ""
+        )
+        if not task_set_digest:
+            expected = intent.get("expected_tasks")
+            if isinstance(expected, bool) or not isinstance(expected, int) or expected <= 0:
+                raise ValueError("transient retry intent has no exact task cardinality")
+            task_set_digest = hashlib.sha256(
+                ("range:" + str(expected)).encode("ascii")
+            ).hexdigest()
+        return (
+            phase.value
+            + "@"
+            + str(int(state.iteration))
+            + "@round="
+            + str(int(state.replacement_round))
+            + "@tasks="
+            + task_set_digest
+        )
 
     def _should_retry_transient_failure(
         self,
@@ -2704,7 +2934,16 @@ class Daemon:
             )
             return False
         attempts = ledger.get("attempts", {})
-        key = self._retry_key(phase, int(state.iteration))
+        try:
+            key = self._retry_key(state, phase)
+        except Exception as exc:
+            self._journal(
+                "transient_retry_ledger_invalid",
+                phase=phase.value,
+                iteration=int(state.iteration),
+                reason=type(exc).__name__ + ": " + str(exc)[:180],
+            )
+            return False
         return int(attempts.get(key, 0)) < max_retry
 
     def _retry_transient_phase(
@@ -2740,12 +2979,12 @@ class Daemon:
                     )
         ledger = self._load_transient_retry_ledger()
         attempts = dict(ledger.get("attempts", {}))
-        key = self._retry_key(phase, int(state.iteration))
+        key = self._retry_key(state, phase)
         attempt = int(attempts.get(key, 0)) + 1
         attempts[key] = attempt
         atomic_write_json(
             self.transient_retry_ledger_path(),
-            {"schema_version": 1, "attempts": attempts},
+            {"schema_version": 2, "attempts": attempts},
         )
         try:
             _submission_intent.mark_failed(
@@ -3685,6 +3924,7 @@ class Daemon:
 
             try:
                 status = self.tick()
+                self._assert_lease_healthy()
             except (StateSchemaError, json.JSONDecodeError) as exc:
                 self._journal("state_corrupt", error=str(exc)[:200])
                 print(

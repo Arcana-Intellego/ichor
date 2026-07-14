@@ -697,7 +697,7 @@ def test_fresh_lease_blocks_second_daemon(tmp_path):
 
     with d1._acquire_lease():
         assert d1.heartbeat_path().is_file()
-        with pytest.raises(DaemonAlreadyRunningError, match="daemon lease is fresh"):
+        with pytest.raises(DaemonAlreadyRunningError, match="lease is active or inconclusive"):
             with d2._acquire_lease():
                 pass
 
@@ -714,7 +714,8 @@ def test_stale_lease_is_recovered(tmp_path):
     d.lease_path().mkdir()
     d.heartbeat_path().write_text(
         json.dumps({
-            "schema_version": 1,
+            "schema_version": 2,
+            "owner_token": "a" * 32,
             "time": time.time() - 3600.0,
             "pid": 123,
             "host": "old-host",
@@ -735,6 +736,23 @@ def test_stale_lease_is_recovered(tmp_path):
     assert recovered
     assert recovered[-1]["previous_host"] == "old-host"
     assert recovered[-1]["previous_phase"] == "AIMALL"
+
+
+def test_stale_lease_owner_cannot_remove_successor_lease(tmp_path):
+    d = _make_daemon(tmp_path)
+    d.config.runtime.lease_heartbeat_seconds = 300
+
+    with d._acquire_lease():
+        successor_token = "b" * 32
+        payload = json.loads(d.heartbeat_path().read_text(encoding="utf-8"))
+        payload["owner_token"] = successor_token
+        d.heartbeat_path().write_text(json.dumps(payload), encoding="utf-8")
+
+    assert d.lease_path().is_dir()
+    successor = json.loads(d.heartbeat_path().read_text(encoding="utf-8"))
+    assert successor["owner_token"] == successor_token
+    events = list(iter_events(d.journal_path()))
+    assert any(event["event"] == "daemon_lease_cleanup_failed" for event in events)
 
 
 def test_request_shutdown_writes_flag_to_state(tmp_path):
@@ -917,8 +935,11 @@ def test_transient_scheduler_failure_retries_once(tmp_path):
     assert state.phase is CampaignPhase.PHASE_A_POLUS
     assert state.pending_jobs[CampaignPhase.PHASE_A_POLUS.value] is None
     payload = json.loads(d.transient_retry_ledger_path().read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 1
-    assert payload["attempts"]["PHASE_A_POLUS@0"] == 1
+    assert payload["schema_version"] == 2
+    assert len(payload["attempts"]) == 1
+    key, count = next(iter(payload["attempts"].items()))
+    assert key.startswith("PHASE_A_POLUS@0@round=0@tasks=")
+    assert count == 1
 
 
 def test_timeout_failure_does_not_transient_retry_by_default(tmp_path):

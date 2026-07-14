@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Union
 
 from .state import atomic_write_json
+from ..submit.slurm_contracts import run_scheduler_command
 
 
 USAGE_SCHEMA_VERSION = 1
@@ -243,6 +244,7 @@ def collect_usage(
     intent: Mapping[str, Any],
     history_limit: int,
     runner: Any = subprocess.run,
+    timeout_seconds: int = 60,
 ) -> Dict[str, Any]:
     job_id = str(intent.get("job_id") or "")
     if not job_id:
@@ -265,11 +267,13 @@ def collect_usage(
                     and str(item.get("job_id")) == job_id
                 ):
                     return dict(item)
-    completed = runner(
+    completed = run_scheduler_command(
+        runner,
         [
             "sacct", "-n", "-P", "-j", job_id,
             "--format=JobIDRaw,State,ExitCode,ElapsedRaw,AllocCPUS,ReqMem,MaxRSS,MaxVMSize,TotalCPU",
         ],
+        timeout_seconds=int(timeout_seconds),
         check=False,
         capture_output=True,
         text=True,

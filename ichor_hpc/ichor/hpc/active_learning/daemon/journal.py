@@ -1,34 +1,37 @@
-"""Append-only NDJSON journal.
+"""Locked, segmented NDJSON journal.
 
-The daemon writes one JSON object per line to "journal.ndjson". Each entry
-is opened O_APPEND and is constrained to under PIPE_BUF bytes (4 KiB on
-a Linux cluster, conservatively used as the safe limit on all platforms). POSIX
-guarantees that a single write(2) of less than PIPE_BUF on an O_APPEND
-file descriptor is atomic with respect to concurrent appenders, which is
-the property we rely on for crash-and-concurrent-process safety.
+The daemon writes one JSON object per line to ``journal.ndjson``. A bounded
+cross-process lock serialises full writes and segment rotation; regular files
+do not inherit the ``PIPE_BUF`` atomicity guarantee provided for pipes.
 
 Schema is intentionally flexible: every line carries "ts" (ISO-8601 UTC) and
 "event" (short string tag); everything else is event-specific payload.
 The daemon uses this for replayable per-iteration provenance and for
 post-mortem analysis after a campaign halts.
 
-The journal is append-only; on rotation (operator-driven, rare), the old
-file is renamed and a fresh empty one is created. This module exposes
+The journal is append-only within each bounded segment. Rotation preserves
+recent immutable segments and starts a fresh current file. This module exposes
 :func: "append_event" for the writer side and :func: "read_events" for
 introspection / CLI / tests.
 """
 from __future__ import annotations
 
 from ..strict_json import strict_json as json
+import math
 import os
+import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, Optional, Union
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union
+
+import portalocker
 
 
 __all__ = [
     "JOURNAL_LINE_LIMIT_BYTES",
     "EventTooLargeError",
+    "JournalCorruptionError",
     "KNOWN_EVENT_TYPES",
     "append_event",
     "iter_events",
@@ -147,9 +150,11 @@ KNOWN_EVENT_TYPES = (
     "daemon_lease_conflict",
     "daemon_lease_stale_recovered",
     "daemon_lease_cleanup_failed",
+    "daemon_lease_heartbeat_failed",
+    "daemon_lease_heartbeat_recovered",
     "ariadne_seed_provenance_repaired",
     "ariadne_seed_provenance_staged",
-    "ariadne_stale_outputs_cleaned",
+    "ariadne_stale_outputs_quarantined",
     "ariadne_task_rejected_missing_result",
     "ariadne_task_rejected_malformed_result",
     "ariadne_task_rejected_unusable_result",
@@ -177,33 +182,104 @@ KNOWN_EVENT_TYPES = (
 )
 
 
-#Linux PIPE_BUF is 4096; POSIX requires write(2) of <= PIPE_BUF to be atomic
-#on O_APPEND files. We enforce strictly less than that to leave room for the
-#trailing newline and any UTF-8 multibyte overhead.
+# Keep individual diagnostic records compact. Cross-process safety comes from
+# the bounded journal lock and full-write loop, not from pipe semantics.
 JOURNAL_LINE_LIMIT_BYTES = 4000
+DEFAULT_JOURNAL_MAX_BYTES = 67_108_864
+DEFAULT_JOURNAL_RETAINED_FILES = 8
+DEFAULT_JOURNAL_LOCK_TIMEOUT_SECONDS = 30
 
 
 class EventTooLargeError(ValueError):
-    """Raised when a serialised event would exceed PIPE_BUF and so cannot be
-    appended atomically. Callers must split the payload."""
+    """Raised when a serialised event exceeds the diagnostic record limit."""
+
+
+class JournalCorruptionError(ValueError):
+    """Raised for malformed records other than one torn current tail."""
+
+    def __init__(self, path: Path, line_number: int, offset: int, reason: str) -> None:
+        self.path = Path(path)
+        self.line_number = int(line_number)
+        self.offset = int(offset)
+        self.reason = str(reason)
+        super().__init__(
+            str(path)
+            + ": journal corruption at line "
+            + str(line_number)
+            + ", byte "
+            + str(offset)
+            + ": "
+            + str(reason)
+        )
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _normalise_advisory_json(value: Any, path: str = "$") -> Tuple[Any, List[str]]:
+    if isinstance(value, float) and not math.isfinite(value):
+        return None, [path]
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        issues: List[str] = []
+        for key, item in value.items():
+            normalised, found = _normalise_advisory_json(item, path + "." + str(key))
+            out[str(key)] = normalised
+            issues.extend(found)
+        return out, issues
+    if isinstance(value, (list, tuple)):
+        out_list: List[Any] = []
+        issues = []
+        for index, item in enumerate(value):
+            normalised, found = _normalise_advisory_json(
+                item, path + "[" + str(index) + "]"
+            )
+            out_list.append(normalised)
+            issues.extend(found)
+        return out_list, issues
+    return value, []
+
+
+def _parse_timestamp(value: Any, label: str) -> datetime:
+    if not isinstance(value, str) or not value:
+        raise ValueError(label + " must be a non-empty ISO-8601 timestamp")
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(label + " is not ISO-8601") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(label + " must include a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
 def _encode_event(event_type: str, payload: Dict[str, Any], ts: Optional[str] = None) -> bytes:
-    record = {"ts": ts or _now_iso(), "event": str(event_type)}
+    event = str(event_type)
+    if not event or any(ord(character) < 32 for character in event):
+        raise ValueError("event type must be a non-empty control-free string")
+    timestamp = ts or _now_iso()
+    _parse_timestamp(timestamp, "journal event timestamp")
+    record = {"ts": timestamp, "event": event}
     for k, v in payload.items():
         if k in ("ts", "event"):
             raise ValueError("payload key " + repr(k) + " is reserved")
         record[k] = v
-    encoded = json.dumps(record, sort_keys=False, default=str).encode("utf-8")
+    record, non_finite = _normalise_advisory_json(record)
+    if non_finite:
+        record["non_finite_fields"] = non_finite
+        record["non_finite_reason"] = "advisory non-finite values were serialised as null"
+    encoded = json.dumps(
+        record,
+        sort_keys=False,
+        default=str,
+        allow_nan=False,
+    ).encode("utf-8")
     if len(encoded) + 1 > JOURNAL_LINE_LIMIT_BYTES:
         raise EventTooLargeError(
             "event line is " + str(len(encoded) + 1) + " bytes; "
-            "the journal enforces < " + str(JOURNAL_LINE_LIMIT_BYTES) + " for "
-            "atomic concurrent appends. Split the payload."
+            "the journal enforces < " + str(JOURNAL_LINE_LIMIT_BYTES) + ". "
+            "Split the payload."
         )
     return encoded + b"\n"
 
@@ -214,13 +290,16 @@ def append_event(
     *,
     ts: Optional[str] = None,
     fsync: bool = False,
+    max_bytes: int = DEFAULT_JOURNAL_MAX_BYTES,
+    retained_files: int = DEFAULT_JOURNAL_RETAINED_FILES,
+    lock_timeout_seconds: int = DEFAULT_JOURNAL_LOCK_TIMEOUT_SECONDS,
     **payload: Any,
 ) -> str:
     """Append a single NDJSON record to "journal_path".
 
-    Opens the file with O_APPEND so concurrent processes do not interleave
-    bytes within a write. Returns the encoded "ts" so the caller can echo it
-    into log lines or unit tests.
+    Serialises rotation and the complete append under a bounded cross-process
+    lock. Returns the encoded "ts" so the caller can echo it into log lines or
+    unit tests.
 
     Setting "fsync=True" forces an fsync after the append; the default
     False matches the design note that journal durability is best-effort --
@@ -228,43 +307,122 @@ def append_event(
     """
     encoded = _encode_event(event_type, payload, ts=ts)
     p = Path(journal_path)
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
+        raise ValueError("journal max_bytes must be a positive integer")
+    if (
+        isinstance(retained_files, bool)
+        or not isinstance(retained_files, int)
+        or retained_files <= 0
+    ):
+        raise ValueError("journal retained_files must be a positive integer")
     p.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(
-        str(p),
-        os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-        0o644,
-    )
-    try:
-        os.write(fd, encoded)
-        if fsync:
-            from .state import _fsync_file_descriptor
+    lock_path = p.with_name(p.name + ".lock")
+    with portalocker.Lock(
+        str(lock_path),
+        mode="a",
+        timeout=float(lock_timeout_seconds),
+        flags=portalocker.LOCK_EX | portalocker.LOCK_NB,
+    ):
+        current_size = p.stat().st_size if p.is_file() else 0
+        if current_size and current_size + len(encoded) > int(max_bytes):
+            segment = p.with_name(
+                p.stem
+                + ".segment."
+                + str(time.time_ns()).zfill(20)
+                + "."
+                + str(os.getpid())
+                + "."
+                + uuid.uuid4().hex[:8]
+                + p.suffix
+            )
+            os.replace(str(p), str(segment))
+            from .state import _fsync_parent_dir
 
-            _fsync_file_descriptor(fd)
-    finally:
-        os.close(fd)
+            _fsync_parent_dir(p)
+            archives = sorted(
+                p.parent.glob(p.stem + ".segment.*" + p.suffix)
+            )
+            keep_archives = max(0, int(retained_files) - 1)
+            for old in archives[: max(0, len(archives) - keep_archives)]:
+                if old.is_symlink() or not old.is_file():
+                    raise ValueError("journal segment is not a regular file: " + str(old))
+                old.unlink()
+            _fsync_parent_dir(p)
+        fd = os.open(
+            str(p),
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            0o600,
+        )
+        try:
+            written = 0
+            while written < len(encoded):
+                try:
+                    progress = os.write(fd, encoded[written:])
+                except InterruptedError:
+                    continue
+                if progress <= 0:
+                    raise OSError("journal append made no write progress")
+                written += int(progress)
+            if fsync:
+                from .state import _fsync_file_descriptor
+
+                _fsync_file_descriptor(fd)
+        finally:
+            os.close(fd)
     return json.loads(encoded.decode("utf-8"))["ts"]
 
 
-def iter_events(journal_path: Union[str, Path]) -> Iterator[Dict[str, Any]]:
-    """Yield each well-formed event from the journal in file order.
+def _journal_segments(path: Path) -> List[Path]:
+    archives = sorted(path.parent.glob(path.stem + ".segment.*" + path.suffix))
+    return archives + ([path] if path.is_file() else [])
 
-    Malformed lines (typically incomplete trailing writes on a crashed
-    process) are silently skipped; the daemon's reconcile path inspects
-    "iter_events" for analysis but treats malformed lines as informational
-    rather than authoritative.
+
+def iter_events(journal_path: Union[str, Path]) -> Iterator[Dict[str, Any]]:
+    """Yield strict event objects from immutable segments and the current file.
+
+    Only an unterminated final line in the current file is treated as a torn
+    best-effort append. Interior or archived corruption is reported.
     """
     p = Path(journal_path)
-    if not p.exists():
+    segments = _journal_segments(p)
+    if not segments:
         return
-    with open(p, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
+    for segment in segments:
+        if segment.is_symlink() or not segment.is_file():
+            raise JournalCorruptionError(segment, 0, 0, "segment is not a regular file")
+        raw = segment.read_bytes()
+        offset = 0
+        lines = raw.splitlines(keepends=True)
+        for line_number, line in enumerate(lines, start=1):
+            terminated = line.endswith((b"\n", b"\r"))
+            body = line.strip()
+            if not body:
+                offset += len(line)
                 continue
             try:
-                yield json.loads(line)
-            except json.JSONDecodeError:
-                continue
+                record = json.loads(body.decode("utf-8"))
+                if not isinstance(record, dict):
+                    raise ValueError("journal record must be a JSON object")
+                event = record.get("event")
+                if not isinstance(event, str) or not event:
+                    raise ValueError("journal event must be a non-empty string")
+                _parse_timestamp(record.get("ts"), "journal event timestamp")
+            except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+                is_torn_current_tail = (
+                    segment == p
+                    and line_number == len(lines)
+                    and not terminated
+                )
+                if is_torn_current_tail:
+                    return
+                raise JournalCorruptionError(
+                    segment,
+                    line_number,
+                    offset,
+                    type(exc).__name__ + ": " + str(exc),
+                ) from exc
+            yield record
+            offset += len(line)
 
 
 def read_events(
@@ -279,6 +437,7 @@ def read_events(
     are dropped. "event_type" may be a single string or an iterable of
     strings; events whose "event" is not in the filter are dropped.
     """
+    since_dt = None if since is None else _parse_timestamp(since, "journal --since")
     if event_type is not None and isinstance(event_type, str):
         wanted = {event_type}
     elif event_type is not None:
@@ -288,6 +447,8 @@ def read_events(
     for record in iter_events(journal_path):
         if wanted is not None and record.get("event") not in wanted:
             continue
-        if since is not None and str(record.get("ts", "")) < since:
+        if since_dt is not None and _parse_timestamp(
+            record.get("ts"), "journal event timestamp"
+        ) < since_dt:
             continue
         yield record

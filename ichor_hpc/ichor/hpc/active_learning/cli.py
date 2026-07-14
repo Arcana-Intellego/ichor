@@ -21,6 +21,8 @@ start: ``live`` or ``dry_run``.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import inspect
 import os
 from .strict_json import strict_json as json
 import secrets
@@ -28,6 +30,7 @@ import subprocess
 import sys
 import time
 import numpy as np
+from collections import deque
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -41,7 +44,18 @@ from .daemon.daemon import (
     DEFAULT_DATA_SUBDIR,
     Daemon,
 )
-from .daemon.journal import KNOWN_EVENT_TYPES, iter_events, read_events
+from .daemon.journal import (
+    KNOWN_EVENT_TYPES,
+    JournalCorruptionError,
+    iter_events,
+    read_events,
+)
+from .daemon.lease import evaluate_lease_liveness, validate_lease_heartbeat
+from .submit.slurm_contracts import (
+    parse_squeue_job_id,
+    run_scheduler_command,
+    validate_parent_job_id,
+)
 from .daemon.config_lock import (
     apply_config_lock_update,
     archive_ferebus_iteration_staging_for_retrain,
@@ -103,6 +117,7 @@ from .daemon.reconcile_transaction import (
 from .daemon import submission_intent as _submission_intent
 from .daemon import scratch as _scratch
 from .daemon.state import (
+    CampaignState,
     CampaignPhase,
     DEFAULT_STATE_FILENAME,
     StateSchemaError,
@@ -352,17 +367,84 @@ def _probe_daemon_lock(lock_path: Path) -> dict:
     return status
 
 
-def _probe_daemon_lease(lease_path: Path) -> dict:
+def _runtime_liveness_policy(campaign: Path) -> Tuple[int, int]:
+    try:
+        config = CampaignConfig.from_yaml(Path(campaign) / "campaign.yaml")
+        return (
+            int(config.runtime.lease_stale_seconds),
+            int(config.runtime.clock_skew_tolerance_seconds),
+        )
+    except Exception:
+        defaults = CampaignConfig()
+        return (
+            int(defaults.runtime.lease_stale_seconds),
+            int(defaults.runtime.clock_skew_tolerance_seconds),
+        )
+
+
+def _runtime_scheduler_policy(campaign: Path) -> Tuple[int, int]:
+    """Return bounded scheduler command and cancellation timeouts."""
+    try:
+        config = CampaignConfig.from_yaml(Path(campaign) / "campaign.yaml")
+    except Exception:
+        config = CampaignConfig()
+    return (
+        int(config.runtime.scheduler_command_timeout_seconds),
+        int(config.runtime.cancellation_confirmation_timeout_seconds),
+    )
+
+
+def _call_timeout_aware(
+    function: Any,
+    *args: Any,
+    timeout_seconds: int,
+    **kwargs: Any,
+) -> Any:
+    """Preserve simple injected test adapters while timing real commands."""
+    try:
+        signature = inspect.signature(function)
+        accepts_timeout = (
+            "timeout_seconds" in signature.parameters
+            or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
+            )
+        )
+    except (TypeError, ValueError):
+        accepts_timeout = True
+    if accepts_timeout:
+        kwargs["timeout_seconds"] = int(timeout_seconds)
+    return function(*args, **kwargs)
+
+
+def _probe_daemon_lease(
+    lease_path: Path,
+    *,
+    stale_seconds: int = 900,
+    clock_skew_tolerance_seconds: int = 60,
+) -> dict:
     status = {
         "lease_dir_exists": lease_path.is_dir(),
         "lease_path": str(lease_path),
         "lease_heartbeat": None,
+        "lease_stale_seconds": int(stale_seconds),
+        "clock_skew_tolerance_seconds": int(clock_skew_tolerance_seconds),
     }
     heartbeat_path = lease_path / DAEMON_HEARTBEAT_FILENAME
     if not heartbeat_path.is_file():
         return status
     try:
-        status["lease_heartbeat"] = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+        heartbeat = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+        status["lease_heartbeat"] = validate_lease_heartbeat(heartbeat)
+        liveness = evaluate_lease_liveness(
+            heartbeat,
+            stale_seconds=int(stale_seconds),
+            clock_skew_tolerance_seconds=int(clock_skew_tolerance_seconds),
+        )
+        status["lease_liveness"] = liveness.disposition
+        status["lease_age_seconds"] = liveness.age_seconds
+        if liveness.error:
+            status["lease_probe_error"] = liveness.error
     except Exception as exc:
         status["lease_probe_error"] = type(exc).__name__ + ": " + str(exc)
     return status
@@ -417,21 +499,31 @@ def _probe_background_daemon(pid_path: Path, log_path: Path) -> Dict[str, Any]:
     return out
 
 
-def _lease_is_fresh(heartbeat: Any, *, stale_seconds: int = 900) -> bool:
-    if not isinstance(heartbeat, dict):
-        return False
-    try:
-        age = time.time() - float(heartbeat.get("time"))
-    except Exception:
-        return False
-    return age <= float(stale_seconds)
+def _lease_is_fresh(
+    heartbeat: Any,
+    *,
+    stale_seconds: int = 900,
+    clock_skew_tolerance_seconds: int = 60,
+) -> bool:
+    return evaluate_lease_liveness(
+        heartbeat,
+        stale_seconds=int(stale_seconds),
+        clock_skew_tolerance_seconds=int(clock_skew_tolerance_seconds),
+    ).fresh
 
 
 def _reconcile_runtime_status(campaign: Path) -> Dict[str, Any]:
     paths = _campaign_paths(campaign)
+    stale_seconds, clock_skew = _runtime_liveness_policy(campaign)
     status: Dict[str, Any] = {}
     status.update(_probe_daemon_lock(paths["lock"]))
-    status.update(_probe_daemon_lease(paths["lease"]))
+    status.update(
+        _probe_daemon_lease(
+            paths["lease"],
+            stale_seconds=stale_seconds,
+            clock_skew_tolerance_seconds=clock_skew,
+        )
+    )
     status.update(_probe_background_daemon(paths["background_pid"], paths["background_log"]))
     blockers: List[str] = []
     if status.get("lock_held") is True:
@@ -446,7 +538,11 @@ def _reconcile_runtime_status(campaign: Path) -> Dict[str, Any]:
             "daemon lease state is unknown: "
             + str(status.get("lease_probe_error"))
         )
-    elif _lease_is_fresh(status.get("lease_heartbeat")):
+    elif _lease_is_fresh(
+        status.get("lease_heartbeat"),
+        stale_seconds=stale_seconds,
+        clock_skew_tolerance_seconds=clock_skew,
+    ):
         blockers.append("daemon lease heartbeat is fresh")
     if status.get("background_pid_alive"):
         blockers.append(
@@ -672,7 +768,7 @@ def _atomic_write_background_pid(pid_path: Path, payload: Dict[str, Any]) -> Non
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = pid_path.with_name(pid_path.name + ".tmp")
     tmp_path.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
         encoding="utf-8",
     )
     tmp_path.replace(pid_path)
@@ -1240,24 +1336,33 @@ def _format_active_submission_intents(value: Any) -> str:
         lifecycle = intent.get("queue_lifecycle")
         lifecycle_bits: List[str] = []
         if isinstance(lifecycle, dict):
+            def advisory_duration(label: str) -> None:
+                raw = lifecycle.get(label)
+                if raw is None:
+                    return
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError):
+                    lifecycle_bits.append(label + "=invalid")
+                    return
+                if not np.isfinite(value) or value < 0.0:
+                    lifecycle_bits.append(label + "=invalid")
+                    return
+                lifecycle_bits.append(
+                    label.replace("_seconds", "")
+                    + "="
+                    + str(round(value, 1))
+                    + "s"
+                )
+
             if lifecycle.get("first_squeue_at_iso"):
                 lifecycle_bits.append("squeue_seen")
             if lifecycle.get("first_sacct_at_iso"):
                 lifecycle_bits.append("sacct_seen")
             if lifecycle.get("terminal_at_iso"):
                 lifecycle_bits.append("terminal")
-            if lifecycle.get("queue_wait_seconds") is not None:
-                lifecycle_bits.append(
-                    "queue_wait="
-                    + str(round(float(lifecycle["queue_wait_seconds"]), 1))
-                    + "s"
-                )
-            if lifecycle.get("postprocess_seconds") is not None:
-                lifecycle_bits.append(
-                    "postprocess="
-                    + str(round(float(lifecycle["postprocess_seconds"]), 1))
-                    + "s"
-                )
+            advisory_duration("queue_wait_seconds")
+            advisory_duration("postprocess_seconds")
             expected = lifecycle.get("n_expected", intent.get("expected_tasks"))
             observed = lifecycle.get("n_observed")
             missing = lifecycle.get("n_missing")
@@ -1377,20 +1482,17 @@ def _active_pending_jobs_summary(pending: Any) -> str:
     return "none active (" + str(completed_markers) + " completed markers)"
 
 
-def _lease_fresh(heartbeat: Any, *, stale_seconds: int = 900) -> bool:
-    if not isinstance(heartbeat, dict):
-        return False
-    try:
-        return time.time() - float(heartbeat.get("time")) <= stale_seconds
-    except Exception:
-        return False
-
-
 def _daemon_activity_status(payload: Dict[str, Any]) -> str:
     active: List[str] = []
     if payload.get("lock_held") is True:
         active.append("foreground lock held")
-    if payload.get("lease_dir_exists") and _lease_fresh(payload.get("lease_heartbeat")):
+    if payload.get("lease_dir_exists") and _lease_is_fresh(
+        payload.get("lease_heartbeat"),
+        stale_seconds=int(payload.get("lease_stale_seconds", 900)),
+        clock_skew_tolerance_seconds=int(
+            payload.get("clock_skew_tolerance_seconds", 60)
+        ),
+    ):
         active.append("fresh lease")
     if payload.get("background_pid_alive") is True:
         active.append("background pid " + str(payload.get("background_pid")))
@@ -1556,6 +1658,21 @@ def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path
                     ),
                     ("force resubmit", partial_array.get("force_resubmit")),
                     ("ledger", partial_array.get("ledger")),
+                ],
+            )
+        )
+    quarantine = payload.get("ariadne_retry_quarantine")
+    if isinstance(quarantine, Mapping) and (
+        quarantine.get("attempts") or quarantine.get("errors")
+    ):
+        lines.append("")
+        lines.extend(
+            _section(
+                "ARIADNE Retry Quarantine",
+                [
+                    ("retained attempts", len(quarantine.get("attempts") or [])),
+                    ("retained bytes", quarantine.get("total_bytes", 0)),
+                    ("invalid entries", len(quarantine.get("errors") or [])),
                 ],
             )
         )
@@ -1729,7 +1846,7 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "ariadne_provenance_reconstructed": "ARIADNE provenance rebuilt",
     "ariadne_seed_provenance_repaired": "ARIADNE seed provenance repaired",
     "ariadne_seed_provenance_staged": "ARIADNE seed provenance staged",
-    "ariadne_stale_outputs_cleaned": "ARIADNE stale outputs cleaned",
+    "ariadne_stale_outputs_quarantined": "ARIADNE stale outputs quarantined",
     "ariadne_task_rejected_missing_result": "ARIADNE result missing",
     "ariadne_task_rejected_malformed_result": "ARIADNE malformed result",
     "ariadne_task_rejected_unusable_result": "ARIADNE result unusable",
@@ -2439,9 +2556,22 @@ def cmd_start(args: argparse.Namespace) -> int:
         sacct_poller = None
         # live mode: let the daemon spot + adopt an orphaned in-flight job on (re)entry rather than
         # double-submitting after a crash or reconcile (A24/A25).
-        job_finder = make_live_job_finder(campaign_dir=campaign)
-        job_name_accounting_finder = make_live_job_accounting_finder()
-        job_liveness_checker = make_live_job_liveness_checker()
+        scheduler_timeout = int(
+            config.runtime.scheduler_command_timeout_seconds
+        )
+        job_finder = _call_timeout_aware(
+            make_live_job_finder,
+            campaign_dir=campaign,
+            timeout_seconds=scheduler_timeout,
+        )
+        job_name_accounting_finder = _call_timeout_aware(
+            make_live_job_accounting_finder,
+            timeout_seconds=scheduler_timeout,
+        )
+        job_liveness_checker = _call_timeout_aware(
+            make_live_job_liveness_checker,
+            timeout_seconds=scheduler_timeout,
+        )
         from .daemon.resource_usage import collect_usage
 
         resource_usage_collector = collect_usage
@@ -2458,6 +2588,9 @@ def cmd_start(args: argparse.Namespace) -> int:
         "campaign_dir": campaign,
         "config": config,
         "executor": executor,
+        "scheduler_identity_kind": (
+            "slurm" if effective_mode == "live" else "synthetic"
+        ),
     }
     if sacct_poller is not None:
         daemon_kwargs["sacct_poller"] = sacct_poller
@@ -2507,22 +2640,40 @@ def cmd_start(args: argparse.Namespace) -> int:
 _FEREBUS_JOB_NAME_EXTERNAL_PHASES = frozenset()
 
 
-def _load_active_submission_intents(campaign: Path) -> List[Dict[str, Any]]:
-    intents: List[Dict[str, Any]] = []
-    root = _submission_intent.intent_dir(campaign)
-    if not root.is_dir():
-        return intents
-    for path in sorted(root.glob("*.json")):
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if isinstance(payload, dict) and str(payload.get("status")) in _submission_intent.ACTIVE_STATUSES:
-            intents.append(payload)
-    return intents
+def _load_active_submission_intents(
+    campaign: Path,
+    *,
+    errors: Optional[List[Dict[str, str]]] = None,
+    fail_on_error: bool = False,
+    expected_campaign_uid: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    inventory = _submission_intent.inventory_intents(
+        campaign,
+        expected_campaign_uid=expected_campaign_uid,
+    )
+    invalid = [dict(item) for item in inventory.get("errors", [])]
+    if errors is not None:
+        errors.extend(invalid)
+    if invalid and fail_on_error:
+        raise ValueError(
+            "submission-intent inventory is incomplete: "
+            + "; ".join(
+                str(item.get("path")) + ": " + str(item.get("error"))
+                for item in invalid[:8]
+            )
+        )
+    return [
+        dict(payload)
+        for payload in inventory.get("records", [])
+        if str(payload.get("status")) in _submission_intent.ACTIVE_STATUSES
+    ]
 
 
-def _lookup_active_slurm_job_for_cancel(job_id: str) -> Dict[str, Any]:
+def _lookup_active_slurm_job_for_cancel(
+    job_id: str,
+    *,
+    timeout_seconds: int = 60,
+) -> Dict[str, Any]:
     cmd = [
         "squeue",
         "-j",
@@ -2531,8 +2682,11 @@ def _lookup_active_slurm_job_for_cancel(job_id: str) -> Dict[str, Any]:
         "--format=%i|%T|%j",
     ]
     try:
-        completed = subprocess.run(
+        requested_job_id = validate_parent_job_id(job_id)
+        completed = run_scheduler_command(
+            subprocess.run,
             cmd,
+            timeout_seconds=int(timeout_seconds),
             check=False,
             capture_output=True,
             text=True,
@@ -2570,8 +2724,27 @@ def _lookup_active_slurm_job_for_cancel(job_id: str) -> Dict[str, Any]:
         if not line.strip():
             continue
         parts = line.split("|", 2)
+        if len(parts) != 3:
+            return {
+                "active": False,
+                "inconclusive": True,
+                "rows": rows,
+                "error": "malformed squeue cancellation row",
+            }
+        row_job_id = parts[0].strip()
+        try:
+            row_parent = parse_squeue_job_id(row_job_id)
+        except ValueError as exc:
+            return {"active": False, "inconclusive": True, "rows": rows, "error": str(exc)}
+        if row_parent != requested_job_id:
+            return {
+                "active": False,
+                "inconclusive": True,
+                "rows": rows,
+                "error": "squeue returned a foreign JobID during cancellation",
+            }
         rows.append({
-            "job_id": parts[0].strip() if len(parts) > 0 else "",
+            "job_id": row_job_id,
             "state": parts[1].strip() if len(parts) > 1 else "",
             "job_name": parts[2].strip() if len(parts) > 2 else "",
         })
@@ -2583,10 +2756,13 @@ def _lookup_active_slurm_job_for_cancel(job_id: str) -> Dict[str, Any]:
     }
 
 
-def _run_scancel(job_id: str) -> Tuple[bool, str]:
+def _run_scancel(job_id: str, *, timeout_seconds: int = 60) -> Tuple[bool, str]:
     try:
-        completed = subprocess.run(
-            ["scancel", str(job_id)],
+        canonical_job_id = validate_parent_job_id(job_id)
+        completed = run_scheduler_command(
+            subprocess.run,
+            ["scancel", canonical_job_id],
+            timeout_seconds=int(timeout_seconds),
             check=False,
             capture_output=True,
             text=True,
@@ -2599,6 +2775,73 @@ def _run_scancel(job_id: str) -> Tuple[bool, str]:
     stdout = getattr(completed, "stdout", "") or ""
     message = stderr.strip() or stdout.strip() or "scancel failed"
     return False, message
+
+
+def _confirm_cancelled_slurm_job(
+    job_id: str,
+    *,
+    expected_tasks: Optional[int],
+    submission_kind: str,
+    confirmation_timeout_seconds: int,
+    command_timeout_seconds: int,
+) -> Tuple[bool, str]:
+    from .submit.sacct_poll import JobStatus, aggregate_states, poll_job
+
+    deadline = time.monotonic() + float(confirmation_timeout_seconds)
+    last_reason = "scheduler has not confirmed cancellation"
+    while True:
+        try:
+            observations = poll_job(
+                job_id,
+                timeout_seconds=int(command_timeout_seconds),
+            )
+            summary = aggregate_states(
+                job_id,
+                observations,
+                expected_task_count=expected_tasks,
+                submission_kind=submission_kind,
+            )
+            if summary.is_terminal:
+                if summary.observations and all(
+                    observation.status is JobStatus.CANCELLED
+                    for observation in summary.observations
+                ):
+                    return True, ""
+                states = sorted(
+                    {
+                        str(observation.status.value)
+                        for observation in summary.observations
+                    }
+                )
+                return False, (
+                    "job became terminal without cancellation-derived states: "
+                    + ", ".join(states)
+                )
+            if summary.n_unknown:
+                last_reason = "accounting returned unknown cancellation state"
+            elif summary.n_missing:
+                last_reason = "accounting is missing expected cancellation rows"
+        except Exception as exc:
+            last_reason = type(exc).__name__ + ": " + str(exc)
+        lookup = _call_timeout_aware(
+            _lookup_active_slurm_job_for_cancel,
+            job_id,
+            timeout_seconds=int(command_timeout_seconds),
+        )
+        if lookup.get("inconclusive"):
+            last_reason = "squeue cancellation lookup is inconclusive: " + str(
+                lookup.get("error") or "unknown error"
+            )
+        elif lookup.get("active"):
+            last_reason = "job remains active or completing in squeue"
+        if time.monotonic() >= deadline:
+            return False, (
+                "cancellation confirmation timed out after "
+                + str(int(confirmation_timeout_seconds))
+                + " seconds: "
+                + last_reason
+            )
+        time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
 
 
 def _job_name_matches_expected(rows: Sequence[Dict[str, Any]], expected_names: Sequence[str]) -> bool:
@@ -2620,6 +2863,8 @@ def _collect_stop_cancel_jobs(campaign: Path, state: Any) -> Dict[str, Dict[str,
                 "phases": set(),
                 "expected_job_names": set(),
                 "intent_keys": set(),
+                "expected_tasks": None,
+                "submission_kind": None,
             },
         )
 
@@ -2629,12 +2874,20 @@ def _collect_stop_cancel_jobs(campaign: Path, state: Any) -> Dict[str, Dict[str,
         item = ensure(str(job_id))
         phase_name = str(phase)
         item["phases"].add(phase_name)
+        item["submission_kind"] = _submission_intent.submission_kind_for_phase(
+            phase_name
+        )
         if phase_name not in _FEREBUS_JOB_NAME_EXTERNAL_PHASES:
             item["expected_job_names"].add(
                 live_job_name(state.campaign_uid, phase_name, int(state.iteration))
             )
 
-    for intent in _load_active_submission_intents(campaign):
+    campaign_uid = str(getattr(state, "campaign_uid", "") or "")
+    for intent in _load_active_submission_intents(
+        campaign,
+        fail_on_error=True,
+        expected_campaign_uid=(campaign_uid or None),
+    ):
         job_id = str(intent.get("job_id") or "")
         if not job_id:
             continue
@@ -2646,16 +2899,29 @@ def _collect_stop_cancel_jobs(campaign: Path, state: Any) -> Dict[str, Dict[str,
         expected = str(intent.get("expected_job_name") or "")
         if expected and phase_name not in _FEREBUS_JOB_NAME_EXTERNAL_PHASES:
             item["expected_job_names"].add(expected)
+        item["expected_tasks"] = intent.get("expected_tasks")
+        item["submission_kind"] = str(intent.get("submission_kind"))
 
     return jobs
 
 
-def _cancel_recorded_slurm_jobs(campaign: Path, state: Any) -> Dict[str, Any]:
+def _cancel_recorded_slurm_jobs(
+    campaign: Path,
+    state: Any,
+    *,
+    command_timeout_seconds: int = 60,
+    confirmation_timeout_seconds: int = 120,
+) -> Dict[str, Any]:
     jobs = _collect_stop_cancel_jobs(campaign, state)
     cancelled: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
     failed: List[Dict[str, Any]] = []
-    for intent in _load_active_submission_intents(campaign):
+    campaign_uid = str(getattr(state, "campaign_uid", "") or "")
+    for intent in _load_active_submission_intents(
+        campaign,
+        fail_on_error=True,
+        expected_campaign_uid=(campaign_uid or None),
+    ):
         if str(intent.get("job_id") or ""):
             continue
         phase_name, iteration = _intent_phase_iteration(intent)
@@ -2667,7 +2933,11 @@ def _cancel_recorded_slurm_jobs(campaign: Path, state: Any) -> Dict[str, Any]:
             + str(iteration),
         })
     for job_id, item in sorted(jobs.items()):
-        lookup = _lookup_active_slurm_job_for_cancel(job_id)
+        lookup = _call_timeout_aware(
+            _lookup_active_slurm_job_for_cancel,
+            job_id,
+            timeout_seconds=int(command_timeout_seconds),
+        )
         if bool(lookup.get("inconclusive")):
             failed.append({
                 "job_id": job_id,
@@ -2691,11 +2961,55 @@ def _cancel_recorded_slurm_jobs(campaign: Path, state: Any) -> Dict[str, Any]:
                 "actual_job_names": actual_names,
             })
             continue
-        ok, message = _run_scancel(job_id)
+        expected_tasks = item.get("expected_tasks")
+        if expected_tasks is not None and (
+            isinstance(expected_tasks, bool)
+            or not isinstance(expected_tasks, int)
+            or expected_tasks <= 0
+        ):
+            failed.append({
+                "job_id": job_id,
+                "reason": "submission intent has an invalid expected task count",
+            })
+            continue
+        submission_kind = str(item.get("submission_kind") or "")
+        if submission_kind not in {"scalar", "array"}:
+            failed.append({
+                "job_id": job_id,
+                "reason": "submission kind is unavailable for cancellation confirmation",
+            })
+            continue
+        if submission_kind == "array" and expected_tasks is None:
+            failed.append({
+                "job_id": job_id,
+                "reason": (
+                    "array task cardinality is unavailable; cancellation was not "
+                    "issued because complete terminal confirmation would be impossible"
+                ),
+            })
+            continue
+        ok, message = _call_timeout_aware(
+            _run_scancel,
+            job_id,
+            timeout_seconds=int(command_timeout_seconds),
+        )
         if not ok:
             failed.append({
                 "job_id": job_id,
                 "reason": "scancel failed: " + message,
+            })
+            continue
+        confirmed, confirmation_reason = _confirm_cancelled_slurm_job(
+            job_id,
+            expected_tasks=expected_tasks,
+            submission_kind=submission_kind,
+            confirmation_timeout_seconds=int(confirmation_timeout_seconds),
+            command_timeout_seconds=int(command_timeout_seconds),
+        )
+        if not confirmed:
+            failed.append({
+                "job_id": job_id,
+                "reason": confirmation_reason,
             })
             continue
         phases = sorted(str(phase) for phase in item.get("phases", set()))
@@ -2790,6 +3104,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
         require_campaign_yaml=False,
     )
     paths = _campaign_paths(campaign)
+    command_timeout, confirmation_timeout = _runtime_scheduler_policy(campaign)
     if not paths["state"].exists():
         if bool(getattr(args, "cancel_jobs", False)):
             print(
@@ -2802,7 +3117,19 @@ def cmd_stop(args: argparse.Namespace) -> int:
                 campaign_uid="",
                 iteration=0,
             )
-            cancel_summary = _cancel_recorded_slurm_jobs(campaign, fallback_state)
+            try:
+                cancel_summary = _cancel_recorded_slurm_jobs(
+                    campaign,
+                    fallback_state,
+                    command_timeout_seconds=command_timeout,
+                    confirmation_timeout_seconds=confirmation_timeout,
+                )
+            except Exception as exc:
+                print(
+                    "could not establish complete scheduler ownership: " + str(exc),
+                    file=sys.stderr,
+                )
+                return 10
             _mark_cancelled_intents_without_state(campaign, cancel_summary)
             _journal_cancel_jobs_summary(paths["journal"], cancel_summary)
             _print_cancel_jobs_summary(cancel_summary)
@@ -2824,7 +3151,19 @@ def cmd_stop(args: argparse.Namespace) -> int:
                 campaign_uid="",
                 iteration=0,
             )
-            cancel_summary = _cancel_recorded_slurm_jobs(campaign, fallback_state)
+            try:
+                cancel_summary = _cancel_recorded_slurm_jobs(
+                    campaign,
+                    fallback_state,
+                    command_timeout_seconds=command_timeout,
+                    confirmation_timeout_seconds=confirmation_timeout,
+                )
+            except Exception as exc:
+                print(
+                    "could not establish complete scheduler ownership: " + str(exc),
+                    file=sys.stderr,
+                )
+                return 10
             _mark_cancelled_intents_without_state(campaign, cancel_summary)
             _journal_cancel_jobs_summary(paths["journal"], cancel_summary)
             _print_cancel_jobs_summary(cancel_summary)
@@ -2909,11 +3248,24 @@ def cmd_stop(args: argparse.Namespace) -> int:
         pass
     cancel_summary = None
     if cancel_jobs:
-        cancel_summary = _cancel_recorded_slurm_jobs(campaign, state)
+        try:
+            cancel_summary = _cancel_recorded_slurm_jobs(
+                campaign,
+                state,
+                command_timeout_seconds=command_timeout,
+                confirmation_timeout_seconds=confirmation_timeout,
+            )
+        except Exception as exc:
+            cancel_summary = {
+                "cancelled": [],
+                "skipped": [],
+                "failed": [{"job_id": "unresolved", "reason": str(exc)}],
+            }
+        next_status = "cancelling" if cancel_summary.get("failed") else "requested"
         updated = update_stop_request(
             campaign,
             str(request.get("request_id")),
-            status="requested",
+            status=next_status,
             cancellation_summary=cancel_summary,
         )
         if updated is not None:
@@ -3013,7 +3365,12 @@ def format_recovery_dashboard(campaign_dir: Path) -> str:
     )
 
     lock_status = _probe_daemon_lock(paths["lock"])
-    lease_status = _probe_daemon_lease(paths["lease"])
+    stale_seconds, clock_skew = _runtime_liveness_policy(campaign)
+    lease_status = _probe_daemon_lease(
+        paths["lease"],
+        stale_seconds=stale_seconds,
+        clock_skew_tolerance_seconds=clock_skew,
+    )
     background = _probe_background_daemon(
         paths["background_pid"],
         paths["background_log"],
@@ -3034,7 +3391,8 @@ def format_recovery_dashboard(campaign_dir: Path) -> str:
         )
     )
 
-    intents = _load_active_submission_intents(campaign)
+    intent_errors: List[Dict[str, str]] = []
+    intents = _load_active_submission_intents(campaign, errors=intent_errors)
     intent_summary = str(len(intents))
     if intents:
         sample = [
@@ -3077,6 +3435,19 @@ def format_recovery_dashboard(campaign_dir: Path) -> str:
             ],
         )
     )
+    if intent_errors:
+        lines.extend(
+            _section(
+                "Invalid submission intents",
+                [
+                    (
+                        str(item.get("path")),
+                        str(item.get("error")),
+                    )
+                    for item in intent_errors[:8]
+                ],
+            )
+        )
 
     cfg_path = campaign / "campaign.yaml"
     if not cfg_path.is_file():
@@ -3158,7 +3529,11 @@ def format_recovery_dashboard(campaign_dir: Path) -> str:
     if (
         intents
         or lock_status.get("lock_held")
-        or _lease_is_fresh(lease_status.get("lease_heartbeat"))
+        or _lease_is_fresh(
+            lease_status.get("lease_heartbeat"),
+            stale_seconds=stale_seconds,
+            clock_skew_tolerance_seconds=clock_skew,
+        )
         or background.get("background_pid_alive")
     ):
         recommendation = "stop --cancel-jobs first, then rerun reconcile"
@@ -3174,6 +3549,16 @@ def cmd_status(args: argparse.Namespace) -> int:
         require_campaign_yaml=False,
     )
     paths = _campaign_paths(campaign)
+    try:
+        from .daemon.ariadne_quarantine import inventory_quarantine
+
+        quarantine_status = inventory_quarantine(campaign)
+    except Exception as exc:
+        quarantine_status = {
+            "attempts": [],
+            "errors": [{"path": "", "error": type(exc).__name__ + ": " + str(exc)}],
+            "total_bytes": 0,
+        }
     if not paths["state"].exists():
         payload: Dict[str, Any] = {
             "status_error": "state_missing",
@@ -3182,12 +3567,14 @@ def cmd_status(args: argparse.Namespace) -> int:
             "stop_request_path": str(paths["stop_request"]),
         }
         payload.update(_stop_control_status(campaign))
+        payload["ariadne_retry_quarantine"] = quarantine_status
         payload.update(_missing_state_context(campaign))
         try:
             cfg = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+            payload["campaign_config_status"] = {"ok": True}
             payload["pool_feasibility"] = _pool_feasibility_summary(campaign, cfg)
         except Exception as exc:
-            payload["pool_feasibility"] = {
+            payload["campaign_config_status"] = {
                 "ok": False,
                 "error": type(exc).__name__ + ": " + str(exc),
             }
@@ -3196,33 +3583,39 @@ def cmd_status(args: argparse.Namespace) -> int:
         )
         payload["next_action"] = payload["recommendations"][0]["primary"]
         if bool(getattr(args, "json", False)):
-            print(json.dumps(payload, indent=2, sort_keys=True))
+            print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
         else:
             print(_format_status_unavailable(payload), end="")
             print("no state.json at " + str(paths["state"]), file=sys.stderr)
         return 4
     try:
         state = read_state(paths["state"])
-    except (StateSchemaError, json.JSONDecodeError) as exc:
+    except (StateSchemaError, json.JSONDecodeError, UnicodeError, OSError) as exc:
         payload = {
-            "status_error": "state_schema_invalid",
+            "status_error": (
+                "state_schema_invalid"
+                if isinstance(exc, (StateSchemaError, json.JSONDecodeError))
+                else "state_unreadable"
+            ),
             "state_error": type(exc).__name__ + ": " + str(exc),
             "state_path": str(paths["state"]),
             "campaign_dir": str(campaign),
             "stop_request_path": str(paths["stop_request"]),
         }
         payload.update(_stop_control_status(campaign))
+        payload["ariadne_retry_quarantine"] = quarantine_status
         payload["recommendations"] = recommendation_dicts(
             build_status_recommendations(campaign, payload, paths["journal"])
         )
         payload["next_action"] = payload["recommendations"][0]["primary"]
         if bool(getattr(args, "json", False)):
-            print(json.dumps(payload, indent=2, sort_keys=True))
+            print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
         else:
             print(_format_status_unavailable(payload), end="")
             print("state.json invalid: " + str(exc), file=sys.stderr)
         return 5
     payload = state.to_dict()
+    payload["ariadne_retry_quarantine"] = quarantine_status
     payload["state_path"] = str(paths["state"])
     payload["lock_path"] = str(paths["lock"])
     payload["stop_request_path"] = str(paths["stop_request"])
@@ -3233,9 +3626,23 @@ def cmd_status(args: argparse.Namespace) -> int:
         )
     )
     payload.update(_probe_daemon_lock(paths["lock"]))
-    payload.update(_probe_daemon_lease(paths["lease"]))
+    stale_seconds, clock_skew = _runtime_liveness_policy(campaign)
+    payload.update(
+        _probe_daemon_lease(
+            paths["lease"],
+            stale_seconds=stale_seconds,
+            clock_skew_tolerance_seconds=clock_skew,
+        )
+    )
     payload.update(_probe_background_daemon(paths["background_pid"], paths["background_log"]))
-    payload["active_submission_intents"] = _load_active_submission_intents(campaign)
+    intent_errors: List[Dict[str, str]] = []
+    payload["active_submission_intents"] = _load_active_submission_intents(
+        campaign,
+        errors=intent_errors,
+        expected_campaign_uid=str(state.campaign_uid),
+    )
+    if intent_errors:
+        payload["submission_intent_errors"] = intent_errors
     try:
         from .point_allocation import point_allocation_path, read_point_allocation
 
@@ -3255,19 +3662,27 @@ def cmd_status(args: argparse.Namespace) -> int:
         payload["point_allocation_summary"] = {
             "error": type(exc).__name__ + ": " + str(exc)
         }
-    payload["latest_halt_event"] = _latest_journal_event(paths["journal"], "halt")
+    try:
+        payload["latest_halt_event"] = _latest_journal_event(
+            paths["journal"], "halt"
+        )
+    except Exception as exc:
+        payload["journal_error"] = type(exc).__name__ + ": " + str(exc)
     try:
         if supports_partial_array_recovery(state.phase):
             ledger = read_array_ledger(campaign, state.phase, int(state.iteration))
             if isinstance(ledger, dict):
                 payload["partial_array_recovery"] = compact_array_recovery_summary(ledger)
-    except Exception:
-        pass
+    except Exception as exc:
+        payload["partial_array_recovery_error"] = (
+            type(exc).__name__ + ": " + str(exc)
+        )
     try:
         cfg = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+        payload["campaign_config_status"] = {"ok": True}
         payload["pool_feasibility"] = _pool_feasibility_summary(campaign, cfg)
     except Exception as exc:
-        payload["pool_feasibility"] = {
+        payload["campaign_config_status"] = {
             "ok": False,
             "error": type(exc).__name__ + ": " + str(exc),
         }
@@ -3296,7 +3711,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     )
     payload["next_action"] = payload["recommendations"][0]["primary"]
     if bool(getattr(args, "json", False)):
-        print(json.dumps(payload, indent=2, sort_keys=True))
+        print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
     else:
         print(
             _format_status(
@@ -3309,6 +3724,105 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _state_payload_digest(payload: Mapping[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            dict(payload),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _finish_resume_transaction(
+    campaign: Path,
+    state_path: Path,
+    *,
+    before_state: Optional[CampaignState] = None,
+    after_state: Optional[CampaignState] = None,
+    request_id: Optional[str] = None,
+    operation: Optional[str] = None,
+    archive_status: str = "resumed",
+) -> Tuple[CampaignState, Path]:
+    """Finish a receipt-backed resume state/control transaction idempotently."""
+    from .daemon.stop_control import (
+        archive_and_clear_stop_request,
+        archive_resume_transaction,
+        prepare_resume_transaction,
+        read_resume_transaction,
+        stop_request_history_dir,
+        update_resume_transaction,
+    )
+
+    transaction = read_resume_transaction(campaign)
+    if transaction is None:
+        if before_state is None or after_state is None or operation is None:
+            raise RuntimeError("no resume transaction is available to finish")
+        transaction = prepare_resume_transaction(
+            campaign,
+            before_state=before_state,
+            after_state=after_state,
+            request_id=request_id,
+            operation=operation,
+        )
+    transaction_id = str(transaction["transaction_id"])
+    status = str(transaction["status"])
+    archived_request_path = transaction.get("stop_request_archive_path")
+    transaction_request_id = transaction.get("request_id")
+    if status == "prepared":
+        if transaction_request_id is not None:
+            archived = archive_and_clear_stop_request(
+                campaign,
+                status=str(archive_status),
+                expected_request_id=str(transaction_request_id),
+            )
+            if archived is None:
+                expected = stop_request_history_dir(campaign) / (
+                    str(transaction_request_id) + ".json"
+                )
+                if not expected.is_file() or expected.is_symlink():
+                    raise RuntimeError(
+                        "resume transaction lost its stop-request archive evidence"
+                    )
+                archived = expected
+            archived_request_path = str(archived)
+        transaction = update_resume_transaction(
+            campaign,
+            transaction_id,
+            status="control_archived",
+            stop_request_archive_path=archived_request_path,
+        )
+        status = "control_archived"
+    if status == "control_archived":
+        current_state = read_state(state_path)
+        current_digest = _state_payload_digest(current_state.to_dict())
+        before_digest = str(transaction["before_state_sha256"])
+        after_digest = str(transaction["after_state_sha256"])
+        if current_digest not in {before_digest, after_digest}:
+            raise RuntimeError(
+                "state changed outside the active resume transaction"
+            )
+        target_state = CampaignState.from_dict(dict(transaction["after_state"]))
+        if current_digest != after_digest:
+            write_state(state_path, target_state)
+        transaction = update_resume_transaction(
+            campaign,
+            transaction_id,
+            status="state_written",
+        )
+        status = "state_written"
+    if status != "state_written":
+        raise RuntimeError("resume transaction did not reach state_written")
+    final_state = read_state(state_path)
+    if _state_payload_digest(final_state.to_dict()) != str(
+        transaction["after_state_sha256"]
+    ):
+        raise RuntimeError("resume transaction target state was not persisted")
+    history_path = archive_resume_transaction(campaign, transaction_id)
+    return final_state, history_path
+
+
 def cmd_resume(args: argparse.Namespace) -> int:
     campaign = resolve_campaign_dir(args.campaign_dir)
     paths = _campaign_paths(campaign)
@@ -3319,20 +3833,44 @@ def cmd_resume(args: argparse.Namespace) -> int:
         except (StateSchemaError, json.JSONDecodeError) as exc:
             print("state.json invalid: " + str(exc), file=sys.stderr)
             return 5
-        if state.phase is CampaignPhase.HALTED:
+        lock_status = _probe_daemon_lock(paths["lock"])
+        if lock_status.get("lock_held") is not False:
             print(
-                "campaign is HALTED; run `ichor-al-daemon reconcile --campaign-dir "
-                + str(campaign)
-                + " --apply` if the recovery proposal is safe before resuming",
+                "cannot resume while daemon lock ownership is active or inconclusive",
                 file=sys.stderr,
             )
-            return 6
+            return 7
+        stale_seconds, skew_seconds = _runtime_liveness_policy(campaign)
+        lease_status = _probe_daemon_lease(
+            paths["lease"],
+            stale_seconds=stale_seconds,
+            clock_skew_tolerance_seconds=skew_seconds,
+        )
+        if lease_status.get("lease_fresh") is True:
+            print(
+                "cannot resume while a fresh daemon lease exists",
+                file=sys.stderr,
+            )
+            return 7
         try:
             from .daemon.stop_control import (
                 archive_and_clear_stop_request,
+                read_resume_transaction,
                 read_stop_request,
             )
 
+            pending_resume = read_resume_transaction(campaign)
+            if pending_resume is not None:
+                operation = str(pending_resume.get("operation") or "")
+                archive_status = "cancelled" if "cancel" in operation else "resumed"
+                state, history_path = _finish_resume_transaction(
+                    campaign,
+                    state_path,
+                    archive_status=archive_status,
+                )
+                print(
+                    "completed interrupted resume transaction: " + str(history_path)
+                )
             stop_request = read_stop_request(
                 campaign,
                 expected_campaign_uid=str(state.campaign_uid),
@@ -3344,7 +3882,14 @@ def cmd_resume(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 7
-
+        if state.phase is CampaignPhase.HALTED:
+            print(
+                "campaign is HALTED; run `ichor-al-daemon reconcile --campaign-dir "
+                + str(campaign)
+                + " --apply` if the recovery proposal is safe before resuming",
+                file=sys.stderr,
+            )
+            return 6
         def archive_stop_request(status: str, event_type: str) -> bool:
             nonlocal stop_request
             if stop_request is None:
@@ -3426,13 +3971,39 @@ def cmd_resume(args: argparse.Namespace) -> int:
                 )
                 return 6
             completed_iteration = int(state.iteration)
-            state.phase = CampaignPhase.SEED_SELECT
-            state.iteration = completed_iteration + 1
-            state.max_iterations = configured_max
-            state.shutdown_requested = False
-            state.lifecycle_context = None
-            state.last_completion_receipt = None
-            write_state(state_path, state)
+            target_state = CampaignState.from_dict(state.to_dict())
+            target_state.phase = CampaignPhase.SEED_SELECT
+            target_state.iteration = completed_iteration + 1
+            target_state.max_iterations = configured_max
+            target_state.shutdown_requested = False
+            target_state.lifecycle_context = None
+            target_state.last_completion_receipt = None
+            cancelling_stop = bool(getattr(args, "cancel_stop_request", False))
+            try:
+                state, resume_history = _finish_resume_transaction(
+                    campaign,
+                    state_path,
+                    before_state=state,
+                    after_state=target_state,
+                    request_id=(
+                        None
+                        if stop_request is None
+                        else str(stop_request.get("request_id"))
+                    ),
+                    operation=(
+                        "reopen_completed_cancel_stop"
+                        if cancelling_stop
+                        else "reopen_completed"
+                    ),
+                    archive_status="cancelled" if cancelling_stop else "resumed",
+                )
+                stop_request = None
+            except Exception as exc:
+                print(
+                    "could not complete the resume transaction: " + str(exc),
+                    file=sys.stderr,
+                )
+                return 7
             try:
                 from .daemon.journal import append_event
 
@@ -3443,6 +4014,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
                     next_iteration=int(state.iteration),
                     max_iterations=configured_max,
                     explicit_reopen=True,
+                    resume_transaction_history=str(resume_history),
                 )
             except Exception:
                 pass
@@ -3450,15 +4022,6 @@ def cmd_resume(args: argparse.Namespace) -> int:
                 "reopened completed campaign at SEED_SELECT iteration "
                 + str(int(state.iteration))
             )
-            if not archive_stop_request(
-                "cancelled" if bool(getattr(args, "cancel_stop_request", False)) else "resumed",
-                (
-                    "operator_stop_request_cancelled"
-                    if bool(getattr(args, "cancel_stop_request", False))
-                    else "operator_stop_resumed"
-                ),
-            ):
-                return 7
         if state.shutdown_requested:
             context = state.lifecycle_context or {}
             if context and str(context.get("disposition") or "") != "stopped":
@@ -3468,19 +4031,50 @@ def cmd_resume(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 6
-            state.shutdown_requested = False
-            state.lifecycle_context = None
-            write_state(state_path, state)
-            print("shutdown_requested=false set in " + str(state_path))
-            if not archive_stop_request(
-                "cancelled" if bool(getattr(args, "cancel_stop_request", False)) else "resumed",
-                (
-                    "operator_stop_request_cancelled"
-                    if bool(getattr(args, "cancel_stop_request", False))
-                    else "operator_stop_resumed"
-                ),
-            ):
+            target_state = CampaignState.from_dict(state.to_dict())
+            target_state.shutdown_requested = False
+            target_state.lifecycle_context = None
+            cancelling_stop = bool(getattr(args, "cancel_stop_request", False))
+            try:
+                state, resume_history = _finish_resume_transaction(
+                    campaign,
+                    state_path,
+                    before_state=state,
+                    after_state=target_state,
+                    request_id=(
+                        None
+                        if stop_request is None
+                        else str(stop_request.get("request_id"))
+                    ),
+                    operation=(
+                        "resume_stopped_cancel_stop"
+                        if cancelling_stop
+                        else "resume_stopped"
+                    ),
+                    archive_status="cancelled" if cancelling_stop else "resumed",
+                )
+                stop_request = None
+            except Exception as exc:
+                print(
+                    "could not complete the resume transaction: " + str(exc),
+                    file=sys.stderr,
+                )
                 return 7
+            print("shutdown_requested=false set in " + str(state_path))
+            try:
+                from .daemon.journal import append_event
+
+                append_event(
+                    paths["journal"],
+                    (
+                        "operator_stop_request_cancelled"
+                        if cancelling_stop
+                        else "operator_stop_resumed"
+                    ),
+                    resume_transaction_history=str(resume_history),
+                )
+            except Exception:
+                pass
         elif bool(getattr(args, "cancel_stop_request", False)):
             if not archive_stop_request(
                 "cancelled",
@@ -5127,7 +5721,7 @@ def _cmd_reconcile_scratch(
     }
     if invalid:
         if json_output:
-            print(json.dumps(payload, indent=2, sort_keys=True))
+            print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
         else:
             print("Scratch clean-up is blocked by invalid ownership evidence:", file=sys.stderr)
             for item in invalid:
@@ -5151,7 +5745,7 @@ def _cmd_reconcile_scratch(
             allowed_attempts=allowed,
         )
     if json_output:
-        print(json.dumps(payload, indent=2, sort_keys=True))
+        print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
         return 0
     _print_reconcile_header(
         campaign,
@@ -5182,11 +5776,100 @@ def _cmd_reconcile_scratch(
     return 0
 
 
+def _cmd_reconcile_ariadne_quarantine(
+    campaign: Path,
+    *,
+    apply: bool,
+    json_output: bool,
+    selected_attempts: Sequence[str],
+) -> int:
+    from .daemon.ariadne_quarantine import clean_quarantine, inventory_quarantine
+
+    inventory = inventory_quarantine(campaign)
+    attempts = list(inventory.get("attempts") or [])
+    errors = list(inventory.get("errors") or [])
+    known = {str(item.get("attempt_id")) for item in attempts}
+    requested = {str(value) for value in selected_attempts}
+    missing = sorted(requested - known)
+    if missing:
+        print(
+            "unknown ARIADNE quarantine attempt selector(s): " + ", ".join(missing),
+            file=sys.stderr,
+        )
+        return 2
+    selected = [
+        item
+        for item in attempts
+        if not requested or str(item.get("attempt_id")) in requested
+    ]
+    payload = {
+        "schema_version": 1,
+        "campaign_dir": str(campaign),
+        "attempts": selected,
+        "errors": errors,
+        "total_bytes": int(sum(int(item.get("verified_bytes", 0)) for item in selected)),
+        "removed": [],
+    }
+    if errors:
+        if json_output:
+            print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
+        else:
+            print(
+                "ARIADNE quarantine clean-up is blocked by invalid evidence:",
+                file=sys.stderr,
+            )
+            for item in errors:
+                print(
+                    "  - " + str(item.get("path")) + ": " + str(item.get("error")),
+                    file=sys.stderr,
+                )
+        return 9
+    if apply:
+        payload["removed"] = clean_quarantine(
+            campaign,
+            attempt_ids=(None if not requested else sorted(requested)),
+        )
+    if json_output:
+        print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
+        return 0
+    _print_reconcile_header(
+        campaign,
+        mode="ariadne-quarantine-apply" if apply else "ariadne-quarantine-proposal",
+        result="CLEANED" if apply else "INSPECT",
+    )
+    if selected:
+        print("Retained ARIADNE retry attempts:")
+        for item in selected:
+            print(
+                "  - "
+                + str(item.get("attempt_id"))
+                + " iteration="
+                + str(item.get("iteration"))
+                + " bytes="
+                + str(item.get("verified_bytes"))
+            )
+    else:
+        print("No retained ARIADNE retry attempts were found.")
+    if apply:
+        print("Removed ARIADNE quarantine attempts: " + str(len(payload["removed"])))
+    else:
+        print(
+            "Rerun with --clean-ariadne-quarantine --apply to remove the listed attempts."
+        )
+    return 0
+
+
 def cmd_reconcile(args: argparse.Namespace) -> int:
     clean_scratch = bool(getattr(args, "clean_scratch", False))
+    clean_quarantine = bool(getattr(args, "clean_ariadne_quarantine", False))
     scratch_attempts = [
         str(value)
         for value in (getattr(args, "scratch_attempt", None) or [])
+        if str(value)
+    ]
+    quarantine_attempts = [
+        str(value)
+        for value in (getattr(args, "ariadne_quarantine_attempt", None) or [])
         if str(value)
     ]
     restore_config = bool(getattr(args, "restore_config_from_lock", False))
@@ -5205,6 +5888,19 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     if scratch_attempts and not clean_scratch:
         print("refusing --scratch-attempt without --clean-scratch", file=sys.stderr)
         return 2
+    if quarantine_attempts and not clean_quarantine:
+        print(
+            "refusing --ariadne-quarantine-attempt without "
+            "--clean-ariadne-quarantine",
+            file=sys.stderr,
+        )
+        return 2
+    if clean_scratch and clean_quarantine:
+        print(
+            "refusing to combine --clean-scratch and --clean-ariadne-quarantine",
+            file=sys.stderr,
+        )
+        return 2
     if clean_scratch:
         incompatible = [
             name
@@ -5220,6 +5916,24 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         if incompatible:
             print(
                 "refusing --clean-scratch with " + ", ".join(incompatible),
+                file=sys.stderr,
+            )
+            return 2
+    if clean_quarantine:
+        incompatible = [
+            name
+            for name, enabled in (
+                ("--restore-config-from-lock", restore_config),
+                ("--restore-config-lock-history", restore_lock),
+                ("--archive-staging", archive_staging_requested),
+                ("--force-resubmit-array-tasks", force_resubmit_array),
+                ("--retrain-ferebus", retrain_ferebus),
+            )
+            if enabled
+        ]
+        if incompatible:
+            print(
+                "refusing --clean-ariadne-quarantine with " + ", ".join(incompatible),
                 file=sys.stderr,
             )
             return 2
@@ -5256,6 +5970,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 },
                 indent=2,
                 sort_keys=True,
+                allow_nan=False,
             )
         )
         return 2
@@ -5348,6 +6063,13 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             json_output=bool(getattr(args, "json", False)),
             selected_attempts=scratch_attempts,
         )
+    if clean_quarantine:
+        return _cmd_reconcile_ariadne_quarantine(
+            campaign,
+            apply=bool(getattr(args, "apply", False)),
+            json_output=bool(getattr(args, "json", False)),
+            selected_attempts=quarantine_attempts,
+        )
     if (
         not bool(getattr(args, "apply", False))
         and not bool(getattr(args, "json", False))
@@ -5406,6 +6128,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 ),
                 indent=2,
                 sort_keys=True,
+                allow_nan=False,
             )
         )
         return 0
@@ -6104,18 +6827,25 @@ def cmd_journal(args: argparse.Namespace) -> int:
         print("Timeline")
         print("  no journal yet at " + str(journal_path))
         return 4
-    iterator = read_events(
-        journal_path,
-        since=args.since,
-        event_type=args.event_type or None,
-    )
-    events = list(iterator)
-    last_n = getattr(args, "last_n", None)
-    if last_n is not None:
-        events = events[-int(last_n):] if int(last_n) > 0 else []
+    try:
+        iterator = read_events(
+            journal_path,
+            since=args.since,
+            event_type=args.event_type or None,
+        )
+        last_n = getattr(args, "last_n", None)
+        if last_n is None:
+            events = list(iterator)
+        elif int(last_n) > 0:
+            events = list(deque(iterator, maxlen=int(last_n)))
+        else:
+            events = []
+    except (JournalCorruptionError, ValueError, OSError) as exc:
+        print("journal is corrupt or unreadable: " + str(exc), file=sys.stderr)
+        return 5
     if bool(getattr(args, "json", False)) or bool(getattr(args, "raw", False)):
         for event in events:
-            print(json.dumps(event, sort_keys=True))
+            print(json.dumps(event, sort_keys=True, allow_nan=False))
     else:
         print(
             _format_journal_events(
@@ -6820,7 +7550,7 @@ def cmd_config_check(args: argparse.Namespace) -> int:
             "ok": False,
             "error": type(exc).__name__ + ": " + str(exc),
         }
-    print(json.dumps(summary, indent=2, sort_keys=True))
+    print(json.dumps(summary, indent=2, sort_keys=True, allow_nan=False))
     return 0 if bool(summary["pool_feasibility"].get("ok", False)) else 10
 
 
@@ -7336,7 +8066,7 @@ def cmd_preflight(args: argparse.Namespace) -> int:
             smoke.get("ok", False)
         )
     if bool(getattr(args, "json", False)):
-        print(json.dumps(payload, indent=2, sort_keys=True))
+        print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
     else:
         print(_format_preflight(payload, verbose=bool(getattr(args, "verbose", False))), end="")
     if payload["ready"]:
@@ -7376,7 +8106,7 @@ def cmd_resource_plan(args: argparse.Namespace) -> int:
         ),
     )
     if bool(getattr(args, "json", False)):
-        print(json.dumps(payload, indent=2, sort_keys=True))
+        print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
     else:
         print(format_resource_plan(payload), end="")
     unavailable = any(
@@ -7725,6 +8455,24 @@ Examples:
         metavar="ID",
         help=(
             "Restrict --clean-scratch to a submission identity or attempt ID. "
+            "Repeat this option to select more than one attempt."
+        ),
+    )
+    p_recon.add_argument(
+        "--clean-ariadne-quarantine",
+        action="store_true",
+        help=(
+            "Inventory retained ARIADNE retry outputs and, with --apply, remove "
+            "only attempts with complete, contained ownership manifests."
+        ),
+    )
+    p_recon.add_argument(
+        "--ariadne-quarantine-attempt",
+        action="append",
+        default=None,
+        metavar="ID",
+        help=(
+            "Restrict --clean-ariadne-quarantine to one retained attempt ID. "
             "Repeat this option to select more than one attempt."
         ),
     )

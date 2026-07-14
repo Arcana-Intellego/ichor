@@ -25,6 +25,10 @@ VALID_CONTEXTS = frozenset({"bootstrap", "active"})
 VALID_SPLITS = frozenset({"train", "int_val", "ext_val"})
 
 
+class PointAllocationLockError(RuntimeError):
+    """Raised when allocation ownership cannot be acquired in time."""
+
+
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
@@ -83,13 +87,18 @@ def _allocation_lock(path: Path):
 
     lock_path = Path(path).with_name(POINT_ALLOCATION_LOCK_FILENAME)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with portalocker.Lock(
-        str(lock_path),
-        mode="a",
-        flags=portalocker.LOCK_EX,
-        timeout=30.0,
-    ):
-        yield
+    try:
+        with portalocker.Lock(
+            str(lock_path),
+            mode="a",
+            flags=portalocker.LOCK_EX | portalocker.LOCK_NB,
+            timeout=30.0,
+        ):
+            yield
+    except (portalocker.LockException, portalocker.AlreadyLocked) as exc:
+        raise PointAllocationLockError(
+            "could not acquire point-allocation ownership within 30 seconds"
+        ) from exc
 
 
 def allocation_targets(config: Any, context: str) -> Dict[str, int]:

@@ -26,6 +26,7 @@ from .runtime_environment import (
     normalise_module_list,
 )
 from .state import atomic_write_json, atomic_write_text
+from ..submit.slurm_contracts import parse_sbatch_parsable_output
 
 
 SMOKE_SUCCESS_MARKER = "ICHOR_SUBMITTED_ENVIRONMENT_SMOKE_OK"
@@ -149,6 +150,7 @@ def render_submitted_environment_smoke_script(
         "set -euo pipefail",
         "export LC_ALL=C",
         "export LC_NUMERIC=C",
+        "module purge",
     ]
     lines.extend("module load " + module for module in runtime_modules)
     lines.append(
@@ -170,13 +172,13 @@ def render_submitted_environment_smoke_script(
 
 
 def _parse_job_id(stdout: str) -> str:
-    lines = [line.strip() for line in str(stdout or "").splitlines() if line.strip()]
-    token = lines[0].split(";", 1)[0].strip() if lines else ""
-    if not token.isdigit():
+    try:
+        job_id, _cluster = parse_sbatch_parsable_output(stdout)
+    except ValueError as exc:
         raise SubmittedEnvironmentSmokeError(
-            "sbatch --parsable --wait did not return a numeric job ID"
-        )
-    return token
+            "sbatch --parsable --wait returned invalid output: " + str(exc)
+        ) from exc
+    return job_id
 
 
 def run_submitted_environment_smoke(

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from ..strict_json import strict_json as json
 import math
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ from typing import Any, Dict, Optional, Union
 from .job_names import live_job_name
 from .state import CampaignPhase, atomic_write_json
 from .filesystem import operational_path
+from ..submit.slurm_contracts import validate_parent_job_id
 
 
 INTENT_SCHEMA_VERSION = 2
@@ -33,6 +35,32 @@ _STATUS_TRANSITIONS = {
     "FAILED": frozenset({"FAILED", "SUPERSEDED"}),
     "SUPERSEDED": frozenset({"SUPERSEDED"}),
 }
+
+_SCALAR_SUBMISSION_PHASES = frozenset({
+    "PHASE_A_POLUS",
+    "PHASE_B_POLUS",
+    "INITIAL_FEREBUS",
+    "FEREBUS",
+})
+
+
+def submission_kind_for_phase(phase_name: str) -> str:
+    return "scalar" if str(phase_name) in _SCALAR_SUBMISSION_PHASES else "array"
+
+
+def _validate_job_identity(value: Any, scheduler_identity_kind: str) -> str:
+    text = str(value)
+    if scheduler_identity_kind == "slurm":
+        return validate_parent_job_id(text)
+    if scheduler_identity_kind != "synthetic":
+        raise ValueError("submission intent scheduler identity kind is invalid")
+    if (
+        not text
+        or text.isdigit()
+        or re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,127}", text) is None
+    ):
+        raise ValueError("synthetic scheduler identity is invalid")
+    return text
 
 
 def _now_iso() -> str:
@@ -128,6 +156,11 @@ def _validate_intent_payload(
     status = data.get("status")
     if status not in INTENT_STATUSES:
         raise ValueError("submission intent status is unknown: " + repr(status))
+    scheduler_identity_kind = data.get("scheduler_identity_kind")
+    if scheduler_identity_kind not in {"slurm", "synthetic"}:
+        raise ValueError(
+            "submission intent scheduler_identity_kind must be slurm or synthetic"
+        )
     job_id = data.get("job_id")
     if job_id is not None and (not isinstance(job_id, str) or not job_id):
         raise ValueError("submission intent job_id must be non-empty or null")
@@ -135,6 +168,19 @@ def _validate_intent_payload(
         raise ValueError("submission intent status " + status + " requires job_id")
     if status == "PRE_SUBMIT" and job_id is not None:
         raise ValueError("PRE_SUBMIT intent cannot already contain job_id")
+    if job_id is not None:
+        try:
+            data["job_id"] = _validate_job_identity(
+                job_id, str(scheduler_identity_kind)
+            )
+        except ValueError as exc:
+            raise ValueError("submission intent job_id is invalid") from exc
+    submission_kind = data.get("submission_kind")
+    expected_kind = submission_kind_for_phase(str(phase_name))
+    if submission_kind != expected_kind:
+        raise ValueError(
+            "submission intent submission_kind must be " + expected_kind
+        )
     if status in {"FAILED", "SUPERSEDED"} and (
         not isinstance(data.get("reason"), str) or not str(data.get("reason")).strip()
     ):
@@ -157,6 +203,11 @@ def _validate_intent_payload(
         raise ValueError("submission intent job_ids_seen must be a list of job IDs")
     if len(job_ids_seen) != len(set(job_ids_seen)):
         raise ValueError("submission intent job_ids_seen contains duplicates")
+    for seen_job_id in job_ids_seen:
+        try:
+            _validate_job_identity(seen_job_id, str(scheduler_identity_kind))
+        except ValueError as exc:
+            raise ValueError("submission intent job_ids_seen contains an invalid JobID") from exc
     if job_id is not None and job_id not in job_ids_seen:
         raise ValueError("submission intent job_id is absent from job_ids_seen")
     decision_contract = data.get("decision_contract")
@@ -275,6 +326,43 @@ def load_active_intent(
     return None
 
 
+def inventory_intents(
+    campaign_dir: Union[str, Path],
+    *,
+    expected_campaign_uid: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Read every current intent without silently dropping malformed ownership."""
+    root = intent_dir(campaign_dir)
+    records = []
+    errors = []
+    if not root.is_dir():
+        return {"records": records, "errors": errors}
+    pattern = re.compile(r"^(.+)-([0-9]{6})\.json$")
+    for path in sorted(root.glob("*.json")):
+        match = pattern.fullmatch(path.name)
+        if match is None:
+            errors.append({"path": str(path), "error": "invalid intent filename"})
+            continue
+        phase_name = match.group(1)
+        iteration = int(match.group(2))
+        try:
+            payload = load_intent(
+                campaign_dir,
+                phase_name,
+                iteration,
+                expected_campaign_uid=expected_campaign_uid,
+            )
+            if payload is None:
+                raise ValueError("intent disappeared during inventory")
+            records.append(payload)
+        except Exception as exc:
+            errors.append({
+                "path": str(path),
+                "error": type(exc).__name__ + ": " + str(exc),
+            })
+    return {"records": records, "errors": errors}
+
+
 def _write_payload(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
     path.parent.mkdir(parents=True, exist_ok=True)
     now = _now_iso()
@@ -293,6 +381,7 @@ def write_pre_submit_intent(
     replacement_round: int = 0,
     expected_tasks: Optional[int] = None,
     decision_contract: Optional[Dict[str, Any]] = None,
+    scheduler_identity_kind: str = "slurm",
 ) -> Dict[str, Any]:
     if not isinstance(campaign_uid, str) or not campaign_uid:
         raise ValueError("submission intent campaign_uid must be a non-empty string")
@@ -360,6 +449,8 @@ def write_pre_submit_intent(
             attempt_id=attempt_id,
         ),
         "status": "PRE_SUBMIT",
+        "submission_kind": submission_kind_for_phase(phase_name),
+        "scheduler_identity_kind": str(scheduler_identity_kind),
         "job_id": None,
         "created_iso": _now_iso(),
     }
@@ -440,12 +531,15 @@ def update_intent_status(
     if not isinstance(lifecycle, dict):
         lifecycle = {}
     if job_id is not None:
-        data["job_id"] = str(job_id)
+        data["job_id"] = _validate_job_identity(
+            job_id,
+            str(data.get("scheduler_identity_kind")),
+        )
         seen = data.get("job_ids_seen", [])
         if not isinstance(seen, list):
             seen = []
-        if str(job_id) not in [str(x) for x in seen]:
-            seen.append(str(job_id))
+        if str(data["job_id"]) not in [str(x) for x in seen]:
+            seen.append(str(data["job_id"]))
         data["job_ids_seen"] = seen
     if reason is not None:
         data["reason"] = str(reason)
@@ -474,7 +568,10 @@ def update_intent_status(
                     minimum=1,
                 )
     if job_ids_seen is not None:
-        data["job_ids_seen"] = [str(x) for x in list(job_ids_seen)]
+        data["job_ids_seen"] = [
+            _validate_job_identity(x, str(data.get("scheduler_identity_kind")))
+            for x in list(job_ids_seen)
+        ]
     if completion_receipt is not None:
         data["completion_receipt"] = dict(completion_receipt)
     if new_status == "SUBMITTED":

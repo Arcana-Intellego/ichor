@@ -25,6 +25,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from .slurm_contracts import (
+    parse_job_row_id,
+    parse_squeue_job_id,
+    run_scheduler_command,
+    validate_parent_job_id,
+)
+
 
 __all__ = [
     "JobStatus",
@@ -57,6 +64,13 @@ class JobStatus(str, Enum):
     RESIZING = "RESIZING"
     STAGE_OUT = "STAGE_OUT"
     SUSPENDED = "SUSPENDED"
+    EXPEDITING = "EXPEDITING"
+    POWER_UP_NODE = "POWER_UP_NODE"
+    REQUEUE_FED = "REQUEUE_FED"
+    REQUEUE_HOLD = "REQUEUE_HOLD"
+    RESV_DEL_HOLD = "RESV_DEL_HOLD"
+    SIGNALING = "SIGNALING"
+    UPDATE_DB = "UPDATE_DB"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     TIMEOUT = "TIMEOUT"
@@ -69,12 +83,18 @@ class JobStatus(str, Enum):
     REVOKED = "REVOKED"
     SPECIAL_EXIT = "SPECIAL_EXIT"
     STOPPED = "STOPPED"
+    LAUNCH_FAILED = "LAUNCH_FAILED"
+    RECONFIG_FAIL = "RECONFIG_FAIL"
     UNKNOWN = "UNKNOWN"
 
     @classmethod
     def from_sacct(cls, raw: str) -> "JobStatus":
         #sacct often emits "CANCELLED+" or "CANCELLED by 12345".
-        token = raw.strip().split()[0].rstrip("+").upper() if raw and raw.strip() else ""
+        token = raw.strip().split()[0].upper() if raw and raw.strip() else ""
+        if token == "CANCELLED+":
+            token = "CANCELLED"
+        elif token.endswith("+"):
+            return cls.UNKNOWN
         try:
             return cls(token)
         except ValueError:
@@ -90,6 +110,15 @@ NON_TERMINAL_STATES = frozenset({
     JobStatus.RESIZING,
     JobStatus.STAGE_OUT,
     JobStatus.SUSPENDED,
+    JobStatus.EXPEDITING,
+    JobStatus.POWER_UP_NODE,
+    JobStatus.REQUEUE_FED,
+    JobStatus.REQUEUE_HOLD,
+    JobStatus.RESV_DEL_HOLD,
+    JobStatus.SIGNALING,
+    JobStatus.UPDATE_DB,
+    JobStatus.SPECIAL_EXIT,
+    JobStatus.STOPPED,
 })
 
 TERMINAL_STATES = frozenset({
@@ -103,8 +132,8 @@ TERMINAL_STATES = frozenset({
     JobStatus.BOOT_FAIL,
     JobStatus.DEADLINE,
     JobStatus.REVOKED,
-    JobStatus.SPECIAL_EXIT,
-    JobStatus.STOPPED,
+    JobStatus.LAUNCH_FAILED,
+    JobStatus.RECONFIG_FAIL,
 })
 
 SUCCESS_STATES = frozenset({JobStatus.COMPLETED})
@@ -123,6 +152,8 @@ class JobObservation:
     status: JobStatus
     exit_code: Optional[Tuple[int, int]]  #(returncode, signal)
     elapsed_seconds: Optional[int]
+    raw_status: Optional[str] = None
+    parse_error: Optional[str] = None
 
     @property
     def is_terminal(self) -> bool:
@@ -156,6 +187,7 @@ class ArrayJobSummary:
     failure_indices: List[int] = field(default_factory=list)
     conflicting_task_indices: List[int] = field(default_factory=list)
     out_of_range_task_indices: List[int] = field(default_factory=list)
+    malformed_job_ids: List[str] = field(default_factory=list)
 
     @property
     def is_terminal(self) -> bool:
@@ -221,12 +253,12 @@ def _parse_exit_code(text: str) -> Optional[Tuple[int, int]]:
     if not text:
         return None
     parts = text.split(":")
-    try:
-        ret = int(parts[0])
-        sig = int(parts[1]) if len(parts) > 1 else 0
-        return (ret, sig)
-    except ValueError:
+    if len(parts) != 2 or any(not part.isdigit() for part in parts):
         return None
+    ret, sig = int(parts[0]), int(parts[1])
+    if ret > 255 or sig > 255:
+        return None
+    return (ret, sig)
 
 
 def parse_sacct_output(stdout: str) -> List[JobObservation]:
@@ -242,16 +274,31 @@ def parse_sacct_output(stdout: str) -> List[JobObservation]:
         if not line.strip():
             continue
         parts = line.split("|")
-        if len(parts) < 4:
+        if len(parts) != 4:
             continue
         job_id, state, exit_code, elapsed = parts[0].strip(), parts[1], parts[2], parts[3]
         if not job_id:
             continue
+        status = JobStatus.from_sacct(state)
+        parsed_exit = _parse_exit_code(exit_code)
+        parse_errors: List[str] = []
+        try:
+            parse_job_row_id(job_id)
+        except ValueError as exc:
+            parse_errors.append(str(exc))
+        if status in TERMINAL_STATES and parsed_exit is None:
+            parse_errors.append("terminal Slurm row has malformed ExitCode")
+        if status is JobStatus.UNKNOWN:
+            parse_errors.append("unrecognised or truncated Slurm state " + repr(state.strip()))
+        if parse_errors:
+            status = JobStatus.UNKNOWN
         observations.append(JobObservation(
             job_id=job_id,
-            status=JobStatus.from_sacct(state),
-            exit_code=_parse_exit_code(exit_code),
+            status=status,
+            exit_code=parsed_exit,
             elapsed_seconds=_parse_elapsed(elapsed),
+            raw_status=state.strip(),
+            parse_error="; ".join(parse_errors) or None,
         ))
     return observations
 
@@ -260,26 +307,55 @@ def aggregate_states(
     parent_job_id: str,
     observations: Sequence[JobObservation],
     expected_task_count: Optional[int] = None,
+    *,
+    submission_kind: Optional[str] = None,
+    strict_parent_job_id: bool = True,
 ) -> ArrayJobSummary:
     """Collapse per-task observations into one summary.
 
     Task rows have job_id like '<parent>_<task_index>'. We pick out tasks
     belonging to 'parent_job_id' and count terminal vs non-terminal states.
     """
-    expected = None if expected_task_count is None else max(0, int(expected_task_count))
-    parent = str(parent_job_id)
+    if expected_task_count is not None and (
+        isinstance(expected_task_count, bool)
+        or not isinstance(expected_task_count, int)
+        or expected_task_count <= 0
+    ):
+        raise ValueError("expected_task_count must be an exact positive integer")
+    expected = expected_task_count
+    if strict_parent_job_id:
+        parent = validate_parent_job_id(parent_job_id)
+    else:
+        parent = str(parent_job_id)
+        if not parent:
+            raise ValueError("synthetic parent job identity must be non-empty")
     prefix = parent + "_"
     parent_rows = [o for o in observations if o.job_id == parent]
     saw_array_row = any(o.job_id.startswith(prefix) for o in observations)
     grouped: Dict[int, List[JobObservation]] = {}
     out_of_range: List[int] = []
+    malformed_job_ids: List[str] = []
     for observation in observations:
-        if not observation.job_id.startswith(prefix):
+        try:
+            if strict_parent_job_id:
+                row_parent, task_index, step = parse_job_row_id(observation.job_id)
+            else:
+                row_id = str(observation.job_id)
+                if row_id == parent:
+                    row_parent, task_index, step = parent, None, None
+                elif row_id.startswith(prefix) and row_id[len(prefix):].isdigit():
+                    row_parent = parent
+                    task_index = int(row_id[len(prefix):])
+                    step = None
+                else:
+                    raise ValueError("synthetic accounting row identity mismatch")
+        except ValueError:
+            if str(observation.job_id).startswith(parent):
+                malformed_job_ids.append(str(observation.job_id))
             continue
-        suffix = observation.job_id[len(prefix):]
-        if not suffix.isdigit():
+        if row_parent != parent or step is not None or task_index is None:
             continue
-        task_id = int(suffix)
+        task_id = int(task_index)
         if expected is not None and not 0 <= task_id < expected:
             out_of_range.append(task_id)
             continue
@@ -319,7 +395,24 @@ def aggregate_states(
 
     # A non-array job is represented by its parent allocation row. For an
     # array, parent summaries are never allowed to stand in for logical tasks.
-    use_task_rows = bool(grouped) or saw_array_row or bool(expected is not None and expected > 1)
+    if submission_kind not in {None, "scalar", "array"}:
+        raise ValueError("submission_kind must be scalar, array, or null")
+    synthetic_single_parent = bool(
+        not strict_parent_job_id
+        and submission_kind == "array"
+        and expected in {None, 1}
+        and parent_rows
+        and not grouped
+    )
+    use_task_rows = (
+        (
+            submission_kind == "array"
+            and not synthetic_single_parent
+        )
+        or bool(grouped)
+        or saw_array_row
+        or bool(expected is not None and expected > 1)
+    )
     task_obs = collapsed if use_task_rows else list(parent_rows[:1])
     observed_count = len(collapsed) if use_task_rows else len(task_obs)
     missing = 0
@@ -331,6 +424,7 @@ def aggregate_states(
     n_unknown = (
         sum(1 for o in task_obs if o.status == JobStatus.UNKNOWN)
         + len(unique_out_of_range)
+        + len(malformed_job_ids)
     )
     n_pending = sum(1 for o in task_obs if not o.is_terminal) + missing
     failure_indices: List[int] = []
@@ -355,6 +449,7 @@ def aggregate_states(
         failure_indices=sorted(failure_indices),
         conflicting_task_indices=sorted(conflicts),
         out_of_range_task_indices=unique_out_of_range,
+        malformed_job_ids=sorted(set(malformed_job_ids)),
     )
 
 
@@ -364,6 +459,7 @@ def poll_job(
     *,
     sacct_runner: Optional[Callable[..., Any]] = None,
     extra_args: Sequence[str] = (),
+    timeout_seconds: int = 60,
 ) -> List[JobObservation]:
     """Run 'sacct -j <id> ...' and return the parsed observations.
 
@@ -376,10 +472,20 @@ def poll_job(
     cmd = [
         "sacct",
         "-j", str(job_id),
-        "--format=JobID,State,ExitCode,Elapsed",
-        "-X", "-P", "-n",
+        "--format=JobIDRaw,State%40,ExitCode,ElapsedRaw",
+        "--array", "-X", "-P", "-n",
     ] + list(extra_args)
-    completed = sacct_runner(cmd, check=False, capture_output=True, text=True)
+    try:
+        completed = run_scheduler_command(
+            sacct_runner,
+            cmd,
+            timeout_seconds=int(timeout_seconds),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("sacct command timed out") from exc
     return_code = int(getattr(completed, "returncode", 1))
     if return_code != 0:
         stderr = getattr(completed, "stderr", "") or ""
@@ -403,6 +509,7 @@ def find_active_job_by_id_detailed(
     job_id: str,
     *,
     squeue_runner: Optional[Callable[..., Any]] = None,
+    timeout_seconds: int = 60,
 ) -> JobQueueLookup:
     """Return whether ``squeue`` still shows a Slurm job or array as active.
 
@@ -420,7 +527,15 @@ def find_active_job_by_id_detailed(
         "--format=%i|%T",
     ]
     try:
-        completed = squeue_runner(cmd, check=False, capture_output=True, text=True)
+        requested_parent = validate_parent_job_id(job_id)
+        completed = run_scheduler_command(
+            squeue_runner,
+            cmd,
+            timeout_seconds=int(timeout_seconds),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
     except Exception as exc:
         return JobQueueLookup(
             active=False,
@@ -443,9 +558,22 @@ def find_active_job_by_id_detailed(
         if not line.strip():
             continue
         parts = line.split("|", 1)
+        if len(parts) != 2:
+            return JobQueueLookup(active=False, inconclusive=True, rows=rows, error="malformed squeue row")
         jid = parts[0].strip()
         if not jid:
             continue
+        try:
+            row_parent = parse_squeue_job_id(jid)
+        except ValueError as exc:
+            return JobQueueLookup(active=False, inconclusive=True, rows=rows, error=str(exc))
+        if row_parent != requested_parent:
+            return JobQueueLookup(
+                active=False,
+                inconclusive=True,
+                rows=rows + [(jid, parts[1].strip())],
+                error="squeue returned a foreign JobID for " + requested_parent,
+            )
         state = parts[1].strip() if len(parts) > 1 else ""
         rows.append((jid, state))
     return JobQueueLookup(active=bool(rows), rows=rows)
@@ -487,6 +615,7 @@ def find_active_job_by_name_detailed(
     name: str,
     *,
     squeue_runner: Optional[Callable[..., Any]] = None,
+    timeout_seconds: int = 60,
 ) -> JobNameLookup:
     """Find an active Slurm job by name using ``squeue``.
 
@@ -502,7 +631,14 @@ def find_active_job_by_name_detailed(
         "--format=%i|%T|%j",
     ]
     try:
-        completed = squeue_runner(cmd, check=False, capture_output=True, text=True)
+        completed = run_scheduler_command(
+            squeue_runner,
+            cmd,
+            timeout_seconds=int(timeout_seconds),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
     except Exception as exc:
         return JobNameLookup(
             None,
@@ -528,10 +664,14 @@ def find_active_job_by_name_detailed(
         job_name = parts[2].strip() if len(parts) > 2 else ""
         if not job_id:
             continue
+        try:
+            base_id = parse_squeue_job_id(job_id)
+        except ValueError as exc:
+            return JobNameLookup(None, inconclusive=True, rows=rows, error=str(exc))
         if job_name and job_name != str(name):
             continue
         rows.append((job_id, state))
-        active_ids.add(_base_allocation_id(job_id))
+        active_ids.add(base_id)
     if not active_ids:
         return JobNameLookup(None, inconclusive=False, rows=rows)
     if len(active_ids) > 1:
@@ -552,16 +692,25 @@ def find_accounted_job_by_name_detailed(
     sacct_runner: Optional[Callable[..., Any]] = None,
     squeue_runner: Optional[Callable[..., Any]] = None,
     use_squeue_fallback: bool = False,
+    submission_kind: Optional[str] = None,
+    timeout_seconds: int = 60,
 ) -> JobNameAccountingLookup:
     """Return active or terminal accounting evidence for one expected job name."""
     if sacct_runner is None:
         sacct_runner = subprocess.run
     cmd = [
         "sacct", "--name", str(name),
-        "--format=JobID,State,ExitCode,Elapsed", "-X", "-P", "-n",
+        "--format=JobIDRaw,State%40,ExitCode,ElapsedRaw", "--array", "-X", "-P", "-n",
     ]
     try:
-        completed = sacct_runner(cmd, check=False, capture_output=True, text=True)
+        completed = run_scheduler_command(
+            sacct_runner,
+            cmd,
+            timeout_seconds=int(timeout_seconds),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
     except Exception as exc:
         return JobNameAccountingLookup(
             None,
@@ -584,6 +733,7 @@ def find_accounted_job_by_name_detailed(
             active = find_active_job_by_name_detailed(
                 name,
                 squeue_runner=squeue_runner,
+                timeout_seconds=int(timeout_seconds),
             )
             if active.job_id:
                 return JobNameAccountingLookup(
@@ -612,6 +762,7 @@ def find_accounted_job_by_name_detailed(
         job_id,
         observations,
         expected_task_count=expected_task_count,
+        submission_kind=submission_kind,
     )
     if use_squeue_fallback and (
         expected_task_count is None or int(summary.n_missing) > 0
@@ -619,6 +770,7 @@ def find_accounted_job_by_name_detailed(
         active = find_active_job_by_name_detailed(
             name,
             squeue_runner=squeue_runner,
+            timeout_seconds=int(timeout_seconds),
         )
         if active.job_id:
             return JobNameAccountingLookup(
@@ -686,6 +838,7 @@ def find_running_job_by_name_detailed(
     sacct_runner: Optional[Callable[..., Any]] = None,
     squeue_runner: Optional[Callable[..., Any]] = None,
     use_squeue_fallback: bool = False,
+    timeout_seconds: int = 60,
 ) -> JobNameLookup:
     """Look for a still-running (or queued) SLURM job with this --job-name and return its JobID,
     or None.
@@ -701,10 +854,17 @@ def find_running_job_by_name_detailed(
         sacct_runner = subprocess.run
     cmd = [
         "sacct", "--name", str(name),
-        "--format=JobID,State", "-X", "-P", "-n",
+        "--format=JobIDRaw,State%40", "--array", "-X", "-P", "-n",
     ]
     try:
-        completed = sacct_runner(cmd, check=False, capture_output=True, text=True)
+        completed = run_scheduler_command(
+            sacct_runner,
+            cmd,
+            timeout_seconds=int(timeout_seconds),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
     except Exception as exc:
         return JobNameLookup(None, inconclusive=True, error=type(exc).__name__ + ": " + str(exc))
     if int(getattr(completed, "returncode", 1)) != 0:
@@ -740,6 +900,7 @@ def find_running_job_by_name_detailed(
             fallback = find_active_job_by_name_detailed(
                 name,
                 squeue_runner=squeue_runner,
+                timeout_seconds=int(timeout_seconds),
             )
             if fallback.job_id or fallback.inconclusive:
                 return fallback
@@ -761,10 +922,12 @@ def find_running_job_by_name(
     sacct_runner: Optional[Callable[..., Any]] = None,
     squeue_runner: Optional[Callable[..., Any]] = None,
     use_squeue_fallback: bool = False,
+    timeout_seconds: int = 60,
 ) -> Optional[str]:
     return find_running_job_by_name_detailed(
         name,
         sacct_runner=sacct_runner,
         squeue_runner=squeue_runner,
         use_squeue_fallback=use_squeue_fallback,
+        timeout_seconds=int(timeout_seconds),
     ).job_id

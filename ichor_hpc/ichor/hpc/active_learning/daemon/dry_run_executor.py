@@ -40,7 +40,7 @@ from ..config import CampaignConfig
 from ..versioning.provenance import (
     PROVENANCE_FILENAME,
     append_recent_seeds,
-    append_to_index,
+    upsert_index_records,
     enrich_with_anti_overlap,
     enrich_with_ariadne,
     enrich_with_error_calibration_input,
@@ -123,6 +123,7 @@ class DryRunPhaseExecutor:
     reference_data_dir_name: str = QM_REFERENCE_DATA_DIRNAME
     models_dir_name: str = TRAINED_MODELS_DIRNAME
     strict_completion_receipt_evidence: bool = True
+    scheduler_identity_kind: str = "synthetic"
     scripts_dir: Path = field(init=False)
     artefact_log: List[str] = field(default_factory=list)
 
@@ -1452,15 +1453,19 @@ class DryRunPhaseExecutor:
             ) from exc
         ensure_index(self.campaign_dir)
         committed_iter_dir = v.iteration_path(target_version)
-        for pdir_name in committed_pointdirs:
-            pdir = committed_iter_dir / pdir_name
-            seed_frame_id = self._read_seed_frame_id_from_pointdir(pdir)
-            append_to_index(
-                self.campaign_dir,
-                iteration=int(target_version),
-                pointdir_name=pdir_name,
-                seed_frame_id=seed_frame_id,
-            )
+        upsert_index_records(
+            self.campaign_dir,
+            records=[
+                {
+                    "iteration": int(target_version),
+                    "pointdir_name": pdir_name,
+                    "seed_frame_id": self._read_seed_frame_id_from_pointdir(
+                        committed_iter_dir / pdir_name
+                    ),
+                }
+                for pdir_name in committed_pointdirs
+            ],
+        )
         self._journal_event(
             "reference_data_committed",
             iteration=int(state.iteration),
@@ -2494,7 +2499,16 @@ class DryRunPhaseExecutor:
             from .filesystem import operational_path
 
             journal_path = operational_path(self.campaign_dir, "journal.ndjson")
-            append_event(journal_path, event_type, **payload)
+            append_event(
+                journal_path,
+                event_type,
+                max_bytes=int(self.config.runtime.journal_max_bytes),
+                retained_files=int(self.config.runtime.journal_retained_files),
+                lock_timeout_seconds=int(
+                    self.config.runtime.ledger_lock_timeout_seconds
+                ),
+                **payload,
+            )
         except Exception:
             pass
 

@@ -14,6 +14,7 @@ from ichor.hpc.active_learning.daemon.state import (
     write_state,
 )
 from ichor.hpc.active_learning.daemon.stop_control import (
+    STOP_REQUEST_SCHEMA_VERSION,
     StopControlError,
     build_stop_request,
     install_stop_request,
@@ -93,7 +94,10 @@ def test_malformed_stop_request_fails_closed(tmp_path):
     daemon = _daemon(tmp_path)
     path = stop_request_path(daemon.campaign_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
+    path.write_text(
+        json.dumps({"schema_version": STOP_REQUEST_SCHEMA_VERSION}),
+        encoding="utf-8",
+    )
 
     with pytest.raises(StopControlError, match="request_id"):
         read_stop_request(daemon.campaign_dir)

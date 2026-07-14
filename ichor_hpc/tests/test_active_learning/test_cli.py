@@ -703,7 +703,7 @@ def test_recovery_dashboard_reports_active_intents(tmp_path):
 
 
 def test_live_job_name_rejects_control_characters_and_caps_length():
-    phase = CampaignPhase.INITIAL_GAUSSIAN.value
+    phase = CampaignPhase.PHASE_A_POLUS.value
     with pytest.raises(ValueError, match="unsafe Slurm job name"):
         live_job_name("bad\nuid", phase, 0)
 
@@ -1428,7 +1428,7 @@ def test_cli_stop_cancel_jobs_records_cancellation_without_rewriting_state(
     state = fresh_campaign_state()
     state.campaign_uid = "abc123def456-uid"
     state.iteration = 0
-    phase = CampaignPhase.INITIAL_GAUSSIAN.value
+    phase = CampaignPhase.PHASE_A_POLUS.value
     state.pending_jobs[phase] = "123"
     write_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME, state)
     expected_name = live_job_name(state.campaign_uid, phase, 0)
@@ -1447,6 +1447,11 @@ def test_cli_stop_cancel_jobs_records_cancellation_without_rewriting_state(
         cli_mod,
         "_run_scancel",
         lambda job_id: (cancelled.append(str(job_id)) or (True, "")),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_confirm_cancelled_slurm_job",
+        lambda *args, **kwargs: (True, ""),
     )
 
     rc = main(["stop", "--campaign-dir", str(campaign), "--cancel-jobs"])
@@ -1483,7 +1488,7 @@ def test_cli_stop_cancel_jobs_records_ferebus_intent_for_daemon_cleanup(
         CampaignPhase.INITIAL_FEREBUS.value,
         0,
         "456",
-        expected_tasks=12,
+        expected_tasks=1,
     )
     expected_name = submission_intent.load_intent(
         campaign,
@@ -1505,6 +1510,11 @@ def test_cli_stop_cancel_jobs_records_ferebus_intent_for_daemon_cleanup(
         cli_mod,
         "_run_scancel",
         lambda job_id: (cancelled.append(str(job_id)) or (True, "")),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_confirm_cancelled_slurm_job",
+        lambda *args, **kwargs: (True, ""),
     )
 
     rc = main(["stop", "--campaign-dir", str(campaign), "--cancel-jobs"])
@@ -1532,7 +1542,7 @@ def test_cli_stop_cancel_jobs_uses_intents_when_state_missing(
         phase_name=phase,
         iteration=0,
     )
-    submission_intent.mark_submitted(campaign, phase, 0, "999")
+    submission_intent.mark_submitted(campaign, phase, 0, "999", expected_tasks=1)
     expected_name = submission_intent.load_intent(
         campaign,
         phase,
@@ -1553,6 +1563,11 @@ def test_cli_stop_cancel_jobs_uses_intents_when_state_missing(
         cli_mod,
         "_run_scancel",
         lambda job_id: (cancelled.append(str(job_id)) or (True, "")),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_confirm_cancelled_slurm_job",
+        lambda *args, **kwargs: (True, ""),
     )
 
     rc = main(["stop", "--campaign-dir", str(campaign), "--cancel-jobs"])
@@ -1582,7 +1597,7 @@ def test_cli_stop_cancel_jobs_uses_intents_when_state_corrupt(
         phase_name=phase,
         iteration=0,
     )
-    submission_intent.mark_submitted(campaign, phase, 0, "1001")
+    submission_intent.mark_submitted(campaign, phase, 0, "1001", expected_tasks=1)
     expected_name = submission_intent.load_intent(
         campaign,
         phase,
@@ -1603,6 +1618,11 @@ def test_cli_stop_cancel_jobs_uses_intents_when_state_corrupt(
         cli_mod,
         "_run_scancel",
         lambda job_id: (cancelled.append(str(job_id)) or (True, "")),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_confirm_cancelled_slurm_job",
+        lambda *args, **kwargs: (True, ""),
     )
 
     rc = main(["stop", "--campaign-dir", str(campaign), "--cancel-jobs"])
@@ -2227,7 +2247,7 @@ def test_cli_journal_verbose_prints_event_details(tmp_path, capsys):
         iteration=0,
         job_id="123",
         expected_tasks=10,
-        ts="not-a-real-timestamp",
+        ts="2026-06-27T14:42:55+00:00",
     )
 
     rc = main(["journal", "--campaign-dir", str(campaign), "--verbose"])
@@ -2241,7 +2261,7 @@ def test_cli_journal_verbose_prints_event_details(tmp_path, capsys):
     assert len(lines) == 2
     assert "raw=sbatch" in lines[1]
     assert "INITIAL_AIMALL" in out
-    assert "not-a-real-timestamp" in out
+    assert "2026-06-27 14:42:55" in out
     assert "iter=0" in out
     assert "job=123" in out
     assert "T/C/R/P=10/0/-/-" in out

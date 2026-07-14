@@ -1050,15 +1050,25 @@ def propose_recovery(
     last_halt_event = None
     journal_path = data / "journal.ndjson"
     if journal_path.exists():
-        for event in iter_events(journal_path):
-            phase_hint = _journal_phase_hint(event)
-            if phase_hint:
-                last_phase = str(phase_hint["phase"])
-                last_phase_event = str(phase_hint.get("event") or "")
-                last_phase_retryable = bool(phase_hint.get("retryable", False))
-                last_iter = event.get("iteration", last_iter)
-            if str(event.get("event") or "") == "halt":
-                last_halt_event = dict(event)
+        try:
+            for event in iter_events(journal_path):
+                phase_hint = _journal_phase_hint(event)
+                if phase_hint:
+                    last_phase = str(phase_hint["phase"])
+                    last_phase_event = str(phase_hint.get("event") or "")
+                    last_phase_retryable = bool(phase_hint.get("retryable", False))
+                    last_iter = event.get("iteration", last_iter)
+                if str(event.get("event") or "") == "halt":
+                    last_halt_event = dict(event)
+        except Exception as exc:
+            journal_problem = (
+                "journal is corrupt or unreadable: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)
+            )
+            notes.append(journal_problem)
+            unsafe_reasons.append(journal_problem)
     # Bootstrap is the only sampling transaction that uses iteration zero.
     # A stale active-loop state must never redirect recovery away from it.
     bootstrap_iteration = 0

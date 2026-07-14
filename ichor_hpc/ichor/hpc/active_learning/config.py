@@ -1647,6 +1647,15 @@ class CampaignConfig:
             "runtime.clock_skew_tolerance_seconds",
             self.runtime.clock_skew_tolerance_seconds,
         )
+        heartbeat_failure_window = (
+            int(self.runtime.lease_heartbeat_seconds)
+            * int(self.runtime.lease_heartbeat_failure_max)
+        )
+        if heartbeat_failure_window >= int(self.runtime.lease_stale_seconds):
+            raise ConfigValidationError(
+                "runtime lease heartbeat failure window must be shorter than "
+                "runtime.lease_stale_seconds"
+            )
         if not isinstance(self.resources.fail_on_memory_estimate_exceeds_request, bool):
             raise ConfigValidationError(
                 "resources.fail_on_memory_estimate_exceeds_request must be a boolean"

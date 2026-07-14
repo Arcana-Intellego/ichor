@@ -16,6 +16,10 @@ _LOCK_FILENAME = "ferebus_split_assignments.lock"
 _SPLITS = ("train", "int_val", "ext_val")
 
 
+class FerebusSplitLedgerLockError(RuntimeError):
+    """Raised when split-ledger ownership cannot be acquired in time."""
+
+
 @contextmanager
 def _ledger_lock(campaign_dir: Path):
     import portalocker
@@ -23,13 +27,18 @@ def _ledger_lock(campaign_dir: Path):
 
     data = operational_data_dir(campaign_dir)
     data.mkdir(parents=True, exist_ok=True)
-    with portalocker.Lock(
-        str(data / _LOCK_FILENAME),
-        mode="a",
-        flags=portalocker.LOCK_EX,
-        timeout=30.0,
-    ):
-        yield
+    try:
+        with portalocker.Lock(
+            str(data / _LOCK_FILENAME),
+            mode="a",
+            flags=portalocker.LOCK_EX | portalocker.LOCK_NB,
+            timeout=30.0,
+        ):
+            yield
+    except (portalocker.LockException, portalocker.AlreadyLocked) as exc:
+        raise FerebusSplitLedgerLockError(
+            "could not acquire FEREBUS split-ledger ownership within 30 seconds"
+        ) from exc
 
 
 def ledger_path(campaign_dir: Path) -> Path:

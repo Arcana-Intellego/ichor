@@ -22,6 +22,7 @@ jobs that take seconds, not hours.
 from __future__ import annotations
 
 import os
+import hashlib
 import shlex
 import shutil
 import subprocess
@@ -41,7 +42,7 @@ from ..config import (
 )
 from ..versioning.provenance import (
     PROVENANCE_FILENAME,
-    append_to_index,
+    upsert_index_records,
     ensure_index,
     enrich_with_anti_overlap,
     enrich_with_ariadne,
@@ -103,6 +104,10 @@ from .runtime_environment import (
     DEFAULT_DAEMON_RUNTIME_MODULES,
     configured_daemon_runtime_modules,
     normalise_module_list,
+)
+from ..submit.slurm_contracts import (
+    parse_sbatch_parsable_output,
+    run_scheduler_command,
 )
 
 
@@ -592,6 +597,7 @@ def clean_stale_ariadne_seed_outputs(
         ariadne_seeds_dir,
     )
     from ..seed_identity import read_ariadne_task_map, task_for_array_task_id
+    from .ariadne_quarantine import quarantine_root, write_quarantine_manifest
 
     campaign = Path(campaign_dir)
     iter_dir = active_iteration_dir(campaign, int(iteration))
@@ -611,14 +617,12 @@ def clean_stale_ariadne_seed_outputs(
     )
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
     quarantine = (
-        campaign
-        / ".DATA"
-        / "ACTIVE_LEARNING"
-        / "ariadne_retry_quarantine"
+        quarantine_root(campaign)
         / active_iteration_name(int(iteration))
         / stamp
     )
     moved: List[str] = []
+    moved_sources: List[Path] = []
     candidates: List[Path] = []
     for task_id in task_ids:
         task = task_for_array_task_id(task_map, task_id)
@@ -646,7 +650,16 @@ def clean_stale_ariadne_seed_outputs(
             target = quarantine / (candidate.name + "." + str(suffix))
             suffix += 1
         shutil.move(str(candidate), str(target))
+        moved_sources.append(candidate)
         moved.append(str(target))
+    if moved:
+        write_quarantine_manifest(
+            campaign,
+            quarantine,
+            iteration=int(iteration),
+            source_paths=moved_sources,
+            target_paths=[Path(value) for value in moved],
+        )
     return moved
 
 #  SBATCH-phase postprocess refusal guard.
@@ -1063,6 +1076,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
     partition: Optional[str] = None
     backend_check: bool = True
     strict_committed_artifact_verification: bool = True
+    scheduler_identity_kind: str = "slurm"
     strict_completion_receipt_evidence: bool = True
 
     def __post_init__(self) -> None:
@@ -1642,6 +1656,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 output_path=slurm_log_paths(bundle, is_array=False)["output"],
                 error_path=slurm_log_paths(bundle, is_array=False)["error"],
                 runtime_preamble=[
+                    "module purge",
+                    *[
+                        "module load " + module
+                        for module in _configured_daemon_runtime_modules()
+                    ],
                     "export ICHOR_ACTIVE_WORKERS="
                     + str(int(resolved.extra.get("active_workers", f.nagents))),
                     "export ICHOR_MEMORY_ONLY_CPUS="
@@ -1656,6 +1675,9 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         resource_resolution_binding=resolution_binding,
                     ),
                 ],
+                scheduler_timeout_seconds=int(
+                    self.config.runtime.scheduler_command_timeout_seconds
+                ),
             )
         except BackendSubmissionError:
             raise
@@ -1853,15 +1875,19 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             ) from exc
         ensure_index(self.campaign_dir)
         committed_iter_dir = v.iteration_path(target_version)
-        for pdir_name in committed_names:
-            pdir = committed_iter_dir / pdir_name
-            seed_frame_id = self._read_seed_frame_id_from_pointdir(pdir)
-            append_to_index(
-                self.campaign_dir,
-                iteration=int(target_version),
-                pointdir_name=pdir_name,
-                seed_frame_id=seed_frame_id,
-            )
+        upsert_index_records(
+            self.campaign_dir,
+            records=[
+                {
+                    "iteration": int(target_version),
+                    "pointdir_name": pdir_name,
+                    "seed_frame_id": self._read_seed_frame_id_from_pointdir(
+                        committed_iter_dir / pdir_name
+                    ),
+                }
+                for pdir_name in committed_names
+            ],
+        )
         self._journal_event(
             "reference_data_committed",
             iteration=int(state.iteration),
@@ -1925,6 +1951,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     **recovery_journal_payload,
                 )
                 retry_ids = list(recovery.get("retry_task_ids") or [])
+                submission_metadata["logical_task_set_sha256"] = hashlib.sha256(
+                    (",".join(str(int(task_id)) for task_id in retry_ids)).encode(
+                        "ascii"
+                    )
+                ).hexdigest()
                 if not retry_ids and int(recovery.get("logical_total") or 0) > 0:
                     self._journal_event(
                         "partial_array_recovery_postprocess_only",
@@ -1950,9 +1981,9 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 )
                 if removed:
                     self._journal_event(
-                        "ariadne_stale_outputs_cleaned",
+                        "ariadne_stale_outputs_quarantined",
                         iteration=int(getattr(state, "iteration", 0)),
-                        removed=int(len(removed)),
+                        retained=int(len(removed)),
                         sample=[str(p) for p in removed[:5]],
                     )
             script = self._write_real_script(
@@ -1992,8 +2023,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 "pre-submit staging failed for " + phase_name + ": "
                 + type(exc).__name__ + ": " + str(exc)
             ) from exc
-        result = self.sbatch_runner(
+        result = run_scheduler_command(
+            self.sbatch_runner,
             ["sbatch", "--parsable", str(script)],
+            timeout_seconds=int(
+                self.config.runtime.scheduler_command_timeout_seconds
+            ),
             check=False,
             capture_output=True,
             text=True,
@@ -2006,12 +2041,19 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 "sbatch failed for phase " + phase_name + ": "
                 + repr(stderr) + " stdout=" + repr(stdout)
             )
-        head = next((ln.strip() for ln in stdout.splitlines() if ln.strip()), "")
-        job_id = head.split(";", 1)[0].strip()
-        if not job_id or not job_id[0].isdigit():
+        try:
+            job_id, _cluster = parse_sbatch_parsable_output(stdout)
+        except ValueError as exc:
             raise BackendSubmissionError(
-                "sbatch returned unparsable JobID for phase " + phase_name + ": " + repr(head)
-            )
+                "sbatch returned invalid parsable output for phase "
+                + phase_name
+                + ": "
+                + str(exc)
+                + "; stdout="
+                + repr(stdout)
+                + "; stderr="
+                + repr(stderr)
+            ) from exc
         self.artefact_log.append(str(script))
         expected_tasks = int(array_size) if array_size is not None else 1
         return PhaseResult(
@@ -4551,6 +4593,7 @@ def make_live_job_finder(
     squeue_runner=None,
     *,
     campaign_dir: Optional[Path] = None,
+    timeout_seconds: int = 60,
 ):
     """the job_finder the daemon uses in live mode: given (state, phase) return the JobID of an
     already-running job for that exact phase+iteration, or None. lets the daemon adopt a job a crash
@@ -4601,6 +4644,7 @@ def make_live_job_finder(
                 sacct_runner=sacct_runner,
                 squeue_runner=squeue_runner,
                 use_squeue_fallback=use_squeue_fallback,
+                timeout_seconds=int(timeout_seconds),
             )
             last_lookup = found
             if found.job_id:
@@ -4612,7 +4656,12 @@ def make_live_job_finder(
     return _finder
 
 
-def make_live_job_accounting_finder(sacct_runner=None, squeue_runner=None):
+def make_live_job_accounting_finder(
+    sacct_runner=None,
+    squeue_runner=None,
+    *,
+    timeout_seconds: int = 60,
+):
     """Return a live-mode expected-job-name accounting lookup."""
     from ..submit.sacct_poll import find_accounted_job_by_name_detailed
 
@@ -4644,6 +4693,8 @@ def make_live_job_accounting_finder(sacct_runner=None, squeue_runner=None):
                 sacct_runner=sacct_runner,
                 squeue_runner=squeue_runner,
                 use_squeue_fallback=use_squeue_fallback,
+                submission_kind=str(active_intent.get("submission_kind")),
+                timeout_seconds=int(timeout_seconds),
             )
             last_lookup = found
             if found.job_id:
@@ -4655,12 +4706,16 @@ def make_live_job_accounting_finder(sacct_runner=None, squeue_runner=None):
     return _finder
 
 
-def make_live_job_liveness_checker(squeue_runner=None):
+def make_live_job_liveness_checker(squeue_runner=None, *, timeout_seconds: int = 60):
     """Return a live-mode checker for whether an existing Slurm JobID is active."""
     from ..submit.sacct_poll import find_active_job_by_id_detailed
 
     def _checker(job_id):
-        return find_active_job_by_id_detailed(job_id, squeue_runner=squeue_runner)
+        return find_active_job_by_id_detailed(
+            job_id,
+            squeue_runner=squeue_runner,
+            timeout_seconds=int(timeout_seconds),
+        )
 
     return _checker
 
@@ -5024,6 +5079,7 @@ def build_sbatch_script(
         "export LC_ALL=C",
         "export LC_NUMERIC=C",
         "",
+        "module purge",
         *["module load " + m for m in _configured_daemon_runtime_modules()],
         "",
     ]

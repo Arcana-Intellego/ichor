@@ -120,6 +120,7 @@ __all__ = [
     "validate_provenance",
     "ensure_index",
     "append_to_index",
+    "upsert_index_records",
     "load_index",
     "load_training_seed_frame_ids",
     "repair_index_from_committed_pointdirs",
@@ -593,21 +594,80 @@ def append_to_index(
     pointdir sidecars at SEED_SELECT time instead -- thousands of NFS
     reads per iteration, much worse.
     """
-    # flock around the load -> append -> write cycle so two APPEND
-    # workers can't lose records to a clobber race.
-    with _index_lock(campaign_dir):
-        data = load_index(campaign_dir)
-        record = {
+    return upsert_index_records(
+        campaign_dir,
+        records=[{
             "iteration": int(iteration),
             "pointdir_name": str(pointdir_name),
             "seed_frame_id": (
                 int(seed_frame_id) if seed_frame_id is not None else None
             ),
-        }
-        data["records"].append(record)
+        }],
+    )
+
+
+def _normalise_index_record(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ProvenanceError("seed-frame index records must be JSON objects")
+    iteration = value.get("iteration")
+    if isinstance(iteration, bool) or not isinstance(iteration, int) or iteration < 0:
+        raise ProvenanceError("seed-frame index iteration must be a non-negative integer")
+    pointdir_name = value.get("pointdir_name")
+    if (
+        not isinstance(pointdir_name, str)
+        or not pointdir_name
+        or Path(pointdir_name).name != pointdir_name
+    ):
+        raise ProvenanceError("seed-frame index pointdir_name must be one safe name")
+    frame_id = value.get("seed_frame_id")
+    if frame_id is not None and (
+        isinstance(frame_id, bool) or not isinstance(frame_id, int) or frame_id < 0
+    ):
+        raise ProvenanceError(
+            "seed-frame index seed_frame_id must be a non-negative integer or null"
+        )
+    return {
+        "iteration": int(iteration),
+        "pointdir_name": pointdir_name,
+        "seed_frame_id": None if frame_id is None else int(frame_id),
+    }
+
+
+def upsert_index_records(
+    campaign_dir: Union[str, Path],
+    *,
+    records: Sequence[Dict[str, Any]],
+) -> Path:
+    """Atomically upsert one committed batch without replay duplication."""
+    incoming = [_normalise_index_record(record) for record in records]
+    with _index_lock(campaign_dir):
+        data = load_index(campaign_dir)
+        by_key: Dict[Tuple[int, str], Dict[str, Any]] = {}
+        for raw in list(data.get("records") or []) + incoming:
+            record = _normalise_index_record(raw)
+            key = (record["iteration"], record["pointdir_name"])
+            existing = by_key.get(key)
+            if existing is not None and existing != record:
+                raise ProvenanceError(
+                    "conflicting seed-frame index record for "
+                    + str(key[0])
+                    + "/"
+                    + key[1]
+                )
+            by_key[key] = record
+        compact = [by_key[key] for key in sorted(by_key)]
         p = _index_path(campaign_dir)
         p.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(p, data)
+        if compact != data.get("records"):
+            atomic_write_json(
+                p,
+                {
+                    "schema_version": INDEX_SCHEMA_VERSION,
+                    "records": compact,
+                },
+            )
+        elif not p.is_file():
+            atomic_write_json(p, _empty_index_payload())
         return p
 
 

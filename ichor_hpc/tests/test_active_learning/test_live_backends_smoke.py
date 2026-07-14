@@ -285,6 +285,7 @@ def test_submitted_environment_smoke_renders_exact_runtime_contract(
         availability=availability,
         output_path=tmp_path / "smoke.out",
     )
+    assert "module purge" in body
 
     assert body.startswith("#!/bin/bash --login\n")
     assert "#SBATCH --partition=multicore" in body

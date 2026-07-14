@@ -32,7 +32,7 @@ class _ExplodingExecutor:
 
 class _SubmittingExecutor:
     def submit_or_run(self, state, phase):
-        return PhaseResult(is_complete=False, submitted_job_id="111")
+        return PhaseResult(is_complete=False, submitted_job_id="dry-111")
     def postprocess(self, *a, **k):
         raise AssertionError
     def handle_failure(self, *a, **k):
@@ -51,7 +51,7 @@ class _IntentCheckingExecutor:
         )
         assert intent is not None
         assert intent["status"] == "PRE_SUBMIT"
-        return PhaseResult(is_complete=False, submitted_job_id="222")
+        return PhaseResult(is_complete=False, submitted_job_id="dry-222")
 
     def postprocess(self, *a, **k):
         raise AssertionError
@@ -148,11 +148,11 @@ def test_daemon_submits_when_no_inflight_job(tmp_path):
     state = _active_state(CampaignPhase.FEREBUS)
     status = d._on_phase_entry(state, state.phase)
     assert status == TickStatus.SUBMITTED
-    assert state.pending_jobs["FEREBUS"] == "111"  # the freshly-submitted id
+    assert state.pending_jobs["FEREBUS"] == "dry-111"  # the freshly-submitted id
     from ichor.hpc.active_learning.daemon.submission_intent import load_intent
     intent = load_intent(tmp_path, "FEREBUS", 1)
     assert intent["status"] == "SUBMITTED"
-    assert intent["job_id"] == "111"
+    assert intent["job_id"] == "dry-111"
 
 
 def test_submission_intent_exists_before_executor_calls_sbatch(tmp_path):
@@ -325,7 +325,7 @@ def test_submission_intent_records_job_id_even_if_state_persist_fails(monkeypatc
     from ichor.hpc.active_learning.daemon.submission_intent import load_intent
     intent = load_intent(tmp_path, "FEREBUS", 1)
     assert intent["status"] == "SUBMITTED"
-    assert intent["job_id"] == "111"
+    assert intent["job_id"] == "dry-111"
 
 
 def test_daemon_does_not_adopt_for_inline_phase(tmp_path):

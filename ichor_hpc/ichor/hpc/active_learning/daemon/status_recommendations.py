@@ -7,12 +7,13 @@ message.
 """
 from __future__ import annotations
 
-import time
+import shlex
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from .state import CampaignPhase
+from .lease import evaluate_lease_liveness
 
 
 @dataclass
@@ -40,7 +41,12 @@ def recommendation_dicts(
 
 
 def _cmd(campaign_dir: Path, command: str) -> str:
-    return "ichor-al-daemon " + command + " --campaign-dir " + str(campaign_dir)
+    return (
+        "ichor-al-daemon "
+        + command
+        + " --campaign-dir "
+        + shlex.quote(str(campaign_dir))
+    )
 
 
 def _start_cmd(campaign_dir: Path) -> str:
@@ -58,14 +64,14 @@ def _journal_cmd(campaign_dir: Path) -> str:
     return _cmd(campaign_dir, "journal")
 
 
-def _lease_is_fresh(heartbeat: Any, *, stale_seconds: int = 900) -> bool:
-    if not isinstance(heartbeat, dict):
-        return False
-    try:
-        age = time.time() - float(heartbeat.get("time"))
-    except Exception:
-        return False
-    return age <= float(stale_seconds)
+def _lease_is_fresh(payload: Dict[str, Any]) -> bool:
+    return evaluate_lease_liveness(
+        payload.get("lease_heartbeat"),
+        stale_seconds=int(payload.get("lease_stale_seconds", 900)),
+        clock_skew_tolerance_seconds=int(
+            payload.get("clock_skew_tolerance_seconds", 60)
+        ),
+    ).fresh
 
 
 def _active_pending_jobs(payload: Dict[str, Any]) -> Dict[str, str]:
@@ -221,7 +227,7 @@ def _runtime_blockers(campaign: Path, payload: Dict[str, Any]) -> List[StatusRec
                 command=_journal_cmd(campaign),
             )
         )
-    if _lease_is_fresh(payload.get("lease_heartbeat")):
+    if _lease_is_fresh(payload):
         recommendations.append(
             StatusRecommendation(
                 code="daemon_running_lease",
@@ -629,6 +635,51 @@ def build_status_recommendations(
     """Return ordered operator recommendations for a status payload."""
     del journal_path  # reserved for future journal-dependent detail expansion
     campaign = Path(campaign_dir)
+    config_status = payload.get("campaign_config_status")
+    if isinstance(config_status, dict) and config_status.get("ok") is False:
+        return [
+            StatusRecommendation(
+                code="campaign_config_invalid",
+                severity="required",
+                primary="repair campaign.yaml before assessing pool feasibility or restarting",
+                why=_short_error(config_status.get("error")),
+            )
+        ]
+    if payload.get("partial_array_recovery_error"):
+        return [
+            StatusRecommendation(
+                code="partial_array_recovery_invalid",
+                severity="required",
+                primary="run reconcile and inspect the malformed partial-array ledger",
+                why=_short_error(payload.get("partial_array_recovery_error")),
+                command=_reconcile_cmd(campaign),
+            )
+        ]
+    if payload.get("journal_error"):
+        return [
+            StatusRecommendation(
+                code="journal_corrupt",
+                severity="required",
+                primary="run reconcile and inspect the corrupt journal segment",
+                why=_short_error(payload.get("journal_error")),
+                command=_reconcile_cmd(campaign),
+            )
+        ]
+    if payload.get("submission_intent_errors"):
+        return [
+            StatusRecommendation(
+                code="submission_intent_invalid",
+                severity="required",
+                primary="run reconcile before cancellation, resubmission, or restart",
+                why="one or more scheduler-ownership intents are malformed",
+                command=_reconcile_cmd(campaign),
+                details=[
+                    _short_error(item.get("path")) + ": " + _short_error(item.get("error"))
+                    for item in list(payload.get("submission_intent_errors") or [])[:8]
+                    if isinstance(item, dict)
+                ],
+            )
+        ]
     if payload.get("stop_control_error"):
         return [
             StatusRecommendation(
@@ -676,7 +727,7 @@ def build_status_recommendations(
                             "campaign.yaml exists, but "
                             ".DATA/ACTIVE_LEARNING/state.json has not been created"
                         ),
-                        command="ichor-al-daemon init --campaign-dir " + str(campaign),
+                        command=_cmd(campaign, "init"),
                     )
                 ]
             return [
@@ -685,7 +736,7 @@ def build_status_recommendations(
                     severity="required",
                     primary="initialise the campaign before starting the daemon",
                     why="campaign.yaml and state.json are both missing",
-                    command="ichor-al-daemon init --campaign-dir " + str(campaign),
+                    command=_cmd(campaign, "init"),
                 )
             ]
         return [
@@ -733,7 +784,7 @@ def build_status_recommendations(
         daemon_active = (
             payload.get("lock_held") is True
             or payload.get("background_pid_alive") is True
-            or _lease_is_fresh(payload.get("lease_heartbeat"))
+            or _lease_is_fresh(payload)
         )
         target = "the next daemon tick"
         if stop_request.get("target_phase") is not None:

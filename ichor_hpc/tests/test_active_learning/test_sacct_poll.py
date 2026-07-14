@@ -61,6 +61,8 @@ def test_terminal_state_sets_are_consistent():
     assert JobStatus.RUNNING not in TERMINAL_STATES
     assert JobStatus.PENDING not in TERMINAL_STATES
     assert JobStatus.UNKNOWN not in TERMINAL_STATES
+    assert JobStatus.STOPPED not in TERMINAL_STATES
+    assert JobStatus.SPECIAL_EXIT not in TERMINAL_STATES
 
 
 def test_parse_sacct_single_completed():
@@ -84,13 +86,15 @@ def test_parse_sacct_failed_with_exit_code():
     assert obs[0].is_failure
 
 
-def test_completed_with_nonzero_or_malformed_exit_code_is_failure():
+def test_completed_with_nonzero_exit_is_failure_and_malformed_is_unknown():
     out = "12345|COMPLETED|1:0|00:01:00\n12346|COMPLETED|not-an-exit|00:01:00\n"
     obs = parse_sacct_output(out)
     assert obs[0].is_failure
-    assert obs[1].is_failure
+    assert obs[1].status is JobStatus.UNKNOWN
+    assert obs[1].parse_error == "terminal Slurm row has malformed ExitCode"
     assert not obs[0].is_success
     assert not obs[1].is_success
+    assert not obs[1].is_terminal
 
 
 def test_parse_sacct_handles_dd_hh_mm_ss_elapsed():
@@ -168,6 +172,40 @@ def test_aggregate_single_non_array_job():
     summary = aggregate_states("99", obs)
     assert summary.n_tasks == 1
     assert summary.is_fully_successful
+
+
+def test_parent_only_row_cannot_certify_one_task_array():
+    observations = [
+        JobObservation("99", JobStatus.COMPLETED, (0, 0), 100),
+    ]
+
+    summary = aggregate_states(
+        "99",
+        observations,
+        expected_task_count=1,
+        submission_kind="array",
+    )
+
+    assert summary.n_observed == 0
+    assert summary.n_missing == 1
+    assert not summary.is_terminal
+
+
+def test_foreign_job_rows_are_inconclusive():
+    observations = [
+        JobObservation("100_0", JobStatus.COMPLETED, (0, 0), 100),
+    ]
+
+    summary = aggregate_states(
+        "99",
+        observations,
+        expected_task_count=1,
+        submission_kind="array",
+    )
+
+    assert summary.n_observed == 0
+    assert summary.n_missing == 1
+    assert not summary.is_terminal
 
 
 def test_aggregate_parent_only_failed_is_terminal_failure_but_unknown_is_inconclusive():
@@ -269,8 +307,8 @@ def test_poll_job_invokes_sacct_with_correct_flags():
     call = runner.calls[0]
     assert call[0] == "sacct"
     assert "-j" in call and "42" in call
-    assert "--format=JobID,State,ExitCode,Elapsed" in call
-    assert "-X" in call and "-P" in call and "-n" in call
+    assert "--format=JobIDRaw,State%40,ExitCode,ElapsedRaw" in call
+    assert "--array" in call and "-X" in call and "-P" in call and "-n" in call
 
 
 def test_poll_job_raises_on_sacct_nonzero():

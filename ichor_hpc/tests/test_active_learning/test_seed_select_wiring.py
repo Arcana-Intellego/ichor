@@ -254,7 +254,7 @@ def test_inline_seed_select_skips_training_pool_frame_ids(tmp_path):
     forbidden = list(pool.frame_ids())[:5]
     for fid in forbidden:
         append_to_index(
-            cd, iteration=-1,
+            cd, iteration=0,
             pointdir_name=f"POINT_dummy_{fid}.pointdir",
             seed_frame_id=int(fid),
         )
@@ -273,6 +273,30 @@ def test_inline_seed_select_skips_training_pool_frame_ids(tmp_path):
     )
     assert set(forbidden).issubset(expected_forbidden)
     assert picked[-1]["forbidden_set_size"] == len(expected_forbidden)
+
+
+def test_seed_frame_index_batch_upsert_is_idempotent_and_conflict_safe(tmp_path):
+    from ichor.hpc.active_learning.versioning.provenance import (
+        ProvenanceError,
+        load_index,
+        upsert_index_records,
+    )
+
+    campaign = tmp_path / "campaign"
+    record = {
+        "iteration": 1,
+        "pointdir_name": "POINT_0001.pointdir",
+        "seed_frame_id": 17,
+    }
+    upsert_index_records(campaign, records=[record, dict(record)])
+    upsert_index_records(campaign, records=[dict(record)])
+
+    assert load_index(campaign)["records"] == [record]
+    with pytest.raises(ProvenanceError, match="conflicting seed-frame index record"):
+        upsert_index_records(
+            campaign,
+            records=[dict(record, seed_frame_id=18)],
+        )
 
 
 def test_inline_seed_select_skips_recent_cooldown_frames(tmp_path):
