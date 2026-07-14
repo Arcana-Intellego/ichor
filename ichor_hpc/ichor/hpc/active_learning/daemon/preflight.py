@@ -12,7 +12,7 @@ LiveBackendsPhaseExecutor requires before it can drive a real campaign:
 
 Pytest's "live" marker decorates tests that need any of these and skips
 them when the host is missing the relevant tool. The CLI uses the same
-detector to refuse the "--live" mode with a clear error rather than running
+detector to refuse live mode with a clear error rather than running
 a daemon that cannot submit anything.
 """
 from __future__ import annotations
@@ -506,9 +506,9 @@ def missing_backend_message(avail: BackendAvailability) -> str:
         )
     lines.append("")
     lines.append(
-        "Live mode requires all of the above. On Windows / off-cluster, use "
-        "`--dry-run` (full file-system flow with stubbed backends) or "
-        "`--mock-ariadne` (pure state-machine progression)."
+        "Live mode requires all of the above. On Windows or off-cluster, "
+        "create a separate campaign with `--mode dry_run` for the full "
+        "file-system flow with stubbed backends."
     )
     
     return "\n".join(lines)

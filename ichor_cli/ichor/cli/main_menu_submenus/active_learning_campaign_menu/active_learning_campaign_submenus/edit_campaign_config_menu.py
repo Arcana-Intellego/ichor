@@ -63,7 +63,6 @@ from ichor.hpc.active_learning.config import (
     VALID_SIZE_NORMALISATION_DISTANCE_MODES,
     VALID_SIZE_NORMALISATION_ENERGY_MODES,
     VALID_SPECTRAL_MODES,
-    VALID_WARMSTART,
 )
 from ichor.hpc.active_learning.ferebus_prior import SUPPORTED_LEVELS
 
@@ -228,32 +227,19 @@ def _saved_config_path_for_review(config_override=None) -> Optional[Path]:
     return campaign_dir / "campaign.yaml"
 
 
-def _load_saved_config_for_review(config_path: Path, preset=None) -> CampaignConfig:
-    import yaml
-
-    preset_name = str(preset).strip() if preset else ""
-    if config_path.is_file():
-        with open(config_path, "r", encoding="utf-8") as f:
-            payload = yaml.safe_load(f) or {}
-    elif preset_name:
-        payload = {}
-    else:
+def _load_saved_config_for_review(config_path: Path) -> CampaignConfig:
+    if not config_path.is_file():
         raise FileNotFoundError("campaign config is not a readable file: " + str(config_path))
-    if preset_name:
-        from ichor.hpc.active_learning.preset_loader import apply_preset
-
-        payload, _preset_payload = apply_preset(preset_name, payload)
-    return CampaignConfig.from_dict(payload)
+    return CampaignConfig.from_yaml(config_path)
 
 
-def saved_config_lock_review(config_override=None, preset=None):
+def saved_config_lock_review(config_override=None):
     global _last_saved_config_lock_error
     _last_saved_config_lock_error = ""
     override_requested = bool(config_override)
-    preset_requested = bool(str(preset).strip()) if preset else False
     campaign_dir = selected_campaign_dir_or_none()
     if campaign_dir is None:
-        if override_requested or preset_requested:
+        if override_requested:
             _last_saved_config_lock_error = "No campaign directory is selected."
         return None
     config_path = _saved_config_path_for_review(config_override)
@@ -266,12 +252,12 @@ def saved_config_lock_review(config_override=None, preset=None):
             + str(config_path)
         )
         return None
-    if not config_path.is_file() and not preset_requested:
+    if not config_path.is_file():
         return None
     try:
-        cfg = _load_saved_config_for_review(config_path, preset=preset)
+        cfg = _load_saved_config_for_review(config_path)
     except Exception as exc:
-        if override_requested or preset_requested:
+        if override_requested:
             _last_saved_config_lock_error = (
                 "Saved config could not be loaded for lock review: "
                 + type(exc).__name__
@@ -321,8 +307,6 @@ def _summarise_paths(paths) -> str:
 
 
 def _config_lock_change_status(path: str) -> str:
-    if path in {"ferebus.warmstart", "ferebus.warmstart_streak"}:
-        return "unsupported: retained for compatibility; no runtime effect"
     review = current_config_lock_review()
     if review is not None:
         for change in review.blocked_changes:
@@ -427,20 +411,20 @@ def _format_editability_line(path: str) -> str:
     )
 
 
-def saved_config_has_blocked_changes(config_override=None, preset=None) -> bool:
-    review = saved_config_lock_review(config_override, preset=preset)
+def saved_config_has_blocked_changes(config_override=None) -> bool:
+    review = saved_config_lock_review(config_override)
     return bool(review is not None and review.blocked_changes)
 
 
-def saved_config_has_lock_changes(config_override=None, preset=None) -> bool:
-    review = saved_config_lock_review(config_override, preset=preset)
+def saved_config_has_lock_changes(config_override=None) -> bool:
+    review = saved_config_lock_review(config_override)
     return bool(review is not None and review.changed)
 
 
-def saved_config_review_failed(config_override=None, preset=None) -> bool:
-    if not config_override and not (str(preset).strip() if preset else ""):
+def saved_config_review_failed(config_override=None) -> bool:
+    if not config_override:
         return False
-    saved_config_lock_review(config_override, preset=preset)
+    saved_config_lock_review(config_override)
     return bool(_last_saved_config_lock_error)
 
 
@@ -448,8 +432,8 @@ def saved_config_lock_review_error() -> str:
     return _last_saved_config_lock_error
 
 
-def format_saved_config_lock_review(config_override=None, preset=None) -> str:
-    review = saved_config_lock_review(config_override, preset=preset)
+def format_saved_config_lock_review(config_override=None) -> str:
+    review = saved_config_lock_review(config_override)
     if review is None:
         return _last_saved_config_lock_error or "No saved config lock review is available."
     from ichor.hpc.active_learning.daemon.config_lock import format_config_review
@@ -474,7 +458,6 @@ class EditCampaignConfigMenuOptions(MenuOptions):
     max_iterations: int = 50
     n_seeds_per_iteration: int = 50
     phase_b_descriptor: str = "hybrid_alf_rmsd"
-    ferebus_warmstart: str = "adaptive"
     ferebus_kernel: str = "rbfc_per"
     acquisition_gradient_mode: str = "cartesian_fd"
     acquisition_max_subspace_dim: int = 6
@@ -587,7 +570,6 @@ def _sync_options_from_config():
         _campaign_config.seed_selection.n_seeds_per_iteration
     )
     edit_campaign_config_menu_options.phase_b_descriptor = _campaign_config.phase_b.descriptor
-    edit_campaign_config_menu_options.ferebus_warmstart = _campaign_config.ferebus.warmstart
     edit_campaign_config_menu_options.ferebus_kernel = _campaign_config.ferebus.kernel
     edit_campaign_config_menu_options.acquisition_gradient_mode = (
         _campaign_config.acquisition.gradient.mode
@@ -929,12 +911,6 @@ class EditCampaignConfigFunctions:
     @staticmethod
     def edit_anti_overlap():
         a = _campaign_config.anti_overlap
-        a.skip_training_seeds = user_input_bool(
-            "anti_overlap.skip_training_seeds: ", a.skip_training_seeds,
-        )
-        a.recent_seeds_cooldown = user_input_int(
-            "anti_overlap.recent_seeds_cooldown: ", a.recent_seeds_cooldown,
-        )
         a.min_post_ariadne_whitened_distance = user_input_float(
             "anti_overlap.min_post_ariadne_whitened_distance: ",
             a.min_post_ariadne_whitened_distance,
@@ -1296,6 +1272,7 @@ _BLOCK_MENUS_BY_LABEL = {
             _read_only_spec("schema_version"),
             _spec("campaign.system_name", "str"),
             _spec("campaign.max_iterations", "int"),
+            _spec("campaign.random_seed", "int"),
             _spec("campaign.custom_bootstrap", "bool"),
             _spec(
                 "campaign.sampling_aggressiveness",
@@ -1398,7 +1375,11 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("gaussian.basis_set", "str"),
             _spec("gaussian.charge", "int"),
             _spec("gaussian.spin_multiplicity", "int"),
-            _spec("gaussian.extra_keywords", "str"),
+            _spec(
+                "gaussian.extra_route_keywords",
+                "csv_list",
+                prompt="gaussian.extra_route_keywords (comma-separated; blank for none): ",
+            ),
         ],
     ),
     "Edit AIMAll block": _make_block_menu(
@@ -1429,14 +1410,14 @@ _BLOCK_MENUS_BY_LABEL = {
                 "choice",
                 choices=sorted(VALID_D_OPTIMAL_DEGENERATE_POLICIES),
             ),
+            _spec("seed_selection.exclude_committed_seed_frames", "bool"),
+            _spec("seed_selection.recent_seed_cooldown_iterations", "int"),
         ],
     ),
     "Edit anti_overlap": _make_block_menu(
         "Edit anti_overlap",
         "Candidate anti-overlap and ARIADNE movement filters.",
         [
-            _spec("anti_overlap.skip_training_seeds", "bool"),
-            _spec("anti_overlap.recent_seeds_cooldown", "int"),
             _spec("anti_overlap.min_post_ariadne_whitened_distance", "float"),
             _spec("anti_overlap.max_post_ariadne_whitened_distance", "float"),
             _spec("anti_overlap.enforce_post_ariadne", "bool"),
@@ -1474,8 +1455,6 @@ _BLOCK_MENUS_BY_LABEL = {
         "Edit FEREBUS Block",
         "FEREBUS model-training controls; dataset slots come from point_allocation.",
         [
-            _read_only_spec("ferebus.warmstart"),
-            _read_only_spec("ferebus.warmstart_streak"),
             _spec("ferebus.kernel", "str", prompt="ferebus.kernel (e.g. rbfc_per, rbf_per): "),
             _spec("ferebus.loss", "str", prompt="ferebus.loss (e.g. huber, mse, mae): "),
             _spec("ferebus.nagents", "int"),
@@ -1736,6 +1715,9 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("quality_gates.ferebus_min_ext_r2", "optional_float"),
             _spec("quality_gates.ferebus_max_ext_rmse_ha", "optional_float"),
             _spec("quality_gates.ferebus_max_condition_number", "optional_float"),
+            _spec("quality_gates.ferebus_max_aggregate_ext_rmse_increase_fraction", "float"),
+            _spec("quality_gates.ferebus_max_task_ext_rmse_increase_fraction", "float"),
+            _spec("quality_gates.ferebus_regression_abs_tolerance_ha", "float"),
             _spec("quality_gates.ariadne_max_displacement_ang", "optional_float"),
             _spec("quality_gates.ariadne_min_pair_distance_ang", "optional_float"),
         ],
@@ -1757,6 +1739,25 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("runtime.poll_sacct_missing_max_ticks", "int"),
             _spec("runtime.poll_squeue_inconclusive_max_ticks", "int"),
             _spec("runtime.halt_on_tick_exception", "bool"),
+            _spec("runtime.scheduler_command_timeout_seconds", "int"),
+            _spec("runtime.cancellation_confirmation_timeout_seconds", "int"),
+            _spec("runtime.journal_max_bytes", "int"),
+            _spec("runtime.journal_retained_files", "int"),
+            _spec("runtime.lease_heartbeat_seconds", "int"),
+            _spec("runtime.lease_heartbeat_failure_max", "int"),
+            _spec("runtime.clock_skew_tolerance_seconds", "int"),
+            _spec("runtime.background_readiness_timeout_seconds", "int"),
+            _spec("runtime.ledger_lock_timeout_seconds", "int"),
+        ],
+    ),
+    "Edit retention": _make_block_menu(
+        "Edit retention",
+        "Durable campaign checkpoint policy.",
+        [
+            _spec("retention.checkpoint_destination", "optional_str"),
+            _spec("retention.checkpoint_every_iterations", "int"),
+            _spec("retention.checkpoint_required", "bool"),
+            _spec("retention.checkpoint_verify_after_write", "bool"),
         ],
     ),
 }
@@ -1844,6 +1845,7 @@ edit_campaign_config_menu_items = [
     _block_submenu_item("Edit error_calibration"),
     _block_submenu_item("Edit quality_gates"),
     _block_submenu_item("Edit runtime"),
+    _block_submenu_item("Edit retention"),
     FunctionItem(
         "Show unsaved changes",
         EditCampaignConfigFunctions.show_unsaved_changes,

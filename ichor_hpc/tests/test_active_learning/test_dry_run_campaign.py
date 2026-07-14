@@ -4,7 +4,7 @@ Drives a Daemon through a 2-iteration campaign using DryRunPhaseExecutor +
 DryRunSacctPoller and asserts on the on-disk artefacts. This is the M8
 acceptance test from the migration plan:
 
-    > On CSF4 scratch, run `ichor-al-daemon start --dry-run --mock-ariadne`
+    > Run `ichor-al-daemon start --mode dry_run` in a dedicated campaign
     > against a small fixture. Verify all directories, manifests, journal
     > entries, sbatch invocations, sacct polls, and atomic renames work
     > end-to-end without real Gaussian/AIMAll/FEREBUS.
@@ -230,7 +230,7 @@ def test_dry_run_cli_drives_campaign_to_done(tmp_path):
     rc = cli_main([
         "start",
         "--campaign-dir", str(campaign),
-        "--dry-run",
+        "--mode", "dry_run",
         "--foreground",
         "--poll-interval", "1",
         "--max-ticks", "500",

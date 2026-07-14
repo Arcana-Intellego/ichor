@@ -45,7 +45,7 @@ laptop, no cluster required)::
 
     cd examples/dry_run_water_tetramer
     ichor-al-daemon init --yes
-    ichor-al-daemon start -d -f -t 200
+    ichor-al-daemon start --mode dry_run --foreground --max-ticks 200
     ichor-al-daemon status
 
 After the third command you should see :code:`"phase": "DONE"` and
@@ -57,45 +57,40 @@ and what to look at next.
 
 Most daemon commands accept :code:`-c/--campaign-dir`. If it is omitted, the
 current directory is used when it contains :code:`campaign.yaml`; otherwise the
-command exits with a usage error. Common flags also have short aliases, so a
-live background launch is now the default (:code:`ichor-al-daemon start`). Use
-:code:`ichor-al-daemon start -f` for a foreground live launch. Explicit
-:code:`-l` and :code:`-b` flags remain available and may be combined as
-:code:`-lb`.
+command exits with a usage error. The first start must explicitly select
+:code:`--mode live` or :code:`--mode dry_run`; that choice is recorded in the
+campaign execution identity and cannot later be changed. Launches are detached
+by default. Use :code:`--foreground` when the shell should remain attached.
 
 
 Modes
 -----
 
-Three execution modes are available. With no mode flag, live mode is selected:
+Two execution modes are available:
 
 .. list-table::
    :header-rows: 1
    :widths: 15 30 35
 
-   * - Flag
+   * - Mode
      - What runs
      - Required backends
-   * - :code:`--dry-run`
+   * - :code:`--mode dry_run`
      - DryRunPhaseExecutor: stubs every external call but writes real
        on-disk artefacts (scripts, reference-data delta versions, manifests,
        journal events, provenance sidecars). The dry-run sacct poller
        returns synthetic COMPLETED observations for every job.
      - None. Works fully off-cluster.
-   * - :code:`--mock-ariadne`
-     - DryRunPhaseExecutor + the mock ARIADNE optimiser (deterministic
-       synthetic trajectories). Useful for testing daemon state-machine
-       changes without the full ARIADNE compile.
-     - None.
-   * - :code:`--live`
+   * - :code:`--mode live`
      - LiveBackendsPhaseExecutor: real sbatch + sacct calls; per-phase
        postprocess parsers consume real Gaussian / AIMAll / FEREBUS
        output. Refuses with exit 12 if any backend is missing on PATH.
      - All cluster backends (see "Backend availability" below).
 
-Always start a new campaign with :code:`--dry-run` to confirm the
+Use a separate campaign with :code:`--mode dry_run` to confirm the
 file-system layout + config are correct before paying the cluster cost
-of a live run.
+of a live run. Execution mode is immutable, so a dry-run campaign cannot be
+converted into a live campaign.
 
 
 Campaign config schema
@@ -107,12 +102,13 @@ The :code:`campaign.yaml` file is a nested block layout. The full
 minimal sparse config overrides only the keys you care about; every other
 field falls back to its dataclass default::
 
-    schema_version: 12
+    schema_version: 13
 
     campaign:
       system_name: CHANGE_ME_SYSTEM
       max_iterations: 50
       sampling_aggressiveness: 5
+      random_seed: 0
       custom_bootstrap: false
 
     runtime:
@@ -130,6 +126,8 @@ field falls back to its dataclass default::
       bulk_fraction: 0.2
       strategy: d_optimal
       d_optimal_degenerate_policy: score_backfill
+      exclude_committed_seed_frames: true
+      recent_seed_cooldown_iterations: 1
 
     ferebus:
       prior_mean_type: 21
@@ -137,10 +135,6 @@ field falls back to its dataclass default::
       prior_mean_iqa_deviation_factor: 1.0
       feature_scaling: true
       property_scaling: false
-
-    anti_overlap:
-      skip_training_seeds: true
-      recent_seeds_cooldown: 3
 
     acquisition:
       property_name: iqa
@@ -172,7 +166,7 @@ Gaussian method and basis set. Property scaling must remain disabled so that
 the physical prior and IQA targets have the same units. Feature scaling is an
 independent setting.
 
-Schema 12 is intentionally strict. Older campaign files are rejected rather
+Schema 13 is intentionally strict. Older campaign files are rejected rather
 than migrated implicitly. The source pool has the fixed campaign path
 ``pool.xyz``. ``ichor-al-daemon init --source /path/to/source.xyz`` copies an
 external source to that path before SHA-pinning it in daemon-owned metadata.
@@ -222,51 +216,13 @@ config) to navigate the nested blocks interactively; every field has its
 own menu item with input validation.
 
 When you save from the menu, ICHOR writes a "diff-against-defaults" YAML
-that contains ONLY the keys you explicitly touched. This is intentional --
-it means combining your campaign.yaml with a preset overlay (e.g.
-:code:`--preset spectroscopy_focused`) leaves preset values intact for
-every key you did not override.
+containing only the keys explicitly touched by the operator. Named presets
+are not supported; the complete effective configuration is determined by
+the schema-13 defaults and the campaign file.
 
 
-Presets
--------
-
-Three YAML presets ship under
-:code:`ichor_hpc/ichor/hpc/active_learning/presets/`. Apply one with
-:code:`--preset NAME` at start time; :code:`campaign.yaml` wins for every
-explicitly-set key, so the preset acts as a strong default::
-
-    ichor-al-daemon start --campaign-dir . \
-        --preset spectroscopy_focused
-
-.. list-table::
-   :header-rows: 1
-   :widths: 25 50
-
-   * - Preset
-     - When to use
-   * - :code:`balanced`
-     - The dataclass defaults. Start here when you have no specific
-       downstream priority.
-   * - :code:`spectroscopy_focused`
-     - Tunes the acquisition surface toward low-frequency modes via
-       :code:`mode_weighting_policy: inverse_frequency` and bumps
-       :code:`max_subspace_dim` to 10. Pins :code:`gradient.mode: active_fd`
-       to avoid the cartesian_fd cost explosion.
-   * - :code:`thermodynamics_focused`
-     - Force-dominant for MD-trajectory stability:
-       :code:`lambda_force: 1.5` and :code:`lambda_energy: 0.5`.
-
-.. warning::
-
-   None of the presets are yet calibrated against a real benchmark
-   dataset. Treat the shipped values as best-effort starting points based
-   on first-principles reasoning; recalibrate them once you have real
-   water-tetramer / N-mer benchmark numbers from a successful live run.
-
-
-Cluster prerequisites for :code:`--live`
-----------------------------------------
+Cluster prerequisites for :code:`--mode live`
+---------------------------------------------
 
 A live campaign on a configured SLURM cluster needs the backend profile in
 ``~/ichor_config.yaml`` plus the Python modules/binaries for that profile.
@@ -305,30 +261,30 @@ Backend availability
      - Verification command
    * - sbatch / sacct
      - Cluster-side (SLURM)
-     - :code:`--live`
+     - :code:`--mode live`
      - :code:`which sbatch && which sacct`
    * - Gaussian g16
      - Cluster module declared in :code:`~/ichor_config.yaml`
-     - :code:`--live`
+     - :code:`--mode live`
      - :code:`ichor-al-daemon preflight --campaign-dir .`
    * - AIMAll
      - Operator-installed at :code:`~/AIMAll/aimqb.ish`
-     - :code:`--live`
+     - :code:`--mode live`
      - :code:`ls ~/AIMAll/aimqb.ish`
    * - FEREBUS (pyferebus)
      - :code:`pip install -e FEREBUS_CPU/pyferebus --no-deps` (in same env as ichor_hpc)
-     - :code:`--live`
+     - :code:`--mode live`
      - :code:`python -c "import pyferebus"`
    * - ARIADNE (oneAPI .so)
      - Build from source with oneAPI/MKL and install into the active venv
-     - :code:`--live` (skip with :code:`--mock-ariadne`)
+     - :code:`--mode live`
      - :code:`python -c "import ariadne"`
    * - POLUS (DIVSampler)
      - :code:`pip install -e POLUS/polus_core_subpackage --no-deps` (in same env as ichor_hpc)
-     - :code:`--live`
+     - :code:`--mode live`
      - :code:`python -c "import polus.samplers.RS.randomSampling"`
 
-The :code:`ichor-al-daemon` :code:`start --live` command exits cleanly
+The :code:`ichor-al-daemon` :code:`start --mode live` command exits cleanly
 (no partial writes) if any of the above checks fail. You can also run
 the backend preflight command directly::
 
@@ -647,7 +603,7 @@ live daemon, but it does not alter :code:`state.json`. Review the proposal,
 then promote it manually::
 
     mv .DATA/ACTIVE_LEARNING/state.json.proposed .DATA/ACTIVE_LEARNING/state.json
-    ichor-al-daemon resume --campaign-dir . --live
+    ichor-al-daemon resume --campaign-dir .
 
 For routine crash recovery, use the guarded apply path instead::
 

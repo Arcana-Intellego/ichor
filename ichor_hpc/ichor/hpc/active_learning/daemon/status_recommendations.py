@@ -44,7 +44,7 @@ def _cmd(campaign_dir: Path, command: str) -> str:
 
 
 def _start_cmd(campaign_dir: Path) -> str:
-    return _cmd(campaign_dir, "start") + " --live"
+    return _cmd(campaign_dir, "start") + " --mode live"
 
 
 def _reconcile_cmd(campaign_dir: Path, *, apply: bool = False) -> str:
@@ -348,7 +348,7 @@ def _halt_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusRecom
             command=_journal_cmd(campaign) + " --event-type halt --last-n 5",
             details=[
                 "changing bootstrap point-allocation sizes after bootstrap has committed cannot remove already-labelled provenance",
-                "for plumbing-only debugging, anti_overlap.skip_training_seeds=false can allow reseeding",
+                "review committed-frame and recent-seed exclusions before initialising a replacement campaign",
             ],
         )
     if "BACKEND_SUBMISSION_FAILED" in upper:

@@ -16,7 +16,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
-from ..campaign_migrations import migrate_campaign_payload
 from ..config import CampaignConfig
 from ..versioning.reference_data import ReferenceDataVersioning
 from ..versioning.trained_models import (
@@ -32,11 +31,10 @@ from .artifact_contracts import (
 from .state import CampaignPhase, CampaignState, atomic_write_json
 
 
-CONFIG_LOCK_SCHEMA_VERSION = 2
-CONFIG_LOCK_LEGACY_SCHEMA_VERSION = 1
+CONFIG_LOCK_SCHEMA_VERSION = 3
 CONFIG_LOCK_FILENAME = "config_lock.json"
-CONFIG_LOCK_POLICY_VERSION = 3
-CONFIG_LOCK_HISTORY_SCHEMA_VERSION = 1
+CONFIG_LOCK_POLICY_VERSION = 4
+CONFIG_LOCK_HISTORY_SCHEMA_VERSION = 2
 CONFIG_LOCK_HISTORY_DIRNAME = "config_lock_history"
 
 
@@ -161,18 +159,9 @@ def _validate_lock_payload(
         policy_version = int(payload.get("field_policy_version", -1))
     except (TypeError, ValueError) as exc:
         raise ValueError("config lock version fields are invalid") from exc
-    if schema_version not in (
-        CONFIG_LOCK_LEGACY_SCHEMA_VERSION,
-        CONFIG_LOCK_SCHEMA_VERSION,
-    ):
+    if schema_version != CONFIG_LOCK_SCHEMA_VERSION:
         raise ValueError("unsupported config lock schema version: " + str(schema_version))
-    if (
-        policy_version != CONFIG_LOCK_POLICY_VERSION
-        and not (
-            schema_version == CONFIG_LOCK_LEGACY_SCHEMA_VERSION
-            and policy_version == 1
-        )
-    ):
+    if policy_version != CONFIG_LOCK_POLICY_VERSION:
         raise ValueError("unsupported config lock field-policy version: " + str(policy_version))
     canonical = payload.get("canonical_config")
     if not isinstance(canonical, dict):
@@ -286,7 +275,7 @@ def restore_config_lock_from_history(
     config_payload = latest.get("canonical_config")
     if not isinstance(config_payload, dict):
         raise ValueError("latest config lock history has no canonical config")
-    config = CampaignConfig.from_dict(migrate_campaign_payload(config_payload))
+    config = CampaignConfig.from_dict(config_payload)
     atomic_write_json(
         path,
         _lock_payload(
@@ -380,32 +369,6 @@ def write_config_lock(
         atomic_write_json(path, refreshed)
         return path
     history_previous = existing
-    if existing is not None and existing.get("history_sequence") is None:
-        legacy_config = CampaignConfig.from_dict(
-            migrate_campaign_payload(existing["canonical_config"])
-        )
-        legacy_sequence, legacy_sha = _write_history_entry(
-            campaign_dir,
-            legacy_config,
-            campaign_uid=effective_uid,
-            previous=None,
-            reason="legacy_config_lock_migration",
-        )
-        history_previous = dict(existing)
-        history_previous["history_sequence"] = legacy_sequence
-        history_previous["history_entry_sha256"] = legacy_sha
-        if config_fingerprint(legacy_config.to_dict()) == new_fingerprint:
-            atomic_write_json(
-                path,
-                _lock_payload(
-                    config,
-                    campaign_uid=effective_uid,
-                    created_at_iso=created,
-                    history_sequence=legacy_sequence,
-                    history_entry_sha256=legacy_sha,
-                ),
-            )
-            return path
     sequence, entry_sha = _write_history_entry(
         campaign_dir,
         config,
@@ -473,6 +436,9 @@ RUNTIME_SAFE_EXACT = {
     "campaign.max_iterations",
     "resources.scheduler_usage_telemetry",
     "resources.scheduler_usage_history_limit",
+    "retention.checkpoint_destination",
+    "retention.checkpoint_every_iterations",
+    "retention.checkpoint_verify_after_write",
 }
 RUNTIME_SAFE_PREFIXES = {
     "runtime.",
@@ -516,7 +482,12 @@ RESOURCE_FUTURE_EXACT = {
     "resources.memory_estimate_safety_factor",
 }
 
-IMMUTABLE_EXACT = {"schema_version"}
+IMMUTABLE_EXACT = {
+    "schema_version",
+    "campaign.system_name",
+    "campaign.random_seed",
+    "retention.checkpoint_required",
+}
 
 PRE_PHASE_A_EXACT = {
     "campaign.custom_bootstrap",
@@ -527,7 +498,6 @@ PRE_PHASE_A_EXACT = {
 PRE_GAUSSIAN_PREFIXES = {"gaussian."}
 PRE_AIMALL_PREFIXES = {"aimall."}
 PRE_FEREBUS_FIRST_EXACT = {
-    "campaign.system_name",
     "ferebus.properties",
     "ferebus.prior_mean_type",
     "ferebus.prior_mean_level_of_theory",
@@ -543,17 +513,24 @@ FUTURE_FEREBUS_EXACT = {
     "ferebus.maxiter",
     "ferebus.is_constant_noise",
     "ferebus.full_ARD",
+}
+PRE_SEED_SELECT_EXACT = {
+    "seed_selection.exclude_committed_seed_frames",
+    "seed_selection.recent_seed_cooldown_iterations",
+}
+SUBMISSION_SNAPSHOT_EXACT = {
+    "runtime.failure_threshold_fraction",
+    "quality_gates.require_readable_aimall_geometry",
+    "quality_gates.require_finite_iqa",
+    "quality_gates.require_finite_integration_error",
+    "quality_gates.max_abs_integration_error",
+    "quality_gates.iqa_energy_recovery_tolerance_ha",
     "quality_gates.ferebus_min_ext_r2",
     "quality_gates.ferebus_max_ext_rmse_ha",
     "quality_gates.ferebus_max_condition_number",
-}
-UNSUPPORTED_FEREBUS_EXACT = {
-    "ferebus.warmstart",
-    "ferebus.warmstart_streak",
-}
-PRE_SEED_SELECT_EXACT = {
-    "anti_overlap.skip_training_seeds",
-    "anti_overlap.recent_seeds_cooldown",
+    "quality_gates.ferebus_max_aggregate_ext_rmse_increase_fraction",
+    "quality_gates.ferebus_max_task_ext_rmse_increase_fraction",
+    "quality_gates.ferebus_regression_abs_tolerance_ha",
 }
 PRE_SEED_SELECT_PREFIXES = {"seed_selection."}
 PRE_ARIADNE_EXACT = {
@@ -589,57 +566,22 @@ PRE_PHASE_B_EXACT = {
     "point_allocation.batch_internal_validation_size",
 }
 PRE_SPLIT_PREFIXES: set[str] = set()
-PRE_AIMALL_QUALITY_EXACT = {
-    "quality_gates.require_readable_aimall_geometry",
-    "quality_gates.require_finite_iqa",
-    "quality_gates.require_finite_integration_error",
-    "quality_gates.max_abs_integration_error",
-    "quality_gates.iqa_energy_recovery_tolerance_ha",
-}
+PRE_AIMALL_QUALITY_EXACT: set[str] = set()
 
 
-# Compatibility names retained for the CLI and older tests. New code should go
-# through ``field_policy_for_path`` / ``describe_field_editability``.
-ALWAYS_SAFE_EXACT = set(RUNTIME_SAFE_EXACT)
-ALWAYS_SAFE_PREFIXES = set(RUNTIME_SAFE_PREFIXES)
-ALWAYS_SAFE_RESOURCE_EXACT = set(RESOURCE_FUTURE_EXACT)
-FUTURE_SAFE_EXACT = set(RESOURCE_FUTURE_EXACT)
-FUTURE_SAFE_PREFIXES = (
-    set(PRE_SEED_SELECT_PREFIXES)
-    | set(PRE_PHASE_B_PREFIXES)
-    | set(PRE_SAMPLING_PROTOCOL_PREFIXES)
-)
-
-ARIADNE_OUTPUT_INTERPRETATION_PREFIXES = {
-    "seed_selection.",
-}
+# Fields whose interpretation is already embedded in current-iteration output.
+ARIADNE_OUTPUT_INTERPRETATION_PREFIXES = {"seed_selection."}
 ARIADNE_OUTPUT_INTERPRETATION_EXACT = {
     "acquisition.gradient.max_acquisition_grad_per_ang",
     "campaign.sampling_aggressiveness",
 }
-
 PHASE_B_OUTPUT_INTERPRETATION_PREFIXES: set[str] = set()
 PHASE_B_OUTPUT_INTERPRETATION_EXACT = (
     set(PRE_PHASE_B_EXACT) | set(PRE_SAMPLING_PROTOCOL_EXACT)
 )
 
-PHASE_LOCAL_EXACT = set(FUTURE_FEREBUS_EXACT)
-COMMITTED_LOCKED_EXACT = (
-    set(PRE_FEREBUS_FIRST_EXACT)
-    | set(PRE_AIMALL_QUALITY_EXACT)
-)
-CAMPAIGN_LOCKED_EXACT = set(IMMUTABLE_EXACT)
-
 
 _POLICIES_EXACT: Dict[str, ConfigFieldPolicy] = {
-    **{
-        path: ConfigFieldPolicy(
-            "unsupported",
-            "unsupported",
-            "unsupported pending FEREBUS-side implementation; no runtime effect",
-        )
-        for path in UNSUPPORTED_FEREBUS_EXACT
-    },
     **{
         path: ConfigFieldPolicy("immutable", "immutable", "never editable mid-campaign")
         for path in IMMUTABLE_EXACT
@@ -647,6 +589,14 @@ _POLICIES_EXACT: Dict[str, ConfigFieldPolicy] = {
     **{
         path: ConfigFieldPolicy("runtime_safe", "runtime", "safe runtime/future daemon change")
         for path in RUNTIME_SAFE_EXACT
+    },
+    **{
+        path: ConfigFieldPolicy(
+            "submission_snapshot",
+            "submission_snapshot",
+            "applies only to future submissions; active attempts retain their snapshot",
+        )
+        for path in SUBMISSION_SNAPSHOT_EXACT
     },
     **{
         path: ConfigFieldPolicy("resource_future", "resource_future", "applies to future submissions only")
@@ -1312,6 +1262,31 @@ def _consumption_block_reason(
         return None
     if kind == "resource_future":
         return None
+    if kind == "submission_snapshot":
+        try:
+            from . import submission_intent as _submission_intent
+
+            intent = _submission_intent.load_intent(
+                campaign_dir,
+                proposed_state.phase.value,
+                int(proposed_state.iteration),
+                expected_campaign_uid=str(proposed_state.campaign_uid),
+            )
+        except FileNotFoundError:
+            intent = None
+        except Exception as exc:
+            return (
+                "submission ownership is inconclusive while checking the "
+                "snapshotted field: " + type(exc).__name__ + ": " + str(exc)[:120]
+            )
+        if isinstance(intent, dict) and str(intent.get("status") or "") in (
+            _submission_intent.ACTIVE_STATUSES
+        ):
+            return (
+                "field is snapshotted by active submission intent "
+                + str(intent.get("attempt_id") or intent.get("submission_identity") or "")
+            )
+        return None
     if kind == "pre_phase_a":
         return _phase_a_consumed(campaign_dir)
     if kind == "pre_gaussian_first":
@@ -1468,22 +1443,18 @@ def review_config_changes(
         return review
 
     try:
-        old_config = CampaignConfig.from_dict(
-            migrate_campaign_payload(old_config)
-        ).to_dict()
-        new_config = CampaignConfig.from_dict(
-            migrate_campaign_payload(canonical_config(config))
-        ).to_dict()
+        old_config = CampaignConfig.from_dict(old_config).to_dict()
+        new_config = CampaignConfig.from_dict(canonical_config(config)).to_dict()
     except Exception as exc:
         review = ConfigLockReview(lock_path=path, lock_existed=True)
         review.blocked_changes.append(
             ConfigChange(
                 "config_lock",
-                "<unmigrated>",
+                "<invalid>",
                 "<current>",
                 "lock_invalid",
                 False,
-                "config lock migration failed: "
+                "config lock validation failed: "
                 + type(exc).__name__
                 + ": "
                 + str(exc)[:160],

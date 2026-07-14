@@ -1141,7 +1141,11 @@ def _basis_factor(config: Any) -> float:
 
 
 def _method_factor(config: Any) -> float:
-    method = (str(getattr(config.gaussian, "method", "")) + " " + str(getattr(config.gaussian, "extra_keywords", ""))).lower()
+    method = (
+        str(getattr(config.gaussian, "method", ""))
+        + " "
+        + " ".join(str(value) for value in config.gaussian.extra_route_keywords)
+    ).lower()
     if "mp2" in method or "ccsd" in method or "casscf" in method:
         return 1.5
     return 1.0

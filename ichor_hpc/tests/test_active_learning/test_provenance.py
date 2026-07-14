@@ -31,6 +31,30 @@ from ichor.hpc.active_learning.versioning.provenance import (
 )
 
 
+def _stage_ariadne_intent(ex, state):
+    from ichor.hpc.active_learning.daemon.config_lock import (
+        canonical_config,
+        config_fingerprint,
+    )
+    from ichor.hpc.active_learning.daemon.state import CampaignPhase
+    from ichor.hpc.active_learning.daemon.submission_intent import (
+        write_pre_submit_intent,
+    )
+
+    write_pre_submit_intent(
+        ex.campaign_dir,
+        campaign_uid=str(state.campaign_uid),
+        phase_name=CampaignPhase.ARIADNE_ARRAY.value,
+        iteration=int(state.iteration),
+        decision_contract={
+            "failure_threshold_fraction": float(
+                ex.config.runtime.failure_threshold_fraction
+            ),
+            "config_sha256": config_fingerprint(canonical_config(ex.config)),
+        },
+    )
+
+
 # --- per-pointdir sidecar ---------------------------------------------
 
 
@@ -385,6 +409,7 @@ def test_full_provenance_chain_through_dry_run_executor(tmp_path):
     state.iteration = 1
 
     ex.submit_or_run(state, CampaignPhase.SEED_SELECT)
+    _stage_ariadne_intent(ex, state)
     ex.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
     from ichor.hpc.active_learning.layout import active_iteration_dir, ariadne_seeds_dir
 
@@ -527,6 +552,7 @@ def test_full_provenance_chain_two_iterations_grows_index_monotonically(tmp_path
             models_version=models_version,
         )
         ex.submit_or_run(state_ns, CampaignPhase.SEED_SELECT)
+        _stage_ariadne_intent(ex, state_ns)
         ex.postprocess(state_ns, CampaignPhase.ARIADNE_ARRAY, observations=[])
         ex.postprocess(state_ns, CampaignPhase.PHASE_B_POLUS, observations=[])
         ex.postprocess(state_ns, CampaignPhase.GAUSSIAN, observations=[])

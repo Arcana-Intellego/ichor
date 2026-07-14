@@ -1,11 +1,4 @@
-"""Campaign configuration -- schema v12.
-
-Schema v12 adds the physical FEREBUS prior contract to the schema-v11 bootstrap
-and exact point-allocation model. Fixed campaign-relative pool/bootstrap inputs
-are admitted by ``ichor-al-daemon init``. Point allocation is therefore an
-explicit scientific contract rather than a cumulative fraction inferred later
-by FEREBUS staging.
-"""
+"""Campaign configuration for the clean-break schema 13 contract."""
 from __future__ import annotations
 
 import math
@@ -75,10 +68,10 @@ __all__ = [
     "BackendResourceBlock",
     "PolusResourceBlock",
     "GaussianResourceBlock",
+    "RetentionConfigBlock",
     "CONFIG_SCHEMA_VERSION",
     "ConfigValidationError",
     "AimallConfigBlock",
-    "VALID_WARMSTART",
     "VALID_DESCRIPTORS",
     "VALID_GEOMETRY_NOVELTY_SCALE_SOURCES",
     "VALID_GEOMETRY_NOVELTY_STATISTICS",
@@ -111,7 +104,6 @@ class ConfigValidationError(ValueError):
     """Raised when campaign.yaml fails to validate."""
 
 
-VALID_WARMSTART = frozenset({"always", "never", "adaptive"})
 VALID_DESCRIPTORS = frozenset({
     "rmsd_massweight", "hybrid_alf_rmsd", "acquisition_weighted",
 })
@@ -208,6 +200,122 @@ def _validate_optional_nonnegative_float(name: str, value: Any) -> None:
         raise ConfigValidationError(name + " must be a number or null")
     if float(value) < 0.0:
         raise ConfigValidationError(name + " must be >= 0")
+
+
+_SIGNED_NUMERIC_PATHS = frozenset({
+    "gaussian.charge",
+    "quality_gates.ferebus_min_ext_r2",
+})
+
+_STRICTLY_POSITIVE_NUMERIC_PATHS = frozenset({
+    "campaign.max_iterations",
+    "point_allocation.bootstrap_training_size",
+    "point_allocation.bootstrap_internal_validation_size",
+    "point_allocation.bootstrap_external_validation_size",
+    "point_allocation.batch_training_size",
+    "seed_selection.n_seeds_per_iteration",
+    "seed_selection.variance_chunk_size",
+    "seed_selection.d_optimal_pool_multiplier",
+    "seed_selection.d_optimal_jitter",
+    "ferebus.nagents",
+    "ferebus.maxiter",
+    "ferebus.prior_mean_iqa_deviation_factor",
+    "acquisition.subspace.neighbour_count",
+    "acquisition.subspace.variance_capture",
+    "acquisition.subspace.min_subspace_dim",
+    "acquisition.subspace.max_subspace_dim",
+    "acquisition.subspace.covariance_regularization",
+    "acquisition.subspace.degeneracy_tolerance",
+    "acquisition.stencils.step_scale",
+    "acquisition.stencils.min_step",
+    "acquisition.stencils.max_step",
+    "acquisition.stencils.jitter",
+    "acquisition.stencils.curvature_floor",
+    "acquisition.stencils.softplus_scale",
+    "acquisition.spectral.omega_floor",
+    "acquisition.gradient.cartesian_step",
+    "acquisition.gradient.active_step",
+    "acquisition.gradient.max_acquisition_grad_per_ang",
+    "acquisition.references.max_reference_samples",
+    "acquisition.references.floor",
+    "acquisition.references.refresh_period",
+    "ariadne.max_iter",
+    "ariadne.gradf_tol",
+    "ariadne.f_tol",
+    "ariadne.delta0",
+    "ariadne.delta_max",
+    "ariadne.gamma",
+    "ariadne.trqn_target_initial_grad_norm",
+    "ariadne.trqn_retry_target_initial_grad_norm",
+    "ariadne.trqn_target_initial_grad_rms",
+    "ariadne.trqn_retry_target_initial_grad_rms",
+    "ariadne.trqn_under_move_target_initial_grad_rms",
+    "ariadne.trqn_min_objective_scale",
+    "ariadne.trqn_max_objective_scale",
+    "ariadne.trqn_fixed_objective_scale",
+    "ariadne.trqn_geodesic_dt",
+    "ariadne.trqn_geodesic_tol",
+    "ariadne.trqn_bt_ic_tol",
+    "ariadne.trqn_max_backtransform_iter",
+    "ariadne.trqn_trust_min",
+    "adversarial_safety.backtrack_points",
+    "error_calibration.min_records_to_apply",
+    "error_calibration.min_model_versions_to_apply",
+    "error_calibration.n_bins",
+    "error_calibration.min_bin_records",
+    "error_calibration.max_records",
+    "error_calibration.quantile",
+    "quality_gates.ferebus_regression_abs_tolerance_ha",
+    "runtime.poll_interval_seconds",
+    "runtime.poll_interval_idle_seconds",
+    "runtime.poll_sacct_error_max_ticks",
+    "runtime.lease_stale_seconds",
+    "runtime.postprocess_settle_attempts",
+    "runtime.scheduler_command_timeout_seconds",
+    "runtime.cancellation_confirmation_timeout_seconds",
+    "runtime.journal_max_bytes",
+    "runtime.journal_retained_files",
+    "runtime.lease_heartbeat_seconds",
+    "runtime.lease_heartbeat_failure_max",
+    "runtime.background_readiness_timeout_seconds",
+    "runtime.ledger_lock_timeout_seconds",
+    "resources.memory_estimate_safety_factor",
+    "resources.scheduler_usage_history_limit",
+    "resources.polus.auto_max_workers",
+    "resources.polus.target_pairs_per_worker",
+    "resources.gaussian.memory_fraction_of_slurm",
+    "gaussian.spin_multiplicity",
+    "aimall.encomp",
+    "retention.checkpoint_every_iterations",
+})
+
+
+def _walk_config_leaves(value: Any, prefix: str = ""):
+    if is_dataclass(value):
+        for config_field in fields(value):
+            path = config_field.name if not prefix else prefix + "." + config_field.name
+            yield from _walk_config_leaves(getattr(value, config_field.name), path)
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from _walk_config_leaves(item, prefix + "[" + str(index) + "]")
+        return
+    yield prefix, value
+
+
+def _validate_numeric_domains(config: Any) -> None:
+    """Apply the campaign-wide finite and baseline sign contracts."""
+    for path, value in _walk_config_leaves(config):
+        if value is None or isinstance(value, bool):
+            continue
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ConfigValidationError(path + " must be finite")
+        if isinstance(value, (int, float)):
+            numeric = float(value)
+            if path not in _SIGNED_NUMERIC_PATHS and numeric < 0.0:
+                raise ConfigValidationError(path + " must be >= 0")
+            if path in _STRICTLY_POSITIVE_NUMERIC_PATHS and numeric <= 0.0:
+                raise ConfigValidationError(path + " must be > 0")
 
 
 def _validate_token(name: str, value: Any, pattern: re.Pattern, description: str) -> None:
@@ -458,6 +566,7 @@ class CampaignIdentityConfigBlock:
     system_name: str = "SYSTEM"
     max_iterations: int = 50
     sampling_aggressiveness: int = 5
+    random_seed: int = 0
     custom_bootstrap: bool = False
 
 
@@ -493,12 +602,12 @@ class SeedSelectionConfigBlock:
     d_optimal_novelty_floor: float = 1.0e-12
     d_optimal_score_power: float = 1.0
     d_optimal_degenerate_policy: str = "score_backfill"
+    exclude_committed_seed_frames: bool = True
+    recent_seed_cooldown_iterations: int = 1
 
 
 @dataclass
 class AntiOverlapConfigBlock:
-    skip_training_seeds: bool = True
-    recent_seeds_cooldown: int = 3
     min_post_ariadne_whitened_distance: float = 0.01
     max_post_ariadne_whitened_distance: float = 10.0
     # when true, seeds flagged moved_too_little / moved_too_far are DROPPED before the expensive QM
@@ -528,13 +637,6 @@ class GeometryNoveltyConfigBlock:
 
 @dataclass
 class FerebusConfigBlock:
-    # NOT YET IMPLEMENTED. warmstart (reuse the previous iteration's converged hyperparameters as the
-    # initial guess) needs a FEREBUS_CPU change to accept a seed-theta -- there is no config-only way
-    # in; see Appendix W of the patch plan. these two are still parsed + validated so existing
-    # campaign.yaml and the menu keep working, but nothing consumes them yet, so do not expect any
-    # warmstart behaviour from them until the FEREBUS-side feature lands. (A34)
-    warmstart: str = "adaptive"
-    warmstart_streak: int = 5
     kernel: str = "rbfc_per"
     loss: str = "huber"
     nagents: int = 20
@@ -633,6 +735,9 @@ class QualityGatesConfigBlock:
     ferebus_min_ext_r2: Optional[float] = None
     ferebus_max_ext_rmse_ha: Optional[float] = None
     ferebus_max_condition_number: Optional[float] = None
+    ferebus_max_aggregate_ext_rmse_increase_fraction: float = 0.05
+    ferebus_max_task_ext_rmse_increase_fraction: float = 0.20
+    ferebus_regression_abs_tolerance_ha: float = 1.0e-6
     ariadne_max_displacement_ang: Optional[float] = 1.25
     ariadne_min_pair_distance_ang: Optional[float] = 0.60
 
@@ -652,6 +757,23 @@ class RuntimeConfigBlock:
     poll_squeue_inconclusive_max_ticks: int = 10
     failure_threshold_fraction: float = 0.5
     halt_on_tick_exception: bool = True
+    scheduler_command_timeout_seconds: int = 60
+    cancellation_confirmation_timeout_seconds: int = 120
+    journal_max_bytes: int = 67_108_864
+    journal_retained_files: int = 8
+    lease_heartbeat_seconds: int = 30
+    lease_heartbeat_failure_max: int = 3
+    clock_skew_tolerance_seconds: int = 60
+    background_readiness_timeout_seconds: int = 60
+    ledger_lock_timeout_seconds: int = 30
+
+
+@dataclass
+class RetentionConfigBlock:
+    checkpoint_destination: Optional[str] = None
+    checkpoint_every_iterations: int = 1
+    checkpoint_required: bool = False
+    checkpoint_verify_after_write: bool = True
 
 
 @dataclass
@@ -976,13 +1098,13 @@ class ResourceConfigBlock:
 class GaussianConfigBlock:
     # level of theory for the ab-initio training-data calculations. the
     # defaults are a reasonable starting point; set these per system in
-    # campaign.yaml. extra_keywords is a space-separated string appended to
-    # the route line (the staging layer always adds the wfn output itself).
+    # campaign.yaml. Route additions are parsed as individual allowlisted
+    # tokens by the staging layer.
     method: str = "B3LYP"
     basis_set: str = "aug-cc-pVTZ"
     charge: int = 0
     spin_multiplicity: int = 1
-    extra_keywords: str = ""
+    extra_route_keywords: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -996,7 +1118,7 @@ class AimallConfigBlock:
 
 @dataclass
 class CampaignConfig:
-    """Top-level campaign configuration (schema v12)."""
+    """Top-level campaign configuration (schema 13)."""
 
     schema_version: int = CONFIG_SCHEMA_VERSION
 
@@ -1031,6 +1153,7 @@ class CampaignConfig:
         default_factory=QualityGatesConfigBlock
     )
     runtime: RuntimeConfigBlock = field(default_factory=RuntimeConfigBlock)
+    retention: RetentionConfigBlock = field(default_factory=RetentionConfigBlock)
     stop: StopConfigBlock = field(default_factory=StopConfigBlock)
     resources: ResourceConfigBlock = field(default_factory=ResourceConfigBlock)
     gaussian: GaussianConfigBlock = field(default_factory=GaussianConfigBlock)
@@ -1168,25 +1291,19 @@ class CampaignConfig:
 
     @classmethod
     def from_yaml(cls, path):
-        import yaml
-        with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
+        from .strict_yaml import StrictYamlError, load_yaml_strict
+
+        try:
+            data = load_yaml_strict(path)
+        except StrictYamlError as exc:
+            raise ConfigValidationError(str(exc)) from exc
         return cls.from_dict(data)
 
     def to_yaml(self, path):
-        """Write ONLY user-edited fields (diff against
-        CampaignConfig() defaults) plus 'schema_version'.
-
-        'to_yaml(asdict(self))' previously emitted
-        all ~108 lines of nested defaults. The next '--preset NAME' run
-        deep-merged campaign.yaml ONTO the preset, which then silently
-        wins on every key (since every key is explicitly present in
-        campaign.yaml). Presets become a no-op the moment the user
-        Saves once. Diff-against-defaults fixes the semantic without
-        operator-tracking machinery.
-        """
+        """Write a validated sparse campaign configuration atomically."""
         import yaml
         from .daemon.state import atomic_write_text
+        self._validate()
         diff = diff_against_defaults(self)
         text = yaml.safe_dump(diff, sort_keys=True, default_flow_style=False)
         atomic_write_text(path, text)
@@ -1197,10 +1314,12 @@ class CampaignConfig:
         NOT used by the menu's Save-to-disk path."""
         import yaml
         from .daemon.state import atomic_write_text
+        self._validate()
         text = yaml.safe_dump(self.to_dict(), sort_keys=True, default_flow_style=False)
         atomic_write_text(path, text)
 
     def _validate(self):
+        _validate_numeric_domains(self)
         _validate_token(
             "campaign.system_name",
             self.campaign.system_name,
@@ -1422,6 +1541,10 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "campaign.sampling_aggressiveness must be in [1, 10]"
             )
+        _validate_nonnegative_int(
+            "campaign.random_seed",
+            self.campaign.random_seed,
+        )
         if self.seed_selection.n_seeds_per_iteration <= 0:
             raise ConfigValidationError(
                 "seed_selection.n_seeds_per_iteration must be > 0"
@@ -1468,6 +1591,14 @@ class CampaignConfig:
             _validate_optional_nonnegative_float(name, value)
         if float(self.seed_selection.d_optimal_jitter) <= 0.0:
             raise ConfigValidationError("seed_selection.d_optimal_jitter must be > 0")
+        if not isinstance(self.seed_selection.exclude_committed_seed_frames, bool):
+            raise ConfigValidationError(
+                "seed_selection.exclude_committed_seed_frames must be a boolean"
+            )
+        _validate_nonnegative_int(
+            "seed_selection.recent_seed_cooldown_iterations",
+            self.seed_selection.recent_seed_cooldown_iterations,
+        )
         if not 0.0 <= float(self.runtime.failure_threshold_fraction) <= 1.0:
             raise ConfigValidationError(
                 "runtime.failure_threshold_fraction must be in [0, 1]"
@@ -1501,13 +1632,24 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "runtime.halt_on_tick_exception must be a boolean"
             )
+        for name in (
+            "scheduler_command_timeout_seconds",
+            "cancellation_confirmation_timeout_seconds",
+            "journal_max_bytes",
+            "journal_retained_files",
+            "lease_heartbeat_seconds",
+            "lease_heartbeat_failure_max",
+            "background_readiness_timeout_seconds",
+            "ledger_lock_timeout_seconds",
+        ):
+            _validate_positive_int("runtime." + name, getattr(self.runtime, name))
+        _validate_nonnegative_int(
+            "runtime.clock_skew_tolerance_seconds",
+            self.runtime.clock_skew_tolerance_seconds,
+        )
         if not isinstance(self.resources.fail_on_memory_estimate_exceeds_request, bool):
             raise ConfigValidationError(
                 "resources.fail_on_memory_estimate_exceeds_request must be a boolean"
-            )
-        if self.anti_overlap.recent_seeds_cooldown < 0:
-            raise ConfigValidationError(
-                "anti_overlap.recent_seeds_cooldown must be >= 0"
             )
         if self.anti_overlap.min_post_ariadne_whitened_distance < 0.0:
             raise ConfigValidationError(
@@ -1553,10 +1695,6 @@ class CampaignConfig:
         if self.geometry_novelty.fallback_scale_angstrom <= 0.0:
             raise ConfigValidationError(
                 "geometry_novelty.fallback_scale_angstrom must be > 0"
-            )
-        if self.ferebus.warmstart not in VALID_WARMSTART:
-            raise ConfigValidationError(
-                "ferebus.warmstart must be one of " + repr(sorted(VALID_WARMSTART))
             )
         try:
             from .ferebus_prior import (
@@ -1633,6 +1771,19 @@ class CampaignConfig:
                 raise ConfigValidationError(
                     "quality_gates.ferebus_min_ext_r2 must be a number or null"
                 )
+            if float(qg.ferebus_min_ext_r2) > 1.0:
+                raise ConfigValidationError(
+                    "quality_gates.ferebus_min_ext_r2 must be <= 1"
+                )
+        for name in (
+            "ferebus_max_aggregate_ext_rmse_increase_fraction",
+            "ferebus_max_task_ext_rmse_increase_fraction",
+            "ferebus_regression_abs_tolerance_ha",
+        ):
+            _validate_optional_nonnegative_float(
+                "quality_gates." + name,
+                getattr(qg, name),
+            )
         safety = self.adversarial_safety
         for bool_name in (
             "adversarial_safety.enabled",
@@ -1847,6 +1998,10 @@ class CampaignConfig:
                 "ariadne.trqn_geodesic_bt_mode must be one of "
                 + repr(sorted(VALID_TRQN_GEODESIC_BT_MODES))
             )
+        if float(ariadne.delta_max) < float(ariadne.delta0):
+            raise ConfigValidationError(
+                "ariadne.delta_max must be >= ariadne.delta0"
+            )
         # Subspace-dim cross-validation. These catch configurations
         #that pass field-by-field validation but blow up later inside PCA.
         if self.acquisition.subspace.neighbour_count < 1:
@@ -1868,6 +2023,16 @@ class CampaignConfig:
                 "acquisition.subspace.neighbour_count must be >= max_subspace_dim "
                 "(PCA needs at least max_subspace_dim neighbours to fill the subspace)"
             )
+        if not 0.0 < float(self.acquisition.subspace.variance_capture) <= 1.0:
+            raise ConfigValidationError(
+                "acquisition.subspace.variance_capture must be in (0, 1]"
+            )
+        if self.acquisition.subspace.gaussian_weight_sigma is not None and float(
+            self.acquisition.subspace.gaussian_weight_sigma
+        ) <= 0.0:
+            raise ConfigValidationError(
+                "acquisition.subspace.gaussian_weight_sigma must be > 0 or null"
+            )
         if self.acquisition.gradient.mode not in VALID_GRADIENT_MODES:
             raise ConfigValidationError(
                 "acquisition.gradient.mode must be one of "
@@ -1876,6 +2041,24 @@ class CampaignConfig:
         if not isinstance(self.acquisition.allow_uniform_posterior_fallback, bool):
             raise ConfigValidationError(
                 "acquisition.allow_uniform_posterior_fallback must be a boolean"
+            )
+        stencils = self.acquisition.stencils
+        if float(stencils.max_step) < float(stencils.min_step):
+            raise ConfigValidationError(
+                "acquisition.stencils.max_step must be >= acquisition.stencils.min_step"
+            )
+        weights = self.acquisition.weights
+        if not any(
+            float(value) > 0.0
+            for value in (
+                weights.lambda_force,
+                weights.lambda_frequency,
+                weights.lambda_anharmonic,
+                weights.lambda_energy,
+            )
+        ):
+            raise ConfigValidationError(
+                "at least one informative acquisition weight must be > 0"
             )
         ba = self.acquisition.barrier
         for name, value in (
@@ -2119,6 +2302,43 @@ class CampaignConfig:
         ):
             if float(value) <= 0.0:
                 raise ConfigValidationError(name + " must be > 0")
+        if self.retention.checkpoint_destination is not None:
+            destination = str(self.retention.checkpoint_destination)
+            if not destination.strip():
+                raise ConfigValidationError(
+                    "retention.checkpoint_destination must be a non-empty path or null"
+                )
+            if destination != destination.strip():
+                raise ConfigValidationError(
+                    "retention.checkpoint_destination must not have surrounding whitespace"
+                )
+        _validate_positive_int(
+            "retention.checkpoint_every_iterations",
+            self.retention.checkpoint_every_iterations,
+        )
+        if not isinstance(self.retention.checkpoint_required, bool):
+            raise ConfigValidationError(
+                "retention.checkpoint_required must be a boolean"
+            )
+        if not isinstance(self.retention.checkpoint_verify_after_write, bool):
+            raise ConfigValidationError(
+                "retention.checkpoint_verify_after_write must be a boolean"
+            )
+        if self.retention.checkpoint_required and self.retention.checkpoint_destination is None:
+            raise ConfigValidationError(
+                "retention.checkpoint_destination is required when checkpoint_required is true"
+            )
+        if not isinstance(self.gaussian.extra_route_keywords, list):
+            raise ConfigValidationError(
+                "gaussian.extra_route_keywords must be a list of strings"
+            )
+        for index, keyword in enumerate(self.gaussian.extra_route_keywords):
+            if not isinstance(keyword, str) or not keyword.strip():
+                raise ConfigValidationError(
+                    "gaussian.extra_route_keywords["
+                    + str(index)
+                    + "] must be a non-empty string"
+                )
         gaussian_mem_per_cpu = self.resources.mem_per_cpu_for("GAUSSIAN")
         gaussian_cpus_per_task = self.resources.cpus_for("GAUSSIAN")
         if (

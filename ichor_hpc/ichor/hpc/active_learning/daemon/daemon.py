@@ -1286,6 +1286,7 @@ class Daemon:
                         getattr(state, "replacement_round", 0)
                     ),
                     expected_tasks=planned_expected_tasks,
+                    decision_contract=self._submission_decision_contract(),
                 )
                 intent_written = True
             except Exception as exc:
@@ -1885,12 +1886,44 @@ class Daemon:
         if phase == CampaignPhase.ARIADNE_ARRAY:
             return self._postprocess(state, phase, observations, summary)
 
-        success_ratio = summary.n_completed / summary.n_tasks
-        failure_threshold = 1.0 - self.config.runtime.failure_threshold_fraction
+        if summary.is_fully_successful:
+            return self._postprocess(state, phase, observations, summary)
 
-        if summary.is_fully_successful or success_ratio >= failure_threshold:
+        success_ratio = summary.n_completed / summary.n_tasks
+        try:
+            failure_threshold_fraction = (
+                _submission_intent.snapshotted_failure_threshold_fraction(
+                    self.campaign_dir,
+                    phase.value,
+                    int(state.iteration),
+                    expected_campaign_uid=str(state.campaign_uid),
+                )
+            )
+        except Exception as exc:
+            return self._halt(
+                state,
+                phase,
+                "submission_decision_contract_invalid: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:180],
+            )
+        failure_threshold = 1.0 - failure_threshold_fraction
+
+        if success_ratio >= failure_threshold:
             return self._postprocess(state, phase, observations, summary)
         return self._handle_failure(state, phase, observations, summary)
+
+    def _submission_decision_contract(self) -> Dict[str, Any]:
+        """Snapshot decision controls that must not change in flight."""
+        from .config_lock import canonical_config, config_fingerprint
+
+        return {
+            "failure_threshold_fraction": float(
+                self.config.runtime.failure_threshold_fraction
+            ),
+            "config_sha256": config_fingerprint(canonical_config(self.config)),
+        }
 
     def _collect_terminal_resource_usage(
         self,
@@ -3460,6 +3493,7 @@ class Daemon:
         *,
         max_ticks: Optional[int] = None,
         catch_keyboard_interrupt: bool = True,
+        readiness_callback: Optional[Callable[[], None]] = None,
     ) -> int:
         """Main loop. Returns an integer exit code suitable for sys.exit.
 
@@ -3490,6 +3524,8 @@ class Daemon:
                         )
                         return 2
                     self._journal("daemon_started", pid=os.getpid())
+                    if readiness_callback is not None:
+                        readiness_callback()
                     try:
                         return self._run_loop(max_ticks=max_ticks)
                     except KeyboardInterrupt:

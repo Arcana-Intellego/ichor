@@ -45,7 +45,6 @@ START_DAEMON_FOREGROUND_DEFAULTS = {
     "selected_max_ticks": 0,            # 0 = unset
     "selected_poll_interval": 0,         # 0 = use config default
     "selected_config": "",
-    "selected_preset": "",
     "reopen_converged": False,
     "cancel_stop_request": False,
 }
@@ -58,7 +57,6 @@ class StartDaemonForegroundMenuOptions(MenuOptions):
     selected_max_ticks: int
     selected_poll_interval: int
     selected_config: str
-    selected_preset: str
     reopen_converged: bool
     cancel_stop_request: bool
 
@@ -98,9 +96,9 @@ class StartDaemonForegroundFunctions:
 
     @staticmethod
     def select_mode():
-        """Pick mock-ariadne / dry-run / live (restricted)."""
+        """Pick dry-run or live execution."""
         chosen = user_input_restricted(
-            ["mock-ariadne", "dry-run", "live"],
+            ["dry_run", "live"],
             "Select mode: ",
             start_daemon_foreground_menu_options.selected_mode,
         )
@@ -131,13 +129,6 @@ class StartDaemonForegroundFunctions:
         ) or ""
 
     @staticmethod
-    def select_preset():
-        start_daemon_foreground_menu_options.selected_preset = user_input_free_flow(
-            "Preset name (blank for none): ",
-            start_daemon_foreground_menu_options.selected_preset,
-        ) or ""
-
-    @staticmethod
     def launch():
         """Launch the daemon in the foreground; the menu blocks until exit."""
         import importlib
@@ -165,22 +156,17 @@ class StartDaemonForegroundFunctions:
             if start_daemon_foreground_menu_options.selected_config
             else None
         )
-        preset_name = (
-            start_daemon_foreground_menu_options.selected_preset
-            if start_daemon_foreground_menu_options.selected_preset
-            else None
-        )
-        if edit_menu.saved_config_review_failed(config_override, preset_name):
-            print("Selected config override could not be reviewed (or selected preset is invalid):")
+        if edit_menu.saved_config_review_failed(config_override):
+            print("Selected config override could not be reviewed:")
             print("  " + edit_menu.saved_config_lock_review_error())
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
-        if edit_menu.saved_config_has_lock_changes(config_override, preset_name):
+        if edit_menu.saved_config_has_lock_changes(config_override):
             if config_override:
                 print("Selected config override differs from the config lock:")
             else:
                 print("Saved campaign.yaml differs from the config lock:")
-            print(edit_menu.format_saved_config_lock_review(config_override, preset_name))
+            print(edit_menu.format_saved_config_lock_review(config_override))
             print("Run reconcile --apply for safe edits or revert blocked edits before starting.")
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
@@ -204,9 +190,7 @@ class StartDaemonForegroundFunctions:
         ns = argparse.Namespace(
             campaign_dir=str(campaign_dir),
             config=config_override,
-            mock_ariadne=(mode == "mock-ariadne"),
-            dry_run=(mode == "dry-run"),
-            live=(mode == "live"),
+            mode=mode,
             poll_interval=(
                 start_daemon_foreground_menu_options.selected_poll_interval
                 if start_daemon_foreground_menu_options.selected_poll_interval > 0
@@ -217,7 +201,6 @@ class StartDaemonForegroundFunctions:
                 if start_daemon_foreground_menu_options.selected_max_ticks > 0
                 else None
             ),
-            preset=preset_name,
             reopen_converged=bool(
                 start_daemon_foreground_menu_options.reopen_converged
             ),
@@ -255,7 +238,7 @@ START_DAEMON_FOREGROUND_FIELD_SPECS = [
     spec(
         "selected_mode",
         "choice",
-        choices=["mock-ariadne", "dry-run", "live"],
+        choices=["dry_run", "live"],
         prompt="Select mode: ",
         item_text="Set mode",
         display_path="mode",
@@ -282,13 +265,6 @@ START_DAEMON_FOREGROUND_FIELD_SPECS = [
         prompt="Config path override",
         item_text="Set config override",
         display_path="config",
-    ),
-    spec(
-        "selected_preset",
-        "clearable_str",
-        prompt="Preset name",
-        item_text="Set preset",
-        display_path="preset",
     ),
     spec(
         "reopen_converged",

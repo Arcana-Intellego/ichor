@@ -1309,7 +1309,7 @@ final_checks() {
     local smoke_dir
     smoke_dir="$(mktemp -d)"
     cat > "${smoke_dir}/campaign.yaml" <<'EOF'
-schema_version: 12
+schema_version: 13
 campaign:
   system_name: INSTALLER_SMOKE
   max_iterations: 1

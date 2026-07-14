@@ -24,6 +24,7 @@ def _yaml():
             "updates. Reinstall ichor-hpc in the active environment."
         ) from exc
     yaml = YAML(typ="rt")
+    yaml.allow_duplicate_keys = False
     yaml.preserve_quotes = True
     yaml.default_flow_style = False
     return yaml

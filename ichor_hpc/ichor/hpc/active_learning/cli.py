@@ -15,15 +15,15 @@ Commands that operate on a campaign accept '--campaign-dir DIR'. When it is
 omitted, the CLI uses the current working directory if it contains
 'campaign.yaml'.
 
-The CLI builds the Daemon with default executor/sacct_poller for production;
-'--mock-ariadne' swaps the executor for a deterministic Mock so dry-runs
-exercise the state machine without invoking real backends.
+The CLI binds each campaign to exactly one immutable execution mode on first
+start: ``live`` or ``dry_run``.
 """
 from __future__ import annotations
 
 import argparse
 import os
 import json
+import secrets
 import subprocess
 import sys
 import time
@@ -72,7 +72,6 @@ from .daemon.live_executor import (
     make_live_job_finder,
     make_live_job_liveness_checker,
 )
-from .daemon.phase_executor import MockPhaseExecutor
 from .daemon.preflight import check_backends, missing_backend_message
 from .daemon.submitted_environment_smoke import run_submitted_environment_smoke
 from .daemon.recovery_contracts import (
@@ -123,6 +122,7 @@ __all__ = [
 
 
 BACKGROUND_CHILD_ENV = "ICHOR_DAEMON_BACKGROUND_CHILD"
+BACKGROUND_READINESS_ENV = "ICHOR_DAEMON_READINESS_PATH"
 BACKGROUND_LOG_FILENAME = "daemon.out"
 BACKGROUND_PID_FILENAME = "daemon.pid"
 BACKGROUND_PID_SCHEMA_VERSION = 1
@@ -179,8 +179,8 @@ def resolve_campaign_dir(
 
 
 _BOOLEAN_SHORT_CLUSTERS = {
-    "start": frozenset({"l", "b", "d", "m"}),
-    "resume": frozenset({"l", "b", "d", "m"}),
+    "start": frozenset({"b"}),
+    "resume": frozenset({"b"}),
     "stop": frozenset({"x"}),
     "status": frozenset({"j", "v"}),
     "reconcile": frozenset({"a", "F"}),
@@ -236,7 +236,7 @@ def expand_boolean_short_flag_clusters(argv: Optional[Sequence[str]]) -> List[st
             raise ShortFlagClusterError(
                 "unsupported short flag cluster "
                 + repr(token)
-                + "; use separate flags such as '-l -b', and pass values as "
+                + "; use separate flags such as '-b', and pass values as "
                 "separate arguments such as '-t 10'."
             )
         else:
@@ -689,18 +689,12 @@ def _background_child_argv(args: argparse.Namespace, campaign: Path) -> List[str
     config = getattr(args, "config", None)
     if config:
         argv.extend(["--config", str(Path(config).expanduser().resolve())])
-    if bool(getattr(args, "mock_ariadne", False)):
-        argv.append("--mock-ariadne")
-    if bool(getattr(args, "dry_run", False)):
-        argv.append("--dry-run")
-    if bool(getattr(args, "live", False)):
-        argv.append("--live")
+    if getattr(args, "mode", None):
+        argv.extend(["--mode", str(args.mode)])
     if getattr(args, "poll_interval", None) is not None:
         argv.extend(["--poll-interval", str(int(args.poll_interval))])
     if getattr(args, "max_ticks", None) is not None:
         argv.extend(["--max-ticks", str(int(args.max_ticks))])
-    if getattr(args, "preset", None):
-        argv.extend(["--preset", str(args.preset)])
     return argv
 
 
@@ -714,28 +708,33 @@ def _tail_text(path: Path, *, max_lines: int = 40) -> str:
     return "\n".join(lines[-max_lines:])
 
 
-def _selected_mode_count(args: argparse.Namespace) -> int:
-    return sum([
-        bool(getattr(args, "live", False)),
-        bool(getattr(args, "dry_run", False)),
-        bool(getattr(args, "mock_ariadne", False)),
-    ])
+def _terminate_unready_background_child(child: subprocess.Popen) -> None:
+    """Stop a detached child that did not establish daemon ownership."""
+    try:
+        child.terminate()
+    except OSError:
+        return
+    wait = getattr(child, "wait", None)
+    if not callable(wait):
+        return
+    try:
+        wait(timeout=5.0)
+        return
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    kill = getattr(child, "kill", None)
+    if callable(kill):
+        try:
+            kill()
+            wait(timeout=5.0)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
 
 def _launch_background_daemon(args: argparse.Namespace, campaign: Path) -> int:
     if os.environ.get(BACKGROUND_CHILD_ENV) == "1":
         print("--background is not allowed inside a background child process", file=sys.stderr)
         return 2
-    if _selected_mode_count(args) > 1:
-        print(
-            "--live, --dry-run, and --mock-ariadne are mutually exclusive; pick one.",
-            file=sys.stderr,
-        )
-        return 2
-    if _selected_mode_count(args) == 0:
-        print("no execution mode selected. Pick --live, --dry-run, or --mock-ariadne.", file=sys.stderr)
-        return 3
-
     paths = _campaign_paths(campaign)
     paths["data"].mkdir(parents=True, exist_ok=True)
     lock_status = _probe_daemon_lock(paths["lock"])
@@ -775,6 +774,14 @@ def _launch_background_daemon(args: argparse.Namespace, campaign: Path) -> int:
     argv = _background_child_argv(args, campaign)
     env = os.environ.copy()
     env[BACKGROUND_CHILD_ENV] = "1"
+    readiness_path = paths["data"] / (
+        "daemon.readiness."
+        + str(os.getpid())
+        + "."
+        + secrets.token_hex(8)
+        + ".json"
+    )
+    env[BACKGROUND_READINESS_ENV] = str(readiness_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -807,20 +814,60 @@ def _launch_background_daemon(args: argparse.Namespace, campaign: Path) -> int:
         )
         return 9
 
-    time.sleep(1.5)
-    rc = child.poll()
-    if rc is not None:
+    timeout_seconds = 60
+    try:
+        config_path = (
+            Path(args.config).expanduser().resolve()
+            if getattr(args, "config", None)
+            else campaign / "campaign.yaml"
+        )
+        timeout_seconds = int(
+            CampaignConfig.from_yaml(config_path).runtime.background_readiness_timeout_seconds
+        )
+    except Exception:
+        pass
+    deadline = time.monotonic() + float(timeout_seconds)
+    readiness_payload = None
+    while time.monotonic() < deadline:
+        rc = child.poll()
+        if rc is not None:
+            print(
+                "background daemon exited during startup with code "
+                + str(rc)
+                + "; log: "
+                + str(log_path),
+                file=sys.stderr,
+            )
+            tail = _tail_text(log_path)
+            if tail:
+                print(tail, file=sys.stderr)
+            try:
+                readiness_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return int(rc) if int(rc) != 0 else 9
+        if readiness_path.is_file() and not readiness_path.is_symlink():
+            try:
+                readiness_payload = json.loads(
+                    readiness_path.read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError):
+                readiness_payload = None
+            if isinstance(readiness_payload, dict) and readiness_payload.get("ready") is True:
+                break
+        time.sleep(0.1)
+    if not isinstance(readiness_payload, dict) or readiness_payload.get("ready") is not True:
+        _terminate_unready_background_child(child)
         print(
-            "background daemon exited during startup with code "
-            + str(rc)
-            + "; log: "
-            + str(log_path),
+            "background daemon did not acknowledge preflight and lock readiness "
+            "within " + str(timeout_seconds) + " seconds; log: " + str(log_path),
             file=sys.stderr,
         )
-        tail = _tail_text(log_path)
-        if tail:
-            print(tail, file=sys.stderr)
-        return int(rc) if int(rc) != 0 else 0
+        try:
+            readiness_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return 9
 
     payload = {
         "schema_version": BACKGROUND_PID_SCHEMA_VERSION,
@@ -831,8 +878,14 @@ def _launch_background_daemon(args: argparse.Namespace, campaign: Path) -> int:
         "started_at_utc": timestamp,
         "host": os.uname().nodename if hasattr(os, "uname") else "",
         "python_executable": sys.executable,
+        "readiness_path": str(readiness_path),
+        "readiness": readiness_payload,
     }
     _atomic_write_background_pid(pid_path, payload)
+    try:
+        readiness_path.unlink(missing_ok=True)
+    except OSError:
+        pass
     print("daemon started in background")
     print("  pid: " + str(child.pid))
     print("  log: " + str(log_path))
@@ -1649,7 +1702,6 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "seed_selected": "seeds selected",
     "anti_overlap_flagged": "anti-overlap flagged",
     "reference_scales_computed": "reference scales computed",
-    "preset_loaded": "preset loaded",
     "failure_action": "phase failure decision",
     "halt": "daemon halted",
     "live_postprocess_refused": "live postprocess refused",
@@ -2128,23 +2180,9 @@ def cmd_start(args: argparse.Namespace) -> int:
         return 2
 
     config_path = Path(args.config).resolve() if args.config else campaign / "campaign.yaml"
-    if not config_path.exists() and not getattr(args, "preset", None):
+    if not config_path.exists():
         print("campaign config not found: " + str(config_path), file=sys.stderr)
         return 2
-
-    mode_count = sum([
-        bool(getattr(args, "live", False)),
-        bool(getattr(args, "dry_run", False)),
-        bool(getattr(args, "mock_ariadne", False)),
-    ])
-    if mode_count > 1:
-        print(
-            "--live, --dry-run, and --mock-ariadne are mutually exclusive; "
-            "pick one.", file=sys.stderr,
-        )
-        return 2
-    if mode_count == 0:
-        args.live = True
     if bool(getattr(args, "foreground", False)) and bool(
         getattr(args, "background", False)
     ):
@@ -2190,11 +2228,13 @@ def cmd_start(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             print(
-                "Then start live mode with:",
+                "Then bind the new campaign to live mode with:",
                 file=sys.stderr,
             )
             print(
-                "  ichor-al-daemon start --campaign-dir " + str(campaign),
+                "  ichor-al-daemon start --campaign-dir "
+                + str(campaign)
+                + " --mode live",
                 file=sys.stderr,
             )
             return 8
@@ -2264,44 +2304,17 @@ def cmd_start(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 6
-    if bool(getattr(args, "background", False)):
-        return _launch_background_daemon(args, campaign)
-    #Fix: --preset overlays the operator-supplied campaign.yaml on top of the
-    #named preset. The preset is the base; the YAML on disk is the overlay.
-    import yaml as _yaml
-    if config_path.exists():
-        with open(config_path, "r", encoding="utf-8") as _f:
-            campaign_payload = _yaml.safe_load(_f) or {}
-    else:
-        campaign_payload = {"schema_version": 3}
-    if getattr(args, "preset", None):
-        from .preset_loader import apply_preset, PresetError
-        try:
-            effective, preset_payload = apply_preset(args.preset, campaign_payload)
-        except PresetError as exc:
-            print("preset load failed: " + str(exc), file=sys.stderr)
-            return 2
-        try:
-            config = CampaignConfig.from_dict(effective)
-        except Exception as exc:
-            print("effective config validation failed: " + str(exc), file=sys.stderr)
-            return 2
-        #journal emits the preset name; the daemon emits on first tick.
-        try:
-            from .daemon.journal import append_event
-            journal_path = (
-                campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson"
-            )
-            journal_path.parent.mkdir(parents=True, exist_ok=True)
-            append_event(
-                journal_path, "preset_loaded",
-                preset_name=str(args.preset),
-                n_overlaid_keys=int(len(preset_payload)),
-            )
-        except Exception:
-            pass
-    else:
+    try:
         config = CampaignConfig.from_yaml(config_path)
+    except Exception as exc:
+        print(
+            "campaign config could not be loaded: "
+            + type(exc).__name__
+            + ": "
+            + str(exc),
+            file=sys.stderr,
+        )
+        return 2
 
     try:
         lock_review = assert_config_unchanged_for_start(
@@ -2325,10 +2338,41 @@ def cmd_start(args: argparse.Namespace) -> int:
             print(formatted, file=sys.stderr)
         return 7
 
-    #NB: journal the effective-config diff against CampaignConfig()
-    #defaults. Operators inspecting the journal can see EXACTLY what the
-    #preset overlay + their campaign.yaml combined to produce, without
-    #having to diff two files by hand.
+    from .execution_identity import ExecutionIdentityError, ensure_execution_identity
+
+    placeholder_system = config.campaign.system_name in {
+        "SYSTEM",
+        "CHANGE_ME_SYSTEM",
+    }
+    if getattr(args, "mode", None) == "live" and placeholder_system:
+        print(
+            "live mode requires campaign.system_name to be set to the real "
+            "molecular system, not " + repr(config.campaign.system_name),
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        effective_mode, execution_identity = ensure_execution_identity(
+            campaign,
+            campaign_uid=str(state_for_lock.campaign_uid),
+            config=config,
+            requested_mode=getattr(args, "mode", None),
+        )
+    except ExecutionIdentityError as exc:
+        print("execution identity refused start: " + str(exc), file=sys.stderr)
+        return 13
+    if effective_mode == "live" and placeholder_system:
+        print(
+            "live mode requires campaign.system_name to be set to the real "
+            "molecular system, not " + repr(config.campaign.system_name),
+            file=sys.stderr,
+        )
+        return 2
+
+    if bool(getattr(args, "background", False)):
+        return _launch_background_daemon(args, campaign)
+
+    # Journal the validated effective configuration diff for operator review.
     try:
         from .config import diff_against_defaults
         from .daemon.journal import append_event
@@ -2361,11 +2405,12 @@ def cmd_start(args: argparse.Namespace) -> int:
         #journal failure.
         pass
 
-    job_finder = None  # set in the live branch below; mock/dry leave it None (no adopt check)
+    # Only the live branch adopts scheduler jobs; dry-run has no scheduler.
+    job_finder = None
     job_name_accounting_finder = None
     job_liveness_checker = None
     resource_usage_collector = None
-    if getattr(args, "live", False):
+    if effective_mode == "live":
         avail = check_backends()
         preflight = evaluate_campaign_preflight(
             campaign,
@@ -2392,16 +2437,13 @@ def cmd_start(args: argparse.Namespace) -> int:
         from .daemon.resource_usage import collect_usage
 
         resource_usage_collector = collect_usage
-    elif getattr(args, "dry_run", False):
+    elif effective_mode == "dry_run":
         executor = DryRunPhaseExecutor(
             campaign_dir=campaign,
             config=config,
         )
         sacct_poller = DryRunSacctPoller(elapsed_seconds=0)
-    elif getattr(args, "mock_ariadne", False):
-        executor = MockPhaseExecutor()
-        sacct_poller = None
-    else:  # pragma: no cover - mode_count is validated before side effects
+    else:  # pragma: no cover - identity validation guarantees this
         raise AssertionError("validated execution mode was not handled")
 
     daemon_kwargs = {
@@ -2423,7 +2465,35 @@ def cmd_start(args: argparse.Namespace) -> int:
     if args.poll_interval is not None:
         #override config-loaded poll interval per-invocation.
         d.config.runtime.poll_interval_seconds = int(args.poll_interval)
-    return d.run(max_ticks=args.max_ticks, catch_keyboard_interrupt=True)
+    readiness_callback = None
+    readiness_value = os.environ.get(BACKGROUND_READINESS_ENV)
+    if readiness_value:
+        readiness_path = Path(readiness_value)
+
+        def _acknowledge_background_readiness() -> None:
+            from .daemon.state import atomic_write_json
+
+            atomic_write_json(
+                readiness_path,
+                {
+                    "schema_version": 1,
+                    "ready": True,
+                    "pid": int(os.getpid()),
+                    "campaign_dir": str(campaign),
+                    "mode": str(effective_mode),
+                    "execution_identity_digest_sha256": str(
+                        execution_identity.get("digest_sha256") or ""
+                    ),
+                    "acknowledged_at_unix": float(time.time()),
+                },
+            )
+
+        readiness_callback = _acknowledge_background_readiness
+    return d.run(
+        max_ticks=args.max_ticks,
+        catch_keyboard_interrupt=True,
+        readiness_callback=readiness_callback,
+    )
 
 
 _FEREBUS_JOB_NAME_EXTERNAL_PHASES = frozenset()
@@ -2707,7 +2777,10 @@ def _print_cancel_jobs_summary(summary: Dict[str, Any]) -> None:
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
-    campaign = resolve_campaign_dir(args.campaign_dir)
+    campaign = resolve_campaign_dir(
+        args.campaign_dir,
+        require_campaign_yaml=False,
+    )
     paths = _campaign_paths(campaign)
     if not paths["state"].exists():
         if bool(getattr(args, "cancel_jobs", False)):
@@ -3088,7 +3161,10 @@ def format_recovery_dashboard(campaign_dir: Path) -> str:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    campaign = resolve_campaign_dir(args.campaign_dir)
+    campaign = resolve_campaign_dir(
+        args.campaign_dir,
+        require_campaign_yaml=False,
+    )
     paths = _campaign_paths(campaign)
     if not paths["state"].exists():
         payload: Dict[str, Any] = {
@@ -5180,7 +5256,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             campaign,
             report,
             contract_status,
-            mode="dry-run",
+            mode="dry_run",
             proposed_state_path=target,
             config_review=config_review,
             runtime_status=runtime_status,
@@ -5739,7 +5815,10 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
 
 
 def cmd_journal(args: argparse.Namespace) -> int:
-    campaign = resolve_campaign_dir(args.campaign_dir)
+    campaign = resolve_campaign_dir(
+        args.campaign_dir,
+        require_campaign_yaml=False,
+    )
     if bool(getattr(args, "list_event_types", False)):
         for event_type in sorted(KNOWN_EVENT_TYPES):
             print(event_type)
@@ -6845,7 +6924,7 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
         lines.append(
             "    ichor-al-daemon start --campaign-dir "
             + str(payload.get("campaign_dir"))
-            + " --live"
+            + " --mode live"
         )
     else:
         lines.append("  fix failed checks before live start")
@@ -7073,6 +7152,26 @@ def cmd_resource_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _positive_cli_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("expected a positive integer")
+    return parsed
+
+
+def _nonnegative_cli_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a non-negative integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("expected a non-negative integer")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     examples = """\
 Campaign directory:
@@ -7083,11 +7182,11 @@ Examples:
   cd ~/campaigns/water_001
   ichor-al-daemon init
   ichor-al-daemon status
-  ichor-al-daemon start -l
-  ichor-al-daemon start -lb
+  ichor-al-daemon start --mode live
+  ichor-al-daemon start --mode live --background
   ichor-al-daemon journal -e phase_submitted
 
-  ichor-al-daemon start -c ~/campaigns/water_001 --live
+  ichor-al-daemon start -c ~/campaigns/water_001 --mode live
 """
     parser = argparse.ArgumentParser(
         prog="ichor-al-daemon",
@@ -7148,16 +7247,15 @@ Examples:
         "start",
         help="Start the daemon.",
         description=(
-            "Start a campaign daemon. The default is --live --background. "
+            "Start a campaign daemon. The first start requires an explicit "
+            "--mode; the mode is immutable thereafter. "
             "From inside a campaign directory, --campaign-dir can be omitted."
         ),
         epilog=(
             "Examples:\n"
-            "  ichor-al-daemon start -d -t 10\n"
-            "  ichor-al-daemon start\n"
-            "  ichor-al-daemon start -lb\n"
-            "  ichor-al-daemon start --foreground\n"
-            "  ichor-al-daemon start -d -f -t 10"
+            "  ichor-al-daemon start --mode dry_run --max-ticks 10\n"
+            "  ichor-al-daemon start --mode live\n"
+            "  ichor-al-daemon start --mode live --foreground"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -7169,43 +7267,27 @@ Examples:
         help="Path to campaign.yaml (defaults to <campaign-dir>/campaign.yaml).",
     )
     p_start.add_argument(
-        "-m",
-        "--mock-ariadne", action="store_true",
-        help="Use MockPhaseExecutor for pure state-machine progression tests (no on-disk artefacts).",
-    )
-    p_start.add_argument(
-        "-d",
-        "--dry-run", action="store_true",
-        help="Use DryRunPhaseExecutor: stub all backend calls but produce real on-disk artefacts (scripts, reference-data delta versions, manifests).",
-    )
-    p_start.add_argument(
-        "-l",
-        "--live", action="store_true",
-        help="Use LiveBackendsPhaseExecutor against configured Slurm backends (sbatch + Gaussian + AIMAll + FEREBUS + ARIADNE). Refuses with exit 12 if any are missing.",
+        "--mode",
+        choices=["live", "dry_run"],
+        default=None,
+        help=(
+            "Execution mode. Required on the first start and permanently "
+            "bound to the campaign execution identity."
+        ),
     )
     p_start.add_argument(
         "-p",
         "--poll-interval",
-        type=int,
+        type=_positive_cli_int,
         default=None,
         help="Override poll_interval_seconds from the config.",
     )
     p_start.add_argument(
         "-t",
         "--max-ticks",
-        type=int,
+        type=_nonnegative_cli_int,
         default=None,
         help="Limit total tick count (testing / time-boxed runs).",
-    )
-    p_start.add_argument(
-        "-P",
-        "--preset",
-        default=None,
-        help=(
-            "Name of a YAML preset under ichor_hpc/.../presets/ to overlay "
-            "campaign.yaml on top of. campaign.yaml wins on every "
-            "explicitly-present key."
-        ),
     )
     add_background_options(p_start)
     p_start.set_defaults(func=cmd_start)
@@ -7291,12 +7373,14 @@ Examples:
     )
     add_campaign(p_resume)
     p_resume.add_argument("-g", "--config", default=None)
-    p_resume.add_argument("-m", "--mock-ariadne", action="store_true")
-    p_resume.add_argument("-d", "--dry-run", action="store_true")
-    p_resume.add_argument("-l", "--live", action="store_true")
-    p_resume.add_argument("-p", "--poll-interval", type=int, default=None)
-    p_resume.add_argument("-t", "--max-ticks", type=int, default=None)
-    p_resume.add_argument("-P", "--preset", default=None)
+    p_resume.add_argument(
+        "--mode",
+        choices=["live", "dry_run"],
+        default=None,
+        help="Optional assertion of the campaign's already-bound execution mode.",
+    )
+    p_resume.add_argument("-p", "--poll-interval", type=_positive_cli_int, default=None)
+    p_resume.add_argument("-t", "--max-ticks", type=_nonnegative_cli_int, default=None)
     p_resume.add_argument(
         "--reopen-converged",
         action="store_true",

@@ -60,7 +60,6 @@ __all__ = [
 #  seed_selected           -- placeholder
 #  anti_overlap_flagged    -- placeholder
 #  reference_scales_computed -- placeholder
-#  preset_loaded           -- placeholder
 KNOWN_EVENT_TYPES = (
     "campaign_started",
     "campaign_completed",
@@ -83,7 +82,6 @@ KNOWN_EVENT_TYPES = (
     "seed_selected",
     "anti_overlap_flagged",
     "reference_scales_computed",
-    "preset_loaded",
     "failure_action",
     "halt",
     # new additions I:

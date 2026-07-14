@@ -1,17 +1,11 @@
-"""Campaign schema version gate.
-
-Schema 12 is an intentional clean break in the FEREBUS prior contract.  Active
-learning now requires the isolated-atom IQA prior (mean type 21), unscaled
-properties, and explicit feature/property scaling fields.  Older files are
-rejected rather than silently reinterpreted with different scientific units.
-"""
+"""Clean-break campaign schema version gate."""
 from __future__ import annotations
 
 import copy
 from typing import Any, Dict, Mapping
 
 
-CURRENT_SCHEMA_VERSION = 12
+CURRENT_SCHEMA_VERSION = 13
 
 
 class CampaignMigrationError(ValueError):
@@ -26,18 +20,17 @@ def migrate_campaign_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
     if not isinstance(payload, Mapping):
         raise CampaignMigrationError("campaign.yaml must be a mapping at the top level")
     data: Dict[str, Any] = copy.deepcopy(dict(payload))
-    try:
-        version = int(data.get("schema_version", -1))
-    except (TypeError, ValueError) as exc:
-        raise CampaignMigrationError("campaign.yaml schema_version must be an integer") from exc
+    version = data.get("schema_version", -1)
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise CampaignMigrationError("campaign.yaml schema_version must be an integer")
     if version != CURRENT_SCHEMA_VERSION:
         raise CampaignMigrationError(
             "campaign.yaml schema_version "
             + str(version)
             + " is unsupported; this release requires schema_version "
             + str(CURRENT_SCHEMA_VERSION)
-            + " with the physical FEREBUS prior_mean_* and explicit "
-            + "feature_scaling/property_scaling fields"
+            + "; schema 13 is a clean break and old campaigns must be "
+            + "initialised again"
         )
     return data
 

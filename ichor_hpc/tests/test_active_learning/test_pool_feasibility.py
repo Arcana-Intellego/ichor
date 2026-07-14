@@ -20,7 +20,7 @@ def _config(*, bootstrap=12, seeds=8, final=4, max_iterations=1, skip=True):
         int(final) - cfg.point_allocation.batch_internal_validation_size
     )
     cfg.max_iterations = int(max_iterations)
-    cfg.anti_overlap.skip_training_seeds = bool(skip)
+    cfg.seed_selection.exclude_committed_seed_frames = bool(skip)
     cfg._validate()
     return cfg
 

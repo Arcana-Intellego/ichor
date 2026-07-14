@@ -8,6 +8,7 @@ attempt was in progress and must run the adoption check before resubmitting.
 from __future__ import annotations
 
 import json
+import math
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +37,29 @@ def _duration_seconds(start: Optional[str], end: Optional[str]) -> Optional[floa
     except ValueError:
         return None
     return max(0.0, float((end_dt - start_dt).total_seconds()))
+
+
+def _validated_decision_contract(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("submission intent decision_contract must be an object")
+    contract = dict(value)
+    threshold = contract.get("failure_threshold_fraction")
+    if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+        raise ValueError("submission intent failure_threshold_fraction is malformed")
+    parsed_threshold = float(threshold)
+    if not math.isfinite(parsed_threshold) or not 0.0 <= parsed_threshold <= 1.0:
+        raise ValueError(
+            "submission intent failure_threshold_fraction must be finite and in [0, 1]"
+        )
+    config_digest = contract.get("config_sha256")
+    if (
+        not isinstance(config_digest, str)
+        or len(config_digest) != 64
+        or any(ch not in "0123456789abcdef" for ch in config_digest)
+    ):
+        raise ValueError("submission intent decision config_sha256 is invalid")
+    contract["failure_threshold_fraction"] = parsed_threshold
+    return contract
 
 
 def intent_dir(campaign_dir: Union[str, Path]) -> Path:
@@ -171,6 +195,9 @@ def load_intent(
         if parsed_expected_tasks <= 0:
             raise ValueError("submission intent expected_tasks must be > 0")
         data["expected_tasks"] = parsed_expected_tasks
+    decision_contract = data.get("decision_contract")
+    if decision_contract is not None:
+        data["decision_contract"] = _validated_decision_contract(decision_contract)
     return data
 
 
@@ -211,6 +238,7 @@ def write_pre_submit_intent(
     iteration: int,
     replacement_round: int = 0,
     expected_tasks: Optional[int] = None,
+    decision_contract: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     path = intent_path(campaign_dir, phase_name, iteration)
     previous = load_intent(campaign_dir, phase_name, iteration)
@@ -275,7 +303,31 @@ def write_pre_submit_intent(
         if parsed_expected <= 0:
             raise ValueError("submission intent expected_tasks must be > 0")
         payload["expected_tasks"] = parsed_expected
+    if decision_contract is not None:
+        payload["decision_contract"] = _validated_decision_contract(decision_contract)
     return _write_payload(path, payload)
+
+
+def snapshotted_failure_threshold_fraction(
+    campaign_dir: Union[str, Path],
+    phase_name: str,
+    iteration: int,
+    *,
+    expected_campaign_uid: Optional[str] = None,
+) -> float:
+    """Return the immutable batch-failure threshold for one submission."""
+    intent = load_intent(
+        campaign_dir,
+        phase_name,
+        iteration,
+        expected_campaign_uid=expected_campaign_uid,
+    )
+    if not isinstance(intent, dict):
+        raise ValueError("submission intent is unavailable for batch decision")
+    contract = intent.get("decision_contract")
+    if not isinstance(contract, dict):
+        raise ValueError("submission intent has no decision_contract snapshot")
+    return float(contract["failure_threshold_fraction"])
 
 
 def update_intent_status(

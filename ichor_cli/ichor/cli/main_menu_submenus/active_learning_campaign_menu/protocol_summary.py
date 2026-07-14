@@ -221,7 +221,7 @@ def _pool_feasibility_summary(
     campaign_dir: str | Path | None,
 ) -> list[str]:
     if campaign_dir is None:
-        if bool(config.anti_overlap.skip_training_seeds):
+        if bool(config.seed_selection.exclude_committed_seed_frames):
             required = (
                 int(config.point_allocation.bootstrap_total_size)
                 + int(config.campaign.max_iterations)

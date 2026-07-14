@@ -15,6 +15,13 @@ from ichor.hpc.active_learning.daemon.dry_run_executor import (
 from ichor.hpc.active_learning.daemon.live_executor import LiveBackendsPhaseExecutor
 from ichor.hpc.active_learning.daemon.phase_executor import BackendSubmissionError
 from ichor.hpc.active_learning.daemon.state import CampaignPhase
+from ichor.hpc.active_learning.daemon.submission_intent import (
+    write_pre_submit_intent,
+)
+from ichor.hpc.active_learning.daemon.config_lock import (
+    canonical_config,
+    config_fingerprint,
+)
 from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
 from ichor.hpc.active_learning.handoff_manifests import (
     ariadne_task_map_path,
@@ -83,6 +90,21 @@ def _select(ex, *, iteration=1):
     return state, ex.submit_or_run(state, CampaignPhase.SEED_SELECT)
 
 
+def _stage_ariadne_intent(ex, state):
+    write_pre_submit_intent(
+        ex.campaign_dir,
+        campaign_uid=str(state.campaign_uid),
+        phase_name=CampaignPhase.ARIADNE_ARRAY.value,
+        iteration=int(state.iteration),
+        decision_contract={
+            "failure_threshold_fraction": float(
+                ex.config.runtime.failure_threshold_fraction
+            ),
+            "config_sha256": config_fingerprint(canonical_config(ex.config)),
+        },
+    )
+
+
 # --- (case a) training-set + (case b) recent-seeds cooldown wiring -----
 
 
@@ -132,7 +154,7 @@ def test_seed_selection_permanently_excludes_pool_matched_bootstrap_geometry(
     cfg = CampaignConfig()
     cfg.campaign.custom_bootstrap = True
     cfg.seed_selection.n_seeds_per_iteration = 3
-    cfg.anti_overlap.skip_training_seeds = False
+    cfg.seed_selection.exclude_committed_seed_frames = False
     ex = DryRunPhaseExecutor(campaign_dir=cd, config=cfg)
 
     _state, _result = _select(ex)
@@ -286,14 +308,14 @@ def test_inline_seed_select_updates_recent_seeds_cache_on_each_run(tmp_path):
         _select(ex, iteration=it)
     cache = load_recent_seeds_payload(cd)
     iters = [e["iteration"] for e in cache["history"]]
-    assert iters == [2, 3, 4]
+    assert iters == [4]
 
 
 def test_inline_seed_select_uses_configured_recent_seed_cooldown(tmp_path):
     cd = tmp_path / "campaign"
     cfg = CampaignConfig()
     cfg.seed_selection.n_seeds_per_iteration = 1
-    cfg.anti_overlap.recent_seeds_cooldown = 1
+    cfg.seed_selection.recent_seed_cooldown_iterations = 1
     ex = DryRunPhaseExecutor(campaign_dir=cd, config=cfg)
     TrajectoryPool.import_from(FIXTURE, cd)
     _select(ex, iteration=1)
@@ -410,6 +432,7 @@ def test_anti_overlap_passes_when_distance_within_band(tmp_path):
     ex = DryRunPhaseExecutor(campaign_dir=cd, config=cfg)
     TrajectoryPool.import_from(FIXTURE, cd)
     state, _result = _select(ex)
+    _stage_ariadne_intent(ex, state)
     ex.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
     pool_dir = ariadne_seeds_dir(active_iteration_dir(cd, 1))
     seed_dirs = sorted(d for d in pool_dir.iterdir() if d.is_dir())
@@ -433,6 +456,7 @@ def test_anti_overlap_uses_campaign_whitened_distance_bounds(tmp_path):
     ex = DryRunPhaseExecutor(campaign_dir=cd, config=cfg)
     TrajectoryPool.import_from(FIXTURE, cd)
     state, _result = _select(ex)
+    _stage_ariadne_intent(ex, state)
     ex.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
 
     pool_dir = ariadne_seeds_dir(active_iteration_dir(cd, 1))
@@ -469,6 +493,7 @@ def test_post_ariadne_uses_picked_seed_frame_ids_when_present(tmp_path):
     TrajectoryPool.import_from(FIXTURE, cd)
     state, _result = _select(ex)
     picked = load_seeds_picked(active_iteration_dir(cd, 1), expected_iteration=1)
+    _stage_ariadne_intent(ex, state)
     ex.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
     pool_dir = ariadne_seeds_dir(active_iteration_dir(cd, 1))
     seed_dirs = sorted(d for d in pool_dir.iterdir() if d.is_dir())

@@ -59,8 +59,32 @@ def _active_state():
     )
 
 
+def _stage_ariadne_intent(ex, state):
+    from ichor.hpc.active_learning.daemon.config_lock import (
+        canonical_config,
+        config_fingerprint,
+    )
+    from ichor.hpc.active_learning.daemon.submission_intent import (
+        write_pre_submit_intent,
+    )
+
+    write_pre_submit_intent(
+        ex.campaign_dir,
+        campaign_uid=str(state.campaign_uid),
+        phase_name=CampaignPhase.ARIADNE_ARRAY.value,
+        iteration=int(state.iteration),
+        decision_contract={
+            "failure_threshold_fraction": float(
+                ex.config.runtime.failure_threshold_fraction
+            ),
+            "config_sha256": config_fingerprint(canonical_config(ex.config)),
+        },
+    )
+
+
 def _prepare_active_quantum_allocation(ex, state):
     ex.submit_or_run(state, CampaignPhase.SEED_SELECT)
+    _stage_ariadne_intent(ex, state)
     ex.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
     ex.postprocess(state, CampaignPhase.PHASE_B_POLUS, observations=[])
     ex.submit_or_run(state, CampaignPhase.SPLIT)

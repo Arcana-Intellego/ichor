@@ -1,6 +1,6 @@
 """Dry-run PhaseExecutor for end-to-end smoke testing of the daemon.
 
-    > On CSF4 scratch, run "ichor-al-daemon start --dry-run"
+    > Run "ichor-al-daemon start --mode dry_run" in a dedicated campaign.
     > against a small fixture (water tetramer, 100 frames). Verify all
     > directories, manifests, journal entries, sbatch invocations, sacct polls,
     > and atomic renames work end-to-end without real Gaussian / AIMAll /
@@ -38,7 +38,6 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from ..config import CampaignConfig
 from ..versioning.provenance import (
-    DEFAULT_RECENT_SEEDS_COOLDOWN,
     PROVENANCE_FILENAME,
     append_recent_seeds,
     append_to_index,
@@ -1006,11 +1005,9 @@ class DryRunPhaseExecutor:
                 "current trajectory pool: " + repr(invalid_bootstrap_ids[:20])
             )
 
-        # anti-overlap case (a): forbid frame_ids already used to seed a committed training point.
-        # honour the config switch -- it used to be hardcoded on, so an operator setting
-        # skip_training_seeds: false (e.g. to allow re-seeding training frames on a tiny system) was
-        # silently ignored (A35).
-        if getattr(self.config.anti_overlap, "skip_training_seeds", True):
+        # Exclude stable frame identities that have already produced committed
+        # reference data before any stochastic or model-based seed scoring.
+        if self.config.seed_selection.exclude_committed_seed_frames:
             training_forbidden = load_training_seed_frame_ids(
                 self.campaign_dir,
                 reference_data_dir=self.campaign_dir / self.reference_data_dir_name,
@@ -1070,10 +1067,10 @@ class DryRunPhaseExecutor:
                 + str(len(recent_forbidden))
                 + ", forbidden_union="
                 + str(len(forbidden))
-                + ", skip_training_seeds="
-                + str(bool(getattr(self.config.anti_overlap, "skip_training_seeds", True)))
-                + ", recent_seeds_cooldown="
-                + str(int(getattr(self.config.anti_overlap, "recent_seeds_cooldown", 0)))
+                + ", exclude_committed_seed_frames="
+                + str(bool(self.config.seed_selection.exclude_committed_seed_frames))
+                + ", recent_seed_cooldown_iterations="
+                + str(int(self.config.seed_selection.recent_seed_cooldown_iterations))
             )
         if selection.n < requested_n:
             raise BackendSubmissionError(
@@ -1089,10 +1086,10 @@ class DryRunPhaseExecutor:
                 + str(len(recent_forbidden))
                 + ", forbidden_union="
                 + str(len(forbidden))
-                + ", skip_training_seeds="
-                + str(bool(getattr(self.config.anti_overlap, "skip_training_seeds", True)))
-                + ", recent_seeds_cooldown="
-                + str(int(getattr(self.config.anti_overlap, "recent_seeds_cooldown", 0)))
+                + ", exclude_committed_seed_frames="
+                + str(bool(self.config.seed_selection.exclude_committed_seed_frames))
+                + ", recent_seed_cooldown_iterations="
+                + str(int(self.config.seed_selection.recent_seed_cooldown_iterations))
             )
 
         bulk_set = {int(i) for i in selection.bulk_indices}
@@ -2049,15 +2046,18 @@ class DryRunPhaseExecutor:
             "rejected": [],
         })
         self.artefact_log.append(str(manifest_path))
-        from .config_lock import canonical_config, config_fingerprint
+        decision_contract = self._decision_contract_for_submission(
+            state,
+            "ARIADNE_ARRAY",
+        )
 
         decision_path = write_ariadne_batch_decision(
             iter_dir,
             campaign_uid=str(campaign_uid),
             iteration=int(state.iteration),
-            config_sha256=config_fingerprint(canonical_config(self.config)),
+            config_sha256=str(decision_contract["config_sha256"]),
             failure_threshold_fraction=float(
-                self.config.runtime.failure_threshold_fraction
+                decision_contract["failure_threshold_fraction"]
             ),
             expected_n=int(len(tasks)),
             n_accepted=int(len(accepted_records)),
@@ -2396,7 +2396,7 @@ class DryRunPhaseExecutor:
     # --- helpers --------------------------------------------------
 
     def _recent_seed_cooldown(self) -> int:
-        return int(getattr(self.config.anti_overlap, "recent_seeds_cooldown", DEFAULT_RECENT_SEEDS_COOLDOWN))
+        return int(self.config.seed_selection.recent_seed_cooldown_iterations)
 
     def _trajectory_sha256_if_available(self) -> str:
         """Return the SHA-256 of the imported trajectory pool manifest if
@@ -2494,6 +2494,30 @@ class DryRunPhaseExecutor:
             append_event(journal_path, event_type, **payload)
         except Exception:
             pass
+
+    def _failure_threshold_for_submission(self, state, phase_name: str) -> float:
+        """Read the immutable batch threshold captured before submission."""
+        return float(
+            self._decision_contract_for_submission(state, phase_name)[
+                "failure_threshold_fraction"
+            ]
+        )
+
+    def _decision_contract_for_submission(self, state, phase_name: str) -> Dict[str, Any]:
+        from .submission_intent import load_intent
+
+        intent = load_intent(
+            self.campaign_dir,
+            str(phase_name),
+            int(state.iteration),
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+        if not isinstance(intent, dict):
+            raise ValueError("submission intent is unavailable for batch decision")
+        contract = intent.get("decision_contract")
+        if not isinstance(contract, dict):
+            raise ValueError("submission intent has no decision_contract snapshot")
+        return dict(contract)
 
 
     def _maybe_refresh_reference_scales(self, state) -> bool:

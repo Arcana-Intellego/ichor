@@ -1043,8 +1043,7 @@ def stage_gaussian_inputs(
     staging.mkdir(parents=True, exist_ok=True)
 
     keywords = ["nosymm", "output=wfn", "force", "geom=notest"]
-    if str(g.extra_keywords).strip():
-        keywords += str(g.extra_keywords).split()
+    keywords += [str(value) for value in g.extra_route_keywords]
 
     pointdirs: List[Path] = []
     for k, atoms in enumerate(frames):

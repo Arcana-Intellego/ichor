@@ -416,7 +416,7 @@ def test_phase_walltime_changes_are_allowed_runtime_changes(tmp_path):
     assert not review.blocked_changes
 
 
-def test_schema_v3_config_lock_is_rejected_without_compatibility_migration(tmp_path):
+def test_legacy_config_lock_is_rejected_without_compatibility_migration(tmp_path):
     campaign = _campaign(tmp_path)
     current = CampaignConfig()
     old_v3 = {
@@ -463,7 +463,7 @@ def test_schema_v3_config_lock_is_rejected_without_compatibility_migration(tmp_p
     review = review_config_changes(campaign, current, fresh_campaign_state())
     assert not review.allowed
     assert [change.path for change in review.blocked_changes] == ["config_lock"]
-    assert "requires schema_version 12" in review.blocked_changes[0].reason
+    assert "unsupported config lock schema version" in review.blocked_changes[0].reason
 
 
 def test_retry_phase_requires_retryable_journal_event():
@@ -515,7 +515,7 @@ def test_reconcile_apply_uses_safe_max_iterations_change(tmp_path, capsys):
     assert recovered.max_iterations == 7
 
 
-def test_memory_estimate_guard_default_migration_is_normalised(tmp_path):
+def test_legacy_memory_guard_lock_is_rejected_without_migration(tmp_path):
     campaign = _campaign(tmp_path)
     original = CampaignConfig()
     write_config_lock(campaign, original)
@@ -536,10 +536,8 @@ def test_memory_estimate_guard_default_migration_is_normalised(tmp_path):
     proposed.phase = CampaignPhase.INITIAL_AIMALL
     review = review_config_changes(campaign, changed, proposed)
 
-    assert review.allowed
-    assert not review.changed
-    assert not review.allowed_changes
-    assert not review.blocked_changes
+    assert not review.allowed
+    assert [change.path for change in review.blocked_changes] == ["config_lock"]
 
 
 def test_missing_current_lock_restores_only_from_verified_history(tmp_path):
@@ -583,7 +581,7 @@ def test_config_lock_history_restore_rejects_fork(tmp_path):
         )
 
 
-def test_acquisition_driver_default_migration_is_normalised(tmp_path):
+def test_legacy_acquisition_driver_lock_is_rejected_without_migration(tmp_path):
     campaign = _campaign(tmp_path)
     original = CampaignConfig()
     write_config_lock(campaign, original)
@@ -604,10 +602,8 @@ def test_acquisition_driver_default_migration_is_normalised(tmp_path):
     proposed.phase = CampaignPhase.ARIADNE_ARRAY
     review = review_config_changes(campaign, changed, proposed)
 
-    assert review.allowed
-    assert not review.changed
-    assert not review.allowed_changes
-    assert not review.blocked_changes
+    assert not review.allowed
+    assert [change.path for change in review.blocked_changes] == ["config_lock"]
 
 
 def test_default_campaign_config_has_no_unclassified_lock_paths():
@@ -1070,7 +1066,7 @@ def test_custom_bootstrap_flag_blocks_after_phase_a_output(tmp_path):
     assert "Phase A" in review.blocked_changes[0].reason
 
 
-def test_system_name_allowed_before_first_ferebus(tmp_path):
+def test_system_name_is_immutable_once_config_lock_exists(tmp_path):
     campaign = _campaign(tmp_path)
     original = CampaignConfig()
     write_config_lock(campaign, original)
@@ -1081,9 +1077,9 @@ def test_system_name_allowed_before_first_ferebus(tmp_path):
     proposed.phase = CampaignPhase.INITIAL_FEREBUS
     review = review_config_changes(campaign, changed, proposed)
 
-    assert review.allowed
-    assert [c.path for c in review.allowed_changes] == ["campaign.system_name"]
-    assert not review.blocked_changes
+    assert not review.allowed
+    assert [c.path for c in review.blocked_changes] == ["campaign.system_name"]
+    assert "immutable" in review.blocked_changes[0].reason
 
 
 def test_system_name_blocks_after_ferebus_staging_exists(tmp_path):
@@ -1102,7 +1098,7 @@ def test_system_name_blocks_after_ferebus_staging_exists(tmp_path):
 
     assert not review.allowed
     assert [c.path for c in review.blocked_changes] == ["campaign.system_name"]
-    assert "FEREBUS" in review.blocked_changes[0].reason
+    assert "immutable" in review.blocked_changes[0].reason
 
 
 def test_removed_fractional_split_controls_are_absent_from_schema(tmp_path):
@@ -2518,12 +2514,11 @@ def test_start_refuses_config_drift_without_reconcile_apply(tmp_path, capsys):
         argparse.Namespace(
             campaign_dir=str(campaign),
             config=None,
-            preset=None,
-            live=False,
-            dry_run=True,
-            mock_ariadne=False,
+            mode="dry_run",
             poll_interval=None,
             max_ticks=1,
+            background=False,
+            foreground=True,
         )
     )
     err = capsys.readouterr().err
@@ -2548,10 +2543,7 @@ def test_start_allows_clean_first_run_with_config_and_pool(tmp_path):
         argparse.Namespace(
             campaign_dir=str(campaign),
             config=None,
-            preset=None,
-            live=False,
-            dry_run=True,
-            mock_ariadne=False,
+            mode="dry_run",
             poll_interval=None,
             max_ticks=1,
             background=False,
@@ -2573,10 +2565,7 @@ def test_start_refuses_missing_state_when_config_lock_exists(tmp_path, capsys):
         argparse.Namespace(
             campaign_dir=str(campaign),
             config=None,
-            preset=None,
-            live=False,
-            dry_run=True,
-            mock_ariadne=False,
+            mode="dry_run",
             poll_interval=None,
             max_ticks=1,
             background=False,
@@ -2600,10 +2589,7 @@ def test_start_refuses_missing_state_in_nonempty_campaign(tmp_path, capsys):
         argparse.Namespace(
             campaign_dir=str(campaign),
             config=None,
-            preset=None,
-            live=False,
-            dry_run=True,
-            mock_ariadne=False,
+            mode="dry_run",
             poll_interval=None,
             max_ticks=1,
             background=False,

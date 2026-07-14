@@ -654,7 +654,7 @@ def clean_stale_ariadne_seed_outputs(
 #
 # Each parser registers itself by adding its phase name
 # to this frozenset. Until then, postprocess() raises NotImplementedError
-# with a hint pointing user at --dry-run or --mock-ariadne.
+# with a hint pointing the operator at a separate dry-run campaign.
 LIVE_POSTPROCESS_IMPLEMENTED: frozenset = frozenset({
     "INITIAL_GAUSSIAN", "GAUSSIAN",
     "INITIAL_AIMALL", "AIMALL",
@@ -1038,7 +1038,7 @@ def _ariadne_optional_diagnostic_warnings(result_dict: Dict[str, Any]) -> List[s
 
 
 class LiveBackendNotAvailableError(RuntimeError):
-    """Raised when --live is requested but a required backend is missing."""
+    """Raised when live mode is requested but a required backend is missing."""
 
 
 @dataclass
@@ -2263,7 +2263,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 "Live postprocess for " + phase_name + " is not yet implemented. "
                 "Refusing to overwrite real backend output with dry-run stub "
                 "artefacts. Register a real parser in LIVE_POSTPROCESS_IMPLEMENTED "
-                "+ _live_postprocess_handlers, or run with --dry-run / --mock-ariadne "
+                "+ _live_postprocess_handlers, or use a separate --mode dry_run campaign"
             )
         # Inline equivalent bookkeeping (manifests / versioning) defers to the
         #dry-run executor so artefact handling is identical between executors.
@@ -3324,9 +3324,25 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         seed_records = list(picked["seed_records"])
         task_records = list(task_map["tasks"])
         expected_n = int(task_map["n_tasks"])
-        from .config_lock import canonical_config, config_fingerprint
-
-        config_sha256 = config_fingerprint(canonical_config(self.config))
+        try:
+            decision_contract = self._decision_contract_for_submission(
+                state,
+                "ARIADNE_ARRAY",
+            )
+        except Exception as exc:
+            return PhaseResult(
+                is_complete=True,
+                failure_reason=(
+                    "ariadne_submission_decision_contract_invalid: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)
+                ),
+            )
+        config_sha256 = str(decision_contract["config_sha256"])
+        failure_threshold_fraction = float(
+            decision_contract["failure_threshold_fraction"]
+        )
 
         def publish_batch_decision(
             *,
@@ -3340,9 +3356,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 campaign_uid=str(state.campaign_uid),
                 iteration=int(state.iteration),
                 config_sha256=str(config_sha256),
-                failure_threshold_fraction=float(
-                    self.config.runtime.failure_threshold_fraction
-                ),
+                failure_threshold_fraction=failure_threshold_fraction,
                 expected_n=int(expected_n),
                 n_accepted=int(n_accepted),
                 n_rejected=int(n_rejected),
@@ -4119,7 +4133,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             )
         if expected_n and (
             n_rejected / float(expected_n)
-        ) > float(self.config.runtime.failure_threshold_fraction):
+        ) > failure_threshold_fraction:
             decision_reasons.append(
                 "too_many_seeds_failed: " + str(n_rejected) + "/" + str(expected_n)
             )

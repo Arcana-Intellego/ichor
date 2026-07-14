@@ -11,18 +11,17 @@ Why not a third-party validator?
 - dataclasses are already the canonical type for every config struct in
   the project. Walking 'fields(cls)' keeps a single source of truth.
 
-The parser handles the subset of types actually used in CampaignConfig:
+The parser handles every type shape used in CampaignConfig:
 - Primitive: int, float, str, bool.
 - Optional[primitive]: None passes through; otherwise primitive rules.
 - Nested dataclass: recursive call.
-
-For anything outside that subset (list, dict, Union of non-Optional) the
-parser passes the value through untouched -- the caller is responsible
-for any further validation.
+- Typed lists and mappings: container and element types are checked.
+- General unions: each declared branch is tried without scalar coercion.
 """
 from __future__ import annotations
 
 import dataclasses
+import types
 import typing
 from typing import Any, Dict, Mapping, Type, TypeVar
 
@@ -63,7 +62,7 @@ def _strip_optional(tp):
 
 
 def _coerce_primitive(value, target, path: str):
-    """Coerce a YAML scalar to the dataclass field type.
+    """Validate a YAML scalar against the exact dataclass field type.
 
     bool is checked BEFORE int because bool is a subclass of int in Python
     and a naive isinstance(value, int) would let 'False' masquerade as an
@@ -102,9 +101,70 @@ def _coerce_primitive(value, target, path: str):
         raise DataclassParseError(
             path + ": expected str, got " + type(value).__name__
         )
-    #unknown primitive (could be a typing construct we do not handle, e.g.
-    #list[X]). Pass through unmodified.
+    # Unknown leaf annotations are passed through for their owning block's
+    # semantic validator.
     return value
+
+
+def _parse_value(value: Any, target_type: Any, path: str) -> Any:
+    """Parse one value without coercing between distinct YAML scalar types."""
+    optional = _is_optional(target_type)
+    if value is None:
+        if optional:
+            return None
+        raise DataclassParseError(path + ": null is not allowed")
+
+    inner = _strip_optional(target_type)
+    if dataclasses.is_dataclass(inner):
+        return parse_dataclass_block(inner, value, path=path)
+
+    origin = typing.get_origin(inner)
+    args = typing.get_args(inner)
+    if origin in (list, typing.List):
+        if not isinstance(value, list):
+            raise DataclassParseError(
+                path + ": expected list, got " + type(value).__name__
+            )
+        element_type = args[0] if args else Any
+        return [
+            _parse_value(item, element_type, path + "[" + str(index) + "]")
+            for index, item in enumerate(value)
+        ]
+    if origin in (dict, typing.Dict, Mapping, typing.Mapping):
+        if not isinstance(value, Mapping):
+            raise DataclassParseError(
+                path + ": expected mapping, got " + type(value).__name__
+            )
+        key_type, value_type = args if len(args) == 2 else (Any, Any)
+        parsed: Dict[Any, Any] = {}
+        for key, item in value.items():
+            parsed_key = key if key_type is Any else _parse_value(
+                key, key_type, path + ".<key>"
+            )
+            parsed[parsed_key] = (
+                item
+                if value_type is Any
+                else _parse_value(item, value_type, path + "." + str(key))
+            )
+        return parsed
+    if origin in (typing.Union, types.UnionType):
+        errors = []
+        for branch in args:
+            if branch is type(None):
+                continue
+            try:
+                return _parse_value(value, branch, path)
+            except DataclassParseError as exc:
+                errors.append(str(exc))
+        raise DataclassParseError(
+            path
+            + ": value does not match any allowed type ("
+            + "; ".join(errors)
+            + ")"
+        )
+    if inner is Any:
+        return value
+    return _coerce_primitive(value, inner, path)
 
 
 def parse_dataclass_block(cls: Type[T], data: Any, *, path: str = "") -> T:
@@ -130,8 +190,6 @@ def parse_dataclass_block(cls: Type[T], data: Any, *, path: str = "") -> T:
         raise TypeError("parse_dataclass_block expects a dataclass type")
     prefix = path + "." if path else ""
 
-    if data is None:
-        return cls()
     if not isinstance(data, Mapping):
         raise DataclassParseError(
             (path or "<top>") + ": expected mapping, got "
@@ -153,18 +211,6 @@ def parse_dataclass_block(cls: Type[T], data: Any, *, path: str = "") -> T:
             continue
         value = data[name]
         target_type = type_hints.get(name, field.type)
-        inner = _strip_optional(target_type)
-
-        # None handling for Optional fields.
-        if value is None and _is_optional(target_type):
-            kwargs[name] = None
-            continue
-
-        if dataclasses.is_dataclass(inner):
-            kwargs[name] = parse_dataclass_block(
-                inner, value, path=prefix + name,
-            )
-        else:
-            kwargs[name] = _coerce_primitive(value, inner, prefix + name)
+        kwargs[name] = _parse_value(value, target_type, prefix + name)
 
     return cls(**kwargs)

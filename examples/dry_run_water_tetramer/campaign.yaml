@@ -1,9 +1,9 @@
 # Tuned for a fast walkthrough (~30s end-to-end). Two iterations,
 # tiny seed counts, small training batch. Real campaigns would lift these
-# defaults substantially (see ichor_hpc/.../presets/ for spectroscopy and
-# thermodynamics-focused starting points).
+# defaults substantially. Production campaigns should calibrate the single
+# sampling-aggressiveness policy against their own system.
 
-schema_version: 12
+schema_version: 13
 
 campaign:
   system_name: WATER_TETRAMER
@@ -11,10 +11,12 @@ campaign:
   custom_bootstrap: false
   # Keep the walkthrough close to the balanced production default.
   sampling_aggressiveness: 5
+  random_seed: 0
 
 # Iteration loop.
 runtime:
   poll_interval_seconds: 1
+  background_readiness_timeout_seconds: 60
 
 # Initial labelled set before active learning.
 point_allocation:
@@ -30,6 +32,8 @@ seed_selection:
   bulk_fraction: 0.2
   strategy: d_optimal
   d_optimal_degenerate_policy: score_backfill
+  exclude_committed_seed_frames: true
+  recent_seed_cooldown_iterations: 1
 
 resources:
   defaults:
@@ -55,6 +59,7 @@ resources:
 gaussian:
   method: B3LYP
   basis_set: aug-cc-pVTZ
+  extra_route_keywords: []
 
 aimall:
   nogui: true
@@ -66,3 +71,14 @@ aimall:
 ferebus:
   feature_scaling: false
   property_scaling: false
+
+quality_gates:
+  ferebus_max_aggregate_ext_rmse_increase_fraction: 0.05
+  ferebus_max_task_ext_rmse_increase_fraction: 0.20
+  ferebus_regression_abs_tolerance_ha: 1.0e-6
+
+retention:
+  checkpoint_destination: null
+  checkpoint_every_iterations: 1
+  checkpoint_required: false
+  checkpoint_verify_after_write: true

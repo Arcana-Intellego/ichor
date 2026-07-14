@@ -1,10 +1,11 @@
-schema_version: 12
+schema_version: 13
 
 campaign:
   system_name: ICHOR_CSF3_LONG_CAMPAIGN
   max_iterations: 20
   custom_bootstrap: false
   sampling_aggressiveness: 5
+  random_seed: 0
 
 # Production-style starting point. Calibrate thresholds from one first-live
 # campaign before increasing batch sizes further.
@@ -20,6 +21,8 @@ seed_selection:
   n_seeds_per_iteration: 16
   bulk_fraction: 0.2
   d_optimal_degenerate_policy: score_backfill
+  exclude_committed_seed_frames: true
+  recent_seed_cooldown_iterations: 1
 
 resources:
   defaults:
@@ -40,3 +43,17 @@ error_calibration:
   min_model_versions_to_apply: 2
   model_version_policy: rolling_normalised
   aggressiveness_match_required: true
+
+quality_gates:
+  ferebus_max_aggregate_ext_rmse_increase_fraction: 0.05
+  ferebus_max_task_ext_rmse_increase_fraction: 0.20
+  ferebus_regression_abs_tolerance_ha: 1.0e-6
+
+gaussian:
+  extra_route_keywords: []
+
+retention:
+  checkpoint_destination: null
+  checkpoint_every_iterations: 1
+  checkpoint_required: false
+  checkpoint_verify_after_write: true

@@ -1,6 +1,6 @@
 """Dry-run sacct poller.
 
-When the daemon is started with "--dry-run", no real SLURM jobs are
+When the daemon is started with ``--mode dry_run``, no real Slurm jobs are
 submitted. The DryRunPhaseExecutor manufactures JobIDs of the form
 "DRYRUN-<PHASE>-<iteration>"; this poller recognises that prefix and
 returns a synthetic COMPLETED observation immediately, so the daemon's

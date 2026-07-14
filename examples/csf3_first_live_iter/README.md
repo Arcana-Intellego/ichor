@@ -233,7 +233,7 @@ ichor-al-daemon init
 ichor-al-daemon preflight --campaign-dir . --verbose
 ichor-al-daemon preflight --campaign-dir . --verbose --submit-environment-smoke
 ichor-al-daemon resource-plan --campaign-dir . --all
-ichor-al-daemon start --campaign-dir . --max-ticks 200
+ichor-al-daemon start --campaign-dir . --mode live --max-ticks 200
 ```
 
 The submitted preflight is an explicit commissioning check: one five-minute,
@@ -274,4 +274,4 @@ If the campaign becomes `HALTED`, inspect `status` and `journal`, run
 `state.json` with the proposal manually. A `DONE` campaign remains terminal;
 after deliberately increasing `campaign.max_iterations` and applying that
 config change through reconcile, extend it only with
-`resume --reopen-converged --live`.
+`resume --reopen-converged`.

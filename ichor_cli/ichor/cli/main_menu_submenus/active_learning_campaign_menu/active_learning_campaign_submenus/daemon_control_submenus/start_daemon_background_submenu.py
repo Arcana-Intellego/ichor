@@ -51,7 +51,6 @@ START_DAEMON_BACKGROUND_DEFAULTS = {
     "selected_poll_interval": 0,
     "selected_max_ticks": 0,
     "selected_config": "",
-    "selected_preset": "",
     "selected_log_path": "",
     "selected_pid_path": "",
     "reopen_converged": False,
@@ -66,7 +65,6 @@ class StartDaemonBackgroundMenuOptions(MenuOptions):
     selected_poll_interval: int
     selected_max_ticks: int
     selected_config: str
-    selected_preset: str
     selected_log_path: str
     selected_pid_path: str
     reopen_converged: bool
@@ -117,9 +115,9 @@ class StartDaemonBackgroundFunctions:
 
     @staticmethod
     def select_mode():
-        """Pick mock-ariadne / dry-run / live (restricted)."""
+        """Pick dry-run or live execution."""
         chosen = user_input_restricted(
-            ["mock-ariadne", "dry-run", "live"],
+            ["dry_run", "live"],
             "Select mode: ",
             start_daemon_background_menu_options.selected_mode,
         )
@@ -146,13 +144,6 @@ class StartDaemonBackgroundFunctions:
         start_daemon_background_menu_options.selected_config = user_input_free_flow(
             "Config path override (blank to use campaign.yaml): ",
             start_daemon_background_menu_options.selected_config,
-        ) or ""
-
-    @staticmethod
-    def select_preset():
-        start_daemon_background_menu_options.selected_preset = user_input_free_flow(
-            "Preset name (blank for none): ",
-            start_daemon_background_menu_options.selected_preset,
         ) or ""
 
     @staticmethod
@@ -186,22 +177,17 @@ class StartDaemonBackgroundFunctions:
             if start_daemon_background_menu_options.selected_config
             else None
         )
-        preset_name = (
-            start_daemon_background_menu_options.selected_preset
-            if start_daemon_background_menu_options.selected_preset
-            else None
-        )
-        if edit_menu.saved_config_review_failed(config_override, preset_name):
-            print("Selected config override could not be reviewed (or selected preset is invalid):")
+        if edit_menu.saved_config_review_failed(config_override):
+            print("Selected config override could not be reviewed:")
             print("  " + edit_menu.saved_config_lock_review_error())
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
-        if edit_menu.saved_config_has_lock_changes(config_override, preset_name):
+        if edit_menu.saved_config_has_lock_changes(config_override):
             if config_override:
                 print("Selected config override differs from the config lock:")
             else:
                 print("Saved campaign.yaml differs from the config lock:")
-            print(edit_menu.format_saved_config_lock_review(config_override, preset_name))
+            print(edit_menu.format_saved_config_lock_review(config_override))
             print("Run reconcile --apply for safe edits or revert blocked edits before starting.")
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
@@ -235,7 +221,6 @@ class StartDaemonBackgroundFunctions:
                     else None
                 ),
                 config=config_override,
-                preset=preset_name,
                 reopen_converged=bool(
                     start_daemon_background_menu_options.reopen_converged
                 ),
@@ -289,7 +274,7 @@ START_DAEMON_BACKGROUND_FIELD_SPECS = [
     spec(
         "selected_mode",
         "choice",
-        choices=["mock-ariadne", "dry-run", "live"],
+        choices=["dry_run", "live"],
         prompt="Select mode: ",
         item_text="Set mode",
         display_path="mode",
@@ -316,13 +301,6 @@ START_DAEMON_BACKGROUND_FIELD_SPECS = [
         prompt="Config path override",
         item_text="Set config override",
         display_path="config",
-    ),
-    spec(
-        "selected_preset",
-        "clearable_str",
-        prompt="Preset name",
-        item_text="Set preset",
-        display_path="preset",
     ),
     spec(
         "selected_log_path",

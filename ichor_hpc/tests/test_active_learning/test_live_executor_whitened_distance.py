@@ -30,6 +30,13 @@ def _seed_iter_pool(campaign_dir, iteration, results, *, config=None):
         write_seed_output_manifest,
     )
     from ichor.hpc.active_learning.daemon.state import atomic_write_json
+    from ichor.hpc.active_learning.daemon.config_lock import (
+        canonical_config,
+        config_fingerprint,
+    )
+    from ichor.hpc.active_learning.daemon.submission_intent import (
+        write_pre_submit_intent,
+    )
     from ichor.hpc.active_learning.handoff_manifests import (
         ARIADNE_RESULTS_SCHEMA_VERSION,
         seeds_picked_path,
@@ -49,6 +56,21 @@ def _seed_iter_pool(campaign_dir, iteration, results, *, config=None):
     from ichor.hpc.active_learning.versioning.manifest import sha256_file
 
     campaign_dir.mkdir(parents=True, exist_ok=True)
+    resolved_config = CampaignConfig() if config is None else config
+    write_pre_submit_intent(
+        campaign_dir,
+        campaign_uid="u",
+        phase_name=CampaignPhase.ARIADNE_ARRAY.value,
+        iteration=int(iteration),
+        decision_contract={
+            "failure_threshold_fraction": float(
+                resolved_config.runtime.failure_threshold_fraction
+            ),
+            "config_sha256": config_fingerprint(
+                canonical_config(resolved_config)
+            ),
+        },
+    )
     pool_source = campaign_dir / "whitened-distance-pool.xyz"
     pool_lines = []
     for frame_id in range(len(results)):
@@ -108,7 +130,7 @@ def _seed_iter_pool(campaign_dir, iteration, results, *, config=None):
     task_map_path = write_ariadne_task_map(iter_dir, selection)
     resolved_protocol = resolve_sampling_protocol(
         campaign_dir,
-        CampaignConfig() if config is None else config,
+        resolved_config,
         iteration=int(iteration),
     )
 

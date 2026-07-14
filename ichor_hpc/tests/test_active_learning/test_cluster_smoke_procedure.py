@@ -64,7 +64,7 @@ def test_csf4_first_iteration_end_to_end(tmp_path):
       1. copy a water-tetramer trajectory into the tmp campaign dir.
       2. ichor-al-daemon init.
       3. copy the example campaign.yaml in.
-      4. ichor-al-daemon start --live --max-ticks 2000.
+      4. ichor-al-daemon start --mode live --max-ticks 2000.
       5. assert state.phase == DONE, reference_data_version >= 1.
     """
     # check preflight one more time so we fail fast if the user did not
@@ -95,9 +95,9 @@ def test_csf4_first_iteration_end_to_end(tmp_path):
     )
     assert rc.returncode == 0, rc.stderr
 
-    # start --live -- budget two hours
+    # Start live mode with a two-hour test budget.
     rc = subprocess.run(
-        ["ichor-al-daemon", "start", "--live",
+        ["ichor-al-daemon", "start", "--mode", "live",
          "--campaign-dir", str(campaign),
          "--max-ticks", "2000"],
         capture_output=True, text=True, timeout=2 * 60 * 60,

@@ -2,7 +2,7 @@
 # Generic first-live-iteration active-learning campaign for CSF3/CSF4.
 # Intended for a small validation run, not a long production campaign.
 
-schema_version: 12
+schema_version: 13
 
 # -------------------------------------------------------------------------
 # Required system-level identifiers
@@ -19,6 +19,9 @@ campaign:
   # 1 conservative, 5 balanced/current default, 10 exploratory. Runtime trust
   # radii are normalised for molecular size and remain bounded by safety gates.
   sampling_aggressiveness: 5
+
+  # Immutable root for all deterministic component seeds.
+  random_seed: 0
 
   # When true, init inspects the campaign-relative bootstrap/ directory for
   # split-specific XYZ/CSV inputs or a model_krig training baseline.
@@ -47,14 +50,14 @@ seed_selection:
   d_optimal_novelty_floor: 1.0e-12
   d_optimal_score_power: 1.0
   d_optimal_degenerate_policy: score_backfill
+  exclude_committed_seed_frames: true
+  recent_seed_cooldown_iterations: 1
 
 # -------------------------------------------------------------------------
 # FEREBUS
 # -------------------------------------------------------------------------
 
 ferebus:
-  warmstart: adaptive
-  warmstart_streak: 5
   kernel: rbfc_per
   loss: huber
   nagents: 20
@@ -91,6 +94,9 @@ quality_gates:
   require_readable_aimall_geometry: true
   require_finite_iqa: true
   require_finite_integration_error: true
+  ferebus_max_aggregate_ext_rmse_increase_fraction: 0.05
+  ferebus_max_task_ext_rmse_increase_fraction: 0.20
+  ferebus_regression_abs_tolerance_ha: 1.0e-6
   ariadne_max_displacement_ang: 1.25
   ariadne_min_pair_distance_ang: 0.60
 
@@ -112,6 +118,21 @@ runtime:
   poll_squeue_inconclusive_max_ticks: 10
   failure_threshold_fraction: 0.5
   halt_on_tick_exception: true
+  scheduler_command_timeout_seconds: 60
+  cancellation_confirmation_timeout_seconds: 120
+  journal_max_bytes: 67108864
+  journal_retained_files: 8
+  lease_heartbeat_seconds: 30
+  lease_heartbeat_failure_max: 3
+  clock_skew_tolerance_seconds: 60
+  background_readiness_timeout_seconds: 60
+  ledger_lock_timeout_seconds: 30
+
+retention:
+  checkpoint_destination: null
+  checkpoint_every_iterations: 1
+  checkpoint_required: false
+  checkpoint_verify_after_write: true
 
 stop:
   alpha0_streak_threshold: 1.0e-2
@@ -191,7 +212,7 @@ gaussian:
   charge: 0
   spin_multiplicity: 1
 
-  extra_keywords: ""
+  extra_route_keywords: []
 
 aimall:
   encomp: 3

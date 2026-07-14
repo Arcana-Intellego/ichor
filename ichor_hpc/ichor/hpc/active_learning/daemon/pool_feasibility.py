@@ -21,7 +21,7 @@ class PoolFeasibility:
     max_iterations: int
     n_seeds_per_iteration: int
     batch_total_size: int
-    skip_training_seeds: bool
+    exclude_committed_seed_frames: bool
     required_pool_frames: int
     expression: str
 
@@ -53,7 +53,9 @@ class PoolFeasibility:
             "configured_seed_surplus": int(
                 self.n_seeds_per_iteration - self.batch_total_size
             ),
-            "skip_training_seeds": bool(self.skip_training_seeds),
+            "exclude_committed_seed_frames": bool(
+                self.exclude_committed_seed_frames
+            ),
             "required_pool_frames": int(self.required_pool_frames),
             "reserve_after_bootstrap": int(self.reserve_after_bootstrap),
             "expression": str(self.expression),
@@ -129,7 +131,7 @@ def evaluate_pool_feasibility_manifest(
     max_iterations = int(config.campaign.max_iterations)
     n_seeds = int(config.seed_selection.n_seeds_per_iteration)
     batch_total = int(config.point_allocation.batch_total_size)
-    skip_training = bool(config.anti_overlap.skip_training_seeds)
+    skip_training = bool(config.seed_selection.exclude_committed_seed_frames)
     if skip_training:
         required = excluded_n + bootstrap_pool_n + max_iterations * n_seeds
         expression = (
@@ -152,7 +154,7 @@ def evaluate_pool_feasibility_manifest(
             + str(excluded_n)
             + " + "
             + str(bootstrap_pool_n)
-            + " (anti_overlap.skip_training_seeds=false)"
+            + " (seed_selection.exclude_committed_seed_frames=false)"
         )
     return PoolFeasibility(
         pool_n_frames=pool_n,
@@ -164,7 +166,7 @@ def evaluate_pool_feasibility_manifest(
         max_iterations=max_iterations,
         n_seeds_per_iteration=n_seeds,
         batch_total_size=batch_total,
-        skip_training_seeds=skip_training,
+        exclude_committed_seed_frames=skip_training,
         required_pool_frames=required,
         expression=expression,
     )

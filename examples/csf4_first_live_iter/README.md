@@ -1,6 +1,6 @@
 # First live iteration on CSF4 -- a walkthrough
 
-This is the procedure for the first real `--live` iteration of the ICHOR
+This is the procedure for the first real `--mode live` iteration of the ICHOR
 active-learning daemon on Manchester's CSF4 cluster. The goal is a single
 water-tetramer iteration that finishes in under two hours and proves the
 pipeline end-to-end with real backend output (real Gaussian SCFs, real
@@ -157,7 +157,7 @@ python -c "from ichor.hpc.runtime_preflight import ensure_xtb_ase_available, ens
 ```
 
 If any of these blow up, fix the import error before going further. The
-daemon will refuse to start in `--live` mode if any backend is missing.
+daemon will refuse to start in `--mode live` if any backend is missing.
 
 ## 3. install the AIMAll script + the FEREBUS Fortran binary
 
@@ -310,7 +310,7 @@ A minimal `campaign.yaml` (also shipped at
 `examples/csf4_first_live_iter/campaign.yaml`):
 
 ```yaml
-schema_version: 12
+schema_version: 13
 
 campaign:
   system_name: CHANGE_ME_SYSTEM
@@ -389,9 +389,8 @@ runtime:
 
 These are deliberately tight numbers (small initial labelled set, few seeds,
 modest ARIADNE iteration budget) so the whole run finishes inside two
-hours. The whole point of the smoke is to prove the pipeline works at
-all -- the production sizes for a real campaign live in the spectroscopy
-or thermodynamics preset.
+hours. The whole point of the smoke is to prove the pipeline works at all;
+production settings must be selected explicitly in `campaign.yaml`.
 
 ## 7. launch the daemon
 
@@ -399,7 +398,7 @@ or thermodynamics preset.
 ichor-al-daemon preflight --campaign-dir . --verbose
 ichor-al-daemon preflight --campaign-dir . --verbose --submit-environment-smoke
 ichor-al-daemon resource-plan --campaign-dir . --all
-ichor-al-daemon start --campaign-dir . --max-ticks 2000
+ichor-al-daemon start --campaign-dir . --mode live --max-ticks 2000
 ```
 
 The second preflight command is an explicit commissioning gate. It submits one
@@ -553,9 +552,8 @@ Congratulations -- you have just run a real one-iteration ICHOR active-
 learning campaign on CSF4. Real next steps from here:
 
 - bump `max_iterations` to something like 20 or 50 for a real campaign.
-- swap in the `spectroscopy_focused` preset if your downstream target is
-  vibrational spectra (the preset bumps the subspace dim and switches the
-  mode-weighting policy to inverse-frequency).
+- tune the explicit spectral and subspace fields only after reviewing the
+  campaign's acquisition diagnostics.
 - tune `geometry_novelty.fallback_scale_angstrom` if you find later
   iterations picking near-duplicates of earlier training points; Phase B
   derives its minimum separation from the geometry novelty protocol.

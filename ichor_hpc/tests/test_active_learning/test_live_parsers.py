@@ -1141,6 +1141,9 @@ def _write_seeds_picked(campaign_dir, iteration, n_seeds):
         selection_fingerprint_sha256,
         write_ariadne_task_map,
     )
+    from ichor.hpc.active_learning.daemon.submission_intent import (
+        write_pre_submit_intent,
+    )
 
     campaign_dir.mkdir(parents=True, exist_ok=True)
     pool_source = campaign_dir / "_test_pool.xyz"
@@ -1197,6 +1200,17 @@ def _write_seeds_picked(campaign_dir, iteration, n_seeds):
     selection_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(selection_path, payload)
     write_ariadne_task_map(iter_dir, payload)
+    write_pre_submit_intent(
+        campaign_dir,
+        campaign_uid="m16-test",
+        phase_name=CampaignPhase.ARIADNE_ARRAY.value,
+        iteration=int(iteration),
+        expected_tasks=int(n_seeds),
+        decision_contract={
+            "failure_threshold_fraction": 0.5,
+            "config_sha256": "d" * 64,
+        },
+    )
     return iter_dir
 
 
@@ -2065,6 +2079,27 @@ def _write_phase_b_manifest(iter_dir, *, n_final=1, write_sample=True):
     state_path.parent.mkdir(parents=True, exist_ok=True)
     write_state(state_path, state)
     _seed_ariadne_pool(campaign, iteration=iteration, n_seeds=int(n_final))
+    from ichor.hpc.active_learning.daemon.config_lock import (
+        canonical_config,
+        config_fingerprint,
+    )
+    from ichor.hpc.active_learning.daemon.submission_intent import (
+        write_pre_submit_intent,
+    )
+
+    write_pre_submit_intent(
+        campaign,
+        campaign_uid="m16-test",
+        phase_name=_CampaignPhase.ARIADNE_ARRAY.value,
+        iteration=iteration,
+        expected_tasks=int(n_final),
+        decision_contract={
+            "failure_threshold_fraction": float(
+                cfg.runtime.failure_threshold_fraction
+            ),
+            "config_sha256": config_fingerprint(canonical_config(cfg)),
+        },
+    )
     for seed_index in range(int(n_final)):
         seed_dir = ariadne_seed_dir(iter_dir, seed_index + 1)
         result_path = seed_dir / "result.json"

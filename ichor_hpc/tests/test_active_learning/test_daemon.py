@@ -72,6 +72,23 @@ def _failed_ferebus_array_poll(job_id, **kw):
     ]
 
 
+def _half_successful_array_poll(job_id, **kw):
+    return [
+        JobObservation(
+            job_id=str(job_id) + "_0",
+            status=JobStatus.COMPLETED,
+            exit_code=(0, 0),
+            elapsed_seconds=1,
+        ),
+        JobObservation(
+            job_id=str(job_id) + "_1",
+            status=JobStatus.FAILED,
+            exit_code=(1, 0),
+            elapsed_seconds=1,
+        ),
+    ]
+
+
 class _StrictMockExecutor(MockPhaseExecutor):
     strict_committed_artifact_verification = True
 
@@ -559,6 +576,33 @@ def test_tick_scrubs_when_failure_below_threshold(tmp_path):
     assert state.phase is CampaignPhase.INITIAL_GAUSSIAN  # advanced past failed phase
 
 
+def test_inflight_failure_threshold_uses_submission_snapshot(tmp_path):
+    class TwoTaskExecutor(MockPhaseExecutor):
+        def submit_or_run(self, state, phase):
+            result = super().submit_or_run(state, phase)
+            if result.submitted_job_id is not None:
+                result.expected_tasks = 2
+            return result
+
+    executor = TwoTaskExecutor(treat_as_sbatch=set(_SBATCH_PHASES))
+    d = _make_daemon(
+        tmp_path,
+        executor=executor,
+        sacct=_half_successful_array_poll,
+    )
+    d.config.runtime.failure_threshold_fraction = 0.5
+    assert d.tick() == TickStatus.ADVANCED
+    assert d.tick() == TickStatus.SUBMITTED
+
+    # An iteration-future edit must not reinterpret an already-submitted batch.
+    d.config.runtime.failure_threshold_fraction = 0.0
+    status = d.tick()
+
+    assert status == TickStatus.ADVANCED
+    assert "postprocess:PHASE_A_POLUS" in executor.operations()
+    assert "handle_failure:PHASE_A_POLUS" not in executor.operations()
+
+
 def test_tick_halts_when_executor_handles_failure_with_halt(tmp_path):
     executor = MockPhaseExecutor(
         treat_as_sbatch=set(_SBATCH_PHASES),
@@ -891,6 +935,14 @@ def test_required_ferebus_output_missing_after_failure_halts_at_producer(tmp_pat
     state.phase = CampaignPhase.INITIAL_FEREBUS
     state.pending_jobs[CampaignPhase.INITIAL_FEREBUS.value] = "16177329"
     write_state(d.state_path(), state)
+    submission_intent.write_pre_submit_intent(
+        d.campaign_dir,
+        campaign_uid=state.campaign_uid,
+        phase_name=CampaignPhase.INITIAL_FEREBUS.value,
+        iteration=0,
+        expected_tasks=12,
+        decision_contract=d._submission_decision_contract(),
+    )
     submission_intent.mark_submitted(
         d.campaign_dir,
         CampaignPhase.INITIAL_FEREBUS.value,

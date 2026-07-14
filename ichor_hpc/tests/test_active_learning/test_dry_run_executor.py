@@ -55,6 +55,29 @@ def _state(iteration=0, **updates):
     return SimpleNamespace(**values)
 
 
+def _stage_ariadne_intent(e, state):
+    from ichor.hpc.active_learning.daemon.config_lock import (
+        canonical_config,
+        config_fingerprint,
+    )
+    from ichor.hpc.active_learning.daemon.submission_intent import (
+        write_pre_submit_intent,
+    )
+
+    write_pre_submit_intent(
+        e.campaign_dir,
+        campaign_uid=str(state.campaign_uid),
+        phase_name=CampaignPhase.ARIADNE_ARRAY.value,
+        iteration=int(state.iteration),
+        decision_contract={
+            "failure_threshold_fraction": float(
+                e.config.runtime.failure_threshold_fraction
+            ),
+            "config_sha256": config_fingerprint(canonical_config(e.config)),
+        },
+    )
+
+
 def _complete_bootstrap(e):
     state = _state()
     e.postprocess(state, CampaignPhase.PHASE_A_POLUS, observations=[])
@@ -73,6 +96,7 @@ def _complete_active_quantum(e, *, iteration=1):
         models_version=0,
     )
     e.submit_or_run(state, CampaignPhase.SEED_SELECT)
+    _stage_ariadne_intent(e, state)
     e.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
     e.postprocess(state, CampaignPhase.PHASE_B_POLUS, observations=[])
     e.postprocess(state, CampaignPhase.GAUSSIAN, observations=[])
@@ -151,6 +175,7 @@ def test_ariadne_postprocess_writes_per_seed_results(tmp_path):
     _complete_bootstrap(e)
     state = _state(1, reference_data_version=0, models_version=0)
     e.submit_or_run(state, CampaignPhase.SEED_SELECT)
+    _stage_ariadne_intent(e, state)
     e.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
     seeds_dir = ariadne_seeds_dir(
         active_iteration_dir(tmp_path / "campaign", 1)
@@ -171,6 +196,7 @@ def test_phase_b_polus_postprocess_writes_sample_xyz(tmp_path):
     _complete_bootstrap(e)
     state = _state(1, reference_data_version=0, models_version=0)
     e.submit_or_run(state, CampaignPhase.SEED_SELECT)
+    _stage_ariadne_intent(e, state)
     e.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
     e.postprocess(state, CampaignPhase.PHASE_B_POLUS, observations=[])
     sample = active_phase_b_dir(
@@ -213,6 +239,7 @@ def test_active_allocation_replaces_failed_candidate_from_finite_reserve(tmp_pat
     _complete_bootstrap(e)
     state = _state(1, reference_data_version=0, models_version=0)
     e.submit_or_run(state, CampaignPhase.SEED_SELECT)
+    _stage_ariadne_intent(e, state)
     e.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
     e.postprocess(state, CampaignPhase.PHASE_B_POLUS, observations=[])
 

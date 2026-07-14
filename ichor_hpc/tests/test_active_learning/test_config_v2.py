@@ -44,10 +44,10 @@ def test_parser_int_type_mismatch_path_qualified():
 
 def test_parser_bool_type_mismatch_path_qualified():
     payload = CampaignConfig().to_dict()
-    payload["anti_overlap"]["skip_training_seeds"] = "yes"
+    payload["seed_selection"]["exclude_committed_seed_frames"] = "yes"
     with pytest.raises(ConfigValidationError) as exc:
         CampaignConfig.from_dict(payload)
-    assert "skip_training_seeds" in str(exc.value)
+    assert "exclude_committed_seed_frames" in str(exc.value)
 
 
 def test_ferebus_properties_default_and_multipole_roundtrip():

@@ -1,7 +1,8 @@
 # Dry-run water-tetramer example
 
 A complete runnable example campaign for the ICHOR active learning daemon.
-Drives the daemon through TWO iterations using `--dry-run` which writes on the disk
+Drives the daemon through TWO iterations using `--mode dry_run`, which writes
+real on-disk
 real artefacts, .i.e., scripts, reference-data delta versions, manifests,
 journal events, provenance sidecars) without calling Gaussian / AIMAll /
 FEREBUS / ARIADNE / POLUS. Finishes in ~30 seconds.
@@ -39,7 +40,7 @@ Imported pool: ./pool.xyz (20 frames, 12 atoms, SHA e006ddc6...)
 
 ```
 python -m ichor.hpc.active_learning.cli start \
-    --dry-run \
+    --mode dry_run \
     --foreground \
     --campaign-dir . \
     --max-ticks 200
@@ -110,8 +111,8 @@ directories so they never accidentally land in a commit.
 
 ## Stepping to a live campaign
 
-Once you have access to CSF4 (or another SLURM cluster with the required
-backends), swap `--dry-run` for `--live`. The daemon will refuse with exit
-code 12 if Gaussian / AIMAll / FEREBUS / ARIADNE / POLUS are not on PATH.
+For a real CSF4 campaign, initialise a separate campaign and bind its first
+start with `--mode live`. Execution mode is immutable. The daemon refuses with
+exit code 12 if Gaussian, AIMAll, FEREBUS, ARIADNE or POLUS is unavailable.
 See `docs/source/active_learning_daemon.rst` Section 5 for the cluster-
 side prerequisites + the canonical `module load` lines.

@@ -429,7 +429,7 @@ def _pool_feasibility_payload(
         "n_seeds_per_iteration": 10,
         "batch_total_size": 10,
         "configured_seed_surplus": 0,
-        "skip_training_seeds": True,
+        "exclude_committed_seed_frames": True,
         "required_pool_frames": int(required_pool_frames),
         "reserve_after_bootstrap": int(pool_n_frames) - 70,
         "expression": (
@@ -443,9 +443,11 @@ def _pool_feasibility_payload(
 def test_build_parser_has_all_subcommands():
     p = build_parser()
     # Parse a known subcommand to confirm registration.
-    args = p.parse_args(["start", "--campaign-dir", "x", "--mock-ariadne"])
+    args = p.parse_args(
+        ["start", "--campaign-dir", "x", "--mode", "dry_run"]
+    )
     assert args.command == "start"
-    assert args.mock_ariadne is True
+    assert args.mode == "dry_run"
 
 
 def test_parser_rejects_missing_subcommand():
@@ -901,7 +903,7 @@ def test_cli_status_reports_stale_lock_file_as_not_held(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
     data = campaign / DEFAULT_DATA_SUBDIR
     data.mkdir(parents=True, exist_ok=True)
-    write_state(data / DEFAULT_STATE_FILENAME, fresh_campaign_state())
+    _write_locked_state(campaign, fresh_campaign_state())
     (data / DAEMON_LOCK_FILENAME).write_text("stale\n", encoding="utf-8")
 
     rc = main(["status", "--campaign-dir", str(campaign), "--json"])
@@ -1341,7 +1343,7 @@ def test_cli_stop_records_phase_and_iteration_boundaries(tmp_path):
     state = fresh_campaign_state(max_iterations=2)
     state.phase = CampaignPhase.AIMALL
     state.iteration = 1
-    write_state(data / DEFAULT_STATE_FILENAME, state)
+    _write_locked_state(campaign, state)
 
     assert main(["stop", "--campaign-dir", str(campaign), "--after-phase"]) == 0
     phase_request = read_stop_request(campaign)
@@ -1364,7 +1366,7 @@ def test_cli_rejects_job_cancellation_for_boundary_stop(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
     data = campaign / DEFAULT_DATA_SUBDIR
     data.mkdir(parents=True, exist_ok=True)
-    write_state(data / DEFAULT_STATE_FILENAME, fresh_campaign_state())
+    _write_locked_state(campaign, fresh_campaign_state())
 
     rc = main(
         [
@@ -1715,7 +1717,7 @@ def test_cli_resume_explicitly_clears_shutdown_flag(tmp_path):
     _write_locked_state(campaign, state)
     rc = main([
         "resume", "--campaign-dir", str(campaign),
-        "--mock-ariadne", "--max-ticks", "0", "--foreground",
+        "--mode", "dry_run", "--max-ticks", "0", "--foreground",
     ])
     assert rc == 0
     s = read_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME)
@@ -1764,14 +1766,24 @@ def test_cli_start_background_spawns_child_without_shell(tmp_path, monkeypatch, 
     campaign = _campaign_with_config(tmp_path)
     data = campaign / DEFAULT_DATA_SUBDIR
     data.mkdir(parents=True, exist_ok=True)
-    write_state(data / DEFAULT_STATE_FILENAME, fresh_campaign_state())
+    _write_locked_state(campaign, fresh_campaign_state())
     calls = []
+    real_popen = cli_mod.subprocess.Popen
 
     class FakePopen:
         pid = 4321
 
+        def __new__(cls, argv, **kwargs):
+            if cli_mod.BACKGROUND_READINESS_ENV not in kwargs.get("env", {}):
+                return real_popen(argv, **kwargs)
+            return super().__new__(cls)
+
         def __init__(self, argv, **kwargs):
             calls.append((argv, kwargs))
+            Path(kwargs["env"][cli_mod.BACKGROUND_READINESS_ENV]).write_text(
+                json.dumps({"schema_version": 1, "ready": True, "pid": self.pid}),
+                encoding="utf-8",
+            )
 
         def poll(self):
             return None
@@ -1783,7 +1795,8 @@ def test_cli_start_background_spawns_child_without_shell(tmp_path, monkeypatch, 
         "start",
         "--campaign-dir",
         str(campaign),
-        "--mock-ariadne",
+        "--mode",
+        "dry_run",
         "--max-ticks",
         "7",
         "--background",
@@ -1799,7 +1812,7 @@ def test_cli_start_background_spawns_child_without_shell(tmp_path, monkeypatch, 
         "start",
     ]
     assert "--background" not in argv
-    assert "--mock-ariadne" in argv
+    assert argv[argv.index("--mode") + 1] == "dry_run"
     assert "--max-ticks" in argv
     assert kwargs["stderr"] is subprocess.STDOUT
     assert kwargs["start_new_session"] is True
@@ -1820,14 +1833,24 @@ def test_cli_resume_background_clears_shutdown_and_spawns_resume(tmp_path, monke
     data.mkdir(parents=True, exist_ok=True)
     state = fresh_campaign_state()
     state.shutdown_requested = True
-    write_state(data / DEFAULT_STATE_FILENAME, state)
+    _write_locked_state(campaign, state)
     calls = []
+    real_popen = cli_mod.subprocess.Popen
 
     class FakePopen:
         pid = 4322
 
+        def __new__(cls, argv, **kwargs):
+            if cli_mod.BACKGROUND_READINESS_ENV not in kwargs.get("env", {}):
+                return real_popen(argv, **kwargs)
+            return super().__new__(cls)
+
         def __init__(self, argv, **kwargs):
             calls.append((argv, kwargs))
+            Path(kwargs["env"][cli_mod.BACKGROUND_READINESS_ENV]).write_text(
+                json.dumps({"schema_version": 1, "ready": True, "pid": self.pid}),
+                encoding="utf-8",
+            )
 
         def poll(self):
             return None
@@ -1839,7 +1862,8 @@ def test_cli_resume_background_clears_shutdown_and_spawns_resume(tmp_path, monke
         "resume",
         "--campaign-dir",
         str(campaign),
-        "--mock-ariadne",
+        "--mode",
+        "dry_run",
         "--background",
     ])
 
@@ -1854,14 +1878,15 @@ def test_cli_background_refuses_recursive_child(tmp_path, monkeypatch, capsys):
     campaign = _campaign_with_config(tmp_path)
     data = campaign / DEFAULT_DATA_SUBDIR
     data.mkdir(parents=True, exist_ok=True)
-    write_state(data / DEFAULT_STATE_FILENAME, fresh_campaign_state())
+    _write_locked_state(campaign, fresh_campaign_state())
     monkeypatch.setenv(cli_mod.BACKGROUND_CHILD_ENV, "1")
 
     rc = main([
         "start",
         "--campaign-dir",
         str(campaign),
-        "--mock-ariadne",
+        "--mode",
+        "dry_run",
         "--background",
     ])
 
@@ -1873,7 +1898,7 @@ def test_cli_background_refuses_live_pid_file(tmp_path, monkeypatch, capsys):
     campaign = _campaign_with_config(tmp_path)
     data = campaign / DEFAULT_DATA_SUBDIR
     data.mkdir(parents=True, exist_ok=True)
-    write_state(data / DEFAULT_STATE_FILENAME, fresh_campaign_state())
+    _write_locked_state(campaign, fresh_campaign_state())
     pid_path = data / cli_mod.BACKGROUND_PID_FILENAME
     pid_path.write_text(
         json.dumps({"pid": 99999, "schema_version": 1}),
@@ -1885,7 +1910,8 @@ def test_cli_background_refuses_live_pid_file(tmp_path, monkeypatch, capsys):
         "start",
         "--campaign-dir",
         str(campaign),
-        "--mock-ariadne",
+        "--mode",
+        "dry_run",
         "--background",
     ])
 
@@ -2426,7 +2452,9 @@ def test_cli_resume_refuses_done_without_explicit_reopen(tmp_path, capsys):
     state.iteration = 2
     write_state(data / DEFAULT_STATE_FILENAME, state)
 
-    rc = main(["resume", "--campaign-dir", str(campaign), "--mock-ariadne"])
+    rc = main(
+        ["resume", "--campaign-dir", str(campaign), "--mode", "dry_run"]
+    )
 
     assert rc == 6
     assert "campaign is DONE" in capsys.readouterr().err
@@ -2451,7 +2479,8 @@ def test_cli_reopen_done_requires_config_lock_reconcile_first(tmp_path, capsys):
         "resume",
         "--campaign-dir",
         str(campaign),
-        "--mock-ariadne",
+        "--mode",
+        "dry_run",
         "--reopen-converged",
         "--max-ticks",
         "0",
@@ -2483,7 +2512,8 @@ def test_cli_reopen_done_is_explicit_and_advances_one_iteration(tmp_path):
         "resume",
         "--campaign-dir",
         str(campaign),
-        "--mock-ariadne",
+        "--mode",
+        "dry_run",
         "--reopen-converged",
         "--max-ticks",
         "0",
@@ -2500,12 +2530,12 @@ def test_cli_reopen_done_is_explicit_and_advances_one_iteration(tmp_path):
     assert any(event.get("event") == "campaign_reopened" for event in events)
 
 
-def test_cli_start_with_mock_ariadne_drives_state_machine(tmp_path):
+def test_cli_start_in_dry_run_mode_drives_state_machine(tmp_path):
     campaign = _campaign_with_config(tmp_path)
     assert main(["init", "--campaign-dir", str(campaign), "--yes"]) == 0
     rc = main([
         "start", "--campaign-dir", str(campaign),
-        "--mock-ariadne", "--max-ticks", "5",
+        "--mode", "dry_run", "--max-ticks", "5",
         "--poll-interval", "1",
         "--foreground",
     ])
@@ -2516,33 +2546,21 @@ def test_cli_start_with_mock_ariadne_drives_state_machine(tmp_path):
     assert state.phase.value != "INIT"
 
 
-def test_cli_start_without_flags_defaults_to_live_background(tmp_path, monkeypatch):
+def test_cli_first_start_requires_explicit_execution_mode(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
     data = campaign / DEFAULT_DATA_SUBDIR
     data.mkdir(parents=True, exist_ok=True)
-    write_state(data / DEFAULT_STATE_FILENAME, fresh_campaign_state())
-    observed = {}
-    monkeypatch.setattr(
-        cli_mod,
-        "_launch_background_daemon",
-        lambda args, resolved_campaign: observed.update(
-            args=args, campaign=resolved_campaign
-        ) or 0,
-    )
-
+    _write_locked_state(campaign, fresh_campaign_state())
     rc = main(["start", "--campaign-dir", str(campaign)])
 
-    assert rc == 0
-    assert observed["campaign"] == campaign.resolve()
-    assert observed["args"].live is True
-    assert observed["args"].background is True
-    assert observed["args"].foreground is False
+    assert rc == 13
+    assert "first start requires --mode live or --mode dry_run" in capsys.readouterr().err
 
 
 def test_cli_start_missing_state_for_clean_campaign_recommends_init(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
 
-    rc = main(["start", "--campaign-dir", str(campaign), "--live"])
+    rc = main(["start", "--campaign-dir", str(campaign), "--mode", "live"])
 
     assert rc == 8
     err = capsys.readouterr().err
@@ -2558,7 +2576,7 @@ def test_cli_start_missing_state_with_artefacts_recommends_reconcile(
     campaign = _campaign_with_config(tmp_path)
     (campaign / "ACTIVE_LEARNING" / "iteration-000001").mkdir(parents=True)
 
-    rc = main(["start", "--campaign-dir", str(campaign), "--live"])
+    rc = main(["start", "--campaign-dir", str(campaign), "--mode", "live"])
 
     assert rc == 8
     err = capsys.readouterr().err
@@ -2566,23 +2584,46 @@ def test_cli_start_missing_state_with_artefacts_recommends_reconcile(
     assert "ichor-al-daemon reconcile --campaign-dir " + str(campaign) in err
 
 
-def test_cli_start_with_mutually_exclusive_flags_refuses(tmp_path, capsys):
-    """--live + --dry-run is a mutually-exclusive configuration; exit 2."""
+def test_cli_start_rejects_removed_execution_flags(tmp_path):
     campaign = _campaign_with_config(tmp_path)
-    rc = main(["start", "--campaign-dir", str(campaign), "--live", "--dry-run"])
-    assert rc == 2
-    captured = capsys.readouterr()
-    assert "mutually exclusive" in captured.err
+    with pytest.raises(SystemExit):
+        main(["start", "--campaign-dir", str(campaign), "--live"])
+    with pytest.raises(SystemExit):
+        main(["start", "--campaign-dir", str(campaign), "--dry-run"])
 
 
-def test_cli_start_live_on_windows_refuses_with_exit_12(tmp_path, capsys):
-    """When --live is requested but the backends are absent (the off-cluster
-    case), the CLI must refuse with exit 12 and a message naming the missing
-    binaries -- not silently spin a daemon."""
+def test_live_placeholder_is_rejected_before_execution_identity_creation(
+    tmp_path,
+    capsys,
+):
+    from ichor.hpc.active_learning.execution_identity import execution_identity_path
+
     campaign = _campaign_with_config(tmp_path)
     assert main(["init", "--campaign-dir", str(campaign), "--yes"]) == 0
     capsys.readouterr()
-    rc = main(["start", "--campaign-dir", str(campaign), "--live", "--foreground"])
+
+    rc = main(
+        ["start", "--campaign-dir", str(campaign), "--mode", "live", "--foreground"]
+    )
+
+    assert rc == 2
+    assert "real molecular system" in capsys.readouterr().err
+    assert not execution_identity_path(campaign).exists()
+
+
+def test_cli_start_live_on_windows_refuses_with_exit_12(tmp_path, capsys):
+    """When live mode is requested but backends are absent (the off-cluster
+    case), the CLI must refuse with exit 12 and a message naming the missing
+    binaries -- not silently spin a daemon."""
+    campaign = _campaign_with_config(tmp_path)
+    live_config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+    live_config.campaign.system_name = "TEST_SYSTEM"
+    live_config.to_yaml(campaign / "campaign.yaml")
+    assert main(["init", "--campaign-dir", str(campaign), "--yes"]) == 0
+    capsys.readouterr()
+    rc = main(
+        ["start", "--campaign-dir", str(campaign), "--mode", "live", "--foreground"]
+    )
     # On a CSF4 host with all binaries present this test would skip; in our
     # CI / Windows environment, the backends are absent and exit 12 is the
     # expected refusal code.
@@ -2602,6 +2643,9 @@ def test_cli_start_live_reaches_daemon_with_all_backends_present(
     from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
 
     campaign = _campaign_with_config(tmp_path)
+    live_config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+    live_config.campaign.system_name = "TEST_SYSTEM"
+    live_config.to_yaml(campaign / "campaign.yaml")
     TrajectoryPool.import_from(campaign / "pool.xyz", campaign)
     data = campaign / DEFAULT_DATA_SUBDIR
     data.mkdir(parents=True, exist_ok=True)
@@ -2634,7 +2678,7 @@ def test_cli_start_live_reaches_daemon_with_all_backends_present(
     monkeypatch.setattr(cli_mod, "make_live_job_liveness_checker", lambda: "liveness")
 
     rc = main([
-        "start", "--campaign-dir", str(campaign), "--live",
+        "start", "--campaign-dir", str(campaign), "--mode", "live",
         "--max-ticks", "0", "--foreground",
     ])
 

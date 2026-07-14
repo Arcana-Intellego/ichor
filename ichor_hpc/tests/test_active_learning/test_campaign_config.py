@@ -29,8 +29,8 @@ from ichor.hpc.active_learning.geometry_protocol import (
 )
 
 
-def test_schema_version_is_twelve():
-    assert CONFIG_SCHEMA_VERSION == 12
+def test_schema_version_is_thirteen():
+    assert CONFIG_SCHEMA_VERSION == 13
 
 
 def test_default_campaign_config_is_valid():
@@ -44,6 +44,9 @@ def test_default_campaign_config_is_valid():
     assert c.point_allocation.batch_internal_validation_size == 1
     assert c.point_allocation.batch_total_size == 4
     assert c.campaign.custom_bootstrap is False
+    assert c.campaign.random_seed == 0
+    assert c.seed_selection.exclude_committed_seed_frames is True
+    assert c.seed_selection.recent_seed_cooldown_iterations == 1
     assert c.quality_gates.require_readable_aimall_geometry is True
     assert c.quality_gates.require_finite_iqa is True
     assert c.quality_gates.require_finite_integration_error is True
@@ -55,6 +58,15 @@ def test_default_campaign_config_is_valid():
     assert c.runtime.poll_sacct_error_max_ticks == 10
     assert c.runtime.poll_sacct_missing_max_ticks == 12
     assert c.runtime.halt_on_tick_exception is True
+    assert c.runtime.scheduler_command_timeout_seconds == 60
+    assert c.runtime.cancellation_confirmation_timeout_seconds == 120
+    assert c.runtime.journal_max_bytes == 67_108_864
+    assert c.runtime.journal_retained_files == 8
+    assert c.runtime.lease_heartbeat_seconds == 30
+    assert c.runtime.lease_heartbeat_failure_max == 3
+    assert c.runtime.clock_skew_tolerance_seconds == 60
+    assert c.runtime.background_readiness_timeout_seconds == 60
+    assert c.runtime.ledger_lock_timeout_seconds == 30
     assert c.seed_selection.variance_chunk_size == 512
     assert c.seed_selection.strategy == "d_optimal"
     assert c.seed_selection.d_optimal_pool_multiplier == 8
@@ -137,6 +149,11 @@ def test_default_campaign_config_is_valid():
     assert c.acquisition.stencils.max_anharmonic_mode_score == 6.0
     assert c.acquisition.stencils.max_anharmonic_total_score == 15.0
     assert c.acquisition.subspace.canonicalise_basis is True
+    assert c.retention.checkpoint_destination is None
+    assert c.retention.checkpoint_every_iterations == 1
+    assert c.retention.checkpoint_required is False
+    assert c.retention.checkpoint_verify_after_write is True
+    assert c.gaussian.extra_route_keywords == []
 
 
 def test_resource_memory_safety_factor_must_be_finite():
@@ -171,17 +188,17 @@ def test_custom_bootstrap_and_point_allocation_integer_sizes_are_validated():
         CampaignConfig.from_dict(payload)
 
 
-def test_pre_v12_schema_is_rejected_without_migration():
+def test_pre_v13_schema_is_rejected_without_migration():
     payload = CampaignConfig().to_dict()
     payload["schema_version"] = 7
-    with pytest.raises(ConfigValidationError, match="requires schema_version 12"):
+    with pytest.raises(ConfigValidationError, match="requires schema_version 13"):
         CampaignConfig.from_dict(payload)
 
 
-def test_schema_eleven_and_removed_ferebus_scaling_field_are_rejected():
+def test_old_schema_and_removed_ferebus_scaling_field_are_rejected():
     payload = CampaignConfig().to_dict()
     payload["schema_version"] = 11
-    with pytest.raises(ConfigValidationError, match="requires schema_version 12"):
+    with pytest.raises(ConfigValidationError, match="requires schema_version 13"):
         CampaignConfig.from_dict(payload)
 
     payload = CampaignConfig().to_dict()
@@ -360,7 +377,7 @@ def test_schema_v3_resources_are_rejected_without_migration():
             "gaussian_link0_mem": "8GB",
         },
     }
-    with pytest.raises(ConfigValidationError, match="requires schema_version 12"):
+    with pytest.raises(ConfigValidationError, match="requires schema_version 13"):
         CampaignConfig.from_dict(payload)
 
 
@@ -532,13 +549,11 @@ def test_dict_roundtrip_preserves_nested_fields():
     c.phase_b.descriptor = "hybrid_alf_rmsd"
     c.point_allocation.batch_training_size = 5
     c.point_allocation.batch_internal_validation_size = 2
-    c.ferebus.warmstart = "never"
     c2 = CampaignConfig.from_dict(c.to_dict())
     assert c2.max_iterations == 3
     assert c2.phase_b.descriptor == "hybrid_alf_rmsd"
     assert c2.point_allocation.batch_training_size == 5
     assert c2.point_allocation.batch_internal_validation_size == 2
-    assert c2.ferebus.warmstart == "never"
 
 
 def test_yaml_roundtrip(tmp_path):
@@ -549,6 +564,94 @@ def test_yaml_roundtrip(tmp_path):
     c2 = CampaignConfig.from_yaml(p)
     assert c2.max_iterations == 7
     assert c2.ferebus.kernel == "rbf_per"
+
+
+def test_yaml_duplicate_keys_are_rejected_with_source_locations(tmp_path):
+    path = tmp_path / "campaign.yaml"
+    path.write_text(
+        "schema_version: 13\n"
+        "campaign:\n"
+        "  max_iterations: 3\n"
+        "  max_iterations: 9\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ConfigValidationError,
+        match=r"duplicate YAML key 'max_iterations'.*first defined",
+    ):
+        CampaignConfig.from_yaml(path)
+
+
+def test_yaml_merge_key_cannot_hide_duplicate_operator_input(tmp_path):
+    path = tmp_path / "campaign.yaml"
+    path.write_text(
+        "defaults: &defaults\n"
+        "  max_iterations: 3\n"
+        "schema_version: 13\n"
+        "campaign:\n"
+        "  <<: *defaults\n"
+        "  max_iterations: 9\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigValidationError, match="duplicate YAML key"):
+        CampaignConfig.from_yaml(path)
+
+
+def test_required_nested_block_cannot_be_null():
+    payload = CampaignConfig().to_dict()
+    payload["acquisition"] = None
+
+    with pytest.raises(ConfigValidationError, match="acquisition: null is not allowed"):
+        CampaignConfig.from_dict(payload)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_values_are_rejected_before_consumers(value):
+    payload = CampaignConfig().to_dict()
+    payload["adversarial_safety"]["max_whitened_distance"] = value
+
+    with pytest.raises(
+        ConfigValidationError,
+        match="adversarial_safety.max_whitened_distance must be finite",
+    ):
+        CampaignConfig.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "ferebus.nagents",
+        "acquisition.subspace.neighbour_count",
+        "acquisition.stencils.min_step",
+        "acquisition.gradient.active_step",
+        "ariadne.delta0",
+        "gaussian.spin_multiplicity",
+    ],
+)
+def test_positive_numeric_domains_are_enforced(path):
+    payload = CampaignConfig().to_dict()
+    _set_path(payload, path, -1)
+
+    with pytest.raises(ConfigValidationError, match=path):
+        CampaignConfig.from_dict(payload)
+
+
+@pytest.mark.parametrize("writer_name", ["to_yaml", "to_yaml_dense"])
+def test_yaml_writer_refuses_invalid_mutable_config_without_replacing_file(
+    tmp_path,
+    writer_name,
+):
+    path = tmp_path / "campaign.yaml"
+    path.write_bytes(b"authoritative prior bytes\n")
+    config = CampaignConfig()
+    config.campaign.max_iterations = 0
+
+    with pytest.raises(ConfigValidationError, match="campaign.max_iterations"):
+        getattr(config, writer_name)(path)
+
+    assert path.read_bytes() == b"authoritative prior bytes\n"
 
 
 def test_unknown_top_level_key_rejected():
@@ -616,7 +719,7 @@ def test_schema_eleven_rejects_removed_top_level_blocks(removed_block):
         CampaignConfig.from_dict(payload)
 
 
-def test_schema_eleven_campaign_block_owns_bootstrap_and_sampling_fields():
+def test_campaign_block_owns_bootstrap_sampling_and_seed_fields():
     payload = CampaignConfig().to_dict()
 
     assert set(payload["campaign"]) == {
@@ -624,6 +727,7 @@ def test_schema_eleven_campaign_block_owns_bootstrap_and_sampling_fields():
         "max_iterations",
         "custom_bootstrap",
         "sampling_aggressiveness",
+        "random_seed",
     }
     assert "trajectory_pool" not in payload
     assert "sampling_protocol" not in payload
@@ -646,7 +750,7 @@ def test_schema_eleven_rejects_removed_point_allocation_anchor():
         CampaignConfig.from_dict(payload)
 
 
-def test_all_shipped_campaign_templates_and_examples_parse_as_schema_twelve():
+def test_all_shipped_campaign_templates_and_examples_parse_as_schema_thirteen():
     repo_root = Path(__file__).resolve().parents[3]
     paths = [
         repo_root
@@ -662,7 +766,7 @@ def test_all_shipped_campaign_templates_and_examples_parse_as_schema_twelve():
     assert paths
     for path in paths:
         config = CampaignConfig.from_yaml(path)
-        assert config.schema_version == 12, str(path)
+        assert config.schema_version == 13, str(path)
 
 
 def test_invalid_descriptor_rejected():
@@ -711,7 +815,7 @@ def test_schema_v4_geometry_payload_is_rejected_without_migration():
     }
     payload["acquisition"]["fullspace_confinement"]["rmsd_scale_ang"] = 99.0
 
-    with pytest.raises(ConfigValidationError, match="requires schema_version 12"):
+    with pytest.raises(ConfigValidationError, match="requires schema_version 13"):
         CampaignConfig.from_dict(payload)
 
 
@@ -736,7 +840,7 @@ def test_schema_v5_bootstrap_and_batch_fields_are_rejected():
         "cap": 30,
     }
 
-    with pytest.raises(ConfigValidationError, match="requires schema_version 12"):
+    with pytest.raises(ConfigValidationError, match="requires schema_version 13"):
         CampaignConfig.from_dict(payload)
 
 
@@ -790,10 +894,10 @@ def test_first_live_examples_match_canonical_template_exactly():
     ) == template
 
 
-def test_invalid_warmstart_rejected():
+def test_removed_warmstart_fields_are_rejected():
     payload = CampaignConfig().to_dict()
-    payload["ferebus"]["warmstart"] = "sometimes_maybe"
-    with pytest.raises(ConfigValidationError):
+    payload["ferebus"]["warmstart"] = "never"
+    with pytest.raises(ConfigValidationError, match="unknown keys"):
         CampaignConfig.from_dict(payload)
 
 

@@ -900,34 +900,6 @@ def test_daemon_launch_refuses_saved_blocked_config_change(
     assert "gaussian.method" in out
 
 
-def test_saved_config_review_includes_selected_preset(tmp_path):
-    import importlib
-
-    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
-        set_selected_campaign_dir,
-    )
-    from ichor.hpc.active_learning.config import CampaignConfig
-
-    edit_menu = importlib.import_module(
-        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
-        "active_learning_campaign_submenus.edit_campaign_config_menu"
-    )
-    original = CampaignConfig()
-    _write_started_campaign_with_lock(tmp_path, original)
-    set_selected_campaign_dir(tmp_path)
-    edit_menu.load_config_for_campaign_dir(tmp_path, quiet=True)
-
-    assert edit_menu.saved_config_has_lock_changes(
-        None,
-        "thermodynamics_focused",
-    )
-    rendered = edit_menu.format_saved_config_lock_review(
-        None,
-        "thermodynamics_focused",
-    )
-    assert "lambda_force" in rendered
-
-
 def test_foreground_launch_reviews_selected_config_override(
     tmp_path, monkeypatch, capsys,
 ):
@@ -955,7 +927,7 @@ def test_foreground_launch_reviews_selected_config_override(
     set_selected_campaign_dir(tmp_path)
     edit_menu.load_config_for_campaign_dir(tmp_path, quiet=True)
     start_menu.start_daemon_foreground_menu_options.selected_command = "resume"
-    start_menu.start_daemon_foreground_menu_options.selected_mode = "dry-run"
+    start_menu.start_daemon_foreground_menu_options.selected_mode = "dry_run"
     start_menu.start_daemon_foreground_menu_options.selected_config = str(override_path)
     calls = []
     import ichor.hpc.active_learning.cli as daemon_cli
@@ -993,7 +965,7 @@ def test_foreground_launch_refuses_missing_config_override(
     set_selected_campaign_dir(tmp_path)
     edit_menu.load_config_for_campaign_dir(tmp_path, quiet=True)
     start_menu.start_daemon_foreground_menu_options.selected_command = "resume"
-    start_menu.start_daemon_foreground_menu_options.selected_mode = "dry-run"
+    start_menu.start_daemon_foreground_menu_options.selected_mode = "dry_run"
     start_menu.start_daemon_foreground_menu_options.selected_config = str(
         tmp_path / "missing.yaml"
     )
@@ -1038,7 +1010,7 @@ def test_foreground_launch_refuses_invalid_config_override(
     set_selected_campaign_dir(tmp_path)
     edit_menu.load_config_for_campaign_dir(tmp_path, quiet=True)
     start_menu.start_daemon_foreground_menu_options.selected_command = "resume"
-    start_menu.start_daemon_foreground_menu_options.selected_mode = "dry-run"
+    start_menu.start_daemon_foreground_menu_options.selected_mode = "dry_run"
     start_menu.start_daemon_foreground_menu_options.selected_config = str(override_path)
     calls = []
     import ichor.hpc.active_learning.cli as daemon_cli
@@ -1082,9 +1054,8 @@ def test_foreground_launch_allows_clean_override_when_campaign_yaml_is_dirty_on_
     set_selected_campaign_dir(tmp_path)
     edit_menu.load_config_for_campaign_dir(tmp_path, quiet=True)
     start_menu.start_daemon_foreground_menu_options.selected_command = "resume"
-    start_menu.start_daemon_foreground_menu_options.selected_mode = "dry-run"
+    start_menu.start_daemon_foreground_menu_options.selected_mode = "dry_run"
     start_menu.start_daemon_foreground_menu_options.selected_config = str(clean_override_path)
-    start_menu.start_daemon_foreground_menu_options.selected_preset = ""
     calls = []
     import ichor.hpc.active_learning.cli as daemon_cli
 
@@ -1124,7 +1095,7 @@ def test_background_launch_reviews_selected_config_override(
     set_selected_campaign_dir(tmp_path)
     edit_menu.load_config_for_campaign_dir(tmp_path, quiet=True)
     start_menu.start_daemon_background_menu_options.selected_command = "resume"
-    start_menu.start_daemon_background_menu_options.selected_mode = "dry-run"
+    start_menu.start_daemon_background_menu_options.selected_mode = "dry_run"
     start_menu.start_daemon_background_menu_options.selected_config = str(override_path)
     calls = []
 
@@ -1170,7 +1141,7 @@ def test_background_launch_refuses_invalid_config_override(
     set_selected_campaign_dir(tmp_path)
     edit_menu.load_config_for_campaign_dir(tmp_path, quiet=True)
     start_menu.start_daemon_background_menu_options.selected_command = "resume"
-    start_menu.start_daemon_background_menu_options.selected_mode = "dry-run"
+    start_menu.start_daemon_background_menu_options.selected_mode = "dry_run"
     start_menu.start_daemon_background_menu_options.selected_config = str(override_path)
     calls = []
 
@@ -1572,8 +1543,6 @@ def test_campaign_config_menu_covers_every_config_leaf():
         set(leaf_paths(CampaignConfig()))
         - {
             "schema_version",
-            "ferebus.warmstart",
-            "ferebus.warmstart_streak",
             "ferebus.prior_mean_type",
             "ferebus.property_scaling",
         }
@@ -1587,8 +1556,6 @@ def test_campaign_config_menu_covers_every_config_leaf():
 
     assert read_only == {
         "schema_version",
-        "ferebus.warmstart",
-        "ferebus.warmstart_streak",
         "ferebus.prior_mean_type",
         "ferebus.property_scaling",
     }
@@ -1794,14 +1761,14 @@ def test_launch_helpers_builds_argv():
     )
     argv = build_daemon_argv(
         Path("/some/campaign"),
-        mode="dry-run",
+        mode="dry_run",
         poll_interval=15,
         max_ticks=5,
     )
     assert argv[1] == "-m"
     assert argv[2] == "ichor.hpc.active_learning.cli"
     assert "start" in argv
-    assert "--dry-run" in argv
+    assert argv[argv.index("--mode") + 1] == "dry_run"
     assert "--poll-interval" in argv
     assert "--max-ticks" in argv
     assert DetachedLaunchResult.__name__ == "DetachedLaunchResult"
@@ -1809,7 +1776,74 @@ def test_launch_helpers_builds_argv():
     assert MENU_LAUNCHED_LOG_FILENAME == "daemon.menu_launched.out"
 
 
-def test_launch_helpers_builds_resume_argv_with_preset_and_config(tmp_path):
+def test_detached_launch_waits_for_readiness_before_publishing_pid(
+    tmp_path,
+    monkeypatch,
+):
+    import json
+    from pathlib import Path
+
+    import ichor.cli.useful_functions.launch_helpers as helpers
+
+    class Child:
+        pid = 2718
+
+        @staticmethod
+        def poll():
+            return None
+
+    def fake_popen(argv, log_path, *, env):
+        Path(env["ICHOR_DAEMON_READINESS_PATH"]).write_text(
+            json.dumps({"schema_version": 1, "ready": True, "pid": Child.pid}),
+            encoding="utf-8",
+        )
+        return Child()
+
+    monkeypatch.setattr(helpers, "_popen_detached", fake_popen)
+    result = helpers.launch_daemon_detached_checked(
+        tmp_path,
+        mode="dry_run",
+        startup_timeout_seconds=1.0,
+    )
+
+    assert result.ready is True
+    assert result.exited_during_startup is False
+    assert result.pid_path.read_text(encoding="utf-8") == "2718\n"
+
+
+def test_detached_launch_timeout_does_not_publish_pid(tmp_path, monkeypatch):
+    import ichor.cli.useful_functions.launch_helpers as helpers
+
+    class Child:
+        pid = 3141
+        terminated = False
+
+        @staticmethod
+        def poll():
+            return None
+
+        def terminate(self):
+            self.terminated = True
+
+    child = Child()
+    monkeypatch.setattr(
+        helpers,
+        "_popen_detached",
+        lambda argv, log_path, *, env: child,
+    )
+    result = helpers.launch_daemon_detached_checked(
+        tmp_path,
+        mode="dry_run",
+        startup_timeout_seconds=0.0,
+    )
+
+    assert result.ready is False
+    assert result.exited_during_startup is True
+    assert child.terminated is True
+    assert not result.pid_path.exists()
+
+
+def test_launch_helpers_builds_resume_argv_with_config(tmp_path):
     from ichor.cli.useful_functions.launch_helpers import build_daemon_argv
 
     cfg = tmp_path / "override.yaml"
@@ -1818,12 +1852,10 @@ def test_launch_helpers_builds_resume_argv_with_preset_and_config(tmp_path):
         command="resume",
         mode="live",
         config=cfg,
-        preset="csf4",
     )
     assert argv[3] == "resume"
-    assert "--live" in argv
+    assert argv[argv.index("--mode") + 1] == "live"
     assert argv[argv.index("--config") + 1] == str(cfg)
-    assert argv[argv.index("--preset") + 1] == "csf4"
 
 
 def test_launch_helpers_builds_explicit_completed_campaign_reopen_argv(tmp_path):
@@ -1887,7 +1919,7 @@ def test_launch_helpers_rejects_unknown_mode():
         build_daemon_argv(Path("."), mode="bogus")
 
     with pytest.raises(ValueError):
-        build_daemon_argv(Path("."), command="bogus", mode="dry-run")
+        build_daemon_argv(Path("."), command="bogus", mode="dry_run")
 
 
 def test_campaign_dir_global_added():
@@ -2305,9 +2337,8 @@ def test_foreground_launch_uses_resume_when_selected(tmp_path, monkeypatch):
 
     set_selected_campaign_dir(tmp_path)
     menu.start_daemon_foreground_menu_options.selected_command = "resume"
-    menu.start_daemon_foreground_menu_options.selected_mode = "dry-run"
+    menu.start_daemon_foreground_menu_options.selected_mode = "dry_run"
     menu.start_daemon_foreground_menu_options.selected_config = ""
-    menu.start_daemon_foreground_menu_options.selected_preset = "balanced"
     menu.start_daemon_foreground_menu_options.selected_poll_interval = 3
     menu.start_daemon_foreground_menu_options.selected_max_ticks = 2
     menu.start_daemon_foreground_menu_options.reopen_converged = True
@@ -2329,8 +2360,7 @@ def test_foreground_launch_uses_resume_when_selected(tmp_path, monkeypatch):
     assert calls[0][0] == "resume"
     ns = calls[0][1]
     assert ns.campaign_dir == str(tmp_path)
-    assert ns.dry_run is True
-    assert ns.preset == "balanced"
+    assert ns.mode == "dry_run"
     assert ns.poll_interval == 3
     assert ns.max_ticks == 2
     assert ns.reopen_converged is True
@@ -2353,9 +2383,8 @@ def test_foreground_launch_rejects_completed_campaign_reopen_with_start(
     )
     set_selected_campaign_dir(tmp_path)
     menu.start_daemon_foreground_menu_options.selected_command = "start"
-    menu.start_daemon_foreground_menu_options.selected_mode = "dry-run"
+    menu.start_daemon_foreground_menu_options.selected_mode = "dry_run"
     menu.start_daemon_foreground_menu_options.selected_config = ""
-    menu.start_daemon_foreground_menu_options.selected_preset = ""
     menu.start_daemon_foreground_menu_options.reopen_converged = True
     menu.start_daemon_foreground_menu_options.cancel_stop_request = False
     monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: "")
@@ -2382,7 +2411,6 @@ def test_background_launch_reports_checked_result(tmp_path, monkeypatch, capsys)
     menu.start_daemon_background_menu_options.selected_command = "resume"
     menu.start_daemon_background_menu_options.selected_mode = "live"
     menu.start_daemon_background_menu_options.selected_config = ""
-    menu.start_daemon_background_menu_options.selected_preset = ""
     menu.start_daemon_background_menu_options.selected_poll_interval = 0
     menu.start_daemon_background_menu_options.selected_max_ticks = 0
     menu.start_daemon_background_menu_options.reopen_converged = True

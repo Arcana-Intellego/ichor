@@ -7,7 +7,7 @@ from ichor.hpc.active_learning import cli
 
 def _write_campaign_yaml(path):
     path.mkdir(parents=True, exist_ok=True)
-    (path / "campaign.yaml").write_text("schema_version: 3\n", encoding="utf-8")
+    (path / "campaign.yaml").write_text("schema_version: 13\n", encoding="utf-8")
 
 
 def _parse(argv):
@@ -41,15 +41,14 @@ def test_resolve_campaign_dir_explicit_path_overrides_cwd(tmp_path, monkeypatch)
     assert cli.resolve_campaign_dir(str(explicit)) == explicit.resolve()
 
 
-def test_main_reports_missing_campaign_dir_without_traceback(tmp_path, monkeypatch, capsys):
+def test_status_remains_available_without_campaign_yaml(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
 
-    with pytest.raises(SystemExit) as exc:
-        cli.main(["status"])
+    assert cli.main(["status"]) == 4
 
-    assert exc.value.code == 2
     captured = capsys.readouterr()
-    assert "current directory does not contain campaign.yaml" in captured.err
+    assert "campaign.yaml: missing" in captured.out
+    assert "state.json" in captured.err
 
 
 def test_status_without_campaign_dir_uses_cwd_campaign(tmp_path, monkeypatch, capsys):
@@ -63,24 +62,23 @@ def test_status_without_campaign_dir_uses_cwd_campaign(tmp_path, monkeypatch, ca
 
 
 def test_start_short_flags_match_long_options():
-    ns = _parse(["start", "-l", "-b", "-d", "-m", "-p", "3", "-t", "9"])
+    ns = _parse(
+        ["start", "--mode", "dry_run", "-b", "-p", "3", "-t", "9"]
+    )
 
-    assert ns.live is True
+    assert ns.mode == "dry_run"
     assert ns.background is True
-    assert ns.dry_run is True
-    assert ns.mock_ariadne is True
     assert ns.poll_interval == 3
     assert ns.max_ticks == 9
 
 
-def test_start_clustered_boolean_flags_expand_to_individual_flags():
-    expanded = cli.expand_boolean_short_flag_clusters(["start", "-lb", "-t", "10"])
-    assert expanded == ["start", "-l", "-b", "-t", "10"]
-
-    ns = _parse(["start", "-lb", "-t", "10"])
-    assert ns.live is True
-    assert ns.background is True
-    assert ns.max_ticks == 10
+def test_removed_execution_mode_short_flags_are_rejected():
+    with pytest.raises(SystemExit):
+        _parse(["start", "-l"])
+    with pytest.raises(SystemExit):
+        _parse(["start", "-d"])
+    with pytest.raises(SystemExit):
+        _parse(["start", "-m"])
 
 
 def test_start_and_resume_foreground_short_flag_parse():
@@ -92,16 +90,16 @@ def test_cluster_expansion_does_not_split_value_taking_options():
     with pytest.raises(cli.ShortFlagClusterError):
         cli.expand_boolean_short_flag_clusters(["start", "-cthing"])
     with pytest.raises(cli.ShortFlagClusterError):
-        cli.expand_boolean_short_flag_clusters(["start", "-lt", "10"])
+        cli.expand_boolean_short_flag_clusters(["start", "-bt", "10"])
 
 
 def test_main_reports_ambiguous_short_cluster_without_traceback(capsys):
     with pytest.raises(SystemExit) as exc:
-        cli.main(["start", "-lt", "10"])
+        cli.main(["start", "-bt", "10"])
 
     assert exc.value.code == 2
     captured = capsys.readouterr()
-    assert "unsupported short flag cluster '-lt'" in captured.err
+    assert "unsupported short flag cluster '-bt'" in captured.err
 
 
 def test_init_and_journal_short_flags_parse():
@@ -163,17 +161,18 @@ def test_help_mentions_campaign_auto_detection_and_examples(capsys):
         parser.parse_args(["--help"])
     top = capsys.readouterr().out
     assert "campaign.yaml" in top
-    assert "ichor-al-daemon start -lb" in top
+    assert "ichor-al-daemon start --mode live" in top
     assert "ichor-al-daemon init" in top
 
     with pytest.raises(SystemExit):
         parser.parse_args(["start", "--help"])
     start = capsys.readouterr().out
-    assert "-l" in start
-    assert "--live" in start
+    assert "--mode" in start
+    assert "dry_run" in start
+    assert "live" in start
     assert "-b" in start
     assert "--background" in start
-    assert "ichor-al-daemon start -lb" in start
+    assert "ichor-al-daemon start --mode live" in start
 
     with pytest.raises(SystemExit):
         parser.parse_args(["init", "--help"])
