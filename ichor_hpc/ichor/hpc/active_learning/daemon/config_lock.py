@@ -9,7 +9,7 @@ edits before ``reconcile --apply`` promotes a proposed recovery state.
 from __future__ import annotations
 
 import hashlib
-import json
+from ..strict_json import strict_json as json
 import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -77,12 +77,9 @@ def _now_iso() -> str:
 
 
 def config_lock_path(campaign_dir: Union[str, Path]) -> Path:
-    return (
-        Path(campaign_dir)
-        / ".DATA"
-        / "ACTIVE_LEARNING"
-        / CONFIG_LOCK_FILENAME
-    )
+    from .filesystem import operational_path
+
+    return operational_path(campaign_dir, CONFIG_LOCK_FILENAME)
 
 
 def config_lock_history_dir(campaign_dir: Union[str, Path]) -> Path:

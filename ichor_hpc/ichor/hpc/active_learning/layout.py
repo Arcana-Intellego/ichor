@@ -20,9 +20,11 @@ STAGING_DIRNAME = "STAGING"
 COMMITTED_VERSION_NAME_WIDTH = 6
 ACTIVE_ITERATION_NAME_WIDTH = 6
 SEED_ID_NAME_WIDTH = 6
+STAGING_POINTDIR_NAME_MIN_WIDTH = 4
 
 _ACTIVE_ITERATION_RE = re.compile(r"^iteration-([0-9]{6,})$")
 _SEED_DIRECTORY_RE = re.compile(r"^seed-([0-9]{6,})$")
+_STAGING_POINTDIR_RE = re.compile(r"^POINT_([0-9]{4,})\.pointdir$")
 
 
 def _positive_identifier(value, label: str) -> int:
@@ -36,6 +38,30 @@ def _positive_identifier(value, label: str) -> int:
 
 def qm_reference_data_dir(campaign_dir: Union[str, Path]) -> Path:
     return Path(campaign_dir) / QM_REFERENCE_DATA_DIRNAME
+
+
+def staging_pointdir_name(point_index: int) -> str:
+    if isinstance(point_index, bool) or not isinstance(point_index, Integral):
+        raise ValueError("staging point index must be an integer")
+    value = int(point_index)
+    if value < 0:
+        raise ValueError("staging point index must be >= 0")
+    return (
+        "POINT_"
+        + str(value).zfill(STAGING_POINTDIR_NAME_MIN_WIDTH)
+        + ".pointdir"
+    )
+
+
+def parse_staging_pointdir_name(name: str) -> int:
+    text = str(name)
+    match = _STAGING_POINTDIR_RE.fullmatch(text)
+    if match is None:
+        raise ValueError("invalid staging point-directory name: " + repr(name))
+    value = int(match.group(1))
+    if staging_pointdir_name(value) != text:
+        raise ValueError("noncanonical staging point-directory name: " + repr(name))
+    return value
 
 
 def trained_models_dir(campaign_dir: Union[str, Path]) -> Path:
@@ -253,7 +279,10 @@ __all__ = [
     "COMMITTED_VERSION_NAME_WIDTH",
     "ACTIVE_ITERATION_NAME_WIDTH",
     "SEED_ID_NAME_WIDTH",
+    "STAGING_POINTDIR_NAME_MIN_WIDTH",
     "qm_reference_data_dir",
+    "staging_pointdir_name",
+    "parse_staging_pointdir_name",
     "trained_models_dir",
     "bootstrap_dir",
     "bootstrap_selection_dir",

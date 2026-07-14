@@ -1,7 +1,7 @@
 """Finite reserve-only replacement sampling for incomplete QM allocations."""
 from __future__ import annotations
 
-import json
+from .strict_json import StrictJSONDecodeError, strict_json as json
 import math
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
@@ -71,6 +71,15 @@ def _active_frame(attempt: Mapping[str, Any]) -> Atoms:
         raise FileNotFoundError("replacement ARIADNE result is missing: " + str(result_path))
     try:
         result = json.loads(result_path.read_text(encoding="utf-8"))
+    except StrictJSONDecodeError as exc:
+        if "non-standard JSON constant" in str(exc):
+            raise ValueError(
+                "replacement ARIADNE result contains non-finite coordinates "
+                "or diagnostics: " + str(result_path)
+            ) from exc
+        raise ValueError(
+            "replacement ARIADNE result is unreadable: " + str(result_path)
+        ) from exc
     except (OSError, ValueError) as exc:
         raise ValueError("replacement ARIADNE result is unreadable: " + str(result_path)) from exc
     atom_types = result.get("atom_types")
@@ -173,8 +182,6 @@ def prepare_replacement_round(
     for sample_index, attempt in enumerate(attempts):
         reserve_rank = int(attempt.get("reserve_rank", sample_index))
         pointdir_index = target_total + reserve_rank
-        if pointdir_index > 9999:
-            raise ValueError("replacement pointdir index exceeds four-digit staging contract")
         records.append({
             **attempt,
             "sample_index": int(sample_index),

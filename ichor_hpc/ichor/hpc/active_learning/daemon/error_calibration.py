@@ -8,7 +8,7 @@ AIMAll batch.
 from __future__ import annotations
 
 import hashlib
-import json
+from ..strict_json import strict_json as json
 import math
 import time
 from pathlib import Path
@@ -16,6 +16,7 @@ from statistics import mean, median
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .state import atomic_write_json
+from ..layout import staging_pointdir_name
 
 
 ERROR_CALIBRATION_RECORDS_FILENAME = "error_calibration_records.json"
@@ -29,7 +30,9 @@ class ErrorCalibrationError(RuntimeError):
 
 
 def _active_learning_dir(campaign_dir: Any) -> Path:
-    return Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING"
+    from .filesystem import operational_data_dir
+
+    return operational_data_dir(campaign_dir)
 
 
 def records_path(campaign_dir: Any) -> Path:
@@ -1143,7 +1146,7 @@ def synthetic_dry_records(
             "iteration": int(iteration),
             "model_version": int(models_version),
             "prior_mean_contract_sha256": str(prior_mean_contract_sha256),
-            "pointdir": "POINT_" + str(i).zfill(4) + ".pointdir",
+            "pointdir": staging_pointdir_name(i),
             "seed_id": int(i) + 1,
             "seed_uid": hashlib.sha256(
                 (str(iteration) + ":" + str(i + 1)).encode("ascii")

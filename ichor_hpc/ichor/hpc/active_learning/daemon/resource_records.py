@@ -1,7 +1,7 @@
 """Immutable resource-resolution records for submitted daemon attempts."""
 from __future__ import annotations
 
-import json
+from ..strict_json import strict_json as json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, Union

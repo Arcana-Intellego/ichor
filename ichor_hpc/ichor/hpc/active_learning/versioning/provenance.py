@@ -28,7 +28,7 @@ serialiser used here (tempfile + fsync + os.replace + parent-dir fsync).
 """
 from __future__ import annotations
 
-import json
+from ..strict_json import strict_json as json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
@@ -71,8 +71,10 @@ def _pointdir_lock(pointdir, timeout: float = _DEFAULT_LOCK_TIMEOUT_SECONDS):
 def _index_lock(campaign_dir, timeout: float = _DEFAULT_LOCK_TIMEOUT_SECONDS):
     """Exclusive lock for read-modify-write of seed_frame_id_index.json."""
     import portalocker
+    from ..daemon.filesystem import operational_data_dir
+
     campaign_dir = Path(campaign_dir)
-    lock_dir = campaign_dir / ".DATA" / "ACTIVE_LEARNING"
+    lock_dir = operational_data_dir(campaign_dir)
     lock_dir.mkdir(parents=True, exist_ok=True)
     lock_path = lock_dir / _INDEX_LOCK_FILENAME
     with portalocker.Lock(
@@ -86,8 +88,10 @@ def _index_lock(campaign_dir, timeout: float = _DEFAULT_LOCK_TIMEOUT_SECONDS):
 def _recent_seeds_lock(campaign_dir, timeout: float = _DEFAULT_LOCK_TIMEOUT_SECONDS):
     """Exclusive lock for read-modify-write of recent_seeds.json."""
     import portalocker
+    from ..daemon.filesystem import operational_data_dir
+
     campaign_dir = Path(campaign_dir)
-    lock_dir = campaign_dir / ".DATA" / "ACTIVE_LEARNING"
+    lock_dir = operational_data_dir(campaign_dir)
     lock_dir.mkdir(parents=True, exist_ok=True)
     lock_path = lock_dir / _RECENT_SEEDS_LOCK_FILENAME
     with portalocker.Lock(
@@ -519,7 +523,9 @@ def enrich_with_point_allocation(
 # Flat index file -- O(1) read at SEED_SELECT time
 
 def _index_path(campaign_dir: Union[str, Path]) -> Path:
-    return Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING" / SEED_FRAME_ID_INDEX_FILENAME
+    from ..daemon.filesystem import operational_path
+
+    return operational_path(campaign_dir, SEED_FRAME_ID_INDEX_FILENAME)
 
 
 def _empty_index_payload() -> Dict[str, Any]:
@@ -731,9 +737,9 @@ DEFAULT_RECENT_SEEDS_COOLDOWN = 3
 
 
 def _recent_seeds_path(campaign_dir: Union[str, Path]) -> Path:
-    return (
-        Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING" / RECENT_SEEDS_FILENAME
-    )
+    from ..daemon.filesystem import operational_path
+
+    return operational_path(campaign_dir, RECENT_SEEDS_FILENAME)
 
 
 def _empty_recent_seeds_payload() -> Dict[str, Any]:

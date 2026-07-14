@@ -1,7 +1,7 @@
 """Read-only resource planning for current, submitted, and future phases."""
 from __future__ import annotations
 
-import json
+from ..strict_json import strict_json as json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
 

@@ -13,8 +13,9 @@ manifest can sit inside the directory it describes.
 from __future__ import annotations
 
 import hashlib
-import json
+from ..strict_json import strict_json as json
 import os
+import platform
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple, Union
@@ -106,14 +107,14 @@ def fsync_regular_files(
     *,
     exclude: Iterable[str] = (),
 ) -> None:
-    """Best-effort fsync for every regular file that will enter a manifest."""
+    """Durably synchronise every regular file that will enter a manifest."""
+    from ..daemon.state import _fsync_file_descriptor
+
     root_path = Path(root)
     for f in _iter_files(root_path, exclude=exclude):
-        try:
-            with open(f, "rb") as handle:
-                os.fsync(handle.fileno())
-        except OSError:
-            continue
+        mode = "rb+" if platform.system() == "Windows" else "rb"
+        with open(f, mode) as handle:
+            _fsync_file_descriptor(handle.fileno())
 
 
 def read_manifest(root: Union[str, Path]) -> Dict[str, str]:

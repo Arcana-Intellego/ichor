@@ -2344,7 +2344,7 @@ def main(argv=None) -> int:
       4 -- ARIADNE descent failed mid-run; we still write result.json.
     """
     import argparse
-    import json
+    from ..strict_json import strict_json as json
     import sys as _sys
     from pathlib import Path as _Path
 

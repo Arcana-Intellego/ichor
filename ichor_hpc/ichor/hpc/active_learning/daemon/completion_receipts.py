@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import hashlib
-import json
+from ..strict_json import strict_json as json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
 
 from ..versioning.manifest import sha256_file
 from .state import CampaignState, atomic_write_json
+from .filesystem import operational_path
 
 
 COMPLETION_RECEIPT_SCHEMA_VERSION = 1
@@ -44,12 +45,7 @@ def state_projection(value: Union[CampaignState, Mapping[str, Any]]) -> Dict[str
 
 
 def receipt_dir(campaign_dir: Union[str, Path]) -> Path:
-    return (
-        Path(campaign_dir)
-        / ".DATA"
-        / "ACTIVE_LEARNING"
-        / COMPLETION_RECEIPT_DIRNAME
-    )
+    return operational_path(campaign_dir, COMPLETION_RECEIPT_DIRNAME)
 
 
 def _inside_campaign(campaign: Path, path: Path) -> Path:

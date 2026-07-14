@@ -18,7 +18,8 @@ Current write protocol:
 """
 from __future__ import annotations
 
-import json
+from ..strict_json import strict_json as json
+import errno
 import math
 import os
 import platform
@@ -468,21 +469,45 @@ def fresh_campaign_state(
     )
 
 
+_UNSUPPORTED_FSYNC_ERRNOS = frozenset(
+    value
+    for value in (
+        getattr(errno, "EINVAL", None),
+        getattr(errno, "ENOSYS", None),
+        getattr(errno, "ENOTSUP", None),
+        getattr(errno, "EOPNOTSUPP", None),
+    )
+    if value is not None
+)
+
+
+def _fsync_file_descriptor(fd: int) -> None:
+    """Synchronise a descriptor, ignoring only unsupported-operation errors."""
+    try:
+        os.fsync(fd)
+    except NotImplementedError:
+        return
+    except OSError as exc:
+        if exc.errno in _UNSUPPORTED_FSYNC_ERRNOS:
+            return
+        raise
+
+
 def _fsync_parent_dir(target: Path) -> None:
-    """Best-effort fsync of the parent directory. Required on POSIX systems
-    like CSF4 (i.e. Lustre) for the rename to be durable across crashes and
-    consistent across NFS clients."""
+    """Synchronise rename metadata for a durable POSIX publication."""
     if platform.system() == "Windows":
         return
     parent = target.parent
     try:
         fd = os.open(str(parent), os.O_RDONLY)
-    except (OSError, NotImplementedError):
+    except NotImplementedError:
         return
+    except OSError as exc:
+        if exc.errno in _UNSUPPORTED_FSYNC_ERRNOS:
+            return
+        raise
     try:
-        os.fsync(fd)
-    except (OSError, NotImplementedError):
-        pass
+        _fsync_file_descriptor(fd)
     finally:
         os.close(fd)
 
@@ -504,11 +529,7 @@ def atomic_write_text(target: Union[str, Path], text: str) -> None:
         with open(tmp, "x", encoding="utf-8", newline="\n") as f:
             f.write(text)
             f.flush()
-            try:
-                os.fsync(f.fileno())
-            except (OSError, NotImplementedError):
-                # fsync may be unsupported on some filesystems (tmpfs/test environments).
-                pass
+            _fsync_file_descriptor(f.fileno())
         os.replace(str(tmp), str(target))
     finally:
         if tmp.exists():
@@ -523,6 +544,22 @@ def atomic_write_json(target: Union[str, Path], payload: Any) -> None:
     atomic_write_text(target, text)
 
 
+def _validated_state_path(path: Union[str, Path]) -> Path:
+    """Reject symlinked daemon state paths before reading or replacing them."""
+    p = Path(path)
+    if (
+        p.name == DEFAULT_STATE_FILENAME
+        and p.parent.name == "ACTIVE_LEARNING"
+        and p.parent.parent.name == ".DATA"
+    ):
+        from .filesystem import campaign_owned_path
+
+        return campaign_owned_path(p.parent.parent.parent, p)
+    if p.is_symlink():
+        raise ValueError("state path is a symlink: " + str(p))
+    return p
+
+
 
 def read_state(path: Union[str, Path]) -> CampaignState:
     """Load a CampaignState from disk and validate it.
@@ -533,7 +570,7 @@ def read_state(path: Union[str, Path]) -> CampaignState:
     json.JSONDecodeError so callers can distinguish "corrupt file" from
     "schema drift".
     """
-    p = Path(path)
+    p = _validated_state_path(path)
     with open(p, "r", encoding="utf-8") as f:
         payload = json.load(f)
     return CampaignState.from_dict(payload)
@@ -544,4 +581,4 @@ def write_state(path: Union[str, Path], state: CampaignState) -> None:
     """Persist a CampaignState atomically (see :func:`atomic_write_json`)."""
     payload = state.to_dict()
     CampaignState.from_dict(payload)
-    atomic_write_json(path, payload)
+    atomic_write_json(_validated_state_path(path), payload)

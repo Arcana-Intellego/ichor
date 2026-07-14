@@ -16,7 +16,7 @@ Layout, matching what the postprocess parsers expect:
 """
 from __future__ import annotations
 
-import json
+from ..strict_json import strict_json as json
 import csv
 import os  # stage_ferebus_inputs cd's into the staging dir to export csvs; this was missing and only bit on a live run
 import re
@@ -40,6 +40,8 @@ from .state import atomic_write_json, atomic_write_text
 from ..layout import (
     COMMITTED_VERSION_NAME_WIDTH,
     TRAINED_MODELS_DIRNAME,
+    parse_staging_pointdir_name,
+    staging_pointdir_name,
     staging_phase_dir,
     staging_root,
     trained_models_dir,
@@ -49,7 +51,6 @@ from ..versioning.manifest import sha256_file
 
 QUANTUM_ACCEPTANCE_MANIFEST = "accepted_pointdirs.json"
 QUANTUM_ACCEPTANCE_SCHEMA_VERSION = 1
-POINTDIR_BASENAME_RE = re.compile(r"^POINT_\d{4}\.pointdir$")
 AIMALL_TASK_METADATA = "AIMALL_TASK.json"
 AIMALL_TASK_METADATA_SCHEMA_VERSION = 1
 WFN_METHOD_RECEIPT = "WFN_METHOD_RECEIPT.json"
@@ -229,8 +230,12 @@ def _copy_atomic_checked_file(source: Path, destination: Path) -> None:
 
 def _validate_pointdir_basename(name: str) -> str:
     text = str(name).strip()
-    if Path(text).name != text or not POINTDIR_BASENAME_RE.fullmatch(text):
+    if Path(text).name != text:
         raise ValueError("unsafe pointdir name in manifest: " + repr(name))
+    try:
+        parse_staging_pointdir_name(text)
+    except ValueError as exc:
+        raise ValueError("unsafe pointdir name in manifest: " + repr(name)) from exc
     return text
 
 
@@ -1052,7 +1057,7 @@ def stage_gaussian_inputs(
             if is_replacement and allocation_records
             else int(k)
         )
-        pd = staging / ("POINT_" + str(point_index).zfill(4) + ".pointdir")
+        pd = staging / staging_pointdir_name(point_index)
         pd.mkdir(parents=True, exist_ok=True)
         gjf = GJF(
             pd / "input.gjf",

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-import json
+from ..strict_json import strict_json as json
 import os
 import sys
 import time

@@ -30,7 +30,7 @@ can assert exact counts of artefacts produced.
 from __future__ import annotations
 
 import csv
-import json
+from ..strict_json import strict_json as json
 import random
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -56,7 +56,6 @@ from ..versioning.reference_data import ReferenceDataVersioning
 from ..versioning.trained_models import TrainedModelVersioning
 from ..versioning.versioned_directory import VersionedDirectory
 from ..layout import (
-    ACTIVE_LEARNING_DIRNAME,
     QM_REFERENCE_DATA_DIRNAME,
     TRAINED_MODELS_DIRNAME,
     active_iteration_dir,
@@ -66,6 +65,7 @@ from ..layout import (
     ariadne_seeds_dir,
     bootstrap_dir,
     bootstrap_selection_dir,
+    staging_pointdir_name,
 )
 from .phase_executor import (
     BackendSubmissionError,
@@ -122,16 +122,17 @@ class DryRunPhaseExecutor:
     rng_seed: int = 0
     reference_data_dir_name: str = QM_REFERENCE_DATA_DIRNAME
     models_dir_name: str = TRAINED_MODELS_DIRNAME
-    al_dir_name: str = ACTIVE_LEARNING_DIRNAME
     strict_completion_receipt_evidence: bool = True
     scripts_dir: Path = field(init=False)
     artefact_log: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         from ..layout import reject_legacy_campaign_layout
+        from .filesystem import operational_data_dir
 
         self.campaign_dir = Path(self.campaign_dir)
         reject_legacy_campaign_layout(self.campaign_dir)
+        operational_data_dir(self.campaign_dir).mkdir(parents=True, exist_ok=True)
         self.scripts_dir = self.campaign_dir / ".DATA" / "SCRIPTS"
         self.scripts_dir.mkdir(parents=True, exist_ok=True)
         (self.campaign_dir / self.reference_data_dir_name).mkdir(parents=True, exist_ok=True)
@@ -1704,7 +1705,7 @@ class DryRunPhaseExecutor:
 
     def _post_ariadne_array(self, state) -> Dict[str, Any]:
         """Publish mock seed outputs through the live ARIADNE contracts."""
-        import json
+        from ..strict_json import strict_json as json
         import os
         import shutil
 
@@ -2403,7 +2404,7 @@ class DryRunPhaseExecutor:
         present; empty string otherwise. The daemon does not require a pool
         to be imported in dry-run, so this is a soft lookup."""
         from ..acquisition.trajectory_pool import POOL_MANIFEST_FILENAME, POOL_SUBDIR
-        import json as _json
+        from ..strict_json import strict_json as _json
 
         manifest_path = self.campaign_dir / POOL_SUBDIR / POOL_MANIFEST_FILENAME
         if not manifest_path.is_file():
@@ -2463,7 +2464,7 @@ class DryRunPhaseExecutor:
     def _read_seed_frame_id_from_pointdir(self, pointdir: Path):
         """Read provenance.json from a committed pointdir and return its
         seed.frame_id (or None if absent / malformed)."""
-        import json as _json
+        from ..strict_json import strict_json as _json
         from ..versioning.provenance import PROVENANCE_FILENAME as _PFN
 
         prov_path = Path(pointdir) / _PFN
@@ -2490,7 +2491,9 @@ class DryRunPhaseExecutor:
         except Exception:
             return
         try:
-            journal_path = self.campaign_dir / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson"
+            from .filesystem import operational_path
+
+            journal_path = operational_path(self.campaign_dir, "journal.ndjson")
             append_event(journal_path, event_type, **payload)
         except Exception:
             pass
@@ -2642,7 +2645,7 @@ class DryRunPhaseExecutor:
                 if replacement
                 else i
             )
-            point_dir = staging_root / ("POINT_" + str(point_index).zfill(4) + ".pointdir")
+            point_dir = staging_root / staging_pointdir_name(point_index)
             point_dir.mkdir(exist_ok=True)
             provenance_source = Path(str(attempt.get("provenance_json") or ""))
             provenance_dest = point_dir / PROVENANCE_FILENAME
@@ -2700,7 +2703,7 @@ class DryRunPhaseExecutor:
 
             records = [
                 {
-                    "pointdir": "POINT_" + str(i).zfill(4) + ".pointdir",
+                    "pointdir": staging_pointdir_name(i),
                     "accepted": True,
                     "reasons": [],
                     "atom_count": 1,

@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import os
 import copy
-import json
+from ..strict_json import strict_json as json
 import signal
 import socket
 import sys
@@ -66,6 +66,7 @@ from .state import (
     read_state,
     write_state,
 )
+from .filesystem import operational_data_dir
 from . import submission_intent as _submission_intent
 
 
@@ -292,7 +293,7 @@ class Daemon:
     # --- path helpers ---------------------------------------------------
 
     def data_dir(self) -> Path:
-        return self.campaign_dir / DEFAULT_DATA_SUBDIR
+        return operational_data_dir(self.campaign_dir)
 
     def state_path(self) -> Path:
         return self.data_dir() / DEFAULT_STATE_FILENAME

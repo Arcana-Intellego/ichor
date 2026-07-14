@@ -1,14 +1,14 @@
 """Immutable daemon submission-attempt script and log bundles."""
 from __future__ import annotations
 
-import json
-import os
+from ..strict_json import strict_json as json
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Sequence, Union
 
 from .state import atomic_write_json, atomic_write_text
+from .filesystem import campaign_owned_path
 
 
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -28,49 +28,6 @@ def safe_component(value: Any, label: str) -> str:
     if not _SAFE_COMPONENT.fullmatch(text):
         raise ValueError(label + " is not a safe path component: " + repr(text))
     return text
-
-
-def campaign_owned_path(
-    campaign_dir: Union[str, Path],
-    path: Union[str, Path],
-) -> Path:
-    """Validate campaign containment without accepting symlinked components."""
-    campaign_path = Path(
-        os.path.abspath(os.fspath(Path(campaign_dir).expanduser()))
-    )
-    raw_candidate = Path(path).expanduser()
-    if not raw_candidate.is_absolute():
-        raw_candidate = campaign_path / raw_candidate
-    candidate_path = Path(os.path.abspath(os.fspath(raw_candidate)))
-
-    try:
-        candidate_path.relative_to(campaign_path)
-    except ValueError as exc:
-        raise ValueError("daemon-owned path escapes campaign root: " + str(path)) from exc
-
-    # Inspect the lexical path before resolve() follows anything. Checking only
-    # the resolved path would miss a symlink that points back inside the
-    # campaign, which is still unsafe for daemon-owned mutation.
-    chain = []
-    current = candidate_path
-    while True:
-        chain.append(current)
-        if current == current.parent:
-            break
-        current = current.parent
-    for component in reversed(chain):
-        if component.is_symlink():
-            raise ValueError(
-                "daemon-owned path contains a symlink: " + str(component)
-            )
-
-    campaign = campaign_path.resolve(strict=False)
-    candidate = candidate_path.resolve(strict=False)
-    try:
-        candidate.relative_to(campaign)
-    except ValueError as exc:
-        raise ValueError("daemon-owned path escapes campaign root: " + str(path)) from exc
-    return candidate
 
 
 def backend_name(phase_name: str) -> str:

@@ -5,7 +5,7 @@ import hashlib
 import importlib
 import importlib.metadata
 import importlib.util
-import json
+from .strict_json import strict_json as json
 import os
 import platform
 import shutil
@@ -18,6 +18,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Union
 from .config import CampaignConfig
 from .daemon.config_lock import config_fingerprint
 from .daemon.state import atomic_write_json
+from .daemon.filesystem import operational_path
 
 
 EXECUTION_IDENTITY_SCHEMA_VERSION = 1
@@ -31,15 +32,15 @@ class ExecutionIdentityError(ValueError):
 
 
 def execution_identity_path(campaign_dir: Union[str, Path]) -> Path:
-    return Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING" / "execution_identity.json"
+    return operational_path(campaign_dir, "execution_identity.json")
 
 
 def environment_generations_dir(campaign_dir: Union[str, Path]) -> Path:
-    return Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING" / "environment_generations"
+    return operational_path(campaign_dir, "environment_generations")
 
 
 def environment_current_path(campaign_dir: Union[str, Path]) -> Path:
-    return Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING" / "environment_current.json"
+    return operational_path(campaign_dir, "environment_current.json")
 
 
 def _canonical_digest(payload: Dict[str, Any]) -> str:

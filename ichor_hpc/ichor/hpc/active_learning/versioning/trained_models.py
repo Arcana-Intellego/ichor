@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import json
+from ..strict_json import strict_json as json
 import os
 import re
 import stat
@@ -425,14 +425,8 @@ def build_trained_model_set_payload(
 
 
 def _read_json_object(path: Path, label: str) -> Dict[str, Any]:
-    def reject_non_finite_constant(value: str) -> None:
-        raise ValueError("non-finite JSON constant: " + value)
-
     try:
-        payload = json.loads(
-            path.read_text(encoding="utf-8"),
-            parse_constant=reject_non_finite_constant,
-        )
+        payload = json.loads(path.read_text(encoding="utf-8"), source=path)
     except (OSError, ValueError) as exc:
         raise TrainedModelError(label + " is unreadable: " + str(path)) from exc
     if not isinstance(payload, dict):

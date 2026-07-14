@@ -20,7 +20,9 @@ _MEMORY_RE = re.compile(
 
 
 def usage_path(campaign_dir: Union[str, Path]) -> Path:
-    return Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING" / USAGE_FILENAME
+    from .filesystem import operational_path
+
+    return operational_path(campaign_dir, USAGE_FILENAME)
 
 
 def _memory_mib(value: Any) -> Optional[float]:
@@ -207,7 +209,7 @@ def append_usage_summary(
     *,
     history_limit: int,
 ) -> Dict[str, Any]:
-    import json
+    from ..strict_json import strict_json as json
 
     path = usage_path(campaign_dir)
     if int(history_limit) <= 0:
@@ -249,7 +251,7 @@ def collect_usage(
     if path.is_symlink():
         raise ValueError("resource usage records must not be a symlink: " + str(path))
     if path.is_file() and not path.is_symlink():
-        import json
+        from ..strict_json import strict_json as json
 
         try:
             existing = json.loads(path.read_text(encoding="utf-8"))

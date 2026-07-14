@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import json
+from .strict_json import strict_json as json
 import math
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence

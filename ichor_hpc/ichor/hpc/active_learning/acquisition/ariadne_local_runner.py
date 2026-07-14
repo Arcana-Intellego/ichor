@@ -21,7 +21,7 @@ SeedLocalAdversarialAcquisition we built earlier.
 """
 from __future__ import annotations
 
-import json
+from ..strict_json import strict_json as json
 import time
 from dataclasses import dataclass
 from pathlib import Path

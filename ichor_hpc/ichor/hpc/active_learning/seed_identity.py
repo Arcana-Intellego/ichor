@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-import json
+from .strict_json import strict_json as json
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 

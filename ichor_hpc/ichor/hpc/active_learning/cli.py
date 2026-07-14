@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import argparse
 import os
-import json
+from .strict_json import strict_json as json
 import secrets
 import subprocess
 import sys
@@ -104,6 +104,7 @@ from .daemon.state import (
     write_state,
     make_lifecycle_context,
 )
+from .daemon.filesystem import operational_data_dir, operational_path
 from .daemon.status_recommendations import (
     build_status_recommendations,
     recommendation_dicts,
@@ -267,16 +268,16 @@ RETRYABLE_CLEANED_REENTRY_PHASES = {
 
 
 def _campaign_paths(campaign_dir: Path):
-    data = campaign_dir / DEFAULT_DATA_SUBDIR
+    data = operational_data_dir(campaign_dir)
     return {
         "data": data,
-        "state": data / DEFAULT_STATE_FILENAME,
-        "lock": data / DAEMON_LOCK_FILENAME,
-        "lease": data / DAEMON_LEASE_DIRNAME,
-        "journal": data / "journal.ndjson",
-        "background_log": data / BACKGROUND_LOG_FILENAME,
-        "background_pid": data / BACKGROUND_PID_FILENAME,
-        "stop_request": data / "stop_request.json",
+        "state": operational_path(campaign_dir, DEFAULT_STATE_FILENAME),
+        "lock": operational_path(campaign_dir, DAEMON_LOCK_FILENAME),
+        "lease": operational_path(campaign_dir, DAEMON_LEASE_DIRNAME),
+        "journal": operational_path(campaign_dir, "journal.ndjson"),
+        "background_log": operational_path(campaign_dir, BACKGROUND_LOG_FILENAME),
+        "background_pid": operational_path(campaign_dir, BACKGROUND_PID_FILENAME),
+        "stop_request": operational_path(campaign_dir, "stop_request.json"),
     }
 
 
@@ -5868,12 +5869,16 @@ def _resolve_init_source(
     campaign: Path,
     raw_source: Optional[str],
 ) -> Path:
-    from .operator_paths import resolve_campaign_input_path
+    from .operator_paths import (
+        reject_operator_input_symlinks,
+        resolve_campaign_input_path,
+    )
 
     source = resolve_campaign_input_path(
         campaign,
         raw_source if raw_source else "pool.xyz",
     )
+    reject_operator_input_symlinks(source)
     if not source.exists():
         raise FileNotFoundError(
             "source trajectory does not exist: "
@@ -5889,8 +5894,9 @@ def _read_pool_candidate(source: Path) -> tuple[List[Any], str]:
     from ichor.core.files.xyz import Trajectory
     from .versioning.manifest import sha256_file
 
-    if source.is_symlink():
-        raise ValueError("pool source refuses a symlink: " + str(source))
+    from .operator_paths import reject_operator_input_symlinks
+
+    reject_operator_input_symlinks(source)
     try:
         trajectory = Trajectory(source)
         trajectory.read()
@@ -6002,61 +6008,6 @@ def _confirm_bootstrap_plan(*, assume_yes: bool) -> bool:
     return response in {"y", "yes"}
 
 
-def _copy_pool_to_campaign(
-    source: Path,
-    campaign: Path,
-    *,
-    allow_replace: bool = False,
-) -> Path:
-    destination = campaign / "pool.xyz"
-    if destination.is_symlink():
-        raise ValueError(
-            "campaign pool destination must not be a symlink: "
-            + str(destination)
-        )
-    if source.resolve() == destination.resolve(strict=False):
-        return destination
-    from .versioning.manifest import sha256_file
-
-    if destination.is_file() and sha256_file(source) == sha256_file(destination):
-        return destination
-    if destination.exists() and not destination.is_file():
-        raise ValueError("campaign pool destination is not a regular file: " + str(destination))
-    if destination.is_file():
-        state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
-        stateful = stateful_campaign_artifacts(campaign)
-        manifest = campaign / ".DATA" / "TRAJECTORY" / "pool.manifest.json"
-        if state_path.is_file() or stateful:
-            raise ValueError(
-                "refusing to replace campaign pool.xyz after stateful daemon "
-                "artefacts exist; create a new campaign directory"
-            )
-        if manifest.is_file() and not allow_replace:
-            raise ValueError(
-                "refusing to replace an imported campaign pool without --force"
-            )
-    from .daemon.state import _fsync_parent_dir
-
-    try:
-        payload = source.read_bytes()
-    except OSError as exc:
-        raise ValueError("pool source is unreadable: " + str(source)) from exc
-    temporary = destination.with_name(
-        ".pool.xyz." + str(os.getpid()) + ".tmp"
-    )
-    try:
-        with temporary.open("wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, destination)
-        _fsync_parent_dir(destination)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
-    return destination
-
-
 def _import_pool_impl(args: argparse.Namespace, campaign: Path, source: Path) -> int:
     """Pull the operator's MD trajectory into the campaign's canonical
     pool location and write a SHA-pinned manifest next to it.
@@ -6066,9 +6017,28 @@ def _import_pool_impl(args: argparse.Namespace, campaign: Path, source: Path) ->
     pinned to, so we make the operator say it out loud.
     """
     from .acquisition.trajectory_pool import TrajectoryPool
+    from .versioning.manifest import sha256_file
+
+    existing_manifest = campaign / ".DATA" / "TRAJECTORY" / "pool.manifest.json"
+    canonical_pool = campaign / "pool.xyz"
+    if (
+        existing_manifest.is_file()
+        and canonical_pool.is_file()
+        and source.is_file()
+        and sha256_file(source) != sha256_file(canonical_pool)
+        and (
+            (campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME).is_file()
+            or stateful_campaign_artifacts(campaign)
+        )
+    ):
+        print(
+            "refusing to replace campaign pool.xyz after stateful daemon "
+            "artefacts exist; create a new campaign directory",
+            file=sys.stderr,
+        )
+        return 14
 
     if bool(getattr(args, "force", False)):
-        existing_manifest = campaign / ".DATA" / "TRAJECTORY" / "pool.manifest.json"
         state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
         if existing_manifest.exists():
             blockers: List[str] = []
@@ -6382,15 +6352,6 @@ def cmd_init(args: argparse.Namespace) -> int:
             except CampaignBootstrapError as exc:
                 print("campaign bootstrap failed: " + str(exc), file=sys.stderr)
                 return 16
-        try:
-            source = _copy_pool_to_campaign(
-                source,
-                campaign,
-                allow_replace=bool(getattr(args, "force", False)),
-            )
-        except ValueError as exc:
-            print("trajectory import failed: " + str(exc), file=sys.stderr)
-            return 14
         import_rc = _import_pool_impl(args, campaign, source)
         if import_rc != 0:
             return import_rc

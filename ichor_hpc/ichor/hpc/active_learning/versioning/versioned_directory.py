@@ -183,8 +183,15 @@ class VersionedDirectory:
                 raise ValueError(
                     "commit target is not a regular directory: " + str(target)
                 )
-            if staging.is_dir():
-                shutil.rmtree(str(staging), ignore_errors=True)
+            if staging.exists() or staging.is_symlink():
+                if staging.is_symlink() or not staging.is_dir():
+                    raise ValueError(
+                        "stale staging path is not a regular directory: "
+                        + str(staging)
+                    )
+                shutil.rmtree(str(staging))
+                if staging.exists() or staging.is_symlink():
+                    raise OSError("stale staging cleanup did not complete: " + str(staging))
             return read_manifest(target)
         if not staging.is_dir():
             raise FileNotFoundError("no staging directory to commit: " + str(staging))

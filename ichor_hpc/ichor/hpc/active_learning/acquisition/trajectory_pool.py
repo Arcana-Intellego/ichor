@@ -29,18 +29,26 @@ file directly.
 """
 from __future__ import annotations
 
-import json
+from ..strict_json import strict_json as json
 import os
 import shutil
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Union
 
+import numpy as np
+
 from ichor.core.atoms import Atoms
 from ichor.core.files.xyz import Trajectory
 
-from ..daemon.state import atomic_write_json
+from ..daemon.filesystem import campaign_owned_path
+from ..daemon.state import (
+    _fsync_file_descriptor,
+    _fsync_parent_dir,
+    atomic_write_json,
+)
 from ..versioning.manifest import sha256_file
 
 
@@ -57,7 +65,135 @@ __all__ = [
 POOL_SUBDIR = Path(".DATA") / "TRAJECTORY"
 POOL_XYZ_FILENAME = "pool.xyz"
 POOL_MANIFEST_FILENAME = "pool.manifest.json"
+POOL_IMPORT_TRANSACTION_FILENAME = "pool.import.transaction.json"
 POOL_SCHEMA_VERSION = 1
+POOL_IMPORT_TRANSACTION_SCHEMA_VERSION = 1
+
+
+def _validated_frames(path: Path, *, source_label: Path) -> tuple:
+    trajectory = Trajectory(path)
+    trajectory.read()
+    frames = [atoms.copy() for atoms in trajectory]
+    if not frames:
+        raise ValueError("trajectory has zero frames: " + str(source_label))
+    head = frames[0]
+    atom_types = tuple(atom.type for atom in head)
+    masses = tuple(float(atom.mass) for atom in head)
+    for index, atoms in enumerate(frames):
+        observed = tuple(atom.type for atom in atoms)
+        if observed != atom_types:
+            raise ValueError(
+                "frame "
+                + str(index)
+                + " atom types "
+                + repr(observed)
+                + " disagree with frame 0 "
+                + repr(atom_types)
+            )
+        coordinates = np.asarray(atoms.coordinates, dtype=float)
+        if coordinates.shape != (len(head), 3):
+            raise ValueError("frame " + str(index) + " coordinate shape is invalid")
+        if not np.all(np.isfinite(coordinates)):
+            raise ValueError("frame " + str(index) + " contains non-finite coordinates")
+    return frames, atom_types, masses
+
+
+def _checked_unlink(path: Path) -> None:
+    if path.is_symlink():
+        raise ValueError("pool transaction path must not be a symlink: " + str(path))
+    if path.exists():
+        if not path.is_file():
+            raise ValueError("pool transaction path is not a regular file: " + str(path))
+        path.unlink()
+        _fsync_parent_dir(path)
+
+
+def _transaction_paths(campaign: Path, token: str) -> Dict[str, Path]:
+    if len(token) != 32 or any(ch not in "0123456789abcdef" for ch in token):
+        raise ValueError("pool import transaction identifier is invalid")
+    trajectory_dir = campaign_owned_path(campaign, POOL_SUBDIR)
+    return {
+        "canonical": campaign_owned_path(campaign, POOL_XYZ_FILENAME),
+        "manifest": campaign_owned_path(
+            campaign, POOL_SUBDIR / POOL_MANIFEST_FILENAME
+        ),
+        "transaction": campaign_owned_path(
+            campaign, POOL_SUBDIR / POOL_IMPORT_TRANSACTION_FILENAME
+        ),
+        "staged": campaign_owned_path(
+            campaign, ".pool.xyz.import-" + token + ".tmp"
+        ),
+        "pool_backup": campaign_owned_path(
+            campaign, ".pool.xyz.backup-" + token
+        ),
+        "manifest_backup": campaign_owned_path(
+            campaign,
+            trajectory_dir / (".pool.manifest.backup-" + token + ".json"),
+        ),
+    }
+
+
+def _recover_import_transaction(campaign: Path) -> None:
+    transaction = campaign_owned_path(
+        campaign, POOL_SUBDIR / POOL_IMPORT_TRANSACTION_FILENAME
+    )
+    if transaction.is_symlink():
+        raise ValueError("pool import transaction must not be a symlink")
+    if not transaction.exists():
+        return
+    if not transaction.is_file():
+        raise ValueError("pool import transaction is not a regular file")
+    payload = json.loads(transaction.read_text(encoding="utf-8"), source=transaction)
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise ValueError("pool import transaction has an unsupported schema")
+    paths = _transaction_paths(campaign, str(payload.get("transaction_id") or ""))
+    canonical = paths["canonical"]
+    manifest = paths["manifest"]
+    new_sha = str(payload.get("new_pool_sha256") or "")
+
+    committed = False
+    if canonical.is_file() and not canonical.is_symlink() and manifest.is_file() and not manifest.is_symlink():
+        try:
+            manifest_payload = json.loads(
+                manifest.read_text(encoding="utf-8"), source=manifest
+            )
+            committed = (
+                isinstance(manifest_payload, dict)
+                and str(manifest_payload.get("sha256") or "") == new_sha
+                and sha256_file(canonical) == new_sha
+            )
+        except (OSError, ValueError):
+            committed = False
+
+    if not committed:
+        old_pool_exists = payload.get("old_pool_exists") is True
+        old_manifest_exists = payload.get("old_manifest_exists") is True
+        old_pool_sha = payload.get("old_pool_sha256")
+        old_manifest_sha = payload.get("old_manifest_sha256")
+
+        if paths["pool_backup"].is_file() and not paths["pool_backup"].is_symlink():
+            _checked_unlink(canonical)
+            os.replace(paths["pool_backup"], canonical)
+            _fsync_parent_dir(canonical)
+        elif old_pool_exists:
+            if not canonical.is_file() or sha256_file(canonical) != old_pool_sha:
+                raise RuntimeError("interrupted pool import cannot restore prior pool bytes")
+        else:
+            _checked_unlink(canonical)
+
+        if paths["manifest_backup"].is_file() and not paths["manifest_backup"].is_symlink():
+            _checked_unlink(manifest)
+            os.replace(paths["manifest_backup"], manifest)
+            _fsync_parent_dir(manifest)
+        elif old_manifest_exists:
+            if not manifest.is_file() or sha256_file(manifest) != old_manifest_sha:
+                raise RuntimeError("interrupted pool import cannot restore prior manifest")
+        else:
+            _checked_unlink(manifest)
+
+    for key in ("staged", "pool_backup", "manifest_backup"):
+        _checked_unlink(paths[key])
+    _checked_unlink(transaction)
 
 
 @dataclass(frozen=True)
@@ -163,18 +299,18 @@ class TrajectoryPool:
         return self.n_frames()
 
     def frame(self, frame_id: int) -> Atoms:
-        """Return the Atoms object at the given stable frame_id."""
+        """Return a detached copy of the frame at the stable frame ID."""
         if not 0 <= int(frame_id) < self.n_frames():
             raise IndexError("frame_id " + str(frame_id) + " out of range [0, " + str(self.n_frames()) + ")")
-        return self._atoms[int(frame_id)]
+        return self._atoms[int(frame_id)].copy()
 
     def frame_ids(self) -> range:
         """Return the inclusive range of all stable frame IDs."""
         return range(self.n_frames())
 
     def to_atoms_list(self) -> List[Atoms]:
-        """Return a *new* list of Atoms (callers may mutate without affecting the pool)."""
-        return list(self._atoms)
+        """Return detached frame copies that cannot mutate the pool."""
+        return [atoms.copy() for atoms in self._atoms]
 
     # --- import + load -----------------------------------------------
 
@@ -194,70 +330,99 @@ class TrajectoryPool:
         the campaign pool and downstream selection/safety gates decide which
         frames are useful.
         """
-        source = Path(source)
-        if source.is_symlink():
-            raise ValueError("trajectory source must not be a symlink: " + str(source))
+        from ..operator_paths import reject_operator_input_symlinks
+
+        source = reject_operator_input_symlinks(Path(source))
         if not source.is_file():
             raise FileNotFoundError("trajectory source does not exist: " + str(source))
         campaign_dir = Path(campaign_dir)
-        target_dir = campaign_dir / POOL_SUBDIR
-        manifest_path = target_dir / POOL_MANIFEST_FILENAME
-        canonical_path = campaign_dir / POOL_XYZ_FILENAME
-        if manifest_path.is_symlink():
-            raise ValueError("pool manifest must not be a symlink: " + str(manifest_path))
-        if canonical_path.is_symlink():
-            raise ValueError("campaign pool must not be a symlink: " + str(canonical_path))
+        target_dir = campaign_owned_path(campaign_dir, POOL_SUBDIR)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        _recover_import_transaction(campaign_dir)
+        manifest_path = campaign_owned_path(
+            campaign_dir, POOL_SUBDIR / POOL_MANIFEST_FILENAME
+        )
+        canonical_path = campaign_owned_path(campaign_dir, POOL_XYZ_FILENAME)
+        if manifest_path.exists() and not manifest_path.is_file():
+            raise ValueError("pool manifest path is not a regular file")
+        if canonical_path.exists() and not canonical_path.is_file():
+            raise ValueError("campaign pool path is not a regular file")
         if manifest_path.exists() and not overwrite:
             raise FileExistsError(
                 "pool manifest already exists at " + str(manifest_path)
                 + " -- refusing to overwrite. Start a new campaign or pass overwrite=True."
             )
-        target_dir.mkdir(parents=True, exist_ok=True)
         source_is_canonical = source.resolve() == canonical_path.resolve(strict=False)
-        if not source_is_canonical:
-            if canonical_path.exists() and not overwrite:
-                raise FileExistsError(
-                    "campaign pool already exists at "
-                    + str(canonical_path)
-                    + " -- refusing to overwrite"
-                )
-            # Write to a temporary path and atomically rename, so a crash
-            # cannot leave the manifest pinning a half-written pool.xyz.
-            tmp_canonical = canonical_path.with_name(canonical_path.name + ".tmp")
-            try:
-                shutil.copyfile(source, tmp_canonical)
-                os.replace(str(tmp_canonical), str(canonical_path))
-            finally:
-                if tmp_canonical.exists():
-                    tmp_canonical.unlink()
-        sha = sha256_file(canonical_path)
-        traj = Trajectory(canonical_path)
-        traj.read()
-        atoms_list: List[Atoms] = [atoms.copy() for atoms in traj]
-        if not atoms_list:
-            raise ValueError("trajectory has zero frames: " + str(source))
-        head = atoms_list[0]
-        atom_types = tuple(a.type for a in head)
-        masses = tuple(float(a.mass) for a in head)
-        #sanity-check that every frame has the same atom layout.
-        for i, atoms in enumerate(atoms_list[1:], start=1):
-            this_types = tuple(a.type for a in atoms)
-            if this_types != atom_types:
-                raise ValueError(
-                    "frame " + str(i) + " atom types " + repr(this_types)
-                    + " disagree with frame 0 " + repr(atom_types)
-                )
-        manifest = TrajectoryPoolManifest(
-            source_path=str(source.resolve()),
-            canonical_path=str(canonical_path.resolve()),
-            sha256=sha,
-            n_frames=len(atoms_list),
-            natoms=len(head),
-            atom_types=atom_types,
-            masses=masses,
-            imported_iso=datetime.now(timezone.utc).isoformat(),
-        )
-        atomic_write_json(manifest_path, manifest.to_dict())
+        if canonical_path.exists() and not overwrite and not source_is_canonical:
+            raise FileExistsError(
+                "campaign pool already exists at "
+                + str(canonical_path)
+                + " -- refusing to overwrite"
+            )
+
+        token = uuid.uuid4().hex
+        paths = _transaction_paths(campaign_dir, token)
+        staged = paths["staged"]
+        transaction_written = False
+        try:
+            with source.open("rb") as input_handle, staged.open("xb") as output_handle:
+                shutil.copyfileobj(input_handle, output_handle)
+                output_handle.flush()
+                _fsync_file_descriptor(output_handle.fileno())
+            atoms_list, atom_types, masses = _validated_frames(
+                staged, source_label=source
+            )
+            sha = sha256_file(staged)
+            manifest = TrajectoryPoolManifest(
+                source_path=str(source.resolve()),
+                canonical_path=str(canonical_path.resolve(strict=False)),
+                sha256=sha,
+                n_frames=len(atoms_list),
+                natoms=len(atoms_list[0]),
+                atom_types=atom_types,
+                masses=masses,
+                imported_iso=datetime.now(timezone.utc).isoformat(),
+            )
+            atomic_write_json(
+                paths["transaction"],
+                {
+                    "schema_version": POOL_IMPORT_TRANSACTION_SCHEMA_VERSION,
+                    "transaction_id": token,
+                    "new_pool_sha256": sha,
+                    "old_pool_exists": canonical_path.is_file(),
+                    "old_pool_sha256": (
+                        sha256_file(canonical_path) if canonical_path.is_file() else None
+                    ),
+                    "old_manifest_exists": manifest_path.is_file(),
+                    "old_manifest_sha256": (
+                        sha256_file(manifest_path) if manifest_path.is_file() else None
+                    ),
+                },
+            )
+            transaction_written = True
+            if canonical_path.is_file():
+                os.replace(canonical_path, paths["pool_backup"])
+                _fsync_parent_dir(canonical_path)
+            if manifest_path.is_file():
+                os.replace(manifest_path, paths["manifest_backup"])
+                _fsync_parent_dir(manifest_path)
+            os.replace(staged, canonical_path)
+            _fsync_parent_dir(canonical_path)
+            atomic_write_json(manifest_path, manifest.to_dict())
+            if sha256_file(canonical_path) != sha:
+                raise RuntimeError("published campaign pool failed SHA verification")
+            _recover_import_transaction(campaign_dir)
+        except BaseException:
+            if transaction_written:
+                try:
+                    _recover_import_transaction(campaign_dir)
+                except Exception as recovery_exc:
+                    raise RuntimeError(
+                        "pool import failed and rollback could not be completed"
+                    ) from recovery_exc
+            else:
+                _checked_unlink(staged)
+            raise
         return cls(manifest, atoms_list)
 
     @classmethod
@@ -267,8 +432,11 @@ class TrajectoryPool:
         Re-verifies the SHA-256 of the canonical pool against the manifest and raises
         if drift is detected (someone touched the file under us)."""
         campaign_dir = Path(campaign_dir)
-        manifest_path = campaign_dir / POOL_SUBDIR / POOL_MANIFEST_FILENAME
-        canonical_path = campaign_dir / POOL_XYZ_FILENAME
+        _recover_import_transaction(campaign_dir)
+        manifest_path = campaign_owned_path(
+            campaign_dir, POOL_SUBDIR / POOL_MANIFEST_FILENAME
+        )
+        canonical_path = campaign_owned_path(campaign_dir, POOL_XYZ_FILENAME)
         if manifest_path.is_symlink():
             raise RuntimeError("pool manifest must not be a symlink: " + str(manifest_path))
         if canonical_path.is_symlink():
@@ -292,7 +460,14 @@ class TrajectoryPool:
                 + on_disk_sha + " != manifest " + manifest.sha256
                 + " -- the trajectory was modified out-of-band. Refusing to load."
             )
-        traj = Trajectory(canonical_path)
-        traj.read()
-        atoms_list = [atoms.copy() for atoms in traj]
+        atoms_list, atom_types, masses = _validated_frames(
+            canonical_path, source_label=canonical_path
+        )
+        if (
+            len(atoms_list) != manifest.n_frames
+            or len(atoms_list[0]) != manifest.natoms
+            or atom_types != manifest.atom_types
+            or masses != manifest.masses
+        ):
+            raise RuntimeError("pool manifest metadata does not match canonical pool.xyz")
         return cls(manifest, atoms_list)

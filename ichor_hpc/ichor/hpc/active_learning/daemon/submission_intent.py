@@ -7,7 +7,7 @@ attempt was in progress and must run the adoption check before resubmitting.
 """
 from __future__ import annotations
 
-import json
+from ..strict_json import strict_json as json
 import math
 import uuid
 from datetime import datetime, timezone
@@ -16,6 +16,7 @@ from typing import Any, Dict, Optional, Union
 
 from .job_names import live_job_name
 from .state import atomic_write_json
+from .filesystem import operational_path
 
 
 INTENT_SCHEMA_VERSION = 1
@@ -63,7 +64,7 @@ def _validated_decision_contract(value: Any) -> Dict[str, Any]:
 
 
 def intent_dir(campaign_dir: Union[str, Path]) -> Path:
-    return Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING" / INTENT_DIR_NAME
+    return operational_path(campaign_dir, INTENT_DIR_NAME)
 
 
 def intent_path(campaign_dir: Union[str, Path], phase_name: str, iteration: int) -> Path:
@@ -352,7 +353,9 @@ def update_intent_status(
         "created_iso": _now_iso(),
     }
     if not str(data.get("campaign_uid") or ""):
-        state_path = Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING" / "state.json"
+        from .filesystem import operational_path
+
+        state_path = operational_path(campaign_dir, "state.json")
         if state_path.is_file() and not state_path.is_symlink():
             try:
                 state_payload = json.loads(state_path.read_text(encoding="utf-8"))

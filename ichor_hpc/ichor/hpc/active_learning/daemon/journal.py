@@ -19,7 +19,7 @@ introspection / CLI / tests.
 """
 from __future__ import annotations
 
-import json
+from ..strict_json import strict_json as json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -236,10 +236,9 @@ def append_event(
     try:
         os.write(fd, encoded)
         if fsync:
-            try:
-                os.fsync(fd)
-            except (OSError, NotImplementedError):
-                pass
+            from .state import _fsync_file_descriptor
+
+            _fsync_file_descriptor(fd)
     finally:
         os.close(fd)
     return json.loads(encoded.decode("utf-8"))["ts"]

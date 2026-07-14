@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
-import json
+from .strict_json import strict_json as json
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path

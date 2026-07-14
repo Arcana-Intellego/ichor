@@ -1,7 +1,7 @@
 """Persistent exact pointdir-level FEREBUS split assignments."""
 from __future__ import annotations
 
-import json
+from ..strict_json import strict_json as json
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence
@@ -19,8 +19,9 @@ _SPLITS = ("train", "int_val", "ext_val")
 @contextmanager
 def _ledger_lock(campaign_dir: Path):
     import portalocker
+    from .filesystem import operational_data_dir
 
-    data = Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING"
+    data = operational_data_dir(campaign_dir)
     data.mkdir(parents=True, exist_ok=True)
     with portalocker.Lock(
         str(data / _LOCK_FILENAME),
@@ -32,16 +33,15 @@ def _ledger_lock(campaign_dir: Path):
 
 
 def ledger_path(campaign_dir: Path) -> Path:
-    return Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING" / FEREBUS_SPLIT_LEDGER_FILENAME
+    from .filesystem import operational_path
+
+    return operational_path(campaign_dir, FEREBUS_SPLIT_LEDGER_FILENAME)
 
 
 def bootstrap_external_validation_path(campaign_dir: Path) -> Path:
-    return (
-        Path(campaign_dir)
-        / ".DATA"
-        / "ACTIVE_LEARNING"
-        / BOOTSTRAP_EXTERNAL_VALIDATION_FILENAME
-    )
+    from .filesystem import operational_path
+
+    return operational_path(campaign_dir, BOOTSTRAP_EXTERNAL_VALIDATION_FILENAME)
 
 
 def _empty_payload() -> Dict[str, Any]:

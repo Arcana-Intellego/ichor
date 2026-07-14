@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
-import json
+from ..strict_json import strict_json as json
 from pathlib import Path
 import shutil
 from typing import Any, Dict, List, Optional, Union
@@ -576,7 +576,7 @@ def _read_bootstrap_handoff_at(
         quantum_acceptance_manifest_path,
         read_quantum_acceptance_manifest,
     )
-    import json as _json
+    from ..strict_json import strict_json as _json
 
     initial = Path(initial_dir)
     manifest_path = quantum_acceptance_manifest_path(initial)
@@ -809,7 +809,7 @@ def _trusted_campaign_uid_sources(
     if intent_root.is_dir():
         for path in sorted(intent_root.glob("*.json")):
             try:
-                import json as _json
+                from ..strict_json import strict_json as _json
 
                 raw = _json.loads(path.read_text(encoding="utf-8"))
                 intent = _submission_intent.load_intent(
@@ -937,7 +937,7 @@ def propose_recovery(
             # campaign identity from the raw json so recovery does not silently
             # mint a brand-new campaign_uid and bin the provenance.
             try:
-                import json as _json
+                from ..strict_json import strict_json as _json
                 raw = _json.loads(state_path.read_text(encoding="utf-8"))
                 salvaged_uid = raw.get("campaign_uid")
                 salvaged_started = raw.get("campaign_started_iso")
@@ -1074,7 +1074,7 @@ def propose_recovery(
     if intent_root.is_dir():
         for p in sorted(intent_root.glob("*.json")):
             try:
-                import json as _json
+                from ..strict_json import strict_json as _json
                 payload = _json.loads(p.read_text(encoding="utf-8"))
             except Exception:
                 unsafe_reasons.append("unreadable submission intent: " + str(p))

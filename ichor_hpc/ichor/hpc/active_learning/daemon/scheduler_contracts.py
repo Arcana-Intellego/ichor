@@ -1,7 +1,7 @@
 """Shared scheduler task-count contracts for daemon and reconcile."""
 from __future__ import annotations
 
-import json
+from ..strict_json import strict_json as json
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 

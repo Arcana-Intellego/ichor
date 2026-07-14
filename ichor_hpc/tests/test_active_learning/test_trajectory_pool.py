@@ -145,6 +145,61 @@ def test_to_atoms_list_returns_fresh_list(tmp_path):
     assert len(a) == pool.n_frames()
 
 
+def test_public_frame_accessors_cannot_mutate_content_addressed_pool(tmp_path):
+    pool = TrajectoryPool.import_from(FIXTURE, tmp_path)
+    original = float(pool.frame(0)[0].x)
+    detached_frame = pool.frame(0)
+    detached_list = pool.to_atoms_list()
+    detached_frame[0].coordinates[0] = original + 10.0
+    detached_list[0][0].coordinates[0] = original + 20.0
+
+    assert pool.frame(0)[0].x == pytest.approx(original)
+    assert TrajectoryPool.load(tmp_path).frame(0)[0].x == pytest.approx(original)
+
+
+def test_malformed_overwrite_preserves_existing_pool_and_manifest(tmp_path):
+    imported = TrajectoryPool.import_from(FIXTURE, tmp_path)
+    manifest_path = tmp_path / POOL_SUBDIR / POOL_MANIFEST_FILENAME
+    old_pool = imported.canonical_path.read_bytes()
+    old_manifest = manifest_path.read_bytes()
+    malformed = tmp_path / "malformed.xyz"
+    malformed.write_text("3\ntruncated\nO 0 0 0\n", encoding="utf-8")
+
+    with pytest.raises(Exception):
+        TrajectoryPool.import_from(malformed, tmp_path, overwrite=True)
+
+    assert imported.canonical_path.read_bytes() == old_pool
+    assert manifest_path.read_bytes() == old_manifest
+    assert TrajectoryPool.load(tmp_path).sha256 == imported.sha256
+
+
+def test_manifest_publication_failure_rolls_back_previous_pair(
+    monkeypatch, tmp_path,
+):
+    import ichor.hpc.active_learning.acquisition.trajectory_pool as module
+
+    imported = TrajectoryPool.import_from(FIXTURE, tmp_path)
+    manifest_path = tmp_path / POOL_SUBDIR / POOL_MANIFEST_FILENAME
+    old_pool = imported.canonical_path.read_bytes()
+    old_manifest = manifest_path.read_bytes()
+    real_write = module.atomic_write_json
+    calls = {"count": 0}
+
+    def fail_second_write(path, payload):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise OSError("injected manifest publication failure")
+        return real_write(path, payload)
+
+    monkeypatch.setattr(module, "atomic_write_json", fail_second_write)
+    with pytest.raises(OSError, match="injected"):
+        TrajectoryPool.import_from(FIXTURE, tmp_path, overwrite=True)
+
+    assert imported.canonical_path.read_bytes() == old_pool
+    assert manifest_path.read_bytes() == old_manifest
+    assert not (tmp_path / POOL_SUBDIR / "pool.import.transaction.json").exists()
+
+
 def test_select_local_neighbours_with_pool_returns_stable_frame_ids(tmp_path):
     """The pool path of select_local_neighbours must populate Neighbour.index
     with the stable frame_id (NOT enumeration position) -- M9.2 contract."""

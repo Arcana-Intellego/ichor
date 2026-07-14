@@ -487,7 +487,7 @@ def validate_ferebus_model_contract(
 
     model_bootstrap = manifest.get("model_bootstrap")
     if isinstance(model_bootstrap, Mapping):
-        import json
+        from ..strict_json import strict_json as json
 
         from ..versioning.manifest import sha256_file
 

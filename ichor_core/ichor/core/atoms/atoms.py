@@ -317,12 +317,27 @@ class Atoms(list):
                     return atom
             raise KeyError(f"Atom '{item}' does not exist")
         elif isinstance(item, (list, np.ndarray, tuple)):
-            if len(item) <= 0:
+            values = list(item)
+            if not values:
                 return Atoms()
-            if isinstance(item[0], (int, np.int, str)):
-                return Atoms([self[i] for i in item])
-            elif isinstance(item[0], bool):
-                return Atoms(list(compress(self, item)))
+            if all(isinstance(value, (bool, np.bool_)) for value in values):
+                if len(values) != len(self):
+                    raise IndexError(
+                        "Boolean atom mask length "
+                        + str(len(values))
+                        + " does not match atom count "
+                        + str(len(self))
+                    )
+                return Atoms([Atom.from_atom(atom) for atom in compress(self, values)])
+            if all(
+                not isinstance(value, (bool, np.bool_))
+                and isinstance(value, (int, np.integer))
+                for value in values
+            ) or all(isinstance(value, str) for value in values):
+                return Atoms([Atom.from_atom(self[value]) for value in values])
+            raise TypeError(
+                "Atom subset indices must be all integers, all names, or a Boolean mask"
+            )
         return super().__getitem__(item)
 
     def __delitem__(self, i: Union[int, str]):

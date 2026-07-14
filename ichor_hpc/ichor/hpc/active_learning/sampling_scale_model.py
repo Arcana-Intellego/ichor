@@ -8,7 +8,7 @@ per-seed result JSON files.
 """
 from __future__ import annotations
 
-import json
+from .strict_json import strict_json as json
 import math
 from datetime import datetime, timezone
 from pathlib import Path

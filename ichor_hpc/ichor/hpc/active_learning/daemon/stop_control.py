@@ -8,7 +8,7 @@ daemon remains the sole writer of campaign state.
 from __future__ import annotations
 
 import copy
-import json
+from ..strict_json import strict_json as json
 import os
 import socket
 import uuid
@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterator, Mapping, Optional, Tuple, Union
 import portalocker
 
 from .state import CampaignPhase, CampaignState, atomic_write_json
+from .filesystem import operational_data_dir
 
 
 STOP_REQUEST_SCHEMA_VERSION = 1
@@ -39,7 +40,7 @@ def _now_iso() -> str:
 
 
 def _data_dir(campaign_dir: Union[str, Path]) -> Path:
-    return Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING"
+    return operational_data_dir(campaign_dir)
 
 
 def stop_request_path(campaign_dir: Union[str, Path]) -> Path:

@@ -8,7 +8,7 @@ lets Phase B express its threshold as a dimensionless multiple of that scale.
 from __future__ import annotations
 
 import hashlib
-import json
+from .strict_json import strict_json as json
 import math
 from dataclasses import replace
 from datetime import datetime, timezone

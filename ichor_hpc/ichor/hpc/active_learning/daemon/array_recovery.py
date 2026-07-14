@@ -8,7 +8,7 @@ daemon-owned ledger, and emits dense retry task maps for Slurm.
 from __future__ import annotations
 
 import hashlib
-import json
+from ..strict_json import strict_json as json
 import shutil
 import uuid
 from datetime import datetime, timezone
@@ -47,7 +47,9 @@ def supports_partial_array_recovery(phase_name: Any) -> bool:
 
 
 def array_recovery_dir(campaign_dir: Union[str, Path]) -> Path:
-    return Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING" / ARRAY_RECOVERY_DIR_NAME
+    from .filesystem import operational_path
+
+    return operational_path(campaign_dir, ARRAY_RECOVERY_DIR_NAME)
 
 
 def array_ledger_path(

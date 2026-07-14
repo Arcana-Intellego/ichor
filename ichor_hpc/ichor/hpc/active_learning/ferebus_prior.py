@@ -9,7 +9,7 @@ trained models before they become campaign state.
 from __future__ import annotations
 
 import hashlib
-import json
+from .strict_json import strict_json as json
 import math
 import re
 from dataclasses import dataclass

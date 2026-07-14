@@ -16,7 +16,14 @@ def resolve_campaign_input_path(
     path = Path(text).expanduser()
     if not path.is_absolute():
         path = Path(campaign_dir) / path
-    return path.resolve(strict=False)
+    return Path(os.path.abspath(os.fspath(path)))
 
 
-__all__ = ["resolve_campaign_input_path"]
+def reject_operator_input_symlinks(path: Union[str, Path]) -> Path:
+    """Reject a source file or parent directory supplied through a symlink."""
+    from .daemon.filesystem import reject_symlink_components
+
+    return reject_symlink_components(path)
+
+
+__all__ = ["reject_operator_input_symlinks", "resolve_campaign_input_path"]

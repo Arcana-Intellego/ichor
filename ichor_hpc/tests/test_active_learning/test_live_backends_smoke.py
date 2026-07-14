@@ -737,7 +737,6 @@ def test_ariadne_seed_provenance_is_created_with_canonical_identity(tmp_path):
     ex = LiveBackendsPhaseExecutor.__new__(LiveBackendsPhaseExecutor)
     ex.campaign_dir = campaign
     ex.config = CampaignConfig()
-    ex.al_dir_name = "ACTIVE_LEARNING"
     ex.artefact_log = []
     state = SimpleNamespace(iteration=1, campaign_uid="test-campaign")
     seed_record = {
@@ -782,7 +781,6 @@ def test_ariadne_seed_provenance_identity_mismatch_still_fails(tmp_path):
     ex = LiveBackendsPhaseExecutor.__new__(LiveBackendsPhaseExecutor)
     ex.campaign_dir = campaign
     ex.config = CampaignConfig()
-    ex.al_dir_name = "ACTIVE_LEARNING"
     ex.artefact_log = []
     state = SimpleNamespace(iteration=1, campaign_uid="test-campaign")
     seed_record = {

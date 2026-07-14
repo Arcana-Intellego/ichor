@@ -47,6 +47,32 @@ def atoms_to_coordinates(atoms: Atoms) -> np.ndarray:
     return np.asarray(atoms.coordinates, dtype=float)
 
 
+def _ordered_atom_identity(atoms: Atoms) -> Tuple[Tuple[str, int, object], ...]:
+    return tuple((str(atom.type), int(atom.index), atom.units) for atom in atoms)
+
+
+def _validate_compatible_geometries(reference: Atoms, mobile: Atoms) -> None:
+    if not reference or not mobile:
+        raise ValueError("aligned geometry comparison requires non-empty molecules")
+    if len(reference) != len(mobile):
+        raise ValueError(
+            "aligned geometry atom-count mismatch: "
+            + str(len(reference))
+            + " != "
+            + str(len(mobile))
+        )
+    if _ordered_atom_identity(reference) != _ordered_atom_identity(mobile):
+        raise ValueError(
+            "aligned geometries must have identical ordered atom identities and units"
+        )
+    ref = atoms_to_coordinates(reference)
+    mob = atoms_to_coordinates(mobile)
+    if ref.shape != (len(reference), 3) or mob.shape != (len(mobile), 3):
+        raise ValueError("aligned geometry coordinates must be shaped (n_atoms, 3)")
+    if not np.all(np.isfinite(ref)) or not np.all(np.isfinite(mob)):
+        raise ValueError("aligned geometry coordinates must be finite")
+
+
 
 def coordinates_to_atoms(template: Atoms, coordinates: np.ndarray) -> Atoms:
     """Build a new Atoms with same atom identities as 'template' but new
@@ -56,8 +82,20 @@ def coordinates_to_atoms(template: Atoms, coordinates: np.ndarray) -> Atoms:
     feeds back into an ALF / index-aware downstream (the per-mode FD stencils
     in acquisition.py do exactly this on every call).
     """
-    new_atoms = Atoms()
     coordinates = np.asarray(coordinates, dtype=float)
+    expected_shape = (len(template), 3)
+    if not template:
+        raise ValueError("coordinate reconstruction requires a non-empty template")
+    if coordinates.shape != expected_shape:
+        raise ValueError(
+            "coordinates must have exact shape "
+            + repr(expected_shape)
+            + ", got "
+            + repr(coordinates.shape)
+        )
+    if not np.all(np.isfinite(coordinates)):
+        raise ValueError("coordinates must be finite")
+    new_atoms = Atoms()
     for atom, coord in zip(template, coordinates):
         new_atom = Atom.from_atom(atom)
         # x/y/z are read-only properties; mutate the backing ndarray.
@@ -70,7 +108,21 @@ def coordinates_to_atoms(template: Atoms, coordinates: np.ndarray) -> Atoms:
 
 
 def copy_atoms_with_flat_displacement(template: Atoms, displacement_flat: np.ndarray) -> Atoms:
-    coords = atoms_to_coordinates(template).reshape(-1) + np.asarray(displacement_flat, dtype=float)
+    displacement = np.asarray(displacement_flat, dtype=float)
+    expected_shape = (3 * len(template),)
+    if displacement.shape != expected_shape:
+        raise ValueError(
+            "flat displacement must have exact shape "
+            + repr(expected_shape)
+            + ", got "
+            + repr(displacement.shape)
+        )
+    if not np.all(np.isfinite(displacement)):
+        raise ValueError("flat displacement must be finite")
+    base = atoms_to_coordinates(template).reshape(-1)
+    if base.shape != expected_shape or not np.all(np.isfinite(base)):
+        raise ValueError("template coordinates must be finite and shaped (n_atoms, 3)")
+    coords = base + displacement
     return coordinates_to_atoms(template, coords.reshape((-1, 3)))
 
 
@@ -95,6 +147,19 @@ def kabsch_align(reference: np.ndarray, mobile: np.ndarray, weights: np.ndarray 
     mob = np.asarray(mobile, dtype=float)
     if ref.shape != mob.shape or ref.ndim != 2 or ref.shape[1] != 3:
         raise ValueError("reference and mobile must both be shaped (n_atoms, 3)")
+    if ref.shape[0] == 0:
+        raise ValueError("reference and mobile must contain at least one atom")
+    if not np.all(np.isfinite(ref)) or not np.all(np.isfinite(mob)):
+        raise ValueError("reference and mobile coordinates must be finite")
+    if weights is not None:
+        checked_weights = np.asarray(weights, dtype=float)
+        if checked_weights.shape != (ref.shape[0],):
+            raise ValueError("Kabsch weights must be shaped (n_atoms,)")
+        if (
+            not np.all(np.isfinite(checked_weights))
+            or np.any(checked_weights <= 0.0)
+        ):
+            raise ValueError("Kabsch weights must be finite and positive")
 
     ref_centroid = _weighted_centroid(ref, weights)
     mob_centroid = _weighted_centroid(mob, weights)
@@ -118,6 +183,7 @@ def kabsch_align(reference: np.ndarray, mobile: np.ndarray, weights: np.ndarray 
 
 
 def aligned_mass_weighted_distance(reference: Atoms, mobile: Atoms) -> float:
+    _validate_compatible_geometries(reference, mobile)
     ref = atoms_to_coordinates(reference)
     mob = atoms_to_coordinates(mobile)
     masses = np.asarray(reference.masses, dtype=float)
@@ -134,6 +200,7 @@ def aligned_mass_weighted_rmsd(reference: Atoms, mobile: Atoms) -> float:
     displacement is mass weighted, then normalised by the total molecular mass instead of growing
     with molecule size.
     """
+    _validate_compatible_geometries(reference, mobile)
     ref = atoms_to_coordinates(reference)
     mob = atoms_to_coordinates(mobile)
     masses = np.asarray(reference.masses, dtype=float)
@@ -150,6 +217,7 @@ def aligned_mass_weighted_rmsd(reference: Atoms, mobile: Atoms) -> float:
 
 
 def aligned_mass_weighted_displacement(reference: Atoms, mobile: Atoms) -> np.ndarray:
+    _validate_compatible_geometries(reference, mobile)
     ref = atoms_to_coordinates(reference)
     mob = atoms_to_coordinates(mobile)
     masses = np.asarray(reference.masses, dtype=float)

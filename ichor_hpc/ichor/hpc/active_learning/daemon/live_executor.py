@@ -438,7 +438,7 @@ def _campaign_manifest_path(
 
 
 def _read_json_object(path: Path, label: str) -> Dict[str, Any]:
-    import json
+    from ..strict_json import strict_json as json
 
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -3220,7 +3220,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
     def _parse_ariadne_array_postprocess(self, state, phase, observations):
         """Validate per-seed ARIADNE results and publish ariadne/RESULTS.json."""
         from pathlib import Path as _Path
-        import json as _json
+        from ..strict_json import strict_json as _json
         from ..handoff_manifests import (
             ARIADNE_RESULTS_SCHEMA_VERSION,
             acquisition_maturity_audit_payload,
@@ -4403,7 +4403,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         return frames
 
     def _phase_b_sample_coordinate_mismatch(self, sample_path, final_records):
-        import json as _json
+        from ..strict_json import strict_json as _json
         import math as _math
 
         try:
@@ -5070,7 +5070,8 @@ def _array_task_mapping_lines(array_task_map: Optional[Path]) -> List[str]:
         + python
         + " -c "
         + _shell_quote(
-            "import json,sys; data=json.load(open(sys.argv[1], encoding='utf-8')); "
+            "import sys; from ichor.hpc.active_learning.strict_json import load_path; "
+            "data=load_path(sys.argv[1]); "
             "print(int(data['dense_to_logical'][int(sys.argv[2])]))"
         )
         + " "
@@ -5247,8 +5248,9 @@ def _aimall_invocation_block(
         python
         + " -c "
         + _shell_quote(
-            "import hashlib,json,pathlib,sys; "
-            "m=json.load(open('AIMALL_TASK.json',encoding='utf-8')); "
+            "import hashlib,pathlib,sys; "
+            "from ichor.hpc.active_learning.strict_json import load_path; "
+            "m=load_path('AIMALL_TASK.json'); "
             "w=pathlib.Path('input.wfn'); "
             "r=pathlib.Path(m['wfn_method_receipt']['path']); "
             "sha=lambda p: hashlib.sha256(p.read_bytes()).hexdigest(); "
@@ -5260,7 +5262,8 @@ def _aimall_invocation_block(
         + python
         + " -c "
         + _shell_quote(
-            "import json; print(int(json.load(open('AIMALL_TASK.json', encoding='utf-8'))['naat']))"
+            "from ichor.hpc.active_learning.strict_json import load_path; "
+            "print(int(load_path('AIMALL_TASK.json')['naat']))"
         )
         + ")",
         'if [ -z "$AIMALL_NAAT" ]; then echo "AIMALL_NAAT is empty in $POINT_DIR" >&2; exit 1; fi',

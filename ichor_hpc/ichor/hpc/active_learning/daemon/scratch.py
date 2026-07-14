@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import argparse
-import json
+from ..strict_json import strict_json as json
 import os
+import stat
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -150,10 +151,19 @@ def prepare_task_scratch(
     if leaf.is_symlink():
         raise ValueError("scratch task leaf must not be a symlink: " + str(leaf))
     leaf.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        leaf.chmod(0o700)
-    except OSError:
-        pass
+    leaf.chmod(0o700)
+    metadata = leaf.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or leaf.is_symlink():
+        raise ValueError("scratch task leaf is not a regular directory: " + str(leaf))
+    if os.name != "nt":
+        if stat.S_IMODE(metadata.st_mode) != 0o700:
+            raise PermissionError(
+                "scratch task leaf permissions are not private (0700): " + str(leaf)
+            )
+        if hasattr(os, "geteuid") and metadata.st_uid != os.geteuid():
+            raise PermissionError(
+                "scratch task leaf is not owned by the current user: " + str(leaf)
+            )
     atomic_write_json(
         leaf / "TASK.json",
         {

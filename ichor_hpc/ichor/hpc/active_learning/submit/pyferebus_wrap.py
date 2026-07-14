@@ -559,7 +559,7 @@ def _bind_generated_configs_to_task_manifest(
     records: Sequence[Mapping[str, Any]],
 ) -> None:
     """Bind generated config bytes into FEREBUS_TASKS before scheduler submission."""
-    import json
+    from ..strict_json import strict_json as json
 
     from ..daemon.state import atomic_write_json
 
