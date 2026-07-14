@@ -40,6 +40,20 @@ def _setup_daemon_with_pending_job(
     )
     state_path = cd / ".DATA" / "ACTIVE_LEARNING" / "state.json"
     write_state(state_path, state)
+    submission_intent.write_pre_submit_intent(
+        cd,
+        campaign_uid=state.campaign_uid,
+        phase_name=CampaignPhase.GAUSSIAN.value,
+        iteration=2,
+        expected_tasks=1,
+    )
+    submission_intent.mark_submitted(
+        cd,
+        CampaignPhase.GAUSSIAN.value,
+        2,
+        "99999",
+        expected_tasks=1,
+    )
     cfg = CampaignConfig()
     cfg.poll_sacct_empty_max_ticks = max_ticks
     daemon = Daemon(

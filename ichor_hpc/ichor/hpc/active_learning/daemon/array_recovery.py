@@ -15,11 +15,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-from .state import atomic_write_json
+from .state import atomic_write_json, atomic_write_text
 from ..layout import staging_phase_dir
 
 
-ARRAY_RECOVERY_SCHEMA_VERSION = 1
+ARRAY_RECOVERY_SCHEMA_VERSION = 2
 ARRAY_RECOVERY_DIR_NAME = "array_task_ledgers"
 RETRY_TASKS_FILENAME_PREFIX = "RETRY_TASKS"
 
@@ -87,11 +87,17 @@ def retry_task_file_path(
             int(iteration),
         )
         round_suffix = ".r" + str(replacement_round).zfill(4)
-    return (
-        Path(campaign_dir)
-        / ".DATA"
-        / "ACTIVE_LEARNING"
-        / (RETRY_TASKS_FILENAME_PREFIX + "." + safe_phase + "." + str(int(iteration)).zfill(6) + round_suffix + ".txt")
+    from .filesystem import operational_path
+
+    return operational_path(
+        campaign_dir,
+        RETRY_TASKS_FILENAME_PREFIX
+        + "."
+        + safe_phase
+        + "."
+        + str(int(iteration)).zfill(6)
+        + round_suffix
+        + ".txt",
     )
 
 
@@ -168,11 +174,24 @@ def _points_file(campaign_dir: Union[str, Path], phase_name: str, iteration: int
 def _read_point_paths(points_file: Path) -> List[Path]:
     if not Path(points_file).is_file():
         return []
+    bucket = Path(points_file).parent
+    if Path(points_file).is_symlink():
+        raise ValueError("POINTS.txt must not be a symlink")
     out: List[Path] = []
-    for raw in Path(points_file).read_text(encoding="utf-8").splitlines():
+    seen = set()
+    for line_number, raw in enumerate(Path(points_file).read_text(encoding="utf-8").splitlines(), start=1):
         text = raw.strip()
         if text:
-            out.append(Path(text))
+            candidate = Path(text)
+            expected = bucket / candidate.name
+            if candidate.resolve(strict=False) != expected.resolve(strict=False):
+                raise ValueError("POINTS.txt path escapes its bucket at line " + str(line_number))
+            if expected.is_symlink() or not expected.is_dir():
+                raise ValueError("POINTS.txt pointdir is missing or symlinked")
+            if expected.name in seen:
+                raise ValueError("POINTS.txt contains a duplicate pointdir")
+            seen.add(expected.name)
+            out.append(expected)
     return out
 
 
@@ -225,6 +244,15 @@ def _validate_quantum_task(
 
         validator = validate_gaussian_completed if "GAUSSIAN" in phase_name else validate_aimall_completed
         ok, reason = validator(PointDirectory(pointdir))
+        if ok:
+            from .quantum_task_receipts import read_quantum_task_receipt
+
+            read_quantum_task_receipt(
+                pointdir,
+                phase_name=phase_name,
+                iteration=int(iteration),
+                logical_task_id=int(task_id),
+            )
         return bool(ok), str(reason or ""), str(Path(pointdir).resolve(strict=False))
     except Exception as exc:
         return False, type(exc).__name__ + ": " + str(exc)[:160], str(Path(pointdir).resolve(strict=False))
@@ -361,8 +389,92 @@ def write_array_ledger(
     iteration = int(payload.get("iteration"))
     path = array_ledger_path(campaign_dir, phase, iteration)
     path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(path, payload)
+    atomic_write_json(path, _validate_array_ledger(dict(payload), path=path, phase=phase, iteration=iteration))
     return path
+
+
+def _ledger_int(value: Any, label: str, *, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(label + " must be an exact integer >= " + str(minimum))
+    return int(value)
+
+
+def _validate_array_ledger(
+    data: Any,
+    *,
+    path: Path,
+    phase: str,
+    iteration: int,
+) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        raise ValueError("array recovery ledger must be a JSON object: " + str(path))
+    if _ledger_int(data.get("schema_version"), "array ledger schema_version") != ARRAY_RECOVERY_SCHEMA_VERSION:
+        raise ValueError("unsupported array recovery ledger schema: " + str(path))
+    if data.get("phase") != str(phase) or not supports_partial_array_recovery(phase):
+        raise ValueError("array recovery ledger phase mismatch")
+    if _ledger_int(data.get("iteration"), "array ledger iteration") != int(iteration):
+        raise ValueError("array recovery ledger iteration mismatch")
+    _ledger_int(data.get("replacement_round"), "array ledger replacement_round")
+    for key in ("force_resubmit", "all_complete"):
+        if not isinstance(data.get(key), bool):
+            raise ValueError("array recovery ledger " + key + " must be a boolean")
+    logical_total = _ledger_int(data.get("logical_total"), "array ledger logical_total")
+    n_complete = _ledger_int(data.get("n_complete"), "array ledger n_complete")
+    n_reuse = _ledger_int(data.get("n_reuse"), "array ledger n_reuse")
+    n_retry = _ledger_int(data.get("n_retry"), "array ledger n_retry")
+    tasks = data.get("tasks")
+    retry_ids = data.get("retry_task_ids")
+    if not isinstance(tasks, list) or len(tasks) != logical_total:
+        raise ValueError("array recovery ledger task cardinality mismatch")
+    if not isinstance(retry_ids, list):
+        raise ValueError("array recovery retry_task_ids must be a list")
+    seen = set()
+    observed_retry = []
+    observed_complete = 0
+    for task in tasks:
+        if not isinstance(task, dict):
+            raise ValueError("array recovery task must be an object")
+        task_id = _ledger_int(task.get("task_id"), "array recovery task_id")
+        if task_id in seen:
+            raise ValueError("array recovery task IDs contain duplicates")
+        seen.add(task_id)
+        status = task.get("status")
+        if status not in {"complete", "pending"}:
+            raise ValueError("array recovery task status is invalid")
+        if task.get("complete") is not (status == "complete"):
+            raise ValueError("array recovery task status/complete mismatch")
+        if not isinstance(task.get("reason"), str) or not isinstance(
+            task.get("output_path"), str
+        ):
+            raise ValueError("array recovery task diagnostics are invalid")
+        digest = task.get("contract_hash")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError("array recovery task contract hash is invalid")
+        if status == "complete":
+            observed_complete += 1
+        else:
+            observed_retry.append(task_id)
+    if seen != set(range(logical_total)):
+        raise ValueError("array recovery logical task IDs must be contiguous from zero")
+    parsed_retry = [
+        _ledger_int(value, "array recovery retry task ID") for value in retry_ids
+    ]
+    if parsed_retry != observed_retry or len(parsed_retry) != len(set(parsed_retry)):
+        raise ValueError("array recovery retry task set mismatch")
+    if (
+        n_complete != observed_complete
+        or n_reuse != observed_complete
+        or n_retry != len(observed_retry)
+        or n_complete + n_retry != logical_total
+    ):
+        raise ValueError("array recovery ledger summary counts mismatch")
+    if data["all_complete"] is not (logical_total > 0 and n_retry == 0):
+        raise ValueError("array recovery all_complete is contradictory")
+    return data
 
 
 def read_array_ledger(
@@ -373,11 +485,15 @@ def read_array_ledger(
     path = array_ledger_path(campaign_dir, phase_name, int(iteration))
     if not path.is_file():
         return None
+    if path.is_symlink():
+        raise ValueError("array recovery ledger must not be a symlink: " + str(path))
     data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError("array recovery ledger must be a JSON object: " + str(path))
-    if int(data.get("schema_version", -1)) != ARRAY_RECOVERY_SCHEMA_VERSION:
-        raise ValueError("unsupported array recovery ledger schema: " + str(path))
+    data = _validate_array_ledger(
+        data,
+        path=path,
+        phase=str(getattr(phase_name, "value", phase_name)),
+        iteration=int(iteration),
+    )
     data["path"] = str(path)
     return data
 
@@ -409,7 +525,7 @@ def write_retry_task_file(
     path = retry_task_file_path(campaign_dir, phase_name, int(iteration))
     path.parent.mkdir(parents=True, exist_ok=True)
     body = "\n".join(str(int(task_id)) for task_id in task_ids)
-    path.write_text(body + ("\n" if body else ""), encoding="utf-8", newline="\n")
+    atomic_write_text(path, body + ("\n" if body else ""))
     return path
 
 
@@ -434,17 +550,24 @@ def _ensure_inside_campaign(campaign_dir: Path, target: Path) -> None:
 
 
 def _move_if_exists(source: Path, target_dir: Path, campaign_dir: Path) -> Optional[str]:
+    from .filesystem import campaign_owned_path
+
     if not source.exists() and not source.is_symlink():
         return None
     if source.is_symlink():
         raise ValueError("refusing to archive symlinked array output: " + str(source))
-    _ensure_inside_campaign(campaign_dir, source)
+    source = campaign_owned_path(campaign_dir, source)
+    target_dir = campaign_owned_path(campaign_dir, target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
+    target_dir = campaign_owned_path(campaign_dir, target_dir)
     target = target_dir / source.name
     suffix = 1
     while target.exists():
-        target = target_dir / (source.name + "." + str(suffix))
+        target = campaign_owned_path(
+            campaign_dir, target_dir / (source.name + "." + str(suffix))
+        )
         suffix += 1
+    target = campaign_owned_path(campaign_dir, target)
     shutil.move(str(source), str(target))
     return str(target)
 
@@ -465,18 +588,38 @@ def archive_existing_array_task_outputs(
         + "-"
         + uuid.uuid4().hex[:8]
     )
-    archive_root = (
-        campaign
-        / ".DATA"
-        / "ACTIVE_LEARNING"
-        / "arr"
-        / phase
-        / (str(int(iteration)).zfill(6) + "-" + stamp)
+    from .filesystem import campaign_owned_path, operational_path
+
+    archive_root = campaign_owned_path(
+        campaign,
+        operational_path(
+            campaign,
+            "arr",
+            phase,
+            str(int(iteration)).zfill(6) + "-" + stamp,
+        ),
     )
+    archive_root.mkdir(parents=True, exist_ok=False)
+    archive_receipt = archive_root / "ARCHIVE.json"
     ids = [int(x) for x in (task_ids if task_ids is not None else logical_task_ids(campaign, phase, int(iteration)))]
     archived: List[str] = []
+
+    def record_archive(status: str) -> None:
+        payload = {
+            "schema_version": 1,
+            "phase": phase,
+            "iteration": int(iteration),
+            "status": str(status),
+            "moved": list(archived),
+            "updated_at_iso": _now_iso(),
+        }
+        atomic_write_json(archive_receipt, payload)
+
+    record_archive("moving")
     for task_id in ids:
-        task_archive = archive_root / str(int(task_id)).zfill(6)
+        task_archive = campaign_owned_path(
+            campaign, archive_root / str(int(task_id)).zfill(6)
+        )
         if phase == "ARIADNE_ARRAY":
             from ..layout import active_iteration_dir, ariadne_seed_dir
             from ..seed_identity import read_ariadne_task_map, task_for_array_task_id
@@ -491,11 +634,13 @@ def archive_existing_array_task_outputs(
             moved = _move_if_exists(seed_dir, task_archive, campaign)
             if moved:
                 archived.append(moved)
+                record_archive("moving")
             partial_pattern = "." + seed_dir.name + ".partial-*"
             for candidate in sorted(seed_dir.parent.glob(partial_pattern)):
                 moved = _move_if_exists(candidate, task_archive, campaign)
                 if moved:
                     archived.append(moved)
+                    record_archive("moving")
             continue
         pointdir = _pointdir_for_task(campaign, phase, int(iteration), int(task_id))
         if pointdir is None:
@@ -506,17 +651,28 @@ def archive_existing_array_task_outputs(
                 pdir / "input.gau",
                 pdir / "input.log",
                 pdir / "input.wfn",
+                pdir / "GAUSSIAN_TASK_RECEIPT.json",
             ]:
                 moved = _move_if_exists(candidate, task_archive, campaign)
                 if moved:
                     archived.append(moved)
+                    record_archive("moving")
         elif "AIMALL" in phase:
-            patterns = ["*_atomicfiles", "*.int", "*.sum", "*.agpviz", "*.mgpviz"]
+            patterns = [
+                "*_atomicfiles",
+                "*.int",
+                "*.sum",
+                "*.agpviz",
+                "*.mgpviz",
+                "AIMALL_COMPLETION_RECEIPT.json",
+            ]
             for pattern in patterns:
                 for candidate in sorted(pdir.glob(pattern)):
                     moved = _move_if_exists(candidate, task_archive, campaign)
                     if moved:
                         archived.append(moved)
+                        record_archive("moving")
+    record_archive("complete")
     return archived
 
 

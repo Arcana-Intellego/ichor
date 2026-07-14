@@ -6,6 +6,7 @@ import pytest
 from ichor.hpc.active_learning.ariadne_outputs import (
     AriadneOutputError,
     SEED_OUTPUT_MANIFEST_FILENAME,
+    read_and_validate_optimisation_trajectory,
     write_optimisation_trajectory,
     write_seed_output_manifest,
 )
@@ -19,6 +20,10 @@ from ichor.hpc.active_learning.handoff_manifests import (
     validate_ariadne_result,
     write_ariadne_results_manifest,
     write_ariadne_batch_decision,
+    write_ariadne_landing_audit,
+)
+from ichor.hpc.active_learning.historical_ariadne import (
+    read_historical_ariadne_records,
 )
 from ichor.hpc.active_learning.layout import active_ariadne_dir, ariadne_seed_dir
 from ichor.hpc.active_learning.seed_identity import (
@@ -211,6 +216,26 @@ def _write_canonical_handoff(
         "accepted": [accepted_record],
         "rejected": [],
     })
+    write_ariadne_landing_audit(iter_dir, {
+        "iteration": 1,
+        "summary": {
+            "accepted": 1,
+            "salvaged": 0,
+            "backtracked": 0,
+            "rejected": 0,
+            "rejection_reasons": {},
+            "policies": {"raw_final": 1},
+        },
+        "seeds": [{
+            "seed_id": 1,
+            "seed_uid": seed_uid,
+            "seed_dir": seed_dir.relative_to(ariadne_root).as_posix(),
+            "result_json": result_path.relative_to(ariadne_root).as_posix(),
+            "landing_safety": result.get("landing_safety"),
+            "handoff_accepted": True,
+            "movement": {"aligned_rmsd_ang": 0.125},
+        }],
+    })
     write_ariadne_batch_decision(
         iter_dir,
         campaign_uid=CAMPAIGN_UID,
@@ -224,6 +249,47 @@ def _write_canonical_handoff(
         reasons=[],
     )
     return iter_dir, selection, result_path
+
+
+def test_historical_reader_requires_agreeing_results_and_audit(tmp_path):
+    iter_dir, selection, _ = _write_canonical_handoff(tmp_path)
+
+    records = read_historical_ariadne_records(
+        iter_dir,
+        expected_iteration=1,
+    )
+
+    assert len(records) == 1
+    assert records[0]["seed_uid"] == selection["seed_records"][0]["seed_uid"]
+    assert records[0]["movement"]["aligned_rmsd_ang"] == pytest.approx(0.125)
+
+
+def test_trajectory_reader_rejects_semantic_drift_with_rebound_hash(tmp_path):
+    seed_dir = tmp_path / "seed-000001"
+    write_optimisation_trajectory(
+        seed_dir,
+        atom_types=["H"],
+        coordinate_frames=[[[0.0, 0.0, 0.0]], [[0.1, 0.0, 0.0]]],
+        alpha_values=[1.0, 2.0],
+        gradient_norms=[0.5, 0.25],
+        origins=["accepted", "accepted"],
+    )
+    trajectory = seed_dir / "trajectory"
+    metrics_path = trajectory / "metrics.jsonl"
+    records = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()]
+    records[1]["frame_number"] = 1
+    metrics_path.write_text(
+        "\n".join(json.dumps(record, sort_keys=True) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    manifest_path = trajectory / "MANIFEST.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"]["metrics_jsonl"]["size"] = metrics_path.stat().st_size
+    manifest["files"]["metrics_jsonl"]["sha256"] = sha256_file(metrics_path)
+    atomic_write_json(manifest_path, manifest)
+
+    with pytest.raises(AriadneOutputError, match="frame numbers"):
+        read_and_validate_optimisation_trajectory(seed_dir)
 
 
 def test_validate_ariadne_result_accepts_canonical_identity():

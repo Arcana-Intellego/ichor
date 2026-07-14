@@ -27,7 +27,6 @@ from ichor.hpc.active_learning.versioning.reference_data import (
     REFERENCE_DATA_VERSION_FILENAME,
     ReferenceDataError,
     ReferenceDataVersioning,
-    reference_data_cache_path,
 )
 from ichor.hpc.active_learning.layout import (
     reject_legacy_campaign_layout,
@@ -119,6 +118,35 @@ def _complete_allocation(
                 "pointdir": str(pointdir),
             }
         )
+    from ichor.hpc.active_learning.daemon.quantum_quality import (
+        write_quantum_quality_manifest,
+    )
+
+    quality_path = write_quantum_quality_manifest(
+        staging,
+        phase_name=("INITIAL_AIMALL" if context == "bootstrap" else "AIMALL"),
+        iteration=iteration,
+        records=[
+            {
+                "pointdir": Path(result["pointdir"]).name,
+                "accepted": True,
+                "reasons": [],
+                "atom_count": 1,
+                "n_int": 1,
+                "per_atom": [
+                    {
+                        "atom": "H1",
+                        "iqa_ha": -0.5,
+                        "integration_error": 0.0,
+                    }
+                ],
+            }
+            for result in results
+        ],
+        gates={},
+    )
+    for result in results:
+        result["quality_manifest"] = str(quality_path.resolve())
     completed = record_quantum_results(allocation_path, results)
     assert len(accepted_attempts(completed)) == 2
 
@@ -191,23 +219,24 @@ def test_reference_data_hash_chain_detects_parent_manifest_tamper(tmp_path):
         )
 
 
-def test_reference_data_cache_is_rebuilt_from_authoritative_manifests(tmp_path):
+def test_reference_data_resolution_has_no_mutable_cache_side_effect(tmp_path):
     campaign = tmp_path / "campaign"
     *_, second, _, _ = _commit_two_versions(campaign)
-    cache = reference_data_cache_path(campaign)
-    cache.write_text('{"untrusted": true}\n', encoding="utf-8")
+    before = sorted(
+        path.relative_to(campaign).as_posix()
+        for path in campaign.rglob("*")
+        if path.is_file()
+    )
 
     rebuilt = ReferenceDataVersioning(campaign / "QM_REFERENCE_DATA").resolve(1)
-    cached = json.loads(cache.read_text(encoding="utf-8"))
+    after = sorted(
+        path.relative_to(campaign).as_posix()
+        for path in campaign.rglob("*")
+        if path.is_file()
+    )
 
     assert rebuilt.cumulative_view_sha256 == second.cumulative_view_sha256
-    assert cached["cumulative_view_sha256"] == second.cumulative_view_sha256
-    assert [record["pointdir_name"] for record in cached["entries"]] == [
-        "POINT_000000.pointdir",
-        "POINT_000001.pointdir",
-        "POINT_000002.pointdir",
-        "POINT_000003.pointdir",
-    ]
+    assert after == before
 
 
 def test_committed_reference_pointdirs_are_read_only(tmp_path):

@@ -23,9 +23,7 @@ from .versioned_directory import VersionedDirectory
 
 
 REFERENCE_DATA_VERSION_FILENAME = "REFERENCE_DATA_VERSION.json"
-REFERENCE_DATA_VERSION_SCHEMA_VERSION = 1
-REFERENCE_DATA_CACHE_FILENAME = "reference_data_view_cache.json"
-REFERENCE_DATA_CACHE_SCHEMA_VERSION = 1
+REFERENCE_DATA_VERSION_SCHEMA_VERSION = 2
 POINTDIR_NAME_WIDTH = 6
 VALID_SPLITS = frozenset({"train", "int_val", "ext_val"})
 
@@ -99,15 +97,6 @@ class ReferenceDataVersioning(VersionedDirectory):
 
 def reference_data_version_path(iteration_dir: Union[str, Path]) -> Path:
     return Path(iteration_dir) / REFERENCE_DATA_VERSION_FILENAME
-
-
-def reference_data_cache_path(campaign_dir: Union[str, Path]) -> Path:
-    return (
-        Path(campaign_dir)
-        / ".DATA"
-        / "ACTIVE_LEARNING"
-        / REFERENCE_DATA_CACHE_FILENAME
-    )
 
 
 def canonical_json_sha256(value: Any) -> str:
@@ -453,14 +442,15 @@ def resolve_reference_data_view(
         if len(added) != len(records):
             raise ReferenceDataError("reference-data point record must be an object")
         _validate_allocation_snapshot(iteration_dir, payload, added)
-        quality_status = str(payload.get("quantum_quality_evidence_status") or "legacy_missing")
+        quality_status = str(payload.get("quantum_quality_evidence_status") or "")
         quality_records = payload.get("quantum_quality_evidence", [])
         if not isinstance(quality_records, list):
             raise ReferenceDataError("reference-data quantum-quality evidence must be a list")
         if quality_status == "committed" and not quality_records:
             raise ReferenceDataError("committed quantum-quality evidence is empty")
-        if quality_status not in {"committed", "legacy_missing"}:
+        if quality_status != "committed":
             raise ReferenceDataError("reference-data quantum-quality evidence status is invalid")
+        quality_committed_names = set()
         for record in quality_records:
             if not isinstance(record, Mapping):
                 raise ReferenceDataError("quantum-quality evidence record must be an object")
@@ -474,6 +464,62 @@ def resolve_reference_data_view(
                 record.get("sha256"), "quantum_quality_evidence.sha256"
             ):
                 raise ReferenceDataError("quantum-quality evidence SHA mismatch")
+            try:
+                from ..daemon.quantum_quality import read_quantum_quality_manifest
+
+                quality_payload = read_quantum_quality_manifest(
+                    evidence_path.parent,
+                    expected_phase=str(record.get("phase") or ""),
+                    expected_iteration=_safe_int(
+                        record.get("iteration"),
+                        "quantum_quality_evidence.iteration",
+                    ),
+                    manifest_path=evidence_path,
+                )
+            except Exception as exc:
+                raise ReferenceDataError(
+                    "committed quantum-quality evidence is invalid: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)
+                ) from exc
+            accepted_source_names = {
+                str(item["pointdir"])
+                for item in quality_payload["records"]
+                if bool(item["accepted"])
+            }
+            bindings = record.get("pointdir_bindings")
+            if not isinstance(bindings, list) or not bindings:
+                raise ReferenceDataError(
+                    "quantum-quality pointdir bindings are missing"
+                )
+            for binding in bindings:
+                if not isinstance(binding, Mapping):
+                    raise ReferenceDataError(
+                        "quantum-quality pointdir binding must be an object"
+                    )
+                source_name = str(binding.get("source_pointdir") or "")
+                committed_name = str(binding.get("committed_pointdir") or "")
+                candidate_id = str(binding.get("candidate_id") or "")
+                matches = [
+                    entry
+                    for entry in added
+                    if entry.pointdir_name == committed_name
+                    and entry.candidate_id == candidate_id
+                ]
+                if source_name not in accepted_source_names or len(matches) != 1:
+                    raise ReferenceDataError(
+                        "quantum-quality pointdir binding does not match its evidence"
+                    )
+                if committed_name in quality_committed_names:
+                    raise ReferenceDataError(
+                        "duplicate committed pointdir in quantum-quality evidence"
+                    )
+                quality_committed_names.add(committed_name)
+        if quality_committed_names != {entry.pointdir_path.name for entry in added}:
+            raise ReferenceDataError(
+                "quantum-quality evidence does not match committed pointdirs"
+            )
         entries.extend(added)
         if [entry.global_ordinal for entry in entries] != list(range(len(entries))):
             raise ReferenceDataError("reference-data global ordinals are not contiguous")
@@ -513,25 +559,7 @@ def resolve_reference_data_view(
         expected_campaign_uid
     ):
         raise ReferenceDataError("reference-data campaign UID does not match state")
-    _write_reference_data_cache(campaign, view)
     return view
-
-
-def _write_reference_data_cache(campaign_dir: Path, view: ReferenceDataView) -> None:
-    from ..daemon.state import atomic_write_json
-
-    path = reference_data_cache_path(campaign_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(
-        path,
-        {
-            "schema_version": REFERENCE_DATA_CACHE_SCHEMA_VERSION,
-            "reference_data_version": int(view.version),
-            "head_manifest_sha256": str(view.head_manifest_sha256),
-            "cumulative_view_sha256": str(view.cumulative_view_sha256),
-            "entries": [entry.identity_payload() for entry in view.entries],
-        },
-    )
 
 
 def build_reference_data_version_payload(
@@ -574,9 +602,7 @@ def build_reference_data_version_payload(
         ),
         "added_pointdirs": [entry.identity_payload() for entry in added_entries],
         "quantum_quality_evidence": [dict(record) for record in quantum_quality_evidence],
-        "quantum_quality_evidence_status": (
-            "committed" if quantum_quality_evidence else "legacy_missing"
-        ),
+        "quantum_quality_evidence_status": "committed",
         "cumulative_view_sha256": _view_sha(all_entries),
     }
 
@@ -584,14 +610,12 @@ def build_reference_data_version_payload(
 __all__ = [
     "REFERENCE_DATA_VERSION_FILENAME",
     "REFERENCE_DATA_VERSION_SCHEMA_VERSION",
-    "REFERENCE_DATA_CACHE_FILENAME",
     "POINTDIR_NAME_WIDTH",
     "ReferenceDataError",
     "ReferenceDataEntry",
     "ReferenceDataView",
     "ReferenceDataVersioning",
     "reference_data_version_path",
-    "reference_data_cache_path",
     "canonical_json_sha256",
     "hash_pointdir_tree",
     "seal_reference_data_version",

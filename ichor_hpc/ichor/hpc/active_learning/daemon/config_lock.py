@@ -28,6 +28,7 @@ from .artifact_contracts import (
     verify_committed_model_version,
     verify_committed_reference_data_version,
 )
+from .filesystem import campaign_owned_path
 from .state import CampaignPhase, CampaignState, atomic_write_json
 
 
@@ -1498,8 +1499,10 @@ def archive_ferebus_iteration_staging_for_retrain(
     if not ok:
         raise ValueError("FEREBUS staging is not complete: " + str(reason))
     validate_ferebus_quality_evidence(target)
-    archive = _timestamped_reconcile_sibling(target)
-    _ensure_inside_campaign(campaign, archive)
+    archive = _reconcile_archive_target(
+        campaign,
+        _timestamped_reconcile_sibling(target),
+    )
     target.rename(archive)
     return str(archive)
 
@@ -1526,29 +1529,33 @@ def assert_config_unchanged_for_start(
 
 
 def _ensure_inside_campaign(campaign_dir: Path, target: Path) -> None:
-    campaign = campaign_dir.resolve()
-    resolved = target.resolve()
-    if resolved != campaign and campaign not in resolved.parents:
-        raise ValueError("refusing to clean path outside campaign: " + str(target))
+    campaign_owned_path(campaign_dir, target)
+
+
+def _reconcile_archive_target(campaign: Path, target: Path) -> Path:
+    """Validate every existing destination ancestor before a repair move."""
+    return campaign_owned_path(campaign, target)
 
 
 def clean_reentry_staging(campaign_dir: Union[str, Path], phase: CampaignPhase) -> List[str]:
     campaign = Path(campaign_dir)
-    removed: List[str] = []
+    archived: List[str] = []
     if phase in (CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS):
         target = trained_models_dir(campaign) / "iteration-staging"
         if target.exists():
             _ensure_inside_campaign(campaign, target)
-            shutil.rmtree(target)
-            removed.append(str(target))
-    scripts = campaign / ".DATA" / "SCRIPTS"
-    if scripts.is_dir():
-        _ensure_inside_campaign(campaign, scripts)
-        for script in sorted(scripts.glob("*.sh")):
-            if script.is_file():
-                script.unlink()
-                removed.append(str(script))
-    return removed
+            if target.is_symlink() or not target.is_dir():
+                raise ValueError(
+                    "refusing invalid model iteration-staging: " + str(target)
+                )
+            destination = _reconcile_archive_target(
+                campaign,
+                _timestamped_reconcile_sibling(target),
+            )
+            target.rename(destination)
+            archived.append(str(destination))
+    archived.extend(archive_scripts_for_reconcile(campaign))
+    return archived
 
 
 def archive_scripts_for_reconcile(campaign_dir: Union[str, Path]) -> List[str]:
@@ -1572,13 +1579,27 @@ def archive_scripts_for_reconcile(campaign_dir: Union[str, Path]) -> List[str]:
         return []
     _ensure_inside_campaign(campaign, scripts)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    archive_root = scripts / "LEGACY_BEFORE_RECONCILE"
-    target = archive_root / stamp
+    archive_root = _reconcile_archive_target(
+        campaign,
+        scripts / "LEGACY_BEFORE_RECONCILE",
+    )
+    archive_root.mkdir(parents=True, exist_ok=True)
+    target = _reconcile_archive_target(campaign, archive_root / stamp)
     suffix = 1
     while target.exists():
-        target = archive_root / (stamp + "." + str(suffix))
+        target = _reconcile_archive_target(
+            campaign,
+            archive_root / (stamp + "." + str(suffix)),
+        )
         suffix += 1
     target.mkdir(parents=True, exist_ok=False)
+    try:
+        target.chmod(0o700)
+    except OSError as exc:
+        raise OSError(
+            "could not enforce private reconcile archive permissions: "
+            + str(target)
+        ) from exc
     for child in legacy_children:
         _ensure_inside_campaign(campaign, child)
         child.rename(target / child.name)
@@ -1653,8 +1674,10 @@ def _archive_completed_model_iteration_staging(
             + " committed="
             + repr(sorted(committed_models))
         )
-    archive = _timestamped_reconcile_sibling(target)
-    _ensure_inside_campaign(campaign, archive)
+    archive = _reconcile_archive_target(
+        campaign,
+        _timestamped_reconcile_sibling(target),
+    )
     target.rename(archive)
     return archive
 
@@ -1680,7 +1703,10 @@ def _clean_model_iteration_staging_locked(
                 "refusing invalid trained-model version staging: " + str(dangling)
             )
         _ensure_inside_campaign(campaign, dangling)
-        archive = _timestamped_reconcile_sibling(dangling)
+        archive = _reconcile_archive_target(
+            campaign,
+            _timestamped_reconcile_sibling(dangling),
+        )
         dangling.rename(archive)
         archived_paths.append(str(archive))
 
@@ -1713,8 +1739,12 @@ def _clean_model_iteration_staging_locked(
         if model_version < 0:
             raise ValueError("models_version is negative; cannot verify committed model")
         verify_committed_model_version(campaign, model_version)
-    shutil.rmtree(target)
-    return archived_paths + [str(target)]
+    archive = _reconcile_archive_target(
+        campaign,
+        _timestamped_reconcile_sibling(target),
+    )
+    target.rename(archive)
+    return archived_paths + [str(archive)]
 
 
 def ferebus_reentry_can_archive_data_staging(
@@ -1754,15 +1784,21 @@ def archive_data_staging_for_ferebus_reentry(
         return []
     _ensure_inside_campaign(campaign, staging)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    target = staging.with_name(staging.name + ".before-reconcile-" + stamp)
+    target = _reconcile_archive_target(
+        campaign,
+        staging.with_name(staging.name + ".before-reconcile-" + stamp),
+    )
     suffix = 1
     while target.exists():
-        target = staging.with_name(
-            staging.name + ".before-reconcile-" + stamp + "." + str(suffix)
+        target = _reconcile_archive_target(
+            campaign,
+            staging.with_name(
+                staging.name + ".before-reconcile-" + stamp + "." + str(suffix)
+            ),
         )
         suffix += 1
     staging.rename(target)
-    staging.mkdir(parents=True, exist_ok=True)
+    _reconcile_archive_target(campaign, staging).mkdir(parents=True, exist_ok=True)
     return [str(target)]
 
 
@@ -1795,15 +1831,21 @@ def archive_data_staging_for_operator_reconcile(
             )
     _ensure_inside_campaign(campaign, staging)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    target = staging.with_name(staging.name + ".archived-" + stamp)
+    target = _reconcile_archive_target(
+        campaign,
+        staging.with_name(staging.name + ".archived-" + stamp),
+    )
     suffix = 1
     while target.exists():
-        target = staging.with_name(
-            staging.name + ".archived-" + stamp + "." + str(suffix)
+        target = _reconcile_archive_target(
+            campaign,
+            staging.with_name(
+                staging.name + ".archived-" + stamp + "." + str(suffix)
+            ),
         )
         suffix += 1
     staging.rename(target)
-    staging.mkdir(parents=True, exist_ok=True)
+    _reconcile_archive_target(campaign, staging).mkdir(parents=True, exist_ok=True)
     return [str(target)]
 
 
@@ -1849,14 +1891,20 @@ def restore_config_from_lock_proposal(campaign_dir: Union[str, Path]) -> Path:
     if not isinstance(config_payload, dict):
         raise ValueError("config lock does not contain canonical_config")
     config = CampaignConfig.from_dict(config_payload)
-    target = campaign / "campaign.yaml.proposed"
+    target = _reconcile_archive_target(campaign, campaign / "campaign.yaml.proposed")
     if target.exists():
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        archive = target.with_name(target.name + ".before-" + stamp)
+        archive = _reconcile_archive_target(
+            campaign,
+            target.with_name(target.name + ".before-" + stamp),
+        )
         suffix = 1
         while archive.exists():
-            archive = target.with_name(
-                target.name + ".before-" + stamp + "." + str(suffix)
+            archive = _reconcile_archive_target(
+                campaign,
+                target.with_name(
+                    target.name + ".before-" + stamp + "." + str(suffix)
+                ),
             )
             suffix += 1
         target.rename(archive)
@@ -1924,15 +1972,21 @@ def archive_reference_data_staging_for_reconcile(
     archived: List[str] = []
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     for staging in tv.list_dangling_staging():
-        target = staging.with_name(staging.name + ".before-reconcile-" + stamp)
+        target = _reconcile_archive_target(
+            campaign,
+            staging.with_name(staging.name + ".before-reconcile-" + stamp),
+        )
         suffix = 1
         while target.exists():
-            target = staging.with_name(
-                staging.name
-                + ".before-reconcile-"
-                + stamp
-                + "."
-                + str(suffix)
+            target = _reconcile_archive_target(
+                campaign,
+                staging.with_name(
+                    staging.name
+                    + ".before-reconcile-"
+                    + stamp
+                    + "."
+                    + str(suffix)
+                ),
             )
             suffix += 1
         staging.rename(target)

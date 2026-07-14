@@ -92,7 +92,7 @@ def _commit_reference_data_version(campaign, version=0):
     )
     allocation = create_point_allocation(
         allocation_path,
-        campaign_uid="config-lock-test",
+        campaign_uid=_FIXTURE_CAMPAIGN_UID,
         context="bootstrap",
         iteration=0,
         targets={"train": 1, "int_val": 0, "ext_val": 0, "total": 1},
@@ -111,7 +111,7 @@ def _commit_reference_data_version(campaign, version=0):
     (pointdir / "input.gjf").write_text("# fixture\n", encoding="utf-8")
     write_seed_provenance(
         pointdir,
-        campaign_uid="config-lock-test",
+        campaign_uid=_FIXTURE_CAMPAIGN_UID,
         iteration=0,
         trajectory_sha256="0" * 64,
         seed_frame_id=0,
@@ -131,6 +131,32 @@ def _commit_reference_data_version(campaign, version=0):
             allocation["slot_assignment_sha256"]
         ),
     )
+    from ichor.hpc.active_learning.daemon.quantum_quality import (
+        write_quantum_quality_manifest,
+    )
+
+    quality_path = write_quantum_quality_manifest(
+        pointdir.parent,
+        phase_name=CampaignPhase.INITIAL_AIMALL.value,
+        iteration=0,
+        records=[
+            {
+                "pointdir": pointdir.name,
+                "accepted": True,
+                "reasons": [],
+                "atom_count": 1,
+                "n_int": 1,
+                "per_atom": [
+                    {
+                        "atom": "H1",
+                        "iqa_ha": -0.5,
+                        "integration_error": 0.0,
+                    }
+                ],
+            }
+        ],
+        gates={},
+    )
     record_quantum_results(
         allocation_path,
         [
@@ -138,6 +164,7 @@ def _commit_reference_data_version(campaign, version=0):
                 "candidate_id": str(attempt["candidate_id"]),
                 "accepted": True,
                 "pointdir": str(pointdir.resolve()),
+                "quality_manifest": str(quality_path.resolve()),
             }
         ],
     )
@@ -1286,6 +1313,14 @@ def test_reconcile_apply_config_lock_failure_restores_old_state(
     config = CampaignConfig()
     write_config_lock(campaign, config)
     _write_config(campaign, config)
+    reference_versions = VersionedDirectory(campaign / "QM_REFERENCE_DATA")
+    current_link = reference_versions.current_link_path()
+    current_pointer = reference_versions._pointer_path()
+    if current_link.is_symlink():
+        current_link.unlink()
+    if current_pointer.is_file():
+        current_pointer.unlink()
+    assert reference_versions.current_version() is None
 
     def fail_config_lock(path, config):
         raise OSError("lock failed")
@@ -1316,6 +1351,7 @@ def test_reconcile_apply_config_lock_failure_restores_old_state(
     state = read_state(state_path)
     assert state.phase is old_state.phase
     assert state.reference_data_version == old_state.reference_data_version
+    assert reference_versions.current_version() is None
     assert (campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json.proposed").is_file()
     assert write_state_calls.count(state_path) >= 2
 

@@ -87,11 +87,18 @@ from .daemon.reconcile import (
     write_proposed_state,
 )
 from .daemon.array_recovery import (
+    array_ledger_path,
     archive_existing_array_task_outputs,
     compact_array_recovery_summary,
     read_array_ledger,
     refresh_array_ledger,
     supports_partial_array_recovery,
+)
+from .daemon.reconcile_transaction import (
+    ReconcileTransaction,
+    begin_reconcile_transaction,
+    restore_version_pointer,
+    snapshot_version_pointer,
 )
 from .daemon import submission_intent as _submission_intent
 from .daemon import scratch as _scratch
@@ -3561,7 +3568,7 @@ def _resolve_terminal_submission_intents_for_apply(
     *,
     pre_submit_stale_seconds: int = 900,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Make conclusively terminal active intents inactive before safe apply.
+    """Classify conclusively terminal active intents before safe apply.
 
     This is intentionally fail-closed.  ``reconcile --apply`` may clear a stale
     active intent only when ``squeue`` no longer sees the job and ``sacct``
@@ -3570,7 +3577,6 @@ def _resolve_terminal_submission_intents_for_apply(
     Missing scheduler data keeps the intent blocking so an operator cannot
     accidentally duplicate a live job.
     """
-    from .daemon.journal import append_event
     from .submit import sacct_poll
 
     terminal_candidates: List[Dict[str, Any]] = []
@@ -3772,54 +3778,207 @@ def _resolve_terminal_submission_intents_for_apply(
         return [], blocking
     resolved: List[Dict[str, Any]] = []
     for candidate in stale_pre_submit_no_job:
-        phase = str(candidate["phase"])
-        iteration = int(candidate["iteration"])
         reason = "reconcile_apply_pre_submit_no_job_id"
+        payload = dict(candidate)
+        payload["reason"] = reason
+        payload["target_status"] = "SUPERSEDED"
+        resolved.append(payload)
+    for candidate in terminal_candidates:
+        terminal_state = str(candidate["terminal_state"])
+        failure_reason = "reconcile_apply_terminal_job:" + terminal_state
+        payload = dict(candidate)
+        payload["reason"] = failure_reason
+        payload["target_status"] = "FAILED"
+        resolved.append(payload)
+    return resolved, blocking
+
+
+def _perform_reconcile_apply_mutations(
+    campaign: Path,
+    report: Any,
+    *,
+    transaction: ReconcileTransaction,
+    retrain_ferebus: bool,
+    force_resubmit_array: bool,
+    partial_array: Optional[Dict[str, Any]],
+    force_array_phase: CampaignPhase,
+    force_array_iteration: int,
+    archive_existing_array_outputs: bool,
+    data_staging_archive_mode: Optional[str],
+) -> Dict[str, Any]:
+    """Perform only lossless, transaction-recorded reconcile mutations."""
+    result: Dict[str, Any] = {
+        "ferebus_retrain_archive": [],
+        "archived_array_outputs": [],
+        "refreshed_array_ledger": None,
+        "archived_scripts": [],
+        "archived_data_staging": [],
+        "archived_model_staging": [],
+        "archived_reference_data_staging": [],
+        "archived_reentry_staging": [],
+    }
+    if retrain_ferebus:
+        archived = archive_ferebus_iteration_staging_for_retrain(
+            campaign,
+            report.proposed_state,
+        )
+        if archived is not None:
+            result["ferebus_retrain_archive"] = [str(archived)]
+            transaction.record_paths("archive_ferebus_retrain", [str(archived)])
+
+    if force_resubmit_array and isinstance(partial_array, dict):
+        if archive_existing_array_outputs:
+            archived_outputs = archive_existing_array_task_outputs(
+                campaign,
+                force_array_phase,
+                int(force_array_iteration),
+            )
+            result["archived_array_outputs"] = list(archived_outputs)
+            transaction.record_paths(
+                "archive_array_outputs",
+                archived_outputs,
+            )
+        refreshed = refresh_array_ledger(
+            campaign,
+            force_array_phase,
+            int(force_array_iteration),
+            force_resubmit=True,
+        )
+        result["refreshed_array_ledger"] = refreshed
+        transaction.record_paths(
+            "refresh_array_ledger",
+            [str(array_ledger_path(campaign, force_array_phase, force_array_iteration))],
+        )
+
+    if ".DATA/SCRIPTS contains sbatch scripts" in report.unsafe_reasons:
+        paths = archive_scripts_for_reconcile(campaign)
+        result["archived_scripts"] = paths
+        transaction.record_paths("archive_scripts", paths)
+
+    if ".DATA/STAGING is non-empty" in report.unsafe_reasons:
+        if data_staging_archive_mode == "ferebus_reentry":
+            paths = archive_data_staging_for_ferebus_reentry(
+                campaign,
+                report.proposed_state,
+            )
+        elif data_staging_archive_mode == "operator":
+            paths = archive_data_staging_for_operator_reconcile(campaign)
+        else:
+            paths = []
+        result["archived_data_staging"] = paths
+        transaction.record_paths("archive_data_staging", paths)
+
+    if "dangling model staging directories exist" in report.unsafe_reasons:
+        paths = clean_model_iteration_staging_for_reconcile(
+            campaign,
+            report.proposed_state,
+        )
+        result["archived_model_staging"] = paths
+        transaction.record_paths("archive_model_staging", paths)
+
+    if "dangling reference-data staging directories exist" in report.unsafe_reasons:
+        paths = archive_reference_data_staging_for_reconcile(
+            campaign,
+            report.proposed_state,
+        )
+        result["archived_reference_data_staging"] = paths
+        transaction.record_paths("archive_reference_data_staging", paths)
+
+    paths = clean_reentry_staging(campaign, report.proposed_state.phase)
+    result["archived_reentry_staging"] = paths
+    transaction.record_paths("archive_reentry_staging", paths)
+    return result
+
+
+def _fail_reconcile_transaction(
+    transaction: Optional[ReconcileTransaction],
+    reason: str,
+) -> None:
+    if transaction is None:
+        return
+    try:
+        transaction.set_status("FAILED", reason=reason)
+    except Exception:
+        pass
+
+
+def _restore_reconcile_pointer_snapshots(
+    campaign: Path,
+    snapshots: Sequence[Mapping[str, Any]],
+) -> List[str]:
+    errors: List[str] = []
+    for snapshot in reversed(list(snapshots)):
+        try:
+            restore_version_pointer(campaign, snapshot)
+        except Exception as exc:
+            errors.append(
+                str(snapshot.get("label") or "pointer")
+                + ": "
+                + type(exc).__name__
+                + ": "
+                + str(exc)
+            )
+    return errors
+
+
+def _publish_reconcile_intent_transitions(
+    campaign: Path,
+    resolved_intents: Sequence[Mapping[str, Any]],
+    recovered_state: Any,
+) -> None:
+    """Publish scheduler-backed intent transitions after the core commit."""
+    from .daemon.journal import append_event
+
+    for item in resolved_intents:
+        phase = str(item["phase"])
+        iteration = int(item["iteration"])
+        reason = str(item["reason"])
+        target_status = str(item["target_status"])
+        if target_status == "SUPERSEDED":
+            _submission_intent.mark_superseded(
+                campaign,
+                phase,
+                iteration,
+                reason,
+            )
+        elif target_status == "FAILED":
+            _submission_intent.mark_failed(
+                campaign,
+                phase,
+                iteration,
+                reason,
+            )
+        else:
+            raise ValueError(
+                "unsupported reconcile intent transition: " + target_status
+            )
+        append_event(
+            campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
+            "reconcile_resolved_terminal_intent",
+            phase=phase,
+            iteration=iteration,
+            job_id=str(item.get("job_id") or ""),
+            terminal_state=str(item.get("terminal_state") or ""),
+            n_sacct_rows=int(item.get("n_sacct_rows") or 0),
+            reason=reason,
+            target_status=target_status,
+        )
+
+    phase = recovered_state.phase.value
+    iteration = int(recovered_state.iteration)
+    current = _submission_intent.load_intent(
+        campaign,
+        phase,
+        iteration,
+        expected_campaign_uid=str(recovered_state.campaign_uid),
+    )
+    if current is not None and str(current.get("status")) == "FAILED":
         _submission_intent.mark_superseded(
             campaign,
             phase,
             iteration,
-            reason,
+            "reconcile_apply_retry",
         )
-        payload = dict(candidate)
-        payload["reason"] = reason
-        resolved.append(payload)
-        try:
-            append_event(
-                campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
-                "reconcile_resolved_terminal_intent",
-                phase=phase,
-                iteration=iteration,
-                job_id="",
-                terminal_state="PRE_SUBMIT_NO_JOB_ID",
-                n_sacct_rows=int(candidate.get("n_sacct_rows") or 0),
-                reason=reason,
-            )
-        except Exception:
-            pass
-    for candidate in terminal_candidates:
-        phase = str(candidate["phase"])
-        iteration = int(candidate["iteration"])
-        terminal_state = str(candidate["terminal_state"])
-        failure_reason = "reconcile_apply_terminal_job:" + terminal_state
-        _submission_intent.mark_failed(
-            campaign,
-            phase,
-            iteration,
-            failure_reason,
-        )
-        payload = dict(candidate)
-        payload["reason"] = failure_reason
-        resolved.append(payload)
-        try:
-            append_event(
-                campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
-                "reconcile_resolved_terminal_intent",
-                **payload,
-            )
-        except Exception:
-            pass
-    return resolved, blocking
 
 
 def _retry_phase_from_cleaned_report(report) -> Optional[CampaignPhase]:
@@ -5295,6 +5454,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 9
+    resolved_intents: List[Dict[str, Any]] = []
     if report.active_submission_intents:
         resolved_intents, blocking_intents = _resolve_terminal_submission_intents_for_apply(
             campaign,
@@ -5478,39 +5638,67 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         )
         print("")
 
-    ferebus_retrain_archive: List[str] = []
-    if retrain_ferebus:
-        try:
-            archived_ferebus = archive_ferebus_iteration_staging_for_retrain(
-                campaign,
-                report.proposed_state,
-            )
-        except Exception as exc:
-            print(
-                "could not archive FEREBUS staging for retraining: " + str(exc),
-                file=sys.stderr,
-            )
-            return 9
-        if archived_ferebus is not None:
-            ferebus_retrain_archive.append(str(archived_ferebus))
-            print("Archived FEREBUS output for explicit retraining:")
-            print("  - " + str(archived_ferebus))
-
     original_report = report
-    archived_array_outputs: List[str] = []
-    if force_resubmit_array and isinstance(partial_array, dict):
-        if archive_existing_array_outputs:
-            archived_array_outputs = archive_existing_array_task_outputs(
-                campaign,
-                force_array_phase,
-                int(force_array_iteration),
-            )
-        refreshed = refresh_array_ledger(
+    transaction: Optional[ReconcileTransaction] = None
+    planned_operations = [
+        "validate_recovery_contract",
+        "repair_current_pointers",
+        "write_recovered_state",
+        "update_config_lock",
+        "publish_intent_transitions",
+    ]
+    if cleanable_now or retrain_ferebus or force_resubmit_array:
+        planned_operations.insert(0, "archive_reconcile_evidence")
+    try:
+        transaction = begin_reconcile_transaction(
             campaign,
-            force_array_phase,
-            int(force_array_iteration),
-            force_resubmit=True,
+            proposed_phase=report.proposed_state.phase.value,
+            proposed_iteration=int(report.proposed_state.iteration),
+            planned_operations=planned_operations,
+            intent_transitions=resolved_intents,
         )
+        transaction.set_status("MUTATING")
+        mutation_result = _perform_reconcile_apply_mutations(
+            campaign,
+            report,
+            transaction=transaction,
+            retrain_ferebus=retrain_ferebus,
+            force_resubmit_array=force_resubmit_array,
+            partial_array=partial_array,
+            force_array_phase=force_array_phase,
+            force_array_iteration=int(force_array_iteration),
+            archive_existing_array_outputs=archive_existing_array_outputs,
+            data_staging_archive_mode=data_staging_archive_mode,
+        )
+    except Exception as exc:
+        _fail_reconcile_transaction(
+            transaction,
+            "reconcile evidence archival failed: " + type(exc).__name__ + ": " + str(exc),
+        )
+        print(
+            "could not archive reconcile evidence losslessly: "
+            + type(exc).__name__
+            + ": "
+            + str(exc),
+            file=sys.stderr,
+        )
+        return 9
+
+    ferebus_retrain_archive = list(mutation_result["ferebus_retrain_archive"])
+    archived_array_outputs = list(mutation_result["archived_array_outputs"])
+    refreshed = mutation_result["refreshed_array_ledger"]
+    archived_scripts = list(mutation_result["archived_scripts"])
+    archived = list(mutation_result["archived_data_staging"])
+    removed_model_staging = list(mutation_result["archived_model_staging"])
+    archived_reference_data_staging = list(
+        mutation_result["archived_reference_data_staging"]
+    )
+    removed = list(mutation_result["archived_reentry_staging"])
+    if ferebus_retrain_archive:
+        print("Archived FEREBUS output for explicit retraining:")
+        for path in ferebus_retrain_archive:
+            print("  - " + str(path))
+    if refreshed is not None:
         print(
             "Marked current array for full resubmission: "
             + str(force_array_phase.value)
@@ -5525,27 +5713,6 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 print("  - " + str(path))
             if len(archived_array_outputs) > 8:
                 print("  - ... " + str(len(archived_array_outputs) - 8) + " more")
-    archived_scripts = archive_scripts_for_reconcile(
-        campaign
-    ) if ".DATA/SCRIPTS contains sbatch scripts" in report.unsafe_reasons else []
-    archived = []
-    if ".DATA/STAGING is non-empty" in report.unsafe_reasons:
-        if data_staging_archive_mode == "ferebus_reentry":
-            archived = archive_data_staging_for_ferebus_reentry(
-                campaign,
-                report.proposed_state,
-            )
-        elif data_staging_archive_mode == "operator":
-            archived = archive_data_staging_for_operator_reconcile(campaign)
-    removed_model_staging = clean_model_iteration_staging_for_reconcile(
-        campaign,
-        report.proposed_state,
-    ) if "dangling model staging directories exist" in report.unsafe_reasons else []
-    archived_reference_data_staging = archive_reference_data_staging_for_reconcile(
-        campaign,
-        report.proposed_state,
-    ) if "dangling reference-data staging directories exist" in report.unsafe_reasons else []
-    removed = clean_reentry_staging(campaign, report.proposed_state.phase)
     cleanup_paths_already_done = (
         list(archived_scripts)
         + list(archived_array_outputs)
@@ -5560,6 +5727,11 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         report = propose_recovery(
             campaign,
             allow_fresh_init_on_nonempty=bool(getattr(args, "allow_fresh_init", False)),
+            _active_reconcile_transaction_id=(
+                str(transaction.payload["transaction_id"])
+                if transaction is not None
+                else None
+            ),
         )
         _apply_retry_phase_after_cleaned_halt(report, original_report)
         _apply_runtime_config_to_recovered_state(report, config)
@@ -5574,10 +5746,18 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                     force_retrain_ferebus=retrain_ferebus,
                 )
             except Exception as exc:
+                _fail_reconcile_transaction(
+                    transaction,
+                    "post-archive config review failed: " + str(exc),
+                )
                 print("campaign config could not be reviewed: " + str(exc), file=sys.stderr)
                 _print_cleanup_already_happened(cleanup_paths_already_done)
                 return 8
         if report.unsafe_reasons:
+            _fail_reconcile_transaction(
+                transaction,
+                "post-archive recovery remained unsafe: " + "; ".join(report.unsafe_reasons),
+            )
             print(
                 "refusing --apply because cleanup did not produce a safe recovery proposal:",
                 file=sys.stderr,
@@ -5587,6 +5767,10 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             _print_cleanup_already_happened(cleanup_paths_already_done)
             return 9
         if report.proposed_state.phase in (CampaignPhase.HALTED, CampaignPhase.DONE):
+            _fail_reconcile_transaction(
+                transaction,
+                "post-archive recovery selected " + report.proposed_state.phase.value,
+            )
             print(
                 "refusing --apply because proposed state is "
                 + report.proposed_state.phase.value
@@ -5596,6 +5780,10 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             _print_cleanup_already_happened(cleanup_paths_already_done)
             return 9
         if config_review is not None and config_review.blocked_changes:
+            _fail_reconcile_transaction(
+                transaction,
+                "post-archive config review found locked changes",
+            )
             print("refusing --apply because campaign.yaml has locked changes", file=sys.stderr)
             print(format_config_review(config_review), file=sys.stderr)
             _print_cleanup_already_happened(cleanup_paths_already_done)
@@ -5627,7 +5815,16 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             report,
         )
         cleanup_paths_already_done.extend(restored_bootstrap_handoff)
+        if transaction is not None:
+            transaction.record_paths(
+                "restore_bootstrap_handoff",
+                restored_bootstrap_handoff,
+            )
     except Exception as exc:
+        _fail_reconcile_transaction(
+            transaction,
+            "bootstrap handoff restoration failed: " + type(exc).__name__ + ": " + str(exc),
+        )
         print(
             "refusing --apply because archived bootstrap staging could not be restored:",
             file=sys.stderr,
@@ -5638,6 +5835,10 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
 
     contract_error = _reconcile_apply_contract_error(campaign, report.proposed_state)
     if contract_error is not None:
+        _fail_reconcile_transaction(
+            transaction,
+            "final state/artefact contract failed: " + str(contract_error),
+        )
         _print_reconcile_apply_blocked(
             campaign,
             title="Final State/Artefact Contract",
@@ -5647,20 +5848,50 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         _print_cleanup_already_happened(cleanup_paths_already_done)
         return 9
 
+    pointer_snapshots: List[Dict[str, Any]] = []
     try:
+        if transaction is None:
+            raise RuntimeError("reconcile transaction was not created")
+        transaction.set_status("COMMITTING")
         state_train_version = int(report.proposed_state.reference_data_version)
         if state_train_version >= 0:
             from .versioning.reference_data import ReferenceDataVersioning
 
-            ReferenceDataVersioning(campaign / "QM_REFERENCE_DATA").ensure_current(
-                state_train_version
+            reference_versioning = ReferenceDataVersioning(campaign / "QM_REFERENCE_DATA")
+            pointer_snapshots.append(
+                snapshot_version_pointer(
+                    campaign,
+                    reference_versioning,
+                    label="reference_data",
+                    requested_version=state_train_version,
+                )
             )
+            transaction.record_pointer_snapshots(pointer_snapshots)
+            reference_versioning.ensure_current(state_train_version)
         state_model_version = int(report.proposed_state.models_version)
         if state_model_version >= 0:
-            TrainedModelVersioning(trained_models_dir(campaign)).ensure_current(
-                state_model_version
+            model_versioning = TrainedModelVersioning(trained_models_dir(campaign))
+            pointer_snapshots.append(
+                snapshot_version_pointer(
+                    campaign,
+                    model_versioning,
+                    label="trained_models",
+                    requested_version=state_model_version,
+                )
             )
+            transaction.record_pointer_snapshots(pointer_snapshots)
+            model_versioning.ensure_current(state_model_version)
     except Exception as exc:
+        pointer_errors = _restore_reconcile_pointer_snapshots(campaign, pointer_snapshots)
+        reason = (
+            "current pointer repair failed: "
+            + type(exc).__name__
+            + ": "
+            + str(exc)
+        )
+        if pointer_errors:
+            reason += "; pointer rollback failed: " + "; ".join(pointer_errors)
+        _fail_reconcile_transaction(transaction, reason)
         print(
             "refusing --apply because committed current pointers could not be "
             "repaired:",
@@ -5670,13 +5901,27 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         _print_cleanup_already_happened(cleanup_paths_already_done)
         return 9
 
-    backup_path = _copy_existing_timestamped(
-        target_canonical,
-        ".before-reconcile-",
-    )
+    try:
+        backup_path = _copy_existing_timestamped(
+            target_canonical,
+            ".before-reconcile-",
+        )
+    except Exception as exc:
+        pointer_errors = _restore_reconcile_pointer_snapshots(campaign, pointer_snapshots)
+        reason = "state backup failed: " + type(exc).__name__ + ": " + str(exc)
+        if pointer_errors:
+            reason += "; pointer rollback failed: " + "; ".join(pointer_errors)
+        _fail_reconcile_transaction(transaction, reason)
+        print(reason, file=sys.stderr)
+        return 9
     try:
         write_state(target_canonical, report.proposed_state)
     except Exception as exc:
+        pointer_errors = _restore_reconcile_pointer_snapshots(campaign, pointer_snapshots)
+        reason = "state write failed: " + type(exc).__name__ + ": " + str(exc)
+        if pointer_errors:
+            reason += "; pointer rollback failed: " + "; ".join(pointer_errors)
+        _fail_reconcile_transaction(transaction, reason)
         print(
             "failed to write recovered state.json: "
             + type(exc).__name__
@@ -5705,6 +5950,13 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 + ": "
                 + str(restore_exc)
             )
+        pointer_errors = _restore_reconcile_pointer_snapshots(campaign, pointer_snapshots)
+        if pointer_errors:
+            restore_message += "; pointer rollback failed: " + "; ".join(pointer_errors)
+        _fail_reconcile_transaction(
+            transaction,
+            "config lock update failed: " + type(exc).__name__ + ": " + str(exc),
+        )
         print(
             "failed to update config lock after writing state.json; "
             + restore_message
@@ -5716,27 +5968,38 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         )
         _print_cleanup_already_happened(cleanup_paths_already_done)
         return 8
-    for intent_path in sorted(
-        (campaign / DEFAULT_DATA_SUBDIR / "submission_intents").glob("*.json")
-        if (campaign / DEFAULT_DATA_SUBDIR / "submission_intents").is_dir()
-        else []
-    ):
-        try:
-            payload = json.loads(intent_path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if (
-            str(payload.get("phase")) == report.proposed_state.phase.value
-            and int(payload.get("iteration", -999999)) == int(report.proposed_state.iteration)
-            and str(payload.get("status")) == "FAILED"
-        ):
-            _submission_intent.mark_superseded(
-                campaign,
-                report.proposed_state.phase.value,
-                int(report.proposed_state.iteration),
-                "reconcile_apply_retry",
+    try:
+        _publish_reconcile_intent_transitions(
+            campaign,
+            resolved_intents,
+            report.proposed_state,
+        )
+    except Exception as exc:
+        reason = (
+            "recovered state committed, but intent publication remains incomplete: "
+            + type(exc).__name__
+            + ": "
+            + str(exc)
+        )
+        _fail_reconcile_transaction(transaction, reason)
+        print(reason, file=sys.stderr)
+        print(
+            "The committed state and current pointers are coherent. Rerun "
+            "reconcile --apply to finish the recorded intent transaction.",
+            file=sys.stderr,
+        )
+        return 9
+    try:
+        applied_proposal_path = _rename_existing_timestamped(target, ".applied-")
+    except Exception as exc:
+        applied_proposal_path = None
+        if transaction is not None:
+            transaction.add_warning(
+                "could not archive applied proposal: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)
             )
-    applied_proposal_path = _rename_existing_timestamped(target, ".applied-")
     try:
         from .daemon.journal import append_event
 
@@ -5798,6 +6061,18 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         )
     except Exception:
         pass
+    if transaction is not None:
+        try:
+            transaction.set_status("COMMITTED")
+        except Exception as exc:
+            print(
+                "warning: reconcile committed, but its transaction receipt "
+                "could not be sealed: "
+                + type(exc).__name__
+                + ": "
+                + str(exc),
+                file=sys.stderr,
+            )
     final_contract_status = recovery_contract_status(campaign, report.proposed_state)
     _print_reconcile_applied_operator_report(
         campaign,

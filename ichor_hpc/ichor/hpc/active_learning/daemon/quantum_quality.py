@@ -12,10 +12,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from .state import atomic_write_json
+from ..strict_json import load_path
 
 
 QUANTUM_QUALITY_MANIFEST = "quantum_quality.json"
-QUANTUM_QUALITY_SCHEMA_VERSION = 1
+QUANTUM_QUALITY_SCHEMA_VERSION = 2
 SUPPORTED_AIMALL_METHODS = frozenset({"HF", "M062X", "B3LYP", "PBE", "PBE0"})
 
 
@@ -243,3 +244,112 @@ def write_quantum_quality_manifest(
     path = staging / QUANTUM_QUALITY_MANIFEST
     atomic_write_json(path, payload)
     return path
+
+
+def read_quantum_quality_manifest(
+    staging_dir: Path,
+    *,
+    expected_phase: str,
+    expected_iteration: int,
+    expected_pointdirs: Optional[Sequence[str]] = None,
+    expected_method: Optional[str] = None,
+    manifest_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Read quality evidence and bind every record to one staged pointdir."""
+    path = (
+        Path(manifest_path)
+        if manifest_path is not None
+        else Path(staging_dir) / QUANTUM_QUALITY_MANIFEST
+    )
+    try:
+        data = load_path(path)
+    except (OSError, ValueError) as exc:
+        raise ValueError("quantum quality manifest is unreadable: " + str(path)) from exc
+    if not isinstance(data, dict):
+        raise ValueError("quantum quality manifest must be a JSON object")
+    for key in ("schema_version", "iteration", "n_total", "n_accepted", "n_rejected"):
+        value = data.get(key)
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError("quantum quality " + key + " must be an exact integer")
+    if data["schema_version"] != QUANTUM_QUALITY_SCHEMA_VERSION:
+        raise ValueError("unsupported quantum quality manifest schema")
+    if data.get("phase") != str(expected_phase):
+        raise ValueError("quantum quality phase mismatch")
+    if data["iteration"] != int(expected_iteration):
+        raise ValueError("quantum quality iteration mismatch")
+    records = data.get("records")
+    if not isinstance(records, list):
+        raise ValueError("quantum quality records must be a list")
+    expected_names = None if expected_pointdirs is None else {str(value) for value in expected_pointdirs}
+    seen = set()
+    accepted_count = 0
+    canonical_method = (
+        None if expected_method is None else canonicalise_aimall_method(expected_method)
+    )
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("quantum quality record must be an object")
+        name = record.get("pointdir")
+        if not isinstance(name, str) or Path(name).name != name or not name:
+            raise ValueError("quantum quality pointdir name is invalid")
+        if name in seen:
+            raise ValueError("duplicate quantum quality pointdir: " + name)
+        seen.add(name)
+        accepted = record.get("accepted")
+        if not isinstance(accepted, bool):
+            raise ValueError("quantum quality accepted must be a boolean")
+        reasons = record.get("reasons")
+        if not isinstance(reasons, list) or any(
+            not isinstance(reason, str) or not reason for reason in reasons
+        ):
+            raise ValueError("quantum quality reasons must be non-empty strings")
+        if accepted == bool(reasons):
+            raise ValueError("quantum quality accepted/reasons are contradictory")
+        if accepted:
+            accepted_count += 1
+            atom_count = record.get("atom_count")
+            n_int = record.get("n_int")
+            if (
+                not isinstance(atom_count, int)
+                or isinstance(atom_count, bool)
+                or atom_count <= 0
+                or not isinstance(n_int, int)
+                or isinstance(n_int, bool)
+                or n_int != atom_count
+            ):
+                raise ValueError("accepted quantum quality atom/INT counts are invalid")
+            per_atom = record.get("per_atom")
+            if not isinstance(per_atom, list) or len(per_atom) != atom_count:
+                raise ValueError("accepted quantum quality per_atom count is invalid")
+            atom_names = set()
+            for atom in per_atom:
+                if not isinstance(atom, dict):
+                    raise ValueError("quantum quality per_atom entry must be an object")
+                atom_name = atom.get("atom")
+                if not isinstance(atom_name, str) or not atom_name or atom_name in atom_names:
+                    raise ValueError("quantum quality atom identity is invalid")
+                atom_names.add(atom_name)
+                for numeric in ("iqa_ha", "integration_error"):
+                    if _finite_float(atom.get(numeric)) is None:
+                        raise ValueError("accepted quantum quality " + numeric + " is non-finite")
+                if canonical_method is not None and atom.get("canonical_dft_model") != canonical_method:
+                    raise ValueError("quantum quality DFT model mismatch")
+    if expected_names is not None and seen != expected_names:
+        raise ValueError("quantum quality pointdir membership mismatch")
+    if data["n_total"] != len(records):
+        raise ValueError("quantum quality n_total mismatch")
+    if data["n_accepted"] != accepted_count:
+        raise ValueError("quantum quality n_accepted mismatch")
+    if data["n_rejected"] != len(records) - accepted_count:
+        raise ValueError("quantum quality n_rejected mismatch")
+    return data
+
+
+__all__ = [
+    "QUANTUM_QUALITY_MANIFEST",
+    "QUANTUM_QUALITY_SCHEMA_VERSION",
+    "canonicalise_aimall_method",
+    "evaluate_aimall_pointdir",
+    "read_quantum_quality_manifest",
+    "write_quantum_quality_manifest",
+]

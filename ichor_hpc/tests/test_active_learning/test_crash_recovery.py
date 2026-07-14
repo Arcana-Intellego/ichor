@@ -487,7 +487,14 @@ def test_from_dict_rejects_malformed_reference_scales():
 
 def test_from_dict_accepts_valid_reference_scales():
     base = CampaignState().to_dict()
-    for good in (None, {}, {"energy": 1.0, "force": 2}):
+    complete = {
+        "energy": 1.0,
+        "force": 2.0,
+        "omega": 3.0,
+        "anh": 4.0,
+        "anh_std": 5.0,
+    }
+    for good in (None, complete):
         payload = dict(base)
         payload["reference_scales"] = good
         CampaignState.from_dict(payload)  # must not raise
@@ -543,6 +550,14 @@ def test_submission_attempt_identity_changes_across_replacement_rounds(tmp_path)
         phase_name="REPLACEMENT_GAUSSIAN",
         iteration=3,
         replacement_round=1,
+    )
+    from ichor.hpc.active_learning.daemon.submission_intent import mark_failed
+
+    mark_failed(
+        tmp_path,
+        "REPLACEMENT_GAUSSIAN",
+        3,
+        "first replacement attempt completed unsuccessfully",
     )
     second = write_pre_submit_intent(
         tmp_path,

@@ -172,7 +172,7 @@ def test_write_quantum_quality_manifest_summarises_records(tmp_path):
 
     assert path.name == QUANTUM_QUALITY_MANIFEST
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["n_total"] == 2
     assert payload["n_accepted"] == 1
     assert payload["n_rejected"] == 1

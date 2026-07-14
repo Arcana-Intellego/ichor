@@ -90,6 +90,69 @@ class PhaseResult:
     submission_metadata: Dict[str, Any] = field(default_factory=dict)
     next_phase_override: Optional[str] = None
 
+    def validate(self, *, stage: str, phase_name: str) -> "PhaseResult":
+        """Validate one mutually exclusive executor outcome."""
+        if stage not in {"submit", "postprocess"}:
+            raise ValueError("PhaseResult stage must be submit or postprocess")
+        if not isinstance(self.is_complete, bool):
+            raise ValueError("PhaseResult.is_complete must be a boolean")
+        if self.submitted_job_id is not None and (
+            not isinstance(self.submitted_job_id, str) or not self.submitted_job_id
+        ):
+            raise ValueError("PhaseResult.submitted_job_id must be a non-empty string")
+        if self.is_complete and self.submitted_job_id is not None:
+            raise ValueError("completed PhaseResult cannot also submit a job")
+        if not self.is_complete and self.submitted_job_id is None:
+            raise ValueError("incomplete PhaseResult must contain a submitted job ID")
+        if not self.is_complete and self.failure_reason is not None:
+            raise ValueError("incomplete PhaseResult cannot contain failure_reason")
+        if self.failure_reason is not None and (
+            not isinstance(self.failure_reason, str) or not self.failure_reason.strip()
+        ):
+            raise ValueError("PhaseResult.failure_reason must be a non-empty string")
+        if self.expected_tasks is not None and (
+            not isinstance(self.expected_tasks, int)
+            or isinstance(self.expected_tasks, bool)
+            or self.expected_tasks <= 0
+        ):
+            raise ValueError("PhaseResult.expected_tasks must be a positive integer")
+        if self.submitted_job_id is None and self.expected_tasks is not None:
+            raise ValueError("PhaseResult.expected_tasks requires a submitted job")
+        if not isinstance(self.state_updates, dict):
+            raise ValueError("PhaseResult.state_updates must be an object")
+        if not self.is_complete and self.state_updates:
+            raise ValueError("submitted PhaseResult cannot contain state updates")
+        if not isinstance(self.submission_metadata, dict):
+            raise ValueError("PhaseResult.submission_metadata must be an object")
+        if self.submitted_job_id is None and self.submission_metadata:
+            raise ValueError("PhaseResult submission metadata requires a submitted job")
+        if not isinstance(self.journal_events, list) or any(
+            not isinstance(event, dict) for event in self.journal_events
+        ):
+            raise ValueError("PhaseResult.journal_events must be a list of objects")
+        if self.next_phase_override is not None:
+            if not self.is_complete:
+                raise ValueError("next_phase_override requires a completed PhaseResult")
+            from .state import CampaignPhase
+
+            try:
+                CampaignPhase(self.next_phase_override)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("PhaseResult next_phase_override is unknown") from exc
+        if stage == "postprocess" and self.submitted_job_id is not None:
+            raise ValueError("postprocess PhaseResult cannot submit another job")
+        if stage == "postprocess" and not self.is_complete:
+            raise ValueError("postprocess PhaseResult must be complete")
+        completion_reason = self.state_updates.get("campaign_completion_reason")
+        if completion_reason is not None:
+            if str(phase_name) != "STOP_CHECK":
+                raise ValueError(
+                    "campaign_completion_reason is valid only for STOP_CHECK"
+                )
+            if not isinstance(completion_reason, str) or not completion_reason.strip():
+                raise ValueError("campaign_completion_reason must be a non-empty string")
+        return self
+
 
 class PhaseExecutor(Protocol):
     """Structural type for daemon phase executors."""
@@ -171,4 +234,3 @@ class MockPhaseExecutor:
     def operations(self) -> List[str]:
         """Compact list of (operation, phase) pairs for assertions."""
         return [c.operation + ":" + c.phase for c in self.calls]
-

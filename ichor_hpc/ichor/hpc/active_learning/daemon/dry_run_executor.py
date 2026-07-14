@@ -2703,7 +2703,7 @@ class DryRunPhaseExecutor:
 
             records = [
                 {
-                    "pointdir": staging_pointdir_name(i),
+                    "pointdir": point_dir.name,
                     "accepted": True,
                     "reasons": [],
                     "atom_count": 1,
@@ -2715,13 +2715,15 @@ class DryRunPhaseExecutor:
                     "per_atom": [
                         {
                             "atom": "X1",
+                            "dft_model": str(self.config.gaussian.method),
+                            "canonical_dft_model": str(self.config.gaussian.method),
                             "iqa_ha": -1.0,
                             "integration_error": 0.0,
                             "reasons": [],
                         }
                     ],
                 }
-                for i in range(n_points)
+                for point_dir in pointdirs
             ]
             manifest = write_quantum_quality_manifest(
                 staging_root,
@@ -2747,6 +2749,7 @@ class DryRunPhaseExecutor:
                 staging_dir=staging_root,
                 gaussian_phase=gaussian_phase,
                 aimall_phase=phase_name,
+                expected_method=str(self.config.gaussian.method),
             )
             if not initial and bool(getattr(self.config.error_calibration, "enabled", True)):
                 from .error_calibration import (

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import os
 import copy
+import inspect
 from ..strict_json import strict_json as json
 import signal
 import socket
@@ -951,8 +952,6 @@ class Daemon:
             replayable_completion_receipts,
             validate_completion_reference,
         )
-        from .config_lock import canonical_config, config_fingerprint
-
         reference = getattr(state, "last_completion_receipt", None)
         if isinstance(reference, dict):
             try:
@@ -997,12 +996,10 @@ class Daemon:
                         completion_receipt=dict(reference),
                     )
 
-        config_sha = config_fingerprint(canonical_config(self.config))
         try:
             matches = replayable_completion_receipts(
                 self.campaign_dir,
                 state,
-                expected_config_sha256=config_sha,
             )
         except CompletionReceiptError as exc:
             return self._halt(
@@ -1257,6 +1254,22 @@ class Daemon:
                 )
                 if accounted is not None:
                     return accounted
+            if active_job_id is not None and self.job_liveness_checker is None:
+                accounted = self._adopt_accounted_intent_job(
+                    state,
+                    phase,
+                    active_intent,
+                    str(active_job_id),
+                )
+                if accounted is not None:
+                    return accounted
+                return self._halt_scheduler_uncertain(
+                    state,
+                    phase,
+                    "active_submission_liveness_unavailable: "
+                    + str(active_job_id)
+                    + "; refusing to supersede without scheduler evidence",
+                )
             try:
                 _submission_intent.mark_superseded(
                     self.campaign_dir,
@@ -1299,6 +1312,7 @@ class Daemon:
                 )
         try:
             result = self.executor.submit_or_run(state, phase)
+            result.validate(stage="submit", phase_name=phase_name)
         except BackendSubmissionError as exc:
             #a backend submission (sbatch) failed outright. halt cleanly so an
             #operator can look, instead of letting it bubble up and take the
@@ -1418,14 +1432,25 @@ class Daemon:
         *,
         expected_task_count: Optional[int] = None,
     ) -> Sequence[JobObservation]:
-        """Poll sacct, passing expected array size to compatible test pollers."""
+        """Poll sacct without masking a TypeError raised inside the poller."""
         try:
+            signature = inspect.signature(self.sacct_poller)
+        except (TypeError, ValueError):
+            accepts_expected = True
+        else:
+            accepts_expected = (
+                "expected_task_count" in signature.parameters
+                or any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in signature.parameters.values()
+                )
+            )
+        if accepts_expected:
             return self.sacct_poller(
                 str(job_id),
                 expected_task_count=expected_task_count,
             )
-        except TypeError:
-            return self.sacct_poller(str(job_id))
+        return self.sacct_poller(str(job_id))
 
     def _adopt_accounted_intent_job(
         self,
@@ -2183,6 +2208,7 @@ class Daemon:
         for attempt in range(attempts):
             try:
                 result = self.executor.postprocess(state, phase, observations)
+                result.validate(stage="postprocess", phase_name=phase.value)
             except Exception as exc:
                 reason = "postprocess_exception: " + type(exc).__name__ + ": " + str(exc)[:180]
                 if attempt + 1 < attempts and self._looks_like_file_settle(reason):
@@ -2322,6 +2348,39 @@ class Daemon:
         )
         return TickStatus.ADVANCED
 
+    def _logical_failure_task_ids(
+        self,
+        state: CampaignState,
+        phase: CampaignPhase,
+        dense_indices: Sequence[int],
+    ) -> List[int]:
+        """Translate scheduler array indexes through the immutable attempt map."""
+        intent = _submission_intent.load_intent(
+            self.campaign_dir,
+            phase.value,
+            int(state.iteration),
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+        metadata = intent.get("submission_metadata") if isinstance(intent, dict) else None
+        bundle_raw = metadata.get("script_bundle") if isinstance(metadata, dict) else None
+        if not isinstance(bundle_raw, str) or not bundle_raw:
+            return [int(value) for value in dense_indices]
+        map_path = Path(bundle_raw) / "array_task_map.json"
+        if not map_path.is_file():
+            return [int(value) for value in dense_indices]
+        from .script_bundles import read_array_task_map
+
+        mapping = list(read_array_task_map(map_path))
+        translated = []
+        for dense in dense_indices:
+            index = int(dense)
+            if index < 0 or index >= len(mapping):
+                raise ValueError(
+                    "scheduler failure index is outside the immutable array map"
+                )
+            translated.append(int(mapping[index]))
+        return translated
+
     def _handle_failure(
         self,
         state: CampaignState,
@@ -2333,12 +2392,19 @@ class Daemon:
             return self._retry_transient_phase(state, phase, observations, summary)
 
         action = self.executor.handle_failure(state, phase, observations)
+        dense_failure_indices = list(summary.failure_indices)
+        logical_failure_task_ids = self._logical_failure_task_ids(
+            state,
+            phase,
+            dense_failure_indices,
+        )
         self._journal(
             "failure_action",
             phase=phase.value,
             iteration=state.iteration,
             action=str(action.value if hasattr(action, "value") else action),
-            failure_indices=list(summary.failure_indices),
+            dense_failure_indices=dense_failure_indices,
+            logical_failure_task_ids=logical_failure_task_ids,
             n_tasks=summary.n_tasks,
             n_completed=summary.n_completed,
             n_failed=summary.n_failed,
@@ -2697,13 +2763,20 @@ class Daemon:
             str(obs.status.value if hasattr(obs.status, "value") else obs.status)
             for obs in observations
         ]
+        dense_failure_indices = list(summary.failure_indices)
+        logical_failure_task_ids = self._logical_failure_task_ids(
+            state,
+            phase,
+            dense_failure_indices,
+        )
         self._journal(
             "transient_phase_retry",
             phase=phase.value,
             iteration=state.iteration,
             attempt=int(attempt),
             statuses=statuses,
-            failure_indices=list(summary.failure_indices),
+            dense_failure_indices=dense_failure_indices,
+            logical_failure_task_ids=logical_failure_task_ids,
         )
         return TickStatus.RETRYING
 
@@ -2939,6 +3012,20 @@ class Daemon:
             if key != "campaign_completion_reason"
         }
         if completion_reason is not None:
+            if phase is not CampaignPhase.STOP_CHECK:
+                self._journal(
+                    "phase_output_contract_invalid",
+                    phase=phase.value,
+                    iteration=int(state.iteration),
+                    reason="campaign_completion_reason is valid only for STOP_CHECK",
+                )
+                self._halt(
+                    state,
+                    phase,
+                    "phase_output_contract_invalid: campaign_completion_reason "
+                    "is valid only for STOP_CHECK",
+                )
+                return False
             before = self._authoritative_state_before_transition(state)
             after = copy.deepcopy(state)
             self._apply_state_updates(after, applied_updates)
@@ -3304,7 +3391,7 @@ class Daemon:
                 reason_code="operator_stop_boundary_reached",
                 message="operator stop boundary reached: " + str(reason),
                 from_phase=phase,
-                iteration=int(before.iteration),
+                iteration=int(after.iteration),
                 source="daemon_stop_control",
                 scheduler_uncertain=any(
                     bool(value) for value in after.pending_jobs.values()
@@ -3358,6 +3445,15 @@ class Daemon:
             after=after,
             phase=phase,
         )
+        try:
+            after = CampaignState.from_dict(after.to_dict())
+        except Exception as exc:
+            raise ValueError(
+                "prospective campaign state is invalid: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)
+            ) from exc
         if not bool(
             getattr(
                 self.executor,
@@ -3374,13 +3470,20 @@ class Daemon:
             # fail-closed evidence contract used by live execution.
             evidence_paths = [path for path in evidence_paths if path.exists()]
         evidence = evidence_records(self.campaign_dir, evidence_paths)
+        receipt_config_sha = config_fingerprint(canonical_config(self.config))
+        if intent is not None:
+            decision_contract = intent.get("decision_contract")
+            if isinstance(decision_contract, Mapping):
+                snapshotted = decision_contract.get("config_sha256")
+                if isinstance(snapshotted, str) and snapshotted:
+                    receipt_config_sha = snapshotted
         receipt_path = write_completion_receipt(
             self.campaign_dir,
             campaign_uid=str(before.campaign_uid),
             phase=phase.value,
             iteration=int(before.iteration),
             replacement_round=int(getattr(before, "replacement_round", 0)),
-            config_sha256=config_fingerprint(canonical_config(self.config)),
+            config_sha256=receipt_config_sha,
             state_before=before,
             state_after=after,
             next_phase=next_phase.value,
@@ -3406,23 +3509,34 @@ class Daemon:
         if stop_request is not None and stop_reason is not None:
             from .stop_control import complete_stop_request
 
-            complete_stop_request(
-                self.campaign_dir,
-                str(stop_request.get("request_id")),
-                reason=str(stop_reason),
-                completion_receipt=after.last_completion_receipt,
-            )
-            self._journal(
-                "operator_stop_boundary_reached",
-                request_id=str(stop_request.get("request_id")),
-                mode=str(stop_request.get("mode")),
-                phase=phase.value,
-                iteration=int(before.iteration),
-                resulting_phase=after.phase.value,
-                resulting_iteration=int(after.iteration),
-                reason=str(stop_reason),
-                completion_receipt=dict(after.last_completion_receipt or {}),
-            )
+            try:
+                complete_stop_request(
+                    self.campaign_dir,
+                    str(stop_request.get("request_id")),
+                    reason=str(stop_reason),
+                    completion_receipt=after.last_completion_receipt,
+                )
+            except Exception as exc:
+                self._journal(
+                    "stop_request_completion_deferred",
+                    request_id=str(stop_request.get("request_id")),
+                    phase=phase.value,
+                    iteration=int(before.iteration),
+                    error=type(exc).__name__ + ": " + str(exc)[:180],
+                    completion_receipt=dict(after.last_completion_receipt or {}),
+                )
+            else:
+                self._journal(
+                    "operator_stop_boundary_reached",
+                    request_id=str(stop_request.get("request_id")),
+                    mode=str(stop_request.get("mode")),
+                    phase=phase.value,
+                    iteration=int(before.iteration),
+                    resulting_phase=after.phase.value,
+                    resulting_iteration=int(after.iteration),
+                    reason=str(stop_reason),
+                    completion_receipt=dict(after.last_completion_receipt or {}),
+                )
 
     def _apply_state_updates(self, state: CampaignState, updates: Dict[str, Any]) -> None:
         if not updates:

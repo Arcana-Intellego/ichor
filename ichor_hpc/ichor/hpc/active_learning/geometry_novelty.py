@@ -329,7 +329,7 @@ def _ariadne_movement_history_values(
 ) -> Tuple[List[float], Dict[str, Any]]:
     if int(window) <= 0 or int(iteration) <= 1:
         return [], {"n_history_files": 0}
-    from .handoff_manifests import ariadne_landing_audit_path, ariadne_results_path
+    from .historical_ariadne import read_historical_ariadne_records
     from .layout import active_iteration_dir
 
     start = max(1, int(iteration) - int(window))
@@ -342,42 +342,13 @@ def _ariadne_movement_history_values(
     n_skipped_nonfinite = 0
     for previous in range(start, int(iteration)):
         iter_dir = active_iteration_dir(campaign_dir, previous)
-        audit_path = ariadne_landing_audit_path(iter_dir)
-        results_path = ariadne_results_path(iter_dir)
-        source_records = None
-        source_kind = None
-        try:
-            if audit_path.is_file():
-                payload = json.loads(audit_path.read_text(encoding="utf-8"))
-                if isinstance(payload, dict):
-                    source_records = payload.get("seeds")
-                    source_kind = "audit"
-                    n_audit_files += 1
-            elif results_path.is_file():
-                payload = json.loads(results_path.read_text(encoding="utf-8"))
-                if isinstance(payload, dict):
-                    source_records = payload.get("accepted")
-                    source_kind = "results"
-                    n_results_files += 1
-        except Exception:
-            continue
-        if source_records is None:
-            continue
+        source_records = read_historical_ariadne_records(
+            iter_dir,
+            expected_iteration=previous,
+        )
         new_values, diag = _movement_values_from_records(source_records)
-        if not new_values and source_kind == "audit" and results_path.is_file():
-            try:
-                payload = json.loads(results_path.read_text(encoding="utf-8"))
-            except Exception:
-                payload = None
-            if isinstance(payload, dict):
-                fallback_values, fallback_diag = _movement_values_from_records(
-                    payload.get("accepted")
-                )
-                if fallback_values:
-                    new_values = fallback_values
-                    diag = fallback_diag
-                    source_kind = "results"
-                    n_results_files += 1
+        n_audit_files += 1
+        n_results_files += 1
         values.extend(new_values)
         n_skipped_handoff_rejected += int(
             diag.get("n_skipped_handoff_rejected", 0)
@@ -385,14 +356,7 @@ def _ariadne_movement_history_values(
         n_skipped_rejected += int(diag.get("n_skipped_rejected", 0))
         n_skipped_nonfinite += int(diag.get("n_skipped_nonfinite", 0))
         n_files += 1
-    if n_audit_files and n_results_files:
-        source = "mixed"
-    elif n_audit_files:
-        source = "ariadne_landing_audit"
-    elif n_results_files:
-        source = "ariadne_results"
-    else:
-        source = "none"
+    source = "strict_ariadne_results_and_landing_audit" if n_files else "none"
     return values, {
         "source": source,
         "n_history_files": int(n_files),

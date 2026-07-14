@@ -212,20 +212,17 @@ def test_state_is_terminal_flag():
 # --- M15 F3: schema bump + new state fields ----------------------------
 
 
-def test_schema_version_is_seven():
+def test_schema_version_is_eight():
     from ichor.hpc.active_learning.daemon.state import SCHEMA_VERSION
-    assert SCHEMA_VERSION == 7
+    assert SCHEMA_VERSION == 8
 
 
-def test_schema_six_payload_is_upgraded_on_read():
+def test_old_schema_payload_is_rejected_on_read():
     payload = CampaignState().to_dict()
     payload["schema_version"] = 6
 
-    loaded = CampaignState.from_dict(payload)
-
-    assert loaded.schema_version == 7
-    assert loaded.lifecycle_context is None
-    assert loaded.last_completion_receipt is None
+    with pytest.raises(StateSchemaError, match="unsupported state.json schema_version"):
+        CampaignState.from_dict(payload)
 
 
 def test_lifecycle_context_roundtrip_for_halt():

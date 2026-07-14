@@ -393,6 +393,13 @@ def _install_pending_array_state(d: Daemon, *, phase=CampaignPhase.INITIAL_AIMAL
     state.phase = phase
     state.pending_jobs[phase.value] = "777"
     write_state(d.state_path(), state)
+    submission_intent.write_pre_submit_intent(
+        d.campaign_dir,
+        campaign_uid=state.campaign_uid,
+        phase_name=phase.value,
+        iteration=0,
+        expected_tasks=5,
+    )
     submission_intent.mark_submitted(
         d.campaign_dir,
         phase.value,
@@ -981,6 +988,14 @@ def test_required_ferebus_output_missing_after_success_halts_at_producer(tmp_pat
     state.phase = CampaignPhase.INITIAL_FEREBUS
     state.pending_jobs[CampaignPhase.INITIAL_FEREBUS.value] = "16177329"
     write_state(d.state_path(), state)
+    submission_intent.write_pre_submit_intent(
+        d.campaign_dir,
+        campaign_uid=state.campaign_uid,
+        phase_name=CampaignPhase.INITIAL_FEREBUS.value,
+        iteration=0,
+        expected_tasks=1,
+        decision_contract=d._submission_decision_contract(),
+    )
     submission_intent.mark_submitted(
         d.campaign_dir,
         CampaignPhase.INITIAL_FEREBUS.value,

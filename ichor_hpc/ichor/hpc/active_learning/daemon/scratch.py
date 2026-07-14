@@ -6,6 +6,7 @@ from ..strict_json import strict_json as json
 import os
 import stat
 import shutil
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
@@ -14,7 +15,8 @@ from .script_bundles import backend_name, campaign_owned_path
 from .state import atomic_write_json
 
 
-SCRATCH_TASK_SCHEMA_VERSION = 1
+SCRATCH_TASK_SCHEMA_VERSION = 2
+_SCRATCH_STATUSES = frozenset({"prepared", "failed_retained", "completed"})
 
 
 def scratch_root(campaign_dir: Union[str, Path]) -> Path:
@@ -205,7 +207,11 @@ def finish_task_scratch(path: Union[str, Path], *, success: bool) -> None:
         payload = json.loads(task_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise ValueError("scratch TASK.json is unreadable: " + str(task_path)) from exc
-    if not isinstance(payload, dict) or int(payload.get("schema_version", -1)) != 1:
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != SCRATCH_TASK_SCHEMA_VERSION
+        or isinstance(payload.get("schema_version"), bool)
+    ):
         raise ValueError("scratch TASK.json has an unsupported schema")
     campaign_value = payload.get("campaign_dir")
     if not isinstance(campaign_value, str) or not campaign_value:
@@ -250,7 +256,11 @@ def _task_record(campaign: Path, root: Path, task_path: Path) -> Dict[str, Any]:
         payload = json.loads(task_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return _invalid(task_path, "TASK.json is unreadable")
-    if not isinstance(payload, dict) or int(payload.get("schema_version", -1)) != 1:
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != SCRATCH_TASK_SCHEMA_VERSION
+        or isinstance(payload.get("schema_version"), bool)
+    ):
         return _invalid(task_path, "TASK.json schema is invalid")
     required_text = (
         "campaign_dir",
@@ -264,11 +274,38 @@ def _task_record(campaign: Path, root: Path, task_path: Path) -> Dict[str, Any]:
     )
     if any(not isinstance(payload.get(key), str) or not payload.get(key) for key in required_text):
         return _invalid(task_path, "TASK.json ownership metadata is incomplete")
-    try:
-        parsed_iteration = int(payload.get("iteration"))
-        parsed_task = int(payload.get("array_task_id"))
-    except (TypeError, ValueError):
+    if any(
+        isinstance(payload.get(key), bool) or not isinstance(payload.get(key), int)
+        for key in ("iteration", "array_task_id")
+    ):
         return _invalid(task_path, "TASK.json numeric ownership metadata is malformed")
+    parsed_iteration = int(payload["iteration"])
+    parsed_task = int(payload["array_task_id"])
+    if parsed_iteration < 0 or parsed_task < 0:
+        return _invalid(task_path, "TASK.json numeric ownership metadata is negative")
+    status = payload.get("status")
+    if status not in _SCRATCH_STATUSES:
+        return _invalid(task_path, "TASK.json status is invalid")
+    for timestamp_key in ("created_at_iso", "finished_at_iso"):
+        value = payload.get(timestamp_key)
+        if timestamp_key == "finished_at_iso" and status == "prepared":
+            if value is not None:
+                return _invalid(task_path, "prepared TASK.json has a finished timestamp")
+            continue
+        if timestamp_key == "finished_at_iso" and status != "prepared" and value is None:
+            return _invalid(task_path, "finished TASK.json lacks a finished timestamp")
+        if value is None:
+            return _invalid(task_path, "TASK.json lacks " + timestamp_key)
+        try:
+            parsed_timestamp = datetime.fromisoformat(str(value))
+        except ValueError:
+            return _invalid(task_path, "TASK.json timestamp is malformed")
+        if parsed_timestamp.tzinfo is None or parsed_timestamp.utcoffset() is None:
+            return _invalid(task_path, "TASK.json timestamp lacks a timezone")
+    try:
+        _safe_token(payload["campaign_uid"], "TASK.json campaign UID")
+    except ValueError:
+        return _invalid(task_path, "TASK.json campaign UID is invalid")
     try:
         expected_backend = backend_name(str(payload["phase"]))
     except ValueError as exc:
@@ -336,6 +373,8 @@ def inventory(campaign_dir: Union[str, Path]) -> List[Dict[str, Any]]:
     task_directories: List[Path] = []
     for current, directory_names, file_names in os.walk(root, topdown=True, followlinks=False):
         directory = Path(current)
+        relative = directory.relative_to(root)
+        depth = len(relative.parts)
         safe_directories: List[str] = []
         for name in directory_names:
             child = directory / name
@@ -343,13 +382,33 @@ def inventory(campaign_dir: Union[str, Path]) -> List[Dict[str, Any]]:
                 records.append(_invalid(child, "scratch hierarchy contains a symlink"))
             else:
                 safe_directories.append(name)
-                if name.startswith("task-"):
+                child_depth = depth + 1
+                valid_component = True
+                if child_depth == 1:
+                    valid_component = name in {"POLUS", "GAUSSIAN", "AIMALL", "ARIADNE", "FEREBUS"}
+                elif child_depth == 2:
+                    valid_component = bool(re.fullmatch(r"[A-Z][A-Z0-9_]*", name))
+                elif child_depth == 3:
+                    valid_component = bool(re.fullmatch(r"iteration-[0-9]{6}", name))
+                elif child_depth == 4:
+                    valid_component = bool(re.fullmatch(r"[A-Za-z0-9_.-]+", name))
+                elif child_depth == 5:
+                    valid_component = bool(re.fullmatch(r"job-[A-Za-z0-9_.-]+", name))
+                elif child_depth == 6:
+                    valid_component = bool(re.fullmatch(r"task-[0-9]+", name))
+                if child_depth <= 6 and not valid_component:
+                    records.append(_invalid(child, "scratch hierarchy component is malformed"))
+                    safe_directories.remove(name)
+                    continue
+                if child_depth == 6:
                     task_directories.append(child)
         directory_names[:] = safe_directories
         for name in file_names:
             child = directory / name
             if child.is_symlink():
                 records.append(_invalid(child, "scratch hierarchy contains a symlink"))
+            elif depth < 6:
+                records.append(_invalid(child, "scratch file exists outside a task directory"))
     for leaf in sorted(task_directories):
         task = leaf / "TASK.json"
         if task.is_symlink() or not task.is_file():

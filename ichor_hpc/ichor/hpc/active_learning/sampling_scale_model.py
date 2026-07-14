@@ -153,55 +153,32 @@ def _accepted_history_records_for_iteration(
         "n_fallback_results_records_used": 0,
     }
     accepted: List[Tuple[Path, Dict[str, Any], str]] = []
-    from .handoff_manifests import ariadne_landing_audit_path, ariadne_results_path
+    from .historical_ariadne import read_historical_ariadne_records
+    from .handoff_manifests import HandoffManifestError
 
-    audit = _json(ariadne_landing_audit_path(iter_dir))
-    if isinstance(audit, dict):
-        for record in audit.get("seeds") or []:
-            if not isinstance(record, dict):
-                counts["n_seen"] += 1
-                counts["n_audit_records_seen"] += 1
-                counts["n_skipped_malformed_record"] += 1
-                continue
-            counts["n_seen"] += 1
-            counts["n_audit_records_seen"] += 1
-            reason = _history_skip_reason(record, source="audit")
-            if reason is not None:
-                counts[reason] += 1
-                continue
-            accepted.append((iter_dir, record, "audit"))
+    iteration = int(Path(iter_dir).name.split("-")[-1])
+    try:
+        records = read_historical_ariadne_records(
+            iter_dir,
+            expected_iteration=iteration,
+        )
+    except (FileNotFoundError, HandoffManifestError, ValueError):
+        counts["n_skipped_malformed_record"] += 1
+        return [], counts
+    for record in records:
+        counts["n_seen"] += 1
+        counts["n_audit_records_seen"] += 1
+        counts["n_results_records_seen"] += 1
+        reason = _history_skip_reason(record, source="audit")
+        if reason is not None:
+            counts[reason] += 1
+            continue
+        accepted.append((iter_dir, record, "strict_audit_and_results"))
+    counts["n_used"] = len(accepted)
+    counts["n_audit_records_used"] = len(accepted)
+    counts["n_results_records_used"] = len(accepted)
     if accepted:
-        counts["n_used"] += len(accepted)
-        counts["n_audit_records_used"] += len(accepted)
         return accepted, counts
-
-    results = _json(ariadne_results_path(iter_dir))
-    if isinstance(results, dict):
-        fallback: List[Tuple[Path, Dict[str, Any], str]] = []
-        seen_keys = set()
-        for record in results.get("accepted") or []:
-            if not isinstance(record, dict):
-                counts["n_seen"] += 1
-                counts["n_results_records_seen"] += 1
-                counts["n_skipped_malformed_record"] += 1
-                continue
-            key = str(record.get("result_json") or record.get("seed_dir") or record.get("seed_id") or len(seen_keys))
-            if key in seen_keys:
-                counts["n_deduplicated_fallback_records"] += 1
-                continue
-            seen_keys.add(key)
-            counts["n_seen"] += 1
-            counts["n_results_records_seen"] += 1
-            reason = _history_skip_reason(record, source="results")
-            if reason is not None:
-                counts[reason] += 1
-                continue
-            fallback.append((iter_dir, record, "results"))
-        if fallback:
-            counts["n_used"] += len(fallback)
-            counts["n_results_records_used"] += len(fallback)
-            counts["n_fallback_results_records_used"] += len(fallback)
-            return fallback, counts
     return [], counts
 
 
@@ -210,18 +187,18 @@ def _result_path(iter_dir: Path, record: Dict[str, Any]) -> Optional[Path]:
 
     root = active_ariadne_dir(iter_dir)
     raw = record.get("result_json")
-    if raw:
-        path = Path(str(raw))
-        if not path.is_absolute():
-            path = root / path
-        return path
-    seed_dir = record.get("seed_dir")
-    if seed_dir:
-        path = Path(str(seed_dir))
-        if not path.is_absolute():
-            path = root / path
-        return path / "result.json"
-    return None
+    if not isinstance(raw, str) or not raw:
+        return None
+    path = Path(raw)
+    candidate = path if path.is_absolute() else root / path
+    if candidate.is_symlink() or not candidate.is_file():
+        return None
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(root.resolve())
+    except ValueError:
+        return None
+    return resolved
 
 
 def _coords(payload: Dict[str, Any], *names: str) -> Optional[List[List[float]]]:
@@ -306,6 +283,8 @@ def _collect_history(
     if int(iteration) > 0 and int(window) > 0:
         for previous in range(start, int(iteration)):
             iter_dir = active_iteration_dir(campaign_dir, previous)
+            if not iter_dir.exists():
+                continue
             records, counts = _accepted_history_records_for_iteration(iter_dir)
             accepted_history.extend(records)
             for key in history_filter:

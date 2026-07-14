@@ -2358,11 +2358,42 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     "no_pointdirs_in_staging: " + str(staging_root)
                 ),
             )
+        try:
+            point_names = _stg._points_file_names(staging_root)
+        except Exception as exc:
+            return PhaseResult(
+                is_complete=True,
+                failure_reason=(
+                    "quantum_task_membership_invalid: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)[:180]
+                ),
+            )
+        task_id_by_name = {name: index for index, name in enumerate(point_names)}
+
+        def publish_task_receipts(candidates):
+            from .quantum_task_receipts import write_quantum_task_receipt
+
+            for candidate in candidates:
+                candidate_path = Path(getattr(candidate, "path", candidate))
+                if candidate_path.name not in task_id_by_name:
+                    raise ValueError(
+                        "validated quantum task is outside canonical POINTS.txt"
+                    )
+                write_quantum_task_receipt(
+                    self.campaign_dir,
+                    candidate_path,
+                    phase_name=phase_name,
+                    iteration=int(state.iteration),
+                    logical_task_id=task_id_by_name[candidate_path.name],
+                )
 
         if "AIMALL" in phase_name:
             from ichor.core.files.point_directory import PointDirectory
             from .quantum_quality import (
                 evaluate_aimall_pointdir,
+                read_quantum_quality_manifest,
                 write_quantum_quality_manifest,
             )
 
@@ -2410,6 +2441,18 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             quality_records = []
             quality_kept = []
             quality_rejected = []
+            try:
+                publish_task_receipts(kept)
+            except Exception as exc:
+                return PhaseResult(
+                    is_complete=True,
+                    failure_reason=(
+                        "quantum_task_receipt_failed: "
+                        + type(exc).__name__
+                        + ": "
+                        + str(exc)[:180]
+                    ),
+                )
             for pdir in kept:
                 record = evaluate_aimall_pointdir(
                     pdir,
@@ -2443,6 +2486,13 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 records=quality_records,
                 gates=getattr(self.config, "quality_gates", None),
             )
+            read_quantum_quality_manifest(
+                staging_root,
+                expected_phase=phase_name,
+                expected_iteration=int(state.iteration),
+                expected_pointdirs=[str(record["pointdir"]) for record in quality_records],
+                expected_method=str(self.config.gaussian.method),
+            )
             self._journal_event(
                 "quantum_quality_summary",
                 phase=phase_name,
@@ -2464,6 +2514,18 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     is_complete=True,
                     failure_reason=(
                         "quantum_task_membership_invalid: "
+                        + type(exc).__name__
+                        + ": "
+                        + str(exc)[:180]
+                    ),
+                )
+            try:
+                publish_task_receipts(kept)
+            except Exception as exc:
+                return PhaseResult(
+                    is_complete=True,
+                    failure_reason=(
+                        "quantum_task_receipt_failed: "
                         + type(exc).__name__
                         + ": "
                         + str(exc)[:180]
@@ -2497,6 +2559,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     staging_dir=staging_root,
                     gaussian_phase=gaussian_phase,
                     aimall_phase=phase_name,
+                    expected_method=str(self.config.gaussian.method),
                 )
             except Exception as exc:
                 return PhaseResult(

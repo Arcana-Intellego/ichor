@@ -12,7 +12,7 @@ from .state import CampaignState, atomic_write_json
 from .filesystem import operational_path
 
 
-COMPLETION_RECEIPT_SCHEMA_VERSION = 1
+COMPLETION_RECEIPT_SCHEMA_VERSION = 2
 COMPLETION_RECEIPT_DIRNAME = "phase_completions"
 
 
@@ -20,8 +20,39 @@ class CompletionReceiptError(ValueError):
     """Raised when a phase-completion receipt cannot be trusted."""
 
 
+def _exact_int(value: Any, label: str, *, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise CompletionReceiptError(label + " must be an integer")
+    parsed = int(value)
+    if parsed < minimum:
+        raise CompletionReceiptError(label + " must be >= " + str(minimum))
+    return parsed
+
+
+def _sha256(value: Any, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise CompletionReceiptError(label + " must be a lowercase SHA-256 digest")
+    return value
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _require_iso_timestamp(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise CompletionReceiptError(label + " must be an ISO timestamp")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise CompletionReceiptError(label + " must be an ISO timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise CompletionReceiptError(label + " must include a timezone")
+    return value
 
 
 def _canonical_json(value: Any) -> str:
@@ -106,20 +137,44 @@ def write_completion_receipt(
     expected_tasks: Optional[int] = None,
     submission_identity: Optional[str] = None,
 ) -> Path:
+    if not isinstance(campaign_uid, str) or not campaign_uid:
+        raise CompletionReceiptError("completion receipt campaign_uid is empty")
+    if not isinstance(phase, str) or not phase:
+        raise CompletionReceiptError("completion receipt phase is empty")
+    if not isinstance(next_phase, str) or not next_phase:
+        raise CompletionReceiptError("completion receipt next_phase is empty")
+    iteration_value = _exact_int(iteration, "completion receipt iteration")
+    replacement_value = _exact_int(
+        replacement_round,
+        "completion receipt replacement_round",
+    )
+    next_iteration_value = _exact_int(
+        next_iteration,
+        "completion receipt next_iteration",
+    )
+    expected_tasks_value = None
+    if expected_tasks is not None:
+        expected_tasks_value = _exact_int(
+            expected_tasks,
+            "completion receipt expected_tasks",
+            minimum=1,
+        )
+    _sha256(config_sha256, "completion receipt config_sha256")
     before_state = state_projection(state_before)
     after_state = state_projection(state_after)
+    CampaignState.from_dict(after_state)
     before_digest = canonical_sha256(before_state)
     after_digest = canonical_sha256(after_state)
     identity = {
-        "campaign_uid": str(campaign_uid),
-        "phase": str(phase),
-        "iteration": int(iteration),
-        "replacement_round": int(replacement_round),
+        "campaign_uid": campaign_uid,
+        "phase": phase,
+        "iteration": iteration_value,
+        "replacement_round": replacement_value,
         "job_id": None if job_id is None else str(job_id),
         "submission_identity": (
             None if submission_identity is None else str(submission_identity)
         ),
-        "config_sha256": str(config_sha256),
+        "config_sha256": config_sha256,
         "state_before_sha256": before_digest,
         "state_after_sha256": after_digest,
     }
@@ -128,9 +183,9 @@ def write_completion_receipt(
         "schema_version": COMPLETION_RECEIPT_SCHEMA_VERSION,
         "receipt_id": receipt_id,
         **identity,
-        "expected_tasks": None if expected_tasks is None else int(expected_tasks),
-        "next_phase": str(next_phase),
-        "next_iteration": int(next_iteration),
+        "expected_tasks": expected_tasks_value,
+        "next_phase": next_phase,
+        "next_iteration": next_iteration_value,
         "state_updates": dict(state_updates),
         "state_after": after_state,
         "evidence": [dict(record) for record in evidence],
@@ -164,8 +219,28 @@ def read_completion_receipt(path: Union[str, Path]) -> Dict[str, Any]:
         raise CompletionReceiptError("completion receipt is unreadable: " + str(target)) from exc
     if not isinstance(payload, dict):
         raise CompletionReceiptError("completion receipt must be a JSON object")
-    if int(payload.get("schema_version", -1)) != COMPLETION_RECEIPT_SCHEMA_VERSION:
+    if _exact_int(payload.get("schema_version"), "completion receipt schema_version") != COMPLETION_RECEIPT_SCHEMA_VERSION:
         raise CompletionReceiptError("unsupported completion receipt schema")
+    if not isinstance(payload.get("campaign_uid"), str) or not payload["campaign_uid"]:
+        raise CompletionReceiptError("completion receipt campaign_uid is empty")
+    if not isinstance(payload.get("phase"), str) or not payload["phase"]:
+        raise CompletionReceiptError("completion receipt phase is empty")
+    _exact_int(payload.get("iteration"), "completion receipt iteration")
+    _exact_int(payload.get("replacement_round"), "completion receipt replacement_round")
+    for label in ("config_sha256", "state_before_sha256", "state_after_sha256"):
+        _sha256(payload.get(label), "completion receipt " + label)
+    expected_tasks = payload.get("expected_tasks")
+    if expected_tasks is not None:
+        _exact_int(expected_tasks, "completion receipt expected_tasks", minimum=1)
+    _exact_int(payload.get("next_iteration"), "completion receipt next_iteration")
+    if not isinstance(payload.get("next_phase"), str) or not payload["next_phase"]:
+        raise CompletionReceiptError("completion receipt next_phase is empty")
+    _require_iso_timestamp(
+        payload.get("created_at_iso"),
+        "completion receipt created_at_iso",
+    )
+    if not isinstance(payload.get("state_updates"), dict):
+        raise CompletionReceiptError("completion receipt state_updates must be an object")
     identity = {
         key: payload.get(key)
         for key in (
@@ -198,11 +273,32 @@ def read_completion_receipt(path: Union[str, Path]) -> Dict[str, Any]:
         raise CompletionReceiptError("completion receipt state_after campaign UID mismatch")
     if str(after_state.get("phase") or "") != str(payload.get("next_phase") or ""):
         raise CompletionReceiptError("completion receipt next phase mismatch")
-    try:
-        if int(after_state.get("iteration")) != int(payload.get("next_iteration")):
-            raise CompletionReceiptError("completion receipt next iteration mismatch")
-    except (TypeError, ValueError) as exc:
-        raise CompletionReceiptError("completion receipt next iteration is invalid") from exc
+    if _exact_int(
+        after_state.get("iteration"),
+        "completion receipt state_after iteration",
+    ) != _exact_int(
+        payload.get("next_iteration"),
+        "completion receipt next_iteration",
+    ):
+        raise CompletionReceiptError("completion receipt next iteration mismatch")
+    seen_evidence = set()
+    for record in evidence:
+        if not isinstance(record, dict):
+            raise CompletionReceiptError("completion evidence record is invalid")
+        relative = record.get("path")
+        if not isinstance(relative, str) or not relative:
+            raise CompletionReceiptError("completion evidence path is invalid")
+        path_value = Path(relative)
+        if path_value.is_absolute() or ".." in path_value.parts:
+            raise CompletionReceiptError("completion evidence path escapes campaign")
+        canonical = path_value.as_posix()
+        if canonical != relative or canonical in seen_evidence:
+            raise CompletionReceiptError(
+                "completion evidence paths must be unique and canonical"
+            )
+        seen_evidence.add(canonical)
+        _exact_int(record.get("size"), "completion evidence size")
+        _sha256(record.get("sha256"), "completion evidence sha256")
     return payload
 
 
@@ -210,7 +306,7 @@ def replayable_completion_receipts(
     campaign_dir: Union[str, Path],
     state: Union[CampaignState, Mapping[str, Any]],
     *,
-    expected_config_sha256: str,
+    expected_config_sha256: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Return validated receipts whose pre-state exactly matches ``state``."""
     campaign = Path(campaign_dir)
@@ -227,7 +323,9 @@ def replayable_completion_receipts(
             continue
         if str(payload.get("campaign_uid") or "") != campaign_uid:
             continue
-        if str(payload.get("config_sha256") or "") != str(expected_config_sha256):
+        if expected_config_sha256 is not None and str(
+            payload.get("config_sha256") or ""
+        ) != str(expected_config_sha256):
             continue
         if str(payload.get("state_before_sha256") or "") != before_sha:
             continue
@@ -283,7 +381,9 @@ def validate_completion_reference(
         resolved = _inside_campaign(campaign, campaign / evidence_path)
         if resolved.is_symlink() or not resolved.is_file():
             raise CompletionReceiptError("completion evidence file is missing")
-        if int(record.get("size", -1)) != int(resolved.stat().st_size):
+        if _exact_int(record.get("size"), "completion evidence size") != int(
+            resolved.stat().st_size
+        ):
             raise CompletionReceiptError("completion evidence size mismatch")
         if str(record.get("sha256") or "") != sha256_file(resolved):
             raise CompletionReceiptError("completion evidence hash mismatch")

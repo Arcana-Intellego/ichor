@@ -59,6 +59,9 @@ from ichor.hpc.active_learning.versioning.provenance import (
 from ichor.hpc.active_learning.versioning.versioned_directory import VersionedDirectory
 
 
+_FIXTURE_CAMPAIGN_UID = "reconcile-test"
+
+
 def _campaign_dirs(tmp_path):
     campaign = tmp_path / "campaign"
     data = campaign / ".DATA" / "ACTIVE_LEARNING"
@@ -90,7 +93,7 @@ def _write_pending_allocation(campaign, *, context, iteration, n):
     campaign_uid = (
         read_state(state_path).campaign_uid
         if state_path.is_file()
-        else "reconcile-test"
+        else _FIXTURE_CAMPAIGN_UID
     )
     targets = {"train": int(n), "int_val": 0, "ext_val": 0, "total": int(n)}
     allocation_path = point_allocation_path(
@@ -183,6 +186,54 @@ def _complete_handoff_allocation(campaign, *, context, iteration, pointdirs):
             "accepted": True,
             "pointdir": str(pointdir.resolve()),
         })
+    from ichor.hpc.active_learning.daemon.quantum_quality import (
+        write_quantum_quality_manifest,
+    )
+
+    quality_records = []
+    for pointdir in pointdirs:
+        geometry = pointdir / "geometry.xyz"
+        atom_names = ["H1"]
+        if geometry.is_file():
+            lines = geometry.read_text(encoding="utf-8").splitlines()[2:]
+            counts = {}
+            atom_names = []
+            for line in lines:
+                if not line.strip():
+                    continue
+                element = line.split()[0]
+                counts[element] = counts.get(element, 0) + 1
+                atom_names.append(element + str(counts[element]))
+        quality_records.append(
+            {
+                "pointdir": pointdir.name,
+                "accepted": True,
+                "reasons": [],
+                "atom_count": len(atom_names),
+                "n_int": len(atom_names),
+                "per_atom": [
+                    {
+                        "atom": atom,
+                        "iqa_ha": -0.5,
+                        "integration_error": 0.0,
+                    }
+                    for atom in atom_names
+                ],
+            }
+        )
+    quality_path = write_quantum_quality_manifest(
+        Path(pointdirs[0]).parent,
+        phase_name=(
+            CampaignPhase.INITIAL_AIMALL.value
+            if str(context) == "bootstrap"
+            else CampaignPhase.AIMALL.value
+        ),
+        iteration=int(iteration),
+        records=quality_records,
+        gates={},
+    )
+    for result in results:
+        result["quality_manifest"] = str(quality_path.resolve())
     return record_quantum_results(allocation_path, results)
 
 

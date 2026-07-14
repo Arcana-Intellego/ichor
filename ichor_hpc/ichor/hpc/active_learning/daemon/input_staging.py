@@ -50,7 +50,7 @@ from ..versioning.manifest import sha256_file
 
 
 QUANTUM_ACCEPTANCE_MANIFEST = "accepted_pointdirs.json"
-QUANTUM_ACCEPTANCE_SCHEMA_VERSION = 1
+QUANTUM_ACCEPTANCE_SCHEMA_VERSION = 2
 AIMALL_TASK_METADATA = "AIMALL_TASK.json"
 AIMALL_TASK_METADATA_SCHEMA_VERSION = 1
 WFN_METHOD_RECEIPT = "WFN_METHOD_RECEIPT.json"
@@ -77,7 +77,7 @@ def write_points_file(staging_dir: Path, pointdirs: Sequence[Path]) -> Path:
     body = "\n".join(str(Path(p).resolve()) for p in pointdirs)
     # force LF. the array sbatch sed-reads this on a linux node, and if we ever stage from
     # windows the default crlf leaves a trailing \r so cd "$POINT_DIR" quietly breaks.
-    points_file.write_text(body + ("\n" if body else ""), encoding="utf-8", newline="\n")
+    atomic_write_text(points_file, body + ("\n" if body else ""))
     return points_file
 
 
@@ -292,25 +292,39 @@ def write_quantum_acceptance_manifest(
     rejected: Sequence[Tuple[str, str]],
 ) -> Path:
     """Persist the exact validated quantum handoff for downstream live stages."""
+    if not isinstance(phase_name, str) or not phase_name:
+        raise ValueError("quantum acceptance phase must be a non-empty string")
+    if isinstance(iteration, bool) or not isinstance(iteration, int) or iteration < 0:
+        raise ValueError("quantum acceptance iteration must be a non-negative integer")
     staging = Path(staging_dir)
     staging.mkdir(parents=True, exist_ok=True)
     accepted_names = [_validate_pointdir_basename(_pointdir_name(p)) for p in accepted]
-    rejected_payload = [
-        {"pointdir": _validate_pointdir_basename(str(name)), "reason": str(reason)}
-        for name, reason in rejected
-    ]
+    rejected_payload = []
+    for name, reason in rejected:
+        reason_text = str(reason).strip()
+        if not reason_text:
+            raise ValueError("quantum rejection reason must be non-empty")
+        rejected_payload.append(
+            {
+                "pointdir": _validate_pointdir_basename(str(name)),
+                "reason": reason_text,
+            }
+        )
+    all_names = accepted_names + [record["pointdir"] for record in rejected_payload]
+    if len(all_names) != len(set(all_names)):
+        raise ValueError("quantum acceptance contains duplicate dispositions")
     payload: Dict[str, Any] = {
         "schema_version": QUANTUM_ACCEPTANCE_SCHEMA_VERSION,
-        "phase": str(phase_name),
-        "iteration": int(iteration),
+        "phase": phase_name,
+        "iteration": iteration,
         "accepted_pointdirs": accepted_names,
         "rejected": rejected_payload,
         "n_total": int(len(accepted_names) + len(rejected_payload)),
     }
     phase_path = quantum_acceptance_manifest_path(staging, phase_name=phase_name)
     atomic_write_json(phase_path, payload)
-    # Keep the legacy filename as a compatibility alias for older tools, while
-    # phase-aware readers prefer the immutable phase-specific handoff.
+    # Retain the latest-phase convenience copy for operator tooling. Consumers
+    # always read the immutable phase-specific handoff.
     atomic_write_json(quantum_acceptance_manifest_path(staging), payload)
     return phase_path
 
@@ -330,8 +344,7 @@ def read_quantum_acceptance_manifest(
     """
     staging = Path(staging_dir)
     phase_path = quantum_acceptance_manifest_path(staging, phase_name=expected_phase)
-    used_legacy_alias = not phase_path.is_file()
-    path = phase_path if phase_path.is_file() else quantum_acceptance_manifest_path(staging)
+    path = phase_path
     if not path.is_file():
         raise FileNotFoundError("quantum acceptance manifest missing: " + str(path))
     try:
@@ -340,17 +353,20 @@ def read_quantum_acceptance_manifest(
         raise ValueError("quantum acceptance manifest unreadable: " + str(path)) from exc
     if not isinstance(data, dict):
         raise ValueError("quantum acceptance manifest must be a JSON object: " + str(path))
-    if int(data.get("schema_version", -1)) != QUANTUM_ACCEPTANCE_SCHEMA_VERSION:
+    if (
+        not isinstance(data.get("schema_version"), int)
+        or isinstance(data.get("schema_version"), bool)
+        or data["schema_version"] != QUANTUM_ACCEPTANCE_SCHEMA_VERSION
+    ):
         raise ValueError("unsupported quantum acceptance manifest schema: " + str(path))
     if data.get("phase") != expected_phase:
         raise ValueError(
             "quantum acceptance manifest phase mismatch: expected "
             + expected_phase + " got " + str(data.get("phase"))
         )
-    try:
-        iteration = int(data.get("iteration"))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("quantum acceptance manifest iteration is not an integer") from exc
+    iteration = data.get("iteration")
+    if not isinstance(iteration, int) or isinstance(iteration, bool):
+        raise ValueError("quantum acceptance manifest iteration is not an integer")
     if iteration != int(expected_iteration):
         raise ValueError(
             "quantum acceptance manifest iteration mismatch: expected "
@@ -363,13 +379,10 @@ def read_quantum_acceptance_manifest(
     if not isinstance(rejected, list):
         raise ValueError("quantum acceptance manifest rejected must be a list")
     n_total = data.get("n_total")
-    if n_total is not None:
-        try:
-            parsed_total = int(n_total)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("quantum acceptance manifest n_total is not an integer") from exc
-        if parsed_total != len(accepted) + len(rejected):
-            raise ValueError("quantum acceptance manifest n_total does not match payload lengths")
+    if not isinstance(n_total, int) or isinstance(n_total, bool):
+        raise ValueError("quantum acceptance manifest n_total is not an integer")
+    if n_total != len(accepted) + len(rejected):
+        raise ValueError("quantum acceptance manifest n_total does not match payload lengths")
 
     seen = set()
     resolved: List[Path] = []
@@ -389,13 +402,36 @@ def read_quantum_acceptance_manifest(
                 "accepted pointdir listed in manifest is missing: " + str(pointdir)
             )
         resolved.append(pointdir)
+    normalised_rejected = []
+    for record in rejected:
+        if not isinstance(record, dict):
+            raise ValueError("quantum rejection record must be an object")
+        if set(record) != {"pointdir", "reason"}:
+            raise ValueError("quantum rejection record has unknown or missing fields")
+        name = _validate_pointdir_basename(record.get("pointdir"))
+        reason = record.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("quantum rejection reason must be a non-empty string")
+        if name in seen:
+            raise ValueError("duplicate or contradictory pointdir disposition: " + name)
+        if points_names is not None and name not in points_names:
+            raise ValueError("rejected pointdir is not present in POINTS.txt: " + name)
+        seen.add(name)
+        normalised_rejected.append({"pointdir": name, "reason": reason.strip()})
+    if points_names is not None and seen != points_names:
+        missing = sorted(points_names - seen)
+        raise ValueError(
+            "quantum acceptance does not cover every POINTS.txt task: "
+            + repr(missing[:8])
+        )
     if require_nonempty and not resolved:
         raise ValueError("quantum acceptance manifest accepted_pointdirs is empty: " + str(path))
-    if used_legacy_alias:
-        # Migrate old in-flight campaigns before the next phase overwrites the
-        # legacy alias with its own acceptance payload.
-        atomic_write_json(phase_path, data)
-    return resolved, data
+    out = dict(data)
+    out["rejected"] = normalised_rejected
+    out["rejections_by_pointdir"] = {
+        record["pointdir"]: record["reason"] for record in normalised_rejected
+    }
+    return resolved, out
 
 
 def hash_pointdir_tree(pointdir: Path) -> str:
@@ -577,6 +613,36 @@ def read_ferebus_manifest(
             }
             if parsed != expected_parsed:
                 raise ValueError("FEREBUS generated_config parsed contract mismatch")
+            if verify_dataset_files:
+                config_path = resolve_ferebus_task_path(
+                    staging_dir,
+                    generated_config.get("path"),
+                    "generated_config.path",
+                )
+                if config_path.is_symlink() or not config_path.is_file():
+                    raise ValueError("FEREBUS generated config file is missing")
+                size = generated_config.get("size")
+                if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+                    raise ValueError("FEREBUS generated config size is invalid")
+                digest = generated_config.get("sha256")
+                if (
+                    not isinstance(digest, str)
+                    or len(digest) != 64
+                    or any(character not in "0123456789abcdef" for character in digest)
+                ):
+                    raise ValueError("FEREBUS generated config SHA-256 is invalid")
+                if int(config_path.stat().st_size) != size:
+                    raise ValueError("FEREBUS generated config size mismatch")
+                if sha256_file(config_path) != digest:
+                    raise ValueError("FEREBUS generated config SHA-256 mismatch")
+                from ..ferebus_prior import validate_ferebus_config_contract
+
+                observed_parsed = validate_ferebus_config_contract(
+                    config_path,
+                    prior_contract,
+                )
+                if observed_parsed != expected_parsed or observed_parsed != parsed:
+                    raise ValueError("FEREBUS generated config content contract mismatch")
         expected_task_dir = prop + "/" + atom
         expected_input_dir = expected_task_dir + "/datasets"
         expected_paths = {
@@ -1329,6 +1395,7 @@ def record_allocation_quantum_results(
     staging_dir: Path,
     gaussian_phase: str,
     aimall_phase: str,
+    expected_method: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Join Gaussian and AIMAll outcomes into one exact allocation update."""
     from ..point_allocation import (
@@ -1407,6 +1474,31 @@ def record_allocation_quantum_results(
         for record in list(aimall_manifest.get("rejected") or [])
         if isinstance(record, dict)
     }
+    aimall_task_names = aimall_accepted_names | set(aimall_rejected)
+    if aimall_task_names != gaussian_accepted_names:
+        raise ValueError(
+            "AIMAll acceptance does not cover exactly the Gaussian-accepted tasks"
+        )
+    quality_path = staging / "quantum_quality.json"
+    if aimall_task_names:
+        from .quantum_quality import read_quantum_quality_manifest
+
+        quality_payload = read_quantum_quality_manifest(
+            staging,
+            expected_phase=str(aimall_phase),
+            expected_iteration=int(iteration),
+            expected_pointdirs=sorted(aimall_task_names),
+            expected_method=expected_method,
+        )
+        quality_accepted = {
+            str(record["pointdir"])
+            for record in quality_payload["records"]
+            if bool(record["accepted"])
+        }
+        if quality_accepted != aimall_accepted_names:
+            raise ValueError(
+                "quantum-quality acceptance does not match AIMAll acceptance"
+            )
     results: List[Dict[str, Any]] = []
     observed_ids: set[str] = set()
     pending_by_id = {str(record["candidate_id"]): record for record in pending}
@@ -1448,25 +1540,24 @@ def record_allocation_quantum_results(
         else:
             accepted = False
             reason = "gaussian_result_missing"
-        results.append(
-            {
-                "candidate_id": candidate_id,
-                "accepted": bool(accepted),
-                "pointdir": str(pointdir.resolve()),
-                "reason": reason,
-                "quality_manifest": str(
-                    (staging / "quantum_quality.json")
-                    .resolve(strict=False)
-                    .relative_to(campaign.resolve())
-                    .as_posix()
-                ),
-            }
-        )
+        result = {
+            "candidate_id": candidate_id,
+            "accepted": bool(accepted),
+            "pointdir": str(pointdir.resolve()),
+            "reason": reason,
+        }
+        if name in aimall_task_names:
+            result["quality_manifest"] = str(
+                (staging / "quantum_quality.json")
+                .resolve(strict=False)
+                .relative_to(campaign.resolve())
+                .as_posix()
+            )
+        results.append(result)
     if pending_ids and observed_ids != pending_ids:
         raise ValueError("quantum staging does not cover every pending allocation candidate")
     if not pending_ids and not observed_ids:
         raise ValueError("quantum result replay contains no allocation candidates")
-    quality_path = staging / "quantum_quality.json"
     acceptance_paths = [
         quantum_acceptance_manifest_path(staging, phase_name=str(gaussian_phase)),
     ]
@@ -1750,10 +1841,48 @@ def commit_reference_data_delta(
                 "quantum-quality evidence is missing: " + str(resolved_quality)
             )
         quality_sources[str(resolved_quality)] = resolved_quality
-    if missing_quality and quality_sources:
-        raise ValueError("accepted allocation has incomplete quantum-quality evidence")
+    if missing_quality:
+        raise ValueError(
+            "accepted allocation lacks mandatory quantum-quality evidence for "
+            + str(missing_quality)
+            + " candidate(s)"
+        )
     quality_evidence: List[Dict[str, Any]] = []
+    committed_by_source = {
+        Path(source).name: {
+            "source_pointdir": Path(source).name,
+            "committed_pointdir": entry.pointdir_name,
+            "candidate_id": str(attempt["candidate_id"]),
+        }
+        for source, attempt, entry in zip(accepted_pointdirs, attempts, added_entries)
+    }
     for index, source_quality in enumerate(sorted(quality_sources.values())):
+        try:
+            quality_payload_raw = json.loads(source_quality.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                "quantum-quality evidence is unreadable: " + str(source_quality)
+            ) from exc
+        if not isinstance(quality_payload_raw, dict):
+            raise ValueError("quantum-quality evidence must be a JSON object")
+        from .quantum_quality import read_quantum_quality_manifest
+
+        quality_payload = read_quantum_quality_manifest(
+            source_quality.parent,
+            expected_phase=str(quality_payload_raw.get("phase") or ""),
+            expected_iteration=int(quality_payload_raw.get("iteration")),
+            manifest_path=source_quality,
+        )
+        accepted_source_names = {
+            str(record["pointdir"])
+            for record in quality_payload["records"]
+            if bool(record["accepted"])
+        }
+        relevant_names = sorted(accepted_source_names & set(committed_by_source))
+        if not relevant_names:
+            raise ValueError(
+                "quantum-quality evidence contains no committed accepted pointdir"
+            )
         destination_quality = (
             staging / "quality_evidence" / ("quantum_quality_" + str(index).zfill(4) + ".json")
         )
@@ -1763,6 +1892,11 @@ def commit_reference_data_delta(
                 "path": destination_quality.relative_to(staging).as_posix(),
                 "sha256": sha256_file(destination_quality),
                 "source_path": source_quality.relative_to(campaign.resolve()).as_posix(),
+                "phase": str(quality_payload["phase"]),
+                "iteration": int(quality_payload["iteration"]),
+                "pointdir_bindings": [
+                    committed_by_source[name] for name in relevant_names
+                ],
             }
         )
     payload = build_reference_data_version_payload(

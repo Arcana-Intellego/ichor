@@ -30,6 +30,34 @@ def test_phase_result_defaults():
     assert r.failure_reason is None
 
 
+def test_phase_result_rejects_completion_and_submission_together():
+    result = PhaseResult(is_complete=True, submitted_job_id="123")
+
+    with pytest.raises(ValueError, match="cannot also submit"):
+        result.validate(stage="submit", phase_name="GAUSSIAN")
+
+
+def test_phase_result_rejects_fractional_expected_tasks():
+    result = PhaseResult(
+        is_complete=False,
+        submitted_job_id="123",
+        expected_tasks=1.5,
+    )
+
+    with pytest.raises(ValueError, match="positive integer"):
+        result.validate(stage="submit", phase_name="GAUSSIAN")
+
+
+def test_phase_result_restricts_convergence_to_stop_check():
+    result = PhaseResult(
+        is_complete=True,
+        state_updates={"campaign_completion_reason": "converged"},
+    )
+
+    with pytest.raises(ValueError, match="only for STOP_CHECK"):
+        result.validate(stage="submit", phase_name="APPEND")
+
+
 def test_mock_inline_phase_completes_immediately():
     e = MockPhaseExecutor()
     r = e.submit_or_run(_state(), CampaignPhase.APPEND)

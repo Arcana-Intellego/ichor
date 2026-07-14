@@ -16,10 +16,10 @@ TRAJECTORY_XYZ_FILENAME = "trajectory.xyz"
 TRAJECTORY_METRICS_FILENAME = "metrics.jsonl"
 TRAJECTORY_TRACE_FILENAME = "trace.jsonl"
 TRAJECTORY_MANIFEST_FILENAME = "MANIFEST.json"
-TRAJECTORY_SCHEMA_VERSION = 1
+TRAJECTORY_SCHEMA_VERSION = 2
 SEED_RESULT_FILENAME = "result.json"
 SEED_OUTPUT_MANIFEST_FILENAME = "ARIADNE_OUTPUT_MANIFEST.json"
-SEED_OUTPUT_SCHEMA_VERSION = 1
+SEED_OUTPUT_SCHEMA_VERSION = 2
 
 
 class AriadneOutputError(RuntimeError):
@@ -34,16 +34,15 @@ def _validate_identity(
     seed_uid: Any,
     array_task_id: Any,
 ) -> Dict[str, Any]:
-    campaign = str(campaign_uid or "")
-    uid = str(seed_uid or "")
-    if any(isinstance(value, bool) for value in (iteration, seed_id, array_task_id)):
-        raise AriadneOutputError("ARIADNE seed identity contains a boolean")
-    try:
-        iteration_value = int(iteration)
-        seed_value = int(seed_id)
-        task_value = int(array_task_id)
-    except (TypeError, ValueError) as exc:
-        raise AriadneOutputError("ARIADNE seed identity contains a non-integer") from exc
+    if not isinstance(campaign_uid, str):
+        raise AriadneOutputError("ARIADNE campaign_uid must be a string")
+    if not isinstance(seed_uid, str):
+        raise AriadneOutputError("ARIADNE seed_uid must be a string")
+    campaign = campaign_uid
+    uid = seed_uid
+    iteration_value = _exact_int(iteration, "ARIADNE iteration", minimum=1)
+    seed_value = _exact_int(seed_id, "ARIADNE seed_id", minimum=1)
+    task_value = _exact_int(array_task_id, "ARIADNE array_task_id")
     if not campaign:
         raise AriadneOutputError("ARIADNE campaign_uid is empty")
     if iteration_value < 1:
@@ -71,6 +70,15 @@ def _finite_or_none(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return parsed if math.isfinite(parsed) else None
+
+
+def _exact_int(value: Any, label: str, *, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise AriadneOutputError(label + " must be an integer")
+    parsed = int(value)
+    if parsed < minimum:
+        raise AriadneOutputError(label + " must be >= " + str(minimum))
+    return parsed
 
 
 def _file_binding(root: Path, path: Path) -> Dict[str, Any]:
@@ -205,8 +213,10 @@ def write_seed_output_manifest(
         seed_uid=seed_uid,
         array_task_id=array_task_id,
     )
-    success = bool(task_success)
-    exit_code = int(task_exit_code)
+    if not isinstance(task_success, bool):
+        raise AriadneOutputError("ARIADNE task_success must be a boolean")
+    success = task_success
+    exit_code = _exact_int(task_exit_code, "ARIADNE task_exit_code")
     if success != (exit_code == 0):
         raise AriadneOutputError(
             "ARIADNE task_success must agree with a zero task_exit_code"
@@ -219,10 +229,7 @@ def write_seed_output_manifest(
         "result_json": _file_binding(root, result_path),
         "trajectory_manifest": _file_binding(root, trajectory_manifest),
     }
-    trajectory_payload = _read_json_object(
-        trajectory_manifest,
-        "ARIADNE trajectory manifest",
-    )
+    trajectory_payload = read_and_validate_optimisation_trajectory(root)
     for label, binding in dict(trajectory_payload.get("files") or {}).items():
         if not isinstance(binding, Mapping):
             raise AriadneOutputError("invalid trajectory file binding: " + str(label))
@@ -257,6 +264,149 @@ def _read_json_object(path: Path, label: str) -> Dict[str, Any]:
     return payload
 
 
+def _validate_binding(root: Path, binding: Any, *, label: str, expected: str) -> Path:
+    if not isinstance(binding, Mapping):
+        raise AriadneOutputError(label + " binding must be an object")
+    if set(binding) != {"path", "size", "sha256"}:
+        raise AriadneOutputError(label + " binding fields are invalid")
+    relative = str(binding.get("path") or "")
+    if relative != expected:
+        raise AriadneOutputError(label + " path is noncanonical")
+    candidate = root / relative
+    actual = _file_binding(root, candidate)
+    if _exact_int(binding.get("size"), label + " size") != actual["size"]:
+        raise AriadneOutputError(label + " size mismatch")
+    digest = binding.get("sha256")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+        or digest != actual["sha256"]
+    ):
+        raise AriadneOutputError(label + " SHA-256 mismatch")
+    return candidate
+
+
+def _read_xyz_frames(path: Path, *, frame_count: int, atom_count: int) -> Sequence[Dict[str, Any]]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise AriadneOutputError("ARIADNE trajectory XYZ is unreadable") from exc
+    frames = []
+    position = 0
+    expected_atoms: Optional[Sequence[str]] = None
+    while position < len(lines):
+        if not lines[position].strip():
+            raise AriadneOutputError("ARIADNE trajectory XYZ contains a blank frame boundary")
+        try:
+            declared = int(lines[position])
+        except ValueError as exc:
+            raise AriadneOutputError("ARIADNE trajectory XYZ atom count is invalid") from exc
+        if declared != atom_count or position + 2 + declared > len(lines):
+            raise AriadneOutputError("ARIADNE trajectory XYZ frame cardinality mismatch")
+        atoms = []
+        coordinates = []
+        for row in lines[position + 2 : position + 2 + declared]:
+            parts = row.split()
+            if len(parts) != 4 or not parts[0]:
+                raise AriadneOutputError("ARIADNE trajectory XYZ atom row is invalid")
+            xyz = []
+            for token in parts[1:]:
+                try:
+                    value = float(token)
+                except ValueError as exc:
+                    raise AriadneOutputError("ARIADNE trajectory coordinate is invalid") from exc
+                if not math.isfinite(value):
+                    raise AriadneOutputError("ARIADNE trajectory coordinate is non-finite")
+                xyz.append(value)
+            atoms.append(parts[0])
+            coordinates.append(xyz)
+        if expected_atoms is None:
+            expected_atoms = tuple(atoms)
+        elif tuple(atoms) != tuple(expected_atoms):
+            raise AriadneOutputError("ARIADNE trajectory atom identity/order changed")
+        frames.append({"atom_types": atoms, "coordinates": coordinates})
+        position += 2 + declared
+    if len(frames) != frame_count:
+        raise AriadneOutputError("ARIADNE trajectory XYZ frame count mismatch")
+    return frames
+
+
+def _read_json_lines(path: Path, *, label: str) -> Sequence[Dict[str, Any]]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise AriadneOutputError(label + " is unreadable") from exc
+    records = []
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            raise AriadneOutputError(label + " contains a blank record")
+        try:
+            record = json.loads(line)
+        except ValueError as exc:
+            raise AriadneOutputError(
+                label + " record " + str(line_number) + " is invalid"
+            ) from exc
+        if not isinstance(record, dict):
+            raise AriadneOutputError(label + " record must be an object")
+        records.append(record)
+    return records
+
+
+def read_and_validate_optimisation_trajectory(seed_dir: Path) -> Dict[str, Any]:
+    """Read and semantically validate one seed's optimisation trajectory."""
+    seed_root = Path(seed_dir)
+    root = seed_root / TRAJECTORY_DIRNAME
+    manifest_path = root / TRAJECTORY_MANIFEST_FILENAME
+    payload = _read_json_object(manifest_path, "ARIADNE trajectory manifest")
+    if _exact_int(payload.get("schema_version"), "trajectory schema_version") != TRAJECTORY_SCHEMA_VERSION:
+        raise AriadneOutputError("unsupported ARIADNE trajectory schema")
+    frame_count = _exact_int(payload.get("frame_count"), "trajectory frame_count", minimum=1)
+    atom_count = _exact_int(payload.get("atom_count"), "trajectory atom_count", minimum=1)
+    files = payload.get("files")
+    if not isinstance(files, dict):
+        raise AriadneOutputError("ARIADNE trajectory files must be an object")
+    required = {
+        "trajectory_xyz": TRAJECTORY_XYZ_FILENAME,
+        "metrics_jsonl": TRAJECTORY_METRICS_FILENAME,
+    }
+    optional = {"trace_jsonl": TRAJECTORY_TRACE_FILENAME}
+    if not set(required).issubset(files) or set(files) - set(required) - set(optional):
+        raise AriadneOutputError("ARIADNE trajectory file set is invalid")
+    paths = {
+        label: _validate_binding(root, files[label], label=label, expected=relative)
+        for label, relative in {**required, **optional}.items()
+        if label in files
+    }
+    frames = _read_xyz_frames(
+        paths["trajectory_xyz"], frame_count=frame_count, atom_count=atom_count
+    )
+    metrics = _read_json_lines(paths["metrics_jsonl"], label="ARIADNE trajectory metrics")
+    if len(metrics) != frame_count:
+        raise AriadneOutputError("ARIADNE trajectory metric count mismatch")
+    for index, record in enumerate(metrics):
+        if _exact_int(record.get("frame_number"), "trajectory frame_number", minimum=1) != index + 1:
+            raise AriadneOutputError("ARIADNE trajectory frame numbers are not contiguous")
+        if _exact_int(record.get("frame_index_zero_based"), "trajectory frame index") != index:
+            raise AriadneOutputError("ARIADNE trajectory frame indexes are not contiguous")
+        for key in ("alpha", "gradient_norm"):
+            value = record.get(key)
+            if value is not None and _finite_or_none(value) is None:
+                raise AriadneOutputError("ARIADNE trajectory " + key + " is non-finite")
+        if not isinstance(record.get("origin"), str) or not record["origin"].strip():
+            raise AriadneOutputError("ARIADNE trajectory origin is empty")
+    trace = []
+    if "trace_jsonl" in paths:
+        trace = list(_read_json_lines(paths["trace_jsonl"], label="ARIADNE trajectory trace"))
+    normalised = dict(payload)
+    normalised["frame_count"] = frame_count
+    normalised["atom_count"] = atom_count
+    normalised["frames"] = list(frames)
+    normalised["metrics"] = list(metrics)
+    normalised["trace"] = trace
+    return normalised
+
+
 def validate_seed_output(
     seed_dir: Path,
     *,
@@ -270,10 +420,10 @@ def validate_seed_output(
     root = Path(seed_dir)
     manifest_path = root / SEED_OUTPUT_MANIFEST_FILENAME
     payload = _read_json_object(manifest_path, "ARIADNE seed output manifest")
-    try:
-        schema_version = int(payload.get("schema_version", -1))
-    except (TypeError, ValueError) as exc:
-        raise AriadneOutputError("invalid ARIADNE seed-output schema") from exc
+    schema_version = _exact_int(
+        payload.get("schema_version"),
+        "ARIADNE seed-output schema_version",
+    )
     if schema_version != SEED_OUTPUT_SCHEMA_VERSION:
         raise AriadneOutputError("unsupported ARIADNE seed-output schema")
     identity = _validate_identity(
@@ -286,15 +436,10 @@ def validate_seed_output(
     task_success = payload.get("task_success")
     if not isinstance(task_success, bool):
         raise AriadneOutputError("ARIADNE task_success must be a boolean")
-    task_exit_code_raw = payload.get("task_exit_code")
-    if isinstance(task_exit_code_raw, bool):
-        raise AriadneOutputError("ARIADNE task_exit_code must be an integer")
-    try:
-        task_exit_code = int(task_exit_code_raw)
-    except (TypeError, ValueError) as exc:
-        raise AriadneOutputError("ARIADNE task_exit_code must be an integer") from exc
-    if task_exit_code < 0:
-        raise AriadneOutputError("ARIADNE task_exit_code must be non-negative")
+    task_exit_code = _exact_int(
+        payload.get("task_exit_code"),
+        "ARIADNE task_exit_code",
+    )
     if task_success != (task_exit_code == 0):
         raise AriadneOutputError(
             "ARIADNE task_success does not agree with task_exit_code"
@@ -358,10 +503,14 @@ def validate_seed_output(
         except ValueError as exc:
             raise AriadneOutputError("ARIADNE output escapes its seed directory") from exc
         actual = _file_binding(root, candidate)
-        if actual["size"] != int(binding.get("size", -1)):
+        if actual["size"] != _exact_int(
+            binding.get("size"),
+            "ARIADNE output size for " + str(label),
+        ):
             raise AriadneOutputError("ARIADNE output size mismatch: " + str(label))
         if actual["sha256"] != str(binding.get("sha256") or ""):
             raise AriadneOutputError("ARIADNE output hash mismatch: " + str(label))
+    read_and_validate_optimisation_trajectory(root)
     payload["task_success"] = task_success
     payload["task_exit_code"] = task_exit_code
     if task_failure_reason is not None:
@@ -380,6 +529,7 @@ __all__ = [
     "SEED_RESULT_FILENAME",
     "SEED_OUTPUT_MANIFEST_FILENAME",
     "write_optimisation_trajectory",
+    "read_and_validate_optimisation_trajectory",
     "write_seed_output_manifest",
     "validate_seed_output",
 ]

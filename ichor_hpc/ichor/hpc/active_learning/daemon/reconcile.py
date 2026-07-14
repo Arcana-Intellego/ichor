@@ -37,6 +37,7 @@ from .artifact_contracts import (
     verify_state_referenced_artifacts,
 )
 from .journal import iter_events
+from .filesystem import campaign_owned_path
 from .recovery_contracts import (
     RecoveryDecision,
     active_iteration_handoff_decisions,
@@ -214,6 +215,7 @@ def stateful_campaign_artifacts(campaign_dir: Union[str, Path]) -> List[str]:
     add_matches(".DATA/" + BOOTSTRAP_DIRNAME + "/allocation/POINT_ALLOCATION.json")
     add_matches(".DATA/ACTIVE_LEARNING/stop_request.json")
     add_matches(".DATA/ACTIVE_LEARNING/stop_request_history/*.json")
+    add_matches(".DATA/ACTIVE_LEARNING/reconcile_transactions/*.json")
     config_lock = campaign / ".DATA" / "ACTIVE_LEARNING" / "config_lock.json"
     pool_manifest = campaign / ".DATA" / "TRAJECTORY" / "pool.manifest.json"
     if config_lock.is_file() and not pool_manifest.is_file():
@@ -281,6 +283,8 @@ class ReconciliationReport:
     last_phase_retryable: bool = False
     last_halt_event: Optional[Dict[str, Any]] = None
     script_inventory: Dict[str, Any] = field(default_factory=dict)
+    scratch_inventory: List[Dict[str, Any]] = field(default_factory=list)
+    reconcile_transactions: List[Dict[str, Any]] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
     existing_state_loaded: bool = False
     unsafe_reasons: List[str] = field(default_factory=list)
@@ -682,8 +686,14 @@ def restore_archived_bootstrap_handoff(
     if not isinstance(handoff, dict) or not bool(handoff.get("archived")):
         return []
     campaign = Path(campaign_dir)
-    source = Path(str(handoff.get("path") or ""))
-    target = campaign / ".DATA" / "STAGING" / "initial"
+    source = campaign_owned_path(
+        campaign,
+        Path(str(handoff.get("path") or "")),
+    )
+    target = campaign_owned_path(
+        campaign,
+        campaign / ".DATA" / "STAGING" / "initial",
+    )
     phase = str(handoff.get("phase") or "")
     iteration = int(handoff.get("iteration", 0))
     if not source.is_dir():
@@ -696,13 +706,6 @@ def restore_archived_bootstrap_handoff(
                 "refusing to restore bootstrap handoff containing symlink: "
                 + str(path)
             )
-    campaign_resolved = campaign.resolve()
-    source_resolved = source.resolve()
-    if campaign_resolved not in source_resolved.parents:
-        raise ValueError(
-            "refusing to restore bootstrap handoff outside campaign: "
-            + str(source)
-        )
     from .input_staging import read_quantum_acceptance_manifest
 
     source_pointdirs, _manifest = read_quantum_acceptance_manifest(
@@ -725,9 +728,10 @@ def restore_archived_bootstrap_handoff(
                 ".DATA/STAGING/initial is not empty"
             )
         target.rmdir()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(
-        target.name + ".restore-" + uuid.uuid4().hex
+    campaign_owned_path(campaign, target.parent).mkdir(parents=True, exist_ok=True)
+    temporary = campaign_owned_path(
+        campaign,
+        target.with_name(target.name + ".restore-" + uuid.uuid4().hex),
     )
     created_target = False
     try:
@@ -892,6 +896,7 @@ def propose_recovery(
     data_subdir: Union[str, Path] = Path(".DATA") / "ACTIVE_LEARNING",
     iteration_prefix: str = "iteration",
     allow_fresh_init_on_nonempty: bool = False,
+    _active_reconcile_transaction_id: Optional[str] = None,
 ) -> ReconciliationReport:
     """Inspect the campaign tree and propose a recovered CampaignState.
 
@@ -985,7 +990,7 @@ def propose_recovery(
                 replayable = replayable_completion_receipts(
                     campaign,
                     existing,
-                    expected_config_sha256=locked_fingerprint,
+                    expected_config_sha256=None,
                 )
                 if len(replayable) > 1:
                     unsafe_reasons.append(
@@ -1074,12 +1079,37 @@ def propose_recovery(
     if intent_root.is_dir():
         for p in sorted(intent_root.glob("*.json")):
             try:
-                from ..strict_json import strict_json as _json
-                payload = _json.loads(p.read_text(encoding="utf-8"))
-            except Exception:
-                unsafe_reasons.append("unreadable submission intent: " + str(p))
+                stem = p.stem
+                matches = [
+                    phase.value
+                    for phase in CampaignPhase
+                    if stem.startswith(phase.value + "-")
+                ]
+                if len(matches) != 1:
+                    raise ValueError("intent filename has no unique phase identity")
+                phase_name = matches[0]
+                iteration_text = stem[len(phase_name) + 1 :]
+                if len(iteration_text) != 6 or not iteration_text.isdigit():
+                    raise ValueError("intent filename iteration is invalid")
+                payload = _submission_intent.load_intent(
+                    campaign,
+                    phase_name,
+                    int(iteration_text),
+                )
+                if payload is None:
+                    raise ValueError("intent disappeared during inventory")
+            except Exception as exc:
+                unsafe_reasons.append(
+                    "malformed submission intent: "
+                    + str(p)
+                    + ": "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)[:160]
+                )
+                blocking_artifacts.append("malformed submission intent")
                 continue
-            if isinstance(payload, dict) and str(payload.get("status")) in _submission_intent.ACTIVE_STATUSES:
+            if str(payload.get("status")) in _submission_intent.ACTIVE_STATUSES:
                 active_intents.append(payload)
     active_intents.sort(
         key=lambda item: (
@@ -1088,6 +1118,71 @@ def propose_recovery(
             int(item.get("iteration") or 0),
         )
     )
+    from .scratch import inventory as scratch_inventory_records
+    from .reconcile_transaction import inventory_reconcile_transactions
+
+    scratch_inventory = scratch_inventory_records(campaign)
+    reconcile_transactions = inventory_reconcile_transactions(campaign)
+    blocking_reconcile_transactions = [
+        record
+        for record in reconcile_transactions
+        if record.get("status") not in {"COMMITTED", "FAILED"}
+        and str(record.get("transaction_id") or "")
+        != str(_active_reconcile_transaction_id or "")
+    ]
+    if blocking_reconcile_transactions:
+        unsafe_reasons.append(
+            "incomplete or invalid reconcile transaction evidence: "
+            + "; ".join(
+                str(record.get("path"))
+                + " ("
+                + str(record.get("status"))
+                + ")"
+                for record in blocking_reconcile_transactions[:5]
+            )
+        )
+        blocking_artifacts.append("reconcile transaction evidence")
+        recommended_actions.append(
+            "Inspect and resolve the recorded reconcile transaction before "
+            "applying another repair."
+        )
+    invalid_scratch = [
+        record for record in scratch_inventory if record.get("status") == "invalid"
+    ]
+    prepared_scratch = [
+        record for record in scratch_inventory if record.get("status") == "prepared"
+    ]
+    retained_scratch = [
+        record
+        for record in scratch_inventory
+        if record.get("status") in {"failed_retained", "completed"}
+    ]
+    if invalid_scratch:
+        unsafe_reasons.append(
+            "invalid campaign scratch evidence: "
+            + "; ".join(
+                str(record.get("path")) + " (" + str(record.get("reason")) + ")"
+                for record in invalid_scratch[:5]
+            )
+        )
+        blocking_artifacts.append("invalid scratch evidence")
+    if prepared_scratch:
+        unsafe_reasons.append(
+            "scheduler-inconclusive prepared scratch task(s) preserve job ownership: "
+            + ", ".join(
+                str(record.get("job_id")) + "@" + str(record.get("phase"))
+                for record in prepared_scratch[:8]
+            )
+        )
+        blocking_artifacts.append("prepared scratch ownership")
+        recommended_actions.append(
+            "Inspect the recorded scratch JobIDs with sacct/squeue before recovery."
+        )
+    if retained_scratch:
+        unsafe_reasons.append(
+            "retained inactive scratch requires explicit reconcile clean-up"
+        )
+        blocking_artifacts.append("retained scratch evidence")
 
     staging_root = campaign / ".DATA" / "STAGING"
     staging_children = [
@@ -2079,6 +2174,8 @@ def propose_recovery(
         last_phase_retryable=last_phase_retryable,
         last_halt_event=last_halt_event,
         script_inventory=script_inventory,
+        scratch_inventory=scratch_inventory,
+        reconcile_transactions=reconcile_transactions,
         notes=notes,
         existing_state_loaded=existing_loaded,
         unsafe_reasons=unsafe_reasons,

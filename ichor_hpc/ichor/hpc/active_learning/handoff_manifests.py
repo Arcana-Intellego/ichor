@@ -25,15 +25,15 @@ from .layout import (
 
 
 ARIADNE_RESULTS_FILENAME = "RESULTS.json"
-ARIADNE_RESULTS_SCHEMA_VERSION = 2
+ARIADNE_RESULTS_SCHEMA_VERSION = 3
 ARIADNE_BATCH_DECISION_FILENAME = "ARIADNE_BATCH_DECISION.json"
-ARIADNE_BATCH_DECISION_SCHEMA_VERSION = 1
+ARIADNE_BATCH_DECISION_SCHEMA_VERSION = 2
 ARIADNE_LANDING_AUDIT_FILENAME = "AUDIT.json"
-ARIADNE_LANDING_AUDIT_SCHEMA_VERSION = 2
+ARIADNE_LANDING_AUDIT_SCHEMA_VERSION = 3
 PHASE_A_SAMPLE_FILENAME = "SELECTION.json"
 PHASE_A_SAMPLE_SCHEMA_VERSION = 4
 PHASE_B_SELECTION_FILENAME = "SELECTION.json"
-PHASE_B_SELECTION_SCHEMA_VERSION = 3
+PHASE_B_SELECTION_SCHEMA_VERSION = 4
 SEED_SELECTION_FILENAME = "SELECTION.json"
 SEED_SELECTION_SCHEMA_VERSION = 2
 SEED_SELECTION_DIAGNOSTICS_FILENAME = SEED_SELECTION_FILENAME
@@ -41,7 +41,7 @@ SEED_SELECTION_DIAGNOSTICS_SCHEMA_VERSION = SEED_SELECTION_SCHEMA_VERSION
 ACQUISITION_MATURITY_AUDIT_FILENAME = ARIADNE_LANDING_AUDIT_FILENAME
 ACQUISITION_MATURITY_AUDIT_SCHEMA_VERSION = ARIADNE_LANDING_AUDIT_SCHEMA_VERSION
 ARIADNE_TASK_MAP_FILENAME = "TASK_MAP.json"
-ARIADNE_TASK_MAP_SCHEMA_VERSION = 1
+ARIADNE_TASK_MAP_SCHEMA_VERSION = 2
 
 
 class HandoffManifestError(ValueError):
@@ -1519,17 +1519,50 @@ def read_phase_b_selection_manifest(
     if data.get("n_kept") is not None and _required_int(data.get("n_kept"), "Phase B n_kept") != len(final):
         raise HandoffManifestError("Phase B n_kept does not match final length")
     source_manifest_raw = data.get("source_ariadne_manifest")
-    source_manifest = None
-    if source_manifest_raw:
-        source_manifest = resolve_handoff_path(
-            root,
-            source_manifest_raw,
-            kind="Phase B source_ariadne_manifest",
-        )
-        if sha256_file(source_manifest) != str(
-            data.get("source_ariadne_manifest_sha256") or ""
-        ):
-            raise HandoffManifestError("Phase B source ARIADNE manifest hash mismatch")
+    if not isinstance(source_manifest_raw, str) or not source_manifest_raw:
+        raise HandoffManifestError("Phase B source ARIADNE manifest is missing")
+    source_manifest = resolve_handoff_path(
+        root,
+        source_manifest_raw,
+        kind="Phase B source_ariadne_manifest",
+    )
+    if source_manifest != ariadne_results_path(iter_dir).resolve():
+        raise HandoffManifestError("Phase B source ARIADNE manifest is noncanonical")
+    if sha256_file(source_manifest) != str(
+        data.get("source_ariadne_manifest_sha256") or ""
+    ):
+        raise HandoffManifestError("Phase B source ARIADNE manifest hash mismatch")
+    read_ariadne_batch_decision(
+        iter_dir,
+        expected_iteration=iteration,
+        require_accepted=True,
+    )
+    source_results = read_ariadne_results_manifest(
+        iter_dir,
+        expected_iteration=iteration,
+        require_nonempty=require_nonempty,
+        accept_legacy_missing_landing_safety=False,
+    )
+    source_by_seed = {
+        int(record["seed_id"]): dict(record) for record in source_results["accepted"]
+    }
+
+    def verify_source_record(record: Dict[str, Any], *, label: str) -> None:
+        seed_id = _required_int(record.get("seed_id"), label + " seed_id")
+        source = source_by_seed.get(seed_id)
+        if source is None:
+            raise HandoffManifestError(label + " seed is outside accepted ARIADNE results")
+        if str(record.get("seed_uid") or "") != str(source.get("seed_uid") or ""):
+            raise HandoffManifestError(label + " seed UID mismatch")
+        for key in ("seed_dir", "result_json", "provenance_json", "output_manifest"):
+            if Path(str(record[key])).resolve() != Path(str(source[key])).resolve():
+                raise HandoffManifestError(label + " " + key + " source mismatch")
+        for key in ("result_sha256", "output_manifest_sha256"):
+            if str(record.get(key) or "") != str(source.get(key) or ""):
+                raise HandoffManifestError(label + " " + key + " source mismatch")
+        safety = source.get("landing_safety")
+        if not isinstance(safety, dict) or safety.get("accepted") is not True:
+            raise HandoffManifestError(label + " source landing safety is not accepted")
     if require_nonempty and not final:
         raise HandoffManifestError("Phase B selection manifest final list is empty")
     allocation = data.get("point_allocation")
@@ -1616,6 +1649,7 @@ def read_phase_b_selection_manifest(
             Path(out_rec["provenance_json"])
         ):
             raise HandoffManifestError("Phase B raw provenance hash mismatch")
+        verify_source_record(out_rec, label="Phase B raw")
         normalised_raw.append(out_rec)
     seen_final = set()
     seen_final_raw = set()
@@ -1646,6 +1680,7 @@ def read_phase_b_selection_manifest(
             Path(out_rec["provenance_json"])
         ):
             raise HandoffManifestError("Phase B final provenance hash mismatch")
+        verify_source_record(out_rec, label="Phase B final")
         normalised_final.append(out_rec)
     if seen_final and sorted(seen_final) != list(range(1, len(seen_final) + 1)):
         raise HandoffManifestError("Phase B final_rank values must be contiguous from one")

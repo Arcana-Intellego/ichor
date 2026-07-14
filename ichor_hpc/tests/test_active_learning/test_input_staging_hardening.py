@@ -29,7 +29,10 @@ def test_copytree_no_symlinks_rejects_symlinked_pointdir_child(tmp_path):
 
 
 def test_quantum_acceptance_manifest_reports_malformed_n_total(tmp_path):
-    path = tmp_path / stg.QUANTUM_ACCEPTANCE_MANIFEST
+    path = stg.quantum_acceptance_manifest_path(
+        tmp_path,
+        phase_name="GAUSSIAN",
+    )
     path.write_text(
             json.dumps({
                 "schema_version": stg.QUANTUM_ACCEPTANCE_SCHEMA_VERSION,
@@ -46,4 +49,18 @@ def test_quantum_acceptance_manifest_reports_malformed_n_total(tmp_path):
             tmp_path,
             expected_phase="GAUSSIAN",
             expected_iteration=0,
+        )
+
+
+def test_quantum_acceptance_rejects_contradictory_dispositions(tmp_path):
+    pointdir = tmp_path / "POINT_0000.pointdir"
+    pointdir.mkdir()
+
+    with pytest.raises(ValueError, match="duplicate dispositions"):
+        stg.write_quantum_acceptance_manifest(
+            tmp_path,
+            phase_name="AIMALL",
+            iteration=1,
+            accepted=[pointdir],
+            rejected=[(pointdir.name, "failed")],
         )

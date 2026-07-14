@@ -37,7 +37,7 @@ def test_ariadne_landing_audit_roundtrip(tmp_path):
     path = write_ariadne_landing_audit(iter_dir, payload)
     assert path.name == "AUDIT.json"
     loaded = read_ariadne_landing_audit(iter_dir, expected_iteration=1)
-    assert loaded["schema_version"] == 2
+    assert loaded["schema_version"] == 3
     assert loaded["summary"]["accepted"] == 1
     assert loaded["seeds"][0]["seed_id"] == 1
 
@@ -86,7 +86,7 @@ def test_acquisition_maturity_audit_roundtrip(tmp_path):
     path = write_acquisition_maturity_audit(iter_dir, payload)
     assert path.name == "AUDIT.json"
     loaded = read_acquisition_maturity_audit(iter_dir, expected_iteration=1)
-    assert loaded["schema_version"] == 2
+    assert loaded["schema_version"] == 3
     maturity = loaded["maturity"]
     assert maturity["summary"]["n_candidates_with_spectral"] == 1
     assert maturity["summary"]["n_candidates_with_fullspace_residual"] == 1

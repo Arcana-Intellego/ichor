@@ -22,6 +22,7 @@ from ichor.hpc.active_learning.daemon.live_executor import (
     clean_stale_ariadne_seed_outputs,
 )
 from ichor.hpc.active_learning.daemon import input_staging as stg
+from ichor.hpc.active_learning.daemon import submission_intent
 from ichor.hpc.active_learning.daemon.phase_executor import (
     BackendSubmissionError,
     PhaseResult,
@@ -105,6 +106,65 @@ def _read_journal_events(campaign_dir):
         for line in journal_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+
+
+def _install_quantum_intent(ex, state, phase):
+    phase_name = phase.value if isinstance(phase, CampaignPhase) else str(phase)
+    staging = ex._quantum_staging_path(state, phase_name)
+    expected_tasks = max(1, len(list(Path(staging).glob("POINT_*.pointdir"))))
+    submission_intent.write_pre_submit_intent(
+        ex.campaign_dir,
+        campaign_uid=str(state.campaign_uid),
+        phase_name=phase_name,
+        iteration=int(state.iteration),
+        expected_tasks=expected_tasks,
+    )
+    submission_intent.mark_submitted(
+        ex.campaign_dir,
+        phase_name,
+        int(state.iteration),
+        "900001",
+        expected_tasks=expected_tasks,
+    )
+
+
+def _parse_quantum_fixture(ex, state, phase):
+    if "AIMALL" in phase.value:
+        from ichor.hpc.active_learning.daemon.state import atomic_write_json
+        from ichor.hpc.active_learning.versioning.manifest import sha256_file
+
+        staging = ex._quantum_staging_path(state, phase.value)
+        for task_index, pointdir in enumerate(sorted(staging.glob("POINT_*.pointdir"))):
+            wfns = sorted(pointdir.glob("*.wfn"))
+            if len(wfns) != 1:
+                continue
+            receipt_path, receipt = stg.rewrite_wfn_for_aimall(
+                wfns[0],
+                method=str(ex.config.gaussian.method),
+                phase_name=phase.value,
+                iteration=int(state.iteration),
+                task_index=task_index,
+                source_acceptance_sha256="0" * 64,
+            )
+            atomic_write_json(
+                pointdir / stg.AIMALL_TASK_METADATA,
+                {
+                    "schema_version": stg.AIMALL_TASK_METADATA_SCHEMA_VERSION,
+                    "atom_count": 3,
+                    "primitive_count": 1,
+                    "nproc": 1,
+                    "naat": 1,
+                    "electronic_method": str(receipt["method"]),
+                    "wfn_sha256": str(receipt["wfn"]["after_sha256"]),
+                    "wfn_method_receipt": {
+                        "path": receipt_path.name,
+                        "sha256": sha256_file(receipt_path),
+                    },
+                    "resource_resolution": {"fixture": True},
+                },
+            )
+    _install_quantum_intent(ex, state, phase)
+    return ex._parse_quantum_postprocess(state, phase, observations=[])
 
 
 def _seed_point_allocation(
@@ -214,6 +274,32 @@ def _complete_point_allocation(
         pointdir.name: pointdir
         for pointdir in sorted(Path(staging).glob("POINT_*.pointdir"))
     }
+    from ichor.hpc.active_learning.daemon.quantum_quality import (
+        write_quantum_quality_manifest,
+    )
+
+    quality_path = write_quantum_quality_manifest(
+        Path(staging),
+        phase_name=(
+            CampaignPhase.INITIAL_AIMALL.value
+            if str(context) == "bootstrap"
+            else CampaignPhase.AIMALL.value
+        ),
+        iteration=int(iteration),
+        records=[{
+            "pointdir": pointdir.name,
+            "accepted": True,
+            "reasons": [],
+            "atom_count": 1,
+            "n_int": 1,
+            "per_atom": [{
+                "atom": "H1",
+                "iqa_ha": -0.5,
+                "integration_error": 0.0,
+            }],
+        } for pointdir in pointdirs.values()],
+        gates={},
+    )
     record_quantum_results(
         allocation_path,
         [
@@ -221,6 +307,7 @@ def _complete_point_allocation(
                 "candidate_id": str(attempt["candidate_id"]),
                 "accepted": True,
                 "pointdir": str(pointdirs[str(attempt["pointdir_name"])]),
+                "quality_manifest": str(quality_path.resolve()),
             }
             for attempt in pending_attempts(allocation)
         ],
@@ -284,9 +371,7 @@ def test_initial_gaussian_happy_path(tmp_path):
     ex = _make_executor(tmp_path)
     _bind_staging(ex, FIXTURES / "initial_quantum")
     state = SimpleNamespace(iteration=0, campaign_uid="m16-test")
-    result = ex._parse_quantum_postprocess(
-        state, CampaignPhase("INITIAL_GAUSSIAN"), observations=[],
-    )
+    result = _parse_quantum_fixture(ex, state, CampaignPhase("INITIAL_GAUSSIAN"))
     assert isinstance(result, PhaseResult)
     assert result.is_complete is True
     assert result.failure_reason is None
@@ -303,9 +388,7 @@ def test_iter_gaussian_happy_path(tmp_path):
     ex = _make_executor(tmp_path)
     _bind_staging(ex, FIXTURES / "iter_quantum")
     state = SimpleNamespace(iteration=3, campaign_uid="m16-test", reference_data_version=0)
-    result = ex._parse_quantum_postprocess(
-        state, CampaignPhase("GAUSSIAN"), observations=[],
-    )
+    result = _parse_quantum_fixture(ex, state, CampaignPhase("GAUSSIAN"))
     assert result.is_complete is True
     assert result.failure_reason is None
 
@@ -327,9 +410,7 @@ def test_initial_aimall_happy_path(tmp_path):
         rejected=[],
     )
     state = SimpleNamespace(iteration=0, campaign_uid="m16-test")
-    result = ex._parse_quantum_postprocess(
-        state, CampaignPhase("INITIAL_AIMALL"), observations=[],
-    )
+    result = _parse_quantum_fixture(ex, state, CampaignPhase("INITIAL_AIMALL"))
     assert result.is_complete is True
     assert result.failure_reason is None
     events = _read_journal_events(tmp_path / "campaign")
@@ -360,7 +441,10 @@ def test_stage_aimall_inputs_writes_resolved_naat_metadata(tmp_path):
         phase_name="INITIAL_GAUSSIAN",
         iteration=0,
         accepted=accepted,
-        rejected=[],
+        rejected=[
+            (pointdir.name, "fixture_not_selected")
+            for pointdir in sorted(staging.glob("POINT_*.pointdir"))[1:]
+        ],
     )
     cfg = CampaignConfig()
     cfg.resources.aimall_cpus_per_task = 8
@@ -421,9 +505,7 @@ def test_aimall_parser_only_consumes_gaussian_accepted_pointdirs(tmp_path):
     )
     state = SimpleNamespace(iteration=0, campaign_uid="m16-test")
 
-    result = ex._parse_quantum_postprocess(
-        state, CampaignPhase("INITIAL_AIMALL"), observations=[],
-    )
+    result = _parse_quantum_fixture(ex, state, CampaignPhase("INITIAL_AIMALL"))
 
     assert result.failure_reason is None
     manifest = json.loads((staging / stg.QUANTUM_ACCEPTANCE_MANIFEST).read_text(encoding="utf-8"))
@@ -434,9 +516,7 @@ def test_partial_rejection_below_threshold_still_succeeds(tmp_path):
     ex = _make_executor(tmp_path, failure_threshold=0.5)
     staging = _bind_staging(ex, FIXTURES / "iter_quantum_scf_failure")
     state = SimpleNamespace(iteration=5, campaign_uid="m16-test")
-    result = ex._parse_quantum_postprocess(
-        state, CampaignPhase("GAUSSIAN"), observations=[],
-    )
+    result = _parse_quantum_fixture(ex, state, CampaignPhase("GAUSSIAN"))
     assert result.failure_reason is None
     manifest = json.loads((staging / stg.QUANTUM_ACCEPTANCE_MANIFEST).read_text(encoding="utf-8"))
     assert manifest["phase"] == "GAUSSIAN"
@@ -452,9 +532,7 @@ def test_high_gaussian_rejection_is_deferred_to_allocation_replacement(tmp_path)
     ex = _make_executor(tmp_path, failure_threshold=0.3)
     staging = _bind_staging(ex, FIXTURES / "iter_quantum_scf_failure")
     state = SimpleNamespace(iteration=5, campaign_uid="m16-test")
-    result = ex._parse_quantum_postprocess(
-        state, CampaignPhase("GAUSSIAN"), observations=[],
-    )
+    result = _parse_quantum_fixture(ex, state, CampaignPhase("GAUSSIAN"))
     assert result.is_complete is True
     assert result.failure_reason is None
     manifest = json.loads(
@@ -468,9 +546,7 @@ def test_missing_staging_dir_sets_failure_reason(tmp_path):
     ex = _make_executor(tmp_path)
     _bind_staging(ex, tmp_path / "ghost_staging_that_does_not_exist")
     state = SimpleNamespace(iteration=2, campaign_uid="m16-test", reference_data_version=0)
-    result = ex._parse_quantum_postprocess(
-        state, CampaignPhase("GAUSSIAN"), observations=[],
-    )
+    result = _parse_quantum_fixture(ex, state, CampaignPhase("GAUSSIAN"))
     assert result.failure_reason is not None
     assert "no_pointdirs_in_staging" in result.failure_reason
 
@@ -519,7 +595,9 @@ def test_postprocess_dispatches_to_quantum_handler(tmp_path):
     ex = _make_executor(tmp_path)
     _bind_staging(ex, FIXTURES / "initial_quantum")
     state = SimpleNamespace(iteration=0, campaign_uid="m16-test")
-    result = ex.postprocess(state, CampaignPhase("INITIAL_GAUSSIAN"), observations=[])
+    phase = CampaignPhase("INITIAL_GAUSSIAN")
+    _install_quantum_intent(ex, state, phase)
+    result = ex.postprocess(state, phase, observations=[])
     assert result.is_complete is True
     assert result.failure_reason is None
 
@@ -574,7 +652,7 @@ def test_commit_initial_reference_data_rejects_incomplete_allocation(tmp_path):
         stg.commit_initial_reference_data(campaign)
 
 
-def test_initial_aimall_reader_migrates_legacy_gaussian_alias(tmp_path):
+def test_initial_aimall_reader_rejects_legacy_gaussian_alias(tmp_path):
     campaign = tmp_path / "campaign"
     initial = campaign / ".DATA" / "STAGING" / "initial"
     pointdir = initial / "POINT_0000.pointdir"
@@ -593,18 +671,13 @@ def test_initial_aimall_reader_migrates_legacy_gaussian_alias(tmp_path):
         encoding="utf-8",
     )
 
-    pointdirs, manifest = stg.read_quantum_acceptance_manifest(
-        initial,
-        expected_phase="INITIAL_GAUSSIAN",
-        expected_iteration=0,
-        require_points_file_membership=True,
-    )
-
-    assert [p.name for p in pointdirs] == ["POINT_0000.pointdir"]
-    assert manifest["phase"] == "INITIAL_GAUSSIAN"
-    migrated = initial / "accepted_pointdirs.INITIAL_GAUSSIAN.json"
-    assert migrated.is_file()
-    assert json.loads(migrated.read_text(encoding="utf-8")) == legacy
+    with pytest.raises(FileNotFoundError, match="quantum acceptance manifest missing"):
+        stg.read_quantum_acceptance_manifest(
+            initial,
+            expected_phase="INITIAL_GAUSSIAN",
+            expected_iteration=0,
+            require_points_file_membership=True,
+        )
 
 
 def test_commit_initial_reference_data_rejects_missing_point_allocation(tmp_path):
@@ -1144,6 +1217,10 @@ def _write_seeds_picked(campaign_dir, iteration, n_seeds):
     from ichor.hpc.active_learning.daemon.submission_intent import (
         write_pre_submit_intent,
     )
+    from ichor.hpc.active_learning.daemon.config_lock import (
+        canonical_config,
+        config_fingerprint,
+    )
 
     campaign_dir.mkdir(parents=True, exist_ok=True)
     pool_source = campaign_dir / "_test_pool.xyz"
@@ -1208,7 +1285,13 @@ def _write_seeds_picked(campaign_dir, iteration, n_seeds):
         expected_tasks=int(n_seeds),
         decision_contract={
             "failure_threshold_fraction": 0.5,
-            "config_sha256": "d" * 64,
+            "config_sha256": config_fingerprint(
+                canonical_config(
+                    CampaignConfig.from_yaml(campaign_dir / "campaign.yaml")
+                    if (campaign_dir / "campaign.yaml").is_file()
+                    else CampaignConfig()
+                )
+            ),
         },
     )
     return iter_dir
@@ -2079,27 +2162,6 @@ def _write_phase_b_manifest(iter_dir, *, n_final=1, write_sample=True):
     state_path.parent.mkdir(parents=True, exist_ok=True)
     write_state(state_path, state)
     _seed_ariadne_pool(campaign, iteration=iteration, n_seeds=int(n_final))
-    from ichor.hpc.active_learning.daemon.config_lock import (
-        canonical_config,
-        config_fingerprint,
-    )
-    from ichor.hpc.active_learning.daemon.submission_intent import (
-        write_pre_submit_intent,
-    )
-
-    write_pre_submit_intent(
-        campaign,
-        campaign_uid="m16-test",
-        phase_name=_CampaignPhase.ARIADNE_ARRAY.value,
-        iteration=iteration,
-        expected_tasks=int(n_final),
-        decision_contract={
-            "failure_threshold_fraction": float(
-                cfg.runtime.failure_threshold_fraction
-            ),
-            "config_sha256": config_fingerprint(canonical_config(cfg)),
-        },
-    )
     for seed_index in range(int(n_final)):
         seed_dir = ariadne_seed_dir(iter_dir, seed_index + 1)
         result_path = seed_dir / "result.json"

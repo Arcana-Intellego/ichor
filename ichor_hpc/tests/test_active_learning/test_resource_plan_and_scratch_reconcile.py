@@ -19,7 +19,7 @@ from ichor.hpc.active_learning.daemon.resource_records import (
     write_resolution,
 )
 from ichor.hpc.active_learning.daemon.resource_solver import ResolvedPhaseResources
-from ichor.hpc.active_learning.daemon.scratch import prepare_task_scratch
+from ichor.hpc.active_learning.daemon.scratch import inventory, prepare_task_scratch
 from ichor.hpc.active_learning.daemon.submission_intent import (
     bind_resource_resolution,
     load_intent,
@@ -70,6 +70,20 @@ def _failed_scratch(campaign: Path, identity: str = "r0000-a0001-deadbeef") -> P
     )
     finish_task_scratch(leaf, success=False)
     return leaf
+
+
+def test_scratch_inventory_reports_every_unowned_entry(tmp_path):
+    root = tmp_path / ".DATA" / "SCRATCH"
+    root.mkdir(parents=True)
+    (root / "unexpected.txt").write_text("unknown\n", encoding="utf-8")
+    (root / "BROKEN").mkdir()
+
+    records = inventory(tmp_path)
+
+    assert len(records) == 2
+    assert {record["status"] for record in records} == {"invalid"}
+    assert any("outside a task directory" in record["reason"] for record in records)
+    assert any("component is malformed" in record["reason"] for record in records)
 
 
 def test_scratch_reconcile_preview_then_apply(monkeypatch, tmp_path, capsys):

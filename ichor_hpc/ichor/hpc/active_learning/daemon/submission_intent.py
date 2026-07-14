@@ -15,14 +15,24 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
 from .job_names import live_job_name
-from .state import atomic_write_json
+from .state import CampaignPhase, atomic_write_json
 from .filesystem import operational_path
 
 
-INTENT_SCHEMA_VERSION = 1
+INTENT_SCHEMA_VERSION = 2
 INTENT_DIR_NAME = "submission_intents"
 INTENT_HISTORY_DIR_NAME = "history"
 ACTIVE_STATUSES = frozenset({"PRE_SUBMIT", "SUBMITTED", "ADOPTED"})
+TERMINAL_STATUSES = frozenset({"COMPLETED", "FAILED", "SUPERSEDED"})
+INTENT_STATUSES = ACTIVE_STATUSES | TERMINAL_STATUSES
+_STATUS_TRANSITIONS = {
+    "PRE_SUBMIT": frozenset({"PRE_SUBMIT", "SUBMITTED", "ADOPTED", "FAILED", "SUPERSEDED"}),
+    "SUBMITTED": frozenset({"SUBMITTED", "ADOPTED", "COMPLETED", "FAILED", "SUPERSEDED"}),
+    "ADOPTED": frozenset({"ADOPTED", "COMPLETED", "FAILED", "SUPERSEDED"}),
+    "COMPLETED": frozenset({"COMPLETED"}),
+    "FAILED": frozenset({"FAILED", "SUPERSEDED"}),
+    "SUPERSEDED": frozenset({"SUPERSEDED"}),
+}
 
 
 def _now_iso() -> str:
@@ -38,6 +48,121 @@ def _duration_seconds(start: Optional[str], end: Optional[str]) -> Optional[floa
     except ValueError:
         return None
     return max(0.0, float((end_dt - start_dt).total_seconds()))
+
+
+def _exact_int(value: Any, label: str, *, minimum: int = 0) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(label + " must be an exact JSON integer")
+    if value < minimum:
+        raise ValueError(label + " must be >= " + str(minimum))
+    return value
+
+
+def _timestamp(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(label + " must be a non-empty ISO-8601 string")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(label + " must be ISO-8601") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(label + " must include a timezone")
+    return value
+
+
+def _validate_intent_payload(
+    data: Any,
+    *,
+    path: Path,
+    phase_name: str,
+    iteration: int,
+    expected_campaign_uid: Optional[str],
+) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        raise ValueError("submission intent must be a JSON object: " + str(path))
+    if _exact_int(data.get("schema_version"), "submission intent schema_version") != INTENT_SCHEMA_VERSION:
+        raise ValueError("unsupported submission intent schema: " + str(path))
+    if str(data.get("phase") or "") != str(phase_name):
+        raise ValueError("submission intent phase mismatch: " + str(path))
+    if str(phase_name) not in {phase.value for phase in CampaignPhase}:
+        raise ValueError("submission intent phase is unknown: " + str(phase_name))
+    recorded_iteration = _exact_int(
+        data.get("iteration"), "submission intent iteration"
+    )
+    if recorded_iteration != int(iteration):
+        raise ValueError("submission intent iteration mismatch: " + str(path))
+    campaign_uid = data.get("campaign_uid")
+    if not isinstance(campaign_uid, str) or not campaign_uid:
+        raise ValueError("submission intent campaign_uid must be non-empty")
+    if expected_campaign_uid is not None and campaign_uid != str(expected_campaign_uid):
+        raise ValueError("submission intent campaign UID mismatch")
+    attempt_id = data.get("attempt_id")
+    if (
+        not isinstance(attempt_id, str)
+        or len(attempt_id) != 32
+        or any(character not in "0123456789abcdef" for character in attempt_id)
+    ):
+        raise ValueError("submission intent attempt_id is invalid")
+    sequence = _exact_int(
+        data.get("attempt_sequence"), "submission intent attempt_sequence", minimum=1
+    )
+    replacement_round = _exact_int(
+        data.get("replacement_round"), "submission intent replacement_round"
+    )
+    identity = data.get("submission_identity")
+    if not isinstance(identity, str) or not identity:
+        raise ValueError("submission intent submission_identity must be non-empty")
+    expected_name = data.get("expected_job_name")
+    if not isinstance(expected_name, str) or not expected_name:
+        raise ValueError("submission intent expected_job_name must be non-empty")
+    recomputed = expected_job_name(
+        campaign_uid,
+        phase_name,
+        recorded_iteration,
+        replacement_round=replacement_round,
+        attempt_sequence=sequence,
+        attempt_id=attempt_id,
+    )
+    if expected_name != recomputed:
+        raise ValueError("submission intent expected job name does not match identity")
+    status = data.get("status")
+    if status not in INTENT_STATUSES:
+        raise ValueError("submission intent status is unknown: " + repr(status))
+    job_id = data.get("job_id")
+    if job_id is not None and (not isinstance(job_id, str) or not job_id):
+        raise ValueError("submission intent job_id must be non-empty or null")
+    if status in {"SUBMITTED", "ADOPTED", "COMPLETED"} and not job_id:
+        raise ValueError("submission intent status " + status + " requires job_id")
+    if status == "PRE_SUBMIT" and job_id is not None:
+        raise ValueError("PRE_SUBMIT intent cannot already contain job_id")
+    if status in {"FAILED", "SUPERSEDED"} and (
+        not isinstance(data.get("reason"), str) or not str(data.get("reason")).strip()
+    ):
+        raise ValueError("terminal submission intent requires a reason")
+    _timestamp(data.get("created_iso"), "submission intent created_iso")
+    _timestamp(data.get("updated_iso"), "submission intent updated_iso")
+    _timestamp(data.get("updated_at_iso"), "submission intent updated_at_iso")
+    for label in ("submitted_at_iso", "adopted_at_iso", "completed_at_iso"):
+        if data.get(label) is not None:
+            _timestamp(data[label], "submission intent " + label)
+    expected_tasks = data.get("expected_tasks")
+    if expected_tasks is not None:
+        data["expected_tasks"] = _exact_int(
+            expected_tasks, "submission intent expected_tasks", minimum=1
+        )
+    job_ids_seen = data.get("job_ids_seen", [])
+    if not isinstance(job_ids_seen, list) or any(
+        not isinstance(value, str) or not value for value in job_ids_seen
+    ):
+        raise ValueError("submission intent job_ids_seen must be a list of job IDs")
+    if len(job_ids_seen) != len(set(job_ids_seen)):
+        raise ValueError("submission intent job_ids_seen contains duplicates")
+    if job_id is not None and job_id not in job_ids_seen:
+        raise ValueError("submission intent job_id is absent from job_ids_seen")
+    decision_contract = data.get("decision_contract")
+    if decision_contract is not None:
+        data["decision_contract"] = _validated_decision_contract(decision_contract)
+    return data
 
 
 def _validated_decision_contract(value: Any) -> Dict[str, Any]:
@@ -105,69 +230,13 @@ def load_intent(
         return None
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    if not isinstance(data, dict):
-        raise ValueError("submission intent must be a JSON object: " + str(path))
-    if int(data.get("schema_version", -1)) != INTENT_SCHEMA_VERSION:
-        raise ValueError("unsupported submission intent schema: " + str(path))
-    recorded_phase = data.get("phase")
-    if str(recorded_phase) != str(phase_name):
-        raise ValueError(
-            "submission intent phase mismatch for "
-            + str(path)
-            + ": expected "
-            + str(phase_name)
-            + " got "
-            + repr(recorded_phase)
-        )
-    try:
-        recorded_iteration = int(data.get("iteration"))
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "submission intent iteration is malformed for " + str(path)
-        ) from exc
-    if recorded_iteration != int(iteration):
-        raise ValueError(
-            "submission intent iteration mismatch for "
-            + str(path)
-            + ": expected "
-            + str(int(iteration))
-            + " got "
-            + str(recorded_iteration)
-        )
-    status = data.get("status")
-    if status is not None and not isinstance(status, str):
-        raise ValueError("submission intent status must be a string: " + str(path))
-    expected = data.get("expected_job_name")
-    if expected is not None and not isinstance(expected, str):
-        raise ValueError(
-            "submission intent expected_job_name must be a string: " + str(path)
-        )
-    identity = data.get("submission_identity")
-    if identity is not None:
-        if not isinstance(identity, str) or not identity:
-            raise ValueError("submission intent identity must be a non-empty string")
-        try:
-            sequence = int(data.get("attempt_sequence"))
-            replacement_round = int(data.get("replacement_round", 0))
-        except (TypeError, ValueError) as exc:
-            raise ValueError("submission intent attempt identity is malformed") from exc
-        attempt_id = str(data.get("attempt_id") or "")
-        if sequence <= 0 or replacement_round < 0 or not attempt_id:
-            raise ValueError("submission intent attempt identity is invalid")
-        recomputed = expected_job_name(
-            data.get("campaign_uid"),
-            phase_name,
-            int(iteration),
-            replacement_round=replacement_round,
-            attempt_sequence=sequence,
-            attempt_id=attempt_id,
-        )
-        if expected != recomputed:
-            raise ValueError("submission intent expected job name does not match identity")
-    if expected_campaign_uid is not None and str(data.get("campaign_uid") or "") != str(
-        expected_campaign_uid
-    ):
-        raise ValueError("submission intent campaign UID mismatch")
+    data = _validate_intent_payload(
+        data,
+        path=path,
+        phase_name=str(phase_name),
+        iteration=int(iteration),
+        expected_campaign_uid=expected_campaign_uid,
+    )
     for key in (
         "resource_resolution_path",
         "resource_formula_version",
@@ -183,22 +252,6 @@ def load_intent(
         or any(ch not in "0123456789abcdef" for ch in digest)
     ):
         raise ValueError("submission intent resource_resolution_sha256 is invalid")
-    expected_tasks = data.get("expected_tasks")
-    if expected_tasks is not None:
-        if isinstance(expected_tasks, bool):
-            raise ValueError("submission intent expected_tasks is malformed")
-        try:
-            parsed_expected_tasks = int(expected_tasks)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "submission intent expected_tasks is malformed"
-            ) from exc
-        if parsed_expected_tasks <= 0:
-            raise ValueError("submission intent expected_tasks must be > 0")
-        data["expected_tasks"] = parsed_expected_tasks
-    decision_contract = data.get("decision_contract")
-    if decision_contract is not None:
-        data["decision_contract"] = _validated_decision_contract(decision_contract)
     return data
 
 
@@ -241,14 +294,26 @@ def write_pre_submit_intent(
     expected_tasks: Optional[int] = None,
     decision_contract: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    path = intent_path(campaign_dir, phase_name, iteration)
-    previous = load_intent(campaign_dir, phase_name, iteration)
+    if not isinstance(campaign_uid, str) or not campaign_uid:
+        raise ValueError("submission intent campaign_uid must be a non-empty string")
+    if not isinstance(phase_name, str) or not phase_name:
+        raise ValueError("submission intent phase must be a non-empty string")
+    iteration_value = _exact_int(iteration, "submission intent iteration")
+    round_number = _exact_int(
+        replacement_round,
+        "submission intent replacement_round",
+    )
+    path = intent_path(campaign_dir, phase_name, iteration_value)
+    previous = load_intent(campaign_dir, phase_name, iteration_value)
     previous_sequence = 0
     if previous is not None:
-        try:
-            previous_sequence = max(0, int(previous.get("attempt_sequence", 0)))
-        except (TypeError, ValueError):
-            previous_sequence = 0
+        if str(previous.get("status")) not in TERMINAL_STATUSES:
+            raise ValueError("refusing to replace an active submission intent")
+        previous_sequence = _exact_int(
+            previous.get("attempt_sequence"),
+            "submission intent attempt_sequence",
+            minimum=1,
+        )
         previous_attempt = str(previous.get("attempt_id") or "legacy")
         safe_attempt = "".join(ch for ch in previous_attempt if ch.isalnum())[:32]
         if not safe_attempt:
@@ -259,7 +324,7 @@ def write_pre_submit_intent(
             / (
                 str(phase_name).replace("/", "_").replace("\\", "_")
                 + "-"
-                + str(int(iteration)).zfill(6)
+                + str(iteration_value).zfill(6)
                 + "-"
                 + safe_attempt
                 + ".json"
@@ -269,7 +334,6 @@ def write_pre_submit_intent(
         atomic_write_json(history_path, previous)
     attempt_sequence = previous_sequence + 1
     attempt_id = uuid.uuid4().hex
-    round_number = max(0, int(replacement_round))
     identity = (
         "r"
         + str(round_number).zfill(4)
@@ -284,13 +348,13 @@ def write_pre_submit_intent(
         "attempt_sequence": int(attempt_sequence),
         "replacement_round": int(round_number),
         "submission_identity": identity,
-        "campaign_uid": str(campaign_uid),
-        "phase": str(phase_name),
-        "iteration": int(iteration),
+        "campaign_uid": campaign_uid,
+        "phase": phase_name,
+        "iteration": iteration_value,
         "expected_job_name": expected_job_name(
             campaign_uid,
             phase_name,
-            iteration,
+            iteration_value,
             replacement_round=round_number,
             attempt_sequence=attempt_sequence,
             attempt_id=attempt_id,
@@ -300,9 +364,9 @@ def write_pre_submit_intent(
         "created_iso": _now_iso(),
     }
     if expected_tasks is not None:
-        parsed_expected = int(expected_tasks)
-        if parsed_expected <= 0:
-            raise ValueError("submission intent expected_tasks must be > 0")
+        parsed_expected = _exact_int(
+            expected_tasks, "submission intent expected_tasks", minimum=1
+        )
         payload["expected_tasks"] = parsed_expected
     if decision_contract is not None:
         payload["decision_contract"] = _validated_decision_contract(decision_contract)
@@ -345,13 +409,9 @@ def update_intent_status(
     completion_receipt: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     path = intent_path(campaign_dir, phase_name, iteration)
-    data = load_intent(campaign_dir, phase_name, iteration) or {
-        "schema_version": INTENT_SCHEMA_VERSION,
-        "attempt_id": uuid.uuid4().hex,
-        "phase": str(phase_name),
-        "iteration": int(iteration),
-        "created_iso": _now_iso(),
-    }
+    data = load_intent(campaign_dir, phase_name, iteration)
+    if data is None:
+        raise FileNotFoundError("submission intent does not exist")
     if not str(data.get("campaign_uid") or ""):
         from .filesystem import operational_path
 
@@ -364,7 +424,18 @@ def update_intent_status(
                     data["campaign_uid"] = state_uid
             except (OSError, ValueError, AttributeError):
                 pass
-    data["status"] = str(status)
+    new_status = str(status)
+    if new_status not in INTENT_STATUSES:
+        raise ValueError("unknown submission intent status: " + repr(new_status))
+    previous_status = str(data.get("status"))
+    if new_status not in _STATUS_TRANSITIONS[previous_status]:
+        raise ValueError(
+            "illegal submission intent transition: "
+            + previous_status
+            + " -> "
+            + new_status
+        )
+    data["status"] = new_status
     lifecycle = data.get("queue_lifecycle")
     if not isinstance(lifecycle, dict):
         lifecycle = {}
@@ -379,7 +450,9 @@ def update_intent_status(
     if reason is not None:
         data["reason"] = str(reason)
     if expected_tasks is not None:
-        data["expected_tasks"] = int(expected_tasks)
+        data["expected_tasks"] = _exact_int(
+            expected_tasks, "submission intent expected_tasks", minimum=1
+        )
     if submission_metadata:
         metadata = dict(submission_metadata)
         data["submission_metadata"] = metadata
@@ -388,34 +461,43 @@ def update_intent_status(
             data["array_recovery"] = dict(array_recovery)
             logical_total = array_recovery.get("logical_total")
             retry_count = array_recovery.get("n_retry")
-            try:
-                if logical_total is not None:
-                    data["logical_expected_tasks"] = int(logical_total)
-            except (TypeError, ValueError):
-                pass
-            try:
-                if retry_count is not None:
-                    data["retry_expected_tasks"] = int(retry_count)
-            except (TypeError, ValueError):
-                pass
+            if logical_total is not None:
+                data["logical_expected_tasks"] = _exact_int(
+                    logical_total,
+                    "submission intent logical_expected_tasks",
+                    minimum=1,
+                )
+            if retry_count is not None:
+                data["retry_expected_tasks"] = _exact_int(
+                    retry_count,
+                    "submission intent retry_expected_tasks",
+                    minimum=1,
+                )
     if job_ids_seen is not None:
         data["job_ids_seen"] = [str(x) for x in list(job_ids_seen)]
     if completion_receipt is not None:
         data["completion_receipt"] = dict(completion_receipt)
-    if str(status) == "SUBMITTED":
+    if new_status == "SUBMITTED":
         submitted_at = data.get("submitted_at_iso") or _now_iso()
         data["submitted_at_iso"] = str(submitted_at)
         lifecycle.setdefault("submitted_at_iso", str(submitted_at))
-    if str(status) == "ADOPTED":
+    if new_status == "ADOPTED":
         adopted_at = data.get("adopted_at_iso") or _now_iso()
         data["adopted_at_iso"] = str(adopted_at)
         lifecycle.setdefault("adopted_at_iso", str(adopted_at))
-    if str(status) == "COMPLETED":
+    if new_status == "COMPLETED":
         completed_at = data.get("completed_at_iso") or _now_iso()
         data["completed_at_iso"] = str(completed_at)
         lifecycle.setdefault("completed_at_iso", str(completed_at))
     data["queue_lifecycle"] = lifecycle
-    return _write_payload(path, data)
+    updated = _write_payload(path, data)
+    return _validate_intent_payload(
+        updated,
+        path=path,
+        phase_name=str(phase_name),
+        iteration=int(iteration),
+        expected_campaign_uid=None,
+    )
 
 
 def record_queue_lifecycle(
@@ -473,11 +555,17 @@ def record_queue_lifecycle(
     else:
         set_once(event_name + "_at_iso", now)
     if n_expected is not None:
-        lifecycle["n_expected"] = int(n_expected)
+        lifecycle["n_expected"] = _exact_int(
+            n_expected, "submission lifecycle n_expected", minimum=1
+        )
     if n_observed is not None:
-        lifecycle["n_observed"] = int(n_observed)
+        lifecycle["n_observed"] = _exact_int(
+            n_observed, "submission lifecycle n_observed"
+        )
     if n_missing is not None:
-        lifecycle["n_missing"] = int(n_missing)
+        lifecycle["n_missing"] = _exact_int(
+            n_missing, "submission lifecycle n_missing"
+        )
 
     submitted_at = lifecycle.get("submitted_at_iso") or data.get("submitted_at_iso")
     first_seen = lifecycle.get("first_squeue_at_iso") or lifecycle.get("first_sacct_at_iso")
@@ -494,7 +582,15 @@ def record_queue_lifecycle(
     if postprocess_seconds is not None:
         lifecycle["postprocess_seconds"] = postprocess_seconds
     data["queue_lifecycle"] = lifecycle
-    updated = _write_payload(intent_path(campaign_dir, phase_name, iteration), data)
+    path = intent_path(campaign_dir, phase_name, iteration)
+    updated = _write_payload(path, data)
+    updated = _validate_intent_payload(
+        updated,
+        path=path,
+        phase_name=str(phase_name),
+        iteration=int(iteration),
+        expected_campaign_uid=None,
+    )
     return {"changed_keys": changed, "intent": updated}
 
 
@@ -546,14 +642,22 @@ def bind_resource_resolution(
     if expected_tasks is not None:
         if isinstance(expected_tasks, bool):
             raise ValueError("submission intent expected_tasks is malformed")
-        parsed_expected_tasks = int(expected_tasks)
-        if parsed_expected_tasks <= 0:
-            raise ValueError("submission intent expected_tasks must be > 0")
+        parsed_expected_tasks = _exact_int(
+            expected_tasks, "submission intent expected_tasks", minimum=1
+        )
         # The initial PRE_SUBMIT value can describe the unrecovered logical
         # array.  Once staging has produced a dense retry array, this field
         # must snapshot the task count that Slurm will actually report.
         intent["expected_tasks"] = parsed_expected_tasks
-    return _write_payload(intent_path(campaign_dir, phase_name, int(iteration)), intent)
+    target = intent_path(campaign_dir, phase_name, int(iteration))
+    updated = _write_payload(target, intent)
+    return _validate_intent_payload(
+        updated,
+        path=target,
+        phase_name=str(phase_name),
+        iteration=int(iteration),
+        expected_campaign_uid=None,
+    )
 
 
 def mark_adopted(

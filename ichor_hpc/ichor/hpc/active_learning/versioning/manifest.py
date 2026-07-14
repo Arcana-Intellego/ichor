@@ -17,7 +17,7 @@ from ..strict_json import strict_json as json
 import os
 import platform
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 
@@ -40,6 +40,62 @@ _BLOCK_SIZE = 1 << 20   # 1 MiB; fits comfortably in L2 cache while limiting sys
 
 class ManifestMismatchError(RuntimeError):
     """Raised when verify_manifest detects content drift."""
+
+
+def _canonical_manifest_entry(key: object, digest: object) -> Tuple[str, str]:
+    if not isinstance(key, str) or not key:
+        raise ManifestMismatchError("manifest path must be a non-empty string")
+    if "\\" in key:
+        raise ManifestMismatchError("manifest path must use POSIX separators: " + repr(key))
+    path = PurePosixPath(key)
+    windows_path = PureWindowsPath(key)
+    if (
+        path.is_absolute()
+        or windows_path.is_absolute()
+        or windows_path.drive
+        or key.startswith("//")
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or path.as_posix() != key
+    ):
+        raise ManifestMismatchError("manifest path is noncanonical: " + repr(key))
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise ManifestMismatchError(
+            "manifest digest must be a lowercase SHA-256 for " + repr(key)
+        )
+    return key, digest
+
+
+def _validated_manifest(manifest: object) -> Dict[str, str]:
+    if not isinstance(manifest, dict):
+        raise ManifestMismatchError("manifest must be a JSON object")
+    validated: Dict[str, str] = {}
+    for raw_key, raw_digest in manifest.items():
+        key, digest = _canonical_manifest_entry(raw_key, raw_digest)
+        if key in validated:
+            raise ManifestMismatchError("duplicate canonical manifest path: " + key)
+        validated[key] = digest
+    return validated
+
+
+def _manifest_file(root: Path, relative: str) -> Path:
+    root_absolute = Path(os.path.abspath(os.fspath(root)))
+    candidate = root_absolute.joinpath(*PurePosixPath(relative).parts)
+    try:
+        candidate.relative_to(root_absolute)
+    except ValueError as exc:
+        raise ManifestMismatchError("manifest path escapes its root: " + relative) from exc
+    current = root_absolute
+    if current.is_symlink():
+        raise ManifestMismatchError("manifest root is a symlink: " + str(root))
+    for part in PurePosixPath(relative).parts:
+        current = current / part
+        if current.is_symlink():
+            raise ManifestMismatchError("manifest path contains a symlink: " + relative)
+    return candidate
 
 
 def sha256_file(path: Union[str, Path]) -> str:
@@ -132,9 +188,10 @@ def read_manifest(root: Union[str, Path]) -> Dict[str, str]:
         raise ManifestMismatchError(
             "manifest at " + str(p) + " is not valid json: " + str(exc)
         ) from exc
-    if not isinstance(data, dict):
-        raise ValueError("manifest must be a JSON object at " + str(p))
-    return {str(k): str(v) for k, v in data.items()}
+    try:
+        return _validated_manifest(data)
+    except ManifestMismatchError as exc:
+        raise ManifestMismatchError("invalid manifest at " + str(p) + ": " + str(exc)) from exc
 
 
 def write_manifest(root: Union[str, Path], manifest: Dict[str, str]) -> Path:
@@ -146,7 +203,7 @@ def write_manifest(root: Union[str, Path], manifest: Dict[str, str]) -> Path:
     from ..daemon.state import atomic_write_json
 
     p = Path(root) / MANIFEST_FILENAME
-    atomic_write_json(p, manifest)
+    atomic_write_json(p, _validated_manifest(manifest))
     return p
 
 
@@ -187,6 +244,7 @@ def verify_manifest(
     *,
     manifest: Optional[Dict[str, str]] = None,
     strict: bool = True,
+    exact: bool = False,
 ) -> Tuple[List[str], List[str]]:
     """Check that every file recorded in the manifest still hashes to its
     recorded SHA-256. Returns (missing, mismatched) lists.
@@ -202,19 +260,28 @@ def verify_manifest(
     root_path = Path(root)
     if manifest is None:
         manifest = read_manifest(root_path)
+    else:
+        manifest = _validated_manifest(manifest)
     missing: List[str] = []
     mismatched: List[str] = []
     for rel, expected_sha in manifest.items():
-        candidate = root_path / rel
+        candidate = _manifest_file(root_path, rel)
         if not candidate.is_file():
             missing.append(rel)
             continue
         actual = sha256_file(candidate)
         if actual != expected_sha:
             mismatched.append(rel)
+    unexpected: List[str] = []
+    if exact:
+        actual_keys = set(compute_directory_manifest(root_path))
+        unexpected = sorted(actual_keys - set(manifest))
+        mismatched.extend("unexpected:" + value for value in unexpected)
     if strict and (missing or mismatched):
         raise ManifestMismatchError(
             "manifest verification failed for " + str(root_path) + ": "
-            + str(len(missing)) + " missing, " + str(len(mismatched)) + " mismatched"
+            + str(len(missing)) + " missing, "
+            + str(len(mismatched) - len(unexpected)) + " mismatched, "
+            + str(len(unexpected)) + " unexpected"
         )
     return missing, mismatched

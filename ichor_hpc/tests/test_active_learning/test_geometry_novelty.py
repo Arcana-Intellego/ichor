@@ -161,7 +161,7 @@ def test_geometry_novelty_nearest_neighbour_fallback_is_not_trajectory_adjacent(
     assert local_diag["nearest_pool_rmsd"]["nearest_k"] == 1
 
 
-def test_geometry_novelty_movement_history_reads_ariadne_landing_audit(tmp_path):
+def test_geometry_novelty_rejects_incomplete_landing_audit_history(tmp_path):
     cfg = CampaignConfig()
     cfg.geometry_novelty.scale_source = "movement_history"
     iter1 = _iter_dir(tmp_path, iteration=1)
@@ -203,16 +203,13 @@ def test_geometry_novelty_movement_history_reads_ariadne_landing_audit(tmp_path)
 
     payload = compute_geometry_novelty_scale(tmp_path, cfg, iteration=2)
 
-    assert payload["fallback_used"] is False
-    assert payload["scale_angstrom"] == pytest.approx(0.07)
+    assert payload["fallback_used"] is True
+    assert payload["scale_angstrom"] == pytest.approx(0.05)
     history_diag = payload["diagnostics"]["movement_history"]
-    assert history_diag["source"] == "ariadne_landing_audit"
-    assert history_diag["n_accepted_movements"] == 1
-    assert history_diag["n_skipped_handoff_rejected"] == 1
-    assert history_diag["n_skipped_rejected"] == 1
+    assert "error" in history_diag
 
 
-def test_geometry_novelty_movement_history_falls_back_to_ariadne_results(tmp_path):
+def test_geometry_novelty_rejects_results_without_landing_audit(tmp_path):
     cfg = CampaignConfig()
     cfg.geometry_novelty.scale_source = "movement_history"
     iter1 = _iter_dir(tmp_path, iteration=1)
@@ -239,9 +236,9 @@ def test_geometry_novelty_movement_history_falls_back_to_ariadne_results(tmp_pat
 
     payload = compute_geometry_novelty_scale(tmp_path, cfg, iteration=2)
 
-    assert payload["fallback_used"] is False
-    assert payload["scale_angstrom"] == pytest.approx(0.09)
-    assert payload["diagnostics"]["movement_history"]["source"] == "ariadne_results"
+    assert payload["fallback_used"] is True
+    assert payload["scale_angstrom"] == pytest.approx(0.05)
+    assert "error" in payload["diagnostics"]["movement_history"]
 
 
 def test_scaled_threshold_and_scores_are_dimensionless():
@@ -422,7 +419,7 @@ def test_geometry_novelty_recomputes_when_history_file_changes(tmp_path):
         encoding="utf-8",
     )
     first = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=2)
-    assert first["scale_angstrom"] == pytest.approx(0.07)
+    assert first["scale_angstrom"] == pytest.approx(0.05)
 
     audit.write_text(
         json.dumps(
@@ -444,7 +441,7 @@ def test_geometry_novelty_recomputes_when_history_file_changes(tmp_path):
     )
     second = ensure_geometry_novelty_scale(tmp_path, cfg, iteration=2)
 
-    assert second["scale_angstrom"] == pytest.approx(0.11)
+    assert second["scale_angstrom"] == pytest.approx(0.05)
     assert "input_fingerprint_mismatch_recomputed" in second["reasons"]
     mismatch = second["diagnostics"]["input_fingerprint_mismatch"]["keys"]
     assert "history_source_files" in mismatch

@@ -5,13 +5,33 @@ import pytest
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.geometry_protocol import PHASE_B_MIN_SEPARATION_SCALE
 from ichor.hpc.active_learning.handoff_manifests import (
+    ARIADNE_RESULTS_SCHEMA_VERSION,
     ariadne_landing_audit_path,
     ariadne_results_path,
     seeds_picked_path,
+    write_ariadne_landing_audit,
+    write_ariadne_results_manifest,
 )
 from ichor.hpc.active_learning.layout import (
+    active_ariadne_dir,
     active_iteration_dir,
     ariadne_seed_dir,
+)
+from ichor.hpc.active_learning.ariadne_outputs import (
+    SEED_OUTPUT_MANIFEST_FILENAME,
+    write_optimisation_trajectory,
+    write_seed_output_manifest,
+)
+from ichor.hpc.active_learning.daemon.state import atomic_write_json
+from ichor.hpc.active_learning.seed_identity import (
+    deterministic_seed_uid,
+    selection_fingerprint_sha256,
+    write_ariadne_task_map,
+)
+from ichor.hpc.active_learning.versioning.manifest import sha256_file
+from ichor.hpc.active_learning.versioning.provenance import (
+    PROVENANCE_FILENAME,
+    write_seed_provenance,
 )
 from ichor.hpc.active_learning.sampling_protocol import (
     hidden_sampling_overrides,
@@ -28,6 +48,173 @@ from ichor.hpc.active_learning.sampling_scale_model import (
     read_sampling_scale_model,
     sampling_scale_model_path,
 )
+
+
+def _write_strict_history(
+    campaign,
+    *,
+    iteration=1,
+    movement=0.2,
+    residual=0.3,
+    min_pair=0.9,
+):
+    iter_dir = active_iteration_dir(campaign, iteration)
+    ariadne_root = active_ariadne_dir(iter_dir)
+    selection = {
+        "schema_version": 2,
+        "campaign_uid": "sampling-protocol-test",
+        "iteration": int(iteration),
+        "models_version": 0,
+        "model_manifest_sha256": "a" * 64,
+        "trajectory_sha256": "b" * 64,
+        "selection_strategy": "hybrid_variance",
+        "n_picked": 1,
+        "seed_records": [{
+            "seed_id": 1,
+            "frame_id": 10,
+            "pool_row_index_zero_based": 10,
+            "selection_origin": "bulk",
+            "variance_at_selection": 0.1,
+        }],
+    }
+    fingerprint = selection_fingerprint_sha256(selection)
+    selection["selection_fingerprint_sha256"] = fingerprint
+    seed_uid = deterministic_seed_uid(
+        campaign_uid=selection["campaign_uid"],
+        iteration=int(iteration),
+        seed_id=1,
+        frame_id=10,
+        models_version=0,
+        model_manifest_sha256=selection["model_manifest_sha256"],
+        selection_fingerprint_sha256_value=fingerprint,
+    )
+    selection["seed_records"][0]["seed_uid"] = seed_uid
+    selection_path = seeds_picked_path(iter_dir)
+    selection_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(selection_path, selection)
+    task_map_path = write_ariadne_task_map(iter_dir, selection)
+
+    seed_dir = ariadne_seed_dir(iter_dir, 1)
+    seed_dir.mkdir(parents=True, exist_ok=True)
+    result_path = seed_dir / "result.json"
+    landing_safety = {
+        "accepted": True,
+        "policy": "raw_final",
+        "selected_origin": "raw_final",
+        "selected_candidate_index": 0,
+        "reasons": [],
+        "record_only_reasons": [],
+        "metrics": {
+            "movement_rmsd_ang": float(movement),
+            "aligned_rmsd_ang": float(movement),
+            "fullspace_residual_distance": float(residual),
+            "min_pair_distance_ang": float(min_pair),
+        },
+        "raw_final": {},
+        "n_candidates_evaluated": 1,
+        "n_safe_candidates": 1,
+    }
+    result = {
+        "iteration": int(iteration),
+        "seed_id": 1,
+        "seed_uid": seed_uid,
+        "array_task_id": 0,
+        "seed_frame_id": 10,
+        "trajectory_sha256": "b" * 64,
+        "atom_types": ["H", "H"],
+        "seed_coordinates": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        "final_coordinates": [
+            [float(movement) / 2.0, 0.0, 0.0],
+            [1.0 + float(movement), 0.0, 0.0],
+        ],
+        "alpha_trajectory": [0.0, 1.0],
+        "alpha_initial": 0.0,
+        "alpha_final": 1.0,
+        "n_evaluations": 2,
+        "return_code": 0,
+        "wall_seconds": 1.0,
+        "fell_back_to_ds": False,
+        "whitened_distance_final": 0.5,
+        "landing_safety": landing_safety,
+    }
+    atomic_write_json(result_path, result)
+    write_optimisation_trajectory(
+        seed_dir,
+        atom_types=result["atom_types"],
+        coordinate_frames=[result["final_coordinates"]],
+        alpha_values=[1.0],
+        gradient_norms=[0.0],
+        origins=["raw_final"],
+    )
+    output_manifest = write_seed_output_manifest(
+        seed_dir,
+        campaign_uid=selection["campaign_uid"],
+        iteration=int(iteration),
+        seed_id=1,
+        seed_uid=seed_uid,
+        array_task_id=0,
+        task_success=True,
+        task_exit_code=0,
+    )
+    provenance_path = write_seed_provenance(
+        seed_dir,
+        campaign_uid=selection["campaign_uid"],
+        iteration=int(iteration),
+        trajectory_sha256="b" * 64,
+        seed_frame_id=10,
+        seed_id=1,
+        seed_uid=seed_uid,
+        array_task_id_zero_based=0,
+        seed_selection_origin="bulk",
+        seed_variance_at_selection=0.1,
+        subspace_neighbour_frame_ids=[],
+        subspace_dimension=0,
+        subspace_eigenvalues=[],
+        mode_weighting_policy="variance",
+    )
+    accepted_record = {
+        "seed_id": 1,
+        "seed_uid": seed_uid,
+        "array_task_id": 0,
+        "seed_frame_id": 10,
+        "seed_dir": seed_dir.relative_to(ariadne_root).as_posix(),
+        "result_json": result_path.relative_to(ariadne_root).as_posix(),
+        "provenance_json": provenance_path.relative_to(ariadne_root).as_posix(),
+        "output_manifest": output_manifest.relative_to(ariadne_root).as_posix(),
+        "return_code": 0,
+        "landing_safety": landing_safety,
+        "result_sha256": sha256_file(result_path),
+        "provenance_sha256": sha256_file(provenance_path),
+        "output_manifest_sha256": sha256_file(output_manifest),
+    }
+    write_ariadne_results_manifest(iter_dir, {
+        "schema_version": ARIADNE_RESULTS_SCHEMA_VERSION,
+        "campaign_uid": selection["campaign_uid"],
+        "iteration": int(iteration),
+        "trajectory_sha256": "b" * 64,
+        "task_map": {
+            "path": task_map_path.relative_to(ariadne_root).as_posix(),
+            "sha256": sha256_file(task_map_path),
+        },
+        "expected_n": 1,
+        "n_accepted": 1,
+        "n_rejected": 0,
+        "accepted": [accepted_record],
+        "rejected": [],
+    })
+    write_ariadne_landing_audit(iter_dir, {
+        "iteration": int(iteration),
+        "summary": {"accepted": 1, "rejected": 0},
+        "seeds": [{
+            "seed_id": 1,
+            "seed_uid": seed_uid,
+            "seed_dir": seed_dir.relative_to(ariadne_root).as_posix(),
+            "result_json": result_path.relative_to(ariadne_root).as_posix(),
+            "landing_safety": landing_safety,
+            "handoff_accepted": True,
+        }],
+    })
+    return iter_dir
 
 
 def test_level_five_preview_matches_current_balanced_defaults():
@@ -201,46 +388,7 @@ def test_resolve_or_load_rejects_partial_protocol_snapshot(tmp_path):
 
 
 def test_scale_model_uses_previous_result_json_motion_history(tmp_path):
-    iter1 = active_iteration_dir(tmp_path, 1)
-    seed_dir = ariadne_seed_dir(iter1, 1)
-    seed_dir.mkdir(parents=True)
-    result_path = seed_dir / "result.json"
-    result_path.write_text(
-        json.dumps(
-            {
-                "seed_coordinates": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-                "final_coordinates": [[0.1, 0.0, 0.0], [1.2, 0.0, 0.0]],
-            }
-        ),
-        encoding="utf-8",
-    )
-    ariadne_landing_audit_path(iter1).write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "iteration": 1,
-                "summary": {},
-                "seeds": [
-                    {
-                        "seed_id": 1,
-                        "seed_dir": str(seed_dir),
-                        "result_json": str(result_path),
-                        "handoff_accepted": True,
-                        "landing_safety": {
-                            "accepted": True,
-                            "metrics": {
-                                "movement_rmsd_ang": 0.2,
-                                "aligned_rmsd_ang": 0.2,
-                                "fullspace_residual_distance": 0.3,
-                                "min_pair_distance_ang": 0.9,
-                            },
-                        },
-                    }
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
+    _write_strict_history(tmp_path, movement=0.2, residual=0.3, min_pair=0.9)
 
     cfg = CampaignConfig()
     resolved = resolve_sampling_protocol(tmp_path, cfg, iteration=2)
@@ -260,47 +408,8 @@ def test_scale_model_uses_previous_result_json_motion_history(tmp_path):
     assert scale["model_version"] == 2
 
 
-def test_scale_model_ignores_rejected_landing_history(tmp_path):
-    iter1 = active_iteration_dir(tmp_path, 1)
-    iter1.mkdir(parents=True)
-    ariadne_landing_audit_path(iter1).parent.mkdir(parents=True, exist_ok=True)
-    ariadne_landing_audit_path(iter1).write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "iteration": 1,
-                "seeds": [
-                    {
-                        "seed_id": 1,
-                        "handoff_accepted": False,
-                        "landing_safety": {
-                            "accepted": False,
-                            "metrics": {
-                                "movement_rmsd_ang": 9.0,
-                                "aligned_rmsd_ang": 9.0,
-                                "fullspace_residual_distance": 9.0,
-                                "min_pair_distance_ang": 0.1,
-                            },
-                        },
-                    },
-                    {
-                        "seed_id": 2,
-                        "handoff_accepted": True,
-                        "landing_safety": {
-                            "accepted": True,
-                            "metrics": {
-                                "movement_rmsd_ang": 0.2,
-                                "aligned_rmsd_ang": 0.2,
-                                "fullspace_residual_distance": 0.3,
-                                "min_pair_distance_ang": 0.9,
-                            },
-                        },
-                    },
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
+def test_scale_model_uses_only_strictly_accepted_history(tmp_path):
+    _write_strict_history(tmp_path, movement=0.2, residual=0.3, min_pair=0.9)
 
     resolved = resolve_sampling_protocol(tmp_path, CampaignConfig(), iteration=2)
     scale = resolved.scale_model_payload
@@ -308,12 +417,12 @@ def test_scale_model_ignores_rejected_landing_history(tmp_path):
     assert scale["geometry_motion_scale"]["value_angstrom"] == pytest.approx(0.2)
     assert scale["residual_fullspace_scale"]["value_angstrom"] == pytest.approx(0.3)
     history_filter = scale["history"]["filter"]
-    assert history_filter["n_seen"] == 2
+    assert history_filter["n_seen"] == 1
     assert history_filter["n_used"] == 1
-    assert history_filter["n_skipped_handoff_rejected"] == 1
+    assert history_filter["n_skipped_handoff_rejected"] == 0
 
 
-def test_scale_model_falls_back_to_results_when_audit_has_no_usable_records(tmp_path):
+def test_scale_model_rejects_results_only_legacy_history(tmp_path):
     iter1 = active_iteration_dir(tmp_path, 1)
     iter1.mkdir(parents=True)
     ariadne_landing_audit_path(iter1).parent.mkdir(parents=True, exist_ok=True)
@@ -348,9 +457,10 @@ def test_scale_model_falls_back_to_results_when_audit_has_no_usable_records(tmp_
     resolved = resolve_sampling_protocol(tmp_path, CampaignConfig(), iteration=2)
     scale = resolved.scale_model_payload
 
-    assert scale["geometry_motion_scale"]["value_angstrom"] == pytest.approx(0.25)
-    assert scale["residual_fullspace_scale"]["value_angstrom"] == pytest.approx(0.35)
-    assert scale["history"]["filter"]["n_fallback_results_records_used"] == 1
+    assert scale["geometry_motion_scale"]["value_angstrom"] == pytest.approx(0.05)
+    assert scale["residual_fullspace_scale"]["value_angstrom"] == pytest.approx(0.5)
+    assert scale["history"]["filter"]["n_skipped_malformed_record"] == 1
+    assert scale["history"]["filter"]["n_fallback_results_records_used"] == 0
 
 
 def test_scale_model_reports_malformed_and_duplicate_legacy_history(tmp_path):
@@ -405,11 +515,11 @@ def test_scale_model_reports_malformed_and_duplicate_legacy_history(tmp_path):
     resolved = resolve_sampling_protocol(tmp_path, CampaignConfig(), iteration=2)
     history_filter = resolved.scale_model_payload["history"]["filter"]
 
-    assert history_filter["n_skipped_malformed_record"] == 2
-    assert history_filter["n_skipped_landing_rejected"] == 1
-    assert history_filter["n_deduplicated_fallback_records"] == 1
-    assert history_filter["n_results_records_used"] == 1
-    assert history_filter["n_fallback_results_records_used"] == 1
+    assert history_filter["n_skipped_malformed_record"] == 1
+    assert history_filter["n_skipped_landing_rejected"] == 0
+    assert history_filter["n_deduplicated_fallback_records"] == 0
+    assert history_filter["n_results_records_used"] == 0
+    assert history_filter["n_fallback_results_records_used"] == 0
 
 
 def test_scale_model_populates_per_seed_records_from_seed_records(tmp_path):
@@ -459,33 +569,7 @@ def test_scale_model_populates_per_seed_records_from_seed_records(tmp_path):
 
 
 def test_preview_uses_campaign_history_without_writing_manifests(tmp_path):
-    iter1 = active_iteration_dir(tmp_path, 1)
-    iter1.mkdir(parents=True)
-    ariadne_landing_audit_path(iter1).parent.mkdir(parents=True, exist_ok=True)
-    ariadne_landing_audit_path(iter1).write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "iteration": 1,
-                "seeds": [
-                    {
-                        "seed_id": 1,
-                        "handoff_accepted": True,
-                        "landing_safety": {
-                            "accepted": True,
-                            "metrics": {
-                                "movement_rmsd_ang": 0.22,
-                                "aligned_rmsd_ang": 0.22,
-                                "fullspace_residual_distance": 0.44,
-                                "min_pair_distance_ang": 0.9,
-                            },
-                        },
-                    }
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
+    _write_strict_history(tmp_path, movement=0.22, residual=0.44, min_pair=0.9)
 
     resolved = preview_sampling_protocol(
         CampaignConfig(),

@@ -166,6 +166,28 @@ def _commit_training_and_model_versions(campaign: Path, versions):
             allocation["slot_assignment_sha256"]
         ),
     )
+    from ichor.hpc.active_learning.daemon.quantum_quality import (
+        write_quantum_quality_manifest,
+    )
+
+    quality_path = write_quantum_quality_manifest(
+        pointdir.parent,
+        phase_name=CampaignPhase.INITIAL_AIMALL.value,
+        iteration=0,
+        records=[{
+            "pointdir": pointdir.name,
+            "accepted": True,
+            "reasons": [],
+            "atom_count": 1,
+            "n_int": 1,
+            "per_atom": [{
+                "atom": "H1",
+                "iqa_ha": -0.5,
+                "integration_error": 0.0,
+            }],
+        }],
+        gates={},
+    )
     record_quantum_results(
         allocation_path,
         [
@@ -173,6 +195,7 @@ def _commit_training_and_model_versions(campaign: Path, versions):
                 "candidate_id": str(attempt["candidate_id"]),
                 "accepted": True,
                 "pointdir": str(pointdir.resolve()),
+                "quality_manifest": str(quality_path.resolve()),
             }
         ],
     )

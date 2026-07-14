@@ -326,6 +326,29 @@ def test_repair_index_from_committed_pointdirs_adds_missing_records(tmp_path):
             allocation["slot_assignment_sha256"]
         ),
     )
+    from ichor.hpc.active_learning.daemon.quantum_quality import (
+        write_quantum_quality_manifest,
+    )
+    from ichor.hpc.active_learning.daemon.state import CampaignPhase
+
+    quality_path = write_quantum_quality_manifest(
+        pdir.parent,
+        phase_name=CampaignPhase.INITIAL_AIMALL.value,
+        iteration=0,
+        records=[{
+            "pointdir": pdir.name,
+            "accepted": True,
+            "reasons": [],
+            "atom_count": 1,
+            "n_int": 1,
+            "per_atom": [{
+                "atom": "H1",
+                "iqa_ha": -0.5,
+                "integration_error": 0.0,
+            }],
+        }],
+        gates={},
+    )
     record_quantum_results(
         allocation_path,
         [
@@ -333,6 +356,7 @@ def test_repair_index_from_committed_pointdirs_adds_missing_records(tmp_path):
                 "candidate_id": str(attempt["candidate_id"]),
                 "accepted": True,
                 "pointdir": str(pdir),
+                "quality_manifest": str(quality_path.resolve()),
             }
         ],
     )
@@ -753,6 +777,31 @@ def test_load_training_seed_frame_ids_self_heals_from_sidecars(tmp_path):
                 "pointdir": str(pd),
             }
         )
+    from ichor.hpc.active_learning.daemon.quantum_quality import (
+        write_quantum_quality_manifest,
+    )
+    from ichor.hpc.active_learning.daemon.state import CampaignPhase
+
+    quality_path = write_quantum_quality_manifest(
+        campaign / ".DATA" / "STAGING" / "initial",
+        phase_name=CampaignPhase.INITIAL_AIMALL.value,
+        iteration=0,
+        records=[{
+            "pointdir": Path(result["pointdir"]).name,
+            "accepted": True,
+            "reasons": [],
+            "atom_count": 1,
+            "n_int": 1,
+            "per_atom": [{
+                "atom": "H1",
+                "iqa_ha": -0.5,
+                "integration_error": 0.0,
+            }],
+        } for result in results],
+        gates={},
+    )
+    for result in results:
+        result["quality_manifest"] = str(quality_path.resolve())
     record_quantum_results(allocation_path, results)
     commit_reference_data_delta(
         campaign,

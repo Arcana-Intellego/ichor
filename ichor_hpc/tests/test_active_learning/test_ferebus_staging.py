@@ -16,7 +16,6 @@ import numpy as np
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.daemon import input_staging as stg
 from ichor.hpc.active_learning.point_allocation import (
-    accepted_attempts,
     allocation_targets,
     create_point_allocation,
     pending_attempts,
@@ -109,8 +108,9 @@ def _prepare_bootstrap_training(
         primary_candidates=candidates,
         reserve_candidates=[],
     )
+    fixture_attempts = list(pending_attempts(allocation))
     results = []
-    for attempt in pending_attempts(allocation):
+    for attempt in fixture_attempts:
         pointdir = source_dir / str(attempt["pointdir_name"])
         pointdir.mkdir(parents=True)
         (pointdir / "input.gjf").write_text("# synthetic\n", encoding="utf-8")
@@ -119,8 +119,7 @@ def _prepare_bootstrap_training(
             "accepted": True,
             "pointdir": str(pointdir),
         })
-    allocation = record_quantum_results(allocation_path, results)
-    for attempt in accepted_attempts(allocation):
+    for attempt in fixture_attempts:
         pointdir = source_dir / str(attempt["pointdir_name"])
         write_seed_provenance(
             pointdir,
@@ -144,6 +143,32 @@ def _prepare_bootstrap_training(
                 allocation["slot_assignment_sha256"]
             ),
         )
+    from ichor.hpc.active_learning.daemon.quantum_quality import (
+        write_quantum_quality_manifest,
+    )
+    from ichor.hpc.active_learning.daemon.state import CampaignPhase
+
+    quality_path = write_quantum_quality_manifest(
+        source_dir,
+        phase_name=CampaignPhase.INITIAL_AIMALL.value,
+        iteration=0,
+        records=[{
+            "pointdir": str(attempt["pointdir_name"]),
+            "accepted": True,
+            "reasons": [],
+            "atom_count": 1,
+            "n_int": 1,
+            "per_atom": [{
+                "atom": "H1",
+                "iqa_ha": -0.5,
+                "integration_error": 0.0,
+            }],
+        } for attempt in fixture_attempts],
+        gates={},
+    )
+    for result in results:
+        result["quality_manifest"] = str(quality_path.resolve())
+    allocation = record_quantum_results(allocation_path, results)
     stg.commit_reference_data_delta(
         campaign,
         reference_data_version=0,

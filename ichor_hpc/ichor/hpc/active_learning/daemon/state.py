@@ -46,8 +46,8 @@ __all__ = [
 ]
 
 
-SCHEMA_VERSION = 7
-READABLE_SCHEMA_VERSIONS = frozenset({6, SCHEMA_VERSION})
+SCHEMA_VERSION = 8
+READABLE_SCHEMA_VERSIONS = frozenset({SCHEMA_VERSION})
 DEFAULT_STATE_FILENAME = "state.json"
 
 
@@ -119,13 +119,14 @@ def _coerce_alpha_history(payload):
     # alpha_history drives the stop check, so a bad value is a schema problem.
     # raise StateSchemaError (not a bare ValueError) so the run loop routes it
     # to the graceful reconcile hint rather than a raw traceback.
-    raw = payload.get("alpha_history", []) or []
-    try:
-        values = [float(x) for x in raw]
-    except (TypeError, ValueError) as exc:
-        raise StateSchemaError(
-            "alpha_history must be a list of numbers, got " + repr(raw)[:120]
-        ) from exc
+    raw = payload.get("alpha_history", [])
+    if not isinstance(raw, list):
+        raise StateSchemaError("alpha_history must be a JSON list")
+    values = []
+    for item in raw:
+        if not _is_finite_number(item):
+            raise StateSchemaError("alpha_history must contain only finite numbers")
+        values.append(float(item))
     for value in values:
         if not math.isfinite(value):
             raise StateSchemaError(
@@ -144,27 +145,23 @@ def _is_finite_number(value: Any) -> bool:
 
 def _coerce_state_int(payload: Dict[str, Any], key: str, default: Any = None) -> int:
     raw = payload.get(key, default)
-    if isinstance(raw, bool):
+    if not isinstance(raw, int) or isinstance(raw, bool):
         raise StateSchemaError(key + " must be an integer")
-    try:
-        return int(raw)
-    except (TypeError, ValueError) as exc:
-        raise StateSchemaError(key + " must be an integer") from exc
+    return raw
 
 
 def _coerce_sacct_empty_streak(payload: Dict[str, Any]) -> Dict[str, int]:
-    raw = payload.get("sacct_empty_streak", {}) or {}
+    raw = payload.get("sacct_empty_streak", {})
     if not isinstance(raw, dict):
         raise StateSchemaError("sacct_empty_streak must be an object")
     parsed: Dict[str, int] = {}
     for key, value in raw.items():
-        if isinstance(value, bool):
+        if not isinstance(key, str) or not key:
+            raise StateSchemaError("sacct_empty_streak keys must be non-empty strings")
+        if not isinstance(value, int) or isinstance(value, bool):
             raise StateSchemaError("sacct_empty_streak values must be integers")
-        try:
-            parsed[str(key)] = int(value)
-        except (TypeError, ValueError) as exc:
-            raise StateSchemaError("sacct_empty_streak values must be integers") from exc
-        if parsed[str(key)] < 0:
+        parsed[key] = value
+        if value < 0:
             raise StateSchemaError("sacct_empty_streak values must be >= 0")
     return parsed
 
@@ -188,14 +185,22 @@ def _coerce_lifecycle_context(payload: Dict[str, Any]) -> Optional[Dict[str, Any
         )
     if parsed["from_phase"] not in {phase.value for phase in CampaignPhase}:
         raise StateSchemaError("lifecycle_context.from_phase is not a known phase")
-    if isinstance(parsed.get("iteration"), bool):
+    if not isinstance(parsed.get("iteration"), int) or isinstance(
+        parsed.get("iteration"), bool
+    ):
         raise StateSchemaError("lifecycle_context.iteration must be an integer")
-    try:
-        parsed["iteration"] = int(parsed.get("iteration"))
-    except (TypeError, ValueError) as exc:
-        raise StateSchemaError("lifecycle_context.iteration must be an integer") from exc
     if parsed["iteration"] < 0:
         raise StateSchemaError("lifecycle_context.iteration must be >= 0")
+    try:
+        timestamp = datetime.fromisoformat(parsed["timestamp_iso"])
+    except ValueError as exc:
+        raise StateSchemaError(
+            "lifecycle_context.timestamp_iso must be ISO-8601"
+        ) from exc
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise StateSchemaError(
+            "lifecycle_context.timestamp_iso must include a timezone"
+        )
     for key in ("job_id", "exception_type", "source", "recovery_action"):
         value = parsed.get(key)
         if value is not None and (not isinstance(value, str) or not value):
@@ -309,6 +314,24 @@ class CampaignState:
         for key in required_str:
             if not isinstance(payload.get(key), str) or not payload[key]:
                 raise StateSchemaError("missing or non-string field: " + key)
+        try:
+            parsed_started = datetime.fromisoformat(payload["campaign_started_iso"])
+        except ValueError as exc:
+            raise StateSchemaError("campaign_started_iso must be ISO-8601") from exc
+        if parsed_started.tzinfo is None or parsed_started.utcoffset() is None:
+            raise StateSchemaError("campaign_started_iso must include a timezone")
+        campaign_uid = payload["campaign_uid"]
+        if (
+            len(campaign_uid) > 128
+            or any(
+                character
+                not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-"
+                for character in campaign_uid
+            )
+        ):
+            raise StateSchemaError(
+                "campaign_uid must be a non-empty safe identity token"
+            )
         for key in required_int:
             if not isinstance(payload.get(key), int) or isinstance(payload.get(key), bool):
                 raise StateSchemaError("missing or non-int field: " + key)
@@ -387,14 +410,12 @@ class CampaignState:
         # (booleans are int subclasses in python, so reject those too.) (A31)
         ref_scales = payload.get("reference_scales")
         if ref_scales is not None:
-            if not isinstance(ref_scales, dict) or not all(
-                isinstance(k, str)
-                and _is_finite_number(v)
-                for k, v in ref_scales.items()
-            ):
-                raise StateSchemaError(
-                    "reference_scales must be null or an object of string -> finite number"
-                )
+            try:
+                from .model_contract import validate_reference_scales
+
+                ref_scales = validate_reference_scales(ref_scales)
+            except Exception as exc:
+                raise StateSchemaError("reference_scales are invalid: " + str(exc)) from exc
 
         reference_scales_iteration = _coerce_state_int(
             payload,
@@ -417,6 +438,10 @@ class CampaignState:
         lifecycle_context = _coerce_lifecycle_context(payload)
         completion_reference = _coerce_completion_reference(payload)
         if lifecycle_context is not None:
+            if int(lifecycle_context["iteration"]) != iteration:
+                raise StateSchemaError(
+                    "lifecycle_context.iteration must match state iteration"
+                )
             disposition = str(lifecycle_context["disposition"])
             if disposition == "halted" and phase is not CampaignPhase.HALTED:
                 raise StateSchemaError("halted lifecycle_context requires phase HALTED")
@@ -437,15 +462,13 @@ class CampaignState:
             last_acquisition_alpha0=None if alpha0 is None else float(alpha0),
             stop_streak=stop_streak,
             shutdown_requested=shutdown_requested,
-            reference_scales=payload.get("reference_scales"),
+            reference_scales=ref_scales,
             reference_scales_iteration=reference_scales_iteration,
             alpha_history=_coerce_alpha_history(payload),
             last_n_anti_overlap_flagged=last_n_anti_overlap_flagged,
             sacct_empty_streak=sacct_empty_streak,
             lifecycle_context=lifecycle_context,
             last_completion_receipt=completion_reference,
-            # Schema 6 is accepted as an input migration only.  Any later
-            # write emits the current schema atomically.
             schema_version=SCHEMA_VERSION,
             campaign_uid=str(payload["campaign_uid"]),
             campaign_started_iso=str(payload["campaign_started_iso"]),
