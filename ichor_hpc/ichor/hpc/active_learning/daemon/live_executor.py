@@ -2414,6 +2414,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 record = evaluate_aimall_pointdir(
                     pdir,
                     getattr(self.config, "quality_gates", None),
+                    expected_method=str(self.config.gaussian.method),
                 )
                 quality_records.append(record)
                 if bool(record.get("accepted")):
@@ -5229,6 +5230,18 @@ def _aimall_invocation_block(
         *_pointdir_selection_lines(points_file, required_filename="input.wfn"),
         'cd "$POINT_DIR"',
         'if [ ! -f AIMALL_TASK.json ]; then echo "AIMALL_TASK.json missing in $POINT_DIR" >&2; exit 1; fi',
+        python
+        + " -c "
+        + _shell_quote(
+            "import hashlib,json,pathlib,sys; "
+            "m=json.load(open('AIMALL_TASK.json',encoding='utf-8')); "
+            "w=pathlib.Path('input.wfn'); "
+            "r=pathlib.Path(m['wfn_method_receipt']['path']); "
+            "sha=lambda p: hashlib.sha256(p.read_bytes()).hexdigest(); "
+            "sys.exit(0 if sha(w)==m['wfn_sha256'] and "
+            "sha(r)==m['wfn_method_receipt']['sha256'] else "
+            "('AIMAll WFN method receipt binding mismatch'))"
+        ),
         "AIMALL_NAAT=$("
         + python
         + " -c "

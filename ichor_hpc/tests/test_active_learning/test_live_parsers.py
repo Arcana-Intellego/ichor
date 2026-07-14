@@ -350,9 +350,9 @@ def test_stage_aimall_inputs_writes_resolved_naat_metadata(tmp_path):
         next(accepted[0].glob("*.gjf")),
         accepted[0] / "input.gjf",
     )
-    (accepted[0] / "input.wfn").write_text(
-        "Synthetic wavefunction   3 MOL ORBITALS   10 PRIMITIVES   3 NUCLEI\n",
-        encoding="utf-8",
+    shutil.copy2(
+        next(accepted[0].glob("*.wfn")),
+        accepted[0] / "input.wfn",
     )
     stg.write_points_file(staging, sorted(staging.glob("POINT_*.pointdir")))
     stg.write_quantum_acceptance_manifest(
@@ -378,6 +378,9 @@ def test_stage_aimall_inputs_writes_resolved_naat_metadata(tmp_path):
     assert task["atom_count"] == 3
     assert task["nproc"] == 8
     assert task["naat"] == 3
+    assert task["electronic_method"] == "B3LYP"
+    assert task["wfn_sha256"]
+    assert task["wfn_method_receipt"]["path"] == stg.WFN_METHOD_RECEIPT
 
     from ichor.hpc.active_learning.daemon.resource_solver import (
         resolve_phase_resources,

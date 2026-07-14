@@ -16,6 +16,7 @@ from .state import atomic_write_json
 
 QUANTUM_QUALITY_MANIFEST = "quantum_quality.json"
 QUANTUM_QUALITY_SCHEMA_VERSION = 1
+SUPPORTED_AIMALL_METHODS = frozenset({"HF", "M062X", "B3LYP", "PBE", "PBE0"})
 
 
 @dataclass
@@ -41,7 +42,37 @@ def _finite_float(value: Any) -> Optional[float]:
     return out if math.isfinite(out) else None
 
 
-def evaluate_aimall_pointdir(pointdir: Any, gates: Any = None) -> Dict[str, Any]:
+def canonicalise_aimall_method(value: Any) -> str:
+    """Return the electronic method token shared by WFN and INT contracts."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("AIMAll electronic method must be a non-empty string")
+    compact = "".join(character for character in value.upper() if character.isalnum())
+    for prefix in ("UNRESTRICTED", "RESTRICTED"):
+        if compact.startswith(prefix):
+            compact = compact[len(prefix) :]
+            break
+    aliases = {
+        "HARTREEFOCK": "HF",
+        "RHF": "HF",
+        "UHF": "HF",
+        "ROHF": "HF",
+        "M062X": "M062X",
+    }
+    compact = aliases.get(compact, compact)
+    if compact not in SUPPORTED_AIMALL_METHODS and len(compact) > 1:
+        unrestricted = compact[1:] if compact[0] in {"R", "U"} else compact
+        compact = aliases.get(unrestricted, unrestricted)
+    if compact not in SUPPORTED_AIMALL_METHODS:
+        raise ValueError("unsupported AIMAll electronic method: " + repr(value))
+    return compact
+
+
+def evaluate_aimall_pointdir(
+    pointdir: Any,
+    gates: Any = None,
+    *,
+    expected_method: Optional[str] = None,
+) -> Dict[str, Any]:
     """Return quality metrics and rejection reasons for one AIMAll pointdir."""
     gates = gates or _DefaultQualityGates()
     path = Path(getattr(pointdir, "path", pointdir))
@@ -68,13 +99,21 @@ def evaluate_aimall_pointdir(pointdir: Any, gates: Any = None) -> Dict[str, Any]
             "aimall_partial_" + str(len(int_files)) + "_of_" + str(atom_count) + "_int"
         )
 
+    expected_method_canonical = (
+        canonicalise_aimall_method(expected_method)
+        if expected_method is not None
+        else None
+    )
     per_atom: List[Dict[str, Any]] = []
     iqa_values: List[float] = []
     integration_values: List[float] = []
+    observed_methods: List[str] = []
     for int_file in int_files:
         atom_name = None
         iqa = None
         integration_error = None
+        dft_model = None
+        canonical_dft_model = None
         atom_reasons: List[str] = []
         try:
             atom_name = str(getattr(int_file, "atom_name"))
@@ -100,14 +139,34 @@ def evaluate_aimall_pointdir(pointdir: Any, gates: Any = None) -> Dict[str, Any]
                 reasons.append("integration_error_missing_or_nonfinite")
         else:
             integration_values.append(integration_error)
+        try:
+            dft_model = str(getattr(int_file, "dft_model"))
+            canonical_dft_model = canonicalise_aimall_method(dft_model)
+            observed_methods.append(canonical_dft_model)
+        except Exception:
+            atom_reasons.append("dft_model_missing_or_unsupported")
+            reasons.append("dft_model_missing_or_unsupported")
+        if (
+            expected_method_canonical is not None
+            and canonical_dft_model is not None
+            and canonical_dft_model != expected_method_canonical
+        ):
+            atom_reasons.append("dft_model_mismatch")
+            reasons.append("dft_model_mismatch")
         per_atom.append(
             {
                 "atom": atom_name,
+                "dft_model": dft_model,
+                "canonical_dft_model": canonical_dft_model,
                 "iqa_ha": iqa,
                 "integration_error": integration_error,
                 "reasons": atom_reasons,
             }
         )
+
+    unique_methods = sorted(set(observed_methods))
+    if len(unique_methods) > 1:
+        reasons.append("mixed_dft_models")
 
     max_abs_integration = (
         max(abs(v) for v in integration_values) if integration_values else None
@@ -155,6 +214,8 @@ def evaluate_aimall_pointdir(pointdir: Any, gates: Any = None) -> Dict[str, Any]
         "wfn_total_energy_ha": wfn_total_energy,
         "iqa_energy_recovery_error_ha": recovery_error,
         "max_abs_integration_error": max_abs_integration,
+        "expected_dft_model": expected_method_canonical,
+        "observed_dft_models": unique_methods,
         "per_atom": per_atom,
     }
 

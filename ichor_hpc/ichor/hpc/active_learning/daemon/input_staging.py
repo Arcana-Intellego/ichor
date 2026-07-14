@@ -28,7 +28,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 from ichor.core.atoms import Atoms
-from ichor.core.files import PointDirectory
+from ichor.core.files import PointDirectory, WFN
 from ichor.core.files.xyz import Trajectory
 
 from .resource_solver import (
@@ -52,6 +52,8 @@ QUANTUM_ACCEPTANCE_SCHEMA_VERSION = 1
 POINTDIR_BASENAME_RE = re.compile(r"^POINT_\d{4}\.pointdir$")
 AIMALL_TASK_METADATA = "AIMALL_TASK.json"
 AIMALL_TASK_METADATA_SCHEMA_VERSION = 1
+WFN_METHOD_RECEIPT = "WFN_METHOD_RECEIPT.json"
+WFN_METHOD_RECEIPT_SCHEMA_VERSION = 1
 FEREBUS_TASK_MANIFEST = "FEREBUS_TASKS.json"
 FEREBUS_TASK_SCHEMA_VERSION = 4
 FEREBUS_JOB_DETAILS = "job-details"
@@ -76,6 +78,65 @@ def write_points_file(staging_dir: Path, pointdirs: Sequence[Path]) -> Path:
     # windows the default crlf leaves a trailing \r so cd "$POINT_DIR" quietly breaks.
     points_file.write_text(body + ("\n" if body else ""), encoding="utf-8", newline="\n")
     return points_file
+
+
+def rewrite_wfn_for_aimall(
+    wfn_path: Path,
+    *,
+    method: str,
+    phase_name: str,
+    iteration: int,
+    task_index: int,
+    source_acceptance_sha256: str,
+) -> Tuple[Path, Dict[str, Any]]:
+    """Atomically inject the campaign method into a Gaussian WFN."""
+    from .quantum_quality import canonicalise_aimall_method
+
+    wfn = Path(wfn_path)
+    if wfn.is_symlink() or not wfn.is_file():
+        raise FileNotFoundError("AIMAll WFN is missing or symlinked: " + str(wfn))
+    canonical_method = canonicalise_aimall_method(method)
+    before_sha256 = sha256_file(wfn)
+    parsed = WFN(wfn)
+    parsed.read()
+    parsed.method = canonical_method
+    rendered = parsed._write_file(wfn)
+    if not isinstance(rendered, str) or not rendered:
+        raise ValueError("WFN method rewrite produced empty output: " + str(wfn))
+    atomic_write_text(wfn, rendered)
+
+    header = wfn.read_text(encoding="utf-8").splitlines()[1].split()
+    observed_method = (
+        "HF"
+        if header[-1].upper() == "NUCLEI"
+        else canonicalise_aimall_method(header[-1])
+    )
+    if observed_method != canonical_method:
+        raise ValueError(
+            "rewritten WFN method mismatch: expected "
+            + canonical_method
+            + ", observed "
+            + observed_method
+        )
+    after_sha256 = sha256_file(wfn)
+    payload = {
+        "schema_version": WFN_METHOD_RECEIPT_SCHEMA_VERSION,
+        "phase": str(phase_name),
+        "iteration": int(iteration),
+        "task_index": int(task_index),
+        "pointdir": str(wfn.parent.name),
+        "method": canonical_method,
+        "source_gaussian_acceptance_sha256": str(source_acceptance_sha256),
+        "wfn": {
+            "path": wfn.name,
+            "before_sha256": before_sha256,
+            "after_sha256": after_sha256,
+            "size_bytes": int(wfn.stat().st_size),
+        },
+    }
+    receipt_path = wfn.parent / WFN_METHOD_RECEIPT
+    atomic_write_json(receipt_path, payload)
+    return receipt_path, payload
 
 
 def _pointdir_name(pointdir: Any) -> str:
@@ -1166,8 +1227,9 @@ def stage_aimall_inputs(
     if not pointdirs:
         write_points_file(staging, [])
         return staging, 0
+    acceptance_sha256 = sha256_file(staging / QUANTUM_ACCEPTANCE_MANIFEST)
     dimensions = []
-    for pointdir in pointdirs:
+    for task_index, pointdir in enumerate(pointdirs):
         wfn = pointdir / "input.wfn"
         if wfn.is_symlink() or not wfn.is_file():
             raise FileNotFoundError(
@@ -1181,7 +1243,23 @@ def stage_aimall_inputs(
             ) from exc
         if atom_count <= 0:
             raise ValueError("AIMAll pointdir has no atoms: " + str(pointdir))
-        dimensions.append((pointdir, atom_count, wfn_primitive_count(wfn)))
+        receipt_path, receipt = rewrite_wfn_for_aimall(
+            wfn,
+            method=str(config.gaussian.method),
+            phase_name=str(phase_name),
+            iteration=int(iteration),
+            task_index=int(task_index),
+            source_acceptance_sha256=acceptance_sha256,
+        )
+        dimensions.append(
+            (
+                pointdir,
+                atom_count,
+                wfn_primitive_count(wfn),
+                receipt_path,
+                receipt,
+            )
+        )
     write_points_file(staging, pointdirs)
     aimall_resources = resolve_phase_resources(
         phase_name=str(phase_name),
@@ -1202,7 +1280,13 @@ def stage_aimall_inputs(
         raise ValueError(
             "AIMAll resource resolution does not cover every staged task"
         )
-    for task_index, (pointdir, atom_count, primitive_count) in enumerate(dimensions):
+    for task_index, (
+        pointdir,
+        atom_count,
+        primitive_count,
+        receipt_path,
+        receipt,
+    ) in enumerate(dimensions):
         if isinstance(raw_naat, str) and raw_naat.strip().lower() == "auto":
             resolved_naat = int(snapshotted_naat[task_index])
         else:
@@ -1219,6 +1303,12 @@ def stage_aimall_inputs(
                 "primitive_count": int(primitive_count),
                 "nproc": int(aimall_cpus),
                 "naat": int(resolved_naat),
+                "electronic_method": str(receipt["method"]),
+                "wfn_sha256": str(receipt["wfn"]["after_sha256"]),
+                "wfn_method_receipt": {
+                    "path": receipt_path.name,
+                    "sha256": sha256_file(receipt_path),
+                },
                 "resource_resolution": aimall_resources.journal_payload(
                     phase_name=str(phase_name)
                 ),

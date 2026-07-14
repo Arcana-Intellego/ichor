@@ -280,6 +280,7 @@ class DryRunPhaseExecutor:
             "[kernels]",
             "number_of_kernels 1",
             "composition k1",
+            "prefactor 1.0",
             "",
             "[kernel.k1]",
             "type rbf",

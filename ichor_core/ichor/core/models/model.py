@@ -72,6 +72,7 @@ class Model(ReadFile, WriteFile):
         program: str = FileContents,
         program_version: Version = FileContents,
         notes: Dict[str, str] = FileContents,
+        prefactor: float = FileContents,
     ):
         super(ReadFile, self).__init__(path)
 
@@ -94,6 +95,7 @@ class Model(ReadFile, WriteFile):
         self.weights = weights
         self.program_version = program_version
         self.notes = notes
+        self.prefactor = prefactor
 
     def _read_file(self, up_to: Optional[str] = None):
         """Read in a FEREBUS output file which contains the optimized
@@ -210,6 +212,10 @@ class Model(ReadFile, WriteFile):
                     kernel_composition = line.split()[-1]
                     continue
 
+                if line.strip().startswith("prefactor "):
+                    self.prefactor = float(line.split()[-1])
+                    continue
+
                 # GP kernel section
                 if "[kernel." in line:
                     kernel_name = line.split(".")[-1].rstrip().rstrip("]")
@@ -300,6 +306,8 @@ class Model(ReadFile, WriteFile):
             if self.kernel or not kernel_composition
             else KernelInterpreter(kernel_composition, kernel_dict).interpret()
         )
+        if self.prefactor is FileContents:
+            self.prefactor = 1.0
 
     @property
     def ialf(self) -> np.ndarray:
@@ -338,14 +346,34 @@ class Model(ReadFile, WriteFile):
         if x_test.ndim == 1:
             x_test = x_test[np.newaxis, ...]
 
-        return self.kernel.r(self.x, x_test)
+        return self.prior_covariance(self.x, x_test)
+
+    @property
+    def kernel_prefactor(self) -> float:
+        value = float(self.prefactor)
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError("model kernel prefactor must be finite and positive")
+        return value
+
+    def prior_covariance(self, x1: np.ndarray, x2: np.ndarray) -> np.ndarray:
+        return self.kernel_prefactor * self.kernel.k(x1, x2)
+
+    def prior_variance_diagonal(self, x: np.ndarray) -> np.ndarray:
+        values = (
+            self.kernel.k_diag(x)
+            if hasattr(self.kernel, "k_diag")
+            else np.diag(self.kernel.k(x, x))
+        )
+        return self.kernel_prefactor * np.asarray(values, dtype=float)
 
     @property
     def R(self) -> np.ndarray:
         """Returns the covariance matrix and adds a jitter
         to the diagonal for numerical stability. This jitter is a very
         small number on the order of 1e-6 to 1e-10."""
-        return self.kernel.R(self.x) + (self.jitter * np.identity(self.ntrain))
+        return self.prior_covariance(self.x, self.x) + (
+            self.jitter * np.identity(self.ntrain)
+        )
 
     @property
     def invR(self) -> np.ndarray:
@@ -368,13 +396,20 @@ class Model(ReadFile, WriteFile):
 
     def compute_weights(self) -> np.ndarray:
         """Computes the training weights from the data given"""
-        return np.linalg.solve(self.lower_cholesky, self._y_minus_mean)
+        lower_solution = np.linalg.solve(
+            self.lower_cholesky,
+            self._y_minus_mean,
+        )
+        return np.linalg.solve(self.lower_cholesky.T, lower_solution)
 
-    def compute_likelihood(self) -> float:
-        """Computes the marginal likelihood from the data given"""
+    def compute_log_marginal_likelihood(self) -> float:
+        """Return the conventional Gaussian-process log marginal likelihood."""
+        quadratic = float(
+            np.dot(self._y_minus_mean.T, self.compute_weights()).item()
+        )
         return (
-            0.5 * np.dot(self._y_minus_mean.T, self.compute_weights()).item()
-            - 0.5 * self.logdet
+            -0.5 * quadratic
+            - float(np.sum(np.log(np.diag(self.lower_cholesky))))
             - 0.5 * self.ntrain * np.log(2 * np.pi)
         )
 
@@ -397,7 +432,9 @@ class Model(ReadFile, WriteFile):
 
         # TODO: need to multiply by tau^2 in order to get "true" variance which can be used for error estimations.
         # here it can only be used to compare points to figure out which point has the largest variance.
-        return 1.0 - np.diag(np.matmul(v.T, v)).flatten()
+        return self.prior_variance_diagonal(x_test) - np.diag(
+            np.matmul(v.T, v)
+        ).flatten()
 
     def _write_file(self, path: Path) -> None:
         if not path.parent.exists():
@@ -442,6 +479,7 @@ class Model(ReadFile, WriteFile):
         write_str += "[kernels]\n"
         write_str += f"number_of_kernels {self.kernel.nkernel}\n"
         write_str += f"composition {self.kernel.name}\n"
+        write_str += f"prefactor {self.kernel_prefactor}\n"
         write_str += "\n"
         write_str += self.kernel.write_str()
         write_str += "\n"

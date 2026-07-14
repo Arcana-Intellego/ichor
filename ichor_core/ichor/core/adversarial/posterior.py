@@ -79,6 +79,38 @@ def _check_kernel_active_dims(model, nfeats: int, label: str) -> None:
         )
 
 
+def _model_prior_covariance(model, x1: np.ndarray, x2: np.ndarray) -> np.ndarray:
+    if hasattr(model, "prior_covariance"):
+        return _check_finite_array(
+            model.prior_covariance(x1, x2),
+            "kernel covariance",
+        )
+    prefactor = float(getattr(model, "prefactor", 1.0))
+    if not np.isfinite(prefactor) or prefactor <= 0.0:
+        raise ValueError("model kernel prefactor must be finite and positive")
+    return _check_finite_array(
+        prefactor * model.kernel.k(x1, x2),
+        "kernel covariance",
+    )
+
+
+def _model_prior_diagonal(model, x: np.ndarray) -> np.ndarray:
+    if hasattr(model, "prior_variance_diagonal"):
+        return _check_finite_array(
+            model.prior_variance_diagonal(x),
+            "kernel diagonal",
+        ).reshape(-1)
+    prefactor = float(getattr(model, "prefactor", 1.0))
+    if not np.isfinite(prefactor) or prefactor <= 0.0:
+        raise ValueError("model kernel prefactor must be finite and positive")
+    values = (
+        model.kernel.k_diag(x)
+        if hasattr(model.kernel, "k_diag")
+        else np.diag(model.kernel.k(x, x))
+    )
+    return _check_finite_array(prefactor * values, "kernel diagonal").reshape(-1)
+
+
 
 def _estimated_signal_variance(model) -> float:
     y_raw = getattr(model, "y")
@@ -119,7 +151,7 @@ def _estimated_signal_variance(model) -> float:
 def model_posterior_covariance(model, x1: np.ndarray, x2: np.ndarray, scaled: bool = True) -> np.ndarray:
     x1 = _ensure_2d(x1)
     x2 = _ensure_2d(x2)
-    k12 = _check_finite_array(model.kernel.k(x1, x2), "kernel covariance")
+    k12 = _model_prior_covariance(model, x1, x2)
     r1 = _check_finite_array(model.r(x1), "train-test covariance")
     r2 = _check_finite_array(model.r(x2), "train-test covariance")
     v1 = np.linalg.solve(model.lower_cholesky, r1)
@@ -366,15 +398,10 @@ class TotalEnergyPosterior:
             )
             # diagonal of model_posterior_covariance(model, X, X) without
             # forming the full n x n block: k_ii - sum_k v[k,i]^2.
-            if hasattr(model.kernel, "k_diag"):
-                k_diag = _check_finite_array(model.kernel.k_diag(X), "kernel diagonal").reshape(-1)
-                if k_diag.shape != (n,):
-                    raise ValueError(
-                        f"kernel diagonal shape for atom {atom} must be {(n,)}, got {k_diag.shape}"
-                    )
-            else:
-                k_diag = np.diag(
-                    _check_finite_array(model.kernel.k(X, X), "kernel covariance")
+            k_diag = _model_prior_diagonal(model, X)
+            if k_diag.shape != (n,):
+                raise ValueError(
+                    f"kernel diagonal shape for atom {atom} must be {(n,)}, got {k_diag.shape}"
                 )
             r = _check_finite_array(model.r(X), "train-test covariance")
             v = np.linalg.solve(model.lower_cholesky, r)
@@ -411,7 +438,7 @@ class TotalEnergyPosterior:
         total_cov = np.zeros((n, n), dtype=float)
         for atom, model in self._property_models.items():
             X = self._stack_feature_rows(feats, atom)
-            kxx = _check_finite_array(model.kernel.k(X, X), "kernel covariance")
+            kxx = _model_prior_covariance(model, X, X)
             if kxx.shape != (n, n):
                 raise ValueError(
                     f"kernel covariance shape for atom {atom} must be {(n, n)}, got {kxx.shape}"

@@ -1,0 +1,16 @@
+{
+  "source": "FEREBUS_CPU/src/calculators/cov_matrix.f90 RBF formula",
+  "kernel": "rbf",
+  "x_train": [[0.0, 0.0], [1.0, 0.5]],
+  "y_train": [1.0, -1.0],
+  "constant_mean": 0.2,
+  "thetas": [0.5, 1.5],
+  "prefactor": 3.0,
+  "nugget": 0.1,
+  "query": [0.25, 0.2],
+  "covariance": [[3.1, 1.250586059035525], [1.250586059035525, 3.1]],
+  "weights": [0.4947410139015287, -0.5866826499414041],
+  "query_cross_covariance": [2.7383684550029006, 1.978546113090176],
+  "prediction": 0.3940045092050884
+}
+

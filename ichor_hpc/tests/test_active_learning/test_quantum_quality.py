@@ -9,8 +9,13 @@ from ichor.core.files.point_directory import PointDirectory
 from ichor.hpc.active_learning.config import QualityGatesConfigBlock
 from ichor.hpc.active_learning.daemon.quantum_quality import (
     QUANTUM_QUALITY_MANIFEST,
+    canonicalise_aimall_method,
     evaluate_aimall_pointdir,
     write_quantum_quality_manifest,
+)
+from ichor.hpc.active_learning.daemon.input_staging import (
+    WFN_METHOD_RECEIPT,
+    rewrite_wfn_for_aimall,
 )
 
 
@@ -22,7 +27,10 @@ def _clean_fixture_pointdir():
 
 
 def test_quantum_quality_accepts_clean_aimall_fixture_with_finite_metrics():
-    record = evaluate_aimall_pointdir(_clean_fixture_pointdir())
+    record = evaluate_aimall_pointdir(
+        _clean_fixture_pointdir(),
+        expected_method="B3LYP",
+    )
 
     assert record["accepted"] is True
     assert record["reasons"] == []
@@ -33,6 +41,59 @@ def test_quantum_quality_accepts_clean_aimall_fixture_with_finite_metrics():
     assert math.isfinite(record["iqa_energy_recovery_error_ha"])
     assert math.isfinite(record["max_abs_integration_error"])
     assert len(record["per_atom"]) == 3
+    assert record["expected_dft_model"] == "B3LYP"
+    assert record["observed_dft_models"] == ["B3LYP"]
+
+
+def test_aimall_method_canonicalisation_accepts_reported_spin_forms():
+    assert canonicalise_aimall_method("Restricted B3LYP") == "B3LYP"
+    assert canonicalise_aimall_method("Unrestricted M06-2X") == "M062X"
+    assert canonicalise_aimall_method("RHF") == "HF"
+
+
+def test_quantum_quality_rejects_wrong_reported_method(tmp_path):
+    pointdir = SimpleNamespace(
+        path=tmp_path / "WRONG.pointdir",
+        atoms=[object()],
+        ints=SimpleNamespace(
+            ints=[
+                SimpleNamespace(
+                    atom_name="O1",
+                    dft_model="Restricted HF",
+                    iqa=-75.0,
+                    integration_error=0.0,
+                )
+            ]
+        ),
+        wfn=SimpleNamespace(total_energy=-75.0),
+    )
+    record = evaluate_aimall_pointdir(pointdir, expected_method="B3LYP")
+    assert record["accepted"] is False
+    assert "dft_model_mismatch" in record["reasons"]
+
+
+def test_wfn_method_rewrite_is_hash_bound_and_parseable(tmp_path):
+    source = next(
+        (FIXTURES / "initial_quantum" / "POINT_0000.pointdir").glob("*.wfn")
+    )
+    pointdir = tmp_path / "POINT_0000.pointdir"
+    pointdir.mkdir()
+    wfn = pointdir / "input.wfn"
+    shutil.copy2(source, wfn)
+
+    receipt_path, receipt = rewrite_wfn_for_aimall(
+        wfn,
+        method="B3LYP",
+        phase_name="INITIAL_AIMALL",
+        iteration=0,
+        task_index=0,
+        source_acceptance_sha256="a" * 64,
+    )
+
+    assert receipt_path.name == WFN_METHOD_RECEIPT
+    assert receipt["method"] == "B3LYP"
+    assert receipt["wfn"]["before_sha256"] != receipt["wfn"]["after_sha256"]
+    assert wfn.read_text(encoding="utf-8").splitlines()[1].endswith("B3LYP")
 
 
 def test_quantum_quality_rejects_missing_int_file(tmp_path):
