@@ -7938,6 +7938,28 @@ def evaluate_campaign_preflight(
         from .ferebus_prior import resolve_ferebus_prior_contract
 
         prior = resolve_ferebus_prior_contract(loaded_config)
+        checkpoint_summary: Dict[str, Any] = {
+            "required": bool(loaded_config.retention.checkpoint_required),
+            "destination": loaded_config.retention.checkpoint_destination,
+            "ok": True,
+        }
+        if bool(loaded_config.retention.checkpoint_required):
+            from .daemon.checkpoints import normalise_checkpoint_destination
+
+            destination = normalise_checkpoint_destination(
+                str(loaded_config.retention.checkpoint_destination)
+            )
+            if not destination.is_dir():
+                raise ValueError(
+                    "required checkpoint destination is absent or not a directory: "
+                    + str(destination)
+                )
+            if not os.access(destination, os.W_OK | os.X_OK):
+                raise ValueError(
+                    "required checkpoint destination is not writable: "
+                    + str(destination)
+                )
+            checkpoint_summary["resolved_destination"] = str(destination)
         config_summary = {
             "ok": True,
             "schema_version": int(loaded_config.schema_version),
@@ -7948,6 +7970,7 @@ def evaluate_campaign_preflight(
             "prior_mean_contract_sha256": prior.contract_sha256,
             "feature_scaling": bool(prior.feature_scaling),
             "property_scaling": bool(prior.property_scaling),
+            "checkpoint": checkpoint_summary,
         }
     except Exception as exc:
         config_summary = {
@@ -8011,6 +8034,20 @@ def evaluate_campaign_preflight(
                 )
                 if review.changed:
                     raise ValueError("campaign config differs from its lock")
+                if bool(loaded_config.retention.checkpoint_required):
+                    from .daemon.checkpoints import checkpoint_store
+
+                    store = checkpoint_store(
+                        str(loaded_config.retention.checkpoint_destination),
+                        str(state.campaign_uid),
+                    )
+                    if (store / "current.json").exists():
+                        from .daemon.checkpoints import checkpoint_status
+
+                        checkpoint_status(
+                            campaign,
+                            str(loaded_config.retention.checkpoint_destination),
+                        )
             state_summary = {
                 "ok": True,
                 "phase": state.phase.value,
@@ -8078,43 +8115,162 @@ def cmd_resource_plan(args: argparse.Namespace) -> int:
     """Print a read-only production resource resolution preview."""
     from .daemon.resource_plan import build_resource_plan, format_resource_plan
 
-    campaign = resolve_campaign_dir(args.campaign_dir)
-    config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
-    state_path = campaign / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
-    if not state_path.is_file():
-        print("resource-plan requires daemon state.json", file=sys.stderr)
+    try:
+        campaign = resolve_campaign_dir(args.campaign_dir)
+        config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+        state_path = (
+            campaign
+            / ".DATA"
+            / "ACTIVE_LEARNING"
+            / DEFAULT_STATE_FILENAME
+        )
+        if not state_path.is_file():
+            print("resource-plan requires daemon state.json", file=sys.stderr)
+            return 2
+        state = read_state(state_path)
+        phase_name = getattr(args, "phase", None)
+        if phase_name is not None and str(phase_name) not in {
+            phase.value for phase in CampaignPhase
+        }:
+            print("unknown campaign phase: " + str(phase_name), file=sys.stderr)
+            return 2
+        payload = build_resource_plan(
+            campaign,
+            config,
+            current_phase=state.phase.value,
+            current_iteration=int(state.iteration),
+            phase_name=phase_name,
+            iteration=getattr(args, "iteration", None),
+            all_phases=bool(getattr(args, "all", False)),
+            replacement_round=int(getattr(state, "replacement_round", 0)),
+            current_models_version=int(getattr(state, "models_version", 0)),
+            current_reference_data_version=int(
+                getattr(state, "reference_data_version", 0)
+            ),
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        print(
+            "resource-plan could not verify its read-only inputs: " + str(exc),
+            file=sys.stderr,
+        )
         return 2
-    state = read_state(state_path)
-    phase_name = getattr(args, "phase", None)
-    if phase_name is not None and str(phase_name) not in {
-        phase.value for phase in CampaignPhase
-    }:
-        print("unknown campaign phase: " + str(phase_name), file=sys.stderr)
-        return 2
-    payload = build_resource_plan(
-        campaign,
-        config,
-        current_phase=state.phase.value,
-        current_iteration=int(state.iteration),
-        phase_name=phase_name,
-        iteration=getattr(args, "iteration", None),
-        all_phases=bool(getattr(args, "all", False)),
-        replacement_round=int(getattr(state, "replacement_round", 0)),
-        current_models_version=int(getattr(state, "models_version", 0)),
-        current_reference_data_version=int(
-            getattr(state, "reference_data_version", 0)
-        ),
-    )
     if bool(getattr(args, "json", False)):
         print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
     else:
         print(format_resource_plan(payload), end="")
-    unavailable = any(
-        str(plan.get("status")) == "evidence_not_yet_produced"
-        for plan in payload["plans"]
-    )
-    if unavailable and not bool(getattr(args, "all", False)):
-        return 14
+    if not bool(getattr(args, "all", False)):
+        statuses = {str(plan.get("status")) for plan in payload["plans"]}
+        if "evidence_invalid" in statuses:
+            return 15
+        if "evidence_not_yet_produced" in statuses:
+            return 14
+    return 0
+
+
+def _checkpoint_destination(
+    config: CampaignConfig,
+    override: Optional[str],
+) -> str:
+    value = override or config.retention.checkpoint_destination
+    if value is None or not str(value).strip():
+        raise ValueError(
+            "no checkpoint destination is configured; set "
+            "retention.checkpoint_destination or pass --destination"
+        )
+    return str(value)
+
+
+def cmd_checkpoint(args: argparse.Namespace) -> int:
+    """Create a verified checkpoint from the current idle boundary."""
+    from .daemon.checkpoints import create_checkpoint
+
+    try:
+        campaign = resolve_campaign_dir(args.campaign_dir)
+        config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+        destination = _checkpoint_destination(
+            config,
+            getattr(args, "destination", None),
+        )
+        payload = create_checkpoint(
+            campaign,
+            destination,
+            verify_after_write=True,
+            allow_active_lease=False,
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        print("checkpoint failed: " + str(exc), file=sys.stderr)
+        return 2
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
+    else:
+        print("Checkpoint verified: " + str(payload["checkpoint"]))
+        print("Manifest SHA-256: " + str(payload["manifest_sha256"]))
+    return 0
+
+
+def cmd_checkpoint_status(args: argparse.Namespace) -> int:
+    """Report and verify the current checkpoint pointer."""
+    from .daemon.checkpoints import checkpoint_status
+
+    try:
+        campaign = resolve_campaign_dir(args.campaign_dir)
+        config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+        destination = _checkpoint_destination(
+            config,
+            getattr(args, "destination", None),
+        )
+        payload = checkpoint_status(campaign, destination)
+    except (OSError, TypeError, ValueError) as exc:
+        print("checkpoint-status failed: " + str(exc), file=sys.stderr)
+        return 2
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
+    else:
+        print("Checkpoint status: " + str(payload["status"]))
+        print("Store: " + str(payload["store"]))
+        if isinstance(payload.get("current"), dict):
+            print("Iteration: " + str(payload["current"].get("iteration")))
+    return 0 if payload["status"] == "verified" else 1
+
+
+def cmd_verify_checkpoint(args: argparse.Namespace) -> int:
+    """Deeply verify one published checkpoint."""
+    from .daemon.checkpoints import verify_checkpoint
+
+    try:
+        payload = verify_checkpoint(args.checkpoint)
+    except (OSError, TypeError, ValueError) as exc:
+        print("verify-checkpoint failed: " + str(exc), file=sys.stderr)
+        return 2
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
+    else:
+        print("Checkpoint verified: " + str(payload["checkpoint"]))
+        print("Manifest SHA-256: " + str(payload["manifest_sha256"]))
+    return 0
+
+
+def cmd_restore_checkpoint(args: argparse.Namespace) -> int:
+    """Restore a verified checkpoint into an empty target directory."""
+    from .daemon.checkpoints import restore_checkpoint
+
+    try:
+        payload = restore_checkpoint(
+            args.checkpoint,
+            args.target_empty_dir,
+            apply=bool(getattr(args, "apply", False)),
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        print("restore-checkpoint failed: " + str(exc), file=sys.stderr)
+        return 2
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
+    elif payload["applied"]:
+        print("Checkpoint restored and verified: " + str(payload["target"]))
+    else:
+        print("Checkpoint restore verified; no files were written.")
+        print("Target: " + str(payload["target"]))
+        print("Re-run with --apply to restore.")
     return 0
 
 
@@ -8699,9 +8855,57 @@ Examples:
     p_resource.add_argument(
         "--json",
         action="store_true",
-        help="Print schema-v1 machine-readable JSON.",
+        help="Print schema-v2 machine-readable JSON.",
     )
     p_resource.set_defaults(func=cmd_resource_plan)
+
+    p_checkpoint = sub.add_parser(
+        "checkpoint",
+        help="Create and verify a durable campaign checkpoint.",
+    )
+    add_campaign(p_checkpoint)
+    p_checkpoint.add_argument(
+        "--destination",
+        default=None,
+        help="Override retention.checkpoint_destination for this checkpoint.",
+    )
+    p_checkpoint.add_argument("--json", action="store_true")
+    p_checkpoint.set_defaults(func=cmd_checkpoint)
+
+    p_checkpoint_status = sub.add_parser(
+        "checkpoint-status",
+        help="Verify and report the current checkpoint pointer.",
+    )
+    add_campaign(p_checkpoint_status)
+    p_checkpoint_status.add_argument(
+        "--destination",
+        default=None,
+        help="Override retention.checkpoint_destination for this query.",
+    )
+    p_checkpoint_status.add_argument("--json", action="store_true")
+    p_checkpoint_status.set_defaults(func=cmd_checkpoint_status)
+
+    p_verify_checkpoint = sub.add_parser(
+        "verify-checkpoint",
+        help="Deeply verify one published checkpoint.",
+    )
+    p_verify_checkpoint.add_argument("--checkpoint", required=True)
+    p_verify_checkpoint.add_argument("--json", action="store_true")
+    p_verify_checkpoint.set_defaults(func=cmd_verify_checkpoint)
+
+    p_restore_checkpoint = sub.add_parser(
+        "restore-checkpoint",
+        help="Restore a checkpoint into an empty target directory.",
+    )
+    p_restore_checkpoint.add_argument("--checkpoint", required=True)
+    p_restore_checkpoint.add_argument("--target-empty-dir", required=True)
+    p_restore_checkpoint.add_argument(
+        "--apply",
+        action="store_true",
+        help="Perform the restore after verification.",
+    )
+    p_restore_checkpoint.add_argument("--json", action="store_true")
+    p_restore_checkpoint.set_defaults(func=cmd_restore_checkpoint)
 
     p_cfg = sub.add_parser(
         "config-check",

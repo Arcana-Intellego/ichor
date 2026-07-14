@@ -12,6 +12,7 @@ import math
 import re
 import csv
 import shutil
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -23,7 +24,7 @@ from ..layout import staging_phase_dir, trained_models_dir
 from ..versioning.manifest import sha256_file
 
 
-RESOURCE_FORMULA_VERSION = "1"
+RESOURCE_FORMULA_VERSION = "2"
 
 
 class ResourceEvidenceUnavailable(BackendSubmissionError):
@@ -34,6 +35,20 @@ class ResourceEvidenceUnavailable(BackendSubmissionError):
         self.detail = str(detail)
         super().__init__(
             "resource evidence not yet produced for "
+            + self.phase_name
+            + ": "
+            + self.detail
+        )
+
+
+class ResourceEvidenceInvalid(BackendSubmissionError):
+    """Raised when producer evidence exists but violates its contract."""
+
+    def __init__(self, phase_name: str, detail: str):
+        self.phase_name = str(phase_name)
+        self.detail = str(detail)
+        super().__init__(
+            "resource evidence is invalid for "
             + self.phase_name
             + ": "
             + self.detail
@@ -145,21 +160,16 @@ def slurm_memory_mib(value: Any) -> float:
 
 
 def gaussian_memory_mib(value: Any) -> float:
-    text = str(value).strip().upper()
-    match = re.fullmatch(r"([1-9][0-9]*)([KMGT]?)(?:B|W)?", text)
-    if not match:
-        raise BackendSubmissionError(
-            "unsupported Gaussian memory syntax: " + repr(value)
+    from ..config import ConfigValidationError, memory_mebibytes
+
+    try:
+        return memory_mebibytes(
+            "resources.gaussian.link0_mem",
+            str(value),
+            gaussian=True,
         )
-    amount = int(match.group(1))
-    unit = match.group(2) or "M"
-    scale = {
-        "K": 1.0 / 1024.0,
-        "M": 1.0,
-        "G": 1024.0,
-        "T": 1024.0 * 1024.0,
-    }[unit]
-    return float(amount) * scale
+    except ConfigValidationError as exc:
+        raise BackendSubmissionError(str(exc)) from exc
 
 
 def _partition_profile(partition: str) -> Optional[Dict[str, Any]]:
@@ -421,6 +431,17 @@ def _file_evidence(path: Path) -> Dict[str, Any]:
     }
 
 
+def _canonical_json_sha256(value: Any) -> str:
+    raw = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
 def _synthetic_evidence(
     backend: str,
     phase_name: str,
@@ -496,61 +517,125 @@ def _pool_evidence(campaign_dir: Path) -> Dict[str, Any]:
         raise ValueError("trajectory pool resource evidence is empty")
     pool_path = campaign_owned_path(campaign_dir, pool.canonical_path)
     manifest_path = campaign_owned_path(campaign_dir, manifest_path)
+    from ..custom_bootstrap import (
+        custom_bootstrap_manifest_path,
+        read_custom_bootstrap_manifest,
+    )
+
+    bootstrap_path = custom_bootstrap_manifest_path(campaign_dir)
+    if bootstrap_path.is_symlink() or not bootstrap_path.is_file():
+        raise FileNotFoundError(
+            "committed bootstrap manifest is not yet available: "
+            + str(bootstrap_path)
+        )
+    bootstrap = read_custom_bootstrap_manifest(campaign_dir)
+    raw_excluded = bootstrap.get("excluded_pool_frame_ids")
+    if not isinstance(raw_excluded, list):
+        raise ValueError("bootstrap excluded_pool_frame_ids must be a list")
+    excluded = []
+    for value in raw_excluded:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("bootstrap excluded pool IDs must be exact integers")
+        if value < 0 or value >= int(pool.manifest.n_frames):
+            raise ValueError("bootstrap excluded pool ID is outside the pool")
+        excluded.append(value)
+    if len(excluded) != len(set(excluded)):
+        raise ValueError("bootstrap excluded pool IDs contain duplicates")
+    excluded_set = set(excluded)
+    eligible = [
+        index
+        for index in range(int(pool.manifest.n_frames))
+        if index not in excluded_set
+    ]
+    if not eligible:
+        raise ValueError("bootstrap exclusions leave no Phase A candidates")
     return {
         "source": "trajectory_pool_manifest",
         "pool": _file_evidence(pool_path),
         "manifest": _file_evidence(manifest_path),
-        "n_frames": int(pool.manifest.n_frames),
+        "bootstrap_manifest": _file_evidence(bootstrap_path),
+        "full_pool_n_frames": int(pool.manifest.n_frames),
+        "excluded_pool_frame_ids": excluded,
+        "excluded_pool_frame_count": len(excluded),
+        "eligible_pool_frame_ids_sha256": _canonical_json_sha256(eligible),
+        "n_frames": len(eligible),
         "n_atoms": int(pool.manifest.natoms),
         "atom_order": list(pool.manifest.atom_types),
         "coordinate_dimension": int(3 * pool.manifest.natoms),
     }
 
 
-def _phase_b_evidence(campaign_dir: Path, iteration: int) -> Dict[str, Any]:
+def _phase_b_evidence_with_config(
+    campaign_dir: Path,
+    iteration: int,
+    config: Any,
+) -> Dict[str, Any]:
+    from ..daemon.config_lock import canonical_config, config_fingerprint
     from ..handoff_manifests import (
+        ariadne_batch_decision_path,
+        ariadne_candidate_frames,
         ariadne_results_path,
-        read_ariadne_results_manifest,
     )
     from ..layout import active_iteration_dir
+    from ..sampling.polus_wrapper import _phase_b_landing_safety_filter
+    from ..sampling_protocol import load_sampling_protocol
 
     iter_dir = campaign_owned_path(
         campaign_dir,
         active_iteration_dir(campaign_dir, int(iteration)),
     )
-    payload = read_ariadne_results_manifest(
+    protocol = load_sampling_protocol(
+        campaign_dir,
+        config,
+        iteration=int(iteration),
+    )
+    accept_legacy = bool(
+        getattr(
+            protocol.effective_config.adversarial_safety,
+            "accept_legacy_missing_landing_safety",
+            False,
+        )
+    )
+    payload, frames, records = ariadne_candidate_frames(
         iter_dir,
         expected_iteration=int(iteration),
-        require_nonempty=True,
+        accept_legacy_missing_landing_safety=accept_legacy,
+        expected_config_sha256=config_fingerprint(canonical_config(config)),
+        require_batch_decision=True,
     )
-    accepted = list(payload["accepted"])
-    if not accepted:
+    frames, records, safety_filter = _phase_b_landing_safety_filter(
+        frames,
+        records,
+        accept_legacy_missing_landing_safety=accept_legacy,
+    )
+    if not frames:
         raise ValueError("ARIADNE results contain no accepted Phase B candidates")
-    n_atoms: Optional[int] = None
-    for record in accepted:
-        result_path = campaign_owned_path(
-            campaign_dir,
-            Path(str(record["result_json"])),
-        )
-        try:
-            result_path.relative_to(iter_dir.resolve())
-        except ValueError as exc:
-            raise ValueError(
-                "ARIADNE result path is outside its active iteration"
-            ) from exc
-        result = json.loads(result_path.read_text(encoding="utf-8"))
-        coordinates = result.get("final_coordinates")
-        if not isinstance(coordinates, list) or not coordinates:
-            raise ValueError("ARIADNE result final_coordinates are invalid")
-        current = len(coordinates)
-        if n_atoms is None:
-            n_atoms = current
-        elif current != n_atoms:
+    n_atoms = len(frames[0])
+    if any(len(frame) != n_atoms for frame in frames):
             raise ValueError("ARIADNE accepted candidates disagree on atom count")
+    result_files = [
+        _file_evidence(
+            campaign_owned_path(campaign_dir, Path(str(record["result_json"])))
+        )
+        for record in records
+    ]
+    protocol_files = []
+    for path in (
+        protocol.manifest_path,
+        protocol.audit_manifest_path,
+        protocol.scale_model_path,
+    ):
+        if path is not None:
+            protocol_files.append(_file_evidence(Path(path)))
     return {
-        "source": "ariadne_results_manifest",
+        "source": "validated_phase_b_handoff",
         "manifest": _file_evidence(ariadne_results_path(iter_dir)),
-        "n_frames": len(accepted),
+        "batch_decision": _file_evidence(ariadne_batch_decision_path(iter_dir)),
+        "sampling_protocol_files": protocol_files,
+        "accepted_result_files": result_files,
+        "accepted_seed_ids": [int(record["seed_id"]) for record in records],
+        "safety_filter": safety_filter,
+        "n_frames": len(frames),
         "n_atoms": int(n_atoms or 0),
         "coordinate_dimension": int(3 * int(n_atoms or 0)),
     }
@@ -792,6 +877,13 @@ def _ariadne_evidence(campaign_dir: Path, iteration: int, config: Any) -> Dict[s
         campaign_dir,
         active_iteration_dir(campaign_dir, int(iteration)),
     )
+    from ..handoff_manifests import ariadne_task_map_path
+
+    task_map_file = ariadne_task_map_path(iter_dir)
+    if task_map_file.is_symlink() or not task_map_file.is_file():
+        raise FileNotFoundError(
+            "ARIADNE task map is not yet available: " + str(task_map_file)
+        )
     task_map = read_ariadne_task_map(iter_dir, expected_iteration=int(iteration))
     pool = TrajectoryPool.load(campaign_dir)
     if str(task_map["trajectory_sha256"]) != str(pool.sha256):
@@ -847,11 +939,30 @@ def _ariadne_evidence(campaign_dir: Path, iteration: int, config: Any) -> Dict[s
         dimensions = [int(3 * n_atoms) for _seed in selected]
         dimension = int(3 * n_atoms)
         dimension_source = "exact_cartesian_dimension"
-    from ..handoff_manifests import ariadne_task_map_path
+    pool_path = campaign_owned_path(campaign_dir, pool.canonical_path)
+    n_pool_frames = int(pool.manifest.n_frames)
+    decoded_coordinate_bytes = int(n_pool_frames * n_atoms * 3 * 8)
+    # The current runner eagerly creates Python Atoms/Atom objects for the
+    # complete pool in every array member.  This conservative object allowance
+    # is explicit and can later be replaced by measured telemetry or a bounded
+    # indexed pool implementation.
+    decoded_object_allowance_bytes = int(
+        n_pool_frames * 1024 + n_pool_frames * n_atoms * 1024
+    )
 
     return {
         "source": "ariadne_task_map_and_model_set",
-        "task_map": _file_evidence(ariadne_task_map_path(iter_dir)),
+        "task_map": _file_evidence(task_map_file),
+        "pool": _file_evidence(pool_path),
+        "pool_n_frames": n_pool_frames,
+        "pool_file_bytes": int(pool_path.stat().st_size),
+        "decoded_coordinate_bytes": decoded_coordinate_bytes,
+        "decoded_object_allowance_bytes": decoded_object_allowance_bytes,
+        "decoded_pool_estimate_bytes": int(
+            pool_path.stat().st_size
+            + decoded_coordinate_bytes
+            + decoded_object_allowance_bytes
+        ),
         "n_tasks": int(task_map["n_tasks"]),
         "n_atoms": int(n_atoms),
         "gradient_dimension": int(dimension),
@@ -887,6 +998,13 @@ def _ferebus_evidence(campaign_dir: Path) -> Dict[str, Any]:
     max_features = 0
     datasets = []
     task_dimensions = []
+    runtime_files = [staging / "commands", staging / "list.txt"]
+    generated_script = staging / "runFerebus.sh"
+    runtime_prepared = (
+        generated_script.is_file()
+        and not generated_script.is_symlink()
+        and all(path.is_file() and not path.is_symlink() for path in runtime_files)
+    )
     for task in payload["tasks"]:
         counts = task["row_counts"]
         for split in maxima:
@@ -899,6 +1017,11 @@ def _ferebus_evidence(campaign_dir: Path) -> Dict[str, Any]:
         ):
             expected = resolve_ferebus_task_path(staging, task[field_name], field_name)
             if not expected.is_file():
+                if runtime_prepared:
+                    raise FileNotFoundError(
+                        "prepared FEREBUS runtime dataset is missing: "
+                        + str(expected)
+                    )
                 expected = resolve_ferebus_task_path(
                     staging,
                     str(task["property"]) + "/" + Path(str(task[field_name])).name,
@@ -931,7 +1054,7 @@ def _ferebus_evidence(campaign_dir: Path) -> Dict[str, Any]:
     if total <= 0 or max_features <= 0:
         raise ValueError("FEREBUS resource dimensions are empty")
     manifest_path = staging / "FEREBUS_TASKS.json"
-    return {
+    evidence = {
         "source": "ferebus_task_manifest_and_datasets",
         "manifest": _file_evidence(manifest_path),
         "n_tasks": int(payload["n_tasks"]),
@@ -943,7 +1066,23 @@ def _ferebus_evidence(campaign_dir: Path) -> Dict[str, Any]:
         "max_features": max_features,
         "task_dimensions": task_dimensions,
         "datasets": datasets,
+        "runtime_tree_prepared": bool(runtime_prepared),
     }
+    if runtime_prepared:
+        evidence["runtime_files"] = [_file_evidence(path) for path in runtime_files]
+        generated_configs = []
+        for task in payload["tasks"]:
+            generated = task.get("generated_config")
+            if not isinstance(generated, dict):
+                raise ValueError("prepared FEREBUS task has no generated config binding")
+            config_path = resolve_ferebus_task_path(
+                staging,
+                str(generated.get("path") or ""),
+                "generated_config",
+            )
+            generated_configs.append(_file_evidence(config_path))
+        evidence["generated_configs"] = generated_configs
+    return evidence
 
 
 def collect_resource_evidence(
@@ -972,7 +1111,9 @@ def collect_resource_evidence(
             return (
                 _pool_evidence(campaign_dir)
                 if phase_name == "PHASE_A_POLUS"
-                else _phase_b_evidence(campaign_dir, int(iteration))
+                else _phase_b_evidence_with_config(
+                    campaign_dir, int(iteration), config
+                )
             )
         if backend in {"gaussian", "aimall"}:
             return _quantum_evidence(
@@ -986,13 +1127,16 @@ def collect_resource_evidence(
             return _ariadne_evidence(campaign_dir, int(iteration), config)
         if backend == "ferebus":
             return _ferebus_evidence(campaign_dir)
-    except ResourceEvidenceUnavailable:
+    except (ResourceEvidenceUnavailable, ResourceEvidenceInvalid):
         raise
-    except Exception as exc:
-        if require_evidence or (
-            campaign_dir is not None and "REPLACEMENT" in str(phase_name)
-        ):
+    except FileNotFoundError as exc:
+        if require_evidence or campaign_dir is not None:
             raise ResourceEvidenceUnavailable(
+                phase_name, type(exc).__name__ + ": " + str(exc)
+            ) from exc
+    except Exception as exc:
+        if require_evidence or campaign_dir is not None:
+            raise ResourceEvidenceInvalid(
                 phase_name, type(exc).__name__ + ": " + str(exc)
             ) from exc
     return _synthetic_evidence(
@@ -1016,16 +1160,11 @@ def _submitted_array_evidence(
         )
     parsed: List[int] = []
     for raw in task_ids:
-        if isinstance(raw, bool):
+        if isinstance(raw, bool) or not isinstance(raw, int):
             raise BackendSubmissionError(
                 "partial-array logical task IDs must be non-negative integers"
             )
-        try:
-            task_id = int(raw)
-        except (TypeError, ValueError) as exc:
-            raise BackendSubmissionError(
-                "partial-array logical task IDs must be non-negative integers"
-            ) from exc
+        task_id = raw
         if task_id < 0 or task_id >= logical_total:
             raise BackendSubmissionError(
                 "partial-array logical task ID "
@@ -1292,13 +1431,22 @@ def _estimate_backend_memory_gb(
         workers = max(1, int(active_workers or candidate_cpus))
         model_bytes = int(evidence["model_bytes"])
         model_size = float(model_bytes) / (1024.0 ** 3)
-        raw_gb = 1.5 + 4.0 * model_size + 0.5 * float(workers)
+        decoded_pool_bytes = int(evidence.get("decoded_pool_estimate_bytes", 0))
+        decoded_pool_gb = float(decoded_pool_bytes) / (1024.0 ** 3)
+        raw_gb = (
+            1.5
+            + 4.0 * model_size
+            + decoded_pool_gb
+            + 0.5 * float(workers)
+        )
         total_gb = raw_gb * safety
         extra.update({
             "model_bytes": model_bytes,
             "model_dir_size_gb": float(model_size),
             "active_workers": int(workers),
             "gradient_dimension": int(evidence["gradient_dimension"]),
+            "decoded_pool_estimate_bytes": decoded_pool_bytes,
+            "decoded_pool_estimate_gb": decoded_pool_gb,
             "unprotected_total_memory_gb": raw_gb,
         })
         return total_gb, "ariadne_gradient_worker_model_memory", extra
@@ -1316,20 +1464,52 @@ def _estimate_backend_memory_gb(
                 }
             ]
         evaluated = []
+        omp_threads = max(1, int(active_workers or candidate_cpus))
+        batch_size = 100
         for item in dimensions:
             n_train = int(item["n_train"])
             n_internal = int(item["n_internal"])
             n_external = int(item["n_external"])
             n_total = int(item["n_total"])
             features = int(item["n_features"])
-            matrix_bytes = 8 * (
-                3 * n_train * n_train
+            distance_tensor_bytes = 8 * features * n_train * n_train
+            distance_construction_peak_bytes = 2 * distance_tensor_bytes
+            threaded_estimator_bytes = 8 * omp_threads * (
+                2 * n_train * n_train
                 + n_train * n_internal
-                + n_train * n_external
-                + n_total * features
+                + n_train * batch_size
+                + 8 * n_train
+                + 4 * n_internal
+                + 4 * batch_size
             )
-            evaluated.append((matrix_bytes, item))
-        matrix_bytes_per_agent, demanding = max(
+            validation_kernel_bytes = 8 * (
+                n_train * n_internal + n_train * n_external
+            )
+            dataset_bytes = 8 * n_total * (features + 1)
+            training_peak_bytes = (
+                distance_tensor_bytes
+                + threaded_estimator_bytes
+                + validation_kernel_bytes
+                + dataset_bytes
+            )
+            working_peak_bytes = max(
+                distance_construction_peak_bytes,
+                training_peak_bytes,
+            )
+            components = {
+                "distance_tensor_bytes": int(distance_tensor_bytes),
+                "distance_construction_peak_bytes": int(
+                    distance_construction_peak_bytes
+                ),
+                "threaded_estimator_bytes": int(threaded_estimator_bytes),
+                "validation_kernel_bytes": int(validation_kernel_bytes),
+                "dataset_bytes": int(dataset_bytes),
+                "working_peak_bytes": int(working_peak_bytes),
+                "omp_threads": int(omp_threads),
+                "batch_size": int(batch_size),
+            }
+            evaluated.append((working_peak_bytes, item, components))
+        working_peak_bytes, demanding, components = max(
             evaluated,
             key=lambda value: (int(value[0]), int(value[1]["n_train"])),
         )
@@ -1338,9 +1518,7 @@ def _estimate_backend_memory_gb(
         n_external = int(demanding["n_external"])
         n_total = int(demanding["n_total"])
         features = int(demanding["n_features"])
-        raw_gb = 1.0 + (
-            float(matrix_bytes_per_agent) * float(nagents) / (1024.0 ** 3)
-        )
+        raw_gb = 1.0 + float(working_peak_bytes) / (1024.0 ** 3)
         total_gb = raw_gb * safety
         extra.update({
             "n_train": n_train,
@@ -1348,12 +1526,13 @@ def _estimate_backend_memory_gb(
             "n_external": n_external,
             "n_total": n_total,
             "n_features": features,
-            "matrix_bytes_per_agent": int(matrix_bytes_per_agent),
+            "ferebus_memory_components": dict(components),
+            "working_peak_bytes": int(working_peak_bytes),
             "most_demanding_task": dict(demanding),
             "active_workers": int(nagents),
             "unprotected_total_memory_gb": raw_gb,
         })
-        return total_gb, "ferebus_agent_kernel_training_memory", extra
+        return total_gb, "ferebus_source_allocation_peak", extra
     return 1.0, "default_minimal_backend_memory", extra
 
 
@@ -1365,7 +1544,27 @@ def resolve_aimall_naat(
 ) -> int:
     raw = getattr(getattr(config, "aimall", object()), "naat", "auto")
     if not (isinstance(raw, str) and raw.strip().lower() == "auto"):
-        return max(1, min(int(raw), int(n_atoms), int(resolved_cpus)))
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise BackendSubmissionError(
+                "aimall.naat must be 'auto' or an exact positive integer"
+            )
+        if raw <= 0:
+            raise BackendSubmissionError("aimall.naat must be > 0")
+        if raw > int(n_atoms):
+            raise BackendSubmissionError(
+                "aimall.naat="
+                + str(raw)
+                + " exceeds staged atom count "
+                + str(int(n_atoms))
+            )
+        if raw > int(resolved_cpus):
+            raise BackendSubmissionError(
+                "aimall.naat="
+                + str(raw)
+                + " exceeds resolved scientific CPUs "
+                + str(int(resolved_cpus))
+            )
+        return raw
     regime = _aimall_regime(int(n_atoms), n_primitives)
     if regime == "small":
         return max(1, min(int(n_atoms), int(resolved_cpus)))
@@ -1463,9 +1662,15 @@ def _auto_cpu_target(
     if backend == "ariadne":
         grad_backend = str(getattr(config.resources, "gradient_parallel_backend", "process"))
         mode = str(getattr(getattr(config.acquisition, "gradient", object()), "mode", "active_fd"))
-        if grad_backend == "serial":
+        if grad_backend == "serial" or (
+            grad_backend == "thread" and mode == "active_fd"
+        ):
             target = partition_min
-            reason = "ariadne_serial_gradient_backend"
+            reason = (
+                "ariadne_serial_gradient_backend"
+                if grad_backend == "serial"
+                else "ariadne_thread_backend_forced_serial_for_active_fd"
+            )
         elif mode == "active_fd":
             dim = int(evidence["gradient_dimension"])
             target = dim
@@ -1543,7 +1748,7 @@ def resolve_phase_resources(
     if not evidence or not isinstance(evidence.get("source"), str):
         raise BackendSubmissionError("resource evidence override is malformed")
     if submitted_task_ids is not None:
-        if backend not in {"gaussian", "aimall", "ariadne"}:
+        if backend not in {"gaussian", "aimall", "ariadne", "ferebus"}:
             raise BackendSubmissionError(
                 "partial-array task IDs are unsupported for backend " + backend
             )
@@ -1555,7 +1760,7 @@ def resolve_phase_resources(
     if (
         require_evidence
         and array_size is not None
-        and backend in {"gaussian", "aimall", "ariadne"}
+        and backend in {"gaussian", "aimall", "ariadne", "ferebus"}
     ):
         evidence_tasks = int(evidence.get("n_tasks", -1))
         if evidence_tasks != int(array_size):
@@ -1696,7 +1901,13 @@ def resolve_phase_resources(
             )
         )
     elif backend == "ariadne":
-        if str(config.resources.gradient_parallel_backend) == "serial":
+        gradient_backend = str(config.resources.gradient_parallel_backend)
+        gradient_mode = str(
+            getattr(getattr(config.acquisition, "gradient", object()), "mode", "active_fd")
+        )
+        if gradient_backend == "serial" or (
+            gradient_backend == "thread" and gradient_mode == "active_fd"
+        ):
             active_workers = 1
         else:
             active_workers = min(
@@ -1788,31 +1999,19 @@ def resolve_phase_resources(
             memory_reason = "gaussian_explicit_allocation_for_gauss_mdef"
     allocated_gb = (slurm_memory_mib(mem_per_cpu) / 1024.0) * float(cpus)
     if float(estimated_total) > allocated_gb + 1.0e-9:
-        if (
-            not _is_auto(raw_mem)
-            and bool(
-                getattr(
-                    config.resources,
-                    "fail_on_memory_estimate_exceeds_request",
-                    True,
-                )
-            )
-        ):
-            raise BackendSubmissionError(
-                "resources."
-                + backend
-                + ".mem_per_cpu="
-                + str(mem_per_cpu)
-                + " requests "
-                + str(round(allocated_gb, 3))
-                + " GB total for "
-                + str(phase_name)
-                + ", below the estimated "
-                + str(round(float(estimated_total), 3))
-                + " GB. Increase the request, choose auto, or set "
-                + "resources.fail_on_memory_estimate_exceeds_request=false."
-            )
-        warnings.append("estimated memory exceeds requested allocation")
+        raise BackendSubmissionError(
+            "resources."
+            + backend
+            + ".mem_per_cpu="
+            + str(mem_per_cpu)
+            + " requests "
+            + str(round(allocated_gb, 3))
+            + " GB total for "
+            + str(phase_name)
+            + ", below the protected estimate "
+            + str(round(float(estimated_total), 3))
+            + " GB. Increase the request, choose auto, or use a higher-memory partition."
+        )
     concurrency = 1
     if array_size is not None:
         throttle = getattr(resources, "array_concurrency_limit", None)

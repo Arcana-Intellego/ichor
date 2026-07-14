@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,6 +21,11 @@ from ichor.hpc.active_learning.daemon.resource_records import (
 )
 from ichor.hpc.active_learning.daemon.resource_solver import ResolvedPhaseResources
 from ichor.hpc.active_learning.daemon.scratch import inventory, prepare_task_scratch
+from ichor.hpc.active_learning.daemon.script_bundles import (
+    prepare_attempt_bundle,
+    write_attempt_script,
+    write_script_binding,
+)
 from ichor.hpc.active_learning.daemon.submission_intent import (
     bind_resource_resolution,
     load_intent,
@@ -56,6 +62,16 @@ def _failed_scratch(campaign: Path, identity: str = "r0000-a0001-deadbeef") -> P
         scratch_path_template="fixture",
     )
     binding = write_resolution(campaign, payload)
+    bundle = prepare_attempt_bundle(
+        campaign,
+        "GAUSSIAN",
+        1,
+        identity,
+        array_size=1,
+        max_log_files_per_directory=10,
+    )
+    write_attempt_script(bundle, "#!/bin/bash\ntrue\n")
+    script_binding = write_script_binding(bundle)
     leaf = prepare_task_scratch(
         campaign,
         campaign_uid="uid",
@@ -67,6 +83,8 @@ def _failed_scratch(campaign: Path, identity: str = "r0000-a0001-deadbeef") -> P
         array_task_id=0,
         resource_resolution_path=binding["path"],
         resource_resolution_sha256=binding["sha256"],
+        script_binding_path=script_binding["path"],
+        script_binding_sha256=script_binding["sha256"],
     )
     finish_task_scratch(leaf, success=False)
     return leaf
@@ -177,6 +195,65 @@ def test_resource_plan_reports_local_and_missing_future_evidence(tmp_path):
     assert local["status"] == "local"
     unavailable = plan_phase(tmp_path, CampaignConfig(), "PHASE_A_POLUS", 0)
     assert unavailable["status"] == "evidence_not_yet_produced"
+
+
+def _campaign_byte_inventory(root: Path):
+    return {
+        path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(root.rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    }
+
+
+def test_orphaned_resolution_is_not_reported_as_submitted(tmp_path):
+    resolved = ResolvedPhaseResources(
+        backend="polus",
+        partition="multicore",
+        ntasks=1,
+        cpus_per_task=1,
+        mem_per_cpu="4G",
+        estimated_total_memory_gb=4.0,
+        partition_memory_per_core_gb=4.0,
+        cpus_raw=1,
+        mem_per_cpu_raw="4G",
+        cpu_reason="fixture",
+        memory_reason="fixture",
+    )
+    payload = resolution_payload(
+        campaign_uid="uid",
+        phase_name="PHASE_A_POLUS",
+        iteration=0,
+        attempt_id="orphan-attempt",
+        submission_identity="r0000-a0001-orphaned",
+        resolved=resolved,
+        evidence={"source": "fixture"},
+        scratch_path_template="fixture",
+    )
+    binding = write_resolution(tmp_path, payload)
+
+    planned = plan_phase(tmp_path, CampaignConfig(), "PHASE_A_POLUS", 0)
+
+    assert planned["status"] == "evidence_not_yet_produced"
+    assert planned["orphaned_resolutions"] == [str(Path(binding["path"]).resolve())]
+
+
+def test_resource_plan_is_byte_for_byte_read_only(tmp_path):
+    data = tmp_path / ".DATA" / "ACTIVE_LEARNING"
+    data.mkdir(parents=True)
+    (tmp_path / "campaign.yaml").write_text("schema_version: 13\n", encoding="utf-8")
+    (data / "operator-note.txt").write_bytes(b"unchanged evidence\n")
+    before = _campaign_byte_inventory(tmp_path)
+
+    payload = build_resource_plan(
+        tmp_path,
+        CampaignConfig(),
+        current_phase="INIT",
+        current_iteration=0,
+        all_phases=True,
+    )
+
+    assert payload["schema_version"] == 2
+    assert _campaign_byte_inventory(tmp_path) == before
 
 
 def test_resource_plan_prefers_immutable_submitted_resolution(tmp_path):
@@ -341,11 +418,16 @@ def test_resource_plan_human_output_includes_formula_and_evidence_contract(tmp_p
                 },
                 "scratch_path_template": "scratch-template",
                 "telemetry": {
-                    "p95_rss_mib": 100.0,
-                    "p95_elapsed_seconds": 20.0,
-                    "recommended_memory_mib": 125.0,
-                    "recommended_walltime_seconds": 30.0,
-                    "n_missing_task_rows": 0,
+                    "status": "final",
+                    "path": "resource_usage_records.json",
+                    "error": None,
+                    "summary": {
+                        "p95_rss_mib": 100.0,
+                        "p95_elapsed_seconds": 20.0,
+                        "recommended_memory_mib": 125.0,
+                        "recommended_walltime_seconds": 30.0,
+                        "n_missing_task_rows": 0,
+                    },
                 },
             }
         ],

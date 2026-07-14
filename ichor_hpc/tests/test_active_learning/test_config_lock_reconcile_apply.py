@@ -542,14 +542,15 @@ def test_reconcile_apply_uses_safe_max_iterations_change(tmp_path, capsys):
     assert recovered.max_iterations == 7
 
 
-def test_legacy_memory_guard_lock_is_rejected_without_migration(tmp_path):
+def test_removed_memory_guard_lock_is_rejected_without_migration(tmp_path):
     campaign = _campaign(tmp_path)
     original = CampaignConfig()
     write_config_lock(campaign, original)
     path = config_lock_path(campaign)
     payload = json.loads(path.read_text(encoding="utf-8"))
-    del payload["canonical_config"]["resources"]["fail_on_memory_estimate_exceeds_request"]
-    payload["schema_version"] = 1
+    payload["canonical_config"]["resources"][
+        "fail_on_memory_estimate_exceeds_request"
+    ] = True
     payload["fingerprint_sha256"] = config_fingerprint(payload["canonical_config"])
     payload.pop("campaign_uid", None)
     payload.pop("history_sequence", None)

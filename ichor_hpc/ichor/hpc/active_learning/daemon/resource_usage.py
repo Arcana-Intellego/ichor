@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 import re
 import subprocess
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Union
@@ -12,7 +13,7 @@ from .state import atomic_write_json
 from ..submit.slurm_contracts import run_scheduler_command
 
 
-USAGE_SCHEMA_VERSION = 1
+USAGE_SCHEMA_VERSION = 2
 USAGE_FILENAME = "resource_usage_records.json"
 _MEMORY_RE = re.compile(
     r"^([0-9]+(?:\.[0-9]+)?)([KMGT]?)(?:[cn])?$",
@@ -24,6 +25,47 @@ def usage_path(campaign_dir: Union[str, Path]) -> Path:
     from .filesystem import operational_path
 
     return operational_path(campaign_dir, USAGE_FILENAME)
+
+
+def read_usage_records(campaign_dir: Union[str, Path]) -> Dict[str, Any]:
+    """Read the telemetry ledger without hiding corruption as absence."""
+    from ..strict_json import strict_json as json
+
+    path = usage_path(campaign_dir)
+    if path.is_symlink():
+        raise ValueError("resource usage records must not be a symlink: " + str(path))
+    if not path.exists():
+        return {"schema_version": USAGE_SCHEMA_VERSION, "attempts": []}
+    if not path.is_file():
+        raise ValueError("resource usage records are not a regular file: " + str(path))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError("resource usage records are unreadable: " + str(path)) from exc
+    if not isinstance(payload, dict):
+        raise ValueError("resource usage records must contain a JSON object")
+    if payload.get("schema_version") != USAGE_SCHEMA_VERSION:
+        raise ValueError("resource usage records have an unsupported schema")
+    attempts = payload.get("attempts")
+    if not isinstance(attempts, list) or any(
+        not isinstance(item, dict) for item in attempts
+    ):
+        raise ValueError("resource usage records attempts must be a list of objects")
+    identities = []
+    for item in attempts:
+        status = item.get("telemetry_status")
+        if status not in {"provisional", "final"}:
+            raise ValueError("resource usage attempt has an invalid telemetry status")
+        attempt_id = item.get("attempt_id")
+        job_id = item.get("job_id")
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise ValueError("resource usage attempt has no attempt_id")
+        if not isinstance(job_id, str) or not job_id:
+            raise ValueError("resource usage attempt has no job_id")
+        identities.append((attempt_id, job_id))
+    if len(identities) != len(set(identities)):
+        raise ValueError("resource usage records contain duplicate attempt identities")
+    return payload
 
 
 def _memory_mib(value: Any) -> Optional[float]:
@@ -87,6 +129,9 @@ def summarise_usage(
     job_id: str,
     rows: Sequence[Mapping[str, Any]],
     expected_tasks: Optional[int] = None,
+    query_command: Optional[Sequence[str]] = None,
+    query_stdout: str = "",
+    collection_sequence: int = 1,
 ) -> Dict[str, Any]:
     rss = [float(row["max_rss_mib"]) for row in rows if row.get("max_rss_mib") is not None]
     vm = [float(row["max_vm_size_mib"]) for row in rows if row.get("max_vm_size_mib") is not None]
@@ -102,6 +147,17 @@ def summarise_usage(
         ),
         reverse=True,
     )[:10]
+    missing_rows = (
+        None
+        if expected_tasks is None
+        else max(0, int(expected_tasks) - len(rows))
+    )
+    complete_metrics = bool(rows) and all(
+        row.get("max_rss_mib") is not None
+        and int(row.get("elapsed_seconds", -1)) >= 0
+        for row in rows
+    )
+    final = (missing_rows in {None, 0}) and complete_metrics
     return {
         "attempt_id": str(attempt_id),
         "submission_identity": str(submission_identity),
@@ -113,11 +169,14 @@ def summarise_usage(
         "n_expected_tasks": (
             None if expected_tasks is None else int(expected_tasks)
         ),
-        "n_missing_task_rows": (
-            None
-            if expected_tasks is None
-            else max(0, int(expected_tasks) - len(rows))
-        ),
+        "n_missing_task_rows": missing_rows,
+        "telemetry_status": "final" if final else "provisional",
+        "collection_complete": bool(final),
+        "collection_sequence": int(collection_sequence),
+        "query_command": list(query_command or []),
+        "query_stdout_sha256": hashlib.sha256(
+            str(query_stdout).encode("utf-8")
+        ).hexdigest(),
         "n_failures": len(failures),
         "max_rss_mib": max(rss) if rss else None,
         "p50_rss_mib": _quantile(rss, 0.50),
@@ -210,28 +269,37 @@ def append_usage_summary(
     *,
     history_limit: int,
 ) -> Dict[str, Any]:
-    from ..strict_json import strict_json as json
-
     path = usage_path(campaign_dir)
     if int(history_limit) <= 0:
         raise ValueError("resource usage history limit must be > 0")
-    if path.is_symlink():
-        raise ValueError("resource usage records must not be a symlink: " + str(path))
-    if path.exists():
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise ValueError("resource usage records are unreadable: " + str(path)) from exc
-    else:
-        payload = {"schema_version": USAGE_SCHEMA_VERSION, "attempts": []}
-    if not isinstance(payload, dict) or int(payload.get("schema_version", -1)) != USAGE_SCHEMA_VERSION:
-        raise ValueError("resource usage records have an unsupported schema")
-    attempts = payload.get("attempts")
-    if not isinstance(attempts, list):
-        raise ValueError("resource usage records attempts must be a list")
+    payload = read_usage_records(campaign_dir)
+    attempts = list(payload["attempts"])
     identity = (str(summary.get("attempt_id")), str(summary.get("job_id")))
-    if not any((str(item.get("attempt_id")), str(item.get("job_id"))) == identity for item in attempts if isinstance(item, dict)):
+    existing_index = next(
+        (
+            index
+            for index, item in enumerate(attempts)
+            if (str(item.get("attempt_id")), str(item.get("job_id"))) == identity
+        ),
+        None,
+    )
+    if existing_index is None:
         attempts.append(dict(summary))
+    else:
+        existing = attempts[existing_index]
+        if str(existing.get("telemetry_status")) == "final":
+            if dict(existing) != dict(summary):
+                raise ValueError("final resource usage telemetry is immutable")
+        else:
+            old_sequence = int(existing.get("collection_sequence", 0))
+            new_sequence = int(summary.get("collection_sequence", 0))
+            old_rows = int(existing.get("n_rows", 0))
+            new_rows = int(summary.get("n_rows", 0))
+            if new_sequence <= old_sequence or new_rows < old_rows:
+                raise ValueError(
+                    "provisional telemetry replacement is not monotonic"
+                )
+            attempts[existing_index] = dict(summary)
     payload["attempts"] = attempts[-int(history_limit):]
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(path, payload)
@@ -250,29 +318,30 @@ def collect_usage(
     if not job_id:
         raise ValueError("submission intent has no JobID for telemetry")
     path = usage_path(campaign_dir)
-    if path.is_symlink():
-        raise ValueError("resource usage records must not be a symlink: " + str(path))
-    if path.is_file() and not path.is_symlink():
-        from ..strict_json import strict_json as json
-
-        try:
-            existing = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            existing = None
-        if isinstance(existing, dict) and isinstance(existing.get("attempts"), list):
-            for item in existing["attempts"]:
-                if (
-                    isinstance(item, dict)
-                    and str(item.get("attempt_id")) == str(intent.get("attempt_id"))
-                    and str(item.get("job_id")) == job_id
-                ):
-                    return dict(item)
+    existing = read_usage_records(campaign_dir)
+    previous = next(
+        (
+            dict(item)
+            for item in existing["attempts"]
+            if str(item.get("attempt_id")) == str(intent.get("attempt_id"))
+            and str(item.get("job_id")) == job_id
+        ),
+        None,
+    )
+    if previous is not None and str(previous.get("telemetry_status")) == "final":
+        return previous
+    query_command = [
+        "sacct",
+        "-n",
+        "-P",
+        "--array",
+        "-j",
+        job_id,
+        "--format=JobIDRaw,State,ExitCode,ElapsedRaw,AllocCPUS,ReqMem,MaxRSS,MaxVMSize,TotalCPU",
+    ]
     completed = run_scheduler_command(
         runner,
-        [
-            "sacct", "-n", "-P", "-j", job_id,
-            "--format=JobIDRaw,State,ExitCode,ElapsedRaw,AllocCPUS,ReqMem,MaxRSS,MaxVMSize,TotalCPU",
-        ],
+        query_command,
         timeout_seconds=int(timeout_seconds),
         check=False,
         capture_output=True,
@@ -289,12 +358,21 @@ def collect_usage(
     expected_raw = intent.get("expected_tasks")
     expected_tasks = None
     if expected_raw is not None:
-        try:
-            expected_tasks = int(expected_raw)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("submission intent expected_tasks is malformed") from exc
+        if isinstance(expected_raw, bool) or not isinstance(expected_raw, int):
+            raise ValueError("submission intent expected_tasks is malformed")
+        expected_tasks = expected_raw
         if expected_tasks <= 0:
             raise ValueError("submission intent expected_tasks must be > 0")
+    submission_kind = str(intent.get("submission_kind") or "")
+    if submission_kind == "array" and expected_tasks is not None:
+        expected_ids = {job_id + "_" + str(index) for index in range(expected_tasks)}
+        observed_ids = {str(row.get("job_id_raw") or "") for row in rows}
+        unexpected = sorted(observed_ids - expected_ids)
+        if unexpected:
+            raise ValueError(
+                "sacct telemetry returned unexpected array task IDs: "
+                + repr(unexpected[:10])
+            )
     summary = summarise_usage(
         attempt_id=str(intent.get("attempt_id") or ""),
         submission_identity=str(intent.get("submission_identity") or ""),
@@ -303,6 +381,11 @@ def collect_usage(
         job_id=job_id,
         rows=rows,
         expected_tasks=expected_tasks,
+        query_command=query_command,
+        query_stdout=getattr(completed, "stdout", "") or "",
+        collection_sequence=(
+            1 if previous is None else int(previous.get("collection_sequence", 0)) + 1
+        ),
     )
     append_usage_summary(campaign_dir, summary, history_limit=int(history_limit))
     return summary

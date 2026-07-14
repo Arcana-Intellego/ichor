@@ -502,8 +502,14 @@ def build_condensed_distance_store(
             for start, block_values in pool.map(_condensed_row_block, blocks):
                 values[start:start + len(block_values)] = block_values
     store = CondensedDistanceStore(n=n, values=values, path=store_path)
-    if not np.all(np.isfinite(values)) or np.any(values < 0.0):
-        raise ValueError("POLUS condensed distances are non-finite or negative")
+    # Validate in bounded slices.  Calling isfinite() over a file-backed
+    # vector materialises a second O(N^2) boolean array and defeats the
+    # bounded-memory contract precisely for the largest pools.
+    validation_chunk = 1_048_576
+    for start in range(0, n_pairs, validation_chunk):
+        chunk = np.asarray(values[start : start + validation_chunk])
+        if not np.all(np.isfinite(chunk)) or np.any(chunk < 0.0):
+            raise ValueError("POLUS condensed distances are non-finite or negative")
     store.flush()
     return store
 

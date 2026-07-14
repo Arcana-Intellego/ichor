@@ -179,6 +179,44 @@ class DaemonControlFunctions:
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
+    def create_checkpoint():
+        from ichor.hpc.active_learning.cli import cmd_checkpoint
+
+        ns = _guarded_campaign_dir_ns()
+        if ns is None:
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        answer = user_input_free_flow(
+            "Create a verified checkpoint at the configured destination? Type YES: ",
+            "",
+        )
+        if str(answer).strip() != "YES":
+            print("Cancelled.")
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        ns.destination = None
+        ns.json = False
+        rc = cmd_checkpoint(ns)
+        if rc != 0:
+            print("checkpoint returned exit code " + str(rc))
+        user_input_free_flow("Press enter to return to the menu: ", "")
+
+    @staticmethod
+    def show_checkpoint_status():
+        from ichor.hpc.active_learning.cli import cmd_checkpoint_status
+
+        ns = _guarded_campaign_dir_ns()
+        if ns is None:
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        ns.destination = None
+        ns.json = False
+        rc = cmd_checkpoint_status(ns)
+        if rc not in {0, 1}:
+            print("checkpoint-status returned exit code " + str(rc))
+        user_input_free_flow("Press enter to return to the menu: ", "")
+
+    @staticmethod
     def show_sampling_protocol_summary():
         try:
             campaign_dir = selected_campaign_dir()
@@ -622,6 +660,14 @@ daemon_control_menu_items = [
     FunctionItem(
         "Submit compute-node environment smoke",
         DaemonControlFunctions.submitted_environment_smoke,
+    ),
+    FunctionItem(
+        "Show checkpoint status",
+        DaemonControlFunctions.show_checkpoint_status,
+    ),
+    FunctionItem(
+        "Create campaign checkpoint",
+        DaemonControlFunctions.create_checkpoint,
     ),
     SubmenuItem(
         IMPORT_TRAJECTORY_POOL_MENU_DESCRIPTION.title,

@@ -1620,19 +1620,73 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
         return staging, 3
 
     def fake_submit(jd_file, working_directory, **kwargs):
-        script = Path(working_directory) / "runFerebus.sh"
+        working = Path(working_directory)
+        script = working / "runFerebus.sh"
         script.write_text("#!/bin/sh\n", encoding="utf-8")
+        manifest_path = working / stg.FEREBUS_TASK_MANIFEST
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        generated = []
+        for task in manifest["tasks"]:
+            config_path = working / task["config_path"]
+            config_path.write_text(
+                "mean_type = 21\n"
+                'level_of_theory = "b3lyp/aug-cc-pvtz"\n'
+                "iqaDeviationFactor = 1.0\n"
+                "scaling = 1\n"
+                "scale_feats = 1\n"
+                "scale_prop = 0\n",
+                encoding="utf-8",
+            )
+            record = {
+                "path": task["config_path"],
+                "size": config_path.stat().st_size,
+                "sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+                "parsed_contract": {
+                    "mean_type": 21,
+                    "level_of_theory": "b3lyp/aug-cc-pvtz",
+                    "iqa_deviation_factor": 1.0,
+                    "scaling": True,
+                    "scale_feats": True,
+                    "scale_prop": False,
+                },
+                "prior_mean_contract_sha256": prior.contract_sha256,
+            }
+            task["generated_config"] = record
+            generated.append(record)
+        manifest_path.write_text(
+            json.dumps(manifest), encoding="utf-8", newline="\n"
+        )
+        overrides = kwargs["prepared_callback"](working, script, generated)
+        submitted_script = Path(overrides["submission_script_path"])
+        submitted_script.write_text("#!/bin/sh\n", encoding="utf-8")
+        from ichor.hpc.active_learning.daemon.script_bundles import (
+            AttemptBundle,
+            write_script_binding,
+        )
+
+        script_binding = write_script_binding(
+            AttemptBundle(
+                root=submitted_script.parent,
+                script=submitted_script,
+                outputs=submitted_script.parent / "OUTPUTS",
+                errors=submitted_script.parent / "ERRORS",
+            )
+        )
+        kwargs["pre_submit_hook"](submitted_script, script_binding)
         calls["submit"] = {
             "jd_file": Path(jd_file),
-            "working_directory": Path(working_directory),
+            "working_directory": working,
             "kwargs": dict(kwargs),
+            "overrides": dict(overrides),
         }
         return FerebusSubmission(
             job_id="4242",
             cluster=None,
-            submission_script=script,
-            working_dir=Path(working_directory),
+            submission_script=submitted_script,
+            working_dir=working,
             transfer_learning=False,
+            generated_configs=tuple(generated),
+            script_binding=script_binding,
         )
 
     monkeypatch.setattr(stg, "stage_ferebus_inputs", fake_stage)
@@ -1673,14 +1727,14 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
         campaign,
         phase="FEREBUS",
         iteration=0,
-    ) == 1
+    ) == 3
 
     write_pre_submit_intent(
         campaign,
         campaign_uid="campaign-uid",
         phase_name="FEREBUS",
         iteration=0,
-        expected_tasks=1,
+        expected_tasks=3,
     )
     result = ex.submit_or_run(
         SimpleNamespace(
@@ -1692,7 +1746,7 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
     )
 
     assert result.submitted_job_id == "4242"
-    assert result.expected_tasks == 1
+    assert result.expected_tasks == 3
     assert calls["stage"]["reference_data_version"] == 4
     assert calls["stage"]["is_initial"] is False
     assert calls["submit"]["jd_file"] == staging / stg.FEREBUS_JOB_DETAILS
@@ -1703,11 +1757,11 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
     assert calls["submit"]["kwargs"]["walltime_hours"] == cfg.resources.ferebus_walltime_hours
     assert calls["submit"]["kwargs"]["platform"] == "CSF3"
     assert calls["submit"]["kwargs"]["partition"] == "multicore"
-    assert calls["submit"]["kwargs"]["cpus_per_task"] == cfg.ferebus.nagents
     assert calls["submit"]["kwargs"]["ncores"] == cfg.ferebus.nagents
-    assert calls["submit"]["kwargs"]["ntasks"] == 1
     assert calls["submit"]["kwargs"]["expected_tasks"] == 3
-    assert calls["submit"]["kwargs"]["mem_per_cpu"].endswith("G")
+    assert calls["submit"]["overrides"]["cpus_per_task"] >= cfg.ferebus.nagents
+    assert calls["submit"]["overrides"]["ntasks"] == 1
+    assert calls["submit"]["overrides"]["mem_per_cpu"].endswith("G")
 
 
 def test_build_sbatch_script_renders_aimall_block(monkeypatch):
@@ -2202,6 +2256,28 @@ def test_write_real_script_creates_sbatch_log_dirs(tmp_path):
         newline="\n",
     )
     TrajectoryPool.import_from(source, campaign)
+    from ichor.hpc.active_learning.daemon.state import atomic_write_json
+
+    bootstrap_root = (
+        campaign / ".DATA" / "ACTIVE_LEARNING" / "bootstrap_inputs"
+    )
+    bootstrap_root.mkdir(parents=True)
+    embedded = {
+        "schema_version": 1,
+        "confirmed": True,
+        "excluded_pool_frame_ids": [],
+        "sources": {},
+        "model": None,
+    }
+    atomic_write_json(bootstrap_root / "CUSTOM_BOOTSTRAP.json", embedded)
+    pointer = dict(embedded)
+    pointer["bootstrap_inputs_root"] = (
+        bootstrap_root.resolve().relative_to(campaign.resolve()).as_posix()
+    )
+    atomic_write_json(
+        campaign / ".DATA" / "ACTIVE_LEARNING" / "CUSTOM_BOOTSTRAP.json",
+        pointer,
+    )
     write_pre_submit_intent(
         campaign,
         campaign_uid="uid",

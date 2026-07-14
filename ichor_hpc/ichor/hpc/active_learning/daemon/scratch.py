@@ -16,11 +16,18 @@ from .state import atomic_write_json
 
 
 SCRATCH_TASK_SCHEMA_VERSION = 2
-_SCRATCH_STATUSES = frozenset({"prepared", "failed_retained", "completed"})
+_SCRATCH_STATUSES = frozenset(
+    {"prepared", "failed_retained", "cleanup_pending"}
+)
 
 
 def scratch_root(campaign_dir: Union[str, Path]) -> Path:
     return Path(campaign_dir) / ".DATA" / "SCRATCH"
+
+
+def scratch_cleanup_root(campaign_dir: Union[str, Path]) -> Path:
+    """Return the campaign-owned tombstone root for interrupted clean-up."""
+    return Path(campaign_dir) / ".DATA" / "SCRATCH_CLEANUP"
 
 
 def _safe_token(value: Any, label: str) -> str:
@@ -64,7 +71,11 @@ def _validate_resolution_ownership(
         raise ValueError(
             "scratch resource resolution is outside the resolution store"
         ) from exc
-    payload = verify_resolution(source, str(resource_resolution_sha256))
+    payload = verify_resolution(
+        source,
+        str(resource_resolution_sha256),
+        campaign_dir=campaign,
+    )
     expected = {
         "campaign_uid": str(campaign_uid),
         "phase": str(phase_name),
@@ -131,6 +142,8 @@ def prepare_task_scratch(
     array_task_id: int,
     resource_resolution_path: str,
     resource_resolution_sha256: str,
+    script_binding_path: str,
+    script_binding_sha256: str,
 ) -> Path:
     campaign = Path(campaign_dir)
     _validate_resolution_ownership(
@@ -150,10 +163,24 @@ def prepare_task_scratch(
         "job-" + _safe_token(job_id, "job ID")
     ) / ("task-" + str(int(array_task_id)))
     leaf = _check_campaign_relative_path(campaign, leaf)
-    if leaf.is_symlink():
-        raise ValueError("scratch task leaf must not be a symlink: " + str(leaf))
-    leaf.mkdir(parents=True, exist_ok=True, mode=0o700)
-    leaf.chmod(0o700)
+    parent = _check_campaign_relative_path(campaign, leaf.parent)
+    parent.mkdir(parents=True, exist_ok=True)
+    parent = _check_campaign_relative_path(campaign, parent)
+    try:
+        leaf.mkdir(mode=0o700, exist_ok=False)
+    except FileExistsError as exc:
+        raise ValueError(
+            "scratch task leaf already exists; refusing to reuse dirty task state: "
+            + str(leaf)
+        ) from exc
+    try:
+        leaf.chmod(0o700)
+    except OSError:
+        try:
+            leaf.rmdir()
+        except OSError:
+            pass
+        raise
     metadata = leaf.lstat()
     if not stat.S_ISDIR(metadata.st_mode) or leaf.is_symlink():
         raise ValueError("scratch task leaf is not a regular directory: " + str(leaf))
@@ -166,9 +193,17 @@ def prepare_task_scratch(
             raise PermissionError(
                 "scratch task leaf is not owned by the current user: " + str(leaf)
             )
-    atomic_write_json(
-        leaf / "TASK.json",
-        {
+    from .script_bundles import verify_script_binding
+
+    binding_path = Path(script_binding_path)
+    if not binding_path.is_absolute():
+        raise ValueError("scratch script-binding path must be absolute")
+    binding_path = campaign_owned_path(campaign, binding_path)
+    verify_script_binding(binding_path, str(script_binding_sha256))
+    try:
+        atomic_write_json(
+            leaf / "TASK.json",
+            {
             "schema_version": SCRATCH_TASK_SCHEMA_VERSION,
             "created_at_iso": datetime.now(timezone.utc).isoformat(),
             "campaign_dir": str(campaign.resolve()),
@@ -181,9 +216,17 @@ def prepare_task_scratch(
             "array_task_id": int(array_task_id),
             "resource_resolution_path": str(resource_resolution_path),
             "resource_resolution_sha256": str(resource_resolution_sha256),
+            "script_binding_path": str(binding_path.resolve()),
+            "script_binding_sha256": str(script_binding_sha256),
             "status": "prepared",
-        },
-    )
+            },
+        )
+    except Exception:
+        try:
+            shutil.rmtree(leaf)
+        except OSError:
+            pass
+        raise
     return leaf
 
 
@@ -230,20 +273,52 @@ def finish_task_scratch(path: Union[str, Path], *, success: bool) -> None:
             + str(ownership.get("reason"))
         )
     payload["finished_at_iso"] = datetime.now(timezone.utc).isoformat()
-    payload["status"] = "completed" if success else "failed_retained"
+    payload["status"] = "cleanup_pending" if success else "failed_retained"
     atomic_write_json(task_path, payload)
     if not success:
         return
-    shutil.rmtree(leaf)
+    relative = leaf.relative_to(root)
+    cleanup_root = _check_campaign_relative_path(
+        campaign, scratch_cleanup_root(campaign)
+    )
+    tombstone = _check_campaign_relative_path(campaign, cleanup_root / relative)
+    tombstone.parent.mkdir(parents=True, exist_ok=True)
+    tombstone = _check_campaign_relative_path(campaign, tombstone)
+    if tombstone.exists() or tombstone.is_symlink():
+        raise ValueError(
+            "scratch cleanup tombstone already exists: " + str(tombstone)
+        )
+    ownership_sidecar = tombstone.parent / (tombstone.name + ".ownership.json")
+    if ownership_sidecar.exists() or ownership_sidecar.is_symlink():
+        raise ValueError(
+            "scratch cleanup ownership sidecar already exists: "
+            + str(ownership_sidecar)
+        )
+    # This copy is deliberately outside the subtree passed to rmtree.  Even a
+    # partial recursive deletion therefore leaves enough trusted ownership for
+    # reconcile to finish the clean-up.
+    atomic_write_json(ownership_sidecar, payload)
+    os.replace(leaf, tombstone)
     _prune_empty(leaf.parent, root)
+    # If recursive deletion fails, the complete ownership record remains in
+    # SCRATCH_CLEANUP and reconcile can safely remove it later.
+    shutil.rmtree(tombstone)
+    ownership_sidecar.unlink()
+    _prune_empty(tombstone.parent, cleanup_root)
 
 
 def _invalid(path: Path, reason: str) -> Dict[str, Any]:
     return {"status": "invalid", "path": str(path), "reason": str(reason)}
 
 
-def _task_record(campaign: Path, root: Path, task_path: Path) -> Dict[str, Any]:
-    leaf = task_path.parent
+def _task_record(
+    campaign: Path,
+    root: Path,
+    task_path: Path,
+    *,
+    leaf_override: Optional[Path] = None,
+) -> Dict[str, Any]:
+    leaf = task_path.parent if leaf_override is None else Path(leaf_override)
     try:
         relative = leaf.resolve(strict=False).relative_to(root.resolve(strict=False))
     except ValueError:
@@ -271,6 +346,8 @@ def _task_record(campaign: Path, root: Path, task_path: Path) -> Dict[str, Any]:
         "job_id",
         "resource_resolution_path",
         "resource_resolution_sha256",
+        "script_binding_path",
+        "script_binding_sha256",
     )
     if any(not isinstance(payload.get(key), str) or not payload.get(key) for key in required_text):
         return _invalid(task_path, "TASK.json ownership metadata is incomplete")
@@ -356,21 +433,40 @@ def _task_record(campaign: Path, root: Path, task_path: Path) -> Dict[str, Any]:
             task_path,
             "TASK.json resource-resolution ownership is invalid: " + str(exc),
         )
+    script_digest = str(payload.get("script_binding_sha256"))
+    if (
+        len(script_digest) != 64
+        or any(ch not in "0123456789abcdef" for ch in script_digest)
+    ):
+        return _invalid(task_path, "TASK.json script-binding digest is invalid")
+    try:
+        from .script_bundles import verify_script_binding
+
+        binding_path = campaign_owned_path(
+            campaign, Path(str(payload["script_binding_path"]))
+        )
+        verify_script_binding(binding_path, script_digest)
+    except Exception as exc:
+        return _invalid(
+            task_path,
+            "TASK.json script-binding ownership is invalid: " + str(exc),
+        )
     record = dict(payload)
     record["path"] = str(leaf)
+    record["ownership_record_path"] = str(task_path)
     record["attempt_path"] = str(leaf.parent.parent)
     return record
 
 
-def inventory(campaign_dir: Union[str, Path]) -> List[Dict[str, Any]]:
-    campaign = Path(campaign_dir)
-    root = scratch_root(campaign)
+def _inventory_root(campaign: Path, root: Path) -> List[Dict[str, Any]]:
     if not root.exists():
         return []
     if root.is_symlink() or not root.is_dir():
         return [_invalid(root, "scratch root is not a regular directory")]
     records: List[Dict[str, Any]] = []
     task_directories: List[Path] = []
+    cleanup_sidecars: Dict[Path, Path] = {}
+    is_cleanup_root = root.name == "SCRATCH_CLEANUP"
     for current, directory_names, file_names in os.walk(root, topdown=True, followlinks=False):
         directory = Path(current)
         relative = directory.relative_to(root)
@@ -407,15 +503,40 @@ def inventory(campaign_dir: Union[str, Path]) -> List[Dict[str, Any]]:
             child = directory / name
             if child.is_symlink():
                 records.append(_invalid(child, "scratch hierarchy contains a symlink"))
+            elif (
+                is_cleanup_root
+                and depth == 5
+                and re.fullmatch(r"task-[0-9]+\.ownership\.json", name)
+            ):
+                leaf_name = name[: -len(".ownership.json")]
+                cleanup_sidecars[directory / leaf_name] = child
             elif depth < 6:
                 records.append(_invalid(child, "scratch file exists outside a task directory"))
-    for leaf in sorted(task_directories):
-        task = leaf / "TASK.json"
+    all_task_leaves = set(task_directories) | set(cleanup_sidecars)
+    for leaf in sorted(all_task_leaves):
+        sidecar = cleanup_sidecars.get(leaf)
+        task = sidecar if sidecar is not None else leaf / "TASK.json"
         if task.is_symlink() or not task.is_file():
             records.append(_invalid(leaf, "scratch task directory has no regular TASK.json"))
             continue
-        records.append(_task_record(campaign, root, task))
+        record = _task_record(campaign, root, task, leaf_override=leaf)
+        if sidecar is not None and record.get("status") not in {
+            "cleanup_pending",
+            "invalid",
+        }:
+            record = _invalid(
+                sidecar,
+                "scratch cleanup ownership sidecar is not cleanup_pending",
+            )
+        records.append(record)
     return records
+
+
+def inventory(campaign_dir: Union[str, Path]) -> List[Dict[str, Any]]:
+    campaign = Path(campaign_dir)
+    return _inventory_root(campaign, scratch_root(campaign)) + _inventory_root(
+        campaign, scratch_cleanup_root(campaign)
+    )
 
 
 def clean_inactive_attempts(
@@ -425,7 +546,6 @@ def clean_inactive_attempts(
     allowed_attempts: Optional[Iterable[str]] = None,
 ) -> List[str]:
     campaign = Path(campaign_dir)
-    root = scratch_root(campaign)
     active = {str(value) for value in active_job_ids}
     selected = None if allowed_attempts is None else {str(value) for value in allowed_attempts}
     removed: List[str] = []
@@ -441,13 +561,24 @@ def clean_inactive_attempts(
         key = str(attempt_path)
         item = attempts.setdefault(
             key,
-            {"path": attempt_path, "job_ids": set(), "identity": identity},
+            {
+                "path": attempt_path,
+                "job_ids": set(),
+                "identity": identity,
+                "root": (
+                    scratch_cleanup_root(campaign)
+                    if scratch_cleanup_root(campaign).resolve(strict=False)
+                    in attempt_path.resolve(strict=False).parents
+                    else scratch_root(campaign)
+                ),
+            },
         )
         item["job_ids"].add(str(record.get("job_id") or ""))
     for item in attempts.values():
         if item["job_ids"] & active:
             continue
         path = _check_campaign_relative_path(campaign, Path(item["path"]))
+        root = _check_campaign_relative_path(campaign, Path(item["root"]))
         try:
             path.relative_to(root.resolve(strict=False))
         except ValueError as exc:
@@ -474,6 +605,8 @@ def _build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--array-task-id", type=int, required=True)
     prepare.add_argument("--resource-resolution", required=True)
     prepare.add_argument("--resource-resolution-sha256", required=True)
+    prepare.add_argument("--script-binding", required=True)
+    prepare.add_argument("--script-binding-sha256", required=True)
     finish = sub.add_parser("finish")
     finish.add_argument("--path", required=True)
     finish.add_argument("--success", action="store_true")
@@ -494,6 +627,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             array_task_id=args.array_task_id,
             resource_resolution_path=args.resource_resolution,
             resource_resolution_sha256=args.resource_resolution_sha256,
+            script_binding_path=args.script_binding,
+            script_binding_sha256=args.script_binding_sha256,
         )
         print(str(path))
         return 0

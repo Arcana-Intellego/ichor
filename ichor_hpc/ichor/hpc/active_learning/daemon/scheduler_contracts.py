@@ -78,7 +78,11 @@ def infer_expected_tasks_from_artifacts(
                 data = json.loads(manifest.read_text(encoding="utf-8"))
                 raw = data.get("n_tasks")
                 if raw is not None:
-                    value = int(raw)
+                    if isinstance(raw, bool) or not isinstance(raw, int):
+                        raise ValueError(
+                            "FEREBUS task manifest n_tasks must be an exact integer"
+                        )
+                    value = raw
                     if value <= 0:
                         raise ValueError("FEREBUS task manifest contains no model commands")
                 else:
@@ -87,10 +91,7 @@ def infer_expected_tasks_from_artifacts(
                         raise ValueError("FEREBUS task manifest contains no model commands")
             else:
                 return None
-            # pyferebus executes all validated model commands serially inside
-            # one submitted batch script.  The manifest count is therefore a
-            # scientific command count, not a Slurm array task count.
-            return 1
+            return value if raw is not None else len(tasks)
         if phase_name == "ARIADNE_ARRAY":
             from ..seed_identity import read_ariadne_task_map
 

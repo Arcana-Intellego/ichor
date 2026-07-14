@@ -9,9 +9,11 @@ from typing import Any, Dict, Iterable, Optional, Sequence, Union
 
 from .state import atomic_write_json, atomic_write_text
 from .filesystem import campaign_owned_path
+from ..versioning.manifest import sha256_file
 
 
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+SCRIPT_BINDING_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -21,6 +23,10 @@ class AttemptBundle:
     outputs: Path
     errors: Path
     array_task_map: Optional[Path] = None
+
+    @property
+    def script_binding(self) -> Path:
+        return self.root / "SCRIPT.json"
 
 
 def safe_component(value: Any, label: str) -> str:
@@ -75,12 +81,11 @@ def _logical_ids(source: Path) -> Sequence[int]:
         text = raw.strip()
         if not text:
             continue
-        try:
-            value = int(text)
-        except ValueError as exc:
+        if not re.fullmatch(r"0|[1-9][0-9]*", text):
             raise ValueError(
                 "array task map line " + str(line_number) + " is not an integer"
-            ) from exc
+            )
+        value = int(text)
         if value < 0:
             raise ValueError("array task map contains a negative logical task ID")
         values.append(value)
@@ -106,6 +111,7 @@ def prepare_attempt_bundle(
     array_size: Optional[int],
     max_log_files_per_directory: int,
     source_array_task_map: Optional[Union[str, Path]] = None,
+    logical_task_ids: Optional[Sequence[int]] = None,
 ) -> AttemptBundle:
     expected_logs = int(array_size) if array_size is not None else 1
     if expected_logs <= 0:
@@ -128,14 +134,33 @@ def prepare_attempt_bundle(
     )
     if root.is_symlink():
         raise ValueError("attempt bundle root must not be a symlink: " + str(root))
-    outputs = root / "OUTPUTS"
-    errors = root / "ERRORS"
+    outputs = campaign_owned_path(campaign_dir, root / "OUTPUTS")
+    errors = campaign_owned_path(campaign_dir, root / "ERRORS")
     outputs.mkdir(parents=True, exist_ok=True)
     errors.mkdir(parents=True, exist_ok=True)
+    # Re-check after creation so a concurrent path substitution cannot redirect
+    # Slurm's stdout or stderr outside the campaign.
+    outputs = campaign_owned_path(campaign_dir, outputs)
+    errors = campaign_owned_path(campaign_dir, errors)
     task_map_path: Optional[Path] = None
-    if source_array_task_map is not None:
-        source = Path(source_array_task_map)
-        logical_ids = list(read_source_array_task_ids(source))
+    if source_array_task_map is not None and logical_task_ids is not None:
+        raise ValueError(
+            "attempt bundle accepts either a source task map or logical IDs, not both"
+        )
+    if source_array_task_map is not None or logical_task_ids is not None:
+        if source_array_task_map is not None:
+            source = Path(source_array_task_map)
+            logical_ids = list(read_source_array_task_ids(source))
+        else:
+            logical_ids = []
+            for value in list(logical_task_ids or []):
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError(
+                        "attempt logical task IDs must be non-negative integers"
+                    )
+                logical_ids.append(value)
+            if len(set(logical_ids)) != len(logical_ids):
+                raise ValueError("attempt logical task IDs contain duplicates")
         if array_size is None or len(logical_ids) != int(array_size):
             raise ValueError("array task map length does not match submitted array size")
         task_map_path = root / "array_task_map.json"
@@ -194,7 +219,87 @@ def write_attempt_script(bundle: AttemptBundle, body: str) -> Path:
         bundle.script.chmod(0o700)
     except OSError:
         pass
+    write_script_binding(bundle)
     return bundle.script
+
+
+def write_script_binding(bundle: AttemptBundle) -> Dict[str, Any]:
+    """Bind the final submitted script bytes to an immutable sidecar."""
+    script = bundle.script
+    if script.is_symlink() or not script.is_file():
+        raise ValueError("attempt job script is not a regular file: " + str(script))
+    payload = {
+        "schema_version": SCRIPT_BINDING_SCHEMA_VERSION,
+        "script_path": str(script.resolve()),
+        "script_size": int(script.stat().st_size),
+        "script_sha256": sha256_file(script),
+    }
+    path = bundle.script_binding
+    if path.exists() or path.is_symlink():
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("attempt script binding is not a regular file: " + str(path))
+        existing = _read_script_binding_payload(path)
+        if existing != payload:
+            raise ValueError("attempt script binding already exists with different content")
+    else:
+        atomic_write_json(path, payload)
+    return {
+        "path": str(path.resolve()),
+        "sha256": sha256_file(path),
+        **payload,
+    }
+
+
+def _read_script_binding_payload(path: Path) -> Dict[str, Any]:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("attempt script binding is not a regular file: " + str(path))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError("attempt script binding is unreadable: " + str(path)) from exc
+    if not isinstance(payload, dict):
+        raise ValueError("attempt script binding must contain a JSON object")
+    if payload.get("schema_version") != SCRIPT_BINDING_SCHEMA_VERSION:
+        raise ValueError("attempt script binding has an unsupported schema")
+    if not isinstance(payload.get("script_path"), str) or not payload["script_path"]:
+        raise ValueError("attempt script binding has no script path")
+    if (
+        isinstance(payload.get("script_size"), bool)
+        or not isinstance(payload.get("script_size"), int)
+        or payload["script_size"] < 0
+    ):
+        raise ValueError("attempt script binding has an invalid script size")
+    digest = payload.get("script_sha256")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(ch not in "0123456789abcdef" for ch in digest)
+    ):
+        raise ValueError("attempt script binding has an invalid script SHA-256")
+    return payload
+
+
+def verify_script_binding(
+    path: Union[str, Path], expected_sha256: str
+) -> Dict[str, Any]:
+    source = Path(path)
+    observed_binding_sha = sha256_file(source)
+    if observed_binding_sha != str(expected_sha256):
+        raise ValueError(
+            "attempt script-binding SHA-256 mismatch: expected "
+            + str(expected_sha256)
+            + " got "
+            + observed_binding_sha
+        )
+    payload = _read_script_binding_payload(source)
+    script = Path(str(payload["script_path"]))
+    if script.is_symlink() or not script.is_file():
+        raise ValueError("bound attempt script is not a regular file: " + str(script))
+    if int(script.stat().st_size) != int(payload["script_size"]):
+        raise ValueError("bound attempt script size has drifted")
+    if sha256_file(script) != str(payload["script_sha256"]):
+        raise ValueError("bound attempt script SHA-256 has drifted")
+    return payload
 
 
 def slurm_log_paths(bundle: AttemptBundle, *, is_array: bool) -> Dict[str, str]:
@@ -218,15 +323,28 @@ def read_array_task_map(path: Union[str, Path]) -> Sequence[int]:
         raise ValueError("array task map dense_to_logical must be a list")
     parsed = []
     for value in values:
-        if isinstance(value, bool):
+        if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError("array task map IDs must be non-negative integers")
-        try:
-            item = int(value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("array task map IDs must be non-negative integers") from exc
+        item = value
         if item < 0:
             raise ValueError("array task map IDs must be non-negative integers")
         parsed.append(item)
     if len(set(parsed)) != len(parsed):
         raise ValueError("array task map contains duplicate logical task IDs")
     return parsed
+
+
+__all__ = [
+    "AttemptBundle",
+    "SCRIPT_BINDING_SCHEMA_VERSION",
+    "backend_name",
+    "bundle_root",
+    "prepare_attempt_bundle",
+    "read_array_task_map",
+    "read_source_array_task_ids",
+    "safe_component",
+    "slurm_log_paths",
+    "verify_script_binding",
+    "write_attempt_script",
+    "write_script_binding",
+]

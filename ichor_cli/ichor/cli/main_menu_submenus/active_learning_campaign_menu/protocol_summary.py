@@ -304,6 +304,7 @@ def format_sampling_protocol_summary(
     ferebus = config.ferebus
     aimall = config.aimall
     runtime = config.runtime
+    retention = config.retention
     geometry_payload = None
     geometry_source = "profile fallback preview"
     sampling_protocol_resolved_path = None
@@ -683,12 +684,6 @@ def format_sampling_protocol_summary(
     )
     lines.append(
         _line(
-            "resources.fail_on_memory_estimate_exceeds_request",
-            resources.fail_on_memory_estimate_exceeds_request,
-        )
-    )
-    lines.append(
-        _line(
             "resources.memory_estimate_safety_factor",
             resources.memory_estimate_safety_factor,
         )
@@ -703,6 +698,30 @@ def format_sampling_protocol_summary(
         _line(
             "resources.scheduler_usage_history_limit",
             resources.scheduler_usage_history_limit,
+        )
+    )
+    lines.append(
+        _line(
+            "retention.checkpoint_destination",
+            retention.checkpoint_destination,
+        )
+    )
+    lines.append(
+        _line(
+            "retention.checkpoint_every_iterations",
+            retention.checkpoint_every_iterations,
+        )
+    )
+    lines.append(
+        _line(
+            "retention.checkpoint_required",
+            retention.checkpoint_required,
+        )
+    )
+    lines.append(
+        _line(
+            "retention.checkpoint_verify_after_write",
+            retention.checkpoint_verify_after_write,
         )
     )
     lines.append(_line("resources.polus.auto_max_workers", resources.polus.auto_max_workers))

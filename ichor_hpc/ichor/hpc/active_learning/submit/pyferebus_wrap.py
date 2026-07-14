@@ -27,7 +27,7 @@ import shlex
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from .slurm_contracts import (
     parse_sbatch_parsable_output as _parse_sbatch_parsable_output,
@@ -114,6 +114,7 @@ class FerebusSubmission:
     sbatch_stderr: str = ""
     pyferebus_kwargs: Mapping[str, Any] = field(default_factory=dict)
     generated_configs: Tuple[Mapping[str, Any], ...] = ()
+    script_binding: Mapping[str, Any] = field(default_factory=dict)
 
 
 _REQUIRED_COMMAND_FLAGS = ("-c", "-I", "-O", "-P", "-A", "-ALF")
@@ -264,6 +265,8 @@ def _harden_generated_script(
     output_path: Optional[str] = None,
     error_path: Optional[str] = None,
     runtime_preamble: Optional[Sequence[str]] = None,
+    expected_tasks: Optional[int] = None,
+    array_concurrency_limit: Optional[int] = None,
 ) -> None:
     text = script.read_text(encoding="utf-8")
     if expected_job_name is not None:
@@ -307,6 +310,10 @@ def _harden_generated_script(
             r"^#SBATCH\s+(?:-e\b|--error(?:=|\b))", stripped
         ):
             return True
+        if expected_tasks is not None and re.match(
+            r"^#SBATCH\s+(?:-a\b|--array(?:=|\b))", stripped
+        ):
+            return True
         return False
 
     lines = [
@@ -338,10 +345,42 @@ def _harden_generated_script(
         directives.append("#SBATCH --output=" + str(output_path))
     if error_path is not None:
         directives.append("#SBATCH --error=" + str(error_path))
+    if expected_tasks is not None:
+        if isinstance(expected_tasks, bool) or not isinstance(expected_tasks, int):
+            raise FerebusSubmissionError("expected FEREBUS task count must be an integer")
+        if expected_tasks <= 0:
+            raise FerebusSubmissionError("expected FEREBUS task count must be > 0")
+        array_value = "0-" + str(expected_tasks - 1)
+        if array_concurrency_limit is not None:
+            if (
+                isinstance(array_concurrency_limit, bool)
+                or not isinstance(array_concurrency_limit, int)
+                or array_concurrency_limit <= 0
+            ):
+                raise FerebusSubmissionError(
+                    "FEREBUS array concurrency limit must be a positive integer"
+                )
+            array_value += "%" + str(min(expected_tasks, array_concurrency_limit))
+        directives.append("#SBATCH --array=" + array_value)
+        # pyferebus's template indexes commands/list.txt from one.  Keep that
+        # internal convention while exposing the daemon-wide zero-based Slurm
+        # identity at every scheduler boundary.
+        lines = [
+            line.replace(
+                "${SLURM_ARRAY_TASK_ID}",
+                "${ICHOR_FEREBUS_TASK_NUMBER}",
+            )
+            for line in lines
+        ]
     lines[sbatch_insert_at:sbatch_insert_at] = directives + [
         "set -eo pipefail",
         "export LC_ALL=C",
         "export LC_NUMERIC=C",
+        *(
+            ["export ICHOR_FEREBUS_TASK_NUMBER=$((SLURM_ARRAY_TASK_ID + 1))"]
+            if expected_tasks is not None
+            else []
+        ),
     ] + list(runtime_preamble or [])
     script.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
     if expected_job_name is not None:
@@ -356,6 +395,31 @@ def _harden_generated_script(
                 + str(script)
                 + ": "
                 + repr(matches)
+            )
+    if expected_tasks is not None:
+        patched = script.read_text(encoding="utf-8")
+        array_matches = re.findall(
+            r"(?m)^#SBATCH\s+(?:-a\s+|--array(?:=|\s+))(.+?)\s*$",
+            patched,
+        )
+        expected_array = "0-" + str(expected_tasks - 1)
+        if array_concurrency_limit is not None:
+            expected_array += "%" + str(
+                min(expected_tasks, int(array_concurrency_limit))
+            )
+        if array_matches != [expected_array]:
+            raise FerebusSubmissionError(
+                "FEREBUS array patch validation failed: " + repr(array_matches)
+            )
+        raw_uses = [
+            line
+            for line in patched.splitlines()
+            if "SLURM_ARRAY_TASK_ID" in line
+            and "ICHOR_FEREBUS_TASK_NUMBER=$((SLURM_ARRAY_TASK_ID + 1))" not in line
+        ]
+        if raw_uses:
+            raise FerebusSubmissionError(
+                "FEREBUS script retains unnormalised array-task indexing"
             )
 
 
@@ -634,6 +698,13 @@ def submit_ferebus(
     error_path: Optional[str] = None,
     runtime_preamble: Optional[Sequence[str]] = None,
     scheduler_timeout_seconds: int = 60,
+    array_concurrency_limit: Optional[int] = None,
+    prepared_callback: Optional[
+        Callable[[Path, Path, Sequence[Mapping[str, Any]]], Mapping[str, Any]]
+    ] = None,
+    pre_submit_hook: Optional[
+        Callable[[Path, Mapping[str, Any]], None]
+    ] = None,
 ) -> FerebusSubmission:
     """Generate the FEREBUS submission script via pyferebus, then submit it
     ourselves through sbatch --parsable so we capture the JobID.
@@ -734,6 +805,46 @@ def submit_ferebus(
     )
     generated_configs = _patch_generated_configs(working_dir, prior_contract)
     _bind_generated_configs_to_task_manifest(working_dir, generated_configs)
+    if prepared_callback is not None:
+        overrides = prepared_callback(working_dir, script, generated_configs)
+        if not isinstance(overrides, Mapping):
+            raise FerebusSubmissionError(
+                "FEREBUS prepared callback must return a mapping"
+            )
+        allowed = {
+            "partition",
+            "mem_per_cpu",
+            "cpus_per_task",
+            "ntasks",
+            "output_path",
+            "error_path",
+            "runtime_preamble",
+            "submission_script_path",
+            "path_to_executable",
+            "array_concurrency_limit",
+        }
+        unknown = sorted(set(overrides) - allowed)
+        if unknown:
+            raise FerebusSubmissionError(
+                "FEREBUS prepared callback returned unknown fields: "
+                + repr(unknown)
+            )
+        partition = overrides.get("partition", partition)
+        mem_per_cpu = overrides.get("mem_per_cpu", mem_per_cpu)
+        cpus_per_task = overrides.get("cpus_per_task", cpus_per_task)
+        ntasks = overrides.get("ntasks", ntasks)
+        output_path = overrides.get("output_path", output_path)
+        error_path = overrides.get("error_path", error_path)
+        runtime_preamble = overrides.get("runtime_preamble", runtime_preamble)
+        submission_script_path = overrides.get(
+            "submission_script_path", submission_script_path
+        )
+        path_to_executable = overrides.get(
+            "path_to_executable", path_to_executable
+        )
+        array_concurrency_limit = overrides.get(
+            "array_concurrency_limit", array_concurrency_limit
+        )
     _harden_generated_script(
         script,
         walltime_hours=walltime_hours,
@@ -745,6 +856,8 @@ def submit_ferebus(
         output_path=output_path,
         error_path=error_path,
         runtime_preamble=runtime_preamble,
+        expected_tasks=expected_tasks,
+        array_concurrency_limit=array_concurrency_limit,
     )
     if path_to_executable:
         _patch_generated_executable(script, path_to_executable)
@@ -772,12 +885,30 @@ def submit_ferebus(
             pass
         script = submitted_script
 
+    from ..daemon.script_bundles import AttemptBundle, write_script_binding
+
+    binding_bundle = AttemptBundle(
+        root=script.parent,
+        script=script,
+        outputs=script.parent / "OUTPUTS",
+        errors=script.parent / "ERRORS",
+    )
+    script_binding = write_script_binding(binding_bundle)
+    if pre_submit_hook is not None:
+        pre_submit_hook(script, script_binding)
+
     submitted_argument = (
         str(script) if submission_script_path is not None else script.name
     )
     completed = run_scheduler_command(
         submit_runner,
-        ["sbatch", "--parsable", submitted_argument],
+        [
+            "sbatch",
+            "--parsable",
+            "--export=ALL,ICHOR_SCRIPT_BINDING_SHA256="
+            + str(script_binding["sha256"]),
+            submitted_argument,
+        ],
         timeout_seconds=int(scheduler_timeout_seconds),
         check=False,
         capture_output=True,
@@ -804,4 +935,5 @@ def submit_ferebus(
         sbatch_stderr=stderr,
         pyferebus_kwargs=dict(model_kwargs),
         generated_configs=tuple(generated_configs),
+        script_binding=dict(script_binding),
     )

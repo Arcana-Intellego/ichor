@@ -32,6 +32,8 @@ from ichor.hpc.active_learning.daemon.script_bundles import (
     prepare_attempt_bundle,
     read_array_task_map,
     slurm_log_paths,
+    write_attempt_script,
+    write_script_binding,
 )
 from ichor.hpc.active_learning.daemon.state import atomic_write_json
 from ichor.hpc.active_learning.sampling.descriptors import (
@@ -67,6 +69,25 @@ def _write_pool(source: Path, n_frames: int) -> None:
     source.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
 
+def _write_empty_committed_bootstrap(campaign: Path) -> None:
+    root = campaign / ".DATA" / "ACTIVE_LEARNING" / "bootstrap_inputs"
+    root.mkdir(parents=True)
+    embedded = {
+        "schema_version": 1,
+        "confirmed": True,
+        "excluded_pool_frame_ids": [],
+        "sources": {},
+        "model": None,
+    }
+    atomic_write_json(root / "CUSTOM_BOOTSTRAP.json", embedded)
+    pointer = dict(embedded)
+    pointer["bootstrap_inputs_root"] = (
+        root.resolve().relative_to(campaign.resolve()).as_posix()
+    )
+    active = campaign / ".DATA" / "ACTIVE_LEARNING"
+    atomic_write_json(active / "CUSTOM_BOOTSTRAP.json", pointer)
+
+
 def test_phase_a_uses_manifest_verified_root_pool_not_data_copy(
     tmp_path,
     resource_profile,
@@ -76,6 +97,7 @@ def test_phase_a_uses_manifest_verified_root_pool_not_data_copy(
     source = tmp_path / "source.xyz"
     _write_pool(source, 3)
     TrajectoryPool.import_from(source, campaign)
+    _write_empty_committed_bootstrap(campaign)
     stale = campaign / ".DATA" / "TRAJECTORY" / "pool.xyz"
     _write_pool(stale, 20)
 
@@ -372,8 +394,17 @@ def test_ferebus_formula_uses_exact_split_and_feature_dimensions(resource_profil
         require_evidence=False,
         evidence_override=evidence,
     )
-    expected_per_agent = 8 * (3 * 100**2 + 100 * 20 + 100 * 30 + 150 * 40)
-    assert resolved.extra["matrix_bytes_per_agent"] == expected_per_agent
+    components = resolved.extra["ferebus_memory_components"]
+    expected_distance = 8 * 40 * 100**2
+    assert components["distance_tensor_bytes"] == expected_distance
+    assert components["distance_construction_peak_bytes"] == 2 * expected_distance
+    assert resolved.extra["working_peak_bytes"] == max(
+        components["distance_construction_peak_bytes"],
+        components["distance_tensor_bytes"]
+        + components["threaded_estimator_bytes"]
+        + components["validation_kernel_bytes"]
+        + components["dataset_bytes"],
+    )
     assert resolved.extra["active_workers"] == 4
 
 
@@ -419,8 +450,9 @@ def test_ferebus_uses_one_real_most_demanding_task(resource_profile):
         evidence_override=evidence,
     )
 
-    expected = 8 * (3 * 80**2 + 80 * 100 + 80 * 100 + 280 * 100)
-    assert resolved.extra["matrix_bytes_per_agent"] == expected
+    components = resolved.extra["ferebus_memory_components"]
+    assert components["distance_tensor_bytes"] == 8 * 100 * 80**2
+    assert resolved.extra["working_peak_bytes"] == components["working_peak_bytes"]
     assert resolved.extra["most_demanding_task"]["task_index"] == 2
 
 
@@ -514,7 +546,13 @@ def test_attempt_bundle_caps_each_log_directory_and_records_retry_map(tmp_path):
 
 
 def test_resource_resolution_is_immutable_and_digest_verified(tmp_path):
-    resolved = SimpleNamespace(to_dict=lambda: {"cpus_per_task": 2, "mem_per_cpu": "4G"})
+    resolved = SimpleNamespace(
+        to_dict=lambda: {
+            "backend": "POLUS",
+            "cpus_per_task": 2,
+            "mem_per_cpu": "4G",
+        }
+    )
     payload = resolution_payload(
         campaign_uid="uid",
         phase_name="PHASE_A_POLUS",
@@ -526,9 +564,11 @@ def test_resource_resolution_is_immutable_and_digest_verified(tmp_path):
         scratch_path_template="template",
     )
     binding = write_resolution(tmp_path, payload)
-    assert verify_resolution(binding["path"], binding["sha256"]) == payload
+    verified = verify_resolution(binding["path"], binding["sha256"])
+    assert verified == read_resolution(binding["path"])
+    assert verified["implementation_identity"]["backend"] == "polus"
     changed = dict(payload)
-    changed["resources"] = {"cpus_per_task": 3}
+    changed["resources"] = {"backend": "POLUS", "cpus_per_task": 3}
     with pytest.raises(ValueError, match="different content"):
         write_resolution(tmp_path, changed)
     assert read_resolution(binding["path"])["attempt_id"] == "attempt"
@@ -549,12 +589,27 @@ def _scratch_resolution(
         attempt_id=attempt_id,
         submission_identity=identity,
         resolved=SimpleNamespace(
-            to_dict=lambda: {"cpus_per_task": 1, "mem_per_cpu": "1G"}
+            to_dict=lambda: {
+                "backend": phase.split("_")[0],
+                "cpus_per_task": 1,
+                "mem_per_cpu": "1G",
+            }
         ),
         evidence={"source": "fixture"},
         scratch_path_template="fixture",
     )
-    return write_resolution(campaign, payload)
+    resolution = write_resolution(campaign, payload)
+    bundle = prepare_attempt_bundle(
+        campaign,
+        phase,
+        iteration,
+        identity,
+        array_size=1,
+        max_log_files_per_directory=10,
+    )
+    write_attempt_script(bundle, "#!/bin/bash\ntrue\n")
+    resolution["script_binding"] = write_script_binding(bundle)
+    return resolution
 
 
 def test_scratch_failure_retains_then_explicit_cleanup_removes_attempt(tmp_path):
@@ -577,6 +632,8 @@ def test_scratch_failure_retains_then_explicit_cleanup_removes_attempt(tmp_path)
         array_task_id=0,
         resource_resolution_path=binding["path"],
         resource_resolution_sha256=binding["sha256"],
+        script_binding_path=binding["script_binding"]["path"],
+        script_binding_sha256=binding["script_binding"]["sha256"],
     )
     finish_task_scratch(leaf, success=False)
     records = inventory(tmp_path)
@@ -609,6 +666,8 @@ def test_scratch_cleanup_never_removes_active_job(tmp_path):
         array_task_id=2,
         resource_resolution_path=binding["path"],
         resource_resolution_sha256=binding["sha256"],
+        script_binding_path=binding["script_binding"]["path"],
+        script_binding_sha256=binding["script_binding"]["sha256"],
     )
     assert clean_inactive_attempts(
         tmp_path,
@@ -637,6 +696,8 @@ def test_successful_scratch_task_self_cleans(tmp_path):
         array_task_id=4,
         resource_resolution_path=binding["path"],
         resource_resolution_sha256=binding["sha256"],
+        script_binding_path=binding["script_binding"]["path"],
+        script_binding_sha256=binding["script_binding"]["sha256"],
     )
     finish_task_scratch(leaf, success=True)
     assert not leaf.exists()
@@ -662,6 +723,8 @@ def test_scratch_inventory_blocks_tampered_resolution_ownership(tmp_path):
         array_task_id=0,
         resource_resolution_path=binding["path"],
         resource_resolution_sha256=binding["sha256"],
+        script_binding_path=binding["script_binding"]["path"],
+        script_binding_sha256=binding["script_binding"]["sha256"],
     )
     task_path = leaf / "TASK.json"
     task = json.loads(task_path.read_text(encoding="utf-8"))
@@ -692,17 +755,21 @@ def test_scratch_rejects_symlinked_path_component(tmp_path):
 
 
 def test_telemetry_parses_aggregates_is_idempotent_and_bounded(tmp_path):
-    stdout = (
+    provisional_stdout = (
         "100|COMPLETED|0:0|21|4|8Gc|4G|5G|00:00:20|\n"
         "100_0|COMPLETED|0:0|10|2|8Gc|||00:00:09|\n"
         "100_0.batch|COMPLETED|0:0|10|2|8Gc|9G|10G|00:00:09|\n"
         "100_1|FAILED|1:0|20|2|8Gc|3G|4G|00:00:18|\n"
     )
-    assert len(parse_usage_rows(stdout)) == 4
+    final_stdout = provisional_stdout + (
+        "100_2|COMPLETED|0:0|12|2|8Gc|2G|3G|00:00:11|\n"
+    )
+    assert len(parse_usage_rows(provisional_stdout)) == 4
     calls = []
 
     def runner(*_args, **_kwargs):
         calls.append(1)
+        stdout = provisional_stdout if len(calls) == 1 else final_stdout
         return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
 
     intent = {
@@ -715,14 +782,19 @@ def test_telemetry_parses_aggregates_is_idempotent_and_bounded(tmp_path):
     }
     first = collect_usage(tmp_path, intent=intent, history_limit=1, runner=runner)
     second = collect_usage(tmp_path, intent=intent, history_limit=1, runner=runner)
-    assert first == second
-    assert len(calls) == 1
+    third = collect_usage(tmp_path, intent=intent, history_limit=1, runner=runner)
+    assert second == third
+    assert len(calls) == 2
+    assert first["telemetry_status"] == "provisional"
+    assert second["telemetry_status"] == "final"
+    assert second["collection_sequence"] == 2
     assert first["n_failures"] == 1
     # Slurm places the task's peak RSS on its .batch step.  It must enrich the
     # owning task without increasing the scientific task count.
     assert first["max_rss_mib"] == 9 * 1024
     assert first["n_rows"] == 2
     assert first["n_missing_task_rows"] == 1
+    assert second["n_missing_task_rows"] == 0
     payload = json.loads(usage_path(tmp_path).read_text(encoding="utf-8"))
     assert len(payload["attempts"]) == 1
 

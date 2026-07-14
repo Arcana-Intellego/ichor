@@ -476,7 +476,6 @@ RESOURCE_FUTURE_EXACT = {
     "resources.ferebus.cpus_per_task",
     "resources.ferebus.mem_per_cpu",
     "resources.array_concurrency_limit",
-    "resources.fail_on_memory_estimate_exceeds_request",
     "resources.memory_estimate_safety_factor",
 }
 

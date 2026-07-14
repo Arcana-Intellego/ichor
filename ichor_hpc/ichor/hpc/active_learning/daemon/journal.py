@@ -115,6 +115,8 @@ KNOWN_EVENT_TYPES = (
     "resolved_phase_resources",
     "scheduler_usage_recorded",
     "scheduler_usage_warning",
+    "checkpoint_failed",
+    "checkpoint_verified",
     "reconcile_resolved_terminal_intent",
     "operator_cancelled_jobs",
     "operator_stop_requested",

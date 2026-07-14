@@ -336,7 +336,7 @@ def _validate_memory(name: str, value: Any, pattern: re.Pattern, description: st
         raise ConfigValidationError(name + " must use " + description + ": " + repr(value))
 
 
-def _memory_mebibytes(name: str, value: str, *, gaussian: bool) -> float:
+def memory_mebibytes(name: str, value: str, *, gaussian: bool) -> float:
     """Parse the memory syntaxes this daemon accepts into MiB.
 
     SLURM values are plain K/M/G/T suffixes. Gaussian accepts byte-like MB/GB and word-like MW/GW
@@ -360,6 +360,12 @@ def _memory_mebibytes(name: str, value: str, *, gaussian: bool) -> float:
     if gaussian and suffix == "W":
         mib *= 8.0
     return mib
+
+
+# Internal callers retained during the schema-13 clean break use the public
+# parser too; keeping one alias prevents the validation and live paths from
+# acquiring different unit semantics again.
+_memory_mebibytes = memory_mebibytes
 
 
 def diff_against_defaults(config) -> Dict[str, Any]:
@@ -836,7 +842,6 @@ class ResourceConfigBlock:
     ferebus: BackendResourceBlock = field(default_factory=BackendResourceBlock)
 
     array_concurrency_limit: Optional[int] = None
-    fail_on_memory_estimate_exceeds_request: bool = True
     memory_estimate_safety_factor: float = 1.25
     scheduler_usage_telemetry: bool = True
     scheduler_usage_history_limit: int = 5000
@@ -1655,10 +1660,6 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "runtime lease heartbeat failure window must be shorter than "
                 "runtime.lease_stale_seconds"
-            )
-        if not isinstance(self.resources.fail_on_memory_estimate_exceeds_request, bool):
-            raise ConfigValidationError(
-                "resources.fail_on_memory_estimate_exceeds_request must be a boolean"
             )
         if self.anti_overlap.min_post_ariadne_whitened_distance < 0.0:
             raise ConfigValidationError(

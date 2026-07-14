@@ -1304,7 +1304,6 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("resources.defaults.cpus_per_task", "str", transform=_auto_or_int, prompt="resources.defaults.cpus_per_task (auto or positive integer): "),
             _spec("resources.defaults.mem_per_cpu", "str", prompt="resources.defaults.mem_per_cpu (auto or SLURM style, e.g. 4G): "),
             _spec("resources.array_concurrency_limit", "optional_int"),
-            _spec("resources.fail_on_memory_estimate_exceeds_request", "bool"),
             _spec("resources.memory_estimate_safety_factor", "float"),
             _spec("resources.scheduler_usage_telemetry", "bool"),
             _spec("resources.scheduler_usage_history_limit", "int"),

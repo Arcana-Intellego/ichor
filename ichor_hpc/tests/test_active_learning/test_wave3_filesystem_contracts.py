@@ -16,6 +16,11 @@ from ichor.hpc.active_learning.daemon.resource_records import (
 )
 from ichor.hpc.active_learning.daemon.resource_solver import ResolvedPhaseResources
 from ichor.hpc.active_learning.daemon.scratch import prepare_task_scratch
+from ichor.hpc.active_learning.daemon.script_bundles import (
+    prepare_attempt_bundle,
+    write_attempt_script,
+    write_script_binding,
+)
 from ichor.hpc.active_learning.daemon.state import (
     atomic_write_text,
     fresh_campaign_state,
@@ -218,6 +223,16 @@ def test_scratch_permission_failure_halts_before_task_metadata(
         scratch_path_template="fixture",
     )
     binding = write_resolution(tmp_path, payload)
+    bundle = prepare_attempt_bundle(
+        tmp_path,
+        "GAUSSIAN",
+        1,
+        identity,
+        array_size=1,
+        max_log_files_per_directory=10,
+    )
+    write_attempt_script(bundle, "#!/bin/bash\ntrue\n")
+    script_binding = write_script_binding(bundle)
     real_chmod = Path.chmod
 
     def fail_leaf_chmod(path, mode):
@@ -238,6 +253,8 @@ def test_scratch_permission_failure_halts_before_task_metadata(
             array_task_id=0,
             resource_resolution_path=binding["path"],
             resource_resolution_sha256=binding["sha256"],
+            script_binding_path=script_binding["path"],
+            script_binding_sha256=script_binding["sha256"],
         )
     assert not any(tmp_path.rglob("TASK.json"))
 

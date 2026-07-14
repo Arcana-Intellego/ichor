@@ -39,8 +39,6 @@ _STATUS_TRANSITIONS = {
 _SCALAR_SUBMISSION_PHASES = frozenset({
     "PHASE_A_POLUS",
     "PHASE_B_POLUS",
-    "INITIAL_FEREBUS",
-    "FEREBUS",
 })
 
 
@@ -303,6 +301,18 @@ def load_intent(
         or any(ch not in "0123456789abcdef" for ch in digest)
     ):
         raise ValueError("submission intent resource_resolution_sha256 is invalid")
+    for key in ("script_binding_path", "submitted_script_path"):
+        value = data.get(key)
+        if value is not None and (not isinstance(value, str) or not value):
+            raise ValueError("submission intent " + key + " must be a non-empty string")
+    for key in ("script_binding_sha256", "submitted_script_sha256"):
+        value = data.get(key)
+        if value is not None and (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(ch not in "0123456789abcdef" for ch in value)
+        ):
+            raise ValueError("submission intent " + key + " is invalid")
     return data
 
 
@@ -746,6 +756,49 @@ def bind_resource_resolution(
         # array.  Once staging has produced a dense retry array, this field
         # must snapshot the task count that Slurm will actually report.
         intent["expected_tasks"] = parsed_expected_tasks
+    target = intent_path(campaign_dir, phase_name, int(iteration))
+    updated = _write_payload(target, intent)
+    return _validate_intent_payload(
+        updated,
+        path=target,
+        phase_name=str(phase_name),
+        iteration=int(iteration),
+        expected_campaign_uid=None,
+    )
+
+
+def bind_submission_script(
+    campaign_dir: Union[str, Path],
+    phase_name: str,
+    iteration: int,
+    *,
+    script_path: str,
+    script_sha256: str,
+    binding_path: str,
+    binding_sha256: str,
+) -> Dict[str, Any]:
+    """Bind final script bytes before the corresponding sbatch call."""
+    intent = load_active_intent(campaign_dir, phase_name, int(iteration))
+    if intent is None or str(intent.get("status")) != "PRE_SUBMIT":
+        raise ValueError("script binding requires an active PRE_SUBMIT intent")
+    updates = {
+        "submitted_script_path": str(script_path),
+        "submitted_script_sha256": str(script_sha256),
+        "script_binding_path": str(binding_path),
+        "script_binding_sha256": str(binding_sha256),
+    }
+    for key in ("submitted_script_sha256", "script_binding_sha256"):
+        digest = updates[key]
+        if (
+            len(digest) != 64
+            or any(ch not in "0123456789abcdef" for ch in digest)
+        ):
+            raise ValueError("submission intent " + key + " is invalid")
+    for key, value in updates.items():
+        previous = intent.get(key)
+        if previous is not None and previous != value:
+            raise ValueError("submission intent " + key + " is already bound differently")
+        intent[key] = value
     target = intent_path(campaign_dir, phase_name, int(iteration))
     updated = _write_payload(target, intent)
     return _validate_intent_payload(

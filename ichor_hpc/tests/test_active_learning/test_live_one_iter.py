@@ -448,12 +448,39 @@ def _patch_ferebus_submit_for_live_smoke(monkeypatch, campaign_dir, call_log):
             in str(kwargs["expected_job_name"])
         )
         assert int(kwargs["expected_tasks"]) >= 1
+        generated = []
+        manifest = json.loads(
+            (working / stg.FEREBUS_TASK_MANIFEST).read_text(encoding="utf-8")
+        )
+        generated = [dict(task["generated_config"]) for task in manifest["tasks"]]
+        overrides = kwargs["prepared_callback"](working, script, generated)
+        submitted_script = Path(overrides["submission_script_path"])
+        submitted_script.write_text(
+            "#!/bin/sh\n# fixture pyferebus submitted script\n",
+            encoding="utf-8",
+        )
+        from ichor.hpc.active_learning.daemon.script_bundles import (
+            AttemptBundle,
+            write_script_binding,
+        )
+
+        script_binding = write_script_binding(
+            AttemptBundle(
+                root=submitted_script.parent,
+                script=submitted_script,
+                outputs=submitted_script.parent / "OUTPUTS",
+                errors=submitted_script.parent / "ERRORS",
+            )
+        )
+        kwargs["pre_submit_hook"](submitted_script, script_binding)
         return FerebusSubmission(
             job_id=str(19000 + calls["n"]),
             cluster=None,
-            submission_script=script,
+            submission_script=submitted_script,
             working_dir=working,
             transfer_learning=False,
+            generated_configs=tuple(generated),
+            script_binding=script_binding,
         )
 
     monkeypatch.setattr(stg, "stage_ferebus_inputs", fake_stage)

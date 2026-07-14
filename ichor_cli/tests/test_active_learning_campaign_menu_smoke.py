@@ -1415,6 +1415,10 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
     assert "campaign.bootstrap_path: bootstrap/ (fixed campaign input)" in out
     assert "degenerate_policy=score_backfill" in out
     assert "error_calibration.model_version_policy: rolling_normalised" in out
+    assert "retention.checkpoint_destination: null" in out
+    assert "retention.checkpoint_every_iterations: 1" in out
+    assert "retention.checkpoint_required: False" in out
+    assert "retention.checkpoint_verify_after_write: True" in out
     assert "sampling_protocol.size_normalised_trust_radius" in out
     protocol_lines = [
         line for line in out.splitlines()

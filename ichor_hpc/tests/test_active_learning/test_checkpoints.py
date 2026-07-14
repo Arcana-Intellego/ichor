@@ -1,0 +1,196 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from ichor.hpc.active_learning.config import CampaignConfig
+from ichor.hpc.active_learning.daemon import checkpoints
+from ichor.hpc.active_learning.daemon.daemon import Daemon, TickStatus
+from ichor.hpc.active_learning.daemon.state import (
+    CampaignPhase,
+    fresh_campaign_state,
+    write_state,
+)
+
+
+def _idle_campaign(tmp_path: Path, monkeypatch) -> Path:
+    campaign = tmp_path / "campaign"
+    campaign.mkdir()
+    CampaignConfig().to_yaml(campaign / "campaign.yaml")
+    state = fresh_campaign_state(campaign_uid="abc123")
+    state.phase = CampaignPhase.SEED_SELECT
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.models_version = 0
+    (campaign / ".DATA" / "ACTIVE_LEARNING").mkdir(parents=True)
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    (campaign / "authoritative.bin").write_bytes(b"authoritative-bytes")
+    scratch = campaign / ".DATA" / "SCRATCH" / "GAUSSIAN"
+    scratch.mkdir(parents=True)
+    (scratch / "temporary.bin").write_bytes(b"scratch")
+    staging = campaign / ".DATA" / "STAGING"
+    staging.mkdir(parents=True)
+    (staging / "incomplete.bin").write_bytes(b"staging")
+    monkeypatch.setattr(
+        checkpoints,
+        "verify_state_referenced_artifacts",
+        lambda *_args, **_kwargs: None,
+    )
+    return campaign
+
+
+def test_checkpoint_deduplicates_verifies_and_restores(tmp_path, monkeypatch):
+    campaign = _idle_campaign(tmp_path, monkeypatch)
+    destination = tmp_path / "checkpoint-store"
+    destination.mkdir()
+
+    created = checkpoints.create_checkpoint(campaign, destination)
+    (Path(created["store"]) / "current.json").unlink()
+    repeated = checkpoints.create_checkpoint(campaign, destination)
+
+    assert created["ok"] is True
+    assert repeated["manifest_sha256"] == created["manifest_sha256"]
+    assert (Path(created["store"]) / "current.json").is_file()
+    manifest = created["manifest"]
+    relative_paths = {item["path"] for item in manifest["files"]}
+    assert "authoritative.bin" in relative_paths
+    assert not any(path.startswith(".DATA/SCRATCH/") for path in relative_paths)
+    assert not any(path.startswith(".DATA/STAGING/") for path in relative_paths)
+    object_paths = list((Path(created["store"]) / "objects").iterdir())
+    assert len(object_paths) == len({item["sha256"] for item in manifest["files"]})
+
+    status = checkpoints.checkpoint_status(campaign, destination)
+    assert status["status"] == "verified"
+    assert status["current"]["iteration"] == 0
+
+    target = tmp_path / "restored"
+    preview = checkpoints.restore_checkpoint(
+        created["checkpoint"],
+        target,
+        apply=False,
+    )
+    assert preview["applied"] is False
+    assert not target.exists()
+
+    restored = checkpoints.restore_checkpoint(
+        created["checkpoint"],
+        target,
+        apply=True,
+    )
+    assert restored["applied"] is True
+    assert (target / "authoritative.bin").read_bytes() == b"authoritative-bytes"
+    assert not (target / ".DATA" / "SCRATCH").exists()
+
+
+def test_checkpoint_rejects_corrupt_object(tmp_path, monkeypatch):
+    campaign = _idle_campaign(tmp_path, monkeypatch)
+    destination = tmp_path / "checkpoint-store"
+    destination.mkdir()
+    created = checkpoints.create_checkpoint(campaign, destination)
+    first = created["manifest"]["files"][0]
+    object_path = Path(created["store"]) / "objects" / first["sha256"]
+    object_path.write_bytes(b"corrupt")
+
+    with pytest.raises(ValueError, match="object (size|digest) mismatch"):
+        checkpoints.verify_checkpoint(created["checkpoint"])
+
+
+def test_checkpoint_restore_requires_empty_target(tmp_path, monkeypatch):
+    campaign = _idle_campaign(tmp_path, monkeypatch)
+    destination = tmp_path / "checkpoint-store"
+    destination.mkdir()
+    created = checkpoints.create_checkpoint(campaign, destination)
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "existing.txt").write_text("occupied", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must be empty"):
+        checkpoints.restore_checkpoint(
+            created["checkpoint"],
+            target,
+            apply=True,
+        )
+
+
+def test_checkpoint_publication_failure_leaves_no_partial_checkpoint(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = _idle_campaign(tmp_path, monkeypatch)
+    destination = tmp_path / "checkpoint-store"
+    destination.mkdir()
+    real_replace = checkpoints.os.replace
+
+    def fail_checkpoint_publication(source, target):
+        if Path(target).name == "iteration-000000" and Path(source).is_dir():
+            raise OSError("injected checkpoint publication failure")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(checkpoints.os, "replace", fail_checkpoint_publication)
+
+    with pytest.raises(OSError, match="injected checkpoint publication failure"):
+        checkpoints.create_checkpoint(campaign, destination)
+
+    store = checkpoints.checkpoint_store(destination, "abc123")
+    checkpoint_root = store / "checkpoints"
+    assert not (checkpoint_root / "iteration-000000").exists()
+    assert not list(checkpoint_root.glob(".iteration-000000.tmp.*"))
+
+
+def test_checkpoint_source_symlink_is_rejected(tmp_path, monkeypatch):
+    campaign = _idle_campaign(tmp_path, monkeypatch)
+    destination = tmp_path / "checkpoint-store"
+    destination.mkdir()
+    source = campaign / "authoritative.bin"
+    link = campaign / "linked.bin"
+    try:
+        link.symlink_to(source)
+    except OSError:
+        pytest.skip("file symlinks are unavailable on this test host")
+
+    with pytest.raises(ValueError, match="contains a symlink"):
+        checkpoints.create_checkpoint(campaign, destination)
+
+
+def test_manual_checkpoint_refuses_active_daemon_lease(tmp_path, monkeypatch):
+    campaign = _idle_campaign(tmp_path, monkeypatch)
+    destination = tmp_path / "checkpoint-store"
+    destination.mkdir()
+    lease = campaign / ".DATA" / "ACTIVE_LEARNING" / "daemon.lease.d"
+    lease.mkdir()
+
+    with pytest.raises(ValueError, match="daemon lease"):
+        checkpoints.create_checkpoint(campaign, destination)
+
+
+def test_required_automatic_checkpoint_failure_blocks_seed_selection(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = tmp_path / "campaign"
+    campaign.mkdir()
+    config = CampaignConfig()
+    config.retention.checkpoint_destination = str(tmp_path / "checkpoint-store")
+    config.retention.checkpoint_required = True
+    state = fresh_campaign_state(campaign_uid="abc123")
+    state.phase = CampaignPhase.SEED_SELECT
+    state.iteration = 1
+    daemon = Daemon(campaign_dir=campaign, config=config)
+    reasons = []
+
+    monkeypatch.setattr(
+        checkpoints,
+        "create_checkpoint",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("destination offline")),
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_halt",
+        lambda _state, _phase, reason: reasons.append(reason) or TickStatus.HALTED,
+    )
+
+    result = daemon._checkpoint_before_seed_selection(state)
+
+    assert result == TickStatus.HALTED
+    assert reasons and "destination offline" in reasons[0]

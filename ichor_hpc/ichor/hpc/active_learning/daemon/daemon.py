@@ -1236,12 +1236,78 @@ class Daemon:
     def _strict_artifact_checks_enabled(self) -> bool:
         return bool(getattr(self.executor, "strict_committed_artifact_verification", False))
 
+    def _checkpoint_before_seed_selection(
+        self,
+        state: CampaignState,
+    ) -> Optional[str]:
+        """Publish the completed iteration before launching new sampling."""
+        if state.phase is not CampaignPhase.SEED_SELECT:
+            return None
+        retention = self.config.retention
+        destination = retention.checkpoint_destination
+        if destination is None:
+            if bool(retention.checkpoint_required):
+                return self._halt(
+                    state,
+                    state.phase,
+                    "required_checkpoint_destination_missing",
+                )
+            return None
+        completed_iteration = int(state.iteration) - 1
+        if completed_iteration < 0:
+            return None
+        frequency = int(retention.checkpoint_every_iterations)
+        if completed_iteration != 0 and completed_iteration % frequency != 0:
+            return None
+        try:
+            from .checkpoints import create_checkpoint
+
+            result = create_checkpoint(
+                self.campaign_dir,
+                str(destination),
+                iteration=completed_iteration,
+                verify_after_write=bool(
+                    retention.checkpoint_verify_after_write
+                ),
+                allow_active_lease=True,
+            )
+        except Exception as exc:
+            reason = (
+                "checkpoint_failed: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:220]
+            )
+            self._journal(
+                "checkpoint_failed",
+                phase=state.phase.value,
+                iteration=int(state.iteration),
+                completed_iteration=completed_iteration,
+                required=bool(retention.checkpoint_required),
+                error=reason,
+            )
+            if bool(retention.checkpoint_required):
+                return self._halt(state, state.phase, reason)
+            return None
+        self._journal(
+            "checkpoint_verified",
+            phase=state.phase.value,
+            iteration=int(state.iteration),
+            completed_iteration=completed_iteration,
+            checkpoint=str(result.get("checkpoint") or ""),
+            manifest_sha256=str(result.get("manifest_sha256") or ""),
+        )
+        return None
+
     def _on_phase_entry(self, state: CampaignState, phase: CampaignPhase) -> str:
         """Called once when entering a phase with no pending JobID."""
         phase_name = phase.value
         verify_status = self._verify_committed_artifacts_if_enabled(state, phase)
         if verify_status is not None:
             return verify_status
+        checkpoint_status = self._checkpoint_before_seed_selection(state)
+        if checkpoint_status is not None:
+            return checkpoint_status
         active_intent = None
         if phase_name in SBATCH_PHASES:
             try:

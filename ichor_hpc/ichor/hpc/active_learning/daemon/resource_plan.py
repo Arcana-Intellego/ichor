@@ -1,7 +1,6 @@
 """Read-only resource planning for current, submitted, and future phases."""
 from __future__ import annotations
 
-from ..strict_json import strict_json as json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
 
@@ -13,13 +12,15 @@ from .resource_records import (
 )
 from .resource_solver import (
     ResourceEvidenceUnavailable,
+    ResourceEvidenceInvalid,
     collect_resource_evidence,
     resolve_phase_resources,
 )
 from .submission_intent import load_intent
+from .resource_usage import read_usage_records, usage_path
 
 
-RESOURCE_PLAN_SCHEMA_VERSION = 1
+RESOURCE_PLAN_SCHEMA_VERSION = 2
 
 
 BOOTSTRAP_PHASES = (
@@ -48,11 +49,11 @@ ACTIVE_PHASES = (
 )
 
 
-def _latest_resolution(
+def _orphaned_resolutions(
     campaign_dir: Path,
     phase_name: str,
     iteration: int,
-) -> Optional[Path]:
+) -> List[str]:
     root = (
         campaign_dir
         / ".DATA"
@@ -62,31 +63,54 @@ def _latest_resolution(
         / ("iteration-" + str(int(iteration)).zfill(6))
     )
     if not root.is_dir() or root.is_symlink():
-        return None
+        return []
     files = [path for path in root.glob("*.json") if path.is_file() and not path.is_symlink()]
     if not files:
-        return None
-    return max(files, key=lambda path: (path.stat().st_mtime_ns, path.name))
+        return []
+    return [str(path.resolve()) for path in sorted(files, key=lambda path: path.name)]
 
 
-def _usage_for_identity(campaign_dir: Path, identity: str) -> Optional[Dict[str, Any]]:
-    path = campaign_dir / ".DATA" / "ACTIVE_LEARNING" / "resource_usage_records.json"
-    if not path.is_file() or path.is_symlink():
-        return None
+def _usage_for_identity(campaign_dir: Path, identity: str) -> Dict[str, Any]:
+    path = usage_path(campaign_dir)
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    attempts = payload.get("attempts") if isinstance(payload, dict) else None
-    if not isinstance(attempts, list):
-        return None
+        payload = read_usage_records(campaign_dir)
+    except ValueError as exc:
+        return {
+            "status": "invalid",
+            "path": str(path),
+            "error": type(exc).__name__ + ": " + str(exc),
+            "summary": None,
+        }
+    attempts = payload["attempts"]
     matches = [
         dict(item)
         for item in attempts
         if isinstance(item, dict)
         and str(item.get("submission_identity") or "") == str(identity)
     ]
-    return matches[-1] if matches else None
+    if not matches:
+        return {
+            "status": "absent",
+            "path": str(path),
+            "error": None,
+            "summary": None,
+        }
+    summary = matches[-1]
+    return {
+        "status": str(summary.get("telemetry_status") or "invalid"),
+        "path": str(path),
+        "error": None,
+        "summary": summary,
+    }
+
+
+def _absent_usage(campaign_dir: Path) -> Dict[str, Any]:
+    return {
+        "status": "absent",
+        "path": str(usage_path(campaign_dir)),
+        "error": None,
+        "summary": None,
+    }
 
 
 def _submitted_plan(
@@ -95,26 +119,33 @@ def _submitted_plan(
     iteration: int,
 ) -> Optional[Dict[str, Any]]:
     intent = load_intent(campaign_dir, phase_name, int(iteration))
+    if not isinstance(intent, dict):
+        return None
     path = None
-    if isinstance(intent, dict) and intent.get("resource_resolution_path"):
+    if intent.get("resource_resolution_path"):
         path = Path(str(intent["resource_resolution_path"]))
-    elif isinstance(intent, dict) and str(intent.get("status") or "") == "PRE_SUBMIT":
+    elif str(intent.get("status") or "") == "PRE_SUBMIT":
         # A new attempt has an identity but has not yet snapshotted resources.
         # Do not mislabel an older retry's resolution as the current attempt.
         return None
-    if path is None or not path.is_file():
-        path = _latest_resolution(campaign_dir, phase_name, int(iteration))
     if path is None:
         return None
-    if isinstance(intent, dict) and intent.get("resource_resolution_path"):
-        digest = intent.get("resource_resolution_sha256")
-        payload = (
-            verify_resolution(path, str(digest))
-            if isinstance(digest, str) and digest
-            else read_resolution(path)
+    if not path.is_file() or path.is_symlink():
+        raise ValueError(
+            "submission intent resource resolution is not a regular file: "
+            + str(path)
         )
-    else:
-        payload = read_resolution(path)
+    digest = intent.get("resource_resolution_sha256")
+    payload = (
+        verify_resolution(
+            path,
+            str(digest),
+            campaign_dir=campaign_dir,
+            verify_bound_inputs=False,
+        )
+        if isinstance(digest, str) and digest
+        else read_resolution(path)
+    )
     expected_path = canonical_resolution_path(
         campaign_dir,
         str(payload.get("phase") or ""),
@@ -129,30 +160,39 @@ def _submitted_plan(
         raise ValueError("submitted resource resolution phase mismatch")
     if int(payload.get("iteration", -1)) != int(iteration):
         raise ValueError("submitted resource resolution iteration mismatch")
-    if isinstance(intent, dict):
-        for payload_key, intent_key in (
-            ("campaign_uid", "campaign_uid"),
-            ("attempt_id", "attempt_id"),
-            ("submission_identity", "submission_identity"),
+    for payload_key, intent_key in (
+        ("campaign_uid", "campaign_uid"),
+        ("attempt_id", "attempt_id"),
+        ("submission_identity", "submission_identity"),
+    ):
+        expected = intent.get(intent_key)
+        if expected not in (None, "") and str(payload.get(payload_key)) != str(
+            expected
         ):
-            expected = intent.get(intent_key)
-            if expected not in (None, "") and str(payload.get(payload_key)) != str(
-                expected
-            ):
-                raise ValueError(
-                    "submitted resource resolution "
-                    + payload_key
-                    + " mismatch"
-                )
-    status = "submitted"
-    intent_status = str((intent or {}).get("status") or "")
-    if intent_status in {"COMPLETED", "FAILED", "SUPERSEDED"}:
-        status = "completed"
+            raise ValueError(
+                "submitted resource resolution " + payload_key + " mismatch"
+            )
+    intent_status = str(intent.get("status") or "")
+    status = {
+        "PRE_SUBMIT": "prepared",
+        "SUBMITTED": "submitted",
+        "ADOPTED": "submitted",
+        "COMPLETED": "completed",
+        "FAILED": "failed",
+        "SUPERSEDED": "superseded",
+    }.get(intent_status)
+    if status is None:
+        raise ValueError("submission intent has an unknown resource-plan status")
+    if status == "submitted" and not str(intent.get("job_id") or ""):
+        raise ValueError("submitted resource plan has no scheduler JobID")
     identity = str(payload.get("submission_identity") or "")
     return {
         "phase": str(phase_name),
         "iteration": int(iteration),
         "status": status,
+        "attempt_status": intent_status,
+        "job_id": intent.get("job_id"),
+        "attempt_reason": intent.get("reason"),
         "submission_identity": identity,
         "resource_resolution_path": str(path.resolve()),
         "formula_version": payload.get("formula_version"),
@@ -172,6 +212,7 @@ def plan_phase(
     replacement_round: int = 0,
     expected_models_version: Optional[int] = None,
     expected_reference_data_version: Optional[int] = None,
+    preview_allowed: bool = True,
 ) -> Dict[str, Any]:
     campaign = Path(campaign_dir).resolve()
     phase = str(phase_name)
@@ -192,6 +233,19 @@ def plan_phase(
     existing = _submitted_plan(campaign, phase, int(iteration))
     if existing is not None:
         return existing
+    orphaned = _orphaned_resolutions(campaign, phase, int(iteration))
+    if not bool(preview_allowed):
+        return {
+            "phase": phase,
+            "iteration": int(iteration),
+            "status": "evidence_not_yet_produced",
+            "message": (
+                "no intent-bound immutable resolution exists for this "
+                "historical iteration; current campaign heads will not be "
+                "substituted"
+            ),
+            "orphaned_resolutions": orphaned,
+        }
     try:
         evidence = collect_resource_evidence(
             phase_name=phase,
@@ -203,7 +257,9 @@ def plan_phase(
         )
         array_size = (
             int(evidence["n_tasks"])
-            if phase == "ARIADNE_ARRAY" or "GAUSSIAN" in phase or "AIMALL" in phase
+            if phase in {"ARIADNE_ARRAY", "INITIAL_FEREBUS", "FEREBUS"}
+            or "GAUSSIAN" in phase
+            or "AIMALL" in phase
             else None
         )
         resolved = resolve_phase_resources(
@@ -234,6 +290,15 @@ def plan_phase(
             "iteration": int(iteration),
             "status": "evidence_not_yet_produced",
             "message": str(exc),
+            "orphaned_resolutions": orphaned,
+        }
+    except ResourceEvidenceInvalid as exc:
+        return {
+            "phase": phase,
+            "iteration": int(iteration),
+            "status": "evidence_invalid",
+            "message": str(exc),
+            "orphaned_resolutions": orphaned,
         }
     return {
         "phase": phase,
@@ -241,7 +306,8 @@ def plan_phase(
         "status": "ready",
         "resources": resolved.to_dict(),
         "evidence": evidence,
-        "telemetry": None,
+        "telemetry": _absent_usage(campaign),
+        "orphaned_resolutions": orphaned,
     }
 
 
@@ -286,6 +352,7 @@ def build_resource_plan(
                 replacement_round=int(replacement_round),
                 expected_models_version=current_models_version,
                 expected_reference_data_version=current_reference_data_version,
+                preview_allowed=(selected_iteration == int(current_iteration)),
             )
             for phase in phases
         ],
@@ -430,18 +497,31 @@ def format_resource_plan(payload: Dict[str, Any]) -> str:
             )
         telemetry = plan.get("telemetry")
         if isinstance(telemetry, dict):
+            telemetry_status = str(telemetry.get("status") or "invalid")
+            lines.append("  telemetry_status=" + telemetry_status)
+            if telemetry.get("error"):
+                lines.append("  telemetry_error=" + str(telemetry["error"]))
+            summary = telemetry.get("summary")
+            if isinstance(summary, dict):
+                lines.append(
+                    "  observed p95_rss_mib="
+                    + str(summary.get("p95_rss_mib"))
+                    + " p95_elapsed_seconds="
+                    + str(summary.get("p95_elapsed_seconds"))
+                )
+                lines.append(
+                    "  advisory memory_mib="
+                    + str(summary.get("recommended_memory_mib"))
+                    + " walltime_seconds="
+                    + str(summary.get("recommended_walltime_seconds"))
+                    + " missing_task_rows="
+                    + str(summary.get("n_missing_task_rows"))
+                )
+        orphaned = plan.get("orphaned_resolutions")
+        if isinstance(orphaned, list) and orphaned:
             lines.append(
-                "  observed p95_rss_mib="
-                + str(telemetry.get("p95_rss_mib"))
-                + " p95_elapsed_seconds="
-                + str(telemetry.get("p95_elapsed_seconds"))
-            )
-            lines.append(
-                "  advisory memory_mib="
-                + str(telemetry.get("recommended_memory_mib"))
-                + " walltime_seconds="
-                + str(telemetry.get("recommended_walltime_seconds"))
-                + " missing_task_rows="
-                + str(telemetry.get("n_missing_task_rows"))
+                "  warning: "
+                + str(len(orphaned))
+                + " unbound resource resolution artefact(s) were ignored"
             )
     return "\n".join(lines) + "\n"

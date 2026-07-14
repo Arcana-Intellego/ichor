@@ -209,7 +209,12 @@ def test_submit_ferebus_happy_path(tmp_path):
     assert "export LC_NUMERIC=C" in script
     # sbatch is driven from the staging directory because the generated script reads
     # sibling commands/list.txt files with relative paths.
-    assert runner.calls == [["sbatch", "--parsable", "runFerebus.sh"]]
+    assert len(runner.calls) == 1
+    assert runner.calls[0][:2] == ["sbatch", "--parsable"]
+    assert runner.calls[0][-1] == "runFerebus.sh"
+    assert runner.calls[0][2].startswith(
+        "--export=ALL,ICHOR_SCRIPT_BINDING_SHA256="
+    )
     assert runner.kwargs[0]["cwd"] == str(tmp_path)
     assert runner.kwargs[0]["check"] is False
     assert runner.kwargs[0]["capture_output"] is True

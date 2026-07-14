@@ -28,6 +28,11 @@ from ichor.hpc.active_learning.daemon.phase_executor import (
     PhaseResult,
 )
 from ichor.hpc.active_learning.daemon.state import CampaignPhase
+from ichor.hpc.active_learning.daemon.script_bundles import (
+    prepare_attempt_bundle,
+    write_attempt_script,
+    write_script_binding,
+)
 from ichor.hpc.active_learning.daemon.ferebus_quality import (
     FEREBUS_QUALITY_SCHEMA_VERSION,
 )
@@ -1843,11 +1848,54 @@ def test_partial_array_recovery_journal_payload_does_not_duplicate_phase(
         backend_check=False,
         sbatch_runner=runner,
     )
+    submission_intent.write_pre_submit_intent(
+        campaign,
+        campaign_uid="m16-test",
+        phase_name="GAUSSIAN",
+        iteration=4,
+        expected_tasks=3,
+    )
     monkeypatch.setattr(ex, "_array_size_after_staging", lambda _phase, _state: 3)
+
+    def write_bound_fixture_script(
+        phase,
+        state,
+        array_size,
+        array_task_map=None,
+    ):
+        phase_name = phase.value if isinstance(phase, CampaignPhase) else str(phase)
+        intent = submission_intent.load_active_intent(
+            campaign,
+            phase_name,
+            state.iteration,
+        )
+        assert intent is not None
+        bundle = prepare_attempt_bundle(
+            campaign,
+            phase_name,
+            state.iteration,
+            str(intent["submission_identity"]),
+            array_size=array_size,
+            max_log_files_per_directory=5000,
+            source_array_task_map=array_task_map,
+        )
+        script = write_attempt_script(bundle, "#!/bin/bash\ntrue\n")
+        binding = write_script_binding(bundle)
+        submission_intent.bind_submission_script(
+            campaign,
+            phase_name,
+            state.iteration,
+            script_path=str(script.resolve()),
+            script_sha256=str(binding["script_sha256"]),
+            binding_path=str(binding["path"]),
+            binding_sha256=str(binding["sha256"]),
+        )
+        return script
+
     monkeypatch.setattr(
         ex,
         "_write_real_script",
-        lambda _phase, _state, _array_size, array_task_map=None: campaign / "job.sh",
+        write_bound_fixture_script,
     )
     monkeypatch.setattr(
         live_executor_mod,
