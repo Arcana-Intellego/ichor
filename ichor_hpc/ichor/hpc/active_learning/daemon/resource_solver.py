@@ -579,7 +579,6 @@ def _phase_b_evidence_with_config(
     payload, frames, records = ariadne_candidate_frames(
         iter_dir,
         expected_iteration=int(iteration),
-        accept_legacy_missing_landing_safety=False,
         expected_config_sha256=config_fingerprint(canonical_config(config)),
         require_batch_decision=True,
     )

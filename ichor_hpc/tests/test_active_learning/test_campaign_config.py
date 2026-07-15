@@ -110,7 +110,9 @@ def test_default_campaign_config_is_valid():
     assert c.aimall.iasmesh == "fine"
     assert c.quality_gates.ariadne_max_displacement_ang == 1.25
     assert c.quality_gates.ariadne_min_pair_distance_ang == 0.60
-    assert c.adversarial_safety.accept_legacy_missing_landing_safety is False
+    assert c.adversarial_safety.salvage_safe_iterate is True
+    assert c.adversarial_safety.backtrack_to_safe_landing is True
+    assert c.adversarial_safety.under_move_retry is True
     assert c.max_acquisition_grad_per_ang == 50.0
     assert c.effective_max_acquisition_grad_per_ang() == 50.0
     assert c.error_calibration.enabled is True
@@ -608,11 +610,11 @@ def test_required_nested_block_cannot_be_null():
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
 def test_non_finite_values_are_rejected_before_consumers(value):
     payload = CampaignConfig().to_dict()
-    payload["adversarial_safety"]["max_whitened_distance"] = value
+    payload["ariadne"]["convergence"]["objective_change_tolerance"] = value
 
     with pytest.raises(
         ConfigValidationError,
-        match="adversarial_safety.max_whitened_distance must be finite",
+        match="ariadne.convergence.objective_change_tolerance must be finite",
     ):
         CampaignConfig.from_dict(payload)
 
@@ -964,9 +966,13 @@ def test_ariadne_block_defaults():
     assert ab.trqn_retry_target_initial_grad_norm == pytest.approx(0.003)
     assert ab.trqn_target_initial_grad_rms == pytest.approx(2.0e-4)
     assert ab.trqn_retry_target_initial_grad_rms == pytest.approx(4.0e-4)
-    assert ab.trqn_under_move_target_initial_grad_rms == pytest.approx(6.0e-4)
-    assert ab.trqn_under_move_retry is True
-    assert ab.trqn_under_move_retry_max == 1
+    assert ab.convergence.mode == "fixed"
+    assert ab.convergence.objective_change_tolerance == pytest.approx(1.0e-6)
+    assert ab.convergence.gradient_rms_tolerance_per_ang == pytest.approx(1.0e-4)
+    assert ab.convergence.gradient_max_tolerance_per_ang == pytest.approx(1.5e-4)
+    assert ab.convergence.step_rms_tolerance_ang == pytest.approx(1.2e-3)
+    assert ab.convergence.step_max_tolerance_ang == pytest.approx(1.8e-3)
+    assert ab.convergence.consecutive_accepted_steps == 2
     assert ab.trqn_min_objective_scale == pytest.approx(1.0e-8)
     assert ab.trqn_max_objective_scale == pytest.approx(1.0)
     assert ab.trqn_fixed_objective_scale == pytest.approx(1.0)

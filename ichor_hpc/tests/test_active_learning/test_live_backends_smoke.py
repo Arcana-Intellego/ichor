@@ -1398,7 +1398,11 @@ def test_ariadne_array_staging_precomputes_geometry_novelty_scale(tmp_path, monk
     )
 
     assert n == 1
-    assert calls == [(campaign, cfg, 1)]
+    assert len(calls) == 1
+    assert calls[0][0] == campaign
+    assert calls[0][2] == 1
+    assert calls[0][1] is not cfg
+    assert calls[0][1].campaign.sampling_aggressiveness == 5
 
 
 def test_ariadne_array_staging_fails_before_submit_when_scale_precompute_fails(

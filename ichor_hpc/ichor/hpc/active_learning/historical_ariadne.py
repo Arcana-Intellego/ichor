@@ -53,7 +53,6 @@ def read_historical_ariadne_records(
         root,
         expected_iteration=int(expected_iteration),
         require_nonempty=False,
-        accept_legacy_missing_landing_safety=False,
     )
     audit = read_ariadne_landing_audit(
         root,

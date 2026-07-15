@@ -100,7 +100,7 @@ def test_mock_to_dict_is_json_serialisable():
     assert d["seed_coordinates"] == d["initial_coordinates"]
     assert d["optimiser_initial_coordinates"] == d["initial_coordinates"]
     assert d["seed_alpha"] == d["optimiser_initial_alpha"]
-    assert d["optimiser_initial_origin"] == "seed_fallback"
+    assert d["optimiser_initial_origin"] == "seed_initial"
     assert d["warm_start_alpha_delta_from_seed"] == 0.0
 
 
@@ -302,7 +302,7 @@ def test_missing_landing_safety_is_not_task_usable_by_default():
     assert usability["reason"] == "missing_landing_safety"
 
 
-def test_missing_landing_safety_can_be_accepted_for_explicit_legacy_migration():
+def test_removed_legacy_landing_safety_bypass_is_not_accepted():
     seed = _water()
     out = AriadneRunResult(
         initial_atoms=seed,
@@ -310,14 +310,11 @@ def test_missing_landing_safety_can_be_accepted_for_explicit_legacy_migration():
         return_code=0,
     )
 
-    usability = ariadne_result_usability_payload(
-        out.to_dict(),
-        accept_legacy_missing_landing_safety=True,
-    )
-
-    assert usability["usable"] is True
-    assert usability["task_exit_code"] == 0
-    assert usability["reason"] == "safe_landing_converged_legacy"
+    with pytest.raises(TypeError, match="accept_legacy_missing_landing_safety"):
+        ariadne_result_usability_payload(
+            out.to_dict(),
+            accept_legacy_missing_landing_safety=True,
+        )
 
 
 def test_unsafe_max_iteration_result_is_not_task_usable():
@@ -414,10 +411,7 @@ def test_backtransform_failure_still_honours_seed_fallback_policy():
         },
     )
 
-    usability = ariadne_result_usability_payload(
-        out.to_dict(),
-        allow_seed_fallback=False,
-    )
+    usability = ariadne_result_usability_payload(out.to_dict())
 
     assert usability["usable"] is False
     assert usability["task_exit_code"] == 4

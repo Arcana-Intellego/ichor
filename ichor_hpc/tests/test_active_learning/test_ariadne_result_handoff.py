@@ -294,6 +294,38 @@ def test_validate_ariadne_result_accepts_canonical_identity():
     assert out["trajectory_sha256"] == TRAJECTORY_SHA
 
 
+def test_validate_ariadne_result_binds_claimed_seed_to_authoritative_pool_frame():
+    selection = _selection_payload()
+    seed_uid = selection["seed_records"][0]["seed_uid"]
+    authoritative = [
+        [0.0, 0.0, 0.0],
+        [0.96, 0.0, 0.0],
+        [-0.24, 0.93, 0.0],
+    ]
+    payload = _result_payload(seed_uid)
+    payload["initial_coordinates"] = [list(row) for row in authoritative]
+    payload["seed_coordinates"] = [list(row) for row in authoritative]
+
+    validate_ariadne_result(
+        payload,
+        expected_iteration=1,
+        seed_record={"seed_id": 1, "seed_uid": seed_uid, "frame_id": 2},
+        expected_initial_coordinates=authoritative,
+    )
+
+    payload["initial_coordinates"][1][0] = 1.25
+    with pytest.raises(
+        HandoffManifestError,
+        match="initial_coordinates_authoritative_seed_mismatch",
+    ):
+        validate_ariadne_result(
+            payload,
+            expected_iteration=1,
+            seed_record={"seed_id": 1, "seed_uid": seed_uid, "frame_id": 2},
+            expected_initial_coordinates=authoritative,
+        )
+
+
 def test_validate_ariadne_result_rejects_wrong_trajectory_sha():
     selection = _selection_payload()
     seed_uid = selection["seed_records"][0]["seed_uid"]

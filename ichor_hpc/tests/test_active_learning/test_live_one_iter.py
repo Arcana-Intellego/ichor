@@ -692,6 +692,7 @@ def _annotate_ariadne_fixture_results(campaign_dir, iteration):
         write_optimisation_trajectory,
         write_seed_output_manifest,
     )
+    from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
     from ichor.hpc.active_learning.daemon.state import atomic_write_json
     from ichor.hpc.active_learning.layout import active_iteration_dir, ariadne_seed_dir
     from ichor.hpc.active_learning.sampling_protocol import (
@@ -710,6 +711,7 @@ def _annotate_ariadne_fixture_results(campaign_dir, iteration):
     scale_path = sampling_scale_model_path(iter_dir)
     audit_path = sampling_protocol_audit_path(iter_dir)
     resolved_payload = _json.loads(resolved_path.read_text(encoding="utf-8"))
+    trajectory_pool = TrajectoryPool.load(campaign_dir)
 
     def protocol_path(path):
         return path.resolve().relative_to(campaign_dir.resolve()).as_posix()
@@ -732,6 +734,13 @@ def _annotate_ariadne_fixture_results(campaign_dir, iteration):
         data["array_task_id"] = array_task_id
         data["seed_frame_id"] = int(task["frame_id"])
         data["trajectory_sha256"] = str(task_map["trajectory_sha256"])
+        seed_atoms = trajectory_pool.frame(int(task["frame_id"]))
+        initial_coordinates = [
+            [float(atom.x), float(atom.y), float(atom.z)]
+            for atom in seed_atoms
+        ]
+        data["initial_coordinates"] = [list(row) for row in initial_coordinates]
+        data["seed_coordinates"] = [list(row) for row in initial_coordinates]
         data["task_success"] = True
         data["sampling_protocol"] = {
             "sampling_aggressiveness": int(

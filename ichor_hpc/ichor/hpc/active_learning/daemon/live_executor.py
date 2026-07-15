@@ -1087,20 +1087,17 @@ def validate_ferebus_completed(staging_dir) -> tuple:
 
 
 def _high_quantile(vals, q=0.9):
-    """a high quantile (default p90) of the kept-seed alphas -- our per-iteration convergence
-    scalar. numpy-free + linear-interpolated. p90 keeps the worst-case/tail focus an adversarial
-    loop needs WITHOUT being hostage to the single worst seed (which a bare max was -- one stuck
-    seed pinned it high forever), and being a real order statistic it never returns a value no seed
-    actually produced. empty -> 0.0, though callers guarantee at least one kept seed in practice."""
+    """Return the nearest-rank observed high quantile (p90 by default)."""
     if not vals:
         return 0.0
     s = sorted(float(v) for v in vals)
-    if len(s) == 1:
-        return s[0]
-    pos = float(q) * (len(s) - 1)
-    lo = int(pos)
-    hi = min(lo + 1, len(s) - 1)
-    return s[lo] + (s[hi] - s[lo]) * (pos - lo)
+    if not all(math.isfinite(value) for value in s):
+        raise ValueError("high-quantile inputs must be finite")
+    quantile = float(q)
+    if not math.isfinite(quantile) or not 0.0 < quantile <= 1.0:
+        raise ValueError("high quantile must be in (0, 1]")
+    rank = max(1, int(math.ceil(quantile * len(s))))
+    return s[rank - 1]
 
 
 def _ariadne_geometry_quality(result_dict: Dict[str, Any], validated: Dict[str, Any], gates: Any) -> Dict[str, Any]:
@@ -1111,6 +1108,7 @@ def _ariadne_geometry_quality(result_dict: Dict[str, Any], validated: Dict[str, 
     metrics: Dict[str, Any] = {
         "max_displacement_ang": None,
         "min_pair_distance_ang": None,
+        "pair_distance_applicable": bool(final.ndim == 2 and final.shape[0] >= 2),
     }
     if final.ndim != 2 or final.shape[1] != 3 or not _np.all(_np.isfinite(final)):
         reasons.append("ariadne_final_geometry_nonfinite")
@@ -1130,18 +1128,20 @@ def _ariadne_geometry_quality(result_dict: Dict[str, Any], validated: Dict[str, 
     except Exception:
         metrics["max_displacement_ang"] = None
     max_disp = getattr(gates, "ariadne_max_displacement_ang", None)
-    if (
-        max_disp is not None
-        and metrics["max_displacement_ang"] is not None
-        and float(metrics["max_displacement_ang"]) > float(max_disp)
-    ):
+    if max_disp is None:
+        reasons.append("ariadne_max_displacement_gate_unresolved")
+    elif metrics["max_displacement_ang"] is None:
+        reasons.append("ariadne_max_displacement_metric_unavailable")
+    elif float(metrics["max_displacement_ang"]) > float(max_disp):
         reasons.append("ariadne_max_displacement_threshold_exceeded")
     min_pair = getattr(gates, "ariadne_min_pair_distance_ang", None)
-    if (
-        min_pair is not None
-        and metrics["min_pair_distance_ang"] is not None
-        and float(metrics["min_pair_distance_ang"]) < float(min_pair)
-    ):
+    if min_pair is None:
+        reasons.append("ariadne_min_pair_distance_gate_unresolved")
+    elif not metrics["pair_distance_applicable"]:
+        pass
+    elif metrics["min_pair_distance_ang"] is None:
+        reasons.append("ariadne_min_pair_distance_metric_unavailable")
+    elif float(metrics["min_pair_distance_ang"]) < float(min_pair):
         reasons.append("ariadne_min_pair_distance_threshold_exceeded")
     return {"accepted": not reasons, "reasons": reasons, "metrics": metrics}
 
@@ -4175,14 +4175,20 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             try:
                 seed_frame_id = seed_record.get("frame_id")
                 expected_atom_types = None
+                expected_initial_coordinates = None
                 if trajectory_pool is not None and seed_frame_id is not None:
                     seed_atoms = trajectory_pool.frame(int(seed_frame_id))
                     expected_atom_types = [str(atom.type) for atom in seed_atoms]
+                    expected_initial_coordinates = [
+                        [float(atom.x), float(atom.y), float(atom.z)]
+                        for atom in seed_atoms
+                    ]
                 validated = validate_ariadne_result(
                     result_dict,
                     expected_iteration=int(state.iteration),
                     seed_record=seed_record,
                     expected_atom_types=expected_atom_types,
+                    expected_initial_coordinates=expected_initial_coordinates,
                     expected_trajectory_sha256=str(picked.get("trajectory_sha256", "")),
                 )
             except Exception as exc:
@@ -4299,17 +4305,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 })
                 continue
 
-            usability = ariadne_result_usability_payload(
-                result_dict,
-                allow_seed_fallback=bool(
-                    getattr(
-                        getattr(result_protocol, "adversarial_safety", None),
-                        "allow_seed_fallback",
-                        False,
-                    )
-                ),
-                accept_legacy_missing_landing_safety=False,
-            )
+            usability = ariadne_result_usability_payload(result_dict)
 
             landing_safety = result_dict.get("landing_safety")
             if not isinstance(landing_safety, dict):
@@ -4751,6 +4747,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             n_kept=int(n_kept),
             n_rejected=int(n_rejected),
             last_acquisition_alpha0=float(last_alpha),
+            acquisition_quantile=0.9,
+            acquisition_quantile_policy="nearest_rank_observed",
         )
         return PhaseResult(
             is_complete=True,

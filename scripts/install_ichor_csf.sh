@@ -669,10 +669,10 @@ verify_ariadne_api() {
     fi
     "${PYTHON}" - <<'PY'
 import ariadne
+from ichor.hpc.active_learning.acquisition.ariadne_abi import probe_ariadne_module
 
-if not (hasattr(ariadne, "Geometric_Trqn") or hasattr(ariadne, "Ds_Optimiser")):
-    raise SystemExit("ariadne imported but no documented optimiser API was found")
-print("ARIADNE OK")
+receipt = probe_ariadne_module(ariadne)
+print("ARIADNE ABI OK:", receipt["contract_version"])
 PY
 }
 

@@ -1372,13 +1372,16 @@ class DryRunPhaseExecutor:
                 tail = history[-(n_window + 1):]
                 rels = []
                 for prev, cur in zip(tail[:-1], tail[1:]):
-                    denom = abs(prev)
-                    # SIGNED, not clamped to >= 0. alpha is MAXIMISED, so cur > prev means it ROSE
-                    # (the model got worse, or found a fresh hard region) -- that gives a negative
-                    # rel and so reads as "not flat", which is exactly what we want: a rising alpha
-                    # must never trigger a stop. the old max(0, ...) flattened a rise to 0, making it
-                    # look identical to a converged plateau and nudging us toward shutdown (A50).
-                    rels.append(0.0 if denom <= 0.0 else (prev - cur) / denom)
+                    # Symmetric relative change remains defined at zero. In
+                    # particular, zero -> positive is -2 rather than a false
+                    # zero plateau, so a newly discovered hard region cannot
+                    # trigger convergence.
+                    denominator = abs(prev) + abs(cur)
+                    rels.append(
+                        0.0
+                        if denominator <= 1.0e-15
+                        else 2.0 * (prev - cur) / denominator
+                    )
                 # flat = alpha barely moved in EITHER direction across the whole window.
                 flat = bool(rels) and all(abs(r) < float(stop.rel_alpha_improvement_min) for r in rels)
                 # ...but a flat plateau only counts as CONVERGED when it is also LOW. a flat-but-high

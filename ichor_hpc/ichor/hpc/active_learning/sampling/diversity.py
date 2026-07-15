@@ -925,36 +925,28 @@ def _run_phase_b(args, campaign, config):
         return 3
     all_ariadne_candidate_records = [dict(record) for record in candidate_records]
 
-    safety_filter = {
-        "enabled": False,
-        "n_input": int(len(candidate_records)),
-        "n_kept": int(len(candidate_records)),
-        "n_dropped": 0,
-        "dropped": [],
-    }
-    if bool(getattr(effective_config.adversarial_safety, "phase_b_filter_enabled", True)):
-        try:
-            candidate_frames, candidate_records, safety_filter = (
-                _phase_b_landing_safety_filter(
-                    candidate_frames,
-                    candidate_records,
-                )
+    try:
+        candidate_frames, candidate_records, safety_filter = (
+            _phase_b_landing_safety_filter(
+                candidate_frames,
+                candidate_records,
             )
-        except Exception as exc:
-            print(
-                "Phase B landing safety filter failed: "
-                + type(exc).__name__
-                + ": "
-                + str(exc),
-                file=_sys.stderr,
-            )
-            return 3
-        if not candidate_frames:
-            print(
-                "Phase B landing safety filter removed every candidate",
-                file=_sys.stderr,
-            )
-            return 3
+        )
+    except Exception as exc:
+        print(
+            "Phase B landing safety filter failed: "
+            + type(exc).__name__
+            + ": "
+            + str(exc),
+            file=_sys.stderr,
+        )
+        return 3
+    if not candidate_frames:
+        print(
+            "Phase B landing safety filter removed every candidate",
+            file=_sys.stderr,
+        )
+        return 3
 
     descriptor = build_descriptor_from_config(effective_config)
     descriptor_indices, descriptor_rejections = partition_descriptor_frames(

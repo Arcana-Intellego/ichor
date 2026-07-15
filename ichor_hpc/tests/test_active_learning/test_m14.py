@@ -20,6 +20,7 @@ from ichor.hpc.active_learning.sampling.anti_overlap import (
     filter_candidates_against_training,
     min_distance_to_training,
 )
+import ichor.hpc.active_learning.sampling.anti_overlap as anti_overlap
 
 
 def _water(offset=(0.0, 0.0, 0.0)):
@@ -163,6 +164,29 @@ def test_stop_check_rising_alpha_does_not_converge(tmp_path):
     assert state.shutdown_requested is False
 
 
+def test_stop_check_zero_to_positive_alpha_is_a_rise_not_a_plateau(tmp_path):
+    cfg = CampaignConfig()
+    cfg.stop.alpha0_streak_threshold = 1.0e-12
+    cfg.stop.alpha0_streak_length = 100
+    cfg.stop.rel_alpha_improvement_min = 0.05
+    cfg.stop.rel_alpha_improvement_window = 3
+    cfg.stop.min_iterations_before_stop = 0
+    ex = DryRunPhaseExecutor(campaign_dir=tmp_path, config=cfg)
+    state = fresh_campaign_state(max_iterations=20)
+
+    completion_reason = None
+    for alpha in (0.0, 0.01, 0.02, 0.03):
+        state.last_acquisition_alpha0 = alpha
+        state.iteration += 1
+        state.reference_data_version = state.iteration
+        state.models_version = state.iteration
+        updates = ex._inline_stop_check(state)
+        state.alpha_history = updates["alpha_history"]
+        completion_reason = updates.get("campaign_completion_reason")
+
+    assert completion_reason is None
+
+
 def test_stop_check_min_iterations_before_stop_blocks_early(tmp_path):
     cfg = CampaignConfig()
     cfg.stop.alpha0_streak_threshold = 0.05
@@ -225,6 +249,17 @@ def test_min_distance_picks_closest():
     ]
     d = min_distance_to_training(candidate, training)
     assert d == pytest.approx(0.0, abs=1.0e-9)
+
+
+def test_nonfinite_distance_never_passes_as_infinite_novelty(monkeypatch):
+    monkeypatch.setattr(
+        anti_overlap,
+        "aligned_mass_weighted_rmsd",
+        lambda *_args, **_kwargs: float("nan"),
+    )
+
+    with pytest.raises(ValueError, match="non-finite"):
+        min_distance_to_training(_water(), [_water()])
 
 
 def test_min_distance_uses_mass_normalized_rmsd_not_size_scaled_distance():

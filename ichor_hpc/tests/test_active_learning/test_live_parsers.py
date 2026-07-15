@@ -1649,6 +1649,18 @@ def _seed_ariadne_pool(campaign_dir, iteration, *, n_seeds=3):
             payload["array_task_id"] = i
             payload["seed_frame_id"] = int(i)
             payload["trajectory_sha256"] = trajectory_sha256
+            offset = 0.01 * float(i)
+            initial_coordinates = [
+                [offset, 0.0, 0.0],
+                [0.96 + offset, 0.0, 0.0],
+                [-0.24 + offset, 0.93, 0.0],
+            ]
+            payload["initial_coordinates"] = [
+                list(row) for row in initial_coordinates
+            ]
+            payload["seed_coordinates"] = [
+                list(row) for row in initial_coordinates
+            ]
             payload["sampling_protocol"] = {
                 "sampling_aggressiveness": int(
                     resolved_protocol.sampling_aggressiveness

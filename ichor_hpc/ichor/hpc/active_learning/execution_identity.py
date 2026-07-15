@@ -160,9 +160,9 @@ def _ariadne_identity() -> Dict[str, Any]:
     try:
         module = importlib.import_module("ariadne")
         identity["import_ok"] = True
-        probe = getattr(module, "get_abi_info_py", None)
-        if callable(probe):
-            identity["abi_probe"] = _json_safe_probe(probe())
+        from .acquisition.ariadne_abi import probe_ariadne_module
+
+        identity["abi_probe"] = _json_safe_probe(probe_ariadne_module(module))
     except Exception as exc:
         identity["abi_probe_error"] = type(exc).__name__ + ": " + str(exc)
     return identity

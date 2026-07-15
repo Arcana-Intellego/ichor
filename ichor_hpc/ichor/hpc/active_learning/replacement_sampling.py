@@ -153,7 +153,6 @@ def _active_frame(
                 "frame_id": attempt.get("seed_frame_id"),
             },
             expected_trajectory_sha256=expected_trajectory_sha256,
-            accept_legacy_missing_landing_safety=False,
         )
     atom_types = result.get("atom_types")
     coordinates = result.get("final_coordinates")
@@ -199,7 +198,6 @@ def _active_frames(
     manifest, _frames, accepted_records = ariadne_candidate_frames(
         iteration_dir,
         expected_iteration=resolved_iteration,
-        accept_legacy_missing_landing_safety=False,
         require_batch_decision=True,
     )
     accepted_by_uid = {

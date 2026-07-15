@@ -34,10 +34,105 @@ from .ase_calculator import AdversarialASECalculator
 
 
 __all__ = [
+    "AriadneConvergenceConfig",
     "AriadneRunConfig",
     "AriadneRunResult",
     "optimise_seed",
+    "resolve_ariadne_convergence",
 ]
+
+
+@dataclass(frozen=True)
+class AriadneConvergenceConfig:
+    """Daemon-owned convergence policy in mature-acquisition units."""
+
+    mode: str = "fixed"
+    objective_change_tolerance: float = 1.0e-6
+    gradient_rms_tolerance_per_ang: float = 1.0e-4
+    gradient_max_tolerance_per_ang: float = 1.5e-4
+    step_rms_tolerance_ang: float = 1.2e-3
+    step_max_tolerance_ang: float = 1.8e-3
+    consecutive_accepted_steps: int = 2
+    adaptive_score_reference: float = 1.0
+    adaptive_length_reference_ang: float = 0.05
+    adaptive_min_multiplier: float = 0.25
+    adaptive_max_multiplier: float = 4.0
+
+
+def resolve_ariadne_convergence(
+    config: AriadneConvergenceConfig,
+    *,
+    initial_acquisition_score: float,
+    initial_trust_scale_ang: float,
+) -> Dict[str, Any]:
+    """Freeze the five effective convergence thresholds for one seed."""
+
+    mode = str(config.mode).strip().lower()
+    if mode not in {"fixed", "scale_adaptive"}:
+        raise ValueError("ARIADNE convergence mode must be fixed or scale_adaptive")
+    score = float(initial_acquisition_score)
+    length = float(initial_trust_scale_ang)
+    if not math.isfinite(score):
+        raise ValueError("initial mature acquisition score must be finite")
+    if not math.isfinite(length) or length <= 0.0:
+        raise ValueError("initial ARIADNE trust scale must be finite and positive")
+    consecutive = config.consecutive_accepted_steps
+    if type(consecutive) is not int or consecutive < 1:
+        raise ValueError("consecutive accepted ARIADNE steps must be a positive integer")
+
+    lower = float(config.adaptive_min_multiplier)
+    upper = float(config.adaptive_max_multiplier)
+    if mode == "fixed":
+        score_multiplier = 1.0
+        length_multiplier = 1.0
+        gradient_multiplier = 1.0
+    else:
+        score_reference = float(config.adaptive_score_reference)
+        length_reference = float(config.adaptive_length_reference_ang)
+        if not math.isfinite(score_reference) or score_reference <= 0.0:
+            raise ValueError("adaptive score reference must be finite and positive")
+        if not math.isfinite(length_reference) or length_reference <= 0.0:
+            raise ValueError("adaptive length reference must be finite and positive")
+        if not math.isfinite(lower) or not math.isfinite(upper) or lower <= 0.0:
+            raise ValueError("adaptive convergence multiplier bounds are invalid")
+        if upper < lower:
+            raise ValueError("adaptive maximum multiplier must cover the minimum")
+        score_multiplier = float(np.clip(abs(score) / score_reference, lower, upper))
+        length_multiplier = float(np.clip(length / length_reference, lower, upper))
+        gradient_multiplier = float(
+            np.clip(score_multiplier / length_multiplier, lower, upper)
+        )
+
+    effective = {
+        "objective_change_tolerance": (
+            float(config.objective_change_tolerance) * score_multiplier
+        ),
+        "gradient_rms_tolerance_per_ang": (
+            float(config.gradient_rms_tolerance_per_ang) * gradient_multiplier
+        ),
+        "gradient_max_tolerance_per_ang": (
+            float(config.gradient_max_tolerance_per_ang) * gradient_multiplier
+        ),
+        "step_rms_tolerance_ang": (
+            float(config.step_rms_tolerance_ang) * length_multiplier
+        ),
+        "step_max_tolerance_ang": (
+            float(config.step_max_tolerance_ang) * length_multiplier
+        ),
+    }
+    if any(not math.isfinite(value) or value <= 0.0 for value in effective.values()):
+        raise ValueError("resolved ARIADNE convergence thresholds are invalid")
+    return {
+        "schema_version": 1,
+        "mode": mode,
+        "initial_acquisition_score": score,
+        "initial_trust_scale_ang": length,
+        "score_multiplier": score_multiplier,
+        "length_multiplier": length_multiplier,
+        "gradient_multiplier": gradient_multiplier,
+        "consecutive_accepted_steps": int(consecutive),
+        "effective_thresholds": effective,
+    }
 
 
 @dataclass(frozen=True)
@@ -47,8 +142,10 @@ class AriadneRunConfig:
     optimiser: str = "trust_region_qn"
     hessian_model: str = "SCHLEGEL"
     max_iter: int = 200
-    gradf_tol: float = 1.0e-4
-    f_tol: float = 1.0e-6
+    convergence: AriadneConvergenceConfig = field(
+        default_factory=AriadneConvergenceConfig
+    )
+    resolved_convergence: Optional[Dict[str, Any]] = None
     delta0: float = 0.10
     delta_max: float = 0.40
     gamma: float = 0.10
@@ -58,9 +155,6 @@ class AriadneRunConfig:
     trqn_retry_target_initial_grad_norm: float = 0.003
     trqn_target_initial_grad_rms: float = 2.0e-4
     trqn_retry_target_initial_grad_rms: float = 4.0e-4
-    trqn_under_move_target_initial_grad_rms: float = 6.0e-4
-    trqn_under_move_retry: bool = True
-    trqn_under_move_retry_max: int = 1
     trqn_min_objective_scale: float = 1.0e-8
     trqn_max_objective_scale: float = 1.0
     trqn_fixed_objective_scale: float = 1.0
@@ -166,7 +260,7 @@ class AriadneRunResult:
                 else float(optimiser_initial_alpha)
             ),
             "optimiser_initial_origin": str(
-                self.optimiser_initial_origin or "seed_fallback"
+                self.optimiser_initial_origin or "seed_initial"
             ),
             "warm_start_alpha_delta_from_seed": (
                 None if warm_start_delta is None else float(warm_start_delta)
@@ -289,9 +383,6 @@ def _is_salvageable_ariadne_return_code(
 
 def ariadne_result_usability_payload(
     payload: Dict[str, Any],
-    *,
-    allow_seed_fallback: bool = False,
-    accept_legacy_missing_landing_safety: bool = False,
 ) -> Dict[str, Any]:
     """Decide whether a per-seed ARIADNE result is usable by Phase B.
 
@@ -345,13 +436,6 @@ def ariadne_result_usability_payload(
         }
     safety = payload.get("landing_safety")
     if not isinstance(safety, dict):
-        if return_code == 0 and bool(accept_legacy_missing_landing_safety):
-            return {
-                "usable": True,
-                "reason": "safe_landing_converged_legacy",
-                "task_exit_code": 0,
-                "optimiser_converged": True,
-            }
         return {
             "usable": False,
             "reason": "missing_landing_safety",
@@ -369,10 +453,14 @@ def ariadne_result_usability_payload(
         }
     policy = str(safety.get("policy", "unknown"))
     selected_origin = str(safety.get("selected_origin", ""))
-    if (
-        not allow_seed_fallback
-        and (policy == "seed_fallback" or selected_origin == "seed_fallback")
-    ):
+    if policy in {"", "unknown", "disabled"}:
+        return {
+            "usable": False,
+            "reason": "landing_policy_unlabelled",
+            "task_exit_code": 4,
+            "optimiser_converged": optimiser_converged,
+        }
+    if policy == "seed_fallback" or selected_origin == "seed_fallback":
         return {
             "usable": False,
             "reason": "seed_fallback_not_allowed",
@@ -398,9 +486,16 @@ def ariadne_result_usability_payload(
         }
     else:
         opt_reason = _optimiser_terminal_reason(payload)
+        if not opt_reason:
+            return {
+                "usable": False,
+                "reason": "nonconverged_termination_unlabelled",
+                "task_exit_code": 4,
+                "optimiser_converged": False,
+            }
         reason = (
             "safe_landing_after_max_iterations"
-            if opt_reason.startswith("max_iterations") or not opt_reason
+            if opt_reason.startswith("max_iterations")
             else "safe_landing_nonconverged"
         )
     return {
@@ -413,15 +508,8 @@ def ariadne_result_usability_payload(
 
 def ariadne_result_usability(
     result: AriadneRunResult,
-    *,
-    allow_seed_fallback: bool = False,
-    accept_legacy_missing_landing_safety: bool = False,
 ) -> Dict[str, Any]:
-    return ariadne_result_usability_payload(
-        result.to_dict(),
-        allow_seed_fallback=allow_seed_fallback,
-        accept_legacy_missing_landing_safety=accept_legacy_missing_landing_safety,
-    )
+    return ariadne_result_usability_payload(result.to_dict())
 
 
 def _import_ariadne():
@@ -563,6 +651,7 @@ def _geometry_metrics(seed_coords: np.ndarray, coords: np.ndarray) -> Dict[str, 
     metrics: Dict[str, Any] = {
         "max_displacement_ang": None,
         "min_pair_distance_ang": None,
+        "pair_distance_applicable": bool(coords.shape[0] >= 2),
     }
     if coords.ndim != 2 or coords.shape[1] != 3 or not np.all(np.isfinite(coords)):
         return metrics
@@ -841,6 +930,7 @@ def _evaluate_landing_candidate(
         )
     except Exception:
         metrics["aligned_mass_weighted_rmsd_ang"] = None
+        reasons.append("ariadne_landing_aligned_rmsd_unavailable")
 
     if coords.shape != seed_coords.shape or not np.all(np.isfinite(coords)):
         reasons.append("ariadne_landing_geometry_nonfinite")
@@ -854,30 +944,29 @@ def _evaluate_landing_candidate(
     seed_equivalent = _is_seed_equivalent(seed_coords, coords)
     metrics["seed_equivalent"] = bool(seed_equivalent)
     if seed_equivalent:
-        if bool(_cfg_value(safety_config, "allow_seed_fallback", False)):
-            record_only.append("ariadne_landing_is_seed")
-        else:
-            reasons.append("ariadne_landing_is_seed")
-            reasons.append("seed_fallback_disabled")
+        reasons.append("ariadne_landing_is_seed")
+        reasons.append("seed_fallback_disabled")
 
     max_disp = _safe_float_or_none(
         _cfg_value(quality_gates, "ariadne_max_displacement_ang", None)
     )
-    if (
-        max_disp is not None
-        and metrics.get("max_displacement_ang") is not None
-        and float(metrics["max_displacement_ang"]) > max_disp
-    ):
+    if max_disp is None:
+        reasons.append("ariadne_max_displacement_gate_unresolved")
+    elif metrics.get("max_displacement_ang") is None:
+        reasons.append("ariadne_max_displacement_metric_unavailable")
+    elif float(metrics["max_displacement_ang"]) > max_disp:
         reasons.append("ariadne_max_displacement_threshold_exceeded")
+    pair_distance_applicable = bool(metrics.get("pair_distance_applicable", True))
     min_pair = _safe_float_or_none(
         _cfg_value(quality_gates, "ariadne_min_pair_distance_ang", None)
     )
-    if (
-        min_pair is not None
-        and metrics.get("min_pair_distance_ang") is not None
-        and float(metrics["min_pair_distance_ang"]) < min_pair
-    ):
-        reasons.append("ariadne_min_pair_distance_threshold_exceeded")
+    if min_pair is None:
+        reasons.append("ariadne_min_pair_distance_gate_unresolved")
+    elif pair_distance_applicable:
+        if metrics.get("min_pair_distance_ang") is None:
+            reasons.append("ariadne_min_pair_distance_metric_unavailable")
+        elif float(metrics["min_pair_distance_ang"]) < min_pair:
+            reasons.append("ariadne_min_pair_distance_threshold_exceeded")
     pair_ratio = _safe_float_or_none(metrics.get("scaled_min_pair_ratio"))
     pair_ratio_floor = _safe_float_or_none(
         metrics.get("sampling_scale_pair_ratio_floor")
@@ -901,6 +990,7 @@ def _evaluate_landing_candidate(
         metrics["whitened_distance"] = float(math.sqrt(max(0.0, float(d_sq))))
     except Exception:
         metrics["whitened_distance"] = None
+        reasons.append("ariadne_landing_whitened_distance_unavailable")
 
     try:
         optimiser_alpha = _safe_float_or_none(alpha)
@@ -1013,7 +1103,12 @@ def _evaluate_landing_candidate(
         metrics["whitened_distance_gate_metric"] = "raw_whitened_distance"
     else:
         metrics["whitened_distance_gate_metric"] = "scaled_per_sqrt_active_dim"
-    if d_gate is not None:
+    if d_gate is None or _safe_float_or_none(d_gate) is None:
+        _append_reason_once(
+            reasons,
+            "ariadne_landing_whitened_distance_unavailable",
+        )
+    else:
         if float(d_gate) < min_w:
             if enforce_min_w:
                 reasons.append("ariadne_landing_below_min_whitened_distance")
@@ -1072,6 +1167,20 @@ def _evaluate_landing_candidate(
         reasons,
         scale_model=scale_model,
     )
+
+    required_finite_metrics = [
+        "aligned_mass_weighted_rmsd_ang",
+        "max_displacement_ang",
+        "whitened_distance",
+        "movement_rmsd_ang",
+        "chemistry_penalty",
+        "total_score",
+    ]
+    if pair_distance_applicable:
+        required_finite_metrics.append("min_pair_distance_ang")
+    for key in required_finite_metrics:
+        if _safe_float_or_none(metrics.get(key)) is None:
+            _append_reason_once(reasons, "ariadne_landing_nonfinite_metric:" + key)
 
     return {
         "candidate_index": int(candidate_index),
@@ -1243,29 +1352,6 @@ def _select_safe_landing(
     quality_gates: Any,
     scale_model: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    if not bool(_cfg_value(safety_config, "enabled", True)):
-        return {
-            "selected_atoms": raw_final_atoms,
-            "selected_alpha": (
-                float(alpha_trajectory[-1]) if alpha_trajectory else None
-            ),
-            "selected_whitened_distance": None,
-            "raw_whitened_distance": None,
-            "landing_safety": {
-                "accepted": True,
-                "policy": "disabled",
-                "selected_origin": "raw_final",
-                "selected_candidate_index": 0,
-                "reasons": [],
-                "record_only_reasons": ["adversarial_safety_disabled"],
-                "metrics": {},
-                "raw_final": {},
-                "n_candidates_evaluated": 0,
-                "n_safe_candidates": 0,
-            },
-            "landing_candidates": [],
-        }
-
     seed_mean_energy = float(acquisition.posterior.mean(seed_atoms))
     optimiser_trajectory_initial_alpha = (
         _safe_float_or_none(alpha_trajectory[0]) if alpha_trajectory else None
@@ -1293,7 +1379,7 @@ def _select_safe_landing(
         origin = (
             str(opt_candidate_origins[k])
             if opt_candidate_origins is not None and k < len(opt_candidate_origins)
-            else ("seed_fallback" if k == 0 else "accepted_iterate")
+            else ("seed_initial" if k == 0 else "accepted_iterate")
         )
         candidate = _evaluate_landing_candidate(
             acquisition=acquisition,
@@ -1358,10 +1444,32 @@ def _select_safe_landing(
     )
     raw_candidate["metrics"] = raw_metrics
     _annotate_acquisition_improvement(raw_candidate, initial_alpha)
-    idx += 1
-    candidates.append(raw_candidate)
-    if not _duplicate_coords(raw_coords, seen_coords):
+    duplicate_position = next(
+        (
+            position
+            for position, candidate in enumerate(candidates)
+            if np.allclose(
+                _coords_array(candidate["atoms"]),
+                raw_coords,
+                atol=1.0e-12,
+                rtol=1.0e-12,
+            )
+        ),
+        None,
+    )
+    if duplicate_position is None:
+        idx += 1
+        candidates.append(raw_candidate)
         seen_coords.append(raw_coords.copy())
+    else:
+        equivalent = candidates[int(duplicate_position)]
+        raw_candidate["candidate_index"] = int(equivalent["candidate_index"])
+        raw_candidate["metrics"]["coordinate_equivalent_origins"] = list(
+            dict.fromkeys(
+                [str(equivalent.get("origin", "unknown")), "raw_final"]
+            )
+        )
+        candidates[int(duplicate_position)] = raw_candidate
 
     if (
         not bool(raw_candidate.get("accepted"))
@@ -1424,45 +1532,12 @@ def _select_safe_landing(
             policy = "salvaged_iterate"
         accepted = True
         reasons: List[str] = []
-    elif bool(_cfg_value(safety_config, "allow_seed_fallback", False)):
-        fallback_candidates = [
-            candidate
-            for candidate in candidates
-            if bool(candidate.get("metrics", {}).get("seed_equivalent", False))
-            and set(candidate.get("reasons") or [])
-            <= {"ariadne_landing_under_moved"}
-        ]
-        if fallback_candidates:
-            selected = dict(max(fallback_candidates, key=_rank_landing_candidate))
-            selected["reasons"] = []
-            selected["record_only_reasons"] = list(
-                dict.fromkeys(
-                    list(selected.get("record_only_reasons") or [])
-                    + ["seed_fallback_under_moved"]
-                )
-            )
-            selected_origin = "seed_fallback"
-            policy = "seed_fallback"
-            accepted = True
-            reasons = []
-        else:
-            selected = raw_candidate
-            selected_origin = "raw_final"
-            policy = "unsafe_raw_final"
-            accepted = not bool(
-                _cfg_value(safety_config, "reject_unsafe_landings", True)
-            )
-            reasons = ["no_safe_non_seed_landing"]
-            if accepted:
-                policy = "unsafe_raw_final_record_only"
     else:
         selected = raw_candidate
         selected_origin = "raw_final"
         policy = "unsafe_raw_final"
-        accepted = not bool(_cfg_value(safety_config, "reject_unsafe_landings", True))
+        accepted = False
         reasons = ["no_safe_non_seed_landing"]
-        if accepted:
-            policy = "unsafe_raw_final_record_only"
 
     metrics = dict(selected.get("metrics") or {})
     selected_alpha = _safe_float_or_none(selected.get("alpha"))
@@ -1613,7 +1688,7 @@ def _mock_optimise_seed(
         "property": "iqa",
         "seed_alpha": float(alpha_values[0]),
         "optimiser_initial_alpha": float(alpha_values[0]),
-        "optimiser_initial_origin": "seed_fallback",
+        "optimiser_initial_origin": "seed_initial",
         "warm_start_alpha_delta_from_seed": 0.0,
         "total_predicted_iqa_ha": float(sum(r["predicted_iqa_ha"] for r in per_atom)),
         "total_energy_variance": float(sum(r["raw_variance"] for r in per_atom)),
@@ -1650,7 +1725,7 @@ def _mock_optimise_seed(
         seed_alpha=float(alpha_values[0]),
         optimiser_initial_atoms=seed,
         optimiser_initial_alpha=float(alpha_values[0]),
-        optimiser_initial_origin="seed_fallback",
+        optimiser_initial_origin="seed_initial",
         warm_start_alpha_delta_from_seed=0.0,
         final_atoms=final,
         alpha_trajectory=alpha_values,
@@ -1688,7 +1763,7 @@ def _select_safe_gradient_band_warm_start(
 ) -> tuple[Optional[np.ndarray], str, List[Dict[str, Any]]]:
     probe_method = getattr(acquisition, "gradient_band_probe_atoms", None)
     if not callable(probe_method):
-        return None, "seed_fallback", []
+        return None, "seed_initial", []
     seed_mean_energy = float(acquisition.posterior.mean(seed_atoms))
     records: List[Dict[str, Any]] = []
     candidates: List[Dict[str, Any]] = []
@@ -1726,7 +1801,7 @@ def _select_safe_gradient_band_warm_start(
                 "risk_penalty_score": None,
             })
     if not candidates:
-        return None, "seed_fallback", records
+        return None, "seed_initial", records
     selected = max(candidates, key=_rank_landing_candidate)
     selected_coords = _coords_array(selected["atoms"])
     for record in records:
@@ -1745,9 +1820,7 @@ def _landing_needs_under_move_retry(
 ) -> bool:
     if not bool(_cfg_value(safety_config, "under_move_retry", True)):
         return False
-    if not bool(getattr(run_config, "trqn_under_move_retry", True)):
-        return False
-    if int(getattr(run_config, "trqn_under_move_retry_max", 1)) <= 0:
+    if int(_cfg_value(safety_config, "under_move_retry_max", 1)) <= 0:
         return False
     safety = payload.get("landing_safety", {}) if isinstance(payload, dict) else {}
     if bool(safety.get("accepted", False)):
@@ -1980,6 +2053,15 @@ def _live_optimise_seed(
         scale_model,
     )
     seed_alpha = float(acquisition.components(acquisition.seed_atoms).total)
+    convergence_resolution = resolve_ariadne_convergence(
+        run_config.convergence,
+        initial_acquisition_score=seed_alpha,
+        initial_trust_scale_ang=float(run_config.delta0),
+    )
+    run_config = replace(
+        run_config,
+        resolved_convergence=convergence_resolution,
+    )
 
     # AdversarialASECalculator subscripts the clamp counter as a dict
     # (per_atom_acquisition_grad key). a plain dict matches that contract exactly --
@@ -2019,6 +2101,9 @@ def _live_optimise_seed(
     )
     opt_result.diagnostics["trust_radius_resolution"] = dict(
         trust_radius_diagnostics
+    )
+    opt_result.diagnostics["convergence_resolution"] = dict(
+        convergence_resolution
     )
 
     raw_final_atoms = _make_ichor_from_positions(
@@ -2066,11 +2151,8 @@ def _live_optimise_seed(
             run_config,
             delta0=float(run_config.delta0) * float(trust_feedback_factor),
             delta_max=float(run_config.delta_max) * float(trust_feedback_factor),
-            trqn_target_initial_grad_rms=float(
-                getattr(run_config, "trqn_under_move_target_initial_grad_rms", 6.0e-4)
-            ),
+            trqn_target_initial_grad_rms=6.0e-4,
             trqn_scale_mode="adaptive_initial_gradient_rms",
-            trqn_under_move_retry_max=0,
         )
         opt_result_retry = run_optimisation_against_calculator(
             seed_atoms=seed_ase,
@@ -2117,11 +2199,14 @@ def _live_optimise_seed(
         opt_result_retry.diagnostics["trust_radius_resolution"] = dict(
             trust_radius_diagnostics
         )
+        opt_result_retry.diagnostics["convergence_resolution"] = dict(
+            convergence_resolution
+        )
         opt_result_retry.diagnostics["trust_radius_feedback"] = dict(
             trust_feedback
         )
         opt_result_retry.diagnostics["under_move_retry_target_grad_rms"] = float(
-            getattr(run_config, "trqn_under_move_target_initial_grad_rms", 6.0e-4)
+            6.0e-4
         )
         opt_result_retry.diagnostics["under_move_retry_succeeded"] = bool(
             landing_retry.get("landing_safety", {}).get("accepted", False)
@@ -2144,7 +2229,7 @@ def _live_optimise_seed(
     )
     optimiser_initial_origin = (
         str(opt_result.candidate_origins[0])
-        if opt_result.candidate_origins else "seed_fallback"
+        if opt_result.candidate_origins else "seed_initial"
     )
     warm_start_alpha_delta = (
         None if optimiser_initial_alpha is None
@@ -2675,21 +2760,7 @@ def main(argv=None) -> int:
         "audit_manifest_sha256": audit_manifest_sha256,
         "hidden_overrides_detected": list(resolved_protocol.hidden_overrides_detected),
     }
-    allow_seed_fallback = bool(
-        getattr(resolved_protocol.adversarial_safety, "allow_seed_fallback", False)
-    )
-    accept_legacy_missing_landing_safety = bool(
-        getattr(
-            resolved_protocol.adversarial_safety,
-            "accept_legacy_missing_landing_safety",
-            False,
-        )
-    )
-    usability = ariadne_result_usability_payload(
-        payload,
-        allow_seed_fallback=allow_seed_fallback,
-        accept_legacy_missing_landing_safety=accept_legacy_missing_landing_safety,
-    )
+    usability = ariadne_result_usability_payload(payload)
     payload["optimiser_converged"] = bool(usability["optimiser_converged"])
     payload["task_success"] = bool(usability["usable"])
     payload["task_success_reason"] = str(usability["reason"])

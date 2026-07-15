@@ -83,29 +83,24 @@ def test_removed_uniform_posterior_fallback_is_rejected():
 
 def test_adversarial_safety_defaults_roundtrip():
     cfg = CampaignConfig()
-    assert cfg.adversarial_safety.enabled is True
-    assert cfg.adversarial_safety.reject_unsafe_landings is True
+    assert cfg.adversarial_safety.salvage_safe_iterate is True
+    assert cfg.adversarial_safety.backtrack_to_safe_landing is True
     assert cfg.adversarial_safety.backtrack_points == 16
-    assert cfg.adversarial_safety.max_whitened_distance == pytest.approx(10.0)
+    assert cfg.adversarial_safety.under_move_retry is True
     payload = cfg.to_dict()
-    payload["adversarial_safety"]["max_whitened_distance"] = 7.5
+    payload["adversarial_safety"]["backtrack_points"] = 7
     loaded = CampaignConfig.from_dict(payload)
-    assert loaded.adversarial_safety.max_whitened_distance == pytest.approx(7.5)
+    assert loaded.adversarial_safety.backtrack_points == 7
 
 
 def test_adversarial_safety_validation_rejects_bad_values():
     payload = CampaignConfig().to_dict()
-    payload["adversarial_safety"]["enabled"] = "yes"
-    with pytest.raises(ConfigValidationError, match="adversarial_safety.enabled"):
+    payload["adversarial_safety"]["salvage_safe_iterate"] = "yes"
+    with pytest.raises(ConfigValidationError, match="salvage_safe_iterate"):
         CampaignConfig.from_dict(payload)
     payload = CampaignConfig().to_dict()
     payload["adversarial_safety"]["backtrack_points"] = 0
     with pytest.raises(ConfigValidationError, match="backtrack_points"):
-        CampaignConfig.from_dict(payload)
-    payload = CampaignConfig().to_dict()
-    payload["adversarial_safety"]["min_whitened_distance"] = 2.0
-    payload["adversarial_safety"]["max_whitened_distance"] = 2.0
-    with pytest.raises(ConfigValidationError, match="max_whitened_distance"):
         CampaignConfig.from_dict(payload)
 
 
@@ -164,7 +159,7 @@ def test_removed_driver_block_is_rejected():
 def test_to_ariadne_run_config_propagates_values():
     c = CampaignConfig()
     c.ariadne.max_iter = 350
-    c.ariadne.gradf_tol = 1.0e-5
+    c.ariadne.convergence.gradient_max_tolerance_per_ang = 1.0e-5
     c.ariadne.delta0 = 0.07
     c.ariadne.trqn_scale_mode = "fixed"
     c.ariadne.trqn_fixed_objective_scale = 0.25
@@ -179,7 +174,7 @@ def test_to_ariadne_run_config_propagates_values():
     c.ariadne.trqn_trust_min = 2.0e-4
     rc = c.to_ariadne_run_config()
     assert rc.max_iter == 350
-    assert rc.gradf_tol == pytest.approx(1.0e-5)
+    assert rc.convergence.gradient_max_tolerance_per_ang == pytest.approx(1.0e-5)
     assert rc.delta0 == pytest.approx(0.07)
     assert rc.trqn_scale_mode == "fixed"
     assert rc.trqn_fixed_objective_scale == pytest.approx(0.25)

@@ -75,6 +75,7 @@ class BackendAvailability:
     gaussian_verified: bool = False
     gaussian_probe_error: str = ""
     ariadne_probe_error: str = ""
+    ariadne_abi_probe: Optional[Dict[str, object]] = None
     pyferebus_probe_error: str = ""
 
     @property
@@ -212,6 +213,14 @@ def _probe_configured_python_details(
             "        results[label] = {'ok': False, 'error': type(exc).__name__ + ': ' + str(exc)[:300]}",
             "    else:",
             "        results[label] = {'ok': True, 'error': ''}",
+            "if results.get('ariadne', {}).get('ok'):",
+            "    try:",
+            "        ariadne = importlib.import_module('ariadne')",
+            "        probe_module = importlib.import_module('ichor.hpc.active_learning.acquisition.ariadne_abi')",
+            "        abi = probe_module.probe_ariadne_module(ariadne)",
+            "        results['ariadne']['abi'] = abi",
+            "    except Exception as exc:",
+            "        results['ariadne'] = {'ok': False, 'error': 'ABI probe failed: ' + type(exc).__name__ + ': ' + str(exc)[:300]}",
             "print(json.dumps({'executable': sys.executable, 'version': list(sys.version_info[:3]), 'modules': results}, sort_keys=True))",
         ]
     )
@@ -254,6 +263,8 @@ def _probe_configured_python_details(
                 "ok": bool(raw_status["ok"]),
                 "error": str(raw_status.get("error") or ""),
             }
+            if label == "ariadne" and isinstance(raw_status.get("abi"), dict):
+                parsed_status[label]["abi"] = dict(raw_status["abi"])
     except Exception as exc:
         return (
             False,
@@ -417,6 +428,11 @@ def check_backends() -> BackendAvailability:
         gaussian_verified=bool(gauss_ok),
         gaussian_probe_error=str(gaussian_probe_error),
         ariadne_probe_error=str(ariadne_status.get("error") or ""),
+        ariadne_abi_probe=(
+            dict(ariadne_status["abi"])
+            if isinstance(ariadne_status.get("abi"), dict)
+            else None
+        ),
         pyferebus_probe_error=str(pyferebus_status.get("error") or ""),
     )
 

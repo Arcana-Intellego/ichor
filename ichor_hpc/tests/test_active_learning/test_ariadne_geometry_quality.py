@@ -12,7 +12,14 @@ def test_ariadne_geometry_quality_records_finite_metrics():
         "final_coordinates": [[0.1, 0.0, 0.0], [1.0, 0.2, 0.0]],
     }
 
-    result = _ariadne_geometry_quality(payload, validated, SimpleNamespace())
+    result = _ariadne_geometry_quality(
+        payload,
+        validated,
+        SimpleNamespace(
+            ariadne_max_displacement_ang=1.25,
+            ariadne_min_pair_distance_ang=0.60,
+        ),
+    )
 
     assert result["accepted"] is True
     assert result["reasons"] == []

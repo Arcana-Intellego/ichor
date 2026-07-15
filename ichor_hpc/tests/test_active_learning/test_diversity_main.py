@@ -635,7 +635,6 @@ def test_phase_b_rejects_missing_landing_safety_even_with_stale_legacy_flag(tmp_
     cfg.phase_b.descriptor = "rmsd_massweight"
     cfg.point_allocation.batch_training_size = 1
     cfg.point_allocation.batch_internal_validation_size = 1
-    cfg.adversarial_safety.accept_legacy_missing_landing_safety = True
     cfg.to_yaml(campaign / "campaign.yaml")
 
     iter_dir = _active_iter(campaign)

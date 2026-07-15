@@ -156,6 +156,13 @@ def _seed_iter_pool(campaign_dir, iteration, results, *, config=None):
         payload["array_task_id"] = array_task_id
         payload["seed_frame_id"] = array_task_id
         payload.setdefault("trajectory_sha256", str(trajectory_pool.sha256))
+        seed_atoms = trajectory_pool.frame(array_task_id)
+        initial_coordinates = [
+            [float(atom.x), float(atom.y), float(atom.z)]
+            for atom in seed_atoms
+        ]
+        payload["initial_coordinates"] = [list(row) for row in initial_coordinates]
+        payload["seed_coordinates"] = [list(row) for row in initial_coordinates]
         payload.setdefault("task_success", True)
         payload.setdefault(
             "landing_safety",

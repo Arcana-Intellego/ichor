@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from .config import (
-    AdversarialSafetyConfigBlock,
     AntiOverlapConfigBlock,
     CampaignConfig,
     ErrorCalibrationConfigBlock,
@@ -58,6 +57,28 @@ class SamplingAggressivenessPolicy:
     bond_ratio_upper: float = 1.35
     angle_ratio_lower: float = 0.65
     angle_ratio_upper: float = 1.45
+
+
+@dataclass
+class ResolvedAdversarialSafety:
+    """Mandatory safety gates plus the public recovery controls."""
+
+    salvage_safe_iterate: bool
+    backtrack_to_safe_landing: bool
+    backtrack_points: int
+    under_move_retry: bool
+    under_move_retry_max: int
+    min_whitened_distance: float = 0.0
+    max_whitened_distance: float = 10.0
+    enforce_min_whitened_distance: bool = False
+    max_predicted_energy_delta_ha: Optional[float] = None
+    max_energy_variance: Optional[float] = None
+    max_chemistry_penalty: Optional[float] = None
+    enforce_movement_band: bool = True
+    reject_over_moved: bool = True
+    reject_unsafe_landings: bool = True
+    allow_seed_fallback: bool = False
+    phase_b_filter_enabled: bool = True
 
 
 _POLICIES: Dict[int, SamplingAggressivenessPolicy] = {
@@ -205,23 +226,18 @@ def _effective_campaign_config(
     )
     effective.acquisition = copy.deepcopy(config.acquisition)
     effective.ariadne = copy.deepcopy(config.ariadne)
-    effective.adversarial_safety = AdversarialSafetyConfigBlock(
-        enabled=True,
-        reject_unsafe_landings=True,
+    effective.adversarial_safety = ResolvedAdversarialSafety(
         salvage_safe_iterate=bool(config.adversarial_safety.salvage_safe_iterate),
         backtrack_to_safe_landing=bool(
             config.adversarial_safety.backtrack_to_safe_landing
         ),
         backtrack_points=int(config.adversarial_safety.backtrack_points),
-        allow_seed_fallback=False,
-        accept_legacy_missing_landing_safety=False,
+        under_move_retry=bool(config.adversarial_safety.under_move_retry),
+        under_move_retry_max=int(config.adversarial_safety.under_move_retry_max),
         min_whitened_distance=0.0,
         max_whitened_distance=float(policy.max_whitened_distance),
         enforce_min_whitened_distance=False,
-        phase_b_filter_enabled=True,
         enforce_movement_band=True,
-        under_move_retry=bool(config.adversarial_safety.under_move_retry),
-        reject_under_moved_after_retry=True,
         reject_over_moved=True,
     )
 
@@ -514,9 +530,7 @@ def _resolved_manifest_payload(resolved: ResolvedSamplingProtocol) -> Dict[str, 
             "delta_max": float(resolved.ariadne_run_config.delta_max),
             "trqn_target_initial_grad_rms": float(resolved.ariadne_run_config.trqn_target_initial_grad_rms),
             "trqn_retry_target_initial_grad_rms": float(resolved.ariadne_run_config.trqn_retry_target_initial_grad_rms),
-            "trqn_under_move_target_initial_grad_rms": float(
-                resolved.ariadne_run_config.trqn_under_move_target_initial_grad_rms
-            ),
+            "under_move_retry_target_initial_grad_rms": 6.0e-4,
         },
         "hard_safety_rails": {
             "reject_unsafe_landings": True,

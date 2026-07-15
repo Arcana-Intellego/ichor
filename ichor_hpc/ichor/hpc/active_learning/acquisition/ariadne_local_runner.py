@@ -24,6 +24,7 @@ from __future__ import annotations
 from ..strict_json import strict_json as json
 import time
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -33,6 +34,7 @@ from .gradient_diagnostics import (
     calculator_gradient_diagnostics,
     flatten_trace_gradient_diagnostics,
 )
+from .ariadne_abi import DS_STATUS_LENGTH, TRQN_STATUS_LENGTH, probe_ariadne_module
 from .pseudo_units import hartree_ev
 
 
@@ -136,6 +138,7 @@ _TRQN_STATUS_PREVIOUS_CYCLE_WAS_REBUILD_SKIP = 71
 _TRQN_STATUS_FULLSTEP_BORKED_LAST = 72
 _TRQN_STATUS_FINAL_BORKED_LAST = 73
 _TRQN_STATUS_FINAL_SOLUTION_KIND_LAST = 74
+_DS_STATUS_PROPOSAL_PENDING = 7
 
 _TRQN_INVALID_REASON_LABELS = {
     0: "none",
@@ -207,7 +210,7 @@ def _json_safe_status(status) -> List[Any]:
 
 def _new_optimiser_diagnostics(optimiser_name: str) -> Dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "optimiser_initial": str(optimiser_name),
         "optimiser_final": str(optimiser_name),
         "n_stage0_calls": 0,
@@ -223,6 +226,10 @@ def _new_optimiser_diagnostics(optimiser_name: str) -> Dict[str, Any]:
         "n_accepted_steps": 0,
         "n_rejected_steps": 0,
         "n_fallback_to_ds": 0,
+        "daemon_convergence_streak": 0,
+        "daemon_convergence_last_metrics": None,
+        "daemon_convergence_last_checks": None,
+        "termination_source": None,
         "ds_init_profile": None,
         "last_return_code_reason": "not_finished",
         "last_no_proposal_reason": None,
@@ -230,6 +237,86 @@ def _new_optimiser_diagnostics(optimiser_name: str) -> Dict[str, Any]:
         "status_samples_first": [],
         "status_samples_last": [],
     }
+
+
+def _resolved_convergence(run_config) -> Dict[str, Any]:
+    payload = getattr(run_config, "resolved_convergence", None)
+    if isinstance(payload, dict):
+        return payload
+    convergence = getattr(run_config, "convergence", None)
+    if str(getattr(convergence, "mode", "fixed")).strip().lower() != "fixed":
+        raise RuntimeError(
+            "scale-adaptive ARIADNE convergence requires frozen seed-scale evidence"
+        )
+    from .ariadne_runner import resolve_ariadne_convergence
+
+    return resolve_ariadne_convergence(
+        convergence,
+        initial_acquisition_score=0.0,
+        initial_trust_scale_ang=float(run_config.delta0),
+    )
+
+
+def _convergence_metrics(
+    *,
+    f_old: float,
+    f_current: float,
+    gradient_current,
+    positions_before: np.ndarray,
+    positions_current: np.ndarray,
+    objective_scale: float,
+) -> Dict[str, float]:
+    scale = float(objective_scale)
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise RuntimeError("objective scale is invalid during convergence evaluation")
+    gradient = np.asarray(gradient_current, dtype=np.float64).reshape(-1) / scale
+    step = np.asarray(positions_current, dtype=np.float64) - np.asarray(
+        positions_before, dtype=np.float64
+    )
+    if not np.isfinite(gradient).all() or not np.isfinite(step).all():
+        raise RuntimeError("non-finite state reached ARIADNE convergence evaluation")
+    return {
+        "objective_change": abs(float(f_current) - float(f_old)) / scale,
+        "gradient_rms_per_ang": float(np.sqrt(np.mean(np.square(gradient)))),
+        "gradient_max_per_ang": float(np.max(np.abs(gradient))),
+        "step_rms_ang": float(np.sqrt(np.mean(np.square(step)))),
+        "step_max_ang": float(np.max(np.abs(step))),
+    }
+
+
+def _convergence_checks(
+    metrics: Dict[str, float],
+    resolution: Dict[str, Any],
+) -> Dict[str, bool]:
+    thresholds = resolution.get("effective_thresholds")
+    if not isinstance(thresholds, dict):
+        raise RuntimeError("ARIADNE convergence thresholds are missing")
+    mapping = {
+        "objective_change": "objective_change_tolerance",
+        "gradient_rms_per_ang": "gradient_rms_tolerance_per_ang",
+        "gradient_max_per_ang": "gradient_max_tolerance_per_ang",
+        "step_rms_ang": "step_rms_tolerance_ang",
+        "step_max_ang": "step_max_tolerance_ang",
+    }
+    return {
+        metric: bool(float(metrics[metric]) <= float(thresholds[threshold]))
+        for metric, threshold in mapping.items()
+    }
+
+
+def _advance_convergence_streak(
+    current: int,
+    *,
+    accepted: bool,
+    checks: Optional[Dict[str, bool]] = None,
+) -> int:
+    """Advance only after an accepted step satisfying every criterion."""
+
+    if not accepted:
+        return 0
+    if not checks:
+        raise RuntimeError("accepted ARIADNE step is missing convergence checks")
+    return int(current) + 1 if all(bool(value) for value in checks.values()) else 0
 
 
 def _trqn_backtransform_mode(run_config) -> str:
@@ -300,6 +387,36 @@ def _status_bool(status, index: int, default: bool = False) -> bool:
     if value is None:
         return default
     return bool(value)
+
+
+def _strict_status_flag(status, index: int, label: str) -> bool:
+    if status is None or len(status) <= int(index):
+        raise RuntimeError("ARIADNE status is missing " + label)
+    value = status[int(index)]
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError("ARIADNE status flag " + label + " is not integer 0/1") from exc
+    if parsed not in (0, 1):
+        raise RuntimeError("ARIADNE status flag " + label + " is not integer 0/1")
+    return bool(parsed)
+
+
+def _validate_status_shape(status, *, optimiser: str) -> tuple:
+    values = tuple(status or ())
+    expected = TRQN_STATUS_LENGTH if optimiser == "trqn" else DS_STATUS_LENGTH
+    if len(values) != expected:
+        raise RuntimeError(
+            "ARIADNE "
+            + optimiser.upper()
+            + " status ABI mismatch: expected "
+            + str(expected)
+            + " values, received "
+            + str(len(values))
+        )
+    return values
 
 
 def _trqn_status_summary(status) -> Dict[str, Any]:
@@ -443,6 +560,10 @@ def _finalise_optimiser_diagnostics(
 ) -> None:
     diagnostics["return_code"] = int(return_code)
     diagnostics["converged"] = bool(converged)
+    if diagnostics.get("termination_source") is None:
+        diagnostics["termination_source"] = (
+            "max_iterations" if int(return_code) == 1 else "optimiser_error"
+        )
     if str(diagnostics.get("last_return_code_reason")) != "not_finished":
         return
     if int(return_code) == 0:
@@ -469,6 +590,10 @@ def _import_ariadne():
             "ARIADNE Python module not importable. Build the oneAPI .so "
             "and prepend build-oneapi/python to PYTHONPATH."
         ) from exc
+    try:
+        probe_ariadne_module(ariadne)
+    except Exception as exc:
+        raise RuntimeError("ARIADNE Python wrapper ABI is incompatible: " + str(exc)) from exc
     return ariadne
 
 
@@ -529,11 +654,11 @@ def _eval_energy_gradient(atoms, *, objective_scale: float = 1.0):
     )
     g_flat_hartree = _flatten_xyz(g_xyz_hartree)
     if not np.isfinite(e_hartree):
-        raise RuntimeError(
+        raise NonFiniteCalculatorOutput(
             "calculator returned non-finite pseudo-energy"
         )
     if not np.isfinite(g_flat_hartree).all():
-        raise RuntimeError(
+        raise NonFiniteCalculatorOutput(
             "calculator returned non-finite entries in the gradient"
         )
     return e_hartree, g_flat_hartree
@@ -636,18 +761,17 @@ def _compute_trqn_objective_scale(
             reason = "adaptive_initial_gradient"
     else:
         target_kind = "rms"
-        attr = (
-            "trqn_under_move_target_initial_grad_rms"
-            if under_move_retry
-            else (
+        if under_move_retry:
+            target = 6.0e-4
+        else:
+            attr = (
                 "trqn_retry_target_initial_grad_rms"
                 if retry else "trqn_target_initial_grad_rms"
             )
-        )
-        try:
-            target = float(getattr(run_config, attr))
-        except (TypeError, ValueError):
-            target = 6.0e-4 if under_move_retry else (4.0e-4 if retry else 2.0e-4)
+            try:
+                target = float(getattr(run_config, attr))
+            except (TypeError, ValueError):
+                target = 4.0e-4 if retry else 2.0e-4
         if not np.isfinite(target) or target <= 0.0:
             target = 6.0e-4 if under_move_retry else (4.0e-4 if retry else 2.0e-4)
         if raw_flat is not None and atoms is not None:
@@ -736,10 +860,12 @@ def _status_trqn(opt):
     The TRQN get_status_py tuple from the starter pack has f_current at
     index 1, converged at index 4 and last_step_accepted at index 5.
     """
-    status = opt.get_status_py()
-    converged = bool(status[4])
-    accepted = bool(status[5])
+    status = _validate_status_shape(opt.get_status_py(), optimiser="trqn")
+    converged = _strict_status_flag(status, 4, "TRQN converged")
+    accepted = _strict_status_flag(status, 5, "TRQN last_step_accepted")
     f_current = float(status[1])
+    if not np.isfinite(f_current):
+        raise RuntimeError("ARIADNE TRQN status returned non-finite f_current")
     return converged, accepted, f_current
 
 
@@ -749,18 +875,17 @@ def _status_ds(opt):
     DS get_status_py layout has f_current at index 2, converged at
     index 8 and last_step_accepted at index 9.
     """
-    status = opt.get_status_py()
-    converged = bool(status[8])
-    accepted = bool(status[9])
+    status = _validate_status_shape(opt.get_status_py(), optimiser="ds")
+    converged = _strict_status_flag(status, 8, "DS converged")
+    accepted = _strict_status_flag(status, 9, "DS last_step_accepted")
     f_current = float(status[2])
+    if not np.isfinite(f_current):
+        raise RuntimeError("ARIADNE DS status returned non-finite f_current")
     return converged, accepted, f_current
 
 
 def _status_tuple(opt):
-    try:
-        return tuple(opt.get_status_py())
-    except Exception:
-        return ()
+    return tuple(opt.get_status_py())
 
 
 def _optimizer_flag(opt, name: str):
@@ -776,7 +901,9 @@ def _optimizer_flag(opt, name: str):
 
 def _raise_if_init_failed(opt, label: str) -> None:
     init_ok = _optimizer_flag(opt, "init_ok")
-    if init_ok is not None and not bool(init_ok):
+    if init_ok is not None:
+        init_ok = _strict_status_flag((init_ok,), 0, label + " init_ok")
+    if init_ok is not None and not init_ok:
         reason = _optimizer_flag(opt, "last_config_error_msg")
         if reason is None:
             reason = _optimizer_flag(opt, "init_reason")
@@ -790,18 +917,29 @@ def _raise_if_init_failed(opt, label: str) -> None:
         )
 
 
-def _proposal_pending(opt, status) -> bool:
+def _proposal_pending(opt, status, *, is_trqn: bool) -> bool:
     value = _optimizer_flag(opt, "proposal_pending")
     if value is not None:
-        return bool(value)
-    return _status_bool(status, _TRQN_STATUS_PROPOSAL_PENDING, True)
+        return _strict_status_flag((value,), 0, "proposal_pending")
+    index = (
+        _TRQN_STATUS_PROPOSAL_PENDING
+        if is_trqn
+        else _DS_STATUS_PROPOSAL_PENDING
+    )
+    return _strict_status_flag(status, index, "proposal_pending")
 
 
-def _skip_step_after_rebuild(opt, status) -> bool:
+def _skip_step_after_rebuild(opt, status, *, is_trqn: bool) -> bool:
+    if not is_trqn:
+        return False
     value = _optimizer_flag(opt, "skip_step_after_rebuild")
     if value is not None:
-        return bool(value)
-    return _status_bool(status, _TRQN_STATUS_SKIP_STEP_AFTER_REBUILD, False)
+        return _strict_status_flag((value,), 0, "skip_step_after_rebuild")
+    return _strict_status_flag(
+        status,
+        _TRQN_STATUS_SKIP_STEP_AFTER_REBUILD,
+        "skip_step_after_rebuild",
+    )
 
 
 def _trqn_no_proposal_failure_reason(status) -> Optional[str]:
@@ -842,6 +980,28 @@ _TRIAL_REASON_CODES = {
     "py_geometry_guard": 9,
     "calc_nonfinite_output": 10,
 }
+
+
+class InvalidTrialReason(Enum):
+    CALCULATOR_EXCEPTION = "calc_exception"
+    CALCULATOR_NONCONVERGED = "calc_nonconverged"
+    PYTHON_GEOMETRY_GUARD = "py_geometry_guard"
+    CALCULATOR_NONFINITE_OUTPUT = "calc_nonfinite_output"
+
+
+class NonFiniteCalculatorOutput(RuntimeError):
+    """Calculator completed but returned a non-finite objective or gradient."""
+
+
+def _classify_trial_exception(exc: BaseException) -> InvalidTrialReason:
+    if isinstance(exc, NonFiniteCalculatorOutput):
+        return InvalidTrialReason.CALCULATOR_NONFINITE_OUTPUT
+    label = (type(exc).__name__ + " " + str(exc)).lower()
+    if "nonconverg" in label:
+        return InvalidTrialReason.CALCULATOR_NONCONVERGED
+    if "geometry" in label and ("guard" in label or "unsafe" in label):
+        return InvalidTrialReason.PYTHON_GEOMETRY_GUARD
+    return InvalidTrialReason.CALCULATOR_EXCEPTION
 
 _DS_INIT_PROFILE = "daemon_safe_v1"
 
@@ -1023,12 +1183,14 @@ def _ds_safe_init_kwargs(run_config) -> Dict[str, Any]:
     gamma_max = max(5.0e1, gamma)
     finish_gmax_trigger = 1.0e-3
     finish_small_gmax_cap = 5.0e-3
+    convergence = _resolved_convergence(run_config)
+    thresholds = convergence["effective_thresholds"]
 
     kwargs: Dict[str, Any] = {
         "gamma": gamma,
         "h": h,
-        "f_tol": float(run_config.f_tol),
-        "gradf_tol": float(run_config.gradf_tol),
+        "f_tol": float(thresholds["objective_change_tolerance"]),
+        "gradf_tol": float(thresholds["gradient_max_tolerance_per_ang"]),
         "hessian_model": _ds_hessian_model_name(run_config.hessian_model),
         "auto_params": False,
         "use_nonzero_p0": False,
@@ -1408,12 +1570,12 @@ def _validate_ds_init_kwargs(kwargs: Dict[str, Any]) -> None:
         raise ValueError("invalid DS init defaults: " + "; ".join(failures))
 
 
-def _set_invalid_trial_reason(opt, reason: str) -> None:
+def _set_invalid_trial_reason(opt, reason: InvalidTrialReason) -> None:
     setter = getattr(opt, "set_invalid_trial_reason_py", None)
     if setter is None:
         return
     try:
-        setter(int(_TRIAL_REASON_CODES.get(str(reason), 7)))
+        setter(int(_TRIAL_REASON_CODES[reason.value]))
     except Exception:
         return
 
@@ -1452,7 +1614,7 @@ def _restart_under_ds(ariadne, atoms, natoms, atom_list, run_config):
     # Re-evaluate at the exact geometry DS will restart from. Gradients from a
     # rejected TRQN proposal or a failed backtransform do not belong to this
     # point and should not be re-used.
-    _f_here, g_here = _eval_energy_gradient(atoms)
+    f_here, g_here = _eval_energy_gradient(atoms)
     opt = _build_ds(
         ariadne,
         np.asfortranarray(atoms.get_positions(), dtype=np.float64),
@@ -1461,7 +1623,7 @@ def _restart_under_ds(ariadne, atoms, natoms, atom_list, run_config):
         run_config,
     )
     _raise_if_init_failed(opt, "DS")
-    return opt
+    return opt, float(f_here), _flatten_xyz(g_here)
 
 
 def run_optimisation_against_calculator(
@@ -1470,7 +1632,7 @@ def run_optimisation_against_calculator(
     run_config,
     trace_path=None,
     initial_positions_angstrom=None,
-    initial_origin: str = "seed_fallback",
+    initial_origin: str = "seed_initial",
     warm_start_records=None,
 ):
     """Drive ARIADNE for a single seed against the supplied calculator.
@@ -1485,8 +1647,7 @@ def run_optimisation_against_calculator(
         is AdversarialASECalculator wrapping SeedLocalAdversarialAcquisition
         built for this seed.
     run_config
-        AriadneRunConfig: which optimiser, max_iter, gradf_tol, f_tol,
-        delta0, delta_max, gamma, fallback_to_ds, hessian_model.
+        AriadneRunConfig: optimiser controls plus a frozen convergence policy.
 
     Returns
     -------
@@ -1509,6 +1670,8 @@ def run_optimisation_against_calculator(
 
     optimiser_name = (run_config.optimiser or "trust_region_qn").strip().lower()
     diagnostics = _new_optimiser_diagnostics(optimiser_name)
+    convergence_resolution = _resolved_convergence(run_config)
+    diagnostics["convergence_resolution"] = dict(convergence_resolution)
     warm_start_records = list(warm_start_records or [])
 
     # one calculator call before the loop -- ariadne needs an initial
@@ -1627,11 +1790,12 @@ def run_optimisation_against_calculator(
     candidate_positions = [np.asarray(q0_xyz_angstrom, dtype=np.float64).copy()]
     candidate_alphas = [float(alpha_trajectory[0])]
     candidate_grad_norms = [float(grad_norm_trajectory[0])]
-    candidate_origins = [str(initial_origin or "seed_fallback")]
+    candidate_origins = [str(initial_origin or "seed_initial")]
     fell_back_to_ds = False
     trqn_retry_attempted = False
     rigid_force_clamps = 0
     consecutive_rejects = 0
+    convergence_streak = 0
     no_proposal_failure_reason: Optional[str] = None
     f_current = e0_hartree
     converged = False
@@ -1641,6 +1805,9 @@ def run_optimisation_against_calculator(
 
     for step_idx in range(int(run_config.max_iter)):
         f_old = f_current
+        positions_before_step = np.asarray(
+            atoms.get_positions(), dtype=np.float64
+        ).copy()
 
         # stage 0 -- propose a step. ariadne does not need a trial
         # energy yet so we pass the previous f and a zero gradient.
@@ -1655,15 +1822,33 @@ def run_optimisation_against_calculator(
                 "stage0_exception:" + type(exc).__name__
             )
             break
-        status_after_stage0 = _status_tuple(opt)
+        try:
+            status_after_stage0 = _validate_status_shape(
+                _status_tuple(opt),
+                optimiser="trqn" if is_trqn else "ds",
+            )
+        except Exception as exc:
+            return_code = 2
+            diagnostics["last_return_code_reason"] = (
+                "status_abi_mismatch:" + type(exc).__name__ + ":" + str(exc)
+            )
+            break
         _append_status_sample(
             diagnostics,
             step_index=step_idx,
             label="after_stage0",
             status=status_after_stage0,
         )
-        proposal_pending = _proposal_pending(opt, status_after_stage0)
-        skip_after_rebuild = _skip_step_after_rebuild(opt, status_after_stage0)
+        proposal_pending = _proposal_pending(
+            opt,
+            status_after_stage0,
+            is_trqn=is_trqn,
+        )
+        skip_after_rebuild = _skip_step_after_rebuild(
+            opt,
+            status_after_stage0,
+            is_trqn=is_trqn,
+        )
         no_proposal_failure_reason = None
         if (
             is_trqn
@@ -1677,6 +1862,8 @@ def run_optimisation_against_calculator(
             not proposal_pending
             or skip_after_rebuild
         ):
+            convergence_streak = 0
+            diagnostics["daemon_convergence_streak"] = 0
             if not proposal_pending:
                 diagnostics["n_no_proposal_pending"] += 1
             if skip_after_rebuild:
@@ -1735,6 +1922,7 @@ def run_optimisation_against_calculator(
             if opt_converged:
                 converged = True
                 return_code = 0
+                diagnostics["termination_source"] = "native_optimiser"
                 break
             if no_proposal_failure_reason is not None:
                 _record_no_proposal_failure(
@@ -1837,7 +2025,7 @@ def run_optimisation_against_calculator(
                     ):
                         try:
                             fallback_from_scale = float(active_objective_scale)
-                            opt = _restart_under_ds(
+                            opt, f_current, g_current_flat = _restart_under_ds(
                                 ariadne,
                                 atoms,
                                 natoms,
@@ -1885,13 +2073,14 @@ def run_optimisation_against_calculator(
                                 optimiser="dissipative_symplectic",
                                 alpha=_raw_alpha_from_scaled(
                                     f_current,
-                                    fallback_from_scale,
+                                    active_objective_scale,
                                 ),
                                 grad_norm=_raw_grad_norm_from_scaled(
-                                    g_current,
-                                    fallback_from_scale,
+                                    g_current_flat,
+                                    active_objective_scale,
                                 ),
-                                objective_scale=float(fallback_from_scale),
+                                objective_scale=float(active_objective_scale),
+                                previous_objective_scale=float(fallback_from_scale),
                                 accepted=False,
                                 reason=str(no_proposal_failure_reason),
                                 wall_seconds=float(time.perf_counter() - t0),
@@ -1923,17 +2112,19 @@ def run_optimisation_against_calculator(
             n_evaluations += 1
             diagnostics["n_trial_evaluations"] += 1
         except Exception as exc:
-            _set_invalid_trial_reason(opt, type(exc).__name__ + ": " + str(exc))
+            invalid_reason = _classify_trial_exception(exc)
+            _set_invalid_trial_reason(opt, invalid_reason)
+            diagnostics["last_invalid_trial_reason"] = invalid_reason.value
+            diagnostics["last_invalid_trial_reason_code"] = int(
+                _TRIAL_REASON_CODES[invalid_reason.value]
+            )
             try:
-                _q_current, g_current = _sync_state(opt, natoms)
-                if not np.isfinite(g_current).all():
-                    g_current = zero_grad
                 diagnostics["n_stage1_calls"] += 1
                 opt.step_py(
                     stage=1,
                     f_old=f_old,
-                    f_new=f_old,
-                    g_xyz_new=_flatten_xyz(g_current),
+                    f_new=0.0,
+                    g_xyz_new=zero_grad,
                 )
             except Exception:
                 pass
@@ -1964,7 +2155,7 @@ def run_optimisation_against_calculator(
             status=_status_tuple(opt),
         )
 
-        q_current, _g_current = _sync_state(opt, natoms)
+        q_current, g_current = _sync_state(opt, natoms)
         _push_positions(atoms, q_current)
 
         if is_trqn:
@@ -1975,8 +2166,16 @@ def run_optimisation_against_calculator(
         alpha_trajectory.append(
             _raw_alpha_from_scaled(f_current, active_objective_scale)
         )
+        current_grad_norm = _raw_grad_norm_from_scaled(
+            g_current,
+            active_objective_scale,
+        )
+        trial_grad_norm = _raw_grad_norm_from_scaled(
+            g_trial,
+            active_objective_scale,
+        )
         grad_norm_trajectory.append(
-            _raw_grad_norm_from_scaled(g_trial, active_objective_scale)
+            current_grad_norm
         )
 
         if accepted:
@@ -1986,13 +2185,18 @@ def run_optimisation_against_calculator(
                 np.asarray(atoms.get_positions(), dtype=np.float64).copy()
             )
             candidate_alphas.append(float(alpha_trajectory[-1]))
-            candidate_grad_norms.append(float(grad_norm_trajectory[-1]))
+            candidate_grad_norms.append(float(current_grad_norm))
             candidate_origins.append("accepted_iterate")
             if bool(diagnostics.get("trqn_retry_attempted")) and is_trqn:
                 diagnostics["trqn_retry_succeeded"] = True
         else:
             diagnostics["n_rejected_steps"] += 1
             consecutive_rejects += 1
+            convergence_streak = _advance_convergence_streak(
+                convergence_streak,
+                accepted=False,
+            )
+            diagnostics["daemon_convergence_streak"] = 0
         _append_trace_event_with_gradient(
             trace_path,
             calculator,
@@ -2000,7 +2204,9 @@ def run_optimisation_against_calculator(
             step=step_idx,
             optimiser=("trust_region_qn" if is_trqn else "dissipative_symplectic"),
             alpha=_raw_alpha_from_scaled(f_current, active_objective_scale),
-            grad_norm=_raw_grad_norm_from_scaled(g_trial, active_objective_scale),
+            grad_norm=float(current_grad_norm),
+            trial_alpha=_raw_alpha_from_scaled(f_trial, active_objective_scale),
+            trial_grad_norm=float(trial_grad_norm),
             objective_scale=float(active_objective_scale),
             accepted=bool(accepted),
             wall_seconds=float(time.perf_counter() - t0),
@@ -2009,14 +2215,54 @@ def run_optimisation_against_calculator(
         if opt_converged:
             converged = True
             return_code = 0
+            diagnostics["termination_source"] = "native_optimiser"
             break
 
-        # also honour the daemon-side gradf_tol -- ariadne internal
-        # convergence is conservative and the daemon may want tighter.
-        if accepted and grad_norm_trajectory[-1] < float(run_config.gradf_tol):
-            converged = True
-            return_code = 0
-            break
+        if accepted:
+            try:
+                convergence_metrics = _convergence_metrics(
+                    f_old=f_old,
+                    f_current=f_current,
+                    gradient_current=g_current,
+                    positions_before=positions_before_step,
+                    positions_current=q_current,
+                    objective_scale=active_objective_scale,
+                )
+                convergence_checks = _convergence_checks(
+                    convergence_metrics,
+                    convergence_resolution,
+                )
+            except Exception as exc:
+                return_code = 2
+                diagnostics["last_return_code_reason"] = (
+                    "convergence_evaluation_failed:"
+                    + type(exc).__name__
+                    + ":"
+                    + str(exc)
+                )
+                break
+            convergence_streak = _advance_convergence_streak(
+                convergence_streak,
+                accepted=True,
+                checks=convergence_checks,
+            )
+            diagnostics["daemon_convergence_streak"] = int(convergence_streak)
+            diagnostics["daemon_convergence_last_metrics"] = dict(
+                convergence_metrics
+            )
+            diagnostics["daemon_convergence_last_checks"] = dict(
+                convergence_checks
+            )
+            if convergence_streak >= int(
+                convergence_resolution["consecutive_accepted_steps"]
+            ):
+                converged = True
+                return_code = 0
+                diagnostics["termination_source"] = "daemon_five_criterion"
+                diagnostics["last_return_code_reason"] = (
+                    "daemon_five_criterion_converged"
+                )
+                break
 
         # TRQN -> DS fallback. when too many consecutive proposals
         # get rejected and the config allows it, abandon TRQN and
@@ -2027,7 +2273,7 @@ def run_optimisation_against_calculator(
             and consecutive_rejects >= _REJECT_STREAK_TRIGGER):
             try:
                 fallback_from_scale = float(active_objective_scale)
-                opt = _restart_under_ds(
+                opt, f_current, g_current_flat = _restart_under_ds(
                     ariadne,
                     atoms,
                     natoms,
@@ -2054,9 +2300,13 @@ def run_optimisation_against_calculator(
                     event="fallback_to_ds",
                     step=step_idx,
                     optimiser="dissipative_symplectic",
-                    alpha=_raw_alpha_from_scaled(f_current, fallback_from_scale),
-                    grad_norm=float(grad_norm_trajectory[-1]),
-                    objective_scale=float(fallback_from_scale),
+                    alpha=_raw_alpha_from_scaled(f_current, active_objective_scale),
+                    grad_norm=_raw_grad_norm_from_scaled(
+                        g_current_flat,
+                        active_objective_scale,
+                    ),
+                    objective_scale=float(active_objective_scale),
+                    previous_objective_scale=float(fallback_from_scale),
                     accepted=False,
                     reason="reject_streak",
                     wall_seconds=float(time.perf_counter() - t0),

@@ -291,7 +291,6 @@ def _require_ariadne_results(
         iteration_dir(campaign, iteration),
         expected_iteration=int(iteration),
         require_nonempty=True,
-        accept_legacy_missing_landing_safety=False,
     )
     config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
     read_ariadne_batch_decision(

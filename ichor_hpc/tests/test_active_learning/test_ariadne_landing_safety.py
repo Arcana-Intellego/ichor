@@ -93,12 +93,9 @@ class _FakeAcquisition:
 
 def _safety(**overrides):
     values = {
-        "enabled": True,
-        "reject_unsafe_landings": True,
         "salvage_safe_iterate": True,
         "backtrack_to_safe_landing": True,
         "backtrack_points": 4,
-        "allow_seed_fallback": False,
         "min_whitened_distance": 0.0,
         "max_whitened_distance": 10.0,
         "enforce_min_whitened_distance": False,
@@ -129,8 +126,8 @@ def _select(raw_x, candidate_xs, safety, origins=None, initial_x=0.0, scale_mode
         alpha_trajectory=[float(initial_x), float(raw_x)],
         safety_config=safety,
         quality_gates=SimpleNamespace(
-            ariadne_max_displacement_ang=None,
-            ariadne_min_pair_distance_ang=None,
+            ariadne_max_displacement_ang=10.0,
+            ariadne_min_pair_distance_ang=0.60,
         ),
         scale_model=scale_model,
     )
@@ -141,6 +138,47 @@ def test_safe_raw_final_selected_unchanged():
     assert out["landing_safety"]["accepted"] is True
     assert out["landing_safety"]["policy"] == "raw_final"
     assert np.asarray(out["selected_atoms"].coordinates)[0, 0] == 1.0
+
+
+def test_raw_final_duplicate_keeps_authoritative_raw_label():
+    out = _select(
+        raw_x=1.0,
+        candidate_xs=[1.0],
+        safety=_safety(),
+        origins=["seed_initial", "accepted_iterate"],
+    )
+
+    safety = out["landing_safety"]
+    assert safety["accepted"] is True
+    assert safety["policy"] == "raw_final"
+    assert safety["selected_origin"] == "raw_final"
+    assert safety["raw_final"]["origin"] == "raw_final"
+    assert safety["raw_final"]["metrics"]["coordinate_equivalent_origins"] == [
+        "accepted_iterate",
+        "raw_final",
+    ]
+
+
+def test_whitened_distance_failure_rejects_landing(monkeypatch):
+    import ichor.core.adversarial.subspace as subspace
+
+    monkeypatch.setattr(
+        subspace,
+        "whitened_distance_squared",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("broken covariance")),
+    )
+
+    out = _select(
+        raw_x=1.0,
+        candidate_xs=[],
+        safety=_safety(backtrack_to_safe_landing=False),
+    )
+
+    assert out["landing_safety"]["accepted"] is False
+    assert (
+        "ariadne_landing_whitened_distance_unavailable"
+        in out["landing_safety"]["raw_final"]["reasons"]
+    )
 
 
 def test_unsafe_raw_final_salvages_safe_iterate():
@@ -195,7 +233,7 @@ def test_seed_equivalent_raw_final_rejects_when_seed_fallback_disabled():
     assert safety["raw_final"]["metrics"]["seed_equivalent"] is True
 
 
-def test_seed_equivalent_raw_final_accepts_only_when_seed_fallback_enabled():
+def test_seed_equivalent_raw_final_rejects_even_with_legacy_seed_fallback_flag():
     out = _select(
         raw_x=0.0,
         candidate_xs=[],
@@ -203,11 +241,10 @@ def test_seed_equivalent_raw_final_accepts_only_when_seed_fallback_enabled():
     )
 
     safety = out["landing_safety"]
-    assert safety["accepted"] is True
-    assert safety["policy"] == "seed_fallback"
-    assert safety["selected_origin"] == "seed_fallback"
-    assert "ariadne_landing_is_seed" in safety["record_only_reasons"]
-    assert safety["metrics"]["seed_equivalent"] is True
+    assert safety["accepted"] is False
+    assert safety["policy"] == "unsafe_raw_final"
+    assert "no_safe_non_seed_landing" in safety["reasons"]
+    assert "seed_fallback_disabled" in safety["reasons"]
 
 
 def test_safe_geometry_with_lower_alpha_is_rejected():
@@ -264,7 +301,7 @@ def test_dimensionless_scale_gate_rejects_over_scaled_atom_move():
     assert safety["raw_final"]["metrics"]["max_per_atom_mobility_ratio"] == pytest.approx(5.0)
 
 
-def test_lower_alpha_raw_final_can_only_fall_back_to_seed_explicitly():
+def test_lower_alpha_raw_final_cannot_fall_back_to_seed():
     out = _select(
         raw_x=-1.0,
         candidate_xs=[],
@@ -275,10 +312,8 @@ def test_lower_alpha_raw_final_can_only_fall_back_to_seed_explicitly():
     )
 
     safety = out["landing_safety"]
-    assert safety["accepted"] is True
-    assert safety["policy"] == "seed_fallback"
-    assert safety["selected_origin"] == "seed_fallback"
-    assert np.asarray(out["selected_atoms"].coordinates)[0, 0] == 0.0
+    assert safety["accepted"] is False
+    assert safety["policy"] == "unsafe_raw_final"
     assert safety["raw_final"]["accepted"] is False
     assert (
         "ariadne_landing_acquisition_not_improved"
@@ -311,8 +346,8 @@ def test_safe_gradient_band_warm_start_skips_under_moved_probe():
         seed_atoms=seed,
         safety_config=_safety(),
         quality_gates=SimpleNamespace(
-            ariadne_max_displacement_ang=None,
-            ariadne_min_pair_distance_ang=None,
+            ariadne_max_displacement_ang=10.0,
+            ariadne_min_pair_distance_ang=0.60,
         ),
     )
 

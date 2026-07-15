@@ -15,20 +15,31 @@ from ichor.hpc.active_learning.acquisition.ariadne_local_runner import (
     _DS_INIT_PROFILE,
     _append_status_sample,
     _append_trace_event,
+    _advance_convergence_streak,
     _build_ds,
     _build_trqn,
+    _classify_trial_exception,
     _compute_trqn_objective_scale,
+    _convergence_checks,
+    _convergence_metrics,
     _ds_safe_init_kwargs,
     _eval_energy_gradient,
     _finalise_optimiser_diagnostics,
     _new_optimiser_diagnostics,
+    _restart_under_ds,
+    _set_invalid_trial_reason,
     _trqn_control_init_kwargs,
     _trqn_status_summary,
     _validate_ds_init_kwargs,
+    InvalidTrialReason,
+    NonFiniteCalculatorOutput,
     run_optimisation_against_calculator,
 )
 import ichor.hpc.active_learning.acquisition.ariadne_local_runner as local_runner
-from ichor.hpc.active_learning.acquisition.ariadne_runner import AriadneRunConfig
+from ichor.hpc.active_learning.acquisition.ariadne_runner import (
+    AriadneConvergenceConfig,
+    AriadneRunConfig,
+)
 
 
 def test_ase_and_ariadne_share_one_pseudo_hartree_conversion():
@@ -48,6 +59,61 @@ def test_ase_and_ariadne_share_one_pseudo_hartree_conversion():
     assert energy == pytest.approx(-2.5)
     np.testing.assert_allclose(gradient, [-1.0, 2.0, -3.0])
     assert gradient.flags["F_CONTIGUOUS"]
+
+
+def test_five_criterion_streak_requires_acceptance_and_every_check():
+    all_pass = {
+        name: True
+        for name in ("objective", "grad_rms", "grad_max", "step_rms", "step_max")
+    }
+    one_fail = dict(all_pass, step_max=False)
+
+    assert _advance_convergence_streak(0, accepted=True, checks=all_pass) == 1
+    assert _advance_convergence_streak(1, accepted=True, checks=all_pass) == 2
+    assert _advance_convergence_streak(2, accepted=True, checks=one_fail) == 0
+    assert _advance_convergence_streak(2, accepted=False) == 0
+
+
+def test_convergence_metrics_and_checks_use_raw_acquisition_units():
+    metrics = _convergence_metrics(
+        f_old=2.0,
+        f_current=2.000002,
+        gradient_current=np.array([2.0e-4, 0.0, 0.0]),
+        positions_before=np.zeros((1, 3)),
+        positions_current=np.array([[2.0e-3, 0.0, 0.0]]),
+        objective_scale=2.0,
+    )
+    resolution = {
+        "effective_thresholds": {
+            "objective_change_tolerance": 1.1e-6,
+            "gradient_rms_tolerance_per_ang": 6.0e-5,
+            "gradient_max_tolerance_per_ang": 1.1e-4,
+            "step_rms_tolerance_ang": 1.2e-3,
+            "step_max_tolerance_ang": 2.1e-3,
+        }
+    }
+
+    checks = _convergence_checks(metrics, resolution)
+
+    assert metrics["objective_change"] == pytest.approx(1.0e-6)
+    assert metrics["gradient_max_per_ang"] == pytest.approx(1.0e-4)
+    assert all(checks.values())
+
+
+def test_invalid_trial_reason_distinguishes_nonfinite_output():
+    reason = _classify_trial_exception(NonFiniteCalculatorOutput("non-finite force"))
+    assert reason is InvalidTrialReason.CALCULATOR_NONFINITE_OUTPUT
+
+    class _Optimiser:
+        def __init__(self):
+            self.reason = None
+
+        def set_invalid_trial_reason_py(self, value):
+            self.reason = int(value)
+
+    optimiser = _Optimiser()
+    _set_invalid_trial_reason(optimiser, reason)
+    assert optimiser.reason == 10
 
 
 def test_append_trace_event_writes_jsonl(tmp_path):
@@ -197,7 +263,14 @@ def test_ds_init_forwards_ariadne_geometry_enum_defaults():
         q0,
         g0,
         atom_list,
-        AriadneRunConfig(delta0=0.3, gamma=0.4, f_tol=1.0e-5, gradf_tol=2.0e-4),
+        AriadneRunConfig(
+            delta0=0.3,
+            gamma=0.4,
+            convergence=AriadneConvergenceConfig(
+                objective_change_tolerance=1.0e-5,
+                gradient_rms_tolerance_per_ang=2.0e-4,
+            ),
+        ),
     )
 
     kwargs = ariadne._ds_factory.last.init_kwargs
@@ -207,7 +280,7 @@ def test_ds_init_forwards_ariadne_geometry_enum_defaults():
     assert kwargs["h"] == 0.3
     assert kwargs["gamma"] == 0.4
     assert kwargs["f_tol"] == 1.0e-5
-    assert kwargs["gradf_tol"] == 2.0e-4
+    assert kwargs["gradf_tol"] == 1.5e-4
     assert kwargs["hpos_estimator"] == "syev"
     assert kwargs["lanczos_k"] == 4
     assert kwargs["hessian_model"] == "schlegel"
@@ -352,7 +425,7 @@ def _trqn_status(
     trust=1.0e-4,
     consecutive_bt_fail_count=1,
 ):
-    status = [0] * 90
+    status = [0] * 89
     status[0] = trust
     status[1] = 0.0
     status[2] = run_idx
@@ -479,7 +552,7 @@ class _AcceptingDs:
         self.g = np.asarray(g_xyz_new, dtype=np.float64).reshape(-1).copy()
 
     def get_status_py(self):
-        status = [0] * 12
+        status = [0] * 42
         status[2] = self.f_current
         status[8] = int(self.converged)
         status[9] = int(self.accepted)
@@ -564,6 +637,112 @@ class _FakeAtoms:
         return np.ones((2, 3), dtype=np.float64)
 
 
+def test_ds_restart_re_evaluates_unscaled_objective_at_restart_geometry(monkeypatch):
+    ariadne = _fake_runner_ariadne()
+    raw_gradient = np.arange(1.0, 7.0, dtype=np.float64)
+    monkeypatch.setattr(
+        local_runner,
+        "_eval_energy_gradient",
+        lambda _atoms: (3.25, raw_gradient.copy()),
+    )
+
+    optimiser, objective, gradient = _restart_under_ds(
+        ariadne,
+        _FakeAtoms(),
+        2,
+        ["O", "H"],
+        AriadneRunConfig(),
+    )
+
+    assert optimiser is ariadne._ds_factory.last
+    assert objective == pytest.approx(3.25)
+    np.testing.assert_allclose(gradient, raw_gradient)
+    np.testing.assert_allclose(
+        optimiser.init_kwargs["g0_xyz"],
+        raw_gradient.reshape(2, 3),
+    )
+
+
+class _RejectingDs:
+    def __init__(self):
+        self.q_current = np.zeros(6, dtype=np.float64)
+        self.q_state = self.q_current.copy()
+        self.g_current = np.ones(6, dtype=np.float64)
+        self.f_current = 0.0
+        self.pending = False
+        self.accepted = False
+
+    def init(self, **kwargs):
+        self.q_current = np.asarray(kwargs["q0_xyz"], dtype=np.float64).reshape(-1).copy()
+        self.q_state = self.q_current.copy()
+        self.g_current = np.asarray(kwargs["g0_xyz"], dtype=np.float64).reshape(-1).copy()
+
+    def step_py(self, *, stage, f_old, f_new, g_xyz_new):
+        if int(stage) == 0:
+            self.pending = True
+            self.q_state = self.q_current + 0.1
+            return
+        self.pending = False
+        self.accepted = False
+        self.f_current = float(f_old)
+        self.q_state = self.q_current.copy()
+
+    def get_status_py(self):
+        status = [0] * 42
+        status[2] = self.f_current
+        status[7] = int(self.pending)
+        status[8] = 0
+        status[9] = int(self.accepted)
+        return tuple(status)
+
+    def get_state_flat_py(self, q_flat, g_flat):
+        q_flat[:] = self.q_state
+        g_flat[:] = self.g_current
+
+
+def test_rejected_trace_pairs_current_and_trial_values_separately(monkeypatch):
+    ds = _RejectingDs()
+    ariadne = SimpleNamespace(
+        Ds_Optimiser=SimpleNamespace(dissipative_symplectic=lambda: ds),
+    )
+    events = []
+    monkeypatch.setattr(local_runner, "_import_ariadne", lambda: ariadne)
+    monkeypatch.setattr(
+        local_runner,
+        "_append_trace_event_with_gradient",
+        lambda _path, _calculator, **payload: events.append(dict(payload)),
+    )
+    def _position_dependent_evaluation(atoms, *, objective_scale=1.0):
+        displaced = bool(np.max(np.abs(atoms.get_positions())) > 0.05)
+        objective = 0.1 if displaced else 0.0
+        gradient = np.full(6, 2.0 if displaced else 1.0, dtype=np.float64)
+        return objective * float(objective_scale), gradient * float(objective_scale)
+
+    monkeypatch.setattr(
+        local_runner,
+        "_eval_energy_gradient",
+        _position_dependent_evaluation,
+    )
+
+    result = run_optimisation_against_calculator(
+        _FakeAtoms(),
+        calculator=None,
+        run_config=AriadneRunConfig(
+            optimiser="dissipative_symplectic",
+            max_iter=1,
+            fallback_to_ds=False,
+        ),
+    )
+
+    rejected = next(event for event in events if event.get("event") == "rejected_step")
+    assert result.return_code == 1
+    assert rejected["accepted"] is False
+    assert rejected["alpha"] == pytest.approx(0.0)
+    assert rejected["trial_alpha"] == pytest.approx(-0.1)
+    assert rejected["grad_norm"] == pytest.approx(np.sqrt(6.0))
+    assert rejected["trial_grad_norm"] == pytest.approx(np.sqrt(24.0))
+
+
 def test_repeated_trqn_no_proposal_backtransform_failure_falls_back_to_ds(monkeypatch):
     ariadne = _fake_runner_ariadne()
     monkeypatch.setattr(local_runner, "_import_ariadne", lambda: ariadne)
@@ -589,7 +768,7 @@ def test_repeated_trqn_no_proposal_backtransform_failure_falls_back_to_ds(monkey
     assert result.diagnostics["optimiser_final"] == "dissipative_symplectic"
     assert result.n_evaluations == 3
     assert len(result.candidate_positions_angstrom) == 2
-    assert result.candidate_origins[0] == "seed_fallback"
+    assert result.candidate_origins[0] == "seed_initial"
     assert result.candidate_origins[1] == "accepted_iterate"
     assert ariadne._ds_factory.last.init_kwargs["hpos_estimator"] == "syev"
     assert ariadne._ds_factory.last.init_kwargs["lanczos_k"] == 4

@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
+
 from .daemon.state import atomic_write_json
 from .layout import (
     active_ariadne_dir,
@@ -967,8 +969,8 @@ def validate_ariadne_result(
     expected_iteration: int,
     seed_record: Dict[str, Any],
     expected_atom_types: Optional[Sequence[str]] = None,
+    expected_initial_coordinates: Optional[Sequence[Sequence[float]]] = None,
     expected_trajectory_sha256: Optional[str] = None,
-    accept_legacy_missing_landing_safety: bool = False,
 ) -> Dict[str, Any]:
     if not isinstance(result, dict):
         raise HandoffManifestError("ARIADNE result must be a JSON object")
@@ -998,12 +1000,7 @@ def validate_ariadne_result(
     try:
         from .acquisition.ariadne_runner import ariadne_result_usability_payload
 
-        usability = ariadne_result_usability_payload(
-            result,
-            accept_legacy_missing_landing_safety=bool(
-                accept_legacy_missing_landing_safety
-            ),
-        )
+        usability = ariadne_result_usability_payload(result)
     except Exception:
         usability = {"usable": False, "reason": "usability_check_failed"}
     if not bool(usability.get("usable", False)):
@@ -1031,6 +1028,23 @@ def validate_ariadne_result(
         if not isinstance(row, list) or len(row) != 3:
             raise HandoffManifestError("final_coordinates_shape_mismatch")
         clean_coords.append([_finite_float(row[0]), _finite_float(row[1]), _finite_float(row[2])])
+    if expected_initial_coordinates is not None:
+        expected_initial = np.asarray(expected_initial_coordinates, dtype=float)
+        if (
+            expected_initial.shape != (len(clean_atom_types), 3)
+            or not np.isfinite(expected_initial).all()
+        ):
+            raise HandoffManifestError("authoritative_seed_coordinates_invalid")
+        for key in ("initial_coordinates", "seed_coordinates"):
+            value = result.get(key)
+            try:
+                observed = np.asarray(value, dtype=float)
+            except (TypeError, ValueError) as exc:
+                raise HandoffManifestError(key + "_invalid") from exc
+            if observed.shape != expected_initial.shape or not np.isfinite(observed).all():
+                raise HandoffManifestError(key + "_shape_or_finiteness_mismatch")
+            if not np.allclose(observed, expected_initial, atol=1.0e-10, rtol=0.0):
+                raise HandoffManifestError(key + "_authoritative_seed_mismatch")
     alpha_trajectory = result.get("alpha_trajectory")
     if not isinstance(alpha_trajectory, list):
         raise HandoffManifestError("alpha_trajectory_missing")
@@ -1124,7 +1138,6 @@ def read_ariadne_results_manifest(
     *,
     expected_iteration: Optional[int] = None,
     require_nonempty: bool = True,
-    accept_legacy_missing_landing_safety: bool = False,
 ) -> Dict[str, Any]:
     path = ariadne_results_path(iter_dir)
     if not path.is_file():
@@ -1317,9 +1330,6 @@ def read_ariadne_results_manifest(
             expected_iteration=iteration,
             seed_record=seed_record,
             expected_trajectory_sha256=trajectory_sha or None,
-            accept_legacy_missing_landing_safety=bool(
-                accept_legacy_missing_landing_safety
-            ),
         )
         normalised_accepted.append(out_rec)
     normalised_rejected = []
@@ -1357,7 +1367,6 @@ def ariadne_candidate_frames(
     iter_dir: Any,
     *,
     expected_iteration: Optional[int] = None,
-    accept_legacy_missing_landing_safety: bool = False,
     expected_config_sha256: Optional[str] = None,
     require_batch_decision: bool = True,
 ) -> Tuple[Dict[str, Any], List[Any], List[Dict[str, Any]]]:
@@ -1374,9 +1383,6 @@ def ariadne_candidate_frames(
     manifest = read_ariadne_results_manifest(
         iter_dir,
         expected_iteration=expected_iteration,
-        accept_legacy_missing_landing_safety=bool(
-            accept_legacy_missing_landing_safety
-        ),
     )
     frames = []
     records = []
@@ -1406,9 +1412,6 @@ def ariadne_candidate_frames(
             expected_iteration=int(manifest["iteration"]),
             seed_record=seed_record,
             expected_trajectory_sha256=str(manifest.get("trajectory_sha256") or "") or None,
-            accept_legacy_missing_landing_safety=bool(
-                accept_legacy_missing_landing_safety
-            ),
         )
         atom_types = result.get("atom_types") or []
         coords = result.get("final_coordinates") or []
@@ -1892,7 +1895,6 @@ def read_phase_b_selection_manifest(
         iter_dir,
         expected_iteration=iteration,
         require_nonempty=require_nonempty,
-        accept_legacy_missing_landing_safety=False,
     )
     source_by_seed = {
         int(record["seed_id"]): dict(record) for record in source_results["accepted"]

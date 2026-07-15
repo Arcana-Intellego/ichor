@@ -357,7 +357,14 @@ ariadne:
   optimiser: trust_region_qn
   hessian_model: SCHLEGEL
   max_iter: 50
-  gradf_tol: 1.0e-4
+  convergence:
+    mode: fixed
+    objective_change_tolerance: 1.0e-6
+    gradient_rms_tolerance_per_ang: 1.0e-4
+    gradient_max_tolerance_per_ang: 1.5e-4
+    step_rms_tolerance_ang: 1.2e-3
+    step_max_tolerance_ang: 1.8e-3
+    consecutive_accepted_steps: 2
   trqn_backtransform_mode: geodesic
   trqn_geodesic_bt_mode: dense
   trqn_geodesic_dt: 1.0e-2

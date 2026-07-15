@@ -95,6 +95,27 @@ quality_gates:
   ariadne_max_displacement_ang: 1.25
   ariadne_min_pair_distance_ang: 0.60
 
+ariadne:
+  convergence:
+    mode: fixed
+    objective_change_tolerance: 1.0e-6
+    gradient_rms_tolerance_per_ang: 1.0e-4
+    gradient_max_tolerance_per_ang: 1.5e-4
+    step_rms_tolerance_ang: 1.2e-3
+    step_max_tolerance_ang: 1.8e-3
+    consecutive_accepted_steps: 2
+    adaptive_score_reference: 1.0
+    adaptive_length_reference_ang: 0.05
+    adaptive_min_multiplier: 0.25
+    adaptive_max_multiplier: 4.0
+
+adversarial_safety:
+  salvage_safe_iterate: true
+  backtrack_to_safe_landing: true
+  backtrack_points: 16
+  under_move_retry: true
+  under_move_retry_max: 1
+
 # -------------------------------------------------------------------------
 # Daemon runtime
 # -------------------------------------------------------------------------

@@ -55,6 +55,7 @@ __all__ = [
     "AcquisitionGradientBlock",
     "AcquisitionReferencesBlock",
     "AcquisitionConfigBlock",
+    "AriadneConvergenceConfigBlock",
     "AriadneConfigBlock",
     "AdversarialSafetyConfigBlock",
     "ErrorCalibrationConfigBlock",
@@ -274,8 +275,16 @@ _STRICTLY_POSITIVE_NUMERIC_PATHS = frozenset({
     "acquisition.references.floor",
     "acquisition.references.refresh_period",
     "ariadne.max_iter",
-    "ariadne.gradf_tol",
-    "ariadne.f_tol",
+    "ariadne.convergence.objective_change_tolerance",
+    "ariadne.convergence.gradient_rms_tolerance_per_ang",
+    "ariadne.convergence.gradient_max_tolerance_per_ang",
+    "ariadne.convergence.step_rms_tolerance_ang",
+    "ariadne.convergence.step_max_tolerance_ang",
+    "ariadne.convergence.consecutive_accepted_steps",
+    "ariadne.convergence.adaptive_score_reference",
+    "ariadne.convergence.adaptive_length_reference_ang",
+    "ariadne.convergence.adaptive_min_multiplier",
+    "ariadne.convergence.adaptive_max_multiplier",
     "ariadne.delta0",
     "ariadne.delta_max",
     "ariadne.gamma",
@@ -283,7 +292,6 @@ _STRICTLY_POSITIVE_NUMERIC_PATHS = frozenset({
     "ariadne.trqn_retry_target_initial_grad_norm",
     "ariadne.trqn_target_initial_grad_rms",
     "ariadne.trqn_retry_target_initial_grad_rms",
-    "ariadne.trqn_under_move_target_initial_grad_rms",
     "ariadne.trqn_min_objective_scale",
     "ariadne.trqn_max_objective_scale",
     "ariadne.trqn_fixed_objective_scale",
@@ -608,12 +616,28 @@ class FerebusConfigBlock:
 
 
 @dataclass
+class AriadneConvergenceConfigBlock:
+    mode: str = "fixed"
+    objective_change_tolerance: float = 1.0e-6
+    gradient_rms_tolerance_per_ang: float = 1.0e-4
+    gradient_max_tolerance_per_ang: float = 1.5e-4
+    step_rms_tolerance_ang: float = 1.2e-3
+    step_max_tolerance_ang: float = 1.8e-3
+    consecutive_accepted_steps: int = 2
+    adaptive_score_reference: float = 1.0
+    adaptive_length_reference_ang: float = 0.05
+    adaptive_min_multiplier: float = 0.25
+    adaptive_max_multiplier: float = 4.0
+
+
+@dataclass
 class AriadneConfigBlock:
     optimiser: str = "trust_region_qn"
     hessian_model: str = "SCHLEGEL"
     max_iter: int = 200
-    gradf_tol: float = 1.0e-4
-    f_tol: float = 1.0e-6
+    convergence: AriadneConvergenceConfigBlock = field(
+        default_factory=AriadneConvergenceConfigBlock
+    )
     delta0: float = 0.10
     delta_max: float = 0.40
     gamma: float = 0.10
@@ -623,9 +647,6 @@ class AriadneConfigBlock:
     trqn_retry_target_initial_grad_norm: float = 0.003
     trqn_target_initial_grad_rms: float = 2.0e-4
     trqn_retry_target_initial_grad_rms: float = 4.0e-4
-    trqn_under_move_target_initial_grad_rms: float = 6.0e-4
-    trqn_under_move_retry: bool = True
-    trqn_under_move_retry_max: int = 1
     trqn_min_objective_scale: float = 1.0e-8
     trqn_max_objective_scale: float = 1.0
     trqn_fixed_objective_scale: float = 1.0
@@ -641,24 +662,11 @@ class AriadneConfigBlock:
 
 @dataclass
 class AdversarialSafetyConfigBlock:
-    enabled: bool = True
-    reject_unsafe_landings: bool = True
     salvage_safe_iterate: bool = True
     backtrack_to_safe_landing: bool = True
     backtrack_points: int = 16
-    allow_seed_fallback: bool = False
-    accept_legacy_missing_landing_safety: bool = False
-    min_whitened_distance: float = 0.0
-    max_whitened_distance: float = 10.0
-    enforce_min_whitened_distance: bool = False
-    max_predicted_energy_delta_ha: Optional[float] = None
-    max_energy_variance: Optional[float] = None
-    max_chemistry_penalty: Optional[float] = None
-    phase_b_filter_enabled: bool = True
-    enforce_movement_band: bool = True
     under_move_retry: bool = True
-    reject_under_moved_after_retry: bool = True
-    reject_over_moved: bool = True
+    under_move_retry_max: int = 1
 
 
 @dataclass
@@ -1731,18 +1739,9 @@ class CampaignConfig:
             )
         safety = self.adversarial_safety
         for bool_name in (
-            "adversarial_safety.enabled",
-            "adversarial_safety.reject_unsafe_landings",
             "adversarial_safety.salvage_safe_iterate",
             "adversarial_safety.backtrack_to_safe_landing",
-            "adversarial_safety.allow_seed_fallback",
-            "adversarial_safety.accept_legacy_missing_landing_safety",
-            "adversarial_safety.enforce_min_whitened_distance",
-            "adversarial_safety.phase_b_filter_enabled",
-            "adversarial_safety.enforce_movement_band",
             "adversarial_safety.under_move_retry",
-            "adversarial_safety.reject_under_moved_after_retry",
-            "adversarial_safety.reject_over_moved",
         ):
             block, field_name = bool_name.split(".", 1)
             value = getattr(getattr(self, block), field_name)
@@ -1752,21 +1751,10 @@ class CampaignConfig:
             "adversarial_safety.backtrack_points",
             safety.backtrack_points,
         )
-        for name, value in (
-            ("adversarial_safety.min_whitened_distance", safety.min_whitened_distance),
-            ("adversarial_safety.max_whitened_distance", safety.max_whitened_distance),
-            ("adversarial_safety.max_predicted_energy_delta_ha", safety.max_predicted_energy_delta_ha),
-            ("adversarial_safety.max_energy_variance", safety.max_energy_variance),
-            ("adversarial_safety.max_chemistry_penalty", safety.max_chemistry_penalty),
-        ):
-            _validate_optional_nonnegative_float(name, value)
-        if (
-            float(safety.max_whitened_distance)
-            <= float(safety.min_whitened_distance)
-        ):
-            raise ConfigValidationError(
-                "adversarial_safety.max_whitened_distance must be > min_whitened_distance"
-            )
+        _validate_nonnegative_int(
+            "adversarial_safety.under_move_retry_max",
+            safety.under_move_retry_max,
+        )
         calib = self.error_calibration
         if not isinstance(calib.enabled, bool):
             raise ConfigValidationError("error_calibration.enabled must be a boolean")
@@ -1836,6 +1824,44 @@ class CampaignConfig:
                 "acquisition.gradient.max_acquisition_grad_per_ang must be > 0"
             )
         ariadne = self.ariadne
+        convergence = ariadne.convergence
+        if convergence.mode not in {"fixed", "scale_adaptive"}:
+            raise ConfigValidationError(
+                "ariadne.convergence.mode must be fixed or scale_adaptive"
+            )
+        for name in (
+            "objective_change_tolerance",
+            "gradient_rms_tolerance_per_ang",
+            "gradient_max_tolerance_per_ang",
+            "step_rms_tolerance_ang",
+            "step_max_tolerance_ang",
+            "adaptive_score_reference",
+            "adaptive_length_reference_ang",
+            "adaptive_min_multiplier",
+            "adaptive_max_multiplier",
+        ):
+            value = getattr(convergence, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) <= 0.0
+            ):
+                raise ConfigValidationError(
+                    "ariadne.convergence." + name + " must be finite and > 0"
+                )
+        _validate_positive_int(
+            "ariadne.convergence.consecutive_accepted_steps",
+            convergence.consecutive_accepted_steps,
+        )
+        if (
+            float(convergence.adaptive_max_multiplier)
+            < float(convergence.adaptive_min_multiplier)
+        ):
+            raise ConfigValidationError(
+                "ariadne.convergence.adaptive_max_multiplier must be >= "
+                "adaptive_min_multiplier"
+            )
         if str(ariadne.trqn_scale_mode) not in VALID_TRQN_SCALE_MODES:
             raise ConfigValidationError(
                 "ariadne.trqn_scale_mode must be one of "
@@ -1858,10 +1884,6 @@ class CampaignConfig:
                 "ariadne.trqn_retry_target_initial_grad_rms",
                 ariadne.trqn_retry_target_initial_grad_rms,
             ),
-            (
-                "ariadne.trqn_under_move_target_initial_grad_rms",
-                ariadne.trqn_under_move_target_initial_grad_rms,
-            ),
             ("ariadne.trqn_min_objective_scale", ariadne.trqn_min_objective_scale),
             ("ariadne.trqn_max_objective_scale", ariadne.trqn_max_objective_scale),
             ("ariadne.trqn_fixed_objective_scale", ariadne.trqn_fixed_objective_scale),
@@ -1877,10 +1899,6 @@ class CampaignConfig:
         _validate_positive_int(
             "ariadne.trqn_max_backtransform_iter",
             ariadne.trqn_max_backtransform_iter,
-        )
-        _validate_nonnegative_int(
-            "ariadne.trqn_under_move_retry_max",
-            ariadne.trqn_under_move_retry_max,
         )
         if (
             float(ariadne.trqn_retry_target_initial_grad_norm)
@@ -1913,10 +1931,6 @@ class CampaignConfig:
         if not isinstance(ariadne.trqn_retry_on_no_proposal, bool):
             raise ConfigValidationError(
                 "ariadne.trqn_retry_on_no_proposal must be a boolean"
-            )
-        if not isinstance(ariadne.trqn_under_move_retry, bool):
-            raise ConfigValidationError(
-                "ariadne.trqn_under_move_retry must be a boolean"
             )
         if str(ariadne.trqn_backtransform_mode) not in VALID_TRQN_BACKTRANSFORM_MODES:
             raise ConfigValidationError(
@@ -2349,14 +2363,35 @@ class CampaignConfig:
 
     def to_ariadne_run_config(self):
         """Materialise an AriadneRunConfig from the ariadne block."""
-        from .acquisition.ariadne_runner import AriadneRunConfig
+        from .acquisition.ariadne_runner import (
+            AriadneConvergenceConfig,
+            AriadneRunConfig,
+        )
         a = self.ariadne
+        convergence = a.convergence
         return AriadneRunConfig(
             optimiser=a.optimiser,
             hessian_model=a.hessian_model,
             max_iter=a.max_iter,
-            gradf_tol=a.gradf_tol,
-            f_tol=a.f_tol,
+            convergence=AriadneConvergenceConfig(
+                mode=convergence.mode,
+                objective_change_tolerance=convergence.objective_change_tolerance,
+                gradient_rms_tolerance_per_ang=(
+                    convergence.gradient_rms_tolerance_per_ang
+                ),
+                gradient_max_tolerance_per_ang=(
+                    convergence.gradient_max_tolerance_per_ang
+                ),
+                step_rms_tolerance_ang=convergence.step_rms_tolerance_ang,
+                step_max_tolerance_ang=convergence.step_max_tolerance_ang,
+                consecutive_accepted_steps=convergence.consecutive_accepted_steps,
+                adaptive_score_reference=convergence.adaptive_score_reference,
+                adaptive_length_reference_ang=(
+                    convergence.adaptive_length_reference_ang
+                ),
+                adaptive_min_multiplier=convergence.adaptive_min_multiplier,
+                adaptive_max_multiplier=convergence.adaptive_max_multiplier,
+            ),
             delta0=a.delta0,
             delta_max=a.delta_max,
             gamma=a.gamma,
@@ -2366,9 +2401,6 @@ class CampaignConfig:
             trqn_retry_target_initial_grad_norm=a.trqn_retry_target_initial_grad_norm,
             trqn_target_initial_grad_rms=a.trqn_target_initial_grad_rms,
             trqn_retry_target_initial_grad_rms=a.trqn_retry_target_initial_grad_rms,
-            trqn_under_move_target_initial_grad_rms=a.trqn_under_move_target_initial_grad_rms,
-            trqn_under_move_retry=a.trqn_under_move_retry,
-            trqn_under_move_retry_max=a.trqn_under_move_retry_max,
             trqn_min_objective_scale=a.trqn_min_objective_scale,
             trqn_max_objective_scale=a.trqn_max_objective_scale,
             trqn_fixed_objective_scale=a.trqn_fixed_objective_scale,

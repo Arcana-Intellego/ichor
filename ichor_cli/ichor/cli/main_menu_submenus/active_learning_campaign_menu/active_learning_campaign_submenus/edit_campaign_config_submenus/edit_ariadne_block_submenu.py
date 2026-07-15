@@ -67,8 +67,62 @@ ARIADNE_FIELD_SPECS = [
         prompt="Hessian model: ",
     ),
     spec("max_iter", "int", prompt="Max iterations per seed: "),
-    spec("gradf_tol", "float", prompt="Gradient norm tolerance (Hartree/Angstrom): "),
-    spec("f_tol", "float", prompt="Value tolerance (Hartree): "),
+    spec(
+        "convergence.mode",
+        "choice",
+        choices=["fixed", "scale_adaptive"],
+        prompt="Convergence mode: ",
+    ),
+    spec(
+        "convergence.objective_change_tolerance",
+        "float",
+        prompt="Objective-change tolerance (acquisition units): ",
+    ),
+    spec(
+        "convergence.gradient_rms_tolerance_per_ang",
+        "float",
+        prompt="Gradient RMS tolerance per Angstrom: ",
+    ),
+    spec(
+        "convergence.gradient_max_tolerance_per_ang",
+        "float",
+        prompt="Gradient maximum tolerance per Angstrom: ",
+    ),
+    spec(
+        "convergence.step_rms_tolerance_ang",
+        "float",
+        prompt="Accepted-step RMS tolerance (Angstrom): ",
+    ),
+    spec(
+        "convergence.step_max_tolerance_ang",
+        "float",
+        prompt="Accepted-step maximum tolerance (Angstrom): ",
+    ),
+    spec(
+        "convergence.consecutive_accepted_steps",
+        "int",
+        prompt="Consecutive accepted steps required: ",
+    ),
+    spec(
+        "convergence.adaptive_score_reference",
+        "float",
+        prompt="Adaptive score reference: ",
+    ),
+    spec(
+        "convergence.adaptive_length_reference_ang",
+        "float",
+        prompt="Adaptive length reference (Angstrom): ",
+    ),
+    spec(
+        "convergence.adaptive_min_multiplier",
+        "float",
+        prompt="Adaptive minimum multiplier: ",
+    ),
+    spec(
+        "convergence.adaptive_max_multiplier",
+        "float",
+        prompt="Adaptive maximum multiplier: ",
+    ),
     spec("delta0", "float", prompt="Initial trust radius (Bohr): "),
     spec("delta_max", "float", prompt="Maximum trust radius (Bohr): "),
     spec("gamma", "float", prompt="Dissipative-symplectic damping (gamma): "),
@@ -102,21 +156,6 @@ ARIADNE_FIELD_SPECS = [
         "trqn_retry_target_initial_grad_rms",
         "float",
         prompt="TRQN retry target initial gradient RMS: ",
-    ),
-    spec(
-        "trqn_under_move_target_initial_grad_rms",
-        "float",
-        prompt="TRQN under-move retry target gradient RMS: ",
-    ),
-    spec(
-        "trqn_under_move_retry",
-        "bool",
-        prompt="Retry TRQN once after under-moved landing: ",
-    ),
-    spec(
-        "trqn_under_move_retry_max",
-        "int",
-        prompt="TRQN under-move retry max: ",
     ),
     spec(
         "trqn_min_objective_scale",

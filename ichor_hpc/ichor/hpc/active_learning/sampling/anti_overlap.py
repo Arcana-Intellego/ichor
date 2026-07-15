@@ -67,6 +67,10 @@ def min_distance_to_training(candidate: Atoms, training: Sequence[Atoms]) -> flo
     best = float("inf")
     for t in training:
         d = float(aligned_mass_weighted_rmsd(candidate, t))
+        if not np.isfinite(d):
+            raise ValueError(
+                "anti-overlap distance is non-finite for a non-empty training set"
+            )
         if d < best:
             best = d
     return best
@@ -114,5 +118,4 @@ def filter_candidates_against_training(
         distances_to_nearest=tuple(distances),
         min_separation=float(min_separation),
     )
-
 

@@ -508,6 +508,26 @@ def format_sampling_protocol_summary(
                 + str(ariadne_run.delta_max),
             )
         )
+        convergence = ariadne_run.convergence
+        lines.append(
+            _line(
+                "sampling_protocol.ariadne_convergence",
+                "mode="
+                + str(convergence.mode)
+                + ", objective_change="
+                + str(convergence.objective_change_tolerance)
+                + ", gradient_rms="
+                + str(convergence.gradient_rms_tolerance_per_ang)
+                + ", gradient_max="
+                + str(convergence.gradient_max_tolerance_per_ang)
+                + ", step_rms_ang="
+                + str(convergence.step_rms_tolerance_ang)
+                + ", step_max_ang="
+                + str(convergence.step_max_tolerance_ang)
+                + ", accepted_streak="
+                + str(convergence.consecutive_accepted_steps),
+            )
+        )
         trust_policy = scale_model.get("trust_radius_policy", {})
         lines.append(
             _line(
