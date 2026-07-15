@@ -1,6 +1,6 @@
 """PhaseExecutor protocol + mock implementation.
 
-The daemon delegates the per-phase work (POLUS sampling, Gaussian / AIMAll
+The daemon delegates the per-phase work (ICHOR diversity, Gaussian / AIMAll
 arrays, FEREBUS training, ARIADNE adversarial attack, atomic appends etc.)
 to a PhaseExecutor. The protocol has three operations:
 
@@ -57,9 +57,9 @@ INLINE_PHASES = frozenset({
     "SPLIT", "APPEND", "STOP_CHECK", "DONE", "HALTED",
 })
 SBATCH_PHASES = frozenset({
-    "PHASE_A_POLUS", "INITIAL_GAUSSIAN", "INITIAL_AIMALL", "INITIAL_FEREBUS",
+    "PHASE_A_DIVERSITY", "INITIAL_GAUSSIAN", "INITIAL_AIMALL", "INITIAL_FEREBUS",
     "INITIAL_REPLACEMENT_GAUSSIAN", "INITIAL_REPLACEMENT_AIMALL",
-    "ARIADNE_ARRAY", "PHASE_B_POLUS", "GAUSSIAN", "AIMALL",
+    "ARIADNE_ARRAY", "PHASE_B_DIVERSITY", "GAUSSIAN", "AIMALL",
     "REPLACEMENT_GAUSSIAN", "REPLACEMENT_AIMALL", "FEREBUS",
 })
 

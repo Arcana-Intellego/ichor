@@ -17,6 +17,7 @@ from ..handoff_manifests import (
     phase_b_selection_path,
     read_ariadne_landing_audit,
     read_ariadne_results_manifest,
+    load_seeds_picked,
     read_phase_a_sample_manifest,
     read_phase_b_selection_manifest,
     seeds_picked_path,
@@ -39,7 +40,7 @@ from .trained_models import resolve_trained_model_set
 
 BOOTSTRAP_MANIFEST_FILENAME = "BOOTSTRAP_MANIFEST.json"
 ITERATION_MANIFEST_FILENAME = "ITERATION_MANIFEST.json"
-SAMPLING_MANIFEST_SCHEMA_VERSION = 1
+SAMPLING_MANIFEST_SCHEMA_VERSION = 2
 _LOCK_FILENAMES = frozenset({".provenance.lock", "POINT_ALLOCATION.lock"})
 _BOOTSTRAP_TOP_LEVEL_DIRECTORIES = frozenset({"selection", "allocation"})
 _ACTIVE_TOP_LEVEL_DIRECTORIES = frozenset({
@@ -81,7 +82,7 @@ def _role(relative_path: str) -> str:
         "selection/selected_indices.dat",
         "seed_selection/seeds.xyz",
         "phase_b/selected.xyz",
-        "phase_b/selected_raw.xyz",
+        "phase_b/considered_candidates.xyz",
     }:
         return "derived_cache"
     return "authoritative"
@@ -239,19 +240,37 @@ def _read_manifest(path: Path, *, kind: str, iteration: int) -> Dict[str, Any]:
         raise SamplingIterationError("sampling manifest is unreadable: " + str(path)) from exc
     if not isinstance(payload, dict):
         raise SamplingIterationError("sampling manifest must be a JSON object")
-    try:
-        schema_version = int(payload.get("schema_version", -1))
-        observed_iteration = int(payload.get("iteration", -1))
-    except (TypeError, ValueError) as exc:
+    schema_version = payload.get("schema_version")
+    observed_iteration = payload.get("iteration")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or isinstance(observed_iteration, bool)
+        or not isinstance(observed_iteration, int)
+    ):
         raise SamplingIterationError(
-            "sampling manifest schema or iteration is not an integer"
-        ) from exc
+            "sampling manifest schema and iteration must be exact JSON integers"
+        )
     if schema_version != SAMPLING_MANIFEST_SCHEMA_VERSION:
         raise SamplingIterationError("unsupported sampling manifest schema")
     if str(payload.get("kind") or "") != str(kind):
         raise SamplingIterationError("sampling manifest kind mismatch")
     if observed_iteration != int(iteration):
         raise SamplingIterationError("sampling manifest iteration mismatch")
+    campaign_uid = payload.get("campaign_uid")
+    if not isinstance(campaign_uid, str) or not campaign_uid:
+        raise SamplingIterationError("sampling manifest campaign_uid is invalid")
+    completed_at = payload.get("completed_at_iso")
+    if not isinstance(completed_at, str) or not completed_at:
+        raise SamplingIterationError("sampling manifest completion time is invalid")
+    try:
+        parsed_completed_at = datetime.fromisoformat(completed_at)
+    except ValueError as exc:
+        raise SamplingIterationError(
+            "sampling manifest completion time is not ISO-8601"
+        ) from exc
+    if parsed_completed_at.tzinfo is None:
+        raise SamplingIterationError("sampling manifest completion time lacks a timezone")
     return payload
 
 
@@ -360,6 +379,7 @@ def finalise_active_iteration(
 
     read_ariadne_results_manifest(root, expected_iteration=value)
     read_ariadne_landing_audit(root, expected_iteration=value)
+    load_seeds_picked(root, expected_iteration=value)
     read_phase_b_selection_manifest(
         root,
         expected_iteration=value,

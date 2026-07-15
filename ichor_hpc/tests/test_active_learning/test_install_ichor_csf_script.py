@@ -16,7 +16,6 @@ LIB = REPO_ROOT / "scripts" / "lib_ichor_csf.sh"
 
 def _make_fake_projects(tmp_path: Path) -> Path:
     projects = tmp_path / "projects"
-    (projects / "POLUS" / "polus_core_subpackage").mkdir(parents=True)
     (projects / "FEREBUS_CPU" / "pyferebus").mkdir(parents=True)
     (projects / "FEREBUS_CPU" / "libs").mkdir(parents=True)
     (projects / "ARIADNE").mkdir(parents=True)
@@ -143,7 +142,7 @@ def test_install_script_dry_run_renders_cluster_defaults(machine, venv_name, tmp
     assert f"machine       = {machine}" in output
     assert "only          = all" in output
     assert venv_name in output
-    assert "POLUS" in output
+    assert "POLUS" not in output
     assert "FEREBUS_CPU" in output
     assert "ARIADNE" in output
     assert "PLUMED" in output

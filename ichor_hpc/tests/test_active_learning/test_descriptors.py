@@ -6,9 +6,9 @@ import pytest
 from ichor.core.atoms import Atom, Atoms
 
 from ichor.hpc.active_learning.sampling.descriptors import (
-    AcquisitionWeightedDescriptor,
     HybridAlfRmsdDescriptor,
     MassWeightedRMSDDescriptor,
+    _normalise_hybrid_feature_matrix,
     kabsch_align,
     mass_weighted_rmsd,
 )
@@ -209,32 +209,20 @@ def test_hybrid_descriptor_rejects_feature_length_mismatch():
         ).pairwise_distance_matrix(frames)
 
 
-def test_acquisition_weighted_descriptor_scales_distances_by_variance():
-    frames = [_water_at(0.0), _water_at(0.10), _water_at(0.20)]
+def test_cyclic_alf_azimuth_is_continuous_across_pi_boundary():
+    epsilon = 1.0e-6
+    values = np.asarray([
+        [2.0, math.pi - epsilon],
+        [2.0, -math.pi + epsilon],
+    ])
 
-    class _StubPosterior:
-        def __init__(self, vs):
-            self._vs = vs
-
-        def variance(self, atoms):
-            return self._vs[id(atoms)]
-
-    base_desc = MassWeightedRMSDDescriptor()
-    base = base_desc.pairwise_distance_matrix(frames)
-
-    high_low_low = _StubPosterior({id(frames[0]): 100.0, id(frames[1]): 1.0, id(frames[2]): 1.0})
-    acq = AcquisitionWeightedDescriptor(
-        posterior=high_low_low,
-        base_descriptor=base_desc,
-        sigma_ref=1.0,
+    encoded = _normalise_hybrid_feature_matrix(
+        values,
+        np.asarray([False, True]),
+        epsilon=1.0e-12,
     )
-    D = acq.pairwise_distance_matrix(frames)
-    np.testing.assert_allclose(D, D.T, atol=1.0e-12)
-    np.testing.assert_allclose(np.diag(D), np.diag(base) * 10.0, atol=1.0e-12)
-    assert D[0, 1] > base[0, 1]
-    assert D[1, 2] == pytest.approx(base[1, 2], rel=1.0e-12)
 
-
-def test_acquisition_weighted_requires_posterior():
-    with pytest.raises(ValueError):
-        AcquisitionWeightedDescriptor().pairwise_distance_matrix([_water_at(0.0)])
+    assert np.linalg.norm(encoded[0] - encoded[1]) == pytest.approx(
+        2.0 * epsilon,
+        rel=1.0e-5,
+    )

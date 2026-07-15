@@ -53,6 +53,10 @@ seed_selection:
   exclude_committed_seed_frames: true
   recent_seed_cooldown_iterations: 1
 
+phase_b:
+  descriptor: hybrid_alf_rmsd
+  beta: 0.5
+
 # -------------------------------------------------------------------------
 # FEREBUS
 # -------------------------------------------------------------------------
@@ -153,7 +157,7 @@ resources:
     mem_per_cpu: auto
 
   # Backend resources are explicit defaults; adjust per backend when needed.
-  polus:
+  diversity:
     partition: multicore
     walltime_hours: 2
     cpus_per_task: auto

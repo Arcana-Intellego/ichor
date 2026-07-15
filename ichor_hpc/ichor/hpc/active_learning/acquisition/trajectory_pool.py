@@ -33,7 +33,7 @@ from ..strict_json import strict_json as json
 import os
 import shutil
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Union
@@ -66,7 +66,7 @@ POOL_SUBDIR = Path(".DATA") / "TRAJECTORY"
 POOL_XYZ_FILENAME = "pool.xyz"
 POOL_MANIFEST_FILENAME = "pool.manifest.json"
 POOL_IMPORT_TRANSACTION_FILENAME = "pool.import.transaction.json"
-POOL_SCHEMA_VERSION = 1
+POOL_SCHEMA_VERSION = 2
 POOL_IMPORT_TRANSACTION_SCHEMA_VERSION = 1
 
 
@@ -226,7 +226,25 @@ class TrajectoryPoolManifest:
     def from_dict(cls, data: Dict[str, Any]) -> "TrajectoryPoolManifest":
         if not isinstance(data, dict):
             raise ValueError("pool manifest must be a JSON object")
-        schema = int(data.get("schema_version", -1))
+        expected_fields = {
+            "source_path",
+            "canonical_path",
+            "sha256",
+            "n_frames",
+            "natoms",
+            "atom_types",
+            "masses",
+            "imported_iso",
+            "schema_version",
+        }
+        if set(data) != expected_fields:
+            raise ValueError(
+                "pool manifest fields are invalid: expected "
+                + repr(sorted(expected_fields))
+            )
+        schema = data.get("schema_version")
+        if isinstance(schema, bool) or not isinstance(schema, int):
+            raise ValueError("pool manifest schema_version must be an integer")
         if schema != POOL_SCHEMA_VERSION:
             raise ValueError(
                 "pool manifest schema_version " + str(schema)
@@ -234,17 +252,42 @@ class TrajectoryPoolManifest:
             )
         required_str = ("source_path", "canonical_path", "sha256", "imported_iso")
         for key in required_str:
-            if not isinstance(data.get(key), str):
+            if not isinstance(data.get(key), str) or not data[key]:
                 raise ValueError("missing or non-string manifest field: " + key)
+        digest = data["sha256"]
+        if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+            raise ValueError("pool manifest sha256 is malformed")
+        try:
+            imported_at = datetime.fromisoformat(data["imported_iso"])
+        except ValueError as exc:
+            raise ValueError("pool manifest imported_iso is malformed") from exc
+        if imported_at.tzinfo is None:
+            raise ValueError("pool manifest imported_iso must include a timezone")
         required_int = ("n_frames", "natoms")
         for key in required_int:
-            if not isinstance(data.get(key), int):
+            if (
+                isinstance(data.get(key), bool)
+                or not isinstance(data.get(key), int)
+                or data[key] <= 0
+            ):
                 raise ValueError("missing or non-int manifest field: " + key)
         atom_types = data.get("atom_types")
         masses = data.get("masses")
-        if not isinstance(atom_types, list) or not all(isinstance(a, str) for a in atom_types):
+        if (
+            not isinstance(atom_types, list)
+            or not all(isinstance(a, str) and a for a in atom_types)
+        ):
             raise ValueError("atom_types must be a list of strings")
-        if not isinstance(masses, list) or not all(isinstance(m, (int, float)) for m in masses):
+        if (
+            not isinstance(masses, list)
+            or not all(
+                not isinstance(mass, bool)
+                and isinstance(mass, (int, float))
+                and np.isfinite(float(mass))
+                and float(mass) > 0.0
+                for mass in masses
+            )
+        ):
             raise ValueError("masses must be a list of numbers")
         if len(atom_types) != data["natoms"] or len(masses) != data["natoms"]:
             raise ValueError("atom_types / masses length disagrees with natoms")
@@ -300,9 +343,12 @@ class TrajectoryPool:
 
     def frame(self, frame_id: int) -> Atoms:
         """Return a detached copy of the frame at the stable frame ID."""
-        if not 0 <= int(frame_id) < self.n_frames():
+        if isinstance(frame_id, bool) or not isinstance(frame_id, (int, np.integer)):
+            raise TypeError("frame_id must be an exact integer")
+        frame_index = int(frame_id)
+        if not 0 <= frame_index < self.n_frames():
             raise IndexError("frame_id " + str(frame_id) + " out of range [0, " + str(self.n_frames()) + ")")
-        return self._atoms[int(frame_id)].copy()
+        return self._atoms[frame_index].copy()
 
     def frame_ids(self) -> range:
         """Return the inclusive range of all stable frame IDs."""

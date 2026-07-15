@@ -9,13 +9,10 @@ from ichor.hpc.active_learning.geometry_protocol import PHASE_B_MIN_SEPARATION_S
 from ichor.hpc.active_learning.handoff_manifests import (
     ariadne_landing_audit_path,
     ariadne_results_path,
+    build_seed_selection_manifest,
     seeds_picked_path,
 )
 from ichor.hpc.active_learning.layout import active_iteration_dir
-from ichor.hpc.active_learning.seed_identity import (
-    deterministic_seed_uid,
-    selection_fingerprint_sha256,
-)
 from ichor.hpc.active_learning.daemon.state import atomic_write_json
 from ichor.hpc.active_learning.geometry_novelty import (
     apply_geometry_novelty_to_acquisition_config,
@@ -59,28 +56,16 @@ def _write_seed_selection(iter_dir, frame_ids, *, trajectory_sha256="a" * 64, ne
         if neighbours and int(frame_id) in neighbours:
             record["subspace_neighbour_frame_ids"] = list(neighbours[int(frame_id)])
         records.append(record)
-    payload = {
-        "schema_version": 2,
-        "campaign_uid": "geometry-novelty-test",
-        "iteration": iteration,
-        "models_version": 0,
-        "model_manifest_sha256": "c" * 64,
-        "trajectory_sha256": str(trajectory_sha256),
-        "n_picked": len(records),
-        "seed_records": records,
-    }
-    fingerprint = selection_fingerprint_sha256(payload)
-    payload["selection_fingerprint_sha256"] = fingerprint
-    for record in records:
-        record["seed_uid"] = deterministic_seed_uid(
-            campaign_uid="geometry-novelty-test",
-            iteration=iteration,
-            seed_id=int(record["seed_id"]),
-            frame_id=int(record["frame_id"]),
-            models_version=0,
-            model_manifest_sha256="c" * 64,
-            selection_fingerprint_sha256_value=fingerprint,
-        )
+    payload = build_seed_selection_manifest(
+        campaign_uid="geometry-novelty-test",
+        campaign_random_seed=0,
+        iteration=iteration,
+        models_version=0,
+        model_manifest_sha256="c" * 64,
+        trajectory_sha256=str(trajectory_sha256),
+        selection_strategy="hybrid_variance",
+        seed_records=records,
+    )
     path = seeds_picked_path(iter_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(path, payload)

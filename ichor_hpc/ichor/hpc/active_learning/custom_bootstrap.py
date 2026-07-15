@@ -31,14 +31,15 @@ from .daemon.state import atomic_write_json, atomic_write_text
 from .campaign_migrations import CURRENT_SCHEMA_VERSION
 from .ferebus_prior import contract_from_payload
 from .sampling.descriptors import mass_weighted_rmsd
+from .strict_yaml import load_yaml_strict
 from .versioning.manifest import sha256_file
 
 
 BOOTSTRAP_DIRECTORY = "bootstrap"
 CUSTOM_BOOTSTRAP_MANIFEST = "CUSTOM_BOOTSTRAP.json"
 MODEL_BOOTSTRAP_MANIFEST = "MODEL_BOOTSTRAP.json"
-CUSTOM_BOOTSTRAP_SCHEMA_VERSION = 1
-MODEL_BOOTSTRAP_SCHEMA_VERSION = 1
+CUSTOM_BOOTSTRAP_SCHEMA_VERSION = 2
+MODEL_BOOTSTRAP_SCHEMA_VERSION = 2
 BOOTSTRAP_DUPLICATE_RMSD_ANGSTROM = 1.0e-6
 SPLITS = ("train", "int_val", "ext_val")
 SPLIT_STEMS = {
@@ -89,7 +90,7 @@ class BootstrapPlan:
     pool_frames: List[Atoms]
     configured_targets: Dict[str, int]
     sources: Dict[str, Optional[BootstrapSource]]
-    polus_deficits: Dict[str, int]
+    diversity_deficits: Dict[str, int]
     excluded_pool_frame_ids: Tuple[int, ...]
     model: Optional[ModelBootstrap] = None
     warnings: List[str] = field(default_factory=list)
@@ -390,11 +391,14 @@ def _load_alf_sidecar(path: Path) -> Dict[str, Sequence[Any]]:
     if path.is_symlink():
         raise BootstrapInputError("bootstrap ALF sidecar refuses a symlink: " + str(path))
     try:
-        import yaml
-
-        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        payload = load_yaml_strict(path) or {}
     except Exception as exc:
-        raise BootstrapInputError("bootstrap ALF sidecar is unreadable: " + str(path)) from exc
+        raise BootstrapInputError(
+            "bootstrap ALF sidecar is unreadable: "
+            + str(path)
+            + ": "
+            + str(exc)
+        ) from exc
     if not isinstance(payload, Mapping):
         raise BootstrapInputError("bootstrap ALF sidecar must be a mapping")
     aliases = {
@@ -406,13 +410,24 @@ def _load_alf_sidecar(path: Path) -> Dict[str, Sequence[Any]]:
         "ext_val": "ext_val",
     }
     out: Dict[str, Sequence[Any]] = {}
+    source_keys: Dict[str, str] = {}
     for key, value in payload.items():
         canonical = aliases.get(str(key))
         if canonical is None:
             raise BootstrapInputError("unknown bootstrap ALF sidecar key: " + str(key))
         if not isinstance(value, (list, tuple)):
             raise BootstrapInputError("bootstrap ALF sidecar entries must be lists")
+        if canonical in out:
+            raise BootstrapInputError(
+                "bootstrap ALF sidecar defines both "
+                + repr(source_keys[canonical])
+                + " and "
+                + repr(str(key))
+                + " for "
+                + canonical
+            )
         out[canonical] = list(value)
+        source_keys[canonical] = str(key)
     return out
 
 
@@ -758,7 +773,7 @@ def inspect_bootstrap_inputs(
         pool_frames=frames,
         configured_targets=configured,
         sources=sources,
-        polus_deficits=deficits,
+        diversity_deficits=deficits,
         excluded_pool_frame_ids=excluded,
         model=model,
     )
@@ -973,7 +988,7 @@ def commit_bootstrap_plan(plan: BootstrapPlan) -> Dict[str, Any]:
             "configured_targets": dict(plan.configured_targets),
             "effective_qm_targets": plan.effective_qm_targets,
             "supplied_counts": plan.supplied_counts,
-            "polus_deficits": dict(plan.polus_deficits),
+            "diversity_deficits": dict(plan.diversity_deficits),
             "effective_training_count": int(plan.effective_training_count),
             "excluded_pool_frame_ids": [int(value) for value in plan.excluded_pool_frame_ids],
             "sources": source_records,
@@ -1026,14 +1041,106 @@ def _plan_identity(plan: BootstrapPlan) -> str:
     ).hexdigest()
 
 
+def _exact_nonnegative_int(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise BootstrapInputError(label + " must be a non-negative integer")
+    return value
+
+
+def _strict_split_counts(value: Any, label: str) -> Dict[str, int]:
+    if not isinstance(value, dict) or set(value) != set(SPLITS):
+        raise BootstrapInputError(
+            label + " must contain exactly " + repr(list(SPLITS))
+        )
+    return {
+        split: _exact_nonnegative_int(value[split], label + "." + split)
+        for split in SPLITS
+    }
+
+
+def _strict_sha256(value: Any, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise BootstrapInputError(label + " must be a lowercase SHA-256 digest")
+    return value
+
+
+def _payload_plan_identity(payload: Mapping[str, Any]) -> str:
+    sources = payload["sources"]
+    model = payload.get("model")
+    identity = {
+        "custom_bootstrap": payload["custom_bootstrap"],
+        "pool_sha256": payload["pool_sha256"],
+        "targets": payload["configured_targets"],
+        "sources": {
+            split: (
+                None
+                if sources[split] is None
+                else {
+                    "kind": sources[split]["kind"],
+                    "sha256": sources[split]["source_sha256"],
+                    "count": sources[split]["count"],
+                    "alf": sources[split]["alf_zero_indexed"],
+                }
+            )
+            for split in SPLITS
+        },
+        "model": (
+            None
+            if model is None
+            else {
+                "training_count": model["training_count"],
+                "prior_mean_contract_sha256": str(
+                    model["prior_mean_contract"].get("contract_sha256") or ""
+                ),
+                "files": [
+                    (record["property"], record["atom"], record["sha256"])
+                    for record in model["files"]
+                ],
+            }
+        ),
+    }
+    return hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def read_custom_bootstrap_manifest(campaign_dir: str | Path) -> Dict[str, Any]:
     path = custom_bootstrap_manifest_path(campaign_dir)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise BootstrapInputError("custom bootstrap manifest is unreadable: " + str(path)) from exc
-    if not isinstance(payload, dict) or int(payload.get("schema_version", -1)) != CUSTOM_BOOTSTRAP_SCHEMA_VERSION:
+    if not isinstance(payload, dict):
+        raise BootstrapInputError("custom bootstrap manifest must be an object")
+    expected_fields = {
+        "schema_version",
+        "campaign_schema_version",
+        "custom_bootstrap",
+        "pool_sha256",
+        "configured_targets",
+        "effective_qm_targets",
+        "supplied_counts",
+        "diversity_deficits",
+        "effective_training_count",
+        "excluded_pool_frame_ids",
+        "sources",
+        "model",
+        "plan_identity_sha256",
+        "confirmed",
+        "bootstrap_inputs_root",
+    }
+    if set(payload) != expected_fields:
+        raise BootstrapInputError("custom bootstrap manifest fields are invalid")
+    if payload.get("schema_version") != CUSTOM_BOOTSTRAP_SCHEMA_VERSION:
         raise BootstrapInputError("custom bootstrap manifest schema is invalid")
+    if payload.get("campaign_schema_version") != CURRENT_SCHEMA_VERSION:
+        raise BootstrapInputError("custom bootstrap campaign schema is invalid")
+    if not isinstance(payload.get("custom_bootstrap"), bool):
+        raise BootstrapInputError("custom_bootstrap must be a boolean")
     root = Path(campaign_dir) / str(payload.get("bootstrap_inputs_root") or "")
     if root.resolve(strict=False) != bootstrap_inputs_dir(campaign_dir).resolve(strict=False):
         raise BootstrapInputError("custom bootstrap manifest root is invalid")
@@ -1056,6 +1163,40 @@ def read_custom_bootstrap_manifest(campaign_dir: str | Path) -> Dict[str, Any]:
         )
     if payload.get("confirmed") is not True:
         raise BootstrapInputError("custom bootstrap manifest is not confirmed")
+    pool_sha256 = _strict_sha256(payload.get("pool_sha256"), "pool_sha256")
+    from .acquisition.trajectory_pool import TrajectoryPool
+
+    pool = TrajectoryPool.load(campaign_dir)
+    if pool_sha256 != pool.sha256:
+        raise BootstrapInputError(
+            "custom bootstrap manifest is bound to a different trajectory pool"
+        )
+    configured = _strict_split_counts(
+        payload.get("configured_targets"), "configured_targets"
+    )
+    supplied = _strict_split_counts(
+        payload.get("supplied_counts"), "supplied_counts"
+    )
+    deficits = _strict_split_counts(
+        payload.get("diversity_deficits"), "diversity_deficits"
+    )
+    effective_raw = payload.get("effective_qm_targets")
+    if not isinstance(effective_raw, dict) or set(effective_raw) != {
+        *SPLITS,
+        "total",
+    }:
+        raise BootstrapInputError("effective_qm_targets fields are invalid")
+    effective = {
+        key: _exact_nonnegative_int(
+            effective_raw[key], "effective_qm_targets." + key
+        )
+        for key in (*SPLITS, "total")
+    }
+    if effective["total"] != sum(effective[split] for split in SPLITS):
+        raise BootstrapInputError("effective_qm_targets total is inconsistent")
+    sources = payload.get("sources")
+    if not isinstance(sources, dict) or set(sources) != set(SPLITS):
+        raise BootstrapInputError("custom bootstrap sources are invalid")
     raw_excluded = payload.get("excluded_pool_frame_ids")
     if not isinstance(raw_excluded, list):
         raise BootstrapInputError(
@@ -1063,19 +1204,12 @@ def read_custom_bootstrap_manifest(campaign_dir: str | Path) -> Dict[str, Any]:
         )
     excluded: List[int] = []
     for value in raw_excluded:
-        if isinstance(value, bool):
+        frame_id = _exact_nonnegative_int(
+            value, "custom bootstrap excluded pool-frame ID"
+        )
+        if frame_id >= pool.n_frames():
             raise BootstrapInputError(
-                "custom bootstrap excluded pool-frame IDs must be integers"
-            )
-        try:
-            frame_id = int(value)
-        except (TypeError, ValueError) as exc:
-            raise BootstrapInputError(
-                "custom bootstrap excluded pool-frame IDs must be integers"
-            ) from exc
-        if frame_id < 0 or str(value).strip() != str(frame_id):
-            raise BootstrapInputError(
-                "custom bootstrap excluded pool-frame IDs are invalid"
+                "custom bootstrap excluded pool-frame ID is out of range"
             )
         excluded.append(frame_id)
     if len(set(excluded)) != len(excluded):
@@ -1099,24 +1233,67 @@ def read_custom_bootstrap_manifest(campaign_dir: str | Path) -> Dict[str, Any]:
             raise BootstrapInputError(label + " is missing")
         return candidate
 
-    for split, record in dict(payload.get("sources") or {}).items():
-        if split not in SPLITS:
-            raise BootstrapInputError("custom bootstrap manifest has an invalid split")
+    committed_frames: List[Atoms] = []
+    for split, record in sources.items():
         if record is None:
+            if supplied[split] != 0:
+                raise BootstrapInputError(
+                    "supplied_counts." + split + " has no source record"
+                )
             continue
         if not isinstance(record, dict):
             raise BootstrapInputError("custom bootstrap source record is invalid")
+        expected_source_fields = {
+            "kind",
+            "operator_path",
+            "source_path",
+            "source_sha256",
+            "canonical_xyz",
+            "canonical_xyz_sha256",
+            "count",
+            "alf_zero_indexed",
+            "alf_one_indexed",
+            "extra_columns",
+        }
+        if set(record) != expected_source_fields:
+            raise BootstrapInputError(
+                split + " custom bootstrap source fields are invalid"
+            )
+        if record.get("kind") not in {"xyz", "csv"}:
+            raise BootstrapInputError(split + " bootstrap source kind is invalid")
+        count = _exact_nonnegative_int(record.get("count"), split + " source count")
+        if count != supplied[split]:
+            raise BootstrapInputError(split + " supplied source count mismatch")
         source = committed_file(record.get("source_path"), split + " source")
         canonical = committed_file(record.get("canonical_xyz"), split + " canonical XYZ")
-        if sha256_file(source) != str(record.get("source_sha256") or ""):
+        source_digest = _strict_sha256(
+            record.get("source_sha256"), split + " source_sha256"
+        )
+        canonical_digest = _strict_sha256(
+            record.get("canonical_xyz_sha256"),
+            split + " canonical_xyz_sha256",
+        )
+        if sha256_file(source) != source_digest:
             raise BootstrapInputError(split + " bootstrap source SHA mismatch")
-        if sha256_file(canonical) != str(record.get("canonical_xyz_sha256") or ""):
+        if sha256_file(canonical) != canonical_digest:
             raise BootstrapInputError(split + " canonical bootstrap SHA mismatch")
+        trajectory = Trajectory(canonical)
+        trajectory.read()
+        frames = [frame.copy() for frame in trajectory]
+        if len(frames) != count:
+            raise BootstrapInputError(split + " canonical bootstrap count mismatch")
+        _validate_molecular_identity(frames, pool.frame(0), split + " canonical")
+        committed_frames.extend(frames)
 
     model = payload.get("model")
     if model is not None:
         if not isinstance(model, dict):
             raise BootstrapInputError("model-bootstrap record is invalid")
+        if model.get("schema_version") != MODEL_BOOTSTRAP_SCHEMA_VERSION:
+            raise BootstrapInputError("model-bootstrap schema is invalid")
+        model_training_count = _exact_nonnegative_int(
+            model.get("training_count"), "model training_count"
+        )
         model_manifest = committed_file(MODEL_BOOTSTRAP_MANIFEST, "model-bootstrap manifest")
         try:
             model_payload = json.loads(model_manifest.read_text(encoding="utf-8"))
@@ -1147,6 +1324,66 @@ def read_custom_bootstrap_manifest(campaign_dir: str | Path) -> Dict[str, Any]:
             raise BootstrapInputError(
                 "model-bootstrap reconstructed training XYZ SHA mismatch"
             )
+        trajectory = Trajectory(reconstructed)
+        trajectory.read()
+        model_frames = [frame.copy() for frame in trajectory]
+        if len(model_frames) != model_training_count:
+            raise BootstrapInputError("model-bootstrap reconstructed count mismatch")
+        _validate_molecular_identity(
+            model_frames,
+            pool.frame(0),
+            "model-bootstrap reconstructed training",
+        )
+        committed_frames.extend(model_frames)
+    else:
+        model_training_count = 0
+
+    expected_effective = dict(configured)
+    if model is not None:
+        expected_effective["train"] = 0
+    expected_effective["total"] = sum(
+        expected_effective[split] for split in SPLITS
+    )
+    if effective != expected_effective:
+        raise BootstrapInputError("effective_qm_targets are inconsistent")
+    expected_deficits = {
+        split: (
+            0
+            if split == "train" and model is not None
+            else configured[split] - supplied[split]
+        )
+        for split in SPLITS
+    }
+    if any(value < 0 for value in expected_deficits.values()):
+        raise BootstrapInputError("bootstrap supplied counts exceed configured targets")
+    if deficits != expected_deficits:
+        raise BootstrapInputError("diversity_deficits are inconsistent")
+    expected_training_count = (
+        model_training_count if model is not None else configured["train"]
+    )
+    if _exact_nonnegative_int(
+        payload.get("effective_training_count"), "effective_training_count"
+    ) != expected_training_count:
+        raise BootstrapInputError("effective_training_count is inconsistent")
+    if not payload["custom_bootstrap"] and (
+        model is not None or any(value != 0 for value in supplied.values())
+    ):
+        raise BootstrapInputError(
+            "custom bootstrap inputs exist while custom_bootstrap is false"
+        )
+    recomputed_excluded = _pool_matches(
+        committed_frames,
+        pool.to_atoms_list(),
+    )
+    if tuple(excluded) != recomputed_excluded:
+        raise BootstrapInputError(
+            "custom bootstrap excluded pool-frame IDs are inconsistent"
+        )
+    plan_identity = _strict_sha256(
+        payload.get("plan_identity_sha256"), "plan_identity_sha256"
+    )
+    if plan_identity != _payload_plan_identity(payload):
+        raise BootstrapInputError("custom bootstrap plan identity mismatch")
     return payload
 
 

@@ -35,8 +35,8 @@ from ichor.hpc.active_learning.submit.sacct_poll import JobObservation, JobStatu
 
 
 _SBATCH_PHASES = (
-    "PHASE_A_POLUS", "INITIAL_GAUSSIAN", "INITIAL_AIMALL", "INITIAL_FEREBUS",
-    "ARIADNE_ARRAY", "PHASE_B_POLUS", "GAUSSIAN", "AIMALL", "FEREBUS",
+    "PHASE_A_DIVERSITY", "INITIAL_GAUSSIAN", "INITIAL_AIMALL", "INITIAL_FEREBUS",
+    "ARIADNE_ARRAY", "PHASE_B_DIVERSITY", "GAUSSIAN", "AIMALL", "FEREBUS",
 )
 
 
@@ -132,7 +132,7 @@ def test_run_handles_malformed_state_json_without_traceback(tmp_path):
 
 def test_pre_submit_intent_without_job_id_recovers_by_accounting_name(tmp_path):
     def lookup(state, phase, intent):
-        assert phase is CampaignPhase.PHASE_A_POLUS
+        assert phase is CampaignPhase.PHASE_A_DIVERSITY
         assert intent["status"] == "PRE_SUBMIT"
         return SimpleNamespace(
             job_id="777",
@@ -146,12 +146,12 @@ def test_pre_submit_intent_without_job_id_recovers_by_accounting_name(tmp_path):
 
     d = _make_daemon(tmp_path, job_name_accounting_finder=lookup)
     state = fresh_campaign_state(max_iterations=1)
-    state.phase = CampaignPhase.PHASE_A_POLUS
+    state.phase = CampaignPhase.PHASE_A_DIVERSITY
     write_state(d.state_path(), state)
     submission_intent.write_pre_submit_intent(
         d.campaign_dir,
         campaign_uid=state.campaign_uid,
-        phase_name=CampaignPhase.PHASE_A_POLUS.value,
+        phase_name=CampaignPhase.PHASE_A_DIVERSITY.value,
         iteration=0,
     )
 
@@ -159,10 +159,10 @@ def test_pre_submit_intent_without_job_id_recovers_by_accounting_name(tmp_path):
 
     assert status is TickStatus.SUBMITTED
     recovered = read_state(d.state_path())
-    assert recovered.pending_jobs[CampaignPhase.PHASE_A_POLUS.value] == "777"
+    assert recovered.pending_jobs[CampaignPhase.PHASE_A_DIVERSITY.value] == "777"
     intent = submission_intent.load_intent(
         d.campaign_dir,
-        CampaignPhase.PHASE_A_POLUS.value,
+        CampaignPhase.PHASE_A_DIVERSITY.value,
         0,
     )
     assert intent["status"] == "ADOPTED"
@@ -172,18 +172,18 @@ def test_pre_submit_intent_without_job_id_recovers_by_accounting_name(tmp_path):
 def test_queue_lifecycle_timestamps_are_recorded_for_successful_job(tmp_path):
     d = _make_daemon(tmp_path)
     state = fresh_campaign_state(max_iterations=1)
-    state.phase = CampaignPhase.PHASE_A_POLUS
-    state.pending_jobs[CampaignPhase.PHASE_A_POLUS.value] = "999"
+    state.phase = CampaignPhase.PHASE_A_DIVERSITY
+    state.pending_jobs[CampaignPhase.PHASE_A_DIVERSITY.value] = "999"
     write_state(d.state_path(), state)
     submission_intent.write_pre_submit_intent(
         d.campaign_dir,
         campaign_uid=state.campaign_uid,
-        phase_name=CampaignPhase.PHASE_A_POLUS.value,
+        phase_name=CampaignPhase.PHASE_A_DIVERSITY.value,
         iteration=0,
     )
     submission_intent.mark_submitted(
         d.campaign_dir,
-        CampaignPhase.PHASE_A_POLUS.value,
+        CampaignPhase.PHASE_A_DIVERSITY.value,
         0,
         "999",
         expected_tasks=1,
@@ -193,7 +193,7 @@ def test_queue_lifecycle_timestamps_are_recorded_for_successful_job(tmp_path):
 
     intent = submission_intent.load_intent(
         d.campaign_dir,
-        CampaignPhase.PHASE_A_POLUS.value,
+        CampaignPhase.PHASE_A_DIVERSITY.value,
         0,
     )
     lifecycle = intent["queue_lifecycle"]
@@ -233,12 +233,12 @@ def test_pre_submit_intent_without_accounted_job_halts_instead_of_resubmitting(t
     executor = MockPhaseExecutor(treat_as_sbatch=set(_SBATCH_PHASES))
     d = _make_daemon(tmp_path, executor=executor, job_name_accounting_finder=lookup)
     state = fresh_campaign_state(max_iterations=1)
-    state.phase = CampaignPhase.PHASE_A_POLUS
+    state.phase = CampaignPhase.PHASE_A_DIVERSITY
     write_state(d.state_path(), state)
     submission_intent.write_pre_submit_intent(
         d.campaign_dir,
         campaign_uid=state.campaign_uid,
-        phase_name=CampaignPhase.PHASE_A_POLUS.value,
+        phase_name=CampaignPhase.PHASE_A_DIVERSITY.value,
         iteration=0,
     )
 
@@ -285,10 +285,10 @@ def test_tick_initialises_state_on_first_call(tmp_path):
     d = _make_daemon(tmp_path)
     assert not d.state_path().exists()
     status = d.tick()
-    # First tick performs INIT -> PHASE_A_POLUS advance (INIT is inline).
+    # First tick performs INIT -> PHASE_A_DIVERSITY advance (INIT is inline).
     assert status == TickStatus.ADVANCED
     state = read_state(d.state_path())
-    assert state.phase is CampaignPhase.PHASE_A_POLUS
+    assert state.phase is CampaignPhase.PHASE_A_DIVERSITY
 
 
 def test_tick_refuses_fresh_state_when_campaign_has_committed_artifacts(tmp_path):
@@ -305,19 +305,19 @@ def test_tick_refuses_fresh_state_when_campaign_has_committed_artifacts(tmp_path
 
 def test_tick_submits_sbatch_phase_then_polls(tmp_path):
     d = _make_daemon(tmp_path)
-    d.tick()  # INIT -> PHASE_A_POLUS
-    # Now phase is PHASE_A_POLUS which is SLURM-backed.
+    d.tick()  # INIT -> PHASE_A_DIVERSITY
+    # Now phase is PHASE_A_DIVERSITY which is SLURM-backed.
     status = d.tick()
     assert status == TickStatus.SUBMITTED
     state = read_state(d.state_path())
-    assert state.phase is CampaignPhase.PHASE_A_POLUS
-    assert state.pending_jobs[CampaignPhase.PHASE_A_POLUS.value] == "MOCK-1"
+    assert state.phase is CampaignPhase.PHASE_A_DIVERSITY
+    assert state.pending_jobs[CampaignPhase.PHASE_A_DIVERSITY.value] == "MOCK-1"
     # Next tick: poll returns COMPLETED -> advance.
     status = d.tick()
     assert status == TickStatus.ADVANCED
     state = read_state(d.state_path())
     assert state.phase is CampaignPhase.INITIAL_GAUSSIAN
-    assert state.pending_jobs[CampaignPhase.PHASE_A_POLUS.value] is None
+    assert state.pending_jobs[CampaignPhase.PHASE_A_DIVERSITY.value] is None
 
 
 def test_sbatch_journal_metadata_reserved_keys_do_not_crash_or_override(tmp_path):
@@ -326,7 +326,7 @@ def test_sbatch_journal_metadata_reserved_keys_do_not_crash_or_override(tmp_path
             super().__init__(treat_as_sbatch=set(_SBATCH_PHASES))
 
         def submit_or_run(self, state, phase):
-            if phase is CampaignPhase.PHASE_A_POLUS:
+            if phase is CampaignPhase.PHASE_A_DIVERSITY:
                 return PhaseResult(
                     is_complete=False,
                     submitted_job_id="123",
@@ -345,14 +345,14 @@ def test_sbatch_journal_metadata_reserved_keys_do_not_crash_or_override(tmp_path
             return super().submit_or_run(state, phase)
 
     d = _make_daemon(tmp_path, executor=MetadataExecutor())
-    d.tick()  # INIT -> PHASE_A_POLUS
+    d.tick()  # INIT -> PHASE_A_DIVERSITY
 
     status = d.tick()
 
     assert status == TickStatus.SUBMITTED
     events = list(iter_events(d.journal_path()))
     sbatch = [event for event in events if event["event"] == "sbatch"][-1]
-    assert sbatch["phase"] == CampaignPhase.PHASE_A_POLUS.value
+    assert sbatch["phase"] == CampaignPhase.PHASE_A_DIVERSITY.value
     assert sbatch["job_id"] == "123"
     assert sbatch["iteration"] == 0
     assert sbatch["expected_tasks"] == 1
@@ -378,13 +378,13 @@ def test_phase_entry_exception_halts_and_persists_state(tmp_path):
 
 def test_tick_polling_keeps_state_when_job_running(tmp_path):
     d = _make_daemon(tmp_path, sacct=_running_poll)
-    d.tick()  # INIT -> PHASE_A_POLUS
-    d.tick()  # submit PHASE_A_POLUS
+    d.tick()  # INIT -> PHASE_A_DIVERSITY
+    d.tick()  # submit PHASE_A_DIVERSITY
     status = d.tick()  # poll -> RUNNING -> POLLING
     assert status == TickStatus.POLLING
     state = read_state(d.state_path())
-    assert state.phase is CampaignPhase.PHASE_A_POLUS
-    assert state.pending_jobs[CampaignPhase.PHASE_A_POLUS.value] == "MOCK-1"
+    assert state.phase is CampaignPhase.PHASE_A_DIVERSITY
+    assert state.pending_jobs[CampaignPhase.PHASE_A_DIVERSITY.value] == "MOCK-1"
 
 
 def _install_pending_array_state(d: Daemon, *, phase=CampaignPhase.INITIAL_AIMALL) -> None:
@@ -571,8 +571,8 @@ def test_tick_scrubs_when_failure_below_threshold(tmp_path):
     # With one task and one failure, success_ratio = 0 < (1 - 0.5) = 0.5, so HALT.
     executor = MockPhaseExecutor(treat_as_sbatch=set(_SBATCH_PHASES))
     d = _make_daemon(tmp_path, executor=executor, sacct=_failed_poll)
-    d.tick()  # INIT -> PHASE_A_POLUS
-    d.tick()  # submit PHASE_A_POLUS
+    d.tick()  # INIT -> PHASE_A_DIVERSITY
+    d.tick()  # submit PHASE_A_DIVERSITY
     status = d.tick()  # poll -> FAILED -> handle_failure (scrub by default)
     # SCRUB_AND_CONTINUE is the mock default action; full failure -> halt
     # because all failed and threshold not met. Actually with 1 failure / 1
@@ -606,8 +606,8 @@ def test_inflight_failure_threshold_uses_submission_snapshot(tmp_path):
     status = d.tick()
 
     assert status == TickStatus.ADVANCED
-    assert "postprocess:PHASE_A_POLUS" in executor.operations()
-    assert "handle_failure:PHASE_A_POLUS" not in executor.operations()
+    assert "postprocess:PHASE_A_DIVERSITY" in executor.operations()
+    assert "handle_failure:PHASE_A_DIVERSITY" not in executor.operations()
 
 
 def test_tick_halts_when_executor_handles_failure_with_halt(tmp_path):
@@ -616,8 +616,8 @@ def test_tick_halts_when_executor_handles_failure_with_halt(tmp_path):
         fail_action=FailureAction.HALT,
     )
     d = _make_daemon(tmp_path, executor=executor, sacct=_failed_poll)
-    d.tick()  # advance to PHASE_A_POLUS
-    d.tick()  # submit PHASE_A_POLUS
+    d.tick()  # advance to PHASE_A_DIVERSITY
+    d.tick()  # submit PHASE_A_DIVERSITY
     status = d.tick()  # poll fails, executor halts
     assert status == TickStatus.HALTED
     state = read_state(d.state_path())
@@ -627,8 +627,8 @@ def test_tick_halts_when_executor_handles_failure_with_halt(tmp_path):
 def test_strict_sbatch_producer_failure_halts_instead_of_scrub(tmp_path):
     executor = _StrictMockExecutor(treat_as_sbatch=set(_SBATCH_PHASES))
     d = _make_daemon(tmp_path, executor=executor, sacct=_failed_poll)
-    d.tick()  # INIT -> PHASE_A_POLUS
-    d.tick()  # submit PHASE_A_POLUS
+    d.tick()  # INIT -> PHASE_A_DIVERSITY
+    d.tick()  # submit PHASE_A_DIVERSITY
 
     status = d.tick()
 
@@ -675,7 +675,7 @@ def test_run_through_complete_campaign(tmp_path):
     state = read_state(d.state_path())
     assert state.phase is CampaignPhase.DONE
     # Two iterations means each per-iter sbatch phase ran twice (5 phases x 2 iters)
-    # plus the initial 4 sbatch phases (PHASE_A_POLUS + INITIAL_*).
+    # plus the initial 4 sbatch phases (PHASE_A_DIVERSITY + INITIAL_*).
     events = list(iter_events(d.journal_path()))
     sbatch_events = [e for e in events if e["event"] == "sbatch"]
     expected_sbatch = 4 + 2 * 5      # 4 initial + 5 per-iter * 2 iters
@@ -783,8 +783,8 @@ def test_postprocess_settle_retries_initially_missing_artifacts(tmp_path):
     d.sleep_fn = lambda seconds: sleeps.append(seconds)
     d.data_dir().mkdir(parents=True, exist_ok=True)
     state = fresh_campaign_state(max_iterations=1)
-    state.phase = CampaignPhase.PHASE_A_POLUS
-    state.pending_jobs[CampaignPhase.PHASE_A_POLUS.value] = "MOCK-1"
+    state.phase = CampaignPhase.PHASE_A_DIVERSITY
+    state.pending_jobs[CampaignPhase.PHASE_A_DIVERSITY.value] = "MOCK-1"
     write_state(d.state_path(), state)
 
     status = d.tick()
@@ -879,8 +879,8 @@ def test_run_loop_returns_nonzero_for_preexisting_halted_state(tmp_path):
 def test_generic_tick_exception_writes_last_exception_sidecar_and_halts(tmp_path):
     d = _make_daemon(tmp_path)
     state = fresh_campaign_state(max_iterations=1)
-    state.phase = CampaignPhase.PHASE_A_POLUS
-    state.pending_jobs[CampaignPhase.PHASE_A_POLUS.value] = "12345"
+    state.phase = CampaignPhase.PHASE_A_DIVERSITY
+    state.pending_jobs[CampaignPhase.PHASE_A_DIVERSITY.value] = "12345"
     write_state(d.state_path(), state)
 
     def raise_tick():
@@ -894,12 +894,12 @@ def test_generic_tick_exception_writes_last_exception_sidecar_and_halts(tmp_path
     assert payload["schema_version"] == 1
     assert payload["exception_type"] == "RuntimeError"
     assert "simulated tick failure" in payload["message"]
-    assert payload["phase"] == CampaignPhase.PHASE_A_POLUS.value
+    assert payload["phase"] == CampaignPhase.PHASE_A_DIVERSITY.value
     assert payload["iteration"] == 0
     assert "traceback" in payload
     recovered = read_state(d.state_path())
     assert recovered.phase is CampaignPhase.HALTED
-    assert recovered.pending_jobs[CampaignPhase.PHASE_A_POLUS.value] == "12345"
+    assert recovered.pending_jobs[CampaignPhase.PHASE_A_DIVERSITY.value] == "12345"
     events = list(iter_events(d.journal_path()))
     assert any(e.get("event") == "tick_error" for e in events)
     assert any(e.get("event") == "tick_exception_halted" for e in events)
@@ -909,7 +909,7 @@ def test_generic_tick_exception_can_re_raise_when_halt_disabled(tmp_path):
     d = _make_daemon(tmp_path)
     d.config.runtime.halt_on_tick_exception = False
     state = fresh_campaign_state(max_iterations=1)
-    state.phase = CampaignPhase.PHASE_A_POLUS
+    state.phase = CampaignPhase.PHASE_A_DIVERSITY
     write_state(d.state_path(), state)
 
     def raise_tick():
@@ -920,7 +920,7 @@ def test_generic_tick_exception_can_re_raise_when_halt_disabled(tmp_path):
     with pytest.raises(RuntimeError, match="simulated tick failure"):
         d._run_loop(max_ticks=1)
 
-    assert read_state(d.state_path()).phase is CampaignPhase.PHASE_A_POLUS
+    assert read_state(d.state_path()).phase is CampaignPhase.PHASE_A_DIVERSITY
 
 
 def test_transient_scheduler_failure_retries_once(tmp_path):
@@ -932,13 +932,13 @@ def test_transient_scheduler_failure_retries_once(tmp_path):
 
     assert status == TickStatus.RETRYING
     state = read_state(d.state_path())
-    assert state.phase is CampaignPhase.PHASE_A_POLUS
-    assert state.pending_jobs[CampaignPhase.PHASE_A_POLUS.value] is None
+    assert state.phase is CampaignPhase.PHASE_A_DIVERSITY
+    assert state.pending_jobs[CampaignPhase.PHASE_A_DIVERSITY.value] is None
     payload = json.loads(d.transient_retry_ledger_path().read_text(encoding="utf-8"))
     assert payload["schema_version"] == 2
     assert len(payload["attempts"]) == 1
     key, count = next(iter(payload["attempts"].items()))
-    assert key.startswith("PHASE_A_POLUS@0@round=0@tasks=")
+    assert key.startswith("PHASE_A_DIVERSITY@0@round=0@tasks=")
     assert count == 1
 
 
@@ -1083,7 +1083,7 @@ def test_journal_records_phase_transitions(tmp_path):
     transitions = [e for e in events if e["event"] == "phase_transition"]
     assert transitions, "expected at least one phase_transition event"
     assert transitions[0]["from_phase"] == "INIT"
-    assert transitions[0]["to_phase"] == "PHASE_A_POLUS"
+    assert transitions[0]["to_phase"] == "PHASE_A_DIVERSITY"
 
 
 # --- M15 F3: _apply_state_updates strict contract ----------------------

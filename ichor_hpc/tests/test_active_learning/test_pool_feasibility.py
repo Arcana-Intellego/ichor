@@ -9,7 +9,15 @@ from ichor.hpc.active_learning.daemon import pool_feasibility as pf
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "water_tetramer.xyz"
 
 
-def _config(*, bootstrap=12, seeds=8, final=4, max_iterations=1, skip=True):
+def _config(
+    *,
+    bootstrap=12,
+    seeds=8,
+    final=4,
+    max_iterations=1,
+    skip=True,
+    cooldown=1,
+):
     cfg = CampaignConfig()
     cfg.point_allocation.bootstrap_external_validation_size = 2
     cfg.point_allocation.bootstrap_internal_validation_size = 2
@@ -21,6 +29,7 @@ def _config(*, bootstrap=12, seeds=8, final=4, max_iterations=1, skip=True):
     )
     cfg.max_iterations = int(max_iterations)
     cfg.seed_selection.exclude_committed_seed_frames = bool(skip)
+    cfg.seed_selection.recent_seed_cooldown_iterations = int(cooldown)
     cfg._validate()
     return cfg
 
@@ -38,27 +47,50 @@ def test_pool_feasibility_passes_for_20_frame_first_live_smoke(monkeypatch, tmp_
 def test_pool_feasibility_fails_for_full_campaign_shortfall(monkeypatch, tmp_path):
     monkeypatch.setattr(pf, "_pool_frame_count", lambda campaign: 20)
 
-    with pytest.raises(pf.PoolFeasibilityError, match="12 \\+ 2 \\* 8 = 28"):
+    with pytest.raises(pf.PoolFeasibilityError, match="required_pool_frames=28"):
         pf.require_pool_feasibility(tmp_path, _config(max_iterations=2))
 
 
 def test_pool_feasibility_fails_when_bootstrap_leaves_no_seed_budget(monkeypatch, tmp_path):
     monkeypatch.setattr(pf, "_pool_frame_count", lambda campaign: 20)
 
-    with pytest.raises(pf.PoolFeasibilityError, match="16 \\+ 1 \\* 8 = 24"):
+    with pytest.raises(pf.PoolFeasibilityError, match="required_pool_frames=24"):
         pf.require_pool_feasibility(tmp_path, _config(bootstrap=16))
 
 
-def test_pool_feasibility_reuse_mode_requires_only_bootstrap(monkeypatch, tmp_path):
+def test_pool_feasibility_reuse_mode_still_requires_one_complete_seed_batch(
+    monkeypatch,
+    tmp_path,
+):
     monkeypatch.setattr(pf, "_pool_frame_count", lambda campaign: 20)
 
-    result = pf.require_pool_feasibility(
-        tmp_path,
-        _config(bootstrap=20, seeds=50, final=4, max_iterations=50, skip=False),
-    )
+    with pytest.raises(pf.PoolFeasibilityError, match="required_pool_frames=100"):
+        pf.require_pool_feasibility(
+            tmp_path,
+            _config(
+                bootstrap=20,
+                seeds=50,
+                final=4,
+                max_iterations=50,
+                skip=False,
+            ),
+        )
 
-    assert result.ok is True
-    assert result.required_pool_frames == 20
+
+def test_pool_feasibility_accounts_for_recent_seed_cooldown(monkeypatch, tmp_path):
+    monkeypatch.setattr(pf, "_pool_frame_count", lambda campaign: 23)
+
+    with pytest.raises(pf.PoolFeasibilityError, match="required_pool_frames=24"):
+        pf.require_pool_feasibility(
+            tmp_path,
+            _config(
+                bootstrap=12,
+                seeds=8,
+                max_iterations=4,
+                skip=False,
+                cooldown=2,
+            ),
+        )
 
 
 def test_pool_feasibility_counts_custom_geometry_topups_and_pool_exclusions(tmp_path):
@@ -68,7 +100,7 @@ def test_pool_feasibility_counts_custom_geometry_topups_and_pool_exclusions(tmp_
         commit_bootstrap_plan,
         inspect_bootstrap_inputs,
     )
-    from ichor.hpc.active_learning.sampling.polus_wrapper import _write_xyz_file
+    from ichor.hpc.active_learning.sampling.diversity import _write_xyz_file
 
     campaign = tmp_path / "c"
     campaign.mkdir()

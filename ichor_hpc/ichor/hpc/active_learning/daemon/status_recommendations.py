@@ -125,7 +125,7 @@ def _artifact_problem(payload: Dict[str, Any]) -> bool:
     if phase not in {
         CampaignPhase.SEED_SELECT.value,
         CampaignPhase.ARIADNE_ARRAY.value,
-        CampaignPhase.PHASE_B_POLUS.value,
+        CampaignPhase.PHASE_B_DIVERSITY.value,
         CampaignPhase.SPLIT.value,
         CampaignPhase.GAUSSIAN.value,
         CampaignPhase.AIMALL.value,
@@ -488,9 +488,9 @@ _PHASE_ACTIONS: Dict[str, tuple[str, str]] = {
         "start the daemon to begin the campaign",
         "campaign is initialised and no daemon work is active",
     ),
-    CampaignPhase.PHASE_A_POLUS.value: (
-        "start the daemon to submit or postprocess initial POLUS diversity sampling",
-        "the next phase is PHASE_A_POLUS",
+    CampaignPhase.PHASE_A_DIVERSITY.value: (
+        "start the daemon to submit or postprocess initial ICHOR diversity sampling",
+        "the next phase is PHASE_A_DIVERSITY",
     ),
     CampaignPhase.INITIAL_GAUSSIAN.value: (
         "start the daemon to submit or postprocess initial Gaussian jobs",
@@ -524,9 +524,9 @@ _PHASE_ACTIONS: Dict[str, tuple[str, str]] = {
         "start the daemon to submit or postprocess ARIADNE jobs",
         "the next phase is ARIADNE_ARRAY",
     ),
-    CampaignPhase.PHASE_B_POLUS.value: (
-        "start the daemon to run Phase B POLUS filtering/selection",
-        "the next phase is PHASE_B_POLUS",
+    CampaignPhase.PHASE_B_DIVERSITY.value: (
+        "start the daemon to run Phase B diversity filtering/selection",
+        "the next phase is PHASE_B_DIVERSITY",
     ),
     CampaignPhase.SPLIT.value: (
         "start the daemon to verify the exact pre-QM slot allocation",

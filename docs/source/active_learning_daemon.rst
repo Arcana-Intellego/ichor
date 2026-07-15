@@ -3,7 +3,7 @@ Active-Learning Daemon
 
 The :code:`ichor-al-daemon` command drives an end-to-end machine-learning-
 force-field active-learning campaign on a SLURM cluster. It orchestrates
-diversity sampling (POLUS), quantum chemistry (Gaussian + AIMAll),
+ICHOR-owned exact diversity sampling, quantum chemistry (Gaussian + AIMAll),
 Gaussian process training (FEREBUS), and differential adversarial seed acquisition
 (ARIADNE) -- committing each iteration's artefacts and writing
 an append-only journal that lets the campaign survive crashes, restarts,
@@ -27,7 +27,7 @@ Install the three packages in order::
     python3 -m pip install -e ichor_cli
 
 For a full Manchester CSF3/CSF4 live active-learning install, use the cluster
-installer. It creates the CSF-specific venv, checks sibling POLUS/FEREBUS_CPU/
+installer. It creates the CSF-specific venv, checks sibling FEREBUS_CPU/
 ARIADNE trees, builds ARIADNE/FEREBUS/PLUMED where needed, verifies xTB/ASE,
 and safely upserts ``~/ichor_config.yaml``::
 
@@ -183,7 +183,7 @@ Set ``campaign.custom_bootstrap: true`` to enable discovery under the fixed
 ``external_validation_set_bootstrap.xyz|csv``. Formats may be mixed between
 splits, but supplying both formats for one split is an error. Every supplied
 split may contain at most its matching ``point_allocation.bootstrap_*_size``;
-POLUS Phase A fills any deficit. Supplied geometries are mandatory and cannot
+ICHOR Phase A diversity fills any deficit. Supplied geometries are mandatory and cannot
 be silently replaced if Gaussian or AIMAll rejects them.
 
 CSV files must begin with the complete consecutive ``f1..f(3N-6)`` ALF feature
@@ -198,7 +198,7 @@ baseline. It is mutually exclusive with a training-set XYZ/CSV. The directory
 must contain exactly one model for every molecule atom and every required
 property: IQA plus all entries in ``ferebus.properties``. Model training-row
 count replaces ``bootstrap_training_size``; only missing internal/external
-validation slots are filled by POLUS. Imported models become immutable model
+validation slots are filled by ICHOR diversity sampling. Imported models become immutable model
 version 0 without a FEREBUS optimisation job, and their original X/Y rows are
 prepended and verified during every later retraining.
 
@@ -279,11 +279,6 @@ Backend availability
      - Build from source with oneAPI/MKL and install into the active venv
      - :code:`--mode live`
      - :code:`python -c "import ariadne"`
-   * - POLUS (DIVSampler)
-     - :code:`pip install -e POLUS/polus_core_subpackage --no-deps` (in same env as ichor_hpc)
-     - :code:`--mode live`
-     - :code:`python -c "import polus.samplers.RS.randomSampling"`
-
 The :code:`ichor-al-daemon` :code:`start --mode live` command exits cleanly
 (no partial writes) if any of the above checks fail. You can also run
 the backend preflight command directly::
@@ -399,7 +394,7 @@ after successful QM labelling and FEREBUS training, commits version :code:`N`::
               trace.jsonl  (optional detailed optimiser trace)
               MANIFEST.json
       phase_b/
-        selected_raw.xyz
+        considered_candidates.xyz
         selected.xyz
         SELECTION.json
       allocation/
@@ -432,7 +427,7 @@ Resource evidence, scripts, and scratch
 
 Live resource requests are resolved from producer-owned evidence after exact
 staging. The daemon does not substitute guessed frame, atom, feature, or row
-counts. Examples include the SHA-pinned root :code:`pool.xyz` for POLUS Phase
+counts. Examples include the SHA-pinned root :code:`pool.xyz` for ICHOR Phase
 A, :code:`ARIADNE_RESULTS.json` for Phase B, exact :code:`POINTS.txt` and
 GJF/WFN dimensions for Gaussian and AIMAll, the ARIADNE task/model manifests,
 and the FEREBUS task manifest plus split CSV hashes. Missing evidence halts an
@@ -441,7 +436,7 @@ actual submission with a precise error.
 Every submission attempt receives an immutable schema-v1 resource record::
 
     .DATA/ACTIVE_LEARNING/resource_resolutions/
-      PHASE_A_POLUS/iteration-000000/r0000-a0001-1234abcd.json
+      PHASE_A_DIVERSITY/iteration-000000/r0000-a0001-1234abcd.json
 
 The record is bound by SHA-256 to the submission intent and job script. It
 contains formula inputs, active scientific workers, any CPUs allocated only
@@ -514,7 +509,7 @@ advisory :code:`p95 * 1.25` memory and :code:`p95 * 1.5` walltime values.
 Telemetry never modifies later requests automatically and a telemetry failure
 does not invalidate scientific output.
 
-POLUS stores exact float64 condensed pair distances. It uses blockwise process
+ICHOR diversity sampling stores exact float64 condensed pair distances. It uses blockwise process
 workers with one BLAS thread each, so it never constructs full
 :code:`N x N` or :code:`N x N x F` arrays. If the condensed store exceeds the
 configured in-memory fraction, it is placed in the task scratch leaf and free
@@ -682,7 +677,7 @@ postprocess parser in the daemon process).
    INIT
      |
      v
-   PHASE_A_POLUS  (sbatch)        Initial diverse sub-sample.
+   PHASE_A_DIVERSITY  (sbatch)        Initial diverse sub-sample.
      |
      v
    INITIAL_GAUSSIAN  (sbatch)     Single-point energies on the sample.
@@ -708,7 +703,7 @@ postprocess parser in the daemon process).
    ARIADNE_ARRAY  (sbatch)      |  Per-seed adversarial descent.
      |                         |
      v                         |
-   PHASE_B_POLUS  (sbatch)      |  POLUS FPS over the adversarial pool.
+   PHASE_B_DIVERSITY  (sbatch)      |  Exact ICHOR maximin sampling over the adversarial pool.
      |                         |
      v                         |
    SPLIT  (inline)              |  Persist the pre-QM exact train/internal-

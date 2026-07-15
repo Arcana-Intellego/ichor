@@ -39,6 +39,7 @@ def _seed_iter_pool(campaign_dir, iteration, results, *, config=None):
     )
     from ichor.hpc.active_learning.handoff_manifests import (
         ARIADNE_RESULTS_SCHEMA_VERSION,
+        build_seed_selection_manifest,
         seeds_picked_path,
         write_ariadne_results_manifest,
     )
@@ -47,11 +48,7 @@ def _seed_iter_pool(campaign_dir, iteration, results, *, config=None):
         active_iteration_dir,
         ariadne_seed_dir,
     )
-    from ichor.hpc.active_learning.seed_identity import (
-        deterministic_seed_uid,
-        selection_fingerprint_sha256,
-        write_ariadne_task_map,
-    )
+    from ichor.hpc.active_learning.seed_identity import write_ariadne_task_map
     from ichor.hpc.active_learning.sampling_protocol import resolve_sampling_protocol
     from ichor.hpc.active_learning.versioning.manifest import sha256_file
 
@@ -102,32 +99,21 @@ def _seed_iter_pool(campaign_dir, iteration, results, *, config=None):
             "selection_origin": "bulk",
             "variance_at_selection": 0.0,
         })
-    selection = {
-        "schema_version": 2,
-        "campaign_uid": "u",
-        "iteration": int(iteration),
-        "models_version": 0,
-        "model_manifest_sha256": "c" * 64,
-        "trajectory_sha256": str(trajectory_pool.sha256),
-        "n_picked": len(seed_records),
-        "seed_records": seed_records,
-    }
-    fingerprint = selection_fingerprint_sha256(selection)
-    selection["selection_fingerprint_sha256"] = fingerprint
-    for record in seed_records:
-        record["seed_uid"] = deterministic_seed_uid(
-            campaign_uid="u",
-            iteration=int(iteration),
-            seed_id=int(record["seed_id"]),
-            frame_id=int(record["frame_id"]),
-            models_version=0,
-            model_manifest_sha256="c" * 64,
-            selection_fingerprint_sha256_value=fingerprint,
-        )
+    selection = build_seed_selection_manifest(
+        campaign_uid="u",
+        campaign_random_seed=0,
+        iteration=int(iteration),
+        models_version=0,
+        model_manifest_sha256="c" * 64,
+        trajectory_sha256=str(trajectory_pool.sha256),
+        selection_strategy="hybrid_variance",
+        seed_records=seed_records,
+    )
     selection_path = seeds_picked_path(iter_dir)
     selection_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(selection_path, selection)
     task_map_path = write_ariadne_task_map(iter_dir, selection)
+    selected_records = selection["seed_records"]
     resolved_protocol = resolve_sampling_protocol(
         campaign_dir,
         resolved_config,
@@ -154,7 +140,7 @@ def _seed_iter_pool(campaign_dir, iteration, results, *, config=None):
     accepted = []
     for array_task_id, payload in enumerate(results):
         seed_id = array_task_id + 1
-        seed_uid = str(seed_records[array_task_id]["seed_uid"])
+        seed_uid = str(selected_records[array_task_id]["seed_uid"])
         sd = ariadne_seed_dir(iter_dir, seed_id)
         sd.mkdir(parents=True, exist_ok=False)
         payload = dict(payload)

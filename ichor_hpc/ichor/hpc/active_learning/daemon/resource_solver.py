@@ -130,8 +130,8 @@ _SLURM_MEM_RE = re.compile(r"^([1-9][0-9]*)([KMGT]?)$", re.IGNORECASE)
 
 
 def backend_for_phase(phase_name: str) -> str:
-    if phase_name in ("PHASE_A_POLUS", "PHASE_B_POLUS"):
-        return "polus"
+    if phase_name in ("PHASE_A_DIVERSITY", "PHASE_B_DIVERSITY"):
+        return "diversity"
     if "GAUSSIAN" in phase_name:
         return "gaussian"
     if "AIMALL" in phase_name:
@@ -451,7 +451,7 @@ def _synthetic_evidence(
 ) -> Dict[str, Any]:
     """Return bounded dimensions for unit tests and explicit dry-run use only."""
     n_atoms = int(n_atoms_override or 12)
-    if backend == "polus":
+    if backend == "diversity":
         return {
             "source": "synthetic_test_evidence",
             "n_frames": 100,
@@ -577,7 +577,7 @@ def _phase_b_evidence_with_config(
         ariadne_results_path,
     )
     from ..layout import active_iteration_dir
-    from ..sampling.polus_wrapper import _phase_b_landing_safety_filter
+    from ..sampling.diversity import _phase_b_landing_safety_filter
     from ..sampling_protocol import load_sampling_protocol
 
     iter_dir = campaign_owned_path(
@@ -589,24 +589,16 @@ def _phase_b_evidence_with_config(
         config,
         iteration=int(iteration),
     )
-    accept_legacy = bool(
-        getattr(
-            protocol.effective_config.adversarial_safety,
-            "accept_legacy_missing_landing_safety",
-            False,
-        )
-    )
     payload, frames, records = ariadne_candidate_frames(
         iter_dir,
         expected_iteration=int(iteration),
-        accept_legacy_missing_landing_safety=accept_legacy,
+        accept_legacy_missing_landing_safety=False,
         expected_config_sha256=config_fingerprint(canonical_config(config)),
         require_batch_decision=True,
     )
     frames, records, safety_filter = _phase_b_landing_safety_filter(
         frames,
         records,
-        accept_legacy_missing_landing_safety=accept_legacy,
     )
     if not frames:
         raise ValueError("ARIADNE results contain no accepted Phase B candidates")
@@ -1107,10 +1099,10 @@ def collect_resource_evidence(
             config=config,
         )
     try:
-        if backend == "polus":
+        if backend == "diversity":
             return (
                 _pool_evidence(campaign_dir)
-                if phase_name == "PHASE_A_POLUS"
+                if phase_name == "PHASE_A_DIVERSITY"
                 else _phase_b_evidence_with_config(
                     campaign_dir, int(iteration), config
                 )
@@ -1380,7 +1372,7 @@ def _estimate_backend_memory_gb(
     safety = float(
         getattr(config.resources, "memory_estimate_safety_factor", 1.25)
     )
-    if backend == "polus":
+    if backend == "diversity":
         n = int(evidence["n_frames"])
         pairs = int(n * (n - 1) // 2)
         store_bytes = int(8 * pairs)
@@ -1400,7 +1392,7 @@ def _estimate_backend_memory_gb(
             "active_workers": workers,
             "unprotected_total_memory_gb": raw_gb,
         })
-        return total_gb, "polus_condensed_distance_store", extra
+        return total_gb, "diversity_condensed_distance_store", extra
     if backend == "gaussian":
         total_gb = max(float(candidate_cpus) * float(partition_gb), 1.0)
         return total_gb, "gaussian_partition_memory_for_gauss_mdef", extra
@@ -1589,14 +1581,14 @@ def _auto_cpu_target(
 ) -> Tuple[int, str, Dict[str, Any], float, str]:
     extra: Dict[str, Any] = {}
     evidence = dict(evidence or {})
-    if backend == "polus":
+    if backend == "diversity":
         n_frames = int(evidence["n_frames"])
         pairs = int(n_frames * (n_frames - 1) // 2)
-        target_pairs = int(config.resources.polus.target_pairs_per_worker)
+        target_pairs = int(config.resources.diversity.target_pairs_per_worker)
         wanted = max(1, int(math.ceil(float(pairs) / float(target_pairs))))
         active = min(
             wanted,
-            int(config.resources.polus.auto_max_workers),
+            int(config.resources.diversity.auto_max_workers),
             int(partition_max),
         )
         target = max(partition_min, active)
@@ -1606,7 +1598,7 @@ def _auto_cpu_target(
             "active_workers": active,
             "worker_target_before_caps": wanted,
         })
-        return target, "polus_pairs_per_worker", extra, 0.0, "polus_condensed_distance_store"
+        return target, "diversity_pairs_per_worker", extra, 0.0, "diversity_condensed_distance_store"
     if backend == "gaussian":
         n_atoms = int(evidence["max_n_atoms"])
         weighted = float(n_atoms) * _basis_factor(config) * _method_factor(config)
@@ -1842,18 +1834,18 @@ def resolve_phase_resources(
                 + " exceeds resolved resources.gaussian.cpus_per_task="
                 + str(scientific_cpus)
             )
-    if backend == "polus":
+    if backend == "diversity":
         pairs = int(evidence["n_frames"] * (evidence["n_frames"] - 1) // 2)
         wanted = max(
             1,
             int(math.ceil(
                 float(pairs)
-                / float(config.resources.polus.target_pairs_per_worker)
+                / float(config.resources.diversity.target_pairs_per_worker)
             )),
         )
         active_workers = min(
             wanted,
-            int(config.resources.polus.auto_max_workers),
+            int(config.resources.diversity.auto_max_workers),
             int(scientific_cpus),
         )
         store_bytes = int(8 * pairs)
@@ -1870,7 +1862,7 @@ def resolve_phase_resources(
                 * 1024.0 ** 2
             )
         fraction = float(
-            config.resources.polus.in_memory_distance_store_fraction
+            config.resources.diversity.in_memory_distance_store_fraction
         )
         in_memory = (
             store_bytes <= prospective_allocation_bytes
@@ -1885,7 +1877,7 @@ def resolve_phase_resources(
                 evidence["scratch_free_bytes_at_resolution"] = free_bytes
                 if free_bytes < required_bytes:
                     raise BackendSubmissionError(
-                        "file-backed POLUS condensed distances require "
+                        "file-backed diversity distances require "
                         + str(required_bytes)
                         + " free bytes under the campaign filesystem, but only "
                         + str(free_bytes)
@@ -2020,7 +2012,7 @@ def resolve_phase_resources(
             int(throttle) if throttle is not None else int(array_size),
         )
     scratch_modes = {
-        "polus": (
+        "diversity": (
             "file_backed_condensed_distances"
             if str(extra.get("distance_store_mode")) == "file"
             else "in_memory_condensed_distances"
@@ -2031,8 +2023,8 @@ def resolve_phase_resources(
         "ferebus": "temporary_environment_staging_runtime",
     }
     expected_scratch_bytes: Optional[int]
-    scratch_requirement_exact = backend == "polus"
-    if backend == "polus":
+    scratch_requirement_exact = backend == "diversity"
+    if backend == "diversity":
         expected_scratch_bytes = (
             int(extra.get("condensed_store_bytes", 0))
             if str(extra.get("distance_store_mode")) == "file"

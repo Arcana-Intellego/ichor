@@ -449,13 +449,13 @@ RESOURCE_FUTURE_EXACT = {
     "resources.defaults.walltime_hours",
     "resources.defaults.cpus_per_task",
     "resources.defaults.mem_per_cpu",
-    "resources.polus.partition",
-    "resources.polus.walltime_hours",
-    "resources.polus.cpus_per_task",
-    "resources.polus.mem_per_cpu",
-    "resources.polus.auto_max_workers",
-    "resources.polus.target_pairs_per_worker",
-    "resources.polus.in_memory_distance_store_fraction",
+    "resources.diversity.partition",
+    "resources.diversity.walltime_hours",
+    "resources.diversity.cpus_per_task",
+    "resources.diversity.mem_per_cpu",
+    "resources.diversity.auto_max_workers",
+    "resources.diversity.target_pairs_per_worker",
+    "resources.diversity.in_memory_distance_store_fraction",
     "resources.gaussian.partition",
     "resources.gaussian.walltime_hours",
     "resources.gaussian.cpus_per_task",
@@ -600,7 +600,7 @@ _POLICIES_EXACT: Dict[str, ConfigFieldPolicy] = {
         for path in RESOURCE_FUTURE_EXACT
     },
     **{
-        path: ConfigFieldPolicy("pre_phase_a", "pre_phase_a", "editable until Phase A POLUS begins")
+        path: ConfigFieldPolicy("pre_phase_a", "pre_phase_a", "editable until Phase A diversity begins")
         for path in PRE_PHASE_A_EXACT
     },
     **{
@@ -773,7 +773,7 @@ def _first_existing_path(campaign_dir: Union[str, Path], patterns: Iterable[str]
 def _phase_a_consumed(campaign_dir: Union[str, Path]) -> Optional[str]:
     intent = _phase_intent_file_exists(
         campaign_dir,
-        (CampaignPhase.PHASE_A_POLUS,),
+        (CampaignPhase.PHASE_A_DIVERSITY,),
     )
     if intent:
         return "Phase A submission intent exists: " + intent
@@ -964,14 +964,14 @@ def _phase_b_outputs_exist(campaign_dir: Union[str, Path], proposed_state: Campa
     if iteration < 1:
         return False
     iter_dir = _iteration_dir(campaign_dir, iteration)
-    if _phase_intent_exists(campaign_dir, CampaignPhase.PHASE_B_POLUS, iteration):
+    if _phase_intent_exists(campaign_dir, CampaignPhase.PHASE_B_DIVERSITY, iteration):
         return True
     from ..layout import active_allocation_dir, active_phase_b_dir
 
     for path in (
         active_phase_b_dir(iter_dir) / "SELECTION.json",
         active_phase_b_dir(iter_dir) / "selected.xyz",
-        active_phase_b_dir(iter_dir) / "selected_raw.xyz",
+        active_phase_b_dir(iter_dir) / "considered_candidates.xyz",
         active_allocation_dir(iter_dir) / "POINT_ALLOCATION.json",
     ):
         if path.exists():
@@ -988,7 +988,7 @@ def _phase_b_consumed_reason(
         return None
     intent = _phase_intent_file_exists(
         campaign_dir,
-        (CampaignPhase.PHASE_B_POLUS,),
+        (CampaignPhase.PHASE_B_DIVERSITY,),
         iteration=iteration,
     )
     if intent:
@@ -999,7 +999,7 @@ def _phase_b_consumed_reason(
     for path in (
         active_phase_b_dir(iter_dir) / "SELECTION.json",
         active_phase_b_dir(iter_dir) / "selected.xyz",
-        active_phase_b_dir(iter_dir) / "selected_raw.xyz",
+        active_phase_b_dir(iter_dir) / "considered_candidates.xyz",
         active_allocation_dir(iter_dir) / "POINT_ALLOCATION.json",
     ):
         if path.exists():
@@ -1083,7 +1083,7 @@ def _blocks_existing_phase_outputs(
         and _phase_outputs_lock_change(
             campaign_dir,
             proposed_state,
-            CampaignPhase.PHASE_B_POLUS,
+            CampaignPhase.PHASE_B_DIVERSITY,
             _phase_b_outputs_exist,
         )
     ):

@@ -193,7 +193,7 @@ def test_scratch_scheduler_state_keeps_missing_array_rows_inconclusive(
 def test_resource_plan_reports_local_and_missing_future_evidence(tmp_path):
     local = plan_phase(tmp_path, CampaignConfig(), "SEED_SELECT", 1)
     assert local["status"] == "local"
-    unavailable = plan_phase(tmp_path, CampaignConfig(), "PHASE_A_POLUS", 0)
+    unavailable = plan_phase(tmp_path, CampaignConfig(), "PHASE_A_DIVERSITY", 0)
     assert unavailable["status"] == "evidence_not_yet_produced"
 
 
@@ -207,7 +207,7 @@ def _campaign_byte_inventory(root: Path):
 
 def test_orphaned_resolution_is_not_reported_as_submitted(tmp_path):
     resolved = ResolvedPhaseResources(
-        backend="polus",
+        backend="diversity",
         partition="multicore",
         ntasks=1,
         cpus_per_task=1,
@@ -221,7 +221,7 @@ def test_orphaned_resolution_is_not_reported_as_submitted(tmp_path):
     )
     payload = resolution_payload(
         campaign_uid="uid",
-        phase_name="PHASE_A_POLUS",
+        phase_name="PHASE_A_DIVERSITY",
         iteration=0,
         attempt_id="orphan-attempt",
         submission_identity="r0000-a0001-orphaned",
@@ -231,7 +231,7 @@ def test_orphaned_resolution_is_not_reported_as_submitted(tmp_path):
     )
     binding = write_resolution(tmp_path, payload)
 
-    planned = plan_phase(tmp_path, CampaignConfig(), "PHASE_A_POLUS", 0)
+    planned = plan_phase(tmp_path, CampaignConfig(), "PHASE_A_DIVERSITY", 0)
 
     assert planned["status"] == "evidence_not_yet_produced"
     assert planned["orphaned_resolutions"] == [str(Path(binding["path"]).resolve())]
@@ -260,12 +260,12 @@ def test_resource_plan_prefers_immutable_submitted_resolution(tmp_path):
     intent = write_pre_submit_intent(
         tmp_path,
         campaign_uid="uid",
-        phase_name="PHASE_A_POLUS",
+        phase_name="PHASE_A_DIVERSITY",
         iteration=0,
         expected_tasks=1,
     )
     resolved = ResolvedPhaseResources(
-        backend="polus",
+        backend="diversity",
         partition="multicore",
         ntasks=1,
         cpus_per_task=10,
@@ -274,8 +274,8 @@ def test_resource_plan_prefers_immutable_submitted_resolution(tmp_path):
         partition_memory_per_core_gb=8.0,
         cpus_raw="auto",
         mem_per_cpu_raw="auto",
-        cpu_reason="polus_pairs_per_worker",
-        memory_reason="polus_condensed_distance_store",
+        cpu_reason="diversity_pairs_per_worker",
+        memory_reason="diversity_condensed_distance_store",
         extra={
             "active_workers": 10,
             "memory_only_cpus": 0,
@@ -284,7 +284,7 @@ def test_resource_plan_prefers_immutable_submitted_resolution(tmp_path):
     )
     payload = resolution_payload(
         campaign_uid="uid",
-        phase_name="PHASE_A_POLUS",
+        phase_name="PHASE_A_DIVERSITY",
         iteration=0,
         attempt_id=str(intent["attempt_id"]),
         submission_identity=str(intent["submission_identity"]),
@@ -295,20 +295,20 @@ def test_resource_plan_prefers_immutable_submitted_resolution(tmp_path):
     binding = write_resolution(tmp_path, payload)
     bind_resource_resolution(
         tmp_path,
-        "PHASE_A_POLUS",
+        "PHASE_A_DIVERSITY",
         0,
         path=str(binding["path"]),
         sha256=str(binding["sha256"]),
         formula_version=str(binding["formula_version"]),
         scratch_path_template="fixture",
     )
-    mark_submitted(tmp_path, "PHASE_A_POLUS", 0, "123", expected_tasks=1)
+    mark_submitted(tmp_path, "PHASE_A_DIVERSITY", 0, "123", expected_tasks=1)
 
-    submitted = plan_phase(tmp_path, CampaignConfig(), "PHASE_A_POLUS", 0)
+    submitted = plan_phase(tmp_path, CampaignConfig(), "PHASE_A_DIVERSITY", 0)
     assert submitted["status"] == "submitted"
     assert submitted["resources"]["cpus_per_task"] == 10
-    mark_completed(tmp_path, "PHASE_A_POLUS", 0)
-    completed = plan_phase(tmp_path, CampaignConfig(), "PHASE_A_POLUS", 0)
+    mark_completed(tmp_path, "PHASE_A_DIVERSITY", 0)
+    completed = plan_phase(tmp_path, CampaignConfig(), "PHASE_A_DIVERSITY", 0)
     assert completed["status"] == "completed"
 
 
@@ -316,12 +316,12 @@ def test_resource_plan_rejects_drifted_submitted_resolution(tmp_path):
     intent = write_pre_submit_intent(
         tmp_path,
         campaign_uid="uid",
-        phase_name="PHASE_A_POLUS",
+        phase_name="PHASE_A_DIVERSITY",
         iteration=0,
         expected_tasks=1,
     )
     resolved = ResolvedPhaseResources(
-        backend="polus",
+        backend="diversity",
         partition="multicore",
         ntasks=1,
         cpus_per_task=1,
@@ -335,7 +335,7 @@ def test_resource_plan_rejects_drifted_submitted_resolution(tmp_path):
     )
     payload = resolution_payload(
         campaign_uid="uid",
-        phase_name="PHASE_A_POLUS",
+        phase_name="PHASE_A_DIVERSITY",
         iteration=0,
         attempt_id=str(intent["attempt_id"]),
         submission_identity=str(intent["submission_identity"]),
@@ -346,7 +346,7 @@ def test_resource_plan_rejects_drifted_submitted_resolution(tmp_path):
     binding = write_resolution(tmp_path, payload)
     bind_resource_resolution(
         tmp_path,
-        "PHASE_A_POLUS",
+        "PHASE_A_DIVERSITY",
         0,
         path=str(binding["path"]),
         sha256="0" * 64,
@@ -355,7 +355,7 @@ def test_resource_plan_rejects_drifted_submitted_resolution(tmp_path):
     )
 
     with pytest.raises(ValueError, match="SHA-256 mismatch"):
-        plan_phase(tmp_path, CampaignConfig(), "PHASE_A_POLUS", 0)
+        plan_phase(tmp_path, CampaignConfig(), "PHASE_A_DIVERSITY", 0)
 
 
 def test_all_resource_plan_keeps_expected_future_absence_informational(tmp_path):
@@ -368,18 +368,18 @@ def test_all_resource_plan_keeps_expected_future_absence_informational(tmp_path)
     )
     statuses = {plan["phase"]: plan["status"] for plan in payload["plans"]}
     assert statuses["INIT"] == "local"
-    assert statuses["PHASE_A_POLUS"] == "evidence_not_yet_produced"
+    assert statuses["PHASE_A_DIVERSITY"] == "evidence_not_yet_produced"
     assert "Resource plan" in format_resource_plan(payload)
 
 
 def test_resource_plan_human_output_includes_formula_and_evidence_contract(tmp_path):
     payload = {
         "campaign_dir": str(tmp_path),
-        "current_phase": "PHASE_A_POLUS",
+        "current_phase": "PHASE_A_DIVERSITY",
         "current_iteration": 0,
         "plans": [
             {
-                "phase": "PHASE_A_POLUS",
+                "phase": "PHASE_A_DIVERSITY",
                 "iteration": 0,
                 "status": "submitted",
                 "resources": {
@@ -387,8 +387,8 @@ def test_resource_plan_human_output_includes_formula_and_evidence_contract(tmp_p
                     "cpus_per_task": 10,
                     "mem_per_cpu": "1G",
                     "estimated_total_memory_gb": 6.0,
-                    "cpu_reason": "polus_pairs_per_worker",
-                    "memory_reason": "polus_condensed_distance_store",
+                    "cpu_reason": "diversity_pairs_per_worker",
+                    "memory_reason": "diversity_condensed_distance_store",
                     "warnings": ["fixture warning"],
                     "extra": {
                         "active_workers": 10,
@@ -433,7 +433,7 @@ def test_resource_plan_human_output_includes_formula_and_evidence_contract(tmp_p
         ],
     }
     output = format_resource_plan(payload)
-    assert "cpu_formula=polus_pairs_per_worker" in output
+    assert "cpu_formula=diversity_pairs_per_worker" in output
     assert "evidence_sha256 pool.xyz " + "a" * 64 in output
     assert "scratch_template=scratch-template" in output
     assert "scratch_mode=file_backed_condensed_distances" in output
@@ -449,7 +449,7 @@ def test_resource_plan_parser_phase_and_all_are_mutually_exclusive():
             [
                 "resource-plan",
                 "--phase",
-                "PHASE_A_POLUS",
+                "PHASE_A_DIVERSITY",
                 "--all",
             ]
         )
@@ -457,15 +457,15 @@ def test_resource_plan_parser_phase_and_all_are_mutually_exclusive():
 
 def test_daemon_terminal_telemetry_is_advisory_and_journalled(tmp_path):
     state = fresh_campaign_state(campaign_uid="uid")
-    state.phase = CampaignPhase.PHASE_A_POLUS
+    state.phase = CampaignPhase.PHASE_A_DIVERSITY
     intent = write_pre_submit_intent(
         tmp_path,
         campaign_uid="uid",
-        phase_name="PHASE_A_POLUS",
+        phase_name="PHASE_A_DIVERSITY",
         iteration=0,
         expected_tasks=1,
     )
-    mark_submitted(tmp_path, "PHASE_A_POLUS", 0, "321", expected_tasks=1)
+    mark_submitted(tmp_path, "PHASE_A_DIVERSITY", 0, "321", expected_tasks=1)
     calls = []
 
     def collector(campaign_dir, *, intent, history_limit):
@@ -479,7 +479,7 @@ def test_daemon_terminal_telemetry_is_advisory_and_journalled(tmp_path):
     )
     daemon._collect_terminal_resource_usage(
         state,
-        CampaignPhase.PHASE_A_POLUS,
+        CampaignPhase.PHASE_A_DIVERSITY,
         "321",
     )
     assert calls[0][1]["attempt_id"] == intent["attempt_id"]
@@ -491,15 +491,15 @@ def test_daemon_terminal_telemetry_is_advisory_and_journalled(tmp_path):
 
 def test_daemon_telemetry_failure_does_not_raise(tmp_path):
     state = fresh_campaign_state(campaign_uid="uid")
-    state.phase = CampaignPhase.PHASE_A_POLUS
+    state.phase = CampaignPhase.PHASE_A_DIVERSITY
     write_pre_submit_intent(
         tmp_path,
         campaign_uid="uid",
-        phase_name="PHASE_A_POLUS",
+        phase_name="PHASE_A_DIVERSITY",
         iteration=0,
         expected_tasks=1,
     )
-    mark_submitted(tmp_path, "PHASE_A_POLUS", 0, "654", expected_tasks=1)
+    mark_submitted(tmp_path, "PHASE_A_DIVERSITY", 0, "654", expected_tasks=1)
 
     def collector(*_args, **_kwargs):
         raise RuntimeError("accounting lag")
@@ -511,7 +511,7 @@ def test_daemon_telemetry_failure_does_not_raise(tmp_path):
     )
     daemon._collect_terminal_resource_usage(
         state,
-        CampaignPhase.PHASE_A_POLUS,
+        CampaignPhase.PHASE_A_DIVERSITY,
         "654",
     )
     events = list(

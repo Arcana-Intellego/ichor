@@ -178,6 +178,7 @@ def _write_config(campaign, config):
 def _write_phase_a_sample(campaign):
     from ichor.hpc.active_learning.handoff_manifests import write_phase_a_sample_manifest
 
+    _write_pool(campaign)
     initial = bootstrap_selection_dir(campaign)
     initial.mkdir(parents=True, exist_ok=True)
     sample = initial / "selected.xyz"
@@ -210,7 +211,7 @@ def _write_phase_a_sample(campaign):
         "split": str(slot["split"]),
     }]
     write_phase_a_sample_manifest(initial, {
-        "phase": "PHASE_A_POLUS",
+        "phase": "PHASE_A_DIVERSITY",
         "iteration": 0,
         "sample_xyz": "selection/selected.xyz",
         "index_path": "selection/selected_indices.dat",
@@ -220,6 +221,7 @@ def _write_phase_a_sample(campaign):
         "descriptor": "mass_weighted_rmsd",
         "n_pool_frames": 1,
         "bootstrap_total_size": 1,
+        "source_pool_manifest": ".DATA/TRAJECTORY/pool.manifest.json",
         "point_allocation": {
             "manifest": "allocation/POINT_ALLOCATION.json",
             "targets": dict(allocation["targets"]),
@@ -454,7 +456,7 @@ def test_legacy_config_lock_is_rejected_without_compatibility_migration(tmp_path
             "default_walltime_hours": 24,
             "polus_walltime_hours": 2,
             "gaussian_walltime_hours": 24,
-            "polus_cpus_per_task": "auto",
+            "diversity_cpus_per_task": "auto",
             "gaussian_cpus_per_task": "auto",
             "aimall_cpus_per_task": "auto",
             "ariadne_cpus_per_task": "auto",
@@ -497,21 +499,21 @@ def test_retry_phase_requires_retryable_journal_event():
     state = fresh_campaign_state()
     success_report = ReconciliationReport(
         proposed_state=state,
-        last_phase_in_journal=CampaignPhase.PHASE_B_POLUS.value,
+        last_phase_in_journal=CampaignPhase.PHASE_B_DIVERSITY.value,
         last_iteration_in_journal=0,
         last_phase_event_in_journal="phase_succeeded",
         last_phase_retryable=False,
     )
     halted_report = ReconciliationReport(
         proposed_state=state,
-        last_phase_in_journal=CampaignPhase.PHASE_B_POLUS.value,
+        last_phase_in_journal=CampaignPhase.PHASE_B_DIVERSITY.value,
         last_iteration_in_journal=0,
         last_phase_event_in_journal="halt",
         last_phase_retryable=True,
     )
 
     assert cli_mod._retry_phase_from_cleaned_report(success_report) is None
-    assert cli_mod._retry_phase_from_cleaned_report(halted_report) is CampaignPhase.PHASE_B_POLUS
+    assert cli_mod._retry_phase_from_cleaned_report(halted_report) is CampaignPhase.PHASE_B_DIVERSITY
 
 
 def test_reconcile_apply_uses_safe_max_iterations_change(tmp_path, capsys):
@@ -765,7 +767,7 @@ def test_phase_b_config_change_blocks_after_selection_exists(tmp_path):
     (iter_dir / "phase_b" / "SELECTION.json").write_text("{}", encoding="utf-8")
 
     proposed = fresh_campaign_state()
-    proposed.phase = CampaignPhase.PHASE_B_POLUS
+    proposed.phase = CampaignPhase.PHASE_B_DIVERSITY
     proposed.iteration = 1
     review = review_config_changes(campaign, changed, proposed)
 
@@ -785,7 +787,7 @@ def test_batch_allocation_change_blocks_after_phase_b_selection_exists(tmp_path)
     (iter_dir / "phase_b" / "SELECTION.json").write_text("{}", encoding="utf-8")
 
     proposed = fresh_campaign_state()
-    proposed.phase = CampaignPhase.PHASE_B_POLUS
+    proposed.phase = CampaignPhase.PHASE_B_DIVERSITY
     proposed.iteration = 1
     review = review_config_changes(campaign, changed, proposed)
 
@@ -871,7 +873,7 @@ def test_geometry_novelty_change_blocks_after_phase_b_selection_exists(tmp_path)
     (iter_dir / "phase_b" / "SELECTION.json").write_text("{}", encoding="utf-8")
 
     proposed = fresh_campaign_state()
-    proposed.phase = CampaignPhase.PHASE_B_POLUS
+    proposed.phase = CampaignPhase.PHASE_B_DIVERSITY
     proposed.iteration = 1
     review = review_config_changes(campaign, changed, proposed)
 
@@ -957,7 +959,7 @@ def test_sampling_aggressiveness_change_blocks_after_phase_b_selection_exists(tm
     (iter_dir / "phase_b" / "SELECTION.json").write_text("{}", encoding="utf-8")
 
     proposed = fresh_campaign_state()
-    proposed.phase = CampaignPhase.PHASE_B_POLUS
+    proposed.phase = CampaignPhase.PHASE_B_DIVERSITY
     proposed.iteration = 1
     review = review_config_changes(campaign, changed, proposed)
 
@@ -1018,7 +1020,7 @@ def test_gaussian_method_change_allowed_before_first_gaussian(tmp_path):
     changed.gaussian.method = "b3lyp"
 
     proposed = fresh_campaign_state()
-    proposed.phase = CampaignPhase.PHASE_A_POLUS
+    proposed.phase = CampaignPhase.PHASE_A_DIVERSITY
     review = review_config_changes(campaign, changed, proposed)
 
     assert review.allowed
@@ -1753,17 +1755,17 @@ def test_reconcile_apply_recovers_prebootstrap_phase_a_submission_failure(
     state.reference_data_version = 0
     state.validation_set_version = 0
     state.models_version = 0
-    state.pending_jobs[CampaignPhase.PHASE_A_POLUS.value] = None
+    state.pending_jobs[CampaignPhase.PHASE_A_DIVERSITY.value] = None
     write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
     submission_intent.write_pre_submit_intent(
         campaign,
         campaign_uid=state.campaign_uid,
-        phase_name=CampaignPhase.PHASE_A_POLUS.value,
+        phase_name=CampaignPhase.PHASE_A_DIVERSITY.value,
         iteration=0,
     )
     submission_intent.mark_failed(
         campaign,
-        CampaignPhase.PHASE_A_POLUS.value,
+        CampaignPhase.PHASE_A_DIVERSITY.value,
         0,
         "backend_submission_failed: partition 'multicore_small' is not present",
     )
@@ -1772,7 +1774,7 @@ def test_reconcile_apply_recovers_prebootstrap_phase_a_submission_failure(
     append_event(
         campaign / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson",
         "halt",
-        from_phase=CampaignPhase.PHASE_A_POLUS.value,
+        from_phase=CampaignPhase.PHASE_A_DIVERSITY.value,
         iteration=0,
         reason="backend_submission_failed: partition 'multicore_small' is not present",
     )
@@ -1790,14 +1792,14 @@ def test_reconcile_apply_recovers_prebootstrap_phase_a_submission_failure(
 
     assert rc == 0
     recovered = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
-    assert recovered.phase is CampaignPhase.PHASE_A_POLUS
+    assert recovered.phase is CampaignPhase.PHASE_A_DIVERSITY
     assert recovered.reference_data_version == -1
     assert recovered.validation_set_version == -1
     assert recovered.models_version == -1
     assert "ichor-al-daemon start --campaign-dir " + str(campaign) in out
     intent = submission_intent.load_intent(
         campaign,
-        CampaignPhase.PHASE_A_POLUS.value,
+        CampaignPhase.PHASE_A_DIVERSITY.value,
         0,
     )
     assert intent["status"] == "SUPERSEDED"

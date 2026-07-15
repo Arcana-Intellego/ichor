@@ -90,8 +90,8 @@ def test_default_campaign_config_is_valid():
     assert c.resources.defaults.walltime_hours == 24
     assert c.resources.defaults.cpus_per_task == "auto"
     assert c.resources.defaults.mem_per_cpu == "auto"
-    assert c.resources.partition_for("PHASE_A_POLUS") == "multicore"
-    assert c.resources.polus.walltime_hours == 2
+    assert c.resources.partition_for("PHASE_A_DIVERSITY") == "multicore"
+    assert c.resources.diversity.walltime_hours == 2
     assert c.resources.gaussian.walltime_hours == 24
     assert c.resources.cpus_for("GAUSSIAN") == "auto"
     assert c.resources.mem_per_cpu_for("AIMALL") == "auto"
@@ -101,9 +101,9 @@ def test_default_campaign_config_is_valid():
     assert c.resources.memory_estimate_safety_factor == 1.25
     assert c.resources.scheduler_usage_telemetry is True
     assert c.resources.scheduler_usage_history_limit == 5000
-    assert c.resources.polus.auto_max_workers == 16
-    assert c.resources.polus.target_pairs_per_worker == 5_000_000
-    assert c.resources.polus.in_memory_distance_store_fraction == 0.35
+    assert c.resources.diversity.auto_max_workers == 16
+    assert c.resources.diversity.target_pairs_per_worker == 5_000_000
+    assert c.resources.diversity.in_memory_distance_store_fraction == 0.35
     assert c.aimall.encomp == 3
     assert c.aimall.nogui is True
     assert c.aimall.naat == "auto"
@@ -239,13 +239,13 @@ def _set_path(payload, path, value):
     [
         ("resources.defaults.walltime_hours", 0),
         ("resources.defaults.walltime_hours", -1),
-        ("resources.polus.walltime_hours", 0),
+        ("resources.diversity.walltime_hours", 0),
         ("resources.gaussian.walltime_hours", -1),
         ("resources.aimall.walltime_hours", 0),
         ("resources.ariadne.walltime_hours", -1),
         ("resources.ferebus.walltime_hours", 0),
         ("resources.defaults.cpus_per_task", 0),
-        ("resources.polus.cpus_per_task", 0),
+        ("resources.diversity.cpus_per_task", 0),
         ("resources.gaussian.cpus_per_task", 0),
         ("resources.aimall.cpus_per_task", 0),
         ("resources.ariadne.cpus_per_task", 0),
@@ -261,9 +261,9 @@ def test_scheduler_positive_resource_fields_validated(path, value):
 
 def test_walltime_accepts_fractional_hours():
     payload = CampaignConfig().to_dict()
-    payload["resources"]["polus"]["walltime_hours"] = 0.25
+    payload["resources"]["diversity"]["walltime_hours"] = 0.25
     cfg = CampaignConfig.from_dict(payload)
-    assert cfg.resources.walltime_for("PHASE_A_POLUS") == 0.25
+    assert cfg.resources.walltime_for("PHASE_A_DIVERSITY") == 0.25
 
 
 def test_walltime_rejects_non_numeric_values():
@@ -278,18 +278,18 @@ def test_backend_resources_inherit_defaults_and_override_per_phase():
     assert cfg.resources.ferebus.walltime_hours is None
     assert cfg.resources.walltime_for("INITIAL_FEREBUS") == cfg.resources.defaults.walltime_hours
     cfg.resources.defaults.walltime_hours = 12
-    cfg.resources.polus.walltime_hours = 1
+    cfg.resources.diversity.walltime_hours = 1
     cfg.resources.gaussian.walltime_hours = 2
     cfg.resources.aimall.walltime_hours = 3
     cfg.resources.ariadne.walltime_hours = 4
     cfg.resources.ferebus.walltime_hours = 5
-    cfg.resources.polus.partition = "interactive"
-    assert cfg.resources.walltime_for("PHASE_A_POLUS") == 1
+    cfg.resources.diversity.partition = "interactive"
+    assert cfg.resources.walltime_for("PHASE_A_DIVERSITY") == 1
     assert cfg.resources.walltime_for("GAUSSIAN") == 2
     assert cfg.resources.walltime_for("INITIAL_AIMALL") == 3
     assert cfg.resources.walltime_for("ARIADNE_ARRAY") == 4
     assert cfg.resources.walltime_for("FEREBUS") == 5
-    assert cfg.resources.partition_for("PHASE_A_POLUS") == "interactive"
+    assert cfg.resources.partition_for("PHASE_A_DIVERSITY") == "interactive"
     assert cfg.resources.partition_for("GAUSSIAN") == "multicore"
 
 
@@ -867,8 +867,8 @@ def test_shipped_active_learning_examples_are_resource_safe(relative_path):
 
     assert cfg.schema_version == CONFIG_SCHEMA_VERSION
     assert cfg.resources.defaults.partition == "multicore"
-    assert cfg.resources.partition_for("PHASE_A_POLUS") == "multicore"
-    assert cfg.resources.cpus_for("PHASE_A_POLUS") == "auto"
+    assert cfg.resources.partition_for("PHASE_A_DIVERSITY") == "multicore"
+    assert cfg.resources.cpus_for("PHASE_A_DIVERSITY") == "auto"
     assert cfg.resources.cpus_for("GAUSSIAN") == "auto"
     if "first_live_iter" in relative_path:
         assert cfg.resources.cpus_for("AIMALL") == "auto"

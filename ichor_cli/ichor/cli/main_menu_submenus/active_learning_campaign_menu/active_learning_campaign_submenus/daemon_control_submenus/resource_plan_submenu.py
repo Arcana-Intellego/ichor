@@ -26,7 +26,7 @@ RESOURCE_PLAN_MENU_DESCRIPTION = MenuDescription(
 @dataclass
 class ResourcePlanMenuOptions:
     scope: str = "current"
-    phase: str = "PHASE_A_POLUS"
+    phase: str = "PHASE_A_DIVERSITY"
     iteration: int | None = None
     json: bool = False
 

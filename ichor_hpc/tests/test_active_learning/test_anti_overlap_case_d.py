@@ -1,6 +1,6 @@
 """Tests for the Phase-B anti-overlap consumer (case d).
 
-We exercise the full integration: polus_wrapper.main runs Phase B,
+We exercise the full integration: diversity.main runs Phase B,
 invokes filter_candidates_against_training with the geometry novelty-derived
 minimum separation,
 and writes both raw + filtered samples plus the DedupReport.
@@ -23,7 +23,7 @@ from ichor.hpc.active_learning.daemon.state import (
 )
 
 
-MODULE = "ichor.hpc.active_learning.sampling.polus_wrapper"
+MODULE = "ichor.hpc.active_learning.sampling.diversity"
 
 
 def _make_seed_result(seed_dir, atom_types, final_coords):
@@ -67,13 +67,12 @@ def _write_ariadne_manifest(iter_dir):
     from ichor.hpc.active_learning.daemon.state import atomic_write_json
     from ichor.hpc.active_learning.handoff_manifests import (
         ARIADNE_RESULTS_SCHEMA_VERSION,
+        build_seed_selection_manifest,
         seeds_picked_path,
         write_ariadne_results_manifest,
     )
     from ichor.hpc.active_learning.layout import active_ariadne_dir
     from ichor.hpc.active_learning.seed_identity import (
-        deterministic_seed_uid,
-        selection_fingerprint_sha256,
         write_ariadne_task_map,
     )
     from ichor.hpc.active_learning.versioning.manifest import sha256_file
@@ -84,16 +83,15 @@ def _write_ariadne_manifest(iter_dir):
 
     ariadne_root = active_ariadne_dir(iter_dir)
     seed_dirs = sorted((ariadne_root / "seeds").glob("seed-*"))
-    selection = {
-        "schema_version": 2,
-        "campaign_uid": "test",
-        "iteration": 1,
-        "models_version": 0,
-        "model_manifest_sha256": "c" * 64,
-        "trajectory_sha256": "0" * 64,
-        "selection_strategy": "hybrid_variance",
-        "n_picked": len(seed_dirs),
-        "seed_records": [
+    selection = build_seed_selection_manifest(
+        campaign_uid="test",
+        campaign_random_seed=0,
+        iteration=1,
+        models_version=0,
+        model_manifest_sha256="c" * 64,
+        trajectory_sha256="0" * 64,
+        selection_strategy="hybrid_variance",
+        seed_records=[
             {
                 "seed_id": seed_id,
                 "frame_id": seed_id - 1,
@@ -103,19 +101,7 @@ def _write_ariadne_manifest(iter_dir):
             }
             for seed_id in range(1, len(seed_dirs) + 1)
         ],
-    }
-    fingerprint = selection_fingerprint_sha256(selection)
-    selection["selection_fingerprint_sha256"] = fingerprint
-    for record in selection["seed_records"]:
-        record["seed_uid"] = deterministic_seed_uid(
-            campaign_uid="test",
-            iteration=1,
-            seed_id=int(record["seed_id"]),
-            frame_id=int(record["frame_id"]),
-            models_version=0,
-            model_manifest_sha256="c" * 64,
-            selection_fingerprint_sha256_value=fingerprint,
-        )
+    )
     selection_path = seeds_picked_path(iter_dir)
     selection_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(selection_path, selection)
@@ -267,7 +253,7 @@ def _write_campaign_state(campaign):
     state = fresh_campaign_state()
     state.campaign_uid = "test"
     state.iteration = 1
-    state.phase = CampaignPhase.PHASE_B_POLUS
+    state.phase = CampaignPhase.PHASE_B_DIVERSITY
     state.reference_data_version = 0
     state.models_version = 0
     data_dir = campaign / ".DATA" / "ACTIVE_LEARNING"

@@ -82,7 +82,7 @@ def _select(ex, *, iteration=1):
             models_version=-1,
             replacement_round=0,
         )
-        ex._post_phase_a_polus(bootstrap_state)
+        ex._post_phase_a_diversity(bootstrap_state)
         ex._post_initial_gaussian(bootstrap_state)
         ex._post_initial_aimall(bootstrap_state)
         ex._post_initial_ferebus(bootstrap_state)
@@ -257,6 +257,7 @@ def test_inline_seed_select_skips_training_pool_frame_ids(tmp_path):
             cd, iteration=0,
             pointdir_name=f"POINT_dummy_{fid}.pointdir",
             seed_frame_id=int(fid),
+            trajectory_sha256=pool.sha256,
         )
     _state, _result = _select(ex)
     seeds_picked = active_seed_selection_dir(
@@ -270,6 +271,7 @@ def test_inline_seed_select_skips_training_pool_frame_ids(tmp_path):
     expected_forbidden = load_training_seed_frame_ids(
         cd,
         reference_data_dir=cd / "QM_REFERENCE_DATA",
+        expected_trajectory_sha256=pool.sha256,
     )
     assert set(forbidden).issubset(expected_forbidden)
     assert picked[-1]["forbidden_set_size"] == len(expected_forbidden)
@@ -287,6 +289,7 @@ def test_seed_frame_index_batch_upsert_is_idempotent_and_conflict_safe(tmp_path)
         "iteration": 1,
         "pointdir_name": "POINT_0001.pointdir",
         "seed_frame_id": 17,
+        "trajectory_sha256": "a" * 64,
     }
     upsert_index_records(campaign, records=[record, dict(record)])
     upsert_index_records(campaign, records=[dict(record)])
@@ -307,7 +310,13 @@ def test_inline_seed_select_skips_recent_cooldown_frames(tmp_path):
     TrajectoryPool.import_from(FIXTURE, cd)
     pool = TrajectoryPool.load(cd)
     recent = list(pool.frame_ids())[:3]
-    append_recent_seeds(cd, iteration=-1, frame_ids=recent, cooldown=3)
+    append_recent_seeds(
+        cd,
+        iteration=0,
+        frame_ids=recent,
+        trajectory_sha256=pool.sha256,
+        cooldown=3,
+    )
     _state, _result = _select(ex)
     payload = json.loads(
         (
@@ -430,7 +439,13 @@ def test_seed_pool_exhaustion_halts_when_no_eligible_frames(tmp_path):
     ex = DryRunPhaseExecutor(campaign_dir=cd, config=cfg)
     TrajectoryPool.import_from(FIXTURE, cd)
     pool = TrajectoryPool.load(cd)
-    append_recent_seeds(cd, iteration=-1, frame_ids=list(pool.frame_ids()), cooldown=3)
+    append_recent_seeds(
+        cd,
+        iteration=0,
+        frame_ids=list(pool.frame_ids()),
+        trajectory_sha256=pool.sha256,
+        cooldown=3,
+    )
     with pytest.raises(BackendSubmissionError, match="seed_pool_exhausted"):
         _select(ex)
 
@@ -471,7 +486,7 @@ def test_anti_overlap_passes_when_distance_within_band(tmp_path):
     assert (len(flagged_events) > 0) == any_flagged
 
 
-def test_anti_overlap_uses_campaign_whitened_distance_bounds(tmp_path):
+def test_hidden_anti_overlap_bounds_cannot_override_sampling_policy(tmp_path):
     cd = tmp_path / "campaign"
     cfg = CampaignConfig()
     cfg.seed_selection.n_seeds_per_iteration = 2
@@ -488,7 +503,7 @@ def test_anti_overlap_uses_campaign_whitened_distance_bounds(tmp_path):
     assert seed_dirs
     for sd in seed_dirs:
         data = read_provenance(sd)
-        assert data["anti_overlap"]["flag"] == "moved_too_little"
+        assert data["anti_overlap"]["flag"] is None
 
 
 def test_synthetic_whitened_distance_returns_none_when_alpha_missing(tmp_path):

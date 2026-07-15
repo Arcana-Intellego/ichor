@@ -163,8 +163,8 @@ def test_after_phase_stops_before_an_unstarted_phase(tmp_path):
 def test_after_phase_finishes_started_phase_and_binds_completion_receipt(tmp_path):
     daemon = _daemon(tmp_path)
     state = fresh_campaign_state(max_iterations=3)
-    state.phase = CampaignPhase.PHASE_A_POLUS
-    state.pending_jobs[CampaignPhase.PHASE_A_POLUS.value] = "101"
+    state.phase = CampaignPhase.PHASE_A_DIVERSITY
+    state.pending_jobs[CampaignPhase.PHASE_A_DIVERSITY.value] = "101"
     write_state(daemon.state_path(), state)
     install_stop_request(
         daemon.campaign_dir,
@@ -175,7 +175,7 @@ def test_after_phase_finishes_started_phase_and_binds_completion_receipt(tmp_pat
 
     stopped = read_state(daemon.state_path())
     control = read_stop_request(daemon.campaign_dir)
-    assert stopped.phase is not CampaignPhase.PHASE_A_POLUS
+    assert stopped.phase is not CampaignPhase.PHASE_A_DIVERSITY
     assert stopped.shutdown_requested is True
     assert stopped.last_completion_receipt is not None
     assert control["status"] == "completed"

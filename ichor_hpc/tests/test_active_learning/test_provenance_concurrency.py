@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from ichor.hpc.active_learning.versioning.provenance import (
+    RECENT_SEEDS_SCHEMA_VERSION,
     append_recent_seeds,
     append_to_index,
     enrich_with_anti_overlap,
@@ -30,7 +31,7 @@ def _setup_pointdir(tmp_path, seed_frame_id=0):
         pdir,
         campaign_uid="conc-test",
         iteration=0,
-        trajectory_sha256="abcd",
+        trajectory_sha256="a" * 64,
         seed_frame_id=seed_frame_id,
         seed_selection_origin="bulk",
         seed_variance_at_selection=None,
@@ -103,6 +104,7 @@ def test_concurrent_index_appends_persist_all(tmp_path):
                 iteration=worker_id,
                 pointdir_name=f"POINT_w{worker_id}_i{i:04d}.pointdir",
                 seed_frame_id=worker_id * 100 + i,
+                trajectory_sha256="a" * 64,
             )
 
     threads = [threading.Thread(target=worker, args=(w,)) for w in range(N_WORKERS)]
@@ -134,6 +136,7 @@ def test_concurrent_recent_seeds_appends_no_loss(tmp_path):
                 tmp_path,
                 iteration=worker_id * 1000 + i,
                 frame_ids=[worker_id * 1000 + i],
+                trajectory_sha256="a" * 64,
                 cooldown=10,
             )
 
@@ -145,7 +148,7 @@ def test_concurrent_recent_seeds_appends_no_loss(tmp_path):
 
     # The file must still be valid JSON with schema_version + history.
     data = load_recent_seeds_payload(tmp_path)
-    assert data["schema_version"] == 1
+    assert data["schema_version"] == RECENT_SEEDS_SCHEMA_VERSION
     assert isinstance(data["history"], list)
     # With cooldown=10 the history is capped at 10 entries.
     assert len(data["history"]) <= 10

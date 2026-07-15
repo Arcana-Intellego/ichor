@@ -25,7 +25,7 @@ RESOURCE_PLAN_SCHEMA_VERSION = 2
 
 BOOTSTRAP_PHASES = (
     "INIT",
-    "PHASE_A_POLUS",
+    "PHASE_A_DIVERSITY",
     "INITIAL_GAUSSIAN",
     "INITIAL_AIMALL",
     "INITIAL_ALLOCATION_CHECK",
@@ -36,7 +36,7 @@ BOOTSTRAP_PHASES = (
 ACTIVE_PHASES = (
     "SEED_SELECT",
     "ARIADNE_ARRAY",
-    "PHASE_B_POLUS",
+    "PHASE_B_DIVERSITY",
     "SPLIT",
     "GAUSSIAN",
     "AIMALL",
@@ -419,7 +419,7 @@ def format_resource_plan(payload: Dict[str, Any]) -> str:
                 )
                 if extra.get("distance_store_mode"):
                     lines.append(
-                        "  POLUS distance_store="
+                        "  diversity distance_store="
                         + str(extra.get("distance_store_mode"))
                         + " bytes="
                         + str(extra.get("condensed_store_bytes"))

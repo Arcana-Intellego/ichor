@@ -241,7 +241,7 @@ def test_dimensionless_scale_gate_rejects_over_scaled_atom_move():
             "reference_min_pair_distance_angstrom": 1.0,
             "ratio_floor": 0.0,
         },
-        "dimensionless_preset": {
+        "dimensionless_policy": {
             "max_scaled_atom_move": 2.0,
             "max_scaled_rmsd": 100.0,
             "max_scaled_fullspace_residual": 100.0,

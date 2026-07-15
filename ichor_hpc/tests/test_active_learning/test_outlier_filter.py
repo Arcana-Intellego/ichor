@@ -190,3 +190,18 @@ def test_filter_handles_empty_trajectory():
     out = filter_initial_trajectory([])
     assert out.n_kept == 0
     assert out.n_rejected == 0
+
+
+def test_filter_rejects_mismatched_supplied_energy_cardinality():
+    with pytest.raises(ValueError, match="exactly one value per frame"):
+        filter_initial_trajectory([_water_at(), _water_at(0.1)], [0.0])
+
+
+def test_filter_rejects_mismatched_atom_identity_or_order():
+    reordered = Atoms([
+        Atom("H", 0.96, 0.0, 0.0),
+        Atom("O", 0.0, 0.0, 0.0),
+        Atom("H", -0.24, 0.93, 0.0),
+    ])
+    with pytest.raises(ValueError, match="atom identity or order"):
+        filter_initial_trajectory([_water_at(), reordered])

@@ -1,4 +1,3 @@
-import re
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Union
 from tqdm import tqdm
@@ -12,6 +11,7 @@ from ichor.core.common.int import count_digits
 from ichor.core.common.io import convert_to_path, mkdir
 from ichor.core.common.itertools import chunker
 from ichor.core.files.file import FileState, ReadFile, WriteFile
+from ichor.core.files.xyz.strict_xyz import read_xyz_frames
 
 
 class Trajectory(ReadFile, WriteFile, ListOfAtoms):
@@ -52,35 +52,8 @@ class Trajectory(ReadFile, WriteFile, ListOfAtoms):
             self.state = FileState.Read
 
     def _read_file(self):
-
-        with open(self.path, "r") as f:
-            # make empty Atoms instance in which to store one timestep
-            atoms = Atoms()
-            for line in f:
-                # match the line containing the number of atoms in timestep
-                if re.match(r"^\s*\d+", line):
-                    natoms = int(line)
-                    # this is the comment line of xyz files.
-                    # It can be empty or contain some useful information that can be stored.
-                    line = next(f)
-                    # if the comment line properties errors, we can store these
-
-                    # TODO: do we still need to get properties in trajectory? - if we do, implement without ast
-                    # if re.match(r"^\s*?i\s*?=\s*?\d+\s*properties_error", line):
-                    #     properties_error = line.split("=")[-1].strip()
-                    #     atoms.properties_error = ast.literal_eval(properties_error)
-
-                    # the next line after the comment line is where coordinates begin
-                    for _ in range(natoms):
-                        line = next(f)
-                        # add *_ to work for extended xyz which contain extra information after x,y,z coordinates
-                        atom_type, x, y, z, *_ = line.split()
-                        atoms.add(Atom(atom_type, float(x), float(y), float(z)))
-
-                    # add the Atoms instance to the Trajectory instance
-                    self.add(atoms)
-                    # make new Atoms instance where next timestep can be stored
-                    atoms = Atoms()
+        for atoms in read_xyz_frames(self.path):
+            self.add(atoms)
 
     @property
     def types(self):

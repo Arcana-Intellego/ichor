@@ -301,11 +301,10 @@ def _iter_dir(campaign, iteration):
 
 def _write_seeds_picked(campaign, iteration, *, n=1):
     from ichor.hpc.active_learning.daemon.state import atomic_write_json
-    from ichor.hpc.active_learning.seed_identity import (
-        deterministic_seed_uid,
-        selection_fingerprint_sha256,
-        write_ariadne_task_map,
+    from ichor.hpc.active_learning.handoff_manifests import (
+        build_seed_selection_manifest,
     )
+    from ichor.hpc.active_learning.seed_identity import write_ariadne_task_map
 
     iter_dir = _iter_dir(campaign, iteration)
     frame_ids = list(range(int(n)))
@@ -315,16 +314,15 @@ def _write_seeds_picked(campaign, iteration, *, n=1):
     model_version = max(0, int(state.models_version))
     model_manifest_sha256 = "c" * 64
     trajectory_sha256 = "0" * 64
-    payload = {
-        "schema_version": SEED_SELECTION_SCHEMA_VERSION,
-        "campaign_uid": campaign_uid,
-        "iteration": int(iteration),
-        "models_version": model_version,
-        "model_manifest_sha256": model_manifest_sha256,
-        "trajectory_sha256": trajectory_sha256,
-        "selection_strategy": "hybrid_variance",
-        "n_picked": int(n),
-        "seed_records": [
+    payload = build_seed_selection_manifest(
+        campaign_uid=campaign_uid,
+        campaign_random_seed=0,
+        iteration=int(iteration),
+        models_version=model_version,
+        model_manifest_sha256=model_manifest_sha256,
+        trajectory_sha256=trajectory_sha256,
+        selection_strategy="hybrid_variance",
+        seed_records=[
             {
                 "seed_id": int(i + 1),
                 "frame_id": int(i),
@@ -334,19 +332,7 @@ def _write_seeds_picked(campaign, iteration, *, n=1):
             }
             for i in frame_ids
         ],
-    }
-    fingerprint = selection_fingerprint_sha256(payload)
-    payload["selection_fingerprint_sha256"] = fingerprint
-    for record in payload["seed_records"]:
-        record["seed_uid"] = deterministic_seed_uid(
-            campaign_uid=campaign_uid,
-            iteration=int(iteration),
-            seed_id=int(record["seed_id"]),
-            frame_id=int(record["frame_id"]),
-            models_version=model_version,
-            model_manifest_sha256=model_manifest_sha256,
-            selection_fingerprint_sha256_value=fingerprint,
-        )
+    )
     selection_path = seeds_picked_path(iter_dir)
     selection_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(selection_path, payload)
@@ -512,7 +498,7 @@ def _write_phase_b_handoff(campaign, iteration, *, n=2):
     from types import SimpleNamespace
 
     from ichor.hpc.active_learning.config import CampaignConfig
-    from ichor.hpc.active_learning.sampling.polus_wrapper import _run_phase_b
+    from ichor.hpc.active_learning.sampling.diversity import _run_phase_b
 
     iter_dir = _write_ariadne_handoff(campaign, iteration, n=n)
     config = CampaignConfig()
@@ -659,16 +645,26 @@ def test_propose_recovery_on_empty_campaign_returns_init(tmp_path):
 
 def test_active_replacement_recovery_advances_only_with_durable_handoffs(tmp_path):
     campaign, _, _, _ = _campaign_dirs(tmp_path)
-    result_path = campaign / "reserve-result.json"
-    result_path.write_text(
-        json.dumps(
-            {
-                "atom_types": ["H"],
-                "final_coordinates": [[0.0, 0.0, 0.0]],
-            }
-        ),
-        encoding="utf-8",
+    iter_dir = _write_ariadne_handoff(campaign, 1, n=2)
+    from ichor.hpc.active_learning.handoff_manifests import (
+        read_ariadne_results_manifest,
     )
+    accepted = read_ariadne_results_manifest(
+        iter_dir,
+        expected_iteration=1,
+    )["accepted"]
+
+    def allocation_candidate(record, candidate_id):
+        return {
+            "candidate_id": candidate_id,
+            "seed_id": int(record["seed_id"]),
+            "seed_uid": str(record["seed_uid"]),
+            "seed_frame_id": int(record["seed_frame_id"]),
+            "result_json": str(record["result_json"]),
+            "result_sha256": str(record["result_sha256"]),
+            "landing_safety": dict(record["landing_safety"]),
+        }
+
     allocation_path = point_allocation_path(
         campaign,
         context="active",
@@ -676,15 +672,16 @@ def test_active_replacement_recovery_advances_only_with_durable_handoffs(tmp_pat
     )
     allocation = create_point_allocation(
         allocation_path,
-        campaign_uid="replacement-recovery-test",
+        campaign_uid=_FIXTURE_CAMPAIGN_UID,
         context="active",
         iteration=1,
         targets={"train": 1, "int_val": 0, "ext_val": 0, "total": 1},
-        primary_candidates=[{"candidate_id": "candidate-primary"}],
+        primary_candidates=[
+            allocation_candidate(accepted[0], "candidate-primary")
+        ],
         reserve_candidates=[
             {
-                "candidate_id": "candidate-reserve",
-                "result_json": str(result_path.resolve()),
+                **allocation_candidate(accepted[1], "candidate-reserve"),
                 "reserve_rank": 0,
             }
         ],
@@ -737,6 +734,8 @@ def test_active_replacement_recovery_advances_only_with_durable_handoffs(tmp_pat
         accepted=[pointdir],
         rejected=[],
     )
+    quality_manifest = round_dir / "quantum_quality.json"
+    atomic_write_json(quality_manifest, {})
     decisions = active_iteration_handoff_decisions(campaign, state)
     assert [decision.phase for decision in decisions] == [
         CampaignPhase.REPLACEMENT_AIMALL
@@ -751,6 +750,7 @@ def test_active_replacement_recovery_advances_only_with_durable_handoffs(tmp_pat
                 "candidate_id": str(replacement_attempt["candidate_id"]),
                 "accepted": True,
                 "pointdir": str(pointdir.resolve()),
+                "quality_manifest": str(quality_manifest.resolve()),
             }
         ],
         expected_generation=int(replacement["generation"]),
@@ -794,6 +794,9 @@ def test_recovery_contract_status_reports_seed_handoff_contract(tmp_path):
 
 def test_propose_recovery_phase_a_sample_reenters_initial_gaussian(tmp_path):
     from ichor.hpc.active_learning.handoff_manifests import write_phase_a_sample_manifest
+    from ichor.hpc.active_learning.sampling.diversity_contract import (
+        diversity_selector_contract,
+    )
 
     campaign, data, _, _ = _campaign_dirs(tmp_path)
     _write_pool(campaign)
@@ -815,7 +818,7 @@ def test_propose_recovery_phase_a_sample_reenters_initial_gaussian(tmp_path):
         n=1,
     )
     write_phase_a_sample_manifest(initial, {
-        "phase": "PHASE_A_POLUS",
+        "phase": "PHASE_A_DIVERSITY",
         "iteration": 0,
         "sample_xyz": str(sample.resolve()),
         "index_path": str(index.resolve()),
@@ -823,6 +826,7 @@ def test_propose_recovery_phase_a_sample_reenters_initial_gaussian(tmp_path):
         "n_frames": 1,
         "selected_indices": [0],
         "descriptor": "mass_weighted_rmsd",
+        "selector": diversity_selector_contract(),
         "n_pool_frames": 1,
         "point_allocation": {
             "manifest": str(allocation_path.resolve()),
@@ -831,6 +835,7 @@ def test_propose_recovery_phase_a_sample_reenters_initial_gaussian(tmp_path):
             "reserve_frame_ids": [],
             "reserve_count": 0,
         },
+        "source_pool_manifest": ".DATA/TRAJECTORY/pool.manifest.json",
     })
 
     report = propose_recovery(campaign)
@@ -872,27 +877,27 @@ def test_propose_recovery_halted_phase_a_failure_retries_phase_a(tmp_path):
     state.reference_data_version = 0
     state.validation_set_version = 0
     state.models_version = 0
-    state.pending_jobs[CampaignPhase.PHASE_A_POLUS.value] = None
+    state.pending_jobs[CampaignPhase.PHASE_A_DIVERSITY.value] = None
     write_state(data / DEFAULT_STATE_FILENAME, state)
     append_event(
         data / "journal.ndjson",
         "halt",
-        from_phase=CampaignPhase.PHASE_A_POLUS.value,
+        from_phase=CampaignPhase.PHASE_A_DIVERSITY.value,
         iteration=0,
         reason="backend_submission_failed: partition 'multicore_small' is not present",
     )
 
     report = propose_recovery(campaign)
 
-    assert report.proposed_state.phase is CampaignPhase.PHASE_A_POLUS
+    assert report.proposed_state.phase is CampaignPhase.PHASE_A_DIVERSITY
     assert report.proposed_state.iteration == 0
     assert report.proposed_state.reference_data_version == -1
     assert report.proposed_state.validation_set_version == -1
     assert report.proposed_state.models_version == -1
     assert report.proposed_state.pending_jobs == {}
-    assert "PHASE_A_POLUS" in report.decision
+    assert "PHASE_A_DIVERSITY" in report.decision
     assert any(
-        c.get("phase") == CampaignPhase.PHASE_A_POLUS.value
+        c.get("phase") == CampaignPhase.PHASE_A_DIVERSITY.value
         for c in report.recovery_candidates
     )
 
@@ -909,7 +914,7 @@ def test_propose_recovery_halted_phase_a_failure_requires_pool(tmp_path):
     append_event(
         data / "journal.ndjson",
         "halt",
-        from_phase=CampaignPhase.PHASE_A_POLUS.value,
+        from_phase=CampaignPhase.PHASE_A_DIVERSITY.value,
         iteration=0,
         reason="backend_submission_failed: partition 'multicore_small' is not present",
     )
@@ -918,7 +923,7 @@ def test_propose_recovery_halted_phase_a_failure_requires_pool(tmp_path):
 
     assert report.proposed_state.phase is CampaignPhase.HALTED
     assert not any(
-        c.get("phase") == CampaignPhase.PHASE_A_POLUS.value
+        c.get("phase") == CampaignPhase.PHASE_A_DIVERSITY.value
         for c in report.recovery_candidates
     )
     assert any("trajectory pool" in reason for reason in report.unsafe_reasons)
@@ -930,12 +935,12 @@ def test_propose_recovery_blocks_real_pending_job_without_intent(tmp_path):
     state = fresh_campaign_state(max_iterations=1)
     state.phase = CampaignPhase.HALTED
     state.iteration = 0
-    state.pending_jobs[CampaignPhase.PHASE_A_POLUS.value] = "123456"
+    state.pending_jobs[CampaignPhase.PHASE_A_DIVERSITY.value] = "123456"
     write_state(data / DEFAULT_STATE_FILENAME, state)
     append_event(
         data / "journal.ndjson",
         "halt",
-        from_phase=CampaignPhase.PHASE_A_POLUS.value,
+        from_phase=CampaignPhase.PHASE_A_DIVERSITY.value,
         iteration=0,
         reason="scheduler status uncertain",
     )
@@ -1483,7 +1488,7 @@ def test_recovery_rejects_phase_b_geometry_drift_even_when_hash_is_rewritten(
 
     report = propose_recovery(campaign)
 
-    assert report.proposed_state.phase is CampaignPhase.PHASE_B_POLUS
+    assert report.proposed_state.phase is CampaignPhase.PHASE_B_DIVERSITY
     assert "valid Phase B handoff" not in report.decision
     assert "valid ARIADNE results handoff" in report.decision
 
@@ -1496,7 +1501,7 @@ def test_propose_recovery_prefers_split_over_stale_phase_b(tmp_path, monkeypatch
     _commit_training_and_model_versions(training, models, [0])
     state = fresh_campaign_state(max_iterations=3)
     state.campaign_uid = "reconcile-test"
-    state.phase = CampaignPhase.PHASE_B_POLUS
+    state.phase = CampaignPhase.PHASE_B_DIVERSITY
     state.iteration = 1
     state.reference_data_version = 0
     state.models_version = 0
@@ -1747,7 +1752,7 @@ def test_propose_recovery_clears_shutdown_request(tmp_path):
 def test_propose_recovery_reads_last_journal_transition(tmp_path):
     campaign, data, _, _ = _campaign_dirs(tmp_path)
     journal = data / "journal.ndjson"
-    append_event(journal, "phase_transition", from_phase="INIT", to_phase="PHASE_A_POLUS", iteration=0)
+    append_event(journal, "phase_transition", from_phase="INIT", to_phase="PHASE_A_DIVERSITY", iteration=0)
     append_event(journal, "phase_transition", from_phase="GAUSSIAN", to_phase="AIMALL", iteration=3)
     report = propose_recovery(campaign)
     assert report.last_phase_in_journal == "AIMALL"
@@ -1760,11 +1765,11 @@ def test_propose_recovery_marks_halt_journal_phase_retryable(tmp_path):
     campaign, data, _, _ = _campaign_dirs(tmp_path)
     journal = data / "journal.ndjson"
     append_event(journal, "phase_succeeded", phase="FEREBUS", iteration=2)
-    append_event(journal, "halt", from_phase="PHASE_B_POLUS", iteration=3)
+    append_event(journal, "halt", from_phase="PHASE_B_DIVERSITY", iteration=3)
 
     report = propose_recovery(campaign)
 
-    assert report.last_phase_in_journal == "PHASE_B_POLUS"
+    assert report.last_phase_in_journal == "PHASE_B_DIVERSITY"
     assert report.last_iteration_in_journal == 3
     assert report.last_phase_event_in_journal == "halt"
     assert report.last_phase_retryable is True

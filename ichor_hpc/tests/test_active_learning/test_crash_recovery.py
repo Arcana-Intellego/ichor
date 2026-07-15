@@ -531,7 +531,7 @@ def test_daemon_persist_preserves_external_shutdown_request(tmp_path):
     disk_state.shutdown_requested = True
     write_state(d.state_path(), disk_state)
 
-    stale_state.phase = CampaignPhase.PHASE_A_POLUS
+    stale_state.phase = CampaignPhase.PHASE_A_DIVERSITY
     d._persist(stale_state)
     assert read_state(d.state_path()).shutdown_requested is True
 

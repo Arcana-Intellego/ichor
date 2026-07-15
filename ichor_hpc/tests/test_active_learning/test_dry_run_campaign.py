@@ -41,8 +41,8 @@ from ichor.hpc.active_learning.versioning.sampling_iterations import (
 
 
 _SBATCH_PHASES = (
-    "PHASE_A_POLUS", "INITIAL_GAUSSIAN", "INITIAL_AIMALL", "INITIAL_FEREBUS",
-    "ARIADNE_ARRAY", "PHASE_B_POLUS", "GAUSSIAN", "AIMALL", "FEREBUS",
+    "PHASE_A_DIVERSITY", "INITIAL_GAUSSIAN", "INITIAL_AIMALL", "INITIAL_FEREBUS",
+    "ARIADNE_ARRAY", "PHASE_B_DIVERSITY", "GAUSSIAN", "AIMALL", "FEREBUS",
 )
 
 
@@ -220,7 +220,15 @@ def test_dry_run_cli_drives_campaign_to_done(tmp_path):
     cfg.to_yaml(campaign / "campaign.yaml")
     (campaign / "pool.xyz").write_text(
         "".join(
-            "1\nframe " + str(index) + "\nH 0.0 0.0 0.0\n"
+            "3\nframe "
+            + str(index)
+            + "\nO 0.0 0.0 0.0\n"
+            + "H "
+            + format(0.94 + 0.002 * index, ".8f")
+            + " 0.0 0.0\n"
+            + "H -0.24 "
+            + format(0.91 + 0.001 * (index % 7), ".8f")
+            + " 0.0\n"
             for index in range(32)
         ),
         encoding="utf-8",

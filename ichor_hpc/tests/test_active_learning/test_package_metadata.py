@@ -18,7 +18,7 @@ IMPORT_TO_PACKAGE = {
     "sqlalchemy": "SQLAlchemy",
     "yaml": "pyyaml",
 }
-EXTERNAL_BACKENDS = {"ariadne", "polus", "pyferebus"}
+EXTERNAL_BACKENDS = {"ariadne", "pyferebus"}
 
 
 def _normalise_package_name(name: str) -> str:

@@ -16,12 +16,14 @@ from ichor.hpc.active_learning.point_allocation import (
 )
 from ichor.hpc.active_learning.replacement_sampling import (
     _active_frame,
+    _bootstrap_frames,
     _write_xyz,
     prepare_replacement_round,
     read_replacement_sample,
     read_replacement_sample_strict,
     replacement_round_dir,
 )
+from ichor.hpc.active_learning.versioning.manifest import sha256_file
 
 
 def _replacement_fixture(tmp_path):
@@ -44,11 +46,15 @@ def _replacement_fixture(tmp_path):
         newline="\n",
     )
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "context": "active",
         "iteration": 1,
         "replacement_round": 1,
-        "sample_xyz": str(sample.resolve()),
+        "sample_xyz": {
+            "path": "replacement-SAMPLE.xyz",
+            "size": sample.stat().st_size,
+            "sha256": sha256_file(sample),
+        },
         "n_candidates": 1,
         "records": [
             {
@@ -80,6 +86,7 @@ def _canonical_bootstrap_replacement(campaign):
         newline="\n",
     )
     TrajectoryPool.import_from(source, campaign, overwrite=True)
+    pool = TrajectoryPool.load(campaign)
     allocation_path = point_allocation_path(
         campaign,
         context="bootstrap",
@@ -93,7 +100,12 @@ def _canonical_bootstrap_replacement(campaign):
         targets={"train": 1, "int_val": 0, "ext_val": 0, "total": 1},
         primary_candidates=[{"candidate_id": "primary", "frame_id": 0}],
         reserve_candidates=[
-            {"candidate_id": "reserve", "frame_id": 1, "reserve_rank": 0}
+            {
+                "candidate_id": "reserve",
+                "frame_id": 1,
+                "reserve_rank": 0,
+                "pool_sha256": pool.sha256,
+            }
         ],
     )
     primary = pending_attempts(allocation)[0]
@@ -175,7 +187,85 @@ def test_active_replacement_rejects_non_finite_coordinates(tmp_path):
     )
 
     with pytest.raises(ValueError, match="non-finite coordinates"):
-        _active_frame({"result_json": str(result)})
+        _active_frame(
+            {
+                "result_json": str(result),
+                "result_sha256": sha256_file(result),
+            }
+        )
+
+
+def test_active_replacement_rejects_tampered_result(tmp_path):
+    result = tmp_path / "result.json"
+    result.write_text(
+        json.dumps(
+            {
+                "atom_types": ["H"],
+                "final_coordinates": [[0.0, 0.0, 0.0]],
+                "landing_safety": {"accepted": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    declared = sha256_file(result)
+    result.write_text(result.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        _active_frame(
+            {
+                "result_json": str(result),
+                "result_sha256": declared,
+                "landing_safety": {"accepted": True},
+            }
+        )
+
+
+def test_active_replacement_rejects_unsafe_landing(tmp_path):
+    result = tmp_path / "result.json"
+    result.write_text(
+        json.dumps(
+            {
+                "atom_types": ["H"],
+                "final_coordinates": [[0.0, 0.0, 0.0]],
+                "landing_safety": {"accepted": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="not explicitly safe"):
+        _active_frame(
+            {
+                "result_json": str(result),
+                "result_sha256": sha256_file(result),
+                "landing_safety": {"accepted": False},
+            }
+        )
+
+
+def test_bootstrap_replacement_rejects_pool_drift(tmp_path):
+    from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
+
+    campaign = tmp_path / "campaign"
+    campaign.mkdir()
+    source = tmp_path / "source.xyz"
+    source.write_text(
+        "1\nframe 0\nH 0.0 0.0 0.0\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    TrajectoryPool.import_from(source, campaign, overwrite=True)
+
+    with pytest.raises(ValueError, match="different trajectory pool"):
+        _bootstrap_frames(
+            campaign,
+            [
+                {
+                    "frame_id": 0,
+                    "pool_sha256": "0" * 64,
+                }
+            ],
+        )
 
 
 def test_strict_replacement_reader_joins_current_pending_attempts(tmp_path):
@@ -191,6 +281,7 @@ def test_strict_replacement_reader_joins_current_pending_attempts(tmp_path):
     )
 
     assert loaded["records"] == payload["records"]
+    assert loaded["records"][0]["pointdir_index"] == 1
 
 
 def test_strict_replacement_reader_rejects_plausible_record_drift(tmp_path):
@@ -217,6 +308,31 @@ def test_strict_replacement_reader_rejects_plausible_record_drift(tmp_path):
             iteration=0,
             replacement_round=1,
         )
+
+
+def test_replacement_sample_reader_rejects_tampered_xyz(tmp_path):
+    round_dir, _allocation_path, _allocation, _payload = _replacement_fixture(tmp_path)
+    sample = round_dir / "replacement-SAMPLE.xyz"
+    sample.write_text(
+        sample.read_text(encoding="utf-8").replace("0.0 0.0 0.0", "0.1 0.0 0.0"),
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        read_replacement_sample(round_dir)
+
+
+def test_replacement_sample_reader_rejects_fractional_integer(tmp_path):
+    round_dir, _allocation_path, _allocation, payload = _replacement_fixture(tmp_path)
+    payload["replacement_round"] = 1.5
+    (round_dir / "REPLACEMENT_SAMPLE.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="exact JSON integer"):
+        read_replacement_sample(round_dir)
 
 
 @pytest.mark.parametrize(

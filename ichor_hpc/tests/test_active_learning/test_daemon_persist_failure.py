@@ -38,7 +38,7 @@ def _prepare_bootstrap(ex, state):
         models_version=-1,
         replacement_round=0,
     )
-    ex.postprocess(bootstrap_state, CampaignPhase.PHASE_A_POLUS, observations=[])
+    ex.postprocess(bootstrap_state, CampaignPhase.PHASE_A_DIVERSITY, observations=[])
     ex.postprocess(bootstrap_state, CampaignPhase.INITIAL_GAUSSIAN, observations=[])
     ex.postprocess(bootstrap_state, CampaignPhase.INITIAL_AIMALL, observations=[])
     result = ex.submit_or_run(
@@ -86,7 +86,7 @@ def _prepare_active_quantum_allocation(ex, state):
     ex.submit_or_run(state, CampaignPhase.SEED_SELECT)
     _stage_ariadne_intent(ex, state)
     ex.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
-    ex.postprocess(state, CampaignPhase.PHASE_B_POLUS, observations=[])
+    ex.postprocess(state, CampaignPhase.PHASE_B_DIVERSITY, observations=[])
     ex.submit_or_run(state, CampaignPhase.SPLIT)
     ex.postprocess(state, CampaignPhase.GAUSSIAN, observations=[])
     ex.postprocess(state, CampaignPhase.AIMALL, observations=[])
@@ -184,7 +184,7 @@ def test_initial_training_idempotent_skip_repairs_current_pointer(tmp_path):
     ex = _make_executor(tmp_path)
     campaign = ex.campaign_dir
     state = SimpleNamespace(iteration=0, campaign_uid="uid", reference_data_version=-1)
-    ex.postprocess(state, CampaignPhase.PHASE_A_POLUS, observations=[])
+    ex.postprocess(state, CampaignPhase.PHASE_A_DIVERSITY, observations=[])
     ex.postprocess(state, CampaignPhase.INITIAL_GAUSSIAN, observations=[])
     ex.postprocess(state, CampaignPhase.INITIAL_AIMALL, observations=[])
     v = VersionedDirectory(campaign / "QM_REFERENCE_DATA")
@@ -275,7 +275,7 @@ def test_persist_before_journal_in_advance(monkeypatch, tmp_path):
     monkeypatch.setattr(daemon, "_journal", recording_journal)
 
     # Drive one tick; the failure happens during _advance after the inline
-    # phase (INIT -> PHASE_A_POLUS).
+    # phase (INIT -> PHASE_A_DIVERSITY).
     with pytest.raises(OSError, match="simulated disk-full"):
         daemon.tick()
 

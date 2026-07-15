@@ -636,6 +636,8 @@ def test_commit_initial_reference_data_rejects_incomplete_allocation(tmp_path):
         for attempt in attempts
         if str(attempt["pointdir_name"]) == good.name
     )
+    quality_manifest = initial / "quantum_quality.json"
+    quality_manifest.write_text("{}\n", encoding="utf-8", newline="\n")
     record_quantum_results(
         allocation_path,
         [
@@ -647,6 +649,11 @@ def test_commit_initial_reference_data_rejects_incomplete_allocation(tmp_path):
                     None
                     if str(attempt["candidate_id"]) == accepted_id
                     else "missing_atomicfiles_dir"
+                ),
+                "quality_manifest": (
+                    str(quality_manifest.resolve())
+                    if str(attempt["candidate_id"]) == accepted_id
+                    else None
                 ),
             }
             for attempt in attempts
@@ -768,7 +775,7 @@ def test_all_nine_sbatch_phases_registered_as_live():
         "INITIAL_AIMALL", "AIMALL",
         "INITIAL_FEREBUS", "FEREBUS",
         "ARIADNE_ARRAY",
-        "PHASE_A_POLUS", "PHASE_B_POLUS",
+        "PHASE_A_DIVERSITY", "PHASE_B_DIVERSITY",
     ):
         assert ph in LIVE_POSTPROCESS_IMPLEMENTED
 
@@ -779,8 +786,8 @@ def test_handlers_dict_dispatches_all_day3_phases(tmp_path):
     assert handlers["INITIAL_FEREBUS"] == ex._parse_ferebus_postprocess
     assert handlers["FEREBUS"] == ex._parse_ferebus_postprocess
     assert handlers["ARIADNE_ARRAY"] == ex._parse_ariadne_array_postprocess
-    assert handlers["PHASE_A_POLUS"] == ex._parse_polus_postprocess
-    assert handlers["PHASE_B_POLUS"] == ex._parse_polus_postprocess
+    assert handlers["PHASE_A_DIVERSITY"] == ex._parse_diversity_postprocess
+    assert handlers["PHASE_B_DIVERSITY"] == ex._parse_diversity_postprocess
 
 
 # --- FEREBUS parser tests ----------------------------------------
@@ -1212,13 +1219,12 @@ def test_ferebus_parser_rejects_missing_staging(tmp_path):
 def _write_seeds_picked(campaign_dir, iteration, n_seeds):
     from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
     from ichor.hpc.active_learning.daemon.state import atomic_write_json
-    from ichor.hpc.active_learning.handoff_manifests import seeds_picked_path
-    from ichor.hpc.active_learning.layout import active_iteration_dir
-    from ichor.hpc.active_learning.seed_identity import (
-        deterministic_seed_uid,
-        selection_fingerprint_sha256,
-        write_ariadne_task_map,
+    from ichor.hpc.active_learning.handoff_manifests import (
+        build_seed_selection_manifest,
+        seeds_picked_path,
     )
+    from ichor.hpc.active_learning.layout import active_iteration_dir
+    from ichor.hpc.active_learning.seed_identity import write_ariadne_task_map
     from ichor.hpc.active_learning.daemon.submission_intent import (
         write_pre_submit_intent,
     )
@@ -1247,15 +1253,15 @@ def _write_seeds_picked(campaign_dir, iteration, n_seeds):
     )
     iter_dir = active_iteration_dir(campaign_dir, int(iteration))
     frame_ids = list(range(int(n_seeds)))
-    payload = {
-        "schema_version": 2,
-        "campaign_uid": "m16-test",
-        "iteration": int(iteration),
-        "models_version": 0,
-        "model_manifest_sha256": "c" * 64,
-        "trajectory_sha256": str(pool.sha256),
-        "n_picked": int(n_seeds),
-        "seed_records": [
+    payload = build_seed_selection_manifest(
+        campaign_uid="m16-test",
+        campaign_random_seed=0,
+        iteration=int(iteration),
+        models_version=0,
+        model_manifest_sha256="c" * 64,
+        trajectory_sha256=str(pool.sha256),
+        selection_strategy="hybrid_variance",
+        seed_records=[
             {
                 "seed_id": i + 1,
                 "frame_id": i,
@@ -1265,19 +1271,7 @@ def _write_seeds_picked(campaign_dir, iteration, n_seeds):
             }
             for i in frame_ids
         ],
-    }
-    fingerprint = selection_fingerprint_sha256(payload)
-    payload["selection_fingerprint_sha256"] = fingerprint
-    for record in payload["seed_records"]:
-        record["seed_uid"] = deterministic_seed_uid(
-            campaign_uid="m16-test",
-            iteration=int(iteration),
-            seed_id=int(record["seed_id"]),
-            frame_id=int(record["frame_id"]),
-            models_version=0,
-            model_manifest_sha256="c" * 64,
-            selection_fingerprint_sha256_value=fingerprint,
-        )
+    )
     selection_path = seeds_picked_path(iter_dir)
     selection_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(selection_path, payload)
@@ -1506,34 +1500,12 @@ def test_ariadne_parser_uses_result_resolved_protocol_manifest(tmp_path):
     iter_dir = active_iteration_dir(tmp_path / "campaign", 4)
     protocol_path = sampling_protocol_resolved_path(iter_dir)
     protocol_path.parent.mkdir(parents=True, exist_ok=True)
+    protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+    protocol["resolved_quality_gates"]["ariadne_max_displacement_ang"] = 1.0e-8
     protocol_path.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "iteration": 4,
-                "sampling_aggressiveness": 5,
-                "resolved_quality_gates": {
-                    "ariadne_max_displacement_ang": 1.0e-8,
-                    "ariadne_min_pair_distance_ang": 0.60,
-                },
-                "resolved_adversarial_safety": {
-                    "accept_legacy_missing_landing_safety": False,
-                    "allow_seed_fallback": False,
-                },
-                "resolved_anti_overlap": {
-                    "skip_training_seeds": True,
-                    "recent_seeds_cooldown": 3,
-                    "min_post_ariadne_whitened_distance": 0.01,
-                    "max_post_ariadne_whitened_distance": 10.0,
-                    "enforce_post_ariadne": False,
-                },
-                "sampling_scale_model": {
-                    "schema_version": 1,
-                    "iteration": 4,
-                },
-            }
-        ),
+        json.dumps(protocol),
         encoding="utf-8",
+        newline="\n",
     )
     seed_dir = ariadne_seed_dir(iter_dir, 1)
     result_path = seed_dir / "result.json"
@@ -2083,6 +2055,10 @@ def _seed_phase_a_sample(campaign_dir, *, n_frames=2):
     """Publish a canonical Phase-A handoff from the legacy-named fixture."""
     from ichor.hpc.active_learning.handoff_manifests import write_phase_a_sample_manifest
     from ichor.hpc.active_learning.layout import bootstrap_selection_dir
+    from ichor.hpc.active_learning.sampling.diversity_contract import (
+        diversity_selector_contract,
+    )
+    from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
 
     target = bootstrap_selection_dir(campaign_dir)
     target.mkdir(parents=True, exist_ok=True)
@@ -2144,12 +2120,22 @@ def _seed_phase_a_sample(campaign_dir, *, n_frames=2):
         "\n".join(line for frame in selected_frames for line in frame) + "\n",
         encoding="utf-8",
     )
+    pool_source = campaign_dir / "phase_a_pool_source.xyz"
+    pool_source.write_text(
+        "\n".join(line for frame in selected_frames for line in frame) + "\n",
+        encoding="utf-8",
+    )
+    pool = TrajectoryPool.import_from(
+        pool_source,
+        campaign_dir,
+        overwrite=True,
+    )
     index.write_text(
         "\n".join(str(frame_id) for frame_id in selected_indices) + "\n",
         encoding="utf-8",
     )
     write_phase_a_sample_manifest(target, {
-        "phase": "PHASE_A_POLUS",
+        "phase": "PHASE_A_DIVERSITY",
         "iteration": 0,
         "sample_xyz": str(dst.resolve()),
         "index_path": str(index.resolve()),
@@ -2157,6 +2143,7 @@ def _seed_phase_a_sample(campaign_dir, *, n_frames=2):
         "n_frames": int(n_frames),
         "selected_indices": selected_indices,
         "descriptor": "rmsd_massweight",
+        "selector": diversity_selector_contract(),
         "n_pool_frames": int(n_frames),
         "bootstrap_total_size": int(n_frames),
         "point_allocation": {
@@ -2167,8 +2154,8 @@ def _seed_phase_a_sample(campaign_dir, *, n_frames=2):
             "reserve_count": 0,
         },
         "reserve_after_bootstrap": 0,
-        "trajectory_sha256": "0" * 64,
-        "source_pool_manifest": "",
+        "trajectory_sha256": str(pool.sha256),
+        "source_pool_manifest": ".DATA/TRAJECTORY/pool.manifest.json",
     })
     return target
 
@@ -2190,7 +2177,7 @@ def _write_phase_b_manifest(iter_dir, *, n_final=1, write_sample=True):
         read_phase_b_selection_manifest,
     )
     from ichor.hpc.active_learning.layout import active_phase_b_dir
-    from ichor.hpc.active_learning.sampling.polus_wrapper import main as polus_main
+    from ichor.hpc.active_learning.sampling.diversity import main as polus_main
 
     iteration = int(iter_dir.name.split("-")[-1])
     campaign = iter_dir.parent.parent
@@ -2233,7 +2220,7 @@ def _write_phase_b_manifest(iter_dir, *, n_final=1, write_sample=True):
         observations=[],
     )
     assert parsed.failure_reason is None
-    state.phase = _CampaignPhase.PHASE_B_POLUS
+    state.phase = _CampaignPhase.PHASE_B_DIVERSITY
     write_state(state_path, state)
     rc = polus_main([
         "--descriptor",
@@ -2259,15 +2246,15 @@ def test_polus_phase_a_happy_path(tmp_path):
     ex = _make_executor(tmp_path)
     _seed_phase_a_sample(tmp_path / "campaign", n_frames=2)
     state = SimpleNamespace(iteration=0, campaign_uid="m16-test")
-    result = ex._parse_polus_postprocess(
-        state, CampaignPhase("PHASE_A_POLUS"), observations=[],
+    result = ex._parse_diversity_postprocess(
+        state, CampaignPhase("PHASE_A_DIVERSITY"), observations=[],
     )
     assert result.is_complete is True
     assert result.failure_reason is None
     events = _read_journal_events(tmp_path / "campaign")
     succeeded = [e for e in events if e.get("event") == "phase_succeeded_live"]
     assert succeeded
-    assert succeeded[-1]["phase"] == "PHASE_A_POLUS"
+    assert succeeded[-1]["phase"] == "PHASE_A_DIVERSITY"
     assert succeeded[-1]["n_frames"] == 2
 
 
@@ -2280,8 +2267,8 @@ def test_polus_phase_a_missing_outdir(tmp_path):
     if target.exists():
         shutil.rmtree(target.parent)
     state = SimpleNamespace(iteration=0, campaign_uid="m16-test")
-    result = ex._parse_polus_postprocess(
-        state, CampaignPhase("PHASE_A_POLUS"), observations=[],
+    result = ex._parse_diversity_postprocess(
+        state, CampaignPhase("PHASE_A_DIVERSITY"), observations=[],
     )
     assert result.failure_reason is not None
     assert "phase_a" in result.failure_reason
@@ -2293,8 +2280,8 @@ def test_polus_phase_a_no_sample_in_outdir(tmp_path):
     state = SimpleNamespace(iteration=0, campaign_uid="m16-test")
     target = bootstrap_selection_dir(tmp_path / "campaign")
     target.mkdir(parents=True, exist_ok=True)
-    result = ex._parse_polus_postprocess(
-        state, CampaignPhase("PHASE_A_POLUS"), observations=[],
+    result = ex._parse_diversity_postprocess(
+        state, CampaignPhase("PHASE_A_DIVERSITY"), observations=[],
     )
     assert result.failure_reason is not None
     assert "phase_a_sample_manifest_invalid" in result.failure_reason
@@ -2306,8 +2293,8 @@ def test_polus_phase_a_uses_manifest_not_lexical_last(tmp_path):
     stale = outdir / "retired-sample-name.xyz"
     stale.write_text("garbage no frames here", encoding="utf-8")
     state = SimpleNamespace(iteration=0, campaign_uid="m16-test")
-    result = ex._parse_polus_postprocess(
-        state, CampaignPhase("PHASE_A_POLUS"), observations=[],
+    result = ex._parse_diversity_postprocess(
+        state, CampaignPhase("PHASE_A_DIVERSITY"), observations=[],
     )
     assert result.failure_reason is None
     events = _read_journal_events(tmp_path / "campaign")
@@ -2326,7 +2313,7 @@ def test_polus_phase_a_manifest_count_mismatch_fails(tmp_path):
     allocation = dict(existing["point_allocation"])
     allocation["primary"] = list(allocation["primary"][:1])
     write_phase_a_sample_manifest(outdir, {
-        "phase": "PHASE_A_POLUS",
+        "phase": "PHASE_A_DIVERSITY",
         "iteration": 0,
         "sample_xyz": str(sample.resolve()),
         "index_path": str(index.resolve()),
@@ -2334,11 +2321,13 @@ def test_polus_phase_a_manifest_count_mismatch_fails(tmp_path):
         "n_frames": 1,
         "selected_indices": [0],
         "descriptor": "rmsd_massweight",
+        "selector": dict(existing["selector"]),
+        "source_pool_manifest": ".DATA/TRAJECTORY/pool.manifest.json",
         "point_allocation": allocation,
     })
     state = SimpleNamespace(iteration=0, campaign_uid="m16-test")
-    result = ex._parse_polus_postprocess(
-        state, CampaignPhase("PHASE_A_POLUS"), observations=[],
+    result = ex._parse_diversity_postprocess(
+        state, CampaignPhase("PHASE_A_DIVERSITY"), observations=[],
     )
     assert result.failure_reason is not None
     assert "Phase A sample XYZ frame count mismatch" in result.failure_reason
@@ -2349,15 +2338,15 @@ def test_polus_phase_b_happy_path(tmp_path):
     iter_dir = _seed_phase_b_sample(tmp_path / "campaign", iteration=5)
     _write_phase_b_manifest(iter_dir, n_final=2)
     state = SimpleNamespace(iteration=5, campaign_uid="m16-test")
-    result = ex._parse_polus_postprocess(
-        state, CampaignPhase("PHASE_B_POLUS"), observations=[],
+    result = ex._parse_diversity_postprocess(
+        state, CampaignPhase("PHASE_B_DIVERSITY"), observations=[],
     )
     assert result.is_complete is True
     assert result.failure_reason is None
     events = _read_journal_events(tmp_path / "campaign")
     succeeded = [e for e in events if e.get("event") == "phase_succeeded_live"]
     assert succeeded
-    assert succeeded[-1]["phase"] == "PHASE_B_POLUS"
+    assert succeeded[-1]["phase"] == "PHASE_B_DIVERSITY"
 
 
 def test_polus_phase_b_missing_sample(tmp_path):
@@ -2365,8 +2354,8 @@ def test_polus_phase_b_missing_sample(tmp_path):
     iter_dir = active_iteration_dir(tmp_path / "campaign", 5)
     _write_phase_b_manifest(iter_dir, n_final=1, write_sample=False)
     state = SimpleNamespace(iteration=5, campaign_uid="m16-test")
-    result = ex._parse_polus_postprocess(
-        state, CampaignPhase("PHASE_B_POLUS"), observations=[],
+    result = ex._parse_diversity_postprocess(
+        state, CampaignPhase("PHASE_B_DIVERSITY"), observations=[],
     )
     assert result.failure_reason is not None
     assert "phase_b_handoff_invalid" in result.failure_reason
@@ -2377,8 +2366,8 @@ def test_polus_phase_b_raw_sample_only_is_rejected(tmp_path):
     iter_dir = active_iteration_dir(tmp_path / "campaign", 5)
     _write_phase_b_manifest(iter_dir, n_final=1, write_sample=False)
     state = SimpleNamespace(iteration=5, campaign_uid="m16-test")
-    result = ex._parse_polus_postprocess(
-        state, CampaignPhase("PHASE_B_POLUS"), observations=[],
+    result = ex._parse_diversity_postprocess(
+        state, CampaignPhase("PHASE_B_DIVERSITY"), observations=[],
     )
     assert result.failure_reason is not None
     assert "phase_b_handoff_invalid" in result.failure_reason
@@ -2395,8 +2384,8 @@ def test_polus_phase_b_enriches_seed_provenance(tmp_path):
     records = _write_phase_b_manifest(iter_dir, n_final=2)
     seed_dir = Path(records[0]["seed_dir"])
     state = SimpleNamespace(iteration=5, campaign_uid="m16-test")
-    result = ex._parse_polus_postprocess(
-        state, CampaignPhase("PHASE_B_POLUS"), observations=[],
+    result = ex._parse_diversity_postprocess(
+        state, CampaignPhase("PHASE_B_DIVERSITY"), observations=[],
     )
     assert result.failure_reason is None
     prov = read_provenance(seed_dir)
@@ -2422,8 +2411,8 @@ def test_polus_phase_b_unreadable_sample_fails(tmp_path):
     manifest["selected_xyz"]["sha256"] = sha256_file(sample)
     atomic_write_json(manifest_path, manifest)
     state = SimpleNamespace(iteration=5, campaign_uid="m16-test")
-    result = ex._parse_polus_postprocess(
-        state, CampaignPhase("PHASE_B_POLUS"), observations=[],
+    result = ex._parse_diversity_postprocess(
+        state, CampaignPhase("PHASE_B_DIVERSITY"), observations=[],
     )
     assert result.failure_reason is not None
     assert "phase_b_handoff_invalid" in result.failure_reason

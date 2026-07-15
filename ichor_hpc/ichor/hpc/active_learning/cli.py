@@ -268,7 +268,7 @@ def expand_boolean_short_flag_clusters(argv: Optional[Sequence[str]]) -> List[st
 
 
 RETRYABLE_CLEANED_REENTRY_PHASES = {
-    CampaignPhase.PHASE_A_POLUS,
+    CampaignPhase.PHASE_A_DIVERSITY,
     CampaignPhase.INITIAL_GAUSSIAN,
     CampaignPhase.INITIAL_AIMALL,
     CampaignPhase.INITIAL_ALLOCATION_CHECK,
@@ -277,7 +277,7 @@ RETRYABLE_CLEANED_REENTRY_PHASES = {
     CampaignPhase.INITIAL_FEREBUS,
     CampaignPhase.SEED_SELECT,
     CampaignPhase.ARIADNE_ARRAY,
-    CampaignPhase.PHASE_B_POLUS,
+    CampaignPhase.PHASE_B_DIVERSITY,
     CampaignPhase.SPLIT,
     CampaignPhase.GAUSSIAN,
     CampaignPhase.AIMALL,
@@ -1076,7 +1076,7 @@ def _format_contract_status(contract: Any) -> Optional[str]:
 
 _PHASE_MEANINGS: Dict[str, str] = {
     CampaignPhase.INIT.value: "campaign initialised; no sampling phase has run yet",
-    CampaignPhase.PHASE_A_POLUS.value: "initial POLUS diversity sampling is next",
+    CampaignPhase.PHASE_A_DIVERSITY.value: "initial ICHOR diversity sampling is next",
     CampaignPhase.INITIAL_GAUSSIAN.value: "initial Gaussian labelling is next",
     CampaignPhase.INITIAL_AIMALL.value: "initial AIMAll postprocessing is next",
     CampaignPhase.INITIAL_ALLOCATION_CHECK.value: "bootstrap point-allocation completeness is being checked",
@@ -1085,7 +1085,7 @@ _PHASE_MEANINGS: Dict[str, str] = {
     CampaignPhase.INITIAL_FEREBUS.value: "bootstrap FEREBUS model training is next",
     CampaignPhase.SEED_SELECT.value: "active-learning seed selection is next",
     CampaignPhase.ARIADNE_ARRAY.value: "ARIADNE adversarial landing is next",
-    CampaignPhase.PHASE_B_POLUS.value: "Phase B POLUS selection is next",
+    CampaignPhase.PHASE_B_DIVERSITY.value: "Phase B diversity selection is next",
     CampaignPhase.SPLIT.value: "the pre-QM exact slot allocation is being verified",
     CampaignPhase.GAUSSIAN.value: "active Gaussian labelling is next",
     CampaignPhase.AIMALL.value: "active AIMAll postprocessing is next",
@@ -1101,7 +1101,7 @@ _PHASE_MEANINGS: Dict[str, str] = {
 
 _BOOTSTRAP_NOT_READY_PHASES = {
     CampaignPhase.INIT.value,
-    CampaignPhase.PHASE_A_POLUS.value,
+    CampaignPhase.PHASE_A_DIVERSITY.value,
     CampaignPhase.INITIAL_GAUSSIAN.value,
     CampaignPhase.INITIAL_AIMALL.value,
     CampaignPhase.INITIAL_ALLOCATION_CHECK.value,
@@ -1112,7 +1112,7 @@ _BOOTSTRAP_NOT_READY_PHASES = {
 _TRAINING_REQUIRED_PHASES = {
     CampaignPhase.SEED_SELECT.value,
     CampaignPhase.ARIADNE_ARRAY.value,
-    CampaignPhase.PHASE_B_POLUS.value,
+    CampaignPhase.PHASE_B_DIVERSITY.value,
     CampaignPhase.SPLIT.value,
     CampaignPhase.GAUSSIAN.value,
     CampaignPhase.AIMALL.value,
@@ -1127,7 +1127,7 @@ _TRAINING_REQUIRED_PHASES = {
 _MODELS_REQUIRED_PHASES = {
     CampaignPhase.SEED_SELECT.value,
     CampaignPhase.ARIADNE_ARRAY.value,
-    CampaignPhase.PHASE_B_POLUS.value,
+    CampaignPhase.PHASE_B_DIVERSITY.value,
     CampaignPhase.SPLIT.value,
     CampaignPhase.GAUSSIAN.value,
     CampaignPhase.AIMALL.value,
@@ -6980,12 +6980,12 @@ def _print_bootstrap_plan(plan: Any) -> None:
                 + ", ".join(str(value) for value in plan.model.properties)
             )
             print("  configured target: ignored")
-            print("  POLUS top-up: 0")
+            print("  diversity top-up: 0")
             continue
-        print("  source: " + ("POLUS" if source is None else str(source.path)))
+        print("  source: " + ("ICHOR diversity" if source is None else str(source.path)))
         print("  supplied: " + str(0 if source is None else source.count))
         print("  configured target: " + str(plan.configured_targets[split]))
-        print("  POLUS top-up: " + str(plan.polus_deficits[split]))
+        print("  Diversity top-up: " + str(plan.diversity_deficits[split]))
         if source is not None and source.alf_zero_indexed is not None:
             print(
                 "  ALF (1-based): "
@@ -7386,7 +7386,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             config,
             {
                 "effective_qm_targets": plan.effective_qm_targets,
-                "polus_deficits": dict(plan.polus_deficits),
+                "diversity_deficits": dict(plan.diversity_deficits),
                 "supplied_counts": plan.supplied_counts,
                 "excluded_pool_frame_ids": list(plan.excluded_pool_frame_ids),
                 "model": (
@@ -7429,7 +7429,9 @@ def cmd_init(args: argparse.Namespace) -> int:
                 bootstrap_manifest.get("plan_identity_sha256") or ""
             ),
             supplied_counts=dict(bootstrap_manifest.get("supplied_counts") or {}),
-            polus_deficits=dict(bootstrap_manifest.get("polus_deficits") or {}),
+            diversity_deficits=dict(
+                bootstrap_manifest.get("diversity_deficits") or {}
+            ),
             model_training_rows=int(
                 (bootstrap_manifest.get("model") or {}).get("training_count", 0)
             ),
@@ -7633,10 +7635,6 @@ def _preflight_failure_details(payload: Dict[str, Any]) -> List[str]:
                 details.append(
                     "install/build ariadne in the configured submitted Python venv"
                 )
-            elif name == "polus_rs":
-                details.append(
-                    "install POLUS in the configured submitted Python venv"
-                )
             elif name == "pyferebus":
                 details.append(
                     "install pyferebus in the configured submitted Python venv"
@@ -7730,15 +7728,6 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
             "importable in submitted environment"
             if avail.get("ariadne")
             else avail.get("ariadne_probe_error") or "not importable",
-        )
-    )
-    lines.append(
-        _preflight_check_line(
-            "POLUS RS",
-            avail.get("polus_rs"),
-            "importable in submitted environment"
-            if avail.get("polus_rs")
-            else avail.get("polus_rs_probe_error") or "not importable",
         )
     )
     lines.append(

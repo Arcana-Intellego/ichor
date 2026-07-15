@@ -4,12 +4,12 @@ This is the procedure for the first real `--mode live` iteration of the ICHOR
 active-learning daemon on Manchester's CSF4 cluster. The goal is a single
 water-tetramer iteration that finishes in under two hours and proves the
 pipeline end-to-end with real backend output (real Gaussian SCFs, real
-AIMAll IQA, real FEREBUS training, real ARIADNE descent, real POLUS
-sub-sample). After this works once, scaling up to a real campaign is just
+AIMAll IQA, real FEREBUS training, real ARIADNE descent, and exact ICHOR
+diversity sampling). After this works once, scaling up to a real campaign is just
 a matter of bumping the iteration count + the seed pool.
 
 Everything below assumes you have already cloned the ICHOR repo and the
-three external packages (POLUS, pyferebus, ARIADNE) into sibling
+the FEREBUS_CPU and ARIADNE projects into sibling
 directories under `~/projects/` (or wherever you keep code). Adjust the
 paths as needed.
 
@@ -66,9 +66,6 @@ python -m pip install --upgrade pip
 pip install -e ~/projects/ichor-active-learning/ichor_core
 pip install -e ~/projects/ichor-active-learning/ichor_hpc
 pip install -e ~/projects/ichor-active-learning/ichor_cli
-
-# the diversity sampler subtree used by the daemon
-pip install -e ~/projects/POLUS/polus_core_subpackage --no-deps
 
 # the FEREBUS Python wrapper (submission staging only -- runtime is the
 # Fortran binary you place under <MACHINE>.software.ferebus in step 4)
@@ -147,7 +144,6 @@ Confirm each backend imports cleanly:
 
 ```
 python -c "import ichor.core, ichor.hpc, ichor.cli; print('ichor packages OK')"
-python -c "import polus.samplers.RS.randomSampling; print('polus RS OK')"
 python -c "import pyferebus.executors.trainer; print('pyferebus OK')"
 python -c "import ariadne; print('ariadne OK')"
 python -c "import ase; print('ASE OK')"
@@ -290,7 +286,7 @@ mkdir -p ~/scratch/ichor_live_smoke
 cd ~/scratch/ichor_live_smoke
 
 # copy the canonical water-tetramer trajectory in. the test fixture has 20
-# frames; for a real smoke you want ~200 -- enough to give POLUS Phase-A
+# frames; for a real smoke you want ~200 -- enough to give Phase A diversity
 # something to pick a diverse initial set from.
 cp ~/projects/ichor-active-learning/ichor_hpc/tests/test_active_learning/fixtures/water_tetramer.xyz pool.xyz
 cp ~/projects/ichor-active-learning/examples/csf4_first_live_iter/campaign.yaml campaign.yaml
@@ -340,7 +336,7 @@ resources:
     walltime_hours: 2
     cpus_per_task: auto
     mem_per_cpu: auto
-  polus:
+  diversity:
     walltime_hours: 1
   gaussian:
     walltime_hours: 2
@@ -522,7 +518,7 @@ set is too small or too clustered. Increase
 internal/external validation counts. Also check that the Gaussian + AIMAll outputs in the pointdirs look
 reasonable.
 
-**Phase A POLUS picks all-coincident frames**. happens when the input
+**Phase A diversity picks all-coincident frames**. happens when the input
 trajectory is too short (under ~20 frames). use a longer trajectory; the
 test fixture only has 20 frames which is OK for the smoke but production
 wants 200+.

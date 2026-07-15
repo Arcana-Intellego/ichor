@@ -6,7 +6,7 @@ from ichor.hpc.active_learning.daemon.daemon import PHASE_ORDER
 
 
 def test_active_learning_daemon_docs_match_executed_phase_order():
-    wanted = ["PHASE_B_POLUS", "SPLIT", "GAUSSIAN", "AIMALL", "APPEND"]
+    wanted = ["PHASE_B_DIVERSITY", "SPLIT", "GAUSSIAN", "AIMALL", "APPEND"]
     source_slice = [phase.value for phase in PHASE_ORDER if phase.value in wanted]
     assert source_slice == wanted
 

@@ -64,8 +64,11 @@ def test_write_seed_provenance_creates_full_schema_skeleton(tmp_path):
         pdir,
         campaign_uid="abc-123",
         iteration=5,
-        trajectory_sha256="deadbeef",
+        trajectory_sha256="d" * 64,
         seed_frame_id=42,
+        seed_id=1,
+        seed_uid="b" * 64,
+        array_task_id_zero_based=0,
         seed_selection_origin="variance",
         seed_variance_at_selection=1.23e-4,
         subspace_neighbour_frame_ids=[42, 41, 99],
@@ -77,7 +80,7 @@ def test_write_seed_provenance_creates_full_schema_skeleton(tmp_path):
     assert data["schema_version"] == PROVENANCE_SCHEMA_VERSION
     assert data["campaign_uid"] == "abc-123"
     assert data["iteration"] == 5
-    assert data["trajectory_sha256"] == "deadbeef"
+    assert data["trajectory_sha256"] == "d" * 64
     assert data["seed"]["frame_id"] == 42
     assert data["seed"]["selection_origin"] == "variance"
     assert data["subspace"]["neighbour_frame_ids"] == [42, 41, 99]
@@ -91,8 +94,9 @@ def test_write_seed_provenance_creates_full_schema_skeleton(tmp_path):
 def test_enrich_with_ariadne_preserves_earlier_blocks(tmp_path):
     pdir = tmp_path / "p"
     write_seed_provenance(
-        pdir, campaign_uid="X", iteration=1, trajectory_sha256="",
-        seed_frame_id=7, seed_selection_origin="bulk",
+        pdir, campaign_uid="X", iteration=1, trajectory_sha256="a" * 64,
+        seed_frame_id=7, seed_id=1, seed_uid="b" * 64,
+        array_task_id_zero_based=0, seed_selection_origin="bulk",
         seed_variance_at_selection=None,
         subspace_neighbour_frame_ids=[7], subspace_dimension=1,
         subspace_eigenvalues=[1.0],
@@ -112,8 +116,9 @@ def test_enrich_with_ariadne_preserves_earlier_blocks(tmp_path):
 def test_enrich_with_anti_overlap_records_flag(tmp_path):
     pdir = tmp_path / "p"
     write_seed_provenance(
-        pdir, campaign_uid="X", iteration=1, trajectory_sha256="",
-        seed_frame_id=None, seed_selection_origin="bulk",
+        pdir, campaign_uid="X", iteration=1, trajectory_sha256="a" * 64,
+        seed_frame_id=None, seed_id=1, seed_uid="b" * 64,
+        array_task_id_zero_based=0, seed_selection_origin="bulk",
         seed_variance_at_selection=None,
         subspace_neighbour_frame_ids=[], subspace_dimension=0,
         subspace_eigenvalues=[],
@@ -132,8 +137,9 @@ def test_enrich_with_anti_overlap_records_flag(tmp_path):
 def test_enrich_with_phase_b_records_diversity_rank(tmp_path):
     pdir = tmp_path / "p"
     write_seed_provenance(
-        pdir, campaign_uid="X", iteration=1, trajectory_sha256="",
-        seed_frame_id=None, seed_selection_origin="bulk",
+        pdir, campaign_uid="X", iteration=1, trajectory_sha256="a" * 64,
+        seed_frame_id=None, seed_id=1, seed_uid="b" * 64,
+        array_task_id_zero_based=0, seed_selection_origin="bulk",
         seed_variance_at_selection=None,
         subspace_neighbour_frame_ids=[], subspace_dimension=0,
         subspace_eigenvalues=[],
@@ -187,7 +193,13 @@ def test_ensure_index_creates_empty_payload(tmp_path):
 
 def test_ensure_index_is_idempotent(tmp_path):
     p1 = ensure_index(tmp_path)
-    append_to_index(tmp_path, iteration=0, pointdir_name="POINT_0000.pointdir", seed_frame_id=7)
+    append_to_index(
+        tmp_path,
+        iteration=0,
+        pointdir_name="POINT_0000.pointdir",
+        seed_frame_id=7,
+        trajectory_sha256="a" * 64,
+    )
     p2 = ensure_index(tmp_path)
     assert p1 == p2
     data = json.loads(p2.read_text(encoding="utf-8"))
@@ -201,6 +213,7 @@ def test_append_to_index_grows_records(tmp_path):
             tmp_path, iteration=i,
             pointdir_name=f"POINT_{i:04d}.pointdir",
             seed_frame_id=10 * i,
+            trajectory_sha256="a" * 64,
         )
     data = load_index(tmp_path)
     assert len(data["records"]) == 3
@@ -215,6 +228,7 @@ def test_append_to_index_accepts_none_frame_id(tmp_path):
         tmp_path, iteration=0,
         pointdir_name="POINT_0000.pointdir",
         seed_frame_id=None,
+        trajectory_sha256="a" * 64,
     )
     data = load_index(tmp_path)
     assert data["records"][0]["seed_frame_id"] is None
@@ -257,10 +271,10 @@ def test_load_index_raises_when_records_not_list(tmp_path):
 
 
 def test_load_training_seed_frame_ids_skips_none(tmp_path):
-    append_to_index(tmp_path, iteration=0, pointdir_name="A", seed_frame_id=5)
-    append_to_index(tmp_path, iteration=0, pointdir_name="B", seed_frame_id=None)
-    append_to_index(tmp_path, iteration=1, pointdir_name="C", seed_frame_id=12)
-    append_to_index(tmp_path, iteration=1, pointdir_name="D", seed_frame_id=5)
+    append_to_index(tmp_path, iteration=0, pointdir_name="A", seed_frame_id=5, trajectory_sha256="a" * 64)
+    append_to_index(tmp_path, iteration=0, pointdir_name="B", seed_frame_id=None, trajectory_sha256="a" * 64)
+    append_to_index(tmp_path, iteration=1, pointdir_name="C", seed_frame_id=12, trajectory_sha256="a" * 64)
+    append_to_index(tmp_path, iteration=1, pointdir_name="D", seed_frame_id=5, trajectory_sha256="a" * 64)
     s = load_training_seed_frame_ids(tmp_path)
     assert isinstance(s, set)
     assert s == {5, 12}
@@ -308,7 +322,7 @@ def test_repair_index_from_committed_pointdirs_adds_missing_records(tmp_path):
         pdir,
         campaign_uid="X",
         iteration=0,
-        trajectory_sha256="",
+        trajectory_sha256="a" * 64,
         seed_frame_id=42,
         seed_selection_origin="variance",
         seed_variance_at_selection=None,
@@ -375,6 +389,7 @@ def test_repair_index_from_committed_pointdirs_adds_missing_records(tmp_path):
             "iteration": 0,
             "pointdir_name": "POINT_000000.pointdir",
             "seed_frame_id": 42,
+            "trajectory_sha256": "a" * 64,
         }
     ]
 
@@ -383,7 +398,7 @@ def test_repair_index_from_committed_pointdirs_adds_missing_records(tmp_path):
 
 
 def test_full_provenance_chain_through_dry_run_executor(tmp_path):
-    """Drive the dry-run executor through ARIADNE_ARRAY -> PHASE_B_POLUS ->
+    """Drive the dry-run executor through ARIADNE_ARRAY -> PHASE_B_DIVERSITY ->
     APPEND for a single iteration and verify the full provenance + index
     flow lands as documented in the M10 design.
 
@@ -419,7 +434,7 @@ def test_full_provenance_chain_through_dry_run_executor(tmp_path):
         models_version=-1,
     )
 
-    ex.postprocess(state, CampaignPhase.PHASE_A_POLUS, observations=[])
+    ex.postprocess(state, CampaignPhase.PHASE_A_DIVERSITY, observations=[])
     ex.postprocess(state, CampaignPhase.INITIAL_GAUSSIAN, observations=[])
     ex.postprocess(state, CampaignPhase.INITIAL_AIMALL, observations=[])
     ex.submit_or_run(state, CampaignPhase.INITIAL_ALLOCATION_CHECK)
@@ -456,7 +471,7 @@ def test_full_provenance_chain_through_dry_run_executor(tmp_path):
         assert isinstance(data["anti_overlap"]["passed"], bool)
         assert data["phase_b"] is None
 
-    ex.postprocess(state, CampaignPhase.PHASE_B_POLUS, observations=[])
+    ex.postprocess(state, CampaignPhase.PHASE_B_DIVERSITY, observations=[])
     selected_after_fps = 0
     for sd in seed_dirs:
         data = read_provenance(sd)
@@ -526,7 +541,7 @@ def test_full_provenance_chain_through_dry_run_executor(tmp_path):
 
 
 def test_full_provenance_chain_two_iterations_grows_index_monotonically(tmp_path):
-    """Two passes through ARIADNE_ARRAY -> PHASE_B_POLUS -> APPEND must
+    """Two passes through ARIADNE_ARRAY -> PHASE_B_DIVERSITY -> APPEND must
     produce a monotonically-growing index. Catches regressions where the
     APPEND phase resets the index, or where iteration numbers in records
     drift."""
@@ -552,7 +567,7 @@ def test_full_provenance_chain_two_iterations_grows_index_monotonically(tmp_path
         reference_data_version=-1,
         models_version=-1,
     )
-    ex.postprocess(bootstrap_state, CampaignPhase.PHASE_A_POLUS, observations=[])
+    ex.postprocess(bootstrap_state, CampaignPhase.PHASE_A_DIVERSITY, observations=[])
     ex.postprocess(bootstrap_state, CampaignPhase.INITIAL_GAUSSIAN, observations=[])
     ex.postprocess(bootstrap_state, CampaignPhase.INITIAL_AIMALL, observations=[])
     ex.submit_or_run(bootstrap_state, CampaignPhase.INITIAL_ALLOCATION_CHECK)
@@ -578,7 +593,7 @@ def test_full_provenance_chain_two_iterations_grows_index_monotonically(tmp_path
         ex.submit_or_run(state_ns, CampaignPhase.SEED_SELECT)
         _stage_ariadne_intent(ex, state_ns)
         ex.postprocess(state_ns, CampaignPhase.ARIADNE_ARRAY, observations=[])
-        ex.postprocess(state_ns, CampaignPhase.PHASE_B_POLUS, observations=[])
+        ex.postprocess(state_ns, CampaignPhase.PHASE_B_DIVERSITY, observations=[])
         ex.postprocess(state_ns, CampaignPhase.GAUSSIAN, observations=[])
         ex.postprocess(state_ns, CampaignPhase.AIMALL, observations=[])
         ex.submit_or_run(state_ns, CampaignPhase.ALLOCATION_CHECK)
@@ -630,13 +645,13 @@ def test_load_recent_seeds_payload_returns_empty_on_missing(tmp_path):
 
 
 def test_append_recent_seeds_grows_and_rolls_off_oldest(tmp_path):
-    append_recent_seeds(tmp_path, iteration=0, frame_ids=[1, 2], cooldown=3)
-    append_recent_seeds(tmp_path, iteration=1, frame_ids=[3], cooldown=3)
-    append_recent_seeds(tmp_path, iteration=2, frame_ids=[4, 5], cooldown=3)
+    append_recent_seeds(tmp_path, iteration=0, frame_ids=[1, 2], trajectory_sha256="a" * 64, cooldown=3)
+    append_recent_seeds(tmp_path, iteration=1, frame_ids=[3], trajectory_sha256="a" * 64, cooldown=3)
+    append_recent_seeds(tmp_path, iteration=2, frame_ids=[4, 5], trajectory_sha256="a" * 64, cooldown=3)
     data = load_recent_seeds_payload(tmp_path)
     assert [e["iteration"] for e in data["history"]] == [0, 1, 2]
     # 4th append rolls iteration 0 off.
-    append_recent_seeds(tmp_path, iteration=3, frame_ids=[6], cooldown=3)
+    append_recent_seeds(tmp_path, iteration=3, frame_ids=[6], trajectory_sha256="a" * 64, cooldown=3)
     data = load_recent_seeds_payload(tmp_path)
     assert [e["iteration"] for e in data["history"]] == [1, 2, 3]
     s = load_recent_seed_frame_ids(tmp_path)
@@ -647,6 +662,7 @@ def test_append_recent_seeds_strips_none_frame_ids(tmp_path):
     append_recent_seeds(
         tmp_path, iteration=0,
         frame_ids=[1, None, 2, None, 3],
+        trajectory_sha256="a" * 64,
         cooldown=3,
     )
     data = load_recent_seeds_payload(tmp_path)
@@ -683,21 +699,25 @@ def test_append_recent_seeds_cooldown_zero_empties_history(tmp_path):
     """cooldown=0 must trim to an empty history after every append (operator
     saying 'do not remember any seeds'). Pre-M15 the lst[-0:] slice silently
     returned the whole list, retaining everything."""
-    append_recent_seeds(tmp_path, iteration=0, frame_ids=[1, 2], cooldown=0)
+    append_recent_seeds(tmp_path, iteration=0, frame_ids=[1, 2], trajectory_sha256="a" * 64, cooldown=0)
     data = load_recent_seeds_payload(tmp_path)
     assert data["history"] == []
     assert data["cooldown"] == 0
-    append_recent_seeds(tmp_path, iteration=1, frame_ids=[3, 4], cooldown=0)
+    append_recent_seeds(tmp_path, iteration=1, frame_ids=[3, 4], trajectory_sha256="a" * 64, cooldown=0)
     data = load_recent_seeds_payload(tmp_path)
     assert data["history"] == []
     assert load_recent_seed_frame_ids(tmp_path) == set()
 
 
-def test_append_recent_seeds_clamps_negative_cooldown_to_zero(tmp_path):
-    append_recent_seeds(tmp_path, iteration=0, frame_ids=[1], cooldown=-5)
-    data = load_recent_seeds_payload(tmp_path)
-    assert data["cooldown"] == 0
-    assert data["history"] == []
+def test_append_recent_seeds_rejects_negative_cooldown(tmp_path):
+    with pytest.raises(ProvenanceError, match="cooldown must be >= 0"):
+        append_recent_seeds(
+            tmp_path,
+            iteration=0,
+            frame_ids=[1],
+            trajectory_sha256="a" * 64,
+            cooldown=-5,
+        )
 
 
 def test_load_training_seed_frame_ids_self_heals_from_sidecars(tmp_path):
@@ -754,7 +774,7 @@ def test_load_training_seed_frame_ids_self_heals_from_sidecars(tmp_path):
         pd.mkdir(parents=True)
         write_seed_provenance(
             pd,
-            campaign_uid="u", iteration=0, trajectory_sha256="s",
+            campaign_uid="u", iteration=0, trajectory_sha256="a" * 64,
             seed_frame_id=int(attempt["frame_id"]), seed_selection_origin="bulk",
             seed_variance_at_selection=None,
             subspace_neighbour_frame_ids=[], subspace_dimension=0,
@@ -817,6 +837,7 @@ def test_load_training_seed_frame_ids_self_heals_from_sidecars(tmp_path):
         iteration=0,
         pointdir_name="POINT_000000.pointdir",
         seed_frame_id=11,
+        trajectory_sha256="a" * 64,
     )
 
     # index-only view misses 22

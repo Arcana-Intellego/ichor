@@ -53,7 +53,7 @@ DEFAULT_STATE_FILENAME = "state.json"
 
 class CampaignPhase(str, Enum):
     INIT = "INIT"
-    PHASE_A_POLUS = "PHASE_A_POLUS"
+    PHASE_A_DIVERSITY = "PHASE_A_DIVERSITY"
     INITIAL_GAUSSIAN = "INITIAL_GAUSSIAN"
     INITIAL_AIMALL = "INITIAL_AIMALL"
     INITIAL_ALLOCATION_CHECK = "INITIAL_ALLOCATION_CHECK"
@@ -62,7 +62,7 @@ class CampaignPhase(str, Enum):
     INITIAL_FEREBUS = "INITIAL_FEREBUS"
     SEED_SELECT = "SEED_SELECT"
     ARIADNE_ARRAY = "ARIADNE_ARRAY"
-    PHASE_B_POLUS = "PHASE_B_POLUS"
+    PHASE_B_DIVERSITY = "PHASE_B_DIVERSITY"
     SPLIT = "SPLIT"
     GAUSSIAN = "GAUSSIAN"
     AIMALL = "AIMALL"
@@ -346,7 +346,7 @@ class CampaignState:
             raise StateSchemaError("iteration must be >= 0")
         bootstrap_phases = {
             CampaignPhase.INIT,
-            CampaignPhase.PHASE_A_POLUS,
+            CampaignPhase.PHASE_A_DIVERSITY,
             CampaignPhase.INITIAL_GAUSSIAN,
             CampaignPhase.INITIAL_AIMALL,
             CampaignPhase.INITIAL_ALLOCATION_CHECK,
@@ -357,7 +357,7 @@ class CampaignState:
         active_phases = {
             CampaignPhase.SEED_SELECT,
             CampaignPhase.ARIADNE_ARRAY,
-            CampaignPhase.PHASE_B_POLUS,
+            CampaignPhase.PHASE_B_DIVERSITY,
             CampaignPhase.SPLIT,
             CampaignPhase.GAUSSIAN,
             CampaignPhase.AIMALL,

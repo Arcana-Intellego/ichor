@@ -1,13 +1,16 @@
 import numpy as np
 import pytest
 
-from ichor.hpc.active_learning.sampling.polus_wrapper import (
+from ichor.hpc.active_learning.sampling.diversity import (
     DEFAULT_DESCRIPTORS,
     FPSResult,
     _phase_b_refill_after_anti_overlap,
     _phase_b_target_size,
+    _relax_scaled_novelty,
     fps_select,
 )
+from ichor.hpc.active_learning.sampling.anti_overlap import DedupReport
+from ichor.hpc.active_learning.sampling.descriptors import CondensedDistanceStore
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.core.atoms import Atom, Atoms
 
@@ -162,6 +165,63 @@ def test_fps_select_non_symmetric_raises():
     D = np.array([[0.0, 1.0], [2.0, 0.0]])
     with pytest.raises(ValueError):
         fps_select(D, 2)
+
+
+@pytest.mark.parametrize("bad", [1.5, "1", True, None])
+def test_fps_select_rejects_non_integer_selection_counts(bad):
+    with pytest.raises((TypeError, ValueError)):
+        fps_select(_line_distance_matrix(3), bad)
+
+
+@pytest.mark.parametrize("bad", [0.5, "0", True])
+def test_fps_select_rejects_non_integer_seed_identity(bad):
+    with pytest.raises((TypeError, ValueError)):
+        fps_select(_line_distance_matrix(3), 2, seed_index=bad)
+
+
+@pytest.mark.parametrize(
+    "matrix",
+    [
+        np.array([[0.0, -1.0], [-1.0, 0.0]]),
+        np.array([[1.0, 1.0], [1.0, 0.0]]),
+        np.array([[0.0, np.nan], [np.nan, 0.0]]),
+        np.array([[0.0, 1.0], [1.0 + 2.0e-12, 0.0]]),
+    ],
+)
+def test_fps_select_rejects_invalid_metric_matrices(matrix):
+    with pytest.raises(ValueError):
+        fps_select(matrix, 1)
+
+
+def test_fps_select_validates_condensed_cardinality_and_values():
+    with pytest.raises(ValueError, match="expected"):
+        fps_select(CondensedDistanceStore(n=3, values=np.asarray([1.0])), 1)
+    with pytest.raises(ValueError, match="finite non-negative"):
+        fps_select(
+            CondensedDistanceStore(n=2, values=np.asarray([np.nan])),
+            1,
+        )
+
+
+def test_scaled_novelty_relaxation_fills_with_non_duplicates():
+    considered = [_h2(1.1), _h2(1.2), _h2(1.3)]
+    report = DedupReport(
+        kept_indices=(),
+        dropped_indices=(0, 1, 2),
+        distances_to_nearest=(0.1, 0.2, 0.3),
+        min_separation=0.5,
+    )
+
+    updated, diagnostic = _relax_scaled_novelty(
+        considered_frames=considered,
+        report=report,
+        training=[_h2(1.0)],
+        target_size=2,
+    )
+
+    assert updated.n_kept == 2
+    assert diagnostic["target_satisfied"] is True
+    assert diagnostic["n_admitted"] == 2
 
 
 def test_default_descriptors_registry_has_phase_a_default():

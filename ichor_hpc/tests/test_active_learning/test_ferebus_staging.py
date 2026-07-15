@@ -267,6 +267,30 @@ def test_model_bootstrap_stages_exact_historical_training_prefix(
     assert len(pool_frames) >= 4
     pool_frames = pool_frames[:4]
 
+    from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
+
+    pool_source = campaign / "pool-source.xyz"
+    pool_source.parent.mkdir(parents=True, exist_ok=True)
+    pool_lines = []
+    for frame_index, frame in enumerate(pool_frames):
+        pool_lines.extend((str(len(frame)), "frame " + str(frame_index)))
+        pool_lines.extend(
+            str(atom.type)
+            + " "
+            + repr(float(atom.x))
+            + " "
+            + repr(float(atom.y))
+            + " "
+            + repr(float(atom.z))
+            for atom in frame
+        )
+    pool_source.write_text(
+        "\n".join(pool_lines) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    pool = TrajectoryPool.import_from(pool_source, campaign)
+
     cfg = CampaignConfig()
     cfg.campaign.system_name = "WATER"
     cfg.campaign.custom_bootstrap = True
@@ -316,11 +340,11 @@ def test_model_bootstrap_stages_exact_historical_training_prefix(
         campaign,
         cfg,
         pool_frames,
-        pool_sha256="a" * 64,
+        pool_sha256=pool.sha256,
     )
     assert plan.model is not None
     assert plan.model.training_count == 2
-    assert plan.polus_deficits == {"train": 0, "int_val": 2, "ext_val": 2}
+    assert plan.diversity_deficits == {"train": 0, "int_val": 2, "ext_val": 2}
     commit_bootstrap_plan(plan)
     _prepare_bootstrap_training(
         campaign,

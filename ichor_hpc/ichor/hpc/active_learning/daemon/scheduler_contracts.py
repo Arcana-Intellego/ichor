@@ -27,7 +27,7 @@ def infer_expected_tasks_from_artifacts(
 ) -> Optional[int]:
     campaign = Path(campaign_dir)
     phase_name = phase.value if isinstance(phase, CampaignPhase) else str(phase)
-    if phase_name in {"PHASE_A_POLUS", "PHASE_B_POLUS"}:
+    if phase_name in {"PHASE_A_DIVERSITY", "PHASE_B_DIVERSITY"}:
         return 1
     try:
         if phase_name in {

@@ -204,7 +204,7 @@ def _hours_label(value) -> str:
 
 def _walltime_summary(resources) -> str:
     phases = (
-        ("POLUS", "PHASE_A_POLUS"),
+        ("Diversity", "PHASE_A_DIVERSITY"),
         ("Gaussian", "INITIAL_GAUSSIAN"),
         ("AIMAll", "INITIAL_AIMALL"),
         ("ARIADNE", "ARIADNE_ARRAY"),
@@ -272,7 +272,7 @@ def _pool_feasibility_summary(
 
 def _backend_effective_summary(resources, field_name: str) -> str:
     phases = (
-        ("POLUS", "PHASE_A_POLUS"),
+        ("Diversity", "PHASE_A_DIVERSITY"),
         ("Gaussian", "INITIAL_GAUSSIAN"),
         ("AIMAll", "INITIAL_AIMALL"),
         ("ARIADNE", "ARIADNE_ARRAY"),
@@ -306,7 +306,7 @@ def format_sampling_protocol_summary(
     runtime = config.runtime
     retention = config.retention
     geometry_payload = None
-    geometry_source = "profile fallback preview"
+    geometry_source = "sampling-policy fallback preview"
     sampling_protocol_resolved_path = None
     if campaign_dir is not None:
         geometry_payload, geometry_source = _latest_geometry_novelty_payload(
@@ -373,7 +373,7 @@ def format_sampling_protocol_summary(
         residual_scale = scale_model.get("residual_fullspace_scale", {})
         mobility = scale_model.get("per_atom_mobility_scales", {})
         pair_ref = scale_model.get("pair_distance_reference", {})
-        dimensionless = scale_model.get("dimensionless_preset", {})
+        dimensionless = scale_model.get("dimensionless_policy", {})
         lines.append(
             _line(
                 "sampling_protocol.scale_model",
@@ -502,14 +502,10 @@ def format_sampling_protocol_summary(
         lines.append(
             _line(
                 "sampling_protocol.resolved_ariadne",
-                "legacy_profile_delta0="
+                "initial_trust_radius_ang="
                 + str(ariadne_run.delta0)
-                + ", legacy_profile_delta_max="
-                + str(ariadne_run.delta_max)
-                + ", target_rms="
-                + str(ariadne_run.trqn_target_initial_grad_rms)
-                + ", under_move_target_rms="
-                + str(ariadne_run.trqn_under_move_target_initial_grad_rms),
+                + ", maximum_trust_radius_ang="
+                + str(ariadne_run.delta_max),
             )
         )
         trust_policy = scale_model.get("trust_radius_policy", {})
@@ -724,17 +720,17 @@ def format_sampling_protocol_summary(
             retention.checkpoint_verify_after_write,
         )
     )
-    lines.append(_line("resources.polus.auto_max_workers", resources.polus.auto_max_workers))
+    lines.append(_line("resources.diversity.auto_max_workers", resources.diversity.auto_max_workers))
     lines.append(
         _line(
-            "resources.polus.target_pairs_per_worker",
-            resources.polus.target_pairs_per_worker,
+            "resources.diversity.target_pairs_per_worker",
+            resources.diversity.target_pairs_per_worker,
         )
     )
     lines.append(
         _line(
-            "resources.polus.in_memory_distance_store_fraction",
-            resources.polus.in_memory_distance_store_fraction,
+            "resources.diversity.in_memory_distance_store_fraction",
+            resources.diversity.in_memory_distance_store_fraction,
         )
     )
     lines.append(_line("resources.gradient_parallel_backend", resources.gradient_parallel_backend))

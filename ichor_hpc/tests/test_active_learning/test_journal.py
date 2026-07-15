@@ -22,13 +22,13 @@ from ichor.hpc.active_learning.daemon.journal import (
 
 def test_append_event_writes_one_line(tmp_path):
     j = tmp_path / "journal.ndjson"
-    ts = append_event(j, "phase_transition", from_phase="INIT", to_phase="PHASE_A_POLUS")
+    ts = append_event(j, "phase_transition", from_phase="INIT", to_phase="PHASE_A_DIVERSITY")
     raw = j.read_text(encoding="utf-8")
     assert raw.count("\n") == 1
     payload = json.loads(raw.strip())
     assert payload["event"] == "phase_transition"
     assert payload["from_phase"] == "INIT"
-    assert payload["to_phase"] == "PHASE_A_POLUS"
+    assert payload["to_phase"] == "PHASE_A_DIVERSITY"
     assert payload["ts"] == ts
 
 

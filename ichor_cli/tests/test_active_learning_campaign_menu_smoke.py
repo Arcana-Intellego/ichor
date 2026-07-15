@@ -205,7 +205,7 @@ def test_edit_campaign_config_menu_items():
         "Edit campaign",
         "Edit point_allocation",
         "Edit resource defaults",
-        "Edit POLUS resources",
+        "Edit diversity resources",
         "Edit Gaussian runtime resources",
         "Edit AIMAll resources",
         "Edit ARIADNE resources",
@@ -1321,22 +1321,22 @@ def test_backend_cpu_override_can_be_cleared_to_inherit(monkeypatch):
         "active_learning_campaign_submenus.edit_campaign_config_menu"
     )
     cfg = CampaignConfig()
-    cfg.resources.polus.cpus_per_task = 4
+    cfg.resources.diversity.cpus_per_task = 4
     menu._replace_campaign_config(cfg, loaded_from=None)
 
-    polus_menu = menu._BLOCK_MENUS_BY_LABEL["Edit POLUS resources"]
+    diversity_menu = menu._BLOCK_MENUS_BY_LABEL["Edit diversity resources"]
     cpu_spec = next(
         spec
-        for spec in polus_menu.this_menu_options.fields
-        if spec.path == "resources.polus.cpus_per_task"
+        for spec in diversity_menu.this_menu_options.fields
+        if spec.path == "resources.diversity.cpus_per_task"
     )
 
     monkeypatch.setattr("builtins.input", lambda prompt: "null")
     menu._edit_field(cpu_spec)
 
     updated = menu.get_campaign_config()
-    assert updated.resources.polus.cpus_per_task is None
-    assert updated.resources.cpus_for("PHASE_A_POLUS") == "auto"
+    assert updated.resources.diversity.cpus_per_task is None
+    assert updated.resources.cpus_for("PHASE_A_DIVERSITY") == "auto"
 
 
 def test_top_three_roi_config_blocks_render_current_values():
@@ -1428,7 +1428,7 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
         "sampling_protocol.resolution: unavailable" in line
         for line in protocol_lines
     ), protocol_lines
-    assert "sampling_protocol.geometry_scale_source: profile fallback preview" in out
+    assert "sampling_protocol.geometry_scale_source: sampling-policy fallback preview" in out
     assert "sampling_protocol.scale_model" in out
     assert "sampling_protocol.scale_model.geometry_motion_scale" in out
     assert "sampling_protocol.scale_model.aligned_rmsd_scale" in out
@@ -2117,7 +2117,7 @@ def test_campaign_config_load_edit_save_preserves_hidden_fields(tmp_path, monkey
     original.system_name = "WATER"
     original.resources.defaults.walltime_hours = 12
     original.resources.defaults.mem_per_cpu = "5G"
-    original.resources.polus.cpus_per_task = 4
+    original.resources.diversity.cpus_per_task = 4
     original.resources.ferebus.cpus_per_task = 4
     original.resources.gaussian.cpus_per_task = 2
     original.resources.aimall.cpus_per_task = 6
@@ -2139,7 +2139,7 @@ def test_campaign_config_load_edit_save_preserves_hidden_fields(tmp_path, monkey
     reloaded = CampaignConfig.from_yaml(tmp_path / "campaign.yaml")
     assert reloaded.system_name == "WATER_AL"
     assert reloaded.resources.defaults.walltime_hours == 12
-    assert reloaded.resources.polus_cpus_per_task == 4
+    assert reloaded.resources.diversity_cpus_per_task == 4
     assert reloaded.resources.ferebus_cpus_per_task == 4
     assert reloaded.resources.gaussian_cpus_per_task == 2
     assert reloaded.resources.aimall_cpus_per_task == 6

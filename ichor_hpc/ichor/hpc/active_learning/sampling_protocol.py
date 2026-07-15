@@ -1,15 +1,9 @@
-"""Resolved active-learning sampling protocol.
-
-Normal campaign files expose a single sampling aggressiveness value.  This
-module expands that public value into the lower-level ARIADNE, acquisition,
-Phase-B, and landing-safety controls consumed by the daemon.  Wave 2 keeps the
-public surface unchanged but adds a daemon-owned scale model so those lower
-level controls are resolved from campaign-local, auditable length scales.
-"""
+"""Versioned resolution of the public sampling-aggressiveness control."""
 from __future__ import annotations
 
 import copy
 import hashlib
+import math
 from .strict_json import strict_json as json
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
@@ -37,123 +31,52 @@ from .geometry_protocol import (
 )
 
 
-SAMPLING_PROTOCOL_SCHEMA_VERSION = 1
-SAMPLING_PROTOCOL_AUDIT_SCHEMA_VERSION = 1
+SAMPLING_PROTOCOL_SCHEMA_VERSION = 2
+SAMPLING_PROTOCOL_AUDIT_SCHEMA_VERSION = 2
+SAMPLING_AGGRESSIVENESS_POLICY_VERSION = 1
 SAMPLING_PROTOCOL_RESOLVED_FILENAME = "SAMPLING_PROTOCOL_RESOLVED.json"
 SAMPLING_PROTOCOL_AUDIT_FILENAME = "SAMPLING_PROTOCOL_AUDIT.json"
 SAMPLING_PROTOCOL_CALIBRATION_FILENAME = "ERROR_CALIBRATION_MODEL.json"
 
 
 @dataclass(frozen=True)
-class AggressivenessProfile:
-    geometry_fallback_scale_angstrom: float
+class SamplingAggressivenessPolicy:
+    fallback_scale_angstrom: float
     phase_b_min_separation_scale: float
-    movement_fraction_scale: float
-    max_whitened_distance: float
-    backtrack_points: int
+    movement_trust_multiplier: float
+    trust_max_to_initial_ratio: float
     lambda_distance: float
     lambda_residual: float
     lambda_rmsd: float
-    ariadne_max_displacement_ang: float
-    ariadne_min_pair_distance_ang: float
-    delta0: float
-    delta_max: float
-    trqn_target_initial_grad_rms: float
-    trqn_retry_target_initial_grad_rms: float
-    trqn_under_move_target_initial_grad_rms: float
-    max_scaled_atom_move: float = 36.0
-    max_scaled_rmsd: float = 4.0
-    max_scaled_fullspace_residual: float = 7.0
-    max_scaled_whitened_distance: float = 10.0
-    pair_ratio_floor: float = 0.0
+    max_whitened_distance: float
+    max_atom_displacement_ang: float
+    min_pair_distance_ang: float
+    max_scaled_atom_move: float
+    max_scaled_rmsd: float
+    max_scaled_fullspace_residual: float
+    normalised_chemistry_penalty_cap: float
     bond_ratio_lower: float = 0.70
     bond_ratio_upper: float = 1.35
     angle_ratio_lower: float = 0.65
     angle_ratio_upper: float = 1.45
-    normalised_chemistry_penalty_cap: float = 20.0
 
 
-_PROFILES: Dict[int, AggressivenessProfile] = {
-    1: AggressivenessProfile(0.020, 0.70, 0.65, 4.0, 24, 2.00, 1.00, 0.50, 0.70, 0.65, 0.04, 0.20, 1.0e-4, 2.0e-4, 3.0e-4),
-    2: AggressivenessProfile(0.025, 0.65, 0.75, 5.0, 22, 1.70, 0.85, 0.42, 0.80, 0.65, 0.05, 0.25, 1.2e-4, 2.5e-4, 3.5e-4),
-    3: AggressivenessProfile(0.030, 0.60, 0.85, 6.0, 20, 1.45, 0.70, 0.35, 0.90, 0.65, 0.06, 0.30, 1.5e-4, 3.0e-4, 4.0e-4),
-    4: AggressivenessProfile(0.040, 0.55, 0.93, 8.0, 18, 1.20, 0.60, 0.30, 1.05, 0.62, 0.08, 0.35, 1.75e-4, 3.5e-4, 5.0e-4),
-    5: AggressivenessProfile(0.050, PHASE_B_MIN_SEPARATION_SCALE, 1.00, 10.0, 16, 1.00, 0.50, 0.25, 1.25, 0.60, 0.10, 0.40, 2.0e-4, 4.0e-4, 6.0e-4),
-    6: AggressivenessProfile(0.060, 0.48, 1.08, 11.0, 16, 0.90, 0.45, 0.22, 1.35, 0.60, 0.12, 0.45, 2.5e-4, 5.0e-4, 7.0e-4),
-    7: AggressivenessProfile(0.075, 0.46, 1.15, 12.0, 16, 0.80, 0.40, 0.20, 1.50, 0.60, 0.14, 0.50, 3.0e-4, 6.0e-4, 8.0e-4),
-    8: AggressivenessProfile(0.090, 0.44, 1.23, 13.0, 14, 0.70, 0.35, 0.18, 1.60, 0.60, 0.16, 0.55, 3.5e-4, 7.0e-4, 9.0e-4),
-    9: AggressivenessProfile(0.110, 0.42, 1.32, 14.0, 14, 0.60, 0.30, 0.16, 1.70, 0.60, 0.18, 0.60, 4.0e-4, 8.0e-4, 1.0e-3),
-    10: AggressivenessProfile(0.130, 0.40, 1.40, 15.0, 12, 0.50, 0.25, 0.14, 1.80, 0.60, 0.20, 0.65, 5.0e-4, 1.0e-3, 1.2e-3),
-}
-
-
-_DIMENSIONLESS_PRESETS: Dict[int, Dict[str, float]] = {
-    1: {
-        "max_scaled_atom_move": 20.0,
-        "max_scaled_rmsd": 2.5,
-        "max_scaled_fullspace_residual": 4.0,
-        "normalised_chemistry_penalty_cap": 10.0,
-    },
-    2: {
-        "max_scaled_atom_move": 24.0,
-        "max_scaled_rmsd": 3.0,
-        "max_scaled_fullspace_residual": 4.8,
-        "normalised_chemistry_penalty_cap": 12.0,
-    },
-    3: {
-        "max_scaled_atom_move": 28.0,
-        "max_scaled_rmsd": 3.4,
-        "max_scaled_fullspace_residual": 5.5,
-        "normalised_chemistry_penalty_cap": 14.0,
-    },
-    4: {
-        "max_scaled_atom_move": 32.0,
-        "max_scaled_rmsd": 3.8,
-        "max_scaled_fullspace_residual": 6.2,
-        "normalised_chemistry_penalty_cap": 17.0,
-    },
-    5: {
-        "max_scaled_atom_move": 36.0,
-        "max_scaled_rmsd": 4.2,
-        "max_scaled_fullspace_residual": 7.0,
-        "normalised_chemistry_penalty_cap": 20.0,
-    },
-    6: {
-        "max_scaled_atom_move": 40.0,
-        "max_scaled_rmsd": 4.8,
-        "max_scaled_fullspace_residual": 7.8,
-        "normalised_chemistry_penalty_cap": 22.0,
-    },
-    7: {
-        "max_scaled_atom_move": 44.0,
-        "max_scaled_rmsd": 5.4,
-        "max_scaled_fullspace_residual": 8.6,
-        "normalised_chemistry_penalty_cap": 24.0,
-    },
-    8: {
-        "max_scaled_atom_move": 48.0,
-        "max_scaled_rmsd": 6.0,
-        "max_scaled_fullspace_residual": 9.4,
-        "normalised_chemistry_penalty_cap": 26.0,
-    },
-    9: {
-        "max_scaled_atom_move": 52.0,
-        "max_scaled_rmsd": 6.6,
-        "max_scaled_fullspace_residual": 10.2,
-        "normalised_chemistry_penalty_cap": 28.0,
-    },
-    10: {
-        "max_scaled_atom_move": 56.0,
-        "max_scaled_rmsd": 7.2,
-        "max_scaled_fullspace_residual": 11.0,
-        "normalised_chemistry_penalty_cap": 30.0,
-    },
+_POLICIES: Dict[int, SamplingAggressivenessPolicy] = {
+    1: SamplingAggressivenessPolicy(0.020, 0.70, 0.65, 5.000, 2.00, 1.00, 0.50, 4.0, 0.70, 0.65, 20.0, 2.5, 4.0, 10.0),
+    2: SamplingAggressivenessPolicy(0.025, 0.65, 0.75, 5.000, 1.70, 0.85, 0.42, 5.0, 0.80, 0.65, 24.0, 3.0, 4.8, 12.0),
+    3: SamplingAggressivenessPolicy(0.030, 0.60, 0.85, 5.000, 1.45, 0.70, 0.35, 6.0, 0.90, 0.65, 28.0, 3.4, 5.5, 14.0),
+    4: SamplingAggressivenessPolicy(0.040, 0.55, 0.93, 4.375, 1.20, 0.60, 0.30, 8.0, 1.05, 0.62, 32.0, 3.8, 6.2, 17.0),
+    5: SamplingAggressivenessPolicy(0.050, 0.50, 1.00, 4.000, 1.00, 0.50, 0.25, 10.0, 1.25, 0.60, 36.0, 4.2, 7.0, 20.0),
+    6: SamplingAggressivenessPolicy(0.060, 0.48, 1.08, 3.750, 0.90, 0.45, 0.22, 11.0, 1.35, 0.60, 40.0, 4.8, 7.8, 22.0),
+    7: SamplingAggressivenessPolicy(0.075, 0.46, 1.15, 3.571, 0.80, 0.40, 0.20, 12.0, 1.50, 0.60, 44.0, 5.4, 8.6, 24.0),
+    8: SamplingAggressivenessPolicy(0.090, 0.44, 1.23, 3.438, 0.70, 0.35, 0.18, 13.0, 1.60, 0.60, 48.0, 6.0, 9.4, 26.0),
+    9: SamplingAggressivenessPolicy(0.110, 0.42, 1.32, 3.333, 0.60, 0.30, 0.16, 14.0, 1.70, 0.60, 52.0, 6.6, 10.2, 28.0),
+    10: SamplingAggressivenessPolicy(0.130, 0.40, 1.40, 3.250, 0.50, 0.25, 0.14, 15.0, 1.80, 0.60, 56.0, 7.2, 11.0, 30.0),
 }
 
 
 _HIDDEN_TOP_LEVEL_BLOCKS = (
     "anti_overlap",
-    "phase_b",
     "geometry_novelty",
     "acquisition",
     "ariadne",
@@ -166,7 +89,7 @@ class ResolvedSamplingProtocol:
     schema_version: int
     iteration: int
     sampling_aggressiveness: int
-    profile: AggressivenessProfile
+    policy: SamplingAggressivenessPolicy
     effective_config: CampaignConfig
     geometry_scale_payload: Dict[str, Any]
     resolved_geometry_scale_angstrom: Optional[float]
@@ -203,31 +126,28 @@ def _iteration_dir(campaign_dir: Union[str, Path], iteration: int) -> Path:
     return active_iteration_dir(campaign_dir, int(iteration))
 
 
-def _profile_for(config: CampaignConfig) -> AggressivenessProfile:
+def _policy_for(config: CampaignConfig) -> SamplingAggressivenessPolicy:
     level = int(config.campaign.sampling_aggressiveness)
     try:
-        profile = _PROFILES[level]
+        policy = _POLICIES[level]
     except KeyError as exc:
         raise ValueError("campaign.sampling_aggressiveness must be in [1, 10]") from exc
-    preset = dict(_DIMENSIONLESS_PRESETS.get(level) or {})
-    preset["max_scaled_whitened_distance"] = float(profile.max_whitened_distance)
-    return replace(profile, **preset)
+    return policy
 
 
-def dimensionless_preset_payload(profile: AggressivenessProfile) -> Dict[str, Any]:
-    """Return the hidden dimensionless policy derived from one public level."""
+def dimensionless_policy_payload(policy: SamplingAggressivenessPolicy) -> Dict[str, Any]:
+    """Return the safety caps resolved by one immutable policy entry."""
     return {
-        "max_scaled_atom_move": float(profile.max_scaled_atom_move),
-        "max_scaled_rmsd": float(profile.max_scaled_rmsd),
-        "max_scaled_fullspace_residual": float(profile.max_scaled_fullspace_residual),
-        "max_scaled_whitened_distance": float(profile.max_scaled_whitened_distance),
-        "pair_ratio_floor": float(profile.pair_ratio_floor),
-        "bond_ratio_lower": float(profile.bond_ratio_lower),
-        "bond_ratio_upper": float(profile.bond_ratio_upper),
-        "angle_ratio_lower": float(profile.angle_ratio_lower),
-        "angle_ratio_upper": float(profile.angle_ratio_upper),
+        "max_scaled_atom_move": float(policy.max_scaled_atom_move),
+        "max_scaled_rmsd": float(policy.max_scaled_rmsd),
+        "max_scaled_fullspace_residual": float(policy.max_scaled_fullspace_residual),
+        "max_scaled_whitened_distance": float(policy.max_whitened_distance),
+        "bond_ratio_lower": float(policy.bond_ratio_lower),
+        "bond_ratio_upper": float(policy.bond_ratio_upper),
+        "angle_ratio_lower": float(policy.angle_ratio_lower),
+        "angle_ratio_upper": float(policy.angle_ratio_upper),
         "normalised_chemistry_penalty_cap": float(
-            profile.normalised_chemistry_penalty_cap
+            policy.normalised_chemistry_penalty_cap
         ),
     }
 
@@ -270,76 +190,81 @@ def hidden_sampling_overrides(config: CampaignConfig) -> List[Dict[str, Any]]:
 
 def _effective_campaign_config(
     config: CampaignConfig,
-    profile: AggressivenessProfile,
+    policy: SamplingAggressivenessPolicy,
 ) -> CampaignConfig:
     effective = copy.deepcopy(config)
-    effective.anti_overlap = AntiOverlapConfigBlock()
-    effective.phase_b = PhaseBConfigBlock()
+    effective.anti_overlap = AntiOverlapConfigBlock(
+        max_post_ariadne_whitened_distance=float(policy.max_whitened_distance),
+    )
+    effective.phase_b = copy.deepcopy(config.phase_b)
     effective.geometry_novelty = GeometryNoveltyConfigBlock(
         enabled=True,
         scale_source="local_motion",
         statistic="median",
         scale_floor_angstrom=1.0e-3,
         history_window_iterations=5,
-        fallback_scale_angstrom=float(profile.geometry_fallback_scale_angstrom),
+        fallback_scale_angstrom=float(policy.fallback_scale_angstrom),
     )
     effective.acquisition = AcquisitionConfigBlock()
     effective.ariadne = AriadneConfigBlock()
-    effective.adversarial_safety = AdversarialSafetyConfigBlock()
-
-    # Keep this migration switch compatible for old manifests even though the
-    # normal operator surface no longer exposes the larger safety block.
-    effective.adversarial_safety.accept_legacy_missing_landing_safety = bool(
-        getattr(config.adversarial_safety, "accept_legacy_missing_landing_safety", False)
+    effective.adversarial_safety = AdversarialSafetyConfigBlock(
+        enabled=True,
+        reject_unsafe_landings=True,
+        salvage_safe_iterate=bool(config.adversarial_safety.salvage_safe_iterate),
+        backtrack_to_safe_landing=bool(
+            config.adversarial_safety.backtrack_to_safe_landing
+        ),
+        backtrack_points=int(config.adversarial_safety.backtrack_points),
+        allow_seed_fallback=False,
+        accept_legacy_missing_landing_safety=False,
+        min_whitened_distance=0.0,
+        max_whitened_distance=float(policy.max_whitened_distance),
+        enforce_min_whitened_distance=False,
+        phase_b_filter_enabled=True,
+        enforce_movement_band=True,
+        under_move_retry=bool(config.adversarial_safety.under_move_retry),
+        reject_under_moved_after_retry=True,
+        reject_over_moved=True,
     )
-    effective.adversarial_safety.max_whitened_distance = float(
-        profile.max_scaled_whitened_distance
-    )
-    effective.adversarial_safety.backtrack_points = int(profile.backtrack_points)
 
-    effective.acquisition.weights.lambda_distance = float(profile.lambda_distance)
-    effective.acquisition.fullspace_confinement.lambda_residual = float(profile.lambda_residual)
-    effective.acquisition.fullspace_confinement.lambda_rmsd = float(profile.lambda_rmsd)
-
-    effective.ariadne.delta0 = float(profile.delta0)
-    effective.ariadne.delta_max = float(profile.delta_max)
-    effective.ariadne.trqn_target_initial_grad_rms = float(profile.trqn_target_initial_grad_rms)
-    effective.ariadne.trqn_retry_target_initial_grad_rms = float(profile.trqn_retry_target_initial_grad_rms)
-    effective.ariadne.trqn_under_move_target_initial_grad_rms = float(
-        profile.trqn_under_move_target_initial_grad_rms
-    )
+    effective.acquisition.weights.lambda_distance = float(policy.lambda_distance)
+    effective.acquisition.fullspace_confinement.lambda_residual = float(policy.lambda_residual)
+    effective.acquisition.fullspace_confinement.lambda_rmsd = float(policy.lambda_rmsd)
 
     effective.quality_gates = copy.deepcopy(config.quality_gates)
     effective.quality_gates.ariadne_max_displacement_ang = float(
-        profile.ariadne_max_displacement_ang
+        policy.max_atom_displacement_ang
     )
     effective.quality_gates.ariadne_min_pair_distance_ang = float(
-        profile.ariadne_min_pair_distance_ang
+        policy.min_pair_distance_ang
     )
     return effective
 
 
-def _apply_profile_to_acquisition_config(acquisition_config: Any, profile: AggressivenessProfile) -> Any:
+def _apply_policy_to_acquisition_config(
+    acquisition_config: Any,
+    policy: SamplingAggressivenessPolicy,
+) -> Any:
     movement = acquisition_config.movement_band
     scaled_movement = replace(
         movement,
-        hard_min_fraction=float(MOVEMENT_BAND_HARD_MIN_FRACTION) * float(profile.movement_fraction_scale),
-        target_low_fraction=float(MOVEMENT_BAND_TARGET_LOW_FRACTION) * float(profile.movement_fraction_scale),
-        target_peak_fraction=float(MOVEMENT_BAND_TARGET_PEAK_FRACTION) * float(profile.movement_fraction_scale),
-        target_high_fraction=float(MOVEMENT_BAND_TARGET_HIGH_FRACTION) * float(profile.movement_fraction_scale),
-        hard_max_fraction=float(MOVEMENT_BAND_HARD_MAX_FRACTION) * float(profile.movement_fraction_scale),
+        hard_min_fraction=float(MOVEMENT_BAND_HARD_MIN_FRACTION) * float(policy.movement_trust_multiplier),
+        target_low_fraction=float(MOVEMENT_BAND_TARGET_LOW_FRACTION) * float(policy.movement_trust_multiplier),
+        target_peak_fraction=float(MOVEMENT_BAND_TARGET_PEAK_FRACTION) * float(policy.movement_trust_multiplier),
+        target_high_fraction=float(MOVEMENT_BAND_TARGET_HIGH_FRACTION) * float(policy.movement_trust_multiplier),
+        hard_max_fraction=float(MOVEMENT_BAND_HARD_MAX_FRACTION) * float(policy.movement_trust_multiplier),
     )
     return replace(
         acquisition_config,
         movement_band=scaled_movement,
         weights=replace(
             acquisition_config.weights,
-            lambda_distance=float(profile.lambda_distance),
+            lambda_distance=float(policy.lambda_distance),
         ),
         fullspace_confinement=replace(
             acquisition_config.fullspace_confinement,
-            lambda_residual=float(profile.lambda_residual),
-            lambda_rmsd=float(profile.lambda_rmsd),
+            lambda_residual=float(policy.lambda_residual),
+            lambda_rmsd=float(policy.lambda_rmsd),
         ),
     )
 
@@ -396,17 +321,14 @@ def _apply_scale_model_to_acquisition_config(
 
 def _attach_trust_radius_policy(
     scale_model_payload: Dict[str, Any],
-    profile: AggressivenessProfile,
+    policy: SamplingAggressivenessPolicy,
 ) -> Dict[str, Any]:
     payload = dict(scale_model_payload)
     payload["trust_radius_policy"] = {
         "enabled": True,
         "normalisation": "weighted_mobility_sqrt_effective_atoms",
-        "aggressiveness_multiplier": float(profile.movement_fraction_scale),
-        "profile_delta0_legacy_reference": float(profile.delta0),
-        "profile_delta_max_legacy_reference": float(profile.delta_max),
-        "max_to_initial_ratio": float(profile.delta_max)
-        / max(float(profile.delta0), 1.0e-12),
+        "aggressiveness_multiplier": float(policy.movement_trust_multiplier),
+        "max_to_initial_ratio": float(policy.trust_max_to_initial_ratio),
         "under_move_feedback_min_factor": 1.0,
         "under_move_feedback_max_factor": 2.0,
         "formula": (
@@ -434,8 +356,57 @@ def _canonical_sha(payload: Dict[str, Any]) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def sampling_policy_table_payload() -> Dict[str, Any]:
+    return {
+        "policy_version": SAMPLING_AGGRESSIVENESS_POLICY_VERSION,
+        "levels": {
+            str(level): asdict(policy)
+            for level, policy in sorted(_POLICIES.items())
+        },
+    }
+
+
+def sampling_policy_table_sha256() -> str:
+    return _canonical_sha(sampling_policy_table_payload())
+
+
+def _validate_policy_table() -> None:
+    if set(_POLICIES) != set(range(1, 11)):
+        raise RuntimeError("sampling-aggressiveness policy must define levels 1 to 10")
+    previous: Optional[SamplingAggressivenessPolicy] = None
+    for level, policy in sorted(_POLICIES.items()):
+        values = asdict(policy)
+        for name, raw in values.items():
+            value = float(raw)
+            if not math.isfinite(value) or value <= 0.0:
+                raise RuntimeError(
+                    "sampling policy level " + str(level) + " has invalid " + name
+                )
+        if policy.min_pair_distance_ang < 0.60:
+            raise RuntimeError("sampling policy pair-distance floor is below 0.60 Angstrom")
+        if not (
+            policy.bond_ratio_lower < policy.bond_ratio_upper
+            and policy.angle_ratio_lower < policy.angle_ratio_upper
+        ):
+            raise RuntimeError("sampling policy chemistry ratios are unordered")
+        if previous is not None:
+            if policy.movement_trust_multiplier < previous.movement_trust_multiplier:
+                raise RuntimeError("sampling policy movement multiplier decreases")
+            if policy.max_atom_displacement_ang < previous.max_atom_displacement_ang:
+                raise RuntimeError("sampling policy displacement cap decreases")
+            if policy.phase_b_min_separation_scale > previous.phase_b_min_separation_scale:
+                raise RuntimeError("sampling policy Phase B separation increases")
+            for name in ("lambda_distance", "lambda_residual", "lambda_rmsd"):
+                if getattr(policy, name) > getattr(previous, name):
+                    raise RuntimeError("sampling policy confinement penalty increases")
+        previous = policy
+
+
+_validate_policy_table()
+
+
 def _resolved_manifest_payload(resolved: ResolvedSamplingProtocol) -> Dict[str, Any]:
-    profile = asdict(resolved.profile)
+    policy = asdict(resolved.policy)
     geometry_payload = dict(resolved.geometry_scale_payload or {})
     scale_model = dict(resolved.scale_model_payload or {})
     scale = resolved.resolved_geometry_scale_angstrom
@@ -474,7 +445,6 @@ def _resolved_manifest_payload(resolved: ResolvedSamplingProtocol) -> Dict[str, 
             "per_atom_mobility": "sampling_scale_model.per_atom_mobility_scales",
             "pair_reference": "sampling_scale_model.pair_distance_reference",
             "bond_angle_reference": "sampling_scale_model.bond_angle_reference",
-            "gradient_scale": "sampling_scale_model.gradient_rms_scale",
             "component_scale": "existing_reference_scales_only",
         },
         "sampling_scale_model": scale_model,
@@ -486,7 +456,10 @@ def _resolved_manifest_payload(resolved: ResolvedSamplingProtocol) -> Dict[str, 
             None if resolved.audit_manifest_path is None
             else str(resolved.audit_manifest_path)
         ),
-        "dimensionless_preset": dimensionless_preset_payload(resolved.profile),
+        "sampling_policy_version": SAMPLING_AGGRESSIVENESS_POLICY_VERSION,
+        "sampling_policy_table_sha256": sampling_policy_table_sha256(),
+        "sampling_policy": policy,
+        "dimensionless_policy": dimensionless_policy_payload(resolved.policy),
         "geometry_novelty_scale": geometry_payload,
         "resolved_geometry_scale_angstrom": scale,
         "resolved_phase_b": phase_b,
@@ -561,13 +534,18 @@ def _resolved_manifest_payload(resolved: ResolvedSamplingProtocol) -> Dict[str, 
             "dimensionless_scale_gates": True,
         },
         "hidden_overrides_detected": list(resolved.hidden_overrides_detected),
-        "profile": profile,
+        "source_scale_hashes": {
+            "geometry_scale_sha256": _canonical_sha(geometry_payload),
+            "sampling_scale_model_sha256": _canonical_sha(scale_model),
+        },
     }
     payload["input_fingerprint"] = {
         "sha256": _canonical_sha(
             {
                 "sampling_aggressiveness": resolved.sampling_aggressiveness,
-                "profile": profile,
+                "sampling_policy_version": SAMPLING_AGGRESSIVENESS_POLICY_VERSION,
+                "sampling_policy_table_sha256": sampling_policy_table_sha256(),
+                "sampling_policy": policy,
                 "geometry_input_fingerprint": geometry_payload.get("input_fingerprint"),
                 "hidden_overrides": resolved.hidden_overrides_detected,
                 "error_calibration": resolved.error_calibration_snapshot,
@@ -665,7 +643,7 @@ def read_sampling_protocol_resolved(
 
 def _sampling_protocol_audit_payload(resolved: ResolvedSamplingProtocol) -> Dict[str, Any]:
     scale_model = dict(resolved.scale_model_payload or {})
-    dimensionless = dimensionless_preset_payload(resolved.profile)
+    dimensionless = dimensionless_policy_payload(resolved.policy)
     diagnostics = dict(scale_model.get("diagnostics") or {})
     history = dict(scale_model.get("history") or {})
     pair_reference = dict(scale_model.get("pair_distance_reference") or {})
@@ -680,7 +658,10 @@ def _sampling_protocol_audit_payload(resolved: ResolvedSamplingProtocol) -> Dict
                 "editable_campaign_field": "campaign.sampling_aggressiveness",
                 "hidden_low_level_blocks": list(_HIDDEN_TOP_LEVEL_BLOCKS),
             },
-            "dimensionless_preset": dimensionless,
+            "sampling_policy_version": SAMPLING_AGGRESSIVENESS_POLICY_VERSION,
+            "sampling_policy_table_sha256": sampling_policy_table_sha256(),
+            "sampling_policy": asdict(resolved.policy),
+            "dimensionless_policy": dimensionless,
             "enforced_landing_gates": {
                 "scaled_whitened_distance_max": float(
                     dimensionless["max_scaled_whitened_distance"]
@@ -692,7 +673,9 @@ def _sampling_protocol_audit_payload(resolved: ResolvedSamplingProtocol) -> Dict
                 "scaled_fullspace_residual_max": float(
                     dimensionless["max_scaled_fullspace_residual"]
                 ),
-                "pair_ratio_floor": float(dimensionless["pair_ratio_floor"]),
+                "absolute_min_pair_distance_angstrom": float(
+                    resolved.policy.min_pair_distance_ang
+                ),
                 "normalised_chemistry_penalty_cap": float(
                     dimensionless["normalised_chemistry_penalty_cap"]
                 ),
@@ -777,8 +760,8 @@ def resolve_sampling_protocol(
     )
 
     level = int(config.campaign.sampling_aggressiveness)
-    profile = _profile_for(config)
-    effective = _effective_campaign_config(config, profile)
+    policy = _policy_for(config)
+    effective = _effective_campaign_config(config, policy)
     calibration_snapshot = _resolve_error_calibration_snapshot(
         campaign_dir,
         effective,
@@ -800,9 +783,23 @@ def resolve_sampling_protocol(
     scale_model_payload = dict(scale_model_payload)
     scale_model_payload = _attach_trust_radius_policy(
         scale_model_payload,
-        profile,
+        policy,
     )
-    scale_model_payload["dimensionless_preset"] = dimensionless_preset_payload(profile)
+    scale_model_payload["dimensionless_policy"] = dimensionless_policy_payload(policy)
+    scale_model_payload["sampling_policy"] = {
+        "version": SAMPLING_AGGRESSIVENESS_POLICY_VERSION,
+        "table_sha256": sampling_policy_table_sha256(),
+        "level": level,
+        "entry": asdict(policy),
+    }
+    scale_model_payload["bond_angle_reference"] = {
+        "source": "sampling_policy_fixed_chemistry_invariants",
+        "fallback_used": False,
+        "bond_ratio_lower": float(policy.bond_ratio_lower),
+        "bond_ratio_upper": float(policy.bond_ratio_upper),
+        "angle_ratio_lower": float(policy.angle_ratio_lower),
+        "angle_ratio_upper": float(policy.angle_ratio_upper),
+    }
     diagnostics = dict(scale_model_payload.get("diagnostics") or {})
     diagnostics["size_independence_wave"] = 3
     scale_model_payload["diagnostics"] = diagnostics
@@ -811,7 +808,7 @@ def resolve_sampling_protocol(
         effective,
         geometry_payload,
     )
-    acquisition_config = _apply_profile_to_acquisition_config(acquisition_config, profile)
+    acquisition_config = _apply_policy_to_acquisition_config(acquisition_config, policy)
     acquisition_config = _apply_scale_model_to_acquisition_config(
         acquisition_config,
         scale_model_payload,
@@ -834,10 +831,10 @@ def resolve_sampling_protocol(
             phase_b_scale = scale_value
         if not (phase_b_scale > 0.0):
             phase_b_scale = scale_value
-        phase_b["scaled_threshold"] = float(profile.phase_b_min_separation_scale)
-        phase_b["min_separation_scaled"] = float(profile.phase_b_min_separation_scale)
+        phase_b["scaled_threshold"] = float(policy.phase_b_min_separation_scale)
+        phase_b["min_separation_scaled"] = float(policy.phase_b_min_separation_scale)
         phase_b["effective_min_separation_angstrom"] = (
-            float(profile.phase_b_min_separation_scale) * float(phase_b_scale)
+            float(policy.phase_b_min_separation_scale) * float(phase_b_scale)
         )
         phase_b["scale_model_source"] = "aligned_rmsd_scale"
         phase_b["scale_model_value_angstrom"] = float(phase_b_scale)
@@ -855,7 +852,7 @@ def resolve_sampling_protocol(
         schema_version=SAMPLING_PROTOCOL_SCHEMA_VERSION,
         iteration=int(iteration),
         sampling_aggressiveness=level,
-        profile=profile,
+        policy=policy,
         effective_config=effective,
         geometry_scale_payload=dict(geometry_payload),
         resolved_geometry_scale_angstrom=scale_value,
@@ -941,8 +938,8 @@ def load_sampling_protocol(
         raise ValueError(
             "resolved sampling protocol aggressiveness does not match campaign config"
         )
-    profile = _profile_for(config)
-    effective = _effective_campaign_config(config, profile)
+    policy = _policy_for(config)
+    effective = _effective_campaign_config(config, policy)
     frozen_settings = calibration_snapshot.get("settings")
     if isinstance(frozen_settings, dict) and frozen_settings:
         effective_payload = effective.to_dict()
@@ -953,9 +950,9 @@ def load_sampling_protocol(
         effective,
         geometry_payload,
     )
-    acquisition_config = _apply_profile_to_acquisition_config(
+    acquisition_config = _apply_policy_to_acquisition_config(
         acquisition_config,
-        profile,
+        policy,
     )
     acquisition_config = _apply_scale_model_to_acquisition_config(
         acquisition_config,
@@ -985,13 +982,13 @@ def load_sampling_protocol(
         if not (phase_b_scale > 0.0):
             phase_b_scale = scale_value
         phase_b["scaled_threshold"] = float(
-            profile.phase_b_min_separation_scale
+            policy.phase_b_min_separation_scale
         )
         phase_b["min_separation_scaled"] = float(
-            profile.phase_b_min_separation_scale
+            policy.phase_b_min_separation_scale
         )
         phase_b["effective_min_separation_angstrom"] = float(
-            profile.phase_b_min_separation_scale
+            policy.phase_b_min_separation_scale
         ) * float(phase_b_scale)
         phase_b["scale_model_source"] = "aligned_rmsd_scale"
         phase_b["scale_model_value_angstrom"] = float(phase_b_scale)
@@ -1002,7 +999,7 @@ def load_sampling_protocol(
         schema_version=SAMPLING_PROTOCOL_SCHEMA_VERSION,
         iteration=int(iteration),
         sampling_aggressiveness=level,
-        profile=profile,
+        policy=policy,
         effective_config=effective,
         geometry_scale_payload=dict(geometry_payload),
         resolved_geometry_scale_angstrom=scale_value,
@@ -1027,8 +1024,11 @@ def load_sampling_protocol(
     expected_payload = _resolved_manifest_payload(resolved)
     invariant_fields = (
         "sampling_aggressiveness",
-        "profile",
-        "dimensionless_preset",
+        "sampling_policy_version",
+        "sampling_policy_table_sha256",
+        "sampling_policy",
+        "dimensionless_policy",
+        "source_scale_hashes",
         "geometry_novelty_scale",
         "sampling_scale_model",
         "resolved_acquisition_weights",
@@ -1094,7 +1094,7 @@ def preview_sampling_protocol(
 
     CLI summaries use this path so merely viewing the menu does not mutate a
     campaign directory.  When no sidecar payload is supplied, the preview uses
-    the profile's geometry fallback scale and labels it as a preview fallback.
+    the policy's geometry fallback scale and labels it as a preview fallback.
     """
     from .geometry_novelty import (
         apply_geometry_novelty_to_acquisition_config,
@@ -1103,15 +1103,15 @@ def preview_sampling_protocol(
     from .sampling_scale_model import build_sampling_scale_model
 
     level = int(config.campaign.sampling_aggressiveness)
-    profile = _profile_for(config)
-    effective = _effective_campaign_config(config, profile)
+    policy = _policy_for(config)
+    effective = _effective_campaign_config(config, policy)
     if geometry_scale_payload is None:
         geometry_scale_payload = {
             "schema_version": 1,
             "iteration": int(iteration),
-            "scale_angstrom": float(profile.geometry_fallback_scale_angstrom),
+            "scale_angstrom": float(policy.fallback_scale_angstrom),
             "fallback_used": True,
-            "scale_resolution_mode": "preview_profile_fallback",
+            "scale_resolution_mode": "preview_policy_fallback",
             "n_values": 0,
         }
     preview_campaign_dir = Path(campaign_dir) if campaign_dir is not None else Path(".")
@@ -1125,9 +1125,23 @@ def preview_sampling_protocol(
     scale_model_payload = dict(scale_model_payload)
     scale_model_payload = _attach_trust_radius_policy(
         scale_model_payload,
-        profile,
+        policy,
     )
-    scale_model_payload["dimensionless_preset"] = dimensionless_preset_payload(profile)
+    scale_model_payload["dimensionless_policy"] = dimensionless_policy_payload(policy)
+    scale_model_payload["sampling_policy"] = {
+        "version": SAMPLING_AGGRESSIVENESS_POLICY_VERSION,
+        "table_sha256": sampling_policy_table_sha256(),
+        "level": level,
+        "entry": asdict(policy),
+    }
+    scale_model_payload["bond_angle_reference"] = {
+        "source": "sampling_policy_fixed_chemistry_invariants",
+        "fallback_used": False,
+        "bond_ratio_lower": float(policy.bond_ratio_lower),
+        "bond_ratio_upper": float(policy.bond_ratio_upper),
+        "angle_ratio_lower": float(policy.angle_ratio_lower),
+        "angle_ratio_upper": float(policy.angle_ratio_upper),
+    }
     diagnostics = dict(scale_model_payload.get("diagnostics") or {})
     diagnostics["size_independence_wave"] = 3
     scale_model_payload["diagnostics"] = diagnostics
@@ -1136,7 +1150,7 @@ def preview_sampling_protocol(
         effective,
         geometry_scale_payload,
     )
-    acquisition_config = _apply_profile_to_acquisition_config(acquisition_config, profile)
+    acquisition_config = _apply_policy_to_acquisition_config(acquisition_config, policy)
     acquisition_config = _apply_scale_model_to_acquisition_config(
         acquisition_config,
         scale_model_payload,
@@ -1159,10 +1173,10 @@ def preview_sampling_protocol(
             phase_b_scale = scale_value
         if not (phase_b_scale > 0.0):
             phase_b_scale = scale_value
-        phase_b["scaled_threshold"] = float(profile.phase_b_min_separation_scale)
-        phase_b["min_separation_scaled"] = float(profile.phase_b_min_separation_scale)
+        phase_b["scaled_threshold"] = float(policy.phase_b_min_separation_scale)
+        phase_b["min_separation_scaled"] = float(policy.phase_b_min_separation_scale)
         phase_b["effective_min_separation_angstrom"] = (
-            float(profile.phase_b_min_separation_scale) * float(phase_b_scale)
+            float(policy.phase_b_min_separation_scale) * float(phase_b_scale)
         )
         phase_b["scale_model_source"] = "aligned_rmsd_scale"
         phase_b["scale_model_value_angstrom"] = float(phase_b_scale)
@@ -1172,7 +1186,7 @@ def preview_sampling_protocol(
         schema_version=SAMPLING_PROTOCOL_SCHEMA_VERSION,
         iteration=int(iteration),
         sampling_aggressiveness=level,
-        profile=profile,
+        policy=policy,
         effective_config=effective,
         geometry_scale_payload=dict(geometry_scale_payload),
         resolved_geometry_scale_angstrom=scale_value,
@@ -1208,7 +1222,11 @@ __all__ = [
     "SAMPLING_PROTOCOL_RESOLVED_FILENAME",
     "SAMPLING_PROTOCOL_SCHEMA_VERSION",
     "ResolvedSamplingProtocol",
-    "dimensionless_preset_payload",
+    "SAMPLING_AGGRESSIVENESS_POLICY_VERSION",
+    "SamplingAggressivenessPolicy",
+    "dimensionless_policy_payload",
+    "sampling_policy_table_payload",
+    "sampling_policy_table_sha256",
     "hidden_sampling_overrides",
     "load_sampling_protocol",
     "phase_b_min_separation_from_resolved",

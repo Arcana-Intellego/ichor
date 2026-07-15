@@ -8,16 +8,13 @@ atom instead:
     <system>_<atom>_INT_VALIDATION_SET.csv
     <system>_<atom>_EXT_VALIDATION_SET.csv
 
-this module does that split. which rows go to train / internal-val / external-val
-is chosen by POLUS's RS sampler (the canonical random sampler), but the csvs are
-written here rather than through RS.write_data_set -- that method slices the last
-column to strip a trailing newline, which is fragile when the property is the
-last column, so we serialise the selected rows ourselves and keep the data
-verbatim.
+This module performs that split. Production uses the persistent point-identity
+ledger. The standalone fraction path uses NumPy PCG64 with an explicit seed and
+does not depend on an external sampler.
 
 the header is normalised so feature columns are bare f1..fN (FEREBUS only treats
 a column as a feature if it is "f" followed by a number). ichor already writes
-bare names so this is a no-op there; a polus-style f1_O3 header gets the suffix
+bare names so this is a no-op there; a legacy suffixed f1_O3 header gets the suffix
 trimmed. property names (iqa, integration_error, ...) are left untouched.
 """
 from __future__ import annotations
@@ -25,8 +22,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
-
-from .import_utils import quiet_import_module
 
 # feature column written with an alf suffix, e.g. f1_O3 -> we want f1. anything
 # that is not f-then-digits-then-underscore (iqa, integration_error, q00) is left
@@ -99,21 +94,26 @@ def plan_sizes(n_rows: int, fractions: Sequence[float]) -> Tuple[int, int, int]:
 
 
 def split_indices(
-    source_csv: Path, prop: str, fractions: Sequence[float],
+    source_csv: Path,
+    prop: str,
+    fractions: Sequence[float],
+    *,
+    random_seed: int = 0,
 ) -> Tuple[List[int], List[int], List[int]]:
-    """Disjoint train / int-val / ext-val row ids chosen by POLUS RS.
-
-    Determinism is the caller's job: seed `random` before calling if a
-    reproducible split is wanted (RS uses the stdlib `random` module).
-    """
-    RS = quiet_import_module("polus.samplers.RS.randomSampling").RS
+    """Return a deterministic disjoint row partition for standalone use."""
+    del prop
+    if isinstance(random_seed, bool) or not isinstance(random_seed, int):
+        raise TypeError("random_seed must be a non-negative integer")
+    if random_seed < 0:
+        raise ValueError("random_seed must be non-negative")
+    import numpy as np
 
     n = _row_count(source_csv)
     n_tr, n_iv, n_ev = plan_sizes(n, fractions)
-    rs = RS(str(source_csv), prop)
-    tr = [int(i) for i in rs.get_training_point_IDs(n_tr)]
-    iv = [int(i) for i in rs.get_validation_point_IDs(n_iv)] if n_iv else []
-    ev = [int(i) for i in rs.get_test_point_IDs(n_ev)] if n_ev else []
+    permutation = np.random.Generator(np.random.PCG64(random_seed)).permutation(n)
+    tr = [int(i) for i in permutation[:n_tr]]
+    iv = [int(i) for i in permutation[n_tr:n_tr + n_iv]]
+    ev = [int(i) for i in permutation[n_tr + n_iv:n_tr + n_iv + n_ev]]
     return tr, iv, ev
 
 
@@ -124,7 +124,7 @@ def _write_subset(header_bare: str, body: List[str], row_ids: Sequence[int], out
         for i in row_ids:
             if not (0 <= i < len(body)):
                 raise ValueError(
-                    "POLUS RS returned out-of-range row id "
+                    "FEREBUS split contains out-of-range row id "
                     + str(i)
                     + " for body length "
                     + str(len(body))
@@ -236,7 +236,7 @@ def split_atom_csv_to_property_dirs(
     body = [ln for ln in body if ln.strip()]
     header_bare = _bare_header(header_raw)
 
-    # Validate requested properties before asking POLUS RS to read the file; its error path exits.
+    # Validate requested properties before constructing any output files.
     cols = [c.strip() for c in header_bare.rstrip("\n").rstrip("\r").split(",")]
     for prop in props:
         if prop not in cols:

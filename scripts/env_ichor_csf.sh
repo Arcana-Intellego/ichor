@@ -294,7 +294,6 @@ _ichor_env_main() {
         _ichor_env_import_check "ARIADNE" "import ariadne; assert hasattr(ariadne, 'Geometric_Trqn') or hasattr(ariadne, 'Ds_Optimiser')" || return 1
         _ichor_env_import_check "PLUMED" "import os, plumed; p=plumed.Plumed(kernel=os.environ['PLUMED_KERNEL']); p.finalize()" || return 1
         _ichor_env_import_check "ICHOR packages" "import ichor.core, ichor.hpc, ichor.cli" || return 1
-        _ichor_env_import_check "POLUS RS" "import polus.samplers.RS.randomSampling" || return 1
         _ichor_env_import_check "pyferebus" "import pyferebus.executors.trainer" || return 1
         _ichor_env_import_check "RDKit" "from rdkit import Chem" || return 1
         _ichor_env_import_check "xTB" "from xtb.ase.calculator import XTB" || return 1

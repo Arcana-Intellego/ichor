@@ -66,7 +66,7 @@ __all__ = [
     "StopConfigBlock",
     "ResourceDefaultsBlock",
     "BackendResourceBlock",
-    "PolusResourceBlock",
+    "DiversityResourceBlock",
     "GaussianResourceBlock",
     "RetentionConfigBlock",
     "CONFIG_SCHEMA_VERSION",
@@ -104,9 +104,7 @@ class ConfigValidationError(ValueError):
     """Raised when campaign.yaml fails to validate."""
 
 
-VALID_DESCRIPTORS = frozenset({
-    "rmsd_massweight", "hybrid_alf_rmsd", "acquisition_weighted",
-})
+VALID_DESCRIPTORS = frozenset({"rmsd_massweight", "hybrid_alf_rmsd"})
 VALID_GEOMETRY_NOVELTY_SCALE_SOURCES = frozenset({
     "local_motion", "movement_history", "hybrid",
 })
@@ -281,8 +279,8 @@ _STRICTLY_POSITIVE_NUMERIC_PATHS = frozenset({
     "runtime.ledger_lock_timeout_seconds",
     "resources.memory_estimate_safety_factor",
     "resources.scheduler_usage_history_limit",
-    "resources.polus.auto_max_workers",
-    "resources.polus.target_pairs_per_worker",
+    "resources.diversity.auto_max_workers",
+    "resources.diversity.target_pairs_per_worker",
     "resources.gaussian.memory_fraction_of_slurm",
     "gaussian.spin_multiplicity",
     "aimall.encomp",
@@ -628,7 +626,7 @@ class AntiOverlapConfigBlock:
 @dataclass
 class PhaseBConfigBlock:
     descriptor: str = "hybrid_alf_rmsd"
-    beta: float = 0.3
+    beta: float = 0.5
 
 
 @dataclass
@@ -808,8 +806,8 @@ class BackendResourceBlock:
 
 
 @dataclass
-class PolusResourceBlock(BackendResourceBlock):
-    """POLUS worker and condensed-distance storage limits."""
+class DiversityResourceBlock(BackendResourceBlock):
+    """ICHOR diversity worker and condensed-distance storage limits."""
 
     auto_max_workers: int = 16
     target_pairs_per_worker: int = 5_000_000
@@ -833,8 +831,8 @@ class ResourceConfigBlock:
     # overrides while keeping defaults explicit. A backend value of None means
     # "inherit from resources.defaults".
     defaults: ResourceDefaultsBlock = field(default_factory=ResourceDefaultsBlock)
-    polus: PolusResourceBlock = field(
-        default_factory=lambda: PolusResourceBlock(walltime_hours=2)
+    diversity: DiversityResourceBlock = field(
+        default_factory=lambda: DiversityResourceBlock(walltime_hours=2)
     )
     gaussian: GaussianResourceBlock = field(default_factory=lambda: GaussianResourceBlock(walltime_hours=24))
     aimall: BackendResourceBlock = field(default_factory=BackendResourceBlock)
@@ -857,8 +855,8 @@ class ResourceConfigBlock:
         return fallback if value is None else value
 
     def backend_for_phase(self, phase_name: str) -> str:
-        if phase_name in ("PHASE_A_POLUS", "PHASE_B_POLUS"):
-            return "polus"
+        if phase_name in ("PHASE_A_DIVERSITY", "PHASE_B_DIVERSITY"):
+            return "diversity"
         if "GAUSSIAN" in phase_name:
             return "gaussian"
         if "AIMALL" in phase_name:
@@ -955,12 +953,12 @@ class ResourceConfigBlock:
         self._backend_block(backend).mem_per_cpu = value
 
     @property
-    def polus_walltime_hours(self):
-        return self._get_walltime("polus")
+    def diversity_walltime_hours(self):
+        return self._get_walltime("diversity")
 
-    @polus_walltime_hours.setter
-    def polus_walltime_hours(self, value):
-        self._set_walltime("polus", value)
+    @diversity_walltime_hours.setter
+    def diversity_walltime_hours(self, value):
+        self._set_walltime("diversity", value)
 
     @property
     def gaussian_walltime_hours(self):
@@ -995,12 +993,12 @@ class ResourceConfigBlock:
         self._set_walltime("ferebus", value)
 
     @property
-    def polus_cpus_per_task(self):
-        return self._get_cpus("polus")
+    def diversity_cpus_per_task(self):
+        return self._get_cpus("diversity")
 
-    @polus_cpus_per_task.setter
-    def polus_cpus_per_task(self, value):
-        self._set_cpus("polus", value)
+    @diversity_cpus_per_task.setter
+    def diversity_cpus_per_task(self, value):
+        self._set_cpus("diversity", value)
 
     @property
     def gaussian_cpus_per_task(self):
@@ -1035,12 +1033,12 @@ class ResourceConfigBlock:
         self._set_cpus("ferebus", value)
 
     @property
-    def polus_mem_per_cpu(self):
-        return self._get_mem("polus")
+    def diversity_mem_per_cpu(self):
+        return self._get_mem("diversity")
 
-    @polus_mem_per_cpu.setter
-    def polus_mem_per_cpu(self, value):
-        self._set_mem("polus", value)
+    @diversity_mem_per_cpu.setter
+    def diversity_mem_per_cpu(self, value):
+        self._set_mem("diversity", value)
 
     @property
     def gaussian_mem_per_cpu(self):
@@ -1351,7 +1349,7 @@ class CampaignConfig:
             _SLURM_MEMORY_RE,
             "SLURM memory syntax such as 4G or 4000M, or auto",
         )
-        for _backend in ("polus", "gaussian", "aimall", "ariadne", "ferebus"):
+        for _backend in ("diversity", "gaussian", "aimall", "ariadne", "ferebus"):
             _block = getattr(self.resources, _backend)
             if _block.partition is not None:
                 _validate_token(
@@ -1383,27 +1381,27 @@ class CampaignConfig:
                 self.resources.array_concurrency_limit,
             )
         _validate_positive_int(
-            "resources.polus.auto_max_workers",
-            self.resources.polus.auto_max_workers,
+            "resources.diversity.auto_max_workers",
+            self.resources.diversity.auto_max_workers,
         )
         _validate_positive_int(
-            "resources.polus.target_pairs_per_worker",
-            self.resources.polus.target_pairs_per_worker,
+            "resources.diversity.target_pairs_per_worker",
+            self.resources.diversity.target_pairs_per_worker,
         )
         if isinstance(
-            self.resources.polus.in_memory_distance_store_fraction, bool
+            self.resources.diversity.in_memory_distance_store_fraction, bool
         ) or not isinstance(
-            self.resources.polus.in_memory_distance_store_fraction,
+            self.resources.diversity.in_memory_distance_store_fraction,
             (int, float),
         ):
             raise ConfigValidationError(
-                "resources.polus.in_memory_distance_store_fraction must be a number"
+                "resources.diversity.in_memory_distance_store_fraction must be a number"
             )
         if not 0.0 < float(
-            self.resources.polus.in_memory_distance_store_fraction
+            self.resources.diversity.in_memory_distance_store_fraction
         ) <= 1.0:
             raise ConfigValidationError(
-                "resources.polus.in_memory_distance_store_fraction must be in (0, 1]"
+                "resources.diversity.in_memory_distance_store_fraction must be in (0, 1]"
             )
         if isinstance(self.resources.memory_estimate_safety_factor, bool) or not isinstance(
             self.resources.memory_estimate_safety_factor, (int, float)

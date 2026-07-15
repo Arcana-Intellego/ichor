@@ -151,17 +151,50 @@ def filter_initial_trajectory(
     rmsd_z_threshold: float = 4.0,
 ) -> OutlierFilterResult:
     n = len(frames)
+    for label, value in (
+        ("energy_z_threshold", energy_z_threshold),
+        ("rmsd_z_threshold", rmsd_z_threshold),
+    ):
+        if isinstance(value, (bool, np.bool_)):
+            raise TypeError(label + " must be a finite non-negative number")
+        try:
+            resolved = float(value)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(label + " must be a finite non-negative number") from exc
+        if not np.isfinite(resolved) or resolved < 0.0:
+            raise ValueError(label + " must be a finite non-negative number")
     if n == 0:
+        if energies is not None and len(energies) != 0:
+            raise ValueError("energies must contain exactly one value per frame")
         return OutlierFilterResult(
             kept_indices=[],
             rejected_indices=[],
             energy_z_threshold=energy_z_threshold,
             rmsd_z_threshold=rmsd_z_threshold,
         )
+    expected_types = tuple(str(atom.type) for atom in frames[0])
+    if not expected_types:
+        raise ValueError("trajectory frames must contain at least one atom")
+    for index, frame in enumerate(frames):
+        observed_types = tuple(str(atom.type) for atom in frame)
+        if observed_types != expected_types:
+            raise ValueError(
+                "trajectory frame "
+                + str(index)
+                + " has a different atom identity or order"
+            )
+
     rejected_reasons = []
     rejected_set = set()
 
-    if energies is not None and len(energies) == n:
+    if energies is not None:
+        if len(energies) != n:
+            raise ValueError(
+                "energies must contain exactly one value per frame: got "
+                + str(len(energies))
+                + ", expected "
+                + str(n)
+            )
         _, energy_rej = filter_by_energy_zscore(energies, energy_z_threshold)
         for i in energy_rej:
             rejected_set.add(i)
@@ -181,6 +214,5 @@ def filter_initial_trajectory(
         energy_z_threshold=energy_z_threshold,
         rmsd_z_threshold=rmsd_z_threshold,
     )
-
 
 

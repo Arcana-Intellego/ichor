@@ -15,6 +15,7 @@ from ichor.hpc.active_learning.handoff_manifests import (
     ARIADNE_RESULTS_SCHEMA_VERSION,
     HandoffManifestError,
     ariadne_candidate_frames,
+    build_seed_selection_manifest,
     read_ariadne_results_manifest,
     seeds_picked_path,
     validate_ariadne_result,
@@ -28,9 +29,7 @@ from ichor.hpc.active_learning.historical_ariadne import (
 from ichor.hpc.active_learning.layout import active_ariadne_dir, ariadne_seed_dir
 from ichor.hpc.active_learning.seed_identity import (
     SeedIdentityError,
-    deterministic_seed_uid,
     read_ariadne_task_map,
-    selection_fingerprint_sha256,
     write_ariadne_task_map,
 )
 from ichor.hpc.active_learning.versioning.manifest import sha256_file
@@ -94,36 +93,22 @@ def _result_payload(
 
 
 def _selection_payload():
-    payload = {
-        "schema_version": 2,
-        "campaign_uid": CAMPAIGN_UID,
-        "iteration": 1,
-        "models_version": 0,
-        "model_manifest_sha256": MODEL_SHA,
-        "trajectory_sha256": TRAJECTORY_SHA,
-        "selection_strategy": "hybrid_variance",
-        "n_picked": 1,
-        "seed_records": [{
+    return build_seed_selection_manifest(
+        campaign_uid=CAMPAIGN_UID,
+        campaign_random_seed=0,
+        iteration=1,
+        models_version=0,
+        model_manifest_sha256=MODEL_SHA,
+        trajectory_sha256=TRAJECTORY_SHA,
+        selection_strategy="hybrid_variance",
+        seed_records=[{
             "seed_id": 1,
             "frame_id": 2,
             "pool_row_index_zero_based": 2,
             "selection_origin": "bulk",
             "variance_at_selection": 0.1,
         }],
-    }
-    fingerprint = selection_fingerprint_sha256(payload)
-    seed_uid = deterministic_seed_uid(
-        campaign_uid=CAMPAIGN_UID,
-        iteration=1,
-        seed_id=1,
-        frame_id=2,
-        models_version=0,
-        model_manifest_sha256=MODEL_SHA,
-        selection_fingerprint_sha256_value=fingerprint,
     )
-    payload["selection_fingerprint_sha256"] = fingerprint
-    payload["seed_records"][0]["seed_uid"] = seed_uid
-    return payload
 
 
 def _write_canonical_handoff(

@@ -2,7 +2,8 @@
 
 This is the CSF3 equivalent of the CSF4 live smoke. It proves one real
 active-learning iteration with Slurm, Gaussian, AIMAll, FEREBUS, ARIADNE, and
-POLUS, while keeping Python, FEREBUS, ARIADNE, and PLUMED outside the repo.
+ICHOR-owned exact diversity sampling, while keeping Python, FEREBUS, ARIADNE,
+and PLUMED outside the repo.
 
 Recommended install path:
 
@@ -72,7 +73,6 @@ pip install -e ~/projects/ichor-active-learning/ichor_core
 pip install -e ~/projects/ichor-active-learning/ichor_hpc
 pip install -e ~/projects/ichor-active-learning/ichor_cli
 
-pip install -e ~/projects/POLUS/polus_core_subpackage --no-deps
 pip install -e ~/projects/FEREBUS_CPU/pyferebus --no-deps
 ```
 

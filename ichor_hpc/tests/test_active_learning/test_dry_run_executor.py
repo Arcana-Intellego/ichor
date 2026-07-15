@@ -80,7 +80,7 @@ def _stage_ariadne_intent(e, state):
 
 def _complete_bootstrap(e):
     state = _state()
-    e.postprocess(state, CampaignPhase.PHASE_A_POLUS, observations=[])
+    e.postprocess(state, CampaignPhase.PHASE_A_DIVERSITY, observations=[])
     e.postprocess(state, CampaignPhase.INITIAL_GAUSSIAN, observations=[])
     e.postprocess(state, CampaignPhase.INITIAL_AIMALL, observations=[])
     check = e.submit_or_run(state, CampaignPhase.INITIAL_ALLOCATION_CHECK)
@@ -98,7 +98,7 @@ def _complete_active_quantum(e, *, iteration=1):
     e.submit_or_run(state, CampaignPhase.SEED_SELECT)
     _stage_ariadne_intent(e, state)
     e.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
-    e.postprocess(state, CampaignPhase.PHASE_B_POLUS, observations=[])
+    e.postprocess(state, CampaignPhase.PHASE_B_DIVERSITY, observations=[])
     e.postprocess(state, CampaignPhase.GAUSSIAN, observations=[])
     e.postprocess(state, CampaignPhase.AIMALL, observations=[])
     check = e.submit_or_run(state, CampaignPhase.ALLOCATION_CHECK)
@@ -119,10 +119,10 @@ def test_executor_creates_canonical_subdirs(tmp_path):
 def test_submit_or_run_sbatch_phase_writes_stub_script(tmp_path):
     e = _make_exec(tmp_path)
     state = SimpleNamespace(iteration=0)
-    result = e.submit_or_run(state, CampaignPhase.PHASE_A_POLUS)
+    result = e.submit_or_run(state, CampaignPhase.PHASE_A_DIVERSITY)
     assert isinstance(result, PhaseResult)
     assert not result.is_complete
-    assert result.submitted_job_id == DRYRUN_JOB_PREFIX + "PHASE_A_POLUS-0"
+    assert result.submitted_job_id == DRYRUN_JOB_PREFIX + "PHASE_A_DIVERSITY-0"
     scripts = list(
         (
             tmp_path
@@ -130,8 +130,8 @@ def test_submit_or_run_sbatch_phase_writes_stub_script(tmp_path):
             / ".DATA"
             / "SCRIPTS"
             / "JOBS"
-            / "POLUS"
-            / "PHASE_A_POLUS"
+            / "DIVERSITY"
+            / "PHASE_A_DIVERSITY"
             / "iteration-000000"
         ).glob("*/job.sh")
     )
@@ -191,14 +191,14 @@ def test_ariadne_postprocess_writes_per_seed_results(tmp_path):
         assert "alpha_trajectory" in payload
 
 
-def test_phase_b_polus_postprocess_writes_sample_xyz(tmp_path):
+def test_phase_b_diversity_postprocess_writes_sample_xyz(tmp_path):
     e = _make_exec(tmp_path)
     _complete_bootstrap(e)
     state = _state(1, reference_data_version=0, models_version=0)
     e.submit_or_run(state, CampaignPhase.SEED_SELECT)
     _stage_ariadne_intent(e, state)
     e.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
-    e.postprocess(state, CampaignPhase.PHASE_B_POLUS, observations=[])
+    e.postprocess(state, CampaignPhase.PHASE_B_DIVERSITY, observations=[])
     sample = active_phase_b_dir(
         active_iteration_dir(tmp_path / "campaign", 1)
     ) / "selected.xyz"
@@ -241,7 +241,7 @@ def test_active_allocation_replaces_failed_candidate_from_finite_reserve(tmp_pat
     e.submit_or_run(state, CampaignPhase.SEED_SELECT)
     _stage_ariadne_intent(e, state)
     e.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
-    e.postprocess(state, CampaignPhase.PHASE_B_POLUS, observations=[])
+    e.postprocess(state, CampaignPhase.PHASE_B_DIVERSITY, observations=[])
 
     allocation_path = point_allocation_path(
         e.campaign_dir,
@@ -251,6 +251,8 @@ def test_active_allocation_replaces_failed_candidate_from_finite_reserve(tmp_pat
     allocation = read_point_allocation(allocation_path)
     attempts = pending_attempts(allocation)
     failed = attempts[-1]
+    quality_manifest = e.campaign_dir / "synthetic-quantum-quality.json"
+    quality_manifest.write_text("{}\n", encoding="utf-8", newline="\n")
     record_quantum_results(
         allocation_path,
         [
@@ -268,6 +270,11 @@ def test_active_allocation_replaces_failed_candidate_from_finite_reserve(tmp_pat
                     "synthetic_qm_failure"
                     if attempt["candidate_id"] == failed["candidate_id"]
                     else None
+                ),
+                "quality_manifest": (
+                    None
+                    if attempt["candidate_id"] == failed["candidate_id"]
+                    else str(quality_manifest.resolve())
                 ),
             }
             for attempt in attempts

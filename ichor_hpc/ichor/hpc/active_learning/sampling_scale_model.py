@@ -18,8 +18,8 @@ from .daemon.state import atomic_write_json
 from .geometry_protocol import FULLSPACE_RMSD_SCALE_MULTIPLIER
 
 
-SAMPLING_SCALE_MODEL_SCHEMA_VERSION = 1
-SAMPLING_SCALE_MODEL_MODEL_VERSION = 2
+SAMPLING_SCALE_MODEL_SCHEMA_VERSION = 2
+SAMPLING_SCALE_MODEL_MODEL_VERSION = 3
 SAMPLING_SCALE_MODEL_FILENAME = "SAMPLING_SCALE_MODEL.json"
 
 
@@ -479,15 +479,6 @@ def build_sampling_scale_model(
     pair_reference = min_pair_floor if observed_pair is None else max(min_pair_floor, float(observed_pair))
     ratio_floor = float(min_pair_floor) / float(pair_reference)
 
-    gradient_scale = {
-        "rms_acquisition_gradient": {
-            "value": _finite_positive(
-                getattr(getattr(config, "ariadne", None), "trqn_target_initial_grad_rms", None)
-            ) or 2.0e-4,
-            "source": "resolved_ariadne_target_initial_grad_rms",
-            "fallback_used": False,
-        }
-    }
     fallback_warnings: List[str] = []
     if bool(geometry_scale["fallback_used"]):
         fallback_warnings.append("geometry_motion_scale_fallback")
@@ -548,7 +539,6 @@ def build_sampling_scale_model(
             "angle_ratio_lower": None,
             "angle_ratio_upper": None,
         },
-        "gradient_rms_scale": gradient_scale,
         "component_scales": {
             "source": "existing_reference_scales_only",
             "fallback_used": True,

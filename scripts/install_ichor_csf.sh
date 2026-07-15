@@ -648,11 +648,10 @@ pip_install() {
 }
 
 install_python_packages() {
-    note "Installing ICHOR, POLUS, and pyferebus Python packages"
+    note "Installing ICHOR and pyferebus Python packages"
     require_dir "${REPO_ROOT}/ichor_core" "ichor_core package"
     require_dir "${REPO_ROOT}/ichor_hpc" "ichor_hpc package"
     require_dir "${REPO_ROOT}/ichor_cli" "ichor_cli package"
-    require_dir "${PROJECTS_DIR}/POLUS/polus_core_subpackage" "POLUS core package"
     require_dir "${PROJECTS_DIR}/FEREBUS_CPU/pyferebus" "pyferebus package"
 
     pip_install --upgrade pip setuptools wheel
@@ -660,7 +659,6 @@ install_python_packages() {
     pip_install -e "${REPO_ROOT}/ichor_core"
     pip_install -e "${REPO_ROOT}/ichor_hpc"
     pip_install -e "${REPO_ROOT}/ichor_cli"
-    pip_install -e "${PROJECTS_DIR}/POLUS/polus_core_subpackage" --no-deps
     pip_install -e "${PROJECTS_DIR}/FEREBUS_CPU/pyferebus" --no-deps
 }
 
@@ -1296,7 +1294,6 @@ final_checks() {
     fi
     export ICHOR_MACHINE="${MACHINE}"
     "${PYTHON}" -c "import ichor.core, ichor.hpc, ichor.cli; print('ICHOR packages OK')"
-    "${PYTHON}" -c "import polus.samplers.RS.randomSampling; print('POLUS RS OK')"
     "${PYTHON}" -c "import pyferebus.executors.trainer; print('pyferebus OK')"
     verify_ariadne_api
     "${PYTHON}" -c "import ase, rdkit, tqdm, portalocker; print('ASE/RDKit/tqdm/portalocker OK')"
@@ -1508,7 +1505,6 @@ stage_doctor() {
 }
 
 require_all_sibling_repos() {
-    require_dir "${PROJECTS_DIR}/POLUS" "POLUS sibling repo"
     require_dir "${PROJECTS_DIR}/FEREBUS_CPU" "FEREBUS_CPU sibling repo"
     require_dir "${PROJECTS_DIR}/ARIADNE" "ARIADNE sibling repo"
 }
@@ -1522,7 +1518,6 @@ stage_python() {
 stage_packages() {
     CURRENT_STAGE="packages"
     ensure_repo_root
-    require_dir "${PROJECTS_DIR}/POLUS" "POLUS sibling repo"
     require_dir "${PROJECTS_DIR}/FEREBUS_CPU" "FEREBUS_CPU sibling repo"
     prepare_python_and_venv 0 0
     install_python_packages

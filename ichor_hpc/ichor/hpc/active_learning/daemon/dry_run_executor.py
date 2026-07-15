@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import csv
 from ..strict_json import strict_json as json
-import random
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -140,7 +139,6 @@ class DryRunPhaseExecutor:
         (self.campaign_dir / self.models_dir_name).mkdir(parents=True, exist_ok=True)
         bootstrap_dir(self.campaign_dir).mkdir(parents=True, exist_ok=True)
         active_learning_dir(self.campaign_dir).mkdir(parents=True, exist_ok=True)
-        self._rng = random.Random(self.rng_seed)
 
     # --- PhaseExecutor protocol ----------------------------------------
 
@@ -896,7 +894,7 @@ class DryRunPhaseExecutor:
         from ..acquisition.seed_selection import select_seeds
         from ..acquisition.trajectory_pool import TrajectoryPool
         from ..handoff_manifests import (
-            SEED_SELECTION_SCHEMA_VERSION,
+            build_seed_selection_manifest,
             seeds_picked_path,
         )
 
@@ -976,6 +974,7 @@ class DryRunPhaseExecutor:
                     self.campaign_dir,
                     iteration=int(state.iteration),
                     frame_ids=list(picked.get("frame_ids") or []),
+                    trajectory_sha256=str(picked["trajectory_sha256"]),
                     cooldown=self._recent_seed_cooldown(),
                 )
             self._journal_event(
@@ -1013,10 +1012,14 @@ class DryRunPhaseExecutor:
             training_forbidden = load_training_seed_frame_ids(
                 self.campaign_dir,
                 reference_data_dir=self.campaign_dir / self.reference_data_dir_name,
+                expected_trajectory_sha256=pool.sha256,
             )
         else:
             training_forbidden = set()
-        recent_forbidden = load_recent_seed_frame_ids(self.campaign_dir)
+        recent_forbidden = load_recent_seed_frame_ids(
+            self.campaign_dir,
+            expected_trajectory_sha256=pool.sha256,
+        )
         forbidden = frozenset(
             bootstrap_forbidden | training_forbidden | recent_forbidden
         )
@@ -1030,12 +1033,22 @@ class DryRunPhaseExecutor:
         else:
             score_transform, score_transform_reason = None, "strategy_hybrid_variance"
 
+        from ..randomness import derive_rng_seed
+
+        seed_selection_rng = derive_rng_seed(
+            campaign_uid=str(state.campaign_uid),
+            campaign_random_seed=int(self.config.campaign.random_seed),
+            iteration=int(state.iteration),
+            phase="SEED_SELECT",
+            logical_task_id="seed-batch",
+            random_purpose="bulk-seed-selection",
+        )
         selection = select_seeds(
             training_atoms,
             posterior,
             n_seeds=int(self.config.seed_selection.n_seeds_per_iteration),
             bulk_fraction=float(self.config.seed_selection.bulk_fraction),
-            rng_seed=int(self.rng_seed) + int(state.iteration),
+            rng_seed=int(seed_selection_rng.derived_seed_128),
             training_frame_ids=training_frame_ids,
             forbidden_frame_ids=forbidden,
             variance_chunk_size=int(self.config.seed_selection.variance_chunk_size),
@@ -1157,36 +1170,19 @@ class DryRunPhaseExecutor:
                 verify_dataset_files=False,
             ).get("prior_mean_contract")
         ).contract_sha256
-        for record in seed_records:
-            record["prior_mean_contract_sha256"] = prior_contract_hash
-        seeds_picked_payload = {
-            "schema_version": SEED_SELECTION_SCHEMA_VERSION,
-            "campaign_uid": str(state.campaign_uid),
-            "iteration": int(state.iteration),
-            "models_version": int(model_version),
-            "model_manifest_sha256": str(model_set.head_manifest_sha256),
-            "prior_mean_contract_sha256": prior_contract_hash,
-            "selection_strategy": str(self.config.seed_selection.strategy),
-            "n_picked": int(selection.n),
-            "frame_ids": list(selection.frame_ids),
-            "indices": list(selection.indices),
-            "bulk_indices": list(selection.bulk_indices),
-            "variance_indices": list(selection.variance_indices),
-            "d_optimal_indices": [
-                int(rec["pool_row_index_zero_based"])
-                for rec in seed_records
-                if rec.get("selection_origin") in {
-                    "d_optimal",
-                    "d_optimal_backfill",
-                }
-            ],
-            "d_optimal_backfill_indices": [
-                int(rec["pool_row_index_zero_based"])
-                for rec in seed_records
-                if rec.get("selection_origin") == "d_optimal_backfill"
-            ],
-            "variances": [float(v) for v in selection.variances],
-            "seed_records": seed_records,
+        seeds_picked_payload = build_seed_selection_manifest(
+            campaign_uid=str(state.campaign_uid),
+            campaign_random_seed=int(self.config.campaign.random_seed),
+            iteration=int(state.iteration),
+            models_version=int(model_version),
+            model_manifest_sha256=str(model_set.head_manifest_sha256),
+            trajectory_sha256=pool.sha256,
+            selection_strategy=str(self.config.seed_selection.strategy),
+            seed_records=seed_records,
+            prior_mean_contract_sha256=prior_contract_hash,
+        )
+        seed_records = list(seeds_picked_payload["seed_records"])
+        seeds_picked_payload.update({
             "forbidden_set_size": int(len(forbidden)),
             "bootstrap_forbidden_set_size": int(len(bootstrap_forbidden)),
             "skipped_unknown_provenance": int(selection.skipped_unknown_provenance),
@@ -1196,9 +1192,7 @@ class DryRunPhaseExecutor:
                 else "posterior_variance"
             ),
             "score_source_reason": str(score_transform_reason),
-            "trajectory_sha256": pool.sha256,
-            "prior_mean_contract_sha256": prior_contract_hash,
-        }
+        })
         diagnostics_payload = {
             "iteration": int(state.iteration),
             "strategy": str(self.config.seed_selection.strategy),
@@ -1221,26 +1215,10 @@ class DryRunPhaseExecutor:
             "trajectory_sha256": pool.sha256,
             "selected": seed_records,
             "summary": dict(selection.diagnostics),
+            "randomness": seed_selection_rng.to_dict(),
         }
         seeds_picked_payload["diagnostics"] = diagnostics_payload
-        from ..seed_identity import (
-            deterministic_seed_uid,
-            selection_fingerprint_sha256,
-            write_ariadne_task_map,
-        )
-
-        fingerprint = selection_fingerprint_sha256(seeds_picked_payload)
-        seeds_picked_payload["selection_fingerprint_sha256"] = fingerprint
-        for record in seed_records:
-            record["seed_uid"] = deterministic_seed_uid(
-                campaign_uid=str(state.campaign_uid),
-                iteration=int(state.iteration),
-                seed_id=int(record["seed_id"]),
-                frame_id=record.get("frame_id"),
-                models_version=int(model_version),
-                model_manifest_sha256=str(model_set.head_manifest_sha256),
-                selection_fingerprint_sha256_value=fingerprint,
-            )
+        from ..seed_identity import write_ariadne_task_map
         selected_frames = [training_atoms[int(index)] for index in selection.indices]
         comments = [
             "active iteration "
@@ -1263,6 +1241,7 @@ class DryRunPhaseExecutor:
             self.campaign_dir,
             iteration=int(state.iteration),
             frame_ids=selection.frame_ids,
+            trajectory_sha256=pool.sha256,
             cooldown=self._recent_seed_cooldown(),
         )
 
@@ -1456,13 +1435,11 @@ class DryRunPhaseExecutor:
         upsert_index_records(
             self.campaign_dir,
             records=[
-                {
-                    "iteration": int(target_version),
-                    "pointdir_name": pdir_name,
-                    "seed_frame_id": self._read_seed_frame_id_from_pointdir(
-                        committed_iter_dir / pdir_name
-                    ),
-                }
+                self._seed_index_record_from_pointdir(
+                    committed_iter_dir / pdir_name,
+                    iteration=int(target_version),
+                    pointdir_name=pdir_name,
+                )
                 for pdir_name in committed_pointdirs
             ],
         )
@@ -1584,14 +1561,14 @@ class DryRunPhaseExecutor:
 
     def _postprocess_handlers(self):
         return {
-            "PHASE_A_POLUS": self._post_phase_a_polus,
+            "PHASE_A_DIVERSITY": self._post_phase_a_diversity,
             "INITIAL_GAUSSIAN": self._post_initial_gaussian,
             "INITIAL_AIMALL": self._post_initial_aimall,
             "INITIAL_REPLACEMENT_GAUSSIAN": self._post_initial_replacement_gaussian,
             "INITIAL_REPLACEMENT_AIMALL": self._post_initial_replacement_aimall,
             "INITIAL_FEREBUS": self._post_initial_ferebus,
             "ARIADNE_ARRAY": self._post_ariadne_array,
-            "PHASE_B_POLUS": self._post_phase_b_polus,
+            "PHASE_B_DIVERSITY": self._post_phase_b_diversity,
             "GAUSSIAN": self._post_gaussian,
             "AIMALL": self._post_aimall,
             "REPLACEMENT_GAUSSIAN": self._post_replacement_gaussian,
@@ -1601,8 +1578,8 @@ class DryRunPhaseExecutor:
 
     # --- per-phase postprocess handlers --------------------------------
 
-    def _post_phase_a_polus(self, state) -> Dict[str, Any]:
-        from ..sampling.polus_wrapper import _run_phase_a
+    def _post_phase_a_diversity(self, state) -> Dict[str, Any]:
+        from ..sampling.diversity import _run_phase_a
         from ..custom_bootstrap import (
             commit_bootstrap_plan,
             custom_bootstrap_manifest_path,
@@ -1820,13 +1797,23 @@ class DryRunPhaseExecutor:
                 result_payload = json.loads(result_path.read_text(encoding="utf-8"))
                 result = None
             else:
+                from ..randomness import derive_rng_seed
+
+                ariadne_rng = derive_rng_seed(
+                    campaign_uid=campaign_uid,
+                    campaign_random_seed=int(self.config.campaign.random_seed),
+                    iteration=int(state.iteration),
+                    phase="ARIADNE_ARRAY",
+                    logical_task_id=seed_uid,
+                    random_purpose="ariadne-seed-optimisation",
+                )
                 result = optimise_seed(
                     models=None,
                     seed=seed_atoms,
                     trajectory=[seed_atoms],
                     run_config=replace(
                         resolved_protocol.ariadne_run_config,
-                        rng_seed=self.rng_seed + array_task_id,
+                        rng_seed=int(ariadne_rng.derived_seed_128),
                     ),
                     mock=True,
                 )
@@ -1852,6 +1839,7 @@ class DryRunPhaseExecutor:
                             resolved_protocol.hidden_overrides_detected
                         ),
                     },
+                    "randomness": ariadne_rng.to_dict(),
                 })
                 if isinstance(result_payload.get("selection_diagnostics"), dict):
                     from ..ferebus_prior import resolve_ferebus_prior_contract
@@ -2085,7 +2073,7 @@ class DryRunPhaseExecutor:
             "last_n_anti_overlap_flagged": int(flagged_count),
         }
 
-    def _post_phase_b_polus(self, state) -> Dict[str, Any]:
+    def _post_phase_b_diversity(self, state) -> Dict[str, Any]:
         import hashlib
 
         from ..handoff_manifests import (
@@ -2105,6 +2093,12 @@ class DryRunPhaseExecutor:
             phase_b_min_separation_from_resolved,
             resolve_sampling_protocol,
         )
+        from ..sampling.descriptors import (
+            build_condensed_distance_store,
+            build_descriptor_from_config,
+            partition_descriptor_frames,
+        )
+        from ..sampling.diversity import fps_select, _selector_contract
         from ..versioning.provenance import (
             enrich_with_phase_b,
             enrich_with_point_allocation,
@@ -2120,6 +2114,22 @@ class DryRunPhaseExecutor:
             expected_iteration=int(state.iteration),
             expected_config_sha256=config_fingerprint(canonical_config(self.config)),
         )
+        descriptor = build_descriptor_from_config(self.config)
+        descriptor_indices, descriptor_rejections = partition_descriptor_frames(
+            descriptor,
+            candidate_frames,
+        )
+        if descriptor_rejections:
+            candidate_frames = [candidate_frames[index] for index in descriptor_indices]
+            accepted = [accepted[index] for index in descriptor_indices]
+        matrix = build_condensed_distance_store(descriptor, candidate_frames, workers=1)
+        selection = fps_select(
+            matrix,
+            len(candidate_frames),
+            descriptor_name=descriptor.name,
+        )
+        candidate_frames = [candidate_frames[index] for index in selection.indices]
+        accepted = [accepted[index] for index in selection.indices]
         batch_total = int(self.config.point_allocation.batch_total_size)
         n_accepted_candidates = len(accepted)
         if n_accepted_candidates < batch_total:
@@ -2171,7 +2181,7 @@ class DryRunPhaseExecutor:
         ]
         reserve_records = [
             allocation_record(rec, reserve_rank=rank)
-            for rank, rec in enumerate(reserve_source, start=1)
+            for rank, rec in enumerate(reserve_source)
         ]
         allocation_path = point_allocation_path(
             self.campaign_dir,
@@ -2198,7 +2208,7 @@ class DryRunPhaseExecutor:
         for final_rank, rec in enumerate(primary_records, start=1):
             out_rec = dict(rec)
             out_rec["candidate_pool_index_zero_based"] = int(final_rank - 1)
-            out_rec["raw_rank"] = int(final_rank)
+            out_rec["considered_rank"] = int(final_rank)
             out_rec["final_rank"] = int(final_rank)
             out_rec["kept_after_dedup"] = True
             out_rec["drop_reason"] = None
@@ -2238,10 +2248,10 @@ class DryRunPhaseExecutor:
             "n_candidates": int(len(final_records)),
             "n_kept": int(len(final_records)),
             "n_dropped": 0,
-            "kept_raw_indexes_zero_based": [
+            "kept_considered_indexes_zero_based": [
                 int(i) for i in range(len(final_records))
             ],
-            "dropped_raw_indexes_zero_based": [],
+            "dropped_considered_indexes_zero_based": [],
             "distances_to_nearest": [],
             "min_separation": float(effective_min_separation),
             "threshold_mode": str(threshold_mode),
@@ -2250,14 +2260,14 @@ class DryRunPhaseExecutor:
             "novelty_scores": [],
             "relaxation": {"applied": False, "reason": None},
         }
-        raw_path = phase_b_dir / "selected_raw.xyz"
+        considered_path = phase_b_dir / "considered_candidates.xyz"
         selected_path = phase_b_dir / "selected.xyz"
         selected_frames = candidate_frames[:batch_total]
         comments = [
             "active iteration " + str(int(state.iteration)) + " Phase B rank " + str(rank)
             for rank in range(1, len(selected_frames) + 1)
         ]
-        atomic_write_text(raw_path, _frames_to_xyz(selected_frames, comments))
+        atomic_write_text(considered_path, _frames_to_xyz(selected_frames, comments))
         atomic_write_text(selected_path, _frames_to_xyz(selected_frames, comments))
 
         def iteration_relative(record):
@@ -2288,6 +2298,7 @@ class DryRunPhaseExecutor:
             "campaign_uid": str(state.campaign_uid),
             "iteration": int(state.iteration),
             "descriptor": str(self.config.phase_b.descriptor),
+            "selector": _selector_contract(),
             "sampling_protocol": {
                 "sampling_aggressiveness": int(
                     resolved_protocol.sampling_aggressiveness
@@ -2300,10 +2311,10 @@ class DryRunPhaseExecutor:
             "source_ariadne_manifest_sha256": hashlib.sha256(
                 ariadne_results_path(iter_dir).read_bytes()
             ).hexdigest(),
-            "selected_raw_xyz": {
-                "path": raw_path.relative_to(iter_dir).as_posix(),
-                "size": int(raw_path.stat().st_size),
-                "sha256": hashlib.sha256(raw_path.read_bytes()).hexdigest(),
+            "considered_candidates_xyz": {
+                "path": considered_path.relative_to(iter_dir).as_posix(),
+                "size": int(considered_path.stat().st_size),
+                "sha256": hashlib.sha256(considered_path.read_bytes()).hexdigest(),
             },
             "selected_xyz": {
                 "path": selected_path.relative_to(iter_dir).as_posix(),
@@ -2320,13 +2331,20 @@ class DryRunPhaseExecutor:
                 "reserve_count": int(len(reserve_records)),
             },
             "n_candidates": int(n_accepted_candidates),
-            "n_selected_raw": int(len(final_records)),
+            "n_considered": int(len(final_records)),
             "n_kept": int(len(final_records)),
-            "raw": list(final_records),
+            "considered": list(final_records),
             "final": list(final_records),
             "dedup": dedup_payload,
+            "safety_filter": {
+                "enabled": True,
+                "n_input": int(len(selection.indices) + len(descriptor_rejections)),
+                "n_kept": int(len(selection.indices)),
+                "n_dropped": int(len(descriptor_rejections)),
+                "descriptor_rejections": descriptor_rejections,
+            },
         })
-        self.artefact_log.extend([str(raw_path), str(selected_path)])
+        self.artefact_log.extend([str(considered_path), str(selected_path)])
         self.artefact_log.append(str(manifest_path))
         return {}
 
@@ -2466,25 +2484,24 @@ class DryRunPhaseExecutor:
         except (TypeError, ValueError):
             return None
 
-    def _read_seed_frame_id_from_pointdir(self, pointdir: Path):
-        """Read provenance.json from a committed pointdir and return its
-        seed.frame_id (or None if absent / malformed)."""
-        from ..strict_json import strict_json as _json
-        from ..versioning.provenance import PROVENANCE_FILENAME as _PFN
+    def _seed_index_record_from_pointdir(
+        self,
+        pointdir: Path,
+        *,
+        iteration: int,
+        pointdir_name: str,
+    ) -> Dict[str, Any]:
+        """Build one exclusion-index record from authoritative provenance."""
+        from ..versioning.provenance import validate_provenance
 
-        prov_path = Path(pointdir) / _PFN
-        if not prov_path.is_file():
-            return None
-        try:
-            with open(prov_path, "r", encoding="utf-8") as f:
-                data = _json.load(f)
-        except (OSError, _json.JSONDecodeError):
-            return None
-        seed_block = data.get("seed")
-        if not isinstance(seed_block, dict):
-            return None
-        fid = seed_block.get("frame_id")
-        return int(fid) if isinstance(fid, int) else None
+        data = validate_provenance(pointdir, iteration=int(iteration))
+        seed = data["seed"]
+        return {
+            "iteration": int(iteration),
+            "pointdir_name": str(pointdir_name),
+            "seed_frame_id": seed.get("frame_id"),
+            "trajectory_sha256": str(data["trajectory_sha256"]),
+        }
 
     def _journal_event(self, event_type: str, **payload) -> None:
         """Robust append to the daemon journal. The journal path is

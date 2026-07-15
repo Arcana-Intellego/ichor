@@ -1,7 +1,7 @@
-"""Descriptors used by the POLUS wrapper for the two diversity passes.
+"""Descriptors used by ICHOR's two exact diversity passes.
 
 A Descriptor retains its dense ``pairwise_distance_matrix`` method for small
-fixtures and compatibility. Production POLUS execution evaluates the same
+fixtures and compatibility. Production diversity execution evaluates the same
 metric blockwise into an exact float64 condensed store, then exposes rows to
 greedy furthest-point sampling without constructing an N by N matrix.
 
@@ -19,12 +19,8 @@ Three concrete descriptors are provided:
    The blend keeps geometric diversity while breaking failure-mode redundancy
    in the adversarial pool.
 
-3. AcquisitionWeightedDescriptor: BatchBALD-style variance reweighting.
-   Multiplies pairwise distances by sqrt(sigma2(i) * sigma2(j) / sigma_ref^4),
-   so high-variance candidates are pulled apart by the FPS criterion.
-
 All descriptors take an ICHOR Atoms sequence as input; they do not know
-about POLUS internals or trajectory file formats.
+about scheduler or trajectory file formats.
 """
 
 from __future__ import annotations
@@ -45,9 +41,9 @@ __all__ = [
     "Descriptor",
     "MassWeightedRMSDDescriptor",
     "HybridAlfRmsdDescriptor",
-    "AcquisitionWeightedDescriptor",
     "CondensedDistanceStore",
     "build_condensed_distance_store",
+    "partition_descriptor_frames",
     "kabsch_align",
     "mass_weighted_rmsd",
     "build_descriptor_from_config",
@@ -189,31 +185,68 @@ class MassWeightedRMSDDescriptor:
 
 
 def _default_alf_feature_extractor():
+    def extract(atoms):
+        return _default_alf_features_and_cyclic_mask(atoms)[0]
+
+    return extract
+
+
+def _default_alf_features_and_cyclic_mask(
+    atoms: Atoms,
+) -> Tuple[np.ndarray, np.ndarray]:
     from ichor.core.calculators import calculate_alf_features
     from ichor.core.calculators import default_alf_calculator
 
-    def extract(atoms):
-        try:
-            system_alf = atoms.alf(default_alf_calculator)
-            features = [
-                np.asarray(
-                    atom.features(calculate_alf_features, system_alf),
-                    dtype=float,
-                ).reshape(-1)
-                for atom in atoms
-            ]
-        except Exception as exc:
-            raise RuntimeError(
-                "Phase B ALF feature extraction failed: " + str(exc)
-            ) from exc
-        if not features:
-            raise ValueError("Phase B ALF feature extraction produced no features")
-        flat = np.concatenate(features)
-        if not np.all(np.isfinite(flat)):
-            raise ValueError("Phase B ALF feature extraction produced non-finite values")
-        return flat
+    try:
+        system_alf = atoms.alf(default_alf_calculator)
+        features = []
+        masks = []
+        for atom in atoms:
+            values = np.asarray(
+                atom.features(calculate_alf_features, system_alf),
+                dtype=float,
+            ).reshape(-1)
+            cyclic = np.zeros(values.size, dtype=bool)
+            if len(atoms) > 3:
+                cyclic[5::3] = True
+            features.append(values)
+            masks.append(cyclic)
+    except Exception as exc:
+        raise RuntimeError(
+            "Phase B ALF feature extraction failed: " + str(exc)
+        ) from exc
+    if not features:
+        raise ValueError("Phase B ALF feature extraction produced no features")
+    flat = np.concatenate(features)
+    cyclic_mask = np.concatenate(masks)
+    if not np.all(np.isfinite(flat)):
+        raise ValueError("Phase B ALF feature extraction produced non-finite values")
+    return flat, cyclic_mask
 
-    return extract
+
+def _normalise_hybrid_feature_matrix(
+    values: np.ndarray,
+    cyclic_mask: np.ndarray,
+    *,
+    epsilon: float,
+) -> np.ndarray:
+    """Standardise linear ALF terms and encode azimuths on the unit circle."""
+    matrix = np.asarray(values, dtype=float)
+    mask = np.asarray(cyclic_mask, dtype=bool).reshape(-1)
+    if matrix.ndim != 2 or matrix.shape[1] != mask.size:
+        raise ValueError("hybrid ALF feature matrix/mask shape mismatch")
+    columns = []
+    for index in range(matrix.shape[1]):
+        column = matrix[:, index]
+        if mask[index]:
+            columns.extend((np.sin(column), np.cos(column)))
+            continue
+        sigma = float(np.std(column))
+        if sigma > float(epsilon):
+            columns.append((column - float(np.mean(column))) / sigma)
+        else:
+            columns.append(np.zeros_like(column))
+    return np.column_stack(columns) if columns else np.empty((len(matrix), 0))
 
 
 def _frame_diagnostic_context(frame: Atoms) -> str:
@@ -226,7 +259,7 @@ def _frame_diagnostic_context(frame: Atoms) -> str:
 
 @dataclass
 class HybridAlfRmsdDescriptor:
-    beta: float = 0.3
+    beta: float = 0.5
     name: str = "hybrid_alf_rmsd"
     feature_extractor: Optional[Callable[[Atoms], np.ndarray]] = None
     epsilon: float = 1.0e-12
@@ -237,81 +270,11 @@ class HybridAlfRmsdDescriptor:
         n = len(frames)
         if n == 0:
             return np.zeros((0, 0), dtype=float)
-        extractor = self.feature_extractor or _default_alf_feature_extractor()
-        feature_rows = []
-        feature_size = None
-        for idx, frame in enumerate(frames):
-            try:
-                row = np.asarray(extractor(frame), dtype=float).reshape(-1)
-            except Exception as exc:
-                raise RuntimeError(
-                    "hybrid_alf_rmsd feature extraction failed for frame "
-                    + str(idx)
-                    + " ("
-                    + _frame_diagnostic_context(frame)
-                    + ")"
-                    + ": "
-                    + str(exc)
-                ) from exc
-            if row.size == 0:
-                raise ValueError(
-                    "hybrid_alf_rmsd feature extraction produced an empty "
-                    + "feature vector for frame "
-                    + str(idx)
-                )
-            if not np.all(np.isfinite(row)):
-                raise ValueError(
-                    "hybrid_alf_rmsd feature extraction produced non-finite "
-                    + "values for frame "
-                    + str(idx)
-                )
-            if feature_size is None:
-                feature_size = int(row.size)
-            elif int(row.size) != feature_size:
-                raise ValueError(
-                    "hybrid_alf_rmsd feature length mismatch: frame "
-                    + str(idx)
-                    + " has "
-                    + str(int(row.size))
-                    + " values, expected "
-                    + str(feature_size)
-                )
-            feature_rows.append(row)
-        feats = np.vstack(feature_rows)
-        mu = feats.mean(axis=0, keepdims=True)
-        sigma = feats.std(axis=0, keepdims=True)
-        sigma = np.where(sigma > self.epsilon, sigma, 1.0)
-        feats_z = (feats - mu) / sigma
+        feats_z = _hybrid_features(self, frames)
         rmsd_mat = MassWeightedRMSDDescriptor().pairwise_distance_matrix(frames)
         sq = (feats_z[:, None, :] - feats_z[None, :, :]) ** 2
         feat_dist = np.sqrt(sq.sum(axis=2))
         return self.beta * rmsd_mat + (1.0 - self.beta) * feat_dist
-
-
-@dataclass
-class AcquisitionWeightedDescriptor:
-    posterior: Any = None
-    sigma_ref: Optional[float] = None
-    base_descriptor: Optional[Descriptor] = None
-    name: str = "acquisition_weighted"
-    epsilon: float = 1.0e-12
-
-    def pairwise_distance_matrix(self, frames):
-        if self.posterior is None:
-            raise ValueError("posterior is required")
-        base = self.base_descriptor or MassWeightedRMSDDescriptor()
-        base_matrix = np.asarray(base.pairwise_distance_matrix(frames), dtype=float)
-        variances = np.array(
-            [float(self.posterior.variance(f)) for f in frames],
-            dtype=float,
-        )
-        sigma_ref_sq = (
-            float(self.sigma_ref) ** 2
-            if self.sigma_ref is not None
-            else float(np.median(variances) + self.epsilon)
-        )
-        weights = np.sqrt(np.maximum(variances, 0.0) / max(sigma_ref_sq, self.epsilon))
-        return base_matrix * np.sqrt(weights[:, None] * weights[None, :])
 
 
 _CONDENSED_WORKER_CONTEXT: Dict[str, Any] = {}
@@ -334,16 +297,13 @@ def _distance_for_pair(context: Dict[str, Any], i: int, j: int) -> float:
     masses = context["masses"]
     rmsd = _mass_weighted_rmsd_arrays(positions[i], positions[j], masses)
     mode = str(context["mode"])
-    if mode in {"mass", "acquisition_mass"}:
+    if mode == "mass":
         value = rmsd
     else:
         features = context["features"]
         feature_distance = float(np.linalg.norm(features[i] - features[j]))
         beta = float(context["beta"])
         value = beta * rmsd + (1.0 - beta) * feature_distance
-    if mode.startswith("acquisition_"):
-        weights = context["weights"]
-        value *= float(np.sqrt(weights[i] * weights[j]))
     return float(value)
 
 
@@ -382,12 +342,18 @@ def _hybrid_features(
 ) -> np.ndarray:
     if not 0.0 <= float(descriptor.beta) <= 1.0:
         raise ValueError("beta out of range")
-    extractor = descriptor.feature_extractor or _default_alf_feature_extractor()
     rows = []
+    cyclic_mask: Optional[np.ndarray] = None
     expected: Optional[int] = None
     for index, frame in enumerate(frames):
         try:
-            row = np.asarray(extractor(frame), dtype=float).reshape(-1)
+            if descriptor.feature_extractor is None:
+                row, observed_mask = _default_alf_features_and_cyclic_mask(frame)
+            else:
+                row = np.asarray(
+                    descriptor.feature_extractor(frame), dtype=float
+                ).reshape(-1)
+                observed_mask = np.zeros(row.size, dtype=bool)
         except Exception as exc:
             raise RuntimeError(
                 "hybrid_alf_rmsd feature extraction failed for frame "
@@ -401,13 +367,52 @@ def _hybrid_features(
             raise ValueError("hybrid_alf_rmsd produced invalid features")
         if expected is None:
             expected = int(row.size)
+            cyclic_mask = observed_mask
         elif int(row.size) != expected:
             raise ValueError("hybrid_alf_rmsd feature length mismatch")
+        elif not np.array_equal(cyclic_mask, observed_mask):
+            raise ValueError("hybrid_alf_rmsd cyclic feature layout mismatch")
         rows.append(row)
     values = np.vstack(rows)
-    sigma = values.std(axis=0, keepdims=True)
-    sigma = np.where(sigma > float(descriptor.epsilon), sigma, 1.0)
-    return (values - values.mean(axis=0, keepdims=True)) / sigma
+    return _normalise_hybrid_feature_matrix(
+        values,
+        np.asarray(cyclic_mask, dtype=bool),
+        epsilon=float(descriptor.epsilon),
+    )
+
+
+def partition_descriptor_frames(
+    descriptor: Descriptor,
+    frames: Sequence[Atoms],
+) -> Tuple[List[int], List[Dict[str, Any]]]:
+    """Identify descriptor-singular frames without discarding valid peers."""
+    kept: List[int] = []
+    rejected: List[Dict[str, Any]] = []
+    for index, frame in enumerate(frames):
+        try:
+            if isinstance(descriptor, HybridAlfRmsdDescriptor):
+                if descriptor.feature_extractor is None:
+                    _default_alf_features_and_cyclic_mask(frame)
+                else:
+                    values = np.asarray(
+                        descriptor.feature_extractor(frame), dtype=float
+                    ).reshape(-1)
+                    if values.size == 0 or not np.all(np.isfinite(values)):
+                        raise ValueError("custom descriptor features are invalid")
+            else:
+                coordinates = np.asarray(frame.coordinates, dtype=float)
+                if coordinates.shape != (len(frame), 3) or not np.all(
+                    np.isfinite(coordinates)
+                ):
+                    raise ValueError("frame coordinates are invalid")
+        except Exception as exc:
+            rejected.append({
+                "candidate_index_zero_based": int(index),
+                "reason": type(exc).__name__ + ": " + str(exc),
+            })
+            continue
+        kept.append(int(index))
+    return kept, rejected
 
 
 def _condensed_context(
@@ -418,7 +423,7 @@ def _condensed_context(
         return {"n": 0, "mode": "mass", "positions": [], "masses": np.array([])}
     n_atoms = len(frames[0])
     if any(len(frame) != n_atoms for frame in frames):
-        raise ValueError("POLUS frames disagree on atom count")
+        raise ValueError("diversity frames disagree on atom count")
     positions = [np.asarray(frame.coordinates, dtype=float) for frame in frames]
     masses = np.asarray([float(atom.mass) for atom in frames[0]], dtype=float)
     context: Dict[str, Any] = {
@@ -428,34 +433,13 @@ def _condensed_context(
         "mode": "mass",
     }
     target: Any = descriptor
-    if isinstance(descriptor, AcquisitionWeightedDescriptor):
-        if descriptor.posterior is None:
-            raise ValueError("posterior is required")
-        target = descriptor.base_descriptor or MassWeightedRMSDDescriptor()
-        variances = np.asarray(
-            [float(descriptor.posterior.variance(frame)) for frame in frames],
-            dtype=float,
-        )
-        sigma_ref_sq = (
-            float(descriptor.sigma_ref) ** 2
-            if descriptor.sigma_ref is not None
-            else float(np.median(variances) + descriptor.epsilon)
-        )
-        context["weights"] = np.sqrt(
-            np.maximum(variances, 0.0)
-            / max(sigma_ref_sq, float(descriptor.epsilon))
-        )
-        context["mode"] = "acquisition_mass"
     if isinstance(target, HybridAlfRmsdDescriptor):
         context["features"] = _hybrid_features(target, frames)
         context["beta"] = float(target.beta)
-        if isinstance(descriptor, AcquisitionWeightedDescriptor):
-            context["mode"] = "acquisition_hybrid"
-        else:
-            context["mode"] = "hybrid"
+        context["mode"] = "hybrid"
     elif not isinstance(target, MassWeightedRMSDDescriptor):
         raise TypeError(
-            "condensed POLUS execution does not support descriptor "
+            "condensed diversity execution does not support descriptor "
             + type(target).__name__
         )
     return context
@@ -509,7 +493,7 @@ def build_condensed_distance_store(
     for start in range(0, n_pairs, validation_chunk):
         chunk = np.asarray(values[start : start + validation_chunk])
         if not np.all(np.isfinite(chunk)) or np.any(chunk < 0.0):
-            raise ValueError("POLUS condensed distances are non-finite or negative")
+            raise ValueError("condensed diversity distances are non-finite or negative")
     store.flush()
     return store
 
@@ -527,18 +511,13 @@ def build_descriptor_from_config(config, *, posterior=None) -> "Descriptor":
     Schema v2 makes "phase_b.beta" tunable; it was a dead in an earlier v.
     The returned descriptor instance carries the live beta /
     config-derived hyperparameters and is consumed by the production
-    Phase-B (POLUS). For the dry-run executor, it is recorded
+    Phase B. For the dry-run executor, it is recorded
     in the per-pointdir provenance phase_b block instead of actually
-    running POLUS.
+    submitting a diversity job.
     """
     name = config.phase_b.descriptor
     if name == "rmsd_massweight":
         return MassWeightedRMSDDescriptor()
     if name == "hybrid_alf_rmsd":
         return HybridAlfRmsdDescriptor(beta=config.phase_b.beta)
-    if name == "acquisition_weighted":
-        return AcquisitionWeightedDescriptor(
-            posterior=posterior,
-            base_descriptor=HybridAlfRmsdDescriptor(beta=config.phase_b.beta),
-        )
     raise ValueError("unknown phase_b.descriptor: " + repr(name))

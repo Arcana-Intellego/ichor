@@ -395,7 +395,7 @@ def test_seed_selection_bulk_fraction_consumed_by_executor(tmp_path):
         reference_data_version=-1,
         models_version=-1,
     )
-    ex.postprocess(bootstrap_state, CampaignPhase.PHASE_A_POLUS, observations=[])
+    ex.postprocess(bootstrap_state, CampaignPhase.PHASE_A_DIVERSITY, observations=[])
     ex.postprocess(
         bootstrap_state,
         CampaignPhase.INITIAL_GAUSSIAN,

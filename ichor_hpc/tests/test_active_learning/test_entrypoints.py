@@ -16,7 +16,7 @@ import pytest
 
 MODULES = [
     "ichor.hpc.active_learning.acquisition.ariadne_runner",
-    "ichor.hpc.active_learning.sampling.polus_wrapper",
+    "ichor.hpc.active_learning.sampling.diversity",
 ]
 
 
@@ -58,12 +58,12 @@ def test_ariadne_runner_missing_campaign_dir(tmp_path):
     assert "campaign-dir does not exist" in result.stderr
 
 
-def test_polus_wrapper_missing_campaign_dir(tmp_path):
+def test_diversity_runner_missing_campaign_dir(tmp_path):
     """same shape as ariadne -- bad --campaign-dir errors with exit 2."""
     bad = tmp_path / "no_such_dir"
     result = subprocess.run(
         [sys.executable, "-m",
-         "ichor.hpc.active_learning.sampling.polus_wrapper",
+         "ichor.hpc.active_learning.sampling.diversity",
          "--descriptor", "rmsd_massweight",
          "--iteration", "0",
          "--campaign-dir", str(bad)],

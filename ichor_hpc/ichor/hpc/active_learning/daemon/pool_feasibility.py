@@ -22,6 +22,7 @@ class PoolFeasibility:
     n_seeds_per_iteration: int
     batch_total_size: int
     exclude_committed_seed_frames: bool
+    recent_seed_cooldown_iterations: int
     required_pool_frames: int
     expression: str
 
@@ -55,6 +56,9 @@ class PoolFeasibility:
             ),
             "exclude_committed_seed_frames": bool(
                 self.exclude_committed_seed_frames
+            ),
+            "recent_seed_cooldown_iterations": int(
+                self.recent_seed_cooldown_iterations
             ),
             "required_pool_frames": int(self.required_pool_frames),
             "reserve_after_bootstrap": int(self.reserve_after_bootstrap),
@@ -99,7 +103,7 @@ def evaluate_pool_feasibility(
         }
         manifest = {
             "effective_qm_targets": configured,
-            "polus_deficits": configured,
+            "diversity_deficits": configured,
             "supplied_counts": {split: 0 for split in configured},
             "excluded_pool_frame_ids": [],
             "model": None,
@@ -121,7 +125,8 @@ def evaluate_pool_feasibility_manifest(
         for split in ("train", "int_val", "ext_val")
     )
     bootstrap_pool_n = sum(
-        int(value) for value in dict(manifest.get("polus_deficits") or {}).values()
+        int(value)
+        for value in dict(manifest.get("diversity_deficits") or {}).values()
     )
     custom_n = sum(
         int(value) for value in dict(manifest.get("supplied_counts") or {}).values()
@@ -132,29 +137,50 @@ def evaluate_pool_feasibility_manifest(
     n_seeds = int(config.seed_selection.n_seeds_per_iteration)
     batch_total = int(config.point_allocation.batch_total_size)
     skip_training = bool(config.seed_selection.exclude_committed_seed_frames)
+    cooldown = int(config.seed_selection.recent_seed_cooldown_iterations)
     if skip_training:
-        required = excluded_n + bootstrap_pool_n + max_iterations * n_seeds
+        per_iteration_requirements = []
+        for iteration in range(max_iterations):
+            recent_iterations = min(iteration, cooldown)
+            older_iterations = max(0, iteration - cooldown)
+            per_iteration_requirements.append(
+                excluded_n
+                + bootstrap_pool_n
+                + older_iterations * batch_total
+                + (recent_iterations + 1) * n_seeds
+            )
+        required = max(per_iteration_requirements)
         expression = (
-            "excluded custom/model pool matches + bootstrap POLUS top-ups + "
-            "max_iterations * seed_selection.n_seeds_per_iteration = "
+            "worst-case committed/cooldown seed simulation = "
             + str(excluded_n)
-            + " + "
+            + " excluded + "
             + str(bootstrap_pool_n)
-            + " + "
+            + " bootstrap diversity + max over "
             + str(max_iterations)
-            + " * "
+            + " iteration(s), cooldown="
+            + str(cooldown)
+            + ", seeds="
             + str(n_seeds)
+            + ", committed_per_iteration="
+            + str(batch_total)
             + " = "
             + str(required)
         )
     else:
-        required = excluded_n + bootstrap_pool_n
+        simultaneous_batches = min(max_iterations, cooldown + 1)
+        required = excluded_n + simultaneous_batches * n_seeds
         expression = (
-            "excluded custom/model pool matches + bootstrap POLUS top-ups = "
+            "excluded custom/model pool matches + current/recent seed batches = "
             + str(excluded_n)
             + " + "
-            + str(bootstrap_pool_n)
-            + " (seed_selection.exclude_committed_seed_frames=false)"
+            + str(simultaneous_batches)
+            + " * "
+            + str(n_seeds)
+            + " = "
+            + str(required)
+            + " (committed-frame exclusion disabled; cooldown="
+            + str(cooldown)
+            + ")"
         )
     return PoolFeasibility(
         pool_n_frames=pool_n,
@@ -167,6 +193,7 @@ def evaluate_pool_feasibility_manifest(
         n_seeds_per_iteration=n_seeds,
         batch_total_size=batch_total,
         exclude_committed_seed_frames=skip_training,
+        recent_seed_cooldown_iterations=cooldown,
         required_pool_frames=required,
         expression=expression,
     )

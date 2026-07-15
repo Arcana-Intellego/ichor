@@ -6,7 +6,7 @@ Cases (a)-(c) live in ichor.hpc.active_learning.daemon (seed-side):
   (b) Recent-seeds cooldown               -> recent_seeds.json
   (c) Post-ARIADNE flag (not filter)      -> _post_ariadne_array
 
-Case (d) is the SAMPLING-side de-duplicate that runs after Phase-B POLUS-FPS produces a
+Case (d) is the sampling-side de-duplicate that runs after Phase B diversity FPS produces a
 candidate set: for each candidate, compute the aligned mass-weighted RMSD
 to the nearest committed training point; drop the candidate if it falls
 below the configured min-separation threshold.
@@ -114,6 +114,5 @@ def filter_candidates_against_training(
         distances_to_nearest=tuple(distances),
         min_separation=float(min_separation),
     )
-
 
 

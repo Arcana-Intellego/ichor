@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import shutil
 from pathlib import Path
 
@@ -75,12 +76,35 @@ def _write_csv(path: Path, frames, *, extras=("iqa", "q00")) -> list[int]:
 
 
 def _inspect(campaign: Path, config: CampaignConfig, frames, **kwargs):
+    from ichor.hpc.active_learning.acquisition.trajectory_pool import (
+        POOL_MANIFEST_FILENAME,
+        POOL_SUBDIR,
+        TrajectoryPool,
+    )
+
+    manifest = campaign / POOL_SUBDIR / POOL_MANIFEST_FILENAME
+    if not manifest.is_file():
+        TrajectoryPool.import_from(campaign / "pool.xyz", campaign)
     return inspect_bootstrap_inputs(
         campaign,
         config,
         frames,
         pool_sha256=sha256_file(campaign / "pool.xyz"),
         **kwargs,
+    )
+
+
+def _mutate_committed_bootstrap(campaign: Path, mutate) -> None:
+    pointer = campaign / ".DATA" / "ACTIVE_LEARNING" / "CUSTOM_BOOTSTRAP.json"
+    payload = json.loads(pointer.read_text(encoding="utf-8"))
+    embedded = campaign / payload["bootstrap_inputs_root"] / "CUSTOM_BOOTSTRAP.json"
+    mutate(payload)
+    embedded_payload = dict(payload)
+    embedded_payload.pop("bootstrap_inputs_root")
+    pointer.write_text(json.dumps(payload), encoding="utf-8")
+    embedded.write_text(
+        json.dumps(embedded_payload),
+        encoding="utf-8",
     )
 
 
@@ -109,7 +133,7 @@ def test_mixed_xyz_and_csv_splits_are_accepted_and_csv_extras_are_recorded(tmp_p
     assert plan.sources["train"].kind == "xyz"
     assert plan.sources["int_val"].kind == "csv"
     assert plan.sources["int_val"].extra_columns == ("iqa", "q00")
-    assert plan.polus_deficits == {"train": 7, "int_val": 1, "ext_val": 2}
+    assert plan.diversity_deficits == {"train": 7, "int_val": 1, "ext_val": 2}
 
 
 @pytest.mark.skipif(not FIXTURE.is_file(), reason="water fixture missing")
@@ -124,6 +148,30 @@ def test_duplicate_format_for_one_split_is_rejected(tmp_path):
 
     with pytest.raises(BootstrapInputError, match="both XYZ and CSV"):
         _inspect(tmp_path, config, frames, alf_values={"ext_val": [1, 2, 3]})
+
+
+@pytest.mark.skipif(not FIXTURE.is_file(), reason="water fixture missing")
+@pytest.mark.parametrize(
+    "sidecar",
+    [
+        "train: [1, 2, 3]\ntrain: [1, 3, 2]\n",
+        "training: [1, 2, 3]\ntrain: [1, 3, 2]\n",
+    ],
+)
+def test_alf_sidecar_rejects_duplicate_and_alias_ambiguous_keys(
+    tmp_path,
+    sidecar,
+):
+    shutil.copy2(FIXTURE, tmp_path / "pool.xyz")
+    frames = _pool_frames()
+    bootstrap = tmp_path / "bootstrap"
+    _write_csv(bootstrap / "training_set_bootstrap.csv", [frames[0]])
+    (bootstrap / "alf.yaml").write_text(sidecar, encoding="utf-8")
+    config = CampaignConfig()
+    config.campaign.custom_bootstrap = True
+
+    with pytest.raises((BootstrapInputError, ValueError), match="duplicate|defines both"):
+        _inspect(tmp_path, config, frames)
 
 
 @pytest.mark.skipif(not FIXTURE.is_file(), reason="water fixture missing")
@@ -243,6 +291,36 @@ def test_committed_bootstrap_reader_rejects_tampered_canonical_geometry(tmp_path
     )
 
     with pytest.raises(BootstrapInputError, match="canonical bootstrap SHA mismatch"):
+        read_custom_bootstrap_manifest(tmp_path)
+
+
+@pytest.mark.skipif(not FIXTURE.is_file(), reason="water fixture missing")
+def test_committed_bootstrap_reader_rejects_pool_identity_drift(tmp_path):
+    shutil.copy2(FIXTURE, tmp_path / "pool.xyz")
+    frames = _pool_frames()
+    config = CampaignConfig()
+    commit_bootstrap_plan(_inspect(tmp_path, config, frames))
+    _mutate_committed_bootstrap(
+        tmp_path,
+        lambda payload: payload.__setitem__("pool_sha256", "0" * 64),
+    )
+
+    with pytest.raises(BootstrapInputError, match="different trajectory pool"):
+        read_custom_bootstrap_manifest(tmp_path)
+
+
+@pytest.mark.skipif(not FIXTURE.is_file(), reason="water fixture missing")
+def test_committed_bootstrap_reader_recomputes_deficits(tmp_path):
+    shutil.copy2(FIXTURE, tmp_path / "pool.xyz")
+    frames = _pool_frames()
+    config = CampaignConfig()
+    commit_bootstrap_plan(_inspect(tmp_path, config, frames))
+    _mutate_committed_bootstrap(
+        tmp_path,
+        lambda payload: payload["diversity_deficits"].__setitem__("train", 0),
+    )
+
+    with pytest.raises(BootstrapInputError, match="diversity_deficits"):
         read_custom_bootstrap_manifest(tmp_path)
 
 

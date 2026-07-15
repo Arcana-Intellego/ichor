@@ -17,7 +17,7 @@ class CommittedArtifactError(RuntimeError):
 _TRAINING_REQUIRED = {
     CampaignPhase.SEED_SELECT,
     CampaignPhase.ARIADNE_ARRAY,
-    CampaignPhase.PHASE_B_POLUS,
+    CampaignPhase.PHASE_B_DIVERSITY,
     CampaignPhase.SPLIT,
     CampaignPhase.GAUSSIAN,
     CampaignPhase.AIMALL,
@@ -32,7 +32,7 @@ _TRAINING_REQUIRED = {
 _MODELS_REQUIRED = {
     CampaignPhase.SEED_SELECT,
     CampaignPhase.ARIADNE_ARRAY,
-    CampaignPhase.PHASE_B_POLUS,
+    CampaignPhase.PHASE_B_DIVERSITY,
     CampaignPhase.SPLIT,
     CampaignPhase.GAUSSIAN,
     CampaignPhase.AIMALL,
@@ -46,7 +46,7 @@ _MODELS_REQUIRED = {
 _COHERENT_TRAINING_MODEL_REQUIRED = {
     CampaignPhase.SEED_SELECT,
     CampaignPhase.ARIADNE_ARRAY,
-    CampaignPhase.PHASE_B_POLUS,
+    CampaignPhase.PHASE_B_DIVERSITY,
     CampaignPhase.SPLIT,
     CampaignPhase.GAUSSIAN,
     CampaignPhase.AIMALL,

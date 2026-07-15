@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from ..strict_json import strict_json as json
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
@@ -132,15 +133,45 @@ __all__ = [
 
 
 PROVENANCE_FILENAME = "provenance.json"
-PROVENANCE_SCHEMA_VERSION = 3
+PROVENANCE_SCHEMA_VERSION = 4
 
 # Index lives under <campaign>/.DATA/ACTIVE_LEARNING/
 SEED_FRAME_ID_INDEX_FILENAME = "seed_frame_id_index.json"
-INDEX_SCHEMA_VERSION = 1
+INDEX_SCHEMA_VERSION = 2
 
 
 class ProvenanceError(RuntimeError):
     """Raised on malformed provenance JSON or index files."""
+
+
+def _exact_integer(value: Any, label: str, *, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ProvenanceError(label + " must be an exact JSON integer")
+    parsed = int(value)
+    if parsed < int(minimum):
+        raise ProvenanceError(label + " must be >= " + str(int(minimum)))
+    return parsed
+
+
+def _sha256_text(value: Any, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ProvenanceError(label + " must be a lowercase SHA-256 digest")
+    return value
+
+
+def _finite_number_or_none(value: Any, label: str) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ProvenanceError(label + " must be a finite JSON number or null")
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ProvenanceError(label + " must be finite")
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -173,34 +204,80 @@ def write_seed_provenance(
     `enrich_with_*` helpers; this call seeds the schema with the campaign
     + seed + subspace metadata that's known immediately.
     """
+    if not isinstance(campaign_uid, str) or not campaign_uid:
+        raise ProvenanceError("provenance campaign_uid must be a non-empty string")
+    iteration_value = _exact_integer(iteration, "provenance iteration")
+    trajectory_digest = _sha256_text(
+        trajectory_sha256, "provenance trajectory_sha256"
+    )
+    frame_id = (
+        None
+        if seed_frame_id is None
+        else _exact_integer(seed_frame_id, "provenance seed.frame_id")
+    )
+    seed_id_value = (
+        None
+        if seed_id is None
+        else _exact_integer(seed_id, "provenance seed.seed_id", minimum=1)
+    )
+    array_id_value = (
+        None
+        if array_task_id_zero_based is None
+        else _exact_integer(
+            array_task_id_zero_based,
+            "provenance seed.array_task_id_zero_based",
+        )
+    )
+    if iteration_value >= 1:
+        if seed_id_value is None or array_id_value != seed_id_value - 1:
+            raise ProvenanceError("active provenance seed/task identity is incomplete")
+        _sha256_text(seed_uid, "provenance seed.seed_uid")
+    elif seed_uid is not None:
+        _sha256_text(seed_uid, "provenance seed.seed_uid")
+    if not isinstance(seed_selection_origin, str) or not seed_selection_origin:
+        raise ProvenanceError("provenance seed.selection_origin must be non-empty")
+    variance_value = _finite_number_or_none(
+        seed_variance_at_selection,
+        "provenance seed.variance_at_selection",
+    )
+    dimension_value = _exact_integer(
+        subspace_dimension, "provenance subspace.dimension"
+    )
+    neighbour_values = [
+        _exact_integer(value, "provenance subspace.neighbour_frame_ids")
+        for value in subspace_neighbour_frame_ids
+    ]
+    if len(neighbour_values) != len(set(neighbour_values)):
+        raise ProvenanceError("provenance subspace neighbour IDs contain duplicates")
+    eigenvalues = [
+        _finite_number_or_none(value, "provenance subspace.eigenvalues")
+        for value in subspace_eigenvalues
+    ]
+    if any(value is None or value < 0.0 for value in eigenvalues):
+        raise ProvenanceError("provenance subspace eigenvalues must be non-negative")
+    if len(eigenvalues) < dimension_value:
+        raise ProvenanceError("provenance subspace has fewer eigenvalues than dimensions")
+    if not isinstance(mode_weighting_policy, str) or not mode_weighting_policy:
+        raise ProvenanceError("provenance mode_weighting_policy must be non-empty")
+
     payload: Dict[str, Any] = {
         "schema_version": PROVENANCE_SCHEMA_VERSION,
-        "campaign_uid": str(campaign_uid),
-        "iteration": int(iteration),
-        "trajectory_sha256": str(trajectory_sha256),
+        "campaign_uid": campaign_uid,
+        "iteration": iteration_value,
+        "trajectory_sha256": trajectory_digest,
         "seed": {
-            "seed_id": None if seed_id is None else int(seed_id),
+            "seed_id": seed_id_value,
             "seed_uid": None if seed_uid is None else str(seed_uid),
-            "array_task_id_zero_based": (
-                None
-                if array_task_id_zero_based is None
-                else int(array_task_id_zero_based)
-            ),
-            "frame_id": (
-                int(seed_frame_id) if seed_frame_id is not None else None
-            ),
-            "selection_origin": str(seed_selection_origin),
-            "variance_at_selection": (
-                float(seed_variance_at_selection)
-                if seed_variance_at_selection is not None
-                else None
-            ),
+            "array_task_id_zero_based": array_id_value,
+            "frame_id": frame_id,
+            "selection_origin": seed_selection_origin,
+            "variance_at_selection": variance_value,
         },
         "subspace": {
-            "neighbour_frame_ids": [int(i) for i in subspace_neighbour_frame_ids],
-            "dimension": int(subspace_dimension),
-            "eigenvalues": [float(v) for v in subspace_eigenvalues],
-            "mode_weighting_policy": str(mode_weighting_policy),
+            "neighbour_frame_ids": neighbour_values,
+            "dimension": dimension_value,
+            "eigenvalues": eigenvalues,
+            "mode_weighting_policy": mode_weighting_policy,
         },
         "ariadne": None,
         "anti_overlap": None,
@@ -223,7 +300,7 @@ def read_provenance(pointdir: Union[str, Path]) -> Dict[str, Any]:
         data = json.load(f)
     if not isinstance(data, dict):
         raise ProvenanceError(str(p) + ": must be a JSON object")
-    schema = int(data.get("schema_version", -1))
+    schema = _exact_integer(data.get("schema_version"), "provenance schema_version")
     if schema != PROVENANCE_SCHEMA_VERSION:
         raise ProvenanceError(
             str(p) + ": schema_version " + str(schema)
@@ -235,12 +312,7 @@ def read_provenance(pointdir: Union[str, Path]) -> Dict[str, Any]:
 def _expect_int_or_none(value: Any, label: str) -> Optional[int]:
     if value is None:
         return None
-    if isinstance(value, bool):
-        raise ProvenanceError(label + " must be an integer or null")
-    try:
-        return int(value)
-    except (TypeError, ValueError) as exc:
-        raise ProvenanceError(label + " must be an integer or null") from exc
+    return _exact_integer(value, label)
 
 
 def validate_provenance(
@@ -266,19 +338,15 @@ def validate_provenance(
         raise ProvenanceError("provenance campaign_uid is missing or invalid")
     if campaign_uid is not None and str(data.get("campaign_uid")) != str(campaign_uid):
         raise ProvenanceError("provenance campaign_uid mismatch")
-    try:
-        prov_iteration = int(data.get("iteration"))
-    except (TypeError, ValueError) as exc:
-        raise ProvenanceError("provenance iteration must be an integer") from exc
-    if prov_iteration < 0:
-        raise ProvenanceError("provenance iteration must be >= 0")
+    prov_iteration = _exact_integer(data.get("iteration"), "provenance iteration")
     if iteration is not None and prov_iteration != int(iteration):
         raise ProvenanceError("provenance iteration mismatch")
-    if not isinstance(data.get("trajectory_sha256"), str):
-        raise ProvenanceError("provenance trajectory_sha256 is missing or invalid")
+    observed_trajectory_sha256 = _sha256_text(
+        data.get("trajectory_sha256"), "provenance trajectory_sha256"
+    )
     if (
         trajectory_sha256 is not None
-        and str(data.get("trajectory_sha256")) != str(trajectory_sha256)
+        and observed_trajectory_sha256 != str(trajectory_sha256)
     ):
         raise ProvenanceError("provenance trajectory_sha256 mismatch")
 
@@ -290,6 +358,10 @@ def validate_provenance(
         raise ProvenanceError("provenance seed.frame_id mismatch")
     if "selection_origin" in seed and not isinstance(seed.get("selection_origin"), str):
         raise ProvenanceError("provenance seed.selection_origin must be a string")
+    _finite_number_or_none(
+        seed.get("variance_at_selection"),
+        "provenance seed.variance_at_selection",
+    )
     observed_seed_id = _expect_int_or_none(
         seed.get("seed_id"),
         "provenance seed.seed_id",
@@ -304,8 +376,7 @@ def validate_provenance(
             raise ProvenanceError("active provenance seed.seed_id must be >= 1")
         if observed_array_task_id != observed_seed_id - 1:
             raise ProvenanceError("active provenance array task/seed mismatch")
-        if not isinstance(observed_seed_uid, str) or len(observed_seed_uid) != 64:
-            raise ProvenanceError("active provenance seed.seed_uid is invalid")
+        _sha256_text(observed_seed_uid, "active provenance seed.seed_uid")
     if seed_id is not None and observed_seed_id != int(seed_id):
         raise ProvenanceError("provenance seed.seed_id mismatch")
     if seed_uid is not None and str(observed_seed_uid or "") != str(seed_uid):
@@ -319,17 +390,45 @@ def validate_provenance(
     subspace = data.get("subspace")
     if not isinstance(subspace, dict):
         raise ProvenanceError("provenance subspace block must be an object")
-    try:
-        dimension = int(subspace.get("dimension"))
-    except (TypeError, ValueError) as exc:
-        raise ProvenanceError("provenance subspace.dimension must be an integer") from exc
-    if dimension < 0:
-        raise ProvenanceError("provenance subspace.dimension must be >= 0")
+    dimension = _exact_integer(
+        subspace.get("dimension"), "provenance subspace.dimension"
+    )
     neighbours = subspace.get("neighbour_frame_ids")
     if not isinstance(neighbours, list):
         raise ProvenanceError("provenance subspace.neighbour_frame_ids must be a list")
-    for value in neighbours:
-        _expect_int_or_none(value, "provenance subspace.neighbour_frame_ids")
+    neighbour_values = [
+        _exact_integer(value, "provenance subspace.neighbour_frame_ids")
+        for value in neighbours
+    ]
+    if len(neighbour_values) != len(set(neighbour_values)):
+        raise ProvenanceError("provenance subspace neighbour IDs contain duplicates")
+    eigenvalues = subspace.get("eigenvalues")
+    if not isinstance(eigenvalues, list):
+        raise ProvenanceError("provenance subspace.eigenvalues must be a list")
+    parsed_eigenvalues = [
+        _finite_number_or_none(value, "provenance subspace.eigenvalues")
+        for value in eigenvalues
+    ]
+    if any(value is None or value < 0.0 for value in parsed_eigenvalues):
+        raise ProvenanceError("provenance subspace eigenvalues must be non-negative")
+    if len(parsed_eigenvalues) < dimension:
+        raise ProvenanceError("provenance subspace has fewer eigenvalues than dimensions")
+    if not isinstance(subspace.get("mode_weighting_policy"), str) or not subspace.get(
+        "mode_weighting_policy"
+    ):
+        raise ProvenanceError("provenance subspace mode-weighting policy is invalid")
+    for optional_section in (
+        "ariadne",
+        "anti_overlap",
+        "error_calibration_input",
+        "phase_b",
+        "point_allocation",
+    ):
+        section = data.get(optional_section)
+        if section is not None and not isinstance(section, dict):
+            raise ProvenanceError(
+                "provenance " + optional_section + " must be an object or null"
+            )
 
     phase_b = data.get("phase_b")
     if require_phase_b_selected is not None:
@@ -564,7 +663,9 @@ def load_index(campaign_dir: Union[str, Path]) -> Dict[str, Any]:
         ) from exc
     if not isinstance(data, dict):
         raise ProvenanceError("seed_frame_id_index.json must be a JSON object")
-    schema = int(data.get("schema_version", -1))
+    schema = _exact_integer(
+        data.get("schema_version"), "seed_frame_id_index.json schema_version"
+    )
     if schema != INDEX_SCHEMA_VERSION:
         raise ProvenanceError(
             "seed_frame_id_index.json schema_version " + str(schema)
@@ -573,7 +674,13 @@ def load_index(campaign_dir: Union[str, Path]) -> Dict[str, Any]:
     records = data.get("records")
     if not isinstance(records, list):
         raise ProvenanceError("seed_frame_id_index.json `records` must be a list")
-    return data
+    normalised = [_normalise_index_record(record) for record in records]
+    keys = [(record["iteration"], record["pointdir_name"]) for record in normalised]
+    if len(keys) != len(set(keys)):
+        raise ProvenanceError("seed_frame_id_index.json contains duplicate point records")
+    if keys != sorted(keys):
+        raise ProvenanceError("seed_frame_id_index.json records are not canonically ordered")
+    return {"schema_version": INDEX_SCHEMA_VERSION, "records": normalised}
 
 
 def append_to_index(
@@ -582,6 +689,7 @@ def append_to_index(
     iteration: int,
     pointdir_name: str,
     seed_frame_id: Optional[int],
+    trajectory_sha256: str,
 ) -> Path:
     """add one (iteration, pointdir_name, seed_frame_id) record to the
     flat index file. the whole add is atomic.
@@ -602,6 +710,7 @@ def append_to_index(
             "seed_frame_id": (
                 int(seed_frame_id) if seed_frame_id is not None else None
             ),
+            "trajectory_sha256": str(trajectory_sha256),
         }],
     )
 
@@ -626,10 +735,15 @@ def _normalise_index_record(value: Any) -> Dict[str, Any]:
         raise ProvenanceError(
             "seed-frame index seed_frame_id must be a non-negative integer or null"
         )
+    trajectory_sha256 = _sha256_text(
+        value.get("trajectory_sha256"),
+        "seed-frame index trajectory_sha256",
+    )
     return {
         "iteration": int(iteration),
         "pointdir_name": pointdir_name,
         "seed_frame_id": None if frame_id is None else int(frame_id),
+        "trajectory_sha256": trajectory_sha256,
     }
 
 
@@ -684,11 +798,22 @@ def _resolved_reference_entries(reference_data_dir: Union[str, Path]):
 
 def seed_frame_ids_from_committed_pointdirs(
     reference_data_dir: Union[str, Path],
+    *,
+    expected_trajectory_sha256: Optional[str] = None,
 ) -> Set[int]:
     """Read seed frame IDs from the authoritative cumulative reference view."""
     out: Set[int] = set()
     for entry in _resolved_reference_entries(reference_data_dir):
         data = read_provenance(entry.pointdir_path)
+        observed_sha256 = _sha256_text(
+            data.get("trajectory_sha256"),
+            "committed provenance trajectory_sha256",
+        )
+        if (
+            expected_trajectory_sha256 is not None
+            and observed_sha256 != str(expected_trajectory_sha256)
+        ):
+            continue
         fid = (data.get("seed") or {}).get("frame_id")
         if isinstance(fid, int):
             out.add(int(fid))
@@ -706,6 +831,10 @@ def _records_from_committed_pointdirs(
             "iteration": int(entry.introduced_in_version),
             "pointdir_name": entry.pointdir_name,
             "seed_frame_id": int(fid) if isinstance(fid, int) else None,
+            "trajectory_sha256": _sha256_text(
+                data.get("trajectory_sha256"),
+                "committed provenance trajectory_sha256",
+            ),
         })
     return out
 
@@ -751,6 +880,8 @@ def repair_index_from_committed_pointdirs(
 def load_training_seed_frame_ids(
     campaign_dir: Union[str, Path],
     reference_data_dir: Optional[Union[str, Path]] = None,
+    *,
+    expected_trajectory_sha256: Optional[str] = None,
 ) -> Set[int]:
     """Return the set of stable trajectory frame_ids that have already been
     used as seeds for committed QM reference-data points.
@@ -770,11 +901,19 @@ def load_training_seed_frame_ids(
     data = load_index(campaign_dir)
     result: Set[int] = set()
     for rec in data.get("records", []):
+        if (
+            expected_trajectory_sha256 is not None
+            and rec["trajectory_sha256"] != str(expected_trajectory_sha256)
+        ):
+            continue
         fid = rec.get("seed_frame_id")
         if isinstance(fid, int):
             result.add(int(fid))
     if reference_data_dir is not None:
-        result |= seed_frame_ids_from_committed_pointdirs(reference_data_dir)
+        result |= seed_frame_ids_from_committed_pointdirs(
+            reference_data_dir,
+            expected_trajectory_sha256=expected_trajectory_sha256,
+        )
     return result
 
 
@@ -792,7 +931,7 @@ def load_training_seed_frame_ids(
 # crash is impossible.
 
 RECENT_SEEDS_FILENAME = "recent_seeds.json"
-RECENT_SEEDS_SCHEMA_VERSION = 1
+RECENT_SEEDS_SCHEMA_VERSION = 2
 DEFAULT_RECENT_SEEDS_COOLDOWN = 3
 
 
@@ -824,22 +963,70 @@ def load_recent_seeds_payload(campaign_dir: Union[str, Path]) -> Dict[str, Any]:
         ) from exc
     if not isinstance(data, dict):
         raise ProvenanceError("recent_seeds.json must be a JSON object")
-    schema = int(data.get("schema_version", -1))
+    schema = _exact_integer(
+        data.get("schema_version"), "recent_seeds.json schema_version"
+    )
     if schema != RECENT_SEEDS_SCHEMA_VERSION:
         raise ProvenanceError(
             "recent_seeds.json schema_version " + str(schema)
             + " != " + str(RECENT_SEEDS_SCHEMA_VERSION)
         )
+    cooldown = _exact_integer(data.get("cooldown"), "recent_seeds.json cooldown")
     if not isinstance(data.get("history"), list):
         raise ProvenanceError("recent_seeds.json `history` must be a list")
-    return data
+    history = []
+    previous_iteration = -1
+    for raw_entry in data["history"]:
+        if not isinstance(raw_entry, dict):
+            raise ProvenanceError("recent_seeds.json history entries must be objects")
+        iteration = _exact_integer(
+            raw_entry.get("iteration"), "recent_seeds.json iteration"
+        )
+        if iteration <= previous_iteration:
+            raise ProvenanceError(
+                "recent_seeds.json history must have strictly increasing iterations"
+            )
+        previous_iteration = iteration
+        frame_ids = raw_entry.get("frame_ids")
+        if not isinstance(frame_ids, list):
+            raise ProvenanceError("recent_seeds.json frame_ids must be a list")
+        parsed_frame_ids = [
+            _exact_integer(value, "recent_seeds.json frame_id")
+            for value in frame_ids
+        ]
+        if len(parsed_frame_ids) != len(set(parsed_frame_ids)):
+            raise ProvenanceError("recent_seeds.json contains duplicate frame IDs")
+        history.append({
+            "iteration": iteration,
+            "frame_ids": parsed_frame_ids,
+            "trajectory_sha256": _sha256_text(
+                raw_entry.get("trajectory_sha256"),
+                "recent_seeds.json trajectory_sha256",
+            ),
+        })
+    if len(history) > cooldown:
+        raise ProvenanceError("recent_seeds.json history exceeds its cooldown")
+    return {
+        "schema_version": RECENT_SEEDS_SCHEMA_VERSION,
+        "cooldown": cooldown,
+        "history": history,
+    }
 
 
-def load_recent_seed_frame_ids(campaign_dir: Union[str, Path]) -> Set[int]:
+def load_recent_seed_frame_ids(
+    campaign_dir: Union[str, Path],
+    *,
+    expected_trajectory_sha256: Optional[str] = None,
+) -> Set[int]:
     """Return the union of seed_frame_ids in the rolling cooldown cache."""
     data = load_recent_seeds_payload(campaign_dir)
     result: Set[int] = set()
     for entry in data.get("history", []):
+        if (
+            expected_trajectory_sha256 is not None
+            and entry["trajectory_sha256"] != str(expected_trajectory_sha256)
+        ):
+            continue
         for fid in entry.get("frame_ids", []):
             if isinstance(fid, int):
                 result.add(int(fid))
@@ -851,6 +1038,7 @@ def append_recent_seeds(
     *,
     iteration: int,
     frame_ids: Sequence[Optional[int]],
+    trajectory_sha256: str,
     cooldown: int = DEFAULT_RECENT_SEEDS_COOLDOWN,
 ) -> Path:
     """Append one (iteration, frame_ids) record and trim to the last
@@ -860,17 +1048,37 @@ def append_recent_seeds(
     # the cooldown cache would corrupt the history list.
     with _recent_seeds_lock(campaign_dir):
         data = load_recent_seeds_payload(campaign_dir)
-        clean: List[int] = [int(f) for f in frame_ids if isinstance(f, int)]
-        # if someone passes a negative cooldown, clamp to zero. python
-        # slicing has a sharp edge here -- lst[-0:] returns the WHOLE
-        # list, not the empty list you might guess. so without this clamp
-        # a negative number silently meant "keep everything forever".
-        cooldown = max(0, int(cooldown))
+        clean: List[int] = []
+        for frame_id in frame_ids:
+            if frame_id is None:
+                continue
+            clean.append(_exact_integer(frame_id, "recent seed frame_id"))
+        clean = sorted(set(clean))
+        iteration_value = _exact_integer(iteration, "recent seed iteration")
+        cooldown = _exact_integer(cooldown, "recent seed cooldown")
+        trajectory_digest = _sha256_text(
+            trajectory_sha256, "recent seed trajectory_sha256"
+        )
         data["cooldown"] = cooldown
-        data["history"].append({
-            "iteration": int(iteration),
+        history_by_iteration = {
+            int(entry["iteration"]): dict(entry)
+            for entry in data["history"]
+        }
+        new_entry = {
+            "iteration": iteration_value,
             "frame_ids": clean,
-        })
+            "trajectory_sha256": trajectory_digest,
+        }
+        existing = history_by_iteration.get(iteration_value)
+        if existing is not None and existing != new_entry:
+            raise ProvenanceError(
+                "conflicting recent-seed record for iteration "
+                + str(iteration_value)
+            )
+        history_by_iteration[iteration_value] = new_entry
+        data["history"] = [
+            history_by_iteration[key] for key in sorted(history_by_iteration)
+        ]
         if cooldown == 0:
             data["history"] = []
         elif len(data["history"]) > cooldown:

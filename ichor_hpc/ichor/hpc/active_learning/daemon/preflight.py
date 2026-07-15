@@ -55,7 +55,6 @@ class BackendAvailability:
     aimall: bool
     ferebus: bool
     ariadne: bool
-    polus_rs: bool
     pyferebus: bool
     bc: bool
     gaussian_binary: str
@@ -76,7 +75,6 @@ class BackendAvailability:
     gaussian_verified: bool = False
     gaussian_probe_error: str = ""
     ariadne_probe_error: str = ""
-    polus_rs_probe_error: str = ""
     pyferebus_probe_error: str = ""
 
     @property
@@ -85,7 +83,7 @@ class BackendAvailability:
             self.profile and self.sbatch and self.sacct and self.squeue and
             self.batch_python and self.gaussian and
             self.aimall and self.ferebus and self.ariadne and
-            self.polus_rs and self.pyferebus and self.bc
+            self.pyferebus and self.bc
         )
 
     @property
@@ -94,7 +92,7 @@ class BackendAvailability:
         for attr in (
             "profile", "sbatch", "sacct", "squeue", "batch_python",
             "gaussian", "aimall", "ferebus",
-            "ariadne", "polus_rs", "pyferebus", "bc",
+            "ariadne", "pyferebus", "bc",
         ):
             if not getattr(self, attr):
                 out.append(attr)
@@ -390,7 +388,6 @@ def check_backends() -> BackendAvailability:
             runtime_modules,
         )
     ariadne_status = submitted_imports["ariadne"]
-    polus_status = submitted_imports["polus_rs"]
     pyferebus_status = submitted_imports["pyferebus"]
     return BackendAvailability(
         profile=profile_ok,
@@ -401,7 +398,6 @@ def check_backends() -> BackendAvailability:
         aimall=bool(aim),
         ferebus=bool(fer),
         ariadne=bool(batch_python and ariadne_status["ok"]),
-        polus_rs=bool(batch_python and polus_status["ok"]),
         pyferebus=bool(batch_python and pyferebus_status["ok"]),
         bc=bool(bc),
         gaussian_binary=gauss,
@@ -421,7 +417,6 @@ def check_backends() -> BackendAvailability:
         gaussian_verified=bool(gauss_ok),
         gaussian_probe_error=str(gaussian_probe_error),
         ariadne_probe_error=str(ariadne_status.get("error") or ""),
-        polus_rs_probe_error=str(polus_status.get("error") or ""),
         pyferebus_probe_error=str(pyferebus_status.get("error") or ""),
     )
 
@@ -482,14 +477,6 @@ def missing_backend_message(avail: BackendAvailability) -> str:
             + (
                 avail.ariadne_probe_error
                 or "Install ARIADNE into the configured batch venv."
-            )
-        )
-    if not avail.polus_rs:
-        lines.append(
-            "  - polus_rs in the submitted Python environment. "
-            + (
-                avail.polus_rs_probe_error
-                or "Install POLUS into the configured batch venv."
             )
         )
     if not avail.pyferebus:

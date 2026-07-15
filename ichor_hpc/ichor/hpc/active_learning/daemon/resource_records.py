@@ -30,9 +30,9 @@ IMPLEMENTATION_IDENTITY_SCHEMA_VERSION = 1
 
 
 _BACKEND_SOURCE_FILES = {
-    "polus": (
+    "diversity": (
         "resource_solver.py",
-        "../sampling/polus_wrapper.py",
+        "../sampling/diversity.py",
         "../sampling/descriptors.py",
     ),
     "gaussian": (

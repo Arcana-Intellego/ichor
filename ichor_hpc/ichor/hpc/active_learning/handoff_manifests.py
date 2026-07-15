@@ -1,4 +1,4 @@
-"""Strict JSON contracts between ARIADNE, Phase B POLUS, and Gaussian.
+"""Strict JSON contracts between ARIADNE, Phase B diversity, and Gaussian.
 
 These manifests are deliberately small and daemon-owned.  They record the
 lineage that cannot be recovered safely from glob order once ARIADNE and
@@ -31,11 +31,11 @@ ARIADNE_BATCH_DECISION_SCHEMA_VERSION = 2
 ARIADNE_LANDING_AUDIT_FILENAME = "AUDIT.json"
 ARIADNE_LANDING_AUDIT_SCHEMA_VERSION = 3
 PHASE_A_SAMPLE_FILENAME = "SELECTION.json"
-PHASE_A_SAMPLE_SCHEMA_VERSION = 4
+PHASE_A_SAMPLE_SCHEMA_VERSION = 5
 PHASE_B_SELECTION_FILENAME = "SELECTION.json"
 PHASE_B_SELECTION_SCHEMA_VERSION = 4
 SEED_SELECTION_FILENAME = "SELECTION.json"
-SEED_SELECTION_SCHEMA_VERSION = 2
+SEED_SELECTION_SCHEMA_VERSION = 3
 SEED_SELECTION_DIAGNOSTICS_FILENAME = SEED_SELECTION_FILENAME
 SEED_SELECTION_DIAGNOSTICS_SCHEMA_VERSION = SEED_SELECTION_SCHEMA_VERSION
 ACQUISITION_MATURITY_AUDIT_FILENAME = ARIADNE_LANDING_AUDIT_FILENAME
@@ -384,21 +384,17 @@ def _finite_float(value: Any, *, allow_none: bool = False) -> Optional[float]:
 def _int_or_none(value: Any) -> Optional[int]:
     if value is None:
         return None
-    if isinstance(value, bool):
-        raise HandoffManifestError("expected integer or null, got bool")
-    try:
-        return int(value)
-    except (TypeError, ValueError) as exc:
-        raise HandoffManifestError("expected integer or null, got " + repr(value)) from exc
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise HandoffManifestError(
+            "expected exact JSON integer or null, got " + repr(value)
+        )
+    return int(value)
 
 
 def _required_int(value: Any, label: str) -> int:
-    if isinstance(value, bool):
-        raise HandoffManifestError(label + " must be an integer, got bool")
-    try:
-        return int(value)
-    except (TypeError, ValueError) as exc:
-        raise HandoffManifestError(label + " must be an integer") from exc
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise HandoffManifestError(label + " must be an exact JSON integer")
+    return int(value)
 
 
 def _json_number_or_none(value: Any) -> Optional[float]:
@@ -412,25 +408,15 @@ def _json_number_or_none(value: Any) -> Optional[float]:
 
 
 def _xyz_frame_count(path: Path, label: str) -> int:
+    from ichor.core.files.xyz.strict_xyz import read_xyz_frames
+
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
+        frames = read_xyz_frames(path)
+    except (OSError, ValueError) as exc:
         raise HandoffManifestError(label + " is unreadable: " + str(path)) from exc
-    cursor = 0
-    count = 0
-    while cursor < len(lines):
-        if not lines[cursor].strip():
-            cursor += 1
-            continue
-        try:
-            atom_count = int(lines[cursor].strip())
-        except ValueError as exc:
-            raise HandoffManifestError(label + " atom count is invalid") from exc
-        if atom_count <= 0 or cursor + atom_count + 2 > len(lines):
-            raise HandoffManifestError(label + " contains a truncated frame")
-        cursor += atom_count + 2
-        count += 1
-    return count
+    if any(len(frame) <= 0 for frame in frames):
+        raise HandoffManifestError(label + " contains an empty frame")
+    return len(frames)
 
 
 def resolve_handoff_path(
@@ -462,6 +448,150 @@ def resolve_handoff_path(
     return resolved
 
 
+def build_seed_selection_manifest(
+    *,
+    campaign_uid: str,
+    campaign_random_seed: int,
+    iteration: int,
+    models_version: int,
+    model_manifest_sha256: str,
+    trajectory_sha256: str,
+    selection_strategy: str,
+    seed_records: Sequence[Dict[str, Any]],
+    prior_mean_contract_sha256: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build the canonical schema-v3 seed-selection handoff."""
+    if not isinstance(campaign_uid, str) or not campaign_uid:
+        raise HandoffManifestError("seed selection campaign_uid is empty")
+    iteration_value = _required_int(iteration, "seed selection iteration")
+    model_version = _required_int(models_version, "seed selection models_version")
+    if iteration_value < 1 or model_version < 0:
+        raise HandoffManifestError("seed selection iteration/model version is invalid")
+    if selection_strategy not in {"hybrid_variance", "d_optimal"}:
+        raise HandoffManifestError("seed selection strategy is invalid")
+    for label, digest in (
+        ("model_manifest_sha256", model_manifest_sha256),
+        ("trajectory_sha256", trajectory_sha256),
+    ):
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise HandoffManifestError("seed selection " + label + " is invalid")
+    if prior_mean_contract_sha256 is not None and (
+        not isinstance(prior_mean_contract_sha256, str)
+        or len(prior_mean_contract_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in prior_mean_contract_sha256
+        )
+    ):
+        raise HandoffManifestError("seed selection prior-mean digest is invalid")
+
+    records: List[Dict[str, Any]] = []
+    for expected_seed_id, raw in enumerate(seed_records, start=1):
+        if not isinstance(raw, dict):
+            raise HandoffManifestError("seed selection records must be objects")
+        record = dict(raw)
+        seed_id = _required_int(record.get("seed_id"), "seed selection seed_id")
+        if seed_id != expected_seed_id:
+            raise HandoffManifestError("seed IDs must be contiguous from one")
+        frame_id = _int_or_none(record.get("frame_id"))
+        pool_row = _required_int(
+            record.get("pool_row_index_zero_based"),
+            "seed selection pool row",
+        )
+        if (frame_id is not None and frame_id < 0) or pool_row < 0:
+            raise HandoffManifestError("seed selection frame/pool row is negative")
+        origin = record.get("selection_origin")
+        if origin not in {
+            "bulk",
+            "variance",
+            "d_optimal",
+            "d_optimal_backfill",
+        }:
+            raise HandoffManifestError("seed selection origin is invalid")
+        record["seed_id"] = seed_id
+        record["frame_id"] = frame_id
+        record["pool_row_index_zero_based"] = pool_row
+        record["variance_at_selection"] = _finite_float(
+            record.get("variance_at_selection"),
+            allow_none=True,
+        )
+        record.pop("seed_uid", None)
+        records.append(record)
+    if not records:
+        raise HandoffManifestError("seed selection cannot be empty")
+    if len({record["pool_row_index_zero_based"] for record in records}) != len(records):
+        raise HandoffManifestError("seed selection contains duplicate pool rows")
+
+    from .randomness import derive_rng_seed
+
+    randomness = derive_rng_seed(
+        campaign_uid=campaign_uid,
+        campaign_random_seed=campaign_random_seed,
+        iteration=iteration_value,
+        phase="SEED_SELECT",
+        logical_task_id="seed-batch",
+        random_purpose="bulk-seed-selection",
+    )
+    rows_by_origin = {
+        origin: [
+            record["pool_row_index_zero_based"]
+            for record in records
+            if record["selection_origin"] == origin
+        ]
+        for origin in ("bulk", "variance", "d_optimal", "d_optimal_backfill")
+    }
+    ranked = (
+        rows_by_origin["variance"]
+        if selection_strategy == "hybrid_variance"
+        else rows_by_origin["d_optimal"] + rows_by_origin["d_optimal_backfill"]
+    )
+    payload: Dict[str, Any] = {
+        "schema_version": SEED_SELECTION_SCHEMA_VERSION,
+        "campaign_uid": campaign_uid,
+        "iteration": iteration_value,
+        "models_version": model_version,
+        "model_manifest_sha256": model_manifest_sha256,
+        "trajectory_sha256": trajectory_sha256,
+        "selection_strategy": selection_strategy,
+        "n_picked": len(records),
+        "frame_ids": [record["frame_id"] for record in records],
+        "indices": [record["pool_row_index_zero_based"] for record in records],
+        "bulk_indices": rows_by_origin["bulk"],
+        "variance_indices": ranked,
+        "d_optimal_indices": (
+            rows_by_origin["d_optimal"] + rows_by_origin["d_optimal_backfill"]
+        ),
+        "d_optimal_backfill_indices": rows_by_origin["d_optimal_backfill"],
+        "variances": [record["variance_at_selection"] for record in records],
+        "seed_records": records,
+        "randomness": randomness.to_dict(),
+    }
+    if prior_mean_contract_sha256 is not None:
+        payload["prior_mean_contract_sha256"] = prior_mean_contract_sha256
+        for record in records:
+            record["prior_mean_contract_sha256"] = prior_mean_contract_sha256
+
+    from .seed_identity import deterministic_seed_uid, selection_fingerprint_sha256
+
+    fingerprint = selection_fingerprint_sha256(payload)
+    payload["selection_fingerprint_sha256"] = fingerprint
+    for record in records:
+        record["seed_uid"] = deterministic_seed_uid(
+            campaign_uid=campaign_uid,
+            iteration=iteration_value,
+            seed_id=record["seed_id"],
+            frame_id=record["frame_id"],
+            models_version=model_version,
+            model_manifest_sha256=model_manifest_sha256,
+            selection_fingerprint_sha256_value=fingerprint,
+        )
+    return payload
+
+
 def load_seeds_picked(iter_dir: Any, *, expected_iteration: Optional[int] = None) -> Dict[str, Any]:
     """Read the authoritative one-based seed-selection manifest."""
     path = seeds_picked_path(iter_dir)
@@ -485,14 +615,33 @@ def load_seeds_picked(iter_dir: Any, *, expected_iteration: Optional[int] = None
             + " got "
             + str(iteration)
         )
-    if not str(data.get("campaign_uid") or ""):
+    campaign_uid = data.get("campaign_uid")
+    if not isinstance(campaign_uid, str) or not campaign_uid:
         raise HandoffManifestError("seed selection campaign_uid is empty")
+    from .randomness import validate_rng_derivation
+
+    try:
+        randomness = validate_rng_derivation(
+            data.get("randomness"),
+            expected_campaign_uid=campaign_uid,
+            expected_iteration=iteration,
+            expected_phase="SEED_SELECT",
+            expected_logical_task_id="seed-batch",
+            expected_random_purpose="bulk-seed-selection",
+        )
+    except ValueError as exc:
+        raise HandoffManifestError(
+            "seed selection randomness contract is invalid: " + str(exc)
+        ) from exc
     models_version = _required_int(
         data.get("models_version"),
         "seed selection models_version",
     )
     if models_version < 0:
         raise HandoffManifestError("seed selection models_version must be >= 0")
+    strategy = data.get("selection_strategy")
+    if strategy not in {"hybrid_variance", "d_optimal"}:
+        raise HandoffManifestError("seed selection strategy is invalid")
     for key in ("model_manifest_sha256", "trajectory_sha256"):
         value = str(data.get(key) or "")
         if len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
@@ -520,7 +669,13 @@ def load_seeds_picked(iter_dir: Any, *, expected_iteration: Optional[int] = None
         if frame_id is not None and frame_id < 0:
             raise HandoffManifestError("frame_id must be >= 0 or null")
         origin = str(raw.get("selection_origin") or "unknown")
-        if origin not in ("bulk", "variance", "d_optimal", "unknown"):
+        if origin not in (
+            "bulk",
+            "variance",
+            "d_optimal",
+            "d_optimal_backfill",
+            "unknown",
+        ):
             raise HandoffManifestError("unknown selection_origin: " + origin)
         record = dict(raw)
         seed_uid = str(raw.get("seed_uid") or "")
@@ -540,11 +695,96 @@ def load_seeds_picked(iter_dir: Any, *, expected_iteration: Optional[int] = None
             }
         )
         records.append(record)
+    record_pool_rows = [record["pool_row_index_zero_based"] for record in records]
+    if len(set(record_pool_rows)) != len(record_pool_rows):
+        raise HandoffManifestError("seed selection contains duplicate pool rows")
+    record_frame_ids = [record["frame_id"] for record in records]
+    raw_selected_indices = data.get("indices")
+    if not isinstance(raw_selected_indices, list):
+        raise HandoffManifestError("seed selection indices must be a list")
+    selected_indices = [
+        _required_int(value, "seed selection indices")
+        for value in raw_selected_indices
+    ]
+    if selected_indices != record_pool_rows:
+        raise HandoffManifestError("seed selection indices disagree with seed_records")
+    raw_frame_ids = data.get("frame_ids")
+    if not isinstance(raw_frame_ids, list):
+        raise HandoffManifestError("seed selection frame_ids must be a list")
+    selected_frame_ids = [
+        _int_or_none(value)
+        for value in raw_frame_ids
+    ]
+    if selected_frame_ids != record_frame_ids:
+        raise HandoffManifestError("seed selection frame_ids disagree with seed_records")
+    for key in (
+        "bulk_indices",
+        "variance_indices",
+        "d_optimal_indices",
+        "d_optimal_backfill_indices",
+    ):
+        raw_indices = data.get(key)
+        if not isinstance(raw_indices, list):
+            raise HandoffManifestError("seed selection " + key + " must be a list")
+        parsed_indices = [_required_int(value, "seed selection " + key) for value in raw_indices]
+        if any(value < 0 for value in parsed_indices):
+            raise HandoffManifestError("seed selection " + key + " contains a negative row")
+        if len(set(parsed_indices)) != len(parsed_indices):
+            raise HandoffManifestError("seed selection " + key + " contains duplicates")
+        if not set(parsed_indices).issubset(set(record_pool_rows)):
+            raise HandoffManifestError("seed selection " + key + " is not a selected-row subset")
+        data[key] = parsed_indices
+    origin_rows = {
+        origin: {
+            record["pool_row_index_zero_based"]
+            for record in records
+            if record["selection_origin"] == origin
+        }
+        for origin in ("bulk", "variance", "d_optimal", "d_optimal_backfill")
+    }
+    if set(data["bulk_indices"]) != origin_rows["bulk"]:
+        raise HandoffManifestError("seed selection bulk_indices disagree with origins")
+    expected_ranked_rows = (
+        origin_rows["variance"]
+        if strategy == "hybrid_variance"
+        else origin_rows["d_optimal"] | origin_rows["d_optimal_backfill"]
+    )
+    if set(data["variance_indices"]) != expected_ranked_rows:
+        raise HandoffManifestError("seed selection variance_indices disagree with origins")
+    if set(data["d_optimal_indices"]) != (
+        origin_rows["d_optimal"] | origin_rows["d_optimal_backfill"]
+    ):
+        raise HandoffManifestError("seed selection d_optimal_indices disagree with origins")
+    if set(data["d_optimal_backfill_indices"]) != origin_rows["d_optimal_backfill"]:
+        raise HandoffManifestError(
+            "seed selection d_optimal_backfill_indices disagree with origins"
+        )
+    from .seed_identity import deterministic_seed_uid, selection_fingerprint_sha256
+
+    observed_fingerprint = data.get("selection_fingerprint_sha256")
+    expected_fingerprint = selection_fingerprint_sha256(data)
+    if observed_fingerprint != expected_fingerprint:
+        raise HandoffManifestError("seed selection fingerprint mismatch")
+    for record in records:
+        expected_seed_uid = deterministic_seed_uid(
+            campaign_uid=campaign_uid,
+            iteration=iteration,
+            seed_id=record["seed_id"],
+            frame_id=record["frame_id"],
+            models_version=models_version,
+            model_manifest_sha256=str(data["model_manifest_sha256"]),
+            selection_fingerprint_sha256_value=expected_fingerprint,
+        )
+        if record["seed_uid"] != expected_seed_uid:
+            raise HandoffManifestError("seed selection seed_uid mismatch")
     out = dict(data)
     out["iteration"] = iteration
     out["models_version"] = models_version
+    out["selection_strategy"] = strategy
     out["n_picked"] = n_picked
-    out["frame_ids"] = [record.get("frame_id") for record in records]
+    out["indices"] = selected_indices
+    out["frame_ids"] = selected_frame_ids
+    out["randomness"] = randomness.to_dict()
     out["seed_records"] = records
     return out
 
@@ -1239,15 +1479,79 @@ def write_phase_a_sample_manifest(initial_dir: Any, payload: Dict[str, Any]) -> 
         raise HandoffManifestError("Phase A point-allocation targets mismatch")
     allocation_binding["targets"] = canonical_targets
     data["point_allocation"] = allocation_binding
+    from .acquisition.trajectory_pool import (
+        POOL_MANIFEST_FILENAME,
+        POOL_SUBDIR,
+        TrajectoryPool,
+    )
+
     source_pool_raw = data.get("source_pool_manifest")
-    if source_pool_raw:
-        source_pool = resolve_handoff_path(
-            campaign,
-            source_pool_raw,
-            kind="Phase A source pool manifest",
+    if not isinstance(source_pool_raw, str) or not source_pool_raw.strip():
+        raise HandoffManifestError(
+            "Phase A source_pool_manifest is required"
         )
-        data["source_pool_manifest_size"] = int(source_pool.stat().st_size)
-        data["source_pool_manifest_sha256"] = sha256_file(source_pool)
+    source_pool = resolve_handoff_path(
+        campaign,
+        source_pool_raw,
+        kind="Phase A source pool manifest",
+    )
+    expected_source_pool = (
+        campaign / POOL_SUBDIR / POOL_MANIFEST_FILENAME
+    ).resolve()
+    if source_pool != expected_source_pool:
+        raise HandoffManifestError(
+            "Phase A source pool manifest is not canonical"
+        )
+    try:
+        pool = TrajectoryPool.load(campaign)
+    except (OSError, ValueError) as exc:
+        raise HandoffManifestError(
+            "Phase A source trajectory pool is invalid: " + str(exc)
+        ) from exc
+    supplied_trajectory_sha = data.get("trajectory_sha256")
+    if (
+        supplied_trajectory_sha not in (None, "")
+        and str(supplied_trajectory_sha) != str(pool.sha256)
+    ):
+        raise HandoffManifestError("Phase A trajectory SHA mismatch")
+    supplied_pool_frames = data.get("n_pool_frames")
+    if (
+        supplied_pool_frames is not None
+        and _required_int(supplied_pool_frames, "Phase A n_pool_frames")
+        != int(pool.n_frames())
+    ):
+        raise HandoffManifestError("Phase A source pool frame-count mismatch")
+    selected = data.get("selected_indices")
+    if not isinstance(selected, list):
+        raise HandoffManifestError("Phase A selected_indices must be a list")
+    selected_pool_indices = [
+        _required_int(value, "Phase A selected_indices")
+        for value in selected
+        if value is not None
+    ]
+    if any(index >= int(pool.n_frames()) for index in selected_pool_indices):
+        raise HandoffManifestError(
+            "Phase A selected pool index is outside the source pool"
+        )
+    supplied_selected_pool = data.get("selected_pool_indices")
+    if supplied_selected_pool is not None:
+        if not isinstance(supplied_selected_pool, list):
+            raise HandoffManifestError(
+                "Phase A selected_pool_indices must be a list"
+            )
+        canonical_supplied = [
+            _required_int(value, "Phase A selected_pool_indices")
+            for value in supplied_selected_pool
+        ]
+        if canonical_supplied != selected_pool_indices:
+            raise HandoffManifestError(
+                "Phase A selected pool indexes disagree with selected_indices"
+            )
+    data["trajectory_sha256"] = str(pool.sha256)
+    data["n_pool_frames"] = int(pool.n_frames())
+    data["selected_pool_indices"] = selected_pool_indices
+    data["source_pool_manifest_size"] = int(source_pool.stat().st_size)
+    data["source_pool_manifest_sha256"] = sha256_file(source_pool)
     custom_bootstrap_raw = data.get("custom_bootstrap_manifest")
     if custom_bootstrap_raw:
         custom_bootstrap = resolve_handoff_path(
@@ -1282,7 +1586,7 @@ def read_phase_a_sample_manifest(
         raise HandoffManifestError("Phase A sample manifest must be a JSON object")
     if _required_int(data.get("schema_version", -1), "Phase A schema_version") != PHASE_A_SAMPLE_SCHEMA_VERSION:
         raise HandoffManifestError("unsupported Phase A sample manifest schema")
-    if str(data.get("phase")) != "PHASE_A_POLUS":
+    if str(data.get("phase")) != "PHASE_A_DIVERSITY":
         raise HandoffManifestError("Phase A sample manifest phase mismatch")
     if (
         expected_campaign_uid is not None
@@ -1292,6 +1596,10 @@ def read_phase_a_sample_manifest(
         raise HandoffManifestError("Phase A sample manifest campaign UID mismatch")
     if _required_int(data.get("iteration"), "Phase A iteration") != 0:
         raise HandoffManifestError("Phase A sample manifest iteration must be 0")
+    from .sampling.diversity_contract import selector_contract_matches
+
+    if not selector_contract_matches(data.get("selector")):
+        raise HandoffManifestError("Phase A selector contract is invalid")
     n_select = _required_int(data.get("n_select"), "Phase A n_select")
     if require_nonempty and n_select <= 0:
         raise HandoffManifestError("Phase A sample manifest n_select must be positive")
@@ -1329,32 +1637,31 @@ def read_phase_a_sample_manifest(
     if str(data.get("index_sha256") or "") != sha256_file(index_path):
         raise HandoffManifestError("Phase A index hash mismatch")
     selected = data.get("selected_indices")
-    if selected is not None:
-        if not isinstance(selected, list):
-            raise HandoffManifestError("Phase A selected_indices must be a list")
-        if len(selected) != n_select:
-            raise HandoffManifestError("Phase A selected_indices length mismatch")
-        seen = set()
-        for value in selected:
-            if value is None:
-                continue
-            idx = _required_int(value, "Phase A selected_indices")
-            if idx in seen:
-                raise HandoffManifestError("Phase A selected_indices contains duplicates")
-            seen.add(idx)
-        expected_index_lines = []
-        custom_number = 0
-        for value in selected:
-            if value is None:
-                expected_index_lines.append("custom:" + str(custom_number))
-                custom_number += 1
-            else:
-                expected_index_lines.append(str(int(value)))
-        observed_index_lines = index_path.read_text(encoding="utf-8").splitlines()
-        if observed_index_lines != expected_index_lines:
-            raise HandoffManifestError(
-                "Phase A index contents do not match selected_indices"
-            )
+    if not isinstance(selected, list):
+        raise HandoffManifestError("Phase A selected_indices must be a list")
+    if len(selected) != n_select:
+        raise HandoffManifestError("Phase A selected_indices length mismatch")
+    seen = set()
+    for value in selected:
+        if value is None:
+            continue
+        idx = _required_int(value, "Phase A selected_indices")
+        if idx in seen:
+            raise HandoffManifestError("Phase A selected_indices contains duplicates")
+        seen.add(idx)
+    expected_index_lines = []
+    custom_number = 0
+    for value in selected:
+        if value is None:
+            expected_index_lines.append("custom:" + str(custom_number))
+            custom_number += 1
+        else:
+            expected_index_lines.append(str(int(value)))
+    observed_index_lines = index_path.read_text(encoding="utf-8").splitlines()
+    if observed_index_lines != expected_index_lines:
+        raise HandoffManifestError(
+            "Phase A index contents do not match selected_indices"
+        )
     allocation = data.get("point_allocation")
     if not isinstance(allocation, dict):
         raise HandoffManifestError("Phase A point_allocation must be an object")
@@ -1424,22 +1731,67 @@ def read_phase_a_sample_manifest(
         raise HandoffManifestError("Phase A point-allocation targets mismatch")
     allocation = dict(allocation)
     allocation["manifest"] = str(allocation_manifest)
+    from .acquisition.trajectory_pool import (
+        POOL_MANIFEST_FILENAME,
+        POOL_SUBDIR,
+        TrajectoryPool,
+    )
+
     source_pool_raw = data.get("source_pool_manifest")
-    if source_pool_raw:
-        source_pool = resolve_handoff_path(
-            campaign,
-            source_pool_raw,
-            kind="Phase A source pool manifest",
+    if not isinstance(source_pool_raw, str) or not source_pool_raw.strip():
+        raise HandoffManifestError(
+            "Phase A source_pool_manifest is required"
         )
-        if _required_int(
-            data.get("source_pool_manifest_size"),
-            "Phase A source_pool_manifest_size",
-        ) != int(source_pool.stat().st_size):
-            raise HandoffManifestError("Phase A source pool size mismatch")
-        if str(data.get("source_pool_manifest_sha256") or "") != sha256_file(
-            source_pool
-        ):
-            raise HandoffManifestError("Phase A source pool hash mismatch")
+    source_pool = resolve_handoff_path(
+        campaign,
+        source_pool_raw,
+        kind="Phase A source pool manifest",
+    )
+    if source_pool != (campaign / POOL_SUBDIR / POOL_MANIFEST_FILENAME).resolve():
+        raise HandoffManifestError(
+            "Phase A source pool manifest is not canonical"
+        )
+    if _required_int(
+        data.get("source_pool_manifest_size"),
+        "Phase A source_pool_manifest_size",
+    ) != int(source_pool.stat().st_size):
+        raise HandoffManifestError("Phase A source pool size mismatch")
+    if str(data.get("source_pool_manifest_sha256") or "") != sha256_file(
+        source_pool
+    ):
+        raise HandoffManifestError("Phase A source pool hash mismatch")
+    try:
+        pool = TrajectoryPool.load(campaign)
+    except (OSError, ValueError) as exc:
+        raise HandoffManifestError(
+            "Phase A source trajectory pool is invalid: " + str(exc)
+        ) from exc
+    if str(data.get("trajectory_sha256") or "") != str(pool.sha256):
+        raise HandoffManifestError("Phase A trajectory SHA mismatch")
+    if _required_int(
+        data.get("n_pool_frames"), "Phase A n_pool_frames"
+    ) != int(pool.n_frames()):
+        raise HandoffManifestError("Phase A source pool frame-count mismatch")
+    selected_pool_indices = data.get("selected_pool_indices")
+    if not isinstance(selected_pool_indices, list):
+        raise HandoffManifestError(
+            "Phase A selected_pool_indices must be a list"
+        )
+    canonical_selected_pool = [
+        _required_int(value, "Phase A selected_pool_indices")
+        for value in selected_pool_indices
+    ]
+    expected_selected_pool = [
+        int(value) for value in selected if value is not None
+    ]
+    if canonical_selected_pool != expected_selected_pool:
+        raise HandoffManifestError(
+            "Phase A selected pool indexes disagree with selected_indices"
+        )
+    if any(index >= int(pool.n_frames()) for index in canonical_selected_pool):
+        raise HandoffManifestError(
+            "Phase A selected pool index is outside the source pool"
+        )
     custom_bootstrap_raw = data.get("custom_bootstrap_manifest")
     if custom_bootstrap_raw:
         custom_bootstrap = resolve_handoff_path(
@@ -1508,14 +1860,20 @@ def read_phase_b_selection_manifest(
         )
     root = Path(iter_dir)
     from .versioning.manifest import sha256_file
-    raw = data.get("raw")
+    considered = data.get("considered")
     final = data.get("final")
-    if not isinstance(raw, list):
-        raise HandoffManifestError("Phase B selection manifest raw must be a list")
+    if not isinstance(considered, list):
+        raise HandoffManifestError(
+            "Phase B selection manifest considered must be a list"
+        )
     if not isinstance(final, list):
         raise HandoffManifestError("Phase B selection manifest final must be a list")
-    if data.get("n_selected_raw") is not None and _required_int(data.get("n_selected_raw"), "Phase B n_selected_raw") != len(raw):
-        raise HandoffManifestError("Phase B n_selected_raw does not match raw length")
+    if data.get("n_considered") is not None and _required_int(
+        data.get("n_considered"), "Phase B n_considered"
+    ) != len(considered):
+        raise HandoffManifestError(
+            "Phase B n_considered does not match considered length"
+        )
     if data.get("n_kept") is not None and _required_int(data.get("n_kept"), "Phase B n_kept") != len(final):
         raise HandoffManifestError("Phase B n_kept does not match final length")
     source_manifest_raw = data.get("source_ariadne_manifest")
@@ -1587,8 +1945,12 @@ def read_phase_b_selection_manifest(
         allocation_payload.get("slot_assignment_sha256") or ""
     ):
         raise HandoffManifestError("Phase B point-allocation assignment mismatch")
+    from .sampling.diversity_contract import selector_contract_matches
+
+    if not selector_contract_matches(data.get("selector")):
+        raise HandoffManifestError("Phase B selector contract is invalid")
     normalised_bindings = {}
-    for label in ("selected_raw_xyz", "selected_xyz"):
+    for label in ("considered_candidates_xyz", "selected_xyz"):
         binding = data.get(label)
         if not isinstance(binding, dict):
             raise HandoffManifestError("Phase B " + label + " binding is missing")
@@ -1616,43 +1978,58 @@ def read_phase_b_selection_manifest(
         if str(binding.get("sha256") or "") != sha256_file(bound):
             raise HandoffManifestError("Phase B protocol " + label + " hash mismatch")
         normalised_protocol[label] = {**binding, "path": str(bound)}
-    seen_raw = set()
-    normalised_raw = []
-    raw_kept_final_indexes = set()
-    for raw_idx, rec in enumerate(raw):
+    seen_considered = set()
+    normalised_considered = []
+    considered_kept_final_indexes = set()
+    for considered_idx, rec in enumerate(considered):
         if not isinstance(rec, dict):
-            raise HandoffManifestError("Phase B raw record must be an object")
+            raise HandoffManifestError("Phase B considered record must be an object")
         out_rec = dict(rec)
-        declared_raw_rank = _required_int(out_rec.get("raw_rank"), "Phase B raw_rank")
-        if declared_raw_rank != raw_idx + 1:
-            raise HandoffManifestError("Phase B raw_rank values must be contiguous from one")
-        if declared_raw_rank in seen_raw:
-            raise HandoffManifestError("duplicate Phase B raw_rank")
-        seen_raw.add(declared_raw_rank)
-        kept = bool(out_rec.get("kept_after_dedup", False))
+        declared_considered_rank = _required_int(
+            out_rec.get("considered_rank"), "Phase B considered_rank"
+        )
+        if declared_considered_rank != considered_idx + 1:
+            raise HandoffManifestError(
+                "Phase B considered_rank values must be contiguous from one"
+            )
+        if declared_considered_rank in seen_considered:
+            raise HandoffManifestError("duplicate Phase B considered_rank")
+        seen_considered.add(declared_considered_rank)
+        kept_value = out_rec.get("kept_after_dedup")
+        if kept_value is not True and kept_value is not False:
+            raise HandoffManifestError(
+                "Phase B kept_after_dedup must be a JSON Boolean"
+            )
+        kept = kept_value is True
         final_rank_value = out_rec.get("final_rank")
         if kept:
             if final_rank_value is None:
-                raise HandoffManifestError("Phase B kept raw record has null final_rank")
-            raw_kept_final_indexes.add(_required_int(final_rank_value, "Phase B raw final_rank"))
+                raise HandoffManifestError(
+                    "Phase B kept considered record has null final_rank"
+                )
+            considered_kept_final_indexes.add(
+                _required_int(final_rank_value, "Phase B considered final_rank")
+            )
         elif final_rank_value is not None:
-            raise HandoffManifestError("Phase B dropped raw record has non-null final_rank")
+            raise HandoffManifestError(
+                "Phase B dropped considered record has non-null final_rank"
+            )
         for key in ("seed_dir", "result_json", "provenance_json", "output_manifest"):
             resolved = resolve_handoff_path(
                 root,
                 out_rec.get(key, ""),
-                kind="Phase B raw " + key,
+                kind="Phase B considered " + key,
                 directory=(key == "seed_dir"),
             )
             out_rec[key] = str(resolved)
         if str(out_rec.get("provenance_sha256") or "") != sha256_file(
             Path(out_rec["provenance_json"])
         ):
-            raise HandoffManifestError("Phase B raw provenance hash mismatch")
-        verify_source_record(out_rec, label="Phase B raw")
-        normalised_raw.append(out_rec)
+            raise HandoffManifestError("Phase B considered provenance hash mismatch")
+        verify_source_record(out_rec, label="Phase B considered")
+        normalised_considered.append(out_rec)
     seen_final = set()
-    seen_final_raw = set()
+    seen_final_considered = set()
     normalised_final = []
     for rec in final:
         if not isinstance(rec, dict):
@@ -1662,11 +2039,13 @@ def read_phase_b_selection_manifest(
         if final_rank in seen_final:
             raise HandoffManifestError("duplicate Phase B final_rank")
         seen_final.add(final_rank)
-        raw_rank = _required_int(out_rec.get("raw_rank"), "Phase B final raw_rank")
-        if raw_rank in seen_final_raw:
-            raise HandoffManifestError("duplicate Phase B final raw_rank")
-        seen_final_raw.add(raw_rank)
-        if not bool(out_rec.get("kept_after_dedup", False)):
+        considered_rank = _required_int(
+            out_rec.get("considered_rank"), "Phase B final considered_rank"
+        )
+        if considered_rank in seen_final_considered:
+            raise HandoffManifestError("duplicate Phase B final considered_rank")
+        seen_final_considered.add(considered_rank)
+        if out_rec.get("kept_after_dedup") is not True:
             raise HandoffManifestError("Phase B final record is not marked kept_after_dedup")
         for key in ("seed_dir", "result_json", "provenance_json", "output_manifest"):
             resolved = resolve_handoff_path(
@@ -1684,17 +2063,21 @@ def read_phase_b_selection_manifest(
         normalised_final.append(out_rec)
     if seen_final and sorted(seen_final) != list(range(1, len(seen_final) + 1)):
         raise HandoffManifestError("Phase B final_rank values must be contiguous from one")
-    if seen_final != raw_kept_final_indexes:
-        raise HandoffManifestError("Phase B final records do not match kept raw records")
-    kept_raw_indexes = {
-        _required_int(rec.get("raw_rank"), "Phase B kept raw_rank")
-        for rec in normalised_raw
-        if bool(rec.get("kept_after_dedup", False))
+    if seen_final != considered_kept_final_indexes:
+        raise HandoffManifestError(
+            "Phase B final records do not match kept considered records"
+        )
+    kept_considered_indexes = {
+        _required_int(rec.get("considered_rank"), "Phase B kept considered_rank")
+        for rec in normalised_considered
+        if rec.get("kept_after_dedup") is True
     }
-    if seen_final_raw != kept_raw_indexes:
-        raise HandoffManifestError("Phase B final raw_rank set does not match kept raw records")
+    if seen_final_considered != kept_considered_indexes:
+        raise HandoffManifestError(
+            "Phase B final considered_rank set does not match kept considered records"
+        )
     out = dict(data)
-    out["raw"] = normalised_raw
+    out["considered"] = normalised_considered
     out["final"] = normalised_final
     normalised_allocation = dict(allocation)
     normalised_allocation["manifest"] = str(allocation_manifest)
@@ -1707,42 +2090,23 @@ def read_phase_b_selection_manifest(
 
 
 def _read_xyz_geometry_records(path: Path) -> List[Dict[str, Any]]:
+    from ichor.core.files.xyz.strict_xyz import read_xyz_frames
+
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
+        frames = read_xyz_frames(path)
+    except (OSError, ValueError) as exc:
         raise HandoffManifestError("Phase B selected XYZ is unreadable: " + str(path)) from exc
-    records: List[Dict[str, Any]] = []
-    position = 0
-    while position < len(lines):
-        if not lines[position].strip():
-            position += 1
-            continue
-        try:
-            n_atoms = int(lines[position].strip())
-        except ValueError as exc:
-            raise HandoffManifestError("Phase B selected XYZ atom count is invalid") from exc
-        end = position + 2 + n_atoms
-        if n_atoms <= 0 or end > len(lines):
-            raise HandoffManifestError("Phase B selected XYZ frame is truncated")
-        atom_types: List[str] = []
-        coordinates: List[List[float]] = []
-        for line in lines[position + 2 : end]:
-            parts = line.split()
-            if len(parts) < 4:
-                raise HandoffManifestError("Phase B selected XYZ atom line is invalid")
-            atom_types.append(str(parts[0]))
-            coordinates.append(
-                [
-                    float(_finite_float(parts[1])),
-                    float(_finite_float(parts[2])),
-                    float(_finite_float(parts[3])),
-                ]
-            )
-        records.append({"atom_types": atom_types, "coordinates": coordinates})
-        position = end
-    if not records:
+    if not frames or any(len(frame) <= 0 for frame in frames):
         raise HandoffManifestError("Phase B selected XYZ contains no frames")
-    return records
+    return [
+        {
+            "atom_types": [str(atom.type) for atom in frame],
+            "coordinates": [
+                [float(atom.x), float(atom.y), float(atom.z)] for atom in frame
+            ],
+        }
+        for frame in frames
+    ]
 
 
 def validate_phase_b_handoff(

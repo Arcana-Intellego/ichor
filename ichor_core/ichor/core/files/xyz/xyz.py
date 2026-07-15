@@ -1,9 +1,10 @@
 from pathlib import Path
 from typing import Optional, Union
 
-from ichor.core.atoms import Atom, Atoms
+from ichor.core.atoms import Atoms
 from ichor.core.files.file import File, FileContents, ReadFile, WriteFile
 from ichor.core.files.file_data import HasAtoms
+from ichor.core.files.xyz.strict_xyz import read_xyz_frames
 
 
 class XYZ(HasAtoms, ReadFile, WriteFile, File):
@@ -27,22 +28,13 @@ class XYZ(HasAtoms, ReadFile, WriteFile, File):
 
     def _read_file(self):
         """Read a .xyz file and constructs the `self.atoms` attribute which is an instance of `Atoms`"""
-        with open(self.path, "r") as f:
-            natoms = int(next(f))
-            _ = next(f)  # blank line
-            read_atoms = Atoms()
-            for _ in range(natoms):
-                record = next(f).split()
-                read_atoms.add(
-                    Atom(
-                        record[0],
-                        float(record[1]),
-                        float(record[2]),
-                        float(record[3]),
-                    )
-                )
-
-        self.atoms = self.atoms or read_atoms
+        frames = read_xyz_frames(self.path)
+        if len(frames) != 1:
+            raise ValueError(
+                "single-frame XYZ reader expected exactly one frame, observed "
+                + str(len(frames))
+            )
+        self.atoms = self.atoms or frames[0]
 
     def _write_file(self, path: Path):
         """Write a .xyz to a given path. If no path is given,

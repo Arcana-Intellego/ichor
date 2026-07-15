@@ -38,8 +38,8 @@ def safe_component(value: Any, label: str) -> str:
 
 def backend_name(phase_name: str) -> str:
     phase = str(phase_name)
-    if phase in {"PHASE_A_POLUS", "PHASE_B_POLUS"}:
-        return "POLUS"
+    if phase in {"PHASE_A_DIVERSITY", "PHASE_B_DIVERSITY"}:
+        return "DIVERSITY"
     if "GAUSSIAN" in phase:
         return "GAUSSIAN"
     if "AIMALL" in phase:

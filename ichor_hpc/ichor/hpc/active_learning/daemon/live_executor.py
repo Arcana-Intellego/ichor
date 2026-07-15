@@ -11,7 +11,7 @@ but overrides the SBATCH phase submission to:
        canonical ICHOR data structures (PointsDirectory, Models, etc.).
 
 The per-phase output parsers below are real: they read the Gaussian /
-AIMAll / FEREBUS / ARIADNE / POLUS results into the canonical ICHOR data
+AIMAll / FEREBUS / ARIADNE / diversity results into the canonical ICHOR data
 structures.
 
 The wiring is verified via the smoke tests ('pytest -m live'), which
@@ -677,7 +677,7 @@ LIVE_POSTPROCESS_IMPLEMENTED: frozenset = frozenset({
     "INITIAL_REPLACEMENT_AIMALL", "REPLACEMENT_AIMALL",
     "INITIAL_FEREBUS", "FEREBUS",
     "ARIADNE_ARRAY",
-    "PHASE_A_POLUS", "PHASE_B_POLUS",
+    "PHASE_A_DIVERSITY", "PHASE_B_DIVERSITY",
 })
 
 
@@ -1090,7 +1090,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
     def handle_failure(self, state, phase, observations) -> FailureAction:
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
-        if phase_name in ("ARIADNE_ARRAY", "PHASE_B_POLUS"):
+        if phase_name in ("ARIADNE_ARRAY", "PHASE_B_DIVERSITY"):
             return FailureAction.HALT
         return super().handle_failure(state, phase, observations)
 
@@ -1324,7 +1324,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
     def _array_size_after_staging(self, phase_name, state):
         """Stage this phase's per-point inputs and return the SLURM array size.
-        None for single-job phases (FEREBUS / POLUS) so no --array is emitted."""
+        None for single-job phases (FEREBUS / diversity) so no --array is emitted."""
         from . import input_staging as _stg
         camp = Path(self.campaign_dir)
         it = int(state.iteration)
@@ -1333,7 +1333,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             if self.partition is not None
             else str(self.config.resources.partition_for(phase_name))
         )
-        if phase_name == "PHASE_A_POLUS":
+        if phase_name == "PHASE_A_DIVERSITY":
             from .pool_feasibility import require_pool_feasibility
 
             feasibility = require_pool_feasibility(camp, self.config)
@@ -1351,7 +1351,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             )
             if sample is None:
                 raise BackendSubmissionError(
-                    "no POLUS sample to stage for " + phase_name
+                    "no diversity sample to stage for " + phase_name
                 )
             _, n = _stg.stage_gaussian_inputs(
                 camp,
@@ -1968,13 +1968,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         upsert_index_records(
             self.campaign_dir,
             records=[
-                {
-                    "iteration": int(target_version),
-                    "pointdir_name": pdir_name,
-                    "seed_frame_id": self._read_seed_frame_id_from_pointdir(
-                        committed_iter_dir / pdir_name
-                    ),
-                }
+                self._seed_index_record_from_pointdir(
+                    committed_iter_dir / pdir_name,
+                    iteration=int(target_version),
+                    pointdir_name=pdir_name,
+                )
                 for pdir_name in committed_names
             ],
         )
@@ -2469,8 +2467,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             "INITIAL_FEREBUS":  self._parse_ferebus_postprocess,
             "FEREBUS":          self._parse_ferebus_postprocess,
             "ARIADNE_ARRAY":    self._parse_ariadne_array_postprocess,
-            "PHASE_A_POLUS":    self._parse_polus_postprocess,
-            "PHASE_B_POLUS":    self._parse_polus_postprocess,
+            "PHASE_A_DIVERSITY":    self._parse_diversity_postprocess,
+            "PHASE_B_DIVERSITY":    self._parse_diversity_postprocess,
         }
 
     # --- quantum-phase parser body ----------------------------
@@ -4429,10 +4427,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         )
 
 
-    #-- POLUS parser body --------------------------------------
+    #-- Diversity parser body ----------------------------------
 
-    def _parse_polus_postprocess(self, state, phase, observations):
-        """Parse the POLUS Phase-A or Phase-B sample output.
+    def _parse_diversity_postprocess(self, state, phase, observations):
+        """Parse the Phase A or Phase B diversity sample output.
 
         Phase A reads .DATA/BOOTSTRAP/selection/SELECTION.json. Phase B validates
         ACTIVE_LEARNING/iteration-NNNNNN/phase_b/SELECTION.json and its
@@ -4447,7 +4445,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
 
-        if phase_name == "PHASE_A_POLUS":
+        if phase_name == "PHASE_A_DIVERSITY":
             from ..layout import bootstrap_selection_dir
 
             outdir = bootstrap_selection_dir(self.campaign_dir)
@@ -4507,11 +4505,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             return PhaseResult(
                 is_complete=True,
                 failure_reason=(
-                    "polus_sample_unreadable_or_empty: " + str(sample)
+                    "diversity_sample_unreadable_or_empty: " + str(sample)
                 ),
             )
 
-        if phase_name == "PHASE_A_POLUS":
+        if phase_name == "PHASE_A_DIVERSITY":
             expected = int(phase_a_manifest.get("n_select", 0))
             declared = phase_a_manifest.get("n_frames")
             if int(n_frames) != expected or (
@@ -4527,7 +4525,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     ),
                 )
 
-        if phase_name == "PHASE_B_POLUS":
+        if phase_name == "PHASE_B_DIVERSITY":
             final_records = list(phase_b_manifest.get("final", []))
             if int(n_frames) != len(final_records):
                 return PhaseResult(
@@ -4542,7 +4540,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
         # if the Phase-B dedup ran, surface its counts in the journal.
         dedup_payload = {}
-        if phase_name == "PHASE_B_POLUS":
+        if phase_name == "PHASE_B_DIVERSITY":
             d = phase_b_manifest.get("dedup", {}) if isinstance(phase_b_manifest, dict) else {}
             if isinstance(d, dict):
                 relaxation = d.get("relaxation") if isinstance(d.get("relaxation"), dict) else {}
@@ -4562,10 +4560,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         phase=phase_name,
                         iteration=int(state.iteration),
                         reason=str(relaxation.get("reason", "unknown")),
-                        kept_raw_index=int(relaxation.get("kept_raw_index", -1)),
-                        distance_to_nearest_angstrom=relaxation.get(
-                            "distance_to_nearest_angstrom"
-                        ),
+                        n_admitted=int(relaxation.get("n_admitted", 0)),
                         effective_min_separation_angstrom=relaxation.get(
                             "effective_min_separation_angstrom"
                         ),
@@ -4581,70 +4576,33 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         return PhaseResult(is_complete=True, state_updates={})
 
     def _count_xyz_frames(self, sample_path):
-        """Count frames in an xyz file by reading natom  blocks.
+        """Count complete positive-cardinality frames using the strict parser."""
+        from ichor.core.files.xyz.strict_xyz import read_xyz_frames
 
-        Returns None if the file is unreadable or malformed; an integer
-        otherwise.  On CSF4 the real POLUS
-        output passes Trajectory.read trivially. We dont require ASE-
-        valid xyz here because POLUS may emit a minimal subset.
-        """
-        from pathlib import Path as _Path
         try:
-            text = _Path(sample_path).read_text(encoding="utf-8")
-        except OSError:
+            frames = read_xyz_frames(sample_path)
+        except (OSError, ValueError):
             return None
-        lines = text.splitlines()
-        i = 0
-        count = 0
-        while i < len(lines):
-            line = lines[i].strip()
-            if not line or line.startswith("#"):
-                i += 1
-                continue
-            try:
-                natoms = int(line)
-            except ValueError:
-                i += 1
-                continue
-            if natoms <= 0:
-                return None
-            i += 2 + natoms
-            if i > len(lines):
-                return None
-            count += 1
-        return count
+        if any(len(frame) <= 0 for frame in frames):
+            return None
+        return len(frames)
 
     def _read_xyz_records(self, sample_path):
-        from pathlib import Path as _Path
+        from ichor.core.files.xyz.strict_xyz import read_xyz_frames
 
-        text = _Path(sample_path).read_text(encoding="utf-8")
-        lines = text.splitlines()
-        frames = []
-        i = 0
-        while i < len(lines):
-            line = lines[i].strip()
-            if not line or line.startswith("#"):
-                i += 1
-                continue
-            try:
-                natoms = int(line)
-            except ValueError:
-                raise ValueError("XYZ frame atom count is not an integer")
-            if natoms <= 0:
-                raise ValueError("XYZ frame atom count must be positive")
-            if i + 2 + natoms > len(lines):
-                raise ValueError("XYZ frame is truncated")
-            atoms = []
-            coords = []
-            for raw in lines[i + 2 : i + 2 + natoms]:
-                parts = raw.split()
-                if len(parts) < 4:
-                    raise ValueError("XYZ atom line has fewer than four columns")
-                atoms.append(str(parts[0]))
-                coords.append([float(parts[1]), float(parts[2]), float(parts[3])])
-            frames.append({"atom_types": atoms, "coordinates": coords})
-            i += 2 + natoms
-        return frames
+        parsed = read_xyz_frames(sample_path)
+        if any(len(frame) <= 0 for frame in parsed):
+            raise ValueError("XYZ frames must contain at least one atom")
+        return [
+            {
+                "atom_types": [str(atom.type) for atom in frame],
+                "coordinates": [
+                    [float(atom.x), float(atom.y), float(atom.z)]
+                    for atom in frame
+                ],
+            }
+            for frame in parsed
+        ]
 
     def _phase_b_sample_coordinate_mismatch(self, sample_path, final_records):
         from ..strict_json import strict_json as _json
@@ -5237,11 +5195,11 @@ def build_sbatch_script(
         *["module load " + m for m in _configured_daemon_runtime_modules()],
         "",
     ]
-    if str(resolved.backend) == "polus":
+    if str(resolved.backend) == "diversity":
         lines += [
-            "export ICHOR_POLUS_DISTANCE_STORE_MODE="
+            "export ICHOR_DIVERSITY_DISTANCE_STORE_MODE="
             + _shell_quote(str(resolved.extra.get("distance_store_mode", "memory"))),
-            "export ICHOR_POLUS_SCRATCH_REQUIRED_BYTES="
+            "export ICHOR_DIVERSITY_SCRATCH_REQUIRED_BYTES="
             + str(
                 int(
                     resolved.extra.get("scratch_required_bytes", 0)
@@ -5302,8 +5260,8 @@ def build_sbatch_script(
             config,
             array_task_map=array_task_map,
         )
-    elif phase_name in ("PHASE_A_POLUS", "PHASE_B_POLUS"):
-        lines += _polus_invocation_block(phase_name, iteration, camp, config)
+    elif phase_name in ("PHASE_A_DIVERSITY", "PHASE_B_DIVERSITY"):
+        lines += _diversity_invocation_block(phase_name, iteration, camp, config)
     else:
         lines.append("# No invocation block registered for phase " + phase_name)
         lines.append("exit 1")
@@ -5577,23 +5535,23 @@ def _ariadne_invocation_block(
     ]
 
 
-def _polus_invocation_block(phase_name, iteration, camp, config) -> List[str]:
+def _diversity_invocation_block(phase_name, iteration, camp, config) -> List[str]:
     descriptor = (
         "rmsd_massweight"
-        if phase_name == "PHASE_A_POLUS"
+        if phase_name == "PHASE_A_DIVERSITY"
         else config.phase_b.descriptor
     )
-    wrapper_iteration = 0 if phase_name == "PHASE_A_POLUS" else int(iteration)
+    wrapper_iteration = 0 if phase_name == "PHASE_A_DIVERSITY" else int(iteration)
     python = _python_executable_for_script()
     camp_q = _shell_quote(camp)
     return [
-        "# POLUS diversity sub-sample (" + phase_name + ").",
+        "# ICHOR exact diversity selection (" + phase_name + ").",
         "export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1",
         "cd " + camp_q,
-        python + " -m ichor.hpc.active_learning.sampling.polus_wrapper \\",
+        python + " -m ichor.hpc.active_learning.sampling.diversity \\",
         "    --descriptor " + _shell_quote(descriptor) + " \\",
         "    --iteration " + str(wrapper_iteration) + " \\",
         "    --campaign-dir " + camp_q + " \\",
         '    --workers "$ICHOR_ACTIVE_WORKERS" \\',
-        '    --distance-store "$ICHOR_JOB_SCRATCH/polus-condensed.float64"',
+        '    --distance-store "$ICHOR_JOB_SCRATCH/diversity-condensed.float64"',
     ]

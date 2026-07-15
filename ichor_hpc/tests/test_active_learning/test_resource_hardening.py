@@ -40,7 +40,7 @@ from ichor.hpc.active_learning.sampling.descriptors import (
     MassWeightedRMSDDescriptor,
     build_condensed_distance_store,
 )
-from ichor.hpc.active_learning.sampling.polus_wrapper import fps_select
+from ichor.hpc.active_learning.sampling.diversity import fps_select
 from ichor.core.atoms import Atom, Atoms
 
 
@@ -69,23 +69,24 @@ def _write_pool(source: Path, n_frames: int) -> None:
     source.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
 
-def _write_empty_committed_bootstrap(campaign: Path) -> None:
-    root = campaign / ".DATA" / "ACTIVE_LEARNING" / "bootstrap_inputs"
-    root.mkdir(parents=True)
-    embedded = {
-        "schema_version": 1,
-        "confirmed": True,
-        "excluded_pool_frame_ids": [],
-        "sources": {},
-        "model": None,
-    }
-    atomic_write_json(root / "CUSTOM_BOOTSTRAP.json", embedded)
-    pointer = dict(embedded)
-    pointer["bootstrap_inputs_root"] = (
-        root.resolve().relative_to(campaign.resolve()).as_posix()
+def _write_empty_committed_bootstrap(
+    campaign: Path,
+    config: CampaignConfig,
+) -> None:
+    from ichor.hpc.active_learning.custom_bootstrap import (
+        commit_bootstrap_plan,
+        inspect_bootstrap_inputs,
     )
-    active = campaign / ".DATA" / "ACTIVE_LEARNING"
-    atomic_write_json(active / "CUSTOM_BOOTSTRAP.json", pointer)
+
+    pool = TrajectoryPool.load(campaign)
+    commit_bootstrap_plan(
+        inspect_bootstrap_inputs(
+            campaign,
+            config,
+            pool.to_atoms_list(),
+            pool_sha256=pool.sha256,
+        )
+    )
 
 
 def test_phase_a_uses_manifest_verified_root_pool_not_data_copy(
@@ -97,13 +98,17 @@ def test_phase_a_uses_manifest_verified_root_pool_not_data_copy(
     source = tmp_path / "source.xyz"
     _write_pool(source, 3)
     TrajectoryPool.import_from(source, campaign)
-    _write_empty_committed_bootstrap(campaign)
+    config = CampaignConfig()
+    config.point_allocation.bootstrap_training_size = 1
+    config.point_allocation.bootstrap_internal_validation_size = 1
+    config.point_allocation.bootstrap_external_validation_size = 1
+    _write_empty_committed_bootstrap(campaign, config)
     stale = campaign / ".DATA" / "TRAJECTORY" / "pool.xyz"
     _write_pool(stale, 20)
 
     resolved = resource_solver.resolve_phase_resources(
-        phase_name="PHASE_A_POLUS",
-        config=CampaignConfig(),
+        phase_name="PHASE_A_DIVERSITY",
+        config=config,
         partition="multicore",
         campaign_dir=campaign,
         require_evidence=True,
@@ -123,7 +128,7 @@ def test_polus_ten_thousand_frame_formula_resolves_ten_workers(resource_profile)
         "atom_order": ["O", "H", "H"],
     }
     resolved = resource_solver.resolve_phase_resources(
-        phase_name="PHASE_A_POLUS",
+        phase_name="PHASE_A_DIVERSITY",
         config=CampaignConfig(),
         partition="multicore",
         campaign_dir=None,
@@ -152,7 +157,7 @@ def test_polus_large_store_falls_back_to_campaign_scratch(
         lambda _path: SimpleNamespace(free=10**15),
     )
     resolved = resource_solver.resolve_phase_resources(
-        phase_name="PHASE_A_POLUS",
+        phase_name="PHASE_A_DIVERSITY",
         config=CampaignConfig(),
         partition="multicore",
         campaign_dir=Path.cwd(),
@@ -180,8 +185,8 @@ def test_polus_large_store_falls_back_to_campaign_scratch(
 @pytest.mark.parametrize(
     "phase",
     [
-        "PHASE_A_POLUS",
-        "PHASE_B_POLUS",
+        "PHASE_A_DIVERSITY",
+        "PHASE_B_DIVERSITY",
         "INITIAL_GAUSSIAN",
         "INITIAL_AIMALL",
         "ARIADNE_ARRAY",
@@ -199,7 +204,7 @@ def test_live_resource_resolution_rejects_missing_backend_evidence(
             config=CampaignConfig(),
             partition="multicore",
             campaign_dir=tmp_path,
-            iteration=1 if phase in {"PHASE_B_POLUS", "ARIADNE_ARRAY"} else 0,
+            iteration=1 if phase in {"PHASE_B_DIVERSITY", "ARIADNE_ARRAY"} else 0,
             require_evidence=True,
         )
 
@@ -548,14 +553,14 @@ def test_attempt_bundle_caps_each_log_directory_and_records_retry_map(tmp_path):
 def test_resource_resolution_is_immutable_and_digest_verified(tmp_path):
     resolved = SimpleNamespace(
         to_dict=lambda: {
-            "backend": "POLUS",
+            "backend": "DIVERSITY",
             "cpus_per_task": 2,
             "mem_per_cpu": "4G",
         }
     )
     payload = resolution_payload(
         campaign_uid="uid",
-        phase_name="PHASE_A_POLUS",
+        phase_name="PHASE_A_DIVERSITY",
         iteration=0,
         attempt_id="attempt",
         submission_identity="r0000-a0001-deadbeef",
@@ -566,9 +571,9 @@ def test_resource_resolution_is_immutable_and_digest_verified(tmp_path):
     binding = write_resolution(tmp_path, payload)
     verified = verify_resolution(binding["path"], binding["sha256"])
     assert verified == read_resolution(binding["path"])
-    assert verified["implementation_identity"]["backend"] == "polus"
+    assert verified["implementation_identity"]["backend"] == "diversity"
     changed = dict(payload)
-    changed["resources"] = {"backend": "POLUS", "cpus_per_task": 3}
+    changed["resources"] = {"backend": "DIVERSITY", "cpus_per_task": 3}
     with pytest.raises(ValueError, match="different content"):
         write_resolution(tmp_path, changed)
     assert read_resolution(binding["path"])["attempt_id"] == "attempt"

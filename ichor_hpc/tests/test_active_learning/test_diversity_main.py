@@ -1,4 +1,4 @@
-"""Tests for the polus_wrapper main(argv) Phase A + Phase B bodies.
+"""Tests for the diversity main(argv) Phase A + Phase B bodies.
 """
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from ichor.hpc.active_learning.layout import (
 )
 
 
-MODULE = "ichor.hpc.active_learning.sampling.polus_wrapper"
+MODULE = "ichor.hpc.active_learning.sampling.diversity"
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "water_tetramer.xyz"
 
 
@@ -54,7 +54,7 @@ def _import_pool(campaign, source):
 
 def _write_custom_training_from_fixture(campaign, n_frames=1):
     from ichor.core.files.xyz import Trajectory
-    from ichor.hpc.active_learning.sampling.polus_wrapper import _write_xyz_file
+    from ichor.hpc.active_learning.sampling.diversity import _write_xyz_file
 
     traj = Trajectory(FIXTURE)
     traj.read()
@@ -93,7 +93,7 @@ def _run(args):
                 from ichor.hpc.active_learning.daemon.state import CampaignPhase
 
                 state.campaign_uid = "test"
-                state.phase = CampaignPhase.PHASE_B_POLUS
+                state.phase = CampaignPhase.PHASE_B_DIVERSITY
                 state.iteration = iteration
                 state.reference_data_version = 0
                 state.models_version = 0
@@ -136,7 +136,7 @@ def test_phase_a_writes_sample_and_index(tmp_path):
     for ln in idx_lines:
         assert ln.strip().isdigit()
     manifest = json.loads((outdir / PHASE_A_SAMPLE_FILENAME).read_text(encoding="utf-8"))
-    assert manifest["phase"] == "PHASE_A_POLUS"
+    assert manifest["phase"] == "PHASE_A_DIVERSITY"
     assert manifest["iteration"] == 0
     assert manifest["n_select"] == 7
     assert manifest["n_frames"] == 7
@@ -297,15 +297,12 @@ def _write_ariadne_manifest(iter_dir):
     from ichor.hpc.active_learning.daemon.state import atomic_write_json
     from ichor.hpc.active_learning.handoff_manifests import (
         ARIADNE_RESULTS_SCHEMA_VERSION,
+        build_seed_selection_manifest,
         seeds_picked_path,
         write_ariadne_results_manifest,
     )
     from ichor.hpc.active_learning.layout import active_ariadne_dir
-    from ichor.hpc.active_learning.seed_identity import (
-        deterministic_seed_uid,
-        selection_fingerprint_sha256,
-        write_ariadne_task_map,
-    )
+    from ichor.hpc.active_learning.seed_identity import write_ariadne_task_map
     from ichor.hpc.active_learning.versioning.manifest import sha256_file
     from ichor.hpc.active_learning.versioning.provenance import (
         PROVENANCE_FILENAME,
@@ -314,16 +311,16 @@ def _write_ariadne_manifest(iter_dir):
 
     ariadne_root = active_ariadne_dir(iter_dir)
     seed_dirs = sorted((ariadne_root / "seeds").glob("seed-*"))
-    selection = {
-        "schema_version": 2,
-        "campaign_uid": "test",
-        "iteration": 1,
-        "models_version": 0,
-        "model_manifest_sha256": "c" * 64,
-        "trajectory_sha256": "0" * 64,
-        "selection_strategy": "hybrid_variance",
-        "n_picked": len(seed_dirs),
-        "seed_records": [
+    frame_ids = list(range(len(seed_dirs)))
+    selection = build_seed_selection_manifest(
+        campaign_uid="test",
+        campaign_random_seed=0,
+        iteration=1,
+        models_version=0,
+        model_manifest_sha256="c" * 64,
+        trajectory_sha256="0" * 64,
+        selection_strategy="hybrid_variance",
+        seed_records=[
             {
                 "seed_id": seed_id,
                 "frame_id": seed_id - 1,
@@ -333,19 +330,7 @@ def _write_ariadne_manifest(iter_dir):
             }
             for seed_id in range(1, len(seed_dirs) + 1)
         ],
-    }
-    fingerprint = selection_fingerprint_sha256(selection)
-    selection["selection_fingerprint_sha256"] = fingerprint
-    for record in selection["seed_records"]:
-        record["seed_uid"] = deterministic_seed_uid(
-            campaign_uid="test",
-            iteration=1,
-            seed_id=int(record["seed_id"]),
-            frame_id=int(record["frame_id"]),
-            models_version=0,
-            model_manifest_sha256="c" * 64,
-            selection_fingerprint_sha256_value=fingerprint,
-        )
+    )
     selection_path = seeds_picked_path(iter_dir)
     selection_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(selection_path, selection)
@@ -533,7 +518,7 @@ def test_phase_b_writes_sample_and_dedup(tmp_path):
     ])
     assert result.returncode == 0, result.stderr
     phase_b_dir = active_phase_b_dir(iter_dir)
-    raw = phase_b_dir / "selected_raw.xyz"
+    raw = phase_b_dir / "considered_candidates.xyz"
     final = phase_b_dir / "selected.xyz"
     dedup = phase_b_dir / "SELECTION.json"
     assert raw.is_file()
@@ -545,9 +530,9 @@ def test_phase_b_writes_sample_and_dedup(tmp_path):
     # regardless of the geometry novelty-derived default minimum separation.
     assert d["n_dropped"] == 0
     assert d["min_separation"] == 0.025
-    assert "distance_to_nearest_angstrom" in manifest["raw"][0]
-    assert "scaled_distance_to_nearest" in manifest["raw"][0]
-    assert "novelty_score" in manifest["raw"][0]
+    assert "distance_to_nearest_angstrom" in manifest["considered"][0]
+    assert "scaled_distance_to_nearest" in manifest["considered"][0]
+    assert "novelty_score" in manifest["considered"][0]
 
 
 def test_phase_b_rejects_unsafe_accepted_landing_before_fps(tmp_path):
@@ -643,7 +628,7 @@ def test_phase_b_rejects_all_missing_landing_safety_by_default(tmp_path):
     assert not (active_phase_b_dir(iter_dir) / "selected_raw.xyz").exists()
 
 
-def test_phase_b_accepts_all_missing_landing_safety_with_legacy_override(tmp_path):
+def test_phase_b_rejects_missing_landing_safety_even_with_stale_legacy_flag(tmp_path):
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
@@ -675,11 +660,8 @@ def test_phase_b_accepts_all_missing_landing_safety_with_legacy_override(tmp_pat
         "--campaign-dir", str(campaign),
     ])
 
-    assert result.returncode == 0, result.stderr
-    manifest = json.loads(
-        (active_phase_b_dir(iter_dir) / "SELECTION.json").read_text(encoding="utf-8")
-    )
-    assert manifest["safety_filter"]["legacy_missing_safety"] is True
+    assert result.returncode == 3
+    assert "missing_landing_safety" in result.stderr
 
 
 def test_phase_b_all_unsafe_candidates_halts_before_gaussian_handoff(tmp_path):
@@ -724,6 +706,7 @@ def test_phase_b_no_seeds_returns_3(tmp_path):
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
+    cfg.phase_b.descriptor = "rmsd_massweight"
     cfg.to_yaml(campaign / "campaign.yaml")
     iter_dir = _active_iter(campaign)
     ariadne_seeds_dir(iter_dir).mkdir(parents=True)
@@ -736,12 +719,11 @@ def test_phase_b_no_seeds_returns_3(tmp_path):
     assert "ARIADNE results manifest" in result.stderr
 
 
-def test_phase_b_ignores_hidden_descriptor_override_single_candidate(tmp_path):
-    """The sampling protocol owns the effective Phase B descriptor."""
+def test_phase_b_uses_public_configured_descriptor_single_candidate(tmp_path):
     campaign = tmp_path / "c"
     campaign.mkdir()
     cfg = CampaignConfig()
-    cfg.phase_b.descriptor = "acquisition_weighted"
+    cfg.phase_b.descriptor = "rmsd_massweight"
     cfg.point_allocation.batch_training_size = 1
     cfg.point_allocation.batch_internal_validation_size = 0
     cfg.to_yaml(campaign / "campaign.yaml")
@@ -755,7 +737,7 @@ def test_phase_b_ignores_hidden_descriptor_override_single_candidate(tmp_path):
     _set_landing_safety(ariadne_seed_dir(iter_dir, 1), accepted=True)
     _write_ariadne_manifest(iter_dir)
     result = _run([
-        "--descriptor", "acquisition_weighted",
+        "--descriptor", "rmsd_massweight",
         "--iteration", "1",
         "--campaign-dir", str(campaign),
     ])
@@ -763,5 +745,5 @@ def test_phase_b_ignores_hidden_descriptor_override_single_candidate(tmp_path):
     manifest = json.loads(
         (active_phase_b_dir(iter_dir) / "SELECTION.json").read_text(encoding="utf-8")
     )
-    assert manifest["descriptor"] == "hybrid_alf_rmsd"
+    assert manifest["descriptor"] == "rmsd_massweight"
     assert manifest["n_kept"] == 1

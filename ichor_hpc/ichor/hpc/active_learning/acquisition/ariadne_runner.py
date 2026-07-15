@@ -708,9 +708,9 @@ def _annotate_sampling_scale_metrics(
             float(chemistry) / float(max(n_atoms, 1))
         )
 
-    preset = (
-        scale_model.get("dimensionless_preset")
-        if isinstance(scale_model.get("dimensionless_preset"), dict)
+    policy = (
+        scale_model.get("dimensionless_policy")
+        if isinstance(scale_model.get("dimensionless_policy"), dict)
         else {}
     )
     for key in (
@@ -725,7 +725,7 @@ def _annotate_sampling_scale_metrics(
         "angle_ratio_lower",
         "angle_ratio_upper",
     ):
-        value = _safe_float_or_none(preset.get(key))
+        value = _safe_float_or_none(policy.get(key))
         if value is not None:
             metrics["sampling_protocol_" + key] = float(value)
 
@@ -743,8 +743,8 @@ def _apply_dimensionless_sampling_gates(
 ) -> None:
     if not isinstance(scale_model, dict):
         return
-    preset = scale_model.get("dimensionless_preset")
-    if not isinstance(preset, dict):
+    policy = scale_model.get("dimensionless_policy")
+    if not isinstance(policy, dict):
         return
     checks = (
         (
@@ -775,11 +775,11 @@ def _apply_dimensionless_sampling_gates(
     )
     for metric_key, threshold_key, reason in checks:
         value = _safe_float_or_none(metrics.get(metric_key))
-        threshold = _safe_float_or_none(preset.get(threshold_key))
+        threshold = _safe_float_or_none(policy.get(threshold_key))
         if value is not None and threshold is not None and float(value) > float(threshold):
             _append_reason_once(reasons, reason)
     pair_ratio = _safe_float_or_none(metrics.get("scaled_min_pair_ratio"))
-    pair_floor = _safe_float_or_none(preset.get("pair_ratio_floor"))
+    pair_floor = _safe_float_or_none(policy.get("pair_ratio_floor"))
     if (
         pair_ratio is not None
         and pair_floor is not None
@@ -1512,7 +1512,7 @@ def _mock_landing_safety(seed: Atoms, final: Atoms) -> Dict[str, Any]:
     seed_coords = _coords_array(seed)
     final_coords = _coords_array(final)
     metrics = _geometry_metrics(seed_coords, final_coords)
-    metrics["whitened_distance"] = 0.0
+    metrics["whitened_distance"] = 0.5
     metrics["spectral_frequency_risk"] = 0.0
     metrics["legacy_frequency_risk"] = 0.0
     metrics["banded_energy_risk"] = None
@@ -1662,10 +1662,10 @@ def _mock_optimise_seed(
         fell_back_to_ds=False,
         rigid_force_clamps=0,
         mock=True,
-        whitened_distance_final=0.0,
+        whitened_distance_final=0.5,
         raw_final_atoms=final,
         raw_alpha_final=alpha_values[-1],
-        raw_whitened_distance_final=0.0,
+        raw_whitened_distance_final=0.5,
         landing_safety=landing_safety,
         landing_candidates=landing_candidates,
         selection_diagnostics=selection_diagnostics,
@@ -2573,7 +2573,20 @@ def main(argv=None) -> int:
         return 3
 
     acquisition_config = resolved_protocol.acquisition_config
-    ariadne_run_config = resolved_protocol.ariadne_run_config
+    from ..randomness import derive_rng_seed
+
+    ariadne_rng = derive_rng_seed(
+        campaign_uid=str(state.campaign_uid),
+        campaign_random_seed=int(config.campaign.random_seed),
+        iteration=int(args.iteration),
+        phase="ARIADNE_ARRAY",
+        logical_task_id=seed_uid,
+        random_purpose="ariadne-seed-optimisation",
+    )
+    ariadne_run_config = replace(
+        resolved_protocol.ariadne_run_config,
+        rng_seed=int(ariadne_rng.derived_seed_128),
+    )
     calibration_snapshot = dict(resolved_protocol.error_calibration_snapshot or {})
     snapshot_model = calibration_snapshot.get("model")
     error_calibration_model = (
@@ -2676,6 +2689,7 @@ def main(argv=None) -> int:
     payload["array_task_id"] = int(args.array_task_id)
     payload["iteration"] = int(args.iteration)
     payload["trajectory_sha256"] = str(pool.sha256)
+    payload["randomness"] = ariadne_rng.to_dict()
 
     payload["sampling_protocol"] = {
         "sampling_aggressiveness": int(resolved_protocol.sampling_aggressiveness),

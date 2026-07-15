@@ -178,18 +178,18 @@ def test_quiet_import_module_suppresses_import_time_banner(monkeypatch, capsys):
     from ichor.hpc.active_learning.daemon import import_utils
 
     def noisy_import(module_name):
-        print("POLUS banner on stdout")
-        print("POLUS banner on stderr", file=sys.stderr)
+        print("backend banner on stdout")
+        print("backend banner on stderr", file=sys.stderr)
         return SimpleNamespace(module_name=module_name)
 
     monkeypatch.setattr(import_utils.importlib, "import_module", noisy_import)
 
-    module = import_utils.quiet_import_module("polus.samplers.RS.randomSampling")
+    module = import_utils.quiet_import_module("example.noisy_backend")
 
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == ""
-    assert module.module_name == "polus.samplers.RS.randomSampling"
+    assert module.module_name == "example.noisy_backend"
 
 
 def test_default_profile_is_not_live_active_learning_profile(monkeypatch):
@@ -205,7 +205,7 @@ def test_default_profile_is_not_live_active_learning_profile(monkeypatch):
     assert "_default" in a.profile_error
     with pytest.raises(BackendSubmissionError, match="_default"):
         build_sbatch_script(
-            phase_name="PHASE_A_POLUS",
+            phase_name="PHASE_A_DIVERSITY",
             iteration=0,
             campaign_dir=Path("/scratch/campaign"),
             config=CampaignConfig(),
@@ -232,7 +232,6 @@ def test_missing_backend_message_names_rendered_gaussian_module():
         aimall=True,
         ferebus=True,
         ariadne=True,
-        polus_rs=True,
         pyferebus=True,
         bc=True,
         gaussian_binary="",
@@ -480,7 +479,7 @@ def test_build_sbatch_script_uses_strict_daemon_module_loads(monkeypatch):
         lambda: list(live_executor_mod.DEFAULT_DAEMON_RUNTIME_MODULES),
     )
     body = build_sbatch_script(
-        phase_name="PHASE_A_POLUS",
+        phase_name="PHASE_A_DIVERSITY",
         iteration=0,
         campaign_dir=Path("/scratch/campaign"),
         config=CampaignConfig(),
@@ -524,7 +523,7 @@ def test_build_sbatch_script_uses_configured_runtime_modules(monkeypatch):
     )
 
     body = build_sbatch_script(
-        phase_name="PHASE_A_POLUS",
+        phase_name="PHASE_A_DIVERSITY",
         iteration=0,
         campaign_dir=Path("/scratch/campaign"),
         config=CampaignConfig(),
@@ -560,7 +559,7 @@ def test_build_sbatch_script_rejects_unsafe_configured_module(monkeypatch):
 
     with pytest.raises(BackendSubmissionError, match="unsafe characters"):
         build_sbatch_script(
-            phase_name="PHASE_A_POLUS",
+            phase_name="PHASE_A_DIVERSITY",
             iteration=0,
             campaign_dir=Path("/scratch/campaign"),
             config=CampaignConfig(),
@@ -865,11 +864,11 @@ def test_multicore_one_core_request_fails_before_sbatch(monkeypatch, machine, ma
     )
     cfg = CampaignConfig()
     cfg.resources.partition = "multicore"
-    cfg.resources.polus_cpus_per_task = 1
+    cfg.resources.diversity_cpus_per_task = 1
 
     with pytest.raises(BackendSubmissionError, match="configured range is \\[2,"):
         build_sbatch_script(
-            phase_name="PHASE_A_POLUS",
+            phase_name="PHASE_A_DIVERSITY",
             iteration=0,
             campaign_dir=Path("/scratch/campaign"),
             config=cfg,
@@ -892,10 +891,10 @@ def test_multicore_two_core_request_passes_profile_range_check(monkeypatch):
     )
     cfg = CampaignConfig()
     cfg.resources.partition = "multicore"
-    cfg.resources.polus_cpus_per_task = 2
+    cfg.resources.diversity_cpus_per_task = 2
 
     body = build_sbatch_script(
-        phase_name="PHASE_A_POLUS",
+        phase_name="PHASE_A_DIVERSITY",
         iteration=0,
         campaign_dir=Path("/scratch/campaign"),
         config=cfg,
@@ -921,10 +920,10 @@ def test_serial_one_core_request_passes_profile_range_check(monkeypatch):
     )
     cfg = CampaignConfig()
     cfg.resources.partition = "serial"
-    cfg.resources.polus_cpus_per_task = 1
+    cfg.resources.diversity_cpus_per_task = 1
 
     body = build_sbatch_script(
-        phase_name="PHASE_A_POLUS",
+        phase_name="PHASE_A_DIVERSITY",
         iteration=0,
         campaign_dir=Path("/scratch/campaign"),
         config=cfg,
@@ -964,10 +963,10 @@ def test_backend_partition_override_uses_grouped_resource_partition(monkeypatch)
     )
     cfg = CampaignConfig()
     cfg.resources.defaults.partition = "multicore"
-    cfg.resources.polus.partition = "interactive"
-    cfg.resources.polus.cpus_per_task = 1
+    cfg.resources.diversity.partition = "interactive"
+    cfg.resources.diversity.cpus_per_task = 1
     body = build_sbatch_script(
-        phase_name="PHASE_A_POLUS",
+        phase_name="PHASE_A_DIVERSITY",
         iteration=0,
         campaign_dir=Path("/scratch/campaign"),
         config=cfg,
@@ -997,10 +996,10 @@ def test_unknown_partition_fails_against_active_profile(monkeypatch):
         "csf3",
     )
     cfg = CampaignConfig()
-    cfg.resources.polus.partition = "multinode"
+    cfg.resources.diversity.partition = "multinode"
     with pytest.raises(BackendSubmissionError, match="not present"):
         build_sbatch_script(
-            phase_name="PHASE_A_POLUS",
+            phase_name="PHASE_A_DIVERSITY",
             iteration=0,
             campaign_dir=Path("/scratch/campaign"),
             config=cfg,
@@ -1032,7 +1031,7 @@ def test_unsupported_profile_partition_fails_before_sbatch(monkeypatch):
     cfg.resources.defaults.partition = "multinode"
     with pytest.raises(BackendSubmissionError, match="not supported"):
         build_sbatch_script(
-            phase_name="PHASE_A_POLUS",
+            phase_name="PHASE_A_DIVERSITY",
             iteration=0,
             campaign_dir=Path("/scratch/campaign"),
             config=cfg,
@@ -1079,10 +1078,10 @@ def test_explicit_memory_above_profile_cap_fails_before_sbatch(monkeypatch):
         "csf4",
     )
     cfg = CampaignConfig()
-    cfg.resources.polus_mem_per_cpu = "8G"
+    cfg.resources.diversity_mem_per_cpu = "8G"
     with pytest.raises(BackendSubmissionError, match="exceeds configured profile memory cap"):
         build_sbatch_script(
-            phase_name="PHASE_A_POLUS",
+            phase_name="PHASE_A_DIVERSITY",
             iteration=0,
             campaign_dir=Path("/scratch/campaign"),
             config=cfg,
@@ -1121,9 +1120,9 @@ def test_configured_array_task_limit_rejects_too_large_array(monkeypatch):
 def test_build_sbatch_script_uses_yaml_scheduler_resources_by_default():
     cfg = CampaignConfig()
     cfg.resources.partition = "csf4-debug"
-    cfg.resources.polus_walltime_hours = 7
+    cfg.resources.diversity_walltime_hours = 7
     body = build_sbatch_script(
-        phase_name="PHASE_A_POLUS",
+        phase_name="PHASE_A_DIVERSITY",
         iteration=0,
         campaign_dir=Path("/scratch/campaign"),
         config=cfg,
@@ -1137,7 +1136,7 @@ def test_build_sbatch_script_explicit_scheduler_overrides_win():
     cfg.resources.partition = "yaml-partition"
     cfg.resources.default_walltime_hours = 7
     body = build_sbatch_script(
-        phase_name="PHASE_A_POLUS",
+        phase_name="PHASE_A_DIVERSITY",
         iteration=0,
         campaign_dir=Path("/scratch/campaign"),
         config=cfg,
@@ -1156,7 +1155,7 @@ def test_build_sbatch_script_uses_phase_walltime_override():
     cfg.resources.gaussian_walltime_hours = 3
     cfg.resources.aimall_walltime_hours = 4
     cfg.resources.ariadne_walltime_hours = 5
-    cfg.resources.polus_walltime_hours = 6
+    cfg.resources.diversity_walltime_hours = 6
     assert "#SBATCH --time=03:00:00" in build_sbatch_script(
         phase_name="GAUSSIAN",
         iteration=1,
@@ -1179,7 +1178,7 @@ def test_build_sbatch_script_uses_phase_walltime_override():
         array_size=1,
     )
     assert "#SBATCH --time=06:00:00" in build_sbatch_script(
-        phase_name="PHASE_B_POLUS",
+        phase_name="PHASE_B_DIVERSITY",
         iteration=1,
         campaign_dir=Path("/scratch/campaign"),
         config=cfg,
@@ -1188,9 +1187,9 @@ def test_build_sbatch_script_uses_phase_walltime_override():
 
 def test_fractional_walltime_renders_minutes():
     cfg = CampaignConfig()
-    cfg.resources.polus.walltime_hours = 0.25
+    cfg.resources.diversity.walltime_hours = 0.25
     body = build_sbatch_script(
-        phase_name="PHASE_B_POLUS",
+        phase_name="PHASE_B_DIVERSITY",
         iteration=1,
         campaign_dir=Path("/scratch/campaign"),
         config=cfg,
@@ -1358,39 +1357,27 @@ def test_array_staging_receives_executor_partition_override(monkeypatch, tmp_pat
 
 def _write_minimal_ariadne_task_map(iter_dir):
     from ichor.hpc.active_learning.daemon.state import atomic_write_json
-    from ichor.hpc.active_learning.handoff_manifests import seeds_picked_path
-    from ichor.hpc.active_learning.seed_identity import (
-        deterministic_seed_uid,
-        selection_fingerprint_sha256,
-        write_ariadne_task_map,
+    from ichor.hpc.active_learning.handoff_manifests import (
+        build_seed_selection_manifest,
+        seeds_picked_path,
     )
+    from ichor.hpc.active_learning.seed_identity import write_ariadne_task_map
 
-    payload = {
-        "schema_version": 2,
-        "campaign_uid": "uid",
-        "iteration": 1,
-        "models_version": 0,
-        "model_manifest_sha256": "c" * 64,
-        "trajectory_sha256": "d" * 64,
-        "n_picked": 1,
-        "seed_records": [{
+    payload = build_seed_selection_manifest(
+        campaign_uid="uid",
+        campaign_random_seed=0,
+        iteration=1,
+        models_version=0,
+        model_manifest_sha256="c" * 64,
+        trajectory_sha256="d" * 64,
+        selection_strategy="hybrid_variance",
+        seed_records=[{
             "seed_id": 1,
             "frame_id": 0,
             "pool_row_index_zero_based": 0,
             "selection_origin": "bulk",
             "variance_at_selection": 0.0,
         }],
-    }
-    fingerprint = selection_fingerprint_sha256(payload)
-    payload["selection_fingerprint_sha256"] = fingerprint
-    payload["seed_records"][0]["seed_uid"] = deterministic_seed_uid(
-        campaign_uid="uid",
-        iteration=1,
-        seed_id=1,
-        frame_id=0,
-        models_version=0,
-        model_manifest_sha256="c" * 64,
-        selection_fingerprint_sha256_value=fingerprint,
     )
     selection_path = seeds_picked_path(iter_dir)
     selection_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1804,31 +1791,31 @@ def test_build_sbatch_script_renders_ariadne_block(monkeypatch):
     assert "--iteration 2" in body
 
 
-def test_build_sbatch_script_renders_polus_block_with_configured_descriptor(monkeypatch):
+def test_build_sbatch_script_renders_diversity_block_with_configured_descriptor(monkeypatch):
     python_path, _ = _install_fake_script_render_profile(monkeypatch)
     cfg = CampaignConfig()
-    cfg.phase_b.descriptor = "acquisition_weighted"
+    cfg.phase_b.descriptor = "hybrid_alf_rmsd"
     body = build_sbatch_script(
-        phase_name="PHASE_B_POLUS",
+        phase_name="PHASE_B_DIVERSITY",
         iteration=4,
         campaign_dir=Path("/scratch/campaign"),
         config=cfg,
     )
-    assert "polus_wrapper" in body
-    assert shlex.quote(python_path) + " -m ichor.hpc.active_learning.sampling.polus_wrapper" in body
-    assert "\npython -m ichor.hpc.active_learning.sampling.polus_wrapper" not in body
-    assert "--descriptor acquisition_weighted" in body
+    assert "sampling.diversity" in body
+    assert shlex.quote(python_path) + " -m ichor.hpc.active_learning.sampling.diversity" in body
+    assert "\npython -m ichor.hpc.active_learning.sampling.diversity" not in body
+    assert "--descriptor hybrid_alf_rmsd" in body
     assert "--iteration 4" in body
 
 
-def test_build_sbatch_script_renders_phase_a_polus_as_bootstrap_iteration_zero():
+def test_build_sbatch_script_renders_phase_a_diversity_as_bootstrap_iteration_zero():
     body = build_sbatch_script(
-        phase_name="PHASE_A_POLUS",
+        phase_name="PHASE_A_DIVERSITY",
         iteration=0,
         campaign_dir=Path("/scratch/campaign"),
         config=CampaignConfig(),
     )
-    assert "polus_wrapper" in body
+    assert "sampling.diversity" in body
     assert "--descriptor rmsd_massweight" in body
     assert "--iteration 0" in body
     assert "OPENBLAS_NUM_THREADS=1" in body
@@ -2024,7 +2011,8 @@ def test_configured_batch_python_probe_uses_exact_interpreter(monkeypatch):
     assert "module load mkl/2024.2" in script
     assert executable in script
     assert "ariadne" in script
-    assert "polus.samplers.RS.randomSampling" in script
+    assert "ichor.hpc" in script
+    assert "polus.samplers.RS.randomSampling" not in script
     assert "pyferebus.executors.trainer" in script
 
 
@@ -2256,42 +2244,38 @@ def test_write_real_script_creates_sbatch_log_dirs(tmp_path):
         newline="\n",
     )
     TrajectoryPool.import_from(source, campaign)
-    from ichor.hpc.active_learning.daemon.state import atomic_write_json
+    from ichor.hpc.active_learning.custom_bootstrap import (
+        commit_bootstrap_plan,
+        inspect_bootstrap_inputs,
+    )
 
-    bootstrap_root = (
-        campaign / ".DATA" / "ACTIVE_LEARNING" / "bootstrap_inputs"
-    )
-    bootstrap_root.mkdir(parents=True)
-    embedded = {
-        "schema_version": 1,
-        "confirmed": True,
-        "excluded_pool_frame_ids": [],
-        "sources": {},
-        "model": None,
-    }
-    atomic_write_json(bootstrap_root / "CUSTOM_BOOTSTRAP.json", embedded)
-    pointer = dict(embedded)
-    pointer["bootstrap_inputs_root"] = (
-        bootstrap_root.resolve().relative_to(campaign.resolve()).as_posix()
-    )
-    atomic_write_json(
-        campaign / ".DATA" / "ACTIVE_LEARNING" / "CUSTOM_BOOTSTRAP.json",
-        pointer,
+    config = CampaignConfig()
+    config.point_allocation.bootstrap_training_size = 1
+    config.point_allocation.bootstrap_internal_validation_size = 1
+    config.point_allocation.bootstrap_external_validation_size = 0
+    pool = TrajectoryPool.load(campaign)
+    commit_bootstrap_plan(
+        inspect_bootstrap_inputs(
+            campaign,
+            config,
+            pool.to_atoms_list(),
+            pool_sha256=pool.sha256,
+        )
     )
     write_pre_submit_intent(
         campaign,
         campaign_uid="uid",
-        phase_name="PHASE_A_POLUS",
+        phase_name="PHASE_A_DIVERSITY",
         iteration=0,
         expected_tasks=1,
     )
     ex = LiveBackendsPhaseExecutor(
         campaign_dir=campaign,
-        config=CampaignConfig(),
+        config=config,
         backend_check=False,
     )
     script = ex._write_real_script(
-        "PHASE_A_POLUS",
+        "PHASE_A_DIVERSITY",
         SimpleNamespace(iteration=0, campaign_uid="uid"),
     )
     assert script.name == "job.sh"

@@ -1,29 +1,11 @@
-"""POLUS wrapper providing a pluggable distance matrix.
-
-Two layers:
-
-* fps_select(distance_matrix, n_select, seed_index=None):
-    Standalone greedy furthes-point sampling over an arbitrary distance
-    matrix. Used in unit tests and as a small-data path that does not need
-    the full POLUS install. Returns FPSResult (indices + diversities).
-
-
-* make_pluggable_polus_sampler(precomputed_distance_matrix, **divsampler_kw):
-    Lazily imports polus.trajectories.diversity.DIVSampler and returns a
-    subclass that overrides SetRMSDMatrix to inject a caller-supplied
-    distance matrix. Used in production for large trajectories where
-    POLUS handles file I/O and the FPS step. The caller computes the
-    distance matrix with whichever Descriptor they want.
-
-Both layers produce the same selection sequence given the same input
-(modulo any seed-geometry choice POLUS makes from ComputeCentroid).
-"""
+"""Exact ICHOR-owned diversity selection for bootstrap and active batches."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from numbers import Integral
 import os
 import shutil
 
@@ -36,12 +18,12 @@ from .descriptors import (
     MassWeightedRMSDDescriptor,
     build_condensed_distance_store,
 )
+from .diversity_contract import diversity_selector_contract
 
 
 __all__ = [
     "fps_select",
     "FPSResult",
-    "make_pluggable_polus_sampler",
     "DEFAULT_DESCRIPTORS",
 ]
 
@@ -50,6 +32,40 @@ DEFAULT_DESCRIPTORS = {
     "rmsd_massweight": MassWeightedRMSDDescriptor,
 }
 FPS_TIE_QUANTISATION = 1.0e-12
+FPS_METRIC_TOLERANCE = 1.0e-12
+
+
+def _selector_contract() -> Dict[str, Any]:
+    return diversity_selector_contract()
+
+
+def _exact_non_negative_integer(value: Any, label: str) -> int:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
+        raise TypeError(label + " must be a non-negative integer")
+    result = int(value)
+    if result < 0:
+        raise ValueError(label + " must be non-negative")
+    return result
+
+
+def _validate_condensed_store(store: Any) -> int:
+    n = _exact_non_negative_integer(store.n, "distance store n")
+    expected = n * (n - 1) // 2
+    values = np.asarray(store.values)
+    if values.ndim != 1 or int(values.size) != expected:
+        raise ValueError(
+            "condensed distance store has "
+            + str(int(values.size))
+            + " values; expected "
+            + str(expected)
+        )
+    for start in range(0, expected, 1_048_576):
+        chunk = np.asarray(values[start:start + 1_048_576], dtype=float)
+        if not np.all(np.isfinite(chunk)) or np.any(chunk < 0.0):
+            raise ValueError(
+                "condensed distance store must contain finite non-negative values"
+            )
+    return n
 
 
 def _runtime_distance_store(
@@ -59,18 +75,28 @@ def _runtime_distance_store(
     workers: int,
     distance_store_path: Optional[Path],
 ):
-    mode = str(os.environ.get("ICHOR_POLUS_DISTANCE_STORE_MODE", "memory")).strip().lower()
+    worker_count = _exact_non_negative_integer(workers, "workers")
+    if worker_count == 0:
+        raise ValueError("workers must be positive")
+    mode = str(os.environ.get("ICHOR_DIVERSITY_DISTANCE_STORE_MODE", "memory")).strip().lower()
     if mode not in {"memory", "file"}:
-        raise ValueError("ICHOR_POLUS_DISTANCE_STORE_MODE must be memory or file")
+        raise ValueError("ICHOR_DIVERSITY_DISTANCE_STORE_MODE must be memory or file")
     target = None
     if mode == "file":
         if distance_store_path is None:
-            raise ValueError("file-backed POLUS requires --distance-store")
-        required = int(os.environ.get("ICHOR_POLUS_SCRATCH_REQUIRED_BYTES", "0"))
+            raise ValueError("file-backed diversity requires --distance-store")
+        required_text = os.environ.get(
+            "ICHOR_DIVERSITY_SCRATCH_REQUIRED_BYTES", "0"
+        )
+        if not str(required_text).isdigit():
+            raise ValueError(
+                "ICHOR_DIVERSITY_SCRATCH_REQUIRED_BYTES must be a non-negative integer"
+            )
+        required = int(required_text)
         free = int(shutil.disk_usage(distance_store_path.parent).free)
         if required > 0 and free < required:
             raise OSError(
-                "file-backed POLUS requires "
+                "file-backed diversity requires "
                 + str(required)
                 + " free bytes at job start; available="
                 + str(free)
@@ -80,7 +106,7 @@ def _runtime_distance_store(
         descriptor,
         frames,
         path=target,
-        workers=max(1, int(workers)),
+        workers=worker_count,
     )
 
 
@@ -108,9 +134,11 @@ def fps_select(
 ) -> FPSResult:
     from .descriptors import CondensedDistanceStore
 
+    requested = _exact_non_negative_integer(n_select, "n_select")
+
     if isinstance(distance_matrix, CondensedDistanceStore):
         D = distance_matrix
-        n = int(D.n)
+        n = _validate_condensed_store(D)
         row = D.row
         row_sums = D.row_sums
     else:
@@ -119,30 +147,41 @@ def fps_select(
             raise ValueError(
                 f"distance_matrix must be square 2D; got shape {dense.shape}"
             )
-        if not np.allclose(dense, dense.T, atol=1.0e-9):
+        if not np.all(np.isfinite(dense)):
+            raise ValueError("distance_matrix must contain only finite values")
+        if np.any(dense < 0.0):
+            raise ValueError("distance_matrix must be non-negative")
+        if np.any(np.abs(np.diag(dense)) > FPS_METRIC_TOLERANCE):
+            raise ValueError("distance_matrix diagonal must be zero")
+        if not np.allclose(
+            dense,
+            dense.T,
+            atol=FPS_METRIC_TOLERANCE,
+            rtol=0.0,
+        ):
             raise ValueError("distance_matrix must be symmetric")
         D = dense
         n = int(dense.shape[0])
         row = lambda index: dense[int(index)]
         row_sums = lambda: dense.sum(axis=1)
-    if n_select <= 0:
+    if requested == 0:
         return FPSResult(
             indices=[],
             diversities=[],
             distance_matrix_shape=(n, n),
             descriptor_name=descriptor_name,
         )
-    if n_select > n:
-        raise ValueError(f"n_select {n_select} > n {n}")
+    if requested > n:
+        raise ValueError(f"n_select {requested} > n {n}")
 
     if seed_index is None:
         sums = row_sums()
         ranked = np.round(sums / FPS_TIE_QUANTISATION) * FPS_TIE_QUANTISATION
         seed = int(np.lexsort((np.arange(n, dtype=int), ranked))[0])
     else:
-        if not 0 <= int(seed_index) < n:
+        seed = _exact_non_negative_integer(seed_index, "seed_index")
+        if seed >= n:
             raise ValueError(f"seed_index {seed_index} out of range")
-        seed = int(seed_index)
 
     selected = [seed]
     selected_mask = np.zeros(n, dtype=bool)
@@ -151,7 +190,7 @@ def fps_select(
     min_dists[seed] = 0.0
     diversities: List[float] = [0.0]
 
-    for _ in range(1, n_select):
+    for _ in range(1, requested):
         candidates = np.flatnonzero(~selected_mask)
         if candidates.size == 0:
             break
@@ -173,47 +212,14 @@ def fps_select(
         descriptor_name=descriptor_name,
     )
 
-
-
-
-
-def make_pluggable_polus_sampler(precomputed_distance_matrix, **divsampler_kwargs):
-    from polus.trajectories.diversity import DIVSampler
-
-    D = np.asarray(precomputed_distance_matrix, dtype=np.float32)
-    if D.ndim != 2 or D.shape[0] != D.shape[1]:
-        raise ValueError("distance matrix must be square 2D")
-
-    class _PluggableMetricDIVSampler(DIVSampler):
-        _PRECOMPUTED_MATRIX = D
-
-        def SetRMSDMatrix(self):
-            self.RotateTrajectory(self.refGeomFilename, self.rotateTraj, self.rotMethod)
-            if not isinstance(self.rotTraj, list):
-                raise RuntimeError("POLUS rotation produced no trajectory")
-            self.samplePool = list(range(len(self.rotTraj)))
-            if self.seedFilename is None:
-                self.ComputeCentroid()
-            else:
-                self.GetSeedGeometry(self.seedFilename)
-            expected = (self.ngeoms, self.ngeoms)
-            if self._PRECOMPUTED_MATRIX.shape != expected:
-                raise ValueError(
-                    f"precomputed matrix shape {self._PRECOMPUTED_MATRIX.shape} "
-                    f"!= POLUS ngeoms {expected}"
-                )
-            self.matrRMSD = self._PRECOMPUTED_MATRIX
-
-    return _PluggableMetricDIVSampler(**divsampler_kwargs)
-
 # --- helpers used by main(argv) below -------------------------------
 
 
 def _write_xyz_file(frames, path):
     """Write a list of ICHOR Atoms objects to a plain xyz file.
 
-    Format: natoms line, comment line, then one atom per line. POLUS
-    parses this same shape so the same writer covers both Phase A
+    Format: atom-count line, comment line, then one atom per line. The
+    same writer covers both Phase A
     (consumed by the daemon parser) and Phase B (consumed by APPEND).
     """
     out_lines = []
@@ -231,7 +237,7 @@ def _write_xyz_file(frames, path):
 
 
 def _write_index_file(indices, path):
-    """Write the per-line list of selected frame ids POLUS produces."""
+    """Write the per-line list of selected stable frame identities."""
     lines = []
     custom_counter = 0
     for value in indices:
@@ -287,65 +293,17 @@ def _load_committed_reference_data(campaign_dir):
     return atoms_list
 
 
-def _build_phase_b_posterior(campaign, config):
-    """Load the current committed FEREBUS models for acquisition_weighted."""
-    from ..daemon.state import DEFAULT_STATE_FILENAME, read_state
-    from ichor.core.adversarial.posterior import TotalEnergyPosterior
-    from ..versioning.trained_models import load_trained_models
-
-    state_path = (
-        Path(campaign)
-        / ".DATA"
-        / "ACTIVE_LEARNING"
-        / DEFAULT_STATE_FILENAME
-    )
-    state = read_state(state_path)
-    models_version = int(getattr(state, "models_version", -1))
-    if models_version < 0:
-        raise FileNotFoundError("state has no committed models_version")
-    property_name = str(config.acquisition.property_name)
-    from ..daemon.artifact_contracts import verify_committed_model_version
-    verify_committed_model_version(campaign, models_version)
-    _, models = load_trained_models(
-        campaign,
-        models_version,
-        verification="deep",
-    )
-    return TotalEnergyPosterior(
-        models,
-        property_name=property_name,
-        scaled=bool(config.acquisition.use_scaled_posterior_covariance),
-    )
-
-
 def _phase_b_landing_safety_filter(
     candidate_frames,
     candidate_records,
-    *,
-    accept_legacy_missing_landing_safety: bool = False,
 ):
     missing = [
         i for i, rec in enumerate(candidate_records)
         if not isinstance(rec.get("landing_safety"), dict)
     ]
     if len(missing) == len(candidate_records):
-        if not bool(accept_legacy_missing_landing_safety):
-            raise ValueError(
-                "all Phase B candidates are missing landing_safety metadata; "
-                "set adversarial_safety.accept_legacy_missing_landing_safety "
-                "to true only for deliberate legacy migration"
-            )
-        return (
-            list(candidate_frames),
-            list(candidate_records),
-            {
-                "enabled": True,
-                "legacy_missing_safety": True,
-                "n_input": int(len(candidate_records)),
-                "n_kept": int(len(candidate_records)),
-                "n_dropped": 0,
-                "dropped": [],
-            },
+        raise ValueError(
+            "all Phase B candidates are missing mandatory landing_safety metadata"
         )
     if missing:
         raise ValueError(
@@ -358,7 +316,7 @@ def _phase_b_landing_safety_filter(
     dropped = []
     for i, (frame, rec) in enumerate(zip(candidate_frames, candidate_records)):
         safety = rec.get("landing_safety")
-        if bool(safety.get("accepted", False)):
+        if safety.get("accepted") is True:
             kept_frames.append(frame)
             kept_records.append(rec)
         else:
@@ -437,7 +395,7 @@ def _phase_b_refill_after_anti_overlap(
     kept_frames = []
 
     for candidate_index in ordered_indices:
-        raw_index = len(considered_indices)
+        considered_index = len(considered_indices)
         cand = candidate_frames[int(candidate_index)]
         distance = float(
             min_distance_to_training(cand, list(training) + list(kept_frames))
@@ -447,9 +405,9 @@ def _phase_b_refill_after_anti_overlap(
         considered_records.append(candidate_records[int(candidate_index)])
         distances.append(distance)
         if distance < float(min_separation):
-            dropped_indices.append(int(raw_index))
+            dropped_indices.append(int(considered_index))
         else:
-            kept_indices.append(int(raw_index))
+            kept_indices.append(int(considered_index))
             kept_frames.append(cand)
             if len(kept_indices) >= int(target_size):
                 break
@@ -535,6 +493,61 @@ def _phase_b_build_reserve(
     }
 
 
+def _relax_scaled_novelty(
+    *,
+    considered_frames,
+    report,
+    training,
+    target_size: int,
+):
+    """Admit the farthest non-duplicate candidates until the target is met."""
+    from .anti_overlap import DedupReport, min_distance_to_training
+    from ..geometry_novelty import EXACT_DUPLICATE_EPSILON_ANGSTROM
+
+    kept = [int(value) for value in report.kept_indices]
+    remaining = [int(value) for value in report.dropped_indices]
+    accepted_context = [considered_frames[index] for index in kept]
+    admitted = []
+    while len(kept) < int(target_size) and remaining:
+        ranked = []
+        context = list(training) + accepted_context
+        for considered_index in remaining:
+            distance = float(
+                min_distance_to_training(considered_frames[considered_index], context)
+            )
+            if np.isfinite(distance) and distance > EXACT_DUPLICATE_EPSILON_ANGSTROM:
+                ranked.append((distance, considered_index))
+        if not ranked:
+            break
+        distance, considered_index = max(ranked, key=lambda item: (item[0], -item[1]))
+        kept.append(int(considered_index))
+        remaining.remove(int(considered_index))
+        accepted_context.append(considered_frames[int(considered_index)])
+        admitted.append({
+            "considered_index_zero_based": int(considered_index),
+            "distance_to_nearest_angstrom": float(distance),
+        })
+
+    kept_set = set(kept)
+    dropped = tuple(
+        index for index in range(len(considered_frames)) if index not in kept_set
+    )
+    updated = DedupReport(
+        kept_indices=tuple(kept),
+        dropped_indices=dropped,
+        distances_to_nearest=tuple(report.distances_to_nearest),
+        min_separation=float(report.min_separation),
+    )
+    return updated, {
+        "applied": bool(admitted),
+        "reason": "scaled_novelty_underfill" if admitted else None,
+        "admitted": admitted,
+        "n_admitted": int(len(admitted)),
+        "target_size": int(target_size),
+        "target_satisfied": len(kept) >= int(target_size),
+    }
+
+
 def _run_phase_a(
     campaign,
     config,
@@ -543,14 +556,10 @@ def _run_phase_a(
     workers: int = 1,
     distance_store_path: Optional[Path] = None,
 ):
-    """POLUS Phase-A: pick a diverse subsample from the imported
-    trajectory pool to seed the campaign with initial training points.
+    """Select a diverse bootstrap subset from the imported trajectory pool.
 
-    Phase A always uses mass-weighted RMSD as the distance metric --
-    no posterior exists yet, so any descriptor that needs one (e.g.
-    acquisition-weighted) does not apply. The two outputs match what
-    POLUS itself would write so the daemon postprocess parser does not
-    care which path produced them.
+    Phase A always uses mass-weighted RMSD because no trained posterior
+    exists at bootstrap time.
     """
     from ..acquisition.trajectory_pool import TrajectoryPool
     from ..acquisition.trajectory_pool import POOL_MANIFEST_FILENAME, POOL_SUBDIR
@@ -590,7 +599,7 @@ def _run_phase_a(
     effective_targets["total"] = sum(effective_targets.values())
     deficits = {
         split: int(value)
-        for split, value in dict(bootstrap_manifest["polus_deficits"]).items()
+        for split, value in dict(bootstrap_manifest["diversity_deficits"]).items()
     }
     n_select = int(effective_targets["total"])
     pool_select = int(sum(deficits.values()))
@@ -658,7 +667,7 @@ def _run_phase_a(
         for frame_id in selected_pool_by_split[split]:
             selected_frames.append(frames[frame_id])
             selected_indices.append(int(frame_id))
-            selected_origins.append((split, "phase_a_polus", int(frame_id)))
+            selected_origins.append((split, "phase_a_diversity", int(frame_id)))
 
     from ..layout import bootstrap_selection_dir
 
@@ -707,10 +716,13 @@ def _run_phase_a(
                 "source": source,
                 "bootstrap_split": split,
                 "frame_id": (
-                    int(source_index) if source == "phase_a_polus" else None
+                    int(source_index) if source == "phase_a_diversity" else None
                 ),
                 "custom_index": (
                     int(source_index) if source == "custom_bootstrap" else None
+                ),
+                "pool_sha256": (
+                    str(pool.sha256) if source == "phase_a_diversity" else None
                 ),
             }
             primary_candidates.append(record)
@@ -728,6 +740,7 @@ def _run_phase_a(
                 "source": "phase_a_reserve",
                 "frame_id": int(frame_id),
                 "reserve_rank": int(reserve_rank),
+                "pool_sha256": str(pool.sha256),
             }
             for reserve_rank, frame_id in enumerate(reserve_pool_indices)
         ]
@@ -783,7 +796,7 @@ def _run_phase_a(
             }[split]),
         )
     write_phase_a_sample_manifest(outdir, {
-        "phase": "PHASE_A_POLUS",
+        "phase": "PHASE_A_DIVERSITY",
         "iteration": 0,
         "sample_xyz": sample_path.resolve().relative_to(outdir.parent.resolve()).as_posix(),
         "index_path": index_path.resolve().relative_to(outdir.parent.resolve()).as_posix(),
@@ -792,6 +805,7 @@ def _run_phase_a(
         "selected_indices": selected_indices,
         "selected_pool_indices": [int(i) for i in selected_pool_indices],
         "descriptor": str(descriptor.name),
+        "selector": _selector_contract(),
         "fps_diversities": diversities,
         "n_pool_frames": int(len(frames)),
         "bootstrap_total_size": int(n_select),
@@ -835,20 +849,15 @@ def _run_phase_a(
 
 
 def _run_phase_b(args, campaign, config):
-    """POLUS Phase-B: pick a diverse subsample from the adversarial
-    pool ARIADNE just produced, then run the optional anti-overlap
-    pass against the committed QM reference data.
+    """Select an exact diverse subset from safe ARIADNE landings.
 
     Two outputs are always written under ``phase_b/``:
-      selected_raw.xyz -- the raw FPS selection.
-      selected.xyz     -- the deduplicated final selection; identical to the
-                          raw selection when the minimum separation is zero.
+      considered_candidates.xyz -- the FPS refill prefix inspected for novelty.
+      selected.xyz              -- the final allocation batch.
     ``SELECTION.json`` binds both files and records deduplication diagnostics.
     """
-    from .descriptors import build_descriptor_from_config
-    from ..daemon.state import atomic_write_json
+    from .descriptors import build_descriptor_from_config, partition_descriptor_frames
     from ..geometry_novelty import (
-        EXACT_DUPLICATE_EPSILON_ANGSTROM,
         novelty_score,
         scaled_distances,
     )
@@ -893,21 +902,12 @@ def _run_phase_b(args, campaign, config):
         )
         return 3
 
-    accept_legacy_missing_landing_safety = bool(
-        getattr(
-            getattr(effective_config, "adversarial_safety", None),
-            "accept_legacy_missing_landing_safety",
-            False,
-        )
-    )
-
     try:
         from ..daemon.config_lock import canonical_config, config_fingerprint
 
         ariadne_manifest, candidate_frames, candidate_records = ariadne_candidate_frames(
             iter_dir,
             expected_iteration=int(args.iteration),
-            accept_legacy_missing_landing_safety=accept_legacy_missing_landing_safety,
             expected_config_sha256=config_fingerprint(canonical_config(config)),
         )
     except Exception as exc:
@@ -938,7 +938,6 @@ def _run_phase_b(args, campaign, config):
                 _phase_b_landing_safety_filter(
                     candidate_frames,
                     candidate_records,
-                    accept_legacy_missing_landing_safety=accept_legacy_missing_landing_safety,
                 )
             )
         except Exception as exc:
@@ -957,22 +956,53 @@ def _run_phase_b(args, campaign, config):
             )
             return 3
 
-    posterior = None
-    if effective_config.phase_b.descriptor == "acquisition_weighted":
-        try:
-            posterior = _build_phase_b_posterior(campaign, effective_config)
-        except Exception as exc:
-            print(
-                "acquisition_weighted descriptor could not load posterior for property "
-                + repr(effective_config.acquisition.property_name)
-                + ": "
-                + type(exc).__name__
-                + ": "
-                + str(exc),
-                file=_sys.stderr,
-            )
-            return 3
-    descriptor = build_descriptor_from_config(effective_config, posterior=posterior)
+    descriptor = build_descriptor_from_config(effective_config)
+    descriptor_indices, descriptor_rejections = partition_descriptor_frames(
+        descriptor,
+        candidate_frames,
+    )
+    if descriptor_rejections:
+        detailed_rejections = []
+        for rejection in descriptor_rejections:
+            index = int(rejection["candidate_index_zero_based"])
+            record = candidate_records[index]
+            detailed_rejections.append({
+                **rejection,
+                "seed_id": record.get("seed_id"),
+                "seed_uid": record.get("seed_uid"),
+            })
+        safety_filter["descriptor_rejections"] = detailed_rejections
+        safety_filter["n_descriptor_rejected"] = int(len(detailed_rejections))
+        candidate_frames = [candidate_frames[index] for index in descriptor_indices]
+        candidate_records = [candidate_records[index] for index in descriptor_indices]
+        safety_filter["n_kept"] = int(len(candidate_frames))
+        safety_filter["n_dropped"] = int(
+            safety_filter.get("n_dropped", 0) + len(detailed_rejections)
+        )
+    else:
+        safety_filter["descriptor_rejections"] = []
+        safety_filter["n_descriptor_rejected"] = 0
+    if not candidate_frames:
+        print(
+            "Phase B descriptor rejected every otherwise safe candidate",
+            file=_sys.stderr,
+        )
+        return 3
+    try:
+        n_select = _phase_b_target_size(
+            effective_config,
+            len(candidate_frames),
+            int(args.iteration),
+        )
+    except Exception as exc:
+        rejected_count = int(len(descriptor_rejections))
+        detail = (
+            "; descriptor-singular candidates rejected=" + str(rejected_count)
+            if rejected_count
+            else ""
+        )
+        print(str(exc) + detail, file=_sys.stderr)
+        return 3
     try:
         matrix = _runtime_distance_store(
             descriptor,
@@ -992,15 +1022,6 @@ def _run_phase_b(args, campaign, config):
             + str(exc),
             file=_sys.stderr,
         )
-        return 3
-    try:
-        n_select = _phase_b_target_size(
-            effective_config,
-            len(candidate_frames),
-            int(args.iteration),
-        )
-    except Exception as exc:
-        print(str(exc), file=_sys.stderr)
         return 3
     geometry_scale_payload = dict(resolved_protocol.geometry_scale_payload)
     min_sep, threshold_mode = phase_b_min_separation_from_resolved(
@@ -1043,42 +1064,20 @@ def _run_phase_b(args, campaign, config):
         target_size=n_select,
     )
     phase_b_dir.mkdir(parents=True, exist_ok=True)
-    raw_path = phase_b_dir / "selected_raw.xyz"
-    _write_xyz_file(selected_frames, raw_path)
+    considered_path = phase_b_dir / "considered_candidates.xyz"
+    _write_xyz_file(selected_frames, considered_path)
     relaxation = {
         "applied": False,
         "reason": None,
     }
-    if int(report.n_kept) <= 0 and threshold_mode == "scaled":
-        finite_nonzero = []
-        for raw_index, distance in enumerate(report.distances_to_nearest):
-            try:
-                d = float(distance)
-            except (TypeError, ValueError):
-                continue
-            if np.isfinite(d) and d > EXACT_DUPLICATE_EPSILON_ANGSTROM:
-                finite_nonzero.append((int(raw_index), float(d)))
-        if finite_nonzero:
-            keep_index, keep_distance = max(
-                finite_nonzero,
-                key=lambda item: (item[1], -item[0]),
-            )
-            dropped_indices = tuple(
-                i for i in range(len(selected_frames)) if int(i) != int(keep_index)
-            )
-            report = type(report)(
-                kept_indices=(int(keep_index),),
-                dropped_indices=dropped_indices,
-                distances_to_nearest=tuple(report.distances_to_nearest),
-                min_separation=float(min_sep),
-            )
-            relaxation = {
-                "applied": True,
-                "reason": "all_candidates_below_scaled_threshold",
-                "kept_raw_index": int(keep_index),
-                "distance_to_nearest_angstrom": float(keep_distance),
-                "effective_min_separation_angstrom": float(min_sep),
-            }
+    if int(report.n_kept) < int(n_select) and threshold_mode == "scaled":
+        report, relaxation = _relax_scaled_novelty(
+            considered_frames=selected_frames,
+            report=report,
+            training=training,
+            target_size=int(n_select),
+        )
+        relaxation["effective_min_separation_angstrom"] = float(min_sep)
 
     scale_angstrom = (
         geometry_scale_payload.get("scale_angstrom")
@@ -1104,8 +1103,8 @@ def _run_phase_b(args, campaign, config):
         else []
     )
     dedup_payload = {
-        "kept_raw_indexes_zero_based": list(report.kept_indices),
-        "dropped_raw_indexes_zero_based": list(report.dropped_indices),
+        "kept_considered_indexes_zero_based": list(report.kept_indices),
+        "dropped_considered_indexes_zero_based": list(report.dropped_indices),
         "distances_to_nearest": list(report.distances_to_nearest),
         "min_separation": report.min_separation,
         "threshold_mode": threshold_mode,
@@ -1135,9 +1134,9 @@ def _run_phase_b(args, campaign, config):
                 "descriptor": str(descriptor.name),
                 "source_ariadne_manifest": "ariadne/RESULTS.json",
                 "n_candidates": int(len(candidate_frames)),
-                "n_selected_raw": 0,
+                "n_considered": 0,
                 "n_kept": 0,
-                "raw": [],
+                "considered": [],
                 "final": [],
                 "dedup": dedup_payload,
                 "refill": refill,
@@ -1150,10 +1149,7 @@ def _run_phase_b(args, campaign, config):
             "phase_b_geometry_novelty_relaxed",
             iteration=int(args.iteration),
             reason=str(relaxation.get("reason", "")),
-            kept_raw_index=int(relaxation.get("kept_raw_index", -1)),
-            distance_to_nearest_angstrom=relaxation.get(
-                "distance_to_nearest_angstrom"
-            ),
+            n_admitted=int(relaxation.get("n_admitted", 0)),
             effective_min_separation_angstrom=float(min_sep),
             n_candidates=int(len(selected_frames)),
         )
@@ -1201,37 +1197,37 @@ def _run_phase_b(args, campaign, config):
     kept_frames = [selected_frames[i] for i in report.kept_indices]
     _write_xyz_file(kept_frames, final_path)
 
-    kept_lookup = {int(raw_index): final_index for final_index, raw_index in enumerate(report.kept_indices)}
-    raw_records = []
+    kept_lookup = {int(considered_index): final_index for final_index, considered_index in enumerate(report.kept_indices)}
+    considered_records = []
     final_records = []
-    for raw_index, rec in enumerate(selected_records):
+    for considered_index, rec in enumerate(selected_records):
         out_rec = dict(rec)
         out_rec["candidate_pool_index_zero_based"] = int(
-            selected_candidate_indices[raw_index]
+            selected_candidate_indices[considered_index]
         )
-        out_rec["raw_rank"] = int(raw_index) + 1
-        out_rec["kept_after_dedup"] = int(raw_index) in kept_lookup
+        out_rec["considered_rank"] = int(considered_index) + 1
+        out_rec["kept_after_dedup"] = int(considered_index) in kept_lookup
         out_rec["final_rank"] = (
-            int(kept_lookup[int(raw_index)]) + 1
-            if int(raw_index) in kept_lookup else None
+            int(kept_lookup[int(considered_index)]) + 1
+            if int(considered_index) in kept_lookup else None
         )
         out_rec["drop_reason"] = None if out_rec["kept_after_dedup"] else "min_separation"
         out_rec["distance_to_nearest_angstrom"] = (
-            report.distances_to_nearest[raw_index]
-            if raw_index < len(report.distances_to_nearest)
+            report.distances_to_nearest[considered_index]
+            if considered_index < len(report.distances_to_nearest)
             else None
         )
         out_rec["scaled_distance_to_nearest"] = (
-            scaled_nearest[raw_index]
-            if raw_index < len(scaled_nearest)
+            scaled_nearest[considered_index]
+            if considered_index < len(scaled_nearest)
             else None
         )
         out_rec["novelty_score"] = (
-            novelty_scores[raw_index]
-            if raw_index < len(novelty_scores)
+            novelty_scores[considered_index]
+            if considered_index < len(novelty_scores)
             else None
         )
-        raw_records.append(dict(out_rec))
+        considered_records.append(dict(out_rec))
         if out_rec["kept_after_dedup"]:
             final_records.append(dict(out_rec))
 
@@ -1314,7 +1310,7 @@ def _run_phase_b(args, campaign, config):
             out = dict(record)
             out["candidate_id"] = candidate_id_by_uid[str(record["seed_uid"])]
             if reserve_rank is not None:
-                out["reserve_rank"] = int(reserve_rank) + 1
+                out["reserve_rank"] = int(reserve_rank)
             if distance is not None:
                 out["distance_to_nearest_angstrom"] = float(distance)
             return _phase_b_json_safe(out)
@@ -1379,7 +1375,7 @@ def _run_phase_b(args, campaign, config):
         final_by_uid = {
             str(record["seed_uid"]): dict(record) for record in final_records
         }
-        raw_records = [
+        considered_records = [
             {
                 **record,
                 "candidate_id": candidate_id_by_uid[str(record["seed_uid"])],
@@ -1387,7 +1383,7 @@ def _run_phase_b(args, campaign, config):
                     Path(str(record["provenance_json"])).read_bytes()
                 ).hexdigest(),
             }
-            for record in raw_records
+            for record in considered_records
         ]
 
         def iteration_relative_record(record):
@@ -1399,7 +1395,7 @@ def _run_phase_b(args, campaign, config):
                     ).as_posix()
             return out
 
-        raw_records = [iteration_relative_record(record) for record in raw_records]
+        considered_records = [iteration_relative_record(record) for record in considered_records]
         final_records = [
             iteration_relative_record(final_by_uid[str(record["seed_uid"])])
             for record in final_records
@@ -1429,6 +1425,7 @@ def _run_phase_b(args, campaign, config):
         "campaign_uid": str(state.campaign_uid),
         "iteration": int(args.iteration),
         "descriptor": str(descriptor.name),
+        "selector": _selector_contract(),
         "sampling_protocol": {
             "sampling_aggressiveness": int(
                 resolved_protocol.sampling_aggressiveness
@@ -1441,10 +1438,10 @@ def _run_phase_b(args, campaign, config):
         "source_ariadne_manifest_sha256": hashlib.sha256(
             manifest_path.read_bytes()
         ).hexdigest(),
-        "selected_raw_xyz": {
-            "path": raw_path.resolve().relative_to(iter_dir.resolve()).as_posix(),
-            "size": int(raw_path.stat().st_size),
-            "sha256": hashlib.sha256(raw_path.read_bytes()).hexdigest(),
+        "considered_candidates_xyz": {
+            "path": considered_path.resolve().relative_to(iter_dir.resolve()).as_posix(),
+            "size": int(considered_path.stat().st_size),
+            "sha256": hashlib.sha256(considered_path.read_bytes()).hexdigest(),
         },
         "selected_xyz": {
             "path": final_path.resolve().relative_to(iter_dir.resolve()).as_posix(),
@@ -1462,9 +1459,9 @@ def _run_phase_b(args, campaign, config):
         },
         "n_candidates": int(len(candidate_frames)),
         "n_considered_after_refill": int(len(selected_frames)),
-        "n_selected_raw": int(len(raw_records)),
+        "n_considered": int(len(considered_records)),
         "n_kept": int(len(final_records)),
-        "raw": raw_records,
+        "considered": considered_records,
         "final": final_records,
         "dedup": dedup_payload,
         "refill": refill,
@@ -1487,7 +1484,7 @@ def _run_phase_b(args, campaign, config):
 
 
 def main(argv=None) -> int:
-    """Command-line entrypoint for POLUS diversity sub-sampling.
+    """Command-line entrypoint for ICHOR exact diversity selection.
 
     The daemon calls this from inside a sbatch script for both Phase A
     (initial pool sub-sample, run once at the start of a campaign) and
@@ -1506,17 +1503,17 @@ def main(argv=None) -> int:
     from pathlib import Path as _Path
 
     parser = argparse.ArgumentParser(
-        prog="python -m ichor.hpc.active_learning.sampling.polus_wrapper",
+        prog="python -m ichor.hpc.active_learning.sampling.diversity",
         description=(
-            "Run POLUS diversity sub-sampling for either the initial "
+            "Run ICHOR diversity selection for either the initial "
             "pool (Phase A) or the per-iteration adversarial pool "
             "(Phase B). Iteration zero means Phase A."
         ),
     )
     parser.add_argument(
         "--descriptor", type=str, required=True,
-        choices=["rmsd_massweight", "hybrid_alf_rmsd", "acquisition_weighted"],
-        help="Distance metric used to build the pairwise matrix POLUS chews on.",
+        choices=["rmsd_massweight", "hybrid_alf_rmsd"],
+        help="Distance metric used to build the exact pairwise store.",
     )
     parser.add_argument(
         "--iteration", type=int, required=True,
@@ -1530,7 +1527,7 @@ def main(argv=None) -> int:
         "--workers",
         type=int,
         default=1,
-        help="Snapshotted number of scientific POLUS distance workers.",
+        help="Snapshotted number of scientific distance workers.",
     )
     parser.add_argument(
         "--distance-store",
@@ -1558,16 +1555,28 @@ def main(argv=None) -> int:
     from ..config import CampaignConfig
     config = CampaignConfig.from_yaml(cfg_path)
 
-    # the descriptor actually used comes from campaign.yaml; --descriptor is
-    # only the launching script stating its intent. surface a mismatch loudly
-    # but let the config win rather than failing the whole job over it.
-    if args.descriptor and args.descriptor != config.phase_b.descriptor:
+    if int(args.iteration) == 0 and args.descriptor != "rmsd_massweight":
         print(
-            "note: --descriptor " + repr(args.descriptor) + " is overridden by "
-            + "campaign.yaml phase_b.descriptor "
+            "Phase A diversity requires descriptor 'rmsd_massweight'",
+            file=_sys.stderr,
+        )
+        return 2
+    if (
+        int(args.iteration) >= 1
+        and args.descriptor
+        and args.descriptor != config.phase_b.descriptor
+    ):
+        print(
+            "submitted descriptor "
+            + repr(args.descriptor)
+            + " does not match campaign.yaml phase_b.descriptor "
             + repr(config.phase_b.descriptor),
             file=_sys.stderr,
         )
+        return 2
+    if isinstance(args.workers, bool) or int(args.workers) <= 0:
+        print("--workers must be a positive integer", file=_sys.stderr)
+        return 2
 
     if int(args.iteration) == 0:
         return _run_phase_a(

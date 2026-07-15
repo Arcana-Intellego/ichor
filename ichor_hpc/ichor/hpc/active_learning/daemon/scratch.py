@@ -481,7 +481,7 @@ def _inventory_root(campaign: Path, root: Path) -> List[Dict[str, Any]]:
                 child_depth = depth + 1
                 valid_component = True
                 if child_depth == 1:
-                    valid_component = name in {"POLUS", "GAUSSIAN", "AIMALL", "ARIADNE", "FEREBUS"}
+                    valid_component = name in {"DIVERSITY", "GAUSSIAN", "AIMALL", "ARIADNE", "FEREBUS"}
                 elif child_depth == 2:
                     valid_component = bool(re.fullmatch(r"[A-Z][A-Z0-9_]*", name))
                 elif child_depth == 3:

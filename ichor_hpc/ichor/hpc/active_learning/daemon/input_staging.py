@@ -1033,7 +1033,7 @@ def stage_gaussian_inputs(
                     for value in selected
                 ]
                 initial_seed_selection_origins = [
-                    "custom_bootstrap" if value is None else "phase_a_polus"
+                    "custom_bootstrap" if value is None else "phase_a_diversity"
                     for value in selected
                 ]
                 pool = TrajectoryPool.load(campaign_dir)
@@ -1150,7 +1150,7 @@ def stage_gaussian_inputs(
                 seed_selection_origin=(
                     initial_seed_selection_origins[k]
                     if k < len(initial_seed_selection_origins)
-                    else "phase_a_polus"
+                    else "phase_a_diversity"
                 ),
                 seed_variance_at_selection=None,
                 subspace_neighbour_frame_ids=[],

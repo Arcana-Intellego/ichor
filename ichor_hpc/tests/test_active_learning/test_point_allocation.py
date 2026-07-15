@@ -66,6 +66,11 @@ def _results(attempts, accepted_ids):
             "candidate_id": attempt["candidate_id"],
             "accepted": attempt["candidate_id"] in accepted,
             "pointdir": "/staging/" + attempt["candidate_id"] + ".pointdir",
+            "quality_manifest": (
+                "/staging/" + attempt["candidate_id"] + "-quality.json"
+                if attempt["candidate_id"] in accepted
+                else None
+            ),
             "reason": (
                 None
                 if attempt["candidate_id"] in accepted
@@ -379,30 +384,25 @@ def test_create_retry_rejects_changed_candidate_evidence(tmp_path):
         )
 
 
-def test_candidate_diagnostics_are_strict_json_safe(tmp_path):
+def test_candidate_diagnostics_reject_non_finite_numbers(tmp_path):
     path = tmp_path / "POINT_ALLOCATION.json"
 
-    payload = create_point_allocation(
-        path,
-        campaign_uid="campaign-uid",
-        context="active",
-        iteration=1,
-        targets={"train": 1, "int_val": 0, "ext_val": 0, "total": 1},
-        primary_candidates=[
-            {
-                "candidate_id": "candidate-0",
-                "distance_to_nearest_angstrom": float("inf"),
-                "nested": {"score": float("nan")},
-            }
-        ],
-        reserve_candidates=[],
-    )
-
-    attempt = payload["slots"][0]["attempts"][0]
-    assert attempt["distance_to_nearest_angstrom"] is None
-    assert attempt["nested"]["score"] is None
-    assert "Infinity" not in path.read_text(encoding="utf-8")
-    assert "NaN" not in path.read_text(encoding="utf-8")
+    with pytest.raises(ValueError, match="non-finite"):
+        create_point_allocation(
+            path,
+            campaign_uid="campaign-uid",
+            context="active",
+            iteration=1,
+            targets={"train": 1, "int_val": 0, "ext_val": 0, "total": 1},
+            primary_candidates=[
+                {
+                    "candidate_id": "candidate-0",
+                    "distance_to_nearest_angstrom": float("inf"),
+                    "nested": {"score": float("nan")},
+                }
+            ],
+            reserve_candidates=[],
+        )
 
 
 def test_consumed_reserve_round_must_match_exact_replacement_attempt(tmp_path):
@@ -432,4 +432,55 @@ def test_allocation_reader_rejects_stale_derived_summary(tmp_path):
     path.write_text(json.dumps(tampered), encoding="utf-8", newline="\n")
 
     with pytest.raises(ValueError, match="summary is inconsistent"):
+        read_point_allocation(path)
+
+
+@pytest.mark.parametrize("bad", [1.5, "1", True, None])
+def test_allocation_reader_rejects_non_integer_generation(tmp_path, bad):
+    path, _payload = _create(tmp_path)
+    tampered = json.loads(path.read_text(encoding="utf-8"))
+    tampered["generation"] = bad
+    path.write_text(json.dumps(tampered), encoding="utf-8", newline="\n")
+    with pytest.raises(ValueError, match="exact JSON integer"):
+        read_point_allocation(path)
+
+
+@pytest.mark.parametrize("bad", ["false", 0, 1, None])
+def test_quantum_results_require_exact_boolean_acceptance(tmp_path, bad):
+    path, payload = _create(tmp_path)
+    result = _results(pending_attempts(payload), set())
+    result[0]["accepted"] = bad
+    with pytest.raises(ValueError, match="exact JSON Boolean"):
+        record_quantum_results(path, result)
+
+
+def test_accepted_attempt_requires_pointdir_and_quality_evidence(tmp_path):
+    path, payload = _create(tmp_path)
+    results = _results(
+        pending_attempts(payload),
+        {attempt["candidate_id"] for attempt in pending_attempts(payload)},
+    )
+    results[0].pop("quality_manifest")
+    with pytest.raises(ValueError, match="quality-manifest evidence"):
+        record_quantum_results(path, results)
+
+
+def test_reader_rejects_accepted_attempt_without_pointdir(tmp_path):
+    path, payload = _create(tmp_path)
+    results = _results(
+        pending_attempts(payload),
+        {attempt["candidate_id"] for attempt in pending_attempts(payload)},
+    )
+    record_quantum_results(path, results)
+    tampered = json.loads(path.read_text(encoding="utf-8"))
+    accepted = next(
+        attempt
+        for slot in tampered["slots"]
+        for attempt in slot["attempts"]
+        if attempt["status"] == "accepted"
+    )
+    accepted.pop("pointdir")
+    tampered.pop("summary", None)
+    path.write_text(json.dumps(tampered), encoding="utf-8", newline="\n")
+    with pytest.raises(ValueError, match="invalid pointdir"):
         read_point_allocation(path)

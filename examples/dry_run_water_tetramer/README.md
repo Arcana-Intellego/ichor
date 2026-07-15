@@ -5,7 +5,7 @@ Drives the daemon through TWO iterations using `--mode dry_run`, which writes
 real on-disk
 real artefacts, .i.e., scripts, reference-data delta versions, manifests,
 journal events, provenance sidecars) without calling Gaussian / AIMAll /
-FEREBUS / ARIADNE / POLUS. Finishes in ~30 seconds.
+FEREBUS / ARIADNE. Finishes in ~30 seconds.
 
 ## Contents
 
@@ -50,7 +50,7 @@ python -m ichor.hpc.active_learning.cli start \
 once `ichor_hpc` is installed in your environment.)
 
 Runs silently for ~30 seconds and exits cleanly. The daemon advances
-through every campaign phase (PHASE_A_POLUS -> INITIAL_GAUSSIAN -> ... ->
+through every campaign phase (PHASE_A_DIVERSITY -> INITIAL_GAUSSIAN -> ... ->
 FEREBUS -> STOP_CHECK -> DONE), commits two training-set + models
 iterations, and writes a journal entry per phase transition.
 
@@ -113,6 +113,6 @@ directories so they never accidentally land in a commit.
 
 For a real CSF4 campaign, initialise a separate campaign and bind its first
 start with `--mode live`. Execution mode is immutable. The daemon refuses with
-exit code 12 if Gaussian, AIMAll, FEREBUS, ARIADNE or POLUS is unavailable.
+exit code 12 if Gaussian, AIMAll, FEREBUS or ARIADNE is unavailable.
 See `docs/source/active_learning_daemon.rst` Section 5 for the cluster-
 side prerequisites + the canonical `module load` lines.

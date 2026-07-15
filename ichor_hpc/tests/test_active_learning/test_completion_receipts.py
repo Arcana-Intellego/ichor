@@ -28,7 +28,7 @@ def test_completion_receipt_roundtrip_binds_state_and_evidence(tmp_path):
     evidence.write_text('{"ok": true}\n', encoding="utf-8")
     before = fresh_campaign_state(campaign_uid=_CAMPAIGN_UID)
     after = fresh_campaign_state(campaign_uid=_CAMPAIGN_UID)
-    after.phase = CampaignPhase.PHASE_A_POLUS
+    after.phase = CampaignPhase.PHASE_A_DIVERSITY
 
     path = write_completion_receipt(
         campaign,
@@ -39,7 +39,7 @@ def test_completion_receipt_roundtrip_binds_state_and_evidence(tmp_path):
         config_sha256="a" * 64,
         state_before=before,
         state_after=after,
-        next_phase="PHASE_A_POLUS",
+        next_phase="PHASE_A_DIVERSITY",
         next_iteration=0,
         state_updates={},
         evidence=evidence_records(campaign, [evidence]),
@@ -53,7 +53,7 @@ def test_completion_receipt_roundtrip_binds_state_and_evidence(tmp_path):
     )
 
     assert payload["phase"] == "INIT"
-    assert payload["next_phase"] == "PHASE_A_POLUS"
+    assert payload["next_phase"] == "PHASE_A_DIVERSITY"
     assert payload["evidence"][0]["path"] == "handoff.json"
 
 
@@ -64,7 +64,7 @@ def test_completion_receipt_detects_evidence_drift(tmp_path):
     evidence.write_text('{"ok": true}\n', encoding="utf-8")
     before = fresh_campaign_state(campaign_uid=_CAMPAIGN_UID)
     after = fresh_campaign_state(campaign_uid=_CAMPAIGN_UID)
-    after.phase = CampaignPhase.PHASE_A_POLUS
+    after.phase = CampaignPhase.PHASE_A_DIVERSITY
     path = write_completion_receipt(
         campaign,
         campaign_uid=_CAMPAIGN_UID,
@@ -74,7 +74,7 @@ def test_completion_receipt_detects_evidence_drift(tmp_path):
         config_sha256="a" * 64,
         state_before=before,
         state_after=after,
-        next_phase="PHASE_A_POLUS",
+        next_phase="PHASE_A_DIVERSITY",
         next_iteration=0,
         state_updates={},
         evidence=evidence_records(campaign, [evidence]),
@@ -109,7 +109,7 @@ def test_completion_receipt_exposes_replayable_post_state(tmp_path):
     (campaign / ".DATA" / "ACTIVE_LEARNING").mkdir(parents=True)
     before = fresh_campaign_state(campaign_uid=_CAMPAIGN_UID)
     after = fresh_campaign_state(campaign_uid=_CAMPAIGN_UID)
-    after.phase = CampaignPhase.PHASE_A_POLUS
+    after.phase = CampaignPhase.PHASE_A_DIVERSITY
     write_completion_receipt(
         campaign,
         campaign_uid=_CAMPAIGN_UID,
@@ -119,7 +119,7 @@ def test_completion_receipt_exposes_replayable_post_state(tmp_path):
         config_sha256="b" * 64,
         state_before=before,
         state_after=after,
-        next_phase="PHASE_A_POLUS",
+        next_phase="PHASE_A_DIVERSITY",
         next_iteration=0,
         state_updates={},
         evidence=[],
@@ -132,7 +132,7 @@ def test_completion_receipt_exposes_replayable_post_state(tmp_path):
     )
 
     assert len(matches) == 1
-    assert matches[0]["payload"]["state_after"]["phase"] == "PHASE_A_POLUS"
+    assert matches[0]["payload"]["state_after"]["phase"] == "PHASE_A_DIVERSITY"
 
 
 def test_daemon_replays_receipt_after_state_persist_crash(tmp_path, monkeypatch):
@@ -162,5 +162,5 @@ def test_daemon_replays_receipt_after_state_persist_crash(tmp_path, monkeypatch)
     assert read_state(daemon.state_path()).phase is CampaignPhase.INIT
     assert daemon.tick() == TickStatus.ADVANCED
     recovered = read_state(daemon.state_path())
-    assert recovered.phase is CampaignPhase.PHASE_A_POLUS
+    assert recovered.phase is CampaignPhase.PHASE_A_DIVERSITY
     assert recovered.last_completion_receipt is not None

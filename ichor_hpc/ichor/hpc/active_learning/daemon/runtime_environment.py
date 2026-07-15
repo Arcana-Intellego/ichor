@@ -23,7 +23,6 @@ SUBMITTED_PYTHON_IMPORTS = {
     "ichor_core": ("ichor.core",),
     "ichor_hpc": ("ichor.hpc",),
     "ariadne": ("ariadne",),
-    "polus_rs": ("polus.samplers.RS.randomSampling",),
     "pyferebus": (
         "pyferebus.executors.trainer",
         "pyferebus.writers.config_file",

@@ -6,8 +6,10 @@ from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.geometry_protocol import PHASE_B_MIN_SEPARATION_SCALE
 from ichor.hpc.active_learning.handoff_manifests import (
     ARIADNE_RESULTS_SCHEMA_VERSION,
+    SEED_SELECTION_SCHEMA_VERSION,
     ariadne_landing_audit_path,
     ariadne_results_path,
+    build_seed_selection_manifest,
     seeds_picked_path,
     write_ariadne_landing_audit,
     write_ariadne_results_manifest,
@@ -23,17 +25,14 @@ from ichor.hpc.active_learning.ariadne_outputs import (
     write_seed_output_manifest,
 )
 from ichor.hpc.active_learning.daemon.state import atomic_write_json
-from ichor.hpc.active_learning.seed_identity import (
-    deterministic_seed_uid,
-    selection_fingerprint_sha256,
-    write_ariadne_task_map,
-)
+from ichor.hpc.active_learning.seed_identity import write_ariadne_task_map
 from ichor.hpc.active_learning.versioning.manifest import sha256_file
 from ichor.hpc.active_learning.versioning.provenance import (
     PROVENANCE_FILENAME,
     write_seed_provenance,
 )
 from ichor.hpc.active_learning.sampling_protocol import (
+    SAMPLING_AGGRESSIVENESS_POLICY_VERSION,
     hidden_sampling_overrides,
     phase_b_min_separation_from_resolved,
     preview_sampling_protocol,
@@ -43,6 +42,8 @@ from ichor.hpc.active_learning.sampling_protocol import (
     resolve_sampling_protocol,
     sampling_protocol_audit_path,
     sampling_protocol_resolved_path,
+    sampling_policy_table_payload,
+    sampling_policy_table_sha256,
 )
 from ichor.hpc.active_learning.sampling_scale_model import (
     read_sampling_scale_model,
@@ -60,35 +61,23 @@ def _write_strict_history(
 ):
     iter_dir = active_iteration_dir(campaign, iteration)
     ariadne_root = active_ariadne_dir(iter_dir)
-    selection = {
-        "schema_version": 2,
-        "campaign_uid": "sampling-protocol-test",
-        "iteration": int(iteration),
-        "models_version": 0,
-        "model_manifest_sha256": "a" * 64,
-        "trajectory_sha256": "b" * 64,
-        "selection_strategy": "hybrid_variance",
-        "n_picked": 1,
-        "seed_records": [{
+    selection = build_seed_selection_manifest(
+        campaign_uid="sampling-protocol-test",
+        campaign_random_seed=0,
+        iteration=int(iteration),
+        models_version=0,
+        model_manifest_sha256="a" * 64,
+        trajectory_sha256="b" * 64,
+        selection_strategy="hybrid_variance",
+        seed_records=[{
             "seed_id": 1,
             "frame_id": 10,
             "pool_row_index_zero_based": 10,
             "selection_origin": "bulk",
             "variance_at_selection": 0.1,
         }],
-    }
-    fingerprint = selection_fingerprint_sha256(selection)
-    selection["selection_fingerprint_sha256"] = fingerprint
-    seed_uid = deterministic_seed_uid(
-        campaign_uid=selection["campaign_uid"],
-        iteration=int(iteration),
-        seed_id=1,
-        frame_id=10,
-        models_version=0,
-        model_manifest_sha256=selection["model_manifest_sha256"],
-        selection_fingerprint_sha256_value=fingerprint,
     )
-    selection["seed_records"][0]["seed_uid"] = seed_uid
+    seed_uid = str(selection["seed_records"][0]["seed_uid"])
     selection_path = seeds_picked_path(iter_dir)
     selection_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(selection_path, selection)
@@ -259,14 +248,14 @@ def test_level_five_preview_matches_current_balanced_defaults():
     assert resolved.acquisition_config.fullspace_confinement.fixed_residual_scale_ang == pytest.approx(0.5)
     assert resolved.ariadne_run_config.delta0 == pytest.approx(0.10)
     assert resolved.ariadne_run_config.delta_max == pytest.approx(0.40)
-    dimensionless = resolved.scale_model_payload["dimensionless_preset"]
+    dimensionless = resolved.scale_model_payload["dimensionless_policy"]
     assert dimensionless["max_scaled_whitened_distance"] == pytest.approx(10.0)
     assert dimensionless["max_scaled_atom_move"] == pytest.approx(36.0)
     assert dimensionless["max_scaled_rmsd"] == pytest.approx(4.2)
     assert dimensionless["normalised_chemistry_penalty_cap"] == pytest.approx(20.0)
 
 
-def test_aggressiveness_profiles_move_from_conservative_to_exploratory():
+def test_aggressiveness_policies_move_from_conservative_to_exploratory():
     conservative = CampaignConfig()
     conservative.campaign.sampling_aggressiveness = 1
     exploratory = CampaignConfig()
@@ -275,11 +264,11 @@ def test_aggressiveness_profiles_move_from_conservative_to_exploratory():
     low = preview_sampling_protocol(conservative)
     high = preview_sampling_protocol(exploratory)
 
-    assert high.profile.geometry_fallback_scale_angstrom > low.profile.geometry_fallback_scale_angstrom
-    assert high.profile.max_whitened_distance > low.profile.max_whitened_distance
-    assert high.profile.lambda_distance < low.profile.lambda_distance
-    assert high.profile.ariadne_max_displacement_ang > low.profile.ariadne_max_displacement_ang
-    assert high.ariadne_run_config.delta_max > low.ariadne_run_config.delta_max
+    assert high.policy.fallback_scale_angstrom > low.policy.fallback_scale_angstrom
+    assert high.policy.max_whitened_distance > low.policy.max_whitened_distance
+    assert high.policy.lambda_distance < low.policy.lambda_distance
+    assert high.policy.max_atom_displacement_ang > low.policy.max_atom_displacement_ang
+    assert high.policy.trust_max_to_initial_ratio < low.policy.trust_max_to_initial_ratio
     assert (
         high.scale_model_payload["trust_radius_policy"][
             "aggressiveness_multiplier"
@@ -288,9 +277,19 @@ def test_aggressiveness_profiles_move_from_conservative_to_exploratory():
             "aggressiveness_multiplier"
         ]
     )
-    assert high.profile.max_scaled_atom_move > low.profile.max_scaled_atom_move
-    assert high.profile.max_scaled_rmsd > low.profile.max_scaled_rmsd
-    assert high.profile.normalised_chemistry_penalty_cap > low.profile.normalised_chemistry_penalty_cap
+    assert high.policy.max_scaled_atom_move > low.policy.max_scaled_atom_move
+    assert high.policy.max_scaled_rmsd > low.policy.max_scaled_rmsd
+    assert high.policy.normalised_chemistry_penalty_cap > low.policy.normalised_chemistry_penalty_cap
+
+
+def test_sampling_policy_table_is_versioned_complete_and_hashed():
+    payload = sampling_policy_table_payload()
+
+    assert payload["policy_version"] == SAMPLING_AGGRESSIVENESS_POLICY_VERSION
+    assert set(payload["levels"]) == {str(level) for level in range(1, 11)}
+    assert len(sampling_policy_table_sha256()) == 64
+    assert payload["levels"]["5"]["movement_trust_multiplier"] == pytest.approx(1.0)
+    assert payload["levels"]["5"]["trust_max_to_initial_ratio"] == pytest.approx(4.0)
 
 
 def test_hidden_low_level_overrides_are_reported_not_applied():
@@ -305,14 +304,14 @@ def test_hidden_low_level_overrides_are_reported_not_applied():
 
     assert "acquisition.weights.lambda_distance" in paths
     assert "geometry_novelty.fallback_scale_angstrom" in paths
-    assert "phase_b.beta" in paths
+    assert "phase_b.beta" not in paths
     assert "quality_gates.ariadne_min_pair_distance_ang" in paths
 
     resolved = preview_sampling_protocol(cfg)
 
     assert resolved.acquisition_config.weights.lambda_distance == pytest.approx(1.0)
     assert resolved.geometry_scale_payload["scale_angstrom"] == pytest.approx(0.05)
-    assert resolved.phase_b["beta"] == pytest.approx(CampaignConfig().phase_b.beta)
+    assert resolved.phase_b["beta"] == pytest.approx(0.9)
     assert resolved.quality_gates.ariadne_min_pair_distance_ang == pytest.approx(0.60)
 
 
@@ -335,17 +334,19 @@ def test_resolver_writes_round_trippable_manifest(tmp_path):
     payload = read_sampling_protocol_resolved(iter_dir, expected_iteration=2)
     audit_payload = read_sampling_protocol_audit(iter_dir, expected_iteration=2)
     scale_payload = read_sampling_scale_model(iter_dir, expected_iteration=2)
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["sampling_aggressiveness"] == 5
     assert payload["sampling_scale_model_manifest"] == str(scale_path)
     assert payload["sampling_protocol_audit_manifest"] == str(audit_path)
-    assert payload["dimensionless_preset"]["max_scaled_atom_move"] == pytest.approx(36.0)
-    assert audit_payload["schema_version"] == 1
-    assert audit_payload["dimensionless_preset"]["max_scaled_atom_move"] == pytest.approx(36.0)
+    assert payload["sampling_policy_version"] == 1
+    assert payload["sampling_policy_table_sha256"] == sampling_policy_table_sha256()
+    assert payload["dimensionless_policy"]["max_scaled_atom_move"] == pytest.approx(36.0)
+    assert audit_payload["schema_version"] == 2
+    assert audit_payload["dimensionless_policy"]["max_scaled_atom_move"] == pytest.approx(36.0)
     assert audit_payload["scheduler_impact"]["new_scheduler_jobs"] == 0
-    assert scale_payload["schema_version"] == 1
-    assert scale_payload["model_version"] == 2
-    assert scale_payload["dimensionless_preset"]["max_scaled_rmsd"] == pytest.approx(4.2)
+    assert scale_payload["schema_version"] == 2
+    assert scale_payload["model_version"] == 3
+    assert scale_payload["dimensionless_policy"]["max_scaled_rmsd"] == pytest.approx(4.2)
     assert scale_payload["geometry_motion_scale"]["value_angstrom"] == pytest.approx(0.05)
     assert payload["resolved_phase_b"]["effective_min_separation_angstrom"] == pytest.approx(
         PHASE_B_MIN_SEPARATION_SCALE * 0.05
@@ -405,7 +406,7 @@ def test_scale_model_uses_previous_result_json_motion_history(tmp_path):
     assert scale["per_atom_mobility_scales"]["values_angstrom"] == pytest.approx(
         [0.1, 0.2]
     )
-    assert scale["model_version"] == 2
+    assert scale["model_version"] == 3
 
 
 def test_scale_model_uses_only_strictly_accepted_history(tmp_path):
@@ -526,22 +527,17 @@ def test_scale_model_populates_per_seed_records_from_seed_records(tmp_path):
     iter1 = active_iteration_dir(tmp_path, 1)
     iter1.mkdir(parents=True)
     seeds_picked_path(iter1).parent.mkdir(parents=True, exist_ok=True)
-    seeds_picked_path(iter1).write_text(
-        json.dumps(
-            {
-                "schema_version": 2,
-                "campaign_uid": "sampling-protocol-test",
-                "iteration": 1,
-                "models_version": 0,
-                "model_manifest_sha256": "a" * 64,
-                "trajectory_sha256": "b" * 64,
-                "n_picked": 2,
-                "frame_ids": [10, 20],
-                "indices": [10, 20],
-                "seed_records": [
+    selection = build_seed_selection_manifest(
+        campaign_uid="sampling-protocol-test",
+        campaign_random_seed=0,
+        iteration=1,
+        models_version=0,
+        model_manifest_sha256="a" * 64,
+        trajectory_sha256="b" * 64,
+        selection_strategy="d_optimal",
+        seed_records=[
                     {
                         "seed_id": 1,
-                        "seed_uid": "c" * 64,
                         "frame_id": 10,
                         "pool_row_index_zero_based": 10,
                         "selection_origin": "bulk",
@@ -549,17 +545,14 @@ def test_scale_model_populates_per_seed_records_from_seed_records(tmp_path):
                     },
                     {
                         "seed_id": 2,
-                        "seed_uid": "d" * 64,
                         "frame_id": 20,
                         "pool_row_index_zero_based": 20,
                         "selection_origin": "d_optimal",
                         "variance_at_selection": 0.4,
                     },
                 ],
-            }
-        ),
-        encoding="utf-8",
     )
+    atomic_write_json(seeds_picked_path(iter1), selection)
 
     resolved = resolve_sampling_protocol(tmp_path, CampaignConfig(), iteration=1)
     per_seed = resolved.scale_model_payload["per_seed_scale_model"]

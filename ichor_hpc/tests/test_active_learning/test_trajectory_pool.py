@@ -1,5 +1,6 @@
 """Tests for ichor.hpc.active_learning.acquisition.trajectory_pool (M9)."""
 import json
+import math
 import os
 from pathlib import Path
 
@@ -135,6 +136,50 @@ def test_frame_index_out_of_range_raises(tmp_path):
         pool.frame(-1)
     with pytest.raises(IndexError):
         pool.frame(pool.n_frames())
+
+
+@pytest.mark.parametrize("frame_id", [0.9, "0", True, None])
+def test_frame_index_requires_an_exact_non_boolean_integer(tmp_path, frame_id):
+    pool = TrajectoryPool.import_from(FIXTURE, tmp_path)
+
+    with pytest.raises(TypeError, match="exact integer"):
+        pool.frame(frame_id)
+
+
+@pytest.mark.parametrize(
+    "field, value, message",
+    [
+        ("schema_version", True, "schema_version"),
+        ("n_frames", True, "n_frames"),
+        ("natoms", 0, "natoms"),
+        ("sha256", "not-a-digest", "sha256"),
+        ("imported_iso", "not-a-time", "imported_iso"),
+        ("masses", [math.nan], "masses"),
+    ],
+)
+def test_pool_manifest_rejects_malformed_scientific_metadata(
+    tmp_path,
+    field,
+    value,
+    message,
+):
+    pool = TrajectoryPool.import_from(FIXTURE, tmp_path)
+    payload = pool.manifest.to_dict()
+    payload[field] = value
+
+    with pytest.raises(ValueError, match=message):
+        TrajectoryPoolManifest.from_dict(payload)
+
+
+def test_pool_load_rejects_manifest_atom_metadata_drift(tmp_path):
+    TrajectoryPool.import_from(FIXTURE, tmp_path)
+    manifest_path = tmp_path / POOL_SUBDIR / POOL_MANIFEST_FILENAME
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["atom_types"][0] = "N"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="metadata"):
+        TrajectoryPool.load(tmp_path)
 
 
 def test_to_atoms_list_returns_fresh_list(tmp_path):

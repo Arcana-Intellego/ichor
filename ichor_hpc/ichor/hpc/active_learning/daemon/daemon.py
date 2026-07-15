@@ -100,7 +100,7 @@ LAST_EXCEPTION_FILENAME = "LAST_EXCEPTION.json"
 
 PHASE_ORDER: Tuple[CampaignPhase, ...] = (
     CampaignPhase.INIT,
-    CampaignPhase.PHASE_A_POLUS,
+    CampaignPhase.PHASE_A_DIVERSITY,
     CampaignPhase.INITIAL_GAUSSIAN,
     CampaignPhase.INITIAL_AIMALL,
     CampaignPhase.INITIAL_ALLOCATION_CHECK,
@@ -109,7 +109,7 @@ PHASE_ORDER: Tuple[CampaignPhase, ...] = (
     CampaignPhase.INITIAL_FEREBUS,
     CampaignPhase.SEED_SELECT,
     CampaignPhase.ARIADNE_ARRAY,
-    CampaignPhase.PHASE_B_POLUS,
+    CampaignPhase.PHASE_B_DIVERSITY,
     CampaignPhase.SPLIT,
     CampaignPhase.GAUSSIAN,
     CampaignPhase.AIMALL,
@@ -3535,7 +3535,7 @@ class Daemon:
         campaign = self.campaign_dir
         iteration = int(state.iteration)
         paths: List[Path] = []
-        if phase is CampaignPhase.PHASE_A_POLUS:
+        if phase is CampaignPhase.PHASE_A_DIVERSITY:
             paths.append(phase_a_sample_manifest_path(bootstrap_selection_dir(campaign)))
         elif phase is CampaignPhase.SEED_SELECT:
             paths.append(seeds_picked_path(active_iteration_dir(campaign, iteration)))
@@ -3549,7 +3549,7 @@ class Daemon:
                     ariadne_batch_decision_path(iter_dir),
                 ]
             )
-        elif phase is CampaignPhase.PHASE_B_POLUS:
+        elif phase is CampaignPhase.PHASE_B_DIVERSITY:
             paths.append(phase_b_selection_path(active_iteration_dir(campaign, iteration)))
         elif phase is CampaignPhase.SPLIT:
             paths.append(

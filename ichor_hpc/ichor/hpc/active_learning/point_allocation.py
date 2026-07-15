@@ -18,11 +18,92 @@ from .layout import (
 )
 
 
-POINT_ALLOCATION_SCHEMA_VERSION = 3
+POINT_ALLOCATION_SCHEMA_VERSION = 4
 POINT_ALLOCATION_FILENAME = "POINT_ALLOCATION.json"
 POINT_ALLOCATION_LOCK_FILENAME = "POINT_ALLOCATION.lock"
 VALID_CONTEXTS = frozenset({"bootstrap", "active"})
 VALID_SPLITS = frozenset({"train", "int_val", "ext_val"})
+MAX_MANIFEST_INTEGER = (1 << 63) - 1
+CANDIDATE_INTEGER_FIELDS = frozenset({
+    "frame_id",
+    "custom_index",
+    "source_index",
+    "seed_id",
+    "seed_frame_id",
+    "pool_row_index_zero_based",
+    "candidate_pool_index_zero_based",
+    "considered_rank",
+    "final_rank",
+    "reserve_rank",
+    "diversity_rank",
+    "seed_index",
+    "replacement_round",
+})
+
+
+def _required_integer(
+    value: Any,
+    label: str,
+    *,
+    minimum: int = 0,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(label + " must be an exact JSON integer")
+    result = int(value)
+    if result < minimum or result > MAX_MANIFEST_INTEGER:
+        raise ValueError(
+            label
+            + " must be between "
+            + str(minimum)
+            + " and "
+            + str(MAX_MANIFEST_INTEGER)
+        )
+    return result
+
+
+def _optional_integer(value: Any, label: str, *, minimum: int = 0) -> Optional[int]:
+    if value is None:
+        return None
+    return _required_integer(value, label, minimum=minimum)
+
+
+def _validate_candidate_integer_fields(record: Dict[str, Any], label: str) -> None:
+    for key in CANDIDATE_INTEGER_FIELDS:
+        if key in record and record[key] is not None:
+            record[key] = _required_integer(record[key], label + " " + key)
+
+
+def _validate_terminal_attempt(attempt: Dict[str, Any], label: str) -> None:
+    status = str(attempt.get("status") or "")
+    if status == "pending":
+        for field_name in ("pointdir", "reason", "quality_manifest"):
+            if attempt.get(field_name) not in (None, ""):
+                raise ValueError(label + " pending attempt contains terminal evidence")
+        return
+    pointdir_text = str(attempt.get("pointdir") or "").strip()
+    pointdir_path = Path(pointdir_text)
+    if (
+        not pointdir_text
+        or any(character in pointdir_text for character in "\r\n\x00")
+        or any(part in {".", ".."} for part in pointdir_path.parts)
+        or Path(pointdir_text).name != pointdir_text.replace("\\", "/").split("/")[-1]
+        or not pointdir_path.name.endswith(".pointdir")
+    ):
+        raise ValueError(label + " terminal attempt has an invalid pointdir")
+    reason = attempt.get("reason")
+    if status == "accepted":
+        if reason not in (None, ""):
+            raise ValueError(label + " accepted attempt cannot have a rejection reason")
+        quality = str(attempt.get("quality_manifest") or "").strip()
+        if (
+            not quality
+            or any(character in quality for character in "\r\n\x00")
+            or any(part in {".", ".."} for part in Path(quality).parts)
+            or Path(quality).suffix.lower() != ".json"
+        ):
+            raise ValueError(label + " accepted attempt lacks quality-manifest evidence")
+    elif not isinstance(reason, str) or not reason.strip():
+        raise ValueError(label + " rejected attempt must have a non-empty reason")
 
 
 class PointAllocationLockError(RuntimeError):
@@ -55,7 +136,9 @@ def slot_assignment_sha256(payload: Mapping[str, Any]) -> str:
             raise ValueError("point-allocation slot lacks an initial attempt")
         assignment.append(
             {
-                "slot_id": int(slot["slot_id"]),
+                "slot_id": _required_integer(
+                    slot.get("slot_id"), "point-allocation slot_id"
+                ),
                 "split": str(slot["split"]),
                 "candidate_id": str(attempts[0]["candidate_id"]),
             }
@@ -70,13 +153,14 @@ def point_allocation_path(
     iteration: int,
 ) -> Path:
     campaign = Path(campaign_dir)
+    resolved_iteration = _required_integer(iteration, "point-allocation iteration")
     if str(context) == "bootstrap":
-        if int(iteration) != 0:
+        if resolved_iteration != 0:
             raise ValueError("bootstrap point allocation requires iteration 0")
         return bootstrap_allocation_dir(campaign) / POINT_ALLOCATION_FILENAME
     if str(context) == "active":
         return active_allocation_dir(
-            active_iteration_dir(campaign, int(iteration))
+            active_iteration_dir(campaign, resolved_iteration)
         ) / POINT_ALLOCATION_FILENAME
     raise ValueError("point-allocation context must be bootstrap or active")
 
@@ -105,14 +189,27 @@ def allocation_targets(config: Any, context: str) -> Dict[str, int]:
     block = config.point_allocation
     if str(context) == "bootstrap":
         counts = {
-            "train": int(block.bootstrap_training_size),
-            "int_val": int(block.bootstrap_internal_validation_size),
-            "ext_val": int(block.bootstrap_external_validation_size),
+            "train": _required_integer(
+                block.bootstrap_training_size, "bootstrap training target"
+            ),
+            "int_val": _required_integer(
+                block.bootstrap_internal_validation_size,
+                "bootstrap internal-validation target",
+            ),
+            "ext_val": _required_integer(
+                block.bootstrap_external_validation_size,
+                "bootstrap external-validation target",
+            ),
         }
     elif str(context) == "active":
         counts = {
-            "train": int(block.batch_training_size),
-            "int_val": int(block.batch_internal_validation_size),
+            "train": _required_integer(
+                block.batch_training_size, "active training target"
+            ),
+            "int_val": _required_integer(
+                block.batch_internal_validation_size,
+                "active internal-validation target",
+            ),
             "ext_val": 0,
         }
     else:
@@ -136,10 +233,11 @@ def stable_candidate_id(
     source_identity: Any,
     provenance_sha256: Optional[str] = None,
 ) -> str:
+    resolved_iteration = _required_integer(iteration, "candidate iteration")
     payload = {
         "campaign_uid": str(campaign_uid),
         "context": str(context),
-        "iteration": int(iteration),
+        "iteration": resolved_iteration,
         "source_identity": source_identity,
         "provenance_sha256": str(provenance_sha256 or ""),
     }
@@ -158,7 +256,11 @@ def _normalise_candidate(record: Mapping[str, Any]) -> Dict[str, Any]:
             return int(value)
         if isinstance(value, Real):
             numeric = float(value)
-            return numeric if math.isfinite(numeric) else None
+            if not math.isfinite(numeric):
+                raise ValueError(
+                    "point-allocation candidate contains a non-finite number"
+                )
+            return numeric
         return value
 
     candidate = json_safe(dict(record))
@@ -166,6 +268,7 @@ def _normalise_candidate(record: Mapping[str, Any]) -> Dict[str, Any]:
     if not candidate_id:
         raise ValueError("point-allocation candidate is missing candidate_id")
     candidate["candidate_id"] = candidate_id
+    _validate_candidate_integer_fields(candidate, "point-allocation candidate")
     return candidate
 
 
@@ -260,7 +363,9 @@ def _validate_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
     if not isinstance(payload, Mapping):
         raise ValueError("point-allocation manifest must be a JSON object")
     data = copy.deepcopy(dict(payload))
-    if int(data.get("schema_version", -1)) != POINT_ALLOCATION_SCHEMA_VERSION:
+    if _required_integer(
+        data.get("schema_version"), "point-allocation schema_version"
+    ) != POINT_ALLOCATION_SCHEMA_VERSION:
         raise ValueError("unsupported point-allocation manifest schema")
     campaign_uid = str(data.get("campaign_uid") or "").strip()
     if not campaign_uid:
@@ -269,7 +374,7 @@ def _validate_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
     context = str(data.get("context") or "")
     if context not in VALID_CONTEXTS:
         raise ValueError("point-allocation manifest context is invalid")
-    iteration = int(data.get("iteration", -1))
+    iteration = _required_integer(data.get("iteration"), "point-allocation iteration")
     if (
         iteration < 0
         or (context == "bootstrap" and iteration != 0)
@@ -277,9 +382,7 @@ def _validate_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
     ):
         raise ValueError("point-allocation manifest iteration is invalid")
     data["iteration"] = iteration
-    generation = int(data.get("generation", -1))
-    if generation < 0:
-        raise ValueError("point-allocation generation must be >= 0")
+    generation = _required_integer(data.get("generation"), "point-allocation generation")
     data["generation"] = generation
     previous_hash = data.get("previous_generation_sha256")
     if generation == 0:
@@ -297,11 +400,13 @@ def _validate_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
     if not isinstance(targets, dict):
         raise ValueError("point-allocation manifest targets must be an object")
     for split in ("train", "int_val", "ext_val"):
-        value = int(targets.get(split, -1))
-        if value < 0:
-            raise ValueError("point-allocation target is invalid for " + split)
+        value = _required_integer(
+            targets.get(split), "point-allocation target " + split
+        )
         targets[split] = value
-    targets["total"] = int(targets.get("total", -1))
+    targets["total"] = _required_integer(
+        targets.get("total"), "point-allocation target total"
+    )
     if targets["total"] != sum(targets[split] for split in VALID_SPLITS):
         raise ValueError("point-allocation target total is inconsistent")
     slots = data.get("slots")
@@ -322,8 +427,10 @@ def _validate_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
         if len(batch_id) != 64 or len(fingerprint) != 64 or batch_id in batch_ids:
             raise ValueError("point-allocation quantum batch identity is invalid")
         batch_ids.add(batch_id)
-        if int(record.get("source_generation", -1)) < 0:
-            raise ValueError("point-allocation quantum batch source generation is invalid")
+        record["source_generation"] = _required_integer(
+            record.get("source_generation"),
+            "point-allocation quantum batch source generation",
+        )
         candidate_ids = record.get("candidate_ids")
         if not isinstance(candidate_ids, list) or not candidate_ids:
             raise ValueError("point-allocation quantum batch candidate IDs are invalid")
@@ -331,7 +438,9 @@ def _validate_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
     attempt_locations: Dict[str, Tuple[int, str, Dict[str, Any]]] = {}
     split_counts = {split: 0 for split in VALID_SPLITS}
     for index, slot in enumerate(slots):
-        if not isinstance(slot, dict) or int(slot.get("slot_id", -1)) != index:
+        if not isinstance(slot, dict) or _required_integer(
+            slot.get("slot_id"), "point-allocation slot_id"
+        ) != index:
             raise ValueError("point-allocation slots must be ordered by slot_id")
         split = str(slot.get("split") or "")
         if split not in VALID_SPLITS:
@@ -346,6 +455,10 @@ def _validate_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
         for attempt_index, attempt in enumerate(attempts):
             if not isinstance(attempt, dict):
                 raise ValueError("point-allocation attempt must be an object")
+            _validate_candidate_integer_fields(
+                attempt,
+                "point-allocation attempt " + str(attempt_index),
+            )
             candidate_id = str(attempt.get("candidate_id") or "")
             if not candidate_id or candidate_id in attempt_candidate_ids:
                 raise ValueError("point-allocation candidate IDs must be non-empty and unique")
@@ -357,22 +470,32 @@ def _validate_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
                 accepted_indexes.append(attempt_index)
             elif status == "pending":
                 pending_indexes.append(attempt_index)
-            attempt_round = int(attempt.get("round", -1))
-            if attempt_round < 0:
-                raise ValueError("point-allocation attempt round must be >= 0")
+            attempt_round = _required_integer(
+                attempt.get("round"), "point-allocation attempt round"
+            )
+            attempt["round"] = attempt_round
+            mandatory_custom = attempt.get("mandatory_custom", False)
+            if not isinstance(mandatory_custom, bool):
+                raise ValueError(
+                    "point-allocation mandatory_custom must be a JSON Boolean"
+                )
             if attempt_index == 0 and attempt_round != 0:
                 raise ValueError("point-allocation primary attempt must be round zero")
             if attempt_round <= previous_round:
                 raise ValueError(
                     "point-allocation attempt rounds must increase strictly per slot"
                 )
-            if bool(attempt.get("mandatory_custom", False)) and (
+            if mandatory_custom and (
                 attempt_index != 0 or attempt_round != 0
             ):
                 raise ValueError(
                     "mandatory custom attempts must be round-zero candidates"
                 )
             previous_round = attempt_round
+            _validate_terminal_attempt(
+                attempt,
+                "point-allocation attempt " + str(attempt_index),
+            )
             attempt_locations[candidate_id] = (index, split, attempt)
         if len(pending_indexes) > 1 or (
             pending_indexes and pending_indexes[0] != len(attempts) - 1
@@ -380,13 +503,17 @@ def _validate_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
             raise ValueError(
                 "only the latest point-allocation attempt may be pending"
             )
-        selected = slot.get("accepted_attempt")
+        selected = _optional_integer(
+            slot.get("accepted_attempt"),
+            "point-allocation accepted_attempt",
+        )
+        slot["accepted_attempt"] = selected
         if selected is None:
             if accepted_indexes:
                 raise ValueError("accepted point-allocation attempt is not selected")
-        elif accepted_indexes != [int(selected)]:
+        elif accepted_indexes != [selected]:
             raise ValueError("point-allocation accepted_attempt is inconsistent")
-        if selected is not None and int(selected) != len(attempts) - 1:
+        if selected is not None and selected != len(attempts) - 1:
             raise ValueError("accepted point-allocation attempt must be final")
     if split_counts != {split: int(targets[split]) for split in VALID_SPLITS}:
         raise ValueError("point-allocation slot split counts do not match targets")
@@ -394,6 +521,7 @@ def _validate_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
     for record in reserve:
         if not isinstance(record, dict):
             raise ValueError("point-allocation reserve record must be an object")
+        _validate_candidate_integer_fields(record, "point-allocation reserve")
         candidate_id = str(record.get("candidate_id") or "")
         status = str(record.get("status", "available"))
         if not candidate_id:
@@ -405,11 +533,16 @@ def _validate_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
         if status not in {"available", "consumed"}:
             raise ValueError("point-allocation reserve status is invalid")
         if status == "consumed":
-            consumed_round = int(record.get("consumed_round", -1))
-            if consumed_round <= 0:
-                raise ValueError("consumed reserve candidate must record a positive round")
+            consumed_round = _required_integer(
+                record.get("consumed_round"),
+                "point-allocation consumed reserve round",
+                minimum=1,
+            )
+            record["consumed_round"] = consumed_round
             slot_id, split, attempt = attempt_locations[candidate_id]
-            if int(attempt.get("round", -1)) != consumed_round:
+            if _required_integer(
+                attempt.get("round"), "point-allocation replacement attempt round"
+            ) != consumed_round:
                 raise ValueError("consumed reserve round does not match its exact attempt")
             if _immutable_candidate_payload(record) != _immutable_candidate_payload(attempt):
                 raise ValueError("consumed reserve payload does not match its exact attempt")
@@ -422,7 +555,9 @@ def _validate_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
     replacement_attempt_ids = {
         candidate_id
         for candidate_id, (_slot_id, _split, attempt) in attempt_locations.items()
-        if int(attempt.get("round", 0)) > 0
+        if _required_integer(
+            attempt.get("round"), "point-allocation replacement attempt round"
+        ) > 0
     }
     if replacement_attempt_ids != consumed_ids:
         raise ValueError(
@@ -546,6 +681,21 @@ def create_point_allocation(
     mandatory_candidate_ids: Sequence[str] = (),
 ) -> Dict[str, Any]:
     manifest = Path(path)
+    resolved_iteration = _required_integer(iteration, "point-allocation iteration")
+    normalised_targets = {
+        split: _required_integer(
+            targets.get(split), "point-allocation target " + split
+        )
+        for split in ("train", "int_val", "ext_val")
+    }
+    normalised_targets["total"] = _required_integer(
+        targets.get("total"), "point-allocation target total"
+    )
+    if normalised_targets["total"] != sum(
+        normalised_targets[split] for split in VALID_SPLITS
+    ):
+        raise ValueError("point-allocation target total is inconsistent")
+    targets = normalised_targets
     primary = [_normalise_candidate(record) for record in primary_candidates]
     reserve = [_normalise_candidate(record) for record in reserve_candidates]
     expected_total = int(targets["total"])
@@ -600,7 +750,7 @@ def create_point_allocation(
         primary_by_id,
         campaign_uid=campaign_uid,
         context=context,
-        iteration=iteration,
+        iteration=resolved_iteration,
     )
     for candidate_id, slot in zip(ordered_ids, available_slots):
         slot["attempts"].append(
@@ -612,7 +762,7 @@ def create_point_allocation(
         "previous_generation_sha256": None,
         "campaign_uid": str(campaign_uid),
         "context": str(context),
-        "iteration": int(iteration),
+        "iteration": resolved_iteration,
         "targets": {
             "train": int(targets["train"]),
             "int_val": int(targets["int_val"]),
@@ -697,10 +847,14 @@ def _mutate_manifest(path: Path, mutator, *, expected_generation: Optional[int] 
     with _allocation_lock(path):
         payload = read_point_allocation(path)
         generation = int(payload.get("generation", 0))
-        if expected_generation is not None and generation != int(expected_generation):
+        resolved_expected_generation = _optional_integer(
+            expected_generation,
+            "expected point-allocation generation",
+        )
+        if resolved_expected_generation is not None and generation != resolved_expected_generation:
             raise ValueError(
                 "stale point-allocation generation: expected "
-                + str(int(expected_generation)) + ", found " + str(generation)
+                + str(resolved_expected_generation) + ", found " + str(generation)
             )
         previous = dict(payload)
         previous.pop("summary", None)
@@ -739,7 +893,33 @@ def record_quantum_results(
     result_fingerprint: Optional[str] = None,
 ) -> Dict[str, Any]:
     manifest = Path(path)
-    normalised = {str(record.get("candidate_id") or ""): dict(record) for record in results}
+    normalised: Dict[str, Dict[str, Any]] = {}
+    for record in results:
+        if not isinstance(record, Mapping):
+            raise ValueError("quantum result must be a JSON object")
+        candidate_id = str(record.get("candidate_id") or "").strip()
+        accepted = record.get("accepted")
+        if accepted is not True and accepted is not False:
+            raise ValueError(
+                "quantum result accepted must be an exact JSON Boolean for "
+                + repr(candidate_id)
+            )
+        result = dict(record)
+        result["candidate_id"] = candidate_id
+        result["accepted"] = accepted
+        terminal_probe = {
+            "status": "accepted" if accepted else "rejected",
+            "pointdir": result.get("pointdir"),
+            "reason": None if accepted else result.get("reason"),
+            "quality_manifest": result.get("quality_manifest"),
+        }
+        _validate_terminal_attempt(
+            terminal_probe,
+            "quantum result " + repr(candidate_id),
+        )
+        if candidate_id in normalised:
+            raise ValueError("quantum result candidate IDs must be unique and non-empty")
+        normalised[candidate_id] = result
     if "" in normalised or len(normalised) != len(results):
         raise ValueError("quantum result candidate IDs must be unique and non-empty")
 
@@ -770,7 +950,7 @@ def record_quantum_results(
         if not pending_by_id and set(normalised).issubset(terminal_by_id):
             for candidate_id, result in normalised.items():
                 attempt = terminal_by_id[candidate_id]
-                expected_status = "accepted" if bool(result.get("accepted", False)) else "rejected"
+                expected_status = "accepted" if result["accepted"] is True else "rejected"
                 if str(attempt.get("status")) != expected_status:
                     raise ValueError(
                         "quantum retry conflicts with recorded allocation result for "
@@ -790,7 +970,7 @@ def record_quantum_results(
             )
         for candidate_id, result in normalised.items():
             slot, attempt_index, attempt = pending_by_id[candidate_id]
-            accepted = bool(result.get("accepted", False))
+            accepted = result["accepted"] is True
             pointdir = str(result.get("pointdir") or "").strip()
             if not pointdir:
                 raise ValueError("quantum allocation result is missing pointdir")
@@ -829,8 +1009,11 @@ def allocate_replacements(
     replacement_round: int,
     expected_generation: Optional[int] = None,
 ) -> Dict[str, Any]:
-    if int(replacement_round) <= 0:
-        raise ValueError("replacement_round must be > 0")
+    resolved_round = _required_integer(
+        replacement_round,
+        "replacement_round",
+        minimum=1,
+    )
     manifest = Path(path)
 
     def mutate(payload):
@@ -855,14 +1038,14 @@ def allocate_replacements(
             )
         for slot, reserve_record in zip(vacant, available):
             reserve_record["status"] = "consumed"
-            reserve_record["consumed_round"] = int(replacement_round)
+            reserve_record["consumed_round"] = resolved_round
             candidate = {
                 key: copy.deepcopy(value)
                 for key, value in reserve_record.items()
                 if key not in {"status", "consumed_round"}
             }
             slot["attempts"].append(
-                {**candidate, "round": int(replacement_round), "status": "pending"}
+                {**candidate, "round": resolved_round, "status": "pending"}
             )
         return payload
 

@@ -587,14 +587,14 @@ def _live_smoke_seed_for_phase(campaign_dir, phase_name, iteration):
     fixtures = _live_smoke_fixtures()
     campaign_dir = Path(campaign_dir)
 
-    if phase_name in ("PHASE_A_POLUS", "PHASE_B_POLUS"):
-        from ichor.hpc.active_learning.sampling.polus_wrapper import main as polus_main
+    if phase_name in ("PHASE_A_DIVERSITY", "PHASE_B_DIVERSITY"):
+        from ichor.hpc.active_learning.sampling.diversity import main as polus_main
 
         rc = polus_main([
             "--descriptor",
             "rmsd_massweight",
             "--iteration",
-            "0" if phase_name == "PHASE_A_POLUS" else str(int(iteration)),
+            "0" if phase_name == "PHASE_A_DIVERSITY" else str(int(iteration)),
             "--campaign-dir",
             str(campaign_dir),
         ])
@@ -804,11 +804,11 @@ def test_live_one_iter_water_tetramer_after_parsers_land(tmp_path, monkeypatch):
 
     phases_called = {p for p, _ in call_log}
     mandatory_submissions = {
-        "PHASE_A_POLUS",
+        "PHASE_A_DIVERSITY",
         "INITIAL_GAUSSIAN",
         "INITIAL_FEREBUS",
         "ARIADNE_ARRAY",
-        "PHASE_B_POLUS",
+        "PHASE_B_DIVERSITY",
         "GAUSSIAN",
         "FEREBUS",
     }
@@ -950,7 +950,7 @@ def test_live_one_iter_whitened_distance_fallback(tmp_path, monkeypatch):
 
 
 def _build_both_phase_b_sbatch_runner(campaign_dir, call_log):
-    """Like the standard live-smoke runner but after PHASE_B_POLUS
+    """Like the standard live-smoke runner but after PHASE_B_DIVERSITY
     standard seeding, additionally writes a different selected_raw.xyz with
     a deliberately different frame count.
 
@@ -966,11 +966,11 @@ def _build_both_phase_b_sbatch_runner(campaign_dir, call_log):
         call_log.append((phase_name, iteration))
         _live_smoke_seed_for_phase(campaign_dir, phase_name, iteration)
 
-        if phase_name == "PHASE_B_POLUS":
-            from ichor.hpc.active_learning.daemon.state import atomic_write_json
-            from ichor.hpc.active_learning.handoff_manifests import phase_b_selection_path
-            from ichor.hpc.active_learning.layout import active_iteration_dir, active_phase_b_dir
-            from ichor.hpc.active_learning.versioning.manifest import sha256_file
+        if phase_name == "PHASE_B_DIVERSITY":
+            from ichor.hpc.active_learning.layout import (
+                active_iteration_dir,
+                active_phase_b_dir,
+            )
 
             iter_dir = active_iteration_dir(campaign_dir, iteration)
             raw = active_phase_b_dir(iter_dir) / "selected_raw.xyz"
@@ -982,11 +982,6 @@ def _build_both_phase_b_sbatch_runner(campaign_dir, call_log):
                 xyz_lines.append("H 0.96 0.0 0.0")
                 xyz_lines.append("H -0.24 0.93 0.0")
             raw.write_text(chr(10).join(xyz_lines) + chr(10), encoding="utf-8")
-            manifest_path = phase_b_selection_path(iter_dir)
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest["selected_raw_xyz"]["size"] = int(raw.stat().st_size)
-            manifest["selected_raw_xyz"]["sha256"] = sha256_file(raw)
-            atomic_write_json(manifest_path, manifest)
 
         n = len(call_log)
         return SimpleNamespace(
@@ -1038,7 +1033,7 @@ def test_live_one_iter_prefers_dedup_filtered_sample(tmp_path, monkeypatch):
     state = read_state(d.state_path())
     assert state.phase is CampaignPhase.DONE
 
-    # inspect the journal for PHASE_B_POLUS phase_succeeded_live event.
+    # inspect the journal for PHASE_B_DIVERSITY phase_succeeded_live event.
     # its sample_path field should end with selected.xyz, not selected_raw.xyz.
     journal_path = (
         campaign / ".DATA" / "ACTIVE_LEARNING"
@@ -1048,9 +1043,9 @@ def test_live_one_iter_prefers_dedup_filtered_sample(tmp_path, monkeypatch):
     phase_b_events = [
         e for e in events
         if e.get("event") == "phase_succeeded_live"
-        and e.get("phase") == "PHASE_B_POLUS"
+        and e.get("phase") == "PHASE_B_DIVERSITY"
     ]
-    assert phase_b_events, "no PHASE_B_POLUS phase_succeeded_live event"
+    assert phase_b_events, "no PHASE_B_DIVERSITY phase_succeeded_live event"
     last = phase_b_events[-1]
     sample_path = str(last.get("sample_path"))
     assert sample_path.endswith("selected.xyz"), (

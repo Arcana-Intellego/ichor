@@ -722,9 +722,9 @@ def _best_active_iteration_handoff(campaign: Path, iteration: int) -> Optional[R
 
         return RecoveryHandoff(
             RecoveryDecision(
-                CampaignPhase.PHASE_B_POLUS,
+                CampaignPhase.PHASE_B_DIVERSITY,
                 int(iteration),
-                "PHASE_B_POLUS: valid ARIADNE results handoff exists",
+                "PHASE_B_DIVERSITY: valid ARIADNE results handoff exists",
                 str(ariadne_results_path(iteration_dir(campaign, iteration))),
             ),
             20,
@@ -794,7 +794,7 @@ def _phase_contract_checks(
     model_version = int(getattr(state, "models_version", -1))
 
     checks: Dict[CampaignPhase, List[Tuple[str, Callable[[], None]]]] = {
-        CampaignPhase.PHASE_A_POLUS: [
+        CampaignPhase.PHASE_A_DIVERSITY: [
             ("trajectory pool", lambda: _require_pool(campaign)),
         ],
         CampaignPhase.INITIAL_GAUSSIAN: [
@@ -864,7 +864,7 @@ def _phase_contract_checks(
         CampaignPhase.ARIADNE_ARRAY: [
             ("seed_selection/SELECTION.json", lambda: _require_seeds(campaign, iteration)),
         ],
-        CampaignPhase.PHASE_B_POLUS: [
+        CampaignPhase.PHASE_B_DIVERSITY: [
             (
                 "ariadne/RESULTS.json",
                 lambda: _require_ariadne_results(
@@ -1056,13 +1056,13 @@ def select_recovery_phase(
             )
         if (
             bool(last_phase_retryable)
-            and str(last_phase or "") == CampaignPhase.PHASE_A_POLUS.value
+            and str(last_phase or "") == CampaignPhase.PHASE_A_DIVERSITY.value
             and _ok(_require_pool, campaign)
         ):
             return RecoveryDecision(
-                CampaignPhase.PHASE_A_POLUS,
+                CampaignPhase.PHASE_A_DIVERSITY,
                 iteration,
-                "PHASE_A_POLUS: retryable pre-bootstrap phase has a valid trajectory pool input",
+                "PHASE_A_DIVERSITY: retryable pre-bootstrap phase has a valid trajectory pool input",
                 "pool.xyz",
             )
         if existing_loaded:
@@ -1070,11 +1070,11 @@ def select_recovery_phase(
                 existing_phase = CampaignPhase(state.phase)
             except Exception:
                 existing_phase = CampaignPhase.HALTED
-            if existing_phase is CampaignPhase.PHASE_A_POLUS and _ok(_require_pool, campaign):
+            if existing_phase is CampaignPhase.PHASE_A_DIVERSITY and _ok(_require_pool, campaign):
                 return RecoveryDecision(
-                    CampaignPhase.PHASE_A_POLUS,
+                    CampaignPhase.PHASE_A_DIVERSITY,
                     iteration,
-                    "PHASE_A_POLUS: existing phase has a valid trajectory pool input",
+                    "PHASE_A_DIVERSITY: existing phase has a valid trajectory pool input",
                     "pool.xyz",
                 )
         return None

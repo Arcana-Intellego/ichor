@@ -82,7 +82,7 @@ _RECOVERY_PHASE_PROGRESS = {
     phase: rank
     for rank, phase in enumerate((
         CampaignPhase.INIT,
-        CampaignPhase.PHASE_A_POLUS,
+        CampaignPhase.PHASE_A_DIVERSITY,
         CampaignPhase.INITIAL_GAUSSIAN,
         CampaignPhase.INITIAL_AIMALL,
         CampaignPhase.INITIAL_ALLOCATION_CHECK,
@@ -91,7 +91,7 @@ _RECOVERY_PHASE_PROGRESS = {
         CampaignPhase.INITIAL_FEREBUS,
         CampaignPhase.SEED_SELECT,
         CampaignPhase.ARIADNE_ARRAY,
-        CampaignPhase.PHASE_B_POLUS,
+        CampaignPhase.PHASE_B_DIVERSITY,
         CampaignPhase.SPLIT,
         CampaignPhase.GAUSSIAN,
         CampaignPhase.AIMALL,
@@ -669,7 +669,7 @@ def _find_phase_a_handoff(campaign_dir: Union[str, Path]) -> Optional[Dict[str, 
     return {
         "path": str(initial),
         "manifest_path": str(phase_a_sample_manifest_path(initial)),
-        "phase": CampaignPhase.PHASE_A_POLUS.value,
+        "phase": CampaignPhase.PHASE_A_DIVERSITY.value,
         "iteration": 0,
         "n_select": int(manifest.get("n_select", 0)),
         "sample_xyz": str(manifest.get("sample_xyz", "")),

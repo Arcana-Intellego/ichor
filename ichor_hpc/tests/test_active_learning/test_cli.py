@@ -86,11 +86,20 @@ def _commit_training_and_model_versions(campaign: Path, versions):
     from ichor.hpc.active_learning.handoff_manifests import (
         write_phase_a_sample_manifest,
     )
+    from ichor.hpc.active_learning.sampling.diversity_contract import (
+        diversity_selector_contract,
+    )
     from ichor.hpc.active_learning.layout import bootstrap_selection_dir
+    from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
     from ichor.hpc.active_learning.versioning.provenance import (
         enrich_with_point_allocation,
     )
 
+    pool = TrajectoryPool.import_from(
+        campaign / "pool.xyz",
+        campaign,
+        overwrite=True,
+    )
     allocation_path = point_allocation_path(
         campaign,
         context="bootstrap",
@@ -125,12 +134,15 @@ def _commit_training_and_model_versions(campaign: Path, versions):
         newline="\n",
     )
     write_phase_a_sample_manifest(selection_dir, {
-        "phase": "PHASE_A_POLUS",
+        "phase": "PHASE_A_DIVERSITY",
         "iteration": 0,
         "sample_xyz": "selection/selected.xyz",
         "index_path": "selection/selected_indices.dat",
         "n_select": 1,
         "selected_indices": [0],
+        "selector": diversity_selector_contract(),
+        "trajectory_sha256": str(pool.sha256),
+        "source_pool_manifest": ".DATA/TRAJECTORY/pool.manifest.json",
         "point_allocation": {
             "manifest": "allocation/POINT_ALLOCATION.json",
             "primary": [{
@@ -148,7 +160,7 @@ def _commit_training_and_model_versions(campaign: Path, versions):
         pointdir,
         campaign_uid="cli-test",
         iteration=0,
-        trajectory_sha256="0" * 64,
+        trajectory_sha256=str(pool.sha256),
         seed_frame_id=0,
         seed_selection_origin="cli_fixture",
         seed_variance_at_selection=None,
@@ -221,17 +233,16 @@ def _write_valid_ariadne_results(campaign: Path, iteration: int = 1):
         write_seed_output_manifest,
     )
     from ichor.hpc.active_learning.daemon.state import atomic_write_json
-    from ichor.hpc.active_learning.handoff_manifests import seeds_picked_path
+    from ichor.hpc.active_learning.handoff_manifests import (
+        build_seed_selection_manifest,
+        seeds_picked_path,
+    )
     from ichor.hpc.active_learning.layout import (
         active_ariadne_dir,
         active_iteration_dir,
         ariadne_seed_dir,
     )
-    from ichor.hpc.active_learning.seed_identity import (
-        deterministic_seed_uid,
-        selection_fingerprint_sha256,
-        write_ariadne_task_map,
-    )
+    from ichor.hpc.active_learning.seed_identity import write_ariadne_task_map
     from ichor.hpc.active_learning.versioning.manifest import sha256_file
 
     try:
@@ -247,35 +258,23 @@ def _write_valid_ariadne_results(campaign: Path, iteration: int = 1):
         pool = TrajectoryPool.import_from(source, campaign)
     trajectory_sha = str(pool.sha256)
     iter_dir = active_iteration_dir(campaign, iteration)
-    selection = {
-        "schema_version": 2,
-        "campaign_uid": "cli-test",
-        "iteration": int(iteration),
-        "models_version": 0,
-        "model_manifest_sha256": "0" * 64,
-        "trajectory_sha256": trajectory_sha,
-        "selection_strategy": "hybrid_variance",
-        "n_picked": 1,
-        "seed_records": [{
+    selection = build_seed_selection_manifest(
+        campaign_uid="cli-test",
+        campaign_random_seed=0,
+        iteration=int(iteration),
+        models_version=0,
+        model_manifest_sha256="0" * 64,
+        trajectory_sha256=trajectory_sha,
+        selection_strategy="hybrid_variance",
+        seed_records=[{
             "seed_id": 1,
             "frame_id": 0,
             "pool_row_index_zero_based": 0,
             "selection_origin": "bulk",
             "variance_at_selection": 0.0,
         }],
-    }
-    fingerprint = selection_fingerprint_sha256(selection)
-    seed_uid = deterministic_seed_uid(
-        campaign_uid="cli-test",
-        iteration=iteration,
-        seed_id=1,
-        frame_id=0,
-        models_version=0,
-        model_manifest_sha256="0" * 64,
-        selection_fingerprint_sha256_value=fingerprint,
     )
-    selection["selection_fingerprint_sha256"] = fingerprint
-    selection["seed_records"][0]["seed_uid"] = seed_uid
+    seed_uid = str(selection["seed_records"][0]["seed_uid"])
     selection_path = seeds_picked_path(iter_dir)
     selection_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(selection_path, selection)
@@ -417,7 +416,6 @@ def _backend_availability(**overrides):
         "aimall": True,
         "ferebus": True,
         "ariadne": True,
-        "polus_rs": True,
         "pyferebus": True,
         "bc": True,
         "gaussian_binary": "jobscript:$g16root/g16/g16",
@@ -703,7 +701,7 @@ def test_recovery_dashboard_reports_active_intents(tmp_path):
 
 
 def test_live_job_name_rejects_control_characters_and_caps_length():
-    phase = CampaignPhase.PHASE_A_POLUS.value
+    phase = CampaignPhase.PHASE_A_DIVERSITY.value
     with pytest.raises(ValueError, match="unsafe Slurm job name"):
         live_job_name("bad\nuid", phase, 0)
 
@@ -863,7 +861,7 @@ def test_cli_status_backend_submission_failure_recommends_reconcile_apply(tmp_pa
     append_event(
         data / "journal.ndjson",
         "halt",
-        from_phase=CampaignPhase.PHASE_A_POLUS.value,
+        from_phase=CampaignPhase.PHASE_A_DIVERSITY.value,
         iteration=0,
         reason="backend_submission_failed: partition 'multicore_small' is not present",
     )
@@ -1254,13 +1252,13 @@ def test_status_recommendations_cover_contract_failure_classes(tmp_path):
     ("phase", "code"),
     [
         (CampaignPhase.INIT, "phase_init_ready"),
-        (CampaignPhase.PHASE_A_POLUS, "phase_phase_a_polus_ready"),
+        (CampaignPhase.PHASE_A_DIVERSITY, "phase_phase_a_diversity_ready"),
         (CampaignPhase.INITIAL_GAUSSIAN, "phase_initial_gaussian_ready"),
         (CampaignPhase.INITIAL_AIMALL, "phase_initial_aimall_ready"),
         (CampaignPhase.INITIAL_FEREBUS, "phase_initial_ferebus_ready"),
         (CampaignPhase.SEED_SELECT, "phase_seed_select_ready"),
         (CampaignPhase.ARIADNE_ARRAY, "phase_ariadne_array_ready"),
-        (CampaignPhase.PHASE_B_POLUS, "phase_phase_b_polus_ready"),
+        (CampaignPhase.PHASE_B_DIVERSITY, "phase_phase_b_diversity_ready"),
         (CampaignPhase.SPLIT, "phase_split_ready"),
         (CampaignPhase.GAUSSIAN, "phase_gaussian_ready"),
         (CampaignPhase.AIMALL, "phase_aimall_ready"),
@@ -1428,7 +1426,7 @@ def test_cli_stop_cancel_jobs_records_cancellation_without_rewriting_state(
     state = fresh_campaign_state()
     state.campaign_uid = "abc123def456-uid"
     state.iteration = 0
-    phase = CampaignPhase.PHASE_A_POLUS.value
+    phase = CampaignPhase.PHASE_A_DIVERSITY.value
     state.pending_jobs[phase] = "123"
     write_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME, state)
     expected_name = live_job_name(state.campaign_uid, phase, 0)
@@ -2107,7 +2105,7 @@ def test_cli_journal_left_justifies_columns_for_long_events(tmp_path, capsys):
     append_event(
         journal,
         "sbatch",
-        phase="PHASE_A_POLUS",
+        phase="PHASE_A_DIVERSITY",
         iteration=0,
         job_id="16175189",
         expected_tasks=1,
@@ -2136,7 +2134,7 @@ def test_cli_journal_left_justifies_columns_for_long_events(tmp_path, capsys):
     assert lines[1].startswith("  2026-06-27 14:32:10")
     assert lines[2].startswith("  2026-06-27 14:42:55")
     assert lines[1].index("iter=0") == lines[2].index("iter=12")
-    assert lines[1].index("PHASE_A_POLUS") == lines[2].index("INITIAL_GAUSSIAN")
+    assert lines[1].index("PHASE_A_DIVERSITY") == lines[2].index("INITIAL_GAUSSIAN")
     assert lines[1].index("job submitted") == lines[2].index("waiting for accounting")
     assert "[RUN]" in lines[1]
     assert "[WAIT]" in lines[2]
@@ -2223,7 +2221,7 @@ def test_cli_journal_unknown_event_gets_readable_fallback_label(tmp_path, capsys
     append_event(
         journal,
         "custom_scheduler_note",
-        phase="PHASE_A_POLUS",
+        phase="PHASE_A_DIVERSITY",
         iteration=0,
         ts="2026-06-27T14:42:55+00:00",
     )
@@ -2347,14 +2345,14 @@ def test_cli_reconcile_cleanable_scripts_reports_candidate_without_manual_mv(
     append_event(
         campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
         "halt",
-        from_phase="PHASE_B_POLUS",
+        from_phase="PHASE_B_DIVERSITY",
         iteration=1,
         reason="too_many_failures: 1/1",
     )
     _write_valid_ariadne_results(campaign, iteration=1)
     scripts = campaign / ".DATA" / "SCRIPTS"
     scripts.mkdir(parents=True)
-    (scripts / "PHASE_B_POLUS-1.sh").write_text("#!/bin/bash\n", encoding="utf-8")
+    (scripts / "PHASE_B_DIVERSITY-1.sh").write_text("#!/bin/bash\n", encoding="utf-8")
     monkeypatch.setattr(cli_mod, "_reconcile_runtime_status", lambda campaign: {})
 
     rc = main(["reconcile", "--campaign-dir", str(campaign)])
@@ -2369,7 +2367,7 @@ def test_cli_reconcile_cleanable_scripts_reports_candidate_without_manual_mv(
     assert "Recovery Safety" in out
     assert "stale sbatch scripts" in out
     assert "expected recovery after cleanup" in out
-    assert "PHASE_B_POLUS@1" in out
+    assert "PHASE_B_DIVERSITY@1" in out
     assert "RESULTS.json" in out
     assert "Apply Plan" in out
     assert "=== Recovery guidance ===" not in out
@@ -2394,7 +2392,7 @@ def test_reconcile_hard_blockers_filter_cleanable_staging_artifacts():
     blockers = cli_mod._reconcile_hard_blockers(
         report,
         {
-            "selected_phase": CampaignPhase.PHASE_B_POLUS.value,
+            "selected_phase": CampaignPhase.PHASE_B_DIVERSITY.value,
             "missing_or_invalid_inputs": [],
         },
     )
@@ -2448,14 +2446,14 @@ def test_cli_reconcile_apply_prints_final_recomputed_phase(
     append_event(
         campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
         "halt",
-        from_phase="PHASE_B_POLUS",
+        from_phase="PHASE_B_DIVERSITY",
         iteration=1,
         reason="too_many_failures: 1/1",
     )
     _write_valid_ariadne_results(campaign, iteration=1)
     scripts = campaign / ".DATA" / "SCRIPTS"
     scripts.mkdir(parents=True)
-    (scripts / "PHASE_B_POLUS-1.sh").write_text("#!/bin/bash\n", encoding="utf-8")
+    (scripts / "PHASE_B_DIVERSITY-1.sh").write_text("#!/bin/bash\n", encoding="utf-8")
     monkeypatch.setattr(cli_mod, "_reconcile_runtime_status", lambda campaign: {})
 
     rc = main(["reconcile", "--campaign-dir", str(campaign), "--apply"])
@@ -2465,7 +2463,7 @@ def test_cli_reconcile_apply_prints_final_recomputed_phase(
     assert "ICHOR Reconcile" in out
     assert "Result: APPLIED" in out
     assert "Applied Changes" in out
-    assert "recover to PHASE_B_POLUS iteration 1" in out
+    assert "recover to PHASE_B_DIVERSITY iteration 1" in out
     assert "Recovery Contract" in out
     assert "status        : ok" in out
     assert "RESULTS.json" in out

@@ -113,7 +113,9 @@ def test_init_refuses_infeasible_pool_before_state_creation(tmp_path, capsys):
     assert rc == 17
     err = capsys.readouterr().err
     assert "trajectory pool is infeasible" in err
-    assert "12 + 2 * 8 = 28" in err
+    assert "12 bootstrap diversity" in err
+    assert "seeds=8" in err
+    assert "= 28" in err
     assert not (
         tmp_path / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
     ).exists()
