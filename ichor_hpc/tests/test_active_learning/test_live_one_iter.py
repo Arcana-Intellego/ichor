@@ -147,6 +147,38 @@ def _ensure_live_quantum_contract_names(staging_dir):
                 if old.name != canonical:
                     old.unlink()
 
+    # The captured fixture pack predates the minimum valid 2/2/2 FEREBUS
+    # bootstrap and contains backend outputs for only three pointdirs.  Clone
+    # those backend-owned outputs into any additional daemon-staged pointdirs;
+    # retain each point's authoritative GJF and provenance, then retarget the
+    # copied WFN/Gaussian geometry in the next helper.
+    templates = [
+        pointdir
+        for pointdir in sorted(root.glob("POINT_*.pointdir"))
+        if (pointdir / "input.wfn").is_file()
+        and (pointdir / "input.gau").is_file()
+    ]
+    if templates:
+        template = templates[0]
+        for pointdir in sorted(root.glob("POINT_*.pointdir")):
+            if (pointdir / "input.wfn").is_file() and (
+                pointdir / "input.gau"
+            ).is_file():
+                continue
+            for source in template.iterdir():
+                destination = pointdir / source.name
+                if source.is_dir():
+                    if not destination.exists():
+                        _copy_tree(source, destination)
+                    continue
+                if not source.is_file() or source.name in {
+                    "input.gjf",
+                    ".provenance.json",
+                }:
+                    continue
+                if not destination.exists():
+                    destination.write_bytes(source.read_bytes())
+
 
 def _retarget_live_quantum_fixture_geometry(staging_dir):
     """Make captured backend outputs describe the daemon-staged GJF geometry."""
@@ -257,6 +289,7 @@ def _write_loadable_ferebus_model(path, *, atom, alf, ntrain=5, nfeats=3):
         "[kernels]",
         "number_of_kernels 1",
         "composition k1",
+        "prefactor 1.0",
         "",
         "[kernel.k1]",
         "type rbf",
@@ -291,8 +324,12 @@ def _seed_pyferebus_manifest_staging(campaign_dir, reference_data_version=0):
     )
     from ichor.hpc.active_learning.config import CampaignConfig
     from ichor.hpc.active_learning.ferebus_prior import (
+        backend_kernel_token,
         resolve_ferebus_prior_contract,
         validate_ferebus_config_contract,
+    )
+    from ichor.hpc.active_learning.versioning.reference_data import (
+        canonical_json_sha256,
     )
 
     prior = resolve_ferebus_prior_contract(CampaignConfig())
@@ -309,6 +346,30 @@ def _seed_pyferebus_manifest_staging(campaign_dir, reference_data_version=0):
         for split in ("train", "int_val", "ext_val")
     }
     row_counts = {split: len(values) for split, values in row_ids.items()}
+    source_rows = [
+        {"pointdir_name": entry.pointdir_name}
+        for entry in reference_view.entries
+    ]
+    split_rows = {
+        split: [source_rows[index] for index in indexes]
+        for split, indexes in row_ids.items()
+    }
+    row_identity_payload = {
+        "schema_version": stg.FEREBUS_ROW_IDENTITIES_SCHEMA_VERSION,
+        "campaign_uid": reference_view.campaign_uid,
+        "reference_data_version": int(reference_data_version),
+        "reference_data_view_sha256": reference_view.cumulative_view_sha256,
+        "source_rows": source_rows,
+        "source_rows_sha256": canonical_json_sha256(source_rows),
+        "splits": {
+            split: {
+                "rows": rows,
+                "n_rows": len(rows),
+                "row_identity_sha256": canonical_json_sha256(rows),
+            }
+            for split, rows in split_rows.items()
+        },
+    }
 
     target = Path(campaign_dir) / "TRAINED_MODELS" / "iteration-staging"
     if target.exists():
@@ -349,7 +410,14 @@ def _seed_pyferebus_manifest_staging(campaign_dir, reference_data_version=0):
             "task_index": idx,
             "property": "iqa",
             "atom": atom,
-            "prior_mean": prior.task_payload("iqa", atom),
+            "prior_mean": prior.task_payload(
+                "iqa",
+                atom,
+                training_values=[0.0] * row_counts["train"],
+                training_dataset_sha256=hashlib.sha256(
+                    train_csv.read_bytes()
+                ).hexdigest(),
+            ),
             "alf_1_indexed": list(alf),
             "alf_cli": "_".join(str(value) for value in alf),
             "property_dir": "iqa",
@@ -376,6 +444,10 @@ def _seed_pyferebus_manifest_staging(campaign_dir, reference_data_version=0):
                     "size": path.stat().st_size,
                     "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                     "rows": row_counts[split],
+                    "row_identity_sha256": row_identity_payload["splits"][split][
+                        "row_identity_sha256"
+                    ],
+                    "row_identity_count": row_counts[split],
                 }
                 for split, path in (
                     ("train", train_csv),
@@ -391,6 +463,21 @@ def _seed_pyferebus_manifest_staging(campaign_dir, reference_data_version=0):
                 "prior_mean_contract_sha256": prior.contract_sha256,
             },
         })
+    row_identity_path = target / stg.FEREBUS_ROW_IDENTITIES
+    row_identity_path.write_text(
+        json.dumps(row_identity_payload),
+        encoding="utf-8",
+    )
+    split_payload = {
+        "schema_version": 7,
+        "assignments": {
+            reference_view.entries[index].pointdir_name: {"split": split}
+            for split, indexes in row_ids.items()
+            for index in indexes
+        },
+    }
+    split_path = target / stg.FEREBUS_SPLIT_SNAPSHOT
+    split_path.write_text(json.dumps(split_payload), encoding="utf-8")
     (target / stg.FEREBUS_TASK_MANIFEST).write_text(
         json.dumps({
             "schema_version": stg.FEREBUS_TASK_SCHEMA_VERSION,
@@ -412,12 +499,60 @@ def _seed_pyferebus_manifest_staging(campaign_dir, reference_data_version=0):
             "n_atoms": len(specs),
             "n_tasks": len(tasks),
             "prior_mean_contract": prior.to_dict(),
+            "kernel_contract": {
+                "family": "rbf",
+                "backend_token": backend_kernel_token("rbf"),
+                "loss": "huber",
+                "constant_noise": True,
+                "full_ard": True,
+                "feature_scaling": True,
+                "property_scaling": False,
+                "kernel_prefactor_mode": 2,
+            },
+            "row_identity_snapshot": {
+                "path": stg.FEREBUS_ROW_IDENTITIES,
+                "size": row_identity_path.stat().st_size,
+                "sha256": hashlib.sha256(row_identity_path.read_bytes()).hexdigest(),
+                "source_rows_sha256": row_identity_payload[
+                    "source_rows_sha256"
+                ],
+            },
+            "split_ledger": {
+                "path": stg.FEREBUS_SPLIT_SNAPSHOT,
+                "size": split_path.stat().st_size,
+                "sha256": hashlib.sha256(split_path.read_bytes()).hexdigest(),
+            },
             "tasks": tasks,
         }),
         encoding="utf-8",
     )
     for name in (stg.FEREBUS_JOB_DETAILS, "commands", "list.txt", "runFerebus.sh"):
         (target / name).write_text(name + "\n", encoding="utf-8")
+    from ichor.hpc.active_learning.daemon.ferebus_task_runner import (
+        write_preexisting_model_receipts,
+    )
+    from ichor.hpc.active_learning.submit.pyferebus_wrap import (
+        _write_structured_task_map,
+    )
+
+    task_map_path = _write_structured_task_map(
+        target,
+        executable="ferebus",
+        execution_kind="synthetic_dry_run",
+    )
+    task_map = json.loads(task_map_path.read_text(encoding="utf-8"))
+    for task in task_map["tasks"]:
+        performance_path = target.joinpath(
+            *str(task["expected_performance_path"]).split("/")
+        )
+        performance_path.write_text(
+            "RMSE 0.0\nMAE 0.0\ncovariance_condition_number 1.0\n",
+            encoding="utf-8",
+        )
+    write_preexisting_model_receipts(
+        target,
+        execution_kind="synthetic_dry_run",
+    )
     return target
 
 
@@ -425,7 +560,13 @@ def _write_ferebus_metric_csv(path, n_rows):
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write("f1,f2,f3,iqa\n")
         for i in range(int(n_rows)):
-            f.write(f"{0.1+i*0.1},{0.2+i*0.1},{0.3+i*0.1},0.0\n")
+            features = [0.1 + i * 0.1 + j * 0.01 for j in range(3)]
+            f.write(
+                ",".join(str(value) for value in features)
+                + ","
+                + str(-75.0 - i * 0.01)
+                + "\n"
+            )
 
 
 def _ensure_live_trajectory_pool(campaign_dir):
@@ -435,7 +576,7 @@ def _ensure_live_trajectory_pool(campaign_dir):
     fixture = _live_smoke_fixtures() / "polus_phase_a" / "initial-SAMPLE-2.xyz"
     source = campaign_dir / "live-smoke-pool.xyz"
     fixture_text = fixture.read_text(encoding="utf-8")
-    source.write_text(fixture_text * 3, encoding="utf-8", newline="\n")
+    source.write_text(fixture_text * 5, encoding="utf-8", newline="\n")
     TrajectoryPool.import_from(
         source,
         campaign_dir,
@@ -452,9 +593,9 @@ def _live_smoke_config(campaign_dir):
     )
 
     config = CampaignConfig(max_iterations=1, poll_interval_seconds=1)
-    config.point_allocation.bootstrap_training_size = 1
-    config.point_allocation.bootstrap_internal_validation_size = 1
-    config.point_allocation.bootstrap_external_validation_size = 1
+    config.point_allocation.bootstrap_training_size = 2
+    config.point_allocation.bootstrap_internal_validation_size = 2
+    config.point_allocation.bootstrap_external_validation_size = 2
     config.point_allocation.batch_training_size = 1
     config.point_allocation.batch_internal_validation_size = 1
     config.seed_selection.n_seeds_per_iteration = 2

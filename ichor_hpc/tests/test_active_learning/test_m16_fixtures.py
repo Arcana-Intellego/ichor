@@ -139,10 +139,15 @@ def test_aimall_validator_accepts_clean_fixture():
 
 def test_ferebus_validator_accepts_clean_fixture(tmp_path):
     import hashlib
+    import json
     from ichor.hpc.active_learning.config import CampaignConfig
     from ichor.hpc.active_learning.ferebus_prior import (
+        backend_kernel_token,
         resolve_ferebus_prior_contract,
         validate_ferebus_config_contract,
+    )
+    from ichor.hpc.active_learning.versioning.reference_data import (
+        canonical_json_sha256,
     )
 
     prior = resolve_ferebus_prior_contract(CampaignConfig())
@@ -183,6 +188,7 @@ def test_ferebus_validator_accepts_clean_fixture(tmp_path):
             "[kernels]",
             "number_of_kernels 1",
             "composition k1",
+            "prefactor 1.0",
             "",
             "[kernel.k1]",
             "type rbf",
@@ -208,22 +214,80 @@ def test_ferebus_validator_accepts_clean_fixture(tmp_path):
         ]) + "\n",
         encoding="utf-8",
     )
+    row_order = [
+        "POINT_" + str(index).zfill(6) + ".pointdir"
+        for index in range(6)
+    ]
+    row_ids = {
+        "train": [0, 1],
+        "int_val": [2, 3],
+        "ext_val": [4, 5],
+    }
+    source_rows = [
+        {"pointdir_name": pointdir_name}
+        for pointdir_name in row_order
+    ]
+    split_rows = {
+        split: [source_rows[index] for index in indexes]
+        for split, indexes in row_ids.items()
+    }
+    row_identity_payload = {
+        "schema_version": stg.FEREBUS_ROW_IDENTITIES_SCHEMA_VERSION,
+        "campaign_uid": "fixture-test",
+        "reference_data_version": 0,
+        "reference_data_view_sha256": "b" * 64,
+        "source_rows": source_rows,
+        "source_rows_sha256": canonical_json_sha256(source_rows),
+        "splits": {
+            split: {
+                "rows": values,
+                "n_rows": len(values),
+                "row_identity_sha256": canonical_json_sha256(values),
+            }
+            for split, values in split_rows.items()
+        },
+    }
+    row_identity_path = root / stg.FEREBUS_ROW_IDENTITIES
+    row_identity_path.write_text(json.dumps(row_identity_payload), encoding="utf-8")
+    split_payload = {
+        "schema_version": 7,
+        "assignments": {
+            row_order[index]: {"split": split}
+            for split, indexes in row_ids.items()
+            for index in indexes
+        },
+    }
+    split_path = root / stg.FEREBUS_SPLIT_SNAPSHOT
+    split_path.write_text(json.dumps(split_payload), encoding="utf-8")
     dataset_records = {}
-    for split, suffix, nrows in (
-        ("train", "TRAINING_SET", 2),
-        ("int_val", "INT_VALIDATION_SET", 0),
-        ("ext_val", "EXT_VALIDATION_SET", 0),
+    for split, suffix in (
+        ("train", "TRAINING_SET"),
+        ("int_val", "INT_VALIDATION_SET"),
+        ("ext_val", "EXT_VALIDATION_SET"),
     ):
         dataset = model_dir / "datasets" / ("WATER_O1_" + suffix + ".csv")
+        split_features = rows if split == "train" else [[0.2, 0.3, 0.4], [0.5, 0.6, 0.7]]
+        split_targets = [-75.0, -75.1]
         dataset.write_text(
-            "f1,f2,f3,iqa\n" + "0.1,0.2,0.3,0.0\n" * nrows,
+            "f1,f2,f3,iqa\n"
+            + "".join(
+                ",".join(str(value) for value in features)
+                + ","
+                + str(target)
+                + "\n"
+                for features, target in zip(split_features, split_targets)
+            ),
             encoding="utf-8",
         )
         dataset_records[split] = {
             "path": dataset.relative_to(root).as_posix(),
             "size": dataset.stat().st_size,
             "sha256": hashlib.sha256(dataset.read_bytes()).hexdigest(),
-            "rows": nrows,
+            "rows": 2,
+            "row_identity_sha256": row_identity_payload["splits"][split][
+                "row_identity_sha256"
+            ],
+            "row_identity_count": 2,
         }
     (root / stg.FEREBUS_TASK_MANIFEST).write_text(
         __import__("json").dumps({
@@ -233,21 +297,44 @@ def test_ferebus_validator_accepts_clean_fixture(tmp_path):
             "reference_data_version": 0,
             "reference_data_head_manifest_sha256": "a" * 64,
             "reference_data_view_sha256": "b" * 64,
-            "n_reference_points": 2,
-            "pointdir_row_order": [
-                "POINT_000000.pointdir",
-                "POINT_000001.pointdir",
-            ],
+            "n_reference_points": 6,
+            "pointdir_row_order": row_order,
             "properties": ["iqa"],
             "atoms": ["O1"],
             "n_atoms": 1,
             "n_tasks": 1,
             "prior_mean_contract": prior.to_dict(),
+            "kernel_contract": {
+                "family": "rbf",
+                "backend_token": backend_kernel_token("rbf"),
+                "loss": "huber",
+                "constant_noise": True,
+                "full_ard": True,
+                "feature_scaling": True,
+                "property_scaling": False,
+                "kernel_prefactor_mode": 2,
+            },
+            "row_identity_snapshot": {
+                "path": stg.FEREBUS_ROW_IDENTITIES,
+                "size": row_identity_path.stat().st_size,
+                "sha256": hashlib.sha256(row_identity_path.read_bytes()).hexdigest(),
+                "source_rows_sha256": row_identity_payload["source_rows_sha256"],
+            },
+            "split_ledger": {
+                "path": stg.FEREBUS_SPLIT_SNAPSHOT,
+                "size": split_path.stat().st_size,
+                "sha256": hashlib.sha256(split_path.read_bytes()).hexdigest(),
+            },
             "tasks": [{
                 "task_index": 1,
                 "property": "iqa",
                 "atom": "O1",
-                "prior_mean": prior.task_payload("iqa", "O1"),
+                "prior_mean": prior.task_payload(
+                    "iqa",
+                    "O1",
+                    training_values=[-75.0, -75.1],
+                    training_dataset_sha256=dataset_records["train"]["sha256"],
+                ),
                 "alf_1_indexed": [1, 2, 3],
                 "alf_cli": "1_2_3",
                 "property_dir": "iqa",
@@ -266,8 +353,8 @@ def test_ferebus_validator_accepts_clean_fixture(tmp_path):
                     "-A", "O1",
                     "-ALF", "1_2_3",
                 ],
-                "row_counts": {"train": 2, "int_val": 0, "ext_val": 0},
-                "row_ids": {"train": [0, 1], "int_val": [], "ext_val": []},
+                "row_counts": {"train": 2, "int_val": 2, "ext_val": 2},
+                "row_ids": dict(row_ids),
                 "datasets": dataset_records,
                 "generated_config": {
                     "path": "iqa/O1/ferebus.config",
@@ -281,6 +368,30 @@ def test_ferebus_validator_accepts_clean_fixture(tmp_path):
             }],
         }),
         encoding="utf-8",
+    )
+    from ichor.hpc.active_learning.daemon.ferebus_task_runner import (
+        write_preexisting_model_receipts,
+    )
+    from ichor.hpc.active_learning.submit.pyferebus_wrap import (
+        _write_structured_task_map,
+    )
+
+    task_map_path = _write_structured_task_map(
+        root,
+        executable="ferebus",
+        execution_kind="synthetic_dry_run",
+    )
+    task_map = json.loads(task_map_path.read_text(encoding="utf-8"))
+    performance_path = root.joinpath(
+        *str(task_map["tasks"][0]["expected_performance_path"]).split("/")
+    )
+    performance_path.write_text(
+        "RMSE 0.0\nMAE 0.0\ncovariance_condition_number 1.0\n",
+        encoding="utf-8",
+    )
+    write_preexisting_model_receipts(
+        root,
+        execution_kind="synthetic_dry_run",
     )
     ok, reason = validate_ferebus_completed(root)
     assert ok, "expected ferebus_staging to pass; got reason=" + reason

@@ -16,28 +16,31 @@ from ichor.hpc.active_learning.versioning.manifest import sha256_file
 
 
 def synthetic_quantum_quality_record(pointdir_name: str) -> dict:
+    atom_iqa = {"O1": -0.6, "H2": -0.2, "H3": -0.2}
     return {
         "pointdir": str(pointdir_name),
         "accepted": True,
         "reasons": [],
-        "atom_count": 1,
-        "expected_atom_names": ["H1"],
-        "n_int": 1,
-        "sum_iqa_ha": -0.5,
-        "wfn_total_energy_ha": -0.5,
+        "atom_count": 3,
+        "expected_atom_names": list(atom_iqa),
+        "n_int": 3,
+        "sum_iqa_ha": -1.0,
+        "wfn_total_energy_ha": -1.0,
         "wfn_virial_ratio": 2.0,
         "iqa_energy_recovery_error_ha": 0.0,
         "max_abs_integration_error": 0.0,
         "per_atom": [
             {
-                "atom": "H1",
-                "int_file": "h1.int",
+                "atom": atom_name,
+                "int_file": atom_name.lower() + ".int",
+                "dft_model": "B3LYP",
                 "canonical_dft_model": "B3LYP",
-                "iqa_ha": -0.5,
+                "iqa_ha": iqa_ha,
                 "integration_error": 0.0,
                 "multipoles": {name: 0.0 for name in multipole_names},
                 "reasons": [],
             }
+            for atom_name, iqa_ha in atom_iqa.items()
         ],
     }
 
@@ -54,7 +57,6 @@ def attach_synthetic_quantum_acceptance(
     root = Path(pointdir)
     for filename in (
         "input.gjf",
-        "input.wfn",
         "input.gau",
         "AIMALL_TASK.json",
         "GAUSSIAN_TASK_RECEIPT.json",
@@ -64,11 +66,26 @@ def attach_synthetic_quantum_acceptance(
         path = root / filename
         if not path.exists():
             path.write_text("fixture\n", encoding="utf-8")
+    from ichor.hpc.active_learning.daemon.dry_run_executor import (
+        DryRunPhaseExecutor,
+    )
+
+    DryRunPhaseExecutor._write_dry_quantum_wfn(
+        root / "input.wfn",
+        method="B3LYP",
+        point_index=0,
+        total_energy_ha=float(quality_record["wfn_total_energy_ha"]),
+    )
     atomic_dir = root / "input_atomicfiles"
     atomic_dir.mkdir(exist_ok=True)
-    int_path = atomic_dir / "h1.int"
-    if not int_path.exists():
-        int_path.write_text("fixture\n", encoding="utf-8")
+    for atom_record in quality_record["per_atom"]:
+        DryRunPhaseExecutor._write_dry_aimall_int(
+            atomic_dir / str(atom_record["int_file"]),
+            atom_name=str(atom_record["atom"]),
+            method="B3LYP",
+            iqa_ha=float(atom_record["iqa_ha"]),
+            multipole_names=multipole_names,
+        )
     receipt_path = write_quantum_acceptance_receipt(
         campaign,
         root,

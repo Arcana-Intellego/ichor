@@ -1543,14 +1543,7 @@ def test_campaign_config_menu_covers_every_config_leaf():
     spec_paths.extend("ariadne." + spec.path for spec in ARIADNE_FIELD_SPECS)
 
     assert len(spec_paths) == len(set(spec_paths))
-    expected_editable = (
-        set(leaf_paths(CampaignConfig()))
-        - {
-            "schema_version",
-            "ferebus.prior_mean_type",
-            "ferebus.property_scaling",
-        }
-    )
+    expected_editable = set(leaf_paths(CampaignConfig())) - {"schema_version"}
     actual_editable = {
         spec.path
         for spec in specs
@@ -1558,11 +1551,7 @@ def test_campaign_config_menu_covers_every_config_leaf():
     } | {"ariadne." + spec.path for spec in ARIADNE_FIELD_SPECS}
     read_only = {spec.path for spec in specs if spec.read_only}
 
-    assert read_only == {
-        "schema_version",
-        "ferebus.prior_mean_type",
-        "ferebus.property_scaling",
-    }
+    assert read_only == {"schema_version"}
     assert actual_editable == expected_editable
     quality_rendered = _BLOCK_MENUS_BY_LABEL["Edit quality_gates"].this_menu_options()
     assert "quality_gates.ariadne_max_displacement_ang" in quality_rendered
@@ -2126,7 +2115,7 @@ def test_campaign_config_load_edit_save_preserves_hidden_fields(tmp_path, monkey
     original.gaussian.method = "B3LYP"
     original.gaussian.basis_set = "def2-TZVP"
     original.ferebus.properties = ["iqa", "q00"]
-    original.ferebus.feature_scaling = False
+    original.ferebus.physical_prior_scale = 0.75
     original.acquisition.allow_uniform_posterior_fallback = True
     original.to_yaml(tmp_path / "campaign.yaml")
     monkeypatch.setattr(menu, "_pause", lambda: None)
@@ -2146,7 +2135,7 @@ def test_campaign_config_load_edit_save_preserves_hidden_fields(tmp_path, monkey
     assert reloaded.resources.gradient_parallel_backend == "serial"
     assert reloaded.gaussian.method == "B3LYP"
     assert reloaded.ferebus.properties == ["iqa", "q00"]
-    assert reloaded.ferebus.feature_scaling is False
+    assert reloaded.ferebus.physical_prior_scale == 0.75
     assert reloaded.acquisition.allow_uniform_posterior_fallback is True
 
 

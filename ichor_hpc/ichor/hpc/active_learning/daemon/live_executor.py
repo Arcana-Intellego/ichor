@@ -277,6 +277,10 @@ def _write_ferebus_task_artefact_layout(
         FEREBUS_QUALITY_DECISION_MANIFEST,
         FEREBUS_QUALITY_MANIFEST,
     )
+    from .ferebus_task_runner import (
+        FEREBUS_TASK_MAP_FILENAME,
+        FEREBUS_TASK_RECEIPT_FILENAME,
+    )
     from ..versioning.trained_models import (
         build_trained_model_set_payload,
         file_record,
@@ -317,11 +321,53 @@ def _write_ferebus_task_artefact_layout(
         )
         task_dir.mkdir(parents=True, exist_ok=True)
         committed_model = task_dir / model_file.name
-        committed_config = task_dir / (
-            "ferebus_" + prop + "_" + atom + ".config"
-        )
+        committed_config = task_dir / "ferebus.config"
         _copy_regular_file_no_symlink(model_file, committed_model, committed_dir)
         _copy_regular_file_no_symlink(config_path, committed_config, committed_dir)
+        raw_datasets = task.get("datasets")
+        if not isinstance(raw_datasets, dict) or set(raw_datasets) != {
+            "train",
+            "int_val",
+            "ext_val",
+        }:
+            raise BackendSubmissionError(
+                "FEREBUS task dataset identities are invalid for " + prop + "/" + atom
+            )
+        committed_datasets: Dict[str, Dict[str, Any]] = {}
+        dataset_dir = task_dir / "datasets"
+        for split in ("train", "int_val", "ext_val"):
+            dataset_record = raw_datasets[split]
+            if not isinstance(dataset_record, dict):
+                raise BackendSubmissionError(
+                    "FEREBUS " + split + " dataset identity is invalid"
+                )
+            dataset_source = _resolve_ferebus_staging_path(
+                staging,
+                dataset_record.get("path", ""),
+                split + " dataset path",
+            )
+            dataset_destination = dataset_dir / dataset_source.name
+            _copy_regular_file_no_symlink(
+                dataset_source,
+                dataset_destination,
+                committed_dir,
+            )
+            committed_datasets[split] = file_record(
+                dataset_destination,
+                committed_dir,
+            )
+        receipt_source = _resolve_ferebus_staging_path(
+            staging,
+            Path(str(task.get("output_dir") or ""))
+            / FEREBUS_TASK_RECEIPT_FILENAME,
+            "task execution receipt",
+        )
+        committed_receipt = task_dir / FEREBUS_TASK_RECEIPT_FILENAME
+        _copy_regular_file_no_symlink(
+            receipt_source,
+            committed_receipt,
+            committed_dir,
+        )
         auxiliary: Dict[str, Optional[Dict[str, Any]]] = {}
         for suffix in FEREBUS_TASK_AUXILIARY_SUFFIXES:
             source = _find_ferebus_auxiliary_file(
@@ -345,14 +391,20 @@ def _write_ferebus_task_artefact_layout(
                 "directory": task_dir.relative_to(committed_dir).as_posix(),
                 "model": file_record(committed_model, committed_dir),
                 "config": file_record(committed_config, committed_dir),
+                "execution_receipt": file_record(
+                    committed_receipt,
+                    committed_dir,
+                ),
+                "datasets": committed_datasets,
                 "auxiliary": auxiliary,
             }
         )
     sidecar_names = (
         _stg.FEREBUS_TASK_MANIFEST,
+        _stg.FEREBUS_ROW_IDENTITIES,
+        _stg.FEREBUS_SPLIT_SNAPSHOT,
+        FEREBUS_TASK_MAP_FILENAME,
         _stg.FEREBUS_JOB_DETAILS,
-        "commands",
-        "list.txt",
         "runFerebus.sh",
         "ATOMS.txt",
         "PROPERTIES.txt",
@@ -366,6 +418,9 @@ def _write_ferebus_task_artefact_layout(
         if not source.is_file():
             if sidecar_name in {
                 _stg.FEREBUS_TASK_MANIFEST,
+                _stg.FEREBUS_ROW_IDENTITIES,
+                _stg.FEREBUS_SPLIT_SNAPSHOT,
+                FEREBUS_TASK_MAP_FILENAME,
                 FEREBUS_QUALITY_MANIFEST,
                 FEREBUS_QUALITY_DECISION_MANIFEST,
             } or (
@@ -394,6 +449,9 @@ def _write_ferebus_task_artefact_layout(
         parent=parent_model_set,
         source_task_manifest=root_record_by_path[_stg.FEREBUS_TASK_MANIFEST],
         quality_manifest=root_record_by_path[FEREBUS_QUALITY_MANIFEST],
+        quality_decision_manifest=root_record_by_path[
+            FEREBUS_QUALITY_DECISION_MANIFEST
+        ],
         properties=[str(value) for value in manifest.get("properties", [])],
         atoms=[str(value) for value in manifest.get("atoms", [])],
         tasks=task_records,
@@ -1012,6 +1070,9 @@ def validate_ferebus_completed(staging_dir) -> tuple:
             validate_ferebus_model_contract,
         )
         validate_ferebus_model_contract(staging, committed=False)
+        from .ferebus_task_runner import validate_task_receipts
+
+        validate_task_receipts(staging)
     except FileNotFoundError as exc:
         return False, "ferebus_manifest_invalid: " + type(exc).__name__ + ": " + str(exc)
     except ModelContractError as exc:
@@ -1855,6 +1916,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     binding_sha256=str(script_binding["sha256"]),
                 )
 
+            from ..ferebus_prior import backend_kernel_token
+
             submission = submit_ferebus(
                 staging / _stg.FEREBUS_JOB_DETAILS,
                 staging,
@@ -1862,14 +1925,16 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 walltime_hours=effective_walltime,
                 ncores=max(1, int(f.nagents)),
                 partition=effective_partition,
-                kernel=str(f.kernel),
-                loss=str(f.loss),
-                is_constant_noise=bool(f.is_constant_noise),
+                kernel=backend_kernel_token(f.kernel),
+                loss="huber",
+                is_constant_noise=True,
                 nagents=int(f.nagents),
                 maxiter=int(f.maxiter),
-                full_ARD=bool(getattr(f, "full_ARD", True)),
+                full_ARD=True,
                 prior_mean_type=int(prior_contract.mean_type),
-                prior_mean_level_of_theory=str(prior_contract.level_of_theory),
+                prior_mean_level_of_theory=str(
+                    prior_contract.level_of_theory or "not_applicable"
+                ),
                 prior_mean_iqa_deviation_factor=float(
                     prior_contract.iqa_deviation_factor
                 ),
@@ -3439,6 +3504,43 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 n_total=int(current_decision.get("n_tasks", 0)),
             )
             if not bool(current_decision.get("accepted")):
+                from ..layout import trained_models_dir
+                from ..versioning.manifest import sha256_file
+
+                evaluation_digest = str(
+                    current_decision.get("evaluation_sha256") or "rejected"
+                )
+                quality_digest = sha256_file(quality_path)
+                candidate_digest = hashlib.sha256(
+                    (quality_digest + ":" + evaluation_digest).encode("ascii")
+                ).hexdigest()
+                quarantine = (
+                    trained_models_dir(self.campaign_dir)
+                    / "rejected-candidates"
+                    / ("reference-" + f"{int(expected_next):06d}")
+                    / candidate_digest
+                )
+                quarantine.parent.mkdir(parents=True, exist_ok=True)
+                if quarantine.exists() or quarantine.is_symlink():
+                    raise ValueError(
+                        "rejected FEREBUS candidate quarantine already exists: "
+                        + str(quarantine)
+                    )
+                os.replace(staging, quarantine)
+                from .state import _fsync_parent_dir
+
+                _fsync_parent_dir(quarantine)
+                self._journal_event(
+                    "ferebus_candidate_rejected",
+                    phase=phase_name,
+                    iteration=int(state.iteration),
+                    reference_data_version=int(expected_next),
+                    quarantine=str(quarantine),
+                    candidate_sha256=candidate_digest,
+                    quality_sha256=quality_digest,
+                    evaluation_sha256=evaluation_digest,
+                    reasons=list(current_decision.get("reasons", [])),
+                )
                 return PhaseResult(
                     is_complete=True,
                     failure_reason="ferebus_quality_failed: "

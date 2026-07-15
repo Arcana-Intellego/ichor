@@ -221,6 +221,7 @@ class DryRunPhaseExecutor:
         alf_1_indexed: Sequence[int],
         ntrain: int,
         prior_mean_ha: float,
+        kernel_family: str = "periodic_rbf",
         feature_rows: Optional[Sequence[Sequence[float]]] = None,
         target_rows: Optional[Sequence[float]] = None,
     ) -> None:
@@ -277,23 +278,63 @@ class DryRunPhaseExecutor:
             "value " + repr(float(prior_mean_ha)),
             "",
             "[kernels]",
-            "number_of_kernels 1",
-            "composition k1",
-            "prefactor 1.0",
-            "",
-            "[kernel.k1]",
-            "type rbf",
-            "number_of_dimensions " + str(nfeatures),
-            "active_dimensions "
-            + " ".join(str(index) for index in range(1, nfeatures + 1)),
-            "thetas " + " ".join("1.0" for _ in range(nfeatures)),
-            "",
-            "[training_data]",
-            "units.x " + " ".join("unknown" for _ in range(nfeatures)),
-            "units.y " + ("Ha" if str(prop) == "iqa" else "unknown"),
-            "",
-            "[training_data.x]",
         ]
+        if kernel_family == "rbf":
+            lines.extend(
+                [
+                    "number_of_kernels 1",
+                    "composition k1",
+                    "prefactor 1.0",
+                    "",
+                    "[kernel.k1]",
+                    "type rbf",
+                    "number_of_dimensions " + str(nfeatures),
+                    "active_dimensions "
+                    + " ".join(str(index) for index in range(1, nfeatures + 1)),
+                    "thetas " + " ".join("1.0" for _ in range(nfeatures)),
+                    "",
+                ]
+            )
+        elif kernel_family == "periodic_rbf":
+            periodic = [
+                index for index in range(4, nfeatures + 1) if index % 3 == 0
+            ]
+            cyclic = [
+                index for index in range(1, nfeatures + 1) if index not in periodic
+            ]
+            lines.extend(
+                [
+                    "number_of_kernels 2",
+                    "composition (k1*k2)",
+                    "prefactor 1.0",
+                    "",
+                    "[kernel.k1]",
+                    "type rbf-cyclic",
+                    "number_of_dimensions " + str(len(cyclic)),
+                    "active_dimensions " + " ".join(map(str, cyclic)),
+                    "thetas " + " ".join("1.0" for _ in cyclic),
+                    "",
+                    "[kernel.k2]",
+                    "type periodic",
+                    "number_of_dimensions " + str(len(periodic)),
+                    "active_dimensions " + " ".join(map(str, periodic)),
+                    "thetas " + " ".join("1.0" for _ in periodic),
+                    "",
+                ]
+            )
+        else:
+            raise BackendSubmissionError(
+                "unsupported dry-run FEREBUS kernel family " + repr(kernel_family)
+            )
+        lines.extend(
+            [
+                "[training_data]",
+                "units.x " + " ".join("unknown" for _ in range(nfeatures)),
+                "units.y " + ("Ha" if str(prop) == "iqa" else "unknown"),
+                "",
+                "[training_data.x]",
+            ]
+        )
         lines.extend(" ".join(str(value) for value in row) for row in resolved_feature_rows)
         lines.extend(["", "[training_data.y]"])
         lines.extend(str(value) for value in resolved_targets)
@@ -382,9 +423,9 @@ class DryRunPhaseExecutor:
             )
             config_path.write_text(
                 "# Dry-run deterministic FEREBUS output.\n"
-                + "mean_type = 21\n"
+                + "mean_type = " + str(prior_contract.mean_type) + "\n"
                 + 'level_of_theory = "'
-                + prior_contract.level_of_theory
+                + str(prior_contract.level_of_theory or "not_applicable")
                 + '"\n'
                 + "iqaDeviationFactor = "
                 + repr(prior_contract.iqa_deviation_factor)
@@ -421,22 +462,53 @@ class DryRunPhaseExecutor:
                 prop=prop,
                 alf_1_indexed=task["alf_1_indexed"],
                 ntrain=len(features),
-                prior_mean_ha=prior_contract.expected_mean_ha(prop, atom),
+                prior_mean_ha=float(task["prior_mean"]["expected_mean_ha"]),
                 feature_rows=features,
                 target_rows=targets,
+                kernel_family=str(manifest["kernel_contract"]["family"]),
             )
         _stg._write_ferebus_manifest(staging, manifest)
         return _stg.read_ferebus_manifest(staging, verify_dataset_files=True)
 
-    def _commit_dry_model_snapshot(self, version: int) -> None:
-        """Commit a dry model snapshot through the live storage contract."""
-        from . import input_staging as _stg
-        from .ferebus_quality import (
-            FEREBUS_QUALITY_MANIFEST,
-            FEREBUS_QUALITY_SCHEMA_VERSION,
-            write_ferebus_quality_decision,
+    @staticmethod
+    def _write_dry_ferebus_execution_evidence(staging: Path) -> None:
+        """Publish deterministic task evidence through the live FEREBUS schema."""
+        from .ferebus_task_runner import write_preexisting_model_receipts
+        from ..strict_json import strict_json as json
+        from ..submit.pyferebus_wrap import _write_structured_task_map
+
+        root = Path(staging)
+        manifest = _write_structured_task_map(
+            root,
+            executable="ferebus",
+            execution_kind="synthetic_dry_run",
         )
+        task_map = json.loads(manifest.read_text(encoding="utf-8"))
+        for task in task_map["tasks"]:
+            performance_path = root.joinpath(
+                *str(task["expected_performance_path"]).split("/")
+            )
+            performance_path.write_text(
+                "RMSE 0.0\n"
+                "MAE 0.0\n"
+                "covariance_condition_number 1.0\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+        write_preexisting_model_receipts(
+            root,
+            execution_kind="synthetic_dry_run",
+        )
+
+    def _commit_prepared_dry_ferebus_snapshot(self, version: int) -> None:
+        """Stage, measure, decide and commit one dry model with live contracts."""
+        from . import input_staging as _stg
         from .config_lock import canonical_config, config_fingerprint
+        from .ferebus_quality import (
+            evaluate_ferebus_quality,
+            write_ferebus_quality_decision,
+            write_ferebus_quality_manifest,
+        )
         from .live_executor import _write_ferebus_task_artefact_layout
         from .model_contract import validate_ferebus_model_contract
         from ..versioning.trained_models import (
@@ -446,269 +518,23 @@ class DryRunPhaseExecutor:
         )
 
         target_version = int(version)
-        reference_view = ReferenceDataVersioning(
-            self.campaign_dir / self.reference_data_dir_name
-        ).resolve(target_version, verification="deep")
-        row_ids = {
-            split: [
-                index
-                for index, entry in enumerate(reference_view.entries)
-                if entry.split == split
-            ]
-            for split in ("train", "int_val", "ext_val")
-        }
-        row_counts = {split: len(values) for split, values in row_ids.items()}
-        if row_counts["train"] <= 0:
-            raise BackendSubmissionError(
-                "dry-run FEREBUS snapshot has no training reference points"
-            )
-
-        properties = [str(value) for value in self.config.ferebus.properties]
-        atoms = ["O1", "H2", "H3"]
-        alfs = {
-            "O1": [1, 2, 3],
-            "H2": [2, 1, 3],
-            "H3": [3, 1, 2],
-        }
-        system = str(self.config.campaign.system_name)
-        from ..ferebus_prior import (
-            resolve_ferebus_prior_contract,
-            validate_ferebus_config_contract,
-        )
-
-        prior_contract = resolve_ferebus_prior_contract(
+        staging, _ = _stg.stage_ferebus_inputs(
+            self.campaign_dir,
             self.config,
-            atom_labels=atoms,
+            target_version,
+            is_initial=target_version == 0,
         )
-        ferebus_staging = self.campaign_dir / self.models_dir_name / "iteration-staging"
-        if ferebus_staging.exists():
-            _stg._checked_rmtree(
-                ferebus_staging,
-                campaign_dir=self.campaign_dir,
-                allowed_roots=[self.campaign_dir / self.models_dir_name],
-            )
-        ferebus_staging.mkdir(parents=True, exist_ok=False)
-
-        tasks: List[Dict[str, Any]] = []
-        for task_index, (prop, atom) in enumerate(
-            ((prop, atom) for prop in properties for atom in atoms),
-            start=1,
-        ):
-            task_dir = ferebus_staging / prop / atom
-            datasets_dir = task_dir / "datasets"
-            datasets_dir.mkdir(parents=True, exist_ok=False)
-            config_path = task_dir / "ferebus.config"
-            config_path.write_text(
-                "name = \"" + system + "\"\nproperty = \"" + prop
-                + "\"\natom = \"" + atom + "\"\nmean_type = 21\n"
-                + 'level_of_theory = "' + prior_contract.level_of_theory + '"\n'
-                + "iqaDeviationFactor = "
-                + repr(prior_contract.iqa_deviation_factor)
-                + "\nscaling = "
-                + ("1" if prior_contract.feature_scaling else "0")
-                + "\nscale_feats = "
-                + ("1" if prior_contract.feature_scaling else "0")
-                + "\nscale_prop = 0\n",
-                encoding="utf-8",
-                newline="\n",
-            )
-            parsed_contract = validate_ferebus_config_contract(
-                config_path,
-                prior_contract,
-            )
-            model_path = task_dir / (system + "_" + prop + "_" + atom + ".model")
-            self._write_dry_ferebus_model(
-                model_path,
-                system=system,
-                atom=atom,
-                prop=prop,
-                alf_1_indexed=alfs[atom],
-                ntrain=row_counts["train"],
-                prior_mean_ha=prior_contract.expected_mean_ha(prop, atom),
-            )
-            csv_paths = {
-                "train": datasets_dir / (system + "_" + atom + "_TRAINING_SET.csv"),
-                "int_val": datasets_dir / (
-                    system + "_" + atom + "_INT_VALIDATION_SET.csv"
-                ),
-                "ext_val": datasets_dir / (
-                    system + "_" + atom + "_EXT_VALIDATION_SET.csv"
-                ),
-            }
-            for split, csv_path in csv_paths.items():
-                self._write_dry_ferebus_csv(
-                    csv_path,
-                    prop=prop,
-                    nrows=row_counts[split],
-                )
-            tasks.append(
-                {
-                    "task_index": int(task_index),
-                    "property": prop,
-                    "atom": atom,
-                    "prior_mean": prior_contract.task_payload(prop, atom),
-                    "alf_1_indexed": list(alfs[atom]),
-                    "alf_cli": "_".join(str(value) for value in alfs[atom]),
-                    "property_dir": prop,
-                    "output_dir": prop + "/" + atom,
-                    "input_dir": prop + "/" + atom + "/datasets",
-                    "config_path": prop + "/" + atom + "/ferebus.config",
-                    "training_csv": csv_paths["train"].relative_to(
-                        ferebus_staging
-                    ).as_posix(),
-                    "int_validation_csv": csv_paths["int_val"].relative_to(
-                        ferebus_staging
-                    ).as_posix(),
-                    "ext_validation_csv": csv_paths["ext_val"].relative_to(
-                        ferebus_staging
-                    ).as_posix(),
-                    "expected_model_path": model_path.relative_to(
-                        ferebus_staging
-                    ).as_posix(),
-                    "command_args": [
-                        "-c",
-                        prop + "/" + atom + "/ferebus.config",
-                        "-I",
-                        prop + "/" + atom + "/datasets",
-                        "-O",
-                        prop + "/" + atom,
-                        "-P",
-                        prop,
-                        "-A",
-                        atom,
-                        "-ALF",
-                        "_".join(str(value) for value in alfs[atom]),
-                    ],
-                    "row_counts": dict(row_counts),
-                    "row_ids": {key: list(value) for key, value in row_ids.items()},
-                    "datasets": {
-                        split: {
-                            "path": csv_path.relative_to(ferebus_staging).as_posix(),
-                            "size": int(csv_path.stat().st_size),
-                            "sha256": sha256_file(csv_path),
-                            "rows": int(row_counts[split]),
-                        }
-                        for split, csv_path in csv_paths.items()
-                    },
-                    "degenerate_property_stats": False,
-                    "generated_config": {
-                        "path": prop + "/" + atom + "/ferebus.config",
-                        "size": int(config_path.stat().st_size),
-                        "sha256": sha256_file(config_path),
-                        "parsed_contract": parsed_contract,
-                        "prior_mean_contract_sha256": prior_contract.contract_sha256,
-                    },
-                }
-            )
-
-        task_manifest = {
-            "schema_version": _stg.FEREBUS_TASK_SCHEMA_VERSION,
-            "campaign_uid": str(reference_view.campaign_uid),
-            "system": system,
-            "reference_data_version": target_version,
-            "reference_data_head_manifest_sha256": str(
-                reference_view.head_manifest_sha256
-            ),
-            "reference_data_view_sha256": str(
-                reference_view.cumulative_view_sha256
-            ),
-            "n_reference_points": len(reference_view.entries),
-            "pointdir_row_order": [
-                entry.pointdir_name for entry in reference_view.entries
-            ],
-            "properties": properties,
-            "atoms": atoms,
-            "n_atoms": len(atoms),
-            "n_tasks": len(tasks),
-            "prior_mean_contract": prior_contract.to_dict(),
-            "degenerate_property_stats": [],
-            "job_details": "FEREBUS_JOB_DETAILS.txt",
-            "split_ledger": {
-                "path": ".DATA/ACTIVE_LEARNING/ferebus_split_assignments.json",
-                "counts": dict(row_counts),
-                "version_allocation": dict(row_counts),
-                "allocation_policy": "dry_run_reference_binding",
-                "allocation_manifest": "dry-run",
-                "allocation_manifest_sha256": "0" * 64,
-                "forced_splits": {
-                    entry.pointdir_name: entry.split for entry in reference_view.entries
-                },
-            },
-            "tasks": tasks,
-        }
-        atomic_write_json(ferebus_staging / _stg.FEREBUS_TASK_MANIFEST, task_manifest)
-        (ferebus_staging / "ATOMS.txt").write_text(
-            "\n".join(atoms) + "\n", encoding="utf-8", newline="\n"
-        )
-        (ferebus_staging / "PROPERTIES.txt").write_text(
-            "\n".join(properties) + "\n", encoding="utf-8", newline="\n"
-        )
-        quality_records = [
-            {
-                "property": str(task["property"]),
-                "atom": str(task["atom"]),
-                "model_path": str(task["expected_model_path"]),
-                "model_sha256": sha256_file(
-                    _stg.resolve_ferebus_task_path(
-                        ferebus_staging,
-                        task["expected_model_path"],
-                        "expected_model_path",
-                    )
-                ),
-                "prior_mean": {
-                    "contract_sha256": prior_contract.contract_sha256,
-                    "expected_mean_ha": prior_contract.expected_mean_ha(
-                        task["property"], task["atom"]
-                    ),
-                    "observed_mean_ha": prior_contract.expected_mean_ha(
-                        task["property"], task["atom"]
-                    ),
-                    "units": "ha",
-                },
-                "row_counts": dict(row_counts),
-                "condition_number": 1.0,
-                "metrics": {
-                    split: {"rmse": 0.0, "mae": 0.0, "r2": 1.0}
-                    for split in ("train", "int_val", "ext_val")
-                },
-                "accepted": True,
-                "reasons": [],
-            }
-            for task in tasks
-        ]
-        quality = {
-            "schema_version": FEREBUS_QUALITY_SCHEMA_VERSION,
-            "campaign_uid": str(reference_view.campaign_uid),
-            "system": system,
-            "reference_data_version": target_version,
-            "reference_data_head_manifest_sha256": str(
-                reference_view.head_manifest_sha256
-            ),
-            "reference_data_view_sha256": str(
-                reference_view.cumulative_view_sha256
-            ),
-            "source_task_manifest_sha256": sha256_file(
-                ferebus_staging / _stg.FEREBUS_TASK_MANIFEST
-            ),
-            "prior_mean_contract": prior_contract.to_dict(),
-            "summary": {
-                "n_tasks": len(tasks),
-                "n_accepted": len(tasks),
-                "n_rejected": 0,
-                "mean_ext_rmse": 0.0,
-                "min_ext_r2": 1.0,
-                "max_condition_number": 1.0,
-            },
-            "records": quality_records,
-            "accepted": True,
-            "reasons": [],
-        }
-        atomic_write_json(ferebus_staging / FEREBUS_QUALITY_MANIFEST, quality)
+        manifest = self._prepare_dry_staged_models(staging)
+        self._write_dry_ferebus_execution_evidence(staging)
+        quality = evaluate_ferebus_quality(staging)
+        write_ferebus_quality_manifest(staging, quality)
+        config_sha = config_fingerprint(canonical_config(self.config))
         write_ferebus_quality_decision(
-            ferebus_staging,
-            config_sha256=config_fingerprint(canonical_config(self.config)),
+            staging,
+            config_sha256=config_sha,
             gates=getattr(self.config, "quality_gates", None),
         )
+        validate_ferebus_model_contract(staging)
 
         model_versioning = self._versioning("models")
         with trained_models_commit_lock(self.campaign_dir):
@@ -732,9 +558,9 @@ class DryRunPhaseExecutor:
                 target_version=target_version,
             )
             _write_ferebus_task_artefact_layout(
-                ferebus_staging,
+                staging,
                 staged,
-                _stg.read_ferebus_manifest(ferebus_staging),
+                manifest,
                 models_version=target_version,
                 parent_model_set=parent,
             )
@@ -756,6 +582,10 @@ class DryRunPhaseExecutor:
             seal_trained_model_version(committed_dir)
             model_versioning.resolve(target_version, verification="deep")
             model_versioning.update_current(target_version)
+
+    def _commit_dry_model_snapshot(self, version: int) -> None:
+        """Commit a dry model snapshot through the live storage contract."""
+        self._commit_prepared_dry_ferebus_snapshot(int(version))
 
     # --- internal: inline phases ---------------------------------------
 
@@ -2611,6 +2441,99 @@ class DryRunPhaseExecutor:
         )
         return True
 
+    @staticmethod
+    def _write_dry_quantum_wfn(
+        path: Path,
+        *,
+        method: str,
+        point_index: int,
+        total_energy_ha: float,
+    ) -> None:
+        """Write a minimal parseable three-atom WFN for dry contract tests."""
+        from ichor.core.atoms import Atom, Atoms
+        from ichor.core.common.units import AtomicDistance
+        from ichor.core.files.gaussian.wfn import MolecularOrbital, WFN
+
+        displacement = 0.01 * int(point_index)
+        atoms = Atoms(
+            [
+                Atom("O", 0.0, 0.0, 0.0, units=AtomicDistance.Bohr),
+                Atom(
+                    "H",
+                    1.43 + displacement,
+                    0.0,
+                    0.0,
+                    units=AtomicDistance.Bohr,
+                ),
+                Atom(
+                    "H",
+                    -0.36,
+                    1.38 + displacement,
+                    0.0,
+                    units=AtomicDistance.Bohr,
+                ),
+            ]
+        )
+        wfn = WFN(path, method=str(method))
+        wfn.atoms = atoms
+        wfn.n_orbitals = 1
+        wfn.n_primitives = 3
+        wfn.n_nuclei = 3
+        wfn.centre_assignments = [1, 2, 3]
+        wfn.type_assignments = [1, 1, 1]
+        wfn.primitive_exponents = [1.0, 1.0, 1.0]
+        wfn.molecular_orbitals = [
+            MolecularOrbital(1, 2.0, -0.5, [1.0, 0.0, 0.0])
+        ]
+        wfn.total_energy = float(total_energy_ha)
+        wfn.virial_ratio = 2.0
+        wfn.write()
+
+    @staticmethod
+    def _write_dry_aimall_int(
+        path: Path,
+        *,
+        atom_name: str,
+        method: str,
+        iqa_ha: float,
+        multipole_names: Sequence[str],
+    ) -> None:
+        """Write the smallest INT accepted by the production AIMAll parser."""
+        lines = [
+            "AIMAll Version 19.10.12,",
+            "Current Directory .",
+            "",
+            "Inp File: input.inp",
+            "Wfn File: input.wfn",
+            "Out File: " + path.name,
+            "",
+            "Title: DRYRUN",
+            "List of critical points",
+            "Optional parameters",
+            "",
+            "DFT Model: " + str(method),
+            "Integration is over atom " + str(atom_name),
+            "Results of the basin integration",
+            "N = 0.0 Charge = 0.0",
+            "L = 0.0",
+            "Atomic Traceless Quadrupole",
+            "Real Spherical Harmonic Moments",
+            "moment header 1",
+            "moment header 2",
+            "moment header 3",
+        ]
+        lines.extend(str(name) + " = 0.0" for name in multipole_names)
+        lines.extend(
+            [
+                "IQA Energy Components",
+                "Component Value",
+                "E_IQA(A) = " + repr(float(iqa_ha)),
+                "End IQA components",
+                "Total time = 0",
+            ]
+        )
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+
     def _stub_quantum_outputs(
         self,
         state,
@@ -2744,36 +2667,41 @@ class DryRunPhaseExecutor:
                 self.config.gaussian.method
             )
 
-            records = [
-                {
-                    "pointdir": point_dir.name,
-                    "accepted": True,
-                    "reasons": [],
-                    "atom_count": 1,
-                    "expected_atom_names": ["X1"],
-                    "n_int": 1,
-                    "sum_iqa_ha": -1.0,
-                    "wfn_total_energy_ha": -1.0,
-                    "wfn_virial_ratio": 2.0,
-                    "iqa_energy_recovery_error_ha": 0.0,
-                    "max_abs_integration_error": 0.0,
-                    "per_atom": [
-                        {
-                            "atom": "X1",
-                            "int_file": "x1.int",
-                            "dft_model": str(self.config.gaussian.method),
-                            "canonical_dft_model": canonical_method,
-                            "iqa_ha": -1.0,
-                            "integration_error": 0.0,
-                            "multipoles": {
-                                name: 0.0 for name in multipole_names
-                            },
-                            "reasons": [],
-                        }
-                    ],
-                }
-                for point_dir in pointdirs
-            ]
+            records = []
+            atom_names = ("O1", "H2", "H3")
+            for point_index, point_dir in enumerate(pointdirs):
+                total_energy = -1.0 - 0.01 * point_index
+                atom_iqa = (0.6 * total_energy, 0.2 * total_energy, 0.2 * total_energy)
+                records.append(
+                    {
+                        "pointdir": point_dir.name,
+                        "accepted": True,
+                        "reasons": [],
+                        "atom_count": 3,
+                        "expected_atom_names": list(atom_names),
+                        "n_int": 3,
+                        "sum_iqa_ha": total_energy,
+                        "wfn_total_energy_ha": total_energy,
+                        "wfn_virial_ratio": 2.0,
+                        "iqa_energy_recovery_error_ha": 0.0,
+                        "max_abs_integration_error": 0.0,
+                        "per_atom": [
+                            {
+                                "atom": atom_name,
+                                "int_file": atom_name.lower() + ".int",
+                                "dft_model": canonical_method,
+                                "canonical_dft_model": canonical_method,
+                                "iqa_ha": value,
+                                "integration_error": 0.0,
+                                "multipoles": {
+                                    name: 0.0 for name in multipole_names
+                                },
+                                "reasons": [],
+                            }
+                            for atom_name, value in zip(atom_names, atom_iqa)
+                        ],
+                    }
+                )
             manifest = write_quantum_quality_manifest(
                 staging_root,
                 phase_name=phase_name,
@@ -2782,10 +2710,11 @@ class DryRunPhaseExecutor:
                 gates=getattr(self.config, "quality_gates", None),
             )
             self.artefact_log.append(str(manifest))
-            for point_dir, quality_record in zip(pointdirs, records):
+            for point_index, (point_dir, quality_record) in enumerate(
+                zip(pointdirs, records)
+            ):
                 for filename in (
                     "input.gjf",
-                    "input.wfn",
                     "input.gau",
                     "AIMALL_TASK.json",
                     "GAUSSIAN_TASK_RECEIPT.json",
@@ -2795,13 +2724,21 @@ class DryRunPhaseExecutor:
                     path = point_dir / filename
                     if not path.exists():
                         path.write_text("DRYRUN synthetic evidence\n", encoding="utf-8")
+                self._write_dry_quantum_wfn(
+                    point_dir / "input.wfn",
+                    method=canonical_method,
+                    point_index=point_index,
+                    total_energy_ha=float(quality_record["wfn_total_energy_ha"]),
+                )
                 atomic_dir = point_dir / "input_atomicfiles"
                 atomic_dir.mkdir(exist_ok=True)
-                int_path = atomic_dir / "x1.int"
-                if not int_path.exists():
-                    int_path.write_text(
-                        "DRYRUN synthetic AIMAll evidence\n",
-                        encoding="utf-8",
+                for atom_record in quality_record["per_atom"]:
+                    self._write_dry_aimall_int(
+                        atomic_dir / str(atom_record["int_file"]),
+                        atom_name=str(atom_record["atom"]),
+                        method=canonical_method,
+                        iqa_ha=float(atom_record["iqa_ha"]),
+                        multipole_names=multipole_names,
                     )
                 write_quantum_acceptance_receipt(
                     self.campaign_dir,

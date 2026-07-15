@@ -1,8 +1,7 @@
 """FEREBUS quality sidecar tests."""
 import json
 import hashlib
-from types import SimpleNamespace
-
+import numpy as np
 import pytest
 
 from ichor.hpc.active_learning.daemon import input_staging as stg
@@ -12,22 +11,42 @@ from ichor.hpc.active_learning.daemon.ferebus_quality import (
     evaluate_ferebus_quality,
     evaluate_ferebus_quality_decision,
     read_ferebus_quality_decision,
+    _stream_model_metrics,
+    validate_ferebus_quality_evidence,
     write_ferebus_quality_decision,
     write_ferebus_quality_manifest,
 )
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.ferebus_prior import (
+    backend_kernel_token,
     resolve_ferebus_prior_contract,
+    validate_ferebus_config_contract,
 )
+from ichor.hpc.active_learning.daemon.ferebus_task_runner import (
+    write_preexisting_model_receipts,
+)
+from ichor.hpc.active_learning.daemon.state import atomic_write_json
+from ichor.hpc.active_learning.submit.pyferebus_wrap import (
+    _write_structured_task_map,
+)
+from ichor.hpc.active_learning.versioning.manifest import sha256_file
+from ichor.hpc.active_learning.versioning.reference_data import canonical_json_sha256
 
 
 PRIOR = resolve_ferebus_prior_contract(CampaignConfig())
 OXYGEN_PRIOR = PRIOR.expected_mean_ha("iqa", "O1")
 
 
+def _gates(**overrides):
+    gates = CampaignConfig().quality_gates
+    for name, value in overrides.items():
+        setattr(gates, name, value)
+    return gates
+
+
 def _write_zero_model(path, *, atom="O1", ntrain=3, nfeats=3):
     rows = [
-        [0.1 + i * 0.1 + j * 0.01 for j in range(nfeats)]
+        [0.1 * (j + 1) + i * 0.1 for j in range(nfeats)]
         for i in range(ntrain)
     ]
     lines = [
@@ -52,6 +71,7 @@ def _write_zero_model(path, *, atom="O1", ntrain=3, nfeats=3):
         "[kernels]",
         "number_of_kernels 1",
         "composition k1",
+        "prefactor 1.0",
         "",
         "[kernel.k1]",
         "type rbf",
@@ -67,7 +87,7 @@ def _write_zero_model(path, *, atom="O1", ntrain=3, nfeats=3):
     ]
     lines += [" ".join(str(v) for v in row) for row in rows]
     lines += ["", "[training_data.y]"]
-    lines += ["0.0" for _ in range(ntrain)]
+    lines += [repr(OXYGEN_PRIOR) for _ in range(ntrain)]
     lines += ["", "[weights]"]
     lines += ["0.0" for _ in range(ntrain)]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -104,30 +124,144 @@ def _seed_quality_staging(tmp_path, *, ext_targets=None):
     _write_dataset(train_csv, (OXYGEN_PRIOR,) * 3)
     _write_dataset(int_csv, (OXYGEN_PRIOR,) * 2)
     _write_dataset(ext_csv, ext_targets)
-    (task_dir / "ferebus.config").write_text("config\n", encoding="utf-8")
-    (staging / stg.FEREBUS_TASK_MANIFEST).write_text(
-        json.dumps({
+    config_path = task_dir / "ferebus.config"
+    config_path.write_text(
+        "mean_type = 21\n"
+        'level_of_theory = "b3lyp/aug-cc-pvtz"\n'
+        "iqaDeviationFactor = 1.0\n"
+        "scaling = 1\n"
+        "scale_feats = 1\n"
+        "scale_prop = 0\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    parsed_contract = validate_ferebus_config_contract(config_path, PRIOR)
+    row_order = [
+        "POINT_" + str(index).zfill(6) + ".pointdir"
+        for index in range(7)
+    ]
+    split_rows = {
+        "train": [0, 1, 2],
+        "int_val": [3, 4],
+        "ext_val": [5, 6],
+    }
+    source_rows = [
+        {
+            "source_row_index": index,
+            "pointdir_name": name,
+            "introduced_in_version": 0,
+            "split": next(
+                split for split, indexes in split_rows.items() if index in indexes
+            ),
+            "provenance_sha256": hashlib.sha256(name.encode("utf-8")).hexdigest(),
+        }
+        for index, name in enumerate(row_order)
+    ]
+    split_identities = {
+        split: [source_rows[index] for index in indexes]
+        for split, indexes in split_rows.items()
+    }
+    row_identity_payload = {
+        "schema_version": stg.FEREBUS_ROW_IDENTITIES_SCHEMA_VERSION,
+        "campaign_uid": "quality-test",
+        "reference_data_version": 0,
+        "reference_data_view_sha256": "b" * 64,
+        "source_rows": source_rows,
+        "source_rows_sha256": canonical_json_sha256(source_rows),
+        "splits": {
+            split: {
+                "rows": rows,
+                "n_rows": len(rows),
+                "row_identity_sha256": canonical_json_sha256(rows),
+            }
+            for split, rows in split_identities.items()
+        },
+    }
+    row_identity_path = staging / stg.FEREBUS_ROW_IDENTITIES
+    atomic_write_json(row_identity_path, row_identity_payload)
+    split_payload = {
+        "schema_version": 7,
+        "allocation_policy": "exact_per_reference_data_version",
+        "historical_training_rows": 0,
+        "assignments": {
+            name: {
+                "split": source_rows[index]["split"],
+                "first_seen_reference_data_version": 0,
+                "assignment_version": 4,
+                "allocation_manifest_sha256": "c" * 64,
+                "provenance_sha256": source_rows[index]["provenance_sha256"],
+            }
+            for index, name in enumerate(row_order)
+        },
+        "version_allocations": {},
+    }
+    split_path = staging / stg.FEREBUS_SPLIT_SNAPSHOT
+    atomic_write_json(split_path, split_payload)
+    datasets = {
+        "train": _dataset_identity(train_csv, 3, staging),
+        "int_val": _dataset_identity(int_csv, 2, staging),
+        "ext_val": _dataset_identity(ext_csv, 2, staging),
+    }
+    for split, record in datasets.items():
+        record["row_identity_sha256"] = row_identity_payload["splits"][split][
+            "row_identity_sha256"
+        ]
+        record["row_identity_count"] = record["rows"]
+    manifest = {
             "schema_version": stg.FEREBUS_TASK_SCHEMA_VERSION,
             "campaign_uid": "quality-test",
             "system": "WATER",
-            "reference_data_version": 4,
+            "reference_data_version": 0,
             "reference_data_head_manifest_sha256": "a" * 64,
             "reference_data_view_sha256": "b" * 64,
             "n_reference_points": 7,
-            "pointdir_row_order": [
-                "POINT_" + str(index).zfill(6) + ".pointdir"
-                for index in range(7)
-            ],
+            "pointdir_row_order": row_order,
             "properties": ["iqa"],
             "atoms": ["O1"],
             "n_atoms": 1,
             "n_tasks": 1,
             "prior_mean_contract": PRIOR.to_dict(),
+            "kernel_contract": {
+                "family": "rbf",
+                "backend_token": backend_kernel_token("rbf"),
+                "loss": "huber",
+                "constant_noise": True,
+                "full_ard": True,
+                "feature_scaling": True,
+                "property_scaling": False,
+                "kernel_prefactor_mode": 2,
+            },
+            "row_identity_snapshot": {
+                "path": stg.FEREBUS_ROW_IDENTITIES,
+                "size": row_identity_path.stat().st_size,
+                "sha256": sha256_file(row_identity_path),
+                "source_rows_sha256": row_identity_payload["source_rows_sha256"],
+            },
+            "split_ledger": {
+                "path": stg.FEREBUS_SPLIT_SNAPSHOT,
+                "size": split_path.stat().st_size,
+                "sha256": sha256_file(split_path),
+                "counts": {"train": 3, "int_val": 2, "ext_val": 2},
+                "version_allocation": {},
+                "allocation_policy": "exact_per_reference_data_version",
+                "allocation_manifest": "test",
+                "allocation_manifest_sha256": "c" * 64,
+                "forced_splits": {
+                    name: source_rows[index]["split"]
+                    for index, name in enumerate(row_order)
+                },
+            },
+            "degenerate_property_stats": [],
             "tasks": [{
                 "task_index": 1,
                 "property": "iqa",
                 "atom": "O1",
-                "prior_mean": PRIOR.task_payload("iqa", "O1"),
+                "prior_mean": PRIOR.task_payload(
+                    "iqa",
+                    "O1",
+                    training_values=[OXYGEN_PRIOR] * 3,
+                    training_dataset_sha256=sha256_file(train_csv),
+                ),
                 "alf_1_indexed": [1, 2, 3],
                 "alf_cli": "1_2_3",
                 "property_dir": "iqa",
@@ -147,25 +281,34 @@ def _seed_quality_staging(tmp_path, *, ext_targets=None):
                     "-ALF", "1_2_3",
                 ],
                 "row_counts": {"train": 3, "int_val": 2, "ext_val": 2},
-                "row_ids": {
-                    "train": [0, 1, 2],
-                    "int_val": [3, 4],
-                    "ext_val": [5, 6],
+                "historical_training_rows": 0,
+                "historical_training_row_ids": [],
+                "row_ids": split_rows,
+                "datasets": datasets,
+                "generated_config": {
+                    "path": "iqa/O1/ferebus.config",
+                    "size": config_path.stat().st_size,
+                    "sha256": sha256_file(config_path),
+                    "parsed_contract": parsed_contract,
+                    "prior_mean_contract_sha256": PRIOR.contract_sha256,
                 },
-                "datasets": {
-                    "train": _dataset_identity(
-                        train_csv, 3, staging
-                    ),
-                    "int_val": _dataset_identity(
-                        int_csv, 2, staging
-                    ),
-                    "ext_val": _dataset_identity(
-                        ext_csv, 2, staging
-                    ),
-                },
+                "degenerate_property_stats": False,
             }],
-        }),
+        }
+    atomic_write_json(staging / stg.FEREBUS_TASK_MANIFEST, manifest)
+    model.with_suffix(".perf").write_text(
+        "RMSE 0.0\nMAE 0.0\ncovariance_condition_number 1.0\n",
         encoding="utf-8",
+        newline="\n",
+    )
+    _write_structured_task_map(
+        staging,
+        executable="ferebus",
+        execution_kind="synthetic_dry_run",
+    )
+    write_preexisting_model_receipts(
+        staging,
+        execution_kind="synthetic_dry_run",
     )
     return staging
 
@@ -175,7 +318,7 @@ def test_ferebus_quality_computes_metrics_and_condition_number(tmp_path):
 
     payload = evaluate_ferebus_quality(staging)
 
-    assert payload["accepted"] is True
+    assert payload["measurement_complete"] is True
     assert payload["summary"]["n_tasks"] == 1
     assert payload["summary"]["mean_ext_rmse"] == 0.0
     assert payload["summary"]["min_ext_r2"] == 1.0
@@ -185,16 +328,116 @@ def test_ferebus_quality_computes_metrics_and_condition_number(tmp_path):
     assert record["metrics"]["ext_val"] == {"rmse": 0.0, "mae": 0.0, "r2": 1.0}
 
 
+def test_ferebus_quality_streams_large_csv_in_bounded_chunks(tmp_path):
+    path = tmp_path / "large.csv"
+    rows = ["f1,f2,f3,iqa"]
+    for index in range(1201):
+        target = float(index) / 100.0
+        rows.append(
+            ",".join(
+                (
+                    repr(target - 1.0),
+                    "0.0",
+                    "0.0",
+                    repr(target),
+                )
+            )
+        )
+    path.write_text("\n".join(rows) + "\n", encoding="utf-8", newline="\n")
+
+    class RecordingModel:
+        x = np.zeros((1, 3), dtype=float)
+        y = np.zeros((1, 1), dtype=float)
+
+        def __init__(self):
+            self.largest_batch = 0
+
+        def predict(self, features):
+            self.largest_batch = max(self.largest_batch, int(features.shape[0]))
+            return np.asarray(features[:, 0], dtype=float)
+
+    model = RecordingModel()
+    metrics, incumbent, count = _stream_model_metrics(path, "iqa", model)
+
+    assert count == 1201
+    assert model.largest_batch <= 512
+    assert incumbent is None
+    assert metrics["rmse"] == pytest.approx(1.0)
+    assert metrics["mae"] == pytest.approx(1.0)
+
+
 def test_ferebus_quality_optional_thresholds_are_enforced(tmp_path):
     staging = _seed_quality_staging(tmp_path, ext_targets=(1.0, 1.0))
 
-    payload = evaluate_ferebus_quality(
-        staging,
-        gates=SimpleNamespace(ferebus_max_ext_rmse_ha=0.5),
+    payload = evaluate_ferebus_quality(staging)
+    decision = evaluate_ferebus_quality_decision(
+        payload,
+        _gates(ferebus_max_ext_rmse_ha=0.5),
     )
 
-    assert payload["accepted"] is False
-    assert "ferebus_ext_rmse_threshold_exceeded" in payload["reasons"]
+    assert decision["accepted"] is False
+    assert "ferebus_ext_rmse_threshold_exceeded" in decision["reasons"]
+
+
+def test_ferebus_promotion_rejects_aggregate_regression_beyond_five_percent():
+    quality = {
+        "records": [
+            {
+                "property": "iqa",
+                "atom": "O1",
+                "row_counts": {"ext_val": 10},
+                "condition_number": 1.0,
+                "metrics": {"ext_val": {"rmse": 1.06, "mae": 1.0, "r2": 0.0}},
+                "incumbent_ext_metrics": {"rmse": 1.0, "mae": 1.0, "r2": 0.0},
+                "incumbent_binding": {"bound": True},
+            }
+        ],
+        "summary": {
+            "aggregate_iqa_ext_rmse": 1.06,
+            "incumbent_aggregate_iqa_ext_rmse": 1.0,
+        },
+    }
+
+    decision = evaluate_ferebus_quality_decision(quality, _gates())
+
+    assert decision["accepted"] is False
+    assert "ferebus_aggregate_ext_rmse_regressed" in decision["reasons"]
+    assert decision["promotion"]["aggregate_rmse_limit"] == pytest.approx(1.05)
+
+
+def test_ferebus_promotion_rejects_single_task_regression_beyond_twenty_percent():
+    quality = {
+        "records": [
+            {
+                "property": "iqa",
+                "atom": "O1",
+                "row_counts": {"ext_val": 10},
+                "condition_number": 1.0,
+                "metrics": {"ext_val": {"rmse": 0.121, "mae": 0.1, "r2": 0.0}},
+                "incumbent_ext_metrics": {"rmse": 0.1, "mae": 0.1, "r2": 0.0},
+                "incumbent_binding": {"bound": True},
+            }
+        ],
+        "summary": {
+            "aggregate_iqa_ext_rmse": 0.121,
+            "incumbent_aggregate_iqa_ext_rmse": 0.1,
+        },
+    }
+    gates = _gates(ferebus_max_aggregate_ext_rmse_increase_fraction=1.0)
+
+    decision = evaluate_ferebus_quality_decision(quality, gates)
+
+    assert decision["accepted"] is False
+    assert "ferebus_task_ext_rmse_regressed" in decision["reasons"]
+    assert decision["tasks"][0]["relative_rmse_limit"] == pytest.approx(0.12)
+
+
+def test_ferebus_promotion_rejects_non_numeric_thresholds():
+    with pytest.raises(ValueError, match="must be numeric"):
+        evaluate_ferebus_quality_decision(
+            {"records": [], "summary": {}},
+            _gates(ferebus_max_task_ext_rmse_increase_fraction=True),
+        )
 
 
 def test_hartree_rmse_threshold_is_not_applied_to_multipoles(tmp_path):
@@ -204,7 +447,7 @@ def test_hartree_rmse_threshold_is_not_applied_to_multipoles(tmp_path):
 
     decision = evaluate_ferebus_quality_decision(
         quality,
-        SimpleNamespace(ferebus_max_ext_rmse_ha=0.01),
+        _gates(ferebus_max_ext_rmse_ha=0.01),
     )
 
     assert decision["accepted"] is True
@@ -231,9 +474,30 @@ def test_write_ferebus_quality_manifest(tmp_path):
     assert json.loads(path.read_text(encoding="utf-8")) == payload
 
 
+def test_quality_validator_recomputes_summary_from_task_records(tmp_path):
+    staging = _seed_quality_staging(tmp_path)
+    quality = evaluate_ferebus_quality(staging)
+    quality["summary"]["n_measured"] = 0
+    write_ferebus_quality_manifest(staging, quality)
+
+    with pytest.raises(ValueError, match="summary n_measured mismatch"):
+        validate_ferebus_quality_evidence(staging)
+
+
+def test_quality_validator_binds_condition_to_native_performance(tmp_path):
+    staging = _seed_quality_staging(tmp_path)
+    quality = evaluate_ferebus_quality(staging)
+    quality["records"][0]["condition_number"] = 2.0
+    quality["summary"]["max_condition_number"] = 2.0
+    write_ferebus_quality_manifest(staging, quality)
+
+    with pytest.raises(ValueError, match="condition number disagrees"):
+        validate_ferebus_quality_evidence(staging)
+
+
 def test_quality_decision_reuses_immutable_metrics_for_threshold_change(tmp_path):
     staging = _seed_quality_staging(tmp_path, ext_targets=(1.0, 1.0))
-    strict = SimpleNamespace(ferebus_max_ext_rmse_ha=0.5)
+    strict = _gates(ferebus_max_ext_rmse_ha=0.5)
     quality = evaluate_ferebus_quality(staging, gates=strict)
     write_ferebus_quality_manifest(staging, quality)
     model = staging / "iqa" / "O1" / "WATER_iqa_O1.model"
@@ -254,7 +518,7 @@ def test_quality_decision_reuses_immutable_metrics_for_threshold_change(tmp_path
     write_ferebus_quality_decision(
         staging,
         config_sha256="relaxed-config",
-        gates=SimpleNamespace(),
+        gates=_gates(),
     )
     accepted = read_ferebus_quality_decision(
         staging,
@@ -273,12 +537,12 @@ def test_quality_decision_rejects_model_drift(tmp_path):
     write_ferebus_quality_decision(
         staging,
         config_sha256="config-a",
-        gates=SimpleNamespace(),
+        gates=_gates(),
     )
     model = staging / "iqa" / "O1" / "WATER_iqa_O1.model"
     model.write_bytes(model.read_bytes() + b"\n# tampered\n")
 
-    with pytest.raises(ValueError, match="model hash mismatch"):
+    with pytest.raises(ValueError, match="model (size|SHA-256|hash) mismatch"):
         read_ferebus_quality_decision(
             staging,
             expected_config_sha256="config-a",

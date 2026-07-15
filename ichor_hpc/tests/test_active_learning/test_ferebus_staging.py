@@ -12,6 +12,7 @@ from pathlib import Path
 
 import ichor.core.files as core_files
 import numpy as np
+import pytest
 
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.daemon import input_staging as stg
@@ -31,6 +32,16 @@ from ichor.hpc.active_learning.versioning.provenance import (
     enrich_with_point_allocation,
     write_seed_provenance,
 )
+
+
+def test_native_ferebus_rejects_diatomic_alf_before_csv_generation():
+    with pytest.raises(ValueError, match="diatomic training is unsupported"):
+        stg._require_native_ferebus_alf(
+            {
+                "H1": (0, 1, 1),
+                "H2": (1, 0, 0),
+            }
+        )
 
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "live_outputs"

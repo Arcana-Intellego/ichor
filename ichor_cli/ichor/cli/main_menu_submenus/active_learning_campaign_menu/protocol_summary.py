@@ -739,7 +739,8 @@ def format_sampling_protocol_summary(
     lines.append(_line("aimall.iasmesh", aimall.iasmesh))
     lines.append(_line("gaussian.method", gaussian.method))
     lines.append(_line("gaussian.basis_set", gaussian.basis_set))
-    lines.append(_line("ferebus.prior_mean_type", ferebus.prior_mean_type))
+    lines.append(_line("ferebus.kernel", ferebus.kernel))
+    lines.append(_line("ferebus.prior_mean_strategy", ferebus.prior_mean_strategy))
     lines.append(
         _line(
             "ferebus.prior_mean_level_of_theory",
@@ -748,8 +749,8 @@ def format_sampling_protocol_summary(
     )
     lines.append(
         _line(
-            "ferebus.prior_mean_iqa_deviation_factor",
-            ferebus.prior_mean_iqa_deviation_factor,
+            "ferebus.physical_prior_scale",
+            ferebus.physical_prior_scale,
         )
     )
     try:
@@ -759,8 +760,10 @@ def format_sampling_protocol_summary(
 
         prior = resolve_ferebus_prior_contract(config)
         prior_summary = (
-            "resolved_level="
-            + prior.level_of_theory
+            "strategy="
+            + prior.strategy
+            + ", resolved_level="
+            + str(prior.level_of_theory or "not_applicable")
             + ", units=ha, hash="
             + prior.contract_sha256[:12]
             + ", feature_scaling="

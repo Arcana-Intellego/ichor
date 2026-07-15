@@ -494,20 +494,15 @@ PRE_GAUSSIAN_PREFIXES = {"gaussian."}
 PRE_AIMALL_PREFIXES = {"aimall."}
 PRE_FEREBUS_FIRST_EXACT = {
     "ferebus.properties",
-    "ferebus.prior_mean_type",
+    "ferebus.prior_mean_strategy",
     "ferebus.prior_mean_level_of_theory",
-    "ferebus.prior_mean_iqa_deviation_factor",
-    "ferebus.feature_scaling",
-    "ferebus.property_scaling",
+    "ferebus.physical_prior_scale",
     "acquisition.property_name",
 }
 FUTURE_FEREBUS_EXACT = {
     "ferebus.kernel",
-    "ferebus.loss",
     "ferebus.nagents",
     "ferebus.maxiter",
-    "ferebus.is_constant_noise",
-    "ferebus.full_ARD",
 }
 PRE_SEED_SELECT_EXACT = {
     "seed_selection.exclude_committed_seed_frames",

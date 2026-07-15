@@ -1131,11 +1131,10 @@ def synthetic_dry_records(
         from ..ferebus_prior import FerebusPriorContract
 
         prior_mean_contract_sha256 = FerebusPriorContract(
+            strategy="physical_atomic_iqa",
             mean_type=21,
             level_of_theory="b3lyp/aug-cc-pvtz",
-            iqa_deviation_factor=1.0,
-            feature_scaling=True,
-            property_scaling=False,
+            physical_prior_scale=1.0,
         ).contract_sha256
     records = []
     for i in range(int(n_points)):

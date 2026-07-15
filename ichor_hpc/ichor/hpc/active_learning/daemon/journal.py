@@ -162,6 +162,7 @@ KNOWN_EVENT_TYPES = (
     "ariadne_task_rejected_unusable_result",
     "ariadne_task_rejected_unsafe_landing",
     "ariadne_task_salvaged_from_nonzero_exit",
+    "ferebus_candidate_rejected",
     "ferebus_quality_summary",
     "geometry_novelty_scale_precomputed",
     "sampling_protocol_resolved",

@@ -72,7 +72,7 @@ def test_save_load_round_trip_preserves_config(tmp_path):
     c = CampaignConfig()
     c.phase_b.beta = 0.7
     c.point_allocation.batch_internal_validation_size = 2
-    c.ferebus.kernel = "rbf_per"
+    c.ferebus.kernel = "rbf"
     p = tmp_path / "c.yaml"
     c.to_yaml(p)
     c2 = CampaignConfig.from_yaml(p)

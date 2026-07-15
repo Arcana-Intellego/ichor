@@ -946,7 +946,17 @@ def _seed_models_staging(campaign_dir, properties=("iqa",)):
     """Create manifest-backed pyferebus staging with parseable models."""
     import hashlib
 
+    from ichor.hpc.active_learning.daemon.ferebus_task_runner import (
+        write_preexisting_model_receipts,
+    )
+    from ichor.hpc.active_learning.daemon.state import atomic_write_json
+    from ichor.hpc.active_learning.submit.pyferebus_wrap import (
+        _write_structured_task_map,
+    )
     from ichor.hpc.active_learning.versioning.manifest import sha256_file
+    from ichor.hpc.active_learning.versioning.reference_data import (
+        canonical_json_sha256,
+    )
     from ichor.hpc.active_learning.config import CampaignConfig
     from ichor.hpc.active_learning.ferebus_prior import (
         resolve_ferebus_prior_contract,
@@ -969,6 +979,56 @@ def _seed_models_staging(campaign_dir, properties=("iqa",)):
         for split in ("train", "int_val", "ext_val")
     }
     row_counts = {split: len(values) for split, values in row_ids.items()}
+    source_rows = [
+        {
+            "source_row_index": index,
+            "pointdir_name": entry.pointdir_name,
+            "introduced_in_version": entry.introduced_in_version,
+            "split": entry.split,
+            "provenance_sha256": entry.provenance_sha256,
+        }
+        for index, entry in enumerate(reference_view.entries)
+    ]
+    split_identity_rows = {
+        split: [source_rows[index] for index in indexes]
+        for split, indexes in row_ids.items()
+    }
+    row_identity_payload = {
+        "schema_version": stg.FEREBUS_ROW_IDENTITIES_SCHEMA_VERSION,
+        "campaign_uid": reference_view.campaign_uid,
+        "reference_data_version": 0,
+        "reference_data_view_sha256": reference_view.cumulative_view_sha256,
+        "source_rows": source_rows,
+        "source_rows_sha256": canonical_json_sha256(source_rows),
+        "splits": {
+            split: {
+                "rows": rows,
+                "n_rows": len(rows),
+                "row_identity_sha256": canonical_json_sha256(rows),
+            }
+            for split, rows in split_identity_rows.items()
+        },
+    }
+    row_identity_path = target / stg.FEREBUS_ROW_IDENTITIES
+    atomic_write_json(row_identity_path, row_identity_payload)
+    split_payload = {
+        "schema_version": 7,
+        "allocation_policy": "exact_per_reference_data_version",
+        "historical_training_rows": 0,
+        "assignments": {
+            row["pointdir_name"]: {
+                "split": row["split"],
+                "first_seen_reference_data_version": row["introduced_in_version"],
+                "assignment_version": 4,
+                "allocation_manifest_sha256": "c" * 64,
+                "provenance_sha256": row["provenance_sha256"],
+            }
+            for row in source_rows
+        },
+        "version_allocations": {},
+    }
+    split_path = target / stg.FEREBUS_SPLIT_SNAPSHOT
+    atomic_write_json(split_path, split_payload)
     tasks = []
     for task_index, prop in enumerate(properties, start=1):
         model_dir = target / prop / "O1"
@@ -997,19 +1057,50 @@ def _seed_models_staging(campaign_dir, properties=("iqa",)):
         _write_metric_csv(train_csv, row_counts["train"], prop=prop)
         _write_metric_csv(int_csv, row_counts["int_val"], prop=prop)
         _write_metric_csv(ext_csv, row_counts["ext_val"], prop=prop)
-        suffixes = ("opt", "perf", "pred", "scurve", "sol") if prop == "iqa" else ("opt",)
+        suffixes = (
+            ("opt", "perf", "pred", "scurve", "sol")
+            if prop == "iqa"
+            else ("opt", "perf")
+        )
         for suffix in suffixes:
             (model_dir / ("WATER_" + prop + "_O1." + suffix)).write_text(
-                suffix + "\n",
+                (
+                    "RMSE 0.0\nMAE 0.0\n"
+                    "covariance_condition_number 1.0\n"
+                    if suffix == "perf"
+                    else suffix + "\n"
+                ),
                 encoding="utf-8",
             )
         task_dir = prop + "/O1"
         input_dir = task_dir + "/datasets"
+        dataset_records = {
+            split: {
+                "path": path.relative_to(target).as_posix(),
+                "size": path.stat().st_size,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "rows": row_counts[split],
+                "row_identity_sha256": row_identity_payload["splits"][split][
+                    "row_identity_sha256"
+                ],
+                "row_identity_count": row_counts[split],
+            }
+            for split, path in (
+                ("train", train_csv),
+                ("int_val", int_csv),
+                ("ext_val", ext_csv),
+            )
+        }
         tasks.append({
             "task_index": task_index,
             "property": prop,
             "atom": "O1",
-            "prior_mean": prior.task_payload(prop, "O1"),
+            "prior_mean": prior.task_payload(
+                prop,
+                "O1",
+                training_values=[0.0] * row_counts["train"],
+                training_dataset_sha256=sha256_file(train_csv),
+            ),
             "alf_1_indexed": [1, 2, 3],
             "alf_cli": "1_2_3",
             "property_dir": prop,
@@ -1029,20 +1120,10 @@ def _seed_models_staging(campaign_dir, properties=("iqa",)):
                 "-ALF", "1_2_3",
             ],
             "row_counts": dict(row_counts),
+            "historical_training_rows": 0,
+            "historical_training_row_ids": [],
             "row_ids": {key: list(value) for key, value in row_ids.items()},
-            "datasets": {
-                split: {
-                    "path": path.relative_to(target).as_posix(),
-                    "size": path.stat().st_size,
-                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-                    "rows": row_counts[split],
-                }
-                for split, path in (
-                    ("train", train_csv),
-                    ("int_val", int_csv),
-                    ("ext_val", ext_csv),
-                )
-            },
+            "datasets": dataset_records,
             "degenerate_property_stats": False,
             "generated_config": {
                 "path": task_dir + "/ferebus.config",
@@ -1066,53 +1147,49 @@ def _seed_models_staging(campaign_dir, properties=("iqa",)):
         "n_atoms": 1,
         "n_tasks": len(tasks),
         "prior_mean_contract": prior.to_dict(),
+        "kernel_contract": {
+            "family": "rbf",
+            "backend_token": "rbf",
+            "loss": "huber",
+            "constant_noise": True,
+            "full_ard": True,
+            "feature_scaling": True,
+            "property_scaling": False,
+            "kernel_prefactor_mode": 2,
+        },
+        "row_identity_snapshot": {
+            "path": stg.FEREBUS_ROW_IDENTITIES,
+            "size": row_identity_path.stat().st_size,
+            "sha256": sha256_file(row_identity_path),
+            "source_rows_sha256": row_identity_payload["source_rows_sha256"],
+        },
+        "split_ledger": {
+            "path": stg.FEREBUS_SPLIT_SNAPSHOT,
+            "size": split_path.stat().st_size,
+            "sha256": sha256_file(split_path),
+            "counts": dict(row_counts),
+            "version_allocation": {},
+            "allocation_policy": "exact_per_reference_data_version",
+            "allocation_manifest": "test",
+            "allocation_manifest_sha256": "c" * 64,
+            "forced_splits": {
+                row["pointdir_name"]: row["split"] for row in source_rows
+            },
+        },
+        "degenerate_property_stats": [],
         "tasks": tasks,
     }
     task_path = target / stg.FEREBUS_TASK_MANIFEST
-    task_path.write_text(json.dumps(task_payload), encoding="utf-8")
-    quality_records = []
-    for task in tasks:
-        model_path = target / task["expected_model_path"]
-        quality_records.append({
-            "property": task["property"],
-            "atom": task["atom"],
-            "model_path": task["expected_model_path"],
-            "model_sha256": sha256_file(model_path),
-            "prior_mean": {
-                "contract_sha256": prior.contract_sha256,
-                "expected_mean_ha": prior.expected_mean_ha(
-                    task["property"], task["atom"]
-                ),
-                "observed_mean_ha": prior.expected_mean_ha(
-                    task["property"], task["atom"]
-                ),
-                "units": "ha",
-            },
-            "row_counts": dict(row_counts),
-            "condition_number": 1.0,
-            "metrics": {
-                split: {"rmse": 0.0, "mae": 0.0, "r2": 1.0}
-                for split in ("train", "int_val", "ext_val")
-            },
-            "accepted": True,
-            "reasons": [],
-        })
-    (target / "FEREBUS_QUALITY.json").write_text(
-        json.dumps({
-            "schema_version": FEREBUS_QUALITY_SCHEMA_VERSION,
-            "campaign_uid": reference_view.campaign_uid,
-            "system": "WATER",
-            "reference_data_version": 0,
-            "reference_data_head_manifest_sha256": reference_view.head_manifest_sha256,
-            "reference_data_view_sha256": reference_view.cumulative_view_sha256,
-            "source_task_manifest_sha256": sha256_file(task_path),
-            "prior_mean_contract": prior.to_dict(),
-            "accepted": True,
-            "summary": {"n_tasks": len(tasks), "n_accepted": len(tasks), "n_rejected": 0},
-            "records": quality_records,
-            "reasons": [],
-        }),
-        encoding="utf-8",
+    atomic_write_json(task_path, task_payload)
+    _write_structured_task_map(
+        target,
+        executable="ferebus",
+        execution_kind="synthetic_dry_run",
+        performance_required=True,
+    )
+    write_preexisting_model_receipts(
+        target,
+        execution_kind="synthetic_dry_run",
     )
     for name in (stg.FEREBUS_JOB_DETAILS, "commands", "list.txt", "runFerebus.sh"):
         (target / name).write_text(name + "\n", encoding="utf-8")
@@ -1145,7 +1222,7 @@ def _write_loadable_model(
         CampaignConfig()
     ).expected_mean_ha(prop, atom)
     rows = [
-        [0.1 + i * 0.1 + j * 0.01 for j in range(nfeats)]
+        [0.1 + i * 0.1, 0.2 + i * 0.1, 0.3 + i * 0.1][:nfeats]
         for i in range(ntrain)
     ]
     lines = [
@@ -1170,6 +1247,7 @@ def _write_loadable_model(
         "[kernels]",
         "number_of_kernels 1",
         "composition k1",
+        "prefactor 1.0",
         "",
         "[kernel.k1]",
         "type rbf",
@@ -1185,7 +1263,7 @@ def _write_loadable_model(
     ]
     lines += [" ".join(str(v) for v in row) for row in rows]
     lines += ["", "[training_data.y]"]
-    lines += [str(-75.0 - i * 0.01) for i in range(ntrain)]
+    lines += ["0.0" for _ in range(ntrain)]
     lines += ["", "[weights]"]
     lines += ["0.0" for _ in range(ntrain)]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1211,14 +1289,19 @@ def test_ferebus_parser_happy_path_commits_models_version(tmp_path):
     task_dir = committed_dir / "iqa" / "O1"
     assert (task_dir / "WATER_iqa_O1.model").is_file()
     assert (committed_dir / stg.FEREBUS_TASK_MANIFEST).is_file()
-    assert (task_dir / "ferebus_iqa_O1.config").is_file()
+    assert not (committed_dir / "commands").exists()
+    assert not (committed_dir / "list.txt").exists()
+    assert (task_dir / "ferebus.config").is_file()
+    assert (
+        task_dir / "datasets" / "WATER_O1_TRAINING_SET.csv"
+    ).is_file()
     assert (task_dir / "WATER_iqa_O1.opt").read_text(encoding="utf-8") == "opt\n"
     assert not (committed_dir / "task_artefacts").exists()
     artefact_manifest = json.loads(
         (committed_dir / FEREBUS_TASK_ARTEFACTS_MANIFEST)
         .read_text(encoding="utf-8")
     )
-    assert artefact_manifest["schema_version"] == 2
+    assert artefact_manifest["schema_version"] == 3
     assert artefact_manifest["storage_mode"] == "full_snapshot"
     assert artefact_manifest["models_version"] == 0
     assert artefact_manifest["tasks"][0]["directory"] == "iqa/O1"
@@ -1226,7 +1309,10 @@ def test_ferebus_parser_happy_path_commits_models_version(tmp_path):
         "iqa/O1/WATER_iqa_O1.model"
     )
     assert artefact_manifest["tasks"][0]["config"]["path"] == (
-        "iqa/O1/ferebus_iqa_O1.config"
+        "iqa/O1/ferebus.config"
+    )
+    assert artefact_manifest["tasks"][0]["datasets"]["train"]["path"] == (
+        "iqa/O1/datasets/WATER_O1_TRAINING_SET.csv"
     )
     assert artefact_manifest["tasks"][0]["auxiliary"]["opt"]["path"] == (
         "iqa/O1/WATER_iqa_O1.opt"
@@ -1254,16 +1340,44 @@ def test_ferebus_task_artefact_layout_supports_properties_and_missing_files(tmp_
     assert result.failure_reason is None
     committed = tmp_path / "campaign" / "TRAINED_MODELS" / "iteration-000000"
     assert (committed / "iqa" / "O1" / "WATER_iqa_O1.model").is_file()
-    assert (committed / "iqa" / "O1" / "ferebus_iqa_O1.config").is_file()
+    assert (committed / "iqa" / "O1" / "ferebus.config").is_file()
     assert (committed / "q00" / "O1" / "WATER_q00_O1.model").is_file()
-    assert (committed / "q00" / "O1" / "ferebus_q00_O1.config").is_file()
+    assert (committed / "q00" / "O1" / "ferebus.config").is_file()
     assert not (committed / "task_artefacts").exists()
     artefact_manifest = json.loads(
         (committed / FEREBUS_TASK_ARTEFACTS_MANIFEST).read_text(encoding="utf-8")
     )
     assert artefact_manifest["n_tasks"] == 2
-    assert artefact_manifest["tasks"][1]["auxiliary"]["perf"] is None
+    assert artefact_manifest["tasks"][1]["auxiliary"]["perf"] is not None
     assert artefact_manifest["tasks"][1]["property"] == "q00"
+
+
+def test_rejected_ferebus_candidate_is_quarantined_without_model_commit(tmp_path):
+    ex = _make_executor(tmp_path)
+    ex.config.quality_gates.ferebus_max_ext_rmse_ha = 0.1
+    _commit_bootstrap_reference_data(ex.campaign_dir)
+    staging = _seed_models_staging(ex.campaign_dir)
+
+    result = ex._parse_ferebus_postprocess(
+        SimpleNamespace(iteration=0, campaign_uid="m16-test", reference_data_version=0),
+        CampaignPhase("FEREBUS"),
+        observations=[],
+    )
+
+    assert result.failure_reason.startswith("ferebus_quality_failed:")
+    assert not staging.exists(), result.failure_reason
+    assert not (
+        ex.campaign_dir / "TRAINED_MODELS" / "iteration-000000"
+    ).exists()
+    quarantined_quality = list(
+        (
+            ex.campaign_dir
+            / "TRAINED_MODELS"
+            / "rejected-candidates"
+            / "reference-000000"
+        ).glob("*/FEREBUS_QUALITY.json")
+    )
+    assert len(quarantined_quality) == 1
 
 
 def test_trained_model_resolver_rejects_post_commit_model_tamper(tmp_path):
@@ -1285,6 +1399,32 @@ def test_trained_model_resolver_rejects_post_commit_model_tamper(tmp_path):
     model.write_text(
         model.read_text(encoding="utf-8") + "\n# tamper\n",
         encoding="utf-8",
+    )
+
+    with pytest.raises(ManifestMismatchError):
+        versioning.resolve(0, verification="deep")
+
+
+def test_trained_model_resolver_rejects_post_commit_dataset_tamper(tmp_path):
+    import stat
+
+    ex = _make_executor(tmp_path)
+    _commit_bootstrap_reference_data(ex.campaign_dir)
+    _seed_models_staging(ex.campaign_dir)
+    result = ex._parse_ferebus_postprocess(
+        SimpleNamespace(iteration=0, campaign_uid="m16-test", reference_data_version=0),
+        CampaignPhase("FEREBUS"),
+        observations=[],
+    )
+    assert result.failure_reason is None
+    versioning = TrainedModelVersioning(ex.campaign_dir / "TRAINED_MODELS")
+    model_set = versioning.resolve(0, verification="deep")
+    dataset = model_set.tasks[0].datasets["train"].path
+    dataset.chmod(stat.S_IMODE(dataset.stat().st_mode) | stat.S_IWUSR)
+    dataset.write_text(
+        dataset.read_text(encoding="utf-8") + "0.9,0.9,0.9,0.0\n",
+        encoding="utf-8",
+        newline="\n",
     )
 
     with pytest.raises(ManifestMismatchError):

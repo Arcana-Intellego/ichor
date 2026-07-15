@@ -1,6 +1,8 @@
 import numpy as np
+import pytest
 
-from ichor.core.models.kernels import PeriodicKernel, RBFCyclic
+from ichor.core.models.kernels import ConstantKernel, PeriodicKernel, RBF, RBFCyclic
+from ichor.core.models.kernels.interpreter.parser import Parser
 
 
 def test_product_kernel_params_flatten_child_parameter_tuples():
@@ -81,3 +83,40 @@ def test_rbf_cyclic_wraps_phi_but_not_inter_axis_angle():
         kernel.k(origin, origin).diagonal(),
         kernel.k_diag(origin),
     )
+
+
+def test_rbf_serialises_with_its_exact_native_type():
+    kernel = RBF(
+        "k1",
+        np.array([0.2, 0.3]),
+        active_dims=np.array([0, 1]),
+    )
+
+    text = kernel.write_str()
+
+    assert "type rbf\n" in text
+    assert "type constant" not in text
+    assert "active_dimensions 1 2\n" in text
+
+
+def test_constant_kernel_constructor_and_serialisation_are_well_formed():
+    kernel = ConstantKernel(
+        "k1",
+        2.5,
+        active_dims=np.array([0, 2]),
+    )
+
+    assert kernel.value == 2.5
+    assert repr(kernel) == "ConstantKernel(value=2.5)"
+    assert kernel.write_str() == (
+        "[kernel.k1]\n"
+        "type constant\n"
+        "number_of_dimensions 2\n"
+        "active_dimensions 1 3\n"
+        "value 2.5\n"
+    )
+
+
+def test_kernel_expression_parser_rejects_trailing_tokens():
+    with pytest.raises(Exception, match="invalid syntax"):
+        Parser("k1 k2").parse()

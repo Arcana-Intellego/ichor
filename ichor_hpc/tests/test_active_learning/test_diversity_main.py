@@ -111,7 +111,7 @@ def test_phase_a_writes_sample_and_index(tmp_path):
     campaign.mkdir()
     cfg = CampaignConfig()
     cfg.point_allocation.bootstrap_training_size = 4
-    cfg.point_allocation.bootstrap_internal_validation_size = 1
+    cfg.point_allocation.bootstrap_internal_validation_size = 2
     cfg.point_allocation.bootstrap_external_validation_size = 2
     cfg.max_iterations = 1
     cfg.seed_selection.n_seeds_per_iteration = 4
@@ -130,19 +130,19 @@ def test_phase_a_writes_sample_and_index(tmp_path):
     indices = list(outdir.glob("selected_indices.dat"))
     assert len(samples) == 1
     assert len(indices) == 1
-    # n_select is the sum of the exact bootstrap slot counts (7).
+    # n_select is the sum of the exact bootstrap slot counts (8).
     idx_lines = indices[0].read_text(encoding="utf-8").strip().splitlines()
-    assert len(idx_lines) == 7
+    assert len(idx_lines) == 8
     for ln in idx_lines:
         assert ln.strip().isdigit()
     manifest = json.loads((outdir / PHASE_A_SAMPLE_FILENAME).read_text(encoding="utf-8"))
     assert manifest["phase"] == "PHASE_A_DIVERSITY"
     assert manifest["iteration"] == 0
-    assert manifest["n_select"] == 7
-    assert manifest["n_frames"] == 7
+    assert manifest["n_select"] == 8
+    assert manifest["n_frames"] == 8
     assert manifest["sample_xyz"].endswith(samples[0].name)
     assert manifest["index_path"].endswith(indices[0].name)
-    assert len(manifest["selected_indices"]) == 7
+    assert len(manifest["selected_indices"]) == 8
     assert manifest["trajectory_sha256"]
     assert len(manifest["sample_xyz_sha256"]) == 64
     assert len(manifest["index_sha256"]) == 64
@@ -155,8 +155,8 @@ def test_phase_a_manifest_rejects_sample_drift(tmp_path):
     campaign.mkdir()
     cfg = CampaignConfig()
     cfg.point_allocation.bootstrap_training_size = 2
-    cfg.point_allocation.bootstrap_internal_validation_size = 1
-    cfg.point_allocation.bootstrap_external_validation_size = 1
+    cfg.point_allocation.bootstrap_internal_validation_size = 2
+    cfg.point_allocation.bootstrap_external_validation_size = 2
     cfg.max_iterations = 1
     cfg.seed_selection.n_seeds_per_iteration = 4
     cfg.to_yaml(campaign / "campaign.yaml")
@@ -183,7 +183,7 @@ def test_phase_a_preserves_custom_training_geometry_and_fills_remainder_from_poo
     campaign.mkdir()
     cfg = CampaignConfig()
     cfg.point_allocation.bootstrap_training_size = 4
-    cfg.point_allocation.bootstrap_internal_validation_size = 1
+    cfg.point_allocation.bootstrap_internal_validation_size = 2
     cfg.point_allocation.bootstrap_external_validation_size = 2
     cfg.campaign.custom_bootstrap = True
     cfg.max_iterations = 1
@@ -201,13 +201,13 @@ def test_phase_a_preserves_custom_training_geometry_and_fills_remainder_from_poo
 
     outdir = bootstrap_selection_dir(campaign)
     manifest = json.loads((outdir / PHASE_A_SAMPLE_FILENAME).read_text(encoding="utf-8"))
-    assert manifest["n_select"] == 7
+    assert manifest["n_select"] == 8
     assert manifest["custom_bootstrap"] is True
     assert manifest["custom_bootstrap_counts"]["train"] == 1
-    assert manifest["bootstrap_pool_frame_count"] == 6
+    assert manifest["bootstrap_pool_frame_count"] == 7
     assert manifest["selected_indices"][0] is None
-    assert len(manifest["selected_pool_indices"]) == 6
-    assert len(manifest["selected_indices"]) == 7
+    assert len(manifest["selected_pool_indices"]) == 7
+    assert len(manifest["selected_indices"]) == 8
     assert 0 not in manifest["selected_pool_indices"]
     assert manifest["excluded_pool_frame_ids"] == [0]
     custom_manifest = (
@@ -238,7 +238,7 @@ def test_bootstrap_discovery_rejects_more_custom_training_rows_than_target(tmp_p
     campaign.mkdir()
     cfg = CampaignConfig()
     cfg.point_allocation.bootstrap_training_size = 4
-    cfg.point_allocation.bootstrap_internal_validation_size = 1
+    cfg.point_allocation.bootstrap_internal_validation_size = 2
     cfg.point_allocation.bootstrap_external_validation_size = 2
     cfg.campaign.custom_bootstrap = True
     cfg.max_iterations = 1

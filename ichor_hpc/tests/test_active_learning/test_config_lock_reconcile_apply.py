@@ -48,6 +48,37 @@ from ichor.hpc.active_learning.versioning.versioned_directory import VersionedDi
 _FIXTURE_CAMPAIGN_UID = "config-lock-test"
 
 
+class _FerebusFixturePointsDirectory(list):
+    """Emit finite three-atom CSV data without parsing fixture quantum files."""
+
+    def __init__(self, path, needs_parsing=True):
+        super().__init__()
+        self.path = path
+
+    def alf_dict(self, _calculator):
+        return {"O1": (0, 1, 2), "H2": (1, 0, 2), "H3": (2, 0, 1)}
+
+    def features_with_properties_to_csv(
+        self,
+        _system_alf,
+        str_to_append_to_fname="_train.csv",
+        property_types=None,
+    ):
+        properties = [str(value) for value in (property_types or ["iqa"])]
+        for atom, base in (("O1", -75.0), ("H2", -0.5), ("H3", -0.5)):
+            path = Path(atom + str_to_append_to_fname)
+            with path.open("w", encoding="utf-8", newline="\n") as handle:
+                handle.write("f1,f2,f3," + ",".join(properties) + "\n")
+                for row_index in range(len(self)):
+                    values = {"iqa": base - row_index * 0.01}
+                    handle.write(
+                        f"{row_index + 0.1},{row_index + 0.2},"
+                        f"{row_index + 0.3},"
+                        + ",".join(str(values[prop]) for prop in properties)
+                        + "\n"
+                    )
+
+
 def fresh_campaign_state(**kwargs):
     """Create fixture state under the same identity as committed artefacts."""
     kwargs.setdefault("campaign_uid", _FIXTURE_CAMPAIGN_UID)
@@ -291,14 +322,14 @@ def _write_stale_pre_submit_intent(campaign, phase):
     return payload
 
 
-def test_ferebus_feature_scaling_change_allowed_for_uncommitted_initial_ferebus(tmp_path):
+def test_ferebus_physical_prior_scale_change_allowed_before_initial_ferebus(tmp_path):
     campaign = _campaign(tmp_path)
     _commit_reference_data_version(campaign, 0)
     state = _write_halted_pre_ferebus_state(campaign)
     original = CampaignConfig()
     write_config_lock(campaign, original)
     changed = CampaignConfig()
-    changed.ferebus.feature_scaling = False
+    changed.ferebus.physical_prior_scale = 0.95
     _write_config(campaign, changed)
 
     proposed = fresh_campaign_state()
@@ -308,7 +339,9 @@ def test_ferebus_feature_scaling_change_allowed_for_uncommitted_initial_ferebus(
     review = review_config_changes(campaign, changed, proposed)
 
     assert review.allowed
-    assert [c.path for c in review.allowed_changes] == ["ferebus.feature_scaling"]
+    assert [c.path for c in review.allowed_changes] == [
+        "ferebus.physical_prior_scale"
+    ]
     assert not review.blocked_changes
     assert state.phase is CampaignPhase.HALTED
 
@@ -318,13 +351,13 @@ def test_physical_prior_contract_is_locked_after_first_ferebus_model(tmp_path):
     _commit_reference_data_version(campaign, 0)
     original = CampaignConfig()
     write_config_lock(campaign, original)
-    from ichor.hpc.active_learning.daemon.dry_run_executor import (
-        DryRunPhaseExecutor,
+    consumed_model = (
+        campaign / "TRAINED_MODELS" / "iteration-000000" / "O1_iqa.model"
     )
-
-    DryRunPhaseExecutor(campaign, original)._commit_dry_model_snapshot(0)
+    consumed_model.parent.mkdir(parents=True, exist_ok=True)
+    consumed_model.write_text("consumed\n", encoding="utf-8")
     changed = CampaignConfig()
-    changed.ferebus.prior_mean_iqa_deviation_factor = 0.99
+    changed.ferebus.physical_prior_scale = 0.99
 
     proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.SEED_SELECT
@@ -333,7 +366,7 @@ def test_physical_prior_contract_is_locked_after_first_ferebus_model(tmp_path):
 
     assert not review.allowed
     assert [c.path for c in review.blocked_changes] == [
-        "ferebus.prior_mean_iqa_deviation_factor"
+        "ferebus.physical_prior_scale"
     ]
     assert review.blocked_changes[0].category == "postprocess_locked"
     assert "FEREBUS" in review.blocked_changes[0].reason
@@ -1169,17 +1202,34 @@ def test_reconcile_apply_promotes_state_and_cleans_ferebus_staging(tmp_path, cap
         )
     )
     lock = json.loads(config_lock_path(campaign).read_text(encoding="utf-8"))
-    assert lock["canonical_config"]["ferebus"]["feature_scaling"] is True
+    assert lock["canonical_config"]["ferebus"]["kernel"] == "periodic_rbf"
 
 
 def test_completed_ferebus_staging_is_archived_when_committed_models_match(
     tmp_path,
+    monkeypatch,
 ):
     campaign = _campaign(tmp_path)
-    _commit_reference_data_version(campaign, 0)
+    import ichor.core.files as core_files
     from ichor.hpc.active_learning.daemon.dry_run_executor import DryRunPhaseExecutor
+    from ichor_hpc.tests.test_active_learning.test_ferebus_staging import (
+        _prepare_bootstrap_training,
+    )
 
-    DryRunPhaseExecutor(campaign, CampaignConfig())._commit_dry_model_snapshot(0)
+    config = CampaignConfig()
+    _prepare_bootstrap_training(
+        campaign,
+        config,
+        n_train=2,
+        n_int_val=2,
+        n_ext_val=2,
+    )
+    monkeypatch.setattr(
+        core_files,
+        "PointsDirectory",
+        _FerebusFixturePointsDirectory,
+    )
+    DryRunPhaseExecutor(campaign, config)._commit_dry_model_snapshot(0)
     staging = campaign / "TRAINED_MODELS" / "iteration-staging"
     proposed = fresh_campaign_state()
     proposed.phase = CampaignPhase.ARIADNE_ARRAY
@@ -1207,14 +1257,31 @@ def test_completed_ferebus_staging_is_archived_when_committed_models_match(
     ).is_file()
 
 
-def test_completed_ferebus_staging_refuses_archive_when_models_do_not_match(
+def test_tampered_ferebus_staging_is_archived_without_changing_committed_model(
     tmp_path,
+    monkeypatch,
 ):
     campaign = _campaign(tmp_path)
-    _commit_reference_data_version(campaign, 0)
+    import ichor.core.files as core_files
     from ichor.hpc.active_learning.daemon.dry_run_executor import DryRunPhaseExecutor
+    from ichor_hpc.tests.test_active_learning.test_ferebus_staging import (
+        _prepare_bootstrap_training,
+    )
 
-    DryRunPhaseExecutor(campaign, CampaignConfig())._commit_dry_model_snapshot(0)
+    config = CampaignConfig()
+    _prepare_bootstrap_training(
+        campaign,
+        config,
+        n_train=2,
+        n_int_val=2,
+        n_ext_val=2,
+    )
+    monkeypatch.setattr(
+        core_files,
+        "PointsDirectory",
+        _FerebusFixturePointsDirectory,
+    )
+    DryRunPhaseExecutor(campaign, config)._commit_dry_model_snapshot(0)
     staging = campaign / "TRAINED_MODELS" / "iteration-staging"
     staged_model = staging / "iqa" / "O1" / "SYSTEM_iqa_O1.model"
     staged_model.write_text(
@@ -1225,13 +1292,25 @@ def test_completed_ferebus_staging_refuses_archive_when_models_do_not_match(
     proposed.phase = CampaignPhase.ARIADNE_ARRAY
     proposed.models_version = 0
 
-    with pytest.raises(ValueError, match="does not match committed model version"):
-        config_lock_mod.clean_model_iteration_staging_for_reconcile(
-            campaign,
-            proposed,
-        )
+    archived = config_lock_mod.clean_model_iteration_staging_for_reconcile(
+        campaign,
+        proposed,
+    )
 
-    assert staging.exists()
+    assert len(archived) == 1
+    archived_model = (
+        Path(archived[0]) / "iqa" / "O1" / "SYSTEM_iqa_O1.model"
+    )
+    assert "# hash drift" in archived_model.read_text(encoding="utf-8")
+    committed_model = (
+        campaign
+        / "TRAINED_MODELS"
+        / "iteration-000000"
+        / "iqa"
+        / "O1"
+        / "SYSTEM_iqa_O1.model"
+    )
+    assert "# hash drift" not in committed_model.read_text(encoding="utf-8")
 
 
 def test_reconcile_archives_dangling_trained_model_version_staging(tmp_path):
@@ -1558,7 +1637,7 @@ def test_reconcile_apply_archives_data_staging_for_ferebus_reentry(tmp_path, cap
     _write_halted_pre_ferebus_state(campaign)
     write_config_lock(campaign, CampaignConfig())
     changed = CampaignConfig()
-    changed.ferebus.feature_scaling = False
+    changed.ferebus.kernel = "rbf"
     _write_config(campaign, changed)
     data_staging = campaign / ".DATA" / "STAGING"
     stale_file = data_staging / "INITIAL_AIMALL" / "old.txt"
@@ -2545,7 +2624,7 @@ def test_start_refuses_config_drift_without_reconcile_apply(tmp_path, capsys):
     original = CampaignConfig()
     write_config_lock(campaign, original)
     changed = CampaignConfig()
-    changed.ferebus.feature_scaling = False
+    changed.ferebus.kernel = "rbf"
     _write_config(campaign, changed)
 
     rc = cmd_start(

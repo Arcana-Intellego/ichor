@@ -94,6 +94,8 @@ __all__ = [
     "VALID_NEGATIVE_CURVATURE_POLICIES",
     "VALID_AIMALL_BOAQ_VALUES",
     "VALID_AIMALL_IASMESH_VALUES",
+    "VALID_FEREBUS_KERNELS",
+    "VALID_FEREBUS_PRIOR_MEAN_STRATEGIES",
 ]
 
 
@@ -192,6 +194,14 @@ VALID_AIMALL_BOAQ_VALUES = frozenset({
 VALID_AIMALL_IASMESH_VALUES = frozenset({
     "sparse", "medium", "fine", "veryfine", "superfine",
 })
+VALID_FEREBUS_KERNELS = frozenset({"periodic_rbf", "rbf"})
+MIN_FEREBUS_ROWS_PER_SPLIT = 2
+VALID_FEREBUS_PRIOR_MEAN_STRATEGIES = frozenset({
+    "physical_atomic_iqa",
+    "zero",
+    "training_mean",
+    "training_median",
+})
 
 _SYSTEM_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 _SCHEDULER_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$")
@@ -263,7 +273,7 @@ _STRICTLY_POSITIVE_NUMERIC_PATHS = frozenset({
     "seed_selection.d_optimal_jitter",
     "ferebus.nagents",
     "ferebus.maxiter",
-    "ferebus.prior_mean_iqa_deviation_factor",
+    "ferebus.physical_prior_scale",
     "acquisition.subspace.neighbour_count",
     "acquisition.subspace.variance_capture",
     "acquisition.subspace.min_subspace_dim",
@@ -655,17 +665,12 @@ class GeometryNoveltyConfigBlock:
 
 @dataclass
 class FerebusConfigBlock:
-    kernel: str = "rbfc_per"
-    loss: str = "huber"
+    kernel: str = "periodic_rbf"
     nagents: int = 20
     maxiter: int = 200
-    is_constant_noise: bool = True
-    prior_mean_type: int = 21
+    prior_mean_strategy: str = "physical_atomic_iqa"
     prior_mean_level_of_theory: str = "auto"
-    prior_mean_iqa_deviation_factor: float = 1.0
-    feature_scaling: bool = True
-    property_scaling: bool = False
-    full_ARD: bool = True
+    physical_prior_scale: float = 1.0
     properties: List[str] = field(default_factory=lambda: ["iqa"])
 
 
@@ -1475,17 +1480,25 @@ class CampaignConfig:
         for allocation_name in (
             "bootstrap_training_size",
             "bootstrap_internal_validation_size",
-            "batch_training_size",
         ):
             value = getattr(allocation, allocation_name)
             if isinstance(value, bool) or not isinstance(value, int):
                 raise ConfigValidationError(
                     "point_allocation." + allocation_name + " must be an integer"
                 )
-            if value <= 0:
+            if value < MIN_FEREBUS_ROWS_PER_SPLIT:
                 raise ConfigValidationError(
-                    "point_allocation." + allocation_name + " must be > 0"
+                    "point_allocation."
+                    + allocation_name
+                    + " must be >= "
+                    + str(MIN_FEREBUS_ROWS_PER_SPLIT)
+                    + " because native FEREBUS requires at least two rows "
+                    "in every initial dataset"
                 )
+        _validate_positive_int(
+            "point_allocation.batch_training_size",
+            allocation.batch_training_size,
+        )
         batch_internal_size = allocation.batch_internal_validation_size
         if (
             isinstance(batch_internal_size, bool)
@@ -1503,10 +1516,12 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "point_allocation.bootstrap_external_validation_size must be an integer"
             )
-        if external_size <= 0:
+        if external_size < MIN_FEREBUS_ROWS_PER_SPLIT:
             raise ConfigValidationError(
-                "point_allocation.bootstrap_external_validation_size must be > 0 "
-                "because FEREBUS quality requires external-validation evidence"
+                "point_allocation.bootstrap_external_validation_size must be >= "
+                + str(MIN_FEREBUS_ROWS_PER_SPLIT)
+                + " because native FEREBUS quality requires at least two "
+                "external-validation rows"
             )
         if not isinstance(self.campaign.custom_bootstrap, bool):
             raise ConfigValidationError(
@@ -1682,6 +1697,27 @@ class CampaignConfig:
         if self.geometry_novelty.fallback_scale_angstrom <= 0.0:
             raise ConfigValidationError(
                 "geometry_novelty.fallback_scale_angstrom must be > 0"
+            )
+        if self.ferebus.kernel not in VALID_FEREBUS_KERNELS:
+            raise ConfigValidationError(
+                "ferebus.kernel must be one of "
+                + repr(sorted(VALID_FEREBUS_KERNELS))
+            )
+        if self.ferebus.prior_mean_strategy not in VALID_FEREBUS_PRIOR_MEAN_STRATEGIES:
+            raise ConfigValidationError(
+                "ferebus.prior_mean_strategy must be one of "
+                + repr(sorted(VALID_FEREBUS_PRIOR_MEAN_STRATEGIES))
+            )
+        _validate_positive_int("ferebus.nagents", self.ferebus.nagents)
+        _validate_positive_int("ferebus.maxiter", self.ferebus.maxiter)
+        if (
+            isinstance(self.ferebus.physical_prior_scale, bool)
+            or not isinstance(self.ferebus.physical_prior_scale, (int, float))
+            or not math.isfinite(float(self.ferebus.physical_prior_scale))
+            or float(self.ferebus.physical_prior_scale) <= 0.0
+        ):
+            raise ConfigValidationError(
+                "ferebus.physical_prior_scale must be a finite positive number"
             )
         try:
             from .ferebus_prior import (

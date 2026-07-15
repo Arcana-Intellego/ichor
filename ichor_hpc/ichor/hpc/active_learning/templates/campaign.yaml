@@ -62,17 +62,12 @@ phase_b:
 # -------------------------------------------------------------------------
 
 ferebus:
-  kernel: rbfc_per
-  loss: huber
+  kernel: periodic_rbf
   nagents: 20
   maxiter: 200
-  is_constant_noise: true
-  prior_mean_type: 21
+  prior_mean_strategy: physical_atomic_iqa
   prior_mean_level_of_theory: auto
-  prior_mean_iqa_deviation_factor: 1.0
-  feature_scaling: true
-  property_scaling: false
-  full_ARD: true
+  physical_prior_scale: 1.0
   properties:
     - iqa
 

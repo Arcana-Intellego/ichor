@@ -8,9 +8,14 @@ class ConstantKernel(Kernel):
     """Implements constant kernel, which scales by a constant factor when used in a kernel product or
     modifies the mean of the Gaussian process when used in a kernel sum"""
 
-    def __init__(self, name: str, value: float, active_dims: Optional[np.ndarray]):
-        super().__init__(self, name, active_dims)
-        self.value = value
+    def __init__(
+        self,
+        name: str,
+        value: float,
+        active_dims: Optional[np.ndarray] = None,
+    ):
+        super().__init__(name, active_dims)
+        self.value = float(value)
 
     @property
     def params(self):
@@ -39,3 +44,6 @@ class ConstantKernel(Kernel):
         str_to_wrte += f"value {self.value}\n"
 
         return str_to_wrte
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(value={self.value})"

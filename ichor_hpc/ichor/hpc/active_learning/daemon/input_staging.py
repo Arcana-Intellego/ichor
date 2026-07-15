@@ -57,7 +57,10 @@ AIMALL_TASK_METADATA_SCHEMA_VERSION = 2
 WFN_METHOD_RECEIPT = "WFN_METHOD_RECEIPT.json"
 WFN_METHOD_RECEIPT_SCHEMA_VERSION = 1
 FEREBUS_TASK_MANIFEST = "FEREBUS_TASKS.json"
-FEREBUS_TASK_SCHEMA_VERSION = 4
+FEREBUS_TASK_SCHEMA_VERSION = 5
+FEREBUS_ROW_IDENTITIES = "FEREBUS_ROW_IDENTITIES.json"
+FEREBUS_ROW_IDENTITIES_SCHEMA_VERSION = 1
+FEREBUS_SPLIT_SNAPSHOT = "FEREBUS_SPLIT_ASSIGNMENTS.json"
 FEREBUS_JOB_DETAILS = "job-details"
 SAFE_PATH_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
@@ -452,6 +455,15 @@ def ferebus_manifest_path(staging_dir: Path) -> Path:
     return Path(staging_dir) / FEREBUS_TASK_MANIFEST
 
 
+def _exact_ferebus_int(value: Any, label: str, *, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(label + " must be an exact JSON integer")
+    parsed = int(value)
+    if parsed < minimum:
+        raise ValueError(label + " must be >= " + str(minimum))
+    return parsed
+
+
 def ferebus_relative_path(staging_dir: Path, path: Path) -> str:
     try:
         return Path(path).resolve().relative_to(Path(staging_dir).resolve()).as_posix()
@@ -498,7 +510,7 @@ def read_ferebus_manifest(
         raise ValueError("FEREBUS task manifest unreadable: " + str(path)) from exc
     if not isinstance(data, dict):
         raise ValueError("FEREBUS task manifest must be a JSON object: " + str(path))
-    if int(data.get("schema_version", -1)) != FEREBUS_TASK_SCHEMA_VERSION:
+    if _exact_ferebus_int(data.get("schema_version"), "FEREBUS task schema") != FEREBUS_TASK_SCHEMA_VERSION:
         raise ValueError("unsupported FEREBUS task manifest schema: " + str(path))
     campaign_uid = str(data.get("campaign_uid") or "")
     system = str(data.get("system") or "")
@@ -506,12 +518,14 @@ def read_ferebus_manifest(
         raise ValueError("FEREBUS task manifest campaign/system identity is invalid")
     validate_safe_path_token("FEREBUS system", system)
     try:
-        reference_data_version = int(data["reference_data_version"])
-        n_reference_points = int(data["n_reference_points"])
+        reference_data_version = _exact_ferebus_int(
+            data["reference_data_version"], "reference_data_version"
+        )
+        n_reference_points = _exact_ferebus_int(
+            data["n_reference_points"], "n_reference_points", minimum=1
+        )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError("FEREBUS task manifest reference-data binding is invalid") from exc
-    if reference_data_version < 0 or n_reference_points <= 0:
-        raise ValueError("FEREBUS task manifest reference-data values are invalid")
     row_order = data.get("pointdir_row_order")
     if not isinstance(row_order, list) or len(row_order) != n_reference_points:
         raise ValueError("FEREBUS task manifest row order/count is invalid")
@@ -524,6 +538,100 @@ def read_ferebus_manifest(
             character not in "0123456789abcdef" for character in value
         ):
             raise ValueError("FEREBUS task manifest " + field_name + " is invalid")
+    row_identity_binding = data.get("row_identity_snapshot")
+    if not isinstance(row_identity_binding, dict):
+        raise ValueError("FEREBUS row-identity snapshot binding is invalid")
+    row_identity_path = resolve_ferebus_task_path(
+        staging_dir,
+        row_identity_binding.get("path"),
+        "row_identity_snapshot.path",
+    )
+    if str(row_identity_binding.get("path")) != FEREBUS_ROW_IDENTITIES:
+        raise ValueError("FEREBUS row-identity snapshot path is invalid")
+    row_identity_payload = None
+    if verify_dataset_files:
+        if not row_identity_path.is_file() or row_identity_path.is_symlink():
+            raise ValueError("FEREBUS row-identity snapshot is missing")
+        if _exact_ferebus_int(
+            row_identity_binding.get("size"),
+            "row-identity snapshot size",
+        ) != int(row_identity_path.stat().st_size):
+            raise ValueError("FEREBUS row-identity snapshot size mismatch")
+        if str(row_identity_binding.get("sha256") or "") != sha256_file(row_identity_path):
+            raise ValueError("FEREBUS row-identity snapshot SHA-256 mismatch")
+        row_identity_payload = json.loads(row_identity_path.read_text(encoding="utf-8"))
+        if not isinstance(row_identity_payload, dict) or _exact_ferebus_int(
+            row_identity_payload.get("schema_version"),
+            "row-identity schema",
+        ) != FEREBUS_ROW_IDENTITIES_SCHEMA_VERSION:
+            raise ValueError("FEREBUS row-identity snapshot schema is invalid")
+        source_rows = row_identity_payload.get("source_rows")
+        if not isinstance(source_rows, list) or [
+            str(record.get("pointdir_name") or "")
+            for record in source_rows
+            if isinstance(record, dict)
+        ] != row_order:
+            raise ValueError("FEREBUS row identities do not match pointdir row order")
+        from ..versioning.reference_data import canonical_json_sha256
+
+        if str(row_identity_payload.get("source_rows_sha256") or "") != canonical_json_sha256(source_rows):
+            raise ValueError("FEREBUS source-row identity digest mismatch")
+        if str(row_identity_binding.get("source_rows_sha256") or "") != str(
+            row_identity_payload.get("source_rows_sha256") or ""
+        ):
+            raise ValueError("FEREBUS row-identity binding digest mismatch")
+    kernel_contract = data.get("kernel_contract")
+    if not isinstance(kernel_contract, dict):
+        raise ValueError("FEREBUS kernel contract is invalid")
+    from ..ferebus_prior import backend_kernel_token
+
+    family = kernel_contract.get("family")
+    if kernel_contract != {
+        "family": family,
+        "backend_token": backend_kernel_token(family),
+        "loss": "huber",
+        "constant_noise": True,
+        "full_ard": True,
+        "feature_scaling": True,
+        "property_scaling": False,
+        "kernel_prefactor_mode": 2,
+    }:
+        raise ValueError("FEREBUS kernel contract contains unsupported settings")
+    split_binding = data.get("split_ledger")
+    if not isinstance(split_binding, dict):
+        raise ValueError("FEREBUS split-ledger binding is invalid")
+    split_snapshot_path = resolve_ferebus_task_path(
+        staging_dir,
+        split_binding.get("path"),
+        "split_ledger.path",
+    )
+    if str(split_binding.get("path")) != FEREBUS_SPLIT_SNAPSHOT:
+        raise ValueError("FEREBUS split-ledger snapshot path is invalid")
+    if verify_dataset_files:
+        if not split_snapshot_path.is_file() or split_snapshot_path.is_symlink():
+            raise ValueError("FEREBUS split-ledger snapshot is missing")
+        if _exact_ferebus_int(
+            split_binding.get("size"), "split-ledger snapshot size"
+        ) != int(split_snapshot_path.stat().st_size):
+            raise ValueError("FEREBUS split-ledger snapshot size mismatch")
+        if str(split_binding.get("sha256") or "") != sha256_file(split_snapshot_path):
+            raise ValueError("FEREBUS split-ledger snapshot SHA-256 mismatch")
+        split_payload = json.loads(split_snapshot_path.read_text(encoding="utf-8"))
+        from .ferebus_split_ledger import FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION
+
+        if not isinstance(split_payload, dict) or _exact_ferebus_int(
+            split_payload.get("schema_version"), "split-ledger schema"
+        ) != FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION:
+            raise ValueError("FEREBUS split-ledger snapshot schema is invalid")
+        assignments = split_payload.get("assignments")
+        if not isinstance(assignments, dict) or set(assignments) != set(row_order):
+            raise ValueError("FEREBUS split-ledger snapshot coverage is invalid")
+        for pointdir in row_order:
+            record = assignments.get(pointdir)
+            if not isinstance(record, dict) or record.get("split") not in {
+                "train", "int_val", "ext_val"
+            }:
+                raise ValueError("FEREBUS split-ledger assignment is invalid")
     tasks = data.get("tasks")
     if not isinstance(tasks, list) or not tasks:
         raise ValueError("FEREBUS task manifest has no tasks: " + str(path))
@@ -547,8 +655,9 @@ def read_ferebus_manifest(
         from ..ferebus_prior import contract_from_payload
 
         prior_contract = contract_from_payload(data.get("prior_mean_contract"))
-        for atom in atom_tokens:
-            prior_contract.expected_mean_ha("iqa", atom)
+        if prior_contract.strategy == "physical_atomic_iqa":
+            for atom in atom_tokens:
+                prior_contract.expected_mean_ha("iqa", atom)
     except Exception as exc:
         raise ValueError(
             "FEREBUS task manifest physical-prior contract is invalid: " + str(exc)
@@ -560,14 +669,11 @@ def read_ferebus_manifest(
     if model_bootstrap is None:
         manifest_historical_training_rows = 0
     elif isinstance(model_bootstrap, dict):
-        try:
-            manifest_historical_training_rows = int(
-                model_bootstrap.get("historical_training_rows", -1)
-            )
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "FEREBUS model-bootstrap training-row count is invalid"
-            ) from exc
+        manifest_historical_training_rows = _exact_ferebus_int(
+            model_bootstrap.get("historical_training_rows"),
+            "model-bootstrap historical_training_rows",
+            minimum=1,
+        )
         if manifest_historical_training_rows <= 0:
             raise ValueError(
                 "FEREBUS model-bootstrap training-row count is invalid"
@@ -581,12 +687,70 @@ def read_ferebus_manifest(
         prop = str(task.get("property") or "")
         atom = str(task.get("atom") or "")
         observed_keys.append((prop, atom))
-        if int(task.get("task_index", -1)) != expected_index:
+        if _exact_ferebus_int(task.get("task_index"), "FEREBUS task index", minimum=1) != expected_index:
             raise ValueError("FEREBUS task indexes are not contiguous")
-        expected_prior = prior_contract.task_payload(prop, atom)
-        if task.get("prior_mean") != expected_prior:
+        task_prior = task.get("prior_mean")
+        expected_prior_fields = {
+            "contract_sha256",
+            "strategy",
+            "mean_type",
+            "level_of_theory",
+            "physical_prior_scale",
+            "units",
+            "expected_mean_ha",
+            "training_dataset_sha256",
+            "feature_scaling",
+            "property_scaling",
+        }
+        if (
+            not isinstance(task_prior, dict)
+            or set(task_prior) != expected_prior_fields
+            or str(task_prior.get("contract_sha256") or "")
+            != prior_contract.contract_sha256
+            or task_prior.get("strategy") != prior_contract.strategy
+            or task_prior.get("mean_type") != prior_contract.mean_type
+            or task_prior.get("level_of_theory") != prior_contract.level_of_theory
+            or task_prior.get("units") != "ha"
+            or task_prior.get("feature_scaling") is not True
+            or task_prior.get("property_scaling") is not False
+        ):
             raise ValueError(
-                "FEREBUS task physical-prior contract mismatch for "
+                "FEREBUS task prior contract mismatch for "
+                + prop
+                + "/"
+                + atom
+            )
+        try:
+            recorded_scale = float(task_prior["physical_prior_scale"])
+            recorded_mean = float(task_prior["expected_mean_ha"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "FEREBUS task prior contains non-numeric values for "
+                + prop
+                + "/"
+                + atom
+            ) from exc
+        if (
+            isinstance(task_prior["physical_prior_scale"], bool)
+            or isinstance(task_prior["expected_mean_ha"], bool)
+            or not np.isfinite(recorded_scale)
+            or recorded_scale != float(prior_contract.physical_prior_scale)
+            or not np.isfinite(recorded_mean)
+        ):
+            raise ValueError(
+                "FEREBUS task prior numeric contract mismatch for "
+                + prop
+                + "/"
+                + atom
+            )
+        if prior_contract.strategy in {"zero", "physical_atomic_iqa"} and not np.isclose(
+            recorded_mean,
+            prior_contract.expected_mean_ha(prop, atom),
+            rtol=1.0e-12,
+            atol=1.0e-12,
+        ):
+            raise ValueError(
+                "FEREBUS task prior mean disagrees with its semantic contract for "
                 + prop
                 + "/"
                 + atom
@@ -604,7 +768,9 @@ def read_ferebus_manifest(
             parsed = generated_config.get("parsed_contract")
             expected_parsed = {
                 "mean_type": int(prior_contract.mean_type),
-                "level_of_theory": prior_contract.level_of_theory,
+                "level_of_theory": (
+                    prior_contract.level_of_theory or "not_applicable"
+                ),
                 "iqa_deviation_factor": float(prior_contract.iqa_deviation_factor),
                 "scaling": bool(
                     prior_contract.feature_scaling or prior_contract.property_scaling
@@ -718,38 +884,28 @@ def read_ferebus_manifest(
         counts = task.get("row_counts")
         if not isinstance(counts, dict):
             raise ValueError("FEREBUS task manifest row_counts is invalid")
-        try:
-            historical_training_rows = int(
-                task.get("historical_training_rows", 0)
-            )
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "FEREBUS task historical training-row count is invalid"
-            ) from exc
-        if historical_training_rows < 0:
-            raise ValueError(
-                "FEREBUS task historical training-row count is invalid"
-            )
+        historical_training_rows = _exact_ferebus_int(
+            task.get("historical_training_rows", 0),
+            "FEREBUS task historical_training_rows",
+        )
         if historical_training_rows != manifest_historical_training_rows:
             raise ValueError(
                 "FEREBUS task historical training-row count disagrees with the manifest"
             )
-        try:
-            historical_ids = [
-                int(value)
-                for value in task.get("historical_training_row_ids", [])
-            ]
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "FEREBUS task historical training-row IDs are invalid"
-            ) from exc
+        historical_ids = [
+            _exact_ferebus_int(value, "historical training-row ID")
+            for value in task.get("historical_training_row_ids", [])
+        ]
         if historical_ids != list(range(historical_training_rows)):
             raise ValueError(
                 "FEREBUS task historical training-row IDs are invalid"
             )
         try:
             task_total = sum(
-                int(counts[split]) for split in ("train", "int_val", "ext_val")
+                _exact_ferebus_int(
+                    counts[split], "FEREBUS " + split + " row count"
+                )
+                for split in ("train", "int_val", "ext_val")
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("FEREBUS task manifest row_counts is invalid") from exc
@@ -763,7 +919,10 @@ def read_ferebus_manifest(
             raise ValueError("FEREBUS task manifest row_ids is invalid")
         try:
             split_rows = {
-                split: [int(value) for value in row_ids[split]]
+                split: [
+                    _exact_ferebus_int(value, "FEREBUS " + split + " row ID")
+                    for value in row_ids[split]
+                ]
                 for split in ("train", "int_val", "ext_val")
             }
         except (KeyError, TypeError, ValueError) as exc:
@@ -797,6 +956,7 @@ def read_ferebus_manifest(
             "int_val": "int_validation_csv",
             "ext_val": "ext_validation_csv",
         }
+        resolved_dataset_paths: Dict[str, Path] = {}
         for split, path_field in dataset_path_fields.items():
             record = datasets.get(split)
             if not isinstance(record, dict):
@@ -804,13 +964,12 @@ def read_ferebus_manifest(
             expected_path = expected_paths[path_field]
             if str(record.get("path") or "") != expected_path:
                 raise ValueError("FEREBUS " + split + " dataset path mismatch")
-            try:
-                dataset_size = int(record.get("size"))
-                dataset_rows = int(record.get("rows"))
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    "FEREBUS " + split + " dataset identity is invalid"
-                ) from exc
+            dataset_size = _exact_ferebus_int(
+                record.get("size"), "FEREBUS " + split + " dataset size"
+            )
+            dataset_rows = _exact_ferebus_int(
+                record.get("rows"), "FEREBUS " + split + " dataset rows"
+            )
             dataset_sha = str(record.get("sha256") or "")
             if dataset_size < 0 or dataset_rows != int(counts[split]):
                 raise ValueError("FEREBUS " + split + " dataset identity is invalid")
@@ -818,6 +977,31 @@ def read_ferebus_manifest(
                 character not in "0123456789abcdef" for character in dataset_sha
             ):
                 raise ValueError("FEREBUS " + split + " dataset SHA-256 is invalid")
+            if split == "train" and str(
+                task_prior.get("training_dataset_sha256") or ""
+            ) != dataset_sha:
+                raise ValueError(
+                    "FEREBUS task prior is not bound to its training dataset"
+                )
+            if row_identity_payload is not None:
+                split_identity = row_identity_payload.get("splits", {}).get(split)
+                if not isinstance(split_identity, dict):
+                    raise ValueError("FEREBUS split row identity is missing")
+                if (
+                    str(record.get("row_identity_sha256") or "")
+                    != str(split_identity.get("row_identity_sha256") or "")
+                    or _exact_ferebus_int(
+                        record.get("row_identity_count"),
+                        "FEREBUS row identity count",
+                    )
+                    != dataset_rows
+                    or _exact_ferebus_int(
+                        split_identity.get("n_rows"),
+                        "FEREBUS split identity row count",
+                    )
+                    != dataset_rows
+                ):
+                    raise ValueError("FEREBUS dataset row-identity binding mismatch")
             if verify_dataset_files:
                 dataset_path = resolve_ferebus_task_path(
                     staging_dir,
@@ -838,9 +1022,32 @@ def read_ferebus_manifest(
                     raise ValueError("FEREBUS " + split + " dataset size mismatch")
                 if sha256_file(dataset_path) != dataset_sha:
                     raise ValueError("FEREBUS " + split + " dataset SHA-256 mismatch")
+                from . import ferebus_dataset as _fds
+
+                validation = _fds.validate_ferebus_csv(dataset_path, prop)
+                if validation["rows"] != dataset_rows:
+                    raise ValueError("FEREBUS dataset validated row count mismatch")
+                resolved_dataset_paths[split] = dataset_path
+        if verify_dataset_files:
+            training_values = _fds.read_property_values(
+                resolved_dataset_paths["train"], prop
+            )
+            expected_prior = prior_contract.task_payload(
+                prop,
+                atom,
+                training_values=training_values,
+                training_dataset_sha256=str(datasets["train"]["sha256"]),
+            )
+            if task_prior != expected_prior:
+                raise ValueError(
+                    "FEREBUS task prior mean is not bound to its training data for "
+                    + prop
+                    + "/"
+                    + atom
+                )
     if observed_keys != expected_keys:
         raise ValueError("FEREBUS tasks do not match the property/atom product")
-    if int(data.get("n_tasks", -1)) != len(expected_keys):
+    if _exact_ferebus_int(data.get("n_tasks"), "FEREBUS n_tasks", minimum=1) != len(expected_keys):
         raise ValueError("FEREBUS task manifest n_tasks is invalid")
     return data
 
@@ -863,6 +1070,15 @@ def _alf_to_ferebus(alf: Any, atom: str) -> List[int]:
     if any(x < 0 for x in raw):
         raise ValueError("ALF for atom " + atom + " contains a negative zero-indexed entry")
     return [x + 1 for x in raw]
+
+
+def _require_native_ferebus_alf(system_alf: Mapping[str, Any]) -> None:
+    """Fail before CSV generation when the native three-index ALF ABI cannot apply."""
+    if not isinstance(system_alf, Mapping) or len(system_alf) < 3:
+        raise ValueError(
+            "FEREBUS training requires at least three atoms because the native "
+            "ALF ABI requires three indexes; diatomic training is unsupported"
+        )
 
 
 def _write_pyferebus_job_details(
@@ -2321,6 +2537,10 @@ def stage_ferebus_inputs(
         entry.pointdir_name: entry.provenance_sha256
         for entry in view.entries
     }
+    pointdir_versions = {
+        entry.pointdir_name: int(entry.introduced_in_version)
+        for entry in view.entries
+    }
     forced_ferebus_splits = {
         entry.pointdir_name: entry.split for entry in view.entries
     }
@@ -2344,6 +2564,7 @@ def stage_ferebus_inputs(
             properties,
         )
     )
+    _require_native_ferebus_alf(system_alf)
 
     # write one <atom>_train.csv per atom containing every configured target property.
     cwd = os.getcwd()
@@ -2400,11 +2621,65 @@ def stage_ferebus_inputs(
         reference_data_view_sha256=str(view.cumulative_view_sha256),
         expected_new_counts=expected_new_counts,
         pointdir_identity=pointdir_identities,
+        pointdir_versions=pointdir_versions,
         forced_splits=forced_ferebus_splits,
         allocation_manifest_sha256=allocation_hash,
         historical_training_rows=historical_training_rows,
     )
     ledger_row_ids = dict(split_ledger["row_ids"])
+    from ..versioning.reference_data import canonical_json_sha256
+
+    source_row_identities = [
+        {
+            "source_row_index": int(index),
+            **entry.identity_payload(),
+        }
+        for index, entry in enumerate(view.entries)
+    ]
+    historical_row_identities = [
+        {
+            "source": "model_bootstrap",
+            "historical_row_index": int(index),
+            "model_bootstrap_manifest_sha256": (
+                None
+                if model_bootstrap is None
+                else sha256_file(model_bootstrap["manifest_path"])
+            ),
+        }
+        for index in range(historical_training_rows)
+    ]
+    split_row_identities = {
+        split: (
+            list(historical_row_identities) if split == "train" else []
+        )
+        + [source_row_identities[index] for index in ledger_row_ids[split]]
+        for split in ("train", "int_val", "ext_val")
+    }
+    row_identity_payload = {
+        "schema_version": FEREBUS_ROW_IDENTITIES_SCHEMA_VERSION,
+        "campaign_uid": str(view.campaign_uid),
+        "reference_data_version": int(version),
+        "reference_data_view_sha256": str(view.cumulative_view_sha256),
+        "source_rows": source_row_identities,
+        "source_rows_sha256": canonical_json_sha256(source_row_identities),
+        "splits": {
+            split: {
+                "rows": split_row_identities[split],
+                "n_rows": len(split_row_identities[split]),
+                "row_identity_sha256": canonical_json_sha256(
+                    split_row_identities[split]
+                ),
+            }
+            for split in ("train", "int_val", "ext_val")
+        },
+    }
+    row_identity_path = staging / FEREBUS_ROW_IDENTITIES
+    atomic_write_json(row_identity_path, row_identity_payload)
+    split_snapshot_path = staging / FEREBUS_SPLIT_SNAPSHOT
+    ledger_payload = json.loads(Path(split_ledger["path"]).read_text(encoding="utf-8"))
+    atomic_write_json(split_snapshot_path, ledger_payload)
+    if sha256_file(split_snapshot_path) != sha256_file(split_ledger["path"]):
+        raise ValueError("FEREBUS split-ledger snapshot copy verification failed")
     atom_labels = []
     alf_by_atom: Dict[str, List[int]] = {}
     split_counts: Dict[str, Dict[str, int]] = {}
@@ -2484,7 +2759,10 @@ def stage_ferebus_inputs(
                 })
     n_atoms = len(atom_labels)
     try:
-        from ..ferebus_prior import resolve_ferebus_prior_contract
+        from ..ferebus_prior import (
+            backend_kernel_token,
+            resolve_ferebus_prior_contract,
+        )
 
         prior_contract = resolve_ferebus_prior_contract(
             config,
@@ -2541,12 +2819,35 @@ def stage_ferebus_inputs(
             source_int_csv = prop_dirs[prop] / int_csv.name
             source_ext_csv = prop_dirs[prop] / ext_csv.name
             model_path = output_dir / (system + "_" + prop + "_" + atom + ".model")
+            dataset_records: Dict[str, Dict[str, Any]] = {}
+            for split_name, dataset_path, source_dataset_path in (
+                ("train", training_csv, source_training_csv),
+                ("int_val", int_csv, source_int_csv),
+                ("ext_val", ext_csv, source_ext_csv),
+            ):
+                identity_record = row_identity_payload["splits"][split_name]
+                dataset_records[split_name] = {
+                    "path": ferebus_relative_path(staging, dataset_path),
+                    "size": int(source_dataset_path.stat().st_size),
+                    "sha256": sha256_file(source_dataset_path),
+                    "rows": int(split_counts[atom][split_name]),
+                    "row_identity_sha256": str(
+                        identity_record["row_identity_sha256"]
+                    ),
+                    "row_identity_count": int(identity_record["n_rows"]),
+                }
+            training_values = _fds.read_property_values(source_training_csv, prop)
             tasks.append(
                 {
                     "task_index": int(task_index),
                     "property": prop,
                     "atom": atom,
-                    "prior_mean": prior_contract.task_payload(prop, atom),
+                    "prior_mean": prior_contract.task_payload(
+                        prop,
+                        atom,
+                        training_values=training_values,
+                        training_dataset_sha256=dataset_records["train"]["sha256"],
+                    ),
                     "alf_1_indexed": [int(x) for x in alf_by_atom[atom]],
                     "alf_cli": alf_cli,
                     "property_dir": ferebus_relative_path(staging, staging / prop),
@@ -2571,19 +2872,7 @@ def stage_ferebus_inputs(
                     "historical_training_row_ids": list(
                         range(historical_training_rows)
                     ),
-                    "datasets": {
-                        split: {
-                            "path": ferebus_relative_path(staging, dataset_path),
-                            "size": int(source_dataset_path.stat().st_size),
-                            "sha256": sha256_file(source_dataset_path),
-                            "rows": int(split_counts[atom][split]),
-                        }
-                        for split, dataset_path, source_dataset_path in (
-                            ("train", training_csv, source_training_csv),
-                            ("int_val", int_csv, source_int_csv),
-                            ("ext_val", ext_csv, source_ext_csv),
-                        )
-                    },
+                    "datasets": dataset_records,
                     "degenerate_property_stats": bool(
                         stats_by_prop_atom.get((prop, atom), {}).get(
                             "degenerate_property_stats", False
@@ -2617,6 +2906,24 @@ def stage_ferebus_inputs(
             "n_atoms": int(n_atoms),
             "n_tasks": int(len(tasks)),
             "prior_mean_contract": prior_contract.to_dict(),
+            "kernel_contract": {
+                "family": str(f.kernel),
+                "backend_token": backend_kernel_token(f.kernel),
+                "loss": "huber",
+                "constant_noise": True,
+                "full_ard": True,
+                "feature_scaling": True,
+                "property_scaling": False,
+                "kernel_prefactor_mode": 2,
+            },
+            "row_identity_snapshot": {
+                "path": FEREBUS_ROW_IDENTITIES,
+                "size": int(row_identity_path.stat().st_size),
+                "sha256": sha256_file(row_identity_path),
+                "source_rows_sha256": str(
+                    row_identity_payload["source_rows_sha256"]
+                ),
+            },
             "degenerate_property_stats": list(degenerate_property_stats),
             "model_bootstrap": (
                 None if model_bootstrap is None else {
@@ -2629,7 +2936,10 @@ def stage_ferebus_inputs(
             ),
             "job_details": ferebus_relative_path(staging, job_details),
             "split_ledger": {
-                "path": Path(split_ledger["path"]).resolve().relative_to(
+                "path": FEREBUS_SPLIT_SNAPSHOT,
+                "size": int(split_snapshot_path.stat().st_size),
+                "sha256": sha256_file(split_snapshot_path),
+                "source_path": Path(split_ledger["path"]).resolve().relative_to(
                     campaign.resolve()
                 ).as_posix(),
                 "counts": dict(split_ledger["counts"]),
@@ -2734,7 +3044,9 @@ def prepare_imported_model_bootstrap(staging_dir: Path) -> Dict[str, Any]:
             + "property = " + prop + "\n"
             + "atom = " + atom + "\n"
             + "mean_type = " + str(prior_contract.mean_type) + "\n"
-            + 'level_of_theory = "' + prior_contract.level_of_theory + '"\n'
+            + 'level_of_theory = "'
+            + str(prior_contract.level_of_theory or "not_applicable")
+            + '"\n'
             + "iqaDeviationFactor = "
             + repr(prior_contract.iqa_deviation_factor)
             + "\n"
@@ -2759,6 +3071,17 @@ def prepare_imported_model_bootstrap(staging_dir: Path) -> Dict[str, Any]:
         }
 
     _write_ferebus_manifest(staging, manifest)
+
+    from .ferebus_task_runner import write_imported_model_receipts
+    from ..submit.pyferebus_wrap import _write_structured_task_map
+
+    _write_structured_task_map(
+        staging,
+        executable="ferebus",
+        execution_kind="imported_model_bootstrap",
+        performance_required=False,
+    )
+    write_imported_model_receipts(staging)
 
     # Re-read with full dataset verification and validate the model parser
     # contract before the caller evaluates held-out quality.

@@ -228,6 +228,24 @@ def test_validate_ferebus_csv_rejects_missing_and_bad_property(tmp_path):
         validate_ferebus_csv(bad, "q00")
 
 
+@pytest.mark.parametrize("non_finite", ["nan", "inf", "-inf"])
+def test_validate_ferebus_csv_rejects_non_finite_numeric_cells(
+    tmp_path,
+    non_finite,
+):
+    bad = tmp_path / "non_finite.csv"
+    bad.write_text(
+        "f1,f2,f3,iqa\n"
+        "0.1,0.2," + non_finite + ",-75.0\n"
+        "0.4,0.5,0.6,-75.1\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    with pytest.raises(ValueError, match="non-finite value"):
+        validate_ferebus_csv(bad, "iqa")
+
+
 def test_prop_stats_from_iqa_column(tmp_path):
     from ichor.hpc.active_learning.daemon.ferebus_dataset import prop_stats
     src = tmp_path / "set.csv"

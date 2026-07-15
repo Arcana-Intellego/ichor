@@ -26,10 +26,11 @@ from .versioned_directory import VersionedDirectory
 
 
 TRAINED_MODEL_SET_FILENAME = "FEREBUS_TASK_ARTEFACTS.json"
-TRAINED_MODEL_SET_SCHEMA_VERSION = 2
+TRAINED_MODEL_SET_SCHEMA_VERSION = 3
 TRAINED_MODEL_STORAGE_MODE = "full_snapshot"
 TRAINED_MODELS_COMMIT_LOCK = ".commit.lock"
 TRAINED_MODEL_AUXILIARY_SUFFIXES = ("opt", "perf", "pred", "scurve", "sol")
+TRAINED_MODEL_DATASET_SPLITS = ("train", "int_val", "ext_val")
 SAFE_PATH_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
@@ -61,6 +62,8 @@ class TrainedModelTask:
     directory: str
     model: TrainedModelFile
     config: TrainedModelFile
+    execution_receipt: TrainedModelFile
+    datasets: Mapping[str, TrainedModelFile]
     auxiliary: Mapping[str, Optional[TrainedModelFile]]
 
     @property
@@ -76,6 +79,11 @@ class TrainedModelTask:
             "directory": self.directory,
             "model": self.model.identity_payload(),
             "config": self.config.identity_payload(),
+            "execution_receipt": self.execution_receipt.identity_payload(),
+            "datasets": {
+                split: self.datasets[split].identity_payload()
+                for split in TRAINED_MODEL_DATASET_SPLITS
+            },
             "auxiliary": {
                 suffix: (
                     None if self.auxiliary[suffix] is None
@@ -287,12 +295,40 @@ def _parse_task(
         prop + "/" + atom + ":config",
         verification=verification,
     )
+    execution_receipt = _parse_file_record(
+        root,
+        payload.get("execution_receipt"),
+        prop + "/" + atom + ":execution_receipt",
+        verification=verification,
+    )
     task_root = PurePosixPath(directory)
     if PurePosixPath(model.relative_path).parent != task_root or not model.relative_path.endswith(".model"):
         raise TrainedModelError(prop + "/" + atom + ":model path is not canonical")
-    expected_config_name = "ferebus_" + prop + "_" + atom + ".config"
-    if PurePosixPath(config.relative_path) != task_root / expected_config_name:
+    if PurePosixPath(config.relative_path) != task_root / "ferebus.config":
         raise TrainedModelError(prop + "/" + atom + ":config path is not canonical")
+    if PurePosixPath(execution_receipt.relative_path) != task_root / "FEREBUS_TASK_RECEIPT.json":
+        raise TrainedModelError(
+            prop + "/" + atom + ":execution receipt path is not canonical"
+        )
+    raw_datasets = payload.get("datasets")
+    if not isinstance(raw_datasets, Mapping) or set(raw_datasets) != set(
+        TRAINED_MODEL_DATASET_SPLITS
+    ):
+        raise TrainedModelError(prop + "/" + atom + ":datasets keys are invalid")
+    datasets: Dict[str, TrainedModelFile] = {}
+    for split in TRAINED_MODEL_DATASET_SPLITS:
+        parsed = _parse_file_record(
+            root,
+            raw_datasets.get(split),
+            prop + "/" + atom + ":dataset:" + split,
+            verification=verification,
+        )
+        dataset_path = PurePosixPath(parsed.relative_path)
+        if dataset_path.parent != task_root / "datasets" or dataset_path.suffix != ".csv":
+            raise TrainedModelError(
+                prop + "/" + atom + ":" + split + " dataset path is not canonical"
+            )
+        datasets[split] = parsed
     raw_auxiliary = payload.get("auxiliary")
     if not isinstance(raw_auxiliary, Mapping):
         raise TrainedModelError(prop + "/" + atom + ":auxiliary must be an object")
@@ -325,6 +361,8 @@ def _parse_task(
         directory=directory,
         model=model,
         config=config,
+        execution_receipt=execution_receipt,
+        datasets=datasets,
         auxiliary=auxiliary,
     )
 
@@ -368,6 +406,7 @@ def _model_set_identity(payload: Mapping[str, Any]) -> Dict[str, Any]:
         "parent_manifest_sha256": payload.get("parent_manifest_sha256"),
         "source_task_manifest": payload.get("source_task_manifest"),
         "quality_manifest": payload.get("quality_manifest"),
+        "quality_decision_manifest": payload.get("quality_decision_manifest"),
         "properties": payload.get("properties"),
         "atoms": payload.get("atoms"),
         "tasks": payload.get("tasks"),
@@ -384,6 +423,7 @@ def build_trained_model_set_payload(
     parent: Optional[TrainedModelSet],
     source_task_manifest: Mapping[str, Any],
     quality_manifest: Mapping[str, Any],
+    quality_decision_manifest: Mapping[str, Any],
     properties: Sequence[str],
     atoms: Sequence[str],
     tasks: Sequence[Mapping[str, Any]],
@@ -414,6 +454,7 @@ def build_trained_model_set_payload(
         ),
         "source_task_manifest": dict(source_task_manifest),
         "quality_manifest": dict(quality_manifest),
+        "quality_decision_manifest": dict(quality_decision_manifest),
         "properties": [str(value) for value in properties],
         "atoms": [str(value) for value in atoms],
         "n_tasks": int(len(tasks)),
@@ -448,6 +489,11 @@ def _validate_exact_inventory(
         expected_directories.add(task.directory)
         expected_task_files.add(task.model.relative_path)
         expected_task_files.add(task.config.relative_path)
+        expected_task_files.add(task.execution_receipt.relative_path)
+        expected_directories.add(task.directory + "/datasets")
+        expected_task_files.update(
+            dataset.relative_path for dataset in task.datasets.values()
+        )
         expected_task_files.update(
             artefact.relative_path
             for artefact in task.auxiliary.values()
@@ -507,10 +553,16 @@ def _validate_source_and_quality(
 ) -> None:
     source = _read_json_object(root / "FEREBUS_TASKS.json", "FEREBUS task manifest")
     quality = _read_json_object(root / "FEREBUS_QUALITY.json", "FEREBUS quality manifest")
-    if _safe_int(source.get("schema_version"), "FEREBUS task schema_version") != 4:
+    decision = _read_json_object(
+        root / "FEREBUS_QUALITY_DECISION.json",
+        "FEREBUS quality decision",
+    )
+    if _safe_int(source.get("schema_version"), "FEREBUS task schema_version") != 5:
         raise TrainedModelError("unsupported committed FEREBUS task schema")
-    if _safe_int(quality.get("schema_version"), "FEREBUS quality schema_version") != 3:
+    if _safe_int(quality.get("schema_version"), "FEREBUS quality schema_version") != 4:
         raise TrainedModelError("unsupported committed FEREBUS quality schema")
+    if _safe_int(decision.get("schema_version"), "FEREBUS decision schema_version") != 2:
+        raise TrainedModelError("unsupported committed FEREBUS quality-decision schema")
     expected_keys = [task.key for task in tasks]
     source_tasks = source.get("tasks")
     if not isinstance(source_tasks, list):
@@ -579,10 +631,18 @@ def _validate_source_and_quality(
         "int_val": "int_validation_csv",
         "ext_val": "ext_validation_csv",
     }
-    for task in source_tasks:
-        if not isinstance(task, Mapping):
+    committed_task_by_key = {task.key: task for task in tasks}
+    for source_task in source_tasks:
+        if not isinstance(source_task, Mapping):
             raise TrainedModelError("FEREBUS source task record is invalid")
-        row_counts = task.get("row_counts") or {}
+        source_key = (
+            str(source_task.get("property")),
+            str(source_task.get("atom")),
+        )
+        committed_task = committed_task_by_key.get(source_key)
+        if committed_task is None:
+            raise TrainedModelError("FEREBUS source task has no committed model task")
+        row_counts = source_task.get("row_counts") or {}
         if not isinstance(row_counts, Mapping):
             raise TrainedModelError("FEREBUS task manifest split counts are invalid")
         observed_counts = {
@@ -596,14 +656,14 @@ def _validate_source_and_quality(
         if observed_counts != expected_counts:
             raise TrainedModelError("FEREBUS task manifest split count mismatch")
         if _safe_int(
-            task.get("historical_training_rows", 0),
+            source_task.get("historical_training_rows", 0),
             "FEREBUS task historical_training_rows",
             minimum=0,
         ) != historical_training_rows:
             raise TrainedModelError(
                 "FEREBUS task historical training-row count mismatch"
             )
-        historical_ids = task.get("historical_training_row_ids", [])
+        historical_ids = source_task.get("historical_training_row_ids", [])
         if not isinstance(historical_ids, list) or [
             _safe_int(
                 value,
@@ -615,7 +675,7 @@ def _validate_source_and_quality(
             raise TrainedModelError(
                 "FEREBUS task historical training-row IDs are invalid"
             )
-        row_ids = task.get("row_ids") or {}
+        row_ids = source_task.get("row_ids") or {}
         if not isinstance(row_ids, Mapping):
             raise TrainedModelError("FEREBUS task manifest split rows are invalid")
         for split in expected_split_rows:
@@ -636,7 +696,7 @@ def _validate_source_and_quality(
         }
         if observed_rows != expected_split_rows:
             raise TrainedModelError("FEREBUS task manifest split row mismatch")
-        datasets = task.get("datasets")
+        datasets = source_task.get("datasets")
         if not isinstance(datasets, Mapping) or set(datasets) != set(
             dataset_path_fields
         ):
@@ -650,7 +710,7 @@ def _validate_source_and_quality(
             if _safe_relative_path(
                 record.get("path"),
                 "FEREBUS " + split + " dataset path",
-            ) != str(task.get(path_field) or ""):
+            ) != str(source_task.get(path_field) or ""):
                 raise TrainedModelError(
                     "FEREBUS " + split + " dataset path mismatch"
                 )
@@ -671,6 +731,24 @@ def _validate_source_and_quality(
                 record.get("sha256"),
                 "FEREBUS " + split + " dataset SHA-256",
             )
+            committed_dataset = committed_task.datasets[split]
+            if (
+                committed_dataset.relative_path != str(record.get("path") or "")
+                or committed_dataset.size
+                != _safe_int(
+                    record.get("size"),
+                    "FEREBUS " + split + " dataset size",
+                    minimum=0,
+                )
+                or committed_dataset.sha256
+                != _safe_sha(
+                    record.get("sha256"),
+                    "FEREBUS " + split + " dataset SHA-256",
+                )
+            ):
+                raise TrainedModelError(
+                    "FEREBUS " + split + " committed dataset binding mismatch"
+                )
     quality_records = quality.get("records")
     if not isinstance(quality_records, list):
         raise TrainedModelError("FEREBUS quality records are invalid")
@@ -682,8 +760,10 @@ def _validate_source_and_quality(
     if quality_keys != expected_keys:
         raise TrainedModelError("FEREBUS quality/model-set task coverage mismatch")
     quality_by_key = dict(zip(quality_keys, quality_records))
-    if quality.get("accepted") is not True:
-        raise TrainedModelError("FEREBUS quality manifest is rejected")
+    if quality.get("measurement_complete") is not True or quality.get(
+        "measurement_errors"
+    ) != []:
+        raise TrainedModelError("committed FEREBUS raw measurements are incomplete")
     if _safe_sha(
         quality.get("source_task_manifest_sha256"),
         "source_task_manifest_sha256",
@@ -696,10 +776,6 @@ def _validate_source_and_quality(
         if not isinstance(record, Mapping):
             raise TrainedModelError(
                 task.property + "/" + task.atom + ":quality record is invalid"
-            )
-        if record.get("accepted") is not True:
-            raise TrainedModelError(
-                task.property + "/" + task.atom + ":quality record is rejected"
             )
         if str(record.get("model_path") or "") != task.model.relative_path:
             raise TrainedModelError(
@@ -729,6 +805,122 @@ def _validate_source_and_quality(
             raise TrainedModelError(
                 task.property + "/" + task.atom + ":quality row count mismatch"
             )
+    quality_binding = decision.get("quality")
+    quality_path = root / "FEREBUS_QUALITY.json"
+    if (
+        not isinstance(quality_binding, Mapping)
+        or quality_binding.get("path") != "FEREBUS_QUALITY.json"
+        or _safe_int(
+            quality_binding.get("size"),
+            "FEREBUS decision quality size",
+            minimum=0,
+        )
+        != int(quality_path.stat().st_size)
+        or _safe_sha(
+            quality_binding.get("sha256"),
+            "FEREBUS decision quality SHA-256",
+        )
+        != sha256_file(quality_path)
+    ):
+        raise TrainedModelError("FEREBUS decision/raw-quality binding mismatch")
+    evaluations = decision.get("evaluations")
+    if not isinstance(evaluations, list) or not evaluations:
+        raise TrainedModelError("FEREBUS decision has no evaluations")
+    current_digest = _safe_sha(
+        decision.get("current_evaluation_sha256"),
+        "FEREBUS current evaluation SHA-256",
+    )
+    current = None
+    from ..daemon.completion_receipts import canonical_sha256
+
+    seen_evaluations = set()
+    for raw_evaluation in evaluations:
+        if not isinstance(raw_evaluation, Mapping):
+            raise TrainedModelError("FEREBUS quality evaluation is invalid")
+        material = dict(raw_evaluation)
+        declared = _safe_sha(
+            material.pop("evaluation_sha256", None),
+            "FEREBUS evaluation SHA-256",
+        )
+        material.pop("evaluated_at_iso", None)
+        if declared in seen_evaluations or declared != canonical_sha256(material):
+            raise TrainedModelError("FEREBUS quality evaluation digest mismatch")
+        seen_evaluations.add(declared)
+        if declared == current_digest:
+            current = raw_evaluation
+    if current is None or current.get("accepted") is not True:
+        raise TrainedModelError("committed FEREBUS promotion decision is rejected")
+    decision_tasks = current.get("tasks")
+    if not isinstance(decision_tasks, list) or [
+        (str(item.get("property")), str(item.get("atom")))
+        for item in decision_tasks
+        if isinstance(item, Mapping)
+    ] != expected_keys or any(
+        not isinstance(item, Mapping) or item.get("accepted") is not True
+        for item in decision_tasks
+    ):
+        raise TrainedModelError("FEREBUS promotion task decisions are invalid")
+
+    execution = quality.get("task_execution")
+    execution_records = execution.get("receipts") if isinstance(execution, Mapping) else None
+    task_map_path = root / "FEREBUS_TASK_MAP.json"
+    if (
+        not isinstance(execution, Mapping)
+        or execution.get("task_map_path") != "FEREBUS_TASK_MAP.json"
+        or _safe_sha(
+            execution.get("task_map_file_sha256"),
+            "FEREBUS task-map file SHA-256",
+        )
+        != sha256_file(task_map_path)
+        or _safe_int(
+            execution.get("n_tasks"),
+            "FEREBUS execution task count",
+            minimum=1,
+        )
+        != len(tasks)
+    ):
+        raise TrainedModelError("FEREBUS task-map execution binding is invalid")
+    if not isinstance(execution_records, list) or len(execution_records) != len(tasks):
+        raise TrainedModelError("FEREBUS task-execution coverage is invalid")
+    for task, execution_record in zip(tasks, execution_records):
+        if not isinstance(execution_record, Mapping):
+            raise TrainedModelError("FEREBUS task-execution record is invalid")
+        if (
+            _safe_int(
+                execution_record.get("task_index"),
+                "FEREBUS execution task index",
+                minimum=1,
+            )
+            != task.task_index
+            or execution_record.get("receipt_path")
+            != task.execution_receipt.relative_path
+            or _safe_sha(
+                execution_record.get("receipt_sha256"),
+                "FEREBUS execution receipt SHA-256",
+            )
+            != task.execution_receipt.sha256
+            or execution_record.get("model_path") != task.model.relative_path
+            or _safe_sha(
+                execution_record.get("model_sha256"),
+                "FEREBUS execution model SHA-256",
+            )
+            != task.model.sha256
+            or execution_record.get("performance_path")
+            != (
+                None
+                if task.auxiliary.get("perf") is None
+                else task.auxiliary["perf"].relative_path
+            )
+            or (
+                task.auxiliary.get("perf") is not None
+                and _safe_sha(
+                    execution_record.get("performance_sha256"),
+                    "FEREBUS execution performance SHA-256",
+                )
+                != task.auxiliary["perf"].sha256
+            )
+        ):
+            raise TrainedModelError("FEREBUS task-execution binding mismatch")
     for field in (
         "reference_data_version",
         "reference_data_head_manifest_sha256",
@@ -832,6 +1024,12 @@ def validate_trained_model_snapshot(
         "quality_manifest",
         verification=verification,
     )
+    quality_decision_record = _parse_file_record(
+        root,
+        payload.get("quality_decision_manifest"),
+        "quality_decision_manifest",
+        verification=verification,
+    )
     root_file_by_path = {record.relative_path: record for record in root_files}
     if source_record.relative_path != "FEREBUS_TASKS.json" or root_file_by_path.get(
         source_record.relative_path
@@ -841,6 +1039,12 @@ def validate_trained_model_snapshot(
         quality_record.relative_path
     ) != quality_record:
         raise TrainedModelError("quality manifest root-file record mismatch")
+    if (
+        quality_decision_record.relative_path != "FEREBUS_QUALITY_DECISION.json"
+        or root_file_by_path.get(quality_decision_record.relative_path)
+        != quality_decision_record
+    ):
+        raise TrainedModelError("quality decision root-file record mismatch")
     if _safe_sha(payload.get("model_set_sha256"), "model_set_sha256") != canonical_json_sha256(
         _model_set_identity(payload)
     ):
@@ -988,15 +1192,28 @@ def resolve_trained_model_set(
             "quality_manifest",
             verification=verification,
         )
+        quality_decision_record = _parse_file_record(
+            version_root,
+            payload.get("quality_decision_manifest"),
+            "quality_decision_manifest",
+            verification=verification,
+        )
         if source_record.relative_path != "FEREBUS_TASKS.json":
             raise TrainedModelError("source task manifest path is invalid")
         if quality_record.relative_path != "FEREBUS_QUALITY.json":
             raise TrainedModelError("quality manifest path is invalid")
+        if quality_decision_record.relative_path != "FEREBUS_QUALITY_DECISION.json":
+            raise TrainedModelError("quality decision path is invalid")
         root_file_by_path = {record.relative_path: record for record in root_files}
         if root_file_by_path.get(source_record.relative_path) != source_record:
             raise TrainedModelError("source task manifest root-file record mismatch")
         if root_file_by_path.get(quality_record.relative_path) != quality_record:
             raise TrainedModelError("quality manifest root-file record mismatch")
+        if (
+            root_file_by_path.get(quality_decision_record.relative_path)
+            != quality_decision_record
+        ):
+            raise TrainedModelError("quality decision root-file record mismatch")
         _validate_exact_inventory(version_root, tasks, root_files)
         _validate_source_and_quality(version_root, payload, tasks, reference_view)
         resolved = TrainedModelSet(

@@ -19,9 +19,13 @@ trimmed. property names (iqa, integration_error, ...) are left untouched.
 """
 from __future__ import annotations
 
+import csv
+import math
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
+
+import numpy as np
 
 # feature column written with an alf suffix, e.g. f1_O3 -> we want f1. anything
 # that is not f-then-digits-then-underscore (iqa, integration_error, q00) is left
@@ -57,6 +61,78 @@ def _row_count(source_csv: Path) -> int:
 
 MIN_ROWS_PER_FEREBUS_SET = 2
 MIN_ROWS_FOR_FEREBUS = 3 * MIN_ROWS_PER_FEREBUS_SET
+
+
+def iter_feature_target_chunks(
+    csv_path: Path,
+    prop: str,
+    *,
+    chunk_size: int = 512,
+) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
+    """Yield finite FEREBUS feature/target rows without loading the CSV."""
+    if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
+        raise ValueError("FEREBUS CSV chunk_size must be a positive integer")
+    path = Path(csv_path)
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.reader(handle)
+        try:
+            header = [value.strip() for value in next(reader)]
+        except StopIteration as exc:
+            raise ValueError("FEREBUS CSV is empty: " + str(path)) from exc
+        feature_indexes = [
+            index
+            for index, value in enumerate(header)
+            if re.fullmatch(r"f\d+", value)
+        ]
+        if not feature_indexes:
+            raise ValueError("FEREBUS CSV has no feature columns: " + str(path))
+        if prop not in header:
+            raise ValueError(
+                "FEREBUS CSV missing property " + repr(prop) + ": " + str(path)
+            )
+        property_index = header.index(prop)
+        feature_rows: List[List[float]] = []
+        targets: List[float] = []
+        observed_rows = 0
+        for row_number, row in enumerate(reader, start=2):
+            if not row or not any(value.strip() for value in row):
+                continue
+            if len(row) != len(header):
+                raise ValueError(
+                    "FEREBUS CSV row length mismatch at row " + str(row_number)
+                )
+            try:
+                features = [float(row[index]) for index in feature_indexes]
+                target = float(row[property_index])
+            except ValueError as exc:
+                raise ValueError(
+                    "FEREBUS CSV contains a non-numeric value at row "
+                    + str(row_number)
+                ) from exc
+            if not all(math.isfinite(value) for value in features) or not math.isfinite(
+                target
+            ):
+                raise ValueError(
+                    "FEREBUS CSV contains a non-finite value at row "
+                    + str(row_number)
+                )
+            feature_rows.append(features)
+            targets.append(target)
+            observed_rows += 1
+            if len(feature_rows) == chunk_size:
+                yield np.asarray(feature_rows, dtype=float), np.asarray(
+                    targets,
+                    dtype=float,
+                )
+                feature_rows = []
+                targets = []
+        if feature_rows:
+            yield np.asarray(feature_rows, dtype=float), np.asarray(
+                targets,
+                dtype=float,
+            )
+        if observed_rows == 0:
+            raise ValueError("FEREBUS CSV has no data rows: " + str(path))
 
 
 def plan_sizes(n_rows: int, fractions: Sequence[float]) -> Tuple[int, int, int]:
@@ -178,7 +254,7 @@ def validate_ferebus_csv(csv_path: Path, prop: str) -> Dict[str, int]:
             if parts[idx] == "":
                 raise ValueError("FEREBUS CSV blank numeric cell at row " + str(row_no))
             try:
-                float(parts[idx])
+                value = float(parts[idx])
             except ValueError as exc:
                 raise ValueError(
                     "FEREBUS CSV non-numeric value "
@@ -190,6 +266,17 @@ def validate_ferebus_csv(csv_path: Path, prop: str) -> Dict[str, int]:
                     + ": "
                     + str(p)
                 ) from exc
+            if not math.isfinite(value):
+                raise ValueError(
+                    "FEREBUS CSV non-finite value "
+                    + repr(parts[idx])
+                    + " at row "
+                    + str(row_no)
+                    + ", column "
+                    + cols[idx]
+                    + ": "
+                    + str(p)
+                )
     return {"rows": len(rows), "columns": len(cols), "features": len(features)}
 
 
@@ -372,9 +459,17 @@ def prop_stats(csv_path, prop: str = "iqa") -> Dict[str, float]:
         if idx >= len(parts):
             continue
         try:
-            vals.append(float(parts[idx]))
+            value = float(parts[idx])
         except ValueError:
             continue
+        if not _math.isfinite(value):
+            raise ValueError(
+                "FEREBUS property statistics contain a non-finite value at row "
+                + str(len(vals) + 2)
+                + ": "
+                + str(p)
+            )
+        vals.append(value)
     if not vals:
         return {}
     n = len(vals)
@@ -405,3 +500,36 @@ def prop_stats(csv_path, prop: str = "iqa") -> Dict[str, float]:
         "mean": mean, "median": median, "std": std, "cv": cv,
         "degenerate_property_stats": bool(degenerate),
     }
+
+
+def read_property_values(csv_path: Path, prop: str) -> List[float]:
+    """Read one exact finite target vector from a staged FEREBUS CSV."""
+    path = Path(csv_path)
+    header, body = _read_csv(path)
+    columns = [value.strip() for value in header.rstrip("\r\n").split(",")]
+    if prop not in columns:
+        raise ValueError("FEREBUS CSV missing property " + repr(prop) + ": " + str(path))
+    index = columns.index(prop)
+    values: List[float] = []
+    for row_number, line in enumerate(body, start=2):
+        if not line.strip():
+            continue
+        parts = [value.strip() for value in line.rstrip("\r\n").split(",")]
+        if len(parts) != len(columns):
+            raise ValueError(
+                "FEREBUS CSV row " + str(row_number) + " has incorrect cardinality"
+            )
+        try:
+            value = float(parts[index])
+        except ValueError as exc:
+            raise ValueError(
+                "FEREBUS CSV property is non-numeric at row " + str(row_number)
+            ) from exc
+        if not math.isfinite(value):
+            raise ValueError(
+                "FEREBUS CSV property is non-finite at row " + str(row_number)
+            )
+        values.append(value)
+    if not values:
+        raise ValueError("FEREBUS CSV property vector is empty: " + str(path))
+    return values

@@ -113,7 +113,8 @@ class Models(Directory, list):
     @property
     def atom_names(self) -> List[str]:
         """Returns a list of atom names (such as O1, H2, H3, etc.) for which models were made"""
-        return list(set(natsorted([model.atom for model in self], key=ignore_alpha)))
+        ordered = natsorted([model.atom for model in self], key=ignore_alpha)
+        return list(dict.fromkeys(ordered))
 
     @property
     def types(self) -> List[str]:

@@ -74,11 +74,11 @@ def test_default_campaign_config_is_valid():
     assert c.seed_selection.d_optimal_novelty_floor == 1.0e-12
     assert c.seed_selection.d_optimal_score_power == 1.0
     assert c.seed_selection.d_optimal_degenerate_policy == "score_backfill"
-    assert c.ferebus.prior_mean_type == 21
+    assert c.ferebus.kernel == "periodic_rbf"
+    assert c.ferebus.prior_mean_strategy == "physical_atomic_iqa"
     assert c.ferebus.prior_mean_level_of_theory == "auto"
-    assert c.ferebus.prior_mean_iqa_deviation_factor == 1.0
-    assert c.ferebus.feature_scaling is True
-    assert c.ferebus.property_scaling is False
+    assert c.ferebus.physical_prior_scale == 1.0
+    assert c.ferebus.properties == ["iqa"]
     assert c.campaign.sampling_aggressiveness == 5
     assert c.geometry_novelty.enabled is True
     assert c.geometry_novelty.scale_source == "local_motion"
@@ -566,12 +566,12 @@ def test_dict_roundtrip_preserves_nested_fields():
 
 def test_yaml_roundtrip(tmp_path):
     c = CampaignConfig(max_iterations=7)
-    c.ferebus.kernel = "rbf_per"
+    c.ferebus.kernel = "rbf"
     p = tmp_path / "campaign.yaml"
     c.to_yaml(p)
     c2 = CampaignConfig.from_yaml(p)
     assert c2.max_iterations == 7
-    assert c2.ferebus.kernel == "rbf_per"
+    assert c2.ferebus.kernel == "rbf"
 
 
 def test_yaml_duplicate_keys_are_rejected_with_source_locations(tmp_path):
@@ -1092,8 +1092,23 @@ def test_seed_selection_d_optimal_fields_reject_bad_values(field, value, match):
 
 def test_bootstrap_external_validation_size_must_support_quality_evidence():
     payload = CampaignConfig().to_dict()
-    payload["point_allocation"]["bootstrap_external_validation_size"] = 0
-    with pytest.raises(ConfigValidationError, match="must be > 0"):
+    payload["point_allocation"]["bootstrap_external_validation_size"] = 1
+    with pytest.raises(ConfigValidationError, match="at least two"):
+        CampaignConfig.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "bootstrap_training_size",
+        "bootstrap_internal_validation_size",
+        "bootstrap_external_validation_size",
+    ),
+)
+def test_initial_ferebus_splits_require_two_rows(field):
+    payload = CampaignConfig().to_dict()
+    payload["point_allocation"][field] = 1
+    with pytest.raises(ConfigValidationError, match=field + ".*at least two"):
         CampaignConfig.from_dict(payload)
 
 

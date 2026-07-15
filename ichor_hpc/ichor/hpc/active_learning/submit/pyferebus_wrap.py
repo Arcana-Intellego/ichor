@@ -25,6 +25,8 @@ import subprocess
 import os
 import shlex
 import re
+import shutil
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
@@ -117,9 +119,6 @@ class FerebusSubmission:
     script_binding: Mapping[str, Any] = field(default_factory=dict)
 
 
-_REQUIRED_COMMAND_FLAGS = ("-c", "-I", "-O", "-P", "-A", "-ALF")
-
-
 def parse_sbatch_parsable_output(stdout: str) -> Tuple[str, Optional[str]]:
     """Parse "sbatch --parsable" stdout into (job_id, cluster).
 
@@ -146,29 +145,11 @@ def _reject_control_chars(label: str, value: str) -> None:
         raise FerebusSubmissionError(label + " contains a control character")
 
 
-def _read_required_nonempty_lines(path: Path, label: str) -> List[str]:
-    if not path.is_file():
-        raise FerebusSubmissionError(
-            "pyferebus did not produce required " + label + ": " + str(path)
-        )
-    if path.stat().st_size <= 0:
-        raise FerebusSubmissionError(
-            "pyferebus produced empty " + label + ": " + str(path)
-        )
-    lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()
-             if line.strip()]
-    if not lines:
-        raise FerebusSubmissionError(
-            "pyferebus produced blank " + label + ": " + str(path)
-        )
-    return lines
-
-
 def _validate_generated_pyferebus_artifacts(
     working_dir: Path,
     *,
     expected_tasks: Optional[int] = None,
-) -> Path:
+) -> Tuple[Path, int]:
     script = working_dir / "runFerebus.sh"
     if not script.is_file():
         raise FerebusSubmissionError(
@@ -180,63 +161,46 @@ def _validate_generated_pyferebus_artifacts(
             "pyferebus produced empty runFerebus.sh in " + str(working_dir)
         )
 
-    command_lines = _read_required_nonempty_lines(working_dir / "commands", "commands")
-    list_lines = _read_required_nonempty_lines(working_dir / "list.txt", "list.txt")
-    if len(command_lines) != len(list_lines):
+    from ..strict_json import strict_json as json
+    from ..daemon.input_staging import FEREBUS_TASK_SCHEMA_VERSION
+
+    manifest_path = working_dir / "FEREBUS_TASKS.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
         raise FerebusSubmissionError(
-            "pyferebus commands/list.txt task count mismatch: commands="
-            + str(len(command_lines))
-            + " list.txt="
-            + str(len(list_lines))
+            "daemon FEREBUS_TASKS.json is missing or unreadable"
+        ) from exc
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema_version") != FEREBUS_TASK_SCHEMA_VERSION
+        or not isinstance(manifest.get("tasks"), list)
+        or not manifest["tasks"]
+    ):
+        raise FerebusSubmissionError("daemon FEREBUS task manifest is invalid")
+    declared_count = manifest.get("n_tasks")
+    if (
+        isinstance(declared_count, bool)
+        or not isinstance(declared_count, int)
+        or declared_count != len(manifest["tasks"])
+    ):
+        raise FerebusSubmissionError(
+            "daemon FEREBUS task manifest cardinality is invalid"
         )
-    if expected_tasks is not None and len(command_lines) != int(expected_tasks):
+    if expected_tasks is not None and (
+        isinstance(expected_tasks, bool) or not isinstance(expected_tasks, int)
+    ):
         raise FerebusSubmissionError(
-            "pyferebus generated task count "
-            + str(len(command_lines))
+            "expected FEREBUS task count must be an exact integer"
+        )
+    if expected_tasks is not None and declared_count != expected_tasks:
+        raise FerebusSubmissionError(
+            "daemon FEREBUS task count "
+            + str(declared_count)
             + " does not match daemon FEREBUS_TASKS.json n_tasks="
-            + str(int(expected_tasks))
+            + str(expected_tasks)
         )
-
-    root = working_dir.resolve()
-    for i, folder in enumerate(list_lines, start=1):
-        raw_folder = Path(folder)
-        path = raw_folder if raw_folder.is_absolute() else working_dir / raw_folder
-        resolved = path.resolve(strict=False)
-        if resolved != root and root not in resolved.parents:
-            raise FerebusSubmissionError(
-                "pyferebus list.txt entry "
-                + str(i)
-                + " escapes the working directory: "
-                + folder
-            )
-        if path.is_symlink() or resolved.is_symlink():
-            raise FerebusSubmissionError(
-                "pyferebus list.txt entry "
-                + str(i)
-                + " is a symlink: "
-                + folder
-            )
-        if not resolved.is_dir():
-            raise FerebusSubmissionError(
-                "pyferebus list.txt entry "
-                + str(i)
-                + " does not point to an existing task directory: "
-                + folder
-            )
-
-    for i, line in enumerate(command_lines, start=1):
-        tokens = line.split()
-        missing = [flag for flag in _REQUIRED_COMMAND_FLAGS if flag not in tokens]
-        if missing:
-            raise FerebusSubmissionError(
-                "pyferebus command "
-                + str(i)
-                + " missing required flags "
-                + repr(missing)
-                + ": "
-                + line
-            )
-    return script
+    return script, declared_count
 
 
 def _format_slurm_walltime_hours(walltime_hours) -> str:
@@ -362,25 +326,10 @@ def _harden_generated_script(
                 )
             array_value += "%" + str(min(expected_tasks, array_concurrency_limit))
         directives.append("#SBATCH --array=" + array_value)
-        # pyferebus's template indexes commands/list.txt from one.  Keep that
-        # internal convention while exposing the daemon-wide zero-based Slurm
-        # identity at every scheduler boundary.
-        lines = [
-            line.replace(
-                "${SLURM_ARRAY_TASK_ID}",
-                "${ICHOR_FEREBUS_TASK_NUMBER}",
-            )
-            for line in lines
-        ]
     lines[sbatch_insert_at:sbatch_insert_at] = directives + [
         "set -eo pipefail",
         "export LC_ALL=C",
         "export LC_NUMERIC=C",
-        *(
-            ["export ICHOR_FEREBUS_TASK_NUMBER=$((SLURM_ARRAY_TASK_ID + 1))"]
-            if expected_tasks is not None
-            else []
-        ),
     ] + list(runtime_preamble or [])
     script.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
     if expected_job_name is not None:
@@ -411,16 +360,6 @@ def _harden_generated_script(
             raise FerebusSubmissionError(
                 "FEREBUS array patch validation failed: " + repr(array_matches)
             )
-        raw_uses = [
-            line
-            for line in patched.splitlines()
-            if "SLURM_ARRAY_TASK_ID" in line
-            and "ICHOR_FEREBUS_TASK_NUMBER=$((SLURM_ARRAY_TASK_ID + 1))" not in line
-        ]
-        if raw_uses:
-            raise FerebusSubmissionError(
-                "FEREBUS script retains unnormalised array-task indexing"
-            )
 
 
 def _validate_configured_executable(path_to_executable: Union[str, Path]) -> str:
@@ -439,31 +378,6 @@ def _validate_configured_executable(path_to_executable: Union[str, Path]) -> str
                 "configured FEREBUS executable is not executable: " + str(p)
             )
     return exe
-
-
-def _patch_generated_executable(script: Path, path_to_executable: Union[str, Path]) -> None:
-    exe = _validate_configured_executable(path_to_executable)
-    if not exe or exe == "ferebus":
-        return
-    text = script.read_text(encoding="utf-8")
-    executable_call = shlex.quote(exe) + " ${line}"
-    patched_text = re.sub(
-        r"(?m)^([ \t]*)ferebus[ \t]+\$\{line\}[ \t]*$",
-        lambda match: match.group(1) + executable_call,
-        text,
-    )
-    if patched_text != text:
-        text = patched_text
-        script.write_text(text, encoding="utf-8", newline="\n")
-    elif executable_call not in text:
-        raise FerebusSubmissionError(
-            "could not patch FEREBUS executable path into " + str(script)
-        )
-    patched = script.read_text(encoding="utf-8")
-    if re.search(r"(?m)^[ \t]*ferebus[ \t]+\$\{line\}[ \t]*$", patched) or executable_call not in patched:
-        raise FerebusSubmissionError(
-            "FEREBUS executable patch validation failed for " + str(script)
-        )
 
 
 def _resolve_model_kwargs(
@@ -528,6 +442,49 @@ def _resolve_model_kwargs(
     return merged
 
 
+def _validate_active_learning_training_contract(
+    *,
+    kernel: Any,
+    loss: Any,
+    is_constant_noise: Any,
+    transfer_learning: Any,
+    full_ARD: Any,
+    feature_scaling: Any,
+    property_scaling: Any,
+    nagents: Any,
+    maxiter: Any,
+) -> None:
+    """Reject backend options that are not supported by the active-learning contract."""
+    if kernel not in {"rbf", "rbfc_per"}:
+        raise FerebusSubmissionError(
+            "active-learning FEREBUS kernel must be 'rbf' or 'rbfc_per'"
+        )
+    if loss != "huber":
+        raise FerebusSubmissionError(
+            "active-learning FEREBUS requires Huber loss"
+        )
+    fixed_booleans = {
+        "is_constant_noise": (is_constant_noise, True),
+        "transfer_learning": (transfer_learning, False),
+        "full_ARD": (full_ARD, True),
+        "feature_scaling": (feature_scaling, True),
+        "property_scaling": (property_scaling, False),
+    }
+    for label, (observed, required) in fixed_booleans.items():
+        if not isinstance(observed, bool) or observed is not required:
+            raise FerebusSubmissionError(
+                "active-learning FEREBUS requires "
+                + label
+                + "="
+                + str(required)
+            )
+    for label, value in (("nagents", nagents), ("maxiter", maxiter)):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise FerebusSubmissionError(
+                "active-learning FEREBUS " + label + " must be a positive integer"
+            )
+
+
 _PRIOR_CONFIG_FIELDS = {
     "mean_type": ("mean_type", None),
     "level_of_theory": ("level_of_theory", None),
@@ -551,7 +508,9 @@ def _patch_one_generated_config(script_path: Path, contract: Any) -> Dict[str, A
         )
     replacements = {
         "mean_type": str(int(contract.mean_type)),
-        "level_of_theory": '"' + str(contract.level_of_theory) + '"',
+        "level_of_theory": '"'
+        + str(contract.level_of_theory or "not_applicable")
+        + '"',
         "iqadeviationfactor": repr(float(contract.iqa_deviation_factor)),
         "scaling": "1" if (contract.feature_scaling or contract.property_scaling) else "0",
         "scale_feats": "1" if contract.feature_scaling else "0",
@@ -607,11 +566,44 @@ def _patch_one_generated_config(script_path: Path, contract: Any) -> Dict[str, A
 
 
 def _patch_generated_configs(working_dir: Path, contract: Any) -> List[Dict[str, Any]]:
+    from ..strict_json import strict_json as json
+
+    manifest_path = working_dir / "FEREBUS_TASKS.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise FerebusSubmissionError(
+            "cannot enumerate generated FEREBUS configs"
+        ) from exc
+    tasks = manifest.get("tasks") if isinstance(manifest, dict) else None
+    if not isinstance(tasks, list) or not tasks:
+        raise FerebusSubmissionError("FEREBUS task manifest has no tasks")
+    root = working_dir.resolve()
     records: List[Dict[str, Any]] = []
-    for folder in _read_required_nonempty_lines(working_dir / "list.txt", "list.txt"):
-        raw = Path(folder)
-        task_dir = raw if raw.is_absolute() else working_dir / raw
-        records.append(_patch_one_generated_config(task_dir / "ferebus.config", contract))
+    for expected_index, task in enumerate(tasks, start=1):
+        if not isinstance(task, dict) or task.get("task_index") != expected_index:
+            raise FerebusSubmissionError("FEREBUS task ordering is invalid")
+        relative = task.get("config_path")
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or "\\" in relative
+            or Path(relative).is_absolute()
+        ):
+            raise FerebusSubmissionError("FEREBUS config path is invalid")
+        config_path = working_dir.joinpath(*relative.split("/"))
+        try:
+            config_path.resolve(strict=False).relative_to(root)
+        except ValueError as exc:
+            raise FerebusSubmissionError(
+                "FEREBUS config path escapes its working directory"
+            ) from exc
+        current = working_dir
+        for part in Path(*relative.split("/")).parts:
+            current = current / part
+            if current.is_symlink():
+                raise FerebusSubmissionError("FEREBUS config path contains a symlink")
+        records.append(_patch_one_generated_config(config_path, contract))
     return records
 
 
@@ -660,6 +652,187 @@ def _bind_generated_configs_to_task_manifest(
     if len(by_relative) != len(payload["tasks"]):
         raise FerebusSubmissionError("generated FEREBUS config/task coverage mismatch")
     atomic_write_json(manifest_path, payload)
+
+
+def _canonical_sha256(payload: Mapping[str, Any]) -> str:
+    import hashlib
+    from ..strict_json import strict_json as json
+
+    encoded = json.dumps(
+        dict(payload),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _write_structured_task_map(
+    working_dir: Path,
+    *,
+    executable: Union[str, Path],
+    execution_kind: str = "native_ferebus",
+    performance_required: bool = True,
+) -> Path:
+    """Bind pyferebus-generated configs to shell-free daemon task records."""
+    from ..daemon.ferebus_task_runner import (
+        FEREBUS_TASK_MAP_FILENAME,
+        FEREBUS_TASK_MAP_SCHEMA_VERSION,
+        FEREBUS_TASK_RECEIPT_FILENAME,
+    )
+    from ..daemon.state import atomic_write_json
+    from ..versioning.manifest import sha256_file
+
+    if execution_kind not in {
+        "native_ferebus",
+        "imported_model_bootstrap",
+        "synthetic_dry_run",
+    }:
+        raise FerebusSubmissionError(
+            "unsupported FEREBUS execution kind " + repr(execution_kind)
+        )
+    if not isinstance(performance_required, bool):
+        raise FerebusSubmissionError("performance_required must be a boolean")
+    if performance_required != (execution_kind != "imported_model_bootstrap"):
+        raise FerebusSubmissionError(
+            "FEREBUS execution kind and performance requirement disagree"
+        )
+    manifest_path = working_dir / "FEREBUS_TASKS.json"
+    try:
+        from ..daemon.input_staging import read_ferebus_manifest
+
+        manifest = read_ferebus_manifest(
+            working_dir,
+            verify_dataset_files=True,
+        )
+    except (OSError, ValueError, KeyError) as exc:
+        raise FerebusSubmissionError(
+            "cannot build FEREBUS task map from authenticated inputs: " + str(exc)
+        ) from exc
+    tasks = manifest.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        raise FerebusSubmissionError("FEREBUS task manifest has no tasks")
+    declared_n_tasks = manifest.get("n_tasks")
+    if (
+        isinstance(declared_n_tasks, bool)
+        or not isinstance(declared_n_tasks, int)
+        or declared_n_tasks != len(tasks)
+    ):
+        raise FerebusSubmissionError("FEREBUS task manifest cardinality is invalid")
+    raw_executable = _validate_configured_executable(executable)
+    resolved_executable = raw_executable
+    if raw_executable and raw_executable != "ferebus":
+        resolved_executable = str(Path(raw_executable).expanduser().resolve())
+    elif raw_executable == "ferebus":
+        resolved_executable = shutil.which("ferebus") or "ferebus"
+    executable_path = Path(resolved_executable)
+    executable_record = {
+        "path": resolved_executable,
+        "sha256": (
+            sha256_file(executable_path)
+            if executable_path.is_file() and not executable_path.is_symlink()
+            else None
+        ),
+    }
+    mapped_tasks: List[Dict[str, Any]] = []
+    for expected_index, task in enumerate(tasks, start=1):
+        if (
+            not isinstance(task, dict)
+            or isinstance(task.get("task_index"), bool)
+            or task.get("task_index") != expected_index
+        ):
+            raise FerebusSubmissionError("FEREBUS task ordering is invalid")
+        generated_config = task.get("generated_config")
+        datasets = task.get("datasets")
+        if not isinstance(generated_config, dict) or not isinstance(datasets, dict):
+            raise FerebusSubmissionError("FEREBUS task inputs are not fully bound")
+        command_args = task.get("command_args")
+        if (
+            not isinstance(command_args, list)
+            or not command_args
+            or any(
+                not isinstance(value, str)
+                or not value
+                or any(ord(character) < 32 or ord(character) == 127 for character in value)
+                for value in command_args
+            )
+        ):
+            raise FerebusSubmissionError("FEREBUS task argv is invalid")
+        argv = [resolved_executable, *command_args]
+        mapped_tasks.append(
+            {
+                "task_index": expected_index,
+                "property": task.get("property"),
+                "atom": task.get("atom"),
+                "argv": argv,
+                "config": {
+                    key: generated_config[key]
+                    for key in ("path", "size", "sha256")
+                },
+                "datasets": {
+                    split: {
+                        key: datasets[split][key]
+                        for key in ("path", "size", "sha256")
+                    }
+                    for split in ("train", "int_val", "ext_val")
+                },
+                "expected_model_path": task.get("expected_model_path"),
+                "expected_performance_path": Path(
+                    str(task.get("expected_model_path"))
+                ).with_suffix(".perf").as_posix(),
+                "receipt_path": (
+                    str(task.get("output_dir"))
+                    + "/"
+                    + FEREBUS_TASK_RECEIPT_FILENAME
+                ),
+            }
+        )
+    payload: Dict[str, Any] = {
+        "schema_version": FEREBUS_TASK_MAP_SCHEMA_VERSION,
+        "task_manifest_path": manifest_path.name,
+        "task_manifest_sha256": sha256_file(manifest_path),
+        "executable": executable_record,
+        "execution_kind": execution_kind,
+        "performance_required": performance_required,
+        "n_tasks": len(mapped_tasks),
+        "tasks": mapped_tasks,
+    }
+    payload["task_map_sha256"] = _canonical_sha256(payload)
+    path = working_dir / FEREBUS_TASK_MAP_FILENAME
+    atomic_write_json(path, payload)
+    return path
+
+
+def _replace_with_structured_task_script(
+    script: Path,
+    *,
+    task_map: Path,
+) -> None:
+    """Discard backend-owned shell commands and invoke the structured runner."""
+    from ..daemon.state import atomic_write_text
+
+    shebang = "#!/bin/bash --login"
+    scheduler_directives: List[str] = []
+    try:
+        original_lines = script.read_text(encoding="utf-8").splitlines()
+        first = original_lines[0]
+        if first.startswith("#!"):
+            shebang = first
+        scheduler_directives = [
+            line for line in original_lines if line.lstrip().startswith("#SBATCH")
+        ]
+    except (OSError, IndexError):
+        pass
+    command = (
+        shlex.quote(str(Path(sys.executable).resolve()))
+        + " -m ichor.hpc.active_learning.daemon.ferebus_task_runner"
+        + " --task-map "
+        + shlex.quote(str(task_map.resolve()))
+        + ' --task-index "${SLURM_ARRAY_TASK_ID}"'
+    )
+    body = [shebang, *scheduler_directives, command]
+    atomic_write_text(script, "\n".join(body) + "\n")
 
 
 def submit_ferebus(
@@ -735,30 +908,63 @@ def submit_ferebus(
             "working_directory does not exist: " + str(working_dir)
         )
 
+    _validate_active_learning_training_contract(
+        kernel=kernel,
+        loss=loss,
+        is_constant_noise=is_constant_noise,
+        transfer_learning=transfer_learning,
+        full_ARD=full_ARD,
+        feature_scaling=feature_scaling,
+        property_scaling=property_scaling,
+        nagents=nagents,
+        maxiter=maxiter,
+    )
+
     if model_class is None:
         from pyferebus.executors.trainer import MODEL as _MODEL
         model_class = _MODEL
     if submit_runner is None:
         submit_runner = subprocess.run
 
-    from ..ferebus_prior import FerebusPriorContract, contract_from_payload
+    from ..ferebus_prior import (
+        FerebusPriorContract,
+        PRIOR_MEAN_TYPES,
+        contract_from_payload,
+    )
+
+    if isinstance(prior_mean_type, bool) or not isinstance(prior_mean_type, int):
+        raise FerebusSubmissionError(
+            "active-learning FEREBUS mean type must be an exact integer"
+        )
+    strategies = {
+        mean_type: strategy for strategy, mean_type in PRIOR_MEAN_TYPES.items()
+    }
+    strategy = strategies.get(prior_mean_type)
+    if strategy is None:
+        raise FerebusSubmissionError(
+            "unsupported active-learning FEREBUS mean type: "
+            + str(prior_mean_type)
+        )
 
     prior_contract = FerebusPriorContract(
+        strategy=strategy,
         mean_type=int(prior_mean_type),
-        level_of_theory=str(prior_mean_level_of_theory),
-        iqa_deviation_factor=float(prior_mean_iqa_deviation_factor),
-        feature_scaling=bool(feature_scaling),
-        property_scaling=bool(property_scaling),
+        level_of_theory=(
+            str(prior_mean_level_of_theory)
+            if strategy == "physical_atomic_iqa"
+            else None
+        ),
+        physical_prior_scale=float(prior_mean_iqa_deviation_factor),
     )
     try:
         prior_contract = contract_from_payload(prior_contract.to_dict())
     except Exception as exc:
         raise FerebusSubmissionError(
-            "invalid active-learning FEREBUS physical-prior contract: " + str(exc)
+            "invalid active-learning FEREBUS prior contract: " + str(exc)
         ) from exc
-    if prior_contract.mean_type != 21 or prior_contract.property_scaling:
+    if not bool(feature_scaling) or bool(property_scaling):
         raise FerebusSubmissionError(
-            "active-learning FEREBUS requires mean type 21 with property scaling disabled"
+            "active-learning FEREBUS requires feature scaling and disables property scaling"
         )
 
     model_kwargs = _resolve_model_kwargs(
@@ -799,10 +1005,12 @@ def submit_ferebus(
     finally:
         os.chdir(cwd)
 
-    script = _validate_generated_pyferebus_artifacts(
+    script, generated_task_count = _validate_generated_pyferebus_artifacts(
         working_dir,
         expected_tasks=expected_tasks,
     )
+    if expected_tasks is None:
+        expected_tasks = generated_task_count
     generated_configs = _patch_generated_configs(working_dir, prior_contract)
     _bind_generated_configs_to_task_manifest(working_dir, generated_configs)
     if prepared_callback is not None:
@@ -845,6 +1053,11 @@ def submit_ferebus(
         array_concurrency_limit = overrides.get(
             "array_concurrency_limit", array_concurrency_limit
         )
+    task_map = _write_structured_task_map(
+        working_dir,
+        executable=path_to_executable or "ferebus",
+    )
+    _replace_with_structured_task_script(script, task_map=task_map)
     _harden_generated_script(
         script,
         walltime_hours=walltime_hours,
@@ -859,9 +1072,6 @@ def submit_ferebus(
         expected_tasks=expected_tasks,
         array_concurrency_limit=array_concurrency_limit,
     )
-    if path_to_executable:
-        _patch_generated_executable(script, path_to_executable)
-
     if submission_script_path is not None:
         from ..daemon.state import atomic_write_text
 

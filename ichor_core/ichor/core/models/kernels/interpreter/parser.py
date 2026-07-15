@@ -67,4 +67,7 @@ class Parser:
         return node
 
     def parse(self) -> ASTNode:
-        return self.expr()
+        node = self.expr()
+        if self.current_token.type != TokenType.Eof:
+            self.error()
+        return node

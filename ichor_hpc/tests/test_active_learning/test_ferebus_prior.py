@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from ichor.hpc.active_learning.config import CampaignConfig, ConfigValidationError
+from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.ferebus_prior import (
     FerebusPriorError,
     contract_from_payload,
@@ -48,14 +48,46 @@ def test_explicit_prior_level_must_match_gaussian_training_level():
         resolve_ferebus_prior_contract(cfg)
 
 
-def test_type_21_rejects_property_scaling_and_unsupported_elements():
-    cfg = CampaignConfig()
-    cfg.ferebus.property_scaling = True
-    with pytest.raises(ConfigValidationError, match="property_scaling must be false"):
-        cfg._validate()
+def test_physical_prior_rejects_unsupported_elements():
     assert element_from_atom_label("C1") == "C"
     with pytest.raises(FerebusPriorError, match="no isolated-atom"):
         element_from_atom_label("Cl1")
+
+
+@pytest.mark.parametrize(
+    ("strategy", "mean_type", "expected"),
+    [
+        ("zero", 0, 0.0),
+        ("training_mean", 1, 2.0),
+        ("training_median", 2, 2.0),
+    ],
+)
+def test_nonphysical_prior_strategies_use_exact_training_contract(
+    strategy,
+    mean_type,
+    expected,
+):
+    cfg = CampaignConfig()
+    cfg.ferebus.prior_mean_strategy = strategy
+    cfg._validate()
+    contract = resolve_ferebus_prior_contract(cfg)
+    assert contract.mean_type == mean_type
+    assert contract.level_of_theory is None
+    assert contract.expected_mean_ha(
+        "iqa",
+        "O1",
+        training_values=[1.0, 2.0, 9.0] if strategy == "training_median" else [1.0, 3.0],
+    ) == pytest.approx(expected)
+    assert contract_from_payload(contract.to_dict()) == contract
+
+
+def test_physical_prior_scale_is_applied_explicitly():
+    cfg = CampaignConfig()
+    cfg.ferebus.physical_prior_scale = 0.5
+    contract = resolve_ferebus_prior_contract(cfg)
+    assert contract.expected_mean_ha("iqa", "H2") == pytest.approx(
+        -0.502259675743 * 0.5
+    )
 
 
 def test_model_prior_mean_is_enforced_for_iqa_and_auxiliary_properties():

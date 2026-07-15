@@ -367,11 +367,10 @@ ariadne:
   trqn_trust_min: 1.0e-4
 
 ferebus:
-  prior_mean_type: 21
+  kernel: periodic_rbf
+  prior_mean_strategy: physical_atomic_iqa
   prior_mean_level_of_theory: auto
-  prior_mean_iqa_deviation_factor: 1.0
-  feature_scaling: false
-  property_scaling: false
+  physical_prior_scale: 1.0
 
 runtime:
   poll_sacct_missing_max_ticks: 30

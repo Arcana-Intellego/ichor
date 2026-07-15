@@ -1,11 +1,4 @@
-"""Physical prior-mean contract shared by active-learning FEREBUS stages.
-
-FEREBUS mean type 21 returns an isolated-atom IQA energy in Hartree for IQA
-models and zero for auxiliary properties.  The values below intentionally
-mirror ``FEREBUS_CPU/src/utils/atomic_energies.f90``.  Keeping the table and a
-version identifier here lets the daemon validate generated configurations and
-trained models before they become campaign state.
-"""
+"""Semantic prior-mean contract shared by active-learning FEREBUS stages."""
 from __future__ import annotations
 
 import hashlib
@@ -19,10 +12,20 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 import numpy as np
 
 
-PRIOR_MEAN_TYPE = 21
+PRIOR_MEAN_TYPES = {
+    "zero": 0,
+    "training_mean": 1,
+    "training_median": 2,
+    "physical_atomic_iqa": 21,
+}
+FEREBUS_KERNEL_TOKENS = {
+    "periodic_rbf": "rbfc_per",
+    "rbf": "rbf",
+}
+PRIOR_MEAN_TYPE = PRIOR_MEAN_TYPES["physical_atomic_iqa"]
 PRIOR_MEAN_UNITS = "ha"
-PRIOR_CONTRACT_SCHEMA_VERSION = 1
-ATOMIC_ENERGY_REGISTRY_VERSION = "ferebus_cpu_atomic_energies_v1"
+PRIOR_CONTRACT_SCHEMA_VERSION = 2
+ATOMIC_ENERGY_REGISTRY_VERSION = "ichor_verified_ferebus_atomic_energies_v2"
 
 
 class FerebusPriorError(ValueError):
@@ -44,19 +47,11 @@ _ATOMIC_ENERGIES_HA: Dict[str, Dict[str, float]] = {
         "N": -54.587774,
         "S": -398.106712319,
     },
-    "b3lyp/6-311+g(d,p)": {
-        "C": -35.0,
-        "H": -0.5,
-        "O": -75.0,
-        "N": -54.0,
-        "S": -398.0,
-    },
     "ccsd/6-31+g(d,p)": {
         "C": -37.755631,
         "H": -0.4982329,
         "O": -74.9015088,
         "N": -54.475602,
-        "S": -398.0,
     },
     "gold": {
         "C": -37.779653,
@@ -115,6 +110,16 @@ def gaussian_level_of_theory(method: Any, basis_set: Any) -> str:
     return canonicalise_level_of_theory(method.strip() + "/" + basis_set.strip())
 
 
+def backend_kernel_token(value: Any) -> str:
+    """Translate one public kernel family to its exact native token."""
+    if not isinstance(value, str) or value not in FEREBUS_KERNEL_TOKENS:
+        raise FerebusPriorError(
+            "unsupported FEREBUS kernel; expected one of "
+            + repr(sorted(FEREBUS_KERNEL_TOKENS))
+        )
+    return FEREBUS_KERNEL_TOKENS[value]
+
+
 def element_from_atom_label(atom: Any) -> str:
     """Extract and validate the chemical element represented by an atom label."""
     label = str(atom or "")
@@ -138,22 +143,39 @@ def element_from_atom_label(atom: Any) -> str:
 
 @dataclass(frozen=True)
 class FerebusPriorContract:
+    strategy: str
     mean_type: int
-    level_of_theory: str
-    iqa_deviation_factor: float
-    feature_scaling: bool
-    property_scaling: bool
+    level_of_theory: Optional[str]
+    physical_prior_scale: float
+
+    @property
+    def iqa_deviation_factor(self) -> float:
+        """Return the native FEREBUS name for the physical scale."""
+        return self.physical_prior_scale
+
+    @property
+    def feature_scaling(self) -> bool:
+        return True
+
+    @property
+    def property_scaling(self) -> bool:
+        return False
 
     def identity_payload(self) -> Dict[str, Any]:
         return {
             "schema_version": PRIOR_CONTRACT_SCHEMA_VERSION,
+            "strategy": self.strategy,
             "mean_type": int(self.mean_type),
             "level_of_theory": self.level_of_theory,
-            "iqa_deviation_factor": float(self.iqa_deviation_factor),
+            "physical_prior_scale": float(self.physical_prior_scale),
             "units": PRIOR_MEAN_UNITS,
-            "feature_scaling": bool(self.feature_scaling),
-            "property_scaling": bool(self.property_scaling),
-            "atomic_energy_registry_version": ATOMIC_ENERGY_REGISTRY_VERSION,
+            "feature_scaling": True,
+            "property_scaling": False,
+            "atomic_energy_registry_version": (
+                ATOMIC_ENERGY_REGISTRY_VERSION
+                if self.strategy == "physical_atomic_iqa"
+                else None
+            ),
         }
 
     @property
@@ -165,25 +187,66 @@ class FerebusPriorContract:
         payload["contract_sha256"] = self.contract_sha256
         return payload
 
-    def expected_mean_ha(self, property_name: Any, atom: Any) -> float:
-        if str(property_name) != "iqa":
+    def expected_mean_ha(
+        self,
+        property_name: Any,
+        atom: Any,
+        *,
+        training_values: Optional[Sequence[float]] = None,
+    ) -> float:
+        if self.strategy == "zero":
             return 0.0
-        element = element_from_atom_label(atom)
-        return float(
-            self.iqa_deviation_factor
-            * _ATOMIC_ENERGIES_HA[self.level_of_theory][element]
-        )
+        if self.strategy == "physical_atomic_iqa":
+            if str(property_name) != "iqa":
+                return 0.0
+            element = element_from_atom_label(atom)
+            level_values = _ATOMIC_ENERGIES_HA.get(str(self.level_of_theory), {})
+            if element not in level_values:
+                raise FerebusPriorError(
+                    "FEREBUS physical prior has no verified value for "
+                    + element
+                    + " at "
+                    + str(self.level_of_theory)
+                )
+            return float(self.physical_prior_scale * level_values[element])
+        if training_values is None:
+            raise FerebusPriorError(
+                self.strategy + " requires the exact task training values"
+            )
+        values = np.asarray(training_values, dtype=float).reshape(-1)
+        if values.size == 0 or not np.all(np.isfinite(values)):
+            raise FerebusPriorError(
+                self.strategy + " requires non-empty finite training values"
+            )
+        if self.strategy == "training_mean":
+            return float(np.mean(values))
+        if self.strategy == "training_median":
+            return float(np.median(values))
+        raise FerebusPriorError("unsupported FEREBUS prior strategy " + repr(self.strategy))
 
-    def task_payload(self, property_name: Any, atom: Any) -> Dict[str, Any]:
+    def task_payload(
+        self,
+        property_name: Any,
+        atom: Any,
+        *,
+        training_values: Optional[Sequence[float]] = None,
+        training_dataset_sha256: Optional[str] = None,
+    ) -> Dict[str, Any]:
         return {
             "contract_sha256": self.contract_sha256,
+            "strategy": self.strategy,
             "mean_type": int(self.mean_type),
             "level_of_theory": self.level_of_theory,
-            "iqa_deviation_factor": float(self.iqa_deviation_factor),
+            "physical_prior_scale": float(self.physical_prior_scale),
             "units": PRIOR_MEAN_UNITS,
-            "expected_mean_ha": self.expected_mean_ha(property_name, atom),
-            "feature_scaling": bool(self.feature_scaling),
-            "property_scaling": bool(self.property_scaling),
+            "expected_mean_ha": self.expected_mean_ha(
+                property_name,
+                atom,
+                training_values=training_values,
+            ),
+            "training_dataset_sha256": training_dataset_sha256,
+            "feature_scaling": True,
+            "property_scaling": False,
         }
 
 
@@ -192,81 +255,67 @@ def resolve_ferebus_prior_contract(
     *,
     atom_labels: Optional[Sequence[Any]] = None,
 ) -> FerebusPriorContract:
-    """Resolve and validate the campaign's physical prior-mean contract."""
+    """Resolve and validate the campaign's semantic prior-mean contract."""
     ferebus = getattr(config, "ferebus", config)
     gaussian = getattr(config, "gaussian", None)
-    mean_type = getattr(ferebus, "prior_mean_type", PRIOR_MEAN_TYPE)
-    try:
-        parsed_mean_type = int(mean_type)
-    except (TypeError, ValueError) as exc:
+    strategy = getattr(ferebus, "prior_mean_strategy", "physical_atomic_iqa")
+    if not isinstance(strategy, str) or strategy not in PRIOR_MEAN_TYPES:
         raise FerebusPriorError(
-            "ferebus.prior_mean_type must be 21 for active-learning campaigns"
-        ) from exc
-    if isinstance(mean_type, bool) or parsed_mean_type != PRIOR_MEAN_TYPE:
-        raise FerebusPriorError(
-            "ferebus.prior_mean_type must be 21 for active-learning campaigns"
+            "ferebus.prior_mean_strategy must be one of "
+            + repr(sorted(PRIOR_MEAN_TYPES))
         )
-    raw_level = canonicalise_level_of_theory(
-        getattr(ferebus, "prior_mean_level_of_theory", "auto")
-    )
-    if raw_level == "auto":
-        if gaussian is None:
-            raise FerebusPriorError(
-                "ferebus.prior_mean_level_of_theory='auto' requires Gaussian settings"
-            )
-        level = gaussian_level_of_theory(
-            getattr(gaussian, "method", None),
-            getattr(gaussian, "basis_set", None),
+    level: Optional[str] = None
+    if strategy == "physical_atomic_iqa":
+        raw_level = canonicalise_level_of_theory(
+            getattr(ferebus, "prior_mean_level_of_theory", "auto")
         )
-    else:
-        level = raw_level
-        if gaussian is not None:
-            gaussian_level = gaussian_level_of_theory(
+        if raw_level == "auto":
+            if gaussian is None:
+                raise FerebusPriorError(
+                    "ferebus.prior_mean_level_of_theory='auto' requires Gaussian settings"
+                )
+            level = gaussian_level_of_theory(
                 getattr(gaussian, "method", None),
                 getattr(gaussian, "basis_set", None),
             )
-            if level != gaussian_level:
-                raise FerebusPriorError(
-                    "ferebus.prior_mean_level_of_theory "
-                    + repr(level)
-                    + " does not match Gaussian training-data level "
-                    + repr(gaussian_level)
+        else:
+            level = raw_level
+            if gaussian is not None:
+                gaussian_level = gaussian_level_of_theory(
+                    getattr(gaussian, "method", None),
+                    getattr(gaussian, "basis_set", None),
                 )
-    factor = getattr(ferebus, "prior_mean_iqa_deviation_factor", 1.0)
+                if level != gaussian_level:
+                    raise FerebusPriorError(
+                        "ferebus.prior_mean_level_of_theory "
+                        + repr(level)
+                        + " does not match Gaussian training-data level "
+                        + repr(gaussian_level)
+                    )
+    factor = getattr(ferebus, "physical_prior_scale", 1.0)
     if isinstance(factor, bool):
         raise FerebusPriorError(
-            "ferebus.prior_mean_iqa_deviation_factor must be a finite positive number"
+            "ferebus.physical_prior_scale must be a finite positive number"
         )
     try:
         factor_float = float(factor)
     except (TypeError, ValueError) as exc:
         raise FerebusPriorError(
-            "ferebus.prior_mean_iqa_deviation_factor must be a finite positive number"
+            "ferebus.physical_prior_scale must be a finite positive number"
         ) from exc
     if not math.isfinite(factor_float) or factor_float <= 0.0:
         raise FerebusPriorError(
-            "ferebus.prior_mean_iqa_deviation_factor must be a finite positive number"
-        )
-    feature_scaling = getattr(ferebus, "feature_scaling", True)
-    property_scaling = getattr(ferebus, "property_scaling", False)
-    if not isinstance(feature_scaling, bool):
-        raise FerebusPriorError("ferebus.feature_scaling must be a boolean")
-    if not isinstance(property_scaling, bool):
-        raise FerebusPriorError("ferebus.property_scaling must be a boolean")
-    if property_scaling:
-        raise FerebusPriorError(
-            "ferebus.property_scaling must be false with prior_mean_type 21 because "
-            "the physical prior and IQA targets must both remain in Hartree"
+            "ferebus.physical_prior_scale must be a finite positive number"
         )
     contract = FerebusPriorContract(
-        mean_type=PRIOR_MEAN_TYPE,
+        strategy=strategy,
+        mean_type=PRIOR_MEAN_TYPES[strategy],
         level_of_theory=level,
-        iqa_deviation_factor=factor_float,
-        feature_scaling=feature_scaling,
-        property_scaling=False,
+        physical_prior_scale=factor_float,
     )
-    for atom in atom_labels or ():
-        element_from_atom_label(atom)
+    if strategy == "physical_atomic_iqa":
+        for atom in atom_labels or ():
+            contract.expected_mean_ha("iqa", atom)
     return contract
 
 
@@ -274,32 +323,45 @@ def contract_from_payload(payload: Any) -> FerebusPriorContract:
     """Parse and authenticate a serialised physical-prior contract."""
     if not isinstance(payload, Mapping):
         raise FerebusPriorError("FEREBUS prior contract must be an object")
-    if int(payload.get("schema_version", -1)) != PRIOR_CONTRACT_SCHEMA_VERSION:
+    schema = payload.get("schema_version")
+    if isinstance(schema, bool) or not isinstance(schema, int) or schema != PRIOR_CONTRACT_SCHEMA_VERSION:
         raise FerebusPriorError("unsupported FEREBUS prior contract schema")
     if str(payload.get("units") or "") != PRIOR_MEAN_UNITS:
         raise FerebusPriorError("FEREBUS prior contract units must be 'ha'")
-    if str(payload.get("atomic_energy_registry_version") or "") != (
-        ATOMIC_ENERGY_REGISTRY_VERSION
-    ):
-        raise FerebusPriorError("unsupported FEREBUS atomic-energy registry")
+    strategy = payload.get("strategy")
+    if not isinstance(strategy, str) or strategy not in PRIOR_MEAN_TYPES:
+        raise FerebusPriorError("FEREBUS prior contract strategy is invalid")
+    level_value = payload.get("level_of_theory")
+    level = None
+    if strategy == "physical_atomic_iqa":
+        if payload.get("atomic_energy_registry_version") != ATOMIC_ENERGY_REGISTRY_VERSION:
+            raise FerebusPriorError("unsupported FEREBUS atomic-energy registry")
+        level = canonicalise_level_of_theory(level_value)
+    elif level_value is not None or payload.get("atomic_energy_registry_version") is not None:
+        raise FerebusPriorError("non-physical FEREBUS prior must not bind an atomic registry")
+    mean_type = payload.get("mean_type")
+    if isinstance(mean_type, bool) or not isinstance(mean_type, int):
+        raise FerebusPriorError("FEREBUS prior contract mean_type must be an integer")
+    factor = payload.get("physical_prior_scale")
+    if isinstance(factor, bool):
+        raise FerebusPriorError("FEREBUS prior contract factor is invalid")
+    try:
+        factor_float = float(factor)
+    except (TypeError, ValueError) as exc:
+        raise FerebusPriorError("FEREBUS prior contract factor is invalid") from exc
     contract = FerebusPriorContract(
-        mean_type=int(payload.get("mean_type", -1)),
-        level_of_theory=canonicalise_level_of_theory(
-            payload.get("level_of_theory")
-        ),
-        iqa_deviation_factor=float(payload.get("iqa_deviation_factor")),
-        feature_scaling=payload.get("feature_scaling"),
-        property_scaling=payload.get("property_scaling"),
+        strategy=strategy,
+        mean_type=mean_type,
+        level_of_theory=level,
+        physical_prior_scale=factor_float,
     )
-    if contract.mean_type != PRIOR_MEAN_TYPE:
-        raise FerebusPriorError("FEREBUS prior contract mean_type must be 21")
-    if not isinstance(contract.feature_scaling, bool):
-        raise FerebusPriorError("FEREBUS prior contract feature_scaling is invalid")
-    if not isinstance(contract.property_scaling, bool) or contract.property_scaling:
-        raise FerebusPriorError("FEREBUS prior contract property_scaling must be false")
+    if contract.mean_type != PRIOR_MEAN_TYPES[strategy]:
+        raise FerebusPriorError("FEREBUS prior contract mean_type/strategy mismatch")
+    if payload.get("feature_scaling") is not True or payload.get("property_scaling") is not False:
+        raise FerebusPriorError("FEREBUS prior contract scaling is invalid")
     if (
-        not math.isfinite(contract.iqa_deviation_factor)
-        or contract.iqa_deviation_factor <= 0.0
+        not math.isfinite(contract.physical_prior_scale)
+        or contract.physical_prior_scale <= 0.0
     ):
         raise FerebusPriorError("FEREBUS prior contract factor is invalid")
     if str(payload.get("contract_sha256") or "") != contract.contract_sha256:
@@ -327,12 +389,36 @@ def validate_model_prior_mean(
     contract: FerebusPriorContract,
     property_name: Any,
     atom: Any,
+    training_values: Optional[Sequence[float]] = None,
+    expected_mean_ha: Optional[float] = None,
     relative_tolerance: float = 1.0e-10,
     absolute_tolerance: float = 1.0e-10,
 ) -> Dict[str, Any]:
-    """Validate and report the physical prior stored in a trained model."""
+    """Validate and report the semantic prior stored in a trained model."""
     observed = model_constant_mean_ha(model)
-    expected = contract.expected_mean_ha(property_name, atom)
+    if expected_mean_ha is None:
+        expected = contract.expected_mean_ha(
+            property_name,
+            atom,
+            training_values=training_values,
+        )
+    else:
+        if isinstance(expected_mean_ha, bool):
+            raise FerebusPriorError("FEREBUS expected prior mean is invalid")
+        expected = float(expected_mean_ha)
+        if not math.isfinite(expected):
+            raise FerebusPriorError("FEREBUS expected prior mean is non-finite")
+        if contract.strategy in {"zero", "physical_atomic_iqa"}:
+            derived = contract.expected_mean_ha(property_name, atom)
+            if not math.isclose(
+                expected,
+                derived,
+                rel_tol=float(relative_tolerance),
+                abs_tol=float(absolute_tolerance),
+            ):
+                raise FerebusPriorError(
+                    "FEREBUS recorded prior mean disagrees with its semantic contract"
+                )
     if not math.isclose(
         observed,
         expected,
@@ -393,9 +479,11 @@ def parse_ferebus_config_contract(path: Path) -> Dict[str, Any]:
         )
     try:
         level = found["level_of_theory"].strip().strip('"').strip("'")
+        if not level:
+            raise ValueError("empty level_of_theory")
         return {
             "mean_type": int(found["mean_type"]),
-            "level_of_theory": canonicalise_level_of_theory(level),
+            "level_of_theory": level.lower(),
             "iqa_deviation_factor": float(found["iqa_deviation_factor"]),
             "scaling": bool(int(found["scaling"])),
             "scale_feats": bool(int(found["scale_feats"])),
@@ -414,12 +502,16 @@ def validate_ferebus_config_contract(
     """Prove that a generated FEREBUS config matches the campaign contract."""
     parsed = parse_ferebus_config_contract(path)
     expected = {
-        "mean_type": PRIOR_MEAN_TYPE,
-        "level_of_theory": contract.level_of_theory,
-        "iqa_deviation_factor": float(contract.iqa_deviation_factor),
-        "scaling": bool(contract.feature_scaling or contract.property_scaling),
-        "scale_feats": bool(contract.feature_scaling),
-        "scale_prop": bool(contract.property_scaling),
+        "mean_type": int(contract.mean_type),
+        "level_of_theory": (
+            contract.level_of_theory
+            if contract.level_of_theory is not None
+            else "not_applicable"
+        ),
+        "iqa_deviation_factor": float(contract.physical_prior_scale),
+        "scaling": True,
+        "scale_feats": True,
+        "scale_prop": False,
     }
     for key, value in expected.items():
         observed = parsed[key]
@@ -444,11 +536,14 @@ __all__ = [
     "FerebusPriorContract",
     "FerebusPriorError",
     "PRIOR_CONTRACT_SCHEMA_VERSION",
+    "PRIOR_MEAN_TYPES",
+    "FEREBUS_KERNEL_TOKENS",
     "PRIOR_MEAN_TYPE",
     "PRIOR_MEAN_UNITS",
     "SUPPORTED_ELEMENTS",
     "SUPPORTED_LEVELS",
     "canonicalise_level_of_theory",
+    "backend_kernel_token",
     "contract_from_payload",
     "element_from_atom_label",
     "gaussian_level_of_theory",

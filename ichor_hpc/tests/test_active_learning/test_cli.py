@@ -105,31 +105,40 @@ def _commit_training_and_model_versions(campaign: Path, versions):
         context="bootstrap",
         iteration=0,
     )
+    candidates = [
+        {
+            "candidate_id": "cli-bootstrap-" + str(index),
+            "frame_id": index,
+            "pointdir_name": "POINT_" + str(index).zfill(4) + ".pointdir",
+        }
+        for index in range(6)
+    ]
     allocation = create_point_allocation(
         allocation_path,
         campaign_uid="cli-test",
         context="bootstrap",
         iteration=0,
-        targets={"train": 1, "int_val": 0, "ext_val": 0, "total": 1},
-        primary_candidates=[
-            {
-                "candidate_id": "cli-bootstrap-0",
-                "frame_id": 0,
-                "pointdir_name": "POINT_0000.pointdir",
-            }
-        ],
+        targets={"train": 2, "int_val": 2, "ext_val": 2, "total": 6},
+        primary_candidates=candidates,
         reserve_candidates=[],
     )
-    attempt = pending_attempts(allocation)[0]
+    attempts = pending_attempts(allocation)
     selection_dir = bootstrap_selection_dir(campaign)
     selection_dir.mkdir(parents=True, exist_ok=True)
     (selection_dir / "selected.xyz").write_text(
-        "1\nbootstrap fixture\nH 0.0 0.0 0.0\n",
+        "".join(
+            "1\nbootstrap fixture "
+            + str(index)
+            + "\nH "
+            + repr(0.01 * index)
+            + " 0.0 0.0\n"
+            for index in range(6)
+        ),
         encoding="utf-8",
         newline="\n",
     )
     (selection_dir / "selected_indices.dat").write_text(
-        "0\n",
+        "".join(str(index) + "\n" for index in range(6)),
         encoding="utf-8",
         newline="\n",
     )
@@ -138,46 +147,61 @@ def _commit_training_and_model_versions(campaign: Path, versions):
         "iteration": 0,
         "sample_xyz": "selection/selected.xyz",
         "index_path": "selection/selected_indices.dat",
-        "n_select": 1,
-        "selected_indices": [0],
+        "n_select": 6,
+        "selected_indices": list(range(6)),
         "selector": diversity_selector_contract(),
         "trajectory_sha256": str(pool.sha256),
         "source_pool_manifest": ".DATA/TRAJECTORY/pool.manifest.json",
         "point_allocation": {
             "manifest": "allocation/POINT_ALLOCATION.json",
-            "primary": [{
-                "candidate_id": str(attempt["candidate_id"]),
-                "frame_id": 0,
-                "slot_id": int(attempt["slot_id"]),
-                "split": str(attempt["split"]),
-            }],
+            "primary": [
+                {
+                    "candidate_id": str(attempt["candidate_id"]),
+                    "frame_id": int(attempt["frame_id"]),
+                    "slot_id": int(attempt["slot_id"]),
+                    "split": str(attempt["split"]),
+                }
+                for attempt in sorted(
+                    attempts,
+                    key=lambda record: int(record["frame_id"]),
+                )
+            ],
         },
     })
-    pointdir = campaign / ".DATA" / "STAGING" / "initial" / "POINT_0000.pointdir"
-    pointdir.mkdir(parents=True, exist_ok=True)
-    (pointdir / "fixture.txt").write_text("reference\n", encoding="utf-8")
-    write_seed_provenance(
-        pointdir,
-        campaign_uid="cli-test",
-        iteration=0,
-        trajectory_sha256=str(pool.sha256),
-        seed_frame_id=0,
-        seed_selection_origin="cli_fixture",
-        seed_variance_at_selection=None,
-        subspace_neighbour_frame_ids=[],
-        subspace_dimension=0,
-        subspace_eigenvalues=[],
-    )
-    enrich_with_point_allocation(
-        pointdir,
-        candidate_id=str(attempt["candidate_id"]),
-        context="bootstrap",
-        slot_id=int(attempt["slot_id"]),
-        split=str(attempt["split"]),
-        allocation_slot_assignment_sha256=str(
-            allocation["slot_assignment_sha256"]
-        ),
-    )
+    pointdirs = []
+    for attempt in attempts:
+        pointdir = (
+            campaign
+            / ".DATA"
+            / "STAGING"
+            / "initial"
+            / str(attempt["pointdir_name"])
+        )
+        pointdir.mkdir(parents=True, exist_ok=True)
+        (pointdir / "fixture.txt").write_text("reference\n", encoding="utf-8")
+        write_seed_provenance(
+            pointdir,
+            campaign_uid="cli-test",
+            iteration=0,
+            trajectory_sha256=str(pool.sha256),
+            seed_frame_id=int(attempt["frame_id"]),
+            seed_selection_origin="cli_fixture",
+            seed_variance_at_selection=None,
+            subspace_neighbour_frame_ids=[],
+            subspace_dimension=0,
+            subspace_eigenvalues=[],
+        )
+        enrich_with_point_allocation(
+            pointdir,
+            candidate_id=str(attempt["candidate_id"]),
+            context="bootstrap",
+            slot_id=int(attempt["slot_id"]),
+            split=str(attempt["split"]),
+            allocation_slot_assignment_sha256=str(
+                allocation["slot_assignment_sha256"]
+            ),
+        )
+        pointdirs.append(pointdir)
     from ichor_hpc.tests.quantum_test_support import (
         attach_synthetic_quantum_batch,
     )
@@ -188,6 +212,7 @@ def _commit_training_and_model_versions(campaign: Path, versions):
             "accepted": True,
             "pointdir": str(pointdir.resolve()),
         }
+        for attempt, pointdir in zip(attempts, pointdirs)
     ]
     attach_synthetic_quantum_batch(
         campaign,

@@ -66,7 +66,7 @@ class RBF(Kernel):
         str_to_write = ""
 
         str_to_write += f"[kernel.{self.name}]\n"
-        str_to_write += "type constant\n"
+        str_to_write += "type rbf\n"
         str_to_write += f"number_of_dimensions {len(self.active_dims)}\n"
         str_to_write += (
             f"active_dimensions {' '.join(map(str, self.active_dims + 1))}\n"

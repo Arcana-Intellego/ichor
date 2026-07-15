@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -103,10 +104,12 @@ class Model(ReadFile, WriteFile):
         kernel_composition = ""
         kernel_dict = {}
         notes = {}
+        declared_kernel_count = None
+        prefactor_seen = False
 
         stop_reading = False
 
-        with open(self.path, "r") as f:
+        with open(self.path, "r", encoding="utf-8", newline=None) as f:
             for line in f:
                 if stop_reading:
                     break
@@ -202,34 +205,73 @@ class Model(ReadFile, WriteFile):
                             mean = LinearMean(beta, xmin, ymin)
                         elif mean_type == "quadratic":
                             mean = QuadraticMean(beta, xmin, ymin)
+                    else:
+                        raise ValueError(
+                            "unsupported FEREBUS model mean type " + repr(mean_type)
+                        )
 
                     self.mean = self.mean or mean
                     continue
 
-                if "composition" in line:
+                if line.strip().startswith("number_of_kernels "):
+                    if declared_kernel_count is not None:
+                        raise ValueError(
+                            "duplicate FEREBUS number_of_kernels declaration"
+                        )
+                    declared_kernel_count = int(line.split()[-1])
+                    if declared_kernel_count <= 0:
+                        raise ValueError(
+                            "FEREBUS number_of_kernels must be positive"
+                        )
+                    continue
+
+                if line.strip().startswith("composition "):
                     # which kernels were used to make the GP model.
                     # Different kernels can be specified for different input dimensions
+                    if kernel_composition:
+                        raise ValueError(
+                            "duplicate FEREBUS kernel composition declaration"
+                        )
                     kernel_composition = line.split()[-1]
                     continue
 
                 if line.strip().startswith("prefactor "):
+                    if prefactor_seen:
+                        raise ValueError("duplicate FEREBUS kernel prefactor")
                     self.prefactor = float(line.split()[-1])
+                    prefactor_seen = True
                     continue
 
                 # GP kernel section
                 if "[kernel." in line:
                     kernel_name = line.split(".")[-1].rstrip().rstrip("]")
+                    if kernel_name in kernel_dict:
+                        raise ValueError(
+                            "duplicate FEREBUS kernel section " + repr(kernel_name)
+                        )
                     line = next(f)
                     kernel_type = line.split()[-1].strip()
                     ndims = int(next(f).split()[-1])  # number of dimensions
                     line = next(f)
                     if "TODO" not in line:
-                        active_dims = np.array([int(ad) - 1 for ad in line.split()[1:]])
+                        active_dims = np.asarray(
+                            [int(ad) - 1 for ad in line.split()[1:]],
+                            dtype=int,
+                        )
                     else:
                         active_dims = np.arange(ndims)
+                    if active_dims.size != ndims:
+                        raise ValueError(
+                            "FEREBUS kernel active-dimension count mismatch"
+                        )
 
                     if kernel_type == "rbf":
-                        thetas = np.array([float(hp) for hp in next(f).split()[1:]])
+                        thetas = np.asarray(
+                            [float(hp) for hp in next(f).split()[1:]],
+                            dtype=float,
+                        )
+                        if thetas.size != ndims:
+                            raise ValueError("FEREBUS RBF theta count mismatch")
                         kernel_dict[kernel_name] = RBF(
                             kernel_name, thetas, active_dims=active_dims
                         )
@@ -237,7 +279,12 @@ class Model(ReadFile, WriteFile):
                         "rbf-cyclic",
                         "rbf-cylic",
                     ]:  # Due to typo in FEREBUS 7.0
-                        thetas = np.array([float(hp) for hp in next(f).split()[1:]])
+                        thetas = np.asarray(
+                            [float(hp) for hp in next(f).split()[1:]],
+                            dtype=float,
+                        )
+                        if thetas.size != ndims:
+                            raise ValueError("FEREBUS cyclic-RBF theta count mismatch")
                         kernel_dict[kernel_name] = RBFCyclic(
                             kernel_name, thetas, active_dims=active_dims
                         )
@@ -247,12 +294,22 @@ class Model(ReadFile, WriteFile):
                             kernel_name, value, active_dims=active_dims
                         )
                     elif kernel_type == "periodic":
-                        thetas = np.array([float(hp) for hp in next(f).split()[1:]])
+                        thetas = np.asarray(
+                            [float(hp) for hp in next(f).split()[1:]],
+                            dtype=float,
+                        )
+                        if thetas.size != ndims:
+                            raise ValueError("FEREBUS periodic theta count mismatch")
                         kernel_dict[kernel_name] = PeriodicKernel(
                             kernel_name,
                             thetas,
                             np.full(thetas.shape, 2 * np.pi),
                             active_dims=active_dims,
+                        )
+                    else:
+                        raise ValueError(
+                            "unsupported FEREBUS model kernel type "
+                            + repr(kernel_type)
                         )
 
                     continue
@@ -265,49 +322,86 @@ class Model(ReadFile, WriteFile):
 
                 # training inputs data
                 if "[training_data.x]" in line:
-                    line = next(f)
                     x = np.empty((self.ntrain, self.nfeats))
-                    i = 0
-                    while line.strip() != "":
-                        x[i, :] = np.array([float(num) for num in line.split()])
-                        i += 1
-                        line = next(f)
-                    self.x = self.x or x
+                    for i in range(self.ntrain):
+                        row = next(f)
+                        if not row.strip():
+                            raise ValueError("truncated FEREBUS training_data.x section")
+                        values = np.array([float(num) for num in row.split()])
+                        if values.size != self.nfeats:
+                            raise ValueError(
+                                "FEREBUS training_data.x feature count mismatch"
+                            )
+                        x[i, :] = values
+                    separator = next(f)
+                    if separator.strip():
+                        raise ValueError(
+                            "FEREBUS training_data.x contains too many rows"
+                        )
+                    self.x = x if self.x is FileContents else self.x
                     continue
 
                 # training labels data
                 if "[training_data.y]" in line:
-                    line = next(f)
                     y = np.empty((self.ntrain, 1))
-                    i = 0
-                    while line.strip() != "":
-                        y[i, 0] = float(line)
-                        i += 1
-                        line = next(f)
-                    self.y = self.y or y
+                    for i in range(self.ntrain):
+                        row = next(f)
+                        if not row.strip():
+                            raise ValueError("truncated FEREBUS training_data.y section")
+                        y[i, 0] = float(row)
+                    separator = next(f)
+                    if separator.strip():
+                        raise ValueError(
+                            "FEREBUS training_data.y contains too many rows"
+                        )
+                    self.y = y if self.y is FileContents else self.y
                     continue
 
                 if "[weights]" in line:
-                    line = next(f)
                     weights = np.empty((self.ntrain, 1))
-                    i = 0
-                    while line.strip() != "":
-                        weights[i, 0] = float(line)
-                        i += 1
+                    for i in range(self.ntrain):
                         try:
-                            line = next(f)
-                        except StopIteration:
-                            break
+                            row = next(f)
+                        except StopIteration as exc:
+                            raise ValueError("truncated FEREBUS weights section") from exc
+                        if not row.strip():
+                            raise ValueError("truncated FEREBUS weights section")
+                        weights[i, 0] = float(row)
+                    for trailing in f:
+                        if trailing.strip():
+                            raise ValueError(
+                                "unexpected content after FEREBUS weights section"
+                            )
+                    self.weights = (
+                        weights if self.weights is FileContents else self.weights
+                    )
+                    stop_reading = True
 
-                    self.weights = self.weights or weights
-
-        self.kernel = (
-            self.kernel
-            if self.kernel or not kernel_composition
-            else KernelInterpreter(kernel_composition, kernel_dict).interpret()
-        )
-        if self.prefactor is FileContents:
-            self.prefactor = 1.0
+        if kernel_dict or kernel_composition:
+            if not kernel_composition:
+                raise ValueError("FEREBUS model is missing kernel composition")
+            if declared_kernel_count is None:
+                raise ValueError("FEREBUS model is missing number_of_kernels")
+            if declared_kernel_count != len(kernel_dict):
+                raise ValueError("FEREBUS kernel section count mismatch")
+            referenced = set(
+                re.findall(r"[A-Za-z_][A-Za-z0-9_]*", kernel_composition)
+            )
+            if referenced != set(kernel_dict):
+                raise ValueError(
+                    "FEREBUS kernel composition/section coverage mismatch"
+                )
+            if not prefactor_seen:
+                raise ValueError("FEREBUS model is missing kernel prefactor")
+            if not np.isfinite(float(self.prefactor)) or float(self.prefactor) <= 0.0:
+                raise ValueError(
+                    "FEREBUS kernel prefactor must be finite and positive"
+                )
+            self.kernel = (
+                self.kernel
+                if self.kernel
+                else KernelInterpreter(kernel_composition, kernel_dict).interpret()
+            )
 
     @property
     def ialf(self) -> np.ndarray:

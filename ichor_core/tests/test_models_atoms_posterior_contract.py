@@ -3,7 +3,7 @@ import pytest
 
 from ichor.core.adversarial.posterior import TotalEnergyPosterior
 from ichor.core.atoms import Atom, Atoms
-from ichor.core.models import Models
+from ichor.core.models import Model, Models
 
 
 def _write_model(path, *, atom, alf, ntrain=5, nfeats=3):
@@ -32,6 +32,7 @@ def _write_model(path, *, atom, alf, ntrain=5, nfeats=3):
         "[kernels]",
         "number_of_kernels 1",
         "composition k1",
+        "prefactor 1.0",
         "",
         "[kernel.k1]",
         "type rbf",
@@ -127,3 +128,82 @@ def test_models_exact_loader_rejects_duplicate_paths(tmp_path):
     _write_model(model, atom="O1", alf=(1, 2, 3))
     with pytest.raises(ValueError, match="duplicate explicit model path"):
         Models.from_model_files(tmp_path, [model, model])
+
+
+def test_model_parser_rejects_nonblank_content_after_exact_weights(tmp_path):
+    path = tmp_path / "WATER_iqa_O1.model"
+    _write_model(path, atom="O1", alf=(1, 2, 3))
+    path.write_text(
+        path.read_text(encoding="utf-8") + "unexpected trailing token\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    model = Model(path)
+    with pytest.raises(ValueError, match="unexpected content after FEREBUS weights"):
+        _ = model.weights
+
+
+def test_model_parser_requires_explicit_kernel_prefactor(tmp_path):
+    path = tmp_path / "WATER_iqa_O1.model"
+    _write_model(path, atom="O1", alf=(1, 2, 3))
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("prefactor 1.0\n", ""),
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    with pytest.raises(ValueError, match="missing kernel prefactor"):
+        _ = Model(path).weights
+
+
+def test_model_parser_requires_exact_kernel_section_count(tmp_path):
+    path = tmp_path / "WATER_iqa_O1.model"
+    _write_model(path, atom="O1", alf=(1, 2, 3))
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "number_of_kernels 1",
+            "number_of_kernels 2",
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    with pytest.raises(ValueError, match="kernel section count mismatch"):
+        _ = Model(path).weights
+
+
+def test_model_parser_rejects_unreferenced_kernel_sections(tmp_path):
+    path = tmp_path / "WATER_iqa_O1.model"
+    _write_model(path, atom="O1", alf=(1, 2, 3))
+    text = path.read_text(encoding="utf-8")
+    extra = (
+        "[kernel.k2]\n"
+        "type rbf\n"
+        "number_of_dimensions 3\n"
+        "active_dimensions 1 2 3\n"
+        "thetas 1.0 1.0 1.0\n\n"
+    )
+    text = text.replace("number_of_kernels 1", "number_of_kernels 2")
+    text = text.replace("[training_data]\n", extra + "[training_data]\n")
+    path.write_text(text, encoding="utf-8", newline="\n")
+
+    with pytest.raises(ValueError, match="composition/section coverage mismatch"):
+        _ = Model(path).weights
+
+
+def test_models_atom_names_are_canonical_and_stably_deduplicated(tmp_path):
+    paths = []
+    for filename, atom, alf in (
+        ("z_H3.model", "H3", (3, 1, 2)),
+        ("a_O1.model", "O1", (1, 2, 3)),
+        ("m_H2.model", "H2", (2, 1, 3)),
+        ("n_q00_H2.model", "H2", (2, 1, 3)),
+    ):
+        path = tmp_path / filename
+        _write_model(path, atom=atom, alf=alf)
+        paths.append(path)
+
+    models = Models.from_model_files(tmp_path, paths)
+
+    assert models.atom_names == ["O1", "H2", "H3"]

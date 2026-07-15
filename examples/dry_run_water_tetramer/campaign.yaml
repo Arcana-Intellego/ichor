@@ -21,8 +21,8 @@ runtime:
 # Initial labelled set before active learning.
 point_allocation:
   bootstrap_training_size: 4
-  bootstrap_internal_validation_size: 1
-  bootstrap_external_validation_size: 1
+  bootstrap_internal_validation_size: 2
+  bootstrap_external_validation_size: 2
   batch_training_size: 1
   batch_internal_validation_size: 1
 
@@ -69,10 +69,6 @@ aimall:
   encomp: 3
   boaq: auto_gs2
   iasmesh: medium
-
-ferebus:
-  feature_scaling: false
-  property_scaling: false
 
 quality_gates:
   ferebus_max_aggregate_ext_rmse_increase_fraction: 0.05

@@ -9,6 +9,8 @@ import numpy as np
 
 
 VARIANCE_NEGATIVE_TOLERANCE = 1.0e-10
+
+
 class ModelContractError(ValueError):
     """Raised when a staged or committed FEREBUS model set is not usable."""
 
@@ -214,7 +216,62 @@ def _model_attr(model: Any, name: str) -> Any:
     return value
 
 
-def _validate_model_object(model: Any, path: Path, task: FerebusTask, system: str) -> None:
+def _validate_kernel_family(kernel: Any, family: str, nfeats: int) -> None:
+    """Validate the exact native FEREBUS kernel topology for one public family."""
+    from ichor.core.models.kernels import PeriodicKernel, RBF, RBFCyclic
+    from ichor.core.models.kernels.kernel import KernelProd
+
+    all_dimensions = np.arange(nfeats, dtype=int)
+    if family == "rbf":
+        if type(kernel) is not RBF:
+            raise ModelContractError("model_kernel_family_mismatch:rbf")
+        active = np.asarray(kernel.active_dims, dtype=int).reshape(-1)
+        if not np.array_equal(active, all_dimensions):
+            raise ModelContractError("model_kernel_active_dims_mismatch:rbf")
+        if np.asarray(kernel.params, dtype=float).reshape(-1).size != nfeats:
+            raise ModelContractError("model_kernel_parameter_count_mismatch:rbf")
+        return
+
+    if family != "periodic_rbf":
+        raise ModelContractError("model_kernel_family_unsupported:" + repr(family))
+    if type(kernel) is not KernelProd:
+        raise ModelContractError("model_kernel_family_mismatch:periodic_rbf")
+    if type(kernel.k1) is not RBFCyclic or type(kernel.k2) is not PeriodicKernel:
+        raise ModelContractError("model_kernel_composition_mismatch:periodic_rbf")
+    periodic_dimensions = np.asarray(
+        [index for index in range(3, nfeats) if (index + 1) % 3 == 0],
+        dtype=int,
+    )
+    periodic_dimension_set = set(periodic_dimensions.tolist())
+    cyclic_dimensions = np.asarray(
+        [index for index in range(nfeats) if index not in periodic_dimension_set],
+        dtype=int,
+    )
+    if not np.array_equal(
+        np.asarray(kernel.k1.active_dims, dtype=int).reshape(-1),
+        cyclic_dimensions,
+    ):
+        raise ModelContractError("model_kernel_active_dims_mismatch:rbf_cyclic")
+    if not np.array_equal(
+        np.asarray(kernel.k2.active_dims, dtype=int).reshape(-1),
+        periodic_dimensions,
+    ):
+        raise ModelContractError("model_kernel_active_dims_mismatch:periodic")
+    if np.asarray(kernel.k1.params, dtype=float).reshape(-1).size != cyclic_dimensions.size:
+        raise ModelContractError("model_kernel_parameter_count_mismatch:rbf_cyclic")
+    periodic_params = getattr(kernel.k2, "_thetas", np.asarray([], dtype=float))
+    if np.asarray(periodic_params, dtype=float).reshape(-1).size != periodic_dimensions.size:
+        raise ModelContractError("model_kernel_parameter_count_mismatch:periodic")
+
+
+def _validate_model_object(
+    model: Any,
+    path: Path,
+    task: FerebusTask,
+    system: str,
+    *,
+    kernel_family: Optional[str] = None,
+) -> None:
     system_name = str(_model_attr(model, "system_name"))
     atom = str(_model_attr(model, "atom"))
     prop = str(_model_attr(model, "type"))
@@ -255,22 +312,39 @@ def _validate_model_object(model: Any, path: Path, task: FerebusTask, system: st
         raise ModelContractError("model_kernel_missing")
     params = getattr(kernel, "params", None)
     if params is not None:
-        _as_finite_array(params, "model_kernel_params")
+        finite_params = _as_finite_array(params, "model_kernel_params")
+        if np.any(finite_params < 0.0):
+            raise ModelContractError("model_kernel_parameter_negative")
     active_dims = np.asarray(getattr(kernel, "active_dims", []), dtype=int).reshape(-1)
     if active_dims.size and (active_dims.min() < 0 or active_dims.max() >= nfeats):
         raise ModelContractError("model_kernel_active_dims_mismatch")
+    prefactor = float(_model_attr(model, "kernel_prefactor"))
+    if not np.isfinite(prefactor) or prefactor <= 0.0:
+        raise ModelContractError("model_kernel_prefactor_invalid")
+    jitter = float(_model_attr(model, "jitter"))
+    if not np.isfinite(jitter) or jitter < 0.0:
+        raise ModelContractError("model_jitter_invalid")
+    if kernel_family is not None:
+        _validate_kernel_family(kernel, str(kernel_family), nfeats)
 
-    _as_finite_array(_model_attr(model, "R"), "model_covariance")
-    _as_finite_array(_model_attr(model, "lower_cholesky"), "model_cholesky")
+    # Admission must stay bounded in ntrain. Native FEREBUS has already built
+    # and reported the dense training factorisation in its authenticated .perf
+    # receipt; the daemon only probes the serialised prediction contract here.
     probe = x[: min(1, ntrain)]
+    prior_diag = _as_finite_array(
+        model.prior_variance_diagonal(probe),
+        "model_prior_variance_diagonal",
+    )
+    cross = _as_finite_array(model.r(probe), "model_cross_covariance")
+    if prior_diag.shape != (probe.shape[0],):
+        raise ModelContractError("model_prior_variance_diagonal_shape_mismatch")
+    if cross.shape != (ntrain, probe.shape[0]):
+        raise ModelContractError("model_cross_covariance_shape_mismatch")
+    if np.any(prior_diag < -VARIANCE_NEGATIVE_TOLERANCE):
+        raise ModelContractError("model_prior_variance_negative")
     pred = _as_finite_array(model.predict(probe), "model_predict")
-    var = _as_finite_array(model.variance(probe), "model_variance")
     if pred.reshape(-1).shape[0] != probe.shape[0]:
         raise ModelContractError("model_predict_shape_mismatch")
-    if var.reshape(-1).shape[0] != probe.shape[0]:
-        raise ModelContractError("model_variance_shape_mismatch")
-    if np.any(var < -VARIANCE_NEGATIVE_TOLERANCE):
-        raise ModelContractError("model_variance_negative")
 
 
 def validate_imported_model_file(
@@ -306,6 +380,7 @@ def validate_imported_model_file(
                 contract=prior_contract,
                 property_name=property_name,
                 atom=atom,
+                training_values=np.asarray(model.y, dtype=float).reshape(-1),
             )
     except ModelContractError:
         raise
@@ -382,6 +457,10 @@ def validate_ferebus_model_contract(
                 + str(exc)
             ) from exc
     system = str(manifest.get("system"))
+    kernel_contract = manifest.get("kernel_contract")
+    if not isinstance(kernel_contract, Mapping):
+        raise ModelContractError("ferebus_kernel_contract_missing")
+    kernel_family = str(kernel_contract.get("family") or "")
     tasks = _manifest_tasks(manifest)
     if not committed:
         for raw_task in manifest.get("tasks", []):
@@ -403,13 +482,14 @@ def validate_ferebus_model_contract(
         {} if model_set is None else {task.key: task for task in model_set.tasks}
     )
     expected_models = set()
-    model_paths: List[Tuple[FerebusTask, Path]] = []
+    model_paths: List[Tuple[FerebusTask, Path, Path]] = []
     raw_tasks_by_key = {
         (str(item.get("property")), str(item.get("atom"))): item
         for item in manifest.get("tasks", [])
         if isinstance(item, Mapping)
     }
     for task in tasks:
+        raw_task = raw_tasks_by_key.get(task.key, {})
         if committed:
             committed_task = committed_tasks.get(task.key)
             if committed_task is None:
@@ -421,11 +501,17 @@ def validate_ferebus_model_contract(
                 )
             config_path = committed_task.config.path
             model_path = committed_task.model.path
+            training_path = committed_task.datasets["train"].path
         else:
             config_path = _config_path_for(root, task, committed=False)
             model_path = _model_path_for(root, task, committed=False)
             config_path = _resolve_under(root, config_path, "ferebus_config")
             model_path = _resolve_under(root, model_path, "ferebus_model")
+            training_path = _resolve_under(
+                root,
+                Path(str(raw_task.get("training_csv") or "")),
+                "ferebus_training_csv",
+            )
         expected_models.add(model_path.resolve())
         if not config_path.is_file():
             raise ModelContractError("ferebus_config_missing: " + str(config_path))
@@ -456,21 +542,66 @@ def validate_ferebus_model_contract(
             raise ModelContractError("expected_model_missing: " + str(model_path))
         if model_path.stat().st_size <= 0:
             raise ModelContractError("model_file_empty")
-        model_paths.append((task, model_path))
+        model_paths.append((task, model_path, training_path))
 
     parsed_models: Dict[Tuple[str, str], Any] = {}
-    for task, model_path in model_paths:
+    for task, model_path, training_path in model_paths:
+        raw_task = raw_tasks_by_key.get(task.key, {})
         declared_ntrain = _declared_ntrain(model_path)
         if declared_ntrain is not None:
             _check_section_rows(model_path, declared_ntrain)
         try:
             model = Model(model_path)
-            _validate_model_object(model, model_path, task, system)
+            _validate_model_object(
+                model,
+                model_path,
+                task,
+                system,
+                kernel_family=kernel_family,
+            )
+            from .ferebus_dataset import iter_feature_target_chunks
+
+            model_x = np.asarray(model.x, dtype=float)
+            training_values = np.asarray(model.y, dtype=float).reshape(-1)
+            offset = 0
+            for training_features, targets in iter_feature_target_chunks(
+                training_path,
+                task.property,
+            ):
+                stop = offset + int(targets.shape[0])
+                if (
+                    stop > model_x.shape[0]
+                    or training_features.shape != model_x[offset:stop].shape
+                    or not np.allclose(
+                        training_features,
+                        model_x[offset:stop],
+                        rtol=0.0,
+                        atol=1.0e-12,
+                    )
+                    or not np.allclose(
+                        targets,
+                        training_values[offset:stop],
+                        rtol=0.0,
+                        atol=1.0e-12,
+                    )
+                ):
+                    raise ModelContractError("model_training_data_binding_mismatch")
+                offset = stop
+            if offset != model_x.shape[0] or offset != training_values.shape[0]:
+                raise ModelContractError("model_training_data_binding_mismatch")
             validate_model_prior_mean(
                 model,
                 contract=prior_contract,
                 property_name=task.property,
                 atom=task.atom,
+                training_values=training_values,
+                expected_mean_ha=(
+                    (raw_task.get("prior_mean") or {}).get(
+                        "expected_mean_ha"
+                    )
+                    if committed
+                    else None
+                ),
             )
             parsed_models[task.key] = model
         except ModelContractError:
