@@ -618,26 +618,18 @@ class DryRunPhaseExecutor:
                 return 1.0 if atoms_a is atoms_b else 0.0
         return _UniformPosterior()
 
-    def _seed_selection_score_transform(self):
-        """Optional calibrated score transform for D-optimal seed ranking.
-
-        This is deliberately cheap: it maps the already-computed total
-        posterior variance through the global empirical calibration table.
-        Missing, sparse, record-only, or malformed calibration falls back to
-        raw posterior variance.
-        """
+    def _seed_selection_score_transform(self, resolved_protocol):
+        """Return the score transform frozen into this iteration's protocol."""
         try:
-            from .error_calibration import (
-                load_calibration_model_for_acquisition,
-                lookup_calibrated_abs_error,
-            )
+            from .error_calibration import lookup_calibrated_abs_error
 
-            model, reason = load_calibration_model_for_acquisition(
-                self.campaign_dir,
-                self.config,
+            snapshot = dict(resolved_protocol.error_calibration_snapshot or {})
+            model = snapshot.get("model")
+            reason = str(
+                snapshot.get("model_reason") or "missing_frozen_snapshot"
             )
-            if model is None:
-                return None, reason
+            if not isinstance(model, dict):
+                return None, reason, snapshot
 
             def _transform(
                 _selection_index: int,
@@ -650,9 +642,10 @@ class DryRunPhaseExecutor:
                     application_uncertainty_scale=population_variance_scale,
                 )
 
-            return _transform, "loaded"
+            return _transform, "loaded_frozen_snapshot", snapshot
         except Exception as exc:
-            return None, "error:" + type(exc).__name__
+            return None, "error:" + type(exc).__name__, {}
+
 
     def _ensure_dry_run_trajectory_pool(self):
         """Create a deterministic canonical pool when a dry campaign has none."""
@@ -815,6 +808,13 @@ class DryRunPhaseExecutor:
         ensure_index(self.campaign_dir)
         # refresh reference scales per acquisition.references.refresh_policy.
         self._maybe_refresh_reference_scales(state)
+        from ..sampling_protocol import resolve_or_load_sampling_protocol
+
+        resolved_protocol = resolve_or_load_sampling_protocol(
+            self.campaign_dir,
+            self.config,
+            iteration=int(state.iteration),
+        )
 
         pool = self._ensure_dry_run_trajectory_pool()
 
@@ -859,9 +859,16 @@ class DryRunPhaseExecutor:
 
         posterior = self._seed_selection_posterior(state, training_atoms)
         if str(self.config.seed_selection.strategy) == "d_optimal":
-            score_transform, score_transform_reason = self._seed_selection_score_transform()
+            (
+                score_transform,
+                score_transform_reason,
+                calibration_snapshot,
+            ) = self._seed_selection_score_transform(resolved_protocol)
         else:
             score_transform, score_transform_reason = None, "strategy_hybrid_variance"
+            calibration_snapshot = dict(
+                resolved_protocol.error_calibration_snapshot or {}
+            )
 
         from ..randomness import derive_rng_seed
 
@@ -959,7 +966,9 @@ class DryRunPhaseExecutor:
                 origin = "unknown"
             variance_value = None
             if seed_position < len(selection.variances):
-                variance_value = float(selection.variances[seed_position])
+                raw_variance = selection.variances[seed_position]
+                if raw_variance is not None:
+                    variance_value = float(raw_variance)
             record = {
                 "seed_id": int(seed_id),
                 "frame_id": frame_id if isinstance(frame_id, int) else None,
@@ -1022,6 +1031,12 @@ class DryRunPhaseExecutor:
                 else "posterior_variance"
             ),
             "score_source_reason": str(score_transform_reason),
+            "calibration_snapshot_model_sha256": calibration_snapshot.get(
+                "model_sha256"
+            ),
+            "calibration_context_sha256": calibration_snapshot.get(
+                "calibration_context_sha256"
+            ),
         })
         diagnostics_payload = {
             "iteration": int(state.iteration),
@@ -1042,6 +1057,12 @@ class DryRunPhaseExecutor:
                 else "posterior_variance"
             ),
             "score_source_reason": str(score_transform_reason),
+            "calibration_snapshot_model_sha256": calibration_snapshot.get(
+                "model_sha256"
+            ),
+            "calibration_context_sha256": calibration_snapshot.get(
+                "calibration_context_sha256"
+            ),
             "trajectory_sha256": pool.sha256,
             "selected": seed_records,
             "summary": dict(selection.diagnostics),
@@ -1600,6 +1621,23 @@ class DryRunPhaseExecutor:
         audit_manifest, audit_manifest_sha256 = protocol_binding(
             resolved_protocol.audit_manifest_path
         )
+        from ..ferebus_prior import resolve_ferebus_prior_contract
+        from .error_calibration_contract import (
+            active_environment_binding,
+            calibration_context_sha256,
+        )
+
+        prior_contract_hash = resolve_ferebus_prior_contract(
+            self.config
+        ).contract_sha256
+        calibration_environment = active_environment_binding(self.campaign_dir)
+        calibration_context = calibration_context_sha256(
+            self.config,
+            prior_mean_contract_sha256=prior_contract_hash,
+            environment_generation_digest_sha256=calibration_environment[
+                "generation_digest_sha256"
+            ],
+        )
         for array_task_id, (task, seed_record) in enumerate(zip(tasks, seed_records)):
             seed_id = int(task["seed_id"])
             seed_uid = str(task["seed_uid"])
@@ -1672,17 +1710,27 @@ class DryRunPhaseExecutor:
                     "randomness": ariadne_rng.to_dict(),
                 })
                 if isinstance(result_payload.get("selection_diagnostics"), dict):
-                    from ..ferebus_prior import resolve_ferebus_prior_contract
-
                     result_payload["selection_diagnostics"].update({
                         "model_version": int(state.models_version),
-                        "prior_mean_contract_sha256": (
-                            resolve_ferebus_prior_contract(self.config).contract_sha256
+                        "model_set_sha256": str(
+                            picked_payload["model_manifest_sha256"]
                         ),
+                        "prior_mean_contract_sha256": prior_contract_hash,
+                        "environment_generation": int(
+                            calibration_environment["generation"]
+                        ),
+                        "environment_generation_digest_sha256": str(
+                            calibration_environment["generation_digest_sha256"]
+                        ),
+                        "calibration_context_sha256": calibration_context,
+                        "sampling_protocol_sha256": resolved_manifest_sha256,
                         "seed_id": seed_id,
                         "seed_uid": seed_uid,
                         "array_task_id": array_task_id,
                         "seed_frame_id": seed_frame_id,
+                        "result_json": result_path.resolve().relative_to(
+                            self.campaign_dir.resolve()
+                        ).as_posix(),
                     })
                 staging_dir = seed_dir.parent / ("." + seed_dir.name + ".partial-dry")
                 if staging_dir.exists() and not staging_dir.is_symlink():
@@ -1761,9 +1809,23 @@ class DryRunPhaseExecutor:
                 return_code=int(result_payload.get("return_code") or 0),
             )
             if isinstance(result_payload.get("selection_diagnostics"), dict):
+                diagnostic_payload = dict(result_payload["selection_diagnostics"])
+                diagnostic_payload.update({
+                    "model_set_sha256": str(picked_payload["model_manifest_sha256"]),
+                    "prior_mean_contract_sha256": prior_contract_hash,
+                    "environment_generation": int(calibration_environment["generation"]),
+                    "environment_generation_digest_sha256": str(
+                        calibration_environment["generation_digest_sha256"]
+                    ),
+                    "calibration_context_sha256": calibration_context,
+                    "sampling_protocol_sha256": resolved_manifest_sha256,
+                    "result_json": result_path.resolve().relative_to(
+                        self.campaign_dir.resolve()
+                    ).as_posix(),
+                })
                 enrich_with_error_calibration_input(
                     seed_dir,
-                    dict(result_payload["selection_diagnostics"]),
+                    diagnostic_payload,
                 )
             #synthesise a placeholder whitened distance from the
             # alpha change during ARIADNE descent; threshold against the
@@ -2776,8 +2838,15 @@ class DryRunPhaseExecutor:
                     write_iteration_audit,
                 )
                 from ..ferebus_prior import resolve_ferebus_prior_contract
+                from .error_calibration_contract import active_environment_binding
+                from ..sampling_protocol import resolve_or_load_sampling_protocol
+                from ..versioning.manifest import sha256_file
 
                 try:
+                    environment = active_environment_binding(self.campaign_dir)
+                    protocol = resolve_or_load_sampling_protocol(
+                        self.campaign_dir, self.config, int(state.iteration)
+                    )
                     synthetic = synthetic_dry_records(
                         iteration=int(state.iteration),
                         models_version=int(getattr(state, "models_version", -1)),
@@ -2787,6 +2856,11 @@ class DryRunPhaseExecutor:
                         ),
                         prior_mean_contract_sha256=(
                             resolve_ferebus_prior_contract(self.config).contract_sha256
+                        ),
+                        config=self.config,
+                        environment_binding=environment,
+                        sampling_protocol_sha256=sha256_file(
+                            protocol.manifest_path
                         ),
                     )
                     all_records, added, duplicate = append_records(
@@ -2798,6 +2872,7 @@ class DryRunPhaseExecutor:
                         self.config,
                         iteration=int(state.iteration),
                         current_model_version=int(getattr(state, "models_version", -1)),
+                        environment_binding=environment,
                     )
                     model_path = write_calibration_model(self.campaign_dir, model)
                     iter_dir = self._iter_dir(state.iteration)

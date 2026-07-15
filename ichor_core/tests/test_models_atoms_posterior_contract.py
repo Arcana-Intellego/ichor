@@ -92,6 +92,19 @@ def test_total_energy_posterior_accepts_atoms_frames_with_real_models(tmp_path):
     assert np.all(np.isfinite(variances))
 
 
+def test_production_model_cholesky_and_identity_are_stable(tmp_path):
+    model = Model(_model_dir(tmp_path) / "WATER_iqa_O1.model")
+
+    identity = model.numeric_identity
+    first = model.lower_cholesky
+    second = model.lower_cholesky
+
+    assert len(identity) == 64
+    assert model.numeric_identity == identity
+    assert first is second
+    assert not first.flags.writeable
+
+
 def test_total_energy_posterior_rejects_non_finite_feature_values(tmp_path):
     posterior = TotalEnergyPosterior(Models(_model_dir(tmp_path)))
     frame = _atoms()

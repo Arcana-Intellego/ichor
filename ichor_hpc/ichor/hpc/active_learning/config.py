@@ -87,7 +87,6 @@ __all__ = [
     "VALID_SIZE_NORMALISATION_BARRIER_MODES",
     "VALID_ACQUISITION_DRIVER_OBJECTIVES",
     "VALID_ACQUISITION_DRIVER_GRADIENT_BACKENDS",
-    "VALID_ERROR_CALIBRATION_MODEL_VERSION_POLICIES",
     "VALID_TRQN_SCALE_MODES",
     "VALID_TRQN_BACKTRANSFORM_MODES",
     "VALID_TRQN_GEODESIC_BT_MODES",
@@ -166,9 +165,6 @@ VALID_GRADIENT_MODES = frozenset({"cartesian_fd", "active_fd"})
 VALID_MODE_WEIGHTING_POLICIES = frozenset({"variance", "inverse_frequency", "uniform"})
 VALID_GRADIENT_PARALLEL_BACKENDS = frozenset({"serial", "thread", "process"})
 VALID_ERROR_CALIBRATION_MODES = frozenset({"record_only", "apply_to_acquisition"})
-VALID_ERROR_CALIBRATION_MODEL_VERSION_POLICIES = frozenset(
-    {"current", "all", "rolling_normalised"}
-)
 VALID_SPECTRAL_MODES = frozenset({"off", "record_only", "blend"})
 VALID_CALIBRATED_ENERGY_UTILITIES = frozenset({"log", "banded"})
 VALID_SIZE_NORMALISATION_ENERGY_MODES = frozenset({"raw_total", "per_sqrt_atom"})
@@ -508,10 +504,10 @@ class AcquisitionSpectralBlock:
 @dataclass
 class AcquisitionCalibratedEnergyBlock:
     utility: str = "banded"
-    band_low_ha: Optional[float] = None
-    band_high_ha: Optional[float] = None
-    low_softness_ha: Optional[float] = None
-    high_softness_ha: Optional[float] = None
+    band_low_ha_per_sqrt_atom: Optional[float] = None
+    band_high_ha_per_sqrt_atom: Optional[float] = None
+    low_softness_ha_per_sqrt_atom: Optional[float] = None
+    high_softness_ha_per_sqrt_atom: Optional[float] = None
     fallback_to_raw_variance: bool = True
 
 
@@ -738,14 +734,10 @@ class ErrorCalibrationConfigBlock:
     min_bin_records: int = 8
     max_records: int = 5000
     max_model_age_iterations: int = 10
-    monotone_estimator: bool = True
     quantile: float = 0.75
     apply_strength: float = 0.0
     group_by_atom_type: bool = True
     group_by_landing_policy: bool = False
-    model_version_policy: str = "rolling_normalised"
-    aggressiveness_match_required: bool = True
-    output_units: str = "ha"
 
 
 @dataclass
@@ -1871,10 +1863,6 @@ class CampaignConfig:
             "error_calibration.max_model_age_iterations",
             calib.max_model_age_iterations,
         )
-        if not isinstance(calib.monotone_estimator, bool):
-            raise ConfigValidationError(
-                "error_calibration.monotone_estimator must be a boolean"
-            )
         if isinstance(calib.quantile, bool) or not isinstance(
             calib.quantile, (int, float)
         ):
@@ -1898,17 +1886,6 @@ class CampaignConfig:
         if not isinstance(calib.group_by_landing_policy, bool):
             raise ConfigValidationError(
                 "error_calibration.group_by_landing_policy must be a boolean"
-            )
-        if calib.output_units != "ha":
-            raise ConfigValidationError("error_calibration.output_units must be 'ha'")
-        if calib.model_version_policy not in VALID_ERROR_CALIBRATION_MODEL_VERSION_POLICIES:
-            raise ConfigValidationError(
-                "error_calibration.model_version_policy must be one of "
-                + repr(sorted(VALID_ERROR_CALIBRATION_MODEL_VERSION_POLICIES))
-            )
-        if not isinstance(calib.aggressiveness_match_required, bool):
-            raise ConfigValidationError(
-                "error_calibration.aggressiveness_match_required must be a boolean"
             )
         max_acquisition_grad = (
             self.acquisition.gradient.max_acquisition_grad_per_ang
@@ -2165,27 +2142,27 @@ class CampaignConfig:
                 "acquisition.calibrated_energy.fallback_to_raw_variance must be a boolean"
             )
         for name, value in (
-            ("acquisition.calibrated_energy.band_low_ha", cal_energy.band_low_ha),
-            ("acquisition.calibrated_energy.band_high_ha", cal_energy.band_high_ha),
-            ("acquisition.calibrated_energy.low_softness_ha", cal_energy.low_softness_ha),
-            ("acquisition.calibrated_energy.high_softness_ha", cal_energy.high_softness_ha),
+            ("acquisition.calibrated_energy.band_low_ha_per_sqrt_atom", cal_energy.band_low_ha_per_sqrt_atom),
+            ("acquisition.calibrated_energy.band_high_ha_per_sqrt_atom", cal_energy.band_high_ha_per_sqrt_atom),
+            ("acquisition.calibrated_energy.low_softness_ha_per_sqrt_atom", cal_energy.low_softness_ha_per_sqrt_atom),
+            ("acquisition.calibrated_energy.high_softness_ha_per_sqrt_atom", cal_energy.high_softness_ha_per_sqrt_atom),
         ):
             _validate_optional_nonnegative_float(name, value)
         if (
-            cal_energy.band_low_ha is not None
-            and cal_energy.band_high_ha is not None
-            and float(cal_energy.band_high_ha) <= float(cal_energy.band_low_ha)
+            cal_energy.band_low_ha_per_sqrt_atom is not None
+            and cal_energy.band_high_ha_per_sqrt_atom is not None
+            and float(cal_energy.band_high_ha_per_sqrt_atom) <= float(cal_energy.band_low_ha_per_sqrt_atom)
         ):
             raise ConfigValidationError(
-                "acquisition.calibrated_energy.band_high_ha must be > band_low_ha"
+                "acquisition.calibrated_energy.band_high_ha_per_sqrt_atom must be > band_low_ha_per_sqrt_atom"
             )
-        if cal_energy.band_high_ha is not None and float(cal_energy.band_high_ha) <= 0.0:
+        if cal_energy.band_high_ha_per_sqrt_atom is not None and float(cal_energy.band_high_ha_per_sqrt_atom) <= 0.0:
             raise ConfigValidationError(
-                "acquisition.calibrated_energy.band_high_ha must be > 0"
+                "acquisition.calibrated_energy.band_high_ha_per_sqrt_atom must be > 0"
             )
         for name, value in (
-            ("acquisition.calibrated_energy.low_softness_ha", cal_energy.low_softness_ha),
-            ("acquisition.calibrated_energy.high_softness_ha", cal_energy.high_softness_ha),
+            ("acquisition.calibrated_energy.low_softness_ha_per_sqrt_atom", cal_energy.low_softness_ha_per_sqrt_atom),
+            ("acquisition.calibrated_energy.high_softness_ha_per_sqrt_atom", cal_energy.high_softness_ha_per_sqrt_atom),
         ):
             if value is not None and float(value) <= 0.0:
                 raise ConfigValidationError(name + " must be > 0")
@@ -2472,10 +2449,10 @@ class CampaignConfig:
             ),
             calibrated_energy=CalibratedEnergyConfig(
                 utility=ce.utility,
-                band_low_ha=ce.band_low_ha,
-                band_high_ha=ce.band_high_ha,
-                low_softness_ha=ce.low_softness_ha,
-                high_softness_ha=ce.high_softness_ha,
+                band_low_ha_per_sqrt_atom=ce.band_low_ha_per_sqrt_atom,
+                band_high_ha_per_sqrt_atom=ce.band_high_ha_per_sqrt_atom,
+                low_softness_ha_per_sqrt_atom=ce.low_softness_ha_per_sqrt_atom,
+                high_softness_ha_per_sqrt_atom=ce.high_softness_ha_per_sqrt_atom,
                 fallback_to_raw_variance=ce.fallback_to_raw_variance,
             ),
             fullspace_confinement=FullspaceConfinementConfig(

@@ -1151,10 +1151,10 @@ def _selection_prediction_diagnostics(
             if breakdown.banded_energy_risk is None
             else float(breakdown.banded_energy_risk)
         ),
-        "calibrated_expected_iqa_error_ha": (
+        "calibrated_expected_iqa_error_ha_per_sqrt_atom": (
             None
-            if breakdown.calibrated_expected_iqa_error_ha is None
-            else float(breakdown.calibrated_expected_iqa_error_ha)
+            if breakdown.calibrated_expected_iqa_error_ha_per_sqrt_atom is None
+            else float(breakdown.calibrated_expected_iqa_error_ha_per_sqrt_atom)
         ),
         "calibration_applied": bool(breakdown.calibration_applied),
         "spectral_frequency_risk": (
@@ -1617,7 +1617,7 @@ def _mock_optimise_seed(
         "raw_energy_risk": float(sum(r["raw_variance"] for r in per_atom)),
         "energy_risk": float(sum(r["raw_variance"] for r in per_atom)),
         "banded_energy_risk": None,
-        "calibrated_expected_iqa_error_ha": None,
+        "calibrated_expected_iqa_error_ha_per_sqrt_atom": None,
         "calibration_applied": False,
         "spectral_frequency_risk": 0.0,
         "legacy_frequency_risk": 0.0,

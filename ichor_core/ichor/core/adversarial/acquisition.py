@@ -9,6 +9,7 @@ from ichor.core.atoms import Atoms
 from ichor.core.files.xyz import Trajectory
 from ichor.core.models.models import Models
 
+from .error_calibration import finite_non_negative, lookup_calibrated_error
 from .barrier import ChemistryBarrierState, build_chemistry_barrier_state, chemistry_barrier_value
 from .config import AcquisitionConfig
 from .geometry import (
@@ -76,7 +77,7 @@ class AcquisitionBreakdown:
     energy_variance: float
     raw_energy_risk: Optional[float] = None
     banded_energy_risk: Optional[float] = None
-    calibrated_expected_iqa_error_ha: Optional[float] = None
+    calibrated_expected_iqa_error_ha_per_sqrt_atom: Optional[float] = None
     calibration_applied: bool = False
     spectral_frequency_risk: Optional[float] = None
     legacy_frequency_risk: Optional[float] = None
@@ -120,31 +121,6 @@ def _finite_positive_float(value, default: Optional[float] = None) -> Optional[f
     return out
 
 
-def _lookup_table_error(table: Mapping[str, object], raw_uncertainty: float) -> Optional[float]:
-    bins = table.get("bins") if isinstance(table, Mapping) else None
-    if not isinstance(bins, list) or not bins:
-        return None
-    raw = float(raw_uncertainty)
-    if not np.isfinite(raw):
-        return None
-    last_value = None
-    for entry in bins:
-        if not isinstance(entry, Mapping):
-            continue
-        value = _finite_positive_float(
-            entry.get("calibrated_abs_error_ha"),
-            _finite_positive_float(entry.get("median_abs_error_ha")),
-        )
-        if value is None:
-            continue
-        last_value = value
-        hi = _finite_positive_float(entry.get("raw_uncertainty_max"), None)
-        if hi is None:
-            continue
-        if raw <= hi:
-            return value
-    return last_value
-
 
 def _lookup_calibrated_error(
     model: Optional[Mapping[str, object]],
@@ -153,24 +129,11 @@ def _lookup_calibrated_error(
     total_variance: float,
     application_uncertainty_scale: Optional[float] = None,
 ) -> Optional[float]:
-    if not isinstance(model, Mapping):
-        return None
-    tables = model.get("tables")
-    if not isinstance(tables, Mapping):
-        return None
-
-    total_table = tables.get("global_total")
-    if isinstance(total_table, Mapping):
-        lookup_variance = float(total_variance)
-        if str(model.get("uncertainty_axis", "raw")) == "model_normalised":
-            scale = _finite_positive_float(application_uncertainty_scale)
-            if scale is None:
-                return None
-            lookup_variance /= float(scale)
-        total_value = _lookup_table_error(total_table, lookup_variance)
-        if total_value is not None:
-            return float(total_value)
-    return None
+    return lookup_calibrated_error(
+        model,
+        total_variance,
+        application_uncertainty_scale=application_uncertainty_scale,
+    )
 
 
 def _sigmoid(x: float) -> float:
@@ -203,9 +166,8 @@ def _calibration_error_values(model: Optional[Mapping[str, object]]) -> List[flo
     for entry in bins:
         if not isinstance(entry, Mapping):
             continue
-        value = _finite_positive_float(
-            entry.get("calibrated_abs_error_ha"),
-            _finite_positive_float(entry.get("median_abs_error_ha")),
+        value = finite_non_negative(
+            entry.get("calibrated_abs_error_ha_per_sqrt_atom")
         )
         if value is not None:
             values.append(float(value))
@@ -364,12 +326,12 @@ class SeedLocalAdversarialAcquisition:
         cfg = self.config.calibrated_energy
         reasons: List[str] = []
         try:
-            low = None if cfg.band_low_ha is None else float(cfg.band_low_ha)
+            low = None if cfg.band_low_ha_per_sqrt_atom is None else float(cfg.band_low_ha_per_sqrt_atom)
         except (TypeError, ValueError):
             low = None
         if low is not None and (not np.isfinite(low) or low < 0.0):
             low = None
-        high = _finite_positive_float(cfg.band_high_ha)
+        high = _finite_positive_float(cfg.band_high_ha_per_sqrt_atom)
         if low is None or high is None:
             inferred = _infer_bands_from_calibration_model(self.error_calibration_model)
             if inferred is not None:
@@ -380,8 +342,8 @@ class SeedLocalAdversarialAcquisition:
         if high <= low:
             return None, tuple(reasons + ["banded_energy_invalid_bands"])
         width = max(high - low, 1.0e-12)
-        low_soft = _finite_positive_float(cfg.low_softness_ha, width / 4.0)
-        high_soft = _finite_positive_float(cfg.high_softness_ha, width / 4.0)
+        low_soft = _finite_positive_float(cfg.low_softness_ha_per_sqrt_atom, width / 4.0)
+        high_soft = _finite_positive_float(cfg.high_softness_ha_per_sqrt_atom, width / 4.0)
         return (
             (float(low), float(high), float(low_soft), float(high_soft)),
             tuple(reasons),
@@ -889,7 +851,7 @@ class SeedLocalAdversarialAcquisition:
             "residual": _median_or_zero(residual_vals) + floor,
             "rmsd": _median_or_zero(rmsd_vals) + floor,
             "calibrated_error": _finite_positive_float(
-                self.error_calibration_model.get("reference_error_ha")
+                self.error_calibration_model.get("reference_error_ha_per_sqrt_atom")
                 if isinstance(self.error_calibration_model, Mapping)
                 else None,
                 _median_or_zero(energy_vars) + floor,
@@ -1156,13 +1118,13 @@ class SeedLocalAdversarialAcquisition:
             )
             if calibrated_error is not None:
                 scale = _finite_positive_float(
-                    self.error_calibration_model.get("reference_error_ha")
+                    self.error_calibration_model.get("reference_error_ha_per_sqrt_atom")
                     if isinstance(self.error_calibration_model, Mapping)
                     else None,
-                    self._reference_scale("calibrated_error", self.reference_scales["energy"]) / max(energy_norm, 1.0e-12),
+                    self._reference_scale("calibrated_error", self.reference_scales["energy"]),
                 )
                 calibrated_risk, banded_energy_risk, energy_reasons = self._energy_utility(
-                    float(calibrated_error) / max(energy_norm, 1.0e-12),
+                    float(calibrated_error),
                     float(scale),
                 )
                 fallback_reasons.extend(energy_reasons)
@@ -1235,7 +1197,7 @@ class SeedLocalAdversarialAcquisition:
             banded_energy_risk=(
                 None if banded_energy_risk is None else float(banded_energy_risk)
             ),
-            calibrated_expected_iqa_error_ha=(
+            calibrated_expected_iqa_error_ha_per_sqrt_atom=(
                 None if calibrated_error is None else float(calibrated_error)
             ),
             calibration_applied=bool(calibration_applied),
@@ -1367,13 +1329,13 @@ class SeedLocalAdversarialAcquisition:
             )
             if calibrated_error is not None:
                 scale = _finite_positive_float(
-                    self.error_calibration_model.get("reference_error_ha")
+                    self.error_calibration_model.get("reference_error_ha_per_sqrt_atom")
                     if isinstance(self.error_calibration_model, Mapping)
                     else None,
-                    self._reference_scale("calibrated_error", self.reference_scales["energy"]) / max(energy_norm, 1.0e-12),
+                    self._reference_scale("calibrated_error", self.reference_scales["energy"]),
                 )
                 calibrated_risk, banded_energy_risk, energy_reasons = self._energy_utility(
-                    float(calibrated_error) / max(energy_norm, 1.0e-12),
+                    float(calibrated_error),
                     float(scale),
                 )
                 fallback_reasons.extend(energy_reasons)
@@ -1445,7 +1407,7 @@ class SeedLocalAdversarialAcquisition:
             banded_energy_risk=(
                 None if banded_energy_risk is None else float(banded_energy_risk)
             ),
-            calibrated_expected_iqa_error_ha=(
+            calibrated_expected_iqa_error_ha_per_sqrt_atom=(
                 None if calibrated_error is None else float(calibrated_error)
             ),
             calibration_applied=bool(calibration_applied),

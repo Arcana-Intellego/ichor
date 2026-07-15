@@ -43,8 +43,6 @@ resources:
 error_calibration:
   mode: record_only
   min_model_versions_to_apply: 2
-  model_version_policy: rolling_normalised
-  aggressiveness_match_required: true
 
 quality_gates:
   ferebus_max_aggregate_ext_rmse_increase_fraction: 0.05

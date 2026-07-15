@@ -619,7 +619,7 @@ def format_sampling_protocol_summary(
     lines.append(_line("error_calibration.enabled", calib.enabled))
     lines.append(_line("error_calibration.mode", calib.mode))
     lines.append(_line("error_calibration.apply_strength", calib.apply_strength))
-    lines.append(_line("error_calibration.model_version_policy", calib.model_version_policy))
+    lines.append(_line("error_calibration.model_policy", "rolling_normalised (fixed)"))
     lines.append(
         _line("error_calibration.min_records_to_apply", calib.min_records_to_apply)
     )
@@ -629,12 +629,7 @@ def format_sampling_protocol_summary(
             calib.min_model_versions_to_apply,
         )
     )
-    lines.append(
-        _line(
-            "error_calibration.aggressiveness_match_required",
-            calib.aggressiveness_match_required,
-        )
-    )
+    lines.append(_line("error_calibration.aggressiveness_match", "required (fixed)"))
     lines.append(_line("error_calibration.max_records", calib.max_records))
     lines.append(
         _line(
@@ -642,7 +637,8 @@ def format_sampling_protocol_summary(
             calib.max_model_age_iterations,
         )
     )
-    lines.append(_line("error_calibration.monotone_estimator", calib.monotone_estimator))
+    lines.append(_line("error_calibration.estimator", "grouped isotonic quantile (fixed)"))
+    lines.append(_line("error_calibration.output_units", "Ha/sqrt(atom) (fixed)"))
     lines.append(_line("error_calibration.quantile", calib.quantile))
     lines.append(_line("resources.defaults.partition", resources.defaults.partition))
     lines.append(_line("resources.defaults.walltime_hours", resources.defaults.walltime_hours))

@@ -16,6 +16,7 @@ from .config import (
     AntiOverlapConfigBlock,
     AriadneConfigBlock,
     CampaignConfig,
+    ErrorCalibrationConfigBlock,
     GeometryNoveltyConfigBlock,
     PhaseBConfigBlock,
 )
@@ -563,22 +564,42 @@ def _resolve_error_calibration_snapshot(
     write_manifest: bool,
 ) -> Dict[str, Any]:
     from .daemon.error_calibration import load_calibration_model_for_acquisition
+    from .daemon.error_calibration_contract import (
+        estimator_settings,
+        estimator_settings_sha256,
+        validate_model,
+    )
     from .layout import active_protocol_dir
 
     settings = asdict(config.error_calibration)
     model, reason = load_calibration_model_for_acquisition(
         campaign_dir,
         config,
-        current_model_version=int(iteration) - 1,
         current_iteration=int(iteration),
     )
+    if model is not None:
+        model = validate_model(model)
     snapshot: Dict[str, Any] = {
         "settings": settings,
+        "estimator_settings": estimator_settings(config),
+        "estimator_settings_sha256": estimator_settings_sha256(config),
         "model_reason": str(reason),
         "model_path": None,
         "model_sha256": None,
         "model": None if model is None else dict(model),
     }
+    if model is not None:
+        snapshot.update(
+            {
+                "calibration_context_sha256": model[
+                    "calibration_context_sha256"
+                ],
+                "environment_generation_digest_sha256": model[
+                    "environment_generation_digest_sha256"
+                ],
+                "source_records_sha256": model["source_records_sha256"],
+            }
+        )
     if write_manifest and model is not None:
         path = active_protocol_dir(_iteration_dir(campaign_dir, int(iteration))) / (
             SAMPLING_PROTOCOL_CALIBRATION_FILENAME
@@ -596,9 +617,7 @@ def _load_error_calibration_snapshot(
 ) -> Dict[str, Any]:
     snapshot = payload.get("resolved_error_calibration")
     if not isinstance(snapshot, dict):
-        # Legacy iteration protocols predate calibration freezing. They remain
-        # readable only when calibration cannot affect acquisition.
-        return {"settings": {}, "model_reason": "legacy_not_frozen", "model": None}
+        raise ValueError("resolved calibration snapshot is missing")
     out = dict(snapshot)
     model_path = out.get("model_path")
     if model_path is None:
@@ -614,7 +633,21 @@ def _load_error_calibration_snapshot(
     model = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(model, dict):
         raise ValueError("resolved calibration model snapshot must be an object")
-    out["model"] = model
+    from .daemon.error_calibration_contract import validate_model
+
+    try:
+        validated = validate_model(model)
+    except Exception as exc:
+        raise ValueError("resolved calibration model snapshot is invalid") from exc
+    if validated.get("calibration_context_sha256") != out.get(
+        "calibration_context_sha256"
+    ):
+        raise ValueError("resolved calibration context binding mismatch")
+    if validated.get("source_records_sha256") != out.get(
+        "source_records_sha256"
+    ):
+        raise ValueError("resolved calibration source-record binding mismatch")
+    out["model"] = validated
     return out
 
 
@@ -942,9 +975,9 @@ def load_sampling_protocol(
     effective = _effective_campaign_config(config, policy)
     frozen_settings = calibration_snapshot.get("settings")
     if isinstance(frozen_settings, dict) and frozen_settings:
-        effective_payload = effective.to_dict()
-        effective_payload["error_calibration"] = dict(frozen_settings)
-        effective = CampaignConfig.from_dict(effective_payload)
+        effective.error_calibration = ErrorCalibrationConfigBlock(
+            **dict(frozen_settings)
+        )
     acquisition_config = apply_geometry_novelty_to_acquisition_config(
         effective.to_acquisition_config(),
         effective,

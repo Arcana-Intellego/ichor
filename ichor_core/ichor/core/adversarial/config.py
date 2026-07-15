@@ -117,10 +117,10 @@ class CalibratedEnergyConfig:
     """Energy/error utility settings for calibrated active learning."""
 
     utility: str = "banded"
-    band_low_ha: Optional[float] = None
-    band_high_ha: Optional[float] = None
-    low_softness_ha: Optional[float] = None
-    high_softness_ha: Optional[float] = None
+    band_low_ha_per_sqrt_atom: Optional[float] = None
+    band_high_ha_per_sqrt_atom: Optional[float] = None
+    low_softness_ha_per_sqrt_atom: Optional[float] = None
+    high_softness_ha_per_sqrt_atom: Optional[float] = None
     fallback_to_raw_variance: bool = True
 
 

@@ -22,6 +22,10 @@ from .layout import (
     bootstrap_selection_dir,
     parse_seed_directory_name,
 )
+from .selection_origins import (
+    SEED_SELECTION_ORIGINS,
+    SEED_SELECTION_READER_ORIGINS,
+)
 
 
 ARIADNE_RESULTS_FILENAME = "RESULTS.json"
@@ -505,12 +509,7 @@ def build_seed_selection_manifest(
         if (frame_id is not None and frame_id < 0) or pool_row < 0:
             raise HandoffManifestError("seed selection frame/pool row is negative")
         origin = record.get("selection_origin")
-        if origin not in {
-            "bulk",
-            "variance",
-            "d_optimal",
-            "d_optimal_backfill",
-        }:
+        if origin not in SEED_SELECTION_ORIGINS:
             raise HandoffManifestError("seed selection origin is invalid")
         record["seed_id"] = seed_id
         record["frame_id"] = frame_id
@@ -669,13 +668,7 @@ def load_seeds_picked(iter_dir: Any, *, expected_iteration: Optional[int] = None
         if frame_id is not None and frame_id < 0:
             raise HandoffManifestError("frame_id must be >= 0 or null")
         origin = str(raw.get("selection_origin") or "unknown")
-        if origin not in (
-            "bulk",
-            "variance",
-            "d_optimal",
-            "d_optimal_backfill",
-            "unknown",
-        ):
+        if origin not in SEED_SELECTION_READER_ORIGINS:
             raise HandoffManifestError("unknown selection_origin: " + origin)
         record = dict(raw)
         seed_uid = str(raw.get("seed_uid") or "")

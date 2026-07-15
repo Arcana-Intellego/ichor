@@ -545,8 +545,6 @@ PRE_SAMPLING_PROTOCOL_CALIBRATION_EXACT = {
     "error_calibration.min_model_versions_to_apply",
     "error_calibration.apply_strength",
     "error_calibration.max_model_age_iterations",
-    "error_calibration.model_version_policy",
-    "error_calibration.aggressiveness_match_required",
 }
 PRE_PHASE_B_PREFIXES = {
     "phase_b.",

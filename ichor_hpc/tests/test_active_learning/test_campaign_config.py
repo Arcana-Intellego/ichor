@@ -121,14 +121,10 @@ def test_default_campaign_config_is_valid():
     assert c.error_calibration.min_bin_records == 8
     assert c.error_calibration.max_records == 5000
     assert c.error_calibration.max_model_age_iterations == 10
-    assert c.error_calibration.monotone_estimator is True
     assert c.error_calibration.quantile == 0.75
     assert c.error_calibration.apply_strength == 0.0
     assert c.error_calibration.group_by_atom_type is True
     assert c.error_calibration.group_by_landing_policy is False
-    assert c.error_calibration.model_version_policy == "rolling_normalised"
-    assert c.error_calibration.aggressiveness_match_required is True
-    assert c.error_calibration.output_units == "ha"
     assert c.acquisition.spectral.enabled is True
     assert c.acquisition.spectral.mode == "blend"
     assert c.acquisition.spectral.mode_weighting == "inverse_frequency"
@@ -430,15 +426,12 @@ def test_acquisition_gradient_clamp_must_be_positive():
         ("min_bin_records", 0, "min_bin_records"),
         ("max_records", 0, "max_records"),
         ("max_model_age_iterations", -1, "max_model_age_iterations"),
-        ("monotone_estimator", "yes", "monotone_estimator"),
         ("quantile", 0.0, "quantile"),
         ("quantile", 1.1, "quantile"),
         ("apply_strength", -0.1, "apply_strength"),
         ("apply_strength", 1.1, "apply_strength"),
         ("group_by_atom_type", "yes", "group_by_atom_type"),
         ("group_by_landing_policy", "no", "group_by_landing_policy"),
-        ("model_version_policy", "recent", "model_version_policy"),
-        ("output_units", "kjmol", "output_units"),
     ],
 )
 def test_error_calibration_validation_rejects_bad_values(field, value, match):
@@ -465,7 +458,7 @@ def test_error_calibration_apply_mode_roundtrips():
         (("spectral", "omega_floor"), 0.0, "omega_floor"),
         (("spectral", "max_modes"), 0, "max_modes"),
         (("calibrated_energy", "utility"), "linear", "calibrated_energy.utility"),
-        (("calibrated_energy", "band_high_ha"), -1.0, "band_high_ha"),
+        (("calibrated_energy", "band_high_ha_per_sqrt_atom"), -1.0, "band_high_ha_per_sqrt_atom"),
         (("stencils", "negative_curvature_policy"), "reward", "negative_curvature_policy"),
         (("stencils", "weak_mode_gating_enabled"), "yes", "weak_mode_gating_enabled"),
         (("stencils", "weak_mode_omega_low_fraction"), -0.1, "weak_mode_omega_low_fraction"),
@@ -495,8 +488,8 @@ def test_mature_acquisition_config_bridge_roundtrips_to_core():
     payload["geometry_novelty"]["fallback_scale_angstrom"] = 0.04
     payload["acquisition"]["spectral"]["mode"] = "record_only"
     payload["acquisition"]["spectral"]["max_modes"] = 3
-    payload["acquisition"]["calibrated_energy"]["band_low_ha"] = 0.01
-    payload["acquisition"]["calibrated_energy"]["band_high_ha"] = 0.10
+    payload["acquisition"]["calibrated_energy"]["band_low_ha_per_sqrt_atom"] = 0.01
+    payload["acquisition"]["calibrated_energy"]["band_high_ha_per_sqrt_atom"] = 0.10
     payload["acquisition"]["stencils"]["negative_curvature_policy"] = "penalise"
     payload["acquisition"]["stencils"]["lambda_negative_curvature"] = 2.0
     payload["acquisition"]["stencils"]["weak_mode_gating_enabled"] = False
@@ -510,8 +503,8 @@ def test_mature_acquisition_config_bridge_roundtrips_to_core():
     core = cfg.to_acquisition_config()
     assert core.spectral.mode == "record_only"
     assert core.spectral.max_modes == 3
-    assert core.calibrated_energy.band_low_ha == 0.01
-    assert core.calibrated_energy.band_high_ha == 0.10
+    assert core.calibrated_energy.band_low_ha_per_sqrt_atom == 0.01
+    assert core.calibrated_energy.band_high_ha_per_sqrt_atom == 0.10
     assert core.fullspace_confinement.residual_scale == FULLSPACE_RESIDUAL_SCALE
     assert core.fullspace_confinement.fixed_residual_scale_ang == FULLSPACE_FIXED_RESIDUAL_SCALE_ANGSTROM
     assert core.fullspace_confinement.rmsd_scale_ang == pytest.approx(

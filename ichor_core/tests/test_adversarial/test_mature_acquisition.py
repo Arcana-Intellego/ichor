@@ -93,10 +93,10 @@ def test_banded_energy_utility_rewards_middle_uncertainty():
         AcquisitionConfig(
             calibrated_energy=CalibratedEnergyConfig(
                 utility="banded",
-                band_low_ha=0.1,
-                band_high_ha=1.0,
-                low_softness_ha=0.05,
-                high_softness_ha=0.05,
+                band_low_ha_per_sqrt_atom=0.1,
+                band_high_ha_per_sqrt_atom=1.0,
+                low_softness_ha_per_sqrt_atom=0.05,
+                high_softness_ha_per_sqrt_atom=0.05,
             )
         )
     )

@@ -3840,6 +3840,27 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 ),
             )
 
+        try:
+            from .error_calibration_contract import (
+                active_environment_binding,
+                calibration_context_sha256,
+            )
+
+            calibration_environment = active_environment_binding(
+                self.campaign_dir
+            )
+            calibration_context = calibration_context_sha256(
+                self.config,
+                prior_mean_contract_sha256=prior_contract_hash,
+                environment_generation_digest_sha256=calibration_environment[
+                    "generation_digest_sha256"
+                ],
+            )
+        except Exception as exc:
+            return PhaseResult(
+                is_complete=True,
+                failure_reason="calibration_context_unavailable: " + str(exc),
+            )
         seed_records = list(picked["seed_records"])
         task_records = list(task_map["tasks"])
         expected_n = int(task_map["n_tasks"])
@@ -4463,7 +4484,23 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             if isinstance(selection_diagnostics, dict):
                 diag_payload = dict(selection_diagnostics)
                 diag_payload["model_version"] = int(getattr(state, "models_version", -1))
+                diag_payload["model_set_sha256"] = str(
+                    picked["model_manifest_sha256"]
+                )
                 diag_payload["prior_mean_contract_sha256"] = prior_contract_hash
+                diag_payload["environment_generation"] = int(
+                    calibration_environment["generation"]
+                )
+                diag_payload["environment_generation_digest_sha256"] = str(
+                    calibration_environment["generation_digest_sha256"]
+                )
+                diag_payload["calibration_context_sha256"] = calibration_context
+                diag_payload["sampling_protocol_sha256"] = str(
+                    dict(result_dict.get("sampling_protocol") or {}).get(
+                        "resolved_manifest_sha256"
+                    )
+                    or ""
+                )
                 diag_payload["seed_id"] = seed_id
                 diag_payload["seed_uid"] = seed_uid
                 diag_payload["array_task_id"] = array_task_id

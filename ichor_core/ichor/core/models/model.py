@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 import re
 from typing import Dict, List, Optional
@@ -97,6 +98,59 @@ class Model(ReadFile, WriteFile):
         self.program_version = program_version
         self.notes = notes
         self.prefactor = prefactor
+        self._numeric_identity_cache = None
+        self._lower_cholesky_cache = None
+
+    @staticmethod
+    def _update_numeric_digest(digest, label: str, value) -> None:
+        digest.update(str(label).encode("utf-8"))
+        digest.update(b"\0")
+        if isinstance(value, np.ndarray):
+            array = np.ascontiguousarray(value)
+            digest.update(str(array.dtype).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(repr(tuple(array.shape)).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(array.tobytes(order="C"))
+        else:
+            digest.update(repr(value).encode("utf-8"))
+        digest.update(b"\0")
+
+    @property
+    def numeric_identity(self) -> str:
+        """Return the immutable identity of this fitted numeric model.
+
+        FEREBUS model objects are read-only after admission.  The digest gives
+        posterior caches an identity that survives repeated property access and
+        does not depend on temporary NumPy allocation addresses.
+        """
+        cached = getattr(self, "_numeric_identity_cache", None)
+        if isinstance(cached, str) and len(cached) == 64:
+            return cached
+        digest = hashlib.sha256()
+        self._update_numeric_digest(digest, "atom", str(self.atom_name))
+        self._update_numeric_digest(digest, "property", str(self.prop))
+        self._update_numeric_digest(digest, "ntrain", int(self.ntrain))
+        self._update_numeric_digest(digest, "nfeats", int(self.nfeats))
+        self._update_numeric_digest(digest, "jitter", float(self.jitter))
+        self._update_numeric_digest(digest, "prefactor", float(self.kernel_prefactor))
+        self._update_numeric_digest(digest, "kernel", self.kernel.write_str())
+        self._update_numeric_digest(digest, "mean", self.mean.write_str())
+        self._update_numeric_digest(digest, "x", np.asarray(self.x, dtype=float))
+        self._update_numeric_digest(digest, "y", np.asarray(self.y, dtype=float))
+        self._update_numeric_digest(
+            digest,
+            "weights",
+            np.asarray(self.weights, dtype=float),
+        )
+        identity = digest.hexdigest()
+        self._numeric_identity_cache = identity
+        return identity
+
+    def invalidate_numeric_cache(self) -> None:
+        """Invalidate cached factors after an explicit in-memory model edit."""
+        self._numeric_identity_cache = None
+        self._lower_cholesky_cache = None
 
     def _read_file(self, up_to: Optional[str] = None):
         """Read in a FEREBUS output file which contains the optimized
@@ -477,7 +531,19 @@ class Model(ReadFile, WriteFile):
     @property
     def lower_cholesky(self) -> np.ndarray:
         """Decomposes the covariance matrix into L and L^T. Returns the lower triangular matrix L."""
-        return np.linalg.cholesky(self.R)
+        identity = self.numeric_identity
+        cached = getattr(self, "_lower_cholesky_cache", None)
+        if (
+            isinstance(cached, tuple)
+            and len(cached) == 2
+            and cached[0] == identity
+            and isinstance(cached[1], np.ndarray)
+        ):
+            return cached[1]
+        factor = np.linalg.cholesky(self.R)
+        factor.setflags(write=False)
+        self._lower_cholesky_cache = (identity, factor)
+        return factor
 
     @property
     def _y_minus_mean(self):

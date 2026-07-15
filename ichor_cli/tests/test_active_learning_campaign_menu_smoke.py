@@ -1368,8 +1368,8 @@ def test_top_three_roi_config_blocks_render_current_values():
     ].this_menu_options()
     assert "error_calibration.mode: apply_to_acquisition" in calibration_rendered
     assert "error_calibration.apply_strength" in calibration_rendered
-    assert "error_calibration.model_version_policy: rolling_normalised" in calibration_rendered
-    assert "error_calibration.aggressiveness_match_required: True" in calibration_rendered
+    assert "error_calibration.model_version_policy" not in calibration_rendered
+    assert "error_calibration.aggressiveness_match_required" not in calibration_rendered
     assert "seed_selection.d_optimal_degenerate_policy" in seed_rendered
 
 
@@ -1414,7 +1414,9 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
     assert "campaign.custom_bootstrap: False" in out
     assert "campaign.bootstrap_path: bootstrap/ (fixed campaign input)" in out
     assert "degenerate_policy=score_backfill" in out
-    assert "error_calibration.model_version_policy: rolling_normalised" in out
+    assert "error_calibration.model_policy: rolling_normalised (fixed)" in out
+    assert "error_calibration.estimator: grouped isotonic quantile (fixed)" in out
+    assert "error_calibration.output_units: Ha/sqrt(atom) (fixed)" in out
     assert "retention.checkpoint_destination: null" in out
     assert "retention.checkpoint_every_iterations: 1" in out
     assert "retention.checkpoint_required: False" in out

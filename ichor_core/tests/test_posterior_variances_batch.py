@@ -237,6 +237,34 @@ def test_scaled_signal_variance_is_cached_per_model_fit():
     )
 
 
+def test_rectangular_cross_covariance_matches_scalar_without_scalar_calls():
+    post, rng = _make_posterior(scaled=True)
+    left = _points(rng, 5)
+    right = _points(rng, 3)
+
+    rectangular = post.cross_covariances(left, right, chunk_size=2)
+    assert post.diagnostics["n_covariance_scalar_calls"] == 0
+
+    expected = np.asarray(
+        [[post.covariance(a, b) for b in right] for a in left],
+        dtype=float,
+    )
+    np.testing.assert_allclose(rectangular, expected, atol=1.0e-10, rtol=1.0e-9)
+
+
+def test_geometry_cache_key_preserves_input_kind_labels_and_shapes():
+    values = np.asarray([1.0, 2.0, 3.0])
+    assert TotalEnergyPosterior._geometry_key({"O1": values}) != (
+        TotalEnergyPosterior._geometry_key({"X9": values})
+    )
+    assert TotalEnergyPosterior._geometry_key({"O1": values}) != (
+        TotalEnergyPosterior._geometry_key({"O1": values.reshape(1, 3)})
+    )
+    assert TotalEnergyPosterior._geometry_key(values) != (
+        TotalEnergyPosterior._geometry_key({"O1": values})
+    )
+
+
 def test_variances_reject_kernel_active_dims_out_of_range():
     post, rng, models = _make_diag_only_posterior()
     models[0].kernel.active_dims = [0, 3]

@@ -23,6 +23,8 @@ import numpy as np
 
 from ichor.core.atoms import Atoms
 
+from ..selection_origins import SEED_SELECTION_ORIGINS
+
 
 __all__ = ["SeedSelection", "select_seeds"]
 
@@ -369,7 +371,7 @@ def _d_optimal_select(
                 + " requested seeds"
             )
         remaining_by_score = _quantised_descending_order(
-            remaining_scores,
+            remaining_variances,
             remaining_indices,
         )
         picked_set = set(picked)
@@ -398,6 +400,7 @@ def _d_optimal_select(
                 "d_optimal_prefilter_rank": int(candidate_rank.get(index, position)),
                 "d_optimal_max_correlation_to_selected": last_correlation.get(index),
                 "d_optimal_backfill_reason": "model_space_degeneracy",
+                "d_optimal_backfill_rank_source": "raw_posterior_variance",
             })
 
     return picked, picked_diag, {
@@ -420,7 +423,7 @@ class SeedSelection:
     indices: List[int]
     bulk_indices: List[int]
     variance_indices: List[int]
-    variances: List[float]
+    variances: List[Optional[float]]
     frame_ids: List[Optional[int]] = field(default_factory=list)
     skipped_unknown_provenance: int = 0
     selection_origins: List[str] = field(default_factory=list)
@@ -567,22 +570,15 @@ def select_seeds(
 
     if n_seeds >= n_eligible:
         all_idx = list(eligible)
-        raw_variances = _posterior_variances(
-            posterior,
-            [training_atoms[i] for i in all_idx],
-            chunk_size=variance_chunk_size,
-        )
-        variances = [
-            float(v)
-            for v in _finite_variances(raw_variances, context="seed selection")
-        ]
+        variances: List[Optional[float]] = [None] * len(all_idx)
         diagnostics = [
             {
                 "selection_index": int(idx),
                 "selection_origin": "bulk",
-                "raw_variance": float(var),
+                "raw_variance": None,
+                "variance_not_evaluated_reason": "all_eligible_selected_as_bulk",
             }
-            for idx, var in zip(all_idx, variances)
+            for idx in all_idx
         ]
         return SeedSelection(
             seeds=[training_atoms[i] for i in all_idx],
@@ -605,9 +601,8 @@ def select_seeds(
                 "d_optimal_bypassed_all_eligible_bulk": bool(strategy == "d_optimal"),
                 "ranking_tie_break_policy": "quantised_score_then_index",
                 "ranking_score_quantisation_abs": float(RANKING_SCORE_QUANTISATION),
-                "n_variance_score_ties_after_quantisation": int(
-                    _quantised_tie_count(variances)
-                ),
+                "n_variance_score_ties_after_quantisation": 0,
+                "posterior_variance_evaluations": 0,
             },
         )
 
@@ -625,6 +620,43 @@ def select_seeds(
     bulk_set = set(bulk_idx)
 
     remaining = [i for i in eligible if i not in bulk_set]
+    if n_variance == 0:
+        diagnostics = [
+            {
+                "selection_index": int(idx),
+                "selection_origin": "bulk",
+                "raw_variance": None,
+                "variance_not_evaluated_reason": "all_bulk_policy",
+            }
+            for idx in bulk_idx
+        ]
+        return SeedSelection(
+            seeds=[training_atoms[i] for i in bulk_idx],
+            indices=bulk_idx,
+            bulk_indices=bulk_idx,
+            variance_indices=[],
+            variances=[None] * len(bulk_idx),
+            frame_ids=[fids[i] for i in bulk_idx],
+            skipped_unknown_provenance=skipped_unknown,
+            selection_origins=["bulk"] * len(bulk_idx),
+            selection_diagnostics=diagnostics,
+            diagnostics={
+                "strategy": strategy,
+                "n_total": int(n_total),
+                "n_eligible": int(n_eligible),
+                "n_bulk": int(len(bulk_idx)),
+                "n_ranked": 0,
+                "prefilter_pool_size": 0,
+                "skipped_unknown_provenance": int(skipped_unknown),
+                "d_optimal_bypassed_all_bulk": bool(strategy == "d_optimal"),
+                "ranking_tie_break_policy": "quantised_score_then_index",
+                "ranking_score_quantisation_abs": float(
+                    RANKING_SCORE_QUANTISATION
+                ),
+                "n_variance_score_ties_after_quantisation": 0,
+                "posterior_variance_evaluations": 0,
+            },
+        )
     # batched scan when the posterior supports it (the real GP). avoids a
     # python variance() call per pool frame on the login node.
     remaining_vars = np.asarray(
@@ -736,6 +768,8 @@ def select_seeds(
                 if strategy == "d_optimal"
                 else "variance"
             )
+            if origin not in SEED_SELECTION_ORIGINS:
+                raise ValueError("unknown seed-selection origin: " + repr(origin))
             diag.setdefault("selection_index", int(idx))
             diag.setdefault("selection_origin", origin)
             diag.setdefault("raw_variance", float(variance_by_idx[int(idx)]))

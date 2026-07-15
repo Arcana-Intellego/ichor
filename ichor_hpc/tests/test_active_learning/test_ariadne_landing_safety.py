@@ -55,7 +55,7 @@ class _FakeAcquisition:
             raw_energy_risk=abs(x),
             energy_risk=abs(x),
             banded_energy_risk=None,
-            calibrated_expected_iqa_error_ha=None,
+            calibrated_expected_iqa_error_ha_per_sqrt_atom=None,
             calibration_applied=False,
             spectral_frequency_risk=0.0,
             legacy_frequency_risk=0.0,

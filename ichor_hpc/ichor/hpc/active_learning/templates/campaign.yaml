@@ -80,14 +80,10 @@ error_calibration:
   min_bin_records: 8
   max_records: 5000
   max_model_age_iterations: 10
-  monotone_estimator: true
   quantile: 0.75
   apply_strength: 0.0
   group_by_atom_type: true
   group_by_landing_policy: false
-  model_version_policy: rolling_normalised
-  aggressiveness_match_required: true
-  output_units: ha
 
 quality_gates:
   require_readable_aimall_geometry: true

@@ -25,6 +25,12 @@ from ichor.hpc.active_learning.ariadne_outputs import (
     write_seed_output_manifest,
 )
 from ichor.hpc.active_learning.daemon.state import atomic_write_json
+from ichor.hpc.active_learning.daemon.error_calibration import (
+    build_calibration_model,
+    model_path as error_calibration_model_path,
+    synthetic_dry_records,
+    write_calibration_model,
+)
 from ichor.hpc.active_learning.seed_identity import write_ariadne_task_map
 from ichor.hpc.active_learning.versioning.manifest import sha256_file
 from ichor.hpc.active_learning.versioning.provenance import (
@@ -375,6 +381,54 @@ def test_resolve_or_load_preserves_immutable_protocol_bytes(tmp_path):
 
     assert loaded.iteration == 1
     assert {path: path.read_bytes() for path in paths} == before
+
+
+def test_resolve_or_load_uses_frozen_calibration_after_global_changes(tmp_path):
+    cfg = CampaignConfig()
+    cfg.error_calibration.mode = "apply_to_acquisition"
+    cfg.error_calibration.apply_strength = 1.0
+    cfg.error_calibration.min_records_to_apply = 1
+    cfg.error_calibration.min_model_versions_to_apply = 1
+    cfg.error_calibration.n_bins = 2
+    cfg.error_calibration.min_bin_records = 1
+
+    records = synthetic_dry_records(
+        iteration=1,
+        models_version=0,
+        n_points=4,
+        config=cfg,
+    )
+    model = build_calibration_model(
+        records,
+        cfg,
+        iteration=1,
+        current_model_version=0,
+    )
+    assert model["usable_for_acquisition"] is True
+    write_calibration_model(tmp_path, model)
+
+    resolved = resolve_sampling_protocol(tmp_path, cfg, iteration=2)
+    snapshot = resolved.error_calibration_snapshot
+    frozen_model_sha = snapshot["model_sha256"]
+    frozen_source_sha = snapshot["source_records_sha256"]
+    assert snapshot["model_reason"] == "loaded"
+    assert snapshot["model"] is not None
+
+    error_calibration_model_path(tmp_path).unlink()
+    cfg.error_calibration.max_model_age_iterations = 0
+
+    loaded = resolve_or_load_sampling_protocol(tmp_path, cfg, iteration=2)
+
+    assert loaded.error_calibration_snapshot["model_sha256"] == frozen_model_sha
+    assert (
+        loaded.error_calibration_snapshot["source_records_sha256"]
+        == frozen_source_sha
+    )
+    assert loaded.error_calibration_snapshot["model"] == snapshot["model"]
+    assert (
+        loaded.effective_config.error_calibration.max_model_age_iterations
+        == snapshot["settings"]["max_model_age_iterations"]
+    )
 
 
 def test_resolve_or_load_rejects_partial_protocol_snapshot(tmp_path):

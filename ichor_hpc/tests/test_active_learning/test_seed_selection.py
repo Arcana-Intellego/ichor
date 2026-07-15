@@ -33,6 +33,21 @@ class _ChunkedPosterior(_StubPosterior):
         return np.array([self.variance(atoms) for atoms in atoms_list], dtype=float)
 
 
+class _CountingPosterior(_StubPosterior):
+    def __init__(self, var_by_id):
+        super().__init__(var_by_id)
+        self.n_variance_calls = 0
+        self.n_variances_calls = 0
+
+    def variance(self, atoms):
+        self.n_variance_calls += 1
+        return super().variance(atoms)
+
+    def variances(self, atoms_list, *, chunk_size=None):
+        self.n_variances_calls += 1
+        return np.array([self.variance(atoms) for atoms in atoms_list], dtype=float)
+
+
 class _CovariancePosterior:
     def __init__(self, atoms, covariance):
         self._pos = {id(atom): i for i, atom in enumerate(atoms)}
@@ -77,6 +92,8 @@ def test_n_seeds_exceeds_training_returns_all():
     out = select_seeds(atoms, posterior, n_seeds=100)
     assert out.n == 5
     assert set(out.indices) == set(range(5))
+    assert out.variances == [None] * 5
+    assert out.diagnostics["posterior_variance_evaluations"] == 0
 
 
 def test_half_half_split_sizes_default():
@@ -124,10 +141,15 @@ def test_variance_near_ties_are_quantised_then_broken_by_index():
 
 
 def test_bulk_fraction_one_pure_random():
-    atoms, posterior, _ = _atoms_with_indexed_variances(20)
+    atoms = [object() for _ in range(20)]
+    posterior = _CountingPosterior({id(atom): idx for idx, atom in enumerate(atoms)})
     out = select_seeds(atoms, posterior, n_seeds=5, bulk_fraction=1.0, rng_seed=0)
     assert len(out.variance_indices) == 0
     assert len(out.bulk_indices) == 5
+    assert out.variances == [None] * 5
+    assert posterior.n_variance_calls == 0
+    assert posterior.n_variances_calls == 0
+    assert out.diagnostics["posterior_variance_evaluations"] == 0
 
 
 def test_reproducibility_with_same_rng_seed():
@@ -171,7 +193,7 @@ def test_non_finite_scalar_variance_rejected_before_selection():
     atoms = [object() for _ in range(4)]
     posterior = _StubPosterior({id(a): float("nan") for a in atoms})
     with pytest.raises(ValueError, match="non-finite"):
-        select_seeds(atoms, posterior, n_seeds=4)
+        select_seeds(atoms, posterior, n_seeds=3, bulk_fraction=0.0)
 
 
 def test_non_finite_batched_variance_rejected_before_ranking():
@@ -494,6 +516,10 @@ def test_d_optimal_score_backfill_is_deterministic_for_rank_one_pool():
     assert output.diagnostics["d_optimal_backfilled"] == 2
     assert all(
         row.get("d_optimal_backfill_reason") == "model_space_degeneracy"
+        for row in output.selection_diagnostics[1:]
+    )
+    assert all(
+        row.get("d_optimal_backfill_rank_source") == "raw_posterior_variance"
         for row in output.selection_diagnostics[1:]
     )
 

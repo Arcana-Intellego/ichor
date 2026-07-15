@@ -81,14 +81,17 @@ def test_apply_to_acquisition_replaces_energy_risk_when_strength_one(monkeypatch
     )
     monkeypatch.setattr(SeedLocalAdversarialAcquisition, "_mode_metrics", lambda self, atoms, mean_energy: ())
     model = {
-        "reference_error_ha": 0.1,
+        "schema_version": 2,
+        "output_units": "ha_per_sqrt_atom",
+        "uncertainty_axis": "model_normalised",
+        "reference_error_ha_per_sqrt_atom": 0.1,
         "tables": {
             "global_total": {
                 "bins": [
                     {
                         "raw_uncertainty_min": 0.0,
                         "raw_uncertainty_max": 5.0,
-                        "calibrated_abs_error_ha": 0.3,
+                        "calibrated_abs_error_ha_per_sqrt_atom": 0.3,
                     }
                 ]
             },
@@ -104,9 +107,9 @@ def test_apply_to_acquisition_replaces_energy_risk_when_strength_one(monkeypatch
     assert breakdown.raw_energy_risk == pytest.approx(
         math.log1p((4.0 / math.sqrt(len(atoms))) / 2.0)
     )
-    assert breakdown.calibrated_expected_iqa_error_ha == pytest.approx(0.3)
+    assert breakdown.calibrated_expected_iqa_error_ha_per_sqrt_atom == pytest.approx(0.3)
     assert breakdown.energy_risk == pytest.approx(
-        math.log1p((0.3 / math.sqrt(len(atoms))) / 0.1)
+        math.log1p(0.3 / 0.1)
     )
 
 
@@ -119,14 +122,17 @@ def test_apply_to_acquisition_requires_global_total_table(monkeypatch):
     )
     monkeypatch.setattr(SeedLocalAdversarialAcquisition, "_mode_metrics", lambda self, atoms, mean_energy: ())
     legacy_atom_only_model = {
-        "reference_error_ha": 0.1,
+        "schema_version": 2,
+        "output_units": "ha_per_sqrt_atom",
+        "uncertainty_axis": "model_normalised",
+        "reference_error_ha_per_sqrt_atom": 0.1,
         "tables": {
             "global": {
                 "bins": [
                     {
                         "raw_uncertainty_min": 0.0,
                         "raw_uncertainty_max": 5.0,
-                        "calibrated_abs_error_ha": 9.0,
+                        "calibrated_abs_error_ha_per_sqrt_atom": 9.0,
                     }
                 ]
             },
@@ -139,7 +145,7 @@ def test_apply_to_acquisition_requires_global_total_table(monkeypatch):
     breakdown = acq.components(atoms, include_movement=False)
 
     assert breakdown.calibration_applied is False
-    assert breakdown.calibrated_expected_iqa_error_ha is None
+    assert breakdown.calibrated_expected_iqa_error_ha_per_sqrt_atom is None
     assert breakdown.energy_risk == pytest.approx(
         math.log1p((4.0 / math.sqrt(len(atoms))) / 2.0)
     )

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Dict, Hashable, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from ichor.core.atoms import Atoms
@@ -112,17 +112,52 @@ def _model_prior_diagonal(model, x: np.ndarray) -> np.ndarray:
 
 
 
-def _estimated_signal_variance(model) -> float:
+def _model_numeric_identity(model) -> Hashable:
+    identity = getattr(model, "numeric_identity", None)
+    if callable(identity):
+        identity = identity()
+    if identity is not None:
+        return (type(model).__module__, type(model).__qualname__, str(identity))
+    x_raw = getattr(model, "x")
+    y_raw = getattr(model, "y")
+    return (
+        type(model).__module__,
+        type(model).__qualname__,
+        id(model),
+        id(x_raw),
+        np.asarray(x_raw).shape,
+        id(y_raw),
+        np.asarray(y_raw).shape,
+        id(getattr(model, "kernel", None)),
+        int(getattr(model, "ntrain", 0)),
+        int(getattr(model, "nfeats", 0)),
+        float(getattr(model, "jitter", 0.0)),
+        float(getattr(model, "prefactor", 1.0)),
+    )
+
+
+def _model_lower_cholesky(model) -> np.ndarray:
+    factor = _check_finite_array(model.lower_cholesky, "model Cholesky factor")
+    expected = (int(model.ntrain), int(model.ntrain))
+    if factor.shape != expected:
+        raise ValueError(
+            "model Cholesky factor shape must be "
+            + repr(expected)
+            + ", got "
+            + repr(factor.shape)
+        )
+    return factor
+
+
+def _estimated_signal_variance(model, *, lower_cholesky: Optional[np.ndarray] = None) -> float:
     y_raw = getattr(model, "y")
     x_raw = getattr(model, "x")
-    chol_raw = getattr(model, "lower_cholesky")
     cache_key = (
+        _model_numeric_identity(model),
         id(y_raw),
         np.asarray(y_raw).shape,
         id(x_raw),
         np.asarray(x_raw).shape,
-        id(chol_raw),
-        np.asarray(chol_raw).shape,
         int(getattr(model, "ntrain", 0)),
     )
     cached = getattr(model, "_ichor_al_signal_variance_cache", None)
@@ -136,7 +171,12 @@ def _estimated_signal_variance(model) -> float:
     x = _check_finite_array(model.x, "model.x")
     mean = _check_finite_array(model.mean.value(x), "model mean").reshape((-1, 1))
     resid = y - mean
-    whitened = np.linalg.solve(model.lower_cholesky, resid)
+    factor = (
+        _model_lower_cholesky(model)
+        if lower_cholesky is None
+        else _check_finite_array(lower_cholesky, "model Cholesky factor")
+    )
+    whitened = np.linalg.solve(factor, resid)
     tau2 = float((whitened.T @ whitened).reshape(-1)[0] / max(model.ntrain, 1))
     if not np.isfinite(tau2) or tau2 <= 0.0:
         tau2 = 1.0
@@ -154,12 +194,16 @@ def model_posterior_covariance(model, x1: np.ndarray, x2: np.ndarray, scaled: bo
     k12 = _model_prior_covariance(model, x1, x2)
     r1 = _check_finite_array(model.r(x1), "train-test covariance")
     r2 = _check_finite_array(model.r(x2), "train-test covariance")
-    v1 = np.linalg.solve(model.lower_cholesky, r1)
-    v2 = np.linalg.solve(model.lower_cholesky, r2)
+    factor = _model_lower_cholesky(model)
+    v1 = np.linalg.solve(factor, r1)
+    v2 = np.linalg.solve(factor, r2)
     posterior = k12 - v1.T @ v2
     posterior = 0.5 * (posterior + posterior.T) if x1.shape == x2.shape and np.array_equal(x1, x2) else posterior
     if scaled:
-        posterior = _estimated_signal_variance(model) * posterior
+        posterior = _estimated_signal_variance(
+            model,
+            lower_cholesky=factor,
+        ) * posterior
     return _check_finite_array(posterior, "posterior covariance")
 
 
@@ -182,9 +226,11 @@ class TotalEnergyPosterior:
         if not property_models:
             raise ValueError(f"No models of property {self.property_name!r} were found.")
         self._property_models: Dict[str, object] = {model.atom: model for model in property_models}
-        self._model_identity = (
-            id(self.models),
-            tuple(sorted((str(model.atom), id(model)) for model in property_models)),
+        self._model_identity = tuple(
+            sorted(
+                (str(model.atom), _model_numeric_identity(model))
+                for model in property_models
+            )
         )
         self._mean_cache: "OrderedDict[Tuple[object, Tuple[float, ...]], float]" = OrderedDict()
         self._cov_cache: "OrderedDict[Tuple[object, Tuple[float, ...], Tuple[float, ...]], float]" = OrderedDict()
@@ -236,17 +282,43 @@ class TotalEnergyPosterior:
         return features
 
     @staticmethod
-    def _geometry_key(x: GeometryInput) -> Tuple[float, ...]:
+    def _geometry_key(x: GeometryInput) -> Hashable:
         if isinstance(x, dict):
-            flat_parts: List[np.ndarray] = []
+            rows = []
             for atom in sorted(x):
-                flat_parts.append(np.asarray(x[atom], dtype=float).reshape(-1))
-            arr = np.concatenate(flat_parts) if flat_parts else np.zeros(0, dtype=float)
-        elif isinstance(x, Atoms):
-            arr = np.asarray(x.coordinates, dtype=float).reshape(-1)
-        else:
-            arr = np.asarray(x, dtype=float).reshape(-1)
-        return tuple(np.round(arr, 12))
+                arr = _check_finite_array(x[atom], "posterior geometry mapping")
+                rows.append(
+                    (
+                        str(atom),
+                        tuple(arr.shape),
+                        tuple(np.round(arr.reshape(-1), 12)),
+                    )
+                )
+            return ("mapping", tuple(rows))
+        if isinstance(x, Atoms):
+            coordinates = _check_finite_array(
+                x.coordinates,
+                "posterior atom coordinates",
+            )
+            identities = tuple(
+                (
+                    str(getattr(atom, "name", "")),
+                    str(getattr(atom, "type", "")),
+                )
+                for atom in x
+            )
+            return (
+                "atoms",
+                identities,
+                tuple(coordinates.shape),
+                tuple(np.round(coordinates.reshape(-1), 12)),
+            )
+        arr = _check_finite_array(x, "posterior geometry array")
+        return (
+            "array",
+            tuple(arr.shape),
+            tuple(np.round(arr.reshape(-1), 12)),
+        )
 
     def mean(self, x: GeometryInput) -> float:
         self._diagnostic_add("n_mean_scalar_calls")
@@ -275,11 +347,8 @@ class TotalEnergyPosterior:
         self._diagnostic_add("n_covariance_scalar_calls")
         key1 = self._geometry_key(x1)
         key2 = self._geometry_key(x2)
-        cache_key = (
-            (self._model_identity, key1, key2)
-            if key1 <= key2
-            else (self._model_identity, key2, key1)
-        )
+        ordered_keys = sorted((key1, key2), key=repr)
+        cache_key = (self._model_identity, ordered_keys[0], ordered_keys[1])
         cached = self._cache_get(self._cov_cache, cache_key)
         if cached is not None:
             return cached
@@ -404,10 +473,14 @@ class TotalEnergyPosterior:
                     f"kernel diagonal shape for atom {atom} must be {(n,)}, got {k_diag.shape}"
                 )
             r = _check_finite_array(model.r(X), "train-test covariance")
-            v = np.linalg.solve(model.lower_cholesky, r)
+            factor = _model_lower_cholesky(model)
+            v = np.linalg.solve(factor, r)
             diag = k_diag - np.sum(v * v, axis=0)
             if self.scaled:
-                diag = _estimated_signal_variance(model) * diag
+                diag = _estimated_signal_variance(
+                    model,
+                    lower_cholesky=factor,
+                ) * diag
             total = total + diag
         return _check_variance_array(total, "posterior variances")
 
@@ -450,7 +523,8 @@ class TotalEnergyPosterior:
                     f"train-test covariance shape for atom {atom} must be "
                     f"{expected_r_shape}, got {r.shape}"
                 )
-            v = np.linalg.solve(model.lower_cholesky, r)
+            factor = _model_lower_cholesky(model)
+            v = np.linalg.solve(factor, r)
             if v.shape != expected_r_shape:
                 raise ValueError(
                     f"posterior solve shape for atom {atom} must be "
@@ -462,7 +536,10 @@ class TotalEnergyPosterior:
                     f"posterior covariance shape for atom {atom} must be {(n, n)}, got {atom_cov.shape}"
                 )
             if self.scaled:
-                atom_cov = _estimated_signal_variance(model) * atom_cov
+                atom_cov = _estimated_signal_variance(
+                    model,
+                    lower_cholesky=factor,
+                ) * atom_cov
             total_cov += atom_cov
         total_cov = 0.5 * (total_cov + total_cov.T)
         return _check_finite_array(total_cov, "posterior covariance matrix")
@@ -518,11 +595,46 @@ class TotalEnergyPosterior:
                 np.vstack(chunks) if chunks else np.zeros((0, n_right), dtype=float),
                 "posterior cross-covariances",
             )
-        cov = np.zeros((n_left, n_right), dtype=float)
-        for i, x_left in enumerate(left):
-            for j, x_right in enumerate(right):
-                cov[i, j] = self.covariance(x_left, x_right)
-        return _check_finite_array(cov, "posterior cross-covariances")
+        left_features = [self._features(point) for point in left]
+        right_features = [self._features(point) for point in right]
+        total = np.zeros((n_left, n_right), dtype=float)
+        for atom, model in self._property_models.items():
+            x_left = self._stack_feature_rows(left_features, atom)
+            x_right = self._stack_feature_rows(right_features, atom)
+            prior = _model_prior_covariance(model, x_left, x_right)
+            expected_prior_shape = (n_left, n_right)
+            if prior.shape != expected_prior_shape:
+                raise ValueError(
+                    f"kernel cross-covariance shape for atom {atom} must be "
+                    f"{expected_prior_shape}, got {prior.shape}"
+                )
+            r_left = _check_finite_array(
+                model.r(x_left),
+                "left train-test covariance",
+            )
+            r_right = _check_finite_array(
+                model.r(x_right),
+                "right train-test covariance",
+            )
+            expected_left = (int(model.ntrain), n_left)
+            expected_right = (int(model.ntrain), n_right)
+            if r_left.shape != expected_left or r_right.shape != expected_right:
+                raise ValueError(
+                    f"rectangular train-test covariance shape mismatch for atom {atom}: "
+                    f"{r_left.shape}/{r_right.shape} != "
+                    f"{expected_left}/{expected_right}"
+                )
+            factor = _model_lower_cholesky(model)
+            solved_left = np.linalg.solve(factor, r_left)
+            solved_right = np.linalg.solve(factor, r_right)
+            atom_covariance = prior - solved_left.T @ solved_right
+            if self.scaled:
+                atom_covariance = _estimated_signal_variance(
+                    model,
+                    lower_cholesky=factor,
+                ) * atom_covariance
+            total += atom_covariance
+        return _check_finite_array(total, "posterior cross-covariances")
 
     def _means_scalar(self, points: Sequence[GeometryInput]) -> np.ndarray:
         return _check_finite_array(
