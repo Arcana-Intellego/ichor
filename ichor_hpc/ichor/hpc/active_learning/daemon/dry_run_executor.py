@@ -67,7 +67,6 @@ from ..layout import (
     ariadne_seeds_dir,
     bootstrap_dir,
     bootstrap_selection_dir,
-    staging_pointdir_name,
 )
 from .phase_executor import (
     BackendSubmissionError,
@@ -148,11 +147,21 @@ class DryRunPhaseExecutor:
     def submit_or_run(self, state, phase) -> PhaseResult:
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
         if phase_name in SBATCH_PHASES:
-            self._write_stub_script(phase_name, state.iteration)
+            expected_tasks = self._prepare_dry_submission(state, phase_name)
+            self._write_stub_script(
+                phase_name,
+                state.iteration,
+                expected_tasks=expected_tasks,
+                campaign_uid=str(getattr(state, "campaign_uid", "")),
+            )
             job_id = (
                 DRYRUN_JOB_PREFIX + phase_name + "-" + str(state.iteration)
             )
-            return PhaseResult(is_complete=False, submitted_job_id=job_id)
+            return PhaseResult(
+                is_complete=False,
+                submitted_job_id=job_id,
+                expected_tasks=int(expected_tasks),
+            )
         # inline phases produce their artefacts synchronously.
         inline_result = self._run_inline(state, phase_name)
         if isinstance(inline_result, PhaseResult):
@@ -173,8 +182,105 @@ class DryRunPhaseExecutor:
 
     # --- internal: script stubbing -------------------------------------
 
-    def _write_stub_script(self, phase_name: str, iteration: int) -> Path:
+    def _prepare_dry_submission(self, state, phase_name: str) -> int:
+        """Run production staging and return the exact simulated task count."""
+        from . import input_staging as staging
+
+        iteration = int(state.iteration)
+        if phase_name in {"PHASE_A_DIVERSITY", "PHASE_B_DIVERSITY"}:
+            if phase_name == "PHASE_A_DIVERSITY":
+                from .pool_feasibility import require_pool_feasibility
+
+                require_pool_feasibility(self.campaign_dir, self.config)
+            return 1
+        if "GAUSSIAN" in phase_name:
+            from .live_executor import locate_gaussian_sample_xyz
+
+            sample = locate_gaussian_sample_xyz(
+                self.campaign_dir,
+                phase_name,
+                iteration,
+                replacement_round=int(getattr(state, "replacement_round", 0)),
+                campaign_uid=str(getattr(state, "campaign_uid", "")),
+            )
+            if sample is None:
+                raise BackendSubmissionError(
+                    "no producer-owned diversity sample for " + phase_name
+                )
+            _root, count = staging.stage_gaussian_inputs(
+                self.campaign_dir,
+                self.config,
+                phase_name,
+                iteration,
+                sample,
+                campaign_uid=str(getattr(state, "campaign_uid", "")),
+            )
+        elif "AIMALL" in phase_name:
+            staging_override = None
+            expected_gaussian_phase = None
+            if "REPLACEMENT" in phase_name:
+                from ..replacement_sampling import replacement_round_dir
+
+                context = (
+                    "bootstrap" if phase_name.startswith("INITIAL_") else "active"
+                )
+                staging_override = replacement_round_dir(
+                    self.campaign_dir,
+                    context=context,
+                    iteration=0 if context == "bootstrap" else iteration,
+                    replacement_round=int(getattr(state, "replacement_round", 0)),
+                )
+                expected_gaussian_phase = (
+                    "INITIAL_REPLACEMENT_GAUSSIAN"
+                    if context == "bootstrap"
+                    else "REPLACEMENT_GAUSSIAN"
+                )
+            _root, count = staging.stage_aimall_inputs(
+                self.campaign_dir,
+                self.config,
+                phase_name,
+                iteration,
+                partition_override=str(
+                    self.config.resources.partition_for(phase_name)
+                ),
+                staging_override=staging_override,
+                expected_gaussian_phase=expected_gaussian_phase,
+            )
+        elif phase_name == "ARIADNE_ARRAY":
+            from ..seed_identity import read_ariadne_task_map
+
+            task_map = read_ariadne_task_map(
+                active_iteration_dir(self.campaign_dir, iteration),
+                expected_iteration=iteration,
+            )
+            count = int(task_map["n_tasks"])
+        elif phase_name in {"INITIAL_FEREBUS", "FEREBUS"}:
+            _root, count = staging.stage_ferebus_inputs(
+                self.campaign_dir,
+                self.config,
+                int(getattr(state, "reference_data_version", 0)),
+                is_initial=phase_name == "INITIAL_FEREBUS",
+            )
+        else:
+            raise BackendSubmissionError(
+                "dry-run has no production staging contract for " + phase_name
+            )
+        if isinstance(count, bool) or int(count) <= 0:
+            raise BackendSubmissionError(
+                "dry-run production staging yielded no tasks for " + phase_name
+            )
+        return int(count)
+
+    def _write_stub_script(
+        self,
+        phase_name: str,
+        iteration: int,
+        *,
+        expected_tasks: int,
+        campaign_uid: str,
+    ) -> Path:
         from .submission_intent import load_active_intent
+        from .live_executor import build_sbatch_script
 
         intent = load_active_intent(self.campaign_dir, phase_name, int(iteration))
         identity = (
@@ -187,18 +293,28 @@ class DryRunPhaseExecutor:
             phase_name,
             int(iteration),
             identity,
-            array_size=None,
+            array_size=(
+                None
+                if phase_name in {"PHASE_A_DIVERSITY", "PHASE_B_DIVERSITY"}
+                else int(expected_tasks)
+            ),
             max_log_files_per_directory=5000,
         )
-        lines = [
-            "#!/bin/sh",
-            "# DRY-RUN stub for phase " + phase_name + ", iteration " + str(iteration),
-            "# Generated by DryRunPhaseExecutor; no real backend invoked.",
-            'echo "DRYRUN ' + phase_name + ' iteration=' + str(iteration) + '"',
-            "exit 0",
-            "",
-        ]
-        path = write_attempt_script(bundle, "\n".join(lines))
+        script = build_sbatch_script(
+            phase_name=phase_name,
+            iteration=int(iteration),
+            campaign_dir=self.campaign_dir,
+            config=self.config,
+            array_size=(
+                None
+                if phase_name in {"PHASE_A_DIVERSITY", "PHASE_B_DIVERSITY"}
+                else int(expected_tasks)
+            ),
+            campaign_uid=campaign_uid,
+            attempt_bundle=bundle,
+            dry_run=True,
+        )
+        path = write_attempt_script(bundle, script)
         self.artefact_log.append(str(path))
         return path
 
@@ -2570,44 +2686,31 @@ class DryRunPhaseExecutor:
         path: Path,
         *,
         method: str,
-        point_index: int,
+        atoms: Any,
         total_energy_ha: float,
     ) -> None:
-        """Write a minimal parseable three-atom WFN for dry contract tests."""
-        from ichor.core.atoms import Atom, Atoms
-        from ichor.core.common.units import AtomicDistance
+        """Write a parseable WFN with the exact staged molecular geometry."""
         from ichor.core.files.gaussian.wfn import MolecularOrbital, WFN
 
-        displacement = 0.01 * int(point_index)
-        atoms = Atoms(
-            [
-                Atom("O", 0.0, 0.0, 0.0, units=AtomicDistance.Bohr),
-                Atom(
-                    "H",
-                    1.43 + displacement,
-                    0.0,
-                    0.0,
-                    units=AtomicDistance.Bohr,
-                ),
-                Atom(
-                    "H",
-                    -0.36,
-                    1.38 + displacement,
-                    0.0,
-                    units=AtomicDistance.Bohr,
-                ),
-            ]
-        )
+        resolved_atoms = atoms.to_bohr()
+        atom_count = len(resolved_atoms)
+        if atom_count <= 0:
+            raise BackendSubmissionError("dry-run WFN geometry is empty")
         wfn = WFN(path, method=str(method))
-        wfn.atoms = atoms
+        wfn.atoms = resolved_atoms
         wfn.n_orbitals = 1
-        wfn.n_primitives = 3
-        wfn.n_nuclei = 3
-        wfn.centre_assignments = [1, 2, 3]
-        wfn.type_assignments = [1, 1, 1]
-        wfn.primitive_exponents = [1.0, 1.0, 1.0]
+        wfn.n_primitives = atom_count
+        wfn.n_nuclei = atom_count
+        wfn.centre_assignments = list(range(1, atom_count + 1))
+        wfn.type_assignments = [1] * atom_count
+        wfn.primitive_exponents = [1.0] * atom_count
         wfn.molecular_orbitals = [
-            MolecularOrbital(1, 2.0, -0.5, [1.0, 0.0, 0.0])
+            MolecularOrbital(
+                1,
+                2.0,
+                -0.5,
+                [1.0] + [0.0] * (atom_count - 1),
+            )
         ]
         wfn.total_energy = float(total_energy_ha)
         wfn.virial_ratio = 2.0
@@ -2715,16 +2818,21 @@ class DryRunPhaseExecutor:
             )
         staging_root.mkdir(parents=True, exist_ok=True)
         n_points = len(attempts)
-        pointdirs = []
-        for i, attempt in enumerate(attempts):
-            point_index = (
-                int(allocation["targets"]["total"])
-                + int(attempt.get("reserve_rank", i))
-                if replacement
-                else i
+        try:
+            point_names = _stg._points_file_names(staging_root)
+        except Exception as exc:
+            raise BackendSubmissionError(
+                "dry-run quantum postprocess requires production POINTS.txt: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)
+            ) from exc
+        if len(point_names) != n_points:
+            raise BackendSubmissionError(
+                "dry-run staged quantum task count does not match allocation"
             )
-            point_dir = staging_root / staging_pointdir_name(point_index)
-            point_dir.mkdir(exist_ok=True)
+        pointdirs = [staging_root / name for name in point_names]
+        for i, (attempt, point_dir) in enumerate(zip(attempts, pointdirs)):
             provenance_source = Path(str(attempt.get("provenance_json") or ""))
             provenance_dest = point_dir / PROVENANCE_FILENAME
             if not provenance_dest.is_file() and provenance_source.is_file():
@@ -2762,7 +2870,6 @@ class DryRunPhaseExecutor:
                 encoding="utf-8",
             )
             self.artefact_log.append(str(point_dir / artefact_name))
-            pointdirs.append(point_dir)
         _stg.write_points_file(staging_root, pointdirs)
         phase_name = (
             ("INITIAL_REPLACEMENT_" if initial else "REPLACEMENT_") + stage
@@ -2776,6 +2883,43 @@ class DryRunPhaseExecutor:
             accepted=pointdirs,
             rejected=[],
         )
+        if stage == "GAUSSIAN":
+            from ichor.core.files.gaussian.gjf import GJF
+
+            from .quantum_quality import canonicalise_aimall_method
+            from .quantum_task_receipts import write_quantum_task_receipt
+
+            canonical_method = canonicalise_aimall_method(
+                self.config.gaussian.method
+            )
+            for logical_task_id, point_dir in enumerate(pointdirs):
+                gjf = GJF(point_dir / "input.gjf")
+                total_energy = -1.0 - 0.01 * logical_task_id
+                self._write_dry_quantum_wfn(
+                    point_dir / "input.wfn",
+                    method=canonical_method,
+                    atoms=gjf.atoms,
+                    total_energy_ha=total_energy,
+                )
+                (point_dir / "input.gau").write_text(
+                    "DRYRUN Gaussian output\nNormal termination of Gaussian\n",
+                    encoding="utf-8",
+                    newline="\n",
+                )
+                receipt = write_quantum_task_receipt(
+                    self.campaign_dir,
+                    point_dir,
+                    phase_name=phase_name,
+                    iteration=int(state.iteration),
+                    logical_task_id=logical_task_id,
+                )
+                self.artefact_log.extend(
+                    [
+                        str(point_dir / "input.wfn"),
+                        str(point_dir / "input.gau"),
+                        str(receipt),
+                    ]
+                )
         if stage == "AIMALL":
             from ichor.core.common.constants import multipole_names
 
@@ -2791,41 +2935,73 @@ class DryRunPhaseExecutor:
                 self.config.gaussian.method
             )
 
+            from ichor.core.files.gaussian.gjf import GJF
+            from ichor.core.files.gaussian.wfn import WFN
+
+            from .quantum_task_receipts import write_quantum_task_receipt
+
             records = []
-            atom_names = ("O1", "H2", "H3")
-            for point_index, point_dir in enumerate(pointdirs):
-                total_energy = -1.0 - 0.01 * point_index
-                atom_iqa = (0.6 * total_energy, 0.2 * total_energy, 0.2 * total_energy)
-                records.append(
+            for logical_task_id, point_dir in enumerate(pointdirs):
+                atoms = GJF(point_dir / "input.gjf").atoms
+                atom_names = list(atoms.atom_names)
+                total_energy = float(WFN(point_dir / "input.wfn").total_energy)
+                weights = [float(atom.nuclear_charge) for atom in atoms]
+                weight_sum = sum(weights)
+                if weight_sum <= 0.0:
+                    raise BackendSubmissionError(
+                        "dry-run AIMAll atom weights are not positive"
+                    )
+                atom_iqa = [
+                    total_energy * weight / weight_sum for weight in weights
+                ]
+                per_atom = [
                     {
-                        "pointdir": point_dir.name,
-                        "accepted": True,
+                        "atom": atom_name,
+                        "int_file": atom_name.lower() + ".int",
+                        "dft_model": canonical_method,
+                        "canonical_dft_model": canonical_method,
+                        "iqa_ha": value,
+                        "integration_error": 0.0,
+                        "multipoles": {
+                            name: 0.0 for name in multipole_names
+                        },
                         "reasons": [],
-                        "atom_count": 3,
-                        "expected_atom_names": list(atom_names),
-                        "n_int": 3,
-                        "sum_iqa_ha": total_energy,
-                        "wfn_total_energy_ha": total_energy,
-                        "wfn_virial_ratio": 2.0,
-                        "iqa_energy_recovery_error_ha": 0.0,
-                        "max_abs_integration_error": 0.0,
-                        "per_atom": [
-                            {
-                                "atom": atom_name,
-                                "int_file": atom_name.lower() + ".int",
-                                "dft_model": canonical_method,
-                                "canonical_dft_model": canonical_method,
-                                "iqa_ha": value,
-                                "integration_error": 0.0,
-                                "multipoles": {
-                                    name: 0.0 for name in multipole_names
-                                },
-                                "reasons": [],
-                            }
-                            for atom_name, value in zip(atom_names, atom_iqa)
-                        ],
                     }
+                    for atom_name, value in zip(atom_names, atom_iqa)
+                ]
+                quality_record = {
+                    "pointdir": point_dir.name,
+                    "accepted": True,
+                    "reasons": [],
+                    "atom_count": len(atom_names),
+                    "expected_atom_names": atom_names,
+                    "n_int": len(atom_names),
+                    "sum_iqa_ha": total_energy,
+                    "wfn_total_energy_ha": total_energy,
+                    "wfn_virial_ratio": 2.0,
+                    "iqa_energy_recovery_error_ha": 0.0,
+                    "max_abs_integration_error": 0.0,
+                    "per_atom": per_atom,
+                }
+                records.append(quality_record)
+                atomic_dir = point_dir / "input_atomicfiles"
+                atomic_dir.mkdir(exist_ok=True)
+                for atom_record in per_atom:
+                    self._write_dry_aimall_int(
+                        atomic_dir / str(atom_record["int_file"]),
+                        atom_name=str(atom_record["atom"]),
+                        method=canonical_method,
+                        iqa_ha=float(atom_record["iqa_ha"]),
+                        multipole_names=multipole_names,
+                    )
+                receipt = write_quantum_task_receipt(
+                    self.campaign_dir,
+                    point_dir,
+                    phase_name=phase_name,
+                    iteration=int(state.iteration),
+                    logical_task_id=logical_task_id,
                 )
+                self.artefact_log.append(str(receipt))
             manifest = write_quantum_quality_manifest(
                 staging_root,
                 phase_name=phase_name,
@@ -2834,36 +3010,7 @@ class DryRunPhaseExecutor:
                 gates=getattr(self.config, "quality_gates", None),
             )
             self.artefact_log.append(str(manifest))
-            for point_index, (point_dir, quality_record) in enumerate(
-                zip(pointdirs, records)
-            ):
-                for filename in (
-                    "input.gjf",
-                    "input.gau",
-                    "AIMALL_TASK.json",
-                    "GAUSSIAN_TASK_RECEIPT.json",
-                    "WFN_METHOD_RECEIPT.json",
-                    "AIMALL_COMPLETION_RECEIPT.json",
-                ):
-                    path = point_dir / filename
-                    if not path.exists():
-                        path.write_text("DRYRUN synthetic evidence\n", encoding="utf-8")
-                self._write_dry_quantum_wfn(
-                    point_dir / "input.wfn",
-                    method=canonical_method,
-                    point_index=point_index,
-                    total_energy_ha=float(quality_record["wfn_total_energy_ha"]),
-                )
-                atomic_dir = point_dir / "input_atomicfiles"
-                atomic_dir.mkdir(exist_ok=True)
-                for atom_record in quality_record["per_atom"]:
-                    self._write_dry_aimall_int(
-                        atomic_dir / str(atom_record["int_file"]),
-                        atom_name=str(atom_record["atom"]),
-                        method=canonical_method,
-                        iqa_ha=float(atom_record["iqa_ha"]),
-                        multipole_names=multipole_names,
-                    )
+            for point_dir, quality_record in zip(pointdirs, records):
                 write_quantum_acceptance_receipt(
                     self.campaign_dir,
                     point_dir,

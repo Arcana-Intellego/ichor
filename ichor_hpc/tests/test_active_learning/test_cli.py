@@ -522,6 +522,48 @@ def test_cli_preflight_prints_operator_dashboard_by_default(tmp_path, capsys, mo
     assert not out.lstrip().startswith("{")
 
 
+def test_campaign_preflight_validates_every_slurm_phase_resource_contract(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon import resource_solver
+    from ichor.hpc.active_learning.daemon.phase_executor import SBATCH_PHASES
+
+    campaign = _campaign_with_config(tmp_path)
+    _write_locked_state(campaign, fresh_campaign_state(max_iterations=2))
+    monkeypatch.setattr(
+        cli_mod,
+        "_pool_feasibility_summary",
+        lambda _campaign, _config: _pool_feasibility_payload(),
+    )
+    supported = []
+    walltimes = []
+    monkeypatch.setattr(
+        resource_solver,
+        "validate_partition_supported",
+        lambda partition: supported.append(str(partition)),
+    )
+    monkeypatch.setattr(
+        resource_solver,
+        "validate_partition_walltime",
+        lambda partition, hours: walltimes.append(
+            (str(partition), float(hours))
+        ),
+    )
+
+    payload = cli_mod.evaluate_campaign_preflight(
+        campaign,
+        avail=_backend_availability(),
+    )
+
+    assert payload["campaign_config"]["ok"] is True
+    assert len(supported) == len(SBATCH_PHASES)
+    assert len(walltimes) == len(SBATCH_PHASES)
+    assert set(payload["campaign_config"]["resource_profile"]) == set(
+        SBATCH_PHASES
+    )
+
+
 def test_cli_preflight_json_prints_single_payload(tmp_path, capsys, monkeypatch):
     campaign = _campaign_with_config(tmp_path)
     state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
@@ -980,10 +1022,10 @@ def test_cli_status_reports_actually_held_lock(tmp_path, capsys):
     finally:
         holder.terminate()
         try:
-            holder.wait(timeout=5)
+            holder.communicate(timeout=5)
         except subprocess.TimeoutExpired:
             holder.kill()
-            holder.wait(timeout=5)
+            holder.communicate(timeout=5)
 
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)

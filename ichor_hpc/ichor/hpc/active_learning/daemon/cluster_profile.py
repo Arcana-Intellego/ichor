@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import os
 import importlib
+import math
 from dataclasses import dataclass
+from numbers import Integral, Real
 from typing import Any, Optional
 
 
@@ -62,7 +64,105 @@ def require_cluster_profile() -> ClusterProfile:
             + repr(machine)
             + " is not present in ~/ichor_config.yaml"
         )
-    return ClusterProfile(machine=str(machine), config=config)
+    profile = ClusterProfile(machine=str(machine), config=config)
+    validate_cluster_profile(profile)
+    return profile
+
+
+def _exact_positive_integer(value: Any, label: str, *, minimum: int = 1) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ClusterProfileError(label + " must be an exact integer")
+    result = int(value)
+    if result < minimum:
+        raise ClusterProfileError(label + " must be >= " + str(minimum))
+    return result
+
+
+def _finite_positive(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ClusterProfileError(label + " must be numeric")
+    result = float(value)
+    if not math.isfinite(result) or result <= 0.0:
+        raise ClusterProfileError(label + " must be finite and > 0")
+    return result
+
+
+def validate_cluster_profile(profile: ClusterProfile) -> None:
+    """Validate the profile semantics consumed by every live renderer."""
+    machine_profile = profile.config.get(profile.machine)
+    if not isinstance(machine_profile, dict):
+        raise ClusterProfileError("active machine profile must be a mapping")
+    hpc = machine_profile.get("hpc")
+    software = machine_profile.get("software")
+    if not isinstance(hpc, dict) or not isinstance(software, dict):
+        raise ClusterProfileError("active profile requires hpc and software mappings")
+    if hpc.get("scheduler") != "slurm":
+        raise ClusterProfileError("active-learning live profiles require hpc.scheduler: slurm")
+    if hpc.get("jobscript_shebang") != "#!/bin/bash --login":
+        raise ClusterProfileError(
+            "active-learning Slurm profiles require jobscript_shebang: "
+            "#!/bin/bash --login"
+        )
+    _exact_positive_integer(
+        hpc.get("max_array_task_id"),
+        "hpc.max_array_task_id",
+        minimum=0,
+    )
+    _exact_positive_integer(
+        hpc.get("max_job_log_files_per_directory"),
+        "hpc.max_job_log_files_per_directory",
+    )
+    partitions = hpc.get("partitions")
+    if not isinstance(partitions, dict) or not partitions:
+        raise ClusterProfileError("hpc.partitions must be a non-empty mapping")
+    for name, partition in partitions.items():
+        label = "hpc.partitions." + str(name)
+        if not isinstance(partition, dict):
+            raise ClusterProfileError(label + " must be a mapping")
+        minimum = _exact_positive_integer(partition.get("min_cpus"), label + ".min_cpus")
+        maximum = _exact_positive_integer(partition.get("max_cpus"), label + ".max_cpus")
+        if maximum < minimum:
+            raise ClusterProfileError(label + ".max_cpus must be >= min_cpus")
+        _finite_positive(partition.get("memory_per_core_gb"), label + ".memory_per_core_gb")
+        _finite_positive(partition.get("max_walltime_hours"), label + ".max_walltime_hours")
+        if not isinstance(partition.get("daemon_supported"), bool):
+            raise ClusterProfileError(label + ".daemon_supported must be a Boolean")
+    python = software.get("python")
+    if not isinstance(python, dict):
+        raise ClusterProfileError("software.python must be a mapping")
+    raw_python = python.get("python_path")
+    if not isinstance(raw_python, str) or not raw_python.strip():
+        raise ClusterProfileError("software.python.python_path must be a non-empty string")
+    if any(character in raw_python for character in "\r\n\x00"):
+        raise ClusterProfileError("software.python.python_path contains control characters")
+    expanded_python = os.path.abspath(
+        os.path.expanduser(os.path.expandvars(raw_python.strip()))
+    )
+    if not os.path.isabs(expanded_python):
+        raise ClusterProfileError("software.python.python_path must resolve absolutely")
+    library_path = python.get("library_path")
+    if library_path is not None:
+        values = [library_path] if isinstance(library_path, str) else library_path
+        if not isinstance(values, (list, tuple)) or not values:
+            raise ClusterProfileError(
+                "software.python.library_path must be a string or non-empty list"
+            )
+        for value in values:
+            if not isinstance(value, str) or not value.strip():
+                raise ClusterProfileError(
+                    "software.python.library_path entries must be non-empty strings"
+                )
+            if any(character in value for character in "\r\n\x00"):
+                raise ClusterProfileError(
+                    "software.python.library_path contains control characters"
+                )
+    ferebus = software.get("ferebus")
+    if not isinstance(ferebus, dict) or not isinstance(
+        ferebus.get("pyferebus_platform"), str
+    ) or not ferebus["pyferebus_platform"].strip():
+        raise ClusterProfileError(
+            "software.ferebus.pyferebus_platform must be explicit for live mode"
+        )
 
 
 def profile_value(*keys: str, default: Any = None, require_profile: bool = False) -> Any:
@@ -94,3 +194,14 @@ def expanded_profile_value(*keys: str, default: Any = None) -> Any:
     if value is None:
         return None
     return os.path.expanduser(os.path.expandvars(str(value)))
+
+
+__all__ = [
+    "ClusterProfile",
+    "ClusterProfileError",
+    "active_machine",
+    "expanded_profile_value",
+    "profile_value",
+    "require_cluster_profile",
+    "validate_cluster_profile",
+]

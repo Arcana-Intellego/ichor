@@ -38,6 +38,7 @@ module load libs/gcc/openssl/1.1.1w
 mkdir -p ~/src ~/opt
 cd ~/src
 wget https://www.python.org/ftp/python/3.11.15/Python-3.11.15.tgz
+echo "f4de1b10bd6c70cbb9fa1cd71fc5038b832747a74ee59d599c69ce4846defb50  Python-3.11.15.tgz" | sha256sum -c -
 tar -xzf Python-3.11.15.tgz
 cd Python-3.11.15
 
@@ -59,7 +60,7 @@ python -m pip install --upgrade pip setuptools wheel
 ```
 
 If direct download is blocked, download the tarball locally from `python.org`,
-copy it to CSF3, and build it on CSF3.
+copy it to CSF3, verify the same SHA-256 on CSF3, and build it there.
 The `import ssl` check is required: if it fails, `pip` cannot use PyPI over
 HTTPS and the Python install must be rebuilt with the OpenSSL module loaded.
 
@@ -131,94 +132,25 @@ in the venv and under `$HOME/opt`; no binaries are committed to this repo.
 
 ## 5. Configure `~/ichor_config.yaml`
 
-```yaml
-csf3:
-  hpc:
-    scheduler: slurm
-    jobscript_shebang: "#!/bin/bash --login"
-    max_array_task_id: 25000
-    max_job_log_files_per_directory: 5000
-    memory_per_core_gb: 8
-    memory_per_core_gb_by_partition:
-      multicore: 8
-      interactive: 8
-      serial: 5
-      multicore_small: 5
-      himem: 32
-    parallel_environments:
-      serial: [1, 1]
-      multicore: [2, 168]
-      interactive: [1, 168]
-      multicore_small: [2, 32]
-      himem: [1, 32]
-    partitions:
-      serial:
-        min_cpus: 1
-        max_cpus: 1
-        memory_per_core_gb: 5
-        max_walltime_hours: 168
-        daemon_supported: true
-      multicore:
-        min_cpus: 2
-        max_cpus: 168
-        memory_per_core_gb: 8
-        max_walltime_hours: 168
-        daemon_supported: true
-      interactive:
-        min_cpus: 1
-        max_cpus: 168
-        memory_per_core_gb: 8
-        max_walltime_hours: 24
-        daemon_supported: true
-      multicore_small:
-        min_cpus: 2
-        max_cpus: 32
-        memory_per_core_gb: 5
-        max_walltime_hours: 168
-        daemon_supported: true
-      himem:
-        min_cpus: 1
-        max_cpus: 32
-        memory_per_core_gb: 32
-        max_walltime_hours: 168
-        daemon_supported: true
+The repository root [`ichor_config.yaml`](../../ichor_config.yaml) is the
+single canonical CSF3 profile. Run `scripts/install_ichor_csf.sh --machine
+csf3`; the installer copies that profile atomically into
+`~/ichor_config.yaml` and overrides only the local Python, AIMAll, FEREBUS and
+PLUMED paths. Do not maintain a second profile in this guide.
 
-  software:
-    python:
-      env_name: "ichor-csf3"
-      python_path: "$HOME/.venv/ichor-csf3/bin/python"
-      modules: []
-
-    gaussian:
-      executable_path: "$g09root/g09/g09"
-      modules: ["apps/binapps/gaussian/g09d01_em64t"]
-
-    aimall:
-      executable_path: "~/AIMAll/aimqb.ish"
-
-    ferebus:
-      executable_path: "$HOME/.local/bin/ferebus"
-      pyferebus_platform: "CSF3"
-
-    ariadne_runtime:
-      modules:
-        - "compilers/intel/oneapi/2025.0.1"
-        - "umf compiler-rt tbb compiler"
-        - "mkl/2025.0"
-
-    plumed:
-      kernel_path: "$HOME/opt/plumed-2.10.0/lib/libplumedKernel.so"
-      library_path: "$HOME/opt/plumed-2.10.0/lib"
-      modules: []
-```
+The canonical CSF3 contract uses a login-shell Slurm script, private CPython
+3.11 plus `$HOME/opt/python-3.11.15/lib`, 8 GB/core on `multicore`, 4
+GB/core on `serial`, 5 GB/core on `multicore_small`, and a six-hour
+`interactive` ceiling. Inspect the installed values with
+`ichor-al-daemon preflight --verbose` before submitting work.
 
 The active-learning daemon defaults all backend-specific `resources.<backend>`
 overrides to `null`, which means "inherit from `resources.defaults`". The
 canonical default partition is `multicore` for every backend. On CSF3 these
 effective resources resolve from the active profile partition metadata: the
 AMD `multicore` and `interactive` partitions use 8G/core, the lower-memory
-Intel `serial`/`multicore_small` partitions use 5G/core, and `himem` is
-available for larger memory jobs.
+Intel `serial` partition uses 4G/core, `multicore_small` uses 5G/core, and
+`himem` is available for larger memory jobs.
 Gaussian live jobs always use the immutable Slurm allocation through
 `GAUSS_PDEF` and `GAUSS_MDEF`. Per-input `%NProcShared` and `%Mem` directives
 are rejected so a staged input cannot disagree with its submitted resources.

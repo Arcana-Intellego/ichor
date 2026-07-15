@@ -4,21 +4,28 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = REPO_ROOT / "scripts" / "install_ichor_csf.sh"
 LIB = REPO_ROOT / "scripts" / "lib_ichor_csf.sh"
+CANONICAL_PROFILE = REPO_ROOT / "ichor_config.yaml"
+UPSERT = REPO_ROOT / "scripts" / "upsert_ichor_config.py"
 
 
 def _make_fake_projects(tmp_path: Path) -> Path:
     projects = tmp_path / "projects"
-    (projects / "FEREBUS_CPU" / "pyferebus").mkdir(parents=True)
-    (projects / "FEREBUS_CPU" / "libs").mkdir(parents=True)
-    (projects / "ARIADNE").mkdir(parents=True)
+    (projects / "FEREBUS_CPU" / "pyferebus").mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    (projects / "FEREBUS_CPU" / "libs").mkdir(parents=True, exist_ok=True)
+    (projects / "ARIADNE").mkdir(parents=True, exist_ok=True)
     return projects
 
 
@@ -33,7 +40,7 @@ def _run_dry(
     projects = _make_fake_projects(tmp_path)
     env = os.environ.copy()
     env["HOME"] = str(tmp_path / "home")
-    (tmp_path / "home").mkdir()
+    (tmp_path / "home").mkdir(exist_ok=True)
     return subprocess.run(
         [
             bash,
@@ -61,6 +68,8 @@ def test_install_script_is_present():
     assert os.access(SCRIPT, os.R_OK)
     text = SCRIPT.read_text(encoding="utf-8")
     lib_text = LIB.read_text(encoding="utf-8")
+    profile_text = CANONICAL_PROFILE.read_text(encoding="utf-8")
+    upsert_text = UPSERT.read_text(encoding="utf-8")
     assert "--machine auto|csf3|csf4" in text
     assert "--only all|python|packages|ariadne|plumed|ferebus|config|verify|doctor" in text
     assert "--debug, --trace" in text
@@ -74,8 +83,8 @@ def test_install_script_is_present():
     assert "from xtb.ase.calculator import XTB" in text
     assert 'init --campaign-dir "${smoke_dir}" --yes' in text
     assert ': > "${smoke_dir}/pool.xyz"' in text
-    assert "pyferebus_platform\": \"CSF3\"" in text
-    assert "pyferebus_platform\": \"CSF4\"" in text
+    assert 'pyferebus_platform: "CSF3"' in profile_text
+    assert 'pyferebus_platform: "CSF4"' in profile_text
     assert "libs/gcc/openssl/1.1.1w" in text
     assert "--with-openssl=" in text
     assert "--with-openssl-rpath=auto" in text
@@ -116,10 +125,19 @@ def test_install_script_is_present():
     assert "unset CC CXX FC F77 F90" in text
     assert "export CC=gcc" in text
     assert "export CXX=g++" in text
-    assert "apps/binapps/gaussian/g09d01_em64t" in text
-    assert "$g09root/g09/g09" in text
-    assert "gaussian/g16c01_em64t_detectcpu" in text
-    assert "$g16root/g16/g16" in text
+    assert "apps/binapps/gaussian/g09d01_em64t" in profile_text
+    assert "$g09root/g09/g09" in profile_text
+    assert "gaussian/g16c01_em64t_detectcpu" in profile_text
+    assert "$g16root/g16/g16" in profile_text
+    assert "OPENBLAS_SHA256=" in text
+    assert 'verify_sha256 "${tarball}" "${OPENBLAS_SHA256}"' in text
+    assert "./fetchOpenBlas.sh" not in text
+    assert 'NO_SHARED=1 NUM_THREADS=64' in text
+    assert 'scripts/upsert_ichor_config.py' in text
+    assert 'canonical = _load_mapping(canonical_config' in upsert_text
+    assert 'data[str(machine)] = profile' in upsert_text
+    assert 'os.replace(temporary, path)' in upsert_text
+    assert '_fsync_parent(path)' in upsert_text
 
 
 def test_install_script_bash_syntax():
@@ -148,7 +166,11 @@ def test_install_script_dry_run_renders_cluster_defaults(machine, venv_name, tmp
     assert "PLUMED" in output
     assert "source " in output
     assert f".venv/{venv_name}/bin/activate" in output.replace("\\", "/")
-    assert "upsert " + machine + " profile in ~/ichor_config.yaml" in output
+    assert (
+        "initialise/update ~/ichor_config.yaml from repo template and upsert "
+        + machine
+        + " profile"
+    ) in output
 
 
 def test_install_script_dry_run_uses_parallel_build_flags(tmp_path):
@@ -210,7 +232,7 @@ def test_install_script_verifies_ariadne_compilers_after_module_load():
     assert "setvars" not in lib_text
 
 
-def test_install_script_dry_run_config_stage_preserves_gaussian_profiles(tmp_path):
+def test_install_script_config_uses_canonical_gaussian_profiles(tmp_path):
     csf3 = _run_dry("csf3", tmp_path, "--only", "config")
     csf4 = _run_dry("csf4", tmp_path, "--only", "config")
 
@@ -218,7 +240,97 @@ def test_install_script_dry_run_config_stage_preserves_gaussian_profiles(tmp_pat
     assert csf4.returncode == 0, csf4.stdout + csf4.stderr
 
     text = SCRIPT.read_text(encoding="utf-8")
-    assert "apps/binapps/gaussian/g09d01_em64t" in text
-    assert "$g09root/g09/g09" in text
-    assert "gaussian/g16c01_em64t_detectcpu" in text
-    assert "$g16root/g16/g16" in text
+    upsert_text = UPSERT.read_text(encoding="utf-8")
+    profile_text = CANONICAL_PROFILE.read_text(encoding="utf-8")
+    assert 'profile = copy.deepcopy(raw_profile)' in upsert_text
+    assert "apps/binapps/gaussian/g09d01_em64t" in profile_text
+    assert "$g09root/g09/g09" in profile_text
+    assert "gaussian/g16c01_em64t_detectcpu" in profile_text
+    assert "$g16root/g16/g16" in profile_text
+    assert '"multinode"' not in text
+
+
+def test_profile_upsert_is_atomic_and_preserves_unrelated_profiles(tmp_path):
+    destination = tmp_path / "ichor_config.yaml"
+    original = {
+        "private-cluster": {"operator_value": 17},
+        "csf4": {"hpc": {"partitions": {"multinode": {}}}},
+    }
+    destination.write_text(
+        yaml.safe_dump(original, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(UPSERT),
+            "--destination",
+            str(destination),
+            "--canonical-config",
+            str(CANONICAL_PROFILE),
+            "--machine",
+            "csf4",
+            "--python-path",
+            "$HOME/.venv/ichor-csf4/bin/python",
+            "--python-library-path",
+            "$HOME/opt/python-3.11.15/lib",
+            "--aimall-path",
+            "$HOME/AIMAll/aimqb.ish",
+            "--ferebus-path",
+            "$HOME/.local/bin/ferebus",
+            "--plumed-kernel",
+            "$HOME/opt/plumed-2.10.0/lib/libplumedKernel.so",
+            "--plumed-library-path",
+            "$HOME/opt/plumed-2.10.0/lib",
+        ],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    installed = yaml.safe_load(destination.read_text(encoding="utf-8"))
+    assert installed["private-cluster"] == {"operator_value": 17}
+    assert "multinode" not in installed["csf4"]["hpc"]["partitions"]
+    assert installed["csf4"]["software"]["python"]["python_path"].startswith(
+        "$HOME/"
+    )
+    backups = list(tmp_path.glob("ichor_config.yaml.bak.*"))
+    assert len(backups) == 1
+    assert yaml.safe_load(backups[0].read_text(encoding="utf-8")) == original
+    assert not list(tmp_path.glob("ichor_config.yaml.tmp.*"))
+
+
+def test_canonical_csf_profiles_match_documented_limits():
+    from ichor.hpc.active_learning.daemon.cluster_profile import (
+        ClusterProfile,
+        validate_cluster_profile,
+    )
+
+    profiles = yaml.safe_load(CANONICAL_PROFILE.read_text(encoding="utf-8"))
+    csf3 = profiles["csf3"]
+    csf4 = profiles["csf4"]
+
+    assert csf3["hpc"]["jobscript_shebang"] == "#!/bin/bash --login"
+    assert csf3["hpc"]["partitions"]["serial"]["memory_per_core_gb"] == 4
+    assert csf3["hpc"]["partitions"]["interactive"]["max_walltime_hours"] == 6
+    assert csf3["software"]["python"]["library_path"].endswith(
+        "/python-3.11.15/lib"
+    )
+    assert csf4["hpc"]["jobscript_shebang"] == "#!/bin/bash --login"
+    assert csf4["hpc"]["partitions"]["multicore"]["max_cpus"] == 40
+    assert "multinode" not in csf4["hpc"]["partitions"]
+    validate_cluster_profile(ClusterProfile(machine="csf3", config=profiles))
+    validate_cluster_profile(ClusterProfile(machine="csf4", config=profiles))
+
+
+def test_cluster_guides_do_not_duplicate_machine_profile_yaml():
+    for relative in (
+        "examples/csf3_first_live_iter/README.md",
+        "examples/csf4_first_live_iter/README.md",
+    ):
+        text = (REPO_ROOT / relative).read_text(encoding="utf-8")
+        assert "```yaml\ncsf3:" not in text
+        assert "```yaml\ncsf4:" not in text
+        assert "single canonical" in text

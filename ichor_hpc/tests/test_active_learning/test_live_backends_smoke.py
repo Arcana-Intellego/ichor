@@ -260,10 +260,25 @@ def test_submitted_environment_smoke_renders_exact_runtime_contract(
                 "hpc": {
                     "scheduler": "slurm",
                     "jobscript_shebang": "#!/bin/bash --login",
+                    "max_array_task_id": 25000,
+                    "max_job_log_files_per_directory": 5000,
                     "memory_per_core_gb_by_partition": {"multicore": 8},
+                    "partitions": {
+                        "multicore": {
+                            "min_cpus": 2,
+                            "max_cpus": 168,
+                            "memory_per_core_gb": 8,
+                            "max_walltime_hours": 168,
+                            "daemon_supported": True,
+                        }
+                    },
                 },
                 "software": {
                     "gaussian": {"modules": ["gaussian/test"]},
+                    "python": {
+                        "python_path": "/home/user/.venv/ichor-csf3/bin/python"
+                    },
+                    "ferebus": {"pyferebus_platform": "CSF3"},
                 },
             }
         },
@@ -272,6 +287,7 @@ def test_submitted_environment_smoke_renders_exact_runtime_contract(
     availability = SimpleNamespace(
         active_profile="csf3",
         batch_runtime_modules=("python/test", "mkl/test"),
+        batch_python_library_paths=("/home/user/opt/python-3.11.15/lib",),
         python_executable="/home/user/.venv/ichor-csf3/bin/python",
         gaussian_binary="/opt/gaussian/g16",
         aimall_path="/home/user/AIMAll/aimqb.ish",
@@ -290,6 +306,9 @@ def test_submitted_environment_smoke_renders_exact_runtime_contract(
     assert "#SBATCH --partition=multicore" in body
     assert "#SBATCH --mem-per-cpu=8G" in body
     assert body.index("module load python/test") < body.index("module load gaussian/test")
+    assert body.index("export LD_LIBRARY_PATH=") < body.index(
+        "/home/user/.venv/ichor-csf3/bin/python"
+    )
     assert "pyferebus.executors.trainer" in body
     assert "test -x /opt/gaussian/g16" in body
     assert "test -x /home/user/AIMAll/aimqb.ish" in body
@@ -304,9 +323,26 @@ def test_submitted_environment_smoke_records_success(tmp_path, monkeypatch):
                 "hpc": {
                     "scheduler": "slurm",
                     "jobscript_shebang": "#!/bin/bash --login",
+                    "max_array_task_id": 25000,
+                    "max_job_log_files_per_directory": 5000,
                     "memory_per_core_gb_by_partition": {"multicore": 4},
+                    "partitions": {
+                        "multicore": {
+                            "min_cpus": 2,
+                            "max_cpus": 40,
+                            "memory_per_core_gb": 4,
+                            "max_walltime_hours": 168,
+                            "daemon_supported": True,
+                        }
+                    },
                 },
-                "software": {"gaussian": {"modules": ["gaussian/test"]}},
+                "software": {
+                    "gaussian": {"modules": ["gaussian/test"]},
+                    "python": {
+                        "python_path": "/home/user/.venv/ichor-csf4/bin/python"
+                    },
+                    "ferebus": {"pyferebus_platform": "CSF4"},
+                },
             }
         },
         "csf4",
@@ -507,6 +543,55 @@ def test_build_sbatch_script_uses_configured_runtime_modules(monkeypatch):
     assert "module load oneapi/custom" in body
     assert "module load mkl/custom" in body
     assert "module load python/3.11.3-gcccore-12.3.0" not in body
+
+
+def test_csf3_private_python_path_and_loader_are_expanded_before_use(monkeypatch):
+    monkeypatch.setenv("HOME", "/home/test-user")
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf3": {
+                "hpc": {
+                    "scheduler": "slurm",
+                    "jobscript_shebang": "#!/bin/bash --login",
+                    "memory_per_core_gb_by_partition": {"multicore": 8},
+                },
+                "software": {
+                    "python": {
+                        "modules": [],
+                        "python_path": "$HOME/.venv/ichor-csf3/bin/python",
+                        "library_path": "$HOME/opt/python-3.11.15/lib",
+                    },
+                    "ariadne_runtime": {"modules": []},
+                },
+            }
+        },
+        "csf3",
+    )
+
+    body = build_sbatch_script(
+        phase_name="PHASE_A_DIVERSITY",
+        iteration=0,
+        campaign_dir=Path("/scratch/campaign"),
+        config=CampaignConfig(),
+    )
+
+    from ichor.hpc.active_learning.daemon.cluster_profile import (
+        expanded_profile_value,
+    )
+    from ichor.hpc.active_learning.daemon.runtime_environment import (
+        configured_python_library_paths,
+    )
+
+    python_path = expanded_profile_value(
+        "software", "python", "python_path"
+    )
+    library_path = configured_python_library_paths()[0]
+    assert body.startswith("#!/bin/bash --login\n")
+    assert "$HOME/.venv/ichor-csf3" not in body
+    assert python_path in body
+    assert library_path in body
+    assert body.index("export LD_LIBRARY_PATH=") < body.index(python_path)
 
 
 def test_build_sbatch_script_rejects_unsafe_configured_module(monkeypatch):
@@ -2094,7 +2179,7 @@ def test_configured_batch_python_probe_rejects_wrong_version(monkeypatch):
             stdout=json.dumps(
                 {
                     "executable": executable,
-                    "version": [3, 13, 1],
+                    "version": [3, 10, 13],
                     "modules": {
                         label: {"ok": True, "error": ""}
                         for label in SUBMITTED_PYTHON_IMPORTS
@@ -2108,8 +2193,46 @@ def test_configured_batch_python_probe_rejects_wrong_version(monkeypatch):
     ok, version, error = preflight._probe_configured_python(executable)
 
     assert ok is False
-    assert version == "3.13.1"
+    assert version == "3.10.13"
     assert "Python 3.11" in error
+
+
+def test_configured_batch_python_probe_accepts_newer_supported_version(monkeypatch):
+    from ichor.hpc.active_learning.daemon import preflight
+
+    executable = "/home/user/.venv/ichor-csf3/bin/python"
+    monkeypatch.setattr(preflight.os.path, "isfile", lambda value: value == executable)
+    monkeypatch.setattr(preflight.os, "access", lambda value, mode: value == executable)
+    monkeypatch.setattr(
+        preflight.shutil,
+        "which",
+        lambda name: "/bin/bash" if name == "bash" else None,
+    )
+    monkeypatch.setattr(
+        preflight.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "executable": executable,
+                    "version": [3, 13, 1],
+                    "modules": {
+                        label: {"ok": True, "error": ""}
+                        for label in SUBMITTED_PYTHON_IMPORTS
+                    },
+                }
+            )
+            + "\n",
+            stderr="",
+        ),
+    )
+
+    ok, version, error = preflight._probe_configured_python(executable)
+
+    assert ok is True
+    assert version == "3.13.1"
+    assert error == ""
 
 
 def test_configured_batch_python_probe_reports_submitted_import_failure(monkeypatch):
@@ -2201,6 +2324,9 @@ def test_gaussian_probe_uses_combined_submitted_runtime_module_stack(monkeypatch
     assert ok is True
     assert resolved == "/opt/gaussian/g16"
     assert error == ""
+    assert scripts[0].index("module purge") < scripts[0].index(
+        "module load python/3.11"
+    )
     assert scripts[0].index("module load python/3.11") < scripts[0].index(
         "module load apps/gaussian/g16"
     )

@@ -20,6 +20,7 @@ from ichor.hpc.active_learning.daemon.dry_run_executor import DryRunPhaseExecuto
 from ichor.hpc.active_learning.daemon.phase_executor import BackendSubmissionError
 from ichor.hpc.active_learning.daemon.state import CampaignPhase
 from ichor.hpc.active_learning.versioning.versioned_directory import VersionedDirectory
+from ichor_hpc.tests.quantum_test_support import prepare_dry_submitted_phase
 
 
 def _make_executor(tmp_path):
@@ -39,7 +40,13 @@ def _prepare_bootstrap(ex, state):
         replacement_round=0,
     )
     ex.postprocess(bootstrap_state, CampaignPhase.PHASE_A_DIVERSITY, observations=[])
+    prepare_dry_submitted_phase(
+        ex, bootstrap_state, CampaignPhase.INITIAL_GAUSSIAN
+    )
     ex.postprocess(bootstrap_state, CampaignPhase.INITIAL_GAUSSIAN, observations=[])
+    prepare_dry_submitted_phase(
+        ex, bootstrap_state, CampaignPhase.INITIAL_AIMALL
+    )
     ex.postprocess(bootstrap_state, CampaignPhase.INITIAL_AIMALL, observations=[])
     result = ex.submit_or_run(
         bootstrap_state,
@@ -88,7 +95,9 @@ def _prepare_active_quantum_allocation(ex, state):
     ex.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
     ex.postprocess(state, CampaignPhase.PHASE_B_DIVERSITY, observations=[])
     ex.submit_or_run(state, CampaignPhase.SPLIT)
+    prepare_dry_submitted_phase(ex, state, CampaignPhase.GAUSSIAN)
     ex.postprocess(state, CampaignPhase.GAUSSIAN, observations=[])
+    prepare_dry_submitted_phase(ex, state, CampaignPhase.AIMALL)
     ex.postprocess(state, CampaignPhase.AIMALL, observations=[])
     result = ex.submit_or_run(state, CampaignPhase.ALLOCATION_CHECK)
     assert result.next_phase_override == CampaignPhase.APPEND.value
@@ -185,7 +194,9 @@ def test_initial_training_idempotent_skip_repairs_current_pointer(tmp_path):
     campaign = ex.campaign_dir
     state = SimpleNamespace(iteration=0, campaign_uid="uid", reference_data_version=-1)
     ex.postprocess(state, CampaignPhase.PHASE_A_DIVERSITY, observations=[])
+    prepare_dry_submitted_phase(ex, state, CampaignPhase.INITIAL_GAUSSIAN)
     ex.postprocess(state, CampaignPhase.INITIAL_GAUSSIAN, observations=[])
+    prepare_dry_submitted_phase(ex, state, CampaignPhase.INITIAL_AIMALL)
     ex.postprocess(state, CampaignPhase.INITIAL_AIMALL, observations=[])
     v = VersionedDirectory(campaign / "QM_REFERENCE_DATA")
     assert commit_initial_reference_data(campaign) is True

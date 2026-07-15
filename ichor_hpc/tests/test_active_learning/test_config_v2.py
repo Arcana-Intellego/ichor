@@ -305,6 +305,7 @@ def test_seed_selection_bulk_fraction_consumed_by_executor(tmp_path):
     from ichor.hpc.active_learning.acquisition.trajectory_pool import (
         TrajectoryPool,
     )
+    from ichor_hpc.tests.quantum_test_support import prepare_dry_submitted_phase
     from pathlib import Path
 
     FIXTURE = (
@@ -324,10 +325,16 @@ def test_seed_selection_bulk_fraction_consumed_by_executor(tmp_path):
         models_version=-1,
     )
     ex.postprocess(bootstrap_state, CampaignPhase.PHASE_A_DIVERSITY, observations=[])
+    prepare_dry_submitted_phase(
+        ex, bootstrap_state, CampaignPhase.INITIAL_GAUSSIAN
+    )
     ex.postprocess(
         bootstrap_state,
         CampaignPhase.INITIAL_GAUSSIAN,
         observations=[],
+    )
+    prepare_dry_submitted_phase(
+        ex, bootstrap_state, CampaignPhase.INITIAL_AIMALL
     )
     ex.postprocess(
         bootstrap_state,

@@ -36,7 +36,9 @@ from .cluster_profile import (
 from .runtime_environment import (
     SUBMITTED_PYTHON_IMPORTS,
     configured_daemon_runtime_modules,
+    configured_python_library_paths,
     normalise_module_list,
+    python_library_path_export_lines,
 )
 
 __all__ = [
@@ -72,6 +74,7 @@ class BackendAvailability:
     batch_python_version: str = ""
     batch_python_error: str = ""
     batch_runtime_modules: tuple = ()
+    batch_python_library_paths: tuple = ()
     gaussian_verified: bool = False
     gaussian_probe_error: str = ""
     ariadne_probe_error: str = ""
@@ -172,6 +175,7 @@ def _run_login_shell(script: str, *, timeout: int = 30) -> subprocess.CompletedP
 def _probe_configured_python_details(
     python_executable: str,
     modules: Optional[List[str]] = None,
+    library_paths: Optional[List[str]] = None,
 ) -> tuple[bool, str, str, Dict[str, Dict[str, object]]]:
     """Probe each required import under the exact submitted Python environment."""
     import_status = {
@@ -227,7 +231,12 @@ def _probe_configured_python_details(
     try:
         module_lines = ["module load " + module for module in (modules or [])]
         script = "\n".join(
-            ["set -euo pipefail", *module_lines]
+            [
+                "set -euo pipefail",
+                "module purge",
+                *module_lines,
+                *python_library_path_export_lines(list(library_paths or [])),
+            ]
             + ["exec " + shlex.quote(executable) + " -c " + shlex.quote(probe)]
         )
         completed = _run_login_shell(script, timeout=30)
@@ -273,11 +282,11 @@ def _probe_configured_python_details(
             import_status,
         )
     version = ".".join(str(value) for value in version_values)
-    if version_values[:2] != (3, 11):
+    if version_values[:2] < (3, 11):
         return (
             False,
             version,
-            "configured batch Python must be Python 3.11",
+            "configured batch Python must be Python 3.11 or newer",
             parsed_status,
         )
     return True, version, "", parsed_status
@@ -288,8 +297,16 @@ def _probe_configured_python(
     modules: Optional[List[str]] = None,
 ) -> tuple[bool, str, str]:
     """Compatibility wrapper requiring Python 3.11 and every runtime import."""
+    try:
+        library_paths = configured_python_library_paths()
+    except Exception as exc:
+        return False, "", "configured Python library path is invalid: " + str(exc)
     interpreter_ok, version, error, import_status = (
-        _probe_configured_python_details(python_executable, modules)
+        _probe_configured_python_details(
+            python_executable,
+            modules,
+            library_paths,
+        )
     )
     missing = [
         label
@@ -337,7 +354,9 @@ def _probe_gaussian_environment() -> tuple[bool, str, str]:
         command = "command -v g16"
     try:
         completed = _run_login_shell(
-            "\n".join(["set -euo pipefail", *module_lines, command]),
+            "\n".join(
+                ["set -euo pipefail", "module purge", *module_lines, command]
+            ),
             timeout=30,
         )
     except Exception as exc:
@@ -379,8 +398,18 @@ def check_backends() -> BackendAvailability:
         python_executable = ""
     try:
         runtime_modules = configured_daemon_runtime_modules()
+        python_library_paths = configured_python_library_paths()
+        missing_library_paths = [
+            path for path in python_library_paths if not os.path.isdir(path)
+        ]
+        if missing_library_paths:
+            raise ValueError(
+                "configured Python library paths are not directories: "
+                + repr(missing_library_paths)
+            )
     except Exception as exc:
         runtime_modules = []
+        python_library_paths = []
         batch_python = False
         batch_python_version = ""
         batch_python_error = "runtime module configuration invalid: " + str(exc)
@@ -397,6 +426,7 @@ def check_backends() -> BackendAvailability:
         ) = _probe_configured_python_details(
             str(python_executable),
             runtime_modules,
+            python_library_paths,
         )
     ariadne_status = submitted_imports["ariadne"]
     pyferebus_status = submitted_imports["pyferebus"]
@@ -425,6 +455,7 @@ def check_backends() -> BackendAvailability:
         batch_python_version=batch_python_version,
         batch_python_error=batch_python_error,
         batch_runtime_modules=tuple(runtime_modules),
+        batch_python_library_paths=tuple(python_library_paths),
         gaussian_verified=bool(gauss_ok),
         gaussian_probe_error=str(gaussian_probe_error),
         ariadne_probe_error=str(ariadne_status.get("error") or ""),

@@ -33,7 +33,7 @@ def merge_mutable(a, b, path=None):
 
 
 def merge(*dicts):
-    """Merges dictionaries (dicts) immutably
+    r"""Merges dictionaries (dicts) immutably
     e.g.
 
     .. code-block:: text

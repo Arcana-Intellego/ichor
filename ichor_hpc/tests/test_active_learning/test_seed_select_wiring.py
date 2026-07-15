@@ -42,6 +42,7 @@ from ichor.hpc.active_learning.versioning.provenance import (
     load_training_seed_frame_ids,
     read_provenance,
 )
+from ichor_hpc.tests.quantum_test_support import prepare_dry_submitted_phase
 
 
 FIXTURE = (
@@ -83,7 +84,13 @@ def _select(ex, *, iteration=1):
             replacement_round=0,
         )
         ex._post_phase_a_diversity(bootstrap_state)
+        prepare_dry_submitted_phase(
+            ex, bootstrap_state, CampaignPhase.INITIAL_GAUSSIAN
+        )
         ex._post_initial_gaussian(bootstrap_state)
+        prepare_dry_submitted_phase(
+            ex, bootstrap_state, CampaignPhase.INITIAL_AIMALL
+        )
         ex._post_initial_aimall(bootstrap_state)
         ex._post_initial_ferebus(bootstrap_state)
     state = _active_state(iteration)

@@ -31,7 +31,7 @@ from ichor.hpc.active_learning.layout import (
     active_seed_selection_dir,
     ariadne_seeds_dir,
 )
-from ichor.hpc.active_learning.submit.sacct_poll import JobObservation, JobStatus
+from ichor.hpc.active_learning.submit.sacct_poll import JobStatus
 from ichor.hpc.active_learning.versioning.versioned_directory import VersionedDirectory
 
 
@@ -55,20 +55,24 @@ def _state(iteration=0, **updates):
     return SimpleNamespace(**values)
 
 
-def _stage_ariadne_intent(e, state):
+def _submit_dry_phase(e, state, phase):
     from ichor.hpc.active_learning.daemon.config_lock import (
         canonical_config,
         config_fingerprint,
     )
     from ichor.hpc.active_learning.daemon.submission_intent import (
+        update_intent_status,
         write_pre_submit_intent,
     )
 
+    phase_name = phase.value
     write_pre_submit_intent(
         e.campaign_dir,
         campaign_uid=str(state.campaign_uid),
-        phase_name=CampaignPhase.ARIADNE_ARRAY.value,
+        phase_name=phase_name,
         iteration=int(state.iteration),
+        replacement_round=int(getattr(state, "replacement_round", 0)),
+        scheduler_identity_kind="synthetic",
         decision_contract={
             "failure_threshold_fraction": float(
                 e.config.runtime.failure_threshold_fraction
@@ -76,15 +80,47 @@ def _stage_ariadne_intent(e, state):
             "config_sha256": config_fingerprint(canonical_config(e.config)),
         },
     )
+    result = e.submit_or_run(state, phase)
+    update_intent_status(
+        e.campaign_dir,
+        phase_name=phase_name,
+        iteration=int(state.iteration),
+        status="SUBMITTED",
+        job_id=str(result.submitted_job_id),
+        expected_tasks=int(result.expected_tasks),
+    )
+    return result
 
 
 def _complete_bootstrap(e):
+    from ichor.hpc.active_learning.daemon.state import (
+        DEFAULT_STATE_FILENAME,
+        fresh_campaign_state,
+        write_state,
+    )
+
     state = _state()
+    state_path = (
+        e.campaign_dir / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
+    )
+    if not state_path.is_file():
+        write_state(
+            state_path,
+            fresh_campaign_state(
+                max_iterations=e.config.campaign.max_iterations,
+                campaign_uid=str(state.campaign_uid),
+            ),
+        )
+    e._ensure_dry_run_trajectory_pool()
+    _submit_dry_phase(e, state, CampaignPhase.PHASE_A_DIVERSITY)
     e.postprocess(state, CampaignPhase.PHASE_A_DIVERSITY, observations=[])
+    _submit_dry_phase(e, state, CampaignPhase.INITIAL_GAUSSIAN)
     e.postprocess(state, CampaignPhase.INITIAL_GAUSSIAN, observations=[])
+    _submit_dry_phase(e, state, CampaignPhase.INITIAL_AIMALL)
     e.postprocess(state, CampaignPhase.INITIAL_AIMALL, observations=[])
     check = e.submit_or_run(state, CampaignPhase.INITIAL_ALLOCATION_CHECK)
     assert check.next_phase_override == CampaignPhase.INITIAL_FEREBUS.value
+    _submit_dry_phase(e, state, CampaignPhase.INITIAL_FEREBUS)
     e.postprocess(state, CampaignPhase.INITIAL_FEREBUS, observations=[])
     return state
 
@@ -96,10 +132,13 @@ def _complete_active_quantum(e, *, iteration=1):
         models_version=0,
     )
     e.submit_or_run(state, CampaignPhase.SEED_SELECT)
-    _stage_ariadne_intent(e, state)
+    _submit_dry_phase(e, state, CampaignPhase.ARIADNE_ARRAY)
     e.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
+    _submit_dry_phase(e, state, CampaignPhase.PHASE_B_DIVERSITY)
     e.postprocess(state, CampaignPhase.PHASE_B_DIVERSITY, observations=[])
+    _submit_dry_phase(e, state, CampaignPhase.GAUSSIAN)
     e.postprocess(state, CampaignPhase.GAUSSIAN, observations=[])
+    _submit_dry_phase(e, state, CampaignPhase.AIMALL)
     e.postprocess(state, CampaignPhase.AIMALL, observations=[])
     check = e.submit_or_run(state, CampaignPhase.ALLOCATION_CHECK)
     assert check.next_phase_override == CampaignPhase.APPEND.value
@@ -118,6 +157,7 @@ def test_executor_creates_canonical_subdirs(tmp_path):
 
 def test_submit_or_run_sbatch_phase_writes_stub_script(tmp_path):
     e = _make_exec(tmp_path)
+    e._ensure_dry_run_trajectory_pool()
     state = SimpleNamespace(iteration=0)
     result = e.submit_or_run(state, CampaignPhase.PHASE_A_DIVERSITY)
     assert isinstance(result, PhaseResult)
@@ -175,7 +215,7 @@ def test_ariadne_postprocess_writes_per_seed_results(tmp_path):
     _complete_bootstrap(e)
     state = _state(1, reference_data_version=0, models_version=0)
     e.submit_or_run(state, CampaignPhase.SEED_SELECT)
-    _stage_ariadne_intent(e, state)
+    _submit_dry_phase(e, state, CampaignPhase.ARIADNE_ARRAY)
     e.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
     seeds_dir = ariadne_seeds_dir(
         active_iteration_dir(tmp_path / "campaign", 1)
@@ -196,8 +236,9 @@ def test_phase_b_diversity_postprocess_writes_sample_xyz(tmp_path):
     _complete_bootstrap(e)
     state = _state(1, reference_data_version=0, models_version=0)
     e.submit_or_run(state, CampaignPhase.SEED_SELECT)
-    _stage_ariadne_intent(e, state)
+    _submit_dry_phase(e, state, CampaignPhase.ARIADNE_ARRAY)
     e.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
+    _submit_dry_phase(e, state, CampaignPhase.PHASE_B_DIVERSITY)
     e.postprocess(state, CampaignPhase.PHASE_B_DIVERSITY, observations=[])
     sample = active_phase_b_dir(
         active_iteration_dir(tmp_path / "campaign", 1)
@@ -225,6 +266,7 @@ def test_ferebus_postprocess_commits_next_models_iteration(tmp_path):
     state = _complete_active_quantum(e)
     append = e.submit_or_run(state, CampaignPhase.APPEND)
     state.reference_data_version = append.state_updates["reference_data_version"]
+    _submit_dry_phase(e, state, CampaignPhase.FEREBUS)
     e.postprocess(state, CampaignPhase.FEREBUS, observations=[])
     v = VersionedDirectory(tmp_path / "campaign" / "TRAINED_MODELS")
     assert sorted(v.list_committed_versions()) == [0, 1]
@@ -239,8 +281,9 @@ def test_active_allocation_replaces_failed_candidate_from_finite_reserve(tmp_pat
     _complete_bootstrap(e)
     state = _state(1, reference_data_version=0, models_version=0)
     e.submit_or_run(state, CampaignPhase.SEED_SELECT)
-    _stage_ariadne_intent(e, state)
+    _submit_dry_phase(e, state, CampaignPhase.ARIADNE_ARRAY)
     e.postprocess(state, CampaignPhase.ARIADNE_ARRAY, observations=[])
+    _submit_dry_phase(e, state, CampaignPhase.PHASE_B_DIVERSITY)
     e.postprocess(state, CampaignPhase.PHASE_B_DIVERSITY, observations=[])
 
     allocation_path = point_allocation_path(
@@ -285,7 +328,9 @@ def test_active_allocation_replaces_failed_candidate_from_finite_reserve(tmp_pat
     assert replacement.next_phase_override == CampaignPhase.REPLACEMENT_GAUSSIAN.value
     assert replacement.state_updates == {"replacement_round": 1}
     state.replacement_round = 1
+    _submit_dry_phase(e, state, CampaignPhase.REPLACEMENT_GAUSSIAN)
     e.postprocess(state, CampaignPhase.REPLACEMENT_GAUSSIAN, observations=[])
+    _submit_dry_phase(e, state, CampaignPhase.REPLACEMENT_AIMALL)
     aimall = e.postprocess(state, CampaignPhase.REPLACEMENT_AIMALL, observations=[])
     assert aimall.next_phase_override == CampaignPhase.ALLOCATION_CHECK.value
     complete = e.submit_or_run(state, CampaignPhase.ALLOCATION_CHECK)
@@ -335,12 +380,10 @@ def test_dry_run_sacct_returns_every_expected_array_row():
     assert all(row.status is JobStatus.COMPLETED for row in observations)
 
 
-def test_dry_run_sacct_falls_back_for_non_dryrun_ids():
-    def fake_fallback(job_id, **kw):
-        return [JobObservation(job_id=job_id, status=JobStatus.RUNNING, exit_code=None, elapsed_seconds=10)]
-    poller = DryRunSacctPoller(fallback_poller=fake_fallback)
-    obs = poller("12345678")
-    assert obs[0].status is JobStatus.RUNNING
+def test_dry_run_sacct_rejects_real_slurm_ids():
+    poller = DryRunSacctPoller()
+    with pytest.raises(ValueError, match="refuses non-synthetic"):
+        poller("12345678")
 
 
 def test_dry_run_sacct_records_invocations():

@@ -116,5 +116,10 @@ def test_csf4_first_iteration_end_to_end(tmp_path):
     assert state.models_version >= 1
     # reference scales should be populated with five real-float keys
     assert state.reference_scales is not None
+    from ichor.hpc.active_learning.daemon.model_contract import (
+        validate_reference_scales,
+    )
+
     expected_keys = {"energy", "force", "omega", "anh", "anh_std"}
-    assert set(state.reference_scales.keys()) == expected_keys
+    assert expected_keys <= set(state.reference_scales)
+    validate_reference_scales(state.reference_scales)

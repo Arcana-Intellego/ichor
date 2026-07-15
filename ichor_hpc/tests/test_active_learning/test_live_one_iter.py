@@ -1,19 +1,4 @@
-"""M15 F14: live-mode end-to-end smoke tests.
-
-Two flavours:
-
-  1. `test_live_refuses_unimplemented_postprocess_*` -- POSITIVE test of
-     the F1 refuse guard. These actually run on a host with `sbatch` on
-     PATH (any cluster), driving the daemon through the entry phase and
-     asserting that hitting the FIRST unimplemented postprocess raises
-     NotImplementedError cleanly rather than silently calling the dry-run
-     stub writer.
-
-  2. `test_live_one_iter_water_tetramer_after_parsers_land` -- SKELETON
-     for the success path. Skipped until M16 lands real parsers that
-     register themselves in LIVE_POSTPROCESS_IMPLEMENTED. Unskipping the
-     test on a CSF4 worker proves the first real iteration completes.
-"""
+"""Offline full-cycle tests for the live executor's production wiring."""
 import json
 import re
 from pathlib import Path
@@ -24,76 +9,31 @@ from ichor.hpc.active_learning.daemon.phase_executor import SBATCH_PHASES
 from ichor.hpc.active_learning.daemon.state import CampaignPhase
 
 
-# --- positive test of F1 refusal ---
-
-
-@pytest.mark.live
-def test_live_refuses_unimplemented_postprocess_for_initial_gaussian(tmp_path):
-    """Live executor must raise NotImplementedError when asked to postprocess
-    a SBATCH phase that isn't registered in LIVE_POSTPROCESS_IMPLEMENTED.
-
-    Without this guard (the pre-F1 state), the daemon would silently fall
-    through to DryRunPhaseExecutor.postprocess and overwrite real Gaussian
-    outputs with dry-run placeholder text. Catastrophic.
-    """
-    pytest.importorskip("ichor.hpc.active_learning.daemon.live_executor")
+def test_live_postprocess_refuses_a_deliberately_unsupported_sbatch_phase(
+    tmp_path,
+    monkeypatch,
+):
+    """The refusal branch must execute even while all real phases are covered."""
     from ichor.hpc.active_learning.config import CampaignConfig
-    from ichor.hpc.active_learning.daemon.live_executor import (
-        LIVE_POSTPROCESS_IMPLEMENTED,
-        LiveBackendNotAvailableError,
-        LiveBackendsPhaseExecutor,
-    )
-    from ichor.hpc.active_learning.daemon.preflight import check_backends
+    from ichor.hpc.active_learning.daemon import live_executor as live_module
     from types import SimpleNamespace
 
-    avail = check_backends()
-    if not avail.sbatch:
-        pytest.skip("sbatch not on PATH; live-mode smoke needs a cluster")
-
     cfg = CampaignConfig()
-    ex = LiveBackendsPhaseExecutor(
-        campaign_dir=tmp_path / "campaign", config=cfg,
+    ex = live_module.LiveBackendsPhaseExecutor(
+        campaign_dir=tmp_path / "campaign",
+        config=cfg,
+        backend_check=False,
     )
     state = SimpleNamespace(iteration=0, campaign_uid="live-smoke")
-
-    # all the SBATCH parsers have since landed, so INITIAL_GAUSSIAN is REGISTERED now and must NOT
-    # refuse -- it dispatches to the real quantum parser, which (with no staging tree here) just
-    # reports a failure_reason rather than raising NotImplementedError. the refuse guard itself is
-    # still exercised for genuinely-unregistered phases by the test below.
-    # (A21a -- inverted from the obsolete pre-M16 assertion.)
-    assert "INITIAL_GAUSSIAN" in LIVE_POSTPROCESS_IMPLEMENTED
-    result = ex.postprocess(state, CampaignPhase("INITIAL_GAUSSIAN"), observations=[])
-    assert result is not None  # a PhaseResult, not a raised NotImplementedError
-
-
-@pytest.mark.live
-def test_live_postprocess_refused_for_all_unimplemented_sbatch_phases(tmp_path):
-    """Every SBATCH phase not in LIVE_POSTPROCESS_IMPLEMENTED must refuse.
-    Catches a future regression where one parser lands but its registration
-    in LIVE_POSTPROCESS_IMPLEMENTED is forgotten."""
-    from ichor.hpc.active_learning.config import CampaignConfig
-    from ichor.hpc.active_learning.daemon.live_executor import (
-        LIVE_POSTPROCESS_IMPLEMENTED,
-        LiveBackendsPhaseExecutor,
+    unsupported = "TEST_UNSUPPORTED_ARRAY"
+    monkeypatch.setattr(
+        live_module,
+        "SBATCH_PHASES",
+        frozenset(set(live_module.SBATCH_PHASES) | {unsupported}),
     )
-    from ichor.hpc.active_learning.daemon.preflight import check_backends
-    from types import SimpleNamespace
 
-    avail = check_backends()
-    if not avail.sbatch:
-        pytest.skip("sbatch not on PATH; live-mode smoke needs a cluster")
-
-    cfg = CampaignConfig()
-    ex = LiveBackendsPhaseExecutor(
-        campaign_dir=tmp_path / "campaign", config=cfg,
-    )
-    state = SimpleNamespace(iteration=0, campaign_uid="live-smoke")
-
-    for phase_name in sorted(SBATCH_PHASES):
-        if phase_name in LIVE_POSTPROCESS_IMPLEMENTED:
-            continue
-        with pytest.raises(NotImplementedError):
-            ex.postprocess(state, CampaignPhase(phase_name), observations=[])
+    with pytest.raises(NotImplementedError, match=unsupported):
+        ex.postprocess(state, unsupported, observations=[])
 
 
 # --- success-path skeleton (skipped until M16) ---
@@ -917,7 +857,7 @@ def _build_live_smoke_poller():
 
 
 
-@pytest.mark.live
+@pytest.mark.integration
 def test_live_one_iter_water_tetramer_after_parsers_land(tmp_path, monkeypatch):
     """End-to-end live executor smoke test.
 
@@ -1114,7 +1054,7 @@ def _build_no_wd_sbatch_runner(campaign_dir, call_log):
     return runner
 
 
-@pytest.mark.live
+@pytest.mark.integration
 def test_live_one_iter_whitened_distance_fallback(tmp_path, monkeypatch):
     """Same end-to-end flow as the main F14 test, but each ARIADNE
     result.json has whitened_distance_final stripped. The daemon should
@@ -1202,7 +1142,7 @@ def _build_both_phase_b_sbatch_runner(campaign_dir, call_log):
     return runner
 
 
-@pytest.mark.live
+@pytest.mark.integration
 def test_live_one_iter_prefers_dedup_filtered_sample(tmp_path, monkeypatch):
     """When both selected.xyz and selected_raw.xyz exist
     (with different frame counts), the live parser should pick the

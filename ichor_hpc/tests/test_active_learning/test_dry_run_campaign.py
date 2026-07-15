@@ -67,6 +67,8 @@ def _run_two_iter_campaign(tmp_path):
         sacct_poller=poller,
         sleep_fn=lambda s: None,
     )
+    d._read_or_initialise_state()
+    executor._ensure_dry_run_trajectory_pool()
     rc = d.run(max_ticks=500, catch_keyboard_interrupt=False)
     assert rc == 0
     return campaign, d, executor, poller
@@ -98,6 +100,54 @@ def test_dry_run_writes_one_stub_script_per_sbatch_phase_per_iter(tmp_path):
         assert (s.parent / "ERRORS").is_dir()
         identities.add(identity)
     assert len(identities) == len(scripts)
+
+
+def test_dry_run_scripts_use_production_renderer_and_exact_array_sizes(tmp_path):
+    from ichor.hpc.active_learning.daemon.submission_intent import load_intent
+
+    campaign, _, _, _ = _run_two_iter_campaign(tmp_path)
+    scripts_root = campaign / ".DATA" / "SCRIPTS" / "JOBS"
+    for script in scripts_root.rglob("job.sh"):
+        _backend, phase, iteration_token, _identity, _filename = (
+            script.relative_to(scripts_root).parts
+        )
+        iteration = int(iteration_token.removeprefix("iteration-"))
+        intent = load_intent(campaign, phase, iteration)
+        assert intent is not None
+        expected = int(intent["expected_tasks"])
+        body = script.read_text(encoding="utf-8")
+        assert body.startswith("#!/bin/bash --login\n")
+        assert "module purge" in body
+        assert "DRY-RUN: production Slurm/resource/environment renderer" in body
+        if phase in {"PHASE_A_DIVERSITY", "PHASE_B_DIVERSITY"}:
+            assert expected == 1
+            assert "#SBATCH --array=" not in body
+        else:
+            assert (
+                "#SBATCH --array=0-" + str(expected - 1)
+            ) in body
+
+
+def test_dry_run_wfn_geometry_matches_every_staged_gjf(tmp_path):
+    import numpy as np
+    from ichor.core.files.gaussian.gjf import GJF
+    from ichor.core.files.gaussian.wfn import WFN
+
+    campaign, _, _, _ = _run_two_iter_campaign(tmp_path)
+    pointdirs = sorted((campaign / "QM_REFERENCE_DATA").rglob("*.pointdir"))
+    assert pointdirs
+    for pointdir in pointdirs:
+        gjf_atoms = list(GJF(pointdir / "input.gjf").atoms)
+        wfn_atoms = list(WFN(pointdir / "input.wfn").atoms.to_angstroms())
+        assert [atom.type for atom in wfn_atoms] == [
+            atom.type for atom in gjf_atoms
+        ]
+        assert np.allclose(
+            [atom.coordinates for atom in wfn_atoms],
+            [atom.coordinates for atom in gjf_atoms],
+            atol=1.0e-8,
+            rtol=0.0,
+        )
 
 
 def test_dry_run_commits_three_reference_data_versions(tmp_path):

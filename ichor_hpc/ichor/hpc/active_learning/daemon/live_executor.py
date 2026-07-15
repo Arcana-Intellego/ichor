@@ -107,7 +107,9 @@ from .runtime_environment import (
     DEFAULT_DAEMON_PYTHON_MODULES,
     DEFAULT_DAEMON_RUNTIME_MODULES,
     configured_daemon_runtime_modules,
+    configured_python_library_paths,
     normalise_module_list,
+    python_library_path_export_lines,
 )
 from ..submit.slurm_contracts import (
     parse_sbatch_parsable_output,
@@ -1249,6 +1251,66 @@ class LiveBackendNotAvailableError(RuntimeError):
     """Raised when live mode is requested but a required backend is missing."""
 
 
+def locate_gaussian_sample_xyz(
+    campaign_dir: Path,
+    phase_name: str,
+    iteration: int,
+    *,
+    replacement_round: int = 0,
+    campaign_uid: Optional[str] = None,
+) -> Optional[Path]:
+    """Resolve the producer-owned geometry sample for a Gaussian phase."""
+    camp = Path(campaign_dir)
+    if phase_name in {
+        "INITIAL_REPLACEMENT_GAUSSIAN",
+        "REPLACEMENT_GAUSSIAN",
+    }:
+        from ..replacement_sampling import read_replacement_sample_strict
+
+        context = (
+            "bootstrap"
+            if phase_name == "INITIAL_REPLACEMENT_GAUSSIAN"
+            else "active"
+        )
+        manifest = read_replacement_sample_strict(
+            camp,
+            context=context,
+            iteration=0 if context == "bootstrap" else int(iteration),
+            replacement_round=int(replacement_round),
+        )
+        return Path(str(manifest["sample_xyz"]))
+    if phase_name == "INITIAL_GAUSSIAN":
+        from ..handoff_manifests import read_phase_a_sample_manifest
+        from ..layout import bootstrap_selection_dir
+        from .state import DEFAULT_STATE_FILENAME, read_state
+
+        outdir = bootstrap_selection_dir(camp)
+        try:
+            expected_campaign_uid = str(campaign_uid or "").strip()
+            if not expected_campaign_uid:
+                current_state = read_state(
+                    camp / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
+                )
+                expected_campaign_uid = str(current_state.campaign_uid)
+            manifest = read_phase_a_sample_manifest(
+                outdir,
+                expected_campaign_uid=expected_campaign_uid,
+            )
+        except Exception as exc:
+            raise BackendSubmissionError(
+                "phase_a_sample_manifest_invalid: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)
+            ) from exc
+        return Path(str(manifest["sample_xyz"]))
+    from ..layout import active_iteration_dir, active_phase_b_dir
+
+    iter_dir = active_iteration_dir(camp, int(iteration))
+    candidate = active_phase_b_dir(iter_dir) / "selected.xyz"
+    return candidate if candidate.is_file() else None
+
+
 @dataclass
 class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
     """Production PhaseExecutor.
@@ -1290,55 +1352,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
     # --- SBATCH submission ---------------------------------------------
 
     def _locate_sample_xyz(self, phase_name, iteration, replacement_round=0):
-        camp = Path(self.campaign_dir)
-        if phase_name in {
-            "INITIAL_REPLACEMENT_GAUSSIAN",
-            "REPLACEMENT_GAUSSIAN",
-        }:
-            from ..replacement_sampling import (
-                read_replacement_sample_strict,
-            )
-
-            context = (
-                "bootstrap"
-                if phase_name == "INITIAL_REPLACEMENT_GAUSSIAN"
-                else "active"
-            )
-            manifest = read_replacement_sample_strict(
-                camp,
-                context=context,
-                iteration=0 if context == "bootstrap" else int(iteration),
-                replacement_round=int(replacement_round),
-            )
-            return Path(str(manifest["sample_xyz"]))
-        if phase_name == "INITIAL_GAUSSIAN":
-            from ..handoff_manifests import read_phase_a_sample_manifest
-            from .state import DEFAULT_STATE_FILENAME, read_state
-
-            from ..layout import bootstrap_selection_dir
-
-            outdir = bootstrap_selection_dir(camp)
-            try:
-                current_state = read_state(
-                    camp / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
-                )
-                manifest = read_phase_a_sample_manifest(
-                    outdir,
-                    expected_campaign_uid=str(current_state.campaign_uid),
-                )
-            except Exception as exc:
-                raise BackendSubmissionError(
-                    "phase_a_sample_manifest_invalid: "
-                    + type(exc).__name__
-                    + ": "
-                    + str(exc)
-                ) from exc
-            return Path(str(manifest["sample_xyz"]))
-        from ..layout import active_iteration_dir, active_phase_b_dir
-
-        iter_dir = active_iteration_dir(camp, int(iteration))
-        candidate = active_phase_b_dir(iter_dir) / "selected.xyz"
-        return candidate if candidate.is_file() else None
+        return locate_gaussian_sample_xyz(
+            self.campaign_dir,
+            str(phase_name),
+            int(iteration),
+            replacement_round=int(replacement_round),
+        )
 
     def _count_seeds(self, iteration):
         from ..handoff_manifests import load_seeds_picked
@@ -1552,6 +1571,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 phase_name,
                 it,
                 sample,
+                campaign_uid=str(getattr(state, "campaign_uid", "")),
             )
             return n
         if "AIMALL" in phase_name:
@@ -5178,7 +5198,7 @@ def _safe_shell_path_component(value: Any, *, fallback: str = "unknown") -> str:
 
 
 def _python_executable_for_script() -> str:
-    python_path = profile_value(
+    python_path = expanded_profile_value(
         "software", "python", "python_path", default=None
     )
     return _shell_executable(python_path or sys.executable)
@@ -5194,7 +5214,7 @@ def _normalise_module_list(raw: Any, *, label: str) -> List[str]:
 def _configured_jobscript_shebang() -> str:
     raw = profile_value("hpc", "jobscript_shebang", default=None)
     if raw is None:
-        return "#!/bin/bash --login" if active_machine() else "#!/bin/bash"
+        return "#!/bin/bash --login"
     value = str(raw).strip()
     _reject_shell_control_chars("configured hpc.jobscript_shebang", value)
     if not _SHEBANG_RE.fullmatch(value):
@@ -5404,6 +5424,7 @@ def build_sbatch_script(
     attempt_bundle: Optional[AttemptBundle] = None,
     submission_intent: Optional[Dict[str, Any]] = None,
     resource_resolution_binding: Optional[Dict[str, Any]] = None,
+    dry_run: bool = False,
 ) -> str:
     """Return the body of an sbatch script for the given phase.
 
@@ -5523,6 +5544,7 @@ def build_sbatch_script(
         "",
         "module purge",
         *["module load " + m for m in _configured_daemon_runtime_modules()],
+        *python_library_path_export_lines(configured_python_library_paths()),
         "",
     ]
     if str(resolved.backend) == "diversity":
@@ -5546,6 +5568,17 @@ def build_sbatch_script(
             resource_resolution_binding=resource_resolution_binding,
             script_binding_path=attempt_bundle.script_binding,
         )
+    if dry_run:
+        lines += [
+            "# DRY-RUN: production Slurm/resource/environment renderer only.",
+            "# No scientific backend is invoked.",
+            "echo " + _shell_quote(
+                "DRYRUN " + str(phase_name) + " iteration=" + str(int(iteration))
+            ),
+            "exit 0",
+            "",
+        ]
+        return "\n".join(lines)
     if "REPLACEMENT" in phase_name:
         from ..replacement_sampling import replacement_round_dir
 

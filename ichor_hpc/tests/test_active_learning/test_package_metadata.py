@@ -54,7 +54,9 @@ def _console_scripts(package_dir: Path) -> dict[str, str]:
 
 
 def _stdlib_modules() -> set[str]:
-    modules = set(getattr(sys, "stdlib_module_names", set()))
+    if not hasattr(sys, "stdlib_module_names"):
+        raise RuntimeError("ICHOR requires Python 3.11 or newer")
+    modules = set(sys.stdlib_module_names)
     modules.update(sys.builtin_module_names)
     return modules
 
@@ -138,3 +140,11 @@ def test_active_learning_console_scripts_are_declared():
         scripts["ichor-al-benchmark-acquisition-gradient"]
         == "ichor.hpc.active_learning.benchmark.acquisition_gradient:main"
     )
+
+
+def test_all_ichor_packages_require_python_311():
+    for package_dir in PACKAGE_DIRS.values():
+        config = configparser.ConfigParser()
+        config.read(package_dir / "setup.cfg")
+        assert config.get("options", "python_requires") == ">=3.11"
+        assert config.get("bdist_wheel", "python-tag") == "py3"

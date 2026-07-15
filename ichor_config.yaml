@@ -10,7 +10,7 @@ csf3:
     memory_per_core_gb_by_partition:
       multicore: 8
       interactive: 8
-      serial: 5
+      serial: 4
       multicore_small: 5
       himem: 32
     parallel_environments:
@@ -30,7 +30,7 @@ csf3:
         min_cpus: 1
         max_cpus: 168
         memory_per_core_gb: 8
-        max_walltime_hours: 24
+        max_walltime_hours: 6
         daemon_supported: true
       multicore_small:
         min_cpus: 2
@@ -41,7 +41,7 @@ csf3:
       serial:
         min_cpus: 1
         max_cpus: 1
-        memory_per_core_gb: 5
+        memory_per_core_gb: 4
         max_walltime_hours: 168
         daemon_supported: true
       himem:
@@ -92,6 +92,7 @@ csf3:
     python:
       env_name: "ichor-csf3"
       python_path: "$HOME/.venv/ichor-csf3/bin/python"
+      library_path: "$HOME/opt/python-3.11.15/lib"
       modules: []
 
     plumed:
@@ -107,14 +108,13 @@ csf4:
   hpc:
 
     scheduler: slurm
-    jobscript_shebang: "#!/bin/bash"
+    jobscript_shebang: "#!/bin/bash --login"
     max_array_task_id: 25000
     max_job_log_files_per_directory: 5000
     memory_per_core_gb: 4
     memory_per_core_gb_by_partition:
       serial: 4
       multicore: 4
-      multinode: 4
     parallel_environments:
       serial: [1, 1]
       multicore: [2, 40]
@@ -131,13 +131,6 @@ csf4:
         memory_per_core_gb: 4
         max_walltime_hours: 168
         daemon_supported: true
-      multinode:
-        min_cpus: 2
-        max_cpus: 10000
-        memory_per_core_gb: 4
-        max_walltime_hours: 168
-        daemon_supported: false
-
   software:
 
     aimall:
@@ -178,7 +171,7 @@ csf4:
 
     python:
       env_name: "ichor-csf4"
-      python_path: "~/.venv/ichor-csf4/bin/python"
+      python_path: "$HOME/.venv/ichor-csf4/bin/python"
       modules: ["python/3.11.3-gcccore-12.3.0"]
 
     plumed:

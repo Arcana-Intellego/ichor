@@ -1,7 +1,9 @@
 """Shared live-job module environment contract."""
 from __future__ import annotations
 
+import os
 import re
+import shlex
 from typing import Any, List
 
 from .cluster_profile import active_machine, profile_value
@@ -92,6 +94,50 @@ def configured_daemon_runtime_modules() -> List[str]:
     )
 
 
+def configured_python_library_paths() -> List[str]:
+    """Return absolute loader paths required by the submitted interpreter."""
+    raw = profile_value("software", "python", "library_path", default=None)
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        values = [raw]
+    else:
+        try:
+            values = list(raw)
+        except TypeError as exc:
+            raise ValueError(
+                "configured python library_path must be a string or list"
+            ) from exc
+    paths: List[str] = []
+    for value in values:
+        expanded = os.path.abspath(
+            os.path.expanduser(os.path.expandvars(str(value).strip()))
+        )
+        if not str(value).strip():
+            continue
+        if any(character in expanded for character in "\r\n\x00"):
+            raise ValueError(
+                "configured python library_path contains control characters"
+            )
+        if not os.path.isabs(expanded):
+            raise ValueError("configured python library_path must be absolute")
+        if expanded not in paths:
+            paths.append(expanded)
+    return paths
+
+
+def python_library_path_export_lines(paths: List[str]) -> List[str]:
+    """Render deterministic loader-path exports before the first Python call."""
+    if not paths:
+        return []
+    prefix = ":".join(paths)
+    return [
+        "export LD_LIBRARY_PATH="
+        + shlex.quote(prefix)
+        + '${LD_LIBRARY_PATH:+:"$LD_LIBRARY_PATH"}'
+    ]
+
+
 def module_load_lines(modules: List[str]) -> List[str]:
     return ["module load " + module for module in modules]
 
@@ -102,6 +148,8 @@ __all__ = [
     "DEFAULT_DAEMON_RUNTIME_MODULES",
     "SUBMITTED_PYTHON_IMPORTS",
     "configured_daemon_runtime_modules",
+    "configured_python_library_paths",
     "module_load_lines",
     "normalise_module_list",
+    "python_library_path_export_lines",
 ]

@@ -24,6 +24,7 @@ from .resource_solver import (
 from .runtime_environment import (
     SUBMITTED_PYTHON_IMPORTS,
     normalise_module_list,
+    python_library_path_export_lines,
 )
 from .state import atomic_write_json, atomic_write_text
 from ..submit.slurm_contracts import parse_sbatch_parsable_output
@@ -153,6 +154,11 @@ def render_submitted_environment_smoke_script(
         "module purge",
     ]
     lines.extend("module load " + module for module in runtime_modules)
+    lines.extend(
+        python_library_path_export_lines(
+            list(getattr(availability, "batch_python_library_paths", ()) or ())
+        )
+    )
     lines.append(
         shlex.quote(python_executable) + " -c " + shlex.quote(probe)
     )

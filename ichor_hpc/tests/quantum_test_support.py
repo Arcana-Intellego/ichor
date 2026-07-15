@@ -12,7 +12,37 @@ from ichor.hpc.active_learning.daemon.quantum_acceptance_receipts import (
 from ichor.hpc.active_learning.daemon.quantum_quality import (
     write_quantum_quality_manifest,
 )
+from ichor.hpc.active_learning.daemon.submission_intent import (
+    mark_submitted,
+    write_pre_submit_intent,
+)
 from ichor.hpc.active_learning.versioning.manifest import sha256_file
+
+
+def prepare_dry_submitted_phase(executor, state, phase) -> int:
+    """Stage a dry backend phase with the same intent order as the daemon."""
+    phase_name = phase.value if hasattr(phase, "value") else str(phase)
+    iteration = int(getattr(state, "iteration", 0))
+    expected_tasks = int(
+        executor._prepare_dry_submission(state, phase_name)
+    )
+    write_pre_submit_intent(
+        executor.campaign_dir,
+        campaign_uid=str(getattr(state, "campaign_uid")),
+        phase_name=phase_name,
+        iteration=iteration,
+        replacement_round=int(getattr(state, "replacement_round", 0)),
+        expected_tasks=expected_tasks,
+        scheduler_identity_kind="synthetic",
+    )
+    mark_submitted(
+        executor.campaign_dir,
+        phase_name,
+        iteration,
+        "DRYRUN-" + phase_name + "-" + str(iteration),
+        expected_tasks=expected_tasks,
+    )
+    return expected_tasks
 
 
 def synthetic_quantum_quality_record(pointdir_name: str) -> dict:
@@ -69,11 +99,18 @@ def attach_synthetic_quantum_acceptance(
     from ichor.hpc.active_learning.daemon.dry_run_executor import (
         DryRunPhaseExecutor,
     )
+    from ichor.core.atoms import Atom, Atoms
 
     DryRunPhaseExecutor._write_dry_quantum_wfn(
         root / "input.wfn",
         method="B3LYP",
-        point_index=0,
+        atoms=Atoms(
+            [
+                Atom("O", 0.0, 0.0, 0.0),
+                Atom("H", 0.95, 0.0, 0.0),
+                Atom("H", -0.24, 0.92, 0.0),
+            ]
+        ),
         total_energy_ha=float(quality_record["wfn_total_energy_ha"]),
     )
     atomic_dir = root / "input_atomicfiles"
@@ -159,5 +196,6 @@ def attach_synthetic_quantum_batch(
 __all__ = [
     "attach_synthetic_quantum_acceptance",
     "attach_synthetic_quantum_batch",
+    "prepare_dry_submitted_phase",
     "synthetic_quantum_quality_record",
 ]

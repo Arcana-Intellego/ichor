@@ -13,10 +13,16 @@ set -euo pipefail
 
 PYTHON_VERSION="3.11.15"
 PLUMED_VERSION="2.10.0"
+OPENBLAS_VERSION="0.3.29"
 PYTHON_TARBALL="Python-${PYTHON_VERSION}.tgz"
 PLUMED_TARBALL="plumed-${PLUMED_VERSION}.tgz"
+OPENBLAS_TARBALL="OpenBLAS-${OPENBLAS_VERSION}.tar.gz"
 PYTHON_URL="https://www.python.org/ftp/python/${PYTHON_VERSION}/${PYTHON_TARBALL}"
 PLUMED_URL="https://github.com/plumed/plumed2/releases/download/v${PLUMED_VERSION}/${PLUMED_TARBALL}"
+OPENBLAS_URL="https://github.com/OpenMathLib/OpenBLAS/releases/download/v${OPENBLAS_VERSION}/${OPENBLAS_TARBALL}"
+PYTHON_SHA256="f4de1b10bd6c70cbb9fa1cd71fc5038b832747a74ee59d599c69ce4846defb50"
+PLUMED_SHA256="5aaf718ac530a1c8df6e0644c22acc84ad4202778106a1d584477057775f2995"
+OPENBLAS_SHA256="38240eee1b29e2bde47ebb5d61160207dc68668a54cac62c076bb5032013b1eb"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -358,22 +364,53 @@ url_available() {
     fi
 }
 
+file_sha256() {
+    local path="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "${path}" | awk '{print tolower($1)}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "${path}" | awk '{print tolower($1)}'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "${path}" | awk '{print tolower($NF)}'
+    else
+        die "sha256sum, shasum, or openssl is required to verify source archives"
+    fi
+}
+
+verify_sha256() {
+    local path="$1"
+    local expected="${2,,}"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "+ verify SHA-256 ${expected} ${path}" >&2
+        return 0
+    fi
+    require_file "${path}" "source archive"
+    local observed
+    observed="$(file_sha256 "${path}")"
+    [[ "${observed}" == "${expected}" ]] || die "SHA-256 mismatch for ${path}: expected ${expected}, observed ${observed}"
+}
+
 download_to() {
     local url="$1"
     local dest="$2"
+    local expected_sha256="$3"
     if [[ "${DRY_RUN}" -eq 1 ]]; then
-        echo "+ download or stage ${url} -> ${dest}" >&2
+        echo "+ download ${url} -> ${dest}, then verify SHA-256 ${expected_sha256}" >&2
         return 0
     fi
     [[ "${ALLOW_DOWNLOAD}" -eq 1 ]] || die "download disabled for ${url}; rerun with --allow-download or stage ${dest}"
     mkdir -p "$(dirname "${dest}")"
+    local partial="${dest}.partial.$$"
+    rm -f "${partial}"
     if command -v curl >/dev/null 2>&1; then
-        run_cmd curl -fL "${url}" -o "${dest}"
+        run_cmd curl -fL "${url}" -o "${partial}"
     elif command -v wget >/dev/null 2>&1; then
-        run_cmd wget -O "${dest}" "${url}"
+        run_cmd wget -O "${partial}" "${url}"
     else
         die "neither curl nor wget is available for download: ${url}"
     fi
+    verify_sha256 "${partial}" "${expected_sha256}"
+    run_cmd mv "${partial}" "${dest}"
 }
 
 print_download_readiness() {
@@ -385,7 +422,7 @@ print_download_readiness() {
             "PyPI|https://pypi.org/simple/" \
             "Python|${PYTHON_URL}" \
             "PLUMED|${PLUMED_URL}" \
-            "GitHub/OpenBLAS|https://github.com/"; do
+            "OpenBLAS|${OPENBLAS_URL}"; do
             local label="${label_url%%|*}"
             local url="${label_url#*|}"
             if url_available "${url}"; then
@@ -400,11 +437,9 @@ print_download_readiness() {
 If online downloads are unavailable and a required source is missing:
   * Python: place ${PYTHON_TARBALL} in ${PROJECTS_DIR}/_sources/
   * PLUMED: place ${PLUMED_TARBALL} in ${PROJECTS_DIR}/_sources/
-            or extract it as ${PROJECTS_DIR}/plumed-${PLUMED_VERSION}
-  * OpenBLAS/FEREBUS: ensure ${PROJECTS_DIR}/FEREBUS_CPU/libs/openblas/lib64/libopenblas.a
-            or ${PROJECTS_DIR}/FEREBUS_CPU/libs/openblas/lib/libopenblas.a exists,
-            or run 'cd ${PROJECTS_DIR}/FEREBUS_CPU/libs && ./fetchOpenBlas.sh'
-            on an internet-capable node.
+            (the installer verifies it before extraction)
+  * OpenBLAS/FEREBUS: place ${OPENBLAS_TARBALL} in ${PROJECTS_DIR}/_sources/;
+            the installer verifies its pinned SHA-256 before building the static archive.
   * Python wheels: set PIP_FIND_LINKS=/path/to/wheelhouse before running this script.
 EOF
 }
@@ -552,7 +587,7 @@ ensure_csf3_python() {
     local sources_dir="${PROJECTS_DIR}/_sources"
     local tarball="${sources_dir}/${PYTHON_TARBALL}"
     if [[ ! -f "${tarball}" ]]; then
-        download_to "${PYTHON_URL}" "${tarball}"
+        download_to "${PYTHON_URL}" "${tarball}" "${PYTHON_SHA256}"
     fi
     if [[ "${DRY_RUN}" -eq 1 ]]; then
         echo "+ build private CPython ${PYTHON_VERSION} from ${tarball} with --with-openssl=${openssl_prefix}"
@@ -561,9 +596,11 @@ ensure_csf3_python() {
         return 0
     fi
     require_file "${tarball}" "Python source tarball"
+    verify_sha256 "${tarball}" "${PYTHON_SHA256}"
     local build_parent="${HOME}/src"
     local src_dir="${build_parent}/Python-${PYTHON_VERSION}"
     run_cmd mkdir -p "${build_parent}" "$(dirname "${PYTHON_PREFIX}")"
+    run_cmd rm -rf "${src_dir}"
     run_cmd tar -xzf "${tarball}" -C "${build_parent}"
     run_in_dir "${src_dir}" ./configure "--prefix=${PYTHON_PREFIX}" --enable-shared --with-ensurepip=install "--with-openssl=${openssl_prefix}" --with-openssl-rpath=auto
     run_in_dir "${src_dir}" make -j "${INSTALL_JOBS}"
@@ -941,19 +978,25 @@ plumed_source_dir() {
     local sources_dir="${PROJECTS_DIR}/_sources"
     local tarball="${sources_dir}/${PLUMED_TARBALL}"
     if [[ -d "${extracted}" ]]; then
+        if [[ "${DRY_RUN}" -eq 0 ]]; then
+            require_file "${extracted}/.ichor-source.sha256" "verified PLUMED source receipt"
+            [[ "$(tr -d '[:space:]' < "${extracted}/.ichor-source.sha256")" == "${PLUMED_SHA256}" ]] || die "existing PLUMED source was not extracted from the pinned archive"
+        fi
         printf '%s\n' "${extracted}"
         return 0
     fi
     if [[ ! -f "${tarball}" ]]; then
-        download_to "${PLUMED_URL}" "${tarball}"
+        download_to "${PLUMED_URL}" "${tarball}" "${PLUMED_SHA256}"
     fi
     if [[ "${DRY_RUN}" -eq 1 ]]; then
         printf '%s\n' "${extracted}"
         return 0
     fi
     require_file "${tarball}" "PLUMED source tarball"
+    verify_sha256 "${tarball}" "${PLUMED_SHA256}"
     run_cmd mkdir -p "${PROJECTS_DIR}"
     run_cmd tar -xzf "${tarball}" -C "${PROJECTS_DIR}"
+    printf '%s\n' "${PLUMED_SHA256}" > "${extracted}/.ichor-source.sha256"
     printf '%s\n' "${extracted}"
 }
 
@@ -1015,6 +1058,8 @@ install_ferebus_if_needed() {
     fi
     local root="${PROJECTS_DIR}/FEREBUS_CPU"
     require_dir "${root}" "FEREBUS_CPU source tree"
+    load_gcc_build_modules
+    require_cmd make "Load a GCC build environment first."
     local openblas_a=""
     for candidate in "${root}/libs/openblas/lib64/libopenblas.a" "${root}/libs/openblas/lib/libopenblas.a"; do
         if [[ -f "${candidate}" ]]; then
@@ -1023,13 +1068,7 @@ install_ferebus_if_needed() {
         fi
     done
     if [[ -z "${openblas_a}" ]]; then
-        if [[ "${DRY_RUN}" -eq 1 ]]; then
-            warn "dry-run: FEREBUS static OpenBLAS is not present; install will require staged OpenBLAS or --allow-download"
-        elif [[ "${ALLOW_DOWNLOAD}" -eq 1 ]]; then
-            run_in_dir "${root}/libs" ./fetchOpenBlas.sh
-        else
-            die "FEREBUS static OpenBLAS is missing. Stage it under ${root}/libs/openblas or rerun with --allow-download."
-        fi
+        build_pinned_openblas "${root}/libs/openblas"
     fi
     if [[ -z "${openblas_a}" && "${DRY_RUN}" -eq 0 ]]; then
         for candidate in "${root}/libs/openblas/lib64/libopenblas.a" "${root}/libs/openblas/lib/libopenblas.a"; do
@@ -1042,7 +1081,6 @@ install_ferebus_if_needed() {
     if [[ -z "${openblas_a}" && "${DRY_RUN}" -eq 0 ]]; then
         die "FEREBUS static OpenBLAS is still missing after setup"
     fi
-    load_gcc_build_modules
     require_cmd cmake "Load the CSF CMake module first."
     require_cmd gfortran "Load a GCC compiler module first."
     local build_dir="${root}/build-ichor-install"
@@ -1066,6 +1104,52 @@ install_ferebus_if_needed() {
     [[ "${DRY_RUN}" -eq 1 || -x "${FEREBUS_PATH}" ]] || die "FEREBUS build did not create executable: ${FEREBUS_PATH}"
 }
 
+build_pinned_openblas() {
+    local prefix="$1"
+    local tarball="${PROJECTS_DIR}/_sources/${OPENBLAS_TARBALL}"
+    local build_parent="${PROJECTS_DIR}/_sources/build"
+    local source_dir="${build_parent}/OpenBLAS-${OPENBLAS_VERSION}"
+
+    note "Building pinned static OpenBLAS ${OPENBLAS_VERSION} for FEREBUS"
+    if [[ ! -f "${tarball}" ]]; then
+        download_to "${OPENBLAS_URL}" "${tarball}" "${OPENBLAS_SHA256}"
+    fi
+    verify_sha256 "${tarball}" "${OPENBLAS_SHA256}"
+
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        mkdir -p "${build_parent}"
+        case "${source_dir}" in
+            "${PROJECTS_DIR}/_sources/build/OpenBLAS-${OPENBLAS_VERSION}") ;;
+            *) die "refusing to replace unexpected OpenBLAS source directory: ${source_dir}" ;;
+        esac
+        rm -rf "${source_dir}"
+        tar -xzf "${tarball}" -C "${build_parent}"
+        [[ -d "${source_dir}" ]] || die "OpenBLAS archive did not extract the expected directory: ${source_dir}"
+    else
+        echo "+ extract verified ${tarball} -> ${source_dir}"
+    fi
+
+    run_in_dir "${source_dir}" make -j "${INSTALL_JOBS}" \
+        TARGET=GENERIC DYNAMIC_ARCH=1 USE_OPENMP=1 NO_AFFINITY=1 \
+        NO_SHARED=1 NUM_THREADS=64
+    run_in_dir "${source_dir}" make "PREFIX=${prefix}" install
+
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        local archive=""
+        for candidate in "${prefix}/lib64/libopenblas.a" "${prefix}/lib/libopenblas.a"; do
+            if [[ -f "${candidate}" ]]; then
+                archive="${candidate}"
+                break
+            fi
+        done
+        [[ -n "${archive}" ]] || die "pinned OpenBLAS build did not install libopenblas.a below ${prefix}"
+        if find "${prefix}" -type f \( -name 'libopenblas.so' -o -name 'libopenblas.so.*' \) -print -quit | grep -q .; then
+            die "OpenBLAS build unexpectedly installed a shared library below ${prefix}"
+        fi
+        echo "FEREBUS OpenBLAS archive: ${archive}"
+    fi
+}
+
 upsert_ichor_config() {
     note "Updating ~/ichor_config.yaml"
     local venv_config
@@ -1073,196 +1157,27 @@ upsert_ichor_config() {
     local ferebus_config
     local plumed_kernel_config
     local plumed_lib_config
+    local python_library_config
     venv_config="$(config_path_for_yaml "${VENV}/bin/python")"
     aimall_config="$(config_path_for_yaml "${AIMALL_PATH}")"
     ferebus_config="$(config_path_for_yaml "${FEREBUS_PATH}")"
     plumed_kernel_config="$(config_path_for_yaml "${PLUMED_KERNEL:-${HOME}/opt/plumed-${PLUMED_VERSION}/lib/libplumedKernel.so}")"
     plumed_lib_config="$(config_path_for_yaml "${PLUMED_LIBRARY_PATH:-${HOME}/opt/plumed-${PLUMED_VERSION}/lib}")"
+    python_library_config="$(config_path_for_yaml "${PYTHON_PREFIX}/lib")"
     if [[ "${DRY_RUN}" -eq 1 ]]; then
         echo "+ initialise/update ~/ichor_config.yaml from repo template and upsert ${MACHINE} profile"
         return 0
     fi
-    "${PYTHON}" - "${MACHINE}" "${REPO_ROOT}/ichor_config.yaml" "${venv_config}" "${aimall_config}" "${ferebus_config}" "${plumed_kernel_config}" "${plumed_lib_config}" <<'PY'
-from __future__ import annotations
-
-import shutil
-import sys
-import time
-from pathlib import Path
-
-import yaml
-
-machine, repo_config_path, python_path, aimall_path, ferebus_path, plumed_kernel, plumed_lib = sys.argv[1:8]
-path = Path.home() / "ichor_config.yaml"
-data = {}
-if path.exists():
-    loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    if not isinstance(loaded, dict):
-        raise SystemExit("~/ichor_config.yaml must contain a YAML mapping")
-    data = loaded
-    backup = path.with_name(path.name + ".bak." + str(int(time.time())))
-    shutil.copy2(path, backup)
-    print(f"Backed up existing config to {backup}")
-else:
-    repo_config = Path(repo_config_path)
-    if repo_config.is_file():
-        loaded = yaml.safe_load(repo_config.read_text(encoding="utf-8")) or {}
-        if not isinstance(loaded, dict):
-            raise SystemExit(f"{repo_config} must contain a YAML mapping")
-        data = loaded
-        print(f"Initialising {path} from {repo_config}")
-
-def deep_update(dst, src):
-    for key, value in src.items():
-        if isinstance(value, dict) and isinstance(dst.get(key), dict):
-            deep_update(dst[key], value)
-        else:
-            dst[key] = value
-
-if machine == "csf3":
-    profile = {
-        "hpc": {
-            "scheduler": "slurm",
-            "jobscript_shebang": "#!/bin/bash --login",
-            "max_array_task_id": 25000,
-            "max_job_log_files_per_directory": 5000,
-            "memory_per_core_gb": 8,
-            "memory_per_core_gb_by_partition": {
-                "multicore": 8,
-                "interactive": 8,
-                "serial": 5,
-                "multicore_small": 5,
-                "himem": 32,
-            },
-            "parallel_environments": {
-                "serial": [1, 1],
-                "multicore": [2, 168],
-                "interactive": [1, 168],
-                "multicore_small": [2, 32],
-                "himem": [1, 32],
-            },
-            "partitions": {
-                "multicore": {
-                    "min_cpus": 2,
-                    "max_cpus": 168,
-                    "memory_per_core_gb": 8,
-                    "max_walltime_hours": 168,
-                    "daemon_supported": True,
-                },
-                "interactive": {
-                    "min_cpus": 1,
-                    "max_cpus": 168,
-                    "memory_per_core_gb": 8,
-                    "max_walltime_hours": 24,
-                    "daemon_supported": True,
-                },
-                "multicore_small": {
-                    "min_cpus": 2,
-                    "max_cpus": 32,
-                    "memory_per_core_gb": 5,
-                    "max_walltime_hours": 168,
-                    "daemon_supported": True,
-                },
-                "serial": {
-                    "min_cpus": 1,
-                    "max_cpus": 1,
-                    "memory_per_core_gb": 5,
-                    "max_walltime_hours": 168,
-                    "daemon_supported": True,
-                },
-                "himem": {
-                    "min_cpus": 1,
-                    "max_cpus": 32,
-                    "memory_per_core_gb": 32,
-                    "max_walltime_hours": 168,
-                    "daemon_supported": True,
-                },
-            },
-        },
-        "software": {
-            "python": {"env_name": "ichor-csf3", "python_path": python_path, "modules": []},
-            "gaussian": {
-                "executable_path": "$g09root/g09/g09",
-                "modules": ["apps/binapps/gaussian/g09d01_em64t"],
-            },
-            "aimall": {"executable_path": aimall_path},
-            "ferebus": {"executable_path": ferebus_path, "pyferebus_platform": "CSF3"},
-            "ariadne_runtime": {
-                "modules": [
-                    "compilers/intel/oneapi/2025.0.1",
-                    "umf compiler-rt tbb compiler",
-                    "mkl/2025.0",
-                ]
-            },
-            "plumed": {"kernel_path": plumed_kernel, "library_path": plumed_lib, "modules": []},
-        },
-    }
-else:
-    profile = {
-        "hpc": {
-            "scheduler": "slurm",
-            "jobscript_shebang": "#!/bin/bash",
-            "max_array_task_id": 25000,
-            "max_job_log_files_per_directory": 5000,
-            "memory_per_core_gb": 4,
-            "memory_per_core_gb_by_partition": {
-                "serial": 4,
-                "multicore": 4,
-                "multinode": 4,
-            },
-            "parallel_environments": {"serial": [1, 1], "multicore": [2, 40]},
-            "partitions": {
-                "serial": {
-                    "min_cpus": 1,
-                    "max_cpus": 1,
-                    "memory_per_core_gb": 4,
-                    "max_walltime_hours": 168,
-                    "daemon_supported": True,
-                },
-                "multicore": {
-                    "min_cpus": 2,
-                    "max_cpus": 40,
-                    "memory_per_core_gb": 4,
-                    "max_walltime_hours": 168,
-                    "daemon_supported": True,
-                },
-                "multinode": {
-                    "min_cpus": 2,
-                    "max_cpus": 10000,
-                    "memory_per_core_gb": 4,
-                    "max_walltime_hours": 168,
-                    "daemon_supported": False,
-                },
-            },
-        },
-        "software": {
-            "python": {
-                "env_name": "ichor-csf4",
-                "python_path": python_path,
-                "modules": ["python/3.11.3-gcccore-12.3.0"],
-            },
-            "gaussian": {
-                "executable_path": "$g16root/g16/g16",
-                "modules": ["gaussian/g16c01_em64t_detectcpu"],
-            },
-            "aimall": {"executable_path": aimall_path},
-            "ferebus": {"executable_path": ferebus_path, "pyferebus_platform": "CSF4"},
-            "ariadne_runtime": {
-                "modules": [
-                    "compilers/oneapi/2024.2.0",
-                    "compiler-rt tbb compiler",
-                    "mkl/2024.2",
-                ]
-            },
-            "plumed": {"kernel_path": plumed_kernel, "library_path": plumed_lib, "modules": []},
-        },
-    }
-
-current = data.setdefault(machine, {})
-deep_update(current, profile)
-path.write_text(yaml.safe_dump(data, sort_keys=True), encoding="utf-8")
-print(f"Updated {path} profile {machine}")
-PY
+    "${PYTHON}" "${REPO_ROOT}/scripts/upsert_ichor_config.py" \
+        --destination "${HOME}/ichor_config.yaml" \
+        --canonical-config "${REPO_ROOT}/ichor_config.yaml" \
+        --machine "${MACHINE}" \
+        --python-path "${venv_config}" \
+        --python-library-path "${python_library_config}" \
+        --aimall-path "${aimall_config}" \
+        --ferebus-path "${ferebus_config}" \
+        --plumed-kernel "${plumed_kernel_config}" \
+        --plumed-library-path "${plumed_lib_config}"
 }
 
 verify_operator_backends() {

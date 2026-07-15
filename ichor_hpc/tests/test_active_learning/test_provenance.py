@@ -423,7 +423,11 @@ def test_full_provenance_chain_through_dry_run_executor(tmp_path):
     )
 
     ex.postprocess(state, CampaignPhase.PHASE_A_DIVERSITY, observations=[])
+    from ichor_hpc.tests.quantum_test_support import prepare_dry_submitted_phase
+
+    prepare_dry_submitted_phase(ex, state, CampaignPhase.INITIAL_GAUSSIAN)
     ex.postprocess(state, CampaignPhase.INITIAL_GAUSSIAN, observations=[])
+    prepare_dry_submitted_phase(ex, state, CampaignPhase.INITIAL_AIMALL)
     ex.postprocess(state, CampaignPhase.INITIAL_AIMALL, observations=[])
     ex.submit_or_run(state, CampaignPhase.INITIAL_ALLOCATION_CHECK)
     bootstrap = ex.postprocess(
@@ -468,7 +472,9 @@ def test_full_provenance_chain_through_dry_run_executor(tmp_path):
         assert data["phase_b"]["descriptor_used"] == cfg.phase_b.descriptor
     assert selected_after_fps == cfg.point_allocation.batch_total_size
 
+    prepare_dry_submitted_phase(ex, state, CampaignPhase.GAUSSIAN)
     ex.postprocess(state, CampaignPhase.GAUSSIAN, observations=[])
+    prepare_dry_submitted_phase(ex, state, CampaignPhase.AIMALL)
     ex.postprocess(state, CampaignPhase.AIMALL, observations=[])
     ex.submit_or_run(state, CampaignPhase.ALLOCATION_CHECK)
     ex.submit_or_run(state, CampaignPhase.APPEND)
@@ -556,7 +562,15 @@ def test_full_provenance_chain_two_iterations_grows_index_monotonically(tmp_path
         models_version=-1,
     )
     ex.postprocess(bootstrap_state, CampaignPhase.PHASE_A_DIVERSITY, observations=[])
+    from ichor_hpc.tests.quantum_test_support import prepare_dry_submitted_phase
+
+    prepare_dry_submitted_phase(
+        ex, bootstrap_state, CampaignPhase.INITIAL_GAUSSIAN
+    )
     ex.postprocess(bootstrap_state, CampaignPhase.INITIAL_GAUSSIAN, observations=[])
+    prepare_dry_submitted_phase(
+        ex, bootstrap_state, CampaignPhase.INITIAL_AIMALL
+    )
     ex.postprocess(bootstrap_state, CampaignPhase.INITIAL_AIMALL, observations=[])
     ex.submit_or_run(bootstrap_state, CampaignPhase.INITIAL_ALLOCATION_CHECK)
     ex.postprocess(
@@ -582,7 +596,9 @@ def test_full_provenance_chain_two_iterations_grows_index_monotonically(tmp_path
         _stage_ariadne_intent(ex, state_ns)
         ex.postprocess(state_ns, CampaignPhase.ARIADNE_ARRAY, observations=[])
         ex.postprocess(state_ns, CampaignPhase.PHASE_B_DIVERSITY, observations=[])
+        prepare_dry_submitted_phase(ex, state_ns, CampaignPhase.GAUSSIAN)
         ex.postprocess(state_ns, CampaignPhase.GAUSSIAN, observations=[])
+        prepare_dry_submitted_phase(ex, state_ns, CampaignPhase.AIMALL)
         ex.postprocess(state_ns, CampaignPhase.AIMALL, observations=[])
         ex.submit_or_run(state_ns, CampaignPhase.ALLOCATION_CHECK)
         result = ex.submit_or_run(state_ns, CampaignPhase.APPEND)

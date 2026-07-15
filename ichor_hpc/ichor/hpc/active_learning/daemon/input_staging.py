@@ -1130,12 +1130,32 @@ def stage_gaussian_inputs(
     phase_name,
     iteration,
     sample_xyz,
+    *,
+    campaign_uid: Optional[str] = None,
 ) -> Tuple[Path, int]:
     """Write one POINT_<k>.pointdir/input.gjf per frame in sample_xyz, plus
     POINTS.txt. Returns (staging_dir, n_points)."""
     from ichor.core.files.gaussian.gjf import GJF
 
     frames = _load_frames(sample_xyz)
+    supplied_campaign_uid = str(campaign_uid or "").strip()
+
+    def expected_campaign_uid() -> str:
+        if supplied_campaign_uid:
+            return supplied_campaign_uid
+        from .state import DEFAULT_STATE_FILENAME, read_state
+
+        current_state = read_state(
+            Path(campaign_dir)
+            / ".DATA"
+            / "ACTIVE_LEARNING"
+            / DEFAULT_STATE_FILENAME
+        )
+        value = str(current_state.campaign_uid).strip()
+        if not value:
+            raise ValueError("campaign state has no campaign_uid")
+        return value
+
     phase_b_records: List[Dict[str, Any]] = []
     allocation_records: List[Dict[str, Any]] = []
     allocation_assignment_hash: Optional[str] = None
@@ -1181,15 +1201,11 @@ def stage_gaussian_inputs(
         if replacement_context == "active":
             phase_b_records = list(allocation_records)
         elif replacement_context == "bootstrap":
-            from .state import read_state, DEFAULT_STATE_FILENAME
             from ..acquisition.trajectory_pool import TrajectoryPool
 
-            current_state = read_state(
-                Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
-            )
             pool = TrajectoryPool.load(campaign_dir)
             initial_provenance_context = {
-                "campaign_uid": str(current_state.campaign_uid),
+                "campaign_uid": expected_campaign_uid(),
                 "trajectory_sha256": str(pool.sha256),
             }
             initial_seed_frame_ids = [int(record["frame_id"]) for record in allocation_records]
@@ -1198,16 +1214,11 @@ def stage_gaussian_inputs(
             raise ValueError("replacement sample context is invalid")
     if str(phase_name) == "GAUSSIAN":
         from ..handoff_manifests import read_phase_b_selection_manifest
-        from .state import DEFAULT_STATE_FILENAME, read_state
-
-        current_state = read_state(
-            Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
-        )
 
         phase_b_manifest = read_phase_b_selection_manifest(
             Path(sample_xyz).parent.parent,
             expected_iteration=int(iteration),
-            expected_campaign_uid=str(current_state.campaign_uid),
+            expected_campaign_uid=expected_campaign_uid(),
         )
         phase_b_records = list(phase_b_manifest.get("final", []))
         if len(phase_b_records) != len(frames):
@@ -1223,16 +1234,12 @@ def stage_gaussian_inputs(
         )
     if str(phase_name) == "INITIAL_GAUSSIAN":
         try:
-            from .state import read_state, DEFAULT_STATE_FILENAME
             from ..acquisition.trajectory_pool import TrajectoryPool
             from ..handoff_manifests import read_phase_a_sample_manifest
 
-            current_state = read_state(
-                Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
-            )
             phase_a_manifest = read_phase_a_sample_manifest(
                 Path(sample_xyz).parent,
-                expected_campaign_uid=str(current_state.campaign_uid),
+                expected_campaign_uid=expected_campaign_uid(),
             )
             selected = phase_a_manifest.get("selected_indices")
             if isinstance(selected, list):
@@ -1253,7 +1260,7 @@ def stage_gaussian_inputs(
                 ]
                 pool = TrajectoryPool.load(campaign_dir)
                 initial_provenance_context = {
-                    "campaign_uid": str(current_state.campaign_uid),
+                    "campaign_uid": expected_campaign_uid(),
                     "trajectory_sha256": str(pool.sha256),
                 }
                 allocation_records = list(
@@ -1281,15 +1288,11 @@ def stage_gaussian_inputs(
     provenance_context = None
     if phase_b_records:
         try:
-            from .state import read_state, DEFAULT_STATE_FILENAME
             from ..acquisition.trajectory_pool import TrajectoryPool
 
-            current_state = read_state(
-                Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
-            )
             pool = TrajectoryPool.load(campaign_dir)
             provenance_context = {
-                "campaign_uid": str(current_state.campaign_uid),
+                "campaign_uid": expected_campaign_uid(),
                 "trajectory_sha256": str(pool.sha256),
             }
         except Exception as exc:

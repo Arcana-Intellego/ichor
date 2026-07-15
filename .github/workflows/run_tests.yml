@@ -15,7 +15,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: "3.8"
+        python-version: "3.11"
     - name: Install dependencies
       run: |
         pip install pre-commit
@@ -34,7 +34,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: "3.8"
+        python-version: "3.11"
     - name: Install dependencies
       run: |
         pip install -e ichor_core[dev]
@@ -51,7 +51,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: "3.8"
+        python-version: "3.11"
     - name: Install dependencies
       run: |
         pip install -e ichor_core[dev]
@@ -61,7 +61,24 @@ jobs:
       # M16-P12: live-mode tests need a real cluster + Gaussian / AIMAll /
       # FEREBUS / ARIADNE binaries; deselect them on GitHub runners.
       run: |
-        pytest ichor_hpc/tests -m "not live and not slow"
+        pytest ichor_hpc/tests -m "not live and not slow and not integration"
+
+  run_daemon_integration_tests:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+    - name: Install dependencies
+      run: |
+        pip install -e ichor_core[dev]
+        pip install -e ichor_hpc
+        pip install -e ichor_cli
+    - name: Run offline daemon integration tests
+      run: |
+        pytest ichor_hpc/tests/test_active_learning/test_live_one_iter.py -m integration
 
   run_ichor_cli_tests:
     runs-on: ubuntu-latest
@@ -70,7 +87,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: "3.8"
+        python-version: "3.11"
     - name: Install dependencies
       run: |
         pip install -e ichor_core[dev]
@@ -87,7 +104,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: "3.8"
+        python-version: "3.11"
     - name: Install dependencies
       run: |
         pip install -e ichor_core[dev]

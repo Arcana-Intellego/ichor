@@ -111,7 +111,9 @@ export CC=gcc
 export CXX=g++
 
 cd ~/projects
+echo "5aaf718ac530a1c8df6e0644c22acc84ad4202778106a1d584477057775f2995  plumed-2.10.0.tgz" | sha256sum -c -
 tar -xf plumed-2.10.0.tgz
+printf '%s\n' "5aaf718ac530a1c8df6e0644c22acc84ad4202778106a1d584477057775f2995" > plumed-2.10.0/.ichor-source.sha256
 cd plumed-2.10.0
 ./configure --prefix=$HOME/opt/plumed-2.10.0 \
     --disable-external-blas \
@@ -176,78 +178,21 @@ automatically.
 ## 4. declare the backend paths in ~/ichor_config.yaml
 
 ICHOR reads backend executable paths from `~/ichor_config.yaml` at start.
-A minimal CSF4 entry that the daemon will be happy with:
 
-```yaml
-# ~/ichor_config.yaml
+The repository root [`ichor_config.yaml`](../../ichor_config.yaml) is the
+single canonical CSF4 profile. Run `scripts/install_ichor_csf.sh --machine
+csf4`; the installer copies that profile atomically into
+`~/ichor_config.yaml` and overrides only the local Python, AIMAll, FEREBUS and
+PLUMED paths. Do not maintain a second profile in this guide.
 
-csf4:
+The canonical CSF4 contract uses login-shell Slurm scripts, 4 GB/core on both
+`serial` and `multicore`, and a maximum of 40 shared-memory cores.
+`multinode` is deliberately absent because the daemon's scientific
+backends are node-local. Inspect the installed values with
+`ichor-al-daemon preflight --verbose` before submitting work.
 
-  hpc:
-    scheduler: slurm
-    max_array_task_id: 25000
-    max_job_log_files_per_directory: 5000
-    memory_per_core_gb: 4
-    memory_per_core_gb_by_partition:
-      serial: 4
-      multicore: 4
-      multinode: 4
-    parallel_environments:
-      serial: [1, 1]
-      multicore: [2, 40]
-    partitions:
-      serial:
-        min_cpus: 1
-        max_cpus: 1
-        memory_per_core_gb: 4
-        max_walltime_hours: 168
-        daemon_supported: true
-      multicore:
-        min_cpus: 2
-        max_cpus: 40
-        memory_per_core_gb: 4
-        max_walltime_hours: 168
-        daemon_supported: true
-      multinode:
-        min_cpus: 2
-        max_cpus: 10000
-        memory_per_core_gb: 4
-        max_walltime_hours: 168
-        daemon_supported: false
-
-  software:
-
-    aimall:
-      executable_path: "~/AIMAll/aimqb.ish"
-
-    ferebus:
-      executable_path: "$HOME/.local/bin/ferebus"
-      pyferebus_platform: "CSF4"
-
-    gaussian:
-      executable_path: "$g16root/g16/g16"
-      modules: ["gaussian/g16c01_em64t_detectcpu"]
-
-    python:
-      env_name: "ichor-csf4"
-      python_path: "~/.venv/ichor-csf4/bin/python"
-      modules: ["python/3.11.3-gcccore-12.3.0"]
-
-    plumed:
-      kernel_path: "$HOME/opt/plumed-2.10.0/lib/libplumedKernel.so"
-      library_path: "$HOME/opt/plumed-2.10.0/lib"
-      modules: []
-
-    ariadne_runtime:
-      modules:
-        - "compilers/oneapi/2024.2.0"
-        - "compiler-rt tbb compiler"
-        - "mkl/2024.2"
-```
-
-Adjust the AIMAll + FEREBUS paths to match where you actually installed
-them in step 3. The repo ships a fuller `ichor_config.yaml` at the repo
-root that you can copy + edit.
+Pass non-default AIMAll or FEREBUS paths to the installer in step 3 so its
+atomic profile upsert records them.
 
 The active-learning daemon defaults all backend-specific
 `resources.*_mem_per_cpu` fields to `auto`. On CSF4 that resolves to 4G/core

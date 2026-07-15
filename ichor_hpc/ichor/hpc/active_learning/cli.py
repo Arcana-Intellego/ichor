@@ -7949,6 +7949,27 @@ def evaluate_campaign_preflight(
                     + str(destination)
                 )
             checkpoint_summary["resolved_destination"] = str(destination)
+        resource_profile: Dict[str, Dict[str, Any]] = {}
+        if bool(getattr(availability, "profile", False)):
+            from .daemon.phase_executor import SBATCH_PHASES
+            from .daemon.resource_solver import (
+                validate_partition_supported,
+                validate_partition_walltime,
+            )
+
+            for phase_name in sorted(SBATCH_PHASES):
+                partition = str(
+                    loaded_config.resources.partition_for(phase_name)
+                )
+                walltime = float(
+                    loaded_config.resources.walltime_for(phase_name)
+                )
+                validate_partition_supported(partition)
+                validate_partition_walltime(partition, walltime)
+                resource_profile[phase_name] = {
+                    "partition": partition,
+                    "walltime_hours": walltime,
+                }
         config_summary = {
             "ok": True,
             "schema_version": int(loaded_config.schema_version),
@@ -7960,6 +7981,7 @@ def evaluate_campaign_preflight(
             "feature_scaling": bool(prior.feature_scaling),
             "property_scaling": bool(prior.property_scaling),
             "checkpoint": checkpoint_summary,
+            "resource_profile": resource_profile,
         }
     except Exception as exc:
         config_summary = {
