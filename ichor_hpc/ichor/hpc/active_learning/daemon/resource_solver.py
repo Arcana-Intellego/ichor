@@ -159,19 +159,6 @@ def slurm_memory_mib(value: Any) -> float:
     return float(amount) * scale
 
 
-def gaussian_memory_mib(value: Any) -> float:
-    from ..config import ConfigValidationError, memory_mebibytes
-
-    try:
-        return memory_mebibytes(
-            "resources.gaussian.link0_mem",
-            str(value),
-            gaussian=True,
-        )
-    except ConfigValidationError as exc:
-        raise BackendSubmissionError(str(exc)) from exc
-
-
 def _partition_profile(partition: str) -> Optional[Dict[str, Any]]:
     partitions = profile_value("hpc", "partitions", default=None)
     if not isinstance(partitions, dict):
@@ -707,24 +694,22 @@ def _gjf_atom_order(path: Path) -> Tuple[str, ...]:
     return tuple(atoms)
 
 
-def _gjf_link0_nproc(path: Path) -> Optional[int]:
+def _reject_gaussian_input_resource_directives(path: Path) -> None:
+    """Reject per-input resources; Slurm owns Gaussian CPU and memory limits."""
     for line in path.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
         if not stripped.startswith("%"):
             if stripped:
                 break
             continue
-        match = re.match(
-            r"^%\s*nprocshared\s*=\s*([0-9]+)\s*$",
-            stripped,
-            flags=re.IGNORECASE,
-        )
-        if match:
-            value = int(match.group(1))
-            if value <= 0:
-                raise ValueError("Gaussian %NProcShared must be > 0")
-            return value
-    return None
+        key = stripped[1:].split("=", 1)[0].strip().lower()
+        if key in {"mem", "nprocshared"}:
+            raise ValueError(
+                "Gaussian input must not contain %Mem or %NProcShared; "
+                "the immutable Slurm resource resolution supplies GAUSS_MDEF "
+                "and GAUSS_PDEF: "
+                + str(path)
+            )
 
 
 def wfn_primitive_count(path: Path) -> int:
@@ -765,7 +750,6 @@ def _quantum_evidence(
         required,
     )
     atom_orders = []
-    gaussian_link0_nproc: List[Optional[int]] = []
     primitive_counts = []
     aimall_task_naat = []
     aimall_task_metadata = []
@@ -777,7 +761,7 @@ def _quantum_evidence(
                 "input.gjf is missing from staged pointdir: " + str(pointdir)
             )
         atom_orders.append(_gjf_atom_order(gjf))
-        gaussian_link0_nproc.append(_gjf_link0_nproc(gjf))
+        _reject_gaussian_input_resource_directives(gjf)
         files.append(_file_evidence(gjf))
         if "AIMALL" in str(phase_name):
             wfn = pointdir / "input.wfn"
@@ -795,14 +779,6 @@ def _quantum_evidence(
         "atom_orders": [list(order) for order in atom_orders],
         "inputs": files,
     }
-    if any(value is not None for value in gaussian_link0_nproc):
-        if not all(value is not None for value in gaussian_link0_nproc):
-            raise ValueError(
-                "Gaussian Link0 %NProcShared is only present for part of the array"
-            )
-        evidence["gaussian_link0_nproc"] = [
-            int(value) for value in gaussian_link0_nproc if value is not None
-        ]
     if primitive_counts:
         evidence["primitive_counts"] = primitive_counts
         evidence["max_n_primitives"] = max(primitive_counts)
@@ -820,9 +796,11 @@ def _quantum_evidence(
                     raise ValueError(
                         "AIMAll task metadata is unreadable: " + str(task_path)
                     ) from exc
-                if not isinstance(task_payload, dict) or int(
-                    task_payload.get("schema_version", -1)
-                ) != 1:
+                if (
+                    not isinstance(task_payload, dict)
+                    or isinstance(task_payload.get("schema_version"), bool)
+                    or task_payload.get("schema_version") != 2
+                ):
                     raise ValueError(
                         "AIMAll task metadata has an unsupported schema: "
                         + str(task_path)
@@ -833,12 +811,44 @@ def _quantum_evidence(
                 naat = int(task_payload.get("naat", -1))
                 if atom_count != len(atom_orders[index]):
                     raise ValueError("AIMAll task metadata atom count has drifted")
+                if task_payload.get("pointdir") != pointdirs[index].name:
+                    raise ValueError("AIMAll task metadata pointdir has drifted")
+                expected_atom_names = task_payload.get("expected_atom_names")
+                if (
+                    not isinstance(expected_atom_names, list)
+                    or len(expected_atom_names) != atom_count
+                    or len(expected_atom_names) != len(set(expected_atom_names))
+                    or any(
+                        not isinstance(name, str) or not name
+                        for name in expected_atom_names
+                    )
+                ):
+                    raise ValueError("AIMAll task atom identities are invalid")
                 if primitive_count != int(primitive_counts[index]):
                     raise ValueError(
                         "AIMAll task metadata primitive count has drifted"
                     )
                 if nproc <= 0 or naat <= 0 or naat > nproc or naat > atom_count:
                     raise ValueError("AIMAll task metadata worker counts are invalid")
+                for binding_name in (
+                    "wfn_method_receipt",
+                    "gaussian_task_receipt",
+                ):
+                    binding = task_payload.get(binding_name)
+                    if not isinstance(binding, dict):
+                        raise ValueError("AIMAll task receipt binding is invalid")
+                    binding_path = pointdirs[index] / str(binding.get("path") or "")
+                    if (
+                        binding_path.parent != pointdirs[index]
+                        or binding_path.is_symlink()
+                        or not binding_path.is_file()
+                        or sha256_file(binding_path) != str(binding.get("sha256") or "")
+                    ):
+                        raise ValueError("AIMAll task receipt binding has drifted")
+                if sha256_file(pointdirs[index] / "input.gjf") != str(
+                    task_payload.get("gjf_sha256") or ""
+                ):
+                    raise ValueError("AIMAll task GJF binding has drifted")
                 aimall_task_naat.append(naat)
                 aimall_task_metadata.append(_file_evidence(task_path))
             evidence["aimall_task_naat"] = aimall_task_naat
@@ -1185,15 +1195,6 @@ def _submitted_array_evidence(
         selected_orders = [atom_orders[index] for index in parsed]
         selected["atom_orders"] = selected_orders
         selected["max_n_atoms"] = max(len(order) for order in selected_orders)
-        link0_nproc = list(evidence.get("gaussian_link0_nproc") or [])
-        if link0_nproc:
-            if len(link0_nproc) != logical_total:
-                raise BackendSubmissionError(
-                    "Gaussian Link0 CPU evidence does not match logical tasks"
-                )
-            selected["gaussian_link0_nproc"] = [
-                int(link0_nproc[index]) for index in parsed
-            ]
         primitive_counts = list(evidence.get("primitive_counts") or [])
         if backend == "aimall":
             if len(primitive_counts) != logical_total:
@@ -1610,17 +1611,6 @@ def _auto_cpu_target(
             target = 8
         else:
             target = 16
-        frozen_nproc = list(evidence.get("gaussian_link0_nproc") or [])
-        if frozen_nproc:
-            frozen_max = max(int(value) for value in frozen_nproc)
-            if frozen_max > partition_max:
-                raise BackendSubmissionError(
-                    "Gaussian frozen %NProcShared="
-                    + str(frozen_max)
-                    + " exceeds partition maximum "
-                    + str(partition_max)
-                )
-            target = max(target, frozen_max)
         extra.update({"n_atoms": int(n_atoms), "gaussian_weighted_size": float(weighted)})
         return min(max(target, partition_min), partition_max), "gaussian_size_basis_throughput", extra, 0.0, "gaussian_partition_memory_for_gauss_mdef"
     if backend == "aimall":
@@ -1825,15 +1815,6 @@ def resolve_phase_resources(
         cpu_reason = "explicit"
 
     scientific_cpus = int(cpus)
-    if backend == "gaussian":
-        frozen_nproc = list(evidence.get("gaussian_link0_nproc") or [])
-        if frozen_nproc and max(int(value) for value in frozen_nproc) > scientific_cpus:
-            raise BackendSubmissionError(
-                "Gaussian frozen %NProcShared="
-                + str(max(int(value) for value in frozen_nproc))
-                + " exceeds resolved resources.gaussian.cpus_per_task="
-                + str(scientific_cpus)
-            )
     if backend == "diversity":
         pairs = int(evidence["n_frames"] * (evidence["n_frames"] - 1) // 2)
         wanted = max(
@@ -2093,30 +2074,21 @@ def resolve_phase_resources(
     )
 
 
-def gaussian_mdef_gb(config: Any, resolved: ResolvedPhaseResources) -> int:
+def gaussian_mdef(config: Any, resolved: ResolvedPhaseResources) -> str:
+    """Render a positive Gaussian memory limit within the Slurm allocation."""
     allocated_mib = slurm_memory_mib(resolved.mem_per_cpu) * float(max(1, int(resolved.cpus_per_task)))
     usable_mib = allocated_mib * float(
         config.resources.gaussian_memory_fraction_of_slurm_for()
     )
-    return max(1, int(math.floor(usable_mib / 1024.0)))
-
-
-def validate_gaussian_link0_memory(config: Any, resolved: ResolvedPhaseResources) -> None:
-    if str(config.resources.gaussian_memory_mode_for()) != "link0":
-        return
-    gaussian_mib = gaussian_memory_mib(config.resources.gaussian_link0_mem_for())
-    allocated_mib = slurm_memory_mib(resolved.mem_per_cpu) * float(max(1, int(resolved.cpus_per_task)))
-    limit_mib = float(config.resources.gaussian_memory_fraction_of_slurm_for()) * allocated_mib
-    if gaussian_mib > limit_mib + 1.0e-9:
+    whole_mib = int(math.floor(usable_mib))
+    if whole_mib < 1:
         raise BackendSubmissionError(
-            "resources.gaussian.link0_mem "
-            + repr(str(config.resources.gaussian_link0_mem_for()))
-            + " exceeds "
-            + str(config.resources.gaussian_memory_fraction_of_slurm_for())
-            + " of the resolved Link0 Gaussian Slurm allocation "
-            + "(resources.gaussian.mem_per_cpu="
-            + repr(str(resolved.mem_per_cpu))
-            + ", resources.gaussian.cpus_per_task="
-            + str(int(resolved.cpus_per_task))
-            + ")"
+            "resolved Gaussian allocation is too small to express a positive "
+            "GAUSS_MDEF within the configured Slurm memory fraction"
         )
+    whole_gib = whole_mib // 1024
+    rendered = str(whole_gib) + "GB" if whole_gib >= 1 else str(whole_mib) + "MB"
+    rendered_mib = float(whole_gib * 1024 if whole_gib >= 1 else whole_mib)
+    if rendered_mib > usable_mib + 1.0e-9:
+        raise BackendSubmissionError("rendered GAUSS_MDEF exceeds its protected Slurm allocation")
+    return rendered

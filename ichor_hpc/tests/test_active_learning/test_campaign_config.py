@@ -96,7 +96,6 @@ def test_default_campaign_config_is_valid():
     assert c.resources.cpus_for("GAUSSIAN") == "auto"
     assert c.resources.mem_per_cpu_for("AIMALL") == "auto"
     assert c.resources.array_concurrency_limit is None
-    assert c.resources.gaussian.memory_mode == "slurm_env"
     assert c.resources.gaussian.memory_fraction_of_slurm == 0.85
     assert c.resources.memory_estimate_safety_factor == 1.25
     assert c.resources.scheduler_usage_telemetry is True
@@ -312,7 +311,6 @@ def test_scheduler_partition_rejects_unsafe_tokens(partition):
 def test_slurm_memory_accepts_csf4_style_units(mem):
     payload = CampaignConfig().to_dict()
     payload["resources"]["gaussian"]["mem_per_cpu"] = mem
-    payload["resources"]["gaussian"]["link0_mem"] = "1MB"
     assert CampaignConfig.from_dict(payload).resources.gaussian_mem_per_cpu == mem
 
 
@@ -324,18 +322,11 @@ def test_slurm_memory_rejects_invalid_units(mem):
         CampaignConfig.from_dict(payload)
 
 
-@pytest.mark.parametrize("mem", ["8GB", "8000MB", "8G", "500MW"])
-def test_gaussian_memory_accepts_gaussian_style_units(mem):
+@pytest.mark.parametrize("field", ["memory_mode", "link0_mem"])
+def test_removed_gaussian_link0_fields_are_rejected(field):
     payload = CampaignConfig().to_dict()
-    payload["resources"]["gaussian"]["link0_mem"] = mem
-    assert CampaignConfig.from_dict(payload).resources.gaussian_link0_mem == mem
-
-
-@pytest.mark.parametrize("mem", ["", "0GB", "8 GB", "eightGB", "8GB;rm"])
-def test_gaussian_memory_rejects_invalid_units(mem):
-    payload = CampaignConfig().to_dict()
-    payload["resources"]["gaussian"]["link0_mem"] = mem
-    with pytest.raises(ConfigValidationError, match="gaussian.link0_mem"):
+    payload["resources"]["gaussian"][field] = "link0" if field == "memory_mode" else "8GB"
+    with pytest.raises(ConfigValidationError, match="unknown keys"):
         CampaignConfig.from_dict(payload)
 
 
@@ -353,14 +344,31 @@ def test_gaussian_slurm_env_cpus_are_backend_specific():
     assert cfg.resources.gaussian_cpus_per_task == 3
 
 
-def test_gaussian_link0_mem_must_leave_slurm_headroom():
+@pytest.mark.parametrize(
+    "token",
+    ["force", "opt", "freq", "geom=checkpoint", "output=wfn", "nosymm", "scf xqc"],
+)
+def test_gaussian_extra_route_rejects_conflicting_or_uncontrolled_tokens(token):
     payload = CampaignConfig().to_dict()
-    payload["resources"]["gaussian"]["memory_mode"] = "link0"
-    payload["resources"]["gaussian"]["mem_per_cpu"] = "4G"
-    payload["resources"]["gaussian"]["cpus_per_task"] = 1
-    payload["resources"]["gaussian"]["link0_mem"] = "4GB"
-    with pytest.raises(ConfigValidationError, match="gaussian.link0_mem"):
+    payload["gaussian"]["extra_route_keywords"] = [token]
+
+    with pytest.raises(ConfigValidationError, match="extra_route_keywords"):
         CampaignConfig.from_dict(payload)
+
+
+def test_gaussian_extra_route_accepts_strict_scf_and_integral_controls():
+    payload = CampaignConfig().to_dict()
+    payload["gaussian"]["extra_route_keywords"] = [
+        "scf=(xqc,maxcycle=512)",
+        "int=ultrafine",
+    ]
+
+    config = CampaignConfig.from_dict(payload)
+
+    assert config.gaussian.extra_route_keywords == [
+        "scf=(xqc,maxcycle=512)",
+        "int=ultrafine",
+    ]
 
 
 def test_schema_v3_resources_are_rejected_without_migration():
@@ -876,7 +884,6 @@ def test_shipped_active_learning_examples_are_resource_safe(relative_path):
         assert cfg.aimall.naat == "auto"
         assert cfg.aimall.boaq == "auto_gs2"
         assert cfg.aimall.iasmesh == "medium"
-    assert cfg.resources.gaussian.memory_mode == "slurm_env"
     if "first_live_iter" in relative_path and cfg.resources.array_concurrency_limit is not None:
         assert cfg.runtime.poll_sacct_missing_max_ticks >= 3
 

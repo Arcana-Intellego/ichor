@@ -100,7 +100,10 @@ class GaussianOutput(ReadFile, HasAtoms, HasData):
                     line = next(f)
                     line = next(f)
 
-                    # we should be at the first line that has an atom here
+                    # Keep one coherent geometry. Gaussian can print several
+                    # orientation tables; the final table is paired with the
+                    # final force evaluation.
+                    orientation_atoms = Atoms()
                     # read until we reach another ------ line
                     while "--------------------" not in line:
 
@@ -108,8 +111,9 @@ class GaussianOutput(ReadFile, HasAtoms, HasData):
                         atomic_num = int(split[1])
                         atom_type = nuclear_charge2type[atomic_num]
                         coords = map(float, split[-3:])
-                        atoms.append(Atom(atom_type, *coords))
+                        orientation_atoms.append(Atom(atom_type, *coords))
                         line = next(f)
+                    atoms = orientation_atoms
 
                 elif "Forces (Hartrees/Bohr)" in line:
 
@@ -118,11 +122,20 @@ class GaussianOutput(ReadFile, HasAtoms, HasData):
                     # -----------------------------------------
                     line = next(f)
 
+                    if not atoms:
+                        raise ValueError(
+                            "Gaussian force table appears before an orientation table"
+                        )
+                    current_forces = {}
                     for atom_name in atoms.names:
                         line = next(f).split()
-                        forces[atom_name] = np.array(
+                        values = np.array(
                             [float(line[2]), float(line[3]), float(line[4])]
                         )
+                        if not np.all(np.isfinite(values)):
+                            raise ValueError("Gaussian force table contains non-finite values")
+                        current_forces[atom_name] = values
+                    forces = current_forces
                 elif "Dipole moment (field-independent basis, Debye)" in line:
                     # dipoles are on one line
                     dipole_line_split = next(f).split()
@@ -187,5 +200,7 @@ class GaussianOutput(ReadFile, HasAtoms, HasData):
                     ]
                     self.molecular_hexadecapole = MolecularHexadecapole(*values)
 
+        if forces and len(forces) != len(atoms):
+            raise ValueError("Gaussian force and geometry cardinalities differ")
         self.global_forces = forces
         self.atoms = atoms

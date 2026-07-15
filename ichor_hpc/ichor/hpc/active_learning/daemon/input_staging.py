@@ -33,10 +33,11 @@ from ichor.core.files.xyz import Trajectory
 
 from .resource_solver import (
     resolve_phase_resources,
-    validate_gaussian_link0_memory,
     wfn_primitive_count,
 )
+from .filesystem import campaign_owned_path
 from .state import atomic_write_json, atomic_write_text
+from ..config import normalise_gaussian_route_keywords
 from ..layout import (
     COMMITTED_VERSION_NAME_WIDTH,
     TRAINED_MODELS_DIRNAME,
@@ -52,7 +53,7 @@ from ..versioning.manifest import sha256_file
 QUANTUM_ACCEPTANCE_MANIFEST = "accepted_pointdirs.json"
 QUANTUM_ACCEPTANCE_SCHEMA_VERSION = 2
 AIMALL_TASK_METADATA = "AIMALL_TASK.json"
-AIMALL_TASK_METADATA_SCHEMA_VERSION = 1
+AIMALL_TASK_METADATA_SCHEMA_VERSION = 2
 WFN_METHOD_RECEIPT = "WFN_METHOD_RECEIPT.json"
 WFN_METHOD_RECEIPT_SCHEMA_VERSION = 1
 FEREBUS_TASK_MANIFEST = "FEREBUS_TASKS.json"
@@ -101,7 +102,7 @@ def rewrite_wfn_for_aimall(
     parsed = WFN(wfn)
     parsed.read()
     parsed.method = canonical_method
-    rendered = parsed._write_file(wfn)
+    rendered = parsed.render(wfn)
     if not isinstance(rendered, str) or not rendered:
         raise ValueError("WFN method rewrite produced empty output: " + str(wfn))
     atomic_write_text(wfn, rendered)
@@ -913,8 +914,6 @@ def stage_gaussian_inputs(
     phase_name,
     iteration,
     sample_xyz,
-    *,
-    partition_override: Optional[str] = None,
 ) -> Tuple[Path, int]:
     """Write one POINT_<k>.pointdir/input.gjf per frame in sample_xyz, plus
     POINTS.txt. Returns (staging_dir, n_points)."""
@@ -1056,10 +1055,6 @@ def stage_gaussian_inputs(
                 allocation_assignment_hash = str(
                     bootstrap_allocation["slot_assignment_sha256"]
                 )
-        except FileNotFoundError:
-            initial_seed_frame_ids = []
-            initial_seed_selection_origins = []
-            initial_provenance_context = None
         except Exception as exc:
             raise ValueError(
                 "failed to load Phase A provenance context for initial Gaussian staging: "
@@ -1094,17 +1089,39 @@ def stage_gaussian_inputs(
         if is_replacement
         else bucket_dir(campaign_dir, phase_name, iteration)
     )
+    campaign_owned_path(campaign_dir, staging)
+    point_indexes = [
+        (
+            int(allocation_records[index].get("pointdir_index", index))
+            if is_replacement and allocation_records
+            else int(index)
+        )
+        for index in range(len(frames))
+    ]
+    expected_pointdir_names = [
+        staging_pointdir_name(index) for index in point_indexes
+    ]
+    if len(expected_pointdir_names) != len(set(expected_pointdir_names)):
+        raise ValueError("Gaussian staging pointdir identities contain duplicates")
     preserve_existing_layout = False
     if staging.exists():
+        _reject_symlink_tree(staging)
         try:
+            listed_names = _points_file_names(staging)
+            actual_names = {
+                child.name
+                for child in staging.iterdir()
+                if child.name.endswith(".pointdir")
+            }
             preserve_existing_layout = (
-                len(_points_file_names(staging)) == len(frames)
+                listed_names == expected_pointdir_names
+                and actual_names == set(expected_pointdir_names)
+                and all((staging / name).is_dir() for name in expected_pointdir_names)
             )
         except Exception:
             preserve_existing_layout = False
-    # Keep an existing same-size layout so partial array recovery can reuse
-    # completed Gaussian outputs.  If the layout is malformed or the task
-    # count changed, clear it before staging fresh inputs.
+    # Keep only an exact task layout. Individual task products survive only
+    # while their rendered GJF bytes remain unchanged.
     if staging.exists() and not preserve_existing_layout:
         _checked_rmtree(
             staging,
@@ -1114,17 +1131,14 @@ def stage_gaussian_inputs(
     staging.mkdir(parents=True, exist_ok=True)
 
     keywords = ["nosymm", "output=wfn", "force", "geom=notest"]
-    keywords += [str(value) for value in g.extra_route_keywords]
+    keywords += normalise_gaussian_route_keywords(g.extra_route_keywords)
 
     pointdirs: List[Path] = []
     for k, atoms in enumerate(frames):
-        point_index = (
-            int(allocation_records[k].get("pointdir_index", k))
-            if is_replacement and allocation_records
-            else int(k)
-        )
-        pd = staging / staging_pointdir_name(point_index)
-        pd.mkdir(parents=True, exist_ok=True)
+        pd = staging / expected_pointdir_names[k]
+        campaign_owned_path(campaign_dir, pd)
+        if pd.is_symlink():
+            raise ValueError("refusing symlinked Gaussian pointdir: " + str(pd))
         gjf = GJF(
             pd / "input.gjf",
             method=str(g.method),
@@ -1134,7 +1148,26 @@ def stage_gaussian_inputs(
             spin_multiplicity=int(g.spin_multiplicity),
             atoms=atoms,
         )
-        gjf.write()
+        rendered_gjf = gjf.render()
+        existing_gjf = pd / "input.gjf"
+        if pd.exists():
+            if not pd.is_dir():
+                raise ValueError("Gaussian pointdir path is not a directory: " + str(pd))
+            unchanged = False
+            if existing_gjf.is_file() and not existing_gjf.is_symlink():
+                try:
+                    unchanged = existing_gjf.read_text(encoding="utf-8") == rendered_gjf
+                except OSError:
+                    unchanged = False
+            if not unchanged:
+                _checked_rmtree(
+                    pd,
+                    campaign_dir=Path(campaign_dir),
+                    allowed_roots=[staging],
+                )
+        pd.mkdir(parents=True, exist_ok=True)
+        if not existing_gjf.exists():
+            atomic_write_text(existing_gjf, rendered_gjf)
         if (
             initial_provenance_context is not None
             and k < len(initial_seed_frame_ids)
@@ -1233,35 +1266,6 @@ def stage_gaussian_inputs(
         pointdirs.append(pd)
 
     write_points_file(staging, pointdirs)
-    if str(config.resources.gaussian_memory_mode_for()) == "link0":
-        gaussian_resources = resolve_phase_resources(
-            phase_name=str(phase_name),
-            config=config,
-            partition=str(
-                partition_override
-                or config.resources.partition_for(str(phase_name))
-            ),
-            campaign_dir=campaign_dir,
-            iteration=int(iteration),
-            array_size=len(frames),
-            staging_dir=staging,
-            n_atoms_override=len(frames[0]),
-            require_evidence=True,
-        )
-        validate_gaussian_link0_memory(config, gaussian_resources)
-        for atoms, pointdir in zip(frames, pointdirs):
-            gjf = GJF(
-                pointdir / "input.gjf",
-                method=str(g.method),
-                basis_set=str(g.basis_set),
-                keywords=list(keywords),
-                charge=int(g.charge),
-                spin_multiplicity=int(g.spin_multiplicity),
-                atoms=atoms,
-            )
-            gjf.set_nproc(int(gaussian_resources.cpus_per_task))
-            gjf.set_mem(str(config.resources.gaussian_link0_mem_for()))
-            gjf.write()
     return staging, len(pointdirs)
 
 
@@ -1297,6 +1301,7 @@ def stage_aimall_inputs(
     if not pointdirs:
         write_points_file(staging, [])
         return staging, 0
+    gaussian_task_names = _points_file_names(staging)
     acceptance_sha256 = sha256_file(staging / QUANTUM_ACCEPTANCE_MANIFEST)
     dimensions = []
     for task_index, pointdir in enumerate(pointdirs):
@@ -1306,13 +1311,33 @@ def stage_aimall_inputs(
                 "Gaussian-accepted pointdir is missing input.wfn: " + str(pointdir)
             )
         try:
-            atom_count = len(PointDirectory(pointdir).atoms)
+            expected_atoms = list(PointDirectory(pointdir).atoms)
+            atom_count = len(expected_atoms)
         except Exception as exc:
             raise ValueError(
                 "failed to count atoms for AIMAll pointdir: " + str(pointdir)
             ) from exc
         if atom_count <= 0:
             raise ValueError("AIMAll pointdir has no atoms: " + str(pointdir))
+        expected_atom_names = [str(atom.name) for atom in expected_atoms]
+        if len(expected_atom_names) != len(set(expected_atom_names)):
+            raise ValueError("AIMAll pointdir geometry has duplicate atom identities")
+        try:
+            gaussian_logical_task_id = gaussian_task_names.index(pointdir.name)
+        except ValueError as exc:
+            raise ValueError("Gaussian acceptance point is absent from POINTS.txt") from exc
+        from .quantum_task_receipts import (
+            GAUSSIAN_TASK_RECEIPT,
+            read_quantum_task_receipt,
+        )
+
+        read_quantum_task_receipt(
+            pointdir,
+            phase_name=expected_phase,
+            iteration=int(iteration),
+            logical_task_id=int(gaussian_logical_task_id),
+        )
+        gaussian_receipt_path = pointdir / GAUSSIAN_TASK_RECEIPT
         receipt_path, receipt = rewrite_wfn_for_aimall(
             wfn,
             method=str(config.gaussian.method),
@@ -1328,6 +1353,9 @@ def stage_aimall_inputs(
                 wfn_primitive_count(wfn),
                 receipt_path,
                 receipt,
+                expected_atom_names,
+                gaussian_logical_task_id,
+                gaussian_receipt_path,
             )
         )
     write_points_file(staging, pointdirs)
@@ -1356,6 +1384,9 @@ def stage_aimall_inputs(
         primitive_count,
         receipt_path,
         receipt,
+        expected_atom_names,
+        gaussian_logical_task_id,
+        gaussian_receipt_path,
     ) in enumerate(dimensions):
         if isinstance(raw_naat, str) and raw_naat.strip().lower() == "auto":
             resolved_naat = int(snapshotted_naat[task_index])
@@ -1369,7 +1400,11 @@ def stage_aimall_inputs(
             pointdir / AIMALL_TASK_METADATA,
             {
                 "schema_version": AIMALL_TASK_METADATA_SCHEMA_VERSION,
+                "pointdir": pointdir.name,
+                "task_index": int(task_index),
+                "gaussian_logical_task_id": int(gaussian_logical_task_id),
                 "atom_count": int(atom_count),
+                "expected_atom_names": list(expected_atom_names),
                 "primitive_count": int(primitive_count),
                 "nproc": int(aimall_cpus),
                 "naat": int(resolved_naat),
@@ -1379,6 +1414,11 @@ def stage_aimall_inputs(
                     "path": receipt_path.name,
                     "sha256": sha256_file(receipt_path),
                 },
+                "gaussian_task_receipt": {
+                    "path": gaussian_receipt_path.name,
+                    "sha256": sha256_file(gaussian_receipt_path),
+                },
+                "gjf_sha256": sha256_file(pointdir / "input.gjf"),
                 "resource_resolution": aimall_resources.journal_payload(
                     phase_name=str(phase_name)
                 ),
@@ -1519,10 +1559,14 @@ def record_allocation_quantum_results(
         validate_provenance(
             pointdir,
             campaign_uid=str(allocation["campaign_uid"]),
+            iteration=int(iteration),
             allocation_candidate_id=candidate_id,
             allocation_context=str(context),
             allocation_slot_id=int(attempt["slot_id"]),
             allocation_split=str(attempt["split"]),
+            allocation_slot_assignment_sha256=str(
+                allocation["slot_assignment_sha256"]
+            ),
         )
         observed_ids.add(candidate_id)
         if name in aimall_accepted_names:
@@ -1552,6 +1596,28 @@ def record_allocation_quantum_results(
                 .resolve(strict=False)
                 .relative_to(campaign.resolve())
                 .as_posix()
+            )
+        if accepted:
+            from .quantum_acceptance_receipts import (
+                QUANTUM_ACCEPTANCE_RECEIPT,
+                read_quantum_acceptance_receipt,
+            )
+
+            acceptance_receipt = read_quantum_acceptance_receipt(
+                campaign,
+                pointdir,
+                expected_phase=str(aimall_phase),
+                expected_iteration=int(iteration),
+                expected_candidate_id=candidate_id,
+                expected_assignment_sha256=str(allocation["slot_assignment_sha256"]),
+            )
+            receipt_path = pointdir / QUANTUM_ACCEPTANCE_RECEIPT
+            result["quantum_acceptance_receipt"] = str(
+                receipt_path.resolve().relative_to(campaign.resolve()).as_posix()
+            )
+            result["quantum_acceptance_receipt_sha256"] = sha256_file(receipt_path)
+            result["accepted_pointdir_content_sha256"] = str(
+                acceptance_receipt["content_sha256"]
             )
         results.append(result)
     if pending_ids and observed_ids != pending_ids:
@@ -1583,6 +1649,12 @@ def record_allocation_quantum_results(
             "accepted": bool(record["accepted"]),
             "pointdir": str(record["pointdir"]),
             "reason": record.get("reason"),
+            "quantum_acceptance_receipt_sha256": record.get(
+                "quantum_acceptance_receipt_sha256"
+            ),
+            "accepted_pointdir_content_sha256": record.get(
+                "accepted_pointdir_content_sha256"
+            ),
         }
         for record in sorted(results, key=lambda item: str(item["candidate_id"]))
     ]
@@ -1647,11 +1719,44 @@ def accepted_allocation_pointdirs(
             )
         validate_provenance(
             resolved,
+            campaign_uid=str(allocation["campaign_uid"]),
+            iteration=int(iteration),
             allocation_candidate_id=str(attempt["candidate_id"]),
             allocation_context=str(context),
             allocation_slot_id=int(attempt["slot_id"]),
             allocation_split=str(attempt["split"]),
+            allocation_slot_assignment_sha256=str(
+                allocation["slot_assignment_sha256"]
+            ),
         )
+        from .quantum_acceptance_receipts import (
+            QUANTUM_ACCEPTANCE_RECEIPT,
+            read_quantum_acceptance_receipt,
+        )
+
+        receipt = read_quantum_acceptance_receipt(
+            campaign,
+            resolved,
+            expected_iteration=int(iteration),
+            expected_candidate_id=str(attempt["candidate_id"]),
+            expected_assignment_sha256=str(allocation["slot_assignment_sha256"]),
+        )
+        receipt_path = resolved / QUANTUM_ACCEPTANCE_RECEIPT
+        expected_receipt_path = str(attempt.get("quantum_acceptance_receipt") or "")
+        expected_receipt_sha = str(
+            attempt.get("quantum_acceptance_receipt_sha256") or ""
+        )
+        expected_content_sha = str(
+            attempt.get("accepted_pointdir_content_sha256") or ""
+        )
+        if (
+            not expected_receipt_path
+            or receipt_path.resolve()
+            != (campaign / expected_receipt_path).resolve(strict=False)
+            or sha256_file(receipt_path) != expected_receipt_sha
+            or str(receipt["content_sha256"]) != expected_content_sha
+        ):
+            raise ValueError("accepted quantum receipt does not match allocation evidence")
         seen.add(resolved)
         pointdirs.append(resolved)
     return pointdirs, allocation
@@ -1796,11 +1901,22 @@ def commit_reference_data_delta(
     first_ordinal = len(parent_view.entries) if parent_view is not None else 0
     added_entries: List[ReferenceDataEntry] = []
     added_names: List[str] = []
+    copied_by_source: Dict[str, Path] = {}
     for offset, (source, attempt) in enumerate(zip(accepted_pointdirs, attempts)):
         ordinal = first_ordinal + offset
         name = "POINT_" + str(ordinal).zfill(POINTDIR_NAME_WIDTH) + ".pointdir"
         destination = staging / name
         _copytree_no_symlinks(source, destination)
+        from .quantum_acceptance_receipts import read_quantum_acceptance_receipt
+
+        read_quantum_acceptance_receipt(
+            campaign,
+            destination,
+            expected_iteration=int(iteration),
+            expected_candidate_id=str(attempt["candidate_id"]),
+            expected_assignment_sha256=str(allocation["slot_assignment_sha256"]),
+            expected_source_pointdir=source.name,
+        )
         lock = destination / ".provenance.lock"
         if lock.exists():
             lock.unlink()
@@ -1822,6 +1938,7 @@ def commit_reference_data_delta(
             )
         )
         added_names.append(name)
+        copied_by_source[source.name] = destination
 
     allocation_relative = allocation_path.relative_to(campaign).as_posix()
     quality_sources: Dict[str, Path] = {}
@@ -1886,12 +2003,52 @@ def commit_reference_data_delta(
         destination_quality = (
             staging / "quality_evidence" / ("quantum_quality_" + str(index).zfill(4) + ".json")
         )
-        _copy_atomic_checked_file(source_quality, destination_quality)
+        destination_quality.parent.mkdir(parents=True, exist_ok=True)
+        committed_quality_payload = dict(quality_payload)
+        committed_records = []
+        for record in quality_payload["records"]:
+            committed_record = dict(record)
+            source_name = str(record.get("pointdir") or "")
+            if source_name in committed_by_source:
+                binding = committed_by_source[source_name]
+                committed_record["committed_pointdir"] = str(
+                    binding["committed_pointdir"]
+                )
+                committed_record["candidate_id"] = str(binding["candidate_id"])
+            committed_records.append(committed_record)
+        committed_quality_payload["records"] = committed_records
+        atomic_write_json(destination_quality, committed_quality_payload)
+        from .quantum_acceptance_receipts import (
+            bind_quantum_acceptance_receipt_to_commit,
+        )
+
+        committed_record_by_source = {
+            str(record.get("pointdir") or ""): record
+            for record in committed_records
+            if bool(record.get("accepted"))
+        }
+        published_quality = (
+            versioning.iteration_path(version)
+            / destination_quality.relative_to(staging)
+        )
+        for source_name in relevant_names:
+            bind_quantum_acceptance_receipt_to_commit(
+                campaign,
+                copied_by_source[source_name],
+                source_pointdir=source_name,
+                committed_pointdir=str(
+                    committed_by_source[source_name]["committed_pointdir"]
+                ),
+                quality_manifest_source=destination_quality,
+                quality_manifest_published=published_quality,
+                quality_record=committed_record_by_source[source_name],
+            )
         quality_evidence.append(
             {
                 "path": destination_quality.relative_to(staging).as_posix(),
                 "sha256": sha256_file(destination_quality),
                 "source_path": source_quality.relative_to(campaign.resolve()).as_posix(),
+                "source_sha256": sha256_file(source_quality),
                 "phase": str(quality_payload["phase"]),
                 "iteration": int(quality_payload["iteration"]),
                 "pointdir_bindings": [
@@ -1899,6 +2056,25 @@ def commit_reference_data_delta(
                 ],
             }
         )
+    # Receipt rebinding changes the committed pointdir tree.  Recompute every
+    # content digest before publishing the immutable version manifest.
+    added_entries = [
+        ReferenceDataEntry(
+            global_ordinal=entry.global_ordinal,
+            introduced_in_version=entry.introduced_in_version,
+            pointdir_name=entry.pointdir_name,
+            pointdir_path=entry.pointdir_path,
+            candidate_id=entry.candidate_id,
+            slot_id=entry.slot_id,
+            split=entry.split,
+            replacement_round=entry.replacement_round,
+            pointdir_tree_sha256=hash_reference_pointdir_tree(entry.pointdir_path),
+            provenance_sha256=sha256_file(
+                entry.pointdir_path / PROVENANCE_FILENAME
+            ),
+        )
+        for entry in added_entries
+    ]
     payload = build_reference_data_version_payload(
         campaign_uid=str(allocation["campaign_uid"]),
         version=version,

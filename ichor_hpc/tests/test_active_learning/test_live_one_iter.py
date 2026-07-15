@@ -135,12 +135,70 @@ def _ensure_live_quantum_contract_names(staging_dir):
             matches = sorted(pointdir.glob(suffix))
             noncanonical_matches = [old for old in matches if old.name != canonical]
             if noncanonical_matches:
-                target.write_bytes(noncanonical_matches[0].read_bytes())
+                # The daemon-owned GJF is the authoritative input contract.
+                # The fixture supplies backend outputs, so it must not replace
+                # that GJF with the historical absolute WFN destination
+                # embedded in the captured input file.
+                if canonical != "input.gjf" or not target.exists():
+                    target.write_bytes(noncanonical_matches[0].read_bytes())
             elif matches and not target.exists():
                 target.write_bytes(matches[0].read_bytes())
             for old in matches:
                 if old.name != canonical:
                     old.unlink()
+
+
+def _retarget_live_quantum_fixture_geometry(staging_dir):
+    """Make captured backend outputs describe the daemon-staged GJF geometry."""
+    from ichor.core.files.gaussian.gjf import GJF
+    from ichor.core.files.gaussian.wfn import WFN
+
+    root = Path(staging_dir)
+    orientation_row = re.compile(
+        r"^(?P<indent>\s*)(?P<centre>\d+)\s+(?P<atomic>\d+)\s+"
+        r"(?P<kind>\d+)\s+[-+0-9.eEdD]+\s+[-+0-9.eEdD]+\s+"
+        r"[-+0-9.eEdD]+\s*$"
+    )
+    for pointdir in root.glob("POINT_*.pointdir"):
+        gjf_path = pointdir / "input.gjf"
+        wfn_path = pointdir / "input.wfn"
+        output_path = pointdir / "input.gau"
+        if not (gjf_path.is_file() and wfn_path.is_file() and output_path.is_file()):
+            continue
+
+        gjf = GJF(gjf_path)
+        target_atoms = list(gjf.atoms)
+
+        # Preserve all captured orbital data while making the WFN nuclei
+        # correspond to the input that this fake backend received.
+        wfn = WFN(wfn_path, method=str(gjf.method))
+        _ = wfn.total_energy
+        wfn.atoms = gjf.atoms.to_bohr()
+        wfn.write()
+
+        lines = output_path.read_text(encoding="utf-8").splitlines()
+        rewritten = []
+        for line in lines:
+            match = orientation_row.match(line)
+            if match is None:
+                rewritten.append(line)
+                continue
+            centre = int(match.group("centre"))
+            if centre < 1 or centre > len(target_atoms):
+                rewritten.append(line)
+                continue
+            atom = target_atoms[centre - 1]
+            rewritten.append(
+                f"{centre:7d}{int(match.group('atomic')):11d}"
+                f"{int(match.group('kind')):12d}"
+                f"{float(atom.x):16.6f}{float(atom.y):12.6f}"
+                f"{float(atom.z):12.6f}"
+            )
+        output_path.write_text(
+            "\n".join(rewritten) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
 
 
 def _prune_unlisted_pointdirs(staging_dir):
@@ -611,6 +669,7 @@ def _live_smoke_seed_for_phase(campaign_dir, phase_name, iteration):
         target = campaign_dir / ".DATA" / "STAGING" / "initial"
         _copy_tree(fixtures / "initial_quantum", target)
         _ensure_live_quantum_contract_names(target)
+        _retarget_live_quantum_fixture_geometry(target)
         _prune_unlisted_pointdirs(target)
     elif phase_name in ("GAUSSIAN", "AIMALL"):
         target = (
@@ -618,6 +677,7 @@ def _live_smoke_seed_for_phase(campaign_dir, phase_name, iteration):
         )
         _copy_tree(fixtures / "iter_quantum", target)
         _ensure_live_quantum_contract_names(target)
+        _retarget_live_quantum_fixture_geometry(target)
         _prune_unlisted_pointdirs(target)
     elif phase_name in ("INITIAL_FEREBUS", "FEREBUS"):
         _seed_pyferebus_manifest_staging(

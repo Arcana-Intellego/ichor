@@ -69,6 +69,61 @@ def _write_pool(source: Path, n_frames: int) -> None:
     source.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
 
+@pytest.mark.parametrize("directive", ["%Mem=8GB", "%NProcShared=8"])
+def test_gaussian_input_resource_directives_are_rejected(tmp_path, directive):
+    path = tmp_path / "input.gjf"
+    path.write_text(
+        directive + "\n# B3LYP/sto-3g force output=wfn\n\njob\n\n0 1\nH 0 0 0\n\ninput.wfn\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    with pytest.raises(ValueError, match="must not contain %Mem or %NProcShared"):
+        resource_solver._reject_gaussian_input_resource_directives(path)
+
+
+def test_gaussian_mdef_uses_megabytes_for_sub_gibibyte_allocations():
+    config = CampaignConfig()
+    resolved = resource_solver.ResolvedPhaseResources(
+        backend="gaussian",
+        partition="multicore",
+        ntasks=1,
+        cpus_per_task=1,
+        mem_per_cpu="512M",
+        estimated_total_memory_gb=0.5,
+        partition_memory_per_core_gb=0.5,
+        cpus_raw=1,
+        mem_per_cpu_raw="512M",
+        cpu_reason="test",
+        memory_reason="test",
+    )
+
+    assert resource_solver.gaussian_mdef(config, resolved) == "435MB"
+
+
+def test_gaussian_mdef_rejects_allocation_below_one_protected_mebibyte():
+    config = CampaignConfig()
+    resolved = resource_solver.ResolvedPhaseResources(
+        backend="gaussian",
+        partition="multicore",
+        ntasks=1,
+        cpus_per_task=1,
+        mem_per_cpu="1K",
+        estimated_total_memory_gb=1.0 / 1024.0 / 1024.0,
+        partition_memory_per_core_gb=1.0,
+        cpus_raw=1,
+        mem_per_cpu_raw="1K",
+        cpu_reason="test",
+        memory_reason="test",
+    )
+
+    with pytest.raises(
+        resource_solver.BackendSubmissionError,
+        match="too small to express a positive GAUSS_MDEF",
+    ):
+        resource_solver.gaussian_mdef(config, resolved)
+
+
 def _write_empty_committed_bootstrap(
     campaign: Path,
     config: CampaignConfig,
@@ -483,32 +538,6 @@ def test_explicit_gaussian_memory_defines_gauss_mdef_allocation(resource_profile
     assert resolved.mem_per_cpu == "4G"
     assert resolved.estimated_total_memory_gb == pytest.approx(8.0)
     assert resolved.memory_reason == "gaussian_explicit_allocation_for_gauss_mdef"
-
-
-def test_gaussian_partial_retry_honours_frozen_link0_cpu_count(resource_profile):
-    cfg = CampaignConfig()
-    cfg.resources.gaussian.cpus_per_task = 4
-    cfg.resources.gaussian.mem_per_cpu = "4G"
-    evidence = {
-        "source": "test_exact_dimensions",
-        "n_tasks": 2,
-        "max_n_atoms": 3,
-        "atom_orders": [["O", "H", "H"], ["O", "H", "H"]],
-        "gaussian_link0_nproc": [8, 4],
-    }
-
-    with pytest.raises(
-        resource_solver.BackendSubmissionError,
-        match="frozen %NProcShared=8 exceeds",
-    ):
-        resource_solver.resolve_phase_resources(
-            phase_name="GAUSSIAN",
-            config=cfg,
-            partition="multicore",
-            array_size=1,
-            submitted_task_ids=[0],
-            evidence_override=evidence,
-        )
 
 
 def test_attempt_bundle_caps_each_log_directory_and_records_retry_map(tmp_path):

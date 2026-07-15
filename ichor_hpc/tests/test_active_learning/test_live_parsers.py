@@ -137,12 +137,29 @@ def _parse_quantum_fixture(ex, state, phase):
     if "AIMALL" in phase.value:
         from ichor.hpc.active_learning.daemon.state import atomic_write_json
         from ichor.hpc.active_learning.versioning.manifest import sha256_file
+        from ichor.hpc.active_learning.daemon.quantum_task_receipts import (
+            GAUSSIAN_TASK_RECEIPT,
+            write_quantum_task_receipt,
+        )
+        from ichor.core.files.point_directory import PointDirectory
 
         staging = ex._quantum_staging_path(state, phase.value)
+        gaussian_phase = (
+            "INITIAL_GAUSSIAN" if phase.value.startswith("INITIAL_") else "GAUSSIAN"
+        )
+        _install_quantum_intent(ex, state, CampaignPhase(gaussian_phase))
         for task_index, pointdir in enumerate(sorted(staging.glob("POINT_*.pointdir"))):
             wfns = sorted(pointdir.glob("*.wfn"))
             if len(wfns) != 1:
                 continue
+            write_quantum_task_receipt(
+                ex.campaign_dir,
+                pointdir,
+                phase_name=gaussian_phase,
+                iteration=int(state.iteration),
+                logical_task_id=task_index,
+            )
+            gaussian_receipt = pointdir / GAUSSIAN_TASK_RECEIPT
             receipt_path, receipt = stg.rewrite_wfn_for_aimall(
                 wfns[0],
                 method=str(ex.config.gaussian.method),
@@ -155,7 +172,11 @@ def _parse_quantum_fixture(ex, state, phase):
                 pointdir / stg.AIMALL_TASK_METADATA,
                 {
                     "schema_version": stg.AIMALL_TASK_METADATA_SCHEMA_VERSION,
+                    "pointdir": pointdir.name,
+                    "task_index": task_index,
+                    "gaussian_logical_task_id": task_index,
                     "atom_count": 3,
+                    "expected_atom_names": list(PointDirectory(pointdir).atoms.names),
                     "primitive_count": 1,
                     "nproc": 1,
                     "naat": 1,
@@ -165,6 +186,11 @@ def _parse_quantum_fixture(ex, state, phase):
                         "path": receipt_path.name,
                         "sha256": sha256_file(receipt_path),
                     },
+                    "gaussian_task_receipt": {
+                        "path": gaussian_receipt.name,
+                        "sha256": sha256_file(gaussian_receipt),
+                    },
+                    "gjf_sha256": sha256_file(next(pointdir.glob("*.gjf"))),
                     "resource_resolution": {"fixture": True},
                 },
             )
@@ -282,29 +308,83 @@ def _complete_point_allocation(
     from ichor.hpc.active_learning.daemon.quantum_quality import (
         write_quantum_quality_manifest,
     )
+    from ichor.core.common.constants import multipole_names
+    from ichor.hpc.active_learning.daemon.quantum_acceptance_receipts import (
+        write_quantum_acceptance_receipt,
+    )
+    from ichor.hpc.active_learning.versioning.manifest import sha256_file
 
+    phase_name = (
+        CampaignPhase.INITIAL_AIMALL.value
+        if str(context) == "bootstrap"
+        else CampaignPhase.AIMALL.value
+    )
+    quality_records = [{
+        "pointdir": pointdir.name,
+        "accepted": True,
+        "reasons": [],
+        "atom_count": 1,
+        "expected_atom_names": ["H1"],
+        "n_int": 1,
+        "sum_iqa_ha": -0.5,
+        "wfn_total_energy_ha": -0.5,
+        "wfn_virial_ratio": 2.0,
+        "iqa_energy_recovery_error_ha": 0.0,
+        "max_abs_integration_error": 0.0,
+        "per_atom": [{
+            "atom": "H1",
+            "int_file": "h1.int",
+            "canonical_dft_model": "B3LYP",
+            "iqa_ha": -0.5,
+            "integration_error": 0.0,
+            "multipoles": {name: 0.0 for name in multipole_names},
+            "reasons": [],
+        }],
+    } for pointdir in pointdirs.values()]
     quality_path = write_quantum_quality_manifest(
         Path(staging),
-        phase_name=(
-            CampaignPhase.INITIAL_AIMALL.value
-            if str(context) == "bootstrap"
-            else CampaignPhase.AIMALL.value
-        ),
+        phase_name=phase_name,
         iteration=int(iteration),
-        records=[{
-            "pointdir": pointdir.name,
-            "accepted": True,
-            "reasons": [],
-            "atom_count": 1,
-            "n_int": 1,
-            "per_atom": [{
-                "atom": "H1",
-                "iqa_ha": -0.5,
-                "integration_error": 0.0,
-            }],
-        } for pointdir in pointdirs.values()],
+        records=quality_records,
         gates={},
     )
+    attempts = {
+        str(attempt["pointdir_name"]): attempt
+        for attempt in pending_attempts(allocation)
+    }
+    result_evidence = {}
+    for pointdir, quality_record in zip(pointdirs.values(), quality_records):
+        for filename in (
+            "input.gjf",
+            "input.wfn",
+            "input.gau",
+            "AIMALL_TASK.json",
+            "GAUSSIAN_TASK_RECEIPT.json",
+            "WFN_METHOD_RECEIPT.json",
+            "AIMALL_COMPLETION_RECEIPT.json",
+        ):
+            path = pointdir / filename
+            if not path.exists():
+                path.write_text("fixture\n", encoding="utf-8")
+        atomic_dir = pointdir / "input_atomicfiles"
+        atomic_dir.mkdir(exist_ok=True)
+        (atomic_dir / "h1.int").write_text("fixture\n", encoding="utf-8")
+        receipt_path = write_quantum_acceptance_receipt(
+            campaign,
+            pointdir,
+            phase_name=phase_name,
+            iteration=int(iteration),
+            quality_manifest=quality_path,
+            quality_record=quality_record,
+        )
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        result_evidence[pointdir.name] = {
+            "quantum_acceptance_receipt": str(
+                receipt_path.resolve().relative_to(Path(campaign).resolve()).as_posix()
+            ),
+            "quantum_acceptance_receipt_sha256": sha256_file(receipt_path),
+            "accepted_pointdir_content_sha256": receipt["content_sha256"],
+        }
     record_quantum_results(
         allocation_path,
         [
@@ -313,6 +393,7 @@ def _complete_point_allocation(
                 "accepted": True,
                 "pointdir": str(pointdirs[str(attempt["pointdir_name"])]),
                 "quality_manifest": str(quality_path.resolve()),
+                **result_evidence[str(attempt["pointdir_name"])],
             }
             for attempt in pending_attempts(allocation)
         ],
@@ -427,19 +508,62 @@ def test_initial_aimall_happy_path(tmp_path):
     assert len(manifest["accepted_pointdirs"]) == 4
 
 
+def test_aimall_visibility_lag_retries_before_publishing_scientific_evidence(
+    tmp_path,
+):
+    ex = _make_executor(tmp_path)
+    staging = _bind_staging(ex, FIXTURES / "initial_quantum")
+    _seed_point_allocation(
+        ex.campaign_dir,
+        staging,
+        context="bootstrap",
+        iteration=0,
+    )
+    pointdirs = sorted(staging.glob("POINT_*.pointdir"))
+    stg.write_quantum_acceptance_manifest(
+        staging,
+        phase_name="INITIAL_GAUSSIAN",
+        iteration=0,
+        accepted=pointdirs,
+        rejected=[],
+    )
+    missing_int = next(pointdirs[0].glob("*_atomicfiles/*.int"))
+    missing_int.unlink()
+    state = SimpleNamespace(iteration=0, campaign_uid="m16-test")
+
+    result = _parse_quantum_fixture(ex, state, CampaignPhase("INITIAL_AIMALL"))
+
+    assert result.failure_reason.startswith(
+        "aimall_outputs_not_settled_missing_or_unreadable"
+    )
+    current = json.loads(
+        (staging / stg.QUANTUM_ACCEPTANCE_MANIFEST).read_text(encoding="utf-8")
+    )
+    assert current["phase"] == "INITIAL_GAUSSIAN"
+    assert not (staging / "quantum_quality.json").exists()
+    assert not any(
+        pointdir.joinpath("AIMALL_COMPLETION_RECEIPT.json").exists()
+        for pointdir in pointdirs
+    )
+
+
 def test_stage_aimall_inputs_writes_resolved_naat_metadata(tmp_path):
     campaign = tmp_path / "campaign"
     staging = campaign / ".DATA" / "STAGING" / "initial"
     shutil.copytree(str(FIXTURES / "initial_quantum"), str(staging))
     accepted = sorted(staging.glob("POINT_*.pointdir"))[:1]
+    source_gjf = next(accepted[0].glob("*.gjf"))
+    source_wfn = next(accepted[0].glob("*.wfn"))
     shutil.copy2(
-        next(accepted[0].glob("*.gjf")),
+        source_gjf,
         accepted[0] / "input.gjf",
     )
     shutil.copy2(
-        next(accepted[0].glob("*.wfn")),
+        source_wfn,
         accepted[0] / "input.wfn",
     )
+    source_gjf.unlink()
+    source_wfn.unlink()
     stg.write_points_file(staging, sorted(staging.glob("POINT_*.pointdir")))
     stg.write_quantum_acceptance_manifest(
         staging,
@@ -454,6 +578,31 @@ def test_stage_aimall_inputs_writes_resolved_naat_metadata(tmp_path):
     cfg = CampaignConfig()
     cfg.resources.aimall_cpus_per_task = 8
     cfg.aimall.naat = "auto"
+    submission_intent.write_pre_submit_intent(
+        campaign,
+        campaign_uid="m16-test",
+        phase_name="INITIAL_GAUSSIAN",
+        iteration=0,
+        expected_tasks=4,
+    )
+    submission_intent.mark_submitted(
+        campaign,
+        "INITIAL_GAUSSIAN",
+        0,
+        "900001",
+        expected_tasks=4,
+    )
+    from ichor.hpc.active_learning.daemon.quantum_task_receipts import (
+        write_quantum_task_receipt,
+    )
+
+    write_quantum_task_receipt(
+        campaign,
+        accepted[0],
+        phase_name="INITIAL_GAUSSIAN",
+        iteration=0,
+        logical_task_id=0,
+    )
 
     staged_dir, n_points = stg.stage_aimall_inputs(
         campaign, cfg, "INITIAL_AIMALL", 0,

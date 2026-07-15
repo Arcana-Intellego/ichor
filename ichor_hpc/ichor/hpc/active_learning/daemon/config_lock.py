@@ -460,8 +460,6 @@ RESOURCE_FUTURE_EXACT = {
     "resources.gaussian.walltime_hours",
     "resources.gaussian.cpus_per_task",
     "resources.gaussian.mem_per_cpu",
-    "resources.gaussian.memory_mode",
-    "resources.gaussian.link0_mem",
     "resources.gaussian.memory_fraction_of_slurm",
     "resources.aimall.partition",
     "resources.aimall.walltime_hours",

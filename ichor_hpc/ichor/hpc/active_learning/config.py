@@ -72,6 +72,7 @@ __all__ = [
     "CONFIG_SCHEMA_VERSION",
     "ConfigValidationError",
     "AimallConfigBlock",
+    "normalise_gaussian_route_keywords",
     "VALID_DESCRIPTORS",
     "VALID_GEOMETRY_NOVELTY_SCALE_SOURCES",
     "VALID_GEOMETRY_NOVELTY_STATISTICS",
@@ -86,7 +87,6 @@ __all__ = [
     "VALID_SIZE_NORMALISATION_BARRIER_MODES",
     "VALID_ACQUISITION_DRIVER_OBJECTIVES",
     "VALID_ACQUISITION_DRIVER_GRADIENT_BACKENDS",
-    "VALID_GAUSSIAN_MEMORY_MODES",
     "VALID_ERROR_CALIBRATION_MODEL_VERSION_POLICIES",
     "VALID_TRQN_SCALE_MODES",
     "VALID_TRQN_BACKTRANSFORM_MODES",
@@ -95,6 +95,55 @@ __all__ = [
     "VALID_AIMALL_BOAQ_VALUES",
     "VALID_AIMALL_IASMESH_VALUES",
 ]
+
+
+_SAFE_GAUSSIAN_ROUTE_TOKEN_RE = re.compile(r"^[A-Za-z0-9(),=._+\-]+$")
+_SAFE_GAUSSIAN_ROUTE_HEADS = frozenset({"scf", "int", "integral"})
+_FORBIDDEN_GAUSSIAN_ROUTE_FRAGMENTS = (
+    "restart",
+    "checkpoint",
+    "chk",
+    "geom",
+    "guess=read",
+    "opt",
+    "freq",
+    "force",
+    "gradient",
+    "output",
+    "link1",
+)
+
+
+def normalise_gaussian_route_keywords(values: Any) -> List[str]:
+    """Validate optional route tokens that preserve the fixed force/WFN job."""
+    if not isinstance(values, list):
+        raise ConfigValidationError(
+            "gaussian.extra_route_keywords must be a list of strings"
+        )
+    normalised: List[str] = []
+    for index, value in enumerate(values):
+        label = "gaussian.extra_route_keywords[" + str(index) + "]"
+        if not isinstance(value, str) or not value:
+            raise ConfigValidationError(label + " must be a non-empty string")
+        if value != value.strip() or any(character.isspace() for character in value):
+            raise ConfigValidationError(label + " must contain exactly one route token")
+        if not _SAFE_GAUSSIAN_ROUTE_TOKEN_RE.fullmatch(value):
+            raise ConfigValidationError(label + " contains unsafe route syntax")
+        lowered = value.lower()
+        head = re.split(r"[=(]", lowered, maxsplit=1)[0]
+        if head not in _SAFE_GAUSSIAN_ROUTE_HEADS:
+            raise ConfigValidationError(
+                label
+                + " is not allowlisted; only SCF and integral-accuracy controls are supported"
+            )
+        if any(fragment in lowered for fragment in _FORBIDDEN_GAUSSIAN_ROUTE_FRAGMENTS):
+            raise ConfigValidationError(
+                label + " conflicts with the daemon's fixed force/WFN calculation"
+            )
+        if lowered.count("(") != lowered.count(")"):
+            raise ConfigValidationError(label + " has unbalanced parentheses")
+        normalised.append(value)
+    return normalised
 
 
 CONFIG_SCHEMA_VERSION = CURRENT_SCHEMA_VERSION
@@ -125,7 +174,6 @@ VALID_SIZE_NORMALISATION_DISTANCE_MODES = frozenset({"raw", "per_subspace_dim"})
 VALID_SIZE_NORMALISATION_BARRIER_MODES = frozenset({"raw_sum", "family_mean"})
 VALID_ACQUISITION_DRIVER_OBJECTIVES = frozenset({"cheap_driver", "full"})
 VALID_ACQUISITION_DRIVER_GRADIENT_BACKENDS = frozenset({"fd", "hybrid_geometry"})
-VALID_GAUSSIAN_MEMORY_MODES = frozenset({"slurm_env", "link0"})
 VALID_TRQN_SCALE_MODES = frozenset({
     "off",
     "fixed",
@@ -148,8 +196,6 @@ VALID_AIMALL_IASMESH_VALUES = frozenset({
 _SYSTEM_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 _SCHEDULER_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$")
 _SLURM_MEMORY_RE = re.compile(r"^(?:auto|[1-9][0-9]*[KMGT]?)$")
-_GAUSSIAN_MEMORY_RE = re.compile(r"^[1-9][0-9]*(?:[KMGT](?:B|W)?)?$")
-_MEMORY_PARSE_RE = re.compile(r"^([1-9][0-9]*)([KMGT]?)([BW]?)$")
 
 
 # Sentinel used by diff_against_defaults to distinguish "default match" from
@@ -332,38 +378,6 @@ def _validate_memory(name: str, value: Any, pattern: re.Pattern, description: st
         raise ConfigValidationError(name + " must be a string")
     if not pattern.fullmatch(value):
         raise ConfigValidationError(name + " must use " + description + ": " + repr(value))
-
-
-def memory_mebibytes(name: str, value: str, *, gaussian: bool) -> float:
-    """Parse the memory syntaxes this daemon accepts into MiB.
-
-    SLURM values are plain K/M/G/T suffixes. Gaussian accepts byte-like MB/GB and word-like MW/GW
-    suffixes; for the resource cross-check, one Gaussian word is treated as eight bytes.
-    Bare numbers are interpreted as MiB because CSF4 SLURM and our campaign examples use explicit
-    G/GB in normal operation and this is the least surprising fallback for validation.
-    """
-    match = _MEMORY_PARSE_RE.fullmatch(str(value).upper())
-    if not match:
-        raise ConfigValidationError(name + " has unsupported memory syntax: " + repr(value))
-    amount = int(match.group(1))
-    scale = match.group(2) or "M"
-    suffix = match.group(3)
-    multiplier_mib = {
-        "K": 1.0 / 1024.0,
-        "M": 1.0,
-        "G": 1024.0,
-        "T": 1024.0 * 1024.0,
-    }[scale]
-    mib = float(amount) * multiplier_mib
-    if gaussian and suffix == "W":
-        mib *= 8.0
-    return mib
-
-
-# Internal callers retained during the schema-13 clean break use the public
-# parser too; keeping one alias prevents the validation and live paths from
-# acquiring different unit semantics again.
-_memory_mebibytes = memory_mebibytes
 
 
 def diff_against_defaults(config) -> Dict[str, Any]:
@@ -820,8 +834,6 @@ class GaussianResourceBlock:
     walltime_hours: Optional[Union[int, float]] = None
     cpus_per_task: Optional[Union[int, str]] = None
     mem_per_cpu: Optional[str] = None
-    memory_mode: str = "slurm_env"
-    link0_mem: str = "8GB"
     memory_fraction_of_slurm: float = 0.85
 
 
@@ -898,12 +910,6 @@ class ResourceConfigBlock:
             self._backend_block(backend).walltime_hours,
             self.defaults.walltime_hours,
         )
-
-    def gaussian_memory_mode_for(self) -> str:
-        return str(self.gaussian.memory_mode)
-
-    def gaussian_link0_mem_for(self) -> str:
-        return str(self.gaussian.link0_mem)
 
     def gaussian_memory_fraction_of_slurm_for(self) -> float:
         return float(self.gaussian.memory_fraction_of_slurm)
@@ -1071,22 +1077,6 @@ class ResourceConfigBlock:
     @ferebus_mem_per_cpu.setter
     def ferebus_mem_per_cpu(self, value):
         self._set_mem("ferebus", value)
-
-    @property
-    def gaussian_memory_mode(self):
-        return self.gaussian.memory_mode
-
-    @gaussian_memory_mode.setter
-    def gaussian_memory_mode(self, value):
-        self.gaussian.memory_mode = value
-
-    @property
-    def gaussian_link0_mem(self):
-        return self.gaussian.link0_mem
-
-    @gaussian_link0_mem.setter
-    def gaussian_link0_mem(self, value):
-        self.gaussian.link0_mem = value
 
     @property
     def gaussian_memory_fraction_of_slurm(self):
@@ -1427,11 +1417,6 @@ class CampaignConfig:
                 "resources.gradient_parallel_backend must be one of "
                 + repr(sorted(VALID_GRADIENT_PARALLEL_BACKENDS))
             )
-        if self.resources.gaussian.memory_mode not in VALID_GAUSSIAN_MEMORY_MODES:
-            raise ConfigValidationError(
-                "resources.gaussian.memory_mode must be one of "
-                + repr(sorted(VALID_GAUSSIAN_MEMORY_MODES))
-            )
         if isinstance(self.resources.gaussian.memory_fraction_of_slurm, bool) or not isinstance(
             self.resources.gaussian.memory_fraction_of_slurm, (int, float)
         ):
@@ -1442,12 +1427,6 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "resources.gaussian.memory_fraction_of_slurm must be in (0, 1]"
             )
-        _validate_memory(
-            "resources.gaussian.link0_mem",
-            self.resources.gaussian.link0_mem,
-            _GAUSSIAN_MEMORY_RE,
-            "Gaussian memory syntax such as 8GB or 8000MB",
-        )
         _validate_positive_int("aimall.encomp", self.aimall.encomp)
         if not isinstance(self.aimall.nogui, bool):
             raise ConfigValidationError("aimall.nogui must be a boolean")
@@ -2336,55 +2315,9 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "retention.checkpoint_destination is required when checkpoint_required is true"
             )
-        if not isinstance(self.gaussian.extra_route_keywords, list):
-            raise ConfigValidationError(
-                "gaussian.extra_route_keywords must be a list of strings"
-            )
-        for index, keyword in enumerate(self.gaussian.extra_route_keywords):
-            if not isinstance(keyword, str) or not keyword.strip():
-                raise ConfigValidationError(
-                    "gaussian.extra_route_keywords["
-                    + str(index)
-                    + "] must be a non-empty string"
-                )
-        gaussian_mem_per_cpu = self.resources.mem_per_cpu_for("GAUSSIAN")
-        gaussian_cpus_per_task = self.resources.cpus_for("GAUSSIAN")
-        if (
-            self.resources.gaussian.memory_mode == "link0"
-            and str(gaussian_mem_per_cpu).strip().lower() != "auto"
-            and not (
-                isinstance(gaussian_cpus_per_task, str)
-                and gaussian_cpus_per_task.strip().lower() == "auto"
-            )
-        ):
-            gaussian_mem_mib = _memory_mebibytes(
-                "resources.gaussian.link0_mem",
-                self.resources.gaussian.link0_mem,
-                gaussian=True,
-            )
-            slurm_mem_mib = _memory_mebibytes(
-                "resources.gaussian.mem_per_cpu",
-                gaussian_mem_per_cpu,
-                gaussian=False,
-            ) * float(gaussian_cpus_per_task)
-            limit_mib = (
-                float(self.resources.gaussian.memory_fraction_of_slurm)
-                * slurm_mem_mib
-            )
-            if gaussian_mem_mib > limit_mib:
-                raise ConfigValidationError(
-                    "resources.gaussian.link0_mem ("
-                    + str(self.resources.gaussian.link0_mem)
-                    + ") exceeds "
-                    + str(self.resources.gaussian.memory_fraction_of_slurm)
-                    + " of the Gaussian Slurm allocation resources.gaussian.mem_per_cpu "
-                    "* resources.gaussian.cpus_per_task ("
-                    + str(gaussian_mem_per_cpu)
-                    + " * "
-                    + str(gaussian_cpus_per_task)
-                    + ")"
-                )
-
+        self.gaussian.extra_route_keywords = normalise_gaussian_route_keywords(
+            self.gaussian.extra_route_keywords
+        )
     def effective_max_acquisition_grad_per_ang(self) -> float:
         return float(self.acquisition.gradient.max_acquisition_grad_per_ang)
 

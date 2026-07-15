@@ -252,7 +252,7 @@ root that you can copy + edit.
 The active-learning daemon defaults all backend-specific
 `resources.*_mem_per_cpu` fields to `auto`. On CSF4 that resolves to 4G/core
 from the profile above. Gaussian live jobs use the Slurm allocation via
-`GAUSS_PDEF` and `GAUSS_MDEF` by default, rather than hard-coding
+`GAUSS_PDEF` and `GAUSS_MDEF`, rather than hard-coding
 `%NProcShared` or `%mem` inside every `.gjf`. Gaussian scratch is
 daemon-owned under `.DATA/SCRATCH/GAUSSIAN/<phase>/`; successful Gaussian tasks
 remove their own scratch directory, while failed tasks keep it for diagnosis.
@@ -340,8 +340,6 @@ resources:
     walltime_hours: 1
   gaussian:
     walltime_hours: 2
-    memory_mode: slurm_env
-    link0_mem: 8GB
     memory_fraction_of_slurm: 0.85
   aimall:
     walltime_hours: 2

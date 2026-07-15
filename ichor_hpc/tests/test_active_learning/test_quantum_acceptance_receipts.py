@@ -1,0 +1,86 @@
+"""Accepted quantum bytes remain immutable between AIMAll and commit."""
+
+from pathlib import Path
+
+import pytest
+
+from ichor.hpc.active_learning.daemon.quantum_acceptance_receipts import (
+    read_quantum_acceptance_receipt,
+)
+from ichor.hpc.active_learning.daemon.quantum_quality import (
+    write_quantum_quality_manifest,
+)
+from ichor.hpc.active_learning.versioning.provenance import (
+    enrich_with_point_allocation,
+    write_seed_provenance,
+)
+from ichor_hpc.tests.quantum_test_support import (
+    attach_synthetic_quantum_acceptance,
+    synthetic_quantum_quality_record,
+)
+
+
+def _accepted_fixture(tmp_path):
+    campaign = tmp_path / "campaign"
+    pointdir = campaign / ".DATA" / "STAGING" / "initial" / "POINT_0000.pointdir"
+    pointdir.mkdir(parents=True)
+    write_seed_provenance(
+        pointdir,
+        campaign_uid="acceptance-test",
+        iteration=0,
+        trajectory_sha256="a" * 64,
+        seed_frame_id=0,
+        seed_selection_origin="phase_a_diversity",
+        seed_variance_at_selection=None,
+        subspace_neighbour_frame_ids=[],
+        subspace_dimension=0,
+        subspace_eigenvalues=[],
+    )
+    enrich_with_point_allocation(
+        pointdir,
+        candidate_id="candidate-0",
+        context="bootstrap",
+        slot_id=0,
+        split="train",
+        allocation_slot_assignment_sha256="b" * 64,
+    )
+    record = synthetic_quantum_quality_record(pointdir.name)
+    quality = write_quantum_quality_manifest(
+        pointdir.parent,
+        phase_name="INITIAL_AIMALL",
+        iteration=0,
+        records=[record],
+        gates={},
+    )
+    attach_synthetic_quantum_acceptance(
+        campaign,
+        pointdir,
+        phase_name="INITIAL_AIMALL",
+        iteration=0,
+        quality_manifest=quality,
+        quality_record=record,
+    )
+    return campaign, pointdir, quality
+
+
+def test_quantum_acceptance_receipt_detects_late_pointdir_mutation(tmp_path):
+    campaign, pointdir, _quality = _accepted_fixture(tmp_path)
+    (pointdir / "input.wfn").write_text("changed\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="bytes have changed"):
+        read_quantum_acceptance_receipt(
+            campaign,
+            pointdir,
+            expected_phase="INITIAL_AIMALL",
+            expected_iteration=0,
+            expected_candidate_id="candidate-0",
+            expected_assignment_sha256="b" * 64,
+        )
+
+
+def test_quantum_acceptance_receipt_detects_late_quality_mutation(tmp_path):
+    campaign, pointdir, quality = _accepted_fixture(tmp_path)
+    quality.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="quality manifest has changed"):
+        read_quantum_acceptance_receipt(campaign, pointdir)

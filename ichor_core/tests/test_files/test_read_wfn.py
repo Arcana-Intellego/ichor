@@ -1,4 +1,6 @@
 from pathlib import Path
+import re
+import shutil
 from typing import List
 
 import numpy as np
@@ -33,7 +35,9 @@ def _test_molecular_orbitals(
 
     """Asserts that a MolecularOrbital instance is equal to a reference MolecularOrbital instance"""
 
+    assert len(wfn_file_molecular_orbitals) == len(reference_molecular_orbitals)
     for mo, ref_mo in zip(wfn_file_molecular_orbitals, reference_molecular_orbitals):
+        assert len(mo.primitives) == len(ref_mo.primitives)
         assert mo.index == ref_mo.index
         assert mo.occupation_number == pytest.approx(ref_mo.occupation_number)
         assert mo.energy == pytest.approx(ref_mo.energy)
@@ -509,3 +513,33 @@ def test_water_monomer_wfn():
         total_energy=-76.421710687455,
         virial_ratio=2.01177209,
     )
+
+
+def test_wfn_rejects_declared_orbital_count_mismatch(tmp_path):
+    source = example_dir / "WATER_MONOMER0000.wfn"
+    target = tmp_path / "bad-count.wfn"
+    shutil.copy2(source, target)
+    lines = target.read_text(encoding="utf-8").splitlines()
+    lines[1] = lines[1].replace("      5 MOL ORBITALS", "      6 MOL ORBITALS")
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+
+    with pytest.raises(ValueError, match="molecular-orbital count"):
+        _ = WFN(target).total_energy
+
+
+@pytest.mark.parametrize("field", ["energy", "virial"])
+def test_wfn_rejects_nonfinite_terminal_values(tmp_path, field):
+    source = example_dir / "WATER_MONOMER0000.wfn"
+    target = tmp_path / ("bad-" + field + ".wfn")
+    text = source.read_text(encoding="utf-8")
+    pattern = (
+        r"(TOTAL ENERGY\s*=\s*)\S+"
+        if field == "energy"
+        else r"(THE VIRIAL\(-V/T\)=\s*)\S+"
+    )
+    text, count = re.subn(pattern, r"\g<1>NaN", text, count=1)
+    assert count == 1
+    target.write_text(text, encoding="utf-8", newline="\n")
+
+    with pytest.raises(ValueError, match="energy and virial"):
+        _ = WFN(target).total_energy

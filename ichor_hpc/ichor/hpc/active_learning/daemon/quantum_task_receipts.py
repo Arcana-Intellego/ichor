@@ -12,7 +12,7 @@ from .state import atomic_write_json
 from .submission_intent import load_intent
 
 
-QUANTUM_TASK_RECEIPT_SCHEMA_VERSION = 1
+QUANTUM_TASK_RECEIPT_SCHEMA_VERSION = 2
 GAUSSIAN_TASK_RECEIPT = "GAUSSIAN_TASK_RECEIPT.json"
 AIMALL_TASK_RECEIPT = "AIMALL_COMPLETION_RECEIPT.json"
 
@@ -67,7 +67,13 @@ def _task_files(pointdir: Path, phase_name: str) -> tuple[List[Path], List[Path]
         return inputs, logs + wfns
     inputs = _regular_matches(
         pointdir,
-        ("*.wfn", "AIMALL_TASK.json", "WFN_METHOD_RECEIPT.json"),
+        (
+            "*.gjf",
+            "*.wfn",
+            "AIMALL_TASK.json",
+            "WFN_METHOD_RECEIPT.json",
+            "GAUSSIAN_TASK_RECEIPT.json",
+        ),
     )
     ints = _regular_matches(pointdir, ("**/*.int",))
     input_names = {path.name for path in inputs}
@@ -75,6 +81,7 @@ def _task_files(pointdir: Path, phase_name: str) -> tuple[List[Path], List[Path]
         len([path for path in inputs if path.suffix.lower() == ".wfn"]) != 1
         or "AIMALL_TASK.json" not in input_names
         or "WFN_METHOD_RECEIPT.json" not in input_names
+        or "GAUSSIAN_TASK_RECEIPT.json" not in input_names
         or not ints
     ):
         raise ValueError("AIMAll task inputs or INT outputs are incomplete")

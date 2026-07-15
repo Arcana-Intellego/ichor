@@ -109,6 +109,44 @@ def test_quantum_quality_rejects_missing_int_file(tmp_path):
     assert any(reason.startswith("aimall_partial_") for reason in record["reasons"])
 
 
+def test_quantum_quality_rejects_duplicate_or_misnamed_int_atom(tmp_path):
+    src = FIXTURES / "initial_quantum" / "POINT_0000.pointdir"
+    dst = tmp_path / "POINT_0000.pointdir"
+    shutil.copytree(src, dst)
+    h3 = next(dst.glob("*_atomicfiles/h3.int"))
+    h3.write_text(
+        h3.read_text(encoding="utf-8").replace(
+            "Integration is over atom H3",
+            "Integration is over atom H2",
+            1,
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    record = evaluate_aimall_pointdir(PointDirectory(dst), expected_method="B3LYP")
+
+    assert record["accepted"] is False
+    assert "duplicate_int_atom_identity" in record["reasons"]
+    assert "int_atom_identity_mismatch" in record["reasons"]
+    assert "int_filename_atom_mismatch" in record["reasons"]
+
+
+def test_quantum_quality_rejects_nonfinite_multipole(tmp_path):
+    src = FIXTURES / "initial_quantum" / "POINT_0000.pointdir"
+    dst = tmp_path / "POINT_0000.pointdir"
+    shutil.copytree(src, dst)
+    o1 = next(dst.glob("*_atomicfiles/o1.int"))
+    text = o1.read_text(encoding="utf-8")
+    text = text.replace("Q[1,0]         =", "Q[1,0]         = NaN #", 1)
+    o1.write_text(text, encoding="utf-8", newline="\n")
+
+    record = evaluate_aimall_pointdir(PointDirectory(dst), expected_method="B3LYP")
+
+    assert record["accepted"] is False
+    assert "multipole_missing_or_nonfinite" in record["reasons"]
+
+
 def test_quantum_quality_rejects_unreadable_geometry_when_required(tmp_path):
     class _BrokenAtoms:
         def __len__(self):

@@ -262,11 +262,8 @@ class WriteFile(File, ABC):
             f"'_write_file' not implemented for '{self.__class__.__name__}'"
         )
 
-    def write(self, path: Optional[Union[Path, str]] = None, *args, **kwargs):
-        """This write method should only be called if no other write method exists. A
-        write method is implemented for files that we typically write out (such as
-        .xyz or .gjf files). But other files (which are outputs of a program, such as .wfn,
-        and .int), we only need to read and do not have to write out ourselves."""
+    def render(self, path: Optional[Union[Path, str]] = None, *args, **kwargs) -> str:
+        """Validate and render the exact text that :meth:`write` would publish."""
         path = Path(path or self.path)
         if not path:
             raise ValueError(
@@ -286,10 +283,15 @@ class WriteFile(File, ABC):
                 f"Exception occurred while writing file '{path.absolute()}'. File was not been written/modified."
             ) from e
 
-        if tmp_str:
-            # if we got to here, we can safely assume that we got a string which can be written to a file
-            # even if the actual string contains wrong things it it
-            with open(path, "w", encoding="utf-8", newline="\n") as f:
-                f.write(tmp_str)
-        else:
+        if not tmp_str:
             raise TypeError("The contents type cannot be written to a file.")
+        return tmp_str
+
+    def write(self, path: Optional[Union[Path, str]] = None, *args, **kwargs):
+        """Render and write this file using deterministic UTF-8/LF bytes."""
+        path = Path(path or self.path)
+        tmp_str = self.render(path, *args, **kwargs)
+
+        # If we got here, rendering and semantic checks succeeded.
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(tmp_str)

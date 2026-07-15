@@ -2125,7 +2125,6 @@ def test_campaign_config_load_edit_save_preserves_hidden_fields(tmp_path, monkey
     original.resources.gradient_parallel_backend = "serial"
     original.gaussian.method = "B3LYP"
     original.gaussian.basis_set = "def2-TZVP"
-    original.resources.gaussian.link0_mem = "6GB"
     original.ferebus.properties = ["iqa", "q00"]
     original.ferebus.feature_scaling = False
     original.acquisition.allow_uniform_posterior_fallback = True
@@ -2144,7 +2143,6 @@ def test_campaign_config_load_edit_save_preserves_hidden_fields(tmp_path, monkey
     assert reloaded.resources.gaussian_cpus_per_task == 2
     assert reloaded.resources.aimall_cpus_per_task == 6
     assert reloaded.resources.ariadne_cpus_per_task == 4
-    assert reloaded.resources.gaussian_link0_mem == "6GB"
     assert reloaded.resources.gradient_parallel_backend == "serial"
     assert reloaded.gaussian.method == "B3LYP"
     assert reloaded.ferebus.properties == ["iqa", "q00"]

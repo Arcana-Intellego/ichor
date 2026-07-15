@@ -219,9 +219,9 @@ effective resources resolve from the active profile partition metadata: the
 AMD `multicore` and `interactive` partitions use 8G/core, the lower-memory
 Intel `serial`/`multicore_small` partitions use 5G/core, and `himem` is
 available for larger memory jobs.
-Gaussian live jobs use Slurm-provided memory through `GAUSS_PDEF` and
-`GAUSS_MDEF` by default; only legacy `resources.gaussian.memory_mode: link0`
-writes `%NProcShared` and `%mem` into `.gjf` files.
+Gaussian live jobs always use the immutable Slurm allocation through
+`GAUSS_PDEF` and `GAUSS_MDEF`. Per-input `%NProcShared` and `%Mem` directives
+are rejected so a staged input cannot disagree with its submitted resources.
 
 ## 6. Preflight and launch
 

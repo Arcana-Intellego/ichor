@@ -171,8 +171,6 @@ resources:
     walltime_hours: 24
     cpus_per_task: auto
     mem_per_cpu: auto
-    memory_mode: slurm_env
-    link0_mem: 8GB
     memory_fraction_of_slurm: 0.85
 
   aimall:

@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 from typing import Dict, Union
 
@@ -163,6 +164,76 @@ class WFN(HasAtoms, HasData, ReadFile, WriteFile):
             # parse with -ve numbers because gaussian/orca have slightly different lines here
             total_energy = float(record[-4])
             virial_ratio = float(record[-1])
+            trailing = f.read()
+
+        if n_orbitals <= 0 or n_primitives <= 0 or n_nuclei <= 0:
+            raise ValueError("WFN header dimensions must all be positive")
+        if len(atoms) != n_nuclei:
+            raise ValueError(
+                "WFN nucleus count does not match its header: "
+                + str(len(atoms))
+                + " parsed, "
+                + str(n_nuclei)
+                + " declared"
+            )
+        for label, values in (
+            ("centre assignments", centre_assignments),
+            ("type assignments", type_assignments),
+            ("primitive exponents", primitive_exponents),
+        ):
+            if len(values) != n_primitives:
+                raise ValueError(
+                    "WFN "
+                    + label
+                    + " count does not match its header: "
+                    + str(len(values))
+                    + " parsed, "
+                    + str(n_primitives)
+                    + " declared"
+                )
+        if any(value < 1 or value > n_nuclei for value in centre_assignments):
+            raise ValueError("WFN centre assignment is outside the declared nuclei")
+        if any(value < 1 for value in type_assignments):
+            raise ValueError("WFN type assignments must be positive")
+        if any(not math.isfinite(float(value)) for value in primitive_exponents):
+            raise ValueError("WFN primitive exponents must be finite")
+        if len(molecular_orbitals) != n_orbitals:
+            raise ValueError(
+                "WFN molecular-orbital count does not match its header: "
+                + str(len(molecular_orbitals))
+                + " parsed, "
+                + str(n_orbitals)
+                + " declared"
+            )
+        expected_orbital_indexes = list(range(1, n_orbitals + 1))
+        observed_orbital_indexes = [orbital.index for orbital in molecular_orbitals]
+        if observed_orbital_indexes != expected_orbital_indexes:
+            raise ValueError("WFN molecular-orbital indexes are not consecutive")
+        for orbital in molecular_orbitals:
+            if len(orbital.primitives) != n_primitives:
+                raise ValueError(
+                    "WFN molecular orbital "
+                    + str(orbital.index)
+                    + " has "
+                    + str(len(orbital.primitives))
+                    + " coefficients; expected "
+                    + str(n_primitives)
+                )
+            values = [
+                orbital.occupation_number,
+                orbital.energy,
+                *orbital.primitives,
+            ]
+            if any(not math.isfinite(float(value)) for value in values):
+                raise ValueError(
+                    "WFN molecular orbital "
+                    + str(orbital.index)
+                    + " contains a non-finite value"
+                )
+        if not math.isfinite(total_energy) or not math.isfinite(virial_ratio):
+            raise ValueError("WFN total energy and virial ratio must be finite")
+        if trailing.strip():
+            raise ValueError("WFN contains unexpected records after the terminal energy line")
 
         self.n_orbitals = self.n_orbitals or n_orbitals
         self.n_primitives = self.n_primitives or n_primitives

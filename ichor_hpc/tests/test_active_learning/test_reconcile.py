@@ -186,54 +186,20 @@ def _complete_handoff_allocation(campaign, *, context, iteration, pointdirs):
             "accepted": True,
             "pointdir": str(pointdir.resolve()),
         })
-    from ichor.hpc.active_learning.daemon.quantum_quality import (
-        write_quantum_quality_manifest,
+    from ichor_hpc.tests.quantum_test_support import (
+        attach_synthetic_quantum_batch,
     )
 
-    quality_records = []
-    for pointdir in pointdirs:
-        geometry = pointdir / "geometry.xyz"
-        atom_names = ["H1"]
-        if geometry.is_file():
-            lines = geometry.read_text(encoding="utf-8").splitlines()[2:]
-            counts = {}
-            atom_names = []
-            for line in lines:
-                if not line.strip():
-                    continue
-                element = line.split()[0]
-                counts[element] = counts.get(element, 0) + 1
-                atom_names.append(element + str(counts[element]))
-        quality_records.append(
-            {
-                "pointdir": pointdir.name,
-                "accepted": True,
-                "reasons": [],
-                "atom_count": len(atom_names),
-                "n_int": len(atom_names),
-                "per_atom": [
-                    {
-                        "atom": atom,
-                        "iqa_ha": -0.5,
-                        "integration_error": 0.0,
-                    }
-                    for atom in atom_names
-                ],
-            }
-        )
-    quality_path = write_quantum_quality_manifest(
-        Path(pointdirs[0]).parent,
+    attach_synthetic_quantum_batch(
+        campaign,
+        results,
         phase_name=(
             CampaignPhase.INITIAL_AIMALL.value
             if str(context) == "bootstrap"
             else CampaignPhase.AIMALL.value
         ),
         iteration=int(iteration),
-        records=quality_records,
-        gates={},
     )
-    for result in results:
-        result["quality_manifest"] = str(quality_path.resolve())
     return record_quantum_results(allocation_path, results)
 
 

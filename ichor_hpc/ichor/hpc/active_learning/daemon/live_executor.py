@@ -35,10 +35,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+import numpy as np
+
 from ..config import (
     CampaignConfig,
     VALID_AIMALL_BOAQ_VALUES,
     VALID_AIMALL_IASMESH_VALUES,
+    normalise_gaussian_route_keywords,
 )
 from ..versioning.provenance import (
     PROVENANCE_FILENAME,
@@ -67,9 +70,8 @@ from .phase_executor import (
 )
 from .resource_solver import (
     ResolvedPhaseResources,
-    gaussian_mdef_gb,
+    gaussian_mdef,
     resolve_phase_resources,
-    validate_gaussian_link0_memory,
     validate_partition_walltime,
 )
 from .resource_records import (
@@ -688,51 +690,126 @@ LIVE_POSTPROCESS_IMPLEMENTED: frozenset = frozenset({
 
 
 def validate_gaussian_completed(pdir) -> tuple:
-    """Return (True, "") if the pointdir contains a complete Gaussian output;
-    (False, reason_tag) otherwise. Validates: .gaussianoutput present,
-    contains "Normal termination", .wfn present and parseable."""
-    #1. Gaussian output present + Normal termination.
-    gau = getattr(pdir, "gaussian_output", None)
-    if gau is None or not getattr(gau, "path", None):
-        return False, "missing_gaussian_output"
+    """Validate one complete, fixed-geometry Gaussian force/WFN task."""
+    from ichor.core.files.gaussian.gaussian_output import GaussianOutput
+    from ichor.core.files.gaussian.gjf import GJF
+    from ichor.core.files.gaussian.wfn import WFN
+
+    root = Path(getattr(pdir, "path", pdir))
+    if root.is_symlink() or not root.is_dir():
+        return False, "gaussian_pointdir_missing_or_symlinked"
+
+    def regular_matches(pattern):
+        return sorted(
+            path
+            for path in root.glob(pattern)
+            if path.is_file() and not path.is_symlink()
+        )
+
+    output_paths = regular_matches("*.gau") + regular_matches("*.gaussianoutput")
+    if len(output_paths) != 1:
+        return False, "missing_or_ambiguous_gaussian_output"
+    output_path = output_paths[0]
     try:
-        gau_text = Path(gau.path).read_text(encoding="utf-8", errors="ignore")
-    except OSError:
+        output_text = output_path.read_text(encoding="utf-8", errors="strict")
+    except (OSError, UnicodeError):
         return False, "gaussian_output_unreadable"
-    last_normal = gau_text.rfind("Normal termination")
-    last_error = gau_text.rfind("Error termination")
-    if last_normal < 0 or last_error > last_normal:
+    meaningful_lines = [line.strip() for line in output_text.splitlines() if line.strip()]
+    if (
+        not meaningful_lines
+        or "Normal termination of Gaussian" not in meaningful_lines[-1]
+        or output_text.rfind("Error termination") > output_text.rfind("Normal termination")
+    ):
         return False, "scf_nonconvergence_or_crash"
-    #2. WFN present + parseable.
-    wfn = getattr(pdir, "wfn", None)
-    if wfn is None or not getattr(wfn, "path", None):
-        return False, "missing_wfn"
+
+    gjf_paths = regular_matches("*.gjf")
+    if len(gjf_paths) != 1:
+        return False, "missing_or_ambiguous_gjf"
+    wfn_paths = regular_matches("*.wfn")
+    if len(wfn_paths) != 1:
+        return False, "missing_or_ambiguous_wfn"
+    gjf_path = gjf_paths[0]
+    wfn_path = wfn_paths[0]
     try:
-        #trigger the WFN lazy parse via total_energy; raises on malformed file.
-        _ = wfn.total_energy
+        gjf = GJF(gjf_path)
+        gjf_atoms = list(gjf.atoms)
+        keywords = [str(value).lower() for value in gjf.keywords]
+        mandatory = {"nosymm", "output=wfn", "force", "geom=notest"}
+        if not mandatory.issubset(set(keywords)):
+            return False, "gjf_route_contract_mismatch"
+        extras = [
+            value
+            for value in gjf.keywords
+            if str(value).lower() not in mandatory
+        ]
+        normalise_gaussian_route_keywords(extras)
+        nonblank = [
+            line.strip()
+            for line in gjf_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        if not nonblank or Path(nonblank[-1]).name != wfn_path.name:
+            return False, "gjf_wfn_destination_mismatch"
+    except Exception:
+        return False, "gjf_parse_or_route_failure"
+
+    try:
+        wfn = WFN(wfn_path)
+        wfn_atoms = list(wfn.atoms.to_angstroms())
+        if not math.isfinite(float(wfn.total_energy)) or not math.isfinite(
+            float(wfn.virial_ratio)
+        ):
+            return False, "wfn_energy_or_virial_nonfinite"
     except Exception:
         return False, "wfn_parse_failure"
-    gjf = getattr(pdir, "gjf", None)
-    if gjf is not None and getattr(gjf, "path", None):
-        try:
-            import numpy as _np
 
-            gjf_atoms = list(gjf.atoms)
-            wfn_atoms = list(wfn.atoms.to_angstroms())
-            if len(gjf_atoms) != len(wfn_atoms):
-                return False, "wfn_gjf_atom_count_mismatch"
-            gjf_types = [str(a.type).capitalize() for a in gjf_atoms]
-            wfn_types = [str(a.type).capitalize() for a in wfn_atoms]
-            if gjf_types != wfn_types:
-                return False, "wfn_gjf_atom_order_mismatch"
-            gjf_coords = _np.asarray([a.coordinates for a in gjf_atoms], dtype=float)
-            wfn_coords = _np.asarray([a.coordinates for a in wfn_atoms], dtype=float)
-            if not _np.all(_np.isfinite(gjf_coords)) or not _np.all(_np.isfinite(wfn_coords)):
-                return False, "wfn_gjf_geometry_nonfinite"
-            if float(_np.max(_np.abs(gjf_coords - wfn_coords))) > 1.0e-4:
-                return False, "wfn_gjf_geometry_mismatch"
-        except Exception:
-            return False, "wfn_gjf_geometry_check_failed"
+    try:
+        gaussian_output = GaussianOutput(output_path)
+        output_atoms = list(gaussian_output.atoms)
+        output_forces = dict(gaussian_output.global_forces)
+        output_charge = int(gaussian_output.charge)
+        output_multiplicity = int(gaussian_output.multiplicity)
+    except Exception:
+        return False, "gaussian_output_semantic_parse_failure"
+
+    if output_charge != int(gjf.charge) or output_multiplicity != int(
+        gjf.spin_multiplicity
+    ):
+        return False, "gaussian_output_charge_or_multiplicity_mismatch"
+    if not gjf_atoms or len(output_atoms) != len(gjf_atoms):
+        return False, "gaussian_output_geometry_count_mismatch"
+    if len(output_forces) != len(gjf_atoms):
+        return False, "gaussian_output_force_count_mismatch"
+    if set(output_forces) != {str(atom.name) for atom in output_atoms}:
+        return False, "gaussian_output_force_identity_mismatch"
+    if any(
+        not np.all(np.isfinite(np.asarray(force, dtype=float)))
+        for force in output_forces.values()
+    ):
+        return False, "gaussian_output_force_nonfinite"
+
+    gjf_types = [str(atom.type).capitalize() for atom in gjf_atoms]
+    wfn_types = [str(atom.type).capitalize() for atom in wfn_atoms]
+    output_types = [str(atom.type).capitalize() for atom in output_atoms]
+    if gjf_types != wfn_types:
+        return False, "wfn_gjf_atom_order_mismatch"
+    if gjf_types != output_types:
+        return False, "gaussian_output_gjf_atom_order_mismatch"
+    gjf_coords = np.asarray([atom.coordinates for atom in gjf_atoms], dtype=float)
+    wfn_coords = np.asarray([atom.coordinates for atom in wfn_atoms], dtype=float)
+    output_coords = np.asarray(
+        [atom.coordinates for atom in output_atoms],
+        dtype=float,
+    )
+    if not all(
+        np.all(np.isfinite(values))
+        for values in (gjf_coords, wfn_coords, output_coords)
+    ):
+        return False, "gaussian_geometry_nonfinite"
+    if float(np.max(np.abs(gjf_coords - wfn_coords))) > 1.0e-4:
+        return False, "wfn_gjf_geometry_mismatch"
+    if float(np.max(np.abs(gjf_coords - output_coords))) > 1.0e-4:
+        return False, "gaussian_output_gjf_geometry_mismatch"
     return True, ""
 
 
@@ -779,7 +856,62 @@ def validate_aimall_completed(pdir) -> tuple:
                 return False, "integration_error_missing_or_nonfinite"
     except Exception:
         return False, "aimall_quality_parse_failure"
+    try:
+        from .quantum_quality import evaluate_aimall_pointdir
+
+        quality = evaluate_aimall_pointdir(pdir)
+    except Exception:
+        return False, "aimall_quality_parse_failure"
+    if not bool(quality.get("accepted")):
+        reasons = list(quality.get("reasons") or [])
+        return False, str(reasons[0] if reasons else "aimall_quality_rejected")
     return True, ""
+
+
+def _aimall_visibility_issue(pointdir: Path) -> Optional[str]:
+    """Return a non-mutating shared-filesystem readiness problem, if any."""
+    root = Path(pointdir)
+    try:
+        from ichor.core.files.point_directory import PointDirectory
+
+        n_atoms = len(PointDirectory(root).atoms)
+    except Exception:
+        return "geometry_unreadable"
+    try:
+        atomic_directories = [
+            child
+            for child in root.iterdir()
+            if child.name.endswith("_atomicfiles")
+        ]
+    except OSError:
+        return "atomicfiles_directory_unreadable"
+    if len(atomic_directories) != 1:
+        return "missing_or_ambiguous_atomicfiles_directory"
+    atomic_directory = atomic_directories[0]
+    if atomic_directory.is_symlink() or not atomic_directory.is_dir():
+        return "atomicfiles_directory_missing_or_symlinked"
+    int_paths = sorted(
+        path
+        for path in atomic_directory.glob("*.int")
+        if "_" not in path.name
+    )
+    if len(int_paths) != int(n_atoms):
+        return (
+            "missing_or_partial_int_set_"
+            + str(len(int_paths))
+            + "_of_"
+            + str(n_atoms)
+        )
+    for int_path in int_paths:
+        if int_path.is_symlink() or not int_path.is_file():
+            return "int_file_missing_or_symlinked:" + int_path.name
+        try:
+            text = int_path.read_text(encoding="utf-8", errors="strict")
+        except (OSError, UnicodeError):
+            return "int_file_unreadable:" + int_path.name
+        if "Total time" not in text:
+            return "int_file_incomplete:" + int_path.name
+    return None
 
 
 def _pointdir_index(name: str) -> Optional[int]:
@@ -1359,7 +1491,6 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 phase_name,
                 it,
                 sample,
-                partition_override=effective_partition,
             )
             return n
         if "AIMALL" in phase_name:
@@ -2602,6 +2733,20 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         + str(exc)[:180]
                     ),
                 )
+            unsettled = []
+            for candidate in gaussian_accepted:
+                issue = _aimall_visibility_issue(Path(candidate))
+                if issue is not None:
+                    unsettled.append(Path(candidate).name + ":" + issue)
+            if unsettled:
+                return PhaseResult(
+                    is_complete=True,
+                    failure_reason=(
+                        "aimall_outputs_not_settled_missing_or_unreadable: "
+                        + "; ".join(unsettled[:8])
+                    ),
+                )
+
             kept = []
             rejected = []
             for candidate in gaussian_accepted:
@@ -2672,6 +2817,36 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 expected_pointdirs=[str(record["pointdir"]) for record in quality_records],
                 expected_method=str(self.config.gaussian.method),
             )
+            try:
+                from .quantum_acceptance_receipts import (
+                    write_quantum_acceptance_receipt,
+                )
+
+                quality_by_name = {
+                    str(record["pointdir"]): record
+                    for record in quality_records
+                    if bool(record.get("accepted"))
+                }
+                for pdir in kept:
+                    pointdir_path = Path(getattr(pdir, "path", pdir))
+                    write_quantum_acceptance_receipt(
+                        self.campaign_dir,
+                        pointdir_path,
+                        phase_name=phase_name,
+                        iteration=int(state.iteration),
+                        quality_manifest=quality_path,
+                        quality_record=quality_by_name[pointdir_path.name],
+                    )
+            except Exception as exc:
+                return PhaseResult(
+                    is_complete=True,
+                    failure_reason=(
+                        "quantum_acceptance_receipt_failed: "
+                        + type(exc).__name__
+                        + ": "
+                        + str(exc)[:180]
+                    ),
+                )
             self._journal_event(
                 "quantum_quality_summary",
                 phase=phase_name,
@@ -5114,8 +5289,6 @@ def build_sbatch_script(
     cpus = int(resolved.cpus_per_task)
     ntasks = int(resolved.ntasks)
     mem_per_cpu = str(resolved.mem_per_cpu)
-    if "GAUSSIAN" in phase_name:
-        validate_gaussian_link0_memory(config, resolved)
     camp = str(Path(campaign_dir).resolve())
     try:
         job_name = _current_submission_job_name(
@@ -5360,18 +5533,8 @@ def _gaussian_invocation_block(
         ["gaussian/g16c01_em64t_detectcpu"],
     )
     gaussian_exe = _configured_backend_shell_executable("gaussian", "g16")
-    mdef_gb = gaussian_mdef_gb(config, resolved_resources)
-    gaussian_memory_mode = str(config.resources.gaussian_memory_mode_for()).strip().lower()
-    memory_lines: List[str]
-    if gaussian_memory_mode == "slurm_env":
-        memory_lines = [
-            'export GAUSS_PDEF="${SLURM_CPUS_PER_TASK:-1}"',
-            "export GAUSS_MDEF=" + str(int(mdef_gb)) + "GB",
-        ]
-    else:
-        memory_lines = [
-            "# Gaussian Link0 memory/core directives are written in input.gjf.",
-        ]
+    mdef = gaussian_mdef(config, resolved_resources)
+    python = _python_executable_for_script()
     camp_q = _shell_quote(camp)
     phase_q = _shell_quote(str(phase_name))
     uid = _safe_shell_path_component(campaign_uid)
@@ -5385,12 +5548,17 @@ def _gaussian_invocation_block(
         "export ICHOR_GAUSSIAN_PHASE=" + phase_q,
         "export ICHOR_ITERATION=" + str(int(iteration)),
         'export GAUSS_SCRDIR="$ICHOR_JOB_SCRATCH/gaussian"',
-        *memory_lines,
+        'export GAUSS_PDEF="${SLURM_CPUS_PER_TASK:-1}"',
+        "export GAUSS_MDEF=" + mdef,
         'mkdir -p "$GAUSS_SCRDIR"',
         'echo "GAUSS_SCRDIR=$GAUSS_SCRDIR"',
         *_array_task_mapping_lines(array_task_map),
         *_pointdir_selection_lines(points_file, required_filename="input.gjf"),
         'cd "$POINT_DIR"',
+        python
+        + " -m ichor.hpc.active_learning.daemon.quantum_job_prepare"
+        + ' --campaign-dir "$ICHOR_CAMPAIGN_DIR"'
+        + ' --pointdir "$POINT_DIR" --backend gaussian',
         gaussian_exe + " < input.gjf > input.gau",
     ]
 
@@ -5484,10 +5652,16 @@ def _aimall_invocation_block(
             "from ichor.hpc.active_learning.strict_json import load_path; "
             "m=load_path('AIMALL_TASK.json'); "
             "w=pathlib.Path('input.wfn'); "
+            "g=pathlib.Path('input.gjf'); "
             "r=pathlib.Path(m['wfn_method_receipt']['path']); "
+            "q=pathlib.Path(m['gaussian_task_receipt']['path']); "
             "sha=lambda p: hashlib.sha256(p.read_bytes()).hexdigest(); "
-            "sys.exit(0 if sha(w)==m['wfn_sha256'] and "
-            "sha(r)==m['wfn_method_receipt']['sha256'] else "
+            "ok=(m.get('schema_version')==2 and "
+            "m.get('pointdir')==pathlib.Path.cwd().name and "
+            "sha(w)==m['wfn_sha256'] and sha(g)==m['gjf_sha256'] and "
+            "sha(r)==m['wfn_method_receipt']['sha256'] and "
+            "sha(q)==m['gaussian_task_receipt']['sha256']); "
+            "sys.exit(0 if ok else "
             "('AIMAll WFN method receipt binding mismatch'))"
         ),
         "AIMALL_NAAT=$("
@@ -5499,6 +5673,10 @@ def _aimall_invocation_block(
         )
         + ")",
         'if [ -z "$AIMALL_NAAT" ]; then echo "AIMALL_NAAT is empty in $POINT_DIR" >&2; exit 1; fi',
+        python
+        + " -m ichor.hpc.active_learning.daemon.quantum_job_prepare"
+        + ' --campaign-dir "$ICHOR_CAMPAIGN_DIR"'
+        + ' --pointdir "$POINT_DIR" --backend aimall',
         " ".join([_shell_quote(aimall_path)] + args + ["input.wfn"]),
     ]
 

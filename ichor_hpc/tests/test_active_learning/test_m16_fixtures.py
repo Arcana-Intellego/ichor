@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from ichor.core.files.point_directory import PointDirectory
+from ichor.core.files.gaussian.gaussian_output import GaussianOutput
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.daemon.live_executor import (
     LiveBackendsPhaseExecutor,
@@ -91,6 +92,43 @@ def test_gaussian_validator_accepts_clean_fixture():
     pdir = PointDirectory(FIXTURES / "initial_quantum" / "POINT_0000.pointdir")
     ok, reason = validate_gaussian_completed(pdir)
     assert ok, "expected clean fixture to pass; got reason=" + reason
+
+
+def test_gaussian_validator_rejects_termination_string_without_science(tmp_path):
+    pointdir = tmp_path / "POINT_0000.pointdir"
+    pointdir.mkdir()
+    (pointdir / "input.gau").write_text(
+        "Normal termination of Gaussian 16\n",
+        encoding="utf-8",
+    )
+
+    ok, reason = validate_gaussian_completed(PointDirectory(pointdir))
+
+    assert ok is False
+    assert reason == "missing_or_ambiguous_gjf"
+
+
+def test_gaussian_output_uses_final_orientation_without_accumulating(tmp_path):
+    source = (
+        FIXTURES
+        / "initial_quantum"
+        / "POINT_0000.pointdir"
+        / "WATER_MONOMER0000.gaussianoutput"
+    )
+    lines = source.read_text(encoding="utf-8").splitlines()
+    start = next(index for index, line in enumerate(lines) if "Input orientation:" in line)
+    block = lines[start : start + 9]
+    target = tmp_path / "two-orientations.gaussianoutput"
+    target.write_text(
+        "\n".join(lines[:start] + block + lines[start:]) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    parsed = GaussianOutput(target)
+
+    assert len(parsed.atoms) == 3
+    assert len(parsed.global_forces) == 3
 
 
 def test_aimall_validator_accepts_clean_fixture():

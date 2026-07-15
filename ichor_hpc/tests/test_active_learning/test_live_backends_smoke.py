@@ -383,6 +383,9 @@ def test_build_sbatch_script_renders_gaussian_block(monkeypatch):
     assert "export LC_ALL=C" in body
     assert "export LC_NUMERIC=C" in body
     assert "export GAUSS_MDEF=" in body
+    preparation = "ichor.hpc.active_learning.daemon.quantum_job_prepare"
+    assert preparation in body
+    assert body.index(preparation) < body.index("g16 < input.gjf")
 
 
 def test_build_sbatch_script_renders_aimall_directives():
@@ -407,9 +410,12 @@ def test_build_sbatch_script_renders_aimall_directives():
     assert "-iasmesh=medium" in body
     command_line = next(line for line in body.splitlines() if "aimqb.ish" in line)
     assert command_line.endswith(" input.wfn")
+    preparation = "ichor.hpc.active_learning.daemon.quantum_job_prepare"
+    assert preparation in body
+    assert body.index(preparation) < body.index(command_line)
 
 
-def test_link0_gaussian_memory_validates_after_auto_resolution(monkeypatch):
+def test_gaussian_memory_uses_environment_contract(monkeypatch):
     _install_fake_global_variables(
         monkeypatch,
         {
@@ -423,38 +429,7 @@ def test_link0_gaussian_memory_validates_after_auto_resolution(monkeypatch):
         "csf4",
     )
     cfg = CampaignConfig()
-    cfg.resources.gaussian_memory_mode = "link0"
     cfg.resources.gaussian_mem_per_cpu = "auto"
-    cfg.resources.partition = "multicore"
-    cfg.resources.gaussian_cpus_per_task = 1
-    cfg.resources.gaussian_link0_mem = "8GB"
-
-    with pytest.raises(BackendSubmissionError, match="gaussian.link0_mem"):
-        build_sbatch_script(
-            phase_name="INITIAL_GAUSSIAN",
-            iteration=0,
-            campaign_dir=Path("/scratch/campaign"),
-            config=cfg,
-        )
-
-
-def test_slurm_env_gaussian_memory_still_uses_environment_contract(monkeypatch):
-    _install_fake_global_variables(
-        monkeypatch,
-        {
-            "csf4": {
-                "hpc": {
-                    "scheduler": "slurm",
-                    "memory_per_core_gb_by_partition": {"multicore": 4},
-                }
-            }
-        },
-        "csf4",
-    )
-    cfg = CampaignConfig()
-    cfg.resources.gaussian_memory_mode = "slurm_env"
-    cfg.resources.gaussian_mem_per_cpu = "auto"
-    cfg.resources.gaussian_link0_mem = "500GB"
 
     body = build_sbatch_script(
         phase_name="INITIAL_GAUSSIAN",
@@ -1284,7 +1259,9 @@ def test_ariadne_auto_cpus_match_cartesian_fd_component_count(monkeypatch, tmp_p
     assert resolved.cpu_reason == "ariadne_cartesian_fd_component_workers"
 
 
-def test_array_staging_receives_executor_partition_override(monkeypatch, tmp_path):
+def test_only_resource_resolving_array_staging_receives_partition_override(
+    monkeypatch, tmp_path
+):
     from ichor.hpc.active_learning.daemon import input_staging as stg
 
     cfg = CampaignConfig()
@@ -1350,7 +1327,7 @@ def test_array_staging_receives_executor_partition_override(monkeypatch, tmp_pat
     assert ex._array_size_after_staging("GAUSSIAN", SimpleNamespace(iteration=4)) == 3
     assert ex._array_size_after_staging("AIMALL", SimpleNamespace(iteration=4)) == 2
 
-    assert calls["gaussian"]["partition_override"] == "override-partition"
+    assert calls["gaussian"]["partition_override"] is None
     assert calls["gaussian"]["sample_xyz"] == sample
     assert calls["aimall"]["partition_override"] == "override-partition"
 

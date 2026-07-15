@@ -5,6 +5,7 @@ loaded as if complete) and A56 (a truncated .model read into uninitialised np.em
 ichor_core/models which we are not allowed to touch, so the validator has to catch them here.
 """
 import hashlib
+from pathlib import Path
 from types import SimpleNamespace
 
 from ichor.hpc.active_learning.daemon.live_executor import (
@@ -288,7 +289,15 @@ def test_aimall_rejects_partial_int_set(tmp_path):
 
 
 def test_aimall_accepts_one_int_per_atom(tmp_path):
-    ints = SimpleNamespace(path=str(tmp_path), ints=[_Int(), _Int(), _Int()])
-    pdir = SimpleNamespace(ints=ints, atoms=[0, 0, 0])
+    from ichor.core.files.point_directory import PointDirectory
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "live_outputs"
+        / "initial_quantum"
+        / "POINT_0000.pointdir"
+    )
+    pdir = PointDirectory(fixture)
     ok, reason = validate_aimall_completed(pdir)
     assert ok, reason

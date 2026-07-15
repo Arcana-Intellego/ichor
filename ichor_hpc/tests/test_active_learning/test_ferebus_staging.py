@@ -143,31 +143,17 @@ def _prepare_bootstrap_training(
                 allocation["slot_assignment_sha256"]
             ),
         )
-    from ichor.hpc.active_learning.daemon.quantum_quality import (
-        write_quantum_quality_manifest,
-    )
     from ichor.hpc.active_learning.daemon.state import CampaignPhase
+    from ichor_hpc.tests.quantum_test_support import (
+        attach_synthetic_quantum_batch,
+    )
 
-    quality_path = write_quantum_quality_manifest(
-        source_dir,
+    attach_synthetic_quantum_batch(
+        campaign,
+        results,
         phase_name=CampaignPhase.INITIAL_AIMALL.value,
         iteration=0,
-        records=[{
-            "pointdir": str(attempt["pointdir_name"]),
-            "accepted": True,
-            "reasons": [],
-            "atom_count": 1,
-            "n_int": 1,
-            "per_atom": [{
-                "atom": "H1",
-                "iqa_ha": -0.5,
-                "integration_error": 0.0,
-            }],
-        } for attempt in fixture_attempts],
-        gates={},
     )
-    for result in results:
-        result["quality_manifest"] = str(quality_path.resolve())
     allocation = record_quantum_results(allocation_path, results)
     stg.commit_reference_data_delta(
         campaign,

@@ -80,8 +80,15 @@ def evaluate_aimall_pointdir(
     reasons: List[str] = []
 
     atom_count = None
+    expected_atom_names: List[str] = []
     try:
-        atom_count = int(len(pointdir.atoms))
+        geometry_atoms = list(pointdir.atoms)
+        atom_count = int(len(geometry_atoms))
+        expected_atom_names = [str(atom.name) for atom in geometry_atoms]
+        if not expected_atom_names or len(expected_atom_names) != len(
+            set(expected_atom_names)
+        ):
+            raise ValueError("geometry atom identities are empty or duplicated")
     except Exception:
         if bool(_gate_value(gates, "require_readable_aimall_geometry")):
             reasons.append("aimall_geometry_unreadable")
@@ -109,6 +116,10 @@ def evaluate_aimall_pointdir(
     iqa_values: List[float] = []
     integration_values: List[float] = []
     observed_methods: List[str] = []
+    observed_atom_names: List[str] = []
+    from ichor.core.common.constants import multipole_names
+
+    required_multipoles = set(multipole_names)
     for int_file in int_files:
         atom_name = None
         iqa = None
@@ -118,8 +129,13 @@ def evaluate_aimall_pointdir(
         atom_reasons: List[str] = []
         try:
             atom_name = str(getattr(int_file, "atom_name"))
+            observed_atom_names.append(atom_name)
+            if Path(getattr(int_file, "path")).stem.capitalize() != atom_name:
+                atom_reasons.append("int_filename_atom_mismatch")
+                reasons.append("int_filename_atom_mismatch")
         except Exception:
             atom_reasons.append("atom_name_unreadable")
+            reasons.append("atom_name_unreadable")
         try:
             iqa = _finite_float(getattr(int_file, "iqa"))
         except Exception:
@@ -154,16 +170,43 @@ def evaluate_aimall_pointdir(
         ):
             atom_reasons.append("dft_model_mismatch")
             reasons.append("dft_model_mismatch")
+        multipoles: Dict[str, Optional[float]] = {}
+        try:
+            raw_multipoles = dict(getattr(int_file, "global_spherical_multipoles"))
+            if not required_multipoles.issubset(set(raw_multipoles)):
+                atom_reasons.append("multipole_key_set_mismatch")
+                reasons.append("multipole_key_set_mismatch")
+            for label in sorted(required_multipoles):
+                value = _finite_float(raw_multipoles.get(label))
+                multipoles[label] = value
+                if value is None:
+                    atom_reasons.append("multipole_missing_or_nonfinite:" + label)
+                    reasons.append("multipole_missing_or_nonfinite")
+        except Exception:
+            atom_reasons.append("multipole_parse_failure")
+            reasons.append("multipole_parse_failure")
         per_atom.append(
             {
                 "atom": atom_name,
+                "int_file": Path(getattr(int_file, "path", "")).name,
                 "dft_model": dft_model,
                 "canonical_dft_model": canonical_dft_model,
                 "iqa_ha": iqa,
                 "integration_error": integration_error,
+                "multipoles": multipoles,
                 "reasons": atom_reasons,
             }
         )
+
+    if expected_atom_names:
+        if len(observed_atom_names) != len(set(observed_atom_names)):
+            reasons.append("duplicate_int_atom_identity")
+        expected_set = set(expected_atom_names)
+        observed_set = set(observed_atom_names)
+        if observed_set != expected_set:
+            reasons.append("int_atom_identity_mismatch")
+        order = {name: index for index, name in enumerate(expected_atom_names)}
+        per_atom.sort(key=lambda record: order.get(str(record.get("atom")), len(order)))
 
     unique_methods = sorted(set(observed_methods))
     if len(unique_methods) > 1:
@@ -182,12 +225,19 @@ def evaluate_aimall_pointdir(
         reasons.append("integration_error_threshold_exceeded")
 
     wfn_total_energy = None
+    wfn_virial_ratio = None
     try:
         wfn = getattr(pointdir, "wfn", None)
         if wfn is not None:
             wfn_total_energy = _finite_float(getattr(wfn, "total_energy"))
+            wfn_virial_ratio = _finite_float(getattr(wfn, "virial_ratio"))
     except Exception:
         wfn_total_energy = None
+        wfn_virial_ratio = None
+    if wfn_total_energy is None:
+        reasons.append("wfn_total_energy_missing_or_nonfinite")
+    if wfn_virial_ratio is None:
+        reasons.append("wfn_virial_ratio_missing_or_nonfinite")
 
     sum_iqa = sum(iqa_values) if iqa_values else None
     recovery_error = (
@@ -206,13 +256,14 @@ def evaluate_aimall_pointdir(
     deduped_reasons = sorted(set(reasons))
     return {
         "pointdir": path.name,
-        "path": str(path.resolve()),
         "accepted": not deduped_reasons,
         "reasons": deduped_reasons,
         "atom_count": atom_count,
+        "expected_atom_names": expected_atom_names,
         "n_int": int(len(int_files)),
         "sum_iqa_ha": sum_iqa,
         "wfn_total_energy_ha": wfn_total_energy,
+        "wfn_virial_ratio": wfn_virial_ratio,
         "iqa_energy_recovery_error_ha": recovery_error,
         "max_abs_integration_error": max_abs_integration,
         "expected_dft_model": expected_method_canonical,
@@ -321,19 +372,50 @@ def read_quantum_quality_manifest(
             per_atom = record.get("per_atom")
             if not isinstance(per_atom, list) or len(per_atom) != atom_count:
                 raise ValueError("accepted quantum quality per_atom count is invalid")
+            expected_atom_names = record.get("expected_atom_names")
+            if (
+                not isinstance(expected_atom_names, list)
+                or len(expected_atom_names) != atom_count
+                or any(
+                    not isinstance(name, str) or not name
+                    for name in expected_atom_names
+                )
+                or len(expected_atom_names) != len(set(expected_atom_names))
+            ):
+                raise ValueError("accepted quantum quality atom ordering is invalid")
             atom_names = set()
-            for atom in per_atom:
+            from ichor.core.common.constants import multipole_names
+
+            for atom_index, atom in enumerate(per_atom):
                 if not isinstance(atom, dict):
                     raise ValueError("quantum quality per_atom entry must be an object")
                 atom_name = atom.get("atom")
                 if not isinstance(atom_name, str) or not atom_name or atom_name in atom_names:
                     raise ValueError("quantum quality atom identity is invalid")
+                if atom_name != expected_atom_names[atom_index]:
+                    raise ValueError("quantum quality atom order does not match geometry")
                 atom_names.add(atom_name)
                 for numeric in ("iqa_ha", "integration_error"):
                     if _finite_float(atom.get(numeric)) is None:
                         raise ValueError("accepted quantum quality " + numeric + " is non-finite")
                 if canonical_method is not None and atom.get("canonical_dft_model") != canonical_method:
                     raise ValueError("quantum quality DFT model mismatch")
+                multipoles = atom.get("multipoles")
+                if not isinstance(multipoles, dict) or set(multipoles) != set(
+                    multipole_names
+                ):
+                    raise ValueError("quantum quality multipole key set is invalid")
+                if any(_finite_float(value) is None for value in multipoles.values()):
+                    raise ValueError("accepted quantum quality multipole is non-finite")
+            for numeric in (
+                "sum_iqa_ha",
+                "wfn_total_energy_ha",
+                "wfn_virial_ratio",
+                "iqa_energy_recovery_error_ha",
+                "max_abs_integration_error",
+            ):
+                if _finite_float(record.get(numeric)) is None:
+                    raise ValueError("accepted quantum quality " + numeric + " is non-finite")
     if expected_names is not None and seen != expected_names:
         raise ValueError("quantum quality pointdir membership mismatch")
     if data["n_total"] != len(records):

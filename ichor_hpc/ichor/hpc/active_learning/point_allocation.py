@@ -5,6 +5,7 @@ import copy
 import hashlib
 from .strict_json import strict_json as json
 import math
+import re
 from contextlib import contextmanager
 from numbers import Integral, Real
 from pathlib import Path
@@ -76,7 +77,14 @@ def _validate_candidate_integer_fields(record: Dict[str, Any], label: str) -> No
 def _validate_terminal_attempt(attempt: Dict[str, Any], label: str) -> None:
     status = str(attempt.get("status") or "")
     if status == "pending":
-        for field_name in ("pointdir", "reason", "quality_manifest"):
+        for field_name in (
+            "pointdir",
+            "reason",
+            "quality_manifest",
+            "quantum_acceptance_receipt",
+            "quantum_acceptance_receipt_sha256",
+            "accepted_pointdir_content_sha256",
+        ):
             if attempt.get(field_name) not in (None, ""):
                 raise ValueError(label + " pending attempt contains terminal evidence")
         return
@@ -102,6 +110,22 @@ def _validate_terminal_attempt(attempt: Dict[str, Any], label: str) -> None:
             or Path(quality).suffix.lower() != ".json"
         ):
             raise ValueError(label + " accepted attempt lacks quality-manifest evidence")
+        receipt = str(attempt.get("quantum_acceptance_receipt") or "").strip()
+        receipt_sha = str(
+            attempt.get("quantum_acceptance_receipt_sha256") or ""
+        ).strip()
+        content_sha = str(
+            attempt.get("accepted_pointdir_content_sha256") or ""
+        ).strip()
+        if any((receipt, receipt_sha, content_sha)):
+            if (
+                not receipt
+                or Path(receipt).is_absolute()
+                or any(part in {".", ".."} for part in Path(receipt).parts)
+                or not re.fullmatch(r"[0-9a-f]{64}", receipt_sha)
+                or not re.fullmatch(r"[0-9a-f]{64}", content_sha)
+            ):
+                raise ValueError(label + " quantum acceptance evidence is invalid")
     elif not isinstance(reason, str) or not reason.strip():
         raise ValueError(label + " rejected attempt must have a non-empty reason")
 
@@ -288,6 +312,9 @@ def _immutable_candidate_payload(record: Mapping[str, Any]) -> Dict[str, Any]:
         "pointdir",
         "reason",
         "quality_manifest",
+        "quantum_acceptance_receipt",
+        "quantum_acceptance_receipt_sha256",
+        "accepted_pointdir_content_sha256",
     ):
         payload.pop(key, None)
     return payload
@@ -979,6 +1006,13 @@ def record_quantum_results(
             attempt["reason"] = None if accepted else str(result.get("reason") or "rejected")
             if result.get("quality_manifest") is not None:
                 attempt["quality_manifest"] = str(result.get("quality_manifest"))
+            for evidence_key in (
+                "quantum_acceptance_receipt",
+                "quantum_acceptance_receipt_sha256",
+                "accepted_pointdir_content_sha256",
+            ):
+                if result.get(evidence_key) is not None:
+                    attempt[evidence_key] = str(result[evidence_key])
             if accepted:
                 if slot.get("accepted_attempt") is not None:
                     raise ValueError("point-allocation slot already has an accepted attempt")

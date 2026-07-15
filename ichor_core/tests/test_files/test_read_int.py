@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -304,3 +305,32 @@ def test_int_with_reference_geometry():
         dipole_mag=pytest.approx(0.2080413063805621),
         total_time=33,
     )
+
+
+def test_int_rejects_unsupported_aimall_major_version(tmp_path):
+    source = example_dir / "WATER_MONOMER0000_atomicfiles" / "o1.int"
+    target = tmp_path / "o1.int"
+    text = source.read_text(encoding="utf-8").replace(
+        "Version 19.",
+        "Version 20.",
+        1,
+    )
+    target.write_text(text, encoding="utf-8", newline="\n")
+
+    with pytest.raises(ValueError, match="unsupported AIMAll INT major version 20"):
+        _ = Int(target).net_charge
+
+
+def test_int_rejects_nonfinite_spherical_multipole(tmp_path):
+    source = example_dir / "WATER_MONOMER0000_atomicfiles" / "o1.int"
+    target = tmp_path / "o1.int"
+    text = re.sub(
+        r"(Q\[1,0\]\s*=\s*)[-+0-9.Ee]+",
+        r"\g<1>NaN",
+        source.read_text(encoding="utf-8"),
+        count=1,
+    )
+    target.write_text(text, encoding="utf-8", newline="\n")
+
+    with pytest.raises(ValueError, match="non-finite AIMAll spherical multipole"):
+        _ = Int(target).net_charge

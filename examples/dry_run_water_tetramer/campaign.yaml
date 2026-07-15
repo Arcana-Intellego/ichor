@@ -52,8 +52,6 @@ resources:
   ariadne:
     cpus_per_task: 2
   gaussian:
-    memory_mode: slurm_env
-    link0_mem: 8GB
     memory_fraction_of_slurm: 0.85
   array_concurrency_limit: 4
   memory_estimate_safety_factor: 1.25

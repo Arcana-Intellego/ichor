@@ -2730,7 +2730,19 @@ class DryRunPhaseExecutor:
             rejected=[],
         )
         if stage == "AIMALL":
-            from .quantum_quality import write_quantum_quality_manifest
+            from ichor.core.common.constants import multipole_names
+
+            from .quantum_acceptance_receipts import (
+                write_quantum_acceptance_receipt,
+            )
+            from .quantum_quality import (
+                canonicalise_aimall_method,
+                write_quantum_quality_manifest,
+            )
+
+            canonical_method = canonicalise_aimall_method(
+                self.config.gaussian.method
+            )
 
             records = [
                 {
@@ -2738,18 +2750,24 @@ class DryRunPhaseExecutor:
                     "accepted": True,
                     "reasons": [],
                     "atom_count": 1,
+                    "expected_atom_names": ["X1"],
                     "n_int": 1,
                     "sum_iqa_ha": -1.0,
                     "wfn_total_energy_ha": -1.0,
+                    "wfn_virial_ratio": 2.0,
                     "iqa_energy_recovery_error_ha": 0.0,
                     "max_abs_integration_error": 0.0,
                     "per_atom": [
                         {
                             "atom": "X1",
+                            "int_file": "x1.int",
                             "dft_model": str(self.config.gaussian.method),
-                            "canonical_dft_model": str(self.config.gaussian.method),
+                            "canonical_dft_model": canonical_method,
                             "iqa_ha": -1.0,
                             "integration_error": 0.0,
+                            "multipoles": {
+                                name: 0.0 for name in multipole_names
+                            },
                             "reasons": [],
                         }
                     ],
@@ -2764,6 +2782,35 @@ class DryRunPhaseExecutor:
                 gates=getattr(self.config, "quality_gates", None),
             )
             self.artefact_log.append(str(manifest))
+            for point_dir, quality_record in zip(pointdirs, records):
+                for filename in (
+                    "input.gjf",
+                    "input.wfn",
+                    "input.gau",
+                    "AIMALL_TASK.json",
+                    "GAUSSIAN_TASK_RECEIPT.json",
+                    "WFN_METHOD_RECEIPT.json",
+                    "AIMALL_COMPLETION_RECEIPT.json",
+                ):
+                    path = point_dir / filename
+                    if not path.exists():
+                        path.write_text("DRYRUN synthetic evidence\n", encoding="utf-8")
+                atomic_dir = point_dir / "input_atomicfiles"
+                atomic_dir.mkdir(exist_ok=True)
+                int_path = atomic_dir / "x1.int"
+                if not int_path.exists():
+                    int_path.write_text(
+                        "DRYRUN synthetic AIMAll evidence\n",
+                        encoding="utf-8",
+                    )
+                write_quantum_acceptance_receipt(
+                    self.campaign_dir,
+                    point_dir,
+                    phase_name=phase_name,
+                    iteration=int(state.iteration),
+                    quality_manifest=manifest,
+                    quality_record=quality_record,
+                )
             gaussian_phase = (
                 "INITIAL_REPLACEMENT_GAUSSIAN"
                 if initial and replacement

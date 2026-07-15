@@ -35,8 +35,6 @@ resources:
     auto_max_workers: 16
     target_pairs_per_worker: 5000000
     in_memory_distance_store_fraction: 0.35
-  gaussian:
-    memory_mode: slurm_env
   array_concurrency_limit: 8
   memory_estimate_safety_factor: 1.25
   scheduler_usage_telemetry: true

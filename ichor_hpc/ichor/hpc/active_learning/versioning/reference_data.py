@@ -520,6 +520,29 @@ def resolve_reference_data_view(
             raise ReferenceDataError(
                 "quantum-quality evidence does not match committed pointdirs"
             )
+        try:
+            from ..daemon.quantum_acceptance_receipts import (
+                read_quantum_acceptance_receipt,
+            )
+
+            for entry in added:
+                read_quantum_acceptance_receipt(
+                    campaign,
+                    entry.pointdir_path,
+                    expected_iteration=_safe_int(
+                        payload.get("source_iteration"),
+                        "source_iteration",
+                        minimum=0,
+                    ),
+                    expected_candidate_id=entry.candidate_id,
+                )
+        except Exception as exc:
+            raise ReferenceDataError(
+                "committed quantum acceptance evidence is invalid: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)
+            ) from exc
         entries.extend(added)
         if [entry.global_ordinal for entry in entries] != list(range(len(entries))):
             raise ReferenceDataError("reference-data global ordinals are not contiguous")

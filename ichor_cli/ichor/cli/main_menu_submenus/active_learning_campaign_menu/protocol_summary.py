@@ -667,8 +667,6 @@ def format_sampling_protocol_summary(
             _backend_effective_summary(resources, "mem_per_cpu"),
         )
     )
-    lines.append(_line("resources.gaussian.memory_mode", resources.gaussian.memory_mode))
-    lines.append(_line("resources.gaussian.link0_mem", resources.gaussian.link0_mem))
     lines.append(
         _line(
             "resources.gaussian.memory_fraction_of_slurm",

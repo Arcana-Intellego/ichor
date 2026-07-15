@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 from pathlib import Path
 
 import pytest
 
 from ichor.hpc.active_learning.daemon.input_staging import (
+    accepted_allocation_pointdirs,
     commit_reference_data_delta,
 )
 from ichor.hpc.active_learning.point_allocation import (
@@ -20,6 +22,7 @@ from ichor.hpc.active_learning.point_allocation import (
     record_quantum_results,
 )
 from ichor.hpc.active_learning.versioning.provenance import (
+    ProvenanceError,
     enrich_with_point_allocation,
     write_seed_provenance,
 )
@@ -31,6 +34,10 @@ from ichor.hpc.active_learning.versioning.reference_data import (
 from ichor.hpc.active_learning.layout import (
     reject_legacy_campaign_layout,
     reject_legacy_training_layout,
+)
+from ichor_hpc.tests.quantum_test_support import (
+    attach_synthetic_quantum_acceptance,
+    synthetic_quantum_quality_record,
 )
 
 
@@ -122,31 +129,29 @@ def _complete_allocation(
         write_quantum_quality_manifest,
     )
 
+    quality_records = [
+        synthetic_quantum_quality_record(Path(result["pointdir"]).name)
+        for result in results
+    ]
     quality_path = write_quantum_quality_manifest(
         staging,
         phase_name=("INITIAL_AIMALL" if context == "bootstrap" else "AIMALL"),
         iteration=iteration,
-        records=[
-            {
-                "pointdir": Path(result["pointdir"]).name,
-                "accepted": True,
-                "reasons": [],
-                "atom_count": 1,
-                "n_int": 1,
-                "per_atom": [
-                    {
-                        "atom": "H1",
-                        "iqa_ha": -0.5,
-                        "integration_error": 0.0,
-                    }
-                ],
-            }
-            for result in results
-        ],
+        records=quality_records,
         gates={},
     )
-    for result in results:
+    for result, quality_record in zip(results, quality_records):
         result["quality_manifest"] = str(quality_path.resolve())
+        result.update(
+            attach_synthetic_quantum_acceptance(
+                campaign,
+                Path(result["pointdir"]),
+                phase_name=("INITIAL_AIMALL" if context == "bootstrap" else "AIMALL"),
+                iteration=iteration,
+                quality_manifest=quality_path,
+                quality_record=quality_record,
+            )
+        )
     completed = record_quantum_results(allocation_path, results)
     assert len(accepted_attempts(completed)) == 2
 
@@ -196,6 +201,124 @@ def test_reference_data_versions_store_only_their_delta(tmp_path):
     assert len(first.entries) == 2
     assert len(second.entries) == 4
     assert second.head_manifest_sha256 != first.head_manifest_sha256
+
+
+def test_committed_quantum_quality_paths_are_version_relative(tmp_path):
+    campaign = tmp_path / "campaign"
+    _complete_allocation(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        first_frame_id=0,
+    )
+    commit_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )
+    version_dir = campaign / "QM_REFERENCE_DATA" / "iteration-000000"
+    manifest = json.loads(
+        (version_dir / REFERENCE_DATA_VERSION_FILENAME).read_text(encoding="utf-8")
+    )
+
+    evidence = manifest["quantum_quality_evidence"]
+    assert evidence
+    assert all(not Path(record["path"]).is_absolute() for record in evidence)
+    assert all(not Path(record["source_path"]).is_absolute() for record in evidence)
+    committed = json.loads(
+        (version_dir / evidence[0]["path"]).read_text(encoding="utf-8")
+    )
+    accepted = [record for record in committed["records"] if record["accepted"]]
+    assert all(record.get("committed_pointdir") for record in accepted)
+    assert all(record.get("candidate_id") for record in accepted)
+
+
+def test_committed_acceptance_receipts_survive_staging_removal(tmp_path):
+    from ichor.hpc.active_learning.daemon.quantum_acceptance_receipts import (
+        QUANTUM_ACCEPTANCE_RECEIPT,
+        read_quantum_acceptance_receipt,
+    )
+
+    campaign = tmp_path / "campaign"
+    _complete_allocation(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        first_frame_id=0,
+    )
+    commit_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )
+    version_dir = campaign / "QM_REFERENCE_DATA" / "iteration-000000"
+    for pointdir in sorted(version_dir.glob("POINT_*.pointdir")):
+        receipt = json.loads(
+            (pointdir / QUANTUM_ACCEPTANCE_RECEIPT).read_text(encoding="utf-8")
+        )
+        assert receipt["committed_pointdir"] == pointdir.name
+        assert receipt["quality_manifest"]["path"].startswith(
+            "QM_REFERENCE_DATA/iteration-000000/quality_evidence/"
+        )
+
+    shutil.rmtree(campaign / ".DATA" / "STAGING")
+    view = ReferenceDataVersioning(campaign / "QM_REFERENCE_DATA").resolve(
+        0,
+        verification="deep",
+    )
+    assert len(view.entries) == 2
+    for entry in view.entries:
+        read_quantum_acceptance_receipt(
+            campaign,
+            entry.pointdir_path,
+            expected_candidate_id=entry.candidate_id,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (("iteration", 9), "provenance iteration mismatch"),
+        (
+            ("point_allocation.slot_assignment_sha256", "f" * 64),
+            "slot_assignment_sha256 mismatch",
+        ),
+    ],
+)
+def test_allocation_join_rejects_stale_provenance_bindings(
+    tmp_path, mutation, message
+):
+    campaign = tmp_path / "campaign"
+    _complete_allocation(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        first_frame_id=0,
+    )
+    pointdir = (
+        campaign / ".DATA" / "STAGING" / "initial" / "POINT_0000.pointdir"
+    )
+    provenance_path = pointdir / "provenance.json"
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    path, value = mutation
+    if path == "iteration":
+        provenance[path] = value
+    else:
+        provenance["point_allocation"]["slot_assignment_sha256"] = value
+    provenance_path.write_text(
+        json.dumps(provenance, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    with pytest.raises(ProvenanceError, match=message):
+        accepted_allocation_pointdirs(
+            campaign,
+            context="bootstrap",
+            iteration=0,
+        )
 
 
 def test_reference_data_hash_chain_detects_parent_manifest_tamper(tmp_path):

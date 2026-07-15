@@ -1,3 +1,4 @@
+import math
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Union
@@ -157,6 +158,14 @@ class Int(ReadFile, HasData):
                 wfn_file_path = Path(next(f).split()[-1])
                 out_file_path = Path(next(f).split()[-1])
 
+            else:
+                raise ValueError(
+                    "unsupported AIMAll INT major version "
+                    + str(aimall_version.major)
+                    + " in "
+                    + str(self.path)
+                )
+
             # TODO: not sure if these are correct or if they are needed. Potentially remove.
             self.inp_file_path = self._path_relative_to_aimall(
                 out_file_path, inp_file_path
@@ -230,7 +239,22 @@ class Int(ReadFile, HasData):
                 multipole_name = "".join(
                     c for c in record[0].lower().strip() if c not in {"[", "]", ","}
                 )
-                self.global_spherical_multipoles[multipole_name] = float(record[1])
+                if multipole_name in self.global_spherical_multipoles:
+                    raise ValueError(
+                        "duplicate AIMAll spherical multipole "
+                        + multipole_name
+                        + " in "
+                        + str(self.path)
+                    )
+                multipole_value = float(record[1])
+                if not math.isfinite(multipole_value):
+                    raise ValueError(
+                        "non-finite AIMAll spherical multipole "
+                        + multipole_name
+                        + " in "
+                        + str(self.path)
+                    )
+                self.global_spherical_multipoles[multipole_name] = multipole_value
                 line = next(f)
 
             # replace q00 so that it subtracts the nuclear charge
