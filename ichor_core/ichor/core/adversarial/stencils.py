@@ -10,6 +10,10 @@ from .geometry import copy_atoms_with_flat_displacement
 from .posterior import TotalEnergyPosterior
 
 
+class PosteriorNumericsError(FloatingPointError):
+    """Posterior covariance cannot support a trustworthy stencil variance."""
+
+
 @dataclass(frozen=True)
 class StencilEvaluation:
     offsets: np.ndarray
@@ -51,14 +55,55 @@ def _stencil_from_coeffs(
     coeffs_arr = np.asarray(coefficients, dtype=float)
     means_arr = np.asarray(means, dtype=float)
     covariance_arr = np.asarray(covariance, dtype=float)
+    n_points = int(coeffs_arr.size)
+    if offsets_arr.shape != (n_points,) or means_arr.shape != (n_points,):
+        raise PosteriorNumericsError(
+            "stencil offsets, coefficients and means must have equal length"
+        )
+    if len(points) != n_points:
+        raise PosteriorNumericsError("stencil point count does not match coefficients")
+    if covariance_arr.shape != (n_points, n_points):
+        raise PosteriorNumericsError(
+            "stencil posterior covariance must be square with one row per point"
+        )
+    if not (
+        np.all(np.isfinite(offsets_arr))
+        and np.all(np.isfinite(coeffs_arr))
+        and np.all(np.isfinite(means_arr))
+        and np.all(np.isfinite(covariance_arr))
+    ):
+        raise PosteriorNumericsError("stencil inputs must be finite")
+    covariance_scale = max(1.0, float(np.max(np.abs(covariance_arr))))
+    symmetry_tolerance = (
+        np.finfo(float).eps * max(1, n_points) * covariance_scale * 128.0
+    )
+    asymmetry = float(np.max(np.abs(covariance_arr - covariance_arr.T)))
+    if asymmetry > symmetry_tolerance:
+        raise PosteriorNumericsError(
+            "stencil posterior covariance is materially asymmetric"
+        )
+    covariance_arr = 0.5 * (covariance_arr + covariance_arr.T)
     mean = float(coeffs_arr @ means_arr)
     variance = float(coeffs_arr @ covariance_arr @ coeffs_arr)
+    variance_tolerance = (
+        np.finfo(float).eps
+        * max(1, n_points)
+        * max(1.0, float(np.dot(coeffs_arr, coeffs_arr)))
+        * covariance_scale
+        * 256.0
+    )
+    if variance < -variance_tolerance:
+        raise PosteriorNumericsError(
+            "stencil posterior covariance produced a materially negative variance: "
+            + repr(variance)
+        )
+    variance = max(0.0, variance)
     return StencilEvaluation(
         offsets=offsets_arr,
         coefficients=coeffs_arr,
         points=list(points),
         mean=mean,
-        variance=max(variance, 0.0),
+        variance=variance,
     )
 
 
@@ -73,7 +118,10 @@ def evaluate_linear_stencil(
 ) -> StencilEvaluation:
     offsets_arr = np.asarray(offsets, dtype=float)
     coeffs_arr = np.asarray(coefficients, dtype=float)
-    points = [displaced_geometry(atoms, direction_flat, float(offset) * float(step)) for offset in offsets_arr]
+    step_f = float(step)
+    if not np.isfinite(step_f) or step_f <= 0.0:
+        raise ValueError("directional stencil step must be finite and positive")
+    points = [displaced_geometry(atoms, direction_flat, float(offset) * step_f) for offset in offsets_arr]
     means = posterior.means(points)
     covariance = posterior.covariance_matrix(points)
     return _stencil_from_coeffs(offsets_arr, coeffs_arr, points, means, covariance)
@@ -87,6 +135,8 @@ def directional_all_stencils(
     step: float,
 ) -> DirectionalStencilBundle:
     step_f = float(step)
+    if not np.isfinite(step_f) or step_f <= 0.0:
+        raise ValueError("directional stencil step must be finite and positive")
     offsets = np.asarray([-2.0, -1.0, 0.0, 1.0, 2.0], dtype=float)
     points = [
         displaced_geometry(atoms, direction_flat, float(offset) * step_f)

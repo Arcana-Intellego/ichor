@@ -11,10 +11,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from .config import (
-    AcquisitionConfigBlock,
     AdversarialSafetyConfigBlock,
     AntiOverlapConfigBlock,
-    AriadneConfigBlock,
     CampaignConfig,
     ErrorCalibrationConfigBlock,
     GeometryNoveltyConfigBlock,
@@ -79,9 +77,6 @@ _POLICIES: Dict[int, SamplingAggressivenessPolicy] = {
 _HIDDEN_TOP_LEVEL_BLOCKS = (
     "anti_overlap",
     "geometry_novelty",
-    "acquisition",
-    "ariadne",
-    "adversarial_safety",
 )
 
 
@@ -171,6 +166,8 @@ def hidden_sampling_overrides(config: CampaignConfig) -> List[Dict[str, Any]]:
         hidden_paths.extend(path for path in current if path == block or path.startswith(block + "."))
     hidden_paths.extend(
         [
+            "ariadne.delta0",
+            "ariadne.delta_max",
             "quality_gates.ariadne_max_displacement_ang",
             "quality_gates.ariadne_min_pair_distance_ang",
         ]
@@ -206,8 +203,8 @@ def _effective_campaign_config(
         history_window_iterations=5,
         fallback_scale_angstrom=float(policy.fallback_scale_angstrom),
     )
-    effective.acquisition = AcquisitionConfigBlock()
-    effective.ariadne = AriadneConfigBlock()
+    effective.acquisition = copy.deepcopy(config.acquisition)
+    effective.ariadne = copy.deepcopy(config.ariadne)
     effective.adversarial_safety = AdversarialSafetyConfigBlock(
         enabled=True,
         reject_unsafe_landings=True,
@@ -227,10 +224,6 @@ def _effective_campaign_config(
         reject_under_moved_after_retry=True,
         reject_over_moved=True,
     )
-
-    effective.acquisition.weights.lambda_distance = float(policy.lambda_distance)
-    effective.acquisition.fullspace_confinement.lambda_residual = float(policy.lambda_residual)
-    effective.acquisition.fullspace_confinement.lambda_rmsd = float(policy.lambda_rmsd)
 
     effective.quality_gates = copy.deepcopy(config.quality_gates)
     effective.quality_gates.ariadne_max_displacement_ang = float(
@@ -507,7 +500,7 @@ def _resolved_manifest_payload(resolved: ResolvedSamplingProtocol) -> Dict[str, 
             "lambda_distance": float(resolved.acquisition_config.weights.lambda_distance),
         },
         "resolved_fullspace_confinement": {
-            "enabled": bool(resolved.acquisition_config.fullspace_confinement.enabled),
+            "enabled": True,
             "lambda_residual": float(resolved.acquisition_config.fullspace_confinement.lambda_residual),
             "lambda_rmsd": float(resolved.acquisition_config.fullspace_confinement.lambda_rmsd),
             "residual_scale": str(resolved.acquisition_config.fullspace_confinement.residual_scale),

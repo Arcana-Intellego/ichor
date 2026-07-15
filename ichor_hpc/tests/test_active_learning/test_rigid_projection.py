@@ -84,23 +84,20 @@ def test_pure_rotation_projected_out():
 
 
 def test_pure_vibrational_gradient_preserved():
-    """A gradient that is mass-weighted-orthogonal to all rigid modes must
-    pass through `project_out_rigid` unchanged."""
+    """A covector orthogonal to rigid displacements must be unchanged."""
     atoms = _water()
     rng = np.random.default_rng(0)
-    M = mass_vector_for(atoms)
     B = rigid_basis(atoms)
 
-    # Build a vibrational gradient: take a random vector and explicitly
-    # remove its rigid component in the M-inner-product. Result is by
-    # construction in the vibrational subspace; projecting again is a no-op.
+    # A scalar gradient is a covector: rigid invariance is B.T @ g == 0,
+    # without a mass metric.
     raw = rng.standard_normal(9)
-    BTMB = B.T @ (M[:, None] * B)
-    coeffs = np.linalg.solve(BTMB, B.T @ (M * raw))
-    pure_vib = raw - B @ coeffs
+    pure_vib = raw - B @ (B.T @ raw)
 
     out = project_out_rigid(pure_vib, atoms)
     np.testing.assert_allclose(out, pure_vib, atol=1.0e-10)
+    np.testing.assert_allclose(B.T @ out, 0.0, atol=1.0e-10)
+    assert np.linalg.norm(B.T @ (mass_vector_for(atoms) * out)) > 1.0e-6
 
 
 def test_mixed_gradient_decomposed_correctly():
@@ -108,15 +105,13 @@ def test_mixed_gradient_decomposed_correctly():
     subspace and (ii) reproduce the same total norm structure when
     re-projected (idempotence)."""
     atoms = _water()
-    M = mass_vector_for(atoms)
     B = rigid_basis(atoms)
     rng = np.random.default_rng(1)
     grad = rng.standard_normal(9)
     proj = project_out_rigid(grad, atoms)
 
-    # Component along rigid modes (M-projection) must be zero.
-    rigid_component_M = B.T @ (M * proj)
-    np.testing.assert_allclose(rigid_component_M, np.zeros(B.shape[1]), atol=1.0e-10)
+    # Every rigid directional derivative must be zero.
+    np.testing.assert_allclose(B.T @ proj, np.zeros(B.shape[1]), atol=1.0e-10)
 
     # Idempotence.
     np.testing.assert_allclose(project_out_rigid(proj, atoms), proj, atol=1.0e-10)

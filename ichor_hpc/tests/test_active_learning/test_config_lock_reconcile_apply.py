@@ -628,13 +628,12 @@ def test_config_lock_history_restore_rejects_fork(tmp_path):
         )
 
 
-def test_legacy_acquisition_driver_lock_is_rejected_without_migration(tmp_path):
+def test_legacy_config_lock_schema_is_rejected_without_migration(tmp_path):
     campaign = _campaign(tmp_path)
     original = CampaignConfig()
     write_config_lock(campaign, original)
     path = config_lock_path(campaign)
     payload = json.loads(path.read_text(encoding="utf-8"))
-    del payload["canonical_config"]["acquisition"]["driver"]
     payload["schema_version"] = 1
     payload["fingerprint_sha256"] = config_fingerprint(payload["canonical_config"])
     payload.pop("campaign_uid", None)

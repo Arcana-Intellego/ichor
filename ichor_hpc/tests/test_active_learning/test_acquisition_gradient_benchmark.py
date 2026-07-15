@@ -42,12 +42,9 @@ class _FakeAcquisition:
 
 
 def test_parse_gradient_modes_rejects_unknown_mode():
-    assert bench._parse_gradient_modes("cartesian_fd, active_fd") == [
-        "cartesian_fd",
-        "active_fd",
-    ]
+    assert bench._parse_gradient_modes("active_fd") == ["active_fd"]
     with pytest.raises(ValueError, match="gradient mode"):
-        bench._parse_gradient_modes("cartesian_fd,unknown")
+        bench._parse_gradient_modes("cartesian_fd")
 
 
 def test_static_gradient_diagnostics_handles_numpy_mode_directions():
@@ -71,6 +68,9 @@ def test_flatten_trace_gradient_diagnostics_keeps_compact_scalar_fields():
         "gradient_mode": "active_fd",
         "gradient_call_count": 2,
         "gradient_wall_seconds_total": 1.5,
+        "last_gradient_norm_raw": 4.0,
+        "last_gradient_norm_post_rigid": 3.0,
+        "last_gradient_norm_post_cap": 2.0,
         "posterior_diagnostics": {
             "n_means_batched_calls": 4,
             "ignored": 99,
@@ -81,6 +81,9 @@ def test_flatten_trace_gradient_diagnostics_keeps_compact_scalar_fields():
         "gradient_mode": "active_fd",
         "gradient_call_count": 2,
         "gradient_wall_seconds_total": 1.5,
+        "last_gradient_norm_raw": 4.0,
+        "last_gradient_norm_post_rigid": 3.0,
+        "last_gradient_norm_post_cap": 2.0,
         "posterior_n_means_batched_calls": 4,
     }
 
@@ -113,22 +116,18 @@ def test_run_benchmark_uses_context_and_reports_mode_comparison(monkeypatch, tmp
         campaign_dir=tmp_path,
         iteration=1,
         seed_id=1,
-        gradient_modes=("cartesian_fd", "active_fd"),
+        gradient_modes=("active_fd",),
         repeat=2,
     )
 
     assert payload["schema_version"] == 1
     assert payload["models_version"] == 7
     assert payload["seed_frame_id"] == 12
-    assert len(payload["runs"]) == 4
+    assert len(payload["runs"]) == 2
     assert payload["gradient_backend"] == "direct"
     assert payload["objective"] == "full"
-    assert {
-        row["gradient_mode"] for row in payload["runs"]
-    } == {"cartesian_fd", "active_fd"}
-    comparison = payload["comparisons"]["active_fd_vs_cartesian_fd"]
-    assert comparison["cosine"] == 0.0
-    assert comparison["speedup"] is not None
+    assert {row["gradient_mode"] for row in payload["runs"]} == {"active_fd"}
+    assert payload["comparisons"] == {}
     json.dumps(bench._json_safe(payload))
 
 
@@ -147,7 +146,7 @@ def test_main_writes_json_payload(monkeypatch, tmp_path, capsys):
                 "grad_norm": 1.0,
                 "n_estimated_acquisition_value_calls": 2,
                 "gradient_backend": kwargs["gradient_backend"],
-                "objective": kwargs["objective"],
+                "objective": "full",
             }],
             "comparisons": {},
         }
@@ -169,10 +168,6 @@ def test_main_writes_json_payload(monkeypatch, tmp_path, capsys):
         "active_fd",
         "--gradient-backend",
         "process",
-        "--objective",
-        "cheap_driver",
-        "--driver-gradient-backend",
-        "hybrid_geometry",
         "--workers",
         "3",
         "--json",
@@ -181,8 +176,8 @@ def test_main_writes_json_payload(monkeypatch, tmp_path, capsys):
 
     assert rc == 0
     assert captured["gradient_backend"] == "process"
-    assert captured["objective"] == "cheap_driver"
-    assert captured["driver_gradient_backend"] == "hybrid_geometry"
+    assert "objective" not in captured
+    assert "driver_gradient_backend" not in captured
     assert captured["workers"] == 3
     assert output.is_file()
     assert json.loads(output.read_text(encoding="utf-8"))["schema_version"] == 1

@@ -37,6 +37,7 @@ class BarrierConfig:
     clash_delta: float = 0.05
     clash_lambda: float = 5.0
     nonbonded_expansion_scale: float = 1.80
+    nonbonded_expansion_selection_margin_ratio: float = 0.10
     nonbonded_expansion_delta: float = 0.10
     nonbonded_expansion_lambda: float = 0.5
     bond_lower_scale: float = 0.80
@@ -103,10 +104,8 @@ class WeightConfig:
 class SpectralConfig:
     """Observable-oriented frequency acquisition settings."""
 
-    enabled: bool = True
     mode: str = "blend"
     mode_weighting: str = "inverse_frequency"
-    lambda_spectral: float = 1.5
     omega_floor: float = 1.0e-6
     low_frequency_power: float = 1.0
     max_modes: Optional[int] = None
@@ -128,7 +127,6 @@ class CalibratedEnergyConfig:
 class FullspaceConfinementConfig:
     """Geometry confinement outside the active local subspace."""
 
-    enabled: bool = True
     lambda_residual: float = 0.5
     lambda_rmsd: float = 0.25
     residual_scale: str = "local_neighbour_median"
@@ -184,48 +182,11 @@ class MovementUtilityConfig:
 
 
 @dataclass(frozen=True)
-class DriverConfig:
-    """Cheap optimiser-driving acquisition objective.
-
-    When disabled, all existing calls use the full acquisition. When enabled
-    by the HPC runner, ARIADNE may use objective="cheap_driver" for gradients
-    while landing selection still evaluates objective="full".
-    """
-
-    enabled: bool = False
-    objective: str = "cheap_driver"
-    gradient_backend: str = "fd"
-    include_stencils: bool = False
-    analytic_movement: bool = True
-    analytic_whitened_distance: bool = True
-    analytic_pair_barriers: bool = True
-    analytic_fullspace_rmsd: bool = True
-    finite_difference_energy: bool = True
-    analytic_validation: bool = False
-    analytic_validation_tol_cosine: float = 0.98
-    lambda_energy: float = 1.0
-    lambda_movement: float = 1.0
-    lambda_distance: float = 1.0
-    lambda_fullspace: float = 1.0
-    lambda_chemistry: float = 1.0
-
-
-@dataclass(frozen=True)
 class GradientConfig:
     """Configuration for the pseudo-force gradient of the acquisition."""
 
-    mode: str = "cartesian_fd"
-    cartesian_step: float = 1.0e-4
     active_step: float = 1.0e-3
     regularization: float = 1.0e-10
-    #Fix #2a: enforce a minimum FD step magnitude.
-    #When > 0, the effective step is max(cartesian_step, cartesian_step_floor).
-    #Default 0.0 preserves prior behaviour exactly.
-    cartesian_step_floor: float = 0.0
-    #Fix #2b (opt-in): skip Cartesian DOF of atoms whose mass is below
-    #this threshold (typically ghost / dummy atoms in QM inputs).
-    #Default 0.0 preserves prior behaviour exactly.
-    ghost_mass_threshold: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -247,8 +208,6 @@ class ReferenceScaleConfig:
 class AcquisitionConfig:
     """Top-level configuration for the single-model seed-local acquisition."""
 
-    property_name: str = "iqa"
-    use_scaled_posterior_covariance: bool = True
     subspace: SubspaceConfig = SubspaceConfig()
     barrier: BarrierConfig = BarrierConfig()
     stencils: StencilConfig = StencilConfig()
@@ -259,6 +218,5 @@ class AcquisitionConfig:
     size_normalisation: SizeNormalisationConfig = SizeNormalisationConfig()
     movement_band: MovementBandConfig = MovementBandConfig()
     movement_utility: MovementUtilityConfig = MovementUtilityConfig()
-    driver: DriverConfig = DriverConfig()
     gradient: GradientConfig = GradientConfig()
     references: ReferenceScaleConfig = ReferenceScaleConfig()

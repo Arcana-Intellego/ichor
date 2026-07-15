@@ -6,7 +6,6 @@ from ichor.core.adversarial import acquisition as acquisition_mod
 from ichor.core.adversarial.acquisition import SeedLocalAdversarialAcquisition
 from ichor.core.adversarial.config import (
     AcquisitionConfig,
-    FullspaceConfinementConfig,
     WeightConfig,
 )
 from ichor.core.atoms import Atom, Atoms
@@ -32,7 +31,6 @@ def _acquisition(*, model=None, strength=0.0):
             lambda_energy=1.0,
             lambda_distance=0.0,
         ),
-        fullspace_confinement=FullspaceConfinementConfig(enabled=False),
     )
     acq = SeedLocalAdversarialAcquisition.__new__(SeedLocalAdversarialAcquisition)
     acq.config = cfg
@@ -48,6 +46,13 @@ def _acquisition(*, model=None, strength=0.0):
     acq.barrier_state = object()
     acq.error_calibration_model = model
     acq.error_calibration_apply_strength = strength
+    acq._fullspace_confinement_metrics = lambda atoms: {
+        "residual_penalty": 0.0,
+        "rmsd_penalty": 0.0,
+        "fallback_reasons": [],
+        "residual_distance": 0.0,
+        "aligned_rmsd_ang": 0.0,
+    }
     return acq
 
 

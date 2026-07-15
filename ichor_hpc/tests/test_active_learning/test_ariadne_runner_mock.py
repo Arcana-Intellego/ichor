@@ -259,7 +259,6 @@ def test_safe_landing_improvement_compares_full_alpha_to_full_initial(monkeypatc
     assert landing["landing_safety"]["accepted"] is True
     metrics = landing["landing_safety"]["metrics"]
     assert metrics["alpha_full_initial"] == 10.0
-    assert metrics["alpha_driver_initial"] == 100.0
     assert metrics["selected_improves_acquisition"] is True
 
 

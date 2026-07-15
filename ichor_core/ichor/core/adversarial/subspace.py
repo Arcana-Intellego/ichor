@@ -21,6 +21,8 @@ class LocalSubspace:
     mass_vector: np.ndarray
     active_covariance: np.ndarray
     neighbour_weights: np.ndarray
+    numerical_rank: int = 0
+    rank_limited_below_minimum: bool = False
 
     @property
     def dimension(self) -> int:
@@ -51,15 +53,14 @@ def _canonicalise_basis(
     degeneracy_tolerance: float,
     sign_threshold: float = 1.0e-10,
 ) -> np.ndarray:
-    """Return a canonicalised copy of 'basis' whose representation is
+    """Return a canonicalised copy of ``basis`` whose representation is
     invariant under 
     (a) per-column sign and 
-    (b) arbitrary rotation within near-degenerate eigenvalue blocks.
+    (b) arbitrary rotation within numerically equal eigenvalue blocks.
 
     The canonicalisation has two stages applied in order:
 
-    1. Within each block of consecutive columns whose eigenvalue gap is less
-       than 'degeneracy_tolerance * max(eigenvalues)', construct a basis from
+    1. Within each machine-precision degenerate block, construct a basis from
        the block projector using deterministic pivoted Cartesian probes. The
        projector is invariant to the eigensolver's arbitrary block rotation.
 
@@ -75,8 +76,25 @@ def _canonicalise_basis(
 
     canonical = basis.copy()
     n_coords, r = canonical.shape
-    lam_max = float(np.max(eigenvalues)) if eigenvalues.size else 1.0
-    threshold = float(degeneracy_tolerance) * max(lam_max, 1.0e-30)
+    lam_max = float(np.max(np.abs(eigenvalues))) if eigenvalues.size else 1.0
+    roundoff_threshold = (
+        np.finfo(float).eps
+        * max(1, n_coords, r)
+        * max(lam_max, 1.0e-30)
+        * 64.0
+    )
+    configured_threshold = max(0.0, float(degeneracy_tolerance)) * max(
+        lam_max, 1.0e-30
+    )
+    # Unequal eigenvectors cannot be rotated while keeping a diagonal
+    # eigensystem.  Canonicalise only equality at machine precision.  The
+    # historical user tolerance is retained as a tightening cap, but zero
+    # must not disable canonicalisation of exactly degenerate eigenvalues.
+    machine_floor = np.finfo(float).eps * max(lam_max, 1.0e-30)
+    threshold = min(
+        roundoff_threshold,
+        max(machine_floor, configured_threshold),
+    )
 
     # 1. Projector-derived basis within near-degenerate blocks.
     block_start = 0
@@ -167,7 +185,15 @@ def build_local_subspace(seed_atoms: Atoms, neighbours: Sequence[Neighbour], con
     eigenvalues = eigenvalues[order]
     eigenvectors = eigenvectors[:, order]
 
-    positive = np.maximum(eigenvalues, 0.0)
+    leading = max(float(eigenvalues[0]), 0.0)
+    rank_tolerance = (
+        np.finfo(float).eps
+        * max(covariance.shape)
+        * max(leading, 1.0e-30)
+        * 64.0
+    )
+    numerical_rank = int(np.count_nonzero(eigenvalues > rank_tolerance))
+    positive = np.asarray(eigenvalues[:numerical_rank], dtype=float)
     total = float(np.sum(positive))
     if total <= 0.0:
         raise ValueError("Degenerate local covariance: all eigenvalues are non-positive.")
@@ -175,10 +201,10 @@ def build_local_subspace(seed_atoms: Atoms, neighbours: Sequence[Neighbour], con
     cumulative = np.cumsum(positive) / total
     r = int(np.searchsorted(cumulative, config.variance_capture, side="left") + 1)
     r = max(config.min_subspace_dim, r)
-    r = min(config.max_subspace_dim, r, covariance.shape[0])
+    r = min(config.max_subspace_dim, r, numerical_rank)
 
     basis = eigenvectors[:, :r].copy()
-    active_eigs = positive[:r].copy()
+    active_eigs = np.asarray(positive[:r], dtype=float).copy()
     relative_regularization = float(config.covariance_regularization) * max(
         float(active_eigs[0]) if active_eigs.size else 0.0,
         1.0e-12,
@@ -199,6 +225,10 @@ def build_local_subspace(seed_atoms: Atoms, neighbours: Sequence[Neighbour], con
         mass_vector=mass_vec,
         active_covariance=active_cov,
         neighbour_weights=weights,
+        numerical_rank=int(numerical_rank),
+        rank_limited_below_minimum=bool(
+            numerical_rank < int(config.min_subspace_dim)
+        ),
     )
 
 

@@ -1,21 +1,10 @@
-"""Mass-weighted rigid-body projector for Cartesian acquisition gradients.
+"""Rigid-body covector projector for Cartesian acquisition gradients.
 
-Given a scalar acquisition f(x) that is invariant under simultaneous
-translations and rigid rotations of all atoms, the natural inner product on
-its Cartesian gradient is mass-weighted:
-
-    <u, v>_M = u^T M v       with  M = diag(m_1, m_1, m_1, m_2, m_2, m_2, ...)
-
-The mass-weighted orthogonal projector onto the rigid-body subspace
-spanned by columns of B (3N x k, k = 6 for non-linear, k = 5 for linear,
-k = 3 for a single atom) is
-
-    P_rigid = B (B^T M B)^-1 B^T M
-
-and "project_out_rigid(g, atoms) = (I - P_rigid) g" strips the rigid
-component from any Cartesian gradient. Doing this at the ASE-calculator
-boundary keeps ARIADNE's curvature gate clean of FD noise that lives in
-directions the optimiser is supposed to ignore.
+For a rigid-invariant scalar ``f(x)``, every infinitesimal rigid displacement
+``B q`` must have zero directional derivative.  Its Cartesian gradient is a
+covector, so the required condition is ``B.T @ grad == 0``.  Applying the
+mass-weighted *vector* projector instead enforces a different condition and
+can inject net force and torque into a valid vibrational gradient.
 
 The implementation auto-detects collinear / single-atom geometries by SVD
 rank thresholding so that no spurious zero-mode is left in B.
@@ -78,36 +67,31 @@ def project_out_rigid(
     *,
     rcond: float = 1.0e-12,
 ) -> np.ndarray:
-    """Project rigid translations + rotations out of a Cartesian gradient.
+    """Project rigid translations and rotations out of a Cartesian covector.
 
     "grad" may be flat "(3N,)" or shaped (N, 3); the projected gradient
-    is returned with the same shape. The projection is mass-weighted:
-
-        g_phys = g - B (B^T M B)^-1 B^T M g
-
-    where B is the orthonormal rigid basis from :func:"rigid_basis" and M is
-    the diagonal mass matrix from :func:"mass_vector_for". The Gram matrix
-    "B^T M B" is k x k SPD; we solve it with "np.linalg.solve" and fall
-    back to a least-squares solve if it is rank-deficient.
+    is returned with the same shape.  ``rigid_basis`` returns Euclidean-
+    orthonormal columns, so ``g - B @ (B.T @ g)`` is the dual projection that
+    enforces the scalar-invariance contract ``B.T @ g == 0``.
     """
     g = np.asarray(grad, dtype=float)
     orig_shape = g.shape
     flat = g.reshape(-1).astype(float, copy=True)
-    M = mass_vector_for(atoms)
-    if flat.shape[0] != M.shape[0]:
+    expected_size = 3 * len(atoms)
+    if flat.shape[0] != expected_size:
         raise ValueError(
-            f"gradient size {flat.shape[0]} does not match 3*natoms {M.shape[0]}"
+            f"gradient size {flat.shape[0]} does not match 3*natoms {expected_size}"
         )
 
     B = rigid_basis(atoms)
     if B.shape[1] == 0:
         return flat.reshape(orig_shape)
 
-    BTMB = B.T @ (M[:, None] * B)
-    rhs = B.T @ (M * flat)
+    gram = B.T @ B
+    rhs = B.T @ flat
     try:
-        coeffs = np.linalg.solve(BTMB, rhs)
+        coeffs = np.linalg.solve(gram, rhs)
     except np.linalg.LinAlgError:
-        coeffs, *_ = np.linalg.lstsq(BTMB, rhs, rcond=rcond)
+        coeffs, *_ = np.linalg.lstsq(gram, rhs, rcond=rcond)
     proj_flat = flat - B @ coeffs
     return proj_flat.reshape(orig_shape)

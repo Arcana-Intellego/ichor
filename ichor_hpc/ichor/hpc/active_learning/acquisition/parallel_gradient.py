@@ -1,12 +1,5 @@
-"""Drive the acquisition's cartesian FD gradient across a process pool.
+"""Task-owned process workers for active-subspace acquisition gradients."""
 
-The core (SeedLocalAdversarialAcquisition) exposes _fd_indices_eps + _fd_single
-so this can compute exactly the same per-coordinate central differences in
-parallel. On CSF4 the ARIADNE array task forks one pool -- the trained model is
-inherited copy-on-write, never pickled -- evaluates the 6N components across the
-task's cpus, and gathers them by index, so the result is identical to the serial
-loop, just faster. Off-cluster (no fork available) it falls back to serial.
-"""
 from __future__ import annotations
 
 import os
@@ -14,15 +7,8 @@ from contextlib import contextmanager
 
 import numpy as np
 
-# the worker reads these from inherited (forked) memory rather than having the
-# model pickled and shipped per task. set in the parent right before the pool
-# is created, cleared in the finally.
-_WORKER_ACQ = None
-_WORKER_ATOMS = None
-_WORKER_FLAT = None
-_WORKER_EPS = None
-_WORKER_ACTIVE_DIRECTIONS = None
-_WORKER_OBJECTIVE = "full"
+
+_WORKER_ACQUISITION = None
 _INSIDE_GRADIENT_WORKER = False
 _LAST_GRADIENT_PARALLEL_DIAGNOSTICS = {}
 _THREAD_ENV_NAMES = (
@@ -34,27 +20,21 @@ _THREAD_ENV_NAMES = (
 )
 
 
-def _worker_component(i):
-    return _WORKER_ACQ._fd_single(
-        i,
-        _WORKER_FLAT,
-        _WORKER_EPS,
-        _WORKER_ATOMS,
-        objective=_WORKER_OBJECTIVE,
+def _worker_active_payload(payload):
+    direction, flat, step, atoms = payload
+    return _WORKER_ACQUISITION._active_fd_single(
+        np.asarray(direction, dtype=float),
+        np.asarray(flat, dtype=float),
+        float(step),
+        atoms,
     )
 
 
-def _worker_active_component(i):
-    return _WORKER_ACQ._active_fd_single(
-        _WORKER_ACTIVE_DIRECTIONS[int(i)],
-        _WORKER_FLAT,
-        _WORKER_EPS,
-        _WORKER_ATOMS,
-        objective=_WORKER_OBJECTIVE,
-    )
+def _worker_ping(value):
+    return int(value)
 
 
-def _worker_init():
+def _worker_initialise():
     global _INSIDE_GRADIENT_WORKER
     _INSIDE_GRADIENT_WORKER = True
     os.environ["ICHOR_GRADIENT_WORKER"] = "1"
@@ -64,6 +44,7 @@ def _worker_init():
 
 @contextmanager
 def _capped_worker_thread_env():
+    """Temporarily prevent nested BLAS/OpenMP parallelism before forking."""
     previous = {name: os.environ.get(name) for name in _THREAD_ENV_NAMES}
     try:
         for name in _THREAD_ENV_NAMES:
@@ -89,27 +70,47 @@ def _gradient_mp_disabled() -> bool:
 
 
 def _slurm_cpu_cap() -> int:
-    # Resource resolution may allocate extra CPUs for memory only. Those CPUs
-    # must not silently enlarge the scientific process pool.
-    env = os.environ.get("ICHOR_ACTIVE_WORKERS") or os.environ.get(
+    # Resource resolution may allocate CPUs for memory only. Scientific
+    # workers are capped separately through ICHOR_ACTIVE_WORKERS.
+    raw = os.environ.get("ICHOR_ACTIVE_WORKERS") or os.environ.get(
         "SLURM_CPUS_PER_TASK"
     )
-    if env:
+    if raw:
         try:
-            return max(1, int(env))
+            return max(1, int(raw))
         except ValueError:
             pass
     return max(1, os.cpu_count() or 1)
 
 
-def _n_active_directions(acq) -> int:
-    directions = getattr(acq, "mode_directions", None)
+def _n_active_directions(acquisition) -> int:
+    directions = getattr(acquisition, "mode_directions", None)
     if directions is None:
         return 0
     try:
         return len(directions)
     except TypeError:
         return 0
+
+
+def resolve_workers(workers, *, n_tasks=None) -> int:
+    """Resolve active workers without exceeding Slurm or task cardinality."""
+    override = os.environ.get("ICHOR_GRADIENT_WORKERS")
+    value = override if override else workers
+    if value is None:
+        resolved = _slurm_cpu_cap()
+    else:
+        try:
+            resolved = max(1, int(value))
+        except (TypeError, ValueError):
+            resolved = 1
+    resolved = min(resolved, _slurm_cpu_cap())
+    if n_tasks is not None:
+        try:
+            resolved = min(resolved, max(1, int(n_tasks)))
+        except (TypeError, ValueError):
+            pass
+    return int(resolved)
 
 
 def _set_last_diagnostics(**payload) -> None:
@@ -121,352 +122,188 @@ def last_gradient_parallel_diagnostics() -> dict:
     return dict(_LAST_GRADIENT_PARALLEL_DIAGNOSTICS)
 
 
-def parallel_cartesian_gradient(acq, atoms, *, workers, chunksize=2, objective="full"):
-    """Cartesian FD gradient with the per-coordinate components spread across
-    `workers` processes. Falls back to the acquisition's own serial gradient
-    when workers <= 1 or the platform has no fork (Windows / spawn-only)."""
-    if not workers or int(workers) <= 1:
-        _set_last_diagnostics(
-            gradient_backend="serial",
-            workers_requested=workers,
-            workers_used=1,
-            inside_gradient_worker=inside_gradient_worker(),
-            parallel_fallback_reason="workers_le_one",
-        )
-        return acq._cartesian_finite_difference_gradient(atoms, objective=objective)
-    if _gradient_mp_disabled():
-        _set_last_diagnostics(
-            gradient_backend="serial",
-            workers_requested=workers,
-            workers_used=1,
-            inside_gradient_worker=inside_gradient_worker(),
-            parallel_fallback_reason="disabled_by_environment",
-        )
-        return acq._cartesian_finite_difference_gradient(atoms, objective=objective)
-    if inside_gradient_worker():
-        _set_last_diagnostics(
-            gradient_backend="serial",
-            workers_requested=workers,
-            workers_used=1,
-            inside_gradient_worker=True,
-            parallel_fallback_reason="inside_gradient_worker",
-        )
-        return acq._cartesian_finite_difference_gradient(atoms, objective=objective)
-    try:
-        import multiprocessing as mp
-        ctx = mp.get_context("fork")
-    except (ValueError, ImportError):
-        _set_last_diagnostics(
-            gradient_backend="serial",
-            workers_requested=workers,
-            workers_used=1,
-            inside_gradient_worker=inside_gradient_worker(),
-            parallel_fallback_reason="fork_unavailable",
-        )
-        return acq._cartesian_finite_difference_gradient(atoms, objective=objective)
+class ActiveGradientWorkerPool:
+    """One reusable fork pool owned by one ARIADNE seed task.
 
-    from concurrent.futures import ProcessPoolExecutor
+    The fitted acquisition is inherited copy-on-write once. Each gradient
+    call sends only the current geometry and active directions. Platforms
+    without ``fork`` retain the exact serial implementation.
+    """
 
-    indices, flat, eps, shape = acq._fd_indices_eps(atoms)
-    if len(indices) <= 1:
-        _set_last_diagnostics(
-            gradient_backend="serial",
-            workers_requested=workers,
-            workers_used=1,
-            inside_gradient_worker=inside_gradient_worker(),
-            parallel_fallback_reason="too_few_components",
+    def __init__(self, acquisition, *, workers=None, chunksize=1):
+        self._acquisition = acquisition
+        self._chunksize = max(1, int(chunksize))
+        self._pool = None
+        self._closed = False
+        self._owns_worker_acquisition = False
+        self._fallback_reason = None
+        self._workers_requested = workers
+        self._workers_used = resolve_workers(
+            workers,
+            n_tasks=_n_active_directions(acquisition),
         )
-        return acq._cartesian_finite_difference_gradient(atoms, objective=objective)
-    workers_used = resolve_workers(workers, n_tasks=len(indices))
-    grad = np.zeros(flat.size, dtype=float)
+        if self._workers_used <= 1:
+            self._fallback_reason = "workers_le_one"
+            return
+        if _gradient_mp_disabled() or inside_gradient_worker():
+            self._fallback_reason = (
+                "inside_gradient_worker"
+                if inside_gradient_worker()
+                else "disabled_by_environment"
+            )
+            self._workers_used = 1
+            return
+        try:
+            import multiprocessing as mp
 
-    global _WORKER_ACQ, _WORKER_ATOMS, _WORKER_FLAT, _WORKER_EPS
-    global _WORKER_OBJECTIVE
-    _WORKER_ACQ, _WORKER_ATOMS, _WORKER_FLAT, _WORKER_EPS = acq, atoms, flat, eps
-    _WORKER_OBJECTIVE = str(objective or "full")
-    try:
-        with _capped_worker_thread_env():
-            with ProcessPoolExecutor(
-                max_workers=int(workers_used),
-                mp_context=ctx,
-                initializer=_worker_init,
-            ) as pool:
-                for i, g in zip(indices, pool.map(_worker_component, indices, chunksize=chunksize)):
-                    grad[i] = g
-        _set_last_diagnostics(
-            gradient_backend="process",
-            workers_requested=workers,
-            workers_used=int(workers_used),
-            inside_gradient_worker=False,
-            parallel_fallback_reason=None,
-        )
-    finally:
-        _WORKER_ACQ = _WORKER_ATOMS = _WORKER_FLAT = _WORKER_EPS = None
-        _WORKER_OBJECTIVE = "full"
-    return grad.reshape(shape)
+            context = mp.get_context("fork")
+        except (ValueError, ImportError):
+            self._fallback_reason = "fork_unavailable"
+            self._workers_used = 1
+            return
 
+        from concurrent.futures import ProcessPoolExecutor
 
-def parallel_active_gradient(acq, atoms, *, workers, chunksize=1, objective="full"):
-    """Active-mode FD gradient with independent mode derivatives in a fork pool."""
-    if not workers or int(workers) <= 1:
-        _set_last_diagnostics(
-            gradient_backend="serial",
-            workers_requested=workers,
-            workers_used=1,
-            inside_gradient_worker=inside_gradient_worker(),
-            parallel_fallback_reason="workers_le_one",
-        )
-        return acq._active_finite_difference_gradient(atoms, objective=objective)
-    if _gradient_mp_disabled():
-        _set_last_diagnostics(
-            gradient_backend="serial",
-            workers_requested=workers,
-            workers_used=1,
-            inside_gradient_worker=inside_gradient_worker(),
-            parallel_fallback_reason="disabled_by_environment",
-        )
-        return acq._active_finite_difference_gradient(atoms, objective=objective)
-    if inside_gradient_worker():
-        _set_last_diagnostics(
-            gradient_backend="serial",
-            workers_requested=workers,
-            workers_used=1,
-            inside_gradient_worker=True,
-            parallel_fallback_reason="inside_gradient_worker",
-        )
-        return acq._active_finite_difference_gradient(atoms, objective=objective)
-    try:
-        import multiprocessing as mp
-        ctx = mp.get_context("fork")
-    except (ValueError, ImportError):
-        _set_last_diagnostics(
-            gradient_backend="serial",
-            workers_requested=workers,
-            workers_used=1,
-            inside_gradient_worker=inside_gradient_worker(),
-            parallel_fallback_reason="fork_unavailable",
-        )
-        return acq._active_finite_difference_gradient(atoms, objective=objective)
-
-    from concurrent.futures import ProcessPoolExecutor
-
-    directions, flat, eps, shape = acq._active_fd_setup(atoms)
-    if len(directions) <= 1:
-        _set_last_diagnostics(
-            gradient_backend="serial",
-            workers_requested=workers,
-            workers_used=1,
-            inside_gradient_worker=inside_gradient_worker(),
-            parallel_fallback_reason="too_few_components",
-        )
-        return acq._active_finite_difference_gradient(atoms, objective=objective)
-    workers_used = resolve_workers(workers, n_tasks=len(directions))
-
-    global _WORKER_ACQ, _WORKER_ATOMS, _WORKER_FLAT, _WORKER_EPS
-    global _WORKER_ACTIVE_DIRECTIONS, _WORKER_OBJECTIVE
-    _WORKER_ACQ = acq
-    _WORKER_ATOMS = atoms
-    _WORKER_FLAT = flat
-    _WORKER_EPS = eps
-    _WORKER_ACTIVE_DIRECTIONS = directions
-    _WORKER_OBJECTIVE = str(objective or "full")
-    try:
-        with _capped_worker_thread_env():
-            with ProcessPoolExecutor(
-                max_workers=int(workers_used),
-                mp_context=ctx,
-                initializer=_worker_init,
-            ) as pool:
-                directional_derivs = list(
-                    pool.map(
-                        _worker_active_component,
-                        range(len(directions)),
-                        chunksize=chunksize,
+        global _WORKER_ACQUISITION
+        if _WORKER_ACQUISITION is not None:
+            raise RuntimeError("another acquisition gradient pool is already active")
+        _WORKER_ACQUISITION = acquisition
+        self._owns_worker_acquisition = True
+        try:
+            with _capped_worker_thread_env():
+                self._pool = ProcessPoolExecutor(
+                    max_workers=int(self._workers_used),
+                    mp_context=context,
+                    initializer=_worker_initialise,
+                )
+                # Force worker creation while the immutable acquisition is
+                # installed in the fork image and native threads are capped.
+                list(
+                    self._pool.map(
+                        _worker_ping,
+                        range(int(self._workers_used)),
+                        chunksize=1,
                     )
                 )
-        _set_last_diagnostics(
-            gradient_backend="process",
-            workers_requested=workers,
-            workers_used=int(workers_used),
-            inside_gradient_worker=False,
-            parallel_fallback_reason=None,
-        )
-    finally:
-        _WORKER_ACQ = _WORKER_ATOMS = _WORKER_FLAT = _WORKER_EPS = None
-        _WORKER_ACTIVE_DIRECTIONS = None
-        _WORKER_OBJECTIVE = "full"
-    return acq._active_fd_project(directions, directional_derivs, shape)
+        except Exception:
+            if self._pool is not None:
+                self._pool.shutdown(wait=True, cancel_futures=True)
+            self._pool = None
+            if self._owns_worker_acquisition:
+                _WORKER_ACQUISITION = None
+                self._owns_worker_acquisition = False
+            raise
 
-
-def resolve_workers(workers, *, n_tasks=None):
-    """how many cores to spread the gradient over. an explicit number wins; otherwise we take
-    what SLURM gave the task ($SLURM_CPUS_PER_TASK) and fall back to the machine cpu count, so a
-    bare resolve_workers(None) on a compute node does the sensible thing. never returns < 1."""
-    override = os.environ.get("ICHOR_GRADIENT_WORKERS")
-    value = override if override else workers
-    if value is not None:
-        try:
-            out = max(1, int(value))
-        except (TypeError, ValueError):
-            out = 1
-    else:
-        out = _slurm_cpu_cap()
-    out = min(out, _slurm_cpu_cap())
-    if n_tasks is not None:
-        try:
-            out = min(out, max(1, int(n_tasks)))
-        except (TypeError, ValueError):
-            pass
-    return out
-
-
-def _thread_cartesian_gradient(acq, atoms, workers, *, objective="full"):
-    """thread-pool variant -- threads share memory so no fork needed, which is why this is the
-    one parallel path that actually runs (not just falls back) off a linux node. same _fd_single
-    components as serial, gathered by index, so it matches to the bit."""
-    from concurrent.futures import ThreadPoolExecutor
-
-    indices, flat, eps, shape = acq._fd_indices_eps(atoms)
-    grad = np.zeros(flat.size, dtype=float)
-    with ThreadPoolExecutor(max_workers=int(workers)) as pool:
-        for i, g in zip(
-            indices,
-            pool.map(
-                lambda j: acq._fd_single(
-                    j,
-                    flat,
-                    eps,
-                    atoms,
-                    objective=objective,
-                ),
-                indices,
+    @property
+    def diagnostics(self) -> dict:
+        return {
+            "gradient_backend": (
+                "process_persistent" if self._pool is not None else "serial"
             ),
-        ):
-            grad[i] = g
-    return grad.reshape(shape)
+            "workers_requested": self._workers_requested,
+            "workers_used": int(self._workers_used),
+            "inside_gradient_worker": inside_gradient_worker(),
+            "parallel_fallback_reason": self._fallback_reason,
+            "gradient_pool_reused": bool(self._pool is not None),
+        }
 
-
-def compute_cartesian_gradient(
-    acq,
-    atoms,
-    *,
-    backend="process",
-    workers=None,
-    objective="full",
-):
-    """single entry point the calculator + the runner call to get the cartesian FD gradient.
-
-    backend picks how the per-coordinate components get spread:
-      * "serial"  -- one core, just the acquisition's own loop.
-      * "thread"  -- a thread pool (works everywhere, windows included).
-      * "process" -- a fork pool on linux, transparently serial where fork is unavailable.
-    every backend computes the SAME central differences via _fd_single, so the answer is identical
-    to the serial loop -- only the speed differs. workers None means "use what SLURM gave us"; any
-    backend with <= 1 worker is just the serial path.
-    """
-    backend = (backend or "serial").lower()
-    w = resolve_workers(workers)
-    if backend == "serial" or w <= 1:
-        _set_last_diagnostics(
-            gradient_backend="serial",
-            workers_requested=workers,
-            workers_used=1,
-            inside_gradient_worker=inside_gradient_worker(),
-            parallel_fallback_reason=(
-                "requested_serial" if backend == "serial" else "workers_le_one"
-            ),
-        )
-        return acq._cartesian_finite_difference_gradient(atoms, objective=objective)
-    if backend == "thread":
-        if _gradient_mp_disabled() or inside_gradient_worker():
+    def gradient(self, atoms):
+        if self._closed:
+            raise RuntimeError("active gradient worker pool is closed")
+        directions, flat, step, shape = self._acquisition._active_fd_setup(atoms)
+        if self._pool is None or len(directions) <= 1:
+            reason = self._fallback_reason or "too_few_components"
+            _set_last_diagnostics(
+                **{**self.diagnostics, "parallel_fallback_reason": reason}
+            )
+            return self._acquisition._active_finite_difference_gradient(atoms)
+        payloads = [
+            (
+                np.asarray(direction, dtype=float),
+                np.asarray(flat, dtype=float),
+                float(step),
+                atoms,
+            )
+            for direction in directions
+        ]
+        try:
+            derivatives = list(
+                self._pool.map(
+                    _worker_active_payload,
+                    payloads,
+                    chunksize=self._chunksize,
+                )
+            )
+        except Exception as exc:
+            self._pool.shutdown(wait=True, cancel_futures=True)
+            self._pool = None
+            global _WORKER_ACQUISITION
+            if self._owns_worker_acquisition:
+                _WORKER_ACQUISITION = None
+                self._owns_worker_acquisition = False
+            self._fallback_reason = (
+                "persistent_process_exception:" + type(exc).__name__
+            )
+            self._workers_used = 1
             _set_last_diagnostics(
                 gradient_backend="serial",
-                workers_requested=workers,
+                workers_requested=self._workers_requested,
                 workers_used=1,
-                inside_gradient_worker=inside_gradient_worker(),
-                parallel_fallback_reason=(
-                    "inside_gradient_worker"
-                    if inside_gradient_worker()
-                    else "disabled_by_environment"
-                ),
+                inside_gradient_worker=False,
+                parallel_fallback_reason=self._fallback_reason,
+                gradient_pool_reused=False,
             )
-            return acq._cartesian_finite_difference_gradient(atoms, objective=objective)
-        _set_last_diagnostics(
-            gradient_backend="thread",
-            workers_requested=workers,
-            workers_used=int(w),
-            inside_gradient_worker=False,
-            parallel_fallback_reason=None,
+            return self._acquisition._active_finite_difference_gradient(atoms)
+        _set_last_diagnostics(**self.diagnostics)
+        return self._acquisition._active_fd_project(
+            directions,
+            derivatives,
+            shape,
         )
-        return _thread_cartesian_gradient(acq, atoms, w, objective=objective)
-    # "process" (and anything unrecognised) -> the fork pool, which serial-falls-back off linux.
-    try:
-        return parallel_cartesian_gradient(
-            acq,
-            atoms,
-            workers=w,
-            objective=objective,
-        )
-    except Exception as exc:
-        _set_last_diagnostics(
-            gradient_backend="serial",
-            workers_requested=workers,
-            workers_used=1,
-            inside_gradient_worker=inside_gradient_worker(),
-            parallel_fallback_reason="process_exception:" + type(exc).__name__,
-        )
-        return acq._cartesian_finite_difference_gradient(atoms, objective=objective)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._pool is not None:
+            self._pool.shutdown(wait=True, cancel_futures=True)
+            self._pool = None
+        global _WORKER_ACQUISITION
+        if self._owns_worker_acquisition:
+            if _WORKER_ACQUISITION is self._acquisition:
+                _WORKER_ACQUISITION = None
+            self._owns_worker_acquisition = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
+        return False
 
 
-def compute_active_gradient(
-    acq,
-    atoms,
-    *,
-    backend="process",
-    workers=None,
-    objective="full",
-):
-    """Single entry point for active-mode FD gradient parallelism.
+def compute_active_gradient(acquisition, atoms, *, backend="process", workers=None):
+    """Evaluate the mature objective in active-subspace directions only."""
+    selected_backend = str(backend or "serial").lower()
+    if selected_backend not in {"serial", "process"}:
+        raise ValueError("active gradient backend must be 'serial' or 'process'")
+    if selected_backend == "serial":
+        _set_last_diagnostics(
+            gradient_backend="serial",
+            workers_requested=workers,
+            workers_used=1,
+            inside_gradient_worker=inside_gradient_worker(),
+            parallel_fallback_reason="requested_serial",
+        )
+        return acquisition._active_finite_difference_gradient(atoms)
+    with ActiveGradientWorkerPool(acquisition, workers=workers) as pool:
+        return pool.gradient(atoms)
 
-    Only the process backend does real parallel work. A thread request falls
-    back to serial because the posterior/model caches are mutable shared
-    Python state; process workers inherit copy-on-write state after fork.
-    """
-    backend = (backend or "serial").lower()
-    w = resolve_workers(workers, n_tasks=_n_active_directions(acq))
-    if backend == "serial" or w <= 1:
-        _set_last_diagnostics(
-            gradient_backend="serial",
-            workers_requested=workers,
-            workers_used=1,
-            inside_gradient_worker=inside_gradient_worker(),
-            parallel_fallback_reason=(
-                "requested_serial" if backend == "serial" else "workers_le_one"
-            ),
-        )
-        return acq._active_finite_difference_gradient(atoms, objective=objective)
-    if backend == "thread":
-        _set_last_diagnostics(
-            gradient_backend="serial",
-            workers_requested=workers,
-            workers_used=1,
-            inside_gradient_worker=inside_gradient_worker(),
-            parallel_fallback_reason="thread_backend_disabled_for_active_fd",
-        )
-        return acq._active_finite_difference_gradient(atoms, objective=objective)
-    try:
-        return parallel_active_gradient(
-            acq,
-            atoms,
-            workers=w,
-            objective=objective,
-        )
-    except Exception as exc:
-        _set_last_diagnostics(
-            gradient_backend="serial",
-            workers_requested=workers,
-            workers_used=1,
-            inside_gradient_worker=inside_gradient_worker(),
-            parallel_fallback_reason="process_exception:" + type(exc).__name__,
-        )
-        return acq._active_finite_difference_gradient(atoms, objective=objective)
+
+__all__ = [
+    "ActiveGradientWorkerPool",
+    "compute_active_gradient",
+    "inside_gradient_worker",
+    "last_gradient_parallel_diagnostics",
+    "resolve_workers",
+]

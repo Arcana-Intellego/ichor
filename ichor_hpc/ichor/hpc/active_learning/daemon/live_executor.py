@@ -2058,9 +2058,6 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         models_version = int(getattr(state, "models_version", -1))
         if models_version < 0:
             return super()._seed_selection_posterior(state, training_atoms)
-        allow_uniform = bool(
-            getattr(self.config.acquisition, "allow_uniform_posterior_fallback", False)
-        )
         try:
             from pathlib import Path as _Path
             from .model_contract import smoke_total_energy_posterior
@@ -2082,18 +2079,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             )
             return smoke_total_energy_posterior(
                 models_dir,
-                property_name=str(self.config.acquisition.property_name),
+                property_name="iqa",
                 probe_frames=list(training_atoms)[:3],
             )
         except Exception as exc:
-            if allow_uniform:
-                self._journal_event(
-                    "seed_posterior_fallback",
-                    iteration=int(state.iteration),
-                    error=str(exc)[:120],
-                    explicit=True,
-                )
-                return super()._seed_selection_posterior(state, training_atoms)
             if isinstance(exc, BackendSubmissionError):
                 raise
             raise BackendSubmissionError(
@@ -3180,10 +3169,6 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         models_version = int(getattr(state, "models_version", -1))
         if models_version < 0:
             return False
-        allow_uniform = bool(
-            getattr(self.config.acquisition, "allow_uniform_posterior_fallback", False)
-        )
-
         # same policy decision as the dry-run path -- decide whether to
         # recompute. we duplicate the small block here rather than calling
         # the _dry method, because the dry method would clobber the real
@@ -3195,6 +3180,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         should_refresh = False
         if prev_scales is None:
             should_refresh = True
+        elif prev_iter == int(state.iteration):
+            should_refresh = False
         elif policy == "every_iteration":
             should_refresh = True
         elif policy == "every_n_iterations":
@@ -3203,6 +3190,46 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         elif policy == "never":
             should_refresh = False
         if not should_refresh:
+            try:
+                from ..layout import active_iteration_dir, active_protocol_dir
+                from ..reference_scale_snapshot import (
+                    build_reference_scale_snapshot,
+                    write_reference_scale_snapshot,
+                )
+
+                source_models_version = int(
+                    getattr(state, "reference_scales_models_version", -1)
+                )
+                source_manifest_sha = getattr(
+                    state,
+                    "reference_scales_model_manifest_sha256",
+                    None,
+                )
+                snapshot = build_reference_scale_snapshot(
+                    iteration=int(state.iteration),
+                    source_iteration=prev_iter,
+                    models_version=source_models_version,
+                    model_set_manifest_sha256=source_manifest_sha,
+                    values=prev_scales,
+                )
+                protocol_dir = active_protocol_dir(
+                    active_iteration_dir(
+                        self.campaign_dir,
+                        int(state.iteration),
+                    )
+                )
+                write_reference_scale_snapshot(
+                    protocol_dir / "reference_scales.json",
+                    snapshot,
+                )
+            except Exception as exc:
+                raise BackendSubmissionError(
+                    "cached reference scales cannot be materialised for this "
+                    "iteration: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)
+                ) from exc
             return False
 
         # load the committed models for this iteration. trying to do this
@@ -3211,21 +3238,15 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         from ..versioning.trained_models import (
             TrainedModelVersioning,
             load_trained_models,
+            trained_model_set_path,
         )
+        from ..versioning.manifest import sha256_file
 
         models_dir = TrainedModelVersioning(
             _Path(self.campaign_dir) / self.models_dir_name
         ).iteration_path(models_version)
         if not models_dir.is_dir():
             message = "reference scales require committed models: " + str(models_dir)
-            if allow_uniform:
-                self._journal_event(
-                    "reference_scales_computed",
-                    iteration=int(state.iteration),
-                    policy=str(policy),
-                    error="models_missing_uniform_fallback_enabled",
-                )
-                return False
             raise BackendSubmissionError(message)
         try:
             verify_committed_model_version(
@@ -3234,20 +3255,13 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 models_dir_name=self.models_dir_name,
             )
         except Exception as exc:
-            if allow_uniform:
-                self._journal_event(
-                    "reference_scales_computed",
-                    iteration=int(state.iteration),
-                    policy=str(policy),
-                    error="model_contract_invalid_uniform_fallback_enabled",
-                )
-                return False
             raise BackendSubmissionError(
                 "reference scale model contract failed: "
                 + type(exc).__name__
                 + ": "
                 + str(exc)
             ) from exc
+        model_manifest_sha256 = sha256_file(trained_model_set_path(models_dir))
 
         try:
             _, models = load_trained_models(
@@ -3263,8 +3277,6 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 policy=str(policy),
                 error="load_failed: " + str(exc)[:80],
             )
-            if allow_uniform:
-                return False
             raise BackendSubmissionError(
                 "reference scale model/pool load failed: "
                 + type(exc).__name__
@@ -3295,8 +3307,6 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 policy=str(policy),
                 error="sampling_protocol_failed: " + str(exc)[:80],
             )
-            if allow_uniform:
-                return False
             raise BackendSubmissionError(
                 "sampling protocol resolution failed for reference scale computation: "
                 + type(exc).__name__
@@ -3323,8 +3333,6 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 policy=str(policy),
                 error="compute_failed: " + str(exc)[:80],
             )
-            if allow_uniform:
-                return False
             raise BackendSubmissionError(
                 "reference scale computation failed: "
                 + type(exc).__name__
@@ -3336,15 +3344,27 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         # read at the top of their main. saves them ~480 GP evaluations
         # per seed.
         from ..layout import active_iteration_dir, active_protocol_dir
+        from ..reference_scale_snapshot import (
+            build_reference_scale_snapshot,
+            write_reference_scale_snapshot,
+        )
 
         iter_dir = active_iteration_dir(self.campaign_dir, int(state.iteration))
         protocol_dir = active_protocol_dir(iter_dir)
-        protocol_dir.mkdir(parents=True, exist_ok=True)
         sidecar = protocol_dir / "reference_scales.json"
-        atomic_write_json(sidecar, scales)
+        snapshot = build_reference_scale_snapshot(
+            iteration=int(state.iteration),
+            source_iteration=int(state.iteration),
+            models_version=models_version,
+            model_set_manifest_sha256=model_manifest_sha256,
+            values=scales,
+        )
+        write_reference_scale_snapshot(sidecar, snapshot)
 
         state.reference_scales = scales
         state.reference_scales_iteration = int(state.iteration)
+        state.reference_scales_models_version = models_version
+        state.reference_scales_model_manifest_sha256 = model_manifest_sha256
         self._journal_event(
             "reference_scales_computed",
             iteration=int(state.iteration),

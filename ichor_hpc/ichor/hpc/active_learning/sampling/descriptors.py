@@ -33,6 +33,7 @@ import os
 import numpy as np
 
 from ichor.core.atoms import Atoms
+from ichor.core.adversarial.geometry import kabsch_align as _core_kabsch_align
 
 from ichor.hpc.active_learning.acquisition.rigid_projection import mass_vector_for
 
@@ -118,32 +119,8 @@ class CondensedDistanceStore:
 
 
 def kabsch_align(reference, mobile, weights=None):
-    reference = np.asarray(reference, dtype=float)
-    mobile = np.asarray(mobile, dtype=float)
-    if reference.shape != mobile.shape or reference.ndim != 2 or reference.shape[1] != 3:
-        raise ValueError("shapes must match and be (N, 3)")
-    if weights is None:
-        w = np.ones(reference.shape[0], dtype=float)
-    else:
-        w = np.asarray(weights, dtype=float).reshape(-1)
-        if w.size != reference.shape[0]:
-            raise ValueError("weights size mismatch")
-        if np.any(w < 0.0):
-            raise ValueError("weights must be non-negative")
-    w_sum = float(np.sum(w))
-    if w_sum <= 0.0:
-        return mobile.copy()
-    w_norm = w / w_sum
-    ref_c = reference - (w_norm[:, None] * reference).sum(axis=0)
-    mob_c = mobile - (w_norm[:, None] * mobile).sum(axis=0)
-    H = (mob_c * w[:, None]).T @ ref_c
-    U, S, Vt = np.linalg.svd(H, full_matrices=False)
-    det = np.linalg.det(Vt.T @ U.T)
-    D = np.eye(3)
-    D[2, 2] = float(np.sign(det) if det != 0.0 else 1.0)
-    R = Vt.T @ D @ U.T
-    aligned = mob_c @ R.T + (w_norm[:, None] * reference).sum(axis=0)
-    return aligned
+    """Use the single validated ICHOR weighted-alignment implementation."""
+    return _core_kabsch_align(reference, mobile, weights=weights)
 
 
 def mass_weighted_rmsd(reference: Atoms, mobile: Atoms) -> float:

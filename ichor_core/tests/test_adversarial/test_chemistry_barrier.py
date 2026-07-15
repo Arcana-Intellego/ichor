@@ -2,6 +2,7 @@ import numpy as np
 
 from ichor.core.adversarial.barrier import (
     ChemistryBarrierState,
+    build_chemistry_barrier_state,
     chemistry_barrier_components,
     chemistry_barrier_value,
 )
@@ -86,3 +87,58 @@ def test_chemistry_barrier_can_exclude_only_angle_terms():
         mean_energy=0.0,
         include_angles=False,
     ) == with_angles["angle"]
+
+
+def test_nonbonded_selection_margin_is_independent_of_softness(monkeypatch):
+    monkeypatch.setattr(
+        "ichor.core.adversarial.barrier.default_connectivity_calculator",
+        lambda atoms: np.zeros((len(atoms), len(atoms)), dtype=bool),
+    )
+
+    class _Posterior:
+        @staticmethod
+        def mean(atoms):
+            return 0.0
+
+    probe = Atoms([Atom("H", 0.0, 0.0, 0.0), Atom("H", 1.0, 0.0, 0.0)])
+    radius_sum = float(probe[0].radius + probe[1].radius)
+    distance = 1.85 * radius_sum
+    seed = Atoms([
+        Atom("H", 0.0, 0.0, 0.0),
+        Atom("H", distance, 0.0, 0.0),
+    ])
+
+    narrow = build_chemistry_barrier_state(
+        seed,
+        [],
+        _Posterior(),
+        BarrierConfig(
+            nonbonded_expansion_scale=1.80,
+            nonbonded_expansion_selection_margin_ratio=0.10,
+            nonbonded_expansion_delta=0.01,
+        ),
+    )
+    broad = build_chemistry_barrier_state(
+        seed,
+        [],
+        _Posterior(),
+        BarrierConfig(
+            nonbonded_expansion_scale=1.80,
+            nonbonded_expansion_selection_margin_ratio=0.10,
+            nonbonded_expansion_delta=10.0,
+        ),
+    )
+    excluded = build_chemistry_barrier_state(
+        seed,
+        [],
+        _Posterior(),
+        BarrierConfig(
+            nonbonded_expansion_scale=1.80,
+            nonbonded_expansion_selection_margin_ratio=0.0,
+            nonbonded_expansion_delta=10.0,
+        ),
+    )
+
+    assert narrow.nonbonded_upper == broad.nonbonded_upper
+    assert (0, 1) in narrow.nonbonded_upper
+    assert (0, 1) not in excluded.nonbonded_upper

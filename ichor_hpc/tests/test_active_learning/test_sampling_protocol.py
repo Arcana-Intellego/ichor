@@ -300,7 +300,6 @@ def test_sampling_policy_table_is_versioned_complete_and_hashed():
 
 def test_hidden_low_level_overrides_are_reported_not_applied():
     cfg = CampaignConfig()
-    cfg.acquisition.weights.lambda_distance = 99.0
     cfg.geometry_novelty.fallback_scale_angstrom = 9.0
     cfg.phase_b.beta = 0.9
     cfg.quality_gates.ariadne_min_pair_distance_ang = 0.2
@@ -308,7 +307,6 @@ def test_hidden_low_level_overrides_are_reported_not_applied():
     overrides = hidden_sampling_overrides(cfg)
     paths = {entry["path"] for entry in overrides}
 
-    assert "acquisition.weights.lambda_distance" in paths
     assert "geometry_novelty.fallback_scale_angstrom" in paths
     assert "phase_b.beta" not in paths
     assert "quality_gates.ariadne_min_pair_distance_ang" in paths

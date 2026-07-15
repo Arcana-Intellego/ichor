@@ -72,15 +72,12 @@ def test_ferebus_properties_validation(properties):
         CampaignConfig.from_dict(payload)
 
 
-def test_acquisition_uniform_posterior_fallback_default_and_validation():
+def test_removed_uniform_posterior_fallback_is_rejected():
     cfg = CampaignConfig()
-    assert cfg.acquisition.allow_uniform_posterior_fallback is False
+    assert not hasattr(cfg.acquisition, "allow_uniform_posterior_fallback")
     payload = cfg.to_dict()
     payload["acquisition"]["allow_uniform_posterior_fallback"] = True
-    loaded = CampaignConfig.from_dict(payload)
-    assert loaded.acquisition.allow_uniform_posterior_fallback is True
-    payload["acquisition"]["allow_uniform_posterior_fallback"] = "yes"
-    with pytest.raises(ConfigValidationError):
+    with pytest.raises(ConfigValidationError, match="unknown keys"):
         CampaignConfig.from_dict(payload)
 
 
@@ -126,102 +123,38 @@ def test_to_acquisition_config_propagates_nested_values():
     assert ac.barrier.use_connectivity_barrier is False
 
 
-def test_subspace_dim_guard_fires_with_cartesian_fd():
+def test_subspace_dimension_is_capped_at_six():
     c = CampaignConfig()
     c.acquisition.subspace.max_subspace_dim = 10
-    assert c.acquisition.gradient.mode == "cartesian_fd"
     with pytest.raises(ConfigValidationError, match="max_subspace_dim"):
-        c.to_acquisition_config()
+        CampaignConfig.from_dict(c.to_dict())
 
 
-def test_subspace_dim_guard_passes_with_active_fd():
+def test_subspace_dimension_six_uses_mandatory_active_gradient():
     c = CampaignConfig()
-    c.acquisition.subspace.max_subspace_dim = 10
-    c.acquisition.gradient.mode = "active_fd"
+    c.acquisition.subspace.max_subspace_dim = 6
     ac = c.to_acquisition_config()
-    assert ac.subspace.max_subspace_dim == 10
-    assert ac.gradient.mode == "active_fd"
+    assert ac.subspace.max_subspace_dim == 6
+    assert not hasattr(ac.gradient, "mode")
 
 
 def test_to_acquisition_config_propagates_active_fd_gradient_values():
     c = CampaignConfig()
-    c.acquisition.gradient.mode = "active_fd"
-    c.acquisition.gradient.cartesian_step = 2.0e-4
     c.acquisition.gradient.active_step = 3.0e-3
     c.acquisition.gradient.regularization = 4.0e-9
-    c.acquisition.gradient.cartesian_step_floor = 5.0e-5
-    c.acquisition.gradient.ghost_mass_threshold = 1.0e-6
 
     ac = c.to_acquisition_config()
 
-    assert ac.gradient.mode == "active_fd"
-    assert ac.gradient.cartesian_step == pytest.approx(2.0e-4)
     assert ac.gradient.active_step == pytest.approx(3.0e-3)
     assert ac.gradient.regularization == pytest.approx(4.0e-9)
-    assert ac.gradient.cartesian_step_floor == pytest.approx(5.0e-5)
-    assert ac.gradient.ghost_mass_threshold == pytest.approx(1.0e-6)
+    assert not hasattr(ac.gradient, "cartesian_step")
 
 
-def test_to_acquisition_config_propagates_driver_values():
-    c = CampaignConfig()
-    c.acquisition.driver.enabled = True
-    c.acquisition.driver.objective = "cheap_driver"
-    c.acquisition.driver.gradient_backend = "hybrid_geometry"
-    c.acquisition.driver.include_stencils = True
-    c.acquisition.driver.analytic_movement = False
-    c.acquisition.driver.analytic_whitened_distance = True
-    c.acquisition.driver.analytic_pair_barriers = False
-    c.acquisition.driver.analytic_fullspace_rmsd = True
-    c.acquisition.driver.finite_difference_energy = False
-    c.acquisition.driver.analytic_validation = True
-    c.acquisition.driver.analytic_validation_tol_cosine = 0.91
-    c.acquisition.driver.lambda_energy = 0.5
-    c.acquisition.driver.lambda_movement = 0.6
-    c.acquisition.driver.lambda_distance = 0.7
-    c.acquisition.driver.lambda_fullspace = 0.8
-    c.acquisition.driver.lambda_chemistry = 0.9
-
-    ac = c.to_acquisition_config()
-
-    assert ac.driver.enabled is True
-    assert ac.driver.objective == "cheap_driver"
-    assert ac.driver.gradient_backend == "hybrid_geometry"
-    assert ac.driver.include_stencils is True
-    assert ac.driver.analytic_movement is False
-    assert ac.driver.analytic_whitened_distance is True
-    assert ac.driver.analytic_pair_barriers is False
-    assert ac.driver.analytic_fullspace_rmsd is True
-    assert ac.driver.finite_difference_energy is False
-    assert ac.driver.analytic_validation is True
-    assert ac.driver.analytic_validation_tol_cosine == pytest.approx(0.91)
-    assert ac.driver.lambda_energy == pytest.approx(0.5)
-    assert ac.driver.lambda_movement == pytest.approx(0.6)
-    assert ac.driver.lambda_distance == pytest.approx(0.7)
-    assert ac.driver.lambda_fullspace == pytest.approx(0.8)
-    assert ac.driver.lambda_chemistry == pytest.approx(0.9)
-
-
-def test_driver_config_validation_rejects_unknown_objective():
+def test_removed_driver_block_is_rejected():
     payload = CampaignConfig().to_dict()
-    payload["acquisition"]["driver"]["objective"] = "mystery"
+    payload["acquisition"]["driver"] = {"objective": "cheap_driver"}
 
-    with pytest.raises(ConfigValidationError, match="acquisition.driver.objective"):
-        CampaignConfig.from_dict(payload)
-
-
-def test_driver_config_validation_rejects_unknown_gradient_backend():
-    payload = CampaignConfig().to_dict()
-    payload["acquisition"]["driver"]["gradient_backend"] = "mystery"
-
-    with pytest.raises(ConfigValidationError, match="acquisition.driver.gradient_backend"):
-        CampaignConfig.from_dict(payload)
-
-
-def test_driver_config_validation_rejects_invalid_validation_cosine():
-    payload = CampaignConfig().to_dict()
-    payload["acquisition"]["driver"]["analytic_validation_tol_cosine"] = 1.5
-
-    with pytest.raises(ConfigValidationError, match="analytic_validation_tol_cosine"):
+    with pytest.raises(ConfigValidationError, match="unknown keys"):
         CampaignConfig.from_dict(payload)
 
 

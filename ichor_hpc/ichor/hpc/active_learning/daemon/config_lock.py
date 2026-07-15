@@ -497,7 +497,6 @@ PRE_FEREBUS_FIRST_EXACT = {
     "ferebus.prior_mean_strategy",
     "ferebus.prior_mean_level_of_theory",
     "ferebus.physical_prior_scale",
-    "acquisition.property_name",
 }
 FUTURE_FEREBUS_EXACT = {
     "ferebus.kernel",

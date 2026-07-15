@@ -266,6 +266,8 @@ class CampaignState:
     #to every SeedLocalAdversarialAcquisition built in that iteration.
     reference_scales: Optional[Dict[str, float]] = None
     reference_scales_iteration: int = -1
+    reference_scales_models_version: int = -1
+    reference_scales_model_manifest_sha256: Optional[str] = None
     #Bounded by stop block window in the
     #config. Appended on every STOP_CHECK inline call from state.last_acquisition_alpha0.
     alpha_history: List[float] = field(default_factory=list)
@@ -424,6 +426,49 @@ class CampaignState:
         )
         if reference_scales_iteration < -1:
             raise StateSchemaError("reference_scales_iteration must be >= -1")
+        reference_scales_models_version = _coerce_state_int(
+            payload,
+            "reference_scales_models_version",
+            -1,
+        )
+        if reference_scales_models_version < -1:
+            raise StateSchemaError(
+                "reference_scales_models_version must be >= -1"
+            )
+        reference_scales_model_manifest_sha256 = payload.get(
+            "reference_scales_model_manifest_sha256"
+        )
+        if reference_scales_model_manifest_sha256 is not None:
+            if (
+                not isinstance(reference_scales_model_manifest_sha256, str)
+                or len(reference_scales_model_manifest_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in reference_scales_model_manifest_sha256
+                )
+            ):
+                raise StateSchemaError(
+                    "reference_scales_model_manifest_sha256 must be a lowercase "
+                    "SHA-256 digest or null"
+                )
+        if ref_scales is None:
+            if (
+                reference_scales_iteration != -1
+                or reference_scales_models_version != -1
+                or reference_scales_model_manifest_sha256 is not None
+            ):
+                raise StateSchemaError(
+                    "reference-scale identity metadata requires reference_scales"
+                )
+        elif (
+            reference_scales_iteration < 0
+            or reference_scales_models_version < 0
+            or reference_scales_model_manifest_sha256 is None
+        ):
+            raise StateSchemaError(
+                "reference_scales require source iteration, model version and "
+                "model manifest SHA metadata"
+            )
         last_n_anti_overlap_flagged = _coerce_state_int(
             payload,
             "last_n_anti_overlap_flagged",
@@ -464,6 +509,10 @@ class CampaignState:
             shutdown_requested=shutdown_requested,
             reference_scales=ref_scales,
             reference_scales_iteration=reference_scales_iteration,
+            reference_scales_models_version=reference_scales_models_version,
+            reference_scales_model_manifest_sha256=(
+                reference_scales_model_manifest_sha256
+            ),
             alpha_history=_coerce_alpha_history(payload),
             last_n_anti_overlap_flagged=last_n_anti_overlap_flagged,
             sacct_empty_streak=sacct_empty_streak,

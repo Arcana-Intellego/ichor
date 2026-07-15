@@ -93,7 +93,9 @@ def test_initial_projected_acquisition_gradient_is_projected_to_active_subspace(
         ),
         size_normalisation=SizeNormalisationConfig(),
     )
-    acq._base_cartesian_gradient = lambda atoms: (active + 10.0 * inactive).reshape(3, 3)
+    acq._base_active_gradient = lambda atoms: (
+        active + 10.0 * inactive
+    ).reshape(3, 3)
 
     direction, source = acq.movement_direction()
 

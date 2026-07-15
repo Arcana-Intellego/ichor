@@ -44,8 +44,6 @@ from ichor.hpc.active_learning.config import (
     ConfigValidationError,
     VALID_AIMALL_BOAQ_VALUES,
     VALID_AIMALL_IASMESH_VALUES,
-    VALID_ACQUISITION_DRIVER_GRADIENT_BACKENDS,
-    VALID_ACQUISITION_DRIVER_OBJECTIVES,
     VALID_CALIBRATED_ENERGY_UTILITIES,
     VALID_DESCRIPTORS,
     VALID_ERROR_CALIBRATION_MODES,
@@ -53,15 +51,11 @@ from ichor.hpc.active_learning.config import (
     VALID_FEREBUS_PRIOR_MEAN_STRATEGIES,
     VALID_GEOMETRY_NOVELTY_SCALE_SOURCES,
     VALID_GEOMETRY_NOVELTY_STATISTICS,
-    VALID_GRADIENT_MODES,
     VALID_GRADIENT_PARALLEL_BACKENDS,
     VALID_MODE_WEIGHTING_POLICIES,
     VALID_NEGATIVE_CURVATURE_POLICIES,
     VALID_D_OPTIMAL_DEGENERATE_POLICIES,
     VALID_SEED_SELECTION_STRATEGIES,
-    VALID_SIZE_NORMALISATION_BARRIER_MODES,
-    VALID_SIZE_NORMALISATION_DISTANCE_MODES,
-    VALID_SIZE_NORMALISATION_ENERGY_MODES,
     VALID_SPECTRAL_MODES,
 )
 from ichor.hpc.active_learning.ferebus_prior import SUPPORTED_LEVELS
@@ -459,7 +453,7 @@ class EditCampaignConfigMenuOptions(MenuOptions):
     n_seeds_per_iteration: int = 50
     phase_b_descriptor: str = "hybrid_alf_rmsd"
     ferebus_kernel: str = "rbfc_per"
-    acquisition_gradient_mode: str = "cartesian_fd"
+    acquisition_gradient_mode: str = "active_fd (mandatory)"
     acquisition_max_subspace_dim: int = 6
 
     def __call__(self):
@@ -572,7 +566,7 @@ def _sync_options_from_config():
     edit_campaign_config_menu_options.phase_b_descriptor = _campaign_config.phase_b.descriptor
     edit_campaign_config_menu_options.ferebus_kernel = _campaign_config.ferebus.kernel
     edit_campaign_config_menu_options.acquisition_gradient_mode = (
-        _campaign_config.acquisition.gradient.mode
+        "active_fd (mandatory)"
     )
     edit_campaign_config_menu_options.acquisition_max_subspace_dim = (
         _campaign_config.acquisition.subspace.max_subspace_dim
@@ -843,298 +837,6 @@ class EditCampaignConfigFunctions:
         _pause()
 
     @staticmethod
-    def edit_campaign_identity():
-        _campaign_config.system_name = user_input_free_flow(
-            "system_name: ", _campaign_config.system_name,
-        )
-        _sync_options_from_config()
-
-    @staticmethod
-    def edit_iteration_control():
-        _campaign_config.max_iterations = user_input_int(
-            "max_iterations: ", _campaign_config.max_iterations,
-        )
-        _campaign_config.poll_interval_seconds = user_input_int(
-            "poll_interval_seconds: ", _campaign_config.poll_interval_seconds,
-        )
-        _campaign_config.poll_interval_idle_seconds = user_input_int(
-            "poll_interval_idle_seconds: ", _campaign_config.poll_interval_idle_seconds,
-        )
-        _campaign_config.poll_sacct_empty_max_ticks = user_input_int(
-            "poll_sacct_empty_max_ticks (0 disables empty-sacct escalation): ",
-            _campaign_config.poll_sacct_empty_max_ticks,
-        )
-        _sync_options_from_config()
-
-    @staticmethod
-    def edit_resources():
-        _unsupported_sequential_field_editor()
-
-    @staticmethod
-    def edit_gaussian():
-        _unsupported_sequential_field_editor()
-
-    @staticmethod
-    def edit_seed_selection():
-        s = _campaign_config.seed_selection
-        s.n_seeds_per_iteration = user_input_int(
-            "seed_selection.n_seeds_per_iteration: ", s.n_seeds_per_iteration,
-        )
-        s.bulk_fraction = user_input_float(
-            "seed_selection.bulk_fraction (0.0-1.0): ", s.bulk_fraction,
-        )
-        chosen = user_input_restricted(
-            sorted(VALID_SEED_SELECTION_STRATEGIES),
-            "seed_selection.strategy: ",
-            s.strategy,
-        )
-        if chosen is not None:
-            s.strategy = chosen
-        s.variance_chunk_size = user_input_int(
-            "seed_selection.variance_chunk_size: ", s.variance_chunk_size,
-        )
-        s.d_optimal_pool_multiplier = user_input_int(
-            "seed_selection.d_optimal_pool_multiplier: ",
-            s.d_optimal_pool_multiplier,
-        )
-        s.d_optimal_jitter = user_input_float(
-            "seed_selection.d_optimal_jitter: ", s.d_optimal_jitter,
-        )
-        s.d_optimal_novelty_floor = user_input_float(
-            "seed_selection.d_optimal_novelty_floor: ", s.d_optimal_novelty_floor,
-        )
-        s.d_optimal_score_power = user_input_float(
-            "seed_selection.d_optimal_score_power: ", s.d_optimal_score_power,
-        )
-        _sync_options_from_config()
-
-    @staticmethod
-    def edit_anti_overlap():
-        a = _campaign_config.anti_overlap
-        a.min_post_ariadne_whitened_distance = user_input_float(
-            "anti_overlap.min_post_ariadne_whitened_distance: ",
-            a.min_post_ariadne_whitened_distance,
-        )
-        a.max_post_ariadne_whitened_distance = user_input_float(
-            "anti_overlap.max_post_ariadne_whitened_distance: ",
-            a.max_post_ariadne_whitened_distance,
-        )
-        a.enforce_post_ariadne = user_input_bool(
-            "anti_overlap.enforce_post_ariadne: ", a.enforce_post_ariadne,
-        )
-        _sync_options_from_config()
-
-    @staticmethod
-    def edit_phase_b():
-        pb = _campaign_config.phase_b
-        chosen = user_input_restricted(
-            sorted(VALID_DESCRIPTORS), "phase_b.descriptor: ", pb.descriptor,
-        )
-        if chosen is not None:
-            pb.descriptor = chosen
-        pb.beta = user_input_float("phase_b.beta (0.0-1.0): ", pb.beta)
-        _sync_options_from_config()
-
-    @staticmethod
-    def edit_split():
-        _unsupported_sequential_field_editor()
-
-    @staticmethod
-    def edit_ferebus():
-        _unsupported_sequential_field_editor()
-
-    @staticmethod
-    def edit_acquisition_core():
-        a = _campaign_config.acquisition
-        a.property_name = user_input_free_flow(
-            "acquisition.property_name: ", a.property_name,
-        )
-        a.use_scaled_posterior_covariance = user_input_bool(
-            "acquisition.use_scaled_posterior_covariance: ",
-            a.use_scaled_posterior_covariance,
-        )
-        a.allow_uniform_posterior_fallback = user_input_bool(
-            "acquisition.allow_uniform_posterior_fallback: ",
-            a.allow_uniform_posterior_fallback,
-        )
-        _sync_options_from_config()
-
-    @staticmethod
-    def edit_robustness():
-        _campaign_config.failure_threshold_fraction = user_input_float(
-            "failure_threshold_fraction (0.0-1.0): ",
-            _campaign_config.failure_threshold_fraction,
-        )
-        _campaign_config.max_force_per_atom_ha_per_ang = user_input_float(
-            "max_force_per_atom_ha_per_ang (deprecated acquisition-gradient alias): ",
-            _campaign_config.max_force_per_atom_ha_per_ang,
-        )
-        _sync_options_from_config()
-
-    @staticmethod
-    def edit_acquisition_subspace():
-        sb = _campaign_config.acquisition.subspace
-        sb.neighbour_count = user_input_int(
-            "acquisition.subspace.neighbour_count: ", sb.neighbour_count,
-        )
-        sb.variance_capture = user_input_float(
-            "acquisition.subspace.variance_capture (0.0-1.0): ", sb.variance_capture,
-        )
-        sb.min_subspace_dim = user_input_int(
-            "acquisition.subspace.min_subspace_dim: ", sb.min_subspace_dim,
-        )
-        sb.max_subspace_dim = user_input_int(
-            "acquisition.subspace.max_subspace_dim: ", sb.max_subspace_dim,
-        )
-        chosen = user_input_restricted(
-            sorted(VALID_MODE_WEIGHTING_POLICIES),
-            "acquisition.subspace.mode_weighting_policy: ",
-            sb.mode_weighting_policy,
-        )
-        if chosen is not None:
-            sb.mode_weighting_policy = chosen
-        sb.canonicalise_basis = user_input_bool(
-            "acquisition.subspace.canonicalise_basis: ", sb.canonicalise_basis,
-        )
-        _sync_options_from_config()
-
-    @staticmethod
-    def edit_acquisition_weights():
-        w = _campaign_config.acquisition.weights
-        w.lambda_force = user_input_float(
-            "acquisition.weights.lambda_force: ", w.lambda_force,
-        )
-        w.lambda_frequency = user_input_float(
-            "acquisition.weights.lambda_frequency: ", w.lambda_frequency,
-        )
-        w.lambda_anharmonic = user_input_float(
-            "acquisition.weights.lambda_anharmonic: ", w.lambda_anharmonic,
-        )
-        w.lambda_energy = user_input_float(
-            "acquisition.weights.lambda_energy: ", w.lambda_energy,
-        )
-        w.lambda_distance = user_input_float(
-            "acquisition.weights.lambda_distance: ", w.lambda_distance,
-        )
-        _sync_options_from_config()
-
-    @staticmethod
-    def edit_acquisition_gradient():
-        g = _campaign_config.acquisition.gradient
-        chosen = user_input_restricted(
-            sorted(VALID_GRADIENT_MODES), "acquisition.gradient.mode: ", g.mode,
-        )
-        if chosen is not None:
-            g.mode = chosen
-        g.cartesian_step = user_input_float(
-            "acquisition.gradient.cartesian_step: ", g.cartesian_step,
-        )
-        g.active_step = user_input_float(
-            "acquisition.gradient.active_step: ", g.active_step,
-        )
-        _sync_options_from_config()
-
-    @staticmethod
-    def edit_acquisition_barrier():
-        b = _campaign_config.acquisition.barrier
-        b.use_connectivity_barrier = user_input_bool(
-            "acquisition.barrier.use_connectivity_barrier: ", b.use_connectivity_barrier,
-        )
-        b.nonbonded_clash_scale = user_input_float(
-            "acquisition.barrier.nonbonded_clash_scale: ", b.nonbonded_clash_scale,
-        )
-        b.clash_delta = user_input_float(
-            "acquisition.barrier.clash_delta: ", b.clash_delta,
-        )
-        b.clash_lambda = user_input_float(
-            "acquisition.barrier.clash_lambda: ", b.clash_lambda,
-        )
-        b.bond_lower_scale = user_input_float(
-            "acquisition.barrier.bond_lower_scale: ", b.bond_lower_scale,
-        )
-        b.bond_upper_scale = user_input_float(
-            "acquisition.barrier.bond_upper_scale: ", b.bond_upper_scale,
-        )
-        b.bond_lambda = user_input_float(
-            "acquisition.barrier.bond_lambda: ", b.bond_lambda,
-        )
-        b.energy_cap_quantile = user_input_float(
-            "acquisition.barrier.energy_cap_quantile (0.0-1.0): ", b.energy_cap_quantile,
-        )
-        b.energy_cap_lambda = user_input_float(
-            "acquisition.barrier.energy_cap_lambda: ", b.energy_cap_lambda,
-        )
-        _sync_options_from_config()
-
-    @staticmethod
-    def edit_acquisition_stencils():
-        st = _campaign_config.acquisition.stencils
-        st.step_scale = user_input_float(
-            "acquisition.stencils.step_scale: ", st.step_scale,
-        )
-        st.min_step = user_input_float(
-            "acquisition.stencils.min_step: ", st.min_step,
-        )
-        st.max_step = user_input_float(
-            "acquisition.stencils.max_step: ", st.max_step,
-        )
-        st.curvature_floor = user_input_float(
-            "acquisition.stencils.curvature_floor: ", st.curvature_floor,
-        )
-        st.softplus_scale = user_input_float(
-            "acquisition.stencils.softplus_scale: ", st.softplus_scale,
-        )
-        st.autotune_from_cubic = user_input_bool(
-            "acquisition.stencils.autotune_from_cubic: ",
-            st.autotune_from_cubic,
-        )
-        _sync_options_from_config()
-
-    @staticmethod
-    def edit_acquisition_references():
-        rs = _campaign_config.acquisition.references
-        rs.max_reference_samples = user_input_int(
-            "acquisition.references.max_reference_samples: ", rs.max_reference_samples,
-        )
-        rs.floor = user_input_float(
-            "acquisition.references.floor: ", rs.floor,
-        )
-        chosen = user_input_restricted(
-            ["every_iteration", "every_n_iterations", "never"],
-            "acquisition.references.refresh_policy: ",
-            rs.refresh_policy,
-        )
-        if chosen is not None:
-            rs.refresh_policy = chosen
-        rs.refresh_period = user_input_int(
-            "acquisition.references.refresh_period (only used by every_n_iterations): ",
-            rs.refresh_period,
-        )
-        _sync_options_from_config()
-
-    @staticmethod
-    def edit_stop():
-        st = _campaign_config.stop
-        st.alpha0_streak_threshold = user_input_float(
-            "stop.alpha0_streak_threshold: ", st.alpha0_streak_threshold,
-        )
-        st.alpha0_streak_length = user_input_int(
-            "stop.alpha0_streak_length (0 disables this rule): ",
-            st.alpha0_streak_length,
-        )
-        st.rel_alpha_improvement_min = user_input_float(
-            "stop.rel_alpha_improvement_min: ", st.rel_alpha_improvement_min,
-        )
-        st.rel_alpha_improvement_window = user_input_int(
-            "stop.rel_alpha_improvement_window (0 disables this rule): ",
-            st.rel_alpha_improvement_window,
-        )
-        st.min_iterations_before_stop = user_input_int(
-            "stop.min_iterations_before_stop: ", st.min_iterations_before_stop,
-        )
-        _sync_options_from_config()
-
-    @staticmethod
     def save_to_disk():
         global _last_save_path, _last_error
         try:
@@ -1217,41 +919,6 @@ class EditCampaignConfigFunctions:
                 print(line)
         print("Note: unmodified campaign.yaml fields and comments are preserved where possible.")
         _pause()
-
-
-def _unsupported_sequential_field_editor():
-    raise RuntimeError(
-        "Sequential campaign config editors are no longer supported. "
-        "Use the block field menus so current values remain visible and every "
-        "campaign.yaml field is edited through one authoritative path."
-    )
-
-
-for _legacy_editor_name in (
-    "edit_campaign_identity",
-    "edit_iteration_control",
-    "edit_resources",
-    "edit_gaussian",
-    "edit_seed_selection",
-    "edit_anti_overlap",
-    "edit_phase_b",
-    "edit_split",
-    "edit_ferebus",
-    "edit_acquisition_core",
-    "edit_robustness",
-    "edit_acquisition_subspace",
-    "edit_acquisition_weights",
-    "edit_acquisition_gradient",
-    "edit_acquisition_barrier",
-    "edit_acquisition_stencils",
-    "edit_acquisition_references",
-    "edit_stop",
-):
-    setattr(
-        EditCampaignConfigFunctions,
-        _legacy_editor_name,
-        staticmethod(_unsupported_sequential_field_editor),
-    )
 
 
 edit_campaign_config_menu = ConsoleMenu(
@@ -1473,15 +1140,6 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("ferebus.properties", "csv_list", prompt="ferebus.properties (comma-separated, e.g. iqa,q00): "),
         ],
     ),
-    "Edit acquisition core": _make_block_menu(
-        "Edit Acquisition Core",
-        "Top-level adversarial acquisition settings.",
-        [
-            _spec("acquisition.property_name", "str"),
-            _spec("acquisition.use_scaled_posterior_covariance", "bool"),
-            _spec("acquisition.allow_uniform_posterior_fallback", "bool"),
-        ],
-    ),
     "Edit acquisition.subspace": _make_block_menu(
         "Edit acquisition.subspace",
         "Local subspace construction for adversarial acquisition.",
@@ -1506,17 +1164,14 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("acquisition.weights.lambda_frequency", "float"),
             _spec("acquisition.weights.lambda_anharmonic", "float"),
             _spec("acquisition.weights.lambda_energy", "float"),
-            _spec("acquisition.weights.lambda_distance", "float"),
         ],
     ),
     "Edit acquisition.spectral": _make_block_menu(
         "Edit acquisition.spectral",
         "Observable-oriented spectral frequency acquisition settings.",
         [
-            _spec("acquisition.spectral.enabled", "bool"),
             _spec("acquisition.spectral.mode", "choice", choices=sorted(VALID_SPECTRAL_MODES)),
             _spec("acquisition.spectral.mode_weighting", "choice", choices=sorted(VALID_MODE_WEIGHTING_POLICIES)),
-            _spec("acquisition.spectral.lambda_spectral", "float"),
             _spec("acquisition.spectral.omega_floor", "float"),
             _spec("acquisition.spectral.low_frequency_power", "float"),
             _spec("acquisition.spectral.max_modes", "optional_int"),
@@ -1534,57 +1189,12 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("acquisition.calibrated_energy.fallback_to_raw_variance", "bool"),
         ],
     ),
-    "Edit acquisition.fullspace_confinement": _make_block_menu(
-        "Edit acquisition.fullspace_confinement",
-        "Full-space geometric confinement outside the local active subspace.",
-        [
-            _spec("acquisition.fullspace_confinement.enabled", "bool"),
-            _spec("acquisition.fullspace_confinement.lambda_residual", "float"),
-            _spec("acquisition.fullspace_confinement.lambda_rmsd", "float"),
-        ],
-    ),
-    "Edit acquisition.size_normalisation": _make_block_menu(
-        "Edit acquisition.size_normalisation",
-        "System-size intensive acquisition term normalisation.",
-        [
-            _spec("acquisition.size_normalisation.enabled", "bool"),
-            _spec("acquisition.size_normalisation.energy_mode", "choice", choices=sorted(VALID_SIZE_NORMALISATION_ENERGY_MODES)),
-            _spec("acquisition.size_normalisation.whitened_distance_mode", "choice", choices=sorted(VALID_SIZE_NORMALISATION_DISTANCE_MODES)),
-            _spec("acquisition.size_normalisation.chemistry_barrier_mode", "choice", choices=sorted(VALID_SIZE_NORMALISATION_BARRIER_MODES)),
-        ],
-    ),
-    "Edit acquisition.driver": _make_block_menu(
-        "Edit acquisition.driver",
-        "Optional cheap optimiser-driving objective; full scoring still selects landings.",
-        [
-            _spec("acquisition.driver.enabled", "bool"),
-            _spec("acquisition.driver.objective", "choice", choices=sorted(VALID_ACQUISITION_DRIVER_OBJECTIVES)),
-            _spec("acquisition.driver.gradient_backend", "choice", choices=sorted(VALID_ACQUISITION_DRIVER_GRADIENT_BACKENDS)),
-            _spec("acquisition.driver.include_stencils", "bool"),
-            _spec("acquisition.driver.analytic_movement", "bool"),
-            _spec("acquisition.driver.analytic_whitened_distance", "bool"),
-            _spec("acquisition.driver.analytic_pair_barriers", "bool"),
-            _spec("acquisition.driver.analytic_fullspace_rmsd", "bool"),
-            _spec("acquisition.driver.finite_difference_energy", "bool"),
-            _spec("acquisition.driver.analytic_validation", "bool"),
-            _spec("acquisition.driver.analytic_validation_tol_cosine", "float"),
-            _spec("acquisition.driver.lambda_energy", "float"),
-            _spec("acquisition.driver.lambda_movement", "float"),
-            _spec("acquisition.driver.lambda_distance", "float"),
-            _spec("acquisition.driver.lambda_fullspace", "float"),
-            _spec("acquisition.driver.lambda_chemistry", "float"),
-        ],
-    ),
     "Edit acquisition.gradient": _make_block_menu(
         "Edit acquisition.gradient",
         "Finite-difference gradient controls.",
         [
-            _spec("acquisition.gradient.mode", "choice", choices=sorted(VALID_GRADIENT_MODES)),
-            _spec("acquisition.gradient.cartesian_step", "float"),
             _spec("acquisition.gradient.active_step", "float"),
             _spec("acquisition.gradient.regularization", "float"),
-            _spec("acquisition.gradient.cartesian_step_floor", "float"),
-            _spec("acquisition.gradient.ghost_mass_threshold", "float"),
             _spec("acquisition.gradient.max_acquisition_grad_per_ang", "float"),
         ],
     ),
@@ -1597,6 +1207,7 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("acquisition.barrier.clash_delta", "float"),
             _spec("acquisition.barrier.clash_lambda", "float"),
             _spec("acquisition.barrier.nonbonded_expansion_scale", "float"),
+            _spec("acquisition.barrier.nonbonded_expansion_selection_margin_ratio", "float"),
             _spec("acquisition.barrier.nonbonded_expansion_delta", "float"),
             _spec("acquisition.barrier.nonbonded_expansion_lambda", "float"),
             _spec("acquisition.barrier.bond_lower_scale", "float"),
@@ -1764,14 +1375,10 @@ def _block_submenu_item(label: str):
 
 
 _ACQUISITION_BLOCK_LABELS = (
-    "Edit acquisition core",
     "Edit acquisition.subspace",
     "Edit acquisition.weights",
     "Edit acquisition.spectral",
     "Edit acquisition.calibrated_energy",
-    "Edit acquisition.fullspace_confinement",
-    "Edit acquisition.size_normalisation",
-    "Edit acquisition.driver",
     "Edit acquisition.gradient",
     "Edit acquisition.barrier",
     "Edit acquisition.stencils",

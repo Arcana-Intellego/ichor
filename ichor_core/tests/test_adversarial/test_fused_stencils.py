@@ -1,6 +1,9 @@
 import numpy as np
+import pytest
 
 from ichor.core.adversarial.stencils import (
+    PosteriorNumericsError,
+    _stencil_from_coeffs,
     directional_all_stencils,
     directional_cubic_stencil,
     directional_curvature_stencil,
@@ -101,3 +104,26 @@ def test_directional_all_stencils_reuses_one_posterior_block():
     assert posterior.n_covariance_calls == 1
     assert bundle.means.shape == (5,)
     assert bundle.covariance.shape == (5, 5)
+
+
+def test_tiny_roundoff_negative_variance_is_clipped_to_zero():
+    result = _stencil_from_coeffs(
+        np.array([0.0]),
+        np.array([1.0]),
+        [_atoms()],
+        np.array([0.0]),
+        np.array([[-1.0e-16]]),
+    )
+
+    assert result.variance == 0.0
+
+
+def test_materially_negative_variance_fails_closed():
+    with pytest.raises(PosteriorNumericsError, match="materially negative"):
+        _stencil_from_coeffs(
+            np.array([0.0]),
+            np.array([1.0]),
+            [_atoms()],
+            np.array([0.0]),
+            np.array([[-1.0e-6]]),
+        )

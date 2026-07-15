@@ -125,15 +125,12 @@ def test_default_campaign_config_is_valid():
     assert c.error_calibration.apply_strength == 0.0
     assert c.error_calibration.group_by_atom_type is True
     assert c.error_calibration.group_by_landing_policy is False
-    assert c.acquisition.spectral.enabled is True
     assert c.acquisition.spectral.mode == "blend"
     assert c.acquisition.spectral.mode_weighting == "inverse_frequency"
-    assert c.acquisition.spectral.lambda_spectral == 1.5
+    assert not hasattr(c.acquisition.spectral, "lambda_spectral")
     assert c.acquisition.calibrated_energy.utility == "banded"
     assert c.acquisition.calibrated_energy.fallback_to_raw_variance is True
-    assert c.acquisition.fullspace_confinement.enabled is True
-    assert c.acquisition.fullspace_confinement.lambda_residual == 0.5
-    assert c.acquisition.fullspace_confinement.lambda_rmsd == 0.25
+    assert not hasattr(c.acquisition, "fullspace_confinement")
     assert c.acquisition.stencils.negative_curvature_policy == "ignore"
     assert c.acquisition.stencils.lambda_negative_curvature == 1.0
     assert c.acquisition.stencils.weak_mode_gating_enabled is True
@@ -814,7 +811,6 @@ def test_schema_v4_geometry_payload_is_rejected_without_migration():
     payload["acquisition"]["movement_utility"] = {
         "lambda_move": 2.0,
     }
-    payload["acquisition"]["fullspace_confinement"]["rmsd_scale_ang"] = 99.0
 
     with pytest.raises(ConfigValidationError, match="requires schema_version 13"):
         CampaignConfig.from_dict(payload)
@@ -947,7 +943,7 @@ def test_anti_overlap_max_must_exceed_min():
 def test_invalid_gradient_mode_rejected():
     payload = CampaignConfig().to_dict()
     payload["acquisition"]["gradient"]["mode"] = "wave_function_magic"
-    with pytest.raises(ConfigValidationError, match="gradient.mode"):
+    with pytest.raises(ConfigValidationError, match="unknown keys"):
         CampaignConfig.from_dict(payload)
 
 
@@ -999,19 +995,18 @@ def test_exact_point_allocation_sizes_must_be_positive_integers():
         CampaignConfig.from_dict(payload)
 
 
-def test_acquisition_property_must_be_trained_property():
+def test_iqa_must_be_a_trained_property():
     payload = CampaignConfig().to_dict()
-    payload["acquisition"]["property_name"] = "iqa"
     payload["ferebus"]["properties"] = ["q00"]
-    with pytest.raises(ConfigValidationError, match="must be present"):
+    with pytest.raises(ConfigValidationError, match="must contain 'iqa'"):
         CampaignConfig.from_dict(payload)
 
 
-def test_non_iqa_active_acquisition_rejected_even_if_trained():
+def test_removed_active_acquisition_property_is_rejected():
     payload = CampaignConfig().to_dict()
     payload["acquisition"]["property_name"] = "q00"
     payload["ferebus"]["properties"] = ["iqa", "q00"]
-    with pytest.raises(ConfigValidationError, match="must be 'iqa'"):
+    with pytest.raises(ConfigValidationError, match="unknown keys"):
         CampaignConfig.from_dict(payload)
 
 

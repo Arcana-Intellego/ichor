@@ -1505,6 +1505,12 @@ def propose_recovery(
             # cached GP reference scales (so we don't recompute on resume):
             reference_scales=existing.reference_scales,
             reference_scales_iteration=existing.reference_scales_iteration,
+            reference_scales_models_version=(
+                existing.reference_scales_models_version
+            ),
+            reference_scales_model_manifest_sha256=(
+                existing.reference_scales_model_manifest_sha256
+            ),
             # alpha trend across iterations (drives the stop check):
             alpha_history=list(existing.alpha_history),
             # anti-overlap diagnostic + sacct stale-job streak counters:

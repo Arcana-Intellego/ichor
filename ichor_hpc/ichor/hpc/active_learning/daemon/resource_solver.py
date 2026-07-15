@@ -1643,25 +1643,13 @@ def _auto_cpu_target(
         return target, "aimall_wavefunction_size_parallel_atoms", extra, 0.0, "aimall_concurrent_atomic_integrations"
     if backend == "ariadne":
         grad_backend = str(getattr(config.resources, "gradient_parallel_backend", "process"))
-        mode = str(getattr(getattr(config.acquisition, "gradient", object()), "mode", "active_fd"))
-        if grad_backend == "serial" or (
-            grad_backend == "thread" and mode == "active_fd"
-        ):
+        if grad_backend == "serial":
             target = partition_min
-            reason = (
-                "ariadne_serial_gradient_backend"
-                if grad_backend == "serial"
-                else "ariadne_thread_backend_forced_serial_for_active_fd"
-            )
-        elif mode == "active_fd":
+            reason = "ariadne_serial_gradient_backend"
+        else:
             dim = int(evidence["gradient_dimension"])
             target = dim
             reason = "ariadne_active_fd_direction_workers"
-        else:
-            n_atoms = int(evidence["n_atoms"])
-            target = int(evidence["gradient_dimension"])
-            reason = "ariadne_cartesian_fd_component_workers"
-            extra["n_atoms"] = int(n_atoms)
         if target > partition_max:
             extra["cpu_cap_warning"] = "auto target capped at partition maximum"
         return min(max(target, partition_min), partition_max), reason, extra, 0.0, "ariadne_gradient_worker_model_memory"
@@ -1875,12 +1863,7 @@ def resolve_phase_resources(
         )
     elif backend == "ariadne":
         gradient_backend = str(config.resources.gradient_parallel_backend)
-        gradient_mode = str(
-            getattr(getattr(config.acquisition, "gradient", object()), "mode", "active_fd")
-        )
-        if gradient_backend == "serial" or (
-            gradient_backend == "thread" and gradient_mode == "active_fd"
-        ):
+        if gradient_backend == "serial":
             active_workers = 1
         else:
             active_workers = min(

@@ -497,6 +497,10 @@ def test_from_dict_accepts_valid_reference_scales():
     for good in (None, complete):
         payload = dict(base)
         payload["reference_scales"] = good
+        if good is not None:
+            payload["reference_scales_iteration"] = 0
+            payload["reference_scales_models_version"] = 0
+            payload["reference_scales_model_manifest_sha256"] = "a" * 64
         CampaignState.from_dict(payload)  # must not raise
 
 

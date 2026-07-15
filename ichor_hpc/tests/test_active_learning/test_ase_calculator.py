@@ -71,16 +71,15 @@ def test_forces_are_positive_alpha_gradient_in_ev_per_angstrom():
     H = _hartree_ev()
     # Use a vibrational gradient (orthogonal to rigid modes) so rigid
     # projection wouldn't change the answer in the next test.
-    M_diag = np.repeat([a.mass for a in atoms], 3)
     raw = np.zeros(9); raw[0] = 1.0; raw[4] = -2.0; raw[8] = 0.5
-    # Strip the rigid part to construct a clean vibrational gradient.
+    # Strip the rigid part with the Euclidean dual projector used for scalar
+    # gradients. A mass-weighted vector projection is not the covector
+    # condition required by rigid invariance.
     from ichor.hpc.active_learning.acquisition.rigid_projection import (
         rigid_basis,
     )
     B = rigid_basis(atoms)
-    BTMB = B.T @ (M_diag[:, None] * B)
-    coeffs = np.linalg.solve(BTMB, B.T @ (M_diag * raw))
-    grad_vib_flat = raw - B @ coeffs
+    grad_vib_flat = raw - B @ (B.T @ raw)
     grad_vib = grad_vib_flat.reshape(3, 3)
 
     acq = _stub_acquisition(lambda a: 0.0, lambda a: grad_vib)
@@ -188,6 +187,35 @@ def test_value_and_gradient_cache_avoids_double_compute():
     f = calc.get_forces(atoms)
     assert call_counter["value"] == 1
     assert call_counter["grad"] == 1
+
+
+def test_gradient_diagnostics_distinguish_raw_projected_and_capped_norms():
+    atoms = _water()
+    raw = np.array([
+        [100.0, 0.0, 0.0],
+        [-50.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0],
+    ])
+    acq = _stub_acquisition(lambda a: 0.0, lambda a: raw)
+    calc = AdversarialASECalculator(
+        acq,
+        project_rigid=True,
+        max_acquisition_grad_per_ang=5.0,
+    )
+
+    calc.get_forces(atoms)
+    diagnostics = calc.gradient_diagnostics()
+
+    assert diagnostics["last_gradient_norm_raw"] == pytest.approx(
+        np.linalg.norm(raw)
+    )
+    assert diagnostics["last_gradient_norm_post_rigid"] <= diagnostics[
+        "last_gradient_norm_raw"
+    ]
+    assert diagnostics["last_gradient_norm_post_cap"] <= 5.0 * np.sqrt(len(atoms))
+    assert diagnostics["last_gradient_norm"] == pytest.approx(
+        diagnostics["last_gradient_norm_post_cap"]
+    )
 
 
 def test_ase_atoms_to_ichor_atoms_roundtrip():

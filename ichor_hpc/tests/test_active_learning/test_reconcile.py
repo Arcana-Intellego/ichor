@@ -1916,11 +1916,15 @@ def test_propose_recovery_preserves_reference_scales_cache(tmp_path):
     state.phase = CampaignPhase.STOP_CHECK
     state.reference_scales = {"energy": 1.0e-3, "force": 1.0e-2, "omega": 1.0, "anh": 1.0, "anh_std": 1.0}
     state.reference_scales_iteration = 7
+    state.reference_scales_models_version = 6
+    state.reference_scales_model_manifest_sha256 = "a" * 64
     write_state(cd / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
     report = propose_recovery(cd)
     proposal = report.proposed_state
     assert proposal.reference_scales == {"energy": 1.0e-3, "force": 1.0e-2, "omega": 1.0, "anh": 1.0, "anh_std": 1.0}
     assert proposal.reference_scales_iteration == 7
+    assert proposal.reference_scales_models_version == 6
+    assert proposal.reference_scales_model_manifest_sha256 == "a" * 64
 
 
 def test_propose_recovery_preserves_alpha_history(tmp_path):

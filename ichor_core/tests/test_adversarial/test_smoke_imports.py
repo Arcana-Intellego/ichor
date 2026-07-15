@@ -48,10 +48,10 @@ def test_default_acquisition_config_instantiates():
     from ichor.core.adversarial import AcquisitionConfig
 
     cfg = AcquisitionConfig()
-    assert cfg.property_name == "iqa"
+    assert not hasattr(cfg, "property_name")
     assert cfg.subspace.variance_capture == pytest.approx(0.90)
-    assert cfg.gradient.mode == "cartesian_fd"
-    assert cfg.gradient.cartesian_step == pytest.approx(1.0e-4)
+    assert cfg.gradient.active_step == pytest.approx(1.0e-3)
+    assert not hasattr(cfg.gradient, "mode")
 
 
 def test_adversarial_module_path():

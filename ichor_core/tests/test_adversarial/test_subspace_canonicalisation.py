@@ -1,17 +1,22 @@
-"""M2 subspace-basis canonicalisation in adversarial.subspace.
+"""Subspace-basis canonicalisation in :mod:`adversarial.subspace`.
 
 These tests target the private helper '_canonicalise_basis' directly so that
 the verification does not require constructing a full GP posterior. The
 helper's contract: given an orthonormal basis of an r-dimensional eigenspace
 together with its eigenvalues, return a representation that is 
 (i) sign-stable per column and 
-(ii) rotation-stable within any near-degenerate eigenvalue block.
+(ii) rotation-stable within a numerically equal eigenvalue block.
 """
 import numpy as np
 import pytest
 
 from ichor.core.adversarial.config import SubspaceConfig
-from ichor.core.adversarial.subspace import _canonicalise_basis
+from ichor.core.adversarial.geometry import Neighbour
+from ichor.core.adversarial.subspace import (
+    _canonicalise_basis,
+    build_local_subspace,
+)
+from ichor.core.atoms import Atom, Atoms
 
 
 def _orthonormalise(M):
@@ -123,6 +128,23 @@ def test_canonicalisation_preserves_orthonormality():
     np.testing.assert_allclose(gram, np.eye(5), atol=1.0e-10)
 
 
+def test_near_but_unequal_eigenvalues_are_not_rotated():
+    """A user degeneracy tolerance must not corrupt a diagonal eigensystem."""
+    rng = np.random.default_rng(41)
+    basis = _orthonormalise(rng.standard_normal((9, 2)))
+    eigenvalues = np.array([2.0, 2.0 - 1.0e-8])
+
+    canonical = _canonicalise_basis(
+        basis,
+        eigenvalues,
+        degeneracy_tolerance=1.0e-3,
+    )
+
+    before = basis @ np.diag(eigenvalues) @ basis.T
+    after = canonical @ np.diag(eigenvalues) @ canonical.T
+    np.testing.assert_allclose(after, before, atol=1.0e-12, rtol=1.0e-12)
+
+
 def test_degenerate_block_is_stable_when_leading_cartesian_probes_have_zero_rank():
     basis = np.zeros((8, 2), dtype=float)
     basis[5, 0] = 1.0
@@ -148,3 +170,32 @@ def test_degenerate_block_is_stable_when_leading_cartesian_probes_have_zero_rank
     )
 
     np.testing.assert_allclose(canonical, rotated, atol=1.0e-12)
+
+
+def test_rank_one_covariance_does_not_invent_null_modes(monkeypatch):
+    seed = Atoms([Atom("H", 0.0, 0.0, 0.0)])
+    neighbours = [
+        Neighbour(
+            index=index,
+            atoms=Atoms([Atom("H", float(index), 0.0, 0.0)]),
+            aligned_distance=float(index),
+        )
+        for index in (1, 2, 3)
+    ]
+    monkeypatch.setattr(
+        "ichor.core.adversarial.subspace.aligned_mass_weighted_displacement",
+        lambda reference, mobile: np.array(
+            [float(mobile.coordinates[0, 0]), 0.0, 0.0]
+        ),
+    )
+
+    subspace = build_local_subspace(
+        seed,
+        neighbours,
+        SubspaceConfig(min_subspace_dim=3, max_subspace_dim=6),
+    )
+
+    assert subspace.numerical_rank == 1
+    assert subspace.dimension == 1
+    assert subspace.rank_limited_below_minimum is True
+    assert np.all(subspace.eigenvalues > 0.0)

@@ -174,6 +174,8 @@ class AriadneRunResult:
             "final_coordinates": np.asarray(self.final_atoms.coordinates).tolist(),
             "atom_types": [a.type for a in self.initial_atoms],
             "alpha_trajectory": list(self.alpha_trajectory),
+            "full_score_trajectory": list(self.alpha_trajectory),
+            "objective_namespace": "mature_full_acquisition",
             "alpha_initial": self.alpha_initial,
             "alpha_final": self.alpha_final,
             "grad_norm_trajectory": list(self.grad_norm_trajectory),
@@ -799,7 +801,9 @@ def _candidate_public(candidate: Dict[str, Any]) -> Dict[str, Any]:
         "metrics": dict(candidate.get("metrics") or {}),
         "alpha": _safe_float_or_none(candidate.get("alpha")),
         "alpha_full": _safe_float_or_none(candidate.get("alpha_full")),
-        "alpha_driver": _safe_float_or_none(candidate.get("alpha_driver")),
+        "alpha_optimizer": _safe_float_or_none(
+            (candidate.get("metrics") or {}).get("alpha_optimizer")
+        ),
         "grad_norm": _safe_float_or_none(candidate.get("grad_norm")),
         "informativeness_score": _safe_float_or_none(
             candidate.get("informativeness_score")
@@ -899,10 +903,9 @@ def _evaluate_landing_candidate(
         metrics["whitened_distance"] = None
 
     try:
-        driver_alpha = _safe_float_or_none(alpha)
-        if driver_alpha is not None:
-            metrics["alpha_driver"] = float(driver_alpha)
-            metrics["alpha_optimizer"] = float(driver_alpha)
+        optimiser_alpha = _safe_float_or_none(alpha)
+        if optimiser_alpha is not None:
+            metrics["alpha_optimizer"] = float(optimiser_alpha)
         breakdown = acquisition.components(atoms)
         metrics["mean_energy_ha"] = float(breakdown.mean_energy)
         metrics["predicted_energy_delta_ha"] = float(
@@ -1076,7 +1079,6 @@ def _evaluate_landing_candidate(
         "atoms": atoms,
         "alpha": alpha_value,
         "alpha_full": alpha_value,
-        "alpha_driver": _safe_float_or_none(alpha),
         "grad_norm": grad_norm,
         "informativeness_score": informativeness,
         "risk_penalty_score": risk_penalty,
@@ -1111,7 +1113,7 @@ def _selection_prediction_diagnostics(
             {
                 "atom": str(atom),
                 "atom_type": str(diag.get("atom_type", "")),
-                "property": str(acquisition.config.property_name),
+                "property": "iqa",
                 "predicted_iqa_ha": float(diag["predicted_iqa_ha"]),
                 "raw_variance": float(diag["raw_variance"]),
             }
@@ -1136,7 +1138,7 @@ def _selection_prediction_diagnostics(
     }
     return {
         "schema_version": 1,
-        "property": str(acquisition.config.property_name),
+        "property": "iqa",
         "total_predicted_iqa_ha": float(breakdown.mean_energy),
         "total_energy_variance": float(breakdown.energy_variance),
         "raw_total_score": float(breakdown.total),
@@ -1265,7 +1267,7 @@ def _select_safe_landing(
         }
 
     seed_mean_energy = float(acquisition.posterior.mean(seed_atoms))
-    driver_initial_alpha = (
+    optimiser_trajectory_initial_alpha = (
         _safe_float_or_none(alpha_trajectory[0]) if alpha_trajectory else None
     )
     initial_alpha = _safe_float_or_none(full_initial_alpha)
@@ -1316,10 +1318,12 @@ def _select_safe_landing(
         candidate_metrics["alpha_full_initial"] = (
             None if initial_alpha is None else float(initial_alpha)
         )
-        candidate_metrics["alpha_driver_initial"] = (
-            None if driver_initial_alpha is None else float(driver_initial_alpha)
+        candidate_metrics["alpha_optimiser_initial"] = (
+            None
+            if optimiser_trajectory_initial_alpha is None
+            else float(optimiser_trajectory_initial_alpha)
         )
-        candidate_metrics["alpha_driver_candidate"] = _safe_float_or_none(
+        candidate_metrics["alpha_optimiser_candidate"] = _safe_float_or_none(
             opt_candidate_alphas[k] if k < len(opt_candidate_alphas) else None
         )
         candidate["metrics"] = candidate_metrics
@@ -1344,10 +1348,12 @@ def _select_safe_landing(
     raw_metrics["alpha_full_initial"] = (
         None if initial_alpha is None else float(initial_alpha)
     )
-    raw_metrics["alpha_driver_initial"] = (
-        None if driver_initial_alpha is None else float(driver_initial_alpha)
+    raw_metrics["alpha_optimiser_initial"] = (
+        None
+        if optimiser_trajectory_initial_alpha is None
+        else float(optimiser_trajectory_initial_alpha)
     )
-    raw_metrics["alpha_driver_candidate"] = (
+    raw_metrics["alpha_optimiser_candidate"] = (
         float(alpha_trajectory[-1]) if alpha_trajectory else None
     )
     raw_candidate["metrics"] = raw_metrics
@@ -1385,10 +1391,12 @@ def _select_safe_landing(
             candidate_metrics["alpha_full_initial"] = (
                 None if initial_alpha is None else float(initial_alpha)
             )
-            candidate_metrics["alpha_driver_initial"] = (
-                None if driver_initial_alpha is None else float(driver_initial_alpha)
+            candidate_metrics["alpha_optimiser_initial"] = (
+                None
+                if optimiser_trajectory_initial_alpha is None
+                else float(optimiser_trajectory_initial_alpha)
             )
-            candidate_metrics["alpha_driver_candidate"] = None
+            candidate_metrics["alpha_optimiser_candidate"] = None
             candidate["metrics"] = candidate_metrics
             _annotate_acquisition_improvement(candidate, initial_alpha)
             candidates.append(candidate)
@@ -1465,10 +1473,6 @@ def _select_safe_landing(
     metrics.setdefault(
         "alpha_full_initial",
         None if initial_alpha is None else float(initial_alpha),
-    )
-    metrics.setdefault(
-        "alpha_driver_initial",
-        None if driver_initial_alpha is None else float(driver_initial_alpha),
     )
     metrics.setdefault(
         "selected_alpha_delta",
@@ -1976,24 +1980,6 @@ def _live_optimise_seed(
         scale_model,
     )
     seed_alpha = float(acquisition.components(acquisition.seed_atoms).total)
-    driver_cfg = getattr(acquisition_config, "driver", None)
-    driver_enabled = bool(getattr(driver_cfg, "enabled", False))
-    driver_objective = "full"
-    if driver_enabled:
-        driver_objective = str(getattr(driver_cfg, "objective", "cheap_driver") or "cheap_driver")
-    if driver_objective not in {"full", "cheap_driver"}:
-        driver_objective = "full"
-    seed_driver_alpha = None
-    if driver_objective != "full":
-        try:
-            seed_driver_alpha = float(
-                acquisition.components(
-                    acquisition.seed_atoms,
-                    objective=driver_objective,
-                ).total
-            )
-        except Exception:
-            seed_driver_alpha = None
 
     # AdversarialASECalculator subscripts the clamp counter as a dict
     # (per_atom_acquisition_grad key). a plain dict matches that contract exactly --
@@ -2008,7 +1994,6 @@ def _live_optimise_seed(
         # honour the operator's resources.gradient_parallel_backend rather than hardcoding -- lets
         # them force "serial" on a node without fork, or for debugging (A33).
         gradient_backend=gradient_backend,
-        objective=driver_objective,
         clamp_counter=counter,
     )
 
@@ -2047,7 +2032,7 @@ def _live_optimise_seed(
                 opt_result.candidate_positions_angstrom[0],
             )
             full_initial_alpha = float(
-                acquisition.components(initial_atoms_for_scoring, objective="full").total
+                acquisition.components(initial_atoms_for_scoring).total
             )
         except Exception:
             full_initial_alpha = None
@@ -2108,7 +2093,7 @@ def _live_optimise_seed(
                     opt_result_retry.candidate_positions_angstrom[0],
                 )
                 full_initial_alpha_retry = float(
-                    acquisition.components(initial_atoms_retry, objective="full").total
+                    acquisition.components(initial_atoms_retry).total
                 )
             except Exception:
                 full_initial_alpha_retry = None
@@ -2178,18 +2163,6 @@ def _live_optimise_seed(
     except Exception:
         final_full_alpha = None
     try:
-        final_driver_alpha = (
-            None if driver_objective == "full"
-            else float(
-                acquisition.components(
-                    landing["selected_atoms"],
-                    objective=driver_objective,
-                ).total
-            )
-        )
-    except Exception:
-        final_driver_alpha = None
-    try:
         selection_diagnostics = _selection_prediction_diagnostics(
             acquisition,
             landing["selected_atoms"],
@@ -2205,14 +2178,7 @@ def _live_optimise_seed(
             None if warm_start_alpha_delta is None
             else float(warm_start_alpha_delta)
         )
-        selection_diagnostics["driver_enabled"] = bool(driver_enabled)
-        selection_diagnostics["driver_objective"] = str(driver_objective)
-        selection_diagnostics["driver_score_initial"] = (
-            None if seed_driver_alpha is None else float(seed_driver_alpha)
-        )
-        selection_diagnostics["driver_score_final"] = (
-            None if final_driver_alpha is None else float(final_driver_alpha)
-        )
+        selection_diagnostics["optimiser_objective"] = "mature_full_acquisition"
         selection_diagnostics["full_score_initial"] = float(seed_alpha)
         selection_diagnostics["full_score_optimiser_initial"] = (
             None if optimiser_initial_full_alpha is None
@@ -2220,11 +2186,6 @@ def _live_optimise_seed(
         )
         selection_diagnostics["full_score_final"] = (
             None if final_full_alpha is None else float(final_full_alpha)
-        )
-        selection_diagnostics["driver_score_delta"] = (
-            None
-            if seed_driver_alpha is None or final_driver_alpha is None
-            else float(final_driver_alpha) - float(seed_driver_alpha)
         )
         selection_diagnostics["full_score_delta"] = (
             None
@@ -2239,6 +2200,7 @@ def _live_optimise_seed(
         gradient_diagnostics = calculator_gradient_diagnostics(calculator)
     except Exception:
         gradient_diagnostics = None
+    calculator.close()
 
     return AriadneRunResult(
         initial_atoms=acquisition.seed_atoms,
@@ -2511,26 +2473,25 @@ def main(argv=None) -> int:
 
     protocol_dir = active_protocol_dir(iter_dir)
     rs_path = protocol_dir / "reference_scales.json"
-    external_reference_scales = None
-    if rs_path.is_file():
-        try:
-            with open(rs_path, "r", encoding="utf-8") as f:
-                external_reference_scales = json.load(f)
-            required = ("energy", "force", "omega", "anh", "anh_std")
-            if not isinstance(external_reference_scales, dict):
-                raise ValueError("reference_scales.json must contain an object")
-            for key in required:
-                value = float(external_reference_scales[key])
-                if not np.isfinite(value) or value <= 0.0:
-                    raise ValueError(
-                        "reference scale " + key + " must be finite and positive"
-                    )
-        except (OSError, KeyError, ValueError):
-            print(
-                "reference_scales.json invalid at " + str(rs_path),
-                file=_sys.stderr,
-            )
-            return 3
+    try:
+        from ..reference_scale_snapshot import read_reference_scale_snapshot
+
+        reference_scale_snapshot = read_reference_scale_snapshot(
+            rs_path,
+            expected_iteration=int(args.iteration),
+        )
+        external_reference_scales = dict(reference_scale_snapshot["values"])
+    except Exception as exc:
+        print(
+            "reference_scales.json invalid at "
+            + str(rs_path)
+            + ": "
+            + type(exc).__name__
+            + ": "
+            + str(exc),
+            file=_sys.stderr,
+        )
+        return 3
 
     try:
         from ..sampling_protocol import load_sampling_protocol
@@ -2681,6 +2642,10 @@ def main(argv=None) -> int:
             trqn_backtransform_mode=ariadne_run_config.trqn_backtransform_mode,
             trqn_geodesic_bt_mode=ariadne_run_config.trqn_geodesic_bt_mode,
         )
+    finally:
+        from .ase_calculator import close_open_gradient_calculators
+
+        close_open_gradient_calculators()
 
     payload = result.to_dict()
     payload["seed_frame_id"] = seed_frame_id
@@ -2690,6 +2655,15 @@ def main(argv=None) -> int:
     payload["iteration"] = int(args.iteration)
     payload["trajectory_sha256"] = str(pool.sha256)
     payload["randomness"] = ariadne_rng.to_dict()
+    payload["reference_scale_snapshot"] = {
+        "iteration": int(reference_scale_snapshot["iteration"]),
+        "source_iteration": int(reference_scale_snapshot["source_iteration"]),
+        "models_version": int(reference_scale_snapshot["models_version"]),
+        "model_set_manifest_sha256": str(
+            reference_scale_snapshot["model_set_manifest_sha256"]
+        ),
+        "values_sha256": str(reference_scale_snapshot["values_sha256"]),
+    }
 
     payload["sampling_protocol"] = {
         "sampling_aggressiveness": int(resolved_protocol.sampling_aggressiveness),

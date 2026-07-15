@@ -27,6 +27,8 @@ def test_fresh_state_has_defaults():
     assert s.campaign_uid
     assert s.campaign_started_iso
     assert s.replacement_round == 0
+    assert s.reference_scales_models_version == -1
+    assert s.reference_scales_model_manifest_sha256 is None
 
 
 def test_state_roundtrip(tmp_path):
@@ -105,6 +107,7 @@ def test_read_state_rejects_wrong_schema_version(tmp_path):
     [
         ("schema_version", None, "schema_version"),
         ("reference_scales_iteration", None, "reference_scales_iteration"),
+        ("reference_scales_models_version", None, "reference_scales_models_version"),
         ("last_n_anti_overlap_flagged", "abc", "last_n_anti_overlap_flagged"),
         ("replacement_round", None, "replacement_round"),
     ],
@@ -169,6 +172,7 @@ def test_read_state_rejects_non_string_pending_job_value(tmp_path):
         ("models_version", -2, "models_version"),
         ("stop_streak", -1, "stop_streak"),
         ("reference_scales_iteration", -2, "reference_scales_iteration"),
+        ("reference_scales_models_version", -2, "reference_scales_models_version"),
         ("last_n_anti_overlap_flagged", -1, "last_n_anti_overlap_flagged"),
     ],
 )
@@ -207,6 +211,21 @@ def test_state_is_terminal_flag():
     assert s.is_terminal
     s.phase = CampaignPhase.HALTED
     assert s.is_terminal
+
+
+def test_reference_scale_cache_requires_complete_model_identity():
+    payload = fresh_campaign_state().to_dict()
+    payload["reference_scales"] = {
+        "energy": 1.0,
+        "force": 1.0,
+        "omega": 1.0,
+        "anh": 1.0,
+        "anh_std": 1.0,
+    }
+    payload["reference_scales_iteration"] = 0
+    payload["reference_scales_models_version"] = 0
+    with pytest.raises(StateSchemaError, match="model manifest SHA"):
+        CampaignState.from_dict(payload)
 
 
 # --- M15 F3: schema bump + new state fields ----------------------------

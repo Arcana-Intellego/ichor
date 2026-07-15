@@ -13,6 +13,9 @@ from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.daemon.phase_executor import BackendSubmissionError
 from ichor.hpc.active_learning.daemon.live_executor import LiveBackendsPhaseExecutor
 from ichor.hpc.active_learning.daemon.dry_run_executor import DryRunPhaseExecutor
+from ichor.hpc.active_learning.reference_scale_snapshot import (
+    read_reference_scale_snapshot,
+)
 
 
 def _make_executor(tmp_path):
@@ -23,12 +26,22 @@ def _make_executor(tmp_path):
     )
 
 
-def _state(iteration=0, models_version=-1, ref_scales=None, ref_iter=-1):
+def _state(
+    iteration=0,
+    models_version=-1,
+    ref_scales=None,
+    ref_iter=-1,
+    ref_models_version=-1,
+    ref_manifest_sha=None,
+):
     return SimpleNamespace(
         iteration=iteration,
         models_version=models_version,
         reference_scales=ref_scales,
         reference_scales_iteration=ref_iter,
+        reference_scales_models_version=ref_models_version,
+        reference_scales_model_manifest_sha256=ref_manifest_sha,
+        campaign_uid="reference-scale-test",
     )
 
 
@@ -54,16 +67,11 @@ def test_missing_models_dir_halts_by_default(tmp_path):
         ex._maybe_refresh_reference_scales(state)
 
 
-def test_missing_models_dir_bails_only_with_explicit_uniform_fallback(tmp_path):
-    cfg = CampaignConfig()
-    cfg.acquisition.allow_uniform_posterior_fallback = True
-    ex = LiveBackendsPhaseExecutor(
-        campaign_dir=tmp_path / "campaign",
-        config=cfg,
-        backend_check=False,
+def test_uniform_posterior_fallback_is_not_public_configuration():
+    assert not hasattr(
+        CampaignConfig().acquisition,
+        "allow_uniform_posterior_fallback",
     )
-    state = _state(iteration=0, models_version=0)
-    assert ex._maybe_refresh_reference_scales(state) is False
 
 
 def test_happy_path_writes_sidecar_and_journals(tmp_path):
@@ -72,6 +80,14 @@ def test_happy_path_writes_sidecar_and_journals(tmp_path):
     ex = _make_executor(tmp_path)
     models_dir = ex.campaign_dir / "TRAINED_MODELS" / "iteration-000000"
     models_dir.mkdir(parents=True, exist_ok=True)
+    from ichor.hpc.active_learning.versioning.trained_models import (
+        TRAINED_MODEL_SET_FILENAME,
+    )
+
+    (models_dir / TRAINED_MODEL_SET_FILENAME).write_text(
+        '{"test": true}\n',
+        encoding="utf-8",
+    )
     pool_xyz = ex.campaign_dir / "pool.xyz"
     pool_xyz.parent.mkdir(parents=True, exist_ok=True)
     xyz_content = "3" + chr(10)
@@ -111,8 +127,13 @@ def test_happy_path_writes_sidecar_and_journals(tmp_path):
         / "iteration-000001" / "protocol" / "reference_scales.json"
     )
     assert sidecar.is_file()
-    persisted = json.loads(sidecar.read_text(encoding="utf-8"))
-    assert persisted == fake_scales
+    persisted = read_reference_scale_snapshot(sidecar, expected_iteration=1)
+    assert persisted["values"] == fake_scales
+    assert persisted["source_iteration"] == 1
+    assert persisted["models_version"] == 0
+    assert state.reference_scales_model_manifest_sha256 == persisted[
+        "model_set_manifest_sha256"
+    ]
     journal = (
         ex.campaign_dir / ".DATA"
         / "ACTIVE_LEARNING" / "journal.ndjson"
@@ -137,3 +158,44 @@ def test_dry_path_still_returns_synthetic_stub(tmp_path):
     assert set(state.reference_scales.keys()) == {
         "energy", "force", "omega", "anh", "anh_std",
     }
+    sidecar = (
+        ex.campaign_dir
+        / "ACTIVE_LEARNING"
+        / "iteration-000001"
+        / "protocol"
+        / "reference_scales.json"
+    )
+    snapshot = read_reference_scale_snapshot(sidecar, expected_iteration=1)
+    assert snapshot["values"] == state.reference_scales
+
+
+def test_cached_scales_are_materialised_for_non_refresh_iteration(tmp_path):
+    ex = _make_executor(tmp_path)
+    scales = {
+        "energy": 0.001,
+        "force": 0.01,
+        "omega": 1.0,
+        "anh": 1.0,
+        "anh_std": 1.0,
+    }
+    digest = "a" * 64
+    state = _state(
+        iteration=2,
+        models_version=1,
+        ref_scales=scales,
+        ref_iter=1,
+        ref_models_version=0,
+        ref_manifest_sha=digest,
+    )
+    assert ex._maybe_refresh_reference_scales(state) is False
+    sidecar = (
+        ex.campaign_dir
+        / "ACTIVE_LEARNING"
+        / "iteration-000002"
+        / "protocol"
+        / "reference_scales.json"
+    )
+    snapshot = read_reference_scale_snapshot(sidecar, expected_iteration=2)
+    assert snapshot["source_iteration"] == 1
+    assert snapshot["models_version"] == 0
+    assert snapshot["model_set_manifest_sha256"] == digest

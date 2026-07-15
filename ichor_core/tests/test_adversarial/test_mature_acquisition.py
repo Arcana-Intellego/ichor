@@ -9,6 +9,7 @@ from ichor.core.adversarial.config import (
     FullspaceConfinementConfig,
     SpectralConfig,
     StencilConfig,
+    WeightConfig,
 )
 from ichor.core.adversarial.subspace import LocalSubspace, fullspace_residual_distance
 from ichor.core.atoms import Atom, Atoms
@@ -58,7 +59,7 @@ def _component_stub(mode, config=None):
         "spectral": 0.5080184931098937,
     }
     acq.posterior = _Posterior()
-    acq.subspace = SimpleNamespace(mode_weights=np.array([1.0]))
+    acq.subspace = SimpleNamespace(mode_weights=np.array([1.0]), dimension=1)
     acq.seed_atoms = Atoms([Atom("O", 0.0, 0.0, 0.0)])
     acq.barrier_state = None
     acq._mode_metrics = lambda atoms, mean_energy=None: (mode,)
@@ -76,7 +77,6 @@ def test_spectral_inverse_frequency_weights_favour_soft_modes():
     acq = _stub_acq(
         AcquisitionConfig(
             spectral=SpectralConfig(
-                enabled=True,
                 mode="blend",
                 mode_weighting="inverse_frequency",
                 omega_floor=1.0e-6,
@@ -86,6 +86,41 @@ def test_spectral_inverse_frequency_weights_favour_soft_modes():
     weights = acq._spectral_mode_weights((_mode(0, 0.1), _mode(1, 10.0)))
     assert weights[0] > weights[1]
     assert sum(weights) == pytest.approx(1.0)
+
+
+def test_lambda_frequency_is_the_only_outer_spectral_coefficient(monkeypatch):
+    monkeypatch.setattr(
+        "ichor.core.adversarial.acquisition.whitened_distance_squared",
+        lambda *args, **kwargs: 0.0,
+    )
+    monkeypatch.setattr(
+        "ichor.core.adversarial.acquisition.chemistry_barrier_value",
+        lambda *args, **kwargs: 0.0,
+    )
+
+    def score(coefficient):
+        config = AcquisitionConfig(
+            weights=WeightConfig(
+                lambda_force=0.0,
+                lambda_frequency=float(coefficient),
+                lambda_anharmonic=0.0,
+                lambda_energy=0.0,
+                lambda_distance=0.0,
+            )
+        )
+        return _component_stub(_mode(0, 1.0), config).components(
+            Atoms([Atom("O", 0.0, 0.0, 0.0)]),
+            include_movement=False,
+        )
+
+    once = score(1.0)
+    twice = score(2.0)
+
+    assert once.spectral_frequency_risk > 0.0
+    assert twice.spectral_frequency_risk == pytest.approx(
+        once.spectral_frequency_risk
+    )
+    assert twice.total == pytest.approx(2.0 * once.total)
 
 
 def test_banded_energy_utility_rewards_middle_uncertainty():

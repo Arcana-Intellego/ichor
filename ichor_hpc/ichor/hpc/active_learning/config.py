@@ -52,9 +52,6 @@ __all__ = [
     "AcquisitionWeightsBlock",
     "AcquisitionSpectralBlock",
     "AcquisitionCalibratedEnergyBlock",
-    "AcquisitionFullspaceConfinementBlock",
-    "AcquisitionSizeNormalisationBlock",
-    "AcquisitionDriverBlock",
     "AcquisitionGradientBlock",
     "AcquisitionReferencesBlock",
     "AcquisitionConfigBlock",
@@ -78,15 +75,9 @@ __all__ = [
     "VALID_GEOMETRY_NOVELTY_STATISTICS",
     "VALID_SEED_SELECTION_STRATEGIES",
     "VALID_D_OPTIMAL_DEGENERATE_POLICIES",
-    "VALID_GRADIENT_MODES",
     "VALID_MODE_WEIGHTING_POLICIES",
     "VALID_SPECTRAL_MODES",
     "VALID_CALIBRATED_ENERGY_UTILITIES",
-    "VALID_SIZE_NORMALISATION_ENERGY_MODES",
-    "VALID_SIZE_NORMALISATION_DISTANCE_MODES",
-    "VALID_SIZE_NORMALISATION_BARRIER_MODES",
-    "VALID_ACQUISITION_DRIVER_OBJECTIVES",
-    "VALID_ACQUISITION_DRIVER_GRADIENT_BACKENDS",
     "VALID_TRQN_SCALE_MODES",
     "VALID_TRQN_BACKTRANSFORM_MODES",
     "VALID_TRQN_GEODESIC_BT_MODES",
@@ -161,17 +152,11 @@ VALID_GEOMETRY_NOVELTY_SCALE_SOURCES = frozenset({
 VALID_GEOMETRY_NOVELTY_STATISTICS = frozenset({"p25", "median", "p75"})
 VALID_SEED_SELECTION_STRATEGIES = frozenset({"hybrid_variance", "d_optimal"})
 VALID_D_OPTIMAL_DEGENERATE_POLICIES = frozenset({"fail", "score_backfill"})
-VALID_GRADIENT_MODES = frozenset({"cartesian_fd", "active_fd"})
 VALID_MODE_WEIGHTING_POLICIES = frozenset({"variance", "inverse_frequency", "uniform"})
-VALID_GRADIENT_PARALLEL_BACKENDS = frozenset({"serial", "thread", "process"})
+VALID_GRADIENT_PARALLEL_BACKENDS = frozenset({"serial", "process"})
 VALID_ERROR_CALIBRATION_MODES = frozenset({"record_only", "apply_to_acquisition"})
 VALID_SPECTRAL_MODES = frozenset({"off", "record_only", "blend"})
 VALID_CALIBRATED_ENERGY_UTILITIES = frozenset({"log", "banded"})
-VALID_SIZE_NORMALISATION_ENERGY_MODES = frozenset({"raw_total", "per_sqrt_atom"})
-VALID_SIZE_NORMALISATION_DISTANCE_MODES = frozenset({"raw", "per_subspace_dim"})
-VALID_SIZE_NORMALISATION_BARRIER_MODES = frozenset({"raw_sum", "family_mean"})
-VALID_ACQUISITION_DRIVER_OBJECTIVES = frozenset({"cheap_driver", "full"})
-VALID_ACQUISITION_DRIVER_GRADIENT_BACKENDS = frozenset({"fd", "hybrid_geometry"})
 VALID_TRQN_SCALE_MODES = frozenset({
     "off",
     "fixed",
@@ -283,7 +268,6 @@ _STRICTLY_POSITIVE_NUMERIC_PATHS = frozenset({
     "acquisition.stencils.curvature_floor",
     "acquisition.stencils.softplus_scale",
     "acquisition.spectral.omega_floor",
-    "acquisition.gradient.cartesian_step",
     "acquisition.gradient.active_step",
     "acquisition.gradient.max_acquisition_grad_per_ang",
     "acquisition.references.max_reference_samples",
@@ -441,6 +425,7 @@ class AcquisitionBarrierBlock:
     clash_delta: float = 0.05
     clash_lambda: float = 5.0
     nonbonded_expansion_scale: float = 1.80
+    nonbonded_expansion_selection_margin_ratio: float = 0.10
     nonbonded_expansion_delta: float = 0.10
     nonbonded_expansion_lambda: float = 0.5
     bond_lower_scale: float = 0.80
@@ -487,15 +472,12 @@ class AcquisitionWeightsBlock:
     lambda_frequency: float = 1.0
     lambda_anharmonic: float = 0.75
     lambda_energy: float = 0.15
-    lambda_distance: float = 1.0
 
 
 @dataclass
 class AcquisitionSpectralBlock:
-    enabled: bool = True
     mode: str = "blend"
     mode_weighting: str = "inverse_frequency"
-    lambda_spectral: float = 1.5
     omega_floor: float = 1.0e-6
     low_frequency_power: float = 1.0
     max_modes: Optional[int] = None
@@ -512,48 +494,9 @@ class AcquisitionCalibratedEnergyBlock:
 
 
 @dataclass
-class AcquisitionFullspaceConfinementBlock:
-    enabled: bool = True
-    lambda_residual: float = 0.5
-    lambda_rmsd: float = 0.25
-
-
-@dataclass
-class AcquisitionSizeNormalisationBlock:
-    enabled: bool = True
-    energy_mode: str = "per_sqrt_atom"
-    whitened_distance_mode: str = "per_subspace_dim"
-    chemistry_barrier_mode: str = "family_mean"
-
-
-@dataclass
-class AcquisitionDriverBlock:
-    enabled: bool = False
-    objective: str = "cheap_driver"
-    gradient_backend: str = "fd"
-    include_stencils: bool = False
-    analytic_movement: bool = True
-    analytic_whitened_distance: bool = True
-    analytic_pair_barriers: bool = True
-    analytic_fullspace_rmsd: bool = True
-    finite_difference_energy: bool = True
-    analytic_validation: bool = False
-    analytic_validation_tol_cosine: float = 0.98
-    lambda_energy: float = 1.0
-    lambda_movement: float = 1.0
-    lambda_distance: float = 1.0
-    lambda_fullspace: float = 1.0
-    lambda_chemistry: float = 1.0
-
-
-@dataclass
 class AcquisitionGradientBlock:
-    mode: str = "cartesian_fd"
-    cartesian_step: float = 1.0e-4
     active_step: float = 1.0e-3
     regularization: float = 1.0e-10
-    cartesian_step_floor: float = 0.0
-    ghost_mass_threshold: float = 0.0
     max_acquisition_grad_per_ang: float = 50.0
 
 
@@ -567,18 +510,12 @@ class AcquisitionReferencesBlock:
 
 @dataclass
 class AcquisitionConfigBlock:
-    property_name: str = "iqa"
-    use_scaled_posterior_covariance: bool = True
-    allow_uniform_posterior_fallback: bool = False
     subspace: AcquisitionSubspaceBlock = field(default_factory=AcquisitionSubspaceBlock)
     barrier: AcquisitionBarrierBlock = field(default_factory=AcquisitionBarrierBlock)
     stencils: AcquisitionStencilsBlock = field(default_factory=AcquisitionStencilsBlock)
     weights: AcquisitionWeightsBlock = field(default_factory=AcquisitionWeightsBlock)
     spectral: AcquisitionSpectralBlock = field(default_factory=AcquisitionSpectralBlock)
     calibrated_energy: AcquisitionCalibratedEnergyBlock = field(default_factory=AcquisitionCalibratedEnergyBlock)
-    fullspace_confinement: AcquisitionFullspaceConfinementBlock = field(default_factory=AcquisitionFullspaceConfinementBlock)
-    size_normalisation: AcquisitionSizeNormalisationBlock = field(default_factory=AcquisitionSizeNormalisationBlock)
-    driver: AcquisitionDriverBlock = field(default_factory=AcquisitionDriverBlock)
     gradient: AcquisitionGradientBlock = field(default_factory=AcquisitionGradientBlock)
     references: AcquisitionReferencesBlock = field(default_factory=AcquisitionReferencesBlock)
 
@@ -1749,16 +1686,9 @@ class CampaignConfig:
                     + repr(sorted(valid_ferebus_props))
                 )
             seen_props.add(prop)
-        if self.acquisition.property_name not in seen_props:
+        if "iqa" not in seen_props:
             raise ConfigValidationError(
-                "acquisition.property_name "
-                + repr(self.acquisition.property_name)
-                + " must be present in ferebus.properties"
-            )
-        if self.acquisition.property_name != "iqa":
-            raise ConfigValidationError(
-                "acquisition.property_name must be 'iqa' for this daemon patch series; "
-                "multipoles may be trained in ferebus.properties but are not valid acquisition targets yet"
+                "ferebus.properties must contain 'iqa'; active acquisition is fixed to IQA"
             )
         qg = self.quality_gates
         for bool_name in (
@@ -2015,6 +1945,10 @@ class CampaignConfig:
             raise ConfigValidationError(
                 "acquisition.subspace.min_subspace_dim must be <= max_subspace_dim"
             )
+        if self.acquisition.subspace.max_subspace_dim > 6:
+            raise ConfigValidationError(
+                "acquisition.subspace.max_subspace_dim must be <= 6"
+            )
         if (
             self.acquisition.subspace.neighbour_count
             < self.acquisition.subspace.max_subspace_dim
@@ -2032,15 +1966,6 @@ class CampaignConfig:
         ) <= 0.0:
             raise ConfigValidationError(
                 "acquisition.subspace.gaussian_weight_sigma must be > 0 or null"
-            )
-        if self.acquisition.gradient.mode not in VALID_GRADIENT_MODES:
-            raise ConfigValidationError(
-                "acquisition.gradient.mode must be one of "
-                + repr(sorted(VALID_GRADIENT_MODES))
-            )
-        if not isinstance(self.acquisition.allow_uniform_posterior_fallback, bool):
-            raise ConfigValidationError(
-                "acquisition.allow_uniform_posterior_fallback must be a boolean"
             )
         stencils = self.acquisition.stencils
         if float(stencils.max_step) < float(stencils.min_step):
@@ -2066,6 +1991,7 @@ class CampaignConfig:
             ("acquisition.barrier.clash_delta", ba.clash_delta),
             ("acquisition.barrier.clash_lambda", ba.clash_lambda),
             ("acquisition.barrier.nonbonded_expansion_scale", ba.nonbonded_expansion_scale),
+            ("acquisition.barrier.nonbonded_expansion_selection_margin_ratio", ba.nonbonded_expansion_selection_margin_ratio),
             ("acquisition.barrier.nonbonded_expansion_delta", ba.nonbonded_expansion_delta),
             ("acquisition.barrier.nonbonded_expansion_lambda", ba.nonbonded_expansion_lambda),
             ("acquisition.barrier.bond_lower_scale", ba.bond_lower_scale),
@@ -2106,8 +2032,6 @@ class CampaignConfig:
                 + repr(sorted(VALID_MODE_WEIGHTING_POLICIES))
             )
         spectral = self.acquisition.spectral
-        if not isinstance(spectral.enabled, bool):
-            raise ConfigValidationError("acquisition.spectral.enabled must be a boolean")
         if spectral.mode not in VALID_SPECTRAL_MODES:
             raise ConfigValidationError(
                 "acquisition.spectral.mode must be one of "
@@ -2119,13 +2043,10 @@ class CampaignConfig:
                 + repr(sorted(VALID_MODE_WEIGHTING_POLICIES))
             )
         for name, value in (
-            ("acquisition.spectral.lambda_spectral", spectral.lambda_spectral),
             ("acquisition.spectral.omega_floor", spectral.omega_floor),
             ("acquisition.spectral.low_frequency_power", spectral.low_frequency_power),
         ):
             _validate_optional_nonnegative_float(name, value)
-        if spectral.lambda_spectral < 0.0:
-            raise ConfigValidationError("acquisition.spectral.lambda_spectral must be >= 0")
         if spectral.omega_floor <= 0.0:
             raise ConfigValidationError("acquisition.spectral.omega_floor must be > 0")
         if spectral.max_modes is not None:
@@ -2167,79 +2088,6 @@ class CampaignConfig:
             if value is not None and float(value) <= 0.0:
                 raise ConfigValidationError(name + " must be > 0")
 
-        fullspace = self.acquisition.fullspace_confinement
-        if not isinstance(fullspace.enabled, bool):
-            raise ConfigValidationError(
-                "acquisition.fullspace_confinement.enabled must be a boolean"
-            )
-        for name, value in (
-            ("acquisition.fullspace_confinement.lambda_residual", fullspace.lambda_residual),
-            ("acquisition.fullspace_confinement.lambda_rmsd", fullspace.lambda_rmsd),
-        ):
-            _validate_optional_nonnegative_float(name, value)
-        norm = self.acquisition.size_normalisation
-        if not isinstance(norm.enabled, bool):
-            raise ConfigValidationError(
-                "acquisition.size_normalisation.enabled must be a boolean"
-            )
-        if norm.energy_mode not in VALID_SIZE_NORMALISATION_ENERGY_MODES:
-            raise ConfigValidationError(
-                "acquisition.size_normalisation.energy_mode must be one of "
-                + repr(sorted(VALID_SIZE_NORMALISATION_ENERGY_MODES))
-            )
-        if norm.whitened_distance_mode not in VALID_SIZE_NORMALISATION_DISTANCE_MODES:
-            raise ConfigValidationError(
-                "acquisition.size_normalisation.whitened_distance_mode must be one of "
-                + repr(sorted(VALID_SIZE_NORMALISATION_DISTANCE_MODES))
-            )
-        if norm.chemistry_barrier_mode not in VALID_SIZE_NORMALISATION_BARRIER_MODES:
-            raise ConfigValidationError(
-                "acquisition.size_normalisation.chemistry_barrier_mode must be one of "
-                + repr(sorted(VALID_SIZE_NORMALISATION_BARRIER_MODES))
-            )
-        driver = self.acquisition.driver
-        if not isinstance(driver.enabled, bool):
-            raise ConfigValidationError(
-                "acquisition.driver.enabled must be a boolean"
-            )
-        if driver.objective not in VALID_ACQUISITION_DRIVER_OBJECTIVES:
-            raise ConfigValidationError(
-                "acquisition.driver.objective must be one of "
-                + repr(sorted(VALID_ACQUISITION_DRIVER_OBJECTIVES))
-            )
-        if driver.gradient_backend not in VALID_ACQUISITION_DRIVER_GRADIENT_BACKENDS:
-            raise ConfigValidationError(
-                "acquisition.driver.gradient_backend must be one of "
-                + repr(sorted(VALID_ACQUISITION_DRIVER_GRADIENT_BACKENDS))
-            )
-        if not isinstance(driver.include_stencils, bool):
-            raise ConfigValidationError(
-                "acquisition.driver.include_stencils must be a boolean"
-            )
-        for name, value in (
-            ("acquisition.driver.analytic_movement", driver.analytic_movement),
-            ("acquisition.driver.analytic_whitened_distance", driver.analytic_whitened_distance),
-            ("acquisition.driver.analytic_pair_barriers", driver.analytic_pair_barriers),
-            ("acquisition.driver.analytic_fullspace_rmsd", driver.analytic_fullspace_rmsd),
-            ("acquisition.driver.finite_difference_energy", driver.finite_difference_energy),
-            ("acquisition.driver.analytic_validation", driver.analytic_validation),
-        ):
-            if not isinstance(value, bool):
-                raise ConfigValidationError(name + " must be a boolean")
-        if not (0.0 <= float(driver.analytic_validation_tol_cosine) <= 1.0):
-            raise ConfigValidationError(
-                "acquisition.driver.analytic_validation_tol_cosine must be in [0, 1]"
-            )
-        for name, value in (
-            ("acquisition.driver.lambda_energy", driver.lambda_energy),
-            ("acquisition.driver.lambda_movement", driver.lambda_movement),
-            ("acquisition.driver.lambda_distance", driver.lambda_distance),
-            ("acquisition.driver.lambda_fullspace", driver.lambda_fullspace),
-            ("acquisition.driver.lambda_chemistry", driver.lambda_chemistry),
-        ):
-            if value is None:
-                raise ConfigValidationError(name + " must be a number")
-            _validate_optional_nonnegative_float(name, value)
         stencils = self.acquisition.stencils
         if stencils.negative_curvature_policy not in VALID_NEGATIVE_CURVATURE_POLICIES:
             raise ConfigValidationError(
@@ -2335,31 +2183,16 @@ class CampaignConfig:
         return float(self.acquisition.gradient.max_acquisition_grad_per_ang)
 
     def to_acquisition_config(self):
-        """Materialise an ichor.core AcquisitionConfig from the nested
-        acquisition block. Enforces the subspace-dim guard (plan trap #3).
-        """
-        if (
-            self.acquisition.subspace.max_subspace_dim > 6
-            and self.acquisition.gradient.mode == "cartesian_fd"
-        ):
-            raise ConfigValidationError(
-                "acquisition.subspace.max_subspace_dim "
-                + str(self.acquisition.subspace.max_subspace_dim)
-                + " > 6 with gradient.mode == cartesian_fd would explode the"
-                " Cartesian FD gradient cost. Pin gradient.mode = active_fd"
-                " or drop max_subspace_dim to <= 6."
-            )
+        """Materialise the mandatory mature IQA acquisition contract."""
         from ichor.core.adversarial.config import (
             AcquisitionConfig,
             BarrierConfig,
             CalibratedEnergyConfig,
-            DriverConfig,
             FullspaceConfinementConfig,
             GradientConfig,
             MovementBandConfig,
             MovementUtilityConfig,
             ReferenceScaleConfig,
-            SizeNormalisationConfig,
             SpectralConfig,
             StencilConfig,
             SubspaceConfig,
@@ -2371,14 +2204,9 @@ class CampaignConfig:
         we = self.acquisition.weights
         sp = self.acquisition.spectral
         ce = self.acquisition.calibrated_energy
-        fs = self.acquisition.fullspace_confinement
-        sn = self.acquisition.size_normalisation
-        dr = self.acquisition.driver
         gr = self.acquisition.gradient
         re = self.acquisition.references
         return AcquisitionConfig(
-            property_name=self.acquisition.property_name,
-            use_scaled_posterior_covariance=self.acquisition.use_scaled_posterior_covariance,
             subspace=SubspaceConfig(
                 neighbour_count=sb.neighbour_count,
                 neighbour_deduplicate_rmsd=sb.neighbour_deduplicate_rmsd,
@@ -2397,6 +2225,7 @@ class CampaignConfig:
                 clash_delta=ba.clash_delta,
                 clash_lambda=ba.clash_lambda,
                 nonbonded_expansion_scale=ba.nonbonded_expansion_scale,
+                nonbonded_expansion_selection_margin_ratio=ba.nonbonded_expansion_selection_margin_ratio,
                 nonbonded_expansion_delta=ba.nonbonded_expansion_delta,
                 nonbonded_expansion_lambda=ba.nonbonded_expansion_lambda,
                 bond_lower_scale=ba.bond_lower_scale,
@@ -2436,13 +2265,10 @@ class CampaignConfig:
                 lambda_frequency=we.lambda_frequency,
                 lambda_anharmonic=we.lambda_anharmonic,
                 lambda_energy=we.lambda_energy,
-                lambda_distance=we.lambda_distance,
             ),
             spectral=SpectralConfig(
-                enabled=sp.enabled,
                 mode=sp.mode,
                 mode_weighting=sp.mode_weighting,
-                lambda_spectral=sp.lambda_spectral,
                 omega_floor=sp.omega_floor,
                 low_frequency_power=sp.low_frequency_power,
                 max_modes=sp.max_modes,
@@ -2456,21 +2282,12 @@ class CampaignConfig:
                 fallback_to_raw_variance=ce.fallback_to_raw_variance,
             ),
             fullspace_confinement=FullspaceConfinementConfig(
-                enabled=fs.enabled,
-                lambda_residual=fs.lambda_residual,
-                lambda_rmsd=fs.lambda_rmsd,
                 residual_scale=FULLSPACE_RESIDUAL_SCALE,
                 fixed_residual_scale_ang=FULLSPACE_FIXED_RESIDUAL_SCALE_ANGSTROM,
                 rmsd_scale_ang=FULLSPACE_RMSD_SCALE_MULTIPLIER
                 * self.geometry_novelty.fallback_scale_angstrom,
                 min_residual_scale_ang=FULLSPACE_MIN_RESIDUAL_SCALE_ANGSTROM,
                 failure_penalty=FULLSPACE_FAILURE_PENALTY,
-            ),
-            size_normalisation=SizeNormalisationConfig(
-                enabled=sn.enabled,
-                energy_mode=sn.energy_mode,
-                whitened_distance_mode=sn.whitened_distance_mode,
-                chemistry_barrier_mode=sn.chemistry_barrier_mode,
             ),
             movement_band=MovementBandConfig(
                 enabled=MOVEMENT_BAND_ENABLED,
@@ -2518,31 +2335,9 @@ class CampaignConfig:
                     * self.geometry_novelty.fallback_scale_angstrom
                 ),
             ),
-            driver=DriverConfig(
-                enabled=dr.enabled,
-                objective=dr.objective,
-                gradient_backend=dr.gradient_backend,
-                include_stencils=dr.include_stencils,
-                analytic_movement=dr.analytic_movement,
-                analytic_whitened_distance=dr.analytic_whitened_distance,
-                analytic_pair_barriers=dr.analytic_pair_barriers,
-                analytic_fullspace_rmsd=dr.analytic_fullspace_rmsd,
-                finite_difference_energy=dr.finite_difference_energy,
-                analytic_validation=dr.analytic_validation,
-                analytic_validation_tol_cosine=dr.analytic_validation_tol_cosine,
-                lambda_energy=dr.lambda_energy,
-                lambda_movement=dr.lambda_movement,
-                lambda_distance=dr.lambda_distance,
-                lambda_fullspace=dr.lambda_fullspace,
-                lambda_chemistry=dr.lambda_chemistry,
-            ),
             gradient=GradientConfig(
-                mode=gr.mode,
-                cartesian_step=gr.cartesian_step,
                 active_step=gr.active_step,
                 regularization=gr.regularization,
-                cartesian_step_floor=gr.cartesian_step_floor,
-                ghost_mass_threshold=gr.ghost_mass_threshold,
             ),
             references=ReferenceScaleConfig(
                 max_reference_samples=re.max_reference_samples,

@@ -36,9 +36,7 @@ def _posterior_diagnostics(acquisition) -> Dict[str, int]:
 
 
 def static_gradient_diagnostics(acquisition, atoms=None, *, gradient_mode=None, gradient_backend=None) -> Dict[str, Any]:
-    config = getattr(acquisition, "config", None)
-    gradient_config = getattr(config, "gradient", None)
-    mode = str(gradient_mode or getattr(gradient_config, "mode", "") or "")
+    mode = "active_fd"
     raw_directions = getattr(acquisition, "mode_directions", ())
     directions = tuple(raw_directions) if raw_directions is not None else ()
     subspace_dim = len(directions)
@@ -51,20 +49,7 @@ def static_gradient_diagnostics(acquisition, atoms=None, *, gradient_mode=None, 
             natoms = 0
         n_cartesian_dof = 3 * natoms
     live_cartesian_dof = n_cartesian_dof
-    if mode == "cartesian_fd" and atoms is not None:
-        setup = getattr(acquisition, "_fd_indices_eps", None)
-        if callable(setup):
-            try:
-                indices, _flat, _eps, _shape = setup(atoms)
-                live_cartesian_dof = len(indices)
-            except Exception:
-                live_cartesian_dof = n_cartesian_dof
-    if mode == "active_fd":
-        estimated_calls = 2 * subspace_dim
-    elif mode == "cartesian_fd":
-        estimated_calls = 2 * live_cartesian_dof
-    else:
-        estimated_calls = None
+    estimated_calls = 2 * subspace_dim
     return {
         "schema_version": 1,
         "gradient_mode": mode or None,
@@ -99,6 +84,11 @@ def calculator_gradient_diagnostics(calculator) -> Dict[str, Any]:
         "gradient_wall_seconds_mean",
         "gradient_wall_seconds_max",
         "last_gradient_norm",
+        "last_gradient_norm_raw",
+        "last_gradient_norm_post_rigid",
+        "last_gradient_norm_post_cap",
+        "last_gradient_clamp_scale",
+        "last_force_norm_ev_per_ang",
     ):
         if key in out:
             out[key] = _finite_float(out.get(key), 0.0)
@@ -116,12 +106,6 @@ def calculator_gradient_diagnostics(calculator) -> Dict[str, Any]:
             out[key] = _finite_int(out.get(key), 0)
     if "inside_gradient_worker" in out:
         out["inside_gradient_worker"] = bool(out.get("inside_gradient_worker"))
-    if "driver_gradient_fallback" in out:
-        out["driver_gradient_fallback"] = bool(out.get("driver_gradient_fallback"))
-    for key in ("driver_gradient_terms", "driver_gradient_reasons"):
-        value = out.get(key)
-        if isinstance(value, (list, tuple)):
-            out[key] = [str(item) for item in value[:12]]
     posterior = out.get("posterior_diagnostics")
     if isinstance(posterior, Mapping):
         out["posterior_diagnostics"] = {
@@ -137,10 +121,6 @@ def flatten_trace_gradient_diagnostics(data: Mapping[str, Any]) -> Dict[str, Any
         "gradient_mode",
         "gradient_objective",
         "gradient_backend",
-        "driver_gradient_backend",
-        "driver_gradient_mode",
-        "driver_gradient_fallback",
-        "driver_gradient_fallback_reason",
         "workers_requested",
         "workers_used",
         "inside_gradient_worker",
@@ -156,18 +136,14 @@ def flatten_trace_gradient_diagnostics(data: Mapping[str, Any]) -> Dict[str, Any
         "gradient_wall_seconds_mean",
         "gradient_wall_seconds_max",
         "last_gradient_norm",
+        "last_gradient_norm_raw",
+        "last_gradient_norm_post_rigid",
+        "last_gradient_norm_post_cap",
+        "last_gradient_clamp_scale",
+        "last_force_norm_ev_per_ang",
     ):
         if key in data:
             out[key] = data[key]
-    for key in ("driver_gradient_terms", "driver_gradient_reasons"):
-        value = data.get(key)
-        if isinstance(value, (list, tuple)):
-            out[key] = ",".join(str(item) for item in value[:12])
-    if "driver_gradient_validation_cosine" in data:
-        out["driver_gradient_validation_cosine"] = _finite_float(
-            data.get("driver_gradient_validation_cosine"),
-            None,
-        )
     posterior = data.get("posterior_diagnostics")
     if isinstance(posterior, Mapping):
         for key in (

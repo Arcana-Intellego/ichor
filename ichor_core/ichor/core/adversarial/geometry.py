@@ -172,11 +172,14 @@ def kabsch_align(reference: np.ndarray, mobile: np.ndarray, weights: np.ndarray 
         w = np.asarray(weights, dtype=float).reshape(-1, 1)
         cov = (w * mob0).T @ ref0
 
-    u, _, vt = np.linalg.svd(cov)
-    rot = vt.T @ u.T
+    u, _, vt = np.linalg.svd(cov, full_matrices=False)
+    # Coordinates are row vectors and cov = mobile.T @ reference, so the
+    # minimising map is U @ Vt.  V @ U.T is its inverse and makes a rigidly
+    # rotated geometry look deformed.
+    rot = u @ vt
     if np.linalg.det(rot) < 0.0:
-        vt[-1, :] *= -1.0
-        rot = vt.T @ u.T
+        u[:, -1] *= -1.0
+        rot = u @ vt
     aligned = mob0 @ rot + ref_centroid
     return aligned
 

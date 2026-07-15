@@ -237,14 +237,10 @@ def test_edit_campaign_config_menu_items():
     assert "Edit acquisition.gradient" not in texts
     acquisition_texts = [it.text for it in edit_acquisition_config_menu.items]
     for expected in (
-        "Edit acquisition core",
         "Edit acquisition.subspace",
         "Edit acquisition.weights",
         "Edit acquisition.spectral",
         "Edit acquisition.calibrated_energy",
-        "Edit acquisition.fullspace_confinement",
-        "Edit acquisition.size_normalisation",
-        "Edit acquisition.driver",
         "Edit acquisition.gradient",
         "Edit acquisition.barrier",
         "Edit acquisition.stencils",
@@ -1163,14 +1159,13 @@ def test_background_launch_refuses_invalid_config_override(
 def test_acquisition_gradient_menu_exposes_active_fd_controls():
     import importlib
 
-    from ichor.hpc.active_learning.config import CampaignConfig, VALID_GRADIENT_MODES
+    from ichor.hpc.active_learning.config import CampaignConfig
 
     menu = importlib.import_module(
         "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
         "active_learning_campaign_submenus.edit_campaign_config_menu"
     )
     cfg = CampaignConfig()
-    cfg.acquisition.gradient.mode = "active_fd"
     cfg.acquisition.gradient.active_step = 3.0e-3
     menu._replace_campaign_config(cfg, loaded_from=None)
 
@@ -1179,68 +1174,26 @@ def test_acquisition_gradient_menu_exposes_active_fd_controls():
     field_specs = {spec.path: spec for spec in gradient_menu.this_menu_options.fields}
 
     assert set(field_specs) == {
-        "acquisition.gradient.mode",
-        "acquisition.gradient.cartesian_step",
         "acquisition.gradient.active_step",
         "acquisition.gradient.regularization",
-        "acquisition.gradient.cartesian_step_floor",
-        "acquisition.gradient.ghost_mass_threshold",
         "acquisition.gradient.max_acquisition_grad_per_ang",
     }
-    assert set(field_specs["acquisition.gradient.mode"].choices) == set(VALID_GRADIENT_MODES)
-    assert "active_fd" in rendered
     assert "acquisition.gradient.active_step: 0.003" in rendered
 
 
-def test_acquisition_driver_menu_exposes_driver_controls():
+def test_removed_acquisition_driver_has_no_menu_or_config_block():
     import importlib
 
-    from ichor.hpc.active_learning.config import (
-        CampaignConfig,
-        VALID_ACQUISITION_DRIVER_GRADIENT_BACKENDS,
-        VALID_ACQUISITION_DRIVER_OBJECTIVES,
-    )
+    from ichor.hpc.active_learning.config import CampaignConfig
 
     menu = importlib.import_module(
         "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
         "active_learning_campaign_submenus.edit_campaign_config_menu"
     )
     cfg = CampaignConfig()
-    cfg.acquisition.driver.enabled = True
-    cfg.acquisition.driver.lambda_energy = 0.5
     menu._replace_campaign_config(cfg, loaded_from=None)
-
-    driver_menu = menu._BLOCK_MENUS_BY_LABEL["Edit acquisition.driver"]
-    rendered = driver_menu.this_menu_options()
-    field_specs = {spec.path: spec for spec in driver_menu.this_menu_options.fields}
-
-    assert set(field_specs) == {
-        "acquisition.driver.enabled",
-        "acquisition.driver.objective",
-        "acquisition.driver.gradient_backend",
-        "acquisition.driver.include_stencils",
-        "acquisition.driver.analytic_movement",
-        "acquisition.driver.analytic_whitened_distance",
-        "acquisition.driver.analytic_pair_barriers",
-        "acquisition.driver.analytic_fullspace_rmsd",
-        "acquisition.driver.finite_difference_energy",
-        "acquisition.driver.analytic_validation",
-        "acquisition.driver.analytic_validation_tol_cosine",
-        "acquisition.driver.lambda_energy",
-        "acquisition.driver.lambda_movement",
-        "acquisition.driver.lambda_distance",
-        "acquisition.driver.lambda_fullspace",
-        "acquisition.driver.lambda_chemistry",
-    }
-    assert set(field_specs["acquisition.driver.objective"].choices) == set(
-        VALID_ACQUISITION_DRIVER_OBJECTIVES
-    )
-    assert set(field_specs["acquisition.driver.gradient_backend"].choices) == set(
-        VALID_ACQUISITION_DRIVER_GRADIENT_BACKENDS
-    )
-    assert "acquisition.driver.enabled: True" in rendered
-    assert "acquisition.driver.gradient_backend: fd" in rendered
-    assert "acquisition.driver.lambda_energy: 0.5" in rendered
+    assert not hasattr(cfg.acquisition, "driver")
+    assert "Edit acquisition.driver" not in menu._BLOCK_MENUS_BY_LABEL
 
 
 def test_campaign_config_csv_and_optional_float_field_editors(monkeypatch):
@@ -1373,18 +1326,15 @@ def test_top_three_roi_config_blocks_render_current_values():
     assert "seed_selection.d_optimal_degenerate_policy" in seed_rendered
 
 
-def test_legacy_sequential_campaign_editors_are_neutralized():
+def test_legacy_sequential_campaign_editors_are_removed():
     import importlib
-
-    import pytest
 
     menu = importlib.import_module(
         "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
         "active_learning_campaign_submenus.edit_campaign_config_menu"
     )
 
-    with pytest.raises(RuntimeError, match="Sequential campaign config editors"):
-        menu.EditCampaignConfigFunctions.edit_seed_selection()
+    assert not hasattr(menu.EditCampaignConfigFunctions, "edit_seed_selection")
 
 
 def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys, monkeypatch):
@@ -2118,7 +2068,7 @@ def test_campaign_config_load_edit_save_preserves_hidden_fields(tmp_path, monkey
     original.gaussian.basis_set = "def2-TZVP"
     original.ferebus.properties = ["iqa", "q00"]
     original.ferebus.physical_prior_scale = 0.75
-    original.acquisition.allow_uniform_posterior_fallback = True
+    original.acquisition.spectral.max_modes = 4
     original.to_yaml(tmp_path / "campaign.yaml")
     monkeypatch.setattr(menu, "_pause", lambda: None)
 
@@ -2138,7 +2088,7 @@ def test_campaign_config_load_edit_save_preserves_hidden_fields(tmp_path, monkey
     assert reloaded.gaussian.method == "B3LYP"
     assert reloaded.ferebus.properties == ["iqa", "q00"]
     assert reloaded.ferebus.physical_prior_scale == 0.75
-    assert reloaded.acquisition.allow_uniform_posterior_fallback is True
+    assert reloaded.acquisition.spectral.max_modes == 4
 
 
 def test_config_save_rejects_invalid_without_writing(tmp_path, monkeypatch):

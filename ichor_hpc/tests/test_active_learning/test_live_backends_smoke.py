@@ -1190,7 +1190,6 @@ def test_ariadne_auto_cpus_match_active_fd_worker_count(monkeypatch):
     cfg = CampaignConfig()
     cfg.resources.partition = "multicore"
     cfg.resources.ariadne_cpus_per_task = "auto"
-    cfg.acquisition.gradient.mode = "active_fd"
     cfg.acquisition.subspace.max_subspace_dim = 6
 
     resolved = resolve_phase_resources(
@@ -1206,7 +1205,7 @@ def test_ariadne_auto_cpus_match_active_fd_worker_count(monkeypatch):
     assert resolved.cpu_reason == "ariadne_active_fd_direction_workers"
 
 
-def test_ariadne_auto_cpus_match_cartesian_fd_component_count(monkeypatch, tmp_path):
+def test_ariadne_auto_cpus_ignore_cartesian_atom_count(monkeypatch, tmp_path):
     from ichor.hpc.active_learning.daemon.resource_solver import resolve_phase_resources
 
     _install_fake_global_variables(
@@ -1243,7 +1242,7 @@ def test_ariadne_auto_cpus_match_cartesian_fd_component_count(monkeypatch, tmp_p
     cfg = CampaignConfig()
     cfg.resources.partition = "multicore"
     cfg.resources.ariadne_cpus_per_task = "auto"
-    cfg.acquisition.gradient.mode = "cartesian_fd"
+    cfg.acquisition.subspace.max_subspace_dim = 6
 
     resolved = resolve_phase_resources(
         phase_name="ARIADNE_ARRAY",
@@ -1255,8 +1254,8 @@ def test_ariadne_auto_cpus_match_cartesian_fd_component_count(monkeypatch, tmp_p
         require_evidence=False,
     )
 
-    assert resolved.cpus_per_task == 12
-    assert resolved.cpu_reason == "ariadne_cartesian_fd_component_workers"
+    assert resolved.cpus_per_task == 6
+    assert resolved.cpu_reason == "ariadne_active_fd_direction_workers"
 
 
 def test_only_resource_resolving_array_staging_receives_partition_override(

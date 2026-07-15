@@ -274,7 +274,6 @@ def test_ariadne_adds_memory_only_cpus_without_more_workers(
         lambda _p: 4.0,
     )
     cfg = CampaignConfig()
-    cfg.acquisition.gradient.mode = "active_fd"
     cfg.acquisition.subspace.max_subspace_dim = 6
     evidence = {
         "source": "test_exact_dimensions",

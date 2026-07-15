@@ -29,10 +29,11 @@ def _make_acq(autotune=False, default_step=0.1):
     return acq
 
 
-def _make_evaluation(cubic_mean, force_std=1.0):
+def _make_evaluation(cubic_mean, force_mean=1.0, force_std=1.0):
     """Synthetic ModeEvaluation for refine-tests."""
     return ModeEvaluation(
-        index=0, force_std=force_std, curvature_mean=1.0, curvature_std=0.1,
+        index=0, force_mean=force_mean, force_std=force_std,
+        curvature_mean=1.0, curvature_std=0.1,
         omega=1.0, omega_std=0.1, cubic_mean=cubic_mean, cubic_std=0.01,
         quartic_mean=0.0, quartic_std=0.0,
         anharmonicity=0.0, anharmonicity_std=0.0,
@@ -42,14 +43,14 @@ def _make_evaluation(cubic_mean, force_std=1.0):
 # --- _refine_steps_from_cubic math ---
 
 def test_refine_steps_targets_one_percent_error():
-    """Target: eps^2 * |cubic| = 0.01 * |grad|.
-    Solve: eps = sqrt(0.01 * grad / |cubic|).
+    """Target: eps^2 * |cubic| / 6 = 0.01 * |grad|.
+    Solve: eps = sqrt(0.06 * grad / |cubic|).
     """
     acq = _make_acq(autotune=True)
     grad_mag, cubic_mag = 1.0, 1.0
-    expected = math.sqrt(0.01 * grad_mag / cubic_mag)
+    expected = math.sqrt(0.06 * grad_mag / cubic_mag)
     tuned = acq._refine_steps_from_cubic([
-        _make_evaluation(cubic_mean=cubic_mag, force_std=grad_mag),
+        _make_evaluation(cubic_mean=cubic_mag, force_mean=grad_mag),
     ])
     assert tuned[0] == pytest.approx(expected, rel=1e-9)
 
@@ -59,7 +60,7 @@ def test_refine_steps_clamps_to_max():
     acq = _make_acq(autotune=True)
     # 0.01 * 100 / 1e-9 = 1e9 -> eps target = ~31000 -> clamp to max_step.
     tuned = acq._refine_steps_from_cubic([
-        _make_evaluation(cubic_mean=1e-9, force_std=100.0),
+        _make_evaluation(cubic_mean=1e-9, force_mean=100.0),
     ])
     assert tuned[0] == acq.config.stencils.max_step
 
@@ -69,7 +70,7 @@ def test_refine_steps_clamps_to_min():
     acq = _make_acq(autotune=True)
     # 0.01 * 1e-9 / 100 = 1e-13 -> eps target ~ 3e-7 -> clamp to min_step.
     tuned = acq._refine_steps_from_cubic([
-        _make_evaluation(cubic_mean=100.0, force_std=1e-9),
+        _make_evaluation(cubic_mean=100.0, force_mean=1e-9),
     ])
     assert tuned[0] == acq.config.stencils.min_step
 
@@ -88,12 +89,21 @@ def test_refine_per_mode_independent():
     """Different cubics per mode -> different tuned eps."""
     acq = _make_acq(autotune=True)
     evals = [
-        _make_evaluation(cubic_mean=1.0, force_std=1.0),    # eps = 0.1
-        _make_evaluation(cubic_mean=4.0, force_std=1.0),    # eps = 0.05
+        _make_evaluation(cubic_mean=1.0, force_mean=1.0),
+        _make_evaluation(cubic_mean=4.0, force_mean=1.0),
     ]
     tuned = acq._refine_steps_from_cubic(evals)
-    assert tuned[0] == pytest.approx(0.1, rel=1e-9)
-    assert tuned[1] == pytest.approx(0.05, rel=1e-9)
+    assert tuned[0] == pytest.approx(math.sqrt(0.06), rel=1e-9)
+    assert tuned[1] == pytest.approx(math.sqrt(0.015), rel=1e-9)
+
+
+def test_refine_steps_do_not_depend_on_force_uncertainty():
+    acq = _make_acq(autotune=True)
+    low_std = _make_evaluation(2.0, force_mean=0.5, force_std=1.0e-9)
+    high_std = _make_evaluation(2.0, force_mean=0.5, force_std=1.0e9)
+    assert acq._refine_steps_from_cubic([low_std])[0] == pytest.approx(
+        acq._refine_steps_from_cubic([high_std])[0]
+    )
 
 
 # --- end-to-end: _mode_metrics cache behaviour ---

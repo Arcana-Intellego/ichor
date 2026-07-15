@@ -6,7 +6,6 @@ from ..strict_json import strict_json as json
 import os
 import sys
 import time
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence
 
@@ -20,7 +19,7 @@ from ..acquisition.gradient_diagnostics import (
     static_gradient_diagnostics,
 )
 from ..acquisition.trajectory_pool import TrajectoryPool
-from ..config import CampaignConfig, VALID_GRADIENT_MODES
+from ..config import CampaignConfig
 from ..daemon.state import DEFAULT_STATE_FILENAME, read_state
 from ..handoff_manifests import load_seeds_picked
 
@@ -47,11 +46,11 @@ def _parse_gradient_modes(text: str) -> List[str]:
     modes = [part.strip() for part in str(text).split(",") if part.strip()]
     if not modes:
         raise ValueError("at least one gradient mode is required")
-    invalid = [mode for mode in modes if mode not in VALID_GRADIENT_MODES]
+    invalid = [mode for mode in modes if mode != "active_fd"]
     if invalid:
         raise ValueError(
             "gradient mode(s) must be one of "
-            + repr(sorted(VALID_GRADIENT_MODES))
+            + repr(["active_fd"])
             + "; got "
             + repr(invalid)
         )
@@ -60,28 +59,13 @@ def _parse_gradient_modes(text: str) -> List[str]:
 
 def _load_reference_scales(iter_dir: Path) -> Dict[str, float] | None:
     from ..layout import active_protocol_dir
+    from ..reference_scale_snapshot import read_reference_scale_snapshot
 
     path = active_protocol_dir(iter_dir) / "reference_scales.json"
     if not path.is_file():
         return None
-    with open(path, "r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-    if not isinstance(payload, Mapping):
-        raise ValueError("reference_scales.json must contain an object")
-    required = ("energy", "force", "omega", "anh", "anh_std")
-    out: Dict[str, float] = {}
-    for key, value in payload.items():
-        try:
-            fvalue = float(value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("reference scale " + str(key) + " is not numeric") from exc
-        if not np.isfinite(fvalue) or fvalue <= 0.0:
-            raise ValueError("reference scale " + str(key) + " must be finite and positive")
-        out[str(key)] = fvalue
-    missing = [key for key in required if key not in out]
-    if missing:
-        raise ValueError("reference_scales.json missing " + ", ".join(missing))
-    return out
+    snapshot = read_reference_scale_snapshot(path)
+    return dict(snapshot["values"])
 
 
 def _load_context(campaign_dir: Path, iteration: int, seed_id: int) -> Dict[str, Any]:
@@ -156,21 +140,10 @@ def _posterior_diagnostics(acquisition: SeedLocalAdversarialAcquisition) -> Dict
 def _build_acquisition(
     context: Mapping[str, Any],
     mode: str,
-    *,
-    objective: str = "full",
-    driver_gradient_backend: str | None = None,
 ) -> SeedLocalAdversarialAcquisition:
+    if str(mode) != "active_fd":
+        raise ValueError("only the mature full active_fd acquisition is supported")
     config = context["config"].to_acquisition_config()
-    config = replace(config, gradient=replace(config.gradient, mode=str(mode)))
-    if driver_gradient_backend:
-        config = replace(
-            config,
-            driver=replace(
-                config.driver,
-                enabled=(str(objective) == "cheap_driver" or bool(config.driver.enabled)),
-                gradient_backend=str(driver_gradient_backend),
-            ),
-        )
     return SeedLocalAdversarialAcquisition(
         models=context["models"],
         seed=context["seed_atoms"],
@@ -181,15 +154,6 @@ def _build_acquisition(
     )
 
 
-def _cosine(a: np.ndarray, b: np.ndarray) -> float | None:
-    avec = np.asarray(a, dtype=float).reshape(-1)
-    bvec = np.asarray(b, dtype=float).reshape(-1)
-    denom = float(np.linalg.norm(avec) * np.linalg.norm(bvec))
-    if not np.isfinite(denom) or denom <= 0.0:
-        return None
-    return float(np.dot(avec, bvec) / denom)
-
-
 def run_benchmark(
     *,
     campaign_dir: Path,
@@ -198,25 +162,14 @@ def run_benchmark(
     gradient_modes: Sequence[str],
     repeat: int,
     gradient_backend: str = "direct",
-    objective: str = "full",
-    driver_gradient_backend: str | None = None,
     workers: int | None = None,
 ) -> Dict[str, Any]:
     context = _load_context(campaign_dir, int(iteration), int(seed_id))
     runs: List[Dict[str, Any]] = []
-    gradients_by_mode: Dict[str, np.ndarray] = {}
-    median_by_mode: Dict[str, float] = {}
-
     for mode in gradient_modes:
-        acquisition = _build_acquisition(
-            context,
-            str(mode),
-            objective=str(objective),
-            driver_gradient_backend=driver_gradient_backend,
-        )
+        acquisition = _build_acquisition(context, str(mode))
         # Warm the reference/acquisition path once outside timing.
-        acquisition.components(context["seed_atoms"], objective=str(objective))
-        mode_walls: List[float] = []
+        acquisition.components(context["seed_atoms"])
         for repeat_index in range(int(repeat)):
             _reset_posterior_diagnostics(acquisition)
             static = static_gradient_diagnostics(
@@ -233,7 +186,6 @@ def run_benchmark(
                     acquisition.gradient(
                         context["seed_atoms"],
                         mode=str(mode),
-                        objective=str(objective),
                     ),
                     dtype=float,
                 )
@@ -243,18 +195,18 @@ def run_benchmark(
                 if workers is not None:
                     os.environ["ICHOR_GRADIENT_WORKERS"] = str(int(workers))
                 try:
-                    calculator = AdversarialASECalculator(
+                    with AdversarialASECalculator(
                         acquisition,
-                        gradient_mode=str(mode),
                         gradient_backend=str(gradient_backend),
-                        objective=str(objective),
                         project_rigid=False,
                         max_acquisition_grad_per_ang=0.0,
-                    )
-                    _energy, forces = calculator.evaluate(context["seed_atoms"])
-                    hartree = calculator._hartree()
-                    grad = np.asarray(forces, dtype=float) / max(float(hartree), 1.0e-300)
-                    calc_diag = calculator_gradient_diagnostics(calculator)
+                    ) as calculator:
+                        _energy, forces = calculator.evaluate(context["seed_atoms"])
+                        hartree = calculator._hartree()
+                        grad = np.asarray(forces, dtype=float) / max(
+                            float(hartree), 1.0e-300
+                        )
+                        calc_diag = calculator_gradient_diagnostics(calculator)
                 finally:
                     if workers is not None:
                         if previous_workers is None:
@@ -262,8 +214,6 @@ def run_benchmark(
                         else:
                             os.environ["ICHOR_GRADIENT_WORKERS"] = previous_workers
             wall = float(time.perf_counter() - t0)
-            mode_walls.append(wall)
-            gradients_by_mode[str(mode)] = grad
             posterior_diag = _posterior_diagnostics(acquisition)
             runs.append({
                 "gradient_mode": str(mode),
@@ -278,36 +228,11 @@ def run_benchmark(
                 "n_cartesian_dof": static.get("n_cartesian_dof"),
                 "n_live_cartesian_dof": static.get("n_live_cartesian_dof"),
                 "gradient_backend": str(gradient_backend),
-                "objective": str(objective),
-                "driver_gradient_backend": driver_gradient_backend,
+                "objective": "full",
                 "workers": workers,
                 "posterior_diagnostics": posterior_diag,
                 "calculator_diagnostics": calc_diag,
             })
-        median_by_mode[str(mode)] = float(np.median(mode_walls)) if mode_walls else 0.0
-
-    comparisons: Dict[str, Any] = {}
-    if "active_fd" in gradients_by_mode and "cartesian_fd" in gradients_by_mode:
-        active = gradients_by_mode["active_fd"]
-        cart = gradients_by_mode["cartesian_fd"]
-        active_median = median_by_mode.get("active_fd", 0.0)
-        cart_median = median_by_mode.get("cartesian_fd", 0.0)
-        comparisons["active_fd_vs_cartesian_fd"] = {
-            "cosine": _cosine(active, cart),
-            "relative_norm": (
-                None
-                if float(np.linalg.norm(cart)) <= 0.0
-                else float(np.linalg.norm(active) / np.linalg.norm(cart))
-            ),
-            "cartesian_wall_seconds_median": cart_median,
-            "active_wall_seconds_median": active_median,
-            "speedup": (
-                None
-                if active_median <= 0.0
-                else float(cart_median / active_median)
-            ),
-        }
-
     seed_atoms = context["seed_atoms"]
     return {
         "schema_version": 1,
@@ -319,12 +244,11 @@ def run_benchmark(
         "natoms": int(len(seed_atoms)),
         "gradient_modes": list(gradient_modes),
         "gradient_backend": str(gradient_backend),
-        "objective": str(objective),
-        "driver_gradient_backend": driver_gradient_backend,
+        "objective": "full",
         "workers": workers,
         "repeat": int(repeat),
         "runs": runs,
-        "comparisons": comparisons,
+        "comparisons": {},
     }
 
 
@@ -359,29 +283,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed-id", required=True, type=int, help="One-based seed ID in seed_selection/SELECTION.json.")
     parser.add_argument(
         "--gradient-mode",
-        default="cartesian_fd,active_fd",
+        default="active_fd",
         help="Comma-separated gradient modes to benchmark.",
     )
     parser.add_argument("--repeat", type=int, default=1, help="Repeats per mode.")
     parser.add_argument(
         "--gradient-backend",
         default="direct",
-        choices=("direct", "serial", "process", "thread"),
+        choices=("direct", "serial", "process"),
         help="direct calls acquisition.gradient(); others route through the live calculator backend.",
     )
-    parser.add_argument(
-        "--objective",
-        default="full",
-        choices=("full", "cheap_driver"),
-        help="Acquisition objective to benchmark.",
-    )
-    parser.add_argument(
-        "--driver-gradient-backend",
-        default="",
-        choices=("", "fd", "hybrid_geometry"),
-        help="Override acquisition.driver.gradient_backend for cheap-driver benchmarks.",
-    )
-    parser.add_argument("--workers", type=int, default=0, help="Worker override for process/thread backends.")
+    parser.add_argument("--workers", type=int, default=0, help="Worker override for process backends.")
     parser.add_argument("--json", dest="json_path", default="", help="Optional JSON output path.")
     return parser
 
@@ -400,8 +312,6 @@ def main(argv=None) -> int:
             gradient_modes=modes,
             repeat=int(args.repeat),
             gradient_backend=str(args.gradient_backend),
-            objective=str(args.objective),
-            driver_gradient_backend=(args.driver_gradient_backend or None),
             workers=(None if int(args.workers) <= 0 else int(args.workers)),
         )
         _print_table(payload)

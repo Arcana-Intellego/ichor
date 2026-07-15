@@ -33,11 +33,8 @@ from .gradient_diagnostics import (
     calculator_gradient_diagnostics,
     flatten_trace_gradient_diagnostics,
 )
+from .pseudo_units import hartree_ev
 
-
-# ASE's Hartree-to-eV scale. Here it is only the reversible pseudo-energy
-# scale used by AdversarialASECalculator at the ASE boundary.
-_HARTREE_EV = 27.211386245988
 
 # ariadne tags hessian models by integer. mirror the starter pack
 # HESSIAN_MODEL_MAP so a config naming a model in caps still resolves.
@@ -524,9 +521,10 @@ def _eval_energy_gradient(atoms, *, objective_scale: float = 1.0):
     e_ev = float(atoms.get_potential_energy())
     forces_ev = np.asarray(atoms.get_forces(), dtype=np.float64)
     grad_ev = -forces_ev
-    e_hartree = (e_ev / _HARTREE_EV) * scale
+    pseudo_hartree_ev = hartree_ev()
+    e_hartree = (e_ev / pseudo_hartree_ev) * scale
     g_xyz_hartree = np.asfortranarray(
-        (grad_ev / _HARTREE_EV) * scale,
+        (grad_ev / pseudo_hartree_ev) * scale,
         dtype=np.float64,
     )
     g_flat_hartree = _flatten_xyz(g_xyz_hartree)

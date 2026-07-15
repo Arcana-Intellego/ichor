@@ -52,7 +52,10 @@ from ..versioning.provenance import (
 )
 from ..versioning.manifest import sha256_file
 from ..versioning.reference_data import ReferenceDataVersioning
-from ..versioning.trained_models import TrainedModelVersioning
+from ..versioning.trained_models import (
+    TRAINED_MODEL_SET_FILENAME,
+    TrainedModelVersioning,
+)
 from ..versioning.versioned_directory import VersionedDirectory
 from ..layout import (
     QM_REFERENCE_DATA_DIRNAME,
@@ -2470,12 +2473,17 @@ class DryRunPhaseExecutor:
         Returns True iff the cache was refreshed.
         """
         refs = self.config.acquisition.references
+        models_version = int(getattr(state, "models_version", -1))
+        if models_version < 0:
+            return False
         policy = refs.refresh_policy
         prev_iter = int(getattr(state, "reference_scales_iteration", -1))
         prev_scales = getattr(state, "reference_scales", None)
         should_refresh = False
         if prev_scales is None:
             should_refresh = True
+        elif prev_iter == int(state.iteration):
+            should_refresh = False
         elif policy == "every_iteration":
             should_refresh = True
         elif policy == "every_n_iterations":
@@ -2483,18 +2491,69 @@ class DryRunPhaseExecutor:
             should_refresh = (int(state.iteration) - prev_iter) >= period
         elif policy == "never":
             should_refresh = False
+        if should_refresh:
+            floor = float(refs.floor)
+            synthetic = {
+                "energy": floor + 1.0e-3,
+                "force": floor + 1.0e-2,
+                "omega": floor + 1.0,
+                "anh": floor + 1.0,
+                "anh_std": floor + 1.0,
+            }
+            model_manifest = (
+                TrainedModelVersioning(
+                    Path(self.campaign_dir) / self.models_dir_name
+                ).iteration_path(models_version)
+                / TRAINED_MODEL_SET_FILENAME
+            )
+            if model_manifest.is_file() and not model_manifest.is_symlink():
+                model_manifest_sha256 = sha256_file(model_manifest)
+            else:
+                import hashlib
+
+                identity = (
+                    "dry-run-reference-scale-model:"
+                    + str(getattr(state, "campaign_uid", "test"))
+                    + ":"
+                    + str(models_version)
+                )
+                model_manifest_sha256 = hashlib.sha256(
+                    identity.encode("utf-8")
+                ).hexdigest()
+            state.reference_scales = synthetic
+            state.reference_scales_iteration = int(state.iteration)
+            state.reference_scales_models_version = models_version
+            state.reference_scales_model_manifest_sha256 = model_manifest_sha256
+        else:
+            synthetic = dict(prev_scales)
+            model_manifest_sha256 = getattr(
+                state,
+                "reference_scales_model_manifest_sha256",
+                None,
+            )
+
+        from ..reference_scale_snapshot import (
+            build_reference_scale_snapshot,
+            write_reference_scale_snapshot,
+        )
+        from ..layout import active_protocol_dir
+
+        snapshot = build_reference_scale_snapshot(
+            iteration=int(state.iteration),
+            source_iteration=int(state.reference_scales_iteration),
+            models_version=int(state.reference_scales_models_version),
+            model_set_manifest_sha256=model_manifest_sha256,
+            values=synthetic,
+        )
+        protocol_dir = active_protocol_dir(
+            active_iteration_dir(self.campaign_dir, int(state.iteration))
+        )
+        write_reference_scale_snapshot(
+            protocol_dir / "reference_scales.json",
+            snapshot,
+        )
         if not should_refresh:
             return False
-        floor = float(refs.floor)
-        synthetic = {
-            "energy": floor + 1.0e-3,
-            "force": floor + 1.0e-2,
-            "omega": floor + 1.0,
-            "anh": floor + 1.0,
-            "anh_std": floor + 1.0,
-        }
-        state.reference_scales = synthetic
-        state.reference_scales_iteration = int(state.iteration)
         self._journal_event(
             "reference_scales_computed",
             iteration=int(state.iteration),

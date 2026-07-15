@@ -19,6 +19,7 @@ from ichor.hpc.active_learning.acquisition.ariadne_local_runner import (
     _build_trqn,
     _compute_trqn_objective_scale,
     _ds_safe_init_kwargs,
+    _eval_energy_gradient,
     _finalise_optimiser_diagnostics,
     _new_optimiser_diagnostics,
     _trqn_control_init_kwargs,
@@ -28,6 +29,25 @@ from ichor.hpc.active_learning.acquisition.ariadne_local_runner import (
 )
 import ichor.hpc.active_learning.acquisition.ariadne_local_runner as local_runner
 from ichor.hpc.active_learning.acquisition.ariadne_runner import AriadneRunConfig
+
+
+def test_ase_and_ariadne_share_one_pseudo_hartree_conversion():
+    from ase.units import Hartree
+
+    class _Atoms:
+        @staticmethod
+        def get_potential_energy():
+            return -2.5 * float(Hartree)
+
+        @staticmethod
+        def get_forces():
+            return np.array([[1.0, -2.0, 3.0]]) * float(Hartree)
+
+    energy, gradient = _eval_energy_gradient(_Atoms())
+
+    assert energy == pytest.approx(-2.5)
+    np.testing.assert_allclose(gradient, [-1.0, 2.0, -3.0])
+    assert gradient.flags["F_CONTIGUOUS"]
 
 
 def test_append_trace_event_writes_jsonl(tmp_path):

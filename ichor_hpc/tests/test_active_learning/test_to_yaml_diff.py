@@ -81,7 +81,6 @@ def test_save_load_round_trip_preserves_config(tmp_path):
 
 def test_active_fd_gradient_settings_round_trip_through_yaml(tmp_path):
     c = CampaignConfig()
-    c.acquisition.gradient.mode = "active_fd"
     c.acquisition.gradient.active_step = 3.0e-3
     c.acquisition.gradient.regularization = 4.0e-9
 
@@ -89,7 +88,7 @@ def test_active_fd_gradient_settings_round_trip_through_yaml(tmp_path):
     c.to_yaml(p)
     c2 = CampaignConfig.from_yaml(p)
 
-    assert c2.acquisition.gradient.mode == "active_fd"
+    assert not hasattr(c2.acquisition.gradient, "mode")
     assert c2.acquisition.gradient.active_step == pytest.approx(3.0e-3)
     assert c2.acquisition.gradient.regularization == pytest.approx(4.0e-9)
     assert c2 == c
