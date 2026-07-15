@@ -211,6 +211,25 @@ def _validate_intent_payload(
     decision_contract = data.get("decision_contract")
     if decision_contract is not None:
         data["decision_contract"] = _validated_decision_contract(decision_contract)
+    environment_generation = data.get("environment_generation")
+    environment_digest = data.get("environment_generation_digest_sha256")
+    if (environment_generation is None) != (environment_digest is None):
+        raise ValueError(
+            "submission intent environment generation and digest must be paired"
+        )
+    if environment_generation is not None:
+        data["environment_generation"] = _exact_int(
+            environment_generation,
+            "submission intent environment_generation",
+        )
+        if (
+            not isinstance(environment_digest, str)
+            or len(environment_digest) != 64
+            or any(ch not in "0123456789abcdef" for ch in environment_digest)
+        ):
+            raise ValueError(
+                "submission intent environment generation digest is invalid"
+            )
     return data
 
 
@@ -392,6 +411,8 @@ def write_pre_submit_intent(
     expected_tasks: Optional[int] = None,
     decision_contract: Optional[Dict[str, Any]] = None,
     scheduler_identity_kind: str = "slurm",
+    environment_generation: Optional[int] = None,
+    environment_generation_digest_sha256: Optional[str] = None,
 ) -> Dict[str, Any]:
     if not isinstance(campaign_uid, str) or not campaign_uid:
         raise ValueError("submission intent campaign_uid must be a non-empty string")
@@ -471,6 +492,26 @@ def write_pre_submit_intent(
         payload["expected_tasks"] = parsed_expected
     if decision_contract is not None:
         payload["decision_contract"] = _validated_decision_contract(decision_contract)
+    if (environment_generation is None) != (
+        environment_generation_digest_sha256 is None
+    ):
+        raise ValueError(
+            "submission intent environment generation and digest must be paired"
+        )
+    if environment_generation is not None:
+        payload["environment_generation"] = _exact_int(
+            environment_generation,
+            "submission intent environment_generation",
+        )
+        digest = str(environment_generation_digest_sha256)
+        if (
+            len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError(
+                "submission intent environment generation digest is invalid"
+            )
+        payload["environment_generation_digest_sha256"] = digest
     return _write_payload(path, payload)
 
 

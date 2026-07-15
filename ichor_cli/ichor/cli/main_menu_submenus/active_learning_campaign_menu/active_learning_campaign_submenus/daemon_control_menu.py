@@ -179,6 +179,49 @@ class DaemonControlFunctions:
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
+    def show_environment_status():
+        from ichor.hpc.active_learning.cli import cmd_environment_status
+
+        ns = _guarded_campaign_dir_ns()
+        if ns is None:
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        ns.json = False
+        rc = cmd_environment_status(ns)
+        if rc not in {0, 18}:
+            print("environment-status returned exit code " + str(rc))
+        user_input_free_flow("Press enter to return to the menu: ", "")
+
+    @staticmethod
+    def rebind_environment():
+        from ichor.hpc.active_learning.cli import cmd_rebind_environment
+
+        ns = _guarded_campaign_dir_ns()
+        if ns is None:
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        ns.apply = False
+        ns.json = False
+        preview_rc = cmd_rebind_environment(ns)
+        if preview_rc != 0:
+            print("environment rebind preview returned exit code " + str(preview_rc))
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        answer = user_input_free_flow(
+            "Rebind this idle campaign to the current verified environment? Type YES: ",
+            "",
+        )
+        if str(answer).strip() != "YES":
+            print("Cancelled.")
+            user_input_free_flow("Press enter to return to the menu: ", "")
+            return
+        ns.apply = True
+        rc = cmd_rebind_environment(ns)
+        if rc != 0:
+            print("rebind-environment returned exit code " + str(rc))
+        user_input_free_flow("Press enter to return to the menu: ", "")
+
+    @staticmethod
     def create_checkpoint():
         from ichor.hpc.active_learning.cli import cmd_checkpoint
 
@@ -660,6 +703,14 @@ daemon_control_menu_items = [
     FunctionItem(
         "Submit compute-node environment smoke",
         DaemonControlFunctions.submitted_environment_smoke,
+    ),
+    FunctionItem(
+        "Show execution environment status",
+        DaemonControlFunctions.show_environment_status,
+    ),
+    FunctionItem(
+        "Rebind idle campaign environment",
+        DaemonControlFunctions.rebind_environment,
     ),
     FunctionItem(
         "Show checkpoint status",

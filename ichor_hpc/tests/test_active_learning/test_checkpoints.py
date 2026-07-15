@@ -5,6 +5,12 @@ from pathlib import Path
 import pytest
 
 from ichor.hpc.active_learning.config import CampaignConfig
+import ichor.hpc.active_learning.execution_identity as execution_identity_module
+from ichor.hpc.active_learning.execution_identity import (
+    _canonical_digest,
+    _environment_fingerprint,
+    ensure_execution_identity,
+)
 from ichor.hpc.active_learning.daemon import checkpoints
 from ichor.hpc.active_learning.daemon.daemon import Daemon, TickStatus
 from ichor.hpc.active_learning.daemon.state import (
@@ -17,7 +23,8 @@ from ichor.hpc.active_learning.daemon.state import (
 def _idle_campaign(tmp_path: Path, monkeypatch) -> Path:
     campaign = tmp_path / "campaign"
     campaign.mkdir()
-    CampaignConfig().to_yaml(campaign / "campaign.yaml")
+    config = CampaignConfig()
+    config.to_yaml(campaign / "campaign.yaml")
     state = fresh_campaign_state(campaign_uid="abc123")
     state.phase = CampaignPhase.SEED_SELECT
     state.iteration = 1
@@ -25,6 +32,52 @@ def _idle_campaign(tmp_path: Path, monkeypatch) -> Path:
     state.models_version = 0
     (campaign / ".DATA" / "ACTIVE_LEARNING").mkdir(parents=True)
     write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+
+    def fake_generation(*args, campaign_uid, config, generation=0, **kwargs):
+        generation_campaign = Path(args[0] if args else campaign).resolve()
+        payload = {
+            "schema_version": 1,
+            "generation": int(generation),
+            "campaign_uid": str(campaign_uid),
+            "created_at_iso": "2026-01-01T00:00:00+00:00",
+            "host": "test-host",
+            "operator": "test-operator",
+            "python_executable": str((Path.cwd() / "python-test").resolve()),
+            "campaign_schema_version": int(config.schema_version),
+            "python_version": "3.11.checkpoint-test",
+            "ichor_git": {},
+            "ichor_package_tree_sha256": "0" * 64,
+            "dependencies": [],
+            "pyferebus": {},
+            "ariadne": {},
+            "ferebus_executable": {},
+            "machine_profile": {},
+            "loaded_modules": [],
+            "native_library_paths": {
+                "LD_LIBRARY_PATH": "",
+                "LIBRARY_PATH": "",
+            },
+            "campaign_config_sha256": "1" * 64,
+            "config_lock_sha256": None,
+            "campaign_dir": str(generation_campaign),
+        }
+        payload["environment_fingerprint_sha256"] = _environment_fingerprint(
+            payload
+        )
+        payload["digest_sha256"] = _canonical_digest(payload)
+        return payload
+
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        fake_generation,
+    )
+    ensure_execution_identity(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        config=config,
+        requested_mode="dry_run",
+    )
     (campaign / "authoritative.bin").write_bytes(b"authoritative-bytes")
     scratch = campaign / ".DATA" / "SCRATCH" / "GAUSSIAN"
     scratch.mkdir(parents=True)
@@ -55,6 +108,12 @@ def test_checkpoint_deduplicates_verifies_and_restores(tmp_path, monkeypatch):
     manifest = created["manifest"]
     relative_paths = {item["path"] for item in manifest["files"]}
     assert "authoritative.bin" in relative_paths
+    assert ".DATA/ACTIVE_LEARNING/execution_identity.json" in relative_paths
+    assert ".DATA/ACTIVE_LEARNING/environment_current.json" in relative_paths
+    assert (
+        ".DATA/ACTIVE_LEARNING/environment_generations/generation-000000.json"
+        in relative_paths
+    )
     assert not any(path.startswith(".DATA/SCRATCH/") for path in relative_paths)
     assert not any(path.startswith(".DATA/STAGING/") for path in relative_paths)
     object_paths = list((Path(created["store"]) / "objects").iterdir())
@@ -81,6 +140,10 @@ def test_checkpoint_deduplicates_verifies_and_restores(tmp_path, monkeypatch):
     assert restored["applied"] is True
     assert (target / "authoritative.bin").read_bytes() == b"authoritative-bytes"
     assert not (target / ".DATA" / "SCRATCH").exists()
+    for record in manifest["files"]:
+        restored_path = target.joinpath(*Path(record["path"]).parts)
+        assert restored_path.stat().st_size == int(record["size"])
+        assert checkpoints._sha256_file(restored_path) == record["sha256"]
 
 
 def test_checkpoint_rejects_corrupt_object(tmp_path, monkeypatch):
@@ -136,6 +199,34 @@ def test_checkpoint_publication_failure_leaves_no_partial_checkpoint(
     checkpoint_root = store / "checkpoints"
     assert not (checkpoint_root / "iteration-000000").exists()
     assert not list(checkpoint_root.glob(".iteration-000000.tmp.*"))
+
+
+def test_checkpoint_restore_publication_failure_leaves_no_partial_target(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = _idle_campaign(tmp_path, monkeypatch)
+    destination = tmp_path / "checkpoint-store"
+    destination.mkdir()
+    created = checkpoints.create_checkpoint(campaign, destination)
+    target = tmp_path / "restored"
+    real_replace = checkpoints.os.replace
+
+    def fail_restore_publication(source, destination_path):
+        if Path(destination_path) == target and ".restore." in Path(source).name:
+            raise OSError("injected restore publication failure")
+        return real_replace(source, destination_path)
+
+    monkeypatch.setattr(checkpoints.os, "replace", fail_restore_publication)
+    with pytest.raises(OSError, match="injected restore publication failure"):
+        checkpoints.restore_checkpoint(
+            created["checkpoint"],
+            target,
+            apply=True,
+        )
+
+    assert not target.exists()
+    assert not list(tmp_path.glob("restored.restore.*"))
 
 
 def test_checkpoint_source_symlink_is_rejected(tmp_path, monkeypatch):

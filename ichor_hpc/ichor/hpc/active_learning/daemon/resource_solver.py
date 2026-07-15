@@ -896,6 +896,8 @@ def _ariadne_evidence(campaign_dir: Path, iteration: int, config: Any) -> Dict[s
     model_root = campaign_owned_path(campaign_dir, model_set.root)
     if str(model_set.head_manifest_sha256) != str(task_map["model_manifest_sha256"]):
         raise ValueError("ARIADNE task map model-manifest SHA mismatch")
+    if str(model_set.model_set_sha256) != str(task_map["model_set_sha256"]):
+        raise ValueError("ARIADNE task map scientific model-set SHA mismatch")
     selected = [
         pool.frame(int(task["pool_row_index_zero_based"]))
         for task in task_map["tasks"]
@@ -969,6 +971,7 @@ def _ariadne_evidence(campaign_dir: Path, iteration: int, config: Any) -> Dict[s
         "gradient_dimension": int(dimension),
         "models_version": version,
         "model_manifest_sha256": str(model_set.head_manifest_sha256),
+        "model_set_sha256": str(model_set.model_set_sha256),
         "model_bytes": int(_directory_bytes(model_root)),
         "gradient_dimensions": dimensions,
         "gradient_dimension_source": dimension_source,

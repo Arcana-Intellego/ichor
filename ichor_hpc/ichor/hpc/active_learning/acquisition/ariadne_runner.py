@@ -2555,6 +2555,11 @@ def main(argv=None) -> int:
     ):
         print("model/task-map manifest SHA mismatch", file=_sys.stderr)
         return 3
+    if str(model_set.model_set_sha256) != str(
+        task_map.get("model_set_sha256") or ""
+    ):
+        print("model/task-map scientific model-set SHA mismatch", file=_sys.stderr)
+        return 3
 
     protocol_dir = active_protocol_dir(iter_dir)
     rs_path = protocol_dir / "reference_scales.json"

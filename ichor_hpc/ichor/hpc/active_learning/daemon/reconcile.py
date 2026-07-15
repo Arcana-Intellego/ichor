@@ -216,6 +216,9 @@ def stateful_campaign_artifacts(campaign_dir: Union[str, Path]) -> List[str]:
     add_matches(".DATA/ACTIVE_LEARNING/stop_request.json")
     add_matches(".DATA/ACTIVE_LEARNING/stop_request_history/*.json")
     add_matches(".DATA/ACTIVE_LEARNING/reconcile_transactions/*.json")
+    add_matches(".DATA/ACTIVE_LEARNING/execution_identity.json")
+    add_matches(".DATA/ACTIVE_LEARNING/environment_current.json")
+    add_matches(".DATA/ACTIVE_LEARNING/environment_generations/*.json")
     config_lock = campaign / ".DATA" / "ACTIVE_LEARNING" / "config_lock.json"
     pool_manifest = campaign / ".DATA" / "TRAJECTORY" / "pool.manifest.json"
     if config_lock.is_file() and not pool_manifest.is_file():

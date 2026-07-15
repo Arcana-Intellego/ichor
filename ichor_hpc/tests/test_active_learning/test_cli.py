@@ -277,6 +277,7 @@ def _write_valid_ariadne_results(campaign: Path, iteration: int = 1):
         iteration=int(iteration),
         models_version=0,
         model_manifest_sha256="0" * 64,
+        model_set_sha256="1" * 64,
         trajectory_sha256=trajectory_sha,
         selection_strategy="hybrid_variance",
         seed_records=[{

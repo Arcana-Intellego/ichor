@@ -286,6 +286,7 @@ def _write_seeds_picked(campaign, iteration, *, n=1):
         iteration=int(iteration),
         models_version=model_version,
         model_manifest_sha256=model_manifest_sha256,
+        model_set_sha256=model_manifest_sha256,
         trajectory_sha256=trajectory_sha256,
         selection_strategy="hybrid_variance",
         seed_records=[

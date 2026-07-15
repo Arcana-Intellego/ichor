@@ -318,6 +318,7 @@ def _write_ariadne_manifest(iter_dir):
         iteration=1,
         models_version=0,
         model_manifest_sha256="c" * 64,
+        model_set_sha256="d" * 64,
         trajectory_sha256="0" * 64,
         selection_strategy="hybrid_variance",
         seed_records=[

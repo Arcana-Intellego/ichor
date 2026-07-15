@@ -62,6 +62,7 @@ def _write_seed_selection(iter_dir, frame_ids, *, trajectory_sha256="a" * 64, ne
         iteration=iteration,
         models_version=0,
         model_manifest_sha256="c" * 64,
+        model_set_sha256="d" * 64,
         trajectory_sha256=str(trajectory_sha256),
         selection_strategy="hybrid_variance",
         seed_records=records,

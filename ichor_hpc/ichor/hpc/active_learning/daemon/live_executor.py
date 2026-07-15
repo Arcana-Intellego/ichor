@@ -661,7 +661,12 @@ def clean_stale_ariadne_seed_outputs(
         ariadne_seeds_dir,
     )
     from ..seed_identity import read_ariadne_task_map, task_for_array_task_id
-    from .ariadne_quarantine import quarantine_root, write_quarantine_manifest
+    from .ariadne_quarantine import (
+        ensure_quarantine_capacity,
+        prepare_quarantine_manifest,
+        quarantine_root,
+        write_quarantine_manifest,
+    )
 
     campaign = Path(campaign_dir)
     iter_dir = active_iteration_dir(campaign, int(iteration))
@@ -692,6 +697,8 @@ def clean_stale_ariadne_seed_outputs(
         task = task_for_array_task_id(task_map, task_id)
         candidates.append(ariadne_seed_dir(iter_dir, int(task["seed_id"])))
     candidates.extend(sorted(seeds_dir.glob(".seed-*.partial-*")))
+    retained_candidates: List[Path] = []
+    seen_candidates = set()
     for candidate in candidates:
         if not candidate.exists() and not candidate.is_symlink():
             continue
@@ -707,12 +714,23 @@ def clean_stale_ariadne_seed_outputs(
                 "refusing to quarantine ARIADNE output outside seeds directory: "
                 + str(candidate)
             ) from exc
-        quarantine.mkdir(parents=True, exist_ok=True)
-        target = quarantine / candidate.name
-        suffix = 1
-        while target.exists():
-            target = quarantine / (candidate.name + "." + str(suffix))
-            suffix += 1
+        identity = str(candidate.resolve())
+        if identity not in seen_candidates:
+            seen_candidates.add(identity)
+            retained_candidates.append(candidate)
+    if not retained_candidates:
+        return []
+    ensure_quarantine_capacity(campaign, retained_candidates)
+    quarantine.mkdir(parents=True, exist_ok=False)
+    targets = [quarantine / candidate.name for candidate in retained_candidates]
+    prepare_quarantine_manifest(
+        campaign,
+        quarantine,
+        iteration=int(iteration),
+        source_paths=retained_candidates,
+        target_paths=targets,
+    )
+    for candidate, target in zip(retained_candidates, targets):
         shutil.move(str(candidate), str(target))
         moved_sources.append(candidate)
         moved.append(str(target))
@@ -3754,6 +3772,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             iteration=int(state.iteration),
             models_version=int(next_version),
             model_set_sha256=str(committed_model_set.model_set_sha256),
+            evidence_set_sha256=str(committed_model_set.evidence_set_sha256),
             model_set_manifest_sha256=str(
                 committed_model_set.head_manifest_sha256
             ),
@@ -4520,9 +4539,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             if isinstance(selection_diagnostics, dict):
                 diag_payload = dict(selection_diagnostics)
                 diag_payload["model_version"] = int(getattr(state, "models_version", -1))
-                diag_payload["model_set_sha256"] = str(
-                    picked["model_manifest_sha256"]
-                )
+                diag_payload["model_set_sha256"] = str(picked["model_set_sha256"])
                 diag_payload["prior_mean_contract_sha256"] = prior_contract_hash
                 diag_payload["environment_generation"] = int(
                     calibration_environment["generation"]

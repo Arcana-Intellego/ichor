@@ -168,6 +168,29 @@ ichor-al-daemon resource-plan --campaign-dir . --all
 ichor-al-daemon start --campaign-dir . --mode live --max-ticks 200
 ```
 
+The first start creates immutable execution identity and environment-generation
+records. Inspect them at any time without changing campaign state:
+
+```bash
+ichor-al-daemon environment-status --campaign-dir .
+```
+
+If Python packages, ICHOR source, ARIADNE, FEREBUS, modules, native-library
+paths or the active machine profile change, the daemon halts before submission
+or postprocess and preserves scheduler ownership. Restore the original
+environment to finish already-submitted work. Rebind only at an idle
+`SEED_SELECT` or `DONE` boundary, after reconcile reports no active or
+inconclusive scheduler ownership and live preflight passes:
+
+```bash
+ichor-al-daemon rebind-environment --campaign-dir .
+ichor-al-daemon rebind-environment --campaign-dir . --apply
+```
+
+Rebinding starts a new calibration eligibility window and invalidates derived
+acquisition reference scales. Never use it to postprocess a job submitted under
+an earlier environment generation.
+
 The submitted preflight is an explicit commissioning check: one five-minute,
 one-core Slurm job imports the configured daemon Python stack and verifies
 Gaussian, AIMAll, FEREBUS and `bc` from a compute node. It performs no

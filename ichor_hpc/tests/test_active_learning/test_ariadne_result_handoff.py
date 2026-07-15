@@ -99,6 +99,7 @@ def _selection_payload():
         iteration=1,
         models_version=0,
         model_manifest_sha256=MODEL_SHA,
+        model_set_sha256=MODEL_SHA,
         trajectory_sha256=TRAJECTORY_SHA,
         selection_strategy="hybrid_variance",
         seed_records=[{

@@ -105,6 +105,7 @@ def _seed_iter_pool(campaign_dir, iteration, results, *, config=None):
         iteration=int(iteration),
         models_version=0,
         model_manifest_sha256="c" * 64,
+        model_set_sha256="d" * 64,
         trajectory_sha256=str(trajectory_pool.sha256),
         selection_strategy="hybrid_variance",
         seed_records=seed_records,

@@ -1363,6 +1363,7 @@ def test_only_resource_resolving_array_staging_receives_partition_override(
         iteration,
         sample_xyz,
         *,
+        campaign_uid=None,
         partition_override=None,
     ):
         calls["gaussian"] = {
@@ -1370,6 +1371,7 @@ def test_only_resource_resolving_array_staging_receives_partition_override(
             "phase_name": phase_name,
             "iteration": iteration,
             "sample_xyz": Path(sample_xyz),
+            "campaign_uid": campaign_uid,
             "partition_override": partition_override,
         }
         return campaign / "gaussian-stage", 3
@@ -1430,6 +1432,7 @@ def _write_minimal_ariadne_task_map(iter_dir):
         iteration=1,
         models_version=0,
         model_manifest_sha256="c" * 64,
+        model_set_sha256="e" * 64,
         trajectory_sha256="d" * 64,
         selection_strategy="hybrid_variance",
         seed_records=[{

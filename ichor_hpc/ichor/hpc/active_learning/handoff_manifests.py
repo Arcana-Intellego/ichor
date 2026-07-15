@@ -461,6 +461,7 @@ def build_seed_selection_manifest(
     iteration: int,
     models_version: int,
     model_manifest_sha256: str,
+    model_set_sha256: str,
     trajectory_sha256: str,
     selection_strategy: str,
     seed_records: Sequence[Dict[str, Any]],
@@ -477,6 +478,7 @@ def build_seed_selection_manifest(
         raise HandoffManifestError("seed selection strategy is invalid")
     for label, digest in (
         ("model_manifest_sha256", model_manifest_sha256),
+        ("model_set_sha256", model_set_sha256),
         ("trajectory_sha256", trajectory_sha256),
     ):
         if (
@@ -556,6 +558,7 @@ def build_seed_selection_manifest(
         "iteration": iteration_value,
         "models_version": model_version,
         "model_manifest_sha256": model_manifest_sha256,
+        "model_set_sha256": model_set_sha256,
         "trajectory_sha256": trajectory_sha256,
         "selection_strategy": selection_strategy,
         "n_picked": len(records),
@@ -587,7 +590,7 @@ def build_seed_selection_manifest(
             seed_id=record["seed_id"],
             frame_id=record["frame_id"],
             models_version=model_version,
-            model_manifest_sha256=model_manifest_sha256,
+            model_set_sha256=model_set_sha256,
             selection_fingerprint_sha256_value=fingerprint,
         )
     return payload
@@ -643,7 +646,7 @@ def load_seeds_picked(iter_dir: Any, *, expected_iteration: Optional[int] = None
     strategy = data.get("selection_strategy")
     if strategy not in {"hybrid_variance", "d_optimal"}:
         raise HandoffManifestError("seed selection strategy is invalid")
-    for key in ("model_manifest_sha256", "trajectory_sha256"):
+    for key in ("model_manifest_sha256", "model_set_sha256", "trajectory_sha256"):
         value = str(data.get(key) or "")
         if len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
             raise HandoffManifestError("seed selection " + key + " is invalid")
@@ -767,7 +770,7 @@ def load_seeds_picked(iter_dir: Any, *, expected_iteration: Optional[int] = None
             seed_id=record["seed_id"],
             frame_id=record["frame_id"],
             models_version=models_version,
-            model_manifest_sha256=str(data["model_manifest_sha256"]),
+            model_set_sha256=str(data["model_set_sha256"]),
             selection_fingerprint_sha256_value=expected_fingerprint,
         )
         if record["seed_uid"] != expected_seed_uid:

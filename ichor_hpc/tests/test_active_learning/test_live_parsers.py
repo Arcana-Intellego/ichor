@@ -1548,6 +1548,7 @@ def _write_seeds_picked(campaign_dir, iteration, n_seeds):
         iteration=int(iteration),
         models_version=0,
         model_manifest_sha256="c" * 64,
+        model_set_sha256="d" * 64,
         trajectory_sha256=str(pool.sha256),
         selection_strategy="hybrid_variance",
         seed_records=[

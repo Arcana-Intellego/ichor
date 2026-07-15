@@ -109,6 +109,7 @@ class TrainedModelSet:
     tasks: Tuple[TrainedModelTask, ...]
     root_files: Tuple[TrainedModelFile, ...]
     model_set_sha256: str
+    evidence_set_sha256: str
     head_manifest_sha256: str
     root: Path
 
@@ -393,7 +394,36 @@ def _validate_root_file_records(root_files: Sequence[TrainedModelFile]) -> None:
 
 
 def _model_set_identity(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return only prediction-affecting model structure and file bytes."""
+    tasks = payload.get("tasks")
+    scientific_tasks = []
+    if isinstance(tasks, list):
+        for task in tasks:
+            if not isinstance(task, Mapping):
+                scientific_tasks.append(task)
+                continue
+            scientific_tasks.append({
+                "task_index": task.get("task_index"),
+                "property": task.get("property"),
+                "atom": task.get("atom"),
+                "alf_1_indexed": task.get("alf_1_indexed"),
+                "directory": task.get("directory"),
+                "model": task.get("model"),
+                "config": task.get("config"),
+            })
     return {
+        "system": payload.get("system"),
+        "properties": payload.get("properties"),
+        "atoms": payload.get("atoms"),
+        "tasks": scientific_tasks,
+    }
+
+
+def _evidence_set_identity(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return complete immutable training and quality provenance evidence."""
+    return {
+        "schema_version": payload.get("schema_version"),
+        "storage_mode": payload.get("storage_mode"),
         "campaign_uid": payload.get("campaign_uid"),
         "system": payload.get("system"),
         "models_version": payload.get("models_version"),
@@ -409,7 +439,9 @@ def _model_set_identity(payload: Mapping[str, Any]) -> Dict[str, Any]:
         "quality_decision_manifest": payload.get("quality_decision_manifest"),
         "properties": payload.get("properties"),
         "atoms": payload.get("atoms"),
+        "n_tasks": payload.get("n_tasks"),
         "tasks": payload.get("tasks"),
+        "root_files": payload.get("root_files"),
     }
 
 
@@ -462,6 +494,9 @@ def build_trained_model_set_payload(
         "root_files": [dict(value) for value in root_files],
     }
     payload["model_set_sha256"] = canonical_json_sha256(_model_set_identity(payload))
+    payload["evidence_set_sha256"] = canonical_json_sha256(
+        _evidence_set_identity(payload)
+    )
     return payload
 
 
@@ -1049,6 +1084,10 @@ def validate_trained_model_snapshot(
         _model_set_identity(payload)
     ):
         raise TrainedModelError("trained-model set SHA mismatch")
+    if _safe_sha(
+        payload.get("evidence_set_sha256"), "evidence_set_sha256"
+    ) != canonical_json_sha256(_evidence_set_identity(payload)):
+        raise TrainedModelError("trained-model evidence-set SHA mismatch")
     _validate_exact_inventory(
         root,
         tasks,
@@ -1072,6 +1111,7 @@ def validate_trained_model_snapshot(
         tasks=tasks,
         root_files=root_files,
         model_set_sha256=str(payload["model_set_sha256"]),
+        evidence_set_sha256=str(payload["evidence_set_sha256"]),
         head_manifest_sha256=sha256_file(trained_model_set_path(root)),
         root=root.resolve(),
     )
@@ -1137,6 +1177,10 @@ def resolve_trained_model_set(
             payload.get("model_set_sha256"), "model_set_sha256"
         ) != canonical_json_sha256(_model_set_identity(payload)):
             raise TrainedModelError("trained-model set SHA mismatch")
+        if _safe_sha(
+            payload.get("evidence_set_sha256"), "evidence_set_sha256"
+        ) != canonical_json_sha256(_evidence_set_identity(payload)):
+            raise TrainedModelError("trained-model evidence-set SHA mismatch")
         head_sha = sha256_file(manifest_path)
         if version != target_version:
             previous_manifest_sha = head_sha
@@ -1230,6 +1274,7 @@ def resolve_trained_model_set(
             tasks=tasks,
             root_files=root_files,
             model_set_sha256=str(payload["model_set_sha256"]),
+            evidence_set_sha256=str(payload["evidence_set_sha256"]),
             head_manifest_sha256=head_sha,
             root=version_root.resolve(),
         )

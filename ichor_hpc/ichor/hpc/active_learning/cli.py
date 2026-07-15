@@ -31,6 +31,7 @@ import sys
 import time
 import numpy as np
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -367,6 +368,35 @@ def _probe_daemon_lock(lock_path: Path) -> dict:
     return status
 
 
+@contextmanager
+def _exclusive_operator_lock(campaign: Path):
+    """Hold the daemon lock across an authoritative operator mutation."""
+    import portalocker
+
+    lock_path = operational_path(campaign, DAEMON_LOCK_FILENAME)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock = portalocker.Lock(
+        str(lock_path),
+        mode="a+",
+        timeout=0,
+        fail_when_locked=True,
+        flags=portalocker.LOCK_EX | portalocker.LOCK_NB,
+    )
+    try:
+        lock.acquire()
+    except (portalocker.AlreadyLocked, portalocker.LockException) as exc:
+        raise RuntimeError(
+            "daemon lock is held; refusing concurrent operator mutation"
+        ) from exc
+    try:
+        yield
+    finally:
+        try:
+            lock.release()
+        except Exception:
+            pass
+
+
 def _runtime_liveness_policy(campaign: Path) -> Tuple[int, int]:
     try:
         config = CampaignConfig.from_yaml(Path(campaign) / "campaign.yaml")
@@ -512,11 +542,24 @@ def _lease_is_fresh(
     ).fresh
 
 
-def _reconcile_runtime_status(campaign: Path) -> Dict[str, Any]:
+def _reconcile_runtime_status(
+    campaign: Path,
+    *,
+    operator_lock_owned: bool = False,
+) -> Dict[str, Any]:
     paths = _campaign_paths(campaign)
     stale_seconds, clock_skew = _runtime_liveness_policy(campaign)
     status: Dict[str, Any] = {}
-    status.update(_probe_daemon_lock(paths["lock"]))
+    if operator_lock_owned:
+        status.update(
+            {
+                "lock_file_exists": paths["lock"].exists(),
+                "lock_held": False,
+                "operator_lock_owned": True,
+            }
+        )
+    else:
+        status.update(_probe_daemon_lock(paths["lock"]))
     status.update(
         _probe_daemon_lease(
             paths["lease"],
@@ -5884,7 +5927,34 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         args.campaign_dir,
         require_campaign_yaml=False,
     )
-    runtime_status = _reconcile_runtime_status(campaign)
+    authoritative_mutation = bool(getattr(args, "apply", False)) or restore_lock
+    if authoritative_mutation and not bool(
+        getattr(args, "_operator_lock_owned", False)
+    ):
+        try:
+            with _exclusive_operator_lock(campaign):
+                args._operator_lock_owned = True
+                return cmd_reconcile(args)
+        except (OSError, RuntimeError) as exc:
+            print("reconcile mutation blocked: " + str(exc), file=sys.stderr)
+            return 3
+        finally:
+            args._operator_lock_owned = False
+    operator_lock_owned = bool(getattr(args, "_operator_lock_owned", False))
+    try:
+        accepts_lock_ownership = (
+            "operator_lock_owned"
+            in inspect.signature(_reconcile_runtime_status).parameters
+        )
+    except (TypeError, ValueError):
+        accepts_lock_ownership = False
+    if operator_lock_owned and accepts_lock_ownership:
+        runtime_status = _reconcile_runtime_status(
+            campaign,
+            operator_lock_owned=True,
+        )
+    else:
+        runtime_status = _reconcile_runtime_status(campaign)
     if scratch_attempts and not clean_scratch:
         print("refusing --scratch-attempt without --clean-scratch", file=sys.stderr)
         return 2
@@ -8178,6 +8248,116 @@ def cmd_resource_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_environment_status(args: argparse.Namespace) -> int:
+    """Compare the current process/native stack with the bound generation."""
+    from .execution_identity import (
+        environment_status,
+        read_execution_identity,
+    )
+
+    try:
+        campaign = resolve_campaign_dir(args.campaign_dir)
+        config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+        state = read_state(operational_path(campaign, DEFAULT_STATE_FILENAME))
+        identity = read_execution_identity(
+            campaign,
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+        payload = environment_status(
+            campaign,
+            campaign_uid=str(state.campaign_uid),
+            config=config,
+        )
+        payload["mode"] = str(identity["mode"])
+        payload["phase"] = state.phase.value
+        payload["iteration"] = int(state.iteration)
+    except (OSError, TypeError, ValueError) as exc:
+        print("environment-status failed: " + str(exc), file=sys.stderr)
+        return 2
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
+    else:
+        print(
+            "Environment status: "
+            + ("MATCH" if payload["matches"] else "DRIFTED")
+        )
+        print("Generation: " + str(payload["generation"]))
+        print("Mode: " + str(payload["mode"]))
+        if payload["changed_fields"]:
+            print("Changed fields: " + ", ".join(payload["changed_fields"]))
+    return 0 if bool(payload["matches"]) else 18
+
+
+def cmd_rebind_environment(args: argparse.Namespace) -> int:
+    """Create a new verified environment generation at an idle boundary."""
+    from .execution_identity import (
+        environment_status,
+        read_execution_identity,
+        rebind_environment,
+    )
+
+    try:
+        campaign = resolve_campaign_dir(args.campaign_dir)
+        config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+        state = read_state(operational_path(campaign, DEFAULT_STATE_FILENAME))
+        identity = read_execution_identity(
+            campaign,
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+        if not bool(getattr(args, "apply", False)):
+            payload = environment_status(
+                campaign,
+                campaign_uid=str(state.campaign_uid),
+                config=config,
+            )
+            payload["applied"] = False
+            payload["mode"] = str(identity["mode"])
+        else:
+            with _exclusive_operator_lock(campaign):
+                runtime = _reconcile_runtime_status(
+                    campaign,
+                    operator_lock_owned=True,
+                )
+                blockers = list(runtime.get("reconcile_apply_blockers") or [])
+                if blockers:
+                    raise ValueError(
+                        "environment rebind is blocked: " + "; ".join(blockers)
+                    )
+                live_preflight_ok = False
+                if str(identity["mode"]) == "live":
+                    availability = check_backends()
+                    live_preflight_ok = bool(availability.all_present)
+                    if not live_preflight_ok:
+                        raise ValueError(missing_backend_message(availability))
+                payload = rebind_environment(
+                    campaign,
+                    config=config,
+                    live_preflight_ok=live_preflight_ok,
+                    scheduler_ownership_clear=True,
+                )
+                payload["applied"] = True
+                payload["mode"] = str(identity["mode"])
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        print("rebind-environment failed: " + str(exc), file=sys.stderr)
+        return 2
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
+    elif not bool(getattr(args, "apply", False)):
+        print(
+            "Environment rebind preview: "
+            + ("not required" if payload["matches"] else "required")
+        )
+        if payload["changed_fields"]:
+            print("Changed fields: " + ", ".join(payload["changed_fields"]))
+        print("Re-run with --apply after reviewing scheduler ownership.")
+    elif bool(payload.get("changed", False)):
+        print("Environment rebound to generation " + str(payload["generation"]))
+        print("Generation SHA-256: " + str(payload["generation_digest_sha256"]))
+    else:
+        print(str(payload.get("message") or "Environment already matches."))
+    return 0
+
+
 def _checkpoint_destination(
     config: CampaignConfig,
     override: Optional[str],
@@ -8202,13 +8382,14 @@ def cmd_checkpoint(args: argparse.Namespace) -> int:
             config,
             getattr(args, "destination", None),
         )
-        payload = create_checkpoint(
-            campaign,
-            destination,
-            verify_after_write=True,
-            allow_active_lease=False,
-        )
-    except (OSError, TypeError, ValueError) as exc:
+        with _exclusive_operator_lock(campaign):
+            payload = create_checkpoint(
+                campaign,
+                destination,
+                verify_after_write=True,
+                allow_active_lease=False,
+            )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
         print("checkpoint failed: " + str(exc), file=sys.stderr)
         return 2
     if bool(getattr(args, "json", False)):
@@ -8869,6 +9050,27 @@ Examples:
         help="Print schema-v2 machine-readable JSON.",
     )
     p_resource.set_defaults(func=cmd_resource_plan)
+
+    p_environment_status = sub.add_parser(
+        "environment-status",
+        help="Compare the current software/native stack with the active generation.",
+    )
+    add_campaign(p_environment_status)
+    p_environment_status.add_argument("--json", action="store_true")
+    p_environment_status.set_defaults(func=cmd_environment_status)
+
+    p_rebind_environment = sub.add_parser(
+        "rebind-environment",
+        help="Bind an idle campaign to a newly verified environment generation.",
+    )
+    add_campaign(p_rebind_environment)
+    p_rebind_environment.add_argument(
+        "--apply",
+        action="store_true",
+        help="Create and publish the new generation after all safety checks pass.",
+    )
+    p_rebind_environment.add_argument("--json", action="store_true")
+    p_rebind_environment.set_defaults(func=cmd_rebind_environment)
 
     p_checkpoint = sub.add_parser(
         "checkpoint",

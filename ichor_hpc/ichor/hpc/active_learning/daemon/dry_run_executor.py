@@ -1134,6 +1134,7 @@ class DryRunPhaseExecutor:
             iteration=int(state.iteration),
             models_version=int(model_version),
             model_manifest_sha256=str(model_set.head_manifest_sha256),
+            model_set_sha256=str(model_set.model_set_sha256),
             trajectory_sha256=pool.sha256,
             selection_strategy=str(self.config.seed_selection.strategy),
             seed_records=seed_records,
@@ -1834,9 +1835,7 @@ class DryRunPhaseExecutor:
                 if isinstance(result_payload.get("selection_diagnostics"), dict):
                     result_payload["selection_diagnostics"].update({
                         "model_version": int(state.models_version),
-                        "model_set_sha256": str(
-                            picked_payload["model_manifest_sha256"]
-                        ),
+                        "model_set_sha256": str(picked_payload["model_set_sha256"]),
                         "prior_mean_contract_sha256": prior_contract_hash,
                         "environment_generation": int(
                             calibration_environment["generation"]
@@ -1933,7 +1932,7 @@ class DryRunPhaseExecutor:
             if isinstance(result_payload.get("selection_diagnostics"), dict):
                 diagnostic_payload = dict(result_payload["selection_diagnostics"])
                 diagnostic_payload.update({
-                    "model_set_sha256": str(picked_payload["model_manifest_sha256"]),
+                    "model_set_sha256": str(picked_payload["model_set_sha256"]),
                     "prior_mean_contract_sha256": prior_contract_hash,
                     "environment_generation": int(calibration_environment["generation"]),
                     "environment_generation_digest_sha256": str(

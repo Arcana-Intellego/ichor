@@ -73,6 +73,7 @@ def _write_strict_history(
         iteration=int(iteration),
         models_version=0,
         model_manifest_sha256="a" * 64,
+        model_set_sha256="c" * 64,
         trajectory_sha256="b" * 64,
         selection_strategy="hybrid_variance",
         seed_records=[{
@@ -585,6 +586,7 @@ def test_scale_model_populates_per_seed_records_from_seed_records(tmp_path):
         iteration=1,
         models_version=0,
         model_manifest_sha256="a" * 64,
+        model_set_sha256="c" * 64,
         trajectory_sha256="b" * 64,
         selection_strategy="d_optimal",
         seed_records=[

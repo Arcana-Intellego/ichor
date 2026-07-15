@@ -154,6 +154,8 @@ KNOWN_EVENT_TYPES = (
     "daemon_lease_cleanup_failed",
     "daemon_lease_heartbeat_failed",
     "daemon_lease_heartbeat_recovered",
+    "environment_drift_halted",
+    "environment_rebound",
     "ariadne_seed_provenance_repaired",
     "ariadne_seed_provenance_staged",
     "ariadne_stale_outputs_quarantined",

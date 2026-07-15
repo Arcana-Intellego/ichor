@@ -105,18 +105,6 @@ def _ichor_package_tree_sha256() -> str:
     return _tree_hash(roots)
 
 
-def _read_json_object(path: Path, label: str) -> Dict[str, Any]:
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(label + " is not a regular file: " + str(path))
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise ValueError(label + " is unreadable: " + str(path)) from exc
-    if not isinstance(payload, dict):
-        raise ValueError(label + " must contain a JSON object")
-    return payload
-
-
 def capture_implementation_identity(
     campaign_dir: Union[str, Path],
     *,
@@ -140,19 +128,19 @@ def capture_implementation_identity(
     generation_record = None
     generation_digest = None
     if current_path.exists() or current_path.is_symlink():
-        current = _read_json_object(current_path, "active environment pointer")
-        if current.get("schema_version") != 1:
-            raise ValueError("active environment pointer has an unsupported schema")
-        generation_relative = current.get("generation_path")
-        if not isinstance(generation_relative, str) or not generation_relative:
-            raise ValueError("active environment pointer has no generation path")
-        generation_path = campaign_owned_path(campaign, campaign / generation_relative)
-        generation = _read_json_object(generation_path, "environment generation")
-        generation_digest = str(current.get("generation_digest_sha256") or "")
-        if len(generation_digest) != 64:
-            raise ValueError("active environment generation digest is malformed")
-        if str(generation.get("digest_sha256") or "") != generation_digest:
-            raise ValueError("active environment generation pointer has drifted")
+        from ..execution_identity import (
+            read_active_environment_generation,
+            read_execution_identity,
+        )
+
+        identity = read_execution_identity(campaign)
+        active = read_active_environment_generation(
+            campaign,
+            expected_campaign_uid=str(identity["campaign_uid"]),
+        )
+        generation_path = Path(active["generation_path"])
+        generation = active["generation"]
+        generation_digest = str(generation["digest_sha256"])
         current_record = _file_record(current_path)
         generation_record = _file_record(generation_path)
     elif require_environment_generation:

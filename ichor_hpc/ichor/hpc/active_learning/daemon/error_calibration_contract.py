@@ -9,7 +9,11 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from ichor.core.adversarial.error_calibration import CALIBRATION_OUTPUT_UNITS
 
-from ..execution_identity import environment_current_path
+from ..execution_identity import (
+    environment_current_path,
+    read_active_environment_generation,
+    read_execution_identity,
+)
 from ..strict_json import strict_json as json
 
 
@@ -133,24 +137,23 @@ def active_environment_binding(campaign_dir: Any) -> Dict[str, Any]:
             "bound": False,
         }
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        identity = read_execution_identity(campaign_dir)
+        active = read_active_environment_generation(
+            campaign_dir,
+            expected_campaign_uid=str(identity["campaign_uid"]),
+        )
+    except (OSError, ValueError, KeyError) as exc:
         raise CalibrationContractError(
             "active environment-generation record is unreadable"
         ) from exc
-    if not isinstance(payload, dict):
-        raise CalibrationContractError(
-            "active environment-generation record must be an object"
-        )
-    if payload.get("schema_version") != 1:
-        raise CalibrationContractError("unsupported active environment schema")
+    payload = active["generation"]
     return {
         "generation": exact_int(
             payload.get("generation"),
             "environment generation",
         ),
         "generation_digest_sha256": digest(
-            payload.get("generation_digest_sha256"),
+            payload.get("digest_sha256"),
             "environment generation digest",
         ),
         "bound": True,

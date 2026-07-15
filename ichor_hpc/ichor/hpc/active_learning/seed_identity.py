@@ -61,8 +61,8 @@ def selection_fingerprint_payload(selection: Mapping[str, Any]) -> Dict[str, Any
             "models_version",
             minimum=0,
         ),
-        "model_manifest_sha256": str(
-            selection.get("model_manifest_sha256") or ""
+        "model_set_sha256": str(
+            selection.get("model_set_sha256") or ""
         ),
         "trajectory_sha256": str(selection.get("trajectory_sha256") or ""),
         "records": [
@@ -93,7 +93,7 @@ def deterministic_seed_uid(
     seed_id: int,
     frame_id: Optional[int],
     models_version: int,
-    model_manifest_sha256: str,
+    model_set_sha256: str,
     selection_fingerprint_sha256_value: str,
 ) -> str:
     payload = {
@@ -106,7 +106,7 @@ def deterministic_seed_uid(
             minimum=0,
         ),
         "models_version": _integer(models_version, "models_version", minimum=0),
-        "model_manifest_sha256": str(model_manifest_sha256),
+        "model_set_sha256": str(model_set_sha256),
         "selection_fingerprint_sha256": str(
             selection_fingerprint_sha256_value
         ),
@@ -131,8 +131,15 @@ def write_ariadne_task_map(
         minimum=0,
     )
     model_sha = str(selection.get("model_manifest_sha256") or "")
-    if len(model_sha) != 64:
-        raise SeedIdentityError("model manifest SHA-256 is invalid")
+    model_set_sha = str(selection.get("model_set_sha256") or "")
+    for label, value in (
+        ("model manifest", model_sha),
+        ("scientific model set", model_set_sha),
+    ):
+        if len(value) != 64 or any(
+            character not in "0123456789abcdef" for character in value
+        ):
+            raise SeedIdentityError(label + " SHA-256 is invalid")
     fingerprint = selection_fingerprint_sha256(selection)
     records = list(selection.get("seed_records") or [])
     tasks = []
@@ -154,7 +161,7 @@ def write_ariadne_task_map(
             seed_id=seed_id,
             frame_id=frame_id,
             models_version=models_version,
-            model_manifest_sha256=model_sha,
+            model_set_sha256=model_set_sha,
             selection_fingerprint_sha256_value=fingerprint,
         )
         tasks.append(
@@ -180,6 +187,7 @@ def write_ariadne_task_map(
         "iteration": int(iteration),
         "models_version": int(models_version),
         "model_manifest_sha256": model_sha,
+        "model_set_sha256": model_set_sha,
         "trajectory_sha256": str(selection.get("trajectory_sha256") or ""),
         "selection_fingerprint_sha256": fingerprint,
         "selection_manifest": {
@@ -247,6 +255,7 @@ def read_ariadne_task_map(
         "campaign_uid",
         "models_version",
         "model_manifest_sha256",
+        "model_set_sha256",
         "trajectory_sha256",
     ):
         if str(payload.get(field)) != str(selection.get(field)):
@@ -276,7 +285,7 @@ def read_ariadne_task_map(
             seed_id=seed_id,
             frame_id=task.get("frame_id"),
             models_version=int(payload["models_version"]),
-            model_manifest_sha256=str(payload["model_manifest_sha256"]),
+            model_set_sha256=str(payload["model_set_sha256"]),
             selection_fingerprint_sha256_value=fingerprint,
         )
         if str(task.get("seed_uid") or "") != expected_uid:

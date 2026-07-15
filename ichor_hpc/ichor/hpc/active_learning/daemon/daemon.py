@@ -315,6 +315,9 @@ class Daemon:
     )
     _lease_heartbeat_failures: int = field(default=0, init=False, repr=False)
     _lease_failure_message: Optional[str] = field(default=None, init=False, repr=False)
+    _last_environment_binding: Optional[Dict[str, Any]] = field(
+        default=None, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         self.campaign_dir = Path(self.campaign_dir)
@@ -1233,6 +1236,100 @@ class Daemon:
                 return self._halt(state, phase, reason)
         return None
 
+    def _verify_environment_boundary(
+        self,
+        state: CampaignState,
+        phase: CampaignPhase,
+        *,
+        boundary: str,
+    ) -> Optional[str]:
+        """Fail closed if an initialised campaign's execution bytes drifted."""
+        from ..execution_identity import (
+            ExecutionIdentityError,
+            assert_environment_unchanged,
+            execution_identity_path,
+        )
+
+        self._last_environment_binding = None
+        identity_path = execution_identity_path(self.campaign_dir)
+        if not identity_path.exists() and not identity_path.is_symlink():
+            # Direct unit-level daemon construction remains supported.  The
+            # public start path always creates the identity before execution.
+            return None
+        try:
+            status = assert_environment_unchanged(
+                self.campaign_dir,
+                campaign_uid=str(state.campaign_uid),
+                config=self.config,
+            )
+        except (ExecutionIdentityError, OSError, ValueError) as exc:
+            return self._halt_environment_drift(
+                state,
+                phase,
+                "environment_drift_before_"
+                + str(boundary)
+                + ": "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:200],
+            )
+        self._last_environment_binding = {
+            "generation": int(status["generation"]),
+            "generation_digest_sha256": str(
+                status["generation_digest_sha256"]
+            ),
+        }
+        return None
+
+    def _verify_intent_environment_binding(
+        self,
+        state: CampaignState,
+        phase: CampaignPhase,
+        intent: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Require submitted work to remain bound to its exact generation."""
+        from ..execution_identity import execution_identity_path
+
+        if phase.value not in SBATCH_PHASES:
+            return None
+        identity_path = execution_identity_path(self.campaign_dir)
+        if not identity_path.exists() and not identity_path.is_symlink():
+            return None
+        try:
+            bound_intent = intent or _submission_intent.load_intent(
+                self.campaign_dir,
+                phase.value,
+                int(state.iteration),
+                expected_campaign_uid=str(state.campaign_uid),
+            )
+            if self._last_environment_binding is None:
+                raise ValueError("active environment binding is unavailable")
+            intent_generation = bound_intent.get("environment_generation")
+            intent_digest = bound_intent.get(
+                "environment_generation_digest_sha256"
+            )
+            if intent_generation is None or intent_digest is None:
+                raise ValueError("submission intent has no environment binding")
+            if int(intent_generation) != int(
+                self._last_environment_binding["generation"]
+            ) or str(intent_digest) != str(
+                self._last_environment_binding["generation_digest_sha256"]
+            ):
+                raise ValueError(
+                    "submission intent environment generation does not match "
+                    "the active generation"
+                )
+        except (OSError, TypeError, ValueError) as exc:
+            return self._halt_environment_drift(
+                state,
+                phase,
+                "submission_intent_environment_binding_invalid: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:200],
+            )
+        return None
+
     def _strict_artifact_checks_enabled(self) -> bool:
         return bool(getattr(self.executor, "strict_committed_artifact_verification", False))
 
@@ -1302,6 +1399,13 @@ class Daemon:
     def _on_phase_entry(self, state: CampaignState, phase: CampaignPhase) -> str:
         """Called once when entering a phase with no pending JobID."""
         phase_name = phase.value
+        environment_status = self._verify_environment_boundary(
+            state,
+            phase,
+            boundary="submission",
+        )
+        if environment_status is not None:
+            return environment_status
         verify_status = self._verify_committed_artifacts_if_enabled(state, phase)
         if verify_status is not None:
             return verify_status
@@ -1322,6 +1426,14 @@ class Daemon:
                     "submission_intent_invalid: "
                     + type(exc).__name__ + ": " + str(exc)[:160],
                 )
+        if active_intent is not None:
+            intent_environment_status = self._verify_intent_environment_binding(
+                state,
+                phase,
+                active_intent,
+            )
+            if intent_environment_status is not None:
+                return intent_environment_status
         # before submitting, check whether a job for THIS phase+iteration is already running on the
         # cluster. a crash in the submit->persist window just below, or a reconcile that cleared
         # pending_jobs, can leave a real job running that state.json has forgotten -- resubmitting
@@ -1518,6 +1630,20 @@ class Daemon:
                     expected_tasks=planned_expected_tasks,
                     decision_contract=self._submission_decision_contract(),
                     scheduler_identity_kind=self.scheduler_identity_kind,
+                    environment_generation=(
+                        None
+                        if self._last_environment_binding is None
+                        else int(self._last_environment_binding["generation"])
+                    ),
+                    environment_generation_digest_sha256=(
+                        None
+                        if self._last_environment_binding is None
+                        else str(
+                            self._last_environment_binding[
+                                "generation_digest_sha256"
+                            ]
+                        )
+                    ),
                 )
                 intent_written = True
             except Exception as exc:
@@ -2456,6 +2582,19 @@ class Daemon:
         observations: Sequence[JobObservation],
         summary,
     ) -> str:
+        environment_status = self._verify_environment_boundary(
+            state,
+            phase,
+            boundary="postprocess",
+        )
+        if environment_status is not None:
+            return environment_status
+        intent_environment_status = self._verify_intent_environment_binding(
+            state,
+            phase,
+        )
+        if intent_environment_status is not None:
+            return intent_environment_status
         attempts = max(1, int(getattr(self.config.runtime, "postprocess_settle_attempts", 3)))
         settle_seconds = max(0, int(getattr(self.config.runtime, "postprocess_settle_seconds", 10)))
         result = None
@@ -3149,6 +3288,41 @@ class Daemon:
             preserves_pending_jobs=True,
             preserves_submission_intent=True,
             iteration=state.iteration,
+        )
+        return TickStatus.HALTED
+
+    def _halt_environment_drift(
+        self,
+        state: CampaignState,
+        phase: CampaignPhase,
+        reason: str,
+    ) -> str:
+        """Halt without changing scheduler ownership or submission evidence."""
+        pending_job = state.pending_jobs.get(phase.value)
+        state.lifecycle_context = make_lifecycle_context(
+            disposition="halted",
+            reason_code="environment_drift",
+            message=str(reason),
+            from_phase=phase,
+            iteration=int(state.iteration),
+            source="daemon_environment_guard",
+            job_id=None if pending_job is None else str(pending_job),
+            scheduler_uncertain=bool(pending_job),
+            recovery_action=(
+                "inspect environment-status, preserve scheduler evidence, then "
+                "reconcile to an idle boundary before rebind-environment"
+            ),
+        )
+        state.phase = CampaignPhase.HALTED
+        self._persist(state)
+        self._journal(
+            "environment_drift_halted",
+            from_phase=phase.value,
+            iteration=int(state.iteration),
+            reason=str(reason),
+            job_id=None if pending_job is None else str(pending_job),
+            preserves_pending_jobs=True,
+            preserves_submission_intent=True,
         )
         return TickStatus.HALTED
 

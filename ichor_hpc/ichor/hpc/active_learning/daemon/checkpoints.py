@@ -187,6 +187,19 @@ def _validate_idle_boundary(
     ]
     if active:
         raise ValueError("checkpoint creation is blocked by active submission intents")
+    from ..execution_identity import (
+        read_active_environment_generation,
+        read_execution_identity,
+    )
+
+    read_execution_identity(
+        campaign_dir,
+        expected_campaign_uid=str(state.campaign_uid),
+    )
+    read_active_environment_generation(
+        campaign_dir,
+        expected_campaign_uid=str(state.campaign_uid),
+    )
     lease = campaign_dir / ".DATA" / "ACTIVE_LEARNING" / "daemon.lease.d"
     if lease.exists() and not allow_active_lease:
         raise ValueError(
@@ -566,6 +579,19 @@ def restore_checkpoint(
         from ..config import CampaignConfig
 
         CampaignConfig.from_yaml(temporary / "campaign.yaml")
+        from ..execution_identity import (
+            read_active_environment_generation,
+            read_execution_identity,
+        )
+
+        read_execution_identity(
+            temporary,
+            expected_campaign_uid=str(restored_state.campaign_uid),
+        )
+        read_active_environment_generation(
+            temporary,
+            expected_campaign_uid=str(restored_state.campaign_uid),
+        )
         verify_state_referenced_artifacts(temporary, restored_state, strict_models=True)
         os.replace(temporary, target)
         _fsync_directory(target.parent)
