@@ -1264,7 +1264,7 @@ EOF
         echo "Install complete."
     fi
     echo "Enter the runtime environment with:"
-    echo "  source ${REPO_ROOT}/scripts/env_ichor_csf.sh ${MACHINE} --smoke"
+    echo "  source ${REPO_ROOT}/scripts/env_ichor_csf.sh --smoke"
 }
 
 verify_entrypoints() {

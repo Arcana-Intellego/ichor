@@ -11,10 +11,9 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     cat >&2 <<'EOF'
 This script must be sourced, not executed:
 
-  source scripts/env_ichor_csf.sh csf3
-  source scripts/env_ichor_csf.sh csf4
-  source scripts/env_ichor_csf.sh auto
+  source scripts/env_ichor_csf.sh
   source scripts/env_ichor_csf.sh --machine csf3
+  source scripts/env_ichor_csf.sh --machine csf4
 EOF
     exit 1
 fi
@@ -26,11 +25,12 @@ source "${_ichor_env_script_dir}/lib_ichor_csf.sh"
 _ichor_env_usage() {
     cat <<'EOF'
 Usage:
+  source scripts/env_ichor_csf.sh [options]
+  source scripts/env_ichor_csf.sh --machine csf3|csf4 [options]
   source scripts/env_ichor_csf.sh auto|csf3|csf4 [options]
-  source scripts/env_ichor_csf.sh --machine auto|csf3|csf4 [options]
 
 Options:
-  --machine auto|csf3|csf4  Select machine explicitly
+  --machine csf3|csf4       Override automatic machine detection
   --venv PATH               Override venv path
   --python-prefix PATH      CSF3 private Python prefix, default ~/opt/python-3.11.15
   --plumed-prefix PATH      PLUMED prefix, default ~/opt/plumed-2.10.0

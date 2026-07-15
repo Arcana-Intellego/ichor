@@ -27,24 +27,98 @@ ichor_csf_expand_path() {
     printf '%s\n' "${value}"
 }
 
-ichor_csf_detect_machine() {
-    local requested="${1:-auto}"
-    if [[ "${requested}" != "auto" ]]; then
-        printf '%s\n' "${requested}"
+ichor_csf_detect_machine_from_evidence() {
+    local csf3_module_root_present="${1:-0}"
+    local csf4_module_root_present="${2:-0}"
+    shift 2
+
+    local evidence lower short_name
+    local evidence_csf3=0
+    local evidence_csf4=0
+    for evidence in "$@"; do
+        lower="${evidence,,}"
+        lower="${lower%%[[:space:]]*}"
+        [[ -n "${lower}" ]] || continue
+        short_name="${lower%%.*}"
+
+        if [[ "${lower}" == *csf3* ]]; then
+            evidence_csf3=1
+        fi
+        if [[ "${lower}" == *csf4* ]]; then
+            evidence_csf4=1
+        fi
+
+        # CSF3 login nodes use names such as login1; CSF4 uses zero-padded
+        # names such as login02. Match complete short hostnames only.
+        if [[ "${short_name}" =~ ^login[1-9][0-9]*$ ]]; then
+            evidence_csf3=1
+        elif [[ "${short_name}" =~ ^login0[0-9]+$ ]]; then
+            evidence_csf4=1
+        fi
+    done
+
+    if [[ "${evidence_csf3}" -eq 1 && "${evidence_csf4}" -eq 1 ]]; then
+        ichor_csf_error "conflicting CSF3/CSF4 hostname evidence; pass --machine csf3 or --machine csf4"
+        return 1
+    fi
+    if [[ "${evidence_csf3}" -eq 1 ]]; then
+        printf 'csf3\n'
+        return 0
+    fi
+    if [[ "${evidence_csf4}" -eq 1 ]]; then
+        printf 'csf4\n'
         return 0
     fi
 
-    local host
-    host="$(hostname -f 2>/dev/null || hostname 2>/dev/null || true)"
-    host="${host,,}"
-    if [[ "${host}" == *csf3* || "${host}" == *login3* ]]; then
-        printf 'csf3\n'
-    elif [[ "${host}" == *csf4* || "${host}" == *login0* ]]; then
-        printf 'csf4\n'
-    else
-        ichor_csf_error "could not auto-detect CSF3/CSF4 from hostname '${host}'"
+    if [[ "${csf3_module_root_present}" -eq 1 && "${csf4_module_root_present}" -eq 1 ]]; then
+        ichor_csf_error "both CSF3 and CSF4 module roots are visible; pass --machine csf3 or --machine csf4"
         return 1
     fi
+    if [[ "${csf3_module_root_present}" -eq 1 ]]; then
+        printf 'csf3\n'
+        return 0
+    fi
+    if [[ "${csf4_module_root_present}" -eq 1 ]]; then
+        printf 'csf4\n'
+        return 0
+    fi
+
+    ichor_csf_error "could not auto-detect CSF3/CSF4; pass --machine csf3 or --machine csf4"
+    return 1
+}
+
+ichor_csf_detect_machine() {
+    local requested="${1:-auto}"
+    case "${requested}" in
+        csf3|csf4)
+            printf '%s\n' "${requested}"
+            return 0
+            ;;
+        auto) ;;
+        *)
+            ichor_csf_error "machine must be auto, csf3, or csf4"
+            return 1
+            ;;
+    esac
+
+    local host_fqdn host_short host_plain host_environment
+    host_fqdn="$(hostname -f 2>/dev/null || true)"
+    host_short="$(hostname -s 2>/dev/null || true)"
+    host_plain="$(hostname 2>/dev/null || true)"
+    host_environment="${HOSTNAME:-}"
+
+    local csf3_module_root_present=0
+    local csf4_module_root_present=0
+    [[ -d /opt/apps/etc/modulefiles/interpreters ]] && csf3_module_root_present=1
+    [[ -d /opt/software/RI/apps ]] && csf4_module_root_present=1
+
+    ichor_csf_detect_machine_from_evidence \
+        "${csf3_module_root_present}" \
+        "${csf4_module_root_present}" \
+        "${host_fqdn}" \
+        "${host_short}" \
+        "${host_plain}" \
+        "${host_environment}"
 }
 
 ichor_csf_module_is_shell_function() {

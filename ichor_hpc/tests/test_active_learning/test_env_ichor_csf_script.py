@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -14,15 +15,72 @@ SCRIPT = REPO_ROOT / "scripts" / "env_ichor_csf.sh"
 LIB = REPO_ROOT / "scripts" / "lib_ichor_csf.sh"
 
 
+def _bash() -> str:
+    bash = shutil.which("bash")
+    if bash:
+        return bash
+    windows_roots = (os.environ.get("ProgramFiles"), os.environ.get("ProgramW6432"))
+    for root in filter(None, windows_roots):
+        candidate = Path(root) / "Git" / "bin" / "bash.exe"
+        if candidate.is_file():
+            return str(candidate)
+    pytest.skip("bash is not available on this host")
+
+
+def _run_bash(
+    source: str,
+    *,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [_bash(), "-c", source],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _make_fake_venv(tmp_path: Path, machine: str) -> tuple[Path, dict[str, str]]:
+    home = tmp_path / "home"
+    venv = home / ".venv" / f"ichor-{machine}"
+    bin_dir = venv / "bin"
+    bin_dir.mkdir(parents=True)
+    activate = bin_dir / "activate"
+    activate.write_text(
+        "\n".join(
+            (
+                f'export VIRTUAL_ENV={shlex.quote(venv.as_posix())}',
+                f'export PATH={shlex.quote(bin_dir.as_posix())}:"$PATH"',
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    for command in ("python", "ichor-cli", "ichor-al-daemon"):
+        executable = bin_dir / command
+        executable.write_text(
+            "#!/usr/bin/env bash\n"
+            "if [[ \"${1:-}\" == \"-V\" ]]; then echo 'Python 3.11 test'; fi\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+    environment = os.environ.copy()
+    environment.pop("VIRTUAL_ENV", None)
+    environment["HOME"] = home.as_posix()
+    environment["HOSTNAME"] = ""
+    return venv, environment
+
+
 def test_env_script_is_present_and_documents_sourcing():
     assert SCRIPT.is_file()
     assert os.access(SCRIPT, os.R_OK)
     text = SCRIPT.read_text(encoding="utf-8")
     assert "This script must be sourced" in text
-    assert "source scripts/env_ichor_csf.sh csf3" in text
-    assert "source scripts/env_ichor_csf.sh csf4" in text
-    assert "source scripts/env_ichor_csf.sh auto" in text
+    assert "source scripts/env_ichor_csf.sh\n" in text
     assert "source scripts/env_ichor_csf.sh --machine csf3" in text
+    assert "source scripts/env_ichor_csf.sh --machine csf4" in text
 
 
 def test_env_script_contains_required_runtime_contracts():
@@ -42,7 +100,11 @@ def test_env_script_contains_required_runtime_contracts():
     assert "ichor_csf_deactivate_existing_venv" in text
     assert "ichor_csf_warn_path_hazards" in text
     assert "ichor_csf_path_inside" in text
-    assert "--machine auto|csf3|csf4" in text
+    assert "--machine csf3|csf4" in text
+    assert "ichor_csf_detect_machine_from_evidence" in lib_text
+    assert "hostname -f" in lib_text
+    assert "hostname -s" in lib_text
+    assert "pass --machine csf3 or --machine csf4" in lib_text
     assert "--env-check" in text
     assert "--debug, --trace" in text
     assert "mktemp" in text
@@ -67,18 +129,22 @@ def test_env_script_default_setup_does_not_smoke_imports():
     assert "plumed.Plumed" not in before_smoke
 
 
+def test_machine_detection_precedes_runtime_environment_mutation():
+    text = SCRIPT.read_text(encoding="utf-8")
+    detection = 'machine="$(ichor_csf_detect_machine "${machine}")"'
+    assert text.index(detection) < text.index("ichor_csf_deactivate_existing_venv")
+    module_load = '_ichor_env_load_runtime_modules "${machine}" "${do_purge}"'
+    assert text.index(detection) < text.index(module_load)
+
+
 def test_env_script_bash_syntax():
-    bash = shutil.which("bash")
-    if not bash:
-        pytest.skip("bash is not available on this host")
+    bash = _bash()
     subprocess.run([bash, "-n", str(LIB)], check=True)
     subprocess.run([bash, "-n", str(SCRIPT)], check=True)
 
 
 def test_env_script_refuses_direct_execution():
-    bash = shutil.which("bash")
-    if not bash:
-        pytest.skip("bash is not available on this host")
+    bash = _bash()
     result = subprocess.run(
         [bash, str(SCRIPT), "csf3"],
         cwd=str(REPO_ROOT),
@@ -88,3 +154,145 @@ def test_env_script_refuses_direct_execution():
     )
     assert result.returncode != 0
     assert "must be sourced" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("machine", "fqdn", "short_name"),
+    (
+        ("csf3", "login1.csf3.itservices.manchester.ac.uk", "login1"),
+        ("csf4", "login02.csf4.itservices.manchester.ac.uk", "login02"),
+    ),
+)
+def test_env_script_sources_without_machine_argument(
+    tmp_path: Path,
+    machine: str,
+    fqdn: str,
+    short_name: str,
+):
+    venv, environment = _make_fake_venv(tmp_path, machine)
+    source = f"""
+module() {{ return 0; }}
+hostname() {{
+    case "${{1:-}}" in
+        -f) printf '%s\\n' {shlex.quote(fqdn)} ;;
+        -s|'') printf '%s\\n' {shlex.quote(short_name)} ;;
+        *) return 1 ;;
+    esac
+}}
+source {shlex.quote(SCRIPT.as_posix())}
+printf 'machine=%s\\nvenv=%s\\n' "$ICHOR_MACHINE" "$VIRTUAL_ENV"
+"""
+    result = _run_bash(source, env=environment)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"machine={machine}" in result.stdout
+    assert f"venv={venv.as_posix()}" in result.stdout
+
+
+def test_env_script_accepts_options_first_with_automatic_detection(tmp_path: Path):
+    _, environment = _make_fake_venv(tmp_path, "csf3")
+    source = f"""
+module() {{ return 0; }}
+hostname() {{ printf 'login1\\n'; }}
+source {shlex.quote(SCRIPT.as_posix())} --quiet --no-purge
+printf 'machine=%s\\n' "$ICHOR_MACHINE"
+"""
+    result = _run_bash(source, env=environment)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "machine=csf3"
+
+
+@pytest.mark.parametrize(
+    ("csf3_root", "csf4_root", "evidence", "message"),
+    (
+        (0, 0, ("login1", "login02"), "conflicting CSF3/CSF4 hostname evidence"),
+        (1, 1, ("unknown-host",), "both CSF3 and CSF4 module roots are visible"),
+        (0, 0, ("unknown-host",), "could not auto-detect CSF3/CSF4"),
+    ),
+)
+def test_machine_evidence_fails_closed(
+    csf3_root: int,
+    csf4_root: int,
+    evidence: tuple[str, ...],
+    message: str,
+):
+    arguments = " ".join(shlex.quote(value) for value in evidence)
+    source = (
+        f"source {shlex.quote(LIB.as_posix())}; "
+        f"ichor_csf_detect_machine_from_evidence {csf3_root} {csf4_root} {arguments}"
+    )
+    result = _run_bash(source)
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert "--machine csf3 or --machine csf4" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("csf3_root", "csf4_root", "evidence", "expected"),
+    (
+        (0, 0, ("login1",), "csf3"),
+        (0, 0, ("login02",), "csf4"),
+        (0, 0, ("worker.csf3.itservices.manchester.ac.uk",), "csf3"),
+        (0, 0, ("worker.csf4.itservices.manchester.ac.uk",), "csf4"),
+        (1, 0, ("unknown-host",), "csf3"),
+        (0, 1, ("unknown-host",), "csf4"),
+    ),
+)
+def test_machine_evidence_resolves_supported_sources(
+    csf3_root: int,
+    csf4_root: int,
+    evidence: tuple[str, ...],
+    expected: str,
+):
+    arguments = " ".join(shlex.quote(value) for value in evidence)
+    source = (
+        f"source {shlex.quote(LIB.as_posix())}; "
+        f"ichor_csf_detect_machine_from_evidence {csf3_root} {csf4_root} {arguments}"
+    )
+    result = _run_bash(source)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected
+
+
+@pytest.mark.parametrize(
+    ("fqdn", "short_name", "plain", "environment_host", "expected"),
+    (
+        ("node.csf3.example", "unknown", "unknown", "unknown", "csf3"),
+        ("unknown", "login02", "unknown", "unknown", "csf4"),
+        ("unknown", "unknown", "login1", "unknown", "csf3"),
+        ("unknown", "unknown", "unknown", "node.csf4.example", "csf4"),
+    ),
+)
+def test_machine_detector_consults_every_hostname_source(
+    fqdn: str,
+    short_name: str,
+    plain: str,
+    environment_host: str,
+    expected: str,
+):
+    source = f"""
+source {shlex.quote(LIB.as_posix())}
+hostname() {{
+    case "${{1:-}}" in
+        -f) printf '%s\\n' {shlex.quote(fqdn)} ;;
+        -s) printf '%s\\n' {shlex.quote(short_name)} ;;
+        '') printf '%s\\n' {shlex.quote(plain)} ;;
+        *) return 1 ;;
+    esac
+}}
+HOSTNAME={shlex.quote(environment_host)}
+ichor_csf_detect_machine auto
+"""
+    result = _run_bash(source)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected
+
+
+@pytest.mark.parametrize("machine", ("csf3", "csf4"))
+def test_explicit_machine_override_remains_available(machine: str):
+    source = (
+        f"source {shlex.quote(LIB.as_posix())}; "
+        f"ichor_csf_detect_machine {shlex.quote(machine)}"
+    )
+    result = _run_bash(source)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == machine

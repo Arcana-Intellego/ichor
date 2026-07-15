@@ -19,7 +19,7 @@ Recommended install path:
 cd ~/projects/ichor-active-learning
 bash scripts/install_ichor_csf.sh --machine csf4 --projects-dir ~/projects \
     --aimall-path ~/AIMAll/aimqb.ish
-source scripts/env_ichor_csf.sh csf4 --smoke
+source scripts/env_ichor_csf.sh --smoke
 ```
 
 The installer checks download access first, explains how to stage missing

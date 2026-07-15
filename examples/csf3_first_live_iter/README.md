@@ -11,7 +11,7 @@ Recommended install path:
 cd ~/projects/ichor-active-learning
 bash scripts/install_ichor_csf.sh --machine csf3 --projects-dir ~/projects \
     --aimall-path ~/AIMAll/aimqb.ish
-source scripts/env_ichor_csf.sh csf3 --smoke
+source scripts/env_ichor_csf.sh --smoke
 ```
 
 The installer uses private CPython 3.11 by default, checks download access,
@@ -158,8 +158,7 @@ are rejected so a staged input cannot disagree with its submitted resources.
 ## 6. Preflight and launch
 
 ```bash
-export ICHOR_MACHINE=csf3
-source ~/projects/ichor-active-learning/scripts/env_ichor_csf.sh csf3 --smoke
+source ~/projects/ichor-active-learning/scripts/env_ichor_csf.sh --smoke
 
 ichor-al-daemon init
 ichor-al-daemon preflight --campaign-dir . --verbose
