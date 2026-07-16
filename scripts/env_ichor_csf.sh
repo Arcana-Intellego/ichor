@@ -61,6 +61,39 @@ _ichor_env_module() {
     fi
 }
 
+
+_ichor_env_prepend_ld_library_paths_once() {
+    local -a prefixes=("$@")
+    local -a existing_parts
+    local prefix part skip
+    local result=""
+
+    IFS=':' read -r -a existing_parts <<< "${LD_LIBRARY_PATH:-}"
+    for prefix in "${prefixes[@]}"; do
+        if [[ -z "${prefix}" ]]; then
+            continue
+        fi
+        result="${result:+${result}:}${prefix}"
+    done
+    for part in "${existing_parts[@]}"; do
+        if [[ -z "${part}" ]]; then
+            continue
+        fi
+        skip=0
+        for prefix in "${prefixes[@]}"; do
+            if [[ "${part}" == "${prefix}" ]]; then
+                skip=1
+                break
+            fi
+        done
+        if [[ "${skip}" -eq 0 ]]; then
+            result="${result:+${result}:}${part}"
+        fi
+    done
+    export LD_LIBRARY_PATH="${result}"
+}
+
+
 _ichor_env_import_check() {
     local label="$1"
     local code="$2"
@@ -260,9 +293,11 @@ _ichor_env_main() {
     export PLUMED_LIBRARY_PATH="${plumed_prefix}/lib"
 
     if [[ "${machine}" == "csf3" ]]; then
-        export LD_LIBRARY_PATH="${python_prefix}/lib:${plumed_prefix}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+        _ichor_env_prepend_ld_library_paths_once \
+            "${python_prefix}/lib" \
+            "${plumed_prefix}/lib"
     else
-        export LD_LIBRARY_PATH="${plumed_prefix}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+        _ichor_env_prepend_ld_library_paths_once "${plumed_prefix}/lib"
     fi
 
     if [[ ! -f "${venv}/bin/activate" ]]; then
@@ -308,6 +343,7 @@ _ichor_env_main() {
 _ichor_env_main "$@"
 _ichor_env_rc=$?
 unset -f _ichor_env_usage _ichor_env_error _ichor_env_note _ichor_env_module
+unset -f _ichor_env_prepend_ld_library_paths_once
 unset -f _ichor_env_import_check _ichor_env_print_env _ichor_env_load_runtime_modules
 unset -f _ichor_env_check_venv_ownership _ichor_env_main
 unset ICHOR_ENV_QUIET _ichor_env_script_dir

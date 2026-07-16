@@ -294,6 +294,50 @@ def _job_recommendations(campaign: Path, payload: Dict[str, Any]) -> List[Status
     return recommendations
 
 
+def _scheduler_uncertain_resume_recommendation(
+    campaign: Path,
+    payload: Dict[str, Any],
+) -> Optional[StatusRecommendation]:
+    if _phase(payload) != CampaignPhase.HALTED.value:
+        return None
+    context = payload.get("lifecycle_context")
+    if not isinstance(context, dict):
+        return None
+    if context.get("scheduler_uncertain") is not True:
+        return None
+    if str(context.get("source") or "") != "daemon":
+        return None
+    pending = _active_pending_jobs(payload)
+    if len(pending) != 1:
+        return None
+    phase, job_id = next(iter(pending.items()))
+    if phase != str(context.get("from_phase") or ""):
+        return None
+    if job_id != str(context.get("job_id") or ""):
+        return None
+    intents = [
+        intent
+        for intent in _active_submission_intents(payload)
+        if str(intent.get("phase") or "") == phase
+        and str(intent.get("job_id") or "") == job_id
+        and str(intent.get("status") or "") in {"SUBMITTED", "ADOPTED"}
+        and intent.get("iteration") == context.get("iteration")
+    ]
+    if len(intents) != 1:
+        return None
+    return StatusRecommendation(
+        code="halted_scheduler_uncertain",
+        severity="required",
+        primary=(
+            "inspect Slurm accounting, then resume to re-poll the preserved job; "
+            "resume will not resubmit while scheduler ownership remains recorded"
+        ),
+        why=_short_error(context.get("message")),
+        command=_cmd(campaign, "resume") + " --mode live",
+        details=[phase + "=" + job_id],
+    )
+
+
 def _halt_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusRecommendation:
     reason = _halt_reason(payload)
     context = payload.get("lifecycle_context")
@@ -859,6 +903,13 @@ def build_status_recommendations(
                 ),
             )
         ] + stale_pid
+
+    scheduler_uncertain = _scheduler_uncertain_resume_recommendation(
+        campaign,
+        payload,
+    )
+    if scheduler_uncertain is not None:
+        return [scheduler_uncertain] + stale_pid
 
     jobs = _job_recommendations(campaign, payload)
     if jobs:

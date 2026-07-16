@@ -201,6 +201,37 @@ printf 'machine=%s\\n' "$ICHOR_MACHINE"
     assert result.stdout.strip() == "machine=csf3"
 
 
+def test_env_script_is_idempotent_for_native_library_paths(tmp_path: Path):
+    _, environment = _make_fake_venv(tmp_path, "csf3")
+    environment["LD_LIBRARY_PATH"] = "/module/runtime/lib"
+    source = f"""
+module() {{ return 0; }}
+hostname() {{ printf 'login1\n'; }}
+source {shlex.quote(SCRIPT.as_posix())} --quiet --no-purge
+first="$LD_LIBRARY_PATH"
+source {shlex.quote(SCRIPT.as_posix())} --quiet --no-purge
+second="$LD_LIBRARY_PATH"
+printf 'first=%s\nsecond=%s\n' "$first" "$second"
+"""
+
+    result = _run_bash(source, env=environment)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    values = dict(
+        line.split("=", 1)
+        for line in result.stdout.splitlines()
+        if line.startswith(("first=", "second="))
+    )
+    assert values["first"] == values["second"]
+    parts = values["second"].split(":")
+    assert sum(
+        part.endswith("/opt/python-3.11.15/lib") for part in parts
+    ) == 1
+    assert sum(
+        part.endswith("/opt/plumed-2.10.0/lib") for part in parts
+    ) == 1
+
+
 @pytest.mark.parametrize(
     ("csf3_root", "csf4_root", "evidence", "message"),
     (

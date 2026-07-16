@@ -78,6 +78,68 @@ def test_parse_sacct_single_completed():
     assert o.is_success
 
 
+def test_parse_sacct_uses_logical_array_identity_and_preserves_raw_allocation():
+    out = (
+        "17615141_0|17615143|COMPLETED|0:0|39\n"
+        "17615141_1|17615144|COMPLETED|0:0|36\n"
+        "17615141_1149|17615141|COMPLETED|0:0|30\n"
+    )
+
+    observations = parse_sacct_output(out)
+    summary = aggregate_states(
+        "17615141",
+        observations,
+        expected_task_count=3,
+        submission_kind="array",
+    )
+
+    assert [row.job_id for row in observations] == [
+        "17615141_0",
+        "17615141_1",
+        "17615141_1149",
+    ]
+    assert [row.job_id_raw for row in observations] == [
+        "17615143",
+        "17615144",
+        "17615141",
+    ]
+    assert summary.n_observed == 2
+    assert summary.out_of_range_task_indices == [1149]
+
+
+def test_recent_slurm_array_mapping_completes_all_expected_logical_tasks():
+    parent = "17615141"
+    rows = []
+    for task_index in range(1150):
+        raw_job_id = (
+            parent
+            if task_index == 1149
+            else str(17615143 + task_index)
+        )
+        rows.append(
+            parent
+            + "_"
+            + str(task_index)
+            + "|"
+            + raw_job_id
+            + "|COMPLETED|0:0|36"
+        )
+
+    summary = aggregate_states(
+        parent,
+        parse_sacct_output("\n".join(rows) + "\n"),
+        expected_task_count=1150,
+        submission_kind="array",
+    )
+
+    assert summary.is_terminal
+    assert summary.is_fully_successful
+    assert summary.n_expected == 1150
+    assert summary.n_observed == 1150
+    assert summary.n_missing == 0
+    assert summary.out_of_range_task_indices == []
+
+
 def test_parse_sacct_failed_with_exit_code():
     out = "12345|FAILED|2:0|00:05:00\n"
     obs = parse_sacct_output(out)
@@ -298,7 +360,9 @@ def test_out_of_range_array_task_is_unknown_even_when_expected_rows_are_complete
 
 
 def test_poll_job_invokes_sacct_with_correct_flags():
-    runner = _StubRunner(result=_StubResult(stdout="42|COMPLETED|0:0|00:00:01\n"))
+    runner = _StubRunner(
+        result=_StubResult(stdout="42|42|COMPLETED|0:0|00:00:01\n")
+    )
     obs = poll_job("42", sacct_runner=runner)
     assert obs[0].job_id == "42"
     assert obs[0].status is JobStatus.COMPLETED
@@ -307,7 +371,7 @@ def test_poll_job_invokes_sacct_with_correct_flags():
     call = runner.calls[0]
     assert call[0] == "sacct"
     assert "-j" in call and "42" in call
-    assert "--format=JobIDRaw,State%40,ExitCode,ElapsedRaw" in call
+    assert "--format=JobID,JobIDRaw,State%40,ExitCode,ElapsedRaw" in call
     assert "--array" in call and "-X" in call and "-P" in call and "-n" in call
 
 
@@ -423,6 +487,54 @@ def test_accounted_name_lookup_does_not_treat_partial_terminal_array_as_terminal
     assert lookup.terminal is False
     assert lookup.failed is False
     assert squeue_runner.calls
+
+
+def test_accounted_name_lookup_uses_logical_ids_from_recent_slurm():
+    from ichor.hpc.active_learning.submit.sacct_poll import (
+        find_accounted_job_by_name_detailed,
+    )
+
+    sacct_runner = _StubRunner(
+        result=_StubResult(
+            stdout=(
+                "17615141_0|17615143|COMPLETED|0:0|39\n"
+                "17615141_1|17615144|COMPLETED|0:0|36\n"
+            )
+        )
+    )
+
+    lookup = find_accounted_job_by_name_detailed(
+        "camp-GAUSSIAN-0",
+        expected_task_count=2,
+        sacct_runner=sacct_runner,
+        submission_kind="array",
+    )
+
+    assert lookup.job_id == "17615141"
+    assert lookup.terminal
+    assert lookup.successful
+    assert not lookup.failed
+    assert (
+        "--format=JobID,JobIDRaw,State%40,ExitCode,ElapsedRaw"
+        in sacct_runner.calls[0]
+    )
+
+
+def test_running_name_lookup_uses_logical_id_not_physical_raw_id():
+    sacct_runner = _StubRunner(
+        result=_StubResult(stdout="17615141_7|17615150|RUNNING\n")
+    )
+
+    lookup = find_running_job_by_name_detailed(
+        "camp-GAUSSIAN-0",
+        sacct_runner=sacct_runner,
+    )
+
+    assert lookup.job_id == "17615141"
+    assert lookup.rows == [("17615141_7", "RUNNING")]
+    assert (
+        "--format=JobID,JobIDRaw,State%40" in sacct_runner.calls[0]
+    )
 
 
 def test_find_running_job_by_name_can_fallback_to_squeue_when_sacct_empty():

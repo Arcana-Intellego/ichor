@@ -27,6 +27,7 @@ from ichor.hpc.active_learning.daemon.state import (
     CampaignPhase,
     DEFAULT_STATE_FILENAME,
     fresh_campaign_state,
+    make_lifecycle_context,
     read_state,
     write_state,
 )
@@ -1240,6 +1241,47 @@ def test_status_recommendations_cover_halted_reason_classes(tmp_path):
             "latest_halt_event": {"reason": "campaign.yaml changed"},
         },
     ) == ["halted_config_changed"]
+
+
+def test_status_recommends_repolling_preserved_scheduler_job(tmp_path):
+    campaign = _campaign_with_config(tmp_path)
+    phase = CampaignPhase.INITIAL_GAUSSIAN.value
+    job_id = "17615141"
+
+    recommendations = build_status_recommendations(
+        campaign,
+        {
+            "lock_held": False,
+            "phase": CampaignPhase.HALTED.value,
+            "iteration": 0,
+            "pending_jobs": {phase: job_id},
+            "active_submission_intents": [
+                {
+                    "phase": phase,
+                    "iteration": 0,
+                    "status": "SUBMITTED",
+                    "job_id": job_id,
+                }
+            ],
+            "lifecycle_context": {
+                "disposition": "halted",
+                "reason_code": "sacct_missing_timeout",
+                "message": "expected Slurm array rows remained missing",
+                "from_phase": phase,
+                "iteration": 0,
+                "source": "daemon",
+                "job_id": job_id,
+                "scheduler_uncertain": True,
+            },
+        },
+    )
+
+    assert [item.code for item in recommendations] == [
+        "halted_scheduler_uncertain"
+    ]
+    assert "will not resubmit" in recommendations[0].primary
+    assert recommendations[0].command.startswith("ichor-al-daemon resume ")
+    assert recommendations[0].command.endswith(" --mode live")
 
 
 @pytest.mark.parametrize(
@@ -2594,6 +2636,131 @@ def test_cli_resume_refuses_halted_state(tmp_path, capsys):
 
     assert rc == 6
     assert "campaign is HALTED" in capsys.readouterr().err
+
+
+def test_cli_resume_repolls_matching_scheduler_uncertain_job(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state(max_iterations=2)
+    phase = CampaignPhase.INITIAL_GAUSSIAN
+    job_id = "17615141"
+    state.phase = CampaignPhase.HALTED
+    state.pending_jobs[phase.value] = job_id
+    state.sacct_empty_streak = {
+        job_id + ":MISSING": 12,
+        "unrelated": 3,
+    }
+    state.lifecycle_context = make_lifecycle_context(
+        disposition="halted",
+        reason_code="sacct_missing_timeout",
+        message="expected Slurm array rows remained missing",
+        from_phase=phase,
+        iteration=0,
+        source="daemon",
+        job_id=job_id,
+        scheduler_uncertain=True,
+        recovery_action="inspect accounting, then resume",
+    )
+    _write_locked_state(campaign, state)
+    submission_intent.write_pre_submit_intent(
+        campaign,
+        campaign_uid=str(state.campaign_uid),
+        phase_name=phase.value,
+        iteration=0,
+        expected_tasks=1150,
+    )
+    submission_intent.mark_submitted(
+        campaign,
+        phase.value,
+        0,
+        job_id,
+        expected_tasks=1150,
+    )
+    started = []
+    monkeypatch.setattr(cli_mod, "cmd_start", lambda args: started.append(args) or 0)
+
+    rc = main(
+        [
+            "resume",
+            "--campaign-dir",
+            str(campaign),
+            "--mode",
+            "live",
+        ]
+    )
+
+    assert rc == 0
+    assert len(started) == 1
+    recovered = read_state(
+        campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
+    )
+    assert recovered.phase is phase
+    assert recovered.pending_jobs == {phase.value: job_id}
+    assert recovered.lifecycle_context is None
+    assert recovered.sacct_empty_streak == {"unrelated": 3}
+    intent = submission_intent.load_intent(
+        campaign,
+        phase.value,
+        0,
+        expected_campaign_uid=str(state.campaign_uid),
+    )
+    assert intent is not None
+    assert intent["status"] == "SUBMITTED"
+    assert intent["job_id"] == job_id
+    assert any(
+        event.get("event") == "scheduler_uncertain_resumed"
+        for event in iter_events(
+            campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson"
+        )
+    )
+    assert "no job was resubmitted" in capsys.readouterr().out
+
+
+def test_cli_resume_refuses_scheduler_uncertain_job_with_mismatched_intent(
+    tmp_path,
+    capsys,
+):
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state(max_iterations=2)
+    phase = CampaignPhase.INITIAL_GAUSSIAN
+    state.phase = CampaignPhase.HALTED
+    state.pending_jobs[phase.value] = "17615141"
+    state.lifecycle_context = make_lifecycle_context(
+        disposition="halted",
+        reason_code="sacct_missing_timeout",
+        message="expected Slurm array rows remained missing",
+        from_phase=phase,
+        iteration=0,
+        source="daemon",
+        job_id="17615141",
+        scheduler_uncertain=True,
+    )
+    _write_locked_state(campaign, state)
+    submission_intent.write_pre_submit_intent(
+        campaign,
+        campaign_uid=str(state.campaign_uid),
+        phase_name=phase.value,
+        iteration=0,
+        expected_tasks=1150,
+    )
+    submission_intent.mark_submitted(
+        campaign,
+        phase.value,
+        0,
+        "17615142",
+        expected_tasks=1150,
+    )
+
+    rc = main(["resume", "--campaign-dir", str(campaign), "--mode", "live"])
+
+    assert rc == 6
+    assert read_state(
+        campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
+    ).phase is CampaignPhase.HALTED
+    assert "submission-intent JobID does not match" in capsys.readouterr().err
 
 
 def test_cli_resume_refuses_done_without_explicit_reopen(tmp_path, capsys):

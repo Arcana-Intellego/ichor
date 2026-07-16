@@ -81,21 +81,41 @@ def _memory_mib(value: Any) -> Optional[float]:
 
 
 def parse_usage_rows(stdout: str) -> List[Dict[str, Any]]:
+    """Parse logical and physical identities from one ``sacct`` response.
+
+    Production rows contain ``JobID`` followed by ``JobIDRaw``.  The older
+    nine-column injected-test seam remains valid and uses its single identity
+    for both fields.
+    """
     rows: List[Dict[str, Any]] = []
     for raw in str(stdout).splitlines():
         if not raw.strip():
             continue
         parts = raw.rstrip("\n").split("|")
-        if len(parts) < 9:
+        if len(parts) >= 10:
+            job_id, job_id_raw = parts[0], parts[1]
+            values = parts[2:10]
+        elif len(parts) >= 9:
+            job_id = parts[0]
+            job_id_raw = job_id
+            values = parts[1:9]
+        else:
             raise ValueError("sacct usage row has fewer than nine columns")
-        job_id, state, exit_code, elapsed, alloc_cpus, req_mem, max_rss, max_vm, total_cpu = parts[:9]
+        state, exit_code, elapsed, alloc_cpus, req_mem, max_rss, max_vm, total_cpu = values
+        job_id = str(job_id).strip()
+        job_id_raw = str(job_id_raw).strip()
+        if not job_id:
+            raise ValueError("sacct usage row has an empty logical JobID")
+        if not job_id_raw:
+            raise ValueError("sacct usage row has an empty JobIDRaw")
         try:
             elapsed_seconds = int(elapsed or 0)
             allocated_cpus = int(alloc_cpus or 0)
         except ValueError as exc:
             raise ValueError("sacct usage row has malformed numeric fields") from exc
         rows.append({
-            "job_id_raw": job_id,
+            "job_id": job_id,
+            "job_id_raw": job_id_raw,
             "state": state,
             "exit_code": exit_code,
             "elapsed_seconds": elapsed_seconds,
@@ -217,32 +237,35 @@ def _scientific_task_rows(
     dropping them loses the memory measurement.  Merge their maxima into the
     owning task instead.
     """
+    def logical_id(row: Mapping[str, Any]) -> str:
+        return str(row.get("job_id") or row.get("job_id_raw") or "")
+
     direct = [
         dict(row)
         for row in rows
-        if "." not in str(row.get("job_id_raw") or "")
+        if "." not in logical_id(row)
     ]
     array_rows = [
         row
         for row in direct
-        if str(row.get("job_id_raw") or "").startswith(str(job_id) + "_")
+        if logical_id(row).startswith(str(job_id) + "_")
     ]
     task_rows = array_rows or [
         row
         for row in direct
-        if str(row.get("job_id_raw") or "") == str(job_id)
+        if logical_id(row) == str(job_id)
     ]
     if not task_rows:
         return []
 
     enriched: List[Dict[str, Any]] = []
     for task in task_rows:
-        task_id = str(task.get("job_id_raw") or "")
+        task_id = logical_id(task)
         steps = [
             row
             for row in rows
-            if str(row.get("job_id_raw") or "").startswith(task_id + ".")
-            and not str(row.get("job_id_raw") or "").endswith(".extern")
+            if logical_id(row).startswith(task_id + ".")
+            and not logical_id(row).endswith(".extern")
         ]
         merged = dict(task)
         for field in ("max_rss_mib", "max_vm_size_mib"):
@@ -337,7 +360,7 @@ def collect_usage(
         "--array",
         "-j",
         job_id,
-        "--format=JobIDRaw,State,ExitCode,ElapsedRaw,AllocCPUS,ReqMem,MaxRSS,MaxVMSize,TotalCPU",
+        "--format=JobID,JobIDRaw,State,ExitCode,ElapsedRaw,AllocCPUS,ReqMem,MaxRSS,MaxVMSize,TotalCPU",
     ]
     completed = run_scheduler_command(
         runner,
@@ -366,7 +389,10 @@ def collect_usage(
     submission_kind = str(intent.get("submission_kind") or "")
     if submission_kind == "array" and expected_tasks is not None:
         expected_ids = {job_id + "_" + str(index) for index in range(expected_tasks)}
-        observed_ids = {str(row.get("job_id_raw") or "") for row in rows}
+        observed_ids = {
+            str(row.get("job_id") or row.get("job_id_raw") or "")
+            for row in rows
+        }
         unexpected = sorted(observed_ids - expected_ids)
         if unexpected:
             raise ValueError(

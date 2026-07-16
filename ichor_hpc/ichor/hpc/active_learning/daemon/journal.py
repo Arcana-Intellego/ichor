@@ -129,6 +129,7 @@ KNOWN_EVENT_TYPES = (
     "sacct_empty_but_squeue_active",
     "sacct_rows_missing_but_squeue_active",
     "squeue_liveness_inconclusive",
+    "scheduler_uncertain_resumed",
     "transient_phase_retry",
     "transient_retry_ledger_invalid",
     "job_adopt_check_failed",

@@ -7,11 +7,16 @@ by JobID. This module parses "sacct" output into a structured
 
 Typical command:
 
-    sacct -j <id> --format=JobID,State,ExitCode,Elapsed -X -P -n
+    sacct -j <id> --format=JobID,JobIDRaw,State,ExitCode,Elapsed -X -P -n
 
   - '-X' excludes ".batch" / ".extern" sub-steps (we want job-level state).
   - '-P' uses pipe-delimited output (no decorative padding).
   - '-n' omits the header row.
+
+``JobID`` is the logical scheduler identity and therefore carries array rows
+as ``<parent>_<task>``.  ``JobIDRaw`` is retained separately as physical
+provenance because recent Slurm versions may assign each array task a distinct
+raw allocation number.
 
 For a single job the parsed state is straightforward. For an array job, sacct
 returns one row per task plus a parent summary row. :func: 'aggregate_states'
@@ -154,6 +159,7 @@ class JobObservation:
     elapsed_seconds: Optional[int]
     raw_status: Optional[str] = None
     parse_error: Optional[str] = None
+    job_id_raw: Optional[str] = None
 
     @property
     def is_terminal(self) -> bool:
@@ -264,19 +270,28 @@ def _parse_exit_code(text: str) -> Optional[Tuple[int, int]]:
 def parse_sacct_output(stdout: str) -> List[JobObservation]:
     """Parse pipe-delimited ('-P') sacct output into a list of JobObservation.
 
-    Expects the four columns: JobID|State|ExitCode|Elapsed (in this order).
-    Rows whose JobID is empty are skipped silently. Unknown JobStatus values
-    map to JobStatus.UNKNOWN rather than raising, so the caller can decide
-    how to handle truly weird output.
+    The production contract is the five columns
+    ``JobID|JobIDRaw|State|ExitCode|Elapsed``.  Four-column rows from injected
+    test runners remain accepted and treat the single identity as both logical
+    and raw.  Rows whose logical JobID is empty are skipped silently. Unknown
+    JobStatus values map to JobStatus.UNKNOWN rather than raising, so the
+    caller can decide how to handle truly weird output.
     """
     observations: List[JobObservation] = []
     for line in stdout.splitlines():
         if not line.strip():
             continue
         parts = line.split("|")
-        if len(parts) != 4:
+        if len(parts) == 5:
+            job_id = parts[0].strip()
+            job_id_raw = parts[1].strip()
+            state, exit_code, elapsed = parts[2], parts[3], parts[4]
+        elif len(parts) == 4:
+            job_id = parts[0].strip()
+            job_id_raw = job_id
+            state, exit_code, elapsed = parts[1], parts[2], parts[3]
+        else:
             continue
-        job_id, state, exit_code, elapsed = parts[0].strip(), parts[1], parts[2], parts[3]
         if not job_id:
             continue
         status = JobStatus.from_sacct(state)
@@ -286,6 +301,8 @@ def parse_sacct_output(stdout: str) -> List[JobObservation]:
             parse_job_row_id(job_id)
         except ValueError as exc:
             parse_errors.append(str(exc))
+        if not job_id_raw:
+            parse_errors.append("Slurm JobIDRaw is empty")
         if status in TERMINAL_STATES and parsed_exit is None:
             parse_errors.append("terminal Slurm row has malformed ExitCode")
         if status is JobStatus.UNKNOWN:
@@ -299,6 +316,7 @@ def parse_sacct_output(stdout: str) -> List[JobObservation]:
             elapsed_seconds=_parse_elapsed(elapsed),
             raw_status=state.strip(),
             parse_error="; ".join(parse_errors) or None,
+            job_id_raw=job_id_raw or None,
         ))
     return observations
 
@@ -377,6 +395,7 @@ def aggregate_states(
                         (int(row.elapsed_seconds) for row in rows if row.elapsed_seconds is not None),
                         default=None,
                     ),
+                    job_id_raw=None,
                 )
             )
             continue
@@ -390,6 +409,7 @@ def aggregate_states(
                     (int(row.elapsed_seconds) for row in rows if row.elapsed_seconds is not None),
                     default=None,
                 ),
+                job_id_raw=exemplar.job_id_raw,
             )
         )
 
@@ -472,7 +492,7 @@ def poll_job(
     cmd = [
         "sacct",
         "-j", str(job_id),
-        "--format=JobIDRaw,State%40,ExitCode,ElapsedRaw",
+        "--format=JobID,JobIDRaw,State%40,ExitCode,ElapsedRaw",
         "--array", "-X", "-P", "-n",
     ] + list(extra_args)
     try:
@@ -700,7 +720,7 @@ def find_accounted_job_by_name_detailed(
         sacct_runner = subprocess.run
     cmd = [
         "sacct", "--name", str(name),
-        "--format=JobIDRaw,State%40,ExitCode,ElapsedRaw", "--array", "-X", "-P", "-n",
+        "--format=JobID,JobIDRaw,State%40,ExitCode,ElapsedRaw", "--array", "-X", "-P", "-n",
     ]
     try:
         completed = run_scheduler_command(
@@ -854,7 +874,7 @@ def find_running_job_by_name_detailed(
         sacct_runner = subprocess.run
     cmd = [
         "sacct", "--name", str(name),
-        "--format=JobIDRaw,State%40", "--array", "-X", "-P", "-n",
+        "--format=JobID,JobIDRaw,State%40", "--array", "-X", "-P", "-n",
     ]
     try:
         completed = run_scheduler_command(
@@ -884,12 +904,26 @@ def find_running_job_by_name_detailed(
         if not line.strip():
             continue
         parts = line.split("|")
-        if len(parts) < 2:
+        if len(parts) >= 3:
+            job_id = parts[0].strip()
+            job_id_raw = parts[1].strip()
+            raw_state = parts[2]
+        elif len(parts) == 2:
+            job_id = parts[0].strip()
+            job_id_raw = job_id
+            raw_state = parts[1]
+        else:
             continue
-        job_id = parts[0].strip()
         if not job_id:
             continue
-        status = JobStatus.from_sacct(parts[1])
+        if not job_id_raw:
+            return JobNameLookup(
+                None,
+                inconclusive=True,
+                rows=rows,
+                error="sacct returned an empty JobIDRaw",
+            )
+        status = JobStatus.from_sacct(raw_state)
         rows.append((job_id, status.value))
         if status in NON_TERMINAL_STATES:
             # 123_4 -> 123 (and 123.batch -> 123): adopt the whole allocation, not a sub-step.

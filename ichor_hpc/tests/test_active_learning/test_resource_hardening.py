@@ -789,19 +789,22 @@ def test_scratch_rejects_symlinked_path_component(tmp_path):
 
 def test_telemetry_parses_aggregates_is_idempotent_and_bounded(tmp_path):
     provisional_stdout = (
-        "100|COMPLETED|0:0|21|4|8Gc|4G|5G|00:00:20|\n"
-        "100_0|COMPLETED|0:0|10|2|8Gc|||00:00:09|\n"
-        "100_0.batch|COMPLETED|0:0|10|2|8Gc|9G|10G|00:00:09|\n"
-        "100_1|FAILED|1:0|20|2|8Gc|3G|4G|00:00:18|\n"
+        "100|100|COMPLETED|0:0|21|4|8Gc|4G|5G|00:00:20|\n"
+        "100_0|101|COMPLETED|0:0|10|2|8Gc|||00:00:09|\n"
+        "100_0.batch|101.batch|COMPLETED|0:0|10|2|8Gc|9G|10G|00:00:09|\n"
+        "100_1|102|FAILED|1:0|20|2|8Gc|3G|4G|00:00:18|\n"
     )
     final_stdout = provisional_stdout + (
-        "100_2|COMPLETED|0:0|12|2|8Gc|2G|3G|00:00:11|\n"
+        "100_2|100|COMPLETED|0:0|12|2|8Gc|2G|3G|00:00:11|\n"
     )
-    assert len(parse_usage_rows(provisional_stdout)) == 4
+    parsed = parse_usage_rows(provisional_stdout)
+    assert len(parsed) == 4
+    assert parsed[1]["job_id"] == "100_0"
+    assert parsed[1]["job_id_raw"] == "101"
     calls = []
 
     def runner(*_args, **_kwargs):
-        calls.append(1)
+        calls.append(list(_args[0]))
         stdout = provisional_stdout if len(calls) == 1 else final_stdout
         return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
 
@@ -818,6 +821,10 @@ def test_telemetry_parses_aggregates_is_idempotent_and_bounded(tmp_path):
     third = collect_usage(tmp_path, intent=intent, history_limit=1, runner=runner)
     assert second == third
     assert len(calls) == 2
+    assert (
+        "--format=JobID,JobIDRaw,State,ExitCode,ElapsedRaw,AllocCPUS,ReqMem,MaxRSS,MaxVMSize,TotalCPU"
+        in calls[0]
+    )
     assert first["telemetry_status"] == "provisional"
     assert second["telemetry_status"] == "final"
     assert second["collection_sequence"] == 2

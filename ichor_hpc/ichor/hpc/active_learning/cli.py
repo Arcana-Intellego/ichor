@@ -1902,6 +1902,7 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "sacct_empty_but_squeue_active": "waiting for Slurm accounting",
     "sacct_rows_missing_but_squeue_active": "waiting for array accounting",
     "squeue_liveness_inconclusive": "scheduler liveness unclear",
+    "scheduler_uncertain_resumed": "scheduler-uncertain job resumed",
     "transient_phase_retry": "transient phase retry",
     "transient_retry_ledger_invalid": "retry ledger invalid",
     "job_adopt_check_failed": "job adoption check failed",
@@ -1973,6 +1974,7 @@ _JOURNAL_RUN_EVENTS = {
     "adopted_inflight_job",
     "partial_array_recovery_prepared",
     "partial_array_recovery_postprocess_only",
+    "scheduler_uncertain_resumed",
 }
 
 _JOURNAL_WAIT_EVENTS = {
@@ -3848,6 +3850,81 @@ def _finish_resume_transaction(
     return final_state, history_path
 
 
+def _scheduler_uncertain_resume_target(
+    campaign: Path,
+    state: CampaignState,
+    *,
+    stop_request: Optional[Mapping[str, Any]],
+    cancel_stop_request: bool,
+) -> Tuple[CampaignState, Dict[str, Any]]:
+    """Validate and prepare re-polling of one preserved scheduler job."""
+    context = state.lifecycle_context
+    if not isinstance(context, dict):
+        raise ValueError("HALTED state has no lifecycle context")
+    if str(context.get("disposition") or "") != "halted":
+        raise ValueError("lifecycle disposition is not halted")
+    if context.get("scheduler_uncertain") is not True:
+        raise ValueError("halt is not marked scheduler-uncertain")
+    if str(context.get("source") or "") != "daemon":
+        raise ValueError("halt was not produced by the daemon scheduler guard")
+    if bool(state.shutdown_requested):
+        raise ValueError("scheduler-uncertain state also has shutdown_requested=true")
+    if stop_request is not None and not cancel_stop_request:
+        raise ValueError(
+            "an active stop request must be cancelled explicitly before recovery"
+        )
+
+    try:
+        from_phase = CampaignPhase(str(context.get("from_phase") or ""))
+    except ValueError as exc:
+        raise ValueError("lifecycle from_phase is invalid") from exc
+    if from_phase in {CampaignPhase.HALTED, CampaignPhase.DONE}:
+        raise ValueError("lifecycle from_phase is not resumable")
+
+    pending = [
+        (str(phase_name), str(job_id))
+        for phase_name, job_id in state.pending_jobs.items()
+        if job_id not in (None, "")
+    ]
+    if len(pending) != 1:
+        raise ValueError(
+            "scheduler-uncertain recovery requires exactly one pending job"
+        )
+    pending_phase, pending_job_id = pending[0]
+    if pending_phase != from_phase.value:
+        raise ValueError("pending-job phase does not match lifecycle from_phase")
+    if str(context.get("job_id") or "") != pending_job_id:
+        raise ValueError("pending JobID does not match lifecycle JobID")
+
+    intent = _submission_intent.load_active_intent(
+        campaign,
+        from_phase.value,
+        int(state.iteration),
+        expected_campaign_uid=str(state.campaign_uid),
+    )
+    if intent is None:
+        raise ValueError("matching active submission intent is missing")
+    if str(intent.get("status") or "") not in {"SUBMITTED", "ADOPTED"}:
+        raise ValueError("matching submission intent is not submitted or adopted")
+    if str(intent.get("job_id") or "") != pending_job_id:
+        raise ValueError("submission-intent JobID does not match pending JobID")
+
+    target = CampaignState.from_dict(state.to_dict())
+    target.phase = from_phase
+    target.lifecycle_context = None
+    target.shutdown_requested = False
+    for suffix in (
+        "",
+        ":UNKNOWN",
+        ":MISSING",
+        ":SQUEUE_INCONCLUSIVE:empty",
+        ":SQUEUE_INCONCLUSIVE:missing",
+        ":ERROR",
+    ):
+        target.sacct_empty_streak.pop(pending_job_id + suffix, None)
+    return target, intent
+
+
 def cmd_resume(args: argparse.Namespace) -> int:
     campaign = resolve_campaign_dir(args.campaign_dir)
     paths = _campaign_paths(campaign)
@@ -3908,13 +3985,76 @@ def cmd_resume(args: argparse.Namespace) -> int:
             )
             return 7
         if state.phase is CampaignPhase.HALTED:
-            print(
-                "campaign is HALTED; run `ichor-al-daemon reconcile --campaign-dir "
-                + str(campaign)
-                + " --apply` if the recovery proposal is safe before resuming",
-                file=sys.stderr,
+            try:
+                target_state, preserved_intent = _scheduler_uncertain_resume_target(
+                    campaign,
+                    state,
+                    stop_request=stop_request,
+                    cancel_stop_request=bool(
+                        getattr(args, "cancel_stop_request", False)
+                    ),
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                print(
+                    "campaign is HALTED; run `ichor-al-daemon reconcile --campaign-dir "
+                    + str(campaign)
+                    + " --apply` if the recovery proposal is safe before resuming; "
+                    + "scheduler-uncertain resume is unavailable: "
+                    + str(exc),
+                    file=sys.stderr,
+                )
+                return 6
+            cancelling_stop = bool(
+                getattr(args, "cancel_stop_request", False)
             )
-            return 6
+            try:
+                state, resume_history = _finish_resume_transaction(
+                    campaign,
+                    state_path,
+                    before_state=state,
+                    after_state=target_state,
+                    request_id=(
+                        None
+                        if stop_request is None
+                        else str(stop_request.get("request_id"))
+                    ),
+                    operation=(
+                        "resume_scheduler_uncertain_cancel_stop"
+                        if cancelling_stop
+                        else "resume_scheduler_uncertain"
+                    ),
+                    archive_status="cancelled" if cancelling_stop else "resumed",
+                )
+                if cancelling_stop:
+                    stop_request = None
+            except Exception as exc:
+                print(
+                    "could not complete scheduler-uncertain resume transaction: "
+                    + str(exc),
+                    file=sys.stderr,
+                )
+                return 7
+            try:
+                from .daemon.journal import append_event
+
+                append_event(
+                    paths["journal"],
+                    "scheduler_uncertain_resumed",
+                    phase=state.phase.value,
+                    iteration=int(state.iteration),
+                    job_id=str(preserved_intent["job_id"]),
+                    intent_status=str(preserved_intent["status"]),
+                    resume_transaction_history=str(resume_history),
+                )
+            except Exception:
+                pass
+            print(
+                "restored "
+                + state.phase.value
+                + " to re-poll preserved Slurm job "
+                + str(preserved_intent["job_id"])
+                + "; no job was resubmitted"
+            )
         def archive_stop_request(status: str, event_type: str) -> bool:
             nonlocal stop_request
             if stop_request is None:
