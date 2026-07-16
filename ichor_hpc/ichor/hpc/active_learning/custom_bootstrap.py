@@ -1,4 +1,4 @@
-"""Discovery and immutable admission of operator bootstrap inputs.
+"""Discovery and immutable admission of user bootstrap inputs.
 
 Bootstrap CSV files are geometry containers: only their leading ALF feature
 columns are used.  Gaussian/AIMAll remain authoritative for scientific labels.

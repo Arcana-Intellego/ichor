@@ -16,8 +16,8 @@ def test_ariadne_geometry_quality_records_finite_metrics():
         payload,
         validated,
         SimpleNamespace(
-            ariadne_max_displacement_ang=1.25,
-            ariadne_min_pair_distance_ang=0.60,
+            ariadne_max_displacement_angstrom=1.25,
+            ariadne_min_pair_distance_angstrom=0.60,
         ),
     )
 
@@ -50,8 +50,8 @@ def test_ariadne_geometry_quality_enforces_optional_thresholds():
         payload,
         validated,
         SimpleNamespace(
-            ariadne_max_displacement_ang=0.1,
-            ariadne_min_pair_distance_ang=0.2,
+            ariadne_max_displacement_angstrom=0.1,
+            ariadne_min_pair_distance_angstrom=0.2,
         ),
     )
 

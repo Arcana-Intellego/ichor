@@ -370,7 +370,7 @@ def _probe_daemon_lock(lock_path: Path) -> dict:
 
 @contextmanager
 def _exclusive_operator_lock(campaign: Path):
-    """Hold the daemon lock across an authoritative operator mutation."""
+    """Hold the daemon lock across an authoritative user mutation."""
     import portalocker
 
     lock_path = operational_path(campaign, DAEMON_LOCK_FILENAME)
@@ -386,7 +386,7 @@ def _exclusive_operator_lock(campaign: Path):
         lock.acquire()
     except (portalocker.AlreadyLocked, portalocker.LockException) as exc:
         raise RuntimeError(
-            "daemon lock is held; refusing concurrent operator mutation"
+            "daemon lock is held; refusing concurrent user mutation"
         ) from exc
     try:
         yield
@@ -555,7 +555,7 @@ def _reconcile_runtime_status(
             {
                 "lock_file_exists": paths["lock"].exists(),
                 "lock_held": False,
-                "operator_lock_owned": True,
+                "user_lock_owned": True,
             }
         )
     else:
@@ -647,7 +647,7 @@ def _print_reconcile_runtime_warning(status: Dict[str, Any], campaign: Path) -> 
         )
     if status.get("stop_control_error"):
         print(
-            "WARNING: operator stop control is invalid: "
+            "WARNING: user stop control is invalid: "
             + str(status.get("stop_control_error")),
             file=sys.stderr,
         )
@@ -725,7 +725,7 @@ def _operator_staging_archive_blockers(
         pass
     except StateSchemaError:
         # Reconcile has already proposed a conservative recovery state; do not
-        # make a corrupt old state an absolute blocker once the operator has
+        # make a corrupt old state an absolute blocker once the user has
         # explicitly requested an archive through --apply.
         pass
     inventory = data_staging_inventory(campaign)
@@ -1139,7 +1139,7 @@ _PHASE_MEANINGS: Dict[str, str] = {
     CampaignPhase.FEREBUS.value: "FEREBUS model retraining is next",
     CampaignPhase.STOP_CHECK.value: "iteration stop/continue decision is next",
     CampaignPhase.DONE.value: "campaign is complete",
-    CampaignPhase.HALTED.value: "campaign is halted and needs operator review",
+    CampaignPhase.HALTED.value: "campaign is halted and needs user review",
 }
 
 _BOOTSTRAP_NOT_READY_PHASES = {
@@ -1547,26 +1547,11 @@ def _daemon_activity_status(payload: Dict[str, Any]) -> str:
 
 
 def _format_runtime_status(payload: Dict[str, Any], *, verbose: bool) -> List[str]:
+    from .daemon.stop_control import describe_stop_request
+
     stop_request = payload.get("stop_request")
     if isinstance(stop_request, dict):
-        target = "next tick"
-        if stop_request.get("target_phase") is not None:
-            target = (
-                str(stop_request.get("target_phase"))
-                + "@"
-                + str(stop_request.get("target_iteration"))
-                + " round="
-                + str(stop_request.get("target_replacement_round"))
-            )
-        elif stop_request.get("target_iteration") is not None:
-            target = "iteration " + str(stop_request.get("target_iteration"))
-        stop_summary = (
-            str(stop_request.get("mode"))
-            + " / "
-            + str(stop_request.get("status"))
-            + " / target "
-            + target
-        )
+        stop_summary = describe_stop_request(stop_request)
     elif payload.get("stop_control_error"):
         stop_summary = "invalid: " + str(payload.get("stop_control_error"))
     else:
@@ -1578,7 +1563,7 @@ def _format_runtime_status(payload: Dict[str, Any], *, verbose: bool) -> List[st
             "submission intents",
             _format_active_submission_intents(payload.get("active_submission_intents")),
         ),
-        ("operator stop control", stop_summary),
+        ("user stop control", stop_summary),
         ("shutdown requested", "yes" if payload.get("shutdown_requested") else "no"),
     ]
     allocation = payload.get("point_allocation_summary")
@@ -1784,18 +1769,18 @@ def _format_status_unavailable(payload: Dict[str, Any]) -> str:
         lines.append("")
         lines.extend(_section("State", [("error", payload.get("state_error"))]))
     if payload.get("stop_request") or payload.get("stop_control_error"):
+        from .daemon.stop_control import describe_stop_request
+
         lines.append("")
         stop_request = payload.get("stop_request")
         lines.extend(
             _section(
-                "Operator Stop Control",
+                "User Stop Control",
                 [
                     (
                         "request",
                         (
-                            str(stop_request.get("mode"))
-                            + " / "
-                            + str(stop_request.get("status"))
+                            describe_stop_request(stop_request)
                             if isinstance(stop_request, dict)
                             else "invalid"
                         ),
@@ -1905,12 +1890,12 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "partial_array_recovery_postprocess_only": "partial array postprocess ready",
     "committed_artifact_settle_retry": "waiting for committed artefacts",
     "resolved_phase_resources": "resources resolved",
-    "operator_cancelled_jobs": "operator cancelled jobs",
-    "operator_stop_requested": "operator stop requested",
-    "operator_stop_boundary_reached": "operator stop boundary reached",
-    "operator_stop_control_invalid": "operator stop control invalid",
-    "operator_stop_request_cancelled": "operator stop request cancelled",
-    "operator_stop_resumed": "operator stop resumed",
+    "user_cancelled_jobs": "user cancelled jobs",
+    "user_stop_requested": "user stop requested",
+    "user_stop_boundary_reached": "user stop boundary reached",
+    "user_stop_control_invalid": "user stop control invalid",
+    "user_stop_request_cancelled": "user stop request cancelled",
+    "user_stop_resumed": "user stop resumed",
     "sacct_empty_timeout": "Slurm accounting empty timeout",
     "sacct_missing_timeout": "Slurm accounting timeout",
     "sacct_unknown_timeout": "Slurm UNKNOWN timeout",
@@ -1976,8 +1961,8 @@ _JOURNAL_OK_EVENTS = {
     "bootstrap_inputs_confirmed",
     "model_bootstrap_committed",
     "error_calibration_summary",
-    "operator_stop_boundary_reached",
-    "operator_stop_resumed",
+    "user_stop_boundary_reached",
+    "user_stop_resumed",
 }
 
 _JOURNAL_RUN_EVENTS = {
@@ -1995,7 +1980,7 @@ _JOURNAL_WAIT_EVENTS = {
     "sacct_rows_missing_but_squeue_active",
     "postprocess_settle_retry",
     "committed_artifact_settle_retry",
-    "operator_stop_requested",
+    "user_stop_requested",
 }
 
 _JOURNAL_WARN_EVENTS = {
@@ -2008,7 +1993,7 @@ _JOURNAL_WARN_EVENTS = {
     "ariadne_optional_diagnostics_warning",
     "phase_b_novelty_threshold_relaxed",
     "daemon_lease_stale_recovered",
-    "operator_stop_request_cancelled",
+    "user_stop_request_cancelled",
 }
 
 _JOURNAL_FAIL_EVENTS = {
@@ -2025,7 +2010,7 @@ _JOURNAL_FAIL_EVENTS = {
     "live_postprocess_refused",
     "error_calibration_failed",
     "job_adopt_check_failed",
-    "operator_stop_control_invalid",
+    "user_stop_control_invalid",
 }
 
 _SQUEUE_RUNNING_STATES = {"R", "RUNNING", "CG", "COMPLETING"}
@@ -2180,6 +2165,13 @@ def _sacct_row_summary(event: Dict[str, Any]) -> str:
 
 def _journal_operator_summary(event: Dict[str, Any]) -> str:
     raw = str(event.get("event", ""))
+    if raw in {"user_stop_requested", "user_stop_boundary_reached"}:
+        from .daemon.stop_control import describe_stop_request
+
+        return describe_stop_request(
+            event,
+            completed=raw == "user_stop_boundary_reached",
+        )
     if raw in {"phase_pre_submit_intent", "phase_submitted", "sbatch"}:
         return "array submitted" if _journal_array_progress(event) else "job submitted"
     if raw == "queue_lifecycle_update":
@@ -2467,7 +2459,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             return 6
         if state_for_lock.shutdown_requested:
             print(
-                "campaign has an operator stop request; use `ichor-al-daemon resume` "
+                "campaign has a user stop request; use `ichor-al-daemon resume` "
                 "rather than start so the stop is cleared explicitly.",
                 file=sys.stderr,
             )
@@ -2540,7 +2532,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     if bool(getattr(args, "background", False)):
         return _launch_background_daemon(args, campaign)
 
-    # Journal the validated effective configuration diff for operator review.
+    # Journal the validated effective configuration diff for user review.
     try:
         from .config import diff_against_defaults
         from .daemon.journal import append_event
@@ -3086,7 +3078,7 @@ def _mark_cancelled_intents_without_state(
                     campaign,
                     str(key["phase"]),
                     int(key["iteration"]),
-                    "operator_cancelled_via_stop",
+                    "user_cancelled_via_stop",
                 )
             except Exception:
                 pass
@@ -3098,7 +3090,7 @@ def _journal_cancel_jobs_summary(journal_path: Path, summary: Dict[str, Any]) ->
 
         append_event(
             journal_path,
-            "operator_cancelled_jobs",
+            "user_cancelled_jobs",
             n_cancelled=len(summary.get("cancelled") or []),
             n_skipped=len(summary.get("skipped") or []),
             n_failed=len(summary.get("failed") or []),
@@ -3224,6 +3216,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
     from .daemon.stop_control import (
         StopControlError,
         build_stop_request,
+        describe_stop_request,
         install_stop_request,
         update_stop_request,
     )
@@ -3275,7 +3268,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
         append_event(
             paths["journal"],
-            "operator_stop_requested",
+            "user_stop_requested",
             request_id=str(request.get("request_id")),
             mode=str(request.get("mode")),
             status=str(request.get("status")),
@@ -3315,20 +3308,9 @@ def cmd_stop(args: argparse.Namespace) -> int:
             request = updated
     if cancel_summary is not None:
         _journal_cancel_jobs_summary(paths["journal"], cancel_summary)
-    print("stop request recorded: " + str(paths["stop_request"]))
+    print(describe_stop_request(request))
     print("request id: " + str(request.get("request_id")))
-    print("mode: " + str(request.get("mode")))
-    if request.get("target_phase") is not None:
-        print(
-            "target: "
-            + str(request.get("target_phase"))
-            + "@"
-            + str(request.get("target_iteration"))
-            + " replacement_round="
-            + str(request.get("target_replacement_round"))
-        )
-    elif request.get("target_iteration") is not None:
-        print("target iteration: " + str(request.get("target_iteration")))
+    print("stop request: " + str(paths["stop_request"]))
     background = _probe_background_daemon(
         paths["background_pid"],
         paths["background_log"],
@@ -3346,6 +3328,8 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
 def format_recovery_dashboard(campaign_dir: Path) -> str:
     """Return a read-only recovery dashboard for a campaign directory."""
+    from .daemon.stop_control import describe_stop_request
+
     campaign = Path(campaign_dir).expanduser().resolve()
     paths = _campaign_paths(campaign)
     lines: List[str] = [
@@ -3384,14 +3368,12 @@ def format_recovery_dashboard(campaign_dir: Path) -> str:
     stop_request = stop_status.get("stop_request")
     lines.extend(
         _section(
-            "Operator stop control",
+            "User stop control",
             [
                 (
                     "request",
                     (
-                        str(stop_request.get("mode"))
-                        + " / "
-                        + str(stop_request.get("status"))
+                        describe_stop_request(stop_request)
                         if isinstance(stop_request, dict)
                         else "none"
                     ),
@@ -3946,7 +3928,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
                 )
             except Exception as exc:
                 print(
-                    "could not archive operator stop request: " + str(exc),
+                    "could not archive user stop request: " + str(exc),
                     file=sys.stderr,
                 )
                 return False
@@ -4069,7 +4051,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
             context = state.lifecycle_context or {}
             if context and str(context.get("disposition") or "") != "stopped":
                 print(
-                    "shutdown_requested is not recorded as an operator stop; "
+                    "shutdown_requested is not recorded as a user stop; "
                     "run reconcile before resuming",
                     file=sys.stderr,
                 )
@@ -4110,9 +4092,9 @@ def cmd_resume(args: argparse.Namespace) -> int:
                 append_event(
                     paths["journal"],
                     (
-                        "operator_stop_request_cancelled"
+                        "user_stop_request_cancelled"
                         if cancelling_stop
-                        else "operator_stop_resumed"
+                        else "user_stop_resumed"
                     ),
                     resume_transaction_history=str(resume_history),
                 )
@@ -4121,7 +4103,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
         elif bool(getattr(args, "cancel_stop_request", False)):
             if not archive_stop_request(
                 "cancelled",
-                "operator_stop_request_cancelled",
+                "user_stop_request_cancelled",
             ):
                 return 7
         elif stop_request is not None:
@@ -4211,7 +4193,7 @@ def _resolve_terminal_submission_intents_for_apply(
     active intent only when ``squeue`` no longer sees the job and ``sacct``
     reports terminal failure for the recorded JobID, or for the expected job
     name in the PRE_SUBMIT crash window where the JobID was never persisted.
-    Missing scheduler data keeps the intent blocking so an operator cannot
+    Missing scheduler data keeps the intent blocking so a user cannot
     accidentally duplicate a live job.
     """
     from .submit import sacct_poll
@@ -4297,7 +4279,7 @@ def _resolve_terminal_submission_intents_for_apply(
                         "expected_job_name": expected_job_name,
                         "reason": "matching scheduler job completed successfully "
                         "but no job_id was persisted in the intent; "
-                        "postprocess/operator review is required",
+                        "postprocess/user review is required",
                     })
                     continue
                 if lookup.job_id and bool(lookup.failed):
@@ -4322,7 +4304,7 @@ def _resolve_terminal_submission_intents_for_apply(
                         "job_id": str(lookup.job_id),
                         "expected_job_name": expected_job_name,
                         "reason": "matching scheduler job is terminal but not "
-                        "conclusively failed or successful; operator review is required",
+                        "conclusively failed or successful; user review is required",
                     })
                     continue
                 age = _intent_age_seconds(intent)
@@ -4498,7 +4480,7 @@ def _perform_reconcile_apply_mutations(
                 campaign,
                 report.proposed_state,
             )
-        elif data_staging_archive_mode == "operator":
+        elif data_staging_archive_mode == "user":
             paths = archive_data_staging_for_operator_reconcile(campaign)
         else:
             paths = []
@@ -5106,7 +5088,7 @@ def _reconcile_staging_summary(
     if protected:
         return "protected: " + "; ".join(protected)
     if ".DATA/STAGING is non-empty" in list(getattr(report, "unsafe_reasons", [])):
-        return "non-empty, operator review required"
+        return "non-empty, user review required"
     return "none"
 
 
@@ -6375,7 +6357,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             )
             if not archive_blockers:
                 cleanable_reasons.add(".DATA/STAGING is non-empty")
-                data_staging_archive_mode = "operator"
+                data_staging_archive_mode = "user"
             else:
                 archive_staging_refusal_reasons = list(archive_blockers)
                 report.notes.append(
@@ -7084,12 +7066,12 @@ def _confirm_bootstrap_plan(*, assume_yes: bool) -> bool:
 
 
 def _import_pool_impl(args: argparse.Namespace, campaign: Path, source: Path) -> int:
-    """Pull the operator's MD trajectory into the campaign's canonical
+    """Pull the user's MD trajectory into the campaign's canonical
     pool location and write a SHA-pinned manifest next to it.
 
     Refuses to overwrite an existing pool unless --force is passed --
     overwriting wipes the SHA the previously-committed iterations were
-    pinned to, so we make the operator say it out loud.
+    pinned to, so we make the user say it out loud.
     """
     from .acquisition.trajectory_pool import TrajectoryPool
     from .versioning.manifest import sha256_file
@@ -7320,7 +7302,7 @@ def _bootstrap_fresh_campaign_state(
             formatted = format_config_review(review)
             raise CampaignBootstrapError(
                 "config_lock.json already exists and does not match campaign.yaml; "
-                "refusing to initialise a fresh state without operator review."
+                "refusing to initialise a fresh state without user review."
                 + (("\n" + formatted) if formatted else "")
             )
         lock_status = "ok"
@@ -8100,7 +8082,7 @@ def evaluate_campaign_preflight(
             if state.phase is CampaignPhase.DONE:
                 raise ValueError("campaign is DONE")
             if state.shutdown_requested:
-                raise ValueError("campaign has an operator stop request")
+                raise ValueError("campaign has a user stop request")
             from .daemon.artifact_contracts import state_artifact_contract_status
 
             contract = state_artifact_contract_status(campaign, state)
@@ -8708,7 +8690,7 @@ Examples:
         action="store_true",
         help=(
             "Archive and cancel an unfinished boundary stop request before "
-            "resuming. A completed operator stop is cleared by ordinary resume."
+            "resuming. A completed user stop is cleared by ordinary resume."
         ),
     )
     add_background_options(p_resume)
@@ -8950,7 +8932,7 @@ Examples:
         description=(
             "Initialise or populate campaign.yaml from the packaged template, "
             "inspect fixed campaign-relative pool/bootstrap inputs, require "
-            "operator confirmation, and create SHA-pinned daemon state and "
+            "user confirmation, and create SHA-pinned daemon state and "
             "manifests. From inside a campaign directory, --campaign-dir and "
             "--source can be omitted."
         ),
@@ -8999,7 +8981,7 @@ Examples:
     p_pre.add_argument(
         "--json",
         action="store_true",
-        help="Print one machine-readable JSON payload instead of the operator summary.",
+        help="Print one machine-readable JSON payload instead of the user summary.",
     )
     p_pre.add_argument(
         "--verbose",

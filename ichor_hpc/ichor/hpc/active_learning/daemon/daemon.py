@@ -235,7 +235,7 @@ def _halt_recovery_action(reason_code: str) -> str:
     if reason_code == "mandatory_custom_bootstrap_failed":
         return (
             "inspect the failed supplied bootstrap quantum output; correct the "
-            "operator input or start a new campaign because mandatory custom "
+            "user input or start a new campaign because mandatory custom "
             "geometries cannot be replaced"
         )
     if reason_code == "replacement_reserve_exhausted":
@@ -768,7 +768,7 @@ class Daemon:
                     )
             except Exception as exc:
                 self._journal(
-                    "operator_stop_control_invalid",
+                    "user_stop_control_invalid",
                     phase=state.phase.value,
                     iteration=int(state.iteration),
                     error=type(exc).__name__ + ": " + str(exc)[:180],
@@ -923,7 +923,7 @@ class Daemon:
                 self.campaign_dir,
                 phase_name,
                 iteration,
-                "operator_cancelled_via_stop",
+                "user_cancelled_via_stop",
             )
         for phase_name, job_id in list(state.pending_jobs.items()):
             if job_id is not None and str(job_id) in cancelled_ids:
@@ -938,14 +938,14 @@ class Daemon:
         reason: str,
         completion_receipt: Optional[Mapping[str, Any]] = None,
     ) -> str:
-        from .stop_control import complete_stop_request
+        from .stop_control import complete_stop_request, describe_stop_request
 
         self._apply_cancelled_jobs_from_request(state, request)
         state.shutdown_requested = True
         state.lifecycle_context = make_lifecycle_context(
             disposition="stopped",
-            reason_code="operator_stop_request",
-            message="operator stop boundary reached: " + str(reason),
+            reason_code="user_stop_request",
+            message=describe_stop_request(request, completed=True),
             from_phase=state.phase,
             iteration=int(state.iteration),
             source="daemon_stop_control",
@@ -970,12 +970,15 @@ class Daemon:
                 completion_receipt=completion_receipt,
             )
         self._journal(
-            "operator_stop_boundary_reached",
+            "user_stop_boundary_reached",
             request_id=str(request.get("request_id")),
             mode=str(request.get("mode")),
             phase=state.phase.value,
             iteration=int(state.iteration),
             reason=str(reason),
+            target_phase=request.get("target_phase"),
+            target_iteration=request.get("target_iteration"),
+            target_replacement_round=request.get("target_replacement_round"),
             completion_receipt=(
                 dict(completion_receipt)
                 if isinstance(completion_receipt, Mapping)
@@ -1000,7 +1003,7 @@ class Daemon:
             request = self._read_stop_control(state)
         except Exception as exc:
             self._journal(
-                "operator_stop_control_invalid",
+                "user_stop_control_invalid",
                 phase=state.phase.value,
                 iteration=int(state.iteration),
                 error=type(exc).__name__ + ": " + str(exc)[:180],
@@ -1658,7 +1661,7 @@ class Daemon:
             result.validate(stage="submit", phase_name=phase_name)
         except BackendSubmissionError as exc:
             #a backend submission (sbatch) failed outright. halt cleanly so an
-            #operator can look, instead of letting it bubble up and take the
+            # user can look, instead of letting it bubble up and take the
             #whole daemon down mid-campaign.
             if intent_written:
                 try:
@@ -1957,7 +1960,7 @@ class Daemon:
                 phase,
                 "pre_submit_no_job_id_no_accounted_job: "
                 + expected_name
-                + "; refusing to supersede without operator review",
+                + "; refusing to supersede without user review",
             )
         expected_tasks = self._expected_tasks_for_adoption(
             active_intent,
@@ -3331,7 +3334,7 @@ class Daemon:
 
         This is deliberately not routed through ``_halt``. A generic daemon
         exception is not evidence that a submitted Slurm job failed, so pending
-        jobs and active submission intents must remain intact for operator
+        jobs and active submission intents must remain intact for user
         cancellation or reconciliation.
         """
         try:
@@ -3562,7 +3565,7 @@ class Daemon:
                 from_phase=phase,
                 iteration=int(state.iteration),
                 source="daemon",
-                recovery_action="use resume to clear the operator-style stop request",
+                recovery_action="use resume to clear the user stop request",
             )
             self._persist_transition_with_receipt(
                 state,
@@ -3863,12 +3866,14 @@ class Daemon:
         if reason is None:
             return None, None
         if after.phase not in {CampaignPhase.DONE, CampaignPhase.HALTED}:
+            from .stop_control import describe_stop_request
+
             self._apply_cancelled_jobs_from_request(after, request)
             after.shutdown_requested = True
             after.lifecycle_context = make_lifecycle_context(
                 disposition="stopped",
-                reason_code="operator_stop_boundary_reached",
-                message="operator stop boundary reached: " + str(reason),
+                reason_code="user_stop_boundary_reached",
+                message=describe_stop_request(request, completed=True),
                 from_phase=phase,
                 iteration=int(after.iteration),
                 source="daemon_stop_control",
@@ -4006,7 +4011,7 @@ class Daemon:
                 )
             else:
                 self._journal(
-                    "operator_stop_boundary_reached",
+                    "user_stop_boundary_reached",
                     request_id=str(stop_request.get("request_id")),
                     mode=str(stop_request.get("mode")),
                     phase=phase.value,
@@ -4014,6 +4019,11 @@ class Daemon:
                     resulting_phase=after.phase.value,
                     resulting_iteration=int(after.iteration),
                     reason=str(stop_reason),
+                    target_phase=stop_request.get("target_phase"),
+                    target_iteration=stop_request.get("target_iteration"),
+                    target_replacement_round=stop_request.get(
+                        "target_replacement_round"
+                    ),
                     completion_receipt=dict(after.last_completion_receipt or {}),
                 )
 
@@ -4071,8 +4081,8 @@ class Daemon:
             state.shutdown_requested = True
             state.lifecycle_context = make_lifecycle_context(
                 disposition="stopped",
-                reason_code="operator_stop_request",
-                message="operator requested an orderly daemon stop",
+                reason_code="user_stop_request",
+                message="user requested an orderly daemon stop",
                 from_phase=state.phase,
                 iteration=int(state.iteration),
                 source="daemon_api",

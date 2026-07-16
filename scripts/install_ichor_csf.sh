@@ -1181,7 +1181,7 @@ upsert_ichor_config() {
 }
 
 verify_operator_backends() {
-    note "Verifying Gaussian/AIMAll operator backends"
+    note "Verifying Gaussian/AIMAll user-provided backends"
     if [[ ! -x "${AIMALL_PATH}" ]]; then
         die "AIMAll executable is missing or not executable: ${AIMALL_PATH}. Re-run with --aimall-path PATH after installing AIMAll."
     fi
@@ -1221,7 +1221,7 @@ final_checks() {
     local smoke_dir
     smoke_dir="$(mktemp -d)"
     cat > "${smoke_dir}/campaign.yaml" <<'EOF'
-schema_version: 13
+schema_version: 14
 campaign:
   system_name: INSTALLER_SMOKE
   max_iterations: 1

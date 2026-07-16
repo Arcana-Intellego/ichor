@@ -7,7 +7,7 @@ from ichor.hpc.active_learning import cli
 
 def _write_campaign_yaml(path):
     path.mkdir(parents=True, exist_ok=True)
-    (path / "campaign.yaml").write_text("schema_version: 13\n", encoding="utf-8")
+    (path / "campaign.yaml").write_text("schema_version: 14\n", encoding="utf-8")
 
 
 def _parse(argv):

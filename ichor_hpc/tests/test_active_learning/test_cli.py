@@ -1,5 +1,6 @@
 """Tests for ichor.hpc.active_learning.cli."""
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -17,7 +18,11 @@ from ichor.hpc.active_learning.daemon.daemon import (
 from ichor.hpc.active_learning.daemon import submission_intent
 from ichor.hpc.active_learning.daemon.config_lock import write_config_lock
 from ichor.hpc.active_learning.daemon.job_names import live_job_name
-from ichor.hpc.active_learning.daemon.journal import append_event, iter_events
+from ichor.hpc.active_learning.daemon.journal import (
+    KNOWN_EVENT_TYPES,
+    append_event,
+    iter_events,
+)
 from ichor.hpc.active_learning.daemon.state import (
     CampaignPhase,
     DEFAULT_STATE_FILENAME,
@@ -44,6 +49,43 @@ from ichor.hpc.active_learning.handoff_manifests import (
     write_ariadne_results_manifest,
 )
 from ichor.hpc.active_learning.versioning.provenance import write_seed_provenance
+
+
+def test_user_facing_cli_contracts_do_not_use_operator_terminology():
+    repo_root = Path(__file__).resolve().parents[3]
+    paths = [
+        repo_root / "ichor_hpc" / "ichor" / "hpc" / "active_learning" / "cli.py",
+        repo_root
+        / "ichor_hpc"
+        / "ichor"
+        / "hpc"
+        / "active_learning"
+        / "daemon"
+        / "journal.py",
+        repo_root
+        / "ichor_hpc"
+        / "ichor"
+        / "hpc"
+        / "active_learning"
+        / "daemon"
+        / "reconcile.py",
+        repo_root
+        / "ichor_hpc"
+        / "ichor"
+        / "hpc"
+        / "active_learning"
+        / "daemon"
+        / "status_recommendations.py",
+        repo_root / "docs" / "source" / "active_learning_daemon.rst",
+        repo_root / "scripts" / "install_ichor_csf.sh",
+        repo_root / "scripts" / "upsert_ichor_config.py",
+    ]
+    for path in paths:
+        assert (
+            re.search(r"\boperator\b", path.read_text(encoding="utf-8"), re.I)
+            is None
+        ), str(path)
+    assert not any(name.startswith("operator_") for name in KNOWN_EVENT_TYPES)
 
 
 def _campaign_with_config(tmp_path) -> Path:
@@ -1375,16 +1417,22 @@ def test_status_recommends_repeating_incomplete_job_cancellation(tmp_path):
         },
     )
 
-    assert recommendations[0].code == "operator_stop_cancellation_incomplete"
+    assert recommendations[0].code == "user_stop_cancellation_incomplete"
     assert "--immediate --cancel-jobs" in str(recommendations[0].command)
 
 
-def test_cli_stop_records_request_without_rewriting_state(tmp_path):
+def test_cli_stop_records_request_without_rewriting_state(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
     (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
     write_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME, fresh_campaign_state())
     rc = main(["stop", "--campaign-dir", str(campaign)])
+    output_lines = capsys.readouterr().out.splitlines()
     assert rc == 0
+    assert output_lines[0] == (
+        "immediate stop requested during INIT in iteration 0"
+    )
+    assert output_lines[1].startswith("request id: ")
+    assert output_lines[2].startswith("stop request: ")
     s = read_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME)
     assert s.shutdown_requested is False
     request = read_stop_request(campaign, expected_campaign_uid=s.campaign_uid)
@@ -1413,27 +1461,35 @@ def test_cli_stop_without_cancel_jobs_does_not_call_scancel(tmp_path, monkeypatc
     assert stopped.pending_jobs[CampaignPhase.INITIAL_GAUSSIAN.value] == "123"
 
 
-def test_cli_stop_records_phase_and_iteration_boundaries(tmp_path):
+def test_cli_stop_records_phase_and_iteration_boundaries(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
     data = campaign / DEFAULT_DATA_SUBDIR
     data.mkdir(parents=True, exist_ok=True)
     state = fresh_campaign_state(max_iterations=2)
     state.phase = CampaignPhase.AIMALL
     state.iteration = 1
+    state.replacement_round = 2
     _write_locked_state(campaign, state)
 
     assert main(["stop", "--campaign-dir", str(campaign), "--after-phase"]) == 0
+    assert capsys.readouterr().out.splitlines()[0] == (
+        "stop requested after phase AIMALL in iteration 1, replacement round 2"
+    )
     phase_request = read_stop_request(campaign)
     assert phase_request["mode"] == "after_phase"
     assert phase_request["target_phase"] == CampaignPhase.AIMALL.value
     assert phase_request["target_iteration"] == 1
 
     assert main(["stop", "--campaign-dir", str(campaign), "--immediate"]) == 0
+    capsys.readouterr()
     archive_and_clear_stop_request(campaign, status="test_reset")
 
     assert main(
         ["stop", "--campaign-dir", str(campaign), "--after-iteration"]
     ) == 0
+    assert capsys.readouterr().out.splitlines()[0] == (
+        "stop requested after iteration 1"
+    )
     iteration_request = read_stop_request(campaign)
     assert iteration_request["mode"] == "after_iteration"
     assert iteration_request["target_iteration"] == 1
@@ -1632,7 +1688,7 @@ def test_cli_stop_cancel_jobs_uses_intents_when_state_missing(
     assert cancelled == ["999"]
     intent = submission_intent.load_intent(campaign, phase, 0)
     assert intent["status"] == "FAILED"
-    assert intent["reason"] == "operator_cancelled_via_stop"
+    assert intent["reason"] == "user_cancelled_via_stop"
 
 
 def test_cli_stop_cancel_jobs_uses_intents_when_state_corrupt(
@@ -1687,7 +1743,7 @@ def test_cli_stop_cancel_jobs_uses_intents_when_state_corrupt(
     assert cancelled == ["1001"]
     intent = submission_intent.load_intent(campaign, phase, 0)
     assert intent["status"] == "FAILED"
-    assert intent["reason"] == "operator_cancelled_via_stop"
+    assert intent["reason"] == "user_cancelled_via_stop"
 
 
 def test_cli_stop_cancel_jobs_refuses_inconclusive_scheduler_lookup(

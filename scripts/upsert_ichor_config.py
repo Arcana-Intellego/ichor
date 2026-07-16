@@ -1,4 +1,4 @@
-"""Atomically install one canonical ICHOR machine profile for an operator."""
+"""Atomically install one canonical ICHOR machine profile for a user."""
 
 from __future__ import annotations
 
@@ -81,7 +81,7 @@ def upsert_profile(
     if destination.exists() or destination.is_symlink():
         if destination.is_symlink():
             raise ValueError("refusing symlinked ICHOR config: " + str(destination))
-        data = _load_mapping(destination, label="operator ICHOR config")
+        data = _load_mapping(destination, label="user ICHOR config")
         backup = destination.with_name(
             destination.name + ".bak." + str(time.time_ns())
         )

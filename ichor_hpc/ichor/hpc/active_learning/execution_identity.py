@@ -781,9 +781,12 @@ def ensure_execution_identity(
             expected_campaign_uid=str(campaign_uid),
         )
         stored_mode = str(payload.get("mode") or "")
-        if payload.get("campaign_random_seed") != int(config.campaign.random_seed):
+        if payload.get("campaign_random_seed") != int(
+            config.campaign.reproducibility_seed
+        ):
             raise ExecutionIdentityError(
-                "campaign.random_seed differs from the immutable execution identity"
+                "campaign.reproducibility_seed differs from the immutable "
+                "execution identity"
             )
         if payload.get("campaign_schema_version") != int(config.schema_version):
             raise ExecutionIdentityError(
@@ -828,7 +831,7 @@ def ensure_execution_identity(
         "schema_version": EXECUTION_IDENTITY_SCHEMA_VERSION,
         "campaign_uid": str(campaign_uid),
         "mode": str(requested_mode),
-        "campaign_random_seed": int(config.campaign.random_seed),
+        "campaign_random_seed": int(config.campaign.reproducibility_seed),
         "campaign_schema_version": int(config.schema_version),
         "initial_config_sha256": config_fingerprint(config.to_dict()),
         "environment_generation": 0,

@@ -473,7 +473,11 @@ def build_sampling_scale_model(
         per_atom_fallback = False
 
     min_pair_floor = _finite_positive(
-        getattr(getattr(config, "quality_gates", None), "ariadne_min_pair_distance_ang", None)
+        getattr(
+            getattr(config, "quality_gates", None),
+            "ariadne_min_pair_distance_angstrom",
+            None,
+        )
     ) or 0.60
     observed_pair = _percentile(history["min_pair_distances"], 0.50)
     pair_reference = min_pair_floor if observed_pair is None else max(min_pair_floor, float(observed_pair))

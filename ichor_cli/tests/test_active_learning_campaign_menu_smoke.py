@@ -1176,7 +1176,7 @@ def test_acquisition_gradient_menu_exposes_active_fd_controls():
     assert set(field_specs) == {
         "acquisition.gradient.active_step",
         "acquisition.gradient.regularization",
-        "acquisition.gradient.max_acquisition_grad_per_ang",
+        "acquisition.gradient.max_acquisition_grad_per_angstrom",
     }
     assert "acquisition.gradient.active_step: 0.003" in rendered
 
@@ -1506,8 +1506,8 @@ def test_campaign_config_menu_covers_every_config_leaf():
     assert read_only == {"schema_version"}
     assert actual_editable == expected_editable
     quality_rendered = _BLOCK_MENUS_BY_LABEL["Edit quality_gates"].this_menu_options()
-    assert "quality_gates.ariadne_max_displacement_ang" in quality_rendered
-    assert "quality_gates.ariadne_min_pair_distance_ang" in quality_rendered
+    assert "quality_gates.ariadne_max_displacement_angstrom" in quality_rendered
+    assert "quality_gates.ariadne_min_pair_distance_angstrom" in quality_rendered
 
 
 def test_campaign_config_block_menus_are_reachable():

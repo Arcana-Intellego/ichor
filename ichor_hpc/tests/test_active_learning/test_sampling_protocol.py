@@ -244,8 +244,8 @@ def test_level_five_preview_matches_current_balanced_defaults():
     assert "sqrt(n_effective_movement_atoms)" in trust_policy["formula"]
     assert resolved.adversarial_safety.max_whitened_distance == pytest.approx(10.0)
     assert resolved.adversarial_safety.backtrack_points == 16
-    assert resolved.quality_gates.ariadne_max_displacement_ang == pytest.approx(1.25)
-    assert resolved.quality_gates.ariadne_min_pair_distance_ang == pytest.approx(0.60)
+    assert resolved.quality_gates.ariadne_max_displacement_angstrom == pytest.approx(1.25)
+    assert resolved.quality_gates.ariadne_min_pair_distance_angstrom == pytest.approx(0.60)
     assert resolved.acquisition_config.weights.lambda_distance == pytest.approx(1.0)
     assert resolved.acquisition_config.fullspace_confinement.lambda_residual == pytest.approx(
         0.5
@@ -303,21 +303,21 @@ def test_hidden_low_level_overrides_are_reported_not_applied():
     cfg = CampaignConfig()
     cfg.geometry_novelty.fallback_scale_angstrom = 9.0
     cfg.phase_b.beta = 0.9
-    cfg.quality_gates.ariadne_min_pair_distance_ang = 0.2
+    cfg.quality_gates.ariadne_min_pair_distance_angstrom = 0.2
 
     overrides = hidden_sampling_overrides(cfg)
     paths = {entry["path"] for entry in overrides}
 
     assert "geometry_novelty.fallback_scale_angstrom" in paths
     assert "phase_b.beta" not in paths
-    assert "quality_gates.ariadne_min_pair_distance_ang" in paths
+    assert "quality_gates.ariadne_min_pair_distance_angstrom" in paths
 
     resolved = preview_sampling_protocol(cfg)
 
     assert resolved.acquisition_config.weights.lambda_distance == pytest.approx(1.0)
     assert resolved.geometry_scale_payload["scale_angstrom"] == pytest.approx(0.05)
     assert resolved.phase_b["beta"] == pytest.approx(0.9)
-    assert resolved.quality_gates.ariadne_min_pair_distance_ang == pytest.approx(0.60)
+    assert resolved.quality_gates.ariadne_min_pair_distance_angstrom == pytest.approx(0.60)
 
 
 def test_resolver_writes_round_trippable_manifest(tmp_path):

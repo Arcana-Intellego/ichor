@@ -1,4 +1,4 @@
-"""Initialise a campaign and import its configured operator inputs."""
+"""Initialise a campaign and import its configured user inputs."""
 import argparse
 from dataclasses import dataclass
 

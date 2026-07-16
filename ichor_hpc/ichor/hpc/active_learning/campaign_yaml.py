@@ -1,4 +1,4 @@
-"""Round-trip campaign.yaml helpers for operator-owned campaign files."""
+"""Round-trip campaign.yaml helpers for user-owned campaign files."""
 from __future__ import annotations
 
 from copy import deepcopy
@@ -79,7 +79,7 @@ def load_campaign_yaml(path: str | Path):
 
 
 def merge_template_with_user(user_payload):
-    """Return the template with operator-provided values overlaid."""
+    """Return the template with user-provided values overlaid."""
     merged = load_template_yaml()
     if user_payload is None:
         return merged
@@ -117,7 +117,7 @@ def write_roundtrip_yaml(path: str | Path, payload) -> None:
 def initialise_campaign_yaml(campaign_dir: str | Path) -> CampaignConfig:
     """Create or populate campaign.yaml from the packaged template.
 
-    Existing operator values override template values. Comments and key order
+    Existing user values override template values. Comments and key order
     are preserved where possible by ruamel.yaml's round-trip loader.
     """
     campaign, config, text = prepare_campaign_yaml(campaign_dir)

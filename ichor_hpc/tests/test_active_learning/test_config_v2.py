@@ -159,7 +159,7 @@ def test_removed_driver_block_is_rejected():
 def test_to_ariadne_run_config_propagates_values():
     c = CampaignConfig()
     c.ariadne.max_iter = 350
-    c.ariadne.convergence.gradient_max_tolerance_per_ang = 1.0e-5
+    c.ariadne.convergence.gradient_max_tolerance_per_angstrom = 1.0e-5
     c.ariadne.delta0 = 0.07
     c.ariadne.trqn_scale_mode = "fixed"
     c.ariadne.trqn_fixed_objective_scale = 0.25

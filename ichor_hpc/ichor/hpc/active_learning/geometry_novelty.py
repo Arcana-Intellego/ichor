@@ -474,7 +474,7 @@ def geometry_novelty_input_fingerprint(
 ) -> Dict[str, Any]:
     """Return the inputs that make a geometry-novelty scale current.
 
-    This is intentionally separate from operator-facing provenance. Provenance
+    This is intentionally separate from user-facing provenance. Provenance
     explains where the sidecar came from; the fingerprint decides whether it is
     still safe to reuse after restart or manual recovery.
     """

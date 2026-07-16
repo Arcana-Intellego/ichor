@@ -1760,7 +1760,7 @@ def test_ariadne_parser_happy_path(tmp_path):
 
 def test_ariadne_parser_ignores_hidden_raw_ariadne_quality_gate_override(tmp_path):
     ex = _make_executor(tmp_path)
-    ex.config.quality_gates.ariadne_max_displacement_ang = 1.0e-8
+    ex.config.quality_gates.ariadne_max_displacement_angstrom = 1.0e-8
     ex.config.anti_overlap.enforce_post_ariadne = True
     ex.config.anti_overlap.max_post_ariadne_whitened_distance = 1.0e-8
     pool = _seed_ariadne_pool(tmp_path / "campaign", iteration=4, n_seeds=1)

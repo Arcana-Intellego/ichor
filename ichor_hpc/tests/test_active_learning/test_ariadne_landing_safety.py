@@ -126,8 +126,8 @@ def _select(raw_x, candidate_xs, safety, origins=None, initial_x=0.0, scale_mode
         alpha_trajectory=[float(initial_x), float(raw_x)],
         safety_config=safety,
         quality_gates=SimpleNamespace(
-            ariadne_max_displacement_ang=10.0,
-            ariadne_min_pair_distance_ang=0.60,
+            ariadne_max_displacement_angstrom=10.0,
+            ariadne_min_pair_distance_angstrom=0.60,
         ),
         scale_model=scale_model,
     )
@@ -346,8 +346,8 @@ def test_safe_gradient_band_warm_start_skips_under_moved_probe():
         seed_atoms=seed,
         safety_config=_safety(),
         quality_gates=SimpleNamespace(
-            ariadne_max_displacement_ang=10.0,
-            ariadne_min_pair_distance_ang=0.60,
+            ariadne_max_displacement_angstrom=10.0,
+            ariadne_min_pair_distance_angstrom=0.60,
         ),
     )
 

@@ -198,8 +198,8 @@ The resource plan is read-only. Before the first submission it should resolve
 Phase A from the manifest-verified root `pool.xyz`; later phases may report
 `evidence_not_yet_produced` until their producer handoffs exist.
 
-The smoke config throttles Slurm arrays with
-`resources.array_concurrency_limit: 4` to be gentle on the scheduler. Backend
+The smoke config sets `resources.array_concurrency_limit: null`, which leaves
+array concurrency to Slurm. Backend
 CPU fields default to `auto`; AIMAll combines that with `aimall.naat: auto`
 to choose an atom-level parallelism appropriate to the staged system size.
 The example AIMAll block uses `naat: auto`,

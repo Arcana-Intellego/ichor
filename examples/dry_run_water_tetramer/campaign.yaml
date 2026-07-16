@@ -3,7 +3,7 @@
 # defaults substantially. Production campaigns should calibrate the single
 # sampling-aggressiveness policy against their own system.
 
-schema_version: 13
+schema_version: 14
 
 campaign:
   system_name: WATER_TETRAMER
@@ -11,7 +11,7 @@ campaign:
   custom_bootstrap: false
   # Keep the walkthrough close to the balanced production default.
   sampling_aggressiveness: 5
-  random_seed: 0
+  reproducibility_seed: 0
 
 # Iteration loop.
 runtime:
@@ -53,7 +53,7 @@ resources:
     cpus_per_task: 2
   gaussian:
     memory_fraction_of_slurm: 0.85
-  array_concurrency_limit: 4
+  array_concurrency_limit: null
   memory_estimate_safety_factor: 1.25
   scheduler_usage_telemetry: true
   scheduler_usage_history_limit: 5000
@@ -79,13 +79,13 @@ ariadne:
   convergence:
     mode: fixed
     objective_change_tolerance: 1.0e-6
-    gradient_rms_tolerance_per_ang: 1.0e-4
-    gradient_max_tolerance_per_ang: 1.5e-4
-    step_rms_tolerance_ang: 1.2e-3
-    step_max_tolerance_ang: 1.8e-3
+    gradient_rms_tolerance_per_angstrom: 1.0e-4
+    gradient_max_tolerance_per_angstrom: 1.5e-4
+    step_rms_tolerance_angstrom: 1.2e-3
+    step_max_tolerance_angstrom: 1.8e-3
     consecutive_accepted_steps: 2
     adaptive_score_reference: 1.0
-    adaptive_length_reference_ang: 0.05
+    adaptive_length_reference_angstrom: 0.05
     adaptive_min_multiplier: 0.25
     adaptive_max_multiplier: 4.0
 

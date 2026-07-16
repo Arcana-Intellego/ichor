@@ -69,7 +69,7 @@ def test_init_fills_sparse_campaign_yaml_preserving_user_override(tmp_path):
         pytest.skip("water_tetramer.xyz fixture missing")
     shutil.copy(FIXTURE, tmp_path / "pool.xyz")
     (tmp_path / "campaign.yaml").write_text(
-        "schema_version: 13\n"
+        "schema_version: 14\n"
         "campaign:\n"
         "  system_name: MY_SYSTEM\n"
         "gaussian:\n"
@@ -94,7 +94,7 @@ def test_init_refuses_infeasible_pool_before_state_creation(tmp_path, capsys):
         pytest.skip("water_tetramer.xyz fixture missing")
     shutil.copy(FIXTURE, tmp_path / "pool.xyz")
     (tmp_path / "campaign.yaml").write_text(
-        "schema_version: 13\n"
+        "schema_version: 14\n"
         "campaign:\n"
         "  max_iterations: 2\n"
         "point_allocation:\n"

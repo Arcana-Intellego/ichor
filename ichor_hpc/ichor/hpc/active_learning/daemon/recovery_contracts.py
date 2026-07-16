@@ -1190,7 +1190,7 @@ def recovery_contract_status(
     campaign_dir: Union[str, Path],
     state: CampaignState,
 ) -> Dict[str, Any]:
-    """Return an operator-facing phase input contract summary."""
+    """Return a user-facing phase input contract summary."""
     campaign = Path(campaign_dir)
     phase = CampaignPhase(state.phase)
     iteration = int(getattr(state, "iteration", 0))

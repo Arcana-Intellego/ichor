@@ -321,7 +321,7 @@ def state_artifact_contract_status(
     models_dir_name: str = TRAINED_MODELS_DIRNAME,
     strict_models: bool = True,
 ) -> Dict[str, Any]:
-    """Return the full state/artefact contract status for operator output.
+    """Return the full state/artefact contract status for user output.
 
     ``artifact_manifest_status`` reports the independent training and model
     version checks. This helper reports the combined producer/consumer

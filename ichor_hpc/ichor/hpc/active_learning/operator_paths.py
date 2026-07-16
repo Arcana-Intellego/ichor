@@ -1,4 +1,4 @@
-"""Resolve operator-supplied campaign input paths consistently."""
+"""Resolve user-supplied campaign input paths consistently."""
 from __future__ import annotations
 
 import os

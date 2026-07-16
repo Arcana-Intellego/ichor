@@ -16,7 +16,7 @@ The detached child is wired up so it survives the menu process exiting:
   handle in odd terminal hosts. Production is Linux.
 
 The PID is written to ``<campaign_dir>/.DATA/ACTIVE_LEARNING/menu_launched.pid``
-so the menu can echo it back and the operator can correlate the running
+so the menu can echo it back and the user can correlate the running
 daemon with the menu invocation. The daemon's own ``daemon.lock`` flock
 remains the source of truth for "is the daemon alive".
 """

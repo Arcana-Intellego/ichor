@@ -1829,7 +1829,7 @@ def test_reconcile_preserves_completed_lifecycle_until_explicit_reopen(
     assert "only resume --reopen-converged" in " ".join(report.notes)
 
 
-def test_reconcile_preserves_operator_stop_until_resume(tmp_path, monkeypatch):
+def test_reconcile_preserves_user_stop_until_resume(tmp_path, monkeypatch):
     from ichor.hpc.active_learning.daemon.state import make_lifecycle_context
 
     monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
@@ -1854,7 +1854,7 @@ def test_reconcile_preserves_operator_stop_until_resume(tmp_path, monkeypatch):
     state.shutdown_requested = True
     state.lifecycle_context = make_lifecycle_context(
         disposition="stopped",
-        reason_code="operator_stop_request",
+        reason_code="user_stop_request",
         message="operator requested stop",
         from_phase=CampaignPhase.SEED_SELECT,
         iteration=1,

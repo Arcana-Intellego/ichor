@@ -12,7 +12,7 @@ def quiet_import_module(module_name: str) -> ModuleType:
 
     Some scientific helper packages print a banner at import time. That is fine
     in batch job logs, but daemon preflight/status output should stay machine
-    readable and operator-focused.
+    readable and user-focused.
     """
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
         io.StringIO()

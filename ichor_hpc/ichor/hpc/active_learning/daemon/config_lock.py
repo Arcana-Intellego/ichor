@@ -1,7 +1,7 @@
 """Campaign configuration lock and guarded recovery checks.
 
 The active-learning daemon is allowed to restart after crashes, scheduler
-failures, and deliberate operator stops. It must not silently continue a
+failures, and deliberate user stops. It must not silently continue a
 campaign after a protocol-changing edit to ``campaign.yaml``. This module
 stores a canonical, default-expanded config snapshot and classifies later
 edits before ``reconcile --apply`` promotes a proposed recovery state.
@@ -34,7 +34,7 @@ from .state import CampaignPhase, CampaignState, atomic_write_json
 
 CONFIG_LOCK_SCHEMA_VERSION = 3
 CONFIG_LOCK_FILENAME = "config_lock.json"
-CONFIG_LOCK_POLICY_VERSION = 4
+CONFIG_LOCK_POLICY_VERSION = 5
 CONFIG_LOCK_HISTORY_SCHEMA_VERSION = 2
 CONFIG_LOCK_HISTORY_DIRNAME = "config_lock_history"
 
@@ -480,7 +480,7 @@ RESOURCE_FUTURE_EXACT = {
 IMMUTABLE_EXACT = {
     "schema_version",
     "campaign.system_name",
-    "campaign.random_seed",
+    "campaign.reproducibility_seed",
     "retention.checkpoint_required",
 }
 
@@ -524,8 +524,8 @@ SUBMISSION_SNAPSHOT_EXACT = {
 PRE_SEED_SELECT_PREFIXES = {"seed_selection."}
 PRE_ARIADNE_EXACT = {
     "resources.gradient_parallel_backend",
-    "quality_gates.ariadne_max_displacement_ang",
-    "quality_gates.ariadne_min_pair_distance_ang",
+    "quality_gates.ariadne_max_displacement_angstrom",
+    "quality_gates.ariadne_min_pair_distance_angstrom",
 }
 PRE_ARIADNE_PREFIXES = {
     "acquisition.",
@@ -559,7 +559,7 @@ PRE_AIMALL_QUALITY_EXACT: set[str] = set()
 # Fields whose interpretation is already embedded in current-iteration output.
 ARIADNE_OUTPUT_INTERPRETATION_PREFIXES = {"seed_selection."}
 ARIADNE_OUTPUT_INTERPRETATION_EXACT = {
-    "acquisition.gradient.max_acquisition_grad_per_ang",
+    "acquisition.gradient.max_acquisition_grad_per_angstrom",
     "campaign.sampling_aggressiveness",
 }
 PHASE_B_OUTPUT_INTERPRETATION_PREFIXES: set[str] = set()
@@ -1855,7 +1855,7 @@ def apply_config_lock_update(
 def restore_config_from_lock_proposal(campaign_dir: Union[str, Path]) -> Path:
     """Write campaign.yaml.proposed from the locked canonical config.
 
-    This is deliberately proposal-only.  The operator must inspect and promote
+    This is deliberately proposal-only.  The user must inspect and promote
     the file manually because campaign.yaml is the protocol contract.
     """
     campaign = Path(campaign_dir)

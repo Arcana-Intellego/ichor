@@ -1161,6 +1161,21 @@ def test_array_concurrency_limit_renders_slurm_percent_throttle():
     assert "#SBATCH --array=0-19%7" in body
 
 
+def test_default_array_concurrency_emits_no_slurm_percent_throttle():
+    cfg = CampaignConfig()
+    body = build_sbatch_script(
+        phase_name="ARIADNE_ARRAY",
+        iteration=0,
+        campaign_dir=Path("/scratch/campaign"),
+        config=cfg,
+        array_size=20,
+    )
+    array_directives = [
+        line for line in body.splitlines() if line.startswith("#SBATCH --array=")
+    ]
+    assert array_directives == ["#SBATCH --array=0-19"]
+
+
 def test_configured_array_task_limit_rejects_too_large_array(monkeypatch):
     _install_fake_global_variables(
         monkeypatch,

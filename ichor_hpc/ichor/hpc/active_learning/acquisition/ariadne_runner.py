@@ -948,7 +948,7 @@ def _evaluate_landing_candidate(
         reasons.append("seed_fallback_disabled")
 
     max_disp = _safe_float_or_none(
-        _cfg_value(quality_gates, "ariadne_max_displacement_ang", None)
+        _cfg_value(quality_gates, "ariadne_max_displacement_angstrom", None)
     )
     if max_disp is None:
         reasons.append("ariadne_max_displacement_gate_unresolved")
@@ -958,7 +958,7 @@ def _evaluate_landing_candidate(
         reasons.append("ariadne_max_displacement_threshold_exceeded")
     pair_distance_applicable = bool(metrics.get("pair_distance_applicable", True))
     min_pair = _safe_float_or_none(
-        _cfg_value(quality_gates, "ariadne_min_pair_distance_ang", None)
+        _cfg_value(quality_gates, "ariadne_min_pair_distance_angstrom", None)
     )
     if min_pair is None:
         reasons.append("ariadne_min_pair_distance_gate_unresolved")
@@ -2073,7 +2073,7 @@ def _live_optimise_seed(
         project_rigid=project_rigid,
         max_acquisition_grad_per_ang=max_acquisition_grad_per_ang,
         max_force_per_atom_ha_per_ang=max_force_per_atom_ha_per_ang,
-        # honour the operator's resources.gradient_parallel_backend rather than hardcoding -- lets
+        # honour the user's resources.gradient_parallel_backend rather than hardcoding -- lets
         # them force "serial" on a node without fork, or for debugging (A33).
         gradient_backend=gradient_backend,
         clamp_counter=counter,
@@ -2628,7 +2628,7 @@ def main(argv=None) -> int:
 
     ariadne_rng = derive_rng_seed(
         campaign_uid=str(state.campaign_uid),
-        campaign_random_seed=int(config.campaign.random_seed),
+        campaign_random_seed=int(config.campaign.reproducibility_seed),
         iteration=int(args.iteration),
         phase="ARIADNE_ARRAY",
         logical_task_id=seed_uid,
@@ -2712,7 +2712,9 @@ def main(argv=None) -> int:
             external_reference_scales=external_reference_scales,
             error_calibration_model=error_calibration_model,
             error_calibration_apply_strength=error_calibration_strength,
-            max_acquisition_grad_per_ang=config.effective_max_acquisition_grad_per_ang(),
+            max_acquisition_grad_per_ang=(
+                config.effective_max_acquisition_grad_per_angstrom()
+            ),
             gradient_backend=str(config.resources.gradient_parallel_backend),
             safety_config=resolved_protocol.adversarial_safety,
             quality_gates=resolved_protocol.quality_gates,

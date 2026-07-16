@@ -57,7 +57,7 @@ def adopt_initial_campaign_dir_if_valid() -> Optional[Path]:
 
 
 def set_selected_campaign_dir(path: str | Path) -> Path:
-    """Record an operator-selected campaign path and mirror the legacy global."""
+    """Record a user-selected campaign path and mirror the legacy global."""
     global _explicit_selection
     selected = Path(path).expanduser().absolute()
     ichor.cli.global_menu_variables.SELECTED_ACTIVE_LEARNING_CAMPAIGN_DIRECTORY_PATH = selected

@@ -327,7 +327,7 @@ def write_quantum_acceptance_manifest(
     }
     phase_path = quantum_acceptance_manifest_path(staging, phase_name=phase_name)
     atomic_write_json(phase_path, payload)
-    # Retain the latest-phase convenience copy for operator tooling. Consumers
+    # Retain the latest-phase convenience copy for user tooling. Consumers
     # always read the immutable phase-specific handoff.
     atomic_write_json(quantum_acceptance_manifest_path(staging), payload)
     return phase_path
@@ -2968,7 +2968,7 @@ def prepare_imported_model_bootstrap(staging_dir: Path) -> Dict[str, Any]:
     """Materialise an imported model set as completed initial FEREBUS output.
 
     The ordinary staging path has already generated the exact train/internal/
-    external CSV contract.  This helper only installs the operator-confirmed
+    external CSV contract.  This helper only installs the user-confirmed
     models and copies those datasets into the per-task layout that pyferebus
     would otherwise create.  It never retrains or rewrites a model.
     """

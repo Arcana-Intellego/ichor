@@ -605,9 +605,27 @@ def _sampling_protocol_for_ariadne_result(
         raise ValueError("sampling protocol audit iteration mismatch")
 
     level = int(protocol_payload.get("sampling_aggressiveness"))
+    quality_gate_values = protocol_payload.get("resolved_quality_gates")
+    if not isinstance(quality_gate_values, dict):
+        raise ValueError("resolved sampling protocol quality-gates block is missing")
+    quality_gate_overrides = dict(quality_gate_values)
+    for persisted_name, campaign_name in (
+        (
+            "ariadne_max_displacement_ang",
+            "ariadne_max_displacement_angstrom",
+        ),
+        (
+            "ariadne_min_pair_distance_ang",
+            "ariadne_min_pair_distance_angstrom",
+        ),
+    ):
+        if persisted_name in quality_gate_overrides:
+            quality_gate_overrides[campaign_name] = quality_gate_overrides.pop(
+                persisted_name
+            )
     quality_gates = _object_with_overrides(
         getattr(fallback_protocol, "quality_gates", None),
-        protocol_payload.get("resolved_quality_gates"),
+        quality_gate_overrides,
     )
     adversarial_safety = _object_with_overrides(
         getattr(fallback_protocol, "adversarial_safety", None),
@@ -749,7 +767,7 @@ def clean_stale_ariadne_seed_outputs(
 #
 # Each parser registers itself by adding its phase name
 # to this frozenset. Until then, postprocess() raises NotImplementedError
-# with a hint pointing the operator at a separate dry-run campaign.
+# with a hint pointing the user at a separate dry-run campaign.
 LIVE_POSTPROCESS_IMPLEMENTED: frozenset = frozenset({
     "INITIAL_GAUSSIAN", "GAUSSIAN",
     "INITIAL_AIMALL", "AIMALL",
@@ -1147,14 +1165,14 @@ def _ariadne_geometry_quality(result_dict: Dict[str, Any], validated: Dict[str, 
             metrics["max_displacement_ang"] = float(_np.max(displacements))
     except Exception:
         metrics["max_displacement_ang"] = None
-    max_disp = getattr(gates, "ariadne_max_displacement_ang", None)
+    max_disp = getattr(gates, "ariadne_max_displacement_angstrom", None)
     if max_disp is None:
         reasons.append("ariadne_max_displacement_gate_unresolved")
     elif metrics["max_displacement_ang"] is None:
         reasons.append("ariadne_max_displacement_metric_unavailable")
     elif float(metrics["max_displacement_ang"]) > float(max_disp):
         reasons.append("ariadne_max_displacement_threshold_exceeded")
-    min_pair = getattr(gates, "ariadne_min_pair_distance_ang", None)
+    min_pair = getattr(gates, "ariadne_min_pair_distance_angstrom", None)
     if min_pair is None:
         reasons.append("ariadne_min_pair_distance_gate_unresolved")
     elif not metrics["pair_distance_applicable"]:
@@ -5771,7 +5789,7 @@ def _gaussian_invocation_block(
 
 
 def _configured_backend_path(backend_name: str, fallback: str) -> str:
-    """Look up the executable_path for a software backend from the operator's
+    """Look up the executable_path for a software backend from the user's
     ~/ichor_config.yaml. Falls back to a sensible default (usually the bare
     command) when no active profile/backend path is declared, so unit tests
     and non-cluster environments keep working.

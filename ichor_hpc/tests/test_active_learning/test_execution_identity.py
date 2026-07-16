@@ -93,7 +93,7 @@ def test_first_start_binds_mode_seed_and_environment_generation(
         _fake_generation,
     )
     config = CampaignConfig()
-    config.campaign.random_seed = 42
+    config.campaign.reproducibility_seed = 42
 
     mode, payload = ensure_execution_identity(
         tmp_path,
@@ -150,9 +150,9 @@ def test_bound_random_seed_cannot_change(tmp_path, monkeypatch):
         config=config,
         requested_mode="dry_run",
     )
-    config.campaign.random_seed = 7
+    config.campaign.reproducibility_seed = 7
 
-    with pytest.raises(ExecutionIdentityError, match="random_seed"):
+    with pytest.raises(ExecutionIdentityError, match="reproducibility_seed"):
         ensure_execution_identity(
             tmp_path,
             campaign_uid="uid-seed",

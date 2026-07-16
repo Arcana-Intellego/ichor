@@ -1,4 +1,4 @@
-"""Campaign configuration for the clean-break schema 13 contract."""
+"""Campaign configuration for the clean-break schema 14 contract."""
 from __future__ import annotations
 
 import math
@@ -270,19 +270,19 @@ _STRICTLY_POSITIVE_NUMERIC_PATHS = frozenset({
     "acquisition.stencils.softplus_scale",
     "acquisition.spectral.omega_floor",
     "acquisition.gradient.active_step",
-    "acquisition.gradient.max_acquisition_grad_per_ang",
+    "acquisition.gradient.max_acquisition_grad_per_angstrom",
     "acquisition.references.max_reference_samples",
     "acquisition.references.floor",
     "acquisition.references.refresh_period",
     "ariadne.max_iter",
     "ariadne.convergence.objective_change_tolerance",
-    "ariadne.convergence.gradient_rms_tolerance_per_ang",
-    "ariadne.convergence.gradient_max_tolerance_per_ang",
-    "ariadne.convergence.step_rms_tolerance_ang",
-    "ariadne.convergence.step_max_tolerance_ang",
+    "ariadne.convergence.gradient_rms_tolerance_per_angstrom",
+    "ariadne.convergence.gradient_max_tolerance_per_angstrom",
+    "ariadne.convergence.step_rms_tolerance_angstrom",
+    "ariadne.convergence.step_max_tolerance_angstrom",
     "ariadne.convergence.consecutive_accepted_steps",
     "ariadne.convergence.adaptive_score_reference",
-    "ariadne.convergence.adaptive_length_reference_ang",
+    "ariadne.convergence.adaptive_length_reference_angstrom",
     "ariadne.convergence.adaptive_min_multiplier",
     "ariadne.convergence.adaptive_max_multiplier",
     "ariadne.delta0",
@@ -382,7 +382,7 @@ def diff_against_defaults(config) -> Dict[str, Any]:
     """Recursive diff of 'config' (a CampaignConfig instance) against
     the dataclass defaults from 'CampaignConfig()'.
 
-    Returns a sparse dict containing only the leaves where the operator's
+    Returns a sparse dict containing only the leaves where the user's
     value differs from the default, plus a 'schema_version' key at the top
     so the result is round-trip-loadable (synchonisable) via 'CampaignConfig.from_dict'.
 
@@ -505,7 +505,7 @@ class AcquisitionCalibratedEnergyBlock:
 class AcquisitionGradientBlock:
     active_step: float = 1.0e-3
     regularization: float = 1.0e-10
-    max_acquisition_grad_per_ang: float = 50.0
+    max_acquisition_grad_per_angstrom: float = 50.0
 
 
 @dataclass
@@ -535,7 +535,7 @@ class CampaignIdentityConfigBlock:
     system_name: str = "SYSTEM"
     max_iterations: int = 50
     sampling_aggressiveness: int = 5
-    random_seed: int = 0
+    reproducibility_seed: int = 0
     custom_bootstrap: bool = False
 
 
@@ -619,13 +619,13 @@ class FerebusConfigBlock:
 class AriadneConvergenceConfigBlock:
     mode: str = "fixed"
     objective_change_tolerance: float = 1.0e-6
-    gradient_rms_tolerance_per_ang: float = 1.0e-4
-    gradient_max_tolerance_per_ang: float = 1.5e-4
-    step_rms_tolerance_ang: float = 1.2e-3
-    step_max_tolerance_ang: float = 1.8e-3
+    gradient_rms_tolerance_per_angstrom: float = 1.0e-4
+    gradient_max_tolerance_per_angstrom: float = 1.5e-4
+    step_rms_tolerance_angstrom: float = 1.2e-3
+    step_max_tolerance_angstrom: float = 1.8e-3
     consecutive_accepted_steps: int = 2
     adaptive_score_reference: float = 1.0
-    adaptive_length_reference_ang: float = 0.05
+    adaptive_length_reference_angstrom: float = 0.05
     adaptive_min_multiplier: float = 0.25
     adaptive_max_multiplier: float = 4.0
 
@@ -698,8 +698,8 @@ class QualityGatesConfigBlock:
     ferebus_max_aggregate_ext_rmse_increase_fraction: float = 0.05
     ferebus_max_task_ext_rmse_increase_fraction: float = 0.20
     ferebus_regression_abs_tolerance_ha: float = 1.0e-6
-    ariadne_max_displacement_ang: Optional[float] = 1.25
-    ariadne_min_pair_distance_ang: Optional[float] = 0.60
+    ariadne_max_displacement_angstrom: Optional[float] = 1.25
+    ariadne_min_pair_distance_angstrom: Optional[float] = 0.60
 
 
 @dataclass
@@ -1053,7 +1053,7 @@ class AimallConfigBlock:
 
 @dataclass
 class CampaignConfig:
-    """Top-level campaign configuration (schema 13)."""
+    """Top-level campaign configuration (schema 14)."""
 
     schema_version: int = CONFIG_SCHEMA_VERSION
 
@@ -1102,14 +1102,6 @@ class CampaignConfig:
             "poll_interval_idle_seconds": ("runtime", "poll_interval_idle_seconds"),
             "poll_sacct_empty_max_ticks": ("runtime", "poll_sacct_empty_max_ticks"),
             "failure_threshold_fraction": ("runtime", "failure_threshold_fraction"),
-            "max_acquisition_grad_per_ang": (
-                "acquisition.gradient",
-                "max_acquisition_grad_per_ang",
-            ),
-            "max_force_per_atom_ha_per_ang": (
-                "acquisition.gradient",
-                "max_acquisition_grad_per_ang",
-            ),
         }
         alias_values = {}
         for alias, target in moved_aliases.items():
@@ -1133,8 +1125,6 @@ class CampaignConfig:
                 raise TypeError("CampaignConfig field has no default: " + f.name)
             setattr(self, f.name, value)
         for (block_path, attr), value in alias_values.items():
-            if value is None and attr == "max_acquisition_grad_per_ang":
-                continue
             target = self
             for part in str(block_path).split("."):
                 target = getattr(target, part)
@@ -1187,22 +1177,6 @@ class CampaignConfig:
     @failure_threshold_fraction.setter
     def failure_threshold_fraction(self, value: float) -> None:
         self.runtime.failure_threshold_fraction = float(value)
-
-    @property
-    def max_acquisition_grad_per_ang(self) -> float:
-        return self.acquisition.gradient.max_acquisition_grad_per_ang
-
-    @max_acquisition_grad_per_ang.setter
-    def max_acquisition_grad_per_ang(self, value: float) -> None:
-        self.acquisition.gradient.max_acquisition_grad_per_ang = float(value)
-
-    @property
-    def max_force_per_atom_ha_per_ang(self) -> float:
-        return self.acquisition.gradient.max_acquisition_grad_per_ang
-
-    @max_force_per_atom_ha_per_ang.setter
-    def max_force_per_atom_ha_per_ang(self, value: float) -> None:
-        self.acquisition.gradient.max_acquisition_grad_per_ang = float(value)
 
     def to_dict(self):
         return asdict(self)
@@ -1476,8 +1450,8 @@ class CampaignConfig:
                 "campaign.sampling_aggressiveness must be in [1, 10]"
             )
         _validate_nonnegative_int(
-            "campaign.random_seed",
-            self.campaign.random_seed,
+            "campaign.reproducibility_seed",
+            self.campaign.reproducibility_seed,
         )
         if self.seed_selection.n_seeds_per_iteration <= 0:
             raise ConfigValidationError(
@@ -1713,8 +1687,14 @@ class CampaignConfig:
             ("quality_gates.iqa_energy_recovery_tolerance_ha", qg.iqa_energy_recovery_tolerance_ha),
             ("quality_gates.ferebus_max_ext_rmse_ha", qg.ferebus_max_ext_rmse_ha),
             ("quality_gates.ferebus_max_condition_number", qg.ferebus_max_condition_number),
-            ("quality_gates.ariadne_max_displacement_ang", qg.ariadne_max_displacement_ang),
-            ("quality_gates.ariadne_min_pair_distance_ang", qg.ariadne_min_pair_distance_ang),
+            (
+                "quality_gates.ariadne_max_displacement_angstrom",
+                qg.ariadne_max_displacement_angstrom,
+            ),
+            (
+                "quality_gates.ariadne_min_pair_distance_angstrom",
+                qg.ariadne_min_pair_distance_angstrom,
+            ),
         ):
             _validate_optional_nonnegative_float(name, value)
         if qg.ferebus_min_ext_r2 is not None:
@@ -1806,22 +1786,22 @@ class CampaignConfig:
                 "error_calibration.group_by_landing_policy must be a boolean"
             )
         max_acquisition_grad = (
-            self.acquisition.gradient.max_acquisition_grad_per_ang
+            self.acquisition.gradient.max_acquisition_grad_per_angstrom
         )
         if isinstance(max_acquisition_grad, bool) or not isinstance(
             max_acquisition_grad,
             (int, float),
         ):
             raise ConfigValidationError(
-                "acquisition.gradient.max_acquisition_grad_per_ang must be a number"
+                "acquisition.gradient.max_acquisition_grad_per_angstrom must be a number"
             )
         if not math.isfinite(float(max_acquisition_grad)):
             raise ConfigValidationError(
-                "acquisition.gradient.max_acquisition_grad_per_ang must be finite"
+                "acquisition.gradient.max_acquisition_grad_per_angstrom must be finite"
             )
         if float(max_acquisition_grad) <= 0.0:
             raise ConfigValidationError(
-                "acquisition.gradient.max_acquisition_grad_per_ang must be > 0"
+                "acquisition.gradient.max_acquisition_grad_per_angstrom must be > 0"
             )
         ariadne = self.ariadne
         convergence = ariadne.convergence
@@ -1831,12 +1811,12 @@ class CampaignConfig:
             )
         for name in (
             "objective_change_tolerance",
-            "gradient_rms_tolerance_per_ang",
-            "gradient_max_tolerance_per_ang",
-            "step_rms_tolerance_ang",
-            "step_max_tolerance_ang",
+            "gradient_rms_tolerance_per_angstrom",
+            "gradient_max_tolerance_per_angstrom",
+            "step_rms_tolerance_angstrom",
+            "step_max_tolerance_angstrom",
             "adaptive_score_reference",
-            "adaptive_length_reference_ang",
+            "adaptive_length_reference_angstrom",
             "adaptive_min_multiplier",
             "adaptive_max_multiplier",
         ):
@@ -2193,8 +2173,9 @@ class CampaignConfig:
         self.gaussian.extra_route_keywords = normalise_gaussian_route_keywords(
             self.gaussian.extra_route_keywords
         )
-    def effective_max_acquisition_grad_per_ang(self) -> float:
-        return float(self.acquisition.gradient.max_acquisition_grad_per_ang)
+
+    def effective_max_acquisition_grad_per_angstrom(self) -> float:
+        return float(self.acquisition.gradient.max_acquisition_grad_per_angstrom)
 
     def to_acquisition_config(self):
         """Materialise the mandatory mature IQA acquisition contract."""
@@ -2377,17 +2358,17 @@ class CampaignConfig:
                 mode=convergence.mode,
                 objective_change_tolerance=convergence.objective_change_tolerance,
                 gradient_rms_tolerance_per_ang=(
-                    convergence.gradient_rms_tolerance_per_ang
+                    convergence.gradient_rms_tolerance_per_angstrom
                 ),
                 gradient_max_tolerance_per_ang=(
-                    convergence.gradient_max_tolerance_per_ang
+                    convergence.gradient_max_tolerance_per_angstrom
                 ),
-                step_rms_tolerance_ang=convergence.step_rms_tolerance_ang,
-                step_max_tolerance_ang=convergence.step_max_tolerance_ang,
+                step_rms_tolerance_ang=convergence.step_rms_tolerance_angstrom,
+                step_max_tolerance_ang=convergence.step_max_tolerance_angstrom,
                 consecutive_accepted_steps=convergence.consecutive_accepted_steps,
                 adaptive_score_reference=convergence.adaptive_score_reference,
                 adaptive_length_reference_ang=(
-                    convergence.adaptive_length_reference_ang
+                    convergence.adaptive_length_reference_angstrom
                 ),
                 adaptive_min_multiplier=convergence.adaptive_min_multiplier,
                 adaptive_max_multiplier=convergence.adaptive_max_multiplier,

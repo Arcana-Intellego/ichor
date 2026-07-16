@@ -203,8 +203,8 @@ daemon-owned under `.DATA/SCRATCH/GAUSSIAN/<phase>/`; successful Gaussian tasks
 remove their own scratch directory, while failed tasks keep it for diagnosis.
 The active-learning daemon deliberately ignores `software.gaussian.scratch_root`
 for Gaussian phases so live campaign runtime files stay inside the campaign
-tree. The first smoke uses `resources.array_concurrency_limit: 4` to be gentle
-on the scheduler. Backend CPU fields default to `auto`; AIMAll combines that with
+tree. The first smoke uses `resources.array_concurrency_limit: null`, leaving
+array concurrency to Slurm. Backend CPU fields default to `auto`; AIMAll combines that with
 `aimall.naat: auto` to choose an atom-level parallelism appropriate to the
 staged system size. The example AIMAll block uses `naat: auto`, `boaq:
 auto_gs2`, and `iasmesh: medium` to keep the first integration pass cheap while
@@ -251,7 +251,7 @@ A minimal `campaign.yaml` (also shipped at
 `examples/csf4_first_live_iter/campaign.yaml`):
 
 ```yaml
-schema_version: 13
+schema_version: 14
 
 campaign:
   system_name: CHANGE_ME_SYSTEM
@@ -305,10 +305,10 @@ ariadne:
   convergence:
     mode: fixed
     objective_change_tolerance: 1.0e-6
-    gradient_rms_tolerance_per_ang: 1.0e-4
-    gradient_max_tolerance_per_ang: 1.5e-4
-    step_rms_tolerance_ang: 1.2e-3
-    step_max_tolerance_ang: 1.8e-3
+    gradient_rms_tolerance_per_angstrom: 1.0e-4
+    gradient_max_tolerance_per_angstrom: 1.5e-4
+    step_rms_tolerance_angstrom: 1.2e-3
+    step_max_tolerance_angstrom: 1.8e-3
     consecutive_accepted_steps: 2
   trqn_backtransform_mode: geodesic
   trqn_geodesic_bt_mode: dense
@@ -500,7 +500,7 @@ CSF accounting has not emitted all expected task rows yet, but `squeue` still
 shows active Slurm array jobs. The daemon keeps polling in this state.
 
 **oneAPI import error at ARIADNE_ARRAY start**. usually means the
-operator did not activate the venv before invoking the daemon. SLURM
+user did not activate the venv before invoking the daemon. SLURM
 copies the submission shell's environment to worker nodes, so as long
 as `~/.venv/ichor-csf4/bin/activate` was sourced before `ichor-al-daemon
 start`, the worker will find ariadne in the venv site-packages.

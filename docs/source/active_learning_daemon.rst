@@ -102,13 +102,13 @@ The :code:`campaign.yaml` file is a nested block layout. The full
 minimal sparse config overrides only the keys you care about; every other
 field falls back to its dataclass default::
 
-    schema_version: 13
+    schema_version: 14
 
     campaign:
       system_name: CHANGE_ME_SYSTEM
       max_iterations: 50
       sampling_aggressiveness: 5
-      random_seed: 0
+      reproducibility_seed: 0
       custom_bootstrap: false
 
     runtime:
@@ -202,9 +202,9 @@ validation slots are filled by ICHOR diversity sampling. Imported models become 
 version 0 without a FEREBUS optimisation job, and their original X/Y rows are
 prepended and verified during every later retraining.
 
-The lower-case ``bootstrap/`` directory is operator-owned input. The
+The lower-case ``bootstrap/`` directory is user-owned input. The
 ``.DATA/BOOTSTRAP/`` directory is daemon-owned Phase A output; do not put
-operator files there. ``bootstrap/model_krig/`` must contain regular
+user files there. ``bootstrap/model_krig/`` must contain regular
 ``.model`` files only, with no symlinks or unrelated sidecar files.
 
 Every ``init`` prints the complete discovery and top-up summary and asks
@@ -216,9 +216,9 @@ config) to navigate the nested blocks interactively; every field has its
 own menu item with input validation.
 
 When you save from the menu, ICHOR writes a "diff-against-defaults" YAML
-containing only the keys explicitly touched by the operator. Named presets
+containing only the keys explicitly touched by the user. Named presets
 are not supported; the complete effective configuration is determined by
-the schema-13 defaults and the campaign file.
+the schema-14 defaults and the campaign file.
 
 
 Cluster prerequisites for :code:`--mode live`
@@ -235,7 +235,7 @@ the live backends at start and refuses with exit 12 if any are missing::
     module load compiler-rt tbb compiler
     module load mkl/2024.2
     module load gaussian/g16c01_em64t_detectcpu
-    # AIMAll lives in ~/AIMAll/ on most CSF nodes (operator-installed).
+    # AIMAll lives in ~/AIMAll/ on most CSF nodes (user-installed).
     # FEREBUS is invoked via the pyferebus Python wrapper; install it
     # in the same venv environment as ichor_hpc.
     # ARIADNE is the oneAPI .so + Python wrapper installed into that venv.
@@ -268,7 +268,7 @@ Backend availability
      - :code:`--mode live`
      - :code:`ichor-al-daemon preflight --campaign-dir .`
    * - AIMAll
-     - Operator-installed at :code:`~/AIMAll/aimqb.ish`
+     - User-installed at :code:`~/AIMAll/aimqb.ish`
      - :code:`--mode live`
      - :code:`ls ~/AIMAll/aimqb.ish`
    * - FEREBUS (pyferebus)
@@ -527,7 +527,7 @@ Recovery + troubleshooting
 Stopping and resuming
 ~~~~~~~~~~~~~~~~~~~~~
 
-Operator stops use a separate atomic control file rather than allowing the
+User stops use a separate atomic control file rather than allowing the
 CLI process to rewrite ``state.json`` while the daemon owns it. The default
 stop is immediate at the next daemon tick; it does not cancel Slurm jobs::
 
@@ -563,7 +563,7 @@ honoured by ordinary ``resume``. Withdraw it explicitly only when intended::
 
 The control file lives at
 ``.DATA/ACTIVE_LEARNING/stop_request.json``. Archived requests are retained
-under ``.DATA/ACTIVE_LEARNING/stop_request_history/`` for operator provenance.
+under ``.DATA/ACTIVE_LEARNING/stop_request_history/`` for user provenance.
 
 The daemon writes three artefacts you care about during recovery:
 
@@ -575,7 +575,7 @@ The daemon writes three artefacts you care about during recovery:
   per-phase event log. Best-effort; you can drop the file and the
   daemon still works, you just lose post-mortem provenance.
 - :code:`<campaign>/.DATA/ACTIVE_LEARNING/stop_request.json` -- current
-  operator stop control. A malformed file is fail-closed and must be reviewed
+  user stop control. A malformed file is fail-closed and must be reviewed
   before reconcile can be applied.
 
 If the daemon refuses to start because :code:`state.json` is missing or
@@ -642,7 +642,7 @@ What reconcile still does not do:
   version;
 - it does not rebuild committed manifests automatically;
 - it does not roll back one-sided newer reference-data/model versions without
-  operator review.
+  user review.
 
 Common failure modes:
 

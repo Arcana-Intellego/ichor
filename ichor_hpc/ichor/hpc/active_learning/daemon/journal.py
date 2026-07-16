@@ -41,7 +41,7 @@ __all__ = [
 
 #Documentation only -- the journal is a free-form NDJSON stream and any
 #string is a valid event type. KNOWN_EVENT_TYPES enumerates the names the
-#daemon and executors currently emit so operators / log consumers can build
+# daemon and executors currently emit so users and log consumers can build
 #dashboards against a stable list.
 #
 #  campaign_started        -- emitted once when state.json is first written
@@ -118,12 +118,12 @@ KNOWN_EVENT_TYPES = (
     "checkpoint_failed",
     "checkpoint_verified",
     "reconcile_resolved_terminal_intent",
-    "operator_cancelled_jobs",
-    "operator_stop_requested",
-    "operator_stop_boundary_reached",
-    "operator_stop_control_invalid",
-    "operator_stop_request_cancelled",
-    "operator_stop_resumed",
+    "user_cancelled_jobs",
+    "user_stop_requested",
+    "user_stop_boundary_reached",
+    "user_stop_control_invalid",
+    "user_stop_request_cancelled",
+    "user_stop_resumed",
     "sacct_unknown_timeout",
     "sacct_missing_timeout",
     "sacct_empty_but_squeue_active",

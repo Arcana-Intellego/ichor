@@ -1,7 +1,7 @@
-"""Operator recommendations for ``ichor-al-daemon status``.
+"""User recommendations for ``ichor-al-daemon status``.
 
 The daemon state is a compact machine contract, but the status command is an
-operator interface. Keep the decision table here so recommendations stay
+user interface. Keep the decision table here so recommendations stay
 specific and testable instead of collapsing into one generic "run reconcile"
 message.
 """
@@ -309,7 +309,7 @@ def _halt_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusRecom
             severity="blocked",
             primary=(
                 "inspect the failed supplied bootstrap calculation; correct the "
-                "operator input or start a new campaign because mandatory custom "
+                "user input or start a new campaign because mandatory custom "
                 "geometries cannot be replaced"
             ),
             why=_short_error(reason),
@@ -632,7 +632,7 @@ def build_status_recommendations(
     payload: Dict[str, Any],
     journal_path: Optional[Any] = None,
 ) -> List[StatusRecommendation]:
-    """Return ordered operator recommendations for a status payload."""
+    """Return ordered user recommendations for a status payload."""
     del journal_path  # reserved for future journal-dependent detail expansion
     campaign = Path(campaign_dir)
     config_status = payload.get("campaign_config_status")
@@ -685,7 +685,7 @@ def build_status_recommendations(
             StatusRecommendation(
                 code="stop_control_invalid",
                 severity="required",
-                primary="inspect and reconcile the malformed operator stop control before continuing",
+                primary="inspect and reconcile the malformed user stop control before continuing",
                 why=_short_error(payload.get("stop_control_error")),
                 command=_reconcile_cmd(campaign),
             )
@@ -767,7 +767,7 @@ def build_status_recommendations(
         if str(stop_request.get("status")) == "cancelling":
             return [
                 StatusRecommendation(
-                    code="operator_stop_cancellation_incomplete",
+                    code="user_stop_cancellation_incomplete",
                     severity="required",
                     primary="rerun the immediate stop command to finish recorded Slurm cancellation",
                     why=(
@@ -797,10 +797,10 @@ def build_status_recommendations(
             target = "iteration " + str(stop_request.get("target_iteration"))
         return [
             StatusRecommendation(
-                code="operator_stop_draining",
+                code="user_stop_draining",
                 severity="watch" if daemon_active else "required",
                 primary=(
-                    "resume the campaign to finalise the completed operator stop"
+                    "resume the campaign to finalise the completed user stop"
                     if request_completed
                     else (
                         "wait for the daemon to reach the requested stop boundary"
@@ -843,7 +843,7 @@ def build_status_recommendations(
                 code="shutdown_requested",
                 severity="required",
                 primary=(
-                    "resume the campaign to clear the explicit operator stop"
+                    "resume the campaign to clear the explicit user stop"
                     if stopped
                     else "run reconcile before clearing an unclassified stop request"
                 ),

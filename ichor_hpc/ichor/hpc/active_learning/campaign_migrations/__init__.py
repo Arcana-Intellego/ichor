@@ -5,7 +5,7 @@ import copy
 from typing import Any, Dict, Mapping
 
 
-CURRENT_SCHEMA_VERSION = 13
+CURRENT_SCHEMA_VERSION = 14
 
 
 class CampaignMigrationError(ValueError):
@@ -29,7 +29,7 @@ def migrate_campaign_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
             + str(version)
             + " is unsupported; this release requires schema_version "
             + str(CURRENT_SCHEMA_VERSION)
-            + "; schema 13 is a clean break and old campaigns must be "
+            + "; schema 14 is a clean break and old campaigns must be "
             + "initialised again"
         )
     return data

@@ -1,11 +1,11 @@
-schema_version: 13
+schema_version: 14
 
 campaign:
   system_name: ICHOR_CSF3_LONG_CAMPAIGN
   max_iterations: 20
   custom_bootstrap: false
   sampling_aggressiveness: 5
-  random_seed: 0
+  reproducibility_seed: 0
 
 # Production-style starting point. Calibrate thresholds from one first-live
 # campaign before increasing batch sizes further.
@@ -35,7 +35,7 @@ resources:
     auto_max_workers: 16
     target_pairs_per_worker: 5000000
     in_memory_distance_store_fraction: 0.35
-  array_concurrency_limit: 8
+  array_concurrency_limit: null
   memory_estimate_safety_factor: 1.25
   scheduler_usage_telemetry: true
   scheduler_usage_history_limit: 5000
@@ -53,13 +53,13 @@ ariadne:
   convergence:
     mode: fixed
     objective_change_tolerance: 1.0e-6
-    gradient_rms_tolerance_per_ang: 1.0e-4
-    gradient_max_tolerance_per_ang: 1.5e-4
-    step_rms_tolerance_ang: 1.2e-3
-    step_max_tolerance_ang: 1.8e-3
+    gradient_rms_tolerance_per_angstrom: 1.0e-4
+    gradient_max_tolerance_per_angstrom: 1.5e-4
+    step_rms_tolerance_angstrom: 1.2e-3
+    step_max_tolerance_angstrom: 1.8e-3
     consecutive_accepted_steps: 2
     adaptive_score_reference: 1.0
-    adaptive_length_reference_ang: 0.05
+    adaptive_length_reference_angstrom: 0.05
     adaptive_min_multiplier: 0.25
     adaptive_max_multiplier: 4.0
 

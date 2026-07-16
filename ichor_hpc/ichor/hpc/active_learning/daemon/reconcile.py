@@ -7,7 +7,7 @@ recover; a silent reconstruction is exactly the bug class we want to avoid.
 "reconcile" inspects the on-disk artefacts that DO exist (QM_REFERENCE_DATA/
 committed iterations, TRAINED_MODELS/, journal entries) and proposes a
 "CampaignState" it believes is consistent with them. The proposal is
-written to "<state_path>.proposed" and the operator must explicitly
+written to "<state_path>.proposed" and the user must explicitly
 promote it ("mv state.json.proposed state.json") before restarting the
 daemon.
 """
@@ -198,8 +198,8 @@ def stateful_campaign_artifacts(campaign_dir: Union[str, Path]) -> List[str]:
         "reconcile_applied",
         "adopted_inflight_job",
         "tick_exception_halted",
-        "operator_stop_requested",
-        "operator_stop_boundary_reached",
+        "user_stop_requested",
+        "user_stop_boundary_reached",
     }
 
     def add_matches(pattern: str) -> None:
@@ -1701,7 +1701,7 @@ def propose_recovery(
         ]
     if len(protected_staging_handoffs) > 1:
         unsafe_reasons.append(
-            "multiple valid staging handoffs need operator review: "
+            "multiple valid staging handoffs need user review: "
             + ", ".join(
                 str(d.phase.value)
                 + "@"
@@ -1724,7 +1724,7 @@ def propose_recovery(
         )
     if len(partial_iteration_handoffs) > 1:
         unsafe_reasons.append(
-            "multiple valid active-iteration handoffs need operator review: "
+            "multiple valid active-iteration handoffs need user review: "
             + ", ".join(
                 str(d.phase.value)
                 + "@"
@@ -1921,9 +1921,9 @@ def propose_recovery(
     elif preserve_stopped_state:
         recovered.phase = CampaignPhase(existing.phase)
         recovered.iteration = int(existing.iteration)
-        decision = "STOPPED: existing operator stop request remains authoritative"
+        decision = "STOPPED: existing user stop request remains authoritative"
         notes.append(
-            "preserved operator stop request; only resume may clear it"
+            "preserved user stop request; only resume may clear it"
         )
     elif identity_recovery_blocked:
         recovered.phase = CampaignPhase.HALTED
@@ -1953,7 +1953,7 @@ def propose_recovery(
                 )
                 decision = (
                     recovered.phase.value
-                    + ": selected from active submission intent for operator review"
+                    + ": selected from active submission intent for user review"
                 )
             except Exception:
                 recovered.phase = CampaignPhase.HALTED
@@ -2059,7 +2059,7 @@ def propose_recovery(
         )
         if recovered.phase is CampaignPhase.INITIAL_FEREBUS:
             # Bootstrap phases are always iteration zero, even when the stale
-            # state was halted after an operator increased max_iterations.
+            # state was halted after a user increased max_iterations.
             recovered.iteration = 0
         decision = (
             "INITIAL_FEREBUS: exact point allocation is complete and valid "
@@ -2077,7 +2077,7 @@ def propose_recovery(
         recovered.phase = CampaignPhase.HALTED
         decision = "HALTED: coherent committed versions exist but unsafe artefacts need review"
         notes.append(
-            "re-entry HALTED because committed artefacts need operator review"
+            "re-entry HALTED because committed artefacts need user review"
         )
     elif reference_data_model_skew_reentry:
         recovered.phase = CampaignPhase.FEREBUS
@@ -2088,9 +2088,9 @@ def propose_recovery(
         )
     elif unsafe_reasons:
         recovered.phase = CampaignPhase.HALTED
-        decision = "HALTED: unsafe artefacts need operator review"
+        decision = "HALTED: unsafe artefacts need user review"
         notes.append(
-            "re-entry HALTED because unsafe committed artefacts need operator review"
+            "re-entry HALTED because unsafe committed artefacts need user review"
         )
     else:
         recovered.phase = CampaignPhase.STOP_CHECK
@@ -2222,7 +2222,7 @@ def write_proposed_state(
     data_subdir: Union[str, Path] = Path(".DATA") / "ACTIVE_LEARNING",
 ) -> Path:
     """Write the proposed state to <state_path>.proposed and return the
-    path. The operator promotes it manually via mv state.json.proposed
+    path. The user promotes it manually via mv state.json.proposed
     state.json after reviewing."""
     target = (
         Path(campaign_dir) / data_subdir / (DEFAULT_STATE_FILENAME + RECONCILE_SUFFIX)

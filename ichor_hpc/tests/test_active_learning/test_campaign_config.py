@@ -29,8 +29,8 @@ from ichor.hpc.active_learning.geometry_protocol import (
 )
 
 
-def test_schema_version_is_thirteen():
-    assert CONFIG_SCHEMA_VERSION == 13
+def test_schema_version_is_fourteen():
+    assert CONFIG_SCHEMA_VERSION == 14
 
 
 def test_default_campaign_config_is_valid():
@@ -44,7 +44,7 @@ def test_default_campaign_config_is_valid():
     assert c.point_allocation.batch_internal_validation_size == 1
     assert c.point_allocation.batch_total_size == 4
     assert c.campaign.custom_bootstrap is False
-    assert c.campaign.random_seed == 0
+    assert c.campaign.reproducibility_seed == 0
     assert c.seed_selection.exclude_committed_seed_frames is True
     assert c.seed_selection.recent_seed_cooldown_iterations == 1
     assert c.quality_gates.require_readable_aimall_geometry is True
@@ -108,13 +108,13 @@ def test_default_campaign_config_is_valid():
     assert c.aimall.naat == "auto"
     assert c.aimall.boaq == "auto"
     assert c.aimall.iasmesh == "fine"
-    assert c.quality_gates.ariadne_max_displacement_ang == 1.25
-    assert c.quality_gates.ariadne_min_pair_distance_ang == 0.60
+    assert c.quality_gates.ariadne_max_displacement_angstrom == 1.25
+    assert c.quality_gates.ariadne_min_pair_distance_angstrom == 0.60
     assert c.adversarial_safety.salvage_safe_iterate is True
     assert c.adversarial_safety.backtrack_to_safe_landing is True
     assert c.adversarial_safety.under_move_retry is True
-    assert c.max_acquisition_grad_per_ang == 50.0
-    assert c.effective_max_acquisition_grad_per_ang() == 50.0
+    assert c.acquisition.gradient.max_acquisition_grad_per_angstrom == 50.0
+    assert c.effective_max_acquisition_grad_per_angstrom() == 50.0
     assert c.error_calibration.enabled is True
     assert c.error_calibration.mode == "record_only"
     assert c.error_calibration.min_records_to_apply == 100
@@ -182,17 +182,59 @@ def test_custom_bootstrap_and_point_allocation_integer_sizes_are_validated():
         CampaignConfig.from_dict(payload)
 
 
-def test_pre_v13_schema_is_rejected_without_migration():
+def test_pre_v14_schema_is_rejected_without_migration():
     payload = CampaignConfig().to_dict()
     payload["schema_version"] = 7
-    with pytest.raises(ConfigValidationError, match="requires schema_version 13"):
+    with pytest.raises(ConfigValidationError, match="requires schema_version 14"):
         CampaignConfig.from_dict(payload)
+
+
+def test_schema_thirteen_is_rejected_without_migration():
+    payload = CampaignConfig().to_dict()
+    payload["schema_version"] = 13
+    with pytest.raises(ConfigValidationError, match="requires schema_version 14"):
+        CampaignConfig.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "campaign.random_seed",
+        "acquisition.gradient.max_acquisition_grad_per_ang",
+        "ariadne.convergence.gradient_rms_tolerance_per_ang",
+        "ariadne.convergence.gradient_max_tolerance_per_ang",
+        "ariadne.convergence.step_rms_tolerance_ang",
+        "ariadne.convergence.step_max_tolerance_ang",
+        "ariadne.convergence.adaptive_length_reference_ang",
+        "quality_gates.ariadne_max_displacement_ang",
+        "quality_gates.ariadne_min_pair_distance_ang",
+    ],
+)
+def test_schema_fourteen_rejects_old_campaign_field_names(path):
+    payload = CampaignConfig().to_dict()
+    target = payload
+    parts = path.split(".")
+    for part in parts[:-1]:
+        target = target[part]
+    target[parts[-1]] = 1
+
+    with pytest.raises(ConfigValidationError, match="unknown keys"):
+        CampaignConfig.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    "alias",
+    ["max_acquisition_grad_per_ang", "max_force_per_atom_ha_per_ang"],
+)
+def test_schema_fourteen_rejects_removed_gradient_aliases(alias):
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        CampaignConfig(**{alias: 1.0})
 
 
 def test_old_schema_and_removed_ferebus_scaling_field_are_rejected():
     payload = CampaignConfig().to_dict()
     payload["schema_version"] = 11
-    with pytest.raises(ConfigValidationError, match="requires schema_version 13"):
+    with pytest.raises(ConfigValidationError, match="requires schema_version 14"):
         CampaignConfig.from_dict(payload)
 
     payload = CampaignConfig().to_dict()
@@ -380,7 +422,7 @@ def test_schema_v3_resources_are_rejected_without_migration():
             "gaussian_link0_mem": "8GB",
         },
     }
-    with pytest.raises(ConfigValidationError, match="requires schema_version 13"):
+    with pytest.raises(ConfigValidationError, match="requires schema_version 14"):
         CampaignConfig.from_dict(payload)
 
 
@@ -404,15 +446,15 @@ def test_aimall_fields_validated():
 
 def test_preferred_acquisition_gradient_clamp_is_nested():
     payload = CampaignConfig().to_dict()
-    payload["acquisition"]["gradient"]["max_acquisition_grad_per_ang"] = 7.5
+    payload["acquisition"]["gradient"]["max_acquisition_grad_per_angstrom"] = 7.5
     cfg = CampaignConfig.from_dict(payload)
-    assert cfg.effective_max_acquisition_grad_per_ang() == 7.5
+    assert cfg.effective_max_acquisition_grad_per_angstrom() == 7.5
 
 
 def test_acquisition_gradient_clamp_must_be_positive():
     payload = CampaignConfig().to_dict()
-    payload["acquisition"]["gradient"]["max_acquisition_grad_per_ang"] = 0.0
-    with pytest.raises(ConfigValidationError, match="max_acquisition_grad_per_ang"):
+    payload["acquisition"]["gradient"]["max_acquisition_grad_per_angstrom"] = 0.0
+    with pytest.raises(ConfigValidationError, match="max_acquisition_grad_per_angstrom"):
         CampaignConfig.from_dict(payload)
 
 
@@ -569,7 +611,7 @@ def test_yaml_roundtrip(tmp_path):
 def test_yaml_duplicate_keys_are_rejected_with_source_locations(tmp_path):
     path = tmp_path / "campaign.yaml"
     path.write_text(
-        "schema_version: 13\n"
+        "schema_version: 14\n"
         "campaign:\n"
         "  max_iterations: 3\n"
         "  max_iterations: 9\n",
@@ -588,7 +630,7 @@ def test_yaml_merge_key_cannot_hide_duplicate_operator_input(tmp_path):
     path.write_text(
         "defaults: &defaults\n"
         "  max_iterations: 3\n"
-        "schema_version: 13\n"
+        "schema_version: 14\n"
         "campaign:\n"
         "  <<: *defaults\n"
         "  max_iterations: 9\n",
@@ -727,7 +769,7 @@ def test_campaign_block_owns_bootstrap_sampling_and_seed_fields():
         "max_iterations",
         "custom_bootstrap",
         "sampling_aggressiveness",
-        "random_seed",
+        "reproducibility_seed",
     }
     assert "trajectory_pool" not in payload
     assert "sampling_protocol" not in payload
@@ -750,7 +792,7 @@ def test_schema_eleven_rejects_removed_point_allocation_anchor():
         CampaignConfig.from_dict(payload)
 
 
-def test_all_shipped_campaign_templates_and_examples_parse_as_schema_thirteen():
+def test_all_shipped_campaign_templates_and_examples_parse_as_schema_fourteen():
     repo_root = Path(__file__).resolve().parents[3]
     paths = [
         repo_root
@@ -766,7 +808,42 @@ def test_all_shipped_campaign_templates_and_examples_parse_as_schema_thirteen():
     assert paths
     for path in paths:
         config = CampaignConfig.from_yaml(path)
-        assert config.schema_version == 13, str(path)
+        assert config.schema_version == 14, str(path)
+        assert config.resources.array_concurrency_limit is None, str(path)
+
+
+def test_tracked_campaign_docs_do_not_reintroduce_schema_thirteen_names():
+    repo_root = Path(__file__).resolve().parents[3]
+    paths = [
+        repo_root
+        / "ichor_hpc"
+        / "ichor"
+        / "hpc"
+        / "active_learning"
+        / "templates"
+        / "campaign.yaml",
+        repo_root / "docs" / "source" / "active_learning_daemon.rst",
+        repo_root / "scripts" / "install_ichor_csf.sh",
+        *sorted((repo_root / "examples").glob("**/campaign.yaml")),
+        *sorted((repo_root / "examples").glob("**/README.md")),
+    ]
+    forbidden = (
+        "schema_version: 13",
+        "  random_seed:",
+        "max_acquisition_grad_per_ang:",
+        "gradient_rms_tolerance_per_ang:",
+        "gradient_max_tolerance_per_ang:",
+        "step_rms_tolerance_ang:",
+        "step_max_tolerance_ang:",
+        "adaptive_length_reference_ang:",
+        "ariadne_max_displacement_ang:",
+        "ariadne_min_pair_distance_ang:",
+    )
+
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        for token in forbidden:
+            assert token not in text, str(path) + " contains " + token
 
 
 def test_invalid_descriptor_rejected():
@@ -814,7 +891,7 @@ def test_schema_v4_geometry_payload_is_rejected_without_migration():
         "lambda_move": 2.0,
     }
 
-    with pytest.raises(ConfigValidationError, match="requires schema_version 13"):
+    with pytest.raises(ConfigValidationError, match="requires schema_version 14"):
         CampaignConfig.from_dict(payload)
 
 
@@ -839,7 +916,7 @@ def test_schema_v5_bootstrap_and_batch_fields_are_rejected():
         "cap": 30,
     }
 
-    with pytest.raises(ConfigValidationError, match="requires schema_version 13"):
+    with pytest.raises(ConfigValidationError, match="requires schema_version 14"):
         CampaignConfig.from_dict(payload)
 
 
@@ -968,10 +1045,10 @@ def test_ariadne_block_defaults():
     assert ab.trqn_retry_target_initial_grad_rms == pytest.approx(4.0e-4)
     assert ab.convergence.mode == "fixed"
     assert ab.convergence.objective_change_tolerance == pytest.approx(1.0e-6)
-    assert ab.convergence.gradient_rms_tolerance_per_ang == pytest.approx(1.0e-4)
-    assert ab.convergence.gradient_max_tolerance_per_ang == pytest.approx(1.5e-4)
-    assert ab.convergence.step_rms_tolerance_ang == pytest.approx(1.2e-3)
-    assert ab.convergence.step_max_tolerance_ang == pytest.approx(1.8e-3)
+    assert ab.convergence.gradient_rms_tolerance_per_angstrom == pytest.approx(1.0e-4)
+    assert ab.convergence.gradient_max_tolerance_per_angstrom == pytest.approx(1.5e-4)
+    assert ab.convergence.step_rms_tolerance_angstrom == pytest.approx(1.2e-3)
+    assert ab.convergence.step_max_tolerance_angstrom == pytest.approx(1.8e-3)
     assert ab.convergence.consecutive_accepted_steps == 2
     assert ab.trqn_min_objective_scale == pytest.approx(1.0e-8)
     assert ab.trqn_max_objective_scale == pytest.approx(1.0)

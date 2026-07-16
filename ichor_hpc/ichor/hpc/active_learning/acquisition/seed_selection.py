@@ -1,7 +1,7 @@
 """Seed selection for the adversarial attack phase.
 
 By default, part of the batch is sampled uniformly at random from the eligible
-trajectory pool and the remainder is chosen by top posterior variance. Operators
+trajectory pool and the remainder is chosen by top posterior variance. Users
 can opt into a cheap D-optimal mode for the non-random part: it still starts
 from high-variance candidates, but greedily avoids points that are redundant
 with seeds already selected in model-posterior covariance space.

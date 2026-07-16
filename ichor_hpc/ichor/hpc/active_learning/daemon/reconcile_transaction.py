@@ -1,4 +1,4 @@
-"""Durable transaction evidence for operator reconciliation repairs."""
+"""Durable transaction evidence for user reconciliation repairs."""
 
 from __future__ import annotations
 

@@ -63,7 +63,7 @@ class ActiveLearningCampaignMenuOptions(MenuOptions):
         """Validate the campaign directory before any daemon op is dispatched.
 
         Returns a warning string when the path is unset / does not exist /
-        is not a directory; the prologue surfaces it in red so the operator
+        is not a directory; the prologue surfaces it in red so the user
         cannot accidentally drive a daemon against a bad path.
         """
         if not is_explicit_campaign_selection():
@@ -83,7 +83,7 @@ class ActiveLearningCampaignMenuOptions(MenuOptions):
 
         Every failure mode is swallowed and surfaced as a human-readable
         placeholder so the menu prologue can NEVER crash on a corrupt
-        state.json -- the operator falls back to 'Reconcile state' from the
+        state.json -- the user falls back to 'Reconcile state' from the
         daemon control submenu instead.
         """
         self._sync_selected_campaign_from_context()

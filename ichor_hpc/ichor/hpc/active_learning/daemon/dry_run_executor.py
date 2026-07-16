@@ -20,7 +20,7 @@ What it DOES NOT do (stubbed):
 
     * Gaussian, AIMAll, FEREBUS subprocesses are never spawned. Stub
       artefacts are produced in the canonical directory layout so a human
-      operator can inspect the dry-run output.
+      user can inspect the dry-run output.
     * ARIADNE is invoked through :func:"optimise_seed(mock=True)" so the
       adversarial pool is synthetic.
 
@@ -993,7 +993,7 @@ class DryRunPhaseExecutor:
 
         seed_selection_rng = derive_rng_seed(
             campaign_uid=str(state.campaign_uid),
-            campaign_random_seed=int(self.config.campaign.random_seed),
+            campaign_random_seed=int(self.config.campaign.reproducibility_seed),
             iteration=int(state.iteration),
             phase="SEED_SELECT",
             logical_task_id="seed-batch",
@@ -1130,7 +1130,7 @@ class DryRunPhaseExecutor:
         ).contract_sha256
         seeds_picked_payload = build_seed_selection_manifest(
             campaign_uid=str(state.campaign_uid),
-            campaign_random_seed=int(self.config.campaign.random_seed),
+            campaign_random_seed=int(self.config.campaign.reproducibility_seed),
             iteration=int(state.iteration),
             models_version=int(model_version),
             model_manifest_sha256=str(model_set.head_manifest_sha256),
@@ -1792,7 +1792,7 @@ class DryRunPhaseExecutor:
 
                 ariadne_rng = derive_rng_seed(
                     campaign_uid=campaign_uid,
-                    campaign_random_seed=int(self.config.campaign.random_seed),
+                    campaign_random_seed=int(self.config.campaign.reproducibility_seed),
                     iteration=int(state.iteration),
                     phase="ARIADNE_ARRAY",
                     logical_task_id=seed_uid,

@@ -1,6 +1,6 @@
 """Readable summaries of the active-learning sampling protocol.
 
-The summary is intentionally read-only. It gives an operator one compact view
+The summary is intentionally read-only. It gives a user one compact view
 of the knobs that materially affect seed choice, adversarial landing, and
 Phase-B safety before a configured Slurm daemon launch.
 """
@@ -477,10 +477,10 @@ def format_sampling_protocol_summary(
         lines.append(
             _line(
                 "sampling_protocol.resolved_quality_gates",
-                "max_displacement_ang="
-                + str(gates.ariadne_max_displacement_ang)
+                "max_displacement_angstrom="
+                + str(gates.ariadne_max_displacement_angstrom)
                 + ", min_pair_distance_policy=scale_model_ratio("
-                + str(gates.ariadne_min_pair_distance_ang)
+                + str(gates.ariadne_min_pair_distance_angstrom)
                 + " Angstrom)",
             )
         )
@@ -502,9 +502,9 @@ def format_sampling_protocol_summary(
         lines.append(
             _line(
                 "sampling_protocol.resolved_ariadne",
-                "initial_trust_radius_ang="
+                "initial_trust_radius_angstrom="
                 + str(ariadne_run.delta0)
-                + ", maximum_trust_radius_ang="
+                + ", maximum_trust_radius_angstrom="
                 + str(ariadne_run.delta_max),
             )
         )
@@ -516,13 +516,13 @@ def format_sampling_protocol_summary(
                 + str(convergence.mode)
                 + ", objective_change="
                 + str(convergence.objective_change_tolerance)
-                + ", gradient_rms="
+                + ", gradient_rms_per_angstrom="
                 + str(convergence.gradient_rms_tolerance_per_ang)
-                + ", gradient_max="
+                + ", gradient_max_per_angstrom="
                 + str(convergence.gradient_max_tolerance_per_ang)
-                + ", step_rms_ang="
+                + ", step_rms_angstrom="
                 + str(convergence.step_rms_tolerance_ang)
-                + ", step_max_ang="
+                + ", step_max_angstrom="
                 + str(convergence.step_max_tolerance_ang)
                 + ", accepted_streak="
                 + str(convergence.consecutive_accepted_steps),

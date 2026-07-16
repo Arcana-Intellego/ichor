@@ -2,7 +2,7 @@
 # Generic first-live-iteration active-learning campaign for CSF3/CSF4.
 # Intended for a small validation run, not a long production campaign.
 
-schema_version: 13
+schema_version: 14
 
 # -------------------------------------------------------------------------
 # Required system-level identifiers
@@ -21,7 +21,7 @@ campaign:
   sampling_aggressiveness: 5
 
   # Immutable root for all deterministic component seeds.
-  random_seed: 0
+  reproducibility_seed: 0
 
   # When true, init inspects the campaign-relative bootstrap/ directory for
   # split-specific XYZ/CSV inputs or a model_krig training baseline.
@@ -92,20 +92,20 @@ quality_gates:
   ferebus_max_aggregate_ext_rmse_increase_fraction: 0.05
   ferebus_max_task_ext_rmse_increase_fraction: 0.20
   ferebus_regression_abs_tolerance_ha: 1.0e-6
-  ariadne_max_displacement_ang: 1.25
-  ariadne_min_pair_distance_ang: 0.60
+  ariadne_max_displacement_angstrom: 1.25
+  ariadne_min_pair_distance_angstrom: 0.60
 
 ariadne:
   convergence:
     mode: fixed
     objective_change_tolerance: 1.0e-6
-    gradient_rms_tolerance_per_ang: 1.0e-4
-    gradient_max_tolerance_per_ang: 1.5e-4
-    step_rms_tolerance_ang: 1.2e-3
-    step_max_tolerance_ang: 1.8e-3
+    gradient_rms_tolerance_per_angstrom: 1.0e-4
+    gradient_max_tolerance_per_angstrom: 1.5e-4
+    step_rms_tolerance_angstrom: 1.2e-3
+    step_max_tolerance_angstrom: 1.8e-3
     consecutive_accepted_steps: 2
     adaptive_score_reference: 1.0
-    adaptive_length_reference_ang: 0.05
+    adaptive_length_reference_angstrom: 0.05
     adaptive_min_multiplier: 0.25
     adaptive_max_multiplier: 4.0
 
@@ -207,9 +207,9 @@ resources:
   scheduler_usage_telemetry: true
   scheduler_usage_history_limit: 5000
 
-  # Keep the first live example gentle on the scheduler.
-  # For larger campaigns, increase or remove this.
-  array_concurrency_limit: 4
+  # null submits every array member without a Slurm %N throttle.
+  # Set a positive integer to cap simultaneously running array tasks.
+  array_concurrency_limit: null
 
   # Use process parallelism for the active_fd gradient path.
   gradient_parallel_backend: process

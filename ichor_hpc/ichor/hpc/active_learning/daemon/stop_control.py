@@ -1,4 +1,4 @@
-"""Durable operator stop requests for the active-learning daemon.
+"""Durable user stop requests for the active-learning daemon.
 
 The command-line process must not rewrite ``state.json`` while the daemon may
 be advancing it.  Stop requests therefore use a separate, atomically replaced
@@ -42,6 +42,65 @@ _STATUS_TRANSITIONS = {
 
 class StopControlError(RuntimeError):
     """Raised when daemon stop control is malformed or conflicts."""
+
+
+def _description_nonnegative_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return int(value)
+
+
+def describe_stop_request(
+    request: Any,
+    *,
+    completed: Optional[bool] = None,
+) -> str:
+    """Return one stable, fail-safe description of a stop target."""
+    if not isinstance(request, Mapping):
+        return "stop target unavailable"
+    mode = request.get("mode")
+    if completed is None:
+        completed = request.get("status") == "completed"
+    if mode == "immediate":
+        phase = request.get("observed_phase", request.get("phase"))
+        iteration = _description_nonnegative_int(request.get("observed_iteration"))
+        if iteration is None:
+            iteration = _description_nonnegative_int(request.get("iteration"))
+        if not isinstance(phase, str) or not phase or iteration is None:
+            return "stop target unavailable"
+        return (
+            "immediate stop requested during "
+            + phase
+            + " in iteration "
+            + str(iteration)
+        )
+    if mode == "after_phase":
+        phase = request.get("target_phase")
+        iteration = _description_nonnegative_int(request.get("target_iteration"))
+        replacement_round = _description_nonnegative_int(
+            request.get("target_replacement_round")
+        )
+        if (
+            not isinstance(phase, str)
+            or not phase
+            or iteration is None
+            or replacement_round is None
+        ):
+            return "stop target unavailable"
+        prefix = "stopped" if completed else "stop requested"
+        description = (
+            prefix + " after phase " + phase + " in iteration " + str(iteration)
+        )
+        if replacement_round > 0:
+            description += ", replacement round " + str(replacement_round)
+        return description
+    if mode == "after_iteration":
+        iteration = _description_nonnegative_int(request.get("target_iteration"))
+        if iteration is None:
+            return "stop target unavailable"
+        prefix = "stopped" if completed else "stop requested"
+        return prefix + " after iteration " + str(iteration)
+    return "stop target unavailable"
 
 
 def _canonical_digest(payload: Mapping[str, Any]) -> str:
@@ -679,6 +738,7 @@ __all__ = [
     "archive_resume_transaction",
     "build_stop_request",
     "complete_stop_request",
+    "describe_stop_request",
     "install_stop_request",
     "prepare_resume_transaction",
     "read_resume_transaction",

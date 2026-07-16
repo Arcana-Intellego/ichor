@@ -934,12 +934,12 @@ edit_campaign_config_menu = ConsoleMenu(
 _BLOCK_MENUS_BY_LABEL = {
     "Edit campaign": _make_block_menu(
         "Edit Campaign",
-        "Campaign identity, operator inputs, length, and sampling control.",
+        "Campaign identity, user inputs, length, and sampling control.",
         [
             _read_only_spec("schema_version"),
             _spec("campaign.system_name", "str"),
             _spec("campaign.max_iterations", "int"),
-            _spec("campaign.random_seed", "int"),
+            _spec("campaign.reproducibility_seed", "int"),
             _spec("campaign.custom_bootstrap", "bool"),
             _spec(
                 "campaign.sampling_aggressiveness",
@@ -1195,7 +1195,10 @@ _BLOCK_MENUS_BY_LABEL = {
         [
             _spec("acquisition.gradient.active_step", "float"),
             _spec("acquisition.gradient.regularization", "float"),
-            _spec("acquisition.gradient.max_acquisition_grad_per_ang", "float"),
+            _spec(
+                "acquisition.gradient.max_acquisition_grad_per_angstrom",
+                "float",
+            ),
         ],
     ),
     "Edit acquisition.barrier": _make_block_menu(
@@ -1312,8 +1315,14 @@ _BLOCK_MENUS_BY_LABEL = {
             _spec("quality_gates.ferebus_max_aggregate_ext_rmse_increase_fraction", "float"),
             _spec("quality_gates.ferebus_max_task_ext_rmse_increase_fraction", "float"),
             _spec("quality_gates.ferebus_regression_abs_tolerance_ha", "float"),
-            _spec("quality_gates.ariadne_max_displacement_ang", "optional_float"),
-            _spec("quality_gates.ariadne_min_pair_distance_ang", "optional_float"),
+            _spec(
+                "quality_gates.ariadne_max_displacement_angstrom",
+                "optional_float",
+            ),
+            _spec(
+                "quality_gates.ariadne_min_pair_distance_angstrom",
+                "optional_float",
+            ),
         ],
     ),
     "Edit runtime": _make_block_menu(

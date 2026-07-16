@@ -240,7 +240,7 @@ def test_orphaned_resolution_is_not_reported_as_submitted(tmp_path):
 def test_resource_plan_is_byte_for_byte_read_only(tmp_path):
     data = tmp_path / ".DATA" / "ACTIVE_LEARNING"
     data.mkdir(parents=True)
-    (tmp_path / "campaign.yaml").write_text("schema_version: 13\n", encoding="utf-8")
+    (tmp_path / "campaign.yaml").write_text("schema_version: 14\n", encoding="utf-8")
     (data / "operator-note.txt").write_bytes(b"unchanged evidence\n")
     before = _campaign_byte_inventory(tmp_path)
 

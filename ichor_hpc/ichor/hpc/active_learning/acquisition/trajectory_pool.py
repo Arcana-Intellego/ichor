@@ -7,7 +7,7 @@ transitively prove descendance from.
 
 Layout on disk under <campaign_dir>:
 
-    pool.xyz                    # canonical operator trajectory
+    pool.xyz                    # canonical user trajectory
     .DATA/TRAJECTORY/
         pool.manifest.json      # SHA + n_frames + atom_types + masses + imported_iso
 
@@ -370,7 +370,7 @@ class TrajectoryPool:
     ) -> "TrajectoryPool":
         """Copy source into the canonical pool path under campaign_dir
         and write the manifest. Refuses to overwrite an existing manifest
-        unless overwrite=True (operator opt-in only).
+        unless overwrite=True (explicit user opt-in only).
 
         The import is deliberately verbatim: every source frame is pinned in
         the campaign pool and downstream selection/safety gates decide which

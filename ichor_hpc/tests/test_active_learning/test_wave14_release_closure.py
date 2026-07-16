@@ -245,7 +245,7 @@ def test_seed_identity_ignores_full_manifest_receipt_churn():
 
 def _long_run_config() -> CampaignConfig:
     config = CampaignConfig(max_iterations=25, poll_interval_seconds=1)
-    config.campaign.random_seed = 9173
+    config.campaign.reproducibility_seed = 9173
     config.point_allocation.bootstrap_training_size = 2
     config.point_allocation.bootstrap_internal_validation_size = 2
     config.point_allocation.bootstrap_external_validation_size = 2

@@ -189,8 +189,8 @@ def hidden_sampling_overrides(config: CampaignConfig) -> List[Dict[str, Any]]:
         [
             "ariadne.delta0",
             "ariadne.delta_max",
-            "quality_gates.ariadne_max_displacement_ang",
-            "quality_gates.ariadne_min_pair_distance_ang",
+            "quality_gates.ariadne_max_displacement_angstrom",
+            "quality_gates.ariadne_min_pair_distance_angstrom",
         ]
     )
     out: List[Dict[str, Any]] = []
@@ -242,10 +242,10 @@ def _effective_campaign_config(
     )
 
     effective.quality_gates = copy.deepcopy(config.quality_gates)
-    effective.quality_gates.ariadne_max_displacement_ang = float(
+    effective.quality_gates.ariadne_max_displacement_angstrom = float(
         policy.max_atom_displacement_ang
     )
-    effective.quality_gates.ariadne_min_pair_distance_ang = float(
+    effective.quality_gates.ariadne_min_pair_distance_angstrom = float(
         policy.min_pair_distance_ang
     )
     return effective
@@ -489,11 +489,17 @@ def _resolved_manifest_payload(resolved: ResolvedSamplingProtocol) -> Dict[str, 
             "reject_over_moved": bool(resolved.adversarial_safety.reject_over_moved),
         },
         "resolved_quality_gates": {
-            "ariadne_max_displacement_ang": resolved.quality_gates.ariadne_max_displacement_ang,
-            "ariadne_min_pair_distance_ang": resolved.quality_gates.ariadne_min_pair_distance_ang,
+            "ariadne_max_displacement_ang": (
+                resolved.quality_gates.ariadne_max_displacement_angstrom
+            ),
+            "ariadne_min_pair_distance_ang": (
+                resolved.quality_gates.ariadne_min_pair_distance_angstrom
+            ),
             "min_pair_distance_policy": {
                 "mode": "scale_model_minimum_safe_pair_ratio",
-                "hard_floor_angstrom": resolved.quality_gates.ariadne_min_pair_distance_ang,
+                "hard_floor_angstrom": (
+                    resolved.quality_gates.ariadne_min_pair_distance_angstrom
+                ),
                 "reference_min_pair_distance_angstrom": (
                     scale_model.get("pair_distance_reference", {})
                     .get("reference_min_pair_distance_angstrom")
@@ -505,7 +511,9 @@ def _resolved_manifest_payload(resolved: ResolvedSamplingProtocol) -> Dict[str, 
             },
             "max_displacement_policy": {
                 "mode": "scale_model_scaled_atom_move_with_absolute_cap",
-                "cap_angstrom": resolved.quality_gates.ariadne_max_displacement_ang,
+                "cap_angstrom": (
+                    resolved.quality_gates.ariadne_max_displacement_angstrom
+                ),
                 "scale_angstrom": (
                     scale_model.get("geometry_motion_scale", {})
                     .get("value_angstrom")

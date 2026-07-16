@@ -17,6 +17,7 @@ from ichor.hpc.active_learning.daemon.stop_control import (
     STOP_REQUEST_SCHEMA_VERSION,
     StopControlError,
     build_stop_request,
+    describe_stop_request,
     install_stop_request,
     read_stop_request,
     stop_request_history_dir,
@@ -48,6 +49,39 @@ def _daemon(tmp_path, *, max_iterations=3, executor=None):
     )
     daemon.data_dir().mkdir(parents=True, exist_ok=True)
     return daemon
+
+
+def test_stop_descriptions_cover_all_modes_and_malformed_payloads():
+    state = fresh_campaign_state(max_iterations=5)
+    state.phase = CampaignPhase.AIMALL
+    state.iteration = 3
+    state.replacement_round = 2
+
+    immediate = build_stop_request(state, mode="immediate")
+    after_phase = build_stop_request(state, mode="after_phase")
+    after_iteration = build_stop_request(
+        state,
+        mode="after_iteration",
+        target_iteration=4,
+    )
+
+    assert describe_stop_request(immediate) == (
+        "immediate stop requested during AIMALL in iteration 3"
+    )
+    assert describe_stop_request(after_phase) == (
+        "stop requested after phase AIMALL in iteration 3, replacement round 2"
+    )
+    assert describe_stop_request(after_phase, completed=True) == (
+        "stopped after phase AIMALL in iteration 3, replacement round 2"
+    )
+    assert describe_stop_request(after_iteration) == "stop requested after iteration 4"
+    assert describe_stop_request(after_iteration, completed=True) == (
+        "stopped after iteration 4"
+    )
+    assert describe_stop_request(None) == "stop target unavailable"
+    assert describe_stop_request({"mode": "after_phase"}) == (
+        "stop target unavailable"
+    )
 
 
 def test_stop_request_is_idempotent_and_immediate_supersedes_drain(tmp_path):
@@ -181,6 +215,18 @@ def test_after_phase_finishes_started_phase_and_binds_completion_receipt(tmp_pat
     assert control["status"] == "completed"
     assert control["completion_reason"] == "phase_completed"
     assert control["completion_receipt"] == stopped.last_completion_receipt
+    assert stopped.lifecycle_context["reason_code"] == "user_stop_boundary_reached"
+    events = [
+        json.loads(line)
+        for line in daemon.journal_path().read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    boundary = next(
+        event for event in events if event["event"] == "user_stop_boundary_reached"
+    )
+    assert boundary["target_phase"] == CampaignPhase.PHASE_A_DIVERSITY.value
+    assert boundary["target_iteration"] == 0
+    assert boundary["target_replacement_round"] == 0
 
 
 def test_historical_same_phase_receipt_does_not_satisfy_new_drain(tmp_path):
@@ -377,4 +423,4 @@ def test_cancelled_job_summary_clears_exact_state_and_intent(tmp_path):
     )
     assert stopped.pending_jobs[state.phase.value] is None
     assert intent["status"] == "FAILED"
-    assert intent["reason"] == "operator_cancelled_via_stop"
+    assert intent["reason"] == "user_cancelled_via_stop"

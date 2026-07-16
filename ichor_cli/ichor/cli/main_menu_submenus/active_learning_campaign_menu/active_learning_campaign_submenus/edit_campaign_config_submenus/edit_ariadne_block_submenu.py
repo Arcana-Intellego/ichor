@@ -79,22 +79,22 @@ ARIADNE_FIELD_SPECS = [
         prompt="Objective-change tolerance (acquisition units): ",
     ),
     spec(
-        "convergence.gradient_rms_tolerance_per_ang",
+        "convergence.gradient_rms_tolerance_per_angstrom",
         "float",
         prompt="Gradient RMS tolerance per Angstrom: ",
     ),
     spec(
-        "convergence.gradient_max_tolerance_per_ang",
+        "convergence.gradient_max_tolerance_per_angstrom",
         "float",
         prompt="Gradient maximum tolerance per Angstrom: ",
     ),
     spec(
-        "convergence.step_rms_tolerance_ang",
+        "convergence.step_rms_tolerance_angstrom",
         "float",
         prompt="Accepted-step RMS tolerance (Angstrom): ",
     ),
     spec(
-        "convergence.step_max_tolerance_ang",
+        "convergence.step_max_tolerance_angstrom",
         "float",
         prompt="Accepted-step maximum tolerance (Angstrom): ",
     ),
@@ -109,7 +109,7 @@ ARIADNE_FIELD_SPECS = [
         prompt="Adaptive score reference: ",
     ),
     spec(
-        "convergence.adaptive_length_reference_ang",
+        "convergence.adaptive_length_reference_angstrom",
         "float",
         prompt="Adaptive length reference (Angstrom): ",
     ),

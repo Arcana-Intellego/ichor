@@ -1745,7 +1745,7 @@ def test_reconcile_apply_cleans_transient_halted_ariadne_reentry(
             last_iteration_in_journal=1,
             last_phase_event_in_journal="halt",
             last_phase_retryable=True,
-            notes=["re-entry HALTED because committed artefacts need operator review"],
+            notes=["re-entry HALTED because committed artefacts need user review"],
             unsafe_reasons=[
                 ".DATA/SCRIPTS contains sbatch scripts",
                 "dangling model staging directories exist",
@@ -2345,7 +2345,7 @@ def test_reconcile_apply_blocks_pre_submit_without_job_id_when_accounting_comple
     err = capsys.readouterr().err
 
     assert rc == 9
-    assert "postprocess/operator review is required" in err
+    assert "postprocess/user review is required" in err
     intent = submission_intent.load_intent(campaign, phase, 0)
     assert intent["status"] == "PRE_SUBMIT"
 
