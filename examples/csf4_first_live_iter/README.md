@@ -404,7 +404,7 @@ When the daemon stops normally (state.phase == DONE), check:
 - `phase: DONE`
 - `iteration: 1` -- bootstrap is iteration 0; the first adversarial sampling
   loop is active iteration 1. A two-iteration run exits with `iteration: 2`.
-- `reference_data_version: 1` (INITIAL + 1 iteration of APPEND)
+- `reference_data_version: 1` (bootstrap + 1 active `REFERENCE_COMMIT`)
 - `models_version: 1` (INITIAL_FEREBUS + 1 iteration of FEREBUS)
 - `reference_scales` populated with five real-float keys (energy, force,
   omega, anh, anh_std)

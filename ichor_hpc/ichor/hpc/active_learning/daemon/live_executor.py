@@ -1360,7 +1360,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
       .log + .wfn, AIMAll .int, FEREBUS .model) into ICHOR data
       structures and runs the atomic append pipeline.
 
-    Inline phases (SEED_SELECT / SPLIT / APPEND / STOP_CHECK) are inherited
+    Inline phases (SEED_SELECT / SPLIT / REFERENCE_COMMIT / STOP_CHECK) are inherited
     from the dry-run executor since they do not change.
     """
 
@@ -1724,7 +1724,6 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 self.campaign_dir,
                 self.config,
                 tv,
-                is_initial=is_initial,
             )
             if int(n_tasks) <= 0:
                 raise BackendSubmissionError("nothing to submit for " + phase_name + ": staged 0 tasks")
@@ -2163,73 +2162,9 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             ) from exc
         return super()._inline_seed_select(state)
 
-    def _inline_append(self, state):
-        """Commit the exact accepted active allocation as one immutable delta."""
-        from . import input_staging as _stg
-
-        v = self._versioning("reference_data")
-        committed = v.list_committed_versions()
-        state_version = int(getattr(state, "reference_data_version", 0))
-        committed_max = max(committed) if committed else -1
-        if committed_max > state_version:
-            if int(committed_max) != int(state_version) + 1:
-                raise BackendSubmissionError(
-                    "reference_data_version_gap: state="
-                    + str(state_version)
-                    + " committed_versions="
-                    + repr(committed)
-                )
-            target_version = int(committed_max)
-        elif committed_max < state_version:
-            raise BackendSubmissionError(
-                "reference_data_version "
-                + str(state_version)
-                + " is ahead of committed reference-data versions "
-                + repr(committed)
-            )
-        else:
-            target_version = int(committed_max) + 1
-        try:
-            view, committed_names, created = _stg.commit_reference_data_delta(
-                self.campaign_dir,
-                reference_data_version=target_version,
-                context="active",
-                iteration=int(state.iteration),
-            )
-        except Exception as exc:
-            raise BackendSubmissionError(
-                "live APPEND requires a complete point allocation and valid "
-                "reference-data transaction: "
-                + type(exc).__name__
-                + ": "
-                + str(exc)
-            ) from exc
-        ensure_index(self.campaign_dir)
-        committed_iter_dir = v.iteration_path(target_version)
-        upsert_index_records(
-            self.campaign_dir,
-            records=[
-                self._seed_index_record_from_pointdir(
-                    committed_iter_dir / pdir_name,
-                    iteration=int(target_version),
-                    pointdir_name=pdir_name,
-                )
-                for pdir_name in committed_names
-            ],
-        )
-        self._journal_event(
-            "reference_data_committed",
-            iteration=int(state.iteration),
-            reference_data_version=int(target_version),
-            n_committed_points=len(committed_names) if created else 0,
-            cumulative_point_count=int(len(view.entries)),
-            head_manifest_sha256=str(view.head_manifest_sha256),
-            cumulative_view_sha256=str(view.cumulative_view_sha256),
-            expected_batch_total=int(self.config.point_allocation.batch_total_size),
-            source="live_quantum_staging",
-            idempotent_skip=not bool(created),
-        )
-        return {"reference_data_version": int(target_version)}
+    def _inline_reference_commit(self, state):
+        """Run the shared transactional reference publication contract."""
+        return super()._inline_reference_commit(state)
 
     def submit_or_run(self, state, phase) -> PhaseResult:
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
@@ -2760,7 +2695,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             allocation after AIMAll.
 
         Does NOT commit anything to QM_REFERENCE_DATA / TRAINED_MODELS itself --
-        that lives in the subsequent INITIAL_FEREBUS / APPEND / FEREBUS
+        that lives in the subsequent REFERENCE_COMMIT / INITIAL_FEREBUS / FEREBUS
         phases. Rejection counts are allocation-managed: failed slots proceed
         to bounded reserve replacement instead of tripping a batch-level
         percentage threshold here.
@@ -3437,10 +3372,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         """Parse FEREBUS output, validate the .model file, commit
         a new TRAINED_MODELS/iteration-NNNNNN/ via VersionedDirectory.
 
-        For INITIAL_FEREBUS this is iteration 0 of both QM_REFERENCE_DATA and
-        TRAINED_MODELS (the initial-quantum stage already produced the
-        pointdirs that go into QM_REFERENCE_DATA/iteration-000000). For FEREBUS this
-        is a per-iteration commit of TRAINED_MODELS only.
+        REFERENCE_COMMIT must already have published the matching immutable QM
+        reference-data version. This parser commits TRAINED_MODELS only.
 
         """
         from .phase_executor import PhaseResult
@@ -3452,6 +3385,13 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         is_initial = phase_name == "INITIAL_FEREBUS"
         if is_initial:
             expected_next = 0
+            if int(getattr(state, "reference_data_version", -1)) != 0:
+                return PhaseResult(
+                    is_complete=True,
+                    failure_reason=(
+                        "initial_ferebus_requires_reference_data_version_zero"
+                    ),
+                )
         else:
             expected_next = int(getattr(state, "reference_data_version", -1))
             if expected_next < 0:
@@ -3506,11 +3446,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             )
             state_updates = {"models_version": int(next_version), "validation_set_version": int(next_version)}
             if is_initial:
-                from . import input_staging as _stg
                 from ..versioning.sampling_iterations import finalise_bootstrap
 
-                _stg.commit_initial_reference_data(self.campaign_dir)
-                state_updates["reference_data_version"] = 0
                 try:
                     finalise_bootstrap(
                         self.campaign_dir,
@@ -3759,13 +3696,6 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
         state_updates = {"models_version": int(next_version), "validation_set_version": int(next_version)}
         if is_initial:
-            # iteration-000000 of the QM reference data is normally built at INITIAL_FEREBUS staging now
-            # (so the feature export has something to read). call the same helper here too -- it
-            # no-ops if staging already did it, and still covers the mock/dry path that never hits
-            # the live stager. only THEN advance the version; staging deliberately leaves that to
-            # us so a crash between staging and here reconciles cleanly.
-            _stg.commit_initial_reference_data(self.campaign_dir)
-            state_updates["reference_data_version"] = 0
             from ..versioning.sampling_iterations import finalise_bootstrap
 
             try:
@@ -5903,6 +5833,12 @@ def _aimall_invocation_block(
         + ' --campaign-dir "$ICHOR_CAMPAIGN_DIR"'
         + ' --pointdir "$POINT_DIR" --backend aimall',
         " ".join([_shell_quote(aimall_path)] + args + ["input.wfn"]),
+        "if ! "
+        + python
+        + " -m ichor.hpc.active_learning.daemon.ferebus_row_cache"
+        + ' produce --campaign-dir "$ICHOR_CAMPAIGN_DIR" --pointdir "$POINT_DIR"; then',
+        '  echo "warning: FEREBUS row shard failed; REFERENCE_COMMIT will repair it serially" >&2',
+        "fi",
     ]
 
 

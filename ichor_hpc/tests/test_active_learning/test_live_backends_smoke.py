@@ -1764,11 +1764,10 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
 
     calls = {}
 
-    def fake_stage(campaign_dir, config, reference_data_version, *, is_initial=False):
+    def fake_stage(campaign_dir, config, reference_data_version):
         calls["stage"] = {
             "campaign_dir": Path(campaign_dir),
             "reference_data_version": reference_data_version,
-            "is_initial": is_initial,
         }
         return staging, 3
 
@@ -1901,7 +1900,7 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
     assert result.submitted_job_id == "4242"
     assert result.expected_tasks == 3
     assert calls["stage"]["reference_data_version"] == 4
-    assert calls["stage"]["is_initial"] is False
+    assert "is_initial" not in calls["stage"]
     assert calls["submit"]["jd_file"] == staging / stg.FEREBUS_JOB_DETAILS
     assert calls["submit"]["working_directory"] == staging
     assert calls["submit"]["kwargs"]["overwrite_workdir"] is False

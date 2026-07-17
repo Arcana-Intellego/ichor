@@ -24,7 +24,6 @@ _TRAINING_REQUIRED = {
     CampaignPhase.ALLOCATION_CHECK,
     CampaignPhase.REPLACEMENT_GAUSSIAN,
     CampaignPhase.REPLACEMENT_AIMALL,
-    CampaignPhase.APPEND,
     CampaignPhase.FEREBUS,
     CampaignPhase.STOP_CHECK,
 }
@@ -39,7 +38,6 @@ _MODELS_REQUIRED = {
     CampaignPhase.ALLOCATION_CHECK,
     CampaignPhase.REPLACEMENT_GAUSSIAN,
     CampaignPhase.REPLACEMENT_AIMALL,
-    CampaignPhase.APPEND,
     CampaignPhase.STOP_CHECK,
 }
 
@@ -53,7 +51,6 @@ _COHERENT_TRAINING_MODEL_REQUIRED = {
     CampaignPhase.ALLOCATION_CHECK,
     CampaignPhase.REPLACEMENT_GAUSSIAN,
     CampaignPhase.REPLACEMENT_AIMALL,
-    CampaignPhase.APPEND,
     CampaignPhase.STOP_CHECK,
 }
 

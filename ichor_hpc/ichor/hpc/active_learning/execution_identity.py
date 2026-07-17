@@ -970,6 +970,19 @@ def rebind_environment(
     state.reference_scales_iteration = -1
     state.reference_scales_models_version = -1
     state.reference_scales_model_manifest_sha256 = None
+    from .daemon.ferebus_row_cache import (
+        clear_row_caches,
+        ensure_cumulative_row_caches,
+    )
+
+    clear_row_caches(campaign)
+    if int(state.reference_data_version) >= 0:
+        from .versioning.reference_data import ReferenceDataVersioning
+
+        reference_view = ReferenceDataVersioning(
+            campaign / "QM_REFERENCE_DATA"
+        ).resolve(int(state.reference_data_version), verification="metadata")
+        ensure_cumulative_row_caches(campaign, reference_view)
     write_state(operational_path(campaign, "state.json"), state)
 
     current = {

@@ -340,8 +340,8 @@ def _rebind_campaign(tmp_path, monkeypatch):
     state = fresh_campaign_state(campaign_uid="uid-rebind")
     state.phase = CampaignPhase.SEED_SELECT
     state.iteration = 1
-    state.reference_data_version = 0
-    state.models_version = 0
+    state.reference_data_version = -1
+    state.models_version = -1
     state.reference_scales = {
         "energy": 1.0,
         "force": 1.0,
@@ -453,6 +453,49 @@ def _changed_generation(*args, campaign_uid, config, generation=0, **kwargs):
     payload["environment_fingerprint_sha256"] = _environment_fingerprint(payload)
     payload["digest_sha256"] = _canonical_digest(payload)
     return payload
+
+
+def test_rebind_rebuilds_row_caches_before_publishing_generation(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon import ferebus_row_cache
+    from ichor.hpc.active_learning.versioning import reference_data
+
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.reference_data_version = 0
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
+    reference_view = SimpleNamespace(version=0)
+    monkeypatch.setattr(
+        reference_data.ReferenceDataVersioning,
+        "resolve",
+        lambda *_args, **_kwargs: reference_view,
+    )
+    calls = []
+    monkeypatch.setattr(
+        ferebus_row_cache,
+        "clear_row_caches",
+        lambda _campaign: calls.append("clear"),
+    )
+    monkeypatch.setattr(
+        ferebus_row_cache,
+        "ensure_cumulative_row_caches",
+        lambda _campaign, view: calls.append(("rebuild", view)),
+    )
+
+    result = rebind_environment(
+        campaign,
+        config=config,
+        scheduler_ownership_clear=True,
+    )
+
+    assert result["generation"] == 1
+    assert calls == ["clear", ("rebuild", reference_view)]
 
 
 def test_rebind_replays_generation_after_state_write_failure(tmp_path, monkeypatch):

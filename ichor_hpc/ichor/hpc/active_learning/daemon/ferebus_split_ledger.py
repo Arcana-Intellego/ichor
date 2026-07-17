@@ -434,7 +434,7 @@ def ensure_split_assignments(
             for historical_version in range(version + 1):
                 historical_view = versioning.resolve(
                     historical_version,
-                    verification="deep",
+                    verification="index",
                 )
                 names_for_version = [
                     name for name in names if versions[name] == historical_version

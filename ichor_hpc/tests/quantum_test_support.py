@@ -123,6 +123,75 @@ def attach_synthetic_quantum_acceptance(
             iqa_ha=float(atom_record["iqa_ha"]),
             multipole_names=multipole_names,
         )
+    # Schema-9 reference commits require the immutable feature contract that
+    # production freezes while staging INITIAL_AIMALL.  Older focused fixtures
+    # bypass that staging path, so create the same contract here before sealing
+    # the accepted pointdir.
+    from ichor.hpc.active_learning.config import CampaignConfig
+    from ichor.hpc.active_learning.daemon.ferebus_row_cache import (
+        ensure_feature_contract,
+        produce_task_row_shard,
+    )
+
+    config_path = Path(campaign) / "campaign.yaml"
+    config = (
+        CampaignConfig.from_yaml(config_path)
+        if config_path.is_file()
+        else CampaignConfig()
+    )
+    try:
+        from ichor.core.files import GJF
+
+        _ = GJF(root / "input.gjf").atoms
+    except Exception:
+        (root / "input.gjf").write_text(
+            "# B3LYP/aug-cc-pVTZ output=wfn\n\n"
+            "Synthetic quantum fixture\n\n"
+            "0 1\n"
+            "O 0.000000 0.000000 0.000000\n"
+            "H 0.950000 0.000000 0.000000\n"
+            "H -0.240000 0.920000 0.000000\n\n"
+            "input.wfn\n\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+    contract = ensure_feature_contract(campaign, config, root)
+    task_path = root / "AIMALL_TASK.json"
+    try:
+        task_payload = json.loads(task_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        task_payload = None
+    if not isinstance(task_payload, dict) or not isinstance(
+        task_payload.get("ferebus_row_shard"), dict
+    ):
+        shard_dir = (
+            root.parent
+            / ".ferebus-row-shards"
+            / root.name
+        )
+        task_payload = {
+            "schema_version": 2,
+            "ferebus_feature_contract": {
+                "path": (
+                    Path(campaign)
+                    / ".DATA"
+                    / "ACTIVE_LEARNING"
+                    / "FEREBUS_FEATURE_CONTRACT.json"
+                ).resolve().relative_to(Path(campaign).resolve()).as_posix(),
+                "contract_sha256": str(contract["contract_sha256"]),
+            },
+            "ferebus_row_shard": {
+                "directory": shard_dir.resolve()
+                .relative_to(Path(campaign).resolve())
+                .as_posix(),
+            },
+        }
+        task_path.write_text(
+            json.dumps(task_payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+    produce_task_row_shard(campaign, root)
     receipt_path = write_quantum_acceptance_receipt(
         campaign,
         root,

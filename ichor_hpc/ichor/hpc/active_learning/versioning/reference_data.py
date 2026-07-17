@@ -23,7 +23,7 @@ from .versioned_directory import VersionedDirectory
 
 
 REFERENCE_DATA_VERSION_FILENAME = "REFERENCE_DATA_VERSION.json"
-REFERENCE_DATA_VERSION_SCHEMA_VERSION = 2
+REFERENCE_DATA_VERSION_SCHEMA_VERSION = 3
 POINTDIR_NAME_WIDTH = 6
 VALID_SPLITS = frozenset({"train", "int_val", "ext_val"})
 
@@ -38,11 +38,13 @@ class ReferenceDataEntry:
     introduced_in_version: int
     pointdir_name: str
     pointdir_path: Path
+    source_pointdir: str
     candidate_id: str
     slot_id: int
     split: str
     replacement_round: int
-    pointdir_tree_sha256: str
+    accepted_content_sha256: str
+    acceptance_receipt_sha256: str
     provenance_sha256: str
 
     def identity_payload(self) -> Dict[str, Any]:
@@ -50,11 +52,13 @@ class ReferenceDataEntry:
             "global_ordinal": int(self.global_ordinal),
             "introduced_in_version": int(self.introduced_in_version),
             "pointdir_name": str(self.pointdir_name),
+            "source_pointdir": str(self.source_pointdir),
             "candidate_id": str(self.candidate_id),
             "slot_id": int(self.slot_id),
             "split": str(self.split),
             "replacement_round": int(self.replacement_round),
-            "pointdir_tree_sha256": str(self.pointdir_tree_sha256),
+            "accepted_content_sha256": str(self.accepted_content_sha256),
+            "acceptance_receipt_sha256": str(self.acceptance_receipt_sha256),
             "provenance_sha256": str(self.provenance_sha256),
         }
 
@@ -137,18 +141,45 @@ def hash_pointdir_tree(pointdir: Union[str, Path]) -> str:
 
 
 def seal_reference_data_version(iteration_dir: Union[str, Path]) -> None:
-    """Make a committed reference-data delta read-only for its owner."""
+    """Seal version metadata without revisiting already sealed pointdir trees."""
     root = Path(iteration_dir)
     if not root.is_dir() or root.is_symlink():
         raise ReferenceDataError("cannot seal missing reference-data version: " + str(root))
-    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
-        if path.is_symlink():
-            raise ReferenceDataError("cannot seal a symlinked reference-data entry: " + str(path))
+    metadata_paths: List[Path] = []
+    for current, directory_names, file_names in os.walk(root, topdown=True):
+        current_path = Path(current)
+        if current_path.is_symlink():
+            raise ReferenceDataError(
+                "cannot seal a symlinked reference-data entry: " + str(current_path)
+            )
+        retained_directories = []
+        for directory_name in directory_names:
+            directory = current_path / directory_name
+            if directory.is_symlink():
+                raise ReferenceDataError(
+                    "cannot seal a symlinked reference-data entry: " + str(directory)
+                )
+            if directory_name.endswith(".pointdir"):
+                if stat.S_IMODE(directory.stat().st_mode) & (
+                    stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
+                ):
+                    raise ReferenceDataError(
+                        "reference pointdir was not sealed at acceptance: " + str(directory)
+                    )
+                continue
+            retained_directories.append(directory_name)
+            metadata_paths.append(directory)
+        directory_names[:] = retained_directories
+        for file_name in file_names:
+            path = current_path / file_name
+            if path.is_symlink() or not path.is_file():
+                raise ReferenceDataError(
+                    "cannot seal a non-regular reference-data entry: " + str(path)
+                )
+            metadata_paths.append(path)
+    for path in sorted(metadata_paths, key=lambda item: len(item.parts), reverse=True):
         mode = stat.S_IMODE(path.stat().st_mode)
-        if path.is_dir():
-            os.chmod(path, mode & ~stat.S_IWUSR & ~stat.S_IWGRP & ~stat.S_IWOTH)
-        elif path.is_file():
-            os.chmod(path, mode & ~stat.S_IWUSR & ~stat.S_IWGRP & ~stat.S_IWOTH)
+        os.chmod(path, mode & ~stat.S_IWUSR & ~stat.S_IWGRP & ~stat.S_IWOTH)
     root_mode = stat.S_IMODE(root.stat().st_mode)
     os.chmod(root, root_mode & ~stat.S_IWUSR & ~stat.S_IWGRP & ~stat.S_IWOTH)
     from ..daemon.state import _fsync_parent_dir
@@ -201,6 +232,9 @@ def _entry_from_record(
     candidate_id = str(record.get("candidate_id") or "")
     if not candidate_id:
         raise ReferenceDataError("reference-data candidate_id is empty")
+    source_pointdir = str(record.get("source_pointdir") or "")
+    if not source_pointdir or Path(source_pointdir).name != source_pointdir:
+        raise ReferenceDataError("reference-data source pointdir is invalid")
     slot_id = _safe_int(record.get("slot_id"), "slot_id", minimum=0)
     split = str(record.get("split") or "")
     replacement_round = _safe_int(
@@ -222,12 +256,16 @@ def _entry_from_record(
         introduced_in_version=int(version),
         pointdir_name=name,
         pointdir_path=pointdir.resolve(),
+        source_pointdir=source_pointdir,
         candidate_id=candidate_id,
         slot_id=slot_id,
         split=split,
         replacement_round=replacement_round,
-        pointdir_tree_sha256=_safe_sha(
-            record.get("pointdir_tree_sha256"), "pointdir_tree_sha256"
+        accepted_content_sha256=_safe_sha(
+            record.get("accepted_content_sha256"), "accepted_content_sha256"
+        ),
+        acceptance_receipt_sha256=_safe_sha(
+            record.get("acceptance_receipt_sha256"), "acceptance_receipt_sha256"
         ),
         provenance_sha256=_safe_sha(
             record.get("provenance_sha256"), "provenance_sha256"
@@ -366,8 +404,10 @@ def resolve_reference_data_view(
     reference_data_root: Optional[Union[str, Path]] = None,
     expected_campaign_uid: Optional[str] = None,
 ) -> ReferenceDataView:
-    if verification not in {"metadata", "deep"}:
-        raise ValueError("reference-data verification must be metadata or deep")
+    if verification not in {"index", "metadata", "deep"}:
+        raise ValueError(
+            "reference-data verification must be index, metadata or deep"
+        )
     campaign = Path(campaign_dir)
     root = (
         Path(reference_data_root)
@@ -417,6 +457,27 @@ def resolve_reference_data_view(
         if not uid or (campaign_uid is not None and uid != campaign_uid):
             raise ReferenceDataError("reference-data campaign UID mismatch")
         campaign_uid = uid
+        commit_receipt_path = iteration_dir / "REFERENCE_COMMIT_RECEIPT.json"
+        commit_receipt = _read_json_object(
+            commit_receipt_path,
+            "reference-commit receipt",
+        )
+        if _safe_int(commit_receipt.get("schema_version"), "commit receipt schema") != 1:
+            raise ReferenceDataError("unsupported reference-commit receipt schema")
+        if (
+            _safe_int(
+                commit_receipt.get("reference_data_version"),
+                "commit receipt reference_data_version",
+            )
+            != version
+            or str(commit_receipt.get("campaign_uid") or "") != uid
+            or _safe_sha(
+                commit_receipt.get("reference_data_version_sha256"),
+                "commit receipt reference-data manifest SHA",
+            )
+            != sha256_file(manifest_path)
+        ):
+            raise ReferenceDataError("reference-commit receipt identity mismatch")
         parent = payload.get("parent_version")
         parent_sha = payload.get("parent_manifest_sha256")
         if version == 0:
@@ -520,29 +581,49 @@ def resolve_reference_data_view(
             raise ReferenceDataError(
                 "quantum-quality evidence does not match committed pointdirs"
             )
-        try:
-            from ..daemon.quantum_acceptance_receipts import (
-                read_quantum_acceptance_receipt,
-            )
-
-            for entry in added:
-                read_quantum_acceptance_receipt(
-                    campaign,
-                    entry.pointdir_path,
-                    expected_iteration=_safe_int(
-                        payload.get("source_iteration"),
-                        "source_iteration",
-                        minimum=0,
-                    ),
-                    expected_candidate_id=entry.candidate_id,
+        if verification != "index":
+            try:
+                from ..daemon.quantum_acceptance_receipts import (
+                    read_quantum_acceptance_receipt,
                 )
-        except Exception as exc:
-            raise ReferenceDataError(
-                "committed quantum acceptance evidence is invalid: "
-                + type(exc).__name__
-                + ": "
-                + str(exc)
-            ) from exc
+
+                for entry in added:
+                    receipt = read_quantum_acceptance_receipt(
+                        campaign,
+                        entry.pointdir_path,
+                        expected_iteration=_safe_int(
+                            payload.get("source_iteration"),
+                            "source_iteration",
+                            minimum=0,
+                        ),
+                        expected_candidate_id=entry.candidate_id,
+                        expected_source_pointdir=entry.source_pointdir,
+                        verification=verification,
+                        validate_quality=False,
+                    )
+                    receipt_path = (
+                        entry.pointdir_path / "QUANTUM_ACCEPTANCE_RECEIPT.json"
+                    )
+                    if sha256_file(receipt_path) != entry.acceptance_receipt_sha256:
+                        raise ReferenceDataError(
+                            "reference-data acceptance receipt SHA mismatch: "
+                            + str(receipt_path)
+                        )
+                    if (
+                        str(receipt.get("content_sha256") or "")
+                        != entry.accepted_content_sha256
+                    ):
+                        raise ReferenceDataError(
+                            "reference-data accepted-content digest mismatch: "
+                            + str(entry.pointdir_path)
+                        )
+            except Exception as exc:
+                raise ReferenceDataError(
+                    "committed quantum acceptance evidence is invalid: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)
+                ) from exc
         entries.extend(added)
         if [entry.global_ordinal for entry in entries] != list(range(len(entries))):
             raise ReferenceDataError("reference-data global ordinals are not contiguous")
@@ -556,15 +637,9 @@ def resolve_reference_data_view(
             minimum=1,
         ) != len(entries):
             raise ReferenceDataError("reference-data cumulative point count mismatch")
-        for entry in added:
-            _validate_provenance(entry)
-            if (
-                verification == "deep"
-                and hash_pointdir_tree(entry.pointdir_path) != entry.pointdir_tree_sha256
-            ):
-                raise ReferenceDataError(
-                    "reference-data pointdir tree SHA mismatch: " + str(entry.pointdir_path)
-                )
+        if verification != "index":
+            for entry in added:
+                _validate_provenance(entry)
         expected_view_sha = _view_sha(entries)
         if _safe_sha(payload.get("cumulative_view_sha256"), "cumulative_view_sha256") != expected_view_sha:
             raise ReferenceDataError("reference-data cumulative view SHA mismatch")

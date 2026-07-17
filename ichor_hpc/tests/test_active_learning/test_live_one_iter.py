@@ -563,9 +563,8 @@ def _patch_ferebus_submit_for_live_smoke(monkeypatch, campaign_dir, call_log):
 
     calls = {"n": 0}
 
-    def fake_stage(campaign_dir_arg, config, reference_data_version, *, is_initial=False):
-        if is_initial:
-            stg.commit_initial_reference_data(campaign_dir_arg)
+    def fake_stage(campaign_dir_arg, config, reference_data_version):
+        is_initial = calls["n"] == 0
         staging = _seed_pyferebus_manifest_staging(
             campaign_dir_arg,
             reference_data_version=0 if is_initial else int(reference_data_version),

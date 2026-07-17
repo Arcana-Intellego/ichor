@@ -2,13 +2,26 @@
 from pathlib import Path
 import re
 
-from ichor.hpc.active_learning.daemon.daemon import PHASE_ORDER
+from ichor.hpc.active_learning.daemon.daemon import next_phase
+from ichor.hpc.active_learning.daemon.state import CampaignPhase
 
 
 def test_active_learning_daemon_docs_match_executed_phase_order():
-    wanted = ["PHASE_B_DIVERSITY", "SPLIT", "GAUSSIAN", "AIMALL", "APPEND"]
-    source_slice = [phase.value for phase in PHASE_ORDER if phase.value in wanted]
-    assert source_slice == wanted
+    wanted_phases = [
+        CampaignPhase.PHASE_B_DIVERSITY,
+        CampaignPhase.SPLIT,
+        CampaignPhase.GAUSSIAN,
+        CampaignPhase.AIMALL,
+        CampaignPhase.ALLOCATION_CHECK,
+        CampaignPhase.REFERENCE_COMMIT,
+        CampaignPhase.FEREBUS,
+    ]
+    observed = [wanted_phases[0]]
+    while observed[-1] is not CampaignPhase.FEREBUS:
+        following, _iteration = next_phase(observed[-1], 1, 2)
+        observed.append(following)
+    assert observed == wanted_phases
+    wanted = [phase.value for phase in wanted_phases]
 
     repo_root = Path(__file__).resolve().parents[3]
     docs = repo_root / "docs" / "source" / "active_learning_daemon.rst"
@@ -22,5 +35,10 @@ def test_active_learning_daemon_docs_match_executed_phase_order():
         architecture,
         flags=re.MULTILINE,
     )
-    positions = [documented_phases.index(phase) for phase in wanted]
+    positions = []
+    cursor = 0
+    for phase in wanted:
+        position = documented_phases.index(phase, cursor)
+        positions.append(position)
+        cursor = position + 1
     assert positions == sorted(positions)

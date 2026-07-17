@@ -34,7 +34,7 @@ from .state import CampaignPhase, CampaignState, atomic_write_json
 
 CONFIG_LOCK_SCHEMA_VERSION = 3
 CONFIG_LOCK_FILENAME = "config_lock.json"
-CONFIG_LOCK_POLICY_VERSION = 5
+CONFIG_LOCK_POLICY_VERSION = 6
 CONFIG_LOCK_HISTORY_SCHEMA_VERSION = 2
 CONFIG_LOCK_HISTORY_DIRNAME = "config_lock_history"
 
@@ -1039,7 +1039,7 @@ def _phase_outputs_lock_change(
         return False
     if _active_iteration_committed(proposed_state, iteration):
         return False
-    # Any current-iteration output that has not yet been appended and retrained
+    # Any current-iteration output that has not yet been committed and retrained
     # is part of the live handoff contract, even if the daemon state has already
     # advanced past the phase that produced it.
     return True
@@ -1913,6 +1913,43 @@ def reference_data_staging_can_archive_for_reconcile(
     dangling = tv.list_dangling_staging()
     if not dangling:
         return True, "no dangling reference-data staging exists"
+    from .reference_commit import inventory_reference_commits
+
+    transaction_staging = {}
+    for record in inventory_reference_commits(campaign):
+        if str(record.get("state")) == "invalid":
+            return (
+                False,
+                "invalid reference-commit transaction evidence must be resolved "
+                "before staging can be archived",
+            )
+        if str(record.get("state")) == "complete":
+            continue
+        ledger = record.get("ledger")
+        if not isinstance(ledger, dict):
+            continue
+        version = ledger.get("reference_data_version")
+        if type(version) is not int or version < 0:
+            continue
+        transaction_staging[
+            tv.staging_path(version).resolve(strict=False)
+        ] = str(record.get("state"))
+    training_resolved = training.resolve()
+    for path in dangling:
+        if path.is_symlink():
+            return False, "refusing to archive symlinked reference-data staging: " + str(path)
+        if not path.is_dir():
+            return False, "reference-data staging is not a directory: " + str(path)
+        _ensure_inside_campaign(campaign, path)
+        resolved = path.resolve()
+        if training_resolved not in resolved.parents:
+            return False, "reference-data staging is outside QM_REFERENCE_DATA: " + str(path)
+        if resolved in transaction_staging:
+            return (
+                False,
+                "reference-data staging belongs to a resumable reference-commit "
+                "transaction in state " + transaction_staging[resolved],
+            )
     try:
         reference_data_version = int(proposed_state.reference_data_version)
     except (TypeError, ValueError):
@@ -1932,16 +1969,6 @@ def reference_data_staging_can_archive_for_reconcile(
             verify_committed_model_version(campaign, model_version)
         except Exception as exc:
             return False, "committed model version is invalid: " + str(exc)[:180]
-    training_resolved = training.resolve()
-    for path in dangling:
-        if path.is_symlink():
-            return False, "refusing to archive symlinked reference-data staging: " + str(path)
-        if not path.is_dir():
-            return False, "reference-data staging is not a directory: " + str(path)
-        _ensure_inside_campaign(campaign, path)
-        resolved = path.resolve()
-        if training_resolved not in resolved.parents:
-            return False, "reference-data staging is outside QM_REFERENCE_DATA: " + str(path)
     return True, "dangling reference-data staging can be archived"
 
 

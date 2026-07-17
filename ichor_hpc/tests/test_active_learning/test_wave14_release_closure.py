@@ -40,7 +40,7 @@ _EXPECTED_DEFAULT_TRANSITIONS = {
     CampaignPhase.PHASE_A_DIVERSITY: CampaignPhase.INITIAL_GAUSSIAN,
     CampaignPhase.INITIAL_GAUSSIAN: CampaignPhase.INITIAL_AIMALL,
     CampaignPhase.INITIAL_AIMALL: CampaignPhase.INITIAL_ALLOCATION_CHECK,
-    CampaignPhase.INITIAL_ALLOCATION_CHECK: CampaignPhase.INITIAL_FEREBUS,
+    CampaignPhase.INITIAL_ALLOCATION_CHECK: CampaignPhase.REFERENCE_COMMIT,
     CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN: CampaignPhase.INITIAL_REPLACEMENT_AIMALL,
     CampaignPhase.INITIAL_REPLACEMENT_AIMALL: CampaignPhase.INITIAL_ALLOCATION_CHECK,
     CampaignPhase.INITIAL_FEREBUS: CampaignPhase.SEED_SELECT,
@@ -50,17 +50,17 @@ _EXPECTED_DEFAULT_TRANSITIONS = {
     CampaignPhase.SPLIT: CampaignPhase.GAUSSIAN,
     CampaignPhase.GAUSSIAN: CampaignPhase.AIMALL,
     CampaignPhase.AIMALL: CampaignPhase.ALLOCATION_CHECK,
-    CampaignPhase.ALLOCATION_CHECK: CampaignPhase.APPEND,
+    CampaignPhase.ALLOCATION_CHECK: CampaignPhase.REFERENCE_COMMIT,
     CampaignPhase.REPLACEMENT_GAUSSIAN: CampaignPhase.REPLACEMENT_AIMALL,
     CampaignPhase.REPLACEMENT_AIMALL: CampaignPhase.ALLOCATION_CHECK,
-    CampaignPhase.APPEND: CampaignPhase.FEREBUS,
     CampaignPhase.FEREBUS: CampaignPhase.STOP_CHECK,
 }
 
 
 def test_independent_fsm_enumeration_matches_every_nonterminal_phase():
     assert set(PHASE_ORDER) == set(_EXPECTED_DEFAULT_TRANSITIONS) | {
-        CampaignPhase.STOP_CHECK
+        CampaignPhase.REFERENCE_COMMIT,
+        CampaignPhase.STOP_CHECK,
     }
     for phase, expected in _EXPECTED_DEFAULT_TRANSITIONS.items():
         iteration = 0 if phase.value.startswith("INITIAL_") or phase in {
@@ -69,6 +69,15 @@ def test_independent_fsm_enumeration_matches_every_nonterminal_phase():
         } else 3
         observed, _next_iteration = next_phase(phase, iteration, 25)
         assert observed is expected
+
+    assert next_phase(CampaignPhase.REFERENCE_COMMIT, 0, 25) == (
+        CampaignPhase.INITIAL_FEREBUS,
+        0,
+    )
+    assert next_phase(CampaignPhase.REFERENCE_COMMIT, 3, 25) == (
+        CampaignPhase.FEREBUS,
+        3,
+    )
 
     assert next_phase(CampaignPhase.STOP_CHECK, 3, 25) == (
         CampaignPhase.SEED_SELECT,

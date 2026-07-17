@@ -1,5 +1,6 @@
 """Quantum job preparation cannot reuse stale task products."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -50,11 +51,26 @@ def test_aimall_preparation_preserves_bound_inputs(tmp_path):
         "input.wfn",
         "GAUSSIAN_TASK_RECEIPT.json",
         "WFN_METHOD_RECEIPT.json",
-        "AIMALL_TASK.json",
         "AIMALL_COMPLETION_RECEIPT.json",
         "QUANTUM_ACCEPTANCE_RECEIPT.json",
     ):
         (pointdir / name).write_text("evidence\n", encoding="utf-8")
+    (pointdir / "AIMALL_TASK.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "ferebus_row_shard": {
+                    "directory": (
+                        ".DATA/CACHE/FEREBUS_ROW_SHARDS/fixture/POINT_0000"
+                    )
+                },
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
     atomic = pointdir / "input_atomicfiles"
     atomic.mkdir()
     (atomic / "h1.int").write_text("stale\n", encoding="utf-8")

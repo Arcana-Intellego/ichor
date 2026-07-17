@@ -106,6 +106,7 @@ PHASE_ORDER: Tuple[CampaignPhase, ...] = (
     CampaignPhase.INITIAL_ALLOCATION_CHECK,
     CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN,
     CampaignPhase.INITIAL_REPLACEMENT_AIMALL,
+    CampaignPhase.REFERENCE_COMMIT,
     CampaignPhase.INITIAL_FEREBUS,
     CampaignPhase.SEED_SELECT,
     CampaignPhase.ARIADNE_ARRAY,
@@ -116,7 +117,6 @@ PHASE_ORDER: Tuple[CampaignPhase, ...] = (
     CampaignPhase.ALLOCATION_CHECK,
     CampaignPhase.REPLACEMENT_GAUSSIAN,
     CampaignPhase.REPLACEMENT_AIMALL,
-    CampaignPhase.APPEND,
     CampaignPhase.FEREBUS,
     CampaignPhase.STOP_CHECK,
 )
@@ -168,14 +168,14 @@ _STRICT_FAILURE_REQUIRES_POSTPROCESS = frozenset(SBATCH_PHASES)
 
 _ALLOWED_PHASE_OVERRIDES = {
     CampaignPhase.INITIAL_ALLOCATION_CHECK: frozenset({
-        CampaignPhase.INITIAL_FEREBUS,
+        CampaignPhase.REFERENCE_COMMIT,
         CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN,
     }),
     CampaignPhase.INITIAL_REPLACEMENT_AIMALL: frozenset({
         CampaignPhase.INITIAL_ALLOCATION_CHECK,
     }),
     CampaignPhase.ALLOCATION_CHECK: frozenset({
-        CampaignPhase.APPEND,
+        CampaignPhase.REFERENCE_COMMIT,
         CampaignPhase.REPLACEMENT_GAUSSIAN,
     }),
     CampaignPhase.REPLACEMENT_AIMALL: frozenset({
@@ -203,9 +203,13 @@ def next_phase(current: CampaignPhase, iteration: int, max_iterations: int) -> T
             return CampaignPhase.DONE, iteration
         return CampaignPhase.SEED_SELECT, next_iter
     if current is CampaignPhase.INITIAL_ALLOCATION_CHECK:
-        return CampaignPhase.INITIAL_FEREBUS, iteration
+        return CampaignPhase.REFERENCE_COMMIT, iteration
     if current is CampaignPhase.ALLOCATION_CHECK:
-        return CampaignPhase.APPEND, iteration
+        return CampaignPhase.REFERENCE_COMMIT, iteration
+    if current is CampaignPhase.REFERENCE_COMMIT:
+        if int(iteration) == 0:
+            return CampaignPhase.INITIAL_FEREBUS, iteration
+        return CampaignPhase.FEREBUS, iteration
     if current is CampaignPhase.INITIAL_REPLACEMENT_AIMALL:
         return CampaignPhase.INITIAL_ALLOCATION_CHECK, iteration
     if current is CampaignPhase.REPLACEMENT_AIMALL:
@@ -3777,7 +3781,7 @@ class Daemon:
             )
             if "AIMALL" in phase.value:
                 paths.append(staging / "quantum_quality.json")
-        elif phase is CampaignPhase.APPEND:
+        elif phase is CampaignPhase.REFERENCE_COMMIT:
             from ..versioning.reference_data import reference_data_version_path
             from ..versioning.reference_data import ReferenceDataVersioning
             from ..layout import qm_reference_data_dir

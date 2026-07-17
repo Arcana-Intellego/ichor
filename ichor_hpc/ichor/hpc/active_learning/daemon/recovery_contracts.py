@@ -71,7 +71,7 @@ def active_iteration_reference_data_committed(
     state: CampaignState,
     iteration: int,
 ) -> bool:
-    """Return true once APPEND has committed this iteration's QM delta."""
+    """Return true once REFERENCE_COMMIT has published this iteration's QM delta."""
     try:
         reference_data_version = int(
             getattr(state, "reference_data_version", -1)
@@ -485,11 +485,19 @@ def _allocation_recovery_decision(
         iteration=int(iteration),
     ).relative_to(campaign).as_posix()
     if bool(summary.get("complete", False)):
-        return RecoveryDecision(
-            CampaignPhase.INITIAL_FEREBUS if context == "bootstrap" else CampaignPhase.APPEND,
+        if _ok(
+            verify_committed_reference_data_version,
+            campaign,
             int(iteration),
-            ("INITIAL_FEREBUS" if context == "bootstrap" else "APPEND")
-            + ": exact point allocation is complete",
+        ):
+            # The allocation remains as authoritative evidence after its
+            # pointdirs have moved. Do not rewind an already published
+            # reference version back into REFERENCE_COMMIT.
+            return None
+        return RecoveryDecision(
+            CampaignPhase.REFERENCE_COMMIT,
+            int(iteration),
+            "REFERENCE_COMMIT: exact point allocation is complete",
             allocation_artifact,
         )
     pending = pending_attempts(allocation)
@@ -586,7 +594,7 @@ def protected_staging_handoff(
         CampaignPhase.ALLOCATION_CHECK,
         CampaignPhase.REPLACEMENT_GAUSSIAN,
         CampaignPhase.REPLACEMENT_AIMALL,
-        CampaignPhase.APPEND,
+        CampaignPhase.REFERENCE_COMMIT,
     }:
         return RecoveryDecision(
             allocation_decision.phase,
@@ -767,7 +775,7 @@ def active_iteration_handoff_decisions(
         if active_iteration_committed(state, iteration):
             continue
         if active_iteration_reference_data_committed(state, iteration):
-            # All per-iteration handoffs through APPEND are now historical.
+            # All per-iteration handoffs through REFERENCE_COMMIT are now historical.
             # Recovery must evaluate the reference-data/model skew and select
             # FEREBUS rather than replaying a completed allocation.
             continue
@@ -843,9 +851,18 @@ def _phase_contract_checks(
         ],
         CampaignPhase.INITIAL_FEREBUS: [
             (
-                "complete bootstrap point allocation",
+                "committed bootstrap reference-data version 0",
+                lambda: _require_reference_data_version(campaign, 0),
+            ),
+        ],
+        CampaignPhase.REFERENCE_COMMIT: [
+            (
+                "complete point allocation",
                 lambda: _require_point_allocation(
-                    campaign, context="bootstrap", iteration=0, complete=True,
+                    campaign,
+                    context="bootstrap" if iteration == 0 else "active",
+                    iteration=iteration,
+                    complete=True,
                 ),
             ),
         ],
@@ -933,17 +950,6 @@ def _phase_contract_checks(
                     context="active",
                     iteration=iteration,
                     replacement_round=int(getattr(state, "replacement_round", 0)),
-                ),
-            ),
-        ],
-        CampaignPhase.APPEND: [
-            (
-                "complete active point allocation",
-                lambda: _require_point_allocation(
-                    campaign,
-                    context="active",
-                    iteration=iteration,
-                    complete=True,
                 ),
             ),
         ],

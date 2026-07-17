@@ -84,14 +84,19 @@ def test_refusal_emits_journal_event(tmp_path, monkeypatch):
 
 
 def test_inline_phases_still_delegate_to_dry_run(tmp_path):
-    """Inline phases (SEED_SELECT, SPLIT, APPEND, STOP_CHECK) must NOT
+    """Inline phases (SEED_SELECT, SPLIT, REFERENCE_COMMIT, STOP_CHECK) must NOT
     be refused -- they have no backend artefacts to mangle."""
     ex = _make_executor(tmp_path)
     state = SimpleNamespace(iteration=0, campaign_uid="uid")
     # Inline-phase names that we expect to pass through to super().postprocess
     # without raising. The dry-run executor returns a PhaseResult or {} from
     # these. We just need them to NOT raise NotImplementedError.
-    for phase_name in ("SEED_SELECT", "SPLIT", "APPEND", "STOP_CHECK"):
+    for phase_name in (
+        "SEED_SELECT",
+        "SPLIT",
+        "REFERENCE_COMMIT",
+        "STOP_CHECK",
+    ):
         phase = CampaignPhase(phase_name)
         # super().postprocess returns a PhaseResult; we just want no refusal
         ex.postprocess(state, phase, observations=[])

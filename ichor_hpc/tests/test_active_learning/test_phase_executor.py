@@ -55,15 +55,15 @@ def test_phase_result_restricts_convergence_to_stop_check():
     )
 
     with pytest.raises(ValueError, match="only for STOP_CHECK"):
-        result.validate(stage="submit", phase_name="APPEND")
+        result.validate(stage="submit", phase_name="REFERENCE_COMMIT")
 
 
 def test_mock_inline_phase_completes_immediately():
     e = MockPhaseExecutor()
-    r = e.submit_or_run(_state(), CampaignPhase.APPEND)
+    r = e.submit_or_run(_state(), CampaignPhase.REFERENCE_COMMIT)
     assert r.is_complete is True
     assert r.submitted_job_id is None
-    assert e.operations() == ["submit_or_run:APPEND"]
+    assert e.operations() == ["submit_or_run:REFERENCE_COMMIT"]
 
 
 def test_mock_sbatch_phase_returns_pending_jobid():

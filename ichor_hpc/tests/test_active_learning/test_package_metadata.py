@@ -128,7 +128,16 @@ def test_csf4_critical_runtime_dependencies_are_declared():
     cli_deps = _declared_runtime_dependencies(PACKAGE_DIRS["ichor_cli"])
 
     assert {"ase", "xtb", "plumed", "rdkit", "tqdm"} <= core_deps
-    assert {"numpy", "ase", "xtb", "plumed", "portalocker", "tqdm", "ruamel-yaml"} <= hpc_deps
+    assert {
+        "numpy",
+        "pandas",
+        "ase",
+        "xtb",
+        "plumed",
+        "portalocker",
+        "tqdm",
+        "ruamel-yaml",
+    } <= hpc_deps
     assert {"console-menu", "termcolor", "ase"} <= cli_deps
 
 

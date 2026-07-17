@@ -203,6 +203,280 @@ def test_reference_data_versions_store_only_their_delta(tmp_path):
     assert second.head_manifest_sha256 != first.head_manifest_sha256
 
 
+def test_reference_index_resolution_does_not_walk_pointdir_payloads(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon import quantum_acceptance_receipts
+    from ichor.hpc.active_learning.versioning import reference_data
+
+    campaign = tmp_path / "campaign"
+    _complete_allocation(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        first_frame_id=0,
+    )
+    commit_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )
+    monkeypatch.setattr(
+        quantum_acceptance_receipts,
+        "read_quantum_acceptance_receipt",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("index resolution walked acceptance payloads")
+        ),
+    )
+    monkeypatch.setattr(
+        reference_data,
+        "_validate_provenance",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("index resolution read pointdir provenance")
+        ),
+    )
+
+    view = ReferenceDataVersioning(
+        campaign / "QM_REFERENCE_DATA"
+    ).resolve(0, verification="index")
+
+    assert len(view.entries) == 2
+
+
+def test_reference_commit_moves_without_copying_or_payload_rehash(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon import reference_commit as commit_mod
+
+    campaign = tmp_path / "campaign"
+    _complete_allocation(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        first_frame_id=0,
+    )
+    sources = sorted(
+        (campaign / ".DATA" / "STAGING" / "initial").glob("*.pointdir")
+    )
+    hashed_paths = []
+    resolve_modes = []
+    quality_reads = 0
+    progress_events = []
+    real_sha256_file = commit_mod.sha256_file
+    real_resolve = ReferenceDataVersioning.resolve
+    real_read_quality = commit_mod.read_quantum_quality_manifest
+
+    def track_sha256(path):
+        hashed_paths.append(Path(path))
+        return real_sha256_file(path)
+
+    def track_resolve(self, version, *args, **kwargs):
+        resolve_modes.append(str(kwargs.get("verification", "metadata")))
+        return real_resolve(self, version, *args, **kwargs)
+
+    def track_quality(*args, **kwargs):
+        nonlocal quality_reads
+        quality_reads += 1
+        return real_read_quality(*args, **kwargs)
+
+    monkeypatch.setattr(commit_mod, "sha256_file", track_sha256)
+    monkeypatch.setattr(commit_mod, "read_quantum_quality_manifest", track_quality)
+    monkeypatch.setattr(ReferenceDataVersioning, "resolve", track_resolve)
+    monkeypatch.setattr(
+        shutil,
+        "copytree",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("reference commit must not call copytree")
+        ),
+    )
+
+    view, names, created = commit_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+        progress_callback=lambda event, payload: progress_events.append(
+            (str(event), dict(payload))
+        ),
+    )
+
+    assert created is True
+    assert len(view.entries) == len(sources) == len(names)
+    assert all(not source.exists() for source in sources)
+    assert all(
+        (campaign / "QM_REFERENCE_DATA" / "iteration-000000" / name).is_dir()
+        for name in names
+    )
+    assert not {
+        path.suffix.lower()
+        for path in hashed_paths
+    } & {".wfn", ".int", ".gau", ".gjf"}
+    assert "deep" not in resolve_modes
+    assert quality_reads == 1
+    shard_progress = [
+        payload
+        for event, payload in progress_events
+        if event == "reference_commit_shard_progress"
+    ]
+    assert shard_progress[-1]["processed_points"] == len(sources)
+    assert shard_progress[-1]["total_points"] == len(sources)
+
+
+def test_aimall_row_sidecar_uses_one_matrix_file_per_point(tmp_path):
+    from ichor.hpc.active_learning.daemon.ferebus_row_cache import (
+        FEREBUS_ROW_SHARD,
+        FEREBUS_ROW_SHARD_ARRAY,
+    )
+
+    campaign = tmp_path / "campaign"
+    _complete_allocation(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        first_frame_id=0,
+    )
+
+    for pointdir in sorted(
+        (campaign / ".DATA" / "STAGING" / "initial").glob("*.pointdir")
+    ):
+        task = json.loads((pointdir / "AIMALL_TASK.json").read_text(encoding="utf-8"))
+        shard = campaign / str(task["ferebus_row_shard"]["directory"])
+        assert sorted(path.name for path in shard.iterdir()) == sorted(
+            [FEREBUS_ROW_SHARD, FEREBUS_ROW_SHARD_ARRAY]
+        )
+
+
+@pytest.mark.parametrize(
+    ("missing_shards", "expected_reused"),
+    ((1, 1), (2, 0)),
+)
+def test_reference_commit_repairs_missing_row_shards_serially(
+    tmp_path,
+    missing_shards,
+    expected_reused,
+):
+    from ichor.hpc.active_learning.daemon import reference_commit as commit_mod
+    from ichor.hpc.active_learning.daemon.ferebus_row_cache import (
+        read_feature_contract,
+        read_version_row_cache,
+    )
+
+    campaign = tmp_path / "campaign"
+    _complete_allocation(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        first_frame_id=0,
+    )
+    staging = campaign / ".DATA" / "STAGING" / "initial"
+    for pointdir in sorted(staging.glob("*.pointdir"))[:missing_shards]:
+        task = json.loads(
+            (pointdir / "AIMALL_TASK.json").read_text(encoding="utf-8")
+        )
+        shard = campaign / str(task["ferebus_row_shard"]["directory"])
+        shutil.rmtree(shard)
+
+    commit_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )
+
+    transaction = commit_mod.classify_reference_commit(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+    )
+    assert transaction["ledger"]["shards_repaired"] == missing_shards
+    assert transaction["ledger"]["shards_reused"] == expected_reused
+    contract = read_feature_contract(campaign)
+    cache, arrays = read_version_row_cache(
+        campaign,
+        str(contract["contract_sha256"]),
+        0,
+    )
+    assert cache["n_rows"] == 2
+    assert {array.shape[0] for array in arrays.values()} == {2}
+
+
+def test_reference_commit_resumes_after_interrupted_point_move(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon import reference_commit as commit_mod
+
+    campaign = tmp_path / "campaign"
+    _complete_allocation(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        first_frame_id=0,
+    )
+    real_replace = commit_mod.os.replace
+    point_moves = 0
+
+    def interrupt_second_point(source, destination):
+        nonlocal point_moves
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if (
+            source_path.name.endswith(".pointdir")
+            and destination_path.name.endswith(".pointdir")
+        ):
+            point_moves += 1
+            if point_moves == 2:
+                raise OSError("injected point-move interruption")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(commit_mod.os, "replace", interrupt_second_point)
+    with pytest.raises(OSError, match="injected point-move interruption"):
+        commit_reference_data_delta(
+            campaign,
+            reference_data_version=0,
+            context="bootstrap",
+            iteration=0,
+        )
+
+    transaction = commit_mod.classify_reference_commit(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+    )
+    assert transaction["state"] == "partially_moved"
+    assert transaction["ledger"]["moved_points"] == 1
+    from ichor.hpc.active_learning.daemon.config_lock import (
+        reference_data_staging_can_archive_for_reconcile,
+    )
+    from ichor.hpc.active_learning.daemon.state import fresh_campaign_state
+
+    can_archive, reason = reference_data_staging_can_archive_for_reconcile(
+        campaign,
+        fresh_campaign_state(),
+    )
+    assert can_archive is False
+    assert "resumable reference-commit transaction" in reason
+
+    monkeypatch.setattr(commit_mod.os, "replace", real_replace)
+    view, names, created = commit_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )
+
+    assert created is True
+    assert len(view.entries) == len(names) == 2
+    assert commit_mod.classify_reference_commit(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+    )["state"] == "complete"
+
+
 def test_committed_quantum_quality_paths_are_version_relative(tmp_path):
     campaign = tmp_path / "campaign"
     _complete_allocation(
@@ -230,8 +504,14 @@ def test_committed_quantum_quality_paths_are_version_relative(tmp_path):
         (version_dir / evidence[0]["path"]).read_text(encoding="utf-8")
     )
     accepted = [record for record in committed["records"] if record["accepted"]]
-    assert all(record.get("committed_pointdir") for record in accepted)
-    assert all(record.get("candidate_id") for record in accepted)
+    assert {record["pointdir"] for record in accepted} == {
+        binding["source_pointdir"]
+        for binding in evidence[0]["pointdir_bindings"]
+    }
+    assert all(
+        binding.get("committed_pointdir") and binding.get("candidate_id")
+        for binding in evidence[0]["pointdir_bindings"]
+    )
 
 
 def test_committed_acceptance_receipts_survive_staging_removal(tmp_path):
@@ -254,14 +534,19 @@ def test_committed_acceptance_receipts_survive_staging_removal(tmp_path):
         iteration=0,
     )
     version_dir = campaign / "QM_REFERENCE_DATA" / "iteration-000000"
+    version_manifest = json.loads(
+        (version_dir / REFERENCE_DATA_VERSION_FILENAME).read_text(encoding="utf-8")
+    )
+    bindings = {
+        record["pointdir_name"]: record
+        for record in version_manifest["added_pointdirs"]
+    }
     for pointdir in sorted(version_dir.glob("POINT_*.pointdir")):
         receipt = json.loads(
             (pointdir / QUANTUM_ACCEPTANCE_RECEIPT).read_text(encoding="utf-8")
         )
-        assert receipt["committed_pointdir"] == pointdir.name
-        assert receipt["quality_manifest"]["path"].startswith(
-            "QM_REFERENCE_DATA/iteration-000000/quality_evidence/"
-        )
+        assert receipt["source_pointdir"] == bindings[pointdir.name]["source_pointdir"]
+        assert "committed_pointdir" not in receipt
 
     shutil.rmtree(campaign / ".DATA" / "STAGING")
     view = ReferenceDataVersioning(campaign / "QM_REFERENCE_DATA").resolve(
@@ -274,6 +559,8 @@ def test_committed_acceptance_receipts_survive_staging_removal(tmp_path):
             campaign,
             entry.pointdir_path,
             expected_candidate_id=entry.candidate_id,
+            expected_source_pointdir=entry.source_pointdir,
+            validate_quality=False,
         )
 
 
@@ -301,6 +588,10 @@ def test_allocation_join_rejects_stale_provenance_bindings(
         campaign / ".DATA" / "STAGING" / "initial" / "POINT_0000.pointdir"
     )
     provenance_path = pointdir / "provenance.json"
+    os.chmod(
+        provenance_path,
+        stat.S_IMODE(provenance_path.stat().st_mode) | stat.S_IWUSR,
+    )
     provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
     path, value = mutation
     if path == "iteration":
@@ -335,9 +626,45 @@ def test_reference_data_hash_chain_detects_parent_manifest_tamper(tmp_path):
     payload["tampered"] = True
     manifest.write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(ReferenceDataError, match="parent manifest SHA mismatch"):
+    with pytest.raises(ReferenceDataError, match="receipt identity mismatch"):
         ReferenceDataVersioning(campaign / "QM_REFERENCE_DATA").resolve(
             1,
+            verification="metadata",
+        )
+
+
+def test_reference_data_reader_rejects_schema_two_manifest(tmp_path):
+    campaign = tmp_path / "campaign"
+    _complete_allocation(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        first_frame_id=0,
+    )
+    commit_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )
+    manifest = (
+        campaign
+        / "QM_REFERENCE_DATA"
+        / "iteration-000000"
+        / REFERENCE_DATA_VERSION_FILENAME
+    )
+    os.chmod(manifest, stat.S_IMODE(manifest.stat().st_mode) | stat.S_IWUSR)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["schema_version"] = 2
+    manifest.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    with pytest.raises(ReferenceDataError, match="unsupported reference-data"):
+        ReferenceDataVersioning(campaign / "QM_REFERENCE_DATA").resolve(
+            0,
             verification="metadata",
         )
 

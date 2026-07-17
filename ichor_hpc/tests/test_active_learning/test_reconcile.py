@@ -723,7 +723,9 @@ def test_active_replacement_recovery_advances_only_with_durable_handoffs(tmp_pat
         expected_generation=int(replacement["generation"]),
     )
     decisions = active_iteration_handoff_decisions(campaign, state)
-    assert [decision.phase for decision in decisions] == [CampaignPhase.APPEND]
+    assert [decision.phase for decision in decisions] == [
+        CampaignPhase.REFERENCE_COMMIT
+    ]
 
 
 def test_recovery_contract_status_marks_halted_state_not_runnable(tmp_path):
@@ -919,7 +921,7 @@ def test_propose_recovery_blocks_real_pending_job_without_intent(tmp_path):
     assert "pending_jobs" in report.blocking_artifacts
 
 
-def test_propose_recovery_initial_aimall_handoff_reenters_initial_ferebus(tmp_path):
+def test_propose_recovery_initial_aimall_handoff_reenters_reference_commit(tmp_path):
     campaign, data, _, _ = _campaign_dirs(tmp_path)
     _write_pool(campaign)
     append_event(
@@ -939,24 +941,24 @@ def test_propose_recovery_initial_aimall_handoff_reenters_initial_ferebus(tmp_pa
 
     report = propose_recovery(campaign)
 
-    assert report.proposed_state.phase is CampaignPhase.INITIAL_FEREBUS
+    assert report.proposed_state.phase is CampaignPhase.REFERENCE_COMMIT
     assert report.proposed_state.reference_data_version == -1
     assert report.proposed_state.models_version == -1
     assert "exact point allocation is complete" in report.decision
     assert any(
-        "protected active staging handoff for INITIAL_FEREBUS" in artefact
+        "protected active staging handoff for REFERENCE_COMMIT" in artefact
         for artefact in report.trusted_artifacts
     )
 
 
-def test_propose_recovery_initial_ferebus_journal_handoff_reenters_initial_ferebus(tmp_path):
+def test_propose_recovery_reference_commit_journal_handoff_reenters_commit(tmp_path):
     campaign, data, _, _ = _campaign_dirs(tmp_path)
     _write_pool(campaign)
     append_event(
         data / "journal.ndjson",
         "phase_transition",
         from_phase=CampaignPhase.INITIAL_AIMALL.value,
-        to_phase=CampaignPhase.INITIAL_FEREBUS.value,
+        to_phase=CampaignPhase.REFERENCE_COMMIT.value,
         iteration=0,
     )
     state = fresh_campaign_state(max_iterations=50)
@@ -969,8 +971,8 @@ def test_propose_recovery_initial_ferebus_journal_handoff_reenters_initial_fereb
 
     report = propose_recovery(campaign)
 
-    assert report.last_phase_in_journal == CampaignPhase.INITIAL_FEREBUS.value
-    assert report.proposed_state.phase is CampaignPhase.INITIAL_FEREBUS
+    assert report.last_phase_in_journal == CampaignPhase.REFERENCE_COMMIT.value
+    assert report.proposed_state.phase is CampaignPhase.REFERENCE_COMMIT
     assert report.proposed_state.reference_data_version == -1
     assert report.proposed_state.models_version == -1
 
@@ -1034,7 +1036,7 @@ def test_propose_recovery_archived_initial_gaussian_handoff_reenters_initial_aim
     assert "valid initial Gaussian handoff" in report.decision
 
 
-def test_propose_recovery_archived_initial_aimall_handoff_reenters_initial_ferebus(tmp_path):
+def test_propose_recovery_archived_initial_aimall_handoff_reenters_reference_commit(tmp_path):
     campaign, data, _, _ = _campaign_dirs(tmp_path)
     _write_pool(campaign)
     state = fresh_campaign_state(max_iterations=50)
@@ -1051,7 +1053,7 @@ def test_propose_recovery_archived_initial_aimall_handoff_reenters_initial_fereb
 
     report = propose_recovery(campaign)
 
-    assert report.proposed_state.phase is CampaignPhase.INITIAL_FEREBUS
+    assert report.proposed_state.phase is CampaignPhase.REFERENCE_COMMIT
     assert report.bootstrap_handoff is not None
     assert report.bootstrap_handoff["path"] == str(archived)
     assert "exact point allocation is complete" in report.decision
@@ -1207,7 +1209,7 @@ def test_propose_recovery_sets_iteration_from_active_version_mapping(tmp_path, m
 
     report = propose_recovery(campaign)
 
-    assert report.proposed_state.phase is CampaignPhase.STOP_CHECK
+    assert report.proposed_state.phase is CampaignPhase.STOP_CHECK, report.unsafe_reasons
     assert report.proposed_state.reference_data_version == 2
     assert report.proposed_state.models_version == 2
     assert report.proposed_state.iteration == 2
@@ -1609,7 +1611,7 @@ def test_propose_recovery_finds_staging_handoff_in_later_iteration(tmp_path, mon
 
     report = propose_recovery(campaign)
 
-    assert report.proposed_state.phase is CampaignPhase.APPEND
+    assert report.proposed_state.phase is CampaignPhase.REFERENCE_COMMIT
     assert report.proposed_state.iteration == 2
     assert ".DATA/STAGING is non-empty" not in report.unsafe_reasons
     assert any("protected active staging handoff" in item for item in report.trusted_artifacts)

@@ -387,13 +387,13 @@ def test_repair_index_from_committed_pointdirs_adds_missing_records(tmp_path):
 
 def test_full_provenance_chain_through_dry_run_executor(tmp_path):
     """Drive the dry-run executor through ARIADNE_ARRAY -> PHASE_B_DIVERSITY ->
-    APPEND for a single iteration and verify the full provenance + index
+    REFERENCE_COMMIT for a single iteration and verify the full provenance + index
     flow lands as documented in the M10 design.
 
     Specifically:
       * each one-based ARIADNE seed directory gets provenance.json,
       * PHASE_B enrich populates the phase_b block in-place,
-      * APPEND copies the provenance sidecar into the committed pointdir
+      * REFERENCE_COMMIT moves the provenance sidecar with the committed pointdir
         AND emits one record per pointdir into seed_frame_id_index.json,
       * a reference_data_committed journal event is emitted.
     """
@@ -430,12 +430,19 @@ def test_full_provenance_chain_through_dry_run_executor(tmp_path):
     prepare_dry_submitted_phase(ex, state, CampaignPhase.INITIAL_AIMALL)
     ex.postprocess(state, CampaignPhase.INITIAL_AIMALL, observations=[])
     ex.submit_or_run(state, CampaignPhase.INITIAL_ALLOCATION_CHECK)
+    committed = ex.submit_or_run(state, CampaignPhase.REFERENCE_COMMIT)
+    state.reference_data_version = committed.state_updates[
+        "reference_data_version"
+    ]
     bootstrap = ex.postprocess(
         state,
         CampaignPhase.INITIAL_FEREBUS,
         observations=[],
     )
-    state.reference_data_version = bootstrap.state_updates["reference_data_version"]
+    state.reference_data_version = bootstrap.state_updates.get(
+        "reference_data_version",
+        state.reference_data_version,
+    )
     state.models_version = bootstrap.state_updates["models_version"]
     state.iteration = 1
 
@@ -477,7 +484,7 @@ def test_full_provenance_chain_through_dry_run_executor(tmp_path):
     prepare_dry_submitted_phase(ex, state, CampaignPhase.AIMALL)
     ex.postprocess(state, CampaignPhase.AIMALL, observations=[])
     ex.submit_or_run(state, CampaignPhase.ALLOCATION_CHECK)
-    ex.submit_or_run(state, CampaignPhase.APPEND)
+    ex.submit_or_run(state, CampaignPhase.REFERENCE_COMMIT)
     v = ReferenceDataVersioning(campaign_dir / "QM_REFERENCE_DATA")
     assert v.current_version() == 1
     committed_iter = v.iteration_path(1)
@@ -509,9 +516,9 @@ def test_full_provenance_chain_through_dry_run_executor(tmp_path):
             assert data["phase_b"] is None
 
     idx_data = load_index(campaign_dir)
-    assert len(idx_data["records"]) == len(active_pdirs)
+    assert len(idx_data["records"]) == len(committed_pdirs)
     for rec in idx_data["records"]:
-        assert rec["iteration"] == 1
+        assert rec["iteration"] in {0, 1}
         assert rec["pointdir_name"].startswith("POINT_")
         assert isinstance(rec["seed_frame_id"], int)
 
@@ -535,9 +542,9 @@ def test_full_provenance_chain_through_dry_run_executor(tmp_path):
 
 
 def test_full_provenance_chain_two_iterations_grows_index_monotonically(tmp_path):
-    """Two passes through ARIADNE_ARRAY -> PHASE_B_DIVERSITY -> APPEND must
+    """Two passes through ARIADNE_ARRAY -> PHASE_B_DIVERSITY -> REFERENCE_COMMIT must
     produce a monotonically-growing index. Catches regressions where the
-    APPEND phase resets the index, or where iteration numbers in records
+    REFERENCE_COMMIT phase resets the index, or where iteration numbers in records
     drift."""
     from types import SimpleNamespace
 
@@ -573,6 +580,13 @@ def test_full_provenance_chain_two_iterations_grows_index_monotonically(tmp_path
     )
     ex.postprocess(bootstrap_state, CampaignPhase.INITIAL_AIMALL, observations=[])
     ex.submit_or_run(bootstrap_state, CampaignPhase.INITIAL_ALLOCATION_CHECK)
+    committed = ex.submit_or_run(
+        bootstrap_state,
+        CampaignPhase.REFERENCE_COMMIT,
+    )
+    bootstrap_state.reference_data_version = int(
+        committed.state_updates["reference_data_version"]
+    )
     ex.postprocess(
         bootstrap_state,
         CampaignPhase.INITIAL_FEREBUS,
@@ -580,8 +594,8 @@ def test_full_provenance_chain_two_iterations_grows_index_monotonically(tmp_path
     )
 
     # Simulate the daemon's state machine: each loop iteration updates
-    # reference_data_version from the APPEND return so the M15 F2 idempotency
-    # guard in _inline_append sees a fresh expected-next per loop.
+    # reference_data_version from REFERENCE_COMMIT so the idempotency guard
+    # sees a fresh expected-next per loop.
     reference_data_version = 0
     models_version = 0
     for it in (1, 2):
@@ -601,7 +615,7 @@ def test_full_provenance_chain_two_iterations_grows_index_monotonically(tmp_path
         prepare_dry_submitted_phase(ex, state_ns, CampaignPhase.AIMALL)
         ex.postprocess(state_ns, CampaignPhase.AIMALL, observations=[])
         ex.submit_or_run(state_ns, CampaignPhase.ALLOCATION_CHECK)
-        result = ex.submit_or_run(state_ns, CampaignPhase.APPEND)
+        result = ex.submit_or_run(state_ns, CampaignPhase.REFERENCE_COMMIT)
         # PhaseResult; pull the updated reference_data_version out of it.
         if hasattr(result, "state_updates") and result.state_updates:
             reference_data_version = int(
@@ -619,7 +633,7 @@ def test_full_provenance_chain_two_iterations_grows_index_monotonically(tmp_path
 
     idx_data = load_index(campaign_dir)
     iterations_in_index = sorted({r["iteration"] for r in idx_data["records"]})
-    assert iterations_in_index == [1, 2]
+    assert iterations_in_index == [0, 1, 2]
     pairs = [(r["iteration"], r["pointdir_name"]) for r in idx_data["records"]]
     assert len(set(pairs)) == len(pairs)
 

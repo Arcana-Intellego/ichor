@@ -231,9 +231,9 @@ def test_reference_scale_cache_requires_complete_model_identity():
 # --- M15 F3: schema bump + new state fields ----------------------------
 
 
-def test_schema_version_is_eight():
+def test_schema_version_is_nine():
     from ichor.hpc.active_learning.daemon.state import SCHEMA_VERSION
-    assert SCHEMA_VERSION == 8
+    assert SCHEMA_VERSION == 9
 
 
 def test_old_schema_payload_is_rejected_on_read():

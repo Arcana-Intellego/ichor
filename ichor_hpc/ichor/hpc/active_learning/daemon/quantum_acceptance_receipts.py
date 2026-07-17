@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import platform
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
@@ -11,12 +14,13 @@ from ..strict_json import strict_json as json
 from ..strict_json import load_path
 from ..versioning.manifest import sha256_file
 from ..versioning.provenance import PROVENANCE_FILENAME, read_provenance
+from .filesystem import campaign_owned_path
 from .quantum_quality import read_quantum_quality_manifest
-from .state import atomic_write_json
+from .state import _fsync_file_descriptor, _fsync_parent_dir, atomic_write_json
 
 
 QUANTUM_ACCEPTANCE_RECEIPT = "QUANTUM_ACCEPTANCE_RECEIPT.json"
-QUANTUM_ACCEPTANCE_RECEIPT_SCHEMA_VERSION = 1
+QUANTUM_ACCEPTANCE_RECEIPT_SCHEMA_VERSION = 2
 
 
 def _exact_int(value: Any, label: str) -> int:
@@ -36,26 +40,33 @@ def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _current_bindings(pointdir: Path) -> list[Dict[str, Any]]:
-    root = Path(pointdir)
+def _scientific_files(root: Path) -> list[Path]:
     if root.is_symlink() or not root.is_dir():
         raise ValueError("accepted quantum pointdir is missing or symlinked")
-    bindings = []
+    files: list[Path] = []
     for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
         if path.is_symlink():
             raise ValueError("accepted quantum pointdir contains a symlink: " + str(path))
-        if not path.is_file():
+        mode = path.lstat().st_mode
+        if stat.S_ISDIR(mode):
             continue
+        if not stat.S_ISREG(mode):
+            raise ValueError(
+                "accepted quantum pointdir contains a special file: " + str(path)
+            )
         relative = path.relative_to(root).as_posix()
         if relative in {QUANTUM_ACCEPTANCE_RECEIPT, ".provenance.lock"}:
             continue
-        bindings.append(
-            {
-                "path": relative,
-                "size": int(path.stat().st_size),
-                "sha256": sha256_file(path),
-            }
-        )
+        lower_name = path.name.lower()
+        if lower_name.startswith(".nfs") or lower_name.endswith((".tmp", ".lock")):
+            raise ValueError(
+                "accepted quantum pointdir contains a transient file: " + str(path)
+            )
+        files.append(path)
+    return files
+
+
+def _validate_required_evidence(bindings: list[Dict[str, Any]]) -> None:
     required_names = {
         "AIMALL_COMPLETION_RECEIPT.json",
         "AIMALL_TASK.json",
@@ -75,7 +86,108 @@ def _current_bindings(pointdir: Path) -> list[Dict[str, Any]]:
             raise ValueError("accepted quantum pointdir lacks " + label + " evidence")
     if not any(suffix in {".gau", ".gaussianoutput"} for suffix in suffixes):
         raise ValueError("accepted quantum pointdir lacks Gaussian output evidence")
+
+
+def _hash_and_fsync_bindings(root: Path) -> list[Dict[str, Any]]:
+    bindings: list[Dict[str, Any]] = []
+    for path in _scientific_files(root):
+        size, digest = _stream_hash_and_fsync(path)
+        bindings.append(
+            {
+                "path": path.relative_to(root).as_posix(),
+                "size": size,
+                "sha256": digest,
+            }
+        )
+    _validate_required_evidence(bindings)
     return bindings
+
+
+def _stream_hash_and_fsync(path: Path) -> tuple[int, str]:
+    """Read, hash and synchronise one accepted artefact through one handle."""
+    digest = hashlib.sha256()
+    size = 0
+    mode = "rb+" if platform.system() == "Windows" else "rb"
+    with path.open(mode) as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+        if int(os.fstat(handle.fileno()).st_size) != size:
+            raise ValueError("accepted quantum artefact changed while hashing: " + str(path))
+        _fsync_file_descriptor(handle.fileno())
+    return int(size), digest.hexdigest()
+
+
+def _validate_current_inventory(
+    root: Path,
+    bindings: list[Dict[str, Any]],
+    *,
+    verification: str,
+) -> None:
+    if verification not in {"receipt", "metadata", "deep"}:
+        raise ValueError(
+            "quantum acceptance verification must be receipt, metadata or deep"
+        )
+    if verification == "receipt":
+        if root.is_symlink() or not root.is_dir():
+            raise ValueError("accepted quantum pointdir is missing or symlinked")
+        if stat.S_IMODE(root.stat().st_mode) & (
+            stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
+        ):
+            raise ValueError("accepted quantum pointdir root is still writable")
+        _validate_required_evidence(bindings)
+        return
+    current_files = _scientific_files(root)
+    current = [
+        {
+            "path": path.relative_to(root).as_posix(),
+            "size": int(path.stat().st_size),
+        }
+        for path in current_files
+    ]
+    expected = [
+        {"path": str(binding.get("path") or ""), "size": binding.get("size")}
+        for binding in bindings
+    ]
+    if current != expected:
+        raise ValueError("accepted quantum pointdir inventory has changed")
+    _validate_required_evidence(bindings)
+    if verification == "deep":
+        for path, binding in zip(current_files, bindings):
+            if sha256_file(path) != str(binding.get("sha256") or ""):
+                raise ValueError(
+                    "accepted quantum pointdir file hash has changed: " + str(path)
+                )
+
+
+def _seal_pointdir(root: Path) -> None:
+    paths = sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True)
+    for path in paths + [root]:
+        if path.is_symlink():
+            raise ValueError("cannot seal symlinked quantum evidence: " + str(path))
+        mode = stat.S_IMODE(path.stat().st_mode)
+        os.chmod(path, mode & ~stat.S_IWUSR & ~stat.S_IWGRP & ~stat.S_IWOTH)
+    _fsync_parent_dir(root)
+
+
+def _require_sealed(root: Path) -> None:
+    for path in [root, *root.rglob("*")]:
+        if path.is_symlink():
+            raise ValueError("sealed quantum evidence contains a symlink: " + str(path))
+        if stat.S_IMODE(path.stat().st_mode) & (
+            stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
+        ):
+            raise ValueError("accepted quantum evidence is still writable: " + str(path))
+
+
+def restore_sealed_pointdir_permissions(pointdir: Path) -> None:
+    """Restore immutable directory modes after verified checkpoint transport."""
+    root = Path(pointdir)
+    _seal_pointdir(root)
+    _require_sealed(root)
 
 
 def write_quantum_acceptance_receipt(
@@ -87,9 +199,9 @@ def write_quantum_acceptance_receipt(
     quality_manifest: Path,
     quality_record: Mapping[str, Any],
 ) -> Path:
-    """Freeze accepted pointdir bytes before allocation and calibration mutate state."""
+    """Hash, fsync and seal one accepted pointdir before allocation publication."""
     campaign = Path(campaign_dir).resolve()
-    root = Path(pointdir)
+    root = campaign_owned_path(campaign, pointdir)
     provenance = read_provenance(root)
     allocation = provenance.get("point_allocation")
     if not isinstance(allocation, dict):
@@ -101,13 +213,26 @@ def write_quantum_acceptance_receipt(
         manifest_relative = manifest.relative_to(campaign).as_posix()
     except ValueError as exc:
         raise ValueError("quantum quality manifest is outside the campaign") from exc
-    bindings = _current_bindings(root)
+    provenance_lock = root / ".provenance.lock"
+    if provenance_lock.exists():
+        if provenance_lock.is_symlink() or not provenance_lock.is_file():
+            raise ValueError("quantum provenance lock is not a regular file")
+        provenance_lock.unlink()
+        _fsync_parent_dir(provenance_lock)
+    bindings = _hash_and_fsync_bindings(root)
+    from .ferebus_row_cache import row_shard_binding
+
+    shard_binding = row_shard_binding(
+        campaign,
+        root,
+        source_bindings=bindings,
+    )
     payload = {
         "schema_version": QUANTUM_ACCEPTANCE_RECEIPT_SCHEMA_VERSION,
         "campaign_uid": str(provenance["campaign_uid"]),
         "phase": str(phase_name),
         "iteration": _exact_int(iteration, "quantum acceptance iteration"),
-        "pointdir": root.name,
+        "source_pointdir": root.name,
         "candidate_id": str(allocation.get("candidate_id") or ""),
         "allocation_slot_assignment_sha256": str(
             allocation.get("slot_assignment_sha256") or ""
@@ -119,65 +244,18 @@ def write_quantum_acceptance_receipt(
         "quality_record_sha256": _canonical_sha256(dict(quality_record)),
         "artefacts": bindings,
         "content_sha256": _canonical_sha256(bindings),
-        "created_at_iso": datetime.now(timezone.utc).isoformat(),
+        "ferebus_row_shard_status": (
+            "available" if shard_binding is not None else "repair_required"
+        ),
+        "ferebus_row_shard": shard_binding,
+        "sealed_at_iso": datetime.now(timezone.utc).isoformat(),
     }
     for key in ("campaign_uid", "candidate_id", "allocation_slot_assignment_sha256"):
         if not payload[key]:
             raise ValueError("quantum acceptance receipt " + key + " is empty")
     target = root / QUANTUM_ACCEPTANCE_RECEIPT
     atomic_write_json(target, payload)
-    return target
-
-
-def bind_quantum_acceptance_receipt_to_commit(
-    campaign_dir: Path,
-    pointdir: Path,
-    *,
-    source_pointdir: str,
-    committed_pointdir: str,
-    quality_manifest_source: Path,
-    quality_manifest_published: Path,
-    quality_record: Mapping[str, Any],
-) -> Path:
-    """Rebind a copied receipt to immutable, version-owned quality evidence."""
-    campaign = Path(campaign_dir).resolve()
-    root = Path(pointdir)
-    payload = read_quantum_acceptance_receipt(
-        campaign,
-        root,
-        expected_source_pointdir=str(source_pointdir),
-    )
-    if root.name != str(committed_pointdir):
-        raise ValueError("committed quantum pointdir name mismatch")
-    if (
-        quality_record.get("pointdir") != str(source_pointdir)
-        or quality_record.get("committed_pointdir") != str(committed_pointdir)
-        or quality_record.get("accepted") is not True
-    ):
-        raise ValueError("committed quantum quality record does not match its pointdir")
-    source = Path(quality_manifest_source)
-    published = Path(quality_manifest_published)
-    if source.is_symlink() or not source.is_file():
-        raise FileNotFoundError("committed quantum quality source is missing")
-    try:
-        published_relative = published.resolve(strict=False).relative_to(
-            campaign
-        ).as_posix()
-    except ValueError as exc:
-        raise ValueError("committed quantum quality path is outside the campaign") from exc
-
-    rebound = dict(payload)
-    rebound["committed_pointdir"] = str(committed_pointdir)
-    rebound["quality_manifest"] = {
-        "path": published_relative,
-        "sha256": sha256_file(source),
-    }
-    rebound["quality_record_sha256"] = _canonical_sha256(dict(quality_record))
-    rebound["artefacts"] = _current_bindings(root)
-    rebound["content_sha256"] = _canonical_sha256(rebound["artefacts"])
-    rebound["committed_at_iso"] = datetime.now(timezone.utc).isoformat()
-    target = root / QUANTUM_ACCEPTANCE_RECEIPT
-    atomic_write_json(target, rebound)
+    _seal_pointdir(root)
     return target
 
 
@@ -190,10 +268,12 @@ def read_quantum_acceptance_receipt(
     expected_candidate_id: Optional[str] = None,
     expected_assignment_sha256: Optional[str] = None,
     expected_source_pointdir: Optional[str] = None,
+    verification: str = "metadata",
+    validate_quality: bool = True,
 ) -> Dict[str, Any]:
-    """Verify that accepted bytes and their quality decision remain unchanged."""
+    """Validate sealed acceptance evidence, rehashing payloads only when requested."""
     campaign = Path(campaign_dir).resolve()
-    root = Path(pointdir)
+    root = campaign_owned_path(campaign, pointdir)
     target = root / QUANTUM_ACCEPTANCE_RECEIPT
     try:
         payload = load_path(target)
@@ -201,27 +281,20 @@ def read_quantum_acceptance_receipt(
         raise ValueError("quantum acceptance receipt is unreadable: " + str(target)) from exc
     if not isinstance(payload, dict):
         raise ValueError("quantum acceptance receipt must be a JSON object")
-    if _exact_int(payload.get("schema_version"), "quantum acceptance schema") != 1:
+    if (
+        _exact_int(payload.get("schema_version"), "quantum acceptance schema")
+        != QUANTUM_ACCEPTANCE_RECEIPT_SCHEMA_VERSION
+    ):
         raise ValueError("unsupported quantum acceptance receipt schema")
     iteration = _exact_int(payload.get("iteration"), "quantum acceptance iteration")
-    payload_source_pointdir = str(payload.get("pointdir") or "")
-    if not payload_source_pointdir:
+    source_pointdir = str(payload.get("source_pointdir") or "")
+    if not source_pointdir:
         raise ValueError("quantum acceptance receipt source pointdir is empty")
-    if (
-        expected_source_pointdir is not None
-        and payload_source_pointdir != str(expected_source_pointdir)
-    ):
-        raise ValueError("quantum acceptance receipt pointdir mismatch")
-    committed_pointdir = payload.get("committed_pointdir")
-    if committed_pointdir is not None and committed_pointdir != root.name:
-        raise ValueError("quantum acceptance receipt committed pointdir mismatch")
-    if (
-        expected_source_pointdir is None
-        and payload_source_pointdir != root.name
-        and committed_pointdir != root.name
-    ):
+    if expected_source_pointdir is not None:
+        if source_pointdir != str(expected_source_pointdir):
+            raise ValueError("quantum acceptance receipt pointdir mismatch")
+    elif source_pointdir != root.name:
         raise ValueError("quantum acceptance receipt pointdir identity mismatch")
-    source_pointdir = payload_source_pointdir
     if expected_phase is not None and payload.get("phase") != str(expected_phase):
         raise ValueError("quantum acceptance receipt phase mismatch")
     if expected_iteration is not None and iteration != int(expected_iteration):
@@ -235,14 +308,20 @@ def read_quantum_acceptance_receipt(
     ) != str(expected_assignment_sha256):
         raise ValueError("quantum acceptance receipt allocation mismatch")
     bindings = payload.get("artefacts")
-    if not isinstance(bindings, list) or not bindings:
+    if not isinstance(bindings, list) or not bindings or any(
+        not isinstance(binding, dict) for binding in bindings
+    ):
         raise ValueError("quantum acceptance receipt artefacts are missing")
-    current = _current_bindings(root)
-    if current != bindings or payload.get("content_sha256") != _canonical_sha256(current):
-        raise ValueError("accepted quantum pointdir bytes have changed")
+    if payload.get("content_sha256") != _canonical_sha256(bindings):
+        raise ValueError("quantum acceptance receipt content digest is invalid")
+    _validate_current_inventory(root, bindings, verification=verification)
+    if verification != "receipt":
+        _require_sealed(root)
     quality_binding = payload.get("quality_manifest")
     if not isinstance(quality_binding, dict):
         raise ValueError("quantum acceptance quality binding is invalid")
+    if not validate_quality:
+        return payload
     relative = Path(str(quality_binding.get("path") or ""))
     if relative.is_absolute() or ".." in relative.parts:
         raise ValueError("quantum acceptance quality path escapes the campaign")
@@ -260,12 +339,7 @@ def read_quantum_acceptance_receipt(
     matching = [
         record
         for record in quality["records"]
-        if record.get("pointdir") == source_pointdir
-        and record.get("accepted") is True
-        and (
-            committed_pointdir is None
-            or record.get("committed_pointdir") == committed_pointdir
-        )
+        if record.get("pointdir") == source_pointdir and record.get("accepted") is True
     ]
     if len(matching) != 1 or _canonical_sha256(matching[0]) != payload.get(
         "quality_record_sha256"
@@ -275,9 +349,9 @@ def read_quantum_acceptance_receipt(
 
 
 __all__ = [
-    "bind_quantum_acceptance_receipt_to_commit",
     "QUANTUM_ACCEPTANCE_RECEIPT",
     "QUANTUM_ACCEPTANCE_RECEIPT_SCHEMA_VERSION",
     "read_quantum_acceptance_receipt",
+    "restore_sealed_pointdir_permissions",
     "write_quantum_acceptance_receipt",
 ]

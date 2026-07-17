@@ -1,5 +1,8 @@
 """Accepted quantum bytes remain immutable between AIMAll and commit."""
 
+import json
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -65,9 +68,11 @@ def _accepted_fixture(tmp_path):
 
 def test_quantum_acceptance_receipt_detects_late_pointdir_mutation(tmp_path):
     campaign, pointdir, _quality = _accepted_fixture(tmp_path)
-    (pointdir / "input.wfn").write_text("changed\n", encoding="utf-8")
+    wfn = pointdir / "input.wfn"
+    os.chmod(wfn, stat.S_IMODE(wfn.stat().st_mode) | stat.S_IWUSR)
+    wfn.write_text("changed\n", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="bytes have changed"):
+    with pytest.raises(ValueError, match="(bytes|inventory) (have|has) changed"):
         read_quantum_acceptance_receipt(
             campaign,
             pointdir,
@@ -78,9 +83,54 @@ def test_quantum_acceptance_receipt_detects_late_pointdir_mutation(tmp_path):
         )
 
 
+def test_quantum_acceptance_hashes_and_fsyncs_each_artefact_once(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon import quantum_acceptance_receipts
+
+    calls = []
+    real_stream = quantum_acceptance_receipts._stream_hash_and_fsync
+
+    def track(path):
+        calls.append(Path(path))
+        return real_stream(path)
+
+    monkeypatch.setattr(
+        quantum_acceptance_receipts,
+        "_stream_hash_and_fsync",
+        track,
+    )
+    campaign, pointdir, _quality = _accepted_fixture(tmp_path)
+    receipt = read_quantum_acceptance_receipt(campaign, pointdir)
+
+    expected = {
+        pointdir / str(binding["path"])
+        for binding in receipt["artefacts"]
+    }
+    assert set(calls) == expected
+    assert len(calls) == len(expected)
+
+
 def test_quantum_acceptance_receipt_detects_late_quality_mutation(tmp_path):
     campaign, pointdir, quality = _accepted_fixture(tmp_path)
     quality.write_text("{}\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="quality manifest has changed"):
+        read_quantum_acceptance_receipt(campaign, pointdir)
+
+
+def test_quantum_acceptance_receipt_rejects_old_schema(tmp_path):
+    campaign, pointdir, _quality = _accepted_fixture(tmp_path)
+    receipt = pointdir / "QUANTUM_ACCEPTANCE_RECEIPT.json"
+    os.chmod(receipt, stat.S_IMODE(receipt.stat().st_mode) | stat.S_IWUSR)
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    payload["schema_version"] = 1
+    receipt.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    with pytest.raises(ValueError, match="unsupported quantum acceptance"):
         read_quantum_acceptance_receipt(campaign, pointdir)

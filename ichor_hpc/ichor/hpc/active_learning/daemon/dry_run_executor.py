@@ -30,6 +30,7 @@ can assert exact counts of artefacts produced.
 from __future__ import annotations
 
 import csv
+import time
 from ..strict_json import strict_json as json
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -259,7 +260,6 @@ class DryRunPhaseExecutor:
                 self.campaign_dir,
                 self.config,
                 int(getattr(state, "reference_data_version", 0)),
-                is_initial=phase_name == "INITIAL_FEREBUS",
             )
         else:
             raise BackendSubmissionError(
@@ -641,7 +641,6 @@ class DryRunPhaseExecutor:
             self.campaign_dir,
             self.config,
             target_version,
-            is_initial=target_version == 0,
         )
         manifest = self._prepare_dry_staged_models(staging)
         self._write_dry_ferebus_execution_evidence(staging)
@@ -721,7 +720,7 @@ class DryRunPhaseExecutor:
             "ALLOCATION_CHECK": self._inline_allocation_check,
             "SEED_SELECT": self._inline_seed_select,
             "SPLIT": self._inline_split,
-            "APPEND": self._inline_append,
+            "REFERENCE_COMMIT": self._inline_reference_commit,
             "STOP_CHECK": self._inline_stop_check,
         }
 
@@ -1251,7 +1250,7 @@ class DryRunPhaseExecutor:
                 "mandatory_custom_bootstrap_failed: supplied slots cannot be replaced"
             )
         if bool(summary.get("complete", False)):
-            next_phase = "INITIAL_FEREBUS" if context == "bootstrap" else "APPEND"
+            next_phase = "REFERENCE_COMMIT"
             self._journal_event(
                 "point_allocation_complete",
                 context=str(context),
@@ -1359,15 +1358,14 @@ class DryRunPhaseExecutor:
         self.artefact_log.append(str(split_path))
         return {}
 
-    def _inline_append(self, state) -> Dict[str, Any]:
-        """Commit this iteration's accepted QM points as one immutable delta."""
+    def _inline_reference_commit(self, state) -> Dict[str, Any]:
+        """Publish one accepted allocation as an immutable reference-data delta."""
         from . import input_staging as _stg
 
         v = self._versioning("reference_data")
         committed = v.list_committed_versions()
         iteration = int(state.iteration)
-        if iteration < 1:
-            raise BackendSubmissionError("APPEND requires active iteration >= 1")
+        context = "bootstrap" if iteration == 0 else "active"
         state_version = int(getattr(state, "reference_data_version", -1))
         committed_max = max(committed) if committed else -1
         if committed != list(range(committed_max + 1)):
@@ -1376,27 +1374,38 @@ class DryRunPhaseExecutor:
             )
         if committed_max not in (iteration - 1, iteration):
             raise BackendSubmissionError(
-                "APPEND reference-data head must be active iteration - 1 or iteration: "
+                "REFERENCE_COMMIT reference-data head must be iteration - 1 or iteration: "
                 + repr(committed)
             )
         if state_version not in (iteration - 1, iteration):
             raise BackendSubmissionError(
-                "APPEND state/reference-data version mismatch: state="
+                "REFERENCE_COMMIT state/reference-data version mismatch: state="
                 + str(state_version)
                 + " iteration="
                 + str(iteration)
             )
         target_version = iteration
+        started = time.monotonic()
+
+        def _progress(event_type, payload):
+            self._journal_event(
+                str(event_type),
+                iteration=int(iteration),
+                reference_data_version=int(target_version),
+                **dict(payload),
+            )
+
         try:
             view, committed_pointdirs, created = _stg.commit_reference_data_delta(
                 self.campaign_dir,
                 reference_data_version=target_version,
-                context="active",
+                context=context,
                 iteration=int(state.iteration),
+                progress_callback=_progress,
             )
         except Exception as exc:
             raise BackendSubmissionError(
-                "reference-data APPEND transaction failed: "
+                "reference-data commit transaction failed: "
                 + type(exc).__name__
                 + ": "
                 + str(exc)
@@ -1424,6 +1433,7 @@ class DryRunPhaseExecutor:
             cumulative_view_sha256=str(view.cumulative_view_sha256),
             expected_batch_total=int(self.config.point_allocation.batch_total_size),
             idempotent_skip=not bool(created),
+            elapsed_seconds=float(time.monotonic() - started),
         )
         return {"reference_data_version": int(target_version)}
 
@@ -1611,20 +1621,18 @@ class DryRunPhaseExecutor:
         )
 
     def _post_initial_ferebus(self, state) -> Dict[str, Any]:
-        """Commit initial reference data and a complete dry model snapshot.
-
-        This is the first time the QM reference-data versioning is exercised; the
-        committed iteration-000000 holds the initial diverse sample's stub
-        PointDirectories.
-        """
+        """Commit a complete dry model snapshot from reference-data version 0."""
         from . import input_staging as _stg
 
+        if int(getattr(state, "reference_data_version", -1)) != 0:
+            raise BackendSubmissionError(
+                "INITIAL_FEREBUS requires published reference-data version 0"
+            )
         if _stg._model_bootstrap_context(self.campaign_dir) is not None:
             staging, _n_tasks = _stg.stage_ferebus_inputs(
                 self.campaign_dir,
                 self.config,
                 0,
-                is_initial=True,
             )
             _stg.prepare_imported_model_bootstrap(staging)
             from .live_executor import LiveBackendsPhaseExecutor
@@ -1641,13 +1649,8 @@ class DryRunPhaseExecutor:
 
         v_train = self._versioning("reference_data")
         v_models = self._versioning("models")
-        v_train.recover_dangling_staging()
         v_models.recover_dangling_staging()
-
-        from .input_staging import commit_initial_reference_data
-
-        commit_initial_reference_data(self.campaign_dir)
-        v_train.ensure_current(0)
+        v_train.resolve(0, verification="index")
 
         self._commit_dry_model_snapshot(0)
         from ..versioning.sampling_iterations import finalise_bootstrap
@@ -1657,7 +1660,7 @@ class DryRunPhaseExecutor:
             str(state.campaign_uid),
         )
         self.artefact_log.append(str(bootstrap_manifest))
-        return {"reference_data_version": 0, "models_version": 0}
+        return {"models_version": 0}
 
     def _post_ariadne_array(self, state) -> Dict[str, Any]:
         """Publish mock seed outputs through the live ARIADNE contracts."""
@@ -2383,7 +2386,7 @@ class DryRunPhaseExecutor:
 
     def _post_ferebus(self, state) -> Dict[str, Any]:
         """Commit the next models iteration. QM reference data itself has already
-        been committed by the inline APPEND phase one step earlier."""
+        been committed by the inline REFERENCE_COMMIT phase one step earlier."""
         v_models = self._versioning("models")
         v_models.recover_dangling_staging()
         committed = v_models.list_committed_versions()
@@ -2413,7 +2416,6 @@ class DryRunPhaseExecutor:
                 self.campaign_dir,
                 self.config,
                 next_version,
-                is_initial=False,
             )
             self._prepare_dry_staged_models(staging)
             from .live_executor import LiveBackendsPhaseExecutor
@@ -2768,9 +2770,9 @@ class DryRunPhaseExecutor:
         initial: bool,
         replacement: bool = False,
     ) -> Dict[str, Any]:
-        """Create stub PointDirectories so APPEND has content to stage. We
+        """Create stub PointDirectories so REFERENCE_COMMIT has content to stage. We
         write into a transient staging area under .DATA/STAGING/quantum/ that
-        the APPEND step copies into the next training iteration.
+        the reference commit publishes into the next training iteration.
         """
         from . import input_staging as _stg
         from ..point_allocation import (
@@ -2938,6 +2940,7 @@ class DryRunPhaseExecutor:
             from ichor.core.files.gaussian.wfn import WFN
 
             from .quantum_task_receipts import write_quantum_task_receipt
+            from .ferebus_row_cache import produce_task_row_shard
 
             records = []
             for logical_task_id, point_dir in enumerate(pointdirs):
@@ -3001,6 +3004,17 @@ class DryRunPhaseExecutor:
                     logical_task_id=logical_task_id,
                 )
                 self.artefact_log.append(str(receipt))
+                try:
+                    shard = produce_task_row_shard(
+                        self.campaign_dir,
+                        point_dir,
+                    )
+                    self.artefact_log.append(str(shard))
+                except Exception:
+                    # The live AIMAll sidecar is deliberately non-fatal. Keep
+                    # dry-run parity: REFERENCE_COMMIT will repair this row
+                    # serially and report it when sidecar production fails.
+                    pass
             manifest = write_quantum_quality_manifest(
                 staging_root,
                 phase_name=phase_name,

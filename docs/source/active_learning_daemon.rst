@@ -692,8 +692,11 @@ postprocess parser in the daemon process).
      |                                      | (bounded reserve only)
      |<-------------------------------------+
      v
-   INITIAL_FEREBUS  (sbatch*)     First GP fit. Commits bootstrap version 0 to
-     |                            QM_REFERENCE_DATA and TRAINED_MODELS. With
+   REFERENCE_COMMIT  (inline)     Atomically publish sealed pointdirs and cached
+     |                            FEREBUS rows as reference-data version 0.
+     v
+   INITIAL_FEREBUS  (sbatch*)     First GP fit. Commits trained-model version 0.
+     |                            With
      |                            model_krig, validated models are imported
      |                            directly and no scheduler job is submitted.
      v
@@ -720,8 +723,8 @@ postprocess parser in the daemon process).
      |                              | (same inherited slot and split)
      |<-----------------------------+
      v                         |
-   APPEND  (inline)             |  Commit accepted AIMAll pointdirs into
-     |                         |  the new training-set iteration.
+   REFERENCE_COMMIT  (inline)   |  Atomically move sealed AIMAll pointdirs and
+     |                         |  publish the new row-cache delta.
      |                         |
      v                         |
    FEREBUS  (sbatch)            |  Re-fit GP. Commits new models iter.
@@ -734,12 +737,13 @@ postprocess parser in the daemon process).
 
 State transitions are persisted to :code:`state.json` BEFORE journaling,
 so a crash between the two leaves the state authoritative and the
-journal at most one event behind. The inline APPEND and FEREBUS commits
-are idempotent: re-running after a partial crash is safe.
-
-The full design rationale lives in
-:code:`C:\Users\bukow\.claude\plans\you-are-a-phd-level-glistening-frost.md`
-(the M9-M16 plan document). The most important reads are sections 1-7
-(architecture + new infrastructure), section 11 (the three traps the
-design avoids), and the M15 + M16 sections (hardening fixes + live
-executor parsers).
+journal at most one event behind. The inline REFERENCE_COMMIT and FEREBUS
+commits are idempotent: re-running after a partial crash is safe. Reference
+publication uses same-filesystem atomic moves, so normal operation does not
+copy or rehash the sealed scientific payload. Each successful AIMAll task also
+writes one compact FEREBUS row shard, consisting of ``ROW_SHARD.json`` and
+``ROWS.npy``. ``REFERENCE_COMMIT`` validates and assembles those shards before
+publishing the reference version. Missing or invalid shards are repaired
+serially and reported explicitly; ordinary FEREBUS staging never reparses
+pointdirs. Derived row caches live below ``.DATA/CACHE/FEREBUS_ROWS`` and are
+rebuilt after checkpoint restoration or an environment rebind.

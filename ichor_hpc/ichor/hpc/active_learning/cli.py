@@ -285,7 +285,7 @@ RETRYABLE_CLEANED_REENTRY_PHASES = {
     CampaignPhase.ALLOCATION_CHECK,
     CampaignPhase.REPLACEMENT_GAUSSIAN,
     CampaignPhase.REPLACEMENT_AIMALL,
-    CampaignPhase.APPEND,
+    CampaignPhase.REFERENCE_COMMIT,
     CampaignPhase.FEREBUS,
 }
 
@@ -1125,6 +1125,7 @@ _PHASE_MEANINGS: Dict[str, str] = {
     CampaignPhase.INITIAL_ALLOCATION_CHECK.value: "bootstrap point-allocation completeness is being checked",
     CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN.value: "replacement bootstrap Gaussian labelling is next",
     CampaignPhase.INITIAL_REPLACEMENT_AIMALL.value: "replacement bootstrap AIMAll postprocessing is next",
+    CampaignPhase.REFERENCE_COMMIT.value: "accepted AIMAll outputs and FEREBUS rows are being published",
     CampaignPhase.INITIAL_FEREBUS.value: "bootstrap FEREBUS model training is next",
     CampaignPhase.SEED_SELECT.value: "active-learning seed selection is next",
     CampaignPhase.ARIADNE_ARRAY.value: "ARIADNE adversarial landing is next",
@@ -1135,7 +1136,6 @@ _PHASE_MEANINGS: Dict[str, str] = {
     CampaignPhase.ALLOCATION_CHECK.value: "active point-allocation completeness is being checked",
     CampaignPhase.REPLACEMENT_GAUSSIAN.value: "replacement active Gaussian labelling is next",
     CampaignPhase.REPLACEMENT_AIMALL.value: "replacement active AIMAll postprocessing is next",
-    CampaignPhase.APPEND.value: "accepted AIMAll outputs are being appended",
     CampaignPhase.FEREBUS.value: "FEREBUS model retraining is next",
     CampaignPhase.STOP_CHECK.value: "iteration stop/continue decision is next",
     CampaignPhase.DONE.value: "campaign is complete",
@@ -1150,6 +1150,7 @@ _BOOTSTRAP_NOT_READY_PHASES = {
     CampaignPhase.INITIAL_ALLOCATION_CHECK.value,
     CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN.value,
     CampaignPhase.INITIAL_REPLACEMENT_AIMALL.value,
+    CampaignPhase.REFERENCE_COMMIT.value,
 }
 
 _TRAINING_REQUIRED_PHASES = {
@@ -1162,7 +1163,6 @@ _TRAINING_REQUIRED_PHASES = {
     CampaignPhase.ALLOCATION_CHECK.value,
     CampaignPhase.REPLACEMENT_GAUSSIAN.value,
     CampaignPhase.REPLACEMENT_AIMALL.value,
-    CampaignPhase.APPEND.value,
     CampaignPhase.FEREBUS.value,
     CampaignPhase.STOP_CHECK.value,
 }
@@ -1177,7 +1177,6 @@ _MODELS_REQUIRED_PHASES = {
     CampaignPhase.ALLOCATION_CHECK.value,
     CampaignPhase.REPLACEMENT_GAUSSIAN.value,
     CampaignPhase.REPLACEMENT_AIMALL.value,
-    CampaignPhase.APPEND.value,
     CampaignPhase.STOP_CHECK.value,
 }
 
@@ -1281,7 +1280,7 @@ def _format_data_products_summary(
                 phase_name in _BOOTSTRAP_NOT_READY_PHASES
                 and reference_data.get("ok") is not True
             ):
-                rows.append(("reference data expected after", "INITIAL_AIMALL / INITIAL_FEREBUS"))
+                rows.append(("reference data expected after", "REFERENCE_COMMIT"))
             if verbose:
                 rows.append(("reference-data version", reference_data.get("version")))
                 for error in reference_data.get("errors") or []:
@@ -1575,6 +1574,28 @@ def _format_runtime_status(payload: Dict[str, Any], *, verbose: bool) -> List[st
                 ("allocation reserve available", allocation.get("reserve_available")),
             ]
         )
+    transactions = payload.get("reference_commit_transactions")
+    if isinstance(transactions, list):
+        active_transactions = [
+            record
+            for record in transactions
+            if str(record.get("state") or "") != "complete"
+        ]
+        for record in active_transactions[:1]:
+            ledger = record.get("ledger") or {}
+            rows.extend(
+                [
+                    ("reference commit", record.get("state")),
+                    (
+                        "reference move progress",
+                        str(ledger.get("moved_points", 0))
+                        + "/"
+                        + str(len(ledger.get("point_bindings") or [])),
+                    ),
+                    ("reference moved bytes", ledger.get("moved_bytes", 0)),
+                    ("row shards repaired", ledger.get("shards_repaired", 0)),
+                ]
+            )
     if verbose:
         lease = "active: " + _heartbeat_summary(payload.get("lease_heartbeat"))
         if not payload.get("lease_dir_exists"):
@@ -1851,6 +1872,11 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "tick_exception_halted": "daemon halted after exception",
     "subspace_built": "subspace built",
     "reference_data_committed": "QM reference data committed",
+    "reference_commit_started": "QM reference commit started",
+    "reference_commit_move_progress": "QM reference move progress",
+    "reference_commit_shards_resolved": "FEREBUS row shards resolved",
+    "reference_commit_cache_complete": "FEREBUS row cache complete",
+    "reference_commit_published": "QM reference version published",
     "models_committed": "models committed",
     "seed_selected": "seeds selected",
     "anti_overlap_flagged": "anti-overlap flagged",
@@ -1957,6 +1983,7 @@ _JOURNAL_OK_EVENTS = {
     "phase_succeeded",
     "phase_succeeded_live",
     "reference_data_committed",
+    "reference_commit_published",
     "models_committed",
     "trajectory_pool_imported",
     "bootstrap_inputs_confirmed",
@@ -1975,6 +2002,9 @@ _JOURNAL_RUN_EVENTS = {
     "partial_array_recovery_prepared",
     "partial_array_recovery_postprocess_only",
     "scheduler_uncertain_resumed",
+    "reference_commit_started",
+    "reference_commit_move_progress",
+    "reference_commit_cache_complete",
 }
 
 _JOURNAL_WAIT_EVENTS = {
@@ -2204,6 +2234,20 @@ def _journal_operator_summary(event: Dict[str, Any]) -> str:
         tasks = event.get("n_tasks")
         action = event.get("action")
         return "action=" + str(action) + " failed=" + str(failed) + "/" + str(tasks)
+    if raw.startswith("reference_commit_"):
+        moved = event.get("moved_points")
+        total = event.get("total_points")
+        if moved is not None and total is not None:
+            return "reference points=" + str(moved) + "/" + str(total)
+        repaired = event.get("shards_repaired")
+        reused = event.get("shards_reused")
+        if repaired is not None or reused is not None:
+            return (
+                "row shards reused="
+                + str(reused or 0)
+                + " repaired="
+                + str(repaired or 0)
+            )
     return ""
 
 
@@ -2219,6 +2263,12 @@ def _compact_event_details(event: Dict[str, Any]) -> str:
         ("n_kept", "kept"),
         ("n_rejected", "rejected"),
         ("n_frames", "frames"),
+        ("moved_points", "moved"),
+        ("total_points", "total"),
+        ("moved_bytes", "bytes"),
+        ("shards_reused", "shards_reused"),
+        ("shards_repaired", "shards_repaired"),
+        ("elapsed_seconds", "elapsed_s"),
         ("pool_n_frames", "pool"),
         ("required_pool_frames", "required"),
         ("action", "action"),
@@ -3689,6 +3739,19 @@ def cmd_status(args: argparse.Namespace) -> int:
         payload["point_allocation_summary"] = {
             "error": type(exc).__name__ + ": " + str(exc)
         }
+    try:
+        from .daemon.reference_commit import inventory_reference_commits
+
+        payload["reference_commit_transactions"] = inventory_reference_commits(
+            campaign
+        )
+    except Exception as exc:
+        payload["reference_commit_transactions"] = [
+            {
+                "state": "invalid",
+                "error": type(exc).__name__ + ": " + str(exc),
+            }
+        ]
     try:
         payload["latest_halt_event"] = _latest_journal_event(
             paths["journal"], "halt"
@@ -5254,6 +5317,34 @@ def _reconcile_reference_data_staging_summary(report: Any) -> str:
     return "none"
 
 
+def _reconcile_reference_commit_summary(report: Any) -> str:
+    records = getattr(report, "reference_commit_transactions", None)
+    if not isinstance(records, list) or not records:
+        return "none"
+    active = [
+        record
+        for record in records
+        if str(record.get("state") or "") != "complete"
+    ]
+    selected = active[0] if active else records[-1]
+    state = str(selected.get("state") or "unknown")
+    ledger = selected.get("ledger")
+    if not isinstance(ledger, dict):
+        reason = str(selected.get("reason") or "")
+        return state + ((": " + reason) if reason else "")
+    return (
+        state
+        + ", moved "
+        + str(ledger.get("moved_points", 0))
+        + "/"
+        + str(len(ledger.get("point_bindings") or []))
+        + ", bytes "
+        + str(ledger.get("moved_bytes", 0))
+        + ", shard repairs "
+        + str(ledger.get("shards_repaired", 0))
+    )
+
+
 def _print_reconcile_header(campaign: Path, *, mode: str, result: str) -> None:
     print("ICHOR Reconcile")
     print("Campaign: " + str(campaign))
@@ -5370,6 +5461,7 @@ def _print_reconcile_artefacts(
             ("staging", _reconcile_staging_summary(campaign, contract_status, report)),
             ("model staging", _reconcile_model_staging_summary(report)),
             ("reference-data staging", _reconcile_reference_data_staging_summary(report)),
+            ("reference commit", _reconcile_reference_commit_summary(report)),
         ]
     )
     inv = getattr(report, "script_inventory", {}) or {}

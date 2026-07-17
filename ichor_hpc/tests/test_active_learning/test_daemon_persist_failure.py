@@ -1,4 +1,4 @@
-"""M15 F2 tests: persist-before-journal ordering + idempotent _inline_append
+"""Persist-before-journal and idempotent reference-commit tests
 under simulated _persist failures.
 
 The contract enforced here:
@@ -52,7 +52,14 @@ def _prepare_bootstrap(ex, state):
         bootstrap_state,
         CampaignPhase.INITIAL_ALLOCATION_CHECK,
     )
-    assert result.next_phase_override == CampaignPhase.INITIAL_FEREBUS.value
+    assert result.next_phase_override == CampaignPhase.REFERENCE_COMMIT.value
+    committed = ex.submit_or_run(
+        bootstrap_state,
+        CampaignPhase.REFERENCE_COMMIT,
+    )
+    bootstrap_state.reference_data_version = int(
+        committed.state_updates["reference_data_version"]
+    )
     ex.postprocess(bootstrap_state, CampaignPhase.INITIAL_FEREBUS, observations=[])
 
 
@@ -100,42 +107,42 @@ def _prepare_active_quantum_allocation(ex, state):
     prepare_dry_submitted_phase(ex, state, CampaignPhase.AIMALL)
     ex.postprocess(state, CampaignPhase.AIMALL, observations=[])
     result = ex.submit_or_run(state, CampaignPhase.ALLOCATION_CHECK)
-    assert result.next_phase_override == CampaignPhase.APPEND.value
+    assert result.next_phase_override == CampaignPhase.REFERENCE_COMMIT.value
 
 
-def test_inline_append_idempotent_when_next_version_already_committed(tmp_path):
+def test_inline_reference_commit_idempotent_when_version_already_committed(tmp_path):
     """If state.reference_data_version + 1 is already a committed iteration
     (e.g. we crashed between commit and _persist on the previous run), the
-    re-run of APPEND must be a no-op rather than producing a duplicate
+    re-run of REFERENCE_COMMIT must be a no-op rather than producing a duplicate
     iteration directory."""
     ex = _make_executor(tmp_path)
     state = _active_state()
     _prepare_bootstrap(ex, state)
-    # First APPEND: commits version 1.
+    # First REFERENCE_COMMIT publishes version 1.
     _prepare_active_quantum_allocation(ex, state)
-    result1 = ex.submit_or_run(state, CampaignPhase.APPEND)
+    result1 = ex.submit_or_run(state, CampaignPhase.REFERENCE_COMMIT)
     assert result1.state_updates["reference_data_version"] == 1
 
     v = VersionedDirectory(tmp_path / "campaign" / "QM_REFERENCE_DATA")
     assert sorted(v.list_committed_versions()) == [0, 1]
 
     # Simulate "crash after commit, before _persist updated state". The
-    # state still reports reference_data_version=0; the same APPEND call
+    # state still reports reference_data_version=0; the same commit call
     # must NOT produce iteration-000002 because version 1 already exists.
-    result2 = ex.submit_or_run(state, CampaignPhase.APPEND)
+    result2 = ex.submit_or_run(state, CampaignPhase.REFERENCE_COMMIT)
     assert result2.state_updates["reference_data_version"] == 1
     assert sorted(v.list_committed_versions()) == [0, 1]
     assert v.current_version() == 1
 
 
-def test_inline_append_idempotent_skip_journals_clearly(tmp_path):
+def test_inline_reference_commit_idempotent_skip_journals_clearly(tmp_path):
     ex = _make_executor(tmp_path)
     state = _active_state()
     _prepare_bootstrap(ex, state)
     _prepare_active_quantum_allocation(ex, state)
-    ex.submit_or_run(state, CampaignPhase.APPEND)
+    ex.submit_or_run(state, CampaignPhase.REFERENCE_COMMIT)
     # Second call should land an idempotent_skip=True in the journal.
-    ex.submit_or_run(state, CampaignPhase.APPEND)
+    ex.submit_or_run(state, CampaignPhase.REFERENCE_COMMIT)
     journal_path = tmp_path / "campaign" / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson"
     events = [
         json.loads(line)
@@ -146,27 +153,27 @@ def test_inline_append_idempotent_skip_journals_clearly(tmp_path):
     assert any(e.get("idempotent_skip") is True for e in commits)
 
 
-def test_inline_append_idempotent_skip_repairs_current_pointer(tmp_path):
+def test_inline_reference_commit_idempotent_skip_repairs_current_pointer(tmp_path):
     ex = _make_executor(tmp_path)
     state = _active_state()
     _prepare_bootstrap(ex, state)
     _prepare_active_quantum_allocation(ex, state)
-    ex.submit_or_run(state, CampaignPhase.APPEND)
+    ex.submit_or_run(state, CampaignPhase.REFERENCE_COMMIT)
 
     v = VersionedDirectory(tmp_path / "campaign" / "QM_REFERENCE_DATA")
     v.update_current(0)
     assert v.current_version() == 0
 
-    ex.submit_or_run(state, CampaignPhase.APPEND)
+    ex.submit_or_run(state, CampaignPhase.REFERENCE_COMMIT)
     assert v.current_version() == 1
 
 
-def test_inline_append_idempotent_skip_rejects_mismatched_allocation(tmp_path):
+def test_inline_reference_commit_rejects_mismatched_allocation(tmp_path):
     ex = _make_executor(tmp_path)
     state = _active_state()
     _prepare_bootstrap(ex, state)
     _prepare_active_quantum_allocation(ex, state)
-    ex.submit_or_run(state, CampaignPhase.APPEND)
+    ex.submit_or_run(state, CampaignPhase.REFERENCE_COMMIT)
 
     snapshot = (
         tmp_path
@@ -182,13 +189,15 @@ def test_inline_append_idempotent_skip_rejects_mismatched_allocation(tmp_path):
 
     with pytest.raises(
         BackendSubmissionError,
-        match="reference-data APPEND transaction failed",
+        match="reference-data commit transaction failed",
     ):
-        ex.submit_or_run(state, CampaignPhase.APPEND)
+        ex.submit_or_run(state, CampaignPhase.REFERENCE_COMMIT)
 
 
-def test_initial_training_idempotent_skip_repairs_current_pointer(tmp_path):
-    from ichor.hpc.active_learning.daemon.input_staging import commit_initial_reference_data
+def test_bootstrap_reference_commit_idempotent_skip_repairs_current_pointer(tmp_path):
+    from ichor.hpc.active_learning.daemon.input_staging import (
+        commit_reference_data_delta,
+    )
 
     ex = _make_executor(tmp_path)
     campaign = ex.campaign_dir
@@ -199,13 +208,23 @@ def test_initial_training_idempotent_skip_repairs_current_pointer(tmp_path):
     prepare_dry_submitted_phase(ex, state, CampaignPhase.INITIAL_AIMALL)
     ex.postprocess(state, CampaignPhase.INITIAL_AIMALL, observations=[])
     v = VersionedDirectory(campaign / "QM_REFERENCE_DATA")
-    assert commit_initial_reference_data(campaign) is True
+    assert commit_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )[2] is True
     for pointer in (v.current_link_path(), v._pointer_path()):
         if pointer.is_symlink() or pointer.is_file():
             pointer.unlink()
     assert v.current_version() is None
 
-    assert commit_initial_reference_data(campaign) is False
+    assert commit_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )[2] is False
     assert v.current_version() == 0
 
 
@@ -222,8 +241,10 @@ def test_dry_ferebus_idempotent_skip_repairs_model_current_pointer(tmp_path):
         SimpleNamespace(iteration=0, campaign_uid="uid", reference_data_version=-1),
     )
     _prepare_active_quantum_allocation(ex, state)
-    appended = ex.submit_or_run(state, CampaignPhase.APPEND)
-    state.reference_data_version = int(appended.state_updates["reference_data_version"])
+    committed = ex.submit_or_run(state, CampaignPhase.REFERENCE_COMMIT)
+    state.reference_data_version = int(
+        committed.state_updates["reference_data_version"]
+    )
 
     first = ex.postprocess(state, CampaignPhase.FEREBUS, observations=[])
     assert first.state_updates["models_version"] == 1

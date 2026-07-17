@@ -7,6 +7,7 @@ import shutil
 from pathlib import Path
 from typing import Iterable
 
+from ..strict_json import load_path
 from ..layout import parse_staging_pointdir_name
 from .filesystem import campaign_owned_path
 
@@ -86,6 +87,20 @@ def prepare_quantum_task(
         stale_files.extend(root.glob("*.gaussianoutput"))
         stale_files.extend(root.glob("*.wfn"))
     _remove_files(stale_files)
+    if selected_backend == "aimall":
+        task_path = root / "AIMALL_TASK.json"
+        if task_path.is_file() and not task_path.is_symlink():
+            task = load_path(task_path)
+            binding = task.get("ferebus_row_shard") if isinstance(task, dict) else None
+            if isinstance(binding, dict):
+                relative = Path(str(binding.get("directory") or ""))
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise ValueError("FEREBUS row-shard directory escapes the campaign")
+                shard = campaign_owned_path(campaign, campaign / relative)
+                if shard.exists():
+                    if shard.is_symlink() or not shard.is_dir():
+                        raise ValueError("stale FEREBUS row shard is not a regular directory")
+                    shutil.rmtree(shard)
 
 
 def main(argv=None) -> int:

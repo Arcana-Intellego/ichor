@@ -92,6 +92,17 @@ def _select(ex, *, iteration=1):
             ex, bootstrap_state, CampaignPhase.INITIAL_AIMALL
         )
         ex._post_initial_aimall(bootstrap_state)
+        ex.submit_or_run(
+            bootstrap_state,
+            CampaignPhase.INITIAL_ALLOCATION_CHECK,
+        )
+        committed = ex.submit_or_run(
+            bootstrap_state,
+            CampaignPhase.REFERENCE_COMMIT,
+        )
+        bootstrap_state.reference_data_version = int(
+            committed.state_updates["reference_data_version"]
+        )
         ex._post_initial_ferebus(bootstrap_state)
     state = _active_state(iteration)
     return state, ex.submit_or_run(state, CampaignPhase.SEED_SELECT)

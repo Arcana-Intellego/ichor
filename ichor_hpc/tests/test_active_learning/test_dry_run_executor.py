@@ -119,7 +119,9 @@ def _complete_bootstrap(e):
     _submit_dry_phase(e, state, CampaignPhase.INITIAL_AIMALL)
     e.postprocess(state, CampaignPhase.INITIAL_AIMALL, observations=[])
     check = e.submit_or_run(state, CampaignPhase.INITIAL_ALLOCATION_CHECK)
-    assert check.next_phase_override == CampaignPhase.INITIAL_FEREBUS.value
+    assert check.next_phase_override == CampaignPhase.REFERENCE_COMMIT.value
+    commit = e.submit_or_run(state, CampaignPhase.REFERENCE_COMMIT)
+    state.reference_data_version = commit.state_updates["reference_data_version"]
     _submit_dry_phase(e, state, CampaignPhase.INITIAL_FEREBUS)
     e.postprocess(state, CampaignPhase.INITIAL_FEREBUS, observations=[])
     return state
@@ -141,7 +143,7 @@ def _complete_active_quantum(e, *, iteration=1):
     _submit_dry_phase(e, state, CampaignPhase.AIMALL)
     e.postprocess(state, CampaignPhase.AIMALL, observations=[])
     check = e.submit_or_run(state, CampaignPhase.ALLOCATION_CHECK)
-    assert check.next_phase_override == CampaignPhase.APPEND.value
+    assert check.next_phase_override == CampaignPhase.REFERENCE_COMMIT.value
     return state
 
 
@@ -250,11 +252,11 @@ def test_phase_b_diversity_postprocess_writes_sample_xyz(tmp_path):
     assert manifest["descriptor"] == "hybrid_alf_rmsd"
 
 
-def test_append_inline_stages_and_commits_next_training_iteration(tmp_path):
+def test_reference_commit_inline_commits_next_training_iteration(tmp_path):
     e = _make_exec(tmp_path)
     _complete_bootstrap(e)
     state = _complete_active_quantum(e)
-    e.submit_or_run(state, CampaignPhase.APPEND)
+    e.submit_or_run(state, CampaignPhase.REFERENCE_COMMIT)
     v = VersionedDirectory(tmp_path / "campaign" / "QM_REFERENCE_DATA")
     assert sorted(v.list_committed_versions()) == [0, 1]
     assert v.current_version() == 1
@@ -264,8 +266,8 @@ def test_ferebus_postprocess_commits_next_models_iteration(tmp_path):
     e = _make_exec(tmp_path)
     _complete_bootstrap(e)
     state = _complete_active_quantum(e)
-    append = e.submit_or_run(state, CampaignPhase.APPEND)
-    state.reference_data_version = append.state_updates["reference_data_version"]
+    commit = e.submit_or_run(state, CampaignPhase.REFERENCE_COMMIT)
+    state.reference_data_version = commit.state_updates["reference_data_version"]
     _submit_dry_phase(e, state, CampaignPhase.FEREBUS)
     e.postprocess(state, CampaignPhase.FEREBUS, observations=[])
     v = VersionedDirectory(tmp_path / "campaign" / "TRAINED_MODELS")
@@ -342,7 +344,7 @@ def test_active_allocation_replaces_failed_candidate_from_finite_reserve(tmp_pat
         "int_val": 1,
         "ext_val": 0,
     }
-    assert complete.next_phase_override == CampaignPhase.APPEND.value
+    assert complete.next_phase_override == CampaignPhase.REFERENCE_COMMIT.value
     assert complete.state_updates == {"replacement_round": 0}
 
 

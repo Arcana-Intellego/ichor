@@ -342,6 +342,13 @@ def test_seed_selection_bulk_fraction_consumed_by_executor(tmp_path):
         observations=[],
     )
     ex.submit_or_run(bootstrap_state, CampaignPhase.INITIAL_ALLOCATION_CHECK)
+    committed = ex.submit_or_run(
+        bootstrap_state,
+        CampaignPhase.REFERENCE_COMMIT,
+    )
+    bootstrap_state.reference_data_version = int(
+        committed.state_updates["reference_data_version"]
+    )
     ex.postprocess(
         bootstrap_state,
         CampaignPhase.INITIAL_FEREBUS,

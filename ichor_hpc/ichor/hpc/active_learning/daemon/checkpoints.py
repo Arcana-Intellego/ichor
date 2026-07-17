@@ -38,6 +38,7 @@ _EXCLUDED_DIRECTORY_PARTS = {
     "__pycache__",
 }
 _EXCLUDED_OPERATIONAL_PREFIXES = (
+    (".DATA", "CACHE"),
     (".DATA", "SCRATCH"),
     (".DATA", "SCRATCH_CLEANUP"),
     (".DATA", "STAGING"),
@@ -555,7 +556,7 @@ def restore_checkpoint(
         }
     if target.exists():
         target.rmdir()
-    temporary = target.with_name(target.name + ".restore." + uuid.uuid4().hex)
+    temporary = target.with_name(".restore-" + uuid.uuid4().hex[:12])
     temporary.mkdir(parents=False, exist_ok=False)
     try:
         manifest = verified["manifest"]
@@ -592,7 +593,30 @@ def restore_checkpoint(
             temporary,
             expected_campaign_uid=str(restored_state.campaign_uid),
         )
+        if int(restored_state.reference_data_version) >= 0:
+            from .quantum_acceptance_receipts import (
+                restore_sealed_pointdir_permissions,
+            )
+            from ..versioning.reference_data import ReferenceDataVersioning
+
+            reference_versioning = ReferenceDataVersioning(
+                temporary / "QM_REFERENCE_DATA"
+            )
+            reference_index = reference_versioning.resolve(
+                int(restored_state.reference_data_version),
+                verification="index",
+            )
+            for entry in reference_index.entries:
+                restore_sealed_pointdir_permissions(entry.pointdir_path)
         verify_state_referenced_artifacts(temporary, restored_state, strict_models=True)
+        if int(restored_state.reference_data_version) >= 0:
+            from .ferebus_row_cache import ensure_cumulative_row_caches
+
+            reference_view = reference_versioning.resolve(
+                int(restored_state.reference_data_version),
+                verification="metadata",
+            )
+            ensure_cumulative_row_caches(temporary, reference_view)
         os.replace(temporary, target)
         _fsync_directory(target.parent)
     except Exception:

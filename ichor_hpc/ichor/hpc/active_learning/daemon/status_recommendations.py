@@ -132,7 +132,7 @@ def _artifact_problem(payload: Dict[str, Any]) -> bool:
         CampaignPhase.ALLOCATION_CHECK.value,
         CampaignPhase.REPLACEMENT_GAUSSIAN.value,
         CampaignPhase.REPLACEMENT_AIMALL.value,
-        CampaignPhase.APPEND.value,
+        CampaignPhase.REFERENCE_COMMIT.value,
         CampaignPhase.FEREBUS.value,
         CampaignPhase.STOP_CHECK.value,
         CampaignPhase.DONE.value,
@@ -596,9 +596,9 @@ _PHASE_ACTIONS: Dict[str, tuple[str, str]] = {
         "start the daemon to postprocess the active replacements with AIMAll",
         "the next phase is REPLACEMENT_AIMALL",
     ),
-    CampaignPhase.APPEND.value: (
-        "start the daemon to append accepted AIMAll pointdirs to the QM reference data",
-        "the next phase is APPEND",
+    CampaignPhase.REFERENCE_COMMIT.value: (
+        "start the daemon to publish accepted AIMAll pointdirs and cached FEREBUS rows",
+        "the next phase is REFERENCE_COMMIT",
     ),
     CampaignPhase.FEREBUS.value: (
         "start the daemon to retrain or postprocess FEREBUS models",

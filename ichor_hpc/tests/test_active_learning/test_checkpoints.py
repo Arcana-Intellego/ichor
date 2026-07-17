@@ -28,8 +28,8 @@ def _idle_campaign(tmp_path: Path, monkeypatch) -> Path:
     state = fresh_campaign_state(campaign_uid="abc123")
     state.phase = CampaignPhase.SEED_SELECT
     state.iteration = 1
-    state.reference_data_version = 0
-    state.models_version = 0
+    state.reference_data_version = -1
+    state.models_version = -1
     (campaign / ".DATA" / "ACTIVE_LEARNING").mkdir(parents=True)
     write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
 
@@ -146,6 +146,59 @@ def test_checkpoint_deduplicates_verifies_and_restores(tmp_path, monkeypatch):
         assert checkpoints._sha256_file(restored_path) == record["sha256"]
 
 
+def test_checkpoint_restore_rebuilds_excluded_ferebus_row_cache(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon.ferebus_row_cache import (
+        FEREBUS_ROW_CACHE,
+        read_feature_contract,
+        row_cache_path,
+    )
+    from ichor.hpc.active_learning.daemon.input_staging import (
+        commit_reference_data_delta,
+    )
+    from ichor.hpc.active_learning.daemon.state import read_state
+    from ichor_hpc.tests.test_active_learning.test_reference_data_versioning import (
+        _complete_allocation,
+    )
+
+    campaign = _idle_campaign(tmp_path, monkeypatch)
+    _complete_allocation(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        first_frame_id=0,
+    )
+    commit_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )
+    state_path = campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json"
+    state = read_state(state_path)
+    state.reference_data_version = 0
+    write_state(state_path, state)
+    destination = tmp_path / "checkpoint-store"
+    destination.mkdir()
+
+    created = checkpoints.create_checkpoint(campaign, destination)
+    assert not any(
+        item["path"].startswith(".DATA/CACHE/")
+        for item in created["manifest"]["files"]
+    )
+    target = tmp_path / "restored"
+    checkpoints.restore_checkpoint(created["checkpoint"], target, apply=True)
+
+    contract = read_feature_contract(target)
+    cache_manifest = (
+        row_cache_path(target, str(contract["contract_sha256"]), 0)
+        / FEREBUS_ROW_CACHE
+    )
+    assert cache_manifest.is_file()
+
+
 def test_checkpoint_rejects_corrupt_object(tmp_path, monkeypatch):
     campaign = _idle_campaign(tmp_path, monkeypatch)
     destination = tmp_path / "checkpoint-store"
@@ -213,7 +266,9 @@ def test_checkpoint_restore_publication_failure_leaves_no_partial_target(
     real_replace = checkpoints.os.replace
 
     def fail_restore_publication(source, destination_path):
-        if Path(destination_path) == target and ".restore." in Path(source).name:
+        if Path(destination_path) == target and Path(source).name.startswith(
+            ".restore-"
+        ):
             raise OSError("injected restore publication failure")
         return real_replace(source, destination_path)
 
@@ -226,7 +281,7 @@ def test_checkpoint_restore_publication_failure_leaves_no_partial_target(
         )
 
     assert not target.exists()
-    assert not list(tmp_path.glob("restored.restore.*"))
+    assert not list(tmp_path.glob(".restore-*"))
 
 
 def test_checkpoint_source_symlink_is_rejected(tmp_path, monkeypatch):

@@ -6,10 +6,11 @@ import os
 import platform
 import re
 import shutil
+import stat
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Mapping, Optional
 
 from .manifest import (
     compute_directory_manifest,
@@ -208,6 +209,76 @@ class VersionedDirectory:
 
         _fsync_parent_dir(target)
         return manifest
+
+    def commit_prehashed(
+        self,
+        target_version: int,
+        *,
+        manifest: Mapping[str, str],
+        expected_sizes: Mapping[str, int],
+    ) -> Dict[str, str]:
+        """Publish a staging tree using trusted producer hashes.
+
+        This path deliberately validates exact paths, regular-file types and
+        sizes without reading payload bytes. It is reserved for sealed quantum
+        pointdirs whose hashes were frozen by acceptance receipts.
+        """
+        staging = self.staging_path(target_version)
+        target = self.iteration_path(target_version)
+        if target.exists() or target.is_symlink():
+            raise FileExistsError("prehashed commit target already exists: " + str(target))
+        if not staging.is_dir() or staging.is_symlink():
+            raise FileNotFoundError("no regular staging directory to commit: " + str(staging))
+        expected = {str(key): str(value) for key, value in manifest.items()}
+        sizes = {str(key): int(value) for key, value in expected_sizes.items()}
+        if set(expected) != set(sizes):
+            raise ValueError("prehashed manifest paths and size paths differ")
+        actual_sizes: Dict[str, int] = {}
+        for path in sorted(staging.rglob("*")):
+            if path.is_symlink():
+                raise ValueError("prehashed staging contains a symlink: " + str(path))
+            relative_path = path.relative_to(staging)
+            path_stat = path.stat()
+            inside_sealed_pointdir = bool(
+                relative_path.parts
+                and relative_path.parts[0].endswith(".pointdir")
+            )
+            if inside_sealed_pointdir and stat.S_IMODE(path_stat.st_mode) & (
+                stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
+            ):
+                raise ValueError(
+                    "prehashed pointdir entry is writable: " + str(path)
+                )
+            if path.is_dir():
+                continue
+            if not path.is_file():
+                raise ValueError("prehashed staging contains a special file: " + str(path))
+            if path.name == ".manifest.json":
+                continue
+            relative = relative_path.as_posix()
+            actual_sizes[relative] = int(path_stat.st_size)
+        if actual_sizes != sizes:
+            missing = sorted(set(sizes) - set(actual_sizes))
+            unexpected = sorted(set(actual_sizes) - set(sizes))
+            wrong_sizes = sorted(
+                key
+                for key in set(actual_sizes) & set(sizes)
+                if actual_sizes[key] != sizes[key]
+            )
+            raise ValueError(
+                "prehashed staging inventory mismatch: missing="
+                + repr(missing[:5])
+                + " unexpected="
+                + repr(unexpected[:5])
+                + " wrong_sizes="
+                + repr(wrong_sizes[:5])
+            )
+        write_manifest(staging, expected)
+        os.replace(str(staging), str(target))
+        from ..daemon.state import _fsync_parent_dir
+
+        _fsync_parent_dir(target)
+        return dict(expected)
 
     def update_current(self, target_version: int) -> None:
         target = self.iteration_path(target_version)

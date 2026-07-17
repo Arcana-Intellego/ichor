@@ -2,9 +2,14 @@
 # dry-run campaign. Timestamps and JobIDs in your run will differ;
 # the event sequence + payload shape should match.
 
-{"event": "phase_transition", "from_phase": "AIMALL", "iteration": 2, "to_phase": "APPEND", ...}
+{"event": "phase_transition", "from_phase": "AIMALL", "iteration": 2, "to_phase": "REFERENCE_COMMIT", ...}
+{"event": "reference_commit_started", "iteration": 2, ...}
+{"event": "reference_commit_move_progress", "complete": true, "iteration": 2, ...}
+{"event": "reference_commit_shard_progress", "processed_points": 2, "total_points": 2, ...}
+{"event": "reference_commit_cache_complete", "iteration": 2, ...}
+{"event": "reference_commit_published", "iteration": 2, ...}
 {"event": "reference_data_committed", "iteration": 2, "n_committed_points": 2, "reference_data_version": 2, ...}
-{"event": "phase_transition", "from_phase": "APPEND", "iteration": 2, "to_phase": "FEREBUS", ...}
+{"event": "phase_transition", "from_phase": "REFERENCE_COMMIT", "iteration": 2, "to_phase": "FEREBUS", ...}
 {"event": "sbatch", "iteration": 2, "job_id": "DRYRUN-FEREBUS-2", "phase": "FEREBUS", ...}
 {"event": "phase_succeeded", "iteration": 2, "n_completed": 1, "n_failed": 0, "n_tasks": 1, "phase": "FEREBUS", ...}
 {"event": "phase_transition", "from_phase": "FEREBUS", "iteration": 2, "to_phase": "STOP_CHECK", ...}

@@ -1,8 +1,4 @@
-"""FEREBUS staging orchestration with the cluster-only PointsDirectory export stubbed.
-
-The daemon stages pyferebus's flat property directories, a pyferebus job-details file, and a
-strict daemon manifest. pyferebus itself later moves the CSVs into per-atom datasets folders.
-"""
+"""FEREBUS staging orchestration from immutable reference-row caches."""
 import csv
 import hashlib
 import json
@@ -47,34 +43,11 @@ def test_native_ferebus_rejects_diatomic_alf_before_csv_generation():
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "live_outputs"
 
 
-class _FakePointsDirectory(list):
-    """stand-in for the real PointsDirectory: instead of reading AIMAll .int files it just emits a
-    known per-atom feature/iqa csv (the iqa scale differs per element, as it really would)."""
-    def __init__(self, path, needs_parsing=True):
-        super().__init__()
-        self._path = path
-        self.path = path
+class _ForbiddenPointsDirectory:
+    """Fail if FEREBUS staging reparses committed pointdirs."""
 
-    def alf_dict(self, _calc):
-        return {"O1": (0, 1, 2), "H2": (1, 0, 2), "H3": (2, 0, 1)}
-
-    def features_with_properties_to_csv(self, _alf, str_to_append_to_fname="_train.csv",
-                                        property_types=None):
-        # stage_ferebus_inputs has chdir'd into the staging dir, so a bare filename lands there.
-        properties = [str(value) for value in (property_types or ["iqa"])]
-        for atom, base in (("O1", -75.0), ("H2", -0.5), ("H3", -0.5)):
-            with open(atom + str_to_append_to_fname, "w", encoding="utf-8", newline="\n") as f:
-                f.write("f1,f2,f3," + ",".join(properties) + "\n")
-                for i in range(len(self)):
-                    values = {
-                        "iqa": base - i * 0.01,
-                        "q00": 0.2 + i * 0.001,
-                    }
-                    f.write(
-                        f"{i + 0.1},{i + 0.2},{i + 0.3},"
-                        + ",".join(str(values[prop]) for prop in properties)
-                        + "\n"
-                    )
+    def __init__(self, *_args, **_kwargs):
+        raise AssertionError("FEREBUS staging reparsed committed pointdirs")
 
 
 def _prepare_bootstrap_training(
@@ -90,6 +63,8 @@ def _prepare_bootstrap_training(
         cfg.point_allocation.bootstrap_training_size = int(n_train)
     cfg.point_allocation.bootstrap_internal_validation_size = int(n_int_val)
     cfg.point_allocation.bootstrap_external_validation_size = int(n_ext_val)
+    campaign.mkdir(parents=True, exist_ok=True)
+    cfg.to_yaml(campaign / "campaign.yaml")
     n_total = int(n_train) + int(n_int_val) + int(n_ext_val)
     targets = {
         "train": int(n_train),
@@ -177,9 +152,7 @@ def _prepare_bootstrap_training(
 
 def test_stage_ferebus_inputs_orchestration(tmp_path, monkeypatch):
     campaign = tmp_path / "c"
-    # stub only the cluster-only export. the function does `from ichor.core.files import
-    # PointsDirectory` at call time, so patching the module attribute takes effect.
-    monkeypatch.setattr(core_files, "PointsDirectory", _FakePointsDirectory)
+    monkeypatch.setattr(core_files, "PointsDirectory", _ForbiddenPointsDirectory)
 
     cfg = CampaignConfig()
     cfg.system_name = "WATER"
@@ -189,7 +162,6 @@ def test_stage_ferebus_inputs_orchestration(tmp_path, monkeypatch):
         campaign,
         cfg,
         reference_data_version=0,
-        is_initial=False,
     )
 
     assert n_tasks == 6
@@ -213,7 +185,9 @@ def test_stage_ferebus_inputs_orchestration(tmp_path, monkeypatch):
     assert manifest["pointdir_row_order"] == [
         "POINT_" + str(i).zfill(6) + ".pointdir" for i in range(20)
     ]
-    assert manifest["degenerate_property_stats"] == []
+    # The shared strict quantum fixture intentionally repeats one finite row;
+    # staging must retain all six tasks and flag the floored statistics.
+    assert len(manifest["degenerate_property_stats"]) == 6
     assert {task["property"] for task in manifest["tasks"]} == {"iqa", "q00"}
     assert {
         tuple(task["row_counts"][key] for key in ("train", "int_val", "ext_val"))
@@ -231,6 +205,38 @@ def test_stage_ferebus_inputs_orchestration(tmp_path, monkeypatch):
     assert not list(staging.glob("ferebus_*.toml"))
     # the transient scratch csvs do not survive into the staging dir
     assert not list(staging.glob("*_normalised_for_split.csv"))
+
+
+def test_stage_ferebus_inputs_never_repairs_missing_row_cache(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon.ferebus_row_cache import (
+        FEREBUS_ROW_CACHE,
+        read_feature_contract,
+        row_cache_path,
+    )
+
+    campaign = tmp_path / "c"
+    config = CampaignConfig()
+    config.system_name = "WATER"
+    _prepare_bootstrap_training(campaign, config)
+    contract = read_feature_contract(campaign)
+    cache_manifest = (
+        row_cache_path(campaign, str(contract["contract_sha256"]), 0)
+        / FEREBUS_ROW_CACHE
+    )
+    cache_manifest.unlink()
+    monkeypatch.setattr(core_files, "PointsDirectory", _ForbiddenPointsDirectory)
+
+    with pytest.raises(ValueError, match="FEREBUS row cache is missing or invalid"):
+        stg.stage_ferebus_inputs(
+            campaign,
+            config,
+            reference_data_version=0,
+        )
+
+    assert not cache_manifest.exists()
 
 
 def test_model_bootstrap_stages_exact_historical_training_prefix(
@@ -350,13 +356,12 @@ def test_model_bootstrap_stages_exact_historical_training_prefix(
         n_int_val=2,
         n_ext_val=2,
     )
-    monkeypatch.setattr(core_files, "PointsDirectory", _FakePointsDirectory)
+    monkeypatch.setattr(core_files, "PointsDirectory", _ForbiddenPointsDirectory)
 
     staging, n_tasks = stg.stage_ferebus_inputs(
         campaign,
         cfg,
         reference_data_version=0,
-        is_initial=False,
     )
     manifest = stg.prepare_imported_model_bootstrap(staging)
 
@@ -425,13 +430,12 @@ def test_stage_ferebus_inputs_clears_stale_models(tmp_path, monkeypatch):
     staging.mkdir(parents=True)
     (staging / "STALE.model").write_text("old model from a previous iteration", encoding="utf-8")
     (staging / "Zz9_train.csv").write_text("f1,iqa\n0.1,-1.0\n", encoding="utf-8")
-    monkeypatch.setattr(core_files, "PointsDirectory", _FakePointsDirectory)
+    monkeypatch.setattr(core_files, "PointsDirectory", _ForbiddenPointsDirectory)
 
     stg.stage_ferebus_inputs(
         campaign,
         cfg,
         reference_data_version=0,
-        is_initial=False,
     )
 
     assert not (staging / "STALE.model").exists()
@@ -447,14 +451,13 @@ def test_stage_ferebus_inputs_rejects_unmanifested_committed_pointdir(tmp_path, 
     rogue = training_dir / "POINT_9999.pointdir"
     rogue.mkdir(parents=True)
     (rogue / "input.gjf").write_text("%chk=x\n", encoding="utf-8")
-    monkeypatch.setattr(core_files, "PointsDirectory", _FakePointsDirectory)
+    monkeypatch.setattr(core_files, "PointsDirectory", _ForbiddenPointsDirectory)
 
     try:
         stg.stage_ferebus_inputs(
             campaign,
             cfg,
             reference_data_version=0,
-            is_initial=False,
         )
     except ManifestMismatchError:
         pass

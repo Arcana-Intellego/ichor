@@ -220,7 +220,7 @@ def _write_xyz_file(frames, path):
 
     Format: atom-count line, comment line, then one atom per line. The
     same writer covers both Phase A
-    (consumed by the daemon parser) and Phase B (consumed by APPEND).
+    (consumed by the daemon parser) and Phase B (consumed by REFERENCE_COMMIT).
     """
     out_lines = []
     for k, frame in enumerate(frames):
@@ -279,7 +279,7 @@ def _load_committed_reference_data(campaign_dir):
     cur = v.current_version()
     if cur is None:
         return []
-    view = v.resolve(int(cur), verification="metadata")
+    view = v.resolve(int(cur), verification="index")
     atoms_list = []
     for entry in view.entries:
         try:

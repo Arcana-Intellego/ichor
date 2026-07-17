@@ -13,7 +13,7 @@ In parallel, an append-only flat index lives at
 
 so the daemon's SEED_SELECT phase can compute "frames already seeded into
 the QM reference data" in O(1) reads rather than O(n) sidecar scans. The fast
-index is updated incrementally on every APPEND (a few records per
+index is updated incrementally on every REFERENCE_COMMIT (a few records per
 iteration), atomically via tempfile + os.replace.
 
 every sidecar JSON pins back to the campaign uid + iteration, so a sweep
@@ -793,7 +793,7 @@ def _resolved_reference_entries(reference_data_dir: Union[str, Path]):
     current = versioning.current_version()
     if current is None:
         return ()
-    return versioning.resolve(current, verification="metadata").entries
+    return versioning.resolve(current, verification="index").entries
 
 
 def seed_frame_ids_from_committed_pointdirs(

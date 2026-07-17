@@ -18,7 +18,8 @@ from __future__ import annotations
 
 from ..strict_json import strict_json as json
 import csv
-import os  # stage_ferebus_inputs cd's into the staging dir to export csvs; this was missing and only bit on a live run
+import os
+import platform
 import re
 import shutil
 import hashlib
@@ -26,6 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
+import pandas as pd
 
 from ichor.core.atoms import Atoms
 from ichor.core.files import PointDirectory, WFN
@@ -36,10 +38,14 @@ from .resource_solver import (
     wfn_primitive_count,
 )
 from .filesystem import campaign_owned_path
-from .state import atomic_write_json, atomic_write_text
+from .state import (
+    _fsync_file_descriptor,
+    _fsync_parent_dir,
+    atomic_write_json,
+    atomic_write_text,
+)
 from ..config import normalise_gaussian_route_keywords
 from ..layout import (
-    COMMITTED_VERSION_NAME_WIDTH,
     TRAINED_MODELS_DIRNAME,
     parse_staging_pointdir_name,
     staging_pointdir_name,
@@ -59,7 +65,7 @@ WFN_METHOD_RECEIPT_SCHEMA_VERSION = 1
 FEREBUS_TASK_MANIFEST = "FEREBUS_TASKS.json"
 FEREBUS_TASK_SCHEMA_VERSION = 5
 FEREBUS_ROW_IDENTITIES = "FEREBUS_ROW_IDENTITIES.json"
-FEREBUS_ROW_IDENTITIES_SCHEMA_VERSION = 1
+FEREBUS_ROW_IDENTITIES_SCHEMA_VERSION = 2
 FEREBUS_SPLIT_SNAPSHOT = "FEREBUS_SPLIT_ASSIGNMENTS.json"
 FEREBUS_JOB_DETAILS = "job-details"
 SAFE_PATH_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -211,11 +217,6 @@ def _reject_symlink_tree(root: Path) -> None:
     for child in root.rglob("*"):
         if child.is_symlink():
             raise ValueError("refusing to copy tree containing symlink: " + str(child))
-
-
-def _copytree_no_symlinks(src: Path, dest: Path) -> None:
-    _reject_symlink_tree(Path(src))
-    shutil.copytree(str(src), str(dest), symlinks=False)
 
 
 def _copy_atomic_checked_file(source: Path, destination: Path) -> None:
@@ -436,19 +437,6 @@ def read_quantum_acceptance_manifest(
         record["pointdir"]: record["reason"] for record in normalised_rejected
     }
     return resolved, out
-
-
-def hash_pointdir_tree(pointdir: Path) -> str:
-    root = Path(pointdir)
-    _reject_symlink_tree(root)
-    digest = hashlib.sha256()
-    for path in sorted((p for p in root.rglob("*") if p.is_file()), key=lambda p: str(p.relative_to(root))):
-        rel = str(path.relative_to(root)).replace("\\", "/")
-        digest.update(rel.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
-    return digest.hexdigest()
 
 
 def ferebus_manifest_path(staging_dir: Path) -> Path:
@@ -1520,6 +1508,14 @@ def stage_aimall_inputs(
     if not pointdirs:
         write_points_file(staging, [])
         return staging, 0
+    from .ferebus_row_cache import ensure_feature_contract, feature_contract_path
+
+    feature_contract = ensure_feature_contract(
+        Path(campaign_dir),
+        config,
+        pointdirs[0],
+    )
+    feature_contract_file = feature_contract_path(Path(campaign_dir))
     gaussian_task_names = _points_file_names(staging)
     acceptance_sha256 = sha256_file(staging / QUANTUM_ACCEPTANCE_MANIFEST)
     dimensions = []
@@ -1641,6 +1637,22 @@ def stage_aimall_inputs(
                 "resource_resolution": aimall_resources.journal_payload(
                     phase_name=str(phase_name)
                 ),
+                "ferebus_feature_contract": {
+                    "path": feature_contract_file.resolve().relative_to(
+                        Path(campaign_dir).resolve()
+                    ).as_posix(),
+                    "contract_sha256": str(feature_contract["contract_sha256"]),
+                    "file_sha256": sha256_file(feature_contract_file),
+                },
+                "ferebus_row_shard": {
+                    "directory": (
+                        staging
+                        / "ferebus_row_shards"
+                        / (pointdir.name + ".row-shard")
+                    ).resolve(strict=False).relative_to(
+                        Path(campaign_dir).resolve()
+                    ).as_posix(),
+                },
             },
         )
     return staging, len(pointdirs)
@@ -1981,363 +1993,24 @@ def accepted_allocation_pointdirs(
     return pointdirs, allocation
 
 
-def verify_committed_allocation_snapshot(
-    campaign_dir: Path,
-    *,
-    reference_data_version: int,
-    context: str,
-    iteration: int,
-) -> Dict[str, Any]:
-    """Prove that a committed delta reproduces one completed allocation."""
-    from ..point_allocation import accepted_attempts, point_allocation_path, read_point_allocation
-    from ..versioning.reference_data import ReferenceDataVersioning
-
-    campaign = Path(campaign_dir)
-    version = int(reference_data_version)
-    versioning = ReferenceDataVersioning(campaign / "QM_REFERENCE_DATA")
-    source_path = point_allocation_path(
-        campaign,
-        context=str(context),
-        iteration=int(iteration),
-    )
-    source = read_point_allocation(source_path)
-    if not bool((source.get("summary") or {}).get("complete", False)):
-        raise ValueError("committed allocation source is incomplete: " + str(source_path))
-    committed_dir = versioning.iteration_path(version)
-    snapshot_path = committed_dir / (
-        "POINT_ALLOCATION.version-"
-        + str(version).zfill(COMMITTED_VERSION_NAME_WIDTH)
-        + ".json"
-    )
-    if not snapshot_path.is_file() or snapshot_path.is_symlink():
-        raise FileNotFoundError(
-            "committed reference-data version lacks its allocation snapshot: "
-            + str(snapshot_path)
-        )
-    view = versioning.resolve(version, verification="deep")
-    try:
-        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise ValueError(
-            "committed allocation snapshot is unreadable: " + str(snapshot_path)
-        ) from exc
-    if snapshot != source:
-        raise ValueError("committed allocation snapshot does not match the source")
-    expected = {
-        str(record["candidate_id"]): (int(record["slot_id"]), str(record["split"]))
-        for record in accepted_attempts(source)
-    }
-    observed = {
-        entry.candidate_id: (entry.slot_id, entry.split)
-        for entry in view.entries
-        if entry.introduced_in_version == version
-    }
-    if observed != expected:
-        raise ValueError(
-            "committed reference-data delta does not reproduce allocation provenance"
-        )
-    return source
-
-
 def commit_reference_data_delta(
     campaign_dir: Path,
     *,
     reference_data_version: int,
     context: str,
     iteration: int,
+    progress_callback=None,
 ) -> Tuple[Any, List[str], bool]:
-    """Commit exactly one immutable QM reference-data delta."""
-    from ..point_allocation import (
-        accepted_attempts,
-        allocation_manifest_sha256,
-        point_allocation_path,
-    )
-    from ..versioning.manifest import sha256_file
-    from ..versioning.provenance import PROVENANCE_FILENAME
-    from ..versioning.reference_data import (
-        POINTDIR_NAME_WIDTH,
-        REFERENCE_DATA_VERSION_FILENAME,
-        ReferenceDataEntry,
-        ReferenceDataVersioning,
-        build_reference_data_version_payload,
-        hash_pointdir_tree as hash_reference_pointdir_tree,
-        seal_reference_data_version,
-    )
+    """Publish one accepted allocation through the transactional move path."""
+    from .reference_commit import commit_reference_data_delta as _commit
 
-    campaign = Path(campaign_dir)
-    version = int(reference_data_version)
-    versioning = ReferenceDataVersioning(campaign / "QM_REFERENCE_DATA")
-    allocation_path = point_allocation_path(
-        campaign,
-        context=str(context),
-        iteration=int(iteration),
-    )
-    committed_versions = versioning.list_committed_versions()
-    if version in committed_versions:
-        verify_committed_allocation_snapshot(
-            campaign,
-            reference_data_version=version,
-            context=str(context),
-            iteration=int(iteration),
-        )
-        view = versioning.resolve(version, verification="deep")
-        seal_reference_data_version(versioning.iteration_path(version))
-        newest_version = max(committed_versions)
-        if newest_version != version:
-            versioning.resolve(newest_version, verification="deep")
-        versioning.ensure_current(newest_version)
-        names = [
-            entry.pointdir_name
-            for entry in view.entries
-            if entry.introduced_in_version == version
-        ]
-        return view, names, False
-    if not allocation_path.is_file():
-        raise FileNotFoundError(
-            "point-allocation manifest missing: " + str(allocation_path)
-        )
-    accepted_pointdirs, allocation = accepted_allocation_pointdirs(
-        campaign,
-        context=str(context),
-        iteration=int(iteration),
-    )
-    attempts = sorted(accepted_attempts(allocation), key=lambda row: int(row["slot_id"]))
-    if len(attempts) != len(accepted_pointdirs):
-        raise ValueError("reference-data allocation/pointdir cardinality mismatch")
-    parent_view = None
-    if version > 0:
-        parent_view = versioning.resolve(version - 1, verification="metadata")
-    elif versioning.list_committed_versions():
-        raise ValueError("reference-data bootstrap is not the first commit")
-    existing_ids = {
-        entry.candidate_id for entry in (parent_view.entries if parent_view else ())
-    }
-    if any(str(attempt["candidate_id"]) in existing_ids for attempt in attempts):
-        raise ValueError("reference-data delta reuses a committed candidate ID")
-
-    versioning.recover_dangling_staging()
-    staging = versioning.stage(source_version=None, target_version=version)
-    first_ordinal = len(parent_view.entries) if parent_view is not None else 0
-    added_entries: List[ReferenceDataEntry] = []
-    added_names: List[str] = []
-    copied_by_source: Dict[str, Path] = {}
-    for offset, (source, attempt) in enumerate(zip(accepted_pointdirs, attempts)):
-        ordinal = first_ordinal + offset
-        name = "POINT_" + str(ordinal).zfill(POINTDIR_NAME_WIDTH) + ".pointdir"
-        destination = staging / name
-        _copytree_no_symlinks(source, destination)
-        from .quantum_acceptance_receipts import read_quantum_acceptance_receipt
-
-        read_quantum_acceptance_receipt(
-            campaign,
-            destination,
-            expected_iteration=int(iteration),
-            expected_candidate_id=str(attempt["candidate_id"]),
-            expected_assignment_sha256=str(allocation["slot_assignment_sha256"]),
-            expected_source_pointdir=source.name,
-        )
-        lock = destination / ".provenance.lock"
-        if lock.exists():
-            lock.unlink()
-        provenance_path = destination / PROVENANCE_FILENAME
-        if not provenance_path.is_file() or provenance_path.is_symlink():
-            raise ValueError("committed reference point lacks provenance: " + str(destination))
-        added_entries.append(
-            ReferenceDataEntry(
-                global_ordinal=int(ordinal),
-                introduced_in_version=version,
-                pointdir_name=name,
-                pointdir_path=destination.resolve(),
-                candidate_id=str(attempt["candidate_id"]),
-                slot_id=int(attempt["slot_id"]),
-                split=str(attempt["split"]),
-                replacement_round=int(attempt.get("round", 0)),
-                pointdir_tree_sha256=hash_reference_pointdir_tree(destination),
-                provenance_sha256=sha256_file(provenance_path),
-            )
-        )
-        added_names.append(name)
-        copied_by_source[source.name] = destination
-
-    allocation_relative = allocation_path.relative_to(campaign).as_posix()
-    quality_sources: Dict[str, Path] = {}
-    missing_quality = 0
-    for attempt in attempts:
-        raw_quality = str(attempt.get("quality_manifest") or "")
-        if not raw_quality:
-            missing_quality += 1
-            continue
-        candidate = Path(raw_quality)
-        source_quality = candidate if candidate.is_absolute() else campaign / candidate
-        resolved_quality = source_quality.resolve(strict=False)
-        if campaign.resolve() not in resolved_quality.parents:
-            raise ValueError("quantum-quality evidence is outside the campaign")
-        if resolved_quality.is_symlink() or not resolved_quality.is_file():
-            raise FileNotFoundError(
-                "quantum-quality evidence is missing: " + str(resolved_quality)
-            )
-        quality_sources[str(resolved_quality)] = resolved_quality
-    if missing_quality:
-        raise ValueError(
-            "accepted allocation lacks mandatory quantum-quality evidence for "
-            + str(missing_quality)
-            + " candidate(s)"
-        )
-    quality_evidence: List[Dict[str, Any]] = []
-    committed_by_source = {
-        Path(source).name: {
-            "source_pointdir": Path(source).name,
-            "committed_pointdir": entry.pointdir_name,
-            "candidate_id": str(attempt["candidate_id"]),
-        }
-        for source, attempt, entry in zip(accepted_pointdirs, attempts, added_entries)
-    }
-    for index, source_quality in enumerate(sorted(quality_sources.values())):
-        try:
-            quality_payload_raw = json.loads(source_quality.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise ValueError(
-                "quantum-quality evidence is unreadable: " + str(source_quality)
-            ) from exc
-        if not isinstance(quality_payload_raw, dict):
-            raise ValueError("quantum-quality evidence must be a JSON object")
-        from .quantum_quality import read_quantum_quality_manifest
-
-        quality_payload = read_quantum_quality_manifest(
-            source_quality.parent,
-            expected_phase=str(quality_payload_raw.get("phase") or ""),
-            expected_iteration=int(quality_payload_raw.get("iteration")),
-            manifest_path=source_quality,
-        )
-        accepted_source_names = {
-            str(record["pointdir"])
-            for record in quality_payload["records"]
-            if bool(record["accepted"])
-        }
-        relevant_names = sorted(accepted_source_names & set(committed_by_source))
-        if not relevant_names:
-            raise ValueError(
-                "quantum-quality evidence contains no committed accepted pointdir"
-            )
-        destination_quality = (
-            staging / "quality_evidence" / ("quantum_quality_" + str(index).zfill(4) + ".json")
-        )
-        destination_quality.parent.mkdir(parents=True, exist_ok=True)
-        committed_quality_payload = dict(quality_payload)
-        committed_records = []
-        for record in quality_payload["records"]:
-            committed_record = dict(record)
-            source_name = str(record.get("pointdir") or "")
-            if source_name in committed_by_source:
-                binding = committed_by_source[source_name]
-                committed_record["committed_pointdir"] = str(
-                    binding["committed_pointdir"]
-                )
-                committed_record["candidate_id"] = str(binding["candidate_id"])
-            committed_records.append(committed_record)
-        committed_quality_payload["records"] = committed_records
-        atomic_write_json(destination_quality, committed_quality_payload)
-        from .quantum_acceptance_receipts import (
-            bind_quantum_acceptance_receipt_to_commit,
-        )
-
-        committed_record_by_source = {
-            str(record.get("pointdir") or ""): record
-            for record in committed_records
-            if bool(record.get("accepted"))
-        }
-        published_quality = (
-            versioning.iteration_path(version)
-            / destination_quality.relative_to(staging)
-        )
-        for source_name in relevant_names:
-            bind_quantum_acceptance_receipt_to_commit(
-                campaign,
-                copied_by_source[source_name],
-                source_pointdir=source_name,
-                committed_pointdir=str(
-                    committed_by_source[source_name]["committed_pointdir"]
-                ),
-                quality_manifest_source=destination_quality,
-                quality_manifest_published=published_quality,
-                quality_record=committed_record_by_source[source_name],
-            )
-        quality_evidence.append(
-            {
-                "path": destination_quality.relative_to(staging).as_posix(),
-                "sha256": sha256_file(destination_quality),
-                "source_path": source_quality.relative_to(campaign.resolve()).as_posix(),
-                "source_sha256": sha256_file(source_quality),
-                "phase": str(quality_payload["phase"]),
-                "iteration": int(quality_payload["iteration"]),
-                "pointdir_bindings": [
-                    committed_by_source[name] for name in relevant_names
-                ],
-            }
-        )
-    # Receipt rebinding changes the committed pointdir tree.  Recompute every
-    # content digest before publishing the immutable version manifest.
-    added_entries = [
-        ReferenceDataEntry(
-            global_ordinal=entry.global_ordinal,
-            introduced_in_version=entry.introduced_in_version,
-            pointdir_name=entry.pointdir_name,
-            pointdir_path=entry.pointdir_path,
-            candidate_id=entry.candidate_id,
-            slot_id=entry.slot_id,
-            split=entry.split,
-            replacement_round=entry.replacement_round,
-            pointdir_tree_sha256=hash_reference_pointdir_tree(entry.pointdir_path),
-            provenance_sha256=sha256_file(
-                entry.pointdir_path / PROVENANCE_FILENAME
-            ),
-        )
-        for entry in added_entries
-    ]
-    payload = build_reference_data_version_payload(
-        campaign_uid=str(allocation["campaign_uid"]),
-        version=version,
-        source_context=str(context),
-        source_iteration=int(iteration),
-        parent_view=parent_view,
-        point_allocation_manifest=allocation_relative,
-        point_allocation_sha256=allocation_manifest_sha256(allocation_path),
-        added_entries=added_entries,
-        quantum_quality_evidence=quality_evidence,
-    )
-    allocation_history = allocation_path.parent / "history"
-    if allocation_history.is_dir():
-        _copytree_no_symlinks(
-            allocation_history,
-            staging / ".point_allocation_history",
-        )
-    atomic_write_json(staging / "POINT_ALLOCATION.json", allocation)
-    atomic_write_json(
-        staging
-        / (
-            "POINT_ALLOCATION.version-"
-            + str(version).zfill(COMMITTED_VERSION_NAME_WIDTH)
-            + ".json"
-        ),
-        allocation,
-    )
-    atomic_write_json(staging / REFERENCE_DATA_VERSION_FILENAME, payload)
-    versioning.commit(version)
-    view = versioning.resolve(version, verification="deep")
-    seal_reference_data_version(versioning.iteration_path(version))
-    versioning.update_current(version)
-    return view, added_names, True
-
-
-def commit_initial_reference_data(campaign_dir) -> bool:
-    """Commit the complete bootstrap allocation as reference-data version 0."""
-    _, _, created = commit_reference_data_delta(
+    return _commit(
         Path(campaign_dir),
-        reference_data_version=0,
-        context="bootstrap",
-        iteration=0,
+        reference_data_version=int(reference_data_version),
+        context=str(context),
+        iteration=int(iteration),
+        progress_callback=progress_callback,
     )
-    return bool(created)
 
 
 def _model_bootstrap_context(campaign: Path) -> Optional[Dict[str, Any]]:
@@ -2487,7 +2160,6 @@ def stage_ferebus_inputs(
     campaign_dir,
     config,
     reference_data_version,
-    is_initial=False,
 ) -> Tuple[Path, int]:
     """Stage pyferebus/FEREBUS inputs and return (staging_dir, n_tasks).
 
@@ -2495,24 +2167,45 @@ def stage_ferebus_inputs(
     property directories that pyferebus expects, plus the pyferebus job-details file and a daemon
     manifest used for strict postprocess validation.
     """
-    from ichor.core.files import PointDirectory, PointsDirectory
-    from ichor.core.calculators import calculate_alf_atom_sequence
     from ..versioning.reference_data import ReferenceDataVersioning
+    from .ferebus_row_cache import (
+        FEREBUS_ROW_CACHE,
+        feature_contract_path,
+        load_cumulative_rows,
+        row_cache_path,
+        system_alf_from_contract,
+    )
 
     campaign = Path(campaign_dir)
-    # The initial bootstrap has no APPEND phase ahead of it, so
-    # QM_REFERENCE_DATA/iteration-000000 may not exist when INITIAL_FEREBUS
-    # stages. Build it from the initial quantum staging so the
-    # export has something to read. idempotent; and we only create the dir here -- the
-    # reference_data_version bump stays in postprocess so a restart mid-flight reconciles cleanly.
-    if is_initial:
-        reference_data_version = 0
-        commit_initial_reference_data(campaign)
     version = int(reference_data_version)
     reference_data = ReferenceDataVersioning(campaign / "QM_REFERENCE_DATA")
-    view = reference_data.resolve(version, verification="deep")
+    view = reference_data.resolve(version, verification="index")
     if not view.entries:
         raise ValueError("committed QM reference data contains no pointdirs")
+    try:
+        feature_contract, cumulative_rows, cache_identities = load_cumulative_rows(
+            campaign,
+            version,
+        )
+    except Exception as exc:
+        raise ValueError(
+            "FEREBUS row cache is missing or invalid; resume REFERENCE_COMMIT, "
+            "restore the checkpoint again, or rebind the environment"
+        ) from exc
+    expected_cache_identities = [
+        (entry.pointdir_name, entry.source_pointdir, entry.candidate_id)
+        for entry in view.entries
+    ]
+    observed_cache_identities = [
+        (
+            str(record.get("pointdir_name") or ""),
+            str(record.get("source_pointdir") or ""),
+            str(record.get("candidate_id") or ""),
+        )
+        for record in cache_identities
+    ]
+    if observed_cache_identities != expected_cache_identities:
+        raise ValueError("FEREBUS row-cache order differs from reference-data view")
 
     staging = trained_models_dir(campaign) / "iteration-staging"
     # iteration-staging is ONE shared scratch dir reused every iteration, so wipe it first.
@@ -2526,16 +2219,7 @@ def stage_ferebus_inputs(
         )
     staging.mkdir(parents=True, exist_ok=True)
 
-    # PointsDirectory is list-backed, so the daemon can supply the authoritative
-    # cumulative order without materialising a duplicate directory tree.
-    pd = PointsDirectory(campaign / "QM_REFERENCE_DATA", needs_parsing=False)
-    pd.path = campaign / "QM_REFERENCE_DATA"
-    for entry in view.entries:
-        pd.append(PointDirectory(entry.pointdir_path))
     pointdir_names = [entry.pointdir_name for entry in view.entries]
-    observed_order = [Path(getattr(point, "path", point)).name for point in pd]
-    if observed_order != pointdir_names:
-        raise ValueError("FEREBUS PointsDirectory row order differs from reference-data view")
     pointdir_identities = {
         entry.pointdir_name: entry.provenance_sha256
         for entry in view.entries
@@ -2551,38 +2235,37 @@ def stage_ferebus_inputs(
     properties = [str(p) for p in getattr(f, "properties", ["iqa"])]
     if not properties:
         raise ValueError("ferebus.properties must contain at least one property")
+    if properties != list(feature_contract["properties"]):
+        raise ValueError("FEREBUS properties differ from the immutable feature contract")
     model_bootstrap = _model_bootstrap_context(campaign)
     model_tasks = (
         {} if model_bootstrap is None
         else _load_model_bootstrap_tasks(model_bootstrap)
     )
-    # Imported baselines must retain the ALFs used to encode their X rows.
-    # Ordinary campaigns continue to use ICHOR's deterministic sequence ALFs.
-    system_alf = (
-        pd.alf_dict(calculate_alf_atom_sequence)
-        if model_bootstrap is None
-        else _model_bootstrap_system_alf(
-            model_bootstrap,
-            model_tasks,
-            properties,
-        )
-    )
+    system_alf = system_alf_from_contract(feature_contract)
     _require_native_ferebus_alf(system_alf)
 
-    # write one <atom>_train.csv per atom containing every configured target property.
-    cwd = os.getcwd()
-    try:
-        os.chdir(staging)
-        pd.features_with_properties_to_csv(
-            system_alf,
-            str_to_append_to_fname="_train.csv",
-            property_types=properties,
+    feature_csvs = []
+    row_headers = [str(value) for value in feature_contract["row_headers"]]
+    for atom in feature_contract["atom_names"]:
+        matrix = np.asarray(cumulative_rows[str(atom)], dtype=np.float64)
+        if matrix.shape != (len(pointdir_names), len(row_headers)):
+            raise ValueError("FEREBUS cumulative row-cache dimensions are invalid")
+        target = staging / (str(atom) + "_train.csv")
+        temporary = target.with_name("." + target.name + ".tmp")
+        pd.DataFrame(matrix, columns=row_headers, dtype=np.float64).to_csv(
+            temporary,
+            index=False,
+            lineterminator="\n",
         )
-    finally:
-        os.chdir(cwd)
-    feature_csvs = sorted(staging.glob("*_train.csv"))
+        mode = "rb+" if platform.system() == "Windows" else "rb"
+        with temporary.open(mode) as handle:
+            _fsync_file_descriptor(handle.fileno())
+        os.replace(temporary, target)
+        _fsync_parent_dir(target)
+        feature_csvs.append(target)
     if not feature_csvs:
-        raise ValueError("PointsDirectory export produced no *_train.csv files for FEREBUS")
+        raise ValueError("FEREBUS row cache produced no *_train.csv files")
 
     system = str(getattr(config.campaign, "system_name", "SYSTEM"))
     validate_safe_path_token("FEREBUS system", system)
@@ -2663,6 +2346,33 @@ def stage_ferebus_inputs(
         "campaign_uid": str(view.campaign_uid),
         "reference_data_version": int(version),
         "reference_data_view_sha256": str(view.cumulative_view_sha256),
+        "feature_contract": {
+            "path": feature_contract_path(campaign).relative_to(campaign).as_posix(),
+            "contract_sha256": str(feature_contract["contract_sha256"]),
+            "file_sha256": sha256_file(feature_contract_path(campaign)),
+        },
+        "version_row_caches": [
+            {
+                "reference_data_version": int(cache_version),
+                "path": (
+                    row_cache_path(
+                        campaign,
+                        str(feature_contract["contract_sha256"]),
+                        cache_version,
+                    )
+                    / FEREBUS_ROW_CACHE
+                ).relative_to(campaign).as_posix(),
+                "sha256": sha256_file(
+                    row_cache_path(
+                        campaign,
+                        str(feature_contract["contract_sha256"]),
+                        cache_version,
+                    )
+                    / FEREBUS_ROW_CACHE
+                ),
+            }
+            for cache_version in range(version + 1)
+        ],
         "source_rows": source_row_identities,
         "source_rows_sha256": canonical_json_sha256(source_row_identities),
         "splits": {

@@ -548,32 +548,41 @@ class PointsDirectory(ListOfAtoms, Directory, HasData):
         if not property_types:
             property_types = ["iqa", "integration_error"] + constants.multipole_names
 
-        for atom_name in atom_names:
-
-            training_data = []
-            features = self[atom_name].features(
-                calculate_alf_features, system_alf, **kwargs
+        requested_atoms = [str(atom_name) for atom_name in atom_names]
+        rows_by_atom = {atom_name: [] for atom_name in requested_atoms}
+        input_headers = None
+        output_headers = [str(output) for output in property_types]
+        expected_atom_order = None
+        for point in self:
+            extracted = point.feature_property_rows(
+                system_alf,
+                output_headers,
+                **kwargs,
             )
+            observed_atom_order = list(extracted["atom_names"])
+            if expected_atom_order is None:
+                expected_atom_order = observed_atom_order
+                input_headers = list(extracted["feature_headers"])
+            elif observed_atom_order != expected_atom_order:
+                raise ValueError("FEREBUS point atom order changed within PointsDirectory")
+            if list(extracted["feature_headers"]) != input_headers:
+                raise ValueError("FEREBUS feature headers changed within PointsDirectory")
+            point_rows = extracted["rows"]
+            for atom_name in requested_atoms:
+                if atom_name not in point_rows:
+                    raise ValueError("FEREBUS row extractor is missing atom " + atom_name)
+                rows_by_atom[atom_name].append(point_rows[atom_name])
 
-            for i, point in enumerate(self):
-                point_properties_dict = point.properties(system_alf)
-                properties = [
-                    point_properties_dict.get(atom_name).get(ty)
-                    for ty in property_types
-                ]
-                training_data.append([*features[i], *properties])
-
-            input_headers = [f"f{i + 1}" for i in range(features.shape[-1])]
-            output_headers = [f"{output}" for output in property_types]
-
+        if input_headers is None:
+            raise ValueError("cannot export FEREBUS rows from an empty PointsDirectory")
+        for atom_name in requested_atoms:
             fname = atom_name + str_to_append_to_fname
-
             df = pd.DataFrame(
-                training_data,
+                rows_by_atom[atom_name],
                 columns=input_headers + output_headers,
                 dtype=np.float64,
             )
-            df.to_csv(fname, index=False)
+            df.to_csv(fname, index=False, lineterminator="\n")
 
     # TODO: move processing code to processing function
     def features_with_wfn_energy_and_dE_df_to_csv(

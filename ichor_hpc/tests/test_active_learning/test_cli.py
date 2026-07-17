@@ -267,7 +267,12 @@ def _commit_training_and_model_versions(campaign: Path, versions):
         allocation_path,
         results,
     )
-    stg.commit_initial_reference_data(campaign)
+    stg.commit_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )
     config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
     DryRunPhaseExecutor(campaign, config)._commit_dry_model_snapshot(0)
     from ichor.hpc.active_learning.versioning.sampling_iterations import (
@@ -1402,7 +1407,7 @@ def test_status_recommendations_cover_contract_failure_classes(tmp_path):
         (CampaignPhase.SPLIT, "phase_split_ready"),
         (CampaignPhase.GAUSSIAN, "phase_gaussian_ready"),
         (CampaignPhase.AIMALL, "phase_aimall_ready"),
-        (CampaignPhase.APPEND, "phase_append_ready"),
+        (CampaignPhase.REFERENCE_COMMIT, "phase_reference_commit_ready"),
         (CampaignPhase.FEREBUS, "phase_ferebus_ready"),
         (CampaignPhase.STOP_CHECK, "phase_stop_check_ready"),
     ],

@@ -1,5 +1,7 @@
 from pathlib import Path
-from typing import Callable, Dict, Union
+from typing import Callable, Dict, List, Union
+
+import numpy as np
 
 from ichor.core.atoms import Atoms, AtomsNotFoundError
 from ichor.core.files import OrcaInput, OrcaOutput
@@ -146,6 +148,68 @@ class PointDirectory(AnnotatedDirectory, HasAtoms, HasData):
         if not props:
             raise ValueError("AIMAll .int properties are empty for pointdir: " + str(self.path))
         return props
+
+    def feature_property_rows(
+        self,
+        system_alf,
+        property_types: List[str],
+        **kwargs,
+    ) -> Dict[str, object]:
+        """Return every atom's finite FEREBUS row from one parse of this point."""
+        from ichor.core.calculators.features.alf_features_calculator import (
+            calculate_alf_features,
+        )
+
+        properties = [str(value) for value in property_types]
+        if not properties:
+            raise ValueError("FEREBUS property_types must not be empty")
+        atom_names = list(self.atoms.atom_names)
+        features = np.asarray(
+            self.features(calculate_alf_features, system_alf, **kwargs),
+            dtype=np.float64,
+        )
+        if features.ndim != 2 or features.shape[0] != len(atom_names):
+            raise ValueError(
+                "FEREBUS feature matrix shape does not match point atom count: "
+                + str(self.path)
+            )
+        point_properties = self.properties(system_alf)
+        rows: Dict[str, np.ndarray] = {}
+        for atom_index, atom_name in enumerate(atom_names):
+            atom_properties = point_properties.get(atom_name)
+            if not isinstance(atom_properties, dict):
+                raise ValueError(
+                    "FEREBUS properties are missing atom "
+                    + atom_name
+                    + " in "
+                    + str(self.path)
+                )
+            try:
+                targets = [float(atom_properties[property_name]) for property_name in properties]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "FEREBUS properties are incomplete for atom "
+                    + atom_name
+                    + " in "
+                    + str(self.path)
+                ) from exc
+            row = np.concatenate(
+                [features[atom_index], np.asarray(targets, dtype=np.float64)]
+            )
+            if not np.isfinite(row).all():
+                raise ValueError(
+                    "FEREBUS row contains a non-finite value for atom "
+                    + atom_name
+                    + " in "
+                    + str(self.path)
+                )
+            rows[atom_name] = row
+        return {
+            "atom_names": atom_names,
+            "feature_headers": ["f" + str(index + 1) for index in range(features.shape[1])],
+            "property_headers": properties,
+            "rows": rows,
+        }
 
     @atoms.setter
     def atoms(self, atms: Atoms):

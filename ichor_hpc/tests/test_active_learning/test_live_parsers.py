@@ -308,39 +308,20 @@ def _complete_point_allocation(
     from ichor.hpc.active_learning.daemon.quantum_quality import (
         write_quantum_quality_manifest,
     )
-    from ichor.core.common.constants import multipole_names
-    from ichor.hpc.active_learning.daemon.quantum_acceptance_receipts import (
-        write_quantum_acceptance_receipt,
+    from ichor_hpc.tests.quantum_test_support import (
+        attach_synthetic_quantum_acceptance,
+        synthetic_quantum_quality_record,
     )
-    from ichor.hpc.active_learning.versioning.manifest import sha256_file
 
     phase_name = (
         CampaignPhase.INITIAL_AIMALL.value
         if str(context) == "bootstrap"
         else CampaignPhase.AIMALL.value
     )
-    quality_records = [{
-        "pointdir": pointdir.name,
-        "accepted": True,
-        "reasons": [],
-        "atom_count": 1,
-        "expected_atom_names": ["H1"],
-        "n_int": 1,
-        "sum_iqa_ha": -0.5,
-        "wfn_total_energy_ha": -0.5,
-        "wfn_virial_ratio": 2.0,
-        "iqa_energy_recovery_error_ha": 0.0,
-        "max_abs_integration_error": 0.0,
-        "per_atom": [{
-            "atom": "H1",
-            "int_file": "h1.int",
-            "canonical_dft_model": "B3LYP",
-            "iqa_ha": -0.5,
-            "integration_error": 0.0,
-            "multipoles": {name: 0.0 for name in multipole_names},
-            "reasons": [],
-        }],
-    } for pointdir in pointdirs.values()]
+    quality_records = [
+        synthetic_quantum_quality_record(pointdir.name)
+        for pointdir in pointdirs.values()
+    ]
     quality_path = write_quantum_quality_manifest(
         Path(staging),
         phase_name=phase_name,
@@ -354,22 +335,7 @@ def _complete_point_allocation(
     }
     result_evidence = {}
     for pointdir, quality_record in zip(pointdirs.values(), quality_records):
-        for filename in (
-            "input.gjf",
-            "input.wfn",
-            "input.gau",
-            "AIMALL_TASK.json",
-            "GAUSSIAN_TASK_RECEIPT.json",
-            "WFN_METHOD_RECEIPT.json",
-            "AIMALL_COMPLETION_RECEIPT.json",
-        ):
-            path = pointdir / filename
-            if not path.exists():
-                path.write_text("fixture\n", encoding="utf-8")
-        atomic_dir = pointdir / "input_atomicfiles"
-        atomic_dir.mkdir(exist_ok=True)
-        (atomic_dir / "h1.int").write_text("fixture\n", encoding="utf-8")
-        receipt_path = write_quantum_acceptance_receipt(
+        result_evidence[pointdir.name] = attach_synthetic_quantum_acceptance(
             campaign,
             pointdir,
             phase_name=phase_name,
@@ -377,14 +343,6 @@ def _complete_point_allocation(
             quality_manifest=quality_path,
             quality_record=quality_record,
         )
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        result_evidence[pointdir.name] = {
-            "quantum_acceptance_receipt": str(
-                receipt_path.resolve().relative_to(Path(campaign).resolve()).as_posix()
-            ),
-            "quantum_acceptance_receipt_sha256": sha256_file(receipt_path),
-            "accepted_pointdir_content_sha256": receipt["content_sha256"],
-        }
     record_quantum_results(
         allocation_path,
         [
@@ -414,7 +372,12 @@ def _commit_bootstrap_reference_data(campaign):
         iteration=0,
         targets={"train": 5, "int_val": 2, "ext_val": 2, "total": 9},
     )
-    stg.commit_initial_reference_data(campaign)
+    stg.commit_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )
     return ReferenceDataVersioning(
         Path(campaign) / "QM_REFERENCE_DATA"
     ).resolve(0, verification="deep")
@@ -564,6 +527,21 @@ def test_stage_aimall_inputs_writes_resolved_naat_metadata(tmp_path):
     )
     source_gjf.unlink()
     source_wfn.unlink()
+    write_seed_provenance(
+        accepted[0],
+        campaign_uid="m16-test",
+        iteration=0,
+        trajectory_sha256="0" * 64,
+        seed_frame_id=0,
+        seed_id=None,
+        seed_uid=None,
+        array_task_id_zero_based=None,
+        seed_selection_origin="live_parser_fixture",
+        seed_variance_at_selection=None,
+        subspace_neighbour_frame_ids=[],
+        subspace_dimension=0,
+        subspace_eigenvalues=[],
+    )
     stg.write_points_file(staging, sorted(staging.glob("POINT_*.pointdir")))
     stg.write_quantum_acceptance_manifest(
         staging,
@@ -756,7 +734,7 @@ def test_postprocess_dispatches_to_quantum_handler(tmp_path):
     assert result.failure_reason is None
 
 
-def test_commit_initial_reference_data_rejects_incomplete_allocation(tmp_path):
+def test_bootstrap_reference_commit_rejects_incomplete_allocation(tmp_path):
     campaign = tmp_path / "campaign"
     initial = campaign / ".DATA" / "STAGING" / "initial"
     good = initial / "POINT_0001.pointdir"
@@ -809,8 +787,16 @@ def test_commit_initial_reference_data_rejects_incomplete_allocation(tmp_path):
         ],
     )
 
-    with pytest.raises(ValueError, match="point allocation is incomplete"):
-        stg.commit_initial_reference_data(campaign)
+    with pytest.raises(
+        ValueError,
+        match="reference commit requires a complete point allocation",
+    ):
+        stg.commit_reference_data_delta(
+            campaign,
+            reference_data_version=0,
+            context="bootstrap",
+            iteration=0,
+        )
 
 
 def test_initial_aimall_reader_rejects_legacy_gaussian_alias(tmp_path):
@@ -841,17 +827,22 @@ def test_initial_aimall_reader_rejects_legacy_gaussian_alias(tmp_path):
         )
 
 
-def test_commit_initial_reference_data_rejects_missing_point_allocation(tmp_path):
+def test_bootstrap_reference_commit_rejects_missing_point_allocation(tmp_path):
     campaign = tmp_path / "campaign"
 
     with pytest.raises(FileNotFoundError, match="point-allocation manifest missing"):
-        stg.commit_initial_reference_data(campaign)
+        stg.commit_reference_data_delta(
+            campaign,
+            reference_data_version=0,
+            context="bootstrap",
+            iteration=0,
+        )
 
 
-def test_live_append_requires_complete_point_allocation(tmp_path):
+def test_reference_commit_requires_complete_point_allocation(tmp_path):
     ex = _make_executor(tmp_path)
     _commit_bootstrap_reference_data(ex.campaign_dir)
-    live_staging = stg.bucket_dir(ex.campaign_dir, "APPEND", 1)
+    live_staging = stg.bucket_dir(ex.campaign_dir, "REFERENCE_COMMIT", 1)
     (live_staging / "POINT_0000.pointdir").mkdir(parents=True)
     _seed_point_allocation(
         ex.campaign_dir,
@@ -866,15 +857,15 @@ def test_live_append_requires_complete_point_allocation(tmp_path):
     )
 
     with pytest.raises(BackendSubmissionError, match="complete point allocation"):
-        ex._inline_append(state)
+        ex._inline_reference_commit(state)
 
 
-def test_live_append_commits_global_pointdir_names_from_manifest(tmp_path):
+def test_reference_commit_publishes_global_pointdir_names_from_manifest(tmp_path):
     ex = _make_executor(tmp_path)
     bootstrap_view = _commit_bootstrap_reference_data(ex.campaign_dir)
     v = ReferenceDataVersioning(ex.campaign_dir / "QM_REFERENCE_DATA")
 
-    live_staging = stg.bucket_dir(ex.campaign_dir, "APPEND", 1)
+    live_staging = stg.bucket_dir(ex.campaign_dir, "REFERENCE_COMMIT", 1)
     new_point = live_staging / "POINT_0000.pointdir"
     new_point.mkdir(parents=True)
     (new_point / "new.txt").write_text("new\n", encoding="utf-8")
@@ -898,7 +889,7 @@ def test_live_append_commits_global_pointdir_names_from_manifest(tmp_path):
         reference_data_version=0,
     )
 
-    result = ex._inline_append(state)
+    result = ex._inline_reference_commit(state)
 
     assert result["reference_data_version"] == 1
     committed = v.iteration_path(1)
@@ -1460,22 +1451,43 @@ def test_ferebus_task_artefact_layout_rejects_unsafe_tokens(tmp_path):
         )
 
 
-def test_initial_ferebus_also_commits_reference_data_version_zero(tmp_path):
+def test_initial_ferebus_consumes_published_reference_data_version_zero(tmp_path):
     ex = _make_executor(tmp_path)
     _commit_bootstrap_reference_data(ex.campaign_dir)
     _seed_phase_a_sample(ex.campaign_dir, n_frames=9)
     _seed_models_staging(tmp_path / "campaign")
 
-    state = SimpleNamespace(iteration=0, campaign_uid="m16-test")
+    state = SimpleNamespace(
+        iteration=0,
+        campaign_uid="m16-test",
+        reference_data_version=0,
+    )
     result = ex._parse_ferebus_postprocess(
         state, CampaignPhase("INITIAL_FEREBUS"), observations=[],
     )
     assert result.failure_reason is None
     assert result.state_updates["models_version"] == 0
-    assert result.state_updates["reference_data_version"] == 0
+    assert "reference_data_version" not in result.state_updates
     train_dir = tmp_path / "campaign" / "QM_REFERENCE_DATA" / "iteration-000000"
     assert train_dir.is_dir()
     assert (train_dir / "POINT_000000.pointdir").is_dir()
+
+
+def test_initial_ferebus_rejects_missing_published_reference_version(tmp_path):
+    ex = _make_executor(tmp_path)
+    state = SimpleNamespace(
+        iteration=0,
+        campaign_uid="m16-test",
+        reference_data_version=-1,
+    )
+
+    result = ex._parse_ferebus_postprocess(
+        state,
+        CampaignPhase("INITIAL_FEREBUS"),
+        observations=[],
+    )
+
+    assert result.failure_reason == "initial_ferebus_requires_reference_data_version_zero"
 
 
 def test_ferebus_parser_rejects_empty_staging(tmp_path):

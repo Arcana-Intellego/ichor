@@ -11,6 +11,9 @@ from ichor.hpc.active_learning.daemon.ferebus_split_ledger import (
     ensure_split_assignments,
     ledger_path,
 )
+from ichor.hpc.active_learning.versioning.reference_data import (
+    REFERENCE_DATA_VERSION_SCHEMA_VERSION,
+)
 
 
 def _names(n):
@@ -39,7 +42,7 @@ def _ensure(tmp_path, names, *, version, counts, identities=None, digest="alloca
     (reference_dir / "REFERENCE_DATA_VERSION.json").write_text(
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": REFERENCE_DATA_VERSION_SCHEMA_VERSION,
                 "reference_data_version": int(version),
                 "point_allocation_sha256": allocation_sha,
             },
@@ -106,7 +109,7 @@ def test_model_bootstrap_allows_zero_new_training_rows_and_tracks_baseline(tmp_p
     (reference_dir / "REFERENCE_DATA_VERSION.json").write_text(
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": REFERENCE_DATA_VERSION_SCHEMA_VERSION,
                 "reference_data_version": 0,
                 "point_allocation_sha256": "a" * 64,
             }
@@ -325,7 +328,7 @@ def test_missing_split_ledger_is_reconstructed_from_reference_history(
         (root / "REFERENCE_DATA_VERSION.json").write_text(
             json.dumps(
                 {
-                    "schema_version": 2,
+                    "schema_version": REFERENCE_DATA_VERSION_SCHEMA_VERSION,
                     "reference_data_version": version,
                     "point_allocation_sha256": allocation_hash,
                 },
@@ -337,7 +340,7 @@ def test_missing_split_ledger_is_reconstructed_from_reference_history(
         )
 
     def fake_resolve(_self, version, *, verification):
-        assert verification == "deep"
+        assert verification == "index"
         cumulative = [
             name for name in names if introduced[name] <= int(version)
         ]

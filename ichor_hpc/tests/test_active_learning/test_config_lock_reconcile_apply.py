@@ -110,7 +110,7 @@ def _write_pool(campaign):
 
 def _commit_reference_data_version(campaign, version=0):
     from ichor.hpc.active_learning.daemon.input_staging import (
-        commit_initial_reference_data,
+        commit_reference_data_delta,
     )
 
     if int(version) != 0:
@@ -183,7 +183,12 @@ def _commit_reference_data_version(campaign, version=0):
         allocation_path,
         results,
     )
-    assert commit_initial_reference_data(campaign) is True
+    assert commit_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )[2] is True
 
 
 def _write_config(campaign, config):

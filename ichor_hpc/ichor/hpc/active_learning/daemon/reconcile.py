@@ -88,6 +88,7 @@ _RECOVERY_PHASE_PROGRESS = {
         CampaignPhase.INITIAL_ALLOCATION_CHECK,
         CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN,
         CampaignPhase.INITIAL_REPLACEMENT_AIMALL,
+        CampaignPhase.REFERENCE_COMMIT,
         CampaignPhase.INITIAL_FEREBUS,
         CampaignPhase.SEED_SELECT,
         CampaignPhase.ARIADNE_ARRAY,
@@ -98,7 +99,6 @@ _RECOVERY_PHASE_PROGRESS = {
         CampaignPhase.ALLOCATION_CHECK,
         CampaignPhase.REPLACEMENT_GAUSSIAN,
         CampaignPhase.REPLACEMENT_AIMALL,
-        CampaignPhase.APPEND,
         CampaignPhase.FEREBUS,
         CampaignPhase.STOP_CHECK,
     ))
@@ -216,6 +216,7 @@ def stateful_campaign_artifacts(campaign_dir: Union[str, Path]) -> List[str]:
     add_matches(".DATA/ACTIVE_LEARNING/stop_request.json")
     add_matches(".DATA/ACTIVE_LEARNING/stop_request_history/*.json")
     add_matches(".DATA/ACTIVE_LEARNING/reconcile_transactions/*.json")
+    add_matches(".DATA/ACTIVE_LEARNING/reference_commit_transactions/*.json")
     add_matches(".DATA/ACTIVE_LEARNING/execution_identity.json")
     add_matches(".DATA/ACTIVE_LEARNING/environment_current.json")
     add_matches(".DATA/ACTIVE_LEARNING/environment_generations/*.json")
@@ -288,6 +289,7 @@ class ReconciliationReport:
     script_inventory: Dict[str, Any] = field(default_factory=dict)
     scratch_inventory: List[Dict[str, Any]] = field(default_factory=list)
     reconcile_transactions: List[Dict[str, Any]] = field(default_factory=list)
+    reference_commit_transactions: List[Dict[str, Any]] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
     existing_state_loaded: bool = False
     unsafe_reasons: List[str] = field(default_factory=list)
@@ -1133,9 +1135,60 @@ def propose_recovery(
     )
     from .scratch import inventory as scratch_inventory_records
     from .reconcile_transaction import inventory_reconcile_transactions
+    from .reference_commit import inventory_reference_commits
 
     scratch_inventory = scratch_inventory_records(campaign)
     reconcile_transactions = inventory_reconcile_transactions(campaign)
+    reference_commit_transactions = inventory_reference_commits(campaign)
+    invalid_reference_commits = [
+        record
+        for record in reference_commit_transactions
+        if str(record.get("state") or "") == "invalid"
+    ]
+    active_reference_commits = [
+        record
+        for record in reference_commit_transactions
+        if str(record.get("state") or "") not in {"complete", "invalid"}
+    ]
+    reference_commit_decisions: List[RecoveryDecision] = []
+    if invalid_reference_commits:
+        unsafe_reasons.append(
+            "invalid reference-commit transaction evidence: "
+            + "; ".join(
+                str(record.get("path"))
+                + " ("
+                + str(record.get("reason") or "invalid")
+                + ")"
+                for record in invalid_reference_commits[:5]
+            )
+        )
+        blocking_artifacts.append("reference-commit transaction evidence")
+    if len(active_reference_commits) > 1:
+        unsafe_reasons.append(
+            "multiple incomplete reference-commit transactions require user review"
+        )
+        blocking_artifacts.append("reference-commit transaction evidence")
+    elif active_reference_commits:
+        transaction = active_reference_commits[0]
+        ledger = transaction.get("ledger") or {}
+        decision = RecoveryDecision(
+            phase=CampaignPhase.REFERENCE_COMMIT,
+            iteration=int(ledger["iteration"]),
+            reason=(
+                "resume reference commit from "
+                + str(transaction.get("state"))
+                + " transaction state"
+            ),
+            trusted_artifact=str(transaction.get("path") or ""),
+        )
+        reference_commit_decisions.append(decision)
+        _append_recovery_candidate(recovery_candidates, decision)
+        trusted_artifacts.append(
+            "reference-commit transaction "
+            + str(transaction.get("state"))
+            + " at "
+            + str(transaction.get("path"))
+        )
     blocking_reconcile_transactions = [
         record
         for record in reconcile_transactions
@@ -1211,6 +1264,23 @@ def propose_recovery(
         unexpected_staging_children = [
             p for p in staging_children
             if p.name != "initial"
+        ]
+    protected_reference_source_paths = set()
+    for transaction in active_reference_commits:
+        ledger = transaction.get("ledger") or {}
+        bucket_name = (
+            "initial"
+            if str(ledger.get("context")) == "bootstrap"
+            else "iter_" + str(int(ledger.get("iteration", 0)))
+        )
+        protected_reference_source_paths.add(
+            str((staging_root / bucket_name).resolve(strict=False))
+        )
+    if protected_reference_source_paths:
+        unexpected_staging_children = [
+            path
+            for path in unexpected_staging_children
+            if str(path.resolve(strict=False)) not in protected_reference_source_paths
         ]
     scripts_root = campaign / ".DATA" / "SCRIPTS"
     script_inventory = _scripts_inventory(campaign)
@@ -1323,7 +1393,21 @@ def propose_recovery(
     if script_files:
         unsafe_reasons.append(".DATA/SCRIPTS contains sbatch scripts")
         trusted_artifacts.append(".DATA/SCRIPTS can be archived by reconcile --apply")
-    if dangling_reference_data:
+    protected_reference_staging_paths = {
+        str(
+            ReferenceDataVersioning(training_dir).staging_path(
+                int((record.get("ledger") or {}).get("iteration", -1))
+            ).resolve(strict=False)
+        )
+        for record in active_reference_commits
+        if isinstance(record.get("ledger"), dict)
+    }
+    unprotected_dangling_reference_data = [
+        path
+        for path in dangling_reference_data
+        if str(path.resolve(strict=False)) not in protected_reference_staging_paths
+    ]
+    if unprotected_dangling_reference_data:
         unsafe_reasons.append("dangling reference-data staging directories exist")
         blocking_artifacts.append("dangling reference-data staging")
     if recoverable_ferebus_staging:
@@ -1737,7 +1821,11 @@ def propose_recovery(
         blocking_artifacts.append(ACTIVE_LEARNING_DIRNAME)
     for decision in partial_iteration_handoffs:
         _append_recovery_candidate(recovery_candidates, decision)
-    combined_handoffs = list(protected_staging_handoffs) + list(partial_iteration_handoffs)
+    combined_handoffs = (
+        list(protected_staging_handoffs)
+        + list(partial_iteration_handoffs)
+        + list(reference_commit_decisions)
+    )
     combined_iterations = {int(d.iteration) for d in combined_handoffs}
     if len(combined_iterations) > 1:
         unsafe_reasons.append(
@@ -1985,11 +2073,11 @@ def propose_recovery(
                 "re-entry at INITIAL_AIMALL to process the initial Gaussian handoff"
             )
         else:
-            recovered.phase = CampaignPhase.INITIAL_FEREBUS
+            recovered.phase = CampaignPhase.REFERENCE_COMMIT
             recovered.iteration = 0
-            decision = "INITIAL_FEREBUS: valid initial AIMAll handoff exists without committed models"
+            decision = "REFERENCE_COMMIT: valid initial AIMAll handoff exists"
             notes.append(
-                "re-entry at INITIAL_FEREBUS to commit initial reference-data/model version 0"
+                "re-entry at REFERENCE_COMMIT to publish reference-data version 0"
             )
         recovered.reference_data_version = -1
         recovered.validation_set_version = -1
@@ -2002,7 +2090,7 @@ def propose_recovery(
         if initial_handoff_valid:
             decision = "HALTED: valid initial AIMAll handoff exists but unsafe artefacts need review"
             notes.append(
-                "re-entry HALTED because unsafe artefacts block INITIAL_FEREBUS recovery"
+                "re-entry HALTED because unsafe artefacts block REFERENCE_COMMIT recovery"
             )
         else:
             decision = "HALTED: INITIAL_AIMALL completed but initial FEREBUS handoff is missing"
@@ -2195,6 +2283,7 @@ def propose_recovery(
         script_inventory=script_inventory,
         scratch_inventory=scratch_inventory,
         reconcile_transactions=reconcile_transactions,
+        reference_commit_transactions=reference_commit_transactions,
         notes=notes,
         existing_state_loaded=existing_loaded,
         unsafe_reasons=unsafe_reasons,

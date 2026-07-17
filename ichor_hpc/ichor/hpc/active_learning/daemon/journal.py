@@ -59,7 +59,7 @@ __all__ = [
 #
 #  Later (provenance ledger) additions:
 #  subspace_built          -- per-iteration count of seeds whose subspace was built
-#  reference_data_committed  -- {reference_data_version, n_committed_points} after APPEND
+#  reference_data_committed  -- {reference_data_version, n_committed_points} after REFERENCE_COMMIT
 #  seed_selected           -- placeholder
 #  anti_overlap_flagged    -- placeholder
 #  reference_scales_computed -- placeholder
@@ -82,6 +82,12 @@ KNOWN_EVENT_TYPES = (
     "tick_exception_halted",
     "subspace_built",
     "reference_data_committed",
+    "reference_commit_started",
+    "reference_commit_move_progress",
+    "reference_commit_shard_progress",
+    "reference_commit_shards_resolved",
+    "reference_commit_cache_complete",
+    "reference_commit_published",
     "seed_selected",
     "anti_overlap_flagged",
     "reference_scales_computed",

@@ -7,7 +7,7 @@ to a PhaseExecutor. The protocol has three operations:
     submit_or_run(state, phase) -> PhaseResult
         decide what to do at the start of a phase. For SLURM-backed phases
         this submits the job and returns the JobID. For inline phases
-        (SEED_SELECT, SPLIT, APPEND, STOP_CHECK in production) this runs
+        (SEED_SELECT, SPLIT, REFERENCE_COMMIT, STOP_CHECK in production) this runs
         the work synchronously and returns is_complete=True immediately.
 
     postprocess(state, phase, observations) -> PhaseResult
@@ -54,7 +54,7 @@ class BackendSubmissionError(RuntimeError):
 #executors.
 INLINE_PHASES = frozenset({
     "INIT", "INITIAL_ALLOCATION_CHECK", "ALLOCATION_CHECK", "SEED_SELECT",
-    "SPLIT", "APPEND", "STOP_CHECK", "DONE", "HALTED",
+    "SPLIT", "REFERENCE_COMMIT", "STOP_CHECK", "DONE", "HALTED",
 })
 SBATCH_PHASES = frozenset({
     "PHASE_A_DIVERSITY", "INITIAL_GAUSSIAN", "INITIAL_AIMALL", "INITIAL_FEREBUS",

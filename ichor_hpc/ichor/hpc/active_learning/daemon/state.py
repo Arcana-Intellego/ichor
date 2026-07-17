@@ -46,7 +46,7 @@ __all__ = [
 ]
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 READABLE_SCHEMA_VERSIONS = frozenset({SCHEMA_VERSION})
 DEFAULT_STATE_FILENAME = "state.json"
 
@@ -69,7 +69,7 @@ class CampaignPhase(str, Enum):
     ALLOCATION_CHECK = "ALLOCATION_CHECK"
     REPLACEMENT_GAUSSIAN = "REPLACEMENT_GAUSSIAN"
     REPLACEMENT_AIMALL = "REPLACEMENT_AIMALL"
-    APPEND = "APPEND"
+    REFERENCE_COMMIT = "REFERENCE_COMMIT"
     FEREBUS = "FEREBUS"
     STOP_CHECK = "STOP_CHECK"
     DONE = "DONE"
@@ -366,7 +366,6 @@ class CampaignState:
             CampaignPhase.ALLOCATION_CHECK,
             CampaignPhase.REPLACEMENT_GAUSSIAN,
             CampaignPhase.REPLACEMENT_AIMALL,
-            CampaignPhase.APPEND,
             CampaignPhase.FEREBUS,
             CampaignPhase.STOP_CHECK,
         }
@@ -588,7 +587,7 @@ def atomic_write_text(target: Union[str, Path], text: str) -> None:
     """Write "text" to "target" atomically.
 
     Sequence:
-        tmp = target.<pid>.<uuid>.tmp
+        tmp = parent/.t-<48-bit-random-token>
         open(tmp, "w"); write; flush; fsync(fd); close
         os.replace(tmp, target)            -- POSIX atomic rename
         fsync(parent_dir)                  -- Lustre / NFS durability
@@ -596,7 +595,7 @@ def atomic_write_text(target: Union[str, Path], text: str) -> None:
     target = Path(target)
     if not target.parent.exists():
         raise FileNotFoundError("parent directory does not exist: " + str(target.parent))
-    tmp = target.parent / (".tmp-" + uuid.uuid4().hex)
+    tmp = target.parent / (".t-" + uuid.uuid4().hex[:12])
     try:
         with open(tmp, "x", encoding="utf-8", newline="\n") as f:
             f.write(text)

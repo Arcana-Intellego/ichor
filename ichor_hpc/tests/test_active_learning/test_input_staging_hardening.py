@@ -13,7 +13,7 @@ def test_safe_path_token_rejects_path_traversal_and_shell_chars():
             stg.validate_safe_path_token("atom", value)
 
 
-def test_copytree_no_symlinks_rejects_symlinked_pointdir_child(tmp_path):
+def test_pointdir_tree_validation_rejects_symlinked_child(tmp_path):
     src = tmp_path / "POINT_0000.pointdir"
     src.mkdir()
     target = tmp_path / "target.txt"
@@ -25,7 +25,7 @@ def test_copytree_no_symlinks_rejects_symlinked_pointdir_child(tmp_path):
         pytest.skip("symlink creation unavailable on this host: " + str(exc))
 
     with pytest.raises(ValueError, match="symlink"):
-        stg._copytree_no_symlinks(src, tmp_path / "copy.pointdir")
+        stg._reject_symlink_tree(src)
 
 
 def test_quantum_acceptance_manifest_reports_malformed_n_total(tmp_path):
