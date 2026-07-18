@@ -357,6 +357,25 @@ rebuildable FEREBUS working directory and is not authoritative. The former
 :code:`6_TRAINED_MODELS/` and nested :code:`task_artefacts/` layouts are
 intentionally unsupported.
 
+FEREBUS quality publication distinguishes a complete scientific measurement
+from a parser or telemetry failure. Only complete measurements may become
+:code:`FEREBUS_QUALITY.json` and a promotion decision. Incomplete measurements
+are recorded under
+:code:`.DATA/ACTIVE_LEARNING/ferebus_quality_attempts/`; raw model, performance
+and task-receipt evidence remains available for recovery and is not classified
+as a rejected model. The reader accepts the exact legacy FEREBUS performance
+labels :code:`weights_l2_nor` and :code:`covariance_con`, canonicalising them to
+their full names while rejecting ambiguous files containing both forms.
+
+For the historical failure in which an incomplete measurement was moved under
+:code:`TRAINED_MODELS/rejected-candidates/`, routine reconcile can identify one
+unambiguous measurement-only candidate and record
+:code:`ferebus_postprocess_recovery.json`. The next resume authenticates and
+copies its raw files into clean staging, leaves the original quarantine
+unchanged, and reruns postprocessing inline. It does not submit another
+FEREBUS job. Genuine threshold or incumbent-regression failures remain rejected
+and are never eligible for this path.
+
 
 Sampling storage and identities
 -------------------------------
@@ -658,8 +677,9 @@ promote it manually before running :code:`reconcile --apply`.
 
 What reconcile still does not do:
 
-- it does not postprocess successful Slurm jobs whose daemon-side commit did
-  not run;
+- except for the authenticated FEREBUS measurement-recovery path described
+  above, it does not postprocess successful Slurm jobs whose daemon-side commit
+  did not run;
 - it does not harvest uncommitted Gaussian/AIMAll outputs into a training
   version;
 - it does not rebuild committed manifests automatically;

@@ -8,6 +8,8 @@ from ichor.hpc.active_learning.daemon import input_staging as stg
 from ichor.hpc.active_learning.daemon.ferebus_quality import (
     FEREBUS_QUALITY_DECISION_MANIFEST,
     FEREBUS_QUALITY_MANIFEST,
+    FerebusQualityMeasurementIncomplete,
+    _parse_perf,
     evaluate_ferebus_quality,
     evaluate_ferebus_quality_decision,
     read_ferebus_quality_decision,
@@ -381,6 +383,7 @@ def test_ferebus_quality_optional_thresholds_are_enforced(tmp_path):
 
 def test_ferebus_promotion_rejects_aggregate_regression_beyond_five_percent():
     quality = {
+        "measurement_complete": True,
         "records": [
             {
                 "property": "iqa",
@@ -407,6 +410,7 @@ def test_ferebus_promotion_rejects_aggregate_regression_beyond_five_percent():
 
 def test_ferebus_promotion_rejects_single_task_regression_beyond_twenty_percent():
     quality = {
+        "measurement_complete": True,
         "records": [
             {
                 "property": "iqa",
@@ -435,7 +439,7 @@ def test_ferebus_promotion_rejects_single_task_regression_beyond_twenty_percent(
 def test_ferebus_promotion_rejects_non_numeric_thresholds():
     with pytest.raises(ValueError, match="must be numeric"):
         evaluate_ferebus_quality_decision(
-            {"records": [], "summary": {}},
+            {"measurement_complete": True, "records": [], "summary": {}},
             _gates(ferebus_max_task_ext_rmse_increase_fraction=True),
         )
 
@@ -466,12 +470,63 @@ def test_ferebus_manifest_rejects_dataset_hash_drift(tmp_path):
 
 
 def test_write_ferebus_quality_manifest(tmp_path):
-    payload = {"schema_version": 1, "accepted": True, "summary": {"n_tasks": 0}}
+    payload = {
+        "schema_version": 1,
+        "accepted": True,
+        "measurement_complete": True,
+        "summary": {"n_tasks": 0},
+    }
 
     path = write_ferebus_quality_manifest(tmp_path, payload)
 
     assert path.name == FEREBUS_QUALITY_MANIFEST
     assert json.loads(path.read_text(encoding="utf-8")) == payload
+
+
+def test_legacy_ferebus_performance_aliases_are_canonicalised(tmp_path):
+    path = tmp_path / "legacy.perf"
+    path.write_text(
+        "RMSE 1.0\n"
+        "MAE 0.5\n"
+        "weights_l2_nor 2.0\n"
+        "covariance_con 3.0\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    parsed = _parse_perf(path)
+
+    assert parsed["weights_l2_norm"] == 2.0
+    assert parsed["covariance_condition_number"] == 3.0
+    assert "weights_l2_nor" not in parsed
+    assert "covariance_con" not in parsed
+
+
+def test_legacy_and_canonical_performance_names_are_ambiguous(tmp_path):
+    path = tmp_path / "ambiguous.perf"
+    path.write_text(
+        "covariance_con 3.0\n"
+        "covariance_condition_number 3.0\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    with pytest.raises(ValueError, match="duplicate or ambiguous"):
+        _parse_perf(path)
+
+
+def test_incomplete_quality_cannot_become_a_decision_or_manifest(tmp_path):
+    quality = {
+        "measurement_complete": False,
+        "measurement_errors": ["ferebus_quality_metric_failed:ValueError:test"],
+        "records": [],
+        "summary": {},
+    }
+
+    with pytest.raises(FerebusQualityMeasurementIncomplete):
+        write_ferebus_quality_manifest(tmp_path, quality)
+    with pytest.raises(FerebusQualityMeasurementIncomplete):
+        evaluate_ferebus_quality_decision(quality, _gates())
 
 
 def test_quality_validator_recomputes_summary_from_task_records(tmp_path):

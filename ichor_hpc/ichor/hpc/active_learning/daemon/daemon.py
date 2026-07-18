@@ -56,6 +56,8 @@ from .phase_executor import (
     MockPhaseExecutor,
     PhaseExecutor,
     PhaseResult,
+    PostprocessFilesystemNotSettled,
+    PostprocessRetryDisposition,
     SBATCH_PHASES,
 )
 from .reconcile import stateful_campaign_artifacts
@@ -1237,7 +1239,7 @@ class Daemon:
                     + ": "
                     + str(exc)[:180]
                 )
-                if attempt + 1 < attempts and self._looks_like_file_settle(reason):
+                if attempt + 1 < attempts and isinstance(exc, FileNotFoundError):
                     self._journal(
                         "committed_artifact_settle_retry",
                         phase=phase.value,
@@ -2664,7 +2666,10 @@ class Daemon:
                 result.validate(stage="postprocess", phase_name=phase.value)
             except Exception as exc:
                 reason = "postprocess_exception: " + type(exc).__name__ + ": " + str(exc)[:180]
-                if attempt + 1 < attempts and self._looks_like_file_settle(reason):
+                if (
+                    attempt + 1 < attempts
+                    and isinstance(exc, PostprocessFilesystemNotSettled)
+                ):
                     self._journal(
                         "postprocess_settle_retry",
                         phase=phase.value,
@@ -2690,7 +2695,8 @@ class Daemon:
             if (
                 result.failure_reason
                 and attempt + 1 < attempts
-                and self._looks_like_file_settle(str(result.failure_reason))
+                and result.retry_disposition
+                is PostprocessRetryDisposition.FILESYSTEM_SETTLE
             ):
                 self._journal(
                     "postprocess_settle_retry",
@@ -3083,19 +3089,6 @@ class Daemon:
             return
         payload["error"] = str(getattr(liveness, "error", "") or "")[:200]
         self._journal("squeue_liveness_inconclusive", **payload)
-
-    def _looks_like_file_settle(self, reason: str) -> bool:
-        text = str(reason).lower()
-        markers = (
-            "missing",
-            "unreadable",
-            "not found",
-            "no such file",
-            "manifest",
-            "expected_model_missing",
-            "ferebus_model_root_missing",
-        )
-        return any(marker in text for marker in markers)
 
     def _load_transient_retry_ledger(self) -> Dict[str, Any]:
         path = self.transient_retry_ledger_path()

@@ -21,6 +21,7 @@ from ichor.hpc.active_learning.daemon.phase_executor import (
     FailureAction,
     MockPhaseExecutor,
     PhaseResult,
+    PostprocessRetryDisposition,
 )
 from ichor.hpc.active_learning.daemon.state import (
     CampaignPhase,
@@ -772,7 +773,13 @@ def test_postprocess_settle_retries_initially_missing_artifacts(tmp_path):
         def postprocess(self, state, phase, observations):
             self.calls += 1
             if self.calls == 1:
-                return PhaseResult(is_complete=True, failure_reason="expected_model_missing")
+                return PhaseResult(
+                    is_complete=True,
+                    failure_reason="expected_model_missing",
+                    retry_disposition=(
+                        PostprocessRetryDisposition.FILESYSTEM_SETTLE
+                    ),
+                )
             return PhaseResult(is_complete=True)
 
     sleeps = []
@@ -794,6 +801,39 @@ def test_postprocess_settle_retries_initially_missing_artifacts(tmp_path):
     assert sleeps == [5.0]
     events = list(iter_events(d.journal_path()))
     assert any(e.get("event") == "postprocess_settle_retry" for e in events)
+
+
+def test_postprocess_failure_text_does_not_implicitly_retry(tmp_path):
+    class TerminalExecutor(MockPhaseExecutor):
+        def __init__(self):
+            super().__init__(treat_as_sbatch=set(_SBATCH_PHASES))
+            self.calls = 0
+
+        def postprocess(self, state, phase, observations):
+            self.calls += 1
+            return PhaseResult(
+                is_complete=True,
+                failure_reason="quality_measurement_missing_but_terminal",
+            )
+
+    executor = TerminalExecutor()
+    d = _make_daemon(tmp_path, executor=executor, sacct=_completed_poll)
+    d.config.runtime.postprocess_settle_attempts = 3
+    d.config.runtime.postprocess_settle_seconds = 0
+    d.data_dir().mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.PHASE_A_DIVERSITY
+    state.pending_jobs[CampaignPhase.PHASE_A_DIVERSITY.value] = "MOCK-1"
+    write_state(d.state_path(), state)
+
+    status = d.tick()
+
+    assert status == TickStatus.HALTED
+    assert executor.calls == 1
+    assert not any(
+        event.get("event") == "postprocess_settle_retry"
+        for event in iter_events(d.journal_path())
+    )
 
 
 def test_phase_entry_complete_failure_halts_instead_of_advancing(tmp_path):

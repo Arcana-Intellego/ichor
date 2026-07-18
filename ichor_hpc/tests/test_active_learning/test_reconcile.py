@@ -1130,6 +1130,80 @@ def test_propose_recovery_bootstrap_training_only_reenters_initial_ferebus(
     assert "exact point allocation is complete" in report.decision
 
 
+def test_propose_recovery_reports_unique_measurement_only_ferebus_candidate(
+    tmp_path,
+):
+    campaign, data, _, _ = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_reference_versions(campaign, (0,))
+    state = fresh_campaign_state(
+        max_iterations=50,
+        campaign_uid="reconcile-test",
+    )
+    state.phase = CampaignPhase.HALTED
+    state.reference_data_version = 0
+    state.models_version = -1
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    candidate = (
+        campaign
+        / "TRAINED_MODELS"
+        / "rejected-candidates"
+        / "reference-000000"
+        / ("a" * 64)
+    )
+    candidate.mkdir(parents=True)
+    error = "ferebus_quality_metric_failed:ValueError:legacy metric"
+    atomic_write_json(
+        candidate / "FEREBUS_QUALITY.json",
+        {
+            "schema_version": 4,
+            "campaign_uid": "reconcile-test",
+            "reference_data_version": 0,
+            "measurement_complete": False,
+            "measurement_errors": [error],
+        },
+    )
+    from ichor.hpc.active_learning.daemon.completion_receipts import (
+        canonical_sha256,
+    )
+    from ichor.hpc.active_learning.versioning.manifest import sha256_file
+
+    quality_path = candidate / "FEREBUS_QUALITY.json"
+    evaluation = {
+        "accepted": False,
+        "reasons": ["ferebus_aggregate_metric_missing", error],
+    }
+    digest = canonical_sha256(evaluation)
+    evaluation["evaluation_sha256"] = digest
+    atomic_write_json(
+        candidate / "FEREBUS_QUALITY_DECISION.json",
+        {
+            "schema_version": 2,
+            "campaign_uid": "reconcile-test",
+            "reference_data_version": 0,
+            "quality": {
+                "path": "FEREBUS_QUALITY.json",
+                "size": quality_path.stat().st_size,
+                "sha256": sha256_file(quality_path),
+            },
+            "evaluations": [evaluation],
+            "current_evaluation_sha256": digest,
+        },
+    )
+    atomic_write_json(candidate / "FEREBUS_TASKS.json", {})
+    atomic_write_json(candidate / "FEREBUS_TASK_MAP.json", {})
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.INITIAL_FEREBUS
+    assert report.ferebus_candidate_recovery is not None
+    assert report.ferebus_candidate_recovery["candidate_id"] == "a" * 64
+    assert any(
+        "without another scheduler submission" in note
+        for note in report.notes
+    )
+
+
 def test_propose_recovery_missing_state_nonempty_staging_halts(tmp_path):
     campaign, _, _, _ = _campaign_dirs(tmp_path)
     staging = campaign / ".DATA" / "STAGING" / "iter_1"

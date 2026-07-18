@@ -1642,6 +1642,17 @@ def _format_runtime_status(payload: Dict[str, Any], *, verbose: bool) -> List[st
                 ),
             ]
         )
+    ferebus_recovery = payload.get("ferebus_candidate_recovery")
+    if isinstance(ferebus_recovery, dict):
+        rows.extend(
+            [
+                ("FEREBUS candidate recovery", ferebus_recovery.get("status")),
+                (
+                    "FEREBUS recovery source",
+                    ferebus_recovery.get("source_path"),
+                ),
+            ]
+        )
     allocation = payload.get("point_allocation_summary")
     if isinstance(allocation, dict):
         rows.extend(
@@ -1970,6 +1981,16 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "quantum_output_rejected": "QM output rejected",
     "quantum_quality_summary": "QM quality summarised",
     "ferebus_quality_summary": "FEREBUS quality summarised",
+    "ferebus_quality_measurement_incomplete": (
+        "FEREBUS quality measurement incomplete"
+    ),
+    "ferebus_candidate_recovery_prepared": (
+        "FEREBUS candidate recovery prepared"
+    ),
+    "ferebus_candidate_recovery_materialised": (
+        "FEREBUS candidate recovery materialised"
+    ),
+    "ferebus_candidate_reprocessed": "FEREBUS candidate reprocessed",
     "ariadne_landing_rejected": "ARIADNE landing rejected",
     "ariadne_landing_summary": "ARIADNE landing summary",
     "ariadne_optional_diagnostics_warning": "ARIADNE diagnostics warning",
@@ -2082,6 +2103,8 @@ _JOURNAL_RUN_EVENTS = {
     "reference_commit_started",
     "reference_commit_move_progress",
     "reference_commit_cache_complete",
+    "ferebus_candidate_recovery_prepared",
+    "ferebus_candidate_recovery_materialised",
 }
 
 _JOURNAL_WAIT_EVENTS = {
@@ -2103,6 +2126,7 @@ _JOURNAL_WARN_EVENTS = {
     "phase_b_novelty_threshold_relaxed",
     "daemon_lease_stale_recovered",
     "user_stop_request_cancelled",
+    "ferebus_quality_measurement_incomplete",
 }
 
 _JOURNAL_FAIL_EVENTS = {
@@ -2128,6 +2152,15 @@ _SQUEUE_PENDING_STATES = {"PD", "PENDING", "CF", "CONFIGURING"}
 
 def _journal_event_severity(event: Dict[str, Any]) -> str:
     raw = str(event.get("event", ""))
+    if raw == "ferebus_candidate_reprocessed":
+        outcome = str(event.get("outcome") or "")
+        if outcome == "accepted":
+            return "OK"
+        if outcome == "measurement_incomplete":
+            return "WARN"
+        if outcome in {"rejected", "failed"}:
+            return "FAIL"
+        return "INFO"
     if raw == "ariadne_landing_summary":
         rejected = _event_int(event, "rejected")
         return "WARN" if rejected is not None and rejected > 0 else "OK"
@@ -3868,6 +3901,18 @@ def cmd_status(args: argparse.Namespace) -> int:
             }
         ]
     try:
+        from .daemon.ferebus_candidate_recovery import read_recovery_request
+
+        payload["ferebus_candidate_recovery"] = read_recovery_request(
+            campaign,
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+    except Exception as exc:
+        payload["ferebus_candidate_recovery"] = {
+            "status": "invalid",
+            "error": type(exc).__name__ + ": " + str(exc),
+        }
+    try:
         payload["latest_halt_event"] = _latest_journal_event(
             paths["journal"], "halt"
         )
@@ -5225,7 +5270,7 @@ def _reconcile_decision_payload(
         }
     )
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "campaign_dir": str(campaign),
         "proposed_state_path": (
             str(proposed_state_path) if proposed_state_path is not None else None
@@ -5254,6 +5299,10 @@ def _reconcile_decision_payload(
             compact_array_recovery_summary(getattr(report, "partial_array_recovery", None))
             if isinstance(getattr(report, "partial_array_recovery", None), dict)
             else None
+        ),
+        "ferebus_candidate_recovery": (
+            dict(getattr(report, "ferebus_candidate_recovery", {}) or {})
+            or None
         ),
         "active_submission_intents": list(getattr(report, "active_submission_intents", []) or []),
         "recommended_actions": list(getattr(report, "recommended_actions", []) or []),
@@ -5659,6 +5708,17 @@ def _print_reconcile_artefacts(
             ("reference commit", _reconcile_reference_commit_summary(report)),
         ]
     )
+    candidate_recovery = getattr(report, "ferebus_candidate_recovery", None)
+    if isinstance(candidate_recovery, dict) and candidate_recovery:
+        print(
+            "  FEREBUS candidate recovery: "
+            + str(candidate_recovery.get("status") or "unknown")
+            + " at "
+            + _reconcile_relative_path(
+                campaign,
+                candidate_recovery.get("source_path"),
+            )
+        )
     inv = getattr(report, "script_inventory", {}) or {}
     sample = inv.get("sample") if isinstance(inv, dict) else None
     if verbose and isinstance(sample, list) and sample:
@@ -6481,7 +6541,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         print(
             json.dumps(
                 {
-                    "schema_version": 3,
+                    "schema_version": 4,
                     "error": "json_apply_not_supported",
                     "message": "reconcile --json is proposal-only; rerun without --json to apply",
                 },
@@ -7007,6 +7067,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     transaction: Optional[ReconcileTransaction] = None
     planned_operations = [
         "validate_recovery_contract",
+        "prepare_ferebus_candidate_recovery",
         "repair_current_pointers",
         "write_recovered_state",
         "update_config_lock",
@@ -7248,6 +7309,42 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         _print_cleanup_already_happened(cleanup_paths_already_done)
         return 9
 
+    ferebus_recovery_request = None
+    candidate_recovery = getattr(report, "ferebus_candidate_recovery", None)
+    if isinstance(candidate_recovery, dict) and candidate_recovery:
+        try:
+            from .daemon.ferebus_candidate_recovery import (
+                prepare_recovery_request,
+            )
+
+            ferebus_recovery_request = prepare_recovery_request(
+                campaign,
+                candidate=candidate_recovery,
+                campaign_uid=str(report.proposed_state.campaign_uid),
+                phase=report.proposed_state.phase.value,
+                iteration=int(report.proposed_state.iteration),
+                reference_data_version=int(
+                    report.proposed_state.reference_data_version
+                ),
+            )
+        except Exception as exc:
+            _fail_reconcile_transaction(
+                transaction,
+                "FEREBUS candidate recovery request failed: "
+                + type(exc).__name__
+                + ": "
+                + str(exc),
+            )
+            print(
+                "refusing --apply because the existing FEREBUS candidate "
+                "could not be bound to a recovery request: "
+                + type(exc).__name__
+                + ": "
+                + str(exc),
+                file=sys.stderr,
+            )
+            return 9
+
     pointer_snapshots: List[Dict[str, Any]] = []
     try:
         if transaction is None:
@@ -7433,6 +7530,25 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                     report.bootstrap_handoff.get("n_total")
                     if report.bootstrap_handoff
                     else None
+                ),
+            )
+        if isinstance(ferebus_recovery_request, dict):
+            append_event(
+                campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
+                "ferebus_candidate_recovery_prepared",
+                phase=report.proposed_state.phase.value,
+                iteration=int(report.proposed_state.iteration),
+                reference_data_version=int(
+                    report.proposed_state.reference_data_version
+                ),
+                candidate_id=str(
+                    ferebus_recovery_request.get("candidate_id") or ""
+                ),
+                source_path=str(
+                    ferebus_recovery_request.get("source_path") or ""
+                ),
+                request_sha256=str(
+                    ferebus_recovery_request.get("request_sha256") or ""
                 ),
             )
         append_event(

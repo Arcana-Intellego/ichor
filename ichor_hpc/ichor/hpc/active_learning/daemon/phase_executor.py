@@ -34,6 +34,8 @@ from typing import Any, Dict, List, Optional, Protocol, Sequence
 
 __all__ = [
     "PhaseResult",
+    "PostprocessRetryDisposition",
+    "PostprocessFilesystemNotSettled",
     "FailureAction",
     "PhaseExecutor",
     "MockPhaseExecutor",
@@ -70,6 +72,17 @@ class FailureAction(str, Enum):
     RETRY = "RETRY"
 
 
+class PostprocessRetryDisposition(str, Enum):
+    """Declare whether one failed postprocess result may be retried in place."""
+
+    NONE = "none"
+    FILESYSTEM_SETTLE = "filesystem_settle"
+
+
+class PostprocessFilesystemNotSettled(RuntimeError):
+    """Raised before mutation when scheduler output is not yet visible."""
+
+
 @dataclass
 class PhaseResult:
     """Outcome of one PhaseExecutor call.
@@ -87,6 +100,9 @@ class PhaseResult:
     state_updates: Dict[str, Any] = field(default_factory=dict)
     journal_events: List[Dict[str, Any]] = field(default_factory=list)
     failure_reason: Optional[str] = None
+    retry_disposition: PostprocessRetryDisposition = (
+        PostprocessRetryDisposition.NONE
+    )
     submission_metadata: Dict[str, Any] = field(default_factory=dict)
     next_phase_override: Optional[str] = None
 
@@ -110,6 +126,23 @@ class PhaseResult:
             not isinstance(self.failure_reason, str) or not self.failure_reason.strip()
         ):
             raise ValueError("PhaseResult.failure_reason must be a non-empty string")
+        if not isinstance(self.retry_disposition, PostprocessRetryDisposition):
+            raise ValueError(
+                "PhaseResult.retry_disposition must be a PostprocessRetryDisposition"
+            )
+        if self.retry_disposition is not PostprocessRetryDisposition.NONE:
+            if stage != "postprocess":
+                raise ValueError(
+                    "PhaseResult retry disposition is valid only during postprocess"
+                )
+            if self.failure_reason is None:
+                raise ValueError(
+                    "PhaseResult retry disposition requires a failure reason"
+                )
+            if self.state_updates or self.next_phase_override is not None:
+                raise ValueError(
+                    "retryable postprocess failure cannot advance campaign state"
+                )
         if self.expected_tasks is not None and (
             not isinstance(self.expected_tasks, int)
             or isinstance(self.expected_tasks, bool)

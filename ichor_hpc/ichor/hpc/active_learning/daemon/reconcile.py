@@ -296,6 +296,7 @@ class ReconciliationReport:
     recommended_actions: List[str] = field(default_factory=list)
     recovery_candidates: List[Dict[str, Any]] = field(default_factory=list)
     partial_array_recovery: Optional[Dict[str, Any]] = None
+    ferebus_candidate_recovery: Optional[Dict[str, Any]] = None
     bootstrap_handoff: Optional[Dict[str, Any]] = None
     phase_a_handoff: Optional[Dict[str, Any]] = None
     artifact_snapshot: Optional[CommittedArtifactSnapshot] = field(
@@ -1494,8 +1495,55 @@ def propose_recovery(
     has_model_iteration_staging = model_iteration_staging.is_dir()
     recoverable_ferebus_staging = False
     recoverable_ferebus_reason = ""
+    if has_model_iteration_staging and not model_iteration_staging.is_symlink():
+        try:
+            from .ferebus_candidate_recovery import read_recovery_request
+
+            recovery_request = read_recovery_request(
+                campaign,
+                expected_campaign_uid=(
+                    str(existing.campaign_uid) if existing is not None else None
+                ),
+            )
+            recovery_source = (
+                campaign_owned_path(
+                    campaign,
+                    str(recovery_request.get("source_path") or ""),
+                )
+                if isinstance(recovery_request, dict)
+                else None
+            )
+            recovery_staging = (
+                campaign_owned_path(
+                    campaign,
+                    str(recovery_request.get("staging_path") or ""),
+                )
+                if isinstance(recovery_request, dict)
+                and recovery_request.get("staging_path")
+                else None
+            )
+            if (
+                isinstance(recovery_request, dict)
+                and str(recovery_request.get("status")) in {
+                    "prepared",
+                    "measurement_incomplete",
+                    "materialised",
+                }
+                and (
+                    recovery_source == model_iteration_staging.absolute()
+                    or recovery_staging == model_iteration_staging.absolute()
+                )
+            ):
+                recoverable_ferebus_staging = True
+                recoverable_ferebus_reason = (
+                    "FEREBUS iteration-staging is protected by recovery request "
+                    + str(recovery_request.get("request_sha256") or "")
+                )
+        except Exception as exc:
+            recoverable_ferebus_reason = type(exc).__name__ + ": " + str(exc)[:180]
     if (
-        verification_level != "authority"
+        not recoverable_ferebus_staging
+        and verification_level != "authority"
         and has_model_iteration_staging
         and not model_iteration_staging.is_symlink()
     ):
@@ -2410,6 +2458,41 @@ def propose_recovery(
             blocking_artifacts.append("proposed state")
             decision = "HALTED: proposed recovery failed final contract validation"
             notes.append("re-entry HALTED because proposed state failed final contract validation")
+    ferebus_candidate_recovery: Optional[Dict[str, Any]] = None
+    if recovered.phase in {
+        CampaignPhase.INITIAL_FEREBUS,
+        CampaignPhase.FEREBUS,
+    }:
+        try:
+            from .ferebus_candidate_recovery import discover_recovery_candidate
+
+            ferebus_candidate_recovery = discover_recovery_candidate(
+                campaign,
+                expected_campaign_uid=str(recovered.campaign_uid),
+                reference_data_version=int(recovered.reference_data_version),
+            )
+        except Exception as exc:
+            reason = (
+                "FEREBUS candidate recovery is ambiguous or invalid: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:300]
+            )
+            unsafe_reasons.append(reason)
+            blocking_artifacts.append("FEREBUS candidate recovery")
+            recovered.phase = CampaignPhase.HALTED
+            decision = "HALTED: FEREBUS candidate recovery requires user review"
+        else:
+            if ferebus_candidate_recovery is not None:
+                trusted_artifacts.append(
+                    "recoverable FEREBUS raw candidate at "
+                    + str(ferebus_candidate_recovery.get("source_path") or "")
+                )
+                notes.append(
+                    "existing authenticated FEREBUS output can be reprocessed "
+                    "without another scheduler submission"
+                )
+
     if recovered.phase is CampaignPhase.HALTED and not recommended_actions:
         recommended_actions.append("Inspect unsafe recovery reasons before applying.")
     if recovered.phase is CampaignPhase.HALTED:
@@ -2502,6 +2585,7 @@ def propose_recovery(
             if isinstance(partial_array_recovery, dict)
             else None
         ),
+        ferebus_candidate_recovery=ferebus_candidate_recovery,
         bootstrap_handoff=bootstrap_handoff,
         phase_a_handoff=phase_a_handoff,
         artifact_snapshot=artifact_snapshot,

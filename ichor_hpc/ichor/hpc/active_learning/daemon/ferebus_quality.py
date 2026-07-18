@@ -16,11 +16,20 @@ FEREBUS_QUALITY_MANIFEST = "FEREBUS_QUALITY.json"
 FEREBUS_QUALITY_SCHEMA_VERSION = 4
 FEREBUS_QUALITY_DECISION_MANIFEST = "FEREBUS_QUALITY_DECISION.json"
 FEREBUS_QUALITY_DECISION_SCHEMA_VERSION = 2
+
+_PERFORMANCE_METRIC_ALIASES = {
+    "weights_l2_nor": "weights_l2_norm",
+    "covariance_con": "covariance_condition_number",
+}
 _PREDICTION_CHUNK_SIZE = 512
 
 
 class FerebusQualityDecisionError(ValueError):
     """Raised when FEREBUS quality evidence or its decision is untrustworthy."""
+
+
+class FerebusQualityMeasurementIncomplete(FerebusQualityDecisionError):
+    """Raised when raw FEREBUS outputs cannot yet support a quality decision."""
 
 
 def _exact_int(value: Any, label: str, *, minimum: int = 0) -> int:
@@ -197,9 +206,13 @@ def _parse_perf(path: Path) -> Dict[str, float]:
                 "FEREBUS performance receipt row has invalid cardinality at line "
                 + str(line_number)
             )
-        key = parts[0]
+        raw_key = parts[0]
+        key = _PERFORMANCE_METRIC_ALIASES.get(raw_key, raw_key)
         if key in values:
-            raise ValueError("duplicate FEREBUS performance metric " + repr(key))
+            raise ValueError(
+                "duplicate or ambiguous FEREBUS performance metric "
+                + repr(key)
+            )
         try:
             value = float(parts[1])
         except ValueError as exc:
@@ -410,6 +423,10 @@ def write_ferebus_quality_manifest(staging_dir: Path, payload: Mapping[str, Any]
     staging.mkdir(parents=True, exist_ok=True)
     path = staging / FEREBUS_QUALITY_MANIFEST
     material = dict(payload)
+    if material.get("measurement_complete") is not True:
+        raise FerebusQualityMeasurementIncomplete(
+            "incomplete FEREBUS measurement cannot become canonical quality evidence"
+        )
     if path.exists() or path.is_symlink():
         if path.is_symlink() or not path.is_file():
             raise FerebusQualityDecisionError(
@@ -848,6 +865,16 @@ def evaluate_ferebus_quality_decision(
     gates: Any,
 ) -> Dict[str, Any]:
     """Apply current policy thresholds to immutable raw FEREBUS metrics."""
+    if quality.get("measurement_complete") is not True:
+        errors = quality.get("measurement_errors")
+        detail = (
+            ";".join(str(value) for value in errors[:3])
+            if isinstance(errors, list) and errors
+            else "measurement evidence is incomplete"
+        )
+        raise FerebusQualityMeasurementIncomplete(
+            "FEREBUS quality measurement is incomplete: " + detail[:300]
+        )
     min_ext_r2 = _threshold(
         gates,
         "ferebus_min_ext_r2",
@@ -1100,6 +1127,7 @@ __all__ = [
     "FEREBUS_QUALITY_DECISION_SCHEMA_VERSION",
     "FEREBUS_QUALITY_MANIFEST",
     "FEREBUS_QUALITY_SCHEMA_VERSION",
+    "FerebusQualityMeasurementIncomplete",
     "FerebusQualityDecisionError",
     "evaluate_ferebus_quality",
     "evaluate_ferebus_quality_decision",

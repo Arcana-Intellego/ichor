@@ -66,6 +66,7 @@ from .phase_executor import (
     FailureAction,
     INLINE_PHASES,
     PhaseResult,
+    PostprocessRetryDisposition,
     SBATCH_PHASES,
 )
 from .resource_solver import (
@@ -1695,6 +1696,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
     def _submit_ferebus_phase(self, state, phase_name: str) -> PhaseResult:
         from . import input_staging as _stg
+        from .ferebus_candidate_recovery import (
+            materialise_recovery_candidate,
+            read_recovery_request,
+            update_recovery_status,
+        )
         from ..submit.pyferebus_wrap import FerebusSubmissionError, submit_ferebus
 
         try:
@@ -1720,6 +1726,68 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         + " is ahead of committed reference-data versions "
                         + repr(committed)
                     )
+            recovery = read_recovery_request(
+                self.campaign_dir,
+                expected_campaign_uid=str(state.campaign_uid),
+            )
+            if recovery is not None and str(recovery.get("status")) in {
+                "prepared",
+                "measurement_incomplete",
+                "materialised",
+            }:
+                recovered_staging = materialise_recovery_candidate(
+                    self.campaign_dir,
+                    campaign_uid=str(state.campaign_uid),
+                    phase=phase_name,
+                    iteration=int(getattr(state, "iteration", 0)),
+                    reference_data_version=int(tv),
+                )
+                if recovered_staging is None:
+                    raise BackendSubmissionError(
+                        "active FEREBUS recovery request could not be materialised"
+                    )
+                self._journal_event(
+                    "ferebus_candidate_recovery_materialised",
+                    phase=phase_name,
+                    iteration=int(getattr(state, "iteration", 0)),
+                    reference_data_version=int(tv),
+                    candidate_id=str(recovery.get("candidate_id") or ""),
+                    staging=str(recovered_staging),
+                    scheduler_jobs_submitted=0,
+                )
+                result = self._parse_ferebus_postprocess(state, phase_name, [])
+                quality_disposition = str(
+                    (result.submission_metadata or {}).get(
+                        "ferebus_quality_disposition", ""
+                    )
+                )
+                if result.failure_reason is None:
+                    recovery_status = "accepted"
+                elif quality_disposition == "measurement_incomplete":
+                    recovery_status = "measurement_incomplete"
+                elif quality_disposition == "quality_rejected":
+                    recovery_status = "rejected"
+                else:
+                    recovery_status = "failed"
+                update_recovery_status(
+                    self.campaign_dir,
+                    campaign_uid=str(state.campaign_uid),
+                    status=recovery_status,
+                    staging_path=(
+                        recovered_staging if recovered_staging.exists() else None
+                    ),
+                    last_error=result.failure_reason,
+                )
+                self._journal_event(
+                    "ferebus_candidate_reprocessed",
+                    phase=phase_name,
+                    iteration=int(getattr(state, "iteration", 0)),
+                    reference_data_version=int(tv),
+                    candidate_id=str(recovery.get("candidate_id") or ""),
+                    outcome=recovery_status,
+                    scheduler_jobs_submitted=0,
+                )
+                return result
             staging, n_tasks = _stg.stage_ferebus_inputs(
                 self.campaign_dir,
                 self.config,
@@ -2713,6 +2781,9 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 failure_reason=(
                     "no_pointdirs_in_staging: " + str(staging_root)
                 ),
+                retry_disposition=(
+                    PostprocessRetryDisposition.FILESYSTEM_SETTLE
+                ),
             )
         try:
             point_names = _stg._points_file_names(staging_root)
@@ -2790,6 +2861,9 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     failure_reason=(
                         "aimall_outputs_not_settled_missing_or_unreadable: "
                         + "; ".join(unsettled[:8])
+                    ),
+                    retry_disposition=(
+                        PostprocessRetryDisposition.FILESYSTEM_SETTLE
                     ),
                 )
 
@@ -3481,6 +3555,13 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             return PhaseResult(
                 is_complete=True,
                 failure_reason="ferebus_staging_invalid: " + reason,
+                retry_disposition=(
+                    PostprocessRetryDisposition.FILESYSTEM_SETTLE
+                    if reason == "ferebus_staging_missing"
+                    or reason.startswith("expected_model_missing")
+                    or "task receipt is missing" in reason
+                    else PostprocessRetryDisposition.NONE
+                ),
             )
 
         try:
@@ -3497,6 +3578,57 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 staging,
                 getattr(self.config, "quality_gates", None),
             )
+            if quality.get("measurement_complete") is not True:
+                from .ferebus_candidate_recovery import (
+                    prepare_staging_recovery_request,
+                    write_quality_attempt,
+                )
+
+                attempt_path = write_quality_attempt(
+                    self.campaign_dir,
+                    phase=phase_name,
+                    iteration=int(state.iteration),
+                    quality=quality,
+                )
+                recovery = prepare_staging_recovery_request(
+                    self.campaign_dir,
+                    campaign_uid=str(state.campaign_uid),
+                    phase=phase_name,
+                    iteration=int(state.iteration),
+                    reference_data_version=int(expected_next),
+                    staging_dir=staging,
+                    quality_attempt_path=attempt_path,
+                )
+                errors = [
+                    str(value) for value in quality.get("measurement_errors", [])
+                ]
+                self._journal_event(
+                    "ferebus_quality_measurement_incomplete",
+                    phase=phase_name,
+                    iteration=int(state.iteration),
+                    reference_data_version=int(expected_next),
+                    n_measurement_failures=int(
+                        (quality.get("summary") or {}).get(
+                            "n_measurement_failures", 0
+                        )
+                    ),
+                    quality_attempt=str(attempt_path),
+                    recovery_request=str(
+                        recovery.get("request_sha256") or ""
+                    ),
+                    errors=errors[:8],
+                )
+                return PhaseResult(
+                    is_complete=True,
+                    failure_reason=(
+                        "ferebus_quality_measurement_incomplete: "
+                        + ";".join(errors)[:300]
+                    ),
+                    submission_metadata={
+                        "ferebus_quality_disposition": "measurement_incomplete",
+                        "quality_attempt_path": str(attempt_path),
+                    },
+                )
             quality_path = write_ferebus_quality_manifest(staging, quality)
             config_sha = config_fingerprint(canonical_config(self.config))
             decision_path = write_ferebus_quality_decision(
@@ -3564,6 +3696,9 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     + ";".join(
                         str(r) for r in current_decision.get("reasons", [])
                     )[:300],
+                    submission_metadata={
+                        "ferebus_quality_disposition": "quality_rejected",
+                    },
                 )
         except Exception as exc:
             return PhaseResult(
@@ -3574,6 +3709,9 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     + ": "
                     + str(exc)
                 ),
+                submission_metadata={
+                    "ferebus_quality_disposition": "measurement_failed",
+                },
             )
 
         v_models.recover_dangling_staging()

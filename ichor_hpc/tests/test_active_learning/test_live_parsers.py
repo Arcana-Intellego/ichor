@@ -1368,6 +1368,265 @@ def test_rejected_ferebus_candidate_is_quarantined_without_model_commit(tmp_path
     assert len(quarantined_quality) == 1
 
 
+def test_incomplete_ferebus_measurement_preserves_raw_staging(tmp_path):
+    from ichor.hpc.active_learning.daemon.ferebus_candidate_recovery import (
+        read_recovery_request,
+    )
+    from ichor.hpc.active_learning.daemon.ferebus_task_runner import (
+        write_preexisting_model_receipts,
+    )
+
+    ex = _make_executor(tmp_path)
+    _commit_bootstrap_reference_data(ex.campaign_dir)
+    staging = _seed_models_staging(ex.campaign_dir)
+    perf = staging / "iqa" / "O1" / "WATER_iqa_O1.perf"
+    perf.write_text(
+        "RMSE 0.0\nMAE 0.0\nunknown_metric 1.0\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    write_preexisting_model_receipts(
+        staging,
+        execution_kind="synthetic_dry_run",
+    )
+
+    result = ex._parse_ferebus_postprocess(
+        SimpleNamespace(
+            iteration=0,
+            campaign_uid="m16-test",
+            reference_data_version=0,
+        ),
+        CampaignPhase("INITIAL_FEREBUS"),
+        observations=[],
+    )
+
+    assert result.failure_reason.startswith(
+        "ferebus_quality_measurement_incomplete:"
+    )
+    assert staging.is_dir()
+    assert not (staging / "FEREBUS_QUALITY.json").exists()
+    assert not (staging / "FEREBUS_QUALITY_DECISION.json").exists()
+    assert not (
+        ex.campaign_dir / "TRAINED_MODELS" / "rejected-candidates"
+    ).exists()
+    attempts = list(
+        (
+            ex.campaign_dir
+            / ".DATA"
+            / "ACTIVE_LEARNING"
+            / "ferebus_quality_attempts"
+        ).glob("reference-000000/*/*.json")
+    )
+    assert len(attempts) == 1
+    request = read_recovery_request(
+        ex.campaign_dir,
+        expected_campaign_uid="m16-test",
+    )
+    assert request is not None
+    assert request["status"] == "measurement_incomplete"
+
+
+def test_legacy_measurement_quarantine_is_copied_for_inline_recovery(tmp_path):
+    from ichor.hpc.active_learning.daemon.ferebus_candidate_recovery import (
+        discover_recovery_candidate,
+        materialise_recovery_candidate,
+        prepare_recovery_request,
+    )
+    from ichor.hpc.active_learning.daemon.state import atomic_write_json
+
+    ex = _make_executor(tmp_path)
+    _commit_bootstrap_reference_data(ex.campaign_dir)
+    staging = _seed_models_staging(ex.campaign_dir)
+    quarantine = (
+        ex.campaign_dir
+        / "TRAINED_MODELS"
+        / "rejected-candidates"
+        / "reference-000000"
+        / ("a" * 16)
+    )
+    quarantine.parent.mkdir(parents=True)
+    shutil.move(str(staging), str(quarantine))
+    measurement_error = (
+        "ferebus_quality_metric_failed:ValueError:"
+        "FEREBUS performance receipt is missing "
+        "['covariance_condition_number']"
+    )
+    atomic_write_json(
+        quarantine / "FEREBUS_QUALITY.json",
+        {
+            "schema_version": 4,
+            "campaign_uid": "m16-test",
+            "reference_data_version": 0,
+            "measurement_complete": False,
+            "measurement_errors": [measurement_error],
+        },
+    )
+    from ichor.hpc.active_learning.daemon.completion_receipts import (
+        canonical_sha256,
+    )
+    from ichor.hpc.active_learning.versioning.manifest import sha256_file
+
+    quality_path = quarantine / "FEREBUS_QUALITY.json"
+    evaluation = {
+        "accepted": False,
+        "reasons": [
+            "ferebus_aggregate_metric_missing",
+            measurement_error,
+        ],
+    }
+    evaluation_digest = canonical_sha256(evaluation)
+    evaluation["evaluation_sha256"] = evaluation_digest
+    atomic_write_json(
+        quarantine / "FEREBUS_QUALITY_DECISION.json",
+        {
+            "schema_version": 2,
+            "campaign_uid": "m16-test",
+            "reference_data_version": 0,
+            "quality": {
+                "path": "FEREBUS_QUALITY.json",
+                "size": quality_path.stat().st_size,
+                "sha256": sha256_file(quality_path),
+            },
+            "evaluations": [evaluation],
+            "current_evaluation_sha256": evaluation_digest,
+        },
+    )
+    source_bytes = {
+        path.relative_to(quarantine).as_posix(): path.read_bytes()
+        for path in quarantine.rglob("*")
+        if path.is_file()
+    }
+
+    candidate = discover_recovery_candidate(
+        ex.campaign_dir,
+        expected_campaign_uid="m16-test",
+        reference_data_version=0,
+    )
+    assert candidate is not None
+    prepare_recovery_request(
+        ex.campaign_dir,
+        candidate=candidate,
+        campaign_uid="m16-test",
+        phase="INITIAL_FEREBUS",
+        iteration=0,
+        reference_data_version=0,
+    )
+    recovered = materialise_recovery_candidate(
+        ex.campaign_dir,
+        campaign_uid="m16-test",
+        phase="INITIAL_FEREBUS",
+        iteration=0,
+        reference_data_version=0,
+    )
+
+    assert recovered == staging
+    assert recovered.is_dir()
+    assert not (recovered / "FEREBUS_QUALITY.json").exists()
+    assert not (recovered / "FEREBUS_QUALITY_DECISION.json").exists()
+    assert (recovered / "iqa" / "O1" / "WATER_iqa_O1.perf").is_file()
+    assert source_bytes == {
+        path.relative_to(quarantine).as_posix(): path.read_bytes()
+        for path in quarantine.rglob("*")
+        if path.is_file()
+    }
+
+
+def test_submit_ferebus_reprocesses_active_recovery_without_sbatch(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon import ferebus_candidate_recovery
+
+    ex = _make_executor(tmp_path)
+    staging = ex.campaign_dir / "TRAINED_MODELS" / "iteration-staging"
+    staging.mkdir(parents=True)
+    recovery = {
+        "status": "prepared",
+        "candidate_id": "candidate-a",
+    }
+    statuses = []
+    monkeypatch.setattr(
+        ferebus_candidate_recovery,
+        "read_recovery_request",
+        lambda *_args, **_kwargs: dict(recovery),
+    )
+    monkeypatch.setattr(
+        ferebus_candidate_recovery,
+        "materialise_recovery_candidate",
+        lambda *_args, **_kwargs: staging,
+    )
+    monkeypatch.setattr(
+        ferebus_candidate_recovery,
+        "update_recovery_status",
+        lambda *_args, **kwargs: statuses.append(kwargs["status"]),
+    )
+    monkeypatch.setattr(
+        ex,
+        "_parse_ferebus_postprocess",
+        lambda *_args, **_kwargs: PhaseResult(
+            is_complete=True,
+            state_updates={"models_version": 0},
+        ),
+    )
+
+    result = ex._submit_ferebus_phase(
+        SimpleNamespace(
+            iteration=0,
+            campaign_uid="m16-test",
+            reference_data_version=0,
+        ),
+        "INITIAL_FEREBUS",
+    )
+
+    assert result.failure_reason is None
+    assert result.state_updates == {"models_version": 0}
+    assert statuses == ["accepted"]
+
+
+def test_recovery_can_record_terminal_status_after_staging_is_moved(tmp_path):
+    from ichor.hpc.active_learning.daemon.ferebus_candidate_recovery import (
+        prepare_staging_recovery_request,
+        read_recovery_request,
+        update_recovery_status,
+    )
+    from ichor.hpc.active_learning.daemon.state import atomic_write_json
+
+    campaign = tmp_path / "campaign"
+    staging = campaign / "TRAINED_MODELS" / "iteration-staging"
+    staging.mkdir(parents=True)
+    atomic_write_json(staging / "FEREBUS_TASKS.json", {"tasks": []})
+    atomic_write_json(staging / "FEREBUS_TASK_MAP.json", {"tasks": []})
+    attempt = campaign / ".DATA" / "ACTIVE_LEARNING" / "attempt.json"
+    attempt.parent.mkdir(parents=True)
+    atomic_write_json(attempt, {"schema_version": 1})
+    prepare_staging_recovery_request(
+        campaign,
+        campaign_uid="recovery-test",
+        phase="INITIAL_FEREBUS",
+        iteration=0,
+        reference_data_version=0,
+        staging_dir=staging,
+        quality_attempt_path=attempt,
+    )
+    quarantine = campaign / "TRAINED_MODELS" / "rejected-candidate"
+    staging.rename(quarantine)
+
+    update_recovery_status(
+        campaign,
+        campaign_uid="recovery-test",
+        status="rejected",
+        last_error="quality threshold failed",
+    )
+
+    request = read_recovery_request(
+        campaign,
+        expected_campaign_uid="recovery-test",
+    )
+    assert request is not None
+    assert request["status"] == "rejected"
+    assert request["last_error"] == "quality threshold failed"
+
+
 def test_trained_model_resolver_rejects_post_commit_model_tamper(tmp_path):
     ex = _make_executor(tmp_path)
     _commit_bootstrap_reference_data(ex.campaign_dir)

@@ -2549,7 +2549,7 @@ def test_cli_reconcile_json_outputs_machine_readable_decision(tmp_path, capsys):
     assert rc == 0
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 4
     assert payload["campaign_dir"] == str(campaign)
     assert payload["proposed_state_path"].endswith("state.json.proposed")
     assert "selected_phase" in payload
