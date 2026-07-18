@@ -31,6 +31,15 @@ ENVIRONMENT_GENERATION_SCHEMA_VERSION = 1
 ENVIRONMENT_CURRENT_SCHEMA_VERSION = 1
 VALID_EXECUTION_MODES = frozenset({"live", "dry_run"})
 
+_REBINDABLE_REFERENCE_COMMIT_STATES = frozenset(
+    {
+        "prepared",
+        "partially_moved",
+        "cache_incomplete",
+        "publication_incomplete",
+    }
+)
+
 _ENVIRONMENT_FINGERPRINT_KEYS = (
     "python_executable",
     "python_version",
@@ -850,12 +859,13 @@ def rebind_environment(
     live_preflight_ok: bool = False,
     scheduler_ownership_clear: bool = False,
 ) -> Dict[str, Any]:
-    """Bind an idle campaign to the current verified execution environment.
+    """Bind a campaign at a verified safe boundary to the current environment.
 
     Generation publication is ordered so interruption remains fail-closed:
     write the immutable generation, clear derived reference scales in state,
     then advance the current pointer.  Repeating the command after any partial
-    attempt is safe.
+    attempt is safe.  An unpublished, valid REFERENCE_COMMIT transaction is a
+    recovery boundary because it is local, resumable and owns no scheduler job.
     """
     campaign = Path(campaign_dir).resolve()
     state = read_state(operational_path(campaign, "state.json"))
@@ -867,9 +877,52 @@ def rebind_environment(
         raise ExecutionIdentityError(
             "live environment rebind requires a successful backend preflight"
         )
-    if state.phase not in {CampaignPhase.SEED_SELECT, CampaignPhase.DONE}:
+    if state.phase is CampaignPhase.REFERENCE_COMMIT:
+        from .daemon.reference_commit import classify_reference_commit
+
+        context = "bootstrap" if int(state.iteration) == 0 else "active"
+        reference_commit_recovery = classify_reference_commit(
+            campaign,
+            context=context,
+            iteration=int(state.iteration),
+        )
+        recovery_state = str(reference_commit_recovery.get("state") or "")
+        if recovery_state not in _REBINDABLE_REFERENCE_COMMIT_STATES:
+            detail = str(reference_commit_recovery.get("reason") or recovery_state)
+            raise ExecutionIdentityError(
+                "environment rebind at REFERENCE_COMMIT requires a valid "
+                "unpublished recovery transaction; observed "
+                + detail
+            )
+        ledger = reference_commit_recovery.get("ledger")
+        if not isinstance(ledger, Mapping):
+            raise ExecutionIdentityError(
+                "environment rebind at REFERENCE_COMMIT lacks a valid transaction ledger"
+            )
+        expected_reference_version = int(state.iteration) - 1
+        observed_identity = (
+            str(ledger.get("campaign_uid") or ""),
+            int(ledger.get("iteration", -1)),
+            int(ledger.get("reference_data_version", -1)),
+            str(ledger.get("context") or ""),
+            int(state.reference_data_version),
+        )
+        expected_identity = (
+            str(state.campaign_uid),
+            int(state.iteration),
+            int(state.iteration),
+            context,
+            expected_reference_version,
+        )
+        if observed_identity != expected_identity:
+            raise ExecutionIdentityError(
+                "environment rebind at REFERENCE_COMMIT found inconsistent "
+                "campaign, iteration, or reference-version identity"
+            )
+    elif state.phase not in {CampaignPhase.SEED_SELECT, CampaignPhase.DONE}:
         raise ExecutionIdentityError(
-            "environment rebind requires an idle SEED_SELECT or DONE boundary"
+            "environment rebind requires an idle SEED_SELECT or DONE boundary, "
+            "or a verified unpublished REFERENCE_COMMIT recovery transaction"
         )
     if any(value is not None for value in state.pending_jobs.values()):
         raise ExecutionIdentityError(

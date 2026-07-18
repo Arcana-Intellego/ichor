@@ -9275,7 +9275,7 @@ Examples:
 
     p_rebind_environment = sub.add_parser(
         "rebind-environment",
-        help="Bind an idle campaign to a newly verified environment generation.",
+        help="Bind a campaign at a verified safe boundary to a new environment generation.",
     )
     add_campaign(p_rebind_environment)
     p_rebind_environment.add_argument(

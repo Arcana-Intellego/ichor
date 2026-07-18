@@ -386,6 +386,106 @@ def test_rebind_rejects_non_idle_or_scheduler_owned_state(tmp_path, monkeypatch)
         rebind_environment(campaign, config=config)
 
 
+def test_rebind_accepts_verified_unpublished_reference_commit_recovery(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.REFERENCE_COMMIT
+    state.iteration = 0
+    state.reference_data_version = -1
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.reference_commit.classify_reference_commit",
+        lambda *_args, **_kwargs: {
+            "state": "prepared",
+            "ledger": {
+                "campaign_uid": state.campaign_uid,
+                "iteration": 0,
+                "reference_data_version": 0,
+                "context": "bootstrap",
+            },
+        },
+    )
+
+    result = rebind_environment(
+        campaign,
+        config=config,
+        scheduler_ownership_clear=True,
+    )
+
+    assert result["changed"] is True
+    assert result["generation"] == 1
+    recovered = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
+    assert recovered.phase is CampaignPhase.REFERENCE_COMMIT
+    assert recovered.reference_data_version == -1
+
+
+@pytest.mark.parametrize("transaction_state", ["absent", "invalid", "published"])
+def test_rebind_rejects_unverified_or_published_reference_commit_recovery(
+    tmp_path,
+    monkeypatch,
+    transaction_state,
+):
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.REFERENCE_COMMIT
+    state.iteration = 0
+    state.reference_data_version = -1
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.reference_commit.classify_reference_commit",
+        lambda *_args, **_kwargs: {
+            "state": transaction_state,
+            "reason": "test transaction is not safely rebindable",
+        },
+    )
+
+    with pytest.raises(
+        ExecutionIdentityError,
+        match="valid unpublished recovery transaction",
+    ):
+        rebind_environment(
+            campaign,
+            config=config,
+            scheduler_ownership_clear=True,
+        )
+
+
+def test_rebind_rejects_reference_commit_transaction_identity_mismatch(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.REFERENCE_COMMIT
+    state.iteration = 0
+    state.reference_data_version = -1
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.reference_commit.classify_reference_commit",
+        lambda *_args, **_kwargs: {
+            "state": "prepared",
+            "ledger": {
+                "campaign_uid": "different-campaign",
+                "iteration": 0,
+                "reference_data_version": 0,
+                "context": "bootstrap",
+            },
+        },
+    )
+
+    with pytest.raises(ExecutionIdentityError, match="inconsistent campaign"):
+        rebind_environment(
+            campaign,
+            config=config,
+            scheduler_ownership_clear=True,
+        )
+
+
 def test_rebind_requires_conclusive_scheduler_clearance(tmp_path, monkeypatch):
     campaign, config, _state = _rebind_campaign(tmp_path, monkeypatch)
 
