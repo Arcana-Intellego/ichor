@@ -34,7 +34,7 @@ import time
 from ..strict_json import strict_json as json
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from ..config import CampaignConfig
 from ..versioning.provenance import (
@@ -1385,11 +1385,12 @@ class DryRunPhaseExecutor:
         started = time.monotonic()
 
         def _progress(event_type, payload):
-            self._journal_event(
+            self._journal_phase_event(
                 str(event_type),
+                phase=CampaignPhase.REFERENCE_COMMIT,
                 iteration=int(iteration),
+                payload=payload,
                 reference_data_version=int(target_version),
-                **dict(payload),
             )
 
         try:
@@ -1420,8 +1421,9 @@ class DryRunPhaseExecutor:
                 for pdir_name in committed_pointdirs
             ],
         )
-        self._journal_event(
+        self._journal_phase_event(
             "reference_data_committed",
+            phase=CampaignPhase.REFERENCE_COMMIT,
             iteration=int(state.iteration),
             reference_data_version=int(target_version),
             n_committed_points=int(len(committed_pointdirs)) if created else 0,
@@ -2514,6 +2516,29 @@ class DryRunPhaseExecutor:
             "seed_frame_id": seed.get("frame_id"),
             "trajectory_sha256": str(data["trajectory_sha256"]),
         }
+
+    def _journal_phase_event(
+        self,
+        event_type: str,
+        *,
+        phase: Any,
+        iteration: int,
+        payload: Optional[Mapping[str, Any]] = None,
+        **context: Any,
+    ) -> None:
+        """Journal an event with canonical phase and iteration context.
+
+        Progress producers own their measurements, while the executor owns
+        FSM context.  Canonical context is assigned last so a malformed or
+        stale callback payload cannot mislabel the event.
+        """
+        event_payload = dict(payload or {})
+        event_payload.update(context)
+        event_payload["phase"] = (
+            phase.value if hasattr(phase, "value") else str(phase)
+        )
+        event_payload["iteration"] = int(iteration)
+        self._journal_event(str(event_type), **event_payload)
 
     def _journal_event(self, event_type: str, **payload) -> None:
         """Robust append to the daemon journal. The journal path is

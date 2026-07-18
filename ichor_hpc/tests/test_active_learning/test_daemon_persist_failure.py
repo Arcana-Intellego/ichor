@@ -151,6 +151,53 @@ def test_inline_reference_commit_idempotent_skip_journals_clearly(tmp_path):
     ]
     commits = [e for e in events if e.get("event") == "reference_data_committed"]
     assert any(e.get("idempotent_skip") is True for e in commits)
+    reference_events = [
+        event
+        for event in events
+        if str(event.get("event") or "").startswith("reference_commit_")
+        or event.get("event") == "reference_data_committed"
+    ]
+    assert reference_events
+    assert all(
+        event.get("phase") == CampaignPhase.REFERENCE_COMMIT.value
+        for event in reference_events
+    )
+    assert all(isinstance(event.get("iteration"), int) for event in reference_events)
+
+
+def test_phase_journal_context_cannot_be_overridden_by_progress_payload(
+    tmp_path,
+    monkeypatch,
+):
+    ex = _make_executor(tmp_path)
+    recorded = []
+    monkeypatch.setattr(
+        ex,
+        "_journal_event",
+        lambda event_type, **payload: recorded.append((event_type, payload)),
+    )
+
+    ex._journal_phase_event(
+        "reference_commit_move_progress",
+        phase=CampaignPhase.REFERENCE_COMMIT,
+        iteration=3,
+        payload={
+            "phase": "WRONG_PHASE",
+            "iteration": 999,
+            "moved_points": 32,
+        },
+    )
+
+    assert recorded == [
+        (
+            "reference_commit_move_progress",
+            {
+                "phase": CampaignPhase.REFERENCE_COMMIT.value,
+                "iteration": 3,
+                "moved_points": 32,
+            },
+        )
+    ]
 
 
 def test_inline_reference_commit_idempotent_skip_repairs_current_pointer(tmp_path):
