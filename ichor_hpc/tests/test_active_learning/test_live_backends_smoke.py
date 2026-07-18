@@ -2252,6 +2252,61 @@ def test_configured_batch_python_probe_accepts_newer_supported_version(monkeypat
     assert error == ""
 
 
+def test_configured_batch_python_probe_runs_initialised_ariadne_smoke(monkeypatch):
+    from ichor.hpc.active_learning.daemon import preflight
+
+    executable = "/home/user/.venv/ichor-csf3/bin/python"
+    monkeypatch.setattr(preflight.os.path, "isfile", lambda value: value == executable)
+    monkeypatch.setattr(preflight.os, "access", lambda value, mode: value == executable)
+    monkeypatch.setattr(
+        preflight.shutil,
+        "which",
+        lambda name: "/bin/bash" if name == "bash" else None,
+    )
+    scripts = []
+    statuses = {
+        label: {"ok": True, "error": ""}
+        for label in SUBMITTED_PYTHON_IMPORTS
+    }
+    statuses["ariadne"].update(
+        {
+            "abi": {"contract_version": 1},
+            "runtime_smoke": {
+                "probe": "initialise_without_step",
+                "trqn": {"initialised": True, "status_length": 89},
+                "ds": {"initialised": True, "status_length": 42},
+            },
+        }
+    )
+
+    def fake_run(command, **_kwargs):
+        scripts.append(command[-1])
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "executable": executable,
+                    "version": [3, 11, 15],
+                    "modules": statuses,
+                }
+            )
+            + "\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(preflight.subprocess, "run", fake_run)
+
+    ok, _version, error, imports = preflight._probe_configured_python_details(
+        executable,
+        ["mkl/2025.0"],
+    )
+
+    assert ok is True
+    assert error == ""
+    assert imports["ariadne"]["runtime_smoke"]["trqn"]["status_length"] == 89
+    assert "probe_ariadne_runtime" in scripts[0]
+
+
 def test_configured_batch_python_probe_reports_submitted_import_failure(monkeypatch):
     from ichor.hpc.active_learning.daemon import preflight
 

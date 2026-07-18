@@ -2100,7 +2100,7 @@ def test_ariadne_parser_uses_result_resolved_protocol_manifest(tmp_path):
         state, CampaignPhase("ARIADNE_ARRAY"), observations=[],
     )
 
-    assert result.failure_reason == "ariadne_no_seed_results_parsed: 1"
+    assert result.failure_reason == "ariadne_no_usable_seed_results: 1"
     manifest = json.loads(ariadne_results_path(iter_dir).read_text(encoding="utf-8"))
     assert manifest["n_accepted"] == 0
     assert manifest["rejected"][0]["reason"] == "ariadne_max_displacement_threshold_exceeded"
@@ -2132,7 +2132,7 @@ def test_ariadne_parser_rejects_sampling_protocol_hash_drift(tmp_path):
         observations=[],
     )
 
-    assert result.failure_reason == "ariadne_no_seed_results_parsed: 1"
+    assert result.failure_reason == "ariadne_no_usable_seed_results: 1"
     manifest = json.loads(
         ariadne_results_path(iter_dir).read_text(encoding="utf-8")
     )
@@ -2242,7 +2242,7 @@ def test_ariadne_parser_rejects_explicit_unsuccessful_task(tmp_path):
         state, CampaignPhase("ARIADNE_ARRAY"), observations=[],
     )
 
-    assert result.failure_reason == "ariadne_no_seed_results_parsed: 1"
+    assert result.failure_reason == "ariadne_no_usable_seed_results: 1"
     iter_dir = active_iteration_dir(tmp_path / "campaign", 4)
     manifest = json.loads(ariadne_results_path(iter_dir).read_text(encoding="utf-8"))
     assert manifest["n_accepted"] == 0
@@ -2257,6 +2257,20 @@ def test_ariadne_parser_rejects_explicit_unsuccessful_task(tmp_path):
     assert audit["seeds"][0]["handoff_rejection_reason"] == (
         "ariadne_unusable:runner_failed_after_result_write"
     )
+    summary = next(
+        event
+        for event in _read_journal_events(tmp_path / "campaign")
+        if event.get("event") == "ariadne_landing_summary"
+    )
+    assert summary["n_expected"] == 1
+    assert summary["n_accepted"] == 0
+    assert summary["n_rejected"] == 1
+    assert summary["dominant_rejection_reasons"] == [
+        {
+            "reason": "ariadne_unusable:runner_failed_after_result_write",
+            "count": 1,
+        }
+    ]
 
 
 def test_ariadne_parser_missing_pool_dir(tmp_path):
@@ -2281,7 +2295,7 @@ def test_ariadne_parser_no_seeds_in_pool(tmp_path):
         state, CampaignPhase("ARIADNE_ARRAY"), observations=[],
     )
     assert result.failure_reason is not None
-    assert "ariadne_no_seed_results_parsed" in result.failure_reason
+    assert "ariadne_no_usable_seed_results" in result.failure_reason
 
 
 def test_ariadne_parser_handles_missing_result_json(tmp_path):
@@ -2317,7 +2331,7 @@ def test_ariadne_parser_all_results_unreadable_fails(tmp_path):
         state, CampaignPhase("ARIADNE_ARRAY"), observations=[],
     )
     assert result.failure_reason is not None
-    assert "ariadne_no_seed_results_parsed" in result.failure_reason
+    assert "ariadne_no_usable_seed_results" in result.failure_reason
 
 
 def test_clean_stale_ariadne_seed_outputs_quarantines_selected_task(tmp_path):
@@ -2600,7 +2614,7 @@ def test_ariadne_submit_rejects_invalid_existing_seed_provenance(tmp_path):
         CampaignPhase("ARIADNE_ARRAY"),
     )
 
-    assert result.failure_reason == "ariadne_no_seed_results_parsed: 1"
+    assert result.failure_reason == "ariadne_no_usable_seed_results: 1"
     manifest = json.loads(
         ariadne_results_path(
             active_iteration_dir(tmp_path / "campaign", 4)

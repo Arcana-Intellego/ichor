@@ -711,6 +711,7 @@ def _deep_reconcile_quiescence_blockers(campaign: Path) -> List[str]:
     active_intents = _load_active_submission_intents(
         campaign,
         errors=intent_errors,
+        state=state,
     )
     if active_intents:
         blockers.append(
@@ -3082,6 +3083,7 @@ def _load_active_submission_intents(
     errors: Optional[List[Dict[str, str]]] = None,
     fail_on_error: bool = False,
     expected_campaign_uid: Optional[str] = None,
+    state: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     inventory = _submission_intent.inventory_intents(
         campaign,
@@ -3098,10 +3100,48 @@ def _load_active_submission_intents(
                 for item in invalid[:8]
             )
         )
-    return [
+    active = [
         dict(payload)
         for payload in inventory.get("records", [])
         if str(payload.get("status")) in _submission_intent.ACTIVE_STATUSES
+    ]
+    if state is None:
+        return active
+    classification = _submission_intent.classify_completed_unsubmitted_intents(
+        campaign,
+        state,
+        intents=tuple(inventory.get("records", [])),
+    )
+    classification_errors = [
+        dict(item) for item in classification.get("errors", [])
+    ]
+    if errors is not None:
+        errors.extend(classification_errors)
+    if classification_errors and fail_on_error:
+        raise ValueError(
+            "completion-receipt intent classification is inconclusive: "
+            + "; ".join(
+                str(item.get("path")) + ": " + str(item.get("error"))
+                for item in classification_errors[:8]
+            )
+        )
+    repair_keys = {
+        (
+            str(item.get("phase") or ""),
+            int(item.get("iteration", 0)),
+            str(item.get("submission_identity") or ""),
+        )
+        for item in classification.get("repairs", [])
+    }
+    return [
+        item
+        for item in active
+        if (
+            str(item.get("phase") or ""),
+            int(item.get("iteration", 0)),
+            str(item.get("submission_identity") or ""),
+        )
+        not in repair_keys
     ]
 
 
@@ -3919,7 +3959,11 @@ def format_recovery_dashboard(campaign_dir: Path) -> str:
     )
 
     intent_errors: List[Dict[str, str]] = []
-    intents = _load_active_submission_intents(campaign, errors=intent_errors)
+    intents = _load_active_submission_intents(
+        campaign,
+        errors=intent_errors,
+        state=state,
+    )
     intent_summary = str(len(intents))
     if intents:
         sample = [
@@ -4210,6 +4254,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         campaign,
         errors=intent_errors,
         expected_campaign_uid=str(state.campaign_uid),
+        state=state,
     )
     if intent_errors:
         payload["submission_intent_errors"] = intent_errors
@@ -5281,12 +5326,18 @@ def _publish_reconcile_intent_transitions(
         iteration = int(item["iteration"])
         reason = str(item["reason"])
         target_status = str(item["target_status"])
+        completion_receipt = item.get("completion_receipt")
         if target_status == "SUPERSEDED":
             _submission_intent.mark_superseded(
                 campaign,
                 phase,
                 iteration,
                 reason,
+                completion_receipt=(
+                    dict(completion_receipt)
+                    if isinstance(completion_receipt, Mapping)
+                    else None
+                ),
             )
         elif target_status == "FAILED":
             _submission_intent.mark_failed(
@@ -5299,16 +5350,25 @@ def _publish_reconcile_intent_transitions(
             raise ValueError(
                 "unsupported reconcile intent transition: " + target_status
             )
+        receipt_backed = isinstance(completion_receipt, Mapping)
         append_event(
             campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
-            "reconcile_resolved_terminal_intent",
+            (
+                "submission_intent_retired_without_submission"
+                if receipt_backed
+                else "reconcile_resolved_terminal_intent"
+            ),
             phase=phase,
             iteration=iteration,
+            submission_identity=str(item.get("submission_identity") or ""),
             job_id=str(item.get("job_id") or ""),
             terminal_state=str(item.get("terminal_state") or ""),
             n_sacct_rows=int(item.get("n_sacct_rows") or 0),
             reason=reason,
             target_status=target_status,
+            completion_receipt=(
+                dict(completion_receipt) if receipt_backed else None
+            ),
         )
 
     phase = recovered_state.phase.value
@@ -5615,7 +5675,7 @@ def _reconcile_decision_payload(
         }
     )
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "campaign_dir": str(campaign),
         "proposed_state_path": (
             str(proposed_state_path) if proposed_state_path is not None else None
@@ -5650,6 +5710,9 @@ def _reconcile_decision_payload(
             or None
         ),
         "active_submission_intents": list(getattr(report, "active_submission_intents", []) or []),
+        "receipt_backed_intent_repairs": list(
+            getattr(report, "receipt_backed_intent_repairs", []) or []
+        ),
         "recommended_actions": list(getattr(report, "recommended_actions", []) or []),
         "next_command": next_command,
         "contract": contract_status,
@@ -6104,6 +6167,25 @@ def _print_reconcile_partial_array(campaign: Path, report: Any) -> None:
     print("")
 
 
+def _print_reconcile_intent_repairs(report: Any) -> None:
+    repairs = list(getattr(report, "receipt_backed_intent_repairs", []) or [])
+    if not repairs:
+        return
+    print("Receipt-Backed Intent Repairs")
+    _print_reconcile_list(
+        "retire on apply",
+        [
+            str(item.get("phase"))
+            + "@"
+            + str(item.get("iteration"))
+            + " submission_identity="
+            + str(item.get("submission_identity"))
+            for item in repairs
+        ],
+    )
+    print("")
+
+
 def _print_reconcile_config_changes(config_review: Any) -> None:
     if config_review is None:
         return
@@ -6288,6 +6370,7 @@ def _print_reconcile_operator_report(
     _print_reconcile_last_failure_compact(report)
     _print_reconcile_safety(campaign, report, contract_status)
     _print_reconcile_artefacts(campaign, report, contract_status, verbose=verbose)
+    _print_reconcile_intent_repairs(report)
     _print_reconcile_partial_array(campaign, report)
     _print_reconcile_config_changes(config_review)
     _print_reconcile_contract_compact(campaign, report, contract_status)
@@ -6886,7 +6969,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         print(
             json.dumps(
                 {
-                    "schema_version": 4,
+                    "schema_version": 5,
                     "error": "json_apply_not_supported",
                     "message": "reconcile --json is proposal-only; rerun without --json to apply",
                 },
@@ -7196,9 +7279,14 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 9
-    resolved_intents: List[Dict[str, Any]] = []
+    resolved_intents: List[Dict[str, Any]] = [
+        dict(item)
+        for item in (
+            getattr(report, "receipt_backed_intent_repairs", []) or []
+        )
+    ]
     if report.active_submission_intents:
-        resolved_intents, blocking_intents = _resolve_terminal_submission_intents_for_apply(
+        scheduler_resolved, blocking_intents = _resolve_terminal_submission_intents_for_apply(
             campaign,
             report.active_submission_intents,
             pre_submit_stale_seconds=(
@@ -7207,6 +7295,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 else 900
             ),
         )
+        resolved_intents.extend(scheduler_resolved)
         if blocking_intents:
             _print_reconcile_apply_blocked(
                 campaign,

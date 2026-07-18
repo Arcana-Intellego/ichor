@@ -13,10 +13,10 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Mapping, Optional, Sequence, Union
 
 from .job_names import live_job_name
-from .state import CampaignPhase, atomic_write_json
+from .state import CampaignPhase, CampaignState, atomic_write_json
 from .filesystem import operational_path
 from ..submit.slurm_contracts import validate_parent_job_id
 
@@ -390,6 +390,176 @@ def inventory_intents(
                 "error": type(exc).__name__ + ": " + str(exc),
             })
     return {"records": records, "errors": errors}
+
+
+def classify_completed_unsubmitted_intents(
+    campaign_dir: Union[str, Path],
+    state: Any,
+    *,
+    intents: Optional[Sequence[Mapping[str, Any]]] = None,
+    completion_receipts: Optional[Sequence[Mapping[str, Any]]] = None,
+    valid_reference_data_versions: Optional[Sequence[int]] = None,
+    valid_model_versions: Optional[Sequence[int]] = None,
+) -> Dict[str, Any]:
+    """Classify jobless intents conclusively covered by completion receipts.
+
+    The helper is read-only.  It intentionally requires both an exact receipt
+    identity match and evidence that campaign state and committed versions have
+    advanced beyond the scheduler-free source phase.
+    """
+    campaign = Path(campaign_dir)
+    errors: list[Dict[str, str]] = []
+    if intents is None:
+        intent_inventory = inventory_intents(
+            campaign,
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+        intents = tuple(intent_inventory.get("records", []))
+        errors.extend(dict(item) for item in intent_inventory.get("errors", []))
+    if completion_receipts is None:
+        from .completion_receipts import inventory_completion_receipts
+
+        receipt_inventory = inventory_completion_receipts(
+            campaign,
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+        completion_receipts = tuple(receipt_inventory.get("records", []))
+        errors.extend(dict(item) for item in receipt_inventory.get("errors", []))
+
+    if valid_reference_data_versions is None:
+        from ..versioning.reference_data import ReferenceDataVersioning
+
+        valid_reference_data_versions = ReferenceDataVersioning(
+            campaign / "QM_REFERENCE_DATA"
+        ).list_committed_versions()
+    if valid_model_versions is None:
+        from ..versioning.trained_models import TrainedModelVersioning
+
+        valid_model_versions = TrainedModelVersioning(
+            campaign / "TRAINED_MODELS"
+        ).list_committed_versions()
+    reference_versions = {int(value) for value in valid_reference_data_versions}
+    model_versions = {int(value) for value in valid_model_versions}
+
+    candidates = [
+        dict(intent)
+        for intent in intents
+        if str(intent.get("status") or "") == "PRE_SUBMIT"
+        and intent.get("job_id") is None
+        and str(intent.get("campaign_uid") or "") == str(state.campaign_uid)
+    ]
+    repairs: list[Dict[str, Any]] = []
+    for intent in candidates:
+        phase = str(intent.get("phase") or "")
+        iteration = int(intent.get("iteration", 0))
+        replacement_round = int(intent.get("replacement_round", 0))
+        submission_identity = str(intent.get("submission_identity") or "")
+        if (
+            state.phase.value == phase
+            and int(state.iteration) == iteration
+            and int(getattr(state, "replacement_round", 0)) == replacement_round
+        ):
+            continue
+
+        matches: list[Mapping[str, Any]] = []
+        for record in completion_receipts:
+            payload = record.get("payload")
+            if not isinstance(payload, Mapping):
+                continue
+            if (
+                str(payload.get("campaign_uid") or "") != str(state.campaign_uid)
+                or str(payload.get("phase") or "") != phase
+                or int(payload.get("iteration", -1)) != iteration
+                or int(payload.get("replacement_round", -1)) != replacement_round
+                or str(payload.get("submission_identity") or "")
+                != submission_identity
+                or payload.get("job_id") is not None
+            ):
+                continue
+            intent_tasks = intent.get("expected_tasks")
+            receipt_tasks = payload.get("expected_tasks")
+            if (
+                intent_tasks is not None
+                and receipt_tasks is not None
+                and int(intent_tasks) != int(receipt_tasks)
+            ):
+                continue
+            matches.append(record)
+        if len(matches) > 1:
+            errors.append(
+                {
+                    "path": phase + "@" + str(iteration),
+                    "error": (
+                        "multiple completion receipts match jobless submission "
+                        "intent " + submission_identity
+                    ),
+                }
+            )
+            continue
+        if not matches:
+            continue
+
+        record = matches[0]
+        payload = dict(record["payload"])
+        try:
+            after = CampaignState.from_dict(dict(payload["state_after"]))
+        except Exception as exc:
+            errors.append(
+                {
+                    "path": str(record.get("path") or ""),
+                    "error": "completion receipt state_after is invalid: " + str(exc),
+                }
+            )
+            continue
+        if int(state.iteration) < int(after.iteration):
+            continue
+        if any(
+            int(getattr(state, field_name)) < int(getattr(after, field_name))
+            for field_name in (
+                "reference_data_version",
+                "validation_set_version",
+                "models_version",
+            )
+        ):
+            continue
+        if (
+            int(after.reference_data_version) >= 0
+            and int(after.reference_data_version) not in reference_versions
+        ):
+            continue
+        if int(after.models_version) >= 0 and int(after.models_version) not in model_versions:
+            continue
+        reference = record.get("reference")
+        if not isinstance(reference, Mapping):
+            errors.append(
+                {
+                    "path": str(record.get("path") or ""),
+                    "error": "completion receipt reference is missing",
+                }
+            )
+            continue
+        repairs.append(
+            {
+                "phase": phase,
+                "iteration": iteration,
+                "replacement_round": replacement_round,
+                "submission_identity": submission_identity,
+                "expected_tasks": intent.get("expected_tasks"),
+                "reason": "phase_completed_without_scheduler_submission",
+                "target_status": "SUPERSEDED",
+                "completion_receipt": dict(reference),
+                "state_after": after.to_dict(),
+            }
+        )
+    repairs.sort(
+        key=lambda item: (
+            int(item["iteration"]),
+            str(item["phase"]),
+            int(item["replacement_round"]),
+            str(item["submission_identity"]),
+        )
+    )
+    return {"repairs": repairs, "errors": errors}
 
 
 def _write_payload(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]:

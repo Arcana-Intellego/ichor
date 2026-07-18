@@ -388,7 +388,7 @@ def test_postprocess_rejects_explicit_unsafe_landing(tmp_path):
         state, CampaignPhase("ARIADNE_ARRAY"), observations=[],
     )
     assert result.is_complete is True
-    assert "ariadne_no_seed_results_parsed" in result.failure_reason
+    assert "ariadne_no_usable_seed_results" in result.failure_reason
     from ichor.hpc.active_learning.handoff_manifests import (
         read_ariadne_landing_audit,
         read_ariadne_results_manifest,

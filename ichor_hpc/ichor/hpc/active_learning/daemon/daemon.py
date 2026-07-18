@@ -3036,7 +3036,12 @@ class Daemon:
         self._unsubmitted_intent_repair_attempted = True
 
         try:
-            inventory = _submission_intent.inventory_intents(self.campaign_dir)
+            classification = (
+                _submission_intent.classify_completed_unsubmitted_intents(
+                    self.campaign_dir,
+                    state,
+                )
+            )
         except Exception as exc:
             self._journal(
                 "submission_intent_read_failed",
@@ -3048,98 +3053,29 @@ class Daemon:
                 + str(exc)[:160],
             )
             return
-        candidates = [
-            dict(intent)
-            for intent in inventory.get("records", [])
-            if str(intent.get("status") or "") == "PRE_SUBMIT"
-            and intent.get("job_id") is None
-            and str(intent.get("campaign_uid") or "") == str(state.campaign_uid)
-        ]
-        if not candidates:
-            return
-
-        from .completion_receipts import (
-            CompletionReceiptError,
-            read_completion_receipt,
-            receipt_dir,
-            receipt_reference,
-        )
-
-        wanted = {
-            (
-                str(intent.get("phase") or ""),
-                int(intent.get("iteration", 0)),
-                str(intent.get("submission_identity") or ""),
+        for error in classification.get("errors", []):
+            self._journal(
+                "submission_intent_read_failed",
+                phase=state.phase.value,
+                iteration=int(state.iteration),
+                error="historical_completion_repair: "
+                + str(error.get("path") or "unknown")
+                + ": "
+                + str(error.get("error") or "invalid evidence")[:150],
             )
-            for intent in candidates
-        }
-        receipts: Dict[tuple[str, int, str], list[tuple[Path, Dict[str, Any]]]] = {}
-        root = receipt_dir(self.campaign_dir)
-        if not root.is_dir() or root.is_symlink():
-            return
-        for path in sorted(root.glob("*.json")):
+        for repair in classification.get("repairs", []):
             try:
-                payload = read_completion_receipt(path)
-            except CompletionReceiptError:
-                continue
-            key = (
-                str(payload.get("phase") or ""),
-                int(payload.get("iteration", 0)),
-                str(payload.get("submission_identity") or ""),
-            )
-            if (
-                key not in wanted
-                or payload.get("job_id") is not None
-                or str(payload.get("campaign_uid") or "")
-                != str(state.campaign_uid)
-            ):
-                continue
-            receipts.setdefault(key, []).append((path, payload))
-
-        for intent in candidates:
-            key = (
-                str(intent.get("phase") or ""),
-                int(intent.get("iteration", 0)),
-                str(intent.get("submission_identity") or ""),
-            )
-            matches = receipts.get(key, [])
-            if len(matches) != 1:
-                continue
-            path, payload = matches[0]
-            try:
-                after = CampaignState.from_dict(dict(payload["state_after"]))
-            except Exception:
-                continue
-            if int(state.iteration) < int(after.iteration):
-                continue
-            if any(
-                int(getattr(state, field_name))
-                < int(getattr(after, field_name))
-                for field_name in (
-                    "reference_data_version",
-                    "validation_set_version",
-                    "models_version",
-                )
-            ):
-                continue
-            if (
-                state.phase.value == str(intent.get("phase") or "")
-                and int(state.iteration) == int(intent.get("iteration", 0))
-            ):
-                continue
-            try:
-                reference = receipt_reference(self.campaign_dir, path)
                 self._complete_intent_after_advance(
-                    str(intent["phase"]),
-                    int(intent["iteration"]),
-                    reference,
+                    str(repair["phase"]),
+                    int(repair["iteration"]),
+                    dict(repair["completion_receipt"]),
                     completed_without_submission=True,
                 )
             except Exception as exc:
                 self._journal(
                     "submission_intent_completion_deferred",
-                    phase=str(intent.get("phase") or ""),
-                    iteration=int(intent.get("iteration", 0)),
+                    phase=str(repair.get("phase") or ""),
+                    iteration=int(repair.get("iteration", 0)),
                     error="historical_completion_repair: "
                     + type(exc).__name__
                     + ": "

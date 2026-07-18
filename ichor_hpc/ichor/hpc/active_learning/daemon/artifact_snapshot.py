@@ -179,6 +179,14 @@ class CommittedArtifactSnapshot:
         default_factory=tuple,
         repr=False,
     )
+    completion_receipts: Tuple[Mapping[str, Any], ...] = field(
+        default_factory=tuple,
+        repr=False,
+    )
+    completion_receipt_errors: Tuple[Mapping[str, Any], ...] = field(
+        default_factory=tuple,
+        repr=False,
+    )
     reconcile_transactions: Tuple[Mapping[str, Any], ...] = field(
         default_factory=tuple,
         repr=False,
@@ -239,7 +247,38 @@ class CommittedArtifactSnapshot:
             raise ArtefactSnapshotError(
                 "committed model inventory changed after reconcile inspection"
             )
-        observed = _anchor_records(campaign_dir, (record[0] for record in self.anchor_records))
+        recorded_paths = tuple(record[0] for record in self.anchor_records)
+        control_roots = (
+            ".DATA/ACTIVE_LEARNING/submission_intents",
+            ".DATA/ACTIVE_LEARNING/phase_completions",
+            ".DATA/ACTIVE_LEARNING/reconcile_transactions",
+            ".DATA/ACTIVE_LEARNING/reference_commit_transactions",
+        )
+        current_control_paths = set()
+        for relative_root in control_roots:
+            root = campaign / relative_root
+            if not root.exists():
+                continue
+            if root.is_symlink() or not root.is_dir():
+                raise ArtefactSnapshotError(
+                    "authority control root changed after reconcile inspection: "
+                    + str(root)
+                )
+            current_control_paths.update(
+                candidate.relative_to(campaign).as_posix()
+                for candidate in sorted(root.glob("*.json"))
+                if candidate.is_file() and not candidate.is_symlink()
+            )
+        recorded_control_paths = {
+            path
+            for path in recorded_paths
+            if any(path.startswith(root + "/") for root in control_roots)
+        }
+        if current_control_paths != recorded_control_paths:
+            raise ArtefactSnapshotError(
+                "committed artefact authority inventory changed after reconcile inspection"
+            )
+        observed = _anchor_records(campaign_dir, recorded_paths)
         digest = _anchor_digest(observed)
         if observed != self.anchor_records or digest != self.anchor_sha256:
             raise ArtefactSnapshotError(
@@ -370,6 +409,7 @@ def _authoritative_anchor_paths(
         paths.add(generation_path.relative_to(campaign).as_posix())
     for relative_root in (
         ".DATA/ACTIVE_LEARNING/submission_intents",
+        ".DATA/ACTIVE_LEARNING/phase_completions",
         ".DATA/ACTIVE_LEARNING/reconcile_transactions",
         ".DATA/ACTIVE_LEARNING/reference_commit_transactions",
     ):
@@ -462,12 +502,15 @@ def build_committed_artifact_snapshot(
     model_errors: Dict[int, str] = {}
     submission_intents: Tuple[Mapping[str, Any], ...] = ()
     submission_intent_errors: Tuple[Mapping[str, Any], ...] = ()
+    completion_receipts: Tuple[Mapping[str, Any], ...] = ()
+    completion_receipt_errors: Tuple[Mapping[str, Any], ...] = ()
     reconcile_transactions: Tuple[Mapping[str, Any], ...] = ()
     reference_commit_transactions: Tuple[Mapping[str, Any], ...] = ()
 
     from .reconcile_transaction import inventory_reconcile_transactions
     from .reference_commit import inventory_reference_commits
     from .submission_intent import inventory_intents
+    from .completion_receipts import inventory_completion_receipts
 
     intent_inventory = inventory_intents(campaign)
     submission_intents = tuple(
@@ -475,6 +518,13 @@ def build_committed_artifact_snapshot(
     )
     submission_intent_errors = tuple(
         dict(record) for record in intent_inventory.get("errors", [])
+    )
+    completion_inventory = inventory_completion_receipts(campaign)
+    completion_receipts = tuple(
+        dict(record) for record in completion_inventory.get("records", [])
+    )
+    completion_receipt_errors = tuple(
+        dict(record) for record in completion_inventory.get("errors", [])
     )
     reconcile_transactions = tuple(
         dict(record) for record in inventory_reconcile_transactions(campaign)
@@ -627,6 +677,8 @@ def build_committed_artifact_snapshot(
         elapsed_seconds=float(time.monotonic() - started),
         submission_intents=submission_intents,
         submission_intent_errors=submission_intent_errors,
+        completion_receipts=completion_receipts,
+        completion_receipt_errors=completion_receipt_errors,
         reconcile_transactions=reconcile_transactions,
         reference_commit_transactions=reference_commit_transactions,
     )

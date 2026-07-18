@@ -290,6 +290,7 @@ class ReconciliationReport:
     existing_state_loaded: bool = False
     unsafe_reasons: List[str] = field(default_factory=list)
     active_submission_intents: List[Dict[str, Any]] = field(default_factory=list)
+    receipt_backed_intent_repairs: List[Dict[str, Any]] = field(default_factory=list)
     decision: str = ""
     trusted_artifacts: List[str] = field(default_factory=list)
     blocking_artifacts: List[str] = field(default_factory=list)
@@ -1234,6 +1235,7 @@ def propose_recovery(
         initial_handoff_indicated = True
 
     active_intents: List[Dict[str, Any]] = []
+    receipt_backed_intent_repairs: List[Dict[str, Any]] = []
     if artifact_snapshot is not None:
         intent_records = getattr(artifact_snapshot, "submission_intents", ())
         intent_errors = getattr(
@@ -1241,10 +1243,22 @@ def propose_recovery(
             "submission_intent_errors",
             (),
         )
+        completion_receipt_records = getattr(
+            artifact_snapshot,
+            "completion_receipts",
+            (),
+        )
+        completion_receipt_errors = getattr(
+            artifact_snapshot,
+            "completion_receipt_errors",
+            (),
+        )
     else:
         intent_inventory = _submission_intent.inventory_intents(campaign)
         intent_records = tuple(intent_inventory.get("records", []))
         intent_errors = tuple(intent_inventory.get("errors", []))
+        completion_receipt_records = None
+        completion_receipt_errors = ()
     for error in intent_errors:
         unsafe_reasons.append(
             "malformed submission intent: "
@@ -1253,9 +1267,73 @@ def propose_recovery(
             + str(error.get("error") or "invalid intent")[:180]
         )
         blocking_artifacts.append("malformed submission intent")
+    for error in completion_receipt_errors:
+        unsafe_reasons.append(
+            "malformed phase-completion receipt: "
+            + str(error.get("path") or "unknown")
+            + ": "
+            + str(error.get("error") or "invalid receipt")[:180]
+        )
+        blocking_artifacts.append("phase completion receipts")
+    if existing is not None:
+        classification = _submission_intent.classify_completed_unsubmitted_intents(
+            campaign,
+            existing,
+            intents=tuple(intent_records),
+            completion_receipts=completion_receipt_records,
+            valid_reference_data_versions=(
+                artifact_snapshot.valid_reference_data_versions
+                if artifact_snapshot is not None
+                else None
+            ),
+            valid_model_versions=(
+                artifact_snapshot.valid_model_versions
+                if artifact_snapshot is not None
+                else None
+            ),
+        )
+        receipt_backed_intent_repairs = [
+            dict(item) for item in classification.get("repairs", [])
+        ]
+        for error in classification.get("errors", []):
+            unsafe_reasons.append(
+                "phase-completion intent classification failed: "
+                + str(error.get("path") or "unknown")
+                + ": "
+                + str(error.get("error") or "invalid evidence")[:180]
+            )
+            blocking_artifacts.append("phase completion receipts")
+    repair_keys = {
+        (
+            str(item.get("phase") or ""),
+            int(item.get("iteration", 0)),
+            str(item.get("submission_identity") or ""),
+        )
+        for item in receipt_backed_intent_repairs
+    }
     for payload in intent_records:
-        if str(payload.get("status")) in _submission_intent.ACTIVE_STATUSES:
+        key = (
+            str(payload.get("phase") or ""),
+            int(payload.get("iteration", 0)),
+            str(payload.get("submission_identity") or ""),
+        )
+        if (
+            str(payload.get("status")) in _submission_intent.ACTIVE_STATUSES
+            and key not in repair_keys
+        ):
             active_intents.append(dict(payload))
+    if receipt_backed_intent_repairs:
+        notes.append(
+            str(len(receipt_backed_intent_repairs))
+            + " receipt-backed scheduler-free submission intent(s) will be retired on apply"
+        )
+        trusted_artifacts.extend(
+            "completion receipt for "
+            + str(item.get("phase"))
+            + "@"
+            + str(item.get("iteration"))
+            for item in receipt_backed_intent_repairs
+        )
     active_intents.sort(
         key=lambda item: (
             str(item.get("updated_at_iso") or item.get("updated_iso") or ""),
@@ -2575,6 +2653,7 @@ def propose_recovery(
         existing_state_loaded=existing_loaded,
         unsafe_reasons=unsafe_reasons,
         active_submission_intents=active_intents,
+        receipt_backed_intent_repairs=receipt_backed_intent_repairs,
         decision=decision,
         trusted_artifacts=trusted_artifacts,
         blocking_artifacts=blocking_artifacts,

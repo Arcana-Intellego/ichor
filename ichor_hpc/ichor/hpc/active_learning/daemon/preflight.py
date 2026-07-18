@@ -79,6 +79,7 @@ class BackendAvailability:
     gaussian_probe_error: str = ""
     ariadne_probe_error: str = ""
     ariadne_abi_probe: Optional[Dict[str, object]] = None
+    ariadne_runtime_probe: Optional[Dict[str, object]] = None
     pyferebus_probe_error: str = ""
 
     @property
@@ -221,8 +222,11 @@ def _probe_configured_python_details(
             "    try:",
             "        ariadne = importlib.import_module('ariadne')",
             "        probe_module = importlib.import_module('ichor.hpc.active_learning.acquisition.ariadne_abi')",
+            "        runtime_module = importlib.import_module('ichor.hpc.active_learning.acquisition.ariadne_local_runner')",
             "        abi = probe_module.probe_ariadne_module(ariadne)",
+            "        runtime_smoke = runtime_module.probe_ariadne_runtime(ariadne)",
             "        results['ariadne']['abi'] = abi",
+            "        results['ariadne']['runtime_smoke'] = runtime_smoke",
             "    except Exception as exc:",
             "        results['ariadne'] = {'ok': False, 'error': 'ABI probe failed: ' + type(exc).__name__ + ': ' + str(exc)[:300]}",
             "print(json.dumps({'executable': sys.executable, 'version': list(sys.version_info[:3]), 'modules': results}, sort_keys=True))",
@@ -274,6 +278,12 @@ def _probe_configured_python_details(
             }
             if label == "ariadne" and isinstance(raw_status.get("abi"), dict):
                 parsed_status[label]["abi"] = dict(raw_status["abi"])
+            if label == "ariadne" and isinstance(
+                raw_status.get("runtime_smoke"), dict
+            ):
+                parsed_status[label]["runtime_smoke"] = dict(
+                    raw_status["runtime_smoke"]
+                )
     except Exception as exc:
         return (
             False,
@@ -462,6 +472,11 @@ def check_backends() -> BackendAvailability:
         ariadne_abi_probe=(
             dict(ariadne_status["abi"])
             if isinstance(ariadne_status.get("abi"), dict)
+            else None
+        ),
+        ariadne_runtime_probe=(
+            dict(ariadne_status["runtime_smoke"])
+            if isinstance(ariadne_status.get("runtime_smoke"), dict)
             else None
         ),
         pyferebus_probe_error=str(pyferebus_status.get("error") or ""),

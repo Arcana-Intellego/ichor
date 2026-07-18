@@ -22,9 +22,11 @@ SeedLocalAdversarialAcquisition we built earlier.
 from __future__ import annotations
 
 from ..strict_json import strict_json as json
+import inspect
 import time
 from dataclasses import dataclass
 from enum import Enum
+from numbers import Integral
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -395,13 +397,31 @@ def _strict_status_flag(status, index: int, label: str) -> bool:
     value = status[int(index)]
     if isinstance(value, (bool, np.bool_)):
         return bool(value)
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise RuntimeError("ARIADNE status flag " + label + " is not integer 0/1") from exc
+    if not isinstance(value, Integral):
+        raise RuntimeError("ARIADNE status flag " + label + " is not integer 0/1")
+    parsed = int(value)
     if parsed not in (0, 1):
         raise RuntimeError("ARIADNE status flag " + label + " is not integer 0/1")
     return bool(parsed)
+
+
+def _fortran_logical(value: Any, label: str) -> bool:
+    """Decode a direct f90wrap Fortran ``LOGICAL`` scalar.
+
+    Intel Fortran conventionally exposes ``.TRUE.`` as ``-1`` through
+    f90wrap, while other builds use ``1``.  This contract is deliberately
+    separate from ``get_status_py()``, whose integer flags are explicitly
+    normalised by ARIADNE to ``0`` or ``1``.
+    """
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, Integral):
+        return int(value) != 0
+    raise RuntimeError(
+        "ARIADNE Fortran LOGICAL "
+        + label
+        + " is not an exact boolean or integer scalar"
+    )
 
 
 def _validate_status_shape(status, *, optimiser: str) -> tuple:
@@ -888,27 +908,48 @@ def _status_tuple(opt):
     return tuple(opt.get_status_py())
 
 
+_OPTIMIZER_ATTRIBUTE_MISSING = object()
+
+
 def _optimizer_flag(opt, name: str):
-    if not hasattr(opt, name):
-        return None
-    value = getattr(opt, name)
+    try:
+        value = getattr(opt, name)
+    except AttributeError as exc:
+        try:
+            inspect.getattr_static(opt, name)
+        except AttributeError:
+            return _OPTIMIZER_ATTRIBUTE_MISSING
+        raise RuntimeError(
+            "ARIADNE optimiser property " + name + " could not be read"
+        ) from exc
+    except Exception as exc:
+        raise RuntimeError(
+            "ARIADNE optimiser property " + name + " could not be read"
+        ) from exc
     try:
         value = value() if callable(value) else value
-    except Exception:
-        return None
+    except Exception as exc:
+        raise RuntimeError(
+            "ARIADNE optimiser property " + name + " could not be evaluated"
+        ) from exc
     return value
 
 
 def _raise_if_init_failed(opt, label: str) -> None:
     init_ok = _optimizer_flag(opt, "init_ok")
-    if init_ok is not None:
-        init_ok = _strict_status_flag((init_ok,), 0, label + " init_ok")
-    if init_ok is not None and not init_ok:
-        reason = _optimizer_flag(opt, "last_config_error_msg")
-        if reason is None:
-            reason = _optimizer_flag(opt, "init_reason")
-        if reason is None:
-            reason = _optimizer_flag(opt, "init_message")
+    if init_ok is _OPTIMIZER_ATTRIBUTE_MISSING:
+        return
+    if not _fortran_logical(init_ok, label + " init_ok"):
+        reason = None
+        for reason_name in (
+            "last_config_error_msg",
+            "init_reason",
+            "init_message",
+        ):
+            candidate = _optimizer_flag(opt, reason_name)
+            if candidate is not _OPTIMIZER_ATTRIBUTE_MISSING and candidate:
+                reason = candidate
+                break
         raise RuntimeError(
             "ARIADNE "
             + label
@@ -919,8 +960,8 @@ def _raise_if_init_failed(opt, label: str) -> None:
 
 def _proposal_pending(opt, status, *, is_trqn: bool) -> bool:
     value = _optimizer_flag(opt, "proposal_pending")
-    if value is not None:
-        return _strict_status_flag((value,), 0, "proposal_pending")
+    if value is not _OPTIMIZER_ATTRIBUTE_MISSING:
+        return _fortran_logical(value, "proposal_pending")
     index = (
         _TRQN_STATUS_PROPOSAL_PENDING
         if is_trqn
@@ -933,8 +974,8 @@ def _skip_step_after_rebuild(opt, status, *, is_trqn: bool) -> bool:
     if not is_trqn:
         return False
     value = _optimizer_flag(opt, "skip_step_after_rebuild")
-    if value is not None:
-        return _strict_status_flag((value,), 0, "skip_step_after_rebuild")
+    if value is not _OPTIMIZER_ATTRIBUTE_MISSING:
+        return _fortran_logical(value, "skip_step_after_rebuild")
     return _strict_status_flag(
         status,
         _TRQN_STATUS_SKIP_STEP_AFTER_REBUILD,
@@ -1608,6 +1649,125 @@ def _build_ds(ariadne, q0_xyz, g0_xyz, atom_list, run_config):
     init_kwargs.update(q0_xyz=q0_xyz, g0_xyz=g0_xyz, atom_list=atom_list)
     opt.init(**init_kwargs)
     return opt
+
+
+def probe_ariadne_runtime(ariadne) -> Dict[str, Any]:
+    """Initialise both optimisers and validate the live wrapper contract.
+
+    This probe deliberately stops before ``step_py``.  It catches compiler-
+    and wrapper-specific logical representations and status-layout drift at
+    preflight time without loading models or evaluating the acquisition.
+    """
+    from .ariadne_runner import AriadneRunConfig
+
+    probe_ariadne_module(ariadne)
+    q0_xyz = np.asfortranarray(
+        [
+            [0.0000, 0.0000, 0.0000],
+            [0.9572, 0.0000, 0.0000],
+            [-0.2400, 0.9270, 0.0000],
+            [3.0000, 0.0000, 0.0000],
+            [3.9572, 0.0000, 0.0000],
+            [2.7600, 0.9270, 0.0000],
+        ],
+        dtype=np.float64,
+    )
+    g0_xyz = np.asfortranarray(
+        np.full((6, 3), 1.0e-4, dtype=np.float64)
+    )
+    atom_list = _symbols_to_atom_list(["O", "H", "H", "O", "H", "H"])
+    run_config = AriadneRunConfig()
+
+    receipts: Dict[str, Any] = {}
+    for name, builder in (("trqn", _build_trqn), ("ds", _build_ds)):
+        try:
+            optimiser = builder(
+                ariadne,
+                q0_xyz.copy(order="F"),
+                g0_xyz.copy(order="F"),
+                atom_list.copy(),
+                run_config,
+            )
+            raw_init_ok = _optimizer_flag(optimiser, "init_ok")
+            if raw_init_ok is _OPTIMIZER_ATTRIBUTE_MISSING:
+                raise RuntimeError("ARIADNE " + name.upper() + " has no init_ok property")
+            init_ok = _fortran_logical(raw_init_ok, name.upper() + " init_ok")
+            if not init_ok:
+                _raise_if_init_failed(optimiser, name.upper())
+
+            status = _validate_status_shape(
+                optimiser.get_status_py(),
+                optimiser=name,
+            )
+            if name == "trqn":
+                status_flags = {
+                    "proposal_pending": _strict_status_flag(
+                        status, _TRQN_STATUS_PROPOSAL_PENDING, "TRQN proposal_pending"
+                    ),
+                    "converged": _strict_status_flag(
+                        status, 4, "TRQN converged"
+                    ),
+                    "last_step_accepted": _strict_status_flag(
+                        status, 5, "TRQN last_step_accepted"
+                    ),
+                    "skip_step_after_rebuild": _strict_status_flag(
+                        status,
+                        _TRQN_STATUS_SKIP_STEP_AFTER_REBUILD,
+                        "TRQN skip_step_after_rebuild",
+                    ),
+                }
+            else:
+                status_flags = {
+                    "proposal_pending": _strict_status_flag(
+                        status, _DS_STATUS_PROPOSAL_PENDING, "DS proposal_pending"
+                    ),
+                    "converged": _strict_status_flag(status, 8, "DS converged"),
+                    "last_step_accepted": _strict_status_flag(
+                        status, 9, "DS last_step_accepted"
+                    ),
+                }
+
+            direct_flags: Dict[str, bool] = {"init_ok": bool(init_ok)}
+            for property_name in (
+                "proposal_pending",
+                "skip_step_after_rebuild",
+            ):
+                raw_value = _optimizer_flag(optimiser, property_name)
+                if raw_value is _OPTIMIZER_ATTRIBUTE_MISSING:
+                    continue
+                direct_flags[property_name] = _fortran_logical(
+                    raw_value,
+                    name.upper() + " " + property_name,
+                )
+
+            q_state, g_state = _sync_state(optimiser, 6)
+            if q_state.shape != (6, 3) or g_state.shape != (6, 3):
+                raise RuntimeError(
+                    "ARIADNE " + name.upper() + " state has the wrong shape"
+                )
+            if not np.all(np.isfinite(q_state)) or not np.all(np.isfinite(g_state)):
+                raise RuntimeError(
+                    "ARIADNE " + name.upper() + " state contains non-finite values"
+                )
+        except Exception as exc:
+            raise RuntimeError(
+                "ARIADNE " + name.upper() + " initialised runtime probe failed: " + str(exc)
+            ) from exc
+
+        receipts[name] = {
+            "initialised": True,
+            "status_length": int(len(status)),
+            "direct_logical_flags": direct_flags,
+            "status_flags": status_flags,
+            "state_shape": [int(value) for value in q_state.shape],
+            "state_finite": True,
+        }
+
+    return {
+        "probe": "initialise_without_step",
+        "geometry": "water_dimer_6_atom",
+        **receipts,
+    }
 
 
 def _restart_under_ds(ariadne, atoms, natoms, atom_list, run_config):

@@ -922,6 +922,31 @@ def test_snapshot_resolves_reference_chain_once_and_rechecks_anchors(
         snapshot.assert_anchors_unchanged(campaign)
 
 
+def test_snapshot_rejects_completion_receipt_added_after_inspection(tmp_path):
+    from ichor.hpc.active_learning.daemon.artifact_snapshot import (
+        ArtefactSnapshotError,
+        build_committed_artifact_snapshot,
+    )
+
+    campaign = tmp_path / "campaign"
+    _commit_two_versions(campaign)
+    snapshot = build_committed_artifact_snapshot(
+        campaign,
+        verification_level="authority",
+    )
+
+    receipts = campaign / ".DATA" / "ACTIVE_LEARNING" / "phase_completions"
+    receipts.mkdir(parents=True, exist_ok=True)
+    (receipts / ("a" * 64 + ".json")).write_text(
+        "{}\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    with pytest.raises(ArtefactSnapshotError, match="inventory changed"):
+        snapshot.assert_anchors_unchanged(campaign)
+
+
 def test_snapshot_stops_at_first_invalid_reference_without_rescanning_prefix(
     tmp_path,
     monkeypatch,

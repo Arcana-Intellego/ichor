@@ -25,14 +25,20 @@ from ichor.hpc.active_learning.acquisition.ariadne_local_runner import (
     _ds_safe_init_kwargs,
     _eval_energy_gradient,
     _finalise_optimiser_diagnostics,
+    _fortran_logical,
     _new_optimiser_diagnostics,
+    _proposal_pending,
+    _raise_if_init_failed,
     _restart_under_ds,
     _set_invalid_trial_reason,
+    _skip_step_after_rebuild,
+    _strict_status_flag,
     _trqn_control_init_kwargs,
     _trqn_status_summary,
     _validate_ds_init_kwargs,
     InvalidTrialReason,
     NonFiniteCalculatorOutput,
+    probe_ariadne_runtime,
     run_optimisation_against_calculator,
 )
 import ichor.hpc.active_learning.acquisition.ariadne_local_runner as local_runner
@@ -59,6 +65,129 @@ def test_ase_and_ariadne_share_one_pseudo_hartree_conversion():
     assert energy == pytest.approx(-2.5)
     np.testing.assert_allclose(gradient, [-1.0, 2.0, -3.0])
     assert gradient.flags["F_CONTIGUOUS"]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (False, False),
+        (True, True),
+        (0, False),
+        (1, True),
+        (-1, True),
+        (np.int32(-7), True),
+    ],
+)
+def test_direct_fortran_logical_accepts_compiler_integer_conventions(
+    value,
+    expected,
+):
+    assert _fortran_logical(value, "test") is expected
+
+
+@pytest.mark.parametrize("value", [1.0, "1", None, np.array([1])])
+def test_direct_fortran_logical_rejects_malformed_values(value):
+    with pytest.raises(RuntimeError, match="exact boolean or integer scalar"):
+        _fortran_logical(value, "test")
+
+
+@pytest.mark.parametrize("value", [-1, 2, 1.0, "1"])
+def test_status_tuple_flags_remain_exact_zero_or_one(value):
+    with pytest.raises(RuntimeError, match="integer 0/1"):
+        _strict_status_flag((value,), 0, "test")
+
+
+def test_direct_logical_properties_accept_ifx_true_and_accessor_failures_are_fatal():
+    optimiser = SimpleNamespace(
+        init_ok=-1,
+        proposal_pending=-1,
+        skip_step_after_rebuild=0,
+    )
+
+    _raise_if_init_failed(optimiser, "TRQN")
+    assert _proposal_pending(optimiser, (0,) * 89, is_trqn=True) is True
+    assert _skip_step_after_rebuild(
+        optimiser,
+        (0,) * 89,
+        is_trqn=True,
+    ) is False
+
+    class _BrokenAccessor:
+        @property
+        def proposal_pending(self):
+            raise RuntimeError("wrapper failure")
+
+    with pytest.raises(RuntimeError, match="could not be read"):
+        _proposal_pending(_BrokenAccessor(), (0,) * 89, is_trqn=True)
+
+    class _BrokenAttributeAccessor:
+        @property
+        def proposal_pending(self):
+            raise AttributeError("broken generated property")
+
+    with pytest.raises(RuntimeError, match="could not be read"):
+        _proposal_pending(_BrokenAttributeAccessor(), (0,) * 89, is_trqn=True)
+
+
+class _RuntimeProbeOptimiser:
+    def __init__(self, status_length, *, init_ok=-1):
+        self.status_length = int(status_length)
+        self.init_ok = init_ok
+        self.proposal_pending = 0
+        self.skip_step_after_rebuild = 0
+        self.q = np.zeros(18, dtype=np.float64)
+        self.g = np.zeros(18, dtype=np.float64)
+
+    def init(self, **kwargs):
+        self.q = np.asarray(kwargs["q0_xyz"], dtype=np.float64).reshape(-1)
+        self.g = np.asarray(kwargs["g0_xyz"], dtype=np.float64).reshape(-1)
+
+    def step_py(self, *, stage, f_old, f_new, g_xyz_new):
+        return stage, f_old, f_new, g_xyz_new
+
+    def get_state_flat_py(self, q_flat, g_flat):
+        q_flat[:] = self.q
+        g_flat[:] = self.g
+
+    def get_status_py(self):
+        status = [0] * self.status_length
+        if self.status_length == 89:
+            status[3] = status[4] = status[5] = status[55] = 0
+        else:
+            status[7] = status[8] = status[9] = 0
+        return tuple(status)
+
+    def set_invalid_trial_reason_py(self, _reason):
+        return None
+
+
+def _runtime_probe_module(*, init_ok=-1):
+    return SimpleNamespace(
+        Geometric_Trqn=SimpleNamespace(
+            trust_region_qn=lambda: _RuntimeProbeOptimiser(89, init_ok=init_ok)
+        ),
+        Ds_Optimiser=SimpleNamespace(
+            dissipative_symplectic=lambda: _RuntimeProbeOptimiser(
+                42,
+                init_ok=init_ok,
+            )
+        ),
+    )
+
+
+def test_initialised_runtime_probe_covers_trqn_and_ds_without_stepping():
+    receipt = probe_ariadne_runtime(_runtime_probe_module())
+
+    assert receipt["trqn"]["initialised"] is True
+    assert receipt["trqn"]["status_length"] == 89
+    assert receipt["ds"]["initialised"] is True
+    assert receipt["ds"]["status_length"] == 42
+    assert receipt["trqn"]["direct_logical_flags"]["init_ok"] is True
+
+
+def test_initialised_runtime_probe_rejects_malformed_direct_logical():
+    with pytest.raises(RuntimeError, match="initialised runtime probe failed"):
+        probe_ariadne_runtime(_runtime_probe_module(init_ok="true"))
 
 
 def test_five_criterion_streak_requires_acceptance_and_every_check():

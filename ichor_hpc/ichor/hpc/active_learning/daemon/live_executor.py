@@ -4791,6 +4791,17 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
         n_kept = len(accepted)
         n_rejected = len(rejected)
+        rejection_counts: Dict[str, int] = {}
+        for record in rejected:
+            reason = str(record.get("reason") or "unknown_rejection")[:180]
+            rejection_counts[reason] = int(rejection_counts.get(reason, 0)) + 1
+        dominant_rejection_reasons = [
+            {"reason": reason, "count": int(count)}
+            for reason, count in sorted(
+                rejection_counts.items(),
+                key=lambda item: (-int(item[1]), str(item[0])),
+            )[:8]
+        ]
         audit_summary = _ariadne_landing_audit_summary(landing_audit_records)
         audit_path = write_ariadne_landing_audit(iter_dir, {
             "iteration": int(state.iteration),
@@ -4825,16 +4836,20 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         self._journal_event(
             "ariadne_landing_summary",
             iteration=int(state.iteration),
+            n_expected=int(expected_n),
+            n_accepted=int(n_kept),
+            n_rejected=int(n_rejected),
             accepted=int(audit_summary.get("accepted", 0)),
             salvaged=int(audit_summary.get("salvaged", 0)),
             backtracked=int(audit_summary.get("backtracked", 0)),
             rejected=int(audit_summary.get("rejected", 0)),
+            dominant_rejection_reasons=dominant_rejection_reasons,
         )
 
         decision_reasons = []
         if n_kept == 0:
             decision_reasons.append(
-                "ariadne_no_seed_results_parsed: " + str(n_rejected)
+                "ariadne_no_usable_seed_results: " + str(n_rejected)
             )
         if expected_n and (
             n_rejected / float(expected_n)
@@ -4853,7 +4868,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             return PhaseResult(
                 is_complete=True,
                 failure_reason=(
-                    "ariadne_no_seed_results_parsed: " + str(n_rejected)
+                    "ariadne_no_usable_seed_results: " + str(n_rejected)
                 ),
             )
 

@@ -339,6 +339,49 @@ def replayable_completion_receipts(
     return matches
 
 
+def inventory_completion_receipts(
+    campaign_dir: Union[str, Path],
+    *,
+    expected_campaign_uid: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Read completion receipts without traversing their scientific evidence."""
+    campaign = Path(campaign_dir).resolve()
+    root = receipt_dir(campaign)
+    records: List[Dict[str, Any]] = []
+    errors: List[Dict[str, str]] = []
+    if not root.is_dir() or root.is_symlink():
+        return {"records": records, "errors": errors}
+    for path in sorted(root.glob("*.json")):
+        try:
+            payload = read_completion_receipt(path)
+            if expected_campaign_uid is not None and str(
+                payload.get("campaign_uid") or ""
+            ) != str(expected_campaign_uid):
+                raise CompletionReceiptError(
+                    "completion receipt campaign UID mismatch"
+                )
+            relative = path.resolve().relative_to(campaign).as_posix()
+            records.append(
+                {
+                    "path": relative,
+                    "payload": dict(payload),
+                    "reference": {
+                        "path": relative,
+                        "sha256": sha256_file(path),
+                        "receipt_id": str(payload["receipt_id"]),
+                    },
+                }
+            )
+        except Exception as exc:
+            errors.append(
+                {
+                    "path": str(path),
+                    "error": type(exc).__name__ + ": " + str(exc),
+                }
+            )
+    return {"records": records, "errors": errors}
+
+
 def receipt_reference(campaign_dir: Union[str, Path], path: Union[str, Path]) -> Dict[str, str]:
     campaign = Path(campaign_dir).resolve()
     resolved = _inside_campaign(Path(campaign_dir), Path(path))
@@ -395,6 +438,7 @@ __all__ = [
     "CompletionReceiptError",
     "canonical_sha256",
     "evidence_records",
+    "inventory_completion_receipts",
     "read_completion_receipt",
     "replayable_completion_receipts",
     "receipt_dir",

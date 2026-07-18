@@ -1296,6 +1296,87 @@ def test_propose_recovery_active_submission_intent_is_adoption_ready(tmp_path):
     assert "expected_job_name=uid-FEREBUS-3" in reason
 
 
+def test_propose_recovery_excludes_receipt_backed_jobless_ferebus_intent(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon.completion_receipts import (
+        write_completion_receipt,
+    )
+    from ichor.hpc.active_learning.daemon.submission_intent import (
+        write_pre_submit_intent,
+    )
+
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_training_and_model_versions(training, models, (0,))
+    _trust_marker_models(monkeypatch)
+
+    before = fresh_campaign_state(
+        max_iterations=2,
+        campaign_uid=_FIXTURE_CAMPAIGN_UID,
+    )
+    before.phase = CampaignPhase.INITIAL_FEREBUS
+    before.reference_data_version = 0
+    before.validation_set_version = 0
+    intent = write_pre_submit_intent(
+        campaign,
+        campaign_uid=before.campaign_uid,
+        phase_name=before.phase.value,
+        iteration=0,
+        expected_tasks=1,
+    )
+    after = fresh_campaign_state(
+        max_iterations=2,
+        campaign_uid=_FIXTURE_CAMPAIGN_UID,
+    )
+    after.phase = CampaignPhase.SEED_SELECT
+    after.iteration = 1
+    after.reference_data_version = 0
+    after.validation_set_version = 0
+    after.models_version = 0
+    write_completion_receipt(
+        campaign,
+        campaign_uid=before.campaign_uid,
+        phase=before.phase.value,
+        iteration=0,
+        replacement_round=0,
+        config_sha256="c" * 64,
+        state_before=before,
+        state_after=after,
+        next_phase=after.phase.value,
+        next_iteration=after.iteration,
+        state_updates={"models_version": 0},
+        evidence=[],
+        job_id=None,
+        expected_tasks=1,
+        submission_identity=str(intent["submission_identity"]),
+    )
+    halted = fresh_campaign_state(
+        max_iterations=2,
+        campaign_uid=_FIXTURE_CAMPAIGN_UID,
+    )
+    halted.phase = CampaignPhase.HALTED
+    halted.iteration = 1
+    halted.reference_data_version = 0
+    halted.validation_set_version = 0
+    halted.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, halted)
+
+    report = propose_recovery(campaign)
+
+    assert report.active_submission_intents == []
+    assert len(report.receipt_backed_intent_repairs) == 1
+    repair = report.receipt_backed_intent_repairs[0]
+    assert repair["phase"] == CampaignPhase.INITIAL_FEREBUS.value
+    assert repair["completion_receipt"]["receipt_id"]
+    assert not any(
+        "active submission intent" in reason
+        or "prepared scratch" in reason
+        for reason in report.unsafe_reasons
+    )
+
+
 def test_propose_recovery_force_cannot_mint_uid_for_nonempty_campaign(tmp_path):
     campaign, _, _, _ = _campaign_dirs(tmp_path)
     staging = campaign / ".DATA" / "STAGING" / "iter_1"

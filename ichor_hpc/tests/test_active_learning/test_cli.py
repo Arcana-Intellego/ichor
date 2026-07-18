@@ -2735,7 +2735,7 @@ def test_cli_reconcile_json_outputs_machine_readable_decision(tmp_path, capsys):
     assert rc == 0
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
-    assert payload["schema_version"] == 4
+    assert payload["schema_version"] == 5
     assert payload["campaign_dir"] == str(campaign)
     assert payload["proposed_state_path"].endswith("state.json.proposed")
     assert "selected_phase" in payload
@@ -2931,6 +2931,50 @@ def test_reconcile_hard_blockers_keep_data_staging_without_archive_staging():
         in blockers
     )
     assert ".DATA/STAGING" in blockers
+
+
+def test_reconcile_publishes_receipt_backed_intent_retirement_after_state_commit(
+    tmp_path,
+):
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state(max_iterations=2, campaign_uid="cli-repair")
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 1
+    intent = submission_intent.write_pre_submit_intent(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        phase_name=CampaignPhase.INITIAL_FEREBUS.value,
+        iteration=0,
+        expected_tasks=6,
+    )
+    reference = {
+        "path": ".DATA/ACTIVE_LEARNING/phase_completions/" + "a" * 64 + ".json",
+        "receipt_id": "a" * 64,
+        "sha256": "b" * 64,
+    }
+
+    cli_mod._publish_reconcile_intent_transitions(
+        campaign,
+        [
+            {
+                "phase": CampaignPhase.INITIAL_FEREBUS.value,
+                "iteration": 0,
+                "submission_identity": intent["submission_identity"],
+                "target_status": "SUPERSEDED",
+                "reason": "phase_completed_without_scheduler_submission",
+                "completion_receipt": reference,
+            }
+        ],
+        state,
+    )
+
+    retired = submission_intent.load_intent(
+        campaign,
+        CampaignPhase.INITIAL_FEREBUS.value,
+        0,
+    )
+    assert retired["status"] == "SUPERSEDED"
+    assert retired["completion_receipt"] == reference
 
 
 def test_cli_reconcile_apply_prints_final_recomputed_phase(
