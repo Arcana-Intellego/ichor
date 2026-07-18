@@ -307,6 +307,11 @@ class Daemon:
     _shutdown_requested: bool = field(default=False, init=False, repr=False)
     _lock_held: Optional[Any] = field(default=None, init=False, repr=False)
     _provenance_index_repair_attempted: bool = field(default=False, init=False, repr=False)
+    _unsubmitted_intent_repair_attempted: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+    )
     _lease_owner_token: Optional[str] = field(default=None, init=False, repr=False)
     _lease_heartbeat_thread: Optional[threading.Thread] = field(
         default=None, init=False, repr=False
@@ -1115,6 +1120,7 @@ class Daemon:
             replayable_completion_receipts,
             validate_completion_reference,
         )
+        self._repair_completed_unsubmitted_intents(state)
         reference = getattr(state, "last_completion_receipt", None)
         if isinstance(reference, dict):
             try:
@@ -1143,21 +1149,12 @@ class Daemon:
                 "FAILED",
                 "SUPERSEDED",
             }:
-                try:
-                    _submission_intent.mark_completed(
-                        self.campaign_dir,
-                        str(payload["phase"]),
-                        int(payload["iteration"]),
-                        completion_receipt=dict(reference),
-                    )
-                except Exception as exc:
-                    self._journal(
-                        "submission_intent_completion_deferred",
-                        phase=str(payload.get("phase") or ""),
-                        iteration=int(payload.get("iteration", 0)),
-                        error=type(exc).__name__ + ": " + str(exc)[:180],
-                        completion_receipt=dict(reference),
-                    )
+                self._complete_intent_after_advance(
+                    str(payload["phase"]),
+                    int(payload["iteration"]),
+                    dict(reference),
+                    completed_without_submission=(payload.get("job_id") is None),
+                )
 
         try:
             matches = replayable_completion_receipts(
@@ -1189,6 +1186,7 @@ class Daemon:
             str(payload["phase"]),
             int(payload["iteration"]),
             recovered.last_completion_receipt,
+            completed_without_submission=(payload.get("job_id") is None),
         )
         self._journal(
             "phase_completion_replayed",
@@ -1813,6 +1811,7 @@ class Daemon:
                     phase_name,
                     completed_iteration,
                     state.last_completion_receipt,
+                    completed_without_submission=True,
                 )
             return TickStatus.ADVANCED
         #defensive: executor returned neither a JobID nor completion.
@@ -2966,17 +2965,53 @@ class Daemon:
         phase_name: str,
         iteration: int,
         completion_receipt: Optional[Dict[str, Any]],
+        *,
+        completed_without_submission: bool = False,
     ) -> None:
         try:
+            receipt = (
+                dict(completion_receipt)
+                if isinstance(completion_receipt, dict)
+                else None
+            )
+            if completed_without_submission:
+                intent = _submission_intent.load_intent(
+                    self.campaign_dir,
+                    phase_name,
+                    int(iteration),
+                )
+                if intent is None:
+                    return
+                status = str(intent.get("status") or "")
+                if status in _submission_intent.TERMINAL_STATUSES:
+                    return
+                if status != "PRE_SUBMIT" or intent.get("job_id") is not None:
+                    raise ValueError(
+                        "scheduler-free completion requires a jobless "
+                        "PRE_SUBMIT intent"
+                    )
+                retired = _submission_intent.mark_superseded(
+                    self.campaign_dir,
+                    phase_name,
+                    int(iteration),
+                    "phase_completed_without_scheduler_submission",
+                    completion_receipt=receipt,
+                )
+                self._journal(
+                    "submission_intent_retired_without_submission",
+                    phase=phase_name,
+                    iteration=int(iteration),
+                    submission_identity=str(
+                        retired.get("submission_identity") or ""
+                    ),
+                    completion_receipt=receipt,
+                )
+                return
             _submission_intent.mark_completed(
                 self.campaign_dir,
                 phase_name,
                 int(iteration),
-                completion_receipt=(
-                    dict(completion_receipt)
-                    if isinstance(completion_receipt, dict)
-                    else None
-                ),
+                completion_receipt=receipt,
             )
         except Exception as exc:
             self._journal(
@@ -2990,6 +3025,126 @@ class Daemon:
                     else None
                 ),
             )
+
+    def _repair_completed_unsubmitted_intents(
+        self,
+        state: CampaignState,
+    ) -> None:
+        """Retire historical jobless intents already covered by receipts."""
+        if self._unsubmitted_intent_repair_attempted:
+            return
+        self._unsubmitted_intent_repair_attempted = True
+
+        try:
+            inventory = _submission_intent.inventory_intents(self.campaign_dir)
+        except Exception as exc:
+            self._journal(
+                "submission_intent_read_failed",
+                phase=state.phase.value,
+                iteration=int(state.iteration),
+                error="historical_completion_repair: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:160],
+            )
+            return
+        candidates = [
+            dict(intent)
+            for intent in inventory.get("records", [])
+            if str(intent.get("status") or "") == "PRE_SUBMIT"
+            and intent.get("job_id") is None
+            and str(intent.get("campaign_uid") or "") == str(state.campaign_uid)
+        ]
+        if not candidates:
+            return
+
+        from .completion_receipts import (
+            CompletionReceiptError,
+            read_completion_receipt,
+            receipt_dir,
+            receipt_reference,
+        )
+
+        wanted = {
+            (
+                str(intent.get("phase") or ""),
+                int(intent.get("iteration", 0)),
+                str(intent.get("submission_identity") or ""),
+            )
+            for intent in candidates
+        }
+        receipts: Dict[tuple[str, int, str], list[tuple[Path, Dict[str, Any]]]] = {}
+        root = receipt_dir(self.campaign_dir)
+        if not root.is_dir() or root.is_symlink():
+            return
+        for path in sorted(root.glob("*.json")):
+            try:
+                payload = read_completion_receipt(path)
+            except CompletionReceiptError:
+                continue
+            key = (
+                str(payload.get("phase") or ""),
+                int(payload.get("iteration", 0)),
+                str(payload.get("submission_identity") or ""),
+            )
+            if (
+                key not in wanted
+                or payload.get("job_id") is not None
+                or str(payload.get("campaign_uid") or "")
+                != str(state.campaign_uid)
+            ):
+                continue
+            receipts.setdefault(key, []).append((path, payload))
+
+        for intent in candidates:
+            key = (
+                str(intent.get("phase") or ""),
+                int(intent.get("iteration", 0)),
+                str(intent.get("submission_identity") or ""),
+            )
+            matches = receipts.get(key, [])
+            if len(matches) != 1:
+                continue
+            path, payload = matches[0]
+            try:
+                after = CampaignState.from_dict(dict(payload["state_after"]))
+            except Exception:
+                continue
+            if int(state.iteration) < int(after.iteration):
+                continue
+            if any(
+                int(getattr(state, field_name))
+                < int(getattr(after, field_name))
+                for field_name in (
+                    "reference_data_version",
+                    "validation_set_version",
+                    "models_version",
+                )
+            ):
+                continue
+            if (
+                state.phase.value == str(intent.get("phase") or "")
+                and int(state.iteration) == int(intent.get("iteration", 0))
+            ):
+                continue
+            try:
+                reference = receipt_reference(self.campaign_dir, path)
+                self._complete_intent_after_advance(
+                    str(intent["phase"]),
+                    int(intent["iteration"]),
+                    reference,
+                    completed_without_submission=True,
+                )
+            except Exception as exc:
+                self._journal(
+                    "submission_intent_completion_deferred",
+                    phase=str(intent.get("phase") or ""),
+                    iteration=int(intent.get("iteration", 0)),
+                    error="historical_completion_repair: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)[:150],
+                )
 
     def _liveness_blocks_accounting_timeout(self, liveness: Optional[Any]) -> bool:
         return liveness is not None and bool(getattr(liveness, "active", False))
@@ -4211,6 +4366,7 @@ class Daemon:
                     )
                     try:
                         state = read_state(self.state_path())
+                        self._repair_completed_unsubmitted_intents(state)
                         self._prepare_environment_generation(state)
                     except Exception as exc:
                         notify_startup(

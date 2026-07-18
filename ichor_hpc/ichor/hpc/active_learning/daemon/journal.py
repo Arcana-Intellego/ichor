@@ -147,6 +147,7 @@ KNOWN_EVENT_TYPES = (
     "submission_intent_update_failed",
     "submission_intent_read_failed",
     "submission_intent_completion_deferred",
+    "submission_intent_retired_without_submission",
     "stop_request_completion_deferred",
     "phase_completion_replayed",
     "provenance_index_repaired",

@@ -886,8 +886,16 @@ def mark_failed(campaign_dir: Union[str, Path], phase_name: str, iteration: int,
     )
 
 
-def mark_superseded(campaign_dir: Union[str, Path], phase_name: str, iteration: int, reason: str) -> Dict[str, Any]:
+def mark_superseded(
+    campaign_dir: Union[str, Path],
+    phase_name: str,
+    iteration: int,
+    reason: str,
+    *,
+    completion_receipt: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     return update_intent_status(
         campaign_dir, phase_name=phase_name, iteration=iteration,
         status="SUPERSEDED", reason=reason,
+        completion_receipt=completion_receipt,
     )

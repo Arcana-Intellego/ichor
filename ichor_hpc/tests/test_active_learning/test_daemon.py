@@ -146,13 +146,23 @@ def test_run_acknowledges_ownership_before_environment_transition(
     d = _make_daemon(tmp_path)
     write_state(d.state_path(), fresh_campaign_state(max_iterations=1))
     startup = []
+    startup_repairs = []
+
+    def repair_unsubmitted_intents(state):
+        startup_repairs.append(state.phase.value)
 
     def prepare_environment(state):
+        assert startup_repairs == [state.phase.value]
         assert startup[-1][0:2] == (
             "ownership_acquired",
             "environment_transition",
         )
 
+    monkeypatch.setattr(
+        d,
+        "_repair_completed_unsubmitted_intents",
+        repair_unsubmitted_intents,
+    )
     monkeypatch.setattr(d, "_prepare_environment_generation", prepare_environment)
 
     rc = d.run(
@@ -926,6 +936,116 @@ def test_phase_entry_complete_failure_halts_instead_of_advancing(tmp_path):
     events = list(iter_events(d.journal_path()))
     assert events[-1]["event"] == "halt"
     assert events[-1]["reason"] == "postprocess_only_validation_failed"
+
+
+def test_scheduler_free_completion_retires_pre_submit_intent(tmp_path):
+    d = _make_daemon(tmp_path)
+    state = fresh_campaign_state(max_iterations=1)
+    submission_intent.write_pre_submit_intent(
+        d.campaign_dir,
+        campaign_uid=state.campaign_uid,
+        phase_name=CampaignPhase.INITIAL_FEREBUS.value,
+        iteration=0,
+        expected_tasks=6,
+    )
+    reference = {
+        "path": ".DATA/ACTIVE_LEARNING/phase_completions/" + "a" * 64 + ".json",
+        "receipt_id": "a" * 64,
+        "sha256": "b" * 64,
+    }
+
+    d._complete_intent_after_advance(
+        CampaignPhase.INITIAL_FEREBUS.value,
+        0,
+        reference,
+        completed_without_submission=True,
+    )
+    d._complete_intent_after_advance(
+        CampaignPhase.INITIAL_FEREBUS.value,
+        0,
+        reference,
+        completed_without_submission=True,
+    )
+
+    retired = submission_intent.load_intent(
+        d.campaign_dir,
+        CampaignPhase.INITIAL_FEREBUS.value,
+        0,
+    )
+    assert retired is not None
+    assert retired["status"] == "SUPERSEDED"
+    assert retired["completion_receipt"] == reference
+    events = list(iter_events(d.journal_path()))
+    assert sum(
+        event.get("event") == "submission_intent_retired_without_submission"
+        for event in events
+    ) == 1
+    assert not any(
+        event.get("event") == "submission_intent_completion_deferred"
+        for event in events
+    )
+
+
+def test_startup_repairs_historical_jobless_intent_from_completion_receipt(
+    tmp_path,
+):
+    from ichor.hpc.active_learning.daemon.completion_receipts import (
+        receipt_reference,
+        write_completion_receipt,
+    )
+
+    d = _make_daemon(tmp_path)
+    before = fresh_campaign_state(max_iterations=2)
+    before.phase = CampaignPhase.INITIAL_FEREBUS
+    before.reference_data_version = 0
+    before.validation_set_version = 0
+    intent = submission_intent.write_pre_submit_intent(
+        d.campaign_dir,
+        campaign_uid=before.campaign_uid,
+        phase_name=before.phase.value,
+        iteration=0,
+        expected_tasks=6,
+    )
+    after = CampaignState.from_dict(before.to_dict())
+    after.phase = CampaignPhase.SEED_SELECT
+    after.iteration = 1
+    after.models_version = 0
+    receipt_path = write_completion_receipt(
+        d.campaign_dir,
+        campaign_uid=before.campaign_uid,
+        phase=before.phase.value,
+        iteration=0,
+        replacement_round=0,
+        config_sha256="c" * 64,
+        state_before=before,
+        state_after=after,
+        next_phase=after.phase.value,
+        next_iteration=after.iteration,
+        state_updates={"models_version": 0},
+        evidence=[],
+        job_id=None,
+        expected_tasks=6,
+        submission_identity=str(intent["submission_identity"]),
+    )
+    after.last_completion_receipt = receipt_reference(
+        d.campaign_dir,
+        receipt_path,
+    )
+
+    assert d._recover_phase_completion(after) is None
+
+    retired = submission_intent.load_intent(
+        d.campaign_dir,
+        CampaignPhase.INITIAL_FEREBUS.value,
+        0,
+    )
+    assert retired is not None
+    assert retired["status"] == "SUPERSEDED"
+    assert retired["completion_receipt"] == after.last_completion_receipt
+    assert not any(
+        event.get("event") == "submission_intent_completion_deferred"
+        for event in iter_events(d.journal_path())
+    )
 
 
 def test_scientific_convergence_transitions_to_done_with_durable_context(tmp_path):

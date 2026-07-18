@@ -2258,6 +2258,9 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "submission_intent_update_failed": "submission intent update failed",
     "submission_intent_read_failed": "submission intent read failed",
     "submission_intent_completion_deferred": "intent completion persistence deferred",
+    "submission_intent_retired_without_submission": (
+        "unused submission intent retired"
+    ),
     "phase_completion_replayed": "phase completion replayed",
     "provenance_index_repaired": "provenance index repaired",
     "provenance_index_repair_failed": "provenance index repair failed",
@@ -2308,6 +2311,7 @@ _JOURNAL_OK_EVENTS = {
     "bootstrap_inputs_confirmed",
     "model_bootstrap_committed",
     "error_calibration_summary",
+    "submission_intent_retired_without_submission",
     "user_stop_boundary_reached",
     "user_stop_resumed",
 }
