@@ -486,6 +486,122 @@ def test_rebind_rejects_reference_commit_transaction_identity_mismatch(
         )
 
 
+@pytest.mark.parametrize(
+    ("phase", "iteration", "reference_version", "model_version"),
+    [
+        (CampaignPhase.INITIAL_FEREBUS, 0, 0, -1),
+        (CampaignPhase.FEREBUS, 2, 2, 1),
+    ],
+)
+def test_rebind_accepts_clean_pre_submission_ferebus_boundary(
+    tmp_path,
+    monkeypatch,
+    phase,
+    iteration,
+    reference_version,
+    model_version,
+):
+    from ichor.hpc.active_learning.daemon import ferebus_row_cache
+    from ichor.hpc.active_learning.versioning import reference_data, trained_models
+
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = phase
+    state.iteration = iteration
+    state.reference_data_version = reference_version
+    state.models_version = model_version
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.recovery_contracts.phase_recovery_contract_error",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        reference_data.ReferenceDataVersioning,
+        "current_version",
+        lambda _self: reference_version,
+    )
+    monkeypatch.setattr(
+        trained_models.TrainedModelVersioning,
+        "current_version",
+        lambda _self: None if model_version < 0 else model_version,
+    )
+    monkeypatch.setattr(
+        reference_data.ReferenceDataVersioning,
+        "resolve",
+        lambda *_args, **_kwargs: SimpleNamespace(version=reference_version),
+    )
+    monkeypatch.setattr(ferebus_row_cache, "clear_row_caches", lambda *_args: False)
+    monkeypatch.setattr(
+        ferebus_row_cache,
+        "ensure_cumulative_row_caches",
+        lambda *_args, **_kwargs: None,
+    )
+
+    result = rebind_environment(
+        campaign,
+        config=config,
+        scheduler_ownership_clear=True,
+    )
+
+    assert result["changed"] is True
+    rebound = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
+    assert rebound.phase is phase
+    assert rebound.reference_data_version == reference_version
+    assert rebound.models_version == model_version
+
+
+def test_rebind_requires_reconcile_to_archive_failed_ferebus_staging(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.INITIAL_FEREBUS
+    state.iteration = 0
+    state.reference_data_version = 0
+    state.models_version = -1
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    (campaign / "TRAINED_MODELS" / "iteration-staging").mkdir(parents=True)
+
+    with pytest.raises(ExecutionIdentityError, match="reconcile to archive"):
+        rebind_environment(
+            campaign,
+            config=config,
+            scheduler_ownership_clear=True,
+        )
+
+
+def test_rebind_rejects_ferebus_current_pointer_mismatch(tmp_path, monkeypatch):
+    from ichor.hpc.active_learning.versioning import reference_data, trained_models
+
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.INITIAL_FEREBUS
+    state.iteration = 0
+    state.reference_data_version = 0
+    state.models_version = -1
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    monkeypatch.setattr(
+        reference_data.ReferenceDataVersioning,
+        "current_version",
+        lambda _self: None,
+    )
+    monkeypatch.setattr(
+        trained_models.TrainedModelVersioning,
+        "current_version",
+        lambda _self: None,
+    )
+
+    with pytest.raises(ExecutionIdentityError, match="current pointers"):
+        rebind_environment(
+            campaign,
+            config=config,
+            scheduler_ownership_clear=True,
+        )
+
+
 def test_rebind_requires_conclusive_scheduler_clearance(tmp_path, monkeypatch):
     campaign, config, _state = _rebind_campaign(tmp_path, monkeypatch)
 

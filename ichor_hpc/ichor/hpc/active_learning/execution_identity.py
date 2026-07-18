@@ -40,6 +40,70 @@ _REBINDABLE_REFERENCE_COMMIT_STATES = frozenset(
     }
 )
 
+
+def _validate_ferebus_rebind_boundary(campaign: Path, state: Any) -> None:
+    """Require a clean, committed-data-only FEREBUS submission boundary."""
+    from .daemon.recovery_contracts import phase_recovery_contract_error
+    from .layout import qm_reference_data_dir, trained_models_dir
+    from .versioning.reference_data import ReferenceDataVersioning
+    from .versioning.trained_models import TrainedModelVersioning
+
+    phase = CampaignPhase(state.phase)
+    staging = trained_models_dir(campaign) / "iteration-staging"
+    if staging.exists() or staging.is_symlink():
+        raise ExecutionIdentityError(
+            "environment rebind at "
+            + phase.value
+            + " requires reconcile to archive TRAINED_MODELS/iteration-staging first"
+        )
+
+    iteration = int(state.iteration)
+    reference_version = int(state.reference_data_version)
+    model_version = int(state.models_version)
+    if phase is CampaignPhase.INITIAL_FEREBUS:
+        expected = (0, 0, -1)
+        observed = (iteration, reference_version, model_version)
+        if observed != expected:
+            raise ExecutionIdentityError(
+                "INITIAL_FEREBUS environment rebind requires iteration/reference/model "
+                "versions 0/0/-1"
+            )
+    elif phase is CampaignPhase.FEREBUS:
+        if (
+            reference_version < 1
+            or iteration != reference_version
+            or model_version != reference_version - 1
+        ):
+            raise ExecutionIdentityError(
+                "FEREBUS environment rebind requires iteration N, reference version N, "
+                "and incumbent model version N-1"
+            )
+    else:  # pragma: no cover - guarded by the caller
+        raise ExecutionIdentityError("invalid FEREBUS environment-rebind phase")
+
+    reference_current = ReferenceDataVersioning(
+        qm_reference_data_dir(campaign)
+    ).current_version()
+    model_current = TrainedModelVersioning(
+        trained_models_dir(campaign)
+    ).current_version()
+    expected_model_current = None if model_version < 0 else model_version
+    if reference_current != reference_version or model_current != expected_model_current:
+        raise ExecutionIdentityError(
+            "environment rebind at "
+            + phase.value
+            + " requires committed current pointers to match campaign state"
+        )
+
+    contract_error = phase_recovery_contract_error(campaign, state)
+    if contract_error is not None:
+        raise ExecutionIdentityError(
+            "environment rebind at "
+            + phase.value
+            + " failed its recovery contract: "
+            + str(contract_error)
+        )
+
 _ENVIRONMENT_FINGERPRINT_KEYS = (
     "python_executable",
     "python_version",
@@ -919,10 +983,13 @@ def rebind_environment(
                 "environment rebind at REFERENCE_COMMIT found inconsistent "
                 "campaign, iteration, or reference-version identity"
             )
+    elif state.phase in {CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS}:
+        _validate_ferebus_rebind_boundary(campaign, state)
     elif state.phase not in {CampaignPhase.SEED_SELECT, CampaignPhase.DONE}:
         raise ExecutionIdentityError(
             "environment rebind requires an idle SEED_SELECT or DONE boundary, "
-            "or a verified unpublished REFERENCE_COMMIT recovery transaction"
+            "a verified unpublished REFERENCE_COMMIT recovery transaction, or a "
+            "clean pre-submission FEREBUS retry boundary"
         )
     if any(value is not None for value in state.pending_jobs.values()):
         raise ExecutionIdentityError(
