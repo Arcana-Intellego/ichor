@@ -139,6 +139,7 @@ def test_daemon_control_archive_staging_dispatches_reconcile(monkeypatch):
         seen["apply"] = ns.apply
         seen["archive_staging"] = ns.archive_staging
         seen["restore_config_from_lock"] = ns.restore_config_from_lock
+        seen["deep_verify"] = ns.deep_verify
         return 0
 
     monkeypatch.setattr(
@@ -148,6 +149,7 @@ def test_daemon_control_archive_staging_dispatches_reconcile(monkeypatch):
     )
     monkeypatch.setattr(menu_mod, "user_input_free_flow", lambda prompt, default: "YES")
     monkeypatch.setattr(cli_mod, "cmd_reconcile", fake_reconcile)
+    menu_mod.daemon_control_menu_options.reconcile_deep_verify = False
 
     menu_mod.DaemonControlFunctions.reconcile_archive_stale_staging()
 
@@ -155,7 +157,39 @@ def test_daemon_control_archive_staging_dispatches_reconcile(monkeypatch):
         "apply": True,
         "archive_staging": True,
         "restore_config_from_lock": False,
+        "deep_verify": False,
     }
+
+
+def test_daemon_control_propagates_deep_reconcile_toggle(monkeypatch):
+    import importlib
+
+    import ichor.hpc.active_learning.cli as cli_mod
+
+    menu_mod = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.daemon_control_menu"
+    )
+    seen = []
+    monkeypatch.setattr(
+        menu_mod,
+        "_guarded_campaign_dir_ns",
+        lambda: SimpleNamespace(campaign_dir="/tmp/campaign"),
+    )
+    monkeypatch.setattr(menu_mod, "user_input_free_flow", lambda *args: "")
+    monkeypatch.setattr(
+        cli_mod,
+        "cmd_reconcile",
+        lambda ns: seen.append(bool(ns.deep_verify)) or 0,
+    )
+    menu_mod.daemon_control_menu_options.reconcile_deep_verify = False
+
+    menu_mod.DaemonControlFunctions.reconcile()
+    menu_mod.DaemonControlFunctions.toggle_reconcile_deep_verify()
+    menu_mod.DaemonControlFunctions.reconcile()
+
+    assert seen == [False, True]
+    menu_mod.daemon_control_menu_options.reconcile_deep_verify = False
 
 
 def test_daemon_control_status_passes_visible_display_options(monkeypatch):

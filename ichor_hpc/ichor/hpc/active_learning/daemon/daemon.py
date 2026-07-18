@@ -1215,10 +1215,18 @@ class Daemon:
         for attempt in range(attempts):
             try:
                 from .artifact_contracts import verify_state_referenced_artifacts
+                from .artifact_snapshot import build_committed_artifact_snapshot
+
+                snapshot = build_committed_artifact_snapshot(
+                    self.campaign_dir,
+                    verification_level="metadata",
+                )
                 verify_state_referenced_artifacts(
                     self.campaign_dir,
                     state,
                     strict_models=True,
+                    verification="metadata",
+                    snapshot=snapshot,
                 )
                 return None
             except Exception as exc:
@@ -3464,8 +3472,24 @@ class Daemon:
                 verify_committed_model_version,
                 verify_committed_reference_data_version,
             )
-            verify_committed_reference_data_version(self.campaign_dir, reference_data_version)
-            verify_committed_model_version(self.campaign_dir, models_version)
+            from .artifact_snapshot import build_committed_artifact_snapshot
+
+            snapshot = build_committed_artifact_snapshot(
+                self.campaign_dir,
+                verification_level="metadata",
+            )
+            verify_committed_reference_data_version(
+                self.campaign_dir,
+                reference_data_version,
+                verification="metadata",
+                snapshot=snapshot,
+            )
+            verify_committed_model_version(
+                self.campaign_dir,
+                models_version,
+                verification="metadata",
+                snapshot=snapshot,
+            )
         except Exception as exc:
             return (
                 "required FEREBUS model commit missing or invalid after "

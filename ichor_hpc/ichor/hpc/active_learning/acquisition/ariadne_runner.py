@@ -2536,7 +2536,7 @@ def main(argv=None) -> int:
         model_set, models = load_trained_models(
             campaign,
             models_version,
-            verification="deep",
+            verification="metadata",
         )
     except Exception as exc:
         print(

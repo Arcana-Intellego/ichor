@@ -1630,6 +1630,9 @@ def _archive_completed_model_iteration_staging(
     campaign: Path,
     target: Path,
     proposed_state: CampaignState,
+    *,
+    verification: str = "metadata",
+    artifact_snapshot: Optional[Any] = None,
 ) -> Path:
     try:
         model_version = int(proposed_state.models_version)
@@ -1640,13 +1643,23 @@ def _archive_completed_model_iteration_staging(
             "completed FEREBUS iteration-staging exists but no committed model "
             "version is recorded"
         )
-    committed_set = resolve_trained_model_set(
-        campaign,
-        model_version,
-        verification="deep",
+    committed_set = (
+        artifact_snapshot.model_set(model_version)
+        if artifact_snapshot is not None
+        else resolve_trained_model_set(
+            campaign,
+            model_version,
+            verification=verification,
+            reference_verification="metadata",
+        )
     )
     committed = committed_set.root
-    verify_committed_model_version(campaign, model_version)
+    verify_committed_model_version(
+        campaign,
+        model_version,
+        verification=verification,
+        snapshot=artifact_snapshot,
+    )
     staged_models = _staged_model_hashes_by_task(target)
     committed_models = {
         task.key: task.model.sha256 for task in committed_set.tasks
@@ -1674,15 +1687,26 @@ def _archive_completed_model_iteration_staging(
 def clean_model_iteration_staging_for_reconcile(
     campaign_dir: Union[str, Path],
     proposed_state: CampaignState,
+    *,
+    verification: str = "metadata",
+    artifact_snapshot: Optional[Any] = None,
 ) -> List[str]:
     campaign = Path(campaign_dir)
     with trained_models_commit_lock(campaign):
-        return _clean_model_iteration_staging_locked(campaign, proposed_state)
+        return _clean_model_iteration_staging_locked(
+            campaign,
+            proposed_state,
+            verification=verification,
+            artifact_snapshot=artifact_snapshot,
+        )
 
 
 def _clean_model_iteration_staging_locked(
     campaign: Path,
     proposed_state: CampaignState,
+    *,
+    verification: str = "metadata",
+    artifact_snapshot: Optional[Any] = None,
 ) -> List[str]:
     model_versioning = TrainedModelVersioning(trained_models_dir(campaign))
     archived_paths: List[str] = []
@@ -1718,6 +1742,8 @@ def _clean_model_iteration_staging_locked(
             campaign,
             target,
             proposed_state,
+            verification=verification,
+            artifact_snapshot=artifact_snapshot,
         )
         return archived_paths + [str(archived)]
     if proposed_state.phase not in (CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS):
@@ -1727,7 +1753,12 @@ def _clean_model_iteration_staging_locked(
             raise ValueError("models_version is not an integer") from exc
         if model_version < 0:
             raise ValueError("models_version is negative; cannot verify committed model")
-        verify_committed_model_version(campaign, model_version)
+        verify_committed_model_version(
+            campaign,
+            model_version,
+            verification=verification,
+            snapshot=artifact_snapshot,
+        )
     archive = _reconcile_archive_target(
         campaign,
         _timestamped_reconcile_sibling(target),
@@ -1739,6 +1770,9 @@ def _clean_model_iteration_staging_locked(
 def ferebus_reentry_can_archive_data_staging(
     campaign_dir: Union[str, Path],
     proposed_state: CampaignState,
+    *,
+    verification: str = "metadata",
+    artifact_snapshot: Optional[Any] = None,
 ) -> Tuple[bool, str]:
     if proposed_state.phase not in (CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS):
         return False, "only FEREBUS re-entry may archive .DATA/STAGING"
@@ -1751,7 +1785,12 @@ def ferebus_reentry_can_archive_data_staging(
     if reference_data_version < 0:
         return False, "reference_data_version is negative"
     try:
-        verify_committed_reference_data_version(campaign_dir, reference_data_version)
+        verify_committed_reference_data_version(
+            campaign_dir,
+            reference_data_version,
+            verification=verification,
+            snapshot=artifact_snapshot,
+        )
     except Exception as exc:
         return False, "committed reference-data version is invalid: " + str(exc)[:180]
     return True, "verified committed training exists for FEREBUS re-entry"
@@ -1760,8 +1799,16 @@ def ferebus_reentry_can_archive_data_staging(
 def archive_data_staging_for_ferebus_reentry(
     campaign_dir: Union[str, Path],
     proposed_state: CampaignState,
+    *,
+    verification: str = "metadata",
+    artifact_snapshot: Optional[Any] = None,
 ) -> List[str]:
-    ok, reason = ferebus_reentry_can_archive_data_staging(campaign_dir, proposed_state)
+    ok, reason = ferebus_reentry_can_archive_data_staging(
+        campaign_dir,
+        proposed_state,
+        verification=verification,
+        artifact_snapshot=artifact_snapshot,
+    )
     if not ok:
         raise ValueError(reason)
     campaign = Path(campaign_dir)
@@ -1904,6 +1951,9 @@ def restore_config_from_lock_proposal(campaign_dir: Union[str, Path]) -> Path:
 def reference_data_staging_can_archive_for_reconcile(
     campaign_dir: Union[str, Path],
     proposed_state: CampaignState,
+    *,
+    verification: str = "metadata",
+    artifact_snapshot: Optional[Any] = None,
 ) -> Tuple[bool, str]:
     campaign = Path(campaign_dir)
     training = campaign / "QM_REFERENCE_DATA"
@@ -1957,7 +2007,12 @@ def reference_data_staging_can_archive_for_reconcile(
     if reference_data_version < 0:
         return False, "reference_data_version is negative"
     try:
-        verify_committed_reference_data_version(campaign, reference_data_version)
+        verify_committed_reference_data_version(
+            campaign,
+            reference_data_version,
+            verification=verification,
+            snapshot=artifact_snapshot,
+        )
     except Exception as exc:
         return False, "committed reference-data version is invalid: " + str(exc)[:180]
     try:
@@ -1966,7 +2021,12 @@ def reference_data_staging_can_archive_for_reconcile(
         model_version = -1
     if model_version >= 0:
         try:
-            verify_committed_model_version(campaign, model_version)
+            verify_committed_model_version(
+                campaign,
+                model_version,
+                verification=verification,
+                snapshot=artifact_snapshot,
+            )
         except Exception as exc:
             return False, "committed model version is invalid: " + str(exc)[:180]
     return True, "dangling reference-data staging can be archived"
@@ -1975,10 +2035,15 @@ def reference_data_staging_can_archive_for_reconcile(
 def archive_reference_data_staging_for_reconcile(
     campaign_dir: Union[str, Path],
     proposed_state: CampaignState,
+    *,
+    verification: str = "metadata",
+    artifact_snapshot: Optional[Any] = None,
 ) -> List[str]:
     ok, reason = reference_data_staging_can_archive_for_reconcile(
         campaign_dir,
         proposed_state,
+        verification=verification,
+        artifact_snapshot=artifact_snapshot,
     )
     if not ok:
         raise ValueError(reason)

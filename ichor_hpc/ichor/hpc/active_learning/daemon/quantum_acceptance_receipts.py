@@ -8,7 +8,7 @@ import platform
 import stat
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, Optional
 
 from ..strict_json import strict_json as json
 from ..strict_json import load_path
@@ -127,6 +127,7 @@ def _validate_current_inventory(
     bindings: list[Dict[str, Any]],
     *,
     verification: str,
+    digest_file: Optional[Callable[[Path, bool], str]] = None,
 ) -> None:
     if verification not in {"receipt", "metadata", "deep"}:
         raise ValueError(
@@ -154,7 +155,12 @@ def _validate_current_inventory(
     _validate_required_evidence(bindings)
     if verification == "deep":
         for path, binding in zip(current_files, bindings):
-            if sha256_file(path) != str(binding.get("sha256") or ""):
+            observed_sha = (
+                digest_file(path, True)
+                if digest_file is not None
+                else sha256_file(path)
+            )
+            if observed_sha != str(binding.get("sha256") or ""):
                 raise ValueError(
                     "accepted quantum pointdir file hash has changed: " + str(path)
                 )
@@ -240,6 +246,7 @@ def read_quantum_acceptance_receipt(
     expected_source_pointdir: Optional[str] = None,
     verification: str = "metadata",
     validate_quality: bool = True,
+    digest_file: Optional[Callable[[Path, bool], str]] = None,
 ) -> Dict[str, Any]:
     """Validate acceptance evidence, rehashing payloads only when requested."""
     campaign = Path(campaign_dir).resolve()
@@ -296,7 +303,12 @@ def read_quantum_acceptance_receipt(
         raise ValueError("quantum acceptance receipt artefacts are missing")
     if payload.get("content_sha256") != _canonical_sha256(bindings):
         raise ValueError("quantum acceptance receipt content digest is invalid")
-    _validate_current_inventory(root, bindings, verification=verification)
+    _validate_current_inventory(
+        root,
+        bindings,
+        verification=verification,
+        digest_file=digest_file,
+    )
     quality_binding = payload.get("quality_manifest")
     if not isinstance(quality_binding, dict):
         raise ValueError("quantum acceptance quality binding is invalid")

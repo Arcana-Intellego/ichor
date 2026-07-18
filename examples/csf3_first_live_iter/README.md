@@ -229,3 +229,13 @@ If the campaign becomes `HALTED`, inspect `status` and `journal`, run
 after deliberately increasing `campaign.max_iterations` and applying that
 config change through reconcile, extend it only with
 `resume --reopen-converged`.
+
+Routine reconcile verifies complete metadata and file sizes without hashing
+the large QM payloads. If state is missing or malformed, or corruption is
+suspected, stop all campaign jobs and run the explicit one-pass check:
+
+```bash
+ichor-al-daemon reconcile --campaign-dir . --deep-verify --apply
+```
+
+Deep progress is printed while WFN, INT and Gaussian payloads are hashed.

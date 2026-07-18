@@ -18,7 +18,7 @@ import os
 import platform
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 
 __all__ = [
@@ -98,16 +98,23 @@ def _manifest_file(root: Path, relative: str) -> Path:
     return candidate
 
 
-def sha256_file(path: Union[str, Path]) -> str:
+def sha256_file(
+    path: Union[str, Path],
+    *,
+    progress_callback: Optional[Callable[[Path, int], None]] = None,
+) -> str:
     """Streamed SHA-256 of one regular file. Memory use is bounded by
     _BLOCK_SIZE regardless of file size."""
     h = hashlib.sha256()
-    with open(path, "rb") as f:
+    source = Path(path)
+    with open(source, "rb") as f:
         while True:
             chunk = f.read(_BLOCK_SIZE)
             if not chunk:
                 break
             h.update(chunk)
+            if progress_callback is not None:
+                progress_callback(source, len(chunk))
     return h.hexdigest()
 
 
@@ -245,6 +252,7 @@ def verify_manifest(
     manifest: Optional[Dict[str, str]] = None,
     strict: bool = True,
     exact: bool = False,
+    digest_file: Optional[Callable[[Path, bool], str]] = None,
 ) -> Tuple[List[str], List[str]]:
     """Check that every file recorded in the manifest still hashes to its
     recorded SHA-256. Returns (missing, mismatched) lists.
@@ -269,7 +277,11 @@ def verify_manifest(
         if not candidate.is_file():
             missing.append(rel)
             continue
-        actual = sha256_file(candidate)
+        actual = (
+            digest_file(candidate, False)
+            if digest_file is not None
+            else sha256_file(candidate)
+        )
         if actual != expected_sha:
             mismatched.append(rel)
     unexpected: List[str] = []

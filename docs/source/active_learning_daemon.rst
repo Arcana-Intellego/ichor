@@ -596,10 +596,12 @@ instead.
 
 This inspects the on-disk artefacts (committed iterations in
 :code:`QM_REFERENCE_DATA/` and :code:`TRAINED_MODELS/`, plus journal events)
-and proposes a recovered state at :code:`state.json.proposed`. Plain
-reconcile is diagnostic: it may write the proposal file and warn about a
-live daemon, but it does not alter :code:`state.json`. Review the proposal,
-then promote it manually::
+and proposes a recovered state at :code:`state.json.proposed`. Routine
+reconcile uses metadata verification: schemas, identities, inventories,
+file sizes and hash chains are checked without rereading WFN, INT or Gaussian
+payload bytes. Plain reconcile is diagnostic: it may write the proposal file
+and warn about a live daemon, but it does not alter :code:`state.json`. Review
+the proposal, then promote it manually::
 
     mv .DATA/ACTIVE_LEARNING/state.json.proposed .DATA/ACTIVE_LEARNING/state.json
     ichor-al-daemon resume --campaign-dir .
@@ -607,6 +609,18 @@ then promote it manually::
 For routine crash recovery, use the guarded apply path instead::
 
     ichor-al-daemon reconcile --campaign-dir . --apply
+
+When :code:`state.json` is missing or malformed and campaign authority must be
+reconstructed solely from committed artefacts, reconcile reports that deep
+verification is required. It never starts that potentially long scan
+implicitly. Run the exact explicit command it prints::
+
+    ichor-al-daemon reconcile --campaign-dir . --deep-verify --apply
+
+Use :code:`--deep-verify` for suspected corruption as well. Deep mode requires
+a quiescent campaign and hashes every committed scientific payload once;
+progress is written to stderr. Checkpoint creation, verification and restore
+retain their existing deep-verification contracts.
 
 The apply path refuses to run if the daemon lock is held, the lock state is
 unknown, the lease heartbeat is fresh, or the background daemon PID appears

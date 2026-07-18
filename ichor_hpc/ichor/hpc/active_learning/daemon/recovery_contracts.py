@@ -426,12 +426,34 @@ def _require_split(campaign: Path, iteration: int) -> None:
         raise RecoveryContractError("SPLIT_RECEIPT.json does not reproduce point allocation")
 
 
-def _require_reference_data_version(campaign: Path, version: int) -> None:
-    verify_committed_reference_data_version(campaign, int(version))
+def _require_reference_data_version(
+    campaign: Path,
+    version: int,
+    *,
+    verification: str = "metadata",
+    artifact_snapshot: Optional[Any] = None,
+) -> None:
+    verify_committed_reference_data_version(
+        campaign,
+        int(version),
+        verification=verification,
+        snapshot=artifact_snapshot,
+    )
 
 
-def _require_model_version(campaign: Path, version: int) -> None:
-    verify_committed_model_version(campaign, int(version))
+def _require_model_version(
+    campaign: Path,
+    version: int,
+    *,
+    verification: str = "metadata",
+    artifact_snapshot: Optional[Any] = None,
+) -> None:
+    verify_committed_model_version(
+        campaign,
+        int(version),
+        verification=verification,
+        snapshot=artifact_snapshot,
+    )
 
 
 def _require_active_iteration_committed(state: CampaignState, iteration: int) -> None:
@@ -443,10 +465,22 @@ def _require_active_iteration_committed(state: CampaignState, iteration: int) ->
         )
 
 
-def _require_ferebus_needed(campaign: Path, reference_data_version: int, model_version: int) -> None:
+def _require_ferebus_needed(
+    campaign: Path,
+    reference_data_version: int,
+    model_version: int,
+    *,
+    verification: str = "metadata",
+    artifact_snapshot: Optional[Any] = None,
+) -> None:
     if int(reference_data_version) < 0:
         raise RecoveryContractError("FEREBUS requires a non-negative reference-data version")
-    _require_reference_data_version(campaign, int(reference_data_version))
+    _require_reference_data_version(
+        campaign,
+        int(reference_data_version),
+        verification=verification,
+        artifact_snapshot=artifact_snapshot,
+    )
     if int(model_version) >= int(reference_data_version):
         raise RecoveryContractError(
             "FEREBUS model version "
@@ -465,6 +499,8 @@ def _allocation_recovery_decision(
     *,
     context: str,
     iteration: int,
+    verification: str = "metadata",
+    artifact_snapshot: Optional[Any] = None,
 ) -> Optional[RecoveryDecision]:
     from ..point_allocation import pending_attempts
 
@@ -489,6 +525,8 @@ def _allocation_recovery_decision(
             verify_committed_reference_data_version,
             campaign,
             int(iteration),
+            verification=verification,
+            snapshot=artifact_snapshot,
         ):
             # The allocation remains as authoritative evidence after its
             # pointdirs have moved. Do not rewind an already published
@@ -582,6 +620,8 @@ def protected_staging_handoff(
     campaign_dir: Union[str, Path],
     *,
     iteration: int,
+    verification: str = "metadata",
+    artifact_snapshot: Optional[Any] = None,
 ) -> Optional[RecoveryDecision]:
     """Return the consumer phase for a valid active quantum staging handoff."""
     campaign = Path(campaign_dir)
@@ -589,6 +629,8 @@ def protected_staging_handoff(
         campaign,
         context="active",
         iteration=int(iteration),
+        verification=verification,
+        artifact_snapshot=artifact_snapshot,
     )
     if allocation_decision is not None and allocation_decision.phase in {
         CampaignPhase.ALLOCATION_CHECK,
@@ -625,6 +667,8 @@ def staging_handoff_decisions(
     state: CampaignState,
     *,
     include_committed: bool = False,
+    verification: str = "metadata",
+    artifact_snapshot: Optional[Any] = None,
 ) -> List[RecoveryDecision]:
     """Return valid quantum staging handoffs that must not be archived."""
     campaign = Path(campaign_dir)
@@ -635,6 +679,8 @@ def staging_handoff_decisions(
             campaign,
             context="bootstrap",
             iteration=0,
+            verification=verification,
+            artifact_snapshot=artifact_snapshot,
         )
         if allocation_decision is not None:
             decisions.append(
@@ -677,17 +723,30 @@ def staging_handoff_decisions(
             continue
         if not include_committed and active_iteration_committed(state, iteration):
             continue
-        decision = protected_staging_handoff(campaign, iteration=iteration)
+        decision = protected_staging_handoff(
+            campaign,
+            iteration=iteration,
+            verification=verification,
+            artifact_snapshot=artifact_snapshot,
+        )
         if decision is not None:
             decisions.append(decision)
     return decisions
 
 
-def _best_active_iteration_handoff(campaign: Path, iteration: int) -> Optional[RecoveryHandoff]:
+def _best_active_iteration_handoff(
+    campaign: Path,
+    iteration: int,
+    *,
+    verification: str = "metadata",
+    artifact_snapshot: Optional[Any] = None,
+) -> Optional[RecoveryHandoff]:
     allocation_decision = _allocation_recovery_decision(
         campaign,
         context="active",
         iteration=int(iteration),
+        verification=verification,
+        artifact_snapshot=artifact_snapshot,
     )
     if allocation_decision is not None:
         return RecoveryHandoff(
@@ -756,6 +815,9 @@ def _best_active_iteration_handoff(campaign: Path, iteration: int) -> Optional[R
 def active_iteration_handoff_decisions(
     campaign_dir: Union[str, Path],
     state: CampaignState,
+    *,
+    verification: str = "metadata",
+    artifact_snapshot: Optional[Any] = None,
 ) -> List[RecoveryDecision]:
     """Return the furthest valid AL handoff for each uncommitted iteration."""
     campaign = Path(campaign_dir)
@@ -779,7 +841,12 @@ def active_iteration_handoff_decisions(
             # Recovery must evaluate the reference-data/model skew and select
             # FEREBUS rather than replaying a completed allocation.
             continue
-        handoff = _best_active_iteration_handoff(campaign, iteration)
+        handoff = _best_active_iteration_handoff(
+            campaign,
+            iteration,
+            verification=verification,
+            artifact_snapshot=artifact_snapshot,
+        )
         if handoff is not None:
             decisions.append(handoff.decision)
     return decisions
@@ -794,6 +861,9 @@ def _single_decision_or_none(decisions: Sequence[RecoveryDecision]) -> Optional[
 def _phase_contract_checks(
     campaign: Path,
     state: CampaignState,
+    *,
+    verification: str = "metadata",
+    artifact_snapshot: Optional[Any] = None,
 ) -> List[Tuple[str, Callable[[], None]]]:
     phase = CampaignPhase(state.phase)
     iteration = int(getattr(state, "iteration", 0))
@@ -852,7 +922,12 @@ def _phase_contract_checks(
         CampaignPhase.INITIAL_FEREBUS: [
             (
                 "committed bootstrap reference-data version 0",
-                lambda: _require_reference_data_version(campaign, 0),
+                lambda: _require_reference_data_version(
+                    campaign,
+                    0,
+                    verification=verification,
+                    artifact_snapshot=artifact_snapshot,
+                ),
             ),
         ],
         CampaignPhase.REFERENCE_COMMIT: [
@@ -869,11 +944,21 @@ def _phase_contract_checks(
         CampaignPhase.SEED_SELECT: [
             (
                 "committed reference-data version " + str(reference_data_version),
-                lambda: _require_reference_data_version(campaign, reference_data_version),
+                lambda: _require_reference_data_version(
+                    campaign,
+                    reference_data_version,
+                    verification=verification,
+                    artifact_snapshot=artifact_snapshot,
+                ),
             ),
             (
                 "committed model version " + str(model_version),
-                lambda: _require_model_version(campaign, model_version),
+                lambda: _require_model_version(
+                    campaign,
+                    model_version,
+                    verification=verification,
+                    artifact_snapshot=artifact_snapshot,
+                ),
             ),
             ("trajectory pool", lambda: _require_pool(campaign)),
         ],
@@ -960,6 +1045,8 @@ def _phase_contract_checks(
                     campaign,
                     reference_data_version,
                     model_version,
+                    verification=verification,
+                    artifact_snapshot=artifact_snapshot,
                 ),
             ),
             (
@@ -983,6 +1070,8 @@ def _existing_phase_recovery(
     *,
     valid_reference_data_versions: Sequence[int],
     valid_model_versions: Sequence[int],
+    verification: str = "metadata",
+    artifact_snapshot: Optional[Any] = None,
 ) -> Optional[RecoveryDecision]:
     phase = CampaignPhase(state.phase)
     iteration = int(getattr(state, "iteration", 0))
@@ -996,7 +1085,12 @@ def _existing_phase_recovery(
                 "STOP_CHECK: active iteration is fully committed",
             )
         return None
-    err = phase_recovery_contract_error(campaign, state)
+    err = phase_recovery_contract_error(
+        campaign,
+        state,
+        verification=verification,
+        artifact_snapshot=artifact_snapshot,
+    )
     if err is None:
         return RecoveryDecision(
             phase,
@@ -1016,6 +1110,8 @@ def select_recovery_phase(
     last_phase: Optional[str] = None,
     last_iteration: Optional[int] = None,
     last_phase_retryable: bool = False,
+    verification: str = "metadata",
+    artifact_snapshot: Optional[Any] = None,
 ) -> Optional[RecoveryDecision]:
     """Choose the furthest safe re-entry phase from producer contracts."""
     campaign = Path(campaign_dir)
@@ -1035,6 +1131,8 @@ def select_recovery_phase(
             campaign,
             context="bootstrap",
             iteration=0,
+            verification=verification,
+            artifact_snapshot=artifact_snapshot,
         )
         if allocation_decision is not None:
             return allocation_decision
@@ -1084,11 +1182,25 @@ def select_recovery_phase(
                 )
         return None
 
-    staging_decision = _single_decision_or_none(staging_handoff_decisions(campaign, state))
+    staging_decision = _single_decision_or_none(
+        staging_handoff_decisions(
+            campaign,
+            state,
+            verification=verification,
+            artifact_snapshot=artifact_snapshot,
+        )
+    )
     if staging_decision is not None:
         return staging_decision
 
-    handoff_decision = _single_decision_or_none(active_iteration_handoff_decisions(campaign, state))
+    handoff_decision = _single_decision_or_none(
+        active_iteration_handoff_decisions(
+            campaign,
+            state,
+            verification=verification,
+            artifact_snapshot=artifact_snapshot,
+        )
+    )
     if handoff_decision is not None:
         return handoff_decision
 
@@ -1155,11 +1267,18 @@ def select_recovery_phase(
             state,
             valid_reference_data_versions=valid_reference_data_versions,
             valid_model_versions=valid_model_versions,
+            verification=verification,
+            artifact_snapshot=artifact_snapshot,
         )
         if existing is not None:
             return existing
 
-    current_handoff = _best_active_iteration_handoff(campaign, iteration)
+    current_handoff = _best_active_iteration_handoff(
+        campaign,
+        iteration,
+        verification=verification,
+        artifact_snapshot=artifact_snapshot,
+    )
     if current_handoff is not None:
         return current_handoff.decision
     if (
@@ -1182,10 +1301,18 @@ def select_recovery_phase(
 def phase_recovery_contract_error(
     campaign_dir: Union[str, Path],
     state: CampaignState,
+    *,
+    verification: str = "metadata",
+    artifact_snapshot: Optional[Any] = None,
 ) -> Optional[str]:
     """Return a phase-specific input error for ``state``, or ``None``."""
     campaign = Path(campaign_dir)
-    for label, check in _phase_contract_checks(campaign, state):
+    for label, check in _phase_contract_checks(
+        campaign,
+        state,
+        verification=verification,
+        artifact_snapshot=artifact_snapshot,
+    ):
         error = _error(check)
         if error is not None:
             return label + ": " + error
@@ -1195,6 +1322,9 @@ def phase_recovery_contract_error(
 def recovery_contract_status(
     campaign_dir: Union[str, Path],
     state: CampaignState,
+    *,
+    verification: str = "metadata",
+    artifact_snapshot: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Return a user-facing phase input contract summary."""
     campaign = Path(campaign_dir)
@@ -1203,7 +1333,12 @@ def recovery_contract_status(
     required_inputs: List[str] = []
     trusted_inputs: List[str] = []
     missing_or_invalid_inputs: List[str] = []
-    for label, check in _phase_contract_checks(campaign, state):
+    for label, check in _phase_contract_checks(
+        campaign,
+        state,
+        verification=verification,
+        artifact_snapshot=artifact_snapshot,
+    ):
         required_inputs.append(label)
         error = _error(check)
         if error is None:
@@ -1213,7 +1348,12 @@ def recovery_contract_status(
 
     protected_artifacts = []
     try:
-        for decision in staging_handoff_decisions(campaign, state):
+        for decision in staging_handoff_decisions(
+            campaign,
+            state,
+            verification=verification,
+            artifact_snapshot=artifact_snapshot,
+        ):
             protected_artifacts.append({
                 "phase": decision.phase.value,
                 "iteration": int(decision.iteration),
@@ -1234,7 +1374,12 @@ def recovery_contract_status(
 
     trusted_handoffs = []
     try:
-        handoff_decisions = active_iteration_handoff_decisions(campaign, state)
+        handoff_decisions = active_iteration_handoff_decisions(
+            campaign,
+            state,
+            verification=verification,
+            artifact_snapshot=artifact_snapshot,
+        )
     except Exception as exc:
         handoff_decisions = []
         missing_or_invalid_inputs.append(
@@ -1271,8 +1416,16 @@ def recovery_contract_status(
 def validate_phase_recovery_contract(
     campaign_dir: Union[str, Path],
     state: CampaignState,
+    *,
+    verification: str = "metadata",
+    artifact_snapshot: Optional[Any] = None,
 ) -> None:
-    error = phase_recovery_contract_error(campaign_dir, state)
+    error = phase_recovery_contract_error(
+        campaign_dir,
+        state,
+        verification=verification,
+        artifact_snapshot=artifact_snapshot,
+    )
     if error is not None:
         raise RecoveryContractError(
             "phase "

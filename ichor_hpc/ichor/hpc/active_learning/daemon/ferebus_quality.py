@@ -275,7 +275,7 @@ def evaluate_ferebus_quality(staging_dir: Path, gates: Any = None) -> Dict[str, 
         incumbent_set = resolve_trained_model_set(
             campaign_dir,
             reference_version - 1,
-            verification="deep",
+            verification="metadata",
         )
         incumbent_tasks = {task.key: task for task in incumbent_set.tasks}
 
@@ -594,7 +594,7 @@ def validate_ferebus_quality_evidence(staging_dir: Path) -> Dict[str, Any]:
         incumbent_set = resolve_trained_model_set(
             staging.parent.parent,
             reference_version - 1,
-            verification="deep",
+            verification="metadata",
         )
         incumbent_tasks = {task.key: task for task in incumbent_set.tasks}
 

@@ -6,7 +6,7 @@ import hashlib
 from ..strict_json import strict_json as json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from ..layout import COMMITTED_VERSION_NAME_WIDTH, qm_reference_data_dir
 from .manifest import (
@@ -80,12 +80,14 @@ class ReferenceDataVersioning(VersionedDirectory):
         version: int,
         *,
         verification: str = "metadata",
+        digest_file: Optional[Callable[[Path, bool], str]] = None,
     ) -> ReferenceDataView:
         return resolve_reference_data_view(
             Path(self.parent).parent,
             int(version),
             verification=verification,
             reference_data_root=self.parent,
+            digest_file=digest_file,
         )
 
     def verify_committed_reference_data_inputs(
@@ -95,6 +97,34 @@ class ReferenceDataVersioning(VersionedDirectory):
         verification: str = "metadata",
     ) -> None:
         self.resolve(version, verification=verification)
+
+    def resolve_chain(
+        self,
+        version: int,
+        *,
+        verification: str = "metadata",
+        digest_file: Optional[Callable[[Path, bool], str]] = None,
+        resolved_views_out: Optional[List[ReferenceDataView]] = None,
+    ) -> Tuple[ReferenceDataView, ...]:
+        return resolve_reference_data_chain(
+            Path(self.parent).parent,
+            int(version),
+            verification=verification,
+            reference_data_root=self.parent,
+            digest_file=digest_file,
+            resolved_views_out=resolved_views_out,
+        )
+
+
+def _digest(
+    path: Path,
+    *,
+    payload: bool,
+    digest_file: Optional[Callable[[Path, bool], str]],
+) -> str:
+    if digest_file is not None:
+        return digest_file(path, payload)
+    return sha256_file(path)
 
 
 def reference_data_version_path(iteration_dir: Union[str, Path]) -> Path:
@@ -224,11 +254,15 @@ def _entry_from_record(
     )
 
 
-def _validate_provenance(entry: ReferenceDataEntry) -> None:
+def _validate_provenance(
+    entry: ReferenceDataEntry,
+    *,
+    digest_file: Optional[Callable[[Path, bool], str]] = None,
+) -> None:
     path = entry.pointdir_path / PROVENANCE_FILENAME
     if not path.is_file() or path.is_symlink():
         raise ReferenceDataError("reference-data provenance is missing: " + str(path))
-    if sha256_file(path) != entry.provenance_sha256:
+    if _digest(path, payload=False, digest_file=digest_file) != entry.provenance_sha256:
         raise ReferenceDataError("reference-data provenance SHA mismatch: " + str(path))
     provenance = read_provenance(entry.pointdir_path)
     allocation = provenance.get("point_allocation")
@@ -258,6 +292,8 @@ def _validate_allocation_snapshot(
     iteration_dir: Path,
     payload: Mapping[str, Any],
     added: Sequence[ReferenceDataEntry],
+    *,
+    digest_file: Optional[Callable[[Path, bool], str]] = None,
 ) -> None:
     from ..point_allocation import (
         accepted_attempts,
@@ -283,7 +319,7 @@ def _validate_allocation_snapshot(
         payload.get("point_allocation_sha256"),
         "point_allocation_sha256",
     )
-    if sha256_file(snapshot) != expected_sha:
+    if _digest(snapshot, payload=False, digest_file=digest_file) != expected_sha:
         raise ReferenceDataError("reference-data allocation snapshot SHA mismatch")
     try:
         allocation = read_point_allocation(
@@ -347,18 +383,31 @@ def _view_sha(entries: Sequence[ReferenceDataEntry]) -> str:
     return canonical_json_sha256([entry.identity_payload() for entry in entries])
 
 
-def resolve_reference_data_view(
+def resolve_reference_data_chain(
     campaign_dir: Union[str, Path],
     reference_data_version: int,
     *,
     verification: str = "metadata",
     reference_data_root: Optional[Union[str, Path]] = None,
     expected_campaign_uid: Optional[str] = None,
-) -> ReferenceDataView:
+    digest_file: Optional[Callable[[Path, bool], str]] = None,
+    resolved_views_out: Optional[List[ReferenceDataView]] = None,
+) -> Tuple[ReferenceDataView, ...]:
     if verification not in {"index", "metadata", "deep"}:
         raise ValueError(
             "reference-data verification must be index, metadata or deep"
         )
+    if verification == "deep" and digest_file is None:
+        digest_cache: Dict[str, str] = {}
+
+        def cached_digest(path: Path, payload: bool) -> str:
+            del payload
+            key = str(Path(path).absolute())
+            if key not in digest_cache:
+                digest_cache[key] = sha256_file(path)
+            return digest_cache[key]
+
+        digest_file = cached_digest
     campaign = Path(campaign_dir)
     root = (
         Path(reference_data_root)
@@ -382,11 +431,10 @@ def resolve_reference_data_view(
     previous_manifest_sha: Optional[str] = None
     campaign_uid: Optional[str] = None
     head_manifest_sha = ""
+    views: List[ReferenceDataView] = []
     for version in expected_versions:
         iteration_dir = versioning.iteration_path(version)
         directory_manifest = read_manifest(iteration_dir)
-        if verification == "deep":
-            verify_manifest(iteration_dir, manifest=directory_manifest)
         extras = unmanifested_directories(
             iteration_dir,
             manifest=directory_manifest,
@@ -426,7 +474,7 @@ def resolve_reference_data_view(
                 commit_receipt.get("reference_data_version_sha256"),
                 "commit receipt reference-data manifest SHA",
             )
-            != sha256_file(manifest_path)
+            != _digest(manifest_path, payload=False, digest_file=digest_file)
         ):
             raise ReferenceDataError("reference-commit receipt identity mismatch")
         parent = payload.get("parent_version")
@@ -453,7 +501,12 @@ def resolve_reference_data_view(
         ]
         if len(added) != len(records):
             raise ReferenceDataError("reference-data point record must be an object")
-        _validate_allocation_snapshot(iteration_dir, payload, added)
+        _validate_allocation_snapshot(
+            iteration_dir,
+            payload,
+            added,
+            digest_file=digest_file,
+        )
         quality_status = str(payload.get("quantum_quality_evidence_status") or "")
         quality_records = payload.get("quantum_quality_evidence", [])
         if not isinstance(quality_records, list):
@@ -472,7 +525,11 @@ def resolve_reference_data_view(
             evidence_path = iteration_dir / relative
             if evidence_path.is_symlink() or not evidence_path.is_file():
                 raise ReferenceDataError("quantum-quality evidence file is missing")
-            if sha256_file(evidence_path) != _safe_sha(
+            if _digest(
+                evidence_path,
+                payload=False,
+                digest_file=digest_file,
+            ) != _safe_sha(
                 record.get("sha256"), "quantum_quality_evidence.sha256"
             ):
                 raise ReferenceDataError("quantum-quality evidence SHA mismatch")
@@ -551,11 +608,16 @@ def resolve_reference_data_view(
                         expected_source_pointdir=entry.source_pointdir,
                         verification=verification,
                         validate_quality=False,
+                        digest_file=digest_file,
                     )
                     receipt_path = (
                         entry.pointdir_path / "QUANTUM_ACCEPTANCE_RECEIPT.json"
                     )
-                    if sha256_file(receipt_path) != entry.acceptance_receipt_sha256:
+                    if _digest(
+                        receipt_path,
+                        payload=False,
+                        digest_file=digest_file,
+                    ) != entry.acceptance_receipt_sha256:
                         raise ReferenceDataError(
                             "reference-data acceptance receipt SHA mismatch: "
                             + str(receipt_path)
@@ -590,25 +652,60 @@ def resolve_reference_data_view(
             raise ReferenceDataError("reference-data cumulative point count mismatch")
         if verification != "index":
             for entry in added:
-                _validate_provenance(entry)
+                _validate_provenance(entry, digest_file=digest_file)
         expected_view_sha = _view_sha(entries)
         if _safe_sha(payload.get("cumulative_view_sha256"), "cumulative_view_sha256") != expected_view_sha:
             raise ReferenceDataError("reference-data cumulative view SHA mismatch")
-        head_manifest_sha = sha256_file(manifest_path)
+        if verification == "deep":
+            verify_manifest(
+                iteration_dir,
+                manifest=directory_manifest,
+                digest_file=digest_file,
+            )
+        head_manifest_sha = _digest(
+            manifest_path,
+            payload=False,
+            digest_file=digest_file,
+        )
         previous_manifest_sha = head_manifest_sha
 
-    view = ReferenceDataView(
-        version=target_version,
-        campaign_uid=str(campaign_uid),
-        entries=tuple(entries),
-        cumulative_view_sha256=_view_sha(entries),
-        head_manifest_sha256=head_manifest_sha,
-    )
-    if expected_campaign_uid is not None and view.campaign_uid != str(
+        view = ReferenceDataView(
+            version=version,
+            campaign_uid=str(campaign_uid),
+            entries=tuple(entries),
+            cumulative_view_sha256=_view_sha(entries),
+            head_manifest_sha256=head_manifest_sha,
+        )
+        views.append(view)
+        if resolved_views_out is not None:
+            resolved_views_out.append(view)
+
+    if not views:
+        raise ReferenceDataError("reference-data chain could not be resolved")
+    if expected_campaign_uid is not None and views[-1].campaign_uid != str(
         expected_campaign_uid
     ):
         raise ReferenceDataError("reference-data campaign UID does not match state")
-    return view
+    return tuple(views)
+
+
+def resolve_reference_data_view(
+    campaign_dir: Union[str, Path],
+    reference_data_version: int,
+    *,
+    verification: str = "metadata",
+    reference_data_root: Optional[Union[str, Path]] = None,
+    expected_campaign_uid: Optional[str] = None,
+    digest_file: Optional[Callable[[Path, bool], str]] = None,
+) -> ReferenceDataView:
+    return resolve_reference_data_chain(
+        campaign_dir,
+        reference_data_version,
+        verification=verification,
+        reference_data_root=reference_data_root,
+        expected_campaign_uid=expected_campaign_uid,
+        digest_file=digest_file,
+    )[-1]
 
 
 def build_reference_data_version_payload(
@@ -664,6 +761,7 @@ __all__ = [
     "ReferenceDataEntry",
     "ReferenceDataView",
     "ReferenceDataVersioning",
+    "resolve_reference_data_chain",
     "reference_data_version_path",
     "canonical_json_sha256",
     "hash_pointdir_tree",

@@ -101,6 +101,10 @@ from .daemon.reconcile import (
     stateful_campaign_artifacts,
     write_proposed_state,
 )
+from .daemon.artifact_snapshot import (
+    ArtefactSnapshotError,
+    build_committed_artifact_snapshot,
+)
 from .daemon.array_recovery import (
     array_ledger_path,
     archive_existing_array_task_outputs,
@@ -611,6 +615,67 @@ def _reconcile_runtime_status(
         )
     status["reconcile_apply_blockers"] = blockers
     return status
+
+
+def _deep_reconcile_quiescence_blockers(campaign: Path) -> List[str]:
+    blockers: List[str] = []
+    state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
+    try:
+        state = read_state(state_path)
+    except (FileNotFoundError, StateSchemaError, ValueError):
+        state = None
+        if state_path.is_file():
+            try:
+                raw_state = json.loads(state_path.read_text(encoding="utf-8"))
+                raw_pending = raw_state.get("pending_jobs")
+            except Exception:
+                raw_pending = None
+            if isinstance(raw_pending, dict) and any(
+                value is not None and str(value)
+                for value in raw_pending.values()
+            ):
+                blockers.append(
+                    "malformed state still records scheduler ownership"
+                )
+    if state is not None:
+        pending = [
+            str(phase) + "=" + str(job_id)
+            for phase, job_id in state.pending_jobs.items()
+            if job_id is not None and str(job_id)
+        ]
+        if pending:
+            blockers.append(
+                "state records scheduler ownership: " + ", ".join(pending[:8])
+            )
+    intent_errors: List[Dict[str, str]] = []
+    active_intents = _load_active_submission_intents(
+        campaign,
+        errors=intent_errors,
+    )
+    if active_intents:
+        blockers.append(
+            "active or scheduler-inconclusive submission intents are present"
+        )
+    if intent_errors:
+        blockers.append("submission-intent ownership is malformed or inconclusive")
+    try:
+        from .daemon.reconcile_transaction import inventory_reconcile_transactions
+
+        transactions = inventory_reconcile_transactions(campaign)
+    except Exception as exc:
+        blockers.append(
+            "reconcile transaction inventory is inconclusive: "
+            + type(exc).__name__
+            + ": "
+            + str(exc)[:120]
+        )
+    else:
+        if any(
+            str(record.get("status") or "") not in {"COMMITTED", "FAILED"}
+            for record in transactions
+        ):
+            blockers.append("an incomplete reconcile transaction is present")
+    return blockers
 
 
 def _print_reconcile_runtime_warning(status: Dict[str, Any], campaign: Path) -> None:
@@ -2704,7 +2769,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             atomic_write_json(
                 readiness_path,
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "ready": True,
                     "pid": int(os.getpid()),
                     "campaign_dir": str(campaign),
@@ -3781,11 +3846,23 @@ def cmd_status(args: argparse.Namespace) -> int:
             artifact_manifest_status,
             state_artifact_contract_status,
         )
-        payload["artifact_manifest_status"] = artifact_manifest_status(campaign, state)
+        status_snapshot = build_committed_artifact_snapshot(
+            campaign,
+            verification_level="metadata",
+        )
+        payload["artifact_manifest_status"] = artifact_manifest_status(
+            campaign,
+            state,
+            verification="metadata",
+            snapshot=status_snapshot,
+        )
         payload["state_artifact_contract_status"] = state_artifact_contract_status(
             campaign,
             state,
+            verification="metadata",
+            snapshot=status_snapshot,
         )
+        payload["artifact_verification"] = status_snapshot.verification_payload()
     except Exception as exc:
         payload["artifact_manifest_status"] = {
             "ok": False,
@@ -4627,6 +4704,8 @@ def _perform_reconcile_apply_mutations(
     force_array_iteration: int,
     archive_existing_array_outputs: bool,
     data_staging_archive_mode: Optional[str],
+    verification: str = "metadata",
+    artifact_snapshot: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Perform only lossless, transaction-recorded reconcile mutations."""
     result: Dict[str, Any] = {
@@ -4682,6 +4761,8 @@ def _perform_reconcile_apply_mutations(
             paths = archive_data_staging_for_ferebus_reentry(
                 campaign,
                 report.proposed_state,
+                verification=verification,
+                artifact_snapshot=artifact_snapshot,
             )
         elif data_staging_archive_mode == "user":
             paths = archive_data_staging_for_operator_reconcile(campaign)
@@ -4694,6 +4775,8 @@ def _perform_reconcile_apply_mutations(
         paths = clean_model_iteration_staging_for_reconcile(
             campaign,
             report.proposed_state,
+            verification=verification,
+            artifact_snapshot=artifact_snapshot,
         )
         result["archived_model_staging"] = paths
         transaction.record_paths("archive_model_staging", paths)
@@ -4702,6 +4785,8 @@ def _perform_reconcile_apply_mutations(
         paths = archive_reference_data_staging_for_reconcile(
             campaign,
             report.proposed_state,
+            verification=verification,
+            artifact_snapshot=artifact_snapshot,
         )
         result["archived_reference_data_staging"] = paths
         transaction.record_paths("archive_reference_data_staging", paths)
@@ -4852,11 +4937,22 @@ def _apply_runtime_config_to_recovered_state(report, config: Optional[CampaignCo
         report.proposed_state.max_iterations = configured_max
 
 
-def _reconcile_apply_contract_error(campaign: Path, state: Any) -> Optional[str]:
+def _reconcile_apply_contract_error(
+    campaign: Path,
+    state: Any,
+    *,
+    verification: str = "metadata",
+    artifact_snapshot: Optional[Any] = None,
+) -> Optional[str]:
     from .daemon.artifact_contracts import state_artifact_contract_status
 
     try:
-        validate_phase_recovery_contract(campaign, state)
+        validate_phase_recovery_contract(
+            campaign,
+            state,
+            verification=verification,
+            artifact_snapshot=artifact_snapshot,
+        )
     except Exception as exc:
         return (
             "phase="
@@ -4868,7 +4964,12 @@ def _reconcile_apply_contract_error(campaign: Path, state: Any) -> Optional[str]
             + ": "
             + str(exc)
         )
-    status = state_artifact_contract_status(campaign, state)
+    status = state_artifact_contract_status(
+        campaign,
+        state,
+        verification=verification,
+        snapshot=artifact_snapshot,
+    )
     if bool(status.get("ok")):
         return None
     detail = str(status.get("error") or "state contract invalid")
@@ -5011,7 +5112,19 @@ def _reconcile_decision_payload(
     blockers = _reconcile_hard_blockers(report, contract_status)
     candidates = _reconcile_valid_candidates(campaign, contract_status, report)
     selected_state = report.proposed_state
-    runnable = bool(contract_status.get("contract_ok")) and not blockers
+    snapshot = getattr(report, "artifact_snapshot", None)
+    deep_pending = bool(
+        getattr(report, "deep_verification_required", False)
+        and (
+            snapshot is None
+            or str(getattr(snapshot, "verification_level", "metadata")) != "deep"
+        )
+    )
+    runnable = (
+        bool(contract_status.get("contract_ok"))
+        and not blockers
+        and not deep_pending
+    )
     why_not_runnable: List[str] = []
     if not bool(contract_status.get("contract_ok")):
         why_not_runnable.extend(
@@ -5019,21 +5132,47 @@ def _reconcile_decision_payload(
             for item in contract_status.get("missing_or_invalid_inputs", [])
         )
     why_not_runnable.extend(blockers)
+    if deep_pending:
+        why_not_runnable.append(
+            "deep verification is required before campaign authority can be reconstructed"
+        )
     if selected_state.phase in (CampaignPhase.HALTED, CampaignPhase.DONE):
         why_not_runnable.append(
             "selected phase is terminal: " + selected_state.phase.value
         )
-    next_command = (
-        "ichor-al-daemon start --campaign-dir " + str(campaign)
-        if runnable and selected_state.phase is not CampaignPhase.DONE
-        else "ichor-al-daemon reconcile --campaign-dir " + str(campaign) + " --apply"
-        if cleanable and not blockers
-        else "inspect blockers before restarting"
-    )
+    if deep_pending:
+        next_command = _reconcile_apply_command(campaign, report)
+    elif runnable and selected_state.phase is not CampaignPhase.DONE:
+        next_command = "ichor-al-daemon start --campaign-dir " + str(campaign)
+    elif cleanable and not blockers:
+        next_command = _reconcile_apply_command(campaign, report)
+    else:
+        next_command = "inspect blockers before restarting"
     if selected_state.phase is CampaignPhase.DONE:
         next_command = "campaign is DONE; inspect outputs or initialise a new campaign"
+    verification = (
+        snapshot.verification_payload(
+            deep_required=bool(
+                getattr(report, "deep_verification_required", False)
+                and snapshot.verification_level != "deep"
+            )
+        )
+        if snapshot is not None
+        else {
+            "level": "metadata",
+            "deep_required": bool(
+                getattr(report, "deep_verification_required", False)
+            ),
+            "files_inspected": 0,
+            "payload_files_hashed": 0,
+            "payload_bytes_hashed": 0,
+            "elapsed_seconds": 0.0,
+            "anchor_sha256": None,
+            "first_invalid_version": None,
+        }
+    )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "campaign_dir": str(campaign),
         "proposed_state_path": (
             str(proposed_state_path) if proposed_state_path is not None else None
@@ -5068,11 +5207,14 @@ def _reconcile_decision_payload(
         "next_command": next_command,
         "contract": contract_status,
         "runtime_status": runtime_status or {},
+        "verification": verification,
     }
 
 
 def _reconcile_apply_command(campaign: Path, report: Any) -> str:
     command = "ichor-al-daemon reconcile --campaign-dir " + str(campaign)
+    if bool(getattr(report, "deep_verification_required", False)):
+        command += " --deep-verify"
     if ".DATA/STAGING is non-empty" in list(getattr(report, "unsafe_reasons", [])):
         command += " --archive-staging"
     return command + " --apply"
@@ -5651,6 +5793,38 @@ def _print_reconcile_operator_report(
 ) -> None:
     result = _reconcile_result_label(report, contract_status)
     _print_reconcile_header(campaign, mode=mode, result=result)
+    snapshot = getattr(report, "artifact_snapshot", None)
+    print("Verification")
+    if snapshot is None:
+        _print_reconcile_key_values(
+            [("status", "verification incomplete")]
+        )
+    else:
+        deep_required = bool(
+            getattr(report, "deep_verification_required", False)
+        )
+        status = (
+            "deep verified"
+            if snapshot.verification_level == "deep"
+            else "deep verification required"
+            if deep_required
+            else "metadata verified"
+        )
+        _print_reconcile_key_values(
+            [
+                ("status", status),
+                ("files inspected", str(int(snapshot.files_inspected))),
+                (
+                    "payload hashed",
+                    str(int(snapshot.payload_files_hashed))
+                    + " files / "
+                    + str(int(snapshot.payload_bytes_hashed))
+                    + " bytes",
+                ),
+                ("anchor", str(snapshot.anchor_sha256)),
+            ]
+        )
+    print("")
     _print_reconcile_recovery_target(report, contract_status)
     _print_reconcile_current_position(campaign, report)
     _print_reconcile_last_failure_compact(report)
@@ -6137,6 +6311,8 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         getattr(args, "archive_existing_array_task_outputs", False)
     )
     retrain_ferebus = bool(getattr(args, "retrain_ferebus", False))
+    deep_verify = bool(getattr(args, "deep_verify", False))
+    verification_level = "deep" if deep_verify else "metadata"
     campaign = resolve_campaign_dir(
         args.campaign_dir,
         require_campaign_yaml=False,
@@ -6248,7 +6424,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         print(
             json.dumps(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "error": "json_apply_not_supported",
                     "message": "reconcile --json is proposal-only; rerun without --json to apply",
                 },
@@ -6360,10 +6536,74 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         and runtime_status.get("reconcile_apply_blockers")
     ):
         _print_reconcile_runtime_warning(runtime_status, campaign)
-    report = propose_recovery(
-        campaign,
-        allow_fresh_init_on_nonempty=bool(getattr(args, "allow_fresh_init", False)),
+    deep_blockers = (
+        list(runtime_status.get("reconcile_apply_blockers") or [])
+        + _deep_reconcile_quiescence_blockers(campaign)
+        if deep_verify
+        else []
     )
+    if deep_blockers:
+        _print_reconcile_apply_blocked(
+            campaign,
+            title="Deep Verification Safety",
+            reasons=deep_blockers,
+            next_actions=[
+                "stop the daemon and wait for scheduler ownership to become conclusive",
+                "rerun reconcile --deep-verify",
+            ],
+        )
+        return 9
+
+    inspection_stream = (
+        sys.stderr if bool(getattr(args, "json", False)) else sys.stdout
+    )
+    print("ICHOR Reconcile", file=inspection_stream, flush=True)
+    print(
+        "Verification: " + verification_level,
+        file=inspection_stream,
+        flush=True,
+    )
+    print(
+        "Scientific payload hashing: "
+        + ("enabled" if deep_verify else "disabled"),
+        file=inspection_stream,
+        flush=True,
+    )
+    print(
+        "Inspecting committed artefact chains...",
+        file=inspection_stream,
+        flush=True,
+    )
+    try:
+        artifact_snapshot = build_committed_artifact_snapshot(
+            campaign,
+            verification_level=verification_level,
+            progress_stream=(sys.stderr if deep_verify else None),
+        )
+    except Exception as exc:
+        print(
+            "committed artefact verification failed: "
+            + type(exc).__name__
+            + ": "
+            + str(exc),
+            file=sys.stderr,
+        )
+        return 9
+    try:
+        report = propose_recovery(
+            campaign,
+            allow_fresh_init_on_nonempty=bool(
+                getattr(args, "allow_fresh_init", False)
+            ),
+            artifact_snapshot=artifact_snapshot,
+            verification_level=verification_level,
+        )
+    except (ArtefactSnapshotError, ValueError) as exc:
+        print(
+            "reconcile inspection became stale or invalid: " + str(exc),
+            file=sys.stderr,
+        )
+        return 9
     config_path = campaign / "campaign.yaml"
     config = None
     config_review = None
@@ -6398,9 +6638,37 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 return 8
             print("campaign config could not be reviewed: " + str(exc), file=sys.stderr)
     _apply_runtime_config_to_recovered_state(report, config)
+    if (
+        bool(getattr(args, "apply", False))
+        and report.deep_verification_required
+        and verification_level != "deep"
+    ):
+        print(
+            "deep verification is required before campaign authority can be "
+            "reconstructed from committed artefacts",
+            file=sys.stderr,
+        )
+        print(
+            "ichor-al-daemon reconcile --campaign-dir "
+            + str(campaign)
+            + " --deep-verify --apply",
+            file=sys.stderr,
+        )
+        return 10
+    if bool(getattr(args, "apply", False)):
+        try:
+            artifact_snapshot.assert_anchors_unchanged(campaign)
+        except ArtefactSnapshotError as exc:
+            print("reconcile snapshot became stale: " + str(exc), file=sys.stderr)
+            return 9
     target = write_proposed_state(campaign, report)
     if bool(getattr(args, "json", False)):
-        contract_status = recovery_contract_status(campaign, report.proposed_state)
+        contract_status = recovery_contract_status(
+            campaign,
+            report.proposed_state,
+            verification=verification_level,
+            artifact_snapshot=artifact_snapshot,
+        )
         print(
             json.dumps(
                 _reconcile_decision_payload(
@@ -6416,7 +6684,12 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             )
         )
         return 0
-    contract_status = recovery_contract_status(campaign, report.proposed_state)
+    contract_status = recovery_contract_status(
+        campaign,
+        report.proposed_state,
+        verification=verification_level,
+        artifact_snapshot=artifact_snapshot,
+    )
     target_canonical = target.with_name(DEFAULT_STATE_FILENAME)
     if not bool(getattr(args, "apply", False)):
         _print_reconcile_operator_report(
@@ -6577,6 +6850,8 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         ok_to_archive_staging, staging_reason = ferebus_reentry_can_archive_data_staging(
             campaign,
             report.proposed_state,
+            verification=verification_level,
+            artifact_snapshot=artifact_snapshot,
         )
         if ok_to_archive_staging:
             cleanable_reasons.add(".DATA/STAGING is non-empty")
@@ -6604,6 +6879,8 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         ok_to_archive_reference_data, reference_data_reason = reference_data_staging_can_archive_for_reconcile(
             campaign,
             report.proposed_state,
+            verification=verification_level,
+            artifact_snapshot=artifact_snapshot,
         )
         if ok_to_archive_reference_data:
             cleanable_reasons.add("dangling reference-data staging directories exist")
@@ -6657,6 +6934,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     if cleanable_now or retrain_ferebus or force_resubmit_array:
         planned_operations.insert(0, "archive_reconcile_evidence")
     try:
+        artifact_snapshot.assert_anchors_unchanged(campaign)
         transaction = begin_reconcile_transaction(
             campaign,
             proposed_phase=report.proposed_state.phase.value,
@@ -6676,6 +6954,8 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             force_array_iteration=int(force_array_iteration),
             archive_existing_array_outputs=archive_existing_array_outputs,
             data_staging_archive_mode=data_staging_archive_mode,
+            verification=verification_level,
+            artifact_snapshot=artifact_snapshot,
         )
     except Exception as exc:
         _fail_reconcile_transaction(
@@ -6731,15 +7011,37 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     )
 
     if original_report.proposed_state.phase is CampaignPhase.HALTED:
-        report = propose_recovery(
-            campaign,
-            allow_fresh_init_on_nonempty=bool(getattr(args, "allow_fresh_init", False)),
-            _active_reconcile_transaction_id=(
-                str(transaction.payload["transaction_id"])
-                if transaction is not None
-                else None
-            ),
-        )
+        try:
+            report = propose_recovery(
+                campaign,
+                allow_fresh_init_on_nonempty=bool(
+                    getattr(args, "allow_fresh_init", False)
+                ),
+                _active_reconcile_transaction_id=(
+                    str(transaction.payload["transaction_id"])
+                    if transaction is not None
+                    else None
+                ),
+                artifact_snapshot=artifact_snapshot,
+                verification_level=verification_level,
+            )
+        except Exception as exc:
+            _fail_reconcile_transaction(
+                transaction,
+                "post-archive recovery inspection failed: "
+                + type(exc).__name__
+                + ": "
+                + str(exc),
+            )
+            print(
+                "post-archive recovery inspection failed: "
+                + type(exc).__name__
+                + ": "
+                + str(exc),
+                file=sys.stderr,
+            )
+            _print_cleanup_already_happened(cleanup_paths_already_done)
+            return 9
         _apply_retry_phase_after_cleaned_halt(report, original_report)
         _apply_runtime_config_to_recovered_state(report, config)
         target = write_proposed_state(campaign, report)
@@ -6795,7 +7097,12 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             print(format_config_review(config_review), file=sys.stderr)
             _print_cleanup_already_happened(cleanup_paths_already_done)
             return 8
-        recomputed_status = recovery_contract_status(campaign, report.proposed_state)
+        recomputed_status = recovery_contract_status(
+            campaign,
+            report.proposed_state,
+            verification=verification_level,
+            artifact_snapshot=artifact_snapshot,
+        )
         print("Recovery After Cleanup")
         _print_reconcile_key_values(
             [
@@ -6840,7 +7147,12 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         _print_cleanup_already_happened(cleanup_paths_already_done)
         return 9
 
-    contract_error = _reconcile_apply_contract_error(campaign, report.proposed_state)
+    contract_error = _reconcile_apply_contract_error(
+        campaign,
+        report.proposed_state,
+        verification=verification_level,
+        artifact_snapshot=artifact_snapshot,
+    )
     if contract_error is not None:
         _fail_reconcile_transaction(
             transaction,
@@ -7080,7 +7392,12 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 + str(exc),
                 file=sys.stderr,
             )
-    final_contract_status = recovery_contract_status(campaign, report.proposed_state)
+    final_contract_status = recovery_contract_status(
+        campaign,
+        report.proposed_state,
+        verification=verification_level,
+        artifact_snapshot=artifact_snapshot,
+    )
     _print_reconcile_applied_operator_report(
         campaign,
         report,
@@ -8317,7 +8634,16 @@ def evaluate_campaign_preflight(
                 raise ValueError("campaign has a user stop request")
             from .daemon.artifact_contracts import state_artifact_contract_status
 
-            contract = state_artifact_contract_status(campaign, state)
+            preflight_snapshot = build_committed_artifact_snapshot(
+                campaign,
+                verification_level="metadata",
+            )
+            contract = state_artifact_contract_status(
+                campaign,
+                state,
+                verification="metadata",
+                snapshot=preflight_snapshot,
+            )
             if not bool(contract.get("ok", False)):
                 raise ValueError(str(contract.get("error") or "artefact contract invalid"))
             if loaded_config is not None:
@@ -8964,6 +9290,15 @@ Examples:
         help=(
             "Print a machine-readable recovery decision payload. Proposal-only; "
             "do not combine with --apply."
+        ),
+    )
+    p_recon.add_argument(
+        "--deep-verify",
+        action="store_true",
+        help=(
+            "Hash every committed scientific payload once while reconciling. "
+            "Required when campaign authority must be reconstructed without "
+            "a valid state file; otherwise metadata verification is used."
         ),
     )
     p_recon.add_argument(

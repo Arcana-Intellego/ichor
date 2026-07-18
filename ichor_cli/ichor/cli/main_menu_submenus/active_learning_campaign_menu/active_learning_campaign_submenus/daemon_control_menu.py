@@ -45,6 +45,7 @@ class DaemonControlMenuOptions(MenuOptions):
     preflight_json: bool = False
     reconcile_json: bool = False
     reconcile_verbose: bool = False
+    reconcile_deep_verify: bool = False
 
 
 daemon_control_menu_options = DaemonControlMenuOptions()
@@ -101,6 +102,12 @@ class DaemonControlFunctions:
     def toggle_reconcile_verbose():
         daemon_control_menu_options.reconcile_verbose = not bool(
             daemon_control_menu_options.reconcile_verbose
+        )
+
+    @staticmethod
+    def toggle_reconcile_deep_verify():
+        daemon_control_menu_options.reconcile_deep_verify = not bool(
+            daemon_control_menu_options.reconcile_deep_verify
         )
 
     @staticmethod
@@ -415,6 +422,9 @@ class DaemonControlFunctions:
             getattr(ns, "archive_existing_array_task_outputs", False)
         )
         ns.retrain_ferebus = bool(getattr(ns, "retrain_ferebus", False))
+        ns.deep_verify = bool(
+            daemon_control_menu_options.reconcile_deep_verify
+        )
         ns.json = bool(getattr(ns, "json", False))
         ns.verbose = bool(getattr(ns, "verbose", False))
         return ns
@@ -680,6 +690,10 @@ daemon_control_menu_items = [
     FunctionItem("Toggle preflight JSON output", DaemonControlFunctions.toggle_preflight_json),
     FunctionItem("Toggle reconcile JSON output", DaemonControlFunctions.toggle_reconcile_json),
     FunctionItem("Toggle reconcile verbose output", DaemonControlFunctions.toggle_reconcile_verbose),
+    FunctionItem(
+        "Toggle deep reconcile verification",
+        DaemonControlFunctions.toggle_reconcile_deep_verify,
+    ),
     FunctionItem("Show status", DaemonControlFunctions.show_status),
     FunctionItem("Validate campaign config", DaemonControlFunctions.config_check),
     FunctionItem(

@@ -2131,6 +2131,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 self.campaign_dir,
                 models_version,
                 models_dir_name=self.models_dir_name,
+                verification="metadata",
             )
             return smoke_total_energy_posterior(
                 models_dir,
@@ -3244,6 +3245,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 self.campaign_dir,
                 models_version,
                 models_dir_name=self.models_dir_name,
+                verification="metadata",
             )
         except Exception as exc:
             raise BackendSubmissionError(
@@ -3258,7 +3260,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             _, models = load_trained_models(
                 self.campaign_dir,
                 models_version,
-                verification="deep",
+                verification="metadata",
             )
             pool = TrajectoryPool.load(_Path(self.campaign_dir))
         except Exception as exc:
@@ -3408,18 +3410,22 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             try:
                 from .model_contract import validate_ferebus_model_contract
 
+                resolved_model_set = v_models.resolve(
+                    next_version,
+                    verification="metadata",
+                )
                 validate_ferebus_model_contract(
                     committed_dir,
                     committed=True,
                     expected_version=next_version,
-                )
-                resolved_model_set = v_models.resolve(
-                    next_version,
-                    verification="deep",
+                    trained_model_set=resolved_model_set,
                 )
                 newest_version = max(committed)
                 if newest_version != next_version:
-                    v_models.resolve(newest_version, verification="deep")
+                    v_models.resolve(
+                        newest_version,
+                        verification="metadata",
+                    )
                 v_models.ensure_current(newest_version)
             except Exception as exc:
                 return PhaseResult(
@@ -3585,7 +3591,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     )
                 parent_model_set = v_models.resolve(
                     next_version - 1,
-                    verification="deep",
+                    verification="metadata",
                 )
             staged = v_models.stage(
                 source_version=None,
@@ -3628,6 +3634,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             from ..versioning.trained_models import (
                 validate_trained_model_snapshot,
             )
+            from ..versioning.reference_data import ReferenceDataVersioning
+
+            reference_view = ReferenceDataVersioning(
+                Path(self.campaign_dir) / self.reference_data_dir_name
+            ).resolve(next_version, verification="metadata")
 
             staged_model_set = validate_trained_model_snapshot(
                 self.campaign_dir,
@@ -3635,6 +3646,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 next_version,
                 parent=parent_model_set,
                 verification="deep",
+                reference_view=reference_view,
             )
             validate_ferebus_model_contract(
                 staged,
@@ -3665,11 +3677,13 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             committed_model_set = v_models.resolve(
                 next_version,
                 verification="deep",
+                reference_verification="metadata",
             )
             validate_ferebus_model_contract(
                 committed_dir,
                 committed=True,
                 expected_version=next_version,
+                trained_model_set=committed_model_set,
             )
             v_models.update_current(next_version)
         except Exception as exc:

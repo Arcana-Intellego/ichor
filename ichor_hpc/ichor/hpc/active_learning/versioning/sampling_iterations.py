@@ -166,9 +166,13 @@ def _validate_top_level(
 def _head_binding(campaign: Path, version: int) -> Dict[str, Any]:
     reference = ReferenceDataVersioning(campaign / "QM_REFERENCE_DATA").resolve(
         int(version),
-        verification="deep",
+        verification="metadata",
     )
-    models = resolve_trained_model_set(campaign, int(version), verification="deep")
+    models = resolve_trained_model_set(
+        campaign,
+        int(version),
+        verification="metadata",
+    )
     if reference.campaign_uid != models.campaign_uid:
         raise SamplingIterationError("reference-data/model campaign UID mismatch")
     return {

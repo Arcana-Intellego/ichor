@@ -61,11 +61,20 @@ def verify_committed_reference_data_version(
     *,
     reference_data_dir_name: str = QM_REFERENCE_DATA_DIRNAME,
     expected_campaign_uid: Optional[str] = None,
+    verification: str = "deep",
+    snapshot: Optional[Any] = None,
 ) -> None:
     try:
-        view = ReferenceDataVersioning(
-            Path(campaign_dir) / reference_data_dir_name
-        ).resolve(int(version), verification="deep")
+        if verification not in {"metadata", "deep"}:
+            raise ValueError("committed artefact verification must be metadata or deep")
+        if snapshot is not None:
+            if verification == "deep" and snapshot.verification_level != "deep":
+                raise ValueError("deep verification requires a deep artefact snapshot")
+            view = snapshot.reference_view(int(version))
+        else:
+            view = ReferenceDataVersioning(
+                Path(campaign_dir) / reference_data_dir_name
+            ).resolve(int(version), verification=verification)
         if expected_campaign_uid is not None and view.campaign_uid != str(
             expected_campaign_uid
         ):
@@ -87,14 +96,24 @@ def verify_committed_model_version(
     *,
     models_dir_name: str = TRAINED_MODELS_DIRNAME,
     expected_campaign_uid: Optional[str] = None,
+    verification: str = "deep",
+    snapshot: Optional[Any] = None,
 ) -> None:
     try:
-        model_set = resolve_trained_model_set(
-            campaign_dir,
-            int(version),
-            verification="deep",
-            trained_models_root=Path(campaign_dir) / models_dir_name,
-        )
+        if verification not in {"metadata", "deep"}:
+            raise ValueError("committed artefact verification must be metadata or deep")
+        if snapshot is not None:
+            if verification == "deep" and snapshot.verification_level != "deep":
+                raise ValueError("deep verification requires a deep artefact snapshot")
+            model_set = snapshot.model_set(int(version))
+        else:
+            model_set = resolve_trained_model_set(
+                campaign_dir,
+                int(version),
+                verification=verification,
+                trained_models_root=Path(campaign_dir) / models_dir_name,
+                reference_verification="metadata",
+            )
         if expected_campaign_uid is not None and model_set.campaign_uid != str(
             expected_campaign_uid
         ):
@@ -125,6 +144,8 @@ def verify_state_referenced_artifacts(
     reference_data_dir_name: str = QM_REFERENCE_DATA_DIRNAME,
     models_dir_name: str = TRAINED_MODELS_DIRNAME,
     strict_models: bool = True,
+    verification: str = "deep",
+    snapshot: Optional[Any] = None,
 ) -> None:
     phase = CampaignPhase(state.phase)
     required_phase = (
@@ -181,6 +202,8 @@ def verify_state_referenced_artifacts(
                 train_version,
                 reference_data_dir_name=reference_data_dir_name,
                 expected_campaign_uid=str(state.campaign_uid),
+                verification=verification,
+                snapshot=snapshot,
             )
         elif required_phase in _TRAINING_REQUIRED:
             raise CommittedArtifactError(
@@ -213,6 +236,8 @@ def verify_state_referenced_artifacts(
                     model_version,
                     models_dir_name=models_dir_name,
                     expected_campaign_uid=str(state.campaign_uid),
+                    verification=verification,
+                    snapshot=snapshot,
                 )
         elif strict_models and required_phase in _MODELS_REQUIRED:
             raise CommittedArtifactError(
@@ -261,6 +286,8 @@ def artifact_manifest_status(
     reference_data_dir_name: str = QM_REFERENCE_DATA_DIRNAME,
     models_dir_name: str = TRAINED_MODELS_DIRNAME,
     strict_models: bool = True,
+    verification: str = "deep",
+    snapshot: Optional[Any] = None,
 ) -> Dict[str, Any]:
     out: Dict[str, Any] = {"reference_data": {}, "models": {}}
     checks: List[tuple] = [
@@ -272,6 +299,8 @@ def artifact_manifest_status(
                 version,
                 reference_data_dir_name=reference_data_dir_name,
                 expected_campaign_uid=str(state.campaign_uid),
+                verification=verification,
+                snapshot=snapshot,
             ),
         ),
     ]
@@ -285,6 +314,8 @@ def artifact_manifest_status(
                     version,
                     models_dir_name=models_dir_name,
                     expected_campaign_uid=str(state.campaign_uid),
+                    verification=verification,
+                    snapshot=snapshot,
                 ),
             )
         )
@@ -317,6 +348,8 @@ def state_artifact_contract_status(
     reference_data_dir_name: str = QM_REFERENCE_DATA_DIRNAME,
     models_dir_name: str = TRAINED_MODELS_DIRNAME,
     strict_models: bool = True,
+    verification: str = "deep",
+    snapshot: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Return the full state/artefact contract status for user output.
 
@@ -344,6 +377,8 @@ def state_artifact_contract_status(
             reference_data_dir_name=reference_data_dir_name,
             models_dir_name=models_dir_name,
             strict_models=strict_models,
+            verification=verification,
+            snapshot=snapshot,
         )
         payload["ok"] = True
     except Exception as exc:

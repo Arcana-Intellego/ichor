@@ -2457,13 +2457,83 @@ def test_cli_reconcile_json_outputs_machine_readable_decision(tmp_path, capsys):
     assert rc == 0
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["campaign_dir"] == str(campaign)
     assert payload["proposed_state_path"].endswith("state.json.proposed")
     assert "selected_phase" in payload
     assert "hard_blockers" in payload
     assert "next_command" in payload
+    assert payload["verification"]["level"] == "metadata"
+    assert payload["verification"]["payload_files_hashed"] == 0
     assert "Proposed state written" not in captured.out
+    assert "Scientific payload hashing: disabled" in captured.err
+
+
+def test_cli_reconcile_deep_verify_reports_deep_level_on_stderr(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+
+    rc = main(
+        [
+            "reconcile",
+            "--campaign-dir",
+            str(campaign),
+            "--json",
+            "--deep-verify",
+        ]
+    )
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["verification"]["level"] == "deep"
+    assert payload["verification"]["deep_required"] is False
+    assert "Scientific payload hashing: enabled" in captured.err
+
+
+def test_cli_reconcile_deep_verify_refuses_recorded_scheduler_ownership(
+    tmp_path,
+    capsys,
+):
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state()
+    state.pending_jobs[CampaignPhase.INITIAL_GAUSSIAN.value] = "12345"
+    _write_locked_state(campaign, state)
+
+    rc = main(
+        [
+            "reconcile",
+            "--campaign-dir",
+            str(campaign),
+            "--deep-verify",
+        ]
+    )
+
+    assert rc == 9
+    captured = capsys.readouterr()
+    assert "Deep Verification Safety" in captured.err
+    assert "state records scheduler ownership" in captured.err
+    assert "Inspecting committed artefact chains" not in captured.err
+
+
+def test_cli_reconcile_apply_requires_explicit_deep_verification(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    original = cli_mod.propose_recovery
+
+    def require_deep(*args, **kwargs):
+        report = original(*args, **kwargs)
+        report.deep_verification_required = True
+        return report
+
+    monkeypatch.setattr(cli_mod, "propose_recovery", require_deep)
+    rc = main(["reconcile", "--campaign-dir", str(campaign), "--apply"])
+
+    assert rc == 10
+    captured = capsys.readouterr()
+    assert "--deep-verify --apply" in captured.err
 
 
 def test_cli_reconcile_json_is_proposal_only(tmp_path, capsys):

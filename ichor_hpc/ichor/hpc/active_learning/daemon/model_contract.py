@@ -444,6 +444,7 @@ def validate_ferebus_model_contract(
                     root.parent.parent,
                     int(expected_version),
                     verification="deep",
+                    reference_verification="metadata",
                 )
             if int(model_set.version) != int(expected_version):
                 raise ModelContractError("trained_model_set_version_mismatch")
@@ -744,7 +745,7 @@ def smoke_total_energy_posterior(
         model_set, models = load_trained_models(
             root.parent.parent,
             version,
-            verification="deep",
+            verification="metadata",
         )
         if model_set.root != root.resolve():
             raise ModelContractError("posterior_model_root_mismatch")

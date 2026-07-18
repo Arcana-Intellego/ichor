@@ -1,7 +1,9 @@
 """Tests for ichor.hpc.active_learning.daemon.reconcile."""
 import json
 import shutil
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -60,6 +62,38 @@ from ichor.hpc.active_learning.versioning.versioned_directory import VersionedDi
 
 
 _FIXTURE_CAMPAIGN_UID = "reconcile-test"
+
+
+def _trust_marker_models(monkeypatch):
+    """Adapt legacy marker-only model fixtures to the snapshot test seam."""
+    original_builder = reconcile_mod.build_committed_artifact_snapshot
+
+    def build(campaign, **kwargs):
+        snapshot = original_builder(campaign, **kwargs)
+        uid = (
+            snapshot.reference_views[-1].campaign_uid
+            if snapshot.reference_views
+            else _FIXTURE_CAMPAIGN_UID
+        )
+        models = tuple(
+            SimpleNamespace(
+                version=int(version),
+                campaign_uid=str(uid),
+                root=(
+                    Path(campaign)
+                    / "TRAINED_MODELS"
+                    / ("iteration-" + f"{int(version):06d}")
+                ),
+            )
+            for version in snapshot.committed_model_versions
+        )
+        return replace(snapshot, model_sets=models, model_errors={})
+
+    monkeypatch.setattr(
+        reconcile_mod,
+        "build_committed_artifact_snapshot",
+        build,
+    )
 
 
 def _campaign_dirs(tmp_path):
@@ -1175,6 +1209,7 @@ def test_propose_recovery_finds_committed_reference_data_versions(tmp_path):
     assert report.proposed_state.reference_data_version == 2
     assert report.proposed_state.models_version == -1
     assert report.proposed_state.phase is CampaignPhase.HALTED
+    assert report.deep_verification_required is True
     assert any("trajectory pool" in r for r in report.unsafe_reasons)
 
 
@@ -1196,7 +1231,7 @@ def test_propose_recovery_reports_decision_and_trusted_versions(tmp_path):
 
 
 def test_propose_recovery_sets_iteration_from_active_version_mapping(tmp_path, monkeypatch):
-    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    _trust_marker_models(monkeypatch)
     monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
     campaign, _, training, models = _campaign_dirs(tmp_path)
     _write_pool(campaign)
@@ -1216,7 +1251,7 @@ def test_propose_recovery_sets_iteration_from_active_version_mapping(tmp_path, m
 
 
 def test_propose_recovery_training_one_ahead_reenters_ferebus(tmp_path, monkeypatch):
-    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    _trust_marker_models(monkeypatch)
     monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
     campaign, _, training, models = _campaign_dirs(tmp_path)
     _write_pool(campaign)
@@ -1237,7 +1272,7 @@ def test_propose_recovery_training_one_ahead_reenters_ferebus(tmp_path, monkeypa
 
 
 def test_propose_recovery_preserves_existing_seed_select_cursor(tmp_path, monkeypatch):
-    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    _trust_marker_models(monkeypatch)
     monkeypatch.setattr(recovery_contracts_mod, "verify_committed_model_version", lambda *a, **k: None)
     monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
     campaign, data, training, models = _campaign_dirs(tmp_path)
@@ -1265,7 +1300,7 @@ def test_propose_recovery_preserves_existing_seed_select_cursor(tmp_path, monkey
 
 
 def test_propose_recovery_prefers_seeds_over_stale_seed_select(tmp_path, monkeypatch):
-    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    _trust_marker_models(monkeypatch)
     monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
     campaign, data, training, models = _campaign_dirs(tmp_path)
     _write_pool(campaign)
@@ -1290,7 +1325,7 @@ def test_recovery_rejects_ariadne_results_without_landing_safety(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    _trust_marker_models(monkeypatch)
     monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
     campaign, data, training, models = _campaign_dirs(tmp_path)
     _write_pool(campaign)
@@ -1327,7 +1362,7 @@ def test_recovery_cannot_advance_from_rejected_ariadne_batch(
         write_ariadne_batch_decision,
     )
 
-    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    _trust_marker_models(monkeypatch)
     monkeypatch.setattr(recovery_contracts_mod, "verify_committed_model_version", lambda *a, **k: None)
     monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
     campaign, data, training, models = _campaign_dirs(tmp_path)
@@ -1379,7 +1414,7 @@ def test_propose_recovery_does_not_preserve_existing_phase_for_committed_iterati
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    _trust_marker_models(monkeypatch)
     monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
     campaign, data, training, models = _campaign_dirs(tmp_path)
     _write_pool(campaign)
@@ -1400,7 +1435,7 @@ def test_propose_recovery_does_not_preserve_existing_phase_for_committed_iterati
 
 
 def test_propose_recovery_prefers_phase_b_over_stale_seed_select(tmp_path, monkeypatch):
-    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    _trust_marker_models(monkeypatch)
     monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
     campaign, data, training, models = _campaign_dirs(tmp_path)
     _write_pool(campaign)
@@ -1429,7 +1464,7 @@ def test_recovery_rejects_phase_b_geometry_drift_even_when_hash_is_rewritten(
     from ichor.hpc.active_learning.handoff_manifests import phase_b_selection_path
     from ichor.hpc.active_learning.versioning.manifest import sha256_file
 
-    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    _trust_marker_models(monkeypatch)
     monkeypatch.setattr(recovery_contracts_mod, "verify_committed_model_version", lambda *a, **k: None)
     monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
     campaign, data, training, models = _campaign_dirs(tmp_path)
@@ -1463,7 +1498,7 @@ def test_recovery_rejects_phase_b_geometry_drift_even_when_hash_is_rewritten(
 
 
 def test_propose_recovery_prefers_split_over_stale_phase_b(tmp_path, monkeypatch):
-    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    _trust_marker_models(monkeypatch)
     monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
     campaign, data, training, models = _campaign_dirs(tmp_path)
     _write_pool(campaign)
@@ -1486,7 +1521,7 @@ def test_propose_recovery_prefers_split_over_stale_phase_b(tmp_path, monkeypatch
 
 
 def test_propose_recovery_invalid_split_reenters_split(tmp_path, monkeypatch):
-    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    _trust_marker_models(monkeypatch)
     monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
     campaign, data, training, models = _campaign_dirs(tmp_path)
     _write_pool(campaign)
@@ -1515,7 +1550,7 @@ def test_propose_recovery_cross_iteration_partial_handoff_beats_stop_check(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    _trust_marker_models(monkeypatch)
     monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
     campaign, data, training, models = _campaign_dirs(tmp_path)
     _write_pool(campaign)
@@ -1537,7 +1572,7 @@ def test_propose_recovery_cross_iteration_partial_handoff_beats_stop_check(
 
 
 def test_propose_recovery_protects_active_gaussian_handoff(tmp_path, monkeypatch):
-    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    _trust_marker_models(monkeypatch)
     monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
     campaign, data, training, models = _campaign_dirs(tmp_path)
     _write_pool(campaign)
@@ -1579,7 +1614,7 @@ def test_propose_recovery_protects_active_gaussian_handoff(tmp_path, monkeypatch
 
 
 def test_propose_recovery_finds_staging_handoff_in_later_iteration(tmp_path, monkeypatch):
-    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    _trust_marker_models(monkeypatch)
     monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
     campaign, data, training, models = _campaign_dirs(tmp_path)
     _write_pool(campaign)
@@ -1618,7 +1653,7 @@ def test_propose_recovery_finds_staging_handoff_in_later_iteration(tmp_path, mon
 
 
 def test_propose_recovery_halts_on_multiple_valid_staging_handoffs(tmp_path, monkeypatch):
-    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    _trust_marker_models(monkeypatch)
     monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
     campaign, data, training, models = _campaign_dirs(tmp_path)
     _write_pool(campaign)
@@ -1795,7 +1830,7 @@ def test_reconcile_preserves_completed_lifecycle_until_explicit_reopen(
 ):
     from ichor.hpc.active_learning.daemon.state import make_lifecycle_context
 
-    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    _trust_marker_models(monkeypatch)
     monkeypatch.setattr(
         reconcile_mod,
         "verify_state_referenced_artifacts",
@@ -1834,7 +1869,7 @@ def test_reconcile_preserves_completed_lifecycle_until_explicit_reopen(
 def test_reconcile_preserves_user_stop_until_resume(tmp_path, monkeypatch):
     from ichor.hpc.active_learning.daemon.state import make_lifecycle_context
 
-    monkeypatch.setattr(reconcile_mod, "verify_committed_model_version", lambda *a, **k: None)
+    _trust_marker_models(monkeypatch)
     monkeypatch.setattr(
         reconcile_mod,
         "verify_state_referenced_artifacts",

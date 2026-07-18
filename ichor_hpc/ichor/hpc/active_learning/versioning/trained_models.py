@@ -7,7 +7,18 @@ import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 from ..layout import trained_models_dir
 from .manifest import (
@@ -17,8 +28,10 @@ from .manifest import (
     verify_manifest,
 )
 from .reference_data import (
+    ReferenceDataView,
     ReferenceDataVersioning,
     canonical_json_sha256,
+    resolve_reference_data_chain,
 )
 from .versioned_directory import VersionedDirectory
 
@@ -134,12 +147,14 @@ class TrainedModelVersioning(VersionedDirectory):
         version: int,
         *,
         verification: str = "deep",
+        reference_verification: Optional[str] = None,
     ) -> TrainedModelSet:
         return resolve_trained_model_set(
             Path(self.parent).parent,
             int(version),
             verification=verification,
             trained_models_root=self.parent,
+            reference_verification=reference_verification,
         )
 
 
@@ -231,6 +246,7 @@ def _parse_file_record(
     label: str,
     *,
     verification: str,
+    digest_file: Optional[Callable[[Path, bool], str]] = None,
 ) -> TrainedModelFile:
     if not isinstance(payload, Mapping):
         raise TrainedModelError(label + " must be an object")
@@ -251,8 +267,14 @@ def _parse_file_record(
         raise TrainedModelError(label + " escapes the model version") from exc
     if int(path.stat().st_size) != expected_size:
         raise TrainedModelError(label + " size mismatch: " + str(path))
-    if verification == "deep" and sha256_file(path) != expected_sha:
-        raise TrainedModelError(label + " SHA-256 mismatch: " + str(path))
+    if verification == "deep":
+        observed_sha = (
+            digest_file(path, True)
+            if digest_file is not None
+            else sha256_file(path)
+        )
+        if observed_sha != expected_sha:
+            raise TrainedModelError(label + " SHA-256 mismatch: " + str(path))
     return TrainedModelFile(
         relative_path=relative,
         path=path.resolve(),
@@ -266,6 +288,7 @@ def _parse_task(
     payload: Any,
     *,
     verification: str,
+    digest_file: Optional[Callable[[Path, bool], str]] = None,
 ) -> TrainedModelTask:
     if not isinstance(payload, Mapping):
         raise TrainedModelError("trained-model task must be an object")
@@ -287,18 +310,21 @@ def _parse_task(
         payload.get("model"),
         prop + "/" + atom + ":model",
         verification=verification,
+        digest_file=digest_file,
     )
     config = _parse_file_record(
         root,
         payload.get("config"),
         prop + "/" + atom + ":config",
         verification=verification,
+        digest_file=digest_file,
     )
     execution_receipt = _parse_file_record(
         root,
         payload.get("execution_receipt"),
         prop + "/" + atom + ":execution_receipt",
         verification=verification,
+        digest_file=digest_file,
     )
     task_root = PurePosixPath(directory)
     if PurePosixPath(model.relative_path).parent != task_root or not model.relative_path.endswith(".model"):
@@ -321,6 +347,7 @@ def _parse_task(
             raw_datasets.get(split),
             prop + "/" + atom + ":dataset:" + split,
             verification=verification,
+            digest_file=digest_file,
         )
         dataset_path = PurePosixPath(parsed.relative_path)
         if dataset_path.parent != task_root / "datasets" or dataset_path.suffix != ".csv":
@@ -344,6 +371,7 @@ def _parse_task(
             record,
             prop + "/" + atom + ":" + suffix,
             verification=verification,
+            digest_file=digest_file,
         )
         expected_auxiliary_name = Path(model.relative_path).stem + "." + suffix
         if (
@@ -972,6 +1000,9 @@ def validate_trained_model_snapshot(
     *,
     parent: Optional[TrainedModelSet],
     verification: str = "deep",
+    reference_view: Optional[ReferenceDataView] = None,
+    digest_file: Optional[Callable[[Path, bool], str]] = None,
+    require_directory_manifest: bool = False,
 ) -> TrainedModelSet:
     """Validate one unpublished full snapshot before its atomic rename."""
     if verification not in {"metadata", "deep"}:
@@ -1012,9 +1043,14 @@ def validate_trained_model_snapshot(
             raise TrainedModelError("trained-model parent manifest SHA mismatch")
     if _safe_int(payload.get("reference_data_version"), "reference_data_version") != expected_version:
         raise TrainedModelError("model/reference-data version mismatch")
-    reference_view = ReferenceDataVersioning(
-        campaign / "QM_REFERENCE_DATA"
-    ).resolve(expected_version, verification=verification)
+    if reference_view is None:
+        reference_view = ReferenceDataVersioning(
+            campaign / "QM_REFERENCE_DATA"
+        ).resolve(
+            expected_version,
+            verification=verification,
+            digest_file=digest_file,
+        )
     if campaign_uid != reference_view.campaign_uid:
         raise TrainedModelError("model/reference-data campaign UID mismatch")
     if str(payload.get("reference_data_head_manifest_sha256")) != reference_view.head_manifest_sha256:
@@ -1027,7 +1063,13 @@ def validate_trained_model_snapshot(
     if not isinstance(raw_tasks, list):
         raise TrainedModelError("trained-model tasks must be a list")
     tasks = tuple(
-        _parse_task(root, task, verification=verification) for task in raw_tasks
+        _parse_task(
+            root,
+            task,
+            verification=verification,
+            digest_file=digest_file,
+        )
+        for task in raw_tasks
     )
     expected_keys = [(prop, atom) for prop in properties for atom in atoms]
     if [task.key for task in tasks] != expected_keys:
@@ -1041,7 +1083,13 @@ def validate_trained_model_snapshot(
     if not isinstance(raw_root_files, list):
         raise TrainedModelError("trained-model root_files must be a list")
     root_files = tuple(
-        _parse_file_record(root, record, "root_file", verification=verification)
+        _parse_file_record(
+            root,
+            record,
+            "root_file",
+            verification=verification,
+            digest_file=digest_file,
+        )
         for record in raw_root_files
     )
     _validate_root_file_records(root_files)
@@ -1050,18 +1098,21 @@ def validate_trained_model_snapshot(
         payload.get("source_task_manifest"),
         "source_task_manifest",
         verification=verification,
+        digest_file=digest_file,
     )
     quality_record = _parse_file_record(
         root,
         payload.get("quality_manifest"),
         "quality_manifest",
         verification=verification,
+        digest_file=digest_file,
     )
     quality_decision_record = _parse_file_record(
         root,
         payload.get("quality_decision_manifest"),
         "quality_decision_manifest",
         verification=verification,
+        digest_file=digest_file,
     )
     root_file_by_path = {record.relative_path: record for record in root_files}
     if source_record.relative_path != "FEREBUS_TASKS.json" or root_file_by_path.get(
@@ -1090,7 +1141,7 @@ def validate_trained_model_snapshot(
         root,
         tasks,
         root_files,
-        require_directory_manifest=False,
+        require_directory_manifest=require_directory_manifest,
     )
     _validate_source_and_quality(root, payload, tasks, reference_view)
     return TrainedModelSet(
@@ -1115,13 +1166,16 @@ def validate_trained_model_snapshot(
     )
 
 
-def resolve_trained_model_set(
+def resolve_trained_model_chain(
     campaign_dir: Union[str, Path],
     models_version: int,
     *,
     verification: str = "deep",
     trained_models_root: Optional[Union[str, Path]] = None,
-) -> TrainedModelSet:
+    reference_views: Optional[Sequence[ReferenceDataView]] = None,
+    digest_file: Optional[Callable[[Path, bool], str]] = None,
+    resolved_models_out: Optional[List[TrainedModelSet]] = None,
+) -> Tuple[TrainedModelSet, ...]:
     if verification not in {"metadata", "deep"}:
         raise ValueError("trained-model verification must be metadata or deep")
     campaign = Path(campaign_dir)
@@ -1138,148 +1192,87 @@ def resolve_trained_model_set(
         raise TrainedModelError(
             "trained-model versions are not contiguous through " + str(target_version)
         )
-    previous_manifest_sha: Optional[str] = None
-    campaign_uid: Optional[str] = None
-    resolved: Optional[TrainedModelSet] = None
+    if verification == "deep" and digest_file is None:
+        digest_cache: Dict[str, str] = {}
+
+        def cached_digest(path: Path, payload: bool) -> str:
+            del payload
+            key = str(Path(path).absolute())
+            if key not in digest_cache:
+                digest_cache[key] = sha256_file(path)
+            return digest_cache[key]
+
+        digest_file = cached_digest
+    if reference_views is None:
+        reference_views = resolve_reference_data_chain(
+            campaign,
+            target_version,
+            verification=verification,
+            digest_file=digest_file,
+        )
+    reference_by_version = {int(view.version): view for view in reference_views}
+    if set(expected_versions) - set(reference_by_version):
+        raise TrainedModelError("trained-model reference-data chain is incomplete")
+
+    resolved: List[TrainedModelSet] = []
+    parent: Optional[TrainedModelSet] = None
     for version in expected_versions:
         version_root = versioning.iteration_path(version)
         directory_manifest = read_manifest(version_root)
-        if verification == "deep" and version == target_version:
-            verify_manifest(version_root, manifest=directory_manifest)
-        manifest_path = trained_model_set_path(version_root)
-        payload = _read_json_object(manifest_path, "trained-model set manifest")
-        if _safe_int(payload.get("schema_version"), "schema_version") != TRAINED_MODEL_SET_SCHEMA_VERSION:
-            raise TrainedModelError("unsupported trained-model set schema")
-        if str(payload.get("storage_mode")) != TRAINED_MODEL_STORAGE_MODE:
-            raise TrainedModelError("trained-model storage_mode must be full_snapshot")
-        if _safe_int(payload.get("models_version"), "models_version") != version:
-            raise TrainedModelError("trained-model version mismatch")
-        uid = str(payload.get("campaign_uid") or "")
-        if not uid or (campaign_uid is not None and uid != campaign_uid):
-            raise TrainedModelError("trained-model campaign UID mismatch")
-        campaign_uid = uid
-        system = _safe_token(payload.get("system"), "system")
-        parent_version = payload.get("parent_version")
-        parent_sha = payload.get("parent_manifest_sha256")
-        if version == 0:
-            if parent_version is not None or parent_sha is not None:
-                raise TrainedModelError("bootstrap model set must not have a parent")
-        else:
-            if _safe_int(parent_version, "parent_version") != version - 1:
-                raise TrainedModelError("trained-model parent version mismatch")
-            if _safe_sha(parent_sha, "parent_manifest_sha256") != previous_manifest_sha:
-                raise TrainedModelError("trained-model parent manifest SHA mismatch")
-        if _safe_int(payload.get("reference_data_version"), "reference_data_version") != version:
-            raise TrainedModelError("model/reference-data version mismatch")
-        if _safe_sha(
-            payload.get("model_set_sha256"), "model_set_sha256"
-        ) != canonical_json_sha256(_model_set_identity(payload)):
-            raise TrainedModelError("trained-model set SHA mismatch")
-        if _safe_sha(
-            payload.get("evidence_set_sha256"), "evidence_set_sha256"
-        ) != canonical_json_sha256(_evidence_set_identity(payload)):
-            raise TrainedModelError("trained-model evidence-set SHA mismatch")
-        head_sha = sha256_file(manifest_path)
-        if version != target_version:
-            previous_manifest_sha = head_sha
-            continue
-        reference_view = ReferenceDataVersioning(
-            campaign / "QM_REFERENCE_DATA"
-        ).resolve(version, verification=verification)
-        if uid != reference_view.campaign_uid:
-            raise TrainedModelError("model/reference-data campaign UID mismatch")
-        if str(payload.get("reference_data_head_manifest_sha256")) != reference_view.head_manifest_sha256:
-            raise TrainedModelError("model/reference-data head manifest SHA mismatch")
-        if str(payload.get("reference_data_view_sha256")) != reference_view.cumulative_view_sha256:
-            raise TrainedModelError("model/reference-data view SHA mismatch")
-        properties = _safe_token_sequence(payload.get("properties"), "properties")
-        atoms = _safe_token_sequence(payload.get("atoms"), "atoms")
-        raw_tasks = payload.get("tasks")
-        if not isinstance(raw_tasks, list):
-            raise TrainedModelError("trained-model tasks must be a list")
-        tasks = tuple(
-            _parse_task(version_root, task, verification=verification)
-            for task in raw_tasks
-        )
-        expected_keys = [(prop, atom) for prop in properties for atom in atoms]
-        if [task.key for task in tasks] != expected_keys:
-            raise TrainedModelError("trained-model tasks do not match property/atom product")
-        if [task.task_index for task in tasks] != list(range(1, len(tasks) + 1)):
-            raise TrainedModelError("trained-model task indexes are not contiguous")
-        _validate_task_file_names(tasks, system)
-        if _safe_int(payload.get("n_tasks"), "n_tasks", minimum=1) != len(tasks):
-            raise TrainedModelError("trained-model task count mismatch")
-        raw_root_files = payload.get("root_files")
-        if not isinstance(raw_root_files, list):
-            raise TrainedModelError("trained-model root_files must be a list")
-        root_files = tuple(
-            _parse_file_record(
+        if verification == "deep":
+            verify_manifest(
                 version_root,
-                record,
-                "root_file",
-                verification=verification,
+                manifest=directory_manifest,
+                digest_file=digest_file,
             )
-            for record in raw_root_files
-        )
-        _validate_root_file_records(root_files)
-        source_record = _parse_file_record(
+        model_set = validate_trained_model_snapshot(
+            campaign,
             version_root,
-            payload.get("source_task_manifest"),
-            "source_task_manifest",
+            version,
+            parent=parent,
             verification=verification,
+            reference_view=reference_by_version[version],
+            digest_file=digest_file,
+            require_directory_manifest=True,
         )
-        quality_record = _parse_file_record(
-            version_root,
-            payload.get("quality_manifest"),
-            "quality_manifest",
-            verification=verification,
-        )
-        quality_decision_record = _parse_file_record(
-            version_root,
-            payload.get("quality_decision_manifest"),
-            "quality_decision_manifest",
-            verification=verification,
-        )
-        if source_record.relative_path != "FEREBUS_TASKS.json":
-            raise TrainedModelError("source task manifest path is invalid")
-        if quality_record.relative_path != "FEREBUS_QUALITY.json":
-            raise TrainedModelError("quality manifest path is invalid")
-        if quality_decision_record.relative_path != "FEREBUS_QUALITY_DECISION.json":
-            raise TrainedModelError("quality decision path is invalid")
-        root_file_by_path = {record.relative_path: record for record in root_files}
-        if root_file_by_path.get(source_record.relative_path) != source_record:
-            raise TrainedModelError("source task manifest root-file record mismatch")
-        if root_file_by_path.get(quality_record.relative_path) != quality_record:
-            raise TrainedModelError("quality manifest root-file record mismatch")
-        if (
-            root_file_by_path.get(quality_decision_record.relative_path)
-            != quality_decision_record
-        ):
-            raise TrainedModelError("quality decision root-file record mismatch")
-        _validate_exact_inventory(version_root, tasks, root_files)
-        _validate_source_and_quality(version_root, payload, tasks, reference_view)
-        resolved = TrainedModelSet(
-            version=version,
-            campaign_uid=uid,
-            system=system,
-            reference_data_version=version,
-            reference_data_head_manifest_sha256=reference_view.head_manifest_sha256,
-            reference_data_view_sha256=reference_view.cumulative_view_sha256,
-            parent_version=None if version == 0 else version - 1,
-            parent_manifest_sha256=None if version == 0 else previous_manifest_sha,
-            properties=properties,
-            atoms=atoms,
-            tasks=tasks,
-            root_files=root_files,
-            model_set_sha256=str(payload["model_set_sha256"]),
-            evidence_set_sha256=str(payload["evidence_set_sha256"]),
-            head_manifest_sha256=head_sha,
-            root=version_root.resolve(),
-        )
-        previous_manifest_sha = head_sha
-    if resolved is None:
-        raise TrainedModelError("trained-model set could not be resolved")
-    return resolved
+        resolved.append(model_set)
+        if resolved_models_out is not None:
+            resolved_models_out.append(model_set)
+        parent = model_set
+    return tuple(resolved)
+
+
+def resolve_trained_model_set(
+    campaign_dir: Union[str, Path],
+    models_version: int,
+    *,
+    verification: str = "deep",
+    trained_models_root: Optional[Union[str, Path]] = None,
+    reference_verification: Optional[str] = None,
+) -> TrainedModelSet:
+    if verification not in {"metadata", "deep"}:
+        raise ValueError("trained-model verification must be metadata or deep")
+    reference_level = (
+        verification
+        if reference_verification is None
+        else str(reference_verification)
+    )
+    if reference_level not in {"metadata", "deep"}:
+        raise ValueError("reference-data verification must be metadata or deep")
+    target_version = _safe_int(models_version, "models_version", minimum=0)
+    campaign = Path(campaign_dir)
+    reference_views = resolve_reference_data_chain(
+        campaign,
+        target_version,
+        verification=reference_level,
+    )
+    return resolve_trained_model_chain(
+        campaign,
+        target_version,
+        verification=verification,
+        trained_models_root=trained_models_root,
+        reference_views=reference_views,
+    )[-1]
 
 
 def load_trained_models(
@@ -1287,6 +1280,7 @@ def load_trained_models(
     models_version: int,
     *,
     verification: str = "deep",
+    reference_verification: Optional[str] = None,
 ):
     from ichor.core.models import Models
 
@@ -1294,6 +1288,7 @@ def load_trained_models(
         campaign_dir,
         models_version,
         verification=verification,
+        reference_verification=reference_verification,
     )
     models = Models.from_model_files(model_set.root, model_set.model_paths)
     return model_set, models
@@ -1314,6 +1309,7 @@ __all__ = [
     "file_record",
     "build_trained_model_set_payload",
     "validate_trained_model_snapshot",
+    "resolve_trained_model_chain",
     "resolve_trained_model_set",
     "load_trained_models",
 ]

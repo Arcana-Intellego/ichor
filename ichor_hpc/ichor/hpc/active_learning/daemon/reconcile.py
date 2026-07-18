@@ -32,9 +32,11 @@ from ..layout import (
     reject_legacy_campaign_layout,
 )
 from .artifact_contracts import (
-    verify_committed_model_version,
-    verify_committed_reference_data_version,
     verify_state_referenced_artifacts,
+)
+from .artifact_snapshot import (
+    CommittedArtifactSnapshot,
+    build_committed_artifact_snapshot,
 )
 from .journal import iter_events
 from .filesystem import campaign_owned_path
@@ -302,6 +304,11 @@ class ReconciliationReport:
     partial_array_recovery: Optional[Dict[str, Any]] = None
     bootstrap_handoff: Optional[Dict[str, Any]] = None
     phase_a_handoff: Optional[Dict[str, Any]] = None
+    artifact_snapshot: Optional[CommittedArtifactSnapshot] = field(
+        default=None,
+        repr=False,
+    )
+    deep_verification_required: bool = False
 
 
 def _candidate_payload(decision: RecoveryDecision) -> Dict[str, Any]:
@@ -776,6 +783,7 @@ def _trusted_campaign_uid_sources(
     valid_model_versions: List[int],
     bootstrap_handoff: Optional[Dict[str, Any]],
     phase_a_handoff: Optional[Dict[str, Any]],
+    artifact_snapshot: Optional[CommittedArtifactSnapshot] = None,
 ) -> List[Dict[str, str]]:
     """Collect campaign identities only from independently validated artefacts."""
     from .completion_receipts import (
@@ -796,14 +804,22 @@ def _trusted_campaign_uid_sources(
     )
     for version in valid_reference_data_versions:
         try:
-            view = reference_versions.resolve(int(version), verification="deep")
+            view = (
+                artifact_snapshot.reference_view(int(version))
+                if artifact_snapshot is not None
+                else reference_versions.resolve(int(version), verification="metadata")
+            )
         except Exception:
             continue
         add("reference-data version " + str(int(version)), view.campaign_uid)
     model_versions = TrainedModelVersioning(campaign / models_dir_name)
     for version in valid_model_versions:
         try:
-            model_set = model_versions.resolve(int(version), verification="deep")
+            model_set = (
+                artifact_snapshot.model_set(int(version))
+                if artifact_snapshot is not None
+                else model_versions.resolve(int(version), verification="metadata")
+            )
         except Exception:
             continue
         add("model version " + str(int(version)), model_set.campaign_uid)
@@ -849,6 +865,8 @@ def _validate_recovered_state_contract(
     *,
     bootstrap_handoff: Optional[Dict[str, Any]] = None,
     phase_a_handoff: Optional[Dict[str, Any]] = None,
+    verification: str = "metadata",
+    artifact_snapshot: Optional[CommittedArtifactSnapshot] = None,
 ) -> None:
     phase = CampaignPhase(state.phase)
     if phase in {CampaignPhase.INIT, CampaignPhase.DONE, CampaignPhase.HALTED}:
@@ -889,8 +907,18 @@ def _validate_recovered_state_contract(
             iteration=int(getattr(state, "iteration", 0)),
         )
         return
-    validate_phase_recovery_contract(campaign_dir, state)
-    verify_state_referenced_artifacts(campaign_dir, state)
+    validate_phase_recovery_contract(
+        campaign_dir,
+        state,
+        verification=verification,
+        artifact_snapshot=artifact_snapshot,
+    )
+    verify_state_referenced_artifacts(
+        campaign_dir,
+        state,
+        verification=verification,
+        snapshot=artifact_snapshot,
+    )
 
 
 def propose_recovery(
@@ -902,6 +930,9 @@ def propose_recovery(
     iteration_prefix: str = "iteration",
     allow_fresh_init_on_nonempty: bool = False,
     _active_reconcile_transaction_id: Optional[str] = None,
+    artifact_snapshot: Optional[CommittedArtifactSnapshot] = None,
+    verification_level: str = "metadata",
+    progress_stream: Optional[Any] = None,
 ) -> ReconciliationReport:
     """Inspect the campaign tree and propose a recovered CampaignState.
 
@@ -1046,6 +1077,37 @@ def propose_recovery(
     else:
         mv = []
         notes.append("models dir " + models_dir_name + " missing")
+
+    if verification_level not in {"metadata", "deep"}:
+        raise ValueError("reconcile verification must be metadata or deep")
+    if artifact_snapshot is not None:
+        if artifact_snapshot.verification_level != verification_level:
+            raise ValueError(
+                "supplied artefact snapshot verification level does not match reconcile"
+            )
+        if list(artifact_snapshot.committed_reference_data_versions) != list(tv):
+            raise ValueError(
+                "supplied artefact snapshot reference-data inventory is stale"
+            )
+        if list(artifact_snapshot.committed_model_versions) != list(mv):
+            raise ValueError("supplied artefact snapshot model inventory is stale")
+    else:
+        try:
+            artifact_snapshot = build_committed_artifact_snapshot(
+                campaign,
+                verification_level=verification_level,
+                progress_stream=progress_stream,
+            )
+        except Exception as exc:
+            unsafe_reasons.append(
+                "committed artefact snapshot failed: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:200]
+            )
+            blocking_artifacts.append("committed artefact snapshot")
+
+    deep_verification_required = bool(not existing_loaded and (tv or mv))
 
     #last phase observed in journal (informational)
     last_phase = None
@@ -1425,46 +1487,41 @@ def propose_recovery(
                 + recoverable_ferebus_reason
             )
 
-    valid_reference_data_versions: List[int] = []
-    for version in tv:
-        try:
-            verify_committed_reference_data_version(
-                campaign,
-                int(version),
-                reference_data_dir_name=reference_data_dir_name,
-            )
-            valid_reference_data_versions.append(int(version))
-            trusted_artifacts.append("reference-data version " + str(version))
-        except Exception as exc:
+    valid_reference_data_versions = (
+        list(artifact_snapshot.valid_reference_data_versions)
+        if artifact_snapshot is not None
+        else []
+    )
+    valid_model_versions = (
+        list(artifact_snapshot.valid_model_versions)
+        if artifact_snapshot is not None
+        else []
+    )
+    trusted_artifacts.extend(
+        "reference-data version " + str(version)
+        for version in valid_reference_data_versions
+    )
+    trusted_artifacts.extend(
+        "model version " + str(version)
+        for version in valid_model_versions
+    )
+    if artifact_snapshot is not None:
+        for version, error in artifact_snapshot.reference_errors.items():
             unsafe_reasons.append(
                 "committed reference-data version "
-                + str(version)
+                + str(int(version))
                 + " manifest invalid: "
-                + type(exc).__name__
-                + ": "
-                + str(exc)[:160]
+                + str(error)[:180]
             )
-            blocking_artifacts.append("reference-data version " + str(version))
-    valid_model_versions: List[int] = []
-    for version in mv:
-        try:
-            verify_committed_model_version(
-                campaign,
-                int(version),
-                models_dir_name=models_dir_name,
-            )
-            valid_model_versions.append(int(version))
-            trusted_artifacts.append("model version " + str(version))
-        except Exception as exc:
+            blocking_artifacts.append("reference-data version " + str(int(version)))
+        for version, error in artifact_snapshot.model_errors.items():
             unsafe_reasons.append(
                 "committed model version "
-                + str(version)
+                + str(int(version))
                 + " manifest invalid: "
-                + type(exc).__name__
-                + ": "
-                + str(exc)[:160]
+                + str(error)[:180]
             )
-            blocking_artifacts.append("model version " + str(version))
+            blocking_artifacts.append("model version " + str(int(version)))
     if tv != valid_reference_data_versions:
         notes.append(
             "valid reference-data versions differ from discovered committed versions"
@@ -1484,6 +1541,7 @@ def propose_recovery(
             valid_model_versions=valid_model_versions,
             bootstrap_handoff=bootstrap_handoff,
             phase_a_handoff=phase_a_handoff,
+            artifact_snapshot=artifact_snapshot,
         )
     except Exception as exc:
         unsafe_reasons.append(
@@ -1757,7 +1815,12 @@ def propose_recovery(
         recovered.models_version = -1
 
     try:
-        protected_staging_handoffs = staging_handoff_decisions(campaign, recovered)
+        protected_staging_handoffs = staging_handoff_decisions(
+            campaign,
+            recovered,
+            verification=verification_level,
+            artifact_snapshot=artifact_snapshot,
+        )
     except Exception as exc:
         protected_staging_handoffs = []
         unsafe_reasons.append(
@@ -1797,7 +1860,12 @@ def propose_recovery(
         )
         blocking_artifacts.append(".DATA/STAGING")
     try:
-        partial_iteration_handoffs = active_iteration_handoff_decisions(campaign, recovered)
+        partial_iteration_handoffs = active_iteration_handoff_decisions(
+            campaign,
+            recovered,
+            verification=verification_level,
+            artifact_snapshot=artifact_snapshot,
+        )
     except Exception as exc:
         partial_iteration_handoffs = []
         unsafe_reasons.append(
@@ -1922,7 +1990,12 @@ def propose_recovery(
         existing.phase is CampaignPhase.DONE or existing.shutdown_requested
     ):
         try:
-            verify_state_referenced_artifacts(campaign, existing)
+            verify_state_referenced_artifacts(
+                campaign,
+                existing,
+                verification=verification_level,
+                snapshot=artifact_snapshot,
+            )
         except Exception as exc:
             reason = (
                 "existing state artefact contract invalid: "
@@ -1993,6 +2066,8 @@ def propose_recovery(
                 last_phase=last_phase,
                 last_iteration=last_iter,
                 last_phase_retryable=last_phase_retryable,
+                verification=verification_level,
+                artifact_snapshot=artifact_snapshot,
             )
         _append_recovery_candidate(recovery_candidates, phase_recovery)
 
@@ -2193,6 +2268,8 @@ def propose_recovery(
                 recovered,
                 bootstrap_handoff=bootstrap_handoff,
                 phase_a_handoff=phase_a_handoff,
+                verification=verification_level,
+                artifact_snapshot=artifact_snapshot,
             )
         except Exception as exc:
             recovered.phase = CampaignPhase.HALTED
@@ -2300,6 +2377,8 @@ def propose_recovery(
         ),
         bootstrap_handoff=bootstrap_handoff,
         phase_a_handoff=phase_a_handoff,
+        artifact_snapshot=artifact_snapshot,
+        deep_verification_required=deep_verification_required,
     )
 
 

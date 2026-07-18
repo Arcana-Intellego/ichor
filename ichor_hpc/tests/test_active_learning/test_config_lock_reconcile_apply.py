@@ -1921,15 +1921,56 @@ def test_reconcile_apply_archive_staging_explicitly_handles_non_ferebus_reentry(
     staging = mv.stage(None, 0)
     (staging / "marker.txt").write_text("model", encoding="utf-8")
     mv.commit(0)
-    monkeypatch.setattr(
-        reconcile_mod,
-        "verify_committed_model_version",
-        lambda *args, **kwargs: None,
+    reference_view = SimpleNamespace(
+        version=0,
+        campaign_uid="reconcile-test",
+    )
+    model_set = SimpleNamespace(
+        version=0,
+        campaign_uid="reconcile-test",
+        root=campaign / "TRAINED_MODELS" / "iteration-000000",
+    )
+    snapshot = SimpleNamespace(
+        verification_level="metadata",
+        committed_reference_data_versions=(0,),
+        committed_model_versions=(0,),
+        valid_reference_data_versions=(0,),
+        valid_model_versions=(0,),
+        reference_errors={},
+        model_errors={},
+        reference_views=(reference_view,),
+        model_sets=(model_set,),
+        files_inspected=2,
+        payload_files_hashed=0,
+        payload_bytes_hashed=0,
+        anchor_sha256="0" * 64,
+        reference_view=lambda version: (_ for _ in ()).throw(
+            ValueError("marker fixture has no semantic reference view")
+        ),
+        model_set=lambda version: (_ for _ in ()).throw(
+            ValueError("marker fixture has no semantic model set")
+        ),
+        assert_anchors_unchanged=lambda campaign_dir: None,
+        verification_payload=lambda **kwargs: {
+            "level": "metadata",
+            "deep_required": False,
+            "files_inspected": 2,
+            "payload_files_hashed": 0,
+            "payload_bytes_hashed": 0,
+            "elapsed_seconds": 0.0,
+            "anchor_sha256": "0" * 64,
+            "first_invalid_version": None,
+        },
     )
     monkeypatch.setattr(
         reconcile_mod,
-        "verify_committed_reference_data_version",
-        lambda *args, **kwargs: None,
+        "build_committed_artifact_snapshot",
+        lambda *args, **kwargs: snapshot,
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "build_committed_artifact_snapshot",
+        lambda *args, **kwargs: snapshot,
     )
     monkeypatch.setattr(
         reconcile_mod,

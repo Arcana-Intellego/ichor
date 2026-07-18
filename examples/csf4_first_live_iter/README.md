@@ -464,6 +464,17 @@ Do not move `state.json.proposed` over `state.json` manually. `--apply` holds th
 daemon lock, rechecks scheduler intent evidence, archives safe stale staging,
 updates the config lock, and verifies the final recovery contract.
 
+Routine reconcile verifies complete metadata and file sizes without hashing
+large WFN, INT or Gaussian payloads. If `state.json` is missing or malformed,
+or corruption is suspected, first make the campaign quiescent and run:
+
+```bash
+ichor-al-daemon reconcile --campaign-dir . --deep-verify --apply
+```
+
+Deep mode hashes each committed scientific payload once and reports progress
+on stderr; it is never started implicitly by ordinary reconcile.
+
 `DONE` is a successful terminal lifecycle, not a stopped daemon. To extend a
 completed campaign deliberately, first increase `campaign.max_iterations`, run
 and review `reconcile --apply`, then use the explicit reopen command:

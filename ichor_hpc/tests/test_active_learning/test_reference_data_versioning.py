@@ -779,6 +779,201 @@ def test_reference_data_resolution_has_no_mutable_cache_side_effect(tmp_path):
     assert after == before
 
 
+def test_metadata_snapshot_skips_payload_hashing_but_deep_detects_tamper(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon import artifact_snapshot as snapshot_mod
+
+    campaign = tmp_path / "campaign"
+    _commit_two_versions(campaign)
+    target = next(
+        (campaign / "QM_REFERENCE_DATA").glob(
+            "iteration-*/POINT_*.pointdir/input.gjf"
+        )
+    )
+    original = target.read_bytes()
+    replacement = (b"!" if original[:1] != b"!" else b"?") + original[1:]
+    assert len(replacement) == len(original)
+    target.write_bytes(replacement)
+
+    hashed = []
+    real_sha256 = snapshot_mod.sha256_file
+
+    def record_hash(path, **kwargs):
+        hashed.append(Path(path).resolve())
+        return real_sha256(path, **kwargs)
+
+    monkeypatch.setattr(snapshot_mod, "sha256_file", record_hash)
+    metadata = snapshot_mod.build_committed_artifact_snapshot(
+        campaign,
+        verification_level="metadata",
+    )
+    assert metadata.valid_reference_data_versions == (0, 1)
+    assert metadata.payload_files_hashed == 0
+    assert target.resolve() not in hashed
+
+    deep = snapshot_mod.build_committed_artifact_snapshot(
+        campaign,
+        verification_level="deep",
+    )
+    assert deep.valid_reference_data_versions == ()
+    assert deep.reference_errors
+    assert target.resolve() in hashed
+
+
+def test_deep_snapshot_hashes_each_scientific_payload_once(tmp_path, monkeypatch):
+    from collections import Counter
+
+    from ichor.hpc.active_learning.daemon import artifact_snapshot as snapshot_mod
+
+    campaign = tmp_path / "campaign"
+    _commit_two_versions(campaign)
+    target = next(
+        (campaign / "QM_REFERENCE_DATA").glob(
+            "iteration-*/POINT_*.pointdir/input.gjf"
+        )
+    ).resolve()
+    calls = Counter()
+    real_sha256 = snapshot_mod.sha256_file
+
+    def count_hash(path, **kwargs):
+        calls[Path(path).resolve()] += 1
+        return real_sha256(path, **kwargs)
+
+    monkeypatch.setattr(snapshot_mod, "sha256_file", count_hash)
+    snapshot = snapshot_mod.build_committed_artifact_snapshot(
+        campaign,
+        verification_level="deep",
+    )
+
+    assert snapshot.valid_reference_data_versions == (0, 1)
+    assert snapshot.payload_files_hashed > 0
+    assert calls[target] == 1
+
+
+def test_snapshot_resolves_reference_chain_once_and_rechecks_anchors(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon.artifact_snapshot import (
+        ArtefactSnapshotError,
+        build_committed_artifact_snapshot,
+    )
+
+    campaign = tmp_path / "campaign"
+    _commit_two_versions(campaign)
+    calls = []
+    original = ReferenceDataVersioning.resolve_chain
+
+    def counted(self, version, **kwargs):
+        calls.append(int(version))
+        return original(self, version, **kwargs)
+
+    monkeypatch.setattr(ReferenceDataVersioning, "resolve_chain", counted)
+    snapshot = build_committed_artifact_snapshot(
+        campaign,
+        verification_level="metadata",
+    )
+    assert calls == [1]
+
+    anchor = (
+        campaign
+        / "QM_REFERENCE_DATA"
+        / "iteration-000000"
+        / REFERENCE_DATA_VERSION_FILENAME
+    )
+    anchor.write_text(anchor.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    with pytest.raises(ArtefactSnapshotError, match="changed"):
+        snapshot.assert_anchors_unchanged(campaign)
+
+
+def test_snapshot_stops_at_first_invalid_reference_without_rescanning_prefix(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon.artifact_snapshot import (
+        build_committed_artifact_snapshot,
+    )
+
+    campaign = tmp_path / "campaign"
+    _commit_two_versions(campaign)
+    second_manifest = (
+        campaign
+        / "QM_REFERENCE_DATA"
+        / "iteration-000001"
+        / REFERENCE_DATA_VERSION_FILENAME
+    )
+    payload = json.loads(second_manifest.read_text(encoding="utf-8"))
+    payload["parent_manifest_sha256"] = "0" * 64
+    second_manifest.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        ReferenceDataVersioning,
+        "resolve",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("snapshot rescanned a cumulative reference prefix")
+        ),
+    )
+
+    snapshot = build_committed_artifact_snapshot(
+        campaign,
+        verification_level="metadata",
+    )
+
+    assert snapshot.valid_reference_data_versions == (0,)
+    assert 1 in snapshot.reference_errors
+
+
+def test_snapshot_reads_each_version_manifest_once_in_40_version_chain(
+    tmp_path,
+    monkeypatch,
+):
+    from collections import Counter
+
+    from ichor.hpc.active_learning.daemon.artifact_snapshot import (
+        build_committed_artifact_snapshot,
+    )
+    from ichor.hpc.active_learning.versioning import reference_data as reference_mod
+
+    campaign = tmp_path / "campaign"
+    for version in range(40):
+        context = "bootstrap" if version == 0 else "active"
+        _complete_allocation(
+            campaign,
+            context=context,
+            iteration=version,
+            first_frame_id=version * 10,
+        )
+        commit_reference_data_delta(
+            campaign,
+            reference_data_version=version,
+            context=context,
+            iteration=version,
+        )
+
+    reads = Counter()
+    original = reference_mod._read_json_object
+
+    def counted(path, label):
+        source = Path(path)
+        if source.name == REFERENCE_DATA_VERSION_FILENAME:
+            reads[source.resolve()] += 1
+        return original(path, label)
+
+    monkeypatch.setattr(reference_mod, "_read_json_object", counted)
+    snapshot = build_committed_artifact_snapshot(
+        campaign,
+        verification_level="metadata",
+    )
+
+    assert snapshot.valid_reference_data_versions == tuple(range(40))
+    assert len(reads) == 40
+    assert set(reads.values()) == {1}
+
+
 def test_committed_reference_pointdirs_remain_owner_writable(tmp_path):
     campaign = tmp_path / "campaign"
     _commit_two_versions(campaign)
