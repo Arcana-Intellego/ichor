@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import hashlib
 from ..strict_json import strict_json as json
-import os
-import stat
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
-from ..daemon.state import atomic_write_json, _fsync_parent_dir
+from ..daemon.state import atomic_write_json
 from ..handoff_manifests import (
     ariadne_landing_audit_path,
     ariadne_results_path,
@@ -54,7 +52,7 @@ _ACTIVE_TOP_LEVEL_DIRECTORIES = frozenset({
 
 
 class SamplingIterationError(RuntimeError):
-    """Raised when a sampling iteration cannot be sealed or trusted."""
+    """Raised when a sampling iteration cannot be finalised or trusted."""
 
 
 def bootstrap_manifest_path(campaign_dir: Path) -> Path:
@@ -274,24 +272,12 @@ def _read_manifest(path: Path, *, kind: str, iteration: int) -> Dict[str, Any]:
     return payload
 
 
-def _seal(root: Path) -> None:
-    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
-        if path.is_symlink():
-            raise SamplingIterationError("cannot seal a symlinked sampling artefact")
-        mode = stat.S_IMODE(path.stat().st_mode)
-        os.chmod(path, mode & ~stat.S_IWUSR & ~stat.S_IWGRP & ~stat.S_IWOTH)
-    mode = stat.S_IMODE(root.stat().st_mode)
-    os.chmod(root, mode & ~stat.S_IWUSR & ~stat.S_IWGRP & ~stat.S_IWOTH)
-    _fsync_parent_dir(root)
-
-
 def finalise_bootstrap(campaign_dir: Path, campaign_uid: str) -> Path:
     campaign = Path(campaign_dir)
     root = bootstrap_dir(campaign)
     path = bootstrap_manifest_path(campaign)
     if path.is_file():
         verify_bootstrap(campaign, expected_campaign_uid=campaign_uid)
-        _seal(root)
         return path
     read_phase_a_sample_manifest(
         bootstrap_selection_dir(campaign),
@@ -332,7 +318,6 @@ def finalise_bootstrap(campaign_dir: Path, campaign_uid: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(path, payload)
     verify_bootstrap(campaign, expected_campaign_uid=campaign_uid)
-    _seal(root)
     return path
 
 
@@ -374,7 +359,6 @@ def finalise_active_iteration(
     path = active_iteration_manifest_path(campaign, value)
     if path.is_file():
         verify_active_iteration(campaign, value, expected_campaign_uid=campaign_uid)
-        _seal(root)
         return path
 
     read_ariadne_results_manifest(root, expected_iteration=value)
@@ -449,7 +433,6 @@ def finalise_active_iteration(
     )
     atomic_write_json(path, payload)
     verify_active_iteration(campaign, value, expected_campaign_uid=campaign_uid)
-    _seal(root)
     return path
 
 

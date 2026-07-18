@@ -1,7 +1,6 @@
-"""Accepted quantum bytes remain immutable between AIMAll and commit."""
+"""Accepted quantum bytes remain content-bound between AIMAll and commit."""
 
 import json
-import os
 import stat
 from pathlib import Path
 
@@ -69,7 +68,6 @@ def _accepted_fixture(tmp_path):
 def test_quantum_acceptance_receipt_detects_late_pointdir_mutation(tmp_path):
     campaign, pointdir, _quality = _accepted_fixture(tmp_path)
     wfn = pointdir / "input.wfn"
-    os.chmod(wfn, stat.S_IMODE(wfn.stat().st_mode) | stat.S_IWUSR)
     wfn.write_text("changed\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="(bytes|inventory) (have|has) changed"):
@@ -123,7 +121,6 @@ def test_quantum_acceptance_receipt_detects_late_quality_mutation(tmp_path):
 def test_quantum_acceptance_receipt_rejects_old_schema(tmp_path):
     campaign, pointdir, _quality = _accepted_fixture(tmp_path)
     receipt = pointdir / "QUANTUM_ACCEPTANCE_RECEIPT.json"
-    os.chmod(receipt, stat.S_IMODE(receipt.stat().st_mode) | stat.S_IWUSR)
     payload = json.loads(receipt.read_text(encoding="utf-8"))
     payload["schema_version"] = 1
     receipt.write_text(
@@ -134,3 +131,31 @@ def test_quantum_acceptance_receipt_rejects_old_schema(tmp_path):
 
     with pytest.raises(ValueError, match="unsupported quantum acceptance"):
         read_quantum_acceptance_receipt(campaign, pointdir)
+
+
+def test_quantum_acceptance_receipt_v3_keeps_campaign_owned_files_writable(tmp_path):
+    campaign, pointdir, _quality = _accepted_fixture(tmp_path)
+    receipt = read_quantum_acceptance_receipt(campaign, pointdir)
+
+    assert receipt["schema_version"] == 3
+    assert receipt["integrity_policy"] == "sha256_inventory"
+    assert isinstance(receipt["accepted_at_iso"], str)
+    assert stat.S_IMODE(pointdir.stat().st_mode) & stat.S_IWUSR
+    assert stat.S_IMODE((pointdir / "input.wfn").stat().st_mode) & stat.S_IWUSR
+
+
+def test_schema_two_acceptance_receipt_remains_readable_when_writable(tmp_path):
+    campaign, pointdir, _quality = _accepted_fixture(tmp_path)
+    receipt_path = pointdir / "QUANTUM_ACCEPTANCE_RECEIPT.json"
+    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = 2
+    payload["sealed_at_iso"] = payload.pop("accepted_at_iso")
+    payload.pop("integrity_policy")
+    receipt_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    restored = read_quantum_acceptance_receipt(campaign, pointdir)
+    assert restored["schema_version"] == 2

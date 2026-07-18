@@ -289,7 +289,7 @@ def _validate_source_binding_metadata(
     task = by_path.get("AIMALL_TASK.json")
     geometry = by_path.get("input.gjf")
     if not isinstance(task, Mapping) or not isinstance(geometry, Mapping):
-        raise ValueError("sealed pointdir metadata lacks row-shard source files")
+        raise ValueError("accepted pointdir metadata lacks row-shard source files")
     if str(task.get("sha256") or "") != str(payload.get("aimall_task_sha256") or ""):
         raise ValueError("FEREBUS row-shard AIMAll-task hash mismatch")
     if str(geometry.get("sha256") or "") != str(payload.get("geometry_sha256") or ""):

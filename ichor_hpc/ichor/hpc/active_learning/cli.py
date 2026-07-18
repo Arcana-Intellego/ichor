@@ -7074,7 +7074,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         except Exception as exc:
             print(
                 "warning: reconcile committed, but its transaction receipt "
-                "could not be sealed: "
+                "could not be finalised: "
                 + type(exc).__name__
                 + ": "
                 + str(exc),

@@ -1,4 +1,4 @@
-"""Immutable content receipts for AIMAll-accepted point directories."""
+"""Content receipts for AIMAll-accepted point directories."""
 
 from __future__ import annotations
 
@@ -20,7 +20,8 @@ from .state import _fsync_file_descriptor, _fsync_parent_dir, atomic_write_json
 
 
 QUANTUM_ACCEPTANCE_RECEIPT = "QUANTUM_ACCEPTANCE_RECEIPT.json"
-QUANTUM_ACCEPTANCE_RECEIPT_SCHEMA_VERSION = 2
+QUANTUM_ACCEPTANCE_RECEIPT_SCHEMA_VERSION = 3
+_SUPPORTED_QUANTUM_ACCEPTANCE_RECEIPT_SCHEMAS = frozenset({2, 3})
 
 
 def _exact_int(value: Any, label: str) -> int:
@@ -134,10 +135,6 @@ def _validate_current_inventory(
     if verification == "receipt":
         if root.is_symlink() or not root.is_dir():
             raise ValueError("accepted quantum pointdir is missing or symlinked")
-        if stat.S_IMODE(root.stat().st_mode) & (
-            stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
-        ):
-            raise ValueError("accepted quantum pointdir root is still writable")
         _validate_required_evidence(bindings)
         return
     current_files = _scientific_files(root)
@@ -163,33 +160,6 @@ def _validate_current_inventory(
                 )
 
 
-def _seal_pointdir(root: Path) -> None:
-    paths = sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True)
-    for path in paths + [root]:
-        if path.is_symlink():
-            raise ValueError("cannot seal symlinked quantum evidence: " + str(path))
-        mode = stat.S_IMODE(path.stat().st_mode)
-        os.chmod(path, mode & ~stat.S_IWUSR & ~stat.S_IWGRP & ~stat.S_IWOTH)
-    _fsync_parent_dir(root)
-
-
-def _require_sealed(root: Path) -> None:
-    for path in [root, *root.rglob("*")]:
-        if path.is_symlink():
-            raise ValueError("sealed quantum evidence contains a symlink: " + str(path))
-        if stat.S_IMODE(path.stat().st_mode) & (
-            stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
-        ):
-            raise ValueError("accepted quantum evidence is still writable: " + str(path))
-
-
-def restore_sealed_pointdir_permissions(pointdir: Path) -> None:
-    """Restore immutable directory modes after verified checkpoint transport."""
-    root = Path(pointdir)
-    _seal_pointdir(root)
-    _require_sealed(root)
-
-
 def write_quantum_acceptance_receipt(
     campaign_dir: Path,
     pointdir: Path,
@@ -199,7 +169,7 @@ def write_quantum_acceptance_receipt(
     quality_manifest: Path,
     quality_record: Mapping[str, Any],
 ) -> Path:
-    """Hash, fsync and seal one accepted pointdir before allocation publication."""
+    """Hash and synchronise one accepted pointdir before allocation publication."""
     campaign = Path(campaign_dir).resolve()
     root = campaign_owned_path(campaign, pointdir)
     provenance = read_provenance(root)
@@ -248,14 +218,14 @@ def write_quantum_acceptance_receipt(
             "available" if shard_binding is not None else "repair_required"
         ),
         "ferebus_row_shard": shard_binding,
-        "sealed_at_iso": datetime.now(timezone.utc).isoformat(),
+        "accepted_at_iso": datetime.now(timezone.utc).isoformat(),
+        "integrity_policy": "sha256_inventory",
     }
     for key in ("campaign_uid", "candidate_id", "allocation_slot_assignment_sha256"):
         if not payload[key]:
             raise ValueError("quantum acceptance receipt " + key + " is empty")
     target = root / QUANTUM_ACCEPTANCE_RECEIPT
     atomic_write_json(target, payload)
-    _seal_pointdir(root)
     return target
 
 
@@ -271,7 +241,7 @@ def read_quantum_acceptance_receipt(
     verification: str = "metadata",
     validate_quality: bool = True,
 ) -> Dict[str, Any]:
-    """Validate sealed acceptance evidence, rehashing payloads only when requested."""
+    """Validate acceptance evidence, rehashing payloads only when requested."""
     campaign = Path(campaign_dir).resolve()
     root = campaign_owned_path(campaign, pointdir)
     target = root / QUANTUM_ACCEPTANCE_RECEIPT
@@ -281,11 +251,23 @@ def read_quantum_acceptance_receipt(
         raise ValueError("quantum acceptance receipt is unreadable: " + str(target)) from exc
     if not isinstance(payload, dict):
         raise ValueError("quantum acceptance receipt must be a JSON object")
-    if (
-        _exact_int(payload.get("schema_version"), "quantum acceptance schema")
-        != QUANTUM_ACCEPTANCE_RECEIPT_SCHEMA_VERSION
-    ):
+    schema_version = _exact_int(
+        payload.get("schema_version"), "quantum acceptance schema"
+    )
+    if schema_version not in _SUPPORTED_QUANTUM_ACCEPTANCE_RECEIPT_SCHEMAS:
         raise ValueError("unsupported quantum acceptance receipt schema")
+    timestamp_key = "sealed_at_iso" if schema_version == 2 else "accepted_at_iso"
+    timestamp = payload.get(timestamp_key)
+    if not isinstance(timestamp, str) or not timestamp:
+        raise ValueError("quantum acceptance receipt timestamp is invalid")
+    try:
+        parsed_timestamp = datetime.fromisoformat(timestamp)
+    except ValueError as exc:
+        raise ValueError("quantum acceptance receipt timestamp is invalid") from exc
+    if parsed_timestamp.tzinfo is None:
+        raise ValueError("quantum acceptance receipt timestamp lacks a timezone")
+    if schema_version == 3 and payload.get("integrity_policy") != "sha256_inventory":
+        raise ValueError("quantum acceptance receipt integrity policy is invalid")
     iteration = _exact_int(payload.get("iteration"), "quantum acceptance iteration")
     source_pointdir = str(payload.get("source_pointdir") or "")
     if not source_pointdir:
@@ -315,8 +297,6 @@ def read_quantum_acceptance_receipt(
     if payload.get("content_sha256") != _canonical_sha256(bindings):
         raise ValueError("quantum acceptance receipt content digest is invalid")
     _validate_current_inventory(root, bindings, verification=verification)
-    if verification != "receipt":
-        _require_sealed(root)
     quality_binding = payload.get("quality_manifest")
     if not isinstance(quality_binding, dict):
         raise ValueError("quantum acceptance quality binding is invalid")
@@ -352,6 +332,5 @@ __all__ = [
     "QUANTUM_ACCEPTANCE_RECEIPT",
     "QUANTUM_ACCEPTANCE_RECEIPT_SCHEMA_VERSION",
     "read_quantum_acceptance_receipt",
-    "restore_sealed_pointdir_permissions",
     "write_quantum_acceptance_receipt",
 ]

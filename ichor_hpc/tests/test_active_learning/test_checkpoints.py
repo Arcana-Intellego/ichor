@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -197,6 +198,11 @@ def test_checkpoint_restore_rebuilds_excluded_ferebus_row_cache(
         / FEREBUS_ROW_CACHE
     )
     assert cache_manifest.is_file()
+    restored_pointdir = next(
+        (target / "QM_REFERENCE_DATA" / "iteration-000000").glob("*.pointdir")
+    )
+    assert os.access(restored_pointdir, os.W_OK)
+    assert os.access(restored_pointdir / "input.wfn", os.W_OK)
 
 
 def test_checkpoint_rejects_corrupt_object(tmp_path, monkeypatch):

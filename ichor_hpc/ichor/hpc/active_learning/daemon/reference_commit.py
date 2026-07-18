@@ -1,4 +1,4 @@
-"""Fast, resumable publication of sealed QM reference-data deltas."""
+"""Fast, resumable publication of accepted QM reference-data deltas."""
 
 from __future__ import annotations
 
@@ -28,7 +28,6 @@ from ..versioning.reference_data import (
     ReferenceDataView,
     build_reference_data_version_payload,
     canonical_json_sha256,
-    seal_reference_data_version,
 )
 from .ferebus_row_cache import (
     FEREBUS_ROW_CACHE,
@@ -650,7 +649,7 @@ def commit_reference_data_delta(
     iteration: int,
     progress_callback: ProgressCallback = None,
 ) -> Tuple[ReferenceDataView, List[str], bool]:
-    """Move one sealed allocation into a durable delta and publish its row cache."""
+    """Move one accepted allocation into a durable delta and publish its row cache."""
     started = time.monotonic()
     campaign = Path(campaign_dir).resolve()
     version = int(reference_data_version)
@@ -804,7 +803,6 @@ def commit_reference_data_delta(
     manifest, sizes = _prehashed_inventory(staging, ledger)
     versioning.commit_prehashed(version, manifest=manifest, expected_sizes=sizes)
     _write_ledger(ledger_path, ledger, status="published")
-    seal_reference_data_version(versioning.iteration_path(version))
     versioning.update_current(version)
     _write_ledger(ledger_path, ledger, status="complete")
     _emit(

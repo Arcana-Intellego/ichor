@@ -1,11 +1,9 @@
-"""Immutable delta-only versioning for committed QM reference data."""
+"""Content-verified delta-only versioning for committed QM reference data."""
 
 from __future__ import annotations
 
 import hashlib
 from ..strict_json import strict_json as json
-import os
-import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
@@ -138,53 +136,6 @@ def hash_pointdir_tree(pointdir: Union[str, Path]) -> str:
     if not records:
         raise ReferenceDataError("reference pointdir contains no committed files: " + str(root))
     return canonical_json_sha256(records)
-
-
-def seal_reference_data_version(iteration_dir: Union[str, Path]) -> None:
-    """Seal version metadata without revisiting already sealed pointdir trees."""
-    root = Path(iteration_dir)
-    if not root.is_dir() or root.is_symlink():
-        raise ReferenceDataError("cannot seal missing reference-data version: " + str(root))
-    metadata_paths: List[Path] = []
-    for current, directory_names, file_names in os.walk(root, topdown=True):
-        current_path = Path(current)
-        if current_path.is_symlink():
-            raise ReferenceDataError(
-                "cannot seal a symlinked reference-data entry: " + str(current_path)
-            )
-        retained_directories = []
-        for directory_name in directory_names:
-            directory = current_path / directory_name
-            if directory.is_symlink():
-                raise ReferenceDataError(
-                    "cannot seal a symlinked reference-data entry: " + str(directory)
-                )
-            if directory_name.endswith(".pointdir"):
-                if stat.S_IMODE(directory.stat().st_mode) & (
-                    stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
-                ):
-                    raise ReferenceDataError(
-                        "reference pointdir was not sealed at acceptance: " + str(directory)
-                    )
-                continue
-            retained_directories.append(directory_name)
-            metadata_paths.append(directory)
-        directory_names[:] = retained_directories
-        for file_name in file_names:
-            path = current_path / file_name
-            if path.is_symlink() or not path.is_file():
-                raise ReferenceDataError(
-                    "cannot seal a non-regular reference-data entry: " + str(path)
-                )
-            metadata_paths.append(path)
-    for path in sorted(metadata_paths, key=lambda item: len(item.parts), reverse=True):
-        mode = stat.S_IMODE(path.stat().st_mode)
-        os.chmod(path, mode & ~stat.S_IWUSR & ~stat.S_IWGRP & ~stat.S_IWOTH)
-    root_mode = stat.S_IMODE(root.stat().st_mode)
-    os.chmod(root, root_mode & ~stat.S_IWUSR & ~stat.S_IWGRP & ~stat.S_IWOTH)
-    from ..daemon.state import _fsync_parent_dir
-
-    _fsync_parent_dir(root)
 
 
 def _read_json_object(path: Path, label: str) -> Dict[str, Any]:
@@ -716,7 +667,6 @@ __all__ = [
     "reference_data_version_path",
     "canonical_json_sha256",
     "hash_pointdir_tree",
-    "seal_reference_data_version",
     "resolve_reference_data_view",
     "build_reference_data_version_payload",
 ]

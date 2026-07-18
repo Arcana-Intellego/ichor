@@ -1,11 +1,9 @@
-"""Authoritative immutable trained-model snapshots."""
+"""Authoritative content-verified trained-model snapshots."""
 
 from __future__ import annotations
 
 from ..strict_json import strict_json as json
-import os
 import re
-import stat
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -1301,22 +1299,6 @@ def load_trained_models(
     return model_set, models
 
 
-def seal_trained_model_version(version_dir: Union[str, Path]) -> None:
-    root = Path(version_dir)
-    if not root.is_dir() or root.is_symlink():
-        raise TrainedModelError("cannot seal missing trained-model version: " + str(root))
-    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
-        if path.is_symlink():
-            raise TrainedModelError("cannot seal symlinked trained-model artefact: " + str(path))
-        mode = stat.S_IMODE(path.stat().st_mode)
-        os.chmod(path, mode & ~stat.S_IWUSR & ~stat.S_IWGRP & ~stat.S_IWOTH)
-    mode = stat.S_IMODE(root.stat().st_mode)
-    os.chmod(root, mode & ~stat.S_IWUSR & ~stat.S_IWGRP & ~stat.S_IWOTH)
-    from ..daemon.state import _fsync_parent_dir
-
-    _fsync_parent_dir(root)
-
-
 __all__ = [
     "TRAINED_MODEL_SET_FILENAME",
     "TRAINED_MODEL_SET_SCHEMA_VERSION",
@@ -1334,5 +1316,4 @@ __all__ = [
     "validate_trained_model_snapshot",
     "resolve_trained_model_set",
     "load_trained_models",
-    "seal_trained_model_version",
 ]

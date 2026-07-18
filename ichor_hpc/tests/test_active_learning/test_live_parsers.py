@@ -1308,13 +1308,10 @@ def test_ferebus_parser_happy_path_commits_models_version(tmp_path):
     assert artefact_manifest["tasks"][0]["auxiliary"]["opt"]["path"] == (
         "iqa/O1/WATER_iqa_O1.opt"
     )
-    import stat
+    import os
 
-    assert not (stat.S_IMODE(task_dir.stat().st_mode) & stat.S_IWUSR)
-    assert not (
-        stat.S_IMODE((task_dir / "WATER_iqa_O1.model").stat().st_mode)
-        & stat.S_IWUSR
-    )
+    assert os.access(task_dir, os.W_OK)
+    assert os.access(task_dir / "WATER_iqa_O1.model", os.W_OK)
     events = _read_journal_events(tmp_path / "campaign")
     assert any(e.get("event") == "models_committed" for e in events)
 
@@ -1372,8 +1369,6 @@ def test_rejected_ferebus_candidate_is_quarantined_without_model_commit(tmp_path
 
 
 def test_trained_model_resolver_rejects_post_commit_model_tamper(tmp_path):
-    import stat
-
     ex = _make_executor(tmp_path)
     _commit_bootstrap_reference_data(ex.campaign_dir)
     _seed_models_staging(ex.campaign_dir)
@@ -1386,7 +1381,6 @@ def test_trained_model_resolver_rejects_post_commit_model_tamper(tmp_path):
     versioning = TrainedModelVersioning(ex.campaign_dir / "TRAINED_MODELS")
     model_set = versioning.resolve(0, verification="deep")
     model = model_set.tasks[0].model.path
-    model.chmod(stat.S_IMODE(model.stat().st_mode) | stat.S_IWUSR)
     model.write_text(
         model.read_text(encoding="utf-8") + "\n# tamper\n",
         encoding="utf-8",
@@ -1397,8 +1391,6 @@ def test_trained_model_resolver_rejects_post_commit_model_tamper(tmp_path):
 
 
 def test_trained_model_resolver_rejects_post_commit_dataset_tamper(tmp_path):
-    import stat
-
     ex = _make_executor(tmp_path)
     _commit_bootstrap_reference_data(ex.campaign_dir)
     _seed_models_staging(ex.campaign_dir)
@@ -1411,7 +1403,6 @@ def test_trained_model_resolver_rejects_post_commit_dataset_tamper(tmp_path):
     versioning = TrainedModelVersioning(ex.campaign_dir / "TRAINED_MODELS")
     model_set = versioning.resolve(0, verification="deep")
     dataset = model_set.tasks[0].datasets["train"].path
-    dataset.chmod(stat.S_IMODE(dataset.stat().st_mode) | stat.S_IWUSR)
     dataset.write_text(
         dataset.read_text(encoding="utf-8") + "0.9,0.9,0.9,0.0\n",
         encoding="utf-8",

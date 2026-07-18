@@ -123,10 +123,10 @@ def attach_synthetic_quantum_acceptance(
             iqa_ha=float(atom_record["iqa_ha"]),
             multipole_names=multipole_names,
         )
-    # Schema-9 reference commits require the immutable feature contract that
+    # Schema-9 reference commits require the content-bound feature contract that
     # production freezes while staging INITIAL_AIMALL.  Older focused fixtures
-    # bypass that staging path, so create the same contract here before sealing
-    # the accepted pointdir.
+    # bypass that staging path, so create the same contract here before recording
+    # the accepted pointdir receipt.
     from ichor.hpc.active_learning.config import CampaignConfig
     from ichor.hpc.active_learning.daemon.ferebus_row_cache import (
         ensure_feature_contract,

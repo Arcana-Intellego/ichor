@@ -477,6 +477,102 @@ def test_reference_commit_resumes_after_interrupted_point_move(
     )["state"] == "complete"
 
 
+def test_schema_two_writable_receipts_resume_zero_move_transaction(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon import reference_commit as commit_mod
+    from ichor_hpc.tests import quantum_test_support
+
+    campaign = tmp_path / "campaign"
+    write_v3_receipt = quantum_test_support.write_quantum_acceptance_receipt
+
+    def write_v2_receipt(*args, **kwargs):
+        receipt_path = write_v3_receipt(*args, **kwargs)
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        payload["schema_version"] = 2
+        payload["sealed_at_iso"] = payload.pop("accepted_at_iso")
+        payload.pop("integrity_policy")
+        receipt_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        return receipt_path
+
+    monkeypatch.setattr(
+        quantum_test_support,
+        "write_quantum_acceptance_receipt",
+        write_v2_receipt,
+    )
+    _complete_allocation(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        first_frame_id=0,
+    )
+    pointdirs = sorted(
+        (campaign / ".DATA" / "STAGING" / "initial").glob("*.pointdir")
+    )
+    for pointdir in pointdirs:
+        for path in [*pointdir.rglob("*"), pointdir]:
+            mode = stat.S_IMODE(path.stat().st_mode)
+            path.chmod(mode & ~stat.S_IWUSR & ~stat.S_IWGRP & ~stat.S_IWOTH)
+
+    real_replace = commit_mod.os.replace
+
+    def deny_first_point_move(source, destination):
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if (
+            source_path.name.endswith(".pointdir")
+            and destination_path.name.endswith(".pointdir")
+        ):
+            raise PermissionError("simulated sealed-directory move failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(commit_mod.os, "replace", deny_first_point_move)
+    with pytest.raises(PermissionError, match="sealed-directory move failure"):
+        commit_reference_data_delta(
+            campaign,
+            reference_data_version=0,
+            context="bootstrap",
+            iteration=0,
+        )
+
+    transaction = commit_mod.classify_reference_commit(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+    )
+    assert transaction["state"] == "prepared"
+    assert transaction["ledger"]["status"] == "moving"
+    assert transaction["ledger"]["moved_points"] == 0
+
+    monkeypatch.setattr(commit_mod.os, "replace", real_replace)
+    for pointdir in pointdirs:
+        for path in [pointdir, *pointdir.rglob("*")]:
+            mode = stat.S_IMODE(path.stat().st_mode)
+            if path.is_dir():
+                path.chmod(mode | stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+            else:
+                path.chmod(mode | stat.S_IRUSR | stat.S_IWUSR)
+
+    view, names, created = commit_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )
+    assert created is True
+    assert len(view.entries) == len(names) == len(pointdirs)
+    assert commit_mod.classify_reference_commit(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+    )["state"] == "complete"
+
+
 def test_committed_quantum_quality_paths_are_version_relative(tmp_path):
     campaign = tmp_path / "campaign"
     _complete_allocation(
@@ -588,10 +684,6 @@ def test_allocation_join_rejects_stale_provenance_bindings(
         campaign / ".DATA" / "STAGING" / "initial" / "POINT_0000.pointdir"
     )
     provenance_path = pointdir / "provenance.json"
-    os.chmod(
-        provenance_path,
-        stat.S_IMODE(provenance_path.stat().st_mode) | stat.S_IWUSR,
-    )
     provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
     path, value = mutation
     if path == "iteration":
@@ -621,7 +713,6 @@ def test_reference_data_hash_chain_detects_parent_manifest_tamper(tmp_path):
         / "iteration-000000"
         / REFERENCE_DATA_VERSION_FILENAME
     )
-    os.chmod(manifest, stat.S_IMODE(manifest.stat().st_mode) | stat.S_IWUSR)
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     payload["tampered"] = True
     manifest.write_text(json.dumps(payload), encoding="utf-8")
@@ -653,7 +744,6 @@ def test_reference_data_reader_rejects_schema_two_manifest(tmp_path):
         / "iteration-000000"
         / REFERENCE_DATA_VERSION_FILENAME
     )
-    os.chmod(manifest, stat.S_IMODE(manifest.stat().st_mode) | stat.S_IWUSR)
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     payload["schema_version"] = 2
     manifest.write_text(
@@ -689,7 +779,7 @@ def test_reference_data_resolution_has_no_mutable_cache_side_effect(tmp_path):
     assert after == before
 
 
-def test_committed_reference_pointdirs_are_read_only(tmp_path):
+def test_committed_reference_pointdirs_remain_owner_writable(tmp_path):
     campaign = tmp_path / "campaign"
     _commit_two_versions(campaign)
     pointdir = (
@@ -700,8 +790,8 @@ def test_committed_reference_pointdirs_are_read_only(tmp_path):
     )
     file_path = pointdir / "input.gjf"
 
-    assert stat.S_IMODE(pointdir.stat().st_mode) & stat.S_IWUSR == 0
-    assert stat.S_IMODE(file_path.stat().st_mode) & stat.S_IWUSR == 0
+    assert os.access(pointdir, os.W_OK)
+    assert os.access(file_path, os.W_OK)
 
 
 def test_idempotent_older_commit_does_not_move_current_backwards(tmp_path):

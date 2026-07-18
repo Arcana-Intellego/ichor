@@ -57,6 +57,33 @@ _EXPECTED_DEFAULT_TRANSITIONS = {
 }
 
 
+def test_active_learning_code_has_no_recursive_permission_sealing():
+    production_root = (
+        Path(__file__).resolve().parents[2]
+        / "ichor"
+        / "hpc"
+        / "active_learning"
+    )
+    forbidden = (
+        "~stat.S_IWUSR",
+        "~stat.S_IWGRP",
+        "~stat.S_IWOTH",
+        "seal_trained_model_version",
+        "seal_reference_data_version",
+        "_seal_pointdir",
+        "_require_sealed",
+    )
+    violations = []
+    for path in sorted(production_root.rglob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        for token in forbidden:
+            if token in source:
+                violations.append(
+                    path.relative_to(production_root).as_posix() + ": " + token
+                )
+    assert violations == []
+
+
 def test_independent_fsm_enumeration_matches_every_nonterminal_phase():
     assert set(PHASE_ORDER) == set(_EXPECTED_DEFAULT_TRANSITIONS) | {
         CampaignPhase.REFERENCE_COMMIT,

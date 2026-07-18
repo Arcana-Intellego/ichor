@@ -293,9 +293,10 @@ QM reference-data storage
 -------------------------
 
 Accepted Gaussian/AIMAll pointdirs are committed under
-:code:`QM_REFERENCE_DATA/`. Each :code:`iteration-NNNNNN/` is an immutable
-**delta** containing only points first accepted in that reference-data
-version. Older pointdirs are not copied or symlinked into later versions.
+:code:`QM_REFERENCE_DATA/`. Each :code:`iteration-NNNNNN/` is a
+content-verified **delta** containing only points first accepted in that
+reference-data version. Older pointdirs are not copied or symlinked into later
+versions.
 
 Every delta contains :code:`REFERENCE_DATA_VERSION.json`, the exact
 point-allocation snapshot and its generation history, and a generic
@@ -319,9 +320,10 @@ mixing the two storage contracts.
 Trained-model storage
 ---------------------
 
-Each successful FEREBUS phase commits one complete immutable snapshot under
-:code:`TRAINED_MODELS/iteration-NNNNNN/`. Task files are grouped by property
-and atom; model and configuration files are never dumped at the version root::
+Each successful FEREBUS phase commits one complete content-verified snapshot
+under :code:`TRAINED_MODELS/iteration-NNNNNN/`. Task files are grouped by
+property and atom; model and configuration files are never dumped at the
+version root::
 
     TRAINED_MODELS/iteration-000001/
       FEREBUS_TASK_ARTEFACTS.json
@@ -349,8 +351,8 @@ not used. Unknown files, missing files, symlinks, hash drift, task-order drift,
 or a rejected quality manifest make the snapshot unusable.
 
 The :code:`current` pointer is updated only after the new snapshot has been
-committed, deeply verified, and made read-only. It may point only at the newest
-committed model version. :code:`TRAINED_MODELS/iteration-staging/` remains a
+committed and deeply verified. It may point only at the newest committed model
+version. :code:`TRAINED_MODELS/iteration-staging/` remains a
 rebuildable FEREBUS working directory and is not authoritative. The former
 :code:`6_TRAINED_MODELS/` and nested :code:`task_artefacts/` layouts are
 intentionally unsupported.
@@ -408,13 +410,15 @@ trajectory-pool row indices remain explicitly zero-based. :code:`TASK_MAP.json`
 is the sole mapping between those domains; code must not infer one from a
 directory name or array position.
 
-Every completed active iteration is sealed by :code:`ITERATION_MANIFEST.json`.
+Every completed active iteration is finalised by :code:`ITERATION_MANIFEST.json`.
 The manifest records an exact recursive file inventory, SHA-256 bindings,
 iteration/model/reference-data identities, and the parent iteration-manifest
 hash. Extra files, missing files, hash drift, symlinks, partial output markers,
-or a broken parent chain make the iteration invalid. Committed iteration
-artefacts are made read-only. The daemon may rebuild explicitly documented
-derived caches, but authoritative manifests and task outputs are immutable.
+or a broken parent chain make the iteration invalid. Campaign files remain
+owner-writable; hashes and exact inventories, rather than permission modes,
+provide the integrity contract. The daemon may rebuild explicitly documented
+derived caches, while authoritative manifests and task outputs remain
+content-bound.
 
 The former :code:`3_DIVERSITY_SAMPLING/`, :code:`7_ACTIVE_LEARNING/`, flat
 iteration files, four-digit active iteration names, :code:`pool/seed_*/`, and
@@ -692,7 +696,7 @@ postprocess parser in the daemon process).
      |                                      | (bounded reserve only)
      |<-------------------------------------+
      v
-   REFERENCE_COMMIT  (inline)     Atomically publish sealed pointdirs and cached
+   REFERENCE_COMMIT  (inline)     Atomically publish accepted pointdirs and cached
      |                            FEREBUS rows as reference-data version 0.
      v
    INITIAL_FEREBUS  (sbatch*)     First GP fit. Commits trained-model version 0.
@@ -723,7 +727,7 @@ postprocess parser in the daemon process).
      |                              | (same inherited slot and split)
      |<-----------------------------+
      v                         |
-   REFERENCE_COMMIT  (inline)   |  Atomically move sealed AIMAll pointdirs and
+   REFERENCE_COMMIT  (inline)   |  Atomically move accepted AIMAll pointdirs and
      |                         |  publish the new row-cache delta.
      |                         |
      v                         |
@@ -740,7 +744,7 @@ so a crash between the two leaves the state authoritative and the
 journal at most one event behind. The inline REFERENCE_COMMIT and FEREBUS
 commits are idempotent: re-running after a partial crash is safe. Reference
 publication uses same-filesystem atomic moves, so normal operation does not
-copy or rehash the sealed scientific payload. Each successful AIMAll task also
+copy or rehash the accepted scientific payload. Each successful AIMAll task also
 writes one compact FEREBUS row shard, consisting of ``ROW_SHARD.json`` and
 ``ROWS.npy``. ``REFERENCE_COMMIT`` validates and assembles those shards before
 publishing the reference version. Missing or invalid shards are repaired

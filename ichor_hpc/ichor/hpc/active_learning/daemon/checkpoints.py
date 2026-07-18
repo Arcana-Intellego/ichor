@@ -593,25 +593,14 @@ def restore_checkpoint(
             temporary,
             expected_campaign_uid=str(restored_state.campaign_uid),
         )
+        verify_state_referenced_artifacts(temporary, restored_state, strict_models=True)
         if int(restored_state.reference_data_version) >= 0:
-            from .quantum_acceptance_receipts import (
-                restore_sealed_pointdir_permissions,
-            )
+            from .ferebus_row_cache import ensure_cumulative_row_caches
             from ..versioning.reference_data import ReferenceDataVersioning
 
             reference_versioning = ReferenceDataVersioning(
                 temporary / "QM_REFERENCE_DATA"
             )
-            reference_index = reference_versioning.resolve(
-                int(restored_state.reference_data_version),
-                verification="index",
-            )
-            for entry in reference_index.entries:
-                restore_sealed_pointdir_permissions(entry.pointdir_path)
-        verify_state_referenced_artifacts(temporary, restored_state, strict_models=True)
-        if int(restored_state.reference_data_version) >= 0:
-            from .ferebus_row_cache import ensure_cumulative_row_caches
-
             reference_view = reference_versioning.resolve(
                 int(restored_state.reference_data_version),
                 verification="metadata",

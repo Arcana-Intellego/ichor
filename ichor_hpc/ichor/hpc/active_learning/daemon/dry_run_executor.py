@@ -631,7 +631,6 @@ class DryRunPhaseExecutor:
         from .live_executor import _write_ferebus_task_artefact_layout
         from .model_contract import validate_ferebus_model_contract
         from ..versioning.trained_models import (
-            seal_trained_model_version,
             trained_models_commit_lock,
             validate_trained_model_snapshot,
         )
@@ -696,8 +695,6 @@ class DryRunPhaseExecutor:
                 trained_model_set=staged_set,
             )
             model_versioning.commit(target_version)
-            committed_dir = model_versioning.iteration_path(target_version)
-            seal_trained_model_version(committed_dir)
             model_versioning.resolve(target_version, verification="deep")
             model_versioning.update_current(target_version)
 

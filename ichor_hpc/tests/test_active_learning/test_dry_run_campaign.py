@@ -13,6 +13,7 @@ The test runs locally in pytest's tmp_path, but the file-system flow is
 the same one CSF4 would exercise.
 """
 import json
+import shutil
 import stat
 from pathlib import Path
 
@@ -219,11 +220,10 @@ def test_dry_run_active_learning_dirs_have_seeds_pool_and_phase_b(tmp_path):
             and record["role"] == "derived_cache"
             for record in manifest["files"]
         )
-        assert not (stat.S_IMODE(d.stat().st_mode) & stat.S_IWUSR)
+        assert stat.S_IMODE(d.stat().st_mode) & stat.S_IWUSR
     verify_sampling_chain(campaign, 2)
 
     first_iteration = campaign / "ACTIVE_LEARNING" / "iteration-000001"
-    first_iteration.chmod(first_iteration.stat().st_mode | stat.S_IWUSR)
     rogue = first_iteration / "rogue.txt"
     rogue.write_text("not in the sealed inventory\n", encoding="utf-8")
     with pytest.raises(SamplingIterationError, match="exact inventory mismatch"):
@@ -233,6 +233,14 @@ def test_dry_run_active_learning_dirs_have_seeds_pool_and_phase_b(tmp_path):
     interrupted.write_text("partial\n", encoding="utf-8")
     with pytest.raises(SamplingIterationError, match="incomplete artefact"):
         verify_active_iteration(campaign, 1)
+
+
+def test_completed_dry_campaign_can_be_removed_without_permission_repair(tmp_path):
+    campaign, _daemon, _config, _pool = _run_two_iter_campaign(tmp_path)
+
+    shutil.rmtree(campaign)
+
+    assert not campaign.exists()
 
 
 def test_dry_run_journal_records_all_phases(tmp_path):

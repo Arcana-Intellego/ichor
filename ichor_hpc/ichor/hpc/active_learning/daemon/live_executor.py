@@ -3407,7 +3407,6 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             committed_dir = v_models.iteration_path(next_version)
             try:
                 from .model_contract import validate_ferebus_model_contract
-                from ..versioning.trained_models import seal_trained_model_version
 
                 validate_ferebus_model_contract(
                     committed_dir,
@@ -3418,7 +3417,6 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     next_version,
                     verification="deep",
                 )
-                seal_trained_model_version(committed_dir)
                 newest_version = max(committed)
                 if newest_version != next_version:
                     v_models.resolve(newest_version, verification="deep")
@@ -3628,7 +3626,6 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         try:
             from .model_contract import validate_ferebus_model_contract
             from ..versioning.trained_models import (
-                seal_trained_model_version,
                 validate_trained_model_snapshot,
             )
 
@@ -3665,7 +3662,6 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         v_models.commit(next_version)
         committed_dir = v_models.iteration_path(next_version)
         try:
-            seal_trained_model_version(committed_dir)
             committed_model_set = v_models.resolve(
                 next_version,
                 verification="deep",

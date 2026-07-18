@@ -6,7 +6,6 @@ import os
 import platform
 import re
 import shutil
-import stat
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -220,8 +219,8 @@ class VersionedDirectory:
         """Publish a staging tree using trusted producer hashes.
 
         This path deliberately validates exact paths, regular-file types and
-        sizes without reading payload bytes. It is reserved for sealed quantum
-        pointdirs whose hashes were frozen by acceptance receipts.
+        sizes without reading payload bytes. It is reserved for accepted quantum
+        pointdirs whose hashes were recorded by acceptance receipts.
         """
         staging = self.staging_path(target_version)
         target = self.iteration_path(target_version)
@@ -239,16 +238,6 @@ class VersionedDirectory:
                 raise ValueError("prehashed staging contains a symlink: " + str(path))
             relative_path = path.relative_to(staging)
             path_stat = path.stat()
-            inside_sealed_pointdir = bool(
-                relative_path.parts
-                and relative_path.parts[0].endswith(".pointdir")
-            )
-            if inside_sealed_pointdir and stat.S_IMODE(path_stat.st_mode) & (
-                stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
-            ):
-                raise ValueError(
-                    "prehashed pointdir entry is writable: " + str(path)
-                )
             if path.is_dir():
                 continue
             if not path.is_file():
