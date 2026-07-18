@@ -207,10 +207,11 @@ def test_stage_ferebus_inputs_orchestration(tmp_path, monkeypatch):
     assert not list(staging.glob("*_normalised_for_split.csv"))
 
 
-def test_stage_ferebus_inputs_never_repairs_missing_row_cache(
+def test_stage_ferebus_inputs_repairs_missing_row_cache_lazily(
     tmp_path,
     monkeypatch,
 ):
+    from ichor.hpc.active_learning.daemon import ferebus_row_cache
     from ichor.hpc.active_learning.daemon.ferebus_row_cache import (
         FEREBUS_ROW_CACHE,
         read_feature_contract,
@@ -226,17 +227,78 @@ def test_stage_ferebus_inputs_never_repairs_missing_row_cache(
         row_cache_path(campaign, str(contract["contract_sha256"]), 0)
         / FEREBUS_ROW_CACHE
     )
+    cached_payload = cache_manifest.read_bytes()
     cache_manifest.unlink()
     monkeypatch.setattr(core_files, "PointsDirectory", _ForbiddenPointsDirectory)
+    repair_calls = []
 
-    with pytest.raises(ValueError, match="FEREBUS row cache is missing or invalid"):
-        stg.stage_ferebus_inputs(
-            campaign,
-            config,
-            reference_data_version=0,
-        )
+    def repair(_campaign, view):
+        repair_calls.append(int(view.version))
+        cache_manifest.write_bytes(cached_payload)
 
-    assert not cache_manifest.exists()
+    monkeypatch.setattr(
+        ferebus_row_cache,
+        "ensure_cumulative_row_caches",
+        repair,
+    )
+
+    staging, n_tasks = stg.stage_ferebus_inputs(
+        campaign,
+        config,
+        reference_data_version=0,
+    )
+
+    assert repair_calls == [0]
+    assert cache_manifest.is_file()
+    assert staging.is_dir()
+    assert n_tasks == 3
+
+
+def test_stage_ferebus_inputs_preserves_incompatible_cache_namespace(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon import ferebus_row_cache
+    from ichor.hpc.active_learning.daemon.ferebus_row_cache import (
+        FEREBUS_FEATURE_CONTRACT,
+        FEREBUS_ROW_CACHE,
+        read_feature_contract,
+        row_cache_path,
+    )
+
+    campaign = tmp_path / "c"
+    config = CampaignConfig()
+    config.system_name = "WATER"
+    _prepare_bootstrap_training(campaign, config)
+    previous_contract = read_feature_contract(campaign)
+    previous_sha = str(previous_contract["contract_sha256"])
+    next_encoding_version = int(previous_contract["row_encoding_version"]) + 1
+    previous_cache = row_cache_path(campaign, previous_sha, 0)
+    assert (previous_cache / FEREBUS_ROW_CACHE).is_file()
+
+    monkeypatch.setattr(
+        ferebus_row_cache,
+        "FEREBUS_ROW_ENCODING_VERSION",
+        next_encoding_version,
+    )
+
+    staging, n_tasks = stg.stage_ferebus_inputs(
+        campaign,
+        config,
+        reference_data_version=0,
+    )
+
+    current_contract = read_feature_contract(campaign)
+    current_sha = str(current_contract["contract_sha256"])
+    assert current_sha != previous_sha
+    assert current_contract["row_encoding_version"] == next_encoding_version
+    assert (previous_cache / FEREBUS_ROW_CACHE).is_file()
+    assert (previous_cache.parent / FEREBUS_FEATURE_CONTRACT).is_file()
+    assert (
+        row_cache_path(campaign, current_sha, 0) / FEREBUS_ROW_CACHE
+    ).is_file()
+    assert staging.is_dir()
+    assert n_tasks == 3
 
 
 def test_model_bootstrap_stages_exact_historical_training_prefix(

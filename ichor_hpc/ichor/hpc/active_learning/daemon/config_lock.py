@@ -9,6 +9,7 @@ edits before ``reconcile --apply`` promotes a proposed recovery state.
 from __future__ import annotations
 
 import hashlib
+import os
 from ..strict_json import strict_json as json
 import shutil
 from dataclasses import dataclass, field
@@ -29,7 +30,7 @@ from .artifact_contracts import (
     verify_committed_reference_data_version,
 )
 from .filesystem import campaign_owned_path
-from .state import CampaignPhase, CampaignState, atomic_write_json
+from .state import CampaignPhase, CampaignState, _fsync_parent_dir, atomic_write_json
 
 
 CONFIG_LOCK_SCHEMA_VERSION = 3
@@ -1631,7 +1632,7 @@ def _archive_completed_model_iteration_staging(
     target: Path,
     proposed_state: CampaignState,
     *,
-    verification: str = "metadata",
+    verification: str = "authority",
     artifact_snapshot: Optional[Any] = None,
 ) -> Path:
     try:
@@ -1688,7 +1689,7 @@ def clean_model_iteration_staging_for_reconcile(
     campaign_dir: Union[str, Path],
     proposed_state: CampaignState,
     *,
-    verification: str = "metadata",
+    verification: str = "authority",
     artifact_snapshot: Optional[Any] = None,
 ) -> List[str]:
     campaign = Path(campaign_dir)
@@ -1705,7 +1706,7 @@ def _clean_model_iteration_staging_locked(
     campaign: Path,
     proposed_state: CampaignState,
     *,
-    verification: str = "metadata",
+    verification: str = "authority",
     artifact_snapshot: Optional[Any] = None,
 ) -> List[str]:
     model_versioning = TrainedModelVersioning(trained_models_dir(campaign))
@@ -1731,6 +1732,31 @@ def _clean_model_iteration_staging_locked(
     if not target.is_dir():
         raise ValueError("model iteration-staging is not a directory")
     _ensure_inside_campaign(campaign, target)
+    if verification == "authority":
+        if proposed_state.phase not in (
+            CampaignPhase.INITIAL_FEREBUS,
+            CampaignPhase.FEREBUS,
+        ):
+            model_version = int(proposed_state.models_version)
+            if model_version < 0:
+                raise ValueError(
+                    "models_version is negative; cannot verify committed model"
+                )
+            verify_committed_model_version(
+                campaign,
+                model_version,
+                verification="authority",
+                snapshot=artifact_snapshot,
+            )
+        archive = _reconcile_archive_target(
+            campaign,
+            _timestamped_reconcile_sibling(target),
+        )
+        os.replace(target, archive)
+        _fsync_parent_dir(target)
+        return archived_paths + [str(archive)]
+    if verification not in {"metadata", "deep"}:
+        raise ValueError("model staging verification level is invalid")
     try:
         from .live_executor import validate_ferebus_completed
 
@@ -1771,7 +1797,7 @@ def ferebus_reentry_can_archive_data_staging(
     campaign_dir: Union[str, Path],
     proposed_state: CampaignState,
     *,
-    verification: str = "metadata",
+    verification: str = "authority",
     artifact_snapshot: Optional[Any] = None,
 ) -> Tuple[bool, str]:
     if proposed_state.phase not in (CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS):
@@ -1800,7 +1826,7 @@ def archive_data_staging_for_ferebus_reentry(
     campaign_dir: Union[str, Path],
     proposed_state: CampaignState,
     *,
-    verification: str = "metadata",
+    verification: str = "authority",
     artifact_snapshot: Optional[Any] = None,
 ) -> List[str]:
     ok, reason = ferebus_reentry_can_archive_data_staging(
@@ -1833,8 +1859,10 @@ def archive_data_staging_for_ferebus_reentry(
             ),
         )
         suffix += 1
-    staging.rename(target)
+    os.replace(staging, target)
+    _fsync_parent_dir(staging)
     _reconcile_archive_target(campaign, staging).mkdir(parents=True, exist_ok=True)
+    _fsync_parent_dir(staging)
     return [str(target)]
 
 
@@ -1859,12 +1887,6 @@ def archive_data_staging_for_operator_reconcile(
     children = [p for p in staging.iterdir() if p.name not in (".", "..")]
     if not children:
         return []
-    for path in staging.rglob("*"):
-        if path.is_symlink():
-            raise ValueError(
-                "refusing to archive .DATA/STAGING containing symlink: "
-                + str(path)
-            )
     _ensure_inside_campaign(campaign, staging)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     target = _reconcile_archive_target(
@@ -1880,8 +1902,10 @@ def archive_data_staging_for_operator_reconcile(
             ),
         )
         suffix += 1
-    staging.rename(target)
+    os.replace(staging, target)
+    _fsync_parent_dir(staging)
     _reconcile_archive_target(campaign, staging).mkdir(parents=True, exist_ok=True)
+    _fsync_parent_dir(staging)
     return [str(target)]
 
 
@@ -1952,7 +1976,7 @@ def reference_data_staging_can_archive_for_reconcile(
     campaign_dir: Union[str, Path],
     proposed_state: CampaignState,
     *,
-    verification: str = "metadata",
+    verification: str = "authority",
     artifact_snapshot: Optional[Any] = None,
 ) -> Tuple[bool, str]:
     campaign = Path(campaign_dir)
@@ -2036,7 +2060,7 @@ def archive_reference_data_staging_for_reconcile(
     campaign_dir: Union[str, Path],
     proposed_state: CampaignState,
     *,
-    verification: str = "metadata",
+    verification: str = "authority",
     artifact_snapshot: Optional[Any] = None,
 ) -> List[str]:
     ok, reason = reference_data_staging_can_archive_for_reconcile(

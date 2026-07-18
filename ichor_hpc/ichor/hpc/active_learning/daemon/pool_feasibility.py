@@ -73,16 +73,35 @@ def _pool_frame_count(campaign_dir: str | Path) -> int:
     return int(TrajectoryPool.load(campaign_dir).n_frames())
 
 
+def _authoritative_pool_frame_count(campaign_dir: str | Path) -> int:
+    from ..acquisition.trajectory_pool import (
+        POOL_MANIFEST_FILENAME,
+        POOL_SUBDIR,
+        TrajectoryPoolManifest,
+    )
+    from ..strict_json import strict_json as json
+
+    path = Path(campaign_dir) / POOL_SUBDIR / POOL_MANIFEST_FILENAME
+    payload = json.loads(path.read_text(encoding="utf-8"), source=path)
+    return int(TrajectoryPoolManifest.from_dict(payload).n_frames)
+
+
 def evaluate_pool_feasibility(
     campaign_dir: str | Path,
     config: Any,
+    *,
+    verify_pool_payload: bool = True,
 ) -> PoolFeasibility:
     from ..custom_bootstrap import (
         custom_bootstrap_manifest_path,
         read_custom_bootstrap_manifest,
     )
 
-    pool_n = _pool_frame_count(campaign_dir)
+    pool_n = (
+        _pool_frame_count(campaign_dir)
+        if verify_pool_payload
+        else _authoritative_pool_frame_count(campaign_dir)
+    )
     bootstrap_manifest_path = custom_bootstrap_manifest_path(campaign_dir)
     if bootstrap_manifest_path.is_file() and not bootstrap_manifest_path.is_symlink():
         manifest = read_custom_bootstrap_manifest(campaign_dir)

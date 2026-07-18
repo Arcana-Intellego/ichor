@@ -826,7 +826,13 @@ def commit_reference_data_delta(
     return view, [entry.pointdir_name for entry in entries], True
 
 
-def classify_reference_commit(campaign_dir: Path, *, context: str, iteration: int) -> Dict[str, Any]:
+def classify_reference_commit(
+    campaign_dir: Path,
+    *,
+    context: str,
+    iteration: int,
+    verification: str = "metadata",
+) -> Dict[str, Any]:
     path = transaction_path(campaign_dir, context=context, iteration=iteration)
     if not path.is_file():
         return {"state": "absent", "path": str(path)}
@@ -849,15 +855,20 @@ def classify_reference_commit(campaign_dir: Path, *, context: str, iteration: in
         else:
             state = "published"
     elif staging.is_dir():
-        try:
-            _reconcile_move_states(Path(campaign_dir).resolve(), staging, ledger)
-        except Exception as exc:
-            return {
-                "state": "invalid",
-                "path": str(path),
-                "reason": type(exc).__name__ + ": " + str(exc),
-                "ledger": ledger,
-            }
+        if verification == "metadata":
+            try:
+                _reconcile_move_states(Path(campaign_dir).resolve(), staging, ledger)
+            except Exception as exc:
+                return {
+                    "state": "invalid",
+                    "path": str(path),
+                    "reason": type(exc).__name__ + ": " + str(exc),
+                    "ledger": ledger,
+                }
+        elif verification != "authority":
+            raise ValueError(
+                "reference-commit classification must use authority or metadata"
+            )
         moved = int(ledger["moved_points"])
         total = len(ledger["point_bindings"])
         if moved == 0:
@@ -877,7 +888,11 @@ def classify_reference_commit(campaign_dir: Path, *, context: str, iteration: in
     return result
 
 
-def inventory_reference_commits(campaign_dir: Path) -> List[Dict[str, Any]]:
+def inventory_reference_commits(
+    campaign_dir: Path,
+    *,
+    verification: str = "authority",
+) -> List[Dict[str, Any]]:
     """Classify every durable reference-commit transaction without mutation."""
     campaign = Path(campaign_dir).resolve()
     root = transaction_dir(campaign)
@@ -908,6 +923,7 @@ def inventory_reference_commits(campaign_dir: Path) -> List[Dict[str, Any]]:
                 campaign,
                 context=str(ledger["context"]),
                 iteration=int(ledger["iteration"]),
+                verification=verification,
             )
         except Exception as exc:
             record = {

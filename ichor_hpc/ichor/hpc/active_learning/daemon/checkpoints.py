@@ -431,7 +431,8 @@ def _resolve_checkpoint(value: Union[str, Path]) -> Tuple[Path, Path, Path]:
     return checkpoint, manifest_path, complete_path
 
 
-def verify_checkpoint(value: Union[str, Path]) -> Dict[str, Any]:
+def _verify_checkpoint_metadata(value: Union[str, Path]) -> Dict[str, Any]:
+    """Validate checkpoint authority without opening content-addressed objects."""
     checkpoint, manifest_path, complete_path = _resolve_checkpoint(value)
     manifest = _strict_json_file(manifest_path, label="checkpoint manifest")
     complete = _strict_json_file(complete_path, label="checkpoint completion record")
@@ -483,7 +484,6 @@ def verify_checkpoint(value: Union[str, Path]) -> Dict[str, Any]:
             raise ValueError("checkpoint manifest file mode is malformed")
         seen.add(relative)
         total_bytes += size
-        _verify_object(_object_path(store, digest_value), digest=digest_value, size=size)
     if total_bytes != int(manifest.get("total_bytes", -1)):
         raise ValueError("checkpoint manifest total byte count is invalid")
     return {
@@ -494,6 +494,68 @@ def verify_checkpoint(value: Union[str, Path]) -> Dict[str, Any]:
         "manifest_sha256": digest,
         "manifest": manifest,
         "complete": complete,
+    }
+
+
+def verify_checkpoint(value: Union[str, Path]) -> Dict[str, Any]:
+    verified = _verify_checkpoint_metadata(value)
+    store = Path(verified["store"])
+    for item in verified["manifest"]["files"]:
+        _verify_object(
+            _object_path(store, str(item["sha256"])),
+            digest=str(item["sha256"]),
+            size=int(item["size"]),
+        )
+    return verified
+
+
+def checkpoint_authority_status(
+    campaign_dir: Union[str, Path],
+    destination: Union[str, Path],
+) -> Dict[str, Any]:
+    """Read the current checkpoint chain without hashing stored payloads."""
+    state = read_state(Path(campaign_dir) / ".DATA" / "ACTIVE_LEARNING" / "state.json")
+    store = checkpoint_store(destination, str(state.campaign_uid))
+    current_path = store / "current.json"
+    if not current_path.exists():
+        return {
+            "schema_version": 1,
+            "campaign_uid": str(state.campaign_uid),
+            "store": str(store),
+            "status": "absent",
+            "current": None,
+        }
+    current = _strict_json_file(current_path, label="checkpoint current pointer")
+    if current.get("schema_version") != CHECKPOINT_CURRENT_SCHEMA_VERSION:
+        raise ValueError("checkpoint current pointer has an unsupported schema")
+    if str(current.get("campaign_uid") or "") != str(state.campaign_uid):
+        raise ValueError("checkpoint current pointer campaign UID mismatch")
+    iteration = current.get("iteration")
+    if isinstance(iteration, bool) or not isinstance(iteration, int) or iteration < 0:
+        raise ValueError("checkpoint current pointer iteration is malformed")
+    relative = current.get("manifest_path")
+    if not isinstance(relative, str) or not relative or "\\" in relative:
+        raise ValueError("checkpoint current pointer manifest path is malformed")
+    relative_path = Path(relative)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise ValueError("checkpoint current pointer manifest path is unsafe")
+    expected_relative = (
+        Path("checkpoints")
+        / ("iteration-" + str(iteration).zfill(6))
+        / "manifest.json"
+    )
+    if relative_path != expected_relative:
+        raise ValueError("checkpoint current pointer manifest path is non-canonical")
+    verified = _verify_checkpoint_metadata(store / relative_path)
+    if verified["manifest_sha256"] != str(current.get("manifest_sha256") or ""):
+        raise ValueError("checkpoint current pointer digest mismatch")
+    return {
+        "schema_version": 1,
+        "campaign_uid": str(state.campaign_uid),
+        "store": str(store),
+        "status": "authority_verified",
+        "current": current,
+        "checkpoint": verified,
     }
 
 
@@ -623,6 +685,7 @@ __all__ = [
     "CHECKPOINT_COMPLETE_SCHEMA_VERSION",
     "CHECKPOINT_CURRENT_SCHEMA_VERSION",
     "CHECKPOINT_MANIFEST_SCHEMA_VERSION",
+    "checkpoint_authority_status",
     "checkpoint_directory",
     "checkpoint_status",
     "checkpoint_store",

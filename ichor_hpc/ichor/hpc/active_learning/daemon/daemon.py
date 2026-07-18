@@ -299,6 +299,7 @@ class Daemon:
     # dry-run daemons never contact Slurm for accounting telemetry.
     resource_usage_collector: Optional[Callable[..., Dict[str, Any]]] = None
     scheduler_identity_kind: Optional[str] = None
+    environment_preflight_ok: bool = False
 
     #internal flags; not part of the public dataclass surface.
     _shutdown_requested: bool = field(default=False, init=False, repr=False)
@@ -1219,13 +1220,13 @@ class Daemon:
 
                 snapshot = build_committed_artifact_snapshot(
                     self.campaign_dir,
-                    verification_level="metadata",
+                    verification_level="authority",
                 )
                 verify_state_referenced_artifacts(
                     self.campaign_dir,
                     state,
                     strict_models=True,
-                    verification="metadata",
+                    verification="authority",
                     snapshot=snapshot,
                 )
                 return None
@@ -1258,24 +1259,22 @@ class Daemon:
         *,
         boundary: str,
     ) -> Optional[str]:
-        """Fail closed if an initialised campaign's execution bytes drifted."""
+        """Require the active generation pointer captured at daemon startup."""
         from ..execution_identity import (
             ExecutionIdentityError,
-            assert_environment_unchanged,
             execution_identity_path,
+            read_active_environment_generation,
         )
 
-        self._last_environment_binding = None
         identity_path = execution_identity_path(self.campaign_dir)
         if not identity_path.exists() and not identity_path.is_symlink():
             # Direct unit-level daemon construction remains supported.  The
             # public start path always creates the identity before execution.
             return None
         try:
-            status = assert_environment_unchanged(
+            active = read_active_environment_generation(
                 self.campaign_dir,
-                campaign_uid=str(state.campaign_uid),
-                config=self.config,
+                expected_campaign_uid=str(state.campaign_uid),
             )
         except (ExecutionIdentityError, OSError, ValueError) as exc:
             return self._halt_environment_drift(
@@ -1288,13 +1287,49 @@ class Daemon:
                 + ": "
                 + str(exc)[:200],
             )
-        self._last_environment_binding = {
-            "generation": int(status["generation"]),
+        observed = {
+            "generation": int(active["generation"]["generation"]),
             "generation_digest_sha256": str(
-                status["generation_digest_sha256"]
+                active["generation"]["digest_sha256"]
             ),
         }
+        if (
+            self._last_environment_binding is not None
+            and observed != self._last_environment_binding
+        ):
+            return self._halt_environment_drift(
+                state,
+                phase,
+                "active environment generation changed while the daemon was running",
+            )
+        self._last_environment_binding = observed
         return None
+
+    def _prepare_environment_generation(self, state: CampaignState) -> None:
+        """Capture once and automatically advance drift at a safe boundary."""
+        from ..execution_identity import (
+            advance_environment_generation,
+            execution_identity_path,
+            read_active_environment_generation,
+        )
+
+        identity_path = execution_identity_path(self.campaign_dir)
+        if not identity_path.exists() and not identity_path.is_symlink():
+            return
+        advance_environment_generation(
+            self.campaign_dir,
+            config=self.config,
+            live_preflight_ok=bool(self.environment_preflight_ok),
+            scheduler_ownership_clear=True,
+        )
+        active = read_active_environment_generation(
+            self.campaign_dir,
+            expected_campaign_uid=str(state.campaign_uid),
+        )["generation"]
+        self._last_environment_binding = {
+            "generation": int(active["generation"]),
+            "generation_digest_sha256": str(active["digest_sha256"]),
+        }
 
     def _verify_intent_environment_binding(
         self,
@@ -3324,8 +3359,8 @@ class Daemon:
             job_id=None if pending_job is None else str(pending_job),
             scheduler_uncertain=bool(pending_job),
             recovery_action=(
-                "inspect environment-status, preserve scheduler evidence, then "
-                "reconcile to an idle boundary before rebind-environment"
+                "preserve scheduler evidence, reconcile to a safe boundary, "
+                "then resume so the environment transition can be retried"
             ),
         )
         state.phase = CampaignPhase.HALTED
@@ -3476,18 +3511,18 @@ class Daemon:
 
             snapshot = build_committed_artifact_snapshot(
                 self.campaign_dir,
-                verification_level="metadata",
+                verification_level="authority",
             )
             verify_committed_reference_data_version(
                 self.campaign_dir,
                 reference_data_version,
-                verification="metadata",
+                verification="authority",
                 snapshot=snapshot,
             )
             verify_committed_model_version(
                 self.campaign_dir,
                 models_version,
-                verification="metadata",
+                verification="authority",
                 snapshot=snapshot,
             )
         except Exception as exc:
@@ -4155,6 +4190,18 @@ class Daemon:
                             file=sys.stderr,
                         )
                         return 2
+                    try:
+                        state = read_state(self.state_path())
+                        self._prepare_environment_generation(state)
+                    except Exception as exc:
+                        print(
+                            "automatic environment transition refused start: "
+                            + type(exc).__name__
+                            + ": "
+                            + str(exc),
+                            file=sys.stderr,
+                        )
+                        return 13
                     self._journal("daemon_started", pid=os.getpid())
                     if readiness_callback is not None:
                         readiness_callback()

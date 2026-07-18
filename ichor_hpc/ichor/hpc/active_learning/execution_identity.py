@@ -41,7 +41,7 @@ _REBINDABLE_REFERENCE_COMMIT_STATES = frozenset(
 )
 
 
-def _validate_ferebus_rebind_boundary(campaign: Path, state: Any) -> None:
+def _validate_ferebus_transition_boundary(campaign: Path, state: Any) -> None:
     """Require a clean, committed-data-only FEREBUS submission boundary."""
     from .daemon.recovery_contracts import phase_recovery_contract_error
     from .layout import qm_reference_data_dir, trained_models_dir
@@ -52,7 +52,7 @@ def _validate_ferebus_rebind_boundary(campaign: Path, state: Any) -> None:
     staging = trained_models_dir(campaign) / "iteration-staging"
     if staging.exists() or staging.is_symlink():
         raise ExecutionIdentityError(
-            "environment rebind at "
+            "environment transition at "
             + phase.value
             + " requires reconcile to archive TRAINED_MODELS/iteration-staging first"
         )
@@ -65,7 +65,7 @@ def _validate_ferebus_rebind_boundary(campaign: Path, state: Any) -> None:
         observed = (iteration, reference_version, model_version)
         if observed != expected:
             raise ExecutionIdentityError(
-                "INITIAL_FEREBUS environment rebind requires iteration/reference/model "
+                "INITIAL_FEREBUS environment transition requires iteration/reference/model "
                 "versions 0/0/-1"
             )
     elif phase is CampaignPhase.FEREBUS:
@@ -75,11 +75,11 @@ def _validate_ferebus_rebind_boundary(campaign: Path, state: Any) -> None:
             or model_version != reference_version - 1
         ):
             raise ExecutionIdentityError(
-                "FEREBUS environment rebind requires iteration N, reference version N, "
+                "FEREBUS environment transition requires iteration N, reference version N, "
                 "and incumbent model version N-1"
             )
     else:  # pragma: no cover - guarded by the caller
-        raise ExecutionIdentityError("invalid FEREBUS environment-rebind phase")
+        raise ExecutionIdentityError("invalid FEREBUS environment-transition phase")
 
     reference_current = ReferenceDataVersioning(
         qm_reference_data_dir(campaign)
@@ -90,15 +90,19 @@ def _validate_ferebus_rebind_boundary(campaign: Path, state: Any) -> None:
     expected_model_current = None if model_version < 0 else model_version
     if reference_current != reference_version or model_current != expected_model_current:
         raise ExecutionIdentityError(
-            "environment rebind at "
+            "environment transition at "
             + phase.value
             + " requires committed current pointers to match campaign state"
         )
 
-    contract_error = phase_recovery_contract_error(campaign, state)
+    contract_error = phase_recovery_contract_error(
+        campaign,
+        state,
+        verification="authority",
+    )
     if contract_error is not None:
         raise ExecutionIdentityError(
-            "environment rebind at "
+            "environment transition at "
             + phase.value
             + " failed its recovery contract: "
             + str(contract_error)
@@ -269,40 +273,89 @@ def _sha256_file(path: Path) -> Optional[str]:
 
 
 def _tree_hash(roots: Iterable[Path]) -> str:
-    digest = hashlib.sha256()
+    """Return a bounded source identity without traversing package trees."""
     resolved_roots = sorted(
-        (path.resolve() for path in roots),
+        {path.resolve() for path in roots if path.exists()},
         key=lambda item: str(item),
     )
-    for root_index, root in enumerate(resolved_roots):
-        if not root.is_dir():
+    repositories: Dict[str, Dict[str, Any]] = {}
+    fallback_roots: List[Dict[str, Any]] = []
+    package_distributions = importlib.metadata.packages_distributions()
+    for root in resolved_roots:
+        try:
+            repository_text = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=str(root),
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout.strip()
+            repository = Path(repository_text).resolve()
+            relative = root.relative_to(repository).as_posix()
+        except (OSError, ValueError, subprocess.SubprocessError):
+            distributions = sorted(
+                package_distributions.get(root.name, [])
+            )
+            fallback_roots.append(
+                {
+                    "root": str(root),
+                    "distributions": [
+                        {
+                            "name": name,
+                            "version": _distribution_version(name),
+                        }
+                        for name in distributions
+                    ],
+                    "initialiser_sha256": _sha256_file(root / "__init__.py"),
+                }
+            )
             continue
-        root_identity = (
-            str(root_index)
-            + ":"
-            + root.parent.name
-            + "/"
-            + root.name
+        key = str(repository)
+        record = repositories.setdefault(
+            key,
+            {
+                "repository": key,
+                "git": _git_identity(repository),
+                "package_roots": [],
+            },
         )
-        for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
-            if not path.is_file() or path.is_symlink() or "__pycache__" in path.parts:
-                continue
-            relative = path.relative_to(root).as_posix()
-            digest.update(root_identity.encode("utf-8"))
-            digest.update(b"\0")
-            digest.update(relative.encode("utf-8"))
-            digest.update(b"\0")
-            with path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-    return digest.hexdigest()
+        record["package_roots"].append(relative)
+    for record in repositories.values():
+        record["package_roots"] = sorted(set(record["package_roots"]))
+    payload = {
+        "repositories": [repositories[key] for key in sorted(repositories)],
+        "installed_roots": fallback_roots,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _git_identity(repo_root: Path) -> Dict[str, Any]:
-    result: Dict[str, Any] = {"commit": None, "tracked_tree_clean": None}
+    result: Dict[str, Any] = {
+        "commit": None,
+        "tree": None,
+        "tracked_tree_clean": None,
+        "tracked_diff_sha256": None,
+    }
     try:
         commit = subprocess.run(
             ["git", "rev-parse", "HEAD"],
+            cwd=str(repo_root),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.strip()
+        tree = subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"],
             cwd=str(repo_root),
             check=True,
             capture_output=True,
@@ -317,13 +370,52 @@ def _git_identity(repo_root: Path) -> Dict[str, Any]:
             text=True,
             timeout=10,
         ).stdout
+        diff = subprocess.run(
+            ["git", "diff", "--no-ext-diff", "--binary", "HEAD", "--"],
+            cwd=str(repo_root),
+            check=True,
+            capture_output=True,
+            timeout=10,
+        ).stdout
         result = {
             "commit": commit,
+            "tree": tree,
             "tracked_tree_clean": not bool(status.strip()),
+            "tracked_diff_sha256": hashlib.sha256(diff).hexdigest(),
         }
     except (OSError, subprocess.SubprocessError):
         pass
     return result
+
+
+def _git_repository_root(path: Path) -> Optional[Path]:
+    try:
+        text = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(Path(path)),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return Path(text).resolve() if text else None
+
+
+def _ichor_package_roots() -> List[Path]:
+    """Locate installed package roots without assuming an editable checkout."""
+    roots = set()
+    for import_name in ("ichor.core", "ichor.hpc", "ichor.cli"):
+        spec = importlib.util.find_spec(import_name)
+        if spec is None or spec.origin is None:
+            continue
+        origin = Path(spec.origin).resolve()
+        if origin.name == "__init__.py" and len(origin.parents) >= 2:
+            roots.add(origin.parents[1])
+        else:
+            roots.add(origin.parent)
+    return sorted(roots, key=lambda value: str(value))
 
 
 def _distribution_version(name: str) -> Optional[str]:
@@ -472,12 +564,13 @@ def capture_environment_generation(
 ) -> Dict[str, Any]:
     """Capture the exact Python/package/native identity for one generation."""
     campaign = Path(campaign_dir).resolve()
-    repo_root = Path(__file__).resolve().parents[4]
-    package_roots = [
-        repo_root / "ichor_core" / "ichor",
-        repo_root / "ichor_hpc" / "ichor",
-        repo_root / "ichor_cli" / "ichor",
-    ]
+    package_roots = _ichor_package_roots()
+    repo_root = _git_repository_root(Path(__file__).resolve().parent)
+    git_identity = (
+        _git_identity(repo_root)
+        if repo_root is not None
+        else _git_identity(Path(__file__).resolve().parent)
+    )
     payload: Dict[str, Any] = {
         "schema_version": ENVIRONMENT_GENERATION_SCHEMA_VERSION,
         "generation": int(generation),
@@ -487,7 +580,7 @@ def capture_environment_generation(
         "operator": os.environ.get("USER") or os.environ.get("USERNAME") or "",
         "python_executable": str(Path(sys.executable).resolve()),
         "python_version": platform.python_version(),
-        "ichor_git": _git_identity(repo_root),
+        "ichor_git": git_identity,
         "ichor_package_tree_sha256": _tree_hash(package_roots),
         "dependencies": _installed_dependencies(),
         "pyferebus": _module_identity("pyferebus"),
@@ -872,11 +965,6 @@ def ensure_execution_identity(
                 + "; requested "
                 + requested_mode
             )
-        assert_environment_unchanged(
-            campaign,
-            campaign_uid=str(campaign_uid),
-            config=config,
-        )
         return stored_mode, payload
 
     if requested_mode not in VALID_EXECUTION_MODES:
@@ -916,14 +1004,14 @@ def ensure_execution_identity(
     return str(requested_mode), payload
 
 
-def rebind_environment(
+def advance_environment_generation(
     campaign_dir: Union[str, Path],
     *,
     config: CampaignConfig,
     live_preflight_ok: bool = False,
     scheduler_ownership_clear: bool = False,
 ) -> Dict[str, Any]:
-    """Bind a campaign at a verified safe boundary to the current environment.
+    """Advance a drifted environment at a verified safe transition boundary.
 
     Generation publication is ordered so interruption remains fail-closed:
     write the immutable generation, clear derived reference scales in state,
@@ -937,102 +1025,6 @@ def rebind_environment(
         campaign,
         expected_campaign_uid=str(state.campaign_uid),
     )
-    if identity["mode"] == "live" and not bool(live_preflight_ok):
-        raise ExecutionIdentityError(
-            "live environment rebind requires a successful backend preflight"
-        )
-    if state.phase is CampaignPhase.REFERENCE_COMMIT:
-        from .daemon.reference_commit import classify_reference_commit
-
-        context = "bootstrap" if int(state.iteration) == 0 else "active"
-        reference_commit_recovery = classify_reference_commit(
-            campaign,
-            context=context,
-            iteration=int(state.iteration),
-        )
-        recovery_state = str(reference_commit_recovery.get("state") or "")
-        if recovery_state not in _REBINDABLE_REFERENCE_COMMIT_STATES:
-            detail = str(reference_commit_recovery.get("reason") or recovery_state)
-            raise ExecutionIdentityError(
-                "environment rebind at REFERENCE_COMMIT requires a valid "
-                "unpublished recovery transaction; observed "
-                + detail
-            )
-        ledger = reference_commit_recovery.get("ledger")
-        if not isinstance(ledger, Mapping):
-            raise ExecutionIdentityError(
-                "environment rebind at REFERENCE_COMMIT lacks a valid transaction ledger"
-            )
-        expected_reference_version = int(state.iteration) - 1
-        observed_identity = (
-            str(ledger.get("campaign_uid") or ""),
-            int(ledger.get("iteration", -1)),
-            int(ledger.get("reference_data_version", -1)),
-            str(ledger.get("context") or ""),
-            int(state.reference_data_version),
-        )
-        expected_identity = (
-            str(state.campaign_uid),
-            int(state.iteration),
-            int(state.iteration),
-            context,
-            expected_reference_version,
-        )
-        if observed_identity != expected_identity:
-            raise ExecutionIdentityError(
-                "environment rebind at REFERENCE_COMMIT found inconsistent "
-                "campaign, iteration, or reference-version identity"
-            )
-    elif state.phase in {CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS}:
-        _validate_ferebus_rebind_boundary(campaign, state)
-    elif state.phase not in {CampaignPhase.SEED_SELECT, CampaignPhase.DONE}:
-        raise ExecutionIdentityError(
-            "environment rebind requires an idle SEED_SELECT or DONE boundary, "
-            "a verified unpublished REFERENCE_COMMIT recovery transaction, or a "
-            "clean pre-submission FEREBUS retry boundary"
-        )
-    if any(value is not None for value in state.pending_jobs.values()):
-        raise ExecutionIdentityError(
-            "environment rebind is blocked by pending scheduler ownership"
-        )
-    if not bool(scheduler_ownership_clear):
-        raise ExecutionIdentityError(
-            "environment rebind requires a conclusive scheduler ownership check"
-        )
-
-    from .daemon.artifact_contracts import verify_state_referenced_artifacts
-    from .daemon.config_lock import review_config_changes
-    from .daemon.submission_intent import ACTIVE_STATUSES, inventory_intents
-
-    review = review_config_changes(
-        campaign,
-        config,
-        state,
-        initialise_missing=False,
-    )
-    if review.changed:
-        raise ExecutionIdentityError(
-            "campaign configuration differs from its lock; reconcile it before rebind"
-        )
-    inventory = inventory_intents(
-        campaign,
-        expected_campaign_uid=str(state.campaign_uid),
-    )
-    if inventory["errors"]:
-        raise ExecutionIdentityError(
-            "environment rebind is blocked by malformed submission intents"
-        )
-    active_intents = [
-        record
-        for record in inventory["records"]
-        if str(record.get("status")) in ACTIVE_STATUSES
-    ]
-    if active_intents:
-        raise ExecutionIdentityError(
-            "environment rebind is blocked by active submission intents"
-        )
-    verify_state_referenced_artifacts(campaign, state, strict_models=True)
-
     active = read_active_environment_generation(
         campaign,
         expected_campaign_uid=str(state.campaign_uid),
@@ -1055,6 +1047,129 @@ def rebind_environment(
             "generation_digest_sha256": str(active_generation["digest_sha256"]),
             "message": "active environment already matches the current process",
         }
+    if identity["mode"] == "live" and not bool(live_preflight_ok):
+        raise ExecutionIdentityError(
+            "automatic live environment transition requires a successful backend preflight"
+        )
+    if state.phase is CampaignPhase.REFERENCE_COMMIT:
+        from .daemon.reference_commit import classify_reference_commit
+
+        context = "bootstrap" if int(state.iteration) == 0 else "active"
+        reference_commit_recovery = classify_reference_commit(
+            campaign,
+            context=context,
+            iteration=int(state.iteration),
+            verification="authority",
+        )
+        recovery_state = str(reference_commit_recovery.get("state") or "")
+        if recovery_state not in _REBINDABLE_REFERENCE_COMMIT_STATES:
+            detail = str(reference_commit_recovery.get("reason") or recovery_state)
+            raise ExecutionIdentityError(
+                "environment transition at REFERENCE_COMMIT requires a valid "
+                "unpublished recovery transaction; observed "
+                + detail
+            )
+        ledger = reference_commit_recovery.get("ledger")
+        if not isinstance(ledger, Mapping):
+            raise ExecutionIdentityError(
+                "environment transition at REFERENCE_COMMIT lacks a valid transaction ledger"
+            )
+        expected_reference_version = int(state.iteration) - 1
+        observed_identity = (
+            str(ledger.get("campaign_uid") or ""),
+            int(ledger.get("iteration", -1)),
+            int(ledger.get("reference_data_version", -1)),
+            str(ledger.get("context") or ""),
+            int(state.reference_data_version),
+        )
+        expected_identity = (
+            str(state.campaign_uid),
+            int(state.iteration),
+            int(state.iteration),
+            context,
+            expected_reference_version,
+        )
+        if observed_identity != expected_identity:
+            raise ExecutionIdentityError(
+                "environment transition at REFERENCE_COMMIT found inconsistent "
+                "campaign, iteration, or reference-version identity"
+            )
+    elif state.phase in {CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS}:
+        _validate_ferebus_transition_boundary(campaign, state)
+    elif state.phase not in {
+        CampaignPhase.SEED_SELECT,
+        CampaignPhase.STOP_CHECK,
+        CampaignPhase.DONE,
+    }:
+        raise ExecutionIdentityError(
+            "environment transition requires an idle SEED_SELECT, STOP_CHECK or DONE "
+            "boundary, "
+            "a verified unpublished REFERENCE_COMMIT recovery transaction, or a "
+            "clean pre-submission FEREBUS retry boundary"
+        )
+    if any(value is not None for value in state.pending_jobs.values()):
+        raise ExecutionIdentityError(
+            "environment transition is blocked by pending scheduler ownership"
+        )
+    if not bool(scheduler_ownership_clear):
+        raise ExecutionIdentityError(
+            "environment transition requires a conclusive scheduler ownership check"
+        )
+
+    from .daemon.artifact_contracts import verify_state_referenced_artifacts
+    from .daemon.config_lock import review_config_changes
+    from .daemon.submission_intent import ACTIVE_STATUSES, inventory_intents
+    from .daemon.reconcile_transaction import inventory_reconcile_transactions
+
+    review = review_config_changes(
+        campaign,
+        config,
+        state,
+        initialise_missing=False,
+    )
+    if review.changed:
+        raise ExecutionIdentityError(
+            "campaign configuration differs from its lock; reconcile it before restart"
+        )
+    inventory = inventory_intents(
+        campaign,
+        expected_campaign_uid=str(state.campaign_uid),
+    )
+    if inventory["errors"]:
+        raise ExecutionIdentityError(
+            "environment transition is blocked by malformed submission intents"
+        )
+    active_intents = [
+        record
+        for record in inventory["records"]
+        if str(record.get("status")) in ACTIVE_STATUSES
+    ]
+    if active_intents:
+        raise ExecutionIdentityError(
+            "environment transition is blocked by active submission intents"
+        )
+    active_reconcile_transactions = [
+        record
+        for record in inventory_reconcile_transactions(campaign)
+        if str(record.get("status") or "") not in {"COMMITTED", "FAILED"}
+    ]
+    if active_reconcile_transactions:
+        raise ExecutionIdentityError(
+            "environment transition is blocked by an incomplete reconcile transaction"
+        )
+    from .daemon.artifact_snapshot import build_committed_artifact_snapshot
+
+    snapshot = build_committed_artifact_snapshot(
+        campaign,
+        verification_level="authority",
+    )
+    verify_state_referenced_artifacts(
+        campaign,
+        state,
+        strict_models=True,
+        verification="authority",
+        snapshot=snapshot,
+    )
 
     generation_number = int(candidate["generation"])
     generations_root = environment_generations_dir(campaign)
@@ -1090,19 +1205,6 @@ def rebind_environment(
     state.reference_scales_iteration = -1
     state.reference_scales_models_version = -1
     state.reference_scales_model_manifest_sha256 = None
-    from .daemon.ferebus_row_cache import (
-        clear_row_caches,
-        ensure_cumulative_row_caches,
-    )
-
-    clear_row_caches(campaign)
-    if int(state.reference_data_version) >= 0:
-        from .versioning.reference_data import ReferenceDataVersioning
-
-        reference_view = ReferenceDataVersioning(
-            campaign / "QM_REFERENCE_DATA"
-        ).resolve(int(state.reference_data_version), verification="metadata")
-        ensure_cumulative_row_caches(campaign, reference_view)
     write_state(operational_path(campaign, "state.json"), state)
 
     current = {
@@ -1117,7 +1219,7 @@ def rebind_environment(
 
         append_event(
             operational_path(campaign, "journal.ndjson"),
-            "environment_rebound",
+            "environment_generation_advanced",
             max_bytes=int(config.runtime.journal_max_bytes),
             retained_files=int(config.runtime.journal_retained_files),
             lock_timeout_seconds=int(config.runtime.ledger_lock_timeout_seconds),
@@ -1143,19 +1245,34 @@ def rebind_environment(
     }
 
 
+def rebind_environment(
+    campaign_dir: Union[str, Path],
+    *,
+    config: CampaignConfig,
+    live_preflight_ok: bool = False,
+    scheduler_ownership_clear: bool = False,
+) -> Dict[str, Any]:
+    """Compatibility wrapper for internal callers; no CLI command exposes it."""
+    return advance_environment_generation(
+        campaign_dir,
+        config=config,
+        live_preflight_ok=live_preflight_ok,
+        scheduler_ownership_clear=scheduler_ownership_clear,
+    )
+
+
 __all__ = [
     "ENVIRONMENT_GENERATION_SCHEMA_VERSION",
     "EXECUTION_IDENTITY_SCHEMA_VERSION",
     "ExecutionIdentityError",
     "VALID_EXECUTION_MODES",
     "assert_environment_unchanged",
+    "advance_environment_generation",
     "capture_environment_generation",
-    "environment_status",
     "ensure_execution_identity",
     "environment_current_path",
     "environment_generations_dir",
     "execution_identity_path",
     "read_active_environment_generation",
     "read_execution_identity",
-    "rebind_environment",
 ]

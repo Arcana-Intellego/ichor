@@ -36,6 +36,7 @@ __all__ = [
     "append_event",
     "iter_events",
     "read_events",
+    "tail_events",
 ]
 
 
@@ -163,6 +164,7 @@ KNOWN_EVENT_TYPES = (
     "daemon_lease_heartbeat_recovered",
     "environment_drift_halted",
     "environment_rebound",
+    "environment_generation_advanced",
     "ariadne_seed_provenance_repaired",
     "ariadne_seed_provenance_staged",
     "ariadne_stale_outputs_quarantined",
@@ -435,6 +437,67 @@ def iter_events(journal_path: Union[str, Path]) -> Iterator[Dict[str, Any]]:
                 ) from exc
             yield record
             offset += len(line)
+
+
+def tail_events(
+    journal_path: Union[str, Path],
+    *,
+    max_records: int = 4096,
+    max_bytes: int = 2 * 1024 * 1024,
+) -> List[Dict[str, Any]]:
+    """Return a bounded, validated tail without replaying complete segments."""
+    if isinstance(max_records, bool) or not isinstance(max_records, int) or max_records <= 0:
+        raise ValueError("journal tail max_records must be a positive integer")
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
+        raise ValueError("journal tail max_bytes must be a positive integer")
+    current = Path(journal_path)
+    remaining = int(max_bytes)
+    collected: List[List[Dict[str, Any]]] = []
+    for segment in reversed(_journal_segments(current)):
+        if remaining <= 0:
+            break
+        if segment.is_symlink() or not segment.is_file():
+            raise JournalCorruptionError(segment, 0, 0, "segment is not a regular file")
+        size = int(segment.stat().st_size)
+        read_size = min(size, remaining)
+        start = size - read_size
+        with open(segment, "rb") as handle:
+            handle.seek(start)
+            raw = handle.read(read_size)
+        remaining -= len(raw)
+        if start:
+            separator = raw.find(b"\n")
+            raw = b"" if separator < 0 else raw[separator + 1 :]
+        lines = raw.splitlines(keepends=True)
+        records: List[Dict[str, Any]] = []
+        for line_number, line in enumerate(lines, start=1):
+            terminated = line.endswith((b"\n", b"\r"))
+            body = line.strip()
+            if not body:
+                continue
+            try:
+                record = json.loads(body.decode("utf-8"))
+                if not isinstance(record, dict):
+                    raise ValueError("journal record must be a JSON object")
+                event = record.get("event")
+                if not isinstance(event, str) or not event:
+                    raise ValueError("journal event must be a non-empty string")
+                _parse_timestamp(record.get("ts"), "journal event timestamp")
+            except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+                if segment == current and line_number == len(lines) and not terminated:
+                    break
+                raise JournalCorruptionError(
+                    segment,
+                    line_number,
+                    start,
+                    type(exc).__name__ + ": " + str(exc),
+                ) from exc
+            records.append(record)
+        collected.append(records)
+        if sum(len(group) for group in collected) >= max_records:
+            break
+    ordered = [record for group in reversed(collected) for record in group]
+    return ordered[-max_records:]
 
 
 def read_events(

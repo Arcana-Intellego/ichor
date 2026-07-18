@@ -613,6 +613,53 @@ def test_campaign_preflight_validates_every_slurm_phase_resource_contract(
     )
 
 
+def test_campaign_preflight_uses_checkpoint_authority_not_payload_verification(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon import checkpoints
+
+    campaign = _campaign_with_config(tmp_path)
+    destination = tmp_path / "checkpoint-store"
+    destination.mkdir()
+    config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+    config.retention.checkpoint_destination = str(destination)
+    config.retention.checkpoint_required = True
+    config.to_yaml(campaign / "campaign.yaml")
+    state = fresh_campaign_state(max_iterations=2)
+    _write_locked_state(campaign, state)
+    store = checkpoints.checkpoint_store(destination, str(state.campaign_uid))
+    store.mkdir(parents=True)
+    (store / "current.json").write_text("{}\n", encoding="utf-8")
+    authority_calls = []
+    monkeypatch.setattr(
+        cli_mod,
+        "_pool_feasibility_summary",
+        lambda _campaign, _config: _pool_feasibility_payload(),
+    )
+    monkeypatch.setattr(
+        checkpoints,
+        "checkpoint_authority_status",
+        lambda *args, **kwargs: authority_calls.append((args, kwargs))
+        or {"status": "authority_verified"},
+    )
+    monkeypatch.setattr(
+        checkpoints,
+        "checkpoint_status",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("preflight invoked deep checkpoint verification")
+        ),
+    )
+
+    payload = cli_mod.evaluate_campaign_preflight(
+        campaign,
+        avail=_backend_availability(),
+    )
+
+    assert payload["ready"] is True
+    assert len(authority_calls) == 1
+
+
 def test_cli_preflight_json_prints_single_payload(tmp_path, capsys, monkeypatch):
     campaign = _campaign_with_config(tmp_path)
     state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
@@ -814,7 +861,7 @@ def test_live_job_name_rejects_control_characters_and_caps_length():
     assert "\n" not in name
 
 
-def test_recovery_dashboard_reports_trajectory_pool_sha_mismatch(tmp_path):
+def test_recovery_dashboard_uses_pool_authority_without_hashing_payload(tmp_path):
     from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
 
     campaign = _campaign_with_config(tmp_path)
@@ -837,7 +884,8 @@ def test_recovery_dashboard_reports_trajectory_pool_sha_mismatch(tmp_path):
     text = cli_mod.format_recovery_dashboard(campaign)
 
     assert "Trajectory pool" in text
-    assert "pool drift detected" in text
+    assert "authority sha=" in text
+    assert "pool drift detected" not in text
 
 
 def test_journal_list_event_types_does_not_require_journal_file(tmp_path, capsys):
@@ -871,6 +919,50 @@ def test_cli_status_json_prints_state_payload(tmp_path, capsys):
     assert payload["state_artifact_contract_status"]["ok"] is True
     assert payload["recommendations"][0]["code"] == "phase_init_ready"
     assert payload["next_action"] == payload["recommendations"][0]["primary"]
+
+
+def test_cli_status_reads_recorded_environment_without_live_capture(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning import execution_identity
+
+    campaign = _campaign_with_config(tmp_path)
+    (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state(max_iterations=2)
+    write_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME, state)
+    config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+    execution_identity.ensure_execution_identity(
+        campaign,
+        campaign_uid=str(state.campaign_uid),
+        config=config,
+        requested_mode="dry_run",
+    )
+    transition_time = "2026-07-18T12:34:56+00:00"
+    append_event(
+        campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
+        "environment_generation_advanced",
+        ts=transition_time,
+        generation=0,
+    )
+
+    def refuse_live_capture(*_args, **_kwargs):
+        raise AssertionError("status attempted to capture the live environment")
+
+    monkeypatch.setattr(
+        execution_identity,
+        "capture_environment_generation",
+        refuse_live_capture,
+    )
+
+    rc = main(["status", "--campaign-dir", str(campaign), "--json"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    environment = payload["active_environment_generation"]
+    assert environment["generation"] == 0
+    assert environment["last_transition"] == transition_time
 
 
 def test_cli_status_init_hides_not_due_committed_artifact_errors(tmp_path, capsys):
@@ -2457,13 +2549,15 @@ def test_cli_reconcile_json_outputs_machine_readable_decision(tmp_path, capsys):
     assert rc == 0
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
     assert payload["campaign_dir"] == str(campaign)
     assert payload["proposed_state_path"].endswith("state.json.proposed")
     assert "selected_phase" in payload
     assert "hard_blockers" in payload
     assert "next_command" in payload
-    assert payload["verification"]["level"] == "metadata"
+    assert payload["verification"]["level"] == "authority"
+    assert payload["verification"]["recursive_scan"] is False
+    assert payload["verification"]["payload_hashing"] is False
     assert payload["verification"]["payload_files_hashed"] == 0
     assert "Proposed state written" not in captured.out
     assert "Scientific payload hashing: disabled" in captured.err

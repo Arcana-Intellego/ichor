@@ -254,19 +254,20 @@ def _parse_file_record(
     expected_size = _safe_int(payload.get("size"), label + ".size", minimum=0)
     expected_sha = _safe_sha(payload.get("sha256"), label + ".sha256")
     path = root.joinpath(*PurePosixPath(relative).parts)
-    current = root
-    for part in PurePosixPath(relative).parts:
-        current = current / part
-        if current.exists() and current.is_symlink():
-            raise TrainedModelError(label + " contains a symlink: " + str(current))
-    if not path.is_file() or path.is_symlink():
-        raise TrainedModelError(label + " is missing: " + str(path))
-    try:
-        path.resolve().relative_to(root.resolve())
-    except ValueError as exc:
-        raise TrainedModelError(label + " escapes the model version") from exc
-    if int(path.stat().st_size) != expected_size:
-        raise TrainedModelError(label + " size mismatch: " + str(path))
+    if verification != "authority":
+        current = root
+        for part in PurePosixPath(relative).parts:
+            current = current / part
+            if current.exists() and current.is_symlink():
+                raise TrainedModelError(label + " contains a symlink: " + str(current))
+        if not path.is_file() or path.is_symlink():
+            raise TrainedModelError(label + " is missing: " + str(path))
+        try:
+            path.resolve().relative_to(root.resolve())
+        except ValueError as exc:
+            raise TrainedModelError(label + " escapes the model version") from exc
+        if int(path.stat().st_size) != expected_size:
+            raise TrainedModelError(label + " size mismatch: " + str(path))
     if verification == "deep":
         observed_sha = (
             digest_file(path, True)
@@ -277,7 +278,7 @@ def _parse_file_record(
             raise TrainedModelError(label + " SHA-256 mismatch: " + str(path))
     return TrainedModelFile(
         relative_path=relative,
-        path=path.resolve(),
+        path=(path.absolute() if verification == "authority" else path.resolve()),
         size=expected_size,
         sha256=expected_sha,
     )
@@ -1005,8 +1006,10 @@ def validate_trained_model_snapshot(
     require_directory_manifest: bool = False,
 ) -> TrainedModelSet:
     """Validate one unpublished full snapshot before its atomic rename."""
-    if verification not in {"metadata", "deep"}:
-        raise ValueError("trained-model verification must be metadata or deep")
+    if verification not in {"authority", "metadata", "deep"}:
+        raise ValueError(
+            "trained-model verification must be authority, metadata or deep"
+        )
     campaign = Path(campaign_dir)
     root = Path(version_root)
     expected_version = _safe_int(version, "models_version", minimum=0)
@@ -1137,12 +1140,52 @@ def validate_trained_model_snapshot(
         payload.get("evidence_set_sha256"), "evidence_set_sha256"
     ) != canonical_json_sha256(_evidence_set_identity(payload)):
         raise TrainedModelError("trained-model evidence-set SHA mismatch")
-    _validate_exact_inventory(
-        root,
-        tasks,
-        root_files,
-        require_directory_manifest=require_directory_manifest,
-    )
+    if verification == "authority":
+        directory_manifest = read_manifest(root)
+        expected_records = {
+            record.relative_path: record.sha256
+            for record in root_files
+        }
+        for task in tasks:
+            task_records = (
+                task.model,
+                task.config,
+                task.execution_receipt,
+                *task.datasets.values(),
+                *(
+                    record
+                    for record in task.auxiliary.values()
+                    if record is not None
+                ),
+            )
+            for record in task_records:
+                expected_records[record.relative_path] = record.sha256
+        expected_records[TRAINED_MODEL_SET_FILENAME] = sha256_file(
+            trained_model_set_path(root)
+        )
+        if directory_manifest != expected_records:
+            unexpected = sorted(set(directory_manifest) - set(expected_records))
+            missing = sorted(set(expected_records) - set(directory_manifest))
+            mismatched = sorted(
+                path
+                for path in set(directory_manifest) & set(expected_records)
+                if directory_manifest[path] != expected_records[path]
+            )
+            raise TrainedModelError(
+                "trained-model authority manifest mismatch: unexpected="
+                + repr(unexpected)
+                + " missing="
+                + repr(missing)
+                + " mismatched="
+                + repr(mismatched)
+            )
+    else:
+        _validate_exact_inventory(
+            root,
+            tasks,
+            root_files,
+            require_directory_manifest=require_directory_manifest,
+        )
     _validate_source_and_quality(root, payload, tasks, reference_view)
     return TrainedModelSet(
         version=expected_version,
@@ -1176,8 +1219,10 @@ def resolve_trained_model_chain(
     digest_file: Optional[Callable[[Path, bool], str]] = None,
     resolved_models_out: Optional[List[TrainedModelSet]] = None,
 ) -> Tuple[TrainedModelSet, ...]:
-    if verification not in {"metadata", "deep"}:
-        raise ValueError("trained-model verification must be metadata or deep")
+    if verification not in {"authority", "metadata", "deep"}:
+        raise ValueError(
+            "trained-model verification must be authority, metadata or deep"
+        )
     campaign = Path(campaign_dir)
     root = (
         Path(trained_models_root)
@@ -1250,15 +1295,19 @@ def resolve_trained_model_set(
     trained_models_root: Optional[Union[str, Path]] = None,
     reference_verification: Optional[str] = None,
 ) -> TrainedModelSet:
-    if verification not in {"metadata", "deep"}:
-        raise ValueError("trained-model verification must be metadata or deep")
+    if verification not in {"authority", "metadata", "deep"}:
+        raise ValueError(
+            "trained-model verification must be authority, metadata or deep"
+        )
     reference_level = (
         verification
         if reference_verification is None
         else str(reference_verification)
     )
-    if reference_level not in {"metadata", "deep"}:
-        raise ValueError("reference-data verification must be metadata or deep")
+    if reference_level not in {"authority", "metadata", "deep"}:
+        raise ValueError(
+            "reference-data verification must be authority, metadata or deep"
+        )
     target_version = _safe_int(models_version, "models_version", minimum=0)
     campaign = Path(campaign_dir)
     reference_views = resolve_reference_data_chain(

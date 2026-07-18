@@ -16,12 +16,16 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, field
 from ..strict_json import strict_json as json
+import os
 from pathlib import Path
-import shutil
 from typing import Any, Dict, List, Optional, Union
-import uuid
 
-from ..acquisition.trajectory_pool import TrajectoryPool
+from ..acquisition.trajectory_pool import (
+    POOL_MANIFEST_FILENAME,
+    POOL_SUBDIR,
+    POOL_XYZ_FILENAME,
+    TrajectoryPoolManifest,
+)
 from ..versioning.reference_data import ReferenceDataVersioning
 from ..versioning.trained_models import TrainedModelVersioning
 from ..layout import (
@@ -38,7 +42,7 @@ from .artifact_snapshot import (
     CommittedArtifactSnapshot,
     build_committed_artifact_snapshot,
 )
-from .journal import iter_events
+from .journal import tail_events
 from .filesystem import campaign_owned_path
 from .recovery_contracts import (
     RecoveryDecision,
@@ -59,10 +63,10 @@ from .state import (
     CampaignState,
     DEFAULT_STATE_FILENAME,
     StateSchemaError,
+    _fsync_parent_dir,
     fresh_campaign_state,
     make_lifecycle_context,
     read_state,
-    atomic_write_text,
     write_state,
 )
 
@@ -154,7 +158,7 @@ def data_staging_inventory(campaign_dir: Union[str, Path]) -> Dict[str, Any]:
         payload["top_level_count"] = len(children)
         payload["top_level_entries"] = [p.name for p in children[:10]]
         mtimes: List[float] = []
-        for path in [staging] + list(staging.rglob("*")):
+        for path in [staging] + children:
             try:
                 st = path.lstat()
             except OSError:
@@ -229,7 +233,7 @@ def stateful_campaign_artifacts(campaign_dir: Union[str, Path]) -> List[str]:
     journal_path = campaign / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson"
     if journal_path.is_file():
         try:
-            for event in iter_events(journal_path):
+            for event in tail_events(journal_path):
                 if str(event.get("event", "")) in stateful_journal_events:
                     findings.append(".DATA/ACTIVE_LEARNING/journal.ndjson")
                     break
@@ -256,21 +260,11 @@ def stateful_campaign_artifacts(campaign_dir: Union[str, Path]) -> List[str]:
         for path in sorted(staging.iterdir()):
             findings.append(str(path.relative_to(campaign)))
     scripts = campaign / ".DATA" / "SCRIPTS"
-    if scripts.is_dir():
-        for path in sorted(scripts.glob("*.sh")):
-            findings.append(str(path.relative_to(campaign)))
-        jobs = scripts / "JOBS"
-        if jobs.is_dir():
-            for path in sorted(jobs.rglob("job.sh")):
-                findings.append(str(path.relative_to(campaign)))
+    if scripts.is_dir() and any(scripts.iterdir()):
+        findings.append(".DATA/SCRIPTS")
     scratch = campaign / ".DATA" / "SCRATCH"
-    if scratch.is_dir():
-        scratch_tasks = sorted(scratch.rglob("TASK.json"))
-        if scratch_tasks:
-            for path in scratch_tasks:
-                findings.append(str(path.relative_to(campaign)))
-        elif any(scratch.iterdir()):
-            findings.append(".DATA/SCRATCH")
+    if scratch.is_dir() and any(scratch.iterdir()):
+        findings.append(".DATA/SCRATCH")
     return findings
 
 
@@ -381,7 +375,9 @@ def _trajectory_pool_unsafe_reason(exc: Exception) -> str:
         if "pool xyz" in msg:
             return "trajectory pool missing"
         return "trajectory pool missing"
-    if isinstance(exc, RuntimeError) and "pool drift detected" in msg:
+    if "SHA mismatch" in msg or (
+        isinstance(exc, RuntimeError) and "pool drift detected" in msg
+    ):
         return "trajectory pool SHA mismatch"
     if isinstance(exc, ValueError):
         if "natoms" in msg or "atom_types" in msg or "masses" in msg:
@@ -390,7 +386,11 @@ def _trajectory_pool_unsafe_reason(exc: Exception) -> str:
     return "trajectory pool unreadable"
 
 
-def _scripts_inventory(campaign: Path) -> Dict[str, Any]:
+def _scripts_inventory(
+    campaign: Path,
+    *,
+    intent_records: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> Dict[str, Any]:
     scripts = campaign / ".DATA" / "SCRIPTS"
     payload: Dict[str, Any] = {
         "path": str(scripts),
@@ -412,96 +412,67 @@ def _scripts_inventory(campaign: Path) -> Dict[str, Any]:
         payload["error"] = ".DATA/SCRIPTS exists but is not a directory"
         return payload
     try:
-        symlinks = sorted(
-            [path for path in scripts.rglob("*") if path.is_symlink()],
-            key=lambda path: str(path.relative_to(scripts)),
-        )
-        payload["has_symlink"] = bool(symlinks)
-        payload["symlink_entries"] = [
-            str(path.relative_to(campaign)) for path in symlinks[:20]
-        ]
-        files = sorted(
-            [p for p in scripts.rglob("*") if p.is_file() and not p.is_symlink()],
-            key=lambda p: str(p.relative_to(scripts)),
-        )
-        payload["count"] = len(files)
+        if scripts.is_symlink():
+            payload["has_symlink"] = True
+            payload["symlink_entries"] = [str(scripts.relative_to(campaign))]
+            return payload
+        legacy_scripts = [path for path in scripts.glob("*.sh") if path.is_file()]
+        payload["legacy_flat_script_count"] = len(legacy_scripts)
+        payload["count"] = len(legacy_scripts)
         payload["sample"] = [
-            str(p.relative_to(campaign))
-            for p in files[:5]
+            str(path.relative_to(campaign)) for path in legacy_scripts[:5]
         ]
-        payload["legacy_flat_script_count"] = len(
-            [path for path in scripts.glob("*.sh") if path.is_file()]
-        )
-        intent_status_by_identity: Dict[str, str] = {}
-        intents_root = campaign / ".DATA" / "ACTIVE_LEARNING" / "submission_intents"
-        if intents_root.is_dir() and not intents_root.is_symlink():
-            for intent_path in sorted(intents_root.glob("*.json")):
-                try:
-                    intent_payload = json.loads(
-                        intent_path.read_text(encoding="utf-8")
-                    )
-                except (OSError, ValueError):
-                    continue
-                if not isinstance(intent_payload, dict):
-                    continue
-                identity = str(intent_payload.get("submission_identity") or "")
-                if identity:
-                    intent_status_by_identity[identity] = str(
-                        intent_payload.get("status") or ""
-                    )
         bundles = []
-        jobs_root = scripts / "JOBS"
-        if jobs_root.is_dir() and not jobs_root.is_symlink():
-            for job_script in sorted(jobs_root.rglob("job.sh")):
-                if job_script.is_symlink() or not job_script.is_file():
-                    continue
-                try:
-                    backend, phase, iteration_token, identity, filename = (
-                        job_script.relative_to(jobs_root).parts
-                    )
-                except ValueError:
-                    payload["invalid_bundle_entries"].append(
-                        str(job_script.relative_to(campaign))
-                    )
-                    continue
-                if filename != "job.sh":
-                    continue
-                bundle = job_script.parent
-                outputs = bundle / "OUTPUTS"
-                errors = bundle / "ERRORS"
-                if (
-                    outputs.is_symlink()
-                    or errors.is_symlink()
-                    or not outputs.is_dir()
-                    or not errors.is_dir()
-                ):
-                    payload["invalid_bundle_entries"].append(
-                        str(bundle.relative_to(campaign))
-                    )
-                    continue
-                output_count = (
-                    len([path for path in outputs.iterdir() if path.is_file()])
-                    if outputs.is_dir() and not outputs.is_symlink()
-                    else 0
-                )
-                error_count = (
-                    len([path for path in errors.iterdir() if path.is_file()])
-                    if errors.is_dir() and not errors.is_symlink()
-                    else 0
-                )
-                bundles.append(
-                    {
-                        "backend": backend,
-                        "phase": phase,
-                        "iteration": iteration_token,
-                        "submission_identity": identity,
-                        "path": str(bundle.relative_to(campaign)),
-                        "intent_status": intent_status_by_identity.get(identity),
-                        "output_log_count": output_count,
-                        "error_log_count": error_count,
-                        "has_array_task_map": (bundle / "array_task_map.json").is_file(),
-                    }
-                )
+        records: Sequence[Mapping[str, Any]]
+        if intent_records is None:
+            intent_inventory = _submission_intent.inventory_intents(campaign)
+            records = tuple(intent_inventory.get("records", []))
+        else:
+            records = tuple(intent_records)
+        for intent_payload in records:
+            if not isinstance(intent_payload, Mapping):
+                continue
+            identity = str(intent_payload.get("submission_identity") or "")
+            script_text = str(intent_payload.get("submitted_script_path") or "")
+            if not identity or not script_text:
+                continue
+            try:
+                script_path = Path(script_text)
+                if not script_path.is_absolute():
+                    script_path = campaign / script_path
+                script_path = campaign_owned_path(campaign, script_path)
+                script_relative = script_path.relative_to(campaign.absolute())
+            except (OSError, ValueError):
+                payload["invalid_bundle_entries"].append(script_text)
+                continue
+            parts = script_relative.parts
+            if (
+                len(parts) != 8
+                or tuple(parts[:3]) != (".DATA", "SCRIPTS", "JOBS")
+                or parts[-1] != "job.sh"
+            ):
+                payload["invalid_bundle_entries"].append(script_relative.as_posix())
+                continue
+            backend, phase, iteration_token, bundle_identity = parts[3:7]
+            if bundle_identity != identity:
+                payload["invalid_bundle_entries"].append(script_relative.as_posix())
+                continue
+            bundles.append(
+                {
+                    "backend": backend,
+                    "phase": phase,
+                    "iteration": iteration_token,
+                    "submission_identity": bundle_identity,
+                    "path": script_relative.parent.as_posix(),
+                    "intent_status": str(intent_payload.get("status") or ""),
+                    "output_log_count": None,
+                    "error_log_count": None,
+                    "has_array_task_map": None,
+                }
+            )
+            payload["count"] = int(payload["count"]) + 1
+            if len(payload["sample"]) < 5:
+                payload["sample"].append(script_relative.as_posix())
         payload["attempt_bundle_count"] = len(bundles)
         payload["attempt_bundles"] = bundles
     except Exception as exc:
@@ -587,8 +558,11 @@ def _read_bootstrap_handoff_at(
     *,
     expected_iteration: int,
     archived: bool,
+    verification_level: str = "authority",
 ) -> Optional[Dict[str, Any]]:
     from .input_staging import (
+        QUANTUM_ACCEPTANCE_SCHEMA_VERSION,
+        _validate_pointdir_basename,
         quantum_acceptance_manifest_path,
         read_quantum_acceptance_manifest,
     )
@@ -610,6 +584,76 @@ def _read_bootstrap_handoff_at(
         CampaignPhase.INITIAL_AIMALL.value,
     }:
         return None
+    if verification_level == "authority":
+        phase_path = quantum_acceptance_manifest_path(
+            initial,
+            phase_name=phase,
+        )
+        try:
+            manifest = _json.loads(
+                phase_path.read_text(encoding="utf-8"),
+                source=phase_path,
+            )
+            if not isinstance(manifest, dict):
+                raise ValueError("quantum acceptance manifest must be an object")
+            if manifest.get("schema_version") != QUANTUM_ACCEPTANCE_SCHEMA_VERSION:
+                raise ValueError("unsupported quantum acceptance manifest schema")
+            if manifest.get("phase") != phase:
+                raise ValueError("quantum acceptance manifest phase mismatch")
+            iteration = manifest.get("iteration")
+            if (
+                isinstance(iteration, bool)
+                or not isinstance(iteration, int)
+                or iteration != int(expected_iteration)
+            ):
+                raise ValueError("quantum acceptance manifest iteration mismatch")
+            accepted = manifest.get("accepted_pointdirs")
+            rejected = manifest.get("rejected", [])
+            n_total = manifest.get("n_total")
+            if not isinstance(accepted, list) or not accepted:
+                raise ValueError("quantum acceptance accepted list is invalid")
+            if not isinstance(rejected, list):
+                raise ValueError("quantum acceptance rejected list is invalid")
+            if (
+                isinstance(n_total, bool)
+                or not isinstance(n_total, int)
+                or n_total != len(accepted) + len(rejected)
+            ):
+                raise ValueError("quantum acceptance total is invalid")
+            accepted_names = [
+                _validate_pointdir_basename(value) for value in accepted
+            ]
+            rejected_names = []
+            for record in rejected:
+                if not isinstance(record, dict) or set(record) != {
+                    "pointdir",
+                    "reason",
+                }:
+                    raise ValueError("quantum rejection record is invalid")
+                rejected_names.append(
+                    _validate_pointdir_basename(record.get("pointdir"))
+                )
+                if not isinstance(record.get("reason"), str) or not str(
+                    record.get("reason")
+                ).strip():
+                    raise ValueError("quantum rejection reason is invalid")
+            dispositions = accepted_names + rejected_names
+            if len(dispositions) != len(set(dispositions)):
+                raise ValueError("quantum acceptance dispositions are duplicated")
+        except Exception:
+            return None
+        return {
+            "path": str(initial),
+            "manifest_path": str(phase_path),
+            "phase": phase,
+            "iteration": int(iteration),
+            "n_total": int(n_total),
+            "accepted_count": len(accepted_names),
+            "archived": bool(archived),
+            "campaign_uid": str(manifest.get("campaign_uid") or ""),
+        }
+    if verification_level not in {"metadata", "deep"}:
+        raise ValueError("bootstrap handoff verification level is invalid")
     try:
         pointdirs, manifest = read_quantum_acceptance_manifest(
             initial,
@@ -636,12 +680,14 @@ def _find_bootstrap_handoff(
     campaign_dir: Union[str, Path],
     *,
     iteration: int,
+    verification_level: str = "authority",
 ) -> Optional[Dict[str, Any]]:
     campaign = Path(campaign_dir)
     live = _read_bootstrap_handoff_at(
         campaign / ".DATA" / "STAGING" / "initial",
         expected_iteration=int(iteration),
         archived=False,
+        verification_level=verification_level,
     )
     if live is not None:
         return live
@@ -660,27 +706,68 @@ def _find_bootstrap_handoff(
             archive / "initial",
             expected_iteration=int(iteration),
             archived=True,
+            verification_level=verification_level,
         )
         if handoff is not None:
             return handoff
     return None
 
 
-def _find_phase_a_handoff(campaign_dir: Union[str, Path]) -> Optional[Dict[str, Any]]:
+def _find_phase_a_handoff(
+    campaign_dir: Union[str, Path],
+    *,
+    verification_level: str = "authority",
+) -> Optional[Dict[str, Any]]:
     from ..handoff_manifests import (
+        PHASE_A_SAMPLE_SCHEMA_VERSION,
         phase_a_sample_manifest_path,
         read_phase_a_sample_manifest,
     )
     from ..layout import bootstrap_selection_dir
 
     initial = bootstrap_selection_dir(Path(campaign_dir))
-    try:
-        manifest = read_phase_a_sample_manifest(initial, require_nonempty=True)
-    except Exception:
-        return None
+    manifest_path = phase_a_sample_manifest_path(initial)
+    if verification_level == "authority":
+        try:
+            manifest = json.loads(
+                manifest_path.read_text(encoding="utf-8"),
+                source=manifest_path,
+            )
+            if not isinstance(manifest, dict):
+                raise ValueError("Phase A sample manifest must be an object")
+            if manifest.get("schema_version") != PHASE_A_SAMPLE_SCHEMA_VERSION:
+                raise ValueError("unsupported Phase A sample manifest schema")
+            if manifest.get("phase") != CampaignPhase.PHASE_A_DIVERSITY.value:
+                raise ValueError("Phase A sample manifest phase mismatch")
+            iteration = manifest.get("iteration")
+            n_select = manifest.get("n_select")
+            selected = manifest.get("selected_indices")
+            if iteration != 0:
+                raise ValueError("Phase A iteration must be zero")
+            if (
+                isinstance(n_select, bool)
+                or not isinstance(n_select, int)
+                or n_select <= 0
+            ):
+                raise ValueError("Phase A n_select is invalid")
+            if not isinstance(selected, list) or len(selected) != n_select:
+                raise ValueError("Phase A selected index count is invalid")
+            from ..sampling.diversity_contract import selector_contract_matches
+
+            if not selector_contract_matches(manifest.get("selector")):
+                raise ValueError("Phase A selector contract is invalid")
+        except Exception:
+            return None
+    elif verification_level in {"metadata", "deep"}:
+        try:
+            manifest = read_phase_a_sample_manifest(initial, require_nonempty=True)
+        except Exception:
+            return None
+    else:
+        raise ValueError("Phase A handoff verification level is invalid")
     return {
         "path": str(initial),
-        "manifest_path": str(phase_a_sample_manifest_path(initial)),
+        "manifest_path": str(manifest_path),
         "phase": CampaignPhase.PHASE_A_DIVERSITY.value,
         "iteration": 0,
         "n_select": int(manifest.get("n_select", 0)),
@@ -712,22 +799,14 @@ def restore_archived_bootstrap_handoff(
         raise FileNotFoundError("archived bootstrap handoff is missing: " + str(source))
     if source.is_symlink():
         raise ValueError("refusing to restore symlinked bootstrap handoff: " + str(source))
-    for path in source.rglob("*"):
-        if path.is_symlink():
-            raise ValueError(
-                "refusing to restore bootstrap handoff containing symlink: "
-                + str(path)
-            )
-    from .input_staging import read_quantum_acceptance_manifest
-
-    source_pointdirs, _manifest = read_quantum_acceptance_manifest(
+    source_evidence = _read_bootstrap_handoff_at(
         source,
-        expected_phase=phase,
         expected_iteration=iteration,
-        require_nonempty=True,
-        require_points_file_membership=False,
+        archived=True,
+        verification_level="authority",
     )
-    pointdir_names = [path.name for path in source_pointdirs]
+    if source_evidence is None or str(source_evidence.get("phase")) != phase:
+        raise ValueError("archived bootstrap authority evidence is invalid")
     if target.exists():
         if target.is_symlink():
             raise ValueError("refusing to restore over symlinked .DATA/STAGING/initial")
@@ -741,35 +820,23 @@ def restore_archived_bootstrap_handoff(
             )
         target.rmdir()
     campaign_owned_path(campaign, target.parent).mkdir(parents=True, exist_ok=True)
-    temporary = campaign_owned_path(
-        campaign,
-        target.with_name(target.name + ".restore-" + uuid.uuid4().hex),
-    )
-    created_target = False
     try:
-        shutil.copytree(str(source), str(temporary), symlinks=False)
-        points_body = "\n".join(
-            str((target / name).resolve(strict=False))
-            for name in pointdir_names
-        )
-        atomic_write_text(
-            temporary / "POINTS.txt",
-            points_body + ("\n" if points_body else ""),
-        )
-        temporary.replace(target)
-        created_target = True
-        read_quantum_acceptance_manifest(
+        os.replace(source, target)
+        _fsync_parent_dir(source)
+        _fsync_parent_dir(target)
+        restored = _read_bootstrap_handoff_at(
             target,
-            expected_phase=phase,
             expected_iteration=iteration,
-            require_nonempty=True,
-            require_points_file_membership=True,
+            archived=False,
+            verification_level="authority",
         )
+        if restored is None or str(restored.get("phase")) != phase:
+            raise ValueError("restored bootstrap authority evidence is invalid")
     except Exception:
-        if temporary.exists():
-            shutil.rmtree(str(temporary), ignore_errors=False)
-        if created_target and target.exists():
-            shutil.rmtree(str(target), ignore_errors=False)
+        if target.exists() and not source.exists():
+            os.replace(target, source)
+            _fsync_parent_dir(target)
+            _fsync_parent_dir(source)
         raise
     return [str(target)]
 
@@ -807,7 +874,7 @@ def _trusted_campaign_uid_sources(
             view = (
                 artifact_snapshot.reference_view(int(version))
                 if artifact_snapshot is not None
-                else reference_versions.resolve(int(version), verification="metadata")
+                else reference_versions.resolve(int(version), verification="authority")
             )
         except Exception:
             continue
@@ -818,7 +885,7 @@ def _trusted_campaign_uid_sources(
             model_set = (
                 artifact_snapshot.model_set(int(version))
                 if artifact_snapshot is not None
-                else model_versions.resolve(int(version), verification="metadata")
+                else model_versions.resolve(int(version), verification="authority")
             )
         except Exception:
             continue
@@ -865,7 +932,7 @@ def _validate_recovered_state_contract(
     *,
     bootstrap_handoff: Optional[Dict[str, Any]] = None,
     phase_a_handoff: Optional[Dict[str, Any]] = None,
-    verification: str = "metadata",
+    verification: str = "authority",
     artifact_snapshot: Optional[CommittedArtifactSnapshot] = None,
 ) -> None:
     phase = CampaignPhase(state.phase)
@@ -931,7 +998,7 @@ def propose_recovery(
     allow_fresh_init_on_nonempty: bool = False,
     _active_reconcile_transaction_id: Optional[str] = None,
     artifact_snapshot: Optional[CommittedArtifactSnapshot] = None,
-    verification_level: str = "metadata",
+    verification_level: str = "authority",
     progress_stream: Optional[Any] = None,
 ) -> ReconciliationReport:
     """Inspect the campaign tree and propose a recovered CampaignState.
@@ -1078,8 +1145,10 @@ def propose_recovery(
         mv = []
         notes.append("models dir " + models_dir_name + " missing")
 
-    if verification_level not in {"metadata", "deep"}:
-        raise ValueError("reconcile verification must be metadata or deep")
+    if verification_level not in {"authority", "metadata", "deep"}:
+        raise ValueError(
+            "reconcile verification must be authority, metadata or deep"
+        )
     if artifact_snapshot is not None:
         if artifact_snapshot.verification_level != verification_level:
             raise ValueError(
@@ -1118,7 +1187,7 @@ def propose_recovery(
     journal_path = data / "journal.ndjson"
     if journal_path.exists():
         try:
-            for event in iter_events(journal_path):
+            for event in tail_events(journal_path):
                 phase_hint = _journal_phase_hint(event)
                 if phase_hint:
                     last_phase = str(phase_hint["phase"])
@@ -1139,11 +1208,23 @@ def propose_recovery(
     # Bootstrap is the only sampling transaction that uses iteration zero.
     # A stale active-loop state must never redirect recovery away from it.
     bootstrap_iteration = 0
-    bootstrap_handoff = _find_bootstrap_handoff(
-        campaign,
-        iteration=bootstrap_iteration,
+    bootstrap_handoff = (
+        None
+        if tv or mv
+        else _find_bootstrap_handoff(
+            campaign,
+            iteration=bootstrap_iteration,
+            verification_level=verification_level,
+        )
     )
-    phase_a_handoff = _find_phase_a_handoff(campaign)
+    phase_a_handoff = (
+        None
+        if tv or mv
+        else _find_phase_a_handoff(
+            campaign,
+            verification_level=verification_level,
+        )
+    )
     initial_handoff_indicated = _initial_aimall_handoff_indicated(
         existing=existing,
         last_phase=last_phase,
@@ -1152,42 +1233,28 @@ def propose_recovery(
         initial_handoff_indicated = True
 
     active_intents: List[Dict[str, Any]] = []
-    intent_root = _submission_intent.intent_dir(campaign)
-    if intent_root.is_dir():
-        for p in sorted(intent_root.glob("*.json")):
-            try:
-                stem = p.stem
-                matches = [
-                    phase.value
-                    for phase in CampaignPhase
-                    if stem.startswith(phase.value + "-")
-                ]
-                if len(matches) != 1:
-                    raise ValueError("intent filename has no unique phase identity")
-                phase_name = matches[0]
-                iteration_text = stem[len(phase_name) + 1 :]
-                if len(iteration_text) != 6 or not iteration_text.isdigit():
-                    raise ValueError("intent filename iteration is invalid")
-                payload = _submission_intent.load_intent(
-                    campaign,
-                    phase_name,
-                    int(iteration_text),
-                )
-                if payload is None:
-                    raise ValueError("intent disappeared during inventory")
-            except Exception as exc:
-                unsafe_reasons.append(
-                    "malformed submission intent: "
-                    + str(p)
-                    + ": "
-                    + type(exc).__name__
-                    + ": "
-                    + str(exc)[:160]
-                )
-                blocking_artifacts.append("malformed submission intent")
-                continue
-            if str(payload.get("status")) in _submission_intent.ACTIVE_STATUSES:
-                active_intents.append(payload)
+    if artifact_snapshot is not None:
+        intent_records = getattr(artifact_snapshot, "submission_intents", ())
+        intent_errors = getattr(
+            artifact_snapshot,
+            "submission_intent_errors",
+            (),
+        )
+    else:
+        intent_inventory = _submission_intent.inventory_intents(campaign)
+        intent_records = tuple(intent_inventory.get("records", []))
+        intent_errors = tuple(intent_inventory.get("errors", []))
+    for error in intent_errors:
+        unsafe_reasons.append(
+            "malformed submission intent: "
+            + str(error.get("path") or "unknown")
+            + ": "
+            + str(error.get("error") or "invalid intent")[:180]
+        )
+        blocking_artifacts.append("malformed submission intent")
+    for payload in intent_records:
+        if str(payload.get("status")) in _submission_intent.ACTIVE_STATUSES:
+            active_intents.append(dict(payload))
     active_intents.sort(
         key=lambda item: (
             str(item.get("updated_at_iso") or item.get("updated_iso") or ""),
@@ -1195,13 +1262,48 @@ def propose_recovery(
             int(item.get("iteration") or 0),
         )
     )
-    from .scratch import inventory as scratch_inventory_records
-    from .reconcile_transaction import inventory_reconcile_transactions
-    from .reference_commit import inventory_reference_commits
+    scratch_inventory = [
+        {
+            "status": "prepared",
+            "path": str(intent.get("scratch_path_template") or ""),
+            "phase": str(intent.get("phase") or ""),
+            "iteration": int(intent.get("iteration") or 0),
+            "job_id": str(intent.get("job_id") or "PRE_SUBMIT"),
+            "submission_identity": str(
+                intent.get("submission_identity") or ""
+            ),
+            "source": "submission_intent",
+        }
+        for intent in active_intents
+    ]
+    if artifact_snapshot is not None:
+        reconcile_transactions = [
+            dict(record)
+            for record in getattr(
+                artifact_snapshot,
+                "reconcile_transactions",
+                (),
+            )
+        ]
+        reference_commit_transactions = [
+            dict(record)
+            for record in getattr(
+                artifact_snapshot,
+                "reference_commit_transactions",
+                (),
+            )
+        ]
+    else:
+        from .reconcile_transaction import inventory_reconcile_transactions
+        from .reference_commit import inventory_reference_commits
 
-    scratch_inventory = scratch_inventory_records(campaign)
-    reconcile_transactions = inventory_reconcile_transactions(campaign)
-    reference_commit_transactions = inventory_reference_commits(campaign)
+        reconcile_transactions = inventory_reconcile_transactions(campaign)
+        reference_commit_transactions = inventory_reference_commits(
+            campaign,
+            verification=(
+                "authority" if verification_level == "authority" else "metadata"
+            ),
+        )
     invalid_reference_commits = [
         record
         for record in reference_commit_transactions
@@ -1345,7 +1447,10 @@ def propose_recovery(
             if str(path.resolve(strict=False)) not in protected_reference_source_paths
         ]
     scripts_root = campaign / ".DATA" / "SCRIPTS"
-    script_inventory = _scripts_inventory(campaign)
+    script_inventory = _scripts_inventory(
+        campaign,
+        intent_records=intent_records,
+    )
     # Persistent attempt bundles under SCRIPTS/JOBS are immutable operational
     # evidence, not stale re-entry artefacts. Only legacy flat scripts retain
     # the old reconcile-cleanable meaning.
@@ -1389,7 +1494,11 @@ def propose_recovery(
     has_model_iteration_staging = model_iteration_staging.is_dir()
     recoverable_ferebus_staging = False
     recoverable_ferebus_reason = ""
-    if has_model_iteration_staging and not model_iteration_staging.is_symlink():
+    if (
+        verification_level != "authority"
+        and has_model_iteration_staging
+        and not model_iteration_staging.is_symlink()
+    ):
         try:
             from .ferebus_quality import validate_ferebus_quality_evidence
             from .live_executor import validate_ferebus_completed
@@ -1407,6 +1516,11 @@ def propose_recovery(
             )
         except Exception as exc:
             recoverable_ferebus_reason = type(exc).__name__ + ": " + str(exc)[:180]
+    elif has_model_iteration_staging:
+        recoverable_ferebus_reason = (
+            "unpublished FEREBUS staging is non-authoritative and will be "
+            "archived before retry"
+        )
 
     if active_intents:
         unsafe_reasons.append(
@@ -1619,11 +1733,24 @@ def propose_recovery(
         has_model_iteration_staging=has_model_iteration_staging,
     ):
         try:
-            pool = TrajectoryPool.load(campaign)
-            if pool.manifest.natoms <= 0:
+            manifest_path = campaign / POOL_SUBDIR / POOL_MANIFEST_FILENAME
+            manifest_payload = json.loads(
+                manifest_path.read_text(encoding="utf-8"),
+                source=manifest_path,
+            )
+            manifest = TrajectoryPoolManifest.from_dict(manifest_payload)
+            expected_pool = (campaign / POOL_XYZ_FILENAME).absolute()
+            if Path(manifest.canonical_path).absolute() != expected_pool:
+                raise ValueError("pool manifest canonical path does not match campaign")
+            if manifest.natoms <= 0:
                 raise ValueError("pool natoms must be positive")
+            if verification_level == "deep":
+                from ..versioning.manifest import sha256_file
+
+                if sha256_file(expected_pool) != str(manifest.sha256):
+                    raise ValueError("trajectory pool SHA mismatch")
             trusted_artifacts.append(
-                "trajectory pool SHA " + str(pool.sha256)[:12]
+                "trajectory pool authority SHA " + str(manifest.sha256)[:12]
             )
         except Exception as exc:
             reason = _trajectory_pool_unsafe_reason(exc)

@@ -2170,8 +2170,12 @@ def stage_ferebus_inputs(
     from ..versioning.reference_data import ReferenceDataVersioning
     from .ferebus_row_cache import (
         FEREBUS_ROW_CACHE,
+        FEREBUS_ROW_ENCODING_VERSION,
+        ensure_cumulative_row_caches,
+        ensure_feature_contract,
         feature_contract_path,
         load_cumulative_rows,
+        read_feature_contract,
         row_cache_path,
         system_alf_from_contract,
     )
@@ -2182,16 +2186,31 @@ def stage_ferebus_inputs(
     view = reference_data.resolve(version, verification="index")
     if not view.entries:
         raise ValueError("committed QM reference data contains no pointdirs")
+    active_contract = read_feature_contract(campaign)
+    if int(active_contract["row_encoding_version"]) != int(
+        FEREBUS_ROW_ENCODING_VERSION
+    ):
+        ensure_feature_contract(
+            campaign,
+            config,
+            view.entries[0].pointdir_path,
+        )
     try:
         feature_contract, cumulative_rows, cache_identities = load_cumulative_rows(
             campaign,
             version,
         )
-    except Exception as exc:
-        raise ValueError(
-            "FEREBUS row cache is missing or invalid; resume REFERENCE_COMMIT, "
-            "restore the checkpoint again, or rebind the environment"
-        ) from exc
+    except Exception:
+        try:
+            ensure_cumulative_row_caches(campaign, view)
+            feature_contract, cumulative_rows, cache_identities = (
+                load_cumulative_rows(campaign, version)
+            )
+        except Exception as exc:
+            raise ValueError(
+                "FEREBUS row cache is missing or invalid and lazy "
+                "reconstruction from committed reference data failed"
+            ) from exc
     expected_cache_identities = [
         (entry.pointdir_name, entry.source_pointdir, entry.candidate_id)
         for entry in view.entries

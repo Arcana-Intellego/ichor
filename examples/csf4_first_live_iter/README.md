@@ -347,27 +347,20 @@ ichor-al-daemon start --campaign-dir . --mode live --max-ticks 2000
 ```
 
 The first start creates immutable execution identity and environment-generation
-records. Inspect them at any time without changing campaign state:
-
-```bash
-ichor-al-daemon environment-status --campaign-dir .
-```
+records. Normal status shows the recorded active generation without inspecting
+the current package installation.
 
 If Python packages, ICHOR source, ARIADNE, FEREBUS, modules, native-library
-paths or the active machine profile change, the daemon halts before submission
-or postprocess and preserves scheduler ownership. Restore the original
-environment to finish already-submitted work. Rebind only at an idle
-`SEED_SELECT` or `DONE` boundary, after reconcile reports no active or
-inconclusive scheduler ownership and live preflight passes:
+paths or the active machine profile change, the next guarded reconcile,
+start or resume automatically records a new environment generation at a safe
+transition boundary. Active or scheduler-inconclusive jobs, active submission
+intents and incomplete publications block the transition with an explicit
+reason. Already-submitted work remains bound to its original generation.
 
-```bash
-ichor-al-daemon rebind-environment --campaign-dir .
-ichor-al-daemon rebind-environment --campaign-dir . --apply
-```
-
-Rebinding starts a new calibration eligibility window and invalidates derived
-acquisition reference scales. Never use it to postprocess a job submitted under
-an earlier environment generation.
+An automatic transition starts a new calibration eligibility window and
+invalidates active derived acquisition reference scales. FEREBUS row caches
+remain on disk and are reused only when their feature-contract and row-encoding
+identities still match.
 
 The second preflight command is an explicit commissioning gate. It submits one
 five-minute, one-core job which imports the configured daemon stack and resolves

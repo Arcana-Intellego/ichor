@@ -65,8 +65,10 @@ def verify_committed_reference_data_version(
     snapshot: Optional[Any] = None,
 ) -> None:
     try:
-        if verification not in {"metadata", "deep"}:
-            raise ValueError("committed artefact verification must be metadata or deep")
+        if verification not in {"authority", "metadata", "deep"}:
+            raise ValueError(
+                "committed artefact verification must be authority, metadata or deep"
+            )
         if snapshot is not None:
             if verification == "deep" and snapshot.verification_level != "deep":
                 raise ValueError("deep verification requires a deep artefact snapshot")
@@ -100,8 +102,10 @@ def verify_committed_model_version(
     snapshot: Optional[Any] = None,
 ) -> None:
     try:
-        if verification not in {"metadata", "deep"}:
-            raise ValueError("committed artefact verification must be metadata or deep")
+        if verification not in {"authority", "metadata", "deep"}:
+            raise ValueError(
+                "committed artefact verification must be authority, metadata or deep"
+            )
         if snapshot is not None:
             if verification == "deep" and snapshot.verification_level != "deep":
                 raise ValueError("deep verification requires a deep artefact snapshot")
@@ -112,20 +116,23 @@ def verify_committed_model_version(
                 int(version),
                 verification=verification,
                 trained_models_root=Path(campaign_dir) / models_dir_name,
-                reference_verification="metadata",
+                reference_verification=(
+                    "authority" if verification == "authority" else "metadata"
+                ),
             )
         if expected_campaign_uid is not None and model_set.campaign_uid != str(
             expected_campaign_uid
         ):
             raise ValueError("trained-model campaign UID does not match state")
-        from .model_contract import validate_ferebus_model_contract
+        if verification != "authority":
+            from .model_contract import validate_ferebus_model_contract
 
-        validate_ferebus_model_contract(
-            model_set.root,
-            committed=True,
-            expected_version=int(version),
-            trained_model_set=model_set,
-        )
+            validate_ferebus_model_contract(
+                model_set.root,
+                committed=True,
+                expected_version=int(version),
+                trained_model_set=model_set,
+            )
     except Exception as exc:
         raise CommittedArtifactError(
             "models_version_invalid:"
@@ -258,7 +265,11 @@ def verify_state_referenced_artifacts(
                 + ", models_version="
                 + str(model_version)
             )
-    if strict_models and min(train_version, model_version) >= 0:
+    if (
+        verification != "authority"
+        and strict_models
+        and min(train_version, model_version) >= 0
+    ):
         completed_through = min(train_version, model_version)
         if phase is CampaignPhase.STOP_CHECK and int(state.iteration) == completed_through:
             completed_through -= 1

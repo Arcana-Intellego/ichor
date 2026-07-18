@@ -1,5 +1,6 @@
 """Tests for ichor.hpc.active_learning.daemon.reconcile."""
 import json
+import os
 import shutil
 from dataclasses import replace
 from pathlib import Path
@@ -1213,6 +1214,74 @@ def test_propose_recovery_finds_committed_reference_data_versions(tmp_path):
     assert any("trajectory pool" in r for r in report.unsafe_reasons)
 
 
+def test_authority_recovery_never_uses_recursive_filesystem_walkers(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, _, _, _ = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_reference_versions(campaign, (0,))
+
+    def refuse_recursive_walk(*_args, **_kwargs):
+        raise AssertionError("authority recovery attempted a recursive walk")
+
+    monkeypatch.setattr(Path, "rglob", refuse_recursive_walk)
+    monkeypatch.setattr(os, "walk", refuse_recursive_walk)
+
+    report = propose_recovery(campaign, verification_level="authority")
+
+    assert report.committed_reference_data_versions == [0]
+    assert report.valid_reference_data_versions == [0]
+    assert report.proposed_state.phase is CampaignPhase.INITIAL_FEREBUS
+    assert report.deep_verification_required is True
+
+
+def test_authority_recovery_reuses_control_inventory_from_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon import (
+        reconcile_transaction,
+        reference_commit,
+        submission_intent,
+    )
+    from ichor.hpc.active_learning.daemon.artifact_snapshot import (
+        build_committed_artifact_snapshot,
+    )
+
+    campaign, _, _, _ = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_reference_versions(campaign, (0,))
+    snapshot = build_committed_artifact_snapshot(
+        campaign,
+        verification_level="authority",
+    )
+
+    def refuse_second_inventory(*_args, **_kwargs):
+        raise AssertionError("recovery re-read authority control records")
+
+    monkeypatch.setattr(submission_intent, "inventory_intents", refuse_second_inventory)
+    monkeypatch.setattr(
+        reconcile_transaction,
+        "inventory_reconcile_transactions",
+        refuse_second_inventory,
+    )
+    monkeypatch.setattr(
+        reference_commit,
+        "inventory_reference_commits",
+        refuse_second_inventory,
+    )
+
+    report = propose_recovery(
+        campaign,
+        artifact_snapshot=snapshot,
+        verification_level="authority",
+    )
+
+    assert report.valid_reference_data_versions == [0]
+    assert report.artifact_snapshot is snapshot
+
+
 def test_propose_recovery_reports_decision_and_trusted_versions(tmp_path):
     campaign, _, training, models = _campaign_dirs(tmp_path)
     mv = VersionedDirectory(models)
@@ -1456,7 +1525,7 @@ def test_propose_recovery_prefers_phase_b_over_stale_seed_select(tmp_path, monke
     assert "valid Phase B handoff" in report.decision
 
 
-def test_recovery_rejects_phase_b_geometry_drift_even_when_hash_is_rewritten(
+def test_phase_b_geometry_drift_requires_deep_reconcile_verification(
     tmp_path,
     monkeypatch,
 ):
@@ -1490,11 +1559,14 @@ def test_recovery_rejects_phase_b_geometry_drift_even_when_hash_is_rewritten(
     manifest["selected_xyz"]["sha256"] = sha256_file(selected)
     atomic_write_json(manifest_path, manifest)
 
-    report = propose_recovery(campaign)
+    authority_report = propose_recovery(campaign)
+    deep_report = propose_recovery(campaign, verification_level="deep")
 
-    assert report.proposed_state.phase is CampaignPhase.PHASE_B_DIVERSITY
-    assert "valid Phase B handoff" not in report.decision
-    assert "valid ARIADNE results handoff" in report.decision
+    assert authority_report.proposed_state.phase is CampaignPhase.SPLIT
+    assert "valid Phase B handoff" in authority_report.decision
+    assert deep_report.proposed_state.phase is CampaignPhase.PHASE_B_DIVERSITY
+    assert "valid Phase B handoff" not in deep_report.decision
+    assert "valid ARIADNE results handoff" in deep_report.decision
 
 
 def test_propose_recovery_prefers_split_over_stale_phase_b(tmp_path, monkeypatch):
@@ -1685,7 +1757,7 @@ def test_propose_recovery_halts_on_multiple_valid_staging_handoffs(tmp_path, mon
     assert ".DATA/STAGING is non-empty" not in report.unsafe_reasons
 
 
-def test_propose_recovery_blocks_trajectory_pool_sha_drift(tmp_path):
+def test_authority_recovery_defers_trajectory_pool_payload_drift_to_deep(tmp_path):
     campaign, _, training, models = _campaign_dirs(tmp_path)
     _write_pool(campaign)
     mv = VersionedDirectory(models)
@@ -1698,21 +1770,31 @@ def test_propose_recovery_blocks_trajectory_pool_sha_drift(tmp_path):
     with pool_xyz.open("a", encoding="utf-8") as f:
         f.write("# drift\n")
 
-    report = propose_recovery(campaign)
+    authority_report = propose_recovery(campaign)
+    deep_report = propose_recovery(campaign, verification_level="deep")
 
-    assert report.proposed_state.phase is CampaignPhase.HALTED
-    assert any("trajectory pool SHA mismatch" in r for r in report.unsafe_reasons)
-    assert "trajectory pool" in report.blocking_artifacts
+    assert not any(
+        "trajectory pool SHA mismatch" in reason
+        for reason in authority_report.unsafe_reasons
+    )
+    assert deep_report.proposed_state.phase is CampaignPhase.HALTED
+    assert any(
+        "trajectory pool SHA mismatch" in reason
+        for reason in deep_report.unsafe_reasons
+    )
+    assert "trajectory pool" in deep_report.blocking_artifacts
 
 
-def test_propose_recovery_reports_unmanifested_committed_pointdir(tmp_path):
+def test_deep_recovery_reports_unmanifested_committed_pointdir(tmp_path):
     campaign, _, training, _ = _campaign_dirs(tmp_path)
     _commit_reference_versions(campaign, (0,))
     v = VersionedDirectory(training)
     rogue = v.iteration_path(0) / "POINT_9999.pointdir"
     rogue.mkdir()
     (rogue / "input.gjf").write_text("%chk=x\n", encoding="utf-8")
-    report = propose_recovery(campaign)
+    authority_report = propose_recovery(campaign)
+    report = propose_recovery(campaign, verification_level="deep")
+    assert authority_report.valid_reference_data_versions == [0]
     assert report.committed_reference_data_versions == [0]
     assert report.valid_reference_data_versions == []
     assert any("committed reference-data version 0" in r for r in report.unsafe_reasons)

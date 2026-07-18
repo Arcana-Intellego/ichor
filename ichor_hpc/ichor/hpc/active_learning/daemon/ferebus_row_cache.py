@@ -209,6 +209,13 @@ def read_feature_contract(path_or_campaign: Path) -> Dict[str, Any]:
         raise ValueError("FEREBUS feature contract must be a JSON object")
     if payload.get("schema_version") != FEREBUS_FEATURE_CONTRACT_SCHEMA_VERSION:
         raise ValueError("unsupported FEREBUS feature-contract schema")
+    row_encoding_version = payload.get("row_encoding_version")
+    if (
+        isinstance(row_encoding_version, bool)
+        or not isinstance(row_encoding_version, int)
+        or row_encoding_version <= 0
+    ):
+        raise ValueError("FEREBUS feature-contract row encoding is invalid")
     digest = str(payload.get("contract_sha256") or "")
     unsigned = dict(payload)
     unsigned.pop("contract_sha256", None)
@@ -231,12 +238,62 @@ def read_feature_contract(path_or_campaign: Path) -> Dict[str, Any]:
     return payload
 
 
+def _preserve_feature_contract(campaign: Path, contract: Mapping[str, Any]) -> None:
+    contract_sha = str(contract["contract_sha256"])
+    historical_path = row_cache_root(
+        campaign,
+        contract_sha,
+    ) / FEREBUS_FEATURE_CONTRACT
+    historical_path.parent.mkdir(parents=True, exist_ok=True)
+    if historical_path.exists():
+        historical = read_feature_contract(historical_path)
+        if historical != dict(contract):
+            raise ValueError(
+                "preserved FEREBUS feature contract conflicts with the active contract"
+            )
+        return
+    atomic_write_json(historical_path, dict(contract))
+
+
+def ensure_current_feature_contract(campaign_dir: Path) -> Dict[str, Any]:
+    """Advance the active contract when row semantics have been versioned.
+
+    Existing cache namespaces are deliberately retained.  The updated contract
+    digest selects a new namespace which is populated lazily by the scientific
+    consumer.
+    """
+    campaign = Path(campaign_dir).resolve()
+    path = feature_contract_path(campaign)
+    observed = read_feature_contract(path)
+    observed_version = int(observed["row_encoding_version"])
+    if observed_version == FEREBUS_ROW_ENCODING_VERSION:
+        return observed
+    if observed_version > FEREBUS_ROW_ENCODING_VERSION:
+        raise ValueError(
+            "FEREBUS feature contract uses a newer row encoding than this ICHOR "
+            "installation"
+        )
+
+    _preserve_feature_contract(campaign, observed)
+
+    updated = dict(observed)
+    updated.pop("contract_sha256", None)
+    updated["row_encoding_version"] = FEREBUS_ROW_ENCODING_VERSION
+    updated["contract_sha256"] = canonical_json_sha256(updated)
+    atomic_write_json(path, updated)
+    return read_feature_contract(path)
+
+
 def ensure_feature_contract(campaign_dir: Path, config: Any, pointdir: Path) -> Dict[str, Any]:
     campaign = Path(campaign_dir).resolve()
     expected = _build_contract(campaign, config, Path(pointdir))
     path = feature_contract_path(campaign)
     if path.exists():
         observed = read_feature_contract(path)
+        if int(observed["row_encoding_version"]) < FEREBUS_ROW_ENCODING_VERSION:
+            _preserve_feature_contract(campaign, observed)
+            atomic_write_json(path, expected)
+            return read_feature_contract(path)
         if observed != expected:
             raise ValueError(
                 "staged geometry/config does not match the immutable FEREBUS feature contract"
@@ -318,6 +375,10 @@ def write_row_shard(
     campaign = Path(campaign_dir).resolve()
     point_root = campaign_owned_path(campaign, pointdir)
     selected_contract = dict(contract or read_feature_contract(campaign))
+    if int(selected_contract.get("row_encoding_version", -1)) != int(
+        FEREBUS_ROW_ENCODING_VERSION
+    ):
+        raise ValueError("FEREBUS row shard requires the current row encoding")
     system_alf = _contract_system_alf(selected_contract)
     extracted = PointDirectory(point_root).feature_property_rows(
         system_alf,
@@ -391,6 +452,8 @@ def read_row_shard(
         raise ValueError("FEREBUS row-shard receipt must be a JSON object")
     if payload.get("schema_version") != FEREBUS_ROW_SHARD_SCHEMA_VERSION:
         raise ValueError("unsupported FEREBUS row-shard schema")
+    if payload.get("row_encoding_version") != FEREBUS_ROW_ENCODING_VERSION:
+        raise ValueError("FEREBUS row-shard encoding is incompatible")
     if payload.get("feature_contract_sha256") != str(expected_contract_sha256):
         raise ValueError("FEREBUS row-shard feature contract mismatch")
     if expected_candidate_id is not None and payload.get("candidate_id") != str(
@@ -514,9 +577,13 @@ def read_version_row_cache(
         row_cache_path(campaign, contract_sha256, version),
     )
     contract = read_feature_contract(campaign_dir)
+    if contract.get("row_encoding_version") != FEREBUS_ROW_ENCODING_VERSION:
+        raise ValueError("FEREBUS row-cache contract encoding is incompatible")
     if str(contract["contract_sha256"]) != str(contract_sha256):
         raise ValueError("FEREBUS row-cache request does not match the active contract")
     payload = _cache_manifest(root)
+    if payload.get("row_encoding_version") != FEREBUS_ROW_ENCODING_VERSION:
+        raise ValueError("FEREBUS row-cache encoding is incompatible")
     if payload.get("feature_contract_sha256") != str(contract_sha256):
         raise ValueError("FEREBUS row-cache feature contract mismatch")
     if payload.get("reference_data_version") != int(version):
@@ -585,7 +652,7 @@ def build_version_row_cache(
     reuse_acceptance_shards: bool = True,
 ) -> Dict[str, Any]:
     campaign = Path(campaign_dir).resolve()
-    contract = read_feature_contract(campaign)
+    contract = ensure_current_feature_contract(campaign)
     contract_sha = str(contract["contract_sha256"])
     target = campaign_owned_path(
         campaign,
@@ -772,7 +839,7 @@ def ensure_cumulative_row_caches(
 ) -> None:
     """Rebuild derived caches serially from authoritative committed pointdirs."""
     campaign = Path(campaign_dir)
-    contract = read_feature_contract(campaign)
+    contract = ensure_current_feature_contract(campaign)
     contract_sha = str(contract["contract_sha256"])
     for version in range(int(view.version) + 1):
         try:
@@ -822,7 +889,7 @@ def ensure_cumulative_row_caches(
 
 
 def clear_row_caches(campaign_dir: Path) -> bool:
-    """Remove only derived FEREBUS row caches after an environment rebind."""
+    """Remove only derived FEREBUS row caches during explicit repair."""
     campaign = Path(campaign_dir).resolve()
     root = campaign / ".DATA" / "CACHE" / "FEREBUS_ROWS"
     if not root.exists() and not root.is_symlink():
@@ -856,12 +923,14 @@ __all__ = [
     "FEREBUS_FEATURE_CONTRACT_SCHEMA_VERSION",
     "FEREBUS_ROW_CACHE",
     "FEREBUS_ROW_CACHE_SCHEMA_VERSION",
+    "FEREBUS_ROW_ENCODING_VERSION",
     "FEREBUS_ROW_SHARD",
     "FEREBUS_ROW_SHARD_ARRAY",
     "FEREBUS_ROW_SHARD_SCHEMA_VERSION",
     "build_version_row_cache",
     "clear_row_caches",
     "ensure_feature_contract",
+    "ensure_current_feature_contract",
     "ensure_cumulative_row_caches",
     "feature_contract_path",
     "load_cumulative_rows",

@@ -805,6 +805,15 @@ def test_metadata_snapshot_skips_payload_hashing_but_deep_detects_tamper(
         return real_sha256(path, **kwargs)
 
     monkeypatch.setattr(snapshot_mod, "sha256_file", record_hash)
+    authority = snapshot_mod.build_committed_artifact_snapshot(
+        campaign,
+        verification_level="authority",
+    )
+    assert authority.valid_reference_data_versions == (0, 1)
+    assert authority.payload_files_hashed == 0
+    assert authority.verification_payload()["recursive_scan"] is False
+    assert target.resolve() not in hashed
+
     metadata = snapshot_mod.build_committed_artifact_snapshot(
         campaign,
         verification_level="metadata",
@@ -820,6 +829,31 @@ def test_metadata_snapshot_skips_payload_hashing_but_deep_detects_tamper(
     assert deep.valid_reference_data_versions == ()
     assert deep.reference_errors
     assert target.resolve() in hashed
+
+
+def test_authority_snapshot_never_uses_recursive_filesystem_walkers(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon import artifact_snapshot as snapshot_mod
+
+    campaign = tmp_path / "campaign"
+    _commit_two_versions(campaign)
+
+    def refuse_recursive_walk(*_args, **_kwargs):
+        raise AssertionError("authority verification attempted a recursive walk")
+
+    monkeypatch.setattr(Path, "rglob", refuse_recursive_walk)
+    monkeypatch.setattr(os, "walk", refuse_recursive_walk)
+
+    snapshot = snapshot_mod.build_committed_artifact_snapshot(
+        campaign,
+        verification_level="authority",
+    )
+
+    assert snapshot.valid_reference_data_versions == (0, 1)
+    assert snapshot.payload_files_hashed == 0
+    assert snapshot.verification_payload()["recursive_scan"] is False
 
 
 def test_deep_snapshot_hashes_each_scientific_payload_once(tmp_path, monkeypatch):

@@ -1931,7 +1931,7 @@ def test_reconcile_apply_archive_staging_explicitly_handles_non_ferebus_reentry(
         root=campaign / "TRAINED_MODELS" / "iteration-000000",
     )
     snapshot = SimpleNamespace(
-        verification_level="metadata",
+        verification_level="authority",
         committed_reference_data_versions=(0,),
         committed_model_versions=(0,),
         valid_reference_data_versions=(0,),
@@ -1952,8 +1952,11 @@ def test_reconcile_apply_archive_staging_explicitly_handles_non_ferebus_reentry(
         ),
         assert_anchors_unchanged=lambda campaign_dir: None,
         verification_payload=lambda **kwargs: {
-            "level": "metadata",
+            "level": "authority",
             "deep_required": False,
+            "recursive_scan": False,
+            "payload_hashing": False,
+            "control_files_checked": 2,
             "files_inspected": 2,
             "payload_files_hashed": 0,
             "payload_bytes_hashed": 0,
@@ -1993,6 +1996,28 @@ def test_reconcile_apply_archive_staging_explicitly_handles_non_ferebus_reentry(
     stale_file = data_staging / "GAUSSIAN" / "old.txt"
     stale_file.parent.mkdir(parents=True)
     stale_file.write_text("old scratch", encoding="utf-8")
+    from ichor.hpc.active_learning import execution_identity
+
+    execution_identity.execution_identity_path(campaign).write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    environment_transitions = []
+    monkeypatch.setattr(
+        execution_identity,
+        "read_execution_identity",
+        lambda *_args, **_kwargs: {"mode": "dry_run"},
+    )
+
+    def record_environment_transition(campaign_dir, **kwargs):
+        environment_transitions.append((Path(campaign_dir), dict(kwargs)))
+        return {"changed": True, "generation": 1}
+
+    monkeypatch.setattr(
+        execution_identity,
+        "advance_environment_generation",
+        record_environment_transition,
+    )
 
     rc = cmd_reconcile(
         argparse.Namespace(
@@ -2015,6 +2040,16 @@ def test_reconcile_apply_archive_staging_explicitly_handles_non_ferebus_reentry(
     assert data_staging.is_dir()
     assert list(data_staging.iterdir()) == []
     assert "archived staging:" in out
+    assert environment_transitions == [
+        (
+            campaign,
+            {
+                "config": config,
+                "live_preflight_ok": True,
+                "scheduler_ownership_clear": True,
+            },
+        )
+    ]
     recovered = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
     assert recovered.phase is CampaignPhase.SEED_SELECT
     events = list(iter_events(campaign / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson"))

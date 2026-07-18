@@ -120,6 +120,21 @@ def test_checkpoint_deduplicates_verifies_and_restores(tmp_path, monkeypatch):
     object_paths = list((Path(created["store"]) / "objects").iterdir())
     assert len(object_paths) == len({item["sha256"] for item in manifest["files"]})
 
+    with monkeypatch.context() as context:
+        context.setattr(
+            checkpoints,
+            "_verify_object",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("authority status hashed a checkpoint object")
+            ),
+        )
+        authority = checkpoints.checkpoint_authority_status(
+            campaign,
+            destination,
+        )
+    assert authority["status"] == "authority_verified"
+    assert authority["current"]["iteration"] == 0
+
     status = checkpoints.checkpoint_status(campaign, destination)
     assert status["status"] == "verified"
     assert status["current"]["iteration"] == 0

@@ -204,6 +204,7 @@ def _entry_from_record(
     *,
     iteration_dir: Path,
     version: int,
+    validate_payload_path: bool = True,
 ) -> ReferenceDataEntry:
     ordinal = _safe_int(record.get("global_ordinal"), "global_ordinal", minimum=0)
     name = str(record.get("pointdir_name") or "")
@@ -226,17 +227,20 @@ def _entry_from_record(
     if split not in VALID_SPLITS:
         raise ReferenceDataError("reference-data allocation identity is invalid")
     pointdir = iteration_dir / name
-    if not pointdir.is_dir() or pointdir.is_symlink():
-        raise ReferenceDataError("reference-data pointdir is missing or symlinked: " + str(pointdir))
-    try:
-        pointdir.resolve().relative_to(iteration_dir.resolve())
-    except ValueError as exc:
-        raise ReferenceDataError("reference-data pointdir escapes its version") from exc
+    if validate_payload_path:
+        if not pointdir.is_dir() or pointdir.is_symlink():
+            raise ReferenceDataError(
+                "reference-data pointdir is missing or symlinked: " + str(pointdir)
+            )
+        try:
+            pointdir.resolve().relative_to(iteration_dir.resolve())
+        except ValueError as exc:
+            raise ReferenceDataError("reference-data pointdir escapes its version") from exc
     return ReferenceDataEntry(
         global_ordinal=ordinal,
         introduced_in_version=int(version),
         pointdir_name=name,
-        pointdir_path=pointdir.resolve(),
+        pointdir_path=(pointdir.resolve() if validate_payload_path else pointdir.absolute()),
         source_pointdir=source_pointdir,
         candidate_id=candidate_id,
         slot_id=slot_id,
@@ -393,9 +397,9 @@ def resolve_reference_data_chain(
     digest_file: Optional[Callable[[Path, bool], str]] = None,
     resolved_views_out: Optional[List[ReferenceDataView]] = None,
 ) -> Tuple[ReferenceDataView, ...]:
-    if verification not in {"index", "metadata", "deep"}:
+    if verification not in {"authority", "index", "metadata", "deep"}:
         raise ValueError(
-            "reference-data verification must be index, metadata or deep"
+            "reference-data verification must be authority, index, metadata or deep"
         )
     if verification == "deep" and digest_file is None:
         digest_cache: Dict[str, str] = {}
@@ -435,15 +439,16 @@ def resolve_reference_data_chain(
     for version in expected_versions:
         iteration_dir = versioning.iteration_path(version)
         directory_manifest = read_manifest(iteration_dir)
-        extras = unmanifested_directories(
-            iteration_dir,
-            manifest=directory_manifest,
-            pattern="POINT_*.pointdir",
-        )
-        if extras:
-            raise ManifestMismatchError(
-                "unmanifested reference pointdir(s): " + ", ".join(extras[:5])
+        if verification != "authority":
+            extras = unmanifested_directories(
+                iteration_dir,
+                manifest=directory_manifest,
+                pattern="POINT_*.pointdir",
             )
+            if extras:
+                raise ManifestMismatchError(
+                    "unmanifested reference pointdir(s): " + ", ".join(extras[:5])
+                )
         manifest_path = reference_data_version_path(iteration_dir)
         payload = _read_json_object(manifest_path, "reference-data version manifest")
         if _safe_int(payload.get("schema_version"), "schema_version") != REFERENCE_DATA_VERSION_SCHEMA_VERSION:
@@ -461,6 +466,16 @@ def resolve_reference_data_chain(
             commit_receipt_path,
             "reference-commit receipt",
         )
+        manifest_sha = _digest(
+            manifest_path,
+            payload=False,
+            digest_file=digest_file,
+        )
+        commit_receipt_sha = _digest(
+            commit_receipt_path,
+            payload=False,
+            digest_file=digest_file,
+        )
         if _safe_int(commit_receipt.get("schema_version"), "commit receipt schema") != 1:
             raise ReferenceDataError("unsupported reference-commit receipt schema")
         if (
@@ -474,9 +489,17 @@ def resolve_reference_data_chain(
                 commit_receipt.get("reference_data_version_sha256"),
                 "commit receipt reference-data manifest SHA",
             )
-            != _digest(manifest_path, payload=False, digest_file=digest_file)
+            != manifest_sha
         ):
             raise ReferenceDataError("reference-commit receipt identity mismatch")
+        if directory_manifest.get(REFERENCE_DATA_VERSION_FILENAME) != manifest_sha:
+            raise ReferenceDataError(
+                "reference-data directory manifest does not bind its version manifest"
+            )
+        if directory_manifest.get("REFERENCE_COMMIT_RECEIPT.json") != commit_receipt_sha:
+            raise ReferenceDataError(
+                "reference-data directory manifest does not bind its commit receipt"
+            )
         parent = payload.get("parent_version")
         parent_sha = payload.get("parent_manifest_sha256")
         if version == 0:
@@ -495,18 +518,46 @@ def resolve_reference_data_chain(
         ):
             raise ReferenceDataError("reference-data added-point count mismatch")
         added = [
-            _entry_from_record(record, iteration_dir=iteration_dir, version=version)
+            _entry_from_record(
+                record,
+                iteration_dir=iteration_dir,
+                version=version,
+                validate_payload_path=verification != "authority",
+            )
             for record in records
             if isinstance(record, Mapping)
         ]
         if len(added) != len(records):
             raise ReferenceDataError("reference-data point record must be an object")
-        _validate_allocation_snapshot(
-            iteration_dir,
-            payload,
-            added,
-            digest_file=digest_file,
-        )
+        added_by_identity = {
+            (entry.pointdir_name, entry.candidate_id): entry
+            for entry in added
+        }
+        if len(added_by_identity) != len(added):
+            raise ReferenceDataError(
+                "reference-data added-point identities are not unique"
+            )
+        if verification == "authority":
+            allocation_name = (
+                "POINT_ALLOCATION.version-"
+                + str(version).zfill(COMMITTED_VERSION_NAME_WIDTH)
+                + ".json"
+            )
+            allocation_sha = _safe_sha(
+                payload.get("point_allocation_sha256"),
+                "point_allocation_sha256",
+            )
+            if directory_manifest.get(allocation_name) != allocation_sha:
+                raise ReferenceDataError(
+                    "reference-data directory manifest does not bind its allocation snapshot"
+                )
+        else:
+            _validate_allocation_snapshot(
+                iteration_dir,
+                payload,
+                added,
+                digest_file=digest_file,
+            )
         quality_status = str(payload.get("quantum_quality_evidence_status") or "")
         quality_records = payload.get("quantum_quality_evidence", [])
         if not isinstance(quality_records, list):
@@ -522,6 +573,35 @@ def resolve_reference_data_chain(
             relative = Path(str(record.get("path") or ""))
             if relative.is_absolute() or ".." in relative.parts:
                 raise ReferenceDataError("quantum-quality evidence path escapes its version")
+            expected_evidence_sha = _safe_sha(
+                record.get("sha256"), "quantum_quality_evidence.sha256"
+            )
+            if verification == "authority":
+                if directory_manifest.get(relative.as_posix()) != expected_evidence_sha:
+                    raise ReferenceDataError(
+                        "reference-data directory manifest does not bind quantum-quality evidence"
+                    )
+                bindings = record.get("pointdir_bindings")
+                if not isinstance(bindings, list) or not bindings:
+                    raise ReferenceDataError(
+                        "quantum-quality pointdir bindings are missing"
+                    )
+                for binding in bindings:
+                    if not isinstance(binding, Mapping):
+                        raise ReferenceDataError(
+                            "quantum-quality pointdir binding must be an object"
+                        )
+                    committed_name = str(binding.get("committed_pointdir") or "")
+                    candidate_id = str(binding.get("candidate_id") or "")
+                    if (
+                        (committed_name, candidate_id) not in added_by_identity
+                        or committed_name in quality_committed_names
+                    ):
+                        raise ReferenceDataError(
+                            "quantum-quality pointdir binding does not match committed metadata"
+                        )
+                    quality_committed_names.add(committed_name)
+                continue
             evidence_path = iteration_dir / relative
             if evidence_path.is_symlink() or not evidence_path.is_file():
                 raise ReferenceDataError("quantum-quality evidence file is missing")
@@ -529,9 +609,7 @@ def resolve_reference_data_chain(
                 evidence_path,
                 payload=False,
                 digest_file=digest_file,
-            ) != _safe_sha(
-                record.get("sha256"), "quantum_quality_evidence.sha256"
-            ):
+            ) != expected_evidence_sha:
                 raise ReferenceDataError("quantum-quality evidence SHA mismatch")
             try:
                 from ..daemon.quantum_quality import read_quantum_quality_manifest
@@ -570,13 +648,10 @@ def resolve_reference_data_chain(
                 source_name = str(binding.get("source_pointdir") or "")
                 committed_name = str(binding.get("committed_pointdir") or "")
                 candidate_id = str(binding.get("candidate_id") or "")
-                matches = [
-                    entry
-                    for entry in added
-                    if entry.pointdir_name == committed_name
-                    and entry.candidate_id == candidate_id
-                ]
-                if source_name not in accepted_source_names or len(matches) != 1:
+                if (
+                    source_name not in accepted_source_names
+                    or (committed_name, candidate_id) not in added_by_identity
+                ):
                     raise ReferenceDataError(
                         "quantum-quality pointdir binding does not match its evidence"
                     )
@@ -589,7 +664,7 @@ def resolve_reference_data_chain(
             raise ReferenceDataError(
                 "quantum-quality evidence does not match committed pointdirs"
             )
-        if verification != "index":
+        if verification not in {"authority", "index"}:
             try:
                 from ..daemon.quantum_acceptance_receipts import (
                     read_quantum_acceptance_receipt,
@@ -650,7 +725,7 @@ def resolve_reference_data_chain(
             minimum=1,
         ) != len(entries):
             raise ReferenceDataError("reference-data cumulative point count mismatch")
-        if verification != "index":
+        if verification not in {"authority", "index"}:
             for entry in added:
                 _validate_provenance(entry, digest_file=digest_file)
         expected_view_sha = _view_sha(entries)

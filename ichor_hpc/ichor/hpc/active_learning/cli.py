@@ -48,7 +48,6 @@ from .daemon.daemon import (
 from .daemon.journal import (
     KNOWN_EVENT_TYPES,
     JournalCorruptionError,
-    iter_events,
     read_events,
 )
 from .daemon.lease import evaluate_lease_liveness, validate_lease_heartbeat
@@ -1159,13 +1158,14 @@ def _lock_summary(lock_held: Any) -> str:
 
 
 def _latest_journal_event(journal_path: Path, event_type: str) -> Optional[Dict[str, Any]]:
-    latest = None
     if not journal_path.exists():
         return None
-    for event in iter_events(journal_path):
+    from .daemon.journal import tail_events
+
+    for event in reversed(tail_events(journal_path, max_records=4096)):
         if event.get("event") == event_type:
-            latest = event
-    return latest
+            return event
+    return None
 
 
 def _format_contract_status(contract: Any) -> Optional[str]:
@@ -1630,6 +1630,18 @@ def _format_runtime_status(payload: Dict[str, Any], *, verbose: bool) -> List[st
         ("user stop control", stop_summary),
         ("shutdown requested", "yes" if payload.get("shutdown_requested") else "no"),
     ]
+    environment = payload.get("active_environment_generation")
+    if isinstance(environment, dict) and environment.get("generation") is not None:
+        rows.extend(
+            [
+                ("environment generation", environment.get("generation")),
+                (
+                    "environment transition",
+                    environment.get("last_transition")
+                    or environment.get("created_at_iso"),
+                ),
+            ]
+        )
     allocation = payload.get("point_allocation_summary")
     if isinstance(allocation, dict):
         rows.extend(
@@ -2743,6 +2755,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         "scheduler_identity_kind": (
             "slurm" if effective_mode == "live" else "synthetic"
         ),
+        "environment_preflight_ok": True,
     }
     if sacct_poller is not None:
         daemon_kwargs["sacct_poller"] = sacct_poller
@@ -3551,10 +3564,21 @@ def format_recovery_dashboard(campaign_dir: Path) -> str:
     lines.extend(_section("Submission intents", [("active", intent_summary)]))
 
     try:
-        from .acquisition.trajectory_pool import TrajectoryPool
+        from .acquisition.trajectory_pool import (
+            POOL_MANIFEST_FILENAME,
+            POOL_SUBDIR,
+            TrajectoryPoolManifest,
+        )
+        from .strict_json import strict_json as _json
 
-        pool = TrajectoryPool.load(campaign)
-        pool_status = "ok sha=" + str(pool.sha256)[:12]
+        manifest_path = campaign / POOL_SUBDIR / POOL_MANIFEST_FILENAME
+        manifest = TrajectoryPoolManifest.from_dict(
+            _json.loads(
+                manifest_path.read_text(encoding="utf-8"),
+                source=manifest_path,
+            )
+        )
+        pool_status = "authority sha=" + str(manifest.sha256)[:12]
     except Exception as exc:
         pool_status = type(exc).__name__ + ": " + str(exc)[:120]
     lines.extend(_section("Trajectory pool", [("status", pool_status)]))
@@ -3692,9 +3716,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     )
     paths = _campaign_paths(campaign)
     try:
-        from .daemon.ariadne_quarantine import inventory_quarantine
+        from .daemon.ariadne_quarantine import inventory_quarantine_authority
 
-        quarantine_status = inventory_quarantine(campaign)
+        quarantine_status = inventory_quarantine_authority(campaign)
     except Exception as exc:
         quarantine_status = {
             "attempts": [],
@@ -3777,6 +3801,32 @@ def cmd_status(args: argparse.Namespace) -> int:
         )
     )
     payload.update(_probe_background_daemon(paths["background_pid"], paths["background_log"]))
+    try:
+        from .execution_identity import read_active_environment_generation
+        from .daemon.journal import tail_events
+
+        active_environment = read_active_environment_generation(
+            campaign,
+            expected_campaign_uid=str(state.campaign_uid),
+        )["generation"]
+        transition = None
+        for event in reversed(tail_events(paths["journal"], max_records=1024)):
+            if str(event.get("event") or "") in {
+                "environment_generation_advanced",
+                "environment_rebound",
+            }:
+                transition = str(event.get("ts") or "")
+                break
+        payload["active_environment_generation"] = {
+            "generation": int(active_environment["generation"]),
+            "digest_sha256": str(active_environment["digest_sha256"]),
+            "created_at_iso": str(active_environment["created_at_iso"]),
+            "last_transition": transition,
+        }
+    except Exception as exc:
+        payload["active_environment_generation"] = {
+            "error": type(exc).__name__ + ": " + str(exc)
+        }
     intent_errors: List[Dict[str, str]] = []
     payload["active_submission_intents"] = _load_active_submission_intents(
         campaign,
@@ -3848,18 +3898,18 @@ def cmd_status(args: argparse.Namespace) -> int:
         )
         status_snapshot = build_committed_artifact_snapshot(
             campaign,
-            verification_level="metadata",
+            verification_level="authority",
         )
         payload["artifact_manifest_status"] = artifact_manifest_status(
             campaign,
             state,
-            verification="metadata",
+            verification="authority",
             snapshot=status_snapshot,
         )
         payload["state_artifact_contract_status"] = state_artifact_contract_status(
             campaign,
             state,
-            verification="metadata",
+            verification="authority",
             snapshot=status_snapshot,
         )
         payload["artifact_verification"] = status_snapshot.verification_payload()
@@ -4704,7 +4754,7 @@ def _perform_reconcile_apply_mutations(
     force_array_iteration: int,
     archive_existing_array_outputs: bool,
     data_staging_archive_mode: Optional[str],
-    verification: str = "metadata",
+    verification: str = "authority",
     artifact_snapshot: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Perform only lossless, transaction-recorded reconcile mutations."""
@@ -4941,7 +4991,7 @@ def _reconcile_apply_contract_error(
     campaign: Path,
     state: Any,
     *,
-    verification: str = "metadata",
+    verification: str = "authority",
     artifact_snapshot: Optional[Any] = None,
 ) -> Optional[str]:
     from .daemon.artifact_contracts import state_artifact_contract_status
@@ -5117,7 +5167,7 @@ def _reconcile_decision_payload(
         getattr(report, "deep_verification_required", False)
         and (
             snapshot is None
-            or str(getattr(snapshot, "verification_level", "metadata")) != "deep"
+            or str(getattr(snapshot, "verification_level", "authority")) != "deep"
         )
     )
     runnable = (
@@ -5159,10 +5209,13 @@ def _reconcile_decision_payload(
         )
         if snapshot is not None
         else {
-            "level": "metadata",
+            "level": "authority",
             "deep_required": bool(
                 getattr(report, "deep_verification_required", False)
             ),
+            "recursive_scan": False,
+            "payload_hashing": False,
+            "control_files_checked": 0,
             "files_inspected": 0,
             "payload_files_hashed": 0,
             "payload_bytes_hashed": 0,
@@ -5172,7 +5225,7 @@ def _reconcile_decision_payload(
         }
     )
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "campaign_dir": str(campaign),
         "proposed_state_path": (
             str(proposed_state_path) if proposed_state_path is not None else None
@@ -5808,7 +5861,7 @@ def _print_reconcile_operator_report(
             if snapshot.verification_level == "deep"
             else "deep verification required"
             if deep_required
-            else "metadata verified"
+            else "authority verified"
         )
         _print_reconcile_key_values(
             [
@@ -5936,7 +5989,11 @@ def _scratch_intent_index(campaign: Path) -> Dict[str, Dict[str, Any]]:
     root = _submission_intent.intent_dir(campaign)
     if not root.is_dir():
         return index
-    for path in sorted(root.rglob("*.json")):
+    paths = list(root.glob("*.json"))
+    history = root / _submission_intent.INTENT_HISTORY_DIR_NAME
+    if history.is_dir() and not history.is_symlink():
+        paths.extend(history.glob("*.json"))
+    for path in sorted(paths):
         if path.is_symlink():
             continue
         try:
@@ -6312,7 +6369,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     )
     retrain_ferebus = bool(getattr(args, "retrain_ferebus", False))
     deep_verify = bool(getattr(args, "deep_verify", False))
-    verification_level = "deep" if deep_verify else "metadata"
+    verification_level = "deep" if deep_verify else "authority"
     campaign = resolve_campaign_dir(
         args.campaign_dir,
         require_campaign_yaml=False,
@@ -6424,7 +6481,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         print(
             json.dumps(
                 {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "error": "json_apply_not_supported",
                     "message": "reconcile --json is proposal-only; rerun without --json to apply",
                 },
@@ -6785,7 +6842,31 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 reason
                 for reason in report.unsafe_reasons
                 if not str(reason).startswith("active submission intent(s) present:")
+                and not str(reason).startswith(
+                    "scheduler-inconclusive prepared scratch task(s)"
+                )
             ]
+            report.blocking_artifacts = [
+                value
+                for value in report.blocking_artifacts
+                if str(value) != "prepared scratch ownership"
+            ]
+            resolved_keys = {
+                (
+                    str(item.get("phase") or ""),
+                    int(item.get("iteration") or 0),
+                    str(item.get("job_id") or ""),
+                )
+                for item in resolved_intents
+            }
+            for scratch_record in report.scratch_inventory:
+                key = (
+                    str(scratch_record.get("phase") or ""),
+                    int(scratch_record.get("iteration") or 0),
+                    str(scratch_record.get("job_id") or ""),
+                )
+                if key in resolved_keys:
+                    scratch_record["status"] = "terminal_intent"
     if report.active_submission_intents:
         print(
             "refusing --apply while active submission intents are present",
@@ -7385,13 +7466,71 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             transaction.set_status("COMMITTED")
         except Exception as exc:
             print(
-                "warning: reconcile committed, but its transaction receipt "
-                "could not be finalised: "
+                "reconcile state was recovered, but its transaction receipt "
+                "could not be finalised; automatic environment transition was "
+                "not attempted: "
                 + type(exc).__name__
                 + ": "
                 + str(exc),
                 file=sys.stderr,
             )
+            return 9
+    environment_transition = None
+    try:
+        from .execution_identity import (
+            advance_environment_generation,
+            execution_identity_path,
+            read_execution_identity,
+        )
+
+        if execution_identity_path(campaign).is_file():
+            identity = read_execution_identity(
+                campaign,
+                expected_campaign_uid=str(report.proposed_state.campaign_uid),
+            )
+            live_preflight_ok = True
+            if str(identity["mode"]) == "live":
+                availability = check_backends()
+                preflight = evaluate_campaign_preflight(
+                    campaign,
+                    config=config,
+                    avail=availability,
+                )
+                live_preflight_ok = bool(preflight.get("ready", False))
+                if not live_preflight_ok:
+                    details = _preflight_failure_details(preflight)
+                    raise ValueError(
+                        "live backend preflight failed: "
+                        + "; ".join(details[:8])
+                    )
+            environment_transition = advance_environment_generation(
+                campaign,
+                config=config,
+                live_preflight_ok=live_preflight_ok,
+                scheduler_ownership_clear=True,
+            )
+    except Exception as exc:
+        print(
+            "reconcile recovery was committed, but automatic environment "
+            "transition was refused: "
+            + type(exc).__name__
+            + ": "
+            + str(exc),
+            file=sys.stderr,
+        )
+        print(
+            "Fix the reported environment blocker, then run resume; resume "
+            "will retry the transition automatically.",
+            file=sys.stderr,
+        )
+        return 13
+    if isinstance(environment_transition, dict) and bool(
+        environment_transition.get("changed", False)
+    ):
+        print(
+            "Advanced environment generation to "
+            + str(environment_transition.get("generation"))
+        )
     final_contract_status = recovery_contract_status(
         campaign,
         report.proposed_state,
@@ -7720,7 +7859,11 @@ def _pool_feasibility_summary(campaign: Path, config: CampaignConfig) -> Dict[st
     try:
         from .daemon.pool_feasibility import evaluate_pool_feasibility
 
-        result = evaluate_pool_feasibility(campaign, config)
+        result = evaluate_pool_feasibility(
+            campaign,
+            config,
+            verify_pool_payload=False,
+        )
         return result.to_dict()
     except Exception as exc:
         return {
@@ -8599,17 +8742,25 @@ def evaluate_campaign_preflight(
     else:
         try:
             feasibility_summary = _pool_feasibility_summary(campaign, loaded_config)
-            from .acquisition.trajectory_pool import TrajectoryPool
-            from .ferebus_prior import resolve_ferebus_prior_contract
-
-            pool_manifest = (
-                campaign / ".DATA" / "TRAJECTORY" / "pool.manifest.json"
+            from .acquisition.trajectory_pool import (
+                POOL_MANIFEST_FILENAME,
+                POOL_SUBDIR,
+                TrajectoryPoolManifest,
             )
+            from .ferebus_prior import resolve_ferebus_prior_contract
+            from .strict_json import strict_json as _json
+
+            pool_manifest = campaign / POOL_SUBDIR / POOL_MANIFEST_FILENAME
             if pool_manifest.is_file():
-                pool = TrajectoryPool.load(campaign)
+                manifest = TrajectoryPoolManifest.from_dict(
+                    _json.loads(
+                        pool_manifest.read_text(encoding="utf-8"),
+                        source=pool_manifest,
+                    )
+                )
                 resolve_ferebus_prior_contract(
                     loaded_config,
-                    atom_labels=pool.manifest.atom_types,
+                    atom_labels=manifest.atom_types,
                 )
         except Exception as exc:
             feasibility_summary = {
@@ -8636,12 +8787,12 @@ def evaluate_campaign_preflight(
 
             preflight_snapshot = build_committed_artifact_snapshot(
                 campaign,
-                verification_level="metadata",
+                verification_level="authority",
             )
             contract = state_artifact_contract_status(
                 campaign,
                 state,
-                verification="metadata",
+                verification="authority",
                 snapshot=preflight_snapshot,
             )
             if not bool(contract.get("ok", False)):
@@ -8663,9 +8814,9 @@ def evaluate_campaign_preflight(
                         str(state.campaign_uid),
                     )
                     if (store / "current.json").exists():
-                        from .daemon.checkpoints import checkpoint_status
+                        from .daemon.checkpoints import checkpoint_authority_status
 
-                        checkpoint_status(
+                        checkpoint_authority_status(
                             campaign,
                             str(loaded_config.retention.checkpoint_destination),
                         )
@@ -8785,116 +8936,6 @@ def cmd_resource_plan(args: argparse.Namespace) -> int:
             return 15
         if "evidence_not_yet_produced" in statuses:
             return 14
-    return 0
-
-
-def cmd_environment_status(args: argparse.Namespace) -> int:
-    """Compare the current process/native stack with the bound generation."""
-    from .execution_identity import (
-        environment_status,
-        read_execution_identity,
-    )
-
-    try:
-        campaign = resolve_campaign_dir(args.campaign_dir)
-        config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
-        state = read_state(operational_path(campaign, DEFAULT_STATE_FILENAME))
-        identity = read_execution_identity(
-            campaign,
-            expected_campaign_uid=str(state.campaign_uid),
-        )
-        payload = environment_status(
-            campaign,
-            campaign_uid=str(state.campaign_uid),
-            config=config,
-        )
-        payload["mode"] = str(identity["mode"])
-        payload["phase"] = state.phase.value
-        payload["iteration"] = int(state.iteration)
-    except (OSError, TypeError, ValueError) as exc:
-        print("environment-status failed: " + str(exc), file=sys.stderr)
-        return 2
-    if bool(getattr(args, "json", False)):
-        print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
-    else:
-        print(
-            "Environment status: "
-            + ("MATCH" if payload["matches"] else "DRIFTED")
-        )
-        print("Generation: " + str(payload["generation"]))
-        print("Mode: " + str(payload["mode"]))
-        if payload["changed_fields"]:
-            print("Changed fields: " + ", ".join(payload["changed_fields"]))
-    return 0 if bool(payload["matches"]) else 18
-
-
-def cmd_rebind_environment(args: argparse.Namespace) -> int:
-    """Create a new verified environment generation at an idle boundary."""
-    from .execution_identity import (
-        environment_status,
-        read_execution_identity,
-        rebind_environment,
-    )
-
-    try:
-        campaign = resolve_campaign_dir(args.campaign_dir)
-        config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
-        state = read_state(operational_path(campaign, DEFAULT_STATE_FILENAME))
-        identity = read_execution_identity(
-            campaign,
-            expected_campaign_uid=str(state.campaign_uid),
-        )
-        if not bool(getattr(args, "apply", False)):
-            payload = environment_status(
-                campaign,
-                campaign_uid=str(state.campaign_uid),
-                config=config,
-            )
-            payload["applied"] = False
-            payload["mode"] = str(identity["mode"])
-        else:
-            with _exclusive_operator_lock(campaign):
-                runtime = _reconcile_runtime_status(
-                    campaign,
-                    operator_lock_owned=True,
-                )
-                blockers = list(runtime.get("reconcile_apply_blockers") or [])
-                if blockers:
-                    raise ValueError(
-                        "environment rebind is blocked: " + "; ".join(blockers)
-                    )
-                live_preflight_ok = False
-                if str(identity["mode"]) == "live":
-                    availability = check_backends()
-                    live_preflight_ok = bool(availability.all_present)
-                    if not live_preflight_ok:
-                        raise ValueError(missing_backend_message(availability))
-                payload = rebind_environment(
-                    campaign,
-                    config=config,
-                    live_preflight_ok=live_preflight_ok,
-                    scheduler_ownership_clear=True,
-                )
-                payload["applied"] = True
-                payload["mode"] = str(identity["mode"])
-    except (OSError, RuntimeError, TypeError, ValueError) as exc:
-        print("rebind-environment failed: " + str(exc), file=sys.stderr)
-        return 2
-    if bool(getattr(args, "json", False)):
-        print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
-    elif not bool(getattr(args, "apply", False)):
-        print(
-            "Environment rebind preview: "
-            + ("not required" if payload["matches"] else "required")
-        )
-        if payload["changed_fields"]:
-            print("Changed fields: " + ", ".join(payload["changed_fields"]))
-        print("Re-run with --apply after reviewing scheduler ownership.")
-    elif bool(payload.get("changed", False)):
-        print("Environment rebound to generation " + str(payload["generation"]))
-        print("Generation SHA-256: " + str(payload["generation_digest_sha256"]))
-    else:
-        print(str(payload.get("message") or "Environment already matches."))
     return 0
 
 
@@ -9298,7 +9339,8 @@ Examples:
         help=(
             "Hash every committed scientific payload once while reconciling. "
             "Required when campaign authority must be reconstructed without "
-            "a valid state file; otherwise metadata verification is used."
+            "a valid state file; otherwise non-recursive authority verification "
+            "is used."
         ),
     )
     p_recon.add_argument(
@@ -9599,27 +9641,6 @@ Examples:
         help="Print schema-v2 machine-readable JSON.",
     )
     p_resource.set_defaults(func=cmd_resource_plan)
-
-    p_environment_status = sub.add_parser(
-        "environment-status",
-        help="Compare the current software/native stack with the active generation.",
-    )
-    add_campaign(p_environment_status)
-    p_environment_status.add_argument("--json", action="store_true")
-    p_environment_status.set_defaults(func=cmd_environment_status)
-
-    p_rebind_environment = sub.add_parser(
-        "rebind-environment",
-        help="Bind a campaign at a verified safe boundary to a new environment generation.",
-    )
-    add_campaign(p_rebind_environment)
-    p_rebind_environment.add_argument(
-        "--apply",
-        action="store_true",
-        help="Create and publish the new generation after all safety checks pass.",
-    )
-    p_rebind_environment.add_argument("--json", action="store_true")
-    p_rebind_environment.set_defaults(func=cmd_rebind_environment)
 
     p_checkpoint = sub.add_parser(
         "checkpoint",

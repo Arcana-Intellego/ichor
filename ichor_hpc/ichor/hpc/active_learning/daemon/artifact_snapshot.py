@@ -29,7 +29,7 @@ from ..versioning.trained_models import (
 )
 
 
-VERIFICATION_LEVELS = frozenset({"metadata", "deep"})
+VERIFICATION_LEVELS = frozenset({"authority", "metadata", "deep"})
 
 
 class ArtefactSnapshotError(RuntimeError):
@@ -171,6 +171,22 @@ class CommittedArtifactSnapshot:
     payload_files_hashed: int = 0
     payload_bytes_hashed: int = 0
     elapsed_seconds: float = 0.0
+    submission_intents: Tuple[Mapping[str, Any], ...] = field(
+        default_factory=tuple,
+        repr=False,
+    )
+    submission_intent_errors: Tuple[Mapping[str, Any], ...] = field(
+        default_factory=tuple,
+        repr=False,
+    )
+    reconcile_transactions: Tuple[Mapping[str, Any], ...] = field(
+        default_factory=tuple,
+        repr=False,
+    )
+    reference_commit_transactions: Tuple[Mapping[str, Any], ...] = field(
+        default_factory=tuple,
+        repr=False,
+    )
 
     @property
     def valid_reference_data_versions(self) -> Tuple[int, ...]:
@@ -234,6 +250,9 @@ class CommittedArtifactSnapshot:
         return {
             "level": self.verification_level,
             "deep_required": bool(deep_required),
+            "recursive_scan": self.verification_level != "authority",
+            "payload_hashing": self.verification_level == "deep",
+            "control_files_checked": int(len(self.anchor_records)),
             "files_inspected": int(self.files_inspected),
             "payload_files_hashed": int(self.payload_files_hashed),
             "payload_bytes_hashed": int(self.payload_bytes_hashed),
@@ -272,6 +291,8 @@ def _authoritative_anchor_paths(
     campaign: Path,
     reference_views: Sequence[ReferenceDataView],
     model_sets: Sequence[TrainedModelSet],
+    *,
+    verification_level: str,
 ) -> Tuple[str, ...]:
     paths: set[str] = set()
     for view in reference_views:
@@ -284,36 +305,87 @@ def _authoritative_anchor_paths(
             "REFERENCE_COMMIT_RECEIPT.json",
         ):
             paths.add((version_root / name).relative_to(campaign).as_posix())
-        for relative_name in read_manifest(version_root):
-            if relative_name.endswith(".json"):
+        if verification_level != "authority":
+            for relative_name in read_manifest(version_root):
+                if relative_name.endswith(".json"):
+                    paths.add(
+                        (version_root / relative_name).relative_to(campaign).as_posix()
+                    )
+            for entry in view.entries:
+                if int(entry.introduced_in_version) != int(view.version):
+                    continue
                 paths.add(
-                    (version_root / relative_name).relative_to(campaign).as_posix()
+                    (entry.pointdir_path / "QUANTUM_ACCEPTANCE_RECEIPT.json")
+                    .relative_to(campaign)
+                    .as_posix()
                 )
-        for entry in view.entries:
-            if int(entry.introduced_in_version) != int(view.version):
-                continue
-            paths.add(
-                (entry.pointdir_path / "QUANTUM_ACCEPTANCE_RECEIPT.json")
-                .relative_to(campaign)
-                .as_posix()
-            )
-            paths.add(
-                (entry.pointdir_path / PROVENANCE_FILENAME)
-                .relative_to(campaign)
-                .as_posix()
-            )
+                paths.add(
+                    (entry.pointdir_path / PROVENANCE_FILENAME)
+                    .relative_to(campaign)
+                    .as_posix()
+                )
     for model in model_sets:
         for name in (MANIFEST_FILENAME, TRAINED_MODEL_SET_FILENAME):
             paths.add((model.root / name).relative_to(campaign).as_posix())
-        for relative_name in read_manifest(model.root):
-            if relative_name.endswith(".json"):
-                paths.add((model.root / relative_name).relative_to(campaign).as_posix())
+        if verification_level != "authority":
+            for relative_name in read_manifest(model.root):
+                if relative_name.endswith(".json"):
+                    paths.add((model.root / relative_name).relative_to(campaign).as_posix())
     for pointer in (
         campaign / "QM_REFERENCE_DATA" / "current",
         campaign / "TRAINED_MODELS" / "current",
     ):
         if pointer.is_file() and not pointer.is_symlink():
             paths.add(pointer.relative_to(campaign).as_posix())
+    for relative_name in (
+        ".DATA/ACTIVE_LEARNING/state.json",
+        ".DATA/ACTIVE_LEARNING/config_lock.json",
+        ".DATA/ACTIVE_LEARNING/execution_identity.json",
+        ".DATA/ACTIVE_LEARNING/environment_current.json",
+    ):
+        candidate = campaign / relative_name
+        if candidate.is_file() and not candidate.is_symlink():
+            paths.add(relative_name)
+    environment_current = campaign / ".DATA/ACTIVE_LEARNING/environment_current.json"
+    if environment_current.is_file() and not environment_current.is_symlink():
+        try:
+            current_payload = json.loads(
+                environment_current.read_text(encoding="utf-8"),
+                source=environment_current,
+            )
+            generation = int(current_payload["generation"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ArtefactSnapshotError(
+                "active environment-generation pointer is invalid"
+            ) from exc
+        generation_path = (
+            campaign
+            / ".DATA/ACTIVE_LEARNING/environment_generations"
+            / ("generation-" + str(generation).zfill(6) + ".json")
+        )
+        if not generation_path.is_file() or generation_path.is_symlink():
+            raise ArtefactSnapshotError(
+                "active environment-generation record is missing"
+            )
+        paths.add(generation_path.relative_to(campaign).as_posix())
+    for relative_root in (
+        ".DATA/ACTIVE_LEARNING/submission_intents",
+        ".DATA/ACTIVE_LEARNING/reconcile_transactions",
+        ".DATA/ACTIVE_LEARNING/reference_commit_transactions",
+    ):
+        root = campaign / relative_root
+        if not root.exists():
+            continue
+        if root.is_symlink() or not root.is_dir():
+            raise ArtefactSnapshotError(
+                "authority control root is unsafe: " + str(root)
+            )
+        for candidate in sorted(root.glob("*.json")):
+            if candidate.is_symlink() or not candidate.is_file():
+                raise ArtefactSnapshotError(
+                    "authority control entry is unsafe: " + str(candidate)
+                )
+            paths.add(candidate.relative_to(campaign).as_posix())
     return tuple(sorted(paths))
 
 
@@ -363,12 +435,12 @@ def _manifest_file_count(root: Path, versions: Sequence[int], versioning: Any) -
 def build_committed_artifact_snapshot(
     campaign_dir: Path,
     *,
-    verification_level: str = "metadata",
+    verification_level: str = "authority",
     progress_stream: Optional[TextIO] = None,
 ) -> CommittedArtifactSnapshot:
     level = str(verification_level)
     if level not in VERIFICATION_LEVELS:
-        raise ValueError("artefact verification must be metadata or deep")
+        raise ValueError("artefact verification must be authority, metadata or deep")
     campaign = Path(campaign_dir).resolve()
     reference_versioning = ReferenceDataVersioning(campaign / "QM_REFERENCE_DATA")
     model_versioning = TrainedModelVersioning(campaign / "TRAINED_MODELS")
@@ -377,9 +449,10 @@ def build_committed_artifact_snapshot(
     tracker = _DigestTracker(
         level=level,
         progress_stream=progress_stream,
-        total_pointdirs=_total_pointdirs(
-            campaign / "QM_REFERENCE_DATA",
-            committed_references,
+        total_pointdirs=(
+            _total_pointdirs(campaign / "QM_REFERENCE_DATA", committed_references)
+            if level == "deep"
+            else 0
         ),
     )
     started = time.monotonic()
@@ -387,6 +460,32 @@ def build_committed_artifact_snapshot(
     model_sets: Tuple[TrainedModelSet, ...] = ()
     reference_errors: Dict[int, str] = {}
     model_errors: Dict[int, str] = {}
+    submission_intents: Tuple[Mapping[str, Any], ...] = ()
+    submission_intent_errors: Tuple[Mapping[str, Any], ...] = ()
+    reconcile_transactions: Tuple[Mapping[str, Any], ...] = ()
+    reference_commit_transactions: Tuple[Mapping[str, Any], ...] = ()
+
+    from .reconcile_transaction import inventory_reconcile_transactions
+    from .reference_commit import inventory_reference_commits
+    from .submission_intent import inventory_intents
+
+    intent_inventory = inventory_intents(campaign)
+    submission_intents = tuple(
+        dict(record) for record in intent_inventory.get("records", [])
+    )
+    submission_intent_errors = tuple(
+        dict(record) for record in intent_inventory.get("errors", [])
+    )
+    reconcile_transactions = tuple(
+        dict(record) for record in inventory_reconcile_transactions(campaign)
+    )
+    reference_commit_transactions = tuple(
+        dict(record)
+        for record in inventory_reference_commits(
+            campaign,
+            verification=("authority" if level == "authority" else "metadata"),
+        )
+    )
 
     if committed_references:
         head = max(committed_references)
@@ -482,18 +581,27 @@ def build_committed_artifact_snapshot(
                             + " is invalid"
                         )
 
-    anchor_paths = _authoritative_anchor_paths(campaign, reference_views, model_sets)
+    anchor_paths = _authoritative_anchor_paths(
+        campaign,
+        reference_views,
+        model_sets,
+        verification_level=level,
+    )
     anchor_records = _anchor_records(campaign, anchor_paths)
-    reference_count = _manifest_file_count(
-        campaign / "QM_REFERENCE_DATA",
-        committed_references,
-        reference_versioning,
-    )
-    model_count = _manifest_file_count(
-        campaign / "TRAINED_MODELS",
-        committed_models,
-        model_versioning,
-    )
+    if level == "authority":
+        reference_count = len(anchor_records)
+        model_count = 0
+    else:
+        reference_count = _manifest_file_count(
+            campaign / "QM_REFERENCE_DATA",
+            committed_references,
+            reference_versioning,
+        )
+        model_count = _manifest_file_count(
+            campaign / "TRAINED_MODELS",
+            committed_models,
+            model_versioning,
+        )
     campaign_uids = tuple(
         sorted(
             {
@@ -517,6 +625,10 @@ def build_committed_artifact_snapshot(
         payload_files_hashed=(tracker.payload_files_hashed if level == "deep" else 0),
         payload_bytes_hashed=(tracker.payload_bytes_hashed if level == "deep" else 0),
         elapsed_seconds=float(time.monotonic() - started),
+        submission_intents=submission_intents,
+        submission_intent_errors=submission_intent_errors,
+        reconcile_transactions=reconcile_transactions,
+        reference_commit_transactions=reference_commit_transactions,
     )
 
 

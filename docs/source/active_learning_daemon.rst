@@ -594,21 +594,25 @@ or :code:`ACTIVE_LEARNING/iteration-*` outputs already exist, start refuses
 to create a new state because that could damage provenance. Use reconcile
 instead.
 
-This inspects the on-disk artefacts (committed iterations in
-:code:`QM_REFERENCE_DATA/` and :code:`TRAINED_MODELS/`, plus journal events)
-and proposes a recovered state at :code:`state.json.proposed`. Routine
-reconcile uses metadata verification: schemas, identities, inventories,
-file sizes and hash chains are checked without rereading WFN, INT or Gaussian
-payload bytes. Plain reconcile is diagnostic: it may write the proposal file
-and warn about a live daemon, but it does not alter :code:`state.json`. Review
-the proposal, then promote it manually::
-
-    mv .DATA/ACTIVE_LEARNING/state.json.proposed .DATA/ACTIVE_LEARNING/state.json
-    ichor-al-daemon resume --campaign-dir .
-
-For routine crash recovery, use the guarded apply path instead::
+This inspects the campaign's authority records (committed-version pointers,
+manifests, receipts, submission intents and recovery ledgers) and proposes a
+recovered state at :code:`state.json.proposed`. Routine reconcile uses
+authority verification: schemas, identities, version continuity, parent
+hashes and pointer coherence are checked without recursively walking
+pointdirs, scripts, logs or scratch. WFN, INT, Gaussian and model payloads are
+not opened or statted. Plain reconcile is diagnostic: it may write the
+proposal file and warn about a live daemon, but it does not alter
+:code:`state.json`. Review the proposal, then use the guarded apply path::
 
     ichor-al-daemon reconcile --campaign-dir . --apply
+
+If the active Python, ICHOR, ARIADNE, FEREBUS or machine-profile identity has
+changed, guarded reconcile or the next start/resume automatically records a
+new environment generation when the campaign is at a safe transition
+boundary. An active job, submission intent, publication transaction or unsafe
+phase blocks the transition with the exact reason. No separate environment
+maintenance command is required. Normal status displays the recorded active
+generation without inspecting the current package installation.
 
 When :code:`state.json` is missing or malformed and campaign authority must be
 reconstructed solely from committed artefacts, reconcile reports that deep
@@ -763,5 +767,8 @@ writes one compact FEREBUS row shard, consisting of ``ROW_SHARD.json`` and
 ``ROWS.npy``. ``REFERENCE_COMMIT`` validates and assembles those shards before
 publishing the reference version. Missing or invalid shards are repaired
 serially and reported explicitly; ordinary FEREBUS staging never reparses
-pointdirs. Derived row caches live below ``.DATA/CACHE/FEREBUS_ROWS`` and are
-rebuilt after checkpoint restoration or an environment rebind.
+pointdirs. Derived row caches live below ``.DATA/CACHE/FEREBUS_ROWS``. An
+environment transition preserves them; their feature-contract and row-encoding
+identities are validated before reuse, and incompatible caches are rebuilt
+lazily in a separate namespace. Checkpoint restoration may also require lazy
+cache reconstruction.

@@ -101,19 +101,107 @@ def _error(func, *args, **kwargs) -> Optional[str]:
         return type(exc).__name__ + ": " + str(exc)[:220]
 
 
-def _require_pool(campaign: Path) -> None:
-    pool = TrajectoryPool.load(campaign)
-    if pool.manifest.natoms <= 0:
+def _require_pool(campaign: Path, *, verification: str = "metadata") -> None:
+    if verification == "authority":
+        from ..acquisition.trajectory_pool import (
+            POOL_MANIFEST_FILENAME,
+            POOL_SUBDIR,
+            TrajectoryPoolManifest,
+        )
+
+        manifest_path = campaign / POOL_SUBDIR / POOL_MANIFEST_FILENAME
+        manifest = TrajectoryPoolManifest.from_dict(
+            json.loads(
+                manifest_path.read_text(encoding="utf-8"),
+                source=manifest_path,
+            )
+        )
+    elif verification in {"metadata", "deep"}:
+        manifest = TrajectoryPool.load(campaign).manifest
+    else:
+        raise RecoveryContractError("pool verification level is invalid")
+    if manifest.natoms <= 0:
         raise RecoveryContractError("trajectory pool atom count is not positive")
 
 
-def _require_phase_a(campaign: Path) -> None:
+def _require_phase_a(campaign: Path, *, verification: str = "metadata") -> None:
     from ..layout import bootstrap_selection_dir
 
-    read_phase_a_sample_manifest(
-        bootstrap_selection_dir(campaign),
-        require_nonempty=True,
+    root = bootstrap_selection_dir(campaign)
+    if verification == "authority":
+        from ..handoff_manifests import (
+            PHASE_A_SAMPLE_SCHEMA_VERSION,
+            phase_a_sample_manifest_path,
+        )
+        from ..sampling.diversity_contract import selector_contract_matches
+
+        path = phase_a_sample_manifest_path(root)
+        payload = json.loads(path.read_text(encoding="utf-8"), source=path)
+        if not isinstance(payload, dict):
+            raise RecoveryContractError("Phase A sample manifest must be an object")
+        n_select = payload.get("n_select")
+        if (
+            payload.get("schema_version") != PHASE_A_SAMPLE_SCHEMA_VERSION
+            or payload.get("phase") != CampaignPhase.PHASE_A_DIVERSITY.value
+            or payload.get("iteration") != 0
+            or isinstance(n_select, bool)
+            or not isinstance(n_select, int)
+            or n_select <= 0
+            or not selector_contract_matches(payload.get("selector"))
+        ):
+            raise RecoveryContractError("Phase A sample authority is invalid")
+        return
+    if verification not in {"metadata", "deep"}:
+        raise RecoveryContractError("Phase A verification level is invalid")
+    read_phase_a_sample_manifest(root, require_nonempty=True)
+
+
+def _require_quantum_acceptance_authority(
+    staging: Path,
+    *,
+    expected_phase: str,
+    expected_iteration: int,
+    require_nonempty: bool,
+) -> None:
+    from .input_staging import (
+        QUANTUM_ACCEPTANCE_SCHEMA_VERSION,
+        _validate_pointdir_basename,
+        quantum_acceptance_manifest_path,
     )
+
+    path = quantum_acceptance_manifest_path(
+        staging,
+        phase_name=expected_phase,
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"), source=path)
+    if not isinstance(payload, dict):
+        raise RecoveryContractError("quantum acceptance manifest must be an object")
+    accepted = payload.get("accepted_pointdirs")
+    rejected = payload.get("rejected", [])
+    total = payload.get("n_total")
+    if (
+        payload.get("schema_version") != QUANTUM_ACCEPTANCE_SCHEMA_VERSION
+        or payload.get("phase") != expected_phase
+        or payload.get("iteration") != int(expected_iteration)
+        or not isinstance(accepted, list)
+        or not isinstance(rejected, list)
+        or isinstance(total, bool)
+        or not isinstance(total, int)
+        or total != len(accepted) + len(rejected)
+        or (require_nonempty and not accepted)
+    ):
+        raise RecoveryContractError("quantum acceptance authority is invalid")
+    names = [_validate_pointdir_basename(name) for name in accepted]
+    for record in rejected:
+        if not isinstance(record, dict) or set(record) != {"pointdir", "reason"}:
+            raise RecoveryContractError("quantum rejection authority is invalid")
+        names.append(_validate_pointdir_basename(record.get("pointdir")))
+        if not isinstance(record.get("reason"), str) or not str(
+            record.get("reason")
+        ).strip():
+            raise RecoveryContractError("quantum rejection reason is invalid")
+    if len(names) != len(set(names)):
+        raise RecoveryContractError("quantum acceptance dispositions are duplicated")
 
 
 def _require_point_allocation(
@@ -197,6 +285,7 @@ def _require_replacement_gaussian_handoff(
     context: str,
     iteration: int,
     replacement_round: int,
+    verification: str = "metadata",
 ) -> None:
     round_dir = _require_replacement_sample(
         campaign,
@@ -209,23 +298,46 @@ def _require_replacement_gaussian_handoff(
         if context == "bootstrap"
         else CampaignPhase.REPLACEMENT_GAUSSIAN
     )
-    _stg.read_quantum_acceptance_manifest(
-        round_dir,
-        expected_phase=phase.value,
-        expected_iteration=int(iteration),
-        require_nonempty=False,
-        require_points_file_membership=True,
-    )
+    if verification == "authority":
+        _require_quantum_acceptance_authority(
+            round_dir,
+            expected_phase=phase.value,
+            expected_iteration=int(iteration),
+            require_nonempty=False,
+        )
+    else:
+        _stg.read_quantum_acceptance_manifest(
+            round_dir,
+            expected_phase=phase.value,
+            expected_iteration=int(iteration),
+            require_nonempty=False,
+            require_points_file_membership=True,
+        )
 
 
-def _require_initial_quantum(campaign: Path, phase: CampaignPhase, iteration: int) -> None:
-    _stg.read_quantum_acceptance_manifest(
-        campaign / ".DATA" / "STAGING" / "initial",
-        expected_phase=phase.value,
-        expected_iteration=int(iteration),
-        require_nonempty=True,
-        require_points_file_membership=True,
-    )
+def _require_initial_quantum(
+    campaign: Path,
+    phase: CampaignPhase,
+    iteration: int,
+    *,
+    verification: str = "metadata",
+) -> None:
+    staging = campaign / ".DATA" / "STAGING" / "initial"
+    if verification == "authority":
+        _require_quantum_acceptance_authority(
+            staging,
+            expected_phase=phase.value,
+            expected_iteration=int(iteration),
+            require_nonempty=True,
+        )
+    else:
+        _stg.read_quantum_acceptance_manifest(
+            staging,
+            expected_phase=phase.value,
+            expected_iteration=int(iteration),
+            require_nonempty=True,
+            require_points_file_membership=True,
+        )
 
 
 def _require_initial_ferebus_input(
@@ -233,12 +345,15 @@ def _require_initial_ferebus_input(
     iteration: int,
     reference_data_version: int,
     model_version: int,
+    *,
+    verification: str = "metadata",
 ) -> None:
     try:
         _require_initial_quantum(
             campaign,
             CampaignPhase.INITIAL_AIMALL,
             int(iteration),
+            verification=verification,
         )
         return
     except Exception as handoff_error:
@@ -262,14 +377,29 @@ def _require_initial_ferebus_input(
         raise
 
 
-def _require_iter_quantum(campaign: Path, phase: CampaignPhase, iteration: int) -> None:
-    _stg.read_quantum_acceptance_manifest(
-        campaign / ".DATA" / "STAGING" / ("iter_" + str(int(iteration))),
-        expected_phase=phase.value,
-        expected_iteration=int(iteration),
-        require_nonempty=True,
-        require_points_file_membership=True,
-    )
+def _require_iter_quantum(
+    campaign: Path,
+    phase: CampaignPhase,
+    iteration: int,
+    *,
+    verification: str = "metadata",
+) -> None:
+    staging = campaign / ".DATA" / "STAGING" / ("iter_" + str(int(iteration)))
+    if verification == "authority":
+        _require_quantum_acceptance_authority(
+            staging,
+            expected_phase=phase.value,
+            expected_iteration=int(iteration),
+            require_nonempty=True,
+        )
+    else:
+        _stg.read_quantum_acceptance_manifest(
+            staging,
+            expected_phase=phase.value,
+            expected_iteration=int(iteration),
+            require_nonempty=True,
+            require_points_file_membership=True,
+        )
 
 
 def _require_seeds(campaign: Path, iteration: int) -> None:
@@ -278,20 +408,149 @@ def _require_seeds(campaign: Path, iteration: int) -> None:
     load_seeds_picked(iteration_dir(campaign, iteration), expected_iteration=int(iteration))
 
 
+def _authority_integer(value: Any, label: str, *, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RecoveryContractError(label + " must be an integer")
+    result = int(value)
+    if result < int(minimum):
+        raise RecoveryContractError(
+            label + " must be >= " + str(int(minimum))
+        )
+    return result
+
+
+def _authority_json_object(path: Path, label: str) -> Dict[str, Any]:
+    if path.is_symlink() or not path.is_file():
+        raise RecoveryContractError(label + " is not a regular file: " + str(path))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RecoveryContractError(label + " is unreadable: " + str(path)) from exc
+    if not isinstance(payload, dict):
+        raise RecoveryContractError(label + " must be a JSON object")
+    return dict(payload)
+
+
+def _require_ariadne_results_authority(
+    campaign: Path,
+    iteration: int,
+    expected_campaign_uid: Optional[str],
+) -> Dict[str, Any]:
+    """Validate the bounded ARIADNE authority without opening seed payloads."""
+    from ..handoff_manifests import (
+        ARIADNE_RESULTS_SCHEMA_VERSION,
+        ariadne_results_path,
+        read_ariadne_batch_decision,
+    )
+    from ..seed_identity import read_ariadne_task_map
+
+    idir = iteration_dir(campaign, iteration)
+    path = ariadne_results_path(idir)
+    payload = _authority_json_object(path, "ARIADNE results manifest")
+    if _authority_integer(
+        payload.get("schema_version"),
+        "ARIADNE results schema_version",
+        minimum=1,
+    ) != ARIADNE_RESULTS_SCHEMA_VERSION:
+        raise RecoveryContractError("unsupported ARIADNE results manifest schema")
+    if _authority_integer(
+        payload.get("iteration"), "ARIADNE results iteration", minimum=1
+    ) != int(iteration):
+        raise RecoveryContractError("ARIADNE results manifest iteration mismatch")
+    campaign_uid = str(payload.get("campaign_uid") or "")
+    if not campaign_uid:
+        raise RecoveryContractError("ARIADNE results campaign UID is missing")
+    if expected_campaign_uid is not None and campaign_uid != str(
+        expected_campaign_uid
+    ):
+        raise RecoveryContractError("ARIADNE results campaign UID mismatch")
+    accepted = payload.get("accepted")
+    rejected = payload.get("rejected")
+    if not isinstance(accepted, list) or not isinstance(rejected, list):
+        raise RecoveryContractError(
+            "ARIADNE results accepted/rejected records must be lists"
+        )
+    expected_n = _authority_integer(
+        payload.get("expected_n"), "ARIADNE expected_n", minimum=1
+    )
+    if _authority_integer(
+        payload.get("n_accepted"), "ARIADNE n_accepted"
+    ) != len(accepted):
+        raise RecoveryContractError("ARIADNE n_accepted does not match its records")
+    if _authority_integer(
+        payload.get("n_rejected"), "ARIADNE n_rejected"
+    ) != len(rejected):
+        raise RecoveryContractError("ARIADNE n_rejected does not match its records")
+    if expected_n != len(accepted) + len(rejected) or not accepted:
+        raise RecoveryContractError("ARIADNE results counts are inconsistent")
+
+    task_map = read_ariadne_task_map(idir, expected_iteration=int(iteration))
+    if str(task_map.get("campaign_uid") or "") != campaign_uid:
+        raise RecoveryContractError("ARIADNE results/task-map campaign UID mismatch")
+    if int(task_map.get("n_tasks", -1)) != expected_n:
+        raise RecoveryContractError("ARIADNE results/task-map count mismatch")
+    task_by_seed = {
+        int(task["seed_id"]): dict(task) for task in list(task_map.get("tasks") or [])
+    }
+    seen = set()
+    for label, records in (("accepted", accepted), ("rejected", rejected)):
+        for record in records:
+            if not isinstance(record, dict):
+                raise RecoveryContractError(
+                    label + " ARIADNE record must be an object"
+                )
+            seed_id = _authority_integer(
+                record.get("seed_id"), label + " ARIADNE seed_id", minimum=1
+            )
+            task = task_by_seed.get(seed_id)
+            if task is None or seed_id in seen:
+                raise RecoveryContractError(
+                    "invalid or duplicate " + label + " ARIADNE seed_id"
+                )
+            seen.add(seed_id)
+            if str(record.get("seed_uid") or "") != str(task.get("seed_uid") or ""):
+                raise RecoveryContractError(label + " ARIADNE seed UID mismatch")
+            if label == "accepted":
+                safety = record.get("landing_safety")
+                if not isinstance(safety, dict) or safety.get("accepted") is not True:
+                    raise RecoveryContractError(
+                        "accepted ARIADNE record lacks accepted landing safety"
+                    )
+    if seen != set(task_by_seed):
+        raise RecoveryContractError("ARIADNE results do not cover every task-map seed")
+
+    read_ariadne_batch_decision(
+        idir,
+        expected_iteration=int(iteration),
+        expected_campaign_uid=campaign_uid,
+        require_accepted=True,
+    )
+    return payload
+
+
 def _require_ariadne_results(
     campaign: Path,
     iteration: int,
     expected_campaign_uid: Optional[str] = None,
+    *,
+    verification: str = "metadata",
 ) -> None:
     from ..config import CampaignConfig
     from .config_lock import canonical_config, config_fingerprint
     from ..handoff_manifests import read_ariadne_batch_decision
 
-    read_ariadne_results_manifest(
-        iteration_dir(campaign, iteration),
-        expected_iteration=int(iteration),
-        require_nonempty=True,
-    )
+    if verification == "authority":
+        _require_ariadne_results_authority(
+            campaign,
+            int(iteration),
+            expected_campaign_uid,
+        )
+    else:
+        read_ariadne_results_manifest(
+            iteration_dir(campaign, iteration),
+            expected_iteration=int(iteration),
+            require_nonempty=True,
+        )
     config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
     read_ariadne_batch_decision(
         iteration_dir(campaign, iteration),
@@ -332,19 +591,192 @@ def _count_xyz_frames(path: Path) -> int:
     return n_frames
 
 
+def _require_phase_b_authority(
+    campaign: Path,
+    iteration: int,
+    expected_campaign_uid: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Validate Phase B authority without reading XYZ or per-seed payloads."""
+    from ..handoff_manifests import (
+        PHASE_B_SELECTION_SCHEMA_VERSION,
+        ariadne_results_path,
+        phase_b_selection_path,
+    )
+    from ..point_allocation import read_point_allocation
+    from ..sampling.diversity_contract import selector_contract_matches
+    from ..versioning.manifest import sha256_file
+    from .filesystem import campaign_owned_path
+
+    idir = iteration_dir(campaign, iteration)
+    path = phase_b_selection_path(idir)
+    payload = _authority_json_object(path, "Phase B selection manifest")
+    if _authority_integer(
+        payload.get("schema_version"), "Phase B schema_version", minimum=1
+    ) != PHASE_B_SELECTION_SCHEMA_VERSION:
+        raise RecoveryContractError("unsupported Phase B selection manifest schema")
+    if _authority_integer(
+        payload.get("iteration"), "Phase B iteration", minimum=1
+    ) != int(iteration):
+        raise RecoveryContractError("Phase B selection manifest iteration mismatch")
+    campaign_uid = str(payload.get("campaign_uid") or "")
+    if not campaign_uid:
+        raise RecoveryContractError("Phase B campaign UID is missing")
+    if expected_campaign_uid is not None and campaign_uid != str(
+        expected_campaign_uid
+    ):
+        raise RecoveryContractError("Phase B campaign UID mismatch")
+    if str(payload.get("status") or "") != "complete":
+        raise RecoveryContractError("Phase B selection is not complete")
+    considered = payload.get("considered")
+    final = payload.get("final")
+    if not isinstance(considered, list) or not isinstance(final, list):
+        raise RecoveryContractError("Phase B considered/final records must be lists")
+    if not final:
+        raise RecoveryContractError("Phase B final records are empty")
+    if payload.get("n_considered") is not None and _authority_integer(
+        payload.get("n_considered"), "Phase B n_considered"
+    ) != len(considered):
+        raise RecoveryContractError("Phase B n_considered mismatch")
+    if payload.get("n_kept") is not None and _authority_integer(
+        payload.get("n_kept"), "Phase B n_kept"
+    ) != len(final):
+        raise RecoveryContractError("Phase B n_kept mismatch")
+
+    source_raw = payload.get("source_ariadne_manifest")
+    if not isinstance(source_raw, str) or not source_raw:
+        raise RecoveryContractError("Phase B source ARIADNE manifest is missing")
+    source = campaign_owned_path(campaign, idir / source_raw)
+    expected_source = campaign_owned_path(campaign, ariadne_results_path(idir))
+    if source != expected_source or not source.is_file():
+        raise RecoveryContractError("Phase B source ARIADNE manifest is noncanonical")
+    if str(payload.get("source_ariadne_manifest_sha256") or "") != sha256_file(
+        source
+    ):
+        raise RecoveryContractError("Phase B source ARIADNE manifest hash mismatch")
+    ariadne = _require_ariadne_results_authority(
+        campaign,
+        int(iteration),
+        campaign_uid,
+    )
+    accepted_by_seed = {
+        int(record["seed_id"]): dict(record)
+        for record in list(ariadne.get("accepted") or [])
+    }
+
+    allocation = payload.get("point_allocation")
+    if not isinstance(allocation, dict):
+        raise RecoveryContractError("Phase B point-allocation binding is missing")
+    allocation_raw = allocation.get("manifest")
+    if not isinstance(allocation_raw, str) or not allocation_raw:
+        raise RecoveryContractError("Phase B point-allocation path is missing")
+    allocation_path = campaign_owned_path(campaign, idir / allocation_raw)
+    allocation_payload = read_point_allocation(
+        allocation_path,
+        expected_campaign_uid=campaign_uid,
+    )
+    if str(allocation.get("slot_assignment_sha256") or "") != str(
+        allocation_payload.get("slot_assignment_sha256") or ""
+    ):
+        raise RecoveryContractError("Phase B point-allocation assignment mismatch")
+    if not selector_contract_matches(payload.get("selector")):
+        raise RecoveryContractError("Phase B selector contract is invalid")
+
+    considered_kept = set()
+    considered_seeds = set()
+    for rank, record in enumerate(considered, start=1):
+        if not isinstance(record, dict):
+            raise RecoveryContractError("Phase B considered record must be an object")
+        if _authority_integer(
+            record.get("considered_rank"), "Phase B considered_rank", minimum=1
+        ) != rank:
+            raise RecoveryContractError("Phase B considered ranks are not contiguous")
+        seed_id = _authority_integer(
+            record.get("seed_id"), "Phase B considered seed_id", minimum=1
+        )
+        source_record = accepted_by_seed.get(seed_id)
+        if source_record is None or seed_id in considered_seeds:
+            raise RecoveryContractError("Phase B considered seed mapping is invalid")
+        considered_seeds.add(seed_id)
+        if str(record.get("seed_uid") or "") != str(
+            source_record.get("seed_uid") or ""
+        ):
+            raise RecoveryContractError("Phase B considered seed UID mismatch")
+        kept = record.get("kept_after_dedup")
+        if kept is not True and kept is not False:
+            raise RecoveryContractError("Phase B kept_after_dedup must be Boolean")
+        final_rank = record.get("final_rank")
+        if kept:
+            considered_kept.add(
+                _authority_integer(
+                    final_rank, "Phase B considered final_rank", minimum=1
+                )
+            )
+        elif final_rank is not None:
+            raise RecoveryContractError(
+                "dropped Phase B considered record has a final rank"
+            )
+
+    final_ranks = set()
+    final_considered = set()
+    for record in final:
+        if not isinstance(record, dict):
+            raise RecoveryContractError("Phase B final record must be an object")
+        final_rank = _authority_integer(
+            record.get("final_rank"), "Phase B final_rank", minimum=1
+        )
+        considered_rank = _authority_integer(
+            record.get("considered_rank"),
+            "Phase B final considered_rank",
+            minimum=1,
+        )
+        if final_rank in final_ranks or considered_rank in final_considered:
+            raise RecoveryContractError("Phase B final ranks are duplicated")
+        final_ranks.add(final_rank)
+        final_considered.add(considered_rank)
+        if record.get("kept_after_dedup") is not True:
+            raise RecoveryContractError("Phase B final record is not marked kept")
+        seed_id = _authority_integer(
+            record.get("seed_id"), "Phase B final seed_id", minimum=1
+        )
+        source_record = accepted_by_seed.get(seed_id)
+        if source_record is None or str(record.get("seed_uid") or "") != str(
+            source_record.get("seed_uid") or ""
+        ):
+            raise RecoveryContractError("Phase B final seed mapping is invalid")
+    expected_ranks = set(range(1, len(final) + 1))
+    if final_ranks != expected_ranks or considered_kept != expected_ranks:
+        raise RecoveryContractError("Phase B final rank coverage is invalid")
+    if final_considered != {
+        int(record["considered_rank"])
+        for record in considered
+        if record.get("kept_after_dedup") is True
+    }:
+        raise RecoveryContractError("Phase B final/considered mapping is invalid")
+    return payload
+
+
 def _phase_b_final_count(
     campaign: Path,
     iteration: int,
     expected_campaign_uid: Optional[str] = None,
+    *,
+    verification: str = "metadata",
 ) -> int:
     idir = iteration_dir(campaign, iteration)
-    from ..handoff_manifests import validate_phase_b_handoff
+    if verification == "authority":
+        manifest = _require_phase_b_authority(
+            campaign,
+            int(iteration),
+            expected_campaign_uid,
+        )
+    else:
+        from ..handoff_manifests import validate_phase_b_handoff
 
-    manifest = validate_phase_b_handoff(
-        idir,
-        expected_iteration=int(iteration),
-        expected_campaign_uid=expected_campaign_uid,
-    )
+        manifest = validate_phase_b_handoff(
+            idir,
+            expected_iteration=int(iteration),
+            expected_campaign_uid=expected_campaign_uid,
+        )
     n_final = len(list(manifest.get("final") or []))
     return int(n_final)
 
@@ -353,11 +785,14 @@ def _require_phase_b(
     campaign: Path,
     iteration: int,
     expected_campaign_uid: Optional[str] = None,
+    *,
+    verification: str = "metadata",
 ) -> None:
     _phase_b_final_count(
         campaign,
         int(iteration),
         expected_campaign_uid=expected_campaign_uid,
+        verification=verification,
     )
 
 
@@ -645,14 +1080,26 @@ def protected_staging_handoff(
             ".DATA/STAGING/iter_" + str(int(iteration)),
             replacement_round=int(allocation_decision.replacement_round),
         )
-    if _ok(_require_iter_quantum, campaign, CampaignPhase.AIMALL, int(iteration)):
+    if _ok(
+        _require_iter_quantum,
+        campaign,
+        CampaignPhase.AIMALL,
+        int(iteration),
+        verification=verification,
+    ):
         return RecoveryDecision(
             CampaignPhase.AIMALL,
             int(iteration),
             "AIMALL: acceptance handoff exists and point-allocation recording must be verified",
             ".DATA/STAGING/iter_" + str(int(iteration)),
         )
-    if _ok(_require_iter_quantum, campaign, CampaignPhase.GAUSSIAN, int(iteration)):
+    if _ok(
+        _require_iter_quantum,
+        campaign,
+        CampaignPhase.GAUSSIAN,
+        int(iteration),
+        verification=verification,
+    ):
         return RecoveryDecision(
             CampaignPhase.AIMALL,
             int(iteration),
@@ -673,8 +1120,10 @@ def staging_handoff_decisions(
     """Return valid quantum staging handoffs that must not be archived."""
     campaign = Path(campaign_dir)
     decisions: List[RecoveryDecision] = []
-    models_version = int(getattr(state, "models_version", -1))
-    if include_committed or models_version < 0:
+    reference_data_version = int(
+        getattr(state, "reference_data_version", -1)
+    )
+    if include_committed or reference_data_version < 0:
         allocation_decision = _allocation_recovery_decision(
             campaign,
             context="bootstrap",
@@ -692,7 +1141,13 @@ def staging_handoff_decisions(
                     replacement_round=int(allocation_decision.replacement_round),
                 )
             )
-        elif _ok(_require_initial_quantum, campaign, CampaignPhase.INITIAL_AIMALL, 0):
+        elif _ok(
+            _require_initial_quantum,
+            campaign,
+            CampaignPhase.INITIAL_AIMALL,
+            0,
+            verification=verification,
+        ):
             decisions.append(
                 RecoveryDecision(
                     CampaignPhase.INITIAL_AIMALL,
@@ -701,7 +1156,13 @@ def staging_handoff_decisions(
                     ".DATA/STAGING/initial",
                 )
             )
-        elif _ok(_require_initial_quantum, campaign, CampaignPhase.INITIAL_GAUSSIAN, 0):
+        elif _ok(
+            _require_initial_quantum,
+            campaign,
+            CampaignPhase.INITIAL_GAUSSIAN,
+            0,
+            verification=verification,
+        ):
             decisions.append(
                 RecoveryDecision(
                     CampaignPhase.INITIAL_AIMALL,
@@ -770,7 +1231,12 @@ def _best_active_iteration_handoff(
             40,
             "split",
         )
-    if _ok(_require_phase_b, campaign, int(iteration)):
+    if _ok(
+        _require_phase_b,
+        campaign,
+        int(iteration),
+        verification=verification,
+    ):
         from ..handoff_manifests import phase_b_selection_path
 
         return RecoveryHandoff(
@@ -783,7 +1249,12 @@ def _best_active_iteration_handoff(
             30,
             "phase_b",
         )
-    if _ok(_require_ariadne_results, campaign, int(iteration)):
+    if _ok(
+        _require_ariadne_results,
+        campaign,
+        int(iteration),
+        verification=verification,
+    ):
         from ..handoff_manifests import ariadne_results_path
 
         return RecoveryHandoff(
@@ -872,10 +1343,16 @@ def _phase_contract_checks(
 
     checks: Dict[CampaignPhase, List[Tuple[str, Callable[[], None]]]] = {
         CampaignPhase.PHASE_A_DIVERSITY: [
-            ("trajectory pool", lambda: _require_pool(campaign)),
+            (
+                "trajectory pool",
+                lambda: _require_pool(campaign, verification=verification),
+            ),
         ],
         CampaignPhase.INITIAL_GAUSSIAN: [
-            ("Phase A sample", lambda: _require_phase_a(campaign)),
+            (
+                "Phase A sample",
+                lambda: _require_phase_a(campaign, verification=verification),
+            ),
         ],
         CampaignPhase.INITIAL_AIMALL: [
             (
@@ -884,6 +1361,7 @@ def _phase_contract_checks(
                     campaign,
                     CampaignPhase.INITIAL_GAUSSIAN,
                     iteration,
+                    verification=verification,
                 ),
             ),
         ],
@@ -905,6 +1383,7 @@ def _phase_contract_checks(
                     context="bootstrap",
                     iteration=0,
                     replacement_round=int(getattr(state, "replacement_round", 0)),
+                    verification=verification,
                 ),
             ),
         ],
@@ -960,7 +1439,10 @@ def _phase_contract_checks(
                     artifact_snapshot=artifact_snapshot,
                 ),
             ),
-            ("trajectory pool", lambda: _require_pool(campaign)),
+            (
+                "trajectory pool",
+                lambda: _require_pool(campaign, verification=verification),
+            ),
         ],
         CampaignPhase.ARIADNE_ARRAY: [
             ("seed_selection/SELECTION.json", lambda: _require_seeds(campaign, iteration)),
@@ -972,6 +1454,7 @@ def _phase_contract_checks(
                     campaign,
                     iteration,
                     str(state.campaign_uid),
+                    verification=verification,
                 ),
             ),
         ],
@@ -982,6 +1465,7 @@ def _phase_contract_checks(
                     campaign,
                     iteration,
                     str(state.campaign_uid),
+                    verification=verification,
                 ),
             ),
         ],
@@ -992,6 +1476,7 @@ def _phase_contract_checks(
                     campaign,
                     iteration,
                     str(state.campaign_uid),
+                    verification=verification,
                 ),
             ),
             ("allocation/SPLIT_RECEIPT.json", lambda: _require_split(campaign, iteration)),
@@ -1003,6 +1488,7 @@ def _phase_contract_checks(
                     campaign,
                     CampaignPhase.GAUSSIAN,
                     iteration,
+                    verification=verification,
                 ),
             ),
         ],
@@ -1024,6 +1510,7 @@ def _phase_contract_checks(
                     context="active",
                     iteration=iteration,
                     replacement_round=int(getattr(state, "replacement_round", 0)),
+                    verification=verification,
                 ),
             ),
         ],
@@ -1136,21 +1623,33 @@ def select_recovery_phase(
         )
         if allocation_decision is not None:
             return allocation_decision
-        if _ok(_require_initial_quantum, campaign, CampaignPhase.INITIAL_AIMALL, iteration):
+        if _ok(
+            _require_initial_quantum,
+            campaign,
+            CampaignPhase.INITIAL_AIMALL,
+            iteration,
+            verification=verification,
+        ):
             return RecoveryDecision(
                 CampaignPhase.INITIAL_AIMALL,
                 iteration,
                 "INITIAL_AIMALL: acceptance exists and point-allocation recording must be verified",
                 ".DATA/STAGING/initial",
             )
-        if _ok(_require_initial_quantum, campaign, CampaignPhase.INITIAL_GAUSSIAN, iteration):
+        if _ok(
+            _require_initial_quantum,
+            campaign,
+            CampaignPhase.INITIAL_GAUSSIAN,
+            iteration,
+            verification=verification,
+        ):
             return RecoveryDecision(
                 CampaignPhase.INITIAL_AIMALL,
                 iteration,
                 "INITIAL_AIMALL: valid initial Gaussian handoff exists without committed models",
                 ".DATA/STAGING/initial",
             )
-        if _ok(_require_phase_a, campaign):
+        if _ok(_require_phase_a, campaign, verification=verification):
             return RecoveryDecision(
                 CampaignPhase.INITIAL_GAUSSIAN,
                 iteration,
@@ -1160,7 +1659,7 @@ def select_recovery_phase(
         if (
             bool(last_phase_retryable)
             and str(last_phase or "") == CampaignPhase.PHASE_A_DIVERSITY.value
-            and _ok(_require_pool, campaign)
+            and _ok(_require_pool, campaign, verification=verification)
         ):
             return RecoveryDecision(
                 CampaignPhase.PHASE_A_DIVERSITY,
@@ -1173,7 +1672,11 @@ def select_recovery_phase(
                 existing_phase = CampaignPhase(state.phase)
             except Exception:
                 existing_phase = CampaignPhase.HALTED
-            if existing_phase is CampaignPhase.PHASE_A_DIVERSITY and _ok(_require_pool, campaign):
+            if existing_phase is CampaignPhase.PHASE_A_DIVERSITY and _ok(
+                _require_pool,
+                campaign,
+                verification=verification,
+            ):
                 return RecoveryDecision(
                     CampaignPhase.PHASE_A_DIVERSITY,
                     iteration,
@@ -1287,7 +1790,7 @@ def select_recovery_phase(
         and reference_data_version == model_version
         and _has_version(valid_reference_data_versions, reference_data_version)
         and _has_version(valid_model_versions, model_version)
-        and _ok(_require_pool, campaign)
+        and _ok(_require_pool, campaign, verification=verification)
     ):
         return RecoveryDecision(
             CampaignPhase.SEED_SELECT,

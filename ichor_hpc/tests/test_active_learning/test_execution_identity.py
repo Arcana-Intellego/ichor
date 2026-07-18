@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
-import argparse
 
 import pytest
 
@@ -32,11 +32,7 @@ from ichor.hpc.active_learning.daemon.state import (
 from ichor.hpc.active_learning.daemon.daemon import Daemon, TickStatus
 from ichor.hpc.active_learning.daemon.phase_executor import PhaseResult
 from ichor.hpc.active_learning.daemon.submission_intent import load_intent
-from ichor.hpc.active_learning.cli import (
-    build_parser,
-    cmd_environment_status,
-    cmd_rebind_environment,
-)
+from ichor.hpc.active_learning.cli import build_parser
 
 
 def _fake_generation(*args, campaign_uid, config, generation=0, **kwargs):
@@ -82,6 +78,25 @@ def test_first_start_requires_explicit_mode(tmp_path):
         )
 
     assert not execution_identity_path(tmp_path).exists()
+
+
+def test_package_identity_never_uses_recursive_filesystem_walkers(
+    tmp_path,
+    monkeypatch,
+):
+    package_root = tmp_path / "bounded_package"
+    package_root.mkdir()
+    (package_root / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    def refuse_recursive_walk(*_args, **_kwargs):
+        raise AssertionError("environment capture attempted a recursive walk")
+
+    monkeypatch.setattr(Path, "rglob", refuse_recursive_walk)
+    monkeypatch.setattr(os, "walk", refuse_recursive_walk)
+
+    observed = execution_identity_module._tree_hash([package_root])
+
+    assert len(observed) == 64
 
 
 def test_first_start_binds_mode_seed_and_environment_generation(
@@ -374,9 +389,17 @@ def _rebind_campaign(tmp_path, monkeypatch):
 
 def test_rebind_rejects_non_idle_or_scheduler_owned_state(tmp_path, monkeypatch):
     campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
     state.phase = CampaignPhase.ARIADNE_ARRAY
     write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
-    with pytest.raises(ExecutionIdentityError, match="idle SEED_SELECT or DONE"):
+    with pytest.raises(
+        ExecutionIdentityError,
+        match="SEED_SELECT, STOP_CHECK or DONE",
+    ):
         rebind_environment(campaign, config=config)
 
     state.phase = CampaignPhase.SEED_SELECT
@@ -433,6 +456,11 @@ def test_rebind_rejects_unverified_or_published_reference_commit_recovery(
     transaction_state,
 ):
     campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
     state.phase = CampaignPhase.REFERENCE_COMMIT
     state.iteration = 0
     state.reference_data_version = -1
@@ -461,6 +489,11 @@ def test_rebind_rejects_reference_commit_transaction_identity_mismatch(
     monkeypatch,
 ):
     campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
     state.phase = CampaignPhase.REFERENCE_COMMIT
     state.iteration = 0
     state.reference_data_version = -1
@@ -559,6 +592,11 @@ def test_rebind_requires_reconcile_to_archive_failed_ferebus_staging(
     monkeypatch,
 ):
     campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
     state.phase = CampaignPhase.INITIAL_FEREBUS
     state.iteration = 0
     state.reference_data_version = 0
@@ -578,6 +616,11 @@ def test_rebind_rejects_ferebus_current_pointer_mismatch(tmp_path, monkeypatch):
     from ichor.hpc.active_learning.versioning import reference_data, trained_models
 
     campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
     state.phase = CampaignPhase.INITIAL_FEREBUS
     state.iteration = 0
     state.reference_data_version = 0
@@ -604,6 +647,11 @@ def test_rebind_rejects_ferebus_current_pointer_mismatch(tmp_path, monkeypatch):
 
 def test_rebind_requires_conclusive_scheduler_clearance(tmp_path, monkeypatch):
     campaign, config, _state = _rebind_campaign(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
 
     with pytest.raises(ExecutionIdentityError, match="conclusive scheduler"):
         rebind_environment(campaign, config=config)
@@ -671,12 +719,11 @@ def _changed_generation(*args, campaign_uid, config, generation=0, **kwargs):
     return payload
 
 
-def test_rebind_rebuilds_row_caches_before_publishing_generation(
+def test_environment_transition_preserves_row_caches_for_lazy_validation(
     tmp_path,
     monkeypatch,
 ):
     from ichor.hpc.active_learning.daemon import ferebus_row_cache
-    from ichor.hpc.active_learning.versioning import reference_data
 
     campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
     state.reference_data_version = 0
@@ -685,12 +732,6 @@ def test_rebind_rebuilds_row_caches_before_publishing_generation(
         execution_identity_module,
         "capture_environment_generation",
         _changed_generation,
-    )
-    reference_view = SimpleNamespace(version=0)
-    monkeypatch.setattr(
-        reference_data.ReferenceDataVersioning,
-        "resolve",
-        lambda *_args, **_kwargs: reference_view,
     )
     calls = []
     monkeypatch.setattr(
@@ -711,7 +752,35 @@ def test_rebind_rebuilds_row_caches_before_publishing_generation(
     )
 
     assert result["generation"] == 1
-    assert calls == ["clear", ("rebuild", reference_view)]
+    assert calls == []
+
+
+def test_daemon_start_automatically_advances_safe_environment_drift(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, config, _state = _rebind_campaign(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
+    daemon = Daemon(
+        campaign_dir=campaign,
+        config=config,
+        executor=_SubmittedExecutor(),
+        environment_preflight_ok=True,
+    )
+
+    rc = daemon.run(max_ticks=0)
+
+    assert rc == 0
+    active = read_active_environment_generation(
+        campaign,
+        expected_campaign_uid="uid-rebind",
+    )["generation"]
+    assert active["generation"] == 1
+    assert active["python_version"] == "3.11.rebound"
 
 
 def test_rebind_replays_generation_after_state_write_failure(tmp_path, monkeypatch):
@@ -924,7 +993,7 @@ def test_submission_intent_snapshots_active_environment(tmp_path, monkeypatch):
     )
 
 
-def test_daemon_halts_before_submission_when_environment_drifted(
+def test_daemon_does_not_recapture_environment_on_every_phase_entry(
     tmp_path,
     monkeypatch,
 ):
@@ -937,14 +1006,11 @@ def test_daemon_halts_before_submission_when_environment_drifted(
 
     result = daemon._on_phase_entry(state, state.phase)
 
-    assert result == TickStatus.HALTED
-    assert executor.submissions == 0
-    halted = read_state(daemon.state_path())
-    assert halted.phase is CampaignPhase.HALTED
-    assert halted.lifecycle_context["reason_code"] == "environment_drift"
+    assert result == TickStatus.SUBMITTED
+    assert executor.submissions == 1
 
 
-def test_daemon_halts_before_postprocess_and_preserves_job_ownership(
+def test_daemon_does_not_recapture_environment_on_every_postprocess_check(
     tmp_path,
     monkeypatch,
 ):
@@ -953,21 +1019,16 @@ def test_daemon_halts_before_postprocess_and_preserves_job_ownership(
     )
     executor = _SubmittedExecutor()
     daemon = Daemon(campaign_dir=campaign, config=config, executor=executor)
-    state.pending_jobs[CampaignPhase.FEREBUS.value] = "dry-environment-1"
-    write_state(daemon.state_path(), state)
     version["value"] = "3.11.drifted"
 
-    result = daemon._postprocess(
+    result = daemon._verify_environment_boundary(
         state,
         state.phase,
-        [],
-        SimpleNamespace(parent_job_id="dry-environment-1"),
+        boundary="postprocess",
     )
 
-    assert result == TickStatus.HALTED
+    assert result is None
     assert executor.postprocess_calls == 0
-    halted = read_state(daemon.state_path())
-    assert halted.pending_jobs[CampaignPhase.FEREBUS.value] == "dry-environment-1"
 
 
 def test_postprocess_rejects_intent_bound_to_previous_environment_generation(
@@ -1012,56 +1073,14 @@ def test_postprocess_rejects_intent_bound_to_previous_environment_generation(
     assert executor.postprocess_calls == 0
     halted = read_state(daemon.state_path())
     assert halted.pending_jobs[CampaignPhase.FEREBUS.value] == "dry-environment-1"
-    assert "submission_intent_environment_binding_invalid" in halted.lifecycle_context[
+    assert "active environment generation changed" in halted.lifecycle_context[
         "message"
     ]
 
 
-def test_environment_commands_are_exposed_by_parser():
+@pytest.mark.parametrize("command", ["environment-status", "rebind-environment"])
+def test_environment_commands_are_not_exposed_by_parser(command):
     parser = build_parser()
 
-    status = parser.parse_args(["environment-status", "--campaign-dir", "campaign"])
-    rebind = parser.parse_args(
-        ["rebind-environment", "--campaign-dir", "campaign", "--apply"]
-    )
-
-    assert status.func is cmd_environment_status
-    assert rebind.func is cmd_rebind_environment
-    assert rebind.apply is True
-
-
-def test_environment_status_and_rebind_cli_round_trip(
-    tmp_path,
-    monkeypatch,
-    capsys,
-):
-    campaign, config, _state = _rebind_campaign(tmp_path, monkeypatch)
-    assert cmd_environment_status(
-        argparse.Namespace(campaign_dir=str(campaign), json=True)
-    ) == 0
-    status_payload = json.loads(capsys.readouterr().out)
-    assert status_payload["matches"] is True
-
-    version = {"value": "3.11.cli-rebind"}
-
-    def changed_generation(*args, campaign_uid, config, generation=0, **kwargs):
-        payload = _fake_generation(
-            campaign_uid=campaign_uid,
-            config=config,
-            generation=generation,
-        )
-        payload["python_version"] = version["value"]
-        payload["environment_fingerprint_sha256"] = _environment_fingerprint(payload)
-        payload["digest_sha256"] = _canonical_digest(payload)
-        return payload
-
-    monkeypatch.setattr(
-        "ichor.hpc.active_learning.execution_identity.capture_environment_generation",
-        changed_generation,
-    )
-    assert cmd_rebind_environment(
-        argparse.Namespace(campaign_dir=str(campaign), apply=True, json=True)
-    ) == 0
-    rebound = json.loads(capsys.readouterr().out)
-    assert rebound["changed"] is True
-    assert rebound["generation"] == 1
+    with pytest.raises(SystemExit):
+        parser.parse_args([command, "--campaign-dir", "campaign"])

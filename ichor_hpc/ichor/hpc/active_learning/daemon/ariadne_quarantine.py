@@ -306,6 +306,112 @@ def inventory_quarantine(campaign_dir: Path) -> Dict[str, Any]:
     }
 
 
+def inventory_quarantine_authority(campaign_dir: Path) -> Dict[str, Any]:
+    """Read bounded quarantine control evidence without walking retained trees."""
+    campaign = Path(campaign_dir)
+    root = quarantine_root(campaign)
+    if not root.exists():
+        return {"attempts": [], "errors": [], "total_bytes": 0}
+    if root.is_symlink() or not root.is_dir():
+        return {
+            "attempts": [],
+            "errors": [{
+                "path": str(root),
+                "error": "quarantine root is not a real directory",
+            }],
+            "total_bytes": 0,
+        }
+    attempts: List[Dict[str, Any]] = []
+    errors: List[Dict[str, str]] = []
+    for path in sorted(root.glob("iteration-*/*")):
+        if path.is_symlink() or not path.is_dir():
+            errors.append({
+                "path": str(path),
+                "error": "quarantine attempt is not a real directory",
+            })
+            continue
+        manifest_path = path / QUARANTINE_MANIFEST_FILENAME
+        try:
+            payload = json.loads(
+                manifest_path.read_text(encoding="utf-8"),
+                source=manifest_path,
+            )
+            if not isinstance(payload, Mapping):
+                raise AriadneQuarantineError(
+                    "ARIADNE quarantine manifest must be an object"
+                )
+            data = dict(payload)
+            if data.get("schema_version") != QUARANTINE_SCHEMA_VERSION:
+                raise AriadneQuarantineError(
+                    "unsupported ARIADNE quarantine schema"
+                )
+            if data.get("attempt_id") != path.name:
+                raise AriadneQuarantineError(
+                    "ARIADNE quarantine attempt identity mismatch"
+                )
+            iteration = data.get("iteration")
+            if (
+                isinstance(iteration, bool)
+                or not isinstance(iteration, int)
+                or iteration < 0
+            ):
+                raise AriadneQuarantineError(
+                    "ARIADNE quarantine iteration is invalid"
+                )
+            if data.get("status") not in {"prepared", "retained_failure"}:
+                raise AriadneQuarantineError(
+                    "ARIADNE quarantine status is invalid"
+                )
+            entries = data.get("entries")
+            if not isinstance(entries, list) or not entries:
+                raise AriadneQuarantineError(
+                    "ARIADNE quarantine entries are invalid"
+                )
+            declared_bytes = 0
+            for entry in entries:
+                if not isinstance(entry, Mapping):
+                    raise AriadneQuarantineError(
+                        "ARIADNE quarantine entry must be an object"
+                    )
+                relative = entry.get("retained_relative_path")
+                expected_prefix = path.relative_to(root).as_posix() + "/"
+                if (
+                    not isinstance(relative, str)
+                    or not relative.startswith(expected_prefix)
+                    or "\\" in relative
+                    or any(part in {"", ".", ".."} for part in relative.split("/"))
+                ):
+                    raise AriadneQuarantineError(
+                        "ARIADNE quarantine entry path is invalid"
+                    )
+                size = entry.get("bytes")
+                if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+                    raise AriadneQuarantineError(
+                        "ARIADNE quarantine byte count is invalid"
+                    )
+                declared_bytes += int(size)
+            if data.get("total_bytes") != declared_bytes:
+                raise AriadneQuarantineError(
+                    "ARIADNE quarantine total byte count mismatch"
+                )
+            data["declared_bytes"] = declared_bytes
+            data["manifest_path"] = str(manifest_path)
+            data["attempt_path"] = str(path)
+            attempts.append(data)
+        except Exception as exc:
+            errors.append({
+                "path": str(path),
+                "error": type(exc).__name__ + ": " + str(exc),
+            })
+    return {
+        "attempts": attempts,
+        "errors": errors,
+        "total_bytes": int(
+            sum(int(item.get("declared_bytes", 0)) for item in attempts)
+        ),
+    }
+
+
 def ensure_quarantine_capacity(
     campaign_dir: Path,
     incoming_paths: Sequence[Path],
@@ -404,6 +510,7 @@ __all__ = [
     "clean_quarantine",
     "ensure_quarantine_capacity",
     "inventory_quarantine",
+    "inventory_quarantine_authority",
     "prepare_quarantine_manifest",
     "quarantine_root",
     "write_quarantine_manifest",
