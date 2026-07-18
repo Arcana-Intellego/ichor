@@ -645,6 +645,39 @@ def test_propose_recovery_on_empty_campaign_returns_init(tmp_path):
     assert report.existing_state_loaded is False
 
 
+def test_script_inventory_accepts_submission_intent_records(tmp_path):
+    campaign = tmp_path / "campaign"
+    identity = "r0000-a0001-test"
+    script = (
+        campaign
+        / ".DATA"
+        / "SCRIPTS"
+        / "JOBS"
+        / "GAUSSIAN"
+        / "INITIAL_GAUSSIAN"
+        / "iteration-000000"
+        / identity
+        / "job.sh"
+    )
+    script.parent.mkdir(parents=True)
+    script.write_text("#!/bin/bash\n", encoding="utf-8", newline="\n")
+
+    inventory = reconcile_mod._scripts_inventory(
+        campaign,
+        intent_records=[
+            {
+                "submission_identity": identity,
+                "submitted_script_path": str(script),
+                "status": "COMPLETED",
+            }
+        ],
+    )
+
+    assert inventory["error"] is None
+    assert inventory["attempt_bundle_count"] == 1
+    assert inventory["attempt_bundles"][0]["submission_identity"] == identity
+
+
 def test_active_replacement_recovery_advances_only_with_durable_handoffs(tmp_path):
     campaign, _, _, _ = _campaign_dirs(tmp_path)
     iter_dir = _write_ariadne_handoff(campaign, 1, n=2)

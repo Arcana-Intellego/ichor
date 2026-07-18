@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from ..strict_json import strict_json as json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 from ..acquisition.trajectory_pool import (
     POOL_MANIFEST_FILENAME,
