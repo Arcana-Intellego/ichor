@@ -4153,7 +4153,9 @@ class Daemon:
         *,
         max_ticks: Optional[int] = None,
         catch_keyboard_interrupt: bool = True,
-        readiness_callback: Optional[Callable[[], None]] = None,
+        startup_callback: Optional[
+            Callable[[str, str, Optional[str]], None]
+        ] = None,
     ) -> int:
         """Main loop. Returns an integer exit code suitable for sys.exit.
 
@@ -4164,10 +4166,25 @@ class Daemon:
         "catch_keyboard_interrupt=False" to surface KeyboardInterrupt
         instead of returning 130.
         """
+        def notify_startup(
+            state_name: str,
+            stage: str,
+            failure: Optional[str] = None,
+        ) -> None:
+            if startup_callback is None:
+                return
+            try:
+                startup_callback(state_name, stage, failure)
+            except Exception:
+                # Operational startup reporting must not block scientific work.
+                pass
+
+        pid_written = False
         try:
             with self._acquire_lock():
                 with self._acquire_lease():
                     self._write_pid()
+                    pid_written = True
                     self._install_signal_handlers()
                     # Initialise state before writing daemon_started. A
                     # pre-state journal entry would otherwise make a brand-new
@@ -4175,6 +4192,11 @@ class Daemon:
                     try:
                         self._read_or_initialise_state()
                     except (StateSchemaError, json.JSONDecodeError) as exc:
+                        notify_startup(
+                            "failed",
+                            "state_validation",
+                            type(exc).__name__ + ": " + str(exc),
+                        )
                         self._journal("state_corrupt", error=str(exc)[:200])
                         print(
                             "state.json failed validation: " + str(exc)
@@ -4183,10 +4205,19 @@ class Daemon:
                             file=sys.stderr,
                         )
                         return 2
+                    notify_startup(
+                        "ownership_acquired",
+                        "environment_transition",
+                    )
                     try:
                         state = read_state(self.state_path())
                         self._prepare_environment_generation(state)
                     except Exception as exc:
+                        notify_startup(
+                            "failed",
+                            "environment_transition",
+                            type(exc).__name__ + ": " + str(exc),
+                        )
                         print(
                             "automatic environment transition refused start: "
                             + type(exc).__name__
@@ -4196,8 +4227,7 @@ class Daemon:
                         )
                         return 13
                     self._journal("daemon_started", pid=os.getpid())
-                    if readiness_callback is not None:
-                        readiness_callback()
+                    notify_startup("ready", "run_loop")
                     try:
                         return self._run_loop(max_ticks=max_ticks)
                     except KeyboardInterrupt:
@@ -4207,10 +4237,18 @@ class Daemon:
                         return 130
                     finally:
                         self._journal("daemon_stopped", pid=os.getpid())
-                        self._remove_pid()
+                        notify_startup("stopped", "shutdown")
         except DaemonAlreadyRunningError as exc:
+            notify_startup(
+                "failed",
+                "ownership",
+                type(exc).__name__ + ": " + str(exc),
+            )
             print(str(exc), file=sys.stderr)
             return 11
+        finally:
+            if pid_written:
+                self._remove_pid()
 
     def _run_loop(self, *, max_ticks: Optional[int]) -> int:
         idle_streak = 0

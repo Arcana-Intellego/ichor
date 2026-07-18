@@ -1772,9 +1772,12 @@ def test_detached_launch_waits_for_readiness_before_publishing_pid(
             return None
 
     def fake_popen(argv, log_path, *, env):
-        Path(env["ICHOR_DAEMON_READINESS_PATH"]).write_text(
-            json.dumps({"schema_version": 1, "ready": True, "pid": Child.pid}),
-            encoding="utf-8",
+        helpers.update_background_startup(
+            Path(env[helpers.BACKGROUND_STARTUP_PATH_ENV]),
+            env[helpers.BACKGROUND_LAUNCH_ID_ENV],
+            state="ready",
+            stage="run_loop",
+            pid=Child.pid,
         )
         return Child()
 
@@ -1790,7 +1793,10 @@ def test_detached_launch_waits_for_readiness_before_publishing_pid(
     assert result.pid_path.read_text(encoding="utf-8") == "2718\n"
 
 
-def test_detached_launch_timeout_does_not_publish_pid(tmp_path, monkeypatch):
+def test_detached_launch_timeout_keeps_child_and_publishes_tracking_pid(
+    tmp_path,
+    monkeypatch,
+):
     import ichor.cli.useful_functions.launch_helpers as helpers
 
     class Child:
@@ -1817,9 +1823,10 @@ def test_detached_launch_timeout_does_not_publish_pid(tmp_path, monkeypatch):
     )
 
     assert result.ready is False
-    assert result.exited_during_startup is True
-    assert child.terminated is True
-    assert not result.pid_path.exists()
+    assert result.exited_during_startup is False
+    assert result.startup_pending is True
+    assert child.terminated is False
+    assert result.pid_path.read_text(encoding="utf-8") == "3141\n"
 
 
 def test_launch_helpers_builds_resume_argv_with_config(tmp_path):

@@ -62,6 +62,16 @@ command exits with a usage error. The first start must explicitly select
 campaign execution identity and cannot later be changed. Launches are detached
 by default. Use :code:`--foreground` when the shell should remain attached.
 
+Detached startup uses :code:`daemon.pid` as a child-owned PID record and
+:code:`daemon.startup.json` as a durable launch-status record. The foreground
+launcher waits up to
+:code:`runtime.background_readiness_timeout_seconds` for ownership or full
+readiness. This value is only a foreground wait budget: if it elapses while the
+child is alive, the command returns successfully, reports that startup is still
+in progress, and does not terminate the daemon. Use :code:`status` to inspect
+the current startup stage and :code:`stop --immediate` for a user-controlled
+SIGTERM request.
+
 
 Modes
 -----

@@ -24,6 +24,7 @@ import argparse
 import hashlib
 import inspect
 import os
+import signal
 from .strict_json import strict_json as json
 import secrets
 import subprocess
@@ -44,6 +45,21 @@ from .daemon.daemon import (
     DAEMON_LOCK_FILENAME,
     DEFAULT_DATA_SUBDIR,
     Daemon,
+)
+from .daemon.background_startup import (
+    BACKGROUND_CHILD_ENV,
+    BACKGROUND_LAUNCH_ID_ENV,
+    BACKGROUND_READINESS_ENV,
+    BACKGROUND_STARTUP_ACKNOWLEDGED_STATES,
+    BACKGROUND_STARTUP_ACTIVE_STATES,
+    BACKGROUND_STARTUP_FILENAME,
+    BACKGROUND_STARTUP_PATH_ENV,
+    BACKGROUND_STARTUP_SCHEMA_VERSION,
+    initialise_background_startup,
+    launch_id_from_environment,
+    read_background_startup,
+    startup_path_from_environment,
+    update_background_startup,
 )
 from .daemon.journal import (
     KNOWN_EVENT_TYPES,
@@ -148,8 +164,6 @@ __all__ = [
 ]
 
 
-BACKGROUND_CHILD_ENV = "ICHOR_DAEMON_BACKGROUND_CHILD"
-BACKGROUND_READINESS_ENV = "ICHOR_DAEMON_READINESS_PATH"
 BACKGROUND_LOG_FILENAME = "daemon.out"
 BACKGROUND_PID_FILENAME = "daemon.pid"
 BACKGROUND_PID_SCHEMA_VERSION = 1
@@ -303,6 +317,9 @@ def _campaign_paths(campaign_dir: Path):
         "journal": operational_path(campaign_dir, "journal.ndjson"),
         "background_log": operational_path(campaign_dir, BACKGROUND_LOG_FILENAME),
         "background_pid": operational_path(campaign_dir, BACKGROUND_PID_FILENAME),
+        "background_startup": operational_path(
+            campaign_dir, BACKGROUND_STARTUP_FILENAME
+        ),
         "stop_request": operational_path(campaign_dir, "stop_request.json"),
     }
 
@@ -517,18 +534,56 @@ def _read_background_pid_payload(pid_path: Path) -> Dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _probe_background_daemon(pid_path: Path, log_path: Path) -> Dict[str, Any]:
+def _probe_background_daemon(
+    pid_path: Path,
+    log_path: Path,
+    startup_path: Optional[Path] = None,
+) -> Dict[str, Any]:
     payload = _read_background_pid_payload(pid_path)
+    startup_path = (
+        Path(startup_path)
+        if startup_path is not None
+        else pid_path.with_name(BACKGROUND_STARTUP_FILENAME)
+    )
+    startup = read_background_startup(startup_path)
     pid = payload.get("pid")
+    if pid is None:
+        pid = startup.get("pid")
     alive = _pid_is_alive(pid)
+    startup_state = str(startup.get("state") or "") or None
+    observed_state = startup_state
+    startup_failure = startup.get("failure")
+    if (
+        startup_state in BACKGROUND_STARTUP_ACTIVE_STATES
+        and pid is not None
+        and not alive
+    ):
+        observed_state = "failed"
+        startup_failure = startup_failure or (
+            "background child is no longer alive before startup completed"
+        )
     out = {
         "background_pid_path": str(pid_path),
-        "background_log_path": str(payload.get("log_path") or log_path),
+        "background_log_path": str(
+            payload.get("log_path") or startup.get("log_path") or log_path
+        ),
         "background_pid": pid,
         "background_pid_alive": alive,
+        "background_startup_path": str(startup_path),
+        "background_startup_state": observed_state,
+        "background_startup_recorded_state": startup_state,
+        "background_startup_stage": startup.get("stage"),
+        "background_startup_failure": startup_failure,
+        "background_startup_started_at": startup.get("started_at_iso"),
+        "background_startup_ownership_acquired_at": startup.get(
+            "ownership_acquired_at_iso"
+        ),
+        "background_startup_ready_at": startup.get("ready_at_iso"),
     }
     if payload:
         out["background_pid_payload"] = payload
+    if startup:
+        out["background_startup_payload"] = startup
     return out
 
 
@@ -570,7 +625,13 @@ def _reconcile_runtime_status(
             clock_skew_tolerance_seconds=clock_skew,
         )
     )
-    status.update(_probe_background_daemon(paths["background_pid"], paths["background_log"]))
+    status.update(
+        _probe_background_daemon(
+            paths["background_pid"],
+            paths["background_log"],
+            paths["background_startup"],
+        )
+    )
     blockers: List[str] = []
     if status.get("lock_held") is True:
         blockers.append("daemon lock is held")
@@ -881,6 +942,71 @@ def _atomic_write_background_pid(pid_path: Path, payload: Dict[str, Any]) -> Non
     tmp_path.replace(pid_path)
 
 
+def _report_background_startup(
+    state: str,
+    stage: str,
+    *,
+    failure: Optional[str] = None,
+    **details: Any,
+) -> Optional[Dict[str, Any]]:
+    """Best-effort child update of the durable launch-status record."""
+    startup_path = startup_path_from_environment()
+    if startup_path is None:
+        return None
+    launch_id = launch_id_from_environment()
+    if not launch_id:
+        launch_id = str(read_background_startup(startup_path).get("launch_id") or "")
+    if not launch_id:
+        return None
+    updates: Dict[str, Any] = {
+        "state": str(state),
+        "stage": str(stage),
+        "pid": int(os.getpid()),
+    }
+    if failure is not None:
+        updates["failure"] = str(failure)
+    updates.update(details)
+    try:
+        return update_background_startup(startup_path, launch_id, **updates)
+    except Exception:
+        # Startup telemetry must never become a new daemon-start blocker.
+        return None
+
+
+def _finish_background_child_status(
+    return_code: int,
+    *,
+    failure: Optional[str] = None,
+) -> None:
+    """Record command-level startup failure when the daemon never took over."""
+    startup_path = startup_path_from_environment()
+    if startup_path is None:
+        return
+    payload = read_background_startup(startup_path)
+    state = str(payload.get("state") or "")
+    if state in {"ready", "failed", "stopped"}:
+        return
+    if int(return_code) != 0 or failure is not None:
+        _report_background_startup(
+            "failed",
+            "command_exit",
+            failure=(
+                failure
+                or "background daemon command exited before startup acknowledgement "
+                + "with code "
+                + str(return_code)
+            ),
+            exit_code=int(return_code),
+        )
+    elif state not in BACKGROUND_STARTUP_ACKNOWLEDGED_STATES:
+        _report_background_startup(
+            "failed",
+            "command_exit",
+            failure="background daemon command exited before startup acknowledgement",
+            exit_code=int(return_code),
+        )
+
+
 def _default_background_path(raw: Optional[str], default_path: Path) -> Path:
     if raw:
         return Path(raw).expanduser().resolve()
@@ -919,29 +1045,6 @@ def _tail_text(path: Path, *, max_lines: int = 40) -> str:
     return "\n".join(lines[-max_lines:])
 
 
-def _terminate_unready_background_child(child: subprocess.Popen) -> None:
-    """Stop a detached child that did not establish daemon ownership."""
-    try:
-        child.terminate()
-    except OSError:
-        return
-    wait = getattr(child, "wait", None)
-    if not callable(wait):
-        return
-    try:
-        wait(timeout=5.0)
-        return
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    kill = getattr(child, "kill", None)
-    if callable(kill):
-        try:
-            kill()
-            wait(timeout=5.0)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-
-
 def _launch_background_daemon(args: argparse.Namespace, campaign: Path) -> int:
     if os.environ.get(BACKGROUND_CHILD_ENV) == "1":
         print("--background is not allowed inside a background child process", file=sys.stderr)
@@ -968,7 +1071,8 @@ def _launch_background_daemon(args: argparse.Namespace, campaign: Path) -> int:
         getattr(args, "background_pid", None),
         paths["background_pid"],
     )
-    existing = _probe_background_daemon(pid_path, log_path)
+    startup_path = paths["background_startup"]
+    existing = _probe_background_daemon(pid_path, log_path, startup_path)
     if existing.get("background_pid_alive"):
         print(
             "refusing background launch: daemon pid "
@@ -985,14 +1089,12 @@ def _launch_background_daemon(args: argparse.Namespace, campaign: Path) -> int:
     argv = _background_child_argv(args, campaign)
     env = os.environ.copy()
     env[BACKGROUND_CHILD_ENV] = "1"
-    readiness_path = paths["data"] / (
-        "daemon.readiness."
-        + str(os.getpid())
-        + "."
-        + secrets.token_hex(8)
-        + ".json"
-    )
-    env[BACKGROUND_READINESS_ENV] = str(readiness_path)
+    launch_id = secrets.token_hex(16)
+    env[BACKGROUND_LAUNCH_ID_ENV] = launch_id
+    env[BACKGROUND_STARTUP_PATH_ENV] = str(startup_path)
+    # Retain the old environment variable for one release so an independently
+    # installed CLI frontend can still locate the durable startup record.
+    env[BACKGROUND_READINESS_ENV] = str(startup_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -1002,6 +1104,21 @@ def _launch_background_daemon(args: argparse.Namespace, campaign: Path) -> int:
         + " command="
         + " ".join(argv)
         + " =====\n"
+    )
+    initialise_background_startup(
+        startup_path,
+        {
+            "schema_version": BACKGROUND_STARTUP_SCHEMA_VERSION,
+            "launch_id": launch_id,
+            "state": "prepared",
+            "stage": "launcher",
+            "campaign_dir": str(campaign),
+            "command": argv,
+            "log_path": str(log_path),
+            "host": os.uname().nodename if hasattr(os, "uname") else "",
+            "python_executable": sys.executable,
+            "launcher_pid": int(os.getpid()),
+        },
     )
     try:
         with open(os.devnull, "rb") as stdin_fh, open(log_path, "a", encoding="utf-8") as log_fh:
@@ -1016,6 +1133,16 @@ def _launch_background_daemon(args: argparse.Namespace, campaign: Path) -> int:
                 start_new_session=True,
             )
     except Exception as exc:
+        try:
+            update_background_startup(
+                startup_path,
+                launch_id,
+                state="failed",
+                stage="process_spawn",
+                failure=type(exc).__name__ + ": " + str(exc),
+            )
+        except Exception:
+            pass
         print(
             "could not launch background daemon: "
             + type(exc).__name__
@@ -1024,6 +1151,26 @@ def _launch_background_daemon(args: argparse.Namespace, campaign: Path) -> int:
             file=sys.stderr,
         )
         return 9
+
+    update_background_startup(
+        startup_path,
+        launch_id,
+        state="spawned",
+        stage="child_process",
+        pid=int(child.pid),
+    )
+    if pid_path.resolve() != paths["background_pid"].resolve():
+        _atomic_write_background_pid(
+            pid_path,
+            {
+                "schema_version": BACKGROUND_PID_SCHEMA_VERSION,
+                "pid": int(child.pid),
+                "launch_id": launch_id,
+                "campaign_dir": str(campaign),
+                "log_path": str(log_path),
+                "startup_path": str(startup_path),
+            },
+        )
 
     timeout_seconds = 60
     try:
@@ -1038,10 +1185,51 @@ def _launch_background_daemon(args: argparse.Namespace, campaign: Path) -> int:
     except Exception:
         pass
     deadline = time.monotonic() + float(timeout_seconds)
-    readiness_payload = None
+    startup_payload: Dict[str, Any] = {}
+    acknowledged = False
     while time.monotonic() < deadline:
+        startup_payload = read_background_startup(startup_path)
+        state_name = str(startup_payload.get("state") or "")
+        if str(startup_payload.get("launch_id") or "") == launch_id:
+            if state_name in BACKGROUND_STARTUP_ACKNOWLEDGED_STATES:
+                acknowledged = True
+                break
+            if state_name == "stopped" and startup_payload.get("ready_at_iso"):
+                acknowledged = True
+                break
+            if state_name == "failed":
+                print(
+                    "background daemon startup failed; log: " + str(log_path),
+                    file=sys.stderr,
+                )
+                failure = startup_payload.get("failure")
+                if failure:
+                    print(str(failure), file=sys.stderr)
+                tail = _tail_text(log_path)
+                if tail:
+                    print(tail, file=sys.stderr)
+                return 9
         rc = child.poll()
         if rc is not None:
+            startup_payload = read_background_startup(startup_path)
+            if startup_payload.get("ready_at_iso"):
+                acknowledged = True
+                break
+            try:
+                update_background_startup(
+                    startup_path,
+                    launch_id,
+                    state="failed",
+                    stage="process_exit",
+                    exit_code=int(rc),
+                    failure=(
+                        "background daemon exited before startup acknowledgement "
+                        + "with code "
+                        + str(rc)
+                    ),
+                )
+            except Exception:
+                pass
             print(
                 "background daemon exited during startup with code "
                 + str(rc)
@@ -1052,55 +1240,49 @@ def _launch_background_daemon(args: argparse.Namespace, campaign: Path) -> int:
             tail = _tail_text(log_path)
             if tail:
                 print(tail, file=sys.stderr)
-            try:
-                readiness_path.unlink(missing_ok=True)
-            except OSError:
-                pass
             return int(rc) if int(rc) != 0 else 9
-        if readiness_path.is_file() and not readiness_path.is_symlink():
-            try:
-                readiness_payload = json.loads(
-                    readiness_path.read_text(encoding="utf-8")
-                )
-            except (OSError, ValueError):
-                readiness_payload = None
-            if isinstance(readiness_payload, dict) and readiness_payload.get("ready") is True:
-                break
         time.sleep(0.1)
-    if not isinstance(readiness_payload, dict) or readiness_payload.get("ready") is not True:
-        _terminate_unready_background_child(child)
-        print(
-            "background daemon did not acknowledge preflight and lock readiness "
-            "within " + str(timeout_seconds) + " seconds; log: " + str(log_path),
-            file=sys.stderr,
-        )
-        try:
-            readiness_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return 9
 
-    payload = {
-        "schema_version": BACKGROUND_PID_SCHEMA_VERSION,
-        "pid": int(child.pid),
-        "command": argv,
-        "campaign_dir": str(campaign),
-        "log_path": str(log_path),
-        "started_at_utc": timestamp,
-        "host": os.uname().nodename if hasattr(os, "uname") else "",
-        "python_executable": sys.executable,
-        "readiness_path": str(readiness_path),
-        "readiness": readiness_payload,
-    }
-    _atomic_write_background_pid(pid_path, payload)
-    try:
-        readiness_path.unlink(missing_ok=True)
-    except OSError:
-        pass
-    print("daemon started in background")
+    if not acknowledged:
+        rc = child.poll()
+        if rc is not None:
+            try:
+                update_background_startup(
+                    startup_path,
+                    launch_id,
+                    state="failed",
+                    stage="process_exit",
+                    exit_code=int(rc),
+                    failure=(
+                        "background daemon exited before startup acknowledgement "
+                        + "with code "
+                        + str(rc)
+                    ),
+                )
+            except Exception:
+                pass
+            print(
+                "background daemon exited during startup with code "
+                + str(rc)
+                + "; log: "
+                + str(log_path),
+                file=sys.stderr,
+            )
+            return int(rc) if int(rc) != 0 else 9
+        startup_payload = read_background_startup(startup_path)
+        print("daemon launch continues in background")
+        print(
+            "  startup: acknowledgement still pending after "
+            + str(timeout_seconds)
+            + " seconds; the live child was not terminated"
+        )
+    else:
+        print("daemon startup acknowledged in background")
+        print("  startup_state: " + str(startup_payload.get("state") or "unknown"))
     print("  pid: " + str(child.pid))
     print("  log: " + str(log_path))
     print("  pid_file: " + str(pid_path))
+    print("  startup_file: " + str(startup_path))
     print("  status: ichor-al-daemon status --campaign-dir " + str(campaign))
     print("  journal: ichor-al-daemon journal --campaign-dir " + str(campaign) + " --json | tail -n 40")
     return 0
@@ -1497,9 +1679,23 @@ def _format_active_submission_intents(value: Any) -> str:
     return summary
 
 
-def _format_background_daemon(pid: Any, alive: Any) -> str:
+def _format_background_daemon(
+    pid: Any,
+    alive: Any,
+    startup_state: Any = None,
+    startup_stage: Any = None,
+) -> str:
     if pid is None:
+        if startup_state == "failed":
+            return "not running (last startup failed)"
         return "not running"
+    if alive is True and startup_state in BACKGROUND_STARTUP_ACTIVE_STATES:
+        detail = str(startup_state)
+        if startup_stage:
+            detail += ": " + str(startup_stage)
+        return "pid " + str(pid) + " (starting; " + detail + ")"
+    if alive is True and startup_state == "ready":
+        return "pid " + str(pid) + " (alive; ready)"
     status = "alive" if alive is True else "not running"
     return "pid " + str(pid) + " (" + status + ")"
 
@@ -1590,6 +1786,19 @@ def _active_pending_jobs_summary(pending: Any) -> str:
 
 
 def _daemon_activity_status(payload: Dict[str, Any]) -> str:
+    startup_state = payload.get("background_startup_state")
+    if (
+        payload.get("background_pid_alive") is True
+        and startup_state in BACKGROUND_STARTUP_ACTIVE_STATES
+    ):
+        stage = payload.get("background_startup_stage")
+        suffix = ": " + str(stage) if stage else ""
+        return (
+            "starting (background pid "
+            + str(payload.get("background_pid"))
+            + suffix
+            + ")"
+        )
     active: List[str] = []
     if payload.get("lock_held") is True:
         active.append("foreground lock held")
@@ -1630,6 +1839,16 @@ def _format_runtime_status(payload: Dict[str, Any], *, verbose: bool) -> List[st
         ("user stop control", stop_summary),
         ("shutdown requested", "yes" if payload.get("shutdown_requested") else "no"),
     ]
+    if payload.get("background_startup_state"):
+        rows.extend(
+            [
+                ("background startup", payload.get("background_startup_state")),
+                ("background startup stage", payload.get("background_startup_stage")),
+                ("background startup began", payload.get("background_startup_started_at")),
+                ("background startup ready", payload.get("background_startup_ready_at")),
+                ("background startup failure", payload.get("background_startup_failure")),
+            ]
+        )
     environment = payload.get("active_environment_generation")
     if isinstance(environment, dict) and environment.get("generation") is not None:
         rows.extend(
@@ -1697,6 +1916,8 @@ def _format_runtime_status(payload: Dict[str, Any], *, verbose: bool) -> List[st
                     _format_background_daemon(
                         payload.get("background_pid"),
                         payload.get("background_pid_alive"),
+                        payload.get("background_startup_state"),
+                        payload.get("background_startup_stage"),
                     ),
                 ),
                 (
@@ -2497,6 +2718,11 @@ def _format_journal_events(events: Sequence[Dict[str, Any]], *, verbose: bool) -
 
 def cmd_start(args: argparse.Namespace) -> int:
     campaign = resolve_campaign_dir(args.campaign_dir)
+    _report_background_startup(
+        "starting",
+        "campaign_validation",
+        campaign_dir=str(campaign),
+    )
     if not campaign.exists():
         print("campaign-dir does not exist: " + str(campaign), file=sys.stderr)
         return 2
@@ -2733,6 +2959,12 @@ def cmd_start(args: argparse.Namespace) -> int:
     job_liveness_checker = None
     resource_usage_collector = None
     if effective_mode == "live":
+        _report_background_startup(
+            "starting",
+            "backend_preflight",
+            campaign_dir=str(campaign),
+            mode=str(effective_mode),
+        )
         avail = check_backends()
         preflight = evaluate_campaign_preflight(
             campaign,
@@ -2804,34 +3036,36 @@ def cmd_start(args: argparse.Namespace) -> int:
     if args.poll_interval is not None:
         #override config-loaded poll interval per-invocation.
         d.config.runtime.poll_interval_seconds = int(args.poll_interval)
-    readiness_callback = None
-    readiness_value = os.environ.get(BACKGROUND_READINESS_ENV)
-    if readiness_value:
-        readiness_path = Path(readiness_value)
+    startup_callback = None
+    if startup_path_from_environment() is not None:
 
-        def _acknowledge_background_readiness() -> None:
-            from .daemon.state import atomic_write_json
-
-            atomic_write_json(
-                readiness_path,
-                {
-                    "schema_version": 2,
-                    "ready": True,
-                    "pid": int(os.getpid()),
-                    "campaign_dir": str(campaign),
-                    "mode": str(effective_mode),
-                    "execution_identity_digest_sha256": str(
-                        execution_identity.get("digest_sha256") or ""
-                    ),
-                    "acknowledged_at_unix": float(time.time()),
-                },
+        def _record_background_startup(
+            state_name: str,
+            stage: str,
+            failure: Optional[str] = None,
+        ) -> None:
+            _report_background_startup(
+                state_name,
+                stage,
+                failure=failure,
+                campaign_dir=str(campaign),
+                mode=str(effective_mode),
+                execution_identity_digest_sha256=str(
+                    execution_identity.get("digest_sha256") or ""
+                ),
             )
 
-        readiness_callback = _acknowledge_background_readiness
+        startup_callback = _record_background_startup
+    _report_background_startup(
+        "starting",
+        "daemon_initialisation",
+        campaign_dir=str(campaign),
+        mode=str(effective_mode),
+    )
     return d.run(
         max_ticks=args.max_ticks,
         catch_keyboard_interrupt=True,
-        readiness_callback=readiness_callback,
+        startup_callback=startup_callback,
     )
 
 
@@ -3296,6 +3530,83 @@ def _print_cancel_jobs_summary(summary: Dict[str, Any]) -> None:
         print("No recorded active Slurm jobs found.")
 
 
+def _signal_recorded_background_daemon(
+    campaign: Path,
+    paths: Mapping[str, Path],
+) -> Dict[str, Any]:
+    """Send SIGTERM only to a launch record bound to this campaign and PID."""
+    background = _probe_background_daemon(
+        paths["background_pid"],
+        paths["background_log"],
+        paths["background_startup"],
+    )
+    result: Dict[str, Any] = {
+        "attempted": False,
+        "signalled": False,
+        "reason": "no live background child",
+    }
+    if background.get("background_pid_alive") is not True:
+        return result
+    startup = background.get("background_startup_payload")
+    if not isinstance(startup, dict):
+        result["reason"] = "live PID has no authenticated startup record"
+        return result
+    startup_state = str(startup.get("state") or "")
+    if (
+        startup_state not in BACKGROUND_STARTUP_ACTIVE_STATES
+        and startup_state != "ready"
+    ):
+        result["reason"] = (
+            "startup record is not active: " + repr(startup_state or "missing")
+        )
+        return result
+    pid = background.get("background_pid")
+    try:
+        startup_pid = int(startup.get("pid"))
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        result["reason"] = "startup record has an invalid PID"
+        return result
+    if startup_pid != pid_int:
+        result["reason"] = "startup-record PID does not match the live PID"
+        return result
+    recorded_campaign = str(startup.get("campaign_dir") or "")
+    if not recorded_campaign:
+        result["reason"] = "startup record has no campaign identity"
+        return result
+    try:
+        campaign_matches = Path(recorded_campaign).resolve() == campaign.resolve()
+    except OSError:
+        campaign_matches = False
+    if not campaign_matches:
+        result["reason"] = "startup record belongs to a different campaign"
+        return result
+    launch_id = str(startup.get("launch_id") or "")
+    if not launch_id:
+        result["reason"] = "startup record has no launch identity"
+        return result
+
+    result["attempted"] = True
+    result["pid"] = pid_int
+    try:
+        os.kill(pid_int, signal.SIGTERM)
+    except OSError as exc:
+        result["reason"] = type(exc).__name__ + ": " + str(exc)
+        return result
+    result["signalled"] = True
+    result["reason"] = "SIGTERM sent after durable immediate-stop request"
+    try:
+        update_background_startup(
+            paths["background_startup"],
+            launch_id,
+            stop_signal_requested_at_unix=float(time.time()),
+            stop_signal="SIGTERM",
+        )
+    except Exception:
+        pass
+    return result
+
+
 def cmd_stop(args: argparse.Namespace) -> int:
     campaign = resolve_campaign_dir(
         args.campaign_dir,
@@ -3445,6 +3756,12 @@ def cmd_stop(args: argparse.Namespace) -> int:
         )
     except Exception:
         pass
+    background_signal = None
+    if mode == "immediate":
+        background_signal = _signal_recorded_background_daemon(
+            campaign,
+            paths,
+        )
     cancel_summary = None
     if cancel_jobs:
         try:
@@ -3477,15 +3794,32 @@ def cmd_stop(args: argparse.Namespace) -> int:
     background = _probe_background_daemon(
         paths["background_pid"],
         paths["background_log"],
+        paths["background_startup"],
     )
     if background.get("background_pid") is not None:
         suffix = " alive" if background.get("background_pid_alive") else " not running"
         print("background pid: " + str(background.get("background_pid")) + " (" + suffix.strip() + ")")
         print("background log: " + str(background.get("background_log_path")))
+    if isinstance(background_signal, dict) and background_signal.get("attempted"):
+        print("background signal: " + str(background_signal.get("reason")))
+    elif (
+        isinstance(background_signal, dict)
+        and background.get("background_pid_alive") is True
+    ):
+        print(
+            "background signal not sent: " + str(background_signal.get("reason")),
+            file=sys.stderr,
+        )
     if cancel_summary is not None:
         _print_cancel_jobs_summary(cancel_summary)
         if cancel_summary.get("failed"):
             return 10
+    if (
+        isinstance(background_signal, dict)
+        and background_signal.get("attempted")
+        and not background_signal.get("signalled")
+    ):
+        return 10
     return 0
 
 
@@ -3562,6 +3896,7 @@ def format_recovery_dashboard(campaign_dir: Path) -> str:
     background = _probe_background_daemon(
         paths["background_pid"],
         paths["background_log"],
+        paths["background_startup"],
     )
     lines.extend(
         _section(
@@ -3833,7 +4168,13 @@ def cmd_status(args: argparse.Namespace) -> int:
             clock_skew_tolerance_seconds=clock_skew,
         )
     )
-    payload.update(_probe_background_daemon(paths["background_pid"], paths["background_log"]))
+    payload.update(
+        _probe_background_daemon(
+            paths["background_pid"],
+            paths["background_log"],
+            paths["background_startup"],
+        )
+    )
     try:
         from .execution_identity import read_active_environment_generation
         from .daemon.journal import tail_events
@@ -9224,9 +9565,11 @@ Examples:
             "--background",
             action="store_true",
             help=(
-                "Launch the daemon as a detached background child. The foreground "
-                "command validates the campaign, writes a PID file, and appends logs "
-                "under .DATA/ACTIVE_LEARNING by default."
+                "Launch the daemon as a detached background child. The child owns "
+                "its PID file; the launcher waits for startup acknowledgement but "
+                "never terminates a live child merely because that wait expires. "
+                "Logs and durable startup status are stored under "
+                ".DATA/ACTIVE_LEARNING by default."
             ),
         )
         process_group.add_argument(
@@ -9828,9 +10171,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.exit(2, parser.prog + ": error: " + str(exc) + "\n")
     args = parser.parse_args(expanded_argv)
     try:
-        return int(args.func(args))
+        return_code = int(args.func(args))
     except CampaignDirResolutionError as exc:
+        _finish_background_child_status(
+            2,
+            failure="CampaignDirResolutionError: " + str(exc),
+        )
         parser.exit(2, parser.prog + ": error: " + str(exc) + "\n")
+    except BaseException as exc:
+        _finish_background_child_status(
+            1,
+            failure=type(exc).__name__ + ": " + str(exc),
+        )
+        raise
+    _finish_background_child_status(return_code)
+    return return_code
 
 
 if __name__ == "__main__":

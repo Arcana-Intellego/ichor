@@ -2066,15 +2066,18 @@ def test_cli_start_background_spawns_child_without_shell(tmp_path, monkeypatch, 
         pid = 4321
 
         def __new__(cls, argv, **kwargs):
-            if cli_mod.BACKGROUND_READINESS_ENV not in kwargs.get("env", {}):
+            if cli_mod.BACKGROUND_STARTUP_PATH_ENV not in kwargs.get("env", {}):
                 return real_popen(argv, **kwargs)
             return super().__new__(cls)
 
         def __init__(self, argv, **kwargs):
             calls.append((argv, kwargs))
-            Path(kwargs["env"][cli_mod.BACKGROUND_READINESS_ENV]).write_text(
-                json.dumps({"schema_version": 1, "ready": True, "pid": self.pid}),
-                encoding="utf-8",
+            cli_mod.update_background_startup(
+                Path(kwargs["env"][cli_mod.BACKGROUND_STARTUP_PATH_ENV]),
+                kwargs["env"][cli_mod.BACKGROUND_LAUNCH_ID_ENV],
+                state="ownership_acquired",
+                stage="environment_transition",
+                pid=self.pid,
             )
 
         def poll(self):
@@ -2111,12 +2114,15 @@ def test_cli_start_background_spawns_child_without_shell(tmp_path, monkeypatch, 
     assert "shell" not in kwargs
     assert kwargs["env"][cli_mod.BACKGROUND_CHILD_ENV] == "1"
     pid_path = campaign / DEFAULT_DATA_SUBDIR / cli_mod.BACKGROUND_PID_FILENAME
-    payload = json.loads(pid_path.read_text(encoding="utf-8"))
+    assert not pid_path.exists(), "the parent must not publish the daemon-owned PID file"
+    startup_path = campaign / DEFAULT_DATA_SUBDIR / cli_mod.BACKGROUND_STARTUP_FILENAME
+    payload = json.loads(startup_path.read_text(encoding="utf-8"))
     assert payload["pid"] == 4321
-    assert payload["schema_version"] == cli_mod.BACKGROUND_PID_SCHEMA_VERSION
+    assert payload["schema_version"] == cli_mod.BACKGROUND_STARTUP_SCHEMA_VERSION
     assert payload["campaign_dir"] == str(campaign.resolve())
     assert payload["log_path"].endswith(cli_mod.BACKGROUND_LOG_FILENAME)
-    assert "daemon started in background" in capsys.readouterr().out
+    assert payload["state"] == "ownership_acquired"
+    assert "daemon startup acknowledged in background" in capsys.readouterr().out
 
 
 def test_cli_resume_background_clears_shutdown_and_spawns_resume(tmp_path, monkeypatch):
@@ -2133,15 +2139,18 @@ def test_cli_resume_background_clears_shutdown_and_spawns_resume(tmp_path, monke
         pid = 4322
 
         def __new__(cls, argv, **kwargs):
-            if cli_mod.BACKGROUND_READINESS_ENV not in kwargs.get("env", {}):
+            if cli_mod.BACKGROUND_STARTUP_PATH_ENV not in kwargs.get("env", {}):
                 return real_popen(argv, **kwargs)
             return super().__new__(cls)
 
         def __init__(self, argv, **kwargs):
             calls.append((argv, kwargs))
-            Path(kwargs["env"][cli_mod.BACKGROUND_READINESS_ENV]).write_text(
-                json.dumps({"schema_version": 1, "ready": True, "pid": self.pid}),
-                encoding="utf-8",
+            cli_mod.update_background_startup(
+                Path(kwargs["env"][cli_mod.BACKGROUND_STARTUP_PATH_ENV]),
+                kwargs["env"][cli_mod.BACKGROUND_LAUNCH_ID_ENV],
+                state="ownership_acquired",
+                stage="environment_transition",
+                pid=self.pid,
             )
 
         def poll(self):
@@ -2164,6 +2173,109 @@ def test_cli_resume_background_clears_shutdown_and_spawns_resume(tmp_path, monke
     argv, _kwargs = calls[0]
     assert argv[3] == "resume"
     assert "--background" not in argv
+
+
+def test_cli_background_wait_timeout_leaves_live_child_running(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    campaign = _campaign_with_config(tmp_path)
+    config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+    config.runtime.background_readiness_timeout_seconds = 1
+    config.to_yaml(campaign / "campaign.yaml")
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    _write_locked_state(campaign, fresh_campaign_state())
+    real_popen = cli_mod.subprocess.Popen
+
+    class FakePopen:
+        pid = 4330
+
+        def __new__(cls, argv, **kwargs):
+            if cli_mod.BACKGROUND_STARTUP_PATH_ENV not in kwargs.get("env", {}):
+                return real_popen(argv, **kwargs)
+            return super().__new__(cls)
+
+        def __init__(self, argv, **kwargs):
+            pass
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            raise AssertionError("a readiness timeout must not terminate the child")
+
+        def kill(self):
+            raise AssertionError("a readiness timeout must not kill the child")
+
+    monkeypatch.setattr(cli_mod.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(cli_mod.time, "sleep", lambda seconds: None)
+
+    rc = main([
+        "start",
+        "--campaign-dir",
+        str(campaign),
+        "--mode",
+        "dry_run",
+        "--background",
+    ])
+
+    assert rc == 0
+    payload = json.loads(
+        (data / cli_mod.BACKGROUND_STARTUP_FILENAME).read_text(encoding="utf-8")
+    )
+    assert payload["state"] == "spawned"
+    assert payload["pid"] == 4330
+    out = capsys.readouterr().out
+    assert "continues in background" in out
+    assert "was not terminated" in out
+
+
+def test_cli_background_child_exit_before_acknowledgement_is_failure(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    _write_locked_state(campaign, fresh_campaign_state())
+    real_popen = cli_mod.subprocess.Popen
+
+    class FakePopen:
+        pid = 4331
+
+        def __new__(cls, argv, **kwargs):
+            if cli_mod.BACKGROUND_STARTUP_PATH_ENV not in kwargs.get("env", {}):
+                return real_popen(argv, **kwargs)
+            return super().__new__(cls)
+
+        def __init__(self, argv, **kwargs):
+            pass
+
+        @staticmethod
+        def poll():
+            return 12
+
+    monkeypatch.setattr(cli_mod.subprocess, "Popen", FakePopen)
+
+    rc = main([
+        "start",
+        "--campaign-dir",
+        str(campaign),
+        "--mode",
+        "dry_run",
+        "--background",
+    ])
+
+    assert rc == 12
+    payload = json.loads(
+        (data / cli_mod.BACKGROUND_STARTUP_FILENAME).read_text(encoding="utf-8")
+    )
+    assert payload["state"] == "failed"
+    assert payload["exit_code"] == 12
+    assert "exited during startup" in capsys.readouterr().err
 
 
 def test_cli_background_refuses_recursive_child(tmp_path, monkeypatch, capsys):
@@ -2211,6 +2323,40 @@ def test_cli_background_refuses_live_pid_file(tmp_path, monkeypatch, capsys):
     assert "still alive" in capsys.readouterr().err
 
 
+def test_cli_background_refuses_live_startup_record_without_pid_file(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    _write_locked_state(campaign, fresh_campaign_state())
+    cli_mod.initialise_background_startup(
+        data / cli_mod.BACKGROUND_STARTUP_FILENAME,
+        {
+            "launch_id": "still-starting",
+            "state": "spawned",
+            "stage": "backend_preflight",
+            "pid": 99998,
+            "campaign_dir": str(campaign.resolve()),
+        },
+    )
+    monkeypatch.setattr(cli_mod, "_pid_is_alive", lambda pid: True)
+
+    rc = main([
+        "start",
+        "--campaign-dir",
+        str(campaign),
+        "--mode",
+        "dry_run",
+        "--background",
+    ])
+
+    assert rc == 8
+    assert "still alive" in capsys.readouterr().err
+
+
 def test_cli_status_reports_background_pid_metadata(tmp_path, capsys, monkeypatch):
     campaign = _campaign_with_config(tmp_path)
     data = campaign / DEFAULT_DATA_SUBDIR
@@ -2236,6 +2382,46 @@ def test_cli_status_reports_background_pid_metadata(tmp_path, capsys, monkeypatc
     assert payload["background_pid"] == pid
     assert payload["background_pid_alive"] is True
     assert payload["background_log_path"] == str(log_path)
+
+
+def test_cli_immediate_stop_signals_authenticated_background_startup(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    _write_locked_state(campaign, fresh_campaign_state())
+    pid = 12346
+    (data / cli_mod.BACKGROUND_PID_FILENAME).write_text(
+        str(pid) + "\n",
+        encoding="utf-8",
+    )
+    cli_mod.initialise_background_startup(
+        data / cli_mod.BACKGROUND_STARTUP_FILENAME,
+        {
+            "launch_id": "launch-stop-test",
+            "state": "starting",
+            "stage": "backend_preflight",
+            "pid": pid,
+            "campaign_dir": str(campaign.resolve()),
+            "log_path": str(data / cli_mod.BACKGROUND_LOG_FILENAME),
+        },
+    )
+    signals = []
+    monkeypatch.setattr(cli_mod, "_pid_is_alive", lambda value: int(value) == pid)
+    monkeypatch.setattr(
+        cli_mod.os,
+        "kill",
+        lambda target, signum: signals.append((target, signum)),
+    )
+
+    rc = main(["stop", "--campaign-dir", str(campaign), "--immediate"])
+
+    assert rc == 0
+    assert signals == [(pid, cli_mod.signal.SIGTERM)]
+    assert "SIGTERM sent after durable immediate-stop request" in capsys.readouterr().out
 
 
 def test_cli_stop_when_no_state_returns_4(tmp_path):

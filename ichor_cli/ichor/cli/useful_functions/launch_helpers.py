@@ -22,7 +22,6 @@ remains the source of truth for "is the daemon alive".
 """
 from __future__ import annotations
 
-import json
 import os
 import secrets
 import subprocess
@@ -31,6 +30,17 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
+
+from ichor.hpc.active_learning.daemon.background_startup import (
+    BACKGROUND_LAUNCH_ID_ENV,
+    BACKGROUND_READINESS_ENV,
+    BACKGROUND_STARTUP_ACKNOWLEDGED_STATES,
+    BACKGROUND_STARTUP_FILENAME,
+    BACKGROUND_STARTUP_PATH_ENV,
+    initialise_background_startup,
+    read_background_startup,
+    update_background_startup,
+)
 
 
 __all__ = [
@@ -57,6 +67,9 @@ class DetachedLaunchResult:
     exited_during_startup: bool
     ready: bool = False
     readiness_error: Optional[str] = None
+    acknowledged: bool = False
+    startup_pending: bool = False
+    startup_state: Optional[str] = None
 
 
 def build_daemon_argv(
@@ -140,29 +153,6 @@ def _popen_detached(
         log_fh.close()
 
 
-def _terminate_unready_child(child: subprocess.Popen) -> None:
-    """Terminate a child that never established daemon ownership."""
-    try:
-        child.terminate()
-    except OSError:
-        return
-    wait = getattr(child, "wait", None)
-    if not callable(wait):
-        return
-    try:
-        wait(timeout=5.0)
-        return
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    kill = getattr(child, "kill", None)
-    if callable(kill):
-        try:
-            kill()
-            wait(timeout=5.0)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-
-
 def launch_daemon_detached_checked(
     campaign_dir: Path,
     *,
@@ -177,11 +167,12 @@ def launch_daemon_detached_checked(
     pid_path: Optional[Path] = None,
     startup_timeout_seconds: float = 60.0,
 ) -> DetachedLaunchResult:
-    """Spawn the daemon and wait for its lock-backed readiness acknowledgement.
+    """Spawn the daemon and briefly wait for a durable startup acknowledgement.
 
     The child's stdout + stderr are appended to
     ``<campaign_dir>/.DATA/ACTIVE_LEARNING/daemon.menu_launched.out``; its
-    PID is recorded in ``menu_launched.pid`` next to it.
+    PID is recorded in ``menu_launched.pid`` next to it.  Exhausting the wait
+    budget returns a pending result and leaves a live child running.
 
     The menu must have already validated that ``campaign_dir`` exists and
     that a ``campaign.yaml`` is in place; this helper does the bare
@@ -213,68 +204,112 @@ def launch_daemon_detached_checked(
     # foreground mode so it does not create an untracked grandchild.
     argv.append("--foreground")
 
-    readiness_path = data_dir / (
-        "daemon.menu-readiness."
-        + str(os.getpid())
-        + "."
-        + secrets.token_hex(8)
-        + ".json"
+    startup_path = data_dir / BACKGROUND_STARTUP_FILENAME
+    launch_id = secrets.token_hex(16)
+    initialise_background_startup(
+        startup_path,
+        {
+            "launch_id": launch_id,
+            "state": "prepared",
+            "stage": "menu_launcher",
+            "campaign_dir": str(campaign_dir),
+            "command": argv,
+            "log_path": str(log_path),
+            "launcher_pid": int(os.getpid()),
+            "python_executable": sys.executable,
+        },
     )
     env = os.environ.copy()
-    env["ICHOR_DAEMON_READINESS_PATH"] = str(readiness_path)
-    child = _popen_detached(argv, log_path, env=env)
+    env[BACKGROUND_LAUNCH_ID_ENV] = launch_id
+    env[BACKGROUND_STARTUP_PATH_ENV] = str(startup_path)
+    env[BACKGROUND_READINESS_ENV] = str(startup_path)
+    try:
+        child = _popen_detached(argv, log_path, env=env)
+    except Exception as exc:
+        update_background_startup(
+            startup_path,
+            launch_id,
+            state="failed",
+            stage="process_spawn",
+            failure=type(exc).__name__ + ": " + str(exc),
+        )
+        raise
+    update_background_startup(
+        startup_path,
+        launch_id,
+        state="spawned",
+        stage="child_process",
+        pid=int(child.pid),
+    )
+
+    temporary_pid_path = pid_path.with_name(
+        pid_path.name + ".tmp." + str(os.getpid()) + "." + secrets.token_hex(4)
+    )
+    temporary_pid_path.write_text(str(child.pid) + "\n", encoding="utf-8")
+    os.replace(temporary_pid_path, pid_path)
 
     deadline = time.monotonic() + max(0.0, float(startup_timeout_seconds))
     returncode = child.poll()
-    readiness_payload = None
+    startup_payload = read_background_startup(startup_path)
+    acknowledged = False
     while returncode is None and time.monotonic() <= deadline:
-        if readiness_path.is_file() and not readiness_path.is_symlink():
-            try:
-                candidate = json.loads(readiness_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                candidate = None
-            candidate_pid = (
-                candidate.get("pid") if isinstance(candidate, dict) else None
-            )
-            if (
-                isinstance(candidate, dict)
-                and candidate.get("ready") is True
-                and isinstance(candidate_pid, int)
-                and not isinstance(candidate_pid, bool)
-                and candidate_pid == int(child.pid)
-            ):
-                readiness_payload = candidate
+        startup_payload = read_background_startup(startup_path)
+        if str(startup_payload.get("launch_id") or "") == launch_id:
+            state = str(startup_payload.get("state") or "")
+            if state in BACKGROUND_STARTUP_ACKNOWLEDGED_STATES:
+                acknowledged = True
+                break
+            if state == "stopped" and startup_payload.get("ready_at_iso"):
+                acknowledged = True
+                break
+            if state == "failed":
                 break
         time.sleep(0.1)
         returncode = child.poll()
 
-    ready = readiness_payload is not None
+    startup_payload = read_background_startup(startup_path)
+    startup_state = str(startup_payload.get("state") or "") or None
+    ready = bool(startup_payload.get("ready_at_iso")) or startup_state == "ready"
     readiness_error = None
-    if not ready:
-        if returncode is None:
-            readiness_error = "daemon readiness acknowledgement timed out"
-            _terminate_unready_child(child)
-        else:
-            readiness_error = "daemon exited before readiness acknowledgement"
-    else:
-        temporary_pid_path = pid_path.with_name(
-            pid_path.name + ".tmp." + str(os.getpid()) + "." + secrets.token_hex(4)
+    if startup_state == "failed":
+        readiness_error = str(
+            startup_payload.get("failure") or "daemon startup failed"
         )
-        temporary_pid_path.write_text(str(child.pid) + "\n", encoding="utf-8")
-        os.replace(temporary_pid_path, pid_path)
-    try:
-        readiness_path.unlink(missing_ok=True)
-    except OSError:
-        pass
+    elif returncode is not None and not acknowledged:
+        readiness_error = "daemon exited before startup acknowledgement"
+        try:
+            update_background_startup(
+                startup_path,
+                launch_id,
+                state="failed",
+                stage="process_exit",
+                exit_code=int(returncode),
+                failure=readiness_error,
+            )
+        except Exception:
+            pass
+        startup_state = "failed"
+    elif not acknowledged:
+        readiness_error = (
+            "startup acknowledgement wait budget elapsed; child continues running"
+        )
     return DetachedLaunchResult(
         pid=child.pid,
         argv=argv,
         log_path=log_path,
         pid_path=pid_path,
         returncode=returncode,
-        exited_during_startup=not ready,
+        exited_during_startup=(
+            (returncode is not None and not acknowledged)
+            or startup_state == "failed"
+        ),
         ready=ready,
         readiness_error=readiness_error,
+        acknowledged=acknowledged,
+        startup_pending=(
+            returncode is None and not acknowledged and startup_state != "failed"
+        ),
+        startup_state=startup_state,
     )
 
 
@@ -293,6 +328,6 @@ def launch_daemon_detached(
         config=config,
         startup_timeout_seconds=60.0,
     )
-    if not result.ready:
+    if result.exited_during_startup:
         raise RuntimeError(result.readiness_error or "daemon startup failed")
     return result.pid

@@ -123,12 +123,79 @@ def test_run_handles_malformed_state_json_without_traceback(tmp_path):
     d = _make_daemon(tmp_path)
     d.data_dir().mkdir(parents=True, exist_ok=True)
     d.state_path().write_text("{bad json", encoding="utf-8")
+    startup = []
 
-    rc = d.run(max_ticks=1)
+    rc = d.run(
+        max_ticks=1,
+        startup_callback=lambda state, stage, failure: startup.append(
+            (state, stage, failure)
+        ),
+    )
 
     assert rc == 2
+    assert startup[0][0:2] == ("failed", "state_validation")
+    assert not d.pid_path().exists()
     events = list(iter_events(d.data_dir() / "journal.ndjson"))
     assert any(e.get("event") == "state_corrupt" for e in events)
+
+
+def test_run_acknowledges_ownership_before_environment_transition(
+    tmp_path,
+    monkeypatch,
+):
+    d = _make_daemon(tmp_path)
+    write_state(d.state_path(), fresh_campaign_state(max_iterations=1))
+    startup = []
+
+    def prepare_environment(state):
+        assert startup[-1][0:2] == (
+            "ownership_acquired",
+            "environment_transition",
+        )
+
+    monkeypatch.setattr(d, "_prepare_environment_generation", prepare_environment)
+
+    rc = d.run(
+        max_ticks=0,
+        startup_callback=lambda state, stage, failure: startup.append(
+            (state, stage, failure)
+        ),
+    )
+
+    assert rc == 0
+    assert [item[0] for item in startup] == [
+        "ownership_acquired",
+        "ready",
+        "stopped",
+    ]
+    assert not d.pid_path().exists()
+
+
+def test_run_environment_transition_failure_is_reported_and_removes_pid(
+    tmp_path,
+    monkeypatch,
+):
+    d = _make_daemon(tmp_path)
+    write_state(d.state_path(), fresh_campaign_state(max_iterations=1))
+    startup = []
+
+    def fail_environment(state):
+        raise RuntimeError("environment probe failed")
+
+    monkeypatch.setattr(d, "_prepare_environment_generation", fail_environment)
+
+    rc = d.run(
+        max_ticks=0,
+        startup_callback=lambda state, stage, failure: startup.append(
+            (state, stage, failure)
+        ),
+    )
+
+    assert rc == 13
+    assert [item[0] for item in startup] == ["ownership_acquired", "failed"]
+    assert startup[-1][1] == "environment_transition"
+    assert "environment probe failed" in startup[-1][2]
+    assert not d.pid_path().exists()
 
 
 def test_pre_submit_intent_without_job_id_recovers_by_accounting_name(tmp_path):

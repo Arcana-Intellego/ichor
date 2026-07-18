@@ -247,6 +247,14 @@ class StartDaemonBackgroundFunctions:
                 "Detached daemon exited during startup with code "
                 + str(result.returncode)
             )
+            if getattr(result, "readiness_error", None):
+                print("Startup failure: " + str(result.readiness_error))
+        elif getattr(result, "startup_pending", False):
+            print("Detached daemon launched with PID " + str(result.pid))
+            print(
+                "Startup is still in progress; the wait budget elapsed without "
+                "terminating the daemon."
+            )
         else:
             print("Detached daemon launched with PID " + str(result.pid))
         print("Log: " + str(result.log_path))
