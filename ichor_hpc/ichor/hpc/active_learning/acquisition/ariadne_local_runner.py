@@ -1688,12 +1688,19 @@ def probe_ariadne_runtime(ariadne) -> Dict[str, Any]:
                 atom_list.copy(),
                 run_config,
             )
+            direct_flags: Dict[str, bool] = {}
             raw_init_ok = _optimizer_flag(optimiser, "init_ok")
             if raw_init_ok is _OPTIMIZER_ATTRIBUTE_MISSING:
-                raise RuntimeError("ARIADNE " + name.upper() + " has no init_ok property")
-            init_ok = _fortran_logical(raw_init_ok, name.upper() + " init_ok")
-            if not init_ok:
-                _raise_if_init_failed(optimiser, name.upper())
+                if name == "trqn":
+                    raise RuntimeError("ARIADNE TRQN has no init_ok property")
+            else:
+                init_ok = _fortran_logical(
+                    raw_init_ok,
+                    name.upper() + " init_ok",
+                )
+                direct_flags["init_ok"] = bool(init_ok)
+                if not init_ok:
+                    _raise_if_init_failed(optimiser, name.upper())
 
             status = _validate_status_shape(
                 optimiser.get_status_py(),
@@ -1727,7 +1734,6 @@ def probe_ariadne_runtime(ariadne) -> Dict[str, Any]:
                     ),
                 }
 
-            direct_flags: Dict[str, bool] = {"init_ok": bool(init_ok)}
             for property_name in (
                 "proposal_pending",
                 "skip_step_after_rebuild",

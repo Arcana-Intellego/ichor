@@ -349,6 +349,98 @@ def test_model_is_bound_to_estimator_settings_and_environment(tmp_path):
     assert reason == "estimator_settings_changed"
 
 
+def test_bound_model_uses_canonical_trained_models_current_pointer(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.versioning.trained_models import (
+        TrainedModelVersioning,
+    )
+
+    config = _applicable_config()
+    environment = {
+        "generation": 2,
+        "generation_digest_sha256": "e" * 64,
+        "bound": True,
+    }
+    records = [
+        _record(
+            0,
+            config=config,
+            environment_generation=2,
+            environment_digest="e" * 64,
+        )
+    ]
+    model = build_calibration_model(
+        records,
+        config,
+        iteration=1,
+        current_model_version=0,
+        environment_binding=environment,
+    )
+    write_calibration_model(tmp_path, model)
+    versions = TrainedModelVersioning(tmp_path / "TRAINED_MODELS")
+    versions.iteration_path(0).mkdir(parents=True)
+    versions.update_current(0)
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.error_calibration.active_environment_binding",
+        lambda _campaign: dict(environment),
+    )
+
+    loaded, reason = load_calibration_model_for_acquisition(
+        tmp_path,
+        config,
+        current_iteration=1,
+    )
+
+    assert reason == "loaded"
+    assert loaded == model
+
+
+def test_legacy_trained_models_root_is_ignored_by_calibration_loader(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.versioning.trained_models import (
+        TrainedModelVersioning,
+    )
+
+    config = _applicable_config()
+    environment = {
+        "generation": 2,
+        "generation_digest_sha256": "e" * 64,
+        "bound": True,
+    }
+    records = [
+        _record(
+            0,
+            config=config,
+            environment_generation=2,
+            environment_digest="e" * 64,
+        )
+    ]
+    model = build_calibration_model(
+        records,
+        config,
+        iteration=1,
+        current_model_version=0,
+        environment_binding=environment,
+    )
+    write_calibration_model(tmp_path, model)
+    legacy = TrainedModelVersioning(tmp_path / "6_TRAINED_MODELS")
+    legacy.iteration_path(0).mkdir(parents=True)
+    legacy.update_current(0)
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.error_calibration.active_environment_binding",
+        lambda _campaign: dict(environment),
+    )
+
+    loaded, reason = load_calibration_model_for_acquisition(tmp_path, config)
+
+    assert loaded is None
+    assert reason == "current_model_version_unavailable"
+
+
 def test_environment_mismatch_rejects_model(tmp_path, monkeypatch):
     config = _applicable_config()
     model = build_calibration_model(

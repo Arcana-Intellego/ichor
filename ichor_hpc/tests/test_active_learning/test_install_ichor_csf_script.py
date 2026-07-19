@@ -302,12 +302,13 @@ def test_profile_upsert_is_atomic_and_preserves_unrelated_profiles(tmp_path):
     assert not list(tmp_path.glob("ichor_config.yaml.tmp.*"))
 
 
-def test_canonical_csf_profiles_match_documented_limits():
+def test_canonical_csf_profiles_match_documented_limits(monkeypatch, tmp_path):
     from ichor.hpc.active_learning.daemon.cluster_profile import (
         ClusterProfile,
         validate_cluster_profile,
     )
 
+    monkeypatch.setenv("HOME", str(tmp_path))
     profiles = yaml.safe_load(CANONICAL_PROFILE.read_text(encoding="utf-8"))
     csf3 = profiles["csf3"]
     csf4 = profiles["csf4"]
@@ -323,6 +324,21 @@ def test_canonical_csf_profiles_match_documented_limits():
     assert "multinode" not in csf4["hpc"]["partitions"]
     validate_cluster_profile(ClusterProfile(machine="csf3", config=profiles))
     validate_cluster_profile(ClusterProfile(machine="csf4", config=profiles))
+
+
+def test_cluster_profile_rejects_relative_submitted_python_path(monkeypatch, tmp_path):
+    from ichor.hpc.active_learning.daemon.cluster_profile import (
+        ClusterProfile,
+        ClusterProfileError,
+        validate_cluster_profile,
+    )
+
+    profiles = yaml.safe_load(CANONICAL_PROFILE.read_text(encoding="utf-8"))
+    profiles["csf3"]["software"]["python"]["python_path"] = "venv/bin/python"
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ClusterProfileError, match="must resolve absolutely"):
+        validate_cluster_profile(ClusterProfile(machine="csf3", config=profiles))
 
 
 def test_cluster_guides_do_not_duplicate_machine_profile_yaml():

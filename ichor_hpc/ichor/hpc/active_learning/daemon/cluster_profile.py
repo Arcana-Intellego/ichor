@@ -135,9 +135,7 @@ def validate_cluster_profile(profile: ClusterProfile) -> None:
         raise ClusterProfileError("software.python.python_path must be a non-empty string")
     if any(character in raw_python for character in "\r\n\x00"):
         raise ClusterProfileError("software.python.python_path contains control characters")
-    expanded_python = os.path.abspath(
-        os.path.expanduser(os.path.expandvars(raw_python.strip()))
-    )
+    expanded_python = os.path.expanduser(os.path.expandvars(raw_python.strip()))
     if not os.path.isabs(expanded_python):
         raise ClusterProfileError("software.python.python_path must resolve absolutely")
     library_path = python.get("library_path")

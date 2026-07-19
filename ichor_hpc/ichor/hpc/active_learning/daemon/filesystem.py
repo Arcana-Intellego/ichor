@@ -68,12 +68,7 @@ def campaign_owned_path(
     if raw_candidate.is_absolute():
         candidate = lexical_absolute_path(raw_candidate)
     else:
-        cwd_candidate = lexical_absolute_path(raw_candidate)
-        try:
-            cwd_candidate.relative_to(campaign)
-            candidate = cwd_candidate
-        except ValueError:
-            candidate = lexical_absolute_path(campaign / raw_candidate)
+        candidate = lexical_absolute_path(campaign / raw_candidate)
     try:
         candidate.relative_to(campaign)
     except ValueError as exc:

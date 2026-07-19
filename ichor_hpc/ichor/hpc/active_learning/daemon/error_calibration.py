@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .state import atomic_write_json
-from ..layout import staging_pointdir_name
+from ..layout import staging_pointdir_name, trained_models_dir
 from .error_calibration_contract import (
     CALIBRATION_AUDIT_SCHEMA_VERSION,
     CALIBRATION_MODEL_SCHEMA_VERSION,
@@ -382,7 +382,7 @@ def load_calibration_model_for_acquisition(
             from ..versioning.trained_models import TrainedModelVersioning
 
             current_model_version = TrainedModelVersioning(
-                Path(campaign_dir) / "6_TRAINED_MODELS"
+                trained_models_dir(campaign_dir)
             ).current_version()
         except Exception:
             current_model_version = None

@@ -129,10 +129,14 @@ def test_direct_logical_properties_accept_ifx_true_and_accessor_failures_are_fat
         _proposal_pending(_BrokenAttributeAccessor(), (0,) * 89, is_trqn=True)
 
 
+_MISSING_INIT_OK = object()
+
+
 class _RuntimeProbeOptimiser:
-    def __init__(self, status_length, *, init_ok=-1):
+    def __init__(self, status_length, *, init_ok=_MISSING_INIT_OK):
         self.status_length = int(status_length)
-        self.init_ok = init_ok
+        if init_ok is not _MISSING_INIT_OK:
+            self.init_ok = init_ok
         self.proposal_pending = 0
         self.skip_step_after_rebuild = 0
         self.q = np.zeros(18, dtype=np.float64)
@@ -161,15 +165,22 @@ class _RuntimeProbeOptimiser:
         return None
 
 
-def _runtime_probe_module(*, init_ok=-1):
+def _runtime_probe_module(
+    *,
+    trqn_init_ok=-1,
+    ds_init_ok=_MISSING_INIT_OK,
+):
     return SimpleNamespace(
         Geometric_Trqn=SimpleNamespace(
-            trust_region_qn=lambda: _RuntimeProbeOptimiser(89, init_ok=init_ok)
+            trust_region_qn=lambda: _RuntimeProbeOptimiser(
+                89,
+                init_ok=trqn_init_ok,
+            )
         ),
         Ds_Optimiser=SimpleNamespace(
             dissipative_symplectic=lambda: _RuntimeProbeOptimiser(
                 42,
-                init_ok=init_ok,
+                init_ok=ds_init_ok,
             )
         ),
     )
@@ -183,11 +194,31 @@ def test_initialised_runtime_probe_covers_trqn_and_ds_without_stepping():
     assert receipt["ds"]["initialised"] is True
     assert receipt["ds"]["status_length"] == 42
     assert receipt["trqn"]["direct_logical_flags"]["init_ok"] is True
+    assert "init_ok" not in receipt["ds"]["direct_logical_flags"]
 
 
 def test_initialised_runtime_probe_rejects_malformed_direct_logical():
     with pytest.raises(RuntimeError, match="initialised runtime probe failed"):
-        probe_ariadne_runtime(_runtime_probe_module(init_ok="true"))
+        probe_ariadne_runtime(_runtime_probe_module(trqn_init_ok="true"))
+
+
+def test_initialised_runtime_probe_requires_trqn_init_ok():
+    with pytest.raises(RuntimeError, match="TRQN has no init_ok property"):
+        probe_ariadne_runtime(
+            _runtime_probe_module(trqn_init_ok=_MISSING_INIT_OK)
+        )
+
+
+@pytest.mark.parametrize("ds_init_ok", [0, "true"])
+def test_initialised_runtime_probe_validates_optional_ds_init_ok(ds_init_ok):
+    with pytest.raises(RuntimeError, match="DS initialised runtime probe failed"):
+        probe_ariadne_runtime(_runtime_probe_module(ds_init_ok=ds_init_ok))
+
+
+def test_initialised_runtime_probe_accepts_ifx_ds_init_ok_when_present():
+    receipt = probe_ariadne_runtime(_runtime_probe_module(ds_init_ok=-1))
+
+    assert receipt["ds"]["direct_logical_flags"]["init_ok"] is True
 
 
 def test_five_criterion_streak_requires_acceptance_and_every_check():

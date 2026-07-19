@@ -8,8 +8,14 @@ from pathlib import Path
 
 import pytest
 
+from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.daemon.daemon import Daemon
 from ichor.hpc.active_learning.daemon.dry_run_executor import DryRunPhaseExecutor
+from ichor.hpc.active_learning.daemon.filesystem import (
+    campaign_owned_path,
+    operational_data_dir,
+    operational_path,
+)
 from ichor.hpc.active_learning.daemon.resource_records import (
     resolution_payload,
     write_resolution,
@@ -156,9 +162,48 @@ def test_operational_paths_reject_symlinked_data_ancestor(tmp_path):
         pytest.skip("symlink creation is unavailable on this host")
 
     with pytest.raises(ValueError, match="symlink"):
-        Daemon(campaign_dir=campaign).data_dir()
+        Daemon(campaign_dir=campaign, config=CampaignConfig()).data_dir()
     with pytest.raises(ValueError, match="symlink"):
         intent_dir(campaign)
+
+
+def test_campaign_owned_relative_paths_are_independent_of_working_directory(
+    monkeypatch,
+    tmp_path,
+):
+    campaign = (tmp_path / "campaign").resolve()
+    nested = campaign / "nested" / "working"
+    unrelated = tmp_path / "unrelated"
+    nested.mkdir(parents=True)
+    unrelated.mkdir()
+    expected_data = campaign / ".DATA" / "ACTIVE_LEARNING"
+
+    for working_directory in (campaign, nested, unrelated):
+        monkeypatch.chdir(working_directory)
+        assert campaign_owned_path(
+            campaign,
+            Path(".DATA") / "ACTIVE_LEARNING",
+        ) == expected_data
+        assert operational_data_dir(campaign) == expected_data
+        assert operational_path(campaign, "state.json") == expected_data / "state.json"
+        assert intent_dir(campaign) == expected_data / "submission_intents"
+
+        daemon = Daemon(campaign_dir=campaign, config=CampaignConfig())
+        assert daemon.state_path() == expected_data / "state.json"
+        assert daemon.lock_path() == expected_data / "daemon.lock"
+        assert daemon.journal_path() == expected_data / "journal.ndjson"
+
+
+def test_campaign_owned_absolute_paths_and_escape_rejection_are_unchanged(tmp_path):
+    campaign = (tmp_path / "campaign").resolve()
+    campaign.mkdir()
+    owned = campaign / ".DATA" / "ACTIVE_LEARNING"
+
+    assert campaign_owned_path(campaign, owned) == owned
+    with pytest.raises(ValueError, match="escapes campaign root"):
+        campaign_owned_path(campaign, Path("..") / "outside")
+    with pytest.raises(ValueError, match="escapes campaign root"):
+        campaign_owned_path(campaign, tmp_path / "outside")
 
 
 def test_state_reader_and_writer_reject_symlinked_campaign_state(tmp_path):

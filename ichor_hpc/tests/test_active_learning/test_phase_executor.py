@@ -85,8 +85,9 @@ def test_mock_postprocess_default_complete():
 def test_mock_postprocess_failure_injection():
     e = MockPhaseExecutor(fail_on_phases={"GAUSSIAN"})
     r = e.postprocess(_state(), CampaignPhase.GAUSSIAN, observations=[])
-    assert r.is_complete is False
+    assert r.is_complete is True
     assert r.failure_reason and "GAUSSIAN" in r.failure_reason
+    assert r.validate(stage="postprocess", phase_name="GAUSSIAN") is r
 
 
 def test_mock_handle_failure_returns_configured_action():

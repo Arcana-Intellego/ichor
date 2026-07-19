@@ -211,8 +211,8 @@ class MockPhaseExecutor:
     Optional knobs:
         fail_on_phases: iterable of phase names; submit_or_run for these
             returns is_complete=False with a fake JobID, and postprocess
-            then returns failure_reason set so the daemon exercises its
-            failure path.
+            then returns a completed terminal failure so the daemon exercises
+            its failure path.
         fake_job_ids: iterable yielding the JobIDs returned by
             submit_or_run when a phase is configured to "run as SLURM";
             defaults to monotonic "MOCK-<n>".
@@ -250,7 +250,7 @@ class MockPhaseExecutor:
         self.calls.append(_RecordedCall("postprocess", phase_name, iteration))
         if phase_name in self._fail_on_phases:
             return PhaseResult(
-                is_complete=False,
+                is_complete=True,
                 failure_reason="mock failure injected for " + phase_name,
             )
         return PhaseResult(is_complete=True)

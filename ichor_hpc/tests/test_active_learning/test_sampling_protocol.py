@@ -382,7 +382,14 @@ def test_resolve_or_load_preserves_immutable_protocol_bytes(tmp_path):
     assert {path: path.read_bytes() for path in paths} == before
 
 
-def test_resolve_or_load_uses_frozen_calibration_after_global_changes(tmp_path):
+def test_resolve_or_load_uses_frozen_calibration_after_global_changes(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.versioning.trained_models import (
+        TrainedModelVersioning,
+    )
+
     cfg = CampaignConfig()
     cfg.error_calibration.mode = "apply_to_acquisition"
     cfg.error_calibration.apply_strength = 1.0
@@ -391,20 +398,34 @@ def test_resolve_or_load_uses_frozen_calibration_after_global_changes(tmp_path):
     cfg.error_calibration.n_bins = 2
     cfg.error_calibration.min_bin_records = 1
 
+    environment = {
+        "generation": 2,
+        "generation_digest_sha256": "e" * 64,
+        "bound": True,
+    }
     records = synthetic_dry_records(
         iteration=1,
         models_version=0,
         n_points=4,
         config=cfg,
+        environment_binding=environment,
     )
     model = build_calibration_model(
         records,
         cfg,
         iteration=1,
         current_model_version=0,
+        environment_binding=environment,
     )
     assert model["usable_for_acquisition"] is True
     write_calibration_model(tmp_path, model)
+    versions = TrainedModelVersioning(tmp_path / "TRAINED_MODELS")
+    versions.iteration_path(0).mkdir(parents=True)
+    versions.update_current(0)
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.error_calibration.active_environment_binding",
+        lambda _campaign: dict(environment),
+    )
 
     resolved = resolve_sampling_protocol(tmp_path, cfg, iteration=2)
     snapshot = resolved.error_calibration_snapshot
