@@ -27,7 +27,10 @@ from ichor.hpc.active_learning.daemon.phase_executor import (
     BackendSubmissionError,
     PhaseResult,
 )
-from ichor.hpc.active_learning.daemon.state import CampaignPhase
+from ichor.hpc.active_learning.daemon.state import CampaignPhase, atomic_write_json
+from ichor.hpc.active_learning.daemon.ariadne_publication import (
+    ariadne_publication_archive_root,
+)
 from ichor.hpc.active_learning.daemon.script_bundles import (
     prepare_attempt_bundle,
     write_attempt_script,
@@ -42,6 +45,7 @@ from ichor.hpc.active_learning.handoff_manifests import (
     seeds_picked_path,
 )
 from ichor.hpc.active_learning.layout import (
+    active_ariadne_dir,
     active_iteration_dir,
     ariadne_seed_dir,
     ariadne_seeds_dir,
@@ -2572,6 +2576,45 @@ def test_ariadne_submit_reuses_complete_existing_results(tmp_path):
     ]
     assert reused
     assert reused[-1]["phase"] == "ARIADNE_ARRAY"
+
+
+def test_ariadne_postprocess_only_archives_incomplete_batch_publication(tmp_path):
+    cfg = CampaignConfig()
+    runner = _FakeSbatch()
+    campaign = tmp_path / "campaign"
+    ex = LiveBackendsPhaseExecutor(
+        campaign_dir=campaign,
+        config=cfg,
+        backend_check=False,
+        sbatch_runner=runner,
+    )
+    _seed_ariadne_pool(campaign, iteration=4)
+    iteration_dir = active_iteration_dir(campaign, 4)
+    ariadne_root = active_ariadne_dir(iteration_dir)
+    atomic_write_json(
+        ariadne_root / "RESULTS.json",
+        {"stale": True},
+    )
+
+    result = ex.submit_or_run(
+        SimpleNamespace(iteration=4, campaign_uid="m16-test", models_version=0),
+        CampaignPhase("ARIADNE_ARRAY"),
+    )
+
+    assert result.is_complete is True
+    assert result.failure_reason is None
+    assert not runner.calls
+    archives = list(ariadne_publication_archive_root(campaign, 4).iterdir())
+    assert len(archives) == 1
+    assert (archives[0] / "RESULTS.json").is_file()
+    events = _read_journal_events(campaign)
+    archived = [
+        event
+        for event in events
+        if event.get("event") == "ariadne_publication_archived"
+    ]
+    assert archived
+    assert archived[-1]["reason"] == "ariadne_postprocess_only_recovery"
 
 
 def test_ariadne_submit_rejects_invalid_existing_seed_provenance(tmp_path):

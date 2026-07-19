@@ -128,6 +128,10 @@ from .daemon.array_recovery import (
     refresh_array_ledger,
     supports_partial_array_recovery,
 )
+from .daemon.ariadne_publication import (
+    archive_ariadne_publication,
+    classify_ariadne_publication,
+)
 from .daemon.reconcile_transaction import (
     ReconcileTransaction,
     begin_reconcile_transaction,
@@ -1995,6 +1999,12 @@ def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path
     lines.extend(_format_lifecycle_status(payload))
     partial_array = payload.get("partial_array_recovery")
     if isinstance(partial_array, dict):
+        publication = payload.get("ariadne_publication_recovery")
+        publication_state = (
+            str(publication.get("state"))
+            if isinstance(publication, Mapping)
+            else None
+        )
         lines.append("")
         lines.extend(
             _section(
@@ -2017,6 +2027,7 @@ def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path
                     ),
                     ("force resubmit", partial_array.get("force_resubmit")),
                     ("ledger", partial_array.get("ledger")),
+                    ("batch publication", publication_state),
                 ],
             )
         )
@@ -2221,6 +2232,7 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "ariadne_seed_provenance_repaired": "ARIADNE seed provenance repaired",
     "ariadne_seed_provenance_staged": "ARIADNE seed provenance staged",
     "ariadne_stale_outputs_quarantined": "ARIADNE stale outputs quarantined",
+    "ariadne_publication_archived": "ARIADNE publication archived",
     "ariadne_task_rejected_missing_result": "ARIADNE result missing",
     "ariadne_task_rejected_malformed_result": "ARIADNE malformed result",
     "ariadne_task_rejected_unusable_result": "ARIADNE result unusable",
@@ -4313,6 +4325,14 @@ def cmd_status(args: argparse.Namespace) -> int:
             ledger = read_array_ledger(campaign, state.phase, int(state.iteration))
             if isinstance(ledger, dict):
                 payload["partial_array_recovery"] = compact_array_recovery_summary(ledger)
+                if state.phase is CampaignPhase.ARIADNE_ARRAY:
+                    payload["ariadne_publication_recovery"] = (
+                        classify_ariadne_publication(
+                            campaign,
+                            int(state.iteration),
+                            expected_campaign_uid=str(state.campaign_uid),
+                        )
+                    )
     except Exception as exc:
         payload["partial_array_recovery_error"] = (
             type(exc).__name__ + ": " + str(exc)
@@ -5202,7 +5222,35 @@ def _perform_reconcile_apply_mutations(
         "archived_model_staging": [],
         "archived_reference_data_staging": [],
         "archived_reentry_staging": [],
+        "archived_ariadne_publication": [],
     }
+    publication = getattr(report, "ariadne_publication_recovery", None)
+    if isinstance(publication, dict) and bool(
+        publication.get("archive_required", False)
+    ):
+        iteration = int(report.proposed_state.iteration)
+        intent = _submission_intent.load_intent(
+            campaign,
+            CampaignPhase.ARIADNE_ARRAY.value,
+            iteration,
+            expected_campaign_uid=str(report.proposed_state.campaign_uid),
+        )
+        archived_publication = archive_ariadne_publication(
+            campaign,
+            iteration,
+            reason="reconcile_postprocess_recovery",
+            campaign_uid=str(report.proposed_state.campaign_uid),
+            submission_identity=(
+                str(intent.get("submission_identity"))
+                if isinstance(intent, dict) and intent.get("submission_identity")
+                else None
+            ),
+            classification=publication,
+        )
+        if bool(archived_publication.get("changed", False)):
+            paths = [str(archived_publication["archive_dir"])]
+            result["archived_ariadne_publication"] = paths
+            transaction.record_paths("archive_ariadne_publication", paths)
     if retrain_ferebus:
         archived = archive_ferebus_iteration_staging_for_retrain(
             campaign,
@@ -5532,6 +5580,8 @@ def _reconcile_cleanable_reasons(report: Any) -> List[str]:
         cleanable.append(
             ".DATA/STAGING is non-empty (requires --archive-staging when safe)"
         )
+    if "stale ARIADNE publication" in reasons:
+        cleanable.append("stale ARIADNE publication")
     return cleanable
 
 
@@ -5543,6 +5593,7 @@ def _reconcile_hard_blockers(
         ".DATA/SCRIPTS contains sbatch scripts",
         "dangling model staging directories exist",
         "dangling reference-data staging directories exist",
+        "stale ARIADNE publication",
     }
     cleanable_blocking_artifacts = set()
     reasons = set(str(reason) for reason in getattr(report, "unsafe_reasons", []))
@@ -5550,6 +5601,8 @@ def _reconcile_hard_blockers(
         cleanable_blocking_artifacts.add("dangling model staging")
     if "dangling reference-data staging directories exist" in reasons:
         cleanable_blocking_artifacts.add("dangling reference-data staging")
+    if "stale ARIADNE publication" in reasons:
+        cleanable_blocking_artifacts.add("stale ARIADNE publication")
     blockers: List[str] = []
     for reason in getattr(report, "unsafe_reasons", []):
         if reason in cleanable_exact:
@@ -5705,6 +5758,10 @@ def _reconcile_decision_payload(
             if isinstance(getattr(report, "partial_array_recovery", None), dict)
             else None
         ),
+        "ariadne_publication_recovery": (
+            dict(getattr(report, "ariadne_publication_recovery", {}) or {})
+            or None
+        ),
         "ferebus_candidate_recovery": (
             dict(getattr(report, "ferebus_candidate_recovery", {}) or {})
             or None
@@ -5741,6 +5798,7 @@ def _reconcile_human_reason(reason: Any) -> str:
             ".DATA/STAGING is non-empty; requires --archive-staging when safe"
         ),
         "active submission intent(s) present": "active submission intent(s)",
+        "stale ARIADNE publication": "stale ARIADNE batch publication",
     }
     return mapping.get(text, text)
 
@@ -6155,6 +6213,12 @@ def _print_reconcile_partial_array(campaign: Path, report: Any) -> None:
     reuse = int(partial.get("n_reuse") or partial.get("n_complete") or 0)
     retry = int(partial.get("n_retry") or 0)
     mode = "full resubmission requested" if bool(partial.get("force_resubmit")) else "reuse completed outputs"
+    publication = getattr(report, "ariadne_publication_recovery", None)
+    publication_state = (
+        str(publication.get("state"))
+        if isinstance(publication, Mapping)
+        else None
+    )
     _print_reconcile_key_values(
         [
             ("phase", phase + " iteration " + iteration),
@@ -6162,6 +6226,7 @@ def _print_reconcile_partial_array(campaign: Path, report: Any) -> None:
             ("ledger", _reconcile_relative_path(campaign, partial.get("ledger"))),
             ("retry task file", _reconcile_relative_path(campaign, partial.get("retry_task_file")) or "none"),
             ("mode", mode),
+            ("batch publication", publication_state),
         ]
     )
     print("")
@@ -7418,6 +7483,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     cleanable_reasons = {
         "dangling model staging directories exist",
         ".DATA/SCRIPTS contains sbatch scripts",
+        "stale ARIADNE publication",
     }
     data_staging_archive_mode = None
     archive_staging_refusal_reasons: List[str] = []
@@ -7557,6 +7623,13 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         mutation_result["archived_reference_data_staging"]
     )
     removed = list(mutation_result["archived_reentry_staging"])
+    archived_ariadne_publication = list(
+        mutation_result["archived_ariadne_publication"]
+    )
+    if archived_ariadne_publication:
+        print("Archived stale ARIADNE batch publication:")
+        for path in archived_ariadne_publication:
+            print("  - " + str(path))
     if ferebus_retrain_archive:
         print("Archived FEREBUS output for explicit retraining:")
         for path in ferebus_retrain_archive:
@@ -7584,6 +7657,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         + list(archived_reference_data_staging)
         + list(ferebus_retrain_archive)
         + list(removed)
+        + list(archived_ariadne_publication)
     )
 
     if original_report.proposed_state.phase is CampaignPhase.HALTED:
@@ -7985,6 +8059,24 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                     ferebus_recovery_request.get("request_sha256") or ""
                 ),
             )
+        if archived_ariadne_publication:
+            append_event(
+                campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
+                "ariadne_publication_archived",
+                phase=report.proposed_state.phase.value,
+                iteration=int(report.proposed_state.iteration),
+                reason="reconcile_postprocess_recovery",
+                archive_path=str(archived_ariadne_publication[0]),
+                n_files=int(
+                    len(
+                        list(
+                            (getattr(original_report, "ariadne_publication_recovery", {}) or {}).get(
+                                "files", []
+                            )
+                        )
+                    )
+                ),
+            )
         append_event(
             campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
             "reconcile_applied",
@@ -7999,6 +8091,11 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             archived_reference_data_staging_paths=archived_reference_data_staging,
             n_archived_scripts_paths=len(archived_scripts),
             archived_scripts_path=(archived_scripts[0] if archived_scripts else None),
+            archived_ariadne_publication_path=(
+                archived_ariadne_publication[0]
+                if archived_ariadne_publication
+                else None
+            ),
             recomputed_after_transient_cleanup=(
                 original_report.proposed_state.phase is CampaignPhase.HALTED
             ),

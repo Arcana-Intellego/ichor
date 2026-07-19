@@ -763,6 +763,65 @@ def clean_stale_ariadne_seed_outputs(
         )
     return moved
 
+
+def archive_stale_ariadne_publication(
+    campaign_dir,
+    state,
+    *,
+    retry_task_ids: Sequence[int],
+) -> Optional[Dict[str, Any]]:
+    """Retire derived batch files before retry or postprocess replay."""
+    from .ariadne_publication import (
+        AriadnePublicationError,
+        archive_ariadne_publication,
+        classify_ariadne_publication,
+    )
+    from .submission_intent import load_intent
+
+    campaign = Path(campaign_dir)
+    iteration = int(getattr(state, "iteration", 0))
+    try:
+        classification = classify_ariadne_publication(
+            campaign,
+            iteration,
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+        if str(classification.get("state") or "") == "invalid":
+            raise AriadnePublicationError(
+                str(classification.get("reason") or "invalid publication")
+            )
+        force = bool(retry_task_ids) and bool(classification.get("files"))
+        if not bool(classification.get("archive_required", False)) and not force:
+            return None
+        intent = load_intent(
+            campaign,
+            CampaignPhase.ARIADNE_ARRAY.value,
+            iteration,
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+        submission_identity = (
+            str(intent.get("submission_identity"))
+            if isinstance(intent, dict) and intent.get("submission_identity")
+            else None
+        )
+        return archive_ariadne_publication(
+            campaign,
+            iteration,
+            reason=(
+                "ariadne_retry_preparation"
+                if retry_task_ids
+                else "ariadne_postprocess_only_recovery"
+            ),
+            campaign_uid=str(state.campaign_uid),
+            submission_identity=submission_identity,
+            classification=classification,
+            force=force,
+        )
+    except AriadnePublicationError as exc:
+        raise BackendSubmissionError(
+            "ARIADNE derived publication could not be archived safely: " + str(exc)
+        ) from exc
+
 #  SBATCH-phase postprocess refusal guard.
 #
 #
@@ -2289,6 +2348,34 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         "ascii"
                     )
                 ).hexdigest()
+                if phase_name == "ARIADNE_ARRAY":
+                    publication_archive = archive_stale_ariadne_publication(
+                        self.campaign_dir,
+                        state,
+                        retry_task_ids=retry_ids,
+                    )
+                    if isinstance(publication_archive, dict) and bool(
+                        publication_archive.get("changed", False)
+                    ):
+                        self._journal_event(
+                            "ariadne_publication_archived",
+                            phase=phase_name,
+                            iteration=int(getattr(state, "iteration", 0)),
+                            reason=(
+                                "ariadne_retry_preparation"
+                                if retry_ids
+                                else "ariadne_postprocess_only_recovery"
+                            ),
+                            archive_id=str(
+                                publication_archive.get("archive_id") or ""
+                            ),
+                            archive_manifest=str(
+                                publication_archive.get("manifest_path") or ""
+                            ),
+                            n_files=int(
+                                len(publication_archive.get("archived_paths") or [])
+                            ),
+                        )
                 if not retry_ids and int(recovery.get("logical_total") or 0) > 0:
                     self._journal_event(
                         "partial_array_recovery_postprocess_only",

@@ -112,8 +112,8 @@ def _validate_ferebus_transition_boundary(campaign: Path, state: Any) -> None:
 def _validate_ariadne_retry_transition_boundary(
     campaign: Path,
     state: Any,
-) -> None:
-    """Require an ARIADNE recovery boundary where every task will be retried."""
+) -> Dict[str, Any]:
+    """Validate an all-retry or all-complete ARIADNE recovery boundary."""
     from .daemon.array_recovery import scan_array_tasks
     from .daemon.recovery_contracts import phase_recovery_contract_error
 
@@ -167,20 +167,133 @@ def _validate_ariadne_retry_transition_boundary(
             "environment transition at ARIADNE_ARRAY requires a non-empty logical "
             "task set"
         )
-    if n_complete != 0 or n_reuse != 0 or all_complete:
+    expected_task_ids = list(range(logical_total))
+    if n_complete == 0 and n_reuse == 0 and not all_complete:
+        if n_retry != logical_total or retry_task_ids != expected_task_ids:
+            raise ExecutionIdentityError(
+                "environment transition at ARIADNE_ARRAY requires the retry set to "
+                "cover every logical task exactly once"
+            )
+        return {
+            "transition_kind": "ariadne_all_retry",
+            "logical_total": int(logical_total),
+        }
+
+    if not (
+        n_complete == logical_total
+        and n_reuse == logical_total
+        and n_retry == 0
+        and not retry_task_ids
+        and all_complete
+    ):
         raise ExecutionIdentityError(
-            "environment transition at ARIADNE_ARRAY requires every logical task "
-            "to be retried under one environment generation; observed "
+            "environment transition at ARIADNE_ARRAY requires either every logical "
+            "task to be retried or every logical task to be complete for "
+            "postprocessing; observed "
             + str(n_reuse)
             + " reusable task(s) out of "
             + str(logical_total)
         )
-    expected_task_ids = list(range(logical_total))
-    if n_retry != logical_total or retry_task_ids != expected_task_ids:
+
+    from .daemon.ariadne_publication import classify_ariadne_publication
+    from .daemon.submission_intent import load_intent
+
+    publication = classify_ariadne_publication(
+        campaign,
+        int(state.iteration),
+        expected_campaign_uid=str(state.campaign_uid),
+    )
+    if str(publication.get("state") or "") not in {
+        "absent",
+        "incomplete",
+        "stale_results_binding",
+        "archive_incomplete",
+    }:
         raise ExecutionIdentityError(
-            "environment transition at ARIADNE_ARRAY requires the retry set to "
-            "cover every logical task exactly once"
+            "environment transition at an all-complete ARIADNE boundary requires "
+            "derived publication to be absent or conclusively incomplete; observed "
+            + str(publication.get("state") or "unknown")
+            + ": "
+            + str(publication.get("reason") or "")
         )
+    intent = load_intent(
+        campaign,
+        phase.value,
+        int(state.iteration),
+        expected_campaign_uid=str(state.campaign_uid),
+    )
+    if not isinstance(intent, Mapping) or str(intent.get("status") or "") != "FAILED":
+        raise ExecutionIdentityError(
+            "environment transition at an all-complete ARIADNE boundary requires "
+            "the terminal producer submission intent"
+        )
+    if not str(intent.get("job_id") or ""):
+        raise ExecutionIdentityError(
+            "all-complete ARIADNE producer intent has no scheduler JobID"
+        )
+    producer_generation = intent.get("environment_generation")
+    producer_digest = str(intent.get("environment_generation_digest_sha256") or "")
+    if (
+        isinstance(producer_generation, bool)
+        or not isinstance(producer_generation, int)
+        or producer_generation < 0
+        or len(producer_digest) != 64
+        or any(ch not in "0123456789abcdef" for ch in producer_digest)
+    ):
+        raise ExecutionIdentityError(
+            "all-complete ARIADNE producer intent lacks a valid environment binding"
+        )
+    recovery = intent.get("array_recovery")
+    metadata = intent.get("submission_metadata")
+    if not isinstance(recovery, Mapping) or not isinstance(metadata, Mapping):
+        raise ExecutionIdentityError(
+            "all-complete ARIADNE producer intent lacks retry ownership evidence"
+        )
+    raw_counts = (
+        recovery.get("logical_total"),
+        recovery.get("n_reuse"),
+        recovery.get("n_retry"),
+        intent.get("logical_expected_tasks"),
+        intent.get("retry_expected_tasks"),
+        intent.get("expected_tasks"),
+    )
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in raw_counts
+    ):
+        raise ExecutionIdentityError(
+            "all-complete ARIADNE producer task counts are malformed"
+        )
+    producer_counts = tuple(int(value) for value in raw_counts)
+    expected_counts = (
+        logical_total,
+        0,
+        logical_total,
+        logical_total,
+        logical_total,
+        logical_total,
+    )
+    if producer_counts != expected_counts:
+        raise ExecutionIdentityError(
+            "all-complete ARIADNE outputs are not bound to one full-array producer "
+            "attempt"
+        )
+    expected_task_set_sha256 = hashlib.sha256(
+        ",".join(str(task_id) for task_id in expected_task_ids).encode("ascii")
+    ).hexdigest()
+    if str(metadata.get("logical_task_set_sha256") or "") != expected_task_set_sha256:
+        raise ExecutionIdentityError(
+            "all-complete ARIADNE producer task-set digest mismatch"
+        )
+    return {
+        "transition_kind": "ariadne_postprocess_only",
+        "logical_total": int(logical_total),
+        "producer_submission_identity": str(intent.get("submission_identity") or ""),
+        "producer_job_id": str(intent.get("job_id") or ""),
+        "producer_environment_generation": int(producer_generation),
+        "producer_environment_generation_digest_sha256": producer_digest,
+        "publication_state": str(publication.get("state") or ""),
+    }
 
 
 _ENVIRONMENT_FINGERPRINT_KEYS = (
@@ -1093,8 +1206,9 @@ def advance_environment_generation(
     then advance the current pointer.  Repeating the command after any partial
     attempt is safe.  An unpublished, valid REFERENCE_COMMIT transaction is a
     recovery boundary because it is local, resumable and owns no scheduler job.
-    A fully retryable ARIADNE array is also safe because no completed task output
-    will cross the environment-generation boundary.
+    A fully retryable ARIADNE array is safe because no completed task output
+    crosses the boundary.  A single-generation, all-complete array is safe when
+    only its derived batch publication remains to be rebuilt.
     """
     campaign = Path(campaign_dir).resolve()
     state = read_state(operational_path(campaign, "state.json"))
@@ -1128,6 +1242,9 @@ def advance_environment_generation(
         raise ExecutionIdentityError(
             "automatic live environment transition requires a successful backend preflight"
         )
+    transition_context: Dict[str, Any] = {
+        "transition_kind": "idle_boundary",
+    }
     if state.phase is CampaignPhase.REFERENCE_COMMIT:
         from .daemon.reference_commit import classify_reference_commit
 
@@ -1171,10 +1288,15 @@ def advance_environment_generation(
                 "environment transition at REFERENCE_COMMIT found inconsistent "
                 "campaign, iteration, or reference-version identity"
             )
+        transition_context = {"transition_kind": "reference_commit_recovery"}
     elif state.phase in {CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS}:
         _validate_ferebus_transition_boundary(campaign, state)
+        transition_context = {"transition_kind": "ferebus_retry"}
     elif state.phase is CampaignPhase.ARIADNE_ARRAY:
-        _validate_ariadne_retry_transition_boundary(campaign, state)
+        transition_context = _validate_ariadne_retry_transition_boundary(
+            campaign,
+            state,
+        )
     elif state.phase not in {
         CampaignPhase.SEED_SELECT,
         CampaignPhase.STOP_CHECK,
@@ -1185,7 +1307,7 @@ def advance_environment_generation(
             "boundary, "
             "a verified unpublished REFERENCE_COMMIT recovery transaction, or a "
             "clean pre-submission FEREBUS retry boundary, or a fully retryable "
-            "ARIADNE recovery boundary"
+            "ARIADNE retry or postprocess-only recovery boundary"
         )
     if any(value is not None for value in state.pending_jobs.values()):
         raise ExecutionIdentityError(
@@ -1312,6 +1434,7 @@ def advance_environment_generation(
                 for key in _ENVIRONMENT_FINGERPRINT_KEYS
                 if active_generation.get(key) != candidate.get(key)
             ],
+            **transition_context,
         )
     except Exception:
         pass
@@ -1322,6 +1445,7 @@ def advance_environment_generation(
         "generation": generation_number,
         "generation_digest_sha256": str(candidate["digest_sha256"]),
         "generation_path": str(generation_path),
+        **transition_context,
     }
 
 

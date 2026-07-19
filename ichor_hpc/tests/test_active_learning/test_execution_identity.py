@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -549,7 +550,131 @@ def test_rebind_rejects_ariadne_boundary_with_reusable_output(
 
     with pytest.raises(
         ExecutionIdentityError,
-        match="requires every logical task to be retried",
+        match="requires either every logical task to be retried",
+    ):
+        rebind_environment(
+            campaign,
+            config=config,
+            scheduler_ownership_clear=True,
+        )
+
+
+def test_rebind_accepts_single_generation_ariadne_postprocess_only_boundary(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 1
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
+    _patch_ariadne_retry_transition(
+        monkeypatch,
+        logical_total=3,
+        n_complete=3,
+        retry_task_ids=[],
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.ariadne_publication."
+        "classify_ariadne_publication",
+        lambda *_args, **_kwargs: {
+            "state": "stale_results_binding",
+            "archive_required": True,
+            "reason": "test stale publication",
+            "files": [],
+        },
+    )
+    task_digest = hashlib.sha256(b"0,1,2").hexdigest()
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.submission_intent.load_intent",
+        lambda *_args, **_kwargs: {
+            "status": "FAILED",
+            "job_id": "12345",
+            "submission_identity": "r0000-a0001-test",
+            "environment_generation": 0,
+            "environment_generation_digest_sha256": "a" * 64,
+            "logical_expected_tasks": 3,
+            "retry_expected_tasks": 3,
+            "expected_tasks": 3,
+            "array_recovery": {
+                "logical_total": 3,
+                "n_reuse": 0,
+                "n_retry": 3,
+            },
+            "submission_metadata": {
+                "logical_task_set_sha256": task_digest,
+            },
+        },
+    )
+
+    result = rebind_environment(
+        campaign,
+        config=config,
+        scheduler_ownership_clear=True,
+    )
+
+    assert result["changed"] is True
+    assert result["transition_kind"] == "ariadne_postprocess_only"
+    assert result["producer_environment_generation"] == 0
+
+
+def test_rebind_rejects_all_complete_ariadne_without_full_attempt_binding(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 1
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
+    _patch_ariadne_retry_transition(
+        monkeypatch,
+        logical_total=3,
+        n_complete=3,
+        retry_task_ids=[],
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.ariadne_publication."
+        "classify_ariadne_publication",
+        lambda *_args, **_kwargs: {
+            "state": "absent",
+            "archive_required": False,
+            "reason": "absent",
+            "files": [],
+        },
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.submission_intent.load_intent",
+        lambda *_args, **_kwargs: {
+            "status": "FAILED",
+            "job_id": "12345",
+            "environment_generation": 0,
+            "environment_generation_digest_sha256": "a" * 64,
+            "logical_expected_tasks": 3,
+            "retry_expected_tasks": 1,
+            "expected_tasks": 1,
+            "array_recovery": {
+                "logical_total": 3,
+                "n_reuse": 2,
+                "n_retry": 1,
+            },
+            "submission_metadata": {
+                "logical_task_set_sha256": hashlib.sha256(b"2").hexdigest(),
+            },
+        },
+    )
+
+    with pytest.raises(
+        ExecutionIdentityError,
+        match="not bound to one full-array producer attempt",
     ):
         rebind_environment(
             campaign,

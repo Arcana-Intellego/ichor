@@ -58,6 +58,7 @@ from .array_recovery import (
     refresh_array_ledger,
     supports_partial_array_recovery,
 )
+from .ariadne_publication import classify_ariadne_publication
 from .state import (
     CampaignPhase,
     CampaignState,
@@ -297,6 +298,7 @@ class ReconciliationReport:
     recommended_actions: List[str] = field(default_factory=list)
     recovery_candidates: List[Dict[str, Any]] = field(default_factory=list)
     partial_array_recovery: Optional[Dict[str, Any]] = None
+    ariadne_publication_recovery: Optional[Dict[str, Any]] = None
     ferebus_candidate_recovery: Optional[Dict[str, Any]] = None
     bootstrap_handoff: Optional[Dict[str, Any]] = None
     phase_a_handoff: Optional[Dict[str, Any]] = None
@@ -2163,6 +2165,7 @@ def propose_recovery(
         blocking_artifacts.append("active-learning handoff inventory")
 
     partial_array_recovery: Optional[Dict[str, Any]] = None
+    ariadne_publication_recovery: Optional[Dict[str, Any]] = None
     partial_array_decision: Optional[RecoveryDecision] = None
     preferred_phase = last_phase
     preferred_iteration = last_iter
@@ -2229,6 +2232,40 @@ def propose_recovery(
             )
             partial_array_recovery = None
             partial_array_decision = None
+    if (
+        isinstance(partial_array_recovery, dict)
+        and str(partial_array_recovery.get("phase") or "")
+        == CampaignPhase.ARIADNE_ARRAY.value
+    ):
+        try:
+            ariadne_publication_recovery = classify_ariadne_publication(
+                campaign,
+                int(partial_array_recovery["iteration"]),
+                expected_campaign_uid=str(recovered.campaign_uid),
+            )
+        except Exception as exc:
+            ariadne_publication_recovery = {
+                "state": "invalid",
+                "archive_required": False,
+                "reason": type(exc).__name__ + ": " + str(exc),
+            }
+        publication_state = str(
+            ariadne_publication_recovery.get("state") or "invalid"
+        )
+        if publication_state == "invalid":
+            reason = (
+                "invalid ARIADNE publication: "
+                + str(ariadne_publication_recovery.get("reason") or "unknown error")
+            )
+            unsafe_reasons.append(reason)
+            blocking_artifacts.append("invalid ARIADNE publication")
+        elif bool(ariadne_publication_recovery.get("archive_required", False)):
+            unsafe_reasons.append("stale ARIADNE publication")
+            blocking_artifacts.append("stale ARIADNE publication")
+            notes.append(
+                "ARIADNE derived publication will be archived before postprocessing: "
+                + publication_state
+            )
     if unexpected_staging_children:
         unsafe_reasons.append(".DATA/STAGING is non-empty")
         blocking_artifacts.append(".DATA/STAGING")
@@ -2662,6 +2699,11 @@ def propose_recovery(
         partial_array_recovery=(
             compact_array_recovery_summary(partial_array_recovery)
             if isinstance(partial_array_recovery, dict)
+            else None
+        ),
+        ariadne_publication_recovery=(
+            dict(ariadne_publication_recovery)
+            if isinstance(ariadne_publication_recovery, dict)
             else None
         ),
         ferebus_candidate_recovery=ferebus_candidate_recovery,

@@ -1667,6 +1667,46 @@ def test_recovery_cannot_advance_from_rejected_ariadne_batch(
     assert "valid ARIADNE results handoff" not in report.decision
 
 
+def test_reconcile_classifies_stale_ariadne_decision_as_cleanable(tmp_path, monkeypatch):
+    _trust_marker_models(monkeypatch)
+    monkeypatch.setattr(
+        reconcile_mod,
+        "_validate_recovered_state_contract",
+        lambda *args, **kwargs: None,
+    )
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_training_and_model_versions(training, models, [0])
+    state = fresh_campaign_state(max_iterations=3, campaign_uid="reconcile-test")
+    state.phase = CampaignPhase.HALTED
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    append_event(
+        data / "journal.ndjson",
+        "halt",
+        from_phase=CampaignPhase.ARIADNE_ARRAY.value,
+        iteration=1,
+        reason="postprocess_exception: stale batch decision",
+    )
+    iteration_dir = _write_ariadne_handoff(campaign, 1, n=2)
+    results_path = active_ariadne_dir(iteration_dir) / "RESULTS.json"
+    results_path.write_text(
+        results_path.read_text(encoding="utf-8") + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.HALTED
+    assert report.partial_array_recovery["n_reuse"] == 2
+    assert report.partial_array_recovery["n_retry"] == 0
+    assert report.ariadne_publication_recovery["state"] == "stale_results_binding"
+    assert "stale ARIADNE publication" in report.unsafe_reasons
+
+
 def test_propose_recovery_does_not_preserve_existing_phase_for_committed_iteration(
     tmp_path,
     monkeypatch,

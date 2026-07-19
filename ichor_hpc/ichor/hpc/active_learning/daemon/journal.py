@@ -169,6 +169,7 @@ KNOWN_EVENT_TYPES = (
     "ariadne_seed_provenance_repaired",
     "ariadne_seed_provenance_staged",
     "ariadne_stale_outputs_quarantined",
+    "ariadne_publication_archived",
     "ariadne_task_rejected_missing_result",
     "ariadne_task_rejected_malformed_result",
     "ariadne_task_rejected_unusable_result",
