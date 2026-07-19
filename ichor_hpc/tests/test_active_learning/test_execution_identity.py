@@ -394,7 +394,7 @@ def test_rebind_rejects_non_idle_or_scheduler_owned_state(tmp_path, monkeypatch)
         "capture_environment_generation",
         _changed_generation,
     )
-    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.phase = CampaignPhase.GAUSSIAN
     write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
     with pytest.raises(
         ExecutionIdentityError,
@@ -407,6 +407,245 @@ def test_rebind_rejects_non_idle_or_scheduler_owned_state(tmp_path, monkeypatch)
     write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
     with pytest.raises(ExecutionIdentityError, match="scheduler ownership"):
         rebind_environment(campaign, config=config)
+
+
+def _patch_ariadne_retry_transition(
+    monkeypatch,
+    *,
+    logical_total=3,
+    n_complete=0,
+    retry_task_ids=None,
+    contract_error=None,
+):
+    retry_ids = (
+        list(range(int(logical_total)))
+        if retry_task_ids is None
+        else list(retry_task_ids)
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.recovery_contracts."
+        "phase_recovery_contract_error",
+        lambda *_args, **_kwargs: contract_error,
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.array_recovery.scan_array_tasks",
+        lambda _campaign, phase, iteration, force_resubmit=False: {
+            "phase": str(getattr(phase, "value", phase)),
+            "iteration": int(iteration),
+            "logical_total": int(logical_total),
+            "n_complete": int(n_complete),
+            "n_reuse": int(n_complete),
+            "n_retry": len(retry_ids),
+            "retry_task_ids": retry_ids,
+            "all_complete": bool(logical_total > 0 and not retry_ids),
+        },
+    )
+
+
+def test_rebind_accepts_fully_retryable_ariadne_boundary(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 1
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
+    _patch_ariadne_retry_transition(monkeypatch, logical_total=3)
+
+    result = rebind_environment(
+        campaign,
+        config=config,
+        scheduler_ownership_clear=True,
+    )
+
+    assert result["changed"] is True
+    assert result["generation"] == 1
+    rebound = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
+    assert rebound.phase is CampaignPhase.ARIADNE_ARRAY
+    assert rebound.iteration == 1
+
+
+def test_rebind_accepts_real_all_retry_ariadne_task_map(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon.state import atomic_write_json
+    from ichor.hpc.active_learning.handoff_manifests import (
+        build_seed_selection_manifest,
+        seeds_picked_path,
+    )
+    from ichor.hpc.active_learning.layout import active_iteration_dir
+    from ichor.hpc.active_learning.seed_identity import write_ariadne_task_map
+
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 1
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    iteration_dir = active_iteration_dir(campaign, 1)
+    selection = build_seed_selection_manifest(
+        campaign_uid=state.campaign_uid,
+        campaign_random_seed=config.campaign.reproducibility_seed,
+        iteration=1,
+        models_version=0,
+        model_manifest_sha256="a" * 64,
+        model_set_sha256="b" * 64,
+        trajectory_sha256="c" * 64,
+        selection_strategy="hybrid_variance",
+        seed_records=[
+            {
+                "seed_id": seed_id,
+                "frame_id": seed_id - 1,
+                "pool_row_index_zero_based": seed_id - 1,
+                "selection_origin": "bulk",
+                "variance_at_selection": 0.1 * seed_id,
+            }
+            for seed_id in range(1, 4)
+        ],
+    )
+    selection_path = seeds_picked_path(iteration_dir)
+    selection_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(selection_path, selection)
+    write_ariadne_task_map(iteration_dir, selection)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
+
+    result = rebind_environment(
+        campaign,
+        config=config,
+        scheduler_ownership_clear=True,
+    )
+
+    assert result["changed"] is True
+    assert result["generation"] == 1
+
+
+def test_rebind_rejects_ariadne_boundary_with_reusable_output(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 1
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
+    _patch_ariadne_retry_transition(
+        monkeypatch,
+        logical_total=3,
+        n_complete=1,
+        retry_task_ids=[1, 2],
+    )
+
+    with pytest.raises(
+        ExecutionIdentityError,
+        match="requires every logical task to be retried",
+    ):
+        rebind_environment(
+            campaign,
+            config=config,
+            scheduler_ownership_clear=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("logical_total", "retry_task_ids", "match"),
+    [
+        (0, [], "non-empty logical task set"),
+        (3, [0, 2], "cover every logical task exactly once"),
+    ],
+)
+def test_rebind_rejects_incomplete_ariadne_retry_identity(
+    tmp_path,
+    monkeypatch,
+    logical_total,
+    retry_task_ids,
+    match,
+):
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 1
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
+    _patch_ariadne_retry_transition(
+        monkeypatch,
+        logical_total=logical_total,
+        retry_task_ids=retry_task_ids,
+    )
+
+    with pytest.raises(ExecutionIdentityError, match=match):
+        rebind_environment(
+            campaign,
+            config=config,
+            scheduler_ownership_clear=True,
+        )
+
+
+def test_rebind_rejects_ariadne_boundary_with_invalid_handoff(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 1
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
+    _patch_ariadne_retry_transition(
+        monkeypatch,
+        contract_error="seed-selection handoff is invalid",
+    )
+
+    with pytest.raises(
+        ExecutionIdentityError,
+        match="failed its recovery contract",
+    ):
+        rebind_environment(
+            campaign,
+            config=config,
+            scheduler_ownership_clear=True,
+        )
+
+
+def test_rebind_ariadne_boundary_retains_scheduler_ownership_checks(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 1
+    state.pending_jobs[CampaignPhase.ARIADNE_ARRAY.value] = "12345"
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
+    _patch_ariadne_retry_transition(monkeypatch, logical_total=3)
+
+    with pytest.raises(ExecutionIdentityError, match="pending scheduler ownership"):
+        rebind_environment(
+            campaign,
+            config=config,
+            scheduler_ownership_clear=True,
+        )
 
 
 def test_rebind_accepts_verified_unpublished_reference_commit_recovery(
@@ -765,6 +1004,38 @@ def test_daemon_start_automatically_advances_safe_environment_drift(
         "capture_environment_generation",
         _changed_generation,
     )
+    daemon = Daemon(
+        campaign_dir=campaign,
+        config=config,
+        executor=_SubmittedExecutor(),
+        environment_preflight_ok=True,
+    )
+
+    rc = daemon.run(max_ticks=0)
+
+    assert rc == 0
+    active = read_active_environment_generation(
+        campaign,
+        expected_campaign_uid="uid-rebind",
+    )["generation"]
+    assert active["generation"] == 1
+    assert active["python_version"] == "3.11.rebound"
+
+
+def test_daemon_start_advances_fully_retryable_ariadne_drift(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 1
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
+    _patch_ariadne_retry_transition(monkeypatch, logical_total=150)
     daemon = Daemon(
         campaign_dir=campaign,
         config=config,
